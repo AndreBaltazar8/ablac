@@ -2,6 +2,7 @@ package dev.ablac.frontend
 
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.nodes.*
+import dev.ablac.language.positionZero
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -39,9 +40,15 @@ class ExecutionVisitor(
     }
 
     override suspend fun visit(compilerExec: CompilerExec) {
-        _executionLayer++
-        super.visit(compilerExec)
-        _executionLayer--
+        if (!compilerExec.compiled) {
+            _executionLayer++
+            super.visit(compilerExec)
+            compilerExec.compiled = true
+            compilerExec.expression = Integer("1", positionZero)
+            _executionLayer--
+        } else {
+            super.visit(compilerExec)
+        }
     }
 
     override suspend fun visit(stringLiteral: StringLiteral) {
@@ -50,7 +57,8 @@ class ExecutionVisitor(
 
     override suspend fun visit(functionCall: FunctionCall) {
         if (_executionLayer > 0) {
-            if (functionCall.name == "import") {
+            val primaryExpression = functionCall.primaryExpression
+            if (primaryExpression is IdentifierExpression && primaryExpression.identifier == "import") {
                 functionCall.parameters[0].accept(this)
 
                 val importName = (_values.removeAt(_values.lastIndex) as StringLiteral).string

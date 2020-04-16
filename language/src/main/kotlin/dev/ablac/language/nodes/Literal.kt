@@ -1,3 +1,3 @@
 package dev.ablac.language.nodes
 
-interface Literal : Expression
+interface Literal : PrimaryExpression

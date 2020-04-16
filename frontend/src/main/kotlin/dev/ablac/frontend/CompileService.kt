@@ -1,21 +1,22 @@
 package dev.ablac.frontend
 
+import dev.ablac.common.CompilationUnit
+import dev.ablac.common.ICodeGenerator
+import dev.ablac.common.SymbolTable
 import dev.ablac.language.IParseService
 import dev.ablac.language.nodes.File
 import dev.ablac.utils.ILockService
 import dev.ablac.utils.IMeasurementService
 import dev.ablac.utils.MeasurementScope
-import dev.ablac.utils.printFlushed
 import kotlinx.coroutines.*
 import java.io.InputStream
 import java.util.*
-import kotlin.coroutines.EmptyCoroutineContext
 
 interface ICompileService {
     suspend fun compileFile(fileName: String, parallel: Boolean = true, compilationContext: CompilationContext? = null)
     suspend fun compileSource(source: String, parallel: Boolean = true, compilationContext: CompilationContext? = null)
     suspend fun compileStream(stream: InputStream, parallel: Boolean = true, compilationContext: CompilationContext? = null)
-    fun output()
+    suspend fun output(codeGenerator: ICodeGenerator)
 }
 
 class CompileService(
@@ -26,6 +27,7 @@ class CompileService(
     private val parentJob = Job()
     private val coroutineScope = CoroutineScope(parentJob + Dispatchers.Default)
 
+    private val global = SymbolTable()
     private val pendingCompilation = Collections.synchronizedMap(mutableMapOf<String, PendingCompilationUnit>())
     private val compiledUnits = Collections.synchronizedMap(mutableMapOf<String, CompilationUnit>())
     private var compileNumber: Int = 0
@@ -51,13 +53,13 @@ class CompileService(
         compile(name, false, parallel, compilationContext) { parserService.parseStream(name, stream, it) }
     }
 
-    override fun output() {
-        runBlocking {
-            parentJob.complete()
-            parentJob.join()
-        }
+    override suspend fun output(codeGenerator: ICodeGenerator) {
+        parentJob.complete()
+        parentJob.join()
 
         println("Compiled Units: ${compiledUnits.size}")
+
+        codeGenerator.generateCode(compiledUnits.values)
     }
 
     private suspend fun compile(
@@ -97,14 +99,12 @@ class CompileService(
                     pendingCompilation.remove(fileName)
 
                     it.measure("type gather") {
-                        compilationUnit.file.accept(TypeGather())
+                        compilationUnit.file.accept(TypeGather(global))
                     }
-                    printFlushed("gather $fileName")
 
                     it.measure("execution") {
                         compilationUnit.file.accept(ExecutionVisitor(compilationContext, this@CompileService))
                     }
-                    printFlushed("executed $fileName")
                 }
             }
 

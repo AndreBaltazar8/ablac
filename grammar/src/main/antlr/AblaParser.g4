@@ -12,7 +12,7 @@ fileDeclaration : functionDeclaration # functionDeclarationFD
                 ;
 
 functionDeclaration: FUN functionName = simpleIdentifier functionBody? ;
-compilerCall: COMPILER_DIRECTIVE functionCall ;
+compilerCall : COMPILER_DIRECTIVE simpleIdentifier callSuffix+ ;
 
 functionBody : block # blockBody
              | ARROW expression # lambdaBody
@@ -23,13 +23,29 @@ block : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
 statement : expression # expressionStatement
           ;
 
-expression : simpleIdentifier # identifierExpression
-           | COMPILER_DIRECTIVE expression # compilerExecution
-           | functionCall # functionCallExpression
-           | literal # literalConstantExpression
+expression : prefixUnaryOperation expression # perfixExpression
+           | primaryExpression postfixUnarySuffix* # suffixExpression
            ;
 
-functionCall : simpleIdentifier LPAREN (expression (COMMA expression)* COMMA?) RPAREN ;
+primaryExpression : simpleIdentifier # simpleIdentifierExpression
+                  | literal # literalExpression
+                  ;
+
+prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
+                     ;
+
+postfixUnarySuffix : callSuffix # callSuffixSuffix
+                   ;
+
+callSuffix : valueArguments
+           ;
+
+valueArguments : LPAREN RPAREN
+               | LPAREN valueArgument (COMMA valueArgument)* COMMA? RPAREN
+               ;
+
+valueArgument : expression
+              ;
 
 literal : stringLiteral # stringLiteralLiteral
         | IntegerLiteral # integerLiteral

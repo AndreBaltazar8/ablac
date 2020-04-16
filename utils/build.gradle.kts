@@ -5,11 +5,7 @@ plugins {
 }
 
 dependencies {
-    implementation(platform(Dependencies.KOTLIN_BOM))
-    implementation(Dependencies.KOTLIN_STDLIB)
+    commonDependencies()
     implementation(Dependencies.KOIN)
     implementation(Dependencies.KOTLINX_COROUTINES_CORE)
-
-    testImplementation(Dependencies.KOTLIN_TEST)
-    testImplementation(Dependencies.KOTLIN_TEST_JUNIT)
 }

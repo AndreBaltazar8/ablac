@@ -4,7 +4,10 @@ import dev.ablac.language.ASTVisitor
 import dev.ablac.language.Identifier
 import dev.ablac.language.Position
 
-class IdentifierExpression(val identifier: Identifier, override val position: Position) : Expression {
+class IdentifierExpression(
+    val identifier: Identifier,
+    override val position: Position
+) : PrimaryExpression {
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }

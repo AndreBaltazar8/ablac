@@ -1,4 +1,4 @@
-package dev.ablac.frontend
+package dev.ablac.common
 
 import dev.ablac.language.nodes.File
 

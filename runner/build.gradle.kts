@@ -5,19 +5,16 @@ plugins {
 }
 
 dependencies {
-    implementation(platform(Dependencies.KOTLIN_BOM))
-    implementation(Dependencies.KOTLIN_STDLIB)
+    commonDependencies()
     implementation(Dependencies.KOIN)
     implementation(Dependencies.KOTLINX_COROUTINES_CORE)
 
     implementation(project(":grammar"))
     implementation(project(":language"))
     implementation(project(":frontend"))
-    implementation(project(":backend"))
+    implementation(project(":backend-llvm"))
+    implementation(project(":common"))
     implementation(project(":utils"))
-
-    testImplementation(Dependencies.KOTLIN_TEST)
-    testImplementation(Dependencies.KOTLIN_TEST_JUNIT)
 }
 
 application {
