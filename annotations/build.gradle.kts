@@ -4,6 +4,4 @@ plugins {
     `java-library`
 }
 
-dependencies {
-    commonDependencies()
-}
+projectCommon()

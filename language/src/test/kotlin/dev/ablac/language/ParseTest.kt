@@ -1,14 +1,22 @@
 package dev.ablac.language
 
 import dev.ablac.utils.MeasurementService
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
 import kotlin.concurrent.thread
 import kotlin.random.Random
-import kotlin.test.Test
-import kotlin.test.assertTrue
 
 class ParseTest {
     @Test
-    fun testParseEfficiency() {
+    fun `1warmup`() = measureEfficiency("fun hi { 1 }", 10000)
+
+    @Test
+    fun testParseEfficiency() = measureEfficiency("fun hi { 1 }", 4500)
+
+    @Test
+    fun testParseEfficiencyExtern() = measureEfficiency("fun hi ", 1000)
+
+    private fun measureEfficiency(code: String, expected: Long) {
         val measurementService = MeasurementService()
         val parseService = ParseService()
         val threads = mutableListOf<Thread>()
@@ -21,7 +29,7 @@ class ParseTest {
                         val random = Random.Default
                         while (lines > 0) {
                             val numLines = random.nextInt(1, minOf(lines, 1000) + 1)
-                            parseService.parseSource("source", "fun hi ".repeat(numLines), it)
+                            parseService.parseSource("source", code.repeat(numLines), it)
                             lines -= numLines
                         }
                     }
@@ -32,6 +40,6 @@ class ParseTest {
 
         val lastMeasurement = measurementService.measurements.last()
         lastMeasurement.print()
-        assertTrue(lastMeasurement.timeElapsed < 1_000_000_000L)
+        assertTrue(lastMeasurement.timeElapsed < expected * 1_000_000L)
     }
 }

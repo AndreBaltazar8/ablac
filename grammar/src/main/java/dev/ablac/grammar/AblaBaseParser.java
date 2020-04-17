@@ -17,6 +17,7 @@ abstract class AblaBaseParser extends Parser {
             token = getTokenStream().get(getCurrentToken().getTokenIndex() - tokensBehind);
             if (token.getType() == AblaParser.NL || token.getType() == AblaParser.DelimitedComment && (token.getText().contains("\n") || token.getText().contains("\r")))
                 return true;
+            tokensBehind++;
         } while (token.getChannel() == Lexer.HIDDEN);
         return true;
     }

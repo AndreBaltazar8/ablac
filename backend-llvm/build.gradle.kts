@@ -2,9 +2,9 @@ plugins {
     kotlin("jvm")
 }
 
-dependencies {
-    commonDependencies()
+projectCommon()
 
+dependencies {
     implementation(Dependencies.KOIN)
     implementation(Dependencies.KOTLINX_COROUTINES_CORE)
     implementation(Dependencies.LLVM)

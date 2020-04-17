@@ -1,13 +1,13 @@
 package dev.ablac.runner
 
+import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 import org.koin.core.context.startKoin
 import org.koin.core.context.stopKoin
-import kotlin.test.AfterTest
-import kotlin.test.BeforeTest
-import kotlin.test.Test
 
 class RunnerTest {
-    @BeforeTest
+    @BeforeEach
     fun before() {
         startKoin {
             printLogger()
@@ -15,7 +15,7 @@ class RunnerTest {
         }
     }
 
-    @AfterTest
+    @AfterEach
     fun tearDown() {
         stopKoin()
     }

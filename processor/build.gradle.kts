@@ -5,8 +5,9 @@ plugins {
     `java-library`
 }
 
+projectCommon()
+
 dependencies {
-    commonDependencies()
     implementation(Dependencies.KOTLIN_POET)
     implementation(Dependencies.AUTO_SERVICE)
     implementation(kotlin("compiler"))

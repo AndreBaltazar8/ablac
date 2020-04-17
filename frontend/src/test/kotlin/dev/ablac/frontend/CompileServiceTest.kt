@@ -1,6 +1,6 @@
 package dev.ablac.frontend
 
-import kotlin.test.Test
+import org.junit.jupiter.api.Test
 
 class CompileServiceTest {
     @Test

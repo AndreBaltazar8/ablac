@@ -1,8 +1,8 @@
 package dev.ablac.language.nodes
 
 import dev.ablac.language.positionZero
-import kotlin.test.Test
-import kotlin.test.assertEquals
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Test
 
 class TypeTest {
     @Test

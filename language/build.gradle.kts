@@ -5,9 +5,9 @@ plugins {
     `java-library`
 }
 
-dependencies {
-    commonDependencies()
+projectCommon()
 
+dependencies {
     kapt(project(":processor"))
     compileOnly(project(":annotations"))
 
