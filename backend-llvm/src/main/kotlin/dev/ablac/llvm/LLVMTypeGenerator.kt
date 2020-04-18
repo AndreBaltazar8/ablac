@@ -122,6 +122,9 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         val function = module.addFunction(functionDeclaration.name, LLVMInt32Type(), argTypes)
         functionDeclaration.llvmValue = function
 
+        if (functionDeclaration.isExtern)
+            function.setLinkage(LLVMExternalLinkage)
+
         functionDeclaration.block?.let {
             function.appendBasicBlock("entry") {
                 functionDeclaration.llvmBlock = this

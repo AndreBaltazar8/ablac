@@ -1,5 +1,7 @@
 package dev.ablac.frontend
 
+import com.sun.jna.Native
+import com.sun.jna.NativeLibrary
 import dev.ablac.common.Symbol
 import dev.ablac.common.SymbolTable
 import dev.ablac.common.symbolTable
@@ -7,6 +9,7 @@ import dev.ablac.language.ASTVisitor
 import dev.ablac.language.nodes.*
 import dev.ablac.language.positionZero
 import dev.ablac.utils.printFlushed
+import jdk.dynalink.DynamicLinker
 import kotlinx.coroutines.Job
 import java.nio.file.FileSystems
 import java.nio.file.Paths
@@ -53,7 +56,18 @@ class ExecutionVisitor(
                 if (functionDeclaration.block != null) {
                     functionDeclaration.block!!.accept(this)
                 } else {
-                    TODO("Extern implementation missing")
+                    val extern = functionDeclaration.modifiers.first { it is Extern } as Extern
+                    if (extern.libName == null)
+                        throw Exception("Must specify lib name in extern to run at compile time")
+                    val result = NativeLibrary.getInstance(extern.libName!!.toValue(currentScope!!) as String)
+                        .getFunction(functionDeclaration.name)
+                        .invoke(
+                            Int::class.java,
+                            functionDeclaration.parameters.map {
+                                currentScope!![it.name].toValue(currentScope!!)
+                            }.toTypedArray()
+                        )
+                    values.push(Integer(result.toString(), positionZero))
                 }
 
                 val returnValue = values.pop()
@@ -113,7 +127,11 @@ class ExecutionVisitor(
                 val file = Paths.get(workingDirectory, importName.substring(1, importName.length - 1)).toAbsolutePath()
                     .toString()
 
-                compilerService.compileFile(file, parallel = true, compilationContext = CompilationContext(job, Job(job)))
+                compilerService.compileFile(
+                    file,
+                    parallel = true,
+                    compilationContext = CompilationContext(job, Job(job))
+                )
                 values.add(Integer("1", positionZero))
             } else {
                 requirePendingImports()
@@ -142,3 +160,10 @@ class ExecutionVisitor(
         currentScope = currentScope!!.parent
     }
 }
+
+private fun Literal?.toValue(currentScope: ExecutionScope): Any =
+    when (this) {
+        is Integer -> number.toInt()
+        is StringLiteral -> string.substring(1, string.length - 1)
+        else -> throw Exception("Unknown literal conversion")
+    }

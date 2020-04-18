@@ -26,7 +26,11 @@ class TypeGather(val global: SymbolTable) : ASTVisitor() {
         tables.push(table)
         functionDeclaration.symbolTable = table
 
-        // TODO: extern/abstract
+        val extern = functionDeclaration.isExtern
+        if (extern && functionDeclaration.block != null)
+            throw Exception("Extern function cannot have a body")
+        if (!extern && functionDeclaration.block == null)
+            throw Exception("Function must have a body or be declared extern or abstract")
 
         functionDeclaration.parameters.forEach {
             table.symbols.add(Symbol.Variable(it.name, it))

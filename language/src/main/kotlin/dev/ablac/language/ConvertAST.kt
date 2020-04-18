@@ -26,8 +26,21 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
             it.parameter().toAST()
         }?.toTypedArray() ?: arrayOf(),
         functionBody()?.toAST(),
+        modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
         position
     )
+
+fun AblaParser.ModifierContext.toAST(): Modifier =
+    when (this) {
+        is AblaParser.FunctionModifierModifierContext -> functionModifier().toAST()
+        else -> throw IllegalStateException("Unknown modifier type ${this::class.simpleName}")
+    }
+
+fun AblaParser.FunctionModifierContext.toAST(): Modifier =
+    when (this) {
+        is AblaParser.ExternModifierContext -> Extern(stringLiteral()?.toAST(), position)
+        else -> throw IllegalStateException("Unknown function modifier type ${this::class.simpleName}")
+    }
 
 fun AblaParser.ParameterContext.toAST() =
     Parameter(simpleIdentifier().text, Type("int", arrayOf(), positionZero), position)
@@ -81,7 +94,7 @@ fun AblaParser.PrefixUnaryOperationContext.toAST(expression: Expression) =
         else -> throw IllegalStateException("Unknown prefix unary operation type ${this::class.simpleName}")
     }
 
-fun AblaParser.PrimaryExpressionContext.toAST() : PrimaryExpression =
+fun AblaParser.PrimaryExpressionContext.toAST(): PrimaryExpression =
     when (this) {
         is AblaParser.SimpleIdentifierExpressionContext -> simpleIdentifier().toAST()
         is AblaParser.LiteralExpressionContext -> literal().toAST()
@@ -99,6 +112,8 @@ fun AblaParser.SimpleIdentifierContext.toAST(): IdentifierExpression = Identifie
 fun AblaParser.LiteralContext.toAST(): Literal =
     when (this) {
         is AblaParser.IntegerLiteralContext -> Integer(text, position)
-        is AblaParser.StringLiteralLiteralContext -> StringLiteral(text, position)
+        is AblaParser.StringLiteralLiteralContext -> stringLiteral().toAST()
         else -> throw IllegalStateException("Unknown literal type ${this::class.simpleName}")
     }
+
+fun AblaParser.StringLiteralContext.toAST() = StringLiteral(text, position)

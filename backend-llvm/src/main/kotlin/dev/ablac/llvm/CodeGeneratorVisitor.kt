@@ -7,29 +7,32 @@ import dev.ablac.language.nodes.*
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.LLVMModuleRef
 import org.bytedeco.llvm.LLVM.LLVMTypeRef
-import org.bytedeco.llvm.global.LLVM
+import org.bytedeco.llvm.global.LLVM.*
 
 class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     private val generatorContext = GeneratorContext()
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
+        if (functionDeclaration.isExtern)
+            return
+
         val function = functionDeclaration.llvmValue!!
         if (functionDeclaration.name == "main") {
             function.setName("%%_main")
 
-            module.addFunction("main", LLVM.LLVMInt16Type(), arrayOf())
-                .setLinkage(LLVM.LLVMExternalLinkage)
+            module.addFunction("main", LLVMInt16Type(), arrayOf())
+                .setLinkage(LLVMExternalLinkage)
                 .appendBasicBlock("entry") {
-                    val builder = LLVM.LLVMCreateBuilder()
-                    LLVM.LLVMPositionBuilderAtEnd(builder, this)
-                    val call = LLVM.LLVMBuildCall(
+                    val builder = LLVMCreateBuilder()
+                    LLVMPositionBuilderAtEnd(builder, this)
+                    val call = LLVMBuildCall(
                         builder,
                         functionDeclaration.llvmValue!!,
                         PointerPointer<LLVMTypeRef>(),
                         0,
                         "main()"
                     )
-                    LLVM.LLVMBuildRet(builder, call)
+                    LLVMBuildRet(builder, call)
                 }
         }
 
@@ -43,9 +46,9 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             // CHECK FOR TYPE
 
             currentBlock.block.also {
-                val builder = LLVM.LLVMCreateBuilder()
-                LLVM.LLVMPositionBuilderAtEnd(builder, it)
-                LLVM.LLVMBuildRet(builder, generatorContext.topValue)
+                val builder = LLVMCreateBuilder()
+                LLVMPositionBuilderAtEnd(builder, it)
+                LLVMBuildRet(builder, generatorContext.topValue)
             }
             currentBlock.hasReturned = true
         }
@@ -65,15 +68,15 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val function = currentBlock.table.find(
             (functionCall.primaryExpression as IdentifierExpression).identifier
         ) as Symbol.Function
-        val builder = LLVM.LLVMCreateBuilder()
-        LLVM.LLVMPositionBuilderAtEnd(builder, currentBlock.block)
+        val builder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(builder, currentBlock.block)
 
         val args = functionCall.arguments.map {
             it.value.accept(this)
             generatorContext.topValuePop
         }.toTypedArray()
 
-        val value = LLVM.LLVMBuildCall(
+        val value = LLVMBuildCall(
             builder,
             function.node.llvmValue,
             PointerPointer(*args),
@@ -84,7 +87,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(integer: Integer) {
-        generatorContext.values.push(LLVM.LLVMConstInt(LLVM.LLVMInt32Type(), integer.number.toLong(), 0))
+        generatorContext.values.push(LLVMConstInt(LLVMInt32Type(), integer.number.toLong(), 0))
         super.visit(integer)
     }
 }

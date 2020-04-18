@@ -8,6 +8,7 @@ WS : [\u0020\u0009\u000C]+ -> channel(HIDDEN) ;
 NL: ('\n' | '\r' '\n'?) -> channel(HIDDEN) ;
 
 ASSIGNMENT : '=' ;
+COLON : ':' ;
 COMMA : ',' ;
 COMPILER_DIRECTIVE : '#' ;
 LCURL : '{' ;
@@ -17,6 +18,8 @@ RPAREN : ')' ;
 ARROW : '=>' ;
 FUN : 'fun' ;
 SEMICOLON : ';' ;
+AT : '@' ;
+EXTERN : 'extern' ;
 
 BooleanLiteral : 'true' | 'false' ;
 IntegerLiteral : DigitNoZero DigitOrSeparator* Digit | Digit ;

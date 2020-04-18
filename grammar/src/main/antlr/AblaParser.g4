@@ -11,10 +11,20 @@ fileDeclaration : functionDeclaration # functionDeclarationFD
                 | compilerCall # compilerCallFD
                 ;
 
-functionDeclaration: FUN functionName = simpleIdentifier functionDeclarationParameters? functionBody? ;
+functionDeclaration: modifierList? FUN functionName = simpleIdentifier functionDeclarationParameters? functionBody? ;
 functionDeclarationParameters : LPAREN (functionDeclarationParameter (COMMA functionDeclarationParameter)* COMMA?)? RPAREN ;
 functionDeclarationParameter : parameter (ASSIGNMENT expression)? ;
 parameter : simpleIdentifier ;
+
+annotation : simpleIdentifier valueArguments? ;
+annotations : (AT annotation (COMMA annotation)*)+ ;
+
+modifierList : annotations | annotations? modifier+ ;
+
+modifier : functionModifier # functionModifierModifier ;
+
+functionModifier : EXTERN (COLON stringLiteral) # externModifier
+                 ;
 
 compilerCall : COMPILER_DIRECTIVE simpleIdentifier callSuffix+ ;
 

@@ -34,6 +34,7 @@ object Dependencies {
     const val ANTLR = "org.antlr:antlr4:4.8-1"
     const val KOIN = "org.koin:koin-core:2.1.5"
     const val LLVM = "org.bytedeco:llvm-platform:10.0.0-1.5.3"
+    const val JNA = "net.java.dev.jna:jna-platform:5.5.0"
 
     const val JUNIT_JUPITER = "org.junit.jupiter:junit-jupiter:5.6.2"
 }
