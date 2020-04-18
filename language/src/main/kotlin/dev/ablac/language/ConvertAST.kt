@@ -67,12 +67,18 @@ fun AblaParser.ValueArgumentContext.toAST() =
 
 fun AblaParser.ExpressionContext.toAST(): Expression =
     when (this) {
-        is AblaParser.PerfixExpressionContext -> IdentifierExpression(text, position)
+        is AblaParser.PerfixExpressionContext -> prefixUnaryOperation().toAST(expression().toAST())
         is AblaParser.SuffixExpressionContext ->
             postfixUnarySuffix().fold<AblaParser.PostfixUnarySuffixContext, PrimaryExpression>(primaryExpression().toAST()) { acc, suffix ->
                 suffix.toAST(acc)
             }
         else -> throw IllegalStateException("Unknown expression type ${this::class.simpleName}")
+    }
+
+fun AblaParser.PrefixUnaryOperationContext.toAST(expression: Expression) =
+    when (this) {
+        is AblaParser.CompilerExecutionContext -> CompilerExec(expression, position)
+        else -> throw IllegalStateException("Unknown prefix unary operation type ${this::class.simpleName}")
     }
 
 fun AblaParser.PrimaryExpressionContext.toAST() : PrimaryExpression =

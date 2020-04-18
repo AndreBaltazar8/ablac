@@ -11,8 +11,12 @@ class LLVMCodeGenerator : ILLVMCodeGenerator {
 
     override suspend fun generateCode(compilationUnits: Collection<CompilationUnit>) {
         module = LLVMModuleCreateWithName("main_module")
+        LLVMSetTarget(module, LLVMGetDefaultTargetTriple())
+
         compilationUnits.forEach { it.file.accept(LLVMTypeGenerator(module)) }
         compilationUnits.forEach { it.file.accept(CodeGeneratorVisitor(module)) }
+
+        LLVMWriteBitcodeToFile(module, "file.bc")
         LLVMDumpModule(module)
     }
 }

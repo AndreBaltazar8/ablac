@@ -68,7 +68,6 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val builder = LLVM.LLVMCreateBuilder()
         LLVM.LLVMPositionBuilderAtEnd(builder, currentBlock.block)
 
-
         val args = functionCall.arguments.map {
             it.value.accept(this)
             generatorContext.topValuePop

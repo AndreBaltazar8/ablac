@@ -1,11 +1,16 @@
 package dev.ablac.frontend
 
+import dev.ablac.common.Symbol
+import dev.ablac.common.SymbolTable
+import dev.ablac.common.symbolTable
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.nodes.*
 import dev.ablac.language.positionZero
+import dev.ablac.utils.printFlushed
 import kotlinx.coroutines.Job
 import java.nio.file.FileSystems
 import java.nio.file.Paths
+import java.util.*
 
 class ExecutionVisitor(
     private val compilationContext: CompilationContext?,
@@ -15,53 +20,106 @@ class ExecutionVisitor(
         compilationContext?.job?.complete()
     }
 
-    private var _fileName: String? = null
+    private var fileName: String? = null
     private val workingDirectory: String
-        get() = _fileName!!.let { fileName ->
+        get() = fileName!!.let { fileName ->
             if (fileName.contains("<"))
                 FileSystems.getDefault().getPath("").toAbsolutePath().toString()
             else
                 java.io.File(fileName).parent.toString()
         }
 
-    private var _executionLayer = 0
-    private var _values = mutableListOf<Any>()
-    override suspend fun visit(file: File) {
-        _fileName = file.fileName
+    private var executionLayer = 0
+    private var values = Stack<Literal>()
+    private var currentScope: ExecutionScope? = null
+    private val currentTable get() = currentScope?.symbolTable
 
-        super.visit(file)
-        job.complete()
+    override suspend fun visit(file: File) {
+        fileName = file.fileName
+        withTable(file.symbolTable) {
+            super.visit(file)
+            job.complete()
+        }
+    }
+
+    override suspend fun visit(functionDeclaration: FunctionDeclaration) {
+        withTable(functionDeclaration.symbolTable) {
+            if (executionLayer > 0) {
+                functionDeclaration.parameters.forEach {
+                    currentScope!![it.name] = values.pop()
+                }
+
+                val numValues = values.size
+                if (functionDeclaration.block != null) {
+                    functionDeclaration.block!!.accept(this)
+                } else {
+                    TODO("Extern implementation missing")
+                }
+
+                val returnValue = values.pop()
+                repeat(values.size - numValues) {
+                    values.pop()
+                }
+                values.push(returnValue)
+            } else
+                super.visit(functionDeclaration)
+        }
+    }
+
+    override suspend fun visit(identifierExpression: IdentifierExpression) {
+        if (executionLayer > 0)
+            values.push(currentScope!![identifierExpression.identifier])
     }
 
     override suspend fun visit(compilerExec: CompilerExec) {
         if (!compilerExec.compiled) {
-            _executionLayer++
+            executionLayer++
             super.visit(compilerExec)
             compilerExec.compiled = true
-            compilerExec.expression = Integer("1", positionZero)
-            _executionLayer--
+            compilerExec.expression = values.pop()
+            executionLayer--
         } else {
             super.visit(compilerExec)
         }
     }
 
     override suspend fun visit(stringLiteral: StringLiteral) {
-        _values.add(stringLiteral)
+        if (executionLayer > 0)
+            values.add(stringLiteral)
+    }
+
+    override suspend fun visit(integer: Integer) {
+        if (executionLayer > 0)
+            values.add(integer)
     }
 
     override suspend fun visit(functionCall: FunctionCall) {
-        if (_executionLayer > 0) {
+        functionCall.arguments.forEach {
+            it.value.accept(this)
+        }
+
+        functionCall.primaryExpression.accept(this)
+
+        if (executionLayer > 0) {
+            values.pop()
             val primaryExpression = functionCall.primaryExpression
-            if (primaryExpression is IdentifierExpression && primaryExpression.identifier == "import") {
+            val functionName = (primaryExpression as IdentifierExpression).identifier
+
+            if (functionName == "import") {
+                values.pop()
                 functionCall.arguments[0].value.accept(this)
 
-                val importName = (_values.removeAt(_values.lastIndex) as StringLiteral).string
+                val importName = (values.removeAt(values.lastIndex) as StringLiteral).string
                 val file = Paths.get(workingDirectory, importName.substring(1, importName.length - 1)).toAbsolutePath()
                     .toString()
 
                 compilerService.compileFile(file, parallel = true, compilationContext = CompilationContext(job, Job(job)))
+                values.add(Integer("1", positionZero))
             } else {
                 requirePendingImports()
+
+                val function = currentTable?.find(functionName) as Symbol.Function
+                function.node.accept(this)
             }
         } else
             super.visit(functionCall)
@@ -76,5 +134,11 @@ class ExecutionVisitor(
         job.complete()
         job.join()
         job = newJob
+    }
+
+    private suspend fun withTable(symbolTable: SymbolTable?, function: suspend () -> Unit) {
+        currentScope = ExecutionScope(currentScope, symbolTable!!)
+        function()
+        currentScope = currentScope!!.parent
     }
 }
