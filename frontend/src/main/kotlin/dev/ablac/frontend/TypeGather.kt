@@ -8,7 +8,7 @@ import dev.ablac.language.nodes.File
 import dev.ablac.language.nodes.FunctionDeclaration
 import java.util.*
 
-class TypeGather(val global: SymbolTable) : ASTVisitor() {
+class TypeGather(private val global: SymbolTable) : ASTVisitor() {
     private val tables = Stack<SymbolTable>().apply {
         push(global)
     }

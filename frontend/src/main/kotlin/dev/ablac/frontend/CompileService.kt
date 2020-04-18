@@ -1,15 +1,15 @@
 package dev.ablac.frontend
 
-import dev.ablac.common.CompilationUnit
-import dev.ablac.common.ICodeGenerator
-import dev.ablac.common.SymbolTable
+import dev.ablac.common.*
 import dev.ablac.language.IParseService
-import dev.ablac.language.nodes.File
+import dev.ablac.language.nodes.*
+import dev.ablac.language.positionZero
 import dev.ablac.utils.ILockService
 import dev.ablac.utils.IMeasurementService
 import dev.ablac.utils.MeasurementScope
 import kotlinx.coroutines.*
 import java.io.InputStream
+import java.nio.file.Paths
 import java.util.*
 
 interface ICompileService {
@@ -28,6 +28,7 @@ class CompileService(
     private val coroutineScope = CoroutineScope(parentJob + Dispatchers.Default)
 
     private val global = SymbolTable()
+
     private val pendingCompilation = Collections.synchronizedMap(mutableMapOf<String, PendingCompilationUnit>())
     private val compiledUnits = Collections.synchronizedMap(mutableMapOf<String, CompilationUnit>())
     private var compileNumber: Int = 0
@@ -103,7 +104,7 @@ class CompileService(
                     }
 
                     it.measure("execution") {
-                        compilationUnit.file.accept(ExecutionVisitor(compilationContext, this@CompileService))
+                        compilationUnit.file.accept(ExecutionVisitor(compilationContext))
                     }
                 }
             }
@@ -118,6 +119,31 @@ class CompileService(
             if (!parallel)
                 job.join()
         }
+    }
+
+    init {
+        addCompileFunction("import", arrayOf(Parameter("fileName", BuiltInTypes.String))) { executionVisitor, args ->
+            val importName = args[0] as String
+            val file = Paths.get(executionVisitor.workingDirectory, importName).toAbsolutePath().toString()
+
+            compileFile(
+                file,
+                true,
+                CompilationContext(executionVisitor.executionJob, Job(executionVisitor.executionJob))
+            )
+
+            Integer("1", positionZero)
+        }
+    }
+
+    private fun addCompileFunction(
+        name: String,
+        parameters: Array<Parameter> = arrayOf(),
+        modifiers: Array<Modifier> = arrayOf(),
+        executionBlock: suspend (ExecutionVisitor, Array<Any>) -> Literal
+    ) {
+        val declaration = CompilerFunctionDeclaration(name, parameters, arrayOf(*modifiers, Compile), executionBlock)
+        global.symbols.add(Symbol.Function(name, declaration))
     }
 
     data class PendingCompilationUnit(val fileName: String, val parse: suspend (MeasurementScope) -> File, var job: Job)

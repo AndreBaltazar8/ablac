@@ -3,8 +3,13 @@ package dev.ablac.language.nodes
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.Identifier
 import dev.ablac.language.Position
+import dev.ablac.language.positionZero
 
-data class Type(val identifier: Identifier, val types: Array<Type>, override val position: Position) : Node {
+data class Type(
+    val identifier: Identifier,
+    val types: Array<Type> = arrayOf(),
+    override val position: Position = positionZero
+) : Node {
     val isGeneric = types.isNotEmpty()
 
     fun toHuman(): String {

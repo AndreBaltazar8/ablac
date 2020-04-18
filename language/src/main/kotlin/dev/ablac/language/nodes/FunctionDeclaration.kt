@@ -3,7 +3,7 @@ package dev.ablac.language.nodes
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.Position
 
-data class FunctionDeclaration(
+open class FunctionDeclaration(
     val name: String,
     val parameters: Array<Parameter>,
     val block: Block?,

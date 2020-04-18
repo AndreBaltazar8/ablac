@@ -65,9 +65,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(functionCall: FunctionCall) {
         val currentBlock = generatorContext.topBlock
-        val function = currentBlock.table.find(
-            (functionCall.primaryExpression as IdentifierExpression).identifier
-        ) as Symbol.Function
+        val functionName = (functionCall.primaryExpression as IdentifierExpression).identifier
+        val symbol = currentBlock.table.find(functionName) ?: throw Exception("Unknown function $functionName")
+        val function = symbol as Symbol.Function
+
         val builder = LLVMCreateBuilder()
         LLVMPositionBuilderAtEnd(builder, currentBlock.block)
 

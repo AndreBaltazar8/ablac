@@ -4,3 +4,4 @@ import dev.ablac.language.Position
 
 interface Modifier
 data class Extern(val libName: StringLiteral?, val position: Position) : Modifier
+object Compile : Modifier

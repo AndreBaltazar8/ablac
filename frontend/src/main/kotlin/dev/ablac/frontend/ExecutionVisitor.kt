@@ -1,6 +1,5 @@
 package dev.ablac.frontend
 
-import com.sun.jna.Native
 import com.sun.jna.NativeLibrary
 import dev.ablac.common.Symbol
 import dev.ablac.common.SymbolTable
@@ -8,23 +7,20 @@ import dev.ablac.common.symbolTable
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.nodes.*
 import dev.ablac.language.positionZero
-import dev.ablac.utils.printFlushed
-import jdk.dynalink.DynamicLinker
 import kotlinx.coroutines.Job
 import java.nio.file.FileSystems
-import java.nio.file.Paths
 import java.util.*
 
 class ExecutionVisitor(
-    private val compilationContext: CompilationContext?,
-    private val compilerService: ICompileService
+    private val compilationContext: CompilationContext?
 ) : ASTVisitor() {
     private var job = Job(compilationContext?.parentJob).apply {
         compilationContext?.job?.complete()
     }
+    val executionJob get() = job
 
     private var fileName: String? = null
-    private val workingDirectory: String
+    val workingDirectory: String
         get() = fileName!!.let { fileName ->
             if (fileName.contains("<"))
                 FileSystems.getDefault().getPath("").toAbsolutePath().toString()
@@ -119,28 +115,23 @@ class ExecutionVisitor(
             val primaryExpression = functionCall.primaryExpression
             val functionName = (primaryExpression as IdentifierExpression).identifier
 
-            if (functionName == "import") {
-                values.pop()
-                functionCall.arguments[0].value.accept(this)
-
-                val importName = (values.removeAt(values.lastIndex) as StringLiteral).string
-                val file = Paths.get(workingDirectory, importName.substring(1, importName.length - 1)).toAbsolutePath()
-                    .toString()
-
-                compilerService.compileFile(
-                    file,
-                    parallel = true,
-                    compilationContext = CompilationContext(job, Job(job))
-                )
-                values.add(Integer("1", positionZero))
-            } else {
+            var symbol = currentTable?.find(functionName)
+            if (symbol == null) {
                 requirePendingImports()
-
-                val function = currentTable?.find(functionName) as Symbol.Function
-                function.node.accept(this)
+                symbol = currentTable?.find(functionName)
             }
-        } else
-            super.visit(functionCall)
+
+            val function = symbol as Symbol.Function
+
+            function.node.let {
+                if (it is CompilerFunctionDeclaration)
+                    values.add(it.executionBlock(this, functionCall.arguments.map {
+                        values.pop().toValue(currentScope!!)
+                    }.toTypedArray()))
+                else
+                    it.accept(this)
+            }
+        }
     }
 
     /*
@@ -161,7 +152,7 @@ class ExecutionVisitor(
     }
 }
 
-private fun Literal?.toValue(currentScope: ExecutionScope): Any =
+fun Literal?.toValue(currentScope: ExecutionScope): Any =
     when (this) {
         is Integer -> number.toInt()
         is StringLiteral -> string.substring(1, string.length - 1)

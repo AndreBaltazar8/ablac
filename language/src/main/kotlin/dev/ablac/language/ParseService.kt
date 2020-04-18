@@ -36,7 +36,7 @@ class ParseService : IParseService {
                 val charStream = try {
                     stream()
                 } catch (e: IOException) {
-                    throw RuntimeException()
+                    throw RuntimeException(e)
                 }
 
                 val lexer = AblaLexer(charStream)
