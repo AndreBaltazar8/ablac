@@ -3,14 +3,14 @@ package dev.ablac.common
 import dev.ablac.language.nodes.FunctionDeclaration
 import dev.ablac.language.nodes.Node
 
-sealed class Symbol(open val name: String) {
+sealed class Symbol<T : Node>(open val name: String, open val node: T) {
     data class Function(
         override val name: String,
-        val functionDeclaration: FunctionDeclaration
-    ) : Symbol(name)
+        override val node: FunctionDeclaration
+    ) : Symbol<FunctionDeclaration>(name, node)
 
     data class Variable(
         override val name: String,
-        val node: Node
-    ) : Symbol(name)
+        override val node: Node
+    ) : Symbol<Node>(name, node)
 }

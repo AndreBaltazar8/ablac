@@ -116,7 +116,10 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
-        val function = module.addFunction(functionDeclaration.name, LLVMInt32Type(), arrayOf())
+        val argTypes = functionDeclaration.parameters.map {
+            LLVMInt32Type()
+        }.toTypedArray()
+        val function = module.addFunction(functionDeclaration.name, LLVMInt32Type(), argTypes)
         functionDeclaration.llvmValue = function
 
         functionDeclaration.block?.let {
@@ -125,7 +128,8 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
                 blocks.push(this)
             }
 
-            // TODO: args
+            for ((index, param) in functionDeclaration.parameters.withIndex())
+                param.llvmValue = LLVMGetParam(function, index)
 
             it.accept(this)
 

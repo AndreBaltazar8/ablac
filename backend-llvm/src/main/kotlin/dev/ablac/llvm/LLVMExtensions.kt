@@ -11,7 +11,7 @@ import org.bytedeco.llvm.global.LLVM.*
 fun LLVMModuleRef.addFunction(
     name: String,
     returnType: LLVMTypeRef,
-    args: Array<LLVMValueRef>,
+    args: Array<LLVMTypeRef>,
     isVarArg: Boolean = false
 ): LLVMValueRef = LLVM.LLVMAddFunction(
     this,

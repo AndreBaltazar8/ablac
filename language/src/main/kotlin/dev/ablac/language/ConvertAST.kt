@@ -20,7 +20,17 @@ fun AblaParser.FileDeclarationContext.toAST(): Declaration =
     }
 
 fun AblaParser.FunctionDeclarationContext.toAST() =
-    FunctionDeclaration(functionName.text, functionBody()?.toAST(), position)
+    FunctionDeclaration(
+        functionName.text,
+        functionDeclarationParameters()?.functionDeclarationParameter()?.map {
+            it.parameter().toAST()
+        }?.toTypedArray() ?: arrayOf(),
+        functionBody()?.toAST(),
+        position
+    )
+
+fun AblaParser.ParameterContext.toAST() =
+    Parameter(simpleIdentifier().text, Type("int", arrayOf(), positionZero), position)
 
 fun AblaParser.FunctionBodyContext.toAST(): Block =
     when (this) {
@@ -48,9 +58,12 @@ fun AblaParser.CompilerCallContext.toAST() =
 fun AblaParser.CallSuffixContext.toAST(primaryExpression: PrimaryExpression) =
     FunctionCall(
         primaryExpression,
-        valueArguments().valueArgument().map { it.expression().toAST() }.toTypedArray(),
+        valueArguments().valueArgument().map { it.toAST() }.toTypedArray(),
         position
     )
+
+fun AblaParser.ValueArgumentContext.toAST() =
+    Argument(simpleIdentifier()?.text, expression().toAST(), position)
 
 fun AblaParser.ExpressionContext.toAST(): Expression =
     when (this) {

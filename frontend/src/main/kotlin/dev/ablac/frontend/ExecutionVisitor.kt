@@ -3,15 +3,9 @@ package dev.ablac.frontend
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.nodes.*
 import dev.ablac.language.positionZero
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.withContext
-import java.io.IOException
-import java.lang.Exception
 import java.nio.file.FileSystems
 import java.nio.file.Paths
-import kotlin.coroutines.EmptyCoroutineContext
 
 class ExecutionVisitor(
     private val compilationContext: CompilationContext?,
@@ -59,7 +53,7 @@ class ExecutionVisitor(
         if (_executionLayer > 0) {
             val primaryExpression = functionCall.primaryExpression
             if (primaryExpression is IdentifierExpression && primaryExpression.identifier == "import") {
-                functionCall.parameters[0].accept(this)
+                functionCall.arguments[0].value.accept(this)
 
                 val importName = (_values.removeAt(_values.lastIndex) as StringLiteral).string
                 val file = Paths.get(workingDirectory, importName.substring(1, importName.length - 1)).toAbsolutePath()

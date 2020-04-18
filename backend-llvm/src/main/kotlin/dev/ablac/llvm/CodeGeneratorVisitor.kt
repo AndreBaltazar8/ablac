@@ -3,10 +3,7 @@ package dev.ablac.llvm
 import dev.ablac.common.Symbol
 import dev.ablac.common.symbolTable
 import dev.ablac.language.ASTVisitor
-import dev.ablac.language.nodes.FunctionCall
-import dev.ablac.language.nodes.FunctionDeclaration
-import dev.ablac.language.nodes.IdentifierExpression
-import dev.ablac.language.nodes.Integer
+import dev.ablac.language.nodes.*
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.LLVMModuleRef
 import org.bytedeco.llvm.LLVM.LLVMTypeRef
@@ -57,6 +54,12 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         generatorContext.popBlock(false)
     }
 
+    override suspend fun visit(identifierExpression: IdentifierExpression) {
+        val currentBlock = generatorContext.topBlock
+        val value = currentBlock.table.find(identifierExpression.identifier)
+        generatorContext.values.push(value!!.node.llvmValue)
+    }
+
     override suspend fun visit(functionCall: FunctionCall) {
         val currentBlock = generatorContext.topBlock
         val function = currentBlock.table.find(
@@ -64,11 +67,18 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         ) as Symbol.Function
         val builder = LLVM.LLVMCreateBuilder()
         LLVM.LLVMPositionBuilderAtEnd(builder, currentBlock.block)
+
+
+        val args = functionCall.arguments.map {
+            it.value.accept(this)
+            generatorContext.topValuePop
+        }.toTypedArray()
+
         val value = LLVM.LLVMBuildCall(
             builder,
-            function.functionDeclaration.llvmValue,
-            PointerPointer<LLVMTypeRef>(),
-            0,
+            function.node.llvmValue,
+            PointerPointer(*args),
+            functionCall.arguments.size,
             "${function.name}()"
         )
         generatorContext.values.push(value)

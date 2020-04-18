@@ -7,6 +7,7 @@ LineComment : '//' ~[\r\n]* -> channel(HIDDEN) ;
 WS : [\u0020\u0009\u000C]+ -> channel(HIDDEN) ;
 NL: ('\n' | '\r' '\n'?) -> channel(HIDDEN) ;
 
+ASSIGNMENT : '=' ;
 COMMA : ',' ;
 COMPILER_DIRECTIVE : '#' ;
 LCURL : '{' ;

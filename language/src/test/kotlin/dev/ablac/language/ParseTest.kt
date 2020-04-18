@@ -28,7 +28,7 @@ class ParseTest {
                         var lines = 125_000
                         val random = Random.Default
                         while (lines > 0) {
-                            val numLines = random.nextInt(1, minOf(lines, 1000) + 1)
+                            val numLines = random.nextInt(1, minOf(lines, 500) + 1)
                             parseService.parseSource("source", code.repeat(numLines), it)
                             lines -= numLines
                         }

@@ -5,7 +5,7 @@ import dev.ablac.language.Position
 
 data class FunctionCall(
     val primaryExpression: PrimaryExpression,
-    val parameters: Array<Expression>,
+    val arguments: Array<Argument>,
     override val position: Position
 ) : PrimaryExpression {
     override suspend fun accept(visitor: ASTVisitor) {

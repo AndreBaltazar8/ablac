@@ -26,7 +26,11 @@ class TypeGather(val global: SymbolTable) : ASTVisitor() {
         tables.push(table)
         functionDeclaration.symbolTable = table
 
-        // TODO: function args
+        // TODO: extern/abstract
+
+        functionDeclaration.parameters.forEach {
+            table.symbols.add(Symbol.Variable(it.name, it))
+        }
 
         functionDeclaration.block?.accept(this)
         tables.pop()

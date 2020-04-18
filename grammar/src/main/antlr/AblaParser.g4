@@ -11,7 +11,11 @@ fileDeclaration : functionDeclaration # functionDeclarationFD
                 | compilerCall # compilerCallFD
                 ;
 
-functionDeclaration: FUN functionName = simpleIdentifier functionBody? ;
+functionDeclaration: FUN functionName = simpleIdentifier functionDeclarationParameters? functionBody? ;
+functionDeclarationParameters : LPAREN (functionDeclarationParameter (COMMA functionDeclarationParameter)* COMMA?)? RPAREN ;
+functionDeclarationParameter : parameter (ASSIGNMENT expression)? ;
+parameter : simpleIdentifier ;
+
 compilerCall : COMPILER_DIRECTIVE simpleIdentifier callSuffix+ ;
 
 functionBody : block # blockBody
@@ -44,7 +48,7 @@ valueArguments : LPAREN RPAREN
                | LPAREN valueArgument (COMMA valueArgument)* COMMA? RPAREN
                ;
 
-valueArgument : expression
+valueArgument : (simpleIdentifier ASSIGNMENT)? expression
               ;
 
 literal : stringLiteral # stringLiteralLiteral

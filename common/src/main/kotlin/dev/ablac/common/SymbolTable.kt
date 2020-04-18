@@ -6,13 +6,13 @@ class SymbolTable(
     val parent: SymbolTable? = null
 ) {
     init {
-        parent?.let { it.children.add(this) }
+        parent?.children?.add(this)
     }
 
-    val children: MutableList<SymbolTable> = Collections.synchronizedList(mutableListOf<SymbolTable>())
-    val symbols: MutableList<Symbol> = Collections.synchronizedList(mutableListOf<Symbol>())
+    val children: MutableList<SymbolTable> = Collections.synchronizedList(mutableListOf())
+    val symbols: MutableList<Symbol<*>> = Collections.synchronizedList(mutableListOf())
 
-    fun find(name: String): Symbol? {
+    fun find(name: String): Symbol<*>? {
         synchronized(symbols) {
             for (sym in symbols) {
                 if (sym.name == name)

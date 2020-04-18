@@ -11,6 +11,8 @@ class GeneratorContext {
 
     val topBlock: CodeGenBlock get() = blocks.peek()
     val topValue: LLVMValueRef get() = values.peek()
+    val topValuePop: LLVMValueRef
+        get() = values.removeAt(values.lastIndex)
 
     fun pushBlock(block: LLVMBasicBlockRef, table: SymbolTable) =
         CodeGenBlock(block, table, blocks.firstOrNull()).also {
