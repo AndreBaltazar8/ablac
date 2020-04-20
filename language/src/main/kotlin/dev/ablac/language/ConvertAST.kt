@@ -71,7 +71,10 @@ fun AblaParser.CompilerCallContext.toAST() =
 fun AblaParser.CallSuffixContext.toAST(primaryExpression: PrimaryExpression) =
     FunctionCall(
         primaryExpression,
-        valueArguments().valueArgument().map { it.toAST() }.toTypedArray(),
+        listOfNotNull(
+            *(valueArguments()?.valueArgument()?.map { it.toAST() }?.toTypedArray() ?: arrayOf<Argument>()),
+            functionLiteral()?.toAST()?.run { Argument(null, this, this.position) }
+        ).toTypedArray(),
         position
     )
 
@@ -115,5 +118,11 @@ fun AblaParser.LiteralContext.toAST(): Literal =
         is AblaParser.StringLiteralLiteralContext -> stringLiteral().toAST()
         else -> throw IllegalStateException("Unknown literal type ${this::class.simpleName}")
     }
+
+fun AblaParser.FunctionLiteralContext.toAST() =
+    FunctionLiteral(
+        Block(statement().mapNotNull { it.toAST() }.toTypedArray(), position),
+        position
+    )
 
 fun AblaParser.StringLiteralContext.toAST() = StringLiteral(text, position)

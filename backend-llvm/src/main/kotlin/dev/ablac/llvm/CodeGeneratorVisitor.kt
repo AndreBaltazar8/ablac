@@ -1,6 +1,7 @@
 package dev.ablac.llvm
 
 import dev.ablac.common.Symbol
+import dev.ablac.common.SymbolTable
 import dev.ablac.common.symbolTable
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.nodes.*
@@ -48,7 +49,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             currentBlock.block.also {
                 val builder = LLVMCreateBuilder()
                 LLVMPositionBuilderAtEnd(builder, it)
-                LLVMBuildRet(builder, generatorContext.topValue)
+                if (generatorContext.values.isNotEmpty())
+                    LLVMBuildRet(builder, generatorContext.topValue)
+                else
+                    LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
             }
             currentBlock.hasReturned = true
         }
@@ -67,8 +71,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val currentBlock = generatorContext.topBlock
         val functionName = (functionCall.primaryExpression as IdentifierExpression).identifier
         val symbol = currentBlock.table.find(functionName) ?: throw Exception("Unknown function $functionName")
-        val function = symbol as Symbol.Function
-
+        //val function = symbol as Symbol.Function
         val builder = LLVMCreateBuilder()
         LLVMPositionBuilderAtEnd(builder, currentBlock.block)
 
@@ -79,10 +82,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         val value = LLVMBuildCall(
             builder,
-            function.node.llvmValue,
+            symbol.node.llvmValue,
             PointerPointer(*args),
             functionCall.arguments.size,
-            "${function.name}()"
+            "${symbol.name}()"
         )
         generatorContext.values.push(value)
     }
@@ -90,5 +93,30 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     override suspend fun visit(integer: Integer) {
         generatorContext.values.push(LLVMConstInt(LLVMInt32Type(), integer.number.toLong(), 0))
         super.visit(integer)
+    }
+
+    override suspend fun visit(functionLiteral: FunctionLiteral) {
+        val numValues = generatorContext.values.size
+        val block = functionLiteral.llvmBlock!!
+        val currentBlock = generatorContext.pushBlock(block, generatorContext.topBlock.table)
+        functionLiteral.block.accept(this)
+        if (!currentBlock.hasReturned) {
+            // CHECK FOR TYPE
+
+            currentBlock.block.also {
+                val builder = LLVMCreateBuilder()
+                LLVMPositionBuilderAtEnd(builder, it)
+                if (generatorContext.values.isNotEmpty())
+                    LLVMBuildRet(builder, generatorContext.topValue)
+                else
+                    LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
+            }
+            currentBlock.hasReturned = true
+        }
+        repeat(generatorContext.values.size - numValues) {
+            generatorContext.values.pop()
+        }
+        generatorContext.popBlock(false)
+        generatorContext.values.push(functionLiteral.llvmValue!!)
     }
 }

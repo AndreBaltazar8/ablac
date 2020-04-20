@@ -20,6 +20,6 @@ class Runner : KoinComponent {
 
             compileService.output(llvmCodeGenerator)
         }
-        measurementService.print()
+        measurementService.measurements.last().print()
     }
 }

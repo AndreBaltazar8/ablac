@@ -103,6 +103,11 @@ class ExecutionVisitor(
             values.add(integer)
     }
 
+    override suspend fun visit(functionLiteral: FunctionLiteral) {
+        if (executionLayer > 0)
+            values.add(functionLiteral)
+    }
+
     override suspend fun visit(functionCall: FunctionCall) {
         functionCall.arguments.forEach {
             it.value.accept(this)
@@ -111,24 +116,36 @@ class ExecutionVisitor(
         functionCall.primaryExpression.accept(this)
 
         if (executionLayer > 0) {
-            values.pop()
-            val primaryExpression = functionCall.primaryExpression
-            val functionName = (primaryExpression as IdentifierExpression).identifier
+            val topVal = values.pop()
 
-            var symbol = currentTable?.find(functionName)
-            if (symbol == null) {
-                requirePendingImports()
-                symbol = currentTable?.find(functionName)
+            val function = if (topVal is FunctionLiteral)
+                topVal
+            else {
+                val primaryExpression = functionCall.primaryExpression
+                val functionName = (primaryExpression as IdentifierExpression).identifier
+
+                var symbol = currentTable?.find(functionName)
+                if (symbol == null) {
+                    requirePendingImports()
+                    symbol = currentTable?.find(functionName)
+                }
+                symbol!!.node
             }
 
-            val function = symbol as Symbol.Function
-
-            function.node.let {
+            function.let {
                 if (it is CompilerFunctionDeclaration)
                     values.add(it.executionBlock(this, functionCall.arguments.map {
                         values.pop().toValue(currentScope!!)
                     }.toTypedArray()))
-                else
+                else if (it is FunctionLiteral) {
+                    val numValues = values.size
+                    it.block.accept(this)
+                    val returnValue = values.pop()
+                    repeat(values.size - numValues) {
+                        values.pop()
+                    }
+                    values.push(returnValue)
+                } else
                     it.accept(this)
             }
         }

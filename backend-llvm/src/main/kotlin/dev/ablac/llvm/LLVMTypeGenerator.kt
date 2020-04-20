@@ -3,6 +3,7 @@ package dev.ablac.llvm
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.nodes.File
 import dev.ablac.language.nodes.FunctionDeclaration
+import dev.ablac.language.nodes.FunctionLiteral
 import org.bytedeco.javacpp.BytePointer
 import org.bytedeco.javacpp.Pointer
 import org.bytedeco.javacpp.PointerPointer
@@ -117,7 +118,10 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         val argTypes = functionDeclaration.parameters.map {
-            LLVMInt32Type()
+            if (it.name == "fn")
+                LLVMPointerType(LLVMFunctionType(LLVMInt32Type(), PointerPointer<LLVMTypeRef>(), 0, 0), 0)
+            else
+                LLVMInt32Type()
         }.toTypedArray()
         val function = module.addFunction(functionDeclaration.name, LLVMInt32Type(), argTypes)
         functionDeclaration.llvmValue = function
@@ -139,5 +143,16 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             blocks.pop()
         }
 
+    }
+
+    override suspend fun visit(functionLiteral: FunctionLiteral) {
+        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), LLVMInt32Type(), arrayOf())
+            .appendBasicBlock("entry") {
+                functionLiteral.llvmBlock = this
+                blocks.push(this)
+            }
+        functionLiteral.llvmValue = function
+        super.visit(functionLiteral)
+        blocks.pop()
     }
 }

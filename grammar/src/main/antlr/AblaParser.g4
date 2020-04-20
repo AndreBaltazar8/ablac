@@ -51,7 +51,8 @@ prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
 postfixUnarySuffix : callSuffix # callSuffixSuffix
                    ;
 
-callSuffix : valueArguments
+callSuffix : valueArguments? functionLiteral
+           | valueArguments
            ;
 
 valueArguments : LPAREN RPAREN
@@ -60,6 +61,8 @@ valueArguments : LPAREN RPAREN
 
 valueArgument : (simpleIdentifier ASSIGNMENT)? expression
               ;
+
+functionLiteral : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
 
 literal : stringLiteral # stringLiteralLiteral
         | IntegerLiteral # integerLiteral

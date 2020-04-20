@@ -39,5 +39,11 @@ abstract class ASTVisitor {
     }
 
     open suspend fun visit(functionCall: FunctionCall) {
+        functionCall.primaryExpression.accept(this)
+        functionCall.arguments.forEach { it.value.accept(this) }
+    }
+
+    open suspend fun visit(functionLiteral: FunctionLiteral) {
+        functionLiteral.block.accept(this)
     }
 }
