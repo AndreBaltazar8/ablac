@@ -62,7 +62,7 @@ fun AblaParser.StatementContext.toAST(): Statement =
 
 fun AblaParser.CompilerCallContext.toAST() =
     CompilerExec(
-        callSuffix().fold<AblaParser.CallSuffixContext, PrimaryExpression>(simpleIdentifier().toAST()) { acc, suffix ->
+        callSuffix().fold<AblaParser.CallSuffixContext, PrimaryExpression>(simpleIdentifier()?.toAST() ?: functionLiteral().toAST()) { acc, suffix ->
             suffix.toAST(acc)
         },
         position
@@ -101,6 +101,7 @@ fun AblaParser.PrimaryExpressionContext.toAST(): PrimaryExpression =
     when (this) {
         is AblaParser.SimpleIdentifierExpressionContext -> simpleIdentifier().toAST()
         is AblaParser.LiteralExpressionContext -> literal().toAST()
+        is AblaParser.FunctionLiteralExpressionContext -> functionLiteral().toAST()
         else -> throw IllegalStateException("Unknown primary expression type ${this::class.simpleName}")
     }
 

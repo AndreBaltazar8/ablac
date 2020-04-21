@@ -1,7 +1,5 @@
 package dev.ablac.llvm
 
-import dev.ablac.common.Symbol
-import dev.ablac.common.SymbolTable
 import dev.ablac.common.symbolTable
 import dev.ablac.language.ASTVisitor
 import dev.ablac.language.nodes.*
@@ -69,9 +67,8 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(functionCall: FunctionCall) {
         val currentBlock = generatorContext.topBlock
-        val functionName = (functionCall.primaryExpression as IdentifierExpression).identifier
-        val symbol = currentBlock.table.find(functionName) ?: throw Exception("Unknown function $functionName")
-        //val function = symbol as Symbol.Function
+        functionCall.primaryExpression.accept(this)
+        val node = generatorContext.topValuePop
         val builder = LLVMCreateBuilder()
         LLVMPositionBuilderAtEnd(builder, currentBlock.block)
 
@@ -82,10 +79,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         val value = LLVMBuildCall(
             builder,
-            symbol.node.llvmValue,
+            node,
             PointerPointer(*args),
             functionCall.arguments.size,
-            "${symbol.name}()"
+            "${node.hashCode()}()"
         )
         generatorContext.values.push(value)
     }

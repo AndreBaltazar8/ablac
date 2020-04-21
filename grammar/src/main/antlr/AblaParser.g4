@@ -26,7 +26,7 @@ modifier : functionModifier # functionModifierModifier ;
 functionModifier : EXTERN (COLON stringLiteral) # externModifier
                  ;
 
-compilerCall : COMPILER_DIRECTIVE simpleIdentifier callSuffix+ ;
+compilerCall : COMPILER_DIRECTIVE (simpleIdentifier | functionLiteral) callSuffix+ ;
 
 functionBody : block # blockBody
              | ARROW expression # lambdaBody
@@ -43,6 +43,7 @@ expression : prefixUnaryOperation expression # perfixExpression
 
 primaryExpression : simpleIdentifier # simpleIdentifierExpression
                   | literal # literalExpression
+                  | functionLiteral # functionLiteralExpression
                   ;
 
 prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
