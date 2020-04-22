@@ -31,4 +31,21 @@ fun LLVMValueRef.appendBasicBlock(name: String, block: LLVMBasicBlockRef.() -> U
     LLVMAppendBasicBlock(this, name).block()
 }
 
+fun LLVMModuleRef.registerType(
+    name: String,
+    methodsTypes: Array<LLVMTypeRef>,
+    methods: Array<LLVMValueRef>
+) {
+    val vTableName = "${name}_vtable_type"
+    val struct = LLVMStructCreateNamed(LLVMGetGlobalContext(), vTableName)
+    LLVMStructSetBody(struct, PointerPointer(*methodsTypes), methodsTypes.size, 0)
+    LLVMAddGlobal(this, struct, vTableName).apply {
+        LLVMSetInitializer(this, LLVMConstStruct(PointerPointer(*methods), methods.size, 0))
+        setLinkage(LLVMGhostLinkage)
+    }
+}
+
+
+
+
 private fun Boolean.toInt(): Int = if (this) 1 else 0

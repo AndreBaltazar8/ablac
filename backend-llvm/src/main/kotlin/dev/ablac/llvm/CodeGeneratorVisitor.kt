@@ -33,6 +33,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                     )
                     LLVMBuildRet(builder, call)
                 }
+            //module.registerType("hello", arrayOf(LLVMPointerType(LLVMFunctionType(LLVMInt32Type(), PointerPointer<LLVMTypeRef>(), 0, 0), 0)), arrayOf(function))
         }
 
         val block = functionDeclaration.llvmBlock!!
