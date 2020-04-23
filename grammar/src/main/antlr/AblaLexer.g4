@@ -7,6 +7,7 @@ LineComment : '//' ~[\r\n]* -> channel(HIDDEN) ;
 WS : [\u0020\u0009\u000C]+ -> channel(HIDDEN) ;
 NL: ('\n' | '\r' '\n'?) -> channel(HIDDEN) ;
 
+DOT : '.' ;
 ASSIGNMENT : '=' ;
 COLON : ':' ;
 COMMA : ',' ;
@@ -20,6 +21,10 @@ FUN : 'fun' ;
 SEMICOLON : ';' ;
 AT : '@' ;
 EXTERN : 'extern' ;
+COMPILER : 'compiler' ;
+QUEST : '?' ;
+LANGLE : '<' ;
+RANGLE : '>' ;
 
 BooleanLiteral : 'true' | 'false' ;
 IntegerLiteral : DigitNoZero DigitOrSeparator* Digit | Digit ;

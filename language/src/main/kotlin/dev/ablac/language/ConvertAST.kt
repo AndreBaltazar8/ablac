@@ -33,6 +33,7 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
 fun AblaParser.ModifierContext.toAST(): Modifier =
     when (this) {
         is AblaParser.FunctionModifierModifierContext -> functionModifier().toAST()
+        is AblaParser.AllocationModifierModifierContext -> allocationModifier().toAST()
         else -> throw IllegalStateException("Unknown modifier type ${this::class.simpleName}")
     }
 
@@ -40,6 +41,12 @@ fun AblaParser.FunctionModifierContext.toAST(): Modifier =
     when (this) {
         is AblaParser.ExternModifierContext -> Extern(stringLiteral()?.toAST(), position)
         else -> throw IllegalStateException("Unknown function modifier type ${this::class.simpleName}")
+    }
+
+fun AblaParser.AllocationModifierContext.toAST(): Modifier =
+    when (this) {
+        is AblaParser.CompilerModifierContext -> ModCompiler(position)
+        else -> throw IllegalStateException("Unknown allocation modifier type ${this::class.simpleName}")
     }
 
 fun AblaParser.ParameterContext.toAST() =

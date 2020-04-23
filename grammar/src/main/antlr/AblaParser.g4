@@ -14,17 +14,33 @@ fileDeclaration : functionDeclaration # functionDeclarationFD
 functionDeclaration: modifierList? FUN functionName = simpleIdentifier functionDeclarationParameters? functionBody? ;
 functionDeclarationParameters : LPAREN (functionDeclarationParameter (COMMA functionDeclarationParameter)* COMMA?)? RPAREN ;
 functionDeclarationParameter : parameter (ASSIGNMENT expression)? ;
-parameter : simpleIdentifier ;
+parameter : simpleIdentifier COLON type ;
+userType : simpleUserType (DOT typeName = simpleUserType)* ;
+simpleUserType : simpleIdentifier (typeArguments)? ;
+
+typeArguments : LANGLE type (COMMA type)* COMMA? RANGLE ;
+type: functionType | parenthesizedType | nullableType | userType ;
+parenthesizedType : LPAREN type RPAREN ;
+functionType: (functionTypeReceiver DOT)? functionTypeParameters ARROW type ;
+functionTypeReceiver : parenthesizedType | nullableType | userType ;
+functionTypeParameters : (LPAREN RPAREN) | (LPAREN (parameter | type) (COMMA (parameter | type))* COMMA? RPAREN) ;
+
+nullableType: userType QUEST ;
 
 annotation : simpleIdentifier valueArguments? ;
 annotations : (AT annotation (COMMA annotation)*)+ ;
 
 modifierList : annotations | annotations? modifier+ ;
 
-modifier : functionModifier # functionModifierModifier ;
+modifier : functionModifier # functionModifierModifier
+         | allocationModifier # allocationModifierModifier
+         ;
 
 functionModifier : EXTERN (COLON stringLiteral) # externModifier
                  ;
+
+allocationModifier : COMPILER # compilerModifier
+                   ;
 
 compilerCall : COMPILER_DIRECTIVE (simpleIdentifier | functionLiteral) callSuffix+ ;
 
@@ -52,8 +68,8 @@ prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
 postfixUnarySuffix : callSuffix # callSuffixSuffix
                    ;
 
-callSuffix : valueArguments? functionLiteral
-           | valueArguments
+callSuffix : typeArguments? valueArguments? functionLiteral
+           | typeArguments? valueArguments
            ;
 
 valueArguments : LPAREN RPAREN
@@ -76,6 +92,7 @@ lineStringExpression : LineStrExprStart expression RCURL ;
 
 simpleIdentifier : ID
                  | FUN
+                 | EXTERN
                  ;
 
 nlsemiOrRCurlNoConsume : SEMICOLON | {this.lineTerminator()}? | {this.noConsumeRCURL()}?;

@@ -142,7 +142,7 @@ class CompileService(
         modifiers: Array<Modifier> = arrayOf(),
         executionBlock: suspend (ExecutionVisitor, Array<Any>) -> Literal
     ) {
-        val declaration = CompilerFunctionDeclaration(name, parameters, arrayOf(*modifiers, Compile), executionBlock)
+        val declaration = CompilerFunctionDeclaration(name, parameters, arrayOf(*modifiers, ModCompiler(positionZero)), executionBlock)
         global.symbols.add(Symbol.Function(name, declaration))
     }
 

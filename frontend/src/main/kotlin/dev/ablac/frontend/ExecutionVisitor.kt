@@ -129,6 +129,8 @@ class ExecutionVisitor(
                     requirePendingImports()
                     symbol = currentTable?.find(functionName)
                 }
+                if (symbol == null)
+                    throw Exception("Unknown function $functionName")
                 symbol!!.node
             }
 
