@@ -9,12 +9,24 @@ file : fileDeclaration* EOF ;
 
 fileDeclaration : functionDeclaration # functionDeclarationFD
                 | compilerCall # compilerCallFD
+                | classDeclaration # classDeclarationFD
                 ;
 
-functionDeclaration: modifierList? FUN functionName = simpleIdentifier functionDeclarationParameters? functionBody? ;
+functionDeclaration: modifierList? FUN (functionTypeReceiver DOT)? functionName = simpleIdentifier (typeParameters)? functionDeclarationParameters? (COLON type)? functionBody? ;
 functionDeclarationParameters : LPAREN (functionDeclarationParameter (COMMA functionDeclarationParameter)* COMMA?)? RPAREN ;
 functionDeclarationParameter : parameter (ASSIGNMENT expression)? ;
+
+typeParameters : LANGLE typeParameter (COMMA typeParameter)* COMMA? RANGLE ;
+typeParameter : simpleIdentifier (COLON type)? ;
+
+classDeclaration : modifierList? CLASS className = simpleIdentifier (typeParameters)? (classBody)? ;
+classBody : LCURL classMemberDeclaration* RCURL ;
+classMemberDeclaration : classDeclaration
+                       | functionDeclaration
+                       ;
+
 parameter : simpleIdentifier COLON type ;
+
 userType : simpleUserType (DOT typeName = simpleUserType)* ;
 simpleUserType : simpleIdentifier (typeArguments)? ;
 

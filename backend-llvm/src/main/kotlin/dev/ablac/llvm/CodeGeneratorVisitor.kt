@@ -19,7 +19,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         if (functionDeclaration.name == "main") {
             function.setName("%%_main")
 
-            module.addFunction("main", LLVMInt16Type(), arrayOf())
+            module.addFunction("main", LLVMInt16Type(), arrayOf()).valueRef
                 .setLinkage(LLVMExternalLinkage)
                 .appendBasicBlock("entry") {
                     val builder = LLVMCreateBuilder()
@@ -33,7 +33,6 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                     )
                     LLVMBuildRet(builder, call)
                 }
-            //module.registerType("hello", arrayOf(LLVMPointerType(LLVMFunctionType(LLVMInt32Type(), PointerPointer<LLVMTypeRef>(), 0, 0), 0)), arrayOf(function))
         }
 
         val block = functionDeclaration.llvmBlock!!
@@ -45,14 +44,12 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         if (!currentBlock.hasReturned) {
             // CHECK FOR TYPE
 
-            currentBlock.block.also {
-                val builder = LLVMCreateBuilder()
-                LLVMPositionBuilderAtEnd(builder, it)
-                if (generatorContext.values.isNotEmpty())
-                    LLVMBuildRet(builder, generatorContext.topValue)
-                else
-                    LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
-            }
+            val builder = LLVMCreateBuilder()
+            LLVMPositionBuilderAtEnd(builder, currentBlock.block)
+            if (generatorContext.values.isNotEmpty())
+                LLVMBuildRet(builder, generatorContext.topValue)
+            else
+                LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
             currentBlock.hasReturned = true
         }
 
@@ -101,14 +98,12 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         if (!currentBlock.hasReturned) {
             // CHECK FOR TYPE
 
-            currentBlock.block.also {
-                val builder = LLVMCreateBuilder()
-                LLVMPositionBuilderAtEnd(builder, it)
-                if (generatorContext.values.isNotEmpty())
-                    LLVMBuildRet(builder, generatorContext.topValue)
-                else
-                    LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
-            }
+            val builder = LLVMCreateBuilder()
+            LLVMPositionBuilderAtEnd(builder, currentBlock.block)
+            if (generatorContext.values.isNotEmpty())
+                LLVMBuildRet(builder, generatorContext.topValue)
+            else
+                LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
             currentBlock.hasReturned = true
         }
         repeat(generatorContext.values.size - numValues) {

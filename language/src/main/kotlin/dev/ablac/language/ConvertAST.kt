@@ -2,6 +2,7 @@ package dev.ablac.language
 
 import dev.ablac.grammar.AblaParser
 import dev.ablac.language.nodes.*
+import org.antlr.v4.codegen.model.decl.Decl
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.Token
 
@@ -16,6 +17,7 @@ fun AblaParser.FileDeclarationContext.toAST(): Declaration =
     when (this) {
         is AblaParser.FunctionDeclarationFDContext -> functionDeclaration().toAST()
         is AblaParser.CompilerCallFDContext -> compilerCall().toAST()
+        is AblaParser.ClassDeclarationFDContext -> classDeclaration().toAST()
         else -> throw IllegalStateException("Unknown declaration type ${this::class.simpleName}")
     }
 
@@ -29,6 +31,19 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
         modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
         position
     )
+
+fun AblaParser.ClassDeclarationContext.toAST() =
+    ClassDeclaration(
+        className.text,
+        modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        classBody()?.classMemberDeclaration()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        position
+    )
+
+fun AblaParser.ClassMemberDeclarationContext.toAST() : Declaration =
+    functionDeclaration()?.toAST() ?:
+            classDeclaration()?.toAST() ?:
+                throw IllegalStateException("Unknown class member type ${this::class.simpleName}")
 
 fun AblaParser.ModifierContext.toAST(): Modifier =
     when (this) {

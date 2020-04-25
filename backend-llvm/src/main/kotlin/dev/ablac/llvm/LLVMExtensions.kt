@@ -5,7 +5,6 @@ import org.bytedeco.llvm.LLVM.LLVMBasicBlockRef
 import org.bytedeco.llvm.LLVM.LLVMModuleRef
 import org.bytedeco.llvm.LLVM.LLVMTypeRef
 import org.bytedeco.llvm.LLVM.LLVMValueRef
-import org.bytedeco.llvm.global.LLVM
 import org.bytedeco.llvm.global.LLVM.*
 
 fun LLVMModuleRef.addFunction(
@@ -13,11 +12,11 @@ fun LLVMModuleRef.addFunction(
     returnType: LLVMTypeRef,
     args: Array<LLVMTypeRef>,
     isVarArg: Boolean = false
-): LLVMValueRef = LLVM.LLVMAddFunction(
-    this,
-    name,
-    LLVMFunctionType(returnType, PointerPointer(*args), args.size, isVarArg.toInt())
-)
+): FunctionLLVM {
+    val type = LLVMFunctionType(returnType, PointerPointer(*args), args.size, isVarArg.toInt())
+    val function = LLVMAddFunction(this, name, type)
+    return FunctionLLVM(type, function)
+}
 
 fun LLVMValueRef.setLinkage(linkage: Int) = apply {
     LLVMSetLinkage(this, linkage)
@@ -31,11 +30,11 @@ fun LLVMValueRef.appendBasicBlock(name: String, block: LLVMBasicBlockRef.() -> U
     LLVMAppendBasicBlock(this, name).block()
 }
 
-fun LLVMModuleRef.registerType(
+fun LLVMModuleRef.registerTypeVtable(
     name: String,
     methodsTypes: Array<LLVMTypeRef>,
     methods: Array<LLVMValueRef>
-) {
+): LLVMTypeRef {
     val vTableName = "${name}_vtable_type"
     val struct = LLVMStructCreateNamed(LLVMGetGlobalContext(), vTableName)
     LLVMStructSetBody(struct, PointerPointer(*methodsTypes), methodsTypes.size, 0)
@@ -43,6 +42,7 @@ fun LLVMModuleRef.registerType(
         LLVMSetInitializer(this, LLVMConstStruct(PointerPointer(*methods), methods.size, 0))
         setLinkage(LLVMGhostLinkage)
     }
+    return struct
 }
 
 

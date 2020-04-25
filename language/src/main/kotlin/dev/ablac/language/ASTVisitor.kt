@@ -46,4 +46,8 @@ abstract class ASTVisitor {
     open suspend fun visit(functionLiteral: FunctionLiteral) {
         functionLiteral.block.accept(this)
     }
+
+    open suspend fun visit(classDeclaration: ClassDeclaration) {
+        classDeclaration.declarations.forEach { it.accept(this) }
+    }
 }

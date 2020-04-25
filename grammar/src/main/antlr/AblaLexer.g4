@@ -22,6 +22,7 @@ SEMICOLON : ';' ;
 AT : '@' ;
 EXTERN : 'extern' ;
 COMPILER : 'compiler' ;
+CLASS : 'class' ;
 QUEST : '?' ;
 LANGLE : '<' ;
 RANGLE : '>' ;
