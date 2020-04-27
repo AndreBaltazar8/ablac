@@ -1,6 +1,5 @@
 plugins {
     kotlin("jvm")
-    kotlin("kapt")
 
     `java-library`
 }
@@ -8,9 +7,6 @@ plugins {
 projectCommon()
 
 dependencies {
-    kapt(project(":processor"))
-    compileOnly(project(":annotations"))
-
     implementation(Dependencies.KOIN)
     implementation(Dependencies.KOTLINX_COROUTINES_CORE)
 

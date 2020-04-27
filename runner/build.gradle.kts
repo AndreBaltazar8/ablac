@@ -19,5 +19,5 @@ dependencies {
 }
 
 application {
-    mainClassName = "dev.ablac.runner.MainKt"
+    mainClassName = "dev.abla.runner.MainKt"
 }
