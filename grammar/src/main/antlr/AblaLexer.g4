@@ -16,7 +16,7 @@ LCURL : '{' ;
 RCURL : '}' ;
 LPAREN : '(' ;
 RPAREN : ')' ;
-ARROW : '=>' ;
+ARROW : '->' ;
 FUN : 'fun' ;
 SEMICOLON : ';' ;
 AT : '@' ;

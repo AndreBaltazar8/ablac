@@ -57,7 +57,7 @@ allocationModifier : COMPILER # compilerModifier
 compilerCall : COMPILER_DIRECTIVE (simpleIdentifier | functionLiteral) callSuffix+ ;
 
 functionBody : block # blockBody
-             | ARROW expression # lambdaBody
+             | ASSIGNMENT expression # lambdaBody
              ;
 
 block : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
@@ -102,9 +102,6 @@ stringLiteral : QUOTE_OPEN (lineStringContent | lineStringExpression)* QUOTE_CLO
 lineStringContent : LineStrText | LineStrEscapedChar | LineStrRef ;
 lineStringExpression : LineStrExprStart expression RCURL ;
 
-simpleIdentifier : ID
-                 | FUN
-                 | EXTERN
-                 ;
+simpleIdentifier : ID ;
 
 nlsemiOrRCurlNoConsume : SEMICOLON | {this.lineTerminator()}? | {this.noConsumeRCURL()}?;
