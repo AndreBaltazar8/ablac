@@ -99,6 +99,7 @@ fun main {
 }
 ```
 
+The test from the `runner` module is the main test which contains the full features available at the moment. When it is run, it produces a single file called `file.bc` with the LLVM bitcode. This can be linked into a working program by running `clang file.bc -o main`.
 
 ## Features
 
@@ -119,6 +120,7 @@ These the current and planned features for the language. It is not exhaustive li
   * Storing LLVM nodes and other data on Nodes
   * Storing info about types
   * More performant way of executing compile-time code
+- Support outputing file with correct name
 - Build string properly from AST
 - Support `const char*` from C as native type that can be used in abla even though strings in abla will probably not be simple null-terminated strings
   * Creating a new built-in type that allows automatic conversion between `const char*` and `string` implementation in abla
