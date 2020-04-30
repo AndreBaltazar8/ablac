@@ -64,7 +64,7 @@ fun AblaParser.AllocationModifierContext.toAST(): Modifier =
     }
 
 fun AblaParser.ParameterContext.toAST() =
-    Parameter(simpleIdentifier().text, Type("int", arrayOf(), positionZero), position)
+    Parameter(simpleIdentifier().text, Type(type().text, arrayOf(), positionZero), position)
 
 fun AblaParser.FunctionBodyContext.toAST(): Block =
     when (this) {

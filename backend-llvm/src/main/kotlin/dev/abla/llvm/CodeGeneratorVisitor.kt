@@ -90,6 +90,15 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         super.visit(integer)
     }
 
+    override suspend fun visit(stringLiteral: StringLiteral) {
+        val builder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+        val string = stringLiteral.string.substring(1, stringLiteral.string.length - 1)
+        val globalValue = LLVMBuildGlobalStringPtr(builder, string, stringLiteral.hashCode().toString())
+        generatorContext.values.push(globalValue)
+        super.visit(stringLiteral)
+    }
+
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         val numValues = generatorContext.values.size
         val block = functionLiteral.llvmBlock!!

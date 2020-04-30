@@ -5,8 +5,6 @@ import dev.abla.language.nodes.ClassDeclaration
 import dev.abla.language.nodes.File
 import dev.abla.language.nodes.FunctionDeclaration
 import dev.abla.language.nodes.FunctionLiteral
-import org.bytedeco.javacpp.BytePointer
-import org.bytedeco.javacpp.Pointer
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.*
 import org.bytedeco.llvm.global.LLVM.*
@@ -28,6 +26,8 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
                 .plus(functionDeclaration.parameters.map {
                     if (it.name == "fn")
                         LLVMPointerType(LLVMFunctionType(LLVMInt32Type(), PointerPointer<LLVMTypeRef>(), 0, 0), 0)
+                    else if (it.type.identifier == "string")
+                        LLVMPointerType(LLVMInt8Type(), 0)
                     else
                         LLVMInt32Type()
                 })
