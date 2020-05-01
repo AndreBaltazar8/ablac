@@ -20,7 +20,7 @@ fun main {
     printf("I'm run at runtime")
 }
 ```
-(this example does not currently run, because we can't handle strings properly yet, but exemplifies the usage)
+(this example runs but its using some magic for handling printf variadic args)
 
 Some fun stuff to do with abla in the future:
 ```abla
