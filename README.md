@@ -120,8 +120,8 @@ These the current and planned features for the language. It is not exhaustive li
   * Storing LLVM nodes and other data on Nodes
   * Storing info about types
   * More performant way of executing compile-time code
-- Support outputing file with correct name
-- Build string properly from AST
+- Support outputting file with correct name
+- Support strings with expressions at runtime
 - Support `const char*` from C as native type that can be used in abla even though strings in abla will probably not be simple null-terminated strings
   * Creating a new built-in type that allows automatic conversion between `const char*` and `string` implementation in abla
 - Add operators

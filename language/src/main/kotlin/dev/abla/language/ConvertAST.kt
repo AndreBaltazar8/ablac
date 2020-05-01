@@ -192,4 +192,39 @@ fun AblaParser.FunctionLiteralContext.toAST() =
         position
     )
 
-fun AblaParser.StringLiteralContext.toAST() = StringLiteral(text, position)
+fun AblaParser.StringLiteralContext.toAST() =
+    StringLiteral(
+        lineString()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        position
+    )
+
+fun AblaParser.LineStringContext.toAST(): StringLiteral.StringPart =
+    lineStringContent()?.toAST() ?:
+            lineStringExpression()?.toAST() ?:
+            throw IllegalStateException("Unknown string type in $text, $position")
+
+fun AblaParser.LineStringContentContext.toAST() =
+    LineStrText()?.let { StringLiteral.StringConst(text, position) } ?:
+        LineStrEscapedChar()?.let { StringLiteral.StringConst(text.unescapeAbla(), position) } ?:
+        LineStrRef()?.let {
+            StringLiteral.StringExpression(
+                IdentifierExpression(
+                    text.substring(1),
+                    position.copy(start = Point(start.line, start.charPositionInLine + 1))
+                ),
+                position
+            )
+        } ?: throw IllegalStateException("Unknown string content type in $text, $position")
+
+fun AblaParser.LineStringExpressionContext.toAST() =
+    StringLiteral.StringExpression(expression().toAST(), position)
+
+fun String.unescapeAbla(): String =
+    when (this[1]) {
+        't' -> "\t"
+        'b' -> "\b"
+        'r' -> "\r"
+        'n' -> "\n"
+        'u' -> substring(2, 6).toInt(16).toChar().toString()
+        else -> substring(1)
+    }

@@ -7,6 +7,8 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.runBlocking
+import java.lang.IllegalStateException
 import java.nio.file.FileSystems
 import java.util.*
 
@@ -130,7 +132,7 @@ class ExecutionVisitor(
                 }
                 if (symbol == null)
                     throw Exception("Unknown function $functionName")
-                symbol!!.node
+                symbol.node
             }
 
             function.let {
@@ -168,11 +170,23 @@ class ExecutionVisitor(
         function()
         currentScope = currentScope!!.parent
     }
+
+    suspend fun Literal?.toValue(currentScope: ExecutionScope): Any =
+        when (this) {
+            is Integer -> number.toInt()
+            is StringLiteral -> {
+                stringParts.map {
+                    when (it) {
+                        is StringLiteral.StringConst -> it.string
+                        is StringLiteral.StringExpression -> {
+                            it.expression.accept(this@ExecutionVisitor)
+                            values.pop().toValue(currentScope).toString()
+                        }
+                        else -> throw IllegalStateException("Unknown string part type ${it.javaClass.simpleName}")
+                    }
+                }.joinToString("")
+            }
+            else -> throw Exception("Unknown literal conversion")
+        }
 }
 
-fun Literal?.toValue(currentScope: ExecutionScope): Any =
-    when (this) {
-        is Integer -> number.toInt()
-        is StringLiteral -> string.substring(1, string.length - 1)
-        else -> throw Exception("Unknown literal conversion")
-    }

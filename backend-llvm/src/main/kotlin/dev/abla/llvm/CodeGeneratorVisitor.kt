@@ -12,7 +12,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     private val generatorContext = GeneratorContext()
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
-        if (functionDeclaration.isExtern)
+        if (functionDeclaration.isExtern || functionDeclaration.isCompiler)
             return
 
         val function = functionDeclaration.llvmValue!!
@@ -65,7 +65,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     override suspend fun visit(identifierExpression: IdentifierExpression) {
         val currentBlock = generatorContext.topBlock
         val value = currentBlock.table.find(identifierExpression.identifier)
-        generatorContext.values.push(value!!.node.llvmValue)
+            ?: throw Exception("Unknown value for identifier ${identifierExpression.identifier}")
+        if (value.node.llvmValue == null)
+            throw Exception("Cannot get llvm value for ${identifierExpression.identifier}. Is it a compiler function?")
+        generatorContext.values.push(value.node.llvmValue)
     }
 
     override suspend fun visit(functionCall: FunctionCall) {
@@ -92,16 +95,23 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(integer: Integer) {
         generatorContext.values.push(LLVMConstInt(LLVMInt32Type(), integer.number.toLong(), 0))
-        super.visit(integer)
     }
 
     override suspend fun visit(stringLiteral: StringLiteral) {
         val builder = LLVMCreateBuilder()
         LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
-        val string = stringLiteral.string.substring(1, stringLiteral.string.length - 1)
-        val globalValue = LLVMBuildGlobalStringPtr(builder, string, stringLiteral.hashCode().toString())
-        generatorContext.values.push(globalValue)
-        super.visit(stringLiteral)
+        if (stringLiteral.stringParts.all { it is StringLiteral.StringConst }) {
+            val string = stringLiteral.stringParts.joinToString("") { (it as StringLiteral.StringConst).string }
+            val globalValue = LLVMBuildGlobalStringPtr(builder, string, stringLiteral.hashCode().toString())
+            generatorContext.values.push(globalValue)
+        } else {
+            /*val globalValue = LLVMBuildGlobalStringPtr(builder, "hi", stringLiteral.hashCode().toString())
+            val string = LLVMBuildArrayAlloca(builder, LLVMInt8Type(), LLVMConstInt(LLVMInt32Type(), 3, 0), "")
+            LLVMBuildMemCpy(builder, string, 0, globalValue, 0, LLVMConstInt(LLVMInt32Type(), 2, 0))
+            generatorContext.values.push(string)*/
+            TODO("String with expression not available at run time")
+            // Either build the code for concat here or add a small C func to do it
+        }
     }
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {

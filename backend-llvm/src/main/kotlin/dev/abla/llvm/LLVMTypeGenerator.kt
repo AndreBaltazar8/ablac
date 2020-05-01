@@ -13,6 +13,9 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     private val typeScopes = Stack<TypeScope>()
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
+        if (functionDeclaration.isCompiler)
+            return
+
         val name = typeScopes.map { it.name }.plus(functionDeclaration.name).joinToString("%")
         val argTypes =
             listOfNotNull(if (!typeScopes.empty()) LLVMPointerType(typeScopes.peek().type, 0) else null)
@@ -79,21 +82,4 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         super.visit(functionLiteral)
         blocks.pop()
     }
-
-    private val Type.llvmType: LLVMTypeRef
-        get() = when {
-            this is FunctionType -> LLVMPointerType(
-                LLVMFunctionType(
-                    returnType.llvmType,
-                    PointerPointer(*parameters.map { it.type.llvmType }.toTypedArray()),
-                    parameters.size,
-                    0
-                ),
-                0
-            )
-            this == UserType.String -> LLVMPointerType(LLVMInt8Type(), 0)
-            this == UserType.Int -> LLVMInt32Type()
-            this == UserType.Void -> LLVMVoidType()
-            else -> throw Exception("Unknown type to llvm type conversion ${this.toHuman()}")
-        }
 }

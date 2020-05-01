@@ -99,7 +99,8 @@ literal : stringLiteral # stringLiteralLiteral
         | BooleanLiteral # booleanLiteral
         ;
 
-stringLiteral : QUOTE_OPEN (lineStringContent | lineStringExpression)* QUOTE_CLOSE;
+stringLiteral : QUOTE_OPEN lineString* QUOTE_CLOSE;
+lineString : lineStringContent | lineStringExpression ;
 lineStringContent : LineStrText | LineStrEscapedChar | LineStrRef ;
 lineStringExpression : LineStrExprStart expression RCURL ;
 
