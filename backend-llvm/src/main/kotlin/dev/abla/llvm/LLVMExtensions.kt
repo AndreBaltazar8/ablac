@@ -45,7 +45,4 @@ fun LLVMModuleRef.registerTypeVtable(
     return struct
 }
 
-
-
-
 private fun Boolean.toInt(): Int = if (this) 1 else 0
