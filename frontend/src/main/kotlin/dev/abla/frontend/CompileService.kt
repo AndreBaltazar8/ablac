@@ -122,7 +122,7 @@ class CompileService(
     }
 
     init {
-        addCompileFunction("import", arrayOf(Parameter("fileName", BuiltInTypes.String))) { executionVisitor, args ->
+        addCompileFunction("import", arrayOf(Parameter("fileName", UserType.String))) { executionVisitor, args ->
             val importName = args[0] as String
             val file = Paths.get(executionVisitor.workingDirectory, importName).toAbsolutePath().toString()
 

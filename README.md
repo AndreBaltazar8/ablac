@@ -129,7 +129,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Switch/When
 - Loops
 - Add simple build-in types (string, int)
-- Types to AST
+- Function calls to void parameters and defined types/classes
 - Type checking everything
 - Class object allocation
 - Class construction

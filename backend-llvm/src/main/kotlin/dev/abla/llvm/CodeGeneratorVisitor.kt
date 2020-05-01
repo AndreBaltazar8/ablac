@@ -29,9 +29,15 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                         functionDeclaration.llvmValue!!,
                         PointerPointer<LLVMTypeRef>(),
                         0,
-                        "main()"
+                        if (functionDeclaration.returnType == UserType.Int) "main()" else ""
                     )
-                    LLVMBuildRet(builder, call)
+                    LLVMBuildRet(
+                        builder,
+                        if (functionDeclaration.returnType == UserType.Int)
+                            call
+                        else
+                            LLVMConstInt(LLVMInt16Type(),0, 0)
+                    )
                 }
         }
 
@@ -46,10 +52,8 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
             val builder = LLVMCreateBuilder()
             LLVMPositionBuilderAtEnd(builder, currentBlock.block)
-            if (generatorContext.values.isNotEmpty())
+            if (generatorContext.values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid())
                 LLVMBuildRet(builder, generatorContext.topValue)
-            else
-                LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
             currentBlock.hasReturned = true
         }
 
@@ -80,7 +84,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             node,
             PointerPointer(*args),
             functionCall.arguments.size,
-            "${node.hashCode()}()"
+            "${node.hashCode()}()" // TODO: figure out void calls
         )
         generatorContext.values.push(value)
     }

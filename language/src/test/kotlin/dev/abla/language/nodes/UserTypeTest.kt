@@ -4,10 +4,15 @@ import dev.abla.language.positionZero
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 
-class TypeTest {
+class UserTypeTest {
     @Test
     fun testToHuman() {
-        val type = Type("List", arrayOf(Type("Int", arrayOf(), positionZero)), positionZero)
+        val type = UserType(
+            "List",
+            arrayOf(UserType("Int", arrayOf(), null, positionZero)),
+            null,
+            positionZero
+        )
         assertEquals("List<Int>", type.toHuman())
     }
 }

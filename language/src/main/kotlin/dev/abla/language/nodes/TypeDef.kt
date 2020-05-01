@@ -1,18 +1,13 @@
 package dev.abla.language.nodes
 
-import dev.abla.language.ASTVisitor
 import dev.abla.language.Identifier
 import dev.abla.language.Position
 
-data class TypeDef(val identifier: Identifier, val types: Array<TypeDefParam>, override val position: Position) : Node {
+data class TypeDef(val identifier: Identifier, val types: Array<TypeDefParam>, val position: Position) {
     val isGeneric get() = types.isNotEmpty()
 
     fun toHuman(): String {
         return identifier + if (isGeneric) "<${types.joinToString { it.toHuman() }}>" else ""
-    }
-
-    override suspend fun accept(visitor: ASTVisitor) {
-        visitor.visit(this)
     }
 
     override fun equals(other: Any?): Boolean {

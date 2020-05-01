@@ -11,4 +11,4 @@ class CompilerFunctionDeclaration(
     parameters: Array<Parameter>,
     modifiers: Array<Modifier>,
     val executionBlock: suspend (ExecutionVisitor, Array<Any>) -> Literal
-) : FunctionDeclaration(name, parameters, null, modifiers, positionZero)
+) : FunctionDeclaration(name, parameters, null, null, modifiers, positionZero)

@@ -1,10 +1,7 @@
 package dev.abla.llvm
 
 import dev.abla.language.ASTVisitor
-import dev.abla.language.nodes.ClassDeclaration
-import dev.abla.language.nodes.File
-import dev.abla.language.nodes.FunctionDeclaration
-import dev.abla.language.nodes.FunctionLiteral
+import dev.abla.language.nodes.*
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.*
 import org.bytedeco.llvm.global.LLVM.*
@@ -15,23 +12,22 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     private val blocks = Stack<LLVMBasicBlockRef>()
     private val typeScopes = Stack<TypeScope>()
 
-    override suspend fun visit(file: File) {
-        super.visit(file)
-    }
-
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         val name = typeScopes.map { it.name }.plus(functionDeclaration.name).joinToString("%")
         val argTypes =
             listOfNotNull(if (!typeScopes.empty()) LLVMPointerType(typeScopes.peek().type, 0) else null)
                 .plus(functionDeclaration.parameters.map {
-                    if (it.name == "fn")
-                        LLVMPointerType(LLVMFunctionType(LLVMInt32Type(), PointerPointer<LLVMTypeRef>(), 0, 0), 0)
-                    else if (it.type.identifier == "string")
-                        LLVMPointerType(LLVMInt8Type(), 0)
-                    else
-                        LLVMInt32Type()
+                    try {
+                        it.type.llvmType
+                    } catch (e: Exception) {
+                        throw Exception("${it.name}: ${e.message}", e)
+                    }
                 })
-        val function = module.addFunction(name, LLVMInt32Type(), argTypes.toTypedArray())
+        val function = module.addFunction(
+            name,
+            functionDeclaration.returnType?.llvmType ?: LLVMVoidType(),
+            argTypes.toTypedArray()
+        )
         typeScopes.lastOrNull()?.methods?.add(function)
         functionDeclaration.llvmValue = function.valueRef
 
@@ -83,4 +79,21 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         super.visit(functionLiteral)
         blocks.pop()
     }
+
+    private val Type.llvmType: LLVMTypeRef
+        get() = when {
+            this is FunctionType -> LLVMPointerType(
+                LLVMFunctionType(
+                    returnType.llvmType,
+                    PointerPointer(*parameters.map { it.type.llvmType }.toTypedArray()),
+                    parameters.size,
+                    0
+                ),
+                0
+            )
+            this == UserType.String -> LLVMPointerType(LLVMInt8Type(), 0)
+            this == UserType.Int -> LLVMInt32Type()
+            this == UserType.Void -> LLVMVoidType()
+            else -> throw Exception("Unknown type to llvm type conversion ${this.toHuman()}")
+        }
 }

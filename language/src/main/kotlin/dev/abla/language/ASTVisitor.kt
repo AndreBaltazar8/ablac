@@ -3,12 +3,6 @@ package dev.abla.language
 import dev.abla.language.nodes.*
 
 abstract class ASTVisitor {
-    open suspend fun visit(type: Type) {
-    }
-
-    open suspend fun visit(typeDef: TypeDef) {
-    }
-
     open suspend fun visit(file: File) {
         file.declarations.forEach {
             it.accept(this)

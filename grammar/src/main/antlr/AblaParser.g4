@@ -35,7 +35,8 @@ type: functionType | parenthesizedType | nullableType | userType ;
 parenthesizedType : LPAREN type RPAREN ;
 functionType: (functionTypeReceiver DOT)? functionTypeParameters ARROW type ;
 functionTypeReceiver : parenthesizedType | nullableType | userType ;
-functionTypeParameters : (LPAREN RPAREN) | (LPAREN (parameter | type) (COMMA (parameter | type))* COMMA? RPAREN) ;
+functionTypeParameters : (LPAREN RPAREN) | (LPAREN functionTypeParameter (COMMA functionTypeParameter)* COMMA? RPAREN) ;
+functionTypeParameter: (parameter | type) ;
 
 nullableType: userType QUEST ;
 

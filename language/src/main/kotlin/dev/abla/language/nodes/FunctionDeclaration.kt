@@ -7,6 +7,7 @@ open class FunctionDeclaration(
     val name: String,
     val parameters: Array<Parameter>,
     val block: Block?,
+    val returnType: Type?,
     val modifiers: Array<Modifier>,
     override val position: Position
 ) : Declaration {

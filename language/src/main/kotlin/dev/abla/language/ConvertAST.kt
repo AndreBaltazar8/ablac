@@ -27,6 +27,7 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
             it.parameter().toAST()
         }?.toTypedArray() ?: arrayOf(),
         functionBody()?.toAST(),
+        type()?.toAST(),
         modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
         position
     )
@@ -64,7 +65,51 @@ fun AblaParser.AllocationModifierContext.toAST(): Modifier =
     }
 
 fun AblaParser.ParameterContext.toAST() =
-    Parameter(simpleIdentifier().text, Type(type().text, arrayOf(), positionZero), position)
+    Parameter(simpleIdentifier().text, type().toAST(), position)
+
+fun AblaParser.TypeContext.toAST(): Type =
+    userType()?.toAST() ?:
+        parenthesizedType()?.type()?.toAST() ?:
+        functionType()?.toAST() ?:
+        nullableType()?.userType()?.let { NullableType(it.toAST(), position) } ?:
+        throw IllegalStateException("Unknown type in $text, $position")
+
+fun AblaParser.UserTypeContext.toAST(): UserType {
+    val iterator = simpleUserType().iterator()
+    if (!iterator.hasNext()) throw UnsupportedOperationException("Empty collection can't be reduced.")
+    var accumulator: UserType = iterator.next().toAST(null)
+    while (iterator.hasNext()) {
+        accumulator = iterator.next().toAST(accumulator)
+    }
+    return accumulator
+}
+
+fun AblaParser.FunctionTypeContext.toAST(): FunctionType =
+    FunctionType(
+        functionTypeParameters().functionTypeParameter().map { it.toAST() }.toTypedArray(),
+        type().toAST(),
+        functionTypeReceiver()?.toAST(),
+        position
+    )
+
+fun AblaParser.FunctionTypeReceiverContext.toAST(): Type =
+    userType()?.toAST() ?:
+        parenthesizedType()?.type()?.toAST() ?:
+        nullableType()?.userType()?.let { NullableType(it.toAST(), position) } ?:
+        throw IllegalStateException("Unknown function receiver type type in $text, $position")
+
+fun AblaParser.FunctionTypeParameterContext.toAST(): Parameter =
+    parameter()?.toAST() ?:
+            type()?.toAST()?.let { Parameter("", it, position) } ?:
+            throw IllegalStateException("Unknown function type parameter type in $text, $position")
+
+fun AblaParser.SimpleUserTypeContext.toAST(parent: UserType?): UserType =
+    UserType(
+        this.simpleIdentifier().text,
+        typeArguments()?.type()?.mapNotNull { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        parent,
+        position
+    )
 
 fun AblaParser.FunctionBodyContext.toAST(): Block =
     when (this) {
