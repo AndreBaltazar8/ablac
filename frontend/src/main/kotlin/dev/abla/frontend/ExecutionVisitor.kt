@@ -7,7 +7,6 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.runBlocking
 import java.lang.IllegalStateException
 import java.nio.file.FileSystems
 import java.util.*
@@ -152,6 +151,23 @@ class ExecutionVisitor(
                     it.accept(this)
             }
         }
+    }
+
+    override suspend fun visit(binaryOperation: BinaryOperation) {
+        if (executionLayer > 0) {
+            binaryOperation.lhs.accept(this)
+            val lhsValue = values.pop().toValue(currentScope!!) as Int
+            binaryOperation.rhs.accept(this)
+            val rhsValue = values.pop().toValue(currentScope!!) as Int
+            val result = when (binaryOperation.operator) {
+                BinaryOperator.Plus -> lhsValue + rhsValue
+                BinaryOperator.Minus -> lhsValue - rhsValue
+                BinaryOperator.Mul -> lhsValue * rhsValue
+                BinaryOperator.Div -> lhsValue / rhsValue
+            }.toString()
+            values.push(Integer(result, positionZero))
+        } else
+            super.visit(binaryOperation)
     }
 
     /*

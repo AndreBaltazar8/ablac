@@ -66,9 +66,19 @@ block : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
 statement : expression # expressionStatement
           ;
 
-expression : prefixUnaryOperation expression # perfixExpression
-           | primaryExpression postfixUnarySuffix* # suffixExpression
-           ;
+expression : binaryOperationHigher binaryOperationOps* ;
+binaryOperationOps : binaryOperatorLower binaryOperationHigher ;
+
+binaryOperationHigher : atomicExpression binaryOperationHigherOps* ;
+binaryOperationHigherOps : binaryOperatorHigher atomicExpression ;
+
+atomicExpression : prefixUnaryOperation atomicExpression # perfixExpression
+                 | primaryExpression postfixUnarySuffix* # suffixExpression
+                 | LPAREN expression RPAREN #parenthesizedExpression
+                 ;
+
+binaryOperatorHigher : MUL | DIV ;
+binaryOperatorLower : PLUS | MINUS ;
 
 primaryExpression : simpleIdentifier # simpleIdentifierExpression
                   | literal # literalExpression

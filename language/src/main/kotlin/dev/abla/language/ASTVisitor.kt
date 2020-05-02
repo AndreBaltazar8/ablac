@@ -44,4 +44,9 @@ abstract class ASTVisitor {
     open suspend fun visit(classDeclaration: ClassDeclaration) {
         classDeclaration.declarations.forEach { it.accept(this) }
     }
+
+    open suspend fun visit(binaryOperation: BinaryOperation) {
+        binaryOperation.lhs.accept(this)
+        binaryOperation.rhs.accept(this)
+    }
 }

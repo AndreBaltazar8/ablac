@@ -148,14 +148,45 @@ fun AblaParser.ValueArgumentContext.toAST() =
     Argument(simpleIdentifier()?.text, expression().toAST(), position)
 
 fun AblaParser.ExpressionContext.toAST(): Expression =
+    binaryOperationOps()?.fold(binaryOperationHigher().toAST()) { acc, it ->
+        BinaryOperation(
+            it.binaryOperatorLower().toAST(),
+            acc,
+            it.binaryOperationHigher().toAST(),
+            position
+        )
+    } ?: binaryOperationHigher().toAST()
+
+fun AblaParser.BinaryOperationHigherContext.toAST(): Expression =
+    binaryOperationHigherOps()?.asSequence()?.fold(atomicExpression().toAST()) { acc, it ->
+        BinaryOperation(
+            it.binaryOperatorHigher().toAST(),
+            acc,
+            it.atomicExpression().toAST(),
+            position
+        )
+    } ?: atomicExpression().toAST()
+
+fun AblaParser.AtomicExpressionContext.toAST(): Expression =
     when (this) {
-        is AblaParser.PerfixExpressionContext -> prefixUnaryOperation().toAST(expression().toAST())
+        is AblaParser.PerfixExpressionContext -> prefixUnaryOperation().toAST(atomicExpression().toAST())
         is AblaParser.SuffixExpressionContext ->
             postfixUnarySuffix().fold<AblaParser.PostfixUnarySuffixContext, PrimaryExpression>(primaryExpression().toAST()) { acc, suffix ->
                 suffix.toAST(acc)
             }
+        is AblaParser.ParenthesizedExpressionContext -> expression().toAST()
         else -> throw IllegalStateException("Unknown expression type ${this::class.simpleName}")
     }
+
+fun AblaParser.BinaryOperatorLowerContext.toAST(): BinaryOperator =
+    PLUS()?.let { BinaryOperator.Plus } ?:
+        MINUS()?.let { BinaryOperator.Minus } ?:
+        throw IllegalStateException("Unknown operator lower type $text, $position")
+
+fun AblaParser.BinaryOperatorHigherContext.toAST(): BinaryOperator =
+    MUL()?.let { BinaryOperator.Mul } ?:
+        DIV()?.let { BinaryOperator.Div } ?:
+        throw IllegalStateException("Unknown operator higher type $text, $position")
 
 fun AblaParser.PrefixUnaryOperationContext.toAST(expression: Expression) =
     when (this) {

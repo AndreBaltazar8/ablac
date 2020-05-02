@@ -26,6 +26,10 @@ CLASS : 'class' ;
 QUEST : '?' ;
 LANGLE : '<' ;
 RANGLE : '>' ;
+PLUS : '+' ;
+MINUS : '-' ;
+MUL : '*' ;
+DIV : '/' ;
 
 BooleanLiteral : 'true' | 'false' ;
 IntegerLiteral : DigitNoZero DigitOrSeparator* Digit | Digit ;

@@ -137,4 +137,20 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         generatorContext.popBlock(false)
         generatorContext.values.push(functionLiteral.llvmValue!!)
     }
+
+    override suspend fun visit(binaryOperation: BinaryOperation) {
+        binaryOperation.lhs.accept(this)
+        val lhsValue = generatorContext.topValuePop
+        binaryOperation.rhs.accept(this)
+        val rhsValue = generatorContext.topValuePop
+        val builder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+        val result = when (binaryOperation.operator) {
+            BinaryOperator.Plus -> LLVMBuildAdd(builder, lhsValue, rhsValue, "")
+            BinaryOperator.Minus -> LLVMBuildSub(builder, lhsValue, rhsValue, "")
+            BinaryOperator.Mul -> LLVMBuildMul(builder, lhsValue, rhsValue, "")
+            BinaryOperator.Div -> LLVMBuildSDiv(builder, lhsValue, rhsValue, "")
+        }
+        generatorContext.values.push(result)
+    }
 }
