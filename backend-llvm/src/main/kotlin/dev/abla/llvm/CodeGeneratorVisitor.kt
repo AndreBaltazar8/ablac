@@ -52,9 +52,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
             val builder = LLVMCreateBuilder()
             LLVMPositionBuilderAtEnd(builder, currentBlock.block)
-            if (generatorContext.values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid()) {
+            if (generatorContext.values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid())
                 LLVMBuildRet(builder, generatorContext.topValue)
-            }
+            else
+                LLVMBuildRetVoid(builder)
             currentBlock.hasReturned = true
         }
 
