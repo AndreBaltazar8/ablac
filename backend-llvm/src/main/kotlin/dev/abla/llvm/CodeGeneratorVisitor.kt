@@ -150,6 +150,12 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             BinaryOperator.Minus -> LLVMBuildSub(builder, lhsValue, rhsValue, "")
             BinaryOperator.Mul -> LLVMBuildMul(builder, lhsValue, rhsValue, "")
             BinaryOperator.Div -> LLVMBuildSDiv(builder, lhsValue, rhsValue, "")
+            BinaryOperator.Equals -> LLVMBuildICmp(builder, LLVMIntEQ, lhsValue, rhsValue, "")
+            BinaryOperator.NotEquals -> LLVMBuildICmp(builder, LLVMIntNE, lhsValue, rhsValue, "")
+            BinaryOperator.GreaterThan -> LLVMBuildICmp(builder, LLVMIntSGT, lhsValue, rhsValue, "")
+            BinaryOperator.LesserThan -> LLVMBuildICmp(builder, LLVMIntSLT, lhsValue, rhsValue, "")
+            BinaryOperator.GreaterThanEqual -> LLVMBuildICmp(builder, LLVMIntSGE, lhsValue, rhsValue, "")
+            BinaryOperator.LesserThanEqual -> LLVMBuildICmp(builder, LLVMIntSLE, lhsValue, rhsValue, "")
         }
         generatorContext.values.push(result)
     }

@@ -15,5 +15,8 @@ data class BinaryOperation(
 }
 
 enum class BinaryOperator {
-    Plus, Minus, Mul, Div
+    Plus, Minus, Mul, Div,
+    Equals, NotEquals,
+    GreaterThan, LesserThan,
+    GreaterThanEqual, LesserThanEqual
 }

@@ -66,7 +66,13 @@ block : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
 statement : expression # expressionStatement
           ;
 
-expression : binaryOperationHigher binaryOperationOps* ;
+expression : comparisonOperation equalityOperationOps* ;
+equalityOperationOps : equalityOperator comparisonOperation ;
+
+comparisonOperation : arithmaticOperationLower comparisonOperationOps* ;
+comparisonOperationOps : comparisonOperator arithmaticOperationLower ;
+
+arithmaticOperationLower : binaryOperationHigher binaryOperationOps* ;
 binaryOperationOps : binaryOperatorLower binaryOperationHigher ;
 
 binaryOperationHigher : atomicExpression binaryOperationHigherOps* ;
@@ -77,6 +83,8 @@ atomicExpression : prefixUnaryOperation atomicExpression # perfixExpression
                  | LPAREN expression RPAREN #parenthesizedExpression
                  ;
 
+equalityOperator : EQUALS | NOT_EQUALS ;
+comparisonOperator : RANGLE | LANGLE | GTE | LTE ;
 binaryOperatorHigher : MUL | DIV ;
 binaryOperatorLower : PLUS | MINUS ;
 

@@ -30,6 +30,10 @@ PLUS : '+' ;
 MINUS : '-' ;
 MUL : '*' ;
 DIV : '/' ;
+EQUALS : '==' ;
+NOT_EQUALS : '!=' ;
+GTE : '>=' ;
+LTE : '<=' ;
 
 BooleanLiteral : 'true' | 'false' ;
 IntegerLiteral : DigitNoZero DigitOrSeparator* Digit | Digit ;

@@ -148,6 +148,26 @@ fun AblaParser.ValueArgumentContext.toAST() =
     Argument(simpleIdentifier()?.text, expression().toAST(), position)
 
 fun AblaParser.ExpressionContext.toAST(): Expression =
+    equalityOperationOps()?.fold(comparisonOperation().toAST()) { acc, it ->
+        BinaryOperation(
+            it.equalityOperator().toAST(),
+            acc,
+            it.comparisonOperation().toAST(),
+            position
+        )
+    } ?: comparisonOperation().toAST()
+
+fun AblaParser.ComparisonOperationContext.toAST(): Expression =
+    comparisonOperationOps()?.fold(arithmaticOperationLower().toAST()) { acc, it ->
+        BinaryOperation(
+            it.comparisonOperator().toAST(),
+            acc,
+            it.arithmaticOperationLower().toAST(),
+            position
+        )
+    } ?: arithmaticOperationLower().toAST()
+
+fun AblaParser.ArithmaticOperationLowerContext.toAST(): Expression =
     binaryOperationOps()?.fold(binaryOperationHigher().toAST()) { acc, it ->
         BinaryOperation(
             it.binaryOperatorLower().toAST(),
@@ -177,6 +197,18 @@ fun AblaParser.AtomicExpressionContext.toAST(): Expression =
         is AblaParser.ParenthesizedExpressionContext -> expression().toAST()
         else -> throw IllegalStateException("Unknown expression type ${this::class.simpleName}")
     }
+
+fun AblaParser.EqualityOperatorContext.toAST(): BinaryOperator =
+    EQUALS()?.let { BinaryOperator.Equals } ?:
+    NOT_EQUALS()?.let { BinaryOperator.NotEquals } ?:
+    throw IllegalStateException("Unknown equality operator type $text, $position")
+
+fun AblaParser.ComparisonOperatorContext.toAST(): BinaryOperator =
+    RANGLE()?.let { BinaryOperator.GreaterThan } ?:
+        LANGLE()?.let { BinaryOperator.LesserThan } ?:
+        GTE()?.let { BinaryOperator.GreaterThanEqual } ?:
+        LTE()?.let { BinaryOperator.LesserThanEqual } ?:
+        throw IllegalStateException("Unknown comparison operator type $text, $position")
 
 fun AblaParser.BinaryOperatorLowerContext.toAST(): BinaryOperator =
     PLUS()?.let { BinaryOperator.Plus } ?:

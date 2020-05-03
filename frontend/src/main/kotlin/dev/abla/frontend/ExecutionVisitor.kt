@@ -164,6 +164,12 @@ class ExecutionVisitor(
                 BinaryOperator.Minus -> lhsValue - rhsValue
                 BinaryOperator.Mul -> lhsValue * rhsValue
                 BinaryOperator.Div -> lhsValue / rhsValue
+                BinaryOperator.Equals -> if (lhsValue == rhsValue) 1 else 0
+                BinaryOperator.NotEquals -> if (lhsValue != rhsValue) 1 else 0
+                BinaryOperator.GreaterThan -> if (lhsValue > rhsValue) 1 else 0
+                BinaryOperator.LesserThan -> if (lhsValue < rhsValue) 1 else 0
+                BinaryOperator.GreaterThanEqual -> if (lhsValue >= rhsValue) 1 else 0
+                BinaryOperator.LesserThanEqual -> if (lhsValue <= rhsValue) 1 else 0
             }.toString()
             values.push(Integer(result, positionZero))
         } else
