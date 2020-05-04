@@ -110,6 +110,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Basic string support
 - Basic function calls
 - Basic operators and comparison for int
+- Basic support for if-else expressions
 - Hardcoded function lambda functionality
 - Import new file
 - Parallel processing of imported files
@@ -126,7 +127,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Support `const char*` from C as native type that can be used in abla even though strings in abla will probably not be simple null-terminated strings
   * Creating a new built-in type that allows automatic conversion between `const char*` and `string` implementation in abla
 - Add operators and comparisons for all types
-- If/else
+- If/else statements
 - Switch/When
 - Loops
 - Add simple build-in types (string, int)
