@@ -1,11 +1,10 @@
 package dev.abla.frontend
 
-import dev.abla.common.Symbol
-import dev.abla.common.SymbolTable
-import dev.abla.common.symbolTable
+import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.File
 import dev.abla.language.nodes.FunctionDeclaration
+import dev.abla.language.nodes.IfElseExpression
 import java.util.*
 
 class TypeGather(private val global: SymbolTable) : ASTVisitor() {
@@ -38,5 +37,27 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
 
         functionDeclaration.block?.accept(this)
         tables.pop()
+    }
+
+    override suspend fun visit(ifElseExpression: IfElseExpression) {
+        ifElseExpression.condition.accept(this)
+
+        val ifBody = ifElseExpression.ifBody
+        if (ifBody != null) {
+            val ifTable = SymbolTable(tables.peek())
+            tables.push(ifTable)
+            ifElseExpression.ifSymbolTable = ifTable
+            ifBody.accept(this)
+            tables.pop()
+        }
+
+        val elseBody = ifElseExpression.elseBody
+        if (elseBody != null) {
+            val elseTable = SymbolTable(tables.peek())
+            tables.push(elseTable)
+            ifElseExpression.elseSymbolTable = elseTable
+            elseBody.accept(this)
+            tables.pop()
+        }
     }
 }

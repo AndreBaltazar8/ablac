@@ -10,6 +10,7 @@ import java.util.*
 
 class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     private val blocks = Stack<LLVMBasicBlockRef>()
+    private val functions = Stack<LLVMValueRef>()
     private val typeScopes = Stack<TypeScope>()
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
@@ -33,6 +34,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         )
         typeScopes.lastOrNull()?.methods?.add(function)
         functionDeclaration.llvmValue = function.valueRef
+        functions.push(function.valueRef)
 
         if (functionDeclaration.isExtern)
             function.valueRef.setLinkage(LLVMExternalLinkage)
@@ -51,6 +53,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
             blocks.pop()
         }
+        functions.pop()
     }
 
     override suspend fun visit(classDeclaration: ClassDeclaration) {
@@ -81,5 +84,31 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         functionLiteral.llvmValue = function
         super.visit(functionLiteral)
         blocks.pop()
+    }
+
+    override suspend fun visit(ifElseExpression: IfElseExpression) {
+        val function = functions[functions.lastIndex]
+
+        ifElseExpression.condition.accept(this)
+
+        function.appendBasicBlock("if_block") {
+            ifElseExpression.llvmIfBlock = this
+            blocks.push(this)
+        }
+        ifElseExpression.ifBody?.accept(this)
+        blocks.pop()
+
+        function.appendBasicBlock("else_block") {
+            ifElseExpression.llvmElseBlock = this
+            blocks.push(this)
+        }
+        ifElseExpression.elseBody?.accept(this)
+        blocks.pop()
+
+        function.appendBasicBlock("if_cont_block") {
+            ifElseExpression.llvmContBlock = this
+            blocks.pop()
+            blocks.push(this)
+        }
     }
 }

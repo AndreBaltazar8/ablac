@@ -2,6 +2,8 @@ package dev.abla.frontend
 
 import com.sun.jna.NativeLibrary
 import dev.abla.common.SymbolTable
+import dev.abla.common.elseSymbolTable
+import dev.abla.common.ifSymbolTable
 import dev.abla.common.symbolTable
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
@@ -44,7 +46,7 @@ class ExecutionVisitor(
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         withTable(functionDeclaration.symbolTable) {
             if (executionLayer > 0) {
-                functionDeclaration.parameters.forEach {
+                functionDeclaration.parameters.reversed().forEach {
                     currentScope!![it.name] = values.pop()
                 }
 
@@ -174,6 +176,26 @@ class ExecutionVisitor(
             values.push(Integer(result, positionZero))
         } else
             super.visit(binaryOperation)
+    }
+
+    override suspend fun visit(ifElseExpression: IfElseExpression) {
+        if (executionLayer > 0) {
+            ifElseExpression.condition.accept(this)
+            val conditionValue = values.pop().toValue(currentScope!!)
+            val conditionTrue = conditionValue as Int == 1
+            val ifBody = ifElseExpression.ifBody
+            val elseBody = ifElseExpression.elseBody
+            if (conditionTrue && ifBody != null) {
+                withTable(ifElseExpression.ifSymbolTable) {
+                    ifBody.accept(this)
+                }
+            } else if (!conditionTrue && elseBody != null) {
+                withTable(ifElseExpression.elseSymbolTable) {
+                    elseBody.accept(this)
+                }
+            }
+        } else
+            super.visit(ifElseExpression)
     }
 
     /*

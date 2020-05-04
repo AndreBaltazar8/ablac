@@ -1,5 +1,7 @@
 package dev.abla.llvm
 
+import dev.abla.common.elseSymbolTable
+import dev.abla.common.ifSymbolTable
 import dev.abla.common.symbolTable
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
@@ -61,6 +63,15 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         generatorContext.values.clear()
         generatorContext.popBlock(false)
+    }
+
+    override suspend fun visit(block: Block) {
+        val topBlock = generatorContext.topBlock
+        for (statement in block.statements) {
+            if (topBlock.hasReturned)
+                return // the rest of statements are dead code
+            statement.accept(this)
+        }
     }
 
     override suspend fun visit(identifierExpression: IdentifierExpression) {
@@ -158,5 +169,59 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             BinaryOperator.LesserThanEqual -> LLVMBuildICmp(builder, LLVMIntSLE, lhsValue, rhsValue, "")
         }
         generatorContext.values.push(result)
+    }
+
+    override suspend fun visit(ifElseExpression: IfElseExpression) {
+        val ifBlock = ifElseExpression.llvmIfBlock!!
+        val elseBlock = ifElseExpression.llvmElseBlock!!
+
+        val builder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+
+        ifElseExpression.condition.accept(this)
+        val condition = generatorContext.topValuePop
+
+        val ifElseResult = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
+        LLVMBuildCondBr(builder, condition, ifBlock, elseBlock)
+
+        val codeIfBlock = generatorContext.pushBlock(ifBlock, ifElseExpression.ifSymbolTable!!)
+        val ifBody = ifElseExpression.ifBody
+        ifBody?.accept(this)
+        val ifRetuned = codeIfBlock.hasReturned
+        LLVMCreateBuilder().apply {
+            LLVMPositionBuilderAtEnd(this, codeIfBlock.block)
+            LLVMBuildStore(this, generatorContext.topValuePop, ifElseResult)
+        }
+        generatorContext.popBlock(true)
+
+        val codeElseBlock = generatorContext.pushBlock(elseBlock, ifElseExpression.elseSymbolTable!!)
+        val elseBody = ifElseExpression.elseBody
+        elseBody?.accept(this)
+        val elseRetuned = codeElseBlock.hasReturned
+        if (elseBody != null) {
+            LLVMCreateBuilder().apply {
+                LLVMPositionBuilderAtEnd(this, codeElseBlock.block)
+                LLVMBuildStore(this, generatorContext.topValuePop, ifElseResult)
+            }
+        }
+        generatorContext.popBlock(true)
+
+        val contBlock = ifElseExpression.llvmContBlock!!
+        if (!ifRetuned) {
+            val ifBuilder = LLVMCreateBuilder()
+            LLVMPositionBuilderAtEnd(ifBuilder, codeIfBlock.block)
+            LLVMBuildBr(ifBuilder, contBlock)
+        }
+
+        if (!elseRetuned) {
+            val elseBuilder = LLVMCreateBuilder()
+            LLVMPositionBuilderAtEnd(elseBuilder, codeElseBlock.block)
+            LLVMBuildBr(elseBuilder, contBlock)
+        }
+
+        generatorContext.pushReplaceBlock(contBlock, generatorContext.topBlock.table)
+        val lastBuilder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(lastBuilder, generatorContext.topBlock.block)
+        generatorContext.values.push(LLVMBuildLoad(lastBuilder, ifElseResult, ""))
     }
 }

@@ -1,9 +1,6 @@
 package dev.abla.llvm
 
-import dev.abla.language.nodes.FunctionType
-import dev.abla.language.nodes.Node
-import dev.abla.language.nodes.Type
-import dev.abla.language.nodes.UserType
+import dev.abla.language.nodes.*
 import dev.abla.utils.BackingField
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.LLVMBasicBlockRef
@@ -13,6 +10,9 @@ import org.bytedeco.llvm.global.LLVM
 
 var Node.llvmValue: LLVMValueRef? by BackingField.nullable()
 var Node.llvmBlock: LLVMBasicBlockRef? by BackingField.nullable()
+var IfElseExpression.llvmIfBlock: LLVMBasicBlockRef? by BackingField.nullable()
+var IfElseExpression.llvmElseBlock: LLVMBasicBlockRef? by BackingField.nullable()
+var IfElseExpression.llvmContBlock: LLVMBasicBlockRef? by BackingField.nullable()
 val Type.llvmType: LLVMTypeRef
     get() = when {
         this is FunctionType -> LLVM.LLVMPointerType(

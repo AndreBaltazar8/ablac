@@ -195,8 +195,14 @@ fun AblaParser.AtomicExpressionContext.toAST(): Expression =
                 suffix.toAST(acc)
             }
         is AblaParser.ParenthesizedExpressionContext -> expression().toAST()
+        is AblaParser.IfExpressionContext -> IfElseExpression(condition.toAST(), ifBody?.toAST(), elseBody?.toAST(), position)
         else -> throw IllegalStateException("Unknown expression type ${this::class.simpleName}")
     }
+
+fun AblaParser.ControlStructureBodyContext.toAST(): Block =
+    block()?.toAST() ?:
+        statement()?.toAST()?.let { Block(arrayOf(it), positionZero) } ?:
+        throw IllegalStateException("Unknown control structure block $text, $position")
 
 fun AblaParser.EqualityOperatorContext.toAST(): BinaryOperator =
     EQUALS()?.let { BinaryOperator.Equals } ?:

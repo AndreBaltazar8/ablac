@@ -49,4 +49,10 @@ abstract class ASTVisitor {
         binaryOperation.lhs.accept(this)
         binaryOperation.rhs.accept(this)
     }
+
+    open suspend fun visit(ifElseExpression: IfElseExpression) {
+        ifElseExpression.condition.accept(this)
+        ifElseExpression.ifBody?.accept(this)
+        ifElseExpression.elseBody?.accept(this)
+    }
 }

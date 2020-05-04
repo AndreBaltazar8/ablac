@@ -81,7 +81,10 @@ binaryOperationHigherOps : binaryOperatorHigher atomicExpression ;
 atomicExpression : prefixUnaryOperation atomicExpression # perfixExpression
                  | primaryExpression postfixUnarySuffix* # suffixExpression
                  | LPAREN expression RPAREN #parenthesizedExpression
+                 | IF LPAREN condition=expression RPAREN ifBody=controlStructureBody (ELSE elseBody=controlStructureBody)? #ifExpression
                  ;
+
+controlStructureBody : block | statement ;
 
 equalityOperator : EQUALS | NOT_EQUALS ;
 comparisonOperator : RANGLE | LANGLE | GTE | LTE ;

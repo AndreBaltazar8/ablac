@@ -23,6 +23,8 @@ AT : '@' ;
 EXTERN : 'extern' ;
 COMPILER : 'compiler' ;
 CLASS : 'class' ;
+IF : 'if' ;
+ELSE : 'else' ;
 QUEST : '?' ;
 LANGLE : '<' ;
 RANGLE : '>' ;
