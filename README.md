@@ -131,14 +131,13 @@ These the current and planned features for the language. It is not exhaustive li
 - Switch/When
 - Loops
 - Add simple build-in types (string, int)
-- Function calls to defined types/classes
+- Function calls to defined types/classes (direct and vtable)
 - Type checking everything
 - Class object allocation
 - Class construction
 - Extension functions
 - Variable declarations (in functions, globally and class fields)
 - Send values to lambdas and other scopes
-- Call to methods in classes
 - Sending compiler context to functions with "compile" modifier
   * Allow reading compiler info
   * Allow modification of code

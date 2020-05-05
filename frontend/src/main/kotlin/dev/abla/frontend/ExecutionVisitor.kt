@@ -138,9 +138,9 @@ class ExecutionVisitor(
 
             function.let {
                 if (it is CompilerFunctionDeclaration)
-                    values.add(it.executionBlock(this, functionCall.arguments.map {
+                    values.add(it.executionBlock(this, functionCall.arguments.reversed().map {
                         values.pop().toValue(currentScope!!)
-                    }.toTypedArray()))
+                    }.reversed().toTypedArray()))
                 else if (it is FunctionLiteral) {
                     val numValues = values.size
                     it.block.accept(this)
@@ -230,6 +230,7 @@ class ExecutionVisitor(
                     }
                 }.joinToString("")
             }
+            is FunctionLiteral -> this
             else -> throw Exception("Unknown literal conversion")
         }
 }

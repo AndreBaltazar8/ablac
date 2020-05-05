@@ -181,6 +181,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         ifElseExpression.condition.accept(this)
         val condition = generatorContext.topValuePop
 
+        // TODO: not easy to determine if this if is an expression or statement
         val ifElseResult = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
         LLVMBuildCondBr(builder, condition, ifBlock, elseBlock)
 
