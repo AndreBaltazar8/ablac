@@ -63,7 +63,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         super.visit(classDeclaration)
         val vTableType = module.registerTypeVtable(
             classDeclaration.name,
-            scope.methods.map { it.type }.toTypedArray(),
+            scope.methods.map { LLVMPointerType(it.type, 0) }.toTypedArray(),
             scope.methods.map { it.valueRef }.toTypedArray()
         )
         LLVMStructSetBody(
