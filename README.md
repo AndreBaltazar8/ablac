@@ -111,6 +111,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Basic function calls
 - Basic operators and comparison for int
 - Basic support for if-else expressions
+- Basic variable declarations
 - Hardcoded function lambda functionality
 - Import new file
 - Parallel processing of imported files
@@ -136,7 +137,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Class object allocation
 - Class construction
 - Extension functions
-- Variable declarations (in functions, globally and class fields)
+- Variable declarations with type check (in functions, globally and class fields)
 - Send values to lambdas and other scopes
 - Sending compiler context to functions with "compile" modifier
   * Allow reading compiler info

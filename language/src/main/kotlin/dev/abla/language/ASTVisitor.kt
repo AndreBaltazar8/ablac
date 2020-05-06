@@ -55,4 +55,8 @@ abstract class ASTVisitor {
         ifElseExpression.ifBody?.accept(this)
         ifElseExpression.elseBody?.accept(this)
     }
+
+    open suspend fun visit(propertyDeclaration: PropertyDeclaration) {
+        propertyDeclaration.value?.accept(this)
+    }
 }

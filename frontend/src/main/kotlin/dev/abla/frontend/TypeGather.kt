@@ -5,6 +5,7 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.File
 import dev.abla.language.nodes.FunctionDeclaration
 import dev.abla.language.nodes.IfElseExpression
+import dev.abla.language.nodes.PropertyDeclaration
 import java.util.*
 
 class TypeGather(private val global: SymbolTable) : ASTVisitor() {
@@ -59,5 +60,12 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
             elseBody.accept(this)
             tables.pop()
         }
+    }
+
+    override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
+        val variable = Symbol.Variable(propertyDeclaration.name, propertyDeclaration)
+        tables.peek().symbols.add(variable)
+
+        super.visit(propertyDeclaration)
     }
 }

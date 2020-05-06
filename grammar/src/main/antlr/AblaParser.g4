@@ -10,6 +10,7 @@ file : fileDeclaration* EOF ;
 fileDeclaration : functionDeclaration # functionDeclarationFD
                 | compilerCall # compilerCallFD
                 | classDeclaration # classDeclarationFD
+                | propertyDeclaration #propertyDeclarationFD
                 ;
 
 functionDeclaration: modifierList? FUN (functionTypeReceiver DOT)? functionName = simpleIdentifier (typeParameters)? functionDeclarationParameters? (COLON type)? functionBody? ;
@@ -23,6 +24,7 @@ classDeclaration : modifierList? CLASS className = simpleIdentifier (typeParamet
 classBody : LCURL classMemberDeclaration* RCURL ;
 classMemberDeclaration : classDeclaration
                        | functionDeclaration
+                       | propertyDeclaration
                        ;
 
 parameter : simpleIdentifier COLON type ;
@@ -64,7 +66,12 @@ functionBody : block # blockBody
 block : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
 
 statement : expression # expressionStatement
+          | propertyDeclaration #propertyDeclarationStatement
           ;
+
+propertyDeclaration : (VAR | VAL) variableDeclaration (ASSIGNMENT expression)? ;
+
+variableDeclaration : simpleIdentifier (COLON type)? ;
 
 expression : comparisonOperation equalityOperationOps* ;
 equalityOperationOps : equalityOperator comparisonOperation ;

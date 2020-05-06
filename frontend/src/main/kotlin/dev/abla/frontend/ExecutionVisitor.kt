@@ -79,8 +79,11 @@ class ExecutionVisitor(
     }
 
     override suspend fun visit(identifierExpression: IdentifierExpression) {
-        if (executionLayer > 0)
-            values.push(currentScope!![identifierExpression.identifier])
+        if (executionLayer > 0) {
+            val value = currentScope!![identifierExpression.identifier]
+            //?: throw IllegalStateException("Unknown value for identifier ${identifierExpression.identifier}") // TODO: check for this later
+            values.push(value)
+        }
     }
 
     override suspend fun visit(compilerExec: CompilerExec) {
@@ -196,6 +199,16 @@ class ExecutionVisitor(
             }
         } else
             super.visit(ifElseExpression)
+    }
+
+    override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
+        if (executionLayer > 0) {
+            propertyDeclaration.value?.let {
+                it.accept(this)
+                currentScope!![propertyDeclaration.name] = values.pop()
+            }
+        } else
+            super.visit(propertyDeclaration)
     }
 
     /*

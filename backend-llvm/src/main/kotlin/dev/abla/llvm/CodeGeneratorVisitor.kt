@@ -78,9 +78,19 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val currentBlock = generatorContext.topBlock
         val value = currentBlock.table.find(identifierExpression.identifier)
             ?: throw Exception("Unknown value for identifier ${identifierExpression.identifier}")
+
         if (value.node.llvmValue == null)
             throw Exception("Cannot get llvm value for ${identifierExpression.identifier}. Is it a compiler function?")
-        generatorContext.values.push(value.node.llvmValue)
+
+        val node = value.node
+        val llvmValue = if (node is PropertyDeclaration && !node.isFinal) {
+            val builder = LLVMCreateBuilder()
+            LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+            LLVMBuildLoad(builder, node.llvmValue, "")
+        } else
+            node.llvmValue
+
+        generatorContext.values.push(llvmValue)
     }
 
     override suspend fun visit(functionCall: FunctionCall) {
@@ -224,5 +234,24 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val lastBuilder = LLVMCreateBuilder()
         LLVMPositionBuilderAtEnd(lastBuilder, generatorContext.topBlock.block)
         generatorContext.values.push(LLVMBuildLoad(lastBuilder, ifElseResult, ""))
+    }
+
+    override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
+        if (propertyDeclaration.isFinal) {
+            val value = propertyDeclaration.value
+                ?: throw IllegalStateException("${propertyDeclaration.name} must have an initialization")
+            value.accept(this)
+            propertyDeclaration.llvmValue = generatorContext.topValuePop
+        } else {
+            val builder = LLVMCreateBuilder()
+            LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+            val allocation = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
+            val value = propertyDeclaration.value
+            if (value != null) {
+                value.accept(this)
+                LLVMBuildStore(builder, generatorContext.topValuePop, allocation)
+            }
+            propertyDeclaration.llvmValue = allocation
+        }
     }
 }

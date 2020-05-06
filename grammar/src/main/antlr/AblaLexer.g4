@@ -25,6 +25,8 @@ COMPILER : 'compiler' ;
 CLASS : 'class' ;
 IF : 'if' ;
 ELSE : 'else' ;
+VAR : 'var' ;
+VAL : 'val' ;
 QUEST : '?' ;
 LANGLE : '<' ;
 RANGLE : '>' ;

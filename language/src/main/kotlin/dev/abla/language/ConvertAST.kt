@@ -17,6 +17,7 @@ fun AblaParser.FileDeclarationContext.toAST(): Declaration =
         is AblaParser.FunctionDeclarationFDContext -> functionDeclaration().toAST()
         is AblaParser.CompilerCallFDContext -> compilerCall().toAST()
         is AblaParser.ClassDeclarationFDContext -> classDeclaration().toAST()
+        is AblaParser.PropertyDeclarationFDContext -> propertyDeclaration().toAST()
         else -> throw IllegalStateException("Unknown declaration type ${this::class.simpleName}")
     }
 
@@ -42,8 +43,9 @@ fun AblaParser.ClassDeclarationContext.toAST() =
 
 fun AblaParser.ClassMemberDeclarationContext.toAST() : Declaration =
     functionDeclaration()?.toAST() ?:
-            classDeclaration()?.toAST() ?:
-                throw IllegalStateException("Unknown class member type ${this::class.simpleName}")
+        classDeclaration()?.toAST() ?:
+        propertyDeclaration()?.toAST() ?:
+        throw IllegalStateException("Unknown class member type ${this::class.simpleName}")
 
 fun AblaParser.ModifierContext.toAST(): Modifier =
     when (this) {
@@ -123,8 +125,18 @@ fun AblaParser.BlockContext.toAST(): Block = Block(statement().mapNotNull { it.t
 fun AblaParser.StatementContext.toAST(): Statement =
     when (this) {
         is AblaParser.ExpressionStatementContext -> expression().toAST()
+        is AblaParser.PropertyDeclarationStatementContext -> propertyDeclaration().toAST()
         else -> throw IllegalStateException("Unknown statement type ${this::class.simpleName}")
     }
+
+fun AblaParser.PropertyDeclarationContext.toAST(): PropertyDeclaration =
+    PropertyDeclaration(
+        VAL() != null,
+        variableDeclaration().simpleIdentifier().text,
+        variableDeclaration().type()?.toAST(),
+        expression()?.toAST(),
+        position
+    )
 
 fun AblaParser.CompilerCallContext.toAST() =
     CompilerExec(
