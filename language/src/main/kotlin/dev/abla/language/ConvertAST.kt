@@ -159,7 +159,14 @@ fun AblaParser.CallSuffixContext.toAST(primaryExpression: PrimaryExpression) =
 fun AblaParser.ValueArgumentContext.toAST() =
     Argument(simpleIdentifier()?.text, expression().toAST(), position)
 
-fun AblaParser.ExpressionContext.toAST(): Expression =
+fun AblaParser.ExpressionContext.toAST(): Expression = assignmentExpression().toAST()
+
+fun AblaParser.AssignmentExpressionContext.toAST(): Expression =
+    applyAssignmentRightAssoc(equalityOperation().toAST(), assignmentExpressionAssignments()) {
+        AssignmentResolved(equalityOperation().toAST(), position)
+    }
+
+fun AblaParser.EqualityOperationContext.toAST(): Expression =
     equalityOperationOps()?.fold(comparisonOperation().toAST()) { acc, it ->
         BinaryOperation(
             it.equalityOperator().toAST(),
@@ -309,3 +316,31 @@ fun String.unescapeAbla(): String =
         'u' -> substring(2, 6).toInt(16).toChar().toString()
         else -> substring(1)
     }
+
+
+// Maybe there is an easier way?
+data class AssignmentResolved(val rhs: Expression, val position: Position)
+private inline fun <T> applyAssignmentRightAssoc(
+    first: Expression,
+    operations: List<T>?,
+    operationReduce: T.() -> AssignmentResolved
+): Expression {
+    if (operations == null)
+        return first
+    lateinit var last: AssignmentResolved
+    val iterator = operations.listIterator(operations.size)
+    if (iterator.hasPrevious()) {
+        last = iterator.previous().operationReduce()
+    } else
+        return first
+
+    if (!iterator.hasPrevious())
+        return Assignment(first, last.rhs, last.position)
+
+    while (iterator.hasPrevious()) {
+        val transformResult = iterator.previous().operationReduce()
+        last = transformResult.copy(rhs = Assignment(transformResult.rhs, last.rhs, last.position))
+    }
+
+    return Assignment(first, last.rhs, last.position)
+}

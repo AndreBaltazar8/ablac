@@ -211,6 +211,26 @@ class ExecutionVisitor(
             super.visit(propertyDeclaration)
     }
 
+    override suspend fun visit(assignment: Assignment) {
+        if (executionLayer > 0) {
+            val lhs = assignment.lhs
+            if (lhs is IdentifierExpression) {
+                val node = currentTable!!.find(lhs.identifier)?.node
+                when {
+                    node == null -> throw IllegalStateException("Unknown identifier ${lhs.identifier}")
+                    node is PropertyDeclaration && node.isFinal -> throw IllegalStateException("Cannot assign value to final variable ${lhs.identifier}")
+                    node is PropertyDeclaration -> {
+                        assignment.rhs.accept(this)
+                        currentScope!![lhs.identifier] = values[values.lastIndex]
+                    }
+                    else -> throw IllegalStateException("Only supports assignments to properties. Found: ${node.javaClass.simpleName}")
+                }
+            } else
+                throw IllegalStateException("Unknown assignment to expression of type ${assignment.rhs.javaClass.simpleName}")
+        } else
+            super.visit(assignment)
+    }
+
     /*
      * TODO: Forcing everything to join here. Maybe a solution could be found to force execution only until the type
      *  that we are looking for is found. This makes it continue to execute normally without being blocked

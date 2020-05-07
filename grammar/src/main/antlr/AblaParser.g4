@@ -73,7 +73,12 @@ propertyDeclaration : (VAR | VAL) variableDeclaration (ASSIGNMENT expression)? ;
 
 variableDeclaration : simpleIdentifier (COLON type)? ;
 
-expression : comparisonOperation equalityOperationOps* ;
+expression : assignmentExpression ;
+
+assignmentExpression : equalityOperation assignmentExpressionAssignments* ;
+assignmentExpressionAssignments : ASSIGNMENT equalityOperation ;
+
+equalityOperation : comparisonOperation equalityOperationOps* ;
 equalityOperationOps : equalityOperator comparisonOperation ;
 
 comparisonOperation : arithmaticOperationLower comparisonOperationOps* ;

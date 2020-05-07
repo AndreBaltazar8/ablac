@@ -84,10 +84,15 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         val node = value.node
         val llvmValue = if (node is PropertyDeclaration && !node.isFinal) {
-            val builder = LLVMCreateBuilder()
-            LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
-            LLVMBuildLoad(builder, node.llvmValue, "")
-        } else
+            if (returnForAssignment == 0) {
+                val builder = LLVMCreateBuilder()
+                LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+                LLVMBuildLoad(builder, node.llvmValue, "")
+            } else
+                node.llvmValue
+        } else if (returnForAssignment > 0)
+            throw java.lang.IllegalStateException("Cannot assign value to final identifier ${identifierExpression.identifier}")
+        else
             node.llvmValue
 
         generatorContext.values.push(llvmValue)
@@ -253,5 +258,20 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             }
             propertyDeclaration.llvmValue = allocation
         }
+    }
+
+    private var returnForAssignment: Int = 0
+    override suspend fun visit(assignment: Assignment) {
+        returnForAssignment++
+        assignment.lhs.accept(this)
+        returnForAssignment--
+
+        val allocation = generatorContext.topValuePop
+
+        assignment.rhs.accept(this)
+
+        val builder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+        LLVMBuildStore(builder, generatorContext.topValue, allocation)
     }
 }

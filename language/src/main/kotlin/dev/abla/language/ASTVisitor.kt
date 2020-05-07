@@ -59,4 +59,9 @@ abstract class ASTVisitor {
     open suspend fun visit(propertyDeclaration: PropertyDeclaration) {
         propertyDeclaration.value?.accept(this)
     }
+
+    open suspend fun visit(assignment: Assignment) {
+        assignment.lhs.accept(this)
+        assignment.rhs.accept(this)
+    }
 }
