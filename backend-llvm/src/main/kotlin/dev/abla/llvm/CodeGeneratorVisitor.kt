@@ -295,10 +295,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         generatorContext.popBlock(true)
 
         // Build main block
-        val mainBuilder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(mainBuilder, mainBlock)
         generatorContext.pushBlock(mainBlock, whileStatement.symbolTable!!)
         whileStatement.block?.accept(this)
+        val mainBuilder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(mainBuilder, generatorContext.topBlock.block)
         LLVMBuildBr(mainBuilder, conditionBlock)
         generatorContext.popBlock(true)
 
