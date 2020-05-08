@@ -67,7 +67,10 @@ block : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
 
 statement : expression # expressionStatement
           | propertyDeclaration #propertyDeclarationStatement
+          | whileStatement #whileStatementST
           ;
+
+whileStatement : WHILE nlsemiOrRCurlNoConsume LPAREN condition=expression RPAREN (controlStructureBody | SEMICOLON) ;
 
 propertyDeclaration : (VAR | VAL) variableDeclaration (ASSIGNMENT expression)? ;
 
@@ -93,7 +96,7 @@ binaryOperationHigherOps : binaryOperatorHigher atomicExpression ;
 atomicExpression : prefixUnaryOperation atomicExpression # perfixExpression
                  | primaryExpression postfixUnarySuffix* # suffixExpression
                  | LPAREN expression RPAREN #parenthesizedExpression
-                 | IF LPAREN condition=expression RPAREN ifBody=controlStructureBody (ELSE elseBody=controlStructureBody)? #ifExpression
+                 | IF LPAREN condition=expression RPAREN nlsemiOrRCurlNoConsume ifBody=controlStructureBody nlsemiOrRCurlNoConsume (ELSE nlsemiOrRCurlNoConsume elseBody=controlStructureBody)? #ifExpression
                  ;
 
 controlStructureBody : block | statement ;

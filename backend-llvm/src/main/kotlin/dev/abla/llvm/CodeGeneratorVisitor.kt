@@ -274,4 +274,35 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
         LLVMBuildStore(builder, generatorContext.topValue, allocation)
     }
+
+    override suspend fun visit(whileStatement: WhileStatement) {
+        val conditionBlock = whileStatement.llvmConditionBlock!!
+        val mainBlock = whileStatement.llvmBlock!!
+        val continuationBlock = whileStatement.llvmContBlock!!
+
+
+        val currentBuilder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(currentBuilder, generatorContext.topBlock.block)
+        LLVMBuildBr(currentBuilder, conditionBlock)
+
+        // Build condition block
+        val conditionBuilder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(conditionBuilder, conditionBlock)
+        generatorContext.pushBlock(conditionBlock, whileStatement.symbolTable!!)
+        whileStatement.condition.accept(this)
+        val condition = generatorContext.topValuePop
+        LLVMBuildCondBr(conditionBuilder, condition, mainBlock, continuationBlock)
+        generatorContext.popBlock(true)
+
+        // Build main block
+        val mainBuilder = LLVMCreateBuilder()
+        LLVMPositionBuilderAtEnd(mainBuilder, mainBlock)
+        generatorContext.pushBlock(mainBlock, whileStatement.symbolTable!!)
+        whileStatement.block?.accept(this)
+        LLVMBuildBr(mainBuilder, conditionBlock)
+        generatorContext.popBlock(true)
+
+        // Build continuation block
+        generatorContext.pushReplaceBlock(continuationBlock, generatorContext.topBlock.table)
+    }
 }

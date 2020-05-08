@@ -13,6 +13,8 @@ var Node.llvmBlock: LLVMBasicBlockRef? by BackingField.nullable()
 var IfElseExpression.llvmIfBlock: LLVMBasicBlockRef? by BackingField.nullable()
 var IfElseExpression.llvmElseBlock: LLVMBasicBlockRef? by BackingField.nullable()
 var IfElseExpression.llvmContBlock: LLVMBasicBlockRef? by BackingField.nullable()
+var WhileStatement.llvmConditionBlock: LLVMBasicBlockRef? by BackingField.nullable()
+var WhileStatement.llvmContBlock: LLVMBasicBlockRef? by BackingField.nullable()
 val Type.llvmType: LLVMTypeRef
     get() = when {
         this is FunctionType -> LLVM.LLVMPointerType(

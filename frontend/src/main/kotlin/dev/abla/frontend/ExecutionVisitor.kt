@@ -231,6 +231,25 @@ class ExecutionVisitor(
             super.visit(assignment)
     }
 
+    override suspend fun visit(whileStatement: WhileStatement) {
+        if (executionLayer > 0) {
+            withTable(whileStatement.symbolTable) {
+                while (true) {
+                    whileStatement.condition.accept(this)
+
+                    val conditionValue = values.pop().toValue(currentScope!!)
+                    val conditionTrue = conditionValue as Int == 1
+
+                    if (!conditionTrue)
+                        break
+
+                    whileStatement.block?.accept(this)
+                }
+            }
+        } else
+            super.visit(whileStatement)
+    }
+
     /*
      * TODO: Forcing everything to join here. Maybe a solution could be found to force execution only until the type
      *  that we are looking for is found. This makes it continue to execute normally without being blocked

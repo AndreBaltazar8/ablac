@@ -64,4 +64,9 @@ abstract class ASTVisitor {
         assignment.lhs.accept(this)
         assignment.rhs.accept(this)
     }
+
+    open suspend fun visit(whileStatement: WhileStatement) {
+        whileStatement.condition.accept(this)
+        whileStatement.block?.accept(this)
+    }
 }

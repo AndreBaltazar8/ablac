@@ -2,10 +2,7 @@ package dev.abla.frontend
 
 import dev.abla.common.*
 import dev.abla.language.ASTVisitor
-import dev.abla.language.nodes.File
-import dev.abla.language.nodes.FunctionDeclaration
-import dev.abla.language.nodes.IfElseExpression
-import dev.abla.language.nodes.PropertyDeclaration
+import dev.abla.language.nodes.*
 import java.util.*
 
 class TypeGather(private val global: SymbolTable) : ASTVisitor() {
@@ -67,5 +64,13 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         tables.peek().symbols.add(variable)
 
         super.visit(propertyDeclaration)
+    }
+
+    override suspend fun visit(whileStatement: WhileStatement) {
+        val table = SymbolTable(tables.peek())
+        tables.push(table)
+        whileStatement.symbolTable = table
+        super.visit(whileStatement)
+        tables.pop()
     }
 }

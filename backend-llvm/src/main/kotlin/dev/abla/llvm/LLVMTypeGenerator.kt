@@ -111,4 +111,27 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             blocks.push(this)
         }
     }
+
+    override suspend fun visit(whileStatement: WhileStatement) {
+        val function = functions[functions.lastIndex]
+        function.appendBasicBlock("while_condition_block") {
+            whileStatement.llvmConditionBlock = this
+            blocks.push(this)
+        }
+        whileStatement.condition.accept(this)
+        blocks.pop()
+
+        function.appendBasicBlock("while_block") {
+            whileStatement.llvmBlock = this
+            blocks.push(this)
+        }
+        whileStatement.block?.accept(this)
+        blocks.pop()
+
+        function.appendBasicBlock("while_cont_block") {
+            whileStatement.llvmContBlock = this
+            blocks.pop()
+            blocks.push(this)
+        }
+    }
 }

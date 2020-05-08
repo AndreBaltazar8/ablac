@@ -116,6 +116,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Import new file
 - Parallel processing of imported files
 - compile-time execution for all available features with interpretation execution
+- While loops
 
 ### To Do
 - Investigate:

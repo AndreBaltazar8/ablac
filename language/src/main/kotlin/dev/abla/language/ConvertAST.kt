@@ -126,8 +126,16 @@ fun AblaParser.StatementContext.toAST(): Statement =
     when (this) {
         is AblaParser.ExpressionStatementContext -> expression().toAST()
         is AblaParser.PropertyDeclarationStatementContext -> propertyDeclaration().toAST()
+        is AblaParser.WhileStatementSTContext -> whileStatement().toAST()
         else -> throw IllegalStateException("Unknown statement type ${this::class.simpleName}")
     }
+
+fun AblaParser.WhileStatementContext.toAST(): WhileStatement =
+    WhileStatement(
+        condition.toAST(),
+        controlStructureBody()?.toAST(),
+        position
+    )
 
 fun AblaParser.PropertyDeclarationContext.toAST(): PropertyDeclaration =
     PropertyDeclaration(
