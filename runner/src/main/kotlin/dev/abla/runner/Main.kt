@@ -15,7 +15,6 @@ val modules = listOf(
 
 fun main(args: Array<String>) {
     startKoin {
-        printLogger()
         modules(modules)
     }
     Runner().run(args)
