@@ -16,7 +16,7 @@ interface ICompileService {
     suspend fun compileFile(fileName: String, parallel: Boolean = true, compilationContext: CompilationContext? = null)
     suspend fun compileSource(source: String, parallel: Boolean = true, compilationContext: CompilationContext? = null)
     suspend fun compileStream(stream: InputStream, parallel: Boolean = true, compilationContext: CompilationContext? = null)
-    suspend fun output(codeGenerator: ICodeGenerator)
+    suspend fun output(codeGenerator: ICodeGenerator, codeGenParameters: CodeGenParameters)
 }
 
 class CompileService(
@@ -54,13 +54,13 @@ class CompileService(
         compile(name, false, parallel, compilationContext) { parserService.parseStream(name, stream, it) }
     }
 
-    override suspend fun output(codeGenerator: ICodeGenerator) {
+    override suspend fun output(codeGenerator: ICodeGenerator, codeGenParameters: CodeGenParameters) {
         parentJob.complete()
         parentJob.join()
 
         println("Compiled Units: ${compiledUnits.size}")
 
-        codeGenerator.generateCode(compiledUnits.values)
+        codeGenerator.generateCode(compiledUnits.values, codeGenParameters)
     }
 
     private suspend fun compile(

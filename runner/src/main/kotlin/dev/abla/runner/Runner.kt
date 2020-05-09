@@ -1,5 +1,6 @@
 package dev.abla.runner
 
+import dev.abla.common.CodeGenParameters
 import dev.abla.llvm.ILLVMCodeGenerator
 import dev.abla.frontend.ICompileService
 import dev.abla.utils.IMeasurementService
@@ -18,7 +19,7 @@ class Runner : KoinComponent {
             else
                 compileService.compileFile(args[0])
 
-            compileService.output(llvmCodeGenerator)
+            compileService.output(llvmCodeGenerator, CodeGenParameters("main"))
         }
         measurementService.measurements.last().print()
     }
