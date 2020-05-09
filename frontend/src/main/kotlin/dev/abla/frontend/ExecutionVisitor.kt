@@ -221,7 +221,7 @@ class ExecutionVisitor(
                     node is PropertyDeclaration && node.isFinal -> throw IllegalStateException("Cannot assign value to final variable ${lhs.identifier}")
                     node is PropertyDeclaration -> {
                         assignment.rhs.accept(this)
-                        currentScope!![lhs.identifier] = values[values.lastIndex]
+                        currentScope!!.modify(lhs.identifier, values[values.lastIndex])
                     }
                     else -> throw IllegalStateException("Only supports assignments to properties. Found: ${node.javaClass.simpleName}")
                 }
