@@ -1,10 +1,7 @@
 package dev.abla.frontend
 
 import com.sun.jna.NativeLibrary
-import dev.abla.common.SymbolTable
-import dev.abla.common.elseSymbolTable
-import dev.abla.common.ifSymbolTable
-import dev.abla.common.symbolTable
+import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
@@ -31,7 +28,7 @@ class ExecutionVisitor(
         }
 
     private var executionLayer = 0
-    private var values = Stack<Literal>()
+    private var values = Stack<ExecutionValue>()
     private var currentScope: ExecutionScope? = null
     private val currentTable get() = currentScope?.symbolTable
 
@@ -62,10 +59,10 @@ class ExecutionVisitor(
                         .invoke(
                             Int::class.java,
                             functionDeclaration.parameters.map {
-                                currentScope!![it.name].toValue(currentScope!!)
+                                currentScope!![it.name]?.value.toValue(currentScope!!)
                             }.toTypedArray()
                         )
-                    values.push(Integer(result.toString(), positionZero))
+                    values.push(ExecutionValue.Value(Integer(result.toString(), positionZero)))
                 }
 
                 val returnValue = values.pop()
@@ -80,9 +77,24 @@ class ExecutionVisitor(
 
     override suspend fun visit(identifierExpression: IdentifierExpression) {
         if (executionLayer > 0) {
-            val value = currentScope!![identifierExpression.identifier]
-            //?: throw IllegalStateException("Unknown value for identifier ${identifierExpression.identifier}") // TODO: check for this later
-            values.push(value)
+            val identifier = identifierExpression.identifier
+            var value = currentScope!![identifier]
+            if (value == null) {
+                requirePendingImports()
+            }
+            value = currentScope!![identifier]
+            if (value == null)
+                throw IllegalStateException("Unknown identifier $identifier")
+
+            if (identifierExpression.returnForAssignment) {
+                if (value.isFinal)
+                    throw IllegalStateException("Cannot assign value to final identifier $identifier")
+
+                values.push(ExecutionValue.AssignableValue {
+                    currentScope!!.modify(identifier, it)
+                })
+            } else
+                values.push(value)
         }
     }
 
@@ -91,7 +103,7 @@ class ExecutionVisitor(
             executionLayer++
             super.visit(compilerExec)
             compilerExec.compiled = true
-            compilerExec.expression = values.pop()
+            compilerExec.expression = values.pop().value
             executionLayer--
         } else {
             super.visit(compilerExec)
@@ -100,17 +112,17 @@ class ExecutionVisitor(
 
     override suspend fun visit(stringLiteral: StringLiteral) {
         if (executionLayer > 0)
-            values.add(stringLiteral)
+            values.add(ExecutionValue.Value(stringLiteral))
     }
 
     override suspend fun visit(integer: Integer) {
         if (executionLayer > 0)
-            values.add(integer)
+            values.add(ExecutionValue.Value(integer))
     }
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         if (executionLayer > 0)
-            values.add(functionLiteral)
+            values.add(ExecutionValue.Value(functionLiteral))
     }
 
     override suspend fun visit(functionCall: FunctionCall) {
@@ -121,39 +133,30 @@ class ExecutionVisitor(
         functionCall.primaryExpression.accept(this)
 
         if (executionLayer > 0) {
-            val topVal = values.pop()
-
-            val function = if (topVal is FunctionLiteral)
-                topVal
-            else {
-                val primaryExpression = functionCall.primaryExpression
-                val functionName = (primaryExpression as IdentifierExpression).identifier
-
-                var symbol = currentTable?.find(functionName)
-                if (symbol == null) {
-                    requirePendingImports()
-                    symbol = currentTable?.find(functionName)
-                }
-                if (symbol == null)
-                    throw Exception("Unknown function $functionName")
-                symbol.node
+            val function = when (val topVal = values.pop()) {
+                is ExecutionValue.Value -> topVal.value
+                is ExecutionValue.ConstSymbol -> topVal.symbol.node
+                else -> throw IllegalStateException("Unknown callable for $functionCall")
             }
 
             function.let {
-                if (it is CompilerFunctionDeclaration)
-                    values.add(it.executionBlock(this, functionCall.arguments.reversed().map {
-                        values.pop().toValue(currentScope!!)
-                    }.reversed().toTypedArray()))
-                else if (it is FunctionLiteral) {
-                    val numValues = values.size
-                    it.block.accept(this)
-                    val returnValue = values.pop()
-                    repeat(values.size - numValues) {
-                        values.pop()
+                when (it) {
+                    is CompilerFunctionDeclaration -> {
+                        values.add(ExecutionValue.Value(it.executionBlock(this, functionCall.arguments.reversed().map {
+                            values.pop().value.toValue(currentScope!!)
+                        }.reversed().toTypedArray())))
                     }
-                    values.push(returnValue)
-                } else
-                    it.accept(this)
+                    is FunctionLiteral -> {
+                        val numValues = values.size
+                        it.block.accept(this)
+                        val returnValue = values.pop()
+                        repeat(values.size - numValues) {
+                            values.pop()
+                        }
+                        values.push(returnValue)
+                    }
+                    else -> it.accept(this)
+                }
             }
         }
     }
@@ -161,9 +164,9 @@ class ExecutionVisitor(
     override suspend fun visit(binaryOperation: BinaryOperation) {
         if (executionLayer > 0) {
             binaryOperation.lhs.accept(this)
-            val lhsValue = values.pop().toValue(currentScope!!) as Int
+            val lhsValue = values.pop().value.toValue(currentScope!!) as Int
             binaryOperation.rhs.accept(this)
-            val rhsValue = values.pop().toValue(currentScope!!) as Int
+            val rhsValue = values.pop().value.toValue(currentScope!!) as Int
             val result = when (binaryOperation.operator) {
                 BinaryOperator.Plus -> lhsValue + rhsValue
                 BinaryOperator.Minus -> lhsValue - rhsValue
@@ -176,7 +179,7 @@ class ExecutionVisitor(
                 BinaryOperator.GreaterThanEqual -> if (lhsValue >= rhsValue) 1 else 0
                 BinaryOperator.LesserThanEqual -> if (lhsValue <= rhsValue) 1 else 0
             }.toString()
-            values.push(Integer(result, positionZero))
+            values.push(ExecutionValue.Value(Integer(result, positionZero)))
         } else
             super.visit(binaryOperation)
     }
@@ -184,7 +187,7 @@ class ExecutionVisitor(
     override suspend fun visit(ifElseExpression: IfElseExpression) {
         if (executionLayer > 0) {
             ifElseExpression.condition.accept(this)
-            val conditionValue = values.pop().toValue(currentScope!!)
+            val conditionValue = values.pop().value.toValue(currentScope!!)
             val conditionTrue = conditionValue as Int == 1
             val ifBody = ifElseExpression.ifBody
             val elseBody = ifElseExpression.elseBody
@@ -205,7 +208,7 @@ class ExecutionVisitor(
         if (executionLayer > 0) {
             propertyDeclaration.value?.let {
                 it.accept(this)
-                currentScope!![propertyDeclaration.name] = values.pop()
+                currentScope!![propertyDeclaration.name] = values.pop().copyWith(propertyDeclaration.isFinal)
             }
         } else
             super.visit(propertyDeclaration)
@@ -213,20 +216,12 @@ class ExecutionVisitor(
 
     override suspend fun visit(assignment: Assignment) {
         if (executionLayer > 0) {
-            val lhs = assignment.lhs
-            if (lhs is IdentifierExpression) {
-                val node = currentTable!!.find(lhs.identifier)?.node
-                when {
-                    node == null -> throw IllegalStateException("Unknown identifier ${lhs.identifier}")
-                    node is PropertyDeclaration && node.isFinal -> throw IllegalStateException("Cannot assign value to final variable ${lhs.identifier}")
-                    node is PropertyDeclaration -> {
-                        assignment.rhs.accept(this)
-                        currentScope!!.modify(lhs.identifier, values[values.lastIndex])
-                    }
-                    else -> throw IllegalStateException("Only supports assignments to properties. Found: ${node.javaClass.simpleName}")
-                }
-            } else
-                throw IllegalStateException("Unknown assignment to expression of type ${assignment.rhs.javaClass.simpleName}")
+            assignment.lhs.accept(this)
+            val value = values.pop()
+            if (value !is ExecutionValue.AssignableValue)
+                throw IllegalStateException("Cannot assign value at $assignment")
+            assignment.rhs.accept(this)
+            value.assign(values[values.lastIndex])
         } else
             super.visit(assignment)
     }
@@ -237,7 +232,7 @@ class ExecutionVisitor(
                 while (true) {
                     whileStatement.condition.accept(this)
 
-                    val conditionValue = values.pop().toValue(currentScope!!)
+                    val conditionValue = values.pop().value.toValue(currentScope!!)
                     val conditionTrue = conditionValue as Int == 1
 
                     if (!conditionTrue)
@@ -276,7 +271,7 @@ class ExecutionVisitor(
                         is StringLiteral.StringConst -> it.string
                         is StringLiteral.StringExpression -> {
                             it.expression.accept(this@ExecutionVisitor)
-                            values.pop().toValue(currentScope).toString()
+                            values.pop().value.toValue(currentScope).toString()
                         }
                         else -> throw IllegalStateException("Unknown string part type ${it.javaClass.simpleName}")
                     }

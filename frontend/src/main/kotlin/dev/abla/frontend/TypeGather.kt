@@ -70,6 +70,11 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         }
     }
 
+    override suspend fun visit(assignment: Assignment) {
+        assignment.lhs.returnForAssignment = true
+        super.visit(assignment)
+    }
+
     private inline fun createTableInParent(action: (table: SymbolTable) -> Unit) {
         val table = SymbolTable(tables.peek())
         tables.push(table)

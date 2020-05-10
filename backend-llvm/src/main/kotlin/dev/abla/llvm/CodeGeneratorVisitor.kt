@@ -2,6 +2,7 @@ package dev.abla.llvm
 
 import dev.abla.common.elseSymbolTable
 import dev.abla.common.ifSymbolTable
+import dev.abla.common.returnForAssignment
 import dev.abla.common.symbolTable
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
@@ -84,12 +85,12 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         val node = value.node
         val llvmValue = if (node is PropertyDeclaration && !node.isFinal) {
-            if (returnForAssignment == 0) {
+            if (!identifierExpression.returnForAssignment) {
                 val builder = generatorContext.topBlock.createBuilderAtEnd()
                 LLVMBuildLoad(builder, node.llvmValue, "")
             } else
                 node.llvmValue
-        } else if (returnForAssignment > 0)
+        } else if (identifierExpression.returnForAssignment)
             throw java.lang.IllegalStateException("Cannot assign value to final identifier ${identifierExpression.identifier}")
         else
             node.llvmValue
@@ -255,11 +256,8 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         }
     }
 
-    private var returnForAssignment: Int = 0
     override suspend fun visit(assignment: Assignment) {
-        returnForAssignment++
         assignment.lhs.accept(this)
-        returnForAssignment--
 
         val allocation = generatorContext.topValuePop
 
