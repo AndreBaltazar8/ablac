@@ -1,10 +1,7 @@
 package dev.abla.llvm
 
 import org.bytedeco.javacpp.PointerPointer
-import org.bytedeco.llvm.LLVM.LLVMBasicBlockRef
-import org.bytedeco.llvm.LLVM.LLVMModuleRef
-import org.bytedeco.llvm.LLVM.LLVMTypeRef
-import org.bytedeco.llvm.LLVM.LLVMValueRef
+import org.bytedeco.llvm.LLVM.*
 import org.bytedeco.llvm.global.LLVM.*
 
 fun LLVMModuleRef.addFunction(
@@ -43,6 +40,14 @@ fun LLVMModuleRef.registerTypeVtable(
         setLinkage(LLVMGhostLinkage)
     }
     return struct
+}
+
+inline fun CodeGenBlock.createBuilderAtEnd(action: (LLVMBuilderRef) -> Unit = {}): LLVMBuilderRef = block.createBuilderAtEnd(action)
+inline fun LLVMBasicBlockRef.createBuilderAtEnd(action: (LLVMBuilderRef) -> Unit = {}): LLVMBuilderRef {
+    val builder = LLVMCreateBuilder()
+    LLVMPositionBuilderAtEnd(builder, this)
+    action(builder)
+    return builder
 }
 
 private fun Boolean.toInt(): Int = if (this) 1 else 0

@@ -19,11 +19,19 @@ class GeneratorContext {
             blocks.push(it)
         }
 
-    fun pushReplaceBlock(block: LLVMBasicBlockRef, table: SymbolTable) {
+    inline fun withBlock(block: LLVMBasicBlockRef, table: SymbolTable, onBlock: CodeGenBlock.() -> Unit) =
+        CodeGenBlock(block, table, blocks.firstOrNull()).also {
+            blocks.push(it)
+            it.onBlock()
+            popBlock(true)
+        }
+
+    inline fun pushReplaceBlock(block: LLVMBasicBlockRef, table: SymbolTable, onBlock: CodeGenBlock.() -> Unit = {}) {
         blocks.peek().let {
             it.block = block
             it.table = table
             it.wasReplaced = true
+            it.onBlock()
         }
     }
 

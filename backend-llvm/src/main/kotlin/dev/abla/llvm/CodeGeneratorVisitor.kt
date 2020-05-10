@@ -24,22 +24,22 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             module.addFunction("main", LLVMInt16Type(), arrayOf()).valueRef
                 .setLinkage(LLVMExternalLinkage)
                 .appendBasicBlock("entry") {
-                    val builder = LLVMCreateBuilder()
-                    LLVMPositionBuilderAtEnd(builder, this)
-                    val call = LLVMBuildCall(
-                        builder,
-                        functionDeclaration.llvmValue!!,
-                        PointerPointer<LLVMTypeRef>(),
-                        0,
-                        ""
-                    )
-                    LLVMBuildRet(
-                        builder,
-                        if (functionDeclaration.returnType == UserType.Int)
-                            call
-                        else
-                            LLVMConstInt(LLVMInt16Type(),0, 0)
-                    )
+                    createBuilderAtEnd { builder ->
+                        val call = LLVMBuildCall(
+                            builder,
+                            functionDeclaration.llvmValue!!,
+                            PointerPointer<LLVMTypeRef>(),
+                            0,
+                            ""
+                        )
+                        LLVMBuildRet(
+                            builder,
+                            if (functionDeclaration.returnType == UserType.Int)
+                                call
+                            else
+                                LLVMConstInt(LLVMInt16Type(),0, 0)
+                        )
+                    }
                 }
         }
 
@@ -52,12 +52,12 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         if (!currentBlock.hasReturned) {
             // CHECK FOR TYPE
 
-            val builder = LLVMCreateBuilder()
-            LLVMPositionBuilderAtEnd(builder, currentBlock.block)
-            if (generatorContext.values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid())
-                LLVMBuildRet(builder, generatorContext.topValue)
-            else
-                LLVMBuildRetVoid(builder)
+            currentBlock.createBuilderAtEnd { builder ->
+                if (generatorContext.values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid())
+                    LLVMBuildRet(builder, generatorContext.topValue)
+                else
+                    LLVMBuildRetVoid(builder)
+            }
             currentBlock.hasReturned = true
         }
 
@@ -85,8 +85,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val node = value.node
         val llvmValue = if (node is PropertyDeclaration && !node.isFinal) {
             if (returnForAssignment == 0) {
-                val builder = LLVMCreateBuilder()
-                LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+                val builder = generatorContext.topBlock.createBuilderAtEnd()
                 LLVMBuildLoad(builder, node.llvmValue, "")
             } else
                 node.llvmValue
@@ -99,25 +98,23 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(functionCall: FunctionCall) {
-        val currentBlock = generatorContext.topBlock
         functionCall.primaryExpression.accept(this)
         val node = generatorContext.topValuePop
-        val builder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(builder, currentBlock.block)
 
-        val args = functionCall.arguments.map {
-            it.value.accept(this)
-            generatorContext.topValuePop
-        }.toTypedArray()
+        generatorContext.topBlock.createBuilderAtEnd { builder ->
+            val args = functionCall.arguments.map {
+                it.value.accept(this)
+                generatorContext.topValuePop
+            }.toTypedArray()
 
-        val value = LLVMBuildCall(
-            builder,
-            node,
-            PointerPointer(*args),
-            functionCall.arguments.size,
-            ""
-        )
-        generatorContext.values.push(value)
+            generatorContext.values.push(LLVMBuildCall(
+                builder,
+                node,
+                PointerPointer(*args),
+                functionCall.arguments.size,
+                ""
+            ))
+        }
     }
 
     override suspend fun visit(integer: Integer) {
@@ -149,12 +146,12 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         if (!currentBlock.hasReturned) {
             // CHECK FOR TYPE
 
-            val builder = LLVMCreateBuilder()
-            LLVMPositionBuilderAtEnd(builder, currentBlock.block)
-            if (generatorContext.values.isNotEmpty())
-                LLVMBuildRet(builder, generatorContext.topValue)
-            else
-                LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
+            currentBlock.createBuilderAtEnd { builder ->
+                if (generatorContext.values.isNotEmpty())
+                    LLVMBuildRet(builder, generatorContext.topValue)
+                else
+                    LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
+            }
             currentBlock.hasReturned = true
         }
         repeat(generatorContext.values.size - numValues) {
@@ -169,29 +166,28 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val lhsValue = generatorContext.topValuePop
         binaryOperation.rhs.accept(this)
         val rhsValue = generatorContext.topValuePop
-        val builder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
-        val result = when (binaryOperation.operator) {
-            BinaryOperator.Plus -> LLVMBuildAdd(builder, lhsValue, rhsValue, "")
-            BinaryOperator.Minus -> LLVMBuildSub(builder, lhsValue, rhsValue, "")
-            BinaryOperator.Mul -> LLVMBuildMul(builder, lhsValue, rhsValue, "")
-            BinaryOperator.Div -> LLVMBuildSDiv(builder, lhsValue, rhsValue, "")
-            BinaryOperator.Equals -> LLVMBuildICmp(builder, LLVMIntEQ, lhsValue, rhsValue, "")
-            BinaryOperator.NotEquals -> LLVMBuildICmp(builder, LLVMIntNE, lhsValue, rhsValue, "")
-            BinaryOperator.GreaterThan -> LLVMBuildICmp(builder, LLVMIntSGT, lhsValue, rhsValue, "")
-            BinaryOperator.LesserThan -> LLVMBuildICmp(builder, LLVMIntSLT, lhsValue, rhsValue, "")
-            BinaryOperator.GreaterThanEqual -> LLVMBuildICmp(builder, LLVMIntSGE, lhsValue, rhsValue, "")
-            BinaryOperator.LesserThanEqual -> LLVMBuildICmp(builder, LLVMIntSLE, lhsValue, rhsValue, "")
+        generatorContext.topBlock.createBuilderAtEnd { builder ->
+            val result = when (binaryOperation.operator) {
+                BinaryOperator.Plus -> LLVMBuildAdd(builder, lhsValue, rhsValue, "")
+                BinaryOperator.Minus -> LLVMBuildSub(builder, lhsValue, rhsValue, "")
+                BinaryOperator.Mul -> LLVMBuildMul(builder, lhsValue, rhsValue, "")
+                BinaryOperator.Div -> LLVMBuildSDiv(builder, lhsValue, rhsValue, "")
+                BinaryOperator.Equals -> LLVMBuildICmp(builder, LLVMIntEQ, lhsValue, rhsValue, "")
+                BinaryOperator.NotEquals -> LLVMBuildICmp(builder, LLVMIntNE, lhsValue, rhsValue, "")
+                BinaryOperator.GreaterThan -> LLVMBuildICmp(builder, LLVMIntSGT, lhsValue, rhsValue, "")
+                BinaryOperator.LesserThan -> LLVMBuildICmp(builder, LLVMIntSLT, lhsValue, rhsValue, "")
+                BinaryOperator.GreaterThanEqual -> LLVMBuildICmp(builder, LLVMIntSGE, lhsValue, rhsValue, "")
+                BinaryOperator.LesserThanEqual -> LLVMBuildICmp(builder, LLVMIntSLE, lhsValue, rhsValue, "")
+            }
+            generatorContext.values.push(result)
         }
-        generatorContext.values.push(result)
     }
 
     override suspend fun visit(ifElseExpression: IfElseExpression) {
         val ifBlock = ifElseExpression.llvmIfBlock!!
         val elseBlock = ifElseExpression.llvmElseBlock!!
 
-        val builder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
+        val builder = generatorContext.topBlock.createBuilderAtEnd()
 
         ifElseExpression.condition.accept(this)
         val condition = generatorContext.topValuePop
@@ -200,45 +196,44 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val ifElseResult = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
         LLVMBuildCondBr(builder, condition, ifBlock, elseBlock)
 
-        val codeIfBlock = generatorContext.pushBlock(ifBlock, ifElseExpression.ifSymbolTable!!)
-        val ifBody = ifElseExpression.ifBody
-        ifBody?.accept(this)
-        val ifRetuned = codeIfBlock.hasReturned
-        LLVMCreateBuilder().apply {
-            LLVMPositionBuilderAtEnd(this, codeIfBlock.block)
-            LLVMBuildStore(this, generatorContext.topValuePop, ifElseResult)
-        }
-        generatorContext.popBlock(true)
-
-        val codeElseBlock = generatorContext.pushBlock(elseBlock, ifElseExpression.elseSymbolTable!!)
-        val elseBody = ifElseExpression.elseBody
-        elseBody?.accept(this)
-        val elseRetuned = codeElseBlock.hasReturned
-        if (elseBody != null) {
-            LLVMCreateBuilder().apply {
-                LLVMPositionBuilderAtEnd(this, codeElseBlock.block)
-                LLVMBuildStore(this, generatorContext.topValuePop, ifElseResult)
+        val codeIfBlock = generatorContext.withBlock(ifBlock, ifElseExpression.ifSymbolTable!!) {
+            val ifBody = ifElseExpression.ifBody
+            ifBody?.accept(this@CodeGeneratorVisitor)
+            createBuilderAtEnd {
+                LLVMBuildStore(it, generatorContext.topValuePop, ifElseResult)
             }
         }
-        generatorContext.popBlock(true)
+        val ifRetuned = codeIfBlock.hasReturned
+
+        val codeElseBlock = generatorContext.withBlock(elseBlock, ifElseExpression.elseSymbolTable!!) {
+            val elseBody = ifElseExpression.elseBody
+            elseBody?.accept(this@CodeGeneratorVisitor)
+            if (elseBody != null) {
+                createBuilderAtEnd { builder ->
+                    LLVMBuildStore(builder, generatorContext.topValuePop, ifElseResult)
+                }
+            }
+        }
+        val elseRetuned = codeElseBlock.hasReturned
 
         val contBlock = ifElseExpression.llvmContBlock!!
         if (!ifRetuned) {
-            val ifBuilder = LLVMCreateBuilder()
-            LLVMPositionBuilderAtEnd(ifBuilder, codeIfBlock.block)
-            LLVMBuildBr(ifBuilder, contBlock)
+            codeIfBlock.block.createBuilderAtEnd {
+                LLVMBuildBr(it, contBlock)
+            }
         }
 
         if (!elseRetuned) {
-            val elseBuilder = LLVMCreateBuilder()
-            LLVMPositionBuilderAtEnd(elseBuilder, codeElseBlock.block)
-            LLVMBuildBr(elseBuilder, contBlock)
+            codeElseBlock.block.createBuilderAtEnd {
+                LLVMBuildBr(it, contBlock)
+            }
         }
 
-        generatorContext.pushReplaceBlock(contBlock, generatorContext.topBlock.table)
-        val lastBuilder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(lastBuilder, generatorContext.topBlock.block)
-        generatorContext.values.push(LLVMBuildLoad(lastBuilder, ifElseResult, ""))
+        generatorContext.pushReplaceBlock(contBlock, generatorContext.topBlock.table) {
+            createBuilderAtEnd { builder ->
+                generatorContext.values.push(LLVMBuildLoad(builder, ifElseResult, ""))
+            }
+        }
     }
 
     override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
@@ -248,15 +243,15 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             value.accept(this)
             propertyDeclaration.llvmValue = generatorContext.topValuePop
         } else {
-            val builder = LLVMCreateBuilder()
-            LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
-            val allocation = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
-            val value = propertyDeclaration.value
-            if (value != null) {
-                value.accept(this)
-                LLVMBuildStore(builder, generatorContext.topValuePop, allocation)
+            generatorContext.topBlock.createBuilderAtEnd { builder ->
+                val allocation = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
+                val value = propertyDeclaration.value
+                if (value != null) {
+                    value.accept(this)
+                    LLVMBuildStore(builder, generatorContext.topValuePop, allocation)
+                }
+                propertyDeclaration.llvmValue = allocation
             }
-            propertyDeclaration.llvmValue = allocation
         }
     }
 
@@ -270,9 +265,9 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         assignment.rhs.accept(this)
 
-        val builder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(builder, generatorContext.topBlock.block)
-        LLVMBuildStore(builder, generatorContext.topValue, allocation)
+        generatorContext.topBlock.createBuilderAtEnd { builder ->
+            LLVMBuildStore(builder, generatorContext.topValue, allocation)
+        }
     }
 
     override suspend fun visit(whileStatement: WhileStatement) {
@@ -280,29 +275,28 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val mainBlock = whileStatement.llvmBlock!!
         val continuationBlock = whileStatement.llvmContBlock!!
 
+        generatorContext.topBlock.createBuilderAtEnd { builder ->
+            LLVMBuildBr(builder, conditionBlock)
+        }
 
-        val currentBuilder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(currentBuilder, generatorContext.topBlock.block)
-        LLVMBuildBr(currentBuilder, conditionBlock)
+        // Condition block
+        generatorContext.withBlock(conditionBlock, whileStatement.symbolTable!!) {
+            whileStatement.condition.accept(this@CodeGeneratorVisitor)
+            val condition = generatorContext.topValuePop
+            createBuilderAtEnd { builder ->
+                LLVMBuildCondBr(builder, condition, mainBlock, continuationBlock)
+            }
+        }
 
-        // Build condition block
-        val conditionBuilder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(conditionBuilder, conditionBlock)
-        generatorContext.pushBlock(conditionBlock, whileStatement.symbolTable!!)
-        whileStatement.condition.accept(this)
-        val condition = generatorContext.topValuePop
-        LLVMBuildCondBr(conditionBuilder, condition, mainBlock, continuationBlock)
-        generatorContext.popBlock(true)
+        // Main block
+        generatorContext.withBlock(mainBlock, whileStatement.symbolTable!!) {
+            whileStatement.block?.accept(this@CodeGeneratorVisitor)
+            createBuilderAtEnd { builder ->
+                LLVMBuildBr(builder, conditionBlock)
+            }
+        }
 
-        // Build main block
-        generatorContext.pushBlock(mainBlock, whileStatement.symbolTable!!)
-        whileStatement.block?.accept(this)
-        val mainBuilder = LLVMCreateBuilder()
-        LLVMPositionBuilderAtEnd(mainBuilder, generatorContext.topBlock.block)
-        LLVMBuildBr(mainBuilder, conditionBlock)
-        generatorContext.popBlock(true)
-
-        // Build continuation block
+        // Continuation block
         generatorContext.pushReplaceBlock(continuationBlock, generatorContext.topBlock.table)
     }
 }

@@ -19,22 +19,21 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         val function = Symbol.Function(functionDeclaration.name, functionDeclaration)
         tables.peek().symbols.add(function)
 
-        val table = SymbolTable(tables.peek())
-        tables.push(table)
-        functionDeclaration.symbolTable = table
+        createTableInParent { table ->
+            functionDeclaration.symbolTable = table
 
-        val extern = functionDeclaration.isExtern
-        if (extern && functionDeclaration.block != null)
-            throw Exception("Extern function cannot have a body")
-        if (!extern && functionDeclaration.block == null)
-            throw Exception("Function must have a body or be declared extern or abstract")
+            val extern = functionDeclaration.isExtern
+            if (extern && functionDeclaration.block != null)
+                throw Exception("Extern function cannot have a body")
+            if (!extern && functionDeclaration.block == null)
+                throw Exception("Function must have a body or be declared extern or abstract")
 
-        functionDeclaration.parameters.forEach {
-            table.symbols.add(Symbol.Variable(it.name, it))
+            functionDeclaration.parameters.forEach {
+                table.symbols.add(Symbol.Variable(it.name, it))
+            }
+
+            functionDeclaration.block?.accept(this)
         }
-
-        functionDeclaration.block?.accept(this)
-        tables.pop()
     }
 
     override suspend fun visit(ifElseExpression: IfElseExpression) {
@@ -42,20 +41,18 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
 
         val ifBody = ifElseExpression.ifBody
         if (ifBody != null) {
-            val ifTable = SymbolTable(tables.peek())
-            tables.push(ifTable)
-            ifElseExpression.ifSymbolTable = ifTable
-            ifBody.accept(this)
-            tables.pop()
+            createTableInParent { ifTable ->
+                ifElseExpression.ifSymbolTable = ifTable
+                ifBody.accept(this)
+            }
         }
 
         val elseBody = ifElseExpression.elseBody
         if (elseBody != null) {
-            val elseTable = SymbolTable(tables.peek())
-            tables.push(elseTable)
-            ifElseExpression.elseSymbolTable = elseTable
-            elseBody.accept(this)
-            tables.pop()
+            createTableInParent { elseTable ->
+                ifElseExpression.elseSymbolTable = elseTable
+                elseBody.accept(this)
+            }
         }
     }
 
@@ -67,10 +64,16 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
     }
 
     override suspend fun visit(whileStatement: WhileStatement) {
+        createTableInParent { table ->
+            whileStatement.symbolTable = table
+            super.visit(whileStatement)
+        }
+    }
+
+    private inline fun createTableInParent(action: (table: SymbolTable) -> Unit) {
         val table = SymbolTable(tables.peek())
         tables.push(table)
-        whileStatement.symbolTable = table
-        super.visit(whileStatement)
+        action(table)
         tables.pop()
     }
 }
