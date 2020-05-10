@@ -25,6 +25,7 @@ classBody : LCURL classMemberDeclaration* RCURL ;
 classMemberDeclaration : classDeclaration
                        | functionDeclaration
                        | propertyDeclaration
+                       | compilerCall
                        ;
 
 parameter : simpleIdentifier COLON type ;

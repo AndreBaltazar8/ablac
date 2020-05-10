@@ -24,7 +24,9 @@ class RunnerTest : KoinComponent {
     }
 
     @Test
-    fun testClassDeclaration() = runResourceFile("examples/test_class_declaration.ab")
+    fun testClassDeclaration() = runResourceFile("examples/test_class_declaration.ab") {
+        println(it)
+    }
 
     @Test
     fun testFunctions() = runResourceFile("examples/test_functions.ab") {

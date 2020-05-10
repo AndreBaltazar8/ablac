@@ -45,6 +45,7 @@ fun AblaParser.ClassMemberDeclarationContext.toAST() : Declaration =
     functionDeclaration()?.toAST() ?:
         classDeclaration()?.toAST() ?:
         propertyDeclaration()?.toAST() ?:
+        compilerCall()?.toAST() ?:
         throw IllegalStateException("Unknown class member type ${this::class.simpleName}")
 
 fun AblaParser.ModifierContext.toAST(): Modifier =
