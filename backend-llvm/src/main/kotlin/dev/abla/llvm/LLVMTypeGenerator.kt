@@ -12,6 +12,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     private val blocks = Stack<LLVMBasicBlockRef>()
     private val functions = Stack<LLVMValueRef>()
     private val typeScopes = Stack<TypeScope>()
+    private var currentScope = Scope.Global
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         if (functionDeclaration.isCompiler)
@@ -49,7 +50,9 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             for ((index, param) in functionDeclaration.parameters.withIndex())
                 param.llvmValue = LLVMGetParam(function.valueRef, index + offset)
 
-            it.accept(this)
+            withScope(Scope.Function) {
+                it.accept(this)
+            }
 
             blocks.pop()
         }
@@ -60,7 +63,9 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         val struct = LLVMStructCreateNamed(LLVMGetGlobalContext(), classDeclaration.name)
         val scope = TypeScope(classDeclaration.name, struct)
         typeScopes.push(scope)
-        super.visit(classDeclaration)
+        withScope(Scope.Class) {
+            super.visit(classDeclaration)
+        }
         val vTableType = module.registerTypeVtable(
             classDeclaration.name,
             scope.methods.map { LLVMPointerType(it.type, 0) }.toTypedArray(),
@@ -133,5 +138,28 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             blocks.pop()
             blocks.push(this)
         }
+    }
+
+    override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
+        if (currentScope == Scope.Global) {
+            LLVMAddGlobal(module, LLVMInt32Type(), "")
+        } else if (currentScope == Scope.Class) {
+            val typeScope = typeScopes.peek()
+            typeScope.fields.add(LLVMInt32Type())
+        }
+        super.visit(propertyDeclaration)
+    }
+
+    private enum class Scope {
+        Global,
+        Class,
+        Function
+    }
+
+    private inline fun withScope(scope: Scope, action: () -> Unit) {
+        val prevScope = currentScope
+        currentScope = scope
+        action()
+        currentScope = prevScope
     }
 }
