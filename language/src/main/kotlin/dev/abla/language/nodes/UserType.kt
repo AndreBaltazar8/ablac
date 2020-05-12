@@ -42,5 +42,6 @@ data class UserType(
         val Void = UserType("void")
         val Int = UserType("int")
         val String = UserType("string")
+        val Any = UserType("any")
     }
 }

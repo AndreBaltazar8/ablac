@@ -75,6 +75,12 @@ class ExecutionVisitor(
         }
     }
 
+    override suspend fun visit(classDeclaration: ClassDeclaration) {
+        withTable(classDeclaration.symbolTable) {
+            super.visit(classDeclaration)
+        }
+    }
+
     override suspend fun visit(identifierExpression: IdentifierExpression) {
         if (executionLayer > 0) {
             val identifier = identifierExpression.identifier

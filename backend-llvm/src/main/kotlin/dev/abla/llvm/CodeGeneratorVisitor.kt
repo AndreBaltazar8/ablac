@@ -1,9 +1,6 @@
 package dev.abla.llvm
 
-import dev.abla.common.elseSymbolTable
-import dev.abla.common.ifSymbolTable
-import dev.abla.common.returnForAssignment
-import dev.abla.common.symbolTable
+import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import org.bytedeco.javacpp.PointerPointer
@@ -80,6 +77,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val value = currentBlock.table.find(identifierExpression.identifier)
             ?: throw Exception("Unknown value for identifier ${identifierExpression.identifier}")
 
+        // TODO: if class select most appropriate constructor
         if (value.node.llvmValue == null)
             throw Exception("Cannot get llvm value for ${identifierExpression.identifier}. Is it a compiler function?")
 
@@ -252,6 +250,15 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                     LLVMBuildStore(builder, generatorContext.topValuePop, allocation)
                 }
                 propertyDeclaration.llvmValue = allocation
+            }
+        }
+    }
+
+    override suspend fun visit(classDeclaration: ClassDeclaration) {
+        generatorContext.withBlock(classDeclaration.llvmBlock!!, classDeclaration.symbolTable!!) {
+            super.visit(classDeclaration)
+            createBuilderAtEnd {
+                LLVMBuildRet(it, LLVMBuildMalloc(it, classDeclaration.struct, ""))
             }
         }
     }

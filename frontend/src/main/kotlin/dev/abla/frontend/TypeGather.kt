@@ -3,9 +3,12 @@ package dev.abla.frontend
 import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
+import java.lang.IllegalStateException
 import java.util.*
 
 class TypeGather(private val global: SymbolTable) : ASTVisitor() {
+    private var currentScope = Scope.Global
+
     private val tables = Stack<SymbolTable>().apply {
         push(global)
     }
@@ -32,7 +35,15 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
                 table.symbols.add(Symbol.Variable(it.name, it))
             }
 
-            functionDeclaration.block?.accept(this)
+            withScope(Scope.Function) {
+                functionDeclaration.block?.accept(this)
+            }
+        }
+    }
+
+    override suspend fun visit(functionLiteral: FunctionLiteral) {
+        withScope(Scope.Function) {
+            super.visit(functionLiteral)
         }
     }
 
@@ -56,9 +67,28 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         }
     }
 
+    override suspend fun visit(classDeclaration: ClassDeclaration) {
+        val classSymbol = Symbol.Class(classDeclaration.name, classDeclaration)
+        tables.peek().symbols.add(classSymbol)
+
+        createTableInParent {
+            classDeclaration.symbolTable = it
+            withScope(Scope.Class) {
+                super.visit(classDeclaration)
+            }
+        }
+    }
+
     override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
+        propertyDeclaration.scope = currentScope
+        if (currentScope == Scope.Global && propertyDeclaration.value != null && !propertyDeclaration.value.isLiteralOrCompileTime()) {
+            throw IllegalStateException("Must be a constant at runtime. Use compile time execution or a literal")
+        }
         val variable = Symbol.Variable(propertyDeclaration.name, propertyDeclaration)
         tables.peek().symbols.add(variable)
+        if (propertyDeclaration.type == null) {
+            propertyDeclaration.type = UserType.Int // TODO: type inference
+        }
 
         super.visit(propertyDeclaration)
     }
@@ -80,5 +110,12 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         tables.push(table)
         action(table)
         tables.pop()
+    }
+
+    private inline fun withScope(scope: Scope, action: () -> Unit) {
+        val prevScope = currentScope
+        currentScope = scope
+        action()
+        currentScope = prevScope
     }
 }

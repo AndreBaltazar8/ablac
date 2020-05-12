@@ -7,7 +7,7 @@ import dev.abla.language.Position
 class PropertyDeclaration(
     val isFinal: Boolean,
     val name: Identifier,
-    val type: Type?,
+    var type: Type?,
     val value: Expression?,
     override val position: Position
 ) : Statement {

@@ -1,5 +1,7 @@
 package dev.abla.llvm
 
+import dev.abla.common.Scope
+import dev.abla.common.scope
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import org.bytedeco.javacpp.PointerPointer
@@ -12,7 +14,6 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     private val blocks = Stack<LLVMBasicBlockRef>()
     private val functions = Stack<LLVMValueRef>()
     private val typeScopes = Stack<TypeScope>()
-    private var currentScope = Scope.Global
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         if (functionDeclaration.isCompiler)
@@ -50,9 +51,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             for ((index, param) in functionDeclaration.parameters.withIndex())
                 param.llvmValue = LLVMGetParam(function.valueRef, index + offset)
 
-            withScope(Scope.Function) {
-                it.accept(this)
-            }
+            it.accept(this)
 
             blocks.pop()
         }
@@ -63,9 +62,16 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         val struct = LLVMStructCreateNamed(LLVMGetGlobalContext(), classDeclaration.name)
         val scope = TypeScope(classDeclaration.name, struct)
         typeScopes.push(scope)
-        withScope(Scope.Class) {
-            super.visit(classDeclaration)
-        }
+        classDeclaration.struct = struct
+        val name = typeScopes.map { it.name }.plus("%constructor").joinToString("%")
+        classDeclaration.constructorFunction = module.addFunction(name, LLVMPointerType(struct, 0), arrayOf())
+            .valueRef.appendBasicBlock("entry") {
+                classDeclaration.llvmBlock = this
+                blocks.push(this)
+            }
+        classDeclaration.llvmValue = classDeclaration.constructorFunction
+        super.visit(classDeclaration)
+        blocks.pop()
         val vTableType = module.registerTypeVtable(
             classDeclaration.name,
             scope.methods.map { LLVMPointerType(it.type, 0) }.toTypedArray(),
@@ -141,25 +147,12 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
-        if (currentScope == Scope.Global) {
-            LLVMAddGlobal(module, LLVMInt32Type(), "")
-        } else if (currentScope == Scope.Class) {
+        if (propertyDeclaration.scope == Scope.Global) {
+            LLVMAddGlobal(module, (propertyDeclaration.type ?: UserType.Any).llvmType, "")
+        } else if (propertyDeclaration.scope == Scope.Class) {
             val typeScope = typeScopes.peek()
-            typeScope.fields.add(LLVMInt32Type())
+            typeScope.fields.add((propertyDeclaration.type ?: UserType.Any).llvmType)
         }
         super.visit(propertyDeclaration)
-    }
-
-    private enum class Scope {
-        Global,
-        Class,
-        Function
-    }
-
-    private inline fun withScope(scope: Scope, action: () -> Unit) {
-        val prevScope = currentScope
-        currentScope = scope
-        action()
-        currentScope = prevScope
     }
 }
