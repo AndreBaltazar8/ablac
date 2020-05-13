@@ -115,12 +115,16 @@ primaryExpression : simpleIdentifier # simpleIdentifierExpression
 prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
                      ;
 
-postfixUnarySuffix : callSuffix # callSuffixSuffix
+postfixUnarySuffix : callSuffix
+                   | navigationSuffix
                    ;
 
 callSuffix : typeArguments? valueArguments? functionLiteral
            | typeArguments? valueArguments
            ;
+
+navigationSuffix : DOT simpleIdentifier
+                 ;
 
 valueArguments : LPAREN RPAREN
                | LPAREN valueArgument (COMMA valueArgument)* COMMA? RPAREN

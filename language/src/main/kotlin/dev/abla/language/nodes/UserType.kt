@@ -41,6 +41,7 @@ data class UserType(
     companion object {
         val Void = UserType("void")
         val Int = UserType("int")
+        val Bool = UserType("bool")
         val String = UserType("string")
         val Any = UserType("any")
     }

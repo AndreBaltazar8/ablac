@@ -1,17 +1,18 @@
 package dev.abla.llvm
 
 import dev.abla.common.SymbolTable
+import dev.abla.language.nodes.Type
 import org.bytedeco.llvm.LLVM.LLVMBasicBlockRef
 import org.bytedeco.llvm.LLVM.LLVMValueRef
 import java.util.*
 
 class GeneratorContext {
     val blocks = Stack<CodeGenBlock>()
-    val values = Stack<LLVMValueRef>()
+    val values = Stack<Value>()
 
     val topBlock: CodeGenBlock get() = blocks.peek()
-    val topValue: LLVMValueRef get() = values.peek()
-    val topValuePop: LLVMValueRef
+    val topValue: Value get() = values.peek()
+    val topValuePop: Value
         get() = values.removeAt(values.lastIndex)
 
     fun pushBlock(block: LLVMBasicBlockRef, table: SymbolTable) =
@@ -44,4 +45,6 @@ class GeneratorContext {
             }
         }
     }
+
+    data class Value(val type: Type, val ref: LLVMValueRef)
 }

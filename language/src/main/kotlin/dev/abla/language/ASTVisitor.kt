@@ -69,4 +69,8 @@ abstract class ASTVisitor {
         whileStatement.condition.accept(this)
         whileStatement.block?.accept(this)
     }
+
+    open suspend fun visit(memberAccess: MemberAccess) {
+        memberAccess.primaryExpression.accept(this)
+    }
 }
