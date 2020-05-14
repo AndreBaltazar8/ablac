@@ -5,6 +5,7 @@ import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
+import dev.abla.utils.BackingField
 import kotlinx.coroutines.Job
 import java.lang.IllegalStateException
 import java.nio.file.FileSystems
@@ -42,10 +43,14 @@ class ExecutionVisitor(
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         withTable(functionDeclaration.symbolTable) {
-            if (executionLayer > 0) {
+            if (executionLayer > 0 && functionDeclaration.callInfo != null) {
+                if (functionDeclaration.callInfo?.instance != null)
+                    currentScope!!["this"] = values.pop()
                 functionDeclaration.parameters.reversed().forEach {
                     currentScope!![it.name] = values.pop()
                 }
+
+                functionDeclaration.callInfo = null
 
                 val numValues = values.size
                 if (functionDeclaration.block != null) {
@@ -164,7 +169,12 @@ class ExecutionVisitor(
                     is ClassDeclaration -> {
                         values.push(ExecutionValue.Instance(it.toType()))
                     }
-                    else -> it.accept(this)
+                    is FunctionDeclaration -> {
+                        val isMemberAccess = functionCall.primaryExpression is MemberAccess
+                        it.callInfo = CallInfo(if (isMemberAccess) values.peek()!! as ExecutionValue.Instance else null)
+                        it.accept(this)
+                    }
+                    else -> throw NotImplementedError("Unsupported")
                 }
             }
         }
@@ -304,5 +314,8 @@ class ExecutionVisitor(
             is FunctionLiteral -> this
             else -> throw Exception("Unknown literal conversion")
         }
+
+    data class CallInfo(val instance: ExecutionValue.Instance?)
+    var FunctionDeclaration.callInfo: CallInfo? by BackingField.nullable()
 }
 
