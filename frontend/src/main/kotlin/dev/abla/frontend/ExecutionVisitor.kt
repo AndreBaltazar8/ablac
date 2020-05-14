@@ -161,8 +161,26 @@ class ExecutionVisitor(
                         }
                         values.push(returnValue)
                     }
+                    is ClassDeclaration -> {
+                        values.push(ExecutionValue.Instance(it.toType()))
+                    }
                     else -> it.accept(this)
                 }
+            }
+        }
+    }
+
+    override suspend fun visit(memberAccess: MemberAccess) {
+        super.visit(memberAccess)
+        if (executionLayer > 0) {
+            val classType = (values.peek() as ExecutionValue.Instance).type
+            if (classType !is UserType)
+                throw NotImplementedError("Unsupported")
+            val symbol = currentTable!!.find(classType.identifier)
+            if (symbol !is Symbol.Class)
+                throw NotImplementedError("Unsupported")
+            withTable(symbol.node.symbolTable!!) {
+                IdentifierExpression(memberAccess.name, memberAccess.position).accept(this)
             }
         }
     }

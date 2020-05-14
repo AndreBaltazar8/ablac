@@ -337,11 +337,3 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         generatorContext.pushReplaceBlock(continuationBlock, generatorContext.topBlock.table)
     }
 }
-
-
-// TODO: need to calculate correct receiver and first parameter
-private fun FunctionDeclaration.toType(): Type =
-    FunctionType(parameters, returnType ?: UserType.Void, null, positionZero)
-
-// TODO: need to calculate correct parent
-private fun ClassDeclaration.toType(): Type = UserType(name, arrayOf(), null, positionZero)
