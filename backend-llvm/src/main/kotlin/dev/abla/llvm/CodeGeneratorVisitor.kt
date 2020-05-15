@@ -79,31 +79,58 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             ?: throw Exception("Unknown value for identifier ${identifierExpression.identifier}")
 
         // TODO: if class select most appropriate constructor
-        if (symbol.node.llvmValue == null)
+        if (symbol.node.run { llvmValue == null && !(this is PropertyDeclaration && scope == Scope.Class) })
             throw Exception("Cannot get llvm value for ${identifierExpression.identifier}. Is it a compiler function?")
 
         val node = symbol.node
         val value = if (node is PropertyDeclaration && !node.isFinal) {
-            if (!identifierExpression.returnForAssignment) {
+            if (node.scope == Scope.Class) {
+                val thisClass = generatorContext.topValue
+                val index = thisClass.type.asClassDeclaration.declarations.filterIsInstance<PropertyDeclaration>()
+                    .indexOfFirst { it == node } // TODO: Properly get index from some shared index table
                 val builder = generatorContext.topBlock.createBuilderAtEnd()
-                GeneratorContext.Value(node.type!!, LLVMBuildLoad(builder, node.llvmValue, ""))
-            } else
-                GeneratorContext.Value(node.type!!, node.llvmValue!!)
-        } else if (identifierExpression.returnForAssignment)
-            throw java.lang.IllegalStateException("Cannot assign value to final identifier ${identifierExpression.identifier}")
-        else {
-            val type = when (symbol) {
-                is Symbol.Function -> (node as FunctionDeclaration).toType()
-                is Symbol.Variable -> if (node is PropertyDeclaration) node.type!! else UserType.Any
-                is Symbol.Class -> (node as ClassDeclaration).toType()
+
+                val ptr = LLVMBuildStructGEP(builder, thisClass.ref, index, "")
+                if (!identifierExpression.returnForAssignment) {
+                    GeneratorContext.Value(node.type!!, LLVMBuildLoad(builder, ptr, ""))
+                } else
+                    GeneratorContext.Value(node.type!!, ptr)
+            } else {
+                if (!identifierExpression.returnForAssignment) {
+                    val builder = generatorContext.topBlock.createBuilderAtEnd()
+                    GeneratorContext.Value(node.type!!, LLVMBuildLoad(builder, node.llvmValue, ""))
+                } else
+                    GeneratorContext.Value(node.type!!, node.llvmValue!!)
             }
-            GeneratorContext.Value(type, node.llvmValue!!)
+        } else if (identifierExpression.returnForAssignment)
+            throw IllegalStateException("Cannot assign value to final identifier ${identifierExpression.identifier}")
+        else {
+            if (node is PropertyDeclaration && node.scope == Scope.Class) {
+                val thisClass = generatorContext.topValue
+                val index = thisClass.type.asClassDeclaration.declarations.filterIsInstance<PropertyDeclaration>()
+                    .indexOfFirst { it == node } // TODO: Properly get index from some shared index table
+                val builder = generatorContext.topBlock.createBuilderAtEnd()
+
+                val ptr = LLVMBuildStructGEP(builder, thisClass.ref, index, "")
+                GeneratorContext.Value(node.type!!, LLVMBuildLoad(builder, ptr, ""))
+            } else {
+                val type = when (symbol) {
+                    is Symbol.Function -> (node as FunctionDeclaration).toType()
+                    is Symbol.Variable -> if (node is PropertyDeclaration) node.type!! else UserType.Any
+                    is Symbol.Class -> (node as ClassDeclaration).toType()
+                }
+                GeneratorContext.Value(type, node.llvmValue!!)
+            }
         }
 
         generatorContext.values.push(value)
     }
 
     override suspend fun visit(functionCall: FunctionCall) {
+        val functionExpression = functionCall.primaryExpression
+        if (functionExpression is MemberAccess)
+            functionExpression.returnClass = true
+
         functionCall.primaryExpression.accept(this)
         val functionToCall = generatorContext.topValuePop
         val returnType = when (val functionType = functionToCall.type) {
@@ -112,7 +139,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             else -> throw IllegalStateException("Expecting function type in function call")
         }
 
-        val isMethodCall = functionCall.primaryExpression is MemberAccess
+        val isMethodCall = functionExpression is MemberAccess
         val thisClass = if (isMethodCall) generatorContext.topValuePop else null
 
         generatorContext.topBlock.createBuilderAtEnd { builder ->
@@ -140,7 +167,14 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         if (symbol !is Symbol.Class)
             throw NotImplementedError("Unsupported")
         generatorContext.withBlock(generatorContext.topBlock.block, symbol.node.symbolTable!!) {
-            IdentifierExpression(memberAccess.name, memberAccess.position).accept(this@CodeGeneratorVisitor)
+            IdentifierExpression(memberAccess.name, memberAccess.position).apply {
+                returnForAssignment = memberAccess.returnForAssignment
+                accept(this@CodeGeneratorVisitor)
+            }
+        }
+
+        if (!memberAccess.returnClass) {
+            generatorContext.values.removeAt(generatorContext.values.lastIndex - 1)
         }
     }
 
@@ -268,6 +302,8 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
+        if (propertyDeclaration.scope != Scope.Function)
+            return
         if (propertyDeclaration.isFinal) {
             val value = propertyDeclaration.value
                 ?: throw IllegalStateException("${propertyDeclaration.name} must have an initialization")
@@ -289,8 +325,18 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     override suspend fun visit(classDeclaration: ClassDeclaration) {
         generatorContext.withBlock(classDeclaration.llvmBlock!!, classDeclaration.symbolTable!!) {
             super.visit(classDeclaration)
-            createBuilderAtEnd {
-                LLVMBuildRet(it, LLVMBuildMalloc(it, classDeclaration.struct, ""))
+            createBuilderAtEnd { builder ->
+                val classInstance = LLVMBuildMalloc(builder, classDeclaration.struct, "")
+                classDeclaration.declarations.filterIsInstance<PropertyDeclaration>()
+                    .forEachIndexed { index, property ->
+                        if (property.value == null)
+                            return
+                        property.value?.accept(this@CodeGeneratorVisitor)
+                        val ptr = LLVMBuildStructGEP(builder, classInstance, index, "")
+                        LLVMBuildStore(builder, generatorContext.topValuePop.ref, ptr)
+                    }
+                // TODO: revisit declarations here
+                LLVMBuildRet(builder, classInstance)
             }
         }
     }
@@ -336,4 +382,14 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         // Continuation block
         generatorContext.pushReplaceBlock(continuationBlock, generatorContext.topBlock.table)
     }
+
+    private val Type.asClassDeclaration: ClassDeclaration
+        get() {
+            if (this !is UserType)
+                throw NotImplementedError("Unsupported")
+            val symbol = generatorContext.topBlock.table.find(identifier)
+            if (symbol !is Symbol.Class)
+                throw NotImplementedError("Unsupported")
+            return symbol.node
+        }
 }

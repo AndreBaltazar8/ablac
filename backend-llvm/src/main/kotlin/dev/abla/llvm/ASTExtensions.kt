@@ -34,3 +34,4 @@ val Type.llvmType: LLVMTypeRef
     }
 var ClassDeclaration.struct: LLVMTypeRef? by BackingField.nullable()
 var ClassDeclaration.constructorFunction: LLVMValueRef? by BackingField.nullable()
+var MemberAccess.returnClass: Boolean by BackingField { false }
