@@ -190,7 +190,10 @@ class ExecutionVisitor(
             if (symbol !is Symbol.Class)
                 throw NotImplementedError("Unsupported")
             withTable(symbol.node.symbolTable!!) {
-                IdentifierExpression(memberAccess.name, memberAccess.position).accept(this)
+                IdentifierExpression(memberAccess.name, memberAccess.position).apply {
+                    returnForAssignment = memberAccess.returnForAssignment
+                    accept(this@ExecutionVisitor)
+                }
             }
         }
     }
