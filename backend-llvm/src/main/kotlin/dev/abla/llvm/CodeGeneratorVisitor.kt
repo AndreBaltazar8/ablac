@@ -87,7 +87,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             if (node.scope == Scope.Class) {
                 val thisClass = generatorContext.topValue
                 val index = thisClass.type.asClassDeclaration.declarations.filterIsInstance<PropertyDeclaration>()
-                    .indexOfFirst { it == node } // TODO: Properly get index from some shared index table
+                    .indexOfFirst { it == node } + 1 // TODO: Properly get index from some shared index table
                 val builder = generatorContext.topBlock.createBuilderAtEnd()
 
                 val ptr = LLVMBuildStructGEP(builder, thisClass.ref, index, "")
@@ -108,7 +108,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             if (node is PropertyDeclaration && node.scope == Scope.Class) {
                 val thisClass = generatorContext.topValue
                 val index = thisClass.type.asClassDeclaration.declarations.filterIsInstance<PropertyDeclaration>()
-                    .indexOfFirst { it == node } // TODO: Properly get index from some shared index table
+                    .indexOfFirst { it == node } + 1 // TODO: Properly get index from some shared index table
                 val builder = generatorContext.topBlock.createBuilderAtEnd()
 
                 val ptr = LLVMBuildStructGEP(builder, thisClass.ref, index, "")
@@ -332,7 +332,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                         if (property.value == null)
                             return
                         property.value?.accept(this@CodeGeneratorVisitor)
-                        val ptr = LLVMBuildStructGEP(builder, classInstance, index, "")
+                        val ptr = LLVMBuildStructGEP(builder, classInstance, index + 1, "")
                         LLVMBuildStore(builder, generatorContext.topValuePop.ref, ptr)
                     }
                 // TODO: revisit declarations here

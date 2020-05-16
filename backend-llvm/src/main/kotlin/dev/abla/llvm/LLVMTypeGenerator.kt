@@ -79,7 +79,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         )
         LLVMStructSetBody(
             struct,
-            PointerPointer(*scope.fields.plus(LLVMPointerType(vTableType, 0)).toTypedArray()),
+            PointerPointer(LLVMPointerType(vTableType, 0), *scope.fields.toTypedArray()),
             scope.fields.size + 1,
             0
         )
