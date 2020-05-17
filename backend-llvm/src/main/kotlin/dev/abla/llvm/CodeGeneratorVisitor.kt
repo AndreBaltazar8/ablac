@@ -85,16 +85,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val node = symbol.node
         val value = if (node is PropertyDeclaration && !node.isFinal) {
             if (node.scope == Scope.Class) {
-                val thisClass = generatorContext.topValue
-                val index = thisClass.type.asClassDeclaration.declarations.filterIsInstance<PropertyDeclaration>()
-                    .indexOfFirst { it == node } + 1 // TODO: Properly get index from some shared index table
-                val builder = generatorContext.topBlock.createBuilderAtEnd()
-
-                val ptr = LLVMBuildStructGEP(builder, thisClass.ref, index, "")
-                if (!identifierExpression.returnForAssignment) {
-                    GeneratorContext.Value(node.type!!, LLVMBuildLoad(builder, ptr, ""))
-                } else
-                    GeneratorContext.Value(node.type!!, ptr)
+                node.buildMemberAccess(identifierExpression.returnForAssignment)
             } else {
                 if (!identifierExpression.returnForAssignment) {
                     val builder = generatorContext.topBlock.createBuilderAtEnd()
@@ -106,13 +97,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             throw IllegalStateException("Cannot assign value to final identifier ${identifierExpression.identifier}")
         else {
             if (node is PropertyDeclaration && node.scope == Scope.Class) {
-                val thisClass = generatorContext.topValue
-                val index = thisClass.type.asClassDeclaration.declarations.filterIsInstance<PropertyDeclaration>()
-                    .indexOfFirst { it == node } + 1 // TODO: Properly get index from some shared index table
-                val builder = generatorContext.topBlock.createBuilderAtEnd()
-
-                val ptr = LLVMBuildStructGEP(builder, thisClass.ref, index, "")
-                GeneratorContext.Value(node.type!!, LLVMBuildLoad(builder, ptr, ""))
+                node.buildMemberAccess(false)
             } else {
                 val type = when (symbol) {
                     is Symbol.Function -> (node as FunctionDeclaration).toType()
@@ -327,15 +312,14 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             super.visit(classDeclaration)
             createBuilderAtEnd { builder ->
                 val classInstance = LLVMBuildMalloc(builder, classDeclaration.struct, "")
-                classDeclaration.declarations.filterIsInstance<PropertyDeclaration>()
-                    .forEachIndexed { index, property ->
-                        if (property.value == null)
-                            return
-                        property.value?.accept(this@CodeGeneratorVisitor)
-                        val ptr = LLVMBuildStructGEP(builder, classInstance, index + 1, "")
-                        LLVMBuildStore(builder, generatorContext.topValuePop.ref, ptr)
-                    }
-                // TODO: revisit declarations here
+                classDeclaration.symbol.fields.forEachIndexed { index, field ->
+                    val property = field.node as PropertyDeclaration
+                    if (property.value == null)
+                        return
+                    property.value?.accept(this@CodeGeneratorVisitor)
+                    val ptr = LLVMBuildStructGEP(builder, classInstance, index + 1, "")
+                    LLVMBuildStore(builder, generatorContext.topValuePop.ref, ptr)
+                }
                 LLVMBuildRet(builder, classInstance)
             }
         }
@@ -383,13 +367,25 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         generatorContext.pushReplaceBlock(continuationBlock, generatorContext.topBlock.table)
     }
 
-    private val Type.asClassDeclaration: ClassDeclaration
+    private val Type.classSymbol: Symbol.Class
         get() {
             if (this !is UserType)
                 throw NotImplementedError("Unsupported")
             val symbol = generatorContext.topBlock.table.find(identifier)
             if (symbol !is Symbol.Class)
                 throw NotImplementedError("Unsupported")
-            return symbol.node
+            return symbol
         }
+
+    private fun PropertyDeclaration.buildMemberAccess(returnForAssignment: Boolean): GeneratorContext.Value {
+        val thisClass = generatorContext.topValue
+        val index =  symbol.classSymbol!!.fields.indexOfFirst { it.node == this } + 1
+        val builder = generatorContext.topBlock.createBuilderAtEnd()
+
+        val ptr = LLVMBuildStructGEP(builder, thisClass.ref, index, "")
+        return if (!returnForAssignment)
+            GeneratorContext.Value(type!!, LLVMBuildLoad(builder, ptr, ""))
+        else
+            GeneratorContext.Value(type!!, ptr)
+    }
 }

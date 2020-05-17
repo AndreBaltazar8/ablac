@@ -9,6 +9,8 @@ sealed class Symbol<T : Node>(open val name: String, open val node: T) {
         override val name: String,
         override val node: FunctionDeclaration
     ) : Symbol<FunctionDeclaration>(name, node) {
+        var receiver: Class? = null
+
         init {
             node.symbol = this
         }
@@ -18,6 +20,8 @@ sealed class Symbol<T : Node>(open val name: String, open val node: T) {
         override val name: String,
         override val node: Node
     ) : Symbol<Node>(name, node) {
+        var classSymbol: Class? = null
+
         init {
             node.symbol = this
         }
@@ -27,6 +31,9 @@ sealed class Symbol<T : Node>(open val name: String, open val node: T) {
         override val name: String,
         override val node: ClassDeclaration
     ) : Symbol<Node>(name, node) {
+        val fields = mutableListOf<Variable>()
+        val methods = mutableListOf<Function>()
+
         init {
             node.symbol = this
         }

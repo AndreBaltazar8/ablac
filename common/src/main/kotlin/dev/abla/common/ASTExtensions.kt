@@ -11,6 +11,12 @@ var WhileStatement.symbolTable: SymbolTable? by BackingField.nullable()
 var IfElseExpression.ifSymbolTable: SymbolTable? by BackingField.nullable()
 var IfElseExpression.elseSymbolTable: SymbolTable? by BackingField.nullable()
 var Node.symbol: Symbol<*>? by BackingField.nullable()
+var ClassDeclaration.symbol: Symbol.Class
+    get() = Node::symbol.get(this) as Symbol.Class
+    set(value) = Node::symbol.set(this, value)
+var PropertyDeclaration.symbol: Symbol.Variable
+    get() = Node::symbol.get(this) as Symbol.Variable
+    set(value) = Node::symbol.set(this, value)
 var Expression.returnForAssignment: Boolean by BackingField { false }
 var PropertyDeclaration.scope: Scope by BackingField { Scope.Global }
 

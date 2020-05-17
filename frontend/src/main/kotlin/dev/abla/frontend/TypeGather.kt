@@ -8,6 +8,7 @@ import java.util.*
 
 class TypeGather(private val global: SymbolTable) : ASTVisitor() {
     private var currentScope = Scope.Global
+    private val classScopes = Stack<Symbol.Class>()
 
     private val tables = Stack<SymbolTable>().apply {
         push(global)
@@ -21,6 +22,11 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         val function = Symbol.Function(functionDeclaration.name, functionDeclaration)
         tables.peek().symbols.add(function)
+        if (currentScope == Scope.Class) {
+            val classSymbol = classScopes.peek()
+            classSymbol.methods.add(function)
+            function.receiver = classSymbol
+        }
 
         createTableInParent { table ->
             functionDeclaration.symbolTable = table
@@ -70,6 +76,7 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
     override suspend fun visit(classDeclaration: ClassDeclaration) {
         val classSymbol = Symbol.Class(classDeclaration.name, classDeclaration)
         tables.peek().symbols.add(classSymbol)
+        classScopes.push(classSymbol)
 
         createTableInParent {
             classDeclaration.symbolTable = it
@@ -77,6 +84,8 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
                 super.visit(classDeclaration)
             }
         }
+
+        classScopes.pop()
     }
 
     override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
@@ -88,6 +97,11 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         tables.peek().symbols.add(variable)
         if (propertyDeclaration.type == null) {
             propertyDeclaration.type = UserType.Int // TODO: type inference
+        }
+        if (currentScope == Scope.Class) {
+            val classSymbol = classScopes.peek()
+            variable.classSymbol = classSymbol
+            classSymbol.fields.add(variable)
         }
 
         super.visit(propertyDeclaration)
