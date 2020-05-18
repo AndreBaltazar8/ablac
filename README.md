@@ -115,8 +115,9 @@ These the current and planned features for the language. It is not exhaustive li
 - Hardcoded function lambda functionality
 - Import new file
 - Parallel processing of imported files
-- compile-time execution for all available features with interpretation execution
 - While loops
+- Class instantiation with simple variables
+- compile-time execution for all available features with interpretation execution
 
 ### To Do
 - Investigate:
@@ -131,12 +132,12 @@ These the current and planned features for the language. It is not exhaustive li
 - Add operators and comparisons for all types
 - If/else statements
 - Switch/When
-- Loops
+- Loops (for, do-while)
 - Add simple build-in types (string, int)
 - Function calls to defined types/classes (direct and vtable)
 - Type checking everything
 - Class object allocation
-- Class construction
+- Class construction with proper constructors
 - Extension functions
 - Variable declarations with type check (in functions, globally and class fields)
 - Send values to lambdas and other scopes
