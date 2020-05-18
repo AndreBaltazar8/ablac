@@ -11,11 +11,11 @@ abstract class ExecutionValue {
         override fun copyWith(final: Boolean): ExecutionValue = Value(value).apply { isFinal = final }
     }
 
-    data class Instance(val type: Type) : ExecutionValue() {
+    data class Instance(val type: Type, val scope: ExecutionScope) : ExecutionValue() {
         override val value: Literal
             get() = throw IllegalStateException("Value cannot be converted to literal")
 
-        override fun copyWith(final: Boolean): ExecutionValue = Instance(type).apply { isFinal = final }
+        override fun copyWith(final: Boolean): ExecutionValue = Instance(type, scope).apply { isFinal = final }
     }
 
 

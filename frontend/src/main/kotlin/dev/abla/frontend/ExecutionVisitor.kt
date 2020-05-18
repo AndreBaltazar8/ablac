@@ -101,8 +101,9 @@ class ExecutionVisitor(
                 if (value.isFinal)
                     throw IllegalStateException("Cannot assign value to final identifier $identifier")
 
+                val scope = currentScope!!
                 values.push(ExecutionValue.AssignableValue {
-                    currentScope!!.modify(identifier, it)
+                    scope.modify(identifier, it)
                 })
             } else
                 values.push(value)
@@ -167,7 +168,15 @@ class ExecutionVisitor(
                         values.push(returnValue)
                     }
                     is ClassDeclaration -> {
-                        values.push(ExecutionValue.Instance(it.toType()))
+                        val instance = ExecutionValue.Instance(it.toType(), ExecutionScope(null, it.symbolTable!!))
+                        it.symbol.fields.forEach{ field ->
+                            val property = field.node as PropertyDeclaration
+                            if (property.value == null)
+                                return
+                            property.value?.accept(this)
+                            instance.scope[property.name] = values.pop().copyWith(property.isFinal)
+                        }
+                        values.push(instance)
                     }
                     is FunctionDeclaration -> {
                         val isMemberAccess = functionCall.primaryExpression is MemberAccess
@@ -183,18 +192,20 @@ class ExecutionVisitor(
     override suspend fun visit(memberAccess: MemberAccess) {
         super.visit(memberAccess)
         if (executionLayer > 0) {
-            val classType = (values.peek() as ExecutionValue.Instance).type
+            val classInstance = values.peek() as ExecutionValue.Instance
+            val classType = classInstance.type
             if (classType !is UserType)
                 throw NotImplementedError("Unsupported")
             val symbol = currentTable!!.find(classType.identifier)
             if (symbol !is Symbol.Class)
                 throw NotImplementedError("Unsupported")
-            withTable(symbol.node.symbolTable!!) {
-                IdentifierExpression(memberAccess.name, memberAccess.position).apply {
-                    returnForAssignment = memberAccess.returnForAssignment
-                    accept(this@ExecutionVisitor)
-                }
+            val previousScope = currentScope
+            currentScope = classInstance.scope
+            IdentifierExpression(memberAccess.name, memberAccess.position).apply {
+                returnForAssignment = memberAccess.returnForAssignment
+                accept(this@ExecutionVisitor)
             }
+            currentScope = previousScope
         }
     }
 
