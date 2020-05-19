@@ -59,6 +59,8 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(classDeclaration: ClassDeclaration) {
+        if (classDeclaration.isCompiler)
+            return
         val struct = LLVMStructCreateNamed(LLVMGetGlobalContext(), classDeclaration.name)
         val scope = TypeScope(classDeclaration.name, struct)
         typeScopes.push(scope)

@@ -308,6 +308,8 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(classDeclaration: ClassDeclaration) {
+        if (classDeclaration.isCompiler)
+            return
         generatorContext.withBlock(classDeclaration.llvmBlock!!, classDeclaration.symbolTable!!) {
             super.visit(classDeclaration)
             createBuilderAtEnd { builder ->

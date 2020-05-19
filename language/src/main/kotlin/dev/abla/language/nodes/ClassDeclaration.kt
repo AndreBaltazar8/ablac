@@ -9,6 +9,7 @@ open class ClassDeclaration(
     val declarations: Array<Declaration>,
     override val position: Position
 ) : Declaration {
+    val isCompiler get() = modifiers.any { it is ModCompiler }
 
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
