@@ -17,6 +17,9 @@ var ClassDeclaration.symbol: Symbol.Class
 var PropertyDeclaration.symbol: Symbol.Variable
     get() = Node::symbol.get(this) as Symbol.Variable
     set(value) = Node::symbol.set(this, value)
+var FunctionDeclaration.symbol: Symbol.Function
+    get() = Node::symbol.get(this) as Symbol.Function
+    set(value) = Node::symbol.set(this, value)
 var Expression.returnForAssignment: Boolean by BackingField { false }
 var PropertyDeclaration.scope: Scope by BackingField { Scope.Global }
 

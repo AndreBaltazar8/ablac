@@ -2,6 +2,7 @@ package dev.abla.llvm
 
 import dev.abla.common.Scope
 import dev.abla.common.scope
+import dev.abla.common.symbol
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import org.bytedeco.javacpp.PointerPointer
@@ -20,15 +21,20 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             return
 
         val name = typeScopes.map { it.name }.plus(functionDeclaration.name).joinToString("%")
-        val argTypes =
-            listOfNotNull(if (!typeScopes.empty()) LLVMPointerType(typeScopes.peek().type, 0) else null)
-                .plus(functionDeclaration.parameters.map {
-                    try {
-                        it.type.llvmType
-                    } catch (e: Exception) {
-                        throw Exception("${it.name}: ${e.message}", e)
-                    }
-                })
+
+        val classType = if (!typeScopes.empty() && functionDeclaration.symbol.receiver != null)
+            LLVMPointerType(typeScopes.peek().type, 0)
+        else
+            null
+
+        val argTypes = listOfNotNull(classType)
+            .plus(functionDeclaration.parameters.map {
+                try {
+                    it.type.llvmType
+                } catch (e: Exception) {
+                    throw Exception("${it.name}: ${e.message}", e)
+                }
+            })
         val function = module.addFunction(
             name,
             functionDeclaration.returnType?.llvmType ?: LLVMVoidType(),
