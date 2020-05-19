@@ -43,7 +43,10 @@ class ExecutionVisitor(
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         withTable(functionDeclaration.symbolTable) {
-            if (executionLayer > 0 && functionDeclaration.callInfo != null) {
+            if (executionLayer > 0) {
+                if (functionDeclaration.callInfo == null)
+                    return@withTable
+
                 if (functionDeclaration.callInfo?.instance != null)
                     currentScope!!["this"] = values.pop()
                 functionDeclaration.parameters.reversed().forEach {

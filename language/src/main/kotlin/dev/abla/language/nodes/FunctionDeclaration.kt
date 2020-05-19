@@ -10,7 +10,7 @@ open class FunctionDeclaration(
     val returnType: Type?,
     val modifiers: Array<Modifier>,
     override val position: Position
-) : Declaration {
+) : Statement {
     val isExtern get() = modifiers.any { it is Extern }
     val isCompiler get() = modifiers.any { it is ModCompiler }
 

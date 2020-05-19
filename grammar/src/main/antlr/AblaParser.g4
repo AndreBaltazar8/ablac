@@ -66,9 +66,10 @@ functionBody : block # blockBody
 
 block : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
 
-statement : expression # expressionStatement
-          | propertyDeclaration #propertyDeclarationStatement
-          | whileStatement #whileStatementST
+statement : expression
+          | propertyDeclaration
+          | whileStatement
+          | functionDeclaration
           ;
 
 whileStatement : WHILE nlsemiOrRCurlNoConsume LPAREN condition=expression RPAREN (controlStructureBody | SEMICOLON) ;
