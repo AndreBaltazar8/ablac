@@ -115,7 +115,7 @@ class ExecutionVisitor(
             executionLayer++
             super.visit(compilerExec)
             compilerExec.compiled = true
-            compilerExec.expression = values.pop().value
+            compilerExec.expression = if(executionLayer > 1) values.peek().value else values.pop().value
             executionLayer--
         } else {
             super.visit(compilerExec)
