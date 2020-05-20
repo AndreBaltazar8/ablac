@@ -47,6 +47,29 @@ class ExecutionVisitor(
                 if (functionDeclaration.callInfo == null)
                     return@withTable
 
+                if (functionDeclaration.isCompiler) {
+                    var symbol = currentTable!!.find("CompilerContext")
+                    if (symbol == null) {
+                        requirePendingImports()
+                        symbol = currentTable!!.find("CompilerContext")
+                    }
+                    if (symbol !is Symbol.Class)
+                        throw NotImplementedError("Unsupported")
+                    symbol.node.symbolTable!!.symbols.let {
+                        it.removeAll { symbol -> symbol.name == "rename" }
+                        it.add(Symbol.Function("rename", CompilerFunctionDeclaration("rename", arrayOf(Parameter("fnName", UserType.String)), arrayOf(ModCompiler(positionZero))) { _, args ->
+                            print("Attempting to RENAME ${functionDeclaration.name} to ${args[0] as String}\n")
+                            functionDeclaration.name = args[0] as String
+                            functionDeclaration.symbol.name = args[0] as String
+                            Integer("1", positionZero)
+                        }))
+                    }
+                    val scope = ExecutionScope(null, symbol.node.symbolTable!!).apply {
+                        set("name", functionDeclaration.name.toExecutionValue())
+                    }
+                    currentScope!!["compilerContext"] = ExecutionValue.Instance(UserType("CompilerContext"), scope)
+                }
+
                 if (functionDeclaration.callInfo?.instance != null)
                     currentScope!!["this"] = values.pop()
                 functionDeclaration.parameters.reversed().forEach {
@@ -157,6 +180,9 @@ class ExecutionVisitor(
             function.let {
                 when (it) {
                     is CompilerFunctionDeclaration -> {
+                        // TODO: support passing instances to compiler functions
+                        if (functionCall.primaryExpression is MemberAccess)
+                            values.pop()
                         values.add(ExecutionValue.Value(it.executionBlock(this, functionCall.arguments.reversed().map {
                             values.pop().value.toValue(currentScope!!)
                         }.reversed().toTypedArray())))
@@ -313,7 +339,7 @@ class ExecutionVisitor(
         currentScope = currentScope!!.parent
     }
 
-    suspend fun Literal?.toValue(currentScope: ExecutionScope): Any =
+    private suspend fun Literal?.toValue(currentScope: ExecutionScope): Any =
         when (this) {
             is Integer -> number.toInt()
             is StringLiteral -> {
@@ -331,6 +357,9 @@ class ExecutionVisitor(
             is FunctionLiteral -> this
             else -> throw Exception("Unknown literal conversion")
         }
+
+    private fun String.toExecutionValue(): ExecutionValue =
+        ExecutionValue.Value(StringLiteral(arrayOf(StringLiteral.StringConst(this, positionZero)), positionZero))
 
     data class CallInfo(val instance: ExecutionValue.Instance?)
     var FunctionDeclaration.callInfo: CallInfo? by BackingField.nullable()

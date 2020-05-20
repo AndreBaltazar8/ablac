@@ -52,7 +52,7 @@ modifier : functionModifier # functionModifierModifier
          | allocationModifier # allocationModifierModifier
          ;
 
-functionModifier : EXTERN (COLON stringLiteral) # externModifier
+functionModifier : EXTERN (COLON stringLiteral)? # externModifier
                  ;
 
 allocationModifier : COMPILER # compilerModifier

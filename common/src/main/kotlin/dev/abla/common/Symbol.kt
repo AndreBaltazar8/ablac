@@ -6,7 +6,7 @@ import dev.abla.language.nodes.Node
 
 sealed class Symbol<T : Node>(open val name: String, open val node: T) {
     data class Function(
-        override val name: String,
+        override var name: String,
         override val node: FunctionDeclaration
     ) : Symbol<FunctionDeclaration>(name, node) {
         var receiver: Class? = null

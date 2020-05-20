@@ -31,6 +31,9 @@ class RunnerTest : KoinComponent {
     }
 
     @Test
+    fun testCompilerContext() = runResourceFile("examples/test_compiler_context.ab")
+
+    @Test
     fun testFunctions() = runResourceFile("examples/test_functions.ab") {
         assert(it.contains("call void @voidReturn()"))
     }

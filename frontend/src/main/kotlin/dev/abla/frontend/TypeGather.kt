@@ -41,6 +41,15 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
                 table.symbols.add(Symbol.Variable(it.name, it))
             }
 
+            if (functionDeclaration.isCompiler) {
+                table.symbols.add(
+                    Symbol.Variable(
+                        "compilerContext",
+                        Parameter("compilerContext", UserType("CompilerContext"))
+                    )
+                )
+            }
+
             withScope(Scope.Function) {
                 functionDeclaration.block?.accept(this)
             }

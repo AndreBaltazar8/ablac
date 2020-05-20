@@ -4,7 +4,7 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
 
 open class FunctionDeclaration(
-    val name: String,
+    var name: String,
     val parameters: Array<Parameter>,
     val block: Block?,
     val returnType: Type?,
