@@ -132,7 +132,7 @@ class CompileService(
                 CompilationContext(executionVisitor.executionJob, Job(executionVisitor.executionJob))
             )
 
-            Integer("1", positionZero)
+            ExecutionValue.Value(Integer("1", positionZero))
         }
 
         // TODO: Remove. This is just an example on how to declare functions from compiler
@@ -142,7 +142,7 @@ class CompileService(
                 File(name, arrayOf(FunctionDeclaration(args[0] as String, arrayOf(), (args[1] as FunctionLiteral).block, UserType.Int, arrayOf(), positionZero)), positionZero)
             }
 
-            Integer("1", positionZero)
+            ExecutionValue.Value(Integer("1", positionZero))
         }
     }
 
@@ -150,7 +150,7 @@ class CompileService(
         name: String,
         parameters: Array<Parameter> = arrayOf(),
         modifiers: Array<Modifier> = arrayOf(),
-        executionBlock: suspend (ExecutionVisitor, Array<Any>) -> Literal
+        executionBlock: suspend (ExecutionVisitor, Array<Any>) -> ExecutionValue
     ) {
         val declaration = CompilerFunctionDeclaration(name, parameters, arrayOf(*modifiers, ModCompiler(positionZero)), executionBlock)
         global.symbols.add(Symbol.Function(name, declaration))

@@ -2,6 +2,7 @@ package dev.abla.frontend
 
 import dev.abla.common.Symbol
 import dev.abla.language.nodes.Literal
+import dev.abla.language.nodes.Node
 import dev.abla.language.nodes.Type
 
 abstract class ExecutionValue {
@@ -30,6 +31,17 @@ abstract class ExecutionValue {
             get() = throw IllegalStateException("Value cannot be converted to literal")
 
         override fun copyWith(final: Boolean): ExecutionValue = AssignableValue(assign).apply { isFinal = final }
+    }
+
+    data class CompilerNode(val node: Node) : ExecutionValue() {
+        init {
+            isFinal = false
+        }
+
+        override val value: Literal
+            get() = throw IllegalStateException("Value cannot be converted to literal")
+
+        override fun copyWith(final: Boolean): ExecutionValue = CompilerNode(node).apply { isFinal = final }
     }
 
     abstract val value: Literal

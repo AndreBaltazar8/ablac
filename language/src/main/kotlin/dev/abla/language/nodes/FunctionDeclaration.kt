@@ -6,7 +6,7 @@ import dev.abla.language.Position
 open class FunctionDeclaration(
     var name: String,
     val parameters: Array<Parameter>,
-    val block: Block?,
+    var block: Block?,
     val returnType: Type?,
     val modifiers: Array<Modifier>,
     override val position: Position

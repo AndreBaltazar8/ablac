@@ -4,7 +4,7 @@ import dev.abla.common.SymbolTable
 import dev.abla.language.nodes.Literal
 import java.lang.IllegalStateException
 
-class ExecutionScope(val parent: ExecutionScope?, val symbolTable: SymbolTable) {
+open class ExecutionScope(val parent: ExecutionScope?, val symbolTable: SymbolTable) {
     private val values = mutableMapOf<String, ExecutionValue>()
 
     operator fun get(identifier: String) : ExecutionValue? =
@@ -16,7 +16,7 @@ class ExecutionScope(val parent: ExecutionScope?, val symbolTable: SymbolTable) 
         values[identifier] = value
     }
 
-    fun modify(identifier: String, value: ExecutionValue) {
+    open fun modify(identifier: String, value: ExecutionValue) {
         if (values.containsKey(identifier))
             values[identifier] = value
         else if (parent == null)

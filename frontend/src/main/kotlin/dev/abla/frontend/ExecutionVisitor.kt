@@ -58,10 +58,38 @@ class ExecutionVisitor(
                     symbol.node.symbolTable!!.symbols.let {
                         it.removeAll { symbol -> symbol.name == "rename" }
                         it.add(Symbol.Function("rename", CompilerFunctionDeclaration("rename", arrayOf(Parameter("fnName", UserType.String)), arrayOf(ModCompiler(positionZero))) { _, args ->
-                            print("Attempting to RENAME ${functionDeclaration.name} to ${args[0] as String}\n")
                             functionDeclaration.name = args[0] as String
                             functionDeclaration.symbol.name = args[0] as String
-                            Integer("1", positionZero)
+                            ExecutionValue.Value(Integer("1", positionZero))
+                        }))
+                        it.add(Symbol.Function("setBody", CompilerFunctionDeclaration("setBody", arrayOf(Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero))), arrayOf(ModCompiler(positionZero))) { _, args ->
+                            functionDeclaration.block = (args[0] as FunctionLiteral).block.copy()
+                            ExecutionValue.Value(Integer("1", positionZero))
+                        }))
+                        it.add(Symbol.Function("modify", CompilerFunctionDeclaration("modify", arrayOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero))), arrayOf(ModCompiler(positionZero))) { _, args ->
+                            val sym = symbol.node.symbolTable!!.find(args[0] as String)
+                            if (sym !is Symbol.Function)
+                                throw Exception("Not a method")
+                            sym.node.block = (args[1] as FunctionLiteral).block.copy()
+                            ExecutionValue.Value(Integer("1", positionZero))
+                        }))
+
+                        it.add(Symbol.Function("find", CompilerFunctionDeclaration("find", arrayOf(Parameter("fnName", UserType.String)), arrayOf(ModCompiler(positionZero))) { _, args ->
+                            val sym = symbol.node.symbolTable!!.find(args[0] as String)
+                            if (sym !is Symbol.Function)
+                                throw Exception("Not a method")
+                            sym.node.block
+                            ExecutionValue.Instance(UserType("CompilerFunctionContext"),
+                                object : ExecutionScope(null, currentTable!!) {
+                                    override fun modify(identifier: String, value: ExecutionValue) {
+                                        super.modify(identifier, value)
+                                        if (identifier == "block")
+                                            sym.node.block = (value as ExecutionValue.CompilerNode).node as Block
+                                    }
+                                }.apply {
+                                    set("block", ExecutionValue.CompilerNode(sym.node.block!!))
+                                }
+                            )
                         }))
                     }
                     val scope = ExecutionScope(null, symbol.node.symbolTable!!).apply {
@@ -183,9 +211,9 @@ class ExecutionVisitor(
                         // TODO: support passing instances to compiler functions
                         if (functionCall.primaryExpression is MemberAccess)
                             values.pop()
-                        values.add(ExecutionValue.Value(it.executionBlock(this, functionCall.arguments.reversed().map {
+                        values.add(it.executionBlock(this, functionCall.arguments.reversed().map {
                             values.pop().value.toValue(currentScope!!)
-                        }.reversed().toTypedArray())))
+                        }.reversed().toTypedArray()))
                     }
                     is FunctionLiteral -> {
                         val numValues = values.size
