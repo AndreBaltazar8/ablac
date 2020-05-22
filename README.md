@@ -1,6 +1,10 @@
 # ablac - compiler for abla programming language
 
-abla is a programming language that allows arbitrary compile-time code execution. It will also allow compile-time modification of code. 
+Abla's mission is to **make compile time as important as runtime**. Why? Because complex systems can be created from simple code, but that simple code is not always possible and sometimes requires complex code generators written in different languages. Why not have the power to generate that code from the same language you are writing, and without complications?
+
+How is this done? By **allowing every piece of code to run at compile time** if needed. Functions can access the compiler context which gives the ability not only to generate new code, but also modify any part of the program being compiled. Any compile time expression can be used to build a constant value.
+
+So what is abla exactly? **Abla is new programming language which allows arbitrary code execution at compile time**. Anything that can run at runtime, is also available at compile time. It allows modifications of the code being compiled, and even allows modification of other compile time code. 
 
 Another long term goal of the language is also to allow new code to be inserted dynamically into compiled programs. Effectively allowing patching and modification of programs at every stage from compilation to execution, which enables a wide range of applications.
 
