@@ -34,7 +34,7 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
             val extern = functionDeclaration.isExtern
             if (extern && functionDeclaration.block != null)
                 throw Exception("Extern function cannot have a body")
-            if (!extern && functionDeclaration.block == null)
+            if (!extern && !functionDeclaration.isAbstract && functionDeclaration.block == null)
                 throw Exception("Function must have a body or be declared extern or abstract")
 
             functionDeclaration.parameters.forEach {

@@ -48,8 +48,9 @@ annotations : (AT annotation (COMMA annotation)*)+ ;
 
 modifierList : annotations | annotations? modifier+ ;
 
-modifier : functionModifier # functionModifierModifier
-         | allocationModifier # allocationModifierModifier
+modifier : functionModifier
+         | allocationModifier
+         | inheritanceModifier
          ;
 
 functionModifier : EXTERN (COLON stringLiteral)? # externModifier
@@ -57,6 +58,9 @@ functionModifier : EXTERN (COLON stringLiteral)? # externModifier
 
 allocationModifier : COMPILER # compilerModifier
                    ;
+
+inheritanceModifier : ABSTRACT # abstractModifier
+                    ;
 
 compilerCall : COMPILER_DIRECTIVE (simpleIdentifier | functionLiteral) callSuffix+ ;
 
@@ -74,7 +78,7 @@ statement : expression
 
 whileStatement : WHILE nlsemiOrRCurlNoConsume LPAREN condition=expression RPAREN (controlStructureBody | SEMICOLON) ;
 
-propertyDeclaration : (VAR | VAL) variableDeclaration (ASSIGNMENT expression)? ;
+propertyDeclaration : modifierList? (VAR | VAL) variableDeclaration (ASSIGNMENT expression)? ;
 
 variableDeclaration : simpleIdentifier (COLON type)? ;
 

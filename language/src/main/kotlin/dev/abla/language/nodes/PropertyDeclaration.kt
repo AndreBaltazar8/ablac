@@ -9,6 +9,7 @@ class PropertyDeclaration(
     val name: Identifier,
     var type: Type?,
     val value: Expression?,
+    val modifiers: Array<Modifier>,
     override val position: Position
 ) : Statement {
     override suspend fun accept(visitor: ASTVisitor) {

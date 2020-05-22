@@ -22,6 +22,7 @@ SEMICOLON : ';' ;
 AT : '@' ;
 EXTERN : 'extern' ;
 COMPILER : 'compiler' ;
+ABSTRACT : 'abstract' ;
 CLASS : 'class' ;
 IF : 'if' ;
 ELSE : 'else' ;

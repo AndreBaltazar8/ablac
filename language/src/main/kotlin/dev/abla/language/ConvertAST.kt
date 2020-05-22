@@ -49,11 +49,10 @@ fun AblaParser.ClassMemberDeclarationContext.toAST() : Declaration =
         throw IllegalStateException("Unknown class member type ${this::class.simpleName}")
 
 fun AblaParser.ModifierContext.toAST(): Modifier =
-    when (this) {
-        is AblaParser.FunctionModifierModifierContext -> functionModifier().toAST()
-        is AblaParser.AllocationModifierModifierContext -> allocationModifier().toAST()
-        else -> throw IllegalStateException("Unknown modifier type ${this::class.simpleName}")
-    }
+    functionModifier()?.toAST() ?:
+    allocationModifier()?.toAST() ?:
+    inheritanceModifier()?.toAST() ?:
+    throw IllegalStateException("Unknown modifier type ${this::class.simpleName}")
 
 fun AblaParser.FunctionModifierContext.toAST(): Modifier =
     when (this) {
@@ -65,6 +64,12 @@ fun AblaParser.AllocationModifierContext.toAST(): Modifier =
     when (this) {
         is AblaParser.CompilerModifierContext -> ModCompiler(position)
         else -> throw IllegalStateException("Unknown allocation modifier type ${this::class.simpleName}")
+    }
+
+fun AblaParser.InheritanceModifierContext.toAST(): Modifier =
+    when (this) {
+        is AblaParser.AbstractModifierContext -> Abstract(position)
+        else -> throw IllegalStateException("Unknown inheritance modifier type ${this::class.simpleName}")
     }
 
 fun AblaParser.ParameterContext.toAST() =
@@ -143,6 +148,7 @@ fun AblaParser.PropertyDeclarationContext.toAST(): PropertyDeclaration =
         variableDeclaration().simpleIdentifier().text,
         variableDeclaration().type()?.toAST(),
         expression()?.toAST(),
+        modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
         position
     )
 

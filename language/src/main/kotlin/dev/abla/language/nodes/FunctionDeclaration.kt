@@ -12,6 +12,7 @@ open class FunctionDeclaration(
     override val position: Position
 ) : Statement {
     val isExtern get() = modifiers.any { it is Extern }
+    val isAbstract get() = modifiers.any { it is Extern }
     val isCompiler get() = modifiers.any { it is ModCompiler }
 
     override suspend fun accept(visitor: ASTVisitor) {
