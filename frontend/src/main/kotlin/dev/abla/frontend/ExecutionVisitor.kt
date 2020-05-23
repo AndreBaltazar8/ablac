@@ -62,10 +62,12 @@ class ExecutionVisitor(
                             functionDeclaration.symbol.name = args[0] as String
                             ExecutionValue.Value(Integer("1", positionZero))
                         }))
+                        it.removeAll { symbol -> symbol.name == "setBody" }
                         it.add(Symbol.Function("setBody", CompilerFunctionDeclaration("setBody", arrayOf(Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero))), arrayOf(ModCompiler(positionZero))) { _, args ->
                             functionDeclaration.block = (args[0] as FunctionLiteral).block.copy()
                             ExecutionValue.Value(Integer("1", positionZero))
                         }))
+                        it.removeAll { symbol -> symbol.name == "modify" }
                         it.add(Symbol.Function("modify", CompilerFunctionDeclaration("modify", arrayOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero))), arrayOf(ModCompiler(positionZero))) { _, args ->
                             val sym = symbol.node.symbolTable!!.find(args[0] as String)
                             if (sym !is Symbol.Function)
@@ -73,7 +75,7 @@ class ExecutionVisitor(
                             sym.node.block = (args[1] as FunctionLiteral).block.copy()
                             ExecutionValue.Value(Integer("1", positionZero))
                         }))
-
+                        it.removeAll { symbol -> symbol.name == "find" }
                         it.add(Symbol.Function("find", CompilerFunctionDeclaration("find", arrayOf(Parameter("fnName", UserType.String)), arrayOf(ModCompiler(positionZero))) { _, args ->
                             val sym = symbol.node.symbolTable!!.find(args[0] as String)
                             if (sym !is Symbol.Function)
