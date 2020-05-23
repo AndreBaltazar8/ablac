@@ -107,10 +107,9 @@ class ExecutionVisitor(
                 arrayOf(
                     Parameter("fnName", UserType.String),
                     Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero))
-                ),
-                arrayOf(ModCompiler(positionZero))
+                )
             ) { _, args ->
-                val sym = symbol.node.symbolTable!!.find(args[0] as String)
+                val sym = functionDeclaration.symbolTable!!.find(args[0] as String)
                 if (sym !is Symbol.Function)
                     throw Exception("Not a method")
                 sym.node.block = (args[1] as FunctionLiteral).block.copy()
@@ -132,6 +131,18 @@ class ExecutionVisitor(
                         set("block", ExecutionValue.CompilerNode(sym.node.block!!))
                     }
                 )
+            }
+            replaceFunction(
+                "defineInClass",
+                arrayOf(Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
+            ) { _, args ->
+                (args[0] as FunctionLiteral).block.statements.filterIsInstance<FunctionDeclaration>().forEach { func ->
+                    val classSymbol = functionDeclaration.symbol.receiver!!
+                    val functionSymbol = Symbol.Function(func.name, func)
+                    classSymbol.methods.add(functionSymbol)
+                    classSymbol.node.symbolTable!!.symbols.add(functionSymbol)
+                }
+                ExecutionValue.Value(Integer("1", positionZero))
             }
         }
         val scope = ExecutionScope(null, symbol.node.symbolTable!!).apply {
