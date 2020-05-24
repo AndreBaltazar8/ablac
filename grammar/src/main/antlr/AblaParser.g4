@@ -101,8 +101,6 @@ binaryOperationHigherOps : binaryOperatorHigher atomicExpression ;
 
 atomicExpression : prefixUnaryOperation atomicExpression # perfixExpression
                  | primaryExpression postfixUnarySuffix* # suffixExpression
-                 | LPAREN expression RPAREN #parenthesizedExpression
-                 | IF LPAREN condition=expression RPAREN nlsemiOrRCurlNoConsume ifBody=controlStructureBody nlsemiOrRCurlNoConsume (ELSE nlsemiOrRCurlNoConsume elseBody=controlStructureBody)? #ifExpression
                  ;
 
 controlStructureBody : block | statement ;
@@ -115,7 +113,14 @@ binaryOperatorLower : PLUS | MINUS ;
 primaryExpression : simpleIdentifier # simpleIdentifierExpression
                   | literal # literalExpression
                   | functionLiteral # functionLiteralExpression
+                  | LPAREN expression RPAREN #parenthesizedExpression
+                  | IF LPAREN condition=expression RPAREN nlsemiOrRCurlNoConsume ifBody=controlStructureBody nlsemiOrRCurlNoConsume (ELSE nlsemiOrRCurlNoConsume elseBody=controlStructureBody)? #ifExpression
+                  | WHEN (LPAREN condition=expression RPAREN)? nlsemiOrRCurlNoConsume LCURL whenCase* RCURL #whenExpression
                   ;
+
+whenCase : expression (nlsemiOrRCurlNoConsume COMMA nlsemiOrRCurlNoConsume expression)* nlsemiOrRCurlNoConsume ARROW nlsemiOrRCurlNoConsume controlStructureBody
+         | ELSE nlsemiOrRCurlNoConsume ARROW nlsemiOrRCurlNoConsume controlStructureBody
+         ;
 
 prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
                      ;

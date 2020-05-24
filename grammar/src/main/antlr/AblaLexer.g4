@@ -29,6 +29,7 @@ ELSE : 'else' ;
 VAR : 'var' ;
 VAL : 'val' ;
 WHILE : 'while' ;
+WHEN : 'when' ;
 QUEST : '?' ;
 LANGLE : '<' ;
 RANGLE : '>' ;

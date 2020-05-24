@@ -112,11 +112,11 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(functionCall: FunctionCall) {
-        val functionExpression = functionCall.primaryExpression
+        val functionExpression = functionCall.expression
         if (functionExpression is MemberAccess)
             functionExpression.returnClass = true
 
-        functionCall.primaryExpression.accept(this)
+        functionCall.expression.accept(this)
         val functionToCall = generatorContext.topValuePop
         val returnType = when (val functionType = functionToCall.type) {
             is FunctionType -> functionType.returnType

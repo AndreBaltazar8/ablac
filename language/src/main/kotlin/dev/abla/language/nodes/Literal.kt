@@ -1,3 +1,3 @@
 package dev.abla.language.nodes
 
-interface Literal : PrimaryExpression
+interface Literal : Expression

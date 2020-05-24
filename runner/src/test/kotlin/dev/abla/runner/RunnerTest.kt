@@ -56,6 +56,9 @@ class RunnerTest : KoinComponent {
     @Test
     fun testWhile() = runResourceFile("examples/test_while.ab")
 
+    @Test
+    fun testWhen() = runResourceFile("examples/test_when.ab")
+
     private fun runResourceFile(file: String, verify: (moduleIR: String) -> Unit = {}) {
         //System.setIn(javaClass.classLoader.getResourceAsStream(file))
         Runner().run(arrayOf(javaClass.classLoader.getResource(file)!!.path))

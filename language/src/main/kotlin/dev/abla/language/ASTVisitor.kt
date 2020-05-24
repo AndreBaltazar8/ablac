@@ -33,7 +33,7 @@ abstract class ASTVisitor {
     }
 
     open suspend fun visit(functionCall: FunctionCall) {
-        functionCall.primaryExpression.accept(this)
+        functionCall.expression.accept(this)
         functionCall.arguments.forEach { it.value.accept(this) }
     }
 
@@ -71,6 +71,15 @@ abstract class ASTVisitor {
     }
 
     open suspend fun visit(memberAccess: MemberAccess) {
-        memberAccess.primaryExpression.accept(this)
+        memberAccess.expression.accept(this)
+    }
+
+    open suspend fun visit(whenExpression: WhenExpression) {
+        whenExpression.condition?.accept(this)
+        whenExpression.cases.forEach {
+            if (it is WhenExpression.ExpressionCase)
+                it.expressions.forEach { expression -> expression.accept(this) }
+            it.body.accept(this)
+        }
     }
 }

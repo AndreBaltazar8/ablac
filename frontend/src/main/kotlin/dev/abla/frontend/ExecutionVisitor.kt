@@ -224,7 +224,7 @@ class ExecutionVisitor(
             it.value.accept(this)
         }
 
-        functionCall.primaryExpression.accept(this)
+        functionCall.expression.accept(this)
 
         if (executionLayer > 0) {
             val function = when (val topVal = values.pop()) {
@@ -237,7 +237,7 @@ class ExecutionVisitor(
                 when (it) {
                     is CompilerFunctionDeclaration -> {
                         // TODO: support passing instances to compiler functions
-                        if (functionCall.primaryExpression is MemberAccess)
+                        if (functionCall.expression is MemberAccess)
                             values.pop()
                         values.add(it.executionBlock(this, functionCall.arguments.reversed().map {
                             values.pop().value.toValue(currentScope!!)
@@ -264,7 +264,7 @@ class ExecutionVisitor(
                         values.push(instance)
                     }
                     is FunctionDeclaration -> {
-                        val isMemberAccess = functionCall.primaryExpression is MemberAccess
+                        val isMemberAccess = functionCall.expression is MemberAccess
                         it.callInfo = CallInfo(if (isMemberAccess) values.peek()!! as ExecutionValue.Instance else null)
                         it.accept(this)
                     }
@@ -376,6 +376,43 @@ class ExecutionVisitor(
             }
         } else
             super.visit(whileStatement)
+    }
+
+    override suspend fun visit(whenExpression: WhenExpression) {
+        if (executionLayer > 0) {
+            lateinit var valueToCompare: Any
+            val condition = whenExpression.condition
+
+            if (condition != null) {
+                condition.accept(this)
+                valueToCompare = values.pop().value.toValue(currentScope!!)
+            }
+
+            loop@ for (case in whenExpression.cases) {
+                when (case) {
+                    is WhenExpression.ElseCase -> {
+                        case.body.accept(this)
+                        break@loop
+                    }
+                    is WhenExpression.ExpressionCase -> {
+                        for (expression in case.expressions) {
+                            expression.accept(this)
+                            val value = values.pop().value.toValue(currentScope!!)
+                            if (condition != null) {
+                                if (value == valueToCompare) {
+                                    case.body.accept(this)
+                                    break@loop
+                                }
+                            } else if (value as Int == 1) {
+                                case.body.accept(this)
+                                break@loop
+                            }
+                        }
+                    }
+                }
+            }
+        } else
+            super.visit(whenExpression)
     }
 
     /*

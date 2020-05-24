@@ -154,15 +154,15 @@ fun AblaParser.PropertyDeclarationContext.toAST(): PropertyDeclaration =
 
 fun AblaParser.CompilerCallContext.toAST() =
     CompilerExec(
-        callSuffix().fold<AblaParser.CallSuffixContext, PrimaryExpression>(simpleIdentifier()?.toAST() ?: functionLiteral().toAST()) { acc, suffix ->
+        callSuffix().fold<AblaParser.CallSuffixContext, Expression>(simpleIdentifier()?.toAST() ?: functionLiteral().toAST()) { acc, suffix ->
             suffix.toAST(acc)
         },
         position
     )
 
-fun AblaParser.CallSuffixContext.toAST(primaryExpression: PrimaryExpression) =
+fun AblaParser.CallSuffixContext.toAST(expression: Expression) =
     FunctionCall(
-        primaryExpression,
+        expression,
         listOfNotNull(
             *(valueArguments()?.valueArgument()?.map { it.toAST() }?.toTypedArray() ?: arrayOf<Argument>()),
             functionLiteral()?.toAST()?.run { Argument(null, this, this.position) }
@@ -170,9 +170,9 @@ fun AblaParser.CallSuffixContext.toAST(primaryExpression: PrimaryExpression) =
         position
     )
 
-fun AblaParser.NavigationSuffixContext.toAST(primaryExpression: PrimaryExpression) =
+fun AblaParser.NavigationSuffixContext.toAST(expression: Expression) =
     MemberAccess(
-        primaryExpression,
+        expression,
         simpleIdentifier().text,
         position
     )
@@ -231,11 +231,9 @@ fun AblaParser.AtomicExpressionContext.toAST(): Expression =
     when (this) {
         is AblaParser.PerfixExpressionContext -> prefixUnaryOperation().toAST(atomicExpression().toAST())
         is AblaParser.SuffixExpressionContext ->
-            postfixUnarySuffix().fold<AblaParser.PostfixUnarySuffixContext, PrimaryExpression>(primaryExpression().toAST()) { acc, suffix ->
+            postfixUnarySuffix().fold<AblaParser.PostfixUnarySuffixContext, Expression>(primaryExpression().toAST()) { acc, suffix ->
                 suffix.toAST(acc)
             }
-        is AblaParser.ParenthesizedExpressionContext -> expression().toAST()
-        is AblaParser.IfExpressionContext -> IfElseExpression(condition.toAST(), ifBody?.toAST(), elseBody?.toAST(), position)
         else -> throw IllegalStateException("Unknown expression type ${this::class.simpleName}")
     }
 
@@ -272,17 +270,25 @@ fun AblaParser.PrefixUnaryOperationContext.toAST(expression: Expression) =
         else -> throw IllegalStateException("Unknown prefix unary operation type ${this::class.simpleName}")
     }
 
-fun AblaParser.PrimaryExpressionContext.toAST(): PrimaryExpression =
+fun AblaParser.PrimaryExpressionContext.toAST(): Expression =
     when (this) {
         is AblaParser.SimpleIdentifierExpressionContext -> simpleIdentifier().toAST()
         is AblaParser.LiteralExpressionContext -> literal().toAST()
         is AblaParser.FunctionLiteralExpressionContext -> functionLiteral().toAST()
+        is AblaParser.ParenthesizedExpressionContext -> expression().toAST()
+        is AblaParser.IfExpressionContext -> IfElseExpression(condition.toAST(), ifBody?.toAST(), elseBody?.toAST(), position)
+        is AblaParser.WhenExpressionContext -> WhenExpression(condition?.toAST(), whenCase()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(), position)
         else -> throw IllegalStateException("Unknown primary expression type ${this::class.simpleName}")
     }
 
-fun AblaParser.PostfixUnarySuffixContext.toAST(primaryExpression: PrimaryExpression) =
-    callSuffix()?.toAST(primaryExpression) ?:
-        navigationSuffix()?.toAST(primaryExpression) ?:
+fun AblaParser.WhenCaseContext.toAST(): WhenExpression.Case =
+    ELSE()?.let { WhenExpression.ElseCase(controlStructureBody().toAST()) } ?:
+    expression()?.let { WhenExpression.ExpressionCase(it.map { expression -> expression.toAST() }.toMutableList(), controlStructureBody().toAST()) } ?:
+    throw IllegalStateException("Unknown when case type $text")
+
+fun AblaParser.PostfixUnarySuffixContext.toAST(expression: Expression) =
+    callSuffix()?.toAST(expression) ?:
+        navigationSuffix()?.toAST(expression) ?:
         throw IllegalStateException("Unknown postfix unary suffix type ${this::class.simpleName}")
 
 fun AblaParser.SimpleIdentifierContext.toAST(): IdentifierExpression = IdentifierExpression(text, position)
