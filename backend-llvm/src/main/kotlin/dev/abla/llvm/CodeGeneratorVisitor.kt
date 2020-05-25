@@ -369,6 +369,63 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         generatorContext.pushReplaceBlock(continuationBlock, generatorContext.topBlock.table)
     }
 
+    override suspend fun visit(whenExpression: WhenExpression) {
+        lateinit var valueToCompare: GeneratorContext.Value
+        val condition = whenExpression.condition
+
+        if (condition != null) {
+            condition.accept(this)
+            valueToCompare = generatorContext.topValuePop
+        }
+
+        var builder = generatorContext.topBlock.createBuilderAtEnd()
+        val whenResult = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
+
+        data class IndexedExpression(val expression: Expression, val caseIndex: Int)
+
+        val cases = whenExpression.cases.withIndex().flatMap { indexedCase ->
+            val case = indexedCase.value
+            if (case is WhenExpression.ExpressionCase)
+                case.expressions.map { IndexedExpression(it, indexedCase.index) }
+            else listOf()
+        }
+
+        for (case in cases) {
+            case.expression.accept(this)
+            val whenCondition = if (condition == null)
+                generatorContext.topValuePop.ref
+            else
+                LLVMBuildICmp(builder, LLVMIntEQ, valueToCompare.ref, generatorContext.topValuePop.ref, "")
+
+            LLVMBuildCondBr(builder, whenCondition, whenExpression.cases[case.caseIndex].body.llvmBlock, case.expression.llvmBlock)
+            generatorContext.pushReplaceBlock(case.expression.llvmBlock!!, generatorContext.topBlock.table)
+            builder = generatorContext.topBlock.createBuilderAtEnd()
+        }
+
+        val lastCase = whenExpression.cases[whenExpression.cases.lastIndex]
+        if (lastCase !is WhenExpression.ElseCase) // TODO: since we support only expressions now, the last case should be else case
+            throw IllegalStateException("Last case of when should be else case!")
+
+        LLVMBuildBr(builder, lastCase.body.llvmBlock)
+
+        for (case in whenExpression.cases) {
+            generatorContext.withBlock(case.body.llvmBlock!!, generatorContext.topBlock.table) { // TODO: need to have symbol table in Block node
+                case.body.accept(this@CodeGeneratorVisitor)
+                createBuilderAtEnd {
+                    LLVMBuildStore(it, generatorContext.topValuePop.ref, whenResult)
+                    LLVMBuildBr(it, whenExpression.llvmBlock!!)
+                }
+            }
+        }
+
+        generatorContext.pushReplaceBlock(whenExpression.llvmBlock!!, generatorContext.topBlock.table) {
+            createBuilderAtEnd { builder ->
+                val result = GeneratorContext.Value(UserType.Any, LLVMBuildLoad(builder, whenResult, ""))
+                generatorContext.values.push(result)
+            }
+        }
+    }
+
     private val Type.classSymbol: Symbol.Class
         get() {
             if (this !is UserType)

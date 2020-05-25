@@ -163,4 +163,37 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         }
         super.visit(propertyDeclaration)
     }
+
+    override suspend fun visit(whenExpression: WhenExpression) {
+        val function = functions[functions.lastIndex]
+
+        whenExpression.condition?.accept(this)
+        for ((index, case) in whenExpression.cases.withIndex()) {
+            if (case is WhenExpression.ExpressionCase) {
+                case.expressions.forEachIndexed { expIndex, expression ->
+                    expression.accept(this)
+                    function.appendBasicBlock("case_test_${index}_${expIndex}") {
+                        expression.llvmBlock = this
+                        blocks.pop()
+                        blocks.push(this)
+                    }
+                }
+            }
+        }
+
+        for ((index, case) in whenExpression.cases.withIndex()) {
+            function.appendBasicBlock("case_$index") {
+                case.body.llvmBlock = this
+                blocks.push(this)
+            }
+            case.body.accept(this)
+            blocks.pop()
+        }
+
+        function.appendBasicBlock("when_cont_block") {
+            whenExpression.llvmBlock = this
+            blocks.pop()
+            blocks.push(this)
+        }
+    }
 }

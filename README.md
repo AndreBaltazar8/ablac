@@ -119,7 +119,8 @@ These the current and planned features for the language. It is not exhaustive li
 - Hardcoded function lambda functionality
 - Import new file
 - Parallel processing of imported files
-- While loops
+- `while` loops
+- `when` expressions
 - Class instantiation with simple variables
 - compile-time execution for all available features with interpretation execution
 
@@ -135,7 +136,6 @@ These the current and planned features for the language. It is not exhaustive li
   * Creating a new built-in type that allows automatic conversion between `const char*` and `string` implementation in abla
 - Add operators and comparisons for all types
 - If/else statements
-- Switch/When
 - Loops (for, do-while)
 - Add simple build-in types (string, int)
 - Function calls to defined types/classes (direct and vtable)
@@ -145,6 +145,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Extension functions
 - Variable declarations with type check (in functions, globally and class fields)
 - Send values to lambdas and other scopes
+  * Don't allow to call functions that capture context before it is declared in another function
 - Sending compiler context to functions with "compile" modifier
   * Allow reading compiler info
   * Allow modification of code
@@ -161,6 +162,7 @@ These the current and planned features for the language. It is not exhaustive li
   * networking and http stack
   * math lib
   * threading
+- Nested functions: fix name of nested functions
 
 ## Contributing
 
