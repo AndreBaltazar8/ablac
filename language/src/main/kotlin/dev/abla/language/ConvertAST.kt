@@ -138,7 +138,7 @@ fun AblaParser.StatementContext.toAST(): Statement =
 fun AblaParser.WhileStatementContext.toAST(): WhileStatement =
     WhileStatement(
         condition.toAST(),
-        controlStructureBody()?.toAST(),
+        controlStructureBody().toAST(),
         position
     )
 
@@ -276,7 +276,7 @@ fun AblaParser.PrimaryExpressionContext.toAST(): Expression =
         is AblaParser.LiteralExpressionContext -> literal().toAST()
         is AblaParser.FunctionLiteralExpressionContext -> functionLiteral().toAST()
         is AblaParser.ParenthesizedExpressionContext -> expression().toAST()
-        is AblaParser.IfExpressionContext -> IfElseExpression(condition.toAST(), ifBody?.toAST(), elseBody?.toAST(), position)
+        is AblaParser.IfExpressionContext -> IfElseExpression(condition.toAST(), ifBody.toAST(), elseBody?.toAST(), position)
         is AblaParser.WhenExpressionContext -> WhenExpression(condition?.toAST(), whenCase()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(), position)
         else -> throw IllegalStateException("Unknown primary expression type ${this::class.simpleName}")
     }

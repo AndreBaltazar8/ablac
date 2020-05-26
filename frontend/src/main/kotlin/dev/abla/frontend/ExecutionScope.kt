@@ -18,7 +18,7 @@ open class ExecutionScope(val parent: ExecutionScope?, val symbolTable: SymbolTa
 
     open fun modify(identifier: String, value: ExecutionValue) {
         if (values.containsKey(identifier))
-            values[identifier] = value
+            values[identifier] = value.copyWith(values[identifier]!!.isFinal)
         else if (parent == null)
             throw IllegalStateException("Can't find $identifier to modify.")
         else

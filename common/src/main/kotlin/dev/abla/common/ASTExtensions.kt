@@ -7,9 +7,7 @@ import dev.abla.utils.BackingField
 var File.symbolTable: SymbolTable? by BackingField.nullable()
 var FunctionDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
 var ClassDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
-var WhileStatement.symbolTable: SymbolTable? by BackingField.nullable()
-var IfElseExpression.ifSymbolTable: SymbolTable? by BackingField.nullable()
-var IfElseExpression.elseSymbolTable: SymbolTable? by BackingField.nullable()
+var Block.symbolTable: SymbolTable? by BackingField.nullable()
 var Node.symbol: Symbol<*>? by BackingField.nullable()
 var ClassDeclaration.symbol: Symbol.Class
     get() = Node::symbol.get(this) as Symbol.Class

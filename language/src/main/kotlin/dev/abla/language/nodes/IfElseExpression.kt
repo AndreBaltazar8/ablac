@@ -5,7 +5,7 @@ import dev.abla.language.Position
 
 class IfElseExpression(
     val condition: Expression,
-    val ifBody: Block?,
+    val ifBody: Block,
     val elseBody: Block?,
     override val position: Position
 ) : Expression {

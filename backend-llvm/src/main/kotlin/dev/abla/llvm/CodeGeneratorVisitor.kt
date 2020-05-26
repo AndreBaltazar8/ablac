@@ -43,7 +43,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         }
 
         val block = functionDeclaration.llvmBlock!!
-        val symbolTable = functionDeclaration.symbolTable!!
+        val symbolTable = functionDeclaration.block!!.symbolTable!!
         val currentBlock = generatorContext.pushBlock(block, symbolTable)
 
         super.visit(functionDeclaration)
@@ -188,7 +188,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         val numValues = generatorContext.values.size
         val block = functionLiteral.llvmBlock!!
-        val currentBlock = generatorContext.pushBlock(block, generatorContext.topBlock.table)
+        val currentBlock = generatorContext.pushBlock(block, functionLiteral.block.symbolTable!!)
         functionLiteral.block.accept(this)
         if (!currentBlock.hasReturned) {
             // CHECK FOR TYPE
@@ -245,25 +245,26 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val ifElseResult = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
         LLVMBuildCondBr(builder, condition, ifBlock, elseBlock)
 
-        val codeIfBlock = generatorContext.withBlock(ifBlock, ifElseExpression.ifSymbolTable!!) {
+        val codeIfBlock = generatorContext.withBlock(ifBlock, ifElseExpression.ifBody.symbolTable!!) {
             val ifBody = ifElseExpression.ifBody
-            ifBody?.accept(this@CodeGeneratorVisitor)
+            ifBody.accept(this@CodeGeneratorVisitor)
             createBuilderAtEnd {
                 LLVMBuildStore(it, generatorContext.topValuePop.ref, ifElseResult)
             }
         }
         val ifRetuned = codeIfBlock.hasReturned
 
-        val codeElseBlock = generatorContext.withBlock(elseBlock, ifElseExpression.elseSymbolTable!!) {
-            val elseBody = ifElseExpression.elseBody
-            elseBody?.accept(this@CodeGeneratorVisitor)
-            if (elseBody != null) {
+        val elseBody = ifElseExpression.elseBody
+        val codeElseBlock = if (elseBody != null)
+            generatorContext.withBlock(elseBlock, elseBody.symbolTable!!) {
+                elseBody.accept(this@CodeGeneratorVisitor)
                 createBuilderAtEnd { builder ->
                     LLVMBuildStore(builder, generatorContext.topValuePop.ref, ifElseResult)
                 }
             }
-        }
-        val elseRetuned = codeElseBlock.hasReturned
+        else null
+
+        val elseRetuned = codeElseBlock?.hasReturned ?: false
 
         val contBlock = ifElseExpression.llvmContBlock!!
         if (!ifRetuned) {
@@ -272,7 +273,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             }
         }
 
-        if (!elseRetuned) {
+        if (!elseRetuned && codeElseBlock != null) {
             codeElseBlock.block.createBuilderAtEnd {
                 LLVMBuildBr(it, contBlock)
             }
@@ -349,7 +350,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         }
 
         // Condition block
-        generatorContext.withBlock(conditionBlock, whileStatement.symbolTable!!) {
+        generatorContext.withBlock(conditionBlock, generatorContext.topBlock.table) {
             whileStatement.condition.accept(this@CodeGeneratorVisitor)
             val condition = generatorContext.topValuePop
             createBuilderAtEnd { builder ->
@@ -358,8 +359,8 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         }
 
         // Main block
-        generatorContext.withBlock(mainBlock, whileStatement.symbolTable!!) {
-            whileStatement.block?.accept(this@CodeGeneratorVisitor)
+        generatorContext.withBlock(mainBlock, whileStatement.block.symbolTable!!) {
+            whileStatement.block.accept(this@CodeGeneratorVisitor)
             createBuilderAtEnd { builder ->
                 LLVMBuildBr(builder, conditionBlock)
             }
@@ -409,7 +410,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         LLVMBuildBr(builder, lastCase.body.llvmBlock)
 
         for (case in whenExpression.cases) {
-            generatorContext.withBlock(case.body.llvmBlock!!, generatorContext.topBlock.table) { // TODO: need to have symbol table in Block node
+            generatorContext.withBlock(case.body.llvmBlock!!, case.body.symbolTable!!) {
                 case.body.accept(this@CodeGeneratorVisitor)
                 createBuilderAtEnd {
                     LLVMBuildStore(it, generatorContext.topValuePop.ref, whenResult)

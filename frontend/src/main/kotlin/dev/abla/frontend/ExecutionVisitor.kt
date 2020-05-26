@@ -59,8 +59,11 @@ class ExecutionVisitor(
                 functionDeclaration.callInfo = null
 
                 val numValues = values.size
-                if (functionDeclaration.block != null) {
-                    functionDeclaration.block!!.accept(this)
+                val block = functionDeclaration.block
+                if (block != null) {
+                    withTable(block.symbolTable) {
+                        block.accept(this)
+                    }
                 } else {
                     val extern = functionDeclaration.modifiers.first { it is Extern } as Extern
                     if (extern.libName == null)
@@ -113,6 +116,7 @@ class ExecutionVisitor(
                 if (sym !is Symbol.Function)
                     throw Exception("Not a method")
                 sym.node.block = (args[1] as FunctionLiteral).block.copy()
+                sym.node.block!!.symbolTable = sym.node.symbolTable
                 ExecutionValue.Value(Integer("1", positionZero))
             }
             replaceFunction("find", arrayOf(Parameter("fnName", UserType.String))) { _, args ->
@@ -245,7 +249,9 @@ class ExecutionVisitor(
                     }
                     is FunctionLiteral -> {
                         val numValues = values.size
-                        it.block.accept(this)
+                        withTable(it.block.symbolTable) {
+                            it.block.accept(this)
+                        }
                         val returnValue = values.pop()
                         repeat(values.size - numValues) {
                             values.pop()
@@ -324,12 +330,12 @@ class ExecutionVisitor(
             val conditionTrue = conditionValue as Int == 1
             val ifBody = ifElseExpression.ifBody
             val elseBody = ifElseExpression.elseBody
-            if (conditionTrue && ifBody != null) {
-                withTable(ifElseExpression.ifSymbolTable) {
+            if (conditionTrue) {
+                withTable(ifBody.symbolTable) {
                     ifBody.accept(this)
                 }
             } else if (!conditionTrue && elseBody != null) {
-                withTable(ifElseExpression.elseSymbolTable) {
+                withTable(elseBody.symbolTable) {
                     elseBody.accept(this)
                 }
             }
@@ -361,19 +367,19 @@ class ExecutionVisitor(
 
     override suspend fun visit(whileStatement: WhileStatement) {
         if (executionLayer > 0) {
-            withTable(whileStatement.symbolTable) {
                 while (true) {
                     whileStatement.condition.accept(this)
 
-                    val conditionValue = values.pop().value.toValue(currentScope!!)
-                    val conditionTrue = conditionValue as Int == 1
+                    withTable(whileStatement.block.symbolTable) {
+                        val conditionValue = values.pop().value.toValue(currentScope!!)
+                        val conditionTrue = conditionValue as Int == 1
 
-                    if (!conditionTrue)
-                        break
+                        if (!conditionTrue)
+                            return@visit
 
-                    whileStatement.block?.accept(this)
+                        whileStatement.block.accept(this)
+                    }
                 }
-            }
         } else
             super.visit(whileStatement)
     }
@@ -426,7 +432,7 @@ class ExecutionVisitor(
         job = newJob
     }
 
-    private suspend fun withTable(symbolTable: SymbolTable?, function: suspend () -> Unit) {
+    private inline fun withTable(symbolTable: SymbolTable?, function: () -> Unit) {
         currentScope = ExecutionScope(currentScope, symbolTable!!)
         function()
         currentScope = currentScope!!.parent

@@ -52,7 +52,7 @@ abstract class ASTVisitor {
 
     open suspend fun visit(ifElseExpression: IfElseExpression) {
         ifElseExpression.condition.accept(this)
-        ifElseExpression.ifBody?.accept(this)
+        ifElseExpression.ifBody.accept(this)
         ifElseExpression.elseBody?.accept(this)
     }
 
@@ -67,7 +67,7 @@ abstract class ASTVisitor {
 
     open suspend fun visit(whileStatement: WhileStatement) {
         whileStatement.condition.accept(this)
-        whileStatement.block?.accept(this)
+        whileStatement.block.accept(this)
     }
 
     open suspend fun visit(memberAccess: MemberAccess) {

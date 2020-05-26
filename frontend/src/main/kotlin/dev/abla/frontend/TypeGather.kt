@@ -50,15 +50,22 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
                 )
             }
 
-            withScope(Scope.Function) {
-                functionDeclaration.block?.accept(this)
+            createTableInParent { blockTable ->
+                functionDeclaration.block?.symbolTable = blockTable
+
+                withScope(Scope.Function) {
+                    functionDeclaration.block?.accept(this)
+                }
             }
         }
     }
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
-        withScope(Scope.Function) {
-            super.visit(functionLiteral)
+        createTableInParent { table ->
+            functionLiteral.block.symbolTable = table
+            withScope(Scope.Function) {
+                super.visit(functionLiteral)
+            }
         }
     }
 
@@ -66,17 +73,15 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         ifElseExpression.condition.accept(this)
 
         val ifBody = ifElseExpression.ifBody
-        if (ifBody != null) {
-            createTableInParent { ifTable ->
-                ifElseExpression.ifSymbolTable = ifTable
-                ifBody.accept(this)
-            }
+        createTableInParent { ifTable ->
+            ifElseExpression.ifBody.symbolTable = ifTable
+            ifBody.accept(this)
         }
 
         val elseBody = ifElseExpression.elseBody
         if (elseBody != null) {
             createTableInParent { elseTable ->
-                ifElseExpression.elseSymbolTable = elseTable
+                elseBody.symbolTable = elseTable
                 elseBody.accept(this)
             }
         }
@@ -118,7 +123,7 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
 
     override suspend fun visit(whileStatement: WhileStatement) {
         createTableInParent { table ->
-            whileStatement.symbolTable = table
+            whileStatement.block.symbolTable = table
             super.visit(whileStatement)
         }
     }
@@ -126,6 +131,18 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
     override suspend fun visit(assignment: Assignment) {
         assignment.lhs.returnForAssignment = true
         super.visit(assignment)
+    }
+
+    override suspend fun visit(whenExpression: WhenExpression) {
+        whenExpression.condition?.accept(this)
+        whenExpression.cases.forEach {
+            if (it is WhenExpression.ExpressionCase)
+                it.expressions.forEach { expression -> expression.accept(this) }
+            createTableInParent { table ->
+                it.body.symbolTable = table
+                it.body.accept(this)
+            }
+        }
     }
 
     private inline fun createTableInParent(action: (table: SymbolTable) -> Unit) {
