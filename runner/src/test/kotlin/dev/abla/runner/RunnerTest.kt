@@ -31,34 +31,82 @@ class RunnerTest : KoinComponent {
     }
 
     @Test
-    fun testCompilerContext() = runResourceFile("examples/test_compiler_context.ab")
+    fun testCompilerContext() = runResourceFile("examples/test_compiler_context.ab") {
+        println(it)
+        assert(it.indexOf("%2 = add i32 %0, 5") == -1)
+        assert(it.contains("%2 = add i32 %0, 20"))
+    }
 
     @Test
     fun testFunctions() = runResourceFile("examples/test_functions.ab") {
+        println(it)
+        assert(it.contains("declare i32 @printf(i8*)"))
         assert(it.contains("call void @voidReturn()"))
     }
 
     @Test
-    fun testFunctionLiterals() = runResourceFile("examples/test_function_literals.ab")
+    fun testFunctionLiterals() = runResourceFile("examples/test_function_literals.ab") {
+        println(it)
+        assert(it.contains("%0 = call i32 @funliteral"))
+        assert(it.contains("define i32 @funliteral"))
+    }
 
     @Test
-    fun testOperators() = runResourceFile("examples/test_operators.ab")
+    fun testOperators() = runResourceFile("examples/test_operators.ab") {
+        println(it)
+        assert(it.contains("%1 = sdiv i32 8, %0"))
+        assert(it.contains("%1 = mul i32 %0, 2"))
+        assert(it.contains("%3 = icmp sgt i32 %2, 2"))
+    }
 
     @Test
-    fun testStrings() = runResourceFile("examples/test_strings.ab")
+    fun testStrings() = runResourceFile("examples/test_strings.ab") {
+        println(it)
+        assert(it.contains("private unnamed_addr constant [5 x i8] c\" ok\\0A\\00\", align 1"))
+
+        assert(it.contains("private unnamed_addr constant [8 x i8] c\"fact(4)\\00\", align 1"))
+        assert(it.contains("private unnamed_addr constant [28 x i8] c\"expecting fact(4) to be 24\\0A\\00\", align 1"))
+
+        assert(it.contains("private unnamed_addr constant [10 x i8] c\"hello hi\\0A\\00\", align 1"))
+    }
 
     @Test
-    fun testTrailingLambdas() = runResourceFile("examples/test_trailing_lambda.ab")
+    fun testTrailingLambdas() = runResourceFile("examples/test_trailing_lambda.ab") {
+        println(it)
+        assert(it.contains("%1 = call i32 %0()"))
+        assert(it.contains("%0 = call i32 @wrap(i32 ()* @funliteral"))
+    }
 
     @Test
-    fun testVariable() = runResourceFile("examples/test_variable.ab")
+    fun testVariable() = runResourceFile("examples/test_variable.ab") {
+        println(it)
+        assert(it.contains("%0 = alloca i32"))
+        assert(it.contains("store i32 1, i32* %0"))
+        assert(it.contains("%1 = alloca i32"))
+        assert(it.contains("store i32 2, i32* %1"))
+        assert(it.contains("%2 = load i32, i32* %0"))
+        assert(it.contains("%3 = load i32, i32* %1"))
+        assert(it.contains("%4 = add i32 %2, %3"))
+    }
 
     @Test
-    fun testWhile() = runResourceFile("examples/test_while.ab")
+    fun testWhile() = runResourceFile("examples/test_while.ab") {
+        println(it)
+        assert(it.contains("br i1 %2, label %while_block, label %while_cont_block"))
+        assert(it.contains("while_block:"))
+        assert(it.contains("br label %while_condition_block"))
+        assert(it.contains("while_cont_block:"))
+    }
 
     @Test
     fun testWhen() = runResourceFile("examples/test_when.ab") {
         println(it)
+        assert(it.contains("icmp eq i32 %0, 1"))
+        assert(it.contains("icmp eq i32 %0, 2"))
+
+        assert(it.contains("icmp eq i32 %1, 10"))
+        assert(it.contains("icmp eq i32 %1, 20"))
+        assert(it.contains("icmp eq i32 %1, 5"))
     }
 
     private fun runResourceFile(file: String, verify: (moduleIR: String) -> Unit = {}) {
