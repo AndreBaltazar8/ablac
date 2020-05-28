@@ -7,6 +7,7 @@ import dev.abla.language.positionZero
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.LLVMModuleRef
 import org.bytedeco.llvm.LLVM.LLVMTypeRef
+import org.bytedeco.llvm.LLVM.LLVMValueRef
 import org.bytedeco.llvm.global.LLVM.*
 
 class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
@@ -241,15 +242,21 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         ifElseExpression.condition.accept(this)
         val condition = generatorContext.topValuePop.ref
 
-        // TODO: not easy to determine if this if is an expression or statement
-        val ifElseResult = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
+        lateinit var ifElseResult: LLVMValueRef
+        val isExpression = ifElseExpression.isExpression
+        if (isExpression)
+            ifElseResult = LLVMBuildAlloca(builder, ifElseExpression.returnType!!.llvmType, "")
+
         LLVMBuildCondBr(builder, condition, ifBlock, elseBlock)
 
         val codeIfBlock = generatorContext.withBlock(ifBlock, ifElseExpression.ifBody.symbolTable!!) {
             val ifBody = ifElseExpression.ifBody
             ifBody.accept(this@CodeGeneratorVisitor)
-            createBuilderAtEnd {
-                LLVMBuildStore(it, generatorContext.topValuePop.ref, ifElseResult)
+
+            if (isExpression) {
+                createBuilderAtEnd {
+                    LLVMBuildStore(it, generatorContext.topValuePop.ref, ifElseResult)
+                }
             }
         }
         val ifRetuned = codeIfBlock.hasReturned
@@ -258,8 +265,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val codeElseBlock = if (elseBody != null)
             generatorContext.withBlock(elseBlock, elseBody.symbolTable!!) {
                 elseBody.accept(this@CodeGeneratorVisitor)
-                createBuilderAtEnd { builder ->
-                    LLVMBuildStore(builder, generatorContext.topValuePop.ref, ifElseResult)
+                if (isExpression) {
+                    createBuilderAtEnd { builder ->
+                        LLVMBuildStore(builder, generatorContext.topValuePop.ref, ifElseResult)
+                    }
                 }
             }
         else null
@@ -280,9 +289,11 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         }
 
         generatorContext.pushReplaceBlock(contBlock, generatorContext.topBlock.table) {
-            createBuilderAtEnd { builder ->
-                val result = GeneratorContext.Value(UserType.Any, LLVMBuildLoad(builder, ifElseResult, ""))
-                generatorContext.values.push(result)
+            if (isExpression) {
+                createBuilderAtEnd { builder ->
+                    val result = GeneratorContext.Value(UserType.Any, LLVMBuildLoad(builder, ifElseResult, ""))
+                    generatorContext.values.push(result)
+                }
             }
         }
     }

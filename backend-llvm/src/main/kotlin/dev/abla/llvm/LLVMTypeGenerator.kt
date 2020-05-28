@@ -114,7 +114,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             ifElseExpression.llvmIfBlock = this
             blocks.push(this)
         }
-        ifElseExpression.ifBody?.accept(this)
+        ifElseExpression.ifBody.accept(this)
         blocks.pop()
 
         function.appendBasicBlock("else_block") {

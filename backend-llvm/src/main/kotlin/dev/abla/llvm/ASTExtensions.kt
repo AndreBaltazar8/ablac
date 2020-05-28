@@ -1,6 +1,8 @@
 package dev.abla.llvm
 
+import dev.abla.common.symbol
 import dev.abla.language.nodes.*
+import dev.abla.language.positionZero
 import dev.abla.utils.BackingField
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.LLVMBasicBlockRef
@@ -35,3 +37,22 @@ val Type.llvmType: LLVMTypeRef
 var ClassDeclaration.struct: LLVMTypeRef? by BackingField.nullable()
 var ClassDeclaration.constructorFunction: LLVMValueRef? by BackingField.nullable()
 var MemberAccess.returnClass: Boolean by BackingField { false }
+val Expression.returnType: Type?
+    get() = when (this) {
+        is IfElseExpression -> if (isExpression) ifBody.returnType else null
+        is FunctionLiteral -> FunctionType(arrayOf(), UserType.Int, null, position)
+        is Integer -> UserType.Int
+        is StringLiteral -> UserType.String
+        is FunctionCall -> expression.returnType
+        is IdentifierExpression -> if (symbol == null) { throw Exception("NUUUUUUUULL $identifier $position") } else when (val node = symbol!!.node) {
+            is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: UserType.Void, node.returnType, node.position)
+            is PropertyDeclaration -> node.type
+            else -> throw Exception("Conversion not implemented")
+        }
+        is BinaryOperation -> rhs.returnType
+        else -> throw Exception("Conversion not implemented")
+    }
+val Block.returnType: Type?
+    get() = statements.lastOrNull { it is Expression }?.let { (it as Expression).returnType }
+val IfElseExpression.isExpression: Boolean
+    get() = elseBody.let { elseBody -> elseBody != null && ifBody.returnType.let { it != null && it == elseBody.returnType }}
