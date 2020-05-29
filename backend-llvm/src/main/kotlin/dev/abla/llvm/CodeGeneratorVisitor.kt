@@ -90,9 +90,9 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             } else {
                 if (!identifierExpression.returnForAssignment) {
                     val builder = generatorContext.topBlock.createBuilderAtEnd()
-                    GeneratorContext.Value(node.type!!, LLVMBuildLoad(builder, node.llvmValue, ""))
+                    GeneratorContext.Value(node.inferredType!!, LLVMBuildLoad(builder, node.llvmValue, ""))
                 } else
-                    GeneratorContext.Value(node.type!!, node.llvmValue!!)
+                    GeneratorContext.Value(node.inferredType!!, node.llvmValue!!)
             }
         } else if (identifierExpression.returnForAssignment)
             throw IllegalStateException("Cannot assign value to final identifier ${identifierExpression.identifier}")
@@ -102,7 +102,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             } else {
                 val type = when (symbol) {
                     is Symbol.Function -> (node as FunctionDeclaration).toType()
-                    is Symbol.Variable -> if (node is PropertyDeclaration) node.type!! else UserType.Any
+                    is Symbol.Variable -> if (node is PropertyDeclaration) node.inferredType!! else UserType.Any
                     is Symbol.Class -> (node as ClassDeclaration).toType()
                 }
                 GeneratorContext.Value(type, node.llvmValue!!)
@@ -245,7 +245,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         lateinit var ifElseResult: LLVMValueRef
         val isExpression = ifElseExpression.isExpression
         if (isExpression)
-            ifElseResult = LLVMBuildAlloca(builder, ifElseExpression.returnType!!.llvmType, "")
+            ifElseResult = LLVMBuildAlloca(builder, ifElseExpression.inferredType!!.llvmType, "")
 
         LLVMBuildCondBr(builder, condition, ifBlock, elseBlock)
 
@@ -455,8 +455,8 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         val ptr = LLVMBuildStructGEP(builder, thisClass.ref, index, "")
         return if (!returnForAssignment)
-            GeneratorContext.Value(type!!, LLVMBuildLoad(builder, ptr, ""))
+            GeneratorContext.Value(inferredType!!, LLVMBuildLoad(builder, ptr, ""))
         else
-            GeneratorContext.Value(type!!, ptr)
+            GeneratorContext.Value(inferredType!!, ptr)
     }
 }

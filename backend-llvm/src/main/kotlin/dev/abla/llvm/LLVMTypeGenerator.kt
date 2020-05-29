@@ -144,7 +144,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             whileStatement.llvmBlock = this
             blocks.push(this)
         }
-        whileStatement.block?.accept(this)
+        whileStatement.block.accept(this)
         blocks.pop()
 
         function.appendBasicBlock("while_cont_block") {
@@ -156,10 +156,10 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
         if (propertyDeclaration.scope == Scope.Global) {
-            LLVMAddGlobal(module, (propertyDeclaration.type ?: UserType.Any).llvmType, "")
+            LLVMAddGlobal(module, (propertyDeclaration.inferredType ?: UserType.Any).llvmType, "")
         } else if (propertyDeclaration.scope == Scope.Class) {
             val typeScope = typeScopes.peek()
-            typeScope.fields.add((propertyDeclaration.type ?: UserType.Any).llvmType)
+            typeScope.fields.add((propertyDeclaration.inferredType ?: UserType.Any).llvmType)
         }
         super.visit(propertyDeclaration)
     }
