@@ -9,6 +9,7 @@ var FunctionDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
 var ClassDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
 var Block.symbolTable: SymbolTable? by BackingField.nullable()
 var Node.symbol: Symbol<*>? by BackingField.nullable()
+var Node.symbolLazy: Lazy<Symbol<*>?>? by BackingField.nullable()
 var ClassDeclaration.symbol: Symbol.Class
     get() = Node::symbol.get(this) as Symbol.Class
     set(value) = Node::symbol.set(this, value)

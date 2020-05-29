@@ -1,6 +1,6 @@
 package dev.abla.llvm
 
-import dev.abla.common.symbol
+import dev.abla.common.symbolLazy
 import dev.abla.language.nodes.*
 import dev.abla.utils.BackingField
 import org.bytedeco.javacpp.PointerPointer
@@ -46,7 +46,7 @@ val Expression.returnType: Type?
             is FunctionType -> returnType.returnType
             else -> throw Exception("Call on non function type?")
         }
-        is IdentifierExpression -> if (symbol == null) { throw Exception("NUUUUUUUULL $identifier $position") } else when (val node = symbol!!.node) {
+        is IdentifierExpression -> when (val node = symbolLazy!!.value!!.node) {
             is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: UserType.Void, node.returnType, node.position)
             is PropertyDeclaration -> node.type
             else -> throw Exception("Conversion not implemented")

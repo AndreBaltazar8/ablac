@@ -128,7 +128,7 @@ class CompileService(
 
             compileFile(
                 file,
-                false,
+                true,
                 CompilationContext(executionVisitor.executionJob, Job(executionVisitor.executionJob))
             )
 

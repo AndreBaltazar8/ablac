@@ -173,7 +173,8 @@ class ExecutionVisitor(
     }
 
     override suspend fun visit(identifierExpression: IdentifierExpression) {
-        identifierExpression.symbol = currentScope!!.symbolTable.find(identifierExpression.identifier)
+        val symbolTable = currentScope!!.symbolTable
+        identifierExpression.symbolLazy = lazy { symbolTable.find(identifierExpression.identifier) }
 
         if (executionLayer > 0) {
             val identifier = identifierExpression.identifier
