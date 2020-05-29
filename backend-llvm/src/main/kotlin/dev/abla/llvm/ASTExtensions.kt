@@ -2,7 +2,6 @@ package dev.abla.llvm
 
 import dev.abla.common.symbol
 import dev.abla.language.nodes.*
-import dev.abla.language.positionZero
 import dev.abla.utils.BackingField
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.LLVMBasicBlockRef
@@ -43,7 +42,10 @@ val Expression.returnType: Type?
         is FunctionLiteral -> FunctionType(arrayOf(), UserType.Int, null, position)
         is Integer -> UserType.Int
         is StringLiteral -> UserType.String
-        is FunctionCall -> expression.returnType
+        is FunctionCall -> when(val returnType = expression.returnType) {
+            is FunctionType -> returnType.returnType
+            else -> throw Exception("Call on non function type?")
+        }
         is IdentifierExpression -> if (symbol == null) { throw Exception("NUUUUUUUULL $identifier $position") } else when (val node = symbol!!.node) {
             is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: UserType.Void, node.returnType, node.position)
             is PropertyDeclaration -> node.type
