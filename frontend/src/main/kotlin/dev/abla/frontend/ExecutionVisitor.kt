@@ -214,6 +214,8 @@ class ExecutionVisitor(
     override suspend fun visit(stringLiteral: StringLiteral) {
         if (executionLayer > 0)
             values.add(ExecutionValue.Value(stringLiteral))
+        else
+            super.visit(stringLiteral)
     }
 
     override suspend fun visit(integer: Integer) {
@@ -224,6 +226,8 @@ class ExecutionVisitor(
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         if (executionLayer > 0)
             values.add(ExecutionValue.Value(functionLiteral))
+        else
+            super.visit(functionLiteral)
     }
 
     override suspend fun visit(functionCall: FunctionCall) {

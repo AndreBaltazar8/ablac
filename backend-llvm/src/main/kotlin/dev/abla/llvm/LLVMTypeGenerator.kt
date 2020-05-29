@@ -95,7 +95,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
-        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), LLVMInt32Type(), arrayOf())
+        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), (functionLiteral.block.returnType ?: UserType.Void).llvmType, arrayOf())
             .valueRef.appendBasicBlock("entry") {
                 functionLiteral.llvmBlock = this
                 blocks.push(this)

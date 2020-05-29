@@ -130,6 +130,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         generatorContext.topBlock.createBuilderAtEnd { builder ->
             val args = listOfNotNull(thisClass?.ref).plus(functionCall.arguments.map {
+                // TODO: if parameter is Function Literal and expected return type for parameter is void force generation with void return type
                 it.value.accept(this)
                 generatorContext.topValuePop.ref
             }).toTypedArray()
@@ -191,14 +192,13 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val block = functionLiteral.llvmBlock!!
         val currentBlock = generatorContext.pushBlock(block, functionLiteral.block.symbolTable!!)
         functionLiteral.block.accept(this)
+        val returnType = functionLiteral.block.returnType ?: UserType.Void
         if (!currentBlock.hasReturned) {
-            // CHECK FOR TYPE
-
             currentBlock.createBuilderAtEnd { builder ->
-                if (generatorContext.values.isNotEmpty())
+                if (generatorContext.values.isNotEmpty() && !returnType.isNullOrVoid())
                     LLVMBuildRet(builder, generatorContext.topValue.ref)
                 else
-                    LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 1, 0))
+                    LLVMBuildRetVoid(builder)
             }
             currentBlock.hasReturned = true
         }
@@ -206,7 +206,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             generatorContext.values.pop()
         }
         generatorContext.popBlock(false)
-        val type = FunctionType(arrayOf(), UserType.Int, null, positionZero)
+        val type = FunctionType(arrayOf(), returnType, null, positionZero)
         generatorContext.values.push(GeneratorContext.Value(type, functionLiteral.llvmValue!!))
     }
 

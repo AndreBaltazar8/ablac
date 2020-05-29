@@ -30,6 +30,10 @@ abstract class ASTVisitor {
     }
 
     open suspend fun visit(stringLiteral: StringLiteral) {
+        stringLiteral.stringParts.forEach { part ->
+            if (part is StringLiteral.StringExpression)
+                part.expression.accept(this)
+        }
     }
 
     open suspend fun visit(functionCall: FunctionCall) {

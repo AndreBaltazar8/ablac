@@ -49,7 +49,7 @@ val Expression.inferredType: Type?
             is FunctionType -> returnType.returnType
             else -> throw Exception("Call on non function type?")
         }
-        is IdentifierExpression -> when (val node = symbolLazy!!.value!!.node) {
+        is IdentifierExpression -> if (symbolLazy == null) throw Exception("Null $identifier") else when (val node = symbolLazy!!.value!!.node) {
             is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: UserType.Void, node.returnType, node.position)
             is PropertyDeclaration -> node.inferredType
             else -> throw Exception("Conversion not implemented")
