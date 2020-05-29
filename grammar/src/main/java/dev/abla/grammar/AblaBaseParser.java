@@ -12,11 +12,23 @@ abstract class AblaBaseParser extends Parser {
 
     public boolean lineTerminator() {
         int tokensBehind = 1;
-        Token token = null;
+        Token token;
         do {
             token = getTokenStream().get(getCurrentToken().getTokenIndex() - tokensBehind);
             if (token.getType() == AblaParser.NL || token.getType() == AblaParser.DelimitedComment && (token.getText().contains("\n") || token.getText().contains("\r")))
                 return true;
+            tokensBehind++;
+        } while (token.getChannel() == Lexer.HIDDEN);
+        return false;
+    }
+
+    public boolean matchNoLineTerminator() {
+        int tokensBehind = 1;
+        Token token;
+        do {
+            token = getTokenStream().get(getCurrentToken().getTokenIndex() - tokensBehind);
+            if (token.getType() == AblaParser.NL || token.getType() == AblaParser.DelimitedComment && (token.getText().contains("\n") || token.getText().contains("\r")))
+                return false;
             tokensBehind++;
         } while (token.getChannel() == Lexer.HIDDEN);
         return true;

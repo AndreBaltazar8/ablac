@@ -76,7 +76,7 @@ statement : expression
           | functionDeclaration
           ;
 
-whileStatement : WHILE nlsemiOrRCurlNoConsume LPAREN condition=expression RPAREN (controlStructureBody | SEMICOLON) ;
+whileStatement : WHILE LPAREN condition=expression RPAREN (controlStructureBody | SEMICOLON) ;
 
 propertyDeclaration : modifierList? (VAR | VAL) variableDeclaration (ASSIGNMENT expression)? ;
 
@@ -114,12 +114,12 @@ primaryExpression : simpleIdentifier # simpleIdentifierExpression
                   | literal # literalExpression
                   | functionLiteral # functionLiteralExpression
                   | LPAREN expression RPAREN #parenthesizedExpression
-                  | IF LPAREN condition=expression RPAREN nlsemiOrRCurlNoConsume ifBody=controlStructureBody nlsemiOrRCurlNoConsume (ELSE nlsemiOrRCurlNoConsume elseBody=controlStructureBody)? #ifExpression
-                  | WHEN (LPAREN condition=expression RPAREN)? nlsemiOrRCurlNoConsume LCURL whenCase* RCURL #whenExpression
+                  | IF LPAREN condition=expression RPAREN ifBody=controlStructureBody (ELSE elseBody=controlStructureBody)? #ifExpression
+                  | WHEN (LPAREN condition=expression RPAREN)? LCURL whenCase* RCURL #whenExpression
                   ;
 
-whenCase : expression (nlsemiOrRCurlNoConsume COMMA nlsemiOrRCurlNoConsume expression)* nlsemiOrRCurlNoConsume ARROW nlsemiOrRCurlNoConsume controlStructureBody
-         | ELSE nlsemiOrRCurlNoConsume ARROW nlsemiOrRCurlNoConsume controlStructureBody
+whenCase : expression (COMMA expression)* ARROW controlStructureBody
+         | ELSE ARROW controlStructureBody
          ;
 
 prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
@@ -136,8 +136,8 @@ callSuffix : typeArguments? valueArguments? functionLiteral
 navigationSuffix : DOT simpleIdentifier
                  ;
 
-valueArguments : LPAREN RPAREN
-               | LPAREN valueArgument (COMMA valueArgument)* COMMA? RPAREN
+valueArguments : {this.matchNoLineTerminator()}? LPAREN RPAREN
+               | {this.matchNoLineTerminator()}? LPAREN valueArgument (COMMA valueArgument)* COMMA? RPAREN
                ;
 
 valueArgument : (simpleIdentifier ASSIGNMENT)? expression
