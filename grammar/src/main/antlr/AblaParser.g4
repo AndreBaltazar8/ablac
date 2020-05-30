@@ -143,7 +143,7 @@ valueArguments : {this.matchNoLineTerminator()}? LPAREN RPAREN
 valueArgument : (simpleIdentifier ASSIGNMENT)? expression
               ;
 
-functionLiteral : LCURL (statement nlsemiOrRCurlNoConsume)* RCURL ;
+functionLiteral : LCURL (simpleIdentifier (COMMA simpleIdentifier)* ARROW)? (statement nlsemiOrRCurlNoConsume)* RCURL ;
 
 literal : stringLiteral # stringLiteralLiteral
         | IntegerLiteral # integerLiteral
