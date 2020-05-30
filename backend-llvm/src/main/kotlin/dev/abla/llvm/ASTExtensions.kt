@@ -61,3 +61,4 @@ val Block.returnType: Type?
     get() = statements.lastOrNull { it is Expression }?.let { (it as Expression).inferredType }
 val IfElseExpression.isExpression: Boolean
     get() = elseBody.let { elseBody -> elseBody != null && ifBody.returnType.let { it != null && it == elseBody.returnType }}
+var FunctionLiteral.forcedReturnType: Type? by BackingField.nullable()

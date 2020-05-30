@@ -129,9 +129,15 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val thisClass = if (isMethodCall) generatorContext.topValuePop else null
 
         generatorContext.topBlock.createBuilderAtEnd { builder ->
-            val args = listOfNotNull(thisClass?.ref).plus(functionCall.arguments.map {
-                // TODO: if parameter is Function Literal and expected return type for parameter is void force generation with void return type
-                it.value.accept(this)
+            val args = listOfNotNull(thisClass?.ref).plus(functionCall.arguments.mapIndexed { index, argument ->
+                val value = argument.value
+                if (value is FunctionLiteral) {
+                    val argType = (functionToCall.type as FunctionType).parameters[index].type
+                    val literalReturnType = (argType as FunctionType).returnType
+                    if (literalReturnType.isNullOrVoid())
+                        value.forcedReturnType = UserType.Void
+                }
+                value.accept(this)
                 generatorContext.topValuePop.ref
             }).toTypedArray()
 
@@ -188,11 +194,14 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
+        val returnType = functionLiteral.forcedReturnType ?: functionLiteral.block.returnType ?: UserType.Void
+        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), returnType.llvmType, arrayOf())
+        functionLiteral.llvmValue = function.valueRef
         val numValues = generatorContext.values.size
         val block = functionLiteral.llvmBlock!!
+        LLVMAppendExistingBasicBlock(function.valueRef, block)
         val currentBlock = generatorContext.pushBlock(block, functionLiteral.block.symbolTable!!)
         functionLiteral.block.accept(this)
-        val returnType = functionLiteral.block.returnType ?: UserType.Void
         if (!currentBlock.hasReturned) {
             currentBlock.createBuilderAtEnd { builder ->
                 if (generatorContext.values.isNotEmpty() && !returnType.isNullOrVoid())
