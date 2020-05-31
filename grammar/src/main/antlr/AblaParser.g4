@@ -129,7 +129,7 @@ postfixUnarySuffix : callSuffix
                    | navigationSuffix
                    ;
 
-callSuffix : typeArguments? valueArguments? functionLiteral
+callSuffix : typeArguments? valueArguments? {this.matchNoLineTerminator()}? functionLiteral
            | typeArguments? valueArguments
            ;
 

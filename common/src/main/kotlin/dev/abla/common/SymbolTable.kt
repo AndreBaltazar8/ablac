@@ -34,4 +34,16 @@ class SymbolTable(
             return parent.find(name)
         return null
     }
+
+    fun findFunction(where: (Symbol.Function) -> Boolean): Symbol.Function? {
+        synchronized(symbols) {
+            val value = symbols.firstOrNull { it is Symbol.Function && where(it) }
+            if (value != null)
+                return@findFunction value as Symbol.Function
+        }
+
+        if (parent != null)
+            return parent.findFunction(where)
+        return null
+    }
 }

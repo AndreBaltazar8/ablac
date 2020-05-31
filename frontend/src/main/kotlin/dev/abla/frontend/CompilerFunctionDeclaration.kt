@@ -10,4 +10,4 @@ class CompilerFunctionDeclaration(
     parameters: Array<Parameter>,
     modifiers: Array<Modifier>,
     val executionBlock: suspend (ExecutionVisitor, Array<Any>) -> ExecutionValue
-) : FunctionDeclaration(name, parameters, null, null, modifiers, positionZero)
+) : FunctionDeclaration(name, parameters, null, null, modifiers,  mutableListOf(), positionZero)

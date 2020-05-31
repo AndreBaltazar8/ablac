@@ -123,7 +123,24 @@ class ExecutionVisitor(
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
                 if (sym !is Symbol.Function)
                     throw Exception("Not a method")
-                sym.node.block
+                ExecutionValue.Instance(UserType("CompilerFunctionContext"),
+                    object : ExecutionScope(null, currentTable!!) {
+                        override fun modify(identifier: String, value: ExecutionValue) {
+                            super.modify(identifier, value)
+                            if (identifier == "block")
+                                sym.node.block = (value as ExecutionValue.CompilerNode).node as Block
+                        }
+                    }.apply {
+                        set("block", ExecutionValue.CompilerNode(sym.node.block!!))
+                    }
+                )
+            }
+            replaceFunction("findAnnotated", arrayOf(Parameter("annotation", UserType.String))) { _, args ->
+                val annotationName = args[0] as String
+                val symbolTable = symbol.node.symbolTable!!
+                val sym = symbolTable.findFunction { it.node.annotations.any { annotation -> annotation.name == annotationName } }
+                if (sym !is Symbol.Function)
+                    throw Exception("Not a method")
                 ExecutionValue.Instance(UserType("CompilerFunctionContext"),
                     object : ExecutionScope(null, currentTable!!) {
                         override fun modify(identifier: String, value: ExecutionValue) {

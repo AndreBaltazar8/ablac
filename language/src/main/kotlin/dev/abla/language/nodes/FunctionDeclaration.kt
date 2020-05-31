@@ -9,6 +9,7 @@ open class FunctionDeclaration(
     var block: Block?,
     val returnType: Type?,
     val modifiers: Array<Modifier>,
+    val annotations: MutableList<Annotation>,
     override val position: Position
 ) : Statement {
     val isExtern get() = modifiers.any { it is Extern }

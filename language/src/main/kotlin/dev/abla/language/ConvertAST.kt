@@ -2,6 +2,7 @@ package dev.abla.language
 
 import dev.abla.grammar.AblaParser
 import dev.abla.language.nodes.*
+import dev.abla.language.nodes.Annotation as AblaAnnotation
 import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.Token
 
@@ -30,6 +31,7 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
         functionBody()?.toAST(),
         type()?.toAST(),
         modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        modifierList()?.annotations()?.annotation()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         position
     )
 
@@ -47,6 +49,13 @@ fun AblaParser.ClassMemberDeclarationContext.toAST() : Declaration =
         propertyDeclaration()?.toAST() ?:
         compilerCall()?.toAST() ?:
         throw IllegalStateException("Unknown class member type ${this::class.simpleName}")
+
+fun AblaParser.AnnotationContext.toAST(): AblaAnnotation =
+    AblaAnnotation(
+        simpleIdentifier().text,
+        valueArguments()?.valueArgument()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
+        position
+    )
 
 fun AblaParser.ModifierContext.toAST(): Modifier =
     functionModifier()?.toAST() ?:
