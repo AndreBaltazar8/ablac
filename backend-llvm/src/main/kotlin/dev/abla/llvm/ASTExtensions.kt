@@ -1,7 +1,5 @@
 package dev.abla.llvm
 
-import dev.abla.common.symbol
-import dev.abla.common.symbolLazy
 import dev.abla.language.nodes.*
 import dev.abla.utils.BackingField
 import org.bytedeco.javacpp.PointerPointer
@@ -37,28 +35,4 @@ val Type.llvmType: LLVMTypeRef
 var ClassDeclaration.struct: LLVMTypeRef? by BackingField.nullable()
 var ClassDeclaration.constructorFunction: LLVMValueRef? by BackingField.nullable()
 var MemberAccess.returnClass: Boolean by BackingField { false }
-val PropertyDeclaration.inferredType: Type?
-    get() = type ?: value!!.inferredType
-val Expression.inferredType: Type?
-    get() = when (this) {
-        is IfElseExpression -> if (isExpression) ifBody.returnType else null
-        is FunctionLiteral -> FunctionType(arrayOf(), UserType.Int, null, position)
-        is Integer -> UserType.Int
-        is StringLiteral -> UserType.String
-        is FunctionCall -> when(val returnType = expression.inferredType) {
-            is FunctionType -> returnType.returnType
-            else -> throw Exception("Call on non function type?")
-        }
-        is IdentifierExpression -> if (symbolLazy == null) throw Exception("Null $identifier") else when (val node = symbolLazy!!.value!!.node) {
-            is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: UserType.Void, node.returnType, node.position)
-            is PropertyDeclaration -> node.inferredType
-            else -> throw Exception("Conversion not implemented")
-        }
-        is BinaryOperation -> rhs.inferredType
-        else -> throw Exception("Conversion not implemented")
-    }
-val Block.returnType: Type?
-    get() = statements.lastOrNull { it is Expression }?.let { (it as Expression).inferredType }
-val IfElseExpression.isExpression: Boolean
-    get() = elseBody.let { elseBody -> elseBody != null && ifBody.returnType.let { it != null && it == elseBody.returnType }}
-var FunctionLiteral.forcedReturnType: Type? by BackingField.nullable()
+

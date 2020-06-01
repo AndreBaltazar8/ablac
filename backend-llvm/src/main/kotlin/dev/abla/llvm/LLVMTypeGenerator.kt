@@ -1,6 +1,7 @@
 package dev.abla.llvm
 
 import dev.abla.common.Scope
+import dev.abla.common.inferredType
 import dev.abla.common.scope
 import dev.abla.common.symbol
 import dev.abla.language.ASTVisitor
