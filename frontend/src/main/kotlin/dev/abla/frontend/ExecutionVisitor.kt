@@ -79,11 +79,17 @@ class ExecutionVisitor(
                     values.push(ExecutionValue.Value(Integer(result.toString(), positionZero)))
                 }
 
-                val returnValue = values.pop()
-                repeat(values.size - numValues) {
-                    values.pop()
+                if (values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid()) {
+                    val returnValue = values.pop()
+                    repeat(values.size - numValues) {
+                        values.pop()
+                    }
+                    values.push(returnValue)
+                } else {
+                    repeat(values.size - numValues) {
+                        values.pop()
+                    }
                 }
-                values.push(returnValue)
             } else
                 super.visit(functionDeclaration)
         }
@@ -221,7 +227,10 @@ class ExecutionVisitor(
             executionLayer++
             super.visit(compilerExec)
             compilerExec.compiled = true
-            compilerExec.expression = if (executionLayer > 1) values.peek().value else values.pop().value
+            if (values.size == 0)
+                compilerExec.expression = Integer("0", positionZero)
+            else
+                compilerExec.expression = if (executionLayer > 1) values.peek().value else values.pop().value
             executionLayer--
         } else {
             super.visit(compilerExec)
