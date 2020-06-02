@@ -16,12 +16,13 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     private val blocks = Stack<LLVMBasicBlockRef>()
     private val functions = Stack<LLVMValueRef>()
     private val typeScopes = Stack<TypeScope>()
+    private val names = Stack<String>()
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         if (functionDeclaration.isCompiler)
             return
 
-        val name = typeScopes.map { it.name }.plus(functionDeclaration.name).joinToString("%")
+        val name = names.plus(functionDeclaration.name).joinToString("%")
 
         val classType = if (!typeScopes.empty() && functionDeclaration.symbol.receiver != null)
             LLVMPointerType(typeScopes.peek().type, 0)
@@ -58,7 +59,9 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             for ((index, param) in functionDeclaration.parameters.withIndex())
                 param.llvmValue = LLVMGetParam(function.valueRef, index + offset)
 
+            names.push(functionDeclaration.name)
             it.accept(this)
+            names.pop()
 
             blocks.pop()
         }
@@ -71,8 +74,9 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         val struct = LLVMStructCreateNamed(LLVMGetGlobalContext(), classDeclaration.name)
         val scope = TypeScope(classDeclaration.name, struct)
         typeScopes.push(scope)
+        names.push(classDeclaration.name)
         classDeclaration.struct = struct
-        val name = typeScopes.map { it.name }.plus("%constructor").joinToString("%")
+        val name = names.plus("%constructor").joinToString("%")
         classDeclaration.constructorFunction = module.addFunction(name, LLVMPointerType(struct, 0), arrayOf())
             .valueRef.appendBasicBlock("entry") {
                 classDeclaration.llvmBlock = this
@@ -93,6 +97,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             0
         )
         typeScopes.pop()
+        names.pop()
     }
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {

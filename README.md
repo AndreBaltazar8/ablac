@@ -161,7 +161,6 @@ These the current and planned features for the language. It is not exhaustive li
   * networking and http stack
   * math lib
   * threading
-- Nested functions: fix name of nested functions
 
 ## Contributing
 
