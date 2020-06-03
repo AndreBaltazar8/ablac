@@ -30,6 +30,7 @@ val Type.llvmType: LLVMTypeRef
         this == UserType.Int -> LLVMInt32Type()
         this == UserType.Void -> LLVMVoidType()
         this == UserType.Any -> LLVMPointerType(LLVMVoidType(), 0)
+        this is PointerType -> LLVMPointerType(LLVMInt64Type(), 0)
         else -> throw Exception("Unknown type to llvm type conversion ${this.toHuman()}")
     }
 var ClassDeclaration.struct: LLVMTypeRef? by BackingField.nullable()

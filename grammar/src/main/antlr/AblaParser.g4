@@ -34,7 +34,7 @@ userType : simpleUserType (DOT typeName = simpleUserType)* ;
 simpleUserType : simpleIdentifier (typeArguments)? ;
 
 typeArguments : LANGLE type (COMMA type)* COMMA? RANGLE ;
-type: functionType | parenthesizedType | nullableType | userType ;
+type: (functionType | parenthesizedType | nullableType | userType) MUL*;
 parenthesizedType : LPAREN type RPAREN ;
 functionType: (functionTypeReceiver DOT)? functionTypeParameters ARROW type ;
 functionTypeReceiver : parenthesizedType | nullableType | userType ;

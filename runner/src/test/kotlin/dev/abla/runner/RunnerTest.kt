@@ -109,6 +109,11 @@ class RunnerTest : KoinComponent {
         assert(it.contains("icmp eq i32 %1, 5"))
     }
 
+    @Test
+    fun testFiles() = runResourceFile("examples/test_files.ab") {
+        println(it)
+    }
+
     private fun runResourceFile(file: String, verify: (moduleIR: String) -> Unit = {}) {
         //System.setIn(javaClass.classLoader.getResourceAsStream(file))
         Runner().run(arrayOf(javaClass.classLoader.getResource(file)!!.path))

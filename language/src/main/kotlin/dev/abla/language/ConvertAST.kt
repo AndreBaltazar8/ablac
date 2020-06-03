@@ -84,12 +84,15 @@ fun AblaParser.InheritanceModifierContext.toAST(): Modifier =
 fun AblaParser.ParameterContext.toAST() =
     Parameter(simpleIdentifier().text, type().toAST(), position)
 
-fun AblaParser.TypeContext.toAST(): Type =
-    userType()?.toAST() ?:
-        parenthesizedType()?.type()?.toAST() ?:
-        functionType()?.toAST() ?:
-        nullableType()?.userType()?.let { NullableType(it.toAST(), position) } ?:
-        throw IllegalStateException("Unknown type in $text, $position")
+fun AblaParser.TypeContext.toAST(): Type {
+    val type = userType()?.toAST() ?:
+    parenthesizedType()?.type()?.toAST() ?:
+    functionType()?.toAST() ?:
+    nullableType()?.userType()?.let { NullableType(it.toAST(), position) } ?:
+    throw IllegalStateException("Unknown type in $text, $position")
+
+    return MUL().fold(type) { acc, _ -> PointerType(acc, position) }
+}
 
 fun AblaParser.UserTypeContext.toAST(): UserType {
     val iterator = simpleUserType().iterator()
