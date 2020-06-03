@@ -291,8 +291,9 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             }
         }
 
-        if (!elseRetuned && codeElseBlock != null) {
-            codeElseBlock.block.createBuilderAtEnd {
+        if (!elseRetuned) {
+            val block = codeElseBlock?.block ?: elseBlock
+            block.createBuilderAtEnd {
                 LLVMBuildBr(it, contBlock)
             }
         }
