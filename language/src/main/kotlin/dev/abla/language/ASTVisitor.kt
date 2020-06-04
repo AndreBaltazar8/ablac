@@ -46,6 +46,11 @@ abstract class ASTVisitor {
     }
 
     open suspend fun visit(classDeclaration: ClassDeclaration) {
+        classDeclaration.constructor?.parameters?.forEach {
+            when (it) {
+                is PropertyDeclaration -> it.accept(this)
+            }
+        }
         classDeclaration.declarations.forEach { it.accept(this) }
     }
 

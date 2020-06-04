@@ -39,7 +39,27 @@ fun AblaParser.ClassDeclarationContext.toAST() =
     ClassDeclaration(
         className.text,
         modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        primaryConstructor()?.let { it.toAST() },
         classBody()?.classMemberDeclaration()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        position
+    )
+
+fun AblaParser.PrimaryConstructorContext.toAST() =
+    ClassConstructor(
+        modifierList()?.modifier()?.map { mod -> mod.toAST() }?.toTypedArray() ?: arrayOf(),
+        classConstructorParameters()?.classConstructorParameter()?.map {
+            if (it.VAL() != null || it.VAR() != null)
+                PropertyDeclaration(
+                    it.VAL() != null,
+                    it.simpleIdentifier().text,
+                    it.type().toAST(),
+                    it.expression()?.toAST(),
+                    it.modifierList()?.modifier()?.map { mod -> mod.toAST() }?.toTypedArray() ?: arrayOf(),
+                    it.position
+                )
+            else
+                Parameter(it.simpleIdentifier().text, it.type().toAST(), it.position)
+        }?.toTypedArray() ?: arrayOf(),
         position
     )
 

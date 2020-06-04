@@ -23,6 +23,7 @@ AT : '@' ;
 EXTERN : 'extern' ;
 COMPILER : 'compiler' ;
 ABSTRACT : 'abstract' ;
+CONSTRUCTOR : 'constructor' ;
 CLASS : 'class' ;
 IF : 'if' ;
 ELSE : 'else' ;

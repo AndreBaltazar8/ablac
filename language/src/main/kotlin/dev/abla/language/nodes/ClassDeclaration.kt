@@ -6,6 +6,7 @@ import dev.abla.language.Position
 open class ClassDeclaration(
     val name: String,
     val modifiers: Array<Modifier>,
+    val constructor: ClassConstructor?,
     val declarations: Array<Declaration>,
     override val position: Position
 ) : Declaration {
@@ -15,3 +16,5 @@ open class ClassDeclaration(
         visitor.visit(this)
     }
 }
+
+class ClassConstructor(val modifiers: Array<Modifier>, val parameters: Array<Node>, val position: Position)

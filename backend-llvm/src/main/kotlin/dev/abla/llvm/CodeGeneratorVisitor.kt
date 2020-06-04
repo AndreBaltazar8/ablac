@@ -336,11 +336,18 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             super.visit(classDeclaration)
             createBuilderAtEnd { builder ->
                 val classInstance = LLVMBuildMalloc(builder, classDeclaration.struct, "")
+                classDeclaration.constructor?.parameters?.forEach {
+                    when (it) {
+                        is PropertyDeclaration -> {
+
+                        }
+                    }
+                }
                 classDeclaration.symbol.fields.forEachIndexed { index, field ->
                     val property = field.node as PropertyDeclaration
                     if (property.value == null)
                         return
-                    property.value?.accept(this@CodeGeneratorVisitor)
+                    property.value!!.accept(this@CodeGeneratorVisitor)
                     val ptr = LLVMBuildStructGEP(builder, classInstance, index + 1, "")
                     LLVMBuildStore(builder, generatorContext.topValuePop.ref, ptr)
                 }

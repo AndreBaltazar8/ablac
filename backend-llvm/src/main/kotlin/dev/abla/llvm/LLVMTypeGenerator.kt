@@ -77,7 +77,14 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         names.push(classDeclaration.name)
         classDeclaration.struct = struct
         val name = names.plus("%constructor").joinToString("%")
-        classDeclaration.constructorFunction = module.addFunction(name, LLVMPointerType(struct, 0), arrayOf())
+        val ctorArgs = classDeclaration.constructor?.parameters?.map {
+            when (it) {
+                is PropertyDeclaration -> it.type!!
+                is Parameter -> it.type
+                else -> throw Exception("Unknown!")
+            }.llvmType
+        }?.toTypedArray() ?: arrayOf()
+        classDeclaration.constructorFunction = module.addFunction(name, LLVMPointerType(struct, 0), ctorArgs)
             .valueRef.appendBasicBlock("entry") {
                 classDeclaration.llvmBlock = this
                 blocks.push(this)

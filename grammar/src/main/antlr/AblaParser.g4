@@ -20,13 +20,18 @@ functionDeclarationParameter : parameter (ASSIGNMENT expression)? ;
 typeParameters : LANGLE typeParameter (COMMA typeParameter)* COMMA? RANGLE ;
 typeParameter : simpleIdentifier (COLON type)? ;
 
-classDeclaration : modifierList? CLASS className = simpleIdentifier (typeParameters)? (classBody)? ;
+classDeclaration : modifierList? CLASS className = simpleIdentifier (typeParameters)? ({this.matchNoLineTerminator()}? primaryConstructor)? (classBody)? ;
 classBody : LCURL classMemberDeclaration* RCURL ;
 classMemberDeclaration : classDeclaration
                        | functionDeclaration
                        | propertyDeclaration
                        | compilerCall
                        ;
+
+primaryConstructor : modifierList? CONSTRUCTOR? classConstructorParameters ;
+
+classConstructorParameters : (LPAREN RPAREN) | (LPAREN classConstructorParameter (COMMA classConstructorParameter)* COMMA? RPAREN) ;
+classConstructorParameter : modifierList? (VAR | VAL)? simpleIdentifier COLON type (ASSIGNMENT expression)? ;
 
 parameter : simpleIdentifier COLON type ;
 
