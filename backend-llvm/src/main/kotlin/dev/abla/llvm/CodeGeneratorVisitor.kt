@@ -103,7 +103,10 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                 val type = when (symbol) {
                     is Symbol.Function -> (node as FunctionDeclaration).toType()
                     is Symbol.Variable -> if (node is PropertyDeclaration) node.inferredType!! else UserType.Any
-                    is Symbol.Class -> (node as ClassDeclaration).toType()
+                    is Symbol.Class -> {
+                        val classDeclaration = (node as ClassDeclaration)
+                        FunctionType(arrayOf(Parameter("a", UserType.Int, positionZero)), classDeclaration.toType(), null, positionZero)
+                    }
                 }
                 GeneratorContext.Value(type, node.llvmValue!!)
             }
@@ -121,7 +124,6 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val functionToCall = generatorContext.topValuePop
         val returnType = when (val functionType = functionToCall.type) {
             is FunctionType -> functionType.returnType
-            is UserType -> functionType
             else -> throw IllegalStateException("Expecting function type in function call")
         }
 
@@ -339,14 +341,16 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                 classDeclaration.constructor?.parameters?.forEach {
                     when (it) {
                         is PropertyDeclaration -> {
-
+                            val index = classDeclaration.symbol.fields.indexOf(it.symbol)
+                            val ptr = LLVMBuildStructGEP(builder, classInstance, index + 1, "")
+                            LLVMBuildStore(builder, it.llvmValue!!, ptr)
                         }
                     }
                 }
                 classDeclaration.symbol.fields.forEachIndexed { index, field ->
                     val property = field.node as PropertyDeclaration
                     if (property.value == null)
-                        return
+                        return@forEachIndexed
                     property.value!!.accept(this@CodeGeneratorVisitor)
                     val ptr = LLVMBuildStructGEP(builder, classInstance, index + 1, "")
                     LLVMBuildStore(builder, generatorContext.topValuePop.ref, ptr)

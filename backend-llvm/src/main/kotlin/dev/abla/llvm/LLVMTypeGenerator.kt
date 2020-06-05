@@ -89,6 +89,13 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
                 classDeclaration.llvmBlock = this
                 blocks.push(this)
             }
+
+        val constructor = classDeclaration.constructor
+        if (constructor != null) {
+            for ((index, param) in constructor.parameters.withIndex())
+                param.llvmValue = LLVMGetParam(classDeclaration.constructorFunction, index)
+        }
+
         classDeclaration.llvmValue = classDeclaration.constructorFunction
         super.visit(classDeclaration)
         blocks.pop()
