@@ -102,7 +102,11 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             } else {
                 val type = when (symbol) {
                     is Symbol.Function -> (node as FunctionDeclaration).toType()
-                    is Symbol.Variable -> if (node is PropertyDeclaration) node.inferredType!! else UserType.Any
+                    is Symbol.Variable -> when (node) {
+                        is PropertyDeclaration -> node.inferredType!!
+                        is Parameter -> node.type
+                        else -> UserType.Any
+                    }
                     is Symbol.Class -> {
                         val classDeclaration = (node as ClassDeclaration)
                         FunctionType(arrayOf(Parameter("a", UserType.Int, positionZero)), classDeclaration.toType(), null, positionZero)

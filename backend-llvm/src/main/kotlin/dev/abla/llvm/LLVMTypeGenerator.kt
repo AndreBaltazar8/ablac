@@ -1,9 +1,6 @@
 package dev.abla.llvm
 
-import dev.abla.common.Scope
-import dev.abla.common.inferredType
-import dev.abla.common.scope
-import dev.abla.common.symbol
+import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import org.bytedeco.javacpp.PointerPointer
@@ -56,6 +53,10 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             }
 
             val offset = if (typeScopes.empty()) 0 else 1
+            if (!typeScopes.empty()) {
+                val parameter = (functionDeclaration.symbolTable!!.find("this")!! as Symbol.Variable).node as Parameter
+                parameter.llvmValue = LLVMGetParam(function.valueRef, 0)
+            }
             for ((index, param) in functionDeclaration.parameters.withIndex())
                 param.llvmValue = LLVMGetParam(function.valueRef, index + offset)
 
