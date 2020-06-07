@@ -293,10 +293,17 @@ class ExecutionVisitor(
                     }
                     is ClassDeclaration -> {
                         val instance = ExecutionValue.Instance(it.toType(), ExecutionScope(null, it.symbolTable!!))
+                        it.constructor?.parameters?.reversed()?.forEach { param ->
+                            when (param) {
+                                is PropertyDeclaration -> instance.scope[param.name] = values.pop().copyWith(param.isFinal)
+                                is Parameter -> TODO("not implemented yet")
+                                else -> throw Exception("Unsupported")
+                            }
+                        }
                         it.symbol.fields.forEach { field ->
                             val property = field.node as PropertyDeclaration
                             if (property.value == null)
-                                return
+                                return@forEach
                             property.value?.accept(this)
                             instance.scope[property.name] = values.pop().copyWith(property.isFinal)
                         }
