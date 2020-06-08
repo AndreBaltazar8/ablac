@@ -324,7 +324,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             propertyDeclaration.llvmValue = generatorContext.topValuePop.ref
         } else {
             generatorContext.topBlock.createBuilderAtEnd { builder ->
-                val allocation = LLVMBuildAlloca(builder, LLVMInt32Type(), "")
+                val allocation = LLVMBuildAlloca(builder, propertyDeclaration.inferredType!!.llvmType, "")
                 val value = propertyDeclaration.value
                 if (value != null) {
                     value.accept(this)
