@@ -1,6 +1,7 @@
 package dev.abla.frontend
 
 import com.sun.jna.NativeLibrary
+import com.sun.jna.Pointer
 import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
@@ -68,15 +69,30 @@ class ExecutionVisitor(
                     val extern = functionDeclaration.modifiers.first { it is Extern } as Extern
                     if (extern.libName == null)
                         throw Exception("Must specify lib name in extern to run at compile time")
-                    val result = NativeLibrary.getInstance(extern.libName!!.toValue(currentScope!!) as String)
+                    val function = NativeLibrary.getInstance(extern.libName!!.toValue(currentScope!!) as String)
                         .getFunction(functionDeclaration.name)
-                        .invoke(
-                            Int::class.java,
+
+                    val returnType = functionDeclaration.returnType ?: UserType.Void
+                    if (returnType == UserType.Void) {
+                        function.invokeVoid(
                             functionDeclaration.parameters.map {
-                                currentScope!![it.name]?.value.toValue(currentScope!!)
+                                currentScope!![it.name]?.toValue(currentScope!!)
                             }.toTypedArray()
                         )
-                    values.push(ExecutionValue.Value(Integer(result.toString(), positionZero)))
+                    } else {
+                        val returnTypeClass = if (returnType == UserType.Int) Int::class.java else Pointer::class.java // TODO: support more types
+                        val result = function.invoke(
+                            returnTypeClass,
+                            functionDeclaration.parameters.map {
+                                currentScope!![it.name]?.toValue(currentScope!!)
+                            }.toTypedArray()
+                        )
+
+                        values.push(if (returnType == UserType.Int)
+                            ExecutionValue.Value(Integer(result.toString(), positionZero))
+                        else
+                            ExecutionValue.Pointer(result as Pointer))
+                    }
                 }
 
                 if (values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid()) {
@@ -261,7 +277,11 @@ class ExecutionVisitor(
             it.value.accept(this)
         }
 
-        functionCall.expression.accept(this)
+        val functionExpression = functionCall.expression
+        if (functionExpression is MemberAccess)
+            functionExpression.returnClassInstance = true
+
+        functionExpression.accept(this)
 
         if (executionLayer > 0) {
             val function = when (val topVal = values.pop()) {
@@ -337,6 +357,9 @@ class ExecutionVisitor(
                 accept(this@ExecutionVisitor)
             }
             currentScope = previousScope
+
+            if (!memberAccess.returnClassInstance)
+                values.removeAt(values.lastIndex - 1)
         }
     }
 
@@ -477,6 +500,13 @@ class ExecutionVisitor(
         function()
         currentScope = currentScope!!.parent
     }
+
+    private suspend fun ExecutionValue.toValue(currentScope: ExecutionScope): Any =
+        when (this) {
+            is ExecutionValue.Value -> value.toValue(currentScope)
+            is ExecutionValue.Pointer -> pointer
+            else -> throw Exception("Unknown conversion")
+        }
 
     private suspend fun Literal?.toValue(currentScope: ExecutionScope): Any =
         when (this) {

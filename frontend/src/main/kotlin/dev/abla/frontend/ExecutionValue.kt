@@ -44,6 +44,13 @@ abstract class ExecutionValue {
         override fun copyWith(final: Boolean): ExecutionValue = CompilerNode(node).apply { isFinal = final }
     }
 
+    data class Pointer(val pointer: com.sun.jna.Pointer) : ExecutionValue() {
+        override val value: Literal
+            get() = throw IllegalStateException("Value cannot be converted to literal")
+
+        override fun copyWith(final: Boolean): ExecutionValue = Pointer(pointer).apply { isFinal = final }
+    }
+
     abstract val value: Literal
     var isFinal: Boolean = true
 }
