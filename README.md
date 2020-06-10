@@ -121,7 +121,9 @@ These the current and planned features for the language. It is not exhaustive li
 - Parallel processing of imported files
 - `while` loops
 - `when` expressions
+- Basic type inference
 - Class instantiation with simple variables
+- Calls to external libraries
 - compile-time execution for all available features with interpretation execution
 
 ### To Do
@@ -143,6 +145,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Class construction with proper constructors
 - Extension functions
 - Variable declarations with type check (in functions, globally and class fields)
+- Type inference algorithm
 - Send values to lambdas and other scopes
   * Don't allow to call functions that capture context before it is declared in another function
 - Sending compiler context to functions with "compile" modifier
