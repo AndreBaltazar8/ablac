@@ -325,7 +325,16 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             propertyDeclaration.llvmValue = generatorContext.topValuePop.ref
         } else {
             generatorContext.topBlock.createBuilderAtEnd { builder ->
-                val allocation = LLVMBuildAlloca(builder, propertyDeclaration.inferredType!!.llvmType, "")
+                val inferredType = propertyDeclaration.inferredType!!
+                val type = if (inferredType is UserType) { // TODO: temporary code for inference of class types
+                    val symbol = generatorContext.topBlock.table.find(inferredType.identifier)
+                    if (symbol == null)
+                        inferredType.llvmType
+                    else
+                        LLVMPointerType((symbol as Symbol.Class).node.struct, 0)
+                } else
+                    inferredType.llvmType
+                val allocation = LLVMBuildAlloca(builder, type, "")
                 val value = propertyDeclaration.value
                 if (value != null) {
                     value.accept(this)
