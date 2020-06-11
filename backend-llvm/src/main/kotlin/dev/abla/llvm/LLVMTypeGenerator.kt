@@ -29,14 +29,14 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         val argTypes = listOfNotNull(classType)
             .plus(functionDeclaration.parameters.map {
                 try {
-                    it.type.llvmType
+                    it.type.llvmType(functionDeclaration.symbolTable!!)
                 } catch (e: Exception) {
                     throw Exception("${it.name}: ${e.message}", e)
                 }
             })
         val function = module.addFunction(
             name,
-            functionDeclaration.returnType?.llvmType ?: LLVMVoidType(),
+            functionDeclaration.returnType?.llvmType(functionDeclaration.symbolTable!!) ?: LLVMVoidType(),
             argTypes.toTypedArray()
         )
         typeScopes.lastOrNull()?.methods?.add(function)
@@ -92,7 +92,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
                 is PropertyDeclaration -> it.type!!
                 is Parameter -> it.type
                 else -> throw Exception("Unknown!")
-            }.llvmType
+            }.llvmType(classDeclaration.symbolTable!!)
         }?.toTypedArray() ?: arrayOf()
         classDeclaration.constructorFunction = module.addFunction(name, LLVMPointerType(struct, 0), ctorArgs)
             .valueRef.appendBasicBlock("entry") {
@@ -183,10 +183,10 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(propertyDeclaration: PropertyDeclaration) {
         if (propertyDeclaration.scope == Scope.Global) {
-            LLVMAddGlobal(module, (propertyDeclaration.inferredType ?: UserType.Any).llvmType, "")
+            LLVMAddGlobal(module, (propertyDeclaration.inferredType ?: UserType.Any).llvmType(propertyDeclaration.symbolTable!!), "")
         } else if (propertyDeclaration.scope == Scope.Class) {
             val typeScope = typeScopes.peek()
-            typeScope.fields.add((propertyDeclaration.inferredType ?: UserType.Any).llvmType)
+            typeScope.fields.add((propertyDeclaration.inferredType ?: UserType.Any).llvmType(propertyDeclaration.symbolTable!!))
         }
         super.visit(propertyDeclaration)
     }

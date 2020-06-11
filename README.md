@@ -90,7 +90,7 @@ class IPLookupAPI(
   }
 
   /*
-   * Two methods declared with same name but differnt annotation. The API library would sort these out at compile time
+   * Two methods declared with same name but different annotation. The API library would sort these out at compile time
    * and produce an versioned API to that route.
    */
 }

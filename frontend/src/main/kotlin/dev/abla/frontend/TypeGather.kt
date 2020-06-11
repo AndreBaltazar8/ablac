@@ -111,11 +111,9 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         if (currentScope == Scope.Global && propertyDeclaration.value != null && !propertyDeclaration.value.isLiteralOrCompileTime()) {
             throw IllegalStateException("Must be a constant at runtime. Use compile time execution or a literal")
         }
+        propertyDeclaration.symbolTable = tables.peek()
         val variable = Symbol.Variable(propertyDeclaration.name, propertyDeclaration)
         tables.peek().symbols.add(variable)
-        if (propertyDeclaration.type == null) {
-            propertyDeclaration.type = UserType.Int // TODO: type inference
-        }
         if (currentScope == Scope.Class) {
             val classSymbol = classScopes.peek()
             variable.classSymbol = classSymbol

@@ -201,7 +201,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         val returnType = functionLiteral.forcedReturnType ?: functionLiteral.block.returnType ?: UserType.Void
-        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), returnType.llvmType, arrayOf())
+        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), returnType.llvmType(generatorContext.topBlock.table), arrayOf())
         functionLiteral.llvmValue = function.valueRef
         val numValues = generatorContext.values.size
         val block = functionLiteral.llvmBlock!!
@@ -261,7 +261,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val isExpression = ifElseExpression.isExpression
         val expressionType = ifElseExpression.inferredType
         if (isExpression)
-            ifElseResult = LLVMBuildAlloca(builder, expressionType!!.llvmType, "")
+            ifElseResult = LLVMBuildAlloca(builder, expressionType!!.llvmType(generatorContext.topBlock.table), "")
 
         LLVMBuildCondBr(builder, condition, ifBlock, elseBlock)
 
@@ -325,15 +325,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             propertyDeclaration.llvmValue = generatorContext.topValuePop.ref
         } else {
             generatorContext.topBlock.createBuilderAtEnd { builder ->
-                val inferredType = propertyDeclaration.inferredType!!
-                val type = if (inferredType is UserType) { // TODO: temporary code for inference of class types
-                    val symbol = generatorContext.topBlock.table.find(inferredType.identifier)
-                    if (symbol == null)
-                        inferredType.llvmType
-                    else
-                        LLVMPointerType((symbol as Symbol.Class).node.struct, 0)
-                } else
-                    inferredType.llvmType
+                val type = propertyDeclaration.inferredType!!.llvmType(generatorContext.topBlock.table)
                 val allocation = LLVMBuildAlloca(builder, type, "")
                 val value = propertyDeclaration.value
                 if (value != null) {

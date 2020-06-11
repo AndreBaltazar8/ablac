@@ -1,5 +1,7 @@
 package dev.abla.llvm
 
+import dev.abla.common.Symbol
+import dev.abla.common.SymbolTable
 import dev.abla.language.nodes.*
 import dev.abla.utils.BackingField
 import org.bytedeco.javacpp.PointerPointer
@@ -15,24 +17,30 @@ var IfElseExpression.llvmElseBlock: LLVMBasicBlockRef? by BackingField.nullable(
 var IfElseExpression.llvmContBlock: LLVMBasicBlockRef? by BackingField.nullable()
 var WhileStatement.llvmConditionBlock: LLVMBasicBlockRef? by BackingField.nullable()
 var WhileStatement.llvmContBlock: LLVMBasicBlockRef? by BackingField.nullable()
-val Type.llvmType: LLVMTypeRef
-    get() = when {
-        this is FunctionType -> LLVMPointerType(
-            LLVMFunctionType(
-                returnType.llvmType,
-                PointerPointer(*parameters.map { it.type.llvmType }.toTypedArray()),
-                parameters.size,
-                0
-            ),
+fun Type.llvmType(symbolTable: SymbolTable): LLVMTypeRef = when {
+    this is FunctionType -> LLVMPointerType(
+        LLVMFunctionType(
+            returnType.llvmType(symbolTable),
+            PointerPointer(*parameters.map { it.type.llvmType(symbolTable) }.toTypedArray()),
+            parameters.size,
             0
-        )
-        this == UserType.String -> LLVMPointerType(LLVMInt8Type(), 0)
-        this == UserType.Int -> LLVMInt32Type()
-        this == UserType.Void -> LLVMVoidType()
-        this == UserType.Any -> LLVMPointerType(LLVMInt64Type(), 0)
-        this is PointerType -> LLVMPointerType(LLVMInt64Type(), 0)
-        else -> throw Exception("Unknown type to llvm type conversion ${this.toHuman()}")
+        ),
+        0
+    )
+    this == UserType.String -> LLVMPointerType(LLVMInt8Type(), 0)
+    this == UserType.Int -> LLVMInt32Type()
+    this == UserType.Void -> LLVMVoidType()
+    this == UserType.Any -> LLVMPointerType(LLVMInt64Type(), 0)
+    this is PointerType -> LLVMPointerType(LLVMInt64Type(), 0)
+    this is UserType -> {
+        val symbol = symbolTable.find(identifier)
+        if (symbol == null)
+            throw Exception("Unknown user type to llvm type conversion ${this.toHuman()}")
+        else
+            LLVMPointerType((symbol as Symbol.Class).node.struct, 0)
     }
+    else -> throw Exception("Unknown type to llvm type conversion ${this.toHuman()}")
+}
 var ClassDeclaration.struct: LLVMTypeRef? by BackingField.nullable()
 var ClassDeclaration.constructorFunction: LLVMValueRef? by BackingField.nullable()
 var MemberAccess.returnClass: Boolean by BackingField { false }

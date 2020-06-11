@@ -8,6 +8,7 @@ var File.symbolTable: SymbolTable? by BackingField.nullable()
 var FunctionDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
 var ClassDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
 var Block.symbolTable: SymbolTable? by BackingField.nullable()
+var PropertyDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
 var Node.symbol: Symbol<*>? by BackingField.nullable()
 var Node.symbolLazy: Lazy<Symbol<*>?>? by BackingField.nullable()
 var ClassDeclaration.symbol: Symbol.Class
@@ -24,7 +25,7 @@ var PropertyDeclaration.scope: Scope by BackingField { Scope.Global }
 
 // TODO: need to calculate correct receiver and first parameter
 fun FunctionDeclaration.toType(): Type =
-    FunctionType(parameters, returnType ?: UserType.Void, null, positionZero)
+    FunctionType(parameters, returnType ?: block?.returnType ?: UserType.Void, null, positionZero)
 
 // TODO: need to calculate correct parent
 fun ClassDeclaration.toType(): Type = UserType(name, arrayOf(), null, positionZero)
@@ -41,8 +42,9 @@ val Expression.inferredType: Type?
             else -> throw Exception("Call on non function type?")
         }
         is IdentifierExpression -> if (symbolLazy == null) throw Exception("Null $identifier") else when (val node = symbolLazy!!.value!!.node) {
-            is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: UserType.Void, node.returnType, node.position)
+            is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: node.block?.returnType ?: UserType.Void, node.returnType, node.position)
             is PropertyDeclaration -> node.inferredType
+            is ClassDeclaration -> FunctionType(arrayOf(), node.toType(), null, node.position)
             else -> throw Exception("Conversion not implemented")
         }
         is BinaryOperation -> rhs.inferredType
