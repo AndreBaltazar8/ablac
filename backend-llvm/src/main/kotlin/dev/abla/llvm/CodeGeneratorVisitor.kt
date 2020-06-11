@@ -21,7 +21,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         if (functionDeclaration.name == "main") {
             function.setName("%%_main")
 
-            module.addFunction("main", LLVMInt16Type(), arrayOf()).valueRef
+            module.addFunction("main", LLVMInt32Type(), arrayOf()).valueRef
                 .setLinkage(LLVMExternalLinkage)
                 .appendBasicBlock("entry") {
                     createBuilderAtEnd { builder ->
@@ -37,7 +37,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                             if (functionDeclaration.returnType == UserType.Int)
                                 call
                             else
-                                LLVMConstInt(LLVMInt16Type(),0, 0)
+                                LLVMConstInt(LLVMInt32Type(),0, 0) // TODO: convert to int16
                         )
                     }
                 }
