@@ -52,13 +52,22 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
                 blocks.push(this)
             }
 
+            val builder = functionDeclaration.llvmBlock!!.createBuilderAtEnd()
+
             val offset = if (typeScopes.empty()) 0 else 1
             if (!typeScopes.empty()) {
                 val parameter = (functionDeclaration.symbolTable!!.find("this")!! as Symbol.Variable).node as Parameter
-                parameter.llvmValue = LLVMGetParam(function.valueRef, 0)
+                val parameterValueRef = LLVMGetParam(function.valueRef, 0)
+                val allocation = LLVMBuildAlloca(builder, argTypes[0], "")
+                LLVMBuildStore(builder, parameterValueRef, allocation)
+                parameter.llvmValue = LLVMBuildLoad(builder, allocation, "")
             }
-            for ((index, param) in functionDeclaration.parameters.withIndex())
-                param.llvmValue = LLVMGetParam(function.valueRef, index + offset)
+            for ((index, param) in functionDeclaration.parameters.withIndex()) {
+                val parameterValueRef = LLVMGetParam(function.valueRef, index + offset)
+                val allocation = LLVMBuildAlloca(builder, argTypes[index + offset], "")
+                LLVMBuildStore(builder, parameterValueRef, allocation)
+                param.llvmValue = LLVMBuildLoad(builder, allocation, "")
+            }
 
             names.push(functionDeclaration.name)
             it.accept(this)
