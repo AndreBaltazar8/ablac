@@ -96,15 +96,9 @@ class ExecutionVisitor(
                 }
 
                 if (values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid()) {
-                    val returnValue = values.pop()
-                    repeat(values.size - numValues) {
-                        values.pop()
-                    }
-                    values.push(returnValue)
+                    values.clearUntilSaveLast(numValues)
                 } else {
-                    repeat(values.size - numValues) {
-                        values.pop()
-                    }
+                    values.clearUntil(numValues)
                 }
             } else
                 super.visit(functionDeclaration)
@@ -143,37 +137,13 @@ class ExecutionVisitor(
             }
             replaceFunction("find", mutableListOf(Parameter("fnName", UserType.String))) { _, args ->
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
-                if (sym !is Symbol.Function)
-                    throw Exception("Not a method")
-                ExecutionValue.Instance(UserType("CompilerFunctionContext"),
-                    object : ExecutionScope(null, currentTable!!) {
-                        override fun modify(identifier: String, value: ExecutionValue) {
-                            super.modify(identifier, value)
-                            if (identifier == "block")
-                                sym.node.block = (value as ExecutionValue.CompilerNode).node as Block
-                        }
-                    }.apply {
-                        set("block", ExecutionValue.CompilerNode(sym.node.block!!))
-                    }
-                )
+                createCompileFunctionContext(sym)
             }
             replaceFunction("findAnnotated", mutableListOf(Parameter("annotation", UserType.String))) { _, args ->
                 val annotationName = args[0] as String
                 val symbolTable = symbol.node.symbolTable!!
                 val sym = symbolTable.findFunction { it.node.annotations.any { annotation -> annotation.name == annotationName } }
-                if (sym !is Symbol.Function)
-                    throw Exception("Not a method")
-                ExecutionValue.Instance(UserType("CompilerFunctionContext"),
-                    object : ExecutionScope(null, currentTable!!) {
-                        override fun modify(identifier: String, value: ExecutionValue) {
-                            super.modify(identifier, value)
-                            if (identifier == "block")
-                                sym.node.block = (value as ExecutionValue.CompilerNode).node as Block
-                        }
-                    }.apply {
-                        set("block", ExecutionValue.CompilerNode(sym.node.block!!))
-                    }
-                )
+                createCompileFunctionContext(sym)
             }
             replaceFunction(
                 "defineInClass",
@@ -192,6 +162,23 @@ class ExecutionVisitor(
             set("name", functionDeclaration.name.toExecutionValue())
         }
         currentScope!!["compilerContext"] = ExecutionValue.Instance(UserType("CompilerContext"), scope)
+    }
+
+    private fun createCompileFunctionContext(sym: Symbol<*>?): ExecutionValue.Instance {
+        if (sym !is Symbol.Function)
+            throw Exception("Not a method")
+
+        return ExecutionValue.Instance(UserType("CompilerFunctionContext"),
+            object : ExecutionScope(null, currentTable!!) {
+                override fun modify(identifier: String, value: ExecutionValue) {
+                    super.modify(identifier, value)
+                    if (identifier == "block")
+                        sym.node.block = (value as ExecutionValue.CompilerNode).node as Block
+                }
+            }.apply {
+                set("block", ExecutionValue.CompilerNode(sym.node.block!!))
+            }
+        )
     }
 
     private suspend fun findClassSymbol(className: String): Symbol.Class {
@@ -305,18 +292,14 @@ class ExecutionVisitor(
                         withTable(it.block.symbolTable) {
                             it.block.accept(this)
                         }
-                        val returnValue = values.pop()
-                        repeat(values.size - numValues) {
-                            values.pop()
-                        }
-                        values.push(returnValue)
+                        values.clearUntilSaveLast(numValues)
                     }
                     is ClassDeclaration -> {
                         val instance = ExecutionValue.Instance(it.toType(), ExecutionScope(null, it.symbolTable!!))
                         it.constructor?.parameters?.reversed()?.forEach { param ->
                             when (param) {
                                 is PropertyDeclaration -> instance.scope[param.name] = values.pop().copyWith(param.isFinal)
-                                is Parameter -> TODO("not implemented yet")
+                                is Parameter -> instance.scope[param.name] = values.pop().copyWith(false)
                                 else -> throw Exception("Unsupported")
                             }
                         }
@@ -533,6 +516,20 @@ class ExecutionVisitor(
     data class CallInfo(val instance: ExecutionValue.Instance?)
 
     var FunctionDeclaration.callInfo: CallInfo? by BackingField.nullable()
+}
+
+private fun <E> Stack<E>.clearUntil(toKeep: Int) {
+    repeat(size - toKeep) {
+        pop()
+    }
+}
+
+private fun <E> Stack<E>.clearUntilSaveLast(toKeep: Int) {
+    val returnValue = pop()
+    repeat(size - toKeep) {
+        pop()
+    }
+    push(returnValue)
 }
 
 private fun MutableList<Symbol<*>>.replaceFunction(
