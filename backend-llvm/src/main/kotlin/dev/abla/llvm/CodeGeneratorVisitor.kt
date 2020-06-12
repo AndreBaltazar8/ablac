@@ -348,8 +348,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                     when (it) {
                         is PropertyDeclaration -> {
                             val index = classDeclaration.symbol.fields.indexOf(it.symbol)
-                            val ptr = LLVMBuildStructGEP(builder, classInstance, index + 1, "")
-                            LLVMBuildStore(builder, it.llvmValue!!, ptr)
+                            classInstance.storeGEP(builder, index + 1, it.llvmValue!!)
                         }
                     }
                 }
@@ -358,8 +357,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                     if (property.value == null)
                         return@forEachIndexed
                     property.value!!.accept(this@CodeGeneratorVisitor)
-                    val ptr = LLVMBuildStructGEP(builder, classInstance, index + 1, "")
-                    LLVMBuildStore(builder, generatorContext.topValuePop.ref, ptr)
+                    classInstance.storeGEP(builder, index + 1, generatorContext.topValuePop.ref)
                 }
                 LLVMBuildRet(builder, classInstance)
             }

@@ -50,4 +50,9 @@ inline fun LLVMBasicBlockRef.createBuilderAtEnd(action: (LLVMBuilderRef) -> Unit
     return builder
 }
 
+fun LLVMValueRef.storeGEP(builder: LLVMBuilderRef, index: Int, value: LLVMValueRef) {
+    val ptr = LLVMBuildStructGEP(builder, this, index, "")
+    LLVMBuildStore(builder, value, ptr)
+}
+
 private fun Boolean.toInt(): Int = if (this) 1 else 0
