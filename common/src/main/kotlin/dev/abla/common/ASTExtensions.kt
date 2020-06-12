@@ -41,13 +41,15 @@ val Expression.inferredType: Type?
             is FunctionType -> returnType.returnType
             else -> throw Exception("Call on non function type?")
         }
-        is IdentifierExpression -> if (symbolLazy == null) throw Exception("Null $identifier") else when (val node = symbolLazy!!.value!!.node) {
+        is IdentifierExpression -> when (val node = symbolLazy!!.value!!.node) {
             is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: node.block?.returnType ?: UserType.Void, node.returnType, node.position)
             is PropertyDeclaration -> node.inferredType
             is ClassDeclaration -> FunctionType(arrayOf(), node.toType(), null, node.position)
+            is Parameter -> node.type
             else -> throw Exception("Conversion not implemented")
         }
         is BinaryOperation -> rhs.inferredType
+        is CompilerExec -> expression.inferredType
         else -> throw Exception("Conversion not implemented")
     }
 val Block.returnType: Type?

@@ -39,7 +39,7 @@ class RunnerTest : KoinComponent {
     fun testCompilerContext() = runResourceFile("examples/test_compiler_context.ab") {
         println(it)
         assert(it.indexOf("%2 = add i32 %0, 5") == -1)
-        assert(it.contains("%2 = add i32 %0, 20"))
+        assert(it.contains("%4 = add i32 %2, 20"))
     }
 
     @Test
@@ -59,7 +59,7 @@ class RunnerTest : KoinComponent {
     @Test
     fun testOperators() = runResourceFile("examples/test_operators.ab") {
         println(it)
-        assert(it.contains("%1 = sdiv i32 8, %0"))
+        assert(it.contains("%3 = sdiv i32 8, %2"))
         assert(it.contains("%1 = mul i32 %0, 2"))
         assert(it.contains("%3 = icmp sgt i32 %2, 2"))
     }
@@ -78,7 +78,7 @@ class RunnerTest : KoinComponent {
     @Test
     fun testTrailingLambdas() = runResourceFile("examples/test_trailing_lambda.ab") {
         println(it)
-        assert(it.contains("%1 = call i32 %0()"))
+        assert(it.contains("%3 = call i32 %2()"))
         assert(it.contains("%0 = call i32 @wrap(i32 ()* @funliteral"))
     }
 
@@ -106,8 +106,8 @@ class RunnerTest : KoinComponent {
     @Test
     fun testWhen() = runResourceFile("examples/test_when.ab") {
         println(it)
-        assert(it.contains("icmp eq i32 %0, 1"))
-        assert(it.contains("icmp eq i32 %0, 2"))
+        assert(it.contains("icmp eq i32 %2, 1"))
+        assert(it.contains("icmp eq i32 %2, 2"))
 
         assert(it.contains("icmp eq i32 %1, 10"))
         assert(it.contains("icmp eq i32 %1, 20"))

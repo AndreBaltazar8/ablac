@@ -42,6 +42,12 @@ class ExecutionVisitor(
         }
     }
 
+    override suspend fun visit(block: Block) {
+        withTable(block.symbolTable) {
+            super.visit(block)
+        }
+    }
+
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         withTable(functionDeclaration.symbolTable) {
             if (executionLayer > 0) {
@@ -62,9 +68,7 @@ class ExecutionVisitor(
                 val numValues = values.size
                 val block = functionDeclaration.block
                 if (block != null) {
-                    withTable(block.symbolTable) {
-                        block.accept(this)
-                    }
+                    block.accept(this)
                 } else {
                     val extern = functionDeclaration.modifiers.first { it is Extern } as Extern
                     if (extern.libName == null)
@@ -289,9 +293,7 @@ class ExecutionVisitor(
                     }
                     is FunctionLiteral -> {
                         val numValues = values.size
-                        withTable(it.block.symbolTable) {
-                            it.block.accept(this)
-                        }
+                        it.block.accept(this)
                         values.clearUntilSaveLast(numValues)
                     }
                     is ClassDeclaration -> {
@@ -416,15 +418,13 @@ class ExecutionVisitor(
                 while (true) {
                     whileStatement.condition.accept(this)
 
-                    withTable(whileStatement.block.symbolTable) {
-                        val conditionValue = values.pop().value.toValue(currentScope!!)
-                        val conditionTrue = conditionValue as Int == 1
+                    val conditionValue = values.pop().value.toValue(currentScope!!)
+                    val conditionTrue = conditionValue as Int == 1
 
-                        if (!conditionTrue)
-                            return@visit
+                    if (!conditionTrue)
+                        return
 
-                        whileStatement.block.accept(this)
-                    }
+                    whileStatement.block.accept(this)
                 }
         } else
             super.visit(whileStatement)
