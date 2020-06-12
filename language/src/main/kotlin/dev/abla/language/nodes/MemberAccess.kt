@@ -4,8 +4,8 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
 
 data class MemberAccess(
-    val expression: Expression,
-    val name: String,
+    var expression: Expression,
+    var name: String,
     override val position: Position
 ) : Expression {
     override suspend fun accept(visitor: ASTVisitor) {

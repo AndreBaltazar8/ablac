@@ -5,11 +5,11 @@ import dev.abla.language.Identifier
 import dev.abla.language.Position
 
 class PropertyDeclaration(
-    val isFinal: Boolean,
-    val name: Identifier,
+    var isFinal: Boolean,
+    var name: Identifier,
     var type: Type?,
-    val value: Expression?,
-    val modifiers: Array<Modifier>,
+    var value: Expression?,
+    var modifiers: MutableList<Modifier>,
     override val position: Position
 ) : Statement {
     override suspend fun accept(visitor: ASTVisitor) {

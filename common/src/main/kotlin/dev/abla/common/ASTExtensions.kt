@@ -25,7 +25,7 @@ var PropertyDeclaration.scope: Scope by BackingField { Scope.Global }
 
 // TODO: need to calculate correct receiver and first parameter
 fun FunctionDeclaration.toType(): Type =
-    FunctionType(parameters, returnType ?: block?.returnType ?: UserType.Void, null, positionZero)
+    FunctionType(parameters.toTypedArray(), returnType ?: block?.returnType ?: UserType.Void, null, positionZero)
 
 // TODO: need to calculate correct parent
 fun ClassDeclaration.toType(): Type = UserType(name, arrayOf(), null, positionZero)

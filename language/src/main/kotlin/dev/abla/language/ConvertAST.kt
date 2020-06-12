@@ -11,7 +11,7 @@ val Token.endPoint get() = Point(line, charPositionInLine + text.length)
 val ParserRuleContext.position get() = Position(start.startPoint, stop.endPoint)
 
 fun AblaParser.FileContext.toAST(fileName: String) =
-    File(fileName, fileDeclaration().mapNotNull { it.toAST() }.toTypedArray(), position)
+    File(fileName, fileDeclaration().mapNotNull { it.toAST() }.toMutableList(), position)
 
 fun AblaParser.FileDeclarationContext.toAST(): Declaration =
     when (this) {
@@ -27,10 +27,10 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
         functionName.text,
         functionDeclarationParameters()?.functionDeclarationParameter()?.map {
             it.parameter().toAST()
-        }?.toTypedArray() ?: arrayOf(),
+        }?.toMutableList() ?: mutableListOf(),
         functionBody()?.toAST(),
         type()?.toAST(),
-        modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        modifierList()?.modifier()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         modifierList()?.annotations()?.annotation()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         position
     )
@@ -38,15 +38,15 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
 fun AblaParser.ClassDeclarationContext.toAST() =
     ClassDeclaration(
         className.text,
-        modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
-        primaryConstructor()?.let { it.toAST() },
-        classBody()?.classMemberDeclaration()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        modifierList()?.modifier()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
+        primaryConstructor()?.toAST(),
+        classBody()?.classMemberDeclaration()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         position
     )
 
 fun AblaParser.PrimaryConstructorContext.toAST() =
     ClassConstructor(
-        modifierList()?.modifier()?.map { mod -> mod.toAST() }?.toTypedArray() ?: arrayOf(),
+        modifierList()?.modifier()?.map { mod -> mod.toAST() }?.toMutableList() ?: mutableListOf(),
         classConstructorParameters()?.classConstructorParameter()?.map {
             if (it.VAL() != null || it.VAR() != null)
                 PropertyDeclaration(
@@ -54,12 +54,12 @@ fun AblaParser.PrimaryConstructorContext.toAST() =
                     it.simpleIdentifier().text,
                     it.type().toAST(),
                     it.expression()?.toAST(),
-                    it.modifierList()?.modifier()?.map { mod -> mod.toAST() }?.toTypedArray() ?: arrayOf(),
+                    it.modifierList()?.modifier()?.map { mod -> mod.toAST() }?.toMutableList() ?: mutableListOf(),
                     it.position
                 )
             else
                 Parameter(it.simpleIdentifier().text, it.type().toAST(), it.position)
-        }?.toTypedArray() ?: arrayOf(),
+        }?.toMutableList() ?: mutableListOf(),
         position
     )
 
@@ -154,11 +154,11 @@ fun AblaParser.SimpleUserTypeContext.toAST(parent: UserType?): UserType =
 fun AblaParser.FunctionBodyContext.toAST(): Block =
     when (this) {
         is AblaParser.BlockBodyContext -> block().toAST()
-        is AblaParser.LambdaBodyContext -> Block(arrayOf(expression().toAST()), position)
+        is AblaParser.LambdaBodyContext -> Block(mutableListOf(expression().toAST()), position)
         else -> throw IllegalStateException("Unknown function body type ${this::class.simpleName}")
     }
 
-fun AblaParser.BlockContext.toAST(): Block = Block(statement().mapNotNull { it.toAST() }.toTypedArray(), position)
+fun AblaParser.BlockContext.toAST(): Block = Block(statement().mapNotNull { it.toAST() }.toMutableList(), position)
 
 fun AblaParser.StatementContext.toAST(): Statement =
     expression()?.toAST() ?:
@@ -180,7 +180,7 @@ fun AblaParser.PropertyDeclarationContext.toAST(): PropertyDeclaration =
         variableDeclaration().simpleIdentifier().text,
         variableDeclaration().type()?.toAST(),
         expression()?.toAST(),
-        modifierList()?.modifier()?.map { it.toAST() }?.toTypedArray() ?: arrayOf(),
+        modifierList()?.modifier()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         position
     )
 
@@ -198,7 +198,7 @@ fun AblaParser.CallSuffixContext.toAST(expression: Expression) =
         listOfNotNull(
             *(valueArguments()?.valueArgument()?.map { it.toAST() }?.toTypedArray() ?: arrayOf<Argument>()),
             functionLiteral()?.toAST()?.run { Argument(null, this, this.position) }
-        ).toTypedArray(),
+        ).toMutableList(),
         position
     )
 
@@ -271,7 +271,7 @@ fun AblaParser.AtomicExpressionContext.toAST(): Expression =
 
 fun AblaParser.ControlStructureBodyContext.toAST(): Block =
     block()?.toAST() ?:
-        statement()?.toAST()?.let { Block(arrayOf(it), positionZero) } ?:
+        statement()?.toAST()?.let { Block(mutableListOf(it), positionZero) } ?:
         throw IllegalStateException("Unknown control structure block $text, $position")
 
 fun AblaParser.EqualityOperatorContext.toAST(): BinaryOperator =
@@ -334,7 +334,7 @@ fun AblaParser.LiteralContext.toAST(): Literal =
 
 fun AblaParser.FunctionLiteralContext.toAST() =
     FunctionLiteral(
-        Block(statement().mapNotNull { it.toAST() }.toTypedArray(), position),
+        Block(statement().mapNotNull { it.toAST() }.toMutableList(), position),
         position
     )
 

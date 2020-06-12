@@ -4,10 +4,10 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
 
 open class ClassDeclaration(
-    val name: String,
-    val modifiers: Array<Modifier>,
-    val constructor: ClassConstructor?,
-    val declarations: Array<Declaration>,
+    var name: String,
+    var modifiers: MutableList<Modifier>,
+    var constructor: ClassConstructor?,
+    var declarations: MutableList<Declaration>,
     override val position: Position
 ) : Declaration {
     val isCompiler get() = modifiers.any { it is ModCompiler }
@@ -17,4 +17,4 @@ open class ClassDeclaration(
     }
 }
 
-class ClassConstructor(val modifiers: Array<Modifier>, val parameters: Array<Node>, val position: Position)
+class ClassConstructor(val modifiers: MutableList<Modifier>, val parameters: MutableList<Node>, val position: Position)

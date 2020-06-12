@@ -5,11 +5,11 @@ import dev.abla.language.Position
 
 open class FunctionDeclaration(
     var name: String,
-    val parameters: Array<Parameter>,
+    var parameters: MutableList<Parameter>,
     var block: Block?,
-    val returnType: Type?,
-    val modifiers: Array<Modifier>,
-    val annotations: MutableList<Annotation>,
+    var returnType: Type?,
+    var modifiers: MutableList<Modifier>,
+    var annotations: MutableList<Annotation>,
     override val position: Position
 ) : Statement {
     val isExtern get() = modifiers.any { it is Extern }

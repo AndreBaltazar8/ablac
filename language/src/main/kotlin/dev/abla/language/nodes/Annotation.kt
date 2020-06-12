@@ -4,7 +4,7 @@ import dev.abla.language.Identifier
 import dev.abla.language.Position
 
 data class Annotation(
-    val name: Identifier,
-    val arguments: MutableList<Argument>,
+    var name: Identifier,
+    var arguments: MutableList<Argument>,
     val position: Position
 )

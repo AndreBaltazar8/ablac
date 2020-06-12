@@ -122,7 +122,7 @@ class CompileService(
     }
 
     init {
-        addCompileFunction("import", arrayOf(Parameter("fileName", UserType.String))) { executionVisitor, args ->
+        addCompileFunction("import", mutableListOf(Parameter("fileName", UserType.String))) { executionVisitor, args ->
             val importName = args[0] as String
             val file = Paths.get(executionVisitor.workingDirectory, importName).toAbsolutePath().toString()
 
@@ -136,10 +136,10 @@ class CompileService(
         }
 
         // TODO: Remove. This is just an example on how to declare functions from compiler
-        addCompileFunction("declareFun", arrayOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))) { executionVisitor, args ->
+        addCompileFunction("declareFun", mutableListOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))) { executionVisitor, args ->
             val name = "declared<$compileNumber>"
             compile(name, false, true, CompilationContext(executionVisitor.executionJob, Job(executionVisitor.executionJob))) {
-                File(name, arrayOf(FunctionDeclaration(args[0] as String, arrayOf(), (args[1] as FunctionLiteral).block, UserType.Int, arrayOf(), mutableListOf(), positionZero)), positionZero)
+                File(name, mutableListOf(FunctionDeclaration(args[0] as String, mutableListOf(), (args[1] as FunctionLiteral).block, UserType.Int, mutableListOf(), mutableListOf(), positionZero)), positionZero)
             }
 
             ExecutionValue.Value(Integer("1", positionZero))
@@ -148,11 +148,17 @@ class CompileService(
 
     private fun addCompileFunction(
         name: String,
-        parameters: Array<Parameter> = arrayOf(),
-        modifiers: Array<Modifier> = arrayOf(),
+        parameters: MutableList<Parameter> = mutableListOf(),
+        modifiers: MutableList<Modifier> = mutableListOf(),
         executionBlock: suspend (ExecutionVisitor, Array<Any>) -> ExecutionValue
     ) {
-        val declaration = CompilerFunctionDeclaration(name, parameters, arrayOf(*modifiers, ModCompiler(positionZero)), executionBlock)
+        val declaration = CompilerFunctionDeclaration(
+            name,
+            parameters,
+            modifiers.toMutableList().apply { add(ModCompiler(positionZero)) },
+            executionBlock
+        )
+
         global.symbols.add(Symbol.Function(name, declaration))
     }
 

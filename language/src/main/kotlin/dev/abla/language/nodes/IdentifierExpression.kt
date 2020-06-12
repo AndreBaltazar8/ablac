@@ -5,7 +5,7 @@ import dev.abla.language.Identifier
 import dev.abla.language.Position
 
 class IdentifierExpression(
-    val identifier: Identifier,
+    var identifier: Identifier,
     override val position: Position
 ) : Expression {
     override suspend fun accept(visitor: ASTVisitor) {

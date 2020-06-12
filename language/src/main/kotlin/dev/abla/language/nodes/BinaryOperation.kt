@@ -4,9 +4,9 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
 
 data class BinaryOperation(
-    val operator: BinaryOperator,
-    val lhs: Expression,
-    val rhs: Expression,
+    var operator: BinaryOperator,
+    var lhs: Expression,
+    var rhs: Expression,
     override val position: Position
 ) : Expression {
     override suspend fun accept(visitor: ASTVisitor) {
