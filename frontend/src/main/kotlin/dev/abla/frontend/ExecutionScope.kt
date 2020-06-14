@@ -8,10 +8,16 @@ open class ExecutionScope(val parent: ExecutionScope?, val symbolTable: SymbolTa
     private val values = mutableMapOf<String, ExecutionValue>()
 
     operator fun get(identifier: String) : ExecutionValue? =
-        values[identifier] ?: symbolTable.getThis(identifier)?.let {
+        values[identifier] ?:
+        symbolTable.getThis(identifier)?.let {
             ExecutionValue.ConstSymbol(it)
                 .copyWith(it.node.let { node -> if (node is PropertyDeclaration) node.isFinal else false })
-        } ?: parent?.get(identifier)
+        } ?:
+        parent?.get(identifier) ?:
+        symbolTable.find(identifier)?.let {
+            ExecutionValue.ConstSymbol(it)
+                .copyWith(it.node.let { node -> if (node is PropertyDeclaration) node.isFinal else false })
+        }
 
     operator fun set(identifier: String, value: ExecutionValue) {
         values[identifier] = value
@@ -28,9 +34,9 @@ open class ExecutionScope(val parent: ExecutionScope?, val symbolTable: SymbolTa
                     if (!node.isFinal)
                         values[identifier] = value.copyWith(false)
                     else
-                        throw IllegalStateException("Cannot assign value to $identifier");
+                        throw IllegalStateException("Cannot assign value to $identifier")
                 } else
-                    throw IllegalStateException("Can't modify parameters yet");
+                    throw IllegalStateException("Can't modify parameters yet")
             } else if (parent == null)
                 throw IllegalStateException("Can't find $identifier to modify.")
             else

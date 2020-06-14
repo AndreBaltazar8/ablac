@@ -19,7 +19,6 @@ abstract class ExecutionValue {
         override fun copyWith(final: Boolean): ExecutionValue = Instance(type, scope).apply { isFinal = final }
     }
 
-
     data class ConstSymbol(val symbol: Symbol<*>) : ExecutionValue() {
         override val value: Literal
             get() = throw IllegalStateException("Value cannot be converted to literal")
