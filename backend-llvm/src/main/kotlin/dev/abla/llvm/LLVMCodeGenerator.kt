@@ -9,20 +9,25 @@ interface ILLVMCodeGenerator : ICodeGenerator {
 }
 
 class LLVMCodeGenerator : ILLVMCodeGenerator {
-    private lateinit var module: LLVMModuleRef
+    private lateinit var lastIR: String
 
     override suspend fun generateCode(
         compilationUnits: Collection<CompilationUnit>,
         codeGenParameters: CodeGenParameters
     ) {
-        module = LLVMModuleCreateWithName("main_module")
+        val context = LLVMContextCreate()
+        val module = LLVMModuleCreateWithNameInContext("main_module", context)
         LLVMSetTarget(module, LLVMGetDefaultTargetTriple())
 
         compilationUnits.forEach { it.file.accept(LLVMTypeGenerator(module)) }
         compilationUnits.forEach { it.file.accept(CodeGeneratorVisitor(module)) }
 
         LLVMWriteBitcodeToFile(module, "${codeGenParameters.outputName}.bc")
+
+        lastIR = LLVMPrintModuleToString(module).string
+        LLVMDisposeModule(module)
+        LLVMContextDispose(context)
     }
 
-    override fun getModuleIR(): String = LLVMPrintModuleToString(module).string
+    override fun getModuleIR(): String = lastIR
 }

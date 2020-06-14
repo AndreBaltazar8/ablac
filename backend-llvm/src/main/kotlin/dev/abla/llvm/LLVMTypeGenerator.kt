@@ -10,6 +10,7 @@ import java.util.*
 
 
 class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
+    private val llvmContext = LLVMGetModuleContext(module)
     private val blocks = Stack<LLVMBasicBlockRef>()
     private val functions = Stack<LLVMValueRef>()
     private val typeScopes = Stack<TypeScope>()
@@ -83,7 +84,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     override suspend fun visit(classDeclaration: ClassDeclaration) {
         if (classDeclaration.isCompiler)
             return
-        val struct = LLVMStructCreateNamed(LLVMGetGlobalContext(), classDeclaration.name)
+        val struct = LLVMStructCreateNamed(llvmContext, classDeclaration.name)
         val scope = TypeScope(classDeclaration.name, struct)
         typeScopes.push(scope)
         names.push(classDeclaration.name)
@@ -127,7 +128,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
-        val block = LLVMCreateBasicBlockInContext(LLVMGetGlobalContext(), "entry")
+        val block = LLVMCreateBasicBlockInContext(llvmContext, "entry")
         functionLiteral.llvmBlock = block
         blocks.push(block)
         super.visit(functionLiteral)

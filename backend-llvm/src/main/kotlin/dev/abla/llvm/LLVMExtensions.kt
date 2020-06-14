@@ -33,7 +33,7 @@ fun LLVMModuleRef.registerTypeVtable(
     methods: Array<LLVMValueRef>
 ): LLVMTypeRef {
     val vTableName = "${name}_vtable_type"
-    val struct = LLVMStructCreateNamed(LLVMGetGlobalContext(), vTableName)
+    val struct = LLVMStructCreateNamed(LLVMGetModuleContext(this), vTableName)
     LLVMStructSetBody(struct, PointerPointer(*methodsTypes), methodsTypes.size, 0)
     LLVMAddGlobal(this, struct, vTableName).apply {
         LLVMSetInitializer(this, LLVMConstStruct(PointerPointer(*methods), methods.size, 0))
