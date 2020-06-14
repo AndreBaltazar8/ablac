@@ -24,6 +24,11 @@ class RunnerTest : KoinComponent {
     }
 
     @Test
+    fun testMisc() = runResourceFile("examples/test_misc.ab") {
+        println(it)
+    }
+
+    @Test
     fun testAPI() = runResourceFile("examples/test_api.ab") {
         println(it)
     }
