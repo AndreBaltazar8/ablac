@@ -58,7 +58,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
             val offset = if (hasReceiver) 1 else 0
             if (hasReceiver) {
-                val parameter = (functionDeclaration.symbolTable!!.find("this")!! as Symbol.Variable).node as Parameter
+                val parameter = functionDeclaration.receiverParameter!!
                 val parameterValueRef = LLVMGetParam(function.valueRef, 0)
                 val allocation = LLVMBuildAlloca(builder, argTypes[0], "")
                 LLVMBuildStore(builder, parameterValueRef, allocation)

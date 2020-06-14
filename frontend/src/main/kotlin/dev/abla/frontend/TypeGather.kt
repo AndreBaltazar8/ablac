@@ -42,6 +42,7 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
             if (function.receiver != null) {
                 val parameter = Parameter("this", function.receiver!!.node.toType())
                 table.symbols.add(Symbol.Variable("this", parameter))
+                functionDeclaration.receiverParameter = parameter
             }
 
             val extern = functionDeclaration.isExtern

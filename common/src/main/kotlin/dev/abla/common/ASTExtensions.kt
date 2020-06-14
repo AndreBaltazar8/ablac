@@ -22,10 +22,17 @@ var FunctionDeclaration.symbol: Symbol.Function
     set(value) = Node::symbol.set(this, value)
 var Expression.returnForAssignment: Boolean by BackingField { false }
 var PropertyDeclaration.scope: Scope by BackingField { Scope.Global }
+var FunctionDeclaration.receiverParameter: Parameter? by BackingField.nullable()
 
-// TODO: need to calculate correct receiver and first parameter
 fun FunctionDeclaration.toType(): Type =
-    FunctionType(parameters.toTypedArray(), returnType ?: block?.returnType ?: UserType.Void, null, positionZero)
+    FunctionType(
+        receiverParameter?.let {
+            arrayOf(it, *parameters.toTypedArray())
+        } ?:parameters.toTypedArray(),
+        returnType ?: block?.returnType ?: UserType.Void,
+        receiver,
+        positionZero
+    )
 
 // TODO: need to calculate correct parent
 fun ClassDeclaration.toType(): Type = UserType(name, arrayOf(), null, positionZero)
