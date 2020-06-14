@@ -124,6 +124,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Basic type inference
 - Class instantiation with simple variables
 - Calls to external libraries
+- Extension functions
 - compile-time execution for all available features with interpretation execution
 
 ### To Do
@@ -143,7 +144,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Type checking everything
 - Class object allocation
 - Class construction with proper constructors
-- Extension functions
+- Extension properties
 - Variable declarations with type check (in functions, globally and class fields)
 - Type inference algorithm
 - Send values to lambdas and other scopes
