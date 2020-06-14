@@ -22,7 +22,16 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         val function = Symbol.Function(functionDeclaration.name, functionDeclaration)
         tables.peek().symbols.add(function)
-        if (currentScope == Scope.Class) {
+
+        val receiverType = functionDeclaration.receiver
+        if (receiverType != null) {
+            if (receiverType !is UserType) // TODO: support other types. This will still crash for builtin UserTypes
+                throw Exception("Not supported")
+            val symbol = tables.peek().find(receiverType.identifier)
+            if (symbol !is Symbol.Class)
+                throw Exception("Expecting class symbol")
+            function.receiver = symbol
+        } else if (currentScope == Scope.Class) {
             val classSymbol = classScopes.peek()
             classSymbol.methods.add(function)
             function.receiver = classSymbol

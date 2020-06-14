@@ -21,8 +21,10 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
         val name = names.plus(functionDeclaration.name).joinToString("%")
 
-        val classType = if (!typeScopes.empty() && functionDeclaration.symbol.receiver != null)
-            LLVMPointerType(typeScopes.peek().type, 0)
+        val receiver = functionDeclaration.symbol.receiver
+        val hasReceiver = receiver != null
+        val classType = if (receiver != null)
+            LLVMPointerType(receiver.node.struct, 0)
         else
             null
 
@@ -54,8 +56,8 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
             val builder = functionDeclaration.llvmBlock!!.createBuilderAtEnd()
 
-            val offset = if (typeScopes.empty()) 0 else 1
-            if (!typeScopes.empty()) {
+            val offset = if (hasReceiver) 1 else 0
+            if (hasReceiver) {
                 val parameter = (functionDeclaration.symbolTable!!.find("this")!! as Symbol.Variable).node as Parameter
                 val parameterValueRef = LLVMGetParam(function.valueRef, 0)
                 val allocation = LLVMBuildAlloca(builder, argTypes[0], "")

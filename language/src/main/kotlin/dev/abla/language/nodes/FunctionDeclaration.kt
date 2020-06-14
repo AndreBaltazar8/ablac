@@ -10,6 +10,7 @@ open class FunctionDeclaration(
     var returnType: Type?,
     var modifiers: MutableList<Modifier>,
     var annotations: MutableList<Annotation>,
+    var receiver: Type?,
     override val position: Position
 ) : Statement {
     val isExtern get() = modifiers.any { it is Extern }

@@ -32,6 +32,7 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
         type()?.toAST(),
         modifierList()?.modifier()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         modifierList()?.annotations()?.annotation()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
+        functionTypeReceiver()?.toAST(),
         position
     )
 
