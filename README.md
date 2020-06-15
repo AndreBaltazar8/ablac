@@ -123,6 +123,7 @@ These the current and planned features for the language. It is not exhaustive li
 - `when` expressions
 - Basic type inference
 - Class instantiation with simple variables
+- Class method calls (no vtable)
 - Calls to external libraries
 - Extension functions
 - compile-time execution for all available features with interpretation execution
@@ -140,7 +141,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Add operators and comparisons for all types
 - Loops (for, do-while)
 - Add simple build-in types (string, int)
-- Function calls to defined types/classes (direct and vtable)
+- Virtual methods for polymorphism and overrides
 - Type checking everything
 - Class object allocation
 - Class construction with proper constructors
