@@ -122,7 +122,9 @@ class ExecutionVisitor(
                 "setBody",
                 mutableListOf(Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
             ) { _, args ->
-                functionDeclaration.block = (args[0] as FunctionLiteral).block.copy()
+                val block = (args[0] as FunctionLiteral).block.copy()
+                block.symbolTable = (args[0] as FunctionLiteral).block.symbolTable // TODO: compute a better symbol table for this
+                functionDeclaration.block = block
                 ExecutionValue.Value(Integer("1", positionZero))
             }
             replaceFunction(
@@ -176,8 +178,11 @@ class ExecutionVisitor(
             object : ExecutionScope(null, currentTable!!) {
                 override fun modify(identifier: String, value: ExecutionValue) {
                     super.modify(identifier, value)
-                    if (identifier == "block")
-                        sym.node.block = (value as ExecutionValue.CompilerNode).node as Block
+                    if (identifier == "block") {
+                        val block = (value as ExecutionValue.CompilerNode).node as Block
+                        block.symbolTable = sym.node.block!!.symbolTable // TODO: compute better symbol table
+                        sym.node.block = block
+                    }
                 }
             }.apply {
                 set("block", ExecutionValue.CompilerNode(sym.node.block!!))
