@@ -91,4 +91,8 @@ abstract class ASTVisitor {
             it.body.accept(this)
         }
     }
+
+    open suspend fun visit(arrayLiteral: ArrayLiteral) {
+        arrayLiteral.elements.forEach { it.accept(this) }
+    }
 }

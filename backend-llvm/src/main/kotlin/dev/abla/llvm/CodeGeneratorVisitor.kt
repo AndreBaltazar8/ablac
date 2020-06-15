@@ -463,6 +463,18 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         }
     }
 
+    override suspend fun visit(arrayLiteral: ArrayLiteral) {
+        generatorContext.topBlock.createBuilderAtEnd { builder ->
+            val arrayType = LLVMArrayType(LLVMInt32Type(), arrayLiteral.elements.size)
+            val size = LLVMConstInt(LLVMInt32Type(), 1, 1)
+            val value = LLVMBuildArrayAlloca(builder, arrayType, size, "")
+            val ptr = LLVMBuildBitCast(builder, value, LLVMPointerType(LLVMInt32Type(), 0), "")
+            // TODO: build GEP to set values here!
+            generatorContext.values.push(GeneratorContext.Value(UserType("array", arrayOf(UserType.Int)), ptr))
+        }
+
+    }
+
     private val Type.classSymbol: Symbol.Class
         get() {
             if (this !is UserType)

@@ -16,6 +16,8 @@ LCURL : '{' -> pushMode(DEFAULT_MODE) ;
 RCURL : '}' -> popMode;
 LPAREN : '(' ;
 RPAREN : ')' ;
+LSQUARE : '[' ;
+RSQUARE : ']' ;
 ARROW : '->' ;
 FUN : 'fun' ;
 SEMICOLON : ';' ;

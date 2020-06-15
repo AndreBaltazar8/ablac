@@ -27,6 +27,8 @@ fun Type.llvmType(symbolTable: SymbolTable): LLVMTypeRef = when {
         ),
         0
     )
+    this is UserType && this.identifier == "array" ->
+        LLVMPointerType((if (types.size == 1) types[0] else UserType.Any).llvmType(symbolTable), 0)
     this == UserType.String -> LLVMPointerType(LLVMInt8Type(), 0)
     this == UserType.Int -> LLVMInt32Type()
     this == UserType.Void -> LLVMVoidType()

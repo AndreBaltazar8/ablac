@@ -330,8 +330,11 @@ fun AblaParser.LiteralContext.toAST(): Literal =
     when (this) {
         is AblaParser.IntegerLiteralContext -> Integer(text, position)
         is AblaParser.StringLiteralLiteralContext -> stringLiteral().toAST()
+        is AblaParser.ArrayLiteralContext -> toAST()
         else -> throw IllegalStateException("Unknown literal type ${this::class.simpleName}")
     }
+
+fun AblaParser.ArrayLiteralContext.toAST() = ArrayLiteral(expression().map { it.toAST() }.toMutableList(), position)
 
 fun AblaParser.FunctionLiteralContext.toAST() =
     FunctionLiteral(
