@@ -132,6 +132,7 @@ prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
 
 postfixUnarySuffix : callSuffix
                    | navigationSuffix
+                   | indexSuffix
                    ;
 
 callSuffix : typeArguments? valueArguments? {this.matchNoLineTerminator()}? functionLiteral
@@ -140,6 +141,9 @@ callSuffix : typeArguments? valueArguments? {this.matchNoLineTerminator()}? func
 
 navigationSuffix : DOT simpleIdentifier
                  ;
+
+indexSuffix : LSQUARE startIndex=expression (COMMA endIndex=expression)? RSQUARE
+            ;
 
 valueArguments : {this.matchNoLineTerminator()}? LPAREN RPAREN
                | {this.matchNoLineTerminator()}? LPAREN valueArgument (COMMA valueArgument)* COMMA? RPAREN

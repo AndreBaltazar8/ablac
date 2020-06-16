@@ -95,4 +95,10 @@ abstract class ASTVisitor {
     open suspend fun visit(arrayLiteral: ArrayLiteral) {
         arrayLiteral.elements.forEach { it.accept(this) }
     }
+
+    open suspend fun visit(indexAccess: IndexAccess) {
+        indexAccess.expression.accept(this)
+        indexAccess.startIndex.accept(this)
+        indexAccess.endIndex?.accept(this)
+    }
 }

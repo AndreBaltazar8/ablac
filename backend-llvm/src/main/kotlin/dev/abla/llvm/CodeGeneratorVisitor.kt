@@ -469,10 +469,29 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             val size = LLVMConstInt(LLVMInt32Type(), 1, 1)
             val value = LLVMBuildArrayAlloca(builder, arrayType, size, "")
             val ptr = LLVMBuildBitCast(builder, value, LLVMPointerType(LLVMInt32Type(), 0), "")
-            // TODO: build GEP to set values here!
+            for ((index, element) in arrayLiteral.elements.withIndex()) {
+                element.accept(this)
+                val indexPtr = LLVMBuildInBoundsGEP(builder, value, PointerPointer(LLVMConstInt(LLVMInt32Type(), 0, 1), LLVMConstInt(LLVMInt32Type(), index.toLong(), 1)), 2, "")
+                LLVMBuildStore(builder, generatorContext.topValuePop.ref, indexPtr)
+            }
             generatorContext.values.push(GeneratorContext.Value(UserType("array", arrayOf(UserType.Int)), ptr))
         }
+    }
 
+    override suspend fun visit(indexAccess: IndexAccess) {
+        generatorContext.topBlock.createBuilderAtEnd { builder ->
+            // TODO: support actually getting arrays from this with endIndex
+            indexAccess.startIndex.accept(this)
+            val index = generatorContext.topValuePop.ref
+            indexAccess.expression.accept(this)
+            val arrayToAccess = generatorContext.topValuePop
+            val arrayType = arrayToAccess.type as UserType
+            val const = LLVMConstInt(LLVMInt32Type(), 2, 1)
+            // TODO: figure out how to access other indexes of the array
+            val indexPtr = LLVMBuildGEP(builder, arrayToAccess.ref, PointerPointer<LLVMValueRef>(const), 0, "")
+            val value = LLVMBuildLoad(builder, indexPtr, "")
+            generatorContext.values.push(GeneratorContext.Value(arrayType.types[0], value))
+        }
     }
 
     private val Type.classSymbol: Symbol.Class

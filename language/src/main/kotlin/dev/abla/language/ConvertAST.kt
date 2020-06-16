@@ -210,6 +210,14 @@ fun AblaParser.NavigationSuffixContext.toAST(expression: Expression) =
         position
     )
 
+fun AblaParser.IndexSuffixContext.toAST(expression: Expression) =
+    IndexAccess(
+        expression,
+        startIndex.toAST(),
+        endIndex?.toAST(),
+        position
+    )
+
 fun AblaParser.ValueArgumentContext.toAST() =
     Argument(simpleIdentifier()?.text, expression().toAST(), position)
 
@@ -321,7 +329,8 @@ fun AblaParser.WhenCaseContext.toAST(): WhenExpression.Case =
 
 fun AblaParser.PostfixUnarySuffixContext.toAST(expression: Expression) =
     callSuffix()?.toAST(expression) ?:
-        navigationSuffix()?.toAST(expression) ?:
+    navigationSuffix()?.toAST(expression) ?:
+    indexSuffix()?.toAST(expression) ?:
         throw IllegalStateException("Unknown postfix unary suffix type ${this::class.simpleName}")
 
 fun AblaParser.SimpleIdentifierContext.toAST(): IdentifierExpression = IdentifierExpression(text, position)
