@@ -116,6 +116,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Basic operators and comparison for int
 - Basic support for if-else expressions/statements
 - Basic variable declarations
+- Basic array support
 - Hardcoded function lambda functionality
 - Import new file
 - Parallel processing of imported files
