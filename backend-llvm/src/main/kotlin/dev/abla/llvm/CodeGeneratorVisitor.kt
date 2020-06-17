@@ -4,6 +4,7 @@ import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
+import org.bytedeco.javacpp.BytePointer
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.LLVMModuleRef
 import org.bytedeco.llvm.LLVM.LLVMTypeRef
@@ -486,11 +487,9 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             indexAccess.expression.accept(this)
             val arrayToAccess = generatorContext.topValuePop
             val arrayType = arrayToAccess.type as UserType
-            val const = LLVMConstInt(LLVMInt32Type(), 2, 1)
-            // TODO: figure out how to access other indexes of the array
-            val indexPtr = LLVMBuildGEP(builder, arrayToAccess.ref, PointerPointer<LLVMValueRef>(const), 0, "")
-            val value = LLVMBuildLoad(builder, indexPtr, "")
-            generatorContext.values.push(GeneratorContext.Value(arrayType.types[0], value))
+            val indexPtr = LLVMBuildGEP(builder, arrayToAccess.ref, index, 1, BytePointer(""))
+            val finalValue = if (indexAccess.returnForAssignment) indexPtr else LLVMBuildLoad(builder, indexPtr, "")
+            generatorContext.values.push(GeneratorContext.Value(arrayType.types[0], finalValue))
         }
     }
 
