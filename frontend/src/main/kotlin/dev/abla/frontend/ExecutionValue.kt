@@ -50,6 +50,19 @@ abstract class ExecutionValue {
         override fun copyWith(final: Boolean): ExecutionValue = Pointer(pointer).apply { isFinal = final }
     }
 
+    data class Array(val values: MutableList<ExecutionValue>) : ExecutionValue() {
+        override val value: Literal
+            get() = throw IllegalStateException("Value cannot be converted to literal")
+
+        override fun copyWith(final: Boolean): ExecutionValue = Array(values).apply { isFinal = final }
+
+        operator fun set(index: Int, value: ExecutionValue) {
+            values[index] = value
+        }
+
+        operator fun get(index: Int) = values[index]
+    }
+
     abstract val value: Literal
     var isFinal: Boolean = true
 }

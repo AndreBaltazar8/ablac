@@ -261,6 +261,16 @@ class ExecutionVisitor(
             values.add(ExecutionValue.Value(integer))
     }
 
+    override suspend fun visit(arrayLiteral: ArrayLiteral) {
+        if (executionLayer > 0)
+            values.add(ExecutionValue.Array(arrayLiteral.elements.map {
+                it.accept(this)
+                values.pop()
+            }.toMutableList()))
+        else
+            super.visit(arrayLiteral)
+    }
+
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         if (executionLayer > 0)
             values.add(ExecutionValue.Value(functionLiteral))
@@ -472,6 +482,25 @@ class ExecutionVisitor(
             super.visit(whenExpression)
     }
 
+    override suspend fun visit(indexAccess: IndexAccess) {
+        if (executionLayer > 0) {
+            indexAccess.startIndex.accept(this)
+            val arrayIndex = values.pop() as ExecutionValue.Value
+            indexAccess.expression.accept(this)
+            val array = values.pop() as ExecutionValue.Array
+            val index = arrayIndex.value.toValue(currentScope!!) as Int
+            if (indexAccess.returnForAssignment) {
+                // Might not actually work
+                values.push(ExecutionValue.AssignableValue {
+                    array[index] = it
+                })
+            } else {
+                values.push(array[index])
+            }
+        } else
+            super.visit(indexAccess)
+    }
+
     /*
      * TODO: Forcing everything to join here. Maybe a solution could be found to force execution only until the type
      *  that we are looking for is found. This makes it continue to execute normally without being blocked
@@ -512,6 +541,7 @@ class ExecutionVisitor(
                 }.joinToString("")
             }
             is FunctionLiteral -> this
+            is ArrayLiteral -> this
             else -> throw Exception("Unknown literal conversion")
         }
 
