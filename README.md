@@ -141,7 +141,8 @@ These the current and planned features for the language. It is not exhaustive li
   * Creating a new built-in type that allows automatic conversion between `const char*` and `string` implementation in abla
 - Add operators and comparisons for all types
 - Loops (for, do-while)
-- Add simple build-in types (string, int)
+- Add simple built-in types (string, int)
+- Support extensions for built-in types
 - Virtual methods for polymorphism and overrides
 - Type checking everything
 - Class object allocation
