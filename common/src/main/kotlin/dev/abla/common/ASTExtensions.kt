@@ -44,6 +44,10 @@ val Expression.inferredType: Type?
         is FunctionLiteral -> FunctionType(arrayOf(), UserType.Int, null, position)
         is Integer -> UserType.Int
         is StringLiteral -> UserType.String
+        is ArrayLiteral -> if (elements.isNotEmpty())
+            UserType("array", arrayOf(elements[0].inferredType!!))
+        else
+            throw Exception("Cannot infer array type")
         is FunctionCall -> when(val returnType = expression.inferredType) {
             is FunctionType -> returnType.returnType
             else -> throw Exception("Call on non function type?")
@@ -57,6 +61,7 @@ val Expression.inferredType: Type?
         }
         is BinaryOperation -> rhs.inferredType
         is CompilerExec -> expression.inferredType
+        is IndexAccess -> (expression.inferredType as UserType).types[0]
         else -> throw Exception("Conversion not implemented")
     }
 val Block.returnType: Type?
