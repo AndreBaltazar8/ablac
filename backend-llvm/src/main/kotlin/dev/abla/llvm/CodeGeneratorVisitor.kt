@@ -161,11 +161,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     override suspend fun visit(memberAccess: MemberAccess) {
         super.visit(memberAccess)
         val classType = generatorContext.topValue.type
-        if (classType !is UserType)
-            throw NotImplementedError("Unsupported")
-        val symbol = generatorContext.topBlock.table.find(classType.identifier)
-        if (symbol !is Symbol.Class)
-            throw NotImplementedError("Unsupported")
+        val symbol = classType.classSymbol
         generatorContext.withBlock(generatorContext.topBlock.block, symbol.node.symbolTable!!) {
             IdentifierExpression(memberAccess.name, memberAccess.position).apply {
                 returnForAssignment = memberAccess.returnForAssignment
@@ -481,8 +477,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(indexAccess: IndexAccess) {
         generatorContext.topBlock.createBuilderAtEnd { builder ->
-            // TODO: support actually getting arrays from this with endIndex
-            indexAccess.startIndex.accept(this)
+            indexAccess.index.accept(this)
             val index = generatorContext.topValuePop.ref
             indexAccess.expression.accept(this)
             val arrayToAccess = generatorContext.topValuePop

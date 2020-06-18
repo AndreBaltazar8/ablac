@@ -484,13 +484,12 @@ class ExecutionVisitor(
 
     override suspend fun visit(indexAccess: IndexAccess) {
         if (executionLayer > 0) {
-            indexAccess.startIndex.accept(this)
+            indexAccess.index.accept(this)
             val arrayIndex = values.pop() as ExecutionValue.Value
             indexAccess.expression.accept(this)
             val array = values.pop() as ExecutionValue.Array
             val index = arrayIndex.value.toValue(currentScope!!) as Int
             if (indexAccess.returnForAssignment) {
-                // Might not actually work
                 values.push(ExecutionValue.AssignableValue {
                     array[index] = it
                 })

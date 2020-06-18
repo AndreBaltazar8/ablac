@@ -97,8 +97,7 @@ abstract class ASTVisitor {
     }
 
     open suspend fun visit(indexAccess: IndexAccess) {
-        indexAccess.startIndex.accept(this)
-        indexAccess.endIndex?.accept(this)
+        indexAccess.index.accept(this)
         indexAccess.expression.accept(this)
     }
 }

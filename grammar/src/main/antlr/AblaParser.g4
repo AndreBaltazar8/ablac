@@ -142,7 +142,7 @@ callSuffix : typeArguments? valueArguments? {this.matchNoLineTerminator()}? func
 navigationSuffix : DOT simpleIdentifier
                  ;
 
-indexSuffix : LSQUARE startIndex=expression (COMMA endIndex=expression)? RSQUARE
+indexSuffix : LSQUARE index=expression RSQUARE
             ;
 
 valueArguments : {this.matchNoLineTerminator()}? LPAREN RPAREN

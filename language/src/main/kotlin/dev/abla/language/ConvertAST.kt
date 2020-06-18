@@ -213,8 +213,7 @@ fun AblaParser.NavigationSuffixContext.toAST(expression: Expression) =
 fun AblaParser.IndexSuffixContext.toAST(expression: Expression) =
     IndexAccess(
         expression,
-        startIndex.toAST(),
-        endIndex?.toAST(),
+        index.toAST(),
         position
     )
 

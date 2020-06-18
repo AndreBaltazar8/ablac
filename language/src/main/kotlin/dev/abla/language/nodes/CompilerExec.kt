@@ -8,6 +8,6 @@ class CompilerExec(
     override val position: Position
 ) : Expression {
     override suspend fun accept(visitor: ASTVisitor) {
-        visitor.visit(this);
+        visitor.visit(this)
     }
 }
