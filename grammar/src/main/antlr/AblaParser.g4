@@ -81,8 +81,9 @@ statement : expression
           | functionDeclaration
           ;
 
-whileStatement : WHILE LPAREN condition=expression RPAREN (controlStructureBody | SEMICOLON) ;
-
+whileStatement : WHILE LPAREN condition=expression RPAREN (controlStructureBody | SEMICOLON)
+               | DO (controlStructureBody | SEMICOLON) WHILE LPAREN condition=expression RPAREN
+               ;
 propertyDeclaration : modifierList? (VAR | VAL) variableDeclaration (ASSIGNMENT expression)? ;
 
 variableDeclaration : simpleIdentifier (COLON type)? ;

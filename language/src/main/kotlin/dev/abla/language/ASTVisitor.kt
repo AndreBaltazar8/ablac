@@ -1,6 +1,7 @@
 package dev.abla.language
 
 import dev.abla.language.nodes.*
+import dev.abla.utils.statementOrder
 
 abstract class ASTVisitor {
     open suspend fun visit(file: File) {
@@ -75,8 +76,11 @@ abstract class ASTVisitor {
     }
 
     open suspend fun visit(whileStatement: WhileStatement) {
-        whileStatement.condition.accept(this)
-        whileStatement.block.accept(this)
+        statementOrder(
+            whileStatement.doWhile,
+            { whileStatement.condition.accept(this) },
+            { whileStatement.block.accept(this) }
+        )
     }
 
     open suspend fun visit(memberAccess: MemberAccess) {

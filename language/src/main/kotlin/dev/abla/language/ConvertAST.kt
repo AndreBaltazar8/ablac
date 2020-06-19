@@ -172,6 +172,7 @@ fun AblaParser.WhileStatementContext.toAST(): WhileStatement =
     WhileStatement(
         condition.toAST(),
         controlStructureBody().toAST(),
+        DO() != null,
         position
     )
 

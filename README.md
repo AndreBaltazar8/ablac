@@ -120,7 +120,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Hardcoded function lambda functionality
 - Import new file
 - Parallel processing of imported files
-- `while` loops
+- `while`, `do-while` loops
 - `when` expressions
 - Basic type inference
 - Class instantiation with simple variables
@@ -140,7 +140,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Support `const char*` from C as native type that can be used in abla even though strings in abla will probably not be simple null-terminated strings
   * Creating a new built-in type that allows automatic conversion between `const char*` and `string` implementation in abla
 - Add operators and comparisons for all types
-- Loops (for, do-while)
+- Loops (for)
 - Add simple built-in types (string, int)
 - Support extensions for built-in types
 - Virtual methods for polymorphism and overrides

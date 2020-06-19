@@ -4,6 +4,7 @@ import dev.abla.common.*
 import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
+import dev.abla.utils.statementOrder
 import org.bytedeco.javacpp.BytePointer
 import org.bytedeco.javacpp.PointerPointer
 import org.bytedeco.llvm.LLVM.LLVMModuleRef
@@ -379,25 +380,31 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val continuationBlock = whileStatement.llvmContBlock!!
 
         generatorContext.topBlock.createBuilderAtEnd { builder ->
-            LLVMBuildBr(builder, conditionBlock)
+            LLVMBuildBr(builder, if (whileStatement.doWhile) mainBlock else conditionBlock)
         }
 
-        // Condition block
-        generatorContext.withBlock(conditionBlock, generatorContext.topBlock.table) {
-            whileStatement.condition.accept(this@CodeGeneratorVisitor)
-            val condition = generatorContext.topValuePop
-            createBuilderAtEnd { builder ->
-                LLVMBuildCondBr(builder, condition.ref, mainBlock, continuationBlock)
+        statementOrder(
+            whileStatement.doWhile,
+            {
+                // Condition block
+                generatorContext.withBlock(conditionBlock, generatorContext.topBlock.table) {
+                    whileStatement.condition.accept(this@CodeGeneratorVisitor)
+                    val condition = generatorContext.topValuePop
+                    createBuilderAtEnd { builder ->
+                        LLVMBuildCondBr(builder, condition.ref, mainBlock, continuationBlock)
+                    }
+                }
+            },
+            {
+                // Main block
+                generatorContext.withBlock(mainBlock, whileStatement.block.symbolTable!!) {
+                    whileStatement.block.accept(this@CodeGeneratorVisitor)
+                    createBuilderAtEnd { builder ->
+                        LLVMBuildBr(builder, conditionBlock)
+                    }
+                }
             }
-        }
-
-        // Main block
-        generatorContext.withBlock(mainBlock, whileStatement.block.symbolTable!!) {
-            whileStatement.block.accept(this@CodeGeneratorVisitor)
-            createBuilderAtEnd { builder ->
-                LLVMBuildBr(builder, conditionBlock)
-            }
-        }
+        )
 
         // Continuation block
         generatorContext.pushReplaceBlock(continuationBlock, generatorContext.topBlock.table)

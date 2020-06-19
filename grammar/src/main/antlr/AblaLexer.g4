@@ -31,6 +31,7 @@ IF : 'if' ;
 ELSE : 'else' ;
 VAR : 'var' ;
 VAL : 'val' ;
+DO : 'do' ;
 WHILE : 'while' ;
 WHEN : 'when' ;
 QUEST : '?' ;

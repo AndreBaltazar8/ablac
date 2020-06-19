@@ -7,6 +7,7 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
 import dev.abla.utils.BackingField
+import dev.abla.utils.statementOrder
 import kotlinx.coroutines.Job
 import java.lang.IllegalStateException
 import java.nio.file.FileSystems
@@ -430,17 +431,28 @@ class ExecutionVisitor(
 
     override suspend fun visit(whileStatement: WhileStatement) {
         if (executionLayer > 0) {
-                while (true) {
-                    whileStatement.condition.accept(this)
+            var finished = false
+            while (!finished) {
+                statementOrder(
+                    whileStatement.doWhile,
+                    {
+                        whileStatement.condition.accept(this)
 
-                    val conditionValue = values.pop().value.toValue(currentScope!!)
-                    val conditionTrue = conditionValue as Int == 1
+                        val conditionValue = values.pop().value.toValue(currentScope!!)
+                        val conditionTrue = conditionValue as Int == 1
 
-                    if (!conditionTrue)
-                        return
-
-                    whileStatement.block.accept(this)
-                }
+                        if (!conditionTrue) {
+                            finished = true
+                            return@statementOrder
+                        }
+                    },
+                    {
+                        if (finished)
+                            return@statementOrder
+                        whileStatement.block.accept(this)
+                    }
+                )
+            }
         } else
             super.visit(whileStatement)
     }
