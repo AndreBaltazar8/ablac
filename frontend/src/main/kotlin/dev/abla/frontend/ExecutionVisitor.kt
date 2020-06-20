@@ -146,6 +146,10 @@ class ExecutionVisitor(
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
                 createCompileFunctionContext(sym)
             }
+            replaceFunction("findClass", mutableListOf(Parameter("className", UserType.String))) { _, args ->
+                val sym = symbol.node.symbolTable!!.find(args[0] as String)
+                createCompileClassContext(sym)
+            }
             replaceFunction("findAnnotated", mutableListOf(Parameter("annotation", UserType.String))) { _, args ->
                 val annotationName = args[0] as String
                 val symbolTable = symbol.node.symbolTable!!
@@ -173,7 +177,7 @@ class ExecutionVisitor(
 
     private fun createCompileFunctionContext(sym: Symbol<*>?): ExecutionValue.Instance {
         if (sym !is Symbol.Function)
-            throw Exception("Not a method")
+            throw Exception("Not a function")
 
         return ExecutionValue.Instance(UserType("CompilerFunctionContext"),
             object : ExecutionScope(null, currentTable!!) {
@@ -189,6 +193,13 @@ class ExecutionVisitor(
                 set("block", ExecutionValue.CompilerNode(sym.node.block!!))
             }
         )
+    }
+
+    private fun createCompileClassContext(sym: Symbol<*>?): ExecutionValue.Instance {
+        if (sym !is Symbol.Class)
+            throw Exception("Not a class")
+
+        return ExecutionValue.Instance(UserType("CompilerClassContext"), ExecutionScope(null, currentTable!!))
     }
 
     private suspend fun findClassSymbol(className: String): Symbol.Class {
