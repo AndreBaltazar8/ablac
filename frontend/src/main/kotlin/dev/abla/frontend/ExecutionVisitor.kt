@@ -114,7 +114,7 @@ class ExecutionVisitor(
         val symbol = findClassSymbol("CompilerContext")
 
         symbol.node.symbolTable!!.symbols.apply {
-            replaceFunction("rename", mutableListOf(Parameter("fnName", UserType.String))) { _, args ->
+            replaceFunction("rename", mutableListOf(Parameter("fnName", UserType.String))) { _, args, _ ->
                 functionDeclaration.name = args[0] as String
                 functionDeclaration.symbol.name = args[0] as String
                 ExecutionValue.Value(Integer("1", positionZero))
@@ -122,7 +122,7 @@ class ExecutionVisitor(
             replaceFunction(
                 "setBody",
                 mutableListOf(Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
-            ) { _, args ->
+            ) { _, args, _ ->
                 val block = (args[0] as FunctionLiteral).block.copy()
                 block.symbolTable = (args[0] as FunctionLiteral).block.symbolTable // TODO: compute a better symbol table for this
                 functionDeclaration.block = block
@@ -134,7 +134,7 @@ class ExecutionVisitor(
                     Parameter("fnName", UserType.String),
                     Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero))
                 )
-            ) { _, args ->
+            ) { _, args, _ ->
                 val sym = functionDeclaration.symbolTable!!.find(args[0] as String)
                 if (sym !is Symbol.Function)
                     throw Exception("Not a method")
@@ -142,15 +142,15 @@ class ExecutionVisitor(
                 sym.node.block!!.symbolTable = sym.node.symbolTable
                 ExecutionValue.Value(Integer("1", positionZero))
             }
-            replaceFunction("find", mutableListOf(Parameter("fnName", UserType.String))) { _, args ->
+            replaceFunction("find", mutableListOf(Parameter("fnName", UserType.String))) { _, args, _ ->
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
                 createCompileFunctionContext(sym)
             }
-            replaceFunction("findClass", mutableListOf(Parameter("className", UserType.String))) { _, args ->
+            replaceFunction("findClass", mutableListOf(Parameter("className", UserType.String))) { _, args, _ ->
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
                 createCompileClassContext(sym)
             }
-            replaceFunction("findAnnotated", mutableListOf(Parameter("annotation", UserType.String))) { _, args ->
+            replaceFunction("findAnnotated", mutableListOf(Parameter("annotation", UserType.String))) { _, args, _ ->
                 val annotationName = args[0] as String
                 val symbolTable = symbol.node.symbolTable!!
                 val sym = symbolTable.findFunction { it.node.annotations.any { annotation -> annotation.name == annotationName } }
@@ -159,7 +159,7 @@ class ExecutionVisitor(
             replaceFunction(
                 "defineInClass",
                 mutableListOf(Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
-            ) { _, args ->
+            ) { _, args, _ ->
                 (args[0] as FunctionLiteral).block.statements.filterIsInstance<FunctionDeclaration>().forEach { func ->
                     val classSymbol = functionDeclaration.symbol.receiver!!
                     val functionSymbol = Symbol.Function(func.name, func)
@@ -196,11 +196,39 @@ class ExecutionVisitor(
         )
     }
 
-    private fun createCompileClassContext(sym: Symbol<*>?): ExecutionValue.Instance {
+    private suspend fun createCompileClassContext(sym: Symbol<*>?): ExecutionValue.Instance {
         if (sym !is Symbol.Class)
             throw Exception("Not a class")
 
-        return ExecutionValue.Instance(UserType("CompilerClassContext"), ExecutionScope(null, currentTable!!))
+        val symbol = findClassSymbol("CompilerClassContext")
+        symbol.node.symbolTable!!.symbols.apply {
+            replaceFunction("annotation") { _, _, typeArgs ->
+                val annotation = sym.node.annotations.firstOrNull { it.name == typeArgs[0].toHuman() }
+                    ?: throw Exception("Unknown annotation ${typeArgs[0]}") // TODO: find this a better way
+
+                val annotationClassSymbol = findClassSymbol(annotation.name)
+
+                val instance = ExecutionValue.Instance(typeArgs[0], ExecutionScope(null, annotationClassSymbol.node.symbolTable!!))
+                annotation.arguments.forEach { it.value.accept(this@ExecutionVisitor) }
+                annotationClassSymbol.node.constructor?.parameters?.reversed()?.forEach { param ->
+                    when (param) {
+                        is PropertyDeclaration -> instance.scope[param.name] = values.pop().copyWith(param.isFinal)
+                        is Parameter -> instance.scope[param.name] = values.pop().copyWith(false)
+                        else -> throw Exception("Unsupported")
+                    }
+                }
+                annotationClassSymbol.node.symbol.fields.forEach { field ->
+                    val property = field.node as PropertyDeclaration
+                    if (property.value == null)
+                        return@forEach
+                    property.value?.accept(this@ExecutionVisitor)
+                    instance.scope[property.name] = values.pop().copyWith(property.isFinal)
+                }
+                instance
+            }
+        }
+
+        return ExecutionValue.Instance(UserType("CompilerClassContext"), ExecutionScope(null, symbol.node.symbolTable!!))
     }
 
     private suspend fun findClassSymbol(className: String): Symbol.Class {
@@ -313,11 +341,17 @@ class ExecutionVisitor(
                 when (it) {
                     is CompilerFunctionDeclaration -> {
                         // TODO: support passing instances to compiler functions
+                        // TODO: support void functions at compile time
                         if (functionCall.expression is MemberAccess)
                             values.pop()
-                        values.add(it.executionBlock(this, functionCall.arguments.reversed().map {
-                            values.pop().value.toValue(currentScope!!)
-                        }.reversed().toTypedArray()))
+                        val returnValue = it.executionBlock(
+                            this,
+                            functionCall.arguments.reversed().map {
+                                values.pop().value.toValue(currentScope!!)
+                            }.reversed().toTypedArray(),
+                            functionCall.typeArgs.toTypedArray()
+                        )
+                        values.add(returnValue)
                     }
                     is FunctionLiteral -> {
                         val numValues = values.size
@@ -600,10 +634,11 @@ private fun MutableList<Symbol<*>>.replaceFunction(
     name: String,
     parameters: MutableList<Parameter> = mutableListOf(),
     modifiers: MutableList<Modifier> = mutableListOf(),
-    executionBlock: suspend (ExecutionVisitor, Array<Any>) -> ExecutionValue
+    typeParameters: MutableList<TypeDefParam> = mutableListOf(),
+    executionBlock: suspend (ExecutionVisitor, Array<Any>, Array<Type>) -> ExecutionValue
 ) {
     val finalModifiers = modifiers.toMutableList().apply { add(ModCompiler(positionZero)) }
-    val function = CompilerFunctionDeclaration(name, parameters, finalModifiers, executionBlock)
+    val function = CompilerFunctionDeclaration(name, parameters, finalModifiers, typeParameters, executionBlock)
     removeAll { symbol -> symbol.name == name }
     add(Symbol.Function(name, function))
 }

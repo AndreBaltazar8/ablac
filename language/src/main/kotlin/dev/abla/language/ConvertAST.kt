@@ -49,6 +49,7 @@ fun AblaParser.ClassDeclarationContext.toAST() =
     ClassDeclaration(
         className.text,
         modifierList()?.modifier()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
+        modifierList()?.annotations()?.annotation()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         primaryConstructor()?.toAST(),
         classBody()?.classMemberDeclaration()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         position

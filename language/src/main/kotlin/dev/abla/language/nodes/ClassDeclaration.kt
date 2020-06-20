@@ -6,6 +6,7 @@ import dev.abla.language.Position
 open class ClassDeclaration(
     var name: String,
     var modifiers: MutableList<Modifier>,
+    var annotations: MutableList<Annotation>,
     var constructor: ClassConstructor?,
     var declarations: MutableList<Declaration>,
     override val position: Position

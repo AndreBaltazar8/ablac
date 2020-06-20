@@ -122,7 +122,7 @@ class CompileService(
     }
 
     init {
-        addCompileFunction("import", mutableListOf(Parameter("fileName", UserType.String))) { executionVisitor, args ->
+        addCompileFunction("import", mutableListOf(Parameter("fileName", UserType.String))) { executionVisitor, args, _ ->
             val importName = args[0] as String
             val file = Paths.get(executionVisitor.workingDirectory, importName).toAbsolutePath().toString()
 
@@ -136,7 +136,7 @@ class CompileService(
         }
 
         // TODO: Remove. This is just an example on how to declare functions from compiler
-        addCompileFunction("declareFun", mutableListOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))) { executionVisitor, args ->
+        addCompileFunction("declareFun", mutableListOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))) { executionVisitor, args, _ ->
             val name = "declared<$compileNumber>"
             compile(name, false, true, CompilationContext(executionVisitor.executionJob, Job(executionVisitor.executionJob))) {
                 File(name, mutableListOf(FunctionDeclaration(args[0] as String, mutableListOf(), (args[1] as FunctionLiteral).block, UserType.Int, mutableListOf(), mutableListOf(), null, mutableListOf(), positionZero)), positionZero)
@@ -150,12 +150,13 @@ class CompileService(
         name: String,
         parameters: MutableList<Parameter> = mutableListOf(),
         modifiers: MutableList<Modifier> = mutableListOf(),
-        executionBlock: suspend (ExecutionVisitor, Array<Any>) -> ExecutionValue
+        executionBlock: suspend (ExecutionVisitor, Array<Any>, Array<Type>) -> ExecutionValue
     ) {
         val declaration = CompilerFunctionDeclaration(
             name,
             parameters,
             modifiers.toMutableList().apply { add(ModCompiler(positionZero)) },
+            mutableListOf(),
             executionBlock
         )
 
