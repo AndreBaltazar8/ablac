@@ -6,6 +6,7 @@ import dev.abla.language.Position
 data class FunctionCall(
     var expression: Expression,
     var arguments: MutableList<Argument>,
+    val typeArgs: MutableList<Type>,
     override val position: Position
 ) : Expression {
     override suspend fun accept(visitor: ASTVisitor) {

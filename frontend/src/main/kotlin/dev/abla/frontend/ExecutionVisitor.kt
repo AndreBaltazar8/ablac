@@ -171,6 +171,7 @@ class ExecutionVisitor(
         }
         val scope = ExecutionScope(null, symbol.node.symbolTable!!).apply {
             set("name", functionDeclaration.name.toExecutionValue())
+            set("firstTypeName", (if (functionDeclaration.callInfo!!.types.size > 0) functionDeclaration.callInfo!!.types[0].toHuman() else "none").toExecutionValue())
         }
         currentScope!!["compilerContext"] = ExecutionValue.Instance(UserType("CompilerContext"), scope)
     }
@@ -343,7 +344,10 @@ class ExecutionVisitor(
                     }
                     is FunctionDeclaration -> {
                         val isMemberAccess = functionCall.expression is MemberAccess
-                        it.callInfo = CallInfo(if (isMemberAccess) values.peek()!! as ExecutionValue.Instance else null)
+                        it.callInfo = CallInfo(
+                            if (isMemberAccess) values.peek()!! as ExecutionValue.Instance else null,
+                            functionCall.typeArgs
+                        )
                         it.accept(this)
                     }
                     else -> throw NotImplementedError("Unsupported")
@@ -570,7 +574,10 @@ class ExecutionVisitor(
     private fun String.toExecutionValue(): ExecutionValue =
         ExecutionValue.Value(StringLiteral(arrayOf(StringLiteral.StringConst(this, positionZero)), positionZero))
 
-    data class CallInfo(val instance: ExecutionValue.Instance?)
+    data class CallInfo(
+        val instance: ExecutionValue.Instance?,
+        val types: MutableList<Type>
+    )
 
     var FunctionDeclaration.callInfo: CallInfo? by BackingField.nullable()
 }

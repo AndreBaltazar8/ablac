@@ -139,7 +139,7 @@ class CompileService(
         addCompileFunction("declareFun", mutableListOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))) { executionVisitor, args ->
             val name = "declared<$compileNumber>"
             compile(name, false, true, CompilationContext(executionVisitor.executionJob, Job(executionVisitor.executionJob))) {
-                File(name, mutableListOf(FunctionDeclaration(args[0] as String, mutableListOf(), (args[1] as FunctionLiteral).block, UserType.Int, mutableListOf(), mutableListOf(), null, positionZero)), positionZero)
+                File(name, mutableListOf(FunctionDeclaration(args[0] as String, mutableListOf(), (args[1] as FunctionLiteral).block, UserType.Int, mutableListOf(), mutableListOf(), null, mutableListOf(), positionZero)), positionZero)
             }
 
             ExecutionValue.Value(Integer("1", positionZero))

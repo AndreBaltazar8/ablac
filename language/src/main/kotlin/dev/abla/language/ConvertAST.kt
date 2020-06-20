@@ -33,7 +33,16 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
         modifierList()?.modifier()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         modifierList()?.annotations()?.annotation()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         functionTypeReceiver()?.toAST(),
+        typeParameters()?.typeParameter()?.map {
+            it.toAST()
+        }?.toMutableList() ?: mutableListOf(),
         position
+    )
+
+fun AblaParser.TypeParameterContext.toAST() =
+    TypeDefParam(
+        TypeDef(simpleIdentifier().text, arrayOf(), positionZero),
+        type()?.toAST()
     )
 
 fun AblaParser.ClassDeclarationContext.toAST() =
@@ -201,6 +210,7 @@ fun AblaParser.CallSuffixContext.toAST(expression: Expression) =
             *(valueArguments()?.valueArgument()?.map { it.toAST() }?.toTypedArray() ?: arrayOf<Argument>()),
             functionLiteral()?.toAST()?.run { Argument(null, this, this.position) }
         ).toMutableList(),
+        typeArguments()?.type()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         position
     )
 

@@ -41,6 +41,11 @@ class RunnerTest : KoinComponent {
     }
 
     @Test
+    fun testGenericTypeFunctions() = runResourceFile("examples/test_generic_type_functions.ab") {
+        println(it)
+    }
+
+    @Test
     fun testClassDeclaration() = runResourceFile("examples/test_class_declaration.ab") {
         println(it)
         assert(it.contains("%Chicken = type { %Chicken_vtable_type*, i32, i32, i32, i8* }"))
