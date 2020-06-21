@@ -204,27 +204,9 @@ class ExecutionVisitor(
         symbol.node.symbolTable!!.symbols.apply {
             replaceFunction("annotation") { _, _, typeArgs ->
                 val annotation = sym.node.annotations.firstOrNull { it.name == typeArgs[0].toHuman() }
-                    ?: throw Exception("Unknown annotation ${typeArgs[0]}") // TODO: find this a better way
+                    ?: throw Exception("Unknown annotation ${typeArgs[0]}")
 
-                val annotationClassSymbol = findClassSymbol(annotation.name)
-
-                val instance = ExecutionValue.Instance(typeArgs[0], ExecutionScope(null, annotationClassSymbol.node.symbolTable!!))
-                annotation.arguments.forEach { it.value.accept(this@ExecutionVisitor) }
-                annotationClassSymbol.node.constructor?.parameters?.reversed()?.forEach { param ->
-                    when (param) {
-                        is PropertyDeclaration -> instance.scope[param.name] = values.pop().copyWith(param.isFinal)
-                        is Parameter -> instance.scope[param.name] = values.pop().copyWith(false)
-                        else -> throw Exception("Unsupported")
-                    }
-                }
-                annotationClassSymbol.node.symbol.fields.forEach { field ->
-                    val property = field.node as PropertyDeclaration
-                    if (property.value == null)
-                        return@forEach
-                    property.value?.accept(this@ExecutionVisitor)
-                    instance.scope[property.name] = values.pop().copyWith(property.isFinal)
-                }
-                instance
+                annotation.value!!
             }
         }
 
@@ -244,6 +226,16 @@ class ExecutionVisitor(
 
     override suspend fun visit(classDeclaration: ClassDeclaration) {
         withTable(classDeclaration.symbolTable) {
+            executionLayer++
+            classDeclaration.annotations.forEach { annotation ->
+                annotation.arguments.forEach { it.value.accept(this@ExecutionVisitor) }
+
+                val annotationClassSymbol = findClassSymbol(annotation.name)
+                val annotationClass = annotationClassSymbol.node
+                annotation.value = annotationClass.createInstance()
+            }
+            executionLayer--
+
             super.visit(classDeclaration)
         }
     }
@@ -359,22 +351,7 @@ class ExecutionVisitor(
                         values.clearUntilSaveLast(numValues)
                     }
                     is ClassDeclaration -> {
-                        val instance = ExecutionValue.Instance(it.toType(), ExecutionScope(null, it.symbolTable!!))
-                        it.constructor?.parameters?.reversed()?.forEach { param ->
-                            when (param) {
-                                is PropertyDeclaration -> instance.scope[param.name] = values.pop().copyWith(param.isFinal)
-                                is Parameter -> instance.scope[param.name] = values.pop().copyWith(false)
-                                else -> throw Exception("Unsupported")
-                            }
-                        }
-                        it.symbol.fields.forEach { field ->
-                            val property = field.node as PropertyDeclaration
-                            if (property.value == null)
-                                return@forEach
-                            property.value?.accept(this)
-                            instance.scope[property.name] = values.pop().copyWith(property.isFinal)
-                        }
-                        values.push(instance)
+                        values.push(it.createInstance())
                     }
                     is FunctionDeclaration -> {
                         val isMemberAccess = functionCall.expression is MemberAccess
@@ -607,6 +584,27 @@ class ExecutionVisitor(
 
     private fun String.toExecutionValue(): ExecutionValue =
         ExecutionValue.Value(StringLiteral(arrayOf(StringLiteral.StringConst(this, positionZero)), positionZero))
+
+    private suspend fun ClassDeclaration.createInstance(): ExecutionValue.Instance {
+        val instance = ExecutionValue.Instance(toType(), ExecutionScope(null, symbolTable!!))
+
+        constructor?.parameters?.reversed()?.forEach { param ->
+            when (param) {
+                is PropertyDeclaration -> instance.scope[param.name] = values.pop().copyWith(param.isFinal)
+                is Parameter -> instance.scope[param.name] = values.pop().copyWith(false)
+                else -> throw Exception("Unsupported")
+            }
+        }
+        symbol.fields.forEach { field ->
+            val property = field.node as PropertyDeclaration
+            if (property.value == null)
+                return@forEach
+            property.value?.accept(this@ExecutionVisitor)
+            instance.scope[property.name] = values.pop().copyWith(property.isFinal)
+        }
+
+        return instance
+    }
 
     data class CallInfo(
         val instance: ExecutionValue.Instance?,
