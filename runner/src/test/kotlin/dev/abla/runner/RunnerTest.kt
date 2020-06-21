@@ -41,6 +41,11 @@ class RunnerTest : KoinComponent {
     }
 
     @Test
+    fun testPackets() = runResourceFile("examples/test_packets.ab") {
+        println(it)
+    }
+
+    @Test
     fun testGenericTypeFunctions() = runResourceFile("examples/test_generic_type_functions.ab") {
         println(it)
     }

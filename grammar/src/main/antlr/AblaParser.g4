@@ -157,6 +157,7 @@ functionLiteral : LCURL (simpleIdentifier (COMMA simpleIdentifier)* ARROW)? (sta
 
 literal : stringLiteral # stringLiteralLiteral
         | IntegerLiteral # integerLiteral
+        | HexLiteral # hexLiteral
         | BooleanLiteral # booleanLiteral
         | LSQUARE (expression (COMMA expression)* COMMA?)? RSQUARE # arrayLiteral
         ;

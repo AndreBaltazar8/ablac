@@ -349,6 +349,7 @@ fun AblaParser.SimpleIdentifierContext.toAST(): IdentifierExpression = Identifie
 fun AblaParser.LiteralContext.toAST(): Literal =
     when (this) {
         is AblaParser.IntegerLiteralContext -> Integer(text, position)
+        is AblaParser.HexLiteralContext -> Integer(text.substring(2).toInt(16).toString(), position)
         is AblaParser.StringLiteralLiteralContext -> stringLiteral().toAST()
         is AblaParser.ArrayLiteralContext -> toAST()
         else -> throw IllegalStateException("Unknown literal type ${this::class.simpleName}")

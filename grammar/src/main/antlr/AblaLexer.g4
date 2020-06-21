@@ -48,6 +48,9 @@ LTE : '<=' ;
 
 BooleanLiteral : 'true' | 'false' ;
 IntegerLiteral : DigitNoZero DigitOrSeparator* Digit | Digit ;
+HexLiteral : '0' [xX] HexDigit HexDigitOrSeparator* HexDigit
+           | '0' [xX] HexDigit
+           ;
 
 ID : NonDigit (NonDigit | Digit)* ;
 
@@ -56,6 +59,7 @@ fragment Digit : [0-9] ;
 fragment DigitNoZero : [1-9] ;
 fragment DigitOrSeparator: Digit | '_' ;
 fragment HexDigit : [0-9a-fA-F] ;
+fragment HexDigitOrSeparator: Digit | '_' ;
 
 fragment UniCharacterLiteral : '\\' 'u' HexDigit HexDigit HexDigit HexDigit ;
 fragment EscapedIdentifier : '\\' ('t' | 'b' | 'r' | 'n' | '\'' | '"' | '\\' | '$') ;
