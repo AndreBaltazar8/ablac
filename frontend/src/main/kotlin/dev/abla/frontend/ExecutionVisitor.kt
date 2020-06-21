@@ -51,6 +51,16 @@ class ExecutionVisitor(
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
         withTable(functionDeclaration.symbolTable) {
+            executionLayer++
+            functionDeclaration.annotations.forEach { annotation ->
+                annotation.arguments.forEach { it.value.accept(this@ExecutionVisitor) }
+
+                val annotationClassSymbol = findClassSymbol(annotation.name)
+                val annotationClass = annotationClassSymbol.node
+                annotation.value = annotationClass.createInstance()
+            }
+            executionLayer--
+
             if (executionLayer > 0) {
                 if (functionDeclaration.callInfo == null)
                     return@withTable
@@ -180,17 +190,35 @@ class ExecutionVisitor(
         if (sym !is Symbol.Function)
             throw Exception("Not a function")
 
+        val table = SymbolTable(sym.node.symbolTable)
+        table.symbols.apply {
+            replaceFunction("annotation") { _, _, typeArgs ->
+                val annotation = sym.node.annotations.firstOrNull { it.name == typeArgs[0].toHuman() }
+                    ?: throw Exception("Unknown annotation ${typeArgs[0]}")
+
+                annotation.value!!
+            }
+        }
+
         return ExecutionValue.Instance(UserType("CompilerFunctionContext"),
-            object : ExecutionScope(null, currentTable!!) {
-                override fun modify(identifier: String, value: ExecutionValue) {
+            object : ExecutionScope(null, table) {
+                override suspend fun modify(identifier: String, value: ExecutionValue) {
                     super.modify(identifier, value)
-                    if (identifier == "block") {
-                        val block = (value as ExecutionValue.CompilerNode).node as Block
-                        block.symbolTable = sym.node.block!!.symbolTable // TODO: compute better symbol table
-                        sym.node.block = block
+                    when (identifier) {
+                        "block" -> {
+                            val block = (value as ExecutionValue.CompilerNode).node as Block
+                            block.symbolTable = sym.node.block!!.symbolTable // TODO: compute better symbol table
+                            sym.node.block = block
+                        }
+                        "name" -> {
+                            val newName = (value as ExecutionValue.Value).toValue(this) as String
+                            sym.name = newName
+                            sym.node.name = newName
+                        }
                     }
                 }
             }.apply {
+                set("name", sym.name.toExecutionValue().copyWith(false))
                 set("block", ExecutionValue.CompilerNode(sym.node.block!!))
             }
         )
@@ -210,7 +238,13 @@ class ExecutionVisitor(
             }
         }
 
-        return ExecutionValue.Instance(UserType("CompilerClassContext"), ExecutionScope(null, symbol.node.symbolTable!!))
+        val scope = ExecutionScope(null, symbol.node.symbolTable!!).apply {
+            set("methods", ExecutionValue.Array(sym.node.symbolTable!!.symbols.filterIsInstance<Symbol.Function>().map {
+                createCompileFunctionContext(it)
+            }.toMutableList()))
+        }
+
+        return ExecutionValue.Instance(UserType("CompilerClassContext"), scope)
     }
 
     private suspend fun findClassSymbol(className: String): Symbol.Class {

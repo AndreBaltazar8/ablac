@@ -25,7 +25,7 @@ abstract class ExecutionValue {
 
         override fun copyWith(final: Boolean): ExecutionValue = ConstSymbol(symbol).apply { isFinal = final }
     }
-    data class AssignableValue(val assign: (ExecutionValue) -> Unit) : ExecutionValue() {
+    data class AssignableValue(val assign: suspend (ExecutionValue) -> Unit) : ExecutionValue() {
         override val value: Literal
             get() = throw IllegalStateException("Value cannot be converted to literal")
 

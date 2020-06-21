@@ -23,7 +23,7 @@ open class ExecutionScope(val parent: ExecutionScope?, val symbolTable: SymbolTa
         values[identifier] = value
     }
 
-    open fun modify(identifier: String, value: ExecutionValue) {
+    open suspend fun modify(identifier: String, value: ExecutionValue) {
         if (values.containsKey(identifier))
             values[identifier] = value.copyWith(values[identifier]!!.isFinal)
         else {
