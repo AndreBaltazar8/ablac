@@ -317,9 +317,18 @@ class ExecutionVisitor(
     }
 
     override suspend fun visit(stringLiteral: StringLiteral) {
-        if (executionLayer > 0)
-            values.add(ExecutionValue.Value(stringLiteral))
-        else
+        if (executionLayer > 0) {
+            values.add(stringLiteral.stringParts.map {
+                when (it) {
+                    is StringLiteral.StringConst -> it.string
+                    is StringLiteral.StringExpression -> {
+                        it.expression.accept(this@ExecutionVisitor)
+                        values.pop().value.toValue(currentScope!!).toString()
+                    }
+                    else -> throw IllegalStateException("Unknown string part type ${it.javaClass.simpleName}")
+                }
+            }.joinToString("").toExecutionValue())
+        } else
             super.visit(stringLiteral)
     }
 
