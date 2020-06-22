@@ -111,7 +111,14 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                     }
                     is Symbol.Class -> {
                         val classDeclaration = (node as ClassDeclaration)
-                        FunctionType(arrayOf(Parameter("a", UserType.Int, positionZero)), classDeclaration.toType(), null, positionZero)
+                        if (classDeclaration.isInterface)
+                            throw Exception("Cannot instantiate interface type ${classDeclaration.name}")
+                        FunctionType(
+                            node.constructor?.mappedParameters?.toTypedArray() ?: arrayOf(),
+                            classDeclaration.toType(),
+                            null,
+                            positionZero
+                        )
                     }
                 }
                 GeneratorContext.Value(type, node.llvmValue!!)

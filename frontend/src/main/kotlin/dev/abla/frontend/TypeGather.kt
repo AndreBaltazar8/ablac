@@ -23,6 +23,7 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         val function = Symbol.Function(functionDeclaration.name, functionDeclaration)
         tables.peek().symbols.add(function)
 
+        var isInInterfaceClass = false
         val receiverType = functionDeclaration.receiver
         if (receiverType != null) {
             if (receiverType !is UserType) // TODO: support other types. This will still crash for builtin UserTypes
@@ -33,6 +34,7 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
             function.receiver = symbol
         } else if (currentScope == Scope.Class) {
             val classSymbol = classScopes.peek()
+            isInInterfaceClass = classSymbol.node.isInterface
             classSymbol.methods.add(function)
             function.receiver = classSymbol
         }
@@ -48,7 +50,7 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
             val extern = functionDeclaration.isExtern
             if (extern && functionDeclaration.block != null)
                 throw Exception("Extern function cannot have a body")
-            if (!extern && !functionDeclaration.isAbstract && functionDeclaration.block == null)
+            if (!extern && !(functionDeclaration.isAbstract || isInInterfaceClass) && functionDeclaration.block == null)
                 throw Exception("Function must have a body or be declared extern or abstract")
 
             functionDeclaration.parameters.forEach {
@@ -102,6 +104,11 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
     }
 
     override suspend fun visit(classDeclaration: ClassDeclaration) {
+        if (classDeclaration.isInterface) {
+            if (classDeclaration.constructor != null)
+                throw Exception("Interface classes cannot have constructor")
+        }
+
         val classSymbol = Symbol.Class(classDeclaration.name, classDeclaration)
         tables.peek().symbols.add(classSymbol)
         classScopes.push(classSymbol)

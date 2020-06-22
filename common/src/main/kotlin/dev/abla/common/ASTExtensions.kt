@@ -53,9 +53,19 @@ val Expression.inferredType: Type?
             else -> throw Exception("Call on non function type?")
         }
         is IdentifierExpression -> when (val node = symbolLazy!!.value!!.node) {
-            is FunctionDeclaration -> FunctionType(arrayOf(), node.returnType ?: node.block?.returnType ?: UserType.Void, node.returnType, node.position)
+            is FunctionDeclaration -> FunctionType(
+                node.parameters.toTypedArray(),
+                node.returnType ?: node.block?.returnType ?: UserType.Void,
+                node.returnType,
+                node.position
+            )
             is PropertyDeclaration -> node.inferredType
-            is ClassDeclaration -> FunctionType(arrayOf(), node.toType(), null, node.position)
+            is ClassDeclaration -> FunctionType(
+                node.constructor?.mappedParameters?.toTypedArray() ?: arrayOf(),
+                node.toType(),
+                null,
+                node.position
+            )
             is Parameter -> node.type
             else -> throw Exception("Conversion not implemented")
         }
@@ -69,3 +79,11 @@ val Block.returnType: Type?
 val IfElseExpression.isExpression: Boolean
     get() = elseBody.let { elseBody -> elseBody != null && ifBody.returnType.let { it != null && it == elseBody.returnType }}
 var FunctionLiteral.forcedReturnType: Type? by BackingField.nullable()
+val ClassConstructor.mappedParameters: List<Parameter>
+    get() = parameters.map {
+        when (it) {
+            is Parameter -> it
+            is PropertyDeclaration -> Parameter(it.name, it.inferredType!!, it.position)
+            else -> throw Exception("Unknown parameter type ${it.javaClass.simpleName}")
+        }
+    }

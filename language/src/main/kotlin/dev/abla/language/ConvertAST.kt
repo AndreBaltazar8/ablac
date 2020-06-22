@@ -52,6 +52,8 @@ fun AblaParser.ClassDeclarationContext.toAST() =
         modifierList()?.annotations()?.annotation()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
         primaryConstructor()?.toAST(),
         classBody()?.classMemberDeclaration()?.map { it.toAST() }?.toMutableList() ?: mutableListOf(),
+        if (INTERFACE() != null) ClassType.Interface else ClassType.Class,
+        INTERFACE() != null,
         position
     )
 

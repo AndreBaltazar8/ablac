@@ -20,7 +20,7 @@ functionDeclarationParameter : parameter (ASSIGNMENT expression)? ;
 typeParameters : LANGLE typeParameter (COMMA typeParameter)* COMMA? RANGLE ;
 typeParameter : simpleIdentifier (COLON type)? ;
 
-classDeclaration : modifierList? CLASS className = simpleIdentifier (typeParameters)? ({this.matchNoLineTerminator()}? primaryConstructor)? (classBody)? ;
+classDeclaration : modifierList? (CLASS | INTERFACE) className = simpleIdentifier (typeParameters)? ({this.matchNoLineTerminator()}? primaryConstructor)? (classBody)? ;
 classBody : LCURL classMemberDeclaration* RCURL ;
 classMemberDeclaration : classDeclaration
                        | functionDeclaration

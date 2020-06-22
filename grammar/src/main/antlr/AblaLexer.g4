@@ -27,6 +27,7 @@ COMPILER : 'compiler' ;
 ABSTRACT : 'abstract' ;
 CONSTRUCTOR : 'constructor' ;
 CLASS : 'class' ;
+INTERFACE : 'interface' ;
 IF : 'if' ;
 ELSE : 'else' ;
 VAR : 'var' ;
