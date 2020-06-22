@@ -156,6 +156,9 @@ class ExecutionVisitor(
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
                 createCompileFunctionContext(sym)
             }
+            replaceFunction("type") { _, _, typeArgs ->
+                createCompileClassContext(findClassSymbol(typeArgs[0].toHuman()))
+            }
             replaceFunction("findClass", mutableListOf(Parameter("className", UserType.String))) { _, args, _ ->
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
                 createCompileClassContext(sym)
