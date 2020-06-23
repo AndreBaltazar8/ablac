@@ -35,7 +35,7 @@ fun FunctionDeclaration.toType(): Type =
     )
 
 // TODO: need to calculate correct parent
-fun ClassDeclaration.toType(): Type = UserType(name, arrayOf(), null, positionZero)
+fun ClassDeclaration.toType(): UserType = UserType(name, arrayOf(), null, positionZero)
 val PropertyDeclaration.inferredType: Type?
     get() = type ?: value!!.inferredType
 val Expression.inferredType: Type?

@@ -10,8 +10,9 @@ data class UserType(
     val parent: Type? = null,
     override val position: Position = positionZero
 ) : Type {
-
     val isGeneric = types.isNotEmpty()
+    val isBuiltIn: Boolean
+        get() = builtInTypes.contains(identifier)
 
     override fun toHuman(): String {
         return (if (parent != null) parent.toHuman() + "." else "") +
@@ -39,10 +40,13 @@ data class UserType(
     }
 
     companion object {
-        val Void = UserType("void")
-        val Int = UserType("int")
-        val Bool = UserType("bool")
-        val String = UserType("string")
-        val Any = UserType("any")
+        val builtInTypes = mutableSetOf<String>()
+
+        val Void = UserType("void").also { builtInTypes.add(it.identifier) }
+        val Int = UserType("int").also { builtInTypes.add(it.identifier) }
+        val Bool = UserType("bool").also { builtInTypes.add(it.identifier) }
+        val String = UserType("string").also { builtInTypes.add(it.identifier) }
+        val Any = UserType("any").also { builtInTypes.add(it.identifier) }
+        val Array = UserType("array").also { builtInTypes.add(it.identifier) }
     }
 }

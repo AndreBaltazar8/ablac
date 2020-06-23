@@ -2,6 +2,7 @@ package dev.abla.llvm
 
 import dev.abla.common.Symbol
 import dev.abla.common.SymbolTable
+import dev.abla.common.toType
 import dev.abla.language.nodes.*
 import dev.abla.utils.BackingField
 import org.bytedeco.javacpp.PointerPointer

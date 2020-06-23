@@ -345,28 +345,33 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     override suspend fun visit(classDeclaration: ClassDeclaration) {
         if (classDeclaration.isCompiler)
             return
-        generatorContext.withBlock(classDeclaration.llvmBlock!!, classDeclaration.symbolTable!!) {
-            super.visit(classDeclaration)
-            createBuilderAtEnd { builder ->
-                val classInstance = LLVMBuildMalloc(builder, classDeclaration.struct, "")
-                classDeclaration.constructor?.parameters?.forEach {
-                    when (it) {
-                        is PropertyDeclaration -> {
-                            val index = classDeclaration.symbol.fields.indexOf(it.symbol)
-                            classInstance.storeGEP(builder, index + 1, it.llvmValue!!)
+
+        val isBuiltin = classDeclaration.toType().isBuiltIn
+        if (!isBuiltin) {
+            generatorContext.withBlock(classDeclaration.llvmBlock!!, classDeclaration.symbolTable!!) {
+                super.visit(classDeclaration)
+                createBuilderAtEnd { builder ->
+                    val classInstance = LLVMBuildMalloc(builder, classDeclaration.struct, "")
+                    classDeclaration.constructor?.parameters?.forEach {
+                        when (it) {
+                            is PropertyDeclaration -> {
+                                val index = classDeclaration.symbol.fields.indexOf(it.symbol)
+                                classInstance.storeGEP(builder, index + 1, it.llvmValue!!)
+                            }
                         }
                     }
+                    classDeclaration.symbol.fields.forEachIndexed { index, field ->
+                        val property = field.node as PropertyDeclaration
+                        if (property.value == null)
+                            return@forEachIndexed
+                        property.value!!.accept(this@CodeGeneratorVisitor)
+                        classInstance.storeGEP(builder, index + 1, generatorContext.topValuePop.ref)
+                    }
+                    LLVMBuildRet(builder, classInstance)
                 }
-                classDeclaration.symbol.fields.forEachIndexed { index, field ->
-                    val property = field.node as PropertyDeclaration
-                    if (property.value == null)
-                        return@forEachIndexed
-                    property.value!!.accept(this@CodeGeneratorVisitor)
-                    classInstance.storeGEP(builder, index + 1, generatorContext.topValuePop.ref)
-                }
-                LLVMBuildRet(builder, classInstance)
             }
-        }
+        } else
+            super.visit(classDeclaration)
     }
 
     override suspend fun visit(assignment: Assignment) {

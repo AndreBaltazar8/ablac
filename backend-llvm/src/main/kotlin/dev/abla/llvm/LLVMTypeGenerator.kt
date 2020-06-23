@@ -25,10 +25,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
         val receiver = functionDeclaration.symbol.receiver
         val hasReceiver = receiver != null
-        val classType = if (receiver != null)
-            LLVMPointerType(receiver.node.struct, 0)
-        else
-            null
+        val classType = receiver?.node?.toType()?.llvmType(receiver.node.symbolTable!!)
 
         val argTypes = listOfNotNull(classType)
             .plus(functionDeclaration.parameters.map {
@@ -85,45 +82,54 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     override suspend fun visit(classDeclaration: ClassDeclaration) {
         if (classDeclaration.isCompiler)
             return
-        val struct = LLVMStructCreateNamed(llvmContext, classDeclaration.name)
-        val scope = TypeScope(classDeclaration.name, struct)
+        val isBuiltin = classDeclaration.toType().isBuiltIn
+        val struct = if (!isBuiltin)
+            LLVMStructCreateNamed(llvmContext, classDeclaration.name)
+        else
+            classDeclaration.toType().llvmType(classDeclaration.symbolTable!!)
+
+        val scope = TypeScope(classDeclaration.name, struct, isBuiltin)
         typeScopes.push(scope)
         names.push(classDeclaration.name)
         classDeclaration.struct = struct
-        val name = names.plus("%constructor").joinToString("%")
-        val ctorArgs = classDeclaration.constructor?.parameters?.map {
-            when (it) {
-                is PropertyDeclaration -> it.type!!
-                is Parameter -> it.type
-                else -> throw Exception("Unknown!")
-            }.llvmType(classDeclaration.symbolTable!!)
-        }?.toTypedArray() ?: arrayOf()
-        classDeclaration.constructorFunction = module.addFunction(name, LLVMPointerType(struct, 0), ctorArgs)
-            .valueRef.appendBasicBlock("entry") {
-                classDeclaration.llvmBlock = this
-                blocks.push(this)
+        if (!isBuiltin) {
+            val name = names.plus("%constructor").joinToString("%")
+            val ctorArgs = classDeclaration.constructor?.parameters?.map {
+                when (it) {
+                    is PropertyDeclaration -> it.type!!
+                    is Parameter -> it.type
+                    else -> throw Exception("Unknown!")
+                }.llvmType(classDeclaration.symbolTable!!)
+            }?.toTypedArray() ?: arrayOf()
+            classDeclaration.constructorFunction = module.addFunction(name, LLVMPointerType(struct, 0), ctorArgs)
+                .valueRef.appendBasicBlock("entry") {
+                    classDeclaration.llvmBlock = this
+                    blocks.push(this)
+                }
+
+            val constructor = classDeclaration.constructor
+            if (constructor != null) {
+                for ((index, param) in constructor.parameters.withIndex())
+                    param.llvmValue = LLVMGetParam(classDeclaration.constructorFunction, index)
             }
 
-        val constructor = classDeclaration.constructor
-        if (constructor != null) {
-            for ((index, param) in constructor.parameters.withIndex())
-                param.llvmValue = LLVMGetParam(classDeclaration.constructorFunction, index)
+            classDeclaration.llvmValue = classDeclaration.constructorFunction
         }
-
-        classDeclaration.llvmValue = classDeclaration.constructorFunction
         super.visit(classDeclaration)
-        blocks.pop()
-        val vTableType = module.registerTypeVtable(
-            classDeclaration.name,
-            scope.methods.map { LLVMPointerType(it.type, 0) }.toTypedArray(),
-            scope.methods.map { it.valueRef }.toTypedArray()
-        )
-        LLVMStructSetBody(
-            struct,
-            PointerPointer(LLVMPointerType(vTableType, 0), *scope.fields.toTypedArray()),
-            scope.fields.size + 1,
-            0
-        )
+        if (!isBuiltin) {
+            blocks.pop()
+            val vTableType = module.registerTypeVtable(
+                classDeclaration.name,
+                scope.methods.map { LLVMPointerType(it.type, 0) }.toTypedArray(),
+                scope.methods.map { it.valueRef }.toTypedArray()
+            )
+            LLVMStructSetBody(
+                struct,
+                PointerPointer(LLVMPointerType(vTableType, 0), *scope.fields.toTypedArray()),
+                scope.fields.size + 1,
+                0
+            )
+        }
         typeScopes.pop()
         names.pop()
     }
@@ -197,6 +203,8 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             LLVMAddGlobal(module, (propertyDeclaration.inferredType ?: UserType.Any).llvmType(propertyDeclaration.symbolTable!!), "")
         } else if (propertyDeclaration.scope == Scope.Class) {
             val typeScope = typeScopes.peek()
+            if (typeScope.isBuiltin)
+                throw Exception("Cannot declare properties on builtin types")
             typeScope.fields.add((propertyDeclaration.inferredType ?: UserType.Any).llvmType(propertyDeclaration.symbolTable!!))
         }
         super.visit(propertyDeclaration)
