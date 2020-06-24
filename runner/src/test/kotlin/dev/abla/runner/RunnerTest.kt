@@ -31,7 +31,8 @@ class RunnerTest : KoinComponent {
     @Test
     fun testArrays() = runResourceFile("examples/test_arrays.ab") {
         println(it)
-        assert(it.contains("%6 = getelementptr i32, i32* %1, i32 1"))
+        assert(it.contains("%1 = getelementptr i32, i32* %0, i32 0"))
+        assert(it.contains("store i32 5, i32* %1"))
         assert(it.contains("%2 = add i32 %1, 20"))
     }
 

@@ -481,13 +481,12 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(arrayLiteral: ArrayLiteral) {
         generatorContext.topBlock.createBuilderAtEnd { builder ->
-            val arrayType = LLVMArrayType(LLVMInt32Type(), arrayLiteral.elements.size)
-            val size = LLVMConstInt(LLVMInt32Type(), 1, 1)
-            val value = LLVMBuildArrayAlloca(builder, arrayType, size, "")
-            val ptr = LLVMBuildBitCast(builder, value, LLVMPointerType(LLVMInt32Type(), 0), "")
+            val size = LLVMConstInt(LLVMInt32Type(), arrayLiteral.elements.size.toLong(), 1)
+            val ptr = LLVMBuildArrayAlloca(builder, LLVMInt32Type(), size, "")
             for ((index, element) in arrayLiteral.elements.withIndex()) {
                 element.accept(this)
-                val indexPtr = LLVMBuildInBoundsGEP(builder, value, PointerPointer(LLVMConstInt(LLVMInt32Type(), 0, 1), LLVMConstInt(LLVMInt32Type(), index.toLong(), 1)), 2, "")
+                val indexConst = LLVMConstInt(LLVMInt32Type(), index.toLong(), 1)
+                val indexPtr = LLVMBuildGEP(builder, ptr, indexConst, 1, BytePointer(""))
                 LLVMBuildStore(builder, generatorContext.topValuePop.ref, indexPtr)
             }
             generatorContext.values.push(GeneratorContext.Value(UserType("array", arrayOf(UserType.Int)), ptr))
