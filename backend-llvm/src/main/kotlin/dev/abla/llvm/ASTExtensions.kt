@@ -33,6 +33,7 @@ fun Type.llvmType(symbolTable: SymbolTable): LLVMTypeRef = when {
     this == UserType.String -> LLVMPointerType(LLVMInt8Type(), 0)
     this == UserType.Int -> LLVMInt32Type()
     this == UserType.Void -> LLVMVoidType()
+    this == UserType.Bool -> LLVMInt1Type()
     this == UserType.Any -> LLVMPointerType(LLVMInt64Type(), 0)
     this is PointerType -> LLVMPointerType(LLVMInt64Type(), 0)
     this is UserType -> {
