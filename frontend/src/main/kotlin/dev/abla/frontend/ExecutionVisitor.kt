@@ -242,7 +242,10 @@ class ExecutionVisitor(
         }
 
         val scope = ExecutionScope(null, symbol.node.symbolTable!!).apply {
-            set("methods", ExecutionValue.Array(sym.node.symbolTable!!.symbols.filterIsInstance<Symbol.Function>().map {
+            // TODO: this should be lazy because the methods could actually change
+            val methods = sym.node.symbolTable!!.symbols.filterIsInstance<Symbol.Function>()
+            set("numMethods", ExecutionValue.Value(Integer(methods.size.toString(), positionZero)))
+            set("methods", ExecutionValue.Array(methods.map {
                 createCompileFunctionContext(it)
             }.toMutableList()))
         }
