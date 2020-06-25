@@ -206,11 +206,9 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         val returnType = functionLiteral.forcedReturnType ?: functionLiteral.block.returnType ?: UserType.Void
-        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), returnType.llvmType(generatorContext.topBlock.table), arrayOf())
-        functionLiteral.llvmValue = function.valueRef
         val numValues = generatorContext.values.size
         val block = functionLiteral.llvmBlock!!
-        LLVMAppendExistingBasicBlock(function.valueRef, block)
+        LLVMAppendExistingBasicBlock(functionLiteral.llvmValue!!, block)
         val currentBlock = generatorContext.pushBlock(block, functionLiteral.block.symbolTable!!)
         functionLiteral.block.accept(this)
         if (!currentBlock.hasReturned) {

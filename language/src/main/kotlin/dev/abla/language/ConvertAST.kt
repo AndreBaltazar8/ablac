@@ -362,6 +362,9 @@ fun AblaParser.ArrayLiteralContext.toAST() = ArrayLiteral(expression().map { it.
 fun AblaParser.FunctionLiteralContext.toAST() =
     FunctionLiteral(
         Block(statement().mapNotNull { it.toAST() }.toMutableList(), position),
+        variableDeclaration().map {
+            InferrableParameter(it.simpleIdentifier().text, it.type()?.toAST(), it.position)
+        }.toMutableList(),
         position
     )
 

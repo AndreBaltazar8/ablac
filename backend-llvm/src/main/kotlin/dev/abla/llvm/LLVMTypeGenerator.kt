@@ -135,9 +135,29 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
+        val table = functionLiteral.block.symbolTable!!
+        val returnType = functionLiteral.forcedReturnType ?: functionLiteral.block.returnType ?: UserType.Void
+        val argTypes = functionLiteral.parameters.map {
+            try {
+                it.type!!.llvmType(table)
+            } catch (e: Exception) {
+                throw Exception("${it.name}: ${e.message}", e)
+            }
+        }
+        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), returnType.llvmType(table), argTypes.toTypedArray())
+        functionLiteral.llvmValue = function.valueRef
+
         val block = LLVMCreateBasicBlockInContext(llvmContext, "entry")
         functionLiteral.llvmBlock = block
         blocks.push(block)
+        //val builder = block.createBuilderAtEnd()
+        for ((index, param) in functionLiteral.parameters.withIndex()) {
+            // TODO: figure out why this allocation doesn't work
+            //val parameterValueRef = LLVMGetParam(function.valueRef, index)
+            //val allocation = LLVMBuildAlloca(builder, argTypes[index], "")
+            //LLVMBuildStore(builder, parameterValueRef, allocation)
+            param.llvmValue = LLVMGetParam(function.valueRef, index)//LLVMBuildLoad(builder, allocation, "")
+        }
         super.visit(functionLiteral)
         blocks.pop()
     }

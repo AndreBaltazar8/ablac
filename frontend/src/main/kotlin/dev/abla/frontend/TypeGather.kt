@@ -80,6 +80,9 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         createTableInParent { table ->
             functionLiteral.block.symbolTable = table
             withScope(Scope.Function) {
+                functionLiteral.parameters.forEach {
+                    table.symbols.add(Symbol.Variable(it.name, it))
+                }
                 super.visit(functionLiteral)
             }
         }
