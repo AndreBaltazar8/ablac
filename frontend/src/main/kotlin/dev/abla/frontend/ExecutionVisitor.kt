@@ -201,6 +201,25 @@ class ExecutionVisitor(
 
                 annotation.value!!
             }
+            replaceFunction("wrap") { _, args, _ ->
+                val wrapLiteral = args[0] as FunctionLiteral
+                val method = sym.node
+                val finalStatements = mutableListOf<Statement>()
+                wrapLiteral.block.statements.forEach {
+                    if (it is FunctionCall) {
+                        val expression = it.expression
+                        if (expression is IdentifierExpression && expression.identifier == wrapLiteral.parameters[0].name) {
+                            finalStatements.addAll(method.block!!.statements)
+                            return@forEach
+                        }
+                    }
+
+                    finalStatements.add(it)
+                }
+                method.block!!.statements = finalStatements
+
+                ExecutionValue.Value(Integer("1", positionZero))
+            }
         }
 
         return ExecutionValue.Instance(UserType("CompilerFunctionContext"),
