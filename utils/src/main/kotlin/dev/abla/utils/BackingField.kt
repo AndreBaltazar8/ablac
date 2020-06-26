@@ -12,7 +12,7 @@ class BackingField<K, V>(val default: () -> V) {
         private val backingFieldsMap = ConcurrentHashMap<ReferenceQueue<*>, BackingField<*, *>>()
 
         init {
-            thread {
+            thread(isDaemon = true) {
                 while (true) {
                     for ((queue, backingField) in backingFieldsMap) {
                         val reference = queue.poll() ?: continue
