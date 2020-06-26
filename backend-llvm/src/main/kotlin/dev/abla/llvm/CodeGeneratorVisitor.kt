@@ -208,7 +208,6 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val returnType = functionLiteral.forcedReturnType ?: functionLiteral.block.returnType ?: UserType.Void
         val numValues = generatorContext.values.size
         val block = functionLiteral.llvmBlock!!
-        LLVMAppendExistingBasicBlock(functionLiteral.llvmValue!!, block)
         val currentBlock = generatorContext.pushBlock(block, functionLiteral.block.symbolTable!!)
         functionLiteral.block.accept(this)
         if (!currentBlock.hasReturned) {

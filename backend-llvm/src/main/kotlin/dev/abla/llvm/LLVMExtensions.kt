@@ -27,6 +27,8 @@ fun LLVMValueRef.appendBasicBlock(name: String, block: LLVMBasicBlockRef.() -> U
     LLVMAppendBasicBlock(this, name).block()
 }
 
+fun FunctionLLVM.createBasicBlock(name: String): LLVMBasicBlockRef = LLVMAppendBasicBlock(this.valueRef, name)
+
 fun LLVMModuleRef.registerTypeVtable(
     name: String,
     methodsTypes: Array<LLVMTypeRef>,

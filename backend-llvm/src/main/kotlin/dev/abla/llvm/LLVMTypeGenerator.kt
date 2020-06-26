@@ -147,16 +147,15 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
         val function = module.addFunction("funliteral" + functionLiteral.hashCode(), returnType.llvmType(table), argTypes.toTypedArray())
         functionLiteral.llvmValue = function.valueRef
 
-        val block = LLVMCreateBasicBlockInContext(llvmContext, "entry")
+        val block = function.createBasicBlock("entry")
         functionLiteral.llvmBlock = block
         blocks.push(block)
-        //val builder = block.createBuilderAtEnd()
+        val builder = block.createBuilderAtEnd()
         for ((index, param) in functionLiteral.parameters.withIndex()) {
-            // TODO: figure out why this allocation doesn't work
-            //val parameterValueRef = LLVMGetParam(function.valueRef, index)
-            //val allocation = LLVMBuildAlloca(builder, argTypes[index], "")
-            //LLVMBuildStore(builder, parameterValueRef, allocation)
-            param.llvmValue = LLVMGetParam(function.valueRef, index)//LLVMBuildLoad(builder, allocation, "")
+            val parameterValueRef = LLVMGetParam(function.valueRef, index)
+            val allocation = LLVMBuildAlloca(builder, argTypes[index], "")
+            LLVMBuildStore(builder, parameterValueRef, allocation)
+            param.llvmValue = LLVMBuildLoad(builder, allocation, "")
         }
         super.visit(functionLiteral)
         blocks.pop()
