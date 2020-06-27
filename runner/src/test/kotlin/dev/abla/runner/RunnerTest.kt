@@ -73,6 +73,11 @@ class RunnerTest : KoinComponent {
     }
 
     @Test
+    fun testBuiltInTypeFunctions() = runResourceFile("examples/test_builtin_type_functions.ab") {
+        println(it)
+    }
+
+    @Test
     fun testFunctionLiterals() = runResourceFile("examples/test_function_literals.ab") {
         println(it)
         assert(it.contains("%0 = call i32 @funliteral"))
