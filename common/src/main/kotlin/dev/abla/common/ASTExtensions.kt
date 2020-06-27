@@ -7,6 +7,7 @@ import dev.abla.utils.BackingField
 var File.symbolTable: SymbolTable? by BackingField.nullable()
 var FunctionDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
 var ClassDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
+var FunctionLiteral.symbolTable: SymbolTable? by BackingField.nullable()
 var Block.symbolTable: SymbolTable? by BackingField.nullable()
 var PropertyDeclaration.symbolTable: SymbolTable? by BackingField.nullable()
 var Node.symbol: Symbol<*>? by BackingField.nullable()

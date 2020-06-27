@@ -78,12 +78,16 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         createTableInParent { table ->
-            functionLiteral.block.symbolTable = table
-            withScope(Scope.Function) {
-                functionLiteral.parameters.forEach {
-                    table.symbols.add(Symbol.Variable(it.name, it))
+            functionLiteral.symbolTable = table
+            functionLiteral.parameters.forEach {
+                table.symbols.add(Symbol.Variable(it.name, it))
+            }
+
+            createTableInParent { blockTable ->
+                functionLiteral.block.symbolTable = blockTable
+                withScope(Scope.Function) {
+                    super.visit(functionLiteral)
                 }
-                super.visit(functionLiteral)
             }
         }
     }

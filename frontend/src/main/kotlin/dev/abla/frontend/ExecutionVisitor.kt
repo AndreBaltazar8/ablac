@@ -415,6 +415,9 @@ class ExecutionVisitor(
                     }
                     is FunctionLiteral -> {
                         val numValues = values.size
+                        it.parameters.reversed().forEach { param ->
+                            currentScope!![param.name] = values.pop()
+                        }
                         it.block.accept(this)
                         values.clearUntilSaveLast(numValues)
                     }
