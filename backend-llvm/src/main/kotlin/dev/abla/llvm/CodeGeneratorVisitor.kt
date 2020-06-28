@@ -206,9 +206,30 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         val returnType = functionLiteral.forcedReturnType ?: functionLiteral.block.returnType ?: UserType.Void
+        val argTypes = functionLiteral.parameters.map {
+            try {
+                it.type!!.llvmType(generatorContext.topBlock.table)
+            } catch (e: Exception) {
+                throw Exception("${it.name}: ${e.message}", e)
+            }
+        }
+        val function = module.addFunction(
+            "funliteral" + functionLiteral.hashCode(),
+            returnType.llvmType(generatorContext.topBlock.table),
+            argTypes.toTypedArray()
+        )
+        functionLiteral.llvmValue = function.valueRef
         val numValues = generatorContext.values.size
         val block = functionLiteral.llvmBlock!!
+        LLVMAppendExistingBasicBlock(function.valueRef, block)
+        val builder = LLVMCreateBuilder()
         val currentBlock = generatorContext.pushBlock(block, functionLiteral.block.symbolTable!!)
+        for ((index, param) in functionLiteral.parameters.withIndex()) {
+            val parameterValueRef = LLVMGetParam(function.valueRef, index)
+            LLVMPositionBuilderBefore(builder, param.llvmValue!!)
+            val allocation = LLVMGetOperand(param.llvmValue!!, 0)
+            LLVMBuildStore(builder, parameterValueRef, allocation)
+        }
         functionLiteral.block.accept(this)
         if (!currentBlock.hasReturned) {
             currentBlock.createBuilderAtEnd { builder ->

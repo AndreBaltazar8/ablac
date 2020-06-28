@@ -136,29 +136,19 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
     override suspend fun visit(functionLiteral: FunctionLiteral) {
         val table = functionLiteral.block.symbolTable!!
-        val returnType = functionLiteral.forcedReturnType ?: functionLiteral.block.returnType ?: UserType.Void
-        val argTypes = functionLiteral.parameters.map {
-            try {
-                it.type!!.llvmType(table)
-            } catch (e: Exception) {
-                throw Exception("${it.name}: ${e.message}", e)
-            }
-        }
-        val function = module.addFunction("funliteral" + functionLiteral.hashCode(), returnType.llvmType(table), argTypes.toTypedArray())
-        functionLiteral.llvmValue = function.valueRef
-
-        val block = function.createBasicBlock("entry")
+        val tmpFunction = module.addFunction("%%tmpFnc", LLVMVoidType(), arrayOf(), false)
+        val block = tmpFunction.createBasicBlock("entry")
         functionLiteral.llvmBlock = block
         blocks.push(block)
         val builder = block.createBuilderAtEnd()
-        for ((index, param) in functionLiteral.parameters.withIndex()) {
-            val parameterValueRef = LLVMGetParam(function.valueRef, index)
-            val allocation = LLVMBuildAlloca(builder, argTypes[index], "")
-            LLVMBuildStore(builder, parameterValueRef, allocation)
+        for (param in functionLiteral.parameters) {
+            val allocation = LLVMBuildAlloca(builder, param.type!!.llvmType(table), "")
             param.llvmValue = LLVMBuildLoad(builder, allocation, "")
         }
         super.visit(functionLiteral)
         blocks.pop()
+        LLVMRemoveBasicBlockFromParent(block)
+        LLVMDeleteFunction(tmpFunction.valueRef)
     }
 
     override suspend fun visit(ifElseExpression: IfElseExpression) {
