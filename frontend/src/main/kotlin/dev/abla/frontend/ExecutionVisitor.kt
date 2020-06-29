@@ -217,6 +217,7 @@ class ExecutionVisitor(
                     finalStatements.add(it)
                 }
                 method.block!!.statements = finalStatements
+                TypeGather(method.block!!.symbolTable!!.parent!!).generateSymbolTable(method.block!!)
 
                 ExecutionValue.Value(Integer("1", positionZero))
             }

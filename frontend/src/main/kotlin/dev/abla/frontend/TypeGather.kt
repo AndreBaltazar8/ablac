@@ -184,4 +184,14 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         action()
         currentScope = prevScope
     }
+
+    suspend fun generateSymbolTable(block: Block) {
+        createTableInParent { blockTable ->
+            block.symbolTable = blockTable
+
+            withScope(Scope.Function) {
+                block.accept(this)
+            }
+        }
+    }
 }
