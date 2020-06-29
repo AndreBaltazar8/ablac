@@ -427,7 +427,7 @@ class ExecutionVisitor(
                     is FunctionDeclaration -> {
                         val isMemberAccess = functionCall.expression is MemberAccess
                         it.callInfo = CallInfo(
-                            if (isMemberAccess) values.peek()!! as ExecutionValue.Instance else null,
+                            if (isMemberAccess) values.peek()!! else null,
                             functionCall.typeArgs
                         )
                         it.accept(this)
@@ -441,15 +441,37 @@ class ExecutionVisitor(
     override suspend fun visit(memberAccess: MemberAccess) {
         super.visit(memberAccess)
         if (executionLayer > 0) {
-            val classInstance = values.peek() as ExecutionValue.Instance
-            val classType = classInstance.type
-            if (classType !is UserType)
-                throw NotImplementedError("Unsupported")
-            val symbol = currentTable!!.find(classType.identifier)
-            if (symbol !is Symbol.Class)
-                throw NotImplementedError("Unsupported")
+            val classInstance = values.peek()
+            lateinit var classType: Type
+            lateinit var classScope: ExecutionScope
+            when (classInstance) {
+                is ExecutionValue.Instance -> {
+                    classType = classInstance.type
+                    if (classType !is UserType)
+                        throw NotImplementedError("Unsupported")
+                    var symbol = currentTable!!.find(classType.identifier)
+                    if (symbol == null) {
+                        requirePendingImports()
+                        symbol = currentTable!!.find(classType.identifier)
+                    }
+                    if (symbol !is Symbol.Class)
+                        throw NotImplementedError("Unsupported")
+                    classScope = classInstance.scope
+                }
+                is ExecutionValue.Value -> {
+                    classType = classInstance.value.inferredType as UserType
+                    var symbol = currentTable!!.find(classType.identifier)
+                    if (symbol == null) {
+                        requirePendingImports()
+                        symbol = currentTable!!.find(classType.identifier)
+                    }
+                    if (symbol !is Symbol.Class)
+                        throw NotImplementedError("Unsupported")
+                    classScope = ExecutionScope(null, symbol.node.symbolTable!!)
+                }
+            }
             val previousScope = currentScope
-            currentScope = classInstance.scope
+            currentScope = classScope
             IdentifierExpression(memberAccess.name, memberAccess.position).apply {
                 returnForAssignment = memberAccess.returnForAssignment
                 accept(this@ExecutionVisitor)
@@ -678,7 +700,7 @@ class ExecutionVisitor(
     }
 
     data class CallInfo(
-        val instance: ExecutionValue.Instance?,
+        val instance: ExecutionValue?,
         val types: MutableList<Type>
     )
 
