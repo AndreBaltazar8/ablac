@@ -12,4 +12,11 @@ class IfElseExpression(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): IfElseExpression = IfElseExpression(
+        condition.deepCopy(),
+        ifBody.deepCopy(),
+        elseBody?.deepCopy(),
+        position.copy()
+    )
 }

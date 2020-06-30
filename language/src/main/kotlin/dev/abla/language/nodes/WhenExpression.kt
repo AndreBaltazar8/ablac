@@ -2,6 +2,8 @@ package dev.abla.language.nodes
 
 import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
+import dev.abla.utils.DeepCopy
+import dev.abla.utils.deepCopy
 
 class WhenExpression(
     var condition: Expression?,
@@ -12,8 +14,24 @@ class WhenExpression(
         visitor.visit(this)
     }
 
-    open class Case(open var body: Block)
-    data class ExpressionCase(var expressions: MutableList<Expression>, override var body: Block) : Case(body)
-    data class ElseCase(override var body: Block) : Case(body)
+    override fun deepCopy(): WhenExpression = WhenExpression(
+        condition?.deepCopy(),
+        cases.deepCopy(),
+        position.copy()
+    )
 
+    abstract class Case(open var body: Block) : DeepCopy<Case>
+
+    data class ExpressionCase(var expressions: MutableList<Expression>, override var body: Block) : Case(body) {
+        override fun deepCopy(): ExpressionCase = ExpressionCase(
+            expressions.deepCopy(),
+            body.deepCopy()
+        )
+    }
+
+    data class ElseCase(override var body: Block) : Case(body) {
+        override fun deepCopy(): ElseCase = ElseCase(
+            body.deepCopy()
+        )
+    }
 }

@@ -2,6 +2,7 @@ package dev.abla.language.nodes
 
 import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
+import dev.abla.utils.deepCopy
 
 data class FunctionCall(
     var expression: Expression,
@@ -12,4 +13,11 @@ data class FunctionCall(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): FunctionCall = FunctionCall(
+        expression.deepCopy(),
+        arguments.deepCopy(),
+        typeArgs.deepCopy(),
+        position.copy()
+    )
 }

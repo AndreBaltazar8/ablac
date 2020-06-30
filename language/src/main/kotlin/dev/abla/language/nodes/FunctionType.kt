@@ -1,6 +1,7 @@
 package dev.abla.language.nodes
 
 import dev.abla.language.Position
+import dev.abla.utils.deepCopy
 
 data class FunctionType(
     val parameters: Array<Parameter>,
@@ -29,4 +30,11 @@ data class FunctionType(
         result = 31 * result + (receiver?.hashCode() ?: 0)
         return result
     }
+
+    override fun deepCopy(): FunctionType = FunctionType(
+        parameters.deepCopy(),
+        returnType.deepCopy(),
+        receiver?.deepCopy(),
+        position.copy()
+    )
 }

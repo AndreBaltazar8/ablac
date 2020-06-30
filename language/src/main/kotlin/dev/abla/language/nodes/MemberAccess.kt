@@ -11,4 +11,10 @@ data class MemberAccess(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): MemberAccess = MemberAccess(
+        expression.deepCopy(),
+        name,
+        position.copy()
+    )
 }

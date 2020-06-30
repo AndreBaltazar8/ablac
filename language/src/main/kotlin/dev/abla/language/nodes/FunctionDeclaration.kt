@@ -2,6 +2,7 @@ package dev.abla.language.nodes
 
 import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
+import dev.abla.utils.deepCopy
 
 open class FunctionDeclaration(
     var name: String,
@@ -21,4 +22,16 @@ open class FunctionDeclaration(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): FunctionDeclaration = FunctionDeclaration(
+        name,
+        parameters.deepCopy(),
+        block?.deepCopy(),
+        returnType?.deepCopy(),
+        modifiers.deepCopy(),
+        annotations.deepCopy(),
+        receiver?.deepCopy(),
+        genericTypes.deepCopy(),
+        position.copy()
+    )
 }

@@ -11,4 +11,9 @@ class IdentifierExpression(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): IdentifierExpression = IdentifierExpression(
+        identifier,
+        position.copy()
+    )
 }

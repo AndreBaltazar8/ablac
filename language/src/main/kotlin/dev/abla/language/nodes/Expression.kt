@@ -1,3 +1,5 @@
 package dev.abla.language.nodes
 
-interface Expression : Statement
+interface Expression : Statement {
+    override fun deepCopy(): Expression
+}

@@ -7,4 +7,9 @@ data class Integer(var number: String, override val position: Position) : Litera
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): Integer = Integer(
+        number,
+        position.copy()
+    )
 }

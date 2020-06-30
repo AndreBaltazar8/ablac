@@ -1,3 +1,5 @@
 package dev.abla.language.nodes
 
-interface Literal : Expression
+interface Literal : Expression {
+    override fun deepCopy(): Literal
+}

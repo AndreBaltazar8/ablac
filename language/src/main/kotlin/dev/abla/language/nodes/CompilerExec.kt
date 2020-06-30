@@ -10,4 +10,9 @@ class CompilerExec(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): CompilerExec = CompilerExec(
+        expression.deepCopy(),
+        position.copy()
+    )
 }

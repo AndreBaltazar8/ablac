@@ -12,6 +12,13 @@ data class BinaryOperation(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): BinaryOperation = BinaryOperation(
+        operator,
+        lhs.deepCopy(),
+        rhs.deepCopy(),
+        position.copy()
+    )
 }
 
 enum class BinaryOperator {

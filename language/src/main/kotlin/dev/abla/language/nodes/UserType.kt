@@ -3,6 +3,7 @@ package dev.abla.language.nodes
 import dev.abla.language.Identifier
 import dev.abla.language.Position
 import dev.abla.language.positionZero
+import dev.abla.utils.deepCopy
 
 data class UserType(
     val identifier: Identifier,
@@ -38,6 +39,13 @@ data class UserType(
         result = 31 * result + (parent?.hashCode() ?: 0)
         return result
     }
+
+    override fun deepCopy(): UserType = UserType(
+        identifier,
+        types.deepCopy(),
+        parent?.deepCopy(),
+        position.copy()
+    )
 
     companion object {
         val builtInTypes = mutableSetOf<String>()

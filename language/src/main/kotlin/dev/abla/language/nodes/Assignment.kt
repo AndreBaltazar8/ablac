@@ -11,4 +11,10 @@ class Assignment(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): Assignment = Assignment(
+        lhs.deepCopy(),
+        rhs.deepCopy(),
+        position.copy()
+    )
 }

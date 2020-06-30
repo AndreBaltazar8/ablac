@@ -12,4 +12,11 @@ class WhileStatement(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): WhileStatement = WhileStatement(
+        condition.deepCopy(),
+        block.deepCopy(),
+        doWhile,
+        position.copy()
+    )
 }

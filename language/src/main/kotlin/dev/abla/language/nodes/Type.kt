@@ -1,8 +1,9 @@
 package dev.abla.language.nodes
 
 import dev.abla.language.Position
+import dev.abla.utils.DeepCopy
 
-interface Type {
+interface Type : DeepCopy<Type> {
     val position: Position
     fun toHuman(): String
 }

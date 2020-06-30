@@ -10,4 +10,9 @@ data class ArrayLiteral(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): ArrayLiteral = ArrayLiteral(
+        elements.map { it.deepCopy() }.toMutableList(),
+        position.copy()
+    )
 }

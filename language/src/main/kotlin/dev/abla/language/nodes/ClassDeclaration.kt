@@ -2,6 +2,8 @@ package dev.abla.language.nodes
 
 import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
+import dev.abla.utils.DeepCopy
+import dev.abla.utils.deepCopy
 
 open class ClassDeclaration(
     var name: String,
@@ -18,6 +20,17 @@ open class ClassDeclaration(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): ClassDeclaration = ClassDeclaration(
+        name,
+        modifiers.deepCopy(),
+        annotations.deepCopy(),
+        constructor?.deepCopy(),
+        declarations.deepCopy(),
+        classType,
+        isInterface,
+        position.copy()
+    )
 }
 
 object ClassType {
@@ -25,4 +38,10 @@ object ClassType {
     const val Interface = "interface"
 }
 
-class ClassConstructor(val modifiers: MutableList<Modifier>, val parameters: MutableList<Node>, val position: Position)
+class ClassConstructor(val modifiers: MutableList<Modifier>, val parameters: MutableList<Node>, val position: Position) : DeepCopy<ClassConstructor> {
+    override fun deepCopy(): ClassConstructor = ClassConstructor(
+        modifiers.deepCopy(),
+        parameters.deepCopy(),
+        position.copy()
+    )
+}

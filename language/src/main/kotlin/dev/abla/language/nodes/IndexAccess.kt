@@ -11,4 +11,10 @@ data class IndexAccess(
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)
     }
+
+    override fun deepCopy(): IndexAccess = IndexAccess(
+        expression.deepCopy(),
+        index.deepCopy(),
+        position.copy()
+    )
 }
