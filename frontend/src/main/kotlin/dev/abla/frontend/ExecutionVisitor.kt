@@ -7,6 +7,7 @@ import dev.abla.language.ASTVisitor
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
 import dev.abla.utils.BackingField
+import dev.abla.utils.deepCopy
 import dev.abla.utils.statementOrder
 import kotlinx.coroutines.Job
 import java.lang.IllegalStateException
@@ -209,12 +210,12 @@ class ExecutionVisitor(
                     if (it is FunctionCall) {
                         val expression = it.expression
                         if (expression is IdentifierExpression && expression.identifier == wrapLiteral.parameters[0].name) {
-                            finalStatements.addAll(method.block!!.statements)
+                            finalStatements.addAll(method.block!!.statements.deepCopy())
                             return@forEach
                         }
                     }
 
-                    finalStatements.add(it)
+                    finalStatements.add(it.deepCopy())
                 }
                 method.block!!.statements = finalStatements
                 TypeGather(method.block!!.symbolTable!!.parent!!).generateSymbolTable(method.block!!)
