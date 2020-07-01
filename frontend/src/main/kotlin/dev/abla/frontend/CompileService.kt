@@ -135,6 +135,10 @@ class CompileService(
             ExecutionValue.Value(Integer("1", positionZero))
         }
 
+        addCompileFunction("code", mutableListOf(Parameter("code", FunctionType(arrayOf(), UserType.Any, null, positionZero)))) { _, args, _ ->
+            ExecutionValue.CompilerNode((args[0] as FunctionLiteral).block)
+        }
+
         // TODO: Remove. This is just an example on how to declare functions from compiler
         addCompileFunction("declareFun", mutableListOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))) { executionVisitor, args, _ ->
             val name = "declared<$compileNumber>"

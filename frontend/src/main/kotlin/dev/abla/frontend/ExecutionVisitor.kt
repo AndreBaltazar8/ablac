@@ -46,7 +46,18 @@ class ExecutionVisitor(
 
     override suspend fun visit(block: Block) {
         withTable(block.symbolTable) {
-            super.visit(block)
+            var index = 0
+            while (index < block.statements.size) {
+                val statement = block.statements[index]
+                try {
+                    statement.accept(this)
+                    index++
+                } catch (e: ReplaceWithCode) {
+                    block.statements.removeAt(index)
+                    block.statements.addAll(index, e.block.statements)
+                    TypeGather(block.symbolTable!!).visitStatements(e.block.statements)
+                }
+            }
         }
     }
 
@@ -333,10 +344,26 @@ class ExecutionVisitor(
             executionLayer++
             super.visit(compilerExec)
             compilerExec.compiled = true
-            if (values.size == 0)
+            if (values.size == 0) {
                 compilerExec.expression = Integer("0", positionZero)
-            else
-                compilerExec.expression = if (executionLayer > 1) values.peek().value else values.pop().value
+            } else {
+                val executionValue = values.peek()
+                when {
+                    executionValue is ExecutionValue.Value ->
+                        compilerExec.expression = if (executionLayer > 1) executionValue.value else values.pop().value
+                    executionValue is ExecutionValue.CompilerNode -> {
+                        when (val node = executionValue.node) {
+                            is Expression -> compilerExec.expression = node
+                            is Block -> {
+                                executionLayer--
+                                throw ReplaceWithCode(node)
+                            }
+                            else -> throw Exception("Unsupported")
+                        }
+                    }
+                    else -> throw Exception("Unsupported returned execution value")
+                }
+            }
             executionLayer--
         } else {
             super.visit(compilerExec)
@@ -705,6 +732,8 @@ class ExecutionVisitor(
         val instance: ExecutionValue?,
         val types: MutableList<Type>
     )
+
+    class ReplaceWithCode(val block: Block) : Throwable("")
 
     var FunctionDeclaration.callInfo: CallInfo? by BackingField.nullable()
 }

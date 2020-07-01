@@ -194,4 +194,8 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
             }
         }
     }
+
+    suspend fun visitStatements(statements: MutableList<Statement>) {
+        statements.forEach { it.accept(this) }
+    }
 }
