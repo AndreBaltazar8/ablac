@@ -8,7 +8,7 @@ class CompilerFunctionDeclaration(
     parameters: MutableList<Parameter>,
     modifiers: MutableList<Modifier>,
     typeParameters: MutableList<TypeDefParam>,
-    val executionBlock: suspend (ExecutionVisitor, Array<Any>, Array<Type>) -> ExecutionValue
+    val executionBlock: suspend (ExecutionVisitor, Array<Any>, Array<Type>) -> ExecutionValue?
 ) : FunctionDeclaration(
     name,
     parameters,

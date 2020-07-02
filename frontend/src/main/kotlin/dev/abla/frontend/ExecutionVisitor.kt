@@ -426,9 +426,19 @@ class ExecutionVisitor(
                 else -> throw IllegalStateException("Unknown callable for $functionCall")
             }
 
-            function.let {
+            function.also {
                 when (it) {
                     is CompilerFunctionDeclaration -> {
+                        assignForceReturnType(functionCall) { index -> it.parameters[index].type }
+                        functionCall.arguments.forEachIndexed { index, argument ->
+                            val value = argument.value
+                            if (value is FunctionLiteral) {
+                                val argType = it.parameters[index].type
+                                val literalReturnType = (argType as FunctionType).returnType
+                                if (literalReturnType.isNullOrVoid())
+                                    value.forcedReturnType = UserType.Void
+                            }
+                        }
                         // TODO: support passing instances to compiler functions
                         // TODO: support void functions at compile time
                         if (functionCall.expression is MemberAccess)
@@ -440,20 +450,38 @@ class ExecutionVisitor(
                             }.reversed().toTypedArray(),
                             functionCall.typeArgs.toTypedArray()
                         )
-                        values.add(returnValue)
+
+                        if (returnValue != null)
+                            values.add(returnValue)
                     }
                     is FunctionLiteral -> {
+                        assignForceReturnType(functionCall) { index -> it.parameters[index].type!! }
                         val numValues = values.size
+                        // TODO: fix return type from block at compile time
+                        //val returnType = it.forcedReturnType ?: it.block.returnType ?: UserType.Void
                         it.parameters.reversed().forEach { param ->
                             currentScope!![param.name] = values.pop()
                         }
                         it.block.accept(this)
+                        /*if (values.isNotEmpty() && !returnType.isNullOrVoid()) {
+                            values.clearUntilSaveLast(numValues)
+                        } else {
+                            values.clearUntil(numValues)
+                        }*/
                         values.clearUntilSaveLast(numValues)
                     }
                     is ClassDeclaration -> {
+                        assignForceReturnType(functionCall) { index ->
+                            when (val param = it.constructor!!.parameters[index]) {
+                                is PropertyDeclaration -> param.type!!
+                                is Parameter -> param.type
+                                else -> throw Exception("Unknown!")
+                            }
+                        }
                         values.push(it.createInstance())
                     }
                     is FunctionDeclaration -> {
+                        assignForceReturnType(functionCall) { index -> it.parameters[index].type }
                         val isMemberAccess = functionCall.expression is MemberAccess
                         it.callInfo = CallInfo(
                             if (isMemberAccess) values.peek()!! else null,
@@ -463,6 +491,18 @@ class ExecutionVisitor(
                     }
                     else -> throw NotImplementedError("Unsupported")
                 }
+            }
+        }
+    }
+
+    private fun assignForceReturnType(functionCall: FunctionCall, paramType: (Int) -> Type) {
+        functionCall.arguments.forEachIndexed { index, argument ->
+            val value = argument.value
+            if (value is FunctionLiteral) {
+                val argType = paramType(index)
+                val literalReturnType = (argType as FunctionType).returnType
+                if (literalReturnType.isNullOrVoid())
+                    value.forcedReturnType = UserType.Void
             }
         }
     }
