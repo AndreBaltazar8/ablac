@@ -241,9 +241,9 @@ class ExecutionVisitor(
                     super.modify(identifier, value)
                     when (identifier) {
                         "block" -> {
-                            val block = (value as ExecutionValue.CompilerNode).node as Block
-                            block.symbolTable = sym.node.block!!.symbolTable // TODO: compute better symbol table
+                            val block = ((value as ExecutionValue.CompilerNode).node as Block).deepCopy()
                             sym.node.block = block
+                            TypeGather(sym.node.symbolTable!!).generateSymbolTable(block)
                         }
                         "name" -> {
                             val newName = (value as ExecutionValue.Value).toValue(this) as String
