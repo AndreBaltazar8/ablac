@@ -584,7 +584,18 @@ class ExecutionVisitor(
                 withTable(ifBody.symbolTable) {
                     ifBody.accept(this)
                 }
+
+                // TODO: debate if this should be executed as layer 0 or not still
+                val prevExecLayer = executionLayer
+                executionLayer = 0
+                elseBody?.accept(this)
+                executionLayer = prevExecLayer
             } else if (!conditionTrue && elseBody != null) {
+                val prevExecLayer = executionLayer
+                executionLayer = 0
+                ifBody.accept(this)
+                executionLayer = prevExecLayer
+
                 withTable(elseBody.symbolTable) {
                     elseBody.accept(this)
                 }
