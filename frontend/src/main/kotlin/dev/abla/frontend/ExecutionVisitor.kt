@@ -213,7 +213,10 @@ class ExecutionVisitor(
 
                 annotation.value!!
             }
-            replaceFunction("wrap") { _, args, _ ->
+            replaceFunction(
+                "wrap",
+                mutableListOf(Parameter("fn", FunctionType(arrayOf(Parameter("body", UserType.Any)), UserType.Void, null, positionZero)))
+            ) { _, args, _ ->
                 val wrapLiteral = args[0] as FunctionLiteral
                 val method = sym.node
                 val finalStatements = mutableListOf<Statement>()
