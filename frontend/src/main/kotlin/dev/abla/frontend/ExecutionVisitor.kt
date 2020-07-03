@@ -457,18 +457,16 @@ class ExecutionVisitor(
                     is FunctionLiteral -> {
                         assignForceReturnType(functionCall) { index -> it.parameters[index].type!! }
                         val numValues = values.size
-                        // TODO: fix return type from block at compile time
-                        //val returnType = it.forcedReturnType ?: it.block.returnType ?: UserType.Void
                         it.parameters.reversed().forEach { param ->
                             currentScope!![param.name] = values.pop()
                         }
                         it.block.accept(this)
-                        /*if (values.isNotEmpty() && !returnType.isNullOrVoid()) {
+                        val returnType = it.forcedReturnType ?: it.block.returnType ?: UserType.Void
+                        if (values.isNotEmpty() && !returnType.isNullOrVoid()) {
                             values.clearUntilSaveLast(numValues)
                         } else {
                             values.clearUntil(numValues)
-                        }*/
-                        values.clearUntilSaveLast(numValues)
+                        }
                     }
                     is ClassDeclaration -> {
                         assignForceReturnType(functionCall) { index ->
