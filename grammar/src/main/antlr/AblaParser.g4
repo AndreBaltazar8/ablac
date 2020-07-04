@@ -46,7 +46,7 @@ functionTypeReceiver : parenthesizedType | nullableType | userType ;
 functionTypeParameters : (LPAREN RPAREN) | (LPAREN functionTypeParameter (COMMA functionTypeParameter)* COMMA? RPAREN) ;
 functionTypeParameter: (parameter | type) ;
 
-nullableType: userType QUEST ;
+nullableType: (userType | parenthesizedType) QUEST ;
 
 annotation : simpleIdentifier valueArguments? ;
 annotations : (AT annotation (COMMA annotation)*)+ ;

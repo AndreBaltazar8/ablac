@@ -121,7 +121,11 @@ fun AblaParser.TypeContext.toAST(): Type {
     val type = userType()?.toAST() ?:
     parenthesizedType()?.type()?.toAST() ?:
     functionType()?.toAST() ?:
-    nullableType()?.userType()?.let { NullableType(it.toAST(), position) } ?:
+    nullableType()?.let {
+        it.parenthesizedType()?.type()?.toAST() ?:
+            userType()?.toAST() ?:
+            throw IllegalStateException("Unknown nullable type in $text, $position")
+    }?.let { NullableType(it, position) } ?:
     throw IllegalStateException("Unknown type in $text, $position")
 
     return MUL().fold(type) { acc, _ -> PointerType(acc, position) }
