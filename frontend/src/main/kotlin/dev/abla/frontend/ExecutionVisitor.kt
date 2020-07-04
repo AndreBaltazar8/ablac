@@ -4,6 +4,7 @@ import com.sun.jna.NativeLibrary
 import com.sun.jna.Pointer
 import dev.abla.common.*
 import dev.abla.language.ASTVisitor
+import dev.abla.language.Position
 import dev.abla.language.nodes.*
 import dev.abla.language.positionZero
 import dev.abla.utils.BackingField
@@ -74,16 +75,20 @@ class ExecutionVisitor(
             executionLayer--
 
             if (executionLayer > 0) {
-                if (functionDeclaration.callInfo == null)
-                    return@withTable
+                val callInfo = functionDeclaration.callInfo ?: return@withTable
 
                 if (functionDeclaration.isCompiler)
                     populateCompilerContext(functionDeclaration)
 
-                if (functionDeclaration.callInfo?.instance != null)
+                if (callInfo.instance != null)
                     currentScope!!["this"] = values.pop()
-                functionDeclaration.parameters.reversed().forEach {
-                    currentScope!![it.name] = values.pop()
+                functionDeclaration.parameters.withIndex().reversed().forEach { (index, param) ->
+                    if (index >= callInfo.arguments.size) {
+                        val expression = param.expression
+                            ?: throw Exception("Missing value for param ${param.name}:$index to call ${functionDeclaration.name}")
+                        expression.accept(this)
+                    }
+                    currentScope!![param.name] = values.pop()
                 }
 
                 functionDeclaration.callInfo = null
@@ -136,14 +141,14 @@ class ExecutionVisitor(
         val symbol = findClassSymbol("CompilerContext")
 
         symbol.node.symbolTable!!.symbols.apply {
-            replaceFunction("rename", mutableListOf(Parameter("fnName", UserType.String))) { _, args, _ ->
+            replaceFunction("rename", mutableListOf(AssignableParameter("fnName", UserType.String))) { _, args, _ ->
                 functionDeclaration.name = args[0] as String
                 functionDeclaration.symbol.name = args[0] as String
                 ExecutionValue.Value(Integer("1", positionZero))
             }
             replaceFunction(
                 "setBody",
-                mutableListOf(Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
+                mutableListOf(AssignableParameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
             ) { _, args, _ ->
                 val block = (args[0] as FunctionLiteral).block.copy()
                 block.symbolTable = (args[0] as FunctionLiteral).block.symbolTable // TODO: compute a better symbol table for this
@@ -153,8 +158,8 @@ class ExecutionVisitor(
             replaceFunction(
                 "modify",
                 mutableListOf(
-                    Parameter("fnName", UserType.String),
-                    Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero))
+                    AssignableParameter("fnName", UserType.String),
+                    AssignableParameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero))
                 )
             ) { _, args, _ ->
                 val sym = functionDeclaration.symbolTable!!.find(args[0] as String)
@@ -164,18 +169,18 @@ class ExecutionVisitor(
                 sym.node.block!!.symbolTable = sym.node.symbolTable
                 ExecutionValue.Value(Integer("1", positionZero))
             }
-            replaceFunction("find", mutableListOf(Parameter("fnName", UserType.String))) { _, args, _ ->
+            replaceFunction("find", mutableListOf(AssignableParameter("fnName", UserType.String))) { _, args, _ ->
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
                 createCompileFunctionContext(sym)
             }
             replaceFunction("type") { _, _, typeArgs ->
                 createCompileClassContext(findClassSymbol(typeArgs[0].toHuman()))
             }
-            replaceFunction("findClass", mutableListOf(Parameter("className", UserType.String))) { _, args, _ ->
+            replaceFunction("findClass", mutableListOf(AssignableParameter("className", UserType.String))) { _, args, _ ->
                 val sym = symbol.node.symbolTable!!.find(args[0] as String)
                 createCompileClassContext(sym)
             }
-            replaceFunction("findAnnotated", mutableListOf(Parameter("annotation", UserType.String))) { _, args, _ ->
+            replaceFunction("findAnnotated", mutableListOf(AssignableParameter("annotation", UserType.String))) { _, args, _ ->
                 val annotationName = args[0] as String
                 val symbolTable = symbol.node.symbolTable!!
                 val sym = symbolTable.findFunction { it.node.annotations.any { annotation -> annotation.name == annotationName } }
@@ -183,7 +188,7 @@ class ExecutionVisitor(
             }
             replaceFunction(
                 "defineInClass",
-                mutableListOf(Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
+                mutableListOf(AssignableParameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
             ) { _, args, _ ->
                 (args[0] as FunctionLiteral).block.statements.filterIsInstance<FunctionDeclaration>().forEach { func ->
                     val classSymbol = functionDeclaration.symbol.receiver!!
@@ -215,7 +220,7 @@ class ExecutionVisitor(
             }
             replaceFunction(
                 "wrap",
-                mutableListOf(Parameter("fn", FunctionType(arrayOf(Parameter("body", UserType.Any)), UserType.Void, null, positionZero)))
+                mutableListOf(AssignableParameter("fn", FunctionType(arrayOf(Parameter("body", UserType.Any)), UserType.Void, null, positionZero)))
             ) { _, args, _ ->
                 val wrapLiteral = args[0] as FunctionLiteral
                 val method = sym.node
@@ -486,7 +491,9 @@ class ExecutionVisitor(
                         val isMemberAccess = functionCall.expression is MemberAccess
                         it.callInfo = CallInfo(
                             if (isMemberAccess) values.peek()!! else null,
-                            functionCall.typeArgs
+                            functionCall.typeArgs,
+                            functionCall.arguments,
+                            functionCall.position
                         )
                         it.accept(this)
                     }
@@ -782,7 +789,9 @@ class ExecutionVisitor(
 
     data class CallInfo(
         val instance: ExecutionValue?,
-        val types: MutableList<Type>
+        val types: MutableList<Type>,
+        val arguments: MutableList<Argument>,
+        val position: Position
     )
 
     class ReplaceWithCode(val block: Block) : Throwable("")
@@ -806,7 +815,7 @@ private fun <E> Stack<E>.clearUntilSaveLast(toKeep: Int) {
 
 private fun MutableList<Symbol<*>>.replaceFunction(
     name: String,
-    parameters: MutableList<Parameter> = mutableListOf(),
+    parameters: MutableList<AssignableParameter> = mutableListOf(),
     modifiers: MutableList<Modifier> = mutableListOf(),
     typeParameters: MutableList<TypeDefParam> = mutableListOf(),
     executionBlock: suspend (ExecutionVisitor, Array<Any>, Array<Type>) -> ExecutionValue

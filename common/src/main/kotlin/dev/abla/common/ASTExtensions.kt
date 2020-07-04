@@ -29,7 +29,7 @@ fun FunctionDeclaration.toType(): Type =
     FunctionType(
         receiverParameter?.let {
             arrayOf(it, *parameters.toTypedArray())
-        } ?:parameters.toTypedArray(),
+        } ?:parameters.toTypedArray<Parameter>(),
         returnType ?: block?.returnType ?: UserType.Void,
         receiver,
         positionZero

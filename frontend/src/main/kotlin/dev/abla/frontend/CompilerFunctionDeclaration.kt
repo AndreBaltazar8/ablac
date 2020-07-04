@@ -5,7 +5,7 @@ import dev.abla.language.positionZero
 
 class CompilerFunctionDeclaration(
     name: String,
-    parameters: MutableList<Parameter>,
+    parameters: MutableList<AssignableParameter>,
     modifiers: MutableList<Modifier>,
     typeParameters: MutableList<TypeDefParam>,
     val executionBlock: suspend (ExecutionVisitor, Array<Any>, Array<Type>) -> ExecutionValue?

@@ -232,11 +232,11 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         }
         functionLiteral.block.accept(this)
         if (!currentBlock.hasReturned) {
-            currentBlock.createBuilderAtEnd { builder ->
+            currentBlock.createBuilderAtEnd { blockBuilder ->
                 if (generatorContext.values.isNotEmpty() && !returnType.isNullOrVoid())
-                    LLVMBuildRet(builder, generatorContext.topValue.ref)
+                    LLVMBuildRet(blockBuilder, generatorContext.topValue.ref)
                 else
-                    LLVMBuildRetVoid(builder)
+                    LLVMBuildRetVoid(blockBuilder)
             }
             currentBlock.hasReturned = true
         }

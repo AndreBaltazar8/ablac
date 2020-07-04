@@ -6,7 +6,7 @@ import dev.abla.utils.deepCopy
 
 open class FunctionDeclaration(
     var name: String,
-    var parameters: MutableList<Parameter>,
+    var parameters: MutableList<AssignableParameter>,
     var block: Block?,
     var returnType: Type?,
     var modifiers: MutableList<Modifier>,

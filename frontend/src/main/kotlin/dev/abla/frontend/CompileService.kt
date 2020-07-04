@@ -122,7 +122,7 @@ class CompileService(
     }
 
     init {
-        addCompileFunction("import", mutableListOf(Parameter("fileName", UserType.String))) { executionVisitor, args, _ ->
+        addCompileFunction("import", mutableListOf(AssignableParameter("fileName", UserType.String))) { executionVisitor, args, _ ->
             val importName = args[0] as String
             val file = Paths.get(executionVisitor.workingDirectory, importName).toAbsolutePath().toString()
 
@@ -135,12 +135,12 @@ class CompileService(
             ExecutionValue.Value(Integer("1", positionZero))
         }
 
-        addCompileFunction("code", mutableListOf(Parameter("code", FunctionType(arrayOf(), UserType.Any, null, positionZero)))) { _, args, _ ->
+        addCompileFunction("code", mutableListOf(AssignableParameter("code", FunctionType(arrayOf(), UserType.Any, null, positionZero)))) { _, args, _ ->
             ExecutionValue.CompilerNode((args[0] as FunctionLiteral).block)
         }
 
         // TODO: Remove. This is just an example on how to declare functions from compiler
-        addCompileFunction("declareFun", mutableListOf(Parameter("fnName", UserType.String), Parameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))) { executionVisitor, args, _ ->
+        addCompileFunction("declareFun", mutableListOf(AssignableParameter("fnName", UserType.String), AssignableParameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))) { executionVisitor, args, _ ->
             val name = "declared<$compileNumber>"
             compile(name, false, true, CompilationContext(executionVisitor.executionJob, Job(executionVisitor.executionJob))) {
                 File(name, mutableListOf(FunctionDeclaration(args[0] as String, mutableListOf(), (args[1] as FunctionLiteral).block, UserType.Int, mutableListOf(), mutableListOf(), null, mutableListOf(), positionZero)), positionZero)
@@ -152,7 +152,7 @@ class CompileService(
 
     private fun addCompileFunction(
         name: String,
-        parameters: MutableList<Parameter> = mutableListOf(),
+        parameters: MutableList<AssignableParameter> = mutableListOf(),
         modifiers: MutableList<Modifier> = mutableListOf(),
         executionBlock: suspend (ExecutionVisitor, Array<Any>, Array<Type>) -> ExecutionValue
     ) {

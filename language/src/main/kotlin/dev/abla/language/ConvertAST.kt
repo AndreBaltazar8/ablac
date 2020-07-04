@@ -26,7 +26,12 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
     FunctionDeclaration(
         functionName.text,
         functionDeclarationParameters()?.functionDeclarationParameter()?.map {
-            it.parameter().toAST()
+            AssignableParameter(
+                it.parameter().simpleIdentifier().text,
+                it.parameter().type().toAST(),
+                it.expression()?.toAST(),
+                it.position
+            )
         }?.toMutableList() ?: mutableListOf(),
         functionBody()?.toAST(),
         type()?.toAST(),
