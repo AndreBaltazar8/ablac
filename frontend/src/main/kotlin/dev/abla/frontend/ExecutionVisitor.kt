@@ -357,8 +357,11 @@ class ExecutionVisitor(
             } else {
                 val executionValue = values.peek()
                 when {
-                    executionValue is ExecutionValue.Value ->
-                        compilerExec.expression = if (executionLayer > 1) executionValue.value else values.pop().value
+                    executionValue is ExecutionValue.Value -> {
+                        compilerExec.expression = executionValue.value
+                        if (executionLayer == 1)
+                            values.pop()
+                    }
                     executionValue is ExecutionValue.CompilerNode -> {
                         when (val node = executionValue.node) {
                             is Expression -> compilerExec.expression = node
@@ -385,7 +388,7 @@ class ExecutionVisitor(
                     is StringLiteral.StringConst -> it.string
                     is StringLiteral.StringExpression -> {
                         it.expression.accept(this@ExecutionVisitor)
-                        values.pop().value.toValue(currentScope!!).toString()
+                        values.pop().toValue(currentScope!!).toString()
                     }
                     else -> throw IllegalStateException("Unknown string part type ${it.javaClass.simpleName}")
                 }
@@ -454,7 +457,7 @@ class ExecutionVisitor(
                         val returnValue = it.executionBlock(
                             this,
                             functionCall.arguments.reversed().map {
-                                values.pop().value.toValue(currentScope!!)
+                                values.pop().toValue(currentScope!!)
                             }.reversed().toTypedArray(),
                             functionCall.typeArgs.toTypedArray()
                         )
@@ -563,9 +566,9 @@ class ExecutionVisitor(
     override suspend fun visit(binaryOperation: BinaryOperation) {
         if (executionLayer > 0) {
             binaryOperation.lhs.accept(this)
-            val lhsValue = values.pop().value.toValue(currentScope!!) as Int
+            val lhsValue = values.pop().toValue(currentScope!!) as Int
             binaryOperation.rhs.accept(this)
-            val rhsValue = values.pop().value.toValue(currentScope!!) as Int
+            val rhsValue = values.pop().toValue(currentScope!!) as Int
             val result = when (binaryOperation.operator) {
                 BinaryOperator.Plus -> lhsValue + rhsValue
                 BinaryOperator.Minus -> lhsValue - rhsValue
@@ -586,7 +589,7 @@ class ExecutionVisitor(
     override suspend fun visit(ifElseExpression: IfElseExpression) {
         if (executionLayer > 0) {
             ifElseExpression.condition.accept(this)
-            val conditionValue = values.pop().value.toValue(currentScope!!)
+            val conditionValue = values.pop().toValue(currentScope!!)
             val conditionTrue = conditionValue as Int == 1
             val ifBody = ifElseExpression.ifBody
             val elseBody = ifElseExpression.elseBody
@@ -645,7 +648,7 @@ class ExecutionVisitor(
                     {
                         whileStatement.condition.accept(this)
 
-                        val conditionValue = values.pop().value.toValue(currentScope!!)
+                        val conditionValue = values.pop().toValue(currentScope!!)
                         val conditionTrue = conditionValue as Int == 1
 
                         if (!conditionTrue) {
@@ -671,7 +674,7 @@ class ExecutionVisitor(
 
             if (condition != null) {
                 condition.accept(this)
-                valueToCompare = values.pop().value.toValue(currentScope!!)
+                valueToCompare = values.pop().toValue(currentScope!!)
             }
 
             loop@ for (case in whenExpression.cases) {
@@ -683,7 +686,7 @@ class ExecutionVisitor(
                     is WhenExpression.ExpressionCase -> {
                         for (expression in case.expressions) {
                             expression.accept(this)
-                            val value = values.pop().value.toValue(currentScope!!)
+                            val value = values.pop().toValue(currentScope!!)
                             if (condition != null) {
                                 if (value == valueToCompare) {
                                     case.body.accept(this)
@@ -752,7 +755,7 @@ class ExecutionVisitor(
                         is StringLiteral.StringConst -> it.string
                         is StringLiteral.StringExpression -> {
                             it.expression.accept(this@ExecutionVisitor)
-                            values.pop().value.toValue(currentScope).toString()
+                            values.pop().toValue(currentScope).toString()
                         }
                         else -> throw IllegalStateException("Unknown string part type ${it.javaClass.simpleName}")
                     }
