@@ -150,9 +150,9 @@ class ExecutionVisitor(
                 "setBody",
                 mutableListOf(AssignableParameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
             ) { _, args, _ ->
-                val block = (args[0] as FunctionLiteral).block.copy()
-                block.symbolTable = (args[0] as FunctionLiteral).block.symbolTable // TODO: compute a better symbol table for this
+                val block = (args[0] as FunctionLiteral).block.deepCopy()
                 functionDeclaration.block = block
+                TypeGather(functionDeclaration.symbolTable!!).generateSymbolTable(block)
                 ExecutionValue.Value(Integer("1", positionZero))
             }
             replaceFunction(
@@ -165,8 +165,9 @@ class ExecutionVisitor(
                 val sym = functionDeclaration.symbolTable!!.find(args[0] as String)
                 if (sym !is Symbol.Function)
                     throw Exception("Not a method")
-                sym.node.block = (args[1] as FunctionLiteral).block.copy()
-                sym.node.block!!.symbolTable = sym.node.symbolTable
+                val block = (args[1] as FunctionLiteral).block.deepCopy()
+                TypeGather(sym.node.block!!.symbolTable!!.parent!!).generateSymbolTable(block)
+                sym.node.block = block
                 ExecutionValue.Value(Integer("1", positionZero))
             }
             replaceFunction("find", mutableListOf(AssignableParameter("fnName", UserType.String))) { _, args, _ ->
