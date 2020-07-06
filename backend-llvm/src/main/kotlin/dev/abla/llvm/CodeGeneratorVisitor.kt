@@ -248,6 +248,11 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         generatorContext.values.push(GeneratorContext.Value(type, functionLiteral.llvmValue!!))
     }
 
+    override suspend fun visit(nullLiteral: NullLiteral) {
+        val value = GeneratorContext.Value(UserType.Void, LLVMConstNull(LLVMPointerType(LLVMInt32Type(), 0))) // TODO: figure the correct type for this
+        generatorContext.values.push(value)
+    }
+
     override suspend fun visit(binaryOperation: BinaryOperation) {
         binaryOperation.lhs.accept(this)
         val lhsValue = generatorContext.topValuePop

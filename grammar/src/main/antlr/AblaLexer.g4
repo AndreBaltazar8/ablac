@@ -52,6 +52,7 @@ IntegerLiteral : DigitNoZero DigitOrSeparator* Digit | Digit ;
 HexLiteral : '0' [xX] HexDigit HexDigitOrSeparator* HexDigit
            | '0' [xX] HexDigit
            ;
+Null : 'null' ;
 
 ID : NonDigit (NonDigit | Digit)* ;
 

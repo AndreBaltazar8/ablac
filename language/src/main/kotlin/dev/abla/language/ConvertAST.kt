@@ -363,6 +363,7 @@ fun AblaParser.LiteralContext.toAST(): Literal =
         is AblaParser.HexLiteralContext -> Integer(text.substring(2).toInt(16).toString(), position)
         is AblaParser.StringLiteralLiteralContext -> stringLiteral().toAST()
         is AblaParser.ArrayLiteralContext -> toAST()
+        is AblaParser.NullLiteralContext -> NullLiteral(position)
         else -> throw IllegalStateException("Unknown literal type ${this::class.simpleName}")
     }
 

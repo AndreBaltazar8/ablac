@@ -160,6 +160,7 @@ literal : stringLiteral # stringLiteralLiteral
         | HexLiteral # hexLiteral
         | BooleanLiteral # booleanLiteral
         | LSQUARE (expression (COMMA expression)* COMMA?)? RSQUARE # arrayLiteral
+        | Null # nullLiteral
         ;
 
 stringLiteral : QUOTE_OPEN lineString* QUOTE_CLOSE;

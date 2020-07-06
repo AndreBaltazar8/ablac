@@ -104,4 +104,7 @@ abstract class ASTVisitor {
         indexAccess.index.accept(this)
         indexAccess.expression.accept(this)
     }
+
+    open suspend fun visit(nullLiteral: NullLiteral) {
+    }
 }

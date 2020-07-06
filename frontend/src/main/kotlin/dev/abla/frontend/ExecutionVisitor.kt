@@ -420,6 +420,13 @@ class ExecutionVisitor(
             super.visit(functionLiteral)
     }
 
+    override suspend fun visit(nullLiteral: NullLiteral) {
+        if (executionLayer > 0)
+            values.add(ExecutionValue.Value(nullLiteral))
+        else
+            super.visit(nullLiteral)
+    }
+
     override suspend fun visit(functionCall: FunctionCall) {
         functionCall.arguments.forEach {
             it.value.accept(this)
@@ -593,6 +600,7 @@ class ExecutionVisitor(
                 lhsValue is ExecutionValue.ConstSymbol && rhsValue is ExecutionValue.Value -> { // TODO: do this properly, just an hack to make the test pass
                     val result = when (binaryOperation.operator) {
                         BinaryOperator.Equals -> if (rhsValue.toValue(currentScope!!) as Int > 0) 1 else 0
+                        BinaryOperator.NotEquals -> if (rhsValue.toValue(currentScope!!) as Int > 0) 0 else 1
                         else -> TODO("Not implemented")
                     }.toString()
                     ExecutionValue.Value(Integer(result, positionZero))
@@ -779,6 +787,7 @@ class ExecutionVisitor(
                     }
                 }.joinToString("")
             }
+            is NullLiteral -> 0
             is FunctionLiteral -> this
             is ArrayLiteral -> this
             else -> throw Exception("Unknown literal conversion")
