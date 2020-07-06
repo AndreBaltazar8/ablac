@@ -128,7 +128,7 @@ fun AblaParser.TypeContext.toAST(): Type {
     functionType()?.toAST() ?:
     nullableType()?.let {
         it.parenthesizedType()?.type()?.toAST() ?:
-            userType()?.toAST() ?:
+            it.userType()?.toAST() ?:
             throw IllegalStateException("Unknown nullable type in $text, $position")
     }?.let { NullableType(it, position) } ?:
     throw IllegalStateException("Unknown type in $text, $position")
