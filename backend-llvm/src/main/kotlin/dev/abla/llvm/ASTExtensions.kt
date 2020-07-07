@@ -19,6 +19,7 @@ var IfElseExpression.llvmContBlock: LLVMBasicBlockRef? by BackingField.nullable(
 var WhileStatement.llvmConditionBlock: LLVMBasicBlockRef? by BackingField.nullable()
 var WhileStatement.llvmContBlock: LLVMBasicBlockRef? by BackingField.nullable()
 fun Type.llvmType(symbolTable: SymbolTable): LLVMTypeRef = when {
+    this is NullableType -> type.llvmType(symbolTable)
     this is FunctionType -> LLVMPointerType(
         LLVMFunctionType(
             returnType.llvmType(symbolTable),

@@ -43,6 +43,7 @@ val Expression.inferredType: Type?
     get() = when (this) {
         is IfElseExpression -> if (isExpression) ifBody.returnType else null
         is FunctionLiteral -> FunctionType(arrayOf(), UserType.Int, null, position)
+        is NullLiteral -> UserType.Void
         is Integer -> UserType.Int
         is StringLiteral -> UserType.String
         is ArrayLiteral -> if (elements.isNotEmpty())

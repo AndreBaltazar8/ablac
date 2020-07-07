@@ -249,7 +249,8 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(nullLiteral: NullLiteral) {
-        val value = GeneratorContext.Value(UserType.Void, LLVMConstNull(LLVMPointerType(LLVMInt32Type(), 0))) // TODO: figure the correct type for this
+        // TODO: figure the correct type for this (very hard without proper inference algorithm)
+        val value = GeneratorContext.Value(UserType.Void, LLVMConstNull(LLVMInt32Type()))
         generatorContext.values.push(value)
     }
 
