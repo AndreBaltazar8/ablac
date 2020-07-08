@@ -458,8 +458,7 @@ class ExecutionVisitor(
                                     value.forcedReturnType = UserType.Void
                             }
                         }
-                        // TODO: support passing instances to compiler functions
-                        // TODO: support void functions at compile time
+
                         if (functionCall.expression is MemberAccess)
                             values.pop()
                         val returnValue = it.executionBlock(
@@ -769,6 +768,7 @@ class ExecutionVisitor(
         when (this) {
             is ExecutionValue.Value -> value.toValue(currentScope)
             is ExecutionValue.Pointer -> pointer
+            is ExecutionValue.Instance -> this
             else -> throw Exception("Unknown conversion")
         }
 
