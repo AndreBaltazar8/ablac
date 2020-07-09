@@ -143,19 +143,19 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
         val isMethodCall = functionExpression is MemberAccess
         val thisClass = if (isMethodCall) generatorContext.topValuePop else null
 
-        generatorContext.topBlock.createBuilderAtEnd { builder ->
-            val args = listOfNotNull(thisClass?.ref).plus(functionCall.arguments.mapIndexed { index, argument ->
-                val value = argument.value
-                if (value is FunctionLiteral) {
-                    val argType = (functionToCall.type as FunctionType).parameters[index].type
-                    val literalReturnType = (argType as FunctionType).returnType
-                    if (literalReturnType.isNullOrVoid())
-                        value.forcedReturnType = UserType.Void
-                }
-                value.accept(this)
-                generatorContext.topValuePop.ref
-            }).toTypedArray()
+        val args = listOfNotNull(thisClass?.ref).plus(functionCall.arguments.mapIndexed { index, argument ->
+            val value = argument.value
+            if (value is FunctionLiteral) {
+                val argType = (functionToCall.type as FunctionType).parameters[index].type
+                val literalReturnType = (argType as FunctionType).returnType
+                if (literalReturnType.isNullOrVoid())
+                    value.forcedReturnType = UserType.Void
+            }
+            value.accept(this)
+            generatorContext.topValuePop.ref
+        }).toTypedArray()
 
+        generatorContext.topBlock.createBuilderAtEnd { builder ->
             generatorContext.values.push(GeneratorContext.Value(returnType, LLVMBuildCall(
                 builder,
                 functionToCall.ref,
