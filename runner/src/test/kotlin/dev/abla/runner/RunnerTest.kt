@@ -157,6 +157,11 @@ class RunnerTest : KoinComponent {
         println(it)
     }
 
+    @Test
+    fun testMath() = runResourceFile("examples/test_math.ab") {
+        println(it)
+    }
+
     private fun runResourceFile(file: String, verify: (moduleIR: String) -> Unit = {}) {
         //System.setIn(javaClass.classLoader.getResourceAsStream(file))
         Runner().run(arrayOf(javaClass.classLoader.getResource(file)!!.path))
