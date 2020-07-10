@@ -20,8 +20,8 @@ abstract class ASTVisitor {
         }
     }
 
-    open suspend fun visit(compilerExec: CompilerExec) {
-        compilerExec.expression.accept(this)
+    open suspend fun visit(compileExec: CompileExec) {
+        compileExec.expression.accept(this)
     }
 
     open suspend fun visit(identifierExpression: IdentifierExpression) {

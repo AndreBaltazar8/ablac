@@ -18,8 +18,8 @@ data class Abstract(val position: Position) : Modifier {
     )
 }
 
-data class ModCompiler(val position: Position) : Modifier {
-    override fun deepCopy(): ModCompiler = ModCompiler(
+data class ModCompile(val position: Position) : Modifier {
+    override fun deepCopy(): ModCompile = ModCompile(
         position.copy()
     )
 }

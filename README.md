@@ -33,7 +33,7 @@ Some fun stuff to do with abla in the future:
  *  - Lambdas with only one parameter declare implicit ´it´ variable
  *  - ´#´ signals the start of a compile-time expression
  *  - Functions with compile modifier are only available at compile time, and can access functions from the compiler
- *  - Function literals called direcly by the compile directive ´#´, can also access compiler functions
+ *  - Function literals called direcly by the compile directive ´#´, can also access compile functions
  */
 
 // Extend import to allow libraries

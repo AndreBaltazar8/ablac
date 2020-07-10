@@ -77,7 +77,7 @@ class ExecutionVisitor(
             if (executionLayer > 0) {
                 val callInfo = functionDeclaration.callInfo ?: return@withTable
 
-                if (functionDeclaration.isCompiler)
+                if (functionDeclaration.isCompile)
                     populateCompilerContext(functionDeclaration)
 
                 if (callInfo.instance != null)
@@ -348,24 +348,24 @@ class ExecutionVisitor(
         }
     }
 
-    override suspend fun visit(compilerExec: CompilerExec) {
-        if (!compilerExec.compiled) {
+    override suspend fun visit(compileExec: CompileExec) {
+        if (!compileExec.compiled) {
             executionLayer++
-            super.visit(compilerExec)
-            compilerExec.compiled = true
+            super.visit(compileExec)
+            compileExec.compiled = true
             if (values.size == 0) {
-                compilerExec.expression = Integer("0", positionZero)
+                compileExec.expression = Integer("0", positionZero)
             } else {
                 val executionValue = values.peek()
                 when {
                     executionValue is ExecutionValue.Value -> {
-                        compilerExec.expression = executionValue.value
+                        compileExec.expression = executionValue.value
                         if (executionLayer == 1)
                             values.pop()
                     }
                     executionValue is ExecutionValue.CompilerNode -> {
                         when (val node = executionValue.node) {
-                            is Expression -> compilerExec.expression = node
+                            is Expression -> compileExec.expression = node
                             is Block -> {
                                 executionLayer--
                                 throw ReplaceWithCode(node)
@@ -378,7 +378,7 @@ class ExecutionVisitor(
             }
             executionLayer--
         } else {
-            super.visit(compilerExec)
+            super.visit(compileExec)
         }
     }
 
@@ -850,7 +850,7 @@ private fun MutableList<Symbol<*>>.replaceFunction(
     typeParameters: MutableList<TypeDefParam> = mutableListOf(),
     executionBlock: suspend (ExecutionVisitor, Array<Any>, Array<Type>) -> ExecutionValue
 ) {
-    val finalModifiers = modifiers.toMutableList().apply { add(ModCompiler(positionZero)) }
+    val finalModifiers = modifiers.toMutableList().apply { add(ModCompile(positionZero)) }
     val function = CompilerFunctionDeclaration(name, parameters, finalModifiers, typeParameters, executionBlock)
     removeAll { symbol -> symbol.name == name }
     add(Symbol.Function(name, function))

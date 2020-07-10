@@ -72,7 +72,7 @@ val Expression.inferredType: Type?
             else -> throw Exception("Conversion not implemented")
         }
         is BinaryOperation -> rhs.inferredType
-        is CompilerExec -> expression.inferredType
+        is CompileExec -> expression.inferredType
         is IndexAccess -> (expression.inferredType as UserType).types[0]
         else -> throw Exception("Conversion not implemented")
     }

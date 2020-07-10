@@ -35,7 +35,7 @@ fun main {
 Code modification (illustrative example)
 
 ```
-compiler fun wrapFunction(function: #function, wrap: #functionLiteral) {
+compile fun wrapFunction(function: #function, wrap: #functionLiteral) {
     val functionBlock = function.block
     // the follow syntax is likely to be different
     function.block = wrap.block.findAll { it == #functionCall("it") }
@@ -46,7 +46,7 @@ fun hi {
     printf("Hello")
 }
 
-compiler fun wrapHi() {
+compile fun wrapHi() {
     wrapFunction(compiler.getFunction("hi")) {
         it()
         printf(" World")

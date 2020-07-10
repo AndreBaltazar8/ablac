@@ -17,7 +17,7 @@ open class FunctionDeclaration(
 ) : Statement {
     val isExtern get() = modifiers.any { it is Extern }
     val isAbstract get() = modifiers.any { it is Abstract }
-    val isCompiler get() = modifiers.any { it is ModCompiler }
+    val isCompile get() = modifiers.any { it is ModCompile }
 
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)

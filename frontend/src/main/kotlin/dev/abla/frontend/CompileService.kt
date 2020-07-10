@@ -159,7 +159,7 @@ class CompileService(
         val declaration = CompilerFunctionDeclaration(
             name,
             parameters,
-            modifiers.toMutableList().apply { add(ModCompiler(positionZero)) },
+            modifiers.toMutableList().apply { add(ModCompile(positionZero)) },
             mutableListOf(),
             executionBlock
         )

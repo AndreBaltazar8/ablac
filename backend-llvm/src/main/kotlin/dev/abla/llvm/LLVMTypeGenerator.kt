@@ -18,7 +18,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     private val names = Stack<String>()
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
-        if (functionDeclaration.isCompiler)
+        if (functionDeclaration.isCompile)
             return
 
         val name = names.plus(functionDeclaration.name).joinToString("%")
@@ -80,7 +80,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(classDeclaration: ClassDeclaration) {
-        if (classDeclaration.isCompiler)
+        if (classDeclaration.isCompile)
             return
         val isBuiltin = classDeclaration.toType().isBuiltIn
         val struct = if (!isBuiltin)

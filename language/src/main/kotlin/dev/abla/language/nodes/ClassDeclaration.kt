@@ -15,7 +15,7 @@ open class ClassDeclaration(
     var isInterface: Boolean,
     override val position: Position
 ) : Declaration {
-    val isCompiler get() = modifiers.any { it is ModCompiler }
+    val isCompile get() = modifiers.any { it is ModCompile }
 
     override suspend fun accept(visitor: ASTVisitor) {
         visitor.visit(this)

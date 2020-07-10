@@ -57,7 +57,7 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
                 table.symbols.add(Symbol.Variable(it.name, it))
             }
 
-            if (functionDeclaration.isCompiler) {
+            if (functionDeclaration.isCompile) {
                 table.symbols.add(
                     Symbol.Variable(
                         "compilerContext",

@@ -8,7 +8,7 @@ options {
 file : fileDeclaration* EOF ;
 
 fileDeclaration : functionDeclaration # functionDeclarationFD
-                | compilerCall # compilerCallFD
+                | compileCall # compileCallFD
                 | classDeclaration # classDeclarationFD
                 | propertyDeclaration #propertyDeclarationFD
                 ;
@@ -25,7 +25,7 @@ classBody : LCURL classMemberDeclaration* RCURL ;
 classMemberDeclaration : classDeclaration
                        | functionDeclaration
                        | propertyDeclaration
-                       | compilerCall
+                       | compileCall
                        ;
 
 primaryConstructor : modifierList? CONSTRUCTOR? classConstructorParameters ;
@@ -61,13 +61,13 @@ modifier : functionModifier
 functionModifier : EXTERN (COLON stringLiteral)? # externModifier
                  ;
 
-allocationModifier : COMPILER # compilerModifier
+allocationModifier : COMPILE # compileModifier
                    ;
 
 inheritanceModifier : ABSTRACT # abstractModifier
                     ;
 
-compilerCall : COMPILER_DIRECTIVE (simpleIdentifier | functionLiteral) callSuffix+ ;
+compileCall : COMPILE_DIRECTIVE (simpleIdentifier | functionLiteral) callSuffix+ ;
 
 functionBody : block # blockBody
              | ASSIGNMENT expression # lambdaBody
@@ -128,7 +128,7 @@ whenCase : expression (COMMA expression)* ARROW controlStructureBody
          | ELSE ARROW controlStructureBody
          ;
 
-prefixUnaryOperation : COMPILER_DIRECTIVE # compilerExecution
+prefixUnaryOperation : COMPILE_DIRECTIVE # compileExecution
                      ;
 
 postfixUnarySuffix : callSuffix

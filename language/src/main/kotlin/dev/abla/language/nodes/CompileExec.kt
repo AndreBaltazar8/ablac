@@ -3,7 +3,7 @@ package dev.abla.language.nodes
 import dev.abla.language.ASTVisitor
 import dev.abla.language.Position
 
-class CompilerExec(
+class CompileExec(
     var expression: Expression,
     override val position: Position
 ) : Expression {
@@ -11,7 +11,7 @@ class CompilerExec(
         visitor.visit(this)
     }
 
-    override fun deepCopy(): CompilerExec = CompilerExec(
+    override fun deepCopy(): CompileExec = CompileExec(
         expression.deepCopy(),
         position.copy()
     )

@@ -11,7 +11,7 @@ class PrintVisitor : ASTVisitor() {
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
     }
 
-    override suspend fun visit(compilerExec: CompilerExec) {
+    override suspend fun visit(compileExec: CompileExec) {
     }
 
     override suspend fun visit(identifierExpression: IdentifierExpression) {

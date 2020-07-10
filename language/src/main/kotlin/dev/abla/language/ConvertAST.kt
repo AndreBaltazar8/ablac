@@ -16,7 +16,7 @@ fun AblaParser.FileContext.toAST(fileName: String) =
 fun AblaParser.FileDeclarationContext.toAST(): Declaration =
     when (this) {
         is AblaParser.FunctionDeclarationFDContext -> functionDeclaration().toAST()
-        is AblaParser.CompilerCallFDContext -> compilerCall().toAST()
+        is AblaParser.CompileCallFDContext -> compileCall().toAST()
         is AblaParser.ClassDeclarationFDContext -> classDeclaration().toAST()
         is AblaParser.PropertyDeclarationFDContext -> propertyDeclaration().toAST()
         else -> throw IllegalStateException("Unknown declaration type ${this::class.simpleName}")
@@ -85,7 +85,7 @@ fun AblaParser.ClassMemberDeclarationContext.toAST() : Declaration =
     functionDeclaration()?.toAST() ?:
         classDeclaration()?.toAST() ?:
         propertyDeclaration()?.toAST() ?:
-        compilerCall()?.toAST() ?:
+        compileCall()?.toAST() ?:
         throw IllegalStateException("Unknown class member type ${this::class.simpleName}")
 
 fun AblaParser.AnnotationContext.toAST(): AblaAnnotation =
@@ -109,7 +109,7 @@ fun AblaParser.FunctionModifierContext.toAST(): Modifier =
 
 fun AblaParser.AllocationModifierContext.toAST(): Modifier =
     when (this) {
-        is AblaParser.CompilerModifierContext -> ModCompiler(position)
+        is AblaParser.CompileModifierContext -> ModCompile(position)
         else -> throw IllegalStateException("Unknown allocation modifier type ${this::class.simpleName}")
     }
 
@@ -207,8 +207,8 @@ fun AblaParser.PropertyDeclarationContext.toAST(): PropertyDeclaration =
         position
     )
 
-fun AblaParser.CompilerCallContext.toAST() =
-    CompilerExec(
+fun AblaParser.CompileCallContext.toAST() =
+    CompileExec(
         callSuffix().fold<AblaParser.CallSuffixContext, Expression>(simpleIdentifier()?.toAST() ?: functionLiteral().toAST()) { acc, suffix ->
             suffix.toAST(acc)
         },
@@ -329,7 +329,7 @@ fun AblaParser.BinaryOperatorHigherContext.toAST(): BinaryOperator =
 
 fun AblaParser.PrefixUnaryOperationContext.toAST(expression: Expression) =
     when (this) {
-        is AblaParser.CompilerExecutionContext -> CompilerExec(expression, position)
+        is AblaParser.CompileExecutionContext -> CompileExec(expression, position)
         else -> throw IllegalStateException("Unknown prefix unary operation type ${this::class.simpleName}")
     }
 

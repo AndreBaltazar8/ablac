@@ -16,7 +16,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     private val generatorContext = GeneratorContext()
 
     override suspend fun visit(functionDeclaration: FunctionDeclaration) {
-        if (functionDeclaration.isExtern || functionDeclaration.isCompiler)
+        if (functionDeclaration.isExtern || functionDeclaration.isCompile)
             return
 
         val function = functionDeclaration.llvmValue!!
@@ -83,7 +83,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
 
         // TODO: if class select most appropriate constructor
         if (symbol.node.run { llvmValue == null && !(this is PropertyDeclaration && scope == Scope.Class) })
-            throw Exception("Cannot get llvm value for ${identifierExpression.identifier}. Is it a compiler function?")
+            throw Exception("Cannot get llvm value for ${identifierExpression.identifier}. Is it a compile time function?")
 
         val node = symbol.node
         val value = if (node is PropertyDeclaration && !node.isFinal) {
@@ -367,7 +367,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
     }
 
     override suspend fun visit(classDeclaration: ClassDeclaration) {
-        if (classDeclaration.isCompiler)
+        if (classDeclaration.isCompile)
             return
 
         val isBuiltin = classDeclaration.toType().isBuiltIn
