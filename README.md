@@ -168,6 +168,12 @@ These the current and planned features for the language. It is not exhaustive li
   * networking and http stack
   * math lib
   * threading
+  
+### Things to try
+- Multiple language parsing
+  * Try to switch based on executing code
+- Self modification at run time
+- Removing main function and use file as main function
 
 ## Contributing
 
