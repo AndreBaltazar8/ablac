@@ -151,7 +151,7 @@ These the current and planned features for the language. It is not exhaustive li
 - Variable declarations with type check (in functions, globally and class fields)
 - Type inference algorithm
 - Send values to lambdas and other scopes
-  * Don't allow to call functions that capture context before it is declared in another function
+  * Don't allow calling functions that capture context before it is declared in another function
 - Sending compiler context to functions with "compile" modifier
   * Allow reading compiler info
   * Allow modification of code
@@ -168,12 +168,15 @@ These the current and planned features for the language. It is not exhaustive li
   * networking and http stack
   * math lib
   * threading
+- Coroutines (go style)
+- Method Cascading
   
 ### Things to try
 - Multiple language parsing
   * Try to switch based on executing code
 - Self modification at run time
 - Removing main function and use file as main function
+- Compilation unit name on import new files/compilation units
 
 ## Contributing
 
