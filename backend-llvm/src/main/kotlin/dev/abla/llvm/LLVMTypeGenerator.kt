@@ -23,7 +23,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
 
         val name = names.plus(functionDeclaration.name).joinToString("%")
 
-        val receiver = functionDeclaration.symbol.receiver
+        val receiver = functionDeclaration.symbol.receiver?.value
         val hasReceiver = receiver != null
         val classType = receiver?.node?.toType()?.llvmType(receiver.node.symbolTable!!)
 

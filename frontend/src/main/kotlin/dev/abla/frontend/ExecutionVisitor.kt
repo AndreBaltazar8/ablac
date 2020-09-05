@@ -192,7 +192,7 @@ class ExecutionVisitor(
                 mutableListOf(AssignableParameter("function", FunctionType(arrayOf(), UserType.Void, null, positionZero)))
             ) { _, args, _ ->
                 (args[0] as FunctionLiteral).block.statements.filterIsInstance<FunctionDeclaration>().forEach { func ->
-                    val classSymbol = functionDeclaration.symbol.receiver!!
+                    val classSymbol = functionDeclaration.symbol.receiver!!.value
                     val functionSymbol = Symbol.Function(func.name, func)
                     classSymbol.methods.add(functionSymbol)
                     classSymbol.node.symbolTable!!.symbols.add(functionSymbol)

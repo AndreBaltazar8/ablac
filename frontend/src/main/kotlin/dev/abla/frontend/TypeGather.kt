@@ -24,25 +24,28 @@ class TypeGather(private val global: SymbolTable) : ASTVisitor() {
         tables.peek().symbols.add(function)
 
         var isInInterfaceClass = false
-        val receiverType = functionDeclaration.receiver
+        var receiverType = functionDeclaration.receiver
         if (receiverType != null) {
             if (receiverType !is UserType) // TODO: support other types. This will still crash for builtin UserTypes
                 throw Exception("Not supported")
-            val symbol = tables.peek().find(receiverType.identifier)
-            if (symbol !is Symbol.Class)
-                throw Exception("Expecting class symbol")
-            function.receiver = symbol
+            function.receiver = lazy {
+                val symbol = tables.peek().find((receiverType as UserType).identifier)
+                if (symbol !is Symbol.Class)
+                    throw Exception("Expecting class symbol")
+                symbol as Symbol.Class
+            }
         } else if (currentScope == Scope.Class) {
             val classSymbol = classScopes.peek()
             isInInterfaceClass = classSymbol.node.isInterface
             classSymbol.methods.add(function)
-            function.receiver = classSymbol
+            function.receiver = lazy { classSymbol }
+            receiverType = classSymbol.node.toType()
         }
 
         createTableInParent { table ->
             functionDeclaration.symbolTable = table
             if (function.receiver != null) {
-                val parameter = Parameter("this", function.receiver!!.node.toType())
+                val parameter = Parameter("this", receiverType!!)
                 table.symbols.add(Symbol.Variable("this", parameter))
                 functionDeclaration.receiverParameter = parameter
             }

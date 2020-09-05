@@ -142,7 +142,6 @@ These the current and planned features for the language. It is not exhaustive li
 - Add operators and comparisons for all types
 - Loops (for)
 - Add simple built-in types (string, int)
-- Support extensions for built-in types
 - Virtual methods for polymorphism and overrides
 - Type checking everything
 - Class object allocation

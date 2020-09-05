@@ -9,7 +9,7 @@ sealed class Symbol<T : Node>(open val name: String, open val node: T) {
         override var name: String,
         override val node: FunctionDeclaration
     ) : Symbol<FunctionDeclaration>(name, node) {
-        var receiver: Class? = null
+        var receiver: Lazy<Class>? = null
 
         init {
             node.symbol = this
