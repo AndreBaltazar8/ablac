@@ -30,13 +30,15 @@ fun FunctionDeclaration.toType(): Type =
         receiverParameter?.let {
             arrayOf(it, *parameters.toTypedArray())
         } ?:parameters.toTypedArray<Parameter>(),
-        returnType ?: block?.returnType ?: UserType.Void,
+        inferredReturnType ?: UserType.Void,
         receiver,
         positionZero
     )
 
 // TODO: need to calculate correct parent
 fun ClassDeclaration.toType(): UserType = UserType(name, arrayOf(), null, positionZero)
+val FunctionDeclaration.inferredReturnType: Type?
+    get() = returnType ?: block?.returnType
 val PropertyDeclaration.inferredType: Type?
     get() = type ?: value!!.inferredType
 val Expression.inferredType: Type?
@@ -52,13 +54,14 @@ val Expression.inferredType: Type?
             throw Exception("Cannot infer array type")
         is FunctionCall -> when(val returnType = expression.inferredType) {
             is FunctionType -> returnType.returnType
+            null -> UserType.Void // TODO: remove when MemberAccess infer is fixed
             else -> throw Exception("Call on non function type?")
         }
         is IdentifierExpression -> when (val node = symbolLazy!!.value!!.node) {
             is FunctionDeclaration -> FunctionType(
                 node.parameters.toTypedArray(),
-                node.returnType ?: node.block?.returnType ?: UserType.Void,
-                node.returnType,
+                node.inferredReturnType ?: UserType.Void,
+                node.inferredReturnType,
                 node.position
             )
             is PropertyDeclaration -> node.inferredType
@@ -74,6 +77,8 @@ val Expression.inferredType: Type?
         is BinaryOperation -> rhs.inferredType
         is CompileExec -> expression.inferredType
         is IndexAccess -> (expression.inferredType as UserType).types[0]
+        is Assignment -> rhs.inferredType
+        is MemberAccess -> null // TODO: Actually infer this type
         else -> throw Exception("Conversion not implemented")
     }
 val Block.returnType: Type?

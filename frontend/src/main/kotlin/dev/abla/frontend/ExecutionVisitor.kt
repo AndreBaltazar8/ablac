@@ -104,7 +104,7 @@ class ExecutionVisitor(
                     val function = NativeLibrary.getInstance(extern.libName!!.toValue(currentScope!!) as String)
                         .getFunction(functionDeclaration.name)
 
-                    val returnType = functionDeclaration.returnType ?: UserType.Void
+                    val returnType = functionDeclaration.inferredReturnType ?: UserType.Void
                     if (returnType == UserType.Void) {
                         function.invokeVoid(
                             functionDeclaration.parameters.map {
@@ -127,7 +127,7 @@ class ExecutionVisitor(
                     }
                 }
 
-                if (values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid()) {
+                if (values.isNotEmpty() && !functionDeclaration.inferredReturnType.isNullOrVoid()) {
                     values.clearUntilSaveLast(numValues)
                 } else {
                     values.clearUntil(numValues)
@@ -153,6 +153,7 @@ class ExecutionVisitor(
                 val block = (args[0] as FunctionLiteral).block.deepCopy()
                 functionDeclaration.block = block
                 TypeGather(functionDeclaration.symbolTable!!).generateSymbolTable(block)
+                ExecutionVisitor(null).visit(block)
                 ExecutionValue.Value(Integer("1", positionZero))
             }
             replaceFunction(
@@ -167,6 +168,7 @@ class ExecutionVisitor(
                     throw Exception("Not a method")
                 val block = (args[1] as FunctionLiteral).block.deepCopy()
                 TypeGather(sym.node.block!!.symbolTable!!.parent!!).generateSymbolTable(block)
+                ExecutionVisitor(null).visit(block)
                 sym.node.block = block
                 ExecutionValue.Value(Integer("1", positionZero))
             }
@@ -239,6 +241,7 @@ class ExecutionVisitor(
                 }
                 method.block!!.statements = finalStatements
                 TypeGather(method.block!!.symbolTable!!.parent!!).generateSymbolTable(method.block!!)
+                ExecutionVisitor(null).visit(method.block!!)
 
                 ExecutionValue.Value(Integer("1", positionZero))
             }
@@ -253,6 +256,7 @@ class ExecutionVisitor(
                             val block = ((value as ExecutionValue.CompilerNode).node as Block).deepCopy()
                             sym.node.block = block
                             TypeGather(sym.node.symbolTable!!).generateSymbolTable(block)
+                            ExecutionVisitor(null).visit(block)
                         }
                         "name" -> {
                             val newName = (value as ExecutionValue.Value).toValue(this) as String

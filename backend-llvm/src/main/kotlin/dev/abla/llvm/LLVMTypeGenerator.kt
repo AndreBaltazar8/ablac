@@ -37,7 +37,7 @@ class LLVMTypeGenerator(private val module: LLVMModuleRef) : ASTVisitor() {
             })
         val function = module.addFunction(
             name,
-            functionDeclaration.returnType?.llvmType(functionDeclaration.symbolTable!!) ?: LLVMVoidType(),
+            functionDeclaration.inferredReturnType?.llvmType(functionDeclaration.symbolTable!!) ?: LLVMVoidType(),
             argTypes.toTypedArray()
         )
         typeScopes.lastOrNull()?.methods?.add(function)

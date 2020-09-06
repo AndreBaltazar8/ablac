@@ -36,7 +36,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
                         )
                         LLVMBuildRet(
                             builder,
-                            if (functionDeclaration.returnType == UserType.Int)
+                            if (functionDeclaration.inferredReturnType == UserType.Int)
                                 call
                             else
                                 LLVMConstInt(LLVMInt32Type(),0, 0) // TODO: convert to int16
@@ -55,7 +55,7 @@ class CodeGeneratorVisitor(private val module: LLVMModuleRef) : ASTVisitor() {
             // CHECK FOR TYPE
 
             currentBlock.createBuilderAtEnd { builder ->
-                if (generatorContext.values.isNotEmpty() && !functionDeclaration.returnType.isNullOrVoid())
+                if (generatorContext.values.isNotEmpty() && !functionDeclaration.inferredReturnType.isNullOrVoid())
                     LLVMBuildRet(builder, generatorContext.topValue.ref)
                 else
                     LLVMBuildRetVoid(builder)
