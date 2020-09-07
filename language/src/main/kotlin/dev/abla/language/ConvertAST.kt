@@ -41,6 +41,7 @@ fun AblaParser.FunctionDeclarationContext.toAST() =
         typeParameters()?.typeParameter()?.map {
             it.toAST()
         }?.toMutableList() ?: mutableListOf(),
+        functionBody()?.let { it is AblaParser.LambdaBodyContext } ?: false,
         position
     )
 

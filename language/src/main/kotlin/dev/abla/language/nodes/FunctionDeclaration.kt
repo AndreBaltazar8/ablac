@@ -13,6 +13,7 @@ open class FunctionDeclaration(
     var annotations: MutableList<Annotation>,
     var receiver: Type?,
     var genericTypes: MutableList<TypeDefParam>,
+    var isLambda: Boolean,
     override val position: Position
 ) : Statement {
     val isExtern get() = modifiers.any { it is Extern }
@@ -32,6 +33,7 @@ open class FunctionDeclaration(
         annotations.deepCopy(),
         receiver?.deepCopy(),
         genericTypes.deepCopy(),
+        isLambda,
         position.copy()
     )
 }

@@ -18,5 +18,6 @@ class CompilerFunctionDeclaration(
     mutableListOf(),
     null,
     typeParameters,
+    false,
     positionZero
 )
