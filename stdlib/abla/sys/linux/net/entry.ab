@@ -1,0 +1,398 @@
+// Linux x86-64 TCP transport and graceful SIGTERM handling implemented with
+// direct syscalls. No libc or project C host capability is required.
+
+#import("abla/sys/linux")
+
+class TcpListener(val descriptor: int)
+
+class TcpConnection(val descriptor: int)
+
+var linuxTcpShutdownDescriptor: int = -1
+var linuxTcpShutdownSeen: bool = false
+
+fun linuxNetStoreU16(
+    var buffer: NativeByteBuffer,
+    offset: int,
+    value: int
+): bool = buffer.store(offset, value) &&
+    buffer.store(offset + 1, value / 256)
+
+fun linuxNetStoreU32(
+    var buffer: NativeByteBuffer,
+    offset: int,
+    value: int
+): bool = linuxNetStoreU16(buffer, offset, value) &&
+    linuxNetStoreU16(buffer, offset + 2, value / 65536)
+
+fun linuxNetReadU16(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) * 256 + buffer.load(offset + 1)
+
+fun linuxTcpCloseDescriptor(descriptor: int): bool =
+    descriptor >= 0 && linuxSyscall1(3, descriptor) == 0
+
+fun linuxIpv4Octets(address: string): array<int> {
+    val octets: array<int> = []
+    var valid = address.size >= 7 && address.size <= 15
+    var value = 0
+    var digits = 0
+    var index = 0
+    while (valid && index <= address.size) {
+        val boundary = index == address.size || address[index] == 46
+        if (boundary) {
+            if (digits == 0 || value > 255 || octets.size >= 4) {
+                valid = false
+            } else {
+                octets.append(value)
+                value = 0
+                digits = 0
+            }
+        } else {
+            val digit = address[index] - 48
+            if (digit < 0 || digit > 9 || digits >= 3) valid = false
+            else {
+                value = value * 10 + digit
+                digits = digits + 1
+            }
+        }
+        index = index + 1
+    }
+    // Callers require exactly four elements. Mark an otherwise four-element
+    // invalid parse without introducing an aliasing branch result.
+    if (!valid && octets.size == 4) octets.append(-1)
+    octets
+}
+
+// Bounded numeric-IPv4 client connection for low-level and compile-provider
+// use. Nonblocking connect + poll prevents an unreachable peer from stalling
+// the compiler or a service indefinitely; DNS remains a portable higher layer.
+fun tcpConnectIpv4(
+    address: string,
+    port: int,
+    timeoutMilliseconds: int
+): TcpConnection {
+    val octets = linuxIpv4Octets(address)
+    var descriptor = -1
+    if (octets.size == 4 && port > 0 && port <= 65535 &&
+        timeoutMilliseconds > 0 && timeoutMilliseconds <= 10000) {
+        descriptor = linuxSyscall3(41, 2, 526337, 0)
+    }
+    if (descriptor >= 0) {
+        val socketAddress = nativeByteBuffer(16)
+        linuxNetStoreU16(socketAddress, 0, 2)
+        socketAddress.store(2, port / 256)
+        socketAddress.store(3, port - (port / 256) * 256)
+        var octet = 0
+        while (octet < 4) {
+            socketAddress.store(4 + octet, octets[octet])
+            octet = octet + 1
+        }
+        val connected = linuxSyscall3(
+            42,
+            descriptor,
+            nativePointerAddress(socketAddress.address),
+            16
+        )
+        socketAddress.close()
+        var ready = connected == 0
+        if (connected == -115) {
+            val pollDescriptor = nativeByteBuffer(8)
+            linuxNetStoreU32(pollDescriptor, 0, descriptor)
+            linuxNetStoreU16(pollDescriptor, 4, 4)
+            var polled = linuxSyscall3(
+                7,
+                nativePointerAddress(pollDescriptor.address),
+                1,
+                timeoutMilliseconds
+            )
+            while (polled == -4) {
+                polled = linuxSyscall3(
+                    7,
+                    nativePointerAddress(pollDescriptor.address),
+                    1,
+                    timeoutMilliseconds
+                )
+            }
+            ready = polled > 0 && pollDescriptor.load(6) != 0
+            pollDescriptor.close()
+        }
+        if (ready) {
+            // Clear O_NONBLOCK after the bounded connection phase.
+            linuxSyscall3(72, descriptor, 4, 0)
+        } else {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = -1
+        }
+    }
+    TcpConnection(descriptor)
+}
+
+fun TcpConnection.readWithTimeout(
+    maximum: int,
+    timeoutMilliseconds: int
+): string {
+    var result = ""
+    if (this.descriptor >= 0 && maximum > 0 && maximum <= 1048576 &&
+        timeoutMilliseconds > 0 && timeoutMilliseconds <= 10000) {
+        val pollDescriptor = nativeByteBuffer(8)
+        linuxNetStoreU32(pollDescriptor, 0, this.descriptor)
+        linuxNetStoreU16(pollDescriptor, 4, 1)
+        var polled = linuxSyscall3(
+            7,
+            nativePointerAddress(pollDescriptor.address),
+            1,
+            timeoutMilliseconds
+        )
+        while (polled == -4) {
+            polled = linuxSyscall3(
+                7,
+                nativePointerAddress(pollDescriptor.address),
+                1,
+                timeoutMilliseconds
+            )
+        }
+        val readable = polled > 0 && pollDescriptor.load(6) != 0
+        pollDescriptor.close()
+        if (readable) result = this.read(maximum)
+    }
+    result
+}
+
+fun tcpListen(port: int, backlog: int = 128): TcpListener {
+    // AF_INET=2, SOCK_STREAM=1, SOCK_CLOEXEC=0x80000.
+    var descriptor = linuxSyscall3(41, 2, 524289, 0)
+    if (descriptor >= 0) {
+        val enabled = nativeByteBuffer(8)
+        linuxNetStoreU32(enabled, 0, 1)
+        linuxSyscall5(
+            54,
+            descriptor,
+            1,
+            2,
+            nativePointerAddress(enabled.address),
+            4
+        )
+        enabled.close()
+
+        val address = nativeByteBuffer(16)
+        // sockaddr_in is native-endian for the family and network-endian for
+        // the port/address. INADDR_ANY preserves the portable facade's server
+        // behavior; applications can add an address-selecting overload later.
+        linuxNetStoreU16(address, 0, 2)
+        address.store(2, port / 256)
+        address.store(3, port - (port / 256) * 256)
+        address.store(4, 0)
+        address.store(5, 0)
+        address.store(6, 0)
+        address.store(7, 0)
+        val bound = linuxSyscall3(
+            49,
+            descriptor,
+            nativePointerAddress(address.address),
+            16
+        )
+        address.close()
+        if (bound < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = bound
+        }
+    }
+    if (descriptor >= 0) {
+        val listening = linuxSyscall2(50, descriptor, backlog)
+        if (listening < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = listening
+        }
+    }
+    TcpListener(descriptor)
+}
+
+fun TcpListener.accept(): TcpConnection {
+    var descriptor = -1
+    if (this.descriptor >= 0) {
+        descriptor = linuxSyscall4(
+            288,
+            this.descriptor,
+            0,
+            0,
+            524288
+        )
+        while (descriptor == -4) {
+            descriptor = linuxSyscall4(
+                288,
+                this.descriptor,
+                0,
+                0,
+                524288
+            )
+        }
+    }
+    TcpConnection(descriptor)
+}
+
+fun TcpListener.localPort(): int {
+    val address = nativeByteBuffer(16)
+    val length = nativeByteBuffer(8)
+    linuxNetStoreU32(length, 0, 16)
+    val status = linuxSyscall3(
+        51,
+        this.descriptor,
+        nativePointerAddress(address.address),
+        nativePointerAddress(length.address)
+    )
+    var port = -1
+    if (status == 0) port = linuxNetReadU16(address, 2)
+    address.close()
+    length.close()
+    port
+}
+
+fun TcpListener.close(): bool =
+    linuxTcpCloseDescriptor(this.descriptor)
+
+fun TcpConnection.read(maximum: int = 65536): string {
+    val buffer = nativeByteBuffer(maximum + 1)
+    var measured = linuxSyscall3(
+        0,
+        this.descriptor,
+        nativePointerAddress(buffer.address),
+        maximum
+    )
+    while (measured == -4) {
+        measured = linuxSyscall3(
+            0,
+            this.descriptor,
+            nativePointerAddress(buffer.address),
+            maximum
+        )
+    }
+    var result = ""
+    if (measured >= 0) result = buffer.adoptString(measured)
+    if (measured < 0) buffer.close()
+    result
+}
+
+fun TcpConnection.write(contents: string): int {
+    val address = nativeCStringAddress(contents)
+    var written = 0
+    var failed = false
+    while (!failed && written < contents.size) {
+        val amount = linuxSyscall6(
+            44,
+            this.descriptor,
+            address + written,
+            contents.size - written,
+            16384,
+            0,
+            0
+        )
+        if (amount > 0) written = written + amount
+        if (amount < 0 && amount != -4) failed = true
+    }
+    if (failed) -1 else written
+}
+
+fun TcpConnection.close(): bool =
+    linuxTcpCloseDescriptor(this.descriptor)
+
+fun tcpEnableGracefulShutdown(): bool {
+    var success = linuxTcpShutdownDescriptor >= 0
+    if (!success) {
+        // Block SIGTERM (signal 15) and receive it synchronously through a
+        // nonblocking close-on-exec signalfd. The kernel x86-64 sigset is 8 B.
+        val signals = nativeByteBuffer(8)
+        signals.storeI64(0, 16384)
+        val blocked = linuxSyscall4(
+            14,
+            0,
+            nativePointerAddress(signals.address),
+            0,
+            8
+        )
+        if (blocked == 0) {
+            linuxTcpShutdownDescriptor = linuxSyscall4(
+                289,
+                -1,
+                nativePointerAddress(signals.address),
+                8,
+                526336
+            )
+            if (linuxTcpShutdownDescriptor < 0) {
+                // Do not leave SIGTERM blocked if signalfd creation failed.
+                linuxSyscall4(
+                    14,
+                    1,
+                    nativePointerAddress(signals.address),
+                    0,
+                    8
+                )
+            }
+        }
+        signals.close()
+        success = linuxTcpShutdownDescriptor >= 0
+    }
+    success
+}
+
+fun linuxTcpDrainShutdown(): bool {
+    if (!linuxTcpShutdownSeen && linuxTcpShutdownDescriptor >= 0) {
+        val signal = nativeByteBuffer(128)
+        val measured = linuxSyscall3(
+            0,
+            linuxTcpShutdownDescriptor,
+            nativePointerAddress(signal.address),
+            128
+        )
+        if (measured >= 128) linuxTcpShutdownSeen = true
+        signal.close()
+    }
+    linuxTcpShutdownSeen
+}
+
+fun tcpShutdownRequested(): bool = linuxTcpDrainShutdown()
+
+fun TcpListener.acceptUntilShutdown(): TcpConnection {
+    var connection = TcpConnection(-1)
+    var waiting = this.descriptor >= 0 && !linuxTcpShutdownSeen
+    while (waiting) {
+        val descriptors = nativeByteBuffer(16)
+        linuxNetStoreU32(descriptors, 0, this.descriptor)
+        linuxNetStoreU16(descriptors, 4, 1)
+        linuxNetStoreU16(descriptors, 6, 0)
+        linuxNetStoreU32(
+            descriptors,
+            8,
+            linuxTcpShutdownDescriptor
+        )
+        linuxNetStoreU16(descriptors, 12, 1)
+        linuxNetStoreU16(descriptors, 14, 0)
+        var ready = linuxSyscall3(
+            7,
+            nativePointerAddress(descriptors.address),
+            2,
+            -1
+        )
+        while (ready == -4) {
+            ready = linuxSyscall3(
+                7,
+                nativePointerAddress(descriptors.address),
+                2,
+                -1
+            )
+        }
+        val listenerReady = descriptors.load(6) != 0 ||
+            descriptors.load(7) != 0
+        val signalReady = descriptors.load(14) != 0 ||
+            descriptors.load(15) != 0
+        descriptors.close()
+        if (signalReady) {
+            linuxTcpDrainShutdown()
+            waiting = false
+        }
+        if (!signalReady && listenerReady) {
+            connection = this.accept()
+            waiting = false
+        }
+        if (ready < 0) waiting = false
+    }
+    connection
+}

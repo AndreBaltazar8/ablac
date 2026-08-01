@@ -1,0 +1,864 @@
+#import("ir.ab")
+
+fun bootstrapBackendUnit() {}
+
+fun bootstrapCResourceDropGuard(): string =
+    ".tag != ABLA_NULL) {\n"
+
+fun bootstrapCParameterFallback(): string =
+    "] : abla_void();\n"
+
+fun bootstrapEscapeCString(value: string): string {
+    var output = ""
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte == 34) output = "$output\\\""
+        else if (byte == 92) output = "$output\\\\"
+        else if (byte == 10) output = "$output\\n"
+        else if (byte == 13) output = "$output\\r"
+        else if (byte == 9) output = "$output\\t"
+        else if (byte == 0) output = "$output\\0"
+        else output = "$output${value.slice(index, index + 1)}"
+        index = index + 1
+    }
+    output
+}
+
+// ISO C only guarantees support for 4095 characters in one string-literal
+// token. Keep each escaped token comfortably below that limit and rely on C's
+// adjacent-literal concatenation for arbitrarily large Abla constants.
+fun bootstrapCStringLiteral(value: string): string {
+    var output = "\""
+    var escapedInToken = 0
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        var escaped = value.slice(index, index + 1)
+        if (byte == 34) escaped = "\\\""
+        else if (byte == 92) escaped = "\\\\"
+        else if (byte == 10) escaped = "\\n"
+        else if (byte == 13) escaped = "\\r"
+        else if (byte == 9) escaped = "\\t"
+        else if (byte == 0) escaped = "\\0"
+        else escaped = escaped
+        if (escapedInToken + escaped.size > 3000) {
+            output = "$output\"\n        \""
+            escapedInToken = 0
+        }
+        output = "$output$escaped"
+        escapedInToken = escapedInToken + escaped.size
+        index = index + 1
+    }
+    "$output\""
+}
+
+class BootstrapCompilation(
+    val output: string,
+    val errors: int,
+    val parserErrors: int,
+    val semanticErrors: int,
+    val diagnostics: string
+)
+
+fun bootstrapEmitPlainProgram(program: BootstrapIrProgram): string {
+    var output =
+        "/* Generated deterministically by the self-hosted Abla front end. */\n#include <stdint.h>\n#include <stdlib.h>\n\n"
+    if (program.functions.size == 0) output = "${output}int main(void) {\n"
+    var lastGlobal = ""
+    var index = 0
+    while (index < program.instructions.size) {
+        val instruction = program.instructions[index]
+        if (instruction.opcode == "const.i64") {
+            output = "$output    int64_t v${instruction.result} = ${instruction.text};\n"
+            output = "$output    (void)v${instruction.result};\n"
+        }
+        if (instruction.opcode == "const.bool") {
+            val value = if (instruction.text == "true") 1 else 0
+            output = "$output    int64_t v${instruction.result} = $value;\n"
+            output = "$output    (void)v${instruction.result};\n"
+        }
+        if (
+            instruction.opcode == "+" || instruction.opcode == "-" ||
+            instruction.opcode == "*" || instruction.opcode == "/" ||
+            instruction.opcode == "==" || instruction.opcode == "!=" ||
+            instruction.opcode == "<" || instruction.opcode == "<=" ||
+            instruction.opcode == ">" || instruction.opcode == ">="
+        ) {
+            output =
+                "$output    int64_t v${instruction.result} = v${instruction.left} ${instruction.opcode} v${instruction.right};\n"
+            output = "$output    (void)v${instruction.result};\n"
+        }
+        if (instruction.opcode == "global.load") {
+            output =
+                "$output    int64_t v${instruction.result} = ${instruction.text};\n"
+            output = "$output    (void)v${instruction.result};\n"
+        }
+        if (instruction.opcode == "global.store") {
+            output =
+                "$output    int64_t ${instruction.text} = v${instruction.left};\n"
+            output = "$output    (void)${instruction.text};\n"
+            lastGlobal = instruction.text
+        }
+        index = index + 1
+    }
+    var hasMain = false
+    var prototypeIndex = 0
+    while (prototypeIndex < program.functions.size) {
+        val function = program.functions[prototypeIndex]
+        if (function.name != "main") {
+            output = "${output}static int64_t ${function.name}("
+            var parameterIndex = 0
+            while (parameterIndex < function.parameters.size) {
+                if (parameterIndex > 0) output = "$output, "
+                output =
+                    "${output}int64_t ${function.parameters[parameterIndex]}"
+                parameterIndex = parameterIndex + 1
+            }
+            if (function.parameters.size == 0) output = "${output}void"
+            output = "$output);\n"
+        }
+        prototypeIndex = prototypeIndex + 1
+    }
+    if (program.functions.size > 0) output = "$output\n"
+    var functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        val function = program.functions[functionIndex]
+        if (function.name == "main") {
+            hasMain = true
+            output = "${output}int main(void) {\n"
+        } else {
+            output = "${output}static int64_t ${function.name}("
+            var parameterIndex = 0
+            while (parameterIndex < function.parameters.size) {
+                if (parameterIndex > 0) output = "$output, "
+                output =
+                    "${output}int64_t ${function.parameters[parameterIndex]}"
+                parameterIndex = parameterIndex + 1
+            }
+            if (function.parameters.size == 0) output = "${output}void"
+            output = "$output) {\n"
+        }
+        var instructionIndex = 0
+        while (instructionIndex < function.instructions.size) {
+            val instruction = function.instructions[instructionIndex]
+            if (instruction.opcode == "const.i64") {
+                output =
+                    "$output    int64_t v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "const.bool") {
+                val value = if (instruction.text == "true") 1 else 0
+                output = "$output    int64_t v${instruction.result} = $value;\n"
+            }
+            if (instruction.opcode == "parameter.load") {
+                output =
+                    "$output    int64_t v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "local.load" ||
+                instruction.opcode == "global.load") {
+                output =
+                    "$output    int64_t v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "local.declare") {
+                output =
+                    "$output    int64_t ${instruction.text} = v${instruction.left};\n"
+                output =
+                    "$output    int64_t v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "local.assign" ||
+                instruction.opcode == "global.assign") {
+                output = "$output    ${instruction.text} = v${instruction.left};\n"
+                output =
+                    "$output    int64_t v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "local.zero") {
+                output = "$output    int64_t ${instruction.text} = 0;\n"
+            }
+            if (instruction.opcode == "local.allocate") {
+                output = "$output    int64_t ${instruction.text};\n"
+            }
+            if (instruction.opcode == "local.set") {
+                output = "$output    ${instruction.text} = v${instruction.left};\n"
+            }
+            if (instruction.opcode == "label") {
+                output = "${output}label_${instruction.target}: ;\n"
+            }
+            if (instruction.opcode == "jump") {
+                output = "$output    goto label_${instruction.target};\n"
+            }
+            if (instruction.opcode == "branch") {
+                output =
+                    "$output    if (v${instruction.left}) goto label_${instruction.target}; else goto label_${instruction.alternate};\n"
+            }
+            if (instruction.opcode == "return") {
+                output = "$output    return v${instruction.left};\n"
+            }
+            if (instruction.opcode == "unreachable") {
+                output = "$output    abort();\n"
+            }
+            if (instruction.opcode == "call") {
+                output =
+                    "$output    int64_t v${instruction.result} = ${instruction.text}("
+                if (instruction.left >= 0) {
+                    output = "${output}v${instruction.left}"
+                }
+                if (instruction.right >= 0) {
+                    output = "$output, v${instruction.right}"
+                }
+                output = "$output);\n"
+            }
+            if (instruction.opcode == "neg") {
+                output =
+                    "$output    int64_t v${instruction.result} = -v${instruction.left};\n"
+            }
+            if (instruction.opcode == "not") {
+                output =
+                    "$output    int64_t v${instruction.result} = !v${instruction.left};\n"
+            }
+            if (
+                instruction.opcode == "+" || instruction.opcode == "-" ||
+                instruction.opcode == "*" || instruction.opcode == "/" ||
+                instruction.opcode == "==" || instruction.opcode == "!=" ||
+                instruction.opcode == "<" || instruction.opcode == "<=" ||
+                instruction.opcode == ">" || instruction.opcode == ">=" ||
+                instruction.opcode == "&&" || instruction.opcode == "||"
+            ) {
+                output =
+                    "$output    int64_t v${instruction.result} = v${instruction.left} ${instruction.opcode} v${instruction.right};\n"
+            }
+            if (instruction.result >= 0) {
+                output = "$output    (void)v${instruction.result};\n"
+            }
+            instructionIndex = instructionIndex + 1
+        }
+        output = "$output    abort();\n}\n\n"
+        functionIndex = functionIndex + 1
+    }
+    if (program.functions.size == 0) {
+        if (lastGlobal == "") output = "$output    return 1;\n"
+        else output = "$output    return (int)$lastGlobal;\n"
+        output = "$output}\n"
+        bootstrapBackendUnit()
+    } else {
+        if (!hasMain) output = "${output}int main(void) { return 1; }\n"
+        bootstrapBackendUnit()
+    }
+    output
+}
+
+fun bootstrapRuntimeBinary(operation: string): string {
+    var result = "abla_add"
+    if (operation == "-") result = "abla_subtract"
+    if (operation == "*") result = "abla_multiply"
+    if (operation == "/") result = "abla_divide"
+    if (operation == "==") result = "abla_equal"
+    if (operation == "!=") result = "abla_not_equal"
+    if (operation == "<") result = "abla_less"
+    if (operation == "<=") result = "abla_less_equal"
+    if (operation == ">") result = "abla_greater"
+    if (operation == ">=") result = "abla_greater_equal"
+    result
+}
+
+fun bootstrapClassId(program: BootstrapIrProgram, name: string): int {
+    var result = -1
+    var index = 0
+    while (index < program.classes.size) {
+        if (program.classes[index].name == name) result = program.classes[index].id
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapFieldId(program: BootstrapIrProgram, name: string): int {
+    var result = -1
+    var next = 0
+    var classIndex = 0
+    while (classIndex < program.classes.size) {
+        var fieldIndex = 0
+        while (fieldIndex < program.classes[classIndex].fields.size) {
+            if (program.classes[classIndex].fields[fieldIndex] == name) result = next
+            next = next + 1
+            fieldIndex = fieldIndex + 1
+        }
+        classIndex = classIndex + 1
+    }
+    result
+}
+
+fun bootstrapFunctionId(program: BootstrapIrProgram, name: string): int {
+    var result = -1
+    var index = 0
+    while (index < program.functions.size) {
+        if (program.functions[index].name == name) result = index
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapEmitRuntimeProgram(program: BootstrapIrProgram): string {
+    var output =
+        "/* Generated deterministically by the self-hosted Abla front end. */\n#include \"abla_runtime.h\"\n\n"
+    var globalIndex = 0
+    while (globalIndex < program.instructions.size) {
+        val instruction = program.instructions[globalIndex]
+        if (instruction.opcode == "global.store") {
+            output = "${output}static AblaValue ${instruction.text};\n"
+        }
+        globalIndex = globalIndex + 1
+    }
+    if (program.instructions.size > 0) output = "$output\n"
+    var functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        val function = program.functions[functionIndex]
+        output =
+            "${output}static AblaValue abla_self_${function.name}(const AblaValue* args, size_t count);\n"
+        functionIndex = functionIndex + 1
+    }
+    output = "${output}\nstatic void abla_self_release_closure(AblaValue function) {\n"
+    output = "$output    (void)abla_as_function(function);\n"
+    output = "$output    if (function.as.function.captures != (AblaValue*)0) abla_platform_free(function.as.function.captures);\n"
+    output = "$output}\n\n"
+    output = "${output}static void abla_self_drop_closure(AblaValue function) {\n"
+    output = "$output    switch (abla_as_function(function)) {\n"
+    functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        val dropId = bootstrapFunctionId(
+            program,
+            bootstrapClosureDropFunctionName(
+                program.functions[functionIndex].name
+            )
+        )
+        if (dropId >= 0) {
+            output = "$output    case $functionIndex: (void)abla_self_${program.functions[dropId].name}(function.as.function.captures, function.as.function.capture_count); break;\n"
+        }
+        functionIndex = functionIndex + 1
+    }
+    output = "$output    default: break;\n"
+    output = "$output    }\n"
+    output = "$output    abla_self_release_closure(function);\n"
+    output = "$output}\n\n"
+    functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        val function = program.functions[functionIndex]
+        var instructionIndex = 0
+        while (instructionIndex < function.instructions.size) {
+            val instruction = function.instructions[instructionIndex]
+            if (instruction.opcode == "extern.c") {
+                output = "${output}extern int64_t ${instruction.text}("
+                var parameter = 0
+                while (parameter < instruction.operands.size) {
+                    if (parameter > 0) output = "$output, "
+                    output = "${output}int64_t"
+                    parameter = parameter + 1
+                }
+                if (instruction.operands.size == 0) output = "${output}void"
+                output = "$output);\n"
+            }
+            instructionIndex = instructionIndex + 1
+        }
+        functionIndex = functionIndex + 1
+    }
+    output = "${output}\nstatic AblaValue abla_self_call_indirect(AblaValue function, const AblaValue* args, size_t count) {\n"
+    output = "$output    const size_t capture_count = abla_function_capture_count(function);\n"
+    output = "$output    const size_t total = capture_count + count;\n"
+    output = "$output    AblaValue* merged = total == 0 ? (AblaValue*)0 : (AblaValue*)abla_platform_alloc(sizeof(AblaValue) * total);\n"
+    output = "$output    for (size_t index = 0; index < capture_count; ++index) merged[index] = abla_function_capture(function, index);\n"
+    output = "$output    for (size_t index = 0; index < count; ++index) merged[capture_count + index] = args[index];\n"
+    output = "$output    AblaValue result;\n"
+    output = "$output    switch (abla_as_function(function)) {\n"
+    functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        output =
+            "$output    case $functionIndex: result = abla_self_${program.functions[functionIndex].name}(merged, total); break;\n"
+        functionIndex = functionIndex + 1
+    }
+    output = "$output    default: abla_platform_panic(\"invalid function reference\", 26);\n"
+    output = "$output    }\n"
+    output = "$output    if (merged != (AblaValue*)0) abla_platform_free(merged);\n"
+    output = "$output    return result;\n}\n\n"
+    var hasMain = false
+    var hasGlobals = false
+    functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        val function = program.functions[functionIndex]
+        if (function.name == "main") hasMain = true
+        if (function.name == "__bootstrap_globals") hasGlobals = true
+        output =
+            "${output}static AblaValue abla_self_${function.name}(const AblaValue* args, size_t count) {\n"
+        output = "$output    (void)count;\n    (void)args;\n"
+        var parameterIndex = 0
+        while (parameterIndex < function.parameters.size) {
+            output =
+                "$output    AblaValue ${function.parameters[parameterIndex]} = count > $parameterIndex ? args[$parameterIndex"
+            output = "$output${bootstrapCParameterFallback()}"
+            output =
+                "$output    (void)${function.parameters[parameterIndex]};\n"
+            parameterIndex = parameterIndex + 1
+        }
+        var instructionIndex = 0
+        while (instructionIndex < function.instructions.size) {
+            val instruction = function.instructions[instructionIndex]
+            if (instruction.opcode == "const.i64") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_i64(INT64_C(${instruction.text}));\n"
+            }
+            if (instruction.opcode == "const.bool") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_bool(${instruction.text});\n"
+            }
+            if (instruction.opcode == "const.string") {
+                if (instruction.text.size <= 750) {
+                    val literal = bootstrapCStringLiteral(instruction.text)
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_string_static($literal, ${instruction.text.size});\n"
+                } else {
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_string_static(\"\", 0);\n"
+                    var chunkBegin = 0
+                    while (chunkBegin < instruction.text.size) {
+                        var chunkEnd = chunkBegin + 750
+                        if (chunkEnd > instruction.text.size) {
+                            chunkEnd = instruction.text.size
+                        }
+                        val chunk = instruction.text.slice(chunkBegin, chunkEnd)
+                        val literal = bootstrapCStringLiteral(chunk)
+                        output =
+                            "$output    v${instruction.result} = abla_string_concat(v${instruction.result}, abla_string_static($literal, ${chunk.size}));\n"
+                        chunkBegin = chunkEnd
+                    }
+                    output = output
+                }
+            }
+            if (instruction.opcode == "const.null") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_null();\n"
+            }
+            if (instruction.opcode == "const.void") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_void();\n"
+            }
+            if (instruction.opcode == "function.ref") {
+                val functionId = bootstrapFunctionId(program, instruction.text)
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_function($functionId);\n"
+            }
+            if (instruction.opcode == "closure.create") {
+                val functionId = bootstrapFunctionId(program, instruction.text)
+                if (instruction.operands.size > 0) {
+                    output =
+                        "$output    AblaValue capture_values_${instruction.result}[] = {"
+                    var capture = 0
+                    while (capture < instruction.operands.size) {
+                        if (capture > 0) output = "$output, "
+                        output =
+                            "${output}v${instruction.operands[capture]}"
+                        capture = capture + 1
+                    }
+                    output = "$output};\n"
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_closure($functionId, capture_values_${instruction.result}, ${instruction.operands.size});\n"
+                } else {
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_function($functionId);\n"
+                }
+            }
+            if (instruction.opcode == "cell.create") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_cell_create(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "cell.get") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_cell_get(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "cell.set") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_cell_set(v${instruction.operands[0]}, v${instruction.operands[1]});\n"
+            }
+            if (instruction.opcode == "shared.create") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_shared_create(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "shared.clone") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_shared_clone(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "shared.get") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_shared_get(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "shared.lock") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_shared_lock(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "shared.unlock") {
+                output =
+                    "$output    (void)abla_shared_unlock(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "shared.release") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_shared_release(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "weak.create") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_weak_create(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "weak.clone") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_weak_clone(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "weak.upgrade") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_weak_upgrade(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "weak.alive") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_weak_alive(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "weak.release") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_weak_release(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "array.create") {
+                if (instruction.operands.size > 0) {
+                    output =
+                        "$output    AblaValue array_values_${instruction.result}[] = {"
+                    var operand = 0
+                    while (operand < instruction.operands.size) {
+                        if (operand > 0) output = "$output, "
+                        output =
+                            "${output}v${instruction.operands[operand]}"
+                        operand = operand + 1
+                    }
+                    output = "$output};\n"
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_array_create(array_values_${instruction.result}, ${instruction.operands.size});\n"
+                } else {
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_array_create((const AblaValue*)0, 0);\n"
+                }
+            }
+            if (instruction.opcode == "extern.host") {
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text}("
+                var operand = 0
+                while (operand < instruction.operands.size) {
+                    if (operand > 0) output = "$output, "
+                    output = "${output}v${instruction.operands[operand]}"
+                    operand = operand + 1
+                }
+                if (instruction.operands.size == 0) output = "${output}"
+                output = "$output);\n"
+            }
+            if (instruction.opcode == "extern.intrinsic") {
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text}("
+                var operand = 0
+                while (operand < instruction.operands.size) {
+                    if (operand > 0) output = "$output, "
+                    output = "${output}v${instruction.operands[operand]}"
+                    operand = operand + 1
+                }
+                output = "$output);\n"
+            }
+            if (instruction.opcode == "extern.c") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_i64(${instruction.text}("
+                var operand = 0
+                while (operand < instruction.operands.size) {
+                    if (operand > 0) output = "$output, "
+                    output =
+                        "${output}abla_as_i64(v${instruction.operands[operand]})"
+                    operand = operand + 1
+                }
+                output = "$output));\n"
+            }
+            if (instruction.opcode == "object.create") {
+                val classId = bootstrapClassId(program, instruction.text)
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_object_create($classId);\n"
+                var classIndex = 0
+                while (classIndex < program.classes.size) {
+                    val found = program.classes[classIndex]
+                    if (found.name == instruction.text) {
+                        var fieldIndex = 0
+                        while (fieldIndex < found.fields.size &&
+                               fieldIndex < found.fieldParameters.size) {
+                            val fieldId = bootstrapFieldId(
+                                program,
+                                found.fields[fieldIndex]
+                            )
+                            val parameter = found.fieldParameters[fieldIndex]
+                            if (parameter < instruction.operands.size) {
+                                output =
+                                    "$output    abla_field_set(v${instruction.result}, $fieldId, v${instruction.operands[parameter]});\n"
+                            }
+                            fieldIndex = fieldIndex + 1
+                        }
+                    }
+                    classIndex = classIndex + 1
+                }
+            }
+            if (instruction.opcode == "object.allocate") {
+                val classId = bootstrapClassId(program, instruction.text)
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_object_create($classId);\n"
+            }
+            if (instruction.opcode == "parameter.load" ||
+                instruction.opcode == "local.load" ||
+                instruction.opcode == "global.load") {
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "resource.peek") {
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "place.root") {
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "place.load" ||
+                instruction.opcode == "place.move" ||
+                instruction.opcode == "place.set" ||
+                instruction.opcode == "borrow.bind" ||
+                instruction.opcode == "borrow.mutate") output = output
+            if (instruction.opcode == "parameter.default") {
+                output =
+                    "$output    if (count <= ${instruction.right}) ${instruction.text} = v${instruction.left};\n"
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "local.declare") {
+                output =
+                    "$output    AblaValue ${instruction.text} = v${instruction.left};\n"
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "local.assign" ||
+                instruction.opcode == "global.assign") {
+                output = "$output    ${instruction.text} = v${instruction.left};\n"
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "global.store") {
+                output =
+                    "$output    ${instruction.text} = v${instruction.left};\n"
+                output =
+                    "$output    AblaValue v${instruction.result} = ${instruction.text};\n"
+            }
+            if (instruction.opcode == "local.zero") {
+                output =
+                    "$output    AblaValue ${instruction.text} = abla_i64(INT64_C(0));\n"
+            }
+            if (instruction.opcode == "local.allocate") {
+                output =
+                    "$output    AblaValue ${instruction.text} = abla_null();\n"
+            }
+            if (instruction.opcode == "local.move") {
+                output = "$output    ${instruction.text} = abla_null();\n"
+            }
+            if (instruction.opcode == "resource.clear") {
+                output = "$output    ${instruction.text} = abla_null();\n"
+            }
+            if (instruction.opcode == "resource.drop") {
+                val dropValue = "${instruction.left}"
+                output = "$output    if (v$dropValue"
+                output = "$output${bootstrapCResourceDropGuard()}"
+                output =
+                    "$output        AblaValue drop_args_$instructionIndex[] = {v${instruction.left}};\n"
+                output =
+                    "$output        (void)abla_self_${bootstrapDropFunctionName(instruction.text)}(drop_args_$instructionIndex, 1);\n"
+                output = "$output    }\n"
+            }
+            if (instruction.opcode == "closure.drop") {
+                output =
+                    "$output    abla_self_drop_closure(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "local.set") {
+                output = "$output    ${instruction.text} = v${instruction.left};\n"
+            }
+            if (instruction.opcode == "label") {
+                output = "${output}label_${instruction.target}: ;\n"
+            }
+            if (instruction.opcode == "jump") {
+                output = "$output    goto label_${instruction.target};\n"
+            }
+            if (instruction.opcode == "branch") {
+                output =
+                    "$output    if (abla_as_bool(v${instruction.left})) goto label_${instruction.target}; else goto label_${instruction.alternate};\n"
+            }
+            if (instruction.opcode == "return") {
+                output = "$output    return v${instruction.left};\n"
+            }
+            if (instruction.opcode == "unreachable") {
+                output = "$output    abla_platform_panic(\"non-exhaustive when\", 19);\n"
+            }
+            if (instruction.opcode == "call") {
+                if (instruction.operands.size > 0) {
+                    output =
+                        "$output    AblaValue call_args_${instruction.result}[] = {"
+                    var operand = 0
+                    while (operand < instruction.operands.size) {
+                        if (operand > 0) output = "$output, "
+                        output =
+                            "${output}v${instruction.operands[operand]}"
+                        operand = operand + 1
+                    }
+                    output = "$output};\n"
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_self_${instruction.text}(call_args_${instruction.result}, ${instruction.operands.size});\n"
+                } else {
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_self_${instruction.text}((const AblaValue*)0, 0);\n"
+                }
+            }
+            if (instruction.opcode == "call.indirect" ||
+                instruction.opcode == "call.indirect.once") {
+                if (instruction.operands.size > 1) {
+                    output =
+                        "$output    AblaValue call_args_${instruction.result}[] = {"
+                    var operand = 1
+                    while (operand < instruction.operands.size) {
+                        if (operand > 1) output = "$output, "
+                        output =
+                            "${output}v${instruction.operands[operand]}"
+                        operand = operand + 1
+                    }
+                    output = "$output};\n"
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_self_call_indirect(v${instruction.operands[0]}, call_args_${instruction.result}, ${instruction.operands.size - 1});\n"
+                } else {
+                    output =
+                        "$output    AblaValue v${instruction.result} = abla_self_call_indirect(v${instruction.operands[0]}, (const AblaValue*)0, 0);\n"
+                }
+                if (instruction.opcode == "call.indirect.once") {
+                    output =
+                        "$output    abla_self_release_closure(v${instruction.operands[0]});\n"
+                }
+            }
+            if (instruction.opcode == "length") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_length(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "index.get") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_index_get(v${instruction.left}, v${instruction.right});\n"
+            }
+            if (instruction.opcode == "index.set") {
+                output =
+                    "$output    abla_array_set(v${instruction.operands[0]}, v${instruction.operands[1]}, v${instruction.operands[2]});\n"
+                output =
+                    "$output    AblaValue v${instruction.result} = v${instruction.operands[2]};\n"
+            }
+            if (instruction.opcode == "field.get") {
+                val fieldId = bootstrapFieldId(program, instruction.text)
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_field_get(v${instruction.left}, $fieldId);\n"
+            }
+            if (instruction.opcode == "field.set") {
+                val fieldId = bootstrapFieldId(program, instruction.text)
+                output =
+                    "$output    abla_field_set(v${instruction.operands[0]}, $fieldId, v${instruction.operands[1]});\n"
+                output =
+                    "$output    AblaValue v${instruction.result} = v${instruction.operands[1]};\n"
+            }
+            if (instruction.opcode == "array.append") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_array_append(v${instruction.operands[0]}, v${instruction.operands[1]});\n"
+            }
+            if (instruction.opcode == "string.slice") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_string_slice(v${instruction.operands[0]}, v${instruction.operands[1]}, v${instruction.operands[2]});\n"
+            }
+            if (instruction.opcode == "to.string") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_to_string(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "string.concat") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_string_concat(v${instruction.left}, v${instruction.right});\n"
+            }
+            if (instruction.opcode == "neg") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_negate(v${instruction.left});\n"
+            }
+            if (instruction.opcode == "not") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_not(v${instruction.left});\n"
+            }
+            if (
+                instruction.opcode == "+" || instruction.opcode == "-" ||
+                instruction.opcode == "*" || instruction.opcode == "/" ||
+                instruction.opcode == "==" || instruction.opcode == "!=" ||
+                instruction.opcode == "<" || instruction.opcode == "<=" ||
+                instruction.opcode == ">" || instruction.opcode == ">="
+            ) {
+                val runtime = bootstrapRuntimeBinary(instruction.opcode)
+                output =
+                    "$output    AblaValue v${instruction.result} = $runtime(v${instruction.left}, v${instruction.right});\n"
+            }
+            if (instruction.opcode == "&&" || instruction.opcode == "||") {
+                output =
+                    "$output    AblaValue v${instruction.result} = abla_bool(abla_as_bool(v${instruction.left}) ${instruction.opcode} abla_as_bool(v${instruction.right}));\n"
+            }
+            if (instruction.result >= 0) {
+                output = "$output    (void)v${instruction.result};\n"
+            }
+            instructionIndex = instructionIndex + 1
+        }
+        output = "$output    abla_platform_panic(\"function fell through\", 21);\n}\n\n"
+        functionIndex = functionIndex + 1
+    }
+    output = "${output}int main(int argc, char** argv) {\n"
+    output = "$output    abla_host_set_arguments(argc, argv);\n"
+    output = "$output    (void)abla_self_call_indirect;\n"
+    output = "$output    (void)abla_self_drop_closure;\n"
+    output = "$output    (void)abla_self_release_closure;\n"
+    functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        output =
+            "$output    (void)abla_self_${program.functions[functionIndex].name};\n"
+        functionIndex = functionIndex + 1
+    }
+    if (hasMain) {
+        if (hasGlobals) {
+            output =
+                "$output    (void)abla_self___bootstrap_globals((const AblaValue*)0, 0);\n"
+        } else output = output
+        output =
+            "$output    AblaValue result = abla_self_main((const AblaValue*)0, 0);\n"
+        output = "$output    if (result.tag == ABLA_VOID) return 0;\n"
+        output = "$output    return (int)abla_as_i64(result);\n"
+    } else output = "$output    return 1;\n"
+    "$output}\n"
+}
+
+fun bootstrapEmitProgram(program: BootstrapIrProgram): string {
+    if (program.functions.size > 0) bootstrapEmitRuntimeProgram(program)
+    else bootstrapEmitPlainProgram(program)
+}
+
+fun bootstrapCompileParsed(
+    parsed: BootstrapParseResult
+): BootstrapCompilation {
+    val analyzed = bootstrapAnalyzeParsed(parsed)
+    val program = bootstrapLowerParsed(parsed, analyzed)
+    var diagnostics = analyzed.diagnostics
+    if (program.errors > analyzed.errors) {
+        diagnostics =
+            "${diagnostics}ir.verification:${program.errors - analyzed.errors}\n${bootstrapIrVerificationDiagnostics(program)}"
+    }
+    BootstrapCompilation(
+        bootstrapEmitProgram(program),
+        program.errors,
+        parsed.errors,
+        analyzed.errors - parsed.errors,
+        diagnostics
+    )
+}
+
+fun bootstrapCompile(source: string): BootstrapCompilation =
+    bootstrapCompileParsed(bootstrapParseStaged(source))
+
+fun bootstrapEmitC(source: string): string = bootstrapCompile(source).output

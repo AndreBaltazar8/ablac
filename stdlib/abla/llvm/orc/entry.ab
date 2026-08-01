@@ -1,0 +1,283 @@
+// Minimal LLVM 21 ORC C binding. All native references are opaque pointers;
+// ownership transfer follows LLVM's documented C API exactly.
+
+#import("abla/unsafe/memory")
+
+noescape extern:"c" fun LLVMInitializeX86TargetInfo(): void
+noescape extern:"c" fun LLVMInitializeX86Target(): void
+noescape extern:"c" fun LLVMInitializeX86TargetMC(): void
+noescape extern:"c" fun LLVMInitializeX86AsmPrinter(): void
+noescape extern:"c" fun LLVMInitializeX86AsmParser(): void
+
+noescape extern:"c" fun LLVMContextCreate(): i64*
+noescape extern:"c" fun LLVMContextDispose(context: i64*): void
+noescape extern:"c" fun LLVMCreateMemoryBufferWithContentsOfFile(
+    path: cstring,
+    outputBuffer: i64*,
+    outputMessage: i64*
+): i32
+noescape extern:"c" fun LLVMDisposeMemoryBuffer(buffer: i64*): void
+noescape extern:"c" fun LLVMDisposeMessage(message: i64*): void
+noescape extern:"c" fun LLVMParseIRInContext(
+    context: i64*,
+    buffer: i64*,
+    outputModule: i64*,
+    outputMessage: i64*
+): i32
+
+noescape extern:"c" fun LLVMOrcCreateNewThreadSafeContextFromLLVMContext(
+    context: i64*
+): i64*
+noescape extern:"c" fun LLVMOrcDisposeThreadSafeContext(context: i64*): void
+noescape extern:"c" fun LLVMOrcCreateNewThreadSafeModule(
+    module: i64*,
+    context: i64*
+): i64*
+noescape extern:"c" fun LLVMOrcDisposeThreadSafeModule(module: i64*): void
+
+noescape extern:"c" fun LLVMOrcCreateLLJIT(
+    outputJit: i64*,
+    builder: i64*
+): i64*
+noescape extern:"c" fun LLVMOrcDisposeLLJIT(jit: i64*): i64*
+noescape extern:"c" fun LLVMOrcLLJITGetMainJITDylib(jit: i64*): i64*
+noescape extern:"c" fun LLVMOrcLLJITGetGlobalPrefix(jit: i64*): i8
+noescape extern:"c" fun LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+    outputGenerator: i64*,
+    globalPrefix: i8,
+    filter: i64*,
+    filterContext: i64*
+): i64*
+noescape extern:"c" fun LLVMOrcJITDylibAddGenerator(
+    dylib: i64*,
+    generator: i64*
+): void
+noescape extern:"c" fun LLVMOrcLLJITAddLLVMIRModule(
+    jit: i64*,
+    dylib: i64*,
+    module: i64*
+): i64*
+noescape extern:"c" fun LLVMOrcJITDylibCreateResourceTracker(
+    dylib: i64*
+): i64*
+noescape extern:"c" fun LLVMOrcReleaseResourceTracker(tracker: i64*): void
+noescape extern:"c" fun LLVMOrcResourceTrackerRemove(tracker: i64*): i64*
+noescape extern:"c" fun LLVMOrcLLJITAddLLVMIRModuleWithRT(
+    jit: i64*,
+    tracker: i64*,
+    module: i64*
+): i64*
+noescape extern:"c" fun LLVMOrcLLJITLookup(
+    jit: i64*,
+    outputAddress: i64*,
+    name: cstring
+): i64*
+noescape extern:"c" fun LLVMConsumeError(error: i64*): void
+noescape extern:"c" fun LLVMLoadLibraryPermanently(path: cstring): i32
+
+fun llvmLoadLibraryPermanently(path: string): int =
+    LLVMLoadLibraryPermanently(path)
+
+fun llvmConsumeError(error: i64*, status: int): int {
+    var result = 0
+    if (!pointerIsNull(error)) {
+        LLVMConsumeError(error)
+        result = status
+    }
+    result
+}
+
+fun llvmInitializeNativeTarget() {
+    LLVMInitializeX86TargetInfo()
+    LLVMInitializeX86Target()
+    LLVMInitializeX86TargetMC()
+    LLVMInitializeX86AsmPrinter()
+    LLVMInitializeX86AsmParser()
+}
+
+class LlvmOrcSession(
+    val jit: i64*,
+    val dylib: i64*,
+    val status: int,
+    var closed: bool
+)
+
+class LlvmOrcGeneration(
+    val tracker: i64*,
+    val status: int,
+    var closed: bool
+)
+
+class LlvmOrcLookup(
+    val status: int,
+    val address: int
+)
+
+// A session owns one LLJIT instance and its process symbol generator. Modules
+// can be added and reclaimed independently through generation trackers.
+fun llvmOrcCreateSession(): LlvmOrcSession {
+    llvmInitializeNativeTarget()
+    val nullPointer = nativeNullPointer()
+    val jit = nativePointerCell(nullPointer)
+    val generator = nativePointerCell(nullPointer)
+    var status = llvmConsumeError(
+        LLVMOrcCreateLLJIT(jit.address, nullPointer),
+        122
+    )
+    var dylib = nullPointer
+    if (status == 0) {
+        dylib = LLVMOrcLLJITGetMainJITDylib(jit.load())
+        status = llvmConsumeError(
+            LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+                generator.address,
+                LLVMOrcLLJITGetGlobalPrefix(jit.load()),
+                nullPointer,
+                nullPointer
+            ),
+            123
+        )
+    }
+    if (status == 0) {
+        LLVMOrcJITDylibAddGenerator(dylib, generator.load())
+    }
+    if (status != 0 && !pointerIsNull(jit.load())) {
+        llvmConsumeError(LLVMOrcDisposeLLJIT(jit.load()), 126)
+        jit.store(nullPointer)
+    }
+    val session = LlvmOrcSession(jit.load(), dylib, status, status != 0)
+    jit.close()
+    generator.close()
+    session
+}
+
+fun LlvmOrcSession.addFile(path: string): LlvmOrcGeneration {
+    val nullPointer = nativeNullPointer()
+    val buffer = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    val module = nativePointerCell(nullPointer)
+    val context = LLVMContextCreate()
+    var contextTransferred = false
+    var threadModuleOwned = false
+    var threadContextDisposed = false
+    var status: int = 128
+    if (!this.closed && this.status == 0) {
+        status = LLVMCreateMemoryBufferWithContentsOfFile(
+            path,
+            buffer.address,
+            message.address
+        )
+    }
+    if (status == 0) {
+        status = LLVMParseIRInContext(
+            context,
+            buffer.load(),
+            module.address,
+            message.address
+        )
+        // LLVMParseIRInContext consumes the memory buffer.
+        if (status != 0) status = 121
+    }
+    if (status != 0 && status != 128 && status != 121) status = 120
+    var threadContext = nullPointer
+    var threadModule = nullPointer
+    var tracker = nullPointer
+    if (status == 0) {
+        threadContext = LLVMOrcCreateNewThreadSafeContextFromLLVMContext(
+            context
+        )
+        contextTransferred = true
+        threadModule = LLVMOrcCreateNewThreadSafeModule(
+            module.load(),
+            threadContext
+        )
+        threadModuleOwned = true
+        tracker = LLVMOrcJITDylibCreateResourceTracker(this.dylib)
+        if (pointerIsNull(tracker)) status = 124
+    }
+    if (status == 0) {
+        status = llvmConsumeError(
+            LLVMOrcLLJITAddLLVMIRModuleWithRT(
+                this.jit,
+                tracker,
+                threadModule
+            ),
+            124
+        )
+        // The WithRT API consumes the thread-safe module even on failure.
+        threadModuleOwned = false
+        LLVMOrcDisposeThreadSafeContext(threadContext)
+        threadContextDisposed = true
+    }
+    if (!contextTransferred) LLVMContextDispose(context)
+    if (threadModuleOwned && !pointerIsNull(threadModule)) {
+        LLVMOrcDisposeThreadSafeModule(threadModule)
+    }
+    if (contextTransferred && !threadContextDisposed &&
+        !pointerIsNull(threadContext)) {
+        LLVMOrcDisposeThreadSafeContext(threadContext)
+    }
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    if (status != 0 && !pointerIsNull(tracker)) {
+        llvmConsumeError(LLVMOrcResourceTrackerRemove(tracker), 127)
+        LLVMOrcReleaseResourceTracker(tracker)
+        tracker = nullPointer
+    }
+    buffer.close()
+    message.close()
+    module.close()
+    LlvmOrcGeneration(tracker, status, status != 0)
+}
+
+fun LlvmOrcSession.lookup(name: string): LlvmOrcLookup {
+    val address = nativeI64Cell(0)
+    var status: int = 128
+    if (!this.closed && this.status == 0) {
+        status = llvmConsumeError(
+            LLVMOrcLLJITLookup(this.jit, address.address, name),
+            125
+        )
+    }
+    val result = LlvmOrcLookup(status, address.load())
+    address.close()
+    result
+}
+
+fun LlvmOrcGeneration.remove(): int {
+    var status = 0
+    if (!this.closed) {
+        status = llvmConsumeError(
+            LLVMOrcResourceTrackerRemove(this.tracker),
+            127
+        )
+        LLVMOrcReleaseResourceTracker(this.tracker)
+        this.closed = true
+    }
+    status
+}
+
+fun LlvmOrcSession.close(): int {
+    var status = 0
+    if (!this.closed) {
+        status = llvmConsumeError(LLVMOrcDisposeLLJIT(this.jit), 126)
+        this.closed = true
+    }
+    status
+}
+
+// Returns the JIT-compiled program's main result. Infrastructure failures use
+// 120-128, keeping them distinct from normal compiler diagnostics.
+fun llvmOrcRunFile(path: string): int {
+    val session = llvmOrcCreateSession()
+    val generation = session.addFile(path)
+    var result = generation.status
+    if (result == 0) {
+        val lookup = session.lookup("main")
+        result = lookup.status
+        if (result == 0) result = callNativeMain(lookup.address)
+    }
+    val removeStatus = generation.remove()
+    if (result == 0 && removeStatus != 0) result = removeStatus
+    val closeStatus = session.close()
+    if (result == 0 && closeStatus != 0) result = closeStatus
+    result
+}

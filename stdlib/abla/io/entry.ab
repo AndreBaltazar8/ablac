@@ -1,0 +1,115 @@
+#import("abla/sys/linux/io")
+#import("abla/platform/host")
+
+// Bootstrap host file services remain explicit so compile-time capability
+// policy can distinguish them from deterministic phase-safe libraries. The
+// public console surface below is target-backed and does not require libc.
+
+// Portable console surface. Platform profiles provide the host declarations
+// above; application code uses these functions and never names that adapter.
+fun print(text: string): void = linuxPrintStandardOutput(text)
+
+fun println(text: string = ""): void =
+    linuxPrintStandardOutput("$text\n")
+
+fun eprint(text: string): void = linuxPrintStandardError(text)
+
+fun eprintln(text: string = ""): void =
+    linuxPrintStandardError("$text\n")
+
+class InputLine(
+    val text: string,
+    val available: bool
+)
+
+// `available` distinguishes EOF from an empty line without sentinel text.
+fun readInputLine(): InputLine {
+    var text = ""
+    var available = false
+    var finished = false
+    while (!finished) {
+        val chunk = LinuxFileDescriptor(0).read(1)
+        if (chunk.size == 0) {
+            finished = true
+            0
+        } else if (chunk[0] == 10) {
+            available = true
+            finished = true
+            0
+        } else {
+            if (chunk[0] != 13) text = "$text$chunk"
+            available = true
+            0
+        }
+    }
+    InputLine(text, available)
+}
+
+// Convenience for programs that intentionally treat EOF as an empty string.
+fun readLine(): string = readInputLine().text
+
+// A portable buffered writer is parameterized by a normal Abla callback. It
+// therefore works for console, files, sockets, tests, and future target
+// adapters without embedding a platform handle in this module.
+class BufferedTextWriter(
+    val sink: (string) -> bool,
+    val capacity: int,
+    var chunks: array<string>,
+    var bufferedBytes: int,
+    var failed: bool
+)
+
+fun bufferedTextWriter(
+    capacity: int,
+    sink: (string) -> bool,
+    initiallyFailed: bool = false
+): BufferedTextWriter = BufferedTextWriter(
+    sink,
+    if (capacity > 0) capacity else 4096,
+    [],
+    0,
+    initiallyFailed
+)
+
+fun BufferedTextWriter.pendingBytes(): int = this.bufferedBytes
+
+fun BufferedTextWriter.isHealthy(): bool = !this.failed
+
+fun BufferedTextWriter.flush(): bool {
+    var success = !this.failed
+    if (success && this.bufferedBytes > 0) {
+        var output = ""
+        var index = 0
+        while (index < this.chunks.size) {
+            output = "$output${this.chunks[index]}"
+            index = index + 1
+        }
+        val outputSink = this.sink
+        success = outputSink(output)
+        if (success) {
+            this.chunks = []
+            this.bufferedBytes = 0
+        } else {
+            this.failed = true
+        }
+    }
+    success
+}
+
+fun BufferedTextWriter.write(text: string): bool {
+    if (!this.failed && text.size > 0) {
+        this.chunks.append(text)
+        this.bufferedBytes = this.bufferedBytes + text.size
+    }
+    if (!this.failed && this.bufferedBytes >= this.capacity) this.flush()
+    !this.failed
+}
+
+fun BufferedTextWriter.writeLine(text: string = ""): bool =
+    this.write("$text\n")
+
+fun bufferedStandardOutput(capacity: int = 4096): BufferedTextWriter =
+    bufferedTextWriter(capacity, linuxWriteStandardOutputAll)
+
+fun bufferedStandardError(capacity: int = 4096): BufferedTextWriter =
+    bufferedTextWriter(capacity, linuxWriteStandardErrorAll)

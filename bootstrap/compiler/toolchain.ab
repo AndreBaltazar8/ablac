@@ -1,0 +1,884 @@
+#import("backend_llvm.ab")
+#import("module.ab")
+#import("abla/sys/linux/fs")
+#import("abla/sys/linux/io")
+#import("abla/sys/linux/process")
+
+class BootstrapTargetDescriptor(
+    val name: string,
+    val llvmTriple: string,
+    val objectFormat: string,
+    val hosted: bool,
+    val libcFree: bool,
+    val entrySymbol: string,
+    val valid: bool
+)
+
+fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
+    var result = BootstrapTargetDescriptor(
+        name, "", "", false, false, "", false
+    )
+    if (name == "x86_64-linux") {
+        result = BootstrapTargetDescriptor(
+            name,
+            "x86_64-unknown-linux-gnu",
+            "elf",
+            true,
+            false,
+            "main",
+            true
+        )
+    }
+    if (name == "x86_64-linux-raw") {
+        result = BootstrapTargetDescriptor(
+            name,
+            "x86_64-unknown-linux-gnu",
+            "elf",
+            false,
+            true,
+            "_start",
+            true
+        )
+    }
+    result
+}
+
+fun bootstrapSupportedTargets(): string =
+    "x86_64-linux, x86_64-linux-raw"
+
+class BootstrapNativeBuild(
+    val status: int,
+    val modules: array<Path>,
+    val cached: bool,
+    val reusedModules: int,
+    val refreshedModules: int,
+    val reusedParsedModules: int,
+    val refreshedParsedModules: int,
+    val reusedLoweredFunctions: int,
+    val refreshedLoweredFunctions: int,
+    val reusedNativePartitions: int,
+    val refreshedNativePartitions: int
+)
+
+fun bootstrapModulePaths(graph: BootstrapModuleGraph): array<Path> {
+    val paths: array<Path> = []
+    var index = 0
+    while (index < graph.modules.size) {
+        paths.append(Path(graph.modules[index].path))
+        index = index + 1
+    }
+    if (graph.modules.size > 0) {
+        val manifest = Path(graph.modules[0].path).parent().child("abla.toml")
+        if (manifest.exists()) paths.append(manifest)
+    }
+    paths
+}
+
+// Bootstrap-only object emission. The final compiler replaces this strategy
+// with the in-process LLVM implementation from abla/llvm/aot.
+fun bootstrapExternalEmitObject(
+    llvmPath: string,
+    objectPath: string
+): int {
+    val optimizedPath = "$objectPath.bc"
+    val optimize = linuxCommand("opt")
+    optimize.argument("--threads=1")
+    optimize.argument("-passes=default<O2>,globaldce")
+    optimize.argument(llvmPath)
+    optimize.argument("-o")
+    optimize.argument(optimizedPath)
+    var status = optimize.run()
+    if (status == 0) {
+        val emitObject = linuxCommand("llc")
+        emitObject.argument("--threads=1")
+        emitObject.argument("-filetype=obj")
+        emitObject.argument("-relocation-model=pic")
+        emitObject.argument("-O2")
+        emitObject.argument(optimizedPath)
+        emitObject.argument("-o")
+        emitObject.argument(objectPath)
+        status = emitObject.run()
+    }
+    status
+}
+
+fun bootstrapNativeCacheHash(
+    source: string,
+    seed: int,
+    factor: int,
+    modulus: int
+): int {
+    var hash = seed
+    var index = 0
+    while (index < source.size) {
+        hash = hash * factor + source[index] + 1
+        hash = hash - (hash / modulus) * modulus
+        index = index + 1
+    }
+    hash
+}
+
+fun bootstrapCopyNativeObject(source: string, destination: string): int {
+    val copy = linuxCommand("cp")
+    copy.argument("--")
+    copy.argument(source)
+    copy.argument(destination)
+    copy.run()
+}
+
+class BootstrapPartitionEmission(
+    val status: int,
+    val reused: int,
+    val refreshed: int
+)
+
+fun bootstrapReplaceAll(
+    source: string,
+    expected: string,
+    replacement: string
+): string {
+    var output = ""
+    var segment = 0
+    var index = 0
+    while (index + expected.size <= source.size) {
+        if (source.slice(index, index + expected.size) == expected) {
+            output = "$output${source.slice(segment, index)}$replacement"
+            index = index + expected.size
+            segment = index
+        } else index = index + 1
+    }
+    "$output${source.slice(segment, source.size)}"
+}
+
+fun bootstrapLlvmUserFunctionSymbols(llvm: string): array<string> {
+    val symbols: array<string> = []
+    val prefix = "define hidden void @abla_fn_"
+    var offset = 0
+    while (offset + prefix.size < llvm.size) {
+        if (llvm.slice(offset, offset + prefix.size) == prefix) {
+            val begin = offset + 20
+            var end = begin
+            while (end < llvm.size && llvm[end] != 40 && llvm[end] != 32 &&
+                   llvm[end] != 10 && llvm[end] != 13) end = end + 1
+            if (end > begin) symbols.append(llvm.slice(begin, end))
+            offset = end
+        } else offset = offset + 1
+    }
+    symbols
+}
+
+fun bootstrapExtractLlvmFunctions(
+    inputPath: string,
+    outputPath: string,
+    symbols: array<string>,
+    deleting: bool
+): int {
+    val extract = linuxCommand("llvm-extract")
+    var symbol = 0
+    while (symbol < symbols.size) {
+        if (deleting) extract.argument("--delete")
+        extract.argument("--func=${symbols[symbol]}")
+        symbol = symbol + 1
+    }
+    extract.argument(inputPath)
+    extract.argument("-S")
+    extract.argument("-o")
+    extract.argument(outputPath)
+    extract.run()
+}
+
+fun bootstrapEmitPartitionedObject(
+    llvmPath: string,
+    objectPath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string,
+    cacheNamespace: string,
+    allowPartitionCache: bool
+): BootstrapPartitionEmission {
+    val llvm = Path(llvmPath).readText()
+    val symbols = bootstrapLlvmUserFunctionSymbols(llvm)
+    var status = 0
+    var reused = 0
+    var refreshed = 0
+    if (symbols.size <= 1) status = emitObject(llvmPath, objectPath)
+    if (symbols.size > 1) {
+        var bucketCount = (symbols.size + 31) / 32
+        if (bucketCount < 1) bucketCount = 1
+        if (bucketCount > 32) bucketCount = 32
+        val buckets: array<array<string>> = []
+        var bucket = 0
+        while (bucket < bucketCount) {
+            val values: array<string> = []
+            buckets.append(values)
+            bucket = bucket + 1
+        }
+        var symbol = 0
+        while (symbol < symbols.size) {
+            var hash = bootstrapNativeCacheHash(
+                symbols[symbol], 227, 307, 1000000007
+            )
+            if (hash < 0) hash = 0 - hash
+            val destination = hash - (hash / bucketCount) * bucketCount
+            buckets[destination].append(symbols[symbol])
+            symbol = symbol + 1
+        }
+
+        val rootLlvm = "$objectPath.root.ll"
+        val rootObject = "$objectPath.root.o"
+        status = bootstrapExtractLlvmFunctions(
+            llvmPath,
+            rootLlvm,
+            symbols,
+            true
+        )
+        if (status == 0) {
+            val rootSource = Path(rootLlvm).readText()
+            if (!Path(rootLlvm).writeTextAtomic(bootstrapReplaceAll(
+                rootSource,
+                "define internal",
+                "define hidden"
+            ))) status = 145
+        }
+        if (status == 0) status = emitObject(rootLlvm, rootObject)
+
+        val partObjects: array<string> = []
+        bucket = 0
+        while (status == 0 && bucket < buckets.size) {
+            if (buckets[bucket].size > 0) {
+                val partLlvm = "$objectPath.part.$bucket.ll"
+                val partObject = "$objectPath.part.$bucket.o"
+                status = bootstrapExtractLlvmFunctions(
+                    llvmPath,
+                    partLlvm,
+                    buckets[bucket],
+                    false
+                )
+                var identity = ""
+                if (status == 0) {
+                    identity = "partition-v2:$cacheProfile:${Path(
+                        partLlvm
+                    ).readText()}"
+                }
+                val first = bootstrapNativeCacheHash(
+                    identity, 229, 311, 1000000007
+                )
+                val second = bootstrapNativeCacheHash(
+                    identity, 233, 313, 1000000009
+                )
+                val cachedObject =
+                    "$cacheNamespace-${identity.size}-$first-$second.o"
+                val cachedInfo = Path(cachedObject).info()
+                var hit = allowPartitionCache && cachedInfo.isFile() &&
+                    cachedInfo.size > 0
+                if (hit) {
+                    status = bootstrapCopyNativeObject(
+                        cachedObject,
+                        partObject
+                    )
+                    if (status == 0) reused = reused + 1
+                }
+                if (!hit) {
+                    if (status == 0) status = emitObject(
+                        partLlvm,
+                        partObject
+                    )
+                    if (status == 0) refreshed = refreshed + 1
+                    if (status == 0 && allowPartitionCache) {
+                        val temporary =
+                            "$cachedObject.tmp.${linuxProcessId()}"
+                        val copyStatus = bootstrapCopyNativeObject(
+                            partObject,
+                            temporary
+                        )
+                        if (copyStatus == 0) {
+                            Path(temporary).moveTo(Path(cachedObject))
+                        }
+                        if (copyStatus != 0) Path(temporary).remove()
+                    }
+                }
+                if (status == 0) partObjects.append(partObject)
+            }
+            bucket = bucket + 1
+        }
+
+        if (status == 0) {
+            val combine = linuxCommand("ld.lld")
+            combine.argument("--threads=1")
+            combine.argument("-r")
+            combine.argument(rootObject)
+            var part = 0
+            while (part < partObjects.size) {
+                combine.argument(partObjects[part])
+                part = part + 1
+            }
+            combine.argument("-o")
+            combine.argument(objectPath)
+            status = combine.run()
+        }
+    }
+    BootstrapPartitionEmission(status, reused, refreshed)
+}
+
+fun bootstrapGraphCompileCapabilitiesCacheable(
+    graph: BootstrapModuleGraph
+): bool {
+    var cacheable = true
+    var module = 0
+    while (module < graph.orderedSnapshots.size) {
+        val actions = graph.orderedSnapshots[module].discovery.actions
+        var action = 0
+        while (action < actions.size) {
+            val staged = actions[action]
+            if (staged.kind == "compile" && staged.children.size == 1) {
+                val expression = staged.children[0]
+                if (expression.kind == "call" &&
+                    expression.text == "compilerGrant") {
+                    if (expression.children.size == 1 &&
+                        expression.children[0].kind == "string") {
+                        if (expression.children[0].text != "filesystem.read" &&
+                            expression.children[0].text != "environment") {
+                            cacheable = false
+                        }
+                    } else {
+                        cacheable = false
+                    }
+                }
+            }
+            action = action + 1
+        }
+        module = module + 1
+    }
+    cacheable
+}
+
+fun bootstrapParseCacheInteger(text: string, var cursor: array<int>): int {
+    var value = 0
+    var valid = cursor[0] < text.size
+    while (cursor[0] < text.size && text[cursor[0]] != 10) {
+        val byte = text[cursor[0]]
+        if (byte < 48 || byte > 57) valid = false
+        if (valid) value = value * 10 + byte - 48
+        cursor[0] = cursor[0] + 1
+    }
+    if (cursor[0] >= text.size) valid = false
+    if (cursor[0] < text.size) cursor[0] = cursor[0] + 1
+    if (valid) value else -1
+}
+
+fun bootstrapSerializeCompileInputs(
+    paths: array<string>,
+    inputs: array<string>
+): string {
+    var output = "abla-inputs-v1\n${paths.size}\n"
+    var index = 0
+    while (index < paths.size) {
+        val path = paths[index]
+        val contents = inputs[index]
+        val first = bootstrapNativeCacheHash(
+            contents, 53, 277, 1000000007
+        )
+        val second = bootstrapNativeCacheHash(
+            contents, 107, 281, 1000000009
+        )
+        output = "${output}${path.size}\n$path${contents.size}\n$first\n$second\n"
+        index = index + 1
+    }
+    output
+}
+
+fun bootstrapValidateCompileInputs(serialized: string): bool {
+    val prefix = "abla-inputs-v1\n"
+    var valid = serialized.size <= 1048576 &&
+        serialized.size >= prefix.size &&
+        serialized.slice(0, prefix.size) == prefix
+    val cursor: array<int> = [prefix.size]
+    var count = -1
+    if (valid) count = bootstrapParseCacheInteger(serialized, cursor)
+    if (count < 0 || count > 256) valid = false
+    var index = 0
+    while (valid && index < count) {
+        val pathSize = bootstrapParseCacheInteger(serialized, cursor)
+        if (pathSize < 0 || cursor[0] + pathSize > serialized.size) {
+            valid = false
+        }
+        var path = ""
+        if (valid) {
+            path = serialized.slice(cursor[0], cursor[0] + pathSize)
+            cursor[0] = cursor[0] + pathSize
+        }
+        val expectedSize = if (valid) {
+            bootstrapParseCacheInteger(serialized, cursor)
+        } else -1
+        val expectedFirst = if (valid) {
+            bootstrapParseCacheInteger(serialized, cursor)
+        } else -1
+        val expectedSecond = if (valid) {
+            bootstrapParseCacheInteger(serialized, cursor)
+        } else -1
+        if (valid) {
+            val contents = bootstrapCompileInputContents(path)
+            valid = contents.size == expectedSize &&
+                bootstrapNativeCacheHash(
+                    contents, 53, 277, 1000000007
+                ) == expectedFirst &&
+                bootstrapNativeCacheHash(
+                    contents, 107, 281, 1000000009
+                ) == expectedSecond
+        }
+        index = index + 1
+    }
+    valid && cursor[0] == serialized.size
+}
+
+fun bootstrapNativeBuildWithEmitterStateCache(
+    sourcePath: string,
+    outputPath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string,
+    var moduleState: BootstrapModuleState,
+    var irCache: BootstrapIrCacheState,
+    allowCache: bool,
+    rawTarget: bool
+): BootstrapNativeBuild {
+    bootstrapBeginCompileOutputs()
+    val modules: array<BootstrapModule> = []
+    moduleState.beginBuild()
+    irCache.beginBuild()
+    val orderedSnapshots: array<BootstrapModuleSnapshot> = []
+    val graph = BootstrapModuleGraph(
+        modules,
+        0,
+        moduleState,
+        orderedSnapshots,
+        []
+    )
+    val source = graph.load(sourcePath)
+    // Filesystem-read providers have serialized content identities. Other
+    // ambient effects remain uncached because they do not yet have a stable
+    // deterministic provider contract.
+    val compileInputsCacheable =
+        bootstrapGraphCompileCapabilitiesCacheable(graph)
+    val paths = bootstrapModulePaths(graph)
+    val llvmPath = "$outputPath.ll"
+    val objectPath = "$outputPath.o"
+    val hostPath = "$outputPath.host.o"
+    val rawRuntimePath = "$outputPath.raw-runtime.o"
+    val publishPath = "$outputPath.tmp.${linuxProcessId()}"
+    val manifestPath = Path(sourcePath).parent().child("abla.toml")
+    val manifest = manifestPath.readText()
+    val sourceIdentity = "$source\nabla-manifest:${manifest.size}\n$manifest"
+    val firstHash = bootstrapNativeCacheHash(
+        sourceIdentity, 17, 257, 1000000007
+    )
+    val secondHash = bootstrapNativeCacheHash(
+        sourceIdentity, 97, 263, 1000000009
+    )
+    // Source identity alone is insufficient: an object produced by an older
+    // compiler can be invalid after semantic or lowering changes even when the
+    // input program is byte-identical. Hash the executable that is performing
+    // this build so cache correctness does not depend on remembering a manual
+    // version bump for every compiler change.
+    val compilerImage = Path("/proc/self/exe").readText()
+    val compilerFirstHash = bootstrapNativeCacheHash(
+        compilerImage, 41, 269, 1000000007
+    )
+    val compilerSecondHash = bootstrapNativeCacheHash(
+        compilerImage, 101, 271, 1000000009
+    )
+    val cacheDirectory = "build/.abla-cache"
+    val partitionCacheNamespace =
+        "$cacheDirectory/native-partition-linux-x86_64-llvm21-v1-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
+    val cacheStem = "$cacheDirectory/native-linux-x86_64-llvm21-v12-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
+    val cacheObjectPath = "$cacheStem.o"
+    val cacheSourcePath = "$cacheStem.source"
+    val cacheLinkLlvmPath = "$cacheStem.link-llvm"
+    val cacheLinkHostPath = "$cacheStem.link-host"
+    val cacheInputsPath = "$cacheStem.inputs"
+    var cached = false
+    if (allowCache && compileInputsCacheable &&
+        Path(cacheObjectPath).exists() &&
+        Path(cacheSourcePath).exists() &&
+        Path(cacheLinkLlvmPath).exists() &&
+        Path(cacheLinkHostPath).exists() &&
+        Path(cacheInputsPath).exists()) {
+        cached = Path(cacheSourcePath).readText() == sourceIdentity &&
+            bootstrapValidateCompileInputs(
+                Path(cacheInputsPath).readText()
+            )
+    }
+    var status = 1
+    var linkLlvm = false
+    var linkHost = false
+    var reusedNativePartitions = 0
+    var refreshedNativePartitions = 0
+    // Remove sidecars left by compilers from before the value runtime was
+    // emitted in LLVM. A successful native build must not advertise or
+    // accidentally reuse the retired C runtime object.
+    Path("$outputPath.runtime.o").remove()
+    Path(hostPath).remove()
+    Path(rawRuntimePath).remove()
+    Path(publishPath).remove()
+    if (cached) {
+        linkLlvm = Path(cacheLinkLlvmPath).readText() == "1"
+        linkHost = Path(cacheLinkHostPath).readText() == "1"
+        status = bootstrapCopyNativeObject(cacheObjectPath, objectPath)
+    }
+    if (!cached) {
+        val compilation = bootstrapCompileLlvmParsedCached(
+            graph.parse(),
+            irCache
+        )
+        linkLlvm = compilation.linkLlvm
+        linkHost = compilation.linkHost
+        if (compilation.errors == 0) {
+            if (Path(llvmPath).writeTextAtomic(compilation.output)) status = 0
+            if (status == 0 && allowCache && compileInputsCacheable &&
+                Path(cacheDirectory).createDirectories()) {
+                val partitioned = bootstrapEmitPartitionedObject(
+                    llvmPath,
+                    objectPath,
+                    emitObject,
+                    cacheProfile,
+                    partitionCacheNamespace,
+                    true
+                )
+                status = partitioned.status
+                reusedNativePartitions = partitioned.reused
+                refreshedNativePartitions = partitioned.refreshed
+            } else if (status == 0) {
+                status = emitObject(llvmPath, objectPath)
+            }
+            if (status == 0 && allowCache && compileInputsCacheable &&
+                Path(cacheDirectory).createDirectories()) {
+                // The source identity is the commit marker. Remove it before
+                // replacing any member so interruption can leave only an
+                // uncommitted record, never a mixed old/new cache hit.
+                Path(cacheSourcePath).remove()
+                val cacheStatus = bootstrapCopyNativeObject(
+                    objectPath,
+                    cacheObjectPath
+                )
+                if (cacheStatus == 0) {
+                    val linkText = if (linkLlvm) "1" else "0"
+                    val hostText = if (linkHost) "1" else "0"
+                    var published = Path(cacheLinkLlvmPath).writeTextAtomic(
+                        linkText
+                    )
+                    if (published) published = Path(
+                        cacheLinkHostPath
+                    ).writeTextAtomic(hostText)
+                    if (published) published = Path(
+                        cacheInputsPath
+                    ).writeTextAtomic(bootstrapSerializeCompileInputs(
+                        compilation.compileInputPaths,
+                        compilation.compileInputContents
+                    ))
+                    if (published) published = Path(
+                        cacheSourcePath
+                    ).writeTextAtomic(sourceIdentity)
+                    if (!published) Path(cacheSourcePath).remove()
+                }
+            }
+        } else {
+            linuxPrintStandardError(compilation.diagnostics)
+            linuxPrintStandardError(
+                "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.semanticErrors} semantic, ${compilation.errors} total error(s)\n"
+            )
+        }
+    }
+    if (status == 0 && rawTarget && (linkHost || linkLlvm)) {
+        linuxPrintStandardError(
+            "target x86_64-linux-raw does not permit hosted or LLVM runtime imports\n"
+        )
+        status = 142
+    }
+    if (status == 0 && rawTarget) {
+        val compileRawRuntime = linuxCommand("clang")
+        compileRawRuntime.argument("-c")
+        compileRawRuntime.argument("-nostdlib")
+        compileRawRuntime.argument("runtime/abla_linux_raw_x86_64.S")
+        compileRawRuntime.argument("-o")
+        compileRawRuntime.argument(rawRuntimePath)
+        status = compileRawRuntime.run()
+    }
+    if (status == 0 && linkHost && !rawTarget) {
+        val compileHost = linuxCommand("clang")
+        compileHost.argument("-std=c11")
+        compileHost.argument("-O2")
+        compileHost.argument("-ffunction-sections")
+        compileHost.argument("-fdata-sections")
+        compileHost.argument("-Iruntime")
+        compileHost.argument("-c")
+        compileHost.argument("runtime/abla_runtime_host.c")
+        compileHost.argument("-o")
+        compileHost.argument(hostPath)
+        status = compileHost.run()
+    }
+    if (status == 0 && rawTarget) {
+        val linkRaw = linuxCommand("ld.lld")
+        linkRaw.argument("--threads=1")
+        linkRaw.argument("--gc-sections")
+        linkRaw.argument("-static")
+        linkRaw.argument("-e")
+        linkRaw.argument("_start")
+        linkRaw.argument(objectPath)
+        linkRaw.argument(rawRuntimePath)
+        linkRaw.argument("-o")
+        linkRaw.argument(publishPath)
+        status = linkRaw.run()
+    }
+    if (status == 0 && !rawTarget) {
+        val link = linuxCommand("clang")
+        link.argument("-fuse-ld=lld")
+        link.argument("-Wl,--threads=1")
+        link.argument("-Wl,--gc-sections")
+        if (linkLlvm) {
+            val llvmConfig = linuxCommand("llvm-config")
+            llvmConfig.argument("--libdir")
+            var llvmLibraryDirectory = llvmConfig.captureText()
+            var end = llvmLibraryDirectory.size
+            while (end > 0 &&
+                (llvmLibraryDirectory[end - 1] == 10 ||
+                 llvmLibraryDirectory[end - 1] == 13)) end = end - 1
+            llvmLibraryDirectory = llvmLibraryDirectory.slice(0, end)
+            link.argument("-Wl,--export-dynamic")
+            link.argument("-L$llvmLibraryDirectory")
+            link.argument("-Wl,-rpath,$llvmLibraryDirectory")
+            link.argument("-lLLVM")
+        }
+        link.argument(objectPath)
+        if (linkHost) link.argument(hostPath)
+        link.argument("-o")
+        link.argument(publishPath)
+        status = link.run()
+    }
+    if (status == 0) {
+        if (!Path(publishPath).moveTo(Path(outputPath))) status = 143
+    }
+    if (status == 0 && !bootstrapCommitCompileOutputs()) status = 144
+    if (status != 0) bootstrapDiscardCompileOutputs()
+    if (status != 0) Path(publishPath).remove()
+    if (status != 0) {
+        linuxPrintStandardError("native toolchain failed with status $status\n")
+    }
+    BootstrapNativeBuild(
+        status,
+        paths,
+        cached,
+        moduleState.reused,
+        moduleState.refreshed,
+        moduleState.reusedParsed,
+        moduleState.refreshedParsed,
+        irCache.reused,
+        irCache.refreshed,
+        reusedNativePartitions,
+        refreshedNativePartitions
+    )
+}
+
+fun bootstrapNativeBuildWithEmitterRetainedState(
+    sourcePath: string,
+    outputPath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string,
+    var moduleState: BootstrapModuleState,
+    var irCache: BootstrapIrCacheState
+): BootstrapNativeBuild = bootstrapNativeBuildWithEmitterStateCache(
+    sourcePath,
+    outputPath,
+    emitObject,
+    cacheProfile,
+    moduleState,
+    irCache,
+    true,
+    false
+)
+
+fun bootstrapNativeBuildWithEmitterState(
+    sourcePath: string,
+    outputPath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string,
+    var moduleState: BootstrapModuleState
+): BootstrapNativeBuild {
+    val irCache = bootstrapIrTransientState()
+    bootstrapNativeBuildWithEmitterRetainedState(
+        sourcePath,
+        outputPath,
+        emitObject,
+        cacheProfile,
+        moduleState,
+        irCache
+    )
+}
+
+fun bootstrapNativeBuildWithEmitter(
+    sourcePath: string,
+    outputPath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string
+): BootstrapNativeBuild {
+    val moduleState = bootstrapModuleState()
+    bootstrapNativeBuildWithEmitterState(
+        sourcePath,
+        outputPath,
+        emitObject,
+        cacheProfile,
+        moduleState
+    )
+}
+
+fun bootstrapNativeBuildUncachedWithEmitter(
+    sourcePath: string,
+    outputPath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string
+): BootstrapNativeBuild {
+    val moduleState = bootstrapModuleState()
+    val irCache = bootstrapIrTransientState()
+    bootstrapNativeBuildWithEmitterStateCache(
+        sourcePath,
+        outputPath,
+        emitObject,
+        cacheProfile,
+        moduleState,
+        irCache,
+        false,
+        false
+    )
+}
+
+fun bootstrapNativeRawBuildWithEmitter(
+    sourcePath: string,
+    outputPath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string,
+    useCache: bool
+): BootstrapNativeBuild {
+    val moduleState = bootstrapModuleState()
+    val irCache = bootstrapIrTransientState()
+    bootstrapNativeBuildWithEmitterStateCache(
+        sourcePath,
+        outputPath,
+        emitObject,
+        "raw-$cacheProfile",
+        moduleState,
+        irCache,
+        useCache,
+        true
+    )
+}
+
+fun bootstrapNativeBuild(
+    sourcePath: string,
+    outputPath: string
+): BootstrapNativeBuild = bootstrapNativeBuildWithEmitter(
+    sourcePath,
+    outputPath,
+    bootstrapExternalEmitObject,
+    "external-o2"
+)
+
+class BootstrapRunIr(
+    val status: int,
+    val llvmPath: string,
+    val linkHost: bool
+)
+
+fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
+    bootstrapBeginCompileOutputs()
+    val llvmPath = "build/.abla-run.ll"
+    val compilation = bootstrapCompileLlvmParsed(
+        bootstrapParseModule(sourcePath)
+    )
+    var status = 1
+    if (compilation.errors == 0 &&
+        Path(llvmPath).writeTextAtomic(compilation.output)) {
+        status = 0
+    }
+    if (status == 0 && !bootstrapCommitCompileOutputs()) status = 144
+    if (status != 0) bootstrapDiscardCompileOutputs()
+    if (compilation.errors != 0) {
+        linuxPrintStandardError(compilation.diagnostics)
+        linuxPrintStandardError(
+            "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.semanticErrors} semantic, ${compilation.errors} total error(s)\n"
+        )
+    }
+    BootstrapRunIr(status, llvmPath, compilation.linkHost)
+}
+
+fun bootstrapBuildJitHostLibrary(outputPath: string): int {
+    val hostCompile = linuxCommand("clang")
+    hostCompile.argument("-std=c11")
+    hostCompile.argument("-O2")
+    hostCompile.argument("-fPIC")
+    hostCompile.argument("-shared")
+    hostCompile.argument("-Wl,--no-undefined")
+    hostCompile.argument("-Iruntime")
+    hostCompile.argument("runtime/abla_runtime_host.c")
+    hostCompile.argument("-o")
+    hostCompile.argument(outputPath)
+    hostCompile.run()
+}
+
+fun bootstrapRun(sourcePath: string): int {
+    val prepared = bootstrapPrepareRun(sourcePath)
+    var status = prepared.status
+    if (status == 0) {
+        val execute = linuxCommand("build/abla-orc-runner")
+        execute.argument(prepared.llvmPath)
+        status = execute.run()
+    }
+    status
+}
+
+fun bootstrapServe(sourcePath: string): int {
+    bootstrapServeWithEmitter(
+        sourcePath,
+        bootstrapExternalEmitObject,
+        "external-o2"
+    )
+}
+
+fun bootstrapServeWithEmitter(
+    sourcePath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string
+): int {
+    var child = LinuxChildProcess(-1)
+    var generation = 0
+    var watcher = watchFile(Path(sourcePath))
+    val moduleState = bootstrapModuleState()
+    val irCache = bootstrapIrCacheState()
+    var rebuild = true
+    while (true) {
+        if (rebuild) {
+            val outputPath = "build/.abla-serve-$generation"
+            val build = bootstrapNativeBuildWithEmitterRetainedState(
+                sourcePath,
+                outputPath,
+                emitObject,
+                cacheProfile,
+                moduleState,
+                irCache
+            )
+            watcher = watchFiles(build.modules)
+            generation = generation + 1
+            if (build.status == 0) {
+                if (child.process >= 0) child.stop()
+                child = linuxCommand(outputPath).start()
+                linuxPrintStandardError(
+                    "reloaded generation $generation; modules: ${build.refreshedModules} refreshed, ${build.reusedModules} reused; parsed: ${build.refreshedParsedModules} refreshed, ${build.reusedParsedModules} reused; lowered: ${build.refreshedLoweredFunctions} refreshed, ${build.reusedLoweredFunctions} reused; objects: ${build.refreshedNativePartitions} refreshed, ${build.reusedNativePartitions} reused\n"
+                )
+            } else {
+                linuxPrintStandardError(
+                    "reload rejected; previous generation remains active\n"
+                )
+            }
+            rebuild = false
+        }
+        linuxSleep(200)
+        if (watcher.changed()) rebuild = true
+    }
+    0
+}

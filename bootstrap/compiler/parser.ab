@@ -1,0 +1,1412 @@
+#import("lexer.ab")
+
+class BootstrapExpression(
+    val kind: string,
+    val text: string,
+    val begin: int,
+    val end: int,
+    val children: array<BootstrapExpression>
+)
+
+class BootstrapParameters(
+    val names: array<string>,
+    val types: array<string>,
+    val defaults: array<BootstrapExpression>,
+    val kinds: array<string>
+)
+
+class BootstrapDeclaration(
+    val kind: string,
+    val name: string,
+    val begin: int,
+    val end: int,
+    val expression: BootstrapExpression,
+    val parameters: array<string>,
+    val parameterTypes: array<string>,
+    val resultType: string,
+    val methods: array<BootstrapDeclaration>,
+    val parameterDefaults: array<BootstrapExpression>,
+    val externalLibrary: string,
+    val parameterKinds: array<string>,
+    val extensionOwner: string,
+    val isTrusted: bool,
+    val isResource: bool,
+    val isNoEscape: bool,
+    val generatedNamespace: string,
+    val generatedOriginBegin: int,
+    val generatedOriginEnd: int
+)
+
+class BootstrapParseResult(
+    val declarations: array<BootstrapDeclaration>,
+    val actions: array<BootstrapExpression>,
+    val errors: int,
+    val compileInputPaths: array<string>,
+    val compileInputContents: array<string>,
+    val diagnostics: string
+)
+
+fun bootstrapHexValue(byte: int): int {
+    var value = -1
+    if (byte >= 48 && byte <= 57) value = byte - 48
+    if (byte >= 65 && byte <= 70) value = byte - 65 + 10
+    if (byte >= 97 && byte <= 102) value = byte - 97 + 10
+    value
+}
+
+fun bootstrapAsciiCodepoint(codepoint: int): string {
+    var result = ""
+    if (codepoint == 9) result = "\t"
+    if (codepoint == 10) result = "\n"
+    if (codepoint == 13) result = "\r"
+    if (codepoint >= 32 && codepoint <= 126) {
+        val printable = " !\"#\$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+        result = printable.slice(codepoint - 32, codepoint - 31)
+    }
+    result
+}
+
+fun bootstrapDecodeString(raw: string): string {
+    var output = ""
+    var segment = 0
+    var index = 0
+    while (index < raw.size) {
+        if (raw[index] == 92 && index + 1 < raw.size) {
+            output = "$output${raw.slice(segment, index)}"
+            val escaped = raw[index + 1]
+            if (escaped == 110) output = "$output\n"
+            else if (escaped == 114) output = "$output\r"
+            else if (escaped == 116) output = "$output\t"
+            else if (escaped == 48) {
+                output = "$output${raw.slice(index, index + 2)}"
+            }
+            else if (escaped == 34) output = "$output\""
+            else if (escaped == 92) output = "$output\\"
+            else if (escaped == 36) output = "$output$"
+            else if (escaped == 117 && index + 5 < raw.size) {
+                var codepoint = 0
+                var digit = 0
+                var valid = true
+                while (digit < 4) {
+                    val value = bootstrapHexValue(raw[index + 2 + digit])
+                    if (value < 0) valid = false
+                    if (value >= 0) codepoint = codepoint * 16 + value
+                    digit = digit + 1
+                }
+                val decoded = bootstrapAsciiCodepoint(codepoint)
+                if (valid && decoded != "") output = "$output$decoded"
+                else output = "$output${raw.slice(index, index + 6)}"
+                index = index + 4
+                output = output
+            }
+            else output = "$output${raw.slice(index, index + 2)}"
+            index = index + 2
+            segment = index
+        } else index = index + 1
+    }
+    "$output${raw.slice(segment, raw.size)}"
+}
+
+class BootstrapParser(
+    val source: string,
+    val tokens: array<BootstrapToken>,
+    val expansionBegins: array<int>,
+    val expansionEnds: array<int>,
+    val expansionExpressions: array<BootstrapExpression>,
+    var position: int,
+    var errors: int
+) {
+    fun at(kind: string): bool = this.tokens[this.position].kind == kind
+
+    fun expansionAt(begin: int): int {
+        var result = -1
+        var index = 0
+        while (index < this.expansionBegins.size) {
+            if (this.expansionBegins[index] == begin) result = index
+            index = index + 1
+        }
+        result
+    }
+
+    fun consume(kind: string): bool {
+        val matched = this.at(kind)
+        if (matched) this.position = this.position + 1
+        matched
+    }
+
+    fun expect(kind: string) {
+        if (!this.consume(kind)) {
+            this.errors = this.errors + 1
+            if (!this.at("end")) this.position = this.position + 1
+        }
+    }
+
+    fun skipSeparators() {
+        var more = this.at("newline") || this.at(";")
+        while (more) {
+            this.position = this.position + 1
+            more = this.at("newline") || this.at(";")
+        }
+    }
+
+    fun skipBalanced(open: string, close: string) {
+        this.expect(open)
+        var depth = 1
+        while (depth > 0 && !this.at("end")) {
+            if (this.at(open)) depth = depth + 1
+            if (this.at(close)) depth = depth - 1
+            this.position = this.position + 1
+        }
+        if (depth != 0) this.errors = this.errors + 1
+    }
+
+    fun skipToDeclarationEnd() {
+        var parentheses = 0
+        var brackets = 0
+        var finished = false
+        while (!finished && !this.at("end")) {
+            if (parentheses == 0 && brackets == 0 &&
+                (this.at("newline") || this.at(";") || this.at("}"))) {
+                finished = true
+                this.position = this.position
+            } else {
+                if (this.at("(")) parentheses = parentheses + 1
+                if (this.at(")")) parentheses = parentheses - 1
+                if (this.at("[")) brackets = brackets + 1
+                if (this.at("]")) brackets = brackets - 1
+                this.position = this.position + 1
+            }
+        }
+    }
+
+    fun parseType(stopOnRightParen: bool): string {
+        var type = ""
+        var angles = 0
+        var parentheses = 0
+        var finished = false
+        while (!finished && !this.at("end")) {
+            if (angles == 0 && parentheses == 0 &&
+                (this.at("=") || this.at("{") ||
+                 this.at("newline") || this.at(";"))) {
+                finished = true
+            } else if (angles == 0 && parentheses == 0 &&
+                (this.at(",") || (stopOnRightParen && this.at(")")))) {
+                finished = true
+            } else {
+                if (this.at("<")) angles = angles + 1
+                if (this.at(">")) angles = angles - 1
+                if (this.at("(")) parentheses = parentheses + 1
+                if (this.at(")")) parentheses = parentheses - 1
+                type = "$type${bootstrapTokenText(this.source, this.tokens[this.position])}"
+                this.position = this.position + 1
+                finished = finished
+            }
+        }
+        type
+    }
+
+    fun parseParameters(): BootstrapParameters {
+        val parameters: array<string> = []
+        val types: array<string> = []
+        val defaults: array<BootstrapExpression> = []
+        val kinds: array<string> = []
+        this.expect("(")
+        this.skipSeparators()
+        while (!this.at(")") && !this.at("end")) {
+            var parameterKind = "parameter"
+            if (this.at("val") || this.at("var") || this.at("own")) {
+                parameterKind = this.tokens[this.position].kind
+                this.position = this.position + 1
+            }
+            kinds.append(parameterKind)
+            val name = this.tokens[this.position]
+            this.expect("identifier")
+            parameters.append(bootstrapTokenText(this.source, name))
+            if (this.consume(":")) {
+                types.append(this.parseType(true))
+            } else types.append("unknown")
+            if (this.consume("=")) {
+                this.skipSeparators()
+                defaults.append(this.parseExpression())
+            } else defaults.append(BootstrapExpression(
+                "missing",
+                "",
+                name.end,
+                name.end,
+                []
+            ))
+            this.skipSeparators()
+            if (!this.consume(",") && !this.at(")")) this.errors = this.errors + 1
+            this.skipSeparators()
+        }
+        this.expect(")")
+        BootstrapParameters(parameters, types, defaults, kinds)
+    }
+
+    fun parseLambdaType(): string {
+        var type = ""
+        var angles = 0
+        var parentheses = 0
+        var finished = false
+        while (!finished && !this.at("end")) {
+            if (angles == 0 && parentheses == 0 &&
+                (this.at(",") || this.at("->"))) {
+                finished = true
+            } else {
+                if (this.at("<")) angles = angles + 1
+                if (this.at(">")) angles = angles - 1
+                if (this.at("(")) parentheses = parentheses + 1
+                if (this.at(")")) parentheses = parentheses - 1
+                type = "$type${bootstrapTokenText(
+                    this.source,
+                    this.tokens[this.position]
+                )}"
+                this.position = this.position + 1
+                finished = finished
+            }
+        }
+        type
+    }
+
+    fun parseLambda(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("{")
+        this.skipSeparators()
+        val children: array<BootstrapExpression> = []
+        val parameterStart = this.position
+        val parameters: array<BootstrapExpression> = []
+        var hasArrow = false
+
+        if (this.consume("->")) {
+            hasArrow = true
+        } else if (this.at("identifier")) {
+            var parsingParameters = true
+            while (parsingParameters) {
+                val name = this.tokens[this.position]
+                this.expect("identifier")
+                var type = "unknown"
+                if (this.consume(":")) type = this.parseLambdaType()
+                parameters.append(BootstrapExpression(
+                    "lambda.parameter",
+                    bootstrapTokenText(this.source, name),
+                    name.begin,
+                    this.tokens[this.position].begin,
+                    [BootstrapExpression(
+                        "type",
+                        type,
+                        name.begin,
+                        this.tokens[this.position].begin,
+                        []
+                    )]
+                ))
+                if (this.consume(",")) {
+                    this.skipSeparators()
+                    parsingParameters = parsingParameters
+                } else parsingParameters = false
+            }
+            if (this.consume("->")) hasArrow = true
+            else {
+                this.position = parameterStart
+                hasArrow = hasArrow
+            }
+        } else hasArrow = hasArrow
+
+        if (hasArrow) {
+            var parameter = 0
+            while (parameter < parameters.size) {
+                children.append(parameters[parameter])
+                parameter = parameter + 1
+            }
+            this.skipSeparators()
+        }
+
+        val statements: array<BootstrapExpression> = []
+        while (!this.at("}") && !this.at("end")) {
+            val before = this.position
+            if (this.at("val") || this.at("var")) {
+                statements.append(this.parseLocal())
+            } else if (this.at("while")) {
+                statements.append(this.parseWhile())
+            } else if (this.at("do")) {
+                statements.append(this.parseDoWhile())
+            } else if (this.at("for")) {
+                statements.append(this.parseFor())
+            } else if (this.at("return")) {
+                statements.append(this.parseReturn())
+            } else if (this.at("break") || this.at("continue")) {
+                statements.append(this.parseLoopControl())
+            } else statements.append(this.parseExpression())
+            if (this.position == before) {
+                this.errors = this.errors + 1
+                this.position = this.position + 1
+            }
+            if (!this.at("}") && !this.at("newline") &&
+                !this.at(";") && !this.at("end")) {
+                this.errors = this.errors + 1
+                this.skipToDeclarationEnd()
+            }
+            this.skipSeparators()
+        }
+        val end = this.tokens[this.position]
+        this.expect("}")
+        children.append(BootstrapExpression(
+            "block",
+            "",
+            start.begin,
+            end.end,
+            statements
+        ))
+        BootstrapExpression("lambda", "", start.begin, end.end, children)
+    }
+
+    fun parseLocal(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        val localKind = this.tokens[this.position].kind
+        this.position = this.position + 1
+        val name = this.tokens[this.position]
+        this.expect("identifier")
+        var declaredType = "inferred"
+        if (this.consume(":")) {
+            declaredType = this.parseType(false)
+        }
+        var initializer = BootstrapExpression(
+            "missing",
+            "",
+            name.end,
+            name.end,
+            []
+        )
+        if (this.consume("=")) {
+            this.skipSeparators()
+            initializer = this.parseExpression()
+        }
+        BootstrapExpression(
+            "local.$localKind",
+            bootstrapTokenText(this.source, name),
+            start.begin,
+            initializer.end,
+            [
+                initializer,
+                BootstrapExpression(
+                    "type",
+                    declaredType,
+                    name.begin,
+                    initializer.begin,
+                    []
+                )
+            ]
+        )
+    }
+
+    fun parseBlock(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("{")
+        val statements: array<BootstrapExpression> = []
+        this.skipSeparators()
+        while (!this.at("}") && !this.at("end")) {
+            val before = this.position
+            if (this.at("val") || this.at("var")) {
+                statements.append(this.parseLocal())
+            } else if (this.at("while")) {
+                statements.append(this.parseWhile())
+            } else if (this.at("do")) {
+                statements.append(this.parseDoWhile())
+            } else if (this.at("for")) {
+                statements.append(this.parseFor())
+            } else if (this.at("return")) {
+                statements.append(this.parseReturn())
+            } else if (this.at("break") || this.at("continue")) {
+                statements.append(this.parseLoopControl())
+            } else statements.append(this.parseExpression())
+            if (this.position == before) {
+                this.errors = this.errors + 1
+                this.position = this.position + 1
+            }
+            if (
+                !this.at("}") && !this.at("newline") &&
+                !this.at(";") && !this.at("end")
+            ) {
+                this.errors = this.errors + 1
+                this.skipToDeclarationEnd()
+            }
+            this.skipSeparators()
+        }
+        val end = this.tokens[this.position]
+        this.expect("}")
+        BootstrapExpression("block", "", start.begin, end.end, statements)
+    }
+
+    fun parseControlBody(): BootstrapExpression {
+        if (this.at("return")) this.parseReturn()
+        else if (this.at("break") || this.at("continue")) {
+            this.parseLoopControl()
+        }
+        else if (this.at("for")) this.parseFor()
+        else if (this.at("{")) this.parseBlock()
+        else this.parseExpression()
+    }
+
+    fun parseLoopControl(): BootstrapExpression {
+        val token = this.tokens[this.position]
+        val kind = token.kind
+        this.position = this.position + 1
+        BootstrapExpression(kind, "", token.begin, token.end, [])
+    }
+
+    fun parseReturn(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("return")
+        var value = BootstrapExpression(
+            "missing",
+            "return",
+            start.end,
+            start.end,
+            []
+        )
+        if (!this.at("newline") && !this.at(";") &&
+            !this.at("}") && !this.at("end")) {
+            value = this.parseExpression()
+        }
+        BootstrapExpression(
+            "return",
+            "",
+            start.begin,
+            value.end,
+            [value]
+        )
+    }
+
+    fun parseIf(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("if")
+        this.expect("(")
+        this.skipSeparators()
+        val condition = this.parseExpression()
+        this.skipSeparators()
+        this.expect(")")
+        this.skipSeparators()
+        val thenBranch = this.parseControlBody()
+        val beforeElseSeparators = this.position
+        this.skipSeparators()
+        var elseBranch = BootstrapExpression(
+            "missing",
+            "",
+            thenBranch.end,
+            thenBranch.end,
+            []
+        )
+        if (this.consume("else")) {
+            this.skipSeparators()
+            elseBranch = this.parseControlBody()
+            this.position = this.position
+        } else this.position = beforeElseSeparators
+        BootstrapExpression(
+            "if",
+            "",
+            start.begin,
+            elseBranch.end,
+            [condition, thenBranch, elseBranch]
+        )
+    }
+
+    fun parseWhile(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("while")
+        this.expect("(")
+        this.skipSeparators()
+        val condition = this.parseExpression()
+        this.skipSeparators()
+        this.expect(")")
+        this.skipSeparators()
+        val body = this.parseControlBody()
+        BootstrapExpression(
+            "while",
+            "",
+            start.begin,
+            body.end,
+            [condition, body]
+        )
+    }
+
+    fun parseDoWhile(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("do")
+        this.skipSeparators()
+        val body = this.parseControlBody()
+        this.skipSeparators()
+        this.expect("while")
+        this.expect("(")
+        this.skipSeparators()
+        val condition = this.parseExpression()
+        this.skipSeparators()
+        val end = this.tokens[this.position]
+        this.expect(")")
+        BootstrapExpression(
+            "do.while",
+            "",
+            start.begin,
+            end.end,
+            [body, condition]
+        )
+    }
+
+    fun parseFor(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("for")
+        this.expect("(")
+        this.skipSeparators()
+        val name = this.tokens[this.position]
+        this.expect("identifier")
+        this.expect("in")
+        this.skipSeparators()
+        val source = this.parseExpression()
+        this.skipSeparators()
+        this.expect(")")
+        this.skipSeparators()
+        val body = this.parseControlBody()
+        BootstrapExpression(
+            "for",
+            bootstrapTokenText(this.source, name),
+            start.begin,
+            body.end,
+            [source, body]
+        )
+    }
+
+    fun parseWhen(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("when")
+        this.expect("(")
+        this.skipSeparators()
+        val subject = this.parseExpression()
+        this.skipSeparators()
+        this.expect(")")
+        this.skipSeparators()
+        this.expect("{")
+        val children: array<BootstrapExpression> = [subject]
+        this.skipSeparators()
+        while (!this.at("}") && !this.at("end")) {
+            val matches: array<BootstrapExpression> = []
+            if (this.consume("else")) {
+                matches.append(BootstrapExpression(
+                    "missing",
+                    "else",
+                    this.tokens[this.position].begin,
+                    this.tokens[this.position].begin,
+                    []
+                ))
+            } else {
+                matches.append(this.parseExpression())
+                while (this.consume(",")) {
+                    this.skipSeparators()
+                    matches.append(this.parseExpression())
+                }
+            }
+            this.skipSeparators()
+            this.expect("->")
+            this.skipSeparators()
+            val body = this.parseExpression()
+            var match = 0
+            while (match < matches.size) {
+                children.append(matches[match])
+                children.append(body)
+                match = match + 1
+            }
+            this.skipSeparators()
+        }
+        val end = this.tokens[this.position]
+        this.expect("}")
+        BootstrapExpression("when", "", start.begin, end.end, children)
+    }
+
+    fun parseRegion(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("region")
+        this.skipSeparators()
+        if (!this.at("{")) {
+            this.errors = this.errors + 1
+            BootstrapExpression(
+                "region",
+                "",
+                start.begin,
+                start.end,
+                [BootstrapExpression(
+                    "invalid",
+                    "",
+                    start.end,
+                    start.end,
+                    []
+                )]
+            )
+        } else {
+            val body = this.parseBlock()
+            BootstrapExpression(
+                "region",
+                "",
+                start.begin,
+                body.end,
+                [body]
+            )
+        }
+    }
+
+    fun parsePrimary(): BootstrapExpression {
+        val token = this.tokens[this.position]
+        val expansion = this.expansionAt(token.begin)
+        if (expansion >= 0 && expansion < this.expansionEnds.size &&
+            expansion < this.expansionExpressions.size) {
+            val end = this.expansionEnds[expansion]
+            while (!this.at("end") &&
+                   this.tokens[this.position].begin < end) {
+                this.position = this.position + 1
+            }
+            this.expansionExpressions[expansion]
+        } else if (this.at("if")) {
+            this.parseIf()
+        } else if (this.at("when")) {
+            this.parseWhen()
+        } else if (this.at("region")) {
+            this.parseRegion()
+        } else if (
+            this.at("integer") || this.at("identifier") ||
+            this.at("true") || this.at("false") || this.at("null")
+        ) {
+            this.position = this.position + 1
+            BootstrapExpression(
+                token.kind,
+                bootstrapTokenText(this.source, token),
+                token.begin,
+                token.end,
+                []
+            )
+        } else if (this.consume("string-start")) {
+            var text = ""
+            var templated = false
+            val parts: array<BootstrapExpression> = []
+            while (!this.at("string-end") && !this.at("end")) {
+                if (this.at("string-text")) {
+                    val textToken = this.tokens[this.position]
+                    val part = bootstrapDecodeString(
+                        bootstrapTokenText(this.source, textToken)
+                    )
+                    text = "$text$part"
+                    parts.append(BootstrapExpression(
+                        "string",
+                        part,
+                        textToken.begin,
+                        textToken.end,
+                        []
+                    ))
+                    this.position = this.position + 1
+                } else if (this.at("interpolation-identifier")) {
+                    templated = true
+                    val identifier = this.tokens[this.position]
+                    parts.append(BootstrapExpression(
+                        "identifier",
+                        bootstrapTokenText(this.source, identifier),
+                        identifier.begin,
+                        identifier.end,
+                        []
+                    ))
+                    this.position = this.position + 1
+                } else if (this.consume("interpolation-start")) {
+                    templated = true
+                    parts.append(this.parseExpression())
+                    this.expect("interpolation-end")
+                    this.position = this.position
+                } else {
+                    this.errors = this.errors + 1
+                    this.position = this.position + 1
+                }
+            }
+            val stringEnd = this.tokens[this.position]
+            this.expect("string-end")
+            if (templated) {
+                BootstrapExpression(
+                    "string.template",
+                    "",
+                    token.begin,
+                    stringEnd.end,
+                    parts
+                )
+            } else BootstrapExpression(
+                "string",
+                text,
+                token.begin,
+                stringEnd.end,
+                []
+            )
+        } else if (this.consume("(")) {
+            this.skipSeparators()
+            val expression = this.parseExpression()
+            this.skipSeparators()
+            this.expect(")")
+            expression
+        } else if (this.consume("[")) {
+            val elements: array<BootstrapExpression> = []
+            this.skipSeparators()
+            while (!this.at("]") && !this.at("end")) {
+                elements.append(this.parseExpression())
+                this.skipSeparators()
+                if (!this.consume(",") && !this.at("]")) {
+                    this.errors = this.errors + 1
+                }
+                this.skipSeparators()
+            }
+            val end = this.tokens[this.position]
+            this.expect("]")
+            BootstrapExpression("array", "", token.begin, end.end, elements)
+        } else if (this.at("{")) {
+            this.parseLambda()
+        } else {
+            this.errors = this.errors + 1
+            if (!this.at("end")) this.position = this.position + 1
+            BootstrapExpression("invalid", "", token.begin, token.end, [])
+        }
+    }
+
+    fun parsePostfix(): BootstrapExpression {
+        var expression = this.parsePrimary()
+        var more = true
+        while (more) {
+            if (this.at("(")) {
+                val arguments: array<BootstrapExpression> = []
+                this.position = this.position + 1
+                this.skipSeparators()
+                while (!this.at(")") && !this.at("end")) {
+                    arguments.append(this.parseExpression())
+                    this.skipSeparators()
+                    if (!this.consume(",") && !this.at(")")) {
+                        this.errors = this.errors + 1
+                    }
+                    this.skipSeparators()
+                }
+                this.expect(")")
+                if (expression.kind == "member") {
+                    val memberArguments: array<BootstrapExpression> = []
+                    memberArguments.append(expression.children[0])
+                    var argument = 0
+                    while (argument < arguments.size) {
+                        memberArguments.append(arguments[argument])
+                        argument = argument + 1
+                    }
+                    expression = BootstrapExpression(
+                        "member.call",
+                        expression.text,
+                        expression.begin,
+                        this.tokens[this.position].begin,
+                        memberArguments
+                    )
+                } else {
+                    expression = BootstrapExpression(
+                        "call",
+                        expression.text,
+                        expression.begin,
+                        this.tokens[this.position].begin,
+                        arguments
+                    )
+                }
+                more = more
+            } else if (this.consume(".")) {
+                val member = this.tokens[this.position]
+                this.expect("identifier")
+                expression = BootstrapExpression(
+                    "member",
+                    bootstrapTokenText(this.source, member),
+                    expression.begin,
+                    member.end,
+                    [expression]
+                )
+                more = more
+            } else if (this.consume("[")) {
+                this.skipSeparators()
+                val index = this.parseExpression()
+                this.skipSeparators()
+                val end = this.tokens[this.position]
+                this.expect("]")
+                expression = BootstrapExpression(
+                    "index",
+                    "",
+                    expression.begin,
+                    end.end,
+                    [expression, index]
+                )
+                more = more
+            } else if (this.at("{")) {
+                val lambda = this.parseLambda()
+                if (expression.kind == "call") {
+                    val arguments: array<BootstrapExpression> = []
+                    var argument = 0
+                    while (argument < expression.children.size) {
+                        arguments.append(expression.children[argument])
+                        argument = argument + 1
+                    }
+                    arguments.append(lambda)
+                    expression = BootstrapExpression(
+                        "call",
+                        expression.text,
+                        expression.begin,
+                        lambda.end,
+                        arguments
+                    )
+                } else if (expression.kind == "member") {
+                    expression = BootstrapExpression(
+                        "member.call",
+                        expression.text,
+                        expression.begin,
+                        lambda.end,
+                        [expression.children[0], lambda]
+                    )
+                } else if (expression.kind == "identifier") {
+                    if (expression.text == "move") {
+                        expression = BootstrapExpression(
+                            "lambda.move",
+                            "",
+                            expression.begin,
+                            lambda.end,
+                            lambda.children
+                        )
+                    } else {
+                        expression = BootstrapExpression(
+                            "call",
+                            expression.text,
+                            expression.begin,
+                            lambda.end,
+                            [lambda]
+                        )
+                    }
+                } else {
+                    this.errors = this.errors + 1
+                    expression = BootstrapExpression(
+                        "invalid",
+                        "trailing-lambda-target",
+                        expression.begin,
+                        lambda.end,
+                        [expression, lambda]
+                    )
+                }
+                more = more
+            } else more = false
+        }
+        expression
+    }
+
+    fun parseFactor(): BootstrapExpression {
+        var expression = this.parseUnary()
+        var more = this.at("*") || this.at("/")
+        while (more) {
+            val operation = this.tokens[this.position]
+            this.position = this.position + 1
+            this.skipSeparators()
+            val right = this.parseUnary()
+            expression = BootstrapExpression(
+                operation.kind,
+                operation.kind,
+                expression.begin,
+                right.end,
+                [expression, right]
+            )
+            more = this.at("*") || this.at("/")
+        }
+        expression
+    }
+
+    fun parseUnary(): BootstrapExpression {
+        if (this.at("#")) {
+            val operation = this.tokens[this.position]
+            this.position = this.position + 1
+            val operand = this.parseUnary()
+            BootstrapExpression(
+                "compile",
+                "",
+                operation.begin,
+                operand.end,
+                [operand]
+            )
+        } else if (this.at("!") || this.at("-") || this.at("+")) {
+            val operation = this.tokens[this.position]
+            this.position = this.position + 1
+            val operand = this.parseUnary()
+            BootstrapExpression(
+                "unary${operation.kind}",
+                operation.kind,
+                operation.begin,
+                operand.end,
+                [operand]
+            )
+        } else this.parsePostfix()
+    }
+
+    fun parseTerm(): BootstrapExpression {
+        var expression = this.parseFactor()
+        var more = this.at("+") || this.at("-")
+        while (more) {
+            val operation = this.tokens[this.position]
+            this.position = this.position + 1
+            this.skipSeparators()
+            val right = this.parseFactor()
+            expression = BootstrapExpression(
+                operation.kind,
+                operation.kind,
+                expression.begin,
+                right.end,
+                [expression, right]
+            )
+            more = this.at("+") || this.at("-")
+        }
+        expression
+    }
+
+    fun parseRange(): BootstrapExpression {
+        var expression = this.parseTerm()
+        if (this.at("..") || this.at("until")) {
+            val operation = this.tokens[this.position]
+            this.position = this.position + 1
+            this.skipSeparators()
+            val right = this.parseTerm()
+            val kind = if (operation.kind == "..") {
+                "range.closed"
+            } else "range.until"
+            expression = BootstrapExpression(
+                kind,
+                operation.kind,
+                expression.begin,
+                right.end,
+                [expression, right]
+            )
+        }
+        expression
+    }
+
+    fun parseComparison(): BootstrapExpression {
+        var expression = this.parseRange()
+        var more =
+            this.at("<") || this.at("<=") ||
+            this.at(">") || this.at(">=")
+        while (more) {
+            val operation = this.tokens[this.position]
+            this.position = this.position + 1
+            this.skipSeparators()
+            val right = this.parseRange()
+            expression = BootstrapExpression(
+                operation.kind,
+                operation.kind,
+                expression.begin,
+                right.end,
+                [expression, right]
+            )
+            more =
+                this.at("<") || this.at("<=") ||
+                this.at(">") || this.at(">=")
+        }
+        expression
+    }
+
+    fun parseEquality(): BootstrapExpression {
+        var expression = this.parseComparison()
+        var more = this.at("==") || this.at("!=")
+        while (more) {
+            val operation = this.tokens[this.position]
+            this.position = this.position + 1
+            this.skipSeparators()
+            val right = this.parseComparison()
+            expression = BootstrapExpression(
+                operation.kind,
+                operation.kind,
+                expression.begin,
+                right.end,
+                [expression, right]
+            )
+            more = this.at("==") || this.at("!=")
+        }
+        expression
+    }
+
+    fun parseLogicalAnd(): BootstrapExpression {
+        var expression = this.parseEquality()
+        while (this.consume("&&")) {
+            this.skipSeparators()
+            val right = this.parseEquality()
+            expression = BootstrapExpression(
+                "&&",
+                "&&",
+                expression.begin,
+                right.end,
+                [expression, right]
+            )
+        }
+        expression
+    }
+
+    fun parseLogicalOr(): BootstrapExpression {
+        var expression = this.parseLogicalAnd()
+        while (this.consume("||")) {
+            this.skipSeparators()
+            val right = this.parseLogicalAnd()
+            expression = BootstrapExpression(
+                "||",
+                "||",
+                expression.begin,
+                right.end,
+                [expression, right]
+            )
+        }
+        expression
+    }
+
+    fun parseExpression(): BootstrapExpression {
+        val expression = this.parseLogicalOr()
+        if (this.consume("=")) {
+            this.skipSeparators()
+            val value = this.parseExpression()
+            if (expression.kind == "identifier") {
+                BootstrapExpression(
+                    "assign",
+                    expression.text,
+                    expression.begin,
+                    value.end,
+                    [value]
+                )
+            } else if (expression.kind == "member") {
+                BootstrapExpression(
+                    "member.assign",
+                    expression.text,
+                    expression.begin,
+                    value.end,
+                    [expression.children[0], value]
+                )
+            } else if (expression.kind == "index") {
+                BootstrapExpression(
+                    "index.assign",
+                    "",
+                    expression.begin,
+                    value.end,
+                    [
+                        expression.children[0],
+                        expression.children[1],
+                        value
+                    ]
+                )
+            } else {
+                this.errors = this.errors + 1
+                BootstrapExpression(
+                    "invalid",
+                    "assignment-target",
+                    expression.begin,
+                    value.end,
+                    [value]
+                )
+            }
+        } else expression
+    }
+
+    fun parseDeclaration(): BootstrapDeclaration {
+        val begin = this.tokens[this.position].begin
+        val kind = this.tokens[this.position].kind
+        this.position = this.position + 1
+        var nameToken = this.tokens[this.position]
+        this.expect("identifier")
+        var declarationName = bootstrapTokenText(this.source, nameToken)
+        var extensionOwner = ""
+        if (kind == "fun" && this.consume(".")) {
+            extensionOwner = declarationName
+            nameToken = this.tokens[this.position]
+            this.expect("identifier")
+            declarationName = bootstrapTokenText(this.source, nameToken)
+        }
+        var expression = BootstrapExpression("missing", "", begin, begin, [])
+        var parameters: array<string> = []
+        var parameterTypes: array<string> = []
+        var parameterDefaults: array<BootstrapExpression> = []
+        var parameterKinds: array<string> = []
+        var resultType = "inferred"
+        val methods: array<BootstrapDeclaration> = []
+
+        if (kind == "fun") {
+            if (this.at("(")) {
+                val parsedParameters = this.parseParameters()
+                parameters = parsedParameters.names
+                parameterTypes = parsedParameters.types
+                parameterDefaults = parsedParameters.defaults
+                parameterKinds = parsedParameters.kinds
+            }
+            if (this.consume(":")) {
+                resultType = this.parseType(false)
+            }
+            if (this.consume("=")) {
+                this.skipSeparators()
+                expression = this.parseExpression()
+                this.skipToDeclarationEnd()
+            }
+            else if (this.at("{")) expression = this.parseBlock()
+        } else if (kind == "class" || kind == "interface") {
+            if (this.at("(")) {
+                val parsedParameters = this.parseParameters()
+                parameters = parsedParameters.names
+                parameterTypes = parsedParameters.types
+                parameterDefaults = parsedParameters.defaults
+                parameterKinds = parsedParameters.kinds
+            }
+            if (this.consume("{")) {
+                this.skipSeparators()
+                while (!this.at("}") && !this.at("end")) {
+                    if (this.at("fun")) {
+                        methods.append(this.parseDeclaration())
+                    } else if (this.at("trusted")) {
+                        methods.append(this.parseTrustedDeclaration())
+                    } else if (this.at("noescape")) {
+                        methods.append(this.parseNoEscapeDeclaration())
+                    } else {
+                        this.errors = this.errors + 1
+                        this.skipToDeclarationEnd()
+                    }
+                    this.skipSeparators()
+                }
+                this.expect("}")
+            }
+        } else {
+            if (this.consume(":")) {
+                resultType = this.parseType(false)
+            }
+            if (this.consume("=")) {
+                this.skipSeparators()
+                expression = this.parseExpression()
+            }
+            this.skipToDeclarationEnd()
+        }
+
+        BootstrapDeclaration(
+            kind,
+            declarationName,
+            begin,
+            this.tokens[this.position].begin,
+            expression,
+            parameters,
+            parameterTypes,
+            resultType,
+            methods,
+            parameterDefaults,
+            "",
+            parameterKinds,
+            extensionOwner,
+            false,
+            false,
+            false,
+            "",
+            begin,
+            this.tokens[this.position].begin
+        )
+    }
+
+    fun parseExternal(): BootstrapDeclaration {
+        val begin = this.tokens[this.position].begin
+        if (this.at("compile")) this.position = this.position + 1
+        this.expect("extern")
+        this.expect(":")
+        this.expect("string-start")
+        var library = ""
+        if (this.at("string-text")) {
+            library = bootstrapDecodeString(bootstrapTokenText(
+                this.source,
+                this.tokens[this.position]
+            ))
+            this.position = this.position + 1
+        }
+        this.expect("string-end")
+        val declaration = this.parseDeclaration()
+        BootstrapDeclaration(
+            "extern",
+            declaration.name,
+            begin,
+            declaration.end,
+            declaration.expression,
+            declaration.parameters,
+            declaration.parameterTypes,
+            declaration.resultType,
+            declaration.methods,
+            declaration.parameterDefaults,
+            library,
+            declaration.parameterKinds,
+            declaration.extensionOwner,
+            declaration.isTrusted,
+            declaration.isResource,
+            declaration.isNoEscape,
+            declaration.generatedNamespace,
+            declaration.generatedOriginBegin,
+            declaration.generatedOriginEnd
+        )
+    }
+
+    fun parseCompileDeclaration(): BootstrapDeclaration {
+        val begin = this.tokens[this.position].begin
+        this.expect("compile")
+        if (this.at("abstract")) this.position = this.position + 1
+        val declaration = this.parseDeclaration()
+        var compileKind = declaration.kind
+        if (declaration.kind == "fun") compileKind = "compile.fun"
+        BootstrapDeclaration(
+            compileKind,
+            declaration.name,
+            begin,
+            declaration.end,
+            declaration.expression,
+            declaration.parameters,
+            declaration.parameterTypes,
+            declaration.resultType,
+            declaration.methods,
+            declaration.parameterDefaults,
+            declaration.externalLibrary,
+            declaration.parameterKinds,
+            declaration.extensionOwner,
+            declaration.isTrusted,
+            declaration.isResource,
+            declaration.isNoEscape,
+            declaration.generatedNamespace,
+            declaration.generatedOriginBegin,
+            declaration.generatedOriginEnd
+        )
+    }
+
+    fun parseTrustedDeclaration(): BootstrapDeclaration {
+        val begin = this.tokens[this.position].begin
+        this.expect("trusted")
+        val declaration = if (this.at("noescape")) {
+            this.parseNoEscapeDeclaration()
+        } else if (this.at("extern")) {
+            this.parseExternal()
+        } else this.parseDeclaration()
+        BootstrapDeclaration(
+            declaration.kind,
+            declaration.name,
+            begin,
+            declaration.end,
+            declaration.expression,
+            declaration.parameters,
+            declaration.parameterTypes,
+            declaration.resultType,
+            declaration.methods,
+            declaration.parameterDefaults,
+            declaration.externalLibrary,
+            declaration.parameterKinds,
+            declaration.extensionOwner,
+            true,
+            declaration.isResource,
+            declaration.isNoEscape,
+            declaration.generatedNamespace,
+            declaration.generatedOriginBegin,
+            declaration.generatedOriginEnd
+        )
+    }
+
+    fun parseResourceDeclaration(): BootstrapDeclaration {
+        val begin = this.tokens[this.position].begin
+        this.expect("resource")
+        val declaration = this.parseDeclaration()
+        if (declaration.kind != "class") this.errors = this.errors + 1
+        BootstrapDeclaration(
+            declaration.kind,
+            declaration.name,
+            begin,
+            declaration.end,
+            declaration.expression,
+            declaration.parameters,
+            declaration.parameterTypes,
+            declaration.resultType,
+            declaration.methods,
+            declaration.parameterDefaults,
+            declaration.externalLibrary,
+            declaration.parameterKinds,
+            declaration.extensionOwner,
+            declaration.isTrusted,
+            true,
+            declaration.isNoEscape,
+            declaration.generatedNamespace,
+            declaration.generatedOriginBegin,
+            declaration.generatedOriginEnd
+        )
+    }
+
+    fun parseNoEscapeDeclaration(): BootstrapDeclaration {
+        val begin = this.tokens[this.position].begin
+        this.expect("noescape")
+        val declaration = if (this.at("trusted")) {
+            this.parseTrustedDeclaration()
+        } else if (this.at("extern")) {
+            this.parseExternal()
+        } else this.parseDeclaration()
+        BootstrapDeclaration(
+            declaration.kind,
+            declaration.name,
+            begin,
+            declaration.end,
+            declaration.expression,
+            declaration.parameters,
+            declaration.parameterTypes,
+            declaration.resultType,
+            declaration.methods,
+            declaration.parameterDefaults,
+            declaration.externalLibrary,
+            declaration.parameterKinds,
+            declaration.extensionOwner,
+            declaration.isTrusted,
+            declaration.isResource,
+            true,
+            declaration.generatedNamespace,
+            declaration.generatedOriginBegin,
+            declaration.generatedOriginEnd
+        )
+    }
+
+    fun parse(): BootstrapParseResult {
+        val declarations: array<BootstrapDeclaration> = []
+        val actions: array<BootstrapExpression> = []
+        this.skipSeparators()
+        while (!this.at("end")) {
+            val before = this.position
+            if (this.at("#")) {
+                var isImport = false
+                if (this.position + 1 < this.tokens.size &&
+                    this.tokens[this.position + 1].kind == "identifier") {
+                    isImport = bootstrapTokenText(
+                        this.source,
+                        this.tokens[this.position + 1]
+                    ) == "import"
+                }
+                if (isImport) this.skipToDeclarationEnd()
+                else actions.append(this.parseExpression())
+            } else if (this.at("trusted")) {
+                declarations.append(this.parseTrustedDeclaration())
+            } else if (this.at("noescape")) {
+                declarations.append(this.parseNoEscapeDeclaration())
+            } else if (this.at("resource")) {
+                declarations.append(this.parseResourceDeclaration())
+            } else if (this.at("extern") ||
+                (this.at("compile") &&
+                 this.tokens[this.position + 1].kind == "extern")) {
+                declarations.append(this.parseExternal())
+            } else if (this.at("compile")) {
+                declarations.append(this.parseCompileDeclaration())
+            } else if (this.consume("abstract")) {
+                declarations.append(this.parseDeclaration())
+            } else if (
+                this.at("fun") || this.at("class") ||
+                this.at("interface") || this.at("val") || this.at("var")
+            ) {
+                declarations.append(this.parseDeclaration())
+            } else {
+                this.errors = this.errors + 1
+                this.skipToDeclarationEnd()
+            }
+            if (this.position == before) {
+                this.errors = this.errors + 1
+                this.position = this.position + 1
+            }
+            this.skipSeparators()
+        }
+        BootstrapParseResult(declarations, actions, this.errors, [], [], "")
+    }
+}
+
+fun bootstrapParse(source: string): BootstrapParseResult {
+    BootstrapParser(source, bootstrapLex(source), [], [], [], 0, 0).parse()
+}

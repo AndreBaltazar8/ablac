@@ -1,0 +1,363 @@
+// Linux x86-64 filesystem implementation with no project C host calls.
+// Import `abla/fs` for the portable profile or this module explicitly when a
+// small raw-kernel binary is preferred.
+
+#import("abla/sys/linux")
+#import("abla/bytes")
+
+class Path(val text: string)
+
+class FileInfo(
+    val path: Path,
+    val kind: int,
+    val size: int,
+    val revision: int
+) {
+    fun exists(): bool = this.kind != 0
+
+    fun isFile(): bool = this.kind == 1
+
+    fun isDirectory(): bool = this.kind == 2
+}
+
+class FileWatch(
+    val paths: array<Path>,
+    var revisions: array<int>
+)
+
+fun path(value: string): Path = Path(value)
+
+fun linuxLoadU16(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) + buffer.load(offset + 1) * 256
+
+fun linuxLoadU32(buffer: NativeByteBuffer, offset: int): int =
+    linuxLoadU16(buffer, offset) +
+    linuxLoadU16(buffer, offset + 2) * 65536
+
+fun linuxFileInfo(filePath: Path): FileInfo {
+    val status = nativeByteBuffer(144)
+    val measured = linuxSyscall4(
+        262,
+        -100,
+        nativeCStringAddress(filePath.text),
+        nativePointerAddress(status.address),
+        0
+    )
+    var kind = 0
+    var size = -1
+    var revision = 0
+    if (measured == 0) {
+        val modeKind = linuxLoadU32(status, 24) / 4096
+        kind = 3
+        if (modeKind == 8) kind = 1
+        if (modeKind == 4) kind = 2
+        size = status.loadI64(48)
+        val modifiedSeconds = status.loadI64(88)
+        val modifiedNanoseconds = status.loadI64(96)
+        revision = modifiedSeconds * 1000000000 + modifiedNanoseconds
+    }
+    status.close()
+    FileInfo(filePath, kind, size, revision)
+}
+
+fun currentDirectory(): Path {
+    val buffer = nativeByteBuffer(4096)
+    val measured = linuxSyscall2(
+        79,
+        nativePointerAddress(buffer.address),
+        buffer.capacity
+    )
+    var result = "."
+    if (measured > 0 && measured <= buffer.capacity) {
+        result = buffer.adoptString(measured - 1)
+    }
+    if (measured <= 0 || measured > buffer.capacity) buffer.close()
+    Path(result)
+}
+
+fun Path.child(name: string): Path {
+    var separator = "/"
+    if (this.text.size > 0 && this.text[this.text.size - 1] == 47) {
+        separator = ""
+    }
+    Path("${this.text}$separator$name")
+}
+
+fun Path.parent(): Path {
+    var end = this.text.size
+    while (end > 1 && this.text[end - 1] == 47) end = end - 1
+    var slash = -1
+    var index = 0
+    while (index < end) {
+        if (this.text[index] == 47) slash = index
+        index = index + 1
+    }
+    var result = "."
+    if (slash == 0) result = "/"
+    if (slash > 0) result = this.text.slice(0, slash)
+    Path(result)
+}
+
+fun Path.name(): string {
+    var end = this.text.size
+    while (end > 1 && this.text[end - 1] == 47) end = end - 1
+    var slash = -1
+    var index = 0
+    while (index < end) {
+        if (this.text[index] == 47) slash = index
+        index = index + 1
+    }
+    this.text.slice(slash + 1, end)
+}
+
+fun Path.extension(): string {
+    val name = this.name()
+    var dot = -1
+    var index = 0
+    while (index < name.size) {
+        if (name[index] == 46) dot = index
+        index = index + 1
+    }
+    var result = ""
+    if (dot > 0 && dot + 1 < name.size) {
+        result = name.slice(dot + 1, name.size)
+    }
+    result
+}
+
+fun Path.info(): FileInfo = linuxFileInfo(this)
+
+fun Path.revision(): int = this.info().revision
+
+fun Path.exists(): bool = this.info().exists()
+
+fun Path.readText(): string {
+    val info = this.info()
+    var result = ""
+    if (info.isFile() && info.size >= 0) {
+        val descriptor = linuxOpen(this.text)
+        if (descriptor.descriptor >= 0) {
+            val buffer = nativeByteBuffer(info.size + 1)
+            var measured = 0
+            var reading = true
+            while (reading && measured < info.size) {
+                val amount = linuxSyscall3(
+                    0,
+                    descriptor.descriptor,
+                    nativePointerAddress(buffer.pointerAt(measured)),
+                    info.size - measured
+                )
+                if (amount > 0) measured = measured + amount
+                if (amount <= 0) reading = false
+            }
+            descriptor.close()
+            result = buffer.adoptString(measured)
+        }
+    }
+    result
+}
+
+fun linuxWriteAll(descriptor: int, contents: string): bool {
+    val address = nativeCStringAddress(contents)
+    var written = 0
+    var success = true
+    while (success && written < contents.size) {
+        val amount = linuxSyscall3(
+            1,
+            descriptor,
+            address + written,
+            contents.size - written
+        )
+        if (amount > 0) written = written + amount
+        if (amount <= 0) success = false
+    }
+    success
+}
+
+fun Path.createDirectories(): bool {
+    var success = true
+    var index = 1
+    while (success && index <= this.text.size) {
+        if (index == this.text.size || this.text[index] == 47) {
+            val component = this.text.slice(0, index)
+            if (component != "" && component != ".") {
+                val status = linuxSyscall2(
+                    83,
+                    nativeCStringAddress(component),
+                    511
+                )
+                if (status != 0 && status != -17) success = false
+            }
+        }
+        index = index + 1
+    }
+    success
+}
+
+fun Path.createParentDirectories(): bool = this.parent().createDirectories()
+
+fun Path.writeText(contents: string): bool {
+    var success = this.createParentDirectories()
+    var descriptor = -1
+    if (success) descriptor = linuxOpen(this.text, 577, 438).descriptor
+    if (descriptor < 0) success = false
+    if (success) success = linuxWriteAll(descriptor, contents)
+    if (descriptor >= 0 && linuxSyscall1(3, descriptor) != 0) success = false
+    success
+}
+
+// Append is a separate operation so buffered portable writers can flush in
+// bounded chunks without retaining an open target-specific descriptor.
+fun Path.appendText(contents: string): bool {
+    var success = this.createParentDirectories()
+    var descriptor = -1
+    // O_WRONLY | O_CREAT | O_APPEND.
+    if (success) descriptor = linuxOpen(this.text, 1089, 438).descriptor
+    if (descriptor < 0) success = false
+    if (success) success = linuxWriteAll(descriptor, contents)
+    if (descriptor >= 0 && linuxSyscall1(3, descriptor) != 0) success = false
+    success
+}
+
+fun Path.writeTextAtomic(contents: string): bool {
+    var success = this.createParentDirectories()
+    val temporary = Path("${this.text}.tmp.${linuxProcessId()}")
+    var descriptor = -1
+    if (success) descriptor = linuxOpen(temporary.text, 705, 438).descriptor
+    if (success && descriptor < 0) {
+        temporary.remove()
+        descriptor = linuxOpen(temporary.text, 705, 438).descriptor
+    }
+    if (descriptor < 0) success = false
+    if (success) success = linuxWriteAll(descriptor, contents)
+    if (success && linuxSyscall1(74, descriptor) != 0) success = false
+    if (descriptor >= 0 && linuxSyscall1(3, descriptor) != 0) success = false
+    if (success) {
+        success = linuxSyscall2(
+            82,
+            nativeCStringAddress(temporary.text),
+            nativeCStringAddress(this.text)
+        ) == 0
+    }
+    if (!success) temporary.remove()
+    success
+}
+
+fun Path.moveTo(destination: Path): bool {
+    var success = destination.createParentDirectories()
+    if (success) {
+        success = linuxSyscall2(
+            82,
+            nativeCStringAddress(this.text),
+            nativeCStringAddress(destination.text)
+        ) == 0
+    }
+    success
+}
+
+fun Path.remove(): bool {
+    var status = linuxSyscall1(87, nativeCStringAddress(this.text))
+    if (status != 0) status = linuxSyscall1(
+        84,
+        nativeCStringAddress(this.text)
+    )
+    status == 0
+}
+
+fun linuxDirectoryEntryName(
+    buffer: NativeByteBuffer,
+    begin: int,
+    end: int
+): string {
+    var length = 0
+    while (begin + length < end && buffer.load(begin + length) != 0) {
+        length = length + 1
+    }
+    val name = nativeByteBuffer(length + 1)
+    var index = 0
+    while (index < length) {
+        name.store(index, buffer.load(begin + index))
+        index = index + 1
+    }
+    name.store(length, 0)
+    name.adoptString(length)
+}
+
+fun Path.entries(): array<Path> {
+    val entries: array<Path> = []
+    val descriptor = linuxOpen(this.text, 65536).descriptor
+    if (descriptor >= 0) {
+        val buffer = nativeByteBuffer(65536)
+        var reading = true
+        while (reading) {
+            val measured = linuxSyscall3(
+                217,
+                descriptor,
+                nativePointerAddress(buffer.address),
+                buffer.capacity
+            )
+            if (measured <= 0) reading = false
+            var offset = 0
+            while (offset + 19 <= measured) {
+                val recordLength = linuxLoadU16(buffer, offset + 16)
+                val validRecord = recordLength >= 20 &&
+                    offset + recordLength <= measured
+                if (!validRecord) {
+                    offset = measured
+                    reading = false
+                }
+                if (validRecord) {
+                    val name = linuxDirectoryEntryName(
+                        buffer,
+                        offset + 19,
+                        offset + recordLength
+                    )
+                    if (name != "." && name != "..") {
+                        entries.append(this.child(name))
+                    }
+                    offset = offset + recordLength
+                }
+            }
+        }
+        buffer.close()
+        linuxSyscall1(3, descriptor)
+    }
+    entries
+}
+
+fun watchFiles(paths: array<Path>): FileWatch {
+    val revisions: array<int> = []
+    var index = 0
+    while (index < paths.size) {
+        revisions.append(paths[index].revision())
+        index = index + 1
+    }
+    FileWatch(paths, revisions)
+}
+
+fun watchFile(filePath: Path): FileWatch = watchFiles([filePath])
+
+fun fileWatchUnit(): void {}
+
+fun FileWatch.changed(): bool {
+    var changed = this.paths.size != this.revisions.size
+    var index = 0
+    while (index < this.paths.size && !changed) {
+        if (this.paths[index].revision() != this.revisions[index]) {
+            changed = true
+        }
+        index = index + 1
+    }
+    changed
+}
+
+fun FileWatch.refresh(): void {
+    val revisions: array<int> = []
+    var index = 0
+    while (index < this.paths.size) {
+        revisions.append(this.paths[index].revision())
+        index = index + 1
+    }
+    this.revisions = revisions
+    fileWatchUnit()
+}

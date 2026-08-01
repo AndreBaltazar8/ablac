@@ -1,0 +1,3919 @@
+#import("sema.ab")
+#import("abla/sys/linux/fs")
+#import("abla/sys/linux/process")
+#import("abla/sys/linux/net")
+
+// Parser handlers, finalizers, and ordinary staged expressions use separate
+// evaluator objects. Keep their transaction in a private per-process staging
+// directory; only scalar counters are global, so scoped-region safety remains
+// independent from compile-driver bookkeeping.
+var bootstrapCompileOutputCount: int = 0
+var bootstrapCompileOutputBytes: int = 0
+
+fun bootstrapCompileOutputRoot(): string =
+    "build/.abla-compile-outputs-${linuxProcessId()}"
+
+fun bootstrapBeginCompileOutputs(): void {
+    val root = bootstrapCompileOutputRoot()
+    var index = 0
+    while (index < 64) {
+        Path("$root/$index.path").remove()
+        Path("$root/$index.data").remove()
+        index = index + 1
+    }
+    Path(root).remove()
+    bootstrapCompileOutputCount = 0
+    bootstrapCompileOutputBytes = 0
+    return
+}
+
+fun bootstrapDiscardCompileOutputs(): void {
+    bootstrapBeginCompileOutputs()
+    return
+}
+
+fun bootstrapCompileOutputPathValid(path: string): bool {
+    var valid = path.size > 0 && path.size <= 4096 && path[0] != 47
+    var begin = 0
+    var index = 0
+    while (valid && index <= path.size) {
+        val boundary = index == path.size || path[index] == 47
+        if (boundary) {
+            val length = index - begin
+            if (length == 0 ||
+                (length == 1 && path[begin] == 46) ||
+                (length == 2 && path[begin] == 46 &&
+                 path[begin + 1] == 46)) valid = false
+            begin = index + 1
+        } else if (path[index] == 0) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun bootstrapStageCompileOutput(path: string, contents: string): bool {
+    var valid = bootstrapCompileOutputPathValid(path) &&
+        contents.size <= 16777216
+    val nextBytes = bootstrapCompileOutputBytes + contents.size
+    if (nextBytes > 67108864) valid = false
+    if (bootstrapCompileOutputCount >= 64) valid = false
+    if (valid) {
+        val root = bootstrapCompileOutputRoot()
+        val pathFile = Path("$root/$bootstrapCompileOutputCount.path")
+        val dataFile = Path("$root/$bootstrapCompileOutputCount.data")
+        valid = pathFile.writeTextAtomic(path)
+        if (valid) valid = dataFile.writeTextAtomic(contents)
+        if (!valid) {
+            pathFile.remove()
+            dataFile.remove()
+        }
+    }
+    if (valid) {
+        bootstrapCompileOutputCount = bootstrapCompileOutputCount + 1
+        bootstrapCompileOutputBytes = nextBytes
+    }
+    valid
+}
+
+fun bootstrapCommitCompileOutputs(): bool {
+    var committed = true
+    var index = 0
+    val root = bootstrapCompileOutputRoot()
+    while (committed && index < bootstrapCompileOutputCount) {
+        val pathFile = Path("$root/$index.path")
+        val dataFile = Path("$root/$index.data")
+        committed = pathFile.exists() && dataFile.exists()
+        if (committed) committed = Path(pathFile.readText()).writeTextAtomic(
+            dataFile.readText()
+        )
+        index = index + 1
+    }
+    bootstrapDiscardCompileOutputs()
+    committed
+}
+
+class BootstrapEvalValue(
+    val kind: string,
+    val integer: int,
+    val boolean: bool,
+    val text: string,
+    val elements: array<BootstrapEvalValue>,
+    val owner: string,
+    val fieldNames: array<string>
+)
+
+class BootstrapEvalResult(
+    val value: BootstrapEvalValue,
+    val errors: int,
+    val compileInputPaths: array<string>,
+    val compileInputContents: array<string>,
+    val generatedDeclarations: array<BootstrapDeclaration>
+)
+
+fun bootstrapEvalInvalid(): BootstrapEvalValue =
+    BootstrapEvalValue("invalid", 0, false, "", [], "", [])
+
+fun bootstrapEvalInteger(value: int): BootstrapEvalValue =
+    BootstrapEvalValue("integer", value, false, "", [], "", [])
+
+fun bootstrapEvalBoolean(value: bool): BootstrapEvalValue =
+    BootstrapEvalValue("boolean", 0, value, "", [], "", [])
+
+fun bootstrapEvalString(value: string): BootstrapEvalValue =
+    BootstrapEvalValue("string", 0, false, value, [], "", [])
+
+fun bootstrapEvalNull(): BootstrapEvalValue =
+    BootstrapEvalValue("null", 0, false, "", [], "", [])
+
+fun bootstrapEvalVoid(): BootstrapEvalValue =
+    BootstrapEvalValue("void", 0, false, "", [], "", [])
+
+fun bootstrapEvalEqual(
+    left: BootstrapEvalValue,
+    right: BootstrapEvalValue
+): bool {
+    var equal = left.kind == right.kind
+    if (left.kind == "integer") {
+        equal = equal && left.integer == right.integer
+    }
+    if (left.kind == "boolean") {
+        equal = equal && left.boolean == right.boolean
+    }
+    if (left.kind == "string") equal = equal && left.text == right.text
+    if (left.kind == "shared" || left.kind == "weak") {
+        equal = equal && left.elements[0] == right.elements[0]
+    }
+    equal
+}
+
+fun bootstrapEvalReturn(value: BootstrapEvalValue): BootstrapEvalValue =
+    BootstrapEvalValue("return", 0, false, "", [value], "", [])
+
+fun bootstrapEvalLoopControl(kind: string): BootstrapEvalValue =
+    BootstrapEvalValue(kind, 0, false, "", [], "", [])
+
+fun bootstrapEvalFunction(name: string): BootstrapEvalValue =
+    BootstrapEvalValue("function", 0, false, name, [], "", [])
+
+fun bootstrapEvalClosure(
+    expression: int,
+    family: string,
+    captures: array<BootstrapEvalValue>,
+    names: array<string>
+): BootstrapEvalValue = BootstrapEvalValue(
+    "closure",
+    expression,
+    family == "once",
+    "",
+    captures,
+    family,
+    names
+)
+
+fun bootstrapEvalArray(
+    elements: array<BootstrapEvalValue>
+): BootstrapEvalValue = BootstrapEvalValue(
+    "array",
+    0,
+    false,
+    "",
+    elements,
+    "",
+    []
+)
+
+fun bootstrapEvalObject(
+    owner: string,
+    fieldNames: array<string>,
+    fields: array<BootstrapEvalValue>
+): BootstrapEvalValue = BootstrapEvalValue(
+    "object",
+    0,
+    false,
+    "",
+    fields,
+    owner,
+    fieldNames
+)
+
+fun bootstrapEvalShared(value: BootstrapEvalValue): BootstrapEvalValue {
+    val control = BootstrapEvalValue(
+        "shared.control",
+        0,
+        false,
+        "",
+        [value, bootstrapEvalInteger(1), bootstrapEvalInteger(1)],
+        "",
+        []
+    )
+    BootstrapEvalValue("shared", 0, false, "", [control], "", [])
+}
+
+fun bootstrapEvalSharedClone(
+    value: BootstrapEvalValue
+): BootstrapEvalValue {
+    val control = value.elements[0]
+    control.elements[1] = bootstrapEvalInteger(
+        control.elements[1].integer + 1
+    )
+    BootstrapEvalValue("shared", 0, false, "", [control], "", [])
+}
+
+fun bootstrapEvalBorrow(value: BootstrapEvalValue): BootstrapEvalValue =
+    BootstrapEvalValue("borrow", 0, false, "", [value], "", [])
+
+fun bootstrapEvalCell(value: BootstrapEvalValue): BootstrapEvalValue =
+    BootstrapEvalValue("cell", 0, false, "", [value], "", [])
+
+fun bootstrapEvalUnwrapBorrow(value: BootstrapEvalValue): BootstrapEvalValue =
+    if (value.kind == "borrow" && value.elements.size == 1) value.elements[0]
+    else value
+
+fun bootstrapEvalValueNeedsBorrow(value: BootstrapEvalValue): bool =
+    value.kind == "object" || value.kind == "array" ||
+    value.kind == "string" || value.kind == "shared" ||
+    value.kind == "weak" || value.kind == "closure" || value.kind == "cell"
+
+fun bootstrapEvalSharedGet(value: BootstrapEvalValue): BootstrapEvalValue =
+    bootstrapEvalBorrow(value.elements[0].elements[0])
+
+fun bootstrapEvalWeak(value: BootstrapEvalValue): BootstrapEvalValue {
+    val control = value.elements[0]
+    control.elements[2] = bootstrapEvalInteger(
+        control.elements[2].integer + 1
+    )
+    BootstrapEvalValue("weak", 0, false, "", [control], "", [])
+}
+
+fun bootstrapEvalWeakClone(value: BootstrapEvalValue): BootstrapEvalValue =
+    bootstrapEvalWeak(value)
+
+fun bootstrapEvalWeakUpgrade(value: BootstrapEvalValue): BootstrapEvalValue {
+    val control = value.elements[0]
+    var result = bootstrapEvalNull()
+    if (control.elements[1].integer > 0) {
+        control.elements[1] = bootstrapEvalInteger(
+            control.elements[1].integer + 1
+        )
+        result = BootstrapEvalValue(
+            "shared", 0, false, "", [control], "", []
+        )
+    }
+    result
+}
+
+class BootstrapEvaluator(
+    val declarations: array<BootstrapDeclaration>,
+    val affineTypes: array<string>,
+    val names: array<string>,
+    val values: array<BootstrapEvalValue>,
+    val mutable: array<bool>,
+    val cursors: array<BootstrapSubparserCursor>,
+    val syntax: array<BootstrapExpression>,
+    val typedCalls: array<BootstrapTypedCall>,
+    val reflectedTypes: array<string>,
+    val generatedDeclarations: array<BootstrapDeclaration>,
+    val extensionRequests: array<BootstrapExtensionRequest>,
+    val compileInputPaths: array<string>,
+    val compileInputContents: array<string>,
+    val allowedCompileEffects: int,
+    var errors: int,
+    var steps: int
+) {
+    fun recordCompileInput(path: string, contents: string): void {
+        var found = -1
+        var index = 0
+        while (index < this.compileInputPaths.size) {
+            if (this.compileInputPaths[index] == path) found = index
+            index = index + 1
+        }
+        if (found >= 0) {
+            this.compileInputContents[found] = contents
+        } else {
+            this.compileInputPaths.append(path)
+            this.compileInputContents.append(contents)
+        }
+    }
+
+    fun uninitializedValue(): BootstrapEvalValue = BootstrapEvalValue(
+        "uninitialized",
+        0,
+        false,
+        "",
+        [],
+        "",
+        []
+    )
+
+    fun directResourceHasDrop(value: BootstrapEvalValue): bool {
+        var found = false
+        if (value.kind == "object") {
+            var declarationIndex = 0
+            while (declarationIndex < this.declarations.size) {
+                val declaration = this.declarations[declarationIndex]
+                if (declaration.kind == "class" && declaration.isResource &&
+                    declaration.name == value.owner) {
+                    var methodIndex = 0
+                    while (methodIndex < declaration.methods.size) {
+                        if (declaration.methods[methodIndex].name == "drop") {
+                            found = true
+                        }
+                        methodIndex = methodIndex + 1
+                    }
+                }
+                declarationIndex = declarationIndex + 1
+            }
+        }
+        found
+    }
+
+    fun valueIsAffine(value: BootstrapEvalValue): bool {
+        var affine = value.kind == "object" &&
+            bootstrapAffineNamesContain(this.affineTypes, value.owner)
+        if (value.kind == "shared") affine = true
+        if (value.kind == "weak") affine = true
+        if (value.kind == "closure" &&
+            (value.owner == "mut" || value.owner == "once")) affine = true
+        if (value.kind == "array") {
+            var element = 0
+            while (element < value.elements.size && !affine) {
+                affine = this.valueIsAffine(value.elements[element])
+                element = element + 1
+            }
+        }
+        affine
+    }
+
+    fun dropValue(var value: BootstrapEvalValue): void {
+        if (value.kind == "shared" && value.elements.size == 1) {
+            val control = value.elements[0]
+            val next = control.elements[1].integer - 1
+            control.elements[1] = bootstrapEvalInteger(next)
+            if (next == 0 &&
+                control.elements[0].kind != "uninitialized") {
+                this.dropValue(control.elements[0])
+                control.elements[0] = this.uninitializedValue()
+                control.elements[2] = bootstrapEvalInteger(
+                    control.elements[2].integer - 1
+                )
+            }
+        }
+        if (value.kind == "weak" && value.elements.size == 1) {
+            val control = value.elements[0]
+            control.elements[2] = bootstrapEvalInteger(
+                control.elements[2].integer - 1
+            )
+        }
+        if (value.kind == "closure" &&
+            (value.owner == "mut" || value.owner == "once")) {
+            var capture = value.elements.size
+            while (capture > 0) {
+                capture = capture - 1
+                if (value.elements[capture].kind != "uninitialized") {
+                    this.dropValue(value.elements[capture])
+                    value.elements[capture] = this.uninitializedValue()
+                }
+            }
+        }
+        if (value.kind == "array" && this.valueIsAffine(value)) {
+            var element = value.elements.size
+            while (element > 0) {
+                element = element - 1
+                if (value.elements[element].kind != "uninitialized") {
+                    this.dropValue(value.elements[element])
+                    value.elements[element] = this.uninitializedValue()
+                }
+            }
+        }
+        if (value.kind == "object" &&
+            bootstrapAffineNamesContain(this.affineTypes, value.owner)) {
+            if (this.directResourceHasDrop(value)) {
+                this.evaluateMethod(value, BootstrapExpression(
+                    "member.call",
+                    "drop",
+                    0,
+                    0,
+                    []
+                ))
+            }
+            var field = value.elements.size
+            while (field > 0) {
+                field = field - 1
+                if (value.elements[field].kind != "uninitialized") {
+                    this.dropValue(value.elements[field])
+                    value.elements[field] = this.uninitializedValue()
+                }
+            }
+        }
+    }
+
+    fun dropOwnedParameters(
+        parameterKinds: array<string>,
+        returned: BootstrapEvalValue,
+        offset: int
+    ): void {
+        var parameter = parameterKinds.size
+        while (parameter > 0) {
+            parameter = parameter - 1
+            val valueIndex = parameter + offset
+            if (parameterKinds[parameter] == "own" &&
+                valueIndex < this.values.size &&
+                this.values[valueIndex].kind != "uninitialized" &&
+                this.values[valueIndex] != returned) {
+                val owned = this.values[valueIndex]
+                this.dropValue(owned)
+                this.values[valueIndex] = this.uninitializedValue()
+            }
+        }
+    }
+
+    fun find(name: string): int {
+        var result = -1
+        var index = 0
+        while (index < this.names.size) {
+            if (this.names[index] == name) result = index
+            index = index + 1
+        }
+        result
+    }
+
+    fun printable(value: BootstrapEvalValue): string {
+        var result = value.text
+        if (value.kind == "integer") result = "${value.integer}"
+        if (value.kind == "boolean") {
+            result = if (value.boolean) "true" else "false"
+        }
+        if (value.kind == "null") result = "null"
+        result
+    }
+
+    fun syntaxValue(expression: BootstrapExpression): BootstrapEvalValue {
+        val handle = this.syntax.size
+        this.syntax.append(expression)
+        BootstrapEvalValue("syntax", handle, false, "", [], "", [])
+    }
+
+    fun reflectedTypeHandle(type: string): int {
+        val normalized = bootstrapNormalizeType(type)
+        var found = -1
+        var index = 0
+        while (index < this.reflectedTypes.size) {
+            if (this.reflectedTypes[index] == normalized) found = index
+            index = index + 1
+        }
+        if (found < 0 && normalized != "" && normalized != "unknown" &&
+            this.reflectedTypes.size < 4096) {
+            this.reflectedTypes.append(normalized)
+            found = this.reflectedTypes.size - 1
+        }
+        found
+    }
+
+    fun reflectedTypeValid(handle: int): bool =
+        handle >= 0 && handle < this.reflectedTypes.size
+
+    fun reflectedTypeKind(type: string): string {
+        var kind = "nominal"
+        if (type == "void" || type == "never" || type == "null" ||
+            type == "bool" || type == "char" || type == "string" ||
+            type == "i8" || type == "i16" || type == "i32" ||
+            type == "i64" || type == "u8" || type == "u16" ||
+            type == "u32" || type == "u64" || type == "f32" ||
+            type == "f64") kind = "primitive"
+        if (bootstrapIsNullableType(type)) kind = "nullable"
+        if (bootstrapIsArrayType(type)) kind = "array"
+        if (bootstrapIsSharedType(type)) kind = "shared"
+        if (bootstrapIsWeakType(type)) kind = "weak"
+        if (bootstrapIsMutexType(type)) kind = "mutex"
+        if (bootstrapIsBorrowType(type)) kind = "borrow"
+        if (bootstrapIsFunctionType(type)) kind = "function"
+        if (bootstrapIsOnceFunctionType(type)) kind = "function.once"
+        if (bootstrapIsMutableFunctionType(type)) kind = "function.mutable"
+        if (type.size > 0 && type[type.size - 1] == 42) kind = "pointer"
+        kind
+    }
+
+    fun reflectedTypeElement(type: string): string {
+        var element = "unknown"
+        if (bootstrapIsNullableType(type)) {
+            element = bootstrapNullableElementType(type)
+        }
+        if (bootstrapIsArrayType(type)) element = bootstrapArrayElementType(type)
+        if (bootstrapIsSharedType(type)) element = bootstrapSharedElementType(type)
+        if (bootstrapIsWeakType(type)) element = bootstrapWeakElementType(type)
+        if (bootstrapIsMutexType(type)) element = bootstrapMutexElementType(type)
+        if (bootstrapIsBorrowType(type)) element = bootstrapBorrowElementType(type)
+        if (type.size > 0 && type[type.size - 1] == 42) {
+            element = type.slice(0, type.size - 1)
+        }
+        element
+    }
+
+    fun generatedIdentifierPart(text: string): string {
+        var result = ""
+        var index = 0
+        while (index < text.size) {
+            val byte = text[index]
+            if ((byte >= 65 && byte <= 90) ||
+                (byte >= 97 && byte <= 122) ||
+                (byte >= 48 && byte <= 57) || byte == 95) {
+                result = "$result${text.slice(index, index + 1)}"
+            } else result = "${result}_"
+            index = index + 1
+        }
+        if (result == "") result = "generated"
+        result
+    }
+
+    fun generatedStringLiteral(text: string): string {
+        var result = "\""
+        var index = 0
+        while (index < text.size) {
+            val byte = text[index]
+            if (byte == 34) result = "${result}\\\""
+            else if (byte == 92) result = "${result}\\\\"
+            else if (byte == 10) result = "${result}\\n"
+            else if (byte == 13) result = "${result}\\r"
+            else if (byte == 9) result = "${result}\\t"
+            else result = "$result${text.slice(index, index + 1)}"
+            index = index + 1
+        }
+        "$result\""
+    }
+
+    fun generatedSyntaxSource(
+        expression: BootstrapExpression,
+        depth: int
+    ): string {
+        if (depth > 128) return ""
+        var result = ""
+        if (expression.kind == "integer") result = expression.text
+        if (expression.kind == "string") {
+            result = this.generatedStringLiteral(expression.text)
+        }
+        if (expression.kind == "identifier") result = expression.text
+        if (expression.kind == "true" || expression.kind == "false" ||
+            expression.kind == "null") result = expression.kind
+        if (expression.kind == "if" && expression.children.size == 3) {
+            result = "if (${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}) ${this.generatedSyntaxSource(
+                expression.children[1], depth + 1
+            )} else ${this.generatedSyntaxSource(
+                expression.children[2], depth + 1
+            )}"
+        }
+        if (expression.kind == "array") {
+            result = "["
+            var element = 0
+            while (element < expression.children.size) {
+                if (element > 0) result = "$result, "
+                result = "$result${this.generatedSyntaxSource(
+                    expression.children[element], depth + 1
+                )}"
+                element = element + 1
+            }
+            result = "$result]"
+        }
+        if (expression.kind == "call") {
+            var name = expression.text
+            if (expression.begin < 0) {
+                val handle = 0 - expression.begin - 1
+                if (this.functionHandleValid(handle)) {
+                    val owner = this.functionHandleOwner(handle)
+                    if (owner < 0) name = this.declarations[handle].name
+                }
+            }
+            result = "$name("
+            var argument = 0
+            while (argument < expression.children.size) {
+                if (argument > 0) result = "$result, "
+                result = "$result${this.generatedSyntaxSource(
+                    expression.children[argument], depth + 1
+                )}"
+                argument = argument + 1
+            }
+            result = "$result)"
+        }
+        if (expression.kind == "member.call" &&
+            expression.children.size > 0) {
+            result = "${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}.${expression.text}("
+            var argument = 1
+            while (argument < expression.children.size) {
+                if (argument > 1) result = "$result, "
+                result = "$result${this.generatedSyntaxSource(
+                    expression.children[argument], depth + 1
+                )}"
+                argument = argument + 1
+            }
+            result = "$result)"
+        }
+        if (expression.kind == "member" && expression.children.size == 1) {
+            result = "${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}.${expression.text}"
+        }
+        if (expression.kind == "index" && expression.children.size == 2) {
+            result = "${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}[${this.generatedSyntaxSource(
+                expression.children[1], depth + 1
+            )}]"
+        }
+        if (expression.children.size == 2 && expression.text != "" &&
+            result == "") {
+            result = "(${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )} ${expression.text} ${this.generatedSyntaxSource(
+                expression.children[1], depth + 1
+            )})"
+        }
+        if (expression.kind == "return") {
+            result = "return"
+            if (expression.children.size > 0) {
+                result = "$result ${this.generatedSyntaxSource(
+                    expression.children[0], depth + 1
+                )}"
+            }
+        }
+        if (expression.kind == "assign" &&
+            expression.children.size == 1) {
+            result = "${expression.text} = ${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}"
+        }
+        if ((expression.kind == "local.val" ||
+             expression.kind == "local.var") &&
+            expression.children.size > 0) {
+            val keyword = if (expression.kind == "local.val") "val" else "var"
+            result = "$keyword ${expression.text}"
+            if (expression.children.size > 1 &&
+                expression.children[1].text != "inferred") {
+                result = "$result: ${expression.children[1].text}"
+            }
+            result = "$result = ${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}"
+        }
+        if (expression.kind == "block") {
+            result = "{\n"
+            var statement = 0
+            while (statement < expression.children.size) {
+                result = "$result${this.generatedSyntaxSource(
+                    expression.children[statement], depth + 1
+                )}\n"
+                statement = statement + 1
+            }
+            result = "$result}"
+        }
+        if ((expression.kind == "lambda" ||
+             expression.kind == "lambda.move") &&
+            expression.children.size > 0) {
+            result = ""
+            if (expression.kind == "lambda.move") result = "move "
+            result = "$result{"
+            var parameter = 0
+            while (parameter + 1 < expression.children.size) {
+                if (parameter > 0) result = "$result, "
+                val found = expression.children[parameter]
+                result = "$result${found.text}: ${found.children[0].text}"
+                parameter = parameter + 1
+            }
+            result = "$result -> ${this.generatedSyntaxSource(
+                expression.children[expression.children.size - 1],
+                depth + 1
+            )}}"
+        }
+        result
+    }
+
+    fun generatedDeclarationName(
+        module: BootstrapEvalValue,
+        hint: string
+    ): string {
+        val namespace = this.generatedIdentifierPart(module.text)
+        val readable = this.generatedIdentifierPart(hint)
+        val base = "__abla_generated_${namespace}_${module.integer}_${module.elements.size}_${readable}"
+        var result = base
+        var suffix = 0
+        var collision = true
+        while (collision && suffix < 1024) {
+            collision = false
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                if (this.declarations[declaration].name == result) {
+                    collision = true
+                }
+                declaration = declaration + 1
+            }
+            var generated = 0
+            while (generated < module.fieldNames.size) {
+                if (module.fieldNames[generated] == result) collision = true
+                generated = generated + 1
+            }
+            if (collision) {
+                suffix = suffix + 1
+                result = "${base}_$suffix"
+            }
+        }
+        if (collision) "" else result
+    }
+
+    fun generatedExportName(
+        module: BootstrapEvalValue,
+        name: string
+    ): string {
+        var available = name != "" &&
+            this.generatedIdentifierPart(name) == name
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            if (this.declarations[declaration].name == name) available = false
+            declaration = declaration + 1
+        }
+        var generated = 0
+        while (generated < module.fieldNames.size) {
+            if (module.fieldNames[generated] == name) available = false
+            generated = generated + 1
+        }
+        if (available) name else ""
+    }
+
+    fun methodHandle(owner: int, method: int): int {
+        var handle = this.declarations.size
+        var declaration = 0
+        while (declaration < owner) {
+            handle = handle + this.declarations[declaration].methods.size
+            declaration = declaration + 1
+        }
+        handle + method
+    }
+
+    fun functionHandleOwner(handle: int): int {
+        var owner = -1
+        if (handle >= this.declarations.size) {
+            var cursor = this.declarations.size
+            var declaration = 0
+            while (owner < 0 && declaration < this.declarations.size) {
+                val next = cursor +
+                    this.declarations[declaration].methods.size
+                if (handle >= cursor && handle < next) owner = declaration
+                cursor = next
+                declaration = declaration + 1
+            }
+        }
+        owner
+    }
+
+    fun functionHandleMethod(handle: int): int {
+        val owner = this.functionHandleOwner(handle)
+        var method = -1
+        if (owner >= 0) method = handle - this.methodHandle(owner, 0)
+        method
+    }
+
+    fun functionHandleValid(handle: int): bool {
+        var valid = handle >= 0 && handle < this.declarations.size &&
+            (this.declarations[handle].kind == "fun" ||
+             this.declarations[handle].kind == "compile.fun" ||
+             this.declarations[handle].kind == "extern")
+        val owner = this.functionHandleOwner(handle)
+        val method = this.functionHandleMethod(handle)
+        if (owner >= 0 && method >= 0 &&
+            method < this.declarations[owner].methods.size) valid = true
+        valid
+    }
+
+    fun functionHandleResultType(handle: int): string {
+        var result = "unknown"
+        if (handle >= 0 && handle < this.declarations.size) {
+            result = bootstrapNormalizeType(
+                this.declarations[handle].resultType
+            )
+        }
+        val owner = this.functionHandleOwner(handle)
+        val method = this.functionHandleMethod(handle)
+        if (owner >= 0 && method >= 0 &&
+            method < this.declarations[owner].methods.size) {
+            result = bootstrapNormalizeType(
+                this.declarations[owner].methods[method].resultType
+            )
+        }
+        result
+    }
+
+    fun generatedDeclarationCount(module: BootstrapEvalValue): int {
+        var count = 0
+        var element = 0
+        if (module.kind == "generated.module") {
+            while (element < module.elements.size) {
+                if (module.elements[element].kind ==
+                    "generated.declaration") count = count + 1
+                element = element + 1
+            }
+        }
+        count
+    }
+
+    fun generatedDeclarationAt(
+        module: BootstrapEvalValue,
+        ordinal: int
+    ): int {
+        var result = -1
+        var current = 0
+        var element = 0
+        if (module.kind == "generated.module" && ordinal >= 0) {
+            while (element < module.elements.size) {
+                val candidate = module.elements[element]
+                if (candidate.kind == "generated.declaration") {
+                    if (current == ordinal) result = candidate.integer
+                    current = current + 1
+                }
+                element = element + 1
+            }
+        }
+        if (result < 0 || result >= this.generatedDeclarations.size) {
+            result = -1
+        }
+        result
+    }
+
+    fun functionHandleParameterType(handle: int, parameter: int): string {
+        var result = "unknown"
+        if (handle >= 0 && handle < this.declarations.size && parameter >= 0 &&
+            parameter < this.declarations[handle].parameterTypes.size) {
+            result = bootstrapNormalizeType(
+                this.declarations[handle].parameterTypes[parameter]
+            )
+        }
+        val owner = this.functionHandleOwner(handle)
+        val method = this.functionHandleMethod(handle)
+        if (owner >= 0 && method >= 0 &&
+            method < this.declarations[owner].methods.size && parameter >= 0 &&
+            parameter <
+                this.declarations[owner].methods[method].parameterTypes.size) {
+            result = bootstrapNormalizeType(
+                this.declarations[owner].methods[method].parameterTypes[parameter]
+            )
+        }
+        result
+    }
+
+    fun functionHandleParameterKind(handle: int, parameter: int): string {
+        var result = "parameter"
+        if (handle >= 0 && handle < this.declarations.size && parameter >= 0 &&
+            parameter < this.declarations[handle].parameterKinds.size) {
+            result = this.declarations[handle].parameterKinds[parameter]
+        }
+        val owner = this.functionHandleOwner(handle)
+        val method = this.functionHandleMethod(handle)
+        if (owner >= 0 && method >= 0 &&
+            method < this.declarations[owner].methods.size && parameter >= 0 &&
+            parameter <
+                this.declarations[owner].methods[method].parameterKinds.size) {
+            val declaration = this.declarations[owner].methods[method]
+            result = declaration.parameterKinds[parameter]
+        }
+        result
+    }
+
+    fun functionHandleDeclaration(handle: int): BootstrapDeclaration {
+        val owner = this.functionHandleOwner(handle)
+        val method = this.functionHandleMethod(handle)
+        if (owner >= 0 && method >= 0) {
+            this.declarations[owner].methods[method]
+        } else this.declarations[handle]
+    }
+
+    fun classFieldType(handle: int, wanted: int): string {
+        var result = "unknown"
+        if (handle >= 0 && handle < this.declarations.size &&
+            this.declarations[handle].kind == "class" && wanted >= 0) {
+            val declaration = this.declarations[handle]
+            var field = 0
+            var parameter = 0
+            while (parameter < declaration.parameterKinds.size) {
+                if (declaration.parameterKinds[parameter] == "val" ||
+                    declaration.parameterKinds[parameter] == "var") {
+                    if (field == wanted &&
+                        parameter < declaration.parameterTypes.size) {
+                        result = bootstrapNormalizeType(
+                            declaration.parameterTypes[parameter]
+                        )
+                    }
+                    field = field + 1
+                }
+                parameter = parameter + 1
+            }
+        }
+        result
+    }
+
+    fun lexicalTypeInExpression(
+        container: BootstrapExpression,
+        name: string,
+        position: int,
+        depth: int
+    ): string {
+        var result = "unknown"
+        if (depth < 32 && container.kind == "block") {
+            var child = 0
+            while (child < container.children.size) {
+                val statement = container.children[child]
+                if ((statement.kind == "local.val" ||
+                     statement.kind == "local.var") &&
+                    statement.text == name && statement.begin < position) {
+                    if (statement.children.size > 1 &&
+                        statement.children[1].text != "inferred") {
+                        result = bootstrapNormalizeType(
+                            statement.children[1].text
+                        )
+                    } else if (statement.children.size > 0) {
+                        result = this.staticSyntaxTypeAt(
+                            statement.children[0], depth + 1
+                        )
+                    }
+                }
+                if (statement.begin <= position &&
+                    statement.end >= position) {
+                    val nested = this.lexicalTypeInExpression(
+                        statement, name, position, depth + 1
+                    )
+                    if (nested != "unknown") result = nested
+                }
+                child = child + 1
+            }
+        } else if (depth < 32 &&
+            container.begin <= position && container.end >= position) {
+            if (container.kind == "lambda" ||
+                container.kind == "lambda.move") {
+                var parameter = 0
+                while (parameter + 1 < container.children.size) {
+                    val found = container.children[parameter]
+                    if (found.kind == "lambda.parameter" &&
+                        found.text == name && found.children.size > 0) {
+                        result = bootstrapNormalizeType(
+                            found.children[0].text
+                        )
+                    }
+                    parameter = parameter + 1
+                }
+            }
+            var child = 0
+            while (child < container.children.size) {
+                val nested = this.lexicalTypeInExpression(
+                    container.children[child],
+                    name,
+                    position,
+                    depth + 1
+                )
+                if (nested != "unknown") result = nested
+                child = child + 1
+            }
+        }
+        result
+    }
+
+    fun lexicalSyntaxType(name: string, position: int): string {
+        var result = "unknown"
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            val candidate = this.declarations[declaration]
+            if (candidate.expression.begin <= position &&
+                candidate.expression.end >= position) {
+                var parameter = 0
+                while (parameter < candidate.parameters.size &&
+                    parameter < candidate.parameterTypes.size) {
+                    if (candidate.parameters[parameter] == name) {
+                        result = bootstrapNormalizeType(
+                            candidate.parameterTypes[parameter]
+                        )
+                    }
+                    parameter = parameter + 1
+                }
+                if (candidate.extensionOwner != "" && name == "this") {
+                    result = bootstrapNormalizeType(candidate.extensionOwner)
+                }
+                val local = this.lexicalTypeInExpression(
+                    candidate.expression,
+                    name,
+                    position,
+                    0
+                )
+                if (local != "unknown") result = local
+            }
+            var method = 0
+            while (method < candidate.methods.size) {
+                val member = candidate.methods[method]
+                if (member.expression.begin <= position &&
+                    member.expression.end >= position) {
+                    if (name == "this") result = candidate.name
+                    var parameter = 0
+                    while (parameter < member.parameters.size &&
+                        parameter < member.parameterTypes.size) {
+                        if (member.parameters[parameter] == name) {
+                            result = bootstrapNormalizeType(
+                                member.parameterTypes[parameter]
+                            )
+                        }
+                        parameter = parameter + 1
+                    }
+                    val local = this.lexicalTypeInExpression(
+                        member.expression,
+                        name,
+                        position,
+                        0
+                    )
+                    if (local != "unknown") result = local
+                }
+                method = method + 1
+            }
+            declaration = declaration + 1
+        }
+        result
+    }
+
+    fun directCallTarget(expression: BootstrapExpression): int {
+        var handle = -1
+        if ((expression.kind == "call" ||
+             expression.kind == "member.call") && expression.begin < 0) {
+            val marked = 0 - expression.begin - 1
+            if (this.functionHandleValid(marked)) handle = marked
+        }
+        if (handle < 0 && expression.kind == "call") {
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                val candidate = this.declarations[declaration]
+                if ((candidate.kind == "fun" ||
+                     candidate.kind == "compile.fun" ||
+                     candidate.kind == "extern") &&
+                    candidate.name == expression.text) {
+                    if (handle >= 0) handle = -2
+                    if (handle == -1) handle = declaration
+                }
+                declaration = declaration + 1
+            }
+        }
+        if (handle < 0 && expression.kind == "member.call" &&
+            expression.children.size > 0) {
+            val receiver = bootstrapBorrowElementType(
+                this.staticSyntaxTypeAt(expression.children[0], 1)
+            )
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                val candidate = this.declarations[declaration]
+                if (bootstrapNormalizeType(candidate.extensionOwner) ==
+                    receiver && candidate.name == expression.text) {
+                    if (handle >= 0) handle = -2
+                    if (handle == -1) handle = declaration
+                }
+                if (candidate.kind == "class" &&
+                    candidate.name == receiver) {
+                    var method = 0
+                    while (method < candidate.methods.size) {
+                        if (candidate.methods[method].name == expression.text) {
+                            if (handle >= 0) handle = -2
+                            if (handle == -1) {
+                                handle = this.methodHandle(declaration, method)
+                            }
+                        }
+                        method = method + 1
+                    }
+                }
+                declaration = declaration + 1
+            }
+        }
+        handle
+    }
+
+    fun staticSyntaxTypeAt(
+        expression: BootstrapExpression,
+        depth: int
+    ): string {
+        var result = "unknown"
+        if (depth >= 32) result = "unknown"
+        if (expression.kind == "integer") result = "i64"
+        if (expression.kind == "true" || expression.kind == "false") {
+            result = "bool"
+        }
+        if (expression.kind == "string") result = "string"
+        if (expression.kind == "null") result = "null"
+        if (expression.kind == "+" || expression.kind == "-" ||
+            expression.kind == "*" || expression.kind == "/") {
+            result = "i64"
+        }
+        if (expression.kind == "==" || expression.kind == "!=" ||
+            expression.kind == "<" || expression.kind == "<=" ||
+            expression.kind == ">" || expression.kind == ">=") {
+            result = "bool"
+        }
+        if (depth < 32 && expression.kind == "identifier") {
+            result = this.lexicalSyntaxType(
+                expression.text,
+                expression.begin
+            )
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                val candidate = this.declarations[declaration]
+                if ((candidate.kind == "val" || candidate.kind == "var") &&
+                    candidate.name == expression.text && result == "unknown") {
+                    if (candidate.resultType == "inferred") {
+                        result = this.staticSyntaxTypeAt(
+                            candidate.expression,
+                            depth + 1
+                        )
+                    } else result = bootstrapNormalizeType(
+                        candidate.resultType
+                    )
+                }
+                if ((candidate.kind == "fun" ||
+                     candidate.kind == "compile.fun" ||
+                    candidate.kind == "extern") &&
+                    candidate.name == expression.text && result == "unknown") {
+                    result = bootstrapDeclarationFunctionType(candidate)
+                }
+                declaration = declaration + 1
+            }
+        }
+        if (depth < 32 && expression.kind == "array") {
+            var elementType = "unknown"
+            var element = 0
+            while (element < expression.children.size) {
+                val found = this.staticSyntaxTypeAt(
+                    expression.children[element], depth + 1
+                )
+                if (elementType == "unknown") elementType = found
+                if (elementType != found) elementType = "unknown"
+                element = element + 1
+            }
+            result = "array:$elementType"
+        }
+        if (depth < 32 && expression.kind == "member" &&
+            expression.children.size > 0) {
+            val receiver = bootstrapBorrowElementType(
+                this.staticSyntaxTypeAt(expression.children[0], depth + 1)
+            )
+            if (expression.text == "size" &&
+                (receiver == "string" || bootstrapIsArrayType(receiver))) {
+                result = "i64"
+            }
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                val candidate = this.declarations[declaration]
+                if (candidate.kind == "class" &&
+                    candidate.name == receiver) {
+                    var field = 0
+                    while (field < candidate.parameters.size) {
+                        if (candidate.parameters[field] == expression.text &&
+                            field < candidate.parameterKinds.size &&
+                            (candidate.parameterKinds[field] == "val" ||
+                             candidate.parameterKinds[field] == "var") &&
+                            field < candidate.parameterTypes.size) {
+                            result = bootstrapNormalizeType(
+                                candidate.parameterTypes[field]
+                            )
+                        }
+                        field = field + 1
+                    }
+                }
+                declaration = declaration + 1
+            }
+        }
+        if (depth < 32) {
+            val target = this.directCallTarget(expression)
+            if (target >= 0) result = this.functionHandleResultType(target)
+            if (expression.kind == "call" && target < 0) {
+                var declaration = 0
+                while (declaration < this.declarations.size) {
+                    if (this.declarations[declaration].kind == "class" &&
+                        this.declarations[declaration].name == expression.text) {
+                        result = this.declarations[declaration].name
+                    }
+                    declaration = declaration + 1
+                }
+            }
+        }
+        result
+    }
+
+    fun staticSyntaxType(expression: BootstrapExpression): string =
+        this.staticSyntaxTypeAt(expression, 0)
+
+    fun typedCallIndex(expression: BootstrapExpression): int {
+        var result = -1
+        var index = 0
+        while (result < 0 && index < this.typedCalls.size) {
+            val candidate = this.typedCalls[index]
+            if (candidate.begin == expression.begin &&
+                candidate.end == expression.end &&
+                candidate.kind == expression.kind &&
+                candidate.name == expression.text) result = index
+            index = index + 1
+        }
+        result
+    }
+
+    fun appendUniqueName(var names: array<string>, name: string): void {
+        var found = false
+        var index = 0
+        while (index < names.size) {
+            if (names[index] == name) found = true
+            index = index + 1
+        }
+        if (!found) names.append(name)
+    }
+
+    fun collectLambdaLocals(
+        expression: BootstrapExpression,
+        var names: array<string>
+    ): void {
+        if (expression.kind == "local.val" ||
+            expression.kind == "local.var") {
+            this.appendUniqueName(names, expression.text)
+        }
+        if (expression.kind != "lambda" &&
+            expression.kind != "lambda.move") {
+            var child = 0
+            while (child < expression.children.size) {
+                this.collectLambdaLocals(expression.children[child], names)
+                child = child + 1
+            }
+        }
+    }
+
+    fun nameIsBound(names: array<string>, name: string): bool {
+        var found = false
+        var index = 0
+        while (index < names.size) {
+            if (names[index] == name) found = true
+            index = index + 1
+        }
+        found
+    }
+
+    fun collectLambdaFreeNames(
+        expression: BootstrapExpression,
+        bound: array<string>,
+        var free: array<string>
+    ): void {
+        var nested = false
+        if (expression.kind == "lambda" ||
+            expression.kind == "lambda.move") {
+            nested = true
+            val nestedBound: array<string> = []
+            var inherited = 0
+            while (inherited < bound.size) {
+                nestedBound.append(bound[inherited])
+                inherited = inherited + 1
+            }
+            var parameter = 0
+            while (parameter + 1 < expression.children.size) {
+                this.appendUniqueName(
+                    nestedBound,
+                    expression.children[parameter].text
+                )
+                parameter = parameter + 1
+            }
+            val body = expression.children[expression.children.size - 1]
+            this.collectLambdaLocals(body, nestedBound)
+            this.collectLambdaFreeNames(body, nestedBound, free)
+        }
+        if (!nested) {
+            if (expression.kind == "identifier" &&
+                !this.nameIsBound(bound, expression.text)) {
+                this.appendUniqueName(free, expression.text)
+            }
+            if ((expression.kind == "call" ||
+                 expression.kind == "assign") &&
+                !this.nameIsBound(bound, expression.text)) {
+                this.appendUniqueName(free, expression.text)
+            }
+            var child = 0
+            while (child < expression.children.size) {
+                this.collectLambdaFreeNames(
+                    expression.children[child],
+                    bound,
+                    free
+                )
+                child = child + 1
+            }
+        }
+    }
+
+    fun lambdaMutatesCapturedPlace(
+        expression: BootstrapExpression,
+        bound: array<string>
+    ): bool {
+        var mutates = false
+        if (expression.kind == "assign" &&
+            !this.nameIsBound(bound, expression.text) &&
+            (this.find(expression.text) >= 0 ||
+             this.find("this") >= 0)) mutates = true
+        if ((expression.kind == "member.assign" ||
+             expression.kind == "index.assign") &&
+            expression.children.size > 0) {
+            val root = bootstrapPlaceRootName(expression.children[0])
+            if (root != "" && !this.nameIsBound(bound, root) &&
+                this.find(root) >= 0) mutates = true
+        }
+        if (expression.kind == "call" &&
+            !this.nameIsBound(bound, expression.text)) {
+            val target = this.find(expression.text)
+            if (target >= 0 && this.values[target].kind == "closure" &&
+                this.values[target].owner == "mut") mutates = true
+        }
+        if (expression.kind != "lambda" &&
+            expression.kind != "lambda.move") {
+            var child = 0
+            while (!mutates && child < expression.children.size) {
+                mutates = this.lambdaMutatesCapturedPlace(
+                    expression.children[child],
+                    bound
+                )
+                child = child + 1
+            }
+        }
+        mutates
+    }
+
+    fun lambdaRequiresMutableCall(
+        expression: BootstrapExpression
+    ): bool {
+        val bound: array<string> = []
+        var parameter = 0
+        while (parameter + 1 < expression.children.size) {
+            bound.append(expression.children[parameter].text)
+            parameter = parameter + 1
+        }
+        val body = expression.children[expression.children.size - 1]
+        this.collectLambdaLocals(body, bound)
+        this.lambdaMutatesCapturedPlace(body, bound)
+    }
+
+    fun evaluateCall(expression: BootstrapExpression): BootstrapEvalValue {
+        var result = bootstrapEvalInvalid()
+        var targetName = expression.text
+        val target = this.find(expression.text)
+        var callable = bootstrapEvalInvalid()
+        if (target >= 0) callable = this.values[target]
+        if (target < 0) {
+            var global = 0
+            while (callable.kind == "invalid" &&
+                   global < this.declarations.size) {
+                val declaration = this.declarations[global]
+                if ((declaration.kind == "val" ||
+                     declaration.kind == "var") &&
+                    declaration.name == expression.text) {
+                    callable = this.evaluate(declaration.expression)
+                }
+                global = global + 1
+            }
+        }
+        if (callable.kind == "function") targetName = callable.text
+        if (callable.kind == "closure") {
+            val closure = callable
+            val lambda = this.syntax[closure.integer]
+            val callNames: array<string> = []
+            val callValues: array<BootstrapEvalValue> = []
+            val callMutable: array<bool> = []
+            var capture = 0
+            while (capture < closure.fieldNames.size) {
+                callNames.append(closure.fieldNames[capture])
+                callValues.append(closure.elements[capture])
+                callMutable.append(closure.owner == "mut")
+                capture = capture + 1
+            }
+            var parameter = 0
+            while (parameter + 1 < lambda.children.size) {
+                callNames.append(lambda.children[parameter].text)
+                var argumentValue = bootstrapEvalInvalid()
+                if (parameter < expression.children.size) {
+                    argumentValue = this.evaluate(
+                        expression.children[parameter]
+                    )
+                    bootstrapSemanticUnit()
+                } else {
+                    this.errors = this.errors + 1
+                    bootstrapSemanticUnit()
+                }
+                callValues.append(argumentValue)
+                callMutable.append(false)
+                parameter = parameter + 1
+            }
+            val invocation = BootstrapEvaluator(
+                this.declarations,
+                this.affineTypes,
+                callNames,
+                callValues,
+                callMutable,
+                this.cursors,
+                this.syntax,
+                this.typedCalls,
+                this.reflectedTypes,
+                this.generatedDeclarations,
+                this.extensionRequests,
+                this.compileInputPaths,
+                this.compileInputContents,
+                this.allowedCompileEffects,
+                this.errors,
+                this.steps
+            )
+            result = invocation.evaluate(
+                lambda.children[lambda.children.size - 1]
+            )
+            if (result.kind == "return" && result.elements.size == 1) {
+                result = result.elements[0]
+            }
+            if (closure.boolean) {
+                capture = closure.elements.size
+                while (capture > 0) {
+                    capture = capture - 1
+                    val captured = invocation.values[capture]
+                    if (captured.kind != "uninitialized" &&
+                        captured != result) {
+                        invocation.dropValue(captured)
+                    }
+                    invocation.values[capture] =
+                        invocation.uninitializedValue()
+                    closure.elements[capture] = this.uninitializedValue()
+                }
+                if (target >= 0) {
+                    this.values[target] = this.uninitializedValue()
+                }
+            }
+            this.errors = invocation.errors
+            this.steps = invocation.steps
+        }
+        // Compiler reflection handles are declaration indexes. They are
+        // stable for one compilation and need no host state, so reflection
+        // works identically in the self-hosted compile-time evaluator.
+        if (targetName == "compilerFindType") {
+            val name = this.evaluate(expression.children[0])
+            result = bootstrapEvalInteger(this.reflectedTypeHandle(name.text))
+        }
+        if (targetName == "typedExpressionTypeHandle") {
+            val syntaxHandle = this.evaluate(expression.children[0]).integer
+            if (syntaxHandle >= 0 && syntaxHandle < this.syntax.size) {
+                val syntaxExpression = this.syntax[syntaxHandle]
+                val typed = this.typedCallIndex(syntaxExpression)
+                var type = this.staticSyntaxType(syntaxExpression)
+                if (typed >= 0) type = this.typedCalls[typed].type
+                if ((syntaxExpression.kind == "call" ||
+                     syntaxExpression.kind == "member.call") && typed < 0) {
+                    this.errors = this.errors + 1
+                } else result = bootstrapEvalInteger(
+                    this.reflectedTypeHandle(type)
+                )
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerFunctionParameterTypeHandle") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val parameter = this.evaluate(expression.children[1]).integer
+            val type = this.functionHandleParameterType(handle, parameter)
+            val typeHandle = this.reflectedTypeHandle(type)
+            if (this.functionHandleValid(handle) && typeHandle >= 0) {
+                result = bootstrapEvalInteger(typeHandle)
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerFunctionResultTypeHandle") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val typeHandle = this.reflectedTypeHandle(
+                this.functionHandleResultType(handle)
+            )
+            if (this.functionHandleValid(handle) && typeHandle >= 0) {
+                result = bootstrapEvalInteger(typeHandle)
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerClassFieldTypeHandle") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val field = this.evaluate(expression.children[1]).integer
+            val typeHandle = this.reflectedTypeHandle(
+                this.classFieldType(handle, field)
+            )
+            if (typeHandle >= 0) result = bootstrapEvalInteger(typeHandle)
+            else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerTypeName" ||
+            targetName == "compilerTypeKind" ||
+            targetName == "compilerTypeIsNullable" ||
+            targetName == "compilerTypeIsAffine" ||
+            targetName == "compilerTypeArgumentCount" ||
+            targetName == "compilerTypeElement" ||
+            targetName == "compilerTypeResult" ||
+            targetName == "compilerTypeDeclaration") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (this.reflectedTypeValid(handle)) {
+                val type = this.reflectedTypes[handle]
+                val kind = this.reflectedTypeKind(type)
+                if (targetName == "compilerTypeName") {
+                    result = bootstrapEvalString(type)
+                }
+                if (targetName == "compilerTypeKind") {
+                    result = bootstrapEvalString(kind)
+                }
+                if (targetName == "compilerTypeIsNullable") {
+                    result = bootstrapEvalBoolean(bootstrapIsNullableType(type))
+                }
+                if (targetName == "compilerTypeIsAffine") {
+                    result = bootstrapEvalBoolean(bootstrapSummaryTypeIsAffine(
+                        type,
+                        this.affineTypes
+                    ))
+                }
+                if (targetName == "compilerTypeArgumentCount") {
+                    var count = 0
+                    if (kind == "nullable" || kind == "array" ||
+                        kind == "shared" || kind == "weak" ||
+                        kind == "mutex" || kind == "borrow" ||
+                        kind == "pointer") count = 1
+                    if (bootstrapIsFunctionType(type)) {
+                        count = bootstrapFunctionParameterCount(type)
+                    }
+                    result = bootstrapEvalInteger(count)
+                }
+                if (targetName == "compilerTypeElement") {
+                    val element = this.reflectedTypeHandle(
+                        this.reflectedTypeElement(type)
+                    )
+                    if (element >= 0) result = bootstrapEvalInteger(element)
+                    else this.errors = this.errors + 1
+                }
+                if (targetName == "compilerTypeResult") {
+                    val resultType = this.reflectedTypeHandle(
+                        bootstrapFunctionResultType(type)
+                    )
+                    if (bootstrapIsFunctionType(type) && resultType >= 0) {
+                        result = bootstrapEvalInteger(resultType)
+                    } else this.errors = this.errors + 1
+                }
+                if (targetName == "compilerTypeDeclaration") {
+                    var declaration = -1
+                    var candidate = 0
+                    while (candidate < this.declarations.size) {
+                        if (this.declarations[candidate].kind == "class" &&
+                            bootstrapNormalizeType(
+                                this.declarations[candidate].name
+                            ) == type) declaration = candidate
+                        candidate = candidate + 1
+                    }
+                    result = bootstrapEvalInteger(declaration)
+                }
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerTypeArgument") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val argument = this.evaluate(expression.children[1]).integer
+            if (this.reflectedTypeValid(handle)) {
+                val type = this.reflectedTypes[handle]
+                var argumentType = "unknown"
+                val kind = this.reflectedTypeKind(type)
+                if (argument == 0 && (kind == "nullable" || kind == "array" ||
+                    kind == "shared" || kind == "weak" || kind == "mutex" ||
+                    kind == "borrow" || kind == "pointer")) {
+                    argumentType = this.reflectedTypeElement(type)
+                }
+                if (bootstrapIsFunctionType(type) && argument >= 0 &&
+                    argument < bootstrapFunctionParameterCount(type)) {
+                    argumentType = bootstrapFunctionParameterType(type, argument)
+                }
+                val argumentHandle = this.reflectedTypeHandle(argumentType)
+                if (argumentHandle >= 0) {
+                    result = bootstrapEvalInteger(argumentHandle)
+                } else this.errors = this.errors + 1
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerFunctions") {
+            val handles: array<BootstrapEvalValue> = []
+            var declarationIndex = 0
+            while (declarationIndex < this.declarations.size) {
+                val declaration = this.declarations[declarationIndex]
+                if (declaration.kind == "fun" ||
+                    declaration.kind == "compile.fun") {
+                    handles.append(bootstrapEvalInteger(declarationIndex))
+                }
+                var method = 0
+                while (method < declaration.methods.size) {
+                    handles.append(bootstrapEvalInteger(
+                        this.methodHandle(declarationIndex, method)
+                    ))
+                    method = method + 1
+                }
+                declarationIndex = declarationIndex + 1
+            }
+            result = bootstrapEvalArray(handles)
+        }
+        if (targetName == "ablaRuntimeMemoryCollect") {
+            // The tree evaluator uses host-managed BootstrapEvalValue graphs;
+            // native collection belongs to the generated program. Treat the
+            // explicit safe point as a successful no-op while staging.
+            result = bootstrapEvalInteger(0)
+        }
+        if (targetName == "compilerFindFunction") {
+            val name = this.evaluate(expression.children[0])
+            var handle = -1
+            var declarationIndex = 0
+            while (declarationIndex < this.declarations.size) {
+                val declaration = this.declarations[declarationIndex]
+                if ((declaration.kind == "fun" ||
+                     declaration.kind == "compile.fun" ||
+                     declaration.kind == "extern") &&
+                    declaration.name == name.text) handle = declarationIndex
+                var method = 0
+                while (method < declaration.methods.size) {
+                    if ("${declaration.name}.${declaration.methods[method].name}" ==
+                        name.text) {
+                        handle = this.methodHandle(declarationIndex, method)
+                    }
+                    method = method + 1
+                }
+                declarationIndex = declarationIndex + 1
+            }
+            result = bootstrapEvalInteger(handle)
+        }
+        if (targetName == "compilerFunctionName" ||
+            targetName == "compilerFunctionCanonicalIdentity" ||
+            targetName == "compilerFunctionOwner" ||
+            targetName == "compilerFunctionParameterCount" ||
+            targetName == "compilerFunctionParameterName" ||
+            targetName == "compilerFunctionParameterType" ||
+            targetName == "compilerFunctionResultType" ||
+            targetName == "compilerFunctionIsCompileOnly" ||
+            targetName == "compilerFunctionIsTrusted" ||
+            targetName == "compilerFunctionIsExternal") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val validHandle = this.functionHandleValid(handle)
+            if (validHandle) {
+                val owner = this.functionHandleOwner(handle)
+                val method = this.functionHandleMethod(handle)
+                var declarationIndex = handle
+                if (owner >= 0) declarationIndex = owner
+                var declaration = this.declarations[declarationIndex]
+                if (owner >= 0) {
+                    declaration = this.declarations[owner].methods[method]
+                }
+                if (targetName == "compilerFunctionName") {
+                    result = bootstrapEvalString(declaration.name)
+                }
+                if (targetName == "compilerFunctionOwner") {
+                    var ownerName = declaration.extensionOwner
+                    if (owner >= 0) {
+                        ownerName = this.declarations[owner].name
+                    }
+                    result = bootstrapEvalString(ownerName)
+                }
+                if (targetName == "compilerFunctionCanonicalIdentity") {
+                    var identity = declaration.name
+                    if (owner >= 0) {
+                        identity = "${this.declarations[owner].name}.${declaration.name}"
+                    } else if (declaration.extensionOwner != "") {
+                        identity = "${bootstrapNormalizeType(
+                            declaration.extensionOwner
+                        )}.${declaration.name}"
+                    }
+                    result = bootstrapEvalString(identity)
+                }
+                if (targetName == "compilerFunctionParameterCount") {
+                    result = bootstrapEvalInteger(declaration.parameters.size)
+                }
+                if (targetName == "compilerFunctionParameterName") {
+                    val parameter = this.evaluate(
+                        expression.children[1]
+                    ).integer
+                    if (parameter >= 0 &&
+                        parameter < declaration.parameters.size) {
+                        result = bootstrapEvalString(
+                            declaration.parameters[parameter]
+                        )
+                    } else this.errors = this.errors + 1
+                }
+                if (targetName == "compilerFunctionParameterType") {
+                    val parameter = this.evaluate(
+                        expression.children[1]
+                    ).integer
+                    if (parameter >= 0 &&
+                        parameter < declaration.parameterTypes.size) {
+                        result = bootstrapEvalString(bootstrapNormalizeType(
+                            declaration.parameterTypes[parameter]
+                        ))
+                    } else this.errors = this.errors + 1
+                }
+                if (targetName == "compilerFunctionResultType") {
+                    result = bootstrapEvalString(
+                        bootstrapNormalizeType(declaration.resultType)
+                    )
+                }
+                if (targetName == "compilerFunctionIsCompileOnly") {
+                    result = bootstrapEvalBoolean(
+                        declaration.kind == "compile.fun"
+                    )
+                }
+                if (targetName == "compilerFunctionIsTrusted") {
+                    result = bootstrapEvalBoolean(declaration.isTrusted)
+                }
+                if (targetName == "compilerFunctionIsExternal") {
+                    result = bootstrapEvalBoolean(
+                        declaration.kind == "extern"
+                    )
+                }
+            }
+            if (!validHandle) this.errors = this.errors + 1
+        }
+        if (targetName == "compilerFunctionGenericSubstitutionCount" ||
+            targetName == "compilerFunctionGenericSubstitutionName" ||
+            targetName == "compilerFunctionGenericSubstitutionTypeHandle") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (this.functionHandleValid(handle)) {
+                if (targetName ==
+                    "compilerFunctionGenericSubstitutionCount") {
+                    result = bootstrapEvalInteger(0)
+                } else {
+                    this.evaluate(expression.children[1])
+                    this.errors = this.errors + 1
+                }
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerFindClass") {
+            val name = this.evaluate(expression.children[0]).text
+            var handle = -1
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                if (this.declarations[declaration].kind == "class" &&
+                    this.declarations[declaration].name == name) {
+                    handle = declaration
+                }
+                declaration = declaration + 1
+            }
+            result = bootstrapEvalInteger(handle)
+        }
+        if (targetName == "compilerClassFieldCount" ||
+            targetName == "compilerClassFieldName" ||
+            targetName == "compilerClassFieldType" ||
+            targetName == "compilerClassFieldIsMutable") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val valid = handle >= 0 && handle < this.declarations.size &&
+                this.declarations[handle].kind == "class"
+            if (valid) {
+                val declaration = this.declarations[handle]
+                if (targetName == "compilerClassFieldCount") {
+                    var count = 0
+                    var parameter = 0
+                    while (parameter < declaration.parameterKinds.size) {
+                        if (declaration.parameterKinds[parameter] == "val" ||
+                            declaration.parameterKinds[parameter] == "var") {
+                            count = count + 1
+                        }
+                        parameter = parameter + 1
+                    }
+                    result = bootstrapEvalInteger(count)
+                } else {
+                    val wanted = this.evaluate(
+                        expression.children[1]
+                    ).integer
+                    var field = -1
+                    var count = 0
+                    var parameter = 0
+                    while (parameter < declaration.parameterKinds.size) {
+                        if (declaration.parameterKinds[parameter] == "val" ||
+                            declaration.parameterKinds[parameter] == "var") {
+                            if (count == wanted) field = parameter
+                            count = count + 1
+                        }
+                        parameter = parameter + 1
+                    }
+                    if (field >= 0) {
+                        if (targetName == "compilerClassFieldName") {
+                            result = bootstrapEvalString(
+                                declaration.parameters[field]
+                            )
+                        }
+                        if (targetName == "compilerClassFieldType") {
+                            result = bootstrapEvalString(bootstrapNormalizeType(
+                                declaration.parameterTypes[field]
+                            ))
+                        }
+                        if (targetName == "compilerClassFieldIsMutable") {
+                            result = bootstrapEvalBoolean(
+                                declaration.parameterKinds[field] == "var"
+                            )
+                        }
+                    } else this.errors = this.errors + 1
+                }
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerRegisterSubparser") {
+            var argument = 0
+            while (argument < expression.children.size) {
+                this.evaluate(expression.children[argument])
+                argument = argument + 1
+            }
+            result = bootstrapEvalVoid()
+        }
+        if (targetName == "compilerGrant") {
+            this.evaluate(expression.children[0])
+            result = bootstrapEvalVoid()
+        }
+        if (targetName == "compilerGenerateModule") {
+            this.evaluate(expression.children[0])
+            this.evaluate(expression.children[1])
+            result = bootstrapEvalVoid()
+        }
+        if (targetName == "compilerRecordExtensionRequest" ||
+            targetName == "compilerRecordGeneratedExtensionRequest") {
+            val namespace = this.evaluate(expression.children[0])
+            val payload = this.evaluate(expression.children[1])
+            val syntaxHandle = this.evaluate(expression.children[2])
+            val finalizer = this.evaluate(expression.children[3])
+            var sourceIdentity = "<unknown>"
+            if (this.cursors.size > 0) {
+                sourceIdentity = this.cursors[0].sourceIdentity
+            }
+            if (namespace.kind == "string" && namespace.text != "" &&
+                payload.kind == "string" && syntaxHandle.kind == "syntax" &&
+                syntaxHandle.integer >= 0 &&
+                syntaxHandle.integer < this.syntax.size &&
+                finalizer.kind == "function" &&
+                this.extensionRequests.size < 256) {
+                this.extensionRequests.append(BootstrapExtensionRequest(
+                    namespace.text,
+                    payload.text,
+                    this.syntax[syntaxHandle.integer],
+                    finalizer.text,
+                    targetName == "compilerRecordGeneratedExtensionRequest",
+                    sourceIdentity,
+                    ""
+                ))
+            } else {
+                var reason = "request limit exceeded"
+                if (finalizer.kind != "function") {
+                    reason = "finalizer is not a compile-time function"
+                }
+                if (syntaxHandle.kind != "syntax" ||
+                    syntaxHandle.integer < 0 ||
+                    syntaxHandle.integer >= this.syntax.size) {
+                    reason = "expression is not a live syntax handle"
+                }
+                if (payload.kind != "string") {
+                    reason = "payload is not a string"
+                }
+                if (namespace.kind != "string" || namespace.text == "") {
+                    reason = "namespace must be a non-empty string"
+                }
+                var origin = BootstrapExpression(
+                    "invalid", "", expression.begin, expression.end, []
+                )
+                if (syntaxHandle.kind == "syntax" &&
+                    syntaxHandle.integer >= 0 &&
+                    syntaxHandle.integer < this.syntax.size) {
+                    origin = this.syntax[syntaxHandle.integer]
+                }
+                this.extensionRequests.append(BootstrapExtensionRequest(
+                    if (namespace.kind == "string") namespace.text
+                        else "<invalid>",
+                    if (payload.kind == "string") payload.text else "",
+                    origin,
+                    if (finalizer.kind == "function") finalizer.text else "",
+                    targetName == "compilerRecordGeneratedExtensionRequest",
+                    sourceIdentity,
+                    "extension.request:${if (namespace.kind == "string") namespace.text else "<invalid>"}:$sourceIdentity:${origin.begin}:${origin.end}:$reason\n"
+                ))
+                this.errors = this.errors + 1
+            }
+            result = bootstrapEvalVoid()
+        }
+        if (targetName == "ablaHostReadFile") {
+            if (bootstrapCompileEffectHas(this.allowedCompileEffects, 4)) {
+                val path = this.evaluate(expression.children[0])
+                val contents = Path(path.text).readText()
+                this.recordCompileInput(path.text, contents)
+                result = bootstrapEvalString(contents)
+            } else {
+                // Parser staging precedes full semantic analysis. Reject the
+                // invocation here so an unauthorized handler cannot touch the
+                // host merely because its eventual program would be denied.
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (targetName == "compilerWriteFile") {
+            val path = this.evaluate(expression.children[0])
+            val contents = this.evaluate(expression.children[1])
+            if (path.kind == "string" && contents.kind == "string" &&
+                bootstrapCompileEffectHas(
+                    this.allowedCompileEffects,
+                    8
+                )) {
+                result = bootstrapEvalBoolean(bootstrapStageCompileOutput(
+                    path.text,
+                    contents.text
+                ))
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (targetName == "compilerEnvironment") {
+            val name = this.evaluate(expression.children[0])
+            var valid = name.kind == "string" && name.text.size > 0 &&
+                name.text.size <= 256
+            var index = 0
+            while (valid && index < name.text.size) {
+                if (name.text[index] == 0 || name.text[index] == 61) {
+                    valid = false
+                }
+                index = index + 1
+            }
+            if (valid && bootstrapCompileEffectHas(
+                this.allowedCompileEffects,
+                16
+            )) {
+                val observed = linuxEnvironment(name.text)
+                val contents = if (observed.found) observed.value else ""
+                this.recordCompileInput(
+                    "abla-input:environment:${name.text}",
+                    contents
+                )
+                result = bootstrapEvalString(contents)
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (targetName == "compilerClockMilliseconds") {
+            if (bootstrapCompileEffectHas(
+                this.allowedCompileEffects,
+                128
+            )) {
+                result = bootstrapEvalInteger(linuxMonotonicMilliseconds())
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (targetName == "compilerRandomInteger") {
+            val maximum = this.evaluate(expression.children[0])
+            if (maximum.kind == "integer" && maximum.integer > 0 &&
+                bootstrapCompileEffectHas(
+                    this.allowedCompileEffects,
+                    256
+                )) {
+                result = bootstrapEvalInteger(
+                    linuxRandomInteger(maximum.integer)
+                )
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (targetName == "compilerRunProcess") {
+            val arguments = this.evaluate(expression.children[0])
+            var valid = arguments.kind == "array" &&
+                arguments.elements.size > 0 &&
+                arguments.elements.size <= 128
+            var argument = 0
+            while (valid && argument < arguments.elements.size) {
+                val value = arguments.elements[argument]
+                if (value.kind != "string" || value.text.size > 4096) {
+                    valid = false
+                }
+                argument = argument + 1
+            }
+            if (valid && bootstrapCompileEffectHas(
+                this.allowedCompileEffects,
+                32
+            )) {
+                val command = linuxCommand(arguments.elements[0].text)
+                argument = 1
+                while (argument < arguments.elements.size) {
+                    command.argument(arguments.elements[argument].text)
+                    argument = argument + 1
+                }
+                result = bootstrapEvalInteger(command.run())
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (targetName == "compilerTcpExchange") {
+            val address = this.evaluate(expression.children[0])
+            val port = this.evaluate(expression.children[1])
+            val request = this.evaluate(expression.children[2])
+            val maximum = this.evaluate(expression.children[3])
+            val timeout = this.evaluate(expression.children[4])
+            var valid = address.kind == "string" &&
+                port.kind == "integer" && request.kind == "string" &&
+                maximum.kind == "integer" && timeout.kind == "integer" &&
+                request.text.size <= 1048576 && maximum.integer > 0 &&
+                maximum.integer <= 1048576 && timeout.integer > 0 &&
+                timeout.integer <= 10000 &&
+                bootstrapCompileEffectHas(this.allowedCompileEffects, 64)
+            if (valid) {
+                val connection = tcpConnectIpv4(
+                    address.text,
+                    port.integer,
+                    timeout.integer
+                )
+                var response = ""
+                if (connection.descriptor >= 0) {
+                    val written = connection.write(request.text)
+                    if (written == request.text.size) {
+                        response = connection.readWithTimeout(
+                            maximum.integer,
+                            timeout.integer
+                        )
+                    }
+                    connection.close()
+                }
+                result = bootstrapEvalString(response)
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (targetName == "parserExpect") {
+            val cursor = this.evaluate(expression.children[0])
+            val expected = this.evaluate(expression.children[1])
+            this.cursors[cursor.integer].expect(expected.text)
+            result = bootstrapEvalVoid()
+        }
+        if (targetName == "parserAt") {
+            val cursor = this.evaluate(expression.children[0])
+            val expected = this.evaluate(expression.children[1])
+            result = bootstrapEvalBoolean(
+                this.cursors[cursor.integer].at(expected.text)
+            )
+        }
+        if (targetName == "parserConsume") {
+            val cursor = this.evaluate(expression.children[0])
+            val expected = this.evaluate(expression.children[1])
+            result = bootstrapEvalBoolean(
+                this.cursors[cursor.integer].consume(expected.text)
+            )
+        }
+        if (targetName == "parserCurrentText") {
+            val cursor = this.evaluate(expression.children[0])
+            result = bootstrapEvalString(
+                this.cursors[cursor.integer].currentText()
+            )
+        }
+        if (targetName == "parserRawAt") {
+            val cursor = this.evaluate(expression.children[0])
+            val text = this.evaluate(expression.children[1])
+            result = bootstrapEvalBoolean(
+                this.cursors[cursor.integer].rawAt(text.text)
+            )
+        }
+        if (targetName == "parserRawConsume") {
+            val cursor = this.evaluate(expression.children[0])
+            val text = this.evaluate(expression.children[1])
+            result = bootstrapEvalBoolean(
+                this.cursors[cursor.integer].rawConsume(text.text)
+            )
+        }
+        if (targetName == "parserRawExpect") {
+            val cursor = this.evaluate(expression.children[0])
+            val text = this.evaluate(expression.children[1])
+            this.cursors[cursor.integer].rawExpect(text.text)
+            result = bootstrapEvalVoid()
+        }
+        if (targetName == "parserRawTakeUntil") {
+            val cursor = this.evaluate(expression.children[0])
+            val delimiters = this.evaluate(expression.children[1])
+            result = bootstrapEvalString(
+                this.cursors[cursor.integer].rawTakeUntil(delimiters.text)
+            )
+        }
+        if (targetName == "parserRawTakeName") {
+            val cursor = this.evaluate(expression.children[0])
+            result = bootstrapEvalString(
+                this.cursors[cursor.integer].rawTakeName()
+            )
+        }
+        if (targetName == "parserRawSkipWhitespace") {
+            val cursor = this.evaluate(expression.children[0])
+            this.cursors[cursor.integer].rawSkipWhitespace()
+            result = bootstrapEvalVoid()
+        }
+        if (targetName == "parserRawEnd") {
+            val cursor = this.evaluate(expression.children[0])
+            result = bootstrapEvalBoolean(
+                this.cursors[cursor.integer].rawEnd()
+            )
+        }
+        if (targetName == "parserSourceIdentity") {
+            val cursor = this.evaluate(expression.children[0])
+            result = bootstrapEvalString(
+                this.cursors[cursor.integer].sourceIdentity
+            )
+        }
+        if (targetName == "parserFail") {
+            val cursor = this.evaluate(expression.children[0])
+            this.evaluate(expression.children[1])
+            this.cursors[cursor.integer].errors =
+                this.cursors[cursor.integer].errors + 1
+            result = bootstrapEvalVoid()
+        }
+        if (targetName == "parserParseAblaExpression") {
+            val cursor = this.evaluate(expression.children[0])
+            result = this.syntaxValue(
+                this.cursors[cursor.integer].parseAblaExpression()
+            )
+        }
+        if (targetName == "syntaxKind" || targetName == "syntaxText" ||
+            targetName == "syntaxChildCount" ||
+            targetName == "syntaxBegin" || targetName == "syntaxEnd") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (handle >= 0 && handle < this.syntax.size) {
+                val inspected = this.syntax[handle]
+                if (targetName == "syntaxKind") {
+                    result = bootstrapEvalString(inspected.kind)
+                }
+                if (targetName == "syntaxText") {
+                    result = bootstrapEvalString(inspected.text)
+                }
+                if (targetName == "syntaxChildCount") {
+                    result = bootstrapEvalInteger(inspected.children.size)
+                }
+                if (targetName == "syntaxBegin") {
+                    result = bootstrapEvalInteger(inspected.begin)
+                }
+                if (targetName == "syntaxEnd") {
+                    result = bootstrapEvalInteger(inspected.end)
+                }
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxChild") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val index = this.evaluate(expression.children[1]).integer
+            if (handle >= 0 && handle < this.syntax.size && index >= 0 &&
+                index < this.syntax[handle].children.size) {
+                val child = this.syntax[handle].children[index]
+                result = this.syntaxValue(child)
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxInteger") {
+            val value = this.evaluate(expression.children[0])
+            result = this.syntaxValue(bootstrapSyntaxInteger(value.integer))
+        }
+        if (targetName == "syntaxString") {
+            val value = this.evaluate(expression.children[0])
+            result = this.syntaxValue(bootstrapSyntaxString(value.text))
+        }
+        if (targetName == "syntaxBoolean") {
+            val value = this.evaluate(expression.children[0])
+            if (value.kind == "boolean") {
+                val literal = if (value.boolean) "true" else "false"
+                result = this.syntaxValue(BootstrapExpression(
+                    literal,
+                    literal,
+                    0,
+                    0,
+                    []
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxNull") {
+            result = this.syntaxValue(BootstrapExpression(
+                "null", "", 0, 0, []
+            ))
+        }
+        if (targetName == "syntaxIdentifier") {
+            val value = this.evaluate(expression.children[0])
+            result = this.syntaxValue(bootstrapSyntaxIdentifier(value.text))
+        }
+        if (targetName == "syntaxBinary") {
+            val operation = this.evaluate(expression.children[0])
+            val left = this.evaluate(expression.children[1])
+            val right = this.evaluate(expression.children[2])
+            result = this.syntaxValue(bootstrapSyntaxBinary(
+                operation.text,
+                this.syntax[left.integer],
+                this.syntax[right.integer]
+            ))
+        }
+        if (targetName == "syntaxArray") {
+            val values = this.evaluate(expression.children[0])
+            val elements: array<BootstrapExpression> = []
+            var element = 0
+            while (element < values.elements.size) {
+                elements.append(this.syntax[values.elements[element].integer])
+                element = element + 1
+            }
+            result = this.syntaxValue(bootstrapSyntaxArray(elements))
+        }
+        if (targetName == "syntaxCall") {
+            val name = this.evaluate(expression.children[0])
+            val values = this.evaluate(expression.children[1])
+            val arguments: array<BootstrapExpression> = []
+            var argument = 0
+            while (argument < values.elements.size) {
+                arguments.append(this.syntax[values.elements[argument].integer])
+                argument = argument + 1
+            }
+            result = this.syntaxValue(bootstrapSyntaxCall(name.text, arguments))
+        }
+        if (targetName == "syntaxCallTarget" ||
+            targetName == "syntaxMethodCallTarget") {
+            val handle = this.evaluate(expression.children[0]).integer
+            var receiver = bootstrapEvalInvalid()
+            var valuesIndex = 1
+            if (targetName == "syntaxMethodCallTarget") {
+                receiver = this.evaluate(expression.children[1])
+                valuesIndex = 2
+            }
+            val values = this.evaluate(expression.children[valuesIndex])
+            val owner = this.functionHandleOwner(handle)
+            val method = this.functionHandleMethod(handle)
+            var valid = this.functionHandleValid(handle) &&
+                values.kind == "array"
+            if (targetName == "syntaxCallTarget" && owner >= 0) valid = false
+            if (targetName == "syntaxMethodCallTarget" &&
+                (receiver.kind != "syntax" || receiver.integer < 0 ||
+                 receiver.integer >= this.syntax.size)) valid = false
+            var declarationIndex = handle
+            if (owner >= 0) declarationIndex = owner
+            var declarationName = ""
+            var extensionOwner = ""
+            if (valid) {
+                declarationName = this.declarations[declarationIndex].name
+                extensionOwner =
+                    this.declarations[declarationIndex].extensionOwner
+                if (owner >= 0) {
+                    declarationName =
+                        this.declarations[owner].methods[method].name
+                    extensionOwner = this.declarations[owner].name
+                }
+                if (targetName == "syntaxMethodCallTarget" && owner < 0 &&
+                    extensionOwner == "") valid = false
+                if (targetName == "syntaxCallTarget" &&
+                    extensionOwner != "") valid = false
+            }
+            val arguments: array<BootstrapExpression> = []
+            var argument = 0
+            while (valid && argument < values.elements.size) {
+                val syntaxHandle = values.elements[argument].integer
+                if (values.elements[argument].kind != "syntax" ||
+                    syntaxHandle < 0 || syntaxHandle >= this.syntax.size) {
+                    valid = false
+                } else arguments.append(this.syntax[syntaxHandle])
+                argument = argument + 1
+            }
+            if (valid && targetName == "syntaxCallTarget") {
+                result = this.syntaxValue(BootstrapExpression(
+                    "call",
+                    declarationName,
+                    0 - handle - 1,
+                    0,
+                    arguments
+                ))
+            }
+            if (valid && targetName == "syntaxMethodCallTarget") {
+                val children: array<BootstrapExpression> = [
+                    this.syntax[receiver.integer]
+                ]
+                argument = 0
+                while (argument < arguments.size) {
+                    children.append(arguments[argument])
+                    argument = argument + 1
+                }
+                result = this.syntaxValue(BootstrapExpression(
+                    "member.call",
+                    declarationName,
+                    0 - handle - 1,
+                    0,
+                    children
+                ))
+            }
+            if (!valid) this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxMember") {
+            val receiver = this.evaluate(expression.children[0])
+            val name = this.evaluate(expression.children[1])
+            if (receiver.kind == "syntax" &&
+                this.generatedIdentifierPart(name.text) == name.text) {
+                result = this.syntaxValue(BootstrapExpression(
+                    "member",
+                    name.text,
+                    0,
+                    0,
+                    [this.syntax[receiver.integer]]
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxIndex") {
+            val receiver = this.evaluate(expression.children[0])
+            val index = this.evaluate(expression.children[1])
+            if (receiver.kind == "syntax" && index.kind == "syntax") {
+                result = this.syntaxValue(BootstrapExpression(
+                    "index",
+                    "",
+                    0,
+                    0,
+                    [this.syntax[receiver.integer], this.syntax[index.integer]]
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxIf") {
+            val condition = this.evaluate(expression.children[0])
+            val thenExpression = this.evaluate(expression.children[1])
+            val elseExpression = this.evaluate(expression.children[2])
+            if (condition.kind == "syntax" &&
+                thenExpression.kind == "syntax" &&
+                elseExpression.kind == "syntax") {
+                result = this.syntaxValue(BootstrapExpression(
+                    "if",
+                    "",
+                    0,
+                    0,
+                    [
+                        this.syntax[condition.integer],
+                        this.syntax[thenExpression.integer],
+                        this.syntax[elseExpression.integer]
+                    ]
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxReturn") {
+            val value = this.evaluate(expression.children[0])
+            if (value.kind == "syntax") {
+                result = this.syntaxValue(BootstrapExpression(
+                    "return", "", 0, 0, [this.syntax[value.integer]]
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxBlock") {
+            val values = this.evaluate(expression.children[0])
+            val statements: array<BootstrapExpression> = []
+            var statement = 0
+            var valid = values.kind == "array"
+            while (valid && statement < values.elements.size) {
+                val value = values.elements[statement]
+                if (value.kind == "syntax" && value.integer >= 0 &&
+                    value.integer < this.syntax.size) {
+                    statements.append(this.syntax[value.integer])
+                } else valid = false
+                statement = statement + 1
+            }
+            if (valid) {
+                result = this.syntaxValue(BootstrapExpression(
+                    "block", "", 0, 0, statements
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxLocal" ||
+            targetName == "syntaxVariable") {
+            val name = this.evaluate(expression.children[0])
+            val typeHandle = this.evaluate(expression.children[1]).integer
+            val initializer = this.evaluate(expression.children[2])
+            if (name.kind == "string" &&
+                this.generatedIdentifierPart(name.text) == name.text &&
+                this.reflectedTypeValid(typeHandle) &&
+                initializer.kind == "syntax") {
+                var kind = "local.val"
+                if (targetName == "syntaxVariable") kind = "local.var"
+                result = this.syntaxValue(BootstrapExpression(
+                    kind,
+                    name.text,
+                    0,
+                    0,
+                    [
+                        this.syntax[initializer.integer],
+                        BootstrapExpression(
+                            "type", this.reflectedTypes[typeHandle], 0, 0, []
+                        )
+                    ]
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxAssign") {
+            val name = this.evaluate(expression.children[0])
+            val value = this.evaluate(expression.children[1])
+            if (name.kind == "string" &&
+                this.generatedIdentifierPart(name.text) == name.text &&
+                value.kind == "syntax") {
+                result = this.syntaxValue(BootstrapExpression(
+                    "assign", name.text, 0, 0,
+                    [this.syntax[value.integer]]
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "syntaxLambda") {
+            val names = this.evaluate(expression.children[0])
+            val types = this.evaluate(expression.children[1])
+            val body = this.evaluate(expression.children[2])
+            val moving = this.evaluate(expression.children[3])
+            var valid = names.kind == "array" && types.kind == "array" &&
+                names.elements.size == types.elements.size &&
+                body.kind == "syntax" && moving.kind == "bool"
+            val children: array<BootstrapExpression> = []
+            var parameter = 0
+            while (valid && parameter < names.elements.size) {
+                val name = names.elements[parameter]
+                val type = types.elements[parameter]
+                if (name.kind != "string" ||
+                    this.generatedIdentifierPart(name.text) != name.text ||
+                    type.kind != "integer" ||
+                    !this.reflectedTypeValid(type.integer)) {
+                    valid = false
+                } else children.append(BootstrapExpression(
+                    "lambda.parameter", name.text, 0, 0,
+                    [BootstrapExpression(
+                        "type", this.reflectedTypes[type.integer], 0, 0, []
+                    )]
+                ))
+                parameter = parameter + 1
+            }
+            if (valid) {
+                children.append(this.syntax[body.integer])
+                var kind = "lambda"
+                if (moving.boolean) kind = "lambda.move"
+                result = this.syntaxValue(BootstrapExpression(
+                    kind, "", 0, 0, children
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerGeneratedModule") {
+            val namespace = this.evaluate(expression.children[0])
+            val origin = this.evaluate(expression.children[1])
+            if (namespace.kind == "string" && namespace.text != "" &&
+                origin.kind == "syntax" && origin.integer >= 0 &&
+                origin.integer < this.syntax.size) {
+                result = BootstrapEvalValue(
+                    "generated.module",
+                    this.syntax[origin.integer].begin,
+                    false,
+                    namespace.text,
+                    [BootstrapEvalValue(
+                        "generated.origin",
+                        this.syntax[origin.integer].end,
+                        false,
+                        "",
+                        [],
+                        "",
+                        []
+                    )],
+                    "",
+                    []
+                )
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerGeneratedFunction" ||
+            targetName == "compilerGeneratedExportFunction") {
+            val module = this.evaluate(expression.children[0])
+            val hint = this.evaluate(expression.children[1])
+            val names = this.evaluate(expression.children[2])
+            val types = this.evaluate(expression.children[3])
+            val resultType = this.evaluate(expression.children[4]).integer
+            val body = this.evaluate(expression.children[5])
+            var valid = module.kind == "generated.module" &&
+                hint.kind == "string" && names.kind == "array" &&
+                types.kind == "array" &&
+                names.elements.size == types.elements.size &&
+                this.reflectedTypeValid(resultType) && body.kind == "syntax" &&
+                module.elements.size < 256
+            var generatedName = this.generatedDeclarationName(module, hint.text)
+            if (targetName == "compilerGeneratedExportFunction") {
+                generatedName = this.generatedExportName(module, hint.text)
+            }
+            if (generatedName == "") valid = false
+            var source = "fun $generatedName("
+            val generatedParameterNames: array<string> = []
+            val generatedParameterTypes: array<string> = []
+            val generatedParameterDefaults: array<BootstrapExpression> = []
+            val generatedParameterKinds: array<string> = []
+            var parameter = 0
+            while (valid && parameter < names.elements.size) {
+                val parameterName = names.elements[parameter]
+                val parameterType = types.elements[parameter]
+                if (parameterName.kind != "string" ||
+                    this.generatedIdentifierPart(parameterName.text) !=
+                        parameterName.text ||
+                    parameterType.kind != "integer" ||
+                    !this.reflectedTypeValid(parameterType.integer)) {
+                    valid = false
+                } else {
+                    if (parameter > 0) source = "$source, "
+                    val parameterTypeName =
+                        this.reflectedTypes[parameterType.integer]
+                    generatedParameterNames.append(parameterName.text)
+                    generatedParameterTypes.append(parameterTypeName)
+                    generatedParameterDefaults.append(BootstrapExpression(
+                        "missing", "", module.integer, module.integer, []
+                    ))
+                    generatedParameterKinds.append("parameter")
+                    source = "$source${parameterName.text}: $parameterTypeName"
+                }
+                parameter = parameter + 1
+            }
+            if (valid) {
+                val generatedResultType = this.reflectedTypes[resultType]
+                source = "$source): $generatedResultType "
+                val bodyExpression = this.syntax[body.integer]
+                if (bodyExpression.kind != "block") source = "$source= "
+                source = "$source${this.generatedSyntaxSource(
+                    bodyExpression, 0
+                )}\n"
+                if (source.size > 65536) valid = false
+            }
+            if (valid) {
+                var originEnd = module.integer
+                if (module.elements.size > 0 &&
+                    module.elements[0].kind == "generated.origin") {
+                    originEnd = module.elements[0].integer
+                }
+                val declarationIndex = this.generatedDeclarations.size
+                this.generatedDeclarations.append(BootstrapDeclaration(
+                    "fun",
+                    generatedName,
+                    module.integer,
+                    originEnd,
+                    this.syntax[body.integer],
+                    generatedParameterNames,
+                    generatedParameterTypes,
+                    this.reflectedTypes[resultType],
+                    [],
+                    generatedParameterDefaults,
+                    "",
+                    generatedParameterKinds,
+                    "",
+                    false,
+                    false,
+                    false,
+                    module.text,
+                    module.integer,
+                    originEnd
+                ))
+                module.elements.append(BootstrapEvalValue(
+                    "generated.declaration",
+                    declarationIndex,
+                    false,
+                    source,
+                    [],
+                    "",
+                    []
+                ))
+                module.fieldNames.append(generatedName)
+                result = bootstrapEvalString(generatedName)
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerGeneratedValue") {
+            val module = this.evaluate(expression.children[0])
+            val hint = this.evaluate(expression.children[1])
+            val typeHandle = this.evaluate(expression.children[2]).integer
+            val initializer = this.evaluate(expression.children[3])
+            var valid = module.kind == "generated.module" &&
+                hint.kind == "string" &&
+                this.reflectedTypeValid(typeHandle) &&
+                initializer.kind == "syntax" && module.elements.size < 256
+            val generatedName = this.generatedDeclarationName(module, hint.text)
+            if (generatedName == "") valid = false
+            if (valid) {
+                val typeName = this.reflectedTypes[typeHandle]
+                val initializerSource = this.generatedSyntaxSource(
+                    this.syntax[initializer.integer], 0
+                )
+                val source = "val $generatedName: $typeName = $initializerSource\n"
+                if (source.size <= 65536) {
+                    var originEnd = module.integer
+                    if (module.elements.size > 0 &&
+                        module.elements[0].kind == "generated.origin") {
+                        originEnd = module.elements[0].integer
+                    }
+                    val declarationIndex = this.generatedDeclarations.size
+                    this.generatedDeclarations.append(BootstrapDeclaration(
+                        "val",
+                        generatedName,
+                        module.integer,
+                        originEnd,
+                        this.syntax[initializer.integer],
+                        [],
+                        [],
+                        typeName,
+                        [],
+                        [],
+                        "",
+                        [],
+                        "",
+                        false,
+                        false,
+                        false,
+                        module.text,
+                        module.integer,
+                        originEnd
+                    ))
+                    module.elements.append(BootstrapEvalValue(
+                        "generated.declaration",
+                        declarationIndex,
+                        false,
+                        source,
+                        [],
+                        "",
+                        []
+                    ))
+                    module.fieldNames.append(generatedName)
+                    result = bootstrapEvalString(generatedName)
+                } else valid = false
+            }
+            if (!valid) this.errors = this.errors + 1
+        }
+        if (targetName == "compilerGeneratedModuleSource") {
+            val module = this.evaluate(expression.children[0])
+            if (module.kind == "generated.module") {
+                var source = ""
+                var declaration = 0
+                while (declaration < module.elements.size) {
+                    source = "$source${module.elements[declaration].text}"
+                    declaration = declaration + 1
+                }
+                result = bootstrapEvalString(source)
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerGeneratedDeclarationCount") {
+            val module = this.evaluate(expression.children[0])
+            if (module.kind == "generated.module") {
+                result = bootstrapEvalInteger(
+                    this.generatedDeclarationCount(module)
+                )
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerGeneratedDeclarationNamespace" ||
+            targetName == "compilerGeneratedDeclarationOriginBegin" ||
+            targetName == "compilerGeneratedDeclarationOriginEnd") {
+            val module = this.evaluate(expression.children[0])
+            val ordinal = this.evaluate(expression.children[1]).integer
+            val declarationIndex = this.generatedDeclarationAt(
+                module,
+                ordinal
+            )
+            if (declarationIndex >= 0) {
+                val declaration = this.generatedDeclarations[
+                    declarationIndex
+                ]
+                if (targetName ==
+                    "compilerGeneratedDeclarationNamespace") {
+                    result = bootstrapEvalString(
+                        declaration.generatedNamespace
+                    )
+                }
+                if (targetName ==
+                    "compilerGeneratedDeclarationOriginBegin") {
+                    result = bootstrapEvalInteger(
+                        declaration.generatedOriginBegin
+                    )
+                }
+                if (targetName ==
+                    "compilerGeneratedDeclarationOriginEnd") {
+                    result = bootstrapEvalInteger(
+                        declaration.generatedOriginEnd
+                    )
+                }
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "compilerGeneratedDeclarationReference" ||
+            targetName == "compilerGeneratedDeclarationCall") {
+            val module = this.evaluate(expression.children[0])
+            val ordinal = this.evaluate(expression.children[1]).integer
+            val declarationIndex = this.generatedDeclarationAt(
+                module, ordinal
+            )
+            val arguments: array<BootstrapExpression> = []
+            var valid = declarationIndex >= 0
+            if (targetName == "compilerGeneratedDeclarationCall") {
+                val values = this.evaluate(expression.children[2])
+                valid = valid && values.kind == "array"
+                var argument = 0
+                while (valid && argument < values.elements.size) {
+                    val value = values.elements[argument]
+                    if (value.kind == "syntax" && value.integer >= 0 &&
+                        value.integer < this.syntax.size) {
+                        arguments.append(this.syntax[value.integer])
+                    } else valid = false
+                    argument = argument + 1
+                }
+            }
+            if (valid) {
+                val declaration = this.generatedDeclarations[
+                    declarationIndex
+                ]
+                var kind = "identifier"
+                if (targetName ==
+                    "compilerGeneratedDeclarationCall") kind = "call"
+                result = this.syntaxValue(BootstrapExpression(
+                    kind,
+                    declaration.name,
+                    0,
+                    -1,
+                    arguments
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "typedExpressionType" ||
+            targetName == "typedExpressionKind") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (handle >= 0 && handle < this.syntax.size) {
+                if (targetName == "typedExpressionType") {
+                    val typed = this.typedCallIndex(this.syntax[handle])
+                    if (typed >= 0) {
+                        result = bootstrapEvalString(
+                            this.typedCalls[typed].type
+                        )
+                    } else this.errors = this.errors + 1
+                } else result = bootstrapEvalString(
+                    this.syntax[handle].kind
+                )
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "typedCallTarget") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (handle >= 0 && handle < this.syntax.size) {
+                val typed = this.typedCallIndex(this.syntax[handle])
+                if (typed >= 0) {
+                    result = bootstrapEvalInteger(this.typedCalls[typed].target)
+                } else this.errors = this.errors + 1
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "typedCallArgumentType") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val argument = this.evaluate(expression.children[1]).integer
+            var typed = -1
+            if (handle >= 0 && handle < this.syntax.size) {
+                typed = this.typedCallIndex(this.syntax[handle])
+            }
+            if (typed >= 0 && argument >= 0 &&
+                argument < this.typedCalls[typed].argumentTypes.size) {
+                result = bootstrapEvalString(
+                    this.typedCalls[typed].argumentTypes[argument]
+                )
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "typedCallArgumentCount") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (handle >= 0 && handle < this.syntax.size &&
+                (this.syntax[handle].kind == "call" ||
+                 this.syntax[handle].kind == "member.call")) {
+                var count = this.syntax[handle].children.size
+                if (this.syntax[handle].kind == "member.call") {
+                    count = count - 1
+                }
+                result = bootstrapEvalInteger(count)
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "typedCallArgument") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val argument = this.evaluate(expression.children[1]).integer
+            var offset = 0
+            if (handle >= 0 && handle < this.syntax.size &&
+                this.syntax[handle].kind == "member.call") offset = 1
+            if (handle >= 0 && handle < this.syntax.size &&
+                (this.syntax[handle].kind == "call" ||
+                 this.syntax[handle].kind == "member.call") &&
+                argument >= 0 &&
+                argument + offset < this.syntax[handle].children.size) {
+                val child = this.syntax[handle].children[argument + offset]
+                result = this.syntaxValue(child)
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "typedCallReceiverType") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (handle >= 0 && handle < this.syntax.size &&
+                this.syntax[handle].kind == "member.call" &&
+                this.syntax[handle].children.size > 0) {
+                val typed = this.typedCallIndex(this.syntax[handle])
+                if (typed >= 0) result = bootstrapEvalString(
+                    this.typedCalls[typed].receiverType
+                )
+                else this.errors = this.errors + 1
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "typedCallParameterTypeHandle" ||
+            targetName == "typedCallResultTypeHandle" ||
+            targetName == "typedCallArgumentParameter" ||
+            targetName == "typedCallArgumentConversion" ||
+            targetName == "typedCallInsertedDefaultCount" ||
+            targetName == "typedCallParameterOwnership" ||
+            targetName == "typedCallIsCompileOnly" ||
+            targetName == "typedCallIsTrusted") {
+            val syntaxHandle = this.evaluate(expression.children[0]).integer
+            var typed = -1
+            if (syntaxHandle >= 0 && syntaxHandle < this.syntax.size) {
+                typed = this.typedCallIndex(this.syntax[syntaxHandle])
+            }
+            if (typed >= 0) {
+                val call = this.typedCalls[typed]
+                if (targetName == "typedCallResultTypeHandle") {
+                    result = bootstrapEvalInteger(this.reflectedTypeHandle(
+                        call.type
+                    ))
+                }
+                if (targetName == "typedCallInsertedDefaultCount") {
+                    result = bootstrapEvalInteger(call.insertedDefaults)
+                }
+                if (targetName == "typedCallIsCompileOnly") {
+                    result = bootstrapEvalBoolean(call.isCompileOnly)
+                }
+                if (targetName == "typedCallIsTrusted") {
+                    result = bootstrapEvalBoolean(call.isTrusted)
+                }
+                if (targetName == "typedCallParameterTypeHandle" ||
+                    targetName == "typedCallArgumentParameter" ||
+                    targetName == "typedCallArgumentConversion" ||
+                    targetName == "typedCallParameterOwnership") {
+                    val selected = this.evaluate(
+                        expression.children[1]
+                    ).integer
+                    if (selected >= 0) {
+                        if (targetName ==
+                                "typedCallParameterTypeHandle" &&
+                            selected < call.parameterTypes.size) {
+                            result = bootstrapEvalInteger(
+                                this.reflectedTypeHandle(
+                                    call.parameterTypes[selected]
+                                )
+                            )
+                        }
+                        if (targetName == "typedCallArgumentParameter" &&
+                            selected < call.argumentParameters.size) {
+                            result = bootstrapEvalInteger(
+                                call.argumentParameters[selected]
+                            )
+                        }
+                        if (targetName == "typedCallArgumentConversion" &&
+                            selected < call.argumentConversions.size) {
+                            result = bootstrapEvalString(
+                                call.argumentConversions[selected]
+                            )
+                        }
+                        if (targetName ==
+                                "typedCallParameterOwnership" &&
+                            selected < call.parameterKinds.size) {
+                            result = bootstrapEvalString(
+                                call.parameterKinds[selected]
+                            )
+                        }
+                        if (result.kind == "invalid") {
+                            this.errors = this.errors + 1
+                        }
+                    } else this.errors = this.errors + 1
+                }
+            } else this.errors = this.errors + 1
+        }
+        var declarationIndex = 0
+        while (result.kind == "invalid" &&
+               declarationIndex < this.declarations.size) {
+            val declaration = this.declarations[declarationIndex]
+            if (declaration.kind == "class" &&
+                declaration.name == targetName) {
+                val fields: array<BootstrapEvalValue> = []
+                val fieldNames: array<string> = []
+                var parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    var value = bootstrapEvalInvalid()
+                    if (parameter < expression.children.size) {
+                        value = this.evaluate(expression.children[parameter])
+                    } else if (parameter < declaration.parameterDefaults.size &&
+                        declaration.parameterDefaults[parameter].kind !=
+                            "missing") {
+                        value = this.evaluate(
+                            declaration.parameterDefaults[parameter]
+                        )
+                    } else {
+                        this.errors = this.errors + 1
+                        value = value
+                    }
+                    if (parameter < declaration.parameterKinds.size &&
+                        (declaration.parameterKinds[parameter] == "val" ||
+                         declaration.parameterKinds[parameter] == "var")) {
+                        fieldNames.append(declaration.parameters[parameter])
+                        fields.append(value)
+                    }
+                    parameter = parameter + 1
+                }
+                result = bootstrapEvalObject(
+                    declaration.name,
+                    fieldNames,
+                    fields
+                )
+            }
+            if (declaration.name == targetName &&
+                (declaration.kind == "fun" ||
+                 declaration.kind == "compile.fun")) {
+                val callNames: array<string> = []
+                val callValues: array<BootstrapEvalValue> = []
+                val callMutable: array<bool> = []
+                var argument = 0
+                while (argument < declaration.parameters.size) {
+                    callNames.append(declaration.parameters[argument])
+                    if (argument < expression.children.size) {
+                        callValues.append(this.evaluate(
+                            expression.children[argument]
+                        ))
+                        argument = argument
+                    } else if (argument < declaration.parameterDefaults.size &&
+                        declaration.parameterDefaults[argument].kind !=
+                            "missing") {
+                        val defaults = BootstrapEvaluator(
+                            this.declarations,
+                            this.affineTypes,
+                            callNames,
+                            callValues,
+                            callMutable,
+                            this.cursors,
+                            this.syntax,
+                            this.typedCalls,
+                            this.reflectedTypes,
+                            this.generatedDeclarations,
+                            this.extensionRequests,
+                            this.compileInputPaths,
+                            this.compileInputContents,
+                            this.allowedCompileEffects,
+                            this.errors,
+                            this.steps
+                        )
+                        callValues.append(defaults.evaluate(
+                            declaration.parameterDefaults[argument]
+                        ))
+                        this.errors = defaults.errors
+                        this.steps = defaults.steps
+                    } else {
+                        callValues.append(bootstrapEvalInvalid())
+                        this.errors = this.errors + 1
+                    }
+                    callMutable.append(false)
+                    argument = argument + 1
+                }
+                val invocation = BootstrapEvaluator(
+                    this.declarations,
+                    this.affineTypes,
+                    callNames,
+                    callValues,
+                    callMutable,
+                    this.cursors,
+                    this.syntax,
+                    this.typedCalls,
+                    this.reflectedTypes,
+                    this.generatedDeclarations,
+                    this.extensionRequests,
+                    this.compileInputPaths,
+                    this.compileInputContents,
+                    this.allowedCompileEffects,
+                    this.errors,
+                    this.steps
+                )
+                result = invocation.evaluate(declaration.expression)
+                if (result.kind == "return" && result.elements.size == 1) {
+                    result = result.elements[0]
+                }
+                invocation.dropOwnedParameters(
+                    declaration.parameterKinds,
+                    result,
+                    0
+                )
+                this.errors = invocation.errors
+                this.steps = invocation.steps
+            }
+            declarationIndex = declarationIndex + 1
+        }
+        if (result.kind == "invalid") this.errors = this.errors + 1
+        result
+    }
+
+    fun evaluateMethod(
+        receiver: BootstrapEvalValue,
+        expression: BootstrapExpression
+    ): BootstrapEvalValue {
+        var result = bootstrapEvalInvalid()
+        var declarationIndex = 0
+        while (declarationIndex < this.declarations.size) {
+            val declaration = this.declarations[declarationIndex]
+            if (declaration.kind == "class" &&
+                declaration.name == receiver.owner) {
+                var methodIndex = 0
+                while (methodIndex < declaration.methods.size) {
+                    val method = declaration.methods[methodIndex]
+                    if (method.name == expression.text) {
+                        val methodNames: array<string> = ["this"]
+                        val methodValues: array<BootstrapEvalValue> = [receiver]
+                        val methodMutable: array<bool> = [false]
+                        var parameter = 0
+                        while (parameter < method.parameters.size) {
+                            methodNames.append(method.parameters[parameter])
+                            if (parameter + 1 < expression.children.size) {
+                                methodValues.append(this.evaluate(
+                                    expression.children[parameter + 1]
+                                ))
+                                this.steps = this.steps
+                            } else if (parameter <
+                                    method.parameterDefaults.size &&
+                                method.parameterDefaults[parameter].kind !=
+                                    "missing") {
+                                val defaults = BootstrapEvaluator(
+                                    this.declarations,
+                                    this.affineTypes,
+                                    methodNames,
+                                    methodValues,
+                                    methodMutable,
+                                    this.cursors,
+                                    this.syntax,
+                                    this.typedCalls,
+                                    this.reflectedTypes,
+                                    this.generatedDeclarations,
+                                    this.extensionRequests,
+                                    this.compileInputPaths,
+                                    this.compileInputContents,
+                                    this.allowedCompileEffects,
+                                    this.errors,
+                                    this.steps
+                                )
+                                methodValues.append(defaults.evaluate(
+                                    method.parameterDefaults[parameter]
+                                ))
+                                this.errors = defaults.errors
+                                this.steps = defaults.steps
+                            } else {
+                                methodValues.append(bootstrapEvalInvalid())
+                                this.errors = this.errors + 1
+                            }
+                            methodMutable.append(false)
+                            parameter = parameter + 1
+                        }
+                        val invocation = BootstrapEvaluator(
+                            this.declarations,
+                            this.affineTypes,
+                            methodNames,
+                            methodValues,
+                            methodMutable,
+                        this.cursors,
+                        this.syntax,
+                        this.typedCalls,
+                        this.reflectedTypes,
+                        this.generatedDeclarations,
+                        this.extensionRequests,
+                            this.compileInputPaths,
+                            this.compileInputContents,
+                            this.allowedCompileEffects,
+                            this.errors,
+                            this.steps
+                        )
+                        result = invocation.evaluate(method.expression)
+                        if (result.kind == "return" &&
+                            result.elements.size == 1) {
+                            result = result.elements[0]
+                        }
+                        invocation.dropOwnedParameters(
+                            method.parameterKinds,
+                            result,
+                            1
+                        )
+                        this.errors = invocation.errors
+                        this.steps = invocation.steps
+                    }
+                    methodIndex = methodIndex + 1
+                }
+            }
+            declarationIndex = declarationIndex + 1
+        }
+        if (result.kind == "invalid") this.errors = this.errors + 1
+        result
+    }
+
+    fun evaluate(expression: BootstrapExpression): BootstrapEvalValue {
+        this.steps = this.steps + 1
+        if (this.steps > 100000) this.errors = this.errors + 1
+        var result = bootstrapEvalInvalid()
+        if (expression.kind == "integer") {
+            var value = 0
+            var index = 0
+            while (index < expression.text.size) {
+                val byte = expression.text[index]
+                if (byte != 95) value = value * 10 + byte - 48
+                index = index + 1
+            }
+            result = bootstrapEvalInteger(value)
+        }
+        if (expression.kind == "true" || expression.kind == "false") {
+            result = bootstrapEvalBoolean(expression.kind == "true")
+        }
+        if (expression.kind == "string") {
+            result = bootstrapEvalString(expression.text)
+        }
+        if (expression.kind == "null") result = bootstrapEvalNull()
+        if (expression.kind == "lambda" ||
+            expression.kind == "lambda.move") {
+            var family = "fn"
+            if (expression.kind == "lambda.move") family = "once"
+            if (expression.kind == "lambda" &&
+                this.lambdaRequiresMutableCall(expression)) family = "mut"
+            val bound: array<string> = []
+            var parameter = 0
+            while (parameter + 1 < expression.children.size) {
+                bound.append(expression.children[parameter].text)
+                parameter = parameter + 1
+            }
+            val body = expression.children[expression.children.size - 1]
+            this.collectLambdaLocals(body, bound)
+            val free: array<string> = []
+            this.collectLambdaFreeNames(body, bound, free)
+            val captureNames: array<string> = []
+            val captureValues: array<BootstrapEvalValue> = []
+            var capture = 0
+            while (capture < free.size) {
+                val found = this.find(free[capture])
+                if (found >= 0 &&
+                    !this.nameIsBound(captureNames, free[capture])) {
+                    var value = this.values[found]
+                    captureNames.append(free[capture])
+                    if (!(expression.kind == "lambda.move" &&
+                          this.valueIsAffine(value))) {
+                        if (value.kind != "cell") {
+                            value = bootstrapEvalCell(value)
+                            this.values[found] = value
+                        }
+                    }
+                    captureValues.append(value)
+                    if (expression.kind == "lambda.move" &&
+                        this.valueIsAffine(value)) {
+                        this.values[found] = this.uninitializedValue()
+                    }
+                }
+                capture = capture + 1
+            }
+            val handle = this.syntax.size
+            this.syntax.append(expression)
+            result = bootstrapEvalClosure(
+                handle,
+                family,
+                captureValues,
+                captureNames
+            )
+        }
+        if (expression.kind == "identifier") {
+            val found = this.find(expression.text)
+            if (found >= 0) {
+                result = this.values[found]
+                if (result.kind == "cell" && result.elements.size == 1) {
+                    result = result.elements[0]
+                }
+                if (result.kind == "uninitialized") {
+                    this.errors = this.errors + 1
+                    result = bootstrapEvalInvalid()
+                }
+                this.errors = this.errors
+            }
+            else {
+                val receiverIndex = this.find("this")
+                if (receiverIndex >= 0 &&
+                    this.values[receiverIndex].kind == "object") {
+                    val receiver = this.values[receiverIndex]
+                    var field = 0
+                    while (field < receiver.fieldNames.size) {
+                        if (receiver.fieldNames[field] == expression.text) {
+                            result = receiver.elements[field]
+                        }
+                        field = field + 1
+                    }
+                }
+                var declarationIndex = 0
+                while (result.kind == "invalid" &&
+                       declarationIndex < this.declarations.size) {
+                    val declaration = this.declarations[declarationIndex]
+                    if ((declaration.kind == "val" ||
+                         declaration.kind == "var") &&
+                        declaration.name == expression.text) {
+                        result = this.evaluate(declaration.expression)
+                    }
+                    if ((declaration.kind == "fun" ||
+                         declaration.kind == "compile.fun") &&
+                        declaration.name == expression.text) {
+                        result = bootstrapEvalFunction(declaration.name)
+                    }
+                    declarationIndex = declarationIndex + 1
+                }
+                if (result.kind == "invalid") {
+                    this.errors = this.errors + 1
+                } else this.errors = this.errors
+            }
+        }
+        if (expression.kind == "call" && expression.text == "move") {
+            if (expression.children.size == 1 &&
+                expression.children[0].kind == "identifier") {
+                val found = this.find(expression.children[0].text)
+                if (found >= 0 && this.values[found].kind != "uninitialized") {
+                    result = this.values[found]
+                    this.values[found] = this.uninitializedValue()
+                    bootstrapSemanticUnit()
+                } else {
+                    this.errors = this.errors + 1
+                    bootstrapSemanticUnit()
+                }
+                bootstrapSemanticUnit()
+            } else if (expression.children.size == 1 &&
+                (expression.children[0].kind == "member" ||
+                 expression.children[0].kind == "index")) {
+                val place = expression.children[0]
+                if (place.kind == "member") {
+                    val receiver = this.evaluate(place.children[0])
+                    var field = 0
+                    while (field < receiver.fieldNames.size) {
+                        if (receiver.fieldNames[field] == place.text) {
+                            result = receiver.elements[field]
+                            receiver.elements[field] = this.uninitializedValue()
+                        }
+                        field = field + 1
+                    }
+                } else {
+                    val receiver = this.evaluate(place.children[0])
+                    val index = this.evaluate(place.children[1]).integer
+                    if (receiver.kind == "array" && index >= 0 &&
+                        index < receiver.elements.size) {
+                        result = receiver.elements[index]
+                        receiver.elements[index] = this.uninitializedValue()
+                        bootstrapSemanticUnit()
+                    } else {
+                        this.errors = this.errors + 1
+                        bootstrapSemanticUnit()
+                    }
+                }
+                if (result.kind == "uninitialized") {
+                    this.errors = this.errors + 1
+                    result = bootstrapEvalInvalid()
+                    bootstrapSemanticUnit()
+                }
+                bootstrapSemanticUnit()
+            } else {
+                this.errors = this.errors + 1
+                bootstrapSemanticUnit()
+            }
+        }
+        if (expression.kind == "call" && expression.text == "Shared") {
+            if (expression.children.size == 1) {
+                result = bootstrapEvalShared(
+                    this.evaluate(expression.children[0])
+                )
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (expression.kind == "call" && expression.text == "Mutex") {
+            if (expression.children.size == 1) {
+                result = bootstrapEvalShared(
+                    this.evaluate(expression.children[0])
+                )
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (expression.kind == "call" && expression.text == "Cell") {
+            if (expression.children.size == 1) {
+                result = bootstrapEvalCell(
+                    this.evaluate(expression.children[0])
+                )
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (expression.kind == "call" && expression.text != "move" &&
+            expression.text != "Shared" && expression.text != "Mutex" &&
+            expression.text != "Cell") {
+            result = this.evaluateCall(expression)
+        }
+        if (expression.kind == "compile") {
+            result = this.evaluate(expression.children[0])
+        }
+        if (expression.kind == "region") {
+            result = this.evaluate(expression.children[0])
+        }
+        if (expression.kind == "string.template") {
+            var text = ""
+            var part = 0
+            while (part < expression.children.size) {
+                text = "$text${this.printable(this.evaluate(
+                    expression.children[part]
+                ))}"
+                part = part + 1
+            }
+            result = bootstrapEvalString(text)
+        }
+        if (expression.kind == "block") {
+            val scopeBegin = this.names.size
+            result = BootstrapEvalValue("void", 0, false, "", [], "", [])
+            var statement = 0
+            while (statement < expression.children.size &&
+                   result.kind != "return" && result.kind != "break" &&
+                   result.kind != "continue") {
+                result = this.evaluate(expression.children[statement])
+                statement = statement + 1
+            }
+            var transferred = result
+            if (result.kind == "return" && result.elements.size == 1) {
+                transferred = result.elements[0]
+            }
+            var local = this.names.size
+            while (local > scopeBegin) {
+                local = local - 1
+                val value = this.values[local]
+                if (value.kind != "uninitialized" && value == transferred &&
+                    this.valueIsAffine(value)) {
+                    this.values[local] = this.uninitializedValue()
+                    bootstrapSemanticUnit()
+                } else if (value.kind != "uninitialized") {
+                    this.dropValue(value)
+                    this.values[local] = this.uninitializedValue()
+                    bootstrapSemanticUnit()
+                }
+                this.names[local] = ""
+            }
+        }
+        if (expression.kind == "return") {
+            var value = bootstrapEvalVoid()
+            if (expression.children.size > 0 &&
+                expression.children[0].kind != "missing") {
+                value = this.evaluate(expression.children[0])
+            }
+            result = bootstrapEvalReturn(value)
+        }
+        if (expression.kind == "break" || expression.kind == "continue") {
+            result = bootstrapEvalLoopControl(expression.kind)
+        }
+        if (expression.kind == "local.val" ||
+            expression.kind == "local.var") {
+            var value = BootstrapEvalValue(
+                "uninitialized",
+                0,
+                false,
+                "",
+                [],
+                "",
+                []
+            )
+            if (expression.children[0].kind != "missing") {
+                value = this.evaluate(expression.children[0])
+            }
+            this.names.append(expression.text)
+            this.values.append(value)
+            this.mutable.append(expression.kind == "local.var")
+            result = BootstrapEvalValue("void", 0, false, "", [], "", [])
+        }
+        if (expression.kind == "assign") {
+            val found = this.find(expression.text)
+            val value = this.evaluate(expression.children[0])
+            if (found >= 0 && this.mutable[found]) {
+                if (this.values[found].kind == "cell" &&
+                    this.values[found].elements.size == 1) {
+                    val cell = this.values[found]
+                    if (cell.elements[0].kind != "uninitialized") {
+                        this.dropValue(cell.elements[0])
+                    }
+                    cell.elements[0] = value
+                } else {
+                    if (this.values[found].kind != "uninitialized") {
+                        val previous = this.values[found]
+                        this.dropValue(previous)
+                    }
+                    this.values[found] = value
+                }
+                result = value
+            } else {
+                var fieldAssigned = false
+                val receiverIndex = this.find("this")
+                if (receiverIndex >= 0 &&
+                    this.values[receiverIndex].kind == "object") {
+                    val receiver = this.values[receiverIndex]
+                    var field = 0
+                    while (field < receiver.fieldNames.size) {
+                        if (receiver.fieldNames[field] == expression.text) {
+                            if (receiver.elements[field].kind !=
+                                "uninitialized") {
+                                this.dropValue(receiver.elements[field])
+                            }
+                            receiver.elements[field] = value
+                            fieldAssigned = true
+                        }
+                        field = field + 1
+                    }
+                }
+                if (!fieldAssigned) this.errors = this.errors + 1
+                result = value
+            }
+        }
+        if (expression.kind == "array") {
+            val elements: array<BootstrapEvalValue> = []
+            var element = 0
+            while (element < expression.children.size) {
+                elements.append(this.evaluate(expression.children[element]))
+                element = element + 1
+            }
+            result = bootstrapEvalArray(elements)
+        }
+        if (expression.kind == "range.closed" ||
+            expression.kind == "range.until") {
+            val begin = this.evaluate(expression.children[0]).integer
+            val end = this.evaluate(expression.children[1]).integer
+            val elements: array<BootstrapEvalValue> = []
+            var current = begin
+            var more = current < end
+            if (expression.kind == "range.closed") more = current <= end
+            while (more && this.steps <= 100000) {
+                elements.append(bootstrapEvalInteger(current))
+                current = current + 1
+                more = current < end
+                if (expression.kind == "range.closed") more = current <= end
+                this.steps = this.steps + 1
+            }
+            result = bootstrapEvalArray(elements)
+        }
+        if (expression.kind == "member") {
+            val rawReceiver = this.evaluate(expression.children[0])
+            val receiver = bootstrapEvalUnwrapBorrow(rawReceiver)
+            if (expression.text == "size") {
+                if (receiver.kind == "string") {
+                    result = bootstrapEvalInteger(receiver.text.size)
+                } else if (receiver.kind == "array") {
+                    result = bootstrapEvalInteger(receiver.elements.size)
+                } else {
+                    this.errors = this.errors + 1
+                    result = result
+                }
+            } else if (receiver.kind == "object") {
+                var field = 0
+                while (field < receiver.fieldNames.size) {
+                    if (receiver.fieldNames[field] == expression.text) {
+                        result = receiver.elements[field]
+                    }
+                    field = field + 1
+                }
+                result = result
+            } else result = result
+            if (rawReceiver.kind == "borrow" &&
+                bootstrapEvalValueNeedsBorrow(result)) {
+                result = bootstrapEvalBorrow(result)
+            }
+        }
+        if (expression.kind == "member.assign") {
+            val receiver = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            val value = this.evaluate(expression.children[1])
+            var assigned = false
+            var field = 0
+            while (field < receiver.fieldNames.size) {
+                if (receiver.fieldNames[field] == expression.text) {
+                    if (receiver.elements[field].kind != "uninitialized") {
+                        this.dropValue(receiver.elements[field])
+                    }
+                    receiver.elements[field] = value
+                    assigned = true
+                }
+                field = field + 1
+            }
+            if (!assigned) this.errors = this.errors + 1
+            result = value
+        }
+        if (expression.kind == "index") {
+            val rawReceiver = this.evaluate(expression.children[0])
+            val receiver = bootstrapEvalUnwrapBorrow(rawReceiver)
+            val index = this.evaluate(expression.children[1]).integer
+            if (receiver.kind == "string" && index >= 0 &&
+                index < receiver.text.size) {
+                result = bootstrapEvalInteger(receiver.text[index])
+            } else if (receiver.kind == "array" && index >= 0 &&
+                index < receiver.elements.size) {
+                result = receiver.elements[index]
+            } else {
+                this.errors = this.errors + 1
+                result = result
+            }
+            if (rawReceiver.kind == "borrow" &&
+                bootstrapEvalValueNeedsBorrow(result)) {
+                result = bootstrapEvalBorrow(result)
+            }
+        }
+        if (expression.kind == "index.assign") {
+            val receiver = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            val index = this.evaluate(expression.children[1]).integer
+            val value = this.evaluate(expression.children[2])
+            if (receiver.kind == "array" && index >= 0 &&
+                index < receiver.elements.size) {
+                if (receiver.elements[index].kind != "uninitialized") {
+                    this.dropValue(receiver.elements[index])
+                }
+                receiver.elements[index] = value
+                result = value
+            } else {
+                this.errors = this.errors + 1
+                result = value
+            }
+        }
+        if (expression.kind == "member.call") {
+            val receiver = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            if (receiver.kind == "cell" && expression.text == "get" &&
+                expression.children.size == 1) {
+                result = receiver.elements[0]
+            } else if (receiver.kind == "cell" &&
+                       expression.text == "set" &&
+                       expression.children.size == 2) {
+                receiver.elements[0] = this.evaluate(expression.children[1])
+                result = bootstrapEvalVoid()
+            } else if (receiver.kind == "shared" && expression.text == "with" &&
+                expression.children.size == 2 &&
+                expression.children[1].kind == "identifier") {
+                val temporary = "__mutex_payload_${this.steps}"
+                this.names.append(temporary)
+                this.values.append(receiver.elements[0].elements[0])
+                this.mutable.append(false)
+                result = this.evaluateCall(BootstrapExpression(
+                    "call",
+                    expression.children[1].text,
+                    expression.begin,
+                    expression.end,
+                    [BootstrapExpression(
+                        "identifier",
+                        temporary,
+                        expression.begin,
+                        expression.end,
+                        []
+                    )]
+                ))
+                this.values[this.values.size - 1] = this.uninitializedValue()
+                this.names[this.names.size - 1] = ""
+            } else if (receiver.kind == "shared" &&
+                expression.text == "clone" &&
+                expression.children.size == 1) {
+                result = bootstrapEvalSharedClone(receiver)
+            } else if (receiver.kind == "shared" &&
+                       expression.text == "get" &&
+                       expression.children.size == 1) {
+                result = bootstrapEvalSharedGet(receiver)
+            } else if (receiver.kind == "shared" &&
+                       expression.text == "downgrade" &&
+                       expression.children.size == 1) {
+                result = bootstrapEvalWeak(receiver)
+            } else if (receiver.kind == "weak" &&
+                       expression.text == "clone" &&
+                       expression.children.size == 1) {
+                result = bootstrapEvalWeakClone(receiver)
+            } else if (receiver.kind == "weak" &&
+                       expression.text == "upgrade" &&
+                       expression.children.size == 1) {
+                result = bootstrapEvalWeakUpgrade(receiver)
+            } else if (receiver.kind == "weak" &&
+                       expression.text == "isAlive" &&
+                       expression.children.size == 1) {
+                result = bootstrapEvalBoolean(
+                    receiver.elements[0].elements[1].integer > 0
+                )
+            } else if (expression.text == "append" &&
+                receiver.kind == "array" &&
+                expression.children.size == 2) {
+                receiver.elements.append(this.evaluate(expression.children[1]))
+                result = BootstrapEvalValue(
+                    "void", 0, false, "", [], "", []
+                )
+            } else if (expression.text == "slice" &&
+                receiver.kind == "string" &&
+                expression.children.size == 3) {
+                val begin = this.evaluate(expression.children[1]).integer
+                val end = this.evaluate(expression.children[2]).integer
+                result = bootstrapEvalString(receiver.text.slice(begin, end))
+            } else if (receiver.kind == "object") {
+                result = this.evaluateMethod(receiver, expression)
+            } else result = result
+        }
+        if (expression.kind == "unary-" || expression.kind == "unary+") {
+            val value = this.evaluate(expression.children[0])
+            var integer = value.integer
+            if (expression.kind == "unary-") integer = -integer
+            result = bootstrapEvalInteger(integer)
+        }
+        if (expression.kind == "unary!") {
+            val value = this.evaluate(expression.children[0])
+            result = bootstrapEvalBoolean(!value.boolean)
+        }
+        if (expression.kind == "+" || expression.kind == "-" ||
+            expression.kind == "*" || expression.kind == "/") {
+            val left = this.evaluate(expression.children[0]).integer
+            val right = this.evaluate(expression.children[1]).integer
+            var value = left + right
+            if (expression.kind == "-") value = left - right
+            if (expression.kind == "*") value = left * right
+            if (expression.kind == "/") value = left / right
+            result = bootstrapEvalInteger(value)
+        }
+        if (expression.kind == "==" || expression.kind == "!=") {
+            val left = this.evaluate(expression.children[0])
+            val right = this.evaluate(expression.children[1])
+            var equal = bootstrapEvalEqual(left, right)
+            if (expression.kind == "!=") equal = !equal
+            result = bootstrapEvalBoolean(equal)
+        }
+        if (expression.kind == "<" || expression.kind == "<=" ||
+            expression.kind == ">" || expression.kind == ">=") {
+            val left = this.evaluate(expression.children[0]).integer
+            val right = this.evaluate(expression.children[1]).integer
+            var value = left < right
+            if (expression.kind == "<=") value = left <= right
+            if (expression.kind == ">") value = left > right
+            if (expression.kind == ">=") value = left >= right
+            result = bootstrapEvalBoolean(value)
+        }
+        if (expression.kind == "&&") {
+            val left = this.evaluate(expression.children[0]).boolean
+            if (left) result = this.evaluate(expression.children[1])
+            else result = bootstrapEvalBoolean(false)
+        }
+        if (expression.kind == "||") {
+            val left = this.evaluate(expression.children[0]).boolean
+            if (left) result = bootstrapEvalBoolean(true)
+            else result = this.evaluate(expression.children[1])
+        }
+        if (expression.kind == "if") {
+            val condition = this.evaluate(expression.children[0]).boolean
+            if (condition) result = this.evaluate(expression.children[1])
+            else if (expression.children[2].kind != "missing") {
+                result = this.evaluate(expression.children[2])
+            } else result = BootstrapEvalValue(
+                "void", 0, false, "", [], "", []
+            )
+        }
+        if (expression.kind == "when") {
+            val subject = this.evaluate(expression.children[0])
+            var selected = false
+            var branch = 1
+            while (!selected && branch + 1 < expression.children.size) {
+                val match = expression.children[branch]
+                if (match.kind == "missing" || bootstrapEvalEqual(
+                    subject,
+                    this.evaluate(match)
+                )) {
+                    result = this.evaluate(expression.children[branch + 1])
+                    selected = true
+                }
+                branch = branch + 2
+            }
+            if (!selected) {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (expression.kind == "while") {
+            var looping = true
+            result = bootstrapEvalVoid()
+            while (looping &&
+                   this.evaluate(expression.children[0]).boolean &&
+                   this.steps <= 100000) {
+                result = this.evaluate(expression.children[1])
+                if (result.kind == "return") looping = false
+                if (result.kind == "break") {
+                    result = bootstrapEvalVoid()
+                    looping = false
+                }
+                if (result.kind == "continue") {
+                    result = bootstrapEvalVoid()
+                }
+            }
+        }
+        if (expression.kind == "do.while") {
+            var more = true
+            var looping = true
+            result = bootstrapEvalVoid()
+            while (more && looping && this.steps <= 100000) {
+                result = this.evaluate(expression.children[0])
+                if (result.kind == "return") looping = false
+                if (result.kind == "break") {
+                    result = bootstrapEvalVoid()
+                    looping = false
+                }
+                if (result.kind == "continue") {
+                    result = bootstrapEvalVoid()
+                }
+                if (looping) {
+                    more = this.evaluate(expression.children[1]).boolean
+                }
+            }
+        }
+        if (expression.kind == "for") {
+            val source = this.evaluate(expression.children[0])
+            val iteratorIndex = this.names.size
+            this.names.append(expression.text)
+            this.values.append(bootstrapEvalInvalid())
+            this.mutable.append(false)
+            var element = 0
+            var looping = true
+            result = bootstrapEvalVoid()
+            var count = source.elements.size
+            if (source.kind == "string") count = source.text.size
+            while (element < count && looping && this.steps <= 100000) {
+                if (source.kind == "string") {
+                    this.values[iteratorIndex] = bootstrapEvalInteger(
+                        source.text[element]
+                    )
+                } else {
+                    this.values[iteratorIndex] = source.elements[element]
+                }
+                result = this.evaluate(expression.children[1])
+                if (result.kind == "return") looping = false
+                if (result.kind == "break") {
+                    result = bootstrapEvalVoid()
+                    looping = false
+                }
+                if (result.kind == "continue") {
+                    result = bootstrapEvalVoid()
+                }
+                element = element + 1
+            }
+            this.values[iteratorIndex] = this.uninitializedValue()
+            this.names[iteratorIndex] = ""
+        }
+        result
+    }
+}
+
+fun bootstrapEvaluate(
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>
+): BootstrapEvalResult {
+    val names: array<string> = []
+    val values: array<BootstrapEvalValue> = []
+    val mutable: array<bool> = []
+    val cursors: array<BootstrapSubparserCursor> = []
+    val syntax: array<BootstrapExpression> = []
+    val generatedDeclarations: array<BootstrapDeclaration> = []
+    val extensionRequests: array<BootstrapExtensionRequest> = []
+    val compileInputPaths: array<string> = []
+    val compileInputContents: array<string> = []
+    val evaluator = BootstrapEvaluator(
+        declarations,
+        bootstrapBuildAffineTypeNames(declarations),
+        names,
+        values,
+        mutable,
+        cursors,
+        syntax,
+        [],
+        [],
+        generatedDeclarations,
+        extensionRequests,
+        compileInputPaths,
+        compileInputContents,
+        1023,
+        0,
+        0
+    )
+    val result = evaluator.evaluate(expression)
+    BootstrapEvalResult(
+        result,
+        evaluator.errors,
+        compileInputPaths,
+        compileInputContents,
+        generatedDeclarations
+    )
+}
+
+class BootstrapSubparserInvocation(
+    val expression: BootstrapExpression,
+    val errors: int,
+    val extensionRequests: array<BootstrapExtensionRequest>,
+    val compileInputPaths: array<string>,
+    val compileInputContents: array<string>
+)
+
+fun bootstrapInvokeSubparserHandler(
+    declarations: array<BootstrapDeclaration>,
+    handler: string,
+    cursor: BootstrapSubparserCursor,
+    allowedCompileEffects: int
+): BootstrapSubparserInvocation {
+    val names: array<string> = ["cursor"]
+    val values: array<BootstrapEvalValue> = [BootstrapEvalValue(
+        "cursor",
+        0,
+        false,
+        "",
+        [],
+        "",
+        []
+    )]
+    val mutable: array<bool> = [false]
+    val cursors: array<BootstrapSubparserCursor> = [cursor]
+    val syntax: array<BootstrapExpression> = []
+    val generatedDeclarations: array<BootstrapDeclaration> = []
+    val extensionRequests: array<BootstrapExtensionRequest> = []
+    val compileInputPaths: array<string> = []
+    val compileInputContents: array<string> = []
+    val evaluator = BootstrapEvaluator(
+        declarations,
+        bootstrapBuildAffineTypeNames(declarations),
+        names,
+        values,
+        mutable,
+        cursors,
+        syntax,
+        [],
+        [],
+        generatedDeclarations,
+        extensionRequests,
+        compileInputPaths,
+        compileInputContents,
+        allowedCompileEffects,
+        0,
+        0
+    )
+    val result = evaluator.evaluate(BootstrapExpression(
+        "call",
+        handler,
+        cursor.rawPosition,
+        cursor.rawPosition,
+        [BootstrapExpression(
+            "identifier",
+            "cursor",
+            cursor.rawPosition,
+            cursor.rawPosition,
+            []
+        )]
+    ))
+    var expression = BootstrapExpression(
+        "invalid",
+        "subparser-result",
+        cursor.rawPosition,
+        cursor.rawPosition,
+        []
+    )
+    if (result.kind == "syntax" && result.integer >= 0 &&
+        result.integer < syntax.size) {
+        expression = syntax[result.integer]
+    }
+    BootstrapSubparserInvocation(
+        expression,
+        evaluator.errors + cursor.errors,
+        extensionRequests,
+        compileInputPaths,
+        compileInputContents
+    )
+}
+
+fun bootstrapInvokeExtensionFinalizer(
+    declarations: array<BootstrapDeclaration>,
+    request: BootstrapExtensionRequest,
+    typedCalls: array<BootstrapTypedCall>,
+    allowedCompileEffects: int
+): BootstrapEvalResult {
+    val names: array<string> = ["payload", "expression"]
+    val values: array<BootstrapEvalValue> = [
+        bootstrapEvalString(request.payload),
+        BootstrapEvalValue("syntax", 0, false, "", [], "", [])
+    ]
+    val mutable: array<bool> = [false, false]
+    val cursors: array<BootstrapSubparserCursor> = []
+    val syntax: array<BootstrapExpression> = [request.expression]
+    val generatedDeclarations: array<BootstrapDeclaration> = []
+    val extensionRequests: array<BootstrapExtensionRequest> = []
+    val compileInputPaths: array<string> = []
+    val compileInputContents: array<string> = []
+    val evaluator = BootstrapEvaluator(
+        declarations,
+        bootstrapBuildAffineTypeNames(declarations),
+        names,
+        values,
+        mutable,
+        cursors,
+        syntax,
+        typedCalls,
+        [],
+        generatedDeclarations,
+        extensionRequests,
+        compileInputPaths,
+        compileInputContents,
+        allowedCompileEffects,
+        0,
+        0
+    )
+    val result = evaluator.evaluate(BootstrapExpression(
+        "call",
+        request.finalizer,
+        request.expression.begin,
+        request.expression.end,
+        [
+            BootstrapExpression(
+                "identifier", "payload", request.expression.begin,
+                request.expression.begin, []
+            ),
+            BootstrapExpression(
+                "identifier", "expression", request.expression.begin,
+                request.expression.end, []
+            )
+        ]
+    ))
+    BootstrapEvalResult(
+        result,
+        evaluator.errors,
+        compileInputPaths,
+        compileInputContents,
+        generatedDeclarations
+    )
+}

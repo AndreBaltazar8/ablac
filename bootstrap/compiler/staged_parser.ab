@@ -1,0 +1,413 @@
+#import("eval.ab")
+
+fun bootstrapMergeCompileInputs(
+    var paths: array<string>,
+    var contents: array<string>,
+    incomingPaths: array<string>,
+    incomingContents: array<string>
+): void {
+    var input = 0
+    while (input < incomingPaths.size) {
+        val path = incomingPaths[input]
+        var found = -1
+        var existing = 0
+        while (existing < paths.size) {
+            if (paths[existing] == path) found = existing
+            existing = existing + 1
+        }
+        if (found >= 0) {
+            contents[found] = incomingContents[input]
+        } else {
+            paths.append(path)
+            contents.append(incomingContents[input])
+        }
+        input = input + 1
+    }
+}
+
+fun bootstrapRegistrationIndex(
+    registry: BootstrapSubparserRegistry,
+    name: string,
+    position: int
+): int {
+    var result = -1
+    var index = 0
+    while (index < registry.registrations.size) {
+        val registration = registry.registrations[index]
+        if (registration.name == name &&
+            registration.availableFrom <= position) result = index
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapApplyGeneratedModules(
+    parsed: BootstrapParseResult,
+    handlerDeclarations: array<BootstrapDeclaration>,
+    extensionRequests: array<BootstrapExtensionRequest>,
+    allowedCompileEffects: int
+): BootstrapParseResult {
+    val declarations: array<BootstrapDeclaration> = []
+    val actions: array<BootstrapExpression> = []
+    val namespaces: array<string> = []
+    val compileInputPaths: array<string> = []
+    val compileInputContents: array<string> = []
+    val typedRequestBegins: array<int> = []
+    val typedRequestEnds: array<int> = []
+    val typedRequestKinds: array<string> = []
+    val typedDeclarations: array<BootstrapDeclaration> = []
+    var importedDeclarationCount =
+        handlerDeclarations.size - parsed.declarations.size
+    if (importedDeclarationCount < 0) importedDeclarationCount = 0
+    var typedDeclaration = 0
+    while (typedDeclaration < importedDeclarationCount) {
+        typedDeclarations.append(handlerDeclarations[typedDeclaration])
+        typedDeclaration = typedDeclaration + 1
+    }
+    typedDeclaration = 0
+    while (typedDeclaration < parsed.declarations.size) {
+        typedDeclarations.append(parsed.declarations[typedDeclaration])
+        typedDeclaration = typedDeclaration + 1
+    }
+    val typedActions: array<BootstrapExpression> = []
+    var typedAction = 0
+    while (typedAction < parsed.actions.size) {
+        typedActions.append(parsed.actions[typedAction])
+        typedAction = typedAction + 1
+    }
+    var typedRequest = 0
+    while (typedRequest < extensionRequests.size) {
+        val requested = extensionRequests[typedRequest].expression
+        typedRequestBegins.append(requested.begin)
+        typedRequestEnds.append(requested.end)
+        typedRequestKinds.append(requested.kind)
+        // Recursive raw providers often return a synthesized runtime tree
+        // which intentionally omits the original call. Keep the immutable
+        // request node in the semantic-only action set so target selection,
+        // bindings, conversions, and result handles remain available.
+        typedActions.append(requested)
+        typedRequest = typedRequest + 1
+    }
+    val typed = bootstrapAnalyzeRequestedSpans(
+        BootstrapParseResult(
+            typedDeclarations,
+            typedActions,
+            parsed.errors,
+            parsed.compileInputPaths,
+            parsed.compileInputContents,
+            parsed.diagnostics
+        ),
+        typedRequestBegins,
+        typedRequestEnds,
+        typedRequestKinds
+    )
+    bootstrapMergeCompileInputs(
+        compileInputPaths,
+        compileInputContents,
+        parsed.compileInputPaths,
+        parsed.compileInputContents
+    )
+    var declaration = 0
+    while (declaration < parsed.declarations.size) {
+        declarations.append(parsed.declarations[declaration])
+        declaration = declaration + 1
+    }
+    var errors = parsed.errors
+    var diagnostics = parsed.diagnostics
+    var action = 0
+    while (action < parsed.actions.size) {
+        val staged = parsed.actions[action]
+        actions.append(staged)
+        var expression = staged
+        if (staged.kind == "compile" && staged.children.size == 1) {
+            expression = staged.children[0]
+        }
+        if (expression.kind == "call" &&
+            expression.text == "compilerGenerateModule") {
+            var valid = expression.children.size == 2 &&
+                expression.children[0].kind == "string" &&
+                expression.children[1].kind == "string" &&
+                expression.children[0].text != "" &&
+                expression.children[1].text.size <= 65536 &&
+                namespaces.size < 64
+            var namespace = ""
+            if (expression.children.size > 0) {
+                namespace = expression.children[0].text
+            }
+            var namespaceIndex = 0
+            while (namespaceIndex < namespaces.size) {
+                if (namespaces[namespaceIndex] == namespace) valid = false
+                namespaceIndex = namespaceIndex + 1
+            }
+            if (!valid) errors = errors + 1
+            if (valid) {
+                namespaces.append(namespace)
+                val generated = bootstrapParse(expression.children[1].text)
+                bootstrapMergeCompileInputs(
+                    compileInputPaths,
+                    compileInputContents,
+                    generated.compileInputPaths,
+                    generated.compileInputContents
+                )
+                errors = errors + generated.errors
+                var generatedDeclaration = 0
+                while (generatedDeclaration < generated.declarations.size) {
+                    declarations.append(
+                        generated.declarations[generatedDeclaration]
+                    )
+                    generatedDeclaration = generatedDeclaration + 1
+                }
+                var generatedAction = 0
+                while (generatedAction < generated.actions.size) {
+                    actions.append(generated.actions[generatedAction])
+                    generatedAction = generatedAction + 1
+                }
+            }
+        }
+        action = action + 1
+    }
+    var request = 0
+    while (request < extensionRequests.size && namespaces.size < 64) {
+        val extensionRequest = extensionRequests[request]
+        val finalized = bootstrapInvokeExtensionFinalizer(
+            handlerDeclarations,
+            extensionRequest,
+            typed.typedCalls,
+            allowedCompileEffects
+        )
+        bootstrapMergeCompileInputs(
+            compileInputPaths,
+            compileInputContents,
+            finalized.compileInputPaths,
+            finalized.compileInputContents
+        )
+        errors = errors + finalized.errors
+        if (finalized.errors > 0) diagnostics =
+            "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:finalizer evaluation failed\n"}"
+        var namespaceAvailable = extensionRequest.namespace != ""
+        var existingNamespace = 0
+        while (existingNamespace < namespaces.size) {
+            if (namespaces[existingNamespace] == extensionRequest.namespace) {
+                namespaceAvailable = false
+            }
+            existingNamespace = existingNamespace + 1
+        }
+        if (!namespaceAvailable) {
+            errors = errors + 1
+            diagnostics =
+                "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:namespace is not unique in this module\n"}"
+        }
+        if (namespaceAvailable && finalized.errors == 0 &&
+            extensionRequest.directAst &&
+            finalized.value.kind == "generated.module" &&
+            finalized.value.text == extensionRequest.namespace) {
+            val generatedIndexes: array<int> = []
+            var validGenerated = true
+            var element = 0
+            while (element < finalized.value.elements.size) {
+                val generated = finalized.value.elements[element]
+                if (generated.kind == "generated.declaration") {
+                    if (generated.integer < 0 ||
+                        generated.integer >=
+                            finalized.generatedDeclarations.size) {
+                        validGenerated = false
+                    } else {
+                        val declaration = finalized.generatedDeclarations[
+                            generated.integer
+                        ]
+                        if (declaration.generatedNamespace !=
+                            extensionRequest.namespace) {
+                            validGenerated = false
+                        } else generatedIndexes.append(generated.integer)
+                    }
+                } else if (generated.kind != "generated.origin") {
+                    validGenerated = false
+                }
+                element = element + 1
+            }
+            if (generatedIndexes.size > 256) validGenerated = false
+            if (validGenerated) {
+                namespaces.append(extensionRequest.namespace)
+                var generatedIndex = 0
+                while (generatedIndex < generatedIndexes.size) {
+                    declarations.append(finalized.generatedDeclarations[
+                        generatedIndexes[generatedIndex]
+                    ])
+                    generatedIndex = generatedIndex + 1
+                }
+            } else {
+                errors = errors + 1
+                diagnostics =
+                    "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:generated module violates the request provenance invariant\n"}"
+            }
+        } else if (namespaceAvailable && finalized.errors == 0 &&
+            !extensionRequest.directAst &&
+            finalized.value.kind == "string" &&
+            finalized.value.text.size <= 65536) {
+            namespaces.append(extensionRequest.namespace)
+            val generated = bootstrapParse(finalized.value.text)
+            bootstrapMergeCompileInputs(
+                compileInputPaths,
+                compileInputContents,
+                generated.compileInputPaths,
+                generated.compileInputContents
+            )
+            errors = errors + generated.errors
+            if (generated.errors > 0) diagnostics =
+                "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:generated compatibility module failed to parse\n"}"
+            var generatedDeclaration = 0
+            while (generatedDeclaration < generated.declarations.size) {
+                declarations.append(
+                    generated.declarations[generatedDeclaration]
+                )
+                generatedDeclaration = generatedDeclaration + 1
+            }
+            var generatedAction = 0
+            while (generatedAction < generated.actions.size) {
+                actions.append(generated.actions[generatedAction])
+                generatedAction = generatedAction + 1
+            }
+        } else if (namespaceAvailable && finalized.errors == 0) {
+            errors = errors + 1
+            diagnostics =
+                "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:finalizer returned the wrong result kind or namespace\n"}"
+        }
+        request = request + 1
+    }
+    if (request < extensionRequests.size) {
+        errors = errors + 1
+        val extensionRequest = extensionRequests[request]
+        diagnostics =
+            "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:generated module namespace limit exceeded\n"}"
+    }
+    BootstrapParseResult(
+        declarations,
+        actions,
+        errors,
+        compileInputPaths,
+        compileInputContents,
+        diagnostics
+    )
+}
+
+fun bootstrapParseStagedRegistered(
+    source: string,
+    sourceIdentity: string,
+    handlerDeclarations: array<BootstrapDeclaration>,
+    registry: BootstrapSubparserRegistry,
+    allowedCompileEffects: int
+): BootstrapParseResult {
+    val tokens = bootstrapLex(source)
+    val expansionBegins: array<int> = []
+    val expansionEnds: array<int> = []
+    val expansionExpressions: array<BootstrapExpression> = []
+    val extensionRequests: array<BootstrapExtensionRequest> = []
+    val compileInputPaths: array<string> = []
+    val compileInputContents: array<string> = []
+    var diagnostics = ""
+
+    var tokenIndex = tokens.size - 2
+    while (tokenIndex >= 0) {
+        if (tokens[tokenIndex].kind == "$" &&
+            tokenIndex + 1 < tokens.size &&
+            tokens[tokenIndex + 1].kind == "identifier") {
+            val name = bootstrapTokenText(source, tokens[tokenIndex + 1])
+            val registrationIndex = bootstrapRegistrationIndex(
+                registry,
+                name,
+                tokens[tokenIndex].begin
+            )
+            if (registrationIndex >= 0) {
+                val position = tokenIndex + 2
+                var rawPosition = source.size
+                if (position < tokens.size) {
+                    rawPosition = tokens[position].begin
+                }
+                val cursor = BootstrapSubparserCursor(
+                    sourceIdentity,
+                    source,
+                    tokens,
+                    expansionBegins,
+                    expansionEnds,
+                    expansionExpressions,
+                    position,
+                    rawPosition,
+                    0
+                )
+                val invocation = bootstrapInvokeSubparserHandler(
+                    handlerDeclarations,
+                    registry.registrations[registrationIndex].handler,
+                    cursor,
+                    allowedCompileEffects
+                )
+                if (invocation.errors == 0 &&
+                    invocation.expression.kind != "invalid" &&
+                    cursor.rawPosition > rawPosition) {
+                    expansionBegins.append(tokens[tokenIndex].begin)
+                    expansionEnds.append(cursor.rawPosition)
+                    expansionExpressions.append(invocation.expression)
+                }
+                var request = 0
+                while (request < invocation.extensionRequests.size) {
+                    val extensionRequest =
+                        invocation.extensionRequests[request]
+                    if (extensionRequest.diagnostic == "") {
+                        extensionRequests.append(extensionRequest)
+                    } else diagnostics =
+                        "$diagnostics${extensionRequest.diagnostic}"
+                    request = request + 1
+                }
+                bootstrapMergeCompileInputs(
+                    compileInputPaths,
+                    compileInputContents,
+                    invocation.compileInputPaths,
+                    invocation.compileInputContents
+                )
+            }
+        }
+        tokenIndex = tokenIndex - 1
+    }
+
+    val parsed = BootstrapParser(
+        source,
+        tokens,
+        expansionBegins,
+        expansionEnds,
+        expansionExpressions,
+        0,
+        0
+    ).parse()
+    bootstrapApplyGeneratedModules(
+        BootstrapParseResult(
+            parsed.declarations,
+            parsed.actions,
+            parsed.errors,
+            compileInputPaths,
+            compileInputContents,
+            diagnostics
+        ),
+        handlerDeclarations,
+        extensionRequests,
+        allowedCompileEffects
+    )
+}
+
+fun bootstrapParseStaged(source: string): BootstrapParseResult {
+    val discovery = bootstrapParse(source)
+    val registry = bootstrapBuildSubparserRegistry(discovery)
+    val parsed = bootstrapParseStagedRegistered(
+        source,
+        "<memory>",
+        discovery.declarations,
+        registry,
+        0
+    )
+    BootstrapParseResult(
+        parsed.declarations,
+        parsed.actions,
+        parsed.errors + registry.errors,
+        parsed.compileInputPaths,
+        parsed.compileInputContents,
+        parsed.diagnostics
+    )
+}

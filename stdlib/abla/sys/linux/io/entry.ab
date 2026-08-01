@@ -1,0 +1,127 @@
+// Linux x86-64 terminal and descriptor I/O implemented with raw syscalls.
+// This is the no-project-C counterpart to portable `abla/io`.
+
+#import("abla/sys/linux")
+
+class LinuxInputLine(
+    val text: string,
+    val available: bool
+)
+
+class LinuxInput(
+    val descriptor: int,
+    var pending: string,
+    var ended: bool
+)
+
+fun linuxStandardInput(): LinuxInput = LinuxInput(0, "", false)
+
+fun linuxFindLineBreak(text: string): int {
+    var result = -1
+    var index = 0
+    while (result < 0 && index < text.size) {
+        if (text[index] == 10) result = index
+        index = index + 1
+    }
+    result
+}
+
+fun linuxStoreU16(
+    var buffer: NativeByteBuffer,
+    offset: int,
+    value: int
+): bool = buffer.store(offset, value) &&
+    buffer.store(offset + 1, value / 256)
+
+fun linuxStoreU32(
+    var buffer: NativeByteBuffer,
+    offset: int,
+    value: int
+): bool = linuxStoreU16(buffer, offset, value) &&
+    linuxStoreU16(buffer, offset + 2, value / 65536)
+
+// Uses poll(2). Pending user-space input is ready without entering the kernel.
+fun LinuxInput.ready(timeoutMilliseconds: int = 0): bool {
+    var result = this.pending.size > 0
+    if (!result && !this.ended) {
+        val descriptor = nativeByteBuffer(8)
+        linuxStoreU32(descriptor, 0, this.descriptor)
+        linuxStoreU16(descriptor, 4, 1)
+        linuxStoreU16(descriptor, 6, 0)
+        result = linuxSyscall3(
+            7,
+            nativePointerAddress(descriptor.address),
+            1,
+            timeoutMilliseconds
+        ) > 0
+        descriptor.close()
+    }
+    result
+}
+
+// Reads through the next line terminator while retaining any following bytes.
+// The returned availability flag distinguishes EOF from an empty input line.
+fun LinuxInput.readLine(): LinuxInputLine {
+    var lineBreak = linuxFindLineBreak(this.pending)
+    while (lineBreak < 0 && !this.ended) {
+        val chunk = LinuxFileDescriptor(this.descriptor).read(4096)
+        if (chunk.size == 0) this.ended = true
+        if (chunk.size > 0) this.pending = "${this.pending}$chunk"
+        lineBreak = linuxFindLineBreak(this.pending)
+    }
+
+    var text = ""
+    var available = false
+    if (lineBreak >= 0) {
+        var end = lineBreak
+        if (end > 0 && this.pending[end - 1] == 13) end = end - 1
+        text = this.pending.slice(0, end)
+        this.pending = this.pending.slice(
+            lineBreak + 1,
+            this.pending.size
+        )
+        available = true
+    }
+    if (lineBreak < 0 && this.ended && this.pending.size > 0) {
+        text = this.pending
+        this.pending = ""
+        available = true
+    }
+    LinuxInputLine(text, available)
+}
+
+fun linuxWriteAllTo(descriptor: int, text: string): bool {
+    val address = nativeCStringAddress(text)
+    var written = 0
+    var success = true
+    while (success && written < text.size) {
+        val amount = linuxSyscall3(
+            1,
+            descriptor,
+            address + written,
+            text.size - written
+        )
+        if (amount > 0) written = written + amount
+        if (amount == -4) success = true
+        if (amount <= 0 && amount != -4) success = false
+    }
+    success
+}
+
+fun linuxWriteStandardOutputAll(text: string): bool =
+    linuxWriteAllTo(1, text)
+
+fun linuxWriteStandardErrorAll(text: string): bool =
+    linuxWriteAllTo(2, text)
+
+fun linuxIoUnit(): void {}
+
+fun linuxPrintStandardOutput(text: string): void {
+    linuxWriteStandardOutputAll(text)
+    linuxIoUnit()
+}
+
+fun linuxPrintStandardError(text: string): void {
+    linuxWriteStandardErrorAll(text)
+    linuxIoUnit()
+}

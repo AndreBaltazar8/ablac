@@ -1,0 +1,332 @@
+// Linux process entry information without the project C host adapter.
+// Process creation/control will grow on this same explicit raw profile.
+
+#import("abla/sys/linux")
+
+noescape extern:"intrinsic" fun ablaLinuxArgumentCount(): int
+
+noescape extern:"intrinsic" fun ablaLinuxArgument(index: int): string
+
+noescape extern:"intrinsic" fun ablaLinuxEnvironmentPointer(): i64*
+
+class LinuxEnvironmentValue(val value: string, val found: bool)
+
+class LinuxProcessResult(val status: int, val output: string)
+
+class LinuxCommand(val arguments: array<string>)
+
+class LinuxChildProcess(val process: int)
+
+fun linuxArgumentCount(): int = ablaLinuxArgumentCount()
+
+fun linuxArgument(index: int): string = ablaLinuxArgument(index)
+
+fun linuxEnvironmentPointer(): i64* = ablaLinuxEnvironmentPointer()
+
+trusted fun linuxEnvironment(name: string): LinuxEnvironmentValue {
+    var cursor = linuxEnvironmentPointer()
+    var found = false
+    var result = ""
+    var current = nativeNullPointer()
+    if (!pointerIsNull(cursor)) {
+        current = NativePointerCell(cursor, false, false).load()
+    }
+    while (!pointerIsNull(current) && !found) {
+        val entry = borrowNativeCString(current)
+        if (entry.size > name.size && entry[name.size] == 61 &&
+            entry.slice(0, name.size) == name) {
+            result = entry.slice(name.size + 1, entry.size)
+            found = true
+        }
+        cursor = ablaUnsafePointerOffset(cursor, 8)
+        current = NativePointerCell(cursor, false, false).load()
+    }
+    LinuxEnvironmentValue(result, found)
+}
+
+fun linuxExecutablePath(executable: string): string {
+    var hasSlash = false
+    var index = 0
+    while (index < executable.size) {
+        if (executable[index] == 47) hasSlash = true
+        index = index + 1
+    }
+    var result = executable
+    if (!hasSlash) {
+        val configured = linuxEnvironment("PATH")
+        var search = "/usr/local/bin:/usr/bin:/bin"
+        if (configured.found) search = configured.value
+        var begin = 0
+        var searching = true
+        while (searching && begin <= search.size) {
+            var end = begin
+            while (end < search.size && search[end] != 58) end = end + 1
+            val directory = search.slice(begin, end)
+            var candidate = executable
+            if (directory != "") candidate = "$directory/$executable"
+            if (linuxSyscall2(
+                21,
+                nativeCStringAddress(candidate),
+                1
+            ) == 0) {
+                result = candidate
+                searching = false
+            }
+            if (end == search.size) searching = false
+            begin = end + 1
+        }
+    }
+    result
+}
+
+fun linuxArgumentVector(arguments: array<string>): NativeByteBuffer {
+    val vector = nativeByteBuffer((arguments.size + 1) * 8)
+    var index = 0
+    while (index < arguments.size) {
+        val address = nativePointerFromAddress(
+            nativeCStringAddress(arguments[index])
+        )
+        vector.storePointer(index * 8, address)
+        index = index + 1
+    }
+    vector.storePointer(arguments.size * 8, nativeNullPointer())
+    vector
+}
+
+fun linuxDecodeWaitStatus(encoded: int): int {
+    val signal = encoded - encoded / 128 * 128
+    var result = 128 + signal
+    if (signal == 0) result = encoded / 256 - encoded / 65536 * 256
+    result
+}
+
+fun linuxWaitProcess(process: int, noHang: bool = false): LinuxProcessResult {
+    val statusBuffer = nativeByteBuffer(8)
+    statusBuffer.storeI64(0, 0)
+    val options = if (noHang) 1 else 0
+    val waited = linuxSyscall4(
+        61,
+        process,
+        nativePointerAddress(statusBuffer.address),
+        options,
+        0
+    )
+    var status = -1
+    if (waited == process) {
+        status = linuxDecodeWaitStatus(statusBuffer.loadI64(0))
+    }
+    statusBuffer.close()
+    var state = ""
+    if (waited == 0) state = "pending"
+    LinuxProcessResult(status, state)
+}
+
+fun linuxExecPrepared(
+    executable: string,
+    vector: NativeByteBuffer
+): int {
+    linuxSyscall3(
+        59,
+        nativeCStringAddress(executable),
+        nativePointerAddress(vector.address),
+        nativePointerAddress(linuxEnvironmentPointer())
+    )
+    linuxSyscall1(60, 127)
+}
+
+fun linuxCommand(executable: string): LinuxCommand =
+    LinuxCommand([executable])
+
+fun LinuxCommand.argument(value: string): LinuxCommand {
+    this.arguments.append(value)
+    this
+}
+
+fun LinuxCommand.run(): int {
+    var result = 127
+    if (this.arguments.size > 0) {
+        val executable = linuxExecutablePath(this.arguments[0])
+        val vector = linuxArgumentVector(this.arguments)
+        val process = linuxSyscall0(57)
+        if (process == 0) result = linuxExecPrepared(executable, vector)
+        if (process > 0) result = linuxWaitProcess(process).status
+        vector.close()
+    }
+    result
+}
+
+fun LinuxCommand.capture(): LinuxProcessResult {
+    var result = LinuxProcessResult(127, "")
+    if (this.arguments.size > 0) {
+        val executable = linuxExecutablePath(this.arguments[0])
+        val vector = linuxArgumentVector(this.arguments)
+        val descriptors = nativeByteBuffer(8)
+        descriptors.storeI64(0, 0)
+        val pipeStatus = linuxSyscall2(
+            293,
+            nativePointerAddress(descriptors.address),
+            524288
+        )
+        if (pipeStatus == 0) {
+            val readDescriptor = descriptors.load(0) +
+                descriptors.load(1) * 256 +
+                descriptors.load(2) * 65536 +
+                descriptors.load(3) * 16777216
+            val writeDescriptor = descriptors.load(4) +
+                descriptors.load(5) * 256 +
+                descriptors.load(6) * 65536 +
+                descriptors.load(7) * 16777216
+            val process = linuxSyscall0(57)
+            if (process == 0) {
+                linuxSyscall1(3, readDescriptor)
+                linuxSyscall2(33, writeDescriptor, 1)
+                linuxSyscall1(3, writeDescriptor)
+                linuxExecPrepared(executable, vector)
+            }
+            if (process > 0) {
+                linuxSyscall1(3, writeDescriptor)
+                var output = ""
+                var reading = true
+                while (reading) {
+                    val chunk = LinuxFileDescriptor(readDescriptor).read(65536)
+                    if (chunk.size > 0) output = "$output$chunk"
+                    if (chunk.size == 0) reading = false
+                }
+                linuxSyscall1(3, readDescriptor)
+                result = LinuxProcessResult(
+                    linuxWaitProcess(process).status,
+                    output
+                )
+            }
+        }
+        descriptors.close()
+        vector.close()
+    }
+    result
+}
+
+fun LinuxCommand.captureText(): string = this.capture().output
+
+fun LinuxCommand.start(): LinuxChildProcess {
+    var process = -1
+    if (this.arguments.size > 0) {
+        val executable = linuxExecutablePath(this.arguments[0])
+        val vector = linuxArgumentVector(this.arguments)
+        process = linuxSyscall0(57)
+        if (process == 0) linuxExecPrepared(executable, vector)
+        vector.close()
+    }
+    LinuxChildProcess(process)
+}
+
+fun LinuxChildProcess.stop(graceMilliseconds: int = 5000): int {
+    var result = -1
+    if (this.process > 0) {
+        linuxSyscall2(62, this.process, 15)
+        var remaining = graceMilliseconds
+        var waiting = true
+        while (waiting && remaining > 0) {
+            val observed = linuxWaitProcess(this.process, true)
+            if (observed.output != "pending") {
+                result = observed.status
+                waiting = false
+            }
+            if (waiting) {
+                var slice = 10
+                if (remaining < slice) slice = remaining
+                linuxSleepMillisecondsChecked(slice)
+                remaining = remaining - slice
+            }
+        }
+        if (waiting) {
+            linuxSyscall2(62, this.process, 9)
+            result = linuxWaitProcess(this.process).status
+        }
+    }
+    result
+}
+
+fun linuxSleepMillisecondsChecked(milliseconds: int): bool {
+    var success = milliseconds >= 0
+    if (success) {
+        val requested = nativeByteBuffer(16)
+        val remaining = nativeByteBuffer(16)
+        requested.storeI64(0, milliseconds / 1000)
+        requested.storeI64(
+            8,
+            (milliseconds - milliseconds / 1000 * 1000) * 1000000
+        )
+        var waiting = true
+        while (waiting) {
+            val status = linuxSyscall2(
+                35,
+                nativePointerAddress(requested.address),
+                nativePointerAddress(remaining.address)
+            )
+            if (status == 0) waiting = false
+            if (status == -4) {
+                requested.storeI64(0, remaining.loadI64(0))
+                requested.storeI64(8, remaining.loadI64(8))
+            }
+            if (status != 0 && status != -4) {
+                success = false
+                waiting = false
+            }
+        }
+        requested.close()
+        remaining.close()
+    }
+    success
+}
+
+fun linuxProcessUnit(): void {}
+
+fun linuxSleep(milliseconds: int): void {
+    linuxSleepMillisecondsChecked(milliseconds)
+    linuxProcessUnit()
+}
+
+// Ambient providers used by the compiler stay on the same libc-free syscall
+// layer as ordinary Abla programs. These helpers expose values, while compile
+// capability policy remains the compiler evaluator's responsibility.
+fun linuxMonotonicMilliseconds(): int {
+    val timestamp = nativeByteBuffer(16)
+    timestamp.storeI64(0, 0)
+    timestamp.storeI64(8, 0)
+    val status = linuxSyscall2(
+        228,
+        1,
+        nativePointerAddress(timestamp.address)
+    )
+    var result = 0
+    if (status == 0) {
+        result = timestamp.loadI64(0) * 1000 +
+            timestamp.loadI64(8) / 1000000
+    }
+    timestamp.close()
+    result
+}
+
+fun linuxRandomInteger(maxExclusive: int): int {
+    var result = 0
+    if (maxExclusive > 0) {
+        val bytes = nativeByteBuffer(8)
+        val status = linuxSyscall3(
+            318,
+            nativePointerAddress(bytes.address),
+            8,
+            0
+        )
+        if (status == 8) {
+            // Seven bytes keep the accumulator positive on a signed i64.
+            var index = 0
+            while (index < 7) {
+                result = result * 256 + bytes.load(index)
+                index = index + 1
+            }
+            result = result - result / maxExclusive * maxExclusive
+        }
+        bytes.close()
+    }
+    result
+}

@@ -1,0 +1,99 @@
+# Compiler API
+
+Status: bootstrap API, version 0.1. The module is imported with
+`#import("abla/compiler")` and is available only to compile-time code.
+
+## Function reflection
+
+The initial API is read-only:
+
+```abla
+compile extern:"compiler" fun compilerFunctions(): array<int>
+compile extern:"compiler" fun compilerFindFunction(name: string): int
+compile extern:"compiler" fun compilerFunctionName(handle: int): string
+compile extern:"compiler" fun compilerFunctionParameterCount(handle: int): int
+compile extern:"compiler" fun compilerFunctionParameterType(handle: int, parameter: int): string
+compile extern:"compiler" fun compilerFunctionResultType(handle: int): string
+compile extern:"compiler" fun compilerFunctionIsCompileOnly(handle: int): bool
+compile extern:"compiler" fun compilerFunctionIsTrusted(handle: int): bool
+compile extern:"compiler" fun compilerFunctionIsExternal(handle: int): bool
+```
+
+A handle is an opaque integer that is stable for the duration of one
+compilation. `compilerFindFunction` returns `-1` when no declaration matches;
+passing that value to an accessor is a compile-time diagnostic. Overload-aware
+lookup will use signature queries rather than changing this function's meaning.
+
+Compiler API declarations are excluded from enumeration. The returned function
+order follows deterministic semantic declaration order. Type names use the
+canonical compiler spelling (`int` currently reports as `i64`).
+
+The VM reads owned IR metadata for handles and never exposes AST, semantic, C++,
+or backend pointers. Future mutation APIs will operate on explicit edit
+transactions, re-run resolution/type checking, and commit only after validation.
+
+Function handles now cover top-level, extension, and inherent methods. They
+expose canonical owner/name identity, source parameter names, normalized
+parameter/result types, phase/trust/native flags, and class-field metadata.
+Typed syntax inspection resolves direct and receiver-bearing calls, including
+receiver/argument types from enclosing function parameters and preceding local
+declarations. `syntaxCallTarget` and `syntaxMethodCallTarget` retain the selected
+handle as compiler-owned provenance, so an extension does not reconstruct its
+call target by name; using an inherent method without its receiver is rejected
+before syntax publication. Structured type handles intern canonical nullable,
+array, sharing/borrow, pointer, function, nominal, and affine/resource types;
+they expose elements, function parameters/results, and nominal declarations
+without semantic pointers. Selected calls additionally expose result/parameter
+type handles, argument-to-parameter mapping, inserted-default count,
+parameter ownership, inserted conversion descriptions, and phase/trust flags.
+Only deferred request expressions retain these compact post-resolution records;
+raw parser handlers cannot query typed state. The stable generic-substitution
+surface returns zero until generic declarations land.
+
+## Effects and generated modules
+
+`compilerGrant(capability)` requests a staged ambient effect. The entry
+module's sibling `abla.toml` must also list it in `compileCapabilities`; source
+cannot forge the compiler's internal authorization marker. The request is
+source- and manifest-fingerprinted. Read-only filesystem staging journals each
+observed path and a dual content identity, which is revalidated before object
+cache reuse. `compilerEnvironment(name)` similarly reads one named environment
+input after an `environment` grant; cache sidecars retain only its size and
+content fingerprints. Subparser and finalizer transactions merge their
+journals into the lowered program, and persistent frontend snapshots
+revalidate them before reusing a staged parse. Because parser staging precedes
+full semantic analysis, the source request and manifest authorization are
+intersected before invoking a handler/finalizer; denial cannot perform the
+effect. Other ambient grants remain uncached.
+
+`compilerClockMilliseconds()`, `compilerRandomInteger(maxExclusive)`, and
+`compilerRunProcess(arguments)` are bounded ambient providers for tooling that
+deliberately opts out of hermetic caching. They require `clock`, `random`, and
+`process.io` respectively; process argument count and size are evaluator
+bounded, while the compiler watchdog bounds time and memory.
+
+`compilerGenerateModule(namespace, source)` submits a bounded deterministic
+virtual module. Generated declarations are parsed and validated together with
+the complete candidate; failure publishes nothing. Subparsers can instead call
+`compilerRecordExtensionRequest(namespace, payload, expression, finalizer)`.
+The Abla finalizer receives the immutable syntax handle and returns the virtual
+module source. It may construct that result through an owned
+`GeneratedModuleBuilder`: function/value builders consume compiler-owned syntax
+and structured type handles, assign deterministic collision-checked internal
+identities, and require an explicit checked operation for a source-visible
+export. Rendering remains a compatibility path. Direct finalizers publish the
+owned AST through the same resolve/type-check transaction, so failure publishes
+nothing. References to builder-owned declarations carry an opaque compiler-only
+hygiene marker that parsed source and ordinary syntax builders cannot forge.
+
+Direct deferred calls additionally expose `typedExpressionType`,
+`typedCallTarget`, and `typedCallArgumentType`. The target is the same stable
+declaration handle used by function reflection; ambiguous/non-call targets are
+diagnostics. This first typed-expression rung covers direct named calls and
+literal, lexical-local, and receiver-bearing arguments. Inserted conversions
+and complete post-resolution node maps remain.
+
+`parserSourceIdentity(cursor)` returns the canonical identity of the module
+owned by the active parser cursor. Providers should include it with the source
+span when constructing request namespaces, because byte offsets are local to a
+module and can be identical in separate imports.

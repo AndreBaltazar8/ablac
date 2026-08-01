@@ -1,0 +1,620 @@
+// A small HTTP/1.1 stack and version-aware router written in Abla. Importing
+// this module does not pull in JSON, files, TLS, the compiler, or hot reload.
+
+#import("abla/net")
+
+class HttpHeader(val name: string, val value: string)
+
+class HttpRequest(
+    val method: string,
+    val path: string,
+    val query: string,
+    val headers: array<HttpHeader>,
+    val body: string,
+    val parameterNames: array<string>,
+    val parameterValues: array<string>
+)
+
+class HttpResponse(
+    val status: int,
+    val headers: array<HttpHeader>,
+    val body: string
+)
+
+// HTTP remains independent of TLS policy. A transport receives already-framed
+// request bytes and returns bounded response bytes; TLS modules can implement
+// the same callback without changing request, response, or client code.
+class HttpTransportResult(
+    val bytes: string,
+    val succeeded: bool
+)
+
+class HttpClientResult(
+    val response: HttpResponse,
+    val succeeded: bool,
+    val complete: bool
+)
+
+class HttpClient(
+    val authority: string,
+    val exchange: (string, int, int) -> HttpTransportResult,
+    val maximumResponseBytes: int,
+    val timeoutMilliseconds: int
+)
+
+class HttpPathMatch(
+    val matched: bool,
+    val names: array<string>,
+    val values: array<string>
+)
+
+class HttpRoute(
+    val method: string,
+    val pattern: string,
+    val version: string,
+    val handler: (HttpRequest) -> HttpResponse
+)
+
+class HttpRouter(
+    val versionHeader: string,
+    val routes: array<HttpRoute>
+)
+
+class HttpVersionedRouter(
+    val router: HttpRouter,
+    val version: string
+)
+
+fun httpRouter(versionHeader: string = "Abla-Version"): HttpRouter =
+    HttpRouter(versionHeader, [])
+
+fun httpAsciiEqualInsensitive(left: string, right: string): bool {
+    var equal = left.size == right.size
+    var index = 0
+    while (index < left.size && equal) {
+        var leftByte = left[index]
+        var rightByte = right[index]
+        if (leftByte >= 65 && leftByte <= 90) leftByte = leftByte + 32
+        if (rightByte >= 65 && rightByte <= 90) rightByte = rightByte + 32
+        if (leftByte != rightByte) equal = false
+        index = index + 1
+    }
+    equal
+}
+
+fun HttpRequest.header(name: string): string {
+    var result = ""
+    var index = 0
+    while (index < this.headers.size) {
+        if (httpAsciiEqualInsensitive(this.headers[index].name, name)) {
+            result = this.headers[index].value
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun HttpRequest.parameter(name: string): string {
+    var result = ""
+    var index = 0
+    while (index < this.parameterNames.size) {
+        if (this.parameterNames[index] == name) {
+            result = this.parameterValues[index]
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun httpRequest(
+    method: string,
+    path: string,
+    body: string = "",
+    headers: array<HttpHeader> = []
+): HttpRequest = HttpRequest(method, path, "", headers, body, [], [])
+
+fun httpGet(path: string, headers: array<HttpHeader> = []): HttpRequest =
+    httpRequest("GET", path, "", headers)
+
+fun httpPost(
+    path: string,
+    body: string,
+    headers: array<HttpHeader> = []
+): HttpRequest = httpRequest("POST", path, body, headers)
+
+fun httpText(body: string, status: int = 200): HttpResponse = HttpResponse(
+    status,
+    [HttpHeader("Content-Type", "text/plain; charset=utf-8")],
+    body
+)
+
+fun httpJson(body: string, status: int = 200): HttpResponse = HttpResponse(
+    status,
+    [HttpHeader("Content-Type", "application/json")],
+    body
+)
+
+fun httpStatusReason(status: int): string {
+    var reason = "OK"
+    if (status == 201) reason = "Created"
+    if (status == 204) reason = "No Content"
+    if (status == 302) reason = "Found"
+    if (status == 303) reason = "See Other"
+    if (status == 400) reason = "Bad Request"
+    if (status == 401) reason = "Unauthorized"
+    if (status == 403) reason = "Forbidden"
+    if (status == 404) reason = "Not Found"
+    if (status == 405) reason = "Method Not Allowed"
+    if (status == 500) reason = "Internal Server Error"
+    reason
+}
+
+fun HttpResponse.render(): string {
+    var output = "HTTP/1.1 ${this.status} ${httpStatusReason(this.status)}\r\n"
+    var index = 0
+    while (index < this.headers.size) {
+        output = "$output${this.headers[index].name}: ${this.headers[index].value}\r\n"
+        index = index + 1
+    }
+    "${output}Content-Length: ${this.body.size}\r\nConnection: close\r\n\r\n${this.body}"
+}
+
+fun HttpRequest.renderForClient(authority: string): string {
+    var target = this.path
+    if (this.query != "") target = "$target?${this.query}"
+    var output = "${this.method} $target HTTP/1.1\r\n"
+    var hasHost = false
+    var hasLength = false
+    var hasConnection = false
+    var index = 0
+    while (index < this.headers.size) {
+        val header = this.headers[index]
+        if (httpAsciiEqualInsensitive(header.name, "Host")) hasHost = true
+        if (httpAsciiEqualInsensitive(header.name, "Content-Length")) {
+            hasLength = true
+        }
+        if (httpAsciiEqualInsensitive(header.name, "Connection")) {
+            hasConnection = true
+        }
+        output = "$output${header.name}: ${header.value}\r\n"
+        index = index + 1
+    }
+    if (!hasHost) output = "${output}Host: $authority\r\n"
+    if (!hasLength) {
+        output = "${output}Content-Length: ${this.body.size}\r\n"
+    }
+    if (!hasConnection) output = "${output}Connection: close\r\n"
+    "$output\r\n${this.body}"
+}
+
+fun httpLineEnd(input: string, begin: int): int {
+    var result = input.size
+    var index = begin
+    var found = false
+    while (index + 1 < input.size && !found) {
+        if (input[index] == 13 && input[index + 1] == 10) {
+            result = index
+            found = true
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun httpFindByte(input: string, byte: int, begin: int, end: int): int {
+    var result = -1
+    var index = begin
+    while (index < end && result < 0) {
+        if (input[index] == byte) result = index
+        index = index + 1
+    }
+    result
+}
+
+fun httpHeaderEnd(input: string): int {
+    var result = -1
+    var index = 0
+    while (index + 3 < input.size && result < 0) {
+        if (input[index] == 13 && input[index + 1] == 10 &&
+            input[index + 2] == 13 && input[index + 3] == 10) {
+            result = index + 4
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun httpDecimalLength(value: string, maximum: int): int {
+    var result = 0
+    var valid = value.size > 0
+    var index = 0
+    while (index < value.size && valid) {
+        val byte = value[index]
+        val digitValid = byte >= 48 && byte <= 57
+        if (!digitValid) valid = false
+        if (digitValid) {
+            result = result * 10 + byte - 48
+            if (result > maximum) valid = false
+        }
+        index = index + 1
+    }
+    if (valid) result else -1
+}
+
+fun httpReadRequest(
+    connection: TcpConnection,
+    maximumHeader: int = 65536,
+    maximumBody: int = 1048576
+): string {
+    var input = connection.read(maximumHeader)
+    var headerEnd = httpHeaderEnd(input)
+    var readingHeaders = headerEnd < 0 && input.size < maximumHeader
+    while (readingHeaders) {
+        val remaining = maximumHeader - input.size
+        val chunk = connection.read(remaining)
+        if (chunk.size > 0) input = "$input$chunk"
+        headerEnd = httpHeaderEnd(input)
+        readingHeaders = headerEnd < 0 && chunk.size > 0 &&
+            input.size < maximumHeader
+    }
+
+    if (headerEnd >= 0) {
+        val preliminary = httpParseRequest(input)
+        val encodedLength = preliminary.header("Content-Length")
+        var contentLength = 0
+        if (encodedLength != "") {
+            contentLength = httpDecimalLength(encodedLength, maximumBody)
+        }
+        if (contentLength >= 0) {
+            val expected = headerEnd + contentLength
+            var readingBody = input.size < expected
+            while (readingBody) {
+                val chunk = connection.read(expected - input.size)
+                if (chunk.size > 0) input = "$input$chunk"
+                readingBody = chunk.size > 0 && input.size < expected
+            }
+        }
+    }
+    input
+}
+
+fun httpParseRequest(input: string): HttpRequest {
+    val requestLineEnd = httpLineEnd(input, 0)
+    val firstSpace = httpFindByte(input, 32, 0, requestLineEnd)
+    val secondSpace = httpFindByte(input, 32, firstSpace + 1, requestLineEnd)
+    var method = ""
+    var target = "/"
+    if (firstSpace > 0 && secondSpace > firstSpace) {
+        method = input.slice(0, firstSpace)
+        target = input.slice(firstSpace + 1, secondSpace)
+    }
+    var path = target
+    var query = ""
+    val question = httpFindByte(target, 63, 0, target.size)
+    if (question >= 0) {
+        path = target.slice(0, question)
+        query = target.slice(question + 1, target.size)
+    }
+
+    val headers: array<HttpHeader> = []
+    var cursor = requestLineEnd + 2
+    var bodyBegin = input.size
+    var more = cursor < input.size
+    while (more) {
+        val end = httpLineEnd(input, cursor)
+        if (end == cursor) {
+            bodyBegin = end + 2
+            more = false
+            cursor = cursor
+        } else {
+            val colon = httpFindByte(input, 58, cursor, end)
+            if (colon > cursor) {
+                var valueBegin = colon + 1
+                while (valueBegin < end && input[valueBegin] == 32) {
+                    valueBegin = valueBegin + 1
+                }
+                headers.append(HttpHeader(
+                    input.slice(cursor, colon),
+                    input.slice(valueBegin, end)
+                ))
+            }
+            cursor = end + 2
+            if (cursor >= input.size) more = false
+            cursor = cursor
+        }
+    }
+    var body = ""
+    if (bodyBegin < input.size) body = input.slice(bodyBegin, input.size)
+    HttpRequest(method, path, query, headers, body, [], [])
+}
+
+fun HttpResponse.header(name: string): string {
+    var result = ""
+    var index = 0
+    while (index < this.headers.size) {
+        if (httpAsciiEqualInsensitive(this.headers[index].name, name)) {
+            result = this.headers[index].value
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun httpParseResponse(input: string): HttpClientResult {
+    val statusLineEnd = httpLineEnd(input, 0)
+    val firstSpace = httpFindByte(input, 32, 0, statusLineEnd)
+    val secondSpace = httpFindByte(input, 32, firstSpace + 1, statusLineEnd)
+    var status = 0
+    if (firstSpace > 0 && secondSpace > firstSpace + 1) {
+        status = httpDecimalLength(
+            input.slice(firstSpace + 1, secondSpace),
+            999
+        )
+    }
+
+    val headers: array<HttpHeader> = []
+    var cursor = statusLineEnd + 2
+    var bodyBegin = input.size + 1
+    var more = statusLineEnd < input.size
+    while (more) {
+        val end = httpLineEnd(input, cursor)
+        if (end == cursor) {
+            bodyBegin = end + 2
+            more = false
+        } else if (end >= input.size) {
+            more = false
+        } else {
+            val colon = httpFindByte(input, 58, cursor, end)
+            if (colon > cursor) {
+                var valueBegin = colon + 1
+                while (valueBegin < end && input[valueBegin] == 32) {
+                    valueBegin = valueBegin + 1
+                }
+                headers.append(HttpHeader(
+                    input.slice(cursor, colon),
+                    input.slice(valueBegin, end)
+                ))
+            }
+            cursor = end + 2
+            if (cursor >= input.size) more = false
+        }
+    }
+
+    var body = ""
+    if (bodyBegin <= input.size) body = input.slice(bodyBegin, input.size)
+    val provisional = HttpResponse(status, headers, body)
+    val encodedLength = provisional.header("Content-Length")
+    var complete = status >= 100 && bodyBegin <= input.size
+    if (encodedLength != "") {
+        val expected = httpDecimalLength(encodedLength, 1048576)
+        complete = complete && expected >= 0 && body.size >= expected
+        if (expected >= 0 && body.size > expected) {
+            body = body.slice(0, expected)
+        }
+    }
+    HttpClientResult(
+        HttpResponse(status, headers, body),
+        status >= 100,
+        complete
+    )
+}
+
+fun httpClient(
+    authority: string,
+    exchange: (string, int, int) -> HttpTransportResult,
+    maximumResponseBytes: int = 1048576,
+    timeoutMilliseconds: int = 5000
+): HttpClient = HttpClient(
+    authority,
+    exchange,
+    maximumResponseBytes,
+    timeoutMilliseconds
+)
+
+fun httpExchangeIpv4(
+    address: string,
+    port: int,
+    request: string,
+    maximumResponseBytes: int,
+    timeoutMilliseconds: int
+): HttpTransportResult {
+    val connection = tcpConnectIpv4(address, port, timeoutMilliseconds)
+    var succeeded = connection.descriptor >= 0
+    if (succeeded) succeeded = connection.write(request) == request.size
+    var response = ""
+    var reading = succeeded
+    while (reading && response.size < maximumResponseBytes) {
+        val chunk = connection.readWithTimeout(
+            maximumResponseBytes - response.size,
+            timeoutMilliseconds
+        )
+        if (chunk.size > 0) response = "$response$chunk"
+        if (chunk.size == 0) reading = false
+    }
+    if (connection.descriptor >= 0) connection.close()
+    HttpTransportResult(response, succeeded)
+}
+
+fun httpIpv4Client(
+    authority: string,
+    address: string,
+    port: int,
+    maximumResponseBytes: int = 1048576,
+    timeoutMilliseconds: int = 5000
+): HttpClient = httpClient(
+    authority,
+    { request: string, maximum: int, timeout: int ->
+        httpExchangeIpv4(address, port, request, maximum, timeout)
+    },
+    maximumResponseBytes,
+    timeoutMilliseconds
+)
+
+fun HttpClient.send(request: HttpRequest): HttpClientResult {
+    val transport = this.exchange
+    val exchanged = transport(
+        request.renderForClient(this.authority),
+        this.maximumResponseBytes,
+        this.timeoutMilliseconds
+    )
+    var result = HttpClientResult(HttpResponse(0, [], ""), false, false)
+    if (exchanged.succeeded) result = httpParseResponse(exchanged.bytes)
+    result
+}
+
+fun httpPathParts(path: string): array<string> {
+    val parts: array<string> = []
+    var begin = 0
+    if (path.size > 0 && path[0] == 47) begin = 1
+    var index = begin
+    while (index <= path.size) {
+        if (index == path.size || path[index] == 47) {
+            parts.append(path.slice(begin, index))
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    parts
+}
+
+fun httpMatchPath(pattern: string, path: string): HttpPathMatch {
+    val expected = httpPathParts(pattern)
+    val actual = httpPathParts(path)
+    val names: array<string> = []
+    val values: array<string> = []
+    var matched = expected.size == actual.size
+    var index = 0
+    while (index < expected.size && matched) {
+        if (expected[index].size > 0 && expected[index][0] == 58) {
+            names.append(expected[index].slice(1, expected[index].size))
+            values.append(actual[index])
+        } else if (expected[index] != actual[index]) {
+            matched = false
+        }
+        index = index + 1
+    }
+    HttpPathMatch(matched, names, values)
+}
+
+fun httpVersionCompare(left: string, right: string): int {
+    var result = 0
+    var index = 0
+    var more = true
+    while (index < left.size && index < right.size && more) {
+        if (left[index] < right[index]) {
+            result = -1
+            more = false
+        }
+        if (left[index] > right[index]) {
+            result = 1
+            more = false
+        }
+        index = index + 1
+    }
+    if (more && left.size < right.size) result = -1
+    if (more && left.size > right.size) result = 1
+    result
+}
+
+fun HttpRouter.get(
+    pattern: string,
+    handler: (HttpRequest) -> HttpResponse
+): HttpRouter {
+    this.routes.append(HttpRoute("GET", pattern, "", handler))
+    this
+}
+
+fun HttpRouter.post(
+    pattern: string,
+    handler: (HttpRequest) -> HttpResponse
+): HttpRouter {
+    this.routes.append(HttpRoute("POST", pattern, "", handler))
+    this
+}
+
+fun HttpRouter.version(versionName: string): HttpVersionedRouter =
+    HttpVersionedRouter(this, versionName)
+
+fun HttpVersionedRouter.get(
+    pattern: string,
+    handler: (HttpRequest) -> HttpResponse
+): HttpRouter {
+    this.router.routes.append(HttpRoute("GET", pattern, this.version, handler))
+    this.router
+}
+
+fun HttpVersionedRouter.post(
+    pattern: string,
+    handler: (HttpRequest) -> HttpResponse
+): HttpRouter {
+    this.router.routes.append(HttpRoute("POST", pattern, this.version, handler))
+    this.router
+}
+
+fun HttpRouter.dispatch(request: HttpRequest): HttpResponse {
+    val requestedVersion = request.header(this.versionHeader)
+    var selected = -1
+    var selectedVersion = ""
+    var selectedMatch = HttpPathMatch(false, [], [])
+    var index = 0
+    while (index < this.routes.size) {
+        val route = this.routes[index]
+        val match = httpMatchPath(route.pattern, request.path)
+        var eligible = route.method == request.method && match.matched
+        if (eligible && requestedVersion != "" && route.version != "" &&
+            httpVersionCompare(route.version, requestedVersion) > 0) {
+            eligible = false
+        }
+        if (eligible && (selected < 0 ||
+            httpVersionCompare(route.version, selectedVersion) > 0)) {
+            selected = index
+            selectedVersion = route.version
+            selectedMatch = match
+        }
+        index = index + 1
+    }
+    var response = httpText("not found", 404)
+    if (selected >= 0) {
+        val routed = HttpRequest(
+            request.method,
+            request.path,
+            request.query,
+            request.headers,
+            request.body,
+            selectedMatch.names,
+            selectedMatch.values
+        )
+        val handler = this.routes[selected].handler
+        response = handler(routed)
+    }
+    response
+}
+
+fun serveHttpOnce(router: HttpRouter, var listener: TcpListener): int {
+    val connection = listener.accept()
+    val request = httpParseRequest(httpReadRequest(connection))
+    val response = router.dispatch(request).render()
+    val written = connection.write(response)
+    connection.close()
+    written
+}
+
+fun serveHttp(router: HttpRouter, port: int): int {
+    val listener = tcpListen(port)
+    serveHttpOnListener(router, listener)
+}
+
+fun serveHttpOnListener(router: HttpRouter, var listener: TcpListener): int {
+    tcpEnableGracefulShutdown()
+    while (!tcpShutdownRequested()) {
+        val connection = listener.acceptUntilShutdown()
+        if (connection.descriptor >= 0) {
+            val request = httpParseRequest(httpReadRequest(connection))
+            val response = router.dispatch(request).render()
+            connection.write(response)
+            connection.close()
+        }
+    }
+    listener.close()
+    0
+}

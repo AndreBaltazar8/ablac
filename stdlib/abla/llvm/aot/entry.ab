@@ -1,0 +1,155 @@
+// In-process LLVM optimization and native object emission.
+
+#import("abla/llvm/orc")
+
+noescape extern:"c" fun LLVMGetDefaultTargetTriple(): i64*
+noescape extern:"c" fun LLVMGetTargetFromTriple(
+    triple: i64*,
+    outputTarget: i64*,
+    outputMessage: i64*
+): i32
+noescape extern:"c" fun LLVMCreateTargetMachine(
+    target: i64*,
+    triple: i64*,
+    cpu: cstring,
+    features: cstring,
+    optimizationLevel: i32,
+    relocationMode: i32,
+    codeModel: i32
+): i64*
+noescape extern:"c" fun LLVMDisposeTargetMachine(machine: i64*): void
+noescape extern:"c" fun LLVMCreateTargetDataLayout(machine: i64*): i64*
+noescape extern:"c" fun LLVMDisposeTargetData(layout: i64*): void
+noescape extern:"c" fun LLVMSetTarget(module: i64*, triple: i64*): void
+noescape extern:"c" fun LLVMSetModuleDataLayout(module: i64*, layout: i64*): void
+noescape extern:"c" fun LLVMCreatePassBuilderOptions(): i64*
+noescape extern:"c" fun LLVMDisposePassBuilderOptions(options: i64*): void
+noescape extern:"c" fun LLVMRunPasses(
+    module: i64*,
+    passes: cstring,
+    machine: i64*,
+    options: i64*
+): i64*
+noescape extern:"c" fun LLVMTargetMachineEmitToFile(
+    machine: i64*,
+    module: i64*,
+    filename: cstring,
+    codegen: i32,
+    outputMessage: i64*
+): i32
+noescape extern:"c" fun LLVMDisposeModule(module: i64*): void
+
+// Returns zero on success and a stable 130-135 infrastructure status on
+// failure. LLVM-owned messages are always disposed. An empty pass pipeline is
+// the low-latency development profile: LLVM parses the module once and emits
+// unoptimized machine code without first rebuilding an optimization pipeline.
+fun llvmAotEmitObjectFileConfigured(
+    irPath: string,
+    objectPath: string,
+    optimizationLevel: int,
+    passes: string
+): int {
+    llvmInitializeNativeTarget()
+    val nullPointer = nativeNullPointer()
+    val buffer = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    val module = nativePointerCell(nullPointer)
+    val target = nativePointerCell(nullPointer)
+    val context = LLVMContextCreate()
+    var status: int = LLVMCreateMemoryBufferWithContentsOfFile(
+        irPath,
+        buffer.address,
+        message.address
+    )
+    if (status != 0) status = 130
+    if (status == 0) {
+        status = LLVMParseIRInContext(
+            context,
+            buffer.load(),
+            module.address,
+            message.address
+        )
+        if (status != 0) status = 131
+    }
+    var triple = nullPointer
+    if (status == 0) {
+        triple = LLVMGetDefaultTargetTriple()
+        status = LLVMGetTargetFromTriple(
+            triple,
+            target.address,
+            message.address
+        )
+        if (status != 0) status = 132
+    }
+    var machine = nullPointer
+    var layout = nullPointer
+    var passOptions = nullPointer
+    if (status == 0) {
+        machine = LLVMCreateTargetMachine(
+            target.load(),
+            triple,
+            "generic",
+            "",
+            optimizationLevel,
+            2,
+            0
+        )
+        if (pointerIsNull(machine)) status = 133
+    }
+    if (status == 0) {
+        LLVMSetTarget(module.load(), triple)
+        layout = LLVMCreateTargetDataLayout(machine)
+        LLVMSetModuleDataLayout(module.load(), layout)
+        if (passes != "") {
+            passOptions = LLVMCreatePassBuilderOptions()
+            status = llvmConsumeError(
+                LLVMRunPasses(
+                    module.load(),
+                    passes,
+                    machine,
+                    passOptions
+                ),
+                134
+            )
+        }
+    }
+    if (status == 0) {
+        status = LLVMTargetMachineEmitToFile(
+            machine,
+            module.load(),
+            objectPath,
+            1,
+            message.address
+        )
+        if (status != 0) status = 135
+    }
+    if (!pointerIsNull(passOptions)) {
+        LLVMDisposePassBuilderOptions(passOptions)
+    }
+    if (!pointerIsNull(layout)) LLVMDisposeTargetData(layout)
+    if (!pointerIsNull(machine)) LLVMDisposeTargetMachine(machine)
+    if (!pointerIsNull(module.load())) LLVMDisposeModule(module.load())
+    LLVMContextDispose(context)
+    if (!pointerIsNull(triple)) LLVMDisposeMessage(triple)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    buffer.close()
+    message.close()
+    module.close()
+    target.close()
+    status
+}
+
+// Reproducible release profile. The pipeline string and code-generation level
+// are explicit compiler inputs and therefore participate in fixed points.
+fun llvmAotEmitObjectFile(irPath: string, objectPath: string): int =
+    llvmAotEmitObjectFileConfigured(
+        irPath,
+        objectPath,
+        3,
+        "default<O2>,globaldce"
+    )
+
+// Low-latency profile for edit/run cycles and watched services. Release builds
+// remain the default so shipping code never silently loses optimization.
+fun llvmAotEmitObjectFileFast(irPath: string, objectPath: string): int =
+    llvmAotEmitObjectFileConfigured(irPath, objectPath, 0, "")

@@ -1,0 +1,391 @@
+# Compiler performance contract
+
+Correctness and full self-hosted conformance come first. Once the pure-Abla
+compiler accepts the complete language surface, optimization proceeds against
+reproducible measurements rather than ad-hoc timings.
+
+Run the current end-to-end baseline with:
+
+```sh
+make benchmark-selfhost
+```
+
+The benchmark reports two independently useful intervals:
+
+- Abla compiler source to generated C (`ablac2` front/middle/backend work);
+- generated C to optimized native executable;
+- their combined source-to-executable time.
+
+The first release performance gate is a complete compiler build below 10
+seconds on the reference development machine. After that, the target is a
+sub-second warm/incremental build through cached module interfaces, persistent
+compiler state, and minimal invalidation. Cold and clean builds remain reported
+separately so caching cannot disguise front-end regressions.
+
+Every optimization must preserve strict-C output, the conformance suite,
+stage-1/stage-2 behavioral parity, and the byte-identical `ablac2`/`ablac3`
+fixed point unless an explicitly versioned deterministic-output change updates
+both stages together.
+
+## Initial baseline
+
+On the reference development session on 2026-07-31, before performance work:
+
+| Phase | Time |
+|---|---:|
+| Pure-Abla compiler, source to C | 198,880 ms |
+| C compiler, generated C to native executable | 3,853 ms |
+| Total | 202,735 ms |
+
+The profile boundary is already clear: over 98% of elapsed time is in the
+current pure-Abla implementation. Expected first targets include replacing
+repeated declaration/symbol scans with indexes, eliminating quadratic string
+assembly in module bundling and C emission, reducing tagged heap allocation,
+and caching parsed/type-checked module interfaces.
+
+## Rope-runtime result
+
+The initial profile identified generated-output concatenation as the dominant
+failure: immutable concatenation copied the complete prefix and retained every
+superseded allocation. A persistent rope with iterative one-time flattening
+removed that quadratic copy/allocation path. On the same development session:
+
+| Phase | Time |
+|---|---:|
+| Pure-Abla compiler, source to C | 685 ms |
+| C compiler, generated C to native executable | 6,519 ms |
+| Total bootstrap source-to-executable | 7,207 ms |
+
+The pure-Abla compiler is now below one second and the legacy bootstrap path is
+below ten seconds. The remaining measured bootstrap cost is external C
+compilation; production work therefore targets LLVM object emission rather
+than tuning the C intermediate. Full compiler LLVM coverage and an LLVM-native
+self-host fixed point are now gated. The next measurements target frontend
+indexes, IR reachability, LLVM global DCE, in-process object emission, and JIT
+startup rather than the compatibility C path.
+
+An early guarded cold `ablac build bootstrap/compiler/main.ab` through the
+LLVM-native compiler completed in 9.53 seconds, including Nix shell entry,
+LLVM O2/global DCE, the then-required platform adapter, and LLD. That adapter
+is no longer part of the compiler build; the current final compiler contains
+no project-C host/platform symbols. Run current measurements independently
+with `make benchmark-native`.
+
+The final compiler now executes ORC in-process. A warm guarded
+`build/ablac run tests/cases/bootstrap/block.ab` measured 27 ms on the same
+machine, including source loading, frontend work, LLVM IR generation, JIT
+materialization, and execution. A persistent REPL stress gate compiled,
+executed, unloaded, and allocation-reset 128 generations in 1.5 seconds.
+
+Bootstrap compiler executables are built with `BOOTSTRAP_CFLAGS=-O2` by
+default; the setting can be overridden on the Make command line for profiling.
+This removes an avoidable unoptimized-host penalty but does not replace the
+algorithmic work measured by `benchmark-selfhost`.
+
+Every `ablac1` and `ablac2` launch is guarded, including direct use of the
+paths under `build/bootstrap` and `make benchmark-selfhost`. The defaults are a
+512 MiB address-space ceiling and 600-second wall/CPU limits, with process-group
+termination after a short grace period. They can be adjusted explicitly with
+`ABLA_MAX_MEMORY_MB`, `ABLA_MAX_SECONDS`, and `ABLA_MAX_CPU_SECONDS`; disabling
+the guard is intentionally not a normal Make option. Whole-compiler fixed-point
+LLVM emission has a separate, still-bounded 896 MiB default through
+`ABLA_SELFHOST_EMIT_MEMORY_MB`; this avoids coupling ordinary compiler limits to
+the temporary address-space requirement of emitting the complete compiler
+module.
+
+## In-process AOT and indexed-backend result
+
+The final compiler calls LLVM 21 directly for `default<O2>,globaldce` and
+object emission. A negative dependency gate places failing `opt` and `llc`
+executables first on `PATH`; `ablac build` must still produce a working native
+program. The final link remains an external Clang/LLD handoff.
+
+Profiling the full compiler exposed a quadratic backend scan: for every
+function, address-taken discovery rescanned every instruction twice. A single
+address-taken pass reduced deterministic LLVM emission from 7.369 s to 3.949 s.
+Hash indexes for functions, natives, locals, globals, classes, and fields then
+reduced it to 1.808 s without changing fixture LLVM output. On the 2026-07-31
+reference session:
+
+| Phase | Time |
+|---|---:|
+| Complete compiler frontend + LLVM text emission | 1.808 s |
+| LLVM O2 optimization and object emission | about 5.6 s |
+| Native linker handoff (historical measurement included an adapter) | about 0.27 s |
+| Full compiler source to executable | **6.861 s** |
+
+This establishes the requested sub-10-second full self-build with margin. The
+sub-second target now requires cached module interfaces, persistent typed IR,
+incremental code generation, and avoiding whole-program O2 on unchanged code;
+it cannot be reached honestly by timing only a cached linker invocation.
+
+On 2026-08-01, after manifest authorization, typed extension generation,
+transactional publication, and the libc-free target landed, a watchdog-bounded
+fast full compiler rebuilds completed in roughly **15–26 seconds** in the
+current instrumented environment, and parent/child full LLVM emissions took
+roughly **13–21 seconds** with byte-identical output. A measured emit peaked at
+923,216 KiB RSS and a measured fast rebuild at 1,064,604 KiB RSS; both were
+hard-capped at **2048 MiB** address space. These newer end-to-end observations
+supersede older development timings for capacity planning; profiling must
+recover the regression before the sub-second cold target can be claimed.
+
+## Fast development AOT profile
+
+The frontend/backend split was remeasured after the final-native conformance
+gate landed. Emitting the full compiler's 8.0 MB textual LLVM module takes
+about 0.5 seconds; external measurements of LLVM O2 plus machine-code emission
+take about 7.2 seconds. Optimization, not Abla parsing or lowering, is now the
+dominant cold-build cost.
+
+`ablac build ... --fast` therefore skips the whole-module optimization pipeline
+and selects LLVM's level-zero code generator. With canonical CFG construction,
+dominance verification, definite-assignment analysis, and the affine-move
+baseline enabled, gated clean pure-Abla compiler self-builds have taken about
+**3.1–5.3 seconds**. Recursive structural-affinity analysis initially raised a
+clean build to 5.268 seconds. Computing its class/type fixed point once per
+compilation and sharing the summary across semantic analysis and all nested
+lowerers reduced the same gated build to 4.358 seconds, while every compiler
+continued to reproduce byte-identical LLVM IR. The subsequent authoritative
+full affinity-only gate measured the cached-affinity compiler at **3.235
+seconds**. After conditional direct-resource destruction and compile-time drop
+parity landed, the next full byte-identical gate measured **3.371 seconds**.
+Recursive structural drop descriptors, projection-remainder cleanup, and
+trusted native-wrapper destructors measured **3.453 seconds** in the following
+full byte-identical self-build gate. Typed `FnOnce` capture descriptors,
+compile-time closure cleanup, and native environment release measured **3.542
+seconds** in the next cold authoritative gate. Field-sensitive CFG place
+liveness and delayed projection-remainder destruction measured **4.153
+seconds** in the subsequent cold gate; this pass deliberately includes the
+new place-state verification rather than timing a weakened frontend. Mutable
+place reinitialization, all-path restoration, and exact moved-set convergence
+measured **3.736 seconds** in the next byte-identical full self-host gate.
+Segment-aware nested place aliasing and conservative dynamic-index restoration
+then measured **3.702 seconds** with the same full gate. Place-sensitive
+borrow/own call exclusion and inferred mode-bearing function values measured
+**3.858 seconds** in the next cold byte-identical self-host gate. The following
+source-syntax-only `(own: T) -> R` gate reused the exact compiler object and
+therefore is not reported as another cold measurement. Call-scoped exclusive
+`var` borrowing initially exposed both a precision and a memory regression:
+repeated whole-body receiver-effect scans classified native `load()` operations
+as writes and peaked near 929 MiB RSS. Replacing them with one fixed-point
+mutable-receiver summary restored read/write precision, reduced the same
+guarded whole-compiler LLVM emission to about **636 MiB RSS**, and kept the
+existing 768 MiB watchdog unchanged. The subsequent full fixed-point gate
+measured the cold fast self-build at **3.958 seconds**, including the affine
+mutable-borrow checker and mode-bearing callable contracts.
+Further work should persist this
+summary in typed module interfaces and avoid rebuilding whole-graph semantic
+state after an unrelated edit.
+
+Adding the affine `Shared<T>`/`Weak<T>` implementation increased the
+self-hosted compiler graph because its LLVM backend now carries the atomic
+control-block generator. The guarded core-compiler emission measured about
+746 MiB peak RSS and the larger ORC compiler graph about 775 MiB. The old
+768 MiB address-space ceiling consequently became too tight and correctly
+aborted one fixed-point build instead of allowing an unbounded process. The
+self-host emission ceiling is now calibrated to 896 MiB, leaving bounded
+headroom while ordinary compiler invocations retain the 512 MiB default.
+Shared/weak LLVM support is feature-selected: programs whose typed IR has no
+shared/weak operation receive neither `%AblaShared` nor its atomic runtime, so
+the new capability does not inflate small ordinary binaries. The completed
+byte-identical gate, including stable nullable-flow refinement, measured a
+**4.323-second** cold fast self-build and a
+**124 ms** exact-source object-cache hit on the same machine.
+`serve` uses this profile automatically. Release `build` remains O2, and the
+sub-second target still requires persistent module/typed-IR/object caches rather
+than weakening what is included in the measurement.
+
+The scoped-region gate adds fixed-point native-call, receiver, and heap-parameter
+retention summaries to that same whole graph. Its first cold fast self-build
+measured **4.672 seconds**; the subsequent complete green gate reproduced both
+compiler fixed points byte-for-byte and measured a **130 ms** exact-source
+object-cache hit. The compiler and REPL remained inside their existing bounded
+watchdogs, including 128 region-reclaimed ORC generations.
+
+The exhaustive-control-flow gate initially triggered the 1024 MiB final-
+compiler watchdog: an unreachable hook recomputed expression types for every
+lowered AST node, and the unoptimized fast self-build amplified that work on
+the complete ORC graph. Replacing the hook with precomputed `never`-callee
+metadata restored both optimized and fast pure-Abla fixed points under the
+unchanged limits. After the owned-parameter contract checks landed, the full
+green gate measured a **4.751-second** cold fast self-build and a **124 ms**
+exact-source cache hit. This is why memory ceilings remain correctness gates,
+not optional benchmark settings.
+
+Stored immutable `Shared.get()` views add backward CFG borrow liveness and a
+selective pre-evaluation verification pass for borrow-bearing runtime
+functions, compile functions, and methods. The first implementation retained
+all compile-function validation IR and pushed the LLVM-linked final compiler
+past its 1024 MiB address-space watchdog. Per-function checkpoints, syntactic
+candidate selection, and reclaiming temporary value-definition/place-state
+verification tables reduced the measured final-compiler peak from about
+**933 MiB to 902 MiB RSS** while preserving the then-current 1024 MiB final
+ceiling. At that gate, the unoptimized fast self-rebuilt executable needed
+1032 MiB of address-space headroom solely for its larger code mapping and
+remained separately bounded.
+The resulting gate measured a **5.049-second** cold fast self-build before
+continuing through the pure self-rebuild and conformance suites.
+
+The chained-view rung adds transitive owner provenance for immutable borrow
+copies and stored field/index projections. Compacting that provenance to one
+table aligned with function locals kept the complete compiler at about
+**905 MiB peak RSS**. Its optimized and unoptimized complete-graph executables
+now use separately calibrated **1040 MiB** and **1056 MiB** address-space
+watchdogs: the additional virtual headroom covers executable mappings, while
+ordinary compiler invocations remain at 512 MiB and the core self-host emission
+remains at 896 MiB. The complete chained-view gate measured a
+**5.093-second** cold fast self-build and a **130 ms** exact-source object-cache
+hit.
+
+The following same-owner lifetime-join rung extends stored borrows through
+block-valued `if` and exhaustive `when` expressions while rejecting ambiguous
+cross-owner joins. It kept the **1040 MiB** optimized and **1056 MiB** fast
+self-host watchdogs unchanged, reproduced both pure-Abla compiler fixed points
+byte-for-byte, and measured a **5.159-second** cold fast self-build with a
+**127 ms** exact-source object-cache hit.
+
+The source-linked borrow-return rung adds `borrow(source) T` contracts for
+functions, compile functions, and methods, plus caller-place substitution and
+overlapping call-argument checks. Its first normalizer used a seven-byte
+`slice()` for every contract-prefix test; arena accumulation raised a guarded
+whole-graph run to roughly **956 MiB RSS**. Direct byte tests and shared
+declaration lookup reduced the final path to about **910 MiB RSS**, while the
+ordinary 512 MiB and core 896 MiB watchdogs remained unchanged. The larger
+complete-graph executables now have calibrated **1064 MiB optimized** and
+**1072 MiB fast** virtual-address watchdogs. Both pure-Abla fixed points are
+byte-identical; the complete green gate measured a **5.379-second** cold fast
+self-build and a **134 ms** exact-source object-cache hit.
+
+The callable-family and synchronized-mutation batch adds `FnMut` capture cells,
+indexed borrow lifetimes through indirect/global/returned callbacks,
+`Borrow<T>`, and `Mutex<T>`. Prefix recognition remains direct byte matching so
+these type forms do not allocate short-lived slices across the whole compiler
+graph. The source compiler is bounded at **960 MiB**; the LLVM-linked complete
+compiler is bounded at **1120 MiB optimized** and **1128 MiB fast**. Under that
+ceiling the optimized compiler emitted the complete compiler twice with
+byte-identical LLVM IR, and one combined evaluator/LLVM/generated-C smoke gate
+covered the batch. These are watchdog ceilings rather than target steady-state
+usage; lowering the graph's retained-memory footprint remains active work.
+
+The following hermetic-effects, canonical-module, typed-global, and extension
+generation batch remains byte-identical at the self-hosted fixed point. Compact
+effect bitsets avoid retaining per-call objects; generated modules are capped
+at 64 per staging unit and 64 KiB each. The complete optimized image now has a
+calibrated **1152 MiB** emission watchdog (1144 MiB fails cleanly), with
+**1160 MiB** reserved for the fast image's mapping margin. Ordinary invocations
+remain bounded independently, and every calibration attempt ran through the
+same process-tree memory/time watchdog.
+
+The whole-graph object cache now makes an unchanged fast compiler build take
+about **0.11–0.14 seconds** (134 ms in the latest full reliability gate), down
+from the multi-second cold fast build. That
+interval includes exact bundled-source validation, copying the cached object,
+and LLD. A permanent gate proves
+that the hit does not regenerate LLVM and that changing the source while
+reusing the output path selects a different object. This reaches the warm
+sub-second milestone for unchanged graphs; edited builds still need
+module-granular interfaces and invalidation rather than whole-graph reuse.
+
+The 2026-08-01 warm-path audit found a regression hidden behind that contract:
+a bundled-source substring search for `compilerGrant(` matched the compiler's
+own cache implementation and semantic checker, conservatively disabling its
+cache. Eligibility now inspects already-parsed top-level `#compilerGrant`
+actions instead. Ordinary compiler source is cacheable again. Authorized
+`filesystem.read` staging is cacheable with a bounded sidecar containing each
+observed path, content size, and dual fingerprint; the entry manifest is part
+of the cache identity, and a missing, corrupt, or changed input record is a
+miss. Parser handlers and finalizers feed the same input identity and invalidate
+their persistent staged-frontend snapshot when an observed file changes. Other
+ambient effects remain conservatively uncached.
+With the corrected eligibility check and an optimized pure-Abla compiler, the
+first fast whole-compiler build completed in about **7.4 seconds** in the
+observed run. The immediately repeated exact-source build completed in
+**0.89 seconds**, including Nix-shell entry, object copy, transactional LLD
+relink, and publication, and peaked at **198,408 KiB RSS** under a 960 MiB
+address-space watchdog. Cold results still vary with host load; the cache gate
+asserts behavior rather than a fragile timing threshold.
+
+Self-build recipes no longer use a blanket 2048 MiB limit. Canonical full-graph
+self-rebuilds use the production release-O2 compiler under a **1536 MiB**
+address-space ceiling; that path was observed at 1,278,560 KiB peak RSS.
+Complete unoptimized compiler images are intentionally not the fixed-point
+gate: their much larger code mapping crossed the watchdog as the compiler grew,
+without adding a stronger correctness property. Fast AOT remains gated on
+ordinary programs. Whole-IR emission retains its smaller separately calibrated
+limit.
+
+The explicit collector is now selected from entry-point reachability. A
+work-list walk follows direct calls and conservatively expands indirect calls
+to address-taken functions. Programs which cannot reach `memoryCollect()` no
+longer carry the pure mark/sweep implementation; collector users retain the
+zero-initialized allocation contract and complete shadow-root path. The
+optimized compiler remained byte-identical at its next fixed point and emitted
+its complete 19.4 MiB LLVM module in **8.855 seconds** in the observed cold run,
+under the unchanged **1152 MiB** emission watchdog. This pass is primarily a
+program-size and optional-runtime win; it does not yet claim a frontend speed
+improvement.
+
+The following allocation pass split tracked allocation into initialized and
+fully-written paths. Collector-capable and host-backed programs retain zeroed
+storage, because conservative tracing must never inspect indeterminate words.
+Pure programs with no reachable collector skip clearing; generated arrays,
+objects, closures, and strings initialize every word they expose before use,
+which is enforced by the existing definite-assignment and runtime conformance
+gates. The complete optimized compiler then emitted the same fixed-point module
+in an observed **8.656 seconds** (about 2.2% below the immediately preceding
+8.855-second run), still under 1152 MiB. This is deliberately recorded as a
+small allocation win, not the sub-second result; typed incremental IR/object
+reuse remains the path to the larger cold-build reduction.
+
+The next collector passes added independently checked scan prefixes, precise
+layout maps for values, fields, arrays, objects, ropes, strings, cells, and
+shared storage, plus a pinned-raw class for deterministically dropped native
+resources. Selecting a managed-memory limit enables compiler-published
+function-entry pressure safe points; programs with no reachable managed-memory
+API still strip the collector. The production graph remains Abla plus LLVM and
+does not import the compatibility C backend or project runtime.
+
+The promoted compiler's fixed module is **19,339,832 bytes**, with SHA-256
+`eaa7294fe1af763a1858d8eb3679063795d61b780e9b3f262af45e8a42f405c8`.
+It rebuilt the complete compiler directly through public `ablac build` in an
+observed **25.9 seconds** under the four-GiB watchdog, and its child emitted
+byte-identical IR. This safety-first ownership migration is above the cold
+sub-10-second target again; incremental typed reuse and retained-summary work
+remain the next performance phase. The phase-separated release helper remains
+the lower-peak fallback; both paths publish output transactionally.
+
+The first persistent module-state rung is now active in `serve`. Source,
+content fingerprints, and scanned import edges are cached per path; a
+same-length leaf edit refreshes exactly that leaf, while unchanged parents and
+siblings are reused, and an import-edge edit replaces the active dependency
+set. Dependency-fingerprinted staged ASTs are cached as well, including the
+visible imported subparser-provider environment; only the current AST for a
+path is retained. Native regression gates cover reuse, leaf/import-edge
+invalidation, nested imported subparsers, and no-project-C linking. This is not
+yet typed-IR incremental compilation: semantic analysis, LLVM emission, and
+object generation remain whole-graph after an edit.
+
+The 6.861 s measurement includes the LLVM-emitted scalar, closure, collection,
+object, formatting, equality, and iterative rope runtime. The resulting
+`bootstrap/compiler/main.ab` compiler was 1,608,216 bytes and reproduced the
+reference LLVM IR byte-for-byte. Large generated runtime strings also exercise
+the new seed-C constant chunking path rather than relying on non-portable C
+translation limits.
+
+## Reachability and size result
+
+The first LLVM size pass marks Abla implementation functions internal, limits
+the indirect dispatcher to address-taken functions, runs LLVM O2/global DCE,
+and links function-sectioned runtime shims with LLD garbage collection. On the
+same 2026-07-31 development session:
+
+| Native program | Before | After | Reduction |
+|---|---:|---:|---:|
+| identifier-shadowing scalar fixture | 37 KiB | 7.5 KiB | 80% |
+| lambda-capture fixture | 47 KiB | 22 KiB | 53% |
+| version-aware HTTP server | 126 KiB | 97 KiB | 23% |
+
+The HTTP result intentionally includes the tagged-value runtime and live TCP
+transport. Further reductions come from IR-level reachability before textual
+emission, a raw-kernel platform profile, specialized/unboxed values, and
+splitting optional HTTP features such as server transport from router-only use.

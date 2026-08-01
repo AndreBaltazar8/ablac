@@ -1,0 +1,330 @@
+#import("backend_llvm.ab")
+#import("module.ab")
+#import("toolchain.ab")
+#import("abla/sys/linux/io")
+#import("abla/sys/linux/process")
+#import("abla/llvm/orc")
+#import("abla/llvm/aot")
+
+fun bootstrapOrcEmit(sourcePath: string): int {
+    bootstrapBeginCompileOutputs()
+    val parsed = bootstrapParseModule(sourcePath)
+    var status = 1
+    val compilation = bootstrapCompileLlvmParsed(parsed)
+    if (compilation.errors == 0) {
+        linuxPrintStandardOutput(compilation.output)
+        status = 0
+    } else {
+        linuxPrintStandardError(compilation.diagnostics)
+        linuxPrintStandardError(
+            "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.semanticErrors} semantic, ${compilation.errors} total error(s)\n"
+        )
+    }
+    if (status == 0 && !bootstrapCommitCompileOutputs()) status = 144
+    if (status != 0) bootstrapDiscardCompileOutputs()
+    status
+}
+
+fun bootstrapRunInProcess(sourcePath: string): int {
+    val prepared = bootstrapPrepareRun(sourcePath)
+    var status = prepared.status
+    if (status == 0 && prepared.linkHost) {
+        val hostLibrary = "build/.abla-jit-host.so"
+        status = bootstrapBuildJitHostLibrary(hostLibrary)
+        if (status == 0) status = llvmLoadLibraryPermanently(hostLibrary)
+    }
+    if (status == 0) status = llvmOrcRunFile(prepared.llvmPath)
+    status
+}
+
+fun bootstrapOrcBuild(
+    sourcePath: string,
+    outputPath: string,
+    fast: bool,
+    useCache: bool,
+    rawTarget: bool
+): int {
+    var status = 1
+    if (rawTarget && fast) {
+        status = bootstrapNativeRawBuildWithEmitter(
+            sourcePath,
+            outputPath,
+            llvmAotEmitObjectFileFast,
+            "inprocess-fast",
+            useCache
+        ).status
+    }
+    if (rawTarget && !fast) {
+        status = bootstrapNativeRawBuildWithEmitter(
+            sourcePath,
+            outputPath,
+            llvmAotEmitObjectFile,
+            "inprocess-o2",
+            useCache
+        ).status
+    }
+    if (!rawTarget && fast && useCache) {
+        status = bootstrapNativeBuildWithEmitter(
+            sourcePath,
+            outputPath,
+            llvmAotEmitObjectFileFast,
+            "inprocess-fast"
+        ).status
+    }
+    if (!rawTarget && !fast && useCache) {
+        status = bootstrapNativeBuildWithEmitter(
+            sourcePath,
+            outputPath,
+            llvmAotEmitObjectFile,
+            "inprocess-o2"
+        ).status
+    }
+    if (!rawTarget && fast && !useCache) {
+        status = bootstrapNativeBuildUncachedWithEmitter(
+            sourcePath,
+            outputPath,
+            llvmAotEmitObjectFileFast,
+            "inprocess-fast"
+        ).status
+    }
+    if (!rawTarget && !fast && !useCache) {
+        status = bootstrapNativeBuildUncachedWithEmitter(
+            sourcePath,
+            outputPath,
+            llvmAotEmitObjectFile,
+            "inprocess-o2"
+        ).status
+    }
+    status
+}
+
+fun bootstrapReplDeclaration(line: string): bool {
+    var declaration = line.size >= 4 && line.slice(0, 4) == "fun "
+    if (line.size >= 6 && line.slice(0, 6) == "class ") declaration = true
+    if (line.size >= 10 && line.slice(0, 10) == "interface ") {
+        declaration = true
+    }
+    if (line.size >= 15 && line.slice(0, 15) == "resource class ") {
+        declaration = true
+    }
+    if (line.size >= 4 && line.slice(0, 4) == "val ") declaration = true
+    if (line.size >= 4 && line.slice(0, 4) == "var ") declaration = true
+    declaration
+}
+
+// Persistent language REPL. Definitions are retained as source and included
+// in later expression generations. Publication is transactional: a malformed
+// definition is diagnosed without changing the accepted declaration set.
+// Machine code remains a reclaimable ORC generation in one LLJIT session.
+fun bootstrapRepl(): int {
+    val session = llvmOrcCreateSession()
+    val standardInput = linuxStandardInput()
+    var declarations = ""
+    var status = session.status
+    var running = status == 0
+    while (running) {
+        linuxPrintStandardOutput("abla> ")
+        val inputLine = standardInput.readLine()
+        val line = inputLine.text
+        if (!inputLine.available || line == ":quit") {
+            running = false
+        } else if (line == ":reset") {
+            declarations = ""
+            linuxPrintStandardOutput("reset\n")
+        } else if (line != "" && bootstrapReplDeclaration(line)) {
+            val source = "$declarations$line\nfun main: int = 0\n"
+            val compilation = bootstrapCompileLlvm(source)
+            if (compilation.errors != 0) {
+                linuxPrintStandardError(compilation.diagnostics)
+            } else {
+                declarations = "$declarations$line\n"
+                linuxPrintStandardOutput("defined\n")
+            }
+        } else if (line != "") {
+            region {
+                val source = "$declarations\nfun main: int = $line\n"
+                val compilation = bootstrapCompileLlvm(source)
+                if (compilation.errors != 0) {
+                    linuxPrintStandardError(compilation.diagnostics)
+                } else {
+                    val llvmPath = "build/.abla-repl.ll"
+                    if (!Path(llvmPath).writeTextAtomic(compilation.output)) {
+                        status = 141
+                        running = false
+                    } else {
+                        val generation = session.addFile(llvmPath)
+                        if (generation.status != 0) {
+                            status = generation.status
+                            running = false
+                        } else {
+                            val lookup = session.lookup("main")
+                            if (lookup.status != 0) {
+                                status = lookup.status
+                                running = false
+                            } else {
+                                val value = callNativeMain(lookup.address)
+                                linuxPrintStandardOutput("$value\n")
+                            }
+                            val removeStatus = generation.remove()
+                            if (status == 0 && removeStatus != 0) {
+                                status = removeStatus
+                                running = false
+                            }
+                        }
+                    }
+                }
+                0
+            }
+        }
+    }
+    val closeStatus = session.close()
+    if (status == 0 && closeStatus != 0) status = closeStatus
+    status
+}
+
+fun bootstrapOrcUsage(): int {
+    linuxPrintStandardError(
+        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--fast] [--no-cache] [--target x86_64-linux|x86_64-linux-raw]\n       ablac run [<file.ab> | --project <dir>]   # in-process LLVM ORC execution\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac --emit-llvm <file.ab>\n"
+    )
+    2
+}
+
+fun main: int {
+    val argumentCount = linuxArgumentCount()
+    var argument0 = ""
+    var argument1 = ""
+    if (argumentCount > 0) argument0 = linuxArgument(0)
+    if (argumentCount > 1) argument1 = linuxArgument(1)
+    var status = 2
+    if (argumentCount == 1 && argument0 == "repl") {
+        status = bootstrapRepl()
+    }
+    if (argumentCount == 2 && argument0 == "--emit-llvm") {
+        status = bootstrapOrcEmit(argument1)
+    }
+    if (argumentCount >= 1 && argument0 == "build") {
+        var sourcePath = ""
+        var outputPath = "build/abla-out"
+        var outputExplicit = false
+        var fast = false
+        var useCache = true
+        var targetName = "x86_64-linux"
+        var valid = true
+        var option = 1
+        var projectRoot = ""
+        if (argumentCount > 1) {
+            val possibleSource = linuxArgument(1)
+            if (possibleSource != "--project" &&
+                possibleSource.size > 0 && possibleSource[0] != 45) {
+                sourcePath = possibleSource
+                option = 2
+            }
+        }
+        while (option < argumentCount) {
+            val value = linuxArgument(option)
+            if (value == "--fast") {
+                fast = true
+                0
+            } else if (value == "--no-cache") {
+                useCache = false
+                0
+            } else if (value == "--target" &&
+                option + 1 < argumentCount) {
+                targetName = linuxArgument(option + 1)
+                option = option + 1
+                0
+            } else if (value == "--project" &&
+                option + 1 < argumentCount && sourcePath == "") {
+                projectRoot = linuxArgument(option + 1)
+                option = option + 1
+                0
+            } else if (value == "-o" && option + 1 < argumentCount) {
+                outputPath = linuxArgument(option + 1)
+                outputExplicit = true
+                option = option + 1
+                0
+            } else {
+                valid = false
+                0
+            }
+            option = option + 1
+        }
+        if (valid && sourcePath == "") {
+            if (projectRoot == "") projectRoot = "."
+            val project = bootstrapProjectDescriptor(projectRoot)
+            if (project.valid) {
+                sourcePath = project.entry
+                if (!outputExplicit) outputPath = project.output
+            } else {
+                linuxPrintStandardError("${project.diagnostic}\n")
+                valid = false
+            }
+        }
+        val target = bootstrapTargetDescriptor(targetName)
+        if (!target.valid) {
+            linuxPrintStandardError(
+                "unsupported target '$targetName'; supported targets: ${bootstrapSupportedTargets()}\n"
+            )
+            valid = false
+        }
+        if (valid) {
+            status = bootstrapOrcBuild(
+                sourcePath,
+                outputPath,
+                fast,
+                useCache,
+                target.libcFree
+            )
+        }
+    }
+    if (argumentCount >= 1 && argument0 == "run") {
+        var runSource = ""
+        var runValid = true
+        if (argumentCount == 2) runSource = argument1
+        if (argumentCount == 1) {
+            val project = bootstrapProjectDescriptor(".")
+            runValid = project.valid
+            runSource = project.entry
+            if (!runValid) linuxPrintStandardError("${project.diagnostic}\n")
+        }
+        if (argumentCount == 3 && argument1 == "--project") {
+            val project = bootstrapProjectDescriptor(linuxArgument(2))
+            runValid = project.valid
+            runSource = project.entry
+            if (!runValid) linuxPrintStandardError("${project.diagnostic}\n")
+        }
+        if (argumentCount > 3 || runSource == "") runValid = false
+        if (runValid) status = bootstrapRunInProcess(runSource)
+    }
+    if (argumentCount >= 1 && argument0 == "serve") {
+        var serveSource = ""
+        var serveValid = true
+        if (argumentCount == 2) serveSource = argument1
+        if (argumentCount == 1) {
+            val project = bootstrapProjectDescriptor(".")
+            serveValid = project.valid
+            serveSource = project.entry
+            if (!serveValid) {
+                linuxPrintStandardError("${project.diagnostic}\n")
+            }
+        }
+        if (argumentCount == 3 && argument1 == "--project") {
+            val project = bootstrapProjectDescriptor(linuxArgument(2))
+            serveValid = project.valid
+            serveSource = project.entry
+            if (!serveValid) {
+                linuxPrintStandardError("${project.diagnostic}\n")
+            }
+        }
+        if (argumentCount > 3 || serveSource == "") serveValid = false
+        if (serveValid) {
+            status = bootstrapServeWithEmitter(
+                serveSource,
+                llvmAotEmitObjectFileFast,
+                "inprocess-fast"
+            )
+        }
+    }
+    if (status == 2) status = bootstrapOrcUsage()
+    status
+}

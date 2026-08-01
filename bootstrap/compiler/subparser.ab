@@ -1,0 +1,263 @@
+#import("parser.ab")
+
+class BootstrapExtensionRequest(
+    val namespace: string,
+    val payload: string,
+    val expression: BootstrapExpression,
+    val finalizer: string,
+    val directAst: bool,
+    val sourceIdentity: string,
+    val diagnostic: string
+)
+
+class BootstrapSubparserRegistration(
+    val name: string,
+    val handler: string,
+    val availableFrom: int
+)
+
+class BootstrapSubparserRegistry(
+    val registrations: array<BootstrapSubparserRegistration>,
+    val errors: int
+) {
+    fun contains(name: string): bool {
+        var found = false
+        var index = 0
+        while (index < this.registrations.size) {
+            if (this.registrations[index].name == name) found = true
+            index = index + 1
+        }
+        found
+    }
+}
+
+class BootstrapSubparserCursor(
+    val sourceIdentity: string,
+    val source: string,
+    val tokens: array<BootstrapToken>,
+    val expansionBegins: array<int>,
+    val expansionEnds: array<int>,
+    val expansionExpressions: array<BootstrapExpression>,
+    var position: int,
+    var rawPosition: int,
+    var errors: int
+) {
+    fun skipTokenSeparators() {
+        while (this.tokens[this.position].kind == "newline" ||
+               this.tokens[this.position].kind == ";") {
+            this.position = this.position + 1
+        }
+        this.rawPosition = this.tokens[this.position].begin
+    }
+
+    fun tokenKind(expected: string): string {
+        var kind = expected
+        if (expected == "string") kind = "string-start"
+        kind
+    }
+
+    fun at(expected: string): bool {
+        this.skipTokenSeparators()
+        this.tokens[this.position].kind == this.tokenKind(expected)
+    }
+
+    fun consume(expected: string): bool {
+        val matched = this.at(expected)
+        if (matched) {
+            this.position = this.position + 1
+            this.rawPosition = this.tokens[this.position].begin
+        }
+        matched
+    }
+
+    fun expect(expected: string) {
+        if (!this.consume(expected)) this.errors = this.errors + 1
+    }
+
+    fun currentText(): string {
+        this.skipTokenSeparators()
+        bootstrapTokenText(this.source, this.tokens[this.position])
+    }
+
+    fun syncTokensFromRaw() {
+        while (this.position + 1 < this.tokens.size &&
+               this.tokens[this.position].end <= this.rawPosition) {
+            this.position = this.position + 1
+        }
+    }
+
+    fun rawAt(text: string): bool {
+        var matched = this.rawPosition + text.size <= this.source.size
+        var index = 0
+        while (matched && index < text.size) {
+            if (this.source[this.rawPosition + index] != text[index]) {
+                matched = false
+            }
+            index = index + 1
+        }
+        matched
+    }
+
+    fun rawConsume(text: string): bool {
+        val matched = this.rawAt(text)
+        if (matched) {
+            this.rawPosition = this.rawPosition + text.size
+            this.syncTokensFromRaw()
+        }
+        matched
+    }
+
+    fun rawExpect(text: string) {
+        if (!this.rawConsume(text)) this.errors = this.errors + 1
+    }
+
+    fun rawTakeUntil(delimiters: string): string {
+        val begin = this.rawPosition
+        var found = false
+        while (!found && this.rawPosition < this.source.size) {
+            var delimiter = 0
+            while (!found && delimiter < delimiters.size) {
+                if (this.source[this.rawPosition] == delimiters[delimiter]) {
+                    found = true
+                }
+                delimiter = delimiter + 1
+            }
+            if (!found) this.rawPosition = this.rawPosition + 1
+        }
+        this.syncTokensFromRaw()
+        this.source.slice(begin, this.rawPosition)
+    }
+
+    fun rawTakeName(): string {
+        val begin = this.rawPosition
+        while (this.rawPosition < this.source.size &&
+               bootstrapIsAlphaNumeric(this.source[this.rawPosition])) {
+            this.rawPosition = this.rawPosition + 1
+        }
+        if (begin == this.rawPosition) this.errors = this.errors + 1
+        this.syncTokensFromRaw()
+        this.source.slice(begin, this.rawPosition)
+    }
+
+    fun rawSkipWhitespace() {
+        while (this.rawPosition < this.source.size &&
+               (this.source[this.rawPosition] == 32 ||
+                this.source[this.rawPosition] == 9 ||
+                this.source[this.rawPosition] == 10 ||
+                this.source[this.rawPosition] == 13)) {
+            this.rawPosition = this.rawPosition + 1
+        }
+        this.syncTokensFromRaw()
+    }
+
+    fun rawEnd(): bool = this.rawPosition >= this.source.size
+
+    fun parseAblaExpression(): BootstrapExpression {
+        this.syncTokensFromRaw()
+        val parser = BootstrapParser(
+            this.source,
+            this.tokens,
+            this.expansionBegins,
+            this.expansionEnds,
+            this.expansionExpressions,
+            this.position,
+            this.errors
+        )
+        val expression = parser.parseExpression()
+        this.position = parser.position
+        this.errors = parser.errors
+        this.rawPosition = this.tokens[this.position].begin
+        expression
+    }
+}
+
+fun bootstrapSyntaxInteger(value: int): BootstrapExpression =
+    BootstrapExpression("integer", "$value", 0, 0, [])
+
+fun bootstrapSyntaxString(value: string): BootstrapExpression =
+    BootstrapExpression("string", value, 0, 0, [])
+
+fun bootstrapSyntaxIdentifier(value: string): BootstrapExpression =
+    BootstrapExpression("identifier", value, 0, 0, [])
+
+fun bootstrapSyntaxBinary(
+    operation: string,
+    left: BootstrapExpression,
+    right: BootstrapExpression
+): BootstrapExpression = BootstrapExpression(
+    operation,
+    operation,
+    left.begin,
+    right.end,
+    [left, right]
+)
+
+fun bootstrapSyntaxArray(
+    elements: array<BootstrapExpression>
+): BootstrapExpression = BootstrapExpression("array", "", 0, 0, elements)
+
+fun bootstrapSyntaxCall(
+    name: string,
+    arguments: array<BootstrapExpression>
+): BootstrapExpression = BootstrapExpression("call", name, 0, 0, arguments)
+
+fun bootstrapIsCompileHandler(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): bool {
+    var found = false
+    var index = 0
+    while (index < declarations.size) {
+        if (declarations[index].kind == "compile.fun" &&
+            declarations[index].name == name) found = true
+        index = index + 1
+    }
+    found
+}
+
+fun bootstrapBuildSubparserRegistry(
+    parsed: BootstrapParseResult
+): BootstrapSubparserRegistry {
+    val registrations: array<BootstrapSubparserRegistration> = []
+    var errors = 0
+    var actionIndex = 0
+    while (actionIndex < parsed.actions.size) {
+        val action = parsed.actions[actionIndex]
+        var expression = action
+        if (action.kind == "compile" && action.children.size == 1) {
+            expression = action.children[0]
+        }
+        if (expression.kind == "call" &&
+            expression.text == "compilerRegisterSubparser") {
+            if (expression.children.size != 2 ||
+                expression.children[0].kind != "string" ||
+                expression.children[1].kind != "identifier") {
+                errors = errors + 1
+            } else {
+                val name = expression.children[0].text
+                val handler = expression.children[1].text
+                var duplicate = false
+                var registration = 0
+                while (registration < registrations.size) {
+                    if (registrations[registration].name == name) {
+                        duplicate = true
+                    }
+                    registration = registration + 1
+                }
+                if (name == "" || duplicate ||
+                    !bootstrapIsCompileHandler(parsed.declarations, handler)) {
+                    errors = errors + 1
+                } else {
+                    registrations.append(BootstrapSubparserRegistration(
+                        name,
+                        handler,
+                        action.end
+                    ))
+                    errors = errors
+                }
+            }
+        }
+        actionIndex = actionIndex + 1
+    }
+    BootstrapSubparserRegistry(registrations, errors)
+}

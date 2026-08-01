@@ -1,0 +1,205 @@
+#ifndef ABLA_RUNTIME_H
+#define ABLA_RUNTIME_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+typedef enum AblaTag {
+    ABLA_VOID,
+    ABLA_NULL,
+    ABLA_I64,
+    ABLA_BOOL,
+    ABLA_STRING,
+    ABLA_FUNCTION,
+    ABLA_CELL,
+    ABLA_ARRAY,
+    ABLA_OBJECT,
+    ABLA_SHARED,
+    ABLA_WEAK
+} AblaTag;
+
+typedef struct AblaValue AblaValue;
+typedef struct AblaArray AblaArray;
+typedef struct AblaObject AblaObject;
+typedef struct AblaStringRope AblaStringRope;
+typedef struct AblaSharedControl AblaSharedControl;
+
+typedef struct AblaString {
+    const char* data;
+    size_t length;
+    bool owned;
+    AblaStringRope* rope;
+} AblaString;
+
+struct AblaValue {
+    AblaTag tag;
+    union {
+        int64_t i64;
+        bool boolean;
+        struct {
+            uint32_t id;
+            size_t capture_count;
+            AblaValue* captures;
+        } function;
+        AblaValue* cell;
+        AblaString string;
+        AblaArray* array;
+        AblaObject* object;
+        AblaSharedControl* shared;
+        AblaSharedControl* weak;
+    } as;
+};
+
+void* abla_platform_alloc(size_t size);
+void abla_platform_free(void* pointer);
+_Noreturn void abla_platform_panic(const char* message, size_t length);
+
+AblaValue abla_void(void);
+AblaValue abla_null(void);
+AblaValue abla_i64(int64_t value);
+AblaValue abla_bool(bool value);
+AblaValue abla_string_static(const char* data, size_t length);
+AblaValue abla_function(uint32_t function);
+AblaValue abla_closure(
+    uint32_t function,
+    const AblaValue* captures,
+    size_t capture_count);
+
+void abla_host_set_arguments(int argc, char** argv);
+AblaValue ablaHostArgumentCount(void);
+AblaValue ablaHostArgument(AblaValue index);
+AblaValue ablaHostReadFile(AblaValue path);
+AblaValue ablaHostWriteFile(AblaValue path, AblaValue contents);
+AblaValue ablaHostWriteFileAtomic(AblaValue path, AblaValue contents);
+AblaValue ablaHostCreateParentDirectories(AblaValue path);
+AblaValue ablaHostCreateDirectories(AblaValue path);
+AblaValue ablaHostFileKind(AblaValue path);
+AblaValue ablaHostFileSize(AblaValue path);
+AblaValue ablaHostListDirectory(AblaValue path);
+AblaValue ablaHostMoveFile(AblaValue source, AblaValue destination);
+AblaValue ablaHostRemoveFile(AblaValue path);
+AblaValue ablaHostCurrentDirectory(void);
+AblaValue ablaHostReadStdinLine(void);
+AblaValue ablaHostStdinLineAvailable(void);
+AblaValue ablaHostWriteStdout(AblaValue text);
+AblaValue ablaHostWriteStderr(AblaValue text);
+AblaValue ablaHostRunProcess(AblaValue arguments);
+AblaValue ablaHostCaptureProcess(AblaValue arguments);
+AblaValue ablaHostStartProcess(AblaValue arguments);
+AblaValue ablaHostStopProcess(AblaValue process);
+AblaValue ablaHostStopProcessGracefully(
+    AblaValue process,
+    AblaValue grace_milliseconds);
+AblaValue ablaHostSleep(AblaValue milliseconds);
+AblaValue ablaHostFileRevision(AblaValue path);
+AblaValue ablaHostTcpListen(AblaValue port, AblaValue backlog);
+AblaValue ablaHostTcpAccept(AblaValue listener);
+AblaValue ablaHostTcpLocalPort(AblaValue listener);
+AblaValue ablaHostTcpRead(AblaValue connection, AblaValue maximum);
+AblaValue ablaHostTcpWrite(AblaValue connection, AblaValue contents);
+AblaValue ablaHostTcpClose(AblaValue descriptor);
+AblaValue ablaHostEnableGracefulShutdown(void);
+AblaValue ablaHostShutdownRequested(void);
+AblaValue ablaHostMemoryCheckpoint(void);
+AblaValue ablaHostMemoryReset(AblaValue checkpoint);
+AblaValue ablaHostMemoryLiveBytes(void);
+AblaValue ablaHostMemoryLimit(void);
+AblaValue ablaHostMemorySetLimit(AblaValue limit);
+
+// Seed-C adapters for LLVM intrinsics. Native LLVM output lowers these
+// operations directly and does not import these symbols.
+AblaValue ablaUnsafeAllocate(AblaValue size);
+AblaValue ablaUnsafeFree(AblaValue pointer);
+AblaValue ablaUnsafeLoadI64(AblaValue address);
+AblaValue ablaUnsafeStoreI64(AblaValue address, AblaValue value);
+AblaValue ablaUnsafeLoadPointer(AblaValue address);
+AblaValue ablaUnsafeStorePointer(AblaValue address, AblaValue value);
+AblaValue ablaUnsafeNullPointer(void);
+AblaValue ablaUnsafePointerIsNull(AblaValue value);
+AblaValue ablaUnsafeCallMain(AblaValue address);
+AblaValue ablaUnsafeCStringAddress(AblaValue value);
+AblaValue ablaUnsafePointerAddress(AblaValue value);
+AblaValue ablaUnsafePointerOffset(AblaValue value, AblaValue offset);
+AblaValue ablaUnsafeLoadU8(AblaValue address);
+AblaValue ablaUnsafeStoreU8(AblaValue address, AblaValue value);
+AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length);
+AblaValue ablaUnsafeBorrowCString(AblaValue address);
+AblaValue ablaLinuxSyscall(
+    AblaValue number,
+    AblaValue argument0,
+    AblaValue argument1,
+    AblaValue argument2,
+    AblaValue argument3,
+    AblaValue argument4,
+    AblaValue argument5);
+AblaValue ablaLinuxArgumentCount(void);
+AblaValue ablaLinuxArgument(AblaValue index);
+AblaValue ablaLinuxEnvironmentPointer(void);
+AblaValue ablaRuntimeMemoryCheckpoint(void);
+AblaValue ablaRuntimeMemoryReset(AblaValue checkpoint);
+AblaValue ablaRuntimeMemoryLiveBytes(void);
+AblaValue ablaRuntimeMemoryLimit(void);
+AblaValue ablaRuntimeMemorySetLimit(AblaValue limit);
+AblaValue ablaRuntimeMemoryCollect(void);
+int64_t abla_platform_memory_checkpoint(void);
+void abla_platform_memory_reset(int64_t checkpoint);
+int64_t abla_platform_memory_live_bytes(void);
+int64_t abla_platform_memory_limit(void);
+void abla_platform_memory_set_limit(int64_t limit);
+void abla_platform_memory_set_scan(void* pointer, int64_t scan_size);
+void abla_platform_memory_set_layout(void* pointer, int64_t layout);
+int64_t abla_platform_memory_collect(void* root_frames);
+
+int64_t abla_as_i64(AblaValue value);
+bool abla_as_bool(AblaValue value);
+const char* abla_as_cstring(AblaValue value);
+const char* abla_string_data(AblaValue value);
+uint32_t abla_as_function(AblaValue value);
+size_t abla_function_capture_count(AblaValue value);
+AblaValue abla_function_capture(AblaValue value, size_t index);
+AblaValue abla_cell_create(AblaValue value);
+AblaValue abla_cell_get(AblaValue cell);
+AblaValue abla_cell_set(AblaValue cell, AblaValue value);
+AblaValue abla_shared_create(AblaValue value);
+AblaValue abla_shared_clone(AblaValue value);
+AblaValue abla_shared_get(AblaValue value);
+AblaValue abla_shared_lock(AblaValue value);
+AblaValue abla_shared_unlock(AblaValue value);
+AblaValue abla_shared_release(AblaValue value);
+AblaValue abla_weak_create(AblaValue value);
+AblaValue abla_weak_clone(AblaValue value);
+AblaValue abla_weak_upgrade(AblaValue value);
+AblaValue abla_weak_alive(AblaValue value);
+AblaValue abla_weak_release(AblaValue value);
+
+AblaValue abla_negate(AblaValue value);
+AblaValue abla_not(AblaValue value);
+AblaValue abla_add(AblaValue left, AblaValue right);
+AblaValue abla_subtract(AblaValue left, AblaValue right);
+AblaValue abla_multiply(AblaValue left, AblaValue right);
+AblaValue abla_divide(AblaValue left, AblaValue right);
+AblaValue abla_equal(AblaValue left, AblaValue right);
+AblaValue abla_not_equal(AblaValue left, AblaValue right);
+AblaValue abla_less(AblaValue left, AblaValue right);
+AblaValue abla_less_equal(AblaValue left, AblaValue right);
+AblaValue abla_greater(AblaValue left, AblaValue right);
+AblaValue abla_greater_equal(AblaValue left, AblaValue right);
+
+AblaValue abla_to_string(AblaValue value);
+AblaValue abla_string_concat(AblaValue left, AblaValue right);
+AblaValue abla_string_length(AblaValue value);
+AblaValue abla_string_get(AblaValue value, AblaValue index);
+AblaValue abla_string_slice(AblaValue value, AblaValue begin, AblaValue end);
+AblaValue abla_length(AblaValue value);
+AblaValue abla_index_get(AblaValue value, AblaValue index);
+AblaValue abla_array_create(const AblaValue* values, size_t count);
+AblaValue abla_array_length(AblaValue value);
+AblaValue abla_array_append(AblaValue value, AblaValue element);
+AblaValue abla_array_get(AblaValue array, AblaValue index);
+void abla_array_set(AblaValue array, AblaValue index, AblaValue value);
+AblaValue abla_object_create(uint32_t type_symbol);
+AblaValue abla_field_get(AblaValue object, uint32_t field_symbol);
+void abla_field_set(AblaValue object, uint32_t field_symbol, AblaValue value);
+
+#endif
