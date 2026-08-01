@@ -1,147 +1,172 @@
-# ablac
+# Abla
 
-`ablac` is a clean-room implementation of the Abla programming language.
-Abla is a statically typed, expression-oriented language with Kotlin-inspired
-syntax and first-class compile-time execution. A program should be able to use
-the same Abla library in either phase and deliberately inspect or transform the
-program being compiled.
+Abla is an experimental programming language whose mission is to **make
+compile time as important as runtime**.
 
-This repository contains:
+Complex systems often begin with simple application code supported by complex
+generators, build scripts, and framework tooling written in other languages.
+Abla explores a different model: ordinary language code can also run during
+compilation, build constant values, inspect the program being compiled, and
+request validated program transformations.
 
-- a C++20 seed compiler (`ablac0`) retained for clean-room bootstrap checking;
-- the Abla runtime and standard library;
-- compatibility tests derived from the public behavior of `../abla-original`;
-- a self-hosted compiler, built in stages once the bootstrap language is rich
-  enough.
+The long-term vision extends the same model from compilation into execution,
+allowing programs to be deliberately inspected, extended, and replaced across
+their lifecycle. This is powerful, advanced functionality rather than a goal of
+being a beginner-oriented language. Kotlin strongly influenced the surface
+syntax, but the language remains free to evolve while it is experimental.
 
-The design is specified in [docs/language.md](docs/language.md), and the
-bootstrap invariants are in [docs/bootstrap.md](docs/bootstrap.md). The
-[original implementation audit](docs/original-audit.md) records what is real,
-partial, and only planned. We preserve
-the useful surface syntax of the prototype, including optional semicolons,
-while making incomplete or accidental behavior explicit.
+`ablac` is a clean-room implementation of the original Abla prototype. It
+contains a C++20 bootstrap seed, a self-hosted compiler written in Abla, the
+runtime and standard library, and compatibility tests derived from the public
+behavior of the prototype.
+
+## Status
+
+Abla is pre-release software under active compiler and language development.
+It is not ready for production use, and syntax, APIs, bootstrap stages, and
+toolchain behavior may change before a stable release.
+
+The current engineering state and known blockers are recorded in
+[docs/status.md](docs/status.md). A release candidate must pass the clean
+bootstrap, fixed-point, native conformance, cache, ownership, and libc-free
+gates listed there.
+
+## Example
+
+The `#` prefix evaluates an expression during compilation. The result becomes a
+normal value in the generated program:
+
+```abla
+fun square(value: int): int = value * value
+
+compile fun compileAdd(left: int, right: int): int = left + right
+
+fun main: int {
+    val generated = #square(6)
+    generated + #compileAdd(2, 2)
+}
+```
+
+Both compile-time expressions are evaluated by the compiler, so `main` returns
+`40`. Compile-time execution uses the same checked language model as runtime
+execution and is subject to explicit capabilities and resource limits.
+
+Abla also supports library-provided compile-time subparsers. For example, JSON
+can be constructed in either phase with the same source form:
+
+```abla
+#import("abla/json")
+
+fun main: int {
+    val frozen = #$json {"number": 20, "name": "abla"}
+    val runtime = $json {"number": 20}
+    frozen.getInt("number") + runtime.getInt("number")
+}
+```
 
 ## Development
 
-Enter the reproducible environment and run the checks:
+The development shell pins nixpkgs and the complete compiler toolchain. Install
+Nix, then enter the environment and build the seed compiler:
 
 ```sh
 nix-shell
+make
+```
+
+Run the ordinary test suite with:
+
+```sh
+make test
+```
+
+The complete bootstrap and fixed-point gate is substantially heavier and may
+use up to 4 GiB of memory:
+
+```sh
 make check
 ```
 
-Useful targets:
+Useful focused targets include:
 
 ```sh
-make                 # build build/ablac0
-make test            # unit and integration tests
-make bootstrap-check # check Abla-written compiler components and emitted C
-make bootstrap-stage1 # build the current native self-host subset compiler
-make bootstrap-selfhost # prove stage-2 behavior and byte-identical fixed point
-make bootstrap-llvm-selfhost # prove the complete LLVM-native compiler fixed point
-make ablac             # build the optimized guarded build/ablac user compiler
-make benchmark-selfhost # measure self-hosted source-to-C and source-to-native time
-make compat-original # parse every original example (requires ../abla-original)
-make compile SOURCE=program.ab OUTPUT=build/program
-make sanitize        # rebuild and test with ASan/UBSan
+make bootstrap-check          # validate Abla compiler components and emitted C
+make bootstrap-stage1         # build the native self-host subset compiler
+make bootstrap-selfhost       # prove the C bootstrap fixed point
+make bootstrap-llvm-selfhost  # prove the LLVM-native compiler fixed point
+make ablac                    # build the guarded self-hosted user compiler
+make sanitize                 # run the seed suite with ASan and UBSan
 make clean
 ```
 
-The stage-0 CLI can tokenize, parse, load imports, resolve names, and type-check
-a source file. It can also print verified IR or execute it in the same bounded
-machine used for compile-time evaluation:
+`make compat-original` additionally checks the original prototype examples
+when that repository is available at `../abla-original`.
+
+## Using the compilers
+
+The seed compiler is built as `build/ablac0`:
 
 ```sh
-build/ablac0 tokens example.ab
-build/ablac0 parse example.ab  # syntax only
-build/ablac0 check example.ab  # imports and name resolution
-build/ablac0 ir example.ab     # verified backend-neutral typed IR
-build/ablac0 emit-c example.ab # deterministic portable C
-build/ablac0 run example.ab    # execute verified IR in the bounded VM
+build/ablac0 tokens program.ab
+build/ablac0 parse program.ab
+build/ablac0 check program.ab
+build/ablac0 ir program.ab
+build/ablac0 emit-c program.ab
+build/ablac0 run program.ab
 ```
 
-After `make ablac`, the self-hosted user interface is:
+After `make ablac`, the self-hosted compiler provides the main user interface:
 
 ```sh
-build/ablac build app.ab -o build/app
-build/ablac build app.ab -o build/app --fast
-build/ablac build app.ab -o build/app --fast --no-cache
-build/ablac build app.ab --target x86_64-linux-raw -o build/app.raw
-build/ablac run app.ab
+build/ablac build program.ab -o build/program
+build/ablac build program.ab -o build/program --fast
+build/ablac build program.ab --target x86_64-linux-raw -o build/program.raw
+build/ablac run program.ab
 build/ablac repl
-build/ablac serve app.ab
+build/ablac serve program.ab
 ```
 
-On NixOS these commands lazily enter the pinned `nix-shell` when the LLVM tools
-are not already on `PATH`; `--emit-llvm` remains a direct compiler-only command.
-`run` executes emitted IR through LLVM ORC inside `ablac`; `build` performs
-LLVM O2 optimization and object emission through libLLVM in the same process,
-then links the executable. `--fast` skips whole-module optimization and uses
-LLVM's low-latency code generator; O2 remains the release default.
-`x86_64-linux-raw` links directly with LLD and emits a static ELF with its own
-startup, syscall allocator, and memory primitives: no CRT, libc, ELF
-interpreter, or dynamic dependency. The target rejects source that selects a
-host or LLVM runtime capability instead of silently reintroducing one.
-Unchanged builds reuse an exact-source/profile-keyed native object and still
-relink against the current selected capabilities. `repl` retains one LLJIT and
-reclaims each evaluated generation. `serve` retains per-module source/import
-snapshots and dependency-fingerprinted staged ASTs, selects the
-fast profile, watches the complete import graph, rejects invalid edits,
-and gracefully drains an active HTTP request before a validated native worker
-is replaced. TCP, polling, and graceful `SIGTERM` handling are raw Abla Linux
-code; the AOT and JIT HTTP gates use no project C capability library.
+The raw x86-64 Linux target emits a static executable with its own startup,
+allocator, and system-call boundary, without a C runtime, libc, ELF interpreter,
+or dynamic dependency. Hosted LLVM remains available for development, JIT
+execution, and C interoperability.
 
-No generated files are committed. Build products stay under `build/`.
+Generated files are not committed. Build products and compiler caches stay
+under `build/`.
 
-`make test` compares VM execution with independently compiled native programs
-and compiles generated C with warnings promoted to errors. The parity suite
-covers recursion, loops, growable arrays, byte-indexed strings, lambdas, scalar
-and compound compile-time values, compiler reflection, `$json`/`$html`
-subparser expressions in both phases (including an Abla-authored JSON parser), classes,
-interpolated strings, early `return` in runtime and compile-time code,
-standard-library imports, and an explicit C ABI call.
+## Project principles
 
-The current bootstrap rung is documented in
-[docs/self-hosting.md](docs/self-hosting.md), and the exact remaining route to
-a compiler/toolchain requiring neither C nor libc is
-[docs/full-self-hosting.md](docs/full-self-hosting.md). The Abla-written compiler now
-compiles its complete source graph directly to LLVM, and that native compiler
-reproduces byte-identical LLVM IR for itself. Its `build`, `run`, and `serve`
-commands are implemented in Abla, and generated LLVM contains the tagged-value,
-closure, collection, object, rope-string, and pure-program allocator/panic
-runtime. Pure and target-backed `abla/io`, `abla/fs`, and `abla/process`
-programs link no project C symbol; explicit host-capability calls select the
-ABI-compatible tracked adapter. The compiler itself now performs module,
-cache, watch, terminal, argument, and sleep operations through raw Abla Linux
-modules, and watched rebuilds refresh only changed module snapshots. The
-compiler has no active project-C host capability. It still dynamically links
-the C++-implemented `libLLVM` and the hosted system runtime, while the raw
-target still uses Clang/LLD to compile startup assembly and link. Those are
-explicit remaining dependencies, alongside the clean-bootstrap seed policy.
-The current compiler no longer
-invokes `opt` or `llc`; `abla/sys/linux` lowers x86-64 syscalls directly. Native
-LLVM builds also no longer compile or link the legacy `abla_runtime.c`; it is
-retained only for generated-C bootstrap and differential tests.
+- Use one coherent language model for compile-time and runtime execution.
+- Validate compiler-generated syntax and declarations through the ordinary
+  parser, resolver, type checker, ownership checker, and IR verifier.
+- Make filesystem, environment, network, clock, and native access explicit
+  capabilities rather than invisible compiler privileges.
+- Keep builds deterministic, bounded, transactional, and reproducible.
+- Preserve a readable source bootstrap and prove fixed points before promotion.
+- Keep hosted facilities optional and maintain a libc-free production target.
 
-After the first clean bootstrap, `make self-rebuild` takes the project-C-free
-source path: it
-forces the native Abla compiler to recompile its complete Abla source graph
-without the object cache or project C/C++ compilation, verifies byte-identical LLVM, and
-builds a child program with the result. `--no-cache` is also available directly
-for reproducibility and profiling. Authorized compile-time filesystem reads,
-including reads performed by subparser handlers/finalizers, are journaled into
-the native artifact identity and revalidated before frontend or object-cache
-reuse; unsupported ambient effects remain uncached.
+## Documentation
 
-The standard-library layout and minimal-binary rules are in
-[docs/standard-library.md](docs/standard-library.md). A working version-aware
-HTTP example is [examples/versioned-http-server.ab](examples/versioned-http-server.ab).
-The gated path from the current fixed point to safe memory, hermetic
-compile-time execution, production reliability, and clean-bootstrap trust is
-specified in [docs/reliability-roadmap.md](docs/reliability-roadmap.md).
-Native runtimes enforce a one-GiB default cumulative tracked-heap budget,
-including libc-free executables; `abla/memory` can inspect or explicitly change
-it. Its tracing collector reclaims unreachable cycles using compiler-emitted,
-higher-order-aware roots and precise allocation-layout maps. Calling
-`memorySetLimit` opts a program into bounded automatic pressure safe points;
-affine native storage is pinned until its deterministic drop or region reset.
+- [Language contract](docs/language.md)
+- [Toolchain interface](docs/toolchain.md)
+- [Bootstrap architecture](docs/bootstrap.md)
+- [Self-hosting status](docs/self-hosting.md)
+- [Standard library](docs/standard-library.md)
+- [Compile-time subparsers](docs/subparsers.md)
+- [Reliability roadmap](docs/reliability-roadmap.md)
+- [Full self-hosting plan](docs/full-self-hosting.md)
+- [RFCs](rfc/)
+
+The [original implementation audit](docs/original-audit.md) separates behavior
+that was demonstrated by the prototype from incomplete or aspirational design.
+
+## Contributing
+
+The language is still defining its safety, bootstrap, package, and extension
+contracts. Contributions should include focused positive, negative, and
+regression tests and preserve the documented resource and reproducibility
+gates.
+
+## License
+
+Abla is licensed under the [Mozilla Public License 2.0](LICENSE).
