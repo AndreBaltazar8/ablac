@@ -47,6 +47,16 @@ nested_deferred_identity_status=$?
 set -e
 [[ $nested_deferred_identity_status -eq 42 ]]
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/nested-deferred-nominal-action.ab" \
+    -o "$output_directory/nested-deferred-nominal-program" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$output_directory/nested-deferred-nominal-program"
+nominal_status=$?
+set -e
+[[ $nominal_status -eq 42 ]]
+
 set +e
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/invalid-resolved-method-builder.ab" \
@@ -103,4 +113,5 @@ grep -q 'extension.request:expected.request.namespace:' \
 grep -q 'finalizer returned the wrong result kind or namespace' \
     "$output_directory/invalid-request-result.err"
 
-printf '%s\n' 'subparser extension: nested deferred calls + source identity + post-resolution handles + provenance-carrying AST publication + rollback passed'
+printf '%s\n' \
+    'subparser extension: nested deferred calls + source identity + nominal-result adapters + post-resolution handles + provenance-carrying AST publication + rollback passed'
