@@ -1,0 +1,86 @@
+#import("actions.ab")
+#import("abla/android/build")
+#import("abla/compiler")
+
+#compilerGrant("filesystem.write")
+
+compile fun rpcAnnotated(function: int): bool {
+    var found = false
+    var index = 0
+    while (index < compiler.annotationCount(function)) {
+        if (compiler.annotation(function, index) == "rpc") found = true
+        index = index + 1
+    }
+    found
+}
+
+compile fun writeRpcAndroidProject(
+    root: string,
+    actionName: string,
+    currentName: string,
+    amountName: string
+): bool {
+    val settings = "pluginManagement {\n    repositories {\n        google()\n        mavenCentral()\n        gradlePluginPortal()\n    }\n}\n\ndependencyResolutionManagement {\n    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)\n    repositories {\n        google()\n        mavenCentral()\n    }\n}\n\nrootProject.name = \"AblaRpcCounter\"\n"
+    val gradle = "plugins {\n    id(\"com.android.application\") version \"8.13.0\"\n    id(\"org.jetbrains.kotlin.android\") version \"2.2.20\"\n}\n\nandroid {\n    namespace = \"org.abla.rpc.example\"\n    compileSdk = 36\n    buildToolsVersion = \"36.0.0\"\n    ndkVersion = \"28.2.13676358\"\n\n    defaultConfig {\n        applicationId = \"org.abla.rpc.example\"\n        minSdk = 24\n        targetSdk = 36\n        versionCode = 1\n        versionName = \"0.0.1\"\n        ndk { abiFilters += \"arm64-v8a\" }\n    }\n\n    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }\n\n    externalNativeBuild {\n        cmake {\n            path = file(\"src/main/cpp/CMakeLists.txt\")\n            version = \"3.22.1\"\n        }\n    }\n\n    sourceSets[\"main\"].jniLibs.srcDir(\"src/main/jniLibs\")\n}\n\nkotlin {\n    compilerOptions {\n        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)\n    }\n}\n"
+    val manifest = "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n    <uses-permission android:name=\"android.permission.INTERNET\" />\n    <application\n        android:allowBackup=\"false\"\n        android:label=\"Abla RPC Counter\"\n        android:theme=\"@android:style/Theme.Material.Light.NoActionBar\"\n        android:usesCleartextTraffic=\"true\">\n        <activity\n            android:name=\".MainActivity\"\n            android:exported=\"true\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.MAIN\" />\n                <category android:name=\"android.intent.category.LAUNCHER\" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n"
+    val activity = "package org.abla.rpc.example\n\nimport android.app.Activity\nimport android.os.Bundle\nimport android.view.Gravity\nimport android.widget.Button\nimport android.widget.LinearLayout\nimport android.widget.TextView\nimport java.net.HttpURLConnection\nimport java.net.URL\n\nclass MainActivity : Activity() {\n    private val endpoint = \"http://10.0.2.2:18080/rpc/$actionName\"\n    private var current = AblaApp.answer()\n\n    override fun onCreate(state: Bundle?) {\n        super.onCreate(state)\n\n        val value = TextView(this).apply {\n            gravity = Gravity.CENTER\n            textSize = 32f\n            text = current.toString()\n        }\n        val increment = Button(this).apply {\n            text = \"Increment on server\"\n            setOnClickListener {\n                isEnabled = false\n                text = \"Calling $actionName...\"\n                Thread { callIncrement(value, this) }.start()\n            }\n        }\n        val layout = LinearLayout(this).apply {\n            orientation = LinearLayout.VERTICAL\n            gravity = Gravity.CENTER\n            addView(value)\n            addView(increment)\n        }\n        setContentView(layout)\n    }\n\n    private fun callIncrement(value: TextView, button: Button) {\n        try {\n            val target = endpoint + \"?$currentName=\" + current + \"&$amountName=1\"\n            val connection = URL(target).openConnection() as HttpURLConnection\n            connection.requestMethod = \"POST\"\n            connection.connectTimeout = 3000\n            connection.readTimeout = 3000\n            val status = connection.responseCode\n            if (status !in 200..299) error(\"HTTP \" + status)\n            val next = connection.inputStream.bufferedReader().use { it.readText() }.trim().toLong()\n            connection.disconnect()\n            current = next\n            runOnUiThread {\n                value.text = current.toString()\n                button.text = \"Increment on server\"\n                button.isEnabled = true\n            }\n        } catch (failure: Exception) {\n            runOnUiThread {\n                button.text = \"Retry: \" + (failure.message ?: \"RPC failed\")\n                button.isEnabled = true\n            }\n        }\n    }\n}\n"
+    var written = compiler.writeFile("$root/settings.gradle.kts", settings)
+    if (written) written = compiler.writeFile("$root/build.gradle.kts", gradle)
+    if (written) written = compiler.writeFile(
+        "$root/src/main/AndroidManifest.xml",
+        manifest
+    )
+    if (written) written = compiler.writeFile(
+        "$root/src/main/kotlin/org/abla/rpc/example/MainActivity.kt",
+        activity
+    )
+    written
+}
+
+compile fun writeRpcServer(
+    root: string,
+    actionName: string,
+    currentName: string,
+    amountName: string
+): bool {
+    val source = "#import(\"abla/http\")\n#import(\"../../../examples/android-rpc/actions.ab\")\n\nfun handleRpc(request: HttpRequest): HttpResponse {\n    val current = httpDecimalLength(request.parameter(\"$currentName\"), 1000000)\n    val amount = httpDecimalLength(request.parameter(\"$amountName\"), 1000000)\n    if (current < 0 || amount < 0) {\n        return httpText(\"expected non-negative integer parameters: $currentName, $amountName\", 400)\n    }\n    val result = $actionName(current, amount)\n    httpText(\"\$result\")\n}\n\nfun main: int {\n    val rpc = httpRouter()\n    rpc.post(\"/rpc/$actionName\", handleRpc)\n    serveHttp(rpc, 18080)\n}\n"
+    compiler.writeFile("$root/server.ab", source)
+}
+
+compile fun configureRpcExample(): void {
+    val root = "build/examples/android-rpc"
+    val action = compiler.findFunction("incrementCounter")
+    if (rpcAnnotated(action) &&
+        compiler.parameterCount(action) == 2 &&
+        compiler.parameterType(action, 0) == "i64" &&
+        compiler.parameterType(action, 1) == "i64" &&
+        compiler.resultType(action) == "i64") {
+        val actionName = compiler.functionName(action)
+        val currentName = compiler.parameterName(action, 0)
+        val amountName = compiler.parameterName(action, 1)
+        writeRpcAndroidProject(root, actionName, currentName, amountName)
+        writeRpcServer(root, actionName, currentName, amountName)
+        compiler.buildProgram(
+            "abla-android-rpc-server",
+            "$root/server.ab",
+            "$root/rpc-server",
+            "x86_64-linux",
+            "executable",
+            true,
+            true
+        )
+        androidBuildArm64Library(
+            "abla-android-rpc-app",
+            "examples/android-rpc/app.ab",
+            root,
+            "org.abla.rpc.example",
+            true,
+            true
+        )
+    }
+    return
+}
+
+#compiler.transform(configureRpcExample)
+
+fun main: int = 0

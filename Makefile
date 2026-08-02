@@ -144,6 +144,8 @@ ablac-force: bootstrap-llvm-selfhost
 	ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=120 tools/run-limited.sh \
 		nix-shell --run 'tools/test-android-extension.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=120 tools/run-limited.sh \
+		nix-shell --run 'tools/test-android-rpc-example.sh $(BUILD_DIR)/ablac.bin'
+	ABLA_MAX_MEMORY_MB=4096 ABLA_MAX_SECONDS=120 tools/run-limited.sh \
 		nix-shell --run 'tools/test-wasm-mvc-extension.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-canonical-module-paths.sh $(BUILD_DIR)/ablac.bin'

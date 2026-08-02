@@ -140,6 +140,8 @@ under `build/`.
 - [Android hello world](examples/android/README.md) compiles Abla to an arm64
   `libabla_app.so`, generates its JNI/Kotlin project, and produces a runnable
   debug APK and release AAB with a pinned Nix/Gradle/Android toolchain.
+- [Android RPC counter](examples/android-rpc/README.md) reflects one `@rpc`
+  action into a generated click client and a separately compiled native server.
 - [Versioned HTTP server](examples/versioned-http-server.ab) demonstrates
   header-selected endpoint versions on the hosted server stack.
 
