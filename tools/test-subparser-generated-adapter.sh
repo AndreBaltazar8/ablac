@@ -67,6 +67,26 @@ late_nominal_status=$?
 set -e
 [[ $late_nominal_status -eq 42 ]]
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/cross-late-root.ab" \
+    -o "$output_directory/cross-late-program" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$output_directory/cross-late-program"
+cross_late_status=$?
+set -e
+[[ $cross_late_status -eq 42 ]]
+
+"$compiler" build \
+    "$project_root/tests/cases/modules/cross-late-root-reversed.ab" \
+    -o "$output_directory/cross-late-reversed-program" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$output_directory/cross-late-reversed-program"
+cross_late_reversed_status=$?
+set -e
+[[ $cross_late_reversed_status -eq 42 ]]
+
 set +e
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/invalid-resolved-method-builder.ab" \
@@ -182,4 +202,4 @@ grep -q 'error\[E_NATIVE_TOOLCHAIN\]: native toolchain failed with status' \
     "$output_directory/invalid-native-toolchain.err"
 
 printf '%s\n' \
-    'subparser extension: nested/late deferred calls + structured parser/finalizer/generated/native diagnostics + nominal adapters + provenance + rollback passed'
+    'subparser extension: nested/same-file/cross-module deferred calls + import-order-independent nominal adapters + structured diagnostics + provenance + rollback passed'
