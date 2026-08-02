@@ -24,6 +24,11 @@ export ABLA_FAST_SELFHOST_BUILD_MEMORY_MB
 
 BUILD_DIR := build
 ABLA_VERIFICATION_STAMP := $(BUILD_DIR)/.ablac-verified
+ABLA_BUILD_STAMP := $(BUILD_DIR)/.ablac-built
+ABLA_COMPILER_FINGERPRINT = { \
+	find bootstrap/compiler runtime stdlib -type f -print0; \
+	printf '%s\0' Makefile shell.nix tools/run-limited-compiler.sh; \
+} | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
 ABLA_VERIFICATION_FINGERPRINT = { \
 	find bootstrap include runtime src stdlib tests tools -type f -print0; \
 	printf '%s\0' Makefile shell.nix; \
@@ -42,11 +47,18 @@ all: $(BUILD_DIR)/ablac0
 
 ablac:
 	@set -e; \
-	current_fingerprint=$$($(ABLA_VERIFICATION_FINGERPRINT)); \
-	verified_fingerprint=$$(sed -n '1p' $(ABLA_VERIFICATION_STAMP) 2>/dev/null || true); \
-	if test ! -x $(BUILD_DIR)/ablac.bin || \
-		test "$$current_fingerprint" != "$$verified_fingerprint"; then \
+	current_fingerprint=$$($(ABLA_COMPILER_FINGERPRINT)); \
+	built_fingerprint=$$(sed -n '1p' $(ABLA_BUILD_STAMP) 2>/dev/null || true); \
+	if test ! -x $(BUILD_DIR)/ablac.bin; then \
 		$(MAKE) ablac-force; \
+	elif test "$$current_fingerprint" != "$$built_fingerprint"; then \
+		ABLA_MAX_MEMORY_MB=$(ABLA_FAST_SELFHOST_BUILD_MEMORY_MB) ABLA_MAX_SECONDS=120 \
+			tools/run-limited.sh nix-shell --run \
+			'$(BUILD_DIR)/ablac.bin build bootstrap/compiler/orc_main.ab -o $(BUILD_DIR)/ablac.bin --fast --no-cache'; \
+		ln -sfn ../tools/run-limited-compiler.sh $(BUILD_DIR)/ablac; \
+		stamp_tmp=$(ABLA_BUILD_STAMP).tmp; \
+		printf '%s\n' "$$current_fingerprint" > "$$stamp_tmp"; \
+		mv "$$stamp_tmp" $(ABLA_BUILD_STAMP); \
 	fi
 
 ablac-force: bootstrap-llvm-selfhost
@@ -71,7 +83,7 @@ ablac-force: bootstrap-llvm-selfhost
 		$(BUILD_DIR)/bootstrap/ablac-orc.self2.ll
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-inprocess-aot.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=$(ABLA_FAST_SELFHOST_BUILD_MEMORY_MB) ABLA_MAX_SECONDS=120 tools/run-limited.sh \
 		nix-shell --run 'tools/test-fast-aot.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=$(ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB) ABLA_MAX_SECONDS=240 tools/run-limited.sh \
 		nix-shell --run 'tools/test-pure-self-rebuild.sh $(BUILD_DIR)/ablac.bin'
@@ -187,7 +199,11 @@ ablac-force: bootstrap-llvm-selfhost
 	current_fingerprint=$$($(ABLA_VERIFICATION_FINGERPRINT)); \
 	stamp_tmp=$(ABLA_VERIFICATION_STAMP).tmp; \
 	printf '%s\n' "$$current_fingerprint" > "$$stamp_tmp"; \
-	mv "$$stamp_tmp" $(ABLA_VERIFICATION_STAMP)
+	mv "$$stamp_tmp" $(ABLA_VERIFICATION_STAMP); \
+	build_fingerprint=$$($(ABLA_COMPILER_FINGERPRINT)); \
+	build_stamp_tmp=$(ABLA_BUILD_STAMP).tmp; \
+	printf '%s\n' "$$build_fingerprint" > "$$build_stamp_tmp"; \
+	mv "$$build_stamp_tmp" $(ABLA_BUILD_STAMP)
 
 self-rebuild:
 	@test -x $(BUILD_DIR)/ablac.bin || { \

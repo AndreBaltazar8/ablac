@@ -1,0 +1,1 @@
+- Support value-bearing returns from blocks inside functions.

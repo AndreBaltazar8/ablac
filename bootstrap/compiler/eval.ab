@@ -108,7 +108,6 @@ fun bootstrapStageArtifactRootRequest(
         if (sameArtifact && !sameArtifactSettings) valid = false
         index = index + 1
     }
-    if (duplicate) return true
     if (valid) valid = Path(root).createDirectories()
     val requestIndex = bootstrapArtifactRootRequestCount
     if (valid) valid = Path("$root/$requestIndex.name").writeTextAtomic(
@@ -146,7 +145,7 @@ fun bootstrapStageArtifactRootRequest(
         Path("$root/$requestIndex.fast").remove()
         Path("$root/$requestIndex.cache").remove()
     }
-    valid
+    valid || duplicate
 }
 
 fun bootstrapTakeArtifactRootRequests(): array<BootstrapArtifactRootRequest> {
@@ -629,7 +628,7 @@ fun bootstrapRecordBuildTransactionPath(path: string): bool {
         if (Path("$root/$index.path").readText() == path) recorded = true
         index = index + 1
     }
-    if (recorded) return true
+    if (recorded) valid = false
     if (bootstrapBuildTransactionCount >= 512) valid = false
     val destination = Path(path)
     val existed = destination.exists()
@@ -648,11 +647,21 @@ fun bootstrapRecordBuildTransactionPath(path: string): bool {
         Path("$root/$journalIndex.path").remove()
         Path("$root/$journalIndex.existed").remove()
     }
-    valid
+    valid || recorded
 }
 
 fun bootstrapCommitBuildTransaction(): void {
     bootstrapBuildTransactionActive = false
+    val root = bootstrapBuildTransactionRoot()
+    var index = 0
+    while (index < bootstrapBuildTransactionCount) {
+        val path = Path("$root/$index.path").readText()
+        if (Path("$root/$index.existed").readText() == "1" &&
+            !Path(path).exists()) {
+            Path("$root/$index.data").moveTo(Path(path))
+        }
+        index = index + 1
+    }
     bootstrapClearBuildTransactionJournal()
     bootstrapSemanticUnit()
 }
@@ -2154,43 +2163,45 @@ class BootstrapEvaluator(
         var seen: array<int>,
         path: string
     ): string {
-        if (declaration < 0 || declaration >= this.declarations.size ||
-            this.intArrayContains(seen, declaration)) return ""
-        seen.append(declaration)
-        val root = this.declarations[declaration]
-        if (root.kind == "var") return "$path -> ${root.name}"
-        if (root.kind == "val" && root.expression.kind != "compile") {
-            return "$path -> ${root.name}"
-        }
-        val references: array<int> = []
-        var bound: array<string> = []
-        if (root.kind == "fun" || root.kind == "compile.fun") {
-            var parameter = 0
-            while (parameter < root.parameters.size) {
-                bound.append(root.parameters[parameter])
-                parameter = parameter + 1
+        var result = ""
+        if (declaration >= 0 && declaration < this.declarations.size &&
+            !this.intArrayContains(seen, declaration)) {
+            seen.append(declaration)
+            val root = this.declarations[declaration]
+            if (root.kind == "var" ||
+                (root.kind == "val" &&
+                 root.expression.kind != "compile")) result = path
+            val references: array<int> = []
+            var bound: array<string> = []
+            if (result == "" &&
+                (root.kind == "fun" || root.kind == "compile.fun")) {
+                var parameter = 0
+                while (parameter < root.parameters.size) {
+                    bound.append(root.parameters[parameter])
+                    parameter = parameter + 1
+                }
+            }
+            if (result == "" &&
+                (root.kind == "fun" || root.kind == "compile.fun" ||
+                 root.kind == "val")) {
+                this.sliceCollectReferencedDeclarations(
+                    root.expression,
+                    bound,
+                    references
+                )
+            }
+            var dependency = 0
+            while (result == "" && dependency < references.size) {
+                val handle = references[dependency]
+                result = this.slicePathFromReachableUnsupported(
+                    handle,
+                    seen,
+                    "$path -> ${this.declarations[handle].name}"
+                )
+                dependency = dependency + 1
             }
         }
-        if (root.kind == "fun" || root.kind == "compile.fun" ||
-            root.kind == "val") {
-            this.sliceCollectReferencedDeclarations(
-                root.expression,
-                bound,
-                references
-            )
-        }
-        var dependency = 0
-        while (dependency < references.size) {
-            val handle = references[dependency]
-            val next = this.slicePathFromReachableUnsupported(
-                handle,
-                seen,
-                "$path -> ${this.declarations[handle].name}"
-            )
-            if (next != "") return next
-            dependency = dependency + 1
-        }
-        ""
+        result
     }
 
     fun lambdaMutatesCapturedPlace(
@@ -2809,6 +2820,7 @@ class BootstrapEvaluator(
                 reflected.integer >= 0 &&
                 reflected.integer < this.declarations.size &&
                 this.declarations[reflected.integer].kind == "fun"
+            var conflict = false
             var functionName = ""
             if (valid) {
                 val declaration = this.declarations[reflected.integer]
@@ -2855,14 +2867,22 @@ class BootstrapEvaluator(
                         cache.boolean
                     )
                 )
+                if (!valid) conflict = true
             }
             if (valid) {
                 result = bootstrapEvalBoolean(true)
             } else {
-                this.recordEvaluatorDiagnostic(
-                    "E_ARTIFACT_ROOT_REQUEST",
-                    "compiler.contributeArtifactRoot requires a unique top-level bool/int function and one consistent bounded artifact contribution"
-                )
+                if (conflict) {
+                    this.recordEvaluatorDiagnostic(
+                        "E_ARTIFACT_ROOT_CONFLICT",
+                        "compiler.contributeArtifactRoot conflicts with an existing contribution for artifact `${name.text}`; one artifact requires consistent settings and one declaration/export mapping"
+                    )
+                } else {
+                    this.recordEvaluatorDiagnostic(
+                        "E_ARTIFACT_ROOT_REQUEST",
+                        "compiler.contributeArtifactRoot requires a unique top-level bool/int function and one consistent bounded artifact contribution"
+                    )
+                }
                 this.errors = this.errors + 1
                 result = bootstrapEvalBoolean(false)
             }
@@ -3005,7 +3025,8 @@ class BootstrapEvaluator(
                     valid = false
                 }
             }
-            while (valid && declarationPath == "" &&
+            while (valid && !bootstrapArtifactSliceActive &&
+                   declarationPath == "" &&
                    declarationIndex < this.declarations.size) {
                 val declaration = this.declarations[declarationIndex]
                 if (declaration.kind == "var" ||

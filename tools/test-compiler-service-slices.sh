@@ -8,9 +8,11 @@ module="$output_directory/client.wasm"
 stateful_output_directory="$project_root/build/artifact-slice-stateful"
 stateful_module="$stateful_output_directory/client.wasm"
 stateful_fail_output="$stateful_output_directory/fail"
+stateful_conflict_output="$project_root/build/artifact-slice-stateful-conflict"
 mkdir -p "$output_directory"
 mkdir -p "$stateful_output_directory"
 mkdir -p "$stateful_fail_output"
+mkdir -p "$stateful_conflict_output"
 
 set +e
 "$compiler" run \
@@ -128,12 +130,30 @@ set +e
 invalid_stateful_status=$?
 set -e
 [[ $invalid_stateful_status -ne 0 ]]
-grep -q 'error[E_ARTIFACT_SLICE_REACHABILITY]' \
+grep -Fq 'error[E_ARTIFACT_SLICE_REACHABILITY]' \
     "$stateful_output_directory/stateful-invalid.err"
-if grep -q 'error[E_EXPORT_SIGNATURE_UNSUPPORTED]' \
+if grep -Fq 'error[E_EXPORT_SIGNATURE_UNSUPPORTED]' \
     "$stateful_output_directory/stateful-invalid.err"; then
     echo "stateful reachability failure regressed to generic export signature error" >&2
     exit 1
 fi
+
+rm -f "$stateful_conflict_output/server" \
+    "$stateful_conflict_output/client.wasm" \
+    "$stateful_conflict_output/client.wasm.abi.json"
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/program-build/artifact-slice-stateful-root-conflict.ab" \
+    -o "$stateful_conflict_output/server" --fast --no-cache \
+    >"$stateful_conflict_output/conflict.out" \
+    2>"$stateful_conflict_output/conflict.err"
+conflict_status=$?
+set -e
+[[ $conflict_status -ne 0 ]]
+grep -Fq 'error[E_ARTIFACT_ROOT_CONFLICT]' \
+    "$stateful_conflict_output/conflict.err"
+[[ ! -e "$stateful_conflict_output/server" ]]
+[[ ! -e "$stateful_conflict_output/client.wasm" ]]
+[[ ! -e "$stateful_conflict_output/client.wasm.abi.json" ]]
 
 echo "compiler service: annotations + validated self-transform + aggregated wasm artifact slices passed"

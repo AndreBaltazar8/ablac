@@ -94,7 +94,7 @@ make bootstrap-check          # validate Abla compiler components and emitted C
 make bootstrap-stage1         # build the native self-host subset compiler
 make bootstrap-selfhost       # prove the C bootstrap fixed point
 make bootstrap-llvm-selfhost  # prove the LLVM-native compiler fixed point
-make ablac                    # verify changed inputs and build the user compiler
+make ablac                    # fast incremental rebuild of the user compiler
 make ablac-force              # rerun the complete fixed-point/conformance gate
 make sanitize                 # run the seed suite with ASan and UBSan
 make clean

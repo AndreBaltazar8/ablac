@@ -25,7 +25,7 @@ find "$cache_directory" -mindepth 1 -maxdepth 1 -type f -delete
 
 partition_count() {
     find "$cache_directory" -maxdepth 1 -type f \
-        -name 'native-partition-linux-x86_64-llvm21-v1-*.o' | wc -l
+        -name 'native-partition-x86_64-linux-llvm21-v1-*.o' | wc -l
 }
 
 before=$(partition_count)

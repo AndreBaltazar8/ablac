@@ -27,11 +27,12 @@ stage-1/stage-2 behavioral parity, and the byte-identical `ablac2`/`ablac3`
 fixed point unless an explicitly versioned deterministic-output change updates
 both stages together.
 
-The release gate is incremental without weakening a clean audit. A successful
-`make ablac` records an ignored content fingerprint covering all compiler,
-runtime, tool, and test inputs. Repeating it with unchanged inputs is
-immediate; adding, deleting, or editing any gated input reruns the proof. Use
-`make ablac-force` to request the complete proof unconditionally.
+The development compiler build is incremental. A successful `make ablac`
+records an ignored content fingerprint covering compiler, runtime, standard
+library, shell and launcher inputs. Repeating it with unchanged inputs is
+immediate; changing compiler inputs performs one fast self-build from the
+promoted compiler. Use `make ablac-force` for the complete bootstrap fixed
+point and conformance proof.
 
 The final native conformance programs remain uncached O2 builds, but independent
 fixtures run concurrently under a memory-aware job cap. On the reference
