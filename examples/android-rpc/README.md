@@ -1,26 +1,35 @@
-# Android RPC counter
+# Android discovered RPC action
 
-This example turns one annotated Abla function into a server endpoint and a
-generated Android click handler. Pressing the button calls the server, which
-increments the counter by running the original Abla function.
-
-[actions.ab](actions.ab) is the single source of truth:
+This example uses the same late typed-call discovery model as `abla-mvc`. The
+application and server action live together in [main.ab](main.ab):
 
 ```abla
 @rpc
-fun incrementCounter(current: int, amount: int): int = current + amount
+fun incrementCounter(current: int): int = current + 1
+
+fun initialCounter: int = 0
+
+fun counterApplication: int =
+    $androidclick { incrementCounter(initialCounter()) }
 ```
 
-At compile time, [build.ab](build.ab) uses the imported `compiler` service to
-inspect the annotation, function name, parameter names, and types. It then:
+The `$androidclick` parser extension records the call rather than looking up a
+hard-coded function name. After ordinary name resolution and type checking, its
+finalizer requires a resolved `@rpc (int) -> int` target and generates a typed
+adapter. The build selects annotated actions generically and derives both sides
+of the boundary; the generated server can compile only when the discovered call
+has caused that adapter to exist:
 
-- generates a Kotlin client whose button sends the RPC;
-- generates a typed HTTP adapter around the action;
-- compiles that adapter and action into a native server executable;
-- compiles [app.ab](app.ab) into the Android `libabla_app.so`.
+- the Android library retains the call's argument provider but strips the
+  unreachable server function and adapter;
+- the generated Kotlin button sends that argument to the discovered endpoint;
+- the native server contains the generated adapter and original action body.
 
-The action body is not bundled into the APK. Android packaging remains in this
-extension-owned build file rather than becoming compiler policy.
+[app.ab](app.ab) is only the JNI export root; both artifacts import the shared
+application and action source from `main.ab`.
+
+Changing the function name updates the client and endpoint automatically. An
+invalid or non-`@rpc` click target fails during late typed finalization.
 
 ## Build and run
 
@@ -31,7 +40,15 @@ nix-shell examples/android-rpc/shell.nix
 make ablac
 build/ablac build examples/android-rpc/build.ab \
   -o build/examples/android-rpc/build-driver --fast
+build/ablac build examples/android-rpc/android_build.ab \
+  -o build/examples/android-rpc/android-build-driver --fast
+build/ablac build build/examples/android-rpc/server.ab \
+  -o build/examples/android-rpc/rpc-server --fast
 ```
+
+The three bounded invocations isolate generation, cross-target Android emission,
+and hosted server emission. This avoids sharing target/evaluator state while the
+compiler's nested mixed-target build queue is still experimental.
 
 Start the generated server:
 
@@ -39,11 +56,13 @@ Start the generated server:
 build/examples/android-rpc/rpc-server
 ```
 
-You can exercise the same endpoint without Android:
+The endpoint uses a deterministic identifier derived from the discovered source
+call. Exercise it without Android using the generated manifest:
 
 ```sh
+action=$(cat build/examples/android-rpc/rpc-action.txt)
 curl -X POST \
-  'http://127.0.0.1:18080/rpc/incrementCounter?current=41&amount=1'
+  "http://127.0.0.1:18080/rpc/$action?current=41"
 ```
 
 It returns `42`. In another terminal, package the Android application:
@@ -59,6 +78,5 @@ The outputs are:
 
 The generated client uses Android Emulator's `10.0.2.2` alias to reach port
 `18080` on the development machine. A physical device needs a reachable server
-address. Cleartext HTTP is enabled only to keep this local example small; a
-real RPC extension should generate TLS, authentication, stable serialization,
-timeouts, and versioned error contracts.
+address. Cleartext HTTP is enabled only for this local example; a production RPC
+extension should add TLS, authentication, serialization, and versioned errors.
