@@ -23,6 +23,11 @@ export ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB
 export ABLA_FAST_SELFHOST_BUILD_MEMORY_MB
 
 BUILD_DIR := build
+ABLA_VERIFICATION_STAMP := $(BUILD_DIR)/.ablac-verified
+ABLA_VERIFICATION_FINGERPRINT = { \
+	find bootstrap include runtime src stdlib tests tools -type f -print0; \
+	printf '%s\0' Makefile shell.nix; \
+} | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
 SOURCE ?=
 OUTPUT ?= $(BUILD_DIR)/program
 LIB_SOURCES := $(filter-out src/main.cpp,$(wildcard src/*.cpp))
@@ -31,11 +36,20 @@ CLI_OBJECT := $(BUILD_DIR)/main.o
 TEST_OBJECT := $(BUILD_DIR)/tests.o
 DEPS := $(LIB_OBJECTS:.o=.d) $(CLI_OBJECT:.o=.d) $(TEST_OBJECT:.o=.d)
 
-.PHONY: all ablac self-rebuild check test bootstrap-check bootstrap-stage1 bootstrap-selfhost bootstrap-llvm-selfhost benchmark-selfhost benchmark-native compat-original compile sanitize clean
+.PHONY: all ablac ablac-force self-rebuild check test bootstrap-check bootstrap-stage1 bootstrap-selfhost bootstrap-llvm-selfhost benchmark-selfhost benchmark-native compat-original compile sanitize clean
 
 all: $(BUILD_DIR)/ablac0
 
-ablac: bootstrap-llvm-selfhost
+ablac:
+	@set -e; \
+	current_fingerprint=$$($(ABLA_VERIFICATION_FINGERPRINT)); \
+	verified_fingerprint=$$(sed -n '1p' $(ABLA_VERIFICATION_STAMP) 2>/dev/null || true); \
+	if test ! -x $(BUILD_DIR)/ablac.bin || \
+		test "$$current_fingerprint" != "$$verified_fingerprint"; then \
+		$(MAKE) ablac-force; \
+	fi
+
+ablac-force: bootstrap-llvm-selfhost
 	ABLA_MAX_MEMORY_MB=$(ABLA_SELFHOST_EMIT_MEMORY_MB) \
 		$(BUILD_DIR)/bootstrap/ablac-llvm --emit-llvm \
 		bootstrap/compiler/orc_main.ab \
@@ -159,6 +173,11 @@ ablac: bootstrap-llvm-selfhost
 		nix-shell --run 'tools/test-jit-host-selection.sh $(BUILD_DIR)/ablac'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'ABLA_EXPECT_JIT_HOST_FREE=1 tools/test-jit-http.sh $(BUILD_DIR)/ablac'
+	@set -e; \
+	current_fingerprint=$$($(ABLA_VERIFICATION_FINGERPRINT)); \
+	stamp_tmp=$(ABLA_VERIFICATION_STAMP).tmp; \
+	printf '%s\n' "$$current_fingerprint" > "$$stamp_tmp"; \
+	mv "$$stamp_tmp" $(ABLA_VERIFICATION_STAMP)
 
 self-rebuild:
 	@test -x $(BUILD_DIR)/ablac.bin || { \

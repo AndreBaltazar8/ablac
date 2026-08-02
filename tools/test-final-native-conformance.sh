@@ -62,11 +62,39 @@ fixtures=(
     exhaustive-when:42
 )
 
-for fixture_specification in "${fixtures[@]}"; do
+available_memory_mb=0
+while read -r memory_key memory_value memory_unit; do
+    if [[ $memory_key == MemAvailable: ]]; then
+        available_memory_mb=$((memory_value / 1024))
+    fi
+done < /proc/meminfo
+processor_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')
+if [[ ! $build_memory_mb =~ ^[1-9][0-9]*$ ]]; then
+    printf 'ABLA_CONFORMANCE_BUILD_MEMORY_MB must be a positive integer, got %q\n' \
+        "$build_memory_mb" >&2
+    exit 2
+fi
+jobs_by_memory=$((available_memory_mb / build_memory_mb))
+(( jobs_by_memory > 0 )) || jobs_by_memory=1
+default_jobs=$processor_count
+(( default_jobs <= jobs_by_memory )) || default_jobs=$jobs_by_memory
+(( default_jobs <= 8 )) || default_jobs=8
+jobs=${ABLA_CONFORMANCE_JOBS:-$default_jobs}
+if [[ ! $jobs =~ ^[1-9][0-9]*$ ]]; then
+    printf 'ABLA_CONFORMANCE_JOBS must be a positive integer, got %q\n' \
+        "$jobs" >&2
+    exit 2
+fi
+(( jobs <= ${#fixtures[@]} )) || jobs=${#fixtures[@]}
+
+run_fixture() {
+    local fixture_specification=$1
     fixture=${fixture_specification%%:*}
     expected=${fixture_specification##*:}
     output="$output_directory/$fixture"
     error_log="$output_directory/$fixture.build-errors.txt"
+    result_log="$output_directory/$fixture.result"
+    : > "$result_log"
 
     if ! ABLA_MAX_MEMORY_MB=$build_memory_mb ABLA_MAX_SECONDS=90 \
         ABLA_MAX_CPU_SECONDS=90 \
@@ -74,9 +102,8 @@ for fixture_specification in "${fixtures[@]}"; do
         "$compiler" build \
         "$project_root/tests/cases/modules/$fixture.ab" \
         -o "$output" --no-cache 2>"$error_log"; then
-        echo "$fixture: final-native build failed" >&2
-        sed -n '1,80p' "$error_log" >&2
-        exit 1
+        printf 'build-failed\n' > "$result_log"
+        return 1
     fi
 
     set +e
@@ -85,9 +112,36 @@ for fixture_specification in "${fixtures[@]}"; do
     status=$?
     set -e
     if [[ $status -ne $expected ]]; then
-        echo "$fixture: expected $expected, got $status" >&2
-        exit 1
+        printf 'expected=%s actual=%s\n' "$expected" "$status" > "$result_log"
+        return 1
     fi
+    printf '%s\n' "$status" > "$result_log"
+}
+export -f run_fixture
+export compiler project_root output_directory build_memory_mb
+
+printf 'final-native conformance: building %s programs with %s parallel job(s)\n' \
+    "${#fixtures[@]}" "$jobs"
+if ! printf '%s\0' "${fixtures[@]}" | \
+    xargs -0 -n 1 -P "$jobs" bash -c 'run_fixture "$1"' _; then
+    for fixture_specification in "${fixtures[@]}"; do
+        fixture=${fixture_specification%%:*}
+        result_log="$output_directory/$fixture.result"
+        result=""
+        if [[ -s $result_log ]]; then result=$(<"$result_log"); fi
+        if [[ ! $result =~ ^[0-9]+$ ]]; then
+            printf '%s: final-native conformance failed (%s)\n' \
+                "$fixture" "$result" >&2
+            sed -n '1,80p' \
+                "$output_directory/$fixture.build-errors.txt" >&2
+        fi
+    done
+    exit 1
+fi
+
+for fixture_specification in "${fixtures[@]}"; do
+    fixture=${fixture_specification%%:*}
+    status=$(<"$output_directory/$fixture.result")
     printf '%-32s %s\n' "$fixture" "$status"
 done
 

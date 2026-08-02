@@ -27,6 +27,18 @@ stage-1/stage-2 behavioral parity, and the byte-identical `ablac2`/`ablac3`
 fixed point unless an explicitly versioned deterministic-output change updates
 both stages together.
 
+The release gate is incremental without weakening a clean audit. A successful
+`make ablac` records an ignored content fingerprint covering all compiler,
+runtime, tool, and test inputs. Repeating it with unchanged inputs is
+immediate; adding, deleting, or editing any gated input reruns the proof. Use
+`make ablac-force` to request the complete proof unconditionally.
+
+The final native conformance programs remain uncached O2 builds, but independent
+fixtures run concurrently under a memory-aware job cap. On the reference
+development machine, all 49 builds and runtime assertions completed in 56.5
+seconds with eight workers while consuming 283 aggregate CPU-seconds. Set
+`ABLA_CONFORMANCE_JOBS` to override the automatically selected concurrency.
+
 ## Initial baseline
 
 On the reference development session on 2026-07-31, before performance work:
