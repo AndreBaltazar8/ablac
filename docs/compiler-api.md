@@ -129,6 +129,13 @@ archive, or no-entry module through `wasm-ld`. Platform packages such as
 `abla/android/build` and `abla/wasm/build` own concrete triples and integration
 policy.
 
+The root and recursively registered program nodes share one bounded output
+transaction. Artifacts, generated source, and compiler-owned sidecars journal
+their prior filesystem entry before replacement. If any later node fails, old
+files are restored and newly created paths are removed; only a completely
+successful graph commits. The journal accepts at most 512 distinct paths and
+reports transaction and rollback failures with stable build diagnostic codes.
+
 `compilerExportFunction(handle, name)` marks one resolved top-level function
 for a stable foreign adapter. The ABI rung accepts up to 16 value `bool`/`i64`,
 borrowed `string`, or direct non-escaping `(i64) -> i64` callback parameters

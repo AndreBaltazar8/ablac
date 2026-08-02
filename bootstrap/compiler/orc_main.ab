@@ -142,6 +142,22 @@ fun bootstrapAppendDefinedTargets(
     status
 }
 
+fun bootstrapRecordNativeOutputSet(output: string): bool {
+    var recorded = bootstrapRecordBuildTransactionPath(output)
+    if (recorded) recorded = bootstrapRecordBuildTransactionPath(
+        "$output.abi.json"
+    )
+    if (recorded) recorded = bootstrapRecordBuildTransactionPath("$output.ll")
+    if (recorded) recorded = bootstrapRecordBuildTransactionPath("$output.o")
+    if (recorded) recorded = bootstrapRecordBuildTransactionPath(
+        "$output.host.o"
+    )
+    if (recorded) recorded = bootstrapRecordBuildTransactionPath(
+        "$output.raw-runtime.o"
+    )
+    recorded
+}
+
 // Compile one root normally, then drain any program nodes registered by its
 // compile-time build definition. Child compilations may register more nodes;
 // the bounded queue makes that recursion explicit and cycle diagnosable.
@@ -155,14 +171,22 @@ fun bootstrapOrcBuild(
 ): int {
     bootstrapTakeCompileProgramRequests()
     bootstrapTakeDefinedTargets()
-    var status = bootstrapOrcBuildSingle(
-        sourcePath,
-        outputPath,
-        fast,
-        useCache,
-        target,
-        artifact
-    )
+    bootstrapBeginBuildTransaction()
+    var status = 0
+    if (!bootstrapRecordNativeOutputSet(outputPath)) {
+        linuxPrintStandardError(
+            "error[E_BUILD_GRAPH_TRANSACTION]: cannot journal root build outputs within bounded transaction limits\n"
+        )
+        status = 156
+    }
+    if (status == 0) status = bootstrapOrcBuildSingle(
+            sourcePath,
+            outputPath,
+            fast,
+            useCache,
+            target,
+            artifact
+        )
     val queued = bootstrapTakeCompileProgramRequests()
     val targets: array<BootstrapDefinedTarget> = []
     val rootTargets = bootstrapTakeDefinedTargets()
@@ -219,6 +243,12 @@ fun bootstrapOrcBuild(
             )
             status = 149
         }
+        if (status == 0 && !bootstrapRecordNativeOutputSet(request.output)) {
+            linuxPrintStandardError(
+                "error[E_BUILD_GRAPH_TRANSACTION]: cannot journal outputs for program '${request.name}' within bounded transaction limits\n"
+            )
+            status = 156
+        }
         if (status == 0) {
             names.append(request.name)
             outputs.append(request.output)
@@ -257,6 +287,14 @@ fun bootstrapOrcBuild(
             "error[E_BUILD_GRAPH_LIMIT]: programmable build exceeds 64 program nodes\n"
         )
         status = 150
+    }
+    if (status == 0) {
+        bootstrapCommitBuildTransaction()
+    } else if (!bootstrapRollbackBuildTransaction()) {
+        linuxPrintStandardError(
+            "error[E_BUILD_GRAPH_ROLLBACK]: failed to restore one or more outputs after graph failure\n"
+        )
+        status = 157
     }
     status
 }

@@ -30,6 +30,14 @@ order. A child program may register more programs, enabling an extension-owned
 `build.ab` to construct its graph dynamically. Names and output paths must be
 unique, paths are project-relative, each evaluation may submit at most 32
 nodes, and the complete recursively expanded graph is capped at 64 nodes.
+Publication is graph-transactional across the root, every recursively
+discovered artifact, ABI/LLVM/object sidecars, and compile-time generated
+file. Before a path is changed, an existing file is atomically renamed into a
+private bounded journal; a later node failure restores prior files and removes
+new ones in reverse order. A successful graph discards the journal. At most 512
+distinct output paths may participate, and exceeding that bound fails with
+`E_BUILD_GRAPH_TRANSACTION` before the unjournaled path is modified. A
+rollback failure is reported separately as `E_BUILD_GRAPH_ROLLBACK`.
 `compilerWriteFile` can stage generated source consumed by a requested node;
 its ordinary `filesystem.write` authorization and output bounds still apply.
 Until build-plan manifests can be restored independently, any module graph

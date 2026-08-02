@@ -123,6 +123,24 @@ grep -q 'error\[E_BUILD_PROGRAM_REQUEST\]' \
 grep -q 'error\[E_BUILD_ARTIFACT_UNSUPPORTED\]' \
     "$output_directory/unsupported-artifact.err"
 
+# A later child failure rolls back the whole graph: a pre-existing root
+# artifact is restored byte-for-byte and a newly generated source is removed.
+printf 'previous-root-artifact\n' >"$output_directory/rollback-root"
+rm -f "$output_directory/rollback-generated.ab"
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/program-build/rollback-root.ab" \
+    -o "$output_directory/rollback-root" --fast --no-cache \
+    >"$output_directory/rollback.out" \
+    2>"$output_directory/rollback.err"
+rollback_status=$?
+set -e
+[[ $rollback_status -ne 0 ]]
+grep -q '^previous-root-artifact$' "$output_directory/rollback-root"
+[[ ! -e $output_directory/rollback-generated.ab ]]
+grep -q 'error\[E_EXPORT_SIGNATURE_UNSUPPORTED\]' \
+    "$output_directory/rollback.err"
+
 set +e
 "$compiler" build \
     "$project_root/tests/cases/program-build/invalid-export.ab" \

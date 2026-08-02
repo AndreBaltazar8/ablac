@@ -9,6 +9,8 @@
 // independent from compile-driver bookkeeping.
 var bootstrapCompileOutputCount: int = 0
 var bootstrapCompileOutputBytes: int = 0
+var bootstrapBuildTransactionActive: bool = false
+var bootstrapBuildTransactionCount: int = 0
 
 class BootstrapCompileProgramRequest(
     val name: string,
@@ -408,6 +410,89 @@ fun bootstrapTakeCompileProgramRequests(
 fun bootstrapCompileOutputRoot(): string =
     "build/.abla-compile-outputs-${linuxProcessId()}"
 
+fun bootstrapBuildTransactionRoot(): string =
+    "build/.abla-build-transaction-${linuxProcessId()}"
+
+fun bootstrapClearBuildTransactionJournal(): void {
+    val root = bootstrapBuildTransactionRoot()
+    var index = 0
+    while (index < 512) {
+        Path("$root/$index.path").remove()
+        Path("$root/$index.existed").remove()
+        Path("$root/$index.data").remove()
+        index = index + 1
+    }
+    Path(root).remove()
+    bootstrapBuildTransactionCount = 0
+    bootstrapSemanticUnit()
+}
+
+fun bootstrapBeginBuildTransaction(): void {
+    bootstrapBuildTransactionActive = false
+    bootstrapClearBuildTransactionJournal()
+    bootstrapBuildTransactionActive = true
+    bootstrapSemanticUnit()
+}
+
+fun bootstrapRecordBuildTransactionPath(path: string): bool {
+    var valid = bootstrapBuildTransactionActive && path.size > 0 &&
+        path.size <= 4096
+    val root = bootstrapBuildTransactionRoot()
+    var recorded = false
+    var index = 0
+    while (valid && !recorded && index < bootstrapBuildTransactionCount) {
+        if (Path("$root/$index.path").readText() == path) recorded = true
+        index = index + 1
+    }
+    if (recorded) return true
+    if (bootstrapBuildTransactionCount >= 512) valid = false
+    val destination = Path(path)
+    val existed = destination.exists()
+    val journalIndex = bootstrapBuildTransactionCount
+    if (valid) valid = Path(root).createDirectories()
+    if (valid) valid = Path("$root/$journalIndex.path").writeTextAtomic(path)
+    if (valid) valid = Path("$root/$journalIndex.existed").writeTextAtomic(
+        if (existed) "1" else "0"
+    )
+    if (valid && existed) valid = destination.moveTo(
+        Path("$root/$journalIndex.data")
+    )
+    if (valid) {
+        bootstrapBuildTransactionCount = journalIndex + 1
+    } else {
+        Path("$root/$journalIndex.path").remove()
+        Path("$root/$journalIndex.existed").remove()
+    }
+    valid
+}
+
+fun bootstrapCommitBuildTransaction(): void {
+    bootstrapBuildTransactionActive = false
+    bootstrapClearBuildTransactionJournal()
+    bootstrapSemanticUnit()
+}
+
+fun bootstrapRollbackBuildTransaction(): bool {
+    bootstrapBuildTransactionActive = false
+    var restored = true
+    val root = bootstrapBuildTransactionRoot()
+    var index = bootstrapBuildTransactionCount
+    while (index > 0) {
+        index = index - 1
+        val path = Path("$root/$index.path").readText()
+        if (Path("$root/$index.existed").readText() == "1") {
+            Path(path).remove()
+            if (!Path("$root/$index.data").moveTo(Path(path))) {
+                restored = false
+            }
+        } else if (!Path(path).remove() && Path(path).exists()) {
+            restored = false
+        }
+    }
+    bootstrapClearBuildTransactionJournal()
+    restored
+}
+
 fun bootstrapBeginCompileOutputs(): void {
     val root = bootstrapCompileOutputRoot()
     var index = 0
@@ -510,6 +595,11 @@ fun bootstrapCommitCompileOutputs(): bool {
         val pathFile = Path("$root/$index.path")
         val dataFile = Path("$root/$index.data")
         committed = pathFile.exists() && dataFile.exists()
+        if (committed && bootstrapBuildTransactionActive) {
+            committed = bootstrapRecordBuildTransactionPath(
+                pathFile.readText()
+            )
+        }
         if (committed) committed = Path(pathFile.readText()).writeTextAtomic(
             dataFile.readText()
         )
