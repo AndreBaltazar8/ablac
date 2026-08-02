@@ -96,7 +96,11 @@ invalid_semantic_status=$?
 set -e
 [[ $invalid_semantic_status -ne 0 ]]
 grep -q 'function.result:' "$output_directory/invalid-semantic.err"
-grep -q 'generated.origin:invalid.semantic:' \
+grep -q 'error\[E_EXT_GENERATED_SEMANTIC\]:' \
+    "$output_directory/invalid-semantic.err"
+grep -q 'source\[generated-origin\]:invalid.semantic:' \
+    "$output_directory/invalid-semantic.err"
+grep -q '0 parser, 1 extension, 0 semantic, 1 total error' \
     "$output_directory/invalid-semantic.err"
 
 set +e
@@ -107,7 +111,13 @@ set +e
 invalid_early_typed_status=$?
 set -e
 [[ $invalid_early_typed_status -ne 0 ]]
-grep -q 'LLVM compilation failed:' \
+grep -q 'error\[E_EXT_TYPED_QUERY_BEFORE_RESOLUTION\]:' \
+    "$output_directory/invalid-early-typed.err"
+grep -q 'context\[subparser\]: `parseEarlyTyped`' \
+    "$output_directory/invalid-early-typed.err"
+grep -q 'source\[extension-expression\]:' \
+    "$output_directory/invalid-early-typed.err"
+grep -q '0 parser, 1 extension, 0 semantic, 1 total error' \
     "$output_directory/invalid-early-typed.err"
 
 set +e
@@ -131,14 +141,45 @@ set +e
 invalid_function_handle_status=$?
 set -e
 [[ $invalid_function_handle_status -ne 0 ]]
-grep -q 'generated-extension finalizer `finalizeInvalidFunctionHandle`' \
+grep -q 'error\[E_EXT_FUNCTION_HANDLE_OUT_OF_RANGE\]:' \
     "$output_directory/invalid-function-handle.err"
 grep -q 'compiler API `compilerFunctionName` received invalid function handle 999999' \
     "$output_directory/invalid-function-handle.err"
 grep -q 'out of range; expected a compilation-scoped function declaration handle' \
     "$output_directory/invalid-function-handle.err"
-grep -q 'extension.request:invalid.function.handle:' \
+grep -q 'context\[generated-extension-finalizer\]: `finalizeInvalidFunctionHandle`' \
+    "$output_directory/invalid-function-handle.err"
+grep -q 'source\[extension-request\]:invalid.function.handle:' \
+    "$output_directory/invalid-function-handle.err"
+grep -q '0 parser, 1 extension, 0 semantic, 1 total error' \
     "$output_directory/invalid-function-handle.err"
 
+set +e
+"$compiler" --emit-llvm \
+    "$project_root/tests/cases/modules/invalid-finalizer-function-handle-states.ab" \
+    > "$output_directory/invalid-function-handle-states.ll" \
+    2> "$output_directory/invalid-function-handle-states.err"
+invalid_function_handle_states_status=$?
+set -e
+[[ $invalid_function_handle_states_status -ne 0 ]]
+grep -q 'error\[E_EXT_FUNCTION_HANDLE_UNKNOWN\]:' \
+    "$output_directory/invalid-function-handle-states.err"
+grep -q 'error\[E_EXT_FUNCTION_HANDLE_WRONG_KIND\]:' \
+    "$output_directory/invalid-function-handle-states.err"
+grep -q 'error\[E_EXT_FUNCTION_HANDLE_OUT_OF_RANGE\]:' \
+    "$output_directory/invalid-function-handle-states.err"
+
+set +e
+PATH=/nonexistent "$compiler" build \
+    "$project_root/tests/cases/bootstrap/block.ab" \
+    -o "$output_directory/invalid-native-toolchain" --no-cache \
+    > "$output_directory/invalid-native-toolchain.out" \
+    2> "$output_directory/invalid-native-toolchain.err"
+invalid_native_toolchain_status=$?
+set -e
+[[ $invalid_native_toolchain_status -ne 0 ]]
+grep -q 'error\[E_NATIVE_TOOLCHAIN\]: native toolchain failed with status' \
+    "$output_directory/invalid-native-toolchain.err"
+
 printf '%s\n' \
-    'subparser extension: nested/late deferred calls + source identity + nominal-result adapters + actionable invalid-handle diagnostics + provenance-carrying AST publication + rollback passed'
+    'subparser extension: nested/late deferred calls + structured parser/finalizer/generated/native diagnostics + nominal adapters + provenance + rollback passed'
