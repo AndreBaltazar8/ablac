@@ -2027,6 +2027,7 @@ fun bootstrapLlvmExportAdapters(
 ): BootstrapLlvmEmission {
     var output = ""
     var errors = 0
+    var ownedBytes = false
     var index = 0
     while (index < exports.size) {
         val request = exports[index]
@@ -2037,6 +2038,10 @@ fun bootstrapLlvmExportAdapters(
             var llvmResult = "void"
             if (request.resultType == "i64") llvmResult = "i64"
             if (request.resultType == "bool") llvmResult = "i8"
+            if (request.resultType == "string") {
+                llvmResult = "ptr"
+                ownedBytes = true
+            }
             var signature = ""
             var parameter = 0
             while (parameter < request.parameterTypes.size) {
@@ -2081,10 +2086,41 @@ fun bootstrapLlvmExportAdapters(
                 output = "$output  %value = zext i1 %boolean to i8\n"
                 output = "$output  ret i8 %value\n"
             }
+            if (request.resultType == "string") {
+                output = "$output  %string_payload = call ptr @abla_string_payload(ptr %result)\n"
+                output = "$output  %string_length_pointer = getelementptr %AblaPayload, ptr %string_payload, i32 0, i32 1\n"
+                output = "$output  %string_length = load i64, ptr %string_length_pointer, align 8\n"
+                output = "$output  %handle_overflow = icmp ugt i64 %string_length, 9223372036854775799\n"
+                output = "$output  br i1 %handle_overflow, label %handle_invalid, label %handle_allocate\n"
+                output = "$output\nhandle_allocate:\n"
+                output = "$output  %handle_size = add i64 %string_length, 8\n"
+                output = "$output  %handle = call ptr @malloc(i64 %handle_size)\n"
+                output = "$output  %handle_valid = icmp ne ptr %handle, null\n"
+                output = "$output  br i1 %handle_valid, label %handle_copy, label %handle_oom\n"
+                output = "$output\nhandle_copy:\n"
+                output = "$output  store i64 %string_length, ptr %handle, align 8\n"
+                output = "$output  %handle_data = getelementptr i8, ptr %handle, i64 8\n"
+                output = "$output  %string_data = call ptr @abla_string_data(ptr byval(%AblaValue) align 8 %result)\n"
+                output = "$output  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %handle_data, ptr align 1 %string_data, i64 %string_length, i1 false)\n"
+                output = "$output  ret ptr %handle\n"
+                output = "$output\nhandle_invalid:\n"
+                output = "$output  %overflow_message = getelementptr [23 x i8], ptr @abla_string_overflow, i64 0, i64 0\n"
+                output = "$output  call void @abla_runtime_panic(ptr %overflow_message, i64 22)\n"
+                output = "$output  unreachable\n"
+                output = "$output\nhandle_oom:\n"
+                output = "$output  %oom_message = getelementptr [14 x i8], ptr @abla_runtime_out_of_memory, i64 0, i64 0\n"
+                output = "$output  call void @abla_runtime_panic(ptr %oom_message, i64 13)\n"
+                output = "$output  unreachable\n"
+            }
             if (request.resultType == "void") output = "$output  ret void\n"
             output = "$output}\n\n"
         }
         index = index + 1
+    }
+    if (ownedBytes) {
+        output = "${output}define ptr @abla_owned_bytes_data(ptr %handle) {\nentry:\n  %data = getelementptr i8, ptr %handle, i64 8\n  ret ptr %data\n}\n\n"
+        output = "${output}define i64 @abla_owned_bytes_length(ptr %handle) {\nentry:\n  %length = load i64, ptr %handle, align 8\n  ret i64 %length\n}\n\n"
+        output = "${output}define void @abla_owned_bytes_release(ptr %handle) {\nentry:\n  call void @free(ptr %handle)\n  ret void\n}\n\n"
     }
     BootstrapLlvmEmission(output, errors, "[]")
 }
@@ -2116,6 +2152,10 @@ fun bootstrapLlvmExportAbi(
         var ownership = "value"
         if (request.resultType == "bool") abi = "u8-bool"
         if (request.resultType == "void") ownership = "none"
+        if (request.resultType == "string") {
+            abi = "owned-bytes-handle"
+            ownership = "owned"
+        }
         if (index > 0) output = "$output,"
         var parameters = "["
         var parameter = 0
@@ -2135,9 +2175,13 @@ fun bootstrapLlvmExportAbi(
             parameter = parameter + 1
         }
         parameters = "$parameters]"
+        var result = "{\"abi\":\"$abi\",\"ownership\":\"$ownership\",\"nullable\":false}"
+        if (request.resultType == "string") {
+            result = "{\"abi\":\"owned-bytes-handle\",\"ownership\":\"owned\",\"nullable\":false,\"data\":\"abla_owned_bytes_data\",\"length\":\"abla_owned_bytes_length\",\"release\":\"abla_owned_bytes_release\",\"releaseExactlyOnce\":true,\"validUntilRelease\":true}"
+        }
         output = "$output\n    {\"source\":\"${bootstrapLlvmJsonEscape(
             request.source
-        )}\",\"symbol\":\"${request.name}\",\"parameters\":$parameters,\"result\":{\"abi\":\"$abi\",\"ownership\":\"$ownership\",\"nullable\":false},\"failure\":{\"panic\":\"not-contained\"}}"
+        )}\",\"symbol\":\"${request.name}\",\"parameters\":$parameters,\"result\":$result,\"failure\":{\"panic\":\"not-contained\"}}"
         index = index + 1
     }
     if (exports.size > 0) output = "$output\n  "

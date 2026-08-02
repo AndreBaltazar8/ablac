@@ -74,7 +74,7 @@ remain roadmap work.
 rung. It exports a C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded
 surface accepts up to 16 value `bool`/`i64` or borrowed `string` parameters,
-no runtime globals, and `void`, `bool`, or `i64` results. Adapters box scalars
+no runtime globals, and `void`, `bool`, `i64`, or owned `string` results. Adapters box scalars
 without exposing `%AblaValue`. A string lowers to a pointer/`u64` byte slice;
 the adapter accepts null only for an empty slice, copies the exact bytes into
 tracked Abla-owned storage, and adds its own terminator before calling user
@@ -87,9 +87,13 @@ result representation, ownership/nullability, and failure containment status.
 The sidecar is cached with the object and restored on a cache hit. The current
 manifest deliberately says `panic: not-contained`; consumers can reject that
 contract instead of assuming exceptions or traps are isolated. The surface is
-still intentionally narrow: owned byte results, opaque owned handles,
-callbacks, and actual panic containment must be implemented before richer
-values cross the boundary.
+still intentionally narrow. A string result is copied into a non-null opaque
+foreign handle. The manifest names `abla_owned_bytes_data`,
+`abla_owned_bytes_length`, and the mandatory exactly-once
+`abla_owned_bytes_release`, and declares validity until release. This first
+handle implementation is limited to libc-backed targets; libc-free WASM fails
+with a target-capability diagnostic instead of importing an undeclared
+allocator. Typed class handles, callbacks, and actual panic containment remain.
 
 ## Direction
 

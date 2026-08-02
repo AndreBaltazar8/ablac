@@ -57,6 +57,18 @@ NODE
 grep -q 'WebAssembly.instantiate' "$adapter"
 grep -q 'instance.exports.abla_mvc_revision' "$adapter"
 
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/wasm-mvc-extension/owned-result-build.ab" \
+    -o "$output_directory/owned-result-driver" --fast --no-cache \
+    >"$output_directory/owned-result.out" \
+    2>"$output_directory/owned-result.err"
+owned_result_status=$?
+set -e
+[[ $owned_result_status -ne 0 ]]
+grep -q 'error\[E_EXPORT_TARGET_CAPABILITY\]' \
+    "$output_directory/owned-result.err"
+
 if rg -n 'abla-mvc-browser|abla_mvc_revision|WebAssembly.instantiate' \
     "$project_root/bootstrap/compiler" >/dev/null; then
     echo "MVC or browser host policy leaked into the compiler" >&2

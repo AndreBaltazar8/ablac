@@ -734,6 +734,14 @@ the caller retains and may immediately reuse or release its buffer after the
 call. The ABI manifest records `ownership: borrowed` and
 `calleeAction: copy`.
 
+An exported `string` result is copied into an opaque foreign handle rather than
+leaking the tracked `%AblaValue` or an interior runtime pointer. Callers inspect
+it through the manifest-named data/length functions and must call the release
+function exactly once. Its bytes remain valid until release. The initial handle
+allocator is available on libc-backed targets; a libc-free extension must
+provide its own compatible allocation contract before selecting this result
+ABI.
+
 ## Compatibility baseline
 
 The original examples establish the initial compatibility suite:

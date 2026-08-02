@@ -50,6 +50,10 @@ llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_bytes_score$'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_bytes_length$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_echo_bytes$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_owned_bytes_release$'
 grep -q '"symbol":"abla_app_add"' \
     "$output_directory/libabla_app.so.abi.json"
 grep -q '"name":"value","abi":"i64","ownership":"value"' \
@@ -60,6 +64,10 @@ grep -q 'define i64 @abla_app_bytes_score(ptr %argument_0_data, i64 %argument_0_
     "$output_directory/libabla_app.so.ll"
 grep -q 'call void @abla_string_copy.*%argument_0_data.*%argument_0_length' \
     "$output_directory/libabla_app.so.ll"
+grep -q '"abi":"owned-bytes-handle","ownership":"owned"' \
+    "$output_directory/libabla_app.so.abi.json"
+grep -q '"release":"abla_owned_bytes_release","releaseExactlyOnce":true' \
+    "$output_directory/libabla_app.so.abi.json"
 if llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_fn_'; then
     echo "internal Abla function symbol escaped the shared-library ABI" >&2

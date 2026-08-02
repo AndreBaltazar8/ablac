@@ -27,12 +27,18 @@ explicit foreign exports, and strips PID-bearing name metadata for byte-level
 reproducibility.
 
 Every successful artifact publishes `<output>.abi.json` through the compiler's
-staged-output transaction after linking. The versioned manifest is derived from resolved export requests rather
-than handwritten platform glue and includes target/artifact identity plus
+staged-output transaction after linking. The versioned manifest is derived
+from resolved export requests rather than handwritten platform glue and
+includes target/artifact identity plus
 ownership, nullability, and failure-containment metadata. It is a member of the
 native cache record, so a cache hit restores a missing sidecar instead of
-silently publishing an undocumented binary. Schema version 1 currently exposes
-only zero-argument scalar adapters and honestly marks panics as uncontained.
+silently publishing an undocumented binary. Schema version 1 exposes value
+scalars, copied borrowed-byte inputs, and owned-byte result handles, and
+honestly marks panics as uncontained.
+The current owned-byte result handle is available only when the target provides
+the libc allocation contract; libc-free module targets reject it before object
+emission.
+
 The default release profile runs the deterministic `default<O2>,globaldce`
 pipeline. Hosted `--fast` skips whole-module optimization and selects LLVM's
 low-latency code generator for edit/build cycles. External cross targets run a

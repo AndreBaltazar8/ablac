@@ -131,13 +131,19 @@ policy.
 
 `compilerExportFunction(handle, name)` marks one resolved top-level function
 for a stable foreign adapter. The ABI rung accepts up to 16 value `bool`/`i64`
-or borrowed `string` parameters and a `void`, `bool`, or `i64` result in
-programs without runtime globals. A foreign string lowers to `(pointer, u64)`;
+or borrowed `string` parameters and a `void`, `bool`, `i64`, or owned `string`
+result in programs without runtime globals. A foreign string lowers to
+`(pointer, u64)`;
 the adapter validates it and copies its exact bytes into tracked Abla-owned
 storage before invoking user code. Empty input permits a null pointer. The
 backend emits only the requested C symbol; internal Abla function symbols stay
-hidden. Unsupported signatures fail with `E_EXPORT_SIGNATURE_UNSUPPORTED`
-rather than exposing the internal `%AblaValue` representation. Successful
+hidden. A string result becomes a non-null opaque owned-bytes handle with
+generated data/length accessors and an exactly-once release operation. This
+first handle runtime requires a libc-backed target; libc-free targets reject it
+with `E_EXPORT_TARGET_CAPABILITY` until their extension supplies a compatible
+allocator contract. Unsupported signatures fail with
+`E_EXPORT_SIGNATURE_UNSUPPORTED` rather than exposing the internal
+`%AblaValue` representation. Successful
 artifacts receive a staged `.abi.json` sidecar describing the target,
 container, exported symbol, lowered representation, ownership/transfer action,
 nullability, and the current uncontained-panic contract. Cached objects retain
