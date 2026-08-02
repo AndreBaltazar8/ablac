@@ -9,6 +9,11 @@ program="$directory/program"
 cache_directory="$project_root/build/.abla-cache"
 mkdir -p "$directory" "$cache_directory"
 
+# This test measures cache population, so prior runs must not turn its first
+# build into a whole-object or partition hit. The cache contains generated,
+# reproducible artifacts only.
+find "$cache_directory" -mindepth 1 -maxdepth 1 -type f -delete
+
 {
     printf 'fun partitionFunction0: int = 1\n'
     for index in $(seq 1 95); do

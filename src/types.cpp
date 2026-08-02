@@ -320,7 +320,7 @@ void TypeChecker::check_statement(ast::Statement& statement) {
     switch (statement.kind) {
     case ast::Statement::Kind::Expression: {
         auto& value = static_cast<ast::ExpressionStatement&>(statement);
-        if (value.expression) check_expression(*value.expression);
+        if (value.expression) check_expression(*value.expression, false);
         break;
     }
     case ast::Statement::Kind::Property:
@@ -345,7 +345,7 @@ void TypeChecker::check_statement(ast::Statement& statement) {
                 loop.condition->span,
                 "loop condition");
         }
-        if (loop.body) check_block(*loop.body);
+        if (loop.body) check_block(*loop.body, false);
         break;
     }
     }
@@ -379,13 +379,16 @@ void TypeChecker::check_function(
                 "default argument");
         }
     }
-    TypeId body_type = typed_.types.void_type();
-    if (declaration.body) body_type = check_block(*declaration.body);
-    if (declaration.expression_body) body_type = check_expression(*declaration.expression_body);
-
     const auto function_type_id = type_of_symbol(symbol);
     const auto function_type = typed_.types.get(function_type_id);
     auto result = function_type.result;
+    const bool body_value_required = result != typed_.types.void_type();
+    TypeId body_type = typed_.types.void_type();
+    if (declaration.body) {
+        body_type = check_block(*declaration.body, body_value_required);
+    }
+    if (declaration.expression_body) body_type = check_expression(*declaration.expression_body);
+
     if (result == typed_.types.unknown()) {
         result = body_type;
         typed_.symbol_types_[&symbol] = typed_.types.function(function_type.arguments, result);
@@ -434,23 +437,30 @@ TypeId TypeChecker::check_property(ast::PropertyDeclaration& declaration) {
     return declared;
 }
 
-TypeId TypeChecker::check_block(ast::Block& block) {
+TypeId TypeChecker::check_block(ast::Block& block, bool value_required) {
     TypeId result = typed_.types.void_type();
-    for (auto& statement : block.statements) {
-        check_statement(*statement);
+    for (std::size_t i = 0; i < block.statements.size(); ++i) {
+        auto& statement = block.statements[i];
         if (statement->kind == ast::Statement::Kind::Expression) {
             auto& expression = static_cast<ast::ExpressionStatement&>(*statement);
-            result = expression.expression
-                ? check_expression(*expression.expression)
-                : typed_.types.void_type();
+            const bool statement_value_required =
+                value_required && i + 1 == block.statements.size();
+            if (expression.expression) {
+                const auto expression_type = check_expression(
+                    *expression.expression, statement_value_required);
+                result = statement_value_required
+                    ? expression_type
+                    : typed_.types.void_type();
+            } else result = typed_.types.void_type();
         } else {
+            check_statement(*statement);
             result = typed_.types.void_type();
         }
     }
     return result;
 }
 
-TypeId TypeChecker::check_expression(ast::Expression& expression) {
+TypeId TypeChecker::check_expression(ast::Expression& expression, bool value_required) {
     if (const auto found = typed_.expression_types_.find(&expression);
         found != typed_.expression_types_.end()) {
         return found->second;
@@ -598,10 +608,13 @@ TypeId TypeChecker::check_expression(ast::Expression& expression) {
             check_expression(*conditional.condition),
             conditional.condition->span,
             "if condition");
-        const auto then_type = check_block(*conditional.then_body);
-        result = conditional.else_body
-            ? common_type(then_type, check_block(*conditional.else_body), expression.span)
-            : typed_.types.void_type();
+        const auto then_type = check_block(*conditional.then_body, value_required);
+        if (conditional.else_body) {
+            const auto else_type = check_block(*conditional.else_body, value_required);
+            result = value_required
+                ? common_type(then_type, else_type, expression.span)
+                : typed_.types.void_type();
+        } else result = typed_.types.void_type();
         break;
     }
     case Kind::When: {
@@ -617,10 +630,12 @@ TypeId TypeChecker::check_expression(ast::Expression& expression) {
                 else require_assignable(
                     typed_.types.bool_type(), match_type, match->span, "when condition");
             }
-            const auto body = check_block(*when_case.body);
-            result = result == typed_.types.unknown()
-                ? body
-                : common_type(result, body, when_case.span);
+            const auto body = check_block(*when_case.body, value_required);
+            if (value_required) {
+                result = result == typed_.types.unknown()
+                    ? body
+                    : common_type(result, body, when_case.span);
+            } else result = typed_.types.void_type();
         }
         if (result == typed_.types.unknown()) result = typed_.types.void_type();
         break;

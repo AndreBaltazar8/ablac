@@ -3,6 +3,7 @@ set -euo pipefail
 
 compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+c_compiler=${ABLA_C_DIFFERENTIAL_COMPILER:-$project_root/build/bootstrap/ablac-llvm}
 output_directory="$project_root/build/nullable-refinement"
 mkdir -p "$output_directory"
 
@@ -18,7 +19,7 @@ if [[ $native_status -ne 42 ]]; then
     exit 1
 fi
 
-"$compiler" "$project_root/tests/cases/modules/nullable-refinement.ab" \
+"$c_compiler" "$project_root/tests/cases/modules/nullable-refinement.ab" \
     > "$output_directory/program.c"
 clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
     -I"$project_root/runtime" \

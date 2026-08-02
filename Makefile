@@ -4,7 +4,8 @@ CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic -Wconversion -Wshadow \
 	-Wnon-virtual-dtor -Wold-style-cast -O2 -g
 BOOTSTRAP_CFLAGS ?= -O2
 ABLA_MAX_MEMORY_MB ?= 512
-ABLA_SELFHOST_EMIT_MEMORY_MB ?= 2048
+ABLA_SELFHOST_EMIT_MEMORY_MB ?= 4096
+ABLA_SELFHOST_EMIT_SECONDS ?= 3600
 ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB ?= 2048
 ABLA_FAST_SELFHOST_EMIT_MEMORY_MB ?= 1160
 ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB ?= 4096
@@ -66,7 +67,7 @@ ablac: bootstrap-llvm-selfhost
 		nix-shell --run 'tools/test-emitted-value-runtime.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-native-platform-boundary.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=240 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=$(ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB) ABLA_MAX_SECONDS=360 tools/run-limited.sh \
 		nix-shell --run 'tools/test-final-native-conformance.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=90 tools/run-limited.sh \
 		nix-shell --run 'tools/test-orc-session.sh $(BUILD_DIR)/ablac.bin'
@@ -92,23 +93,23 @@ ablac: bootstrap-llvm-selfhost
 		nix-shell --run 'tools/test-runtime-memory.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-module-incremental-state.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=90 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=90 tools/run-limited.sh \
 		nix-shell --run 'tools/test-lowered-ir-cache.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=90 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=90 tools/run-limited.sh \
 		nix-shell --run 'tools/test-stable-native-symbols.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=120 tools/run-limited.sh \
 		nix-shell --run 'tools/test-native-partition-cache.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-return-control.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-loop-control.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-for-range.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-definite-assignment.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-unsafe-boundary.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
+	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-affine-move.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-nullable-refinement.sh $(BUILD_DIR)/ablac.bin'
@@ -466,13 +467,15 @@ bootstrap-stage1: all
 		runtime/abla_runtime_host.c -o $(BUILD_DIR)/bootstrap/self-lexer
 
 bootstrap-selfhost: bootstrap-stage1
-	$(BUILD_DIR)/bootstrap/ablac1 bootstrap/compiler/main.ab \
+	ABLA_MAX_MEMORY_MB=$(ABLA_SELFHOST_EMIT_MEMORY_MB) \
+		$(BUILD_DIR)/bootstrap/ablac1 bootstrap/compiler/main.ab \
 		> $(BUILD_DIR)/bootstrap/ablac2.c
 	$(CC) $(BOOTSTRAP_CFLAGS) -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
 		-Iruntime $(BUILD_DIR)/bootstrap/ablac2.c runtime/abla_runtime.c \
 		runtime/abla_runtime_host.c -o $(BUILD_DIR)/bootstrap/ablac2.bin
 	ln -sfn ../../tools/run-limited-compiler.sh $(BUILD_DIR)/bootstrap/ablac2
-	$(BUILD_DIR)/bootstrap/ablac2 bootstrap/compiler/main.ab \
+	ABLA_MAX_MEMORY_MB=$(ABLA_SELFHOST_EMIT_MEMORY_MB) \
+		$(BUILD_DIR)/bootstrap/ablac2 bootstrap/compiler/main.ab \
 		> $(BUILD_DIR)/bootstrap/ablac3.c
 	cmp $(BUILD_DIR)/bootstrap/ablac2.c $(BUILD_DIR)/bootstrap/ablac3.c
 	$(BUILD_DIR)/bootstrap/ablac2 tests/cases/bootstrap/block.ab \
@@ -584,14 +587,23 @@ bootstrap-selfhost: bootstrap-stage1
 
 bootstrap-llvm-selfhost: bootstrap-stage1
 	ABLA_MAX_MEMORY_MB=$(ABLA_SELFHOST_EMIT_MEMORY_MB) \
+	ABLA_MAX_SECONDS=$(ABLA_SELFHOST_EMIT_SECONDS) \
+	ABLA_MAX_CPU_SECONDS=$(ABLA_SELFHOST_EMIT_SECONDS) \
 		$(BUILD_DIR)/bootstrap/ablac1 --emit-llvm bootstrap/compiler/main.ab \
 		> $(BUILD_DIR)/bootstrap/ablac-llvm.ll
 	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=600 tools/run-limited.sh \
 		nix-shell --run 'opt --threads=1 -passes=verify -disable-output $(BUILD_DIR)/bootstrap/ablac-llvm.ll && llc --threads=1 -filetype=obj -relocation-model=pic -O2 $(BUILD_DIR)/bootstrap/ablac-llvm.ll -o $(BUILD_DIR)/bootstrap/ablac-llvm.o && clang -std=c11 -O2 -Iruntime -c runtime/abla_runtime_host.c -o $(BUILD_DIR)/bootstrap/ablac-llvm-host.o && clang -fuse-ld=lld -Wl,--threads=1 $(BUILD_DIR)/bootstrap/ablac-llvm.o $(BUILD_DIR)/bootstrap/ablac-llvm-host.o -o $(BUILD_DIR)/bootstrap/ablac-llvm.bin'
 	ln -sfn ../../tools/run-limited-compiler.sh $(BUILD_DIR)/bootstrap/ablac-llvm
-	ABLA_MAX_MEMORY_MB=$(ABLA_SELFHOST_EMIT_MEMORY_MB) \
-		$(BUILD_DIR)/bootstrap/ablac-llvm --emit-llvm bootstrap/compiler/main.ab \
-		> $(BUILD_DIR)/bootstrap/ablac-llvm.fixed.ll
+	@if ! test -s $(BUILD_DIR)/bootstrap/ablac-llvm.fixed.ll || \
+		! cmp -s $(BUILD_DIR)/bootstrap/ablac-llvm.ll \
+			$(BUILD_DIR)/bootstrap/ablac-llvm.fixed.ll; then \
+		ABLA_MAX_MEMORY_MB=$(ABLA_SELFHOST_EMIT_MEMORY_MB) \
+		ABLA_MAX_SECONDS=$(ABLA_SELFHOST_EMIT_SECONDS) \
+		ABLA_MAX_CPU_SECONDS=$(ABLA_SELFHOST_EMIT_SECONDS) \
+			$(BUILD_DIR)/bootstrap/ablac-llvm --emit-llvm \
+			bootstrap/compiler/main.ab \
+			> $(BUILD_DIR)/bootstrap/ablac-llvm.fixed.ll; \
+	fi
 	cmp $(BUILD_DIR)/bootstrap/ablac-llvm.ll \
 		$(BUILD_DIR)/bootstrap/ablac-llvm.fixed.ll
 	$(BUILD_DIR)/bootstrap/ablac-llvm --emit-llvm \

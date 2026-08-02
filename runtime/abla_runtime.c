@@ -45,6 +45,7 @@ static const char* string_data(AblaString value) {
     size_t count = 1;
     AblaString* pending =
         (AblaString*)abla_platform_alloc(sizeof(AblaString) * capacity);
+    abla_platform_memory_set_layout(pending, 9);
     pending[0] = value;
 
     if (value.length == SIZE_MAX) {
@@ -91,6 +92,7 @@ static const char* string_data(AblaString value) {
             const size_t next_capacity = capacity * 2;
             AblaString* next = (AblaString*)abla_platform_alloc(
                 sizeof(AblaString) * next_capacity);
+            abla_platform_memory_set_layout(next, 9);
             for (size_t index = 0; index < count; ++index) {
                 next[index] = pending[index];
             }
@@ -153,6 +155,9 @@ AblaValue abla_closure(
     AblaValue* owned_captures = capture_count == 0
         ? (AblaValue*)0
         : (AblaValue*)abla_platform_alloc(sizeof(AblaValue) * capture_count);
+    if (owned_captures != (AblaValue*)0) {
+        abla_platform_memory_set_layout(owned_captures, 2);
+    }
     for (size_t index = 0; index < capture_count; ++index) {
         owned_captures[index] = captures[index];
     }
@@ -197,6 +202,7 @@ AblaValue abla_function_capture(AblaValue value, size_t index) {
 }
 AblaValue abla_cell_create(AblaValue value) {
     AblaValue* cell = (AblaValue*)abla_platform_alloc(sizeof(AblaValue));
+    abla_platform_memory_set_layout(cell, 8);
     *cell = value;
     return (AblaValue){.tag = ABLA_CELL, .as.cell = cell};
 }
@@ -230,6 +236,7 @@ static AblaSharedControl* weak_control(AblaValue value) {
 AblaValue abla_shared_create(AblaValue value) {
     AblaSharedControl* control =
         (AblaSharedControl*)abla_platform_alloc(sizeof(AblaSharedControl));
+    abla_platform_memory_set_layout(control, 7);
     atomic_init(&control->strong, 1);
     /* One implicit weak count keeps the control block alive while strong. */
     atomic_init(&control->weak, 1);
@@ -435,6 +442,7 @@ AblaValue abla_string_concat(AblaValue left, AblaValue right) {
     const size_t length = left.as.string.length + right.as.string.length;
     AblaStringRope* rope =
         (AblaStringRope*)abla_platform_alloc(sizeof(AblaStringRope));
+    abla_platform_memory_set_layout(rope, 6);
     rope->left = left.as.string;
     rope->right = right.as.string;
     rope->flattened = (char*)0;
@@ -505,11 +513,15 @@ AblaValue abla_array_create(const AblaValue* values, size_t count) {
         panic("array allocation overflow", 25);
     }
     AblaArray* array = (AblaArray*)abla_platform_alloc(sizeof(AblaArray));
+    abla_platform_memory_set_layout(array, 4);
     array->length = count;
     array->capacity = count;
     array->values = count == 0
         ? (AblaValue*)0
         : (AblaValue*)abla_platform_alloc(sizeof(AblaValue) * count);
+    if (array->values != (AblaValue*)0) {
+        abla_platform_memory_set_layout(array->values, 2);
+    }
     for (size_t index = 0; index < count; ++index) array->values[index] = values[index];
     return (AblaValue){.tag = ABLA_ARRAY, .as.array = array};
 }
@@ -531,6 +543,7 @@ AblaValue abla_array_append(AblaValue value, AblaValue element) {
         }
         AblaValue* values =
             (AblaValue*)abla_platform_alloc(sizeof(AblaValue) * capacity);
+        abla_platform_memory_set_layout(values, 2);
         for (size_t index = 0; index < array->length; ++index) {
             values[index] = array->values[index];
         }
@@ -560,6 +573,7 @@ void abla_array_set(AblaValue value, AblaValue index_value, AblaValue element) {
 
 AblaValue abla_object_create(uint32_t type_symbol) {
     AblaObject* object = (AblaObject*)abla_platform_alloc(sizeof(AblaObject));
+    abla_platform_memory_set_layout(object, 5);
     object->type_symbol = type_symbol;
     object->count = 0;
     object->capacity = 0;
@@ -587,6 +601,7 @@ void abla_field_set(AblaValue value, uint32_t field_symbol, AblaValue field_valu
     if (object->count == object->capacity) {
         const size_t capacity = object->capacity == 0 ? 4 : object->capacity * 2;
         AblaField* fields = (AblaField*)abla_platform_alloc(sizeof(AblaField) * capacity);
+        abla_platform_memory_set_layout(fields, 3);
         for (size_t index = 0; index < object->count; ++index) fields[index] = object->fields[index];
         if (object->fields != (AblaField*)0) abla_platform_free(object->fields);
         object->fields = fields;

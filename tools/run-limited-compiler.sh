@@ -4,6 +4,14 @@ set -euo pipefail
 launcher=$(readlink -f -- "${BASH_SOURCE[0]}")
 script_directory=$(cd -- "$(dirname -- "$launcher")" && pwd)
 compiler="${0}.bin"
+stack_kb=${ABLA_MAX_STACK_KB:-65536}
+
+if [[ ! $stack_kb =~ ^[1-9][0-9]*$ ]]; then
+    printf '[abla-limit] ABLA_MAX_STACK_KB must be a positive integer, got %q\n' \
+        "$stack_kb" >&2
+    exit 2
+fi
+ulimit -S -s "$stack_kb"
 
 # A full compiler graph legitimately needs room for the pure-Abla frontend and
 # LLVM O2 in one process. Keep the ordinary ceiling small, but make the public

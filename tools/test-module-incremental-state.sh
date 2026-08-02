@@ -5,7 +5,7 @@ compiler=${1:-build/ablac.bin}
 output=build/module-incremental-state-test
 
 "$compiler" build tests/cases/modules/module-incremental-state.ab \
-    -o "$output" --fast
+    -o "$output" --fast --no-cache
 
 set +e
 ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=30 \

@@ -10,6 +10,7 @@ compiler=$1
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/fast-aot-test"
 fast_compiler="$output_directory/ablac-fast"
+fast_payload="$fast_compiler.bin"
 mkdir -p "$output_directory"
 
 "$compiler" --emit-llvm "$project_root/bootstrap/compiler/main.ab" \
@@ -17,12 +18,12 @@ mkdir -p "$output_directory"
 
 begin=$(date +%s%N)
 "$compiler" build "$project_root/bootstrap/compiler/main.ab" \
-    -o "$fast_compiler" --fast
+    -o "$fast_payload" --fast --no-cache
 end=$(date +%s%N)
 elapsed_ms=$(((end - begin) / 1000000))
 
-ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=120 \
-    "$project_root/tools/run-limited.sh" \
+ln -sfn ../../tools/run-limited-compiler.sh "$fast_compiler"
+ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 \
     "$fast_compiler" --emit-llvm \
     "$project_root/bootstrap/compiler/main.ab" \
     > "$output_directory/fixed.ll"

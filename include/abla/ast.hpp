@@ -31,6 +31,7 @@ struct TypeSyntax {
     std::vector<ParameterMode> parameter_modes;
     std::unique_ptr<TypeSyntax> receiver;
     std::unique_ptr<TypeSyntax> return_type;
+    std::optional<std::string> borrow_source;
     bool nullable{};
     std::size_t pointer_depth{};
 

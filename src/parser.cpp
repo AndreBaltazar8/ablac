@@ -450,7 +450,24 @@ std::vector<ast::TypeParameter> Parser::parse_type_parameters() {
 
 ast::TypeSyntax Parser::parse_type() {
     const auto begin = current().span.begin;
+    std::optional<std::string> borrow_source;
+    if (at(TokenKind::Identifier) && text(current()) == "borrow" &&
+        position_ + 1 < tokens_.size() &&
+        tokens_[position_ + 1].kind == TokenKind::LeftParen) {
+        position_ += 2;
+        if (at(TokenKind::Identifier) || at(TokenKind::Integer)) {
+            borrow_source = text(current());
+            ++position_;
+        } else {
+            diagnostics_.error(
+                current().span,
+                "expected a parameter name, 'this', or parameter index "
+                "inside borrow result contract");
+        }
+        expect(TokenKind::RightParen, "after borrow result source");
+    }
     auto result = parse_named_or_function_type();
+    result.borrow_source = std::move(borrow_source);
     if (consume(TokenKind::Question)) {
         result.nullable = true;
     }

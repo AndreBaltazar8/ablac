@@ -6,6 +6,8 @@
 #include <limits>
 #include <ostream>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace abla::backend {
 
@@ -24,6 +26,29 @@ const char* runtime_binary(ir::Opcode opcode) {
     case ir::Opcode::Greater: return "abla_greater";
     case ir::Opcode::GreaterEqual: return "abla_greater_equal";
     default: return nullptr;
+    }
+}
+
+bool may_allocate(ir::Opcode opcode) {
+    using ir::Opcode;
+    switch (opcode) {
+    case Opcode::ConstantString:
+    case Opcode::ConstantFrozen:
+    case Opcode::ToString:
+    case Opcode::StringConcat:
+    case Opcode::Equal:
+    case Opcode::NotEqual:
+    case Opcode::Call:
+    case Opcode::CallIndirect:
+    case Opcode::ArrayCreate:
+    case Opcode::ArrayAppend:
+    case Opcode::StringGet:
+    case Opcode::StringSlice:
+    case Opcode::ObjectCreate:
+    case Opcode::FieldSet:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -201,14 +226,93 @@ void CEmitter::emit_function(
             }
         }
     }
+    using LiveSet = std::unordered_set<ir::ValueId>;
+    std::vector<LiveSet> uses(function.blocks.size());
+    std::vector<LiveSet> definitions(function.blocks.size());
+    std::vector<std::vector<ir::BlockId>> successors(function.blocks.size());
+    for (const auto& block : function.blocks) {
+        for (const auto& instruction : block.instructions) {
+            for (const auto operand : instruction.operands) {
+                if (!definitions[block.id].contains(operand)) {
+                    uses[block.id].insert(operand);
+                }
+            }
+            if (instruction.result != ir::no_value) {
+                definitions[block.id].insert(instruction.result);
+            }
+        }
+        if (block.terminator.value != ir::no_value &&
+            !definitions[block.id].contains(block.terminator.value)) {
+            uses[block.id].insert(block.terminator.value);
+        }
+        if (block.terminator.kind == ir::TerminatorKind::Jump) {
+            successors[block.id].push_back(block.terminator.first);
+        } else if (block.terminator.kind == ir::TerminatorKind::Branch) {
+            successors[block.id].push_back(block.terminator.first);
+            successors[block.id].push_back(block.terminator.second);
+        }
+    }
+    std::vector<LiveSet> live_in(function.blocks.size());
+    std::vector<LiveSet> live_out(function.blocks.size());
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::size_t reverse = function.blocks.size(); reverse > 0; --reverse) {
+            const auto block = reverse - 1;
+            LiveSet next_out;
+            for (const auto successor : successors[block]) {
+                next_out.insert(live_in[successor].begin(), live_in[successor].end());
+            }
+            LiveSet next_in = uses[block];
+            for (const auto value : next_out) {
+                if (!definitions[block].contains(value)) next_in.insert(value);
+            }
+            if (next_in != live_in[block] || next_out != live_out[block]) {
+                live_in[block] = std::move(next_in);
+                live_out[block] = std::move(next_out);
+                changed = true;
+            }
+        }
+    }
+    std::unordered_map<const ir::Instruction*, std::vector<ir::ValueId>> dead_after;
+    for (const auto& block : function.blocks) {
+        auto live = live_out[block.id];
+        if (block.terminator.value != ir::no_value) {
+            live.insert(block.terminator.value);
+        }
+        for (std::size_t reverse = block.instructions.size(); reverse > 0; --reverse) {
+            const auto& instruction = block.instructions[reverse - 1];
+            auto& dead = dead_after[&instruction];
+            if (instruction.result != ir::no_value) {
+                if (!live.contains(instruction.result)) {
+                    dead.push_back(instruction.result);
+                }
+                live.erase(instruction.result);
+            }
+            for (const auto operand : instruction.operands) {
+                if (!live.contains(operand)) dead.push_back(operand);
+                live.insert(operand);
+            }
+        }
+    }
+    const auto local_count = std::max<std::size_t>(function.locals.size(), 1);
+    const auto emitted_value_count = std::max<ir::ValueId>(value_count, 1);
+    const auto root_count = local_count + emitted_value_count;
     output << "static AblaValue " << function_name(function.id)
            << "(const AblaValue* args, size_t count) {\n"
               "    (void)count;\n"
               "    (void)args;\n"
-           << "    AblaValue locals[" << std::max<std::size_t>(function.locals.size(), 1)
-           << "];\n"
-           << "    AblaValue values[" << std::max<ir::ValueId>(value_count, 1)
-           << "];\n"
+           << "    AblaValue locals[" << local_count << "] = {0};\n"
+           << "    AblaValue values[" << emitted_value_count << "] = {0};\n"
+           << "    void* abla_root_slots[" << root_count << "];\n"
+              "    AblaRuntimeRootFrame abla_root_frame;\n"
+           << "    for (size_t i = 0; i < " << local_count
+           << "; ++i) abla_root_slots[i] = &locals[i];\n"
+           << "    for (size_t i = 0; i < " << emitted_value_count
+           << "; ++i) abla_root_slots[" << local_count
+           << " + i] = &values[i];\n"
+           << "    abla_runtime_roots_push(&abla_root_frame, abla_root_slots, "
+           << root_count << ");\n"
               "    (void)locals;\n"
               "    (void)values;\n";
     for (std::size_t i = 0; i < function.parameters.size(); ++i) {
@@ -218,7 +322,16 @@ void CEmitter::emit_function(
     for (const auto& block : function.blocks) {
         output << "block_" << block.id << ": ;\n";
         for (const auto& instruction : block.instructions) {
+            if (may_allocate(instruction.opcode)) {
+                output << "    abla_runtime_memory_pressure();\n";
+            }
             emit_instruction(output, instruction);
+            for (const auto value : dead_after[&instruction]) {
+                output << "    values[" << value << "] = abla_void();\n";
+            }
+            if (may_allocate(instruction.opcode)) {
+                output << "    abla_runtime_memory_pressure();\n";
+            }
         }
         emit_terminator(output, block.terminator);
     }
@@ -463,10 +576,11 @@ void CEmitter::emit_terminator(
     std::ostream& output,
     const ir::Terminator& terminator) {
     if (terminator.kind == ir::TerminatorKind::Return) {
-        output << "    return ";
+        output << "    {\n        AblaValue abla_result = ";
         if (terminator.value == ir::no_value) output << "abla_void()";
         else output << "values[" << terminator.value << ']';
-        output << ";\n";
+        output << ";\n        abla_runtime_roots_pop(&abla_root_frame);\n"
+                  "        return abla_result;\n    }\n";
     } else if (terminator.kind == ir::TerminatorKind::Jump) {
         output << "    goto block_" << terminator.first << ";\n";
     } else if (terminator.kind == ir::TerminatorKind::Branch) {
@@ -495,6 +609,13 @@ void CEmitter::emit_entry(std::ostream& output) {
               "    (void)abla_dispatch;\n"
               "    (void)abla_global_get;\n"
               "    (void)abla_global_set;\n";
+    const auto global_count = std::max<std::size_t>(program_.globals.size(), 1);
+    output << "    void* abla_root_slots[" << global_count << "];\n"
+           << "    for (size_t i = 0; i < " << global_count
+           << "; ++i) abla_root_slots[i] = &abla_globals[i];\n"
+              "    AblaRuntimeRootFrame abla_root_frame;\n"
+           << "    abla_runtime_roots_push(&abla_root_frame, abla_root_slots, "
+           << global_count << ");\n";
     if (program_.globals.empty()) {
         output << "    (void)abla_globals;\n"
                   "    (void)abla_global_state;\n";
@@ -504,6 +625,7 @@ void CEmitter::emit_entry(std::ostream& output) {
     }
     output << "    AblaValue result = " << function_name(found->id)
            << "((const AblaValue*)0, 0);\n"
+              "    abla_runtime_roots_pop(&abla_root_frame);\n"
               "    if (result.tag == ABLA_VOID) return 0;\n"
               "    return (int)abla_as_i64(result);\n"
               "}\n";

@@ -9,7 +9,7 @@ mkdir -p "$output_directory"
 program="$output_directory/program"
 "$compiler" build \
     "$project_root/tests/cases/modules/return-control.ab" \
-    -o "$program"
+    -o "$program" --no-cache
 
 set +e
 "$project_root/tools/run-limited.sh" "$program"
@@ -24,7 +24,7 @@ rm -f "$output_directory/invalid"
 set +e
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/invalid-return-type.ab" \
-    -o "$output_directory/invalid" \
+    -o "$output_directory/invalid" --no-cache \
     >"$output_directory/invalid-output.txt" \
     2>"$output_directory/invalid-errors.txt"
 invalid_status=$?
@@ -46,7 +46,7 @@ fi
 
 "$compiler" build \
     "$project_root/tests/cases/modules/return-c-backend.ab" \
-    -o "$output_directory/c-generator"
+    -o "$output_directory/c-generator" --no-cache
 "$project_root/tools/run-limited.sh" \
     "$output_directory/c-generator" >"$output_directory/program.c"
 clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \

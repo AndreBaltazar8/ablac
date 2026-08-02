@@ -60,7 +60,7 @@ fi
 
 "$compiler" build \
     "$project_root/tests/cases/modules/loop-control-c-backend.ab" \
-    -o "$output_directory/c-generator"
+    -o "$output_directory/c-generator" --no-cache
 "$project_root/tools/run-limited.sh" \
     "$output_directory/c-generator" >"$output_directory/program.c"
 clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \

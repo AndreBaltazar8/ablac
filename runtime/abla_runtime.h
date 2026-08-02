@@ -24,6 +24,7 @@ typedef struct AblaArray AblaArray;
 typedef struct AblaObject AblaObject;
 typedef struct AblaStringRope AblaStringRope;
 typedef struct AblaSharedControl AblaSharedControl;
+typedef struct AblaRuntimeRootFrame AblaRuntimeRootFrame;
 
 typedef struct AblaString {
     const char* data;
@@ -49,6 +50,12 @@ struct AblaValue {
         AblaSharedControl* shared;
         AblaSharedControl* weak;
     } as;
+};
+
+struct AblaRuntimeRootFrame {
+    AblaRuntimeRootFrame* previous;
+    void** roots;
+    uint64_t count;
 };
 
 void* abla_platform_alloc(size_t size);
@@ -150,6 +157,12 @@ void abla_platform_memory_set_limit(int64_t limit);
 void abla_platform_memory_set_scan(void* pointer, int64_t scan_size);
 void abla_platform_memory_set_layout(void* pointer, int64_t layout);
 int64_t abla_platform_memory_collect(void* root_frames);
+void abla_runtime_roots_push(
+    AblaRuntimeRootFrame* frame,
+    void** roots,
+    uint64_t count);
+void abla_runtime_roots_pop(AblaRuntimeRootFrame* frame);
+void abla_runtime_memory_pressure(void);
 
 int64_t abla_as_i64(AblaValue value);
 bool abla_as_bool(AblaValue value);

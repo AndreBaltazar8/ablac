@@ -109,6 +109,7 @@ class Counter(var value: int) {
         value
     }
 }
+
 resource class Handle(val id: int)
 compile fun generate<T>(input: T?) {
     #printf("type")
@@ -172,6 +173,57 @@ fun main {
             invoke->parameters[0].type.parameter_modes[0] ==
                 abla::ast::ParameterMode::MutableBorrow,
         "mutable-borrow callable mode is preserved");
+}
+
+void test_borrow_result_contract_syntax() {
+    FrontendResult result(
+        "borrow-results.ab",
+        R"(
+class Holder(val value: int)
+fun borrowParameter(owner: Holder): borrow(owner) Holder = owner
+fun Holder.borrowReceiver(): borrow(this) Holder = this
+fun borrowCallable(
+    callback: (Holder) -> borrow(0) Holder
+): (Holder) -> borrow(0) Holder = callback
+)");
+    if (result.diagnostics.has_errors()) {
+        result.diagnostics.render(std::cerr, result.source);
+    }
+    check(
+        !result.diagnostics.has_errors(),
+        "borrow result contracts parse in declarations and callable types");
+    check(
+        result.program->declarations.size() == 4,
+        "borrow result fixture retains every declaration");
+    const auto* parameter = dynamic_cast<const abla::ast::FunctionDeclaration*>(
+        result.program->declarations[1].get());
+    check(
+        parameter != nullptr && parameter->return_type &&
+            parameter->return_type->borrow_source == "owner" &&
+            parameter->return_type->name == "Holder",
+        "named borrow result source is preserved separately from its type");
+    const auto* receiver = dynamic_cast<const abla::ast::FunctionDeclaration*>(
+        result.program->declarations[2].get());
+    check(
+        receiver != nullptr && receiver->return_type &&
+            receiver->return_type->borrow_source == "this",
+        "receiver borrow result source is preserved");
+    const auto* callable = dynamic_cast<const abla::ast::FunctionDeclaration*>(
+        result.program->declarations[3].get());
+    check(
+        callable != nullptr && !callable->parameters.empty() &&
+            callable->parameters[0].type.return_type &&
+            callable->parameters[0].type.return_type->borrow_source == "0" &&
+            callable->return_type && callable->return_type->return_type &&
+            callable->return_type->return_type->borrow_source == "0",
+        "indexed borrow result source is preserved in callable types");
+
+    FrontendResult invalid(
+        "invalid-borrow-result.ab",
+        "fun invalid(owner: Holder): borrow() Holder = owner");
+    check(
+        invalid.diagnostics.has_errors(),
+        "empty borrow result source is diagnosed");
 }
 
 void test_optional_semicolons() {
@@ -277,6 +329,24 @@ void test_valid_semantic_types() {
             function.result == typed.types.int_type(),
             "function result resolves to canonical int/i64 type");
     }
+}
+
+void test_statement_conditionals_and_dominating_values() {
+    abla::ModuleGraph graph;
+    static_cast<void>(
+        graph.load_entry("tests/cases/modules/statement-conditionals.ab"));
+    auto semantics = abla::sema::Resolver(graph).resolve();
+    auto typed = abla::sema::TypeChecker(graph, semantics).check();
+    auto program = abla::ir::Lowerer(graph, semantics, typed).lower();
+    const auto verified = abla::ir::Verifier(
+        typed.types, graph.entry()->diagnostics).verify(program);
+    if (graph.has_errors()) graph.render_diagnostics(std::cerr);
+    check(
+        !graph.has_errors(),
+        "statement conditionals may discard branches of different types");
+    check(
+        verified,
+        "values defined before a branch remain visible on dominated paths");
 }
 
 void test_ir_lowering_and_verification() {
@@ -616,12 +686,14 @@ int main() {
     test_lexer_nested_comments_and_semicolons();
     test_string_interpolation();
     test_parser_compatible_surface();
+    test_borrow_result_contract_syntax();
     test_optional_semicolons();
     test_diagnostics();
     test_module_graph_and_resolution();
     test_resolution_diagnostics();
     test_type_diagnostics();
     test_valid_semantic_types();
+    test_statement_conditionals_and_dominating_values();
     test_ir_lowering_and_verification();
     test_vm_execution();
     test_registered_native_execution();

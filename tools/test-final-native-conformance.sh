@@ -73,7 +73,7 @@ for fixture_specification in "${fixtures[@]}"; do
         "$project_root/tools/run-limited.sh" \
         "$compiler" build \
         "$project_root/tests/cases/modules/$fixture.ab" \
-        -o "$output" 2>"$error_log"; then
+        -o "$output" --no-cache 2>"$error_log"; then
         echo "$fixture: final-native build failed" >&2
         sed -n '1,80p' "$error_log" >&2
         exit 1

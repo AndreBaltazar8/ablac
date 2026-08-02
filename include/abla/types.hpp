@@ -116,8 +116,8 @@ private:
     void check_function(ast::FunctionDeclaration& declaration, const Symbol& symbol);
     void check_class(ast::ClassDeclaration& declaration);
     TypeId check_property(ast::PropertyDeclaration& declaration);
-    TypeId check_block(ast::Block& block);
-    TypeId check_expression(ast::Expression& expression);
+    TypeId check_block(ast::Block& block, bool value_required = true);
+    TypeId check_expression(ast::Expression& expression, bool value_required = true);
     TypeId check_call(ast::CallExpression& call);
     TypeId check_member(ast::MemberExpression& member);
     TypeId type_from_syntax(ast::TypeSyntax& syntax);

@@ -325,20 +325,22 @@ fun bootstrapLlvmInstructionMayCollect(
     functionIndex: BootstrapLlvmNameIndex,
     mayCollect: array<bool>
 ): bool {
+    var result = false
     if (instruction.opcode == "extern.intrinsic" &&
-        instruction.text == "ablaRuntimeMemoryCollect") return true
+        instruction.text == "ablaRuntimeMemoryCollect") result = true
     if (instruction.opcode == "call.indirect" ||
-        instruction.opcode == "call.indirect.once") return true
+        instruction.opcode == "call.indirect.once") result = true
     if (instruction.opcode == "call") {
         val called = functionIndex.find(instruction.text)
-        if (called >= 0 && called < mayCollect.size) return mayCollect[called]
+        if (called >= 0 && called < mayCollect.size) result = mayCollect[called]
     }
-    false
+    result
 }
 
 fun bootstrapLlvmInstructionMayAllocate(
     instruction: BootstrapInstruction
 ): bool {
+    var result = false
     if (instruction.opcode == "array.create" ||
         instruction.opcode == "array.append" ||
         instruction.opcode == "cell.create" ||
@@ -349,15 +351,16 @@ fun bootstrapLlvmInstructionMayAllocate(
         instruction.opcode == "shared.create" ||
         instruction.opcode == "string.concat" ||
         instruction.opcode == "string.slice" ||
-        instruction.opcode == "to.string") return true
+        instruction.opcode == "to.string") result = true
     // String inspection may lazily flatten ropes. Host/native boundaries may
     // materialize returned heap values.
     if (instruction.opcode == "==" || instruction.opcode == "!=" ||
         instruction.opcode == "index.get" ||
         instruction.opcode == "extern.c" ||
-        instruction.opcode == "extern.host") return true
-    instruction.opcode == "extern.intrinsic" &&
-        instruction.text == "ablaUnsafeAllocate"
+        instruction.opcode == "extern.host") result = true
+    if (instruction.opcode == "extern.intrinsic" &&
+        instruction.text == "ablaUnsafeAllocate") result = true
+    result
 }
 
 fun bootstrapLlvmCollectingFunctions(
@@ -423,39 +426,80 @@ fun bootstrapLlvmCollectingFunctions(
     result
 }
 
-fun bootstrapLlvmValueNeedsGcRoot(
+fun bootstrapLlvmGcRootPlan(
     function: BootstrapIrFunction,
-    value: int,
     functionIndex: BootstrapLlvmNameIndex,
     mayCollect: array<bool>
-): bool {
-    var definition = -1
-    var lastUse = -1
+): array<bool> {
+    var valueCount = 0
     var instruction = 0
     while (instruction < function.instructions.size) {
         val candidate = function.instructions[instruction]
-        if (candidate.result == value && definition < 0) definition = instruction
-        if (candidate.left == value || candidate.right == value) {
-            lastUse = instruction
-        }
+        if (candidate.result >= valueCount) valueCount = candidate.result + 1
+        if (candidate.left >= valueCount) valueCount = candidate.left + 1
+        if (candidate.right >= valueCount) valueCount = candidate.right + 1
         var operand = 0
         while (operand < candidate.operands.size) {
-            if (candidate.operands[operand] == value) lastUse = instruction
+            if (candidate.operands[operand] >= valueCount) {
+                valueCount = candidate.operands[operand] + 1
+            }
             operand = operand + 1
         }
         instruction = instruction + 1
     }
-    if (definition < 0 || lastUse <= definition) return false
-    instruction = definition + 1
-    while (instruction < lastUse) {
+
+    val definitions: array<int> = []
+    val lastUses: array<int> = []
+    val result: array<bool> = []
+    var value = 0
+    while (value < valueCount) {
+        definitions.append(-1)
+        lastUses.append(-1)
+        result.append(false)
+        value = value + 1
+    }
+
+    // collectorPrefix[n] counts collection-capable instructions before n.
+    // That makes the old strict interval (definition, last use) an O(1)
+    // lookup for every SSA value instead of rescanning the whole function.
+    val collectorPrefix: array<int> = []
+    collectorPrefix.append(0)
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.result >= 0 &&
+            definitions[candidate.result] < 0) {
+            definitions[candidate.result] = instruction
+        }
+        if (candidate.left >= 0) lastUses[candidate.left] = instruction
+        if (candidate.right >= 0) lastUses[candidate.right] = instruction
+        var operand = 0
+        while (operand < candidate.operands.size) {
+            val used = candidate.operands[operand]
+            if (used >= 0) lastUses[used] = instruction
+            operand = operand + 1
+        }
+        var collectorCount = collectorPrefix[instruction]
         if (bootstrapLlvmInstructionMayCollect(
-            function.instructions[instruction],
+            candidate,
             functionIndex,
             mayCollect
-        )) return true
+        )) collectorCount = collectorCount + 1
+        collectorPrefix.append(collectorCount)
         instruction = instruction + 1
     }
-    false
+
+    value = 0
+    while (value < valueCount) {
+        val definition = definitions[value]
+        val lastUse = lastUses[value]
+        if (definition >= 0 && lastUse > definition &&
+            collectorPrefix[lastUse] > collectorPrefix[definition + 1]) {
+            result[value] = true
+        }
+        value = value + 1
+    }
+    result
 }
 
 fun bootstrapLlvmParameterId(
@@ -733,7 +777,8 @@ fun bootstrapLlvmRuntimePlatform(
         output = "${output}define internal i64 @abla_runtime_memory_live_bytes() {\nentry:\n  %value = load i64, ptr @abla_runtime_allocation_live_bytes, align 8\n  ret i64 %value\n}\n\n"
         output = "${output}define internal i64 @abla_runtime_memory_limit() {\nentry:\n  %value = load i64, ptr @abla_runtime_allocation_limit, align 8\n  ret i64 %value\n}\n\n"
         output = "${output}define internal void @abla_runtime_memory_set_limit(i64 %limit) {\nentry:\n  %negative = icmp slt i64 %limit, 0\n  %live = load i64, ptr @abla_runtime_allocation_live_bytes, align 8\n  %below_live = icmp ult i64 %limit, %live\n  %invalid = or i1 %negative, %below_live\n  br i1 %invalid, label %failed, label %ready\nready:\n  store i64 %limit, ptr @abla_runtime_allocation_limit, align 8\n  ret void\nfailed:\n  %message = getelementptr [21 x i8], ptr @abla_runtime_invalid_memory_limit, i64 0, i64 0\n  call void @abla_runtime_panic(ptr %message, i64 20)\n  unreachable\n}\n\n"
-        output = "${output}define internal void @abla_runtime_memory_reset(i64 %checkpoint) {\nentry:\n  %generation = load i64, ptr @abla_runtime_allocation_generation, align 8\n  %valid = icmp ule i64 %checkpoint, %generation\n  br i1 %valid, label %condition, label %invalid\ncondition:\n  %tail = load ptr, ptr @abla_runtime_allocation_tail, align 8\n  %has_tail = icmp ne ptr %tail, null\n  br i1 %has_tail, label %inspect, label %done\ninspect:\n  %generation_slot = getelementptr i8, ptr %tail, i64 16\n  %tail_generation = load i64, ptr %generation_slot, align 8\n  %newer = icmp ugt i64 %tail_generation, %checkpoint\n  br i1 %newer, label %release, label %done\nrelease:\n  %payload = getelementptr i8, ptr %tail, i64 40\n  call void @abla_runtime_free(ptr %payload)\n  br label %condition\ndone:\n  ret void\ninvalid:\n  %message = getelementptr [26 x i8], ptr @abla_runtime_invalid_checkpoint, i64 0, i64 0\n  call void @abla_runtime_panic(ptr %message, i64 25)\n  unreachable\n}\n\n"
+        output = "${output}define internal void @abla_runtime_clear_newer_rope_caches(i64 %checkpoint) {\nentry:\n  %initial = load ptr, ptr @abla_runtime_allocation_tail, align 8\n  br label %condition\ncondition:\n  %header = phi ptr [ %initial, %entry ], [ %previous, %next ]\n  %more = icmp ne ptr %header, null\n  br i1 %more, label %inspect, label %done\ninspect:\n  %generation_slot = getelementptr i8, ptr %header, i64 16\n  %generation = load i64, ptr %generation_slot, align 8\n  %retained = icmp ule i64 %generation, %checkpoint\n  %scan_slot = getelementptr i8, ptr %header, i64 32\n  %scan = load i64, ptr %scan_slot, align 8\n  %layout = lshr i64 %scan, 56\n  %rope = icmp eq i64 %layout, 6\n  %inspect_cache = and i1 %retained, %rope\n  br i1 %inspect_cache, label %cache, label %next\ncache:\n  %payload = getelementptr i8, ptr %header, i64 40\n  %cache_slot = getelementptr i8, ptr %payload, i64 64\n  %flattened = load ptr, ptr %cache_slot, align 8\n  %has_cache = icmp ne ptr %flattened, null\n  br i1 %has_cache, label %cache_generation, label %next\ncache_generation:\n  %cache_generation_slot = getelementptr i8, ptr %flattened, i64 -24\n  %cached_generation = load i64, ptr %cache_generation_slot, align 8\n  %cache_newer = icmp ugt i64 %cached_generation, %checkpoint\n  br i1 %cache_newer, label %clear, label %next\nclear:\n  store ptr null, ptr %cache_slot, align 8\n  br label %next\nnext:\n  %previous_slot = getelementptr i8, ptr %header, i64 0\n  %previous = load ptr, ptr %previous_slot, align 8\n  br label %condition\ndone:\n  ret void\n}\n\n"
+        output = "${output}define internal void @abla_runtime_memory_reset(i64 %checkpoint) {\nentry:\n  %generation = load i64, ptr @abla_runtime_allocation_generation, align 8\n  call void @abla_runtime_clear_newer_rope_caches(i64 %checkpoint)\n  %valid = icmp ule i64 %checkpoint, %generation\n  br i1 %valid, label %condition, label %invalid\ncondition:\n  %tail = load ptr, ptr @abla_runtime_allocation_tail, align 8\n  %has_tail = icmp ne ptr %tail, null\n  br i1 %has_tail, label %inspect, label %done\ninspect:\n  %generation_slot = getelementptr i8, ptr %tail, i64 16\n  %tail_generation = load i64, ptr %generation_slot, align 8\n  %newer = icmp ugt i64 %tail_generation, %checkpoint\n  br i1 %newer, label %release, label %done\nrelease:\n  %payload = getelementptr i8, ptr %tail, i64 40\n  call void @abla_runtime_free(ptr %payload)\n  br label %condition\ndone:\n  ret void\ninvalid:\n  %message = getelementptr [26 x i8], ptr @abla_runtime_invalid_checkpoint, i64 0, i64 0\n  call void @abla_runtime_panic(ptr %message, i64 25)\n  unreachable\n}\n\n"
     }
     output
 }
@@ -760,8 +805,8 @@ fun bootstrapLlvmRootRuntime(
         output = "${output}define internal i64 @abla_runtime_memory_collect() {\nentry:\n  ret i64 0\n}\n\n"
     }
     if (collectorEnabled) {
-        output = "${output}@abla_runtime_collection_threshold = internal global i64 8388608, align 8\n\n"
-        output = "${output}define internal void @abla_runtime_memory_pressure() {\nentry:\n  %live = call i64 @abla_runtime_memory_live_bytes()\n  %limit = call i64 @abla_runtime_memory_limit()\n  %half_limit = udiv i64 %limit, 2\n  %configured = load i64, ptr @abla_runtime_collection_threshold, align 8\n  %configured_first = icmp ult i64 %configured, %half_limit\n  %trigger = select i1 %configured_first, i64 %configured, i64 %half_limit\n  %pressured = icmp uge i64 %live, %trigger\n  br i1 %pressured, label %collect, label %done\ncollect:\n  %freed = call i64 @abla_runtime_memory_collect()\n  %after = call i64 @abla_runtime_memory_live_bytes()\n  %plus = add i64 %after, 1048576\n  %plus_overflow = icmp ult i64 %plus, %after\n  %doubled = shl i64 %after, 1\n  %double_overflow = icmp ult i64 %doubled, %after\n  %larger_double = icmp ugt i64 %doubled, %plus\n  %grown = select i1 %larger_double, i64 %doubled, i64 %plus\n  %growth_overflow = or i1 %plus_overflow, %double_overflow\n  %candidate = select i1 %growth_overflow, i64 %limit, i64 %grown\n  %above_limit = icmp ugt i64 %candidate, %limit\n  %next = select i1 %above_limit, i64 %limit, i64 %candidate\n  store i64 %next, ptr @abla_runtime_collection_threshold, align 8\n  br label %done\ndone:\n  ret void\n}\n\n"
+        output = "${output}@abla_runtime_collection_threshold = internal global i64 9223372036854775807, align 8\n\n"
+        output = "${output}define internal void @abla_runtime_memory_pressure() alwaysinline {\nentry:\n  %live = call i64 @abla_runtime_memory_live_bytes()\n  %limit = call i64 @abla_runtime_memory_limit()\n  %has_large_reserve = icmp ugt i64 %limit, 536870912\n  %small_reserve = udiv i64 %limit, 2\n  %reserve = select i1 %has_large_reserve, i64 536870912, i64 %small_reserve\n  %latest = sub i64 %limit, %reserve\n  %configured = load i64, ptr @abla_runtime_collection_threshold, align 8\n  %configured_first = icmp ult i64 %configured, %latest\n  %trigger = select i1 %configured_first, i64 %configured, i64 %latest\n  %pressured = icmp uge i64 %live, %trigger\n  br i1 %pressured, label %collect, label %done\ncollect:\n  %freed = call i64 @abla_runtime_memory_collect()\n  %after = call i64 @abla_runtime_memory_live_bytes()\n  %plus = add i64 %after, 1048576\n  %plus_overflow = icmp ult i64 %plus, %after\n  %doubled = shl i64 %after, 1\n  %double_overflow = icmp ult i64 %doubled, %after\n  %larger_double = icmp ugt i64 %doubled, %plus\n  %grown = select i1 %larger_double, i64 %doubled, i64 %plus\n  %growth_overflow = or i1 %plus_overflow, %double_overflow\n  %candidate = select i1 %growth_overflow, i64 %limit, i64 %grown\n  %above_limit = icmp ugt i64 %candidate, %limit\n  %next = select i1 %above_limit, i64 %limit, i64 %candidate\n  store i64 %next, ptr @abla_runtime_collection_threshold, align 8\n  br label %done\ndone:\n  ret void\n}\n\n"
     } else {
         output = "${output}define internal void @abla_runtime_memory_pressure() alwaysinline {\nentry:\n  ret void\n}\n\n"
     }
@@ -993,6 +1038,11 @@ fun bootstrapLlvmEmitFunction(
     mayCollect: array<bool>
 ): BootstrapLlvmEmission {
     val localIndex = bootstrapLlvmLocalIndex(function)
+    val gcRootPlan = bootstrapLlvmGcRootPlan(
+        function,
+        functionIndex,
+        mayCollect
+    )
     var errors = 0
     var output =
         "define hidden void @${identities.symbols[functionId]}(ptr noalias sret(%AblaValue) align 8 %out, ptr %args, i64 %count) {\nentry:\n"
@@ -1004,12 +1054,10 @@ fun bootstrapLlvmEmitFunction(
         if (instruction.result >= 0) {
             output = "$output  %v${instruction.result} = alloca %AblaValue, align 8\n"
             if (functionId < mayCollect.size && mayCollect[functionId] &&
-                bootstrapLlvmValueNeedsGcRoot(
-                    function,
-                    instruction.result,
-                    functionIndex,
-                    mayCollect
-                )) rootNames.append("v${instruction.result}")
+                instruction.result < gcRootPlan.size &&
+                gcRootPlan[instruction.result]) {
+                rootNames.append("v${instruction.result}")
+            }
         }
         if (instruction.opcode == "local.declare" ||
             instruction.opcode == "local.zero" ||
@@ -1055,14 +1103,22 @@ fun bootstrapLlvmEmitFunction(
         }
         parameter = parameter + 1
     }
+    instructionIndex = 0
+    while (instructionIndex < function.instructions.size) {
+        val instruction = function.instructions[instructionIndex]
+        if (instruction.result >= 0) {
+            output = "$output  store %AblaValue zeroinitializer, ptr %v${instruction.result}, align 8\n"
+        }
+        if (instruction.opcode == "local.declare" ||
+            instruction.opcode == "local.zero" ||
+            instruction.opcode == "local.allocate") {
+            output = "$output  store %AblaValue zeroinitializer, ptr %local_$instructionIndex, align 8\n"
+        }
+        instructionIndex = instructionIndex + 1
+    }
     if (rootNames.size > 0) {
         output = "$output  %gc_frame = alloca %AblaRootFrame, align 8\n"
         output = "$output  %gc_roots = alloca [${rootNames.size} x ptr], align 8\n"
-    }
-    var root = 0
-    while (root < rootNames.size) {
-        output = "$output  store %AblaValue zeroinitializer, ptr %${rootNames[root]}, align 8\n"
-        root = root + 1
     }
 
     parameter = 0
@@ -1080,7 +1136,7 @@ fun bootstrapLlvmEmitFunction(
         parameter = parameter + 1
     }
 
-    root = 0
+    var root = 0
     while (root < rootNames.size) {
         output = "$output  %gc_root_$root = getelementptr [${rootNames.size} x ptr], ptr %gc_roots, i64 0, i64 $root\n"
         output = "$output  store ptr %${rootNames[root]}, ptr %gc_root_$root, align 8\n"
@@ -2106,6 +2162,7 @@ fun bootstrapEmitLlvmProgram(
         errors = errors + emitted.errors
         functionIndex = functionIndex + 1
     }
+
 
     output = "$output${bootstrapLlvmClosureDropDispatcher(
         program,

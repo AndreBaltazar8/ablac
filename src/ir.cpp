@@ -1227,7 +1227,73 @@ bool Verifier::verify_function(const Program& program, const Function& function)
         }
     }
 
-    std::unordered_map<ValueId, sema::TypeId> all_values;
+    struct Definition {
+        std::size_t block;
+        sema::TypeId type;
+    };
+    std::unordered_map<ValueId, Definition> definitions;
+    for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
+        const auto& block = function.blocks[block_index];
+        for (std::size_t instruction_index = 0;
+             instruction_index < block.instructions.size(); ++instruction_index) {
+            const auto& instruction = block.instructions[instruction_index];
+            if (instruction.result == no_value) continue;
+            if (definitions.contains(instruction.result)) {
+                diagnostics_.error(instruction.span, "IR value is defined more than once");
+                valid = false;
+            } else {
+                definitions.emplace(
+                    instruction.result,
+                    Definition{block_index, instruction.type});
+            }
+        }
+    }
+
+    std::vector<std::vector<std::size_t>> predecessors(function.blocks.size());
+    for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
+        const auto& block = function.blocks[block_index];
+        const auto add_predecessor = [&](BlockId target) {
+            if (target < function.blocks.size()) {
+                predecessors[target].push_back(block_index);
+            }
+        };
+        if (block.terminator.kind == TerminatorKind::Jump) {
+            add_predecessor(block.terminator.first);
+        } else if (block.terminator.kind == TerminatorKind::Branch) {
+            add_predecessor(block.terminator.first);
+            add_predecessor(block.terminator.second);
+        }
+    }
+    std::vector<std::vector<bool>> dominates(
+        function.blocks.size(),
+        std::vector<bool>(function.blocks.size(), true));
+    for (std::size_t block = 0; block < function.blocks.size(); ++block) {
+        if (block == 0 || predecessors[block].empty()) {
+            std::fill(dominates[block].begin(), dominates[block].end(), false);
+            dominates[block][block] = true;
+        }
+    }
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::size_t block = 1; block < function.blocks.size(); ++block) {
+            if (predecessors[block].empty()) continue;
+            std::vector<bool> next(function.blocks.size(), true);
+            for (const auto predecessor : predecessors[block]) {
+                for (std::size_t candidate = 0;
+                     candidate < function.blocks.size(); ++candidate) {
+                    next[candidate] =
+                        next[candidate] && dominates[predecessor][candidate];
+                }
+            }
+            next[block] = true;
+            if (next != dominates[block]) {
+                dominates[block] = std::move(next);
+                changed = true;
+            }
+        }
+    }
+
     for (std::size_t block_index = 0; block_index < function.blocks.size(); ++block_index) {
         const auto& block = function.blocks[block_index];
         if (block.id != block_index) {
@@ -1235,13 +1301,21 @@ bool Verifier::verify_function(const Program& program, const Function& function)
             valid = false;
         }
         std::unordered_map<ValueId, sema::TypeId> visible;
-        for (const auto& instruction : block.instructions) {
+        for (const auto& [value, definition] : definitions) {
+            if (definition.block != block_index &&
+                dominates[block_index][definition.block]) {
+                visible[value] = definition.type;
+            }
+        }
+        for (std::size_t instruction_index = 0;
+             instruction_index < block.instructions.size(); ++instruction_index) {
+            const auto& instruction = block.instructions[instruction_index];
             for (const auto operand : instruction.operands) {
                 if (!visible.contains(operand)) {
                     diagnostics_.error(
                         instruction.span,
                         "IR operand " + std::to_string(operand) +
-                            " is not defined earlier in block " +
+                            " is not defined on a dominating path before block " +
                             std::to_string(block.id) + " of function '" +
                             function.name + "'");
                     valid = false;
@@ -1250,11 +1324,6 @@ bool Verifier::verify_function(const Program& program, const Function& function)
             valid = verify_instruction(
                 program, function, block, instruction, visible) && valid;
             if (instruction.result != no_value) {
-                if (all_values.contains(instruction.result)) {
-                    diagnostics_.error(instruction.span, "IR value is defined more than once");
-                    valid = false;
-                }
-                all_values[instruction.result] = instruction.type;
                 visible[instruction.result] = instruction.type;
             }
         }

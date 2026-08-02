@@ -19,6 +19,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define ABLA_HOST_FALLBACK __attribute__((weak))
+#else
+#define ABLA_HOST_FALLBACK
+#endif
+
 static int host_argc;
 static char** host_argv;
 static char** host_envp;
@@ -42,9 +48,43 @@ static AblaAllocationHeader* host_allocation_head;
 static AblaAllocationHeader* host_allocation_tail;
 static uint64_t host_allocation_generation;
 static size_t host_allocation_live_bytes;
-// Tracked heap budget. Programs must explicitly opt in before consuming more
-// than one GiB, so a runaway compiler cannot silently exhaust the host.
+// The standalone default remains one GiB. The guarded compiler launcher may
+// publish a stricter or larger process budget through ABLA_MAX_MEMORY_MB; use
+// the same value for the tracked heap so native pressure decisions agree with
+// the enforced address-space envelope.
 static size_t host_allocation_limit = (size_t)1024 * 1024 * 1024;
+static bool host_allocation_limit_initialized;
+static AblaRuntimeRootFrame* host_root_frame;
+static size_t host_collection_threshold = (size_t)256 * 1024 * 1024;
+static AblaAllocationHeader** host_collection_index;
+static size_t host_collection_index_count;
+static AblaAllocationHeader** host_mark_worklist;
+static size_t host_mark_worklist_count;
+
+static void host_initialize_allocation_limit(void) {
+    if (host_allocation_limit_initialized) return;
+    host_allocation_limit_initialized = true;
+    const char* configured = getenv("ABLA_MAX_MEMORY_MB");
+    if (configured == NULL || configured[0] == '\0') return;
+    size_t megabytes = 0;
+    size_t index = 0;
+    while (configured[index] != '\0') {
+        const unsigned char byte = (unsigned char)configured[index];
+        if (byte < (unsigned char)'0' || byte > (unsigned char)'9') {
+            abla_platform_panic("invalid ABLA_MAX_MEMORY_MB", 26);
+        }
+        const size_t digit = (size_t)(byte - (unsigned char)'0');
+        if (megabytes > (SIZE_MAX - digit) / 10) {
+            abla_platform_panic("ABLA_MAX_MEMORY_MB overflow", 27);
+        }
+        megabytes = megabytes * 10 + digit;
+        ++index;
+    }
+    if (megabytes == 0 || megabytes > SIZE_MAX / ((size_t)1024 * 1024)) {
+        abla_platform_panic("invalid ABLA_MAX_MEMORY_MB", 26);
+    }
+    host_allocation_limit = megabytes * (size_t)1024 * 1024;
+}
 
 // Private value-ABI helpers used only by the C platform adapter. Production
 // LLVM modules provide their own Abla-authored value runtime; keeping this
@@ -264,6 +304,7 @@ static AblaValue host_owned_string(const char* data, size_t length) {
 }
 
 void* abla_platform_alloc(size_t size) {
+    host_initialize_allocation_limit();
     const size_t measured = size == 0 ? 1 : size;
     if (measured > SIZE_MAX - sizeof(AblaAllocationHeader) ||
         host_allocation_generation >= (uint64_t)INT64_MAX ||
@@ -1030,6 +1071,26 @@ AblaValue ablaHostMemoryReset(AblaValue checkpoint_value) {
     if (checkpoint < 0 || (uint64_t)checkpoint > host_allocation_generation) {
         abla_platform_panic("invalid memory checkpoint", 25);
     }
+    // Flattening an older rope may allocate its cache inside a temporary
+    // generation. Do not leave that rope pointing at bytes the reset is about
+    // to release. Cache payloads are always tracked allocations, so their
+    // header records whether they are newer than the checkpoint.
+    AblaAllocationHeader* retained = host_allocation_head;
+    while (retained != NULL &&
+        retained->allocation.generation <= (uint64_t)checkpoint) {
+        if (retained->allocation.scan_layout == 6 &&
+            retained->allocation.size >= sizeof(AblaStringRope)) {
+            AblaStringRope* rope = (AblaStringRope*)(retained + 1);
+            if (rope->flattened != NULL) {
+                const AblaAllocationHeader* cache =
+                    ((const AblaAllocationHeader*)rope->flattened) - 1;
+                if (cache->allocation.generation > (uint64_t)checkpoint) {
+                    rope->flattened = NULL;
+                }
+            }
+        }
+        retained = retained->allocation.next;
+    }
     while (host_allocation_tail != NULL &&
         host_allocation_tail->allocation.generation > (uint64_t)checkpoint) {
         abla_platform_free((void*)(host_allocation_tail + 1));
@@ -1038,6 +1099,7 @@ AblaValue ablaHostMemoryReset(AblaValue checkpoint_value) {
 }
 
 AblaValue ablaHostMemoryLiveBytes(void) {
+    host_initialize_allocation_limit();
     if (host_allocation_live_bytes > (size_t)INT64_MAX) {
         abla_platform_panic("live allocation count overflow", 30);
     }
@@ -1045,6 +1107,7 @@ AblaValue ablaHostMemoryLiveBytes(void) {
 }
 
 AblaValue ablaHostMemoryLimit(void) {
+    host_initialize_allocation_limit();
     if (host_allocation_limit > (size_t)INT64_MAX) {
         abla_platform_panic("memory limit overflow", 21);
     }
@@ -1052,6 +1115,7 @@ AblaValue ablaHostMemoryLimit(void) {
 }
 
 AblaValue ablaHostMemorySetLimit(AblaValue limit_value) {
+    host_initialize_allocation_limit();
     const int64_t limit = host_value_as_i64(limit_value);
     if (limit < 0 || (uint64_t)limit < host_allocation_live_bytes) {
         abla_platform_panic("invalid memory limit", 20);
@@ -1089,17 +1153,34 @@ void abla_platform_memory_reset(int64_t checkpoint) {
 }
 
 int64_t abla_platform_memory_live_bytes(void) {
+    host_initialize_allocation_limit();
     return (int64_t)host_allocation_live_bytes;
 }
 
-typedef struct AblaRuntimeRootFrame AblaRuntimeRootFrame;
-struct AblaRuntimeRootFrame {
-    AblaRuntimeRootFrame* previous;
-    void** roots;
-    uint64_t count;
-};
-
 static bool host_mark_pointer(uintptr_t candidate) {
+    if (host_collection_index != NULL) {
+        size_t begin = 0;
+        size_t end = host_collection_index_count;
+        while (begin < end) {
+            const size_t middle = begin + (end - begin) / 2;
+            const uintptr_t payload =
+                (uintptr_t)(host_collection_index[middle] + 1);
+            if (payload < candidate) begin = middle + 1;
+            else end = middle;
+        }
+        if (begin >= host_collection_index_count ||
+            (uintptr_t)(host_collection_index[begin] + 1) != candidate) {
+            return false;
+        }
+        AblaAllocationHeader* header = host_collection_index[begin];
+        if ((header->allocation.generation >> 63) != 0) return false;
+        header->allocation.generation |= UINT64_C(1) << 63;
+        if (host_mark_worklist_count >= host_collection_index_count) {
+            abla_platform_panic("collection worklist overflow", 28);
+        }
+        host_mark_worklist[host_mark_worklist_count++] = header;
+        return true;
+    }
     AblaAllocationHeader* header = host_allocation_tail;
     while (header != NULL) {
         if ((uintptr_t)(header + 1) == candidate) {
@@ -1110,6 +1191,16 @@ static bool host_mark_pointer(uintptr_t candidate) {
         header = header->allocation.previous;
     }
     return false;
+}
+
+static int host_compare_allocation_payloads(
+    const void* left,
+    const void* right) {
+    const uintptr_t left_payload =
+        (uintptr_t)(*(AblaAllocationHeader* const*)left + 1);
+    const uintptr_t right_payload =
+        (uintptr_t)(*(AblaAllocationHeader* const*)right + 1);
+    return left_payload < right_payload ? -1 : left_payload > right_payload;
 }
 
 static bool host_mark_words(const void* bytes, size_t size) {
@@ -1203,6 +1294,45 @@ static bool host_mark_allocation(const AblaAllocationHeader* header) {
 
 int64_t abla_platform_memory_collect(void* opaque_frames) {
     const size_t before = host_allocation_live_bytes;
+    size_t allocation_count = 0;
+    for (AblaAllocationHeader* header = host_allocation_tail;
+         header != NULL; header = header->allocation.previous) {
+        ++allocation_count;
+    }
+    if (allocation_count > SIZE_MAX / sizeof(*host_collection_index)) {
+        abla_platform_panic("collection index overflow", 25);
+    }
+    host_collection_index = allocation_count == 0
+        ? NULL
+        : (AblaAllocationHeader**)malloc(
+            allocation_count * sizeof(*host_collection_index));
+    if (allocation_count != 0 && host_collection_index == NULL) {
+        abla_platform_panic("out of memory", 13);
+    }
+    host_collection_index_count = allocation_count;
+    host_mark_worklist = allocation_count == 0
+        ? NULL
+        : (AblaAllocationHeader**)malloc(
+            allocation_count * sizeof(*host_mark_worklist));
+    if (allocation_count != 0 && host_mark_worklist == NULL) {
+        free(host_collection_index);
+        host_collection_index = NULL;
+        host_collection_index_count = 0;
+        abla_platform_panic("out of memory", 13);
+    }
+    host_mark_worklist_count = 0;
+    size_t allocation_index = 0;
+    for (AblaAllocationHeader* header = host_allocation_tail;
+         header != NULL; header = header->allocation.previous) {
+        host_collection_index[allocation_index++] = header;
+    }
+    if (host_collection_index_count > 1) {
+        qsort(
+            host_collection_index,
+            host_collection_index_count,
+            sizeof(*host_collection_index),
+            host_compare_allocation_payloads);
+    }
     AblaRuntimeRootFrame* frame = (AblaRuntimeRootFrame*)opaque_frames;
     while (frame != NULL) {
         for (uint64_t root = 0; root < frame->count; ++root) {
@@ -1210,17 +1340,10 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
         }
         frame = frame->previous;
     }
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        AblaAllocationHeader* header = host_allocation_tail;
-        while (header != NULL) {
-            if ((header->allocation.generation >> 63) != 0 &&
-                host_mark_allocation(header)) {
-                changed = true;
-            }
-            header = header->allocation.previous;
-        }
+    while (host_mark_worklist_count != 0) {
+        const AblaAllocationHeader* marked =
+            host_mark_worklist[--host_mark_worklist_count];
+        (void)host_mark_allocation(marked);
     }
     AblaAllocationHeader* header = host_allocation_tail;
     while (header != NULL) {
@@ -1233,6 +1356,11 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
         }
         header = previous;
     }
+    free(host_collection_index);
+    host_collection_index = NULL;
+    host_collection_index_count = 0;
+    free(host_mark_worklist);
+    host_mark_worklist = NULL;
     const size_t freed = before - host_allocation_live_bytes;
     if (freed > (size_t)INT64_MAX) {
         abla_platform_panic("collection size overflow", 24);
@@ -1241,6 +1369,7 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
 }
 
 int64_t abla_platform_memory_limit(void) {
+    host_initialize_allocation_limit();
     return (int64_t)host_allocation_limit;
 }
 
@@ -1249,10 +1378,43 @@ void abla_platform_memory_set_limit(int64_t limit) {
 }
 
 AblaValue ablaRuntimeMemoryCollect(void) {
-    // Seed-C calls have no compiler-emitted root frame. They are used only at
-    // explicit test/evaluator boundaries where generation regions remain the
-    // reclamation mechanism; native LLVM lowers this intrinsic directly.
-    return host_value_i64(0);
+    return host_value_i64(abla_platform_memory_collect(host_root_frame));
+}
+
+ABLA_HOST_FALLBACK void abla_runtime_roots_push(
+    AblaRuntimeRootFrame* frame,
+    void** roots,
+    uint64_t count) {
+    frame->previous = host_root_frame;
+    frame->roots = roots;
+    frame->count = count;
+    host_root_frame = frame;
+}
+
+ABLA_HOST_FALLBACK void abla_runtime_roots_pop(AblaRuntimeRootFrame* frame) {
+    if (host_root_frame != frame) {
+        abla_platform_panic("unbalanced root frame", 21);
+    }
+    host_root_frame = frame->previous;
+}
+
+ABLA_HOST_FALLBACK void abla_runtime_memory_pressure(void) {
+    host_initialize_allocation_limit();
+    const size_t reserve = (size_t)64 * 1024 * 1024;
+    const size_t latest = host_allocation_limit > reserve
+        ? host_allocation_limit - reserve
+        : host_allocation_limit;
+    size_t trigger = host_collection_threshold;
+    if (trigger > latest) trigger = latest;
+    if (host_allocation_live_bytes < trigger) return;
+    (void)abla_platform_memory_collect(host_root_frame);
+    const size_t live = host_allocation_live_bytes;
+    const size_t growth = live / 2 > reserve ? live / 2 : reserve;
+    size_t next = live > SIZE_MAX - growth
+        ? latest
+        : live + growth;
+    if (next < host_collection_threshold) next = host_collection_threshold;
+    host_collection_threshold = next > latest ? latest : next;
 }
 
 AblaValue ablaHostWriteStdout(AblaValue text) {
