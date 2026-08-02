@@ -128,6 +128,31 @@ fun bootstrapExternalEmitObject(
     status
 }
 
+fun bootstrapTargetNeutralPanicRuntime(llvm: string): string {
+    val signature =
+        "define internal void @abla_runtime_panic(ptr %message, i64 %length) noreturn {\n"
+    var begin = -1
+    var index = 0
+    while (begin < 0 && index + signature.size <= llvm.size) {
+        if (llvm.slice(index, index + signature.size) == signature) {
+            begin = index
+        }
+        index = index + 1
+    }
+    var end = begin
+    if (begin >= 0) {
+        end = begin + signature.size
+        while (end + 2 < llvm.size &&
+               llvm.slice(end, end + 3) != "}\n\n") end = end + 1
+        if (end + 2 < llvm.size) end = end + 3
+    }
+    var result = llvm
+    if (begin >= 0 && end > begin) {
+        result = "${llvm.slice(0, begin)}${signature}entry:\n  unreachable\n}\n\n${llvm.slice(end, llvm.size)}"
+    }
+    result
+}
+
 fun bootstrapExternalEmitObjectForTarget(
     llvmPath: string,
     objectPath: string,
@@ -138,6 +163,15 @@ fun bootstrapExternalEmitObjectForTarget(
     // fast build must prune unreachable host-only implementation details before
     // llc validates target-specific inline assembly and register constraints.
     val inputPath = "$objectPath.bc"
+    val targetLlvmPath = "$objectPath.target.ll"
+    var optimizationSource = llvmPath
+    var prepared = true
+    if (llvmTriple == "wasm32-unknown-unknown") {
+        prepared = Path(targetLlvmPath).writeTextAtomic(
+            bootstrapTargetNeutralPanicRuntime(Path(llvmPath).readText())
+        )
+        if (prepared) optimizationSource = targetLlvmPath
+    }
     val optimize = linuxCommand("opt")
     optimize.argument("--threads=1")
     optimize.argument(if (fast)
@@ -145,10 +179,10 @@ fun bootstrapExternalEmitObjectForTarget(
     else
         "-passes=default<O2>,globaldce"
     )
-    optimize.argument(llvmPath)
+    optimize.argument(optimizationSource)
     optimize.argument("-o")
     optimize.argument(inputPath)
-    var status = optimize.run()
+    var status = if (prepared) optimize.run() else 1
     if (status == 0) {
         val emitObject = linuxCommand("llc")
         emitObject.argument("--threads=1")
@@ -161,6 +195,7 @@ fun bootstrapExternalEmitObjectForTarget(
         emitObject.argument(objectPath)
         status = emitObject.run()
     }
+    Path(targetLlvmPath).remove()
     status
 }
 
@@ -1102,15 +1137,17 @@ fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
     )
     val requestedPrograms = bootstrapTakeCompileProgramRequests()
     val definedTargets = bootstrapTakeDefinedTargets()
+    val artifactRoots = bootstrapTakeArtifactRootRequests()
     var status = 1
-    if (requestedPrograms.size > 0 || definedTargets.size > 0) {
+    if (requestedPrograms.size > 0 || definedTargets.size > 0 ||
+        artifactRoots.size > 0) {
         linuxPrintStandardError(
             "error[E_BUILD_COMMAND_UNSUPPORTED]: run cannot execute programmable build nodes; use 'ablac build'\n"
         )
         status = 151
     }
     if (compilation.errors == 0 && requestedPrograms.size == 0 &&
-        definedTargets.size == 0 &&
+        definedTargets.size == 0 && artifactRoots.size == 0 &&
         Path(llvmPath).writeTextAtomic(compilation.output)) {
         status = 0
     }
@@ -1182,8 +1219,10 @@ fun bootstrapServeWithEmitter(
             )
             val requestedPrograms = bootstrapTakeCompileProgramRequests()
             val definedTargets = bootstrapTakeDefinedTargets()
+            val artifactRoots = bootstrapTakeArtifactRootRequests()
             var accepted = build.status == 0
-            if (requestedPrograms.size > 0 || definedTargets.size > 0) {
+            if (requestedPrograms.size > 0 || definedTargets.size > 0 ||
+                artifactRoots.size > 0) {
                 linuxPrintStandardError(
                     "error[E_BUILD_COMMAND_UNSUPPORTED]: serve cannot execute programmable build nodes; use 'ablac build'\n"
                 )

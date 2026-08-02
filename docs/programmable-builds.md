@@ -6,7 +6,8 @@ surface for declaring programs and producing verified artifacts; ordinary
 Abla packages decide how Android, browser, server, embedded, or other projects
 compose those primitives.
 
-The first executable slice is `compilerBuildProgram`:
+The low-level executable node is `compilerBuildProgram`; public extensions may
+use the grouped `compiler.buildProgram(...)` method:
 
 ```abla
 #import("abla/compiler")
@@ -23,6 +24,27 @@ val app = #compilerBuildProgram(
 
 fun main: int = if (app) 0 else 1
 ```
+
+Resolved declarations can also become roots of a named target artifact:
+
+```abla
+compile fun configureClient(): void {
+    val action = compiler.findFunction("clientAnswer")
+    compiler.contributeArtifactRoot(
+        "browser", "wasm32-module", "module",
+        "build/client.wasm", action, "abla_client_answer", true, true
+    )
+    return
+}
+
+#compiler.transform(configureClient)
+```
+
+Repeated contributions to `browser` aggregate into one target-correct child
+compilation. The generated entry, module, object/LLVM/ABI sidecars, native root,
+and any prior versions share the graph rollback journal. This generic mechanism
+does not assign meaning to annotations such as `@client`; the selecting
+extension checks annotation policy through compiler reflection.
 
 The call adds a node to the current compilation transaction. After validating
 the root program, the driver drains those nodes in deterministic declaration
@@ -143,7 +165,9 @@ scalar exported module and thin host loader; typed model/state exchange, DOM or
 canvas renderers, hydration, host integration, and bundler policy remain library
 work. Neither workflow belongs in `ablac` itself.
 
-`#import("abla/build")` is the first ordinary library façade over these
+`#import("abla/compiler")` now exposes the compile-time-only `compiler` service
+object as the primary façade. `#import("abla/build")` remains the small
+compatibility/convenience façade over these
 compiler services. Its `buildProgram`, `defineTarget`, and `exportFunction`
 helpers contain no platform policy; Android and WASM/MVC extensions wrap them
 with their own typed descriptors and generated artifacts.

@@ -13,12 +13,14 @@ fun bootstrapOrcEmit(sourcePath: string): int {
     val compilation = bootstrapCompileLlvmParsed(parsed)
     val requestedPrograms = bootstrapTakeCompileProgramRequests()
     val definedTargets = bootstrapTakeDefinedTargets()
+    val artifactRoots = bootstrapTakeArtifactRootRequests()
     if (compilation.errors == 0 && requestedPrograms.size == 0 &&
-        definedTargets.size == 0) {
+        definedTargets.size == 0 && artifactRoots.size == 0) {
         linuxPrintStandardOutput(compilation.output)
         status = 0
     }
-    if (requestedPrograms.size > 0 || definedTargets.size > 0) {
+    if (requestedPrograms.size > 0 || definedTargets.size > 0 ||
+        artifactRoots.size > 0) {
         linuxPrintStandardError(
             "error[E_BUILD_COMMAND_UNSUPPORTED]: --emit-llvm cannot execute programmable build nodes; use 'ablac build'\n"
         )
@@ -155,7 +157,93 @@ fun bootstrapRecordNativeOutputSet(output: string): bool {
     if (recorded) recorded = bootstrapRecordBuildTransactionPath(
         "$output.raw-runtime.o"
     )
+    if (recorded) recorded = bootstrapRecordBuildTransactionPath(
+        "$output.o.bc"
+    )
     recorded
+}
+
+fun bootstrapArtifactSliceSourcePath(sourcePath: string): string {
+    var result = sourcePath
+    if (sourcePath.size > 0 && sourcePath[0] != 47) {
+        result = currentDirectory().child(sourcePath).text
+    }
+    result
+}
+
+fun bootstrapAppendArtifactSlices(
+    var queued: array<BootstrapCompileProgramRequest>,
+    roots: array<BootstrapArtifactRootRequest>,
+    sourcePath: string,
+    var sliceEntries: array<string>
+): int {
+    var status = 0
+    val emitted: array<string> = []
+    val importedSource = bootstrapArtifactSliceSourcePath(sourcePath)
+    var safeSource = importedSource.size > 0
+    var sourceByte = 0
+    while (safeSource && sourceByte < importedSource.size) {
+        if (importedSource[sourceByte] == 10 ||
+            importedSource[sourceByte] == 13 ||
+            importedSource[sourceByte] == 34 ||
+            importedSource[sourceByte] == 92) safeSource = false
+        sourceByte = sourceByte + 1
+    }
+    if (!safeSource && roots.size > 0) {
+        linuxPrintStandardError(
+            "error[E_ARTIFACT_ROOT_SOURCE]: source path cannot be represented safely in a generated artifact entry\n"
+        )
+        status = 158
+    }
+    var root = 0
+    while (status == 0 && root < roots.size) {
+        val request = roots[root]
+        var alreadyEmitted = false
+        var emittedIndex = 0
+        while (emittedIndex < emitted.size) {
+            if (emitted[emittedIndex] == request.name) {
+                alreadyEmitted = true
+            }
+            emittedIndex = emittedIndex + 1
+        }
+        if (!alreadyEmitted) {
+            var source = "#import(\"$importedSource\")\n#import(\"abla/compiler\")\ncompile fun __abla_export_slice(): void {\n"
+            var contribution = 0
+            while (contribution < roots.size) {
+                val selected = roots[contribution]
+                if (selected.name == request.name) {
+                    source = "${source}    val __abla_slice_handle_$contribution = compiler.findFunction(\"${selected.functionName}\")\n"
+                    source = "${source}    compiler.exportFunction(__abla_slice_handle_$contribution, \"${selected.exportName}\")\n"
+                }
+                contribution = contribution + 1
+            }
+            source = "${source}    return\n}\n#compiler.transform(__abla_export_slice)\n"
+            val entry = "${request.output}.abla-slice.ab"
+            var valid = Path(entry).parent().createDirectories()
+            if (valid) valid = bootstrapRecordBuildTransactionPath(entry)
+            if (valid) valid = Path(entry).writeTextAtomic(source)
+            if (!valid) {
+                linuxPrintStandardError(
+                    "error[E_ARTIFACT_ROOT_ENTRY]: cannot stage generated entry for artifact '${request.name}'\n"
+                )
+                status = 159
+            } else {
+                emitted.append(request.name)
+                sliceEntries.append(entry)
+                queued.append(BootstrapCompileProgramRequest(
+                    request.name,
+                    entry,
+                    request.output,
+                    request.target,
+                    request.artifact,
+                    request.fast,
+                    request.cache
+                ))
+            }
+        }
+        root = root + 1
+    }
+    status
 }
 
 // Compile one root normally, then drain any program nodes registered by its
@@ -171,6 +259,7 @@ fun bootstrapOrcBuild(
 ): int {
     bootstrapTakeCompileProgramRequests()
     bootstrapTakeDefinedTargets()
+    bootstrapTakeArtifactRootRequests()
     bootstrapBeginBuildTransaction()
     var status = 0
     if (!bootstrapRecordNativeOutputSet(outputPath)) {
@@ -188,6 +277,14 @@ fun bootstrapOrcBuild(
             artifact
         )
     val queued = bootstrapTakeCompileProgramRequests()
+    val artifactRoots = bootstrapTakeArtifactRootRequests()
+    val sliceEntries: array<string> = []
+    if (status == 0) status = bootstrapAppendArtifactSlices(
+        queued,
+        artifactRoots,
+        sourcePath,
+        sliceEntries
+    )
     val targets: array<BootstrapDefinedTarget> = []
     val rootTargets = bootstrapTakeDefinedTargets()
     if (status == 0) {
@@ -252,6 +349,13 @@ fun bootstrapOrcBuild(
         if (status == 0) {
             names.append(request.name)
             outputs.append(request.output)
+            var slice = false
+            var sliceEntry = 0
+            while (sliceEntry < sliceEntries.size) {
+                if (sliceEntries[sliceEntry] == request.entry) slice = true
+                sliceEntry = sliceEntry + 1
+            }
+            bootstrapArtifactSliceActive = slice
             status = bootstrapOrcBuildSingle(
                 request.entry,
                 request.output,
@@ -260,6 +364,14 @@ fun bootstrapOrcBuild(
                 requestedTarget,
                 request.artifact
             )
+            bootstrapArtifactSliceActive = false
+            val recursiveArtifactRoots = bootstrapTakeArtifactRootRequests()
+            if (status == 0 && recursiveArtifactRoots.size > 0) {
+                linuxPrintStandardError(
+                    "error[E_ARTIFACT_ROOT_RECURSION]: child program contributed artifact roots outside a generated slice\n"
+                )
+                status = 160
+            }
             val nested = bootstrapTakeCompileProgramRequests()
             val nestedTargets = bootstrapTakeDefinedTargets()
             if (status == 0) {

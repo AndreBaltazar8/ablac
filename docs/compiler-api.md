@@ -1,11 +1,35 @@
 # Compiler API
 
-Status: bootstrap API, version 0.1. The module is imported with
+Status: bootstrap API, version 0.2. The module is imported with
 `#import("abla/compiler")` and is available only to compile-time code.
+
+The public surface is the compile-time-only `compiler: Compiler` service:
+
+```abla
+#import("abla/compiler")
+
+@client
+fun answer(value: int): int = value + 1
+
+compile fun configure(): void {
+    val function = compiler.findFunction("answer")
+    if (compiler.annotation(function, 0) == "client") {
+        compiler.replaceFunctionBody(function, "value + 2")
+    }
+    return
+}
+
+#compiler.transform(configure)
+```
+
+Its methods group reflection, validated transforms, files, targets, child
+programs, artifact roots, and foreign exports behind one coherent object. The
+standalone `compiler...` externs remain the versioned bootstrap ABI used by the
+standard library; new extension code should prefer the service object.
 
 ## Function reflection
 
-The initial API is read-only:
+The low-level reflection ABI includes:
 
 ```abla
 compile extern:"compiler" fun compilerFunctions(): array<int>
@@ -29,8 +53,19 @@ order follows deterministic semantic declaration order. Type names use the
 canonical compiler spelling (`int` currently reports as `i64`).
 
 The VM reads owned IR metadata for handles and never exposes AST, semantic, C++,
-or backend pointers. Future mutation APIs will operate on explicit edit
-transactions, re-run resolution/type checking, and commit only after validation.
+or backend pointers. Marker annotations are retained with source spans, included
+in interface/IR fingerprints, and exposed through `compiler.annotationCount`
+and `compiler.annotation`.
+
+`#compiler.transform(handler)` opens the bounded mutation stage before final
+semantic analysis. `compiler.replaceFunctionBody(handle, source)` currently
+accepts one unique top-level runtime function and either an expression or block
+body. The compiler parses the body as exactly one synthetic function, preserves
+the original declaration identity/signature/annotations, and then runs ordinary
+typing, ownership, trust, effect, IR, and target verification over the complete
+candidate. A failure publishes no artifact. The service object itself is a
+`compile val`; referring to it from runtime code is a phase diagnostic and it
+creates no runtime global.
 
 Function handles now cover top-level, extension, and inherent methods. They
 expose canonical owner/name identity, source parameter names, normalized
@@ -115,6 +150,17 @@ targets additionally use the generic `module` artifact; stable exported
 adapters remain separate from those containers. See
 `docs/programmable-builds.md` for the ABI, target-description, and
 transactional build-graph roadmap.
+
+`compiler.contributeArtifactRoot(name, target, artifact, output, function,
+exportName, fast, cache)` adds an exact resolved top-level scalar root to a
+named child artifact. Contributions with identical artifact configuration are
+aggregated into one generated entry and one child compilation. The bounded rung
+accepts value `bool`/`int` parameters and `void`/`bool`/`int` results, requires
+an unambiguous top-level identity, and publishes only the requested explicit
+foreign symbols. Each child is independently optimized, target-lowered,
+verified, linked, manifested, and committed in the parent build transaction.
+For libc-free Wasm, uncontained panic paths lower to target-neutral
+`unreachable`; the ABI manifest records `panic: not-contained`.
 
 `compilerDefineTarget(name, llvmTriple, objectFormat, linkerFlavor,
 linkerEmulation, hosted, libcFree)` registers an extension-owned target for the

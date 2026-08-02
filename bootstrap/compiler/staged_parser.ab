@@ -41,6 +41,205 @@ fun bootstrapRegistrationIndex(
     result
 }
 
+fun bootstrapReplacementFunctionSource(
+    declaration: BootstrapDeclaration,
+    body: string
+): string {
+    var source = "fun __abla_replacement("
+    var parameter = 0
+    while (parameter < declaration.parameters.size) {
+        if (parameter > 0) source = "$source, "
+        if (parameter < declaration.parameterKinds.size &&
+            declaration.parameterKinds[parameter] == "own") {
+            source = "${source}own "
+        }
+        if (parameter < declaration.parameterKinds.size &&
+            declaration.parameterKinds[parameter] == "var") {
+            source = "${source}var "
+        }
+        source = "$source${declaration.parameters[parameter]}: "
+        source = "$source${declaration.parameterTypes[parameter]}"
+        parameter = parameter + 1
+    }
+    source = "$source)"
+    if (declaration.resultType != "inferred") {
+        source = "$source: ${declaration.resultType}"
+    }
+    if (body.size > 0 && body[0] == 123) {
+        source = "$source $body"
+    } else source = "$source = $body"
+    source
+}
+
+fun bootstrapDeclarationWithExpression(
+    declaration: BootstrapDeclaration,
+    expression: BootstrapExpression
+): BootstrapDeclaration = BootstrapDeclaration(
+    declaration.kind,
+    declaration.name,
+    declaration.begin,
+    declaration.end,
+    expression,
+    declaration.parameters,
+    declaration.parameterTypes,
+    declaration.resultType,
+    declaration.methods,
+    declaration.parameterDefaults,
+    declaration.externalLibrary,
+    declaration.parameterKinds,
+    declaration.extensionOwner,
+    declaration.isTrusted,
+    declaration.isResource,
+    declaration.isNoEscape,
+    declaration.generatedNamespace,
+    declaration.generatedOriginBegin,
+    declaration.generatedOriginEnd,
+    declaration.annotations,
+    declaration.annotationBegins,
+    declaration.annotationEnds
+)
+
+fun bootstrapDeclarationWithName(
+    declaration: BootstrapDeclaration,
+    name: string
+): BootstrapDeclaration = BootstrapDeclaration(
+    declaration.kind,
+    name,
+    declaration.begin,
+    declaration.end,
+    declaration.expression,
+    declaration.parameters,
+    declaration.parameterTypes,
+    declaration.resultType,
+    declaration.methods,
+    declaration.parameterDefaults,
+    declaration.externalLibrary,
+    declaration.parameterKinds,
+    declaration.extensionOwner,
+    declaration.isTrusted,
+    declaration.isResource,
+    declaration.isNoEscape,
+    declaration.generatedNamespace,
+    declaration.generatedOriginBegin,
+    declaration.generatedOriginEnd,
+    declaration.annotations,
+    declaration.annotationBegins,
+    declaration.annotationEnds
+)
+
+fun bootstrapApplyFunctionBodyReplacement(
+    var declarations: array<BootstrapDeclaration>,
+    replacement: BootstrapFunctionBodyReplacement
+): bool {
+    var valid = replacement.handle >= 0 &&
+        replacement.handle < declarations.size
+    if (valid) {
+        val declaration = declarations[replacement.handle]
+        valid = declaration.kind == "fun" &&
+            declaration.extensionOwner == "" &&
+            declaration.parameterDefaults.size == declaration.parameters.size
+        val parsed = bootstrapParse(bootstrapReplacementFunctionSource(
+            declaration,
+            replacement.body
+        ))
+        valid = valid && parsed.errors == 0 &&
+            parsed.declarations.size == 1 && parsed.actions.size == 0 &&
+            parsed.declarations[0].kind == "fun" &&
+            parsed.declarations[0].expression.kind != "missing"
+        if (valid) declarations[replacement.handle] =
+            bootstrapDeclarationWithExpression(
+                declaration,
+                parsed.declarations[0].expression
+            )
+    }
+    valid
+}
+
+fun bootstrapApplyCompilerTransforms(
+    var declarations: array<BootstrapDeclaration>,
+    actions: array<BootstrapExpression>,
+    allowedCompileEffects: int
+): BootstrapEvalResult {
+    // A failed earlier compilation must never leak staged requests into this
+    // candidate transaction.
+    bootstrapTakeFunctionBodyReplacements()
+    var errors = 0
+    var diagnostics = ""
+    val compileInputPaths: array<string> = []
+    val compileInputContents: array<string> = []
+    var action = 0
+    while (action < actions.size) {
+        var expression = actions[action]
+        if (expression.kind == "compile" && expression.children.size == 1) {
+            expression = expression.children[0]
+        }
+        if (expression.kind == "member.call" &&
+            expression.text == "transform" &&
+            expression.children.size > 0 &&
+            expression.children[0].kind == "identifier" &&
+            expression.children[0].text == "compiler") {
+            var valid = expression.children.size == 2 &&
+                expression.children[1].kind == "identifier"
+            var handler = ""
+            if (valid) handler = expression.children[1].text
+            var matches = 0
+            var declaration = 0
+            while (valid && declaration < declarations.size) {
+                val candidate = declarations[declaration]
+                if (candidate.name == handler &&
+                    candidate.extensionOwner == "" &&
+                    candidate.kind == "compile.fun" &&
+                    candidate.parameters.size == 0) matches = matches + 1
+                declaration = declaration + 1
+            }
+            if (matches != 1) valid = false
+            if (valid) {
+                val invoked = bootstrapInvokeCompilerTransform(
+                    declarations,
+                    handler,
+                    expression.begin,
+                    expression.end,
+                    allowedCompileEffects
+                )
+                errors = errors + invoked.errors
+                diagnostics = "$diagnostics${invoked.diagnostics}"
+                bootstrapMergeCompileInputs(
+                    compileInputPaths,
+                    compileInputContents,
+                    invoked.compileInputPaths,
+                    invoked.compileInputContents
+                )
+            } else {
+                errors = errors + 1
+                diagnostics =
+                    "${diagnostics}error[E_COMPILER_TRANSFORM_HANDLER]: compiler.transform requires one unique zero-argument compile function identifier\n"
+            }
+        }
+        action = action + 1
+    }
+    val replacements = bootstrapTakeFunctionBodyReplacements()
+    var replacement = 0
+    while (replacement < replacements.size) {
+        if (!bootstrapApplyFunctionBodyReplacement(
+            declarations,
+            replacements[replacement]
+        )) {
+            errors = errors + 1
+            diagnostics =
+                "${diagnostics}error[E_COMPILER_TRANSFORM_BODY]: replacement body did not parse as exactly one compatible top-level function body\n"
+        }
+        replacement = replacement + 1
+    }
+    BootstrapEvalResult(
+        bootstrapEvalVoid(),
+        errors,
+        diagnostics,
+        compileInputPaths,
+        compileInputContents,
+        []
+    )
+}
+
 fun bootstrapApplyGeneratedModules(
     parsed: BootstrapParseResult,
     handlerDeclarations: array<BootstrapDeclaration>,
@@ -282,6 +481,58 @@ fun bootstrapApplyGeneratedModules(
         val extensionRequest = extensionRequests[request]
         diagnostics =
             "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:generated module namespace limit exceeded\n"}"
+    }
+    val transformDeclarations: array<BootstrapDeclaration> = []
+    var transformDeclaration = 0
+    while (transformDeclaration < handlerDeclarations.size) {
+        val local = transformDeclaration - currentDeclarationBegin
+        if (local >= 0 && local < parsed.declarations.size) {
+            transformDeclarations.append(declarations[local])
+        } else transformDeclarations.append(
+            handlerDeclarations[transformDeclaration]
+        )
+        transformDeclaration = transformDeclaration + 1
+    }
+    var generatedForTransform = parsed.declarations.size
+    while (generatedForTransform < declarations.size) {
+        transformDeclarations.append(declarations[generatedForTransform])
+        generatedForTransform = generatedForTransform + 1
+    }
+    val transformed = bootstrapApplyCompilerTransforms(
+        transformDeclarations,
+        actions,
+        allowedCompileEffects
+    )
+    errors = errors + transformed.errors
+    diagnostics = "$diagnostics${transformed.diagnostics}"
+    bootstrapMergeCompileInputs(
+        compileInputPaths,
+        compileInputContents,
+        transformed.compileInputPaths,
+        transformed.compileInputContents
+    )
+    var transformedLocal = 0
+    while (transformedLocal < parsed.declarations.size) {
+        val candidate = currentDeclarationBegin + transformedLocal
+        if (candidate >= 0 && candidate < transformDeclarations.size) {
+            declarations[transformedLocal] =
+                transformDeclarations[candidate]
+        }
+        transformedLocal = transformedLocal + 1
+    }
+    if (bootstrapArtifactSliceActive) {
+        var sliceDeclaration = 0
+        while (sliceDeclaration < declarations.size) {
+            if (declarations[sliceDeclaration].kind == "fun" &&
+                declarations[sliceDeclaration].name == "main" &&
+                declarations[sliceDeclaration].extensionOwner == "") {
+                declarations[sliceDeclaration] = bootstrapDeclarationWithName(
+                    declarations[sliceDeclaration],
+                    "__abla_slice_excluded_main"
+                )
+            }
+            sliceDeclaration = sliceDeclaration + 1
+        }
     }
     BootstrapParseResult(
         declarations,
