@@ -71,4 +71,19 @@ if rg -n 'android-arm64|aarch64-linux-android' \
     exit 1
 fi
 
-echo "Android extension: deterministic arm64 libabla_app.so + generated ABI/JNI/Kotlin/Gradle integration passed"
+example_root="$project_root/build/examples/android"
+"$compiler" build \
+    "$project_root/examples/android/build.ab" \
+    -o "$example_root/build-driver" --fast --no-cache
+[[ -s $example_root/build.gradle.kts ]]
+[[ -s $example_root/settings.gradle.kts ]]
+[[ -s $example_root/src/main/AndroidManifest.xml ]]
+[[ -s $example_root/src/main/kotlin/org/abla/example/MainActivity.kt ]]
+[[ -s $example_root/src/main/jniLibs/arm64-v8a/libabla_app.so ]]
+grep -q 'abiFilters += "arm64-v8a"' "$example_root/build.gradle.kts"
+grep -q 'Hello from Abla:' \
+    "$example_root/src/main/kotlin/org/abla/example/MainActivity.kt"
+grep -q 'android.intent.category.LAUNCHER' \
+    "$example_root/src/main/AndroidManifest.xml"
+
+echo "Android extension: deterministic arm64 library, integration, and runnable example project passed"

@@ -135,6 +135,14 @@ execution, and C interoperability.
 Generated files are not committed. Build products and compiler caches stay
 under `build/`.
 
+## Examples
+
+- [Android hello world](examples/android/README.md) compiles Abla to an arm64
+  `libabla_app.so`, generates its JNI/Kotlin project, and produces a runnable
+  debug APK and release AAB with a pinned Nix/Gradle/Android toolchain.
+- [Versioned HTTP server](examples/versioned-http-server.ab) demonstrates
+  header-selected endpoint versions on the hosted server stack.
+
 ## Project principles
 
 - Use one coherent language model for compile-time and runtime execution.
