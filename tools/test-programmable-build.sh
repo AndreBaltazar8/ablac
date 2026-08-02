@@ -55,6 +55,8 @@ llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_invoke$'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_checked_divide$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_owned_bytes_release$'
 grep -q '"symbol":"abla_app_add"' \
     "$output_directory/libabla_app.so.abi.json"
@@ -73,6 +75,10 @@ grep -q '"release":"abla_owned_bytes_release","releaseExactlyOnce":true' \
 grep -q '"abi":"callback","callingConvention":"c","lowering":\["function-pointer","context-pointer"\]' \
     "$output_directory/libabla_app.so.abi.json"
 grep -q '"lifetime":"call","retention":"forbidden","invocation":"synchronous"' \
+    "$output_directory/libabla_app.so.abi.json"
+grep -q '"panic":"contained","statusAbi":"i32"' \
+    "$output_directory/libabla_app.so.abi.json"
+grep -q '"panicContainment":"sjlj"' \
     "$output_directory/libabla_app.so.abi.json"
 if llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_fn_'; then

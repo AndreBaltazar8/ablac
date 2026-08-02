@@ -86,9 +86,18 @@ records the selected target,
 artifact container, foreign symbol, source declaration, parameter list, ABI
 result representation, ownership/nullability, and failure containment status.
 The sidecar is cached with the object and restored on a cache hit. The current
-manifest deliberately says `panic: not-contained`; consumers can reject that
-contract instead of assuming exceptions or traps are isolated. The surface is
-still intentionally narrow. A string result is copied into a non-null opaque
+direct-export manifest deliberately says `panic: not-contained`; consumers can
+reject that contract instead of assuming exceptions or traps are isolated.
+`compilerExportCheckedFunction` is the opt-in contained form on hosted x86-64
+Linux. It returns an `i32` status, writes a successful result through an
+out-pointer, and copies panic bytes into a caller-provided bounded buffer while
+reporting the full required length. Status `0` is success, `1` is a contained
+panic, and `2` is an invalid boundary argument. Recovery restores nested panic
+and GC-root frames, so the host can call again after failure. Cleanup is
+abortive and external side effects are not rolled back; those limitations are
+explicit in the manifest. Other targets reject checked exports until their
+descriptor/runtime supplies a compatible containment capability. The surface
+is still intentionally narrow. A string result is copied into a non-null opaque
 foreign handle. The manifest names `abla_owned_bytes_data`,
 `abla_owned_bytes_length`, and the mandatory exactly-once
 `abla_owned_bytes_release`, and declares validity until release. This first
@@ -99,7 +108,8 @@ pointer. It is synchronously borrowed for the exported call, may be invoked
 directly by that function, and may not be stored, returned, captured, or passed
 on; export validation rejects those escape shapes. The manifest records the C
 calling convention, scalar signature, call lifetime, forbidden retention, and
-forbidden unwind. Typed class handles and actual panic containment remain.
+forbidden unwind. Typed class handles and checked-containment support on more
+targets remain.
 
 ## Direction
 

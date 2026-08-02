@@ -742,6 +742,16 @@ foreign pointer cannot outlive its caller-owned context. The manifest records
 the callback signature, C calling convention, call lifetime, forbidden
 retention, and the requirement that it not unwind across the ABI.
 
+Checked export adapters are opt-in through `exportCheckedFunction`. Their C ABI
+returns an `int32_t` status and moves the normal result to an out-pointer. A
+panic becomes status `1`; its bytes are copied into a caller-owned buffer and
+the full length is reported even when that buffer truncates the message.
+Status `2` reports invalid boundary output pointers. This contains control flow
+and restores the runtime's recovery/root frames, but cleanup is abortive and
+external side effects are not transactional. Direct exports remain explicitly
+uncontained. Targets that do not advertise the required runtime capability
+reject checked exports.
+
 An exported `string` result is copied into an opaque foreign handle rather than
 leaking the tracked `%AblaValue` or an interior runtime pointer. Callers inspect
 it through the manifest-named data/length functions and must call the release

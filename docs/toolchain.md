@@ -34,8 +34,11 @@ ownership, nullability, and failure-containment metadata. It is a member of the
 native cache record, so a cache hit restores a missing sidecar instead of
 silently publishing an undocumented binary. Schema version 1 exposes value
 scalars, copied borrowed-byte inputs, call-scoped non-escaping scalar
-callbacks, and owned-byte result handles, and honestly marks panics as
-uncontained.
+callbacks, and owned-byte result handles. Direct exports honestly mark panics
+as uncontained. Opt-in checked exports on hosted x86-64 Linux publish their
+status/out-pointer/caller-buffer ABI and abortive-cleanup semantics; unsupported
+targets reject them with `E_EXPORT_TARGET_CAPABILITY` rather than silently
+downgrading containment.
 The current owned-byte result handle is available only when the target provides
 the libc allocation contract; libc-free module targets reject it before object
 emission.

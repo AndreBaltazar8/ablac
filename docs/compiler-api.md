@@ -153,3 +153,14 @@ artifacts receive a staged `.abi.json` sidecar describing the target,
 container, exported symbol, lowered representation, ownership/transfer action,
 nullability, and the current uncontained-panic contract. Cached objects retain
 and restore the same manifest.
+
+`compilerExportCheckedFunction(handle, name)` requests the contained variant.
+On the currently supported hosted x86-64 Linux target, its C adapter returns an
+`i32` status, writes the ordinary result through an out-pointer, and copies a
+panic message into caller-provided bounded byte storage while returning the
+full required length. Status values are `0` for success, `1` for panic, and `2`
+for invalid output arguments. A caught panic restores the nested recovery and
+GC-root frames, allowing later calls in the same process. Recovery is abortive:
+resource cleanup is not run and prior external side effects are not rolled
+back. The ABI manifest records all of these properties. Targets without the
+checked-panic capability fail with `E_EXPORT_TARGET_CAPABILITY`.

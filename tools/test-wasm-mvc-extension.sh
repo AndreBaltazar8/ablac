@@ -64,10 +64,19 @@ set +e
     >"$output_directory/owned-result.out" \
     2>"$output_directory/owned-result.err"
 owned_result_status=$?
+"$compiler" build \
+    "$project_root/tests/cases/wasm-mvc-extension/checked-export-build.ab" \
+    -o "$output_directory/checked-export-driver" --fast --no-cache \
+    >"$output_directory/checked-export.out" \
+    2>"$output_directory/checked-export.err"
+checked_export_status=$?
 set -e
 [[ $owned_result_status -ne 0 ]]
 grep -q 'error\[E_EXPORT_TARGET_CAPABILITY\]' \
     "$output_directory/owned-result.err"
+[[ $checked_export_status -ne 0 ]]
+grep -q 'error\[E_EXPORT_TARGET_CAPABILITY\]' \
+    "$output_directory/checked-export.err"
 
 if rg -n 'abla-mvc-browser|abla_mvc_revision|WebAssembly.instantiate' \
     "$project_root/bootstrap/compiler" >/dev/null; then

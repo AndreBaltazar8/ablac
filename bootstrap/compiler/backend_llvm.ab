@@ -618,6 +618,24 @@ fun bootstrapLlvmRuntimeBinary(opcode: string): string {
     result
 }
 
+fun bootstrapLlvmReplaceAll(
+    source: string,
+    expected: string,
+    replacement: string
+): string {
+    var output = ""
+    var segment = 0
+    var index = 0
+    while (index + expected.size <= source.size) {
+        if (source.slice(index, index + expected.size) == expected) {
+            output = "$output${source.slice(segment, index)}$replacement"
+            index = index + expected.size
+            segment = index
+        } else index = index + 1
+    }
+    "$output${source.slice(segment, source.size)}"
+}
+
 fun bootstrapLlvmIsBinary(opcode: string): bool =
     opcode == "+" || opcode == "-" || opcode == "*" || opcode == "/" ||
     opcode == "==" || opcode == "!=" || opcode == "<" ||
@@ -740,7 +758,8 @@ fun bootstrapLlvmSharedRuntime(): string {
 
 fun bootstrapLlvmRuntimePlatform(
     program: BootstrapIrProgram,
-    collectorEnabled: bool
+    collectorEnabled: bool,
+    checkedExports: bool
 ): string {
     var output = ""
     if (bootstrapLlvmNeedsHostRuntime(program)) {
@@ -784,6 +803,14 @@ fun bootstrapLlvmRuntimePlatform(
         output = "${output}define internal void @abla_runtime_clear_newer_rope_caches(i64 %checkpoint) {\nentry:\n  %initial = load ptr, ptr @abla_runtime_allocation_tail, align 8\n  br label %condition\ncondition:\n  %header = phi ptr [ %initial, %entry ], [ %previous, %next ]\n  %more = icmp ne ptr %header, null\n  br i1 %more, label %inspect, label %done\ninspect:\n  %generation_slot = getelementptr i8, ptr %header, i64 16\n  %generation = load i64, ptr %generation_slot, align 8\n  %retained = icmp ule i64 %generation, %checkpoint\n  %scan_slot = getelementptr i8, ptr %header, i64 32\n  %scan = load i64, ptr %scan_slot, align 8\n  %layout = lshr i64 %scan, 56\n  %rope = icmp eq i64 %layout, 6\n  %inspect_cache = and i1 %retained, %rope\n  br i1 %inspect_cache, label %cache, label %next\ncache:\n  %payload = getelementptr i8, ptr %header, i64 40\n  %cache_slot = getelementptr i8, ptr %payload, i64 64\n  %flattened = load ptr, ptr %cache_slot, align 8\n  %has_cache = icmp ne ptr %flattened, null\n  br i1 %has_cache, label %cache_generation, label %next\ncache_generation:\n  %cache_generation_slot = getelementptr i8, ptr %flattened, i64 -24\n  %cached_generation = load i64, ptr %cache_generation_slot, align 8\n  %cache_newer = icmp ugt i64 %cached_generation, %checkpoint\n  br i1 %cache_newer, label %clear, label %next\nclear:\n  store ptr null, ptr %cache_slot, align 8\n  br label %next\nnext:\n  %previous_slot = getelementptr i8, ptr %header, i64 0\n  %previous = load ptr, ptr %previous_slot, align 8\n  br label %condition\ndone:\n  ret void\n}\n\n"
         output = "${output}define internal void @abla_runtime_memory_reset(i64 %checkpoint) {\nentry:\n  %generation = load i64, ptr @abla_runtime_allocation_generation, align 8\n  call void @abla_runtime_clear_newer_rope_caches(i64 %checkpoint)\n  %valid = icmp ule i64 %checkpoint, %generation\n  br i1 %valid, label %condition, label %invalid\ncondition:\n  %tail = load ptr, ptr @abla_runtime_allocation_tail, align 8\n  %has_tail = icmp ne ptr %tail, null\n  br i1 %has_tail, label %inspect, label %done\ninspect:\n  %generation_slot = getelementptr i8, ptr %tail, i64 16\n  %tail_generation = load i64, ptr %generation_slot, align 8\n  %newer = icmp ugt i64 %tail_generation, %checkpoint\n  br i1 %newer, label %release, label %done\nrelease:\n  %payload = getelementptr i8, ptr %tail, i64 40\n  call void @abla_runtime_free(ptr %payload)\n  br label %condition\ndone:\n  ret void\ninvalid:\n  %message = getelementptr [26 x i8], ptr @abla_runtime_invalid_checkpoint, i64 0, i64 0\n  call void @abla_runtime_panic(ptr %message, i64 25)\n  unreachable\n}\n\n"
     }
+    if (checkedExports) {
+        output = bootstrapLlvmReplaceAll(
+            output,
+            "define internal void @abla_runtime_panic(",
+            "define internal void @abla_runtime_panic_uncontained("
+        )
+        output = "${output}define internal void @abla_runtime_panic(ptr %message, i64 %length) noreturn {\nentry:\n  %frame = load ptr, ptr @abla_runtime_panic_frame, align 8\n  %recoverable = icmp ne ptr %frame, null\n  br i1 %recoverable, label %recover, label %uncontained\nrecover:\n  %message_slot = getelementptr %AblaPanicFrame, ptr %frame, i32 0, i32 3\n  %length_slot = getelementptr %AblaPanicFrame, ptr %frame, i32 0, i32 4\n  store ptr %message, ptr %message_slot, align 8\n  store i64 %length, ptr %length_slot, align 8\n  %jump = getelementptr %AblaPanicFrame, ptr %frame, i32 0, i32 2\n  call void @longjmp(ptr %jump, i32 1)\n  unreachable\nuncontained:\n  call void @abla_runtime_panic_uncontained(ptr %message, i64 %length)\n  unreachable\n}\n\n"
+    }
     output
 }
 
@@ -817,7 +844,10 @@ fun bootstrapLlvmRootRuntime(
     output
 }
 
-fun bootstrapLlvmHeader(program: BootstrapIrProgram): string {
+fun bootstrapLlvmHeader(
+    program: BootstrapIrProgram,
+    checkedExports: bool
+): string {
     val collectorEnabled = bootstrapLlvmNeedsCollector(program)
     var output =
         "; Generated deterministically by the self-hosted Abla LLVM backend.\n"
@@ -827,6 +857,12 @@ fun bootstrapLlvmHeader(program: BootstrapIrProgram): string {
     output = "${output}%AblaValue = type { i32, %AblaPayload }\n\n"
     output = "${output}%AblaRootFrame = type { ptr, ptr, i64 }\n"
     output = "${output}@abla_runtime_root_frame = internal global ptr null, align 8\n\n"
+    if (checkedExports) {
+        output = "${output}%AblaPanicFrame = type { ptr, ptr, [64 x i64], ptr, i64 }\n"
+        output = "${output}@abla_runtime_panic_frame = internal global ptr null, align 8\n"
+        output = "${output}declare i32 @_setjmp(ptr) returns_twice\n"
+        output = "${output}declare void @longjmp(ptr, i32) noreturn\n\n"
+    }
     output = "${output}%AblaString = type { ptr, i64, i8, ptr }\n"
     output = "${output}%AblaStringRope = type { %AblaString, %AblaString, ptr }\n"
     output = "${output}%AblaArray = type { i64, i64, ptr }\n\n"
@@ -840,7 +876,8 @@ fun bootstrapLlvmHeader(program: BootstrapIrProgram): string {
     output = "${output}@abla_process_envp = internal global ptr null, align 8\n\n"
     output = "$output${bootstrapLlvmRuntimePlatform(
         program,
-        collectorEnabled
+        collectorEnabled,
+        checkedExports
     )}"
     output = "$output${bootstrapLlvmRootRuntime(
         program,
@@ -2064,23 +2101,32 @@ fun bootstrapLlvmExportAdapters(
                 ownedBytes = true
             }
             var signature = ""
+            var forwarded = ""
             var parameter = 0
             while (parameter < request.parameterTypes.size) {
                 if (parameter > 0) signature = "$signature, "
+                if (parameter > 0) forwarded = "$forwarded, "
                 if (request.parameterTypes[parameter] == "string") {
                     signature = "${signature}ptr %argument_${parameter}_data, i64 %argument_${parameter}_length"
+                    forwarded = "${forwarded}ptr %argument_${parameter}_data, i64 %argument_${parameter}_length"
                 } else if (request.parameterTypes[parameter] ==
                     "function:(i64)->i64") {
                     signature = "${signature}ptr %argument_${parameter}_callback, ptr %argument_${parameter}_context"
+                    forwarded = "${forwarded}ptr %argument_${parameter}_callback, ptr %argument_${parameter}_context"
                 } else {
                     val parameterType = if (
                         request.parameterTypes[parameter] == "bool"
                     ) "i8" else "i64"
                     signature = "$signature$parameterType %argument_$parameter"
+                    forwarded = "$forwarded$parameterType %argument_$parameter"
                 }
                 parameter = parameter + 1
             }
-            output = "${output}define $llvmResult @${request.name}($signature) {\nentry:\n"
+            val adapterName = if (request.checked) {
+                "abla_checked_body_$index"
+            } else request.name
+            val adapterVisibility = if (request.checked) "internal " else ""
+            output = "${output}define ${adapterVisibility}$llvmResult @$adapterName($signature) {\nentry:\n"
             var arguments = "null"
             if (request.parameterTypes.size > 0) {
                 output = "$output  %arguments = alloca [${request.parameterTypes.size} x %AblaValue], align 8\n"
@@ -2162,6 +2208,73 @@ fun bootstrapLlvmExportAdapters(
             }
             if (request.resultType == "void") output = "$output  ret void\n"
             output = "$output}\n\n"
+            if (request.checked) {
+                var checkedSignature = signature
+                if (checkedSignature.size > 0) {
+                    checkedSignature = "$checkedSignature, "
+                }
+                if (request.resultType != "void") {
+                    checkedSignature = "${checkedSignature}ptr %result_out, "
+                }
+                checkedSignature = "${checkedSignature}ptr %error_data, i64 %error_capacity, ptr %error_length"
+                output = "${output}define i32 @${request.name}($checkedSignature) {\nentry:\n"
+                output = "$output  %checked_error_length_valid = icmp ne ptr %error_length, null\n"
+                output = "$output  %checked_error_data_present = icmp ne ptr %error_data, null\n"
+                output = "$output  %checked_error_capacity_empty = icmp eq i64 %error_capacity, 0\n"
+                output = "$output  %checked_error_data_valid = or i1 %checked_error_data_present, %checked_error_capacity_empty\n"
+                output = "$output  %checked_error_output_valid = and i1 %checked_error_length_valid, %checked_error_data_valid\n"
+                if (request.resultType != "void") {
+                    output = "$output  %checked_result_valid = icmp ne ptr %result_out, null\n"
+                    output = "$output  %checked_outputs_valid = and i1 %checked_error_output_valid, %checked_result_valid\n"
+                } else {
+                    output = "$output  %checked_outputs_valid = and i1 %checked_error_output_valid, true\n"
+                }
+                output = "$output  br i1 %checked_outputs_valid, label %checked_setup, label %checked_invalid\n"
+                output = "$output\nchecked_invalid:\n  ret i32 2\n"
+                output = "$output\nchecked_setup:\n"
+                output = "$output  %checked_frame = alloca %AblaPanicFrame, align 16\n"
+                output = "$output  %checked_previous_panic = load ptr, ptr @abla_runtime_panic_frame, align 8\n"
+                output = "$output  %checked_previous_panic_slot = getelementptr %AblaPanicFrame, ptr %checked_frame, i32 0, i32 0\n"
+                output = "$output  store ptr %checked_previous_panic, ptr %checked_previous_panic_slot, align 8\n"
+                output = "$output  %checked_previous_roots = load ptr, ptr @abla_runtime_root_frame, align 8\n"
+                output = "$output  %checked_previous_roots_slot = getelementptr %AblaPanicFrame, ptr %checked_frame, i32 0, i32 1\n"
+                output = "$output  store ptr %checked_previous_roots, ptr %checked_previous_roots_slot, align 8\n"
+                output = "$output  %checked_message_slot = getelementptr %AblaPanicFrame, ptr %checked_frame, i32 0, i32 3\n"
+                output = "$output  %checked_length_slot = getelementptr %AblaPanicFrame, ptr %checked_frame, i32 0, i32 4\n"
+                output = "$output  store ptr null, ptr %checked_message_slot, align 8\n"
+                output = "$output  store i64 0, ptr %checked_length_slot, align 8\n"
+                output = "$output  store ptr %checked_frame, ptr @abla_runtime_panic_frame, align 8\n"
+                output = "$output  %checked_jump = getelementptr %AblaPanicFrame, ptr %checked_frame, i32 0, i32 2\n"
+                output = "$output  %checked_status = call i32 @_setjmp(ptr %checked_jump) returns_twice\n"
+                output = "$output  %checked_first = icmp eq i32 %checked_status, 0\n"
+                output = "$output  br i1 %checked_first, label %checked_run, label %checked_caught\n"
+                output = "$output\nchecked_run:\n"
+                if (request.resultType == "void") {
+                    output = "$output  call void @$adapterName($forwarded)\n"
+                } else {
+                    output = "$output  %checked_result = call $llvmResult @$adapterName($forwarded)\n"
+                    output = "$output  store $llvmResult %checked_result, ptr %result_out, align 1\n"
+                }
+                output = "$output  store ptr %checked_previous_panic, ptr @abla_runtime_panic_frame, align 8\n"
+                output = "$output  store i64 0, ptr %error_length, align 8\n"
+                output = "$output  ret i32 0\n"
+                output = "$output\nchecked_caught:\n"
+                output = "$output  %checked_restore_panic = load ptr, ptr %checked_previous_panic_slot, align 8\n"
+                output = "$output  %checked_restore_roots = load ptr, ptr %checked_previous_roots_slot, align 8\n"
+                output = "$output  store ptr %checked_restore_panic, ptr @abla_runtime_panic_frame, align 8\n"
+                output = "$output  store ptr %checked_restore_roots, ptr @abla_runtime_root_frame, align 8\n"
+                output = "$output  %checked_message = load ptr, ptr %checked_message_slot, align 8\n"
+                output = "$output  %checked_length = load i64, ptr %checked_length_slot, align 8\n"
+                output = "$output  store i64 %checked_length, ptr %error_length, align 8\n"
+                output = "$output  %checked_capacity_short = icmp ult i64 %error_capacity, %checked_length\n"
+                output = "$output  %checked_copy_length = select i1 %checked_capacity_short, i64 %error_capacity, i64 %checked_length\n"
+                output = "$output  %checked_copy_needed = icmp ne i64 %checked_copy_length, 0\n"
+                output = "$output  br i1 %checked_copy_needed, label %checked_copy, label %checked_done\n"
+                output = "$output\nchecked_copy:\n"
+                output = "$output  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %error_data, ptr align 1 %checked_message, i64 %checked_copy_length, i1 false)\n"
+                output = "$output  br label %checked_done\n"
+                output = "$output\nchecked_done:\n  ret i32 1\n}\n\n"
+            }
         }
         index = index + 1
     }
@@ -2231,9 +2344,20 @@ fun bootstrapLlvmExportAbi(
         if (request.resultType == "string") {
             result = "{\"abi\":\"owned-bytes-handle\",\"ownership\":\"owned\",\"nullable\":false,\"data\":\"abla_owned_bytes_data\",\"length\":\"abla_owned_bytes_length\",\"release\":\"abla_owned_bytes_release\",\"releaseExactlyOnce\":true,\"validUntilRelease\":true}"
         }
+        if (request.checked && request.resultType != "void") {
+            result = bootstrapLlvmReplaceAll(
+                result,
+                "{\"abi\":",
+                "{\"lowering\":[\"out-pointer\"],\"abi\":"
+            )
+        }
+        var failure = "{\"panic\":\"not-contained\"}"
+        if (request.checked) {
+            failure = "{\"panic\":\"contained\",\"statusAbi\":\"i32\",\"status\":{\"success\":0,\"panic\":1,\"invalidArguments\":2},\"message\":{\"data\":\"caller-buffer\",\"capacity\":\"u64\",\"requiredLength\":\"u64-out\",\"encoding\":\"bytes\",\"truncation\":\"prefix\"},\"cleanup\":\"abortive\",\"sideEffectsRolledBack\":false,\"concurrency\":\"single-threaded\"}"
+        }
         output = "$output\n    {\"source\":\"${bootstrapLlvmJsonEscape(
             request.source
-        )}\",\"symbol\":\"${request.name}\",\"parameters\":$parameters,\"result\":$result,\"failure\":{\"panic\":\"not-contained\"}}"
+        )}\",\"symbol\":\"${request.name}\",\"parameters\":$parameters,\"result\":$result,\"failure\":$failure}"
         index = index + 1
     }
     if (exports.size > 0) output = "$output\n  "
@@ -2244,6 +2368,12 @@ fun bootstrapEmitLlvmProgram(
     program: BootstrapIrProgram
 ): BootstrapLlvmEmission {
     val exports = bootstrapTakeExportRequests()
+    var checkedExports = false
+    var checkedExportIndex = 0
+    while (checkedExportIndex < exports.size) {
+        if (exports[checkedExportIndex].checked) checkedExports = true
+        checkedExportIndex = checkedExportIndex + 1
+    }
     val functionNames: array<string> = []
     var nameIndex = 0
     while (nameIndex < program.functions.size) {
@@ -2268,7 +2398,7 @@ fun bootstrapEmitLlvmProgram(
         addressTaken
     )
     val identities = bootstrapLlvmFunctionIdentities(program)
-    var output = bootstrapLlvmHeader(program)
+    var output = bootstrapLlvmHeader(program, checkedExports)
     var errors = program.errors + identities.collisions +
         bootstrapLlvmStableNameCollisions(classNamesIndex.names) +
         bootstrapLlvmStableNameCollisions(fieldNamesIndex.names)
