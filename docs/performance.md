@@ -377,6 +377,23 @@ invalidation, nested imported subparsers, and no-project-C linking. This is not
 yet typed-IR incremental compilation: semantic analysis, LLVM emission, and
 object generation remain whole-graph after an edit.
 
+## Programmable-build foundation profile
+
+On 2026-08-02, after recursive build graphs, foreign ABI manifests, Android and
+WASM extension proofs, checked exports, and graph rollback landed, an uncached
+fast self-build completed in **27.162 seconds**. A separate full LLVM-emission
+run completed in **21.220 seconds**. Instrumentation of that emission attributed
+approximately 0.651 seconds to parsing, 10.602 seconds to semantic analysis,
+8.204 seconds to lowering, and 0.935 seconds to LLVM text emission. The small
+remainder is phase-boundary overhead.
+
+This build remains below the requested 30-second ceiling, but no longer has the
+margin of earlier, smaller compiler graphs. The next cold-build work belongs in
+semantic-summary reuse and lowering, not output-string micro-optimization. The
+existing exact-source cache remains the warm path; these figures deliberately
+measure an uncached complete compiler and do not use a cache hit to hide the
+regression.
+
 The 6.861 s measurement includes the LLVM-emitted scalar, closure, collection,
 object, formatting, equality, and iterative rope runtime. The resulting
 `bootstrap/compiler/main.ab` compiler was 1,608,216 bytes and reproduced the

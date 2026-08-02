@@ -119,28 +119,29 @@ calling convention, scalar signature, call lifetime, forbidden retention, and
 forbidden unwind. Typed class handles and checked-containment support on more
 targets remain.
 
-## Direction
+## Foundation status
 
-The general build service will grow around program handles and immutable
-descriptors for:
+The compiler foundation now provides generated source, recursively requested
+program nodes, extension-defined target descriptors, executable/library/module
+artifacts, explicit foreign exports, versioned ABI and ownership metadata,
+content-addressed leaf caching, bounded effects and graph expansion, structured
+extension diagnostics, and graph-wide transactional publication. These are
+generic compiler mechanisms; none encodes a mobile, browser, UI, packaging, or
+framework policy.
 
-- generated and existing source modules;
-- external target descriptions and toolchain commands;
-- explicit imports, exports, ABI metadata, and ownership contracts;
-- declared sidecar artifacts;
-- dependencies between program and artifact nodes;
-- graph-wide transactional publication;
-- content-addressed incremental execution;
-- cycle, depth, process, memory, and output limits; and
-- structured diagnostics carrying program and artifact context.
+The next compiler-level increments are explicit dependency edges between
+program and artifact nodes, module-granular typed-IR invalidation, independently
+declared sidecars, richer target capability negotiation, and resource accounting
+for external tools. They extend the same contracts rather than adding platform
+workflows to `ablac`.
 
-The Android proof now uses only those facilities. It intentionally stops at a
+The Android proof uses only those facilities. It intentionally stops at a
 single arm64 library and generated integration skeleton: Android SDK discovery,
 APK packaging, signing, manifests, resources, additional ABIs, and application
 policy remain extension/toolchain work. The WASM/MVC proof likewise stops at a
 scalar exported module and thin host loader; typed model/state exchange, DOM or
-canvas renderers, hydration, callbacks, error containment, and bundler policy
-remain library work. Neither workflow belongs in `ablac` itself.
+canvas renderers, hydration, host integration, and bundler policy remain library
+work. Neither workflow belongs in `ablac` itself.
 
 `#import("abla/build")` is the first ordinary library façade over these
 compiler services. Its `buildProgram`, `defineTarget`, and `exportFunction`
