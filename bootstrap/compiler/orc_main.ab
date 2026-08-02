@@ -11,10 +11,17 @@ fun bootstrapOrcEmit(sourcePath: string): int {
     val parsed = bootstrapParseModule(sourcePath)
     var status = 1
     val compilation = bootstrapCompileLlvmParsed(parsed)
-    if (compilation.errors == 0) {
+    val requestedPrograms = bootstrapTakeCompileProgramRequests()
+    if (compilation.errors == 0 && requestedPrograms.size == 0) {
         linuxPrintStandardOutput(compilation.output)
         status = 0
-    } else {
+    }
+    if (requestedPrograms.size > 0) {
+        linuxPrintStandardError(
+            "error[E_BUILD_COMMAND_UNSUPPORTED]: --emit-llvm cannot execute programmable build nodes; use 'ablac build'\n"
+        )
+    }
+    if (compilation.errors != 0) {
         linuxPrintStandardError(compilation.diagnostics)
         linuxPrintStandardError(
             "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.extensionErrors} extension, ${compilation.semanticErrors} semantic, ${compilation.errors} total error(s)\n"
@@ -37,7 +44,7 @@ fun bootstrapRunInProcess(sourcePath: string): int {
     status
 }
 
-fun bootstrapOrcBuild(
+fun bootstrapOrcBuildSingle(
     sourcePath: string,
     outputPath: string,
     fast: bool,
@@ -94,6 +101,96 @@ fun bootstrapOrcBuild(
             llvmAotEmitObjectFile,
             "inprocess-o2"
         ).status
+    }
+    status
+}
+
+// Compile one root normally, then drain any program nodes registered by its
+// compile-time build definition. Child compilations may register more nodes;
+// the bounded queue makes that recursion explicit and cycle diagnosable.
+fun bootstrapOrcBuild(
+    sourcePath: string,
+    outputPath: string,
+    fast: bool,
+    useCache: bool,
+    rawTarget: bool
+): int {
+    bootstrapTakeCompileProgramRequests()
+    var status = bootstrapOrcBuildSingle(
+        sourcePath,
+        outputPath,
+        fast,
+        useCache,
+        rawTarget
+    )
+    val queued = bootstrapTakeCompileProgramRequests()
+    val names: array<string> = []
+    val outputs: array<string> = []
+    var cursor = 0
+    while (status == 0 && cursor < queued.size && cursor < 64) {
+        val request = queued[cursor]
+        var unique = true
+        var previous = 0
+        while (previous < names.size) {
+            if (names[previous] == request.name ||
+                outputs[previous] == request.output) unique = false
+            previous = previous + 1
+        }
+        val target = bootstrapTargetDescriptor(request.target)
+        if (!unique) {
+            linuxPrintStandardError(
+                "error[E_BUILD_GRAPH_DUPLICATE]: duplicate program name or output for '${request.name}'\n"
+            )
+            status = 146
+        }
+        if (status == 0 && request.artifact != "executable") {
+            linuxPrintStandardError(
+                "error[E_BUILD_ARTIFACT_UNSUPPORTED]: program '${request.name}' requested unsupported artifact '${request.artifact}'; supported artifacts: executable\n"
+            )
+            status = 147
+        }
+        if (status == 0 && !target.valid) {
+            linuxPrintStandardError(
+                "error[E_BUILD_TARGET_UNSUPPORTED]: program '${request.name}' requested unsupported target '${request.target}'; supported targets: ${bootstrapSupportedTargets()}\n"
+            )
+            status = 148
+        }
+        if (status == 0 && !Path(request.output).parent().createDirectories()) {
+            linuxPrintStandardError(
+                "error[E_BUILD_OUTPUT]: cannot create output directory for program '${request.name}'\n"
+            )
+            status = 149
+        }
+        if (status == 0) {
+            names.append(request.name)
+            outputs.append(request.output)
+            status = bootstrapOrcBuildSingle(
+                request.entry,
+                request.output,
+                request.fast,
+                request.cache,
+                target.libcFree
+            )
+            val nested = bootstrapTakeCompileProgramRequests()
+            var nestedIndex = 0
+            while (nestedIndex < nested.size && queued.size < 64) {
+                queued.append(nested[nestedIndex])
+                nestedIndex = nestedIndex + 1
+            }
+            if (nestedIndex < nested.size) {
+                linuxPrintStandardError(
+                    "error[E_BUILD_GRAPH_LIMIT]: programmable build exceeds 64 program nodes\n"
+                )
+                status = 150
+            }
+        }
+        cursor = cursor + 1
+    }
+    if (status == 0 && cursor < queued.size) {
+        linuxPrintStandardError(
+            "error[E_BUILD_GRAPH_LIMIT]: programmable build exceeds 64 program nodes\n"
+        )
+        status = 150
     }
     status
 }

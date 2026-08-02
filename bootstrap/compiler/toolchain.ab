@@ -338,6 +338,10 @@ fun bootstrapGraphCompileCapabilitiesCacheable(
         var action = 0
         while (action < actions.size) {
             val staged = actions[action]
+            if (bootstrapExpressionContainsCall(
+                staged,
+                "compilerBuildProgram"
+            )) cacheable = false
             if (staged.kind == "compile" && staged.children.size == 1) {
                 val expression = staged.children[0]
                 if (expression.kind == "call" &&
@@ -355,9 +359,59 @@ fun bootstrapGraphCompileCapabilitiesCacheable(
             }
             action = action + 1
         }
+        val declarations =
+            graph.orderedSnapshots[module].discovery.declarations
+        var declaration = 0
+        while (declaration < declarations.size) {
+            if (bootstrapDeclarationContainsCall(
+                declarations[declaration],
+                "compilerBuildProgram"
+            )) cacheable = false
+            declaration = declaration + 1
+        }
         module = module + 1
     }
     cacheable
+}
+
+fun bootstrapExpressionContainsCall(
+    expression: BootstrapExpression,
+    name: string
+): bool {
+    var found = expression.kind == "call" && expression.text == name
+    var child = 0
+    while (!found && child < expression.children.size) {
+        found = bootstrapExpressionContainsCall(
+            expression.children[child],
+            name
+        )
+        child = child + 1
+    }
+    found
+}
+
+fun bootstrapDeclarationContainsCall(
+    declaration: BootstrapDeclaration,
+    name: string
+): bool {
+    var found = bootstrapExpressionContainsCall(declaration.expression, name)
+    var defaultIndex = 0
+    while (!found && defaultIndex < declaration.parameterDefaults.size) {
+        found = bootstrapExpressionContainsCall(
+            declaration.parameterDefaults[defaultIndex],
+            name
+        )
+        defaultIndex = defaultIndex + 1
+    }
+    var method = 0
+    while (!found && method < declaration.methods.size) {
+        found = bootstrapDeclarationContainsCall(
+            declaration.methods[method],
+            name
+        )
+        method = method + 1
+    }
+    found
 }
 
 fun bootstrapParseCacheInteger(text: string, var cursor: array<int>): int {
@@ -802,8 +856,15 @@ fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
     val compilation = bootstrapCompileLlvmParsed(
         bootstrapParseModule(sourcePath)
     )
+    val requestedPrograms = bootstrapTakeCompileProgramRequests()
     var status = 1
-    if (compilation.errors == 0 &&
+    if (requestedPrograms.size > 0) {
+        linuxPrintStandardError(
+            "error[E_BUILD_COMMAND_UNSUPPORTED]: run cannot execute programmable build nodes; use 'ablac build'\n"
+        )
+        status = 151
+    }
+    if (compilation.errors == 0 && requestedPrograms.size == 0 &&
         Path(llvmPath).writeTextAtomic(compilation.output)) {
         status = 0
     }
@@ -873,9 +934,17 @@ fun bootstrapServeWithEmitter(
                 moduleState,
                 irCache
             )
+            val requestedPrograms = bootstrapTakeCompileProgramRequests()
+            var accepted = build.status == 0
+            if (requestedPrograms.size > 0) {
+                linuxPrintStandardError(
+                    "error[E_BUILD_COMMAND_UNSUPPORTED]: serve cannot execute programmable build nodes; use 'ablac build'\n"
+                )
+                accepted = false
+            }
             watcher = watchFiles(build.modules)
             generation = generation + 1
-            if (build.status == 0) {
+            if (accepted) {
                 if (child.process >= 0) child.stop()
                 child = linuxCommand(outputPath).start()
                 linuxPrintStandardError(

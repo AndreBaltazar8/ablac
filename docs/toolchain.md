@@ -45,6 +45,14 @@ object semantics change without a corresponding source-graph change.
 `.ll`/object sidecars. It is the reproducibility and profiling mode used by the
 pure self-rebuild gate; options after the source are order-independent.
 
+Compile-time build definitions may register additional program nodes through
+the versioned compiler API. After the root succeeds, `build` drains the bounded
+graph in declaration order; a requested program may add further nodes. This
+mechanism is target- and framework-neutral—the compiler executes program and
+artifact requests, while libraries own Android, WASM, MVC, RPC, or packaging
+policy. The initial executable slice and its remaining transaction/target work
+are documented in `docs/programmable-builds.md`.
+
 Long-lived builds additionally retain a module snapshot store in pure Abla.
 Each snapshot atomically associates source text, scanned import edges, two
 content fingerprints, and the observed file size/revision. On a watched

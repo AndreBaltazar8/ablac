@@ -150,6 +150,8 @@ under `build/`.
 
 - [Language contract](docs/language.md)
 - [Toolchain interface](docs/toolchain.md)
+- [Compiler extension API](docs/compiler-api.md)
+- [Programmable builds](docs/programmable-builds.md)
 - [Bootstrap architecture](docs/bootstrap.md)
 - [Self-hosting status](docs/self-hosting.md)
 - [Standard library](docs/standard-library.md)

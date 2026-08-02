@@ -97,3 +97,18 @@ and complete post-resolution node maps remain.
 owned by the active parser cursor. Providers should include it with the source
 span when constructing request namespaces, because byte offsets are local to a
 module and can be identical in separate imports.
+
+## Programmable build nodes
+
+`compilerBuildProgram(name, entry, output, target, artifact, fast, cache)`
+registers a bounded program node during compile-time execution. The compiler
+driver validates and drains the resulting graph in deterministic declaration
+order; requested programs may themselves register more nodes. Paths are
+project-relative, names and outputs are unique, one evaluation may register at
+most 32 nodes, and the recursively expanded graph is capped at 64 nodes.
+
+This is a general compiler-service primitive. Android, WASM, MVC, UI, RPC, and
+packaging policy belong to libraries that construct nodes and emit sidecars,
+not to the frontend. The first implementation supports executable artifacts on
+the existing Linux targets. See `docs/programmable-builds.md` for the staged
+artifact, ABI, target-description, and transactional build-graph roadmap.
