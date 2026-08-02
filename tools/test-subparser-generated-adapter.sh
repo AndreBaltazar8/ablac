@@ -57,6 +57,16 @@ nominal_status=$?
 set -e
 [[ $nominal_status -eq 42 ]]
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/late-nominal-action.ab" \
+    -o "$output_directory/late-nominal-program" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$output_directory/late-nominal-program"
+late_nominal_status=$?
+set -e
+[[ $late_nominal_status -eq 42 ]]
+
 set +e
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/invalid-resolved-method-builder.ab" \
@@ -113,5 +123,22 @@ grep -q 'extension.request:expected.request.namespace:' \
 grep -q 'finalizer returned the wrong result kind or namespace' \
     "$output_directory/invalid-request-result.err"
 
+set +e
+"$compiler" --emit-llvm \
+    "$project_root/tests/cases/modules/invalid-finalizer-function-handle.ab" \
+    > "$output_directory/invalid-function-handle.ll" \
+    2> "$output_directory/invalid-function-handle.err"
+invalid_function_handle_status=$?
+set -e
+[[ $invalid_function_handle_status -ne 0 ]]
+grep -q 'generated-extension finalizer `finalizeInvalidFunctionHandle`' \
+    "$output_directory/invalid-function-handle.err"
+grep -q 'compiler API `compilerFunctionName` received invalid function handle 999999' \
+    "$output_directory/invalid-function-handle.err"
+grep -q 'out of range; expected a compilation-scoped function declaration handle' \
+    "$output_directory/invalid-function-handle.err"
+grep -q 'extension.request:invalid.function.handle:' \
+    "$output_directory/invalid-function-handle.err"
+
 printf '%s\n' \
-    'subparser extension: nested deferred calls + source identity + nominal-result adapters + post-resolution handles + provenance-carrying AST publication + rollback passed'
+    'subparser extension: nested/late deferred calls + source identity + nominal-result adapters + actionable invalid-handle diagnostics + provenance-carrying AST publication + rollback passed'
