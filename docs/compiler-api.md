@@ -114,6 +114,17 @@ static-library, and shared-library artifacts; stable exported adapters remain
 separate from those containers. See `docs/programmable-builds.md` for the ABI,
 target-description, and transactional build-graph roadmap.
 
+`compilerDefineTarget(name, llvmTriple, objectFormat, linkerFlavor,
+linkerEmulation, hosted, libcFree)` registers an extension-owned target for the
+same graph. Values are bounded identifier-like tokens. The current generic
+implementation accepts ELF with the host Clang driver for hosted x86-64 aliases
+or direct LLD for non-hosted, libc-backed targets. The latter may emit object,
+static-library, and shared-library artifacts but require extension-provided
+runtime/startup support before libc-free targets or executables. Descriptors
+are graph-scoped, deterministic, duplicate-checked, and included in cache
+identities. Platform packages such as
+`abla/android/build` own concrete triples and integration policy.
+
 `compilerExportFunction(handle, name)` marks one resolved top-level function
 for a stable foreign adapter. The first ABI rung accepts no parameters and a
 `void`, `bool`, or `i64` result in programs without runtime globals. The

@@ -22,8 +22,10 @@ artifact container; executable remains the default. Libraries without `main`
 must explicitly publish at least one supported foreign adapter through the
 compiler API; internal Abla symbols remain hidden.
 The default release profile runs the deterministic `default<O2>,globaldce`
-pipeline. `--fast` skips whole-module optimization and selects LLVM's
-low-latency code generator for edit/build cycles. It still runs the complete
+pipeline. Hosted `--fast` skips whole-module optimization and selects LLVM's
+low-latency code generator for edit/build cycles. External cross targets run a
+bounded `default<O1>,globaldce` pass even in fast mode, because target lowering
+must not validate unreachable host-only runtime assembly. It still runs the complete
 frontend, compile-time evaluator, verifier, object emitter, and linker; it is
 not a cached or partial build. The default output is a native executable under
 `build/`.
@@ -52,10 +54,11 @@ pure self-rebuild gate; options after the source are order-independent.
 Compile-time build definitions may register additional program nodes through
 the versioned compiler API. After the root succeeds, `build` drains the bounded
 graph in declaration order; a requested program may add further nodes. This
-mechanism is target- and framework-neutral—the compiler executes program and
-artifact requests, while libraries own Android, WASM, MVC, RPC, or packaging
-policy. The initial executable slice and its remaining transaction/target work
-are documented in `docs/programmable-builds.md`.
+mechanism is target- and framework-neutral—the compiler executes program,
+artifact, and bounded external-target requests, while libraries own Android,
+WASM, MVC, RPC, or packaging policy. The Android arm64 shared-library proof and
+remaining transaction/ABI work are documented in
+`docs/programmable-builds.md`.
 
 Long-lived builds additionally retain a module snapshot store in pure Abla.
 Each snapshot atomically associates source text, scanned import edges, two

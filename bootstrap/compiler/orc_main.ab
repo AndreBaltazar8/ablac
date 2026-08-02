@@ -12,11 +12,13 @@ fun bootstrapOrcEmit(sourcePath: string): int {
     var status = 1
     val compilation = bootstrapCompileLlvmParsed(parsed)
     val requestedPrograms = bootstrapTakeCompileProgramRequests()
-    if (compilation.errors == 0 && requestedPrograms.size == 0) {
+    val definedTargets = bootstrapTakeDefinedTargets()
+    if (compilation.errors == 0 && requestedPrograms.size == 0 &&
+        definedTargets.size == 0) {
         linuxPrintStandardOutput(compilation.output)
         status = 0
     }
-    if (requestedPrograms.size > 0) {
+    if (requestedPrograms.size > 0 || definedTargets.size > 0) {
         linuxPrintStandardError(
             "error[E_BUILD_COMMAND_UNSUPPORTED]: --emit-llvm cannot execute programmable build nodes; use 'ablac build'\n"
         )
@@ -49,31 +51,93 @@ fun bootstrapOrcBuildSingle(
     outputPath: string,
     fast: bool,
     useCache: bool,
-    rawTarget: bool,
+    target: BootstrapTargetDescriptor,
     artifact: string
 ): int {
     var status = 1
-    if (fast) {
+    if (fast && target.llvmTriple == "x86_64-unknown-linux-gnu") {
         status = bootstrapNativeArtifactBuildWithEmitter(
             sourcePath,
             outputPath,
             llvmAotEmitObjectFileFast,
             "inprocess-fast",
             useCache,
-            rawTarget,
+            target,
             artifact
         ).status
     }
-    if (!fast) {
+    if (!fast && target.llvmTriple == "x86_64-unknown-linux-gnu") {
         status = bootstrapNativeArtifactBuildWithEmitter(
             sourcePath,
             outputPath,
             llvmAotEmitObjectFile,
             "inprocess-o2",
             useCache,
-            rawTarget,
+            target,
             artifact
         ).status
+    }
+    if (target.llvmTriple != "x86_64-unknown-linux-gnu") {
+        val targetTriple = target.llvmTriple
+        val targetFast = fast
+        val targetEmitter: (string, string) -> int = {
+            input: string,
+            output: string ->
+            bootstrapExternalEmitObjectForTarget(
+                input,
+                output,
+                targetTriple,
+                targetFast
+            )
+        }
+        status = bootstrapNativeArtifactBuildWithEmitter(
+            sourcePath,
+            outputPath,
+            targetEmitter,
+            if (fast) "cross-fast" else "cross-o2",
+            useCache,
+            target,
+            artifact
+        ).status
+    }
+    status
+}
+
+fun bootstrapAppendDefinedTargets(
+    var targets: array<BootstrapDefinedTarget>,
+    additions: array<BootstrapDefinedTarget>
+): int {
+    var status = 0
+    var addition = 0
+    while (status == 0 && addition < additions.size) {
+        val candidate = additions[addition]
+        val descriptor = bootstrapDefinedTargetDescriptor(candidate)
+        var duplicate = bootstrapTargetDescriptor(candidate.name).valid
+        var previous = 0
+        while (!duplicate && previous < targets.size) {
+            if (targets[previous].name == candidate.name) duplicate = true
+            previous = previous + 1
+        }
+        if (!descriptor.valid) {
+            linuxPrintStandardError(
+                "error[E_BUILD_TARGET_DEFINITION]: target '${candidate.name}' requested an unsupported object format or linker flavor\n"
+            )
+            status = 148
+        }
+        if (status == 0 && duplicate) {
+            linuxPrintStandardError(
+                "error[E_BUILD_TARGET_DEFINITION]: duplicate target '${candidate.name}'\n"
+            )
+            status = 146
+        }
+        if (status == 0 && targets.size >= 32) {
+            linuxPrintStandardError(
+                "error[E_BUILD_GRAPH_LIMIT]: programmable build exceeds 32 target descriptions\n"
+            )
+            status = 150
+        }
+        if (status == 0) targets.append(candidate)
+        addition = addition + 1
     }
     status
 }
@@ -86,19 +150,25 @@ fun bootstrapOrcBuild(
     outputPath: string,
     fast: bool,
     useCache: bool,
-    rawTarget: bool,
+    target: BootstrapTargetDescriptor,
     artifact: string
 ): int {
     bootstrapTakeCompileProgramRequests()
+    bootstrapTakeDefinedTargets()
     var status = bootstrapOrcBuildSingle(
         sourcePath,
         outputPath,
         fast,
         useCache,
-        rawTarget,
+        target,
         artifact
     )
     val queued = bootstrapTakeCompileProgramRequests()
+    val targets: array<BootstrapDefinedTarget> = []
+    val rootTargets = bootstrapTakeDefinedTargets()
+    if (status == 0) {
+        status = bootstrapAppendDefinedTargets(targets, rootTargets)
+    }
     val names: array<string> = []
     val outputs: array<string> = []
     var cursor = 0
@@ -111,7 +181,16 @@ fun bootstrapOrcBuild(
                 outputs[previous] == request.output) unique = false
             previous = previous + 1
         }
-        val target = bootstrapTargetDescriptor(request.target)
+        var requestedTarget = bootstrapTargetDescriptor(request.target)
+        var definedTarget = 0
+        while (!requestedTarget.valid && definedTarget < targets.size) {
+            if (targets[definedTarget].name == request.target) {
+                requestedTarget = bootstrapDefinedTargetDescriptor(
+                    targets[definedTarget]
+                )
+            }
+            definedTarget = definedTarget + 1
+        }
         if (!unique) {
             linuxPrintStandardError(
                 "error[E_BUILD_GRAPH_DUPLICATE]: duplicate program name or output for '${request.name}'\n"
@@ -127,9 +206,9 @@ fun bootstrapOrcBuild(
             )
             status = 147
         }
-        if (status == 0 && !target.valid) {
+        if (status == 0 && !requestedTarget.valid) {
             linuxPrintStandardError(
-                "error[E_BUILD_TARGET_UNSUPPORTED]: program '${request.name}' requested unsupported target '${request.target}'; supported targets: ${bootstrapSupportedTargets()}\n"
+                "error[E_BUILD_TARGET_UNSUPPORTED]: program '${request.name}' requested target '${request.target}', which is neither built in nor defined by this build graph\n"
             )
             status = 148
         }
@@ -147,10 +226,17 @@ fun bootstrapOrcBuild(
                 request.output,
                 request.fast,
                 request.cache,
-                target.libcFree,
+                requestedTarget,
                 request.artifact
             )
             val nested = bootstrapTakeCompileProgramRequests()
+            val nestedTargets = bootstrapTakeDefinedTargets()
+            if (status == 0) {
+                status = bootstrapAppendDefinedTargets(
+                    targets,
+                    nestedTargets
+                )
+            }
             var nestedIndex = 0
             while (nestedIndex < nested.size && queued.size < 64) {
                 queued.append(nested[nestedIndex])
@@ -355,7 +441,7 @@ fun main: int {
                 outputPath,
                 fast,
                 useCache,
-                target.libcFree,
+                target,
                 artifact
             )
         }

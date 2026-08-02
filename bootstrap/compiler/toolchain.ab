@@ -11,12 +11,14 @@ class BootstrapTargetDescriptor(
     val hosted: bool,
     val libcFree: bool,
     val entrySymbol: string,
+    val linkerFlavor: string,
+    val linkerEmulation: string,
     val valid: bool
 )
 
 fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
     var result = BootstrapTargetDescriptor(
-        name, "", "", false, false, "", false
+        name, "", "", false, false, "", "", "", false
     )
     if (name == "x86_64-linux") {
         result = BootstrapTargetDescriptor(
@@ -26,6 +28,8 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             true,
             false,
             "main",
+            "host-clang",
+            "elf_x86_64",
             true
         )
     }
@@ -37,11 +41,32 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             false,
             true,
             "_start",
+            "lld-elf",
+            "elf_x86_64",
             true
         )
     }
     result
 }
+
+fun bootstrapDefinedTargetDescriptor(
+    target: BootstrapDefinedTarget
+): BootstrapTargetDescriptor = BootstrapTargetDescriptor(
+    target.name,
+    target.llvmTriple,
+    target.objectFormat,
+    target.hosted,
+    target.libcFree,
+    "",
+    target.linkerFlavor,
+    target.linkerEmulation,
+    target.objectFormat == "elf" &&
+        !target.libcFree &&
+        ((target.hosted &&
+          target.llvmTriple == "x86_64-unknown-linux-gnu" &&
+          target.linkerFlavor == "host-clang") ||
+         (!target.hosted && target.linkerFlavor == "lld-elf"))
+)
 
 fun bootstrapSupportedTargets(): string =
     "x86_64-linux, x86_64-linux-raw"
@@ -95,6 +120,42 @@ fun bootstrapExternalEmitObject(
         emitObject.argument("-relocation-model=pic")
         emitObject.argument("-O2")
         emitObject.argument(optimizedPath)
+        emitObject.argument("-o")
+        emitObject.argument(objectPath)
+        status = emitObject.run()
+    }
+    status
+}
+
+fun bootstrapExternalEmitObjectForTarget(
+    llvmPath: string,
+    objectPath: string,
+    llvmTriple: string,
+    fast: bool
+): int {
+    // Cross-target LLVM still contains the complete portable runtime. Even a
+    // fast build must prune unreachable host-only implementation details before
+    // llc validates target-specific inline assembly and register constraints.
+    val inputPath = "$objectPath.bc"
+    val optimize = linuxCommand("opt")
+    optimize.argument("--threads=1")
+    optimize.argument(if (fast)
+        "-passes=default<O1>,globaldce"
+    else
+        "-passes=default<O2>,globaldce"
+    )
+    optimize.argument(llvmPath)
+    optimize.argument("-o")
+    optimize.argument(inputPath)
+    var status = optimize.run()
+    if (status == 0) {
+        val emitObject = linuxCommand("llc")
+        emitObject.argument("--threads=1")
+        emitObject.argument("-filetype=obj")
+        emitObject.argument("-relocation-model=pic")
+        emitObject.argument(if (fast) "-O0" else "-O2")
+        emitObject.argument("-mtriple=$llvmTriple")
+        emitObject.argument(inputPath)
         emitObject.argument("-o")
         emitObject.argument(objectPath)
         status = emitObject.run()
@@ -501,9 +562,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     var moduleState: BootstrapModuleState,
     var irCache: BootstrapIrCacheState,
     allowCache: bool,
-    rawTarget: bool,
+    target: BootstrapTargetDescriptor,
     artifact: string
 ): BootstrapNativeBuild {
+    val rawTarget = target.libcFree
     bootstrapBeginCompileOutputs()
     val modules: array<BootstrapModule> = []
     moduleState.beginBuild()
@@ -530,7 +592,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val publishPath = "$outputPath.tmp.${linuxProcessId()}"
     val manifestPath = Path(sourcePath).parent().child("abla.toml")
     val manifest = manifestPath.readText()
-    val sourceIdentity = "$source\nabla-manifest:${manifest.size}\n$manifest"
+    val targetIdentity = "${target.name}:${target.llvmTriple}:${target.objectFormat}:${target.hosted}:${target.libcFree}:${target.entrySymbol}:${target.linkerFlavor}:${target.linkerEmulation}"
+    val sourceIdentity = "$source\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact"
     val firstHash = bootstrapNativeCacheHash(
         sourceIdentity, 17, 257, 1000000007
     )
@@ -551,8 +614,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     )
     val cacheDirectory = "build/.abla-cache"
     val partitionCacheNamespace =
-        "$cacheDirectory/native-partition-linux-x86_64-llvm21-v1-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
-    val cacheStem = "$cacheDirectory/native-linux-x86_64-llvm21-v12-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
+        "$cacheDirectory/native-partition-${target.name}-llvm21-v1-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
+    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v12-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
     val cacheObjectPath = "$cacheStem.o"
     val cacheSourcePath = "$cacheStem.source"
     val cacheLinkLlvmPath = "$cacheStem.link-llvm"
@@ -597,6 +660,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (compilation.errors == 0) {
             if (Path(llvmPath).writeTextAtomic(compilation.output)) status = 0
             if (status == 0 && allowCache && compileInputsCacheable &&
+                target.hosted &&
                 Path(cacheDirectory).createDirectories()) {
                 val partitioned = bootstrapEmitPartitionedObject(
                     llvmPath,
@@ -660,15 +724,29 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (status == 0 && rawTarget && artifact != "executable") {
         linuxPrintStandardError(
-            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target x86_64-linux-raw currently supports only executable artifacts\n"
+            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target '${target.name}' currently supports only executable artifacts\n"
         )
         status = 147
     }
     if (status == 0 && rawTarget && (linkHost || linkLlvm)) {
         linuxPrintStandardError(
-            "target x86_64-linux-raw does not permit hosted or LLVM runtime imports\n"
+            "target ${target.name} does not permit hosted or LLVM runtime imports\n"
         )
         status = 142
+    }
+    if (status == 0 && !target.hosted && !rawTarget &&
+        (linkHost || linkLlvm)) {
+        linuxPrintStandardError(
+            "error[E_BUILD_TARGET_CAPABILITY]: target '${target.name}' cannot use compiler-host or LLVM runtime imports\n"
+        )
+        status = 152
+    }
+    if (status == 0 && !target.hosted && !rawTarget &&
+        artifact == "executable") {
+        linuxPrintStandardError(
+            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: externally defined target '${target.name}' requires an extension-provided startup before executable emission\n"
+        )
+        status = 147
     }
     if (status == 0 && rawTarget && artifact == "executable") {
         val compileRawRuntime = linuxCommand("clang")
@@ -679,7 +757,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileRawRuntime.argument(rawRuntimePath)
         status = compileRawRuntime.run()
     }
-    if (status == 0 && linkHost && !rawTarget && artifact != "object") {
+    if (status == 0 && linkHost && target.hosted && artifact != "object") {
         val compileHost = linuxCommand("clang")
         compileHost.argument("-std=c11")
         compileHost.argument("-O2")
@@ -705,7 +783,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkRaw.argument(publishPath)
         status = linkRaw.run()
     }
-    if (status == 0 && !rawTarget && artifact == "executable") {
+    if (status == 0 && target.hosted && artifact == "executable") {
         val link = linuxCommand("clang")
         link.argument("-fuse-ld=lld")
         link.argument("-Wl,--threads=1")
@@ -741,7 +819,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (linkHost) archive.argument(hostPath)
         status = archive.run()
     }
-    if (status == 0 && !rawTarget && artifact == "shared-library") {
+    if (status == 0 && target.hosted && artifact == "shared-library") {
         val linkShared = linuxCommand("clang")
         linkShared.argument("-shared")
         linkShared.argument("-fuse-ld=lld")
@@ -762,6 +840,19 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
         linkShared.argument(objectPath)
         if (linkHost) linkShared.argument(hostPath)
+        linkShared.argument("-o")
+        linkShared.argument(publishPath)
+        status = linkShared.run()
+    }
+    if (status == 0 && !target.hosted && !rawTarget &&
+        artifact == "shared-library") {
+        val linkShared = linuxCommand("ld.lld")
+        linkShared.argument("--threads=1")
+        linkShared.argument("--gc-sections")
+        linkShared.argument("-shared")
+        linkShared.argument("-m")
+        linkShared.argument(target.linkerEmulation)
+        linkShared.argument(objectPath)
         linkShared.argument("-o")
         linkShared.argument(publishPath)
         status = linkShared.run()
@@ -807,7 +898,7 @@ fun bootstrapNativeBuildWithEmitterRetainedState(
     moduleState,
     irCache,
     true,
-    false,
+    bootstrapTargetDescriptor("x86_64-linux"),
     "executable"
 )
 
@@ -861,7 +952,7 @@ fun bootstrapNativeBuildUncachedWithEmitter(
         moduleState,
         irCache,
         false,
-        false,
+        bootstrapTargetDescriptor("x86_64-linux"),
         "executable"
     )
 }
@@ -883,7 +974,7 @@ fun bootstrapNativeRawBuildWithEmitter(
         moduleState,
         irCache,
         useCache,
-        true,
+        bootstrapTargetDescriptor("x86_64-linux-raw"),
         "executable"
     )
 }
@@ -894,7 +985,7 @@ fun bootstrapNativeArtifactBuildWithEmitter(
     emitObject: (string, string) -> int,
     cacheProfile: string,
     useCache: bool,
-    rawTarget: bool,
+    target: BootstrapTargetDescriptor,
     artifact: string
 ): BootstrapNativeBuild {
     val moduleState = bootstrapModuleState()
@@ -903,11 +994,11 @@ fun bootstrapNativeArtifactBuildWithEmitter(
         sourcePath,
         outputPath,
         emitObject,
-        if (rawTarget) "raw-$cacheProfile" else cacheProfile,
+        if (target.libcFree) "raw-$cacheProfile" else cacheProfile,
         moduleState,
         irCache,
         useCache,
-        rawTarget,
+        target,
         artifact
     )
 }
@@ -935,14 +1026,16 @@ fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
         bootstrapParseModule(sourcePath)
     )
     val requestedPrograms = bootstrapTakeCompileProgramRequests()
+    val definedTargets = bootstrapTakeDefinedTargets()
     var status = 1
-    if (requestedPrograms.size > 0) {
+    if (requestedPrograms.size > 0 || definedTargets.size > 0) {
         linuxPrintStandardError(
             "error[E_BUILD_COMMAND_UNSUPPORTED]: run cannot execute programmable build nodes; use 'ablac build'\n"
         )
         status = 151
     }
     if (compilation.errors == 0 && requestedPrograms.size == 0 &&
+        definedTargets.size == 0 &&
         Path(llvmPath).writeTextAtomic(compilation.output)) {
         status = 0
     }
@@ -1013,8 +1106,9 @@ fun bootstrapServeWithEmitter(
                 irCache
             )
             val requestedPrograms = bootstrapTakeCompileProgramRequests()
+            val definedTargets = bootstrapTakeDefinedTargets()
             var accepted = build.status == 0
-            if (requestedPrograms.size > 0) {
+            if (requestedPrograms.size > 0 || definedTargets.size > 0) {
                 linuxPrintStandardError(
                     "error[E_BUILD_COMMAND_UNSUPPORTED]: serve cannot execute programmable build nodes; use 'ablac build'\n"
                 )

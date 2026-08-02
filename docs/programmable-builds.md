@@ -43,11 +43,22 @@ instead of silently dropping requests or leaving process-private request data.
 
 The built-in hosted Linux target can emit `executable`, `object`,
 `static-library`, and `shared-library` nodes. The raw Linux target remains
-executable-only. Library containers are now real toolchain outputs, but the
-foreign-call surface remains explicit rather than exporting internal Abla
-symbols. The API deliberately carries artifact and target names so later WASM
-and externally described targets do not add mobile, UI, RPC, or browser
-concepts to the compiler frontend.
+executable-only. Build libraries may also register bounded ELF target
+descriptors with `defineTarget`: a name, LLVM triple, linker flavor/emulation,
+and generic hosted/libc-free capabilities. Target descriptions are part of
+the native cache identity. They are limited to 16 per compile-time evaluation
+and 32 across a recursively expanded graph; invalid and duplicate definitions
+fail before their program node is compiled.
+
+The compiler interprets those generic properties but knows nothing about
+Android. `abla/android/build` owns the first platform proof: its `build.ab`
+helper defines an AArch64 Android target, requests only an exported
+`libabla_app.so`, and generates the ABI header, JNI bridge, Kotlin declaration,
+CMake import, and Gradle source-set fragment. The regression inspects the ELF
+machine/type and dynamic symbol table and checks byte-identical repeated
+output. Cross-target fast builds still run bounded O1/global-DCE before LLVM
+target lowering so dead host-runtime details cannot invalidate another
+architecture.
 
 `compilerExportFunction(handle, name)` provides the first stable foreign ABI
 rung. It exports a C-identifier symbol for a resolved top-level function while
@@ -72,12 +83,14 @@ descriptors for:
 - cycle, depth, process, memory, and output limits; and
 - structured diagnostics carrying program and artifact context.
 
-An Android extension should eventually use only those facilities to generate
-JNI/Kotlin/Gradle integration and request an Android NDK shared library. A
-WASM/MVC extension should use the same facilities to request a browser module
-and generate its host adapter. Neither workflow belongs in `ablac` itself.
+The Android proof now uses only those facilities. It intentionally stops at a
+single arm64 library and generated integration skeleton: Android SDK discovery,
+APK packaging, signing, manifests, resources, additional ABIs, and application
+policy remain extension/toolchain work. A WASM/MVC extension should use the
+same facilities to request a browser module and generate its host adapter.
+Neither workflow belongs in `ablac` itself.
 
 `#import("abla/build")` is the first ordinary library façade over these
-compiler services. Its `buildProgram` and `exportFunction` helpers contain no
-platform policy; Android and browser extensions can wrap or replace them with
-their own typed descriptors and generated artifacts.
+compiler services. Its `buildProgram`, `defineTarget`, and `exportFunction`
+helpers contain no platform policy; Android and browser extensions can wrap or
+replace them with their own typed descriptors and generated artifacts.
