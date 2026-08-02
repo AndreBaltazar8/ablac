@@ -130,8 +130,9 @@ archive, or no-entry module through `wasm-ld`. Platform packages such as
 policy.
 
 `compilerExportFunction(handle, name)` marks one resolved top-level function
-for a stable foreign adapter. The first ABI rung accepts no parameters and a
-`void`, `bool`, or `i64` result in programs without runtime globals. The
+for a stable foreign adapter. The scalar ABI rung accepts up to 16 value
+`bool`/`i64` parameters and a `void`, `bool`, or `i64` result in programs
+without runtime globals. The
 backend emits only the requested C symbol; internal Abla function symbols stay
 hidden. Unsupported signatures fail with `E_EXPORT_SIGNATURE_UNSUPPORTED`
 rather than exposing the internal `%AblaValue` representation. Successful

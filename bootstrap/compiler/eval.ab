@@ -23,7 +23,9 @@ class BootstrapCompileProgramRequest(
 class BootstrapExportRequest(
     val source: string,
     val name: string,
-    val resultType: string
+    val resultType: string,
+    val parameterNames: array<string>,
+    val parameterTypes: array<string>
 )
 
 class BootstrapDefinedTarget(
@@ -180,11 +182,31 @@ fun bootstrapStageExportRequest(request: BootstrapExportRequest): bool {
     if (valid) valid = Path("$root/$requestIndex.result").writeTextAtomic(
         request.resultType
     )
+    if (valid) valid = Path("$root/$requestIndex.parameters").writeTextAtomic(
+        "${request.parameterTypes.size}"
+    )
+    var parameter = 0
+    while (valid && parameter < request.parameterTypes.size) {
+        valid = Path(
+            "$root/$requestIndex.parameter-$parameter-name"
+        ).writeTextAtomic(request.parameterNames[parameter])
+        if (valid) valid = Path(
+            "$root/$requestIndex.parameter-$parameter-type"
+        ).writeTextAtomic(request.parameterTypes[parameter])
+        parameter = parameter + 1
+    }
     if (valid) bootstrapExportRequestCount = requestIndex + 1
     if (!valid) {
         Path("$root/$requestIndex.source").remove()
         Path("$root/$requestIndex.name").remove()
         Path("$root/$requestIndex.result").remove()
+        Path("$root/$requestIndex.parameters").remove()
+        parameter = 0
+        while (parameter < request.parameterTypes.size) {
+            Path("$root/$requestIndex.parameter-$parameter-name").remove()
+            Path("$root/$requestIndex.parameter-$parameter-type").remove()
+            parameter = parameter + 1
+        }
     }
     valid
 }
@@ -194,14 +216,34 @@ fun bootstrapTakeExportRequests(): array<BootstrapExportRequest> {
     val root = bootstrapExportRequestRoot()
     var index = 0
     while (index < bootstrapExportRequestCount) {
+        val parameterNames: array<string> = []
+        val parameterTypes: array<string> = []
+        val parameterCount = bootstrapDecimalIndex(
+            Path("$root/$index.parameters").readText()
+        )
+        var parameter = 0
+        while (parameter < parameterCount) {
+            parameterNames.append(Path(
+                "$root/$index.parameter-$parameter-name"
+            ).readText())
+            parameterTypes.append(Path(
+                "$root/$index.parameter-$parameter-type"
+            ).readText())
+            Path("$root/$index.parameter-$parameter-name").remove()
+            Path("$root/$index.parameter-$parameter-type").remove()
+            parameter = parameter + 1
+        }
         requests.append(BootstrapExportRequest(
             Path("$root/$index.source").readText(),
             Path("$root/$index.name").readText(),
-            Path("$root/$index.result").readText()
+            Path("$root/$index.result").readText(),
+            parameterNames,
+            parameterTypes
         ))
         Path("$root/$index.source").remove()
         Path("$root/$index.name").remove()
         Path("$root/$index.result").remove()
+        Path("$root/$index.parameters").remove()
         index = index + 1
     }
     bootstrapExportRequestCount = 0
@@ -2284,14 +2326,32 @@ class BootstrapEvaluator(
                 reflected.integer < this.declarations.size
             var source = ""
             var resultType = ""
+            val parameterNames: array<string> = []
+            val parameterTypes: array<string> = []
             if (valid) {
                 val declaration = this.declarations[reflected.integer]
                 source = declaration.name
                 resultType = bootstrapNormalizeType(declaration.resultType)
                 valid = declaration.kind == "fun" &&
-                    declaration.parameters.size == 0 &&
+                    declaration.parameters.size <= 16 &&
                     (resultType == "void" || resultType == "bool" ||
                      resultType == "i64")
+                var parameter = 0
+                while (valid && parameter < declaration.parameters.size) {
+                    val parameterType = bootstrapNormalizeType(
+                        declaration.parameterTypes[parameter]
+                    )
+                    valid = declaration.parameterKinds[parameter] ==
+                        "parameter" &&
+                        (parameterType == "bool" || parameterType == "i64")
+                    if (valid) {
+                        parameterNames.append(
+                            declaration.parameters[parameter]
+                        )
+                        parameterTypes.append(parameterType)
+                    }
+                    parameter = parameter + 1
+                }
             }
             var declarationIndex = 0
             while (valid && declarationIndex < this.declarations.size) {
@@ -2302,13 +2362,19 @@ class BootstrapEvaluator(
                 declarationIndex = declarationIndex + 1
             }
             if (valid) valid = bootstrapStageExportRequest(
-                BootstrapExportRequest(source, exportName.text, resultType)
+                BootstrapExportRequest(
+                    source,
+                    exportName.text,
+                    resultType,
+                    parameterNames,
+                    parameterTypes
+                )
             )
             if (valid) {
                 result = bootstrapEvalBoolean(true)
             } else {
                 bootstrapStageDriverDiagnostic(
-                    "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: compilerExportFunction requires a unique C identifier and a top-level, zero-parameter function returning void, bool, or i64 without mutable or runtime-initialized globals\n"
+                    "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: compilerExportFunction requires a unique C identifier and a top-level function with at most 16 value bool/i64 parameters, returning void, bool, or i64, without mutable or runtime-initialized globals\n"
                 )
                 this.errors = this.errors + 1
                 result = bootstrapEvalBoolean(false)

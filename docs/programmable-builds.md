@@ -73,8 +73,10 @@ remain roadmap work.
 `compilerExportFunction(handle, name)` provides the first stable foreign ABI
 rung. It exports a C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded
-surface accepts zero parameters, no runtime globals, and `void`, `bool`, or
-`i64` results. Every native artifact now publishes a sibling `.abi.json` after
+surface accepts up to 16 value `bool`/`i64` parameters, no runtime globals, and
+`void`, `bool`, or `i64` results. Adapters box those scalars into the internal
+call frame without exposing `%AblaValue`; C conformance calls a two-parameter
+Abla function directly. Every native artifact publishes a sibling `.abi.json` after
 successful linking through the staged-output transaction. Schema `abla.abi.v1`
 records the selected target,
 artifact container, foreign symbol, source declaration, parameter list, ABI

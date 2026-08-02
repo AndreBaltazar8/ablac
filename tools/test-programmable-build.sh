@@ -44,6 +44,12 @@ llvm-readelf -h "$output_directory/libabla_app.so" | \
     grep -q 'DYN (Shared object file)'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_answer$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_add$'
+grep -q '"symbol":"abla_app_add"' \
+    "$output_directory/libabla_app.so.abi.json"
+grep -q '"name":"value","abi":"i64","ownership":"value"' \
+    "$output_directory/libabla_app.so.abi.json"
 if llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_fn_'; then
     echo "internal Abla function symbol escaped the shared-library ABI" >&2
