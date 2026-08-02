@@ -73,10 +73,13 @@ remain roadmap work.
 `compilerExportFunction(handle, name)` provides the first stable foreign ABI
 rung. It exports a C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded
-surface accepts up to 16 value `bool`/`i64` parameters, no runtime globals, and
-`void`, `bool`, or `i64` results. Adapters box those scalars into the internal
-call frame without exposing `%AblaValue`; C conformance calls a two-parameter
-Abla function directly. Every native artifact publishes a sibling `.abi.json` after
+surface accepts up to 16 value `bool`/`i64` or borrowed `string` parameters,
+no runtime globals, and `void`, `bool`, or `i64` results. Adapters box scalars
+without exposing `%AblaValue`. A string lowers to a pointer/`u64` byte slice;
+the adapter accepts null only for an empty slice, copies the exact bytes into
+tracked Abla-owned storage, and adds its own terminator before calling user
+code. C conformance covers embedded NUL/non-UTF-8 bytes and the empty-null
+case. Every native artifact publishes a sibling `.abi.json` after
 successful linking through the staged-output transaction. Schema `abla.abi.v1`
 records the selected target,
 artifact container, foreign symbol, source declaration, parameter list, ABI
@@ -84,9 +87,9 @@ result representation, ownership/nullability, and failure containment status.
 The sidecar is cached with the object and restored on a cache hit. The current
 manifest deliberately says `panic: not-contained`; consumers can reject that
 contract instead of assuming exceptions or traps are isolated. The surface is
-still intentionally narrow: byte slices, opaque owned handles, callbacks, and
-actual panic containment must be implemented before richer values cross the
-boundary.
+still intentionally narrow: owned byte results, opaque owned handles,
+callbacks, and actual panic containment must be implemented before richer
+values cross the boundary.
 
 ## Direction
 

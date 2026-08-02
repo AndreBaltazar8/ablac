@@ -691,9 +691,10 @@ fun bootstrapLlvmArrayRuntime(): string {
 
 fun bootstrapLlvmStringRuntime(): string {
     var output =
-        "@abla_string_expected = private unnamed_addr constant [16 x i8] c\"expected string\\00\", align 1\n@abla_string_bounds = private unnamed_addr constant [27 x i8] c\"string index out of bounds\\00\", align 1\n@abla_string_slice_bounds = private unnamed_addr constant [30 x i8] c\"string slice is out of bounds\\00\", align 1\n@abla_string_overflow = private unnamed_addr constant [23 x i8] c\"string length overflow\\00\", align 1\n\n"
+        "@abla_string_expected = private unnamed_addr constant [16 x i8] c\"expected string\\00\", align 1\n@abla_string_bounds = private unnamed_addr constant [27 x i8] c\"string index out of bounds\\00\", align 1\n@abla_string_slice_bounds = private unnamed_addr constant [30 x i8] c\"string slice is out of bounds\\00\", align 1\n@abla_string_overflow = private unnamed_addr constant [23 x i8] c\"string length overflow\\00\", align 1\n@abla_string_invalid_borrow = private unnamed_addr constant [23 x i8] c\"invalid borrowed bytes\\00\", align 1\n\n"
     output = "${output}define internal ptr @abla_string_payload(ptr %boxed) {\nentry:\n  %tag_pointer = getelementptr %AblaValue, ptr %boxed, i32 0, i32 0\n  %tag = load i32, ptr %tag_pointer, align 8\n  %valid = icmp eq i32 %tag, 4\n  br i1 %valid, label %value, label %invalid\nvalue:\n  %payload = getelementptr %AblaValue, ptr %boxed, i32 0, i32 1\n  ret ptr %payload\ninvalid:\n  %message = getelementptr [16 x i8], ptr @abla_string_expected, i64 0, i64 0\n  call void @abla_runtime_panic(ptr %message, i64 15)\n  unreachable\n}\n\n"
     output = "${output}define internal void @abla_string_static(ptr noalias sret(%AblaValue) align 8 %out, ptr %data, i64 %length) {\nentry:\n  %data_integer = ptrtoint ptr %data to i64\n  %payload_data = insertvalue %AblaPayload zeroinitializer, i64 %data_integer, 0\n  %payload_length = insertvalue %AblaPayload %payload_data, i64 %length, 1\n  %tagged = insertvalue %AblaValue zeroinitializer, i32 4, 0\n  %value = insertvalue %AblaValue %tagged, %AblaPayload %payload_length, 1\n  store %AblaValue %value, ptr %out, align 8\n  ret void\n}\n\n"
+    output = "${output}define internal void @abla_string_copy(ptr noalias sret(%AblaValue) align 8 %out, ptr %data, i64 %length) noinline {\nentry:\n  %empty = icmp eq i64 %length, 0\n  %has_data = icmp ne ptr %data, null\n  %valid = or i1 %empty, %has_data\n  %overflow = icmp eq i64 %length, -1\n  %not_overflow = xor i1 %overflow, true\n  %accepted = and i1 %valid, %not_overflow\n  br i1 %accepted, label %allocate, label %invalid\nallocate:\n  %allocation_size = add i64 %length, 1\n  %text = call ptr @abla_runtime_alloc(i64 %allocation_size)\n  call void @abla_runtime_memory_set_layout(ptr %text, i64 1)\n  br i1 %empty, label %finish, label %copy\ncopy:\n  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %text, ptr align 1 %data, i64 %length, i1 false)\n  br label %finish\nfinish:\n  %terminator = getelementptr i8, ptr %text, i64 %length\n  store i8 0, ptr %terminator, align 1\n  %text_integer = ptrtoint ptr %text to i64\n  %payload_data = insertvalue %AblaPayload zeroinitializer, i64 %text_integer, 0\n  %payload_length = insertvalue %AblaPayload %payload_data, i64 %length, 1\n  %payload_owned = insertvalue %AblaPayload %payload_length, i64 1, 2\n  %tagged = insertvalue %AblaValue zeroinitializer, i32 4, 0\n  %value = insertvalue %AblaValue %tagged, %AblaPayload %payload_owned, 1\n  store %AblaValue %value, ptr %out, align 8\n  ret void\ninvalid:\n  %message = getelementptr [23 x i8], ptr @abla_string_invalid_borrow, i64 0, i64 0\n  call void @abla_runtime_panic(ptr %message, i64 22)\n  unreachable\n}\n\n"
     output = "${output}define internal void @abla_string_concat(ptr noalias sret(%AblaValue) align 8 %out, ptr byval(%AblaValue) align 8 %left, ptr byval(%AblaValue) align 8 %right) noinline optnone {\nentry:\n  %left_payload = call ptr @abla_string_payload(ptr %left)\n  %right_payload = call ptr @abla_string_payload(ptr %right)\n  %left_length_pointer = getelementptr %AblaPayload, ptr %left_payload, i32 0, i32 1\n  %right_length_pointer = getelementptr %AblaPayload, ptr %right_payload, i32 0, i32 1\n  %left_length = load i64, ptr %left_length_pointer, align 8\n  %right_length = load i64, ptr %right_length_pointer, align 8\n  %left_empty = icmp eq i64 %left_length, 0\n  br i1 %left_empty, label %return_right, label %right_check\nreturn_right:\n  %right_value = load %AblaValue, ptr %right, align 8\n  store %AblaValue %right_value, ptr %out, align 8\n  ret void\nright_check:\n  %right_empty = icmp eq i64 %right_length, 0\n  br i1 %right_empty, label %return_left, label %concatenate\nreturn_left:\n  %left_value = load %AblaValue, ptr %left, align 8\n  store %AblaValue %left_value, ptr %out, align 8\n  ret void\nconcatenate:\n  %length = add i64 %left_length, %right_length\n  %overflow = icmp ult i64 %length, %left_length\n  br i1 %overflow, label %invalid, label %allocate\nallocate:\n  %rope = call ptr @abla_runtime_alloc(i64 72)\n  call void @abla_runtime_memory_set_layout(ptr %rope, i64 6)\n  %rope_left = getelementptr %AblaStringRope, ptr %rope, i32 0, i32 0\n  %rope_right = getelementptr %AblaStringRope, ptr %rope, i32 0, i32 1\n  %rope_flattened = getelementptr %AblaStringRope, ptr %rope, i32 0, i32 2\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %rope_left, ptr align 8 %left_payload, i64 32, i1 false)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %rope_right, ptr align 8 %right_payload, i64 32, i1 false)\n  store ptr null, ptr %rope_flattened, align 8\n  call void asm sideeffect \"\", \"r,~{memory}\"(ptr %rope)\n  %rope_integer = ptrtoint ptr %rope to i64\n  %payload_length = insertvalue %AblaPayload zeroinitializer, i64 %length, 1\n  %payload_rope = insertvalue %AblaPayload %payload_length, i64 %rope_integer, 3\n  %tagged = insertvalue %AblaValue zeroinitializer, i32 4, 0\n  %value = insertvalue %AblaValue %tagged, %AblaPayload %payload_rope, 1\n  store %AblaValue %value, ptr %out, align 8\n  ret void\ninvalid:\n  %message = getelementptr [23 x i8], ptr @abla_string_overflow, i64 0, i64 0\n  call void @abla_runtime_panic(ptr %message, i64 22)\n  unreachable\n}\n\n"
     output = "${output}define internal void @abla_string_length(ptr noalias sret(%AblaValue) align 8 %out, ptr byval(%AblaValue) align 8 %boxed) {\nentry:\n  %payload = call ptr @abla_string_payload(ptr %boxed)\n  %length_pointer = getelementptr %AblaPayload, ptr %payload, i32 0, i32 1\n  %length = load i64, ptr %length_pointer, align 8\n  call void @abla_i64(ptr sret(%AblaValue) align 8 %out, i64 %length)\n  ret void\n}\n\n"
     output = "${output}define internal void @abla_string_get(ptr noalias sret(%AblaValue) align 8 %out, ptr byval(%AblaValue) align 8 %boxed, ptr byval(%AblaValue) align 8 %index_boxed) noinline {\nentry:\n  %payload = call ptr @abla_string_payload(ptr %boxed)\n  %index = call i64 @abla_as_i64(ptr byval(%AblaValue) align 8 %index_boxed)\n  %length_pointer = getelementptr %AblaPayload, ptr %payload, i32 0, i32 1\n  %length = load i64, ptr %length_pointer, align 8\n  %nonnegative = icmp sge i64 %index, 0\n  %below = icmp ult i64 %index, %length\n  %valid = and i1 %nonnegative, %below\n  br i1 %valid, label %value, label %invalid\nvalue:\n  %data = call ptr @abla_string_data(ptr byval(%AblaValue) align 8 %boxed)\n  %source = getelementptr i8, ptr %data, i64 %index\n  %byte = load i8, ptr %source, align 1\n  %integer = zext i8 %byte to i64\n  call void @abla_i64(ptr sret(%AblaValue) align 8 %out, i64 %integer)\n  ret void\ninvalid:\n  %message = getelementptr [27 x i8], ptr @abla_string_bounds, i64 0, i64 0\n  call void @abla_runtime_panic(ptr %message, i64 26)\n  unreachable\n}\n\n"
@@ -2040,10 +2041,14 @@ fun bootstrapLlvmExportAdapters(
             var parameter = 0
             while (parameter < request.parameterTypes.size) {
                 if (parameter > 0) signature = "$signature, "
-                val parameterType = if (
-                    request.parameterTypes[parameter] == "bool"
-                ) "i8" else "i64"
-                signature = "$signature$parameterType %argument_$parameter"
+                if (request.parameterTypes[parameter] == "string") {
+                    signature = "${signature}ptr %argument_${parameter}_data, i64 %argument_${parameter}_length"
+                } else {
+                    val parameterType = if (
+                        request.parameterTypes[parameter] == "bool"
+                    ) "i8" else "i64"
+                    signature = "$signature$parameterType %argument_$parameter"
+                }
                 parameter = parameter + 1
             }
             output = "${output}define $llvmResult @${request.name}($signature) {\nentry:\n"
@@ -2056,6 +2061,8 @@ fun bootstrapLlvmExportAdapters(
                     if (request.parameterTypes[parameter] == "bool") {
                         output = "$output  %argument_bool_$parameter = trunc i8 %argument_$parameter to i1\n"
                         output = "$output  call void @abla_bool(ptr sret(%AblaValue) align 8 %argument_slot_$parameter, i1 %argument_bool_$parameter)\n"
+                    } else if (request.parameterTypes[parameter] == "string") {
+                        output = "$output  call void @abla_string_copy(ptr sret(%AblaValue) align 8 %argument_slot_$parameter, ptr %argument_${parameter}_data, i64 %argument_${parameter}_length)\n"
                     } else {
                         output = "$output  call void @abla_i64(ptr sret(%AblaValue) align 8 %argument_slot_$parameter, i64 %argument_$parameter)\n"
                     }
@@ -2116,9 +2123,15 @@ fun bootstrapLlvmExportAbi(
             if (parameter > 0) parameters = "$parameters,"
             var abi = request.parameterTypes[parameter]
             if (abi == "bool") abi = "u8-bool"
-            parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
-                request.parameterNames[parameter]
-            )}\",\"abi\":\"$abi\",\"ownership\":\"value\",\"nullable\":false}"
+            if (abi == "string") {
+                parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
+                    request.parameterNames[parameter]
+                )}\",\"abi\":\"bytes\",\"lowering\":[\"pointer\",\"u64\"],\"ownership\":\"borrowed\",\"calleeAction\":\"copy\",\"nullable\":false,\"nullPointerAllowedWhenEmpty\":true}"
+            } else {
+                parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
+                    request.parameterNames[parameter]
+                )}\",\"abi\":\"$abi\",\"ownership\":\"value\",\"nullable\":false}"
+            }
             parameter = parameter + 1
         }
         parameters = "$parameters]"

@@ -727,6 +727,13 @@ until ownership is declared. Other types require an explicit adapter rather
 than an unchecked cast. Native libraries are registered explicitly in the VM
 and linked explicitly for generated code.
 
+Export adapters are a separate, manifest-described boundary. Their current
+borrowed `string` input is length-delimited `(const uint8_t*, uint64_t)`, not a
+C string. The adapter validates the pair and copies it into Abla ownership, so
+the caller retains and may immediately reuse or release its buffer after the
+call. The ABI manifest records `ownership: borrowed` and
+`calleeAction: copy`.
+
 ## Compatibility baseline
 
 The original examples establish the initial compatibility suite:
