@@ -51,6 +51,7 @@ grep -q 'int64_t abla_app_answer(void)' "$header"
 grep -q 'Java_org_abla_generated_AblaApp_answer' "$jni"
 grep -q 'external fun answer(): Long' "$kotlin"
 grep -q 'IMPORTED_LOCATION.*ANDROID_ABI.*libabla_app.so' "$cmake"
+grep -q 'IMPORTED_NO_SONAME TRUE' "$cmake"
 grep -q 'jniLibs.srcDir' "$gradle"
 
 set +e
