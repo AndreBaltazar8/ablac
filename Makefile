@@ -49,12 +49,25 @@ ablac:
 	@set -e; \
 	current_fingerprint=$$($(ABLA_COMPILER_FINGERPRINT)); \
 	built_fingerprint=$$(sed -n '1p' $(ABLA_BUILD_STAMP) 2>/dev/null || true); \
-	if test ! -x $(BUILD_DIR)/ablac.bin; then \
-		$(MAKE) ablac-force; \
+	rebuild=false; \
+	compiler=$(BUILD_DIR)/ablac.bin; \
+	build_flags='--no-cache'; \
+	if test ! -x "$$compiler"; then \
+		compiler=$(BUILD_DIR)/bootstrap/ablac-llvm; \
+		build_flags='--no-cache'; \
+		if test ! -x "$$compiler"; then \
+			$(MAKE) ablac-force; \
+			exit 0; \
+		fi; \
+		rebuild=true; \
 	elif test "$$current_fingerprint" != "$$built_fingerprint"; then \
-		ABLA_MAX_MEMORY_MB=$(ABLA_FAST_SELFHOST_BUILD_MEMORY_MB) ABLA_MAX_SECONDS=120 \
-			tools/run-limited.sh nix-shell --run \
-			'$(BUILD_DIR)/ablac.bin build bootstrap/compiler/orc_main.ab -o $(BUILD_DIR)/ablac.bin --fast --no-cache'; \
+		rebuild=true; \
+	fi; \
+	if test "$$rebuild" = true; then \
+		ABLA_MAX_MEMORY_MB=$(ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB) ABLA_MAX_SECONDS=240 \
+			timeout --signal=TERM --kill-after=5s 240s nix-shell --run \
+			"ulimit -S -s 65536; $$compiler build bootstrap/compiler/orc_main.ab -o $(BUILD_DIR)/bootstrap/ablac-fast-next $$build_flags"; \
+		mv $(BUILD_DIR)/bootstrap/ablac-fast-next $(BUILD_DIR)/ablac.bin; \
 		ln -sfn ../tools/run-limited-compiler.sh $(BUILD_DIR)/ablac; \
 		stamp_tmp=$(ABLA_BUILD_STAMP).tmp; \
 		printf '%s\n' "$$current_fingerprint" > "$$stamp_tmp"; \
@@ -83,7 +96,7 @@ ablac-force: bootstrap-llvm-selfhost
 		$(BUILD_DIR)/bootstrap/ablac-orc.self2.ll
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-inprocess-aot.sh $(BUILD_DIR)/ablac.bin'
-	ABLA_MAX_MEMORY_MB=$(ABLA_FAST_SELFHOST_BUILD_MEMORY_MB) ABLA_MAX_SECONDS=120 tools/run-limited.sh \
+	timeout --signal=TERM --kill-after=5s 120s \
 		nix-shell --run 'tools/test-fast-aot.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=$(ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB) ABLA_MAX_SECONDS=240 tools/run-limited.sh \
 		nix-shell --run 'tools/test-pure-self-rebuild.sh $(BUILD_DIR)/ablac.bin'

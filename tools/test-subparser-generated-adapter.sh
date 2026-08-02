@@ -38,6 +38,29 @@ set -e
 [[ $nested_deferred_status -eq 42 ]]
 
 "$compiler" build \
+    "$project_root/tests/cases/modules/raw-extension-literal.ab" \
+    -o "$output_directory/raw-extension-literal-program" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$output_directory/raw-extension-literal-program"
+raw_literal_status=$?
+set -e
+[[ $raw_literal_status -eq 42 ]]
+
+set +e
+"$compiler" --emit-llvm \
+    "$project_root/tests/cases/modules/invalid-raw-extension-literal.ab" \
+    > "$output_directory/invalid-raw-extension-literal.ll" \
+    2> "$output_directory/invalid-raw-extension-literal.err"
+invalid_raw_literal_status=$?
+set -e
+[[ $invalid_raw_literal_status -ne 0 ]]
+grep -Fq 'error[E_SUBPARSER_INVOCATION]' \
+    "$output_directory/invalid-raw-extension-literal.err"
+grep -Fq 'source[extension-expression]:' \
+    "$output_directory/invalid-raw-extension-literal.err"
+
+"$compiler" build \
     "$project_root/tests/cases/modules/nested-deferred-source-identity.ab" \
     -o "$output_directory/nested-deferred-identity-program" --no-cache
 set +e
