@@ -20,6 +20,7 @@ unrelated policy or compiler machinery into the program:
 | `abla/http` | HTTP/1 client/server, pluggable transport, and version-aware routing |
 | `abla/json`, `abla/html` | data models and `$json`/`$html` subparsers |
 | `abla/compiler/*` | compile-time parser/reflection APIs only |
+| `abla/build` | framework-neutral compile-time program and export requests |
 | `abla/unsafe/memory` | internal trusted native boundary plus checked pointer cells/buffers; retained at this legacy import path while typed resource modules stabilize |
 | `abla/sys/linux` | opt-in raw x86-64 Linux syscall and native descriptor APIs |
 | `abla/sys/linux/fs` | raw-kernel `Path`, metadata, atomic writes, entries, and watches |

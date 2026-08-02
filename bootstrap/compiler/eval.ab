@@ -20,8 +20,84 @@ class BootstrapCompileProgramRequest(
     val cache: bool
 )
 
+class BootstrapExportRequest(
+    val source: string,
+    val name: string,
+    val resultType: string
+)
+
 var bootstrapCompileProgramRequestCount: int = 0
 var bootstrapDriverDiagnosticCount: int = 0
+var bootstrapExportRequestCount: int = 0
+
+fun bootstrapExportRequestRoot(): string =
+    "build/.abla-export-requests-${linuxProcessId()}"
+
+fun bootstrapExportNameValid(name: string): bool {
+    var valid = name.size > 0 && name.size <= 128 && name != "main"
+    var index = 0
+    while (valid && index < name.size) {
+        val byte = name[index]
+        val alpha = (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 95
+        val digit = byte >= 48 && byte <= 57
+        if (!alpha && !(index > 0 && digit)) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun bootstrapStageExportRequest(request: BootstrapExportRequest): bool {
+    var valid = bootstrapExportRequestCount < 64 &&
+        bootstrapExportNameValid(request.name)
+    val root = bootstrapExportRequestRoot()
+    var index = 0
+    while (valid && index < bootstrapExportRequestCount) {
+        if (Path("$root/$index.name").readText() == request.name ||
+            Path("$root/$index.source").readText() == request.source) {
+            valid = false
+        }
+        index = index + 1
+    }
+    if (valid) valid = Path(root).createDirectories()
+    val requestIndex = bootstrapExportRequestCount
+    if (valid) valid = Path("$root/$requestIndex.source").writeTextAtomic(
+        request.source
+    )
+    if (valid) valid = Path("$root/$requestIndex.name").writeTextAtomic(
+        request.name
+    )
+    if (valid) valid = Path("$root/$requestIndex.result").writeTextAtomic(
+        request.resultType
+    )
+    if (valid) bootstrapExportRequestCount = requestIndex + 1
+    if (!valid) {
+        Path("$root/$requestIndex.source").remove()
+        Path("$root/$requestIndex.name").remove()
+        Path("$root/$requestIndex.result").remove()
+    }
+    valid
+}
+
+fun bootstrapTakeExportRequests(): array<BootstrapExportRequest> {
+    val requests: array<BootstrapExportRequest> = []
+    val root = bootstrapExportRequestRoot()
+    var index = 0
+    while (index < bootstrapExportRequestCount) {
+        requests.append(BootstrapExportRequest(
+            Path("$root/$index.source").readText(),
+            Path("$root/$index.name").readText(),
+            Path("$root/$index.result").readText()
+        ))
+        Path("$root/$index.source").remove()
+        Path("$root/$index.name").remove()
+        Path("$root/$index.result").remove()
+        index = index + 1
+    }
+    bootstrapExportRequestCount = 0
+    Path(root).remove()
+    requests
+}
 
 fun bootstrapDriverDiagnosticRoot(): string =
     "build/.abla-driver-diagnostics-${linuxProcessId()}"
@@ -2017,6 +2093,47 @@ class BootstrapEvaluator(
             } else {
                 bootstrapStageDriverDiagnostic(
                     "error[E_BUILD_PROGRAM_REQUEST]: compilerBuildProgram received an invalid or duplicate program node\n"
+                )
+                this.errors = this.errors + 1
+                result = bootstrapEvalBoolean(false)
+            }
+        }
+        if (targetName == "compilerExportFunction") {
+            val reflected = this.evaluate(expression.children[0])
+            val exportName = this.evaluate(expression.children[1])
+            var valid = reflected.kind == "integer" &&
+                exportName.kind == "string" &&
+                bootstrapExportNameValid(exportName.text) &&
+                this.functionHandleValid(reflected.integer) &&
+                reflected.integer >= 0 &&
+                reflected.integer < this.declarations.size
+            var source = ""
+            var resultType = ""
+            if (valid) {
+                val declaration = this.declarations[reflected.integer]
+                source = declaration.name
+                resultType = bootstrapNormalizeType(declaration.resultType)
+                valid = declaration.kind == "fun" &&
+                    declaration.parameters.size == 0 &&
+                    (resultType == "void" || resultType == "bool" ||
+                     resultType == "i64")
+            }
+            var declarationIndex = 0
+            while (valid && declarationIndex < this.declarations.size) {
+                val declaration = this.declarations[declarationIndex]
+                if (declaration.kind == "var" ||
+                    (declaration.kind == "val" &&
+                     declaration.expression.kind != "compile")) valid = false
+                declarationIndex = declarationIndex + 1
+            }
+            if (valid) valid = bootstrapStageExportRequest(
+                BootstrapExportRequest(source, exportName.text, resultType)
+            )
+            if (valid) {
+                result = bootstrapEvalBoolean(true)
+            } else {
+                bootstrapStageDriverDiagnostic(
+                    "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: compilerExportFunction requires a unique C identifier and a top-level, zero-parameter function returning void, bool, or i64 without mutable or runtime-initialized globals\n"
                 )
                 this.errors = this.errors + 1
                 result = bootstrapEvalBoolean(false)

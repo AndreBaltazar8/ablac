@@ -17,6 +17,10 @@ ablac serve app.ab
 
 `build` loads the module graph, executes bounded compile-time actions, verifies
 typed IR, emits LLVM objects, and links the requested executable or library.
+`--emit executable|object|static-library|shared-library` selects the hosted
+artifact container; executable remains the default. Libraries without `main`
+must explicitly publish at least one supported foreign adapter through the
+compiler API; internal Abla symbols remain hidden.
 The default release profile runs the deterministic `default<O2>,globaldce`
 pipeline. `--fast` skips whole-module optimization and selects LLVM's
 low-latency code generator for edit/build cycles. It still runs the complete

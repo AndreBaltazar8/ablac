@@ -501,7 +501,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     var moduleState: BootstrapModuleState,
     var irCache: BootstrapIrCacheState,
     allowCache: bool,
-    rawTarget: bool
+    rawTarget: bool,
+    artifact: string
 ): BootstrapNativeBuild {
     bootstrapBeginCompileOutputs()
     val modules: array<BootstrapModule> = []
@@ -649,13 +650,27 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             )
         }
     }
+    if (status == 0 && artifact != "executable" &&
+        artifact != "object" && artifact != "static-library" &&
+        artifact != "shared-library") {
+        linuxPrintStandardError(
+            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: unsupported artifact '$artifact'; supported artifacts: executable, object, static-library, shared-library\n"
+        )
+        status = 147
+    }
+    if (status == 0 && rawTarget && artifact != "executable") {
+        linuxPrintStandardError(
+            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target x86_64-linux-raw currently supports only executable artifacts\n"
+        )
+        status = 147
+    }
     if (status == 0 && rawTarget && (linkHost || linkLlvm)) {
         linuxPrintStandardError(
             "target x86_64-linux-raw does not permit hosted or LLVM runtime imports\n"
         )
         status = 142
     }
-    if (status == 0 && rawTarget) {
+    if (status == 0 && rawTarget && artifact == "executable") {
         val compileRawRuntime = linuxCommand("clang")
         compileRawRuntime.argument("-c")
         compileRawRuntime.argument("-nostdlib")
@@ -664,7 +679,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileRawRuntime.argument(rawRuntimePath)
         status = compileRawRuntime.run()
     }
-    if (status == 0 && linkHost && !rawTarget) {
+    if (status == 0 && linkHost && !rawTarget && artifact != "object") {
         val compileHost = linuxCommand("clang")
         compileHost.argument("-std=c11")
         compileHost.argument("-O2")
@@ -677,7 +692,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileHost.argument(hostPath)
         status = compileHost.run()
     }
-    if (status == 0 && rawTarget) {
+    if (status == 0 && rawTarget && artifact == "executable") {
         val linkRaw = linuxCommand("ld.lld")
         linkRaw.argument("--threads=1")
         linkRaw.argument("--gc-sections")
@@ -690,7 +705,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkRaw.argument(publishPath)
         status = linkRaw.run()
     }
-    if (status == 0 && !rawTarget) {
+    if (status == 0 && !rawTarget && artifact == "executable") {
         val link = linuxCommand("clang")
         link.argument("-fuse-ld=lld")
         link.argument("-Wl,--threads=1")
@@ -714,6 +729,42 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         link.argument("-o")
         link.argument(publishPath)
         status = link.run()
+    }
+    if (status == 0 && !rawTarget && artifact == "object") {
+        status = bootstrapCopyNativeObject(objectPath, publishPath)
+    }
+    if (status == 0 && !rawTarget && artifact == "static-library") {
+        val archive = linuxCommand("llvm-ar")
+        archive.argument("rcs")
+        archive.argument(publishPath)
+        archive.argument(objectPath)
+        if (linkHost) archive.argument(hostPath)
+        status = archive.run()
+    }
+    if (status == 0 && !rawTarget && artifact == "shared-library") {
+        val linkShared = linuxCommand("clang")
+        linkShared.argument("-shared")
+        linkShared.argument("-fuse-ld=lld")
+        linkShared.argument("-Wl,--threads=1")
+        linkShared.argument("-Wl,--gc-sections")
+        if (linkLlvm) {
+            val llvmConfig = linuxCommand("llvm-config")
+            llvmConfig.argument("--libdir")
+            var llvmLibraryDirectory = llvmConfig.captureText()
+            var end = llvmLibraryDirectory.size
+            while (end > 0 &&
+                (llvmLibraryDirectory[end - 1] == 10 ||
+                 llvmLibraryDirectory[end - 1] == 13)) end = end - 1
+            llvmLibraryDirectory = llvmLibraryDirectory.slice(0, end)
+            linkShared.argument("-L$llvmLibraryDirectory")
+            linkShared.argument("-Wl,-rpath,$llvmLibraryDirectory")
+            linkShared.argument("-lLLVM")
+        }
+        linkShared.argument(objectPath)
+        if (linkHost) linkShared.argument(hostPath)
+        linkShared.argument("-o")
+        linkShared.argument(publishPath)
+        status = linkShared.run()
     }
     if (status == 0) {
         if (!Path(publishPath).moveTo(Path(outputPath))) status = 143
@@ -756,7 +807,8 @@ fun bootstrapNativeBuildWithEmitterRetainedState(
     moduleState,
     irCache,
     true,
-    false
+    false,
+    "executable"
 )
 
 fun bootstrapNativeBuildWithEmitterState(
@@ -809,7 +861,8 @@ fun bootstrapNativeBuildUncachedWithEmitter(
         moduleState,
         irCache,
         false,
-        false
+        false,
+        "executable"
     )
 }
 
@@ -830,7 +883,32 @@ fun bootstrapNativeRawBuildWithEmitter(
         moduleState,
         irCache,
         useCache,
-        true
+        true,
+        "executable"
+    )
+}
+
+fun bootstrapNativeArtifactBuildWithEmitter(
+    sourcePath: string,
+    outputPath: string,
+    emitObject: (string, string) -> int,
+    cacheProfile: string,
+    useCache: bool,
+    rawTarget: bool,
+    artifact: string
+): BootstrapNativeBuild {
+    val moduleState = bootstrapModuleState()
+    val irCache = bootstrapIrTransientState()
+    bootstrapNativeBuildWithEmitterStateCache(
+        sourcePath,
+        outputPath,
+        emitObject,
+        if (rawTarget) "raw-$cacheProfile" else cacheProfile,
+        moduleState,
+        irCache,
+        useCache,
+        rawTarget,
+        artifact
     )
 }
 

@@ -41,11 +41,21 @@ Program nodes execute only under `ablac build`. LLVM-only emission, `run`, and
 `serve` reject a discovered build graph with `E_BUILD_COMMAND_UNSUPPORTED`
 instead of silently dropping requests or leaving process-private request data.
 
-Only the `executable` artifact and the built-in Linux target descriptions are
-implemented in this first slice. The API deliberately carries artifact and
-target names so subsequent static-library, shared-library, object, and WASM
-support extends the toolchain without adding mobile, UI, RPC, or browser
+The built-in hosted Linux target can emit `executable`, `object`,
+`static-library`, and `shared-library` nodes. The raw Linux target remains
+executable-only. Library containers are now real toolchain outputs, but the
+foreign-call surface remains explicit rather than exporting internal Abla
+symbols. The API deliberately carries artifact and target names so later WASM
+and externally described targets do not add mobile, UI, RPC, or browser
 concepts to the compiler frontend.
+
+`compilerExportFunction(handle, name)` provides the first stable foreign ABI
+rung. It exports a C-identifier symbol for a resolved top-level function while
+keeping internal Abla symbols and value layouts hidden. This initial bounded
+surface accepts zero parameters, no runtime globals, and `void`, `bool`, or
+`i64` results. It is intentionally narrow: byte slices, opaque owned handles,
+callbacks, panic containment, and generated ABI manifests must be specified
+before richer values can cross the boundary.
 
 ## Direction
 
@@ -66,3 +76,8 @@ An Android extension should eventually use only those facilities to generate
 JNI/Kotlin/Gradle integration and request an Android NDK shared library. A
 WASM/MVC extension should use the same facilities to request a browser module
 and generate its host adapter. Neither workflow belongs in `ablac` itself.
+
+`#import("abla/build")` is the first ordinary library façade over these
+compiler services. Its `buildProgram` and `exportFunction` helpers contain no
+platform policy; Android and browser extensions can wrap or replace them with
+their own typed descriptors and generated artifacts.

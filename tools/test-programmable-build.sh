@@ -12,6 +12,9 @@ mkdir -p "$output_directory"
 "$compiler" build \
     "$project_root/tests/cases/program-build/generated-root.ab" \
     -o "$output_directory/generated-root" --fast --no-cache
+"$compiler" build \
+    "$project_root/tests/cases/program-build/artifacts-root.ab" \
+    -o "$output_directory/artifacts-root" --fast --no-cache
 
 set +e
 "$output_directory/program-root"
@@ -24,6 +27,8 @@ grandchild_status=$?
 generated_root_status=$?
 "$output_directory/generated-child"
 generated_child_status=$?
+"$output_directory/artifacts-root"
+artifacts_root_status=$?
 set -e
 
 [[ $root_status -eq 40 ]]
@@ -31,6 +36,23 @@ set -e
 [[ $grandchild_status -eq 42 ]]
 [[ $generated_root_status -eq 39 ]]
 [[ $generated_child_status -eq 43 ]]
+[[ $artifacts_root_status -eq 38 ]]
+
+llvm-readelf -h "$output_directory/program.o" | grep -q 'REL (Relocatable file)'
+llvm-ar t "$output_directory/libprogram.a" | grep -q '.o$'
+llvm-readelf -h "$output_directory/libabla_app.so" | \
+    grep -q 'DYN (Shared object file)'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_answer$'
+if llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_fn_'; then
+    echo "internal Abla function symbol escaped the shared-library ABI" >&2
+    exit 1
+fi
+clang "$project_root/tests/cases/program-build/export-caller.c" \
+    -L"$output_directory" -Wl,-rpath,"$output_directory" -labla_app \
+    -o "$output_directory/export-caller"
+"$output_directory/export-caller"
 
 # A graph-producing root must never skip plan evaluation on a native-object
 # cache hit. Remove only its requested artifacts and prove a repeated cached
@@ -66,6 +88,18 @@ grep -q 'error\[E_BUILD_ARTIFACT_UNSUPPORTED\]' \
     "$output_directory/unsupported-artifact.err"
 
 set +e
+"$compiler" build \
+    "$project_root/tests/cases/program-build/invalid-export.ab" \
+    --emit shared-library -o "$output_directory/invalid-export.so" \
+    --fast --no-cache >"$output_directory/invalid-export.out" \
+    2>"$output_directory/invalid-export.err"
+invalid_export_status=$?
+set -e
+[[ $invalid_export_status -ne 0 ]]
+grep -q 'error\[E_EXPORT_SIGNATURE_UNSUPPORTED\]' \
+    "$output_directory/invalid-export.err"
+
+set +e
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/program-build/program-root.ab" \
     >"$output_directory/emit-build-plan.ll" \
@@ -76,4 +110,4 @@ set -e
 grep -q 'error\[E_BUILD_COMMAND_UNSUPPORTED\]' \
     "$output_directory/emit-build-plan.err"
 
-echo "programmable build: generated source + dynamic child + nested child passed"
+echo "programmable build: generated/nested programs + object/static/shared artifacts + C ABI export passed"

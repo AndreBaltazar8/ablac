@@ -2017,9 +2017,47 @@ fun bootstrapLlvmIndirectDispatcher(
     "$output  ret void\n}\n\n"
 }
 
+fun bootstrapLlvmExportAdapters(
+    exports: array<BootstrapExportRequest>,
+    functionNames: BootstrapLlvmNameIndex,
+    identities: BootstrapLlvmFunctionIdentities
+): BootstrapLlvmEmission {
+    var output = ""
+    var errors = 0
+    var index = 0
+    while (index < exports.size) {
+        val request = exports[index]
+        val function = functionNames.find(request.source)
+        if (function < 0 || function >= identities.symbols.size) {
+            errors = errors + 1
+        } else {
+            var llvmResult = "void"
+            if (request.resultType == "i64") llvmResult = "i64"
+            if (request.resultType == "bool") llvmResult = "i8"
+            output = "${output}define $llvmResult @${request.name}() {\nentry:\n"
+            output = "$output  %result = alloca %AblaValue, align 8\n"
+            output = "$output  call void @${identities.symbols[function]}(ptr sret(%AblaValue) align 8 %result, ptr null, i64 0)\n"
+            if (request.resultType == "i64") {
+                output = "$output  %value = call i64 @abla_as_i64(ptr byval(%AblaValue) align 8 %result)\n"
+                output = "$output  ret i64 %value\n"
+            }
+            if (request.resultType == "bool") {
+                output = "$output  %boolean = call i1 @abla_as_bool(ptr byval(%AblaValue) align 8 %result)\n"
+                output = "$output  %value = zext i1 %boolean to i8\n"
+                output = "$output  ret i8 %value\n"
+            }
+            if (request.resultType == "void") output = "$output  ret void\n"
+            output = "$output}\n\n"
+        }
+        index = index + 1
+    }
+    BootstrapLlvmEmission(output, errors)
+}
+
 fun bootstrapEmitLlvmProgram(
     program: BootstrapIrProgram
 ): BootstrapLlvmEmission {
+    val exports = bootstrapTakeExportRequests()
     val functionNames: array<string> = []
     var nameIndex = 0
     while (nameIndex < program.functions.size) {
@@ -2178,7 +2216,23 @@ fun bootstrapEmitLlvmProgram(
 
     val mainId = functionNamesIndex.find("main")
     val globalsId = functionNamesIndex.find("__bootstrap_globals")
-    output = "${output}define i32 @main(i32 %argc, ptr %argv) {\nentry:\n"
+    val exportAdapters = bootstrapLlvmExportAdapters(
+        exports,
+        functionNamesIndex,
+        identities
+    )
+    output = "$output${exportAdapters.output}"
+    errors = errors + exportAdapters.errors
+    if (exports.size > 0 && globalsId >= 0) {
+        output = "$output@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [{ i32, ptr, ptr } { i32 65535, ptr @abla_export_initialize, ptr null }]\n"
+        output = "${output}define internal void @abla_export_initialize() {\nentry:\n"
+        output = "$output  %result = alloca %AblaValue, align 8\n"
+        output = "$output  call void @${identities.symbols[globalsId]}(ptr sret(%AblaValue) align 8 %result, ptr null, i64 0)\n"
+        output = "$output  ret void\n}\n\n"
+    }
+
+    if (mainId >= 0) {
+        output = "${output}define i32 @main(i32 %argc, ptr %argv) {\nentry:\n"
     if (globalNamesIndex.names.size > 0) {
         output = "$output  %global_gc_frame = alloca %AblaRootFrame, align 8\n"
         output = "$output  %global_gc_roots = alloca [${globalNamesIndex.names.size} x ptr], align 8\n"
@@ -2202,22 +2256,18 @@ fun bootstrapEmitLlvmProgram(
     if (bootstrapLlvmNeedsHostRuntime(program)) {
         output = "$output  call void @abla_host_set_arguments(i32 %argc, ptr %argv)\n"
     }
-    if (globalsId >= 0) {
+    if (globalsId >= 0 && exports.size == 0) {
         output = "$output  %global_result = alloca %AblaValue, align 8\n"
         output = "$output  call void @${identities.symbols[globalsId]}(ptr sret(%AblaValue) align 8 %global_result, ptr null, i64 0)\n"
     }
-    if (mainId >= 0) {
         output = "$output  %main_result = alloca %AblaValue, align 8\n"
         output = "$output  call void @${identities.symbols[mainId]}(ptr sret(%AblaValue) align 8 %main_result, ptr null, i64 0)\n"
         output = "$output  %main_status_i64 = call i64 @abla_as_i64(ptr byval(%AblaValue) align 8 %main_result)\n"
         output = "$output  %main_status = trunc i64 %main_status_i64 to i32\n"
         output = "$output  ret i32 %main_status\n"
+        output = "$output}\n"
     }
-    if (mainId < 0) {
-        output = "$output  ret i32 1\n"
-        errors = errors + 1
-    }
-    output = "$output}\n"
+    if (mainId < 0 && exports.size == 0) errors = errors + 1
     BootstrapLlvmEmission(output, errors)
 }
 
