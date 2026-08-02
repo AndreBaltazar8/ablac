@@ -134,4 +134,8 @@ for a stable foreign adapter. The first ABI rung accepts no parameters and a
 `void`, `bool`, or `i64` result in programs without runtime globals. The
 backend emits only the requested C symbol; internal Abla function symbols stay
 hidden. Unsupported signatures fail with `E_EXPORT_SIGNATURE_UNSUPPORTED`
-rather than exposing the internal `%AblaValue` representation.
+rather than exposing the internal `%AblaValue` representation. Successful
+artifacts receive a staged `.abi.json` sidecar describing the target,
+container, exported symbol, scalar representation, value ownership,
+nullability, and the current uncontained-panic contract. Cached objects retain
+and restore the same manifest.

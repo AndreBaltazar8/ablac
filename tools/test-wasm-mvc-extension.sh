@@ -5,6 +5,7 @@ compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/wasm-mvc-extension"
 module="$output_directory/abla-mvc.wasm"
+abi_manifest="$module.abi.json"
 adapter="$output_directory/abla-mvc.js"
 mkdir -p "$output_directory"
 
@@ -16,9 +17,13 @@ build_once() {
 
 build_once
 first_identity=$(sha256sum "$module" | cut -d' ' -f1)
+first_abi_identity=$(sha256sum "$abi_manifest" | cut -d' ' -f1)
+rm -f "$abi_manifest"
 build_once
 second_identity=$(sha256sum "$module" | cut -d' ' -f1)
+second_abi_identity=$(sha256sum "$abi_manifest" | cut -d' ' -f1)
 [[ $first_identity == "$second_identity" ]]
+[[ $first_abi_identity == "$second_abi_identity" ]]
 
 set +e
 "$output_directory/build-driver"
@@ -29,11 +34,18 @@ set -e
 llvm-readobj --file-headers "$module" | grep -q 'Format: WASM'
 llvm-readobj --file-headers "$module" | grep -q 'Arch: wasm32'
 llvm-readobj --symbols "$module" | grep -q 'Name: abla_mvc_revision'
+grep -q '"schema":"abla.abi.v1"' "$abi_manifest"
+grep -q '"name":"wasm32-module"' "$abi_manifest"
+grep -q '"symbol":"abla_mvc_revision"' "$abi_manifest"
+grep -q '"ownership":"value"' "$abi_manifest"
+grep -q '"panic":"not-contained"' "$abi_manifest"
+node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' \
+    "$abi_manifest"
 if llvm-readobj --sections "$module" | grep -q 'Type: IMPORT'; then
     echo "WASM proof unexpectedly requires runtime imports" >&2
     exit 1
 fi
-node - "$module" <<'NODE'
+node --disable-wasm-trap-handler - "$module" <<'NODE'
 const { readFileSync } = require("node:fs");
 WebAssembly.instantiate(readFileSync(process.argv[2]), {}).then(({ instance }) => {
     if (instance.exports.abla_mvc_revision() !== 42n) {

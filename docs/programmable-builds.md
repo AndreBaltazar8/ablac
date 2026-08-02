@@ -74,9 +74,17 @@ remain roadmap work.
 rung. It exports a C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded
 surface accepts zero parameters, no runtime globals, and `void`, `bool`, or
-`i64` results. It is intentionally narrow: byte slices, opaque owned handles,
-callbacks, panic containment, and generated ABI manifests must be specified
-before richer values can cross the boundary.
+`i64` results. Every native artifact now publishes a sibling `.abi.json` after
+successful linking through the staged-output transaction. Schema `abla.abi.v1`
+records the selected target,
+artifact container, foreign symbol, source declaration, parameter list, ABI
+result representation, ownership/nullability, and failure containment status.
+The sidecar is cached with the object and restored on a cache hit. The current
+manifest deliberately says `panic: not-contained`; consumers can reject that
+contract instead of assuming exceptions or traps are isolated. The surface is
+still intentionally narrow: byte slices, opaque owned handles, callbacks, and
+actual panic containment must be implemented before richer values cross the
+boundary.
 
 ## Direction
 

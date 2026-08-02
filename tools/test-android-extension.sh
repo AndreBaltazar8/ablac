@@ -5,6 +5,7 @@ compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/android-extension"
 library="$output_directory/src/main/jniLibs/arm64-v8a/libabla_app.so"
+abi_manifest="$library.abi.json"
 mkdir -p "$output_directory"
 
 build_once() {
@@ -15,9 +16,13 @@ build_once() {
 
 build_once
 first_identity=$(sha256sum "$library" | cut -d' ' -f1)
+first_abi_identity=$(sha256sum "$abi_manifest" | cut -d' ' -f1)
+rm -f "$abi_manifest"
 build_once
 second_identity=$(sha256sum "$library" | cut -d' ' -f1)
+second_abi_identity=$(sha256sum "$abi_manifest" | cut -d' ' -f1)
 [[ $first_identity == "$second_identity" ]]
+[[ $first_abi_identity == "$second_abi_identity" ]]
 
 set +e
 "$output_directory/build-driver"
@@ -28,6 +33,13 @@ set -e
 llvm-readelf -h "$library" | grep -q 'AArch64'
 llvm-readelf -h "$library" | grep -q 'DYN (Shared object file)'
 llvm-nm -D --defined-only "$library" | grep -q ' abla_app_answer$'
+grep -q '"schema":"abla.abi.v1"' "$abi_manifest"
+grep -q '"name":"android-arm64"' "$abi_manifest"
+grep -q '"symbol":"abla_app_answer"' "$abi_manifest"
+grep -q '"ownership":"value"' "$abi_manifest"
+grep -q '"panic":"not-contained"' "$abi_manifest"
+node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' \
+    "$abi_manifest"
 
 header="$output_directory/src/main/cpp/abla-app.h"
 jni="$output_directory/src/main/cpp/abla_jni.c"
