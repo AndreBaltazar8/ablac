@@ -1993,6 +1993,7 @@ fun bootstrapLlvmIndirectDispatcher(
     output = "$output  call void @abla_runtime_roots_push(ptr %indirect_frame, ptr %indirect_roots, i64 %root_count)\n"
     output = "$output  %function_id = call i32 @abla_as_function(ptr byval(%AblaValue) align 8 %function)\n"
     output = "$output  switch i32 %function_id, label %invalid_function [\n"
+    output = "$output    i32 -1, label %foreign_callback\n"
     var functionIndex = 0
     while (functionIndex < program.functions.size) {
         if (addressTaken[functionIndex]) {
@@ -2010,6 +2011,26 @@ fun bootstrapLlvmIndirectDispatcher(
         }
         functionIndex = functionIndex + 1
     }
+    output = "$output\nforeign_callback:\n"
+    output = "$output  %foreign_capture_count_valid = icmp eq i64 %capture_count, 2\n"
+    output = "$output  %foreign_argument_count_valid = icmp eq i64 %count, 1\n"
+    output = "$output  %foreign_signature_valid = and i1 %foreign_capture_count_valid, %foreign_argument_count_valid\n"
+    output = "$output  br i1 %foreign_signature_valid, label %foreign_invoke, label %foreign_invalid\n"
+    output = "$output\nforeign_invoke:\n"
+    output = "$output  %foreign_callback_integer = call i64 @abla_as_i64(ptr byval(%AblaValue) align 8 %merged)\n"
+    output = "$output  %foreign_context_value = getelementptr %AblaValue, ptr %merged, i64 1\n"
+    output = "$output  %foreign_context_integer = call i64 @abla_as_i64(ptr byval(%AblaValue) align 8 %foreign_context_value)\n"
+    output = "$output  %foreign_argument_value = getelementptr %AblaValue, ptr %merged, i64 2\n"
+    output = "$output  %foreign_argument = call i64 @abla_as_i64(ptr byval(%AblaValue) align 8 %foreign_argument_value)\n"
+    output = "$output  %foreign_callback_pointer = inttoptr i64 %foreign_callback_integer to ptr\n"
+    output = "$output  %foreign_context_pointer = inttoptr i64 %foreign_context_integer to ptr\n"
+    output = "$output  %foreign_result = call i64 %foreign_callback_pointer(ptr %foreign_context_pointer, i64 %foreign_argument)\n"
+    output = "$output  call void @abla_i64(ptr sret(%AblaValue) align 8 %out, i64 %foreign_result)\n"
+    output = "$output  br label %indirect_done\n"
+    output = "$output\nforeign_invalid:\n"
+    output = "$output  %foreign_invalid_message = getelementptr [25 x i8], ptr @abla_invalid_foreign_callback, i64 0, i64 0\n"
+    output = "$output  call void @abla_runtime_panic(ptr %foreign_invalid_message, i64 24)\n"
+    output = "$output  unreachable\n"
     output = "$output\ninvalid_function:\n"
     output = "$output  %invalid_message = getelementptr [27 x i8], ptr @abla_invalid_function, i64 0, i64 0\n"
     output = "$output  call void @abla_runtime_panic(ptr %invalid_message, i64 26)\n"
@@ -2048,6 +2069,9 @@ fun bootstrapLlvmExportAdapters(
                 if (parameter > 0) signature = "$signature, "
                 if (request.parameterTypes[parameter] == "string") {
                     signature = "${signature}ptr %argument_${parameter}_data, i64 %argument_${parameter}_length"
+                } else if (request.parameterTypes[parameter] ==
+                    "function:(i64)->i64") {
+                    signature = "${signature}ptr %argument_${parameter}_callback, ptr %argument_${parameter}_context"
                 } else {
                     val parameterType = if (
                         request.parameterTypes[parameter] == "bool"
@@ -2068,6 +2092,30 @@ fun bootstrapLlvmExportAdapters(
                         output = "$output  call void @abla_bool(ptr sret(%AblaValue) align 8 %argument_slot_$parameter, i1 %argument_bool_$parameter)\n"
                     } else if (request.parameterTypes[parameter] == "string") {
                         output = "$output  call void @abla_string_copy(ptr sret(%AblaValue) align 8 %argument_slot_$parameter, ptr %argument_${parameter}_data, i64 %argument_${parameter}_length)\n"
+                    } else if (request.parameterTypes[parameter] ==
+                        "function:(i64)->i64") {
+                        output = "$output  %callback_${parameter}_valid = icmp ne ptr %argument_${parameter}_callback, null\n"
+                        output = "$output  br i1 %callback_${parameter}_valid, label %callback_${parameter}_box, label %callback_${parameter}_invalid\n"
+                        output = "$output\ncallback_${parameter}_invalid:\n"
+                        output = "$output  %callback_${parameter}_invalid_message = getelementptr [25 x i8], ptr @abla_invalid_foreign_callback, i64 0, i64 0\n"
+                        output = "$output  call void @abla_runtime_panic(ptr %callback_${parameter}_invalid_message, i64 24)\n"
+                        output = "$output  unreachable\n"
+                        output = "$output\ncallback_${parameter}_box:\n"
+                        output = "$output  %callback_${parameter}_captures = alloca [2 x %AblaValue], align 8\n"
+                        output = "$output  %callback_${parameter}_function_capture = getelementptr [2 x %AblaValue], ptr %callback_${parameter}_captures, i64 0, i64 0\n"
+                        output = "$output  %callback_${parameter}_context_capture = getelementptr [2 x %AblaValue], ptr %callback_${parameter}_captures, i64 0, i64 1\n"
+                        output = "$output  %callback_${parameter}_function_integer = ptrtoint ptr %argument_${parameter}_callback to i64\n"
+                        output = "$output  %callback_${parameter}_context_integer = ptrtoint ptr %argument_${parameter}_context to i64\n"
+                        output = "$output  call void @abla_i64(ptr sret(%AblaValue) align 8 %callback_${parameter}_function_capture, i64 %callback_${parameter}_function_integer)\n"
+                        output = "$output  call void @abla_i64(ptr sret(%AblaValue) align 8 %callback_${parameter}_context_capture, i64 %callback_${parameter}_context_integer)\n"
+                        output = "$output  %callback_${parameter}_captures_pointer = getelementptr [2 x %AblaValue], ptr %callback_${parameter}_captures, i64 0, i64 0\n"
+                        output = "$output  %callback_${parameter}_captures_integer = ptrtoint ptr %callback_${parameter}_captures_pointer to i64\n"
+                        output = "$output  %callback_${parameter}_payload_function = insertvalue %AblaPayload zeroinitializer, i64 4294967295, 0\n"
+                        output = "$output  %callback_${parameter}_payload_count = insertvalue %AblaPayload %callback_${parameter}_payload_function, i64 2, 1\n"
+                        output = "$output  %callback_${parameter}_payload_captures = insertvalue %AblaPayload %callback_${parameter}_payload_count, i64 %callback_${parameter}_captures_integer, 2\n"
+                        output = "$output  %callback_${parameter}_tagged = insertvalue %AblaValue zeroinitializer, i32 5, 0\n"
+                        output = "$output  %callback_${parameter}_boxed = insertvalue %AblaValue %callback_${parameter}_tagged, %AblaPayload %callback_${parameter}_payload_captures, 1\n"
+                        output = "$output  store %AblaValue %callback_${parameter}_boxed, ptr %argument_slot_$parameter, align 8\n"
                     } else {
                         output = "$output  call void @abla_i64(ptr sret(%AblaValue) align 8 %argument_slot_$parameter, i64 %argument_$parameter)\n"
                     }
@@ -2167,6 +2215,10 @@ fun bootstrapLlvmExportAbi(
                 parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
                     request.parameterNames[parameter]
                 )}\",\"abi\":\"bytes\",\"lowering\":[\"pointer\",\"u64\"],\"ownership\":\"borrowed\",\"calleeAction\":\"copy\",\"nullable\":false,\"nullPointerAllowedWhenEmpty\":true}"
+            } else if (abi == "function:(i64)->i64") {
+                parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
+                    request.parameterNames[parameter]
+                )}\",\"abi\":\"callback\",\"callingConvention\":\"c\",\"lowering\":[\"function-pointer\",\"context-pointer\"],\"signature\":{\"parameters\":[\"i64\"],\"result\":\"i64\"},\"ownership\":\"borrowed\",\"lifetime\":\"call\",\"retention\":\"forbidden\",\"invocation\":\"synchronous\",\"callbackNullable\":false,\"contextNullable\":true,\"unwind\":\"forbidden\"}"
             } else {
                 parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
                     request.parameterNames[parameter]
@@ -2220,7 +2272,7 @@ fun bootstrapEmitLlvmProgram(
     var errors = program.errors + identities.collisions +
         bootstrapLlvmStableNameCollisions(classNamesIndex.names) +
         bootstrapLlvmStableNameCollisions(fieldNamesIndex.names)
-    output = "$output@abla_invalid_function = private unnamed_addr constant [27 x i8] c\"invalid function reference\\00\", align 1\n@abla_non_exhaustive_when = private unnamed_addr constant [20 x i8] c\"non-exhaustive when\\00\", align 1\n"
+    output = "$output@abla_invalid_function = private unnamed_addr constant [27 x i8] c\"invalid function reference\\00\", align 1\n@abla_invalid_foreign_callback = private unnamed_addr constant [25 x i8] c\"invalid foreign callback\\00\", align 1\n@abla_non_exhaustive_when = private unnamed_addr constant [20 x i8] c\"non-exhaustive when\\00\", align 1\n"
 
     var stringFunction = 0
     while (stringFunction < program.functions.size) {

@@ -734,6 +734,14 @@ the caller retains and may immediately reuse or release its buffer after the
 call. The ABI manifest records `ownership: borrowed` and
 `calleeAction: copy`.
 
+An exported `(int) -> int` callback parameter lowers to a C callback taking an
+explicit context pointer followed by `int64_t`. It is borrowed synchronously
+for that exported call. The Abla function may invoke it directly, but export
+validation rejects storing, returning, capturing, or forwarding it, so the
+foreign pointer cannot outlive its caller-owned context. The manifest records
+the callback signature, C calling convention, call lifetime, forbidden
+retention, and the requirement that it not unwind across the ABI.
+
 An exported `string` result is copied into an opaque foreign handle rather than
 leaking the tracked `%AblaValue` or an interior runtime pointer. Callers inspect
 it through the manifest-named data/length functions and must call the release

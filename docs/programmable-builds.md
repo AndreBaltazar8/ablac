@@ -73,8 +73,9 @@ remain roadmap work.
 `compilerExportFunction(handle, name)` provides the first stable foreign ABI
 rung. It exports a C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded
-surface accepts up to 16 value `bool`/`i64` or borrowed `string` parameters,
-no runtime globals, and `void`, `bool`, `i64`, or owned `string` results. Adapters box scalars
+surface accepts up to 16 value `bool`/`i64`, borrowed `string`, or direct
+non-escaping `(i64) -> i64` callback parameters, no runtime globals, and
+`void`, `bool`, `i64`, or owned `string` results. Adapters box scalars
 without exposing `%AblaValue`. A string lowers to a pointer/`u64` byte slice;
 the adapter accepts null only for an empty slice, copies the exact bytes into
 tracked Abla-owned storage, and adds its own terminator before calling user
@@ -93,7 +94,12 @@ foreign handle. The manifest names `abla_owned_bytes_data`,
 `abla_owned_bytes_release`, and declares validity until release. This first
 handle implementation is limited to libc-backed targets; libc-free WASM fails
 with a target-capability diagnostic instead of importing an undeclared
-allocator. Typed class handles, callbacks, and actual panic containment remain.
+allocator. A callback lowers to a C function pointer plus an explicit context
+pointer. It is synchronously borrowed for the exported call, may be invoked
+directly by that function, and may not be stored, returned, captured, or passed
+on; export validation rejects those escape shapes. The manifest records the C
+calling convention, scalar signature, call lifetime, forbidden retention, and
+forbidden unwind. Typed class handles and actual panic containment remain.
 
 ## Direction
 

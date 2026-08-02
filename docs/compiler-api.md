@@ -130,14 +130,19 @@ archive, or no-entry module through `wasm-ld`. Platform packages such as
 policy.
 
 `compilerExportFunction(handle, name)` marks one resolved top-level function
-for a stable foreign adapter. The ABI rung accepts up to 16 value `bool`/`i64`
-or borrowed `string` parameters and a `void`, `bool`, `i64`, or owned `string`
-result in programs without runtime globals. A foreign string lowers to
+for a stable foreign adapter. The ABI rung accepts up to 16 value `bool`/`i64`,
+borrowed `string`, or direct non-escaping `(i64) -> i64` callback parameters
+and a `void`, `bool`, `i64`, or owned `string` result in programs without
+runtime globals. A foreign string lowers to
 `(pointer, u64)`;
 the adapter validates it and copies its exact bytes into tracked Abla-owned
-storage before invoking user code. Empty input permits a null pointer. The
-backend emits only the requested C symbol; internal Abla function symbols stay
-hidden. A string result becomes a non-null opaque owned-bytes handle with
+storage before invoking user code. Empty input permits a null pointer. A
+callback lowers to a C function pointer plus context pointer and is
+synchronously borrowed for the exported call. It may be called directly but
+not stored, returned, captured, or forwarded; export validation rejects a
+source use that could escape that lifetime. The callback must return normally.
+The backend emits only the requested C symbol; internal Abla function symbols
+stay hidden. A string result becomes a non-null opaque owned-bytes handle with
 generated data/length accessors and an exactly-once release operation. This
 first handle runtime requires a libc-backed target; libc-free targets reject it
 with `E_EXPORT_TARGET_CAPABILITY` until their extension supplies a compatible

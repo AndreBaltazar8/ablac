@@ -10,9 +10,20 @@ extern void *abla_app_echo_bytes(const uint8_t *data, uint64_t length);
 extern const uint8_t *abla_owned_bytes_data(void *handle);
 extern uint64_t abla_owned_bytes_length(void *handle);
 extern void abla_owned_bytes_release(void *handle);
+typedef int64_t (*abla_i64_callback)(void *context, int64_t value);
+extern int64_t abla_app_invoke(
+    abla_i64_callback callback,
+    void *context,
+    int64_t value
+);
+
+static int64_t add_context(void *context, int64_t value) {
+    return *(const int64_t *)context + value;
+}
 
 int main(void) {
     const uint8_t bytes[] = {39, 0, 255};
+    const int64_t context = 19;
     void *echo = abla_app_echo_bytes(bytes, 3);
     int valid = echo != NULL &&
         abla_owned_bytes_length(echo) == 3 &&
@@ -21,5 +32,6 @@ int main(void) {
     return valid && abla_app_answer() == 42 &&
         abla_app_add(19, 23) == 42 &&
         abla_app_bytes_score(bytes, 3) == 42 &&
-        abla_app_bytes_length(NULL, 0) == 0 ? 0 : 1;
+        abla_app_bytes_length(NULL, 0) == 0 &&
+        abla_app_invoke(add_context, (void *)&context, 23) == 42 ? 0 : 1;
 }

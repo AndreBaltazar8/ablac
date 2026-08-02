@@ -53,6 +53,8 @@ llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_echo_bytes$'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_invoke$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_owned_bytes_release$'
 grep -q '"symbol":"abla_app_add"' \
     "$output_directory/libabla_app.so.abi.json"
@@ -67,6 +69,10 @@ grep -q 'call void @abla_string_copy.*%argument_0_data.*%argument_0_length' \
 grep -q '"abi":"owned-bytes-handle","ownership":"owned"' \
     "$output_directory/libabla_app.so.abi.json"
 grep -q '"release":"abla_owned_bytes_release","releaseExactlyOnce":true' \
+    "$output_directory/libabla_app.so.abi.json"
+grep -q '"abi":"callback","callingConvention":"c","lowering":\["function-pointer","context-pointer"\]' \
+    "$output_directory/libabla_app.so.abi.json"
+grep -q '"lifetime":"call","retention":"forbidden","invocation":"synchronous"' \
     "$output_directory/libabla_app.so.abi.json"
 if llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_fn_'; then
@@ -118,10 +124,19 @@ set +e
     --fast --no-cache >"$output_directory/invalid-export.out" \
     2>"$output_directory/invalid-export.err"
 invalid_export_status=$?
+"$compiler" build \
+    "$project_root/tests/cases/program-build/invalid-callback-export.ab" \
+    --emit shared-library -o "$output_directory/invalid-callback-export.so" \
+    --fast --no-cache >"$output_directory/invalid-callback-export.out" \
+    2>"$output_directory/invalid-callback-export.err"
+invalid_callback_export_status=$?
 set -e
 [[ $invalid_export_status -ne 0 ]]
 grep -q 'error\[E_EXPORT_SIGNATURE_UNSUPPORTED\]' \
     "$output_directory/invalid-export.err"
+[[ $invalid_callback_export_status -ne 0 ]]
+grep -q 'error\[E_EXPORT_SIGNATURE_UNSUPPORTED\]' \
+    "$output_directory/invalid-callback-export.err"
 
 set +e
 "$compiler" --emit-llvm \
