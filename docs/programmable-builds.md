@@ -43,7 +43,7 @@ instead of silently dropping requests or leaving process-private request data.
 
 The built-in hosted Linux target can emit `executable`, `object`,
 `static-library`, and `shared-library` nodes. The raw Linux target remains
-executable-only. Build libraries may also register bounded ELF target
+executable-only. Build libraries may also register bounded ELF or WebAssembly target
 descriptors with `defineTarget`: a name, LLVM triple, linker flavor/emulation,
 and generic hosted/libc-free capabilities. Target descriptions are part of
 the native cache identity. They are limited to 16 per compile-time evaluation
@@ -59,6 +59,16 @@ machine/type and dynamic symbol table and checks byte-identical repeated
 output. Cross-target fast builds still run bounded O1/global-DCE before LLVM
 target lowering so dead host-runtime details cannot invalidate another
 architecture.
+
+`abla/wasm/build` owns the format-level `wasm32-unknown-unknown` descriptor and
+requests a generic `module` artifact. `abla/mvc/wasm/build` composes it with an
+extension-generated JavaScript loader. Its proof module exports only the stable
+`abla_mvc_revision` adapter, carries no runtime imports, and is byte-identical
+across repeated cached builds. The compiler contains WebAssembly object/linker
+support, but no fetch, JavaScript, browser, DOM, rendering, or MVC policy. LLD
+name/debug metadata is stripped from the deployable module because its
+transactional temporary filename is nondeterministic; explicit debug sidecars
+remain roadmap work.
 
 `compilerExportFunction(handle, name)` provides the first stable foreign ABI
 rung. It exports a C-identifier symbol for a resolved top-level function while
@@ -86,11 +96,12 @@ descriptors for:
 The Android proof now uses only those facilities. It intentionally stops at a
 single arm64 library and generated integration skeleton: Android SDK discovery,
 APK packaging, signing, manifests, resources, additional ABIs, and application
-policy remain extension/toolchain work. A WASM/MVC extension should use the
-same facilities to request a browser module and generate its host adapter.
-Neither workflow belongs in `ablac` itself.
+policy remain extension/toolchain work. The WASM/MVC proof likewise stops at a
+scalar exported module and thin host loader; typed model/state exchange, DOM or
+canvas renderers, hydration, callbacks, error containment, and bundler policy
+remain library work. Neither workflow belongs in `ablac` itself.
 
 `#import("abla/build")` is the first ordinary library façade over these
 compiler services. Its `buildProgram`, `defineTarget`, and `exportFunction`
-helpers contain no platform policy; Android and browser extensions can wrap or
-replace them with their own typed descriptors and generated artifacts.
+helpers contain no platform policy; Android and WASM/MVC extensions wrap them
+with their own typed descriptors and generated artifacts.

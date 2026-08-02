@@ -110,9 +110,11 @@ most 32 nodes, and the recursively expanded graph is capped at 64 nodes.
 This is a general compiler-service primitive. Android, WASM, MVC, UI, RPC, and
 packaging policy belong to libraries that construct nodes and emit sidecars,
 not to the frontend. The hosted Linux toolchain supports executable, object,
-static-library, and shared-library artifacts; stable exported adapters remain
-separate from those containers. See `docs/programmable-builds.md` for the ABI,
-target-description, and transactional build-graph roadmap.
+static-library, and shared-library artifacts. Extension-defined WebAssembly
+targets additionally use the generic `module` artifact; stable exported
+adapters remain separate from those containers. See
+`docs/programmable-builds.md` for the ABI, target-description, and
+transactional build-graph roadmap.
 
 `compilerDefineTarget(name, llvmTriple, objectFormat, linkerFlavor,
 linkerEmulation, hosted, libcFree)` registers an extension-owned target for the
@@ -122,8 +124,10 @@ or direct LLD for non-hosted, libc-backed targets. The latter may emit object,
 static-library, and shared-library artifacts but require extension-provided
 runtime/startup support before libc-free targets or executables. Descriptors
 are graph-scoped, deterministic, duplicate-checked, and included in cache
-identities. Platform packages such as
-`abla/android/build` own concrete triples and integration policy.
+identities. A non-hosted libc-free WebAssembly descriptor may emit an object,
+archive, or no-entry module through `wasm-ld`. Platform packages such as
+`abla/android/build` and `abla/wasm/build` own concrete triples and integration
+policy.
 
 `compilerExportFunction(handle, name)` marks one resolved top-level function
 for a stable foreign adapter. The first ABI rung accepts no parameters and a

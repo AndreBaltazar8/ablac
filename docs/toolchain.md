@@ -21,6 +21,10 @@ typed IR, emits LLVM objects, and links the requested executable or library.
 artifact container; executable remains the default. Libraries without `main`
 must explicitly publish at least one supported foreign adapter through the
 compiler API; internal Abla symbols remain hidden.
+Programmable external targets can additionally request a generic `module`
+artifact. The current WebAssembly linker produces a no-entry module, preserves
+explicit foreign exports, and strips PID-bearing name metadata for byte-level
+reproducibility.
 The default release profile runs the deterministic `default<O2>,globaldce`
 pipeline. Hosted `--fast` skips whole-module optimization and selects LLVM's
 low-latency code generator for edit/build cycles. External cross targets run a
@@ -56,8 +60,8 @@ the versioned compiler API. After the root succeeds, `build` drains the bounded
 graph in declaration order; a requested program may add further nodes. This
 mechanism is target- and framework-neutral—the compiler executes program,
 artifact, and bounded external-target requests, while libraries own Android,
-WASM, MVC, RPC, or packaging policy. The Android arm64 shared-library proof and
-remaining transaction/ABI work are documented in
+WASM, MVC, RPC, or packaging policy. The Android arm64 shared-library and
+WASM/MVC module proofs plus remaining transaction/ABI work are documented in
 `docs/programmable-builds.md`.
 
 Long-lived builds additionally retain a module snapshot store in pure Abla.

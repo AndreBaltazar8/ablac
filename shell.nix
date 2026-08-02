@@ -14,6 +14,7 @@ pkgs.mkShell {
     llvmPackages.llvm
     llvmPackages.clang
     llvmPackages.lld
+    nodejs
   ];
 
   shellHook = ''

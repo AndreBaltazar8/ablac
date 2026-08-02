@@ -22,6 +22,8 @@ unrelated policy or compiler machinery into the program:
 | `abla/compiler/*` | compile-time parser/reflection APIs only |
 | `abla/build` | framework-neutral compile-time program and export requests |
 | `abla/android/build` | Android-owned arm64 target, `libabla_app.so` request, and generated JNI/Kotlin/CMake/Gradle integration |
+| `abla/wasm/build` | WebAssembly-owned wasm32 target and no-entry module request |
+| `abla/mvc/wasm/build` | MVC composition that generates a thin browser loader around the WASM module |
 | `abla/unsafe/memory` | internal trusted native boundary plus checked pointer cells/buffers; retained at this legacy import path while typed resource modules stabilize |
 | `abla/sys/linux` | opt-in raw x86-64 Linux syscall and native descriptor APIs |
 | `abla/sys/linux/fs` | raw-kernel `Path`, metadata, atomic writes, entries, and watches |

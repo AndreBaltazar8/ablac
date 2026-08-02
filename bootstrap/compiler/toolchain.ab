@@ -60,12 +60,13 @@ fun bootstrapDefinedTargetDescriptor(
     "",
     target.linkerFlavor,
     target.linkerEmulation,
-    target.objectFormat == "elf" &&
-        !target.libcFree &&
-        ((target.hosted &&
-          target.llvmTriple == "x86_64-unknown-linux-gnu" &&
-          target.linkerFlavor == "host-clang") ||
-         (!target.hosted && target.linkerFlavor == "lld-elf"))
+    ((target.objectFormat == "elf" && !target.libcFree &&
+      ((target.hosted &&
+        target.llvmTriple == "x86_64-unknown-linux-gnu" &&
+        target.linkerFlavor == "host-clang") ||
+       (!target.hosted && target.linkerFlavor == "lld-elf"))) ||
+     (target.objectFormat == "wasm" && !target.hosted &&
+      target.libcFree && target.linkerFlavor == "wasm-ld"))
 )
 
 fun bootstrapSupportedTargets(): string =
@@ -565,7 +566,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     target: BootstrapTargetDescriptor,
     artifact: string
 ): BootstrapNativeBuild {
-    val rawTarget = target.libcFree
+    // A libc-free target is not necessarily the built-in raw Linux process.
+    // An entry symbol identifies the latter; external module formats provide
+    // their own loader/runtime contract and must not receive the Linux startup.
+    val rawTarget = target.libcFree && target.entrySymbol.size > 0
     bootstrapBeginCompileOutputs()
     val modules: array<BootstrapModule> = []
     moduleState.beginBuild()
@@ -716,9 +720,18 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (status == 0 && artifact != "executable" &&
         artifact != "object" && artifact != "static-library" &&
-        artifact != "shared-library") {
+        artifact != "shared-library" && artifact != "module") {
         linuxPrintStandardError(
-            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: unsupported artifact '$artifact'; supported artifacts: executable, object, static-library, shared-library\n"
+            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: unsupported artifact '$artifact'; supported artifacts: executable, object, static-library, shared-library, module\n"
+        )
+        status = 147
+    }
+    if (status == 0 &&
+        ((target.objectFormat == "wasm" && artifact != "object" &&
+          artifact != "static-library" && artifact != "module") ||
+         (target.objectFormat != "wasm" && artifact == "module"))) {
+        linuxPrintStandardError(
+            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target '${target.name}' cannot emit artifact '$artifact'\n"
         )
         status = 147
     }
@@ -856,6 +869,21 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkShared.argument("-o")
         linkShared.argument(publishPath)
         status = linkShared.run()
+    }
+    if (status == 0 && target.objectFormat == "wasm" &&
+        artifact == "module") {
+        val linkModule = linuxCommand("wasm-ld")
+        linkModule.argument("--no-entry")
+        linkModule.argument("--gc-sections")
+        linkModule.argument("--export-dynamic")
+        // LLD otherwise records the transactional PID-bearing output name in
+        // the custom name section. Debug/name data belongs in an explicit
+        // sidecar; the published module must be byte reproducible.
+        linkModule.argument("--strip-all")
+        linkModule.argument(objectPath)
+        linkModule.argument("-o")
+        linkModule.argument(publishPath)
+        status = linkModule.run()
     }
     if (status == 0) {
         if (!Path(publishPath).moveTo(Path(outputPath))) status = 143
