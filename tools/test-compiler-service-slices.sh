@@ -5,7 +5,12 @@ compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/artifact-slice"
 module="$output_directory/client.wasm"
+stateful_output_directory="$project_root/build/artifact-slice-stateful"
+stateful_module="$stateful_output_directory/client.wasm"
+stateful_fail_output="$stateful_output_directory/fail"
 mkdir -p "$output_directory"
+mkdir -p "$stateful_output_directory"
+mkdir -p "$stateful_fail_output"
 
 set +e
 "$compiler" run \
@@ -39,6 +44,12 @@ build_slice() {
         -o "$output_directory/server" --fast --no-cache
 }
 
+build_stateful_slice() {
+    "$compiler" build \
+        "$project_root/tests/cases/program-build/artifact-slice-stateful-root.ab" \
+        -o "$stateful_output_directory/server" --fast --no-cache
+}
+
 build_slice
 first_identity=$(sha256sum "$module" | cut -d' ' -f1)
 build_slice
@@ -69,5 +80,60 @@ WebAssembly.instantiate(readFileSync(process.argv[2]), {}).then(({ instance }) =
     }
 });
 NODE
+
+build_stateful_slice
+stateful_first_identity=$(sha256sum "$stateful_module" | cut -d' ' -f1)
+build_stateful_slice
+stateful_second_identity=$(sha256sum "$stateful_module" | cut -d' ' -f1)
+[[ $stateful_first_identity == "$stateful_second_identity" ]]
+
+llvm-readobj --symbols "$stateful_module" | grep -q 'Name: client_increment'
+llvm-readobj --symbols "$stateful_module" | grep -q 'Name: client_double'
+if llvm-readobj --symbols "$stateful_module" | \
+    grep -Eq 'Name: (unselectedStatefulClient|invalidStatefulClient|serverAction|serverSessions|serverAction)'; then
+    echo "unselected/unrelated declaration escaped the stateful artifact slice ABI" >&2
+    exit 1
+fi
+if [[ $(grep -o '"symbol":"client_increment"' "$stateful_module.abi.json" | wc -l | awk '{ print $1 }') -ne 1 ]]; then
+    echo "stateful export was duplicated in ABI manifest" >&2
+    exit 1
+fi
+if [[ $(grep -o '"symbol":"client_double"' "$stateful_module.abi.json" | wc -l | awk '{ print $1 }') -ne 1 ]]; then
+    echo "stateful export was duplicated in ABI manifest" >&2
+    exit 1
+fi
+if grep -q '"symbol":"unselectedStatefulClient"' "$stateful_module.abi.json"; then
+    echo "unselected stateful client escaped the artifact slice ABI" >&2
+    exit 1
+fi
+
+node --disable-wasm-trap-handler - "$stateful_module" <<'NODE'
+const { readFileSync } = require("node:fs");
+WebAssembly.instantiate(readFileSync(process.argv[2]), {}).then(({ instance }) => {
+    if (instance.exports.client_increment(40n) !== 41n) {
+        throw new Error("unexpected selected client increment");
+    }
+    if (instance.exports.client_double(21n) !== 44n) {
+        throw new Error("unexpected aggregated client double");
+    }
+});
+NODE
+
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/program-build/artifact-slice-stateful-root-invalid.ab" \
+    -o "$stateful_fail_output/server" --fast --no-cache \
+    >"$stateful_output_directory/stateful-invalid.out" \
+    2>"$stateful_output_directory/stateful-invalid.err"
+invalid_stateful_status=$?
+set -e
+[[ $invalid_stateful_status -ne 0 ]]
+grep -q 'error[E_ARTIFACT_SLICE_REACHABILITY]' \
+    "$stateful_output_directory/stateful-invalid.err"
+if grep -q 'error[E_EXPORT_SIGNATURE_UNSUPPORTED]' \
+    "$stateful_output_directory/stateful-invalid.err"; then
+    echo "stateful reachability failure regressed to generic export signature error" >&2
+    exit 1
+fi
 
 echo "compiler service: annotations + validated self-transform + aggregated wasm artifact slices passed"

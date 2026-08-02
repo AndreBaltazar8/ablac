@@ -82,22 +82,33 @@ fun bootstrapStageArtifactRootRequest(
         request.functionName.size > 0 && request.functionName.size <= 128
     val root = bootstrapArtifactRootRequestRoot()
     var index = 0
+    var duplicate = false
     while (valid && index < bootstrapArtifactRootRequestCount) {
         val sameArtifact = Path("$root/$index.name").readText() ==
             request.name
-        if (sameArtifact &&
-            (Path("$root/$index.target").readText() != request.target ||
-             Path("$root/$index.artifact").readText() != request.artifact ||
-             Path("$root/$index.output").readText() != request.output ||
-             Path("$root/$index.fast").readText() !=
-                (if (request.fast) "1" else "0") ||
-             Path("$root/$index.cache").readText() !=
-                (if (request.cache) "1" else "0"))) valid = false
-        if (Path("$root/$index.export").readText() == request.exportName ||
-            Path("$root/$index.function").readText() ==
-                request.functionName) valid = false
+        val sameArtifactSettings = sameArtifact &&
+            Path("$root/$index.target").readText() == request.target &&
+            Path("$root/$index.artifact").readText() == request.artifact &&
+            Path("$root/$index.output").readText() == request.output &&
+            Path("$root/$index.fast").readText() ==
+                (if (request.fast) "1" else "0") &&
+            Path("$root/$index.cache").readText() ==
+                (if (request.cache) "1" else "0")
+        val existingFunction = Path("$root/$index.function").readText()
+        val existingExport = Path("$root/$index.export").readText()
+        if (sameArtifact && sameArtifactSettings &&
+            existingFunction == request.functionName &&
+            existingExport == request.exportName) {
+            duplicate = true
+            valid = false
+        }
+        if (sameArtifact && sameArtifactSettings && (
+            existingFunction == request.functionName ||
+            existingExport == request.exportName)) valid = false
+        if (sameArtifact && !sameArtifactSettings) valid = false
         index = index + 1
     }
+    if (duplicate) return true
     if (valid) valid = Path(root).createDirectories()
     val requestIndex = bootstrapArtifactRootRequestCount
     if (valid) valid = Path("$root/$requestIndex.name").writeTextAtomic(
@@ -2032,6 +2043,156 @@ class BootstrapEvaluator(
         }
     }
 
+    fun declarationIndexByName(name: string): int {
+        var result = -1
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            if (this.declarations[declaration].name == name) {
+                result = declaration
+            }
+            declaration = declaration + 1
+        }
+        result
+    }
+
+    fun nameArrayContains(values: array<string>, value: string): bool {
+        var found = false
+        var index = 0
+        while (index < values.size) {
+            if (values[index] == value) found = true
+            index = index + 1
+        }
+        found
+    }
+
+    fun intArrayContains(values: array<int>, value: int): bool {
+        var found = false
+        var index = 0
+        while (index < values.size) {
+            if (values[index] == value) found = true
+            index = index + 1
+        }
+        found
+    }
+
+    fun intArrayAppendUnique(var values: array<int>, value: int): void {
+        if (!this.intArrayContains(values, value)) values.append(value)
+    }
+
+    fun sliceCollectReferencedDeclarations(
+        expression: BootstrapExpression,
+        var bound: array<string>,
+        var references: array<int>
+    ): void {
+        var processChildren = true
+        if (expression.kind == "local.val" ||
+            expression.kind == "local.var") {
+            processChildren = false
+            if (expression.children.size > 0) {
+                this.sliceCollectReferencedDeclarations(
+                    expression.children[0],
+                    bound,
+                    references
+                )
+                if (expression.children.size > 1) {
+                    this.sliceCollectReferencedDeclarations(
+                        expression.children[1],
+                        bound,
+                        references
+                    )
+                }
+            }
+            this.appendUniqueName(bound, expression.text)
+        }
+        if (expression.kind == "lambda" ||
+            expression.kind == "lambda.move") {
+            processChildren = false
+            val nested: array<string> = []
+            var inherited = 0
+            while (inherited < bound.size) {
+                nested.append(bound[inherited])
+                inherited = inherited + 1
+            }
+            var parameter = 0
+            while (parameter + 1 < expression.children.size) {
+                nested.append(expression.children[parameter].text)
+                parameter = parameter + 1
+            }
+            val body = expression.children[expression.children.size - 1]
+            this.collectLambdaLocals(body, nested)
+            this.sliceCollectReferencedDeclarations(body, nested, references)
+        }
+        if ((expression.kind == "identifier" &&
+             !this.nameIsBound(bound, expression.text)) ||
+            (expression.kind == "call" &&
+             !this.nameIsBound(bound, expression.text)) ||
+            (expression.kind == "assign" &&
+             !this.nameIsBound(bound, expression.text))) {
+            val declaration = this.declarationIndexByName(expression.text)
+            if (declaration >= 0 && declaration < this.declarations.size) {
+                this.intArrayAppendUnique(
+                    references,
+                    declaration
+                )
+            }
+        }
+        if (processChildren) {
+            var child = 0
+            while (child < expression.children.size) {
+                this.sliceCollectReferencedDeclarations(
+                    expression.children[child],
+                    bound,
+                    references
+                )
+                child = child + 1
+            }
+        }
+    }
+
+    fun slicePathFromReachableUnsupported(
+        declaration: int,
+        var seen: array<int>,
+        path: string
+    ): string {
+        if (declaration < 0 || declaration >= this.declarations.size ||
+            this.intArrayContains(seen, declaration)) return ""
+        seen.append(declaration)
+        val root = this.declarations[declaration]
+        if (root.kind == "var") return "$path -> ${root.name}"
+        if (root.kind == "val" && root.expression.kind != "compile") {
+            return "$path -> ${root.name}"
+        }
+        val references: array<int> = []
+        var bound: array<string> = []
+        if (root.kind == "fun" || root.kind == "compile.fun") {
+            var parameter = 0
+            while (parameter < root.parameters.size) {
+                bound.append(root.parameters[parameter])
+                parameter = parameter + 1
+            }
+        }
+        if (root.kind == "fun" || root.kind == "compile.fun" ||
+            root.kind == "val") {
+            this.sliceCollectReferencedDeclarations(
+                root.expression,
+                bound,
+                references
+            )
+        }
+        var dependency = 0
+        while (dependency < references.size) {
+            val handle = references[dependency]
+            val next = this.slicePathFromReachableUnsupported(
+                handle,
+                seen,
+                "$path -> ${this.declarations[handle].name}"
+            )
+            if (next != "") return next
+            dependency = dependency + 1
+        }
+        ""
+    }
+
     fun lambdaMutatesCapturedPlace(
         expression: BootstrapExpression,
         bound: array<string>
@@ -2832,7 +2993,20 @@ class BootstrapEvaluator(
                 }
             }
             var declarationIndex = 0
-            while (valid && declarationIndex < this.declarations.size) {
+            var declarationPath = ""
+            if (bootstrapArtifactSliceActive) {
+                val path = this.slicePathFromReachableUnsupported(
+                    reflected.integer,
+                    [],
+                    this.declarations[reflected.integer].name
+                )
+                if (path != "") {
+                    declarationPath = path
+                    valid = false
+                }
+            }
+            while (valid && declarationPath == "" &&
+                   declarationIndex < this.declarations.size) {
                 val declaration = this.declarations[declarationIndex]
                 if (declaration.kind == "var" ||
                     (declaration.kind == "val" &&
@@ -2852,9 +3026,15 @@ class BootstrapEvaluator(
             if (valid) {
                 result = bootstrapEvalBoolean(true)
             } else {
-                bootstrapStageDriverDiagnostic(
-                    "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: compilerExportFunction rejected $reflectedKind handle ${reflected.integer} (declaration `$declarationKind`, source `$source`, result `$resultType`, export `${exportName.text}`); it requires a unique non-reserved C identifier and a top-level function with at most 16 value bool/i64, copied borrowed-string, or direct non-escaping (i64)->i64 callback parameters, returning void, bool, i64, or owned string, without mutable or runtime-initialized globals\n"
-                )
+                if (declarationPath == "") {
+                    bootstrapStageDriverDiagnostic(
+                        "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: compilerExportFunction rejected $reflectedKind handle ${reflected.integer} (declaration `$declarationKind`, source `$source`, result `$resultType`, export `${exportName.text}`); it requires a unique non-reserved C identifier and a top-level function with at most 16 value bool/i64, copied borrowed-string, or direct non-escaping (i64)->i64 callback parameters, returning void, bool, i64, or owned string, without mutable or runtime-initialized globals\n"
+                    )
+                } else {
+                    bootstrapStageDriverDiagnostic(
+                        "error[E_ARTIFACT_SLICE_REACHABILITY]: compilerExportFunction rejected $reflectedKind handle ${reflected.integer} (declaration `$declarationKind`, source `$source`, result `$resultType`, export `${exportName.text}`); selected root `${source}` cannot be included because it reaches unsupported declaration `${declarationPath}`\n"
+                    )
+                }
                 this.errors = this.errors + 1
                 result = bootstrapEvalBoolean(false)
             }
