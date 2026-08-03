@@ -170,15 +170,19 @@ fun httpStatusReason(status: int): string {
     reason
 }
 
-fun HttpResponse.render(): string {
+fun HttpResponse.renderHeaders(): string {
     var output = "HTTP/1.1 ${this.status} ${httpStatusReason(this.status)}\r\n"
     var index = 0
     while (index < this.headers.size) {
         output = "$output${this.headers[index].name}: ${this.headers[index].value}\r\n"
         index = index + 1
     }
-    "${output}Content-Length: ${this.body.size}\r\nConnection: close\r\n\r\n${this.body}"
+    "${output}Content-Length: ${this.body.size}\r\nConnection: close\r\n"
 }
+
+fun HttpResponse.render(): string = "${this.renderHeaders()}\r\n${this.body}"
+
+fun HttpResponse.renderHead(): string = "${this.renderHeaders()}\r\n"
 
 fun HttpRequest.renderForClient(authority: string): string {
     var target = this.path
@@ -553,6 +557,14 @@ fun HttpRouter.post(
     this
 }
 
+fun HttpRouter.head(
+    pattern: string,
+    handler: (HttpRequest) -> HttpResponse
+): HttpRouter {
+    this.routes.append(HttpRoute("HEAD", pattern, "", handler))
+    this
+}
+
 fun HttpRouter.version(versionName: string): HttpVersionedRouter =
     HttpVersionedRouter(this, versionName)
 
@@ -572,25 +584,42 @@ fun HttpVersionedRouter.post(
     this.router
 }
 
+fun HttpVersionedRouter.head(
+    pattern: string,
+    handler: (HttpRequest) -> HttpResponse
+): HttpRouter {
+    this.router.routes.append(HttpRoute("HEAD", pattern, this.version, handler))
+    this.router
+}
+
 fun HttpRouter.dispatch(request: HttpRequest): HttpResponse {
     val requestedVersion = request.header(this.versionHeader)
     var selected = -1
     var selectedVersion = ""
     var selectedMatch = HttpPathMatch(false, [], [])
+    var selectedExactMethod = false
     var index = 0
     while (index < this.routes.size) {
         val route = this.routes[index]
         val match = httpMatchPath(route.pattern, request.path)
-        var eligible = route.method == request.method && match.matched
+        val exactMethod = route.method == request.method
+        val headFallback = request.method == "HEAD" && route.method == "GET"
+        var eligible = (exactMethod || headFallback) && match.matched
         if (eligible && requestedVersion != "" && route.version != "" &&
             httpVersionCompare(route.version, requestedVersion) > 0) {
             eligible = false
         }
-        if (eligible && (selected < 0 ||
-            httpVersionCompare(route.version, selectedVersion) > 0)) {
+        val versionComparison = httpVersionCompare(
+            route.version,
+            selectedVersion
+        )
+        if (eligible && (selected < 0 || versionComparison > 0 ||
+            (versionComparison == 0 && exactMethod &&
+                !selectedExactMethod))) {
             selected = index
             selectedVersion = route.version
             selectedMatch = match
+            selectedExactMethod = exactMethod
         }
         index = index + 1
     }
@@ -614,8 +643,10 @@ fun HttpRouter.dispatch(request: HttpRequest): HttpResponse {
 fun serveHttpOnce(router: HttpRouter, var listener: TcpListener): int {
     val connection = listener.accept()
     val request = httpParseRequest(httpReadRequest(connection))
-    val response = router.dispatch(request).render()
-    val written = connection.write(response)
+    val response = router.dispatch(request)
+    var rendered = response.render()
+    if (request.method == "HEAD") rendered = response.renderHead()
+    val written = connection.write(rendered)
     connection.close()
     written
 }
@@ -631,8 +662,10 @@ fun serveHttpOnListener(router: HttpRouter, var listener: TcpListener): int {
         val connection = listener.acceptUntilShutdown()
         if (connection.descriptor >= 0) {
             val request = httpParseRequest(httpReadRequest(connection))
-            val response = router.dispatch(request).render()
-            connection.write(response)
+            val response = router.dispatch(request)
+            var rendered = response.render()
+            if (request.method == "HEAD") rendered = response.renderHead()
+            connection.write(rendered)
             connection.close()
         }
     }
