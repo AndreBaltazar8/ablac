@@ -207,7 +207,8 @@ fun bootstrapAppendArtifactSlices(
             emittedIndex = emittedIndex + 1
         }
         if (!alreadyEmitted) {
-            var source = "#import(\"$importedSource\")\n#import(\"abla/compiler\")\ncompile fun __abla_export_slice(): void {\n"
+            val importMarker = "#"
+            var source = "${importMarker}import(\"$importedSource\")\n${importMarker}import(\"abla/compiler\")\ncompile fun __abla_export_slice(): void {\n"
             var contribution = 0
             val contributionKeys: array<string> = []
             while (contribution < roots.size) {
@@ -511,7 +512,7 @@ fun bootstrapRepl(): int {
 
 fun bootstrapOrcUsage(): int {
     linuxPrintStandardError(
-        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast] [--no-cache] [--target x86_64-linux|x86_64-linux-raw]\n       ablac run [<file.ab> | --project <dir>]   # in-process LLVM ORC execution\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac --emit-llvm <file.ab>\n"
+        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast] [--no-cache] [--offline] [--target x86_64-linux|x86_64-linux-raw]\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac run [<file.ab> | --project <dir>] [--offline] # in-process LLVM ORC execution\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac --emit-llvm <file.ab>\n"
     )
     2
 }
@@ -529,12 +530,57 @@ fun main: int {
     if (argumentCount == 2 && argument0 == "--emit-llvm") {
         status = bootstrapOrcEmit(argument1)
     }
+    if (argumentCount >= 2 && argument0 == "package") {
+        val operation = argument1
+        var projectRoot = "."
+        var offline = false
+        var valid = operation == "update" || operation == "vendor"
+        var option = 2
+        while (option < argumentCount) {
+            val value = linuxArgument(option)
+            if (value == "--project" && option + 1 < argumentCount) {
+                projectRoot = linuxArgument(option + 1)
+                option = option + 1
+            } else if (value == "--offline" && operation == "vendor") {
+                offline = true
+                0
+            } else {
+                valid = false
+                0
+            }
+            option = option + 1
+        }
+        val project = bootstrapProjectDescriptor(projectRoot)
+        if (!project.valid) {
+            linuxPrintStandardError("${project.diagnostic}\n")
+            valid = false
+        }
+        if (valid) {
+            val imported = bootstrapDiscoverImportProviders(project.entry)
+            var result = BootstrapPackageResult(1, imported.diagnostic)
+            if (imported.errors == 0 && operation == "update") {
+                result = bootstrapPackageUpdateWithDependencies(
+                    projectRoot, imported
+                )
+            }
+            if (imported.errors == 0 && operation == "vendor") {
+                result = bootstrapPackageVendorWithDependencies(
+                    projectRoot, imported, offline
+                )
+            }
+            if (result.diagnostic != "") {
+                linuxPrintStandardError(result.diagnostic)
+            }
+            status = result.status
+        }
+    }
     if (argumentCount >= 1 && argument0 == "build") {
         var sourcePath = ""
         var outputPath = "build/abla-out"
         var outputExplicit = false
         var fast = false
         var useCache = true
+        var offline = false
         var targetName = "x86_64-linux"
         var artifact = "executable"
         var valid = true
@@ -555,6 +601,9 @@ fun main: int {
                 0
             } else if (value == "--no-cache") {
                 useCache = false
+                0
+            } else if (value == "--offline") {
+                offline = true
                 0
             } else if (value == "--target" &&
                 option + 1 < argumentCount) {
@@ -588,6 +637,20 @@ fun main: int {
             if (project.valid) {
                 sourcePath = project.entry
                 if (!outputExplicit) outputPath = project.output
+                val imported = bootstrapDiscoverImportProviders(project.entry)
+                if (imported.errors != 0) {
+                    linuxPrintStandardError(imported.diagnostic)
+                    valid = false
+                }
+                if (valid) {
+                    val prepared = bootstrapPackagePrepareWithDependencies(
+                        projectRoot, imported, offline
+                    )
+                    if (prepared.status != 0) {
+                        linuxPrintStandardError(prepared.diagnostic)
+                        valid = false
+                    }
+                }
             } else {
                 linuxPrintStandardError("${project.diagnostic}\n")
                 valid = false
@@ -614,20 +677,49 @@ fun main: int {
     if (argumentCount >= 1 && argument0 == "run") {
         var runSource = ""
         var runValid = true
+        var runProject = ""
+        var runOffline = false
         if (argumentCount == 2) runSource = argument1
         if (argumentCount == 1) {
             val project = bootstrapProjectDescriptor(".")
             runValid = project.valid
             runSource = project.entry
+            runProject = "."
             if (!runValid) linuxPrintStandardError("${project.diagnostic}\n")
         }
         if (argumentCount == 3 && argument1 == "--project") {
             val project = bootstrapProjectDescriptor(linuxArgument(2))
             runValid = project.valid
             runSource = project.entry
+            runProject = linuxArgument(2)
             if (!runValid) linuxPrintStandardError("${project.diagnostic}\n")
         }
-        if (argumentCount > 3 || runSource == "") runValid = false
+        if (argumentCount == 4 && argument1 == "--project" &&
+            linuxArgument(3) == "--offline") {
+            val project = bootstrapProjectDescriptor(linuxArgument(2))
+            runValid = project.valid
+            runSource = project.entry
+            runProject = linuxArgument(2)
+            runOffline = true
+            if (!runValid) linuxPrintStandardError("${project.diagnostic}\n")
+        }
+        if (argumentCount > 4 || runSource == "") runValid = false
+        if (runValid && runProject != "") {
+            val imported = bootstrapDiscoverImportProviders(runSource)
+            if (imported.errors != 0) {
+                linuxPrintStandardError(imported.diagnostic)
+                runValid = false
+            }
+            if (runValid) {
+                val prepared = bootstrapPackagePrepareWithDependencies(
+                    runProject, imported, runOffline
+                )
+                if (prepared.status != 0) {
+                    linuxPrintStandardError(prepared.diagnostic)
+                    runValid = false
+                }
+            }
+        }
         if (runValid) status = bootstrapRunInProcess(runSource)
     }
     if (argumentCount >= 1 && argument0 == "serve") {

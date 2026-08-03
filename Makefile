@@ -196,6 +196,8 @@ ablac-force: bootstrap-llvm-selfhost
 		nix-shell --run 'tools/test-http-client.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-package-build.sh $(BUILD_DIR)/ablac.bin'
+	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=120 tools/run-limited.sh \
+		nix-shell --run 'tools/test-package-providers.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 tools/run-limited.sh \
 		nix-shell --run 'tools/test-text-unicode.sh $(BUILD_DIR)/ablac.bin'
 	ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 tools/run-limited.sh \

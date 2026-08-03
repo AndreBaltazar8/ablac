@@ -127,6 +127,17 @@ build/ablac repl
 build/ablac serve program.ab
 ```
 
+Projects can import locked Git packages through compile-time source providers:
+
+```abla
+#import(github("AndreBaltazar8/abla-mvc"))
+```
+
+Run `build/ablac package update --project .` to resolve/update `abla.lock`;
+ordinary and `--offline` builds never change locked revisions. See
+[package imports](docs/packages.md) for custom provider functions and
+vendoring.
+
 The raw x86-64 Linux target emits a static executable with its own startup,
 allocator, and system-call boundary, without a C runtime, libc, ELF interpreter,
 or dynamic dependency. Hosted LLVM remains available for development, JIT
@@ -162,14 +173,13 @@ under `build/`.
 - [Toolchain interface](docs/toolchain.md)
 - [Compiler extension API](docs/compiler-api.md)
 - [Programmable builds](docs/programmable-builds.md)
+- [Package imports](docs/packages.md)
 - [Bootstrap architecture](docs/bootstrap.md)
 - [Self-hosting status](docs/self-hosting.md)
 - [Standard library](docs/standard-library.md)
 - [Compile-time subparsers](docs/subparsers.md)
 - [Reliability roadmap](docs/reliability-roadmap.md)
 - [Full self-hosting plan](docs/full-self-hosting.md)
-- [RFCs](rfc/)
-
 The [original implementation audit](docs/original-audit.md) separates behavior
 that was demonstrated by the prototype from incomplete or aspirational design.
 

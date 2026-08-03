@@ -681,6 +681,18 @@ The prototype spelling remains valid:
 #import("path/to/file.ab")
 ```
 
+An import argument may also be a pure compile-time source-provider call. The
+provider returns a locked source descriptor rather than performing network I/O
+during parsing:
+
+```abla
+#import(github("AndreBaltazar8/abla-mvc"))
+```
+
+User-defined compile functions can return `gitImportSource(...)` descriptors.
+Resolution, immutable locks, offline behavior, and vendoring are documented in
+`docs/packages.md`.
+
 The stable module form will be:
 
 ```abla

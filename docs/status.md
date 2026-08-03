@@ -1,7 +1,7 @@
 # Abla status
 
 This is the lean handoff for the current tree. Design detail belongs in the
-focused documents and RFCs; the no-C/no-libc proof boundary is in
+focused documents; the no-C/no-libc proof boundary is in
 [full-self-hosting.md](full-self-hosting.md).
 
 ## Goal
@@ -29,6 +29,10 @@ require libc; hosted facilities are optional capabilities.
   boundary on supported hosted targets.
 - Android and WASM/MVC are extension-owned proofs. The compiler contains only
   generic target, artifact, ABI, capability, and graph machinery.
+- Compile-time import-provider functions resolve Git/GitHub packages through
+  immutable commit/tree locks, bounded transactional caches, offline mode, and
+  a complete vendor fallback. Root manifests retain dependency capability
+  authority.
 - A current uncached fast full self-build was measured at 27.162 seconds. The
   dominant phases are semantic analysis and lowering; unchanged whole-graph
   builds use the content cache.
@@ -54,14 +58,12 @@ follow-on performance and API work, not blockers for the foundation milestone.
 
 1. Reduce cold semantic-analysis and lowering cost without weakening fixed-point
    or conformance gates; preserve the warm cache path.
-2. Finish deterministic package resolution, lockfiles, vendoring, and offline
-   builds.
-3. Continue the language safety/type layer: checked generics, interfaces,
+2. Continue the language safety/type layer: checked generics, interfaces,
    inference, aggregate lifetime cases, and concurrency primitives.
-4. Grow host-neutral standard libraries and extension-owned Android/WASM
+3. Grow host-neutral standard libraries and extension-owned Android/WASM
    packages on top of the generic compiler contracts.
-5. Resolve the remaining focused RFCs under `rfc/`, changing their proposed
-   designs where a smaller or safer contract is better.
+4. Add signed package/registry identities above the immutable provider/lock
+   foundation when the ecosystem needs hosted distribution.
 
 ## Required release gates
 

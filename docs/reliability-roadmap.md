@@ -403,8 +403,9 @@ the full suite and can compile the next source revision without seed changes.
 
 ## 8. Production usability
 
-- Introduce signed packages, a content-addressed registry, semantic versions,
-  lockfiles, offline/vendor mode, and capability declarations.
+- Build signed publisher identities, a content-addressed registry, and
+  semantic-version policy above the implemented immutable Git provider locks,
+  offline/vendor mode, and root-owned capability declarations.
 - Derive formatter, documentation, symbol index, and LSP data from the compiler
   parser/type APIs so tooling cannot drift from the language.
 - Establish stable/preview/nightly language editions and deprecation policy.
