@@ -2349,8 +2349,99 @@ class BootstrapEvaluator(
             this.steps = invocation.steps
             this.diagnostics = invocation.diagnostics
         }
-        // Import providers are pure compile-time descriptor constructors.
-        // The package resolver, not provider code, owns network authority.
+        // Import providers construct typed, deferred sources. Normal discovery
+        // evaluates the source value but never invokes its resolver closure.
+        if (targetName == "importFile" && expression.children.size == 2) {
+            val path = this.evaluate(expression.children[0])
+            val contents = this.evaluate(expression.children[1])
+            if (path.kind == "string" && contents.kind == "string") {
+                result = bootstrapEvalObject(
+                    "ImportFile", ["path", "contents"], [path, contents]
+                )
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "resolvedImport" &&
+            expression.children.size == 3) {
+            val revision = this.evaluate(expression.children[0])
+            val entry = this.evaluate(expression.children[1])
+            val files = this.evaluate(expression.children[2])
+            if (revision.kind == "string" && entry.kind == "string" &&
+                files.kind == "array") {
+                result = bootstrapEvalObject(
+                    "ResolvedImport",
+                    ["revision", "entry", "files"],
+                    [revision, entry, files]
+                )
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "importSource" &&
+            expression.children.size == 4) {
+            val name = this.evaluate(expression.children[0])
+            val identity = this.evaluate(expression.children[1])
+            val selector = this.evaluate(expression.children[2])
+            val resolver = this.evaluate(expression.children[3])
+            if (name.kind == "string" && identity.kind == "string" &&
+                selector.kind == "string" &&
+                (resolver.kind == "closure" || resolver.kind == "function")) {
+                result = bootstrapEvalObject(
+                    "ImportSource",
+                    [
+                        "name", "identity", "selector", "provider",
+                        "source", "selectorKind", "resolver",
+                        "resolvedRevision", "resolvedEntry", "resolvedFiles"
+                    ],
+                    [
+                        name, identity, selector,
+                        bootstrapEvalString("content"),
+                        bootstrapEvalString(""), bootstrapEvalString(""),
+                        resolver, bootstrapEvalString(""),
+                        bootstrapEvalString(""), bootstrapEvalArray([])
+                    ]
+                )
+            } else this.errors = this.errors + 1
+        }
+        // This evaluator-only operation is intentionally absent from semantic
+        // builtins: package update may synthesize it, user programs cannot.
+        if (targetName == "__ablaResolveImportSource" &&
+            bootstrapCompileEffectHas(this.allowedCompileEffects, 1024) &&
+            expression.children.size == 1) {
+            val source = this.evaluate(expression.children[0])
+            if (source.kind == "object" && source.owner == "ImportSource" &&
+                source.elements.size == 10 &&
+                (source.elements[6].kind == "closure" ||
+                 source.elements[6].kind == "function")) {
+                val resolverName = "__abla_import_resolver_${this.steps}"
+                this.names.append(resolverName)
+                this.values.append(source.elements[6])
+                this.mutable.append(false)
+                val resolved = this.evaluateCall(BootstrapExpression(
+                    "call", resolverName, expression.begin,
+                    expression.end, []
+                ))
+                if (resolved.kind == "object" &&
+                    resolved.owner == "ResolvedImport" &&
+                    resolved.elements.size == 3) {
+                    result = bootstrapEvalObject(
+                        "ImportSource",
+                        source.fieldNames,
+                        [
+                            source.elements[0], source.elements[1],
+                            source.elements[2], source.elements[3],
+                            source.elements[4], source.elements[5],
+                            source.elements[6], resolved.elements[0],
+                            resolved.elements[1], resolved.elements[2]
+                        ]
+                    )
+                } else this.errors = this.errors + 1
+            } else if (source.kind == "object" &&
+                source.owner == "ImportSource" && source.elements.size == 10 &&
+                source.elements[3].kind == "string" &&
+                source.elements[3].text == "git") {
+                result = source
+            } else this.errors = this.errors + 1
+        }
+        // Git remains one provider implementation of the generic source
+        // contract. The package updater owns Git/network authority.
         if (targetName == "gitImportSource" &&
             expression.children.size == 4) {
             val name = this.evaluate(expression.children[0])
@@ -2359,8 +2450,20 @@ class BootstrapEvaluator(
             val selector = this.evaluate(expression.children[3])
             if (name.kind == "string" && source.kind == "string" &&
                 selectorKind.kind == "string" && selector.kind == "string") {
-                result = bootstrapEvalString(
-                    "abla-import-v1|git|${name.text}|${source.text}|${selectorKind.text}|${selector.text}"
+                result = bootstrapEvalObject(
+                    "ImportSource",
+                    [
+                        "name", "identity", "selector", "provider",
+                        "source", "selectorKind", "resolver",
+                        "resolvedRevision", "resolvedEntry", "resolvedFiles"
+                    ],
+                    [
+                        name, bootstrapEvalString("git:${source.text}"),
+                        selector, bootstrapEvalString("git"), source,
+                        selectorKind, bootstrapEvalNull(),
+                        bootstrapEvalString(""), bootstrapEvalString(""),
+                        bootstrapEvalArray([])
+                    ]
                 )
             } else this.errors = this.errors + 1
         }
@@ -2374,8 +2477,25 @@ class BootstrapEvaluator(
                     index = index + 1
                 }
                 val name = repository.text.slice(slash + 1, repository.text.size)
-                result = bootstrapEvalString(
-                    "abla-import-v1|git|$name|https://github.com/${repository.text}.git|head|HEAD"
+                val source = bootstrapEvalString(
+                    "https://github.com/${repository.text}.git"
+                )
+                result = bootstrapEvalObject(
+                    "ImportSource",
+                    [
+                        "name", "identity", "selector", "provider",
+                        "source", "selectorKind", "resolver",
+                        "resolvedRevision", "resolvedEntry", "resolvedFiles"
+                    ],
+                    [
+                        bootstrapEvalString(name),
+                        bootstrapEvalString("github:${repository.text}"),
+                        bootstrapEvalString("HEAD"),
+                        bootstrapEvalString("git"), source,
+                        bootstrapEvalString("head"), bootstrapEvalNull(),
+                        bootstrapEvalString(""), bootstrapEvalString(""),
+                        bootstrapEvalArray([])
+                    ]
                 )
             } else this.errors = this.errors + 1
         }

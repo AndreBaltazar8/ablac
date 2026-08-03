@@ -15,10 +15,11 @@ ablac serve app.ab
 
 ## Packages
 
-`ablac package update --project <dir>` evaluates pure import-provider
-expressions, resolves their Git selectors, and transactionally publishes an
-immutable `abla.lock` plus validated cache entries. Project builds prepare the
-locked graph before module loading; `--offline` forbids fetching.
+`ablac package update --project <dir>` evaluates typed `ImportSource`
+expressions, resolves Git selectors or invokes deferred custom resolvers, and
+transactionally publishes an immutable `abla.lock` plus validated cache
+entries. Project builds prepare the locked graph before module loading without
+invoking custom resolvers; `--offline` forbids Git fetching.
 `ablac package vendor --project <dir>` publishes the complete locked source
 graph under `vendor/`. The provider and lock contract is specified in
 `docs/packages.md`.

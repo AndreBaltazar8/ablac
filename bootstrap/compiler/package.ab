@@ -2,15 +2,25 @@
 #import("abla/sys/linux/process")
 #import("eval.ab")
 
-// Deterministic Git package resolution is deliberately kept above the module
-// parser. Network selectors are resolved only by `package update`; ordinary
-// builds consume immutable records from abla.lock.
+// Import providers are evaluated above the module parser. Ordinary builds use
+// only stable source identity plus abla.lock; `package update` alone invokes a
+// deferred provider resolver or resolves an external Git selector.
+
+class BootstrapPackageSourceFile(
+    val path: string,
+    val contents: string
+)
 
 class BootstrapPackageDependency(
     val name: string,
+    val provider: string,
+    val identity: string,
     val source: string,
     val selectorKind: string,
-    val selector: string
+    val selector: string,
+    val resolvedRevision: string,
+    val resolvedEntry: string,
+    val resolvedFiles: array<BootstrapPackageSourceFile>
 )
 
 class BootstrapPackageDependencies(
@@ -21,6 +31,8 @@ class BootstrapPackageDependencies(
 
 class BootstrapLockedPackage(
     val name: string,
+    val provider: string,
+    val identity: string,
     val source: string,
     val selectorKind: string,
     val selector: string,
@@ -38,6 +50,13 @@ class BootstrapPackageLock(
 class BootstrapPackageResult(
     val status: int,
     val diagnostic: string
+)
+
+class BootstrapPackageContentResult(
+    val status: int,
+    val diagnostic: string,
+    val digest: string,
+    val source: string
 )
 
 class BootstrapImportProviderResult(
@@ -161,7 +180,9 @@ class BootstrapPackageProviderCollector(
 }
 
 fun bootstrapPackageDiscoverImportProviders(
-    entry: string
+    entry: string,
+    resolve: bool = false,
+    resolveEffects: int = 0
 ): BootstrapPackageDependencies {
     val collector = BootstrapPackageProviderCollector([], [], [], 0, "")
     collector.collect(entry)
@@ -169,17 +190,27 @@ fun bootstrapPackageDiscoverImportProviders(
     var index = 0
     while (index < collector.providers.size) {
         val expression = collector.providers[index]
-        val parsed = bootstrapParse("#$expression")
+        var requestedExpression = expression
+        if (resolve) requestedExpression =
+            "__ablaResolveImportSource($expression)"
+        val parsed = bootstrapParse("#$requestedExpression")
         if (parsed.errors == 0 && parsed.actions.size == 1) {
+            // Bit 1024 is private authority to invoke a deferred ImportSource
+            // resolver; ordinary compile-time evaluation never receives it.
+            val allowedEffects = if (resolve) resolveEffects + 1024 else 0
             val evaluated = bootstrapEvaluateWithEffects(
-                parsed.actions[0], collector.declarations, 0
+                parsed.actions[0], collector.declarations, allowedEffects
             )
             collector.errors = collector.errors + evaluated.errors
             collector.diagnostic =
                 "${collector.diagnostic}${evaluated.diagnostics}"
-            if (evaluated.value.kind == "string") {
-                val decoded = bootstrapPackageDependencyFromDescriptor(
-                    evaluated.value.text
+            if (resolve && evaluated.errors > 0) {
+                collector.diagnostic = "${collector.diagnostic}error[E_IMPORT_PROVIDER_EFFECT_DENIED]: deferred resolver failed; authorize any required effects in the root manifest compileCapabilities\n"
+            }
+            if (evaluated.value.kind == "object" &&
+                evaluated.value.owner == "ImportSource") {
+                val decoded = bootstrapPackageDependencyFromValue(
+                    evaluated.value, resolve
                 )
                 collector.errors = collector.errors + decoded.errors
                 collector.diagnostic =
@@ -191,7 +222,9 @@ fun bootstrapPackageDiscoverImportProviders(
                     dependencies.append(decoded.dependency)
                 }
                 if (decoded.errors == 0 && existing >= 0 &&
-                    (dependencies[existing].source != decoded.dependency.source ||
+                    (dependencies[existing].provider != decoded.dependency.provider ||
+                     dependencies[existing].identity != decoded.dependency.identity ||
+                     dependencies[existing].source != decoded.dependency.source ||
                      dependencies[existing].selectorKind != decoded.dependency.selectorKind ||
                      dependencies[existing].selector != decoded.dependency.selector)) {
                     collector.errors = collector.errors + 1
@@ -199,7 +232,7 @@ fun bootstrapPackageDiscoverImportProviders(
                 }
             } else {
                 collector.errors = collector.errors + 1
-                collector.diagnostic = "${collector.diagnostic}error[E_IMPORT_PROVIDER_RESULT]: provider expression '$expression' must return a Git import source descriptor\n"
+                collector.diagnostic = "${collector.diagnostic}error[E_IMPORT_PROVIDER_RESULT]: provider expression '$expression' must return ImportSource\n"
             }
         } else {
             collector.errors = collector.errors + 1
@@ -212,48 +245,96 @@ fun bootstrapPackageDiscoverImportProviders(
     )
 }
 
-fun bootstrapPackageDescriptorPart(
-    descriptor: string,
-    wanted: int
-): string {
-    var result = ""
-    var part = 0
-    var begin = 0
+fun bootstrapPackageEvalField(
+    value: BootstrapEvalValue,
+    name: string
+): BootstrapEvalValue {
+    var result = bootstrapEvalInvalid()
     var index = 0
-    while (index <= descriptor.size) {
-        if (index == descriptor.size || descriptor[index] == 124) {
-            if (part == wanted) result = descriptor.slice(begin, index)
-            part = part + 1
-            begin = index + 1
-        }
+    while (index < value.fieldNames.size && index < value.elements.size) {
+        if (value.fieldNames[index] == name) result = value.elements[index]
         index = index + 1
     }
     result
 }
 
-fun bootstrapPackageDependencyFromDescriptor(
-    descriptor: string
+fun bootstrapPackageDependencyFromValue(
+    value: BootstrapEvalValue,
+    resolved: bool
 ): BootstrapImportProviderResult {
-    val version = bootstrapPackageDescriptorPart(descriptor, 0)
-    val provider = bootstrapPackageDescriptorPart(descriptor, 1)
-    val name = bootstrapPackageDescriptorPart(descriptor, 2)
-    val source = bootstrapPackageDescriptorPart(descriptor, 3)
-    val selectorKind = bootstrapPackageDescriptorPart(descriptor, 4)
-    val selector = bootstrapPackageDescriptorPart(descriptor, 5)
+    val nameValue = bootstrapPackageEvalField(value, "name")
+    val providerValue = bootstrapPackageEvalField(value, "provider")
+    val identityValue = bootstrapPackageEvalField(value, "identity")
+    val sourceValue = bootstrapPackageEvalField(value, "source")
+    val selectorKindValue = bootstrapPackageEvalField(value, "selectorKind")
+    val selectorValue = bootstrapPackageEvalField(value, "selector")
+    val resolverValue = bootstrapPackageEvalField(value, "resolver")
+    val revisionValue = bootstrapPackageEvalField(value, "resolvedRevision")
+    val entryValue = bootstrapPackageEvalField(value, "resolvedEntry")
+    val filesValue = bootstrapPackageEvalField(value, "resolvedFiles")
+    val name = nameValue.text
+    val provider = providerValue.text
+    val identity = identityValue.text
+    val source = sourceValue.text
+    val selectorKind = selectorKindValue.text
+    val selector = selectorValue.text
+    val revision = revisionValue.text
+    val entry = entryValue.text
+    val files: array<BootstrapPackageSourceFile> = []
     var errors = 0
     var diagnostic = ""
-    if (version != "abla-import-v1" || provider != "git" ||
+    if (value.kind != "object" || value.owner != "ImportSource" ||
+        nameValue.kind != "string" || providerValue.kind != "string" ||
+        identityValue.kind != "string" || selectorValue.kind != "string" ||
         !bootstrapPackageNameValid(name) ||
-        !bootstrapPackageStringSafe(source) ||
-        (selectorKind != "rev" && selectorKind != "tag" &&
-         selectorKind != "branch" && selectorKind != "head") ||
-        !bootstrapPackageStringSafe(selector)) {
+        !bootstrapPackageStringSafe(identity) ||
+        !bootstrapPackageStringSafe(selector) ||
+        (provider != "git" && provider != "content")) {
         errors = 1
-        diagnostic = "error[E_IMPORT_PROVIDER_DESCRIPTOR]: import provider returned an invalid or unsupported source descriptor\n"
+        diagnostic = "error[E_IMPORT_PROVIDER_DESCRIPTOR]: ImportSource has invalid identity, selector, or provider fields\n"
+    }
+    if (errors == 0 && provider == "git" &&
+        (sourceValue.kind != "string" ||
+         selectorKindValue.kind != "string" ||
+         !bootstrapPackageStringSafe(source) ||
+         (selectorKind != "rev" && selectorKind != "tag" &&
+          selectorKind != "branch" && selectorKind != "head"))) {
+        errors = 1
+        diagnostic = "error[E_IMPORT_PROVIDER_DESCRIPTOR]: Git ImportSource has invalid source or selector kind\n"
+    }
+    if (errors == 0 && provider == "content" &&
+        (sourceValue.kind != "string" || source != "" ||
+         selectorKindValue.kind != "string" || selectorKind != "" ||
+         (resolverValue.kind != "closure" &&
+          resolverValue.kind != "function"))) {
+        errors = 1
+        diagnostic = "error[E_IMPORT_PROVIDER_DESCRIPTOR]: content ImportSource has an invalid deferred resolver\n"
+    }
+    if (errors == 0 && resolved && provider == "content") {
+        if (revisionValue.kind != "string" || entryValue.kind != "string" ||
+            filesValue.kind != "array" ||
+            !bootstrapPackageStringSafe(revision) ||
+            !bootstrapPackageRelativePathValid(entry)) errors = 1
+        var index = 0
+        while (errors == 0 && index < filesValue.elements.size) {
+            val file = filesValue.elements[index]
+            val path = bootstrapPackageEvalField(file, "path")
+            val contents = bootstrapPackageEvalField(file, "contents")
+            if (file.kind != "object" || file.owner != "ImportFile" ||
+                path.kind != "string" || contents.kind != "string" ||
+                !bootstrapPackageRelativePathValid(path.text)) errors = 1
+            if (errors == 0) files.append(BootstrapPackageSourceFile(
+                path.text, contents.text
+            ))
+            index = index + 1
+        }
+        if (errors != 0) diagnostic =
+            "error[E_IMPORT_PROVIDER_RESOLUTION]: resolved ImportSource has invalid revision, entry, or files\n"
     }
     BootstrapImportProviderResult(
         BootstrapPackageDependency(
-            name, source, selectorKind, selector
+            name, provider, identity, source, selectorKind, selector,
+            revision, entry, files
         ),
         errors,
         diagnostic
@@ -288,9 +369,11 @@ fun bootstrapPackageRelativePathValid(path: string): bool {
     var begin = 0
     var index = 0
     while (valid && index <= path.size) {
+        if (index < path.size && path[index] == 0) valid = false
         if (index == path.size || path[index] == 47) {
             val component = path.slice(begin, index)
-            if (component == "" || component == "." || component == "..") {
+            if (component == "" || component == "." || component == ".." ||
+                component == ".git") {
                 valid = false
             }
             begin = index + 1
@@ -406,7 +489,8 @@ fun bootstrapPackageManifestDependencies(
             if (duplicate) valid = false
             if (valid) {
                 dependencies.append(BootstrapPackageDependency(
-                    name, git, selectorKind, selector
+                    name, "git", "git:$git", git, selectorKind,
+                    selector, "", "", []
                 ))
             } else {
                 errors = errors + 1
@@ -443,6 +527,8 @@ fun bootstrapPackageTomlField(line: string, key: string): string {
 fun bootstrapPackageAppendLockRecord(
     var packages: array<BootstrapLockedPackage>,
     name: string,
+    provider: string,
+    identity: string,
     source: string,
     selectorKind: string,
     selector: string,
@@ -451,15 +537,19 @@ fun bootstrapPackageAppendLockRecord(
     entry: string
 ): bool {
     val valid = bootstrapPackageNameValid(name) &&
-        bootstrapPackageStringSafe(source) &&
-        (selectorKind == "rev" || selectorKind == "tag" ||
-         selectorKind == "branch" || selectorKind == "head") &&
+        (provider == "git" || provider == "content") &&
+        bootstrapPackageStringSafe(identity) &&
+        (provider != "git" || bootstrapPackageStringSafe(source)) &&
+        (provider != "git" || selectorKind == "rev" ||
+         selectorKind == "tag" || selectorKind == "branch" ||
+         selectorKind == "head") &&
         bootstrapPackageStringSafe(selector) &&
-        bootstrapPackageHexRevision(revision) &&
+        bootstrapPackageStringSafe(revision) &&
         bootstrapPackageHexRevision(digest) &&
         bootstrapPackageRelativePathValid(entry)
     if (valid) packages.append(BootstrapLockedPackage(
-        name, source, selectorKind, selector, revision, digest, entry
+        name, provider, identity, source, selectorKind, selector,
+        revision, digest, entry
     ))
     valid
 }
@@ -470,6 +560,8 @@ fun bootstrapPackageReadLock(lockPath: string): BootstrapPackageLock {
     var valid = Path(lockPath).exists()
     var diagnostic = ""
     var name = ""
+    var provider = ""
+    var identity = ""
     var source = ""
     var selectorKind = ""
     var selector = ""
@@ -485,11 +577,14 @@ fun bootstrapPackageReadLock(lockPath: string): BootstrapPackageLock {
         val line = bootstrapPackageTrim(text.slice(lineBegin, lineEnd))
         if (line == "[[package]]") {
             if (active) valid = bootstrapPackageAppendLockRecord(
-                packages, name, source, selectorKind, selector,
+                packages, name, provider, identity, source,
+                selectorKind, selector,
                 revision, digest, entry
             )
             active = true
             name = ""
+            provider = ""
+            identity = ""
             source = ""
             selectorKind = ""
             selector = ""
@@ -498,6 +593,8 @@ fun bootstrapPackageReadLock(lockPath: string): BootstrapPackageLock {
             entry = ""
         } else if (active && line != "" && line[0] != 35) {
             val foundName = bootstrapPackageTomlField(line, "name")
+            val foundProvider = bootstrapPackageTomlField(line, "provider")
+            val foundIdentity = bootstrapPackageTomlField(line, "identity")
             val foundSource = bootstrapPackageTomlField(line, "source")
             val foundKind = bootstrapPackageTomlField(line, "selector-kind")
             val foundSelector = bootstrapPackageTomlField(line, "selector")
@@ -505,6 +602,8 @@ fun bootstrapPackageReadLock(lockPath: string): BootstrapPackageLock {
             val foundDigest = bootstrapPackageTomlField(line, "digest")
             val foundEntry = bootstrapPackageTomlField(line, "entry")
             if (foundName != "") name = foundName
+            if (foundProvider != "") provider = foundProvider
+            if (foundIdentity != "") identity = foundIdentity
             if (foundSource != "") source = foundSource
             if (foundKind != "") selectorKind = foundKind
             if (foundSelector != "") selector = foundSelector
@@ -517,7 +616,7 @@ fun bootstrapPackageReadLock(lockPath: string): BootstrapPackageLock {
             text[lineBegin] == 10) lineBegin = lineBegin + 1
     }
     if (valid && active) valid = bootstrapPackageAppendLockRecord(
-        packages, name, source, selectorKind, selector,
+        packages, name, provider, identity, source, selectorKind, selector,
         revision, digest, entry
     )
     if (!Path(lockPath).exists()) {
@@ -571,7 +670,9 @@ fun bootstrapPackageMergeDependencies(
         val dependency = right.values[index]
         val existing = bootstrapPackageDependencyIndex(values, dependency.name)
         if (existing < 0) values.append(dependency)
-        else if (values[existing].source != dependency.source ||
+        else if (values[existing].provider != dependency.provider ||
+            values[existing].identity != dependency.identity ||
+            values[existing].source != dependency.source ||
             values[existing].selectorKind != dependency.selectorKind ||
             values[existing].selector != dependency.selector) {
             errors = errors + 1
@@ -598,8 +699,11 @@ fun bootstrapPackageCacheRoot(): string {
     result
 }
 
-fun bootstrapPackageCachePath(package: BootstrapLockedPackage): string =
-    "${bootstrapPackageCacheRoot()}/git/${package.name}/${package.revision}"
+fun bootstrapPackageCachePath(package: BootstrapLockedPackage): string {
+    val key = if (package.provider == "content") package.digest
+        else package.revision
+    "${bootstrapPackageCacheRoot()}/${package.provider}/${package.name}/$key"
+}
 
 fun bootstrapPackageHexRevision(value: string): bool {
     var valid = value.size == 40
@@ -724,17 +828,33 @@ fun bootstrapPackageGitValue(directory: string, value: string): string {
     result
 }
 
+fun bootstrapPackageGitWriteTree(directory: string): string {
+    val command = linuxCommand("git")
+    command.argument("-C")
+    command.argument(directory)
+    command.argument("write-tree")
+    val captured = command.capture()
+    var result = ""
+    if (captured.status == 0) result = bootstrapPackageTrim(captured.output)
+    result
+}
+
 fun bootstrapPackageCacheValid(package: BootstrapLockedPackage): bool {
     val root = bootstrapPackageCachePath(package)
     val source = "$root/source"
     var valid = Path(source).info().isDirectory() &&
-        Path("$root/source-url").readText() == package.source &&
+        Path("$root/provider").readText() == package.provider &&
         Path("$root/digest").readText() == package.digest
-    if (valid) {
+    if (valid && package.provider == "git") {
+        valid = Path("$root/identity").readText() == package.identity &&
+            Path("$root/revision").readText() == package.revision &&
+            Path("$root/source-url").readText() == package.source
+    }
+    if (valid && package.provider == "git") {
         valid = bootstrapPackageGitValue(source, "HEAD") == package.revision &&
             bootstrapPackageGitValue(source, "HEAD^{tree}") == package.digest
     }
-    if (valid) {
+    if (valid && package.provider == "git") {
         val command = linuxCommand("git")
         command.argument("-C")
         command.argument(source)
@@ -742,6 +862,29 @@ fun bootstrapPackageCacheValid(package: BootstrapLockedPackage): bool {
         command.argument("--porcelain")
         val status = command.capture()
         valid = status.status == 0 && bootstrapPackageTrim(status.output) == ""
+    }
+    if (valid && package.provider == "content") {
+        val changed = linuxCommand("git")
+        changed.argument("-C")
+        changed.argument(source)
+        changed.argument("diff-files")
+        changed.argument("--quiet")
+        valid = changed.run() == 0
+        if (valid) {
+            val tree = bootstrapPackageGitWriteTree(source)
+            valid = tree == package.digest
+        }
+        if (valid) {
+            val untracked = linuxCommand("git")
+            untracked.argument("-C")
+            untracked.argument(source)
+            untracked.argument("ls-files")
+            untracked.argument("--others")
+            untracked.argument("--exclude-standard")
+            val observed = untracked.capture()
+            valid = observed.status == 0 &&
+                bootstrapPackageTrim(observed.output) == ""
+        }
     }
     valid
 }
@@ -751,9 +894,9 @@ fun bootstrapPackageFetch(
     revision: string
 ): BootstrapPackageResult {
     val placeholder = BootstrapLockedPackage(
-        dependency.name, dependency.source, dependency.selectorKind,
-        dependency.selector, revision, "0000000000000000000000000000000000000000",
-        "entry.ab"
+        dependency.name, "git", dependency.identity, dependency.source,
+        dependency.selectorKind, dependency.selector, revision,
+        "0000000000000000000000000000000000000000", "entry.ab"
     )
     val root = bootstrapPackageCachePath(placeholder)
     val temporary = "$root.tmp.${linuxProcessId()}"
@@ -765,6 +908,7 @@ fun bootstrapPackageFetch(
         val init = linuxCommand("git")
         init.argument("init")
         init.argument("--quiet")
+        init.argument("--object-format=sha1")
         init.argument("$temporary/source")
         if (init.run() != 0) status = 1
     }
@@ -812,6 +956,11 @@ fun bootstrapPackageFetch(
     }
     if (status == 0) {
         var written = Path("$temporary/source-url").writeText(dependency.source)
+        if (written) written = Path("$temporary/provider").writeText("git")
+        if (written) written = Path("$temporary/identity").writeText(
+            dependency.identity
+        )
+        if (written) written = Path("$temporary/revision").writeText(revision)
         if (written) written = Path("$temporary/digest").writeText(digest)
         if (!written) status = 1
     }
@@ -826,6 +975,83 @@ fun bootstrapPackageFetch(
         }
     }
     BootstrapPackageResult(status, diagnostic)
+}
+
+fun bootstrapPackagePublishContent(
+    dependency: BootstrapPackageDependency
+): BootstrapPackageContentResult {
+    val base = "${bootstrapPackageCacheRoot()}/content/${dependency.name}"
+    val temporary = "$base/.tmp.${linuxProcessId()}"
+    bootstrapPackageRemoveTree(temporary)
+    var status = 0
+    var diagnostic = ""
+    var total = 0
+    var entryFound = false
+    var manifestFound = false
+    var fileIndex = 0
+    while (status == 0 && fileIndex < dependency.resolvedFiles.size) {
+        val file = dependency.resolvedFiles[fileIndex]
+        if (!bootstrapPackageRelativePathValid(file.path)) status = 1
+        var previous = 0
+        while (status == 0 && previous < fileIndex) {
+            if (dependency.resolvedFiles[previous].path == file.path) status = 1
+            previous = previous + 1
+        }
+        total = total + file.path.size + file.contents.size
+        if (total > 134217728) status = 1
+        if (file.path == dependency.resolvedEntry) entryFound = true
+        if (file.path == "abla.toml") manifestFound = true
+        if (status == 0 && !Path("$temporary/source/${file.path}").writeText(
+            file.contents
+        )) status = 1
+        fileIndex = fileIndex + 1
+    }
+    if (!entryFound || !manifestFound ||
+        dependency.resolvedFiles.size == 0) status = 1
+    if (status == 0) {
+        val init = linuxCommand("git")
+        init.argument("init")
+        init.argument("--quiet")
+        init.argument("--object-format=sha1")
+        init.argument("$temporary/source")
+        if (init.run() != 0) status = 1
+    }
+    if (status == 0) {
+        val add = linuxCommand("git")
+        add.argument("-C")
+        add.argument("$temporary/source")
+        add.argument("add")
+        add.argument("--all")
+        if (add.run() != 0) status = 1
+    }
+    var digest = ""
+    if (status == 0) digest = bootstrapPackageGitWriteTree(
+        "$temporary/source"
+    )
+    if (!bootstrapPackageHexRevision(digest)) status = 1
+    if (status == 0) {
+        var written = Path("$temporary/provider").writeText("content")
+        if (written) written = Path("$temporary/identity").writeText(
+            dependency.identity
+        )
+        if (written) written = Path("$temporary/revision").writeText(
+            dependency.resolvedRevision
+        )
+        if (written) written = Path("$temporary/digest").writeText(digest)
+        if (!written) status = 1
+    }
+    var source = ""
+    if (status == 0) {
+        val root = "$base/$digest"
+        if (Path(root).exists()) bootstrapPackageRemoveTree(root)
+        if (!Path(temporary).moveTo(Path(root))) status = 1
+        if (status == 0) source = "$root/source"
+    }
+    if (status != 0) {
+        bootstrapPackageRemoveTree(temporary)
+        diagnostic = "error[E_IMPORT_PROVIDER_RESOLUTION]: provider '${dependency.identity}' returned invalid, duplicate, oversized, or unpublishable source files for dependency '${dependency.name}'\n"
+    }
+    BootstrapPackageContentResult(status, diagnostic, digest, source)
 }
 
 fun bootstrapPackageManifestString(manifestPath: string, key: string): string {
@@ -915,9 +1141,12 @@ fun bootstrapPackageCheckoutValid(
     source: string,
     package: BootstrapLockedPackage
 ): bool {
-    var valid = bootstrapPackageGitValue(source, "HEAD") == package.revision &&
-        bootstrapPackageGitValue(source, "HEAD^{tree}") == package.digest
-    if (valid) {
+    var valid = Path(source).info().isDirectory()
+    if (valid && package.provider == "git") {
+        valid = bootstrapPackageGitValue(source, "HEAD") == package.revision &&
+            bootstrapPackageGitValue(source, "HEAD^{tree}") == package.digest
+    }
+    if (valid && package.provider == "git") {
         val command = linuxCommand("git")
         command.argument("-C")
         command.argument(source)
@@ -926,6 +1155,26 @@ fun bootstrapPackageCheckoutValid(
         val observed = command.capture()
         valid = observed.status == 0 &&
             bootstrapPackageTrim(observed.output) == ""
+    }
+    if (valid && package.provider == "content") {
+        val changed = linuxCommand("git")
+        changed.argument("-C")
+        changed.argument(source)
+        changed.argument("diff-files")
+        changed.argument("--quiet")
+        valid = changed.run() == 0 &&
+            bootstrapPackageGitWriteTree(source) == package.digest
+        if (valid) {
+            val untracked = linuxCommand("git")
+            untracked.argument("-C")
+            untracked.argument(source)
+            untracked.argument("ls-files")
+            untracked.argument("--others")
+            untracked.argument("--exclude-standard")
+            val observed = untracked.capture()
+            valid = observed.status == 0 &&
+                bootstrapPackageTrim(observed.output) == ""
+        }
     }
     valid
 }
@@ -957,13 +1206,30 @@ fun bootstrapPackageValidateCapabilityPolicy(
                 authorized, requested[capability]
             )) {
                 status = 1
-                diagnostic = "error[E_PACKAGE_CAPABILITY_DENIED]: dependency '${package.name}', locked revision '${package.revision}', source '${package.source}' requested compile capability '${requested[capability]}' that is not authorized by root manifest '${manifest.text}'\n"
+                diagnostic = "error[E_PACKAGE_CAPABILITY_DENIED]: dependency '${package.name}', locked revision '${package.revision}', ImportSource '${package.identity}' requested compile capability '${requested[capability]}' that is not authorized by root manifest '${manifest.text}'\n"
             }
             capability = capability + 1
         }
         packageIndex = packageIndex + 1
     }
     BootstrapPackageResult(status, diagnostic)
+}
+
+fun bootstrapPackageAuthorizedEffects(projectRoot: string): int {
+    val capabilities = bootstrapPackageManifestStringArray(
+        Path(projectRoot).child("abla.toml").text,
+        "compileCapabilities"
+    )
+    var effects = 0
+    var index = 0
+    while (index < capabilities.size) {
+        effects = bootstrapCompileEffectMerge(
+            effects,
+            bootstrapCompileEffectFromName(capabilities[index])
+        )
+        index = index + 1
+    }
+    effects
 }
 
 fun bootstrapPackageStackContains(stack: array<string>, name: string): bool {
@@ -979,22 +1245,25 @@ fun bootstrapPackageStackContains(stack: array<string>, name: string): bool {
 fun bootstrapPackageResolveOne(
     dependency: BootstrapPackageDependency,
     var packages: array<BootstrapLockedPackage>,
-    stack: array<string>
+    stack: array<string>,
+    resolveEffects: int
 ): BootstrapPackageResult {
     var status = 0
     var diagnostic = ""
     val existing = bootstrapPackageLockIndex(packages, dependency.name)
     if (bootstrapPackageStackContains(stack, dependency.name)) {
         status = 1
-        diagnostic = "error[E_PACKAGE_CYCLE]: dependency cycle reaches '${dependency.name}' from selector ${dependency.selectorKind}='${dependency.selector}' at '${dependency.source}'\n"
+        diagnostic = "error[E_PACKAGE_CYCLE]: dependency cycle reaches '${dependency.name}' from ImportSource '${dependency.identity}' selector '${dependency.selector}'\n"
     }
     if (status == 0 && existing >= 0) {
         val found = packages[existing]
-        if (found.source != dependency.source ||
+        if (found.provider != dependency.provider ||
+            found.identity != dependency.identity ||
+            found.source != dependency.source ||
             found.selectorKind != dependency.selectorKind ||
             found.selector != dependency.selector) {
             status = 1
-            diagnostic = "error[E_PACKAGE_COLLISION]: dependency '${dependency.name}' has incompatible sources or selectors ('${found.source}' versus '${dependency.source}')\n"
+            diagnostic = "error[E_PACKAGE_COLLISION]: dependency '${dependency.name}' has incompatible ImportSource identities or selectors ('${found.identity}' versus '${dependency.identity}')\n"
         }
     }
     if (status == 0 && existing < 0) {
@@ -1005,16 +1274,21 @@ fun bootstrapPackageResolveOne(
             stackIndex = stackIndex + 1
         }
         nestedStack.append(dependency.name)
-        val revision = bootstrapPackageResolveRevision(dependency)
-        if (revision == "") {
-            status = 1
-            diagnostic = "error[E_PACKAGE_RESOLVE]: dependency '${dependency.name}', selector ${dependency.selectorKind}='${dependency.selector}', source '${dependency.source}' did not resolve to an immutable revision\n"
-        }
+        var revision = dependency.resolvedRevision
         var digest = ""
         var cacheSource = ""
-        if (status == 0) {
+        var entry = dependency.resolvedEntry
+        if (dependency.provider == "git") {
+            revision = bootstrapPackageResolveRevision(dependency)
+            if (revision == "") {
+                status = 1
+                diagnostic = "error[E_PACKAGE_RESOLVE]: dependency '${dependency.name}', selector ${dependency.selectorKind}='${dependency.selector}', source '${dependency.source}' did not resolve to an immutable revision\n"
+            }
+        }
+        if (status == 0 && dependency.provider == "git") {
             val placeholder = BootstrapLockedPackage(
-                dependency.name, dependency.source, dependency.selectorKind,
+                dependency.name, "git", dependency.identity,
+                dependency.source, dependency.selectorKind,
                 dependency.selector, revision,
                 "0000000000000000000000000000000000000000", "entry.ab"
             )
@@ -1032,31 +1306,54 @@ fun bootstrapPackageResolveOne(
             }
             digest = bootstrapPackageGitValue(cacheSource, "HEAD^{tree}")
         }
+        if (status == 0 && dependency.provider == "content") {
+            if (revision == "" || entry == "" ||
+                dependency.resolvedFiles.size == 0) {
+                status = 1
+                diagnostic = "error[E_IMPORT_PROVIDER_RESOLUTION]: ImportSource '${dependency.identity}' did not resolve revision, entry, and files\n"
+            }
+            if (status == 0) {
+                val published = bootstrapPackagePublishContent(dependency)
+                status = published.status
+                diagnostic = published.diagnostic
+                digest = published.digest
+                cacheSource = published.source
+            }
+        }
         val manifest = "$cacheSource/abla.toml"
         var packageName = ""
-        var entry = ""
         if (status == 0) {
             packageName = bootstrapPackageManifestString(manifest, "name")
-            entry = bootstrapPackageManifestString(manifest, "entry")
+            val manifestEntry = bootstrapPackageManifestString(
+                manifest, "entry"
+            )
+            if (entry == "") entry = manifestEntry
             if (entry == "") entry = "src/${dependency.name}.ab"
             if (packageName != dependency.name ||
+                (manifestEntry != "" && manifestEntry != entry) ||
                 !bootstrapPackageRelativePathValid(entry) ||
                 !Path("$cacheSource/$entry").exists()) {
                 status = 1
-                diagnostic = "error[E_PACKAGE_ENTRY]: dependency '${dependency.name}', revision '$revision', source '${dependency.source}' has an invalid manifest name or missing entry '$entry'\n"
+                diagnostic = "error[E_PACKAGE_ENTRY]: dependency '${dependency.name}', ImportSource '${dependency.identity}', revision '$revision' has an invalid manifest name or missing entry '$entry'\n"
             }
         }
         if (status == 0) {
             val locked = BootstrapLockedPackage(
-                dependency.name, dependency.source, dependency.selectorKind,
+                dependency.name, dependency.provider, dependency.identity,
+                dependency.source, dependency.selectorKind,
                 dependency.selector, revision, digest, entry
             )
             val cacheRoot = bootstrapPackageCachePath(locked)
-            Path("$cacheRoot/source-url").writeText(dependency.source)
+            Path("$cacheRoot/provider").writeText(dependency.provider)
+            Path("$cacheRoot/identity").writeText(dependency.identity)
+            Path("$cacheRoot/revision").writeText(revision)
+            if (dependency.provider == "git") {
+                Path("$cacheRoot/source-url").writeText(dependency.source)
+            }
             Path("$cacheRoot/digest").writeText(digest)
             val declared = bootstrapPackageManifestDependencies(manifest)
             val imported = bootstrapPackageDiscoverImportProviders(
-                "$cacheSource/$entry"
+                "$cacheSource/$entry", true, resolveEffects
             )
             val transitive = bootstrapPackageMergeDependencies(
                 declared, imported
@@ -1068,7 +1365,8 @@ fun bootstrapPackageResolveOne(
             var index = 0
             while (status == 0 && index < transitive.values.size) {
                 val resolved = bootstrapPackageResolveOne(
-                    transitive.values[index], packages, nestedStack
+                    transitive.values[index], packages, nestedStack,
+                    resolveEffects
                 )
                 status = resolved.status
                 diagnostic = resolved.diagnostic
@@ -1084,12 +1382,14 @@ fun bootstrapPackageWriteLock(
     lockPath: string,
     packages: array<BootstrapLockedPackage>
 ): bool {
-    var output = "version = 1\n"
+    var output = "version = 2\n"
     var index = 0
     while (index < packages.size) {
         val package = packages[index]
         output = "$output\n[[package]]\n"
         output = "${output}name = \"${package.name}\"\n"
+        output = "${output}provider = \"${package.provider}\"\n"
+        output = "${output}identity = \"${package.identity}\"\n"
         output = "${output}source = \"${package.source}\"\n"
         output = "${output}selector-kind = \"${package.selectorKind}\"\n"
         output = "${output}selector = \"${package.selector}\"\n"
@@ -1112,11 +1412,12 @@ fun bootstrapPackageUpdateWithDependencies(
     val packages: array<BootstrapLockedPackage> = []
     var status = if (dependencies.errors == 0) 0 else 1
     var diagnostic = dependencies.diagnostic
+    val resolveEffects = bootstrapPackageAuthorizedEffects(projectRoot)
     var index = 0
     while (status == 0 && index < dependencies.values.size) {
         val stack: array<string> = []
         val resolved = bootstrapPackageResolveOne(
-            dependencies.values[index], packages, stack
+            dependencies.values[index], packages, stack, resolveEffects
         )
         status = resolved.status
         diagnostic = resolved.diagnostic
@@ -1154,6 +1455,8 @@ fun bootstrapPackageDependencyMatches(
     dependency: BootstrapPackageDependency,
     package: BootstrapLockedPackage
 ): bool = dependency.name == package.name &&
+    dependency.provider == package.provider &&
+    dependency.identity == package.identity &&
     dependency.source == package.source &&
     dependency.selectorKind == package.selectorKind &&
     dependency.selector == package.selector
@@ -1173,12 +1476,12 @@ fun bootstrapPackageValidateDependencies(
         val lockedIndex = bootstrapPackageLockIndex(packages, dependency.name)
         if (lockedIndex < 0) {
             status = 1
-            diagnostic = "error[E_PACKAGE_LOCK_DISAGREEMENT]: import provider dependency '${dependency.name}', selector ${dependency.selectorKind}='${dependency.selector}', source '${dependency.source}' is absent from abla.lock\n"
+            diagnostic = "error[E_PACKAGE_LOCK_DISAGREEMENT]: import provider dependency '${dependency.name}', ImportSource '${dependency.identity}', selector '${dependency.selector}' is absent from abla.lock\n"
         } else if (!bootstrapPackageDependencyMatches(
             dependency, packages[lockedIndex]
         )) {
             status = 1
-            diagnostic = "error[E_PACKAGE_LOCK_DISAGREEMENT]: import provider dependency '${dependency.name}' does not match locked revision '${packages[lockedIndex].revision}' from '${packages[lockedIndex].source}'\n"
+            diagnostic = "error[E_PACKAGE_LOCK_DISAGREEMENT]: import provider dependency '${dependency.name}' does not match locked revision '${packages[lockedIndex].revision}' from ImportSource '${packages[lockedIndex].identity}'\n"
         } else if (bootstrapPackageStackContains(stack, dependency.name)) {
             status = 1
             diagnostic = "error[E_PACKAGE_CYCLE]: locked import provider dependency cycle reaches '${dependency.name}'\n"
@@ -1228,18 +1531,22 @@ fun bootstrapPackageMaterialize(
     if (!vendorValid && !bootstrapPackageCacheValid(package)) {
         if (offline) {
             status = 1
-            diagnostic = "error[E_PACKAGE_OFFLINE_MISS]: dependency '${package.name}', selector ${package.selectorKind}='${package.selector}', locked revision '${package.revision}', source '${package.source}' is unavailable or invalid in cache '$cacheRoot'\n"
+            diagnostic = "error[E_PACKAGE_OFFLINE_MISS]: dependency '${package.name}', ImportSource '${package.identity}', selector '${package.selector}', locked revision '${package.revision}' is unavailable or invalid in cache '$cacheRoot'\n"
+        } else if (package.provider == "content") {
+            status = 1
+            diagnostic = "error[E_PACKAGE_CACHE_MISS]: dependency '${package.name}', ImportSource '${package.identity}', locked revision '${package.revision}' is unavailable or invalid in cache '$cacheRoot'; run 'ablac package update' to invoke its resolver\n"
         } else {
             val dependency = BootstrapPackageDependency(
-                package.name, package.source,
-                package.selectorKind, package.selector
+                package.name, package.provider, package.identity,
+                package.source, package.selectorKind, package.selector,
+                "", "", []
             )
             val fetched = bootstrapPackageFetch(dependency, package.revision)
             status = fetched.status
             diagnostic = fetched.diagnostic
             if (status == 0 && !bootstrapPackageCacheValid(package)) {
                 status = 1
-                diagnostic = "error[E_PACKAGE_DIGEST_MISMATCH]: dependency '${package.name}', locked revision '${package.revision}', source '${package.source}' does not match digest '${package.digest}'\n"
+                diagnostic = "error[E_PACKAGE_DIGEST_MISMATCH]: dependency '${package.name}', ImportSource '${package.identity}', locked revision '${package.revision}' does not match digest '${package.digest}'\n"
             }
         }
     }
@@ -1273,7 +1580,7 @@ fun bootstrapPackageMaterialize(
         }
         if (status != 0) bootstrapPackageRemoveTree(temporary)
         if (status != 0 && diagnostic == "") {
-            diagnostic = "error[E_PACKAGE_MATERIALIZE]: dependency '${package.name}', locked revision '${package.revision}', source '${package.source}' could not be materialized transactionally\n"
+            diagnostic = "error[E_PACKAGE_MATERIALIZE]: dependency '${package.name}', ImportSource '${package.identity}', locked revision '${package.revision}' could not be materialized transactionally\n"
         }
     }
     BootstrapPackageResult(status, diagnostic)

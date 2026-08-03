@@ -37,7 +37,7 @@ version = "0.1.0"
 entry = "src/provider-dep.ab"
 EOF
 cat > "$repository/src/leaf-provider.ab" <<EOF
-compile fun leafDependency(): string = gitImportSource(
+compile fun leafDependency(): ImportSource = gitImportSource(
     "provider-leaf",
     "$leaf_repository",
     "branch",
@@ -59,7 +59,7 @@ version = "0.1.0"
 entry = "src/main.ab"
 EOF
 cat > "$application/src/provider.ab" <<EOF
-compile fun localDependency(): string = gitImportSource(
+compile fun localDependency(): ImportSource = gitImportSource(
     "provider-dep",
     "$repository",
     "branch",
@@ -158,5 +158,106 @@ set -e
 [[ $github_status -ne 0 ]]
 [[ $github_output == *'E_PACKAGE_LOCK_MISSING'* ]]
 
+generated_application="$test_root/generated-application"
+generated_cache="$test_root/generated-cache"
+mkdir -p -- "$generated_application/src"
+cat > "$generated_application/abla.toml" <<'EOF'
+name = "generated-provider-app"
+entry = "src/main.ab"
+EOF
+cat > "$generated_application/src/provider.ab" <<'EOF'
+#import("abla/compiler")
+
+compile fun resolveGenerated(): ResolvedImport {
+    val revision = compilerEnvironment("ABLA_GENERATED_REVISION")
+    resolvedImport(
+        revision,
+        "src/generated-dependency.ab",
+        [
+            importFile(
+                "abla.toml",
+                "name = \"generated-dependency\"\nentry = \"src/generated-dependency.ab\"\n"
+            ),
+            importFile(
+                "src/generated-dependency.ab",
+                "fun generatedAnswer: int = 42\n"
+            )
+        ]
+    )
+}
+
+compile fun generatedDependency(): ImportSource = importSource(
+    "generated-dependency",
+    "generated:answer",
+    "v1",
+    resolveGenerated
+)
+EOF
+cat > "$generated_application/src/main.ab" <<'EOF'
+#import("provider.ab")
+#import(generatedDependency())
+
+fun main: int = generatedAnswer()
+EOF
+
+set +e
+generated_denied_output=$(ABLA_GENERATED_REVISION=generated-v1 \
+    ABLA_PACKAGE_CACHE="$generated_cache" "$compiler" package update \
+    --project "$generated_application" 2>&1)
+generated_denied_status=$?
+set -e
+[[ $generated_denied_status -ne 0 ]]
+[[ $generated_denied_output == *'E_IMPORT_PROVIDER_EFFECT_DENIED'* ]]
+
+cat >> "$generated_application/abla.toml" <<'EOF'
+compileCapabilities = ["environment"]
+EOF
+ABLA_GENERATED_REVISION=generated-v1 \
+    ABLA_PACKAGE_CACHE="$generated_cache" "$compiler" package update \
+    --project "$generated_application"
+grep -q '^version = 2$' "$generated_application/abla.lock"
+grep -q 'provider = "content"' "$generated_application/abla.lock"
+grep -q 'identity = "generated:answer"' "$generated_application/abla.lock"
+grep -q 'revision = "generated-v1"' "$generated_application/abla.lock"
+ABLA_PACKAGE_CACHE="$generated_cache" "$compiler" build \
+    --project "$generated_application" --fast --no-cache --offline
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$generated_application/build/generated-provider-app"
+generated_first_status=$?
+set -e
+[[ $generated_first_status -eq 42 ]]
+
+# Changing the deferred resolver cannot move an existing lock during a build,
+# and a build does not require the environment input used only by the resolver.
+sed -i 's/generatedAnswer: int = 42/generatedAnswer: int = 41/' \
+    "$generated_application/src/provider.ab"
+rm -rf -- "$generated_application/.abla"
+ABLA_PACKAGE_CACHE="$generated_cache" "$compiler" build \
+    --project "$generated_application" --fast --no-cache --offline
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$generated_application/build/generated-provider-app"
+generated_locked_status=$?
+set -e
+[[ $generated_locked_status -eq 42 ]]
+grep -q 'revision = "generated-v1"' "$generated_application/abla.lock"
+
+ABLA_GENERATED_REVISION=generated-v2 \
+    ABLA_PACKAGE_CACHE="$generated_cache" "$compiler" package update \
+    --project "$generated_application"
+grep -q 'revision = "generated-v2"' "$generated_application/abla.lock"
+ABLA_PACKAGE_CACHE="$generated_cache" "$compiler" package vendor \
+    --project "$generated_application"
+rm -rf -- "$generated_cache" "$generated_application/.abla"
+ABLA_PACKAGE_CACHE="$generated_cache" "$compiler" build \
+    --project "$generated_application" --fast --no-cache --offline
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$generated_application/build/generated-provider-app"
+generated_vendored_status=$?
+set -e
+[[ $generated_vendored_status -eq 41 ]]
+
 printf '%s\n' \
-    'package providers: compile-time descriptor, immutable lock, offline cache, explicit update, and vendor fallback passed'
+    'package providers: typed Git and generated sources, immutable lock, offline cache, explicit update, and vendor fallback passed'

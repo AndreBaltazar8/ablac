@@ -478,7 +478,9 @@ class BootstrapImportProviderDiscovery(
 fun bootstrapEvaluateImportProvider(
     expression: string,
     ordered: array<BootstrapModuleSnapshot>,
-    current: BootstrapParseResult
+    current: BootstrapParseResult,
+    resolve: bool = false,
+    resolveEffects: int = 0
 ): BootstrapImportProviderResult {
     val declarations: array<BootstrapDeclaration> = []
     var moduleIndex = 0
@@ -497,26 +499,38 @@ fun bootstrapEvaluateImportProvider(
         declarations.append(current.declarations[declaration])
         declaration = declaration + 1
     }
-    val parsed = bootstrapParse("#$expression")
+    var requestedExpression = expression
+    if (resolve) requestedExpression =
+        "__ablaResolveImportSource($expression)"
+    val parsed = bootstrapParse("#$requestedExpression")
     var errors = parsed.errors
     var diagnostic = ""
-    var dependency = BootstrapPackageDependency("", "", "", "")
+    var dependency = BootstrapPackageDependency(
+        "", "", "", "", "", "", "", "", []
+    )
     if (errors == 0 && parsed.actions.size == 1) {
+        // Bit 1024 is private authority to invoke a deferred ImportSource
+        // resolver; ordinary compile-time evaluation never receives it.
+        val allowedEffects = if (resolve) resolveEffects + 1024 else 0
         val evaluated = bootstrapEvaluateWithEffects(
-            parsed.actions[0], declarations, 0
+            parsed.actions[0], declarations, allowedEffects
         )
         errors = errors + evaluated.errors
         diagnostic = evaluated.diagnostics
-        if (evaluated.value.kind == "string") {
-            val decoded = bootstrapPackageDependencyFromDescriptor(
-                evaluated.value.text
+        if (resolve && evaluated.errors > 0) {
+            diagnostic = "${diagnostic}error[E_IMPORT_PROVIDER_EFFECT_DENIED]: deferred resolver failed; authorize any required effects in the root manifest compileCapabilities\n"
+        }
+        if (evaluated.value.kind == "object" &&
+            evaluated.value.owner == "ImportSource") {
+            val decoded = bootstrapPackageDependencyFromValue(
+                evaluated.value, resolve
             )
             dependency = decoded.dependency
             errors = errors + decoded.errors
             diagnostic = "$diagnostic${decoded.diagnostic}"
         } else {
             errors = errors + 1
-            diagnostic = "${diagnostic}error[E_IMPORT_PROVIDER_RESULT]: import provider '$expression' must return a Git import source descriptor\n"
+            diagnostic = "${diagnostic}error[E_IMPORT_PROVIDER_RESULT]: import provider '$expression' must return ImportSource\n"
         }
     } else {
         errors = errors + 1
@@ -526,7 +540,9 @@ fun bootstrapEvaluateImportProvider(
 }
 
 fun bootstrapDiscoverImportProviders(
-    entry: string
+    entry: string,
+    resolve: bool = false,
+    resolveEffects: int = 0
 ): BootstrapPackageDependencies {
     val discovery = BootstrapImportProviderDiscovery(
         bootstrapModuleState(), [], [], 0, ""
@@ -540,7 +556,8 @@ fun bootstrapDiscoverImportProviders(
         while (providerIndex < snapshot.providers.size) {
             val provider = bootstrapEvaluateImportProvider(
                 snapshot.providers[providerIndex], discovery.ordered,
-                BootstrapParseResult([], [], 0, 0, [], [], "")
+                BootstrapParseResult([], [], 0, 0, [], [], ""),
+                resolve, resolveEffects
             )
             discovery.errors = discovery.errors + provider.errors
             discovery.diagnostics =

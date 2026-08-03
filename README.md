@@ -127,16 +127,18 @@ build/ablac repl
 build/ablac serve program.ab
 ```
 
-Projects can import locked Git packages through compile-time source providers:
+Projects can import locked packages through typed compile-time source
+providers:
 
 ```abla
 #import(github("AndreBaltazar8/abla-mvc"))
 ```
 
 Run `build/ablac package update --project .` to resolve/update `abla.lock`;
-ordinary and `--offline` builds never change locked revisions. See
-[package imports](docs/packages.md) for custom provider functions and
-vendoring.
+ordinary and `--offline` builds never change locked revisions. Providers can
+use Git or return generated source files directly. See [package
+imports](docs/packages.md) for the `ImportSource` protocol, custom providers,
+and vendoring.
 
 The raw x86-64 Linux target emits a static executable with its own startup,
 allocator, and system-call boundary, without a C runtime, libc, ELF interpreter,
