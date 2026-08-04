@@ -1,5 +1,41 @@
 #include "abla_runtime.h"
 
+int8_t ablaCompilerTypeNeedsNormalization(
+    const char* type,
+    int64_t length
+) {
+    if (type == NULL || length <= 0) return 0;
+    const unsigned char first = (unsigned char)type[0];
+    const unsigned char last = (unsigned char)type[length - 1];
+    if (first == ' ' || last == ' ' || last == '?' ||
+        first == 'F' || first == '(') return 1;
+    if (length == 3 && first == 'i' && type[1] == 'n' && type[2] == 't') {
+        return 1;
+    }
+    if (length >= 6 && first == 'a' &&
+        type[1] == 'r' && type[2] == 'r' && type[3] == 'a' &&
+        type[4] == 'y' && type[5] == '<') return 1;
+    if (length >= 7 && first == 'S' &&
+        type[1] == 'h' && type[2] == 'a' && type[3] == 'r' &&
+        type[4] == 'e' && type[5] == 'd' && type[6] == '<') return 1;
+    if (length >= 5 && first == 'W' &&
+        type[1] == 'e' && type[2] == 'a' && type[3] == 'k' &&
+        type[4] == '<') return 1;
+    if (length >= 6 && first == 'M' &&
+        type[1] == 'u' && type[2] == 't' && type[3] == 'e' &&
+        type[4] == 'x' && type[5] == '<') return 1;
+    if (length >= 5 && first == 'C' &&
+        type[1] == 'e' && type[2] == 'l' && type[3] == 'l' &&
+        type[4] == '<') return 1;
+    if (length >= 7 && first == 'B' &&
+        type[1] == 'o' && type[2] == 'r' && type[3] == 'r' &&
+        type[4] == 'o' && type[5] == 'w' && type[6] == '<') return 1;
+    if (length >= 7 && first == 'b' &&
+        type[1] == 'o' && type[2] == 'r' && type[3] == 'r' &&
+        type[4] == 'o' && type[5] == 'w' && type[6] == '(') return 1;
+    return 0;
+}
+
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,6 +148,7 @@ static const char* string_data(AblaString value) {
     }
     flattened[value.length] = '\0';
     value.rope->flattened = flattened;
+    abla_platform_memory_set_cache_owner(flattened, value.rope);
     return flattened;
 }
 

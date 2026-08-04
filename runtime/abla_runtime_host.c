@@ -41,6 +41,7 @@ union AblaAllocationHeader {
         size_t size;
         size_t scan_size;
         uint8_t scan_layout;
+        AblaStringRope* cache_owner;
     } allocation;
     max_align_t alignment;
 };
@@ -208,6 +209,7 @@ static const char* host_string_storage(AblaString value) {
     }
     flattened[value.length] = '\0';
     value.rope->flattened = flattened;
+    abla_platform_memory_set_cache_owner(flattened, value.rope);
     return flattened;
 }
 
@@ -334,6 +336,7 @@ void* abla_platform_alloc(size_t size) {
     // Platform allocations are native bytes unless the caller publishes a
     // managed layout immediately after allocation.
     header->allocation.scan_layout = 1;
+    header->allocation.cache_owner = NULL;
     if (host_allocation_tail != NULL) {
         host_allocation_tail->allocation.next = header;
     } else {
@@ -380,6 +383,14 @@ void abla_platform_memory_set_layout(void* pointer, int64_t layout) {
     }
     AblaAllocationHeader* header = ((AblaAllocationHeader*)pointer) - 1;
     header->allocation.scan_layout = (uint8_t)layout;
+}
+
+void abla_platform_memory_set_cache_owner(void* pointer, void* owner) {
+    if (pointer == NULL || owner == NULL) {
+        abla_platform_panic("invalid cache owner", 19);
+    }
+    AblaAllocationHeader* header = ((AblaAllocationHeader*)pointer) - 1;
+    header->allocation.cache_owner = (AblaStringRope*)owner;
 }
 
 _Noreturn void abla_platform_panic(const char* message, size_t length) {
@@ -1123,28 +1134,14 @@ AblaValue ablaHostMemoryReset(AblaValue checkpoint_value) {
     if (checkpoint < 0 || (uint64_t)checkpoint > host_allocation_generation) {
         abla_platform_panic("invalid memory checkpoint", 25);
     }
-    // Flattening an older rope may allocate its cache inside a temporary
-    // generation. Do not leave that rope pointing at bytes the reset is about
-    // to release. Cache payloads are always tracked allocations, so their
-    // header records whether they are newer than the checkpoint.
-    AblaAllocationHeader* retained = host_allocation_head;
-    while (retained != NULL &&
-        retained->allocation.generation <= (uint64_t)checkpoint) {
-        if (retained->allocation.scan_layout == 6 &&
-            retained->allocation.size >= sizeof(AblaStringRope)) {
-            AblaStringRope* rope = (AblaStringRope*)(retained + 1);
-            if (rope->flattened != NULL) {
-                const AblaAllocationHeader* cache =
-                    ((const AblaAllocationHeader*)rope->flattened) - 1;
-                if (cache->allocation.generation > (uint64_t)checkpoint) {
-                    rope->flattened = NULL;
-                }
-            }
-        }
-        retained = retained->allocation.next;
-    }
     while (host_allocation_tail != NULL &&
         host_allocation_tail->allocation.generation > (uint64_t)checkpoint) {
+        AblaAllocationHeader* released = host_allocation_tail;
+        if (released->allocation.cache_owner != NULL &&
+            released->allocation.cache_owner->flattened ==
+                (char*)(released + 1)) {
+            released->allocation.cache_owner->flattened = NULL;
+        }
         abla_platform_free((void*)(host_allocation_tail + 1));
     }
     return host_value_void();

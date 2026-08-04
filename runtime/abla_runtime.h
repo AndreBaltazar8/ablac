@@ -156,6 +156,11 @@ int64_t abla_platform_memory_limit(void);
 void abla_platform_memory_set_limit(int64_t limit);
 void abla_platform_memory_set_scan(void* pointer, int64_t scan_size);
 void abla_platform_memory_set_layout(void* pointer, int64_t layout);
+void abla_platform_memory_set_cache_owner(void* pointer, void* owner);
+int8_t ablaCompilerTypeNeedsNormalization(
+    const char* type,
+    int64_t length
+);
 int64_t abla_platform_memory_collect(void* root_frames);
 void abla_runtime_roots_push(
     AblaRuntimeRootFrame* frame,

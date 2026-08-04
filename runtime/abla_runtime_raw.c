@@ -18,6 +18,11 @@ static void* raw_as_pointer(AblaValue value) {
     return (void*)(uintptr_t)(uint64_t)abla_as_i64(value);
 }
 
+void abla_platform_memory_set_cache_owner(void* pointer, void* owner) {
+    (void)pointer;
+    (void)owner;
+}
+
 AblaValue ablaUnsafeAllocate(AblaValue size) {
     void* pointer = abla_platform_alloc((size_t)abla_as_i64(size));
     abla_platform_memory_set_layout(pointer, 10);

@@ -2,7 +2,9 @@ BUILD_DIR := build
 COMPILER := $(BUILD_DIR)/ablac
 COMPILER_PAYLOAD := $(BUILD_DIR)/ablac.bin
 COMPILER_ENTRY := src/orc_main.ab
-COMPILER_SOURCES := $(shell find src -name '*.ab' -type f | sort)
+COMPILER_SOURCES := $(shell find src stdlib -name '*.ab' -type f | sort) \
+	runtime/abla_runtime.c runtime/abla_runtime.h runtime/abla_runtime_host.c \
+	runtime/abla_runtime_raw.c
 
 SOURCE ?=
 OUTPUT ?= $(BUILD_DIR)/program

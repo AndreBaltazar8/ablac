@@ -229,6 +229,105 @@ class BootstrapPartitionEmission(
     val refreshed: int
 )
 
+fun bootstrapNativeParallelism(): int {
+    val detected = linuxCommand("nproc").captureText()
+    var jobs = 0
+    var index = 0
+    while (index < detected.size && detected[index] >= 48 &&
+           detected[index] <= 57) {
+        jobs = jobs * 10 + detected[index] - 48
+        index = index + 1
+    }
+    if (jobs < 1) jobs = 1
+    if (jobs > 32) jobs = 32
+    jobs
+}
+
+fun bootstrapEmitParallelObject(
+    llvmPath: string,
+    objectPath: string
+): int {
+    val jobs = bootstrapNativeParallelism()
+    val partCount = jobs * 2
+    val prefix = "$objectPath.parallel."
+    val split = linuxCommand("llvm-split")
+    split.argument("-j")
+    split.argument("$partCount")
+    split.argument("-o")
+    split.argument(prefix)
+    split.argument(llvmPath)
+    var status = split.run()
+    var next = 0
+    val children: array<int> = []
+    while (status == 0 && next < jobs && next < partCount) {
+        val child = linuxCommand("/proc/self/exe")
+        child.argument("--aot-object")
+        child.argument("$prefix$next")
+        child.argument("$prefix$next.o")
+        val process = child.start().process
+        if (process <= 0) status = 127
+        children.append(process)
+        next = next + 1
+    }
+    var completed = 0
+    while (status == 0 && completed < partCount) {
+        var progressed = false
+        var slot = 0
+        while (slot < children.size) {
+            var observed = LinuxProcessResult(-1, "pending")
+            if (children[slot] > 0) {
+                observed = linuxWaitProcess(children[slot], true)
+            }
+            if (children[slot] > 0 && observed.output != "pending") {
+                progressed = true
+                completed = completed + 1
+                if (observed.status != 0) status = observed.status
+                if (status == 0 && next < partCount) {
+                    val child = linuxCommand("/proc/self/exe")
+                    child.argument("--aot-object")
+                    child.argument("$prefix$next")
+                    child.argument("$prefix$next.o")
+                    val process = child.start().process
+                    if (process <= 0) status = 127
+                    children[slot] = process
+                    next = next + 1
+                } else children[slot] = -1
+            }
+            slot = slot + 1
+        }
+        if (status == 0 && !progressed) {
+            linuxSleepMillisecondsChecked(1)
+        }
+    }
+    if (status != 0) {
+        var slot = 0
+        while (slot < children.size) {
+            if (children[slot] > 0) linuxWaitProcess(children[slot])
+            slot = slot + 1
+        }
+    }
+    if (status == 0) {
+        val combine = linuxCommand("ld.lld")
+        combine.argument("--threads=1")
+        combine.argument("-r")
+        var part = 0
+        while (part < partCount) {
+            combine.argument("$prefix$part.o")
+            part = part + 1
+        }
+        combine.argument("-o")
+        combine.argument(objectPath)
+        status = combine.run()
+    }
+    var cleanup = 0
+    while (cleanup < partCount) {
+        Path("$prefix$cleanup").remove()
+        Path("$prefix$cleanup.o").remove()
+        cleanup = cleanup + 1
+    }
+    status
+}
+
 fun bootstrapReplaceAll(
     source: string,
     expected: string,
@@ -756,7 +855,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 reusedNativePartitions = partitioned.reused
                 refreshedNativePartitions = partitioned.refreshed
             } else if (status == 0) {
-                status = emitObject(llvmPath, objectPath)
+                val llvmInfo = Path(llvmPath).info()
+                if (cacheProfile == "inprocess-o2" && target.hosted &&
+                    llvmInfo.isFile() && llvmInfo.size > 8388608 &&
+                    bootstrapNativeParallelism() > 1) {
+                    status = bootstrapEmitParallelObject(
+                        llvmPath, objectPath
+                    )
+                } else status = emitObject(llvmPath, objectPath)
             }
             if (status == 0 && allowCache && compileInputsCacheable &&
                 Path(cacheDirectory).createDirectories()) {
