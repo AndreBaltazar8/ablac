@@ -673,6 +673,73 @@ compiler-only hygiene marker that source and ordinary syntax builders cannot
 mint. Complete overload/conversion maps and populated generic substitutions
 remain later refinements.
 
+## Cleanup, generators, tasks, and threads
+
+`defer` registers lexical cleanup. Registrations run in last-in, first-out
+order before affine locals are dropped, on block fallthrough and on `return`,
+`break`, or `continue`:
+
+```abla
+fun useConnection(): void {
+    val connection = openConnection()
+    defer { connection.close() }
+    consume(connection)
+}
+```
+
+The body must produce `void`. A `defer` body cannot itself return, break, or
+continue. Registration is conditional only when the `defer` is inside an
+explicit conditional block. Normal scope and coroutine-cancellation cleanup is
+guaranteed; panic recovery remains abortive and does not unwind defers.
+
+A generator is a lazy, synchronous, single-pass sequence:
+
+```abla
+val values = generator {
+    yield 20
+    yield 22
+}
+
+for (value in values) {
+    consume(value)
+}
+```
+
+Its inferred/public type is `Generator<T>`. `yield` suspends the generator
+without unwinding its locals. Exhaustion, breaking out of its `for`, or dropping
+it closes the generator and runs its defers and affine cleanup. The initial
+implementation requires at least one yield and restricts yielded values to
+non-borrowed, non-affine types.
+
+`task` creates a stackful cooperative coroutine on the current OS thread;
+`await` consumes it and produces its result:
+
+```abla
+val parse = task { parseDocument(source) }
+val document = await parse
+```
+
+Tasks begin when scheduled by `await`; an awaiting task may schedule another
+task without blocking an OS thread. A task has type `Task<T>`. Task results are
+currently restricted to non-borrowed, non-affine values.
+
+`thread` starts an OS thread immediately. Awaiting its `Thread<T>` joins it;
+dropping an unawaited thread also joins it, so a lexical scope cannot leave a
+worker detached:
+
+```abla
+val workerState = state.clone()
+val worker = thread { workerState.with(processBatch) }
+val result = await worker
+```
+
+Thread closures may capture only moved `Shared<T>`, `Mutex<T>`, and `Weak<T>`
+handles in this first version, and may not mutate an ordinary captured place.
+Clone a shared handle before capture when the parent also needs it. Thread
+results, like task results, must currently be non-borrowed and non-affine.
+
+These suspension and OS-thread runtimes currently require a hosted target.
+
 ## Modules and imports
 
 The prototype spelling remains valid:

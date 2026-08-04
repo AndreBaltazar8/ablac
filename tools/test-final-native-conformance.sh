@@ -46,6 +46,8 @@ fixtures=(
     types-valid:7
     compiler-reflection:42
     return-control:42
+    defer:42
+    concurrency:42
     loop-control:42
     for-range:42
     definite-assignment:42

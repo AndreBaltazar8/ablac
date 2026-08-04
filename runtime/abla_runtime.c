@@ -27,6 +27,16 @@ int8_t ablaCompilerTypeNeedsNormalization(
     if (length >= 5 && first == 'C' &&
         type[1] == 'e' && type[2] == 'l' && type[3] == 'l' &&
         type[4] == '<') return 1;
+    if (length >= 10 && first == 'G' &&
+        type[1] == 'e' && type[2] == 'n' && type[3] == 'e' &&
+        type[4] == 'r' && type[5] == 'a' && type[6] == 't' &&
+        type[7] == 'o' && type[8] == 'r' && type[9] == '<') return 1;
+    if (length >= 5 && first == 'T' &&
+        type[1] == 'a' && type[2] == 's' && type[3] == 'k' &&
+        type[4] == '<') return 1;
+    if (length >= 7 && first == 'T' &&
+        type[1] == 'h' && type[2] == 'r' && type[3] == 'e' &&
+        type[4] == 'a' && type[5] == 'd' && type[6] == '<') return 1;
     if (length >= 7 && first == 'B' &&
         type[1] == 'o' && type[2] == 'r' && type[3] == 'r' &&
         type[4] == 'o' && type[5] == 'w' && type[6] == '<') return 1;
@@ -350,10 +360,9 @@ AblaValue abla_shared_lock(AblaValue value) {
     return control->value;
 }
 
-AblaValue abla_shared_unlock(AblaValue value) {
+void abla_shared_unlock(AblaValue value) {
     AblaSharedControl* control = shared_control(value);
     atomic_store_explicit(&control->lock, 0, memory_order_release);
-    return abla_void();
 }
 
 AblaValue abla_shared_release(AblaValue value) {
@@ -451,6 +460,10 @@ AblaValue abla_equal(AblaValue left, AblaValue right) {
     case ABLA_OBJECT: return abla_bool(left.as.object == right.as.object);
     case ABLA_SHARED: return abla_bool(left.as.shared == right.as.shared);
     case ABLA_WEAK: return abla_bool(left.as.weak == right.as.weak);
+    case ABLA_GENERATOR:
+    case ABLA_TASK:
+    case ABLA_THREAD:
+        return abla_bool(left.as.concurrent == right.as.concurrent);
     }
     return abla_bool(false);
 }

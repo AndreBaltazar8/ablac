@@ -16,7 +16,10 @@ typedef enum AblaTag {
     ABLA_ARRAY,
     ABLA_OBJECT,
     ABLA_SHARED,
-    ABLA_WEAK
+    ABLA_WEAK,
+    ABLA_GENERATOR,
+    ABLA_TASK,
+    ABLA_THREAD
 } AblaTag;
 
 typedef struct AblaValue AblaValue;
@@ -49,8 +52,16 @@ struct AblaValue {
         AblaObject* object;
         AblaSharedControl* shared;
         AblaSharedControl* weak;
+        void* concurrent;
     } as;
 };
+
+typedef void (*AblaDispatch)(
+    AblaValue* output,
+    const AblaValue* closure,
+    const AblaValue* arguments,
+    uint64_t count);
+typedef void (*AblaClosureCleanup)(const AblaValue* closure);
 
 struct AblaRuntimeRootFrame {
     AblaRuntimeRootFrame* previous;
@@ -169,6 +180,29 @@ void abla_runtime_roots_push(
 void abla_runtime_roots_pop(AblaRuntimeRootFrame* frame);
 void abla_runtime_memory_pressure(void);
 
+AblaValue abla_generator_create(
+    AblaValue closure,
+    AblaDispatch dispatch,
+    AblaClosureCleanup release,
+    AblaClosureCleanup drop);
+AblaValue abla_generator_next(AblaValue generator);
+AblaValue abla_generator_value(AblaValue generator);
+AblaValue abla_generator_yield(AblaValue value);
+AblaValue abla_generator_drop(AblaValue generator);
+AblaValue abla_task_create(
+    AblaValue closure,
+    AblaDispatch dispatch,
+    AblaClosureCleanup release,
+    AblaClosureCleanup drop);
+AblaValue abla_task_drop(AblaValue task);
+AblaValue abla_thread_create(
+    AblaValue closure,
+    AblaDispatch dispatch,
+    AblaClosureCleanup release,
+    AblaClosureCleanup drop);
+AblaValue abla_thread_drop(AblaValue thread);
+AblaValue abla_await(AblaValue operation);
+
 int64_t abla_as_i64(AblaValue value);
 bool abla_as_bool(AblaValue value);
 const char* abla_as_cstring(AblaValue value);
@@ -197,7 +231,7 @@ AblaValue abla_shared_create(AblaValue value);
 AblaValue abla_shared_clone(AblaValue value);
 AblaValue abla_shared_get(AblaValue value);
 AblaValue abla_shared_lock(AblaValue value);
-AblaValue abla_shared_unlock(AblaValue value);
+void abla_shared_unlock(AblaValue value);
 AblaValue abla_shared_release(AblaValue value);
 AblaValue abla_weak_create(AblaValue value);
 AblaValue abla_weak_clone(AblaValue value);

@@ -466,6 +466,30 @@ fun bootstrapArrayElementType(type: string): string {
     else "unknown"
 }
 
+fun bootstrapIsGeneratorType(type: string): bool =
+    type.size >= 10 && type.slice(0, 10) == "generator:"
+
+fun bootstrapGeneratorElementType(type: string): string {
+    if (bootstrapIsGeneratorType(type)) type.slice(10, type.size)
+    else "unknown"
+}
+
+fun bootstrapIsTaskType(type: string): bool =
+    type.size >= 5 && type.slice(0, 5) == "task:"
+
+fun bootstrapTaskResultType(type: string): string {
+    if (bootstrapIsTaskType(type)) type.slice(5, type.size)
+    else "unknown"
+}
+
+fun bootstrapIsThreadType(type: string): bool =
+    type.size >= 7 && type.slice(0, 7) == "thread:"
+
+fun bootstrapThreadResultType(type: string): string {
+    if (bootstrapIsThreadType(type)) type.slice(7, type.size)
+    else "unknown"
+}
+
 fun bootstrapFunctionClose(type: string, begin: int): int {
     var close = -1
     var depth = 0
@@ -791,6 +815,21 @@ fun bootstrapNormalizeTypeSlow(type: string): string {
         type.slice(type.size - 1, type.size) == ">") {
         val element = bootstrapNormalizeType(type.slice(5, type.size - 1))
         result = "cell:$element"
+    }
+    if (type.size >= 12 && type.slice(0, 10) == "Generator<" &&
+        type.slice(type.size - 1, type.size) == ">") {
+        val element = bootstrapNormalizeType(type.slice(10, type.size - 1))
+        result = "generator:$element"
+    }
+    if (type.size >= 7 && type.slice(0, 5) == "Task<" &&
+        type.slice(type.size - 1, type.size) == ">") {
+        val element = bootstrapNormalizeType(type.slice(5, type.size - 1))
+        result = "task:$element"
+    }
+    if (type.size >= 9 && type.slice(0, 7) == "Thread<" &&
+        type.slice(type.size - 1, type.size) == ">") {
+        val element = bootstrapNormalizeType(type.slice(7, type.size - 1))
+        result = "thread:$element"
     }
     if (type.size >= 9 && type[0] == 66 && type[1] == 111 &&
         type[2] == 114 && type[3] == 114 && type[4] == 111 &&
@@ -1251,6 +1290,27 @@ fun bootstrapExpressionBreaksCurrentLoop(
     breaks
 }
 
+fun bootstrapExpressionContainsDeferredControl(
+    expression: BootstrapExpression
+): bool {
+    var found = expression.kind == "return" || expression.kind == "break" ||
+        expression.kind == "continue"
+    if (expression.kind == "lambda" || expression.kind == "lambda.move") {
+        found = false
+        bootstrapSemanticUnit()
+    } else {
+        var child = 0
+        while (!found && child < expression.children.size) {
+            found = bootstrapExpressionContainsDeferredControl(
+                expression.children[child]
+            )
+            child = child + 1
+        }
+        bootstrapSemanticUnit()
+    }
+    found
+}
+
 fun bootstrapAffineNamesContain(
     names: array<string>,
     name: string
@@ -1275,6 +1335,9 @@ fun bootstrapSummaryTypeIsAffineAt(
         bootstrapIsSharedType(normalized) ||
         bootstrapIsWeakType(normalized) ||
         bootstrapIsMutexType(normalized) ||
+        bootstrapIsGeneratorType(normalized) ||
+        bootstrapIsTaskType(normalized) ||
+        bootstrapIsThreadType(normalized) ||
         bootstrapAffineNamesContain(names, normalized)
     if (!affine && depth < 32 && bootstrapIsNullableType(normalized)) {
         affine = bootstrapSummaryTypeIsAffineAt(
@@ -2453,7 +2516,9 @@ class BootstrapAnalyzer(
     var trustedDepth: int,
     var regionDepth: int,
     var regionScope: int,
-    var compileDepth: int
+    var compileDepth: int,
+    var generatorDepth: int,
+    var yieldedType: string
 ) {
     fun fail(code: string) {
         this.errors = this.errors + 1
@@ -3841,7 +3906,8 @@ class BootstrapAnalyzer(
             this.appendUniqueCaptureName(names, expression.text)
         }
         if (expression.kind != "lambda" &&
-            expression.kind != "lambda.move") {
+            expression.kind != "lambda.move" &&
+            expression.kind != "lambda.generator") {
             var child = 0
             while (child < expression.children.size) {
                 this.collectLambdaLocalNames(expression.children[child], names)
@@ -3867,7 +3933,8 @@ class BootstrapAnalyzer(
     ): void {
         var nested = false
         if (expression.kind == "lambda" ||
-            expression.kind == "lambda.move") {
+            expression.kind == "lambda.move" ||
+            expression.kind == "lambda.generator") {
             nested = true
             val nestedBound: array<string> = []
             var inherited = 0
@@ -3994,10 +4061,12 @@ class BootstrapAnalyzer(
             }
             if (this.hasVisibleLocal(name) &&
                 this.typeIsAffine(this.findType(name))) {
-                if (expression.kind != "lambda.move") {
+                if (expression.kind != "lambda.move" &&
+                    expression.kind != "lambda.generator") {
                     this.fail("ownership.capture-move-required:$name")
                 }
-                if (expression.kind == "lambda.move" &&
+                if ((expression.kind == "lambda.move" ||
+                     expression.kind == "lambda.generator") &&
                     !this.hasMovableLocal(name)) {
                     this.fail("ownership.borrow-capture:$name")
                 }
@@ -4008,6 +4077,61 @@ class BootstrapAnalyzer(
             }
             capture = capture + 1
         }
+    }
+
+    fun threadCaptureTypeIsSend(type: string): bool {
+        val normalized = bootstrapNormalizeType(type)
+        bootstrapIsSharedType(normalized) ||
+            bootstrapIsMutexType(normalized) ||
+            bootstrapIsWeakType(normalized)
+    }
+
+    fun validateThreadCaptures(body: BootstrapExpression): void {
+        val bound: array<string> = []
+        this.collectLambdaLocalNames(body, bound)
+        if (this.lambdaMutatesCapturedPlace(body, bound)) {
+            this.fail("thread.capture-mutation")
+        }
+        val captures: array<string> = []
+        this.collectLambdaCaptureNames(body, bound, captures)
+        var capture = 0
+        while (capture < captures.size) {
+            val name = captures[capture]
+            if (this.hasVisibleLocal(name) &&
+                !this.threadCaptureTypeIsSend(this.findType(name))) {
+                this.fail(
+                    "thread.capture-type:$name:${this.findType(name)}"
+                )
+            }
+            capture = capture + 1
+        }
+        if (this.threadUsesMutableGlobal(body)) {
+            this.fail("thread.mutable-global")
+        }
+    }
+
+    fun threadUsesMutableGlobal(expression: BootstrapExpression): bool {
+        var found = false
+        if ((expression.kind == "identifier" ||
+             expression.kind == "assign") &&
+            this.findKind(expression.text) == "var") found = true
+        if ((expression.kind == "member.assign" ||
+             expression.kind == "index.assign") &&
+            expression.children.size > 0) {
+            val root = bootstrapPlaceRootName(expression.children[0])
+            if (root != "" && this.findKind(root) == "var") found = true
+        }
+        if (expression.kind != "lambda" &&
+            expression.kind != "lambda.move") {
+            var child = 0
+            while (!found && child < expression.children.size) {
+                found = this.threadUsesMutableGlobal(
+                    expression.children[child]
+                )
+                child = child + 1
+            }
+        }
+        found
     }
 
     fun borrowArgumentSource(expression: BootstrapExpression): string {
@@ -4384,7 +4508,8 @@ class BootstrapAnalyzer(
             )
         }
         if (expression.kind == "lambda" ||
-            expression.kind == "lambda.move") {
+            expression.kind == "lambda.move" ||
+            expression.kind == "lambda.generator") {
             this.validateLambdaCaptures(expression)
             val previousScope = this.enterScope()
             val previousResultType = this.currentResultType
@@ -4392,10 +4517,16 @@ class BootstrapAnalyzer(
                 this.currentBorrowResultSource
             val previousReturnedType = this.returnedType
             val previousLoopDepth = this.loopDepth
+            val previousGeneratorDepth = this.generatorDepth
+            val previousYieldedType = this.yieldedType
             this.currentResultType = "inferred"
             this.currentBorrowResultSource = ""
             this.returnedType = "unknown"
             this.loopDepth = 0
+            if (expression.kind != "lambda.generator") {
+                this.generatorDepth = 0
+                this.yieldedType = "unknown"
+            }
             var parameters = ""
             var parameter = 0
             while (parameter + 1 < expression.children.size) {
@@ -4434,9 +4565,14 @@ class BootstrapAnalyzer(
             this.currentBorrowResultSource = previousBorrowResultSource
             this.returnedType = previousReturnedType
             this.loopDepth = previousLoopDepth
+            if (expression.kind != "lambda.generator") {
+                this.generatorDepth = previousGeneratorDepth
+                this.yieldedType = previousYieldedType
+            }
             this.leaveScope(previousScope)
             val functionType = "function:($parameters)->$bodyType"
-            if (expression.kind == "lambda.move") {
+            if (expression.kind == "lambda.move" ||
+                expression.kind == "lambda.generator") {
                 result = "once:$functionType"
             } else if (this.lambdaRequiresMutableCall(expression)) {
                 result = "mut:$functionType"
@@ -5158,6 +5294,110 @@ class BootstrapAnalyzer(
             }
             this.leaveScope(previousScope)
         }
+        if (expression.kind == "defer") {
+            if (expression.children.size != 1 ||
+                expression.children[0].kind == "missing") {
+                this.fail("defer.body")
+            }
+            if (expression.children.size == 1 &&
+                bootstrapExpressionContainsDeferredControl(
+                    expression.children[0]
+                )) this.fail("defer.control")
+            var deferredType = "once:function:()->void"
+            if (expression.children.size == 1 &&
+                expression.children[0].kind != "missing") {
+                deferredType = this.infer(BootstrapExpression(
+                    "lambda.move",
+                    "",
+                    expression.begin,
+                    expression.end,
+                    [expression.children[0]]
+                ))
+            }
+            if (deferredType != "once:function:()->void") {
+                this.fail("defer.result")
+            }
+            result = "void"
+        }
+        if (expression.kind == "generator") {
+            if (expression.children.size != 1 ||
+                expression.children[0].kind == "missing") {
+                this.fail("generator.body")
+                result = "generator:unknown"
+            } else {
+                val previousGeneratorDepth = this.generatorDepth
+                val previousYieldedType = this.yieldedType
+                this.generatorDepth = this.generatorDepth + 1
+                this.yieldedType = "unknown"
+                val callable = this.infer(BootstrapExpression(
+                    "lambda.generator",
+                    "",
+                    expression.begin,
+                    expression.end,
+                    [expression.children[0]]
+                ))
+                val element = this.yieldedType
+                this.generatorDepth = previousGeneratorDepth
+                this.yieldedType = previousYieldedType
+                if (bootstrapFunctionResultType(callable) != "void") {
+                    this.fail("generator.result")
+                }
+                if (element == "unknown") this.fail("generator.empty")
+                result = "generator:$element"
+            }
+        }
+        if (expression.kind == "yield") {
+            if (this.generatorDepth <= 0) this.fail("yield.outside-generator")
+            var found = "unknown"
+            if (expression.children.size == 1) {
+                found = this.infer(expression.children[0])
+            } else this.fail("yield.value")
+            if (bootstrapIsBorrowType(found) || this.typeIsAffine(found)) {
+                this.fail("yield.affine:$found")
+            }
+            if (this.yieldedType == "unknown") this.yieldedType = found
+            else if (!bootstrapTypesCompatible(this.yieldedType, found)) {
+                this.fail("yield.type")
+            }
+            result = "void"
+        }
+        if (expression.kind == "task" || expression.kind == "thread") {
+            if (expression.children.size != 1 ||
+                expression.children[0].kind == "missing") {
+                this.fail("${expression.kind}.body")
+                result = "${expression.kind}:unknown"
+            } else {
+                if (expression.kind == "thread") {
+                    this.validateThreadCaptures(expression.children[0])
+                }
+                val callable = this.infer(BootstrapExpression(
+                    "lambda.move",
+                    "",
+                    expression.begin,
+                    expression.end,
+                    [expression.children[0]]
+                ))
+                val found = bootstrapFunctionResultType(callable)
+                if (bootstrapIsBorrowType(found) || this.typeIsAffine(found)) {
+                    this.fail("${expression.kind}.affine-result:$found")
+                }
+                result = "${expression.kind}:$found"
+            }
+        }
+        if (expression.kind == "await") {
+            var operation = "unknown"
+            if (expression.children.size == 1) {
+                operation = this.infer(expression.children[0])
+            } else this.fail("await.operation")
+            if (bootstrapIsTaskType(operation)) {
+                result = bootstrapTaskResultType(operation)
+            } else if (bootstrapIsThreadType(operation)) {
+                result = bootstrapThreadResultType(operation)
+            } else {
+                this.fail("await.type:$operation")
+                result = "unknown"
+            }
+        }
         if (expression.kind == "return") {
             if (this.regionDepth > 0) this.fail("region.control:return")
             var returned = "void"
@@ -5437,6 +5677,9 @@ class BootstrapAnalyzer(
             var elementType = "unknown"
             if (bootstrapIsArrayType(sourceType)) {
                 elementType = bootstrapArrayElementType(sourceType)
+            }
+            if (bootstrapIsGeneratorType(sourceType)) {
+                elementType = bootstrapGeneratorElementType(sourceType)
             }
             if (sourceType == "string") elementType = "i64"
             if (elementType == "unknown") this.fail("for.source")
@@ -6183,7 +6426,9 @@ fun bootstrapAnalyzeRequestedSpans(
         0,
         0,
         -1,
-        0
+        0,
+        0,
+        "unknown"
     ).analyze(parsed)
 }
 

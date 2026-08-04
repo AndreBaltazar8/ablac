@@ -8,8 +8,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <setjmp.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +20,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -56,8 +59,10 @@ static size_t host_allocation_live_bytes;
 // the enforced address-space envelope.
 static size_t host_allocation_limit = (size_t)1024 * 1024 * 1024;
 static bool host_allocation_limit_initialized;
-static AblaRuntimeRootFrame* host_root_frame;
+static _Thread_local AblaRuntimeRootFrame* host_root_frame;
 static size_t host_collection_threshold = (size_t)256 * 1024 * 1024;
+static pthread_mutex_t host_heap_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_size_t host_active_threads;
 typedef struct AblaCheckedFrame {
     jmp_buf jump;
     struct AblaCheckedFrame* previous;
@@ -69,6 +74,43 @@ static AblaAllocationHeader** host_collection_index;
 static size_t host_collection_index_count;
 static AblaAllocationHeader** host_mark_worklist;
 static size_t host_mark_worklist_count;
+
+typedef enum AblaHostCoroutineState {
+    ABLA_COROUTINE_CREATED,
+    ABLA_COROUTINE_RUNNING,
+    ABLA_COROUTINE_SUSPENDED,
+    ABLA_COROUTINE_DONE
+} AblaHostCoroutineState;
+
+typedef struct AblaHostCoroutine {
+    AblaValue closure;
+    AblaValue current;
+    AblaValue result;
+    AblaDispatch dispatch;
+    AblaClosureCleanup release;
+    AblaClosureCleanup drop;
+    AblaRuntimeRootFrame* roots;
+    AblaRuntimeRootFrame* caller_roots;
+    void* stack;
+    size_t stack_size;
+    AblaHostCoroutineState state;
+    bool generator;
+    bool cancelled;
+    ucontext_t context;
+    ucontext_t caller;
+} AblaHostCoroutine;
+
+typedef struct AblaHostThread {
+    AblaValue closure;
+    AblaValue result;
+    AblaDispatch dispatch;
+    AblaClosureCleanup release;
+    AblaClosureCleanup drop;
+    pthread_t native;
+    bool joined;
+} AblaHostThread;
+
+static _Thread_local AblaHostCoroutine* host_current_coroutine;
 
 static void host_initialize_allocation_limit(void) {
     if (host_allocation_limit_initialized) return;
@@ -314,6 +356,7 @@ static AblaValue host_owned_string(const char* data, size_t length) {
 }
 
 void* abla_platform_alloc(size_t size) {
+    (void)pthread_mutex_lock(&host_heap_lock);
     host_initialize_allocation_limit();
     const size_t measured = size == 0 ? 1 : size;
     if (measured > SIZE_MAX - sizeof(AblaAllocationHeader) ||
@@ -345,10 +388,12 @@ void* abla_platform_alloc(size_t size) {
     host_allocation_tail = header;
     host_allocation_live_bytes += measured;
     memset((void*)(header + 1), 0, measured);
-    return (void*)(header + 1);
+    void* result = (void*)(header + 1);
+    (void)pthread_mutex_unlock(&host_heap_lock);
+    return result;
 }
 
-void abla_platform_free(void* pointer) {
+static void host_platform_free_unlocked(void* pointer) {
     if (pointer == NULL) return;
     AblaAllocationHeader* header = ((AblaAllocationHeader*)pointer) - 1;
     if (header->allocation.previous != NULL) {
@@ -366,6 +411,13 @@ void abla_platform_free(void* pointer) {
     free(header);
 }
 
+void abla_platform_free(void* pointer) {
+    if (pointer == NULL) return;
+    (void)pthread_mutex_lock(&host_heap_lock);
+    host_platform_free_unlocked(pointer);
+    (void)pthread_mutex_unlock(&host_heap_lock);
+}
+
 void abla_platform_memory_set_scan(void* pointer, int64_t scan_size) {
     if (pointer == NULL || scan_size < 0) {
         abla_platform_panic("invalid memory scan size", 24);
@@ -378,7 +430,7 @@ void abla_platform_memory_set_scan(void* pointer, int64_t scan_size) {
 }
 
 void abla_platform_memory_set_layout(void* pointer, int64_t layout) {
-    if (pointer == NULL || layout < 0 || layout > 10) {
+    if (pointer == NULL || layout < 0 || layout > 12) {
         abla_platform_panic("invalid memory scan layout", 26);
     }
     AblaAllocationHeader* header = ((AblaAllocationHeader*)pointer) - 1;
@@ -1287,6 +1339,22 @@ static bool host_mark_value(const AblaValue* value) {
         changed = host_mark_pointer((uintptr_t)value->as.shared);
     } else if (value->tag == ABLA_WEAK) {
         changed = host_mark_pointer((uintptr_t)value->as.weak);
+    } else if (value->tag == ABLA_GENERATOR || value->tag == ABLA_TASK ||
+               value->tag == ABLA_THREAD) {
+        changed = host_mark_pointer((uintptr_t)value->as.concurrent);
+    }
+    return changed;
+}
+
+static bool host_mark_root_frames(AblaRuntimeRootFrame* frame) {
+    bool changed = false;
+    while (frame != NULL) {
+        for (uint64_t root = 0; root < frame->count; ++root) {
+            if (host_mark_value((const AblaValue*)frame->roots[root])) {
+                changed = true;
+            }
+        }
+        frame = frame->previous;
     }
     return changed;
 }
@@ -1343,10 +1411,27 @@ static bool host_mark_allocation(const AblaAllocationHeader* header) {
         }
         return changed;
     }
+    if (layout == 11 && size >= sizeof(AblaHostCoroutine)) {
+        const AblaHostCoroutine* coroutine =
+            (const AblaHostCoroutine*)payload;
+        if (host_mark_value(&coroutine->closure)) changed = true;
+        if (host_mark_value(&coroutine->current)) changed = true;
+        if (host_mark_value(&coroutine->result)) changed = true;
+        if (host_mark_root_frames(coroutine->roots)) changed = true;
+        return changed;
+    }
+    if (layout == 12 && size >= sizeof(AblaHostThread)) {
+        const AblaHostThread* thread = (const AblaHostThread*)payload;
+        if (host_mark_value(&thread->closure)) changed = true;
+        if (host_mark_value(&thread->result)) changed = true;
+        return changed;
+    }
     return host_mark_words(payload, size);
 }
 
 int64_t abla_platform_memory_collect(void* opaque_frames) {
+    if (atomic_load_explicit(
+            &host_active_threads, memory_order_acquire) != 0) return 0;
     const size_t before = host_allocation_live_bytes;
     size_t allocation_count = 0;
     for (AblaAllocationHeader* header = host_allocation_tail;
@@ -1387,12 +1472,10 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
             sizeof(*host_collection_index),
             host_compare_allocation_payloads);
     }
-    AblaRuntimeRootFrame* frame = (AblaRuntimeRootFrame*)opaque_frames;
-    while (frame != NULL) {
-        for (uint64_t root = 0; root < frame->count; ++root) {
-            host_mark_value((const AblaValue*)frame->roots[root]);
-        }
-        frame = frame->previous;
+    (void)host_mark_root_frames((AblaRuntimeRootFrame*)opaque_frames);
+    if (host_current_coroutine != NULL) {
+        (void)host_mark_pointer((uintptr_t)host_current_coroutine);
+        (void)host_mark_root_frames(host_current_coroutine->caller_roots);
     }
     while (host_mark_worklist_count != 0) {
         const AblaAllocationHeader* marked =
@@ -1406,7 +1489,7 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
             header->allocation.scan_layout == 10) {
             header->allocation.generation &= INT64_MAX;
         } else {
-            abla_platform_free((void*)(header + 1));
+            host_platform_free_unlocked((void*)(header + 1));
         }
         header = previous;
     }
@@ -1429,6 +1512,260 @@ int64_t abla_platform_memory_limit(void) {
 
 void abla_platform_memory_set_limit(int64_t limit) {
     (void)ablaHostMemorySetLimit(host_value_i64(limit));
+}
+
+static AblaHostCoroutine* host_as_coroutine(
+    AblaValue value,
+    AblaTag expected) {
+    if (value.tag != expected || value.as.concurrent == NULL) {
+        abla_platform_panic("invalid coroutine handle", 24);
+    }
+    return (AblaHostCoroutine*)value.as.concurrent;
+}
+
+static void host_coroutine_entry(uint32_t low, uint32_t high) {
+    const uintptr_t bits = (uintptr_t)low |
+        ((uintptr_t)high << 32);
+    AblaHostCoroutine* coroutine = (AblaHostCoroutine*)bits;
+    AblaValue result = host_value_void();
+    coroutine->dispatch(&result, &coroutine->closure, NULL, 0);
+    coroutine->result = result;
+    coroutine->release(&coroutine->closure);
+    coroutine->closure = (AblaValue){.tag = ABLA_NULL};
+    coroutine->roots = host_root_frame;
+    coroutine->state = ABLA_COROUTINE_DONE;
+    host_root_frame = coroutine->caller_roots;
+    if (swapcontext(&coroutine->context, &coroutine->caller) != 0) {
+        abla_platform_panic("cannot finish coroutine", 23);
+    }
+    abla_platform_panic("resumed completed coroutine", 27);
+}
+
+static AblaHostCoroutine* host_coroutine_create(
+    AblaValue closure,
+    AblaDispatch dispatch,
+    AblaClosureCleanup release,
+    AblaClosureCleanup drop,
+    bool generator) {
+    if (dispatch == NULL || release == NULL || drop == NULL) {
+        abla_platform_panic("invalid coroutine callbacks", 27);
+    }
+    AblaHostCoroutine* coroutine =
+        (AblaHostCoroutine*)abla_platform_alloc(sizeof(*coroutine));
+    abla_platform_memory_set_layout(coroutine, 11);
+    coroutine->closure = closure;
+    coroutine->current = (AblaValue){.tag = ABLA_NULL};
+    coroutine->result = host_value_void();
+    coroutine->dispatch = dispatch;
+    coroutine->release = release;
+    coroutine->drop = drop;
+    coroutine->stack_size = (size_t)1024 * 1024;
+    coroutine->stack = malloc(coroutine->stack_size);
+    if (coroutine->stack == NULL) abla_platform_panic("out of memory", 13);
+    coroutine->state = ABLA_COROUTINE_CREATED;
+    coroutine->generator = generator;
+    coroutine->cancelled = false;
+    if (getcontext(&coroutine->context) != 0) {
+        abla_platform_panic("cannot create coroutine", 23);
+    }
+    coroutine->context.uc_stack.ss_sp = coroutine->stack;
+    coroutine->context.uc_stack.ss_size = coroutine->stack_size;
+    coroutine->context.uc_link = NULL;
+    const uintptr_t bits = (uintptr_t)coroutine;
+    makecontext(
+        &coroutine->context,
+        (void (*)(void))host_coroutine_entry,
+        2,
+        (uint32_t)bits,
+        (uint32_t)(bits >> 32));
+    return coroutine;
+}
+
+static void host_coroutine_resume(AblaHostCoroutine* coroutine) {
+    if (coroutine->state != ABLA_COROUTINE_CREATED &&
+        coroutine->state != ABLA_COROUTINE_SUSPENDED) return;
+    AblaHostCoroutine* previous = host_current_coroutine;
+    coroutine->caller_roots = host_root_frame;
+    host_root_frame = coroutine->roots;
+    host_current_coroutine = coroutine;
+    coroutine->state = ABLA_COROUTINE_RUNNING;
+    if (swapcontext(&coroutine->caller, &coroutine->context) != 0) {
+        abla_platform_panic("cannot resume coroutine", 23);
+    }
+    host_current_coroutine = previous;
+    host_root_frame = coroutine->caller_roots;
+}
+
+static void host_coroutine_free(AblaHostCoroutine* coroutine) {
+    free(coroutine->stack);
+    coroutine->stack = NULL;
+    abla_platform_free(coroutine);
+}
+
+AblaValue abla_generator_create(
+    AblaValue closure,
+    AblaDispatch dispatch,
+    AblaClosureCleanup release,
+    AblaClosureCleanup drop) {
+    AblaHostCoroutine* coroutine = host_coroutine_create(
+        closure, dispatch, release, drop, true);
+    return (AblaValue){
+        .tag = ABLA_GENERATOR,
+        .as.concurrent = coroutine};
+}
+
+AblaValue abla_generator_next(AblaValue generator) {
+    AblaHostCoroutine* coroutine = host_as_coroutine(
+        generator, ABLA_GENERATOR);
+    coroutine->current = (AblaValue){.tag = ABLA_NULL};
+    host_coroutine_resume(coroutine);
+    return host_value_bool(coroutine->state == ABLA_COROUTINE_SUSPENDED);
+}
+
+AblaValue abla_generator_value(AblaValue generator) {
+    AblaHostCoroutine* coroutine = host_as_coroutine(
+        generator, ABLA_GENERATOR);
+    if (coroutine->state != ABLA_COROUTINE_SUSPENDED) {
+        abla_platform_panic("generator has no current value", 30);
+    }
+    return coroutine->current;
+}
+
+AblaValue abla_generator_yield(AblaValue value) {
+    AblaHostCoroutine* coroutine = host_current_coroutine;
+    if (coroutine == NULL || !coroutine->generator) {
+        abla_platform_panic("yield outside generator", 23);
+    }
+    coroutine->current = value;
+    coroutine->roots = host_root_frame;
+    coroutine->state = ABLA_COROUTINE_SUSPENDED;
+    host_root_frame = coroutine->caller_roots;
+    if (swapcontext(&coroutine->context, &coroutine->caller) != 0) {
+        abla_platform_panic("cannot suspend generator", 24);
+    }
+    host_root_frame = coroutine->roots;
+    coroutine->state = ABLA_COROUTINE_RUNNING;
+    return host_value_bool(!coroutine->cancelled);
+}
+
+AblaValue abla_generator_drop(AblaValue generator) {
+    AblaHostCoroutine* coroutine = host_as_coroutine(
+        generator, ABLA_GENERATOR);
+    if (coroutine->state == ABLA_COROUTINE_CREATED) {
+        coroutine->drop(&coroutine->closure);
+        coroutine->closure = (AblaValue){.tag = ABLA_NULL};
+    } else if (coroutine->state == ABLA_COROUTINE_SUSPENDED) {
+        coroutine->cancelled = true;
+        host_coroutine_resume(coroutine);
+    }
+    host_coroutine_free(coroutine);
+    return host_value_void();
+}
+
+AblaValue abla_task_create(
+    AblaValue closure,
+    AblaDispatch dispatch,
+    AblaClosureCleanup release,
+    AblaClosureCleanup drop) {
+    AblaHostCoroutine* coroutine = host_coroutine_create(
+        closure, dispatch, release, drop, false);
+    return (AblaValue){.tag = ABLA_TASK, .as.concurrent = coroutine};
+}
+
+AblaValue abla_task_drop(AblaValue task) {
+    AblaHostCoroutine* coroutine = host_as_coroutine(task, ABLA_TASK);
+    if (coroutine->state == ABLA_COROUTINE_CREATED) {
+        coroutine->drop(&coroutine->closure);
+        coroutine->closure = (AblaValue){.tag = ABLA_NULL};
+    }
+    host_coroutine_free(coroutine);
+    return host_value_void();
+}
+
+static AblaHostThread* host_as_thread(AblaValue value) {
+    if (value.tag != ABLA_THREAD || value.as.concurrent == NULL) {
+        abla_platform_panic("invalid thread handle", 21);
+    }
+    return (AblaHostThread*)value.as.concurrent;
+}
+
+static void* host_thread_entry(void* opaque) {
+    AblaHostThread* thread = (AblaHostThread*)opaque;
+    AblaValue result = host_value_void();
+    thread->dispatch(&result, &thread->closure, NULL, 0);
+    thread->result = result;
+    thread->release(&thread->closure);
+    thread->closure = (AblaValue){.tag = ABLA_NULL};
+    (void)atomic_fetch_sub_explicit(
+        &host_active_threads, 1, memory_order_release);
+    return NULL;
+}
+
+AblaValue abla_thread_create(
+    AblaValue closure,
+    AblaDispatch dispatch,
+    AblaClosureCleanup release,
+    AblaClosureCleanup drop) {
+    if (dispatch == NULL || release == NULL || drop == NULL) {
+        abla_platform_panic("invalid thread callbacks", 24);
+    }
+    AblaHostThread* thread =
+        (AblaHostThread*)abla_platform_alloc(sizeof(*thread));
+    abla_platform_memory_set_layout(thread, 12);
+    thread->closure = closure;
+    thread->result = host_value_void();
+    thread->dispatch = dispatch;
+    thread->release = release;
+    thread->drop = drop;
+    thread->joined = false;
+    (void)atomic_fetch_add_explicit(
+        &host_active_threads, 1, memory_order_release);
+    if (pthread_create(&thread->native, NULL, host_thread_entry, thread) != 0) {
+        (void)atomic_fetch_sub_explicit(
+            &host_active_threads, 1, memory_order_release);
+        thread->drop(&thread->closure);
+        abla_platform_free(thread);
+        abla_platform_panic("cannot create thread", 20);
+    }
+    return (AblaValue){.tag = ABLA_THREAD, .as.concurrent = thread};
+}
+
+static void host_thread_join(AblaHostThread* thread) {
+    if (!thread->joined) {
+        if (pthread_join(thread->native, NULL) != 0) {
+            abla_platform_panic("cannot join thread", 18);
+        }
+        thread->joined = true;
+    }
+}
+
+AblaValue abla_thread_drop(AblaValue value) {
+    AblaHostThread* thread = host_as_thread(value);
+    host_thread_join(thread);
+    abla_platform_free(thread);
+    return host_value_void();
+}
+
+AblaValue abla_await(AblaValue operation) {
+    if (operation.tag == ABLA_TASK) {
+        AblaHostCoroutine* coroutine = host_as_coroutine(
+            operation, ABLA_TASK);
+        host_coroutine_resume(coroutine);
+        if (coroutine->state != ABLA_COROUTINE_DONE) {
+            abla_platform_panic("task did not complete", 21);
+        }
+        const AblaValue result = coroutine->result;
+        host_coroutine_free(coroutine);
+        return result;
+    }
+    if (operation.tag == ABLA_THREAD) {
+        AblaHostThread* thread = host_as_thread(operation);
+        host_thread_join(thread);
+        const AblaValue result = thread->result;
+        abla_platform_free(thread);
+        return result;
+    }
+    abla_platform_panic("await expects task or thread", 28);
 }
 
 AblaValue ablaRuntimeMemoryCollect(void) {

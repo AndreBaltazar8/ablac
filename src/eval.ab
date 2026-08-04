@@ -1081,6 +1081,8 @@ class BootstrapEvaluator(
         if (value.kind == "weak") affine = true
         if (value.kind == "closure" &&
             (value.owner == "mut" || value.owner == "once")) affine = true
+        if (value.kind == "generator" || value.kind == "task" ||
+            value.kind == "thread") affine = true
         if (value.kind == "array") {
             var element = 0
             while (element < value.elements.size && !affine) {
@@ -1121,6 +1123,12 @@ class BootstrapEvaluator(
                     value.elements[capture] = this.uninitializedValue()
                 }
             }
+        }
+        if ((value.kind == "generator" || value.kind == "task" ||
+             value.kind == "thread") && value.elements.size == 1 &&
+            value.elements[0].kind != "uninitialized") {
+            this.dropValue(value.elements[0])
+            value.elements[0] = this.uninitializedValue()
         }
         if (value.kind == "array" && this.valueIsAffine(value)) {
             var element = value.elements.size
@@ -1384,6 +1392,23 @@ class BootstrapEvaluator(
                     expression.children[0], depth + 1
                 )}"
             }
+        }
+        if (expression.kind == "defer" && expression.children.size == 1) {
+            result = "defer ${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}"
+        }
+        if ((expression.kind == "generator" || expression.kind == "task" ||
+             expression.kind == "thread") && expression.children.size == 1) {
+            result = "${expression.kind} ${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}"
+        }
+        if ((expression.kind == "await" || expression.kind == "yield") &&
+            expression.children.size == 1) {
+            result = "${expression.kind} ${this.generatedSyntaxSource(
+                expression.children[0], depth + 1
+            )}"
         }
         if (expression.kind == "assign" &&
             expression.children.size == 1) {
@@ -4782,6 +4807,43 @@ class BootstrapEvaluator(
         if (expression.kind == "region") {
             result = this.evaluate(expression.children[0])
         }
+        if ((expression.kind == "task" || expression.kind == "thread") &&
+            expression.children.size == 1) {
+            val closure = this.evaluate(BootstrapExpression(
+                "lambda.move",
+                "",
+                expression.begin,
+                expression.end,
+                [expression.children[0]]
+            ))
+            result = BootstrapEvalValue(
+                expression.kind, 0, false, "", [closure], "", []
+            )
+        }
+        if (expression.kind == "await" && expression.children.size == 1) {
+            val operation = this.evaluate(expression.children[0])
+            if ((operation.kind == "task" || operation.kind == "thread") &&
+                operation.elements.size == 1 &&
+                operation.elements[0].kind != "uninitialized") {
+                val name = "await_${expression.begin}_${this.steps}"
+                this.names.append(name)
+                this.values.append(operation.elements[0])
+                this.mutable.append(false)
+                result = this.evaluate(BootstrapExpression(
+                    "call", name, expression.begin, expression.end, []
+                ))
+                operation.elements[0] = this.uninitializedValue()
+                this.values[this.values.size - 1] = this.uninitializedValue()
+                this.names[this.names.size - 1] = ""
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (expression.kind == "generator" || expression.kind == "yield") {
+            this.errors = this.errors + 1
+            result = bootstrapEvalInvalid()
+        }
         if (expression.kind == "string.template") {
             var text = ""
             var part = 0
@@ -4795,13 +4857,40 @@ class BootstrapEvaluator(
         }
         if (expression.kind == "block") {
             val scopeBegin = this.names.size
+            val deferred: array<string> = []
             result = BootstrapEvalValue("void", 0, false, "", [], "", [])
             var statement = 0
             while (statement < expression.children.size &&
                    result.kind != "return" && result.kind != "break" &&
                    result.kind != "continue") {
-                result = this.evaluate(expression.children[statement])
+                val current = expression.children[statement]
+                if (current.kind == "defer" && current.children.size == 1) {
+                    val name = "defer_${current.begin}_${deferred.size}"
+                    val closure = this.evaluate(BootstrapExpression(
+                        "lambda.move",
+                        "",
+                        current.begin,
+                        current.end,
+                        [current.children[0]]
+                    ))
+                    this.names.append(name)
+                    this.values.append(closure)
+                    this.mutable.append(false)
+                    deferred.append(name)
+                    result = bootstrapEvalVoid()
+                } else result = this.evaluate(current)
                 statement = statement + 1
+            }
+            var deferredIndex = deferred.size
+            while (deferredIndex > 0) {
+                deferredIndex = deferredIndex - 1
+                this.evaluate(BootstrapExpression(
+                    "call",
+                    deferred[deferredIndex],
+                    expression.end,
+                    expression.end,
+                    []
+                ))
             }
             var transferred = result
             if (result.kind == "return" && result.elements.size == 1) {
@@ -4823,6 +4912,7 @@ class BootstrapEvaluator(
                 this.names[local] = ""
             }
         }
+        if (expression.kind == "defer") result = bootstrapEvalVoid()
         if (expression.kind == "return") {
             var value = bootstrapEvalVoid()
             if (expression.children.size > 0 &&

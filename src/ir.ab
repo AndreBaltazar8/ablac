@@ -2009,6 +2009,14 @@ fun bootstrapCollectDropType(
                 types
             )
         }
+        if (bootstrapIsGeneratorType(normalized)) {
+            bootstrapCollectDropType(
+                bootstrapGeneratorElementType(normalized),
+                declarations,
+                affineTypes,
+                types
+            )
+        }
         val declarationIndex = bootstrapDropDeclarationIndex(
             declarations,
             normalized
@@ -2133,6 +2141,15 @@ fun bootstrapBuildDropFunction(
         bootstrapSemanticUnit()
     } else if (bootstrapIsWeakType(normalized)) {
         builder.emit("weak.release", value, -1, "")
+        bootstrapSemanticUnit()
+    } else if (bootstrapIsGeneratorType(normalized)) {
+        builder.emit("generator.drop", value, -1, "")
+        bootstrapSemanticUnit()
+    } else if (bootstrapIsTaskType(normalized)) {
+        builder.emit("task.drop", value, -1, "")
+        bootstrapSemanticUnit()
+    } else if (bootstrapIsThreadType(normalized)) {
+        builder.emit("thread.drop", value, -1, "")
         bootstrapSemanticUnit()
     } else if (bootstrapIsNullableType(normalized)) {
         builder.emitMany(
@@ -2352,6 +2369,8 @@ class BootstrapLowerer(
     val localStorage: array<string>,
     val localScopes: array<int>,
     val localBorrowSources: array<string>,
+    val deferredScopes: array<int>,
+    val deferredStorage: array<string>,
     var scopeParents: array<int>,
     var currentScope: int,
     val declarations: array<BootstrapDeclaration>,
@@ -2526,6 +2545,20 @@ class BootstrapLowerer(
     }
 
     fun emitScopeDrops(scope: int) {
+        var deferred = this.deferredScopes.size
+        while (deferred > 0) {
+            deferred = deferred - 1
+            if (this.deferredScopes[deferred] == scope) {
+                val callable = this.emit(
+                    "local.load", -1, -1, this.deferredStorage[deferred]
+                )
+                this.emitMany("call.indirect.once", [callable], "")
+                this.emitControl(
+                    "local.move", -1, -1, -1,
+                    this.deferredStorage[deferred]
+                )
+            }
+        }
         var index = this.locals.size
         while (index > 0) {
             index = index - 1
@@ -2759,6 +2792,28 @@ class BootstrapLowerer(
         if (expression.kind == "region") {
             result = this.lowerExpressionType(expression.children[0])
         }
+        if (expression.kind == "generator") {
+            result = "generator:${this.lowerGeneratorElementType(
+                expression.children[0]
+            )}"
+        }
+        if (expression.kind == "task" || expression.kind == "thread") {
+            result = "${expression.kind}:${this.lowerExpressionType(
+                expression.children[0]
+            )}"
+        }
+        if (expression.kind == "await") {
+            val operation = this.lowerExpressionType(expression.children[0])
+            if (bootstrapIsTaskType(operation)) {
+                result = bootstrapTaskResultType(operation)
+            }
+            if (bootstrapIsThreadType(operation)) {
+                result = bootstrapThreadResultType(operation)
+            }
+        }
+        if (expression.kind == "yield" || expression.kind == "defer") {
+            result = "void"
+        }
         if (expression.kind == "identifier") {
             if (this.isParameter(expression.text)) {
                 result = this.lowerParameterType(expression.text)
@@ -2948,8 +3003,31 @@ class BootstrapLowerer(
                 result = "mut:function:unknown"
             } else result = "function:unknown"
         }
-        if (expression.kind == "lambda.move") {
+        if (expression.kind == "lambda.move" ||
+            expression.kind == "lambda.generator") {
             result = "once:function:unknown"
+        }
+        result
+    }
+
+    fun lowerGeneratorElementType(expression: BootstrapExpression): string {
+        var result = "unknown"
+        if (expression.kind == "yield" && expression.children.size == 1) {
+            result = this.lowerExpressionType(expression.children[0])
+        }
+        if (expression.kind != "lambda" &&
+            expression.kind != "lambda.move" &&
+            expression.kind != "lambda.generator" &&
+            expression.kind != "generator" &&
+            expression.kind != "task" && expression.kind != "thread") {
+            var child = 0
+            while (child < expression.children.size) {
+                val found = this.lowerGeneratorElementType(
+                    expression.children[child]
+                )
+                if (result == "unknown") result = found
+                child = child + 1
+            }
         }
         result
     }
@@ -3165,7 +3243,8 @@ class BootstrapLowerer(
             this.appendUniqueName(names, expression.text)
         }
         if (expression.kind != "lambda" &&
-            expression.kind != "lambda.move") {
+            expression.kind != "lambda.move" &&
+            expression.kind != "lambda.generator") {
             var child = 0
             while (child < expression.children.size) {
                 this.collectLambdaLocals(expression.children[child], names)
@@ -3191,7 +3270,8 @@ class BootstrapLowerer(
     ): void {
         var nested = false
         if (expression.kind == "lambda" ||
-            expression.kind == "lambda.move") {
+            expression.kind == "lambda.move" ||
+            expression.kind == "lambda.generator") {
             nested = true
             val nestedBound: array<string> = []
             var inherited = 0
@@ -3275,7 +3355,8 @@ class BootstrapLowerer(
                 )) mutates = true
         }
         if (expression.kind != "lambda" &&
-            expression.kind != "lambda.move") {
+            expression.kind != "lambda.move" &&
+            expression.kind != "lambda.generator") {
             var child = 0
             while (!mutates && child < expression.children.size) {
                 mutates = this.lambdaMutatesCapturedPlace(
@@ -3308,7 +3389,8 @@ class BootstrapLowerer(
     ): bool {
         var captured = false
         if (expression.kind == "lambda" ||
-            expression.kind == "lambda.move") {
+            expression.kind == "lambda.move" ||
+            expression.kind == "lambda.generator") {
             val bound: array<string> = []
             var parameter = 0
             while (parameter + 1 < expression.children.size) {
@@ -3954,7 +4036,8 @@ class BootstrapLowerer(
             }
         }
         if (expression.kind == "lambda" ||
-            expression.kind == "lambda.move") {
+            expression.kind == "lambda.move" ||
+            expression.kind == "lambda.generator") {
             val lambdaInstructions: array<BootstrapInstruction> = []
             val lambdaParameters: array<string> = []
             val lambdaParameterTypes: array<string> = []
@@ -3998,7 +4081,8 @@ class BootstrapLowerer(
                         captureType = this.lowerParameterType(captureName)
                     }
                     if (this.lowerTypeIsAffine(captureType) &&
-                        expression.kind == "lambda.move") {
+                        (expression.kind == "lambda.move" ||
+                         expression.kind == "lambda.generator")) {
                         captureValues.append(this.captureOwned(captureName))
                         ownedCaptures.append(captureName)
                     } else {
@@ -4038,6 +4122,8 @@ class BootstrapLowerer(
                 lambdaLocalTypes,
                 lambdaStorage,
                 lambdaScopes,
+                [],
+                [],
                 [],
                 [-1],
                 0,
@@ -4082,7 +4168,8 @@ class BootstrapLowerer(
             )
             this.errors = this.errors + lambdaFunction.verificationErrors
             this.functions.append(lambdaFunction)
-            if (expression.kind == "lambda.move") {
+            if (expression.kind == "lambda.move" ||
+                expression.kind == "lambda.generator") {
                 val closureDrop = bootstrapBuildClosureDropFunction(
                     lambdaName,
                     captureNames,
@@ -4105,6 +4192,70 @@ class BootstrapLowerer(
             if (result < 0) result = this.emit("const.void", -1, -1, "")
             this.emitScopeDrops(this.currentScope)
             this.leaveLocalScope(previousScope)
+        }
+        if (expression.kind == "defer") {
+            if (expression.children.size == 1) {
+                val closure = this.lowerExpression(BootstrapExpression(
+                    "lambda.move",
+                    "",
+                    expression.begin,
+                    expression.end,
+                    [expression.children[0]]
+                ))
+                val name = "defer_${this.nextValue}"
+                val storage = "local_${this.nextValue}_$name"
+                this.locals.append(name)
+                this.localTypes.append("once:function:()->void")
+                this.localStorage.append(storage)
+                this.localScopes.append(this.currentScope)
+                this.localBorrowSources.append("")
+                this.emit("local.declare", closure, -1, storage)
+                this.deferredScopes.append(this.currentScope)
+                this.deferredStorage.append(storage)
+            } else this.errors = this.errors + 1
+            result = this.emit("const.void", -1, -1, "")
+        }
+        if (expression.kind == "generator" && expression.children.size == 1) {
+            val closure = this.lowerExpression(BootstrapExpression(
+                "lambda.generator",
+                "",
+                expression.begin,
+                expression.end,
+                [expression.children[0]]
+            ))
+            result = this.emit("generator.create", closure, -1, "")
+        }
+        if ((expression.kind == "task" || expression.kind == "thread") &&
+            expression.children.size == 1) {
+            val closure = this.lowerExpression(BootstrapExpression(
+                "lambda.move",
+                "",
+                expression.begin,
+                expression.end,
+                [expression.children[0]]
+            ))
+            result = this.emit("${expression.kind}.create", closure, -1, "")
+        }
+        if (expression.kind == "yield" && expression.children.size == 1) {
+            val value = this.lowerExpression(expression.children[0])
+            val keepRunning = this.emit("generator.yield", value, -1, "")
+            val continueLabel = this.allocateLabel()
+            val cancelLabel = this.allocateLabel()
+            this.emitControl(
+                "branch", keepRunning, continueLabel, cancelLabel, ""
+            )
+            this.emitControl("label", -1, cancelLabel, -1, "")
+            this.emitDropsThroughScope(-1)
+            this.emitOwnedParameterDrops()
+            val cancelled = this.emit("const.void", -1, -1, "")
+            this.emitControl("return", cancelled, -1, -1, "")
+            this.emitControl("label", -1, continueLabel, -1, "")
+            result = this.emit("const.void", -1, -1, "")
+        }
+        if (expression.kind == "await" && expression.children.size == 1) {
+            val operation = this.lowerExpression(expression.children[0])
+            result = this.emit("await", operation, -1, "")
+            this.emitResultMove(expression.children[0])
         }
         if (expression.kind == "return") {
             if (expression.children[0].kind == "missing") {
@@ -4783,12 +4934,22 @@ class BootstrapLowerer(
             val sourceType = this.lowerExpressionType(expression.children[0])
             var elementType = bootstrapArrayElementType(sourceType)
             if (sourceType == "string") elementType = "i64"
+            if (bootstrapIsGeneratorType(sourceType)) {
+                elementType = bootstrapGeneratorElementType(sourceType)
+            }
             val source = this.lowerExpression(expression.children[0])
-            val length = this.emit("length", source, -1, "")
-            val indexStorage = "for_index_${this.nextLabel}"
-            this.emitControl("local.zero", -1, -1, -1, indexStorage)
-            val zero = this.emit("const.i64", -1, -1, "0")
-            this.emitControl("local.set", zero, -1, -1, indexStorage)
+            if (bootstrapIsGeneratorType(sourceType)) {
+                this.emitResultMove(expression.children[0])
+            }
+            var length = -1
+            var indexStorage = ""
+            if (!bootstrapIsGeneratorType(sourceType)) {
+                length = this.emit("length", source, -1, "")
+                indexStorage = "for_index_${this.nextLabel}"
+                this.emitControl("local.zero", -1, -1, -1, indexStorage)
+                val zero = this.emit("const.i64", -1, -1, "0")
+                this.emitControl("local.set", zero, -1, -1, indexStorage)
+            }
             val conditionLabel = this.allocateLabel()
             val bodyLabel = this.allocateLabel()
             val incrementLabel = this.allocateLabel()
@@ -4818,11 +4979,19 @@ class BootstrapLowerer(
             this.localBorrowSources.append("")
             this.emitControl("jump", -1, conditionLabel, -1, "")
             this.emitControl("label", -1, conditionLabel, -1, "")
-            val index = this.emit("local.load", -1, -1, indexStorage)
-            val more = this.emit("<", index, length, "")
+            var index = -1
+            var more = -1
+            if (bootstrapIsGeneratorType(sourceType)) {
+                more = this.emit("generator.next", source, -1, "")
+            } else {
+                index = this.emit("local.load", -1, -1, indexStorage)
+                more = this.emit("<", index, length, "")
+            }
             this.emitControl("branch", more, bodyLabel, mergeLabel, "")
             this.emitControl("label", -1, bodyLabel, -1, "")
-            val value = this.emit("index.get", source, index, "")
+            val value = if (bootstrapIsGeneratorType(sourceType))
+                this.emit("generator.value", source, -1, "")
+            else this.emit("index.get", source, index, "")
             var iteratorValue = value
             if (iteratorCaptured) {
                 iteratorValue = this.emit("cell.create", value, -1, "")
@@ -4836,12 +5005,17 @@ class BootstrapLowerer(
             this.continueScope = previousContinueScope
             this.leaveLocalScope(previousScope)
             this.emitControl("label", -1, incrementLabel, -1, "")
-            val current = this.emit("local.load", -1, -1, indexStorage)
-            val one = this.emit("const.i64", -1, -1, "1")
-            val next = this.emit("+", current, one, "")
-            this.emitControl("local.set", next, -1, -1, indexStorage)
+            if (!bootstrapIsGeneratorType(sourceType)) {
+                val current = this.emit("local.load", -1, -1, indexStorage)
+                val one = this.emit("const.i64", -1, -1, "1")
+                val next = this.emit("+", current, one, "")
+                this.emitControl("local.set", next, -1, -1, indexStorage)
+            }
             this.emitControl("jump", -1, conditionLabel, -1, "")
             this.emitControl("label", -1, mergeLabel, -1, "")
+            if (bootstrapIsGeneratorType(sourceType)) {
+                this.emit("generator.drop", source, -1, "")
+            }
             result = this.emit("const.void", -1, -1, "")
         }
         if (expression.kind == "break") {
@@ -4995,6 +5169,8 @@ class BootstrapLowerer(
             functionStorage,
             functionScopes,
             [],
+            [],
+            [],
             [-1],
             0,
             this.declarations,
@@ -5101,6 +5277,8 @@ class BootstrapLowerer(
             functionLocalTypes,
             functionStorage,
             functionScopes,
+            [],
+            [],
             [],
             [-1],
             0,
@@ -5467,6 +5645,8 @@ fun bootstrapLowerParsedCached(
         localTypes,
         localStorage,
         localScopes,
+        [],
+        [],
         [],
         [-1],
         0,
