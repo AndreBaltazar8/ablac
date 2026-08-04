@@ -3,8 +3,13 @@ set -euo pipefail
 
 launcher=$(readlink -f -- "${BASH_SOURCE[0]}")
 script_directory=$(cd -- "$(dirname -- "$launcher")" && pwd)
+toolchain_root=$(cd -- "$script_directory/.." && pwd)
 compiler="${0}.bin"
 stack_kb=${ABLA_MAX_STACK_KB:-65536}
+
+# Keep compiler-owned sources independent from the caller's working directory.
+# An explicit sysroot still wins for installed or custom toolchains.
+export ABLA_SYSROOT=${ABLA_SYSROOT:-$toolchain_root}
 
 if [[ ! $stack_kb =~ ^[1-9][0-9]*$ ]]; then
     printf '[abla-limit] ABLA_MAX_STACK_KB must be a positive integer, got %q\n' \
@@ -16,7 +21,7 @@ ulimit -S -s "$stack_kb"
 # A full compiler graph legitimately needs room for the pure-Abla frontend and
 # LLVM O2 in one process. Keep the ordinary ceiling small, but make the public
 # self-build command work without secret environment tuning.
-if [[ ${1:-} == build && ${2:-} == *bootstrap/compiler/orc_main.ab &&
+if [[ ${1:-} == build && ${2:-} == *src/orc_main.ab &&
       -z ${ABLA_MAX_MEMORY_MB:-} ]]; then
     export ABLA_MAX_MEMORY_MB=4096
     export ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-240}
@@ -42,7 +47,7 @@ case ${1:-} in
                 invocation+=("$escaped_argument")
             done
             shell_command=${invocation[*]}
-            exec nix-shell --run "$shell_command"
+            exec nix-shell "$toolchain_root/shell.nix" --run "$shell_command"
         fi
         ;;
 esac

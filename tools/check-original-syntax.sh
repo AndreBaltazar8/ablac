@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-compiler=${1:-build/ablac0}
+compiler=${1:-build/ablac}
 original=${ABLA_ORIGINAL:-../abla-original}
 examples="$original/runner/src/test/resources/examples"
 

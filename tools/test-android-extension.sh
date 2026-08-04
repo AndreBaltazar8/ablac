@@ -67,7 +67,7 @@ grep -q 'error\[E_BUILD_TARGET_DEFINITION\]' \
     "$output_directory/invalid-target.err"
 
 if rg -n 'android-arm64|aarch64-linux-android' \
-    "$project_root/bootstrap/compiler" >/dev/null; then
+    "$project_root/src" >/dev/null; then
     echo "Android platform policy leaked into the compiler" >&2
     exit 1
 fi

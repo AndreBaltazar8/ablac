@@ -14,11 +14,11 @@ to bypass its safety contract from safe Abla code.
 
 - The complete Abla compiler graph lowers directly to LLVM.
 - A native Abla compiler recompiles itself and emits byte-identical LLVM.
-- `make self-rebuild` performs an uncached post-seed rebuild without compiling
-  project C or C++ and uses the result to build a child program.
+- `make self-rebuild` performs an uncached rebuild using only the Abla compiler
+  implementation and uses the result to build a child program.
 - The final compiler contains no project-C host/platform bridge symbols.
-- A clean build from an empty directory still uses the C++/C bootstrap seed.
-  LLVM and Clang/LLD remain external toolchain dependencies.
+- A clean build starts from the checksum-pinned Abla release binary. LLVM and
+  Clang/LLD remain external toolchain dependencies.
 - AOT, persistent ORC `run`, transactional REPL generations, watched `serve`,
   graceful HTTP reload, raw Linux facilities, watchdog limits, and stackable
   compile-time subparsers have bounded regression gates.
@@ -382,7 +382,7 @@ Use explicit terms rather than one overloaded "self-hosted" claim.
    This remains open.
 5. **Target-independent self-maintaining**: the Abla compiler and standard
    library can add a backend/platform by implementing documented Abla-facing
-   target interfaces, without changing the historical C++ seed.
+   target interfaces without another compiler implementation.
 
 To close tiers 4 and 5:
 

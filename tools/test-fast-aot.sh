@@ -13,11 +13,11 @@ fast_compiler="$output_directory/ablac-fast"
 fast_payload="$fast_compiler.bin"
 mkdir -p "$output_directory"
 
-"$compiler" --emit-llvm "$project_root/bootstrap/compiler/main.ab" \
+"$compiler" --emit-llvm "$project_root/src/main.ab" \
     > "$output_directory/reference.ll"
 
 begin=$(date +%s%N)
-"$compiler" build "$project_root/bootstrap/compiler/main.ab" \
+"$compiler" build "$project_root/src/main.ab" \
     -o "$fast_payload" --fast --no-cache
 end=$(date +%s%N)
 elapsed_ms=$(((end - begin) / 1000000))
@@ -25,7 +25,7 @@ elapsed_ms=$(((end - begin) / 1000000))
 ln -sfn ../../tools/run-limited-compiler.sh "$fast_compiler"
 ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 \
     "$fast_compiler" --emit-llvm \
-    "$project_root/bootstrap/compiler/main.ab" \
+    "$project_root/src/main.ab" \
     > "$output_directory/fixed.ll"
 cmp "$output_directory/reference.ll" "$output_directory/fixed.ll"
 

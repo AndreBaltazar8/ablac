@@ -14,7 +14,7 @@ second_ir="$project_root/build/orc-session-second.ll"
 
 ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=60 \
     "$project_root/tools/run-limited.sh" \
-    "$compiler" build "$project_root/bootstrap/orc_session_runner.ab" \
+    "$compiler" build "$project_root/src/orc_session_runner.ab" \
     -o "$runner"
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/return-41.ab" > "$first_ir"

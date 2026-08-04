@@ -9,11 +9,12 @@ fi
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=$1
 output=$2
-entry=${3:-bootstrap/compiler/orc_main.ab}
-emit_memory_mb=${ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB:-2048}
+entry=${3:-src/orc_main.ab}
+emit_memory_mb=${ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB:-4096}
 object_memory_mb=${ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB:-1536}
 
 cd "$project_root"
+export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 mkdir -p -- "$(dirname -- "$output")" "$project_root/build"
 temporary_directory=$(mktemp -d "$project_root/build/.selfhost-release.XXXXXX")
 cleanup() {

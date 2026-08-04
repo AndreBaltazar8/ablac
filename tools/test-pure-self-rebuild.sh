@@ -3,19 +3,20 @@ set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-entry="$project_root/bootstrap/compiler/orc_main.ab"
+export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
+entry="$project_root/src/orc_main.ab"
 output="$project_root/build/ablac-pure-self"
 reference_ir="$project_root/build/ablac-pure-self.reference.ll"
 self_ir="$project_root/build/ablac-pure-self.fixed.ll"
 probe="$project_root/build/ablac-pure-self-probe"
-final_emit_memory_mb=${ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB:-2048}
+final_emit_memory_mb=${ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB:-4096}
 
-# This deliberately bypasses the native object cache and exercises the public
-# compiler command itself. The four-GiB guard remains below machine-wide
-# exhaustion while allowing Abla and LLVM's O2 pipeline to coexist.
-ABLA_MAX_MEMORY_MB=${ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB:-4096} \
-    ABLA_MAX_SECONDS=240 "$project_root/tools/run-limited.sh" \
-    "$compiler" build "$entry" -o "$output" --no-cache
+# Keep frontend emission and LLVM object generation in separate bounded
+# processes. This canonical release path avoids making both heap peaks coexist
+# during a complete compiler rebuild.
+ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
+    "$project_root/tools/build-self-hosted-release.sh" \
+    "$compiler" "$output" "$entry"
 
 [[ -s $output ]]
 [[ -s $output.ll ]]
@@ -37,10 +38,12 @@ ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=60 \
     "$output" --emit-llvm "$entry" > "$self_ir"
 cmp "$reference_ir" "$self_ir"
 
+printf -v probe_build \
+    '%q build %q -o %q --fast --no-cache' \
+    "$output" "$project_root/tests/cases/bootstrap/block.ab" "$probe"
 ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
     "$project_root/tools/run-limited.sh" \
-    "$output" build "$project_root/tests/cases/bootstrap/block.ab" \
-    -o "$probe" --fast --no-cache
+    nix-shell "$project_root/shell.nix" --run "$probe_build"
 set +e
 ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=20 \
     "$project_root/tools/run-limited.sh" "$probe"

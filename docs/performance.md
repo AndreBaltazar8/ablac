@@ -77,7 +77,7 @@ self-host fixed point are now gated. The next measurements target frontend
 indexes, IR reachability, LLVM global DCE, in-process object emission, and JIT
 startup rather than the compatibility C path.
 
-An early guarded cold `ablac build bootstrap/compiler/main.ab` through the
+An early guarded cold `ablac build src/main.ab` through the
 LLVM-native compiler completed in 9.53 seconds, including Nix shell entry,
 LLVM O2/global DCE, the then-required platform adapter, and LLD. That adapter
 is no longer part of the compiler build; the current final compiler contains
@@ -397,7 +397,7 @@ regression.
 
 The 6.861 s measurement includes the LLVM-emitted scalar, closure, collection,
 object, formatting, equality, and iterative rope runtime. The resulting
-`bootstrap/compiler/main.ab` compiler was 1,608,216 bytes and reproduced the
+`src/main.ab` compiler was 1,608,216 bytes and reproduced the
 reference LLVM IR byte-for-byte. Large generated runtime strings also exercise
 the new seed-C constant chunking path rather than relying on non-portable C
 translation limits.

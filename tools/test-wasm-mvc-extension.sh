@@ -79,7 +79,7 @@ grep -q 'error\[E_EXPORT_TARGET_CAPABILITY\]' \
     "$output_directory/checked-export.err"
 
 if rg -n 'abla-mvc-browser|abla_mvc_revision|WebAssembly.instantiate' \
-    "$project_root/bootstrap/compiler" >/dev/null; then
+    "$project_root/src" >/dev/null; then
     echo "MVC or browser host policy leaked into the compiler" >&2
     exit 1
 fi

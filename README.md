@@ -15,10 +15,9 @@ their lifecycle. This is powerful, advanced functionality rather than a goal of
 being a beginner-oriented language. Kotlin strongly influenced the surface
 syntax, but the language remains free to evolve while it is experimental.
 
-`ablac` is a clean-room implementation of the original Abla prototype. It
-contains a C++20 bootstrap seed, a self-hosted compiler written in Abla, the
-runtime and standard library, and compatibility tests derived from the public
-behavior of the prototype.
+`ablac` is a clean-room implementation of the original Abla prototype. The
+compiler is written entirely in Abla, alongside its runtime, standard library,
+and compatibility tests derived from the public behavior of the prototype.
 
 ## Status
 
@@ -66,8 +65,8 @@ fun main: int {
 
 ## Development
 
-The development shell pins nixpkgs and the complete compiler toolchain. Install
-Nix, then enter the environment and build the seed compiler:
+The development shell pins nixpkgs and the native LLVM toolchain. Install Nix,
+then enter the environment and build the compiler:
 
 ```sh
 nix-shell
@@ -80,43 +79,31 @@ Run the ordinary test suite with:
 make test
 ```
 
-The complete bootstrap and fixed-point gate is substantially heavier and may
-use up to 4 GiB of memory:
+The complete test and fixed-point gate is substantially heavier and may use up
+to 4 GiB of memory:
 
 ```sh
 make check
 ```
 
-Useful focused targets include:
+The build has one compiler and a deliberately small target surface:
 
 ```sh
-make bootstrap-check          # validate Abla compiler components and emitted C
-make bootstrap-stage1         # build the native self-host subset compiler
-make bootstrap-selfhost       # prove the C bootstrap fixed point
-make bootstrap-llvm-selfhost  # prove the LLVM-native compiler fixed point
-make ablac                    # fast incremental rebuild of the user compiler
-make ablac-force              # rerun the complete fixed-point/conformance gate
-make sanitize                 # run the seed suite with ASan and UBSan
-make clean
+make bootstrap     # fetch and verify the published v0.1.0 compiler
+make ablac         # rebuild build/ablac from src/*.ab
+make test          # run the self-hosted conformance suite
+make self-rebuild  # prove a byte-identical compiler fixed point
+make check         # test plus fixed point
+make clean         # remove generated files
 ```
 
-`make compat-original` additionally checks the original prototype examples
-when that repository is available at `../abla-original`.
+On an empty build directory, `make` downloads the checksum-pinned compiler from
+the `v0.1.0` GitHub release and immediately recompiles the current `src/` graph.
+No C++ compiler implementation or generated-C bootstrap is involved.
 
-## Using the compilers
+## Using the compiler
 
-The seed compiler is built as `build/ablac0`:
-
-```sh
-build/ablac0 tokens program.ab
-build/ablac0 parse program.ab
-build/ablac0 check program.ab
-build/ablac0 ir program.ab
-build/ablac0 emit-c program.ab
-build/ablac0 run program.ab
-```
-
-After `make ablac`, the self-hosted compiler provides the main user interface:
+`make ablac` produces the single compiler interface:
 
 ```sh
 build/ablac build program.ab -o build/program
@@ -166,7 +153,8 @@ under `build/`.
 - Make filesystem, environment, network, clock, and native access explicit
   capabilities rather than invisible compiler privileges.
 - Keep builds deterministic, bounded, transactional, and reproducible.
-- Preserve a readable source bootstrap and prove fixed points before promotion.
+- Keep the compiler readable, self-hosted, and fixed-point tested before
+  promotion.
 - Keep hosted facilities optional and maintain a libc-free production target.
 
 ## Documentation
@@ -176,12 +164,12 @@ under `build/`.
 - [Compiler extension API](docs/compiler-api.md)
 - [Programmable builds](docs/programmable-builds.md)
 - [Package imports](docs/packages.md)
-- [Bootstrap architecture](docs/bootstrap.md)
+- [Bootstrap and trust model](docs/bootstrap.md)
 - [Self-hosting status](docs/self-hosting.md)
 - [Standard library](docs/standard-library.md)
 - [Compile-time subparsers](docs/subparsers.md)
 - [Reliability roadmap](docs/reliability-roadmap.md)
-- [Full self-hosting plan](docs/full-self-hosting.md)
+- [Freestanding follow-on work](docs/full-self-hosting.md)
 The [original implementation audit](docs/original-audit.md) separates behavior
 that was demonstrated by the prototype from incomplete or aspirational design.
 

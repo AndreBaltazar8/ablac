@@ -1,8 +1,15 @@
 # `ablac` toolchain interface
 
 The final tool is one self-hosted native `ablac` executable. C emission remains
-an optional bootstrap/debug backend in `bootstrap/compiler/main.ab`, not part
+an optional bootstrap/debug backend in `src/main.ab`, not part
 of the production `orc_main.ab` compiler graph or the normal user workflow.
+
+The public `ablac` launcher resolves compiler-owned standard-library and
+runtime sources from its toolchain root, independently of the caller's working
+directory. Installed or custom layouts may override that root with
+`ABLA_SYSROOT`; `ABLA_STDLIB` remains available as a narrower standard-library
+override. Project inputs, outputs, and caches continue to use project or
+invocation-relative paths.
 
 ```sh
 ablac build app.ab -o build/app
@@ -78,7 +85,7 @@ before reusing staged syntax. A hit skips
 frontend and LLVM work, restores the recorded
 libLLVM/host-adapter link decisions, recompiles the C adapter only when the
 program imports a host capability, and relinks. Local adapter changes are never hidden. The
-cache ABI tag in `bootstrap/compiler/toolchain.ab` must be bumped whenever
+cache ABI tag in `src/toolchain.ab` must be bumped whenever
 object semantics change without a corresponding source-graph change.
 `--no-cache` bypasses both lookup and publication while still emitting the
 `.ll`/object sidecars. It is the reproducibility and profiling mode used by the
@@ -163,9 +170,8 @@ checked lexical allocation region and ORC resource tracker. The same region
 checker is available to HTTP libraries, though request-handler adoption still
 needs an explicit API policy for promoted response values and long-lived state.
 
-The complete compiler rebuild uses the same public command as every program:
-`ablac build bootstrap/compiler/orc_main.ab -o build/ablac-next`. It runs under
-a four-GiB address-space and time watchdog, and native output publication is
-transactional. `tools/build-self-hosted-release.sh` remains a lower-peak
-recovery/bootstrap path that splits deterministic LLVM emission, object
-optimization, and linking into guarded processes.
+The complete compiler rebuild uses
+`tools/build-self-hosted-release.sh build/ablac.bin build/ablac-next`. It splits
+deterministic LLVM emission, object generation, and linking into separate
+bounded processes so the frontend and LLVM object-generation heap peaks do not
+coexist. The release gate verifies byte-identical IR from the rebuilt compiler.
