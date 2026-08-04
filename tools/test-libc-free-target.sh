@@ -30,7 +30,7 @@ if readelf -d "$program" 2>&1 | rg -q 'NEEDED'; then
     exit 1
 fi
 if nm --defined-only "$program" | awk '{print $3}' |
-    rg -q '^ablaHost|^abla_host_|^abla_platform_'; then
+    rg -q '^ablaHost|^abla_host_|^abla_checked_'; then
     echo 'libc-free target linked a project host capability symbol' >&2
     exit 1
 fi

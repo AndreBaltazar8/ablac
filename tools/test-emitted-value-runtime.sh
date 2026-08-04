@@ -33,14 +33,16 @@ done
     > "$output_directory/runtime.ll"
 
 legacy='abla_(as_cstring|divide|equal|not_equal|to_string|string_data|array_|object_|cell_|closure|string_(static|concat|length|get|slice))'
-if rg -q "^declare .*@${legacy}" "$output_directory/runtime.ll"; then
-    echo "generated LLVM still imports a legacy C value-runtime symbol" >&2
-    rg "^declare .*@${legacy}" "$output_directory/runtime.ll" >&2
+if rg -q "^define .*@${legacy}" "$output_directory/runtime.ll"; then
+    echo "generated LLVM duplicated the portable value runtime" >&2
+    rg "^define .*@${legacy}" "$output_directory/runtime.ll" >&2
     exit 1
 fi
+rg -q '^declare .*@abla_string_concat' "$output_directory/runtime.ll"
+rg -q '^declare .*@abla_to_string' "$output_directory/runtime.ll"
+rg -q '^declare .*@abla_equal' "$output_directory/runtime.ll"
+[[ -s $output_directory/value-runtime.value-runtime.o ]]
+nm --defined-only "$output_directory/value-runtime.value-runtime.o" |
+    rg -q ' [Tt] abla_string_data$'
 
-rg -q '^define internal ptr @abla_string_data' "$output_directory/runtime.ll"
-rg -q '^define internal void @abla_to_string' "$output_directory/runtime.ll"
-rg -q '^define internal void @abla_equal' "$output_directory/runtime.ll"
-
-echo "LLVM-emitted value runtime: strings, ropes, formatting, equality, no C value imports"
+echo "portable value runtime: strings, ropes, formatting, equality, and one linked implementation"

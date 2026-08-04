@@ -2,7 +2,7 @@ BUILD_DIR := build
 COMPILER := $(BUILD_DIR)/ablac
 COMPILER_PAYLOAD := $(BUILD_DIR)/ablac.bin
 COMPILER_ENTRY := src/orc_main.ab
-COMPILER_SOURCES := $(shell find src -maxdepth 1 -name '*.ab' -type f | sort)
+COMPILER_SOURCES := $(shell find src -name '*.ab' -type f | sort)
 
 SOURCE ?=
 OUTPUT ?= $(BUILD_DIR)/program

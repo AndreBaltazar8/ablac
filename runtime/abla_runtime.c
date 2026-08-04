@@ -1,6 +1,8 @@
 #include "abla_runtime.h"
 
 #include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
 
 typedef struct AblaField {
     uint32_t symbol;
@@ -193,6 +195,44 @@ size_t abla_function_capture_count(AblaValue value) {
     if (value.tag != ABLA_FUNCTION) panic("expected function", 17);
     return value.as.function.capture_count;
 }
+
+AblaValue* abla_function_capture_pointer(AblaValue value) {
+    (void)abla_as_function(value);
+    return value.as.function.captures;
+}
+
+void abla_closure_release(AblaValue value) {
+    abla_platform_free(abla_function_capture_pointer(value));
+}
+
+typedef struct AblaOwnedBytes {
+    uint64_t length;
+    uint8_t data[];
+} AblaOwnedBytes;
+
+void* abla_owned_bytes_from_value(AblaValue value) {
+    const char* data = abla_string_data(value);
+    const uint64_t length = (uint64_t)value.as.string.length;
+    if (length > SIZE_MAX - sizeof(AblaOwnedBytes)) {
+        panic("string length overflow", 22);
+    }
+    AblaOwnedBytes* handle = (AblaOwnedBytes*)malloc(
+        sizeof(AblaOwnedBytes) + (size_t)length);
+    if (handle == NULL) panic("out of memory", 13);
+    handle->length = length;
+    if (length != 0) memcpy(handle->data, data, (size_t)length);
+    return handle;
+}
+
+const uint8_t* abla_owned_bytes_data(void* opaque_handle) {
+    return ((const AblaOwnedBytes*)opaque_handle)->data;
+}
+
+uint64_t abla_owned_bytes_length(void* opaque_handle) {
+    return ((const AblaOwnedBytes*)opaque_handle)->length;
+}
+
+void abla_owned_bytes_release(void* handle) { free(handle); }
 AblaValue abla_function_capture(AblaValue value, size_t index) {
     if (value.tag != ABLA_FUNCTION) panic("expected function", 17);
     if (index >= value.as.function.capture_count) {

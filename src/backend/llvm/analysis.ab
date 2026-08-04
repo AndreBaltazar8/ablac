@@ -1,0 +1,871 @@
+#import("../../ir.ab")
+
+class BootstrapLlvmEmission(
+    val output: string,
+    val errors: int,
+    val abiExports: string
+)
+
+class BootstrapLlvmCompilation(
+    val output: string,
+    val errors: int,
+    val parserErrors: int,
+    val extensionErrors: int,
+    val semanticErrors: int,
+    val diagnostics: string,
+    val linkLlvm: bool,
+    val linkHost: bool,
+    val compileInputPaths: array<string>,
+    val compileInputContents: array<string>,
+    val abiExports: string
+)
+
+fun bootstrapLlvmNeedsLlvm(program: BootstrapIrProgram): bool {
+    var needed = false
+    var index = 0
+    while (index < program.natives.size) {
+        val name = program.natives[index].name
+        if (name.size >= 4 && name.slice(0, 4) == "LLVM") needed = true
+        index = index + 1
+    }
+    needed
+}
+
+// Host-created arrays and strings must share the tracked allocator with the
+// emitted value runtime. Programs with no host capabilities can instead keep
+// allocation and panic entirely inside their generated LLVM module.
+fun bootstrapLlvmNeedsHostRuntime(program: BootstrapIrProgram): bool {
+    var needed = false
+    var index = 0
+    while (index < program.instructions.size) {
+        if (program.instructions[index].opcode == "extern.host") needed = true
+        index = index + 1
+    }
+    var functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        val function = program.functions[functionIndex]
+        var instructionIndex = 0
+        while (instructionIndex < function.instructions.size) {
+            if (function.instructions[instructionIndex].opcode ==
+                "extern.host") {
+                needed = true
+            }
+            instructionIndex = instructionIndex + 1
+        }
+        functionIndex = functionIndex + 1
+    }
+    needed
+}
+
+fun bootstrapLlvmInstructionNeedsSharedRuntime(
+    instruction: BootstrapInstruction
+): bool =
+    instruction.opcode == "shared.create" ||
+    instruction.opcode == "shared.clone" ||
+    instruction.opcode == "shared.get" ||
+    instruction.opcode == "shared.lock" ||
+    instruction.opcode == "shared.unlock" ||
+    instruction.opcode == "shared.release" ||
+    instruction.opcode == "weak.create" ||
+    instruction.opcode == "weak.clone" ||
+    instruction.opcode == "weak.upgrade" ||
+    instruction.opcode == "weak.alive" ||
+    instruction.opcode == "weak.release"
+
+fun bootstrapLlvmNeedsSharedRuntime(program: BootstrapIrProgram): bool {
+    var needed = false
+    var index = 0
+    while (index < program.instructions.size) {
+        if (bootstrapLlvmInstructionNeedsSharedRuntime(
+            program.instructions[index]
+        )) needed = true
+        index = index + 1
+    }
+    var functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        val function = program.functions[functionIndex]
+        var instructionIndex = 0
+        while (instructionIndex < function.instructions.size) {
+            if (bootstrapLlvmInstructionNeedsSharedRuntime(
+                function.instructions[instructionIndex]
+            )) needed = true
+            instructionIndex = instructionIndex + 1
+        }
+        functionIndex = functionIndex + 1
+    }
+    needed
+}
+
+fun bootstrapLlvmNeedsCollector(program: BootstrapIrProgram): bool {
+    val names: array<string> = []
+    var function = 0
+    while (function < program.functions.size) {
+        names.append(program.functions[function].name)
+        function = function + 1
+    }
+    val functionIndex = bootstrapLlvmNameIndex(names)
+    val addressTaken = bootstrapLlvmAddressTaken(program, functionIndex)
+    val reachable: array<bool> = []
+    function = 0
+    while (function < program.functions.size) {
+        reachable.append(program.functions[function].name == "main" ||
+            program.functions[function].name == "__bootstrap_globals")
+        function = function + 1
+    }
+    val pending: array<int> = []
+    function = 0
+    while (function < reachable.size) {
+        if (reachable[function]) pending.append(function)
+        function = function + 1
+    }
+    var cursor = 0
+    var needed = false
+    while (cursor < pending.size && !needed) {
+        function = pending[cursor]
+        cursor = cursor + 1
+        var instruction = 0
+        while (instruction <
+               program.functions[function].instructions.size) {
+            val candidate =
+                program.functions[function].instructions[instruction]
+            if (candidate.opcode == "extern.intrinsic" &&
+                (candidate.text == "ablaRuntimeMemoryCollect" ||
+                 candidate.text == "ablaRuntimeMemorySetLimit")) {
+                needed = true
+            }
+            if (candidate.opcode == "call") {
+                val called = functionIndex.find(candidate.text)
+                if (called >= 0 && !reachable[called]) {
+                    reachable[called] = true
+                    pending.append(called)
+                }
+            }
+            if (candidate.opcode == "call.indirect" ||
+                candidate.opcode == "call.indirect.once") {
+                var target = 0
+                while (target < addressTaken.size) {
+                    if (addressTaken[target] && !reachable[target]) {
+                        reachable[target] = true
+                        pending.append(target)
+                    }
+                    target = target + 1
+                }
+            }
+            instruction = instruction + 1
+        }
+    }
+    needed
+}
+
+class BootstrapLlvmNameIndex(
+    val names: array<string>,
+    val values: array<int>,
+    val slots: array<int>
+)
+
+fun bootstrapLlvmHash(name: string): int {
+    var hash = 0
+    var index = 0
+    while (index < name.size) {
+        hash = hash * 131 + name[index]
+        hash = hash - hash / 2147483647 * 2147483647
+        index = index + 1
+    }
+    hash
+}
+
+fun bootstrapLlvmNameValueIndex(
+    names: array<string>,
+    values: array<int>
+): BootstrapLlvmNameIndex {
+    var capacity = 8
+    while (capacity < names.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var index = 0
+    while (index < capacity) {
+        slots.append(-1)
+        index = index + 1
+    }
+    index = 0
+    while (index < names.size) {
+        var slot = bootstrapLlvmHash(names[index])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0 || names[existing] == names[index]) {
+                slots[slot] = index
+                placed = true
+                placed = placed
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+                placed = placed
+            }
+        }
+        index = index + 1
+    }
+    BootstrapLlvmNameIndex(names, values, slots)
+}
+
+fun bootstrapLlvmNameIndex(names: array<string>): BootstrapLlvmNameIndex {
+    val values: array<int> = []
+    var index = 0
+    while (index < names.size) {
+        values.append(index)
+        index = index + 1
+    }
+    bootstrapLlvmNameValueIndex(names, values)
+}
+
+fun BootstrapLlvmNameIndex.find(name: string): int {
+    var result = -1
+    var slot = bootstrapLlvmHash(name)
+    slot = slot - slot / this.slots.size * this.slots.size
+    var probes = 0
+    var searching = true
+    while (searching && probes < this.slots.size) {
+        val existing = this.slots[slot]
+        if (existing < 0) {
+            searching = false
+            searching = searching
+        } else if (this.names[existing] == name) {
+            result = this.values[existing]
+            searching = false
+            searching = searching
+        } else {
+            slot = slot + 1
+            if (slot == this.slots.size) slot = 0
+            probes = probes + 1
+            searching = searching
+        }
+    }
+    result
+}
+
+fun bootstrapLlvmNativeParameterType(
+    program: BootstrapIrProgram,
+    nativeIndex: BootstrapLlvmNameIndex,
+    name: string,
+    parameter: int
+): string {
+    var result = "unknown"
+    val native = nativeIndex.find(name)
+    if (native >= 0 && parameter >= 0 &&
+        parameter < program.natives[native].parameterTypes.size) {
+        result = program.natives[native].parameterTypes[parameter]
+    }
+    result
+}
+
+fun bootstrapLlvmNativeResultType(
+    program: BootstrapIrProgram,
+    nativeIndex: BootstrapLlvmNameIndex,
+    name: string
+): string {
+    var result = "unknown"
+    val native = nativeIndex.find(name)
+    if (native >= 0) result = program.natives[native].resultType
+    result
+}
+
+fun bootstrapLlvmIsPointerType(type: string): bool =
+    type.size > 1 && type.slice(type.size - 1, type.size) == "*"
+
+fun bootstrapLlvmNativeType(type: string): string {
+    var result = "unknown"
+    if (type == "i8" || type == "u8" || type == "char") result = "i8"
+    if (type == "i16" || type == "u16") result = "i16"
+    if (type == "i32" || type == "u32") result = "i32"
+    if (type == "i64" || type == "u64") result = "i64"
+    if (type == "bool") result = "i1"
+    if (type == "cstring" || bootstrapLlvmIsPointerType(type)) result = "ptr"
+    if (type == "void") result = "void"
+    result
+}
+
+fun bootstrapLlvmIsNarrowNativeInteger(type: string): bool =
+    type == "i8" || type == "u8" || type == "char" ||
+    type == "i16" || type == "u16" ||
+    type == "i32" || type == "u32"
+
+fun bootstrapLlvmIsNativeInteger(type: string): bool =
+    bootstrapLlvmIsNarrowNativeInteger(type) ||
+    type == "i64" || type == "u64"
+
+fun bootstrapLlvmIsUnsignedNativeInteger(type: string): bool =
+    type == "u8" || type == "u16" || type == "u32" || type == "u64"
+
+fun bootstrapLlvmAddressTaken(
+    program: BootstrapIrProgram,
+    functionIndex: BootstrapLlvmNameIndex
+): array<bool> {
+    val taken: array<bool> = []
+    var function = 0
+    while (function < program.functions.size) {
+        taken.append(false)
+        function = function + 1
+    }
+    var owner = 0
+    while (owner < program.functions.size) {
+        var instructionIndex = 0
+        while (instructionIndex < program.functions[owner].instructions.size) {
+            val instruction = program.functions[owner].instructions[instructionIndex]
+            if (instruction.opcode == "function.ref" ||
+                instruction.opcode == "closure.create") {
+                val found = functionIndex.find(instruction.text)
+                if (found >= 0) taken[found] = true
+            }
+            instructionIndex = instructionIndex + 1
+        }
+        owner = owner + 1
+    }
+    taken
+}
+
+fun bootstrapLlvmInstructionMayCollect(
+    instruction: BootstrapInstruction,
+    functionIndex: BootstrapLlvmNameIndex,
+    mayCollect: array<bool>
+): bool {
+    var result = false
+    if (instruction.opcode == "extern.intrinsic" &&
+        instruction.text == "ablaRuntimeMemoryCollect") result = true
+    if (instruction.opcode == "call.indirect" ||
+        instruction.opcode == "call.indirect.once") result = true
+    if (instruction.opcode == "call") {
+        val called = functionIndex.find(instruction.text)
+        if (called >= 0 && called < mayCollect.size) result = mayCollect[called]
+    }
+    result
+}
+
+fun bootstrapLlvmInstructionMayAllocate(
+    instruction: BootstrapInstruction
+): bool {
+    var result = false
+    if (instruction.opcode == "array.create" ||
+        instruction.opcode == "array.append" ||
+        instruction.opcode == "cell.create" ||
+        instruction.opcode == "closure.create" ||
+        instruction.opcode == "field.set" ||
+        instruction.opcode == "object.allocate" ||
+        instruction.opcode == "object.create" ||
+        instruction.opcode == "shared.create" ||
+        instruction.opcode == "string.concat" ||
+        instruction.opcode == "string.slice" ||
+        instruction.opcode == "to.string") result = true
+    // String inspection may lazily flatten ropes. Host/native boundaries may
+    // materialize returned heap values.
+    if (instruction.opcode == "==" || instruction.opcode == "!=" ||
+        instruction.opcode == "index.get" ||
+        instruction.opcode == "extern.c" ||
+        instruction.opcode == "extern.host") result = true
+    if (instruction.opcode == "extern.intrinsic" &&
+        instruction.text == "ablaUnsafeAllocate") result = true
+    result
+}
+
+fun bootstrapLlvmCollectingFunctions(
+    program: BootstrapIrProgram,
+    functionIndex: BootstrapLlvmNameIndex,
+    addressTaken: array<bool>
+): array<bool> {
+    val automaticPressure = bootstrapLlvmNeedsCollector(program)
+    val result: array<bool> = []
+    var function = 0
+    while (function < program.functions.size) {
+        var direct = false
+        var instruction = 0
+        while (instruction < program.functions[function].instructions.size) {
+            val candidate = program.functions[function].instructions[instruction]
+            if (candidate.opcode == "extern.intrinsic" &&
+                candidate.text == "ablaRuntimeMemoryCollect") direct = true
+            if (automaticPressure &&
+                bootstrapLlvmInstructionMayAllocate(candidate)) direct = true
+            instruction = instruction + 1
+        }
+        result.append(direct)
+        function = function + 1
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        var indirectMayCollect = false
+        function = 0
+        while (function < result.size && function < addressTaken.size) {
+            if (result[function] && addressTaken[function]) {
+                indirectMayCollect = true
+            }
+            function = function + 1
+        }
+        function = 0
+        while (function < program.functions.size) {
+            if (!result[function]) {
+                var instruction = 0
+                while (instruction <
+                       program.functions[function].instructions.size) {
+                    val candidate =
+                        program.functions[function].instructions[instruction]
+                    if (candidate.opcode == "call") {
+                        val called = functionIndex.find(candidate.text)
+                        if (called >= 0 && result[called]) {
+                            result[function] = true
+                            changed = true
+                        }
+                    }
+                    if ((candidate.opcode == "call.indirect" ||
+                         candidate.opcode == "call.indirect.once") &&
+                        indirectMayCollect) {
+                        result[function] = true
+                        changed = true
+                    }
+                    instruction = instruction + 1
+                }
+            }
+            function = function + 1
+        }
+    }
+    result
+}
+
+fun bootstrapLlvmGcRootPlan(
+    function: BootstrapIrFunction,
+    functionIndex: BootstrapLlvmNameIndex,
+    mayCollect: array<bool>
+): array<bool> {
+    var valueCount = 0
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.result >= valueCount) valueCount = candidate.result + 1
+        if (candidate.left >= valueCount) valueCount = candidate.left + 1
+        if (candidate.right >= valueCount) valueCount = candidate.right + 1
+        var operand = 0
+        while (operand < candidate.operands.size) {
+            if (candidate.operands[operand] >= valueCount) {
+                valueCount = candidate.operands[operand] + 1
+            }
+            operand = operand + 1
+        }
+        instruction = instruction + 1
+    }
+
+    val definitions: array<int> = []
+    val lastUses: array<int> = []
+    val result: array<bool> = []
+    var value = 0
+    while (value < valueCount) {
+        definitions.append(-1)
+        lastUses.append(-1)
+        result.append(false)
+        value = value + 1
+    }
+
+    // collectorPrefix[n] counts collection-capable instructions before n.
+    // That makes the old strict interval (definition, last use) an O(1)
+    // lookup for every SSA value instead of rescanning the whole function.
+    val collectorPrefix: array<int> = []
+    collectorPrefix.append(0)
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.result >= 0 &&
+            definitions[candidate.result] < 0) {
+            definitions[candidate.result] = instruction
+        }
+        if (candidate.left >= 0) lastUses[candidate.left] = instruction
+        if (candidate.right >= 0) lastUses[candidate.right] = instruction
+        var operand = 0
+        while (operand < candidate.operands.size) {
+            val used = candidate.operands[operand]
+            if (used >= 0) lastUses[used] = instruction
+            operand = operand + 1
+        }
+        var collectorCount = collectorPrefix[instruction]
+        if (bootstrapLlvmInstructionMayCollect(
+            candidate,
+            functionIndex,
+            mayCollect
+        )) collectorCount = collectorCount + 1
+        collectorPrefix.append(collectorCount)
+        instruction = instruction + 1
+    }
+
+    value = 0
+    while (value < valueCount) {
+        val definition = definitions[value]
+        val lastUse = lastUses[value]
+        if (definition >= 0 && lastUse > definition &&
+            collectorPrefix[lastUse] > collectorPrefix[definition + 1]) {
+            result[value] = true
+        }
+        value = value + 1
+    }
+    result
+}
+
+fun bootstrapLlvmParameterId(
+    function: BootstrapIrFunction,
+    name: string
+): int {
+    var result = -1
+    var index = 0
+    while (index < function.parameters.size) {
+        if (function.parameters[index] == name) result = index
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapLlvmLocalIndex(
+    function: BootstrapIrFunction
+): BootstrapLlvmNameIndex {
+    val names: array<string> = []
+    val values: array<int> = []
+    var index = 0
+    while (index < function.instructions.size) {
+        val instruction = function.instructions[index]
+        if (instruction.opcode == "local.declare" ||
+            instruction.opcode == "local.zero" ||
+            instruction.opcode == "local.allocate") {
+            names.append(instruction.text)
+            values.append(index)
+        }
+        index = index + 1
+    }
+    bootstrapLlvmNameValueIndex(names, values)
+}
+
+fun bootstrapLlvmGlobalIndex(
+    program: BootstrapIrProgram
+): BootstrapLlvmNameIndex {
+    val names: array<string> = []
+    val values: array<int> = []
+    var index = 0
+    while (index < program.instructions.size) {
+        val instruction = program.instructions[index]
+        if (instruction.opcode == "global.store") {
+            names.append(instruction.text)
+            values.append(index)
+        }
+        index = index + 1
+    }
+    bootstrapLlvmNameValueIndex(names, values)
+}
+
+fun bootstrapLlvmClassIndex(
+    program: BootstrapIrProgram
+): BootstrapLlvmNameIndex {
+    val names: array<string> = []
+    val values: array<int> = []
+    var index = 0
+    while (index < program.classes.size) {
+        names.append(program.classes[index].name)
+        values.append(program.classes[index].id)
+        index = index + 1
+    }
+    bootstrapLlvmNameValueIndex(names, values)
+}
+
+fun bootstrapLlvmFieldIndex(
+    program: BootstrapIrProgram
+): BootstrapLlvmNameIndex {
+    val names: array<string> = []
+    val values: array<int> = []
+    var next = 0
+    var classIndex = 0
+    while (classIndex < program.classes.size) {
+        var fieldIndex = 0
+        while (fieldIndex < program.classes[classIndex].fields.size) {
+            names.append(program.classes[classIndex].fields[fieldIndex])
+            values.append(next)
+            next = next + 1
+            fieldIndex = fieldIndex + 1
+        }
+        classIndex = classIndex + 1
+    }
+    bootstrapLlvmNameValueIndex(names, values)
+}
+
+fun bootstrapLlvmHexDigit(value: int): string =
+    "0123456789ABCDEF".slice(value, value + 1)
+
+fun bootstrapLlvmBytes(value: string): string {
+    var output = ""
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        output =
+            "$output\\${bootstrapLlvmHexDigit(byte / 16)}${bootstrapLlvmHexDigit(byte - byte / 16 * 16)}"
+        index = index + 1
+    }
+    "$output\\00"
+}
+
+fun bootstrapLlvmRuntimeBinary(opcode: string): string {
+    var result = ""
+    if (opcode == "+") result = "abla_add"
+    if (opcode == "-") result = "abla_subtract"
+    if (opcode == "*") result = "abla_multiply"
+    if (opcode == "/") result = "abla_divide"
+    if (opcode == "==") result = "abla_equal"
+    if (opcode == "!=") result = "abla_not_equal"
+    if (opcode == "<") result = "abla_less"
+    if (opcode == "<=") result = "abla_less_equal"
+    if (opcode == ">") result = "abla_greater"
+    if (opcode == ">=") result = "abla_greater_equal"
+    result
+}
+
+fun bootstrapLlvmReplaceAll(
+    source: string,
+    expected: string,
+    replacement: string
+): string {
+    var output = ""
+    var segment = 0
+    var index = 0
+    while (index + expected.size <= source.size) {
+        if (source.slice(index, index + expected.size) == expected) {
+            output = "$output${source.slice(segment, index)}$replacement"
+            index = index + expected.size
+            segment = index
+        } else index = index + 1
+    }
+    "$output${source.slice(segment, source.size)}"
+}
+
+fun bootstrapLlvmIsBinary(opcode: string): bool =
+    opcode == "+" || opcode == "-" || opcode == "*" || opcode == "/" ||
+    opcode == "==" || opcode == "!=" || opcode == "<" ||
+    opcode == "<=" || opcode == ">" || opcode == ">="
+
+fun bootstrapLlvmFunctionFingerprint(
+    function: BootstrapIrFunction,
+    seed: int,
+    factor: int,
+    modulus: int
+): int {
+    var hash = bootstrapIrHashText(seed, function.name, factor, modulus)
+    var parameter = 0
+    while (parameter < function.parameters.size) {
+        hash = bootstrapIrHashText(
+            hash,
+            function.parameters[parameter],
+            factor,
+            modulus
+        )
+        parameter = parameter + 1
+    }
+    hash = hash * factor + function.result + 2
+    hash = hash - (hash / modulus) * modulus
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        val found = function.instructions[instruction]
+        hash = bootstrapIrHashText(hash, found.opcode, factor, modulus)
+        hash = bootstrapIrHashText(hash, found.text, factor, modulus)
+        hash = hash * factor + found.result + 2
+        hash = hash - (hash / modulus) * modulus
+        hash = hash * factor + found.left + 2
+        hash = hash - (hash / modulus) * modulus
+        hash = hash * factor + found.right + 2
+        hash = hash - (hash / modulus) * modulus
+        hash = hash * factor + found.target + 2
+        hash = hash - (hash / modulus) * modulus
+        hash = hash * factor + found.alternate + 2
+        hash = hash - (hash / modulus) * modulus
+        var operand = 0
+        while (operand < found.operands.size) {
+            hash = hash * factor + found.operands[operand] + 2
+            hash = hash - (hash / modulus) * modulus
+            operand = operand + 1
+        }
+        instruction = instruction + 1
+    }
+    if (hash < 0) 0 - hash else hash
+}
+
+// Linkage identities describe declarations, not implementations. A body edit
+// must leave callers' relocation targets intact so their native objects remain
+// reusable. The extracted LLVM partition is hashed separately by the
+// toolchain, which invalidates the object that actually contains the edit.
+fun bootstrapLlvmFunctionLinkFingerprint(
+    function: BootstrapIrFunction,
+    seed: int,
+    factor: int,
+    modulus: int
+): int {
+    var hash = bootstrapIrHashText(seed, function.name, factor, modulus)
+    var parameter = 0
+    while (parameter < function.parameters.size) {
+        hash = bootstrapIrHashText(
+            hash,
+            function.parameters[parameter],
+            factor,
+            modulus
+        )
+        parameter = parameter + 1
+    }
+    if (hash < 0) 0 - hash else hash
+}
+
+fun bootstrapLlvmFunctionSymbol(function: BootstrapIrFunction): string =
+    "abla_fn_${bootstrapLlvmFunctionLinkFingerprint(
+        function, 41, 269, 1000000007
+    )}_${bootstrapLlvmFunctionLinkFingerprint(
+        function, 101, 271, 1000000009
+    )}"
+
+fun bootstrapLlvmFunctionRuntimeId(function: BootstrapIrFunction): int =
+    bootstrapLlvmFunctionLinkFingerprint(function, 151, 277, 1000000007)
+
+class BootstrapLlvmFunctionIdentities(
+    val symbols: array<string>,
+    val runtimeIds: array<int>,
+    val collisions: int
+)
+
+fun bootstrapLlvmFunctionIdentities(
+    program: BootstrapIrProgram
+): BootstrapLlvmFunctionIdentities {
+    val symbols: array<string> = []
+    val runtimeIds: array<int> = []
+    var collisions = 0
+    var function = 0
+    while (function < program.functions.size) {
+        val symbol = bootstrapLlvmFunctionSymbol(program.functions[function])
+        val runtimeId = bootstrapLlvmFunctionRuntimeId(
+            program.functions[function]
+        )
+        var previous = 0
+        while (previous < symbols.size) {
+            if (symbols[previous] == symbol ||
+                runtimeIds[previous] == runtimeId) collisions = collisions + 1
+            previous = previous + 1
+        }
+        symbols.append(symbol)
+        runtimeIds.append(runtimeId)
+        function = function + 1
+    }
+    BootstrapLlvmFunctionIdentities(symbols, runtimeIds, collisions)
+}
+
+fun bootstrapLlvmStableNameId(name: string): int {
+    var hash = bootstrapIrHashText(181, name, 281, 1000000007)
+    if (hash < 0) hash = 0 - hash
+    hash
+}
+
+fun bootstrapLlvmStableNameCollisions(names: array<string>): int {
+    var collisions = 0
+    var index = 0
+    while (index < names.size) {
+        val identity = bootstrapLlvmStableNameId(names[index])
+        var previous = 0
+        while (previous < index) {
+            if (names[previous] != names[index] &&
+                bootstrapLlvmStableNameId(names[previous]) == identity) {
+                collisions = collisions + 1
+            }
+            previous = previous + 1
+        }
+        index = index + 1
+    }
+    collisions
+}
+
+fun bootstrapLlvmGlobalSymbol(name: string): string =
+    "abla_global_${bootstrapIrHashText(
+        191, name, 283, 1000000007
+    )}_${bootstrapIrHashText(
+        211, name, 293, 1000000009
+    )}"
+
+fun bootstrapLlvmStringSymbol(
+    function: BootstrapIrFunction,
+    result: int
+): string = "abla_string_${bootstrapLlvmFunctionSymbol(function)}_$result"
+
+fun bootstrapLlvmStringSymbolFrom(
+    functionSymbol: string,
+    result: int
+): string = "abla_string_${functionSymbol}_$result"
+
+fun bootstrapLlvmJsonEscape(value: string): string {
+    var output = ""
+    var index = 0
+    while (index < value.size) {
+        val byte = value[index]
+        if (byte == 34) output = "$output\\\""
+        else if (byte == 92) output = "$output\\\\"
+        else if (byte == 10) output = "$output\\n"
+        else if (byte == 13) output = "$output\\r"
+        else if (byte == 9) output = "$output\\t"
+        else output = "$output${value.slice(index, index + 1)}"
+        index = index + 1
+    }
+    output
+}
+
+fun bootstrapLlvmExportAbi(
+    exports: array<BootstrapExportRequest>
+): string {
+    var output = "["
+    var index = 0
+    while (index < exports.size) {
+        val request = exports[index]
+        var abi = request.resultType
+        var ownership = "value"
+        if (request.resultType == "bool") abi = "u8-bool"
+        if (request.resultType == "void") ownership = "none"
+        if (request.resultType == "string") {
+            abi = "owned-bytes-handle"
+            ownership = "owned"
+        }
+        if (index > 0) output = "$output,"
+        var parameters = "["
+        var parameter = 0
+        while (parameter < request.parameterTypes.size) {
+            if (parameter > 0) parameters = "$parameters,"
+            var abi = request.parameterTypes[parameter]
+            if (abi == "bool") abi = "u8-bool"
+            if (abi == "string") {
+                parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
+                    request.parameterNames[parameter]
+                )}\",\"abi\":\"bytes\",\"lowering\":[\"pointer\",\"u64\"],\"ownership\":\"borrowed\",\"calleeAction\":\"copy\",\"nullable\":false,\"nullPointerAllowedWhenEmpty\":true}"
+            } else if (abi == "function:(i64)->i64") {
+                parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
+                    request.parameterNames[parameter]
+                )}\",\"abi\":\"callback\",\"callingConvention\":\"c\",\"lowering\":[\"function-pointer\",\"context-pointer\"],\"signature\":{\"parameters\":[\"i64\"],\"result\":\"i64\"},\"ownership\":\"borrowed\",\"lifetime\":\"call\",\"retention\":\"forbidden\",\"invocation\":\"synchronous\",\"callbackNullable\":false,\"contextNullable\":true,\"unwind\":\"forbidden\"}"
+            } else {
+                parameters = "$parameters{\"name\":\"${bootstrapLlvmJsonEscape(
+                    request.parameterNames[parameter]
+                )}\",\"abi\":\"$abi\",\"ownership\":\"value\",\"nullable\":false}"
+            }
+            parameter = parameter + 1
+        }
+        parameters = "$parameters]"
+        var result = "{\"abi\":\"$abi\",\"ownership\":\"$ownership\",\"nullable\":false}"
+        if (request.resultType == "string") {
+            result = "{\"abi\":\"owned-bytes-handle\",\"ownership\":\"owned\",\"nullable\":false,\"data\":\"abla_owned_bytes_data\",\"length\":\"abla_owned_bytes_length\",\"release\":\"abla_owned_bytes_release\",\"releaseExactlyOnce\":true,\"validUntilRelease\":true}"
+        }
+        if (request.checked && request.resultType != "void") {
+            result = bootstrapLlvmReplaceAll(
+                result,
+                "{\"abi\":",
+                "{\"lowering\":[\"out-pointer\"],\"abi\":"
+            )
+        }
+        var failure = "{\"panic\":\"not-contained\"}"
+        if (request.checked) {
+            failure = "{\"panic\":\"contained\",\"statusAbi\":\"i32\",\"status\":{\"success\":0,\"panic\":1,\"invalidArguments\":2},\"message\":{\"data\":\"caller-buffer\",\"capacity\":\"u64\",\"requiredLength\":\"u64-out\",\"encoding\":\"bytes\",\"truncation\":\"prefix\"},\"cleanup\":\"abortive\",\"sideEffectsRolledBack\":false,\"concurrency\":\"single-threaded\"}"
+        }
+        output = "$output\n    {\"source\":\"${bootstrapLlvmJsonEscape(
+            request.source
+        )}\",\"symbol\":\"${request.name}\",\"parameters\":$parameters,\"result\":$result,\"failure\":$failure}"
+        index = index + 1
+    }
+    if (exports.size > 0) output = "$output\n  "
+    "$output]"
+}

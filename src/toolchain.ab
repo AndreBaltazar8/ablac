@@ -1,4 +1,4 @@
-#import("backend_llvm.ab")
+#import("backend/llvm/backend.ab")
 #import("module.ab")
 #import("abla/sys/linux/fs")
 #import("abla/sys/linux/io")
@@ -639,6 +639,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val llvmPath = "$outputPath.ll"
     val objectPath = "$outputPath.o"
     val hostPath = "$outputPath.host.o"
+    val valueRuntimePath = "$outputPath.value-runtime.o"
+    val rawAdaptersPath = "$outputPath.raw-adapters.o"
     val rawRuntimePath = "$outputPath.raw-runtime.o"
     val publishPath = "$outputPath.tmp.${linuxProcessId()}"
     val manifestPath = Path(sourcePath).parent().child("abla.toml")
@@ -692,11 +694,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     var abiManifest = ""
     var reusedNativePartitions = 0
     var refreshedNativePartitions = 0
-    // Remove sidecars left by compilers from before the value runtime was
-    // emitted in LLVM. A successful native build must not advertise or
-    // accidentally reuse the retired C runtime object.
+    // Remove the legacy runtime sidecar name and every target-specific object
+    // before publishing a fresh build.
     Path("$outputPath.runtime.o").remove()
     Path(hostPath).remove()
+    Path(valueRuntimePath).remove()
+    Path(rawAdaptersPath).remove()
     Path(rawRuntimePath).remove()
     Path(publishPath).remove()
     if (cached) {
@@ -856,7 +859,56 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileRawRuntime.argument(rawRuntimePath)
         status = compileRawRuntime.run()
     }
-    if (status == 0 && linkHost && target.hosted && artifact != "object") {
+    if (status == 0 && rawTarget && artifact == "executable") {
+        val compileValueRuntime = linuxCommand("clang")
+        compileValueRuntime.argument("-std=c11")
+        compileValueRuntime.argument("-O2")
+        compileValueRuntime.argument("-ffreestanding")
+        compileValueRuntime.argument("-fno-stack-protector")
+        compileValueRuntime.argument("-ffunction-sections")
+        compileValueRuntime.argument("-fdata-sections")
+        compileValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
+        compileValueRuntime.argument("-c")
+        compileValueRuntime.argument(
+            Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
+        )
+        compileValueRuntime.argument("-o")
+        compileValueRuntime.argument(valueRuntimePath)
+        status = compileValueRuntime.run()
+    }
+    if (status == 0 && rawTarget && artifact == "executable") {
+        val compileRawAdapters = linuxCommand("clang")
+        compileRawAdapters.argument("-std=c11")
+        compileRawAdapters.argument("-O2")
+        compileRawAdapters.argument("-ffreestanding")
+        compileRawAdapters.argument("-fno-stack-protector")
+        compileRawAdapters.argument("-ffunction-sections")
+        compileRawAdapters.argument("-fdata-sections")
+        compileRawAdapters.argument("-I${bootstrapRuntimeRoot()}")
+        compileRawAdapters.argument("-c")
+        compileRawAdapters.argument(
+            Path(bootstrapRuntimeRoot()).child("abla_runtime_raw.c").text
+        )
+        compileRawAdapters.argument("-o")
+        compileRawAdapters.argument(rawAdaptersPath)
+        status = compileRawAdapters.run()
+    }
+    if (status == 0 && target.hosted && artifact != "object") {
+        val compileValueRuntime = linuxCommand("clang")
+        compileValueRuntime.argument("-std=c11")
+        compileValueRuntime.argument("-O2")
+        compileValueRuntime.argument("-ffunction-sections")
+        compileValueRuntime.argument("-fdata-sections")
+        compileValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
+        compileValueRuntime.argument("-c")
+        compileValueRuntime.argument(
+            Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
+        )
+        compileValueRuntime.argument("-o")
+        compileValueRuntime.argument(valueRuntimePath)
+        status = compileValueRuntime.run()
+    }
+    if (status == 0 && target.hosted && artifact != "object") {
         val compileHost = linuxCommand("clang")
         compileHost.argument("-std=c11")
         compileHost.argument("-O2")
@@ -879,6 +931,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkRaw.argument("-e")
         linkRaw.argument("_start")
         linkRaw.argument(objectPath)
+        linkRaw.argument(valueRuntimePath)
+        linkRaw.argument(rawAdaptersPath)
         linkRaw.argument(rawRuntimePath)
         linkRaw.argument("-o")
         linkRaw.argument(publishPath)
@@ -904,7 +958,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             link.argument("-lLLVM")
         }
         link.argument(objectPath)
-        if (linkHost) link.argument(hostPath)
+        if (target.hosted) {
+            link.argument(valueRuntimePath)
+            link.argument(hostPath)
+        }
         link.argument("-o")
         link.argument(publishPath)
         status = link.run()
@@ -917,7 +974,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         archive.argument("rcs")
         archive.argument(publishPath)
         archive.argument(objectPath)
-        if (linkHost) archive.argument(hostPath)
+        if (target.hosted) {
+            archive.argument(valueRuntimePath)
+            archive.argument(hostPath)
+        }
         status = archive.run()
     }
     if (status == 0 && target.hosted && artifact == "shared-library") {
@@ -940,7 +1000,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             linkShared.argument("-lLLVM")
         }
         linkShared.argument(objectPath)
-        if (linkHost) linkShared.argument(hostPath)
+        if (target.hosted) {
+            linkShared.argument(valueRuntimePath)
+            linkShared.argument(hostPath)
+        }
         linkShared.argument("-o")
         linkShared.argument(publishPath)
         status = linkShared.run()
@@ -1176,6 +1239,9 @@ fun bootstrapBuildJitHostLibrary(outputPath: string): int {
     hostCompile.argument("-shared")
     hostCompile.argument("-Wl,--no-undefined")
     hostCompile.argument("-I${bootstrapRuntimeRoot()}")
+    hostCompile.argument(
+        Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
+    )
     hostCompile.argument(
         Path(bootstrapRuntimeRoot()).child("abla_runtime_host.c").text
     )

@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <setjmp.h>
 #include <sys/socket.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +57,13 @@ static size_t host_allocation_limit = (size_t)1024 * 1024 * 1024;
 static bool host_allocation_limit_initialized;
 static AblaRuntimeRootFrame* host_root_frame;
 static size_t host_collection_threshold = (size_t)256 * 1024 * 1024;
+typedef struct AblaCheckedFrame {
+    jmp_buf jump;
+    struct AblaCheckedFrame* previous;
+    const char* message;
+    size_t length;
+} AblaCheckedFrame;
+static _Thread_local AblaCheckedFrame* host_checked_frame;
 static AblaAllocationHeader** host_collection_index;
 static size_t host_collection_index_count;
 static AblaAllocationHeader** host_mark_worklist;
@@ -375,13 +383,52 @@ void abla_platform_memory_set_layout(void* pointer, int64_t layout) {
 }
 
 _Noreturn void abla_platform_panic(const char* message, size_t length) {
+    if (host_checked_frame != NULL) {
+        host_checked_frame->message = message;
+        host_checked_frame->length = length;
+        longjmp(host_checked_frame->jump, 1);
+    }
     fputs("abla panic: ", stderr);
     fwrite(message, 1, length, stderr);
     fputc('\n', stderr);
     abort();
 }
 
-void abla_host_set_arguments(int argc, char** argv) {
+int32_t abla_checked_invoke(
+    void* opaque_function,
+    const AblaValue* arguments,
+    uint64_t count,
+    AblaValue* result,
+    uint8_t* error_data,
+    uint64_t error_capacity,
+    uint64_t* error_length) {
+    if (result == NULL || error_length == NULL ||
+        (error_data == NULL && error_capacity != 0)) return 2;
+    typedef void (*AblaGeneratedFunction)(
+        AblaValue*, const AblaValue*, uint64_t);
+    AblaCheckedFrame frame = {
+        .previous = host_checked_frame,
+        .message = NULL,
+        .length = 0
+    };
+    host_checked_frame = &frame;
+    if (setjmp(frame.jump) == 0) {
+        ((AblaGeneratedFunction)opaque_function)(
+            result, arguments, count);
+        host_checked_frame = frame.previous;
+        *error_length = 0;
+        return 0;
+    }
+    host_checked_frame = frame.previous;
+    *error_length = (uint64_t)frame.length;
+    const size_t copied = error_capacity < frame.length
+        ? (size_t)error_capacity
+        : frame.length;
+    if (copied != 0) memcpy(error_data, frame.message, copied);
+    return 1;
+}
+
+void abla_runtime_set_arguments(int argc, char** argv) {
     host_argc = argc;
     host_argv = argv;
     host_envp = argv == NULL ? NULL : argv + (size_t)argc + 1;
@@ -390,7 +437,12 @@ void abla_host_set_arguments(int argc, char** argv) {
 AblaValue ablaUnsafeAllocate(AblaValue size_value) {
     const int64_t size = host_value_as_i64(size_value);
     if (size < 0) abla_platform_panic("negative allocation size", 24);
-    return host_value_pointer(abla_platform_alloc((size_t)size));
+    void* pointer = abla_platform_alloc((size_t)size);
+    // Unsafe pointers are represented as integers and therefore cannot be
+    // discovered by the managed-value marker. Their lifetime is explicitly
+    // controlled by unsafeFree/adoption, so keep them out of GC sweeping.
+    abla_platform_memory_set_layout(pointer, 10);
+    return host_value_pointer(pointer);
 }
 
 AblaValue ablaUnsafeFree(AblaValue pointer) {
@@ -1121,6 +1173,11 @@ AblaValue ablaHostMemorySetLimit(AblaValue limit_value) {
         abla_platform_panic("invalid memory limit", 20);
     }
     host_allocation_limit = (size_t)limit;
+    const size_t reserve = host_allocation_limit / 4;
+    const size_t latest = host_allocation_limit - reserve;
+    if (host_collection_threshold > latest) {
+        host_collection_threshold = latest;
+    }
     return host_value_void();
 }
 
@@ -1400,10 +1457,12 @@ ABLA_HOST_FALLBACK void abla_runtime_roots_pop(AblaRuntimeRootFrame* frame) {
 
 ABLA_HOST_FALLBACK void abla_runtime_memory_pressure(void) {
     host_initialize_allocation_limit();
-    const size_t reserve = (size_t)64 * 1024 * 1024;
-    const size_t latest = host_allocation_limit > reserve
-        ? host_allocation_limit - reserve
-        : host_allocation_limit;
+    const size_t maximum_reserve = (size_t)64 * 1024 * 1024;
+    const size_t proportional_reserve = host_allocation_limit / 4;
+    const size_t reserve = proportional_reserve < maximum_reserve
+        ? proportional_reserve
+        : maximum_reserve;
+    const size_t latest = host_allocation_limit - reserve;
     size_t trigger = host_collection_threshold;
     if (trigger > latest) trigger = latest;
     if (host_allocation_live_bytes < trigger) return;

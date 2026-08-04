@@ -5,6 +5,7 @@ compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/final-native-conformance"
 build_memory_mb=${ABLA_CONFORMANCE_BUILD_MEMORY_MB:-4096}
+build_seconds=${ABLA_CONFORMANCE_BUILD_SECONDS:-300}
 mkdir -p "$output_directory"
 
 # These exercise staged evaluation, nested subparsers, nominal types, lambda
@@ -74,6 +75,11 @@ if [[ ! $build_memory_mb =~ ^[1-9][0-9]*$ ]]; then
         "$build_memory_mb" >&2
     exit 2
 fi
+if [[ ! $build_seconds =~ ^[1-9][0-9]*$ ]]; then
+    printf 'ABLA_CONFORMANCE_BUILD_SECONDS must be a positive integer, got %q\n' \
+        "$build_seconds" >&2
+    exit 2
+fi
 jobs_by_memory=$((available_memory_mb / build_memory_mb))
 (( jobs_by_memory > 0 )) || jobs_by_memory=1
 default_jobs=$processor_count
@@ -96,8 +102,8 @@ run_fixture() {
     result_log="$output_directory/$fixture.result"
     : > "$result_log"
 
-    if ! ABLA_MAX_MEMORY_MB=$build_memory_mb ABLA_MAX_SECONDS=90 \
-        ABLA_MAX_CPU_SECONDS=90 \
+    if ! ABLA_MAX_MEMORY_MB=$build_memory_mb ABLA_MAX_SECONDS=$build_seconds \
+        ABLA_MAX_CPU_SECONDS=$build_seconds \
         "$project_root/tools/run-limited.sh" \
         "$compiler" build \
         "$project_root/tests/cases/modules/$fixture.ab" \
@@ -118,7 +124,7 @@ run_fixture() {
     printf '%s\n' "$status" > "$result_log"
 }
 export -f run_fixture
-export compiler project_root output_directory build_memory_mb
+export compiler project_root output_directory build_memory_mb build_seconds
 
 printf 'final-native conformance: building %s programs with %s parallel job(s)\n' \
     "${#fixtures[@]}" "$jobs"

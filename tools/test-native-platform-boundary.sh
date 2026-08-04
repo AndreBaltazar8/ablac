@@ -16,24 +16,19 @@ linux_filesystem_output="$output_directory/linux-filesystem"
     "$project_root/tests/cases/modules/collections.ab" \
     > "$output_directory/pure-collections.ll"
 
-if rg -q '^declare .*@abla_platform_|@abla_host_set_arguments' \
+if rg -q '^define .*@abla_(platform_|runtime_set_arguments)' \
     "$output_directory/pure-collections.ll"; then
-    echo "pure program retained the C host/platform boundary" >&2
+    echo "generated module duplicated the portable platform runtime" >&2
     exit 1
 fi
-rg -q '^define internal ptr @abla_runtime_alloc' \
+rg -q '^declare .*@abla_array_create' \
     "$output_directory/pure-collections.ll"
-rg -q '^define internal void @abla_runtime_panic' \
+rg -q '^declare .*@abla_runtime_set_arguments' \
     "$output_directory/pure-collections.ll"
-if [[ -e $pure_output.host.o ]]; then
-    echo "pure native build compiled an unused C host adapter" >&2
-    exit 1
-fi
-if nm --defined-only "$pure_output" | awk '{print $3}' |
-    rg -q '^ablaHost|^abla_host_|^abla_platform_'; then
-    echo "pure executable linked a project C platform symbol" >&2
-    exit 1
-fi
+[[ -s $pure_output.value-runtime.o ]]
+[[ -s $pure_output.host.o ]]
+nm --defined-only "$pure_output" | awk '{print $3}' |
+    rg -q '^abla_platform_alloc$'
 set +e
 ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$pure_output"
@@ -57,15 +52,8 @@ rg -q '^abla panic: array index out of bounds$' \
 "$compiler" build \
     "$project_root/tests/cases/modules/linux-filesystem.ab" \
     -o "$linux_filesystem_output"
-if [[ -e $linux_filesystem_output.host.o ]]; then
-    echo "raw Linux filesystem compiled an unused C host adapter" >&2
-    exit 1
-fi
-if nm --defined-only "$linux_filesystem_output" | awk '{print $3}' |
-    rg -q '^ablaHost|^abla_host_|^abla_platform_'; then
-    echo "raw Linux filesystem linked a project C platform symbol" >&2
-    exit 1
-fi
+[[ -s $linux_filesystem_output.value-runtime.o ]]
+[[ -s $linux_filesystem_output.host.o ]]
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$linux_filesystem_output"
@@ -76,23 +64,11 @@ set -e
 fixtures=(filesystem process-capture)
 for fixture in "${fixtures[@]}"; do
     output="$output_directory/$fixture"
-    rm -f "$output.runtime.o"
     "$compiler" build \
         "$project_root/tests/cases/modules/$fixture.ab" \
         -o "$output"
-    if [[ -e $output.runtime.o ]]; then
-        echo "$fixture: native build recreated the legacy runtime object" >&2
-        exit 1
-    fi
-    if [[ -e $output.host.o ]]; then
-        echo "$fixture: portable target-backed module compiled a host adapter" >&2
-        exit 1
-    fi
-    if nm --defined-only "$output" |
-        rg -q ' [TW] abla_(void|i64|bool|string_static|string_data|array_)'; then
-        echo "$fixture: executable exports legacy C value-runtime symbols" >&2
-        exit 1
-    fi
+    [[ -s $output.value-runtime.o ]]
+    [[ -s $output.host.o ]]
     set +e
     ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
         "$project_root/tools/run-limited.sh" "$output"
@@ -109,9 +85,6 @@ host_output="$output_directory/host-runtime"
     "$project_root/tests/cases/modules/host-runtime.ab" \
     -o "$host_output"
 [[ -s $host_output.host.o ]]
-if nm -u "$host_output.host.o" | awk '{print $2}' | rg -q '^abla_'; then
-    echo 'explicit host adapter imports the legacy Abla value ABI' >&2
-    exit 1
-fi
+[[ -s $host_output.value-runtime.o ]]
 
-echo "native platform boundary: host adapter omitted for pure/portable-raw programs; private bridge only when explicitly selected"
+echo "native platform boundary: generated modules use one linked portable value/platform runtime"

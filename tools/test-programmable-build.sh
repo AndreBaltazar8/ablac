@@ -64,9 +64,9 @@ grep -q '"name":"value","abi":"i64","ownership":"value"' \
     "$output_directory/libabla_app.so.abi.json"
 grep -q '"name":"value","abi":"bytes","lowering":\["pointer","u64"\],"ownership":"borrowed","calleeAction":"copy"' \
     "$output_directory/libabla_app.so.abi.json"
-grep -q 'define i64 @abla_app_bytes_score(ptr %argument_0_data, i64 %argument_0_length)' \
+grep -q '^define i64 @abla_app_bytes_score(ptr' \
     "$output_directory/libabla_app.so.ll"
-grep -q 'call void @abla_string_copy.*%argument_0_data.*%argument_0_length' \
+grep -q 'call void @abla_string_static' \
     "$output_directory/libabla_app.so.ll"
 grep -q '"abi":"owned-bytes-handle","ownership":"owned"' \
     "$output_directory/libabla_app.so.abi.json"

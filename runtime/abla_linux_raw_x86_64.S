@@ -23,6 +23,68 @@ _start:
     ud2
     .size _start, .-_start
 
+    .globl abla_platform_alloc
+    .type abla_platform_alloc,@function
+abla_platform_alloc:
+    jmp malloc
+    .size abla_platform_alloc, .-abla_platform_alloc
+
+    .globl abla_platform_free
+    .type abla_platform_free,@function
+abla_platform_free:
+    jmp free
+    .size abla_platform_free, .-abla_platform_free
+
+    .globl abla_platform_panic
+    .type abla_platform_panic,@function
+abla_platform_panic:
+    movl $127, %edi
+    movl $231, %eax
+    syscall
+    ud2
+    .size abla_platform_panic, .-abla_platform_panic
+
+    .globl abla_platform_memory_checkpoint
+abla_platform_memory_checkpoint:
+    xorl %eax, %eax
+    ret
+    .globl abla_platform_memory_reset
+abla_platform_memory_reset:
+    ret
+    .globl abla_platform_memory_live_bytes
+abla_platform_memory_live_bytes:
+    xorl %eax, %eax
+    ret
+    .globl abla_platform_memory_limit
+abla_platform_memory_limit:
+    movabsq $9223372036854775807, %rax
+    ret
+    .globl abla_platform_memory_set_limit
+abla_platform_memory_set_limit:
+    ret
+    .globl abla_platform_memory_set_scan
+abla_platform_memory_set_scan:
+    ret
+    .globl abla_platform_memory_set_layout
+abla_platform_memory_set_layout:
+    ret
+    .globl abla_platform_memory_collect
+abla_platform_memory_collect:
+    /* A collection pass completed. The raw allocator returns one when no
+       tracked byte count is available so callers can distinguish the pass
+       from an unsupported operation. */
+    movl $1, %eax
+    ret
+    .globl abla_runtime_roots_push
+abla_runtime_roots_push:
+    ret
+    .globl abla_runtime_roots_pop
+abla_runtime_roots_pop:
+    ret
+    .globl abla_runtime_memory_pressure
+abla_runtime_memory_pressure:
+    ret
+
     .globl malloc
     .type malloc,@function
 malloc:

@@ -73,7 +73,7 @@ AblaValue abla_closure(
     const AblaValue* captures,
     size_t capture_count);
 
-void abla_host_set_arguments(int argc, char** argv);
+void abla_runtime_set_arguments(int argc, char** argv);
 AblaValue ablaHostArgumentCount(void);
 AblaValue ablaHostArgument(AblaValue index);
 AblaValue ablaHostReadFile(AblaValue path);
@@ -114,8 +114,8 @@ AblaValue ablaHostMemoryLiveBytes(void);
 AblaValue ablaHostMemoryLimit(void);
 AblaValue ablaHostMemorySetLimit(AblaValue limit);
 
-// Seed-C adapters for LLVM intrinsics. Native LLVM output lowers these
-// operations directly and does not import these symbols.
+// Runtime adapters for Abla's unsafe-memory and raw-Linux intrinsics. The
+// direct LLVM backend calls this stable ABI on both hosted and raw targets.
 AblaValue ablaUnsafeAllocate(AblaValue size);
 AblaValue ablaUnsafeFree(AblaValue pointer);
 AblaValue ablaUnsafeLoadI64(AblaValue address);
@@ -170,7 +170,21 @@ const char* abla_as_cstring(AblaValue value);
 const char* abla_string_data(AblaValue value);
 uint32_t abla_as_function(AblaValue value);
 size_t abla_function_capture_count(AblaValue value);
+AblaValue* abla_function_capture_pointer(AblaValue value);
 AblaValue abla_function_capture(AblaValue value, size_t index);
+void abla_closure_release(AblaValue value);
+void* abla_owned_bytes_from_value(AblaValue value);
+const uint8_t* abla_owned_bytes_data(void* handle);
+uint64_t abla_owned_bytes_length(void* handle);
+void abla_owned_bytes_release(void* handle);
+int32_t abla_checked_invoke(
+    void* function,
+    const AblaValue* arguments,
+    uint64_t count,
+    AblaValue* result,
+    uint8_t* error_data,
+    uint64_t error_capacity,
+    uint64_t* error_length);
 AblaValue abla_cell_create(AblaValue value);
 AblaValue abla_cell_get(AblaValue cell);
 AblaValue abla_cell_set(AblaValue cell, AblaValue value);
