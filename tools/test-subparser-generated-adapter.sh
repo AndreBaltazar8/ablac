@@ -7,6 +7,21 @@ output_directory="$project_root/build/subparser-generated-adapter"
 source_file="$project_root/tests/cases/modules/subparser-generated-adapter.ab"
 mkdir -p "$output_directory"
 
+assert_compiler_diagnostic_accounting() {
+    local diagnostic_file=$1
+    local summary parser extension semantic ir total primary
+    summary=$(grep 'compilation failed:' "$diagnostic_file" | tail -n 1)
+    read -r parser extension semantic ir total < <(
+        sed -E \
+            's/.*: ([0-9]+) parser, ([0-9]+) extension, ([0-9]+) semantic, ([0-9]+) IR, ([0-9]+) total.*/\1 \2 \3 \4 \5/' \
+            <<<"$summary"
+    )
+    [[ $((parser + extension + semantic + ir)) -eq $total ]]
+    primary=$(grep -c '^error\[' "$diagnostic_file")
+    [[ $primary -eq $total ]]
+    ! grep -q 'error\[E_NATIVE_TOOLCHAIN\]' "$diagnostic_file"
+}
+
 "$compiler" --emit-llvm "$source_file" > "$output_directory/first.ll"
 "$compiler" --emit-llvm "$source_file" > "$output_directory/second.ll"
 cmp "$output_directory/first.ll" "$output_directory/second.ll"
@@ -143,7 +158,9 @@ grep -q 'error\[E_EXT_GENERATED_SEMANTIC\]:' \
     "$output_directory/invalid-semantic.err"
 grep -q 'source\[generated-origin\]:invalid.semantic:' \
     "$output_directory/invalid-semantic.err"
-grep -q '0 parser, 1 extension, 0 semantic, 1 total error' \
+grep -q '0 parser, 1 extension, 0 semantic, 0 IR, 1 total error' \
+    "$output_directory/invalid-semantic.err"
+assert_compiler_diagnostic_accounting \
     "$output_directory/invalid-semantic.err"
 
 set +e
@@ -160,7 +177,9 @@ grep -q 'context\[subparser\]: `parseEarlyTyped`' \
     "$output_directory/invalid-early-typed.err"
 grep -q 'source\[extension-expression\]:' \
     "$output_directory/invalid-early-typed.err"
-grep -q '0 parser, 1 extension, 0 semantic, 1 total error' \
+grep -q '0 parser, 1 extension, 0 semantic, 0 IR, 1 total error' \
+    "$output_directory/invalid-early-typed.err"
+assert_compiler_diagnostic_accounting \
     "$output_directory/invalid-early-typed.err"
 
 set +e
@@ -171,9 +190,15 @@ set +e
 invalid_request_result_status=$?
 set -e
 [[ $invalid_request_result_status -ne 0 ]]
-grep -q 'extension.request:expected.request.namespace:' \
+grep -q 'error\[E_EXT_FINALIZER_RESULT\]:' \
+    "$output_directory/invalid-request-result.err"
+grep -q 'context\[generated-namespace\]: expected.request.namespace' \
+    "$output_directory/invalid-request-result.err"
+grep -q 'source\[extension-request\]:' \
     "$output_directory/invalid-request-result.err"
 grep -q 'finalizer returned the wrong result kind or namespace' \
+    "$output_directory/invalid-request-result.err"
+assert_compiler_diagnostic_accounting \
     "$output_directory/invalid-request-result.err"
 
 set +e
@@ -194,8 +219,54 @@ grep -q 'context\[generated-extension-finalizer\]: `finalizeInvalidFunctionHandl
     "$output_directory/invalid-function-handle.err"
 grep -q 'source\[extension-request\]:invalid.function.handle:' \
     "$output_directory/invalid-function-handle.err"
-grep -q '0 parser, 1 extension, 0 semantic, 1 total error' \
+grep -q '0 parser, 1 extension, 0 semantic, 0 IR, 1 total error' \
     "$output_directory/invalid-function-handle.err"
+assert_compiler_diagnostic_accounting \
+    "$output_directory/invalid-function-handle.err"
+
+set +e
+"$compiler" --emit-llvm \
+    "$project_root/tests/cases/bootstrap/invalid-parser-diagnostics.ab" \
+    > "$output_directory/invalid-parser.ll" \
+    2> "$output_directory/invalid-parser.err"
+invalid_parser_status=$?
+set -e
+[[ $invalid_parser_status -ne 0 ]]
+grep -q 'error\[E_PARSE_PARAMETER_SEPARATOR\]:' \
+    "$output_directory/invalid-parser.err"
+grep -Fq \
+    'source[parser]:'"$project_root"'/tests/cases/bootstrap/invalid-parser-diagnostics.ab:' \
+    "$output_directory/invalid-parser.err"
+grep -q 'error\[E_IR_UNCLASSIFIED\]:' \
+    "$output_directory/invalid-parser.err"
+assert_compiler_diagnostic_accounting \
+    "$output_directory/invalid-parser.err"
+
+"$compiler" build \
+    "$project_root/tests/cases/modules/ir-diagnostic-fallback.ab" \
+    -o "$output_directory/ir-diagnostic-fallback" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$output_directory/ir-diagnostic-fallback"
+ir_diagnostic_status=$?
+set -e
+[[ $ir_diagnostic_status -eq 42 ]]
+
+set +e
+PATH=/nonexistent "$compiler" build \
+    "$project_root/tests/cases/modules/types-error.ab" \
+    -o "$output_directory/invalid-compiler" --no-cache \
+    > "$output_directory/invalid-compiler.out" \
+    2> "$output_directory/invalid-compiler.err"
+invalid_compiler_status=$?
+set -e
+[[ $invalid_compiler_status -ne 0 ]]
+grep -q 'error\[E_SEMANTIC\]:' \
+    "$output_directory/invalid-compiler.err"
+grep -q '0 parser, 0 extension, 4 semantic, 0 IR, 4 total error' \
+    "$output_directory/invalid-compiler.err"
+assert_compiler_diagnostic_accounting \
+    "$output_directory/invalid-compiler.err"
 
 set +e
 "$compiler" --emit-llvm \
@@ -223,6 +294,8 @@ set -e
 [[ $invalid_native_toolchain_status -ne 0 ]]
 grep -q 'error\[E_NATIVE_TOOLCHAIN\]: native toolchain failed with status' \
     "$output_directory/invalid-native-toolchain.err"
+
+"$project_root/tools/test-generated-cross-module-diagnostics.sh" "$compiler"
 
 printf '%s\n' \
     'subparser extension: nested/same-file/cross-module deferred calls + import-order-independent nominal adapters + structured diagnostics + provenance + rollback passed'

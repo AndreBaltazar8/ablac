@@ -726,7 +726,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         0,
         moduleState,
         orderedSnapshots,
-        []
+        [],
+        ""
     )
     val source = graph.load(sourcePath)
     // Filesystem-read providers have serialized content identities. Other
@@ -788,6 +789,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             )
     }
     var status = 1
+    // Empty means an external compiler, linker, or archiver owns the status.
+    // Compiler, capability, and filesystem failures already have a more
+    // accurate diagnostic and must not be relabelled as native-tool failures.
+    var failureKind = ""
     var linkLlvm = false
     var linkHost = false
     var abiManifest = ""
@@ -806,6 +811,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkHost = Path(cacheLinkHostPath).readText() == "1"
         abiManifest = Path(cacheAbiPath).readText()
         status = bootstrapCopyNativeObject(cacheObjectPath, objectPath)
+        if (status != 0) failureKind = "io"
     }
     if (!cached) {
         val compilation = bootstrapCompileLlvmParsedCached(
@@ -829,6 +835,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     "error[E_EXPORT_TARGET_CAPABILITY]: target '${target.name}' has no checked-panic containment runtime\n"
                 )
                 status = 155
+                failureKind = "reported"
             } else if (target.libcFree && bootstrapTextContains(
                 compilation.abiExports,
                 "\"abi\":\"owned-bytes-handle\""
@@ -837,9 +844,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     "error[E_EXPORT_TARGET_CAPABILITY]: target '${target.name}' has no owned-bytes allocator/release contract\n"
                 )
                 status = 154
+                failureKind = "reported"
             } else if (Path(llvmPath).writeTextAtomic(
                 compilation.output
             )) status = 0
+            else {
+                status = 145
+                failureKind = "io"
+            }
             if (status == 0 && allowCache && compileInputsCacheable &&
                 target.hosted &&
                 Path(cacheDirectory).createDirectories()) {
@@ -899,16 +911,20 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 }
             }
         } else {
+            failureKind = "compiler"
             linuxPrintStandardError(compilation.diagnostics)
             linuxPrintStandardError(
-                "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.extensionErrors} extension, ${compilation.semanticErrors} semantic, ${compilation.errors} total error(s)\n"
+                "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.extensionErrors} extension, ${compilation.semanticErrors} semantic, ${compilation.irErrors} IR, ${compilation.errors} total error(s)\n"
             )
         }
     }
     if (status == 0 && !bootstrapStageToolchainOutput(
         "$outputPath.abi.json",
         abiManifest
-    )) status = 153
+    )) {
+        status = 153
+        failureKind = "io"
+    }
     if (status == 0 && artifact != "executable" &&
         artifact != "object" && artifact != "static-library" &&
         artifact != "shared-library" && artifact != "module") {
@@ -916,6 +932,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "error[E_BUILD_ARTIFACT_UNSUPPORTED]: unsupported artifact '$artifact'; supported artifacts: executable, object, static-library, shared-library, module\n"
         )
         status = 147
+        failureKind = "reported"
     }
     if (status == 0 &&
         ((target.objectFormat == "wasm" && artifact != "object" &&
@@ -925,18 +942,21 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target '${target.name}' cannot emit artifact '$artifact'\n"
         )
         status = 147
+        failureKind = "reported"
     }
     if (status == 0 && rawTarget && artifact != "executable") {
         linuxPrintStandardError(
             "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target '${target.name}' currently supports only executable artifacts\n"
         )
         status = 147
+        failureKind = "reported"
     }
     if (status == 0 && rawTarget && (linkHost || linkLlvm)) {
         linuxPrintStandardError(
-            "target ${target.name} does not permit hosted or LLVM runtime imports\n"
+            "error[E_BUILD_TARGET_CAPABILITY]: target '${target.name}' does not permit hosted or LLVM runtime imports\n"
         )
         status = 142
+        failureKind = "reported"
     }
     if (status == 0 && !target.hosted && !rawTarget &&
         (linkHost || linkLlvm)) {
@@ -944,6 +964,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "error[E_BUILD_TARGET_CAPABILITY]: target '${target.name}' cannot use compiler-host or LLVM runtime imports\n"
         )
         status = 152
+        failureKind = "reported"
     }
     if (status == 0 && !target.hosted && !rawTarget &&
         artifact == "executable") {
@@ -951,6 +972,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "error[E_BUILD_ARTIFACT_UNSUPPORTED]: externally defined target '${target.name}' requires an extension-provided startup before executable emission\n"
         )
         status = 147
+        failureKind = "reported"
     }
     if (status == 0 && rawTarget && artifact == "executable") {
         val compileRawRuntime = linuxCommand("clang")
@@ -1076,6 +1098,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (status == 0 && !rawTarget && artifact == "object") {
         status = bootstrapCopyNativeObject(objectPath, publishPath)
+        if (status != 0) failureKind = "io"
     }
     if (status == 0 && !rawTarget && artifact == "static-library") {
         val archive = linuxCommand("llvm-ar")
@@ -1146,12 +1169,23 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = linkModule.run()
     }
     if (status == 0) {
-        if (!Path(publishPath).moveTo(Path(outputPath))) status = 143
+        if (!Path(publishPath).moveTo(Path(outputPath))) {
+            status = 143
+            failureKind = "io"
+        }
     }
-    if (status == 0 && !bootstrapCommitCompileOutputs()) status = 144
+    if (status == 0 && !bootstrapCommitCompileOutputs()) {
+        status = 144
+        failureKind = "io"
+    }
     if (status != 0) bootstrapDiscardCompileOutputs()
     if (status != 0) Path(publishPath).remove()
-    if (status != 0) {
+    if (status != 0 && failureKind == "io") {
+        linuxPrintStandardError(
+            "error[E_BUILD_IO]: native build could not publish an intermediate or output artifact (status $status)\n"
+        )
+    }
+    if (status != 0 && failureKind == "") {
         linuxPrintStandardError(
             "error[E_NATIVE_TOOLCHAIN]: native toolchain failed with status $status\n"
         )
@@ -1334,7 +1368,7 @@ fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
     if (compilation.errors != 0) {
         linuxPrintStandardError(compilation.diagnostics)
         linuxPrintStandardError(
-            "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.extensionErrors} extension, ${compilation.semanticErrors} semantic, ${compilation.errors} total error(s)\n"
+            "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.extensionErrors} extension, ${compilation.semanticErrors} semantic, ${compilation.irErrors} IR, ${compilation.errors} total error(s)\n"
         )
     }
     BootstrapRunIr(status, llvmPath, compilation.linkHost)

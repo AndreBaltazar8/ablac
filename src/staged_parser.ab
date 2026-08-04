@@ -25,6 +25,13 @@ fun bootstrapMergeCompileInputs(
     }
 }
 
+fun bootstrapGeneratedRequestDiagnostic(
+    code: string,
+    message: string,
+    request: BootstrapExtensionRequest
+): string =
+    "error[$code]: $message\ncontext[generated-namespace]: ${request.namespace}\nsource[extension-request]:${request.sourceIdentity}:${request.expression.begin}:${request.expression.end}\n"
+
 fun bootstrapRegistrationIndex(
     registry: BootstrapSubparserRegistry,
     name: string,
@@ -339,10 +346,19 @@ fun bootstrapApplyGeneratedModules(
                 if (namespaces[namespaceIndex] == namespace) valid = false
                 namespaceIndex = namespaceIndex + 1
             }
-            if (!valid) errors = errors + 1
+            if (!valid) {
+                errors = errors + 1
+                diagnostics =
+                    "${diagnostics}error[E_EXT_GENERATED_MODULE_REQUEST]: compilerGenerateModule requires a unique non-empty namespace and at most 65536 bytes of source\n"
+                diagnostics =
+                    "${diagnostics}source[generated-origin]:$namespace:${expression.begin}:${expression.end}\n"
+            }
             if (valid) {
                 namespaces.append(namespace)
-                val generated = bootstrapParse(expression.children[1].text)
+                val generated = bootstrapParseWithIdentity(
+                    expression.children[1].text,
+                    "<generated:$namespace>"
+                )
                 bootstrapMergeCompileInputs(
                     compileInputPaths,
                     compileInputContents,
@@ -350,6 +366,7 @@ fun bootstrapApplyGeneratedModules(
                     generated.compileInputContents
                 )
                 errors = errors + generated.errors
+                diagnostics = "$diagnostics${generated.diagnostics}"
                 var generatedDeclaration = 0
                 while (generatedDeclaration < generated.declarations.size) {
                     declarations.append(
@@ -409,7 +426,11 @@ fun bootstrapApplyGeneratedModules(
         if (!namespaceAvailable) {
             errors = errors + 1
             diagnostics =
-                "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:namespace is not unique in this module\n"}"
+                "$diagnostics${bootstrapGeneratedRequestDiagnostic(
+                    "E_EXT_NAMESPACE_COLLISION",
+                    "generated namespace `${extensionRequest.namespace}` is not unique in this module",
+                    extensionRequest
+                )}"
         }
         if (namespaceAvailable && finalized.errors == 0 &&
             extensionRequest.directAst &&
@@ -448,14 +469,21 @@ fun bootstrapApplyGeneratedModules(
             } else {
                 errors = errors + 1
                 diagnostics =
-                    "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:generated module violates the request provenance invariant\n"}"
+                    "$diagnostics${bootstrapGeneratedRequestDiagnostic(
+                        "E_EXT_GENERATED_PROVENANCE",
+                        "generated module violates its request provenance invariant",
+                        extensionRequest
+                    )}"
             }
         } else if (namespaceAvailable && finalized.errors == 0 &&
             !extensionRequest.directAst &&
             finalized.value.kind == "string" &&
             finalized.value.text.size <= 65536) {
             namespaces.append(extensionRequest.namespace)
-            val generated = bootstrapParse(finalized.value.text)
+            val generated = bootstrapParseWithIdentity(
+                finalized.value.text,
+                "<generated:${extensionRequest.namespace}>"
+            )
             bootstrapMergeCompileInputs(
                 compileInputPaths,
                 compileInputContents,
@@ -463,8 +491,9 @@ fun bootstrapApplyGeneratedModules(
                 generated.compileInputContents
             )
             errors = errors + generated.errors
+            diagnostics = "$diagnostics${generated.diagnostics}"
             if (generated.errors > 0) diagnostics =
-                "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:generated compatibility module failed to parse\n"}"
+                "${diagnostics}context[generated-extension]: generated compatibility module failed to parse in namespace `${extensionRequest.namespace}`\nsource[extension-request]:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}\n"
             var generatedDeclaration = 0
             while (generatedDeclaration < generated.declarations.size) {
                 declarations.append(
@@ -480,7 +509,11 @@ fun bootstrapApplyGeneratedModules(
         } else if (namespaceAvailable && finalized.errors == 0) {
             errors = errors + 1
             diagnostics =
-                "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:finalizer returned the wrong result kind or namespace\n"}"
+                "$diagnostics${bootstrapGeneratedRequestDiagnostic(
+                    "E_EXT_FINALIZER_RESULT",
+                    "finalizer returned the wrong result kind or namespace",
+                    extensionRequest
+                )}"
         }
         request = request + 1
     }
@@ -488,7 +521,11 @@ fun bootstrapApplyGeneratedModules(
         errors = errors + 1
         val extensionRequest = extensionRequests[request]
         diagnostics =
-            "$diagnostics${"extension.request:${extensionRequest.namespace}:${extensionRequest.sourceIdentity}:${extensionRequest.expression.begin}:${extensionRequest.expression.end}:generated module namespace limit exceeded\n"}"
+            "$diagnostics${bootstrapGeneratedRequestDiagnostic(
+                "E_EXT_NAMESPACE_LIMIT",
+                "generated module namespace limit exceeded",
+                extensionRequest
+            )}"
     }
     val transformDeclarations: array<BootstrapDeclaration> = []
     var transformDeclaration = 0
@@ -654,13 +691,15 @@ fun bootstrapParseStagedRegistered(
     }
 
     val parsed = BootstrapParser(
+        sourceIdentity,
         source,
         tokens,
         expansionBegins,
         expansionEnds,
         expansionExpressions,
         0,
-        0
+        0,
+        ""
     ).parse()
     bootstrapApplyGeneratedModules(
         BootstrapParseResult(
@@ -670,7 +709,7 @@ fun bootstrapParseStagedRegistered(
             extensionErrors,
             compileInputPaths,
             compileInputContents,
-            diagnostics
+            "${parsed.diagnostics}$diagnostics"
         ),
         handlerDeclarations,
         currentDeclarationBegin,
@@ -697,6 +736,6 @@ fun bootstrapParseStaged(source: string): BootstrapParseResult {
         parsed.extensionErrors + registry.errors,
         parsed.compileInputPaths,
         parsed.compileInputContents,
-        parsed.diagnostics
+        "${parsed.diagnostics}${registry.diagnostics}"
     )
 }

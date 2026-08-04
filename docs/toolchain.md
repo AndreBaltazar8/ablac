@@ -135,6 +135,26 @@ evaluation, `run`, tests, the REPL, and macro/subparser handlers share the same
 instructions, values, limits, native registry, and diagnostics. The JIT is a
 different execution backend for that IR and must pass interpreter/JIT parity.
 
+## Compiler diagnostics
+
+Every failed compilation renders at least one primary `error[E_*]` diagnostic
+for every counted error. Parser diagnostics carry the normalized module source
+identity and byte range. Extension-generated declarations additionally retain
+their generated namespace and originating extension-expression range through
+semantic analysis and typed IR lowering.
+
+Failure summaries partition the total into parser, extension, semantic, and IR
+counts; those four counts always add to the displayed total. A function-level
+IR verification failure names the function and invariant category. Lowering or
+emission failures that cannot be associated with a function use the explicit
+`E_IR_UNCLASSIFIED` or `E_IR_EMISSION` fallback rather than disappearing into
+the aggregate count.
+
+`E_NATIVE_TOOLCHAIN` is reserved for a nonzero result from an external native
+compiler, linker, or archiver. Compiler diagnostics, unsupported target or
+artifact requests, and filesystem publication failures retain their own error
+codes and are not relabelled as native-toolchain failures.
+
 ## Serve
 
 `serve` is a persistent run mode intended for HTTP servers, build daemons, and

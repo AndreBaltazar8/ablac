@@ -104,6 +104,9 @@ provider-visible declaration set, including imported helper functions. Use
 `parserSourceIdentity(cursor)` plus the expression span for a request namespace
 that distinguishes otherwise identical imported modules. Request and finalizer
 invariant diagnostics include that identity, namespace, and source span.
+Resolved function and type handles use compilation-wide canonical identities,
+so a generated adapter can retain a target declared in a relative module or a
+locked package without depending on a transient per-module declaration index.
 
 Checkpoint/restoration, explicit-span diagnostics, populated generic
 substitutions, richer UTF-8 operations, and lazy tokenization remain future API
