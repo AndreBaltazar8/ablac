@@ -128,6 +128,10 @@ Value Machine::execute(
             }
             continue;
         }
+        if (terminator.kind == ir::TerminatorKind::Unreachable) {
+            runtime_error(terminator.span, "VM reached unreachable control flow");
+            break;
+        }
         runtime_error(terminator.span, "VM reached unterminated basic block");
     }
     --call_depth_;

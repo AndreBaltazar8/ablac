@@ -252,6 +252,15 @@ void CEmitter::emit_function(
             successors[block.id].push_back(block.terminator.second);
         }
     }
+    std::vector<bool> reachable(function.blocks.size(), false);
+    std::vector<ir::BlockId> pending{0};
+    while (!pending.empty()) {
+        const auto id = pending.back();
+        pending.pop_back();
+        if (id >= reachable.size() || reachable[id]) continue;
+        reachable[id] = true;
+        for (const auto successor : successors[id]) pending.push_back(successor);
+    }
     std::vector<LiveSet> live_in(function.blocks.size());
     std::vector<LiveSet> live_out(function.blocks.size());
     bool changed = true;
@@ -320,6 +329,7 @@ void CEmitter::emit_function(
     }
     output << "    goto block_0;\n";
     for (const auto& block : function.blocks) {
+        if (!reachable[block.id]) continue;
         output << "block_" << block.id << ": ;\n";
         for (const auto& instruction : block.instructions) {
             if (may_allocate(instruction.opcode)) {
@@ -587,6 +597,9 @@ void CEmitter::emit_terminator(
         output << "    if (abla_as_bool(values[" << terminator.value << "])) "
                << "goto block_" << terminator.first << "; else goto block_"
                << terminator.second << ";\n";
+    } else if (terminator.kind == ir::TerminatorKind::Unreachable) {
+        output << "    abla_runtime_roots_pop(&abla_root_frame);\n"
+                  "    return abla_void();\n";
     }
 }
 

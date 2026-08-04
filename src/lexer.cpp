@@ -39,6 +39,7 @@ const std::unordered_map<std::string_view, TokenKind> keywords{
     {"null", TokenKind::KwNull},
     {"own", TokenKind::KwOwn},
     {"resource", TokenKind::KwResource},
+    {"return", TokenKind::KwReturn},
     {"true", TokenKind::KwTrue},
     {"trusted", TokenKind::KwTrusted},
     {"val", TokenKind::KwVal},

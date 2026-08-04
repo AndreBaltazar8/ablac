@@ -35,6 +35,7 @@ enum class TokenKind {
     KwNull,
     KwOwn,
     KwResource,
+    KwReturn,
     KwTrue,
     KwTrusted,
     KwVal,

@@ -17,6 +17,7 @@ enum class TypeKind {
     Error,
     Unknown,
     Void,
+    Never,
     Bool,
     Integer,
     Float,
@@ -52,12 +53,13 @@ public:
     [[nodiscard]] TypeId error() const noexcept { return 0; }
     [[nodiscard]] TypeId unknown() const noexcept { return 1; }
     [[nodiscard]] TypeId void_type() const noexcept { return 2; }
-    [[nodiscard]] TypeId bool_type() const noexcept { return 3; }
-    [[nodiscard]] TypeId null_type() const noexcept { return 4; }
-    [[nodiscard]] TypeId any_type() const noexcept { return 5; }
-    [[nodiscard]] TypeId string_type() const noexcept { return 6; }
-    [[nodiscard]] TypeId cstring_type() const noexcept { return 7; }
-    [[nodiscard]] TypeId char_type() const noexcept { return 8; }
+    [[nodiscard]] TypeId never_type() const noexcept { return 3; }
+    [[nodiscard]] TypeId bool_type() const noexcept { return 4; }
+    [[nodiscard]] TypeId null_type() const noexcept { return 5; }
+    [[nodiscard]] TypeId any_type() const noexcept { return 6; }
+    [[nodiscard]] TypeId string_type() const noexcept { return 7; }
+    [[nodiscard]] TypeId cstring_type() const noexcept { return 8; }
+    [[nodiscard]] TypeId char_type() const noexcept { return 9; }
     [[nodiscard]] TypeId int_type() const noexcept { return i64_; }
 
     [[nodiscard]] const Type& get(TypeId id) const;
@@ -123,6 +125,7 @@ private:
     TypeId type_from_syntax(ast::TypeSyntax& syntax);
     TypeId type_of_symbol(const Symbol& symbol);
     TypeId common_type(TypeId left, TypeId right, SourceSpan span);
+    TypeId inferred_result_type(TypeId body, TypeId returned, SourceSpan span);
     void require_assignable(TypeId target, TypeId source, SourceSpan span, std::string_view context);
     [[nodiscard]] const Symbol* declaration_symbol(const ast::Statement& statement) const;
     [[nodiscard]] Symbol* scope_symbol(const ast::Node& owner, std::string_view name) const;
@@ -133,6 +136,8 @@ private:
     SemanticModel& semantics_;
     TypedProgram typed_;
     Module* current_module_{};
+    std::optional<TypeId> current_result_type_;
+    TypeId returned_type_{};
     std::unordered_map<const Symbol*, CheckState> states_;
 };
 

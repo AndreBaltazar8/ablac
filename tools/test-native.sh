@@ -51,6 +51,8 @@ compile_and_expect abla-subparser-builder 42
 compile_and_expect bootstrap-lexer 42
 compile_and_expect bootstrap-parser 42
 compile_and_expect bootstrap-sema 42
+compile_and_expect return-control 42
+compile_and_expect return-when 42
 compile_and_expect bootstrap-ir 42
 compile_and_expect bootstrap-block 42
 compile_and_expect bootstrap-collections 42

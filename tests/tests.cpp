@@ -390,6 +390,78 @@ void test_vm_execution() {
     }
 }
 
+void test_value_bearing_return_control() {
+    abla::ModuleGraph graph;
+    static_cast<void>(
+        graph.load_entry("tests/cases/modules/return-control.ab"));
+    auto semantics = abla::sema::Resolver(graph).resolve();
+    auto typed = abla::sema::TypeChecker(graph, semantics).check();
+    auto program = abla::ir::Lowerer(graph, semantics, typed).lower();
+    abla::vm::Machine compile_machine(
+        program, typed.types, graph.entry()->diagnostics);
+    check(
+        abla::vm::materialize_compile_actions(
+            program, compile_machine, graph.entry()->diagnostics),
+        "early returns execute in compile functions");
+    check(
+        abla::ir::Verifier(
+            typed.types, graph.entry()->diagnostics).verify(program),
+        "nested value-bearing returns produce verified IR");
+    abla::vm::Machine machine(
+        program, typed.types, graph.entry()->diagnostics);
+    const auto main = machine.find_function("main");
+    check(main.has_value(), "return-control fixture has a main function");
+    if (main) {
+        const auto result = machine.run(*main);
+        if (graph.has_errors()) graph.render_diagnostics(std::cerr);
+        check(!graph.has_errors(), "nested returns execute without VM errors");
+        check(
+            result.as_integer() == 42,
+            "functions, methods, lambdas, loops, and if return values early");
+    }
+
+    abla::ModuleGraph when_graph;
+    static_cast<void>(
+        when_graph.load_entry("tests/cases/modules/return-when.ab"));
+    auto when_semantics = abla::sema::Resolver(when_graph).resolve();
+    auto when_typed = abla::sema::TypeChecker(
+        when_graph, when_semantics).check();
+    auto when_program = abla::ir::Lowerer(
+        when_graph, when_semantics, when_typed).lower();
+    check(
+        abla::ir::Verifier(
+            when_typed.types, when_graph.entry()->diagnostics).verify(when_program),
+        "returns from when case bodies produce verified IR");
+    abla::vm::Machine when_machine(
+        when_program, when_typed.types, when_graph.entry()->diagnostics);
+    const auto when_main = when_machine.find_function("main");
+    check(when_main.has_value(), "when-return fixture has a main function");
+    if (when_main) {
+        const auto result = when_machine.run(*when_main);
+        if (when_graph.has_errors()) when_graph.render_diagnostics(std::cerr);
+        check(
+            !when_graph.has_errors() && result.as_integer() == 42,
+            "when case bodies may return values from their enclosing function");
+    }
+
+    abla::ModuleGraph invalid;
+    static_cast<void>(
+        invalid.load_entry("tests/cases/bootstrap/invalid-return-type.ab"));
+    auto invalid_semantics = abla::sema::Resolver(invalid).resolve();
+    auto invalid_typed = abla::sema::TypeChecker(
+        invalid, invalid_semantics).check();
+    static_cast<void>(invalid_typed);
+    check(invalid.has_errors(), "return values are checked against declared results");
+    check(
+        std::any_of(
+            invalid.entry()->diagnostics.entries().begin(),
+            invalid.entry()->diagnostics.entries().end(),
+            [](const auto& diagnostic) {
+                return diagnostic.message.find("return expects") != std::string::npos;
+            }),
+        "invalid return reports a return-specific type diagnostic");
+}
+
 void test_registered_native_execution() {
     abla::ModuleGraph graph;
     static_cast<void>(graph.load_entry("tests/cases/modules/native.ab"));
@@ -696,6 +768,7 @@ int main() {
     test_statement_conditionals_and_dominating_values();
     test_ir_lowering_and_verification();
     test_vm_execution();
+    test_value_bearing_return_control();
     test_registered_native_execution();
     test_compile_time_materialization();
     test_compound_compile_time_materialization();

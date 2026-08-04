@@ -72,6 +72,7 @@ struct Expression : Node {
         Member,
         Index,
         Compile,
+        Return,
         If,
         When,
         Lambda,
@@ -166,6 +167,13 @@ struct IndexExpression final : Expression {
 
     ExprPtr receiver;
     ExprPtr index;
+};
+
+struct ReturnExpression final : Expression {
+    ReturnExpression(SourceSpan source_span, ExprPtr returned_value)
+        : Expression(Kind::Return, source_span), value(std::move(returned_value)) {}
+
+    ExprPtr value;
 };
 
 struct IfExpression final : Expression {

@@ -132,7 +132,7 @@ Symbol* Resolver::declare(
 void Resolver::install_prelude() {
     prelude_ = &make_scope(nullptr, nullptr, nullptr);
     static constexpr const char* builtin_types[] = {
-        "void", "bool", "i8", "i16", "i32", "i64", "int",
+        "void", "never", "bool", "i8", "i16", "i32", "i64", "int",
         "u8", "u16", "u32", "u64", "f32", "f64", "char",
         "string", "cstring", "array", "any"};
     for (const auto* name : builtin_types) {
@@ -387,6 +387,11 @@ void Resolver::resolve_expression(Scope& scope, ast::Expression& expression) {
     case Kind::Compile: {
         auto& unary = static_cast<ast::UnaryExpression&>(expression);
         if (unary.operand) resolve_expression(scope, *unary.operand);
+        break;
+    }
+    case Kind::Return: {
+        auto& returned = static_cast<ast::ReturnExpression&>(expression);
+        if (returned.value) resolve_expression(scope, *returned.value);
         break;
     }
     case Kind::Binary:

@@ -32,6 +32,7 @@ std::string_view token_kind_name(TokenKind kind) {
     ABLA_TOKEN_CASE(KwNull, "'null'");
     ABLA_TOKEN_CASE(KwOwn, "'own'");
     ABLA_TOKEN_CASE(KwResource, "'resource'");
+    ABLA_TOKEN_CASE(KwReturn, "'return'");
     ABLA_TOKEN_CASE(KwTrue, "'true'");
     ABLA_TOKEN_CASE(KwTrusted, "'trusted'");
     ABLA_TOKEN_CASE(KwVal, "'val'");

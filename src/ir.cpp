@@ -297,6 +297,9 @@ void Lowerer::collect_lambdas(ast::Expression& expression) {
                 action, function, type, unary.span});
             global_initializers_[function] = unary.operand.get();
         }
+    } else if (expression.kind == Kind::Return) {
+        auto& returned = static_cast<ast::ReturnExpression&>(expression);
+        if (returned.value) collect_lambdas(*returned.value);
     } else if (expression.kind == Kind::Binary || expression.kind == Kind::Assignment) {
         auto& binary = static_cast<ast::BinaryExpression&>(expression);
         collect_lambdas(*binary.left);
@@ -484,6 +487,7 @@ ValueId Lowerer::lower_block(ast::Block& block) {
             lower_statement(*statement);
             result = no_value;
         }
+        if (block_->terminator.kind != TerminatorKind::None) break;
     }
     return result;
 }
@@ -622,6 +626,15 @@ ValueId Lowerer::lower_expression(ast::Expression& expression) {
             : Opcode::Negate;
         instruction.operands = {operand};
         return emit(std::move(instruction));
+    }
+    case Kind::Return: {
+        auto& returned = static_cast<ast::ReturnExpression&>(expression);
+        const auto value = returned.value
+            ? lower_expression(*returned.value)
+            : no_value;
+        terminate(Terminator{
+            TerminatorKind::Return, value, 0, 0, expression.span});
+        return no_value;
     }
     case Kind::Assignment: {
         auto& assignment = static_cast<ast::BinaryExpression&>(expression);
@@ -874,7 +887,8 @@ ValueId Lowerer::lower_call(ast::CallExpression& call) {
 
 ValueId Lowerer::lower_if(ast::IfExpression& conditional) {
     const auto type = types_.expression_type(conditional);
-    const auto has_value = type != types_.types.void_type();
+    const auto has_value = type != types_.types.void_type() &&
+        type != types_.types.never_type();
     const auto result_local = has_value ? temporary(type, "$if") : 0;
     const auto condition = lower_expression(*conditional.condition);
     const auto then_block = add_block("if.then");
@@ -885,7 +899,9 @@ ValueId Lowerer::lower_if(ast::IfExpression& conditional) {
 
     select_block(then_block);
     const auto then_value = lower_block(*conditional.then_body);
-    if (has_value) {
+    const auto then_falls_through =
+        block_->terminator.kind == TerminatorKind::None;
+    if (has_value && then_falls_through) {
         Instruction store;
         store.opcode = Opcode::StoreLocal;
         store.type = types_.types.void_type();
@@ -894,13 +910,15 @@ ValueId Lowerer::lower_if(ast::IfExpression& conditional) {
         store.span = conditional.then_body->span;
         emit(std::move(store));
     }
-    terminate(Terminator{
-        TerminatorKind::Jump, no_value, merge, 0, conditional.then_body->span});
+    if (then_falls_through) {
+        terminate(Terminator{
+            TerminatorKind::Jump, no_value, merge, 0, conditional.then_body->span});
+    }
 
     select_block(else_block);
     if (conditional.else_body) {
         const auto else_value = lower_block(*conditional.else_body);
-        if (has_value) {
+        if (has_value && block_->terminator.kind == TerminatorKind::None) {
             Instruction store;
             store.opcode = Opcode::StoreLocal;
             store.type = types_.types.void_type();
@@ -910,10 +928,19 @@ ValueId Lowerer::lower_if(ast::IfExpression& conditional) {
             emit(std::move(store));
         }
     }
-    terminate(Terminator{
-        TerminatorKind::Jump, no_value, merge, 0, conditional.span});
+    const auto else_falls_through =
+        block_->terminator.kind == TerminatorKind::None;
+    if (else_falls_through) {
+        terminate(Terminator{
+            TerminatorKind::Jump, no_value, merge, 0, conditional.span});
+    }
 
     select_block(merge);
+    if (!then_falls_through && !else_falls_through) {
+        terminate(Terminator{
+            TerminatorKind::Unreachable, no_value, 0, 0, conditional.span});
+        return no_value;
+    }
     if (!has_value) return no_value;
     Instruction load;
     load.opcode = Opcode::LoadLocal;
@@ -925,7 +952,8 @@ ValueId Lowerer::lower_if(ast::IfExpression& conditional) {
 
 ValueId Lowerer::lower_when(ast::WhenExpression& when) {
     const auto type = types_.expression_type(when);
-    const auto has_value = type != types_.types.void_type();
+    const auto has_value = type != types_.types.void_type() &&
+        type != types_.types.never_type();
     const auto result_local = has_value ? temporary(type, "$when") : 0;
     std::optional<LocalId> subject_local;
     if (when.subject) {
@@ -940,6 +968,7 @@ ValueId Lowerer::lower_when(ast::WhenExpression& when) {
         emit(std::move(store));
     }
     const auto merge = add_block("when.merge");
+    bool merge_reachable = false;
     for (std::size_t case_index = 0; case_index < when.cases.size(); ++case_index) {
         auto& when_case = when.cases[case_index];
         const auto body = add_block("when.case." + std::to_string(case_index));
@@ -978,7 +1007,9 @@ ValueId Lowerer::lower_when(ast::WhenExpression& when) {
         const auto next_case_block = block_->id;
         select_block(body);
         const auto value = lower_block(*when_case.body);
-        if (has_value) {
+        const auto body_falls_through =
+            block_->terminator.kind == TerminatorKind::None;
+        if (has_value && body_falls_through) {
             Instruction store;
             store.opcode = Opcode::StoreLocal;
             store.type = types_.types.void_type();
@@ -987,13 +1018,24 @@ ValueId Lowerer::lower_when(ast::WhenExpression& when) {
             store.span = when_case.body->span;
             emit(std::move(store));
         }
-        terminate(Terminator{
-            TerminatorKind::Jump, no_value, merge, 0, when_case.body->span});
+        if (body_falls_through) {
+            terminate(Terminator{
+                TerminatorKind::Jump, no_value, merge, 0, when_case.body->span});
+            merge_reachable = true;
+        }
         select_block(next_case_block);
     }
-    terminate(Terminator{
-        TerminatorKind::Jump, no_value, merge, 0, when.span});
+    if (block_->terminator.kind == TerminatorKind::None) {
+        terminate(Terminator{
+            TerminatorKind::Jump, no_value, merge, 0, when.span});
+        merge_reachable = true;
+    }
     select_block(merge);
+    if (!merge_reachable) {
+        terminate(Terminator{
+            TerminatorKind::Unreachable, no_value, 0, 0, when.span});
+        return no_value;
+    }
     if (!has_value) return no_value;
     Instruction load;
     load.opcode = Opcode::LoadLocal;
@@ -1359,6 +1401,8 @@ bool Verifier::verify_function(const Program& program, const Function& function)
                 diagnostics_.error(terminator.span, "IR branch has invalid target");
                 valid = false;
             }
+        } else if (terminator.kind == TerminatorKind::Unreachable) {
+            // No operands or successors to verify.
         }
     }
     return valid;
@@ -1570,6 +1614,8 @@ void print(
             } else if (terminator.kind == TerminatorKind::Branch) {
                 output << "branch v" << terminator.value << " ^"
                        << terminator.first << " ^" << terminator.second;
+            } else if (terminator.kind == TerminatorKind::Unreachable) {
+                output << "unreachable";
             } else {
                 output << "<unterminated>";
             }

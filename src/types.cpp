@@ -14,6 +14,7 @@ TypeStore::TypeStore() {
     simple(TypeKind::Error, "<error>");
     simple(TypeKind::Unknown, "<unknown>");
     simple(TypeKind::Void, "void");
+    simple(TypeKind::Never, "never");
     simple(TypeKind::Bool, "bool");
     simple(TypeKind::Null, "null");
     simple(TypeKind::Any, "any");
@@ -135,6 +136,7 @@ bool TypeStore::can_assign(TypeId target, TypeId source) const {
     if (target == source || target == any_type()) {
         return true;
     }
+    if (source == never_type()) return true;
     const auto& target_type = get(target);
     if (target_type.kind == TypeKind::Nullable) {
         return source == null_type() ||
@@ -173,6 +175,8 @@ const Symbol* TypedProgram::selected_call(const ast::CallExpression& call) const
 TypedProgram TypeChecker::check() {
     typed_ = TypedProgram{};
     states_.clear();
+    current_result_type_.reset();
+    returned_type_ = typed_.types.unknown();
     prepare_symbols();
     for (const auto& module : graph_.modules()) {
         current_module_ = module.get();
@@ -191,6 +195,7 @@ void TypeChecker::prepare_symbols() {
         if (symbol.kind == SymbolKind::BuiltinType) {
             TypeId type = typed_.types.error();
             if (symbol.name == "void") type = typed_.types.void_type();
+            else if (symbol.name == "never") type = typed_.types.never_type();
             else if (symbol.name == "bool") type = typed_.types.bool_type();
             else if (symbol.name == "any") type = typed_.types.any_type();
             else if (symbol.name == "string") type = typed_.types.string_type();
@@ -382,6 +387,10 @@ void TypeChecker::check_function(
     const auto function_type_id = type_of_symbol(symbol);
     const auto function_type = typed_.types.get(function_type_id);
     auto result = function_type.result;
+    const auto saved_result = current_result_type_;
+    const auto saved_returned = returned_type_;
+    current_result_type_ = result;
+    returned_type_ = typed_.types.unknown();
     const bool body_value_required = result != typed_.types.void_type();
     TypeId body_type = typed_.types.void_type();
     if (declaration.body) {
@@ -389,13 +398,16 @@ void TypeChecker::check_function(
     }
     if (declaration.expression_body) body_type = check_expression(*declaration.expression_body);
 
+    const auto explicit_returns = returned_type_;
     if (result == typed_.types.unknown()) {
-        result = body_type;
+        result = inferred_result_type(body_type, explicit_returns, declaration.span);
         typed_.symbol_types_[&symbol] = typed_.types.function(function_type.arguments, result);
     } else if (result != typed_.types.void_type() &&
                (declaration.body || declaration.expression_body)) {
         require_assignable(result, body_type, declaration.span, "function result");
     }
+    current_result_type_ = saved_result;
+    returned_type_ = saved_returned;
     states_[&symbol] = CheckState::Checked;
     current_module_ = saved_module;
 }
@@ -439,6 +451,7 @@ TypeId TypeChecker::check_property(ast::PropertyDeclaration& declaration) {
 
 TypeId TypeChecker::check_block(ast::Block& block, bool value_required) {
     TypeId result = typed_.types.void_type();
+    bool reachable = true;
     for (std::size_t i = 0; i < block.statements.size(); ++i) {
         auto& statement = block.statements[i];
         if (statement->kind == ast::Statement::Kind::Expression) {
@@ -448,13 +461,18 @@ TypeId TypeChecker::check_block(ast::Block& block, bool value_required) {
             if (expression.expression) {
                 const auto expression_type = check_expression(
                     *expression.expression, statement_value_required);
-                result = statement_value_required
-                    ? expression_type
-                    : typed_.types.void_type();
-            } else result = typed_.types.void_type();
+                if (reachable) {
+                    result = expression_type == typed_.types.never_type()
+                        ? typed_.types.never_type()
+                        : statement_value_required
+                            ? expression_type
+                            : typed_.types.void_type();
+                    reachable = expression_type != typed_.types.never_type();
+                }
+            } else if (reachable) result = typed_.types.void_type();
         } else {
             check_statement(*statement);
-            result = typed_.types.void_type();
+            if (reachable) result = typed_.types.void_type();
         }
     }
     return result;
@@ -521,6 +539,25 @@ TypeId TypeChecker::check_expression(ast::Expression& expression, bool value_req
             diagnostics().error(expression.span, "unary numeric operator requires a number");
             result = typed_.types.error();
         }
+        break;
+    }
+    case Kind::Return: {
+        auto& returned = static_cast<ast::ReturnExpression&>(expression);
+        const auto value_type = returned.value
+            ? check_expression(*returned.value)
+            : typed_.types.void_type();
+        if (!current_result_type_) {
+            diagnostics().error(expression.span, "return is only valid inside a function or lambda");
+        } else {
+            if (*current_result_type_ != typed_.types.unknown()) {
+                require_assignable(
+                    *current_result_type_, value_type, expression.span, "return");
+            }
+            returned_type_ = returned_type_ == typed_.types.unknown()
+                ? value_type
+                : inferred_result_type(value_type, returned_type_, expression.span);
+        }
+        result = typed_.types.never_type();
         break;
     }
     case Kind::Binary:
@@ -611,8 +648,9 @@ TypeId TypeChecker::check_expression(ast::Expression& expression, bool value_req
         const auto then_type = check_block(*conditional.then_body, value_required);
         if (conditional.else_body) {
             const auto else_type = check_block(*conditional.else_body, value_required);
-            result = value_required
-                ? common_type(then_type, else_type, expression.span)
+            const auto branches = common_type(then_type, else_type, expression.span);
+            result = branches == typed_.types.never_type() || value_required
+                ? branches
                 : typed_.types.void_type();
         } else result = typed_.types.void_type();
         break;
@@ -623,7 +661,9 @@ TypeId TypeChecker::check_expression(ast::Expression& expression, bool value_req
             ? check_expression(*when.subject)
             : typed_.types.bool_type();
         result = typed_.types.unknown();
+        bool has_else = false;
         for (auto& when_case : when.cases) {
+            has_else = has_else || when_case.is_else;
             for (auto& match : when_case.matches) {
                 const auto match_type = check_expression(*match);
                 if (when.subject) static_cast<void>(common_type(subject, match_type, match->span));
@@ -631,17 +671,24 @@ TypeId TypeChecker::check_expression(ast::Expression& expression, bool value_req
                     typed_.types.bool_type(), match_type, match->span, "when condition");
             }
             const auto body = check_block(*when_case.body, value_required);
-            if (value_required) {
+            if (value_required || body == typed_.types.never_type()) {
                 result = result == typed_.types.unknown()
                     ? body
                     : common_type(result, body, when_case.span);
             } else result = typed_.types.void_type();
         }
-        if (result == typed_.types.unknown()) result = typed_.types.void_type();
+        if (result == typed_.types.unknown() ||
+            (result == typed_.types.never_type() && !has_else)) {
+            result = typed_.types.void_type();
+        }
         break;
     }
     case Kind::Lambda: {
         auto& lambda = static_cast<ast::LambdaExpression&>(expression);
+        const auto saved_result = current_result_type_;
+        const auto saved_returned = returned_type_;
+        current_result_type_ = typed_.types.unknown();
+        returned_type_ = typed_.types.unknown();
         std::vector<TypeId> parameters;
         for (auto& parameter : lambda.parameters) {
             TypeId type = typed_.types.unknown();
@@ -654,7 +701,11 @@ TypeId TypeChecker::check_expression(ast::Expression& expression, bool value_req
                 typed_.symbol_types_[symbol] = type;
             }
         }
-        result = typed_.types.function(std::move(parameters), check_block(*lambda.body));
+        const auto body = check_block(*lambda.body);
+        const auto lambda_result = inferred_result_type(body, returned_type_, lambda.span);
+        current_result_type_ = saved_result;
+        returned_type_ = saved_returned;
+        result = typed_.types.function(std::move(parameters), lambda_result);
         break;
     }
     }
@@ -869,6 +920,22 @@ TypeId TypeChecker::common_type(TypeId left, TypeId right, SourceSpan span) {
         "incompatible types '" + typed_.types.to_string(left) +
             "' and '" + typed_.types.to_string(right) + "'");
     return typed_.types.error();
+}
+
+TypeId TypeChecker::inferred_result_type(
+    TypeId body,
+    TypeId returned,
+    SourceSpan span) {
+    if (body == typed_.types.never_type()) {
+        return returned == typed_.types.unknown() ? body : returned;
+    }
+    if (returned == typed_.types.unknown()) return body;
+    // A bare early return makes an inferred function void; any trailing
+    // expression is then a discarded statement value on the fallthrough path.
+    if (body == typed_.types.void_type() || returned == typed_.types.void_type()) {
+        return typed_.types.void_type();
+    }
+    return common_type(body, returned, span);
 }
 
 void TypeChecker::require_assignable(

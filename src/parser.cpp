@@ -738,6 +738,16 @@ ast::ExprPtr Parser::parse_postfix() {
 
 ast::ExprPtr Parser::parse_primary() {
     const auto token = current();
+    if (consume(TokenKind::KwReturn)) {
+        ast::ExprPtr value;
+        if (!at(TokenKind::Newline) && !at(TokenKind::Semicolon) &&
+            !at(TokenKind::RightBrace) && !at(TokenKind::End)) {
+            value = parse_expression();
+        }
+        const auto end = value ? value->span.end : token.span.end;
+        return std::make_unique<ast::ReturnExpression>(
+            SourceSpan{token.span.begin, end}, std::move(value));
+    }
     if (at(TokenKind::Dollar)) {
         return parse_subparser();
     }

@@ -79,7 +79,7 @@ struct Instruction {
     SourceSpan span;
 };
 
-enum class TerminatorKind { None, Return, Jump, Branch };
+enum class TerminatorKind { None, Return, Jump, Branch, Unreachable };
 
 struct Terminator {
     TerminatorKind kind{TerminatorKind::None};
