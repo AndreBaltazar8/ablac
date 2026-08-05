@@ -653,6 +653,16 @@ them. Mutations are transactional: on diagnostic failure, the program remains
 unchanged. Stable reflection handles expose declarations, types, annotations,
 and syntax builders. They never expose C++ or backend pointers.
 
+Typed deferred-expression reflection also exposes deterministic state access
+paths. Paths are rooted at semantic parameters, receivers, locals, or globals
+and retain field, constant/dynamic index, `Cell`, delegate, and conservative
+wildcard projections. Function summaries propagate those paths through calls
+by substituting resolved arguments; recursion or an unavailable body widens to
+an explicit unknown result. Extensions may compare read and write paths for
+prefix-aware invalidation and may lift a recorded expression into a generated
+function only by listing explicit, ownership-safe captures. This facility is
+framework-neutral and does not make ordinary values observable at runtime.
+
 Compile-time libraries are ordinary Abla modules. The compiler supplies a
 versioned `compiler` module containing reflection, diagnostics, source,
 filesystem, environment, and process capabilities. Ambient filesystem and

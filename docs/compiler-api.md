@@ -117,6 +117,51 @@ for its delegate type, and `-1` for accessor handles and `by` offsets. Handles
 describe compilation-owned metadata and never expose a live runtime value or
 delegate object.
 
+## Typed dependency and mutation reflection
+
+Deferred expressions and function handles expose bounded, compiler-owned
+read/write summaries through `abla/compiler/parser`. An opaque
+`TypedAccessPath` has a semantic root (`parameter`, `receiver`, `local`, or
+`global`) followed by field, constant-index, dynamic-index, `cell`, `delegate`,
+or wildcard segments. Root parameters use declaration-order indexes; global
+identities are module-qualified. Queries never return a backend pointer or a
+live application value.
+
+`typedExpressionReadCount`/`typedExpressionRead` and their write and consume
+counterparts inspect any resolved deferred expression, not only a direct call.
+`typedFunctionRead...` and `typedFunctionWrite...` report declaration summaries
+relative to parameters, receivers, and globals. Direct and member calls
+substitute callee parameter paths with the caller's resolved argument path.
+Aliases, constant and dynamic indexes, `Cell.get`/`Cell.set`, delegated
+getter/setter bodies, receiver-field shorthand, globals, and imported helper
+functions retain structured paths. Recursive, indirect, contract-only, or
+otherwise unavailable bodies widen conservatively through the `ReadsUnknown`
+and `WritesUnknown` flags.
+
+Path query operations expose the root identity and ordered segments.
+`typedAccessPathsIntersect(left, right)` implements the prefix-aware
+invalidation relation: a write to a prefix intersects every dependency below
+it, dynamic/wildcard projections are conservative, and disjoint fields or
+constant indexes remain distinct. Ordering and the 64-path/8-segment bounds
+are deterministic. Exceeding a bound widens to unknown or wildcard metadata
+instead of silently omitting an access.
+
+`typedExpressionHasEffect` and `typedFunctionHasEffect` expose the ordinary
+transitive capability summary using the stable effect names
+`filesystem.read`, `filesystem.write`, `environment`, `process.io`, `network`,
+`clock`, `random`, and `trusted.native`. A framework can therefore require a
+binding evaluator to be read-only and capability-free while permitting a
+handler's declared state writes.
+
+`compilerGeneratedLiftedFunction` consumes a recorded expression and parallel
+capture-name, generated-parameter, type, and mutable-mode arrays. It rewrites
+free references to explicit parameters while respecting nested local/lambda
+bindings. Unlisted free variables, borrowed or affine captures, and writes
+through a capture not declared mutable fail transactionally with stable
+reactive diagnostics. The resulting declaration is still parsed, typed,
+ownership-checked, effect-checked, lowered, and target-verified with its
+generated namespace and originating expression span.
+
 Deferred call inspection also exposes
 `typedCallIsContract(expression)`. It reports whether the selected declaration
 came from an `import contract` projection while `typedCallTarget` and all

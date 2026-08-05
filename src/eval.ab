@@ -950,6 +950,132 @@ fun bootstrapEvalUnwrapBorrow(value: BootstrapEvalValue): BootstrapEvalValue =
     if (value.kind == "borrow" && value.elements.size == 1) value.elements[0]
     else value
 
+// Compiler-owned, pointer-free dependency metadata. Paths are materialized as
+// opaque evaluator values only while a finalizer is inspecting one typed
+// snapshot; generated/runtime programs never retain these records.
+class BootstrapAccessPath(
+    val rootKind: string,
+    val rootIdentity: string,
+    val rootParameter: int,
+    val segmentKinds: array<string>,
+    val segmentNames: array<string>,
+    val segmentIndexes: array<int>
+)
+
+class BootstrapAccessSummary(
+    val reads: array<BootstrapAccessPath>,
+    val writes: array<BootstrapAccessPath>,
+    val consumes: array<BootstrapAccessPath>,
+    var readsUnknown: bool,
+    var writesUnknown: bool
+)
+
+class BootstrapLiftValidity(val valid: Cell<bool>)
+
+fun bootstrapAccessSummary(): BootstrapAccessSummary =
+    BootstrapAccessSummary([], [], [], false, false)
+
+fun bootstrapAccessClonePath(path: BootstrapAccessPath): BootstrapAccessPath {
+    val kinds: array<string> = []
+    val names: array<string> = []
+    val indexes: array<int> = []
+    var segment = 0
+    while (segment < path.segmentKinds.size) {
+        kinds.append(path.segmentKinds[segment])
+        names.append(path.segmentNames[segment])
+        indexes.append(path.segmentIndexes[segment])
+        segment = segment + 1
+    }
+    BootstrapAccessPath(
+        path.rootKind,
+        path.rootIdentity,
+        path.rootParameter,
+        kinds,
+        names,
+        indexes
+    )
+}
+
+fun bootstrapAccessPathKey(path: BootstrapAccessPath): string {
+    var key = "${path.rootKind}:${path.rootIdentity}:${path.rootParameter}"
+    var segment = 0
+    while (segment < path.segmentKinds.size) {
+        key = "$key/${path.segmentKinds[segment]}:${path.segmentNames[segment]}:${path.segmentIndexes[segment]}"
+        segment = segment + 1
+    }
+    key
+}
+
+fun bootstrapAccessAppendUnique(
+    var paths: array<BootstrapAccessPath>,
+    path: BootstrapAccessPath
+): void {
+    val key = bootstrapAccessPathKey(path)
+    var found = false
+    var index = 0
+    while (index < paths.size) {
+        if (bootstrapAccessPathKey(paths[index]) == key) found = true
+        index = index + 1
+    }
+    if (!found && paths.size < 64) paths.append(path)
+}
+
+fun bootstrapAccessPathAppend(
+    path: BootstrapAccessPath,
+    kind: string,
+    name: string,
+    index: int
+): BootstrapAccessPath {
+    val result = bootstrapAccessClonePath(path)
+    if (result.segmentKinds.size < 8) {
+        result.segmentKinds.append(kind)
+        result.segmentNames.append(name)
+        result.segmentIndexes.append(index)
+    } else if (result.segmentKinds.size == 8 &&
+        result.segmentKinds[7] != "wildcard") {
+        result.segmentKinds[7] = "wildcard"
+        result.segmentNames[7] = ""
+        result.segmentIndexes[7] = -1
+    }
+    result
+}
+
+fun bootstrapAccessPathsIntersect(
+    left: BootstrapAccessPath,
+    right: BootstrapAccessPath
+): bool {
+    var intersects = left.rootKind == right.rootKind &&
+        left.rootIdentity == right.rootIdentity &&
+        (left.rootParameter == right.rootParameter ||
+         left.rootParameter < 0 || right.rootParameter < 0)
+    var segment = 0
+    val shared = if (left.segmentKinds.size < right.segmentKinds.size) {
+        left.segmentKinds.size
+    } else right.segmentKinds.size
+    while (intersects && segment < shared) {
+        val leftKind = left.segmentKinds[segment]
+        val rightKind = right.segmentKinds[segment]
+        if (leftKind == "wildcard" || rightKind == "wildcard") {
+            segment = shared
+        } else if ((leftKind == "index.dynamic" &&
+                    (rightKind == "index.dynamic" ||
+                     rightKind == "index.constant")) ||
+                   (rightKind == "index.dynamic" &&
+                    leftKind == "index.constant")) {
+            intersects = intersects
+        } else if (leftKind != rightKind) intersects = false
+        else if (leftKind == "field" &&
+            left.segmentNames[segment] != right.segmentNames[segment]) {
+            intersects = false
+        } else if (leftKind == "index.constant" &&
+            left.segmentIndexes[segment] != right.segmentIndexes[segment]) {
+            intersects = false
+        }
+        segment = segment + 1
+    }
+    intersects
+}
+
 fun bootstrapEvalValueNeedsBorrow(value: BootstrapEvalValue): bool =
     value.kind == "object" || value.kind == "array" ||
     value.kind == "string" || value.kind == "shared" ||
@@ -1033,6 +1159,808 @@ class BootstrapEvaluator(
         val message =
             "compiler API `$operation` received invalid function handle $handle ($classification; expected a $domain)"
         this.recordEvaluatorDiagnostic(code, message)
+    }
+
+    fun accessContainingHandle(expression: BootstrapExpression): int {
+        var result = -1
+        var bestSpan = 2147483647
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            val candidate = this.declarations[declaration]
+            if ((candidate.kind == "fun" ||
+                 candidate.kind == "compile.fun") &&
+                candidate.generatedNamespace == "" &&
+                bootstrapCanonicalDeclarationModuleIdentity(
+                    candidate.name
+                ) == "" &&
+                candidate.expression.begin <= expression.begin &&
+                candidate.expression.end >= expression.end) {
+                val span = candidate.expression.end - candidate.expression.begin
+                if (span < bestSpan) {
+                    result = declaration
+                    bestSpan = span
+                }
+            }
+            var method = 0
+            while (bootstrapCanonicalDeclarationModuleIdentity(
+                    candidate.name
+                ) == "" && method < candidate.methods.size) {
+                val found = candidate.methods[method]
+                if (found.expression.begin <= expression.begin &&
+                    found.expression.end >= expression.end) {
+                    val span = found.expression.end - found.expression.begin
+                    if (span < bestSpan) {
+                        result = this.methodHandle(declaration, method)
+                        bestSpan = span
+                    }
+                }
+                method = method + 1
+            }
+            declaration = declaration + 1
+        }
+        result
+    }
+
+    fun accessAliasIndex(names: array<string>, name: string): int {
+        var result = -1
+        var index = 0
+        while (index < names.size) {
+            if (names[index] == name) result = index
+            index = index + 1
+        }
+        result
+    }
+
+    fun accessDelegatedTypeInExpression(
+        expression: BootstrapExpression,
+        name: string,
+        before: int
+    ): string {
+        var result = "unknown"
+        if ((expression.kind == "local.val" ||
+             expression.kind == "local.var") && expression.text == name &&
+            expression.begin < before && expression.children.size > 0 &&
+            expression.children[0].kind == "delegate.initializer" &&
+            expression.children[0].children.size > 0) {
+            result = this.staticSyntaxType(
+                expression.children[0].children[0]
+            )
+        }
+        var child = 0
+        while (child < expression.children.size) {
+            val found = this.accessDelegatedTypeInExpression(
+                expression.children[child], name, before
+            )
+            if (found != "unknown") result = found
+            child = child + 1
+        }
+        result
+    }
+
+    fun accessDelegatedType(
+        name: string,
+        context: int,
+        before: int
+    ): string {
+        var result = "unknown"
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            val candidate = this.declarations[declaration]
+            if (bootstrapDeclarationIsValue(candidate.kind) &&
+                candidate.name == name &&
+                candidate.expression.kind == "delegate.initializer" &&
+                candidate.expression.children.size > 0) {
+                result = this.staticSyntaxType(
+                    candidate.expression.children[0]
+                )
+            }
+            declaration = declaration + 1
+        }
+        if (context >= 0 && this.functionHandleValid(context)) {
+            val local = this.accessDelegatedTypeInExpression(
+                this.functionHandleDeclaration(context).expression,
+                name,
+                before
+            )
+            if (local != "unknown") result = local
+        }
+        result
+    }
+
+    fun accessMethodHandle(ownerName: string, name: string): int {
+        var result = -1
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            val owner = this.declarations[declaration]
+            if (owner.kind == "class" && owner.name == ownerName) {
+                var method = 0
+                while (method < owner.methods.size) {
+                    if (owner.methods[method].name == name) {
+                        result = this.methodHandle(declaration, method)
+                    }
+                    method = method + 1
+                }
+            }
+            if (result < 0 && owner.extensionOwner != "" &&
+                bootstrapNormalizeType(owner.extensionOwner) == ownerName &&
+                owner.name == name) result = declaration
+            declaration = declaration + 1
+        }
+        result
+    }
+
+    fun accessRootPath(
+        name: string,
+        context: int,
+        aliasNames: array<string>,
+        aliasPaths: array<BootstrapAccessPath>
+    ): BootstrapAccessPath {
+        val alias = this.accessAliasIndex(aliasNames, name)
+        if (alias >= 0 && alias < aliasPaths.size) {
+            bootstrapAccessClonePath(aliasPaths[alias])
+        } else {
+            var rootKind = "unknown"
+            var identity = name
+            var parameter = -1
+            if (context >= 0 && this.functionHandleValid(context)) {
+                val declaration = this.functionHandleDeclaration(context)
+                var index = 0
+                while (index < declaration.parameters.size) {
+                    if (declaration.parameters[index] == name) {
+                        rootKind = "parameter"
+                        identity = "${bootstrapCanonicalDeclarationModuleIdentity(
+                            declaration.name
+                        )}:${declaration.name}#$index"
+                        parameter = index
+                    }
+                    index = index + 1
+                }
+                if (name == "this" && this.functionHandleOwner(context) >= 0) {
+                    rootKind = "receiver"
+                    val ownerName = this.declarations[
+                        this.functionHandleOwner(context)
+                    ].name
+                    identity = "${bootstrapCanonicalDeclarationModuleIdentity(
+                        ownerName
+                    )}:$ownerName"
+                    parameter = -1
+                }
+            }
+            var declarationIndex = 0
+            while (rootKind == "unknown" &&
+                declarationIndex < this.declarations.size) {
+                val declaration = this.declarations[declarationIndex]
+                if (bootstrapDeclarationIsValue(declaration.kind) &&
+                    declaration.name == name) {
+                    rootKind = "global"
+                    identity = "${bootstrapCanonicalDeclarationModuleIdentity(
+                        declaration.name
+                    )}:${declaration.name}"
+                }
+                declarationIndex = declarationIndex + 1
+            }
+            if (rootKind == "unknown" && context >= 0 &&
+                this.functionHandleOwner(context) >= 0) {
+                val ownerIndex = this.functionHandleOwner(context)
+                val owner = this.declarations[ownerIndex]
+                var field = 0
+                while (field < owner.parameters.size) {
+                    if (owner.parameters[field] == name &&
+                        field < owner.parameterKinds.size &&
+                        (owner.parameterKinds[field] == "val" ||
+                         owner.parameterKinds[field] == "var")) {
+                        rootKind = "receiver"
+                        identity = "${bootstrapCanonicalDeclarationModuleIdentity(
+                            owner.name
+                        )}:${owner.name}"
+                        parameter = -1
+                    }
+                    field = field + 1
+                }
+                if (rootKind == "receiver") {
+                    val receiver = BootstrapAccessPath(
+                        rootKind, identity, parameter, [], [], []
+                    )
+                    return bootstrapAccessPathAppend(
+                        receiver, "field", name, -1
+                    )
+                }
+            }
+            if (rootKind == "unknown" && context >= 0) {
+                rootKind = "local"
+                val declaration = this.functionHandleDeclaration(context)
+                identity = "${bootstrapCanonicalDeclarationModuleIdentity(
+                    declaration.name
+                )}:${declaration.name}:$name"
+            }
+            BootstrapAccessPath(
+                rootKind,
+                identity,
+                parameter,
+                [],
+                [],
+                []
+            )
+        }
+    }
+
+    fun accessPathForPlace(
+        expression: BootstrapExpression,
+        context: int,
+        aliasNames: array<string>,
+        aliasPaths: array<BootstrapAccessPath>
+    ): BootstrapAccessPath {
+        var result = BootstrapAccessPath("unknown", "", -1, [], [], [])
+        if (expression.kind == "identifier") {
+            result = this.accessRootPath(
+                expression.text,
+                context,
+                aliasNames,
+                aliasPaths
+            )
+        }
+        if (expression.kind == "member" && expression.children.size > 0) {
+            result = bootstrapAccessPathAppend(
+                this.accessPathForPlace(
+                    expression.children[0],
+                    context,
+                    aliasNames,
+                    aliasPaths
+                ),
+                "field",
+                expression.text,
+                -1
+            )
+        }
+        if (expression.kind == "index" && expression.children.size > 1) {
+            var kind = "index.dynamic"
+            var index = -1
+            if (expression.children[1].kind == "integer") {
+                kind = "index.constant"
+                index = bootstrapDecimalIndex(expression.children[1].text)
+            }
+            result = bootstrapAccessPathAppend(
+                this.accessPathForPlace(
+                    expression.children[0],
+                    context,
+                    aliasNames,
+                    aliasPaths
+                ),
+                kind,
+                "",
+                index
+            )
+        }
+        if (expression.kind == "delegate.project" &&
+            expression.children.size == 1) {
+            result = bootstrapAccessPathAppend(
+                this.accessPathForPlace(
+                    expression.children[0],
+                    context,
+                    aliasNames,
+                    aliasPaths
+                ),
+                "delegate",
+                "",
+                -1
+            )
+        }
+        result
+    }
+
+    fun accessTypeIsScalar(type: string): bool {
+        val normalized = bootstrapNormalizeType(type)
+        normalized == "bool" || normalized == "char" ||
+        normalized == "i8" || normalized == "i16" ||
+        normalized == "i32" || normalized == "i64" ||
+        normalized == "u8" || normalized == "u16" ||
+        normalized == "u32" || normalized == "u64" ||
+        normalized == "f32" || normalized == "f64" ||
+        normalized == "cstring" || bootstrapIsNullableType(normalized)
+    }
+
+    fun accessNameIsClass(name: string): bool {
+        var found = false
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            if (this.declarations[declaration].kind == "class" &&
+                this.declarations[declaration].name == name) found = true
+            declaration = declaration + 1
+        }
+        found
+    }
+
+    fun accessSubstitutedPath(
+        path: BootstrapAccessPath,
+        call: BootstrapExpression,
+        context: int,
+        aliasNames: array<string>,
+        aliasPaths: array<BootstrapAccessPath>
+    ): BootstrapAccessPath {
+        var base = bootstrapAccessClonePath(path)
+        var argument = -1
+        if (path.rootKind == "receiver" && call.kind == "member.call" &&
+            call.children.size > 0) argument = 0
+        if (path.rootKind == "parameter") {
+            argument = path.rootParameter
+            if (call.kind == "member.call") argument = argument + 1
+        }
+        if (argument >= 0 && argument < call.children.size) {
+            val supplied = this.accessPathForPlace(
+                call.children[argument],
+                context,
+                aliasNames,
+                aliasPaths
+            )
+            if (supplied.rootKind != "unknown") {
+                base = supplied
+                var segment = 0
+                while (segment < path.segmentKinds.size) {
+                    base = bootstrapAccessPathAppend(
+                        base,
+                        path.segmentKinds[segment],
+                        path.segmentNames[segment],
+                        path.segmentIndexes[segment]
+                    )
+                    segment = segment + 1
+                }
+            } else base = BootstrapAccessPath(
+                "value", "", -1, [], [], []
+            )
+        }
+        base
+    }
+
+    fun accessMergeCallSummary(
+        var summary: BootstrapAccessSummary,
+        call: BootstrapExpression,
+        callee: BootstrapAccessSummary,
+        context: int,
+        aliasNames: array<string>,
+        aliasPaths: array<BootstrapAccessPath>
+    ): void {
+        var index = 0
+        while (index < callee.reads.size) {
+            val path = this.accessSubstitutedPath(
+                callee.reads[index], call, context, aliasNames, aliasPaths
+            )
+            if (path.rootKind == "unknown") summary.readsUnknown = true
+            else if (callee.reads[index].rootKind != "local") {
+                if (path.rootKind != "value") {
+                    bootstrapAccessAppendUnique(summary.reads, path)
+                }
+            }
+            index = index + 1
+        }
+        index = 0
+        while (index < callee.writes.size) {
+            val path = this.accessSubstitutedPath(
+                callee.writes[index], call, context, aliasNames, aliasPaths
+            )
+            if (path.rootKind == "unknown") summary.writesUnknown = true
+            else if (callee.writes[index].rootKind != "local") {
+                if (path.rootKind != "value") {
+                    bootstrapAccessAppendUnique(summary.writes, path)
+                }
+            }
+            index = index + 1
+        }
+        index = 0
+        while (index < callee.consumes.size) {
+            val path = this.accessSubstitutedPath(
+                callee.consumes[index], call, context, aliasNames, aliasPaths
+            )
+            if (path.rootKind == "unknown") summary.writesUnknown = true
+            else if (callee.consumes[index].rootKind != "local") {
+                if (path.rootKind != "value") {
+                    bootstrapAccessAppendUnique(summary.consumes, path)
+                }
+            }
+            index = index + 1
+        }
+        if (callee.readsUnknown) summary.readsUnknown = true
+        if (callee.writesUnknown) summary.writesUnknown = true
+    }
+
+    fun accessSummaryForFunctionAt(
+        handle: int,
+        depth: int,
+        visited: array<int>
+    ): BootstrapAccessSummary {
+        val summary = bootstrapAccessSummary()
+        if (!this.functionHandleValid(handle)) {
+            summary.readsUnknown = true
+            summary.writesUnknown = true
+        } else if (depth >= 8 || this.intArrayContains(visited, handle)) {
+            summary.readsUnknown = true
+            summary.writesUnknown = true
+        } else {
+            val declaration = this.functionHandleDeclaration(handle)
+            if (declaration.kind == "extern") {
+                summary.readsUnknown = true
+                var parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    if (parameter < declaration.parameterKinds.size &&
+                        declaration.parameterKinds[parameter] == "var") {
+                        val wildcard = bootstrapAccessPathAppend(
+                            this.accessRootPath(
+                                declaration.parameters[parameter],
+                                handle,
+                                [],
+                                []
+                            ),
+                            "wildcard",
+                            "",
+                            -1
+                        )
+                        bootstrapAccessAppendUnique(summary.writes, wildcard)
+                    }
+                    parameter = parameter + 1
+                }
+            } else if (declaration.expression.kind == "missing") {
+                summary.readsUnknown = true
+                summary.writesUnknown = true
+            } else {
+                val nestedVisited: array<int> = []
+                var seen = 0
+                while (seen < visited.size) {
+                    nestedVisited.append(visited[seen])
+                    seen = seen + 1
+                }
+                nestedVisited.append(handle)
+                this.accessAnalyzeExpression(
+                    declaration.expression,
+                    summary,
+                    handle,
+                    [],
+                    [],
+                    depth,
+                    nestedVisited,
+                    true
+                )
+            }
+        }
+        summary
+    }
+
+    fun accessAnalyzeExpression(
+        expression: BootstrapExpression,
+        var summary: BootstrapAccessSummary,
+        context: int,
+        var aliasNames: array<string>,
+        var aliasPaths: array<BootstrapAccessPath>,
+        depth: int,
+        visited: array<int>,
+        valueRead: bool
+    ): void {
+        if (summary.reads.size >= 64 || summary.writes.size >= 64) {
+            summary.readsUnknown = true
+            summary.writesUnknown = true
+            return
+        }
+        if (expression.kind == "identifier" && valueRead) {
+            val path = this.accessPathForPlace(
+                expression, context, aliasNames, aliasPaths
+            )
+            if (path.rootKind == "unknown") summary.readsUnknown = true
+            else bootstrapAccessAppendUnique(summary.reads, path)
+            val delegateType = this.accessDelegatedType(
+                expression.text,
+                context,
+                expression.begin
+            )
+            val getter = this.accessMethodHandle(delegateType, "getValue")
+            if (getter >= 0) {
+                val projected = BootstrapExpression(
+                    "delegate.project", "", expression.begin,
+                    expression.end, [expression]
+                )
+                val call = BootstrapExpression(
+                    "member.call", "getValue", expression.begin,
+                    expression.end, [projected]
+                )
+                this.accessMergeCallSummary(
+                    summary,
+                    call,
+                    this.accessSummaryForFunctionAt(
+                        getter, depth + 1, visited
+                    ),
+                    context,
+                    aliasNames,
+                    aliasPaths
+                )
+            }
+        } else if ((expression.kind == "member" ||
+                    expression.kind == "index" ||
+                    expression.kind == "delegate.project") && valueRead) {
+            val path = this.accessPathForPlace(
+                expression, context, aliasNames, aliasPaths
+            )
+            if (path.rootKind == "unknown") summary.readsUnknown = true
+            else bootstrapAccessAppendUnique(summary.reads, path)
+            if (expression.kind == "index" &&
+                expression.children.size > 1 &&
+                expression.children[1].kind != "integer") {
+                this.accessAnalyzeExpression(
+                    expression.children[1], summary, context,
+                    aliasNames, aliasPaths, depth, visited, true
+                )
+            }
+        } else if (expression.kind == "assign") {
+            val path = this.accessRootPath(
+                expression.text, context, aliasNames, aliasPaths
+            )
+            if (path.rootKind == "unknown") summary.writesUnknown = true
+            else bootstrapAccessAppendUnique(summary.writes, path)
+            if (expression.children.size > 0) this.accessAnalyzeExpression(
+                expression.children[0], summary, context,
+                aliasNames, aliasPaths, depth, visited, true
+            )
+            val delegateType = this.accessDelegatedType(
+                expression.text,
+                context,
+                expression.begin
+            )
+            val setter = this.accessMethodHandle(delegateType, "setValue")
+            if (setter >= 0 && expression.children.size > 0) {
+                val receiver = BootstrapExpression(
+                    "delegate.project", "", expression.begin,
+                    expression.end, [BootstrapExpression(
+                        "identifier", expression.text, expression.begin,
+                        expression.end, []
+                    )]
+                )
+                val call = BootstrapExpression(
+                    "member.call", "setValue", expression.begin,
+                    expression.end, [receiver, expression.children[0]]
+                )
+                this.accessMergeCallSummary(
+                    summary,
+                    call,
+                    this.accessSummaryForFunctionAt(
+                        setter, depth + 1, visited
+                    ),
+                    context,
+                    aliasNames,
+                    aliasPaths
+                )
+            }
+        } else if ((expression.kind == "member.assign" ||
+                    expression.kind == "index.assign" ||
+                    expression.kind == "delegate.assign") &&
+            expression.children.size > 0) {
+            val target = if (expression.kind == "delegate.assign") {
+                BootstrapExpression(
+                    "delegate.project", "", expression.begin,
+                    expression.end, [expression.children[0]]
+                )
+            } else if (expression.kind == "index.assign" &&
+                expression.children.size > 1) {
+                BootstrapExpression(
+                    "index", "", expression.begin, expression.end,
+                    [expression.children[0], expression.children[1]]
+                )
+            } else expression.children[0]
+            var path = this.accessPathForPlace(
+                target, context, aliasNames, aliasPaths
+            )
+            if (expression.kind == "member.assign") {
+                path = bootstrapAccessPathAppend(
+                    path, "field", expression.text, -1
+                )
+            }
+            if (path.rootKind == "unknown") summary.writesUnknown = true
+            else bootstrapAccessAppendUnique(summary.writes, path)
+            val valueIndex = expression.children.size - 1
+            this.accessAnalyzeExpression(
+                expression.children[valueIndex], summary, context,
+                aliasNames, aliasPaths, depth, visited, true
+            )
+        } else if ((expression.kind == "local.val" ||
+                    expression.kind == "local.var") &&
+            expression.children.size > 0) {
+            val initializer = expression.children[0]
+            val aliasPath = this.accessPathForPlace(
+                initializer, context, aliasNames, aliasPaths
+            )
+            if (aliasPath.rootKind == "unknown" ||
+                this.accessTypeIsScalar(this.staticSyntaxType(initializer))) {
+                this.accessAnalyzeExpression(
+                    initializer, summary, context,
+                    aliasNames, aliasPaths, depth, visited, true
+                )
+            }
+            if (aliasPath.rootKind != "unknown") {
+                aliasNames.append(expression.text)
+                aliasPaths.append(aliasPath)
+            }
+        } else if (expression.kind == "call" &&
+            expression.text == "move" && expression.children.size == 1) {
+            val path = this.accessPathForPlace(
+                expression.children[0], context, aliasNames, aliasPaths
+            )
+            if (path.rootKind == "unknown") summary.writesUnknown = true
+            else bootstrapAccessAppendUnique(summary.consumes, path)
+        } else if ((expression.kind == "call" ||
+                    expression.kind == "member.call")) {
+            val cellReceiver = expression.kind == "member.call" &&
+                expression.children.size > 0 && bootstrapIsCellType(
+                    this.staticSyntaxType(expression.children[0])
+                )
+            if (cellReceiver && expression.text == "get") {
+                val cell = bootstrapAccessPathAppend(
+                    this.accessPathForPlace(
+                        expression.children[0], context,
+                        aliasNames, aliasPaths
+                    ),
+                    "cell",
+                    "",
+                    -1
+                )
+                if (cell.rootKind == "unknown") summary.readsUnknown = true
+                else bootstrapAccessAppendUnique(summary.reads, cell)
+            } else if (cellReceiver && expression.text == "set") {
+                val cell = bootstrapAccessPathAppend(
+                    this.accessPathForPlace(
+                        expression.children[0], context,
+                        aliasNames, aliasPaths
+                    ),
+                    "cell",
+                    "",
+                    -1
+                )
+                if (cell.rootKind == "unknown") summary.writesUnknown = true
+                else bootstrapAccessAppendUnique(summary.writes, cell)
+                if (expression.children.size > 1) {
+                    this.accessAnalyzeExpression(
+                        expression.children[1], summary, context,
+                        aliasNames, aliasPaths, depth, visited, true
+                    )
+                }
+            } else {
+                val target = this.directCallTarget(expression, 0)
+                var offset = 0
+                if (expression.kind == "member.call") offset = 1
+                var argument = offset
+                while (argument < expression.children.size) {
+                    var readArgument = target < 0
+                    val parameter = argument - offset
+                    if (target >= 0 && this.accessTypeIsScalar(
+                        this.functionHandleParameterType(target, parameter)
+                    )) readArgument = true
+                    if (readArgument) this.accessAnalyzeExpression(
+                        expression.children[argument], summary, context,
+                        aliasNames, aliasPaths, depth, visited, true
+                    )
+                    argument = argument + 1
+                }
+                if (target >= 0) {
+                    val callee = this.accessSummaryForFunctionAt(
+                        target, depth + 1, visited
+                    )
+                    this.accessMergeCallSummary(
+                        summary, expression, callee, context,
+                        aliasNames, aliasPaths
+                    )
+                } else if (!this.accessNameIsClass(expression.text)) {
+                    summary.readsUnknown = true
+                    summary.writesUnknown = true
+                }
+            }
+        } else {
+            var child = 0
+            while (child < expression.children.size) {
+                this.accessAnalyzeExpression(
+                    expression.children[child], summary, context,
+                    aliasNames, aliasPaths, depth, visited, true
+                )
+                child = child + 1
+            }
+        }
+    }
+
+    fun accessSummaryForExpression(
+        expression: BootstrapExpression
+    ): BootstrapAccessSummary {
+        val summary = bootstrapAccessSummary()
+        val aliases: array<string> = []
+        val aliasPaths: array<BootstrapAccessPath> = []
+        val visited: array<int> = []
+        this.accessAnalyzeExpression(
+            expression,
+            summary,
+            this.accessContainingHandle(expression),
+            aliases,
+            aliasPaths,
+            0,
+            visited,
+            true
+        )
+        summary
+    }
+
+    fun accessExpressionEffectMask(expression: BootstrapExpression): int {
+        val effects = bootstrapBuildCompileEffectSummary(this.declarations)
+        val delegatedNames: array<string> = []
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            val candidate = this.declarations[declaration]
+            if (bootstrapDeclarationIsValue(candidate.kind) &&
+                candidate.expression.kind == "delegate.initializer") {
+                delegatedNames.append(candidate.name)
+            }
+            declaration = declaration + 1
+        }
+        bootstrapCollectDelegatedNames(expression, delegatedNames)
+        bootstrapExpressionDelegatedCompileEffects(
+            expression,
+            effects,
+            delegatedNames
+        )
+    }
+
+    fun accessFunctionEffectMask(handle: int): int {
+        var mask = 0
+        if (this.functionHandleValid(handle)) {
+            val declaration = this.functionHandleDeclaration(handle)
+            val effects = bootstrapBuildCompileEffectSummary(this.declarations)
+            mask = bootstrapCompileEffectLookup(
+                effects,
+                declaration.name,
+                this.functionHandleOwner(handle) >= 0
+            )
+        }
+        mask
+    }
+
+    fun accessPathValue(path: BootstrapAccessPath): BootstrapEvalValue {
+        val segments: array<BootstrapEvalValue> = []
+        var segment = 0
+        while (segment < path.segmentKinds.size) {
+            segments.append(BootstrapEvalValue(
+                "typed.access.segment",
+                path.segmentIndexes[segment],
+                false,
+                path.segmentNames[segment],
+                [],
+                path.segmentKinds[segment],
+                []
+            ))
+            segment = segment + 1
+        }
+        BootstrapEvalValue(
+            "typed.access.path",
+            path.rootParameter,
+            false,
+            path.rootIdentity,
+            segments,
+            path.rootKind,
+            []
+        )
+    }
+
+    fun accessValuePath(value: BootstrapEvalValue): BootstrapAccessPath {
+        val kinds: array<string> = []
+        val names: array<string> = []
+        val indexes: array<int> = []
+        if (value.kind == "typed.access.path") {
+            var segment = 0
+            while (segment < value.elements.size) {
+                val found = value.elements[segment]
+                kinds.append(found.owner)
+                names.append(found.text)
+                indexes.append(found.integer)
+                segment = segment + 1
+            }
+        }
+        BootstrapAccessPath(
+            if (value.kind == "typed.access.path") value.owner else "unknown",
+            if (value.kind == "typed.access.path") value.text else "",
+            if (value.kind == "typed.access.path") value.integer else -1,
+            kinds,
+            names,
+            indexes
+        )
     }
 
     fun recordCompileInput(path: string, contents: string): void {
@@ -1543,6 +2471,111 @@ class BootstrapEvaluator(
         }
         }
         result
+    }
+
+    fun liftedCaptureIndex(names: array<string>, name: string): int {
+        var result = -1
+        var index = 0
+        while (index < names.size) {
+            if (names[index] == name) result = index
+            index = index + 1
+        }
+        result
+    }
+
+    fun liftedNameIsDeclaration(name: string): bool {
+        var found = false
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            if (this.declarations[declaration].name == name) found = true
+            declaration = declaration + 1
+        }
+        found
+    }
+
+    fun rewriteLiftedExpression(
+        expression: BootstrapExpression,
+        captureNames: array<string>,
+        parameterNames: array<string>,
+        var bound: array<string>,
+        validity: BootstrapLiftValidity
+    ): BootstrapExpression {
+        var text = expression.text
+        val children: array<BootstrapExpression> = []
+        if (expression.kind == "block") {
+            var statement = 0
+            while (statement < expression.children.size) {
+                val child = expression.children[statement]
+                children.append(this.rewriteLiftedExpression(
+                    child,
+                    captureNames,
+                    parameterNames,
+                    bound,
+                    validity
+                ))
+                if (child.kind == "local.val" || child.kind == "local.var") {
+                    bound.append(child.text)
+                }
+                statement = statement + 1
+            }
+        } else if (expression.kind == "lambda" ||
+            expression.kind == "lambda.move") {
+            val nested: array<string> = []
+            var inherited = 0
+            while (inherited < bound.size) {
+                nested.append(bound[inherited])
+                inherited = inherited + 1
+            }
+            var parameter = 0
+            while (parameter + 1 < expression.children.size) {
+                nested.append(expression.children[parameter].text)
+                children.append(expression.children[parameter])
+                parameter = parameter + 1
+            }
+            children.append(this.rewriteLiftedExpression(
+                expression.children[expression.children.size - 1],
+                captureNames,
+                parameterNames,
+                nested,
+                validity
+            ))
+        } else {
+            var child = 0
+            while (child < expression.children.size) {
+                children.append(this.rewriteLiftedExpression(
+                    expression.children[child],
+                    captureNames,
+                    parameterNames,
+                    bound,
+                    validity
+                ))
+                child = child + 1
+            }
+        }
+        if (expression.kind == "identifier" ||
+            expression.kind == "assign" || expression.kind == "call") {
+            val capture = this.liftedCaptureIndex(captureNames, text)
+            if (capture >= 0 && capture < parameterNames.size &&
+                !this.nameIsBound(bound, text)) {
+                text = parameterNames[capture]
+            } else if (expression.kind == "identifier" &&
+                !this.nameIsBound(bound, text) &&
+                !this.liftedNameIsDeclaration(text)) {
+                validity.valid.set(false)
+            }
+            if (expression.kind == "assign" &&
+                !this.nameIsBound(bound, text) &&
+                !this.liftedNameIsDeclaration(text) && capture < 0) {
+                validity.valid.set(false)
+            }
+        }
+        BootstrapExpression(
+            expression.kind,
+            text,
+            expression.begin,
+            expression.end,
+            children
+        )
     }
 
     fun generatedDeclarationName(
@@ -4141,6 +5174,187 @@ class BootstrapEvaluator(
                 )
             } else this.errors = this.errors + 1
         }
+        if (targetName == "compilerGeneratedLiftedFunction") {
+            val module = this.evaluate(expression.children[0])
+            val hint = this.evaluate(expression.children[1])
+            val captures = this.evaluate(expression.children[2])
+            val names = this.evaluate(expression.children[3])
+            val types = this.evaluate(expression.children[4])
+            val mutableCaptures = this.evaluate(expression.children[5])
+            val resultType = this.evaluate(expression.children[6]).integer
+            val body = this.evaluate(expression.children[7])
+            var valid = module.kind == "generated.module" &&
+                hint.kind == "string" && captures.kind == "array" &&
+                names.kind == "array" && types.kind == "array" &&
+                mutableCaptures.kind == "array" &&
+                captures.elements.size == names.elements.size &&
+                names.elements.size == types.elements.size &&
+                types.elements.size == mutableCaptures.elements.size &&
+                this.reflectedTypeValid(resultType) && body.kind == "syntax" &&
+                module.elements.size < 256
+            var ownershipValid = true
+            var mutableValid = true
+            val captureNames: array<string> = []
+            val parameterNames: array<string> = []
+            val parameterTypes: array<string> = []
+            val parameterKinds: array<string> = []
+            val parameterDefaults: array<BootstrapExpression> = []
+            var source = ""
+            var parameter = 0
+            while (valid && parameter < names.elements.size) {
+                val capture = captures.elements[parameter]
+                val name = names.elements[parameter]
+                val type = types.elements[parameter]
+                val mutable = mutableCaptures.elements[parameter]
+                if (capture.kind != "string" || name.kind != "string" ||
+                    type.kind != "integer" || mutable.kind != "boolean" ||
+                    this.generatedIdentifierPart(capture.text) != capture.text ||
+                    this.generatedIdentifierPart(name.text) != name.text ||
+                    !this.reflectedTypeValid(type.integer)) {
+                    valid = false
+                } else {
+                    val typeName = this.reflectedTypes[type.integer]
+                    if (bootstrapIsBorrowType(typeName) ||
+                        bootstrapSummaryTypeIsAffine(
+                            typeName,
+                            this.affineTypes
+                        )) {
+                        valid = false
+                        ownershipValid = false
+                    }
+                    captureNames.append(capture.text)
+                    parameterNames.append(name.text)
+                    parameterTypes.append(typeName)
+                    parameterKinds.append(
+                        if (mutable.boolean) "var" else "parameter"
+                    )
+                    parameterDefaults.append(BootstrapExpression(
+                        "missing", "", module.integer, module.integer, []
+                    ))
+                    if (parameter > 0) source = "$source, "
+                    if (mutable.boolean) source = "${source}var "
+                    source = "$source${name.text}: $typeName"
+                }
+                parameter = parameter + 1
+            }
+            if (valid) {
+                val bodyExpression = this.syntax[body.integer]
+                val bodySummary = this.accessSummaryForExpression(
+                    bodyExpression
+                )
+                val bodyContext = this.accessContainingHandle(bodyExpression)
+                var capture = 0
+                while (capture < captureNames.size &&
+                    capture < mutableCaptures.elements.size) {
+                    if (!mutableCaptures.elements[capture].boolean) {
+                        val root = this.accessRootPath(
+                            captureNames[capture],
+                            bodyContext,
+                            [],
+                            []
+                        )
+                        var write = 0
+                        while (write < bodySummary.writes.size) {
+                            val candidate = bodySummary.writes[write]
+                            if (candidate.rootKind == root.rootKind &&
+                                candidate.rootIdentity == root.rootIdentity &&
+                                candidate.rootParameter == root.rootParameter) {
+                                mutableValid = false
+                            }
+                            write = write + 1
+                        }
+                        if (bodySummary.writesUnknown) mutableValid = false
+                    }
+                    capture = capture + 1
+                }
+                if (!mutableValid) valid = false
+            }
+            val bound: array<string> = []
+            val validity = BootstrapLiftValidity(Cell(valid))
+            var rewritten = BootstrapExpression(
+                "invalid", "lift", module.integer, module.integer, []
+            )
+            if (valid) rewritten = this.rewriteLiftedExpression(
+                this.syntax[body.integer],
+                captureNames,
+                parameterNames,
+                bound,
+                validity
+            )
+            valid = validity.valid.get()
+            val generatedName = this.generatedDeclarationName(
+                module,
+                hint.text
+            )
+            if (generatedName == "") valid = false
+            if (valid) {
+                val resultName = this.reflectedTypes[resultType]
+                var rendered = "fun $generatedName($source): $resultName "
+                if (rewritten.kind != "block") rendered = "$rendered= "
+                rendered = "$rendered${this.generatedSyntaxSource(
+                    rewritten,
+                    0
+                )}\n"
+                if (rendered.size > 65536) valid = false
+                if (valid) {
+                    var originEnd = module.integer
+                    if (module.elements.size > 0 &&
+                        module.elements[0].kind == "generated.origin") {
+                        originEnd = module.elements[0].integer
+                    }
+                    val declarationIndex = this.generatedDeclarations.size
+                    this.generatedDeclarations.append(BootstrapDeclaration(
+                        "fun",
+                        generatedName,
+                        module.integer,
+                        originEnd,
+                        rewritten,
+                        parameterNames,
+                        parameterTypes,
+                        this.reflectedTypes[resultType],
+                        [],
+                        parameterDefaults,
+                        "",
+                        parameterKinds,
+                        "",
+                        false,
+                        false,
+                        false,
+                        module.text,
+                        module.integer,
+                        originEnd,
+                        [],
+                        [],
+                        []
+                    ))
+                    module.elements.append(BootstrapEvalValue(
+                        "generated.declaration",
+                        declarationIndex,
+                        false,
+                        rendered,
+                        [],
+                        "",
+                        []
+                    ))
+                    module.fieldNames.append(generatedName)
+                    result = bootstrapEvalString(generatedName)
+                }
+            }
+            if (!valid) {
+                if (!ownershipValid) this.recordEvaluatorDiagnostic(
+                    "E_REACTIVE_LIFT_OWNERSHIP",
+                    "generated lifted function cannot capture a borrowed or affine value"
+                )
+                else if (!mutableValid) this.recordEvaluatorDiagnostic(
+                    "E_REACTIVE_HANDLER_CAPTURE",
+                    "generated lifted function writes through a capture that was not declared mutable"
+                )
+                else this.recordEvaluatorDiagnostic(
+                    "E_REACTIVE_LIFT_FREE_VARIABLE",
+                    "generated lifted function has an invalid or unlisted free variable"
+                )
+            }
+        }
         if (targetName == "compilerGeneratedFunction" ||
             targetName == "compilerGeneratedExportFunction") {
             val module = this.evaluate(expression.children[0])
@@ -4390,6 +5604,187 @@ class BootstrapEvaluator(
                     0,
                     -1,
                     arguments
+                ))
+            } else this.errors = this.errors + 1
+        }
+        if (targetName == "typedExpressionReadCount" ||
+            targetName == "typedExpressionRead" ||
+            targetName == "typedExpressionWriteCount" ||
+            targetName == "typedExpressionWrite" ||
+            targetName == "typedExpressionConsumeCount" ||
+            targetName == "typedExpressionConsume" ||
+            targetName == "typedExpressionReadsUnknown" ||
+            targetName == "typedExpressionWritesUnknown") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (handle >= 0 && handle < this.syntax.size &&
+                this.typedCallIndex(this.syntax[handle]) >= 0) {
+                val summary = this.accessSummaryForExpression(
+                    this.syntax[handle]
+                )
+                if (targetName == "typedExpressionReadCount") {
+                    result = bootstrapEvalInteger(summary.reads.size)
+                }
+                if (targetName == "typedExpressionWriteCount") {
+                    result = bootstrapEvalInteger(summary.writes.size)
+                }
+                if (targetName == "typedExpressionConsumeCount") {
+                    result = bootstrapEvalInteger(summary.consumes.size)
+                }
+                if (targetName == "typedExpressionReadsUnknown") {
+                    result = bootstrapEvalBoolean(summary.readsUnknown)
+                }
+                if (targetName == "typedExpressionWritesUnknown") {
+                    result = bootstrapEvalBoolean(summary.writesUnknown)
+                }
+                if (targetName == "typedExpressionRead" ||
+                    targetName == "typedExpressionWrite" ||
+                    targetName == "typedExpressionConsume") {
+                    val index = this.evaluate(expression.children[1]).integer
+                    var valid = false
+                    if (targetName == "typedExpressionRead" && index >= 0 &&
+                        index < summary.reads.size) {
+                        result = this.accessPathValue(summary.reads[index])
+                        valid = true
+                    }
+                    if (targetName == "typedExpressionWrite" && index >= 0 &&
+                        index < summary.writes.size) {
+                        result = this.accessPathValue(summary.writes[index])
+                        valid = true
+                    }
+                    if (targetName == "typedExpressionConsume" && index >= 0 &&
+                        index < summary.consumes.size) {
+                        result = this.accessPathValue(summary.consumes[index])
+                        valid = true
+                    }
+                    if (!valid) this.errors = this.errors + 1
+                }
+            } else this.recordEvaluatorDiagnostic(
+                "E_REACTIVE_DEPENDENCY_UNAVAILABLE",
+                "typed access reflection requires a resolved deferred expression"
+            )
+        }
+        if (targetName == "typedFunctionReadCount" ||
+            targetName == "typedFunctionRead" ||
+            targetName == "typedFunctionWriteCount" ||
+            targetName == "typedFunctionWrite" ||
+            targetName == "typedFunctionReadsUnknown" ||
+            targetName == "typedFunctionWritesUnknown") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (this.functionHandleValid(handle)) {
+                val summary = this.accessSummaryForFunctionAt(
+                    handle,
+                    0,
+                    []
+                )
+                if (targetName == "typedFunctionReadCount") {
+                    result = bootstrapEvalInteger(summary.reads.size)
+                }
+                if (targetName == "typedFunctionWriteCount") {
+                    result = bootstrapEvalInteger(summary.writes.size)
+                }
+                if (targetName == "typedFunctionReadsUnknown") {
+                    result = bootstrapEvalBoolean(summary.readsUnknown)
+                }
+                if (targetName == "typedFunctionWritesUnknown") {
+                    result = bootstrapEvalBoolean(summary.writesUnknown)
+                }
+                if (targetName == "typedFunctionRead" ||
+                    targetName == "typedFunctionWrite") {
+                    val index = this.evaluate(expression.children[1]).integer
+                    val paths = if (targetName == "typedFunctionRead") {
+                        summary.reads
+                    } else summary.writes
+                    if (index >= 0 && index < paths.size) {
+                        result = this.accessPathValue(paths[index])
+                    } else this.errors = this.errors + 1
+                }
+            } else this.recordInvalidFunctionHandle(targetName, handle)
+        }
+        if (targetName == "typedExpressionHasEffect") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val effectName = this.evaluate(expression.children[1])
+            if (handle >= 0 && handle < this.syntax.size &&
+                this.typedCallIndex(this.syntax[handle]) >= 0 &&
+                effectName.kind == "string") {
+                val effect = bootstrapCompileEffectFromName(effectName.text)
+                if (effect > 0) result = bootstrapEvalBoolean(
+                    bootstrapCompileEffectHas(
+                        this.accessExpressionEffectMask(this.syntax[handle]),
+                        effect
+                    )
+                )
+                else this.errors = this.errors + 1
+            } else this.recordEvaluatorDiagnostic(
+                "E_REACTIVE_DEPENDENCY_UNAVAILABLE",
+                "typed effect reflection requires a resolved deferred expression"
+            )
+        }
+        if (targetName == "typedFunctionHasEffect") {
+            val handle = this.evaluate(expression.children[0]).integer
+            val effectName = this.evaluate(expression.children[1])
+            if (this.functionHandleValid(handle) &&
+                effectName.kind == "string") {
+                val effect = bootstrapCompileEffectFromName(effectName.text)
+                if (effect > 0) result = bootstrapEvalBoolean(
+                    bootstrapCompileEffectHas(
+                        this.accessFunctionEffectMask(handle),
+                        effect
+                    )
+                )
+                else this.errors = this.errors + 1
+            } else this.recordInvalidFunctionHandle(targetName, handle)
+        }
+        if (targetName == "typedAccessRootKind" ||
+            targetName == "typedAccessRootIdentity" ||
+            targetName == "typedAccessRootParameter" ||
+            targetName == "typedAccessSegmentCount" ||
+            targetName == "typedAccessSegmentKind" ||
+            targetName == "typedAccessSegmentName" ||
+            targetName == "typedAccessSegmentIndex") {
+            val path = this.evaluate(expression.children[0])
+            if (path.kind == "typed.access.path") {
+                if (targetName == "typedAccessRootKind") {
+                    result = bootstrapEvalString(path.owner)
+                }
+                if (targetName == "typedAccessRootIdentity") {
+                    result = bootstrapEvalString(path.text)
+                }
+                if (targetName == "typedAccessRootParameter") {
+                    result = bootstrapEvalInteger(path.integer)
+                }
+                if (targetName == "typedAccessSegmentCount") {
+                    result = bootstrapEvalInteger(path.elements.size)
+                }
+                if (targetName == "typedAccessSegmentKind" ||
+                    targetName == "typedAccessSegmentName" ||
+                    targetName == "typedAccessSegmentIndex") {
+                    val index = this.evaluate(expression.children[1]).integer
+                    if (index >= 0 && index < path.elements.size) {
+                        val segment = path.elements[index]
+                        if (targetName == "typedAccessSegmentKind") {
+                            result = bootstrapEvalString(segment.owner)
+                        }
+                        if (targetName == "typedAccessSegmentName") {
+                            result = bootstrapEvalString(segment.text)
+                        }
+                        if (targetName == "typedAccessSegmentIndex") {
+                            result = bootstrapEvalInteger(segment.integer)
+                        }
+                    } else this.errors = this.errors + 1
+                }
+            } else this.recordEvaluatorDiagnostic(
+                "E_REACTIVE_DEPENDENCY_UNAVAILABLE",
+                "typed access query received a stale or invalid path handle"
+            )
+        }
+        if (targetName == "typedAccessPathsIntersect") {
+            val left = this.evaluate(expression.children[0])
+            val right = this.evaluate(expression.children[1])
+            if (left.kind == "typed.access.path" &&
+                right.kind == "typed.access.path") {
+                result = bootstrapEvalBoolean(bootstrapAccessPathsIntersect(
+                    this.accessValuePath(left),
+                    this.accessValuePath(right)
                 ))
             } else this.errors = this.errors + 1
         }
