@@ -614,9 +614,8 @@ compileCapabilities = ["filesystem.read"]
 ```
 
 ```abla
-#import("abla/compiler")
-#import("abla/io")
-
+import "abla/compiler"
+import "abla/io"
 #compilerGrant("filesystem.read")
 fun schemaSize(): int {
     val schema = #ablaHostReadFile("api.json")
@@ -742,10 +741,15 @@ These suspension and OS-thread runtimes currently require a hosted target.
 
 ## Modules and imports
 
-The prototype spelling remains valid:
+Imports are top-level declarations. A direct implementation import may retain
+compatibility visibility or bind the target to a module-local alias:
 
 ```abla
-#import("path/to/file.ab")
+import "path/to/file.ab"
+import "shared/models.ab" as models
+
+fun load(value: models.Account): models.Account =
+    models.normalize(value)
 ```
 
 An import argument may also be a typed compile-time source-provider call. The
@@ -753,7 +757,7 @@ provider returns `ImportSource` rather than performing network I/O during
 parsing:
 
 ```abla
-#import(github("AndreBaltazar8/abla-mvc"))
+import github("AndreBaltazar8/abla-mvc") as mvc
 ```
 
 User-defined compile functions can return `ImportSource` through
@@ -761,23 +765,26 @@ User-defined compile functions can return `ImportSource` through
 that supplies a `ResolvedImport` of source files. Resolution, immutable locks,
 offline behavior, and vendoring are documented in `docs/packages.md`.
 
-The stable module form will be:
-
-```abla
-import abla.math
-import "./local.ab"
-```
-
 Imports are canonicalized, cached by content and configuration, cycle checked,
 and processed deterministically. Compile-time and runtime code can import the
-same module; phase filtering happens per declaration.
+same module; phase filtering happens per declaration. An aliased module is a
+compile-time namespace, not a runtime value. Its functions, globals,
+constructors, interfaces, and nominal types are available only through the
+alias. Aliases are direct and module-local; importing a facade does not expose
+the aliases used inside that facade.
+
+Canonical declaration and type identities derive from the normalized defining
+module, not the consumer's alias spelling. Consequently, alias renames affect
+only the importing frontend and do not rename native symbols or reflected
+canonical identities. Two unaliased direct imports exposing the same short
+name are diagnosed as `E_IMPORT_UNQUALIFIED_AMBIGUOUS`; source order never
+selects a winner.
 
 Portable console programs import `abla/io`; the selected target profile
 provides the implementation behind the same source API:
 
 ```abla
-#import("abla/io")
-
+import "abla/io"
 fun main: int {
     println("Hello, world!")
     0

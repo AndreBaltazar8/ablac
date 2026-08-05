@@ -10,8 +10,7 @@ The low-level executable node is `compilerBuildProgram`; public extensions may
 use the grouped `compiler.buildProgram(...)` method:
 
 ```abla
-#import("abla/compiler")
-
+import "abla/compiler"
 val app = #compilerBuildProgram(
     "app-core",
     "src/app.ab",
@@ -165,8 +164,8 @@ scalar exported module and thin host loader; typed model/state exchange, DOM or
 canvas renderers, hydration, host integration, and bundler policy remain library
 work. Neither workflow belongs in `ablac` itself.
 
-`#import("abla/compiler")` now exposes the compile-time-only `compiler` service
-object as the primary façade. `#import("abla/build")` remains the small
+`import "abla/compiler"` now exposes the compile-time-only `compiler` service
+object as the primary façade. `import "abla/build"` remains the small
 compatibility/convenience façade over these
 compiler services. Its `buildProgram`, `defineTarget`, and `exportFunction`
 helpers contain no platform policy; Android and WASM/MVC extensions wrap them

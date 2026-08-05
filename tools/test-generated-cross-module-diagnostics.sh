@@ -47,16 +47,17 @@ compile fun actionDependency(): ImportSource = gitImportSource(
 )
 EOF
 cat > "$application/src/generated-provider.ab" <<'EOF'
-#import("abla/compiler")
-#import("abla/compiler/parser")
-
+import "abla/compiler"
+import "abla/compiler/parser"
 compile fun finalizePackageAction(
     generatedName: string,
     expression: SyntaxExpression
 ): GeneratedModuleBuilder {
     val target = typedCallTarget(expression)
     val module = compilerGeneratedModule("package.action", expression)
-    val valid = compilerFunctionCanonicalIdentity(target) == "packageAction" &&
+    val valid = compilerFunctionName(target) == "packageAction" &&
+        compilerFunctionCanonicalIdentity(target) != "packageAction" &&
+        compilerFunctionModuleIdentity(target).size > 0 &&
         compilerFunctionParameterType(target, 0) == "i64" &&
         compilerFunctionResultType(target) == "PackageActionResult" &&
         compilerFunctionAnnotationCount(target) == 1 &&
@@ -69,7 +70,7 @@ compile fun finalizePackageAction(
         "adapter",
         parameterNames,
         parameterTypes,
-        compilerFindType("PackageActionResult"),
+        compilerFunctionResultTypeHandle(target),
         syntaxCallTarget(target, arguments)
     )
     compilerGeneratedExportFunction(
@@ -77,7 +78,7 @@ compile fun finalizePackageAction(
         generatedName,
         parameterNames,
         parameterTypes,
-        compilerFindType("PackageActionResult"),
+        compilerFunctionResultTypeHandle(target),
         compilerGeneratedDeclarationCall(module, 0, arguments)
     )
     if (!valid) {
@@ -111,11 +112,11 @@ compile fun parsePackageAction(cursor: ParserCursor): SyntaxExpression {
 #compilerRegisterSubparser("packageAction", parsePackageAction)
 EOF
 cat > "$application/src/main.ab" <<'EOF'
-#import("package-provider.ab")
-#import(actionDependency())
-#import("generated-provider.ab")
+import "package-provider.ab"
+import actionDependency() as actions
+import "generated-provider.ab"
 
-val directPackageAction = $packageAction(packageAction(1))
+val directPackageAction = $packageAction(actions.packageAction(1))
 
 fun main: int =
     generatedPackageAction(41).value + directPackageAction.value

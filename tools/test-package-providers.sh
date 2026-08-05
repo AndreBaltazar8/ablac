@@ -45,8 +45,8 @@ compile fun leafDependency(): ImportSource = gitImportSource(
 )
 EOF
 cat > "$repository/src/provider-dep.ab" <<'EOF'
-#import("leaf-provider.ab")
-#import(leafDependency())
+import "leaf-provider.ab"
+import leafDependency()
 fun dependencyAnswer: int = 40 + leafAnswer()
 EOF
 git -C "$repository" add abla.toml src/provider-dep.ab src/leaf-provider.ab
@@ -67,9 +67,8 @@ compile fun localDependency(): ImportSource = gitImportSource(
 )
 EOF
 cat > "$application/src/main.ab" <<'EOF'
-#import("provider.ab")
-#import(localDependency())
-
+import "provider.ab"
+import localDependency()
 fun main: int = dependencyAnswer()
 EOF
 
@@ -108,8 +107,8 @@ set -e
 [[ $first_status -eq 42 ]]
 
 cat > "$repository/src/provider-dep.ab" <<'EOF'
-#import("leaf-provider.ab")
-#import(leafDependency())
+import "leaf-provider.ab"
+import leafDependency()
 fun dependencyAnswer: int = 39 + leafAnswer()
 EOF
 git -C "$repository" add src/provider-dep.ab
@@ -147,7 +146,7 @@ name = "github-provider-probe"
 entry = "src/main.ab"
 EOF
 cat > "$github_application/src/main.ab" <<'EOF'
-#import(github("AndreBaltazar8/abla-mvc"))
+import github("AndreBaltazar8/abla-mvc")
 fun main: int = 0
 EOF
 set +e
@@ -166,8 +165,7 @@ name = "generated-provider-app"
 entry = "src/main.ab"
 EOF
 cat > "$generated_application/src/provider.ab" <<'EOF'
-#import("abla/compiler")
-
+import "abla/compiler"
 compile fun resolveGenerated(): ResolvedImport {
     val revision = compilerEnvironment("ABLA_GENERATED_REVISION")
     resolvedImport(
@@ -194,9 +192,8 @@ compile fun generatedDependency(): ImportSource = importSource(
 )
 EOF
 cat > "$generated_application/src/main.ab" <<'EOF'
-#import("provider.ab")
-#import(generatedDependency())
-
+import "provider.ab"
+import generatedDependency()
 fun main: int = generatedAnswer()
 EOF
 

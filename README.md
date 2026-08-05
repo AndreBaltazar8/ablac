@@ -54,8 +54,7 @@ Abla also supports library-provided compile-time subparsers. For example, JSON
 can be constructed in either phase with the same source form:
 
 ```abla
-#import("abla/json")
-
+import "abla/json"
 fun main: int {
     val frozen = #$json {"number": 20, "name": "abla"}
     val runtime = $json {"number": 20}
@@ -118,7 +117,7 @@ Projects can import locked packages through typed compile-time source
 providers:
 
 ```abla
-#import(github("AndreBaltazar8/abla-mvc"))
+import github("AndreBaltazar8/abla-mvc")
 ```
 
 Run `build/ablac package update --project .` to resolve/update `abla.lock`;

@@ -114,9 +114,9 @@ then follows calls and address-taken functions. This can remove an unused
 backend body after semantic analysis. It does not prevent the body and its
 imports from participating in earlier phases.
 
-The [import-aliases RFC](import-aliases-and-qualified-resolution.md) replaces
-the prototype `#import(...)` form with an `import` declaration and gives every
-direct edge an optional module alias.
+The module graph now represents each `import` declaration as a structured edge
+with an optional module alias. This RFC extends that edge with contract-only
+projection and consumption semantics.
 
 ## Goals
 

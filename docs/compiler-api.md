@@ -1,13 +1,12 @@
 # Compiler API
 
 Status: bootstrap API, version 0.2. The module is imported with
-`#import("abla/compiler")` and is available only to compile-time code.
+`import "abla/compiler"` and is available only to compile-time code.
 
 The public surface is the compile-time-only `compiler: Compiler` service:
 
 ```abla
-#import("abla/compiler")
-
+import "abla/compiler"
 @client
 fun answer(value: int): int = value + 1
 
@@ -35,9 +34,12 @@ The low-level reflection ABI includes:
 compile extern:"compiler" fun compilerFunctions(): array<int>
 compile extern:"compiler" fun compilerFindFunction(name: string): int
 compile extern:"compiler" fun compilerFunctionName(handle: int): string
+compile extern:"compiler" fun compilerFunctionCanonicalIdentity(handle: int): string
+compile extern:"compiler" fun compilerFunctionModuleIdentity(handle: int): string
 compile extern:"compiler" fun compilerFunctionParameterCount(handle: int): int
 compile extern:"compiler" fun compilerFunctionParameterType(handle: int, parameter: int): string
 compile extern:"compiler" fun compilerFunctionResultType(handle: int): string
+compile extern:"compiler" fun compilerTypeModuleIdentity(handle: int): string
 compile extern:"compiler" fun compilerFunctionIsCompileOnly(handle: int): bool
 compile extern:"compiler" fun compilerFunctionIsTrusted(handle: int): bool
 compile extern:"compiler" fun compilerFunctionIsExternal(handle: int): bool
@@ -51,6 +53,10 @@ lookup will use signature queries rather than changing this function's meaning.
 Compiler API declarations are excluded from enumeration. The returned function
 order follows deterministic semantic declaration order. Type names use the
 canonical compiler spelling (`int` currently reports as `i64`).
+`compilerFunctionName` and reflected type spellings remain source-facing short
+names. Canonical identity and the explicit module-origin queries distinguish
+same-named declarations imported under aliases; neither result depends on the
+consumer's alias spelling.
 
 The VM reads owned IR metadata for handles and never exposes AST, semantic, C++,
 or backend pointers. Marker annotations are retained with source spans, included

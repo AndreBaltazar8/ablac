@@ -1,7 +1,7 @@
-#import("staged_parser.ab")
-#import("package.ab")
-#import("abla/sys/linux/fs")
-#import("abla/sys/linux/process")
+import "staged_parser.ab"
+import "package.ab"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
 
 // Module identity is lexical and deterministic: it does not consult the host
 // filesystem or resolve symlinks. This keeps absent generated inputs, caches,
@@ -54,58 +54,193 @@ fun bootstrapResolveImport(importer: string, requested: string): string {
     bootstrapNormalizeModulePath(result)
 }
 
-class BootstrapImportScan(
-    val imports: array<string>,
-    val providers: array<string>,
-    val errors: int
+class BootstrapImportEdge(
+    val source: string,
+    val provider: bool,
+    val alias: string,
+    val contractOnly: bool,
+    val begin: int,
+    val end: int
 )
 
+class BootstrapImportScan(
+    val edges: array<BootstrapImportEdge>,
+    val errors: int,
+    val diagnostics: string
+)
+
+fun bootstrapImportWordAt(source: string, offset: int, word: string): bool {
+    var equal = offset + word.size <= source.size &&
+        bootstrapRegionEquals(source, offset, offset + word.size, word)
+    if (equal && offset > 0 && bootstrapIsAlphaNumeric(source[offset - 1])) {
+        equal = false
+    }
+    if (equal && offset + word.size < source.size &&
+        bootstrapIsAlphaNumeric(source[offset + word.size])) equal = false
+    equal
+}
+
+fun bootstrapImportAliasValid(alias: string): bool {
+    var valid = alias.size > 0 && bootstrapIsAlpha(alias[0])
+    var index = 1
+    while (valid && index < alias.size) {
+        valid = bootstrapIsAlphaNumeric(alias[index])
+        index = index + 1
+    }
+    if (valid && bootstrapKeyword(alias, 0, alias.size) != "identifier") {
+        valid = false
+    }
+    if (alias == "as" || alias == "contract" || alias == "import") {
+        valid = false
+    }
+    valid
+}
+
 fun bootstrapScanImports(source: string): BootstrapImportScan {
-    val imports: array<string> = []
-    val providers: array<string> = []
+    val edges: array<BootstrapImportEdge> = []
     var errors = 0
+    var diagnostics = ""
     var offset = 0
     var sourceQuoted = false
     var lineComment = false
-    val importMarker = "#"
-    while (offset + 8 <= source.size) {
+    var blockComment = 0
+    var braces = 0
+    while (offset < source.size) {
         if (source[offset] == 10 || source[offset] == 13) lineComment = false
+        if (!sourceQuoted && !lineComment && blockComment == 0 &&
+            source[offset] == 47 &&
+            offset + 1 < source.size && source[offset + 1] == 42) {
+            blockComment = blockComment + 1
+            offset = offset + 2
+            continue
+        }
+        if (blockComment > 0) {
+            if (offset + 1 < source.size && source[offset] == 42 &&
+                source[offset + 1] == 47) {
+                blockComment = blockComment - 1
+                offset = offset + 2
+            } else offset = offset + 1
+            continue
+        }
         if (!sourceQuoted && !lineComment && source[offset] == 47 &&
             offset + 1 < source.size && source[offset + 1] == 47) {
             lineComment = true
         }
-        if (!lineComment && source[offset] == 34 &&
+        if (blockComment == 0 && !lineComment && source[offset] == 34 &&
             (offset == 0 || source[offset - 1] != 92)) {
             sourceQuoted = !sourceQuoted
         }
-        if (!sourceQuoted && !lineComment &&
-            bootstrapRegionEquals(
-                source, offset, offset + 8, "${importMarker}import("
-            )) {
-            val begin = offset + 8
-            var end = begin
-            var depth = 1
-            var quoted = false
-            while (end < source.size && depth > 0) {
-                if (source[end] == 34 &&
-                    (end == begin || source[end - 1] != 92)) quoted = !quoted
-                if (!quoted && source[end] == 40) depth = depth + 1
-                if (!quoted && source[end] == 41) depth = depth - 1
-                if (depth > 0) end = end + 1
+        if (!sourceQuoted && !lineComment && blockComment == 0) {
+            if (source[offset] == 123) braces = braces + 1
+            if (source[offset] == 125 && braces > 0) braces = braces - 1
+        }
+        if (!sourceQuoted && !lineComment && blockComment == 0 &&
+            braces == 0 && bootstrapImportWordAt(source, offset, "import")) {
+            val importBegin = offset
+            var cursor = offset + 6
+            while (cursor < source.size &&
+                (source[cursor] == 32 || source[cursor] == 9)) {
+                cursor = cursor + 1
             }
-            if (end < source.size && depth == 0) {
-                val argument = bootstrapPackageTrim(source.slice(begin, end))
-                if (argument.size >= 2 && argument[0] == 34 &&
-                    argument[argument.size - 1] == 34) {
-                    imports.append(argument.slice(1, argument.size - 1))
-                } else if (argument != "") providers.append(argument)
-                else errors = errors + 1
-            } else errors = errors + 1
+            var contractOnly = false
+            if (bootstrapImportWordAt(source, cursor, "contract")) {
+                contractOnly = true
+                cursor = cursor + 8
+                while (cursor < source.size &&
+                    (source[cursor] == 32 || source[cursor] == 9)) {
+                    cursor = cursor + 1
+                }
+            }
+            val sourceBegin = cursor
+            var sourceEnd = cursor
+            var end = cursor
+            var provider = true
+            var alias = ""
+            if (cursor < source.size && source[cursor] == 34) {
+                provider = false
+                cursor = cursor + 1
+                val valueBegin = cursor
+                while (cursor < source.size &&
+                    (source[cursor] != 34 || source[cursor - 1] == 92)) {
+                    cursor = cursor + 1
+                }
+                sourceEnd = cursor
+                if (cursor < source.size) cursor = cursor + 1
+                end = cursor
+                val requested = source.slice(valueBegin, sourceEnd)
+                while (cursor < source.size &&
+                    (source[cursor] == 32 || source[cursor] == 9)) {
+                    cursor = cursor + 1
+                }
+                if (bootstrapImportWordAt(source, cursor, "as")) {
+                    cursor = cursor + 2
+                    while (cursor < source.size &&
+                        (source[cursor] == 32 || source[cursor] == 9)) {
+                        cursor = cursor + 1
+                    }
+                    val aliasBegin = cursor
+                    while (cursor < source.size &&
+                        bootstrapIsAlphaNumeric(source[cursor])) {
+                        cursor = cursor + 1
+                    }
+                    alias = source.slice(aliasBegin, cursor)
+                    end = cursor
+                }
+                if (requested == "" ||
+                    (alias != "" && !bootstrapImportAliasValid(alias))) {
+                    errors = errors + 1
+                    diagnostics =
+                        "${diagnostics}error[E_IMPORT_ALIAS_INVALID]: import source and alias must be non-empty valid identifiers\nsource[import]:$importBegin:$end\n"
+                } else edges.append(BootstrapImportEdge(
+                    requested, provider, alias, contractOnly, importBegin, end
+                ))
+            } else {
+                var depth = 0
+                var quoted = false
+                var aliasAt = -1
+                while (cursor < source.size &&
+                    !(!quoted && depth == 0 &&
+                      (source[cursor] == 10 || source[cursor] == 13 ||
+                       source[cursor] == 59))) {
+                    if (source[cursor] == 34 &&
+                        (cursor == sourceBegin || source[cursor - 1] != 92)) {
+                        quoted = !quoted
+                    }
+                    if (!quoted && (source[cursor] == 40 ||
+                        source[cursor] == 91)) depth = depth + 1
+                    if (!quoted && (source[cursor] == 41 ||
+                        source[cursor] == 93)) depth = depth - 1
+                    if (!quoted && depth == 0 &&
+                        bootstrapImportWordAt(source, cursor, "as")) {
+                        aliasAt = cursor
+                        sourceEnd = cursor
+                    }
+                    cursor = cursor + 1
+                }
+                end = cursor
+                if (aliasAt >= 0) {
+                    val rawAlias = bootstrapPackageTrim(source.slice(
+                        aliasAt + 2, end
+                    ))
+                    alias = rawAlias
+                } else sourceEnd = end
+                val requested = bootstrapPackageTrim(source.slice(
+                    sourceBegin, sourceEnd
+                ))
+                if (requested == "" ||
+                    (alias != "" && !bootstrapImportAliasValid(alias))) {
+                    errors = errors + 1
+                    diagnostics =
+                        "${diagnostics}error[E_IMPORT_ALIAS_INVALID]: import source and alias must be non-empty valid identifiers\nsource[import]:$importBegin:$end\n"
+                } else edges.append(BootstrapImportEdge(
+                    requested, provider, alias, contractOnly, importBegin, end
+                ))
+            }
             offset = end
         }
         offset = offset + 1
     }
-    BootstrapImportScan(imports, providers, errors)
+    BootstrapImportScan(edges, errors, diagnostics)
 }
 
 fun bootstrapModuleFingerprint(
@@ -207,8 +342,7 @@ fun bootstrapModuleInterfaceIdentity(
 class BootstrapModuleSnapshot(
     val path: string,
     val source: string,
-    val imports: array<string>,
-    val providers: array<string>,
+    val importEdges: array<BootstrapImportEdge>,
     val importErrors: int,
     val exists: bool,
     val size: int,
@@ -320,7 +454,6 @@ class BootstrapModuleState(
             modulePath,
             "",
             [],
-            [],
             0,
             false,
             -1,
@@ -338,8 +471,7 @@ class BootstrapModuleState(
             result = BootstrapModuleSnapshot(
                 modulePath,
                 source,
-                scan.imports,
-                scan.providers,
+                scan.edges,
                 scan.errors,
                 info.exists(),
                 info.size,
@@ -465,10 +597,13 @@ class BootstrapImportProviderDiscovery(
             this.paths.append(identity)
             val snapshot = this.state.acquire(identity)
             this.errors = this.errors + snapshot.importErrors
+            this.diagnostics =
+                "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
             var index = 0
-            while (index < snapshot.imports.size) {
-                this.collect(bootstrapResolveImport(
-                    identity, snapshot.imports[index]
+            while (index < snapshot.importEdges.size) {
+                val edge = snapshot.importEdges[index]
+                if (!edge.provider) this.collect(bootstrapResolveImport(
+                    identity, edge.source
                 ))
                 index = index + 1
             }
@@ -554,32 +689,36 @@ fun bootstrapDiscoverImportProviders(
     var moduleIndex = 0
     while (moduleIndex < discovery.ordered.size) {
         val snapshot = discovery.ordered[moduleIndex]
-        var providerIndex = 0
-        while (providerIndex < snapshot.providers.size) {
-            val provider = bootstrapEvaluateImportProvider(
-                snapshot.providers[providerIndex], discovery.ordered,
-                BootstrapParseResult([], [], 0, 0, [], [], ""),
-                resolve, resolveEffects
-            )
-            discovery.errors = discovery.errors + provider.errors
-            discovery.diagnostics =
-                "${discovery.diagnostics}${provider.diagnostic}"
-            val existing = bootstrapPackageDependencyIndex(
-                dependencies, provider.dependency.name
-            )
-            if (provider.errors == 0 && existing < 0) {
-                dependencies.append(provider.dependency)
+        var edgeIndex = 0
+        while (edgeIndex < snapshot.importEdges.size) {
+            val edge = snapshot.importEdges[edgeIndex]
+            if (edge.provider) {
+                val provider = bootstrapEvaluateImportProvider(
+                    edge.source, discovery.ordered,
+                    BootstrapParseResult([], [], 0, 0, [], [], ""),
+                    resolve, resolveEffects
+                )
+                discovery.errors = discovery.errors + provider.errors
+                discovery.diagnostics =
+                    "${discovery.diagnostics}${provider.diagnostic}"
+                val existing = bootstrapPackageDependencyIndex(
+                    dependencies, provider.dependency.name
+                )
+                if (provider.errors == 0 && existing < 0) {
+                    dependencies.append(provider.dependency)
+                }
+                if (provider.errors == 0 && existing >= 0 &&
+                    (dependencies[existing].source !=
+                        provider.dependency.source ||
+                     dependencies[existing].selectorKind !=
+                        provider.dependency.selectorKind ||
+                     dependencies[existing].selector !=
+                        provider.dependency.selector)) {
+                    discovery.errors = discovery.errors + 1
+                    discovery.diagnostics = "${discovery.diagnostics}error[E_PACKAGE_COLLISION]: import providers request incompatible sources or selectors for dependency '${provider.dependency.name}'\n"
+                }
             }
-            if (provider.errors == 0 && existing >= 0 &&
-                (dependencies[existing].source != provider.dependency.source ||
-                 dependencies[existing].selectorKind !=
-                    provider.dependency.selectorKind ||
-                 dependencies[existing].selector !=
-                    provider.dependency.selector)) {
-                discovery.errors = discovery.errors + 1
-                discovery.diagnostics = "${discovery.diagnostics}error[E_PACKAGE_COLLISION]: import providers request incompatible sources or selectors for dependency '${provider.dependency.name}'\n"
-            }
-            providerIndex = providerIndex + 1
+            edgeIndex = edgeIndex + 1
         }
         moduleIndex = moduleIndex + 1
     }
@@ -783,14 +922,391 @@ class BootstrapModule(
     val source: string
 )
 
+class BootstrapModuleAlias(
+    val importer: string,
+    val target: string,
+    val alias: string,
+    val contractOnly: bool,
+    val begin: int,
+    val end: int
+)
+
+fun bootstrapModuleCanonicalPrefix(modulePath: string): string {
+    val digits = "0123456789abcdef"
+    var prefix = "__abla_module_"
+    var index = 0
+    while (index < modulePath.size) {
+        val byte = modulePath[index]
+        prefix = "$prefix${digits.slice(byte / 16, byte / 16 + 1)}"
+        prefix = "$prefix${digits.slice(byte - (byte / 16) * 16,
+            byte - (byte / 16) * 16 + 1)}"
+        index = index + 1
+    }
+    "${prefix}__"
+}
+
+fun bootstrapModuleAliasTargetPrefix(
+    aliases: array<BootstrapModuleAlias>,
+    target: string
+): string {
+    var prefix = ""
+    var index = 0
+    while (index < aliases.size && prefix == "") {
+        if (aliases[index].target == target && aliases[index].alias != "") {
+            prefix = bootstrapModuleCanonicalPrefix(target)
+        }
+        index = index + 1
+    }
+    prefix
+}
+
+fun bootstrapExpressionDeclaresAliasBefore(
+    expression: BootstrapExpression,
+    alias: string,
+    position: int
+): bool {
+    var found = (expression.kind == "local.val" ||
+        expression.kind == "local.var") &&
+        expression.text == alias && expression.begin <= position
+    var child = 0
+    while (child < expression.children.size && !found) {
+        found = bootstrapExpressionDeclaresAliasBefore(
+            expression.children[child], alias, position
+        )
+        child = child + 1
+    }
+    found
+}
+
+fun bootstrapAliasShadowedAt(
+    parsed: BootstrapParseResult,
+    alias: string,
+    position: int
+): bool {
+    var shadowed = false
+    var declaration = 0
+    while (declaration < parsed.declarations.size && !shadowed) {
+        val found = parsed.declarations[declaration]
+        if (position >= found.begin && position <= found.end) {
+            var parameter = 0
+            while (parameter < found.parameters.size && !shadowed) {
+                if (found.parameters[parameter] == alias) shadowed = true
+                parameter = parameter + 1
+            }
+            if (!shadowed) shadowed = bootstrapExpressionDeclaresAliasBefore(
+                found.expression, alias, position
+            )
+        }
+        declaration = declaration + 1
+    }
+    shadowed
+}
+
+fun bootstrapRewriteModuleSource(
+    snapshot: BootstrapModuleSnapshot,
+    aliases: array<BootstrapModuleAlias>
+): string {
+    val names: array<string> = []
+    val replacements: array<string> = []
+    val ownPrefix = bootstrapModuleAliasTargetPrefix(
+        aliases, snapshot.path
+    )
+    if (ownPrefix != "") {
+        var declaration = 0
+        while (declaration < snapshot.discovery.declarations.size) {
+            val name = snapshot.discovery.declarations[declaration].name
+            if (name != "") {
+                names.append(name)
+                replacements.append("$ownPrefix$name")
+            }
+            declaration = declaration + 1
+        }
+    }
+    val localAliases: array<string> = []
+    val aliasPrefixes: array<string> = []
+    var aliasIndex = 0
+    while (aliasIndex < aliases.size) {
+        val edge = aliases[aliasIndex]
+        if (edge.importer == snapshot.path && edge.alias != "") {
+            localAliases.append(edge.alias)
+            aliasPrefixes.append(bootstrapModuleCanonicalPrefix(edge.target))
+        }
+        aliasIndex = aliasIndex + 1
+    }
+    if (names.size == 0 && localAliases.size == 0) snapshot.source
+    else {
+        val tokens = bootstrapLex(snapshot.source)
+        var output = ""
+        var cursor = 0
+        var tokenIndex = 0
+        var inImport = false
+        while (tokenIndex < tokens.size) {
+            val token = tokens[tokenIndex]
+            if (token.kind == "import") inImport = true
+            if (token.kind == "newline" || token.kind == ";") {
+                inImport = false
+            }
+            var qualified = -1
+            if (!inImport && token.kind == "identifier" &&
+                tokenIndex + 2 < tokens.size &&
+                tokens[tokenIndex + 1].kind == "." &&
+                tokens[tokenIndex + 2].kind == "identifier") {
+                val qualifier = bootstrapTokenText(snapshot.source, token)
+                var candidate = 0
+                while (candidate < localAliases.size && qualified < 0) {
+                    if (localAliases[candidate] == qualifier) {
+                        qualified = candidate
+                    }
+                    candidate = candidate + 1
+                }
+                if (qualified >= 0 && bootstrapAliasShadowedAt(
+                    snapshot.discovery, qualifier, token.begin
+                )) qualified = -1
+            }
+            if (qualified >= 0) {
+                val member = tokens[tokenIndex + 2]
+                output = "$output${snapshot.source.slice(cursor, token.begin)}"
+                output = "$output${aliasPrefixes[qualified]}${bootstrapTokenText(
+                    snapshot.source, member
+                )}"
+                cursor = member.end
+                tokenIndex = tokenIndex + 3
+            } else {
+                var replacement = -1
+                if (!inImport && token.kind == "identifier" &&
+                    (tokenIndex == 0 ||
+                     tokens[tokenIndex - 1].kind != ".")) {
+                    val text = bootstrapTokenText(snapshot.source, token)
+                    var candidate = 0
+                    while (candidate < names.size && replacement < 0) {
+                        if (names[candidate] == text) replacement = candidate
+                        candidate = candidate + 1
+                    }
+                }
+                if (replacement >= 0) {
+                    output =
+                        "$output${snapshot.source.slice(cursor, token.begin)}${replacements[replacement]}"
+                    cursor = token.end
+                }
+                tokenIndex = tokenIndex + 1
+            }
+        }
+        "$output${snapshot.source.slice(cursor, snapshot.source.size)}"
+    }
+}
+
+fun bootstrapPrepareModuleSnapshot(
+    snapshot: BootstrapModuleSnapshot,
+    aliases: array<BootstrapModuleAlias>
+): BootstrapModuleSnapshot {
+    val source = bootstrapRewriteModuleSource(snapshot, aliases)
+    BootstrapModuleSnapshot(
+        snapshot.path,
+        source,
+        snapshot.importEdges,
+        snapshot.importErrors,
+        snapshot.exists,
+        snapshot.size,
+        snapshot.revision,
+        bootstrapModuleFingerprint(source, 17, 257, 1000000007),
+        bootstrapModuleFingerprint(source, 97, 263, 1000000009),
+        bootstrapParseWithIdentity(source, snapshot.path)
+    )
+}
+
+fun bootstrapImportAliasExposedTarget(target: string): string {
+    var exposed = target
+    if (target.size >= 9 &&
+        target.slice(target.size - 9, target.size) == "/entry.ab") {
+        val source = Path(target).readText()
+        val scan = bootstrapScanImports(source)
+        val parsed = bootstrapParseWithIdentity(source, target)
+        if (parsed.declarations.size == 0 && scan.errors == 0 &&
+            scan.edges.size == 1 && !scan.edges[0].provider &&
+            scan.edges[0].alias == "") {
+            exposed = bootstrapResolveImport(target, scan.edges[0].source)
+        }
+    }
+    exposed
+}
+
+class BootstrapImportAliasValidation(
+    val errors: int,
+    val diagnostics: string
+)
+
+fun bootstrapValidateImportAliases(
+    aliases: array<BootstrapModuleAlias>,
+    state: BootstrapModuleState
+): BootstrapImportAliasValidation {
+    var errors = 0
+    var diagnostics = ""
+    var aliasIndex = 0
+    while (aliasIndex < aliases.size) {
+        val edge = aliases[aliasIndex]
+        if (edge.alias != "") {
+            val importerIndex = state.indexOf(edge.importer)
+            val targetIndex = state.indexOf(edge.target)
+            if (importerIndex >= 0 && targetIndex >= 0) {
+                val importer = state.snapshots[importerIndex]
+                val target = state.snapshots[targetIndex]
+                val tokens = bootstrapLex(importer.source)
+                var tokenIndex = 0
+                var inImport = false
+                while (tokenIndex < tokens.size) {
+                    val token = tokens[tokenIndex]
+                    if (token.kind == "import") inImport = true
+                    if (token.kind == "newline" || token.kind == ";") {
+                        inImport = false
+                    }
+                    if (!inImport && token.kind == "identifier" &&
+                        bootstrapTokenText(importer.source, token) ==
+                            edge.alias &&
+                        !bootstrapAliasShadowedAt(
+                            importer.discovery, edge.alias, token.begin
+                        )) {
+                        if (tokenIndex + 2 < tokens.size &&
+                            tokens[tokenIndex + 1].kind == "." &&
+                            tokens[tokenIndex + 2].kind == "identifier") {
+                            val member = bootstrapTokenText(
+                                importer.source,
+                                tokens[tokenIndex + 2]
+                            )
+                            var exposed = false
+                            var declaration = 0
+                            while (declaration <
+                                target.discovery.declarations.size) {
+                                if (target.discovery.declarations[
+                                    declaration
+                                ].name == member) exposed = true
+                                declaration = declaration + 1
+                            }
+                            if (!exposed) {
+                                errors = errors + 1
+                                diagnostics =
+                                    "${diagnostics}error[E_IMPORT_ALIAS_MEMBER_UNKNOWN]: module alias `${edge.alias}` has no exposed declaration named `$member`\ncontext[canonical-module]: ${edge.target}\nsource[qualified-import]:${edge.importer}:${token.begin}:${tokens[tokenIndex + 2].end}\n"
+                            }
+                            tokenIndex = tokenIndex + 2
+                        } else {
+                            errors = errors + 1
+                            diagnostics =
+                                "${diagnostics}error[E_IMPORT_ALIAS_USED_AS_VALUE]: module alias `${edge.alias}` is compile-time-only and must qualify a declaration\ncontext[canonical-module]: ${edge.target}\nsource[qualified-import]:${edge.importer}:${token.begin}:${token.end}\n"
+                        }
+                    }
+                    tokenIndex = tokenIndex + 1
+                }
+            }
+        }
+        aliasIndex = aliasIndex + 1
+    }
+    BootstrapImportAliasValidation(errors, diagnostics)
+}
+
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
     var errors: int,
     val state: BootstrapModuleState,
     val orderedSnapshots: array<BootstrapModuleSnapshot>,
     val authorizedCompileCapabilities: array<string>,
-    var diagnostics: string
+    var diagnostics: string,
+    val aliases: array<BootstrapModuleAlias>
 ) {
+    fun recordImportEdge(
+        importer: BootstrapModuleSnapshot,
+        edge: BootstrapImportEdge,
+        target: string
+    ): void {
+        var duplicateAlias = false
+        var duplicateTarget = false
+        var index = 0
+        while (index < this.aliases.size) {
+            val found = this.aliases[index]
+            if (found.importer == importer.path && edge.alias != "" &&
+                found.alias == edge.alias) duplicateAlias = true
+            if (found.importer == importer.path && found.target == target) {
+                duplicateTarget = true
+            }
+            index = index + 1
+        }
+        var declarationCollision = false
+        index = 0
+        while (index < importer.discovery.declarations.size) {
+            if (edge.alias != "" &&
+                importer.discovery.declarations[index].name == edge.alias) {
+                declarationCollision = true
+            }
+            index = index + 1
+        }
+        var unqualifiedAmbiguities = 0
+        var ambiguityDiagnostics = ""
+        if (edge.alias == "") {
+            val targetDeclarations = bootstrapParseWithIdentity(
+                Path(target).readText(), target
+            ).declarations
+            index = 0
+            while (index < this.aliases.size) {
+                val found = this.aliases[index]
+                if (found.importer == importer.path && found.alias == "" &&
+                    found.target != target) {
+                    val foundDeclarations = bootstrapParseWithIdentity(
+                        Path(found.target).readText(), found.target
+                    ).declarations
+                    var targetDeclaration = 0
+                    while (targetDeclaration < targetDeclarations.size) {
+                        var foundDeclaration = 0
+                        while (foundDeclaration < foundDeclarations.size) {
+                            val name = targetDeclarations[
+                                targetDeclaration
+                            ].name
+                            if (name != "" && name == foundDeclarations[
+                                foundDeclaration
+                            ].name) {
+                                unqualifiedAmbiguities =
+                                    unqualifiedAmbiguities + 1
+                                ambiguityDiagnostics =
+                                    "${ambiguityDiagnostics}error[E_IMPORT_UNQUALIFIED_AMBIGUOUS]: unqualified declaration `$name` is exposed by both `${found.target}` and `$target`; add explicit aliases\nsource[import]:${importer.path}:${edge.begin}:${edge.end}\n"
+                            }
+                            foundDeclaration = foundDeclaration + 1
+                        }
+                        targetDeclaration = targetDeclaration + 1
+                    }
+                }
+                index = index + 1
+            }
+        }
+        if (duplicateAlias) {
+            this.errors = this.errors + 1
+            this.diagnostics =
+                "${this.diagnostics}error[E_IMPORT_ALIAS_DUPLICATE]: import alias `${edge.alias}` is bound more than once in module `${importer.path}`\nsource[import]:${importer.path}:${edge.begin}:${edge.end}\n"
+        }
+        if (declarationCollision) {
+            this.errors = this.errors + 1
+            this.diagnostics =
+                "${this.diagnostics}error[E_IMPORT_ALIAS_DECLARATION_COLLISION]: import alias `${edge.alias}` collides with a declaration in module `${importer.path}`\nsource[import]:${importer.path}:${edge.begin}:${edge.end}\n"
+        }
+        if (duplicateTarget) {
+            this.errors = this.errors + 1
+            this.diagnostics =
+                "${this.diagnostics}error[E_IMPORT_ALIAS_TARGET_DUPLICATE]: module `$target` is imported more than once by `${importer.path}`\nsource[import]:${importer.path}:${edge.begin}:${edge.end}\n"
+        }
+        if (unqualifiedAmbiguities > 0) {
+            this.errors = this.errors + unqualifiedAmbiguities
+            this.diagnostics =
+                "${this.diagnostics}$ambiguityDiagnostics"
+        }
+        if (!duplicateAlias && !declarationCollision && !duplicateTarget &&
+            unqualifiedAmbiguities == 0) {
+            this.aliases.append(BootstrapModuleAlias(
+                importer.path,
+                target,
+                edge.alias,
+                edge.contractOnly,
+                edge.begin,
+                edge.end
+            ))
+        }
+        bootstrapSemanticUnit()
+    }
     fun contains(modulePath: string): bool {
         val identity = bootstrapNormalizeModulePath(modulePath)
         var found = false
@@ -819,42 +1335,49 @@ class BootstrapModuleGraph(
         if (!this.contains(identity)) {
             val snapshot = this.state.acquire(identity)
             this.errors = this.errors + snapshot.importErrors
-            var importError = 0
-            while (importError < snapshot.importErrors) {
-                this.diagnostics =
-                    "${this.diagnostics}error[E_IMPORT_SYNTAX]: malformed import declaration in module `$identity`\nsource[import]:$identity:0:0\n"
-                importError = importError + 1
-            }
+            this.diagnostics =
+                "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
             this.modules.append(BootstrapModule(identity, snapshot.source))
             var index = 0
-            while (index < snapshot.imports.size) {
-                val imported = bootstrapResolveImport(
-                    identity,
-                    snapshot.imports[index]
-                )
-                output = "$output${this.load(imported)}\n"
-                index = index + 1
-            }
-            index = 0
-            while (index < snapshot.providers.size) {
-                val provider = bootstrapEvaluateImportProvider(
-                    snapshot.providers[index], this.orderedSnapshots,
-                    snapshot.discovery
-                )
-                if (provider.errors == 0) {
-                    val imported = bootstrapResolvePackageImport(
-                        identity, "package/${provider.dependency.name}"
+            while (index < snapshot.importEdges.size) {
+                val edge = snapshot.importEdges[index]
+                if (!edge.provider) {
+                    val imported = bootstrapResolveImport(
+                        identity,
+                        edge.source
                     )
-                    if (imported != "") output = "$output${this.load(imported)}\n"
-                    else {
-                        this.errors = this.errors + 1
-                        this.diagnostics =
-                            "${this.diagnostics}error[E_PACKAGE_IMPORT]: locked package `${provider.dependency.name}` could not be resolved from module `$identity`\n"
-                    }
+                    this.recordImportEdge(
+                        snapshot,
+                        edge,
+                        bootstrapImportAliasExposedTarget(imported)
+                    )
+                    output = "$output${this.load(imported)}\n"
                 } else {
-                    this.errors = this.errors + provider.errors
-                    this.diagnostics =
-                        "${this.diagnostics}${provider.diagnostic}"
+                    val provider = bootstrapEvaluateImportProvider(
+                        edge.source, this.orderedSnapshots,
+                        snapshot.discovery
+                    )
+                    if (provider.errors == 0) {
+                        val imported = bootstrapResolvePackageImport(
+                            identity, "package/${provider.dependency.name}"
+                        )
+                        if (imported != "") {
+                            this.recordImportEdge(
+                                snapshot,
+                                edge,
+                                bootstrapImportAliasExposedTarget(imported)
+                            )
+                            output = "$output${this.load(imported)}\n"
+                        } else {
+                            this.errors = this.errors + 1
+                            this.diagnostics =
+                                "${this.diagnostics}error[E_PACKAGE_IMPORT]: locked package `${provider.dependency.name}` could not be resolved from module `$identity`\n"
+                        }
+                    } else {
+                        this.errors = this.errors + provider.errors
+                        this.diagnostics =
+                            "${this.diagnostics}${provider.diagnostic}"
+                    }
                 }
                 index = index + 1
             }
@@ -871,9 +1394,22 @@ class BootstrapModuleGraph(
         val compileInputContents: array<string> = []
         val handlerDeclarations: array<BootstrapDeclaration> = []
         val importedRegistrations: array<BootstrapSubparserRegistration> = []
-        var parseErrors = this.errors
+        val preparedSnapshots: array<BootstrapModuleSnapshot> = []
+        var preparedIndex = 0
+        while (preparedIndex < this.orderedSnapshots.size) {
+            preparedSnapshots.append(bootstrapPrepareModuleSnapshot(
+                this.orderedSnapshots[preparedIndex],
+                this.aliases
+            ))
+            preparedIndex = preparedIndex + 1
+        }
+        val aliasValidation = bootstrapValidateImportAliases(
+            this.aliases, this.state
+        )
+        var parseErrors = this.errors + aliasValidation.errors
         var extensionErrors = 0
-        var parseDiagnostics = this.diagnostics
+        var parseDiagnostics =
+            "${this.diagnostics}${aliasValidation.diagnostics}"
         var dependencyFingerprint = 29
         var authorizedEffects = 0
         var authorized = 0
@@ -890,8 +1426,8 @@ class BootstrapModuleGraph(
         val completeDeclarations: array<BootstrapDeclaration> = []
         var completeDeclarationFingerprint = 41
         var requestedModule = 0
-        while (requestedModule < this.orderedSnapshots.size) {
-            val requestedSnapshot = this.orderedSnapshots[requestedModule]
+        while (requestedModule < preparedSnapshots.size) {
+            val requestedSnapshot = preparedSnapshots[requestedModule]
             requestedEffects = bootstrapCompileEffectMerge(
                 requestedEffects,
                 bootstrapBuildCompileEffectRequests(
@@ -930,8 +1466,8 @@ class BootstrapModuleGraph(
             completeDeclarationFingerprint
         var moduleIndex = 0
         var currentDeclarationBegin = 0
-        while (moduleIndex < this.orderedSnapshots.size) {
-            val snapshot = this.orderedSnapshots[moduleIndex]
+        while (moduleIndex < preparedSnapshots.size) {
+            val snapshot = preparedSnapshots[moduleIndex]
             val visibleDeclarations: array<BootstrapDeclaration> = []
             var declarationIndex = 0
             while (declarationIndex < handlerDeclarations.size) {
@@ -1083,7 +1619,9 @@ fun bootstrapBundleWithState(
     state.refreshedParsed = 0
     val modules: array<BootstrapModule> = []
     val ordered: array<BootstrapModuleSnapshot> = []
-    BootstrapModuleGraph(modules, 0, state, ordered, [], "").load(modulePath)
+    BootstrapModuleGraph(modules, 0, state, ordered, [], "", []).load(
+        modulePath
+    )
 }
 
 fun bootstrapBundle(modulePath: string): string {
@@ -1099,7 +1637,7 @@ fun bootstrapParseModuleWithState(
     state.refreshed = 0
     state.reusedParsed = 0
     state.refreshedParsed = 0
-    val graph = BootstrapModuleGraph([], 0, state, [], [], "")
+    val graph = BootstrapModuleGraph([], 0, state, [], [], "", [])
     graph.load(modulePath)
     graph.parse()
 }

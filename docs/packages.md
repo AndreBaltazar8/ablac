@@ -4,13 +4,23 @@ Abla package imports are typed compile-time source expressions. The concise
 GitHub form is:
 
 ```abla
-#import(github("AndreBaltazar8/abla-mvc"))
+import github("AndreBaltazar8/abla-mvc")
 ```
 
 `github(...)` returns `ImportSource`; it is not a special import syntax and it
 does not fetch while parsing or during an ordinary build. Libraries can return
 the same type from their own compile functions, including providers that do not
 use Git.
+
+The surrounding import may bind any provider result to a local namespace:
+
+```abla
+import github("AndreBaltazar8/abla-mvc") as mvc
+```
+
+The alias affects source lookup only. Lock identity, vendoring, offline cache
+keys, and canonical declarations continue to use the resolved package and
+module identity.
 
 ## The source protocol
 
@@ -60,7 +70,7 @@ compile fun generatedMvc(): ImportSource = importSource(
     resolveGeneratedMvc
 )
 
-#import(generatedMvc())
+import generatedMvc()
 ```
 
 This protocol can represent generated code, an internal registry, an archive,
@@ -82,7 +92,7 @@ compile fun companyMvc(): ImportSource = gitImportSource(
     "v0.1.0"
 )
 
-#import(companyMvc())
+import companyMvc()
 ```
 
 Provider expressions may compute names, identities, and selectors using pure
