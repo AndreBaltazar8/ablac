@@ -74,6 +74,57 @@ before a read. An untyped deferred declaration and a deferred `val` are
 rejected; `val` continues to receive its value at its declaration until
 single-assignment path merging is implemented.
 
+### Delegated bindings
+
+A local or top-level `val`/`var` may store a policy object while exposing the
+value returned by that object's accessors:
+
+```abla
+class ClampedInt(var current: int, val minimum: int, val maximum: int) {
+    fun getValue(): int = current
+    fun setValue(next: int): void {
+        if (next < minimum) current = minimum
+        else if (next > maximum) current = maximum
+        else current = next
+        return
+    }
+}
+
+var volume: int by ClampedInt(40, 0, 100)
+volume = 140                         // setValue(140), result is 140
+val stored = volume                  // one getValue(), observes 100
+^volume = ClampedInt(20, 0, 50)      // replaces the stored delegate
+```
+
+`val/var name [: Exposed] by delegate` evaluates `delegate` exactly once. If
+`Exposed` is omitted, it is inferred from the unambiguous zero-argument
+`getValue` result. A delegated `var` additionally requires
+`setValue(Exposed): void`; a delegated `val` does not. Every ordinary read
+calls `getValue` once, and every ordinary assignment evaluates its right-hand
+side once and calls `setValue` once. The assignment result remains the
+converted attempted value and does not perform an extra getter call.
+
+Prefix `^` projects the stored delegate rather than the exposed value.
+Ordinary arguments therefore remain value-oriented, while `inspect(^volume)`
+uses the delegate's static type and the normal parameter, borrow, and ownership
+rules. Only a delegated `var` permits `^volume = replacement`, and the
+replacement must have the same static delegate type. Its expression is
+evaluated before an affine old delegate is dropped. `move(^volume)` is rejected
+because it would leave the exposed binding without initialized storage.
+
+A closure captures the live delegate slot, not a getter snapshot. Captured
+`var` replacement remains visible through the existing shared capture cell.
+Top-level delegates follow normal deterministic initializer order. Delegate
+getters and setters retain their ordinary transitive effects in staged and
+runtime code; a denied compiler capability is not hidden by delegated syntax.
+An owned affine getter result is rejected, while the delegate itself may be
+affine and is dropped once under the usual scope/reassignment rules.
+
+Compile-time binding reflection reports delegation, exposed and delegate
+types, mutability, selected getter/setter handles, replacement permission, and
+the `by` span. Reflection exposes metadata only; the live delegate is available
+solely through source-level `^binding`.
+
 Function declarations may omit `()` only when they have no parameters. This
 retains prototype compatibility. Trailing lambdas are supported. Lambdas are
 lexical closures: captured bindings outlive their declaring call, nested

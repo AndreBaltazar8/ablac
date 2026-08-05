@@ -5,6 +5,10 @@ fun bootstrapSemanticUnit(): void {}
 fun bootstrapPlaceRootName(expression: BootstrapExpression): string {
     var root = ""
     if (expression.kind == "identifier") root = expression.text
+    if (expression.kind == "delegate.project" &&
+        expression.children.size == 1) {
+        root = bootstrapPlaceRootName(expression.children[0])
+    }
     if ((expression.kind == "member" || expression.kind == "index") &&
         expression.children.size > 0) {
         root = bootstrapPlaceRootName(expression.children[0])
@@ -16,6 +20,8 @@ fun bootstrapOwnershipPlaceKey(expression: BootstrapExpression): string {
     var key = ""
     var place = expression
     if (place.kind == "call" && place.text == "move" &&
+        place.children.size == 1) place = place.children[0]
+    if (place.kind == "delegate.project" &&
         place.children.size == 1) place = place.children[0]
     if (place.kind == "identifier") key = place.text
     if (place.kind == "member" && place.children.size > 0) {
@@ -85,6 +91,8 @@ fun bootstrapCollectOwnershipPlace(
         place.children.size == 1) {
         place = place.children[0]
     }
+    if (place.kind == "delegate.project" &&
+        place.children.size == 1) place = place.children[0]
     if (place.kind == "identifier") {
         kinds.append(0)
         values.append(place.text)
@@ -853,6 +861,66 @@ noescape extern:"c" fun ablaCompilerTypeNeedsNormalization(
 fun bootstrapNormalizeType(type: string): string =
     if (ablaCompilerTypeNeedsNormalization(type, type.size) != 0)
         bootstrapNormalizeTypeSlow(type)
+    else type
+
+// Delegated bindings store the delegate type while ordinary lookup exposes a
+// different type. Length-prefixing keeps nested array/function type syntax
+// unambiguous without introducing a runtime wrapper.
+fun bootstrapDelegatedType(
+    mutable: bool,
+    storageType: string,
+    exposedType: string
+): string = "delegate@${if (mutable) 1 else 0}@${storageType.size}:$storageType$exposedType"
+
+fun bootstrapIsDelegatedType(type: string): bool =
+    type.size > 12 && type.slice(0, 9) == "delegate@" &&
+    (type[9] == 48 || type[9] == 49) && type[10] == 64
+
+fun bootstrapDelegatedTypeSeparator(type: string): int {
+    var separator = -1
+    var index = 11
+    while (separator < 0 && index < type.size) {
+        if (type[index] == 58) separator = index
+        index = index + 1
+    }
+    separator
+}
+
+fun bootstrapDelegatedStorageType(type: string): string {
+    var result = "unknown"
+    if (bootstrapIsDelegatedType(type)) {
+        val separator = bootstrapDelegatedTypeSeparator(type)
+        if (separator > 11) {
+            val length = bootstrapDecimalIndex(type.slice(11, separator))
+            val begin = separator + 1
+            if (length >= 0 && begin + length <= type.size) {
+                result = type.slice(begin, begin + length)
+            }
+        }
+    }
+    result
+}
+
+fun bootstrapDelegatedExposedType(type: string): string {
+    var result = "unknown"
+    if (bootstrapIsDelegatedType(type)) {
+        val separator = bootstrapDelegatedTypeSeparator(type)
+        if (separator > 11) {
+            val length = bootstrapDecimalIndex(type.slice(11, separator))
+            val begin = separator + 1
+            if (length >= 0 && begin + length <= type.size) {
+                result = type.slice(begin + length, type.size)
+            }
+        }
+    }
+    result
+}
+
+fun bootstrapDelegatedIsMutable(type: string): bool =
+    bootstrapIsDelegatedType(type) && type[9] == 49
+
+fun bootstrapDelegatedStorageOrSelf(type: string): string =
+    if (bootstrapIsDelegatedType(type)) bootstrapDelegatedStorageType(type)
     else type
 
 fun bootstrapIsNullableType(type: string): bool =
@@ -1684,6 +1752,74 @@ fun bootstrapExpressionCompileEffects(
     mask
 }
 
+fun bootstrapCollectDelegatedNames(
+    expression: BootstrapExpression,
+    var names: array<string>
+): void {
+    if ((expression.kind == "local.val" ||
+         expression.kind == "local.var") &&
+        expression.children.size > 0 &&
+        expression.children[0].kind == "delegate.initializer" &&
+        !bootstrapAffineNamesContain(names, expression.text)) {
+        names.append(expression.text)
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapCollectDelegatedNames(expression.children[child], names)
+        child = child + 1
+    }
+}
+
+fun bootstrapExpressionDelegatedCompileEffects(
+    expression: BootstrapExpression,
+    summary: BootstrapCompileEffectSummary,
+    delegatedNames: array<string>
+): int {
+    var mask = 0
+    if (expression.kind == "identifier" &&
+        bootstrapAffineNamesContain(delegatedNames, expression.text)) {
+        mask = bootstrapCompileEffectLookup(summary, "getValue", true)
+    }
+    if (expression.kind == "assign" &&
+        bootstrapAffineNamesContain(delegatedNames, expression.text)) {
+        mask = bootstrapCompileEffectLookup(summary, "setValue", true)
+    }
+    if (expression.kind == "call" && expression.text != "move" &&
+        expression.text != "Shared" && expression.text != "Mutex" &&
+        expression.text != "Cell") {
+        mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
+            summary,
+            expression.text,
+            false
+        ))
+    }
+    if (expression.kind == "member.call") {
+        mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
+            summary,
+            expression.text,
+            true
+        ))
+    }
+    var begin = 0
+    var end = expression.children.size
+    if (expression.kind == "delegate.project") end = 0
+    if (expression.kind == "delegate.assign") begin = 1
+    if (expression.kind == "delegate.initializer") end = 1
+    var child = begin
+    while (child < end) {
+        mask = bootstrapCompileEffectMerge(
+            mask,
+            bootstrapExpressionDelegatedCompileEffects(
+                expression.children[child],
+                summary,
+                delegatedNames
+            )
+        )
+        child = child + 1
+    }
+    mask
+}
+
 fun bootstrapBuildCompileEffectSummary(
     declarations: array<BootstrapDeclaration>
 ): BootstrapCompileEffectSummary {
@@ -1725,6 +1861,16 @@ fun bootstrapBuildCompileEffectSummary(
         declarationIndex = declarationIndex + 1
     }
     val summary = BootstrapCompileEffectSummary(names, methodNames, masks)
+    val globalDelegatedNames: array<string> = []
+    declarationIndex = 0
+    while (declarationIndex < declarations.size) {
+        val declaration = declarations[declarationIndex]
+        if (bootstrapDeclarationIsValue(declaration.kind) &&
+            declaration.expression.kind == "delegate.initializer") {
+            globalDelegatedNames.append(declaration.name)
+        }
+        declarationIndex = declarationIndex + 1
+    }
     var changed = true
     var round = 0
     while (changed && round <= names.size) {
@@ -1737,9 +1883,22 @@ fun bootstrapBuildCompileEffectSummary(
                 declaration.kind == "compile.fun" ||
                 declaration.kind == "extern") {
                 if (declaration.kind != "extern") {
-                    val inferred = bootstrapExpressionCompileEffects(
+                    val delegatedNames: array<string> = []
+                    var globalDelegate = 0
+                    while (globalDelegate < globalDelegatedNames.size) {
+                        delegatedNames.append(
+                            globalDelegatedNames[globalDelegate]
+                        )
+                        globalDelegate = globalDelegate + 1
+                    }
+                    bootstrapCollectDelegatedNames(
                         declaration.expression,
-                        summary
+                        delegatedNames
+                    )
+                    val inferred = bootstrapExpressionDelegatedCompileEffects(
+                        declaration.expression,
+                        summary,
+                        delegatedNames
                     )
                     val merged = bootstrapCompileEffectMerge(
                         masks[entry],
@@ -1754,9 +1913,22 @@ fun bootstrapBuildCompileEffectSummary(
             while (methodIndex < declaration.methods.size) {
                 val method = declaration.methods[methodIndex]
                 if (method.kind != "extern") {
-                    val inferred = bootstrapExpressionCompileEffects(
+                    val delegatedNames: array<string> = []
+                    var globalDelegate = 0
+                    while (globalDelegate < globalDelegatedNames.size) {
+                        delegatedNames.append(
+                            globalDelegatedNames[globalDelegate]
+                        )
+                        globalDelegate = globalDelegate + 1
+                    }
+                    bootstrapCollectDelegatedNames(
                         method.expression,
-                        summary
+                        delegatedNames
+                    )
+                    val inferred = bootstrapExpressionDelegatedCompileEffects(
+                        method.expression,
+                        summary,
+                        delegatedNames
                     )
                     val merged = bootstrapCompileEffectMerge(
                         masks[entry],
@@ -2524,12 +2696,58 @@ class BootstrapAnalyzer(
     var yieldedType: string,
     val allowContractCalls: bool
 ) {
+    fun expressionCompileEffects(expression: BootstrapExpression): int {
+        val delegatedNames: array<string> = []
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            val candidate = this.declarations[declaration]
+            if (bootstrapDeclarationIsValue(candidate.kind) &&
+                candidate.expression.kind == "delegate.initializer") {
+                delegatedNames.append(candidate.name)
+            }
+            declaration = declaration + 1
+        }
+        bootstrapCollectDelegatedNames(expression, delegatedNames)
+        bootstrapExpressionDelegatedCompileEffects(
+            expression,
+            this.compileEffects,
+            delegatedNames
+        )
+    }
+
     fun fail(code: string) {
         this.errors = this.errors + 1
         if (code.size >= 27 &&
             code.slice(0, 27) == "contract.call.not-consumed:") {
             this.diagnostics =
                 "${this.diagnostics}error[E_CONTRACT_CALL_NOT_CONSUMED]: contract-only function `${code.slice(27, code.size)}` has no local implementation\n"
+        } else if (code.size >= 24 &&
+            code.slice(0, 24) == "delegate.getter-missing:") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_DELEGATE_GETTER_MISSING]: ${code.slice(24, code.size)}\n"
+        } else if (code.size >= 24 &&
+            code.slice(0, 24) == "delegate.setter-missing:") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_DELEGATE_SETTER_MISSING]: ${code.slice(24, code.size)}\n"
+        } else if (code.size >= 23 &&
+            code.slice(0, 23) == "delegate.not-delegated:") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_NOT_DELEGATED]: ${code.slice(23, code.size)}\n"
+        } else if (code.size >= 21 &&
+            code.slice(0, 21) == "delegate.replace-val:") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_DELEGATE_REPLACE_VAL]: ${code.slice(21, code.size)}\n"
+        } else if (code.size >= 22 &&
+            code.slice(0, 22) == "delegate.affine-value:") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_DELEGATE_AFFINE_VALUE]: ${code.slice(22, code.size)}\n"
+        } else if (code.size >= 23 &&
+            code.slice(0, 23) == "delegate.type-mismatch:") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_DELEGATE_TYPE_MISMATCH]: ${code.slice(23, code.size)}\n"
+        } else if (code == "delegate.move-projection") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_DELEGATE_MOVE_PROJECTION]: a delegate projection cannot be consumed with `move`\n"
         } else if (this.currentGeneratedNamespace != "") {
             this.extensionErrors = this.extensionErrors + 1
             this.diagnostics =
@@ -2626,7 +2844,56 @@ class BootstrapAnalyzer(
         if (result == "unknown" && name == "importSource") {
             result = "function:(string,string,string,function:()->ResolvedImport)->ImportSource"
         }
+        if (bootstrapIsDelegatedType(result)) {
+            result = bootstrapDelegatedExposedType(result)
+        }
         result
+    }
+
+    fun findStorageType(name: string): string {
+        var result = "unknown"
+        var localIndex = 0
+        while (localIndex < this.locals.size) {
+            if (this.locals[localIndex].name == name &&
+                this.scopeIsVisible(this.locals[localIndex].scope)) {
+                result = this.locals[localIndex].type
+            }
+            localIndex = localIndex + 1
+        }
+        var index = 0
+        while (index < this.symbols.size) {
+            if (result == "unknown" && this.symbols[index].name == name) {
+                result = this.symbols[index].type
+            }
+            index = index + 1
+        }
+        result
+    }
+
+    fun nameIsDelegated(name: string): bool =
+        bootstrapIsDelegatedType(this.findStorageType(name))
+
+    fun delegateType(name: string): string =
+        bootstrapDelegatedStorageType(this.findStorageType(name))
+
+    fun delegatedNameIsMutable(name: string): bool =
+        bootstrapDelegatedIsMutable(this.findStorageType(name))
+
+    fun replaceSymbolType(name: string, type: string): void {
+        var index = 0
+        while (index < this.symbols.size) {
+            val symbol = this.symbols[index]
+            if (symbol.name == name) {
+                this.symbols[index] = BootstrapSymbol(
+                    symbol.name,
+                    symbol.kind,
+                    type,
+                    symbol.scope,
+                    symbol.borrowSource
+                )
+            }
+            index = index + 1
+        }
     }
 
     fun addNullableRefinement(
@@ -2740,7 +3007,8 @@ class BootstrapAnalyzer(
         while (index < this.locals.size) {
             if (this.locals[index].name == name &&
                 this.scopeIsVisible(this.locals[index].scope)) {
-                mutable = this.locals[index].kind == "var"
+                mutable = this.locals[index].kind == "var" ||
+                    bootstrapDelegatedIsMutable(this.locals[index].type)
             }
             index = index + 1
         }
@@ -3158,6 +3426,124 @@ class BootstrapAnalyzer(
         result
     }
 
+    fun delegatedInitializerType(
+        expression: BootstrapExpression,
+        binding: string
+    ): string {
+        var delegateType = "unknown"
+        var exposedType = "unknown"
+        if (expression.children.size != 2) {
+            this.fail("delegate.getter-missing:$binding has no delegate initializer")
+        } else {
+            val rawDelegateType = this.infer(expression.children[0])
+            delegateType = bootstrapBorrowElementType(rawDelegateType)
+            if (bootstrapIsBorrowType(rawDelegateType)) {
+                this.fail("ownership.borrow-store:delegate.$binding")
+            }
+            val getterParameters = this.methodParameterCount(
+                delegateType,
+                "getValue"
+            )
+            val getterResult = this.methodResultType(
+                delegateType,
+                "getValue"
+            )
+            if (getterParameters != 0 || getterResult == "unknown" ||
+                getterResult == "void") {
+                this.fail(
+                    "delegate.getter-missing:`$delegateType` does not provide `getValue()` required by `$binding`"
+                )
+            }
+            exposedType = getterResult
+            val declared = expression.children[1].text
+            if (declared != "inferred") {
+                exposedType = bootstrapNormalizeType(declared)
+                if (!bootstrapTypesCompatible(exposedType, getterResult)) {
+                    this.fail(
+                        "delegate.getter-missing:`$delegateType.getValue()` does not return `$exposedType` required by `$binding`"
+                    )
+                }
+            }
+            if (!bootstrapIsBorrowType(getterResult) &&
+                this.typeIsAffine(getterResult)) {
+                this.fail(
+                    "delegate.affine-value:`$binding` getter returns owned affine `$getterResult`"
+                )
+            }
+            if (expression.text == "var") {
+                val setterParameters = this.methodParameterCount(
+                    delegateType,
+                    "setValue"
+                )
+                val setterResult = this.methodResultType(
+                    delegateType,
+                    "setValue"
+                )
+                val setterInput = this.methodParameterType(
+                    delegateType,
+                    "setValue",
+                    0
+                )
+                if (setterParameters != 1 || setterResult != "void" ||
+                    !bootstrapTypesCompatible(setterInput, exposedType)) {
+                    this.fail(
+                        "delegate.setter-missing:mutable `$binding` requires `$delegateType.setValue($exposedType) -> void`"
+                    )
+                }
+            }
+            val getter = this.selectedMethodHandle(
+                delegateType,
+                "getValue"
+            )
+            if (getter >= 0 && this.selectedHandleIsCompileOnly(getter) &&
+                this.compileDepth == 0) {
+                this.fail("compile.call-runtime:$delegateType.getValue")
+            }
+        }
+        bootstrapDelegatedType(
+            expression.text == "var",
+            delegateType,
+            exposedType
+        )
+    }
+
+    fun validateDelegatedRead(
+        expression: BootstrapExpression,
+        name: string
+    ): void {
+        val owner = this.delegateType(name)
+        val receiverKind = this.methodReceiverKind(owner, "getValue")
+        if (receiverKind == "var" && this.hasVisibleLocal(name)) {
+            this.validateMutableBorrowArgument(
+                BootstrapExpression(
+                    "delegate.project",
+                    "",
+                    expression.begin,
+                    expression.end,
+                    [BootstrapExpression(
+                        "identifier",
+                        name,
+                        expression.begin,
+                        expression.end,
+                        []
+                    )]
+                ),
+                owner,
+                "delegate.get.$name"
+            )
+        }
+        this.recordTypedCall(
+            expression,
+            this.findType(name),
+            owner,
+            this.selectedMethodHandle(owner, "getValue"),
+            [],
+            [],
+            [],
+            0
+        )
+    }
+
     fun functionParameterCount(name: string): int {
         var result = -1
         var index = 0
@@ -3365,6 +3751,11 @@ class BootstrapAnalyzer(
         var result = "unknown"
         if (expression.kind == "identifier") {
             result = this.findType(expression.text)
+        }
+        if (expression.kind == "delegate.project" &&
+            expression.children.size == 1 &&
+            expression.children[0].kind == "identifier") {
+            result = this.delegateType(expression.children[0].text)
         }
         if (expression.kind == "call") {
             if (this.findKind(expression.text) == "class") {
@@ -4025,6 +4416,20 @@ class BootstrapAnalyzer(
                 this.currentOwner,
                 expression.text
              ) != "unknown"))) mutates = true
+        if (expression.kind == "identifier" &&
+            !this.captureNameIsBound(bound, expression.text) &&
+            this.nameIsDelegated(expression.text) &&
+            bootstrapMutableReceiverContains(
+                this.mutableReceivers,
+                this.delegateType(expression.text),
+                "getValue"
+            )) mutates = true
+        if (expression.kind == "delegate.assign" &&
+            expression.children.size > 0) {
+            val root = bootstrapPlaceRootName(expression.children[0])
+            if (root != "" && !this.captureNameIsBound(bound, root) &&
+                this.hasVisibleLocal(root)) mutates = true
+        }
         if ((expression.kind == "member.assign" ||
              expression.kind == "index.assign") &&
             expression.children.size > 0) {
@@ -4047,7 +4452,10 @@ class BootstrapAnalyzer(
                 this.hasVisibleLocal(root) &&
                 bootstrapMutableReceiverContains(
                     this.mutableReceivers,
-                    bootstrapBorrowElementType(this.findType(root)),
+                    if (this.nameIsDelegated(root) &&
+                        expression.children[0].kind == "delegate.project") {
+                        this.delegateType(root)
+                    } else bootstrapBorrowElementType(this.findType(root)),
                     expression.text
                 )) mutates = true
         }
@@ -4097,8 +4505,12 @@ class BootstrapAnalyzer(
                 this.fieldType(this.currentOwner, name) != "unknown") {
                 name = "this"
             }
+            var captureType = this.findType(name)
+            if (this.nameIsDelegated(name)) {
+                captureType = this.delegateType(name)
+            }
             if (this.hasVisibleLocal(name) &&
-                this.typeIsAffine(this.findType(name))) {
+                this.typeIsAffine(captureType)) {
                 if (expression.kind != "lambda.move" &&
                     expression.kind != "lambda.generator") {
                     this.fail("ownership.capture-move-required:$name")
@@ -4135,10 +4547,14 @@ class BootstrapAnalyzer(
         var capture = 0
         while (capture < captures.size) {
             val name = captures[capture]
+            var captureType = this.findType(name)
+            if (this.nameIsDelegated(name)) {
+                captureType = this.delegateType(name)
+            }
             if (this.hasVisibleLocal(name) &&
-                !this.threadCaptureTypeIsSend(this.findType(name))) {
+                !this.threadCaptureTypeIsSend(captureType)) {
                 this.fail(
-                    "thread.capture-type:$name:${this.findType(name)}"
+                    "thread.capture-type:$name:$captureType"
                 )
             }
             capture = capture + 1
@@ -4186,6 +4602,11 @@ class BootstrapAnalyzer(
 
     fun borrowExpressionSource(expression: BootstrapExpression): string {
         var source = ""
+        if (expression.kind == "identifier" &&
+            this.nameIsDelegated(expression.text) &&
+            bootstrapIsBorrowType(this.findType(expression.text))) {
+            source = expression.text
+        }
         if (expression.kind == "member.call" &&
             expression.text == "get" && expression.children.size == 1) {
             val root = bootstrapPlaceRootName(expression.children[0])
@@ -4470,9 +4891,8 @@ class BootstrapAnalyzer(
             result = "string"
         }
         if (expression.kind == "compile") {
-            val effects = bootstrapExpressionCompileEffects(
-                expression.children[0],
-                this.compileEffects
+            val effects = this.expressionCompileEffects(
+                expression.children[0]
             )
             val deniedEffects = bootstrapDeniedCompileEffects(
                 effects,
@@ -4544,6 +4964,10 @@ class BootstrapAnalyzer(
             if (result == "unknown") this.fail(
                 "identifier:${expression.text}@${expression.begin}"
             )
+            if (result != "unknown" &&
+                this.nameIsDelegated(expression.text)) {
+                this.validateDelegatedRead(expression, expression.text)
+            }
         }
         if (expression.kind == "lambda" ||
             expression.kind == "lambda.move" ||
@@ -4628,6 +5052,8 @@ class BootstrapAnalyzer(
                     } else if (!this.hasMovableLocal(moved.text)) {
                         this.fail("move.local")
                     }
+                } else if (moved.kind == "delegate.project") {
+                    this.fail("delegate.move-projection")
                 } else if (moved.kind == "member" ||
                            moved.kind == "index") {
                     val root = bootstrapPlaceRootName(moved)
@@ -5486,6 +5912,34 @@ class BootstrapAnalyzer(
             if (this.hasLocal(expression.text)) {
                 this.fail("local.duplicate:${expression.text}")
             }
+            val delegated = expression.children.size > 0 &&
+                expression.children[0].kind == "delegate.initializer"
+            if (delegated) {
+                val initializer = expression.children[0]
+                val type = this.delegatedInitializerType(
+                    initializer,
+                    expression.text
+                )
+                val delegateType = bootstrapDelegatedStorageType(type)
+                this.validateOwnershipTransfer(
+                    delegateType,
+                    initializer.children[0],
+                    "delegate.${expression.text}"
+                )
+                val kind = if (expression.kind == "local.var") "var" else "val"
+                this.locals.append(BootstrapSymbol(
+                    expression.text,
+                    kind,
+                    type,
+                    this.currentScope,
+                    ""
+                ))
+                if (this.regionDepth > 0 &&
+                    this.regionExpressionIsOwned(initializer.children[0])) {
+                    this.markRegionOwned(expression.text, this.currentScope)
+                }
+                result = "void"
+            } else {
             val hasInitializer = expression.children[0].kind != "missing"
             var initializerType = "unknown"
             var borrowSource = ""
@@ -5495,7 +5949,8 @@ class BootstrapAnalyzer(
                     this.typeNeedsManagedAliasTracking(initializerType) &&
                     (expression.children[0].kind == "identifier" ||
                      expression.children[0].kind == "member" ||
-                     expression.children[0].kind == "index")) {
+                     expression.children[0].kind == "index" ||
+                     expression.children[0].kind == "delegate.project")) {
                     val managedSource = this.borrowArgumentSource(
                         expression.children[0]
                     )
@@ -5514,6 +5969,13 @@ class BootstrapAnalyzer(
                     )
                 }
                 if (bootstrapIsBorrowType(initializerType)) {
+                    if (borrowSource == "" &&
+                        expression.children[0].kind == "identifier" &&
+                        this.nameIsDelegated(
+                            expression.children[0].text
+                        )) {
+                        borrowSource = expression.children[0].text
+                    }
                     if (borrowSource == "") {
                         borrowSource = this.borrowExpressionSource(
                             expression.children[0]
@@ -5594,8 +6056,10 @@ class BootstrapAnalyzer(
                 this.markRegionOwned(expression.text, this.currentScope)
             }
             result = "void"
+            }
         }
         if (expression.kind == "assign") {
+            val delegated = this.nameIsDelegated(expression.text)
             val target = this.findType(expression.text)
             val value = this.infer(expression.children[0])
             if (bootstrapIsBorrowType(value)) {
@@ -5607,11 +6071,47 @@ class BootstrapAnalyzer(
                     "assignment.type:${expression.text}@${expression.begin}"
                 )
             }
-            this.validateOwnershipTransfer(
-                target,
-                expression.children[0],
-                "assignment.${expression.text}"
-            )
+            if (delegated) {
+                val delegateType = this.delegateType(expression.text)
+                val setterInput = this.methodParameterType(
+                    delegateType,
+                    "setValue",
+                    0
+                )
+                this.validateOwnershipTransfer(
+                    setterInput,
+                    expression.children[0],
+                    "delegate.setter.${expression.text}"
+                )
+                this.validateBorrowMutation(
+                    BootstrapExpression(
+                        "identifier",
+                        expression.text,
+                        expression.begin,
+                        expression.end,
+                        []
+                    ),
+                    "delegate.setter.${expression.text}"
+                )
+                this.recordTypedCall(
+                    expression,
+                    "void",
+                    delegateType,
+                    this.selectedMethodHandle(delegateType, "setValue"),
+                    [value],
+                    [setterInput],
+                    [this.methodParameterKind(
+                        delegateType,
+                        "setValue",
+                        0
+                    )],
+                    0
+                )
+            } else this.validateOwnershipTransfer(
+                    target,
+                    expression.children[0],
+                    "assignment.${expression.text}"
+                )
             if (this.hasVisibleLocal(expression.text) &&
                 !this.localIsMutable(expression.text)) {
                 this.fail("assignment.immutable:${expression.text}")
@@ -5633,11 +6133,11 @@ class BootstrapAnalyzer(
                 expression.end,
                 []
             )
-            this.validateRegionStore(
-                assignmentTarget,
-                expression.children[0],
-                "assignment.${expression.text}"
-            )
+            if (!delegated) this.validateRegionStore(
+                    assignmentTarget,
+                    expression.children[0],
+                    "assignment.${expression.text}"
+                )
             if (this.regionDepth > 0 &&
                 this.hasVisibleLocal(expression.text) &&
                 this.scopeIsWithin(
@@ -5650,6 +6150,60 @@ class BootstrapAnalyzer(
                 )
             }
             result = value
+        }
+        if (expression.kind == "delegate.project") {
+            if (expression.children.size != 1 ||
+                expression.children[0].kind != "identifier") {
+                this.fail(
+                    "delegate.not-delegated:delegate projection requires an addressable delegated binding"
+                )
+                result = "unknown"
+            } else {
+                val name = expression.children[0].text
+                if (!this.nameIsDelegated(name)) {
+                    this.fail("delegate.not-delegated:`$name` has ordinary storage")
+                    result = "unknown"
+                } else result = this.delegateType(name)
+            }
+        }
+        if (expression.kind == "delegate.assign") {
+            var name = ""
+            if (expression.children.size == 2 &&
+                expression.children[0].kind == "identifier") {
+                name = expression.children[0].text
+            }
+            if (name == "" || !this.nameIsDelegated(name)) {
+                this.fail("delegate.not-delegated:projection target has ordinary storage")
+                if (expression.children.size > 1) {
+                    result = this.infer(expression.children[1])
+                }
+            } else {
+                val expected = this.delegateType(name)
+                val actual = this.infer(expression.children[1])
+                if (!this.delegatedNameIsMutable(name)) {
+                    this.fail("delegate.replace-val:`$name` is declared `val`")
+                }
+                if (!bootstrapTypesCompatible(expected, actual)) {
+                    this.fail(
+                        "delegate.type-mismatch:`^$name` stores `$expected`, not `$actual`"
+                    )
+                }
+                this.validateOwnershipTransfer(
+                    expected,
+                    expression.children[1],
+                    "delegate.replace.$name"
+                )
+                this.validateBorrowMutation(
+                    expression.children[0],
+                    "delegate.replace.$name"
+                )
+                this.validateRegionStore(
+                    expression.children[0],
+                    expression.children[1],
+                    "delegate.replace.$name"
+                )
+                result = actual
+            }
         }
         if (
             expression.kind == "unary-" ||
@@ -5858,7 +6412,16 @@ class BootstrapAnalyzer(
             var publish = false
             if (bootstrapDeclarationIsValue(declaration.kind) &&
                 declaration.resultType != "inferred") {
-                type = bootstrapNormalizeType(declaration.resultType)
+                val exposed = bootstrapNormalizeType(declaration.resultType)
+                type = if (declaration.expression.kind ==
+                    "delegate.initializer") {
+                    bootstrapDelegatedType(
+                        declaration.kind == "var" ||
+                            declaration.kind == "compile.var",
+                        "unknown",
+                        exposed
+                    )
+                } else exposed
                 publish = true
             }
             if (declaration.kind == "fun" ||
@@ -5913,13 +6476,28 @@ class BootstrapAnalyzer(
                     declaration.kind == "compile.var") {
                     this.compileDepth = this.compileDepth + 1
                 }
-                val inferredType = this.infer(declaration.expression)
+                var inferredType = "unknown"
+                if (declaration.expression.kind == "delegate.initializer") {
+                    inferredType = this.delegatedInitializerType(
+                        declaration.expression,
+                        declaration.name
+                    )
+                    val delegateType = bootstrapDelegatedStorageType(
+                        inferredType
+                    )
+                    this.validateOwnershipTransfer(
+                        delegateType,
+                        declaration.expression.children[0],
+                        "delegate.global.${declaration.name}"
+                    )
+                } else inferredType = this.infer(declaration.expression)
                 if (declaration.kind == "compile.val" ||
                     declaration.kind == "compile.var") {
                     this.compileDepth = this.compileDepth - 1
                 }
                 type = inferredType
-                if (declaration.resultType != "inferred") {
+                if (declaration.resultType != "inferred" &&
+                    declaration.expression.kind != "delegate.initializer") {
                     val declaredType = bootstrapNormalizeType(
                         declaration.resultType
                     )
@@ -5937,6 +6515,10 @@ class BootstrapAnalyzer(
                     this.fail(
                         "ownership.affine-callable-global:${declaration.name}"
                     )
+                }
+                if (predeclared &&
+                    declaration.expression.kind == "delegate.initializer") {
+                    this.replaceSymbolType(symbolName, type)
                 }
             }
             if (declaration.kind == "fun" || declaration.kind == "extern" ||

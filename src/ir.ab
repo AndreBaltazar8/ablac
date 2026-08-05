@@ -10,7 +10,9 @@ fun bootstrapGlobalValueType(
     var index = 0
     while (result == "unknown" && index < declarations.size) {
         val declaration = declarations[index]
-        if ((declaration.kind == "val" || declaration.kind == "var") &&
+        if ((declaration.kind == "val" || declaration.kind == "var" ||
+             declaration.kind == "compile.val" ||
+             declaration.kind == "compile.var") &&
             declaration.name == name) {
             if (declaration.resultType != "inferred") {
                 result = bootstrapNormalizeType(declaration.resultType)
@@ -2569,7 +2571,7 @@ class BootstrapLowerer(
                  this.localStorage[index].slice(0, 10) != "for_value_")) {
                 this.emitAffineDrop(
                     this.localStorage[index],
-                    this.localTypes[index]
+                    bootstrapDelegatedStorageOrSelf(this.localTypes[index])
                 )
             }
         }
@@ -2589,7 +2591,7 @@ class BootstrapLowerer(
             index = index - 1
             this.emitAffineDrop(
                 this.ownedParameters[index],
-                this.lowerParameterType(this.ownedParameters[index])
+                this.lowerStorageType(this.ownedParameters[index])
             )
         }
     }
@@ -2603,6 +2605,9 @@ class BootstrapLowerer(
                 result = bootstrapNormalizeType(this.parameterTypes[index])
             }
             index = index + 1
+        }
+        if (bootstrapIsDelegatedType(result)) {
+            result = bootstrapDelegatedExposedType(result)
         }
         val refined = this.lowerRefinedType(name)
         if (refined != "unknown") result = refined
@@ -2679,12 +2684,99 @@ class BootstrapLowerer(
                 if (result.size > 5 && result.slice(0, 5) == "cell:") {
                     result = result.slice(5, result.size)
                 }
+                if (bootstrapIsDelegatedType(result)) {
+                    result = bootstrapDelegatedExposedType(result)
+                }
             }
             index = index + 1
         }
         val refined = this.lowerRefinedType(name)
         if (refined != "unknown") result = refined
         result
+    }
+
+    fun lowerLocalMetadataType(name: string): string {
+        var result = "unknown"
+        var index = 0
+        while (index < this.locals.size) {
+            if (this.locals[index] == name &&
+                index < this.localTypes.size &&
+                this.localScopeVisible(this.localScopes[index])) {
+                result = this.localTypes[index]
+                if (result.size > 5 && result.slice(0, 5) == "cell:") {
+                    result = result.slice(5, result.size)
+                }
+            }
+            index = index + 1
+        }
+        result
+    }
+
+    fun lowerParameterMetadataType(name: string): string {
+        var result = "unknown"
+        var index = 0
+        while (index < this.parameters.size) {
+            if (this.parameters[index] == name &&
+                index < this.parameterTypes.size) {
+                result = bootstrapNormalizeType(this.parameterTypes[index])
+            }
+            index = index + 1
+        }
+        result
+    }
+
+    fun lowerGlobalMetadataType(name: string): string {
+        var result = "unknown"
+        var declarationIndex = 0
+        while (declarationIndex < this.declarations.size) {
+            val declaration = this.declarations[declarationIndex]
+            if ((declaration.kind == "val" || declaration.kind == "var" ||
+                 declaration.kind == "compile.val" ||
+                 declaration.kind == "compile.var") &&
+                declaration.name == name &&
+                declaration.expression.kind == "delegate.initializer" &&
+                declaration.expression.children.size > 1) {
+                val storage = this.lowerExpressionType(
+                    declaration.expression.children[0]
+                )
+                var exposed = this.lowerMethodResultType(
+                    storage,
+                    "getValue"
+                )
+                if (declaration.resultType != "inferred") {
+                    exposed = bootstrapNormalizeType(declaration.resultType)
+                }
+                result = bootstrapDelegatedType(
+                    declaration.kind == "var" ||
+                        declaration.kind == "compile.var",
+                    storage,
+                    exposed
+                )
+            }
+            declarationIndex = declarationIndex + 1
+        }
+        result
+    }
+
+    fun lowerDelegatedMetadataType(name: string): string {
+        var result = "unknown"
+        if (this.isLocal(name)) result = this.lowerLocalMetadataType(name)
+        else if (this.isParameter(name)) {
+            result = this.lowerParameterMetadataType(name)
+        } else if (this.isGlobal(name)) result = this.lowerGlobalMetadataType(name)
+        result
+    }
+
+    fun lowerNameIsDelegated(name: string): bool =
+        bootstrapIsDelegatedType(this.lowerDelegatedMetadataType(name))
+
+    fun lowerStorageType(name: string): string {
+        val metadata = this.lowerDelegatedMetadataType(name)
+        if (bootstrapIsDelegatedType(metadata)) {
+            bootstrapDelegatedStorageType(metadata)
+        } else if (this.isLocal(name)) this.lowerLocalType(name)
+        else if (this.isParameter(name)) this.lowerParameterType(name)
+        else bootstrapGlobalValueType(this.declarations, name)
     }
 
     fun lowerFieldType(owner: string, field: string): string {
@@ -2786,6 +2878,10 @@ class BootstrapLowerer(
         if (expression.kind == "string" ||
             expression.kind == "string.template") result = "string"
         if (expression.kind == "null") result = "null"
+        if (expression.kind == "delegate.initializer" &&
+            expression.children.size > 0) {
+            result = this.lowerExpressionType(expression.children[0])
+        }
         if (expression.kind == "compile") {
             result = this.lowerExpressionType(expression.children[0])
         }
@@ -2829,6 +2925,24 @@ class BootstrapLowerer(
             } else if (this.isFunction(expression.text)) {
                 result = this.lowerFunctionType(expression.text)
             } else result = this.lowerFunctionResultType(expression.text)
+            if (this.lowerNameIsDelegated(expression.text)) {
+                result = bootstrapDelegatedExposedType(
+                    this.lowerDelegatedMetadataType(expression.text)
+                )
+            }
+        }
+        if (expression.kind == "delegate.project" &&
+            expression.children.size == 1 &&
+            expression.children[0].kind == "identifier") {
+            result = bootstrapDelegatedStorageType(
+                this.lowerDelegatedMetadataType(
+                    expression.children[0].text
+                )
+            )
+        }
+        if (expression.kind == "delegate.assign" &&
+            expression.children.size == 2) {
+            result = this.lowerExpressionType(expression.children[1])
         }
         if (expression.kind == "call") {
             if (expression.text == "move" && expression.children.size == 1) {
@@ -3322,6 +3436,20 @@ class BootstrapLowerer(
             (this.isLocal(expression.text) ||
              this.isParameter(expression.text) ||
              this.isField(expression.text))) mutates = true
+        if (expression.kind == "identifier" &&
+            !this.nameIsBound(bound, expression.text) &&
+            this.lowerNameIsDelegated(expression.text) &&
+            bootstrapMutableReceiverContains(
+                this.mutableReceivers,
+                this.lowerStorageType(expression.text),
+                "getValue"
+            )) mutates = true
+        if (expression.kind == "delegate.assign" &&
+            expression.children.size > 0) {
+            val root = bootstrapPlaceRootName(expression.children[0])
+            if (root != "" && !this.nameIsBound(bound, root) &&
+                (this.isLocal(root) || this.isParameter(root))) mutates = true
+        }
         if ((expression.kind == "member.assign" ||
              expression.kind == "index.assign") &&
             expression.children.size > 0) {
@@ -3440,8 +3568,72 @@ class BootstrapLowerer(
         result
     }
 
+    fun lowerDelegateSlot(name: string): int {
+        var result = -1
+        if (this.isParameter(name)) {
+            result = this.emit("parameter.load", -1, -1, name)
+            if (this.isCapturedParameter(name)) {
+                result = this.emit("cell.get", result, -1, "")
+            }
+        } else if (this.isLocal(name)) {
+            result = this.emit(
+                "local.load",
+                -1,
+                -1,
+                this.storageFor(name)
+            )
+            if (this.localIsCell(name)) {
+                result = this.emit("cell.get", result, -1, "")
+            }
+        } else if (this.isGlobal(name)) {
+            result = this.emit("global.load", -1, -1, name)
+        }
+        result
+    }
+
+    fun emitDelegatedMethod(
+        name: string,
+        method: string,
+        arguments: array<int>,
+        begin: int,
+        end: int
+    ): int {
+        val owner = bootstrapDelegatedStorageType(
+            this.lowerDelegatedMetadataType(name)
+        )
+        val operands: array<int> = [this.lowerDelegateSlot(name)]
+        var argument = 0
+        while (argument < arguments.size) {
+            operands.append(arguments[argument])
+            argument = argument + 1
+        }
+        if (bootstrapMutableReceiverContains(
+            this.mutableReceivers,
+            owner,
+            method
+        )) this.emitBorrowMutation(BootstrapExpression(
+            "delegate.project",
+            "",
+            begin,
+            end,
+            [BootstrapExpression("identifier", name, begin, end, [])]
+        ))
+        val extensionOwner = this.lowerExtensionOwner(owner, method)
+        if (extensionOwner != "") {
+            this.emitMany(
+                "call",
+                operands,
+                "extension_${extensionOwner}_$method"
+            )
+        } else this.emitMany("call", operands, "${owner}_$method")
+    }
+
     fun lowerPlacePath(expression: BootstrapExpression): string {
         var result = ""
+        if (expression.kind == "delegate.project" &&
+            expression.children.size == 1) {
+            result = this.lowerPlacePath(expression.children[0])
+        }
         if (expression.kind == "identifier" &&
             (this.isLocal(expression.text) ||
              this.isParameter(expression.text))) {
@@ -3497,6 +3689,17 @@ class BootstrapLowerer(
 
     fun lowerBorrowSource(expression: BootstrapExpression): string {
         var source = ""
+        if (expression.kind == "identifier" &&
+            this.lowerNameIsDelegated(expression.text) &&
+            bootstrapIsBorrowType(this.lowerExpressionType(expression))) {
+            source = this.lowerPlacePath(BootstrapExpression(
+                "delegate.project",
+                "",
+                expression.begin,
+                expression.end,
+                [expression]
+            ))
+        }
         if (expression.kind == "member.call" && expression.text == "get" &&
             expression.children.size == 1 && bootstrapIsSharedType(
                 bootstrapBorrowElementType(this.lowerExpressionType(
@@ -3705,7 +3908,9 @@ class BootstrapLowerer(
         var index = 0
         while (index < this.declarations.size) {
             val declaration = this.declarations[index]
-            if ((declaration.kind == "val" || declaration.kind == "var") &&
+            if ((declaration.kind == "val" || declaration.kind == "var" ||
+                 declaration.kind == "compile.val" ||
+                 declaration.kind == "compile.var") &&
                 declaration.name == name) found = true
             index = index + 1
         }
@@ -3962,6 +4167,10 @@ class BootstrapLowerer(
         if (expression.kind == "null") {
             result = this.emit("const.null", -1, -1, "")
         }
+        if (expression.kind == "delegate.initializer" &&
+            expression.children.size > 0) {
+            result = this.lowerExpression(expression.children[0])
+        }
         if (expression.kind == "compile") {
             if (this.validationOnly) {
                 result = this.emit("const.void", -1, -1, "")
@@ -3989,7 +4198,15 @@ class BootstrapLowerer(
             )
         }
         if (expression.kind == "identifier") {
-            if (this.isField(expression.text) &&
+            if (this.lowerNameIsDelegated(expression.text)) {
+                result = this.emitDelegatedMethod(
+                    expression.text,
+                    "getValue",
+                    [],
+                    expression.begin,
+                    expression.end
+                )
+            } else if (this.isField(expression.text) &&
                 !this.isParameter(expression.text) &&
                 !this.isLocal(expression.text)) {
                 val receiver = this.emit(
@@ -4080,13 +4297,20 @@ class BootstrapLowerer(
                     if (this.isParameter(captureName)) {
                         captureType = this.lowerParameterType(captureName)
                     }
-                    if (this.lowerTypeIsAffine(captureType) &&
+                    if (this.lowerNameIsDelegated(captureName)) {
+                        captureType = this.lowerDelegatedMetadataType(
+                            captureName
+                        )
+                    }
+                    val captureStorageType =
+                        bootstrapDelegatedStorageOrSelf(captureType)
+                    if (this.lowerTypeIsAffine(captureStorageType) &&
                         (expression.kind == "lambda.move" ||
                          expression.kind == "lambda.generator")) {
                         captureValues.append(this.captureOwned(captureName))
                         ownedCaptures.append(captureName)
                     } else {
-                        if (this.lowerTypeIsAffine(captureType)) {
+                        if (this.lowerTypeIsAffine(captureStorageType)) {
                             this.errors = this.errors + 1
                         }
                         capturedCells.append(captureName)
@@ -4170,10 +4394,18 @@ class BootstrapLowerer(
             this.functions.append(lambdaFunction)
             if (expression.kind == "lambda.move" ||
                 expression.kind == "lambda.generator") {
+                val lambdaDropTypes: array<string> = []
+                var dropType = 0
+                while (dropType < lambdaParameterTypes.size) {
+                    lambdaDropTypes.append(bootstrapDelegatedStorageOrSelf(
+                        lambdaParameterTypes[dropType]
+                    ))
+                    dropType = dropType + 1
+                }
                 val closureDrop = bootstrapBuildClosureDropFunction(
                     lambdaName,
                     captureNames,
-                    lambdaParameterTypes,
+                    lambdaDropTypes,
                     this.affineTypes
                 )
                 this.errors =
@@ -4274,17 +4506,39 @@ class BootstrapLowerer(
             expression.kind == "local.var"
         ) {
             val hasInitializer = expression.children[0].kind != "missing"
-            val managedAlias = this.isManagedAlias(expression)
+            val delegated = hasInitializer &&
+                expression.children[0].kind == "delegate.initializer" &&
+                expression.children[0].children.size > 1
+            val initializer = if (delegated) {
+                expression.children[0].children[0]
+            } else expression.children[0]
+            val managedAlias = !delegated && this.isManagedAlias(expression)
             var value = -1
             var localType = "unknown"
             if (hasInitializer) {
-                value = this.lowerExpression(expression.children[0])
-                localType = this.lowerExpressionType(expression.children[0])
+                value = this.lowerExpression(initializer)
+                localType = this.lowerExpressionType(initializer)
+            }
+            if (delegated) {
+                val delegateType = localType
+                var exposedType = this.lowerMethodResultType(
+                    delegateType,
+                    "getValue"
+                )
+                val declared = expression.children[0].children[1].text
+                if (declared != "inferred") {
+                    exposedType = bootstrapNormalizeType(declared)
+                }
+                localType = bootstrapDelegatedType(
+                    expression.kind == "local.var",
+                    delegateType,
+                    exposedType
+                )
             }
             if (managedAlias && !bootstrapIsBorrowType(localType)) {
                 localType = "borrow:$localType"
             }
-            if (expression.children.size > 1 &&
+            if (!delegated && expression.children.size > 1 &&
                 expression.children[1].text != "inferred") {
                 val declaredType = bootstrapNormalizeType(
                     expression.children[1].text
@@ -4301,7 +4555,7 @@ class BootstrapLowerer(
             this.localBorrowSources.append("")
             if (hasInitializer) {
                 result = this.emit("local.declare", value, -1, storage)
-                if (bootstrapIsBorrowType(localType)) {
+                if (!delegated && bootstrapIsBorrowType(localType)) {
                     val constructorAlias = managedAlias &&
                         expression.children[0].kind == "call" &&
                         this.isClass(expression.children[0].text)
@@ -4312,6 +4566,11 @@ class BootstrapLowerer(
                         )
                     } else if (managedAlias) {
                         this.lowerBorrowArgumentSource(expression.children[0])
+                    } else if (expression.children[0].kind == "identifier" &&
+                        this.lowerNameIsDelegated(
+                            expression.children[0].text
+                        )) {
+                        this.lowerPlacePath(expression.children[0])
                     } else this.lowerBorrowSource(expression.children[0])
                     if (source == "") {
                         this.errors = this.errors + 1
@@ -4337,7 +4596,16 @@ class BootstrapLowerer(
         }
         if (expression.kind == "assign") {
             val value = this.lowerExpression(expression.children[0])
-            if (this.isLocal(expression.text)) {
+            if (this.lowerNameIsDelegated(expression.text)) {
+                this.emitDelegatedMethod(
+                    expression.text,
+                    "setValue",
+                    [value],
+                    expression.begin,
+                    expression.end
+                )
+                result = value
+            } else if (this.isLocal(expression.text)) {
                 this.emitAffineDrop(
                     this.storageFor(expression.text),
                     this.lowerLocalType(expression.text)
@@ -4394,6 +4662,56 @@ class BootstrapLowerer(
                     expression.text
                 )
             } else result = this.emit("global.assign", value, -1, expression.text)
+        }
+        if (expression.kind == "delegate.project" &&
+            expression.children.size == 1 &&
+            expression.children[0].kind == "identifier") {
+            val name = expression.children[0].text
+            val place = this.lowerPlacePath(expression)
+            if (place != "") {
+                this.emitControl("place.load", -1, -1, -1, place)
+            }
+            result = this.lowerDelegateSlot(name)
+        }
+        if (expression.kind == "delegate.assign" &&
+            expression.children.size == 2 &&
+            expression.children[0].kind == "identifier") {
+            val name = expression.children[0].text
+            val value = this.lowerExpression(expression.children[1])
+            val storageType = this.lowerStorageType(name)
+            if (this.isLocal(name)) {
+                if (this.localIsCell(name)) {
+                    val cell = this.emit(
+                        "local.load", -1, -1, this.storageFor(name)
+                    )
+                    if (this.lowerTypeIsAffine(storageType)) {
+                        val previous = this.emit("cell.get", cell, -1, "")
+                        this.emitAffineValueDrop(previous, storageType)
+                    }
+                    this.emitMany("cell.set", [cell, value], "")
+                } else {
+                    this.emitAffineDrop(this.storageFor(name), storageType)
+                    this.emit("local.assign", value, -1, this.storageFor(name))
+                }
+            } else if (this.isCapturedParameter(name)) {
+                val cell = this.emit("parameter.load", -1, -1, name)
+                if (this.lowerTypeIsAffine(storageType)) {
+                    val previous = this.emit("cell.get", cell, -1, "")
+                    this.emitAffineValueDrop(previous, storageType)
+                }
+                this.emitMany("cell.set", [cell, value], "")
+            } else if (this.isGlobal(name)) {
+                if (this.lowerTypeIsAffine(storageType)) {
+                    val previous = this.emit("global.load", -1, -1, name)
+                    this.emitAffineValueDrop(previous, storageType)
+                }
+                this.emit("global.assign", value, -1, name)
+            } else this.errors = this.errors + 1
+            val place = this.lowerPlacePath(expression.children[0])
+            if (place != "") {
+                this.emitControl("place.set", -1, -1, -1, place)
+            }
+            result = value
         }
         if (expression.kind == "call" && expression.text == "move") {
             if (expression.children.size == 1 &&
@@ -5786,6 +6104,48 @@ fun bootstrapIrGeneratedProvenance(
     provenance
 }
 
+fun bootstrapExpressionContainsDelegateReplacement(
+    expression: BootstrapExpression
+): bool {
+    var found = expression.kind == "delegate.assign"
+    var child = 0
+    while (!found && child < expression.children.size) {
+        found = bootstrapExpressionContainsDelegateReplacement(
+            expression.children[child]
+        )
+        child = child + 1
+    }
+    found
+}
+
+fun bootstrapIrFunctionContainsDelegateReplacement(
+    parsed: BootstrapParseResult,
+    functionName: string
+): bool {
+    var found = false
+    var declaration = 0
+    while (!found && declaration < parsed.declarations.size) {
+        val candidate = parsed.declarations[declaration]
+        if (candidate.name == functionName) {
+            found = bootstrapExpressionContainsDelegateReplacement(
+                candidate.expression
+            )
+        }
+        var method = 0
+        while (!found && method < candidate.methods.size) {
+            val candidateMethod = candidate.methods[method]
+            if ("${candidate.name}_${candidateMethod.name}" == functionName) {
+                found = bootstrapExpressionContainsDelegateReplacement(
+                    candidateMethod.expression
+                )
+            }
+            method = method + 1
+        }
+        declaration = declaration + 1
+    }
+    found
+}
+
 fun bootstrapIrVerificationDiagnostics(
     program: BootstrapIrProgram,
     parsed: BootstrapParseResult,
@@ -5797,11 +6157,19 @@ fun bootstrapIrVerificationDiagnostics(
     var index = 0
     while (index < program.functions.size) {
         val function = program.functions[index]
+        val delegatedReplacement =
+            bootstrapIrFunctionContainsDelegateReplacement(
+                parsed,
+                function.name
+            )
         var functionError = 0
         while (functionError < function.verificationErrors &&
             classified < totalIrErrors) {
-            diagnostics =
-                "${diagnostics}error[E_IR_FUNCTION_VERIFICATION]: function `${function.name}` violated a typed IR invariant (failure ${functionError + 1} of ${function.verificationErrors})\n"
+            if (delegatedReplacement && functionError == 0) {
+                diagnostics =
+                    "${diagnostics}error[E_DELEGATE_BORROW_CONFLICT]: delegate replacement in `${function.name}` conflicts with a live projected view\n"
+            } else diagnostics =
+                    "${diagnostics}error[E_IR_FUNCTION_VERIFICATION]: function `${function.name}` violated a typed IR invariant (failure ${functionError + 1} of ${function.verificationErrors})\n"
             diagnostics =
                 "$diagnostics${bootstrapIrGeneratedProvenance(
                     parsed, function.name

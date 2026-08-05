@@ -91,6 +91,32 @@ Only deferred request expressions retain these compact post-resolution records;
 raw parser handlers cannot query typed state. The stable generic-substitution
 surface returns zero until generic declarations land.
 
+## Binding reflection
+
+Top-level values use stable declaration handles through `compiler.bindings()`
+and `compiler.findBinding(name)`. The binding surface reports its source name,
+mutability, and storage form. For delegated bindings it additionally reports
+the exposed type, delegate type, selected getter and optional setter function
+handles, whether delegate replacement is allowed, and the source offsets of
+the `by` initializer:
+
+```abla
+val binding = compiler.findBinding("volume")
+if (compiler.bindingIsDelegated(binding)) {
+    val valueType = compiler.bindingExposedType(binding)
+    val policyType = compiler.bindingDelegateType(binding)
+    val getter = compiler.bindingGetter(binding)
+}
+```
+
+The low-level ABI uses `compilerBindings`, `compilerFindBinding`, and the
+`compilerBinding...` accessors declared by `abla/compiler`. Getter and setter
+results are ordinary function-reflection handles; a missing accessor is `-1`.
+An ordinary binding reports `false` for delegation and replacement, `unknown`
+for its delegate type, and `-1` for accessor handles and `by` offsets. Handles
+describe compilation-owned metadata and never expose a live runtime value or
+delegate object.
+
 Deferred call inspection also exposes
 `typedCallIsContract(expression)`. It reports whether the selected declaration
 came from an `import contract` projection while `typedCallTarget` and all

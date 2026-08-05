@@ -64,6 +64,7 @@ fixtures=(
     borrow-lifetimes:42
     scoped-region:42
     exhaustive-when:42
+    delegated-bindings:42
 )
 
 available_memory_mb=0

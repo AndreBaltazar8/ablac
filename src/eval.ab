@@ -939,6 +939,13 @@ fun bootstrapEvalBorrow(value: BootstrapEvalValue): BootstrapEvalValue =
 fun bootstrapEvalCell(value: BootstrapEvalValue): BootstrapEvalValue =
     BootstrapEvalValue("cell", 0, false, "", [value], "", [])
 
+fun bootstrapEvalDelegate(
+    value: BootstrapEvalValue,
+    mutable: bool
+): BootstrapEvalValue = BootstrapEvalValue(
+    "delegate", 0, mutable, "", [value], "", []
+)
+
 fun bootstrapEvalUnwrapBorrow(value: BootstrapEvalValue): BootstrapEvalValue =
     if (value.kind == "borrow" && value.elements.size == 1) value.elements[0]
     else value
@@ -1091,10 +1098,18 @@ class BootstrapEvaluator(
                 element = element + 1
             }
         }
+        if (value.kind == "delegate" && value.elements.size == 1) {
+            affine = this.valueIsAffine(value.elements[0])
+        }
         affine
     }
 
     fun dropValue(var value: BootstrapEvalValue): void {
+        if (value.kind == "delegate" && value.elements.size == 1 &&
+            value.elements[0].kind != "uninitialized") {
+            this.dropValue(value.elements[0])
+            value.elements[0] = this.uninitializedValue()
+        }
         if (value.kind == "shared" && value.elements.size == 1) {
             val control = value.elements[0]
             val next = control.elements[1].integer - 1
@@ -1189,6 +1204,73 @@ class BootstrapEvaluator(
         while (index < this.names.size) {
             if (this.names[index] == name) result = index
             index = index + 1
+        }
+        result
+    }
+
+    fun invokeDelegateMethod(
+        delegate: BootstrapEvalValue,
+        name: string,
+        argument: BootstrapEvalValue,
+        hasArgument: bool,
+        begin: int,
+        end: int
+    ): BootstrapEvalValue {
+        val children: array<BootstrapExpression> = []
+        if (hasArgument) {
+            val temporary = "__delegate_argument_${this.steps}_${this.names.size}"
+            this.names.append(temporary)
+            this.values.append(argument)
+            this.mutable.append(false)
+            children.append(BootstrapExpression(
+                "invalid", "delegate-receiver", begin, begin, []
+            ))
+            children.append(BootstrapExpression(
+                "identifier", temporary, begin, end, []
+            ))
+            val result = this.evaluateMethod(
+                bootstrapEvalUnwrapBorrow(delegate),
+                BootstrapExpression(
+                    "member.call", name, begin, end, children
+                )
+            )
+            this.values[this.values.size - 1] = this.uninitializedValue()
+            this.names[this.names.size - 1] = ""
+            result
+        } else this.evaluateMethod(
+            bootstrapEvalUnwrapBorrow(delegate),
+            BootstrapExpression("member.call", name, begin, end, children)
+        )
+    }
+
+    fun delegatedSlot(name: string): BootstrapEvalValue {
+        var result = bootstrapEvalInvalid()
+        val found = this.find(name)
+        if (found >= 0) {
+            result = this.values[found]
+            if (result.kind == "cell" && result.elements.size == 1) {
+                result = result.elements[0]
+            }
+        }
+        val cacheName = "delegate.global@$name"
+        val cached = this.find(cacheName)
+        if (result.kind == "invalid" && cached >= 0) {
+            result = this.values[cached]
+        }
+        if (result.kind == "invalid") {
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                val candidate = this.declarations[declaration]
+                if (bootstrapDeclarationIsValue(candidate.kind) &&
+                    candidate.name == name &&
+                    candidate.expression.kind == "delegate.initializer") {
+                    result = this.evaluate(candidate.expression)
+                    this.names.append(cacheName)
+                    this.values.append(result)
+                    this.mutable.append(false)
+                }
+                declaration = declaration + 1
+            }
         }
         result
     }
@@ -1658,6 +1740,62 @@ class BootstrapEvaluator(
         if (owner >= 0 && method >= 0) {
             this.declarations[owner].methods[method]
         } else this.declarations[handle]
+    }
+
+    fun bindingHandleValid(handle: int): bool =
+        handle >= 0 && handle < this.declarations.size &&
+        bootstrapDeclarationIsValue(this.declarations[handle].kind)
+
+    fun bindingIsDelegated(handle: int): bool =
+        this.bindingHandleValid(handle) &&
+        this.declarations[handle].expression.kind == "delegate.initializer" &&
+        this.declarations[handle].expression.children.size == 2
+
+    fun bindingDelegateType(handle: int): string {
+        var result = "unknown"
+        if (this.bindingIsDelegated(handle)) {
+            result = this.staticSyntaxType(
+                this.declarations[handle].expression.children[0]
+            )
+        }
+        result
+    }
+
+    fun bindingMethodHandle(handle: int, name: string): int {
+        var result = -1
+        val ownerName = this.bindingDelegateType(handle)
+        var declaration = 0
+        while (declaration < this.declarations.size) {
+            val owner = this.declarations[declaration]
+            if (owner.kind == "class" && owner.name == ownerName) {
+                var method = 0
+                while (method < owner.methods.size) {
+                    if (owner.methods[method].name == name) {
+                        result = this.methodHandle(declaration, method)
+                    }
+                    method = method + 1
+                }
+            }
+            if (result < 0 && owner.extensionOwner != "" &&
+                bootstrapNormalizeType(owner.extensionOwner) == ownerName &&
+                owner.name == name) result = declaration
+            declaration = declaration + 1
+        }
+        result
+    }
+
+    fun bindingExposedType(handle: int): string {
+        var result = "unknown"
+        if (this.bindingHandleValid(handle)) {
+            val declaration = this.declarations[handle]
+            if (declaration.resultType != "inferred") {
+                result = bootstrapNormalizeType(declaration.resultType)
+            } else if (this.bindingIsDelegated(handle)) {
+                val getter = this.bindingMethodHandle(handle, "getValue")
+                if (getter >= 0) result = this.functionHandleResultType(getter)
+            } else result = this.staticSyntaxType(declaration.expression)
+        }
+        result
     }
 
     fun classFieldType(handle: int, wanted: int): string {
@@ -2697,6 +2835,17 @@ class BootstrapEvaluator(
             }
             result = bootstrapEvalArray(handles)
         }
+        if (targetName == "compilerBindings") {
+            val handles: array<BootstrapEvalValue> = []
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                if (bootstrapDeclarationIsValue(
+                    this.declarations[declaration].kind
+                )) handles.append(bootstrapEvalInteger(declaration))
+                declaration = declaration + 1
+            }
+            result = bootstrapEvalArray(handles)
+        }
         if (targetName == "compilerFunctionsAnnotated") {
             val annotation = this.evaluate(expression.children[0])
             val handles: array<BootstrapEvalValue> = []
@@ -2757,6 +2906,82 @@ class BootstrapEvaluator(
                 declarationIndex = declarationIndex + 1
             }
             result = bootstrapEvalInteger(handle)
+        }
+        if (targetName == "compilerFindBinding") {
+            val name = this.evaluate(expression.children[0])
+            var handle = -1
+            var declaration = 0
+            while (declaration < this.declarations.size) {
+                val candidate = this.declarations[declaration]
+                if (bootstrapDeclarationIsValue(candidate.kind) &&
+                    candidate.name == name.text) handle = declaration
+                declaration = declaration + 1
+            }
+            result = bootstrapEvalInteger(handle)
+        }
+        if (targetName == "compilerBindingName" ||
+            targetName == "compilerBindingIsDelegated" ||
+            targetName == "compilerBindingExposedType" ||
+            targetName == "compilerBindingDelegateType" ||
+            targetName == "compilerBindingIsMutable" ||
+            targetName == "compilerBindingGetter" ||
+            targetName == "compilerBindingSetter" ||
+            targetName == "compilerBindingCanReplaceDelegate" ||
+            targetName == "compilerBindingByBegin" ||
+            targetName == "compilerBindingByEnd") {
+            val handle = this.evaluate(expression.children[0]).integer
+            if (this.bindingHandleValid(handle)) {
+                val declaration = this.declarations[handle]
+                val delegated = this.bindingIsDelegated(handle)
+                val mutable = declaration.kind == "var" ||
+                    declaration.kind == "compile.var"
+                if (targetName == "compilerBindingName") {
+                    result = bootstrapEvalString(declaration.name)
+                }
+                if (targetName == "compilerBindingIsDelegated") {
+                    result = bootstrapEvalBoolean(delegated)
+                }
+                if (targetName == "compilerBindingExposedType") {
+                    result = bootstrapEvalString(
+                        bootstrapSourceVisibleType(
+                            this.bindingExposedType(handle)
+                        )
+                    )
+                }
+                if (targetName == "compilerBindingDelegateType") {
+                    result = bootstrapEvalString(
+                        bootstrapSourceVisibleType(
+                            this.bindingDelegateType(handle)
+                        )
+                    )
+                }
+                if (targetName == "compilerBindingIsMutable") {
+                    result = bootstrapEvalBoolean(mutable)
+                }
+                if (targetName == "compilerBindingGetter") {
+                    result = bootstrapEvalInteger(
+                        this.bindingMethodHandle(handle, "getValue")
+                    )
+                }
+                if (targetName == "compilerBindingSetter") {
+                    result = bootstrapEvalInteger(
+                        this.bindingMethodHandle(handle, "setValue")
+                    )
+                }
+                if (targetName == "compilerBindingCanReplaceDelegate") {
+                    result = bootstrapEvalBoolean(delegated && mutable)
+                }
+                if (targetName == "compilerBindingByBegin") {
+                    result = bootstrapEvalInteger(
+                        if (delegated) declaration.expression.begin else -1
+                    )
+                }
+                if (targetName == "compilerBindingByEnd") {
+                    result = bootstrapEvalInteger(
+                        if (delegated) declaration.expression.end else -1
+                    )
+                }
+            } else this.errors = this.errors + 1
         }
         if (targetName == "compilerFunctionName" ||
             targetName == "compilerFunctionCanonicalIdentity" ||
@@ -4754,6 +4979,13 @@ class BootstrapEvaluator(
             result = bootstrapEvalString(expression.text)
         }
         if (expression.kind == "null") result = bootstrapEvalNull()
+        if (expression.kind == "delegate.initializer" &&
+            expression.children.size > 0) {
+            result = bootstrapEvalDelegate(
+                this.evaluate(expression.children[0]),
+                expression.text == "var"
+            )
+        }
         if (expression.kind == "lambda" ||
             expression.kind == "lambda.move") {
             var family = "fn"
@@ -4835,7 +5067,10 @@ class BootstrapEvaluator(
                     val declaration = this.declarations[declarationIndex]
                     if (bootstrapDeclarationIsValue(declaration.kind) &&
                         declaration.name == expression.text) {
-                        result = this.evaluate(declaration.expression)
+                        if (declaration.expression.kind ==
+                            "delegate.initializer") {
+                            result = this.delegatedSlot(expression.text)
+                        } else result = this.evaluate(declaration.expression)
                     }
                     if ((declaration.kind == "fun" ||
                          declaration.kind == "compile.fun") &&
@@ -4847,6 +5082,17 @@ class BootstrapEvaluator(
                 if (result.kind == "invalid") {
                     this.errors = this.errors + 1
                 } else this.errors = this.errors
+            }
+            if (result.kind == "delegate" &&
+                result.elements.size == 1) {
+                result = this.invokeDelegateMethod(
+                    result.elements[0],
+                    "getValue",
+                    bootstrapEvalInvalid(),
+                    false,
+                    expression.begin,
+                    expression.end
+                )
             }
         }
         if (expression.kind == "call" && expression.text == "move") {
@@ -5078,9 +5324,38 @@ class BootstrapEvaluator(
             result = BootstrapEvalValue("void", 0, false, "", [], "", [])
         }
         if (expression.kind == "assign") {
-            val found = this.find(expression.text)
+            var found = this.find(expression.text)
+            if (found < 0) {
+                val global = this.delegatedSlot(expression.text)
+                if (global.kind == "delegate") {
+                    this.names.append(expression.text)
+                    this.values.append(global)
+                    this.mutable.append(global.boolean)
+                    found = this.values.size - 1
+                }
+            }
             val value = this.evaluate(expression.children[0])
-            if (found >= 0 && this.mutable[found]) {
+            var slot = bootstrapEvalInvalid()
+            if (found >= 0) slot = this.values[found]
+            if (slot.kind == "cell" && slot.elements.size == 1) {
+                slot = slot.elements[0]
+            }
+            if (slot.kind == "delegate" && slot.elements.size == 1) {
+                if (slot.boolean) {
+                    this.invokeDelegateMethod(
+                        slot.elements[0],
+                        "setValue",
+                        value,
+                        true,
+                        expression.begin,
+                        expression.end
+                    )
+                    result = value
+                } else {
+                    this.errors = this.errors + 1
+                    result = value
+                }
+            } else if (found >= 0 && this.mutable[found]) {
                 if (this.values[found].kind == "cell" &&
                     this.values[found].elements.size == 1) {
                     val cell = this.values[found]
@@ -5116,6 +5391,34 @@ class BootstrapEvaluator(
                     }
                 }
                 if (!fieldAssigned) this.errors = this.errors + 1
+                result = value
+            }
+        }
+        if (expression.kind == "delegate.project" &&
+            expression.children.size == 1 &&
+            expression.children[0].kind == "identifier") {
+            val slot = this.delegatedSlot(expression.children[0].text)
+            if (slot.kind == "delegate" && slot.elements.size == 1) {
+                result = slot.elements[0]
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
+        if (expression.kind == "delegate.assign" &&
+            expression.children.size == 2 &&
+            expression.children[0].kind == "identifier") {
+            val slot = this.delegatedSlot(expression.children[0].text)
+            val value = this.evaluate(expression.children[1])
+            if (slot.kind == "delegate" && slot.elements.size == 1 &&
+                slot.boolean) {
+                if (slot.elements[0].kind != "uninitialized") {
+                    this.dropValue(slot.elements[0])
+                }
+                slot.elements[0] = value
+                result = value
+            } else {
+                this.errors = this.errors + 1
                 result = value
             }
         }

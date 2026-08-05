@@ -1,0 +1,223 @@
+import "abla/compiler"
+
+class ClampedInt(
+    var current: int,
+    val minimum: int,
+    var maximum: int
+) {
+    fun getValue(): int = current
+
+    fun setValue(next: int): void {
+        if (next < minimum) current = minimum
+        else if (next > maximum) current = maximum
+        else current = next
+        return
+    }
+}
+
+class ConstantInt(val current: int) {
+    fun getValue(): int = current
+}
+
+resource class BorrowedTicket(val value: int)
+
+resource class BorrowingDelegate(val handle: Shared<BorrowedTicket>) {
+    fun getValue(): borrow(this) BorrowedTicket = this.handle.get()
+}
+
+class CountingInt(var current: int, var gets: int, var sets: int) {
+    fun getValue(): int {
+        gets = gets + 1
+        current
+    }
+
+    fun setValue(next: int): void {
+        sets = sets + 1
+        current = next
+        return
+    }
+}
+
+var initializerCalls = 0
+
+fun countingInt(value: int): CountingInt {
+    initializerCalls = initializerCalls + 1
+    CountingInt(value, 0, 0)
+}
+
+fun delegateTrace(delegate: CountingInt): int =
+    delegate.current + delegate.gets * 10 + delegate.sets * 100
+
+var globalValue: int by countingInt(4)
+
+compile fun delegatedReflection(): int {
+    val binding = compiler.findBinding("globalValue")
+    val getter = compiler.bindingGetter(binding)
+    val setter = compiler.bindingSetter(binding)
+    if (binding >= 0 && compiler.bindingName(binding) == "globalValue" &&
+        compiler.bindingIsDelegated(binding) &&
+        compiler.bindingExposedType(binding) == "i64" &&
+        compiler.bindingDelegateType(binding) == "CountingInt" &&
+        compiler.bindingIsMutable(binding) &&
+        compiler.bindingCanReplaceDelegate(binding) &&
+        compiler.functionName(getter) == "getValue" &&
+        compiler.functionName(setter) == "setValue" &&
+        compiler.bindingByBegin(binding) >= 0 &&
+        compiler.bindingByEnd(binding) > compiler.bindingByBegin(binding)) 42
+    else 0
+}
+
+val delegatedReflectionResult = #delegatedReflection()
+
+var delegateDrops = 0
+
+resource class OwnedInt(var current: int, val bornAfterDrops: int) {
+    fun getValue(): int = current
+
+    fun setValue(next: int): void {
+        current = next
+        return
+    }
+
+    fun drop(): void {
+        delegateDrops = delegateDrops + current
+        return
+    }
+}
+
+fun ownedInt(value: int): OwnedInt = OwnedInt(value, delegateDrops)
+
+fun bornAfter(delegate: OwnedInt): int = delegate.bornAfterDrops
+
+class StageTrace(var initializers: int, var gets: int, var sets: int, var drops: int)
+
+resource class StageOwnedInt(
+    var current: int,
+    val trace: StageTrace,
+    val bornAfterDrops: int
+) {
+    fun getValue(): int {
+        trace.gets = trace.gets + 1
+        current
+    }
+
+    fun setValue(next: int): void {
+        trace.sets = trace.sets + 1
+        current = next
+        return
+    }
+
+    fun drop(): void {
+        trace.drops = trace.drops + current
+        return
+    }
+}
+
+compile fun stageOwnedInt(var trace: StageTrace, value: int): StageOwnedInt {
+    trace.initializers = trace.initializers + 1
+    StageOwnedInt(value, trace, trace.drops)
+}
+
+compile fun stageBornAfter(delegate: StageOwnedInt): int =
+    delegate.bornAfterDrops
+
+compile val stagedGlobalValue: int by ConstantInt(42)
+
+val stagedGlobalResult = #stagedGlobalValue
+
+fun widen(var policy: ClampedInt): void {
+    policy.maximum = policy.maximum + 50
+    return
+}
+
+fun delegatedCore(): int {
+    var volume: int by ClampedInt(40, 0, 100)
+    val fixed by ConstantInt(7)
+    val attempted = (volume = 140)
+    val first = volume
+    widen(^volume)
+    volume = 124
+    val widened = volume
+    ^volume = ClampedInt(20, 0, 50)
+    val replaced = volume
+    if (attempted == 140 && first == 100 && widened == 124 &&
+        replaced == 20 && fixed == 7) 42 else 0
+}
+
+fun countedAccess(): bool {
+    var value by countingInt(6)
+    val attempted = (value = 9)
+    val first = value
+    val second = value
+    attempted == 9 && first == 9 && second == 9 &&
+        delegateTrace(^value) == 129
+}
+
+fun borrowedAccess(): bool {
+    val ticket by BorrowingDelegate(Shared(BorrowedTicket(42)))
+    val view: Borrow<BorrowedTicket> = ticket
+    view.value == 42
+}
+
+fun capturedStorage(): bool {
+    var value: int by CountingInt(1, 0, 0)
+    val read = { value }
+    value = 7
+    val afterSet = read()
+    ^value = CountingInt(11, 0, 0)
+    val afterReplace = read()
+    afterSet == 7 && afterReplace == 11 && delegateTrace(^value) == 21
+}
+
+fun affineStorage(): bool {
+    var value: int by ownedInt(3)
+    ^value = ownedInt(5)
+    val replacementWasEvaluatedFirst = bornAfter(^value) == 0
+    val exposed = value
+    replacementWasEvaluatedFirst && exposed == 5
+}
+
+fun globalStorage(): bool {
+    val initial = globalValue
+    val attempted = (globalValue = 8)
+    val updated = globalValue
+    ^globalValue = CountingInt(12, 0, 0)
+    val replaced = globalValue
+    initializerCalls == 2 && initial == 4 && attempted == 8 &&
+        updated == 8 && replaced == 12 && delegateTrace(^globalValue) == 22
+}
+
+compile fun stagedDelegated(): int {
+    val trace = StageTrace(0, 0, 0, 0)
+    var value: int by stageOwnedInt(trace, 10)
+    val attempted = (value = 30)
+    val first = value
+    ^value = stageOwnedInt(trace, 42)
+    val replacementWasEvaluatedFirst = stageBornAfter(^value) == 0
+    val second = value
+    if (attempted == 30 && first == 30 && second == 42 &&
+        replacementWasEvaluatedFirst && trace.initializers == 2 &&
+        trace.gets == 2 && trace.sets == 1 && trace.drops == 30) 42 else 0
+}
+
+fun main: int {
+    val staged = #stagedDelegated()
+    val core = delegatedCore()
+    val counted = countedAccess()
+    val captured = capturedStorage()
+    val borrowed = borrowedAccess()
+    val affine = affineStorage()
+    val affineDropped = delegateDrops == 8
+    val global = globalStorage()
+    if (staged != 42) return 1
+    if (core != 42) return 2
+    if (!counted) return 3
+    if (!captured) return 4
+    if (!borrowed) return 10
+    if (!affine) return 5
+    if (!affineDropped) return 6
+    if (!global) return 7
+    if (delegatedReflectionResult != 42) return 8
+    if (stagedGlobalResult != 42) return 9
+    42
+}

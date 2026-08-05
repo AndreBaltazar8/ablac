@@ -29,6 +29,7 @@ tools/test-concurrency.sh "$compiler"
 tools/test-package-build.sh "$compiler"
 tools/test-toolchain-root.sh "$compiler"
 tools/test-contract-imports.sh "$compiler"
+tools/test-delegated-bindings.sh "$compiler"
 tools/test-inprocess-aot.sh "${compiler}.bin"
 tools/test-final-native-conformance.sh "$compiler"
 
