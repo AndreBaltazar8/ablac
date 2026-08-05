@@ -6,6 +6,14 @@ project_root=$(cd "$(dirname "$0")/.." && pwd)
 output_directory="$project_root/build/subparser-generated-adapter"
 source_file="$project_root/tests/cases/modules/subparser-generated-adapter.ab"
 mkdir -p "$output_directory"
+missing_toolchain_path="$output_directory/missing-toolchain-path"
+mkdir -p "$missing_toolchain_path"
+ln -sf "$(command -v bash)" "$missing_toolchain_path/bash"
+ln -sf "$(command -v readlink)" "$missing_toolchain_path/readlink"
+ln -sf "$(command -v dirname)" "$missing_toolchain_path/dirname"
+ln -sf "$(command -v timeout)" "$missing_toolchain_path/timeout"
+ln -sf "$(command -v prlimit)" "$missing_toolchain_path/prlimit"
+ln -sf "$(command -v opt)" "$missing_toolchain_path/opt"
 
 assert_compiler_diagnostic_accounting() {
     local diagnostic_file=$1
@@ -94,6 +102,12 @@ set +e
 nominal_status=$?
 set -e
 [[ $nominal_status -eq 42 ]]
+
+"$compiler" build \
+    "$project_root/tests/cases/modules/nested-generated-subparser.ab" \
+    -o "$output_directory/nested-generated-subparser-program" --no-cache
+
+"$output_directory/nested-generated-subparser-program"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/late-nominal-action.ab" \
@@ -237,12 +251,14 @@ grep -q 'error\[E_PARSE_PARAMETER_SEPARATOR\]:' \
 grep -Fq \
     'source[parser]:'"$project_root"'/tests/cases/bootstrap/invalid-parser-diagnostics.ab:' \
     "$output_directory/invalid-parser.err"
-grep -q 'error\[E_IR_UNCLASSIFIED\]:' \
+grep -q 'error\[E_IR_FUNCTION_VERIFICATION\]:' \
+    "$output_directory/invalid-parser.err"
+grep -q 'error\[E_IR_EMISSION\]:' \
     "$output_directory/invalid-parser.err"
 assert_compiler_diagnostic_accounting \
     "$output_directory/invalid-parser.err"
 
-"$compiler" build \
+ABLA_MAX_MEMORY_MB=4096 "$compiler" build \
     "$project_root/tests/cases/modules/ir-diagnostic-fallback.ab" \
     -o "$output_directory/ir-diagnostic-fallback" --no-cache
 set +e
@@ -253,7 +269,7 @@ set -e
 [[ $ir_diagnostic_status -eq 42 ]]
 
 set +e
-PATH=/nonexistent "$compiler" build \
+PATH="$missing_toolchain_path" "$compiler" build \
     "$project_root/tests/cases/modules/types-error.ab" \
     -o "$output_directory/invalid-compiler" --no-cache \
     > "$output_directory/invalid-compiler.out" \
@@ -284,7 +300,7 @@ grep -q 'error\[E_EXT_FUNCTION_HANDLE_OUT_OF_RANGE\]:' \
     "$output_directory/invalid-function-handle-states.err"
 
 set +e
-PATH=/nonexistent "$compiler" build \
+PATH="$missing_toolchain_path" "$compiler" build \
     "$project_root/tests/cases/bootstrap/block.ab" \
     -o "$output_directory/invalid-native-toolchain" --no-cache \
     > "$output_directory/invalid-native-toolchain.out" \
