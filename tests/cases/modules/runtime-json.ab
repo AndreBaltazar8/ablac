@@ -1,0 +1,188 @@
+import "abla/http/json"
+import "abla/http"
+import "abla/json"
+
+fun responseHeader(response: HttpResponse, name: string): string {
+    var value = ""
+    var index = 0
+    while (index < response.headers.size) {
+        if (httpAsciiEqualInsensitive(
+            response.headers[index].name, name
+        )) {
+            value = response.headers[index].value
+        }
+        index = index + 1
+    }
+    value
+}
+
+fun jsonCoreChecks(): bool {
+    val source =
+        "{\"text\":\"line\\n\\uD83D\\uDE00\",\"numbers\":[-9223372036854775808,9223372036854775808,1.50e+2],\"flag\":true,\"empty\":null}"
+    val parsed = jsonParse(source)
+    val numbers = parsed.value.get("numbers")
+    val encoded = jsonStringify(parsed.value)
+    val reparsed = jsonParse(encoded)
+    parsed.succeeded &&
+        parsed.value.isObject() &&
+        parsed.value.has("empty") &&
+        parsed.value.get("empty").isNull() &&
+        parsed.value.get("flag").asBoolean() &&
+        parsed.value.get("text").asString() == "line\n😀" &&
+        numbers.size() == 3 &&
+        numbers.at(0).intAvailable() &&
+        !numbers.at(1).intAvailable() &&
+        numbers.at(1).asNumber().text == "9223372036854775808" &&
+        !numbers.at(2).asNumber().integer &&
+        numbers.at(2).asNumber().text == "1.50e+2" &&
+        reparsed.succeeded && jsonStringify(reparsed.value) == encoded &&
+        jsonStringify(parsed.value) == encoded
+}
+
+fun jsonErrorChecks(): bool {
+    val duplicate = jsonParse("{\"a\":1,\"a\":2}")
+    val relaxed = jsonParse(
+        "{\"a\":1,\"a\":2}",
+        JsonLimits(100, 10, 10, 100, 10, false)
+    )
+    val number = jsonParse("1e+")
+    val leadingZero = jsonParse("01")
+    val leadingPlus = jsonParse("+1")
+    val escape = jsonParse("\"\\q\"")
+    val surrogate = jsonParse("\"\\uD800x\"")
+    val control = jsonParse("\"line\nbreak\"")
+    val trailing = jsonParse("true false")
+    val located = jsonParse("[true,\n false] trailing")
+    val ended = jsonParse("[1")
+    val depth = jsonParse(
+        "[[]]", JsonLimits(100, 1, 100, 100, 10, true)
+    )
+    val nodes = jsonParse(
+        "[null]", JsonLimits(100, 10, 1, 100, 10, true)
+    )
+    val memberLimit = jsonParse(
+        "{\"a\":1,\"b\":2}", JsonLimits(100, 10, 10, 100, 1, true)
+    )
+    val stringLimit = jsonParse(
+        "\"abcd\"", JsonLimits(100, 10, 10, 3, 10, true)
+    )
+    val input = jsonParse(
+        "true", JsonLimits(3, 10, 10, 10, 10, true)
+    )
+    val nul = jsonParse("\"\\u0000\"")
+    !duplicate.succeeded && duplicate.error.code == "duplicate_key" &&
+        duplicate.error.byteOffset > 0 && duplicate.error.line == 1 &&
+        relaxed.succeeded && relaxed.value.size() == 2 &&
+        relaxed.value.getInt("a") == 2 &&
+        jsonStringify(relaxed.value) == "{\"a\":1,\"a\":2}" &&
+        !number.succeeded && number.error.code == "invalid_number" &&
+        !leadingZero.succeeded &&
+        leadingZero.error.code == "invalid_number" &&
+        !leadingPlus.succeeded &&
+        leadingPlus.error.code == "invalid_number" &&
+        !escape.succeeded && escape.error.code == "invalid_escape" &&
+        !surrogate.succeeded && surrogate.error.code == "invalid_unicode" &&
+        !control.succeeded && control.error.code == "unexpected_token" &&
+        !trailing.succeeded && trailing.error.code == "trailing_input" &&
+        !located.succeeded && located.error.code == "trailing_input" &&
+        located.error.line == 2 && located.error.column == 9 &&
+        !ended.succeeded && ended.error.code == "unexpected_end" &&
+        !depth.succeeded && depth.error.code == "depth_limit" &&
+        !nodes.succeeded && nodes.error.code == "node_limit" &&
+        !memberLimit.succeeded && memberLimit.error.code == "node_limit" &&
+        !stringLimit.succeeded && stringLimit.error.code == "string_limit" &&
+        !input.succeeded && input.error.code == "input_limit" &&
+        jsonParse(
+            "null", JsonLimits(4, 1, 1, 4, 1, true)
+        ).succeeded &&
+        jsonParse(
+            "\"abc\"", JsonLimits(5, 1, 1, 3, 1, true)
+        ).succeeded &&
+        jsonParse(
+            "{\"a\":null}", JsonLimits(10, 2, 2, 1, 1, true)
+        ).succeeded &&
+        nul.succeeded && nul.value.asString().size == 1 &&
+        nul.value.asString()[0] == 0
+}
+
+compile fun stagedJsonSize(): int = jsonParse(
+    "{\"ratio\":1.5,\"large\":9223372036854775808,\"nested\":[false,null]}"
+).value.size()
+
+compile fun stagedJsonText(): string = jsonStringify(jsonParse(
+    "{\"ratio\":1.5,\"large\":9223372036854775808,\"nested\":[false,null]}"
+).value)
+
+fun jsonLiteralStatus(): int {
+    val literal = $json {
+        "ratio": 1.5,
+        "large": 9223372036854775808,
+        "nested": [false, null]
+    }
+    val stagedJsonObjectSize = #stagedJsonSize()
+    val stagedJsonEncoded = #stagedJsonText()
+    if (stagedJsonObjectSize != 3) 41
+    else if (literal.size() != 3) 39
+    else if (jsonStringify(literal) != stagedJsonEncoded) 31
+    else if (literal.get("ratio").asNumber().text != "1.5") 32
+    else if (literal.get("large").intAvailable()) 33
+    else 42
+}
+
+fun jsonHttpChecks(): bool {
+    val value = jsonObject(
+        ["message"],
+        [jsonString("hello \"rpc\"")]
+    )
+    val request = httpPostJson(
+        "/rpc",
+        value,
+        [HttpHeader("Content-Type", "text/plain"),
+         HttpHeader("X-Test", "1")]
+    )
+    val accepted = httpPostJson(
+        "/rpc", value, [HttpHeader("aCcEpT", "application/problem+json")]
+    )
+    val parsed = request.parseJson()
+    val suffixRequest = httpRequest(
+        "POST",
+        "/rpc",
+        request.body,
+        [HttpHeader(
+            "content-type", "Application/Problem+JSON; Charset=UTF-8"
+        )]
+    )
+    val missing = httpRequest("POST", "/rpc", request.body).parseJson()
+    val response = httpJsonValue(
+        value,
+        422,
+        [HttpHeader("content-type", "text/plain"),
+         HttpHeader("X-Test", "1")]
+    )
+    parsed.succeeded && parsed.value.getString("message") == "hello \"rpc\"" &&
+        suffixRequest.parseJson().succeeded &&
+        !missing.succeeded && missing.error.code == "unsupported_media_type" &&
+        request.header("Content-Type") ==
+            "application/json; charset=utf-8" &&
+        request.header("Accept") == "application/json" &&
+        accepted.header("Accept") == "application/problem+json" &&
+        request.header("X-Test") == "1" &&
+        responseHeader(response, "Content-Type") ==
+            "application/json; charset=utf-8" &&
+        response.headers.size == 2 &&
+        response.body == jsonStringify(value) &&
+        httpStatusReason(409) == "Conflict" &&
+        httpStatusReason(413) == "Payload Too Large" &&
+        httpStatusReason(415) == "Unsupported Media Type" &&
+        httpStatusReason(422) == "Unprocessable Content" &&
+        httpStatusReason(429) == "Too Many Requests" &&
+        httpStatusReason(799) == "Unknown Status"
+}
+
+fun main: int {
+    if (!jsonCoreChecks()) 10
+    else if (!jsonErrorChecks()) 20
+    else if (jsonLiteralStatus() != 42) jsonLiteralStatus()
+    else if (!jsonHttpChecks()) 40
+    else 42
+}

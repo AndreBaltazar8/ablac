@@ -18,7 +18,9 @@ unrelated policy or compiler machinery into the program:
 | `abla/runtime/memory` | internal emitted checkpoint/live-byte/budget/collection intrinsics used by the portable facade, compiler, and tests |
 | `abla/net` | typed TCP listener/connection facade; raw Linux backend today |
 | `abla/http` | HTTP/1 client/server, pluggable transport, and version-aware routing |
-| `abla/json`, `abla/html` | data models and `$json`/`$html` subparsers |
+| `abla/json` | [bounded JSON parsing, deterministic serialization, and `$json` literals](json.md) |
+| `abla/http/json` | opt-in adapters between JSON values and HTTP requests/responses |
+| `abla/html` | HTML data model and `$html` subparser |
 | `abla/compiler/*` | compile-time parser/reflection APIs only |
 | `abla/build` | framework-neutral compile-time program and export requests |
 | `abla/android/build` | Android-owned arm64 target, `libabla_app.so` request, and generated JNI/Kotlin/CMake/Gradle integration |

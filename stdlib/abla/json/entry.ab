@@ -1,7 +1,17 @@
-// Phase-safe JSON model and compile-time `$json` parser provider.
-// Kinds: 0 null, 1 string, 2 integer, 3 boolean, 4 array, 5 object.
+// Phase-safe JSON values, strict bounded parsing, deterministic serialization,
+// and the `$json` parser provider. Kinds: 0 null, 1 string, 2 number,
+// 3 boolean, 4 array, 5 object.
 
+import "abla/bytes"
 import "abla/compiler/parser"
+import "abla/text"
+
+class JsonNumber(
+    val text: string,
+    val integer: bool,
+    val intValue: int,
+    val intAvailable: bool
+)
 
 class Json(
     val kind: int,
@@ -9,8 +19,747 @@ class Json(
     val intValue: int,
     val boolValue: bool,
     val keys: array<string>,
-    val values: array<Json>
+    val values: array<Json>,
+    val numberValue: JsonNumber
 )
+
+class JsonError(
+    val code: string,
+    val message: string,
+    val byteOffset: int,
+    val line: int,
+    val column: int
+)
+
+class JsonParseResult(
+    val value: Json,
+    val succeeded: bool,
+    val error: JsonError
+)
+
+class JsonLimits(
+    val maximumBytes: int,
+    val maximumDepth: int,
+    val maximumNodes: int,
+    val maximumStringBytes: int,
+    val maximumObjectMembers: int,
+    val rejectDuplicateKeys: bool
+)
+
+class JsonNumberGrammar(
+    val valid: bool,
+    val integer: bool
+)
+
+class JsonParserState(
+    val source: string,
+    val limits: JsonLimits,
+    var offset: int,
+    var nodes: int,
+    var errorCode: string,
+    var errorMessage: string,
+    var errorOffset: int
+)
+
+class JsonWriter(
+    val output: ByteBuffer,
+    var valid: bool
+)
+
+fun jsonDefaultLimits(): JsonLimits = JsonLimits(
+    1048576,
+    64,
+    100000,
+    1048576,
+    10000,
+    true
+)
+
+fun jsonLimitsValid(limits: JsonLimits): bool =
+    limits.maximumBytes > 0 && limits.maximumBytes <= 16777216 &&
+    limits.maximumDepth > 0 && limits.maximumDepth <= 256 &&
+    limits.maximumNodes > 0 && limits.maximumNodes <= 1000000 &&
+    limits.maximumStringBytes > 0 &&
+    limits.maximumStringBytes <= 16777216 &&
+    limits.maximumObjectMembers > 0 &&
+    limits.maximumObjectMembers <= 100000
+
+fun jsonEmptyNumber(): JsonNumber = JsonNumber("", false, 0, false)
+
+fun jsonNull(): Json = Json(0, "", 0, false, [], [], jsonEmptyNumber())
+
+fun jsonString(value: string): Json {
+    if (value.isValidUtf8()) {
+        Json(1, value, 0, false, [], [], jsonEmptyNumber())
+    } else jsonNull()
+}
+
+fun jsonNumberGrammar(text: string): JsonNumberGrammar {
+    var offset = 0
+    var valid = text.size > 0
+    var integer = true
+    if (valid && text[offset] == 45) {
+        offset = offset + 1
+        if (offset >= text.size) valid = false
+    }
+    if (valid && text[offset] == 48) {
+        offset = offset + 1
+        if (offset < text.size && text[offset] >= 48 && text[offset] <= 57) {
+            valid = false
+        }
+    } else if (valid && text[offset] >= 49 && text[offset] <= 57) {
+        while (offset < text.size && text[offset] >= 48 &&
+               text[offset] <= 57) {
+            offset = offset + 1
+        }
+    } else valid = false
+    if (valid && offset < text.size && text[offset] == 46) {
+        integer = false
+        offset = offset + 1
+        val fractionBegin = offset
+        while (offset < text.size && text[offset] >= 48 &&
+               text[offset] <= 57) {
+            offset = offset + 1
+        }
+        if (offset == fractionBegin) valid = false
+    }
+    if (valid && offset < text.size &&
+        (text[offset] == 101 || text[offset] == 69)) {
+        integer = false
+        offset = offset + 1
+        if (offset < text.size &&
+            (text[offset] == 43 || text[offset] == 45)) {
+            offset = offset + 1
+        }
+        val exponentBegin = offset
+        while (offset < text.size && text[offset] >= 48 &&
+               text[offset] <= 57) {
+            offset = offset + 1
+        }
+        if (offset == exponentBegin) valid = false
+    }
+    if (offset != text.size) valid = false
+    JsonNumberGrammar(valid, valid && integer)
+}
+
+fun jsonIntegerTextAvailable(text: string): bool {
+    var negative = false
+    var begin = 0
+    if (text.size > 0 && text[0] == 45) {
+        negative = true
+        begin = 1
+    }
+    val digits = text.size - begin
+    var available = digits > 0 && digits <= 19
+    if (available && digits == 19) {
+        val limit = if (negative) "9223372036854775808"
+            else "9223372036854775807"
+        var index = 0
+        var decided = false
+        while (index < 19 && !decided) {
+            val actual = text[begin + index]
+            val maximum = limit[index]
+            if (actual < maximum) decided = true
+            if (actual > maximum) {
+                available = false
+                decided = true
+            }
+            index = index + 1
+        }
+    }
+    available
+}
+
+fun jsonIntegerTextValue(text: string): int {
+    val negative = text.size > 0 && text[0] == 45
+    var offset = if (negative) 1 else 0
+    var value = 0
+    while (offset < text.size) {
+        value = value * 10 - (text[offset] - 48)
+        offset = offset + 1
+    }
+    if (negative) value else -value
+}
+
+fun jsonNumberInfo(text: string): JsonNumber {
+    val grammar = jsonNumberGrammar(text)
+    val available = grammar.valid && grammar.integer &&
+        jsonIntegerTextAvailable(text)
+    JsonNumber(
+        text,
+        grammar.integer,
+        if (available) jsonIntegerTextValue(text) else 0,
+        available
+    )
+}
+
+fun jsonNumber(value: JsonNumber): Json {
+    val checked = jsonNumberInfo(value.text)
+    if (jsonNumberGrammar(value.text).valid) {
+        Json(
+            2,
+            "",
+            checked.intValue,
+            false,
+            [],
+            [],
+            checked
+        )
+    } else jsonNull()
+}
+
+fun jsonNumberText(value: string): Json = jsonNumber(jsonNumberInfo(value))
+
+fun jsonInteger(value: int): Json = jsonNumberText("$value")
+
+fun jsonBoolean(value: bool): Json =
+    Json(3, "", 0, value, [], [], jsonEmptyNumber())
+
+fun jsonArray(values: array<Json>): Json =
+    Json(4, "", 0, false, [], values, jsonEmptyNumber())
+
+fun jsonObject(keys: array<string>, values: array<Json>): Json {
+    var valid = keys.size == values.size
+    var index = 0
+    while (valid && index < keys.size) {
+        valid = keys[index].isValidUtf8()
+        index = index + 1
+    }
+    if (valid) Json(5, "", 0, false, keys, values, jsonEmptyNumber())
+    else jsonNull()
+}
+
+// Compatibility constructors retained for existing `$json` consumers.
+fun ablaJsonNull(): Json = jsonNull()
+fun ablaJsonString(value: string): Json = jsonString(value)
+fun ablaJsonInteger(value: int): Json = jsonInteger(value)
+fun ablaJsonNumberText(value: string): Json = jsonNumberText(value)
+fun ablaJsonBoolean(value: bool): Json = jsonBoolean(value)
+fun ablaJsonArray(values: array<Json>): Json = jsonArray(values)
+fun ablaJsonObject(keys: array<string>, values: array<Json>): Json =
+    jsonObject(keys, values)
+
+fun Json.isNull(): bool = this.kind == 0
+fun Json.isString(): bool = this.kind == 1
+fun Json.isNumber(): bool = this.kind == 2
+fun Json.isBoolean(): bool = this.kind == 3
+fun Json.isArray(): bool = this.kind == 4
+fun Json.isObject(): bool = this.kind == 5
+fun Json.asString(): string = if (this.kind == 1) this.stringValue else ""
+fun Json.asBoolean(): bool = this.kind == 3 && this.boolValue
+fun Json.asNumber(): JsonNumber =
+    if (this.kind == 2) this.numberValue else jsonEmptyNumber()
+fun Json.asInt(): int =
+    if (this.kind == 2 && this.numberValue.intAvailable) this.intValue else 0
+fun Json.intAvailable(): bool =
+    this.kind == 2 && this.numberValue.intAvailable
+
+fun Json.get(key: string): Json {
+    var value = jsonNull()
+    var index = 0
+    while (index < this.keys.size && index < this.values.size) {
+        if (this.keys[index] == key) value = this.values[index]
+        index = index + 1
+    }
+    value
+}
+
+fun Json.has(key: string): bool {
+    var found = false
+    var index = 0
+    while (!found && index < this.keys.size) {
+        if (this.keys[index] == key) found = true
+        index = index + 1
+    }
+    found
+}
+
+fun Json.size(): int {
+    if (this.kind == 4) this.values.size
+    else if (this.kind == 5) this.keys.size
+    else 0
+}
+
+fun Json.at(index: int): Json = this.values[index]
+
+fun Json.getString(key: string): string = this.get(key).asString()
+
+fun Json.getInt(key: string): int = this.get(key).asInt()
+
+fun JsonParserState.fail(
+    code: string,
+    message: string,
+    offset: int
+): void {
+    if (this.errorCode == "") {
+        this.errorCode = code
+        this.errorMessage = message
+        this.errorOffset = offset
+    }
+}
+
+fun jsonSkipWhitespace(var state: JsonParserState): void {
+    var scanning = true
+    while (scanning && state.offset < state.source.size) {
+        val byte = state.source[state.offset]
+        scanning = byte == 32 || byte == 9 || byte == 10 || byte == 13
+        if (scanning) state.offset = state.offset + 1
+    }
+}
+
+fun jsonHexValue(byte: int): int {
+    var value = -1
+    if (byte >= 48 && byte <= 57) value = byte - 48
+    if (byte >= 65 && byte <= 70) value = byte - 65 + 10
+    if (byte >= 97 && byte <= 102) value = byte - 97 + 10
+    value
+}
+
+fun jsonHexQuad(source: string, offset: int): int {
+    var value = 0
+    var valid = offset >= 0 && offset + 4 <= source.size
+    var index = 0
+    while (valid && index < 4) {
+        val digit = jsonHexValue(source[offset + index])
+        if (digit < 0) valid = false
+        if (digit >= 0) value = value * 16 + digit
+        index = index + 1
+    }
+    if (valid) value else -1
+}
+
+fun jsonParseString(var state: JsonParserState): string {
+    val output = byteBuffer()
+    val quoteOffset = state.offset
+    if (state.offset < state.source.size && state.source[state.offset] == 34) {
+        state.offset = state.offset + 1
+    } else state.fail("unexpected_token", "expected JSON string", state.offset)
+    var closed = false
+    while (state.errorCode == "" && !closed &&
+           state.offset < state.source.size) {
+        val byte = state.source[state.offset]
+        if (byte == 34) {
+            closed = true
+            state.offset = state.offset + 1
+        } else if (byte == 92) {
+            val escapeOffset = state.offset
+            state.offset = state.offset + 1
+            if (state.offset >= state.source.size) {
+                state.fail(
+                    "unexpected_end", "unterminated JSON escape", state.offset
+                )
+            } else {
+                val escaped = state.source[state.offset]
+                state.offset = state.offset + 1
+                if (escaped == 34) output.appendText("\"")
+                else if (escaped == 92) output.appendText("\\")
+                else if (escaped == 47) output.appendText("/")
+                else if (escaped == 98) output.appendText(utf8Encode(8))
+                else if (escaped == 102) output.appendText(utf8Encode(12))
+                else if (escaped == 110) output.appendText("\n")
+                else if (escaped == 114) output.appendText("\r")
+                else if (escaped == 116) output.appendText("\t")
+                else if (escaped == 117) {
+                    val unicodeOffset = state.offset
+                    var scalar = jsonHexQuad(state.source, state.offset)
+                    if (scalar < 0) {
+                        state.fail(
+                            "invalid_unicode",
+                            "invalid JSON Unicode escape",
+                            unicodeOffset
+                        )
+                    } else {
+                        state.offset = state.offset + 4
+                        if (scalar >= 55296 && scalar <= 56319) {
+                            if (state.offset + 6 <= state.source.size &&
+                                state.source[state.offset] == 92 &&
+                                state.source[state.offset + 1] == 117) {
+                                val low = jsonHexQuad(
+                                    state.source, state.offset + 2
+                                )
+                                if (low >= 56320 && low <= 57343) {
+                                    scalar = 65536 + (scalar - 55296) * 1024 +
+                                        low - 56320
+                                    state.offset = state.offset + 6
+                                } else state.fail(
+                                    "invalid_unicode",
+                                    "invalid JSON surrogate pair",
+                                    state.offset
+                                )
+                            } else state.fail(
+                                "invalid_unicode",
+                                "missing JSON low surrogate",
+                                state.offset
+                            )
+                        } else if (scalar >= 56320 && scalar <= 57343) {
+                            state.fail(
+                                "invalid_unicode",
+                                "unexpected JSON low surrogate",
+                                unicodeOffset
+                            )
+                        }
+                        if (state.errorCode == "") {
+                            output.appendText(utf8Encode(scalar))
+                        }
+                    }
+                } else state.fail(
+                    "invalid_escape", "invalid JSON string escape", escapeOffset
+                )
+            }
+        } else if (byte < 32) {
+            state.fail(
+                "unexpected_token",
+                "unescaped control byte in JSON string",
+                state.offset
+            )
+        } else if (byte < 128) {
+            output.appendText(state.source.slice(state.offset, state.offset + 1))
+            state.offset = state.offset + 1
+        } else {
+            val length = utf8SequenceLength(byte)
+            if (!utf8SequenceValid(state.source, state.offset, length)) {
+                state.fail(
+                    "invalid_unicode", "invalid UTF-8 in JSON string", state.offset
+                )
+            } else {
+                output.appendText(state.source.slice(
+                    state.offset, state.offset + length
+                ))
+                state.offset = state.offset + length
+            }
+        }
+        if (state.errorCode == "" &&
+            output.size() > state.limits.maximumStringBytes) {
+            state.fail(
+                "string_limit", "JSON string exceeds configured limit", quoteOffset
+            )
+        }
+    }
+    if (state.errorCode == "" && !closed) {
+        state.fail(
+            "unexpected_end", "unterminated JSON string", state.source.size
+        )
+    }
+    output.toText()
+}
+
+fun jsonParseNumber(var state: JsonParserState): Json {
+    val begin = state.offset
+    var scanning = true
+    while (scanning && state.offset < state.source.size) {
+        val byte = state.source[state.offset]
+        scanning = (byte >= 48 && byte <= 57) || byte == 45 ||
+            byte == 43 || byte == 46 || byte == 101 || byte == 69
+        if (scanning) state.offset = state.offset + 1
+    }
+    val text = state.source.slice(begin, state.offset)
+    val grammar = jsonNumberGrammar(text)
+    if (!grammar.valid) {
+        state.fail("invalid_number", "invalid JSON number", begin)
+        jsonNull()
+    } else jsonNumberText(text)
+}
+
+fun jsonParseValue(var state: JsonParserState, depth: int): Json {
+    jsonSkipWhitespace(state)
+    var result = jsonNull()
+    if (state.errorCode == "" && depth > state.limits.maximumDepth) {
+        state.fail("depth_limit", "JSON nesting exceeds configured limit", state.offset)
+    }
+    if (state.errorCode == "") {
+        state.nodes = state.nodes + 1
+        if (state.nodes > state.limits.maximumNodes) {
+            state.fail("node_limit", "JSON node count exceeds configured limit", state.offset)
+        }
+    }
+    if (state.errorCode == "" && state.offset >= state.source.size) {
+        state.fail("unexpected_end", "expected JSON value", state.offset)
+    }
+    if (state.errorCode == "") {
+        val byte = state.source[state.offset]
+        if (byte == 34) result = jsonString(jsonParseString(state))
+        else if (byte == 91) {
+            state.offset = state.offset + 1
+            val values: array<Json> = []
+            jsonSkipWhitespace(state)
+            var closed = false
+            if (state.offset < state.source.size &&
+                state.source[state.offset] == 93) {
+                state.offset = state.offset + 1
+                closed = true
+            }
+            while (state.errorCode == "" && !closed) {
+                values.append(jsonParseValue(state, depth + 1))
+                jsonSkipWhitespace(state)
+                if (state.offset >= state.source.size) {
+                    state.fail(
+                        "unexpected_end", "unterminated JSON array", state.offset
+                    )
+                } else if (state.source[state.offset] == 93) {
+                    state.offset = state.offset + 1
+                    closed = true
+                } else if (state.source[state.offset] == 44) {
+                    state.offset = state.offset + 1
+                    jsonSkipWhitespace(state)
+                    if (state.offset < state.source.size &&
+                        state.source[state.offset] == 93) {
+                        state.fail(
+                            "unexpected_token",
+                            "trailing comma in JSON array",
+                            state.offset
+                        )
+                    }
+                } else state.fail(
+                    "unexpected_token",
+                    "expected comma or closing bracket",
+                    state.offset
+                )
+            }
+            result = jsonArray(values)
+        } else if (byte == 123) {
+            state.offset = state.offset + 1
+            val keys: array<string> = []
+            val values: array<Json> = []
+            jsonSkipWhitespace(state)
+            var closed = false
+            if (state.offset < state.source.size &&
+                state.source[state.offset] == 125) {
+                state.offset = state.offset + 1
+                closed = true
+            }
+            while (state.errorCode == "" && !closed) {
+                if (state.offset >= state.source.size) {
+                    state.fail(
+                        "unexpected_end", "unterminated JSON object", state.offset
+                    )
+                } else if (state.source[state.offset] != 34) {
+                    state.fail(
+                        "unexpected_token",
+                        "JSON object key must be a string",
+                        state.offset
+                    )
+                }
+                var key = ""
+                if (state.errorCode == "") key = jsonParseString(state)
+                if (state.errorCode == "" &&
+                    keys.size >= state.limits.maximumObjectMembers) {
+                    state.fail(
+                        "node_limit",
+                        "JSON object member count exceeds configured limit",
+                        state.offset
+                    )
+                }
+                var duplicate = false
+                var keyIndex = 0
+                while (keyIndex < keys.size) {
+                    if (keys[keyIndex] == key) duplicate = true
+                    keyIndex = keyIndex + 1
+                }
+                if (state.errorCode == "" && duplicate &&
+                    state.limits.rejectDuplicateKeys) {
+                    state.fail(
+                        "duplicate_key", "duplicate JSON object key", state.offset
+                    )
+                }
+                jsonSkipWhitespace(state)
+                if (state.errorCode == "" &&
+                    (state.offset >= state.source.size ||
+                     state.source[state.offset] != 58)) {
+                    state.fail(
+                        "unexpected_token",
+                        "expected colon after JSON object key",
+                        state.offset
+                    )
+                }
+                if (state.errorCode == "") state.offset = state.offset + 1
+                var value = jsonNull()
+                if (state.errorCode == "") {
+                    value = jsonParseValue(state, depth + 1)
+                }
+                if (state.errorCode == "") {
+                    keys.append(key)
+                    values.append(value)
+                }
+                jsonSkipWhitespace(state)
+                if (state.errorCode == "" &&
+                    state.offset >= state.source.size) {
+                    state.fail(
+                        "unexpected_end", "unterminated JSON object", state.offset
+                    )
+                } else if (state.errorCode == "" &&
+                    state.source[state.offset] == 125) {
+                    state.offset = state.offset + 1
+                    closed = true
+                } else if (state.errorCode == "" &&
+                    state.source[state.offset] == 44) {
+                    state.offset = state.offset + 1
+                    jsonSkipWhitespace(state)
+                    if (state.offset < state.source.size &&
+                        state.source[state.offset] == 125) {
+                        state.fail(
+                            "unexpected_token",
+                            "trailing comma in JSON object",
+                            state.offset
+                        )
+                    }
+                } else if (state.errorCode == "") state.fail(
+                    "unexpected_token",
+                    "expected comma or closing brace",
+                    state.offset
+                )
+            }
+            result = jsonObject(keys, values)
+        } else if ((byte >= 48 && byte <= 57) || byte == 45 || byte == 43) {
+            result = jsonParseNumber(state)
+        } else if (state.offset + 4 <= state.source.size &&
+            state.source.slice(state.offset, state.offset + 4) == "true") {
+            state.offset = state.offset + 4
+            result = jsonBoolean(true)
+        } else if (state.offset + 5 <= state.source.size &&
+            state.source.slice(state.offset, state.offset + 5) == "false") {
+            state.offset = state.offset + 5
+            result = jsonBoolean(false)
+        } else if (state.offset + 4 <= state.source.size &&
+            state.source.slice(state.offset, state.offset + 4) == "null") {
+            state.offset = state.offset + 4
+            result = jsonNull()
+        } else state.fail(
+            "unexpected_token", "unexpected token in JSON input", state.offset
+        )
+    }
+    result
+}
+
+fun jsonErrorLocation(source: string, offset: int): array<int> {
+    var line = 1
+    var column = 1
+    var index = 0
+    while (index < offset && index < source.size) {
+        if (source[index] == 10) {
+            line = line + 1
+            column = 1
+        } else column = column + 1
+        index = index + 1
+    }
+    [line, column]
+}
+
+fun jsonParse(
+    source: string,
+    limits: JsonLimits = jsonDefaultLimits()
+): JsonParseResult {
+    val state = JsonParserState(source, limits, 0, 0, "", "", 0)
+    if (!jsonLimitsValid(limits)) {
+        state.fail("input_limit", "invalid JSON parser limits", 0)
+    }
+    if (state.errorCode == "" && source.size > limits.maximumBytes) {
+        state.fail(
+            "input_limit", "JSON input exceeds configured byte limit",
+            limits.maximumBytes
+        )
+    }
+    if (state.errorCode == "") {
+        val utf8 = utf8Info(source)
+        if (!utf8.valid) {
+            state.fail("invalid_unicode", "JSON input is not valid UTF-8", utf8.errorOffset)
+        }
+    }
+    var value = jsonNull()
+    if (state.errorCode == "") value = jsonParseValue(state, 1)
+    jsonSkipWhitespace(state)
+    if (state.errorCode == "" && state.offset != source.size) {
+        state.fail("trailing_input", "trailing input after JSON value", state.offset)
+    }
+    if (state.errorCode == "") {
+        JsonParseResult(value, true, JsonError("", "", 0, 1, 1))
+    } else {
+        val location = jsonErrorLocation(source, state.errorOffset)
+        JsonParseResult(
+            jsonNull(),
+            false,
+            JsonError(
+                state.errorCode,
+                state.errorMessage,
+                state.errorOffset,
+                location[0],
+                location[1]
+            )
+        )
+    }
+}
+
+fun jsonWriteString(var writer: JsonWriter, value: string): void {
+    if (!value.isValidUtf8()) writer.valid = false
+    if (writer.valid) writer.output.appendText("\"")
+    var offset = 0
+    val hex = "0123456789abcdef"
+    while (writer.valid && offset < value.size) {
+        val byte = value[offset]
+        if (byte == 34) writer.output.appendText("\\\"")
+        else if (byte == 92) writer.output.appendText("\\\\")
+        else if (byte == 8) writer.output.appendText("\\b")
+        else if (byte == 12) writer.output.appendText("\\f")
+        else if (byte == 10) writer.output.appendText("\\n")
+        else if (byte == 13) writer.output.appendText("\\r")
+        else if (byte == 9) writer.output.appendText("\\t")
+        else if (byte < 32) {
+            writer.output.appendText("\\u00")
+            writer.output.appendText(hex.slice(byte / 16, byte / 16 + 1))
+            val low = byte - (byte / 16) * 16
+            writer.output.appendText(hex.slice(low, low + 1))
+        } else if (byte < 128) {
+            writer.output.appendText(value.slice(offset, offset + 1))
+        } else {
+            val length = utf8SequenceLength(byte)
+            if (!utf8SequenceValid(value, offset, length)) writer.valid = false
+            if (writer.valid) writer.output.appendText(
+                value.slice(offset, offset + length)
+            )
+            offset = offset + length - 1
+        }
+        offset = offset + 1
+    }
+    if (writer.valid) writer.output.appendText("\"")
+}
+
+fun jsonWriteValue(var writer: JsonWriter, value: Json): void {
+    if (value.kind == 0) writer.output.appendText("null")
+    else if (value.kind == 1) jsonWriteString(writer, value.stringValue)
+    else if (value.kind == 2) {
+        if (jsonNumberGrammar(value.numberValue.text).valid) {
+            writer.output.appendText(value.numberValue.text)
+        } else writer.valid = false
+    } else if (value.kind == 3) {
+        writer.output.appendText(if (value.boolValue) "true" else "false")
+    } else if (value.kind == 4) {
+        writer.output.appendText("[")
+        var index = 0
+        while (writer.valid && index < value.values.size) {
+            if (index > 0) writer.output.appendText(",")
+            jsonWriteValue(writer, value.values[index])
+            index = index + 1
+        }
+        if (writer.valid) writer.output.appendText("]")
+    } else if (value.kind == 5) {
+        if (value.keys.size != value.values.size) writer.valid = false
+        if (writer.valid) writer.output.appendText("{")
+        var index = 0
+        while (writer.valid && index < value.keys.size) {
+            if (index > 0) writer.output.appendText(",")
+            jsonWriteString(writer, value.keys[index])
+            if (writer.valid) writer.output.appendText(":")
+            if (writer.valid) jsonWriteValue(writer, value.values[index])
+            index = index + 1
+        }
+        if (writer.valid) writer.output.appendText("}")
+    } else writer.valid = false
+}
+
+fun jsonStringify(value: Json): string {
+    val writer = JsonWriter(byteBuffer(), true)
+    jsonWriteValue(writer, value)
+    if (writer.valid) writer.output.toText() else "null"
+}
 
 compile fun ablaJsonSyntaxCall(
     name: string,
@@ -30,10 +779,8 @@ compile fun ablaJsonParseValue(cursor: ParserCursor): SyntaxExpression {
             parserParseAblaExpression(cursor)
         )
     } else if (parserAt(cursor, "integer") || parserAt(cursor, "-")) {
-        ablaJsonSyntaxCall(
-            "ablaJsonInteger",
-            parserParseAblaExpression(cursor)
-        )
+        val number = parserRawTakeUntil(cursor, " \t\r\n,]}")
+        ablaJsonSyntaxCall("ablaJsonNumberText", syntaxString(number))
     } else if (parserAt(cursor, "true") || parserAt(cursor, "false")) {
         ablaJsonSyntaxCall(
             "ablaJsonBoolean",
@@ -53,6 +800,7 @@ compile fun ablaJsonParseArray(cursor: ParserCursor): SyntaxExpression {
     while (more) {
         values.append(ablaJsonParseValue(cursor))
         more = parserConsume(cursor, ",")
+        if (more) parserRawSkipWhitespace(cursor)
     }
     parserExpect(cursor, "]")
     ablaJsonSyntaxCall("ablaJsonArray", syntaxArray(values))
@@ -68,6 +816,7 @@ compile fun ablaJsonParseObject(cursor: ParserCursor): SyntaxExpression {
         parserExpect(cursor, ":")
         values.append(ablaJsonParseValue(cursor))
         more = parserConsume(cursor, ",")
+        if (more) parserRawSkipWhitespace(cursor)
     }
     parserExpect(cursor, "}")
     val arguments: array<SyntaxExpression> = []
@@ -77,42 +826,3 @@ compile fun ablaJsonParseObject(cursor: ParserCursor): SyntaxExpression {
 }
 
 #compilerRegisterSubparser("json", ablaJsonParseValue)
-
-fun ablaJsonNull(): Json = Json(0, "", 0, false, [], [])
-
-fun ablaJsonString(value: string): Json = Json(1, value, 0, false, [], [])
-
-fun ablaJsonInteger(value: int): Json = Json(2, "", value, false, [], [])
-
-fun ablaJsonBoolean(value: bool): Json = Json(3, "", 0, value, [], [])
-
-fun ablaJsonArray(values: array<Json>): Json = Json(4, "", 0, false, [], values)
-
-fun ablaJsonObject(keys: array<string>, values: array<Json>): Json =
-    Json(5, "", 0, false, keys, values)
-
-fun Json.getString(key: string): string {
-    var result = ""
-    var index = 0
-    while (index < this.keys.size) {
-        if (this.keys[index] == key && this.values[index].kind == 1) {
-            result = this.values[index].stringValue
-        }
-        index = index + 1
-    }
-    result
-}
-
-fun Json.getInt(key: string): int {
-    var result = 0
-    var index = 0
-    while (index < this.keys.size) {
-        if (this.keys[index] == key && this.values[index].kind == 2) {
-            result = this.values[index].intValue
-        }
-        index = index + 1
-    }
-    result
-}
-
-fun Json.at(index: int): Json = this.values[index]

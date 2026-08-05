@@ -2,6 +2,7 @@ import "sema.ab"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
 import "abla/sys/linux/net"
+import "abla/text"
 
 // Parser handlers, finalizers, and ordinary staged expressions use separate
 // evaluator objects. Keep their transaction in a private per-process staging
@@ -2725,6 +2726,12 @@ class BootstrapEvaluator(
             // explicit safe point as a successful no-op while staging.
             result = bootstrapEvalInteger(0)
         }
+        if (targetName == "ablaUtf8EncodeScalar") {
+            val scalar = this.evaluate(expression.children[0])
+            if (scalar.kind == "integer") {
+                result = bootstrapEvalString(utf8Encode(scalar.integer))
+            } else this.errors = this.errors + 1
+        }
         if (targetName == "compilerFindFunction") {
             val name = this.evaluate(expression.children[0])
             var handle = -1
@@ -4451,6 +4458,10 @@ class BootstrapEvaluator(
         expression: BootstrapExpression
     ): BootstrapEvalValue {
         var result = bootstrapEvalInvalid()
+        var receiverType = receiver.owner
+        if (receiver.kind == "string") receiverType = "string"
+        if (receiver.kind == "integer") receiverType = "i64"
+        if (receiver.kind == "boolean") receiverType = "bool"
         if (receiver.owner == "Compiler") {
             var target = ""
             if (expression.text == "functions") {
@@ -4545,6 +4556,88 @@ class BootstrapEvaluator(
         while (result.kind == "invalid" &&
                declarationIndex < this.declarations.size) {
             val declaration = this.declarations[declarationIndex]
+            if ((declaration.kind == "fun" ||
+                 declaration.kind == "compile.fun") &&
+                declaration.extensionOwner == receiverType &&
+                declaration.name == expression.text) {
+                val extensionNames: array<string> = ["this"]
+                val extensionValues: array<BootstrapEvalValue> = [receiver]
+                val extensionMutable: array<bool> = [false]
+                var parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    extensionNames.append(declaration.parameters[parameter])
+                    if (parameter + 1 < expression.children.size) {
+                        extensionValues.append(this.evaluate(
+                            expression.children[parameter + 1]
+                        ))
+                    } else if (parameter <
+                            declaration.parameterDefaults.size &&
+                        declaration.parameterDefaults[parameter].kind !=
+                            "missing") {
+                        val defaults = BootstrapEvaluator(
+                            this.declarations,
+                            this.affineTypes,
+                            extensionNames,
+                            extensionValues,
+                            extensionMutable,
+                            this.cursors,
+                            this.syntax,
+                            this.typedCalls,
+                            this.reflectedTypes,
+                            this.generatedDeclarations,
+                            this.extensionRequests,
+                            this.compileInputPaths,
+                            this.compileInputContents,
+                            this.allowedCompileEffects,
+                            this.errors,
+                            this.steps,
+                            this.diagnostics
+                        )
+                        extensionValues.append(defaults.evaluate(
+                            declaration.parameterDefaults[parameter]
+                        ))
+                        this.errors = defaults.errors
+                        this.steps = defaults.steps
+                        this.diagnostics = defaults.diagnostics
+                    } else {
+                        extensionValues.append(bootstrapEvalInvalid())
+                        this.errors = this.errors + 1
+                    }
+                    extensionMutable.append(false)
+                    parameter = parameter + 1
+                }
+                val invocation = BootstrapEvaluator(
+                    this.declarations,
+                    this.affineTypes,
+                    extensionNames,
+                    extensionValues,
+                    extensionMutable,
+                    this.cursors,
+                    this.syntax,
+                    this.typedCalls,
+                    this.reflectedTypes,
+                    this.generatedDeclarations,
+                    this.extensionRequests,
+                    this.compileInputPaths,
+                    this.compileInputContents,
+                    this.allowedCompileEffects,
+                    this.errors,
+                    this.steps,
+                    this.diagnostics
+                )
+                result = invocation.evaluate(declaration.expression)
+                if (result.kind == "return" && result.elements.size == 1) {
+                    result = result.elements[0]
+                }
+                invocation.dropOwnedParameters(
+                    declaration.parameterKinds,
+                    result,
+                    1
+                )
+                this.errors = invocation.errors
+                this.steps = invocation.steps
+                this.diagnostics = invocation.diagnostics
+            }
             if (declaration.kind == "class" &&
                 declaration.name == receiver.owner) {
                 var methodIndex = 0
@@ -5209,7 +5302,10 @@ class BootstrapEvaluator(
                 val begin = this.evaluate(expression.children[1]).integer
                 val end = this.evaluate(expression.children[2]).integer
                 result = bootstrapEvalString(receiver.text.slice(begin, end))
-            } else if (receiver.kind == "object") {
+            } else if (receiver.kind == "object" ||
+                       receiver.kind == "string" ||
+                       receiver.kind == "integer" ||
+                       receiver.kind == "boolean") {
                 result = this.evaluateMethod(receiver, expression)
             } else result = result
         }

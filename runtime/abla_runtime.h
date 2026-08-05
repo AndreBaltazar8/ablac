@@ -257,6 +257,7 @@ AblaValue abla_string_concat(AblaValue left, AblaValue right);
 AblaValue abla_string_length(AblaValue value);
 AblaValue abla_string_get(AblaValue value, AblaValue index);
 AblaValue abla_string_slice(AblaValue value, AblaValue begin, AblaValue end);
+AblaValue ablaUtf8EncodeScalar(AblaValue value);
 AblaValue abla_length(AblaValue value);
 AblaValue abla_index_get(AblaValue value, AblaValue index);
 AblaValue abla_array_create(const AblaValue* values, size_t count);

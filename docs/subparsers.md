@@ -21,6 +21,10 @@ expression is phase-neutral: it executes at runtime in the first two examples
 and in the shared compile VM under `#` in the third. A handler must not smuggle
 compile-only host values into runtime IR.
 
+The `$json` provider uses the same [JSON model](json.md) as `jsonParse`. It
+accepts integer, fractional, and exponent number forms without converting them
+through floating point, including across formatted multi-line literals.
+
 ## Registration staging
 
 Parser providers are ordinary modules. Registration is an explicit top-level

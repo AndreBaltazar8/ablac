@@ -586,6 +586,45 @@ AblaValue abla_string_slice(
             .rope = (AblaStringRope*)0}};
 }
 
+AblaValue ablaUtf8EncodeScalar(AblaValue value) {
+    const int64_t scalar = abla_as_i64(value);
+    if (scalar < 0 || scalar > 0x10ffff ||
+        (scalar >= 0xd800 && scalar <= 0xdfff)) {
+        return abla_string_static("", 0);
+    }
+    char encoded[4];
+    size_t length = 0;
+    if (scalar <= 0x7f) {
+        encoded[0] = (char)scalar;
+        length = 1;
+    } else if (scalar <= 0x7ff) {
+        encoded[0] = (char)(0xc0 | (scalar >> 6));
+        encoded[1] = (char)(0x80 | (scalar & 0x3f));
+        length = 2;
+    } else if (scalar <= 0xffff) {
+        encoded[0] = (char)(0xe0 | (scalar >> 12));
+        encoded[1] = (char)(0x80 | ((scalar >> 6) & 0x3f));
+        encoded[2] = (char)(0x80 | (scalar & 0x3f));
+        length = 3;
+    } else {
+        encoded[0] = (char)(0xf0 | (scalar >> 18));
+        encoded[1] = (char)(0x80 | ((scalar >> 12) & 0x3f));
+        encoded[2] = (char)(0x80 | ((scalar >> 6) & 0x3f));
+        encoded[3] = (char)(0x80 | (scalar & 0x3f));
+        length = 4;
+    }
+    char* result = (char*)abla_platform_alloc(length + 1);
+    copy_bytes(result, encoded, length);
+    result[length] = '\0';
+    return (AblaValue){
+        .tag = ABLA_STRING,
+        .as.string = {
+            .data = result,
+            .length = length,
+            .owned = true,
+            .rope = (AblaStringRope*)0}};
+}
+
 AblaValue abla_length(AblaValue value) {
     if (value.tag == ABLA_STRING) return abla_string_length(value);
     if (value.tag == ABLA_ARRAY) return abla_array_length(value);

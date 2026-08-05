@@ -18,6 +18,7 @@ fixtures=(
     compile-shared:42
     collections:42
     json-subparser:42
+    runtime-json:42
     html-subparser:42
     abla-subparser:42
     abla-subparser-builder:42
