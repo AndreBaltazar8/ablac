@@ -259,6 +259,20 @@ fun bootstrapModuleFingerprint(
     hash
 }
 
+fun bootstrapModuleExpressionIdentity(
+    expression: BootstrapExpression
+): string {
+    var identity = "${expression.kind}:${expression.text}("
+    var child = 0
+    while (child < expression.children.size) {
+        identity = "$identity${bootstrapModuleExpressionIdentity(
+            expression.children[child]
+        )},"
+        child = child + 1
+    }
+    "$identity)"
+}
+
 fun bootstrapModuleInterfaceIdentity(
     parsed: BootstrapParseResult,
     implementationFirst: int,
@@ -269,7 +283,12 @@ fun bootstrapModuleInterfaceIdentity(
     var declaration = 0
     while (declaration < parsed.declarations.size) {
         val found = parsed.declarations[declaration]
-        identity = "$identity${found.kind}:${found.name}:${found.extensionOwner}:${found.resultType}:${found.isResource}:${found.isTrusted}:${found.isNoEscape}|"
+        var interfaceKind = found.kind
+        if (interfaceKind == "extern" && found.externalLibrary.size >= 9 &&
+            found.externalLibrary.slice(0, 9) == "contract:") {
+            interfaceKind = "fun"
+        }
+        identity = "$identity$interfaceKind:${found.name}:${found.extensionOwner}:${found.resultType}:${found.isResource}:${found.isTrusted}:${found.isNoEscape}|"
         var annotation = 0
         while (annotation < found.annotations.size) {
             identity = "$identity@${found.annotations[annotation]},"
@@ -286,6 +305,12 @@ fun bootstrapModuleInterfaceIdentity(
                 kind = found.parameterKinds[parameter]
             }
             identity = "$identity${found.parameters[parameter]}:$kind:$type,"
+            if (parameter < found.parameterDefaults.size &&
+                found.parameterDefaults[parameter].kind != "missing") {
+                identity = "$identity=${bootstrapModuleExpressionIdentity(
+                    found.parameterDefaults[parameter]
+                )}"
+            }
             parameter = parameter + 1
         }
         var method = 0
@@ -308,6 +333,13 @@ fun bootstrapModuleInterfaceIdentity(
                     kind = member.parameterKinds[parameter]
                 }
                 identity = "$identity$kind:$type,"
+                if (parameter < member.parameterDefaults.size &&
+                    member.parameterDefaults[parameter].kind != "missing") {
+                    identity =
+                        "$identity=${bootstrapModuleExpressionIdentity(
+                            member.parameterDefaults[parameter]
+                        )}"
+                }
                 parameter = parameter + 1
             }
             identity = "$identity)"
@@ -960,6 +992,165 @@ fun bootstrapModuleAliasTargetPrefix(
     prefix
 }
 
+fun bootstrapModuleIsContractTarget(
+    aliases: array<BootstrapModuleAlias>,
+    target: string
+): bool {
+    var contractOnly = false
+    var index = 0
+    while (index < aliases.size) {
+        if (aliases[index].target == target && aliases[index].contractOnly) {
+            contractOnly = true
+        }
+        index = index + 1
+    }
+    contractOnly
+}
+
+fun bootstrapContractDeclaration(
+    declaration: BootstrapDeclaration,
+    moduleIdentity: string
+): BootstrapDeclaration {
+    val annotations: array<string> = []
+    var annotation = 0
+    while (annotation < declaration.annotations.size) {
+        annotations.append(declaration.annotations[annotation])
+        annotation = annotation + 1
+    }
+    val kind = if (declaration.kind == "fun") "extern" else declaration.kind
+    val externalLibrary = if (declaration.kind == "fun") {
+        "contract:$moduleIdentity"
+    } else declaration.externalLibrary
+    BootstrapDeclaration(
+        kind,
+        declaration.name,
+        declaration.begin,
+        declaration.end,
+        BootstrapExpression(
+            "missing", "contract", declaration.begin, declaration.end, []
+        ),
+        declaration.parameters,
+        declaration.parameterTypes,
+        declaration.resultType,
+        [],
+        declaration.parameterDefaults,
+        externalLibrary,
+        declaration.parameterKinds,
+        declaration.extensionOwner,
+        declaration.isTrusted,
+        declaration.isResource,
+        declaration.isNoEscape,
+        declaration.generatedNamespace,
+        declaration.generatedOriginBegin,
+        declaration.generatedOriginEnd,
+        annotations,
+        declaration.annotationBegins,
+        declaration.annotationEnds
+    )
+}
+
+fun bootstrapProjectContract(
+    parsed: BootstrapParseResult,
+    moduleIdentity: string
+): BootstrapParseResult {
+    val declarations: array<BootstrapDeclaration> = []
+    var index = 0
+    while (index < parsed.declarations.size) {
+        val declaration = parsed.declarations[index]
+        if (declaration.kind == "fun" || declaration.kind == "class" ||
+            declaration.kind == "interface") {
+            declarations.append(bootstrapContractDeclaration(
+                declaration, moduleIdentity
+            ))
+        }
+        index = index + 1
+    }
+    BootstrapParseResult(
+        declarations,
+        [],
+        parsed.errors,
+        parsed.extensionErrors,
+        [],
+        [],
+        parsed.diagnostics
+    )
+}
+
+fun bootstrapContractTypeMentions(typeName: string, name: string): bool {
+    var found = false
+    var offset = 0
+    while (!found && offset + name.size <= typeName.size) {
+        val before = offset == 0 ||
+            !bootstrapIsAlphaNumeric(typeName[offset - 1])
+        val afterOffset = offset + name.size
+        val after = afterOffset == typeName.size ||
+            !bootstrapIsAlphaNumeric(typeName[afterOffset])
+        if (before && after && bootstrapRegionEquals(
+            typeName, offset, afterOffset, name
+        )) found = true
+        offset = offset + 1
+    }
+    found
+}
+
+fun bootstrapContractShapeMentions(
+    parsed: BootstrapParseResult,
+    name: string
+): bool {
+    var found = false
+    var declaration = 0
+    while (!found && declaration < parsed.declarations.size) {
+        val current = parsed.declarations[declaration]
+        if (bootstrapContractTypeMentions(current.resultType, name)) {
+            found = true
+        }
+        var parameter = 0
+        while (!found && parameter < current.parameterTypes.size) {
+            found = bootstrapContractTypeMentions(
+                current.parameterTypes[parameter], name
+            )
+            parameter = parameter + 1
+        }
+        var method = 0
+        while (!found && method < current.methods.size) {
+            val member = current.methods[method]
+            if (bootstrapContractTypeMentions(member.resultType, name)) {
+                found = true
+            }
+            parameter = 0
+            while (!found && parameter < member.parameterTypes.size) {
+                found = bootstrapContractTypeMentions(
+                    member.parameterTypes[parameter], name
+                )
+                parameter = parameter + 1
+            }
+            method = method + 1
+        }
+        declaration = declaration + 1
+    }
+    found
+}
+
+fun bootstrapContractImportRequired(
+    parsed: BootstrapParseResult,
+    edge: BootstrapImportEdge,
+    imported: BootstrapParseResult
+): bool {
+    var required = edge.alias != "" &&
+        bootstrapContractShapeMentions(parsed, edge.alias)
+    var declaration = 0
+    while (!required && edge.alias == "" &&
+           declaration < imported.declarations.size) {
+        val candidate = imported.declarations[declaration]
+        if ((candidate.kind == "class" || candidate.kind == "interface") &&
+            bootstrapContractShapeMentions(parsed, candidate.name)) {
+            required = true
+        }
+        declaration = declaration + 1
+    }
+    required
+}
+
 fun bootstrapExpressionDeclaresAliasBefore(
     expression: BootstrapExpression,
     alias: string,
@@ -1100,6 +1291,14 @@ fun bootstrapPrepareModuleSnapshot(
     aliases: array<BootstrapModuleAlias>
 ): BootstrapModuleSnapshot {
     val source = bootstrapRewriteModuleSource(snapshot, aliases)
+    var discovery = bootstrapParseWithIdentity(source, snapshot.path)
+    val contractOnly = bootstrapModuleIsContractTarget(aliases, snapshot.path)
+    if (contractOnly) {
+        discovery = bootstrapProjectContract(discovery, snapshot.path)
+    }
+    val fingerprintSource = if (contractOnly) {
+        bootstrapModuleInterfaceIdentity(discovery, 0, 0)
+    } else source
     BootstrapModuleSnapshot(
         snapshot.path,
         source,
@@ -1108,9 +1307,9 @@ fun bootstrapPrepareModuleSnapshot(
         snapshot.exists,
         snapshot.size,
         snapshot.revision,
-        bootstrapModuleFingerprint(source, 17, 257, 1000000007),
-        bootstrapModuleFingerprint(source, 97, 263, 1000000009),
-        bootstrapParseWithIdentity(source, snapshot.path)
+        bootstrapModuleFingerprint(fingerprintSource, 17, 257, 1000000007),
+        bootstrapModuleFingerprint(fingerprintSource, 97, 263, 1000000009),
+        discovery
     )
 }
 
@@ -1318,6 +1517,45 @@ class BootstrapModuleGraph(
         found
     }
 
+    fun loadContract(modulePath: string): string {
+        val identity = bootstrapNormalizeModulePath(modulePath)
+        if (!this.contains(identity)) {
+            val snapshot = this.state.acquire(identity)
+            this.errors = this.errors + snapshot.importErrors
+            this.diagnostics =
+                "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
+            this.modules.append(BootstrapModule(identity, ""))
+            var index = 0
+            while (index < snapshot.importEdges.size) {
+                val edge = snapshot.importEdges[index]
+                if (!edge.provider) {
+                    val imported = bootstrapResolveImport(identity, edge.source)
+                    val exposed = bootstrapImportAliasExposedTarget(imported)
+                    val importedSnapshot = this.state.acquire(exposed)
+                    if (bootstrapContractImportRequired(
+                        snapshot.discovery,
+                        edge,
+                        importedSnapshot.discovery
+                    )) {
+                        val contractEdge = BootstrapImportEdge(
+                            edge.source,
+                            edge.provider,
+                            edge.alias,
+                            true,
+                            edge.begin,
+                            edge.end
+                        )
+                        this.recordImportEdge(snapshot, contractEdge, exposed)
+                        this.loadContract(imported)
+                    }
+                }
+                index = index + 1
+            }
+            this.orderedSnapshots.append(snapshot)
+        }
+        ""
+    }
+
     fun load(modulePath: string): string {
         val identity = bootstrapNormalizeModulePath(modulePath)
         if (this.modules.size == 0 &&
@@ -1351,7 +1589,9 @@ class BootstrapModuleGraph(
                         edge,
                         bootstrapImportAliasExposedTarget(imported)
                     )
-                    output = "$output${this.load(imported)}\n"
+                    if (edge.contractOnly) {
+                        output = "$output${this.loadContract(imported)}\n"
+                    } else output = "$output${this.load(imported)}\n"
                 } else {
                     val provider = bootstrapEvaluateImportProvider(
                         edge.source, this.orderedSnapshots,
@@ -1367,7 +1607,10 @@ class BootstrapModuleGraph(
                                 edge,
                                 bootstrapImportAliasExposedTarget(imported)
                             )
-                            output = "$output${this.load(imported)}\n"
+                            if (edge.contractOnly) {
+                                output =
+                                    "$output${this.loadContract(imported)}\n"
+                            } else output = "$output${this.load(imported)}\n"
                         } else {
                             this.errors = this.errors + 1
                             this.diagnostics =
@@ -1537,7 +1780,10 @@ class BootstrapModuleGraph(
                 registrationIndex = registrationIndex + 1
             }
 
-            val parsed = this.state.acquireParsed(
+            val parsed = if (bootstrapModuleIsContractTarget(
+                this.aliases, snapshot.path
+            )) snapshot.discovery
+            else this.state.acquireParsed(
                 snapshot,
                 dependencyFingerprint,
                 completeDeclarations,

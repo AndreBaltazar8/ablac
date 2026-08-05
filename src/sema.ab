@@ -1514,7 +1514,8 @@ class BootstrapTypedCall(
     val argumentConversions: array<string>,
     val insertedDefaults: int,
     val isCompileOnly: bool,
-    val isTrusted: bool
+    val isTrusted: bool,
+    val isContract: bool
 )
 
 class BootstrapSemanticResult(
@@ -2518,11 +2519,16 @@ class BootstrapAnalyzer(
     var regionScope: int,
     var compileDepth: int,
     var generatorDepth: int,
-    var yieldedType: string
+    var yieldedType: string,
+    val allowContractCalls: bool
 ) {
     fun fail(code: string) {
         this.errors = this.errors + 1
-        if (this.currentGeneratedNamespace != "") {
+        if (code.size >= 27 &&
+            code.slice(0, 27) == "contract.call.not-consumed:") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_CONTRACT_CALL_NOT_CONSUMED]: contract-only function `${code.slice(27, code.size)}` has no local implementation\n"
+        } else if (this.currentGeneratedNamespace != "") {
             this.extensionErrors = this.extensionErrors + 1
             this.diagnostics =
                 "${this.diagnostics}error[E_EXT_GENERATED_SEMANTIC]: $code\n"
@@ -2531,6 +2537,24 @@ class BootstrapAnalyzer(
         } else this.diagnostics =
             "${this.diagnostics}error[E_SEMANTIC]: $code\n"
         bootstrapSemanticUnit()
+    }
+
+    fun contractModuleForFunction(name: string): string {
+        var moduleIdentity = ""
+        var index = 0
+        while (index < this.declarations.size && moduleIdentity == "") {
+            val declaration = this.declarations[index]
+            val prefix = "contract:"
+            if (declaration.name == name && declaration.kind == "extern" &&
+                declaration.externalLibrary.size >= prefix.size &&
+                declaration.externalLibrary.slice(0, prefix.size) == prefix) {
+                moduleIdentity = declaration.externalLibrary.slice(
+                    prefix.size, declaration.externalLibrary.size
+                )
+            }
+            index = index + 1
+        }
+        moduleIdentity
     }
 
     fun scopeIsVisible(scope: int): bool {
@@ -3759,6 +3783,16 @@ class BootstrapAnalyzer(
         result
     }
 
+    fun selectedHandleIsContract(handle: int): bool {
+        var result = false
+        if (handle >= 0 && handle < this.declarations.size) {
+            val library = this.declarations[handle].externalLibrary
+            result = library.size >= 9 &&
+                library.slice(0, 9) == "contract:"
+        }
+        result
+    }
+
     fun typedArgumentConversion(expected: string, actual: string): string {
         var result = "none"
         if (expected == "cstring" && actual == "string") {
@@ -3830,7 +3864,8 @@ class BootstrapAnalyzer(
                 conversions,
                 insertedDefaults,
                 this.selectedHandleIsCompileOnly(target),
-                this.selectedHandleIsTrusted(target)
+                this.selectedHandleIsTrusted(target),
+                this.selectedHandleIsContract(target)
             ))
         }
     }
@@ -4696,6 +4731,14 @@ class BootstrapAnalyzer(
             }
             val functionType = this.findType(expression.text)
             val symbolKind = this.findKind(expression.text)
+            val contractModule = this.contractModuleForFunction(
+                expression.text
+            )
+            if (contractModule != "" && !this.allowContractCalls) {
+                this.fail(
+                    "contract.call.not-consumed:$contractModule::${bootstrapCanonicalDeclarationSourceName(expression.text)}"
+                )
+            }
             if (this.regionDepth > 0 &&
                 bootstrapIsFunctionType(functionType) &&
                 symbolKind != "fun" && symbolKind != "extern" &&
@@ -6429,7 +6472,8 @@ fun bootstrapAnalyzeRequestedSpans(
         -1,
         0,
         0,
-        "unknown"
+        "unknown",
+        typedRequestBegins.size > 0
     ).analyze(parsed)
 }
 

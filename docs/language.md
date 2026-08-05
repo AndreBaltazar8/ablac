@@ -780,6 +780,26 @@ canonical identities. Two unaliased direct imports exposing the same short
 name are diagnosed as `E_IMPORT_UNQUALIFIED_AMBIGUOUS`; source order never
 selects a winner.
 
+A contract import exposes callable signatures, annotations, defaults, ownership
+modes, and reachable nominal data shapes without adding their implementations
+to the runtime program:
+
+```abla
+import contract "../backend/counter.ab" as counter
+
+val request = $rpc(counter.incrementRemotely(41))
+```
+
+Contract calls are ordinary typed direct calls while a deferred compiler
+extension inspects them. The extension must replace the call with executable
+client-side syntax. A contract call left in the final program fails with
+`E_CONTRACT_CALL_NOT_CONSUMED` before IR construction. Contract extraction does
+not stage backend initializers or compile actions and follows only imports
+needed by declaration shapes, so implementation-only dependencies and ambient
+capabilities remain outside the consumer. Interface fingerprints exclude
+function bodies; changing a signature, annotation, default, or reachable data
+shape changes the contract identity, while a body-only edit does not.
+
 Portable console programs import `abla/io`; the selected target profile
 provides the implementation behind the same source API:
 

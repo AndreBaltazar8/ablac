@@ -91,6 +91,15 @@ Only deferred request expressions retain these compact post-resolution records;
 raw parser handlers cannot query typed state. The stable generic-substitution
 surface returns zero until generic declarations land.
 
+Deferred call inspection also exposes
+`typedCallIsContract(expression)`. It reports whether the selected declaration
+came from an `import contract` projection while `typedCallTarget` and all
+signature, annotation, default, conversion, type-handle, canonical-identity,
+and module-origin queries continue to work normally. Contract calls are
+metadata-only: the finalizer must return syntax that no longer contains the
+call, or final semantic validation emits `E_CONTRACT_CALL_NOT_CONSUMED` before
+IR construction.
+
 ## Effects and generated modules
 
 `compilerGrant(capability)` requests a staged ambient effect. The entry
