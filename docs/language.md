@@ -327,6 +327,13 @@ fun twice(var callback: FnMut() -> int): int =
 fun finish(own callback: FnOnce() -> int): int = callback()
 ```
 
+A lambda passed directly to a statically known function, method, or constructor
+parameter may omit its parameter annotations; the expected callable type
+supplies them before the body is checked. An unconstrained omitted type remains
+an error. A read-only `Fn` can satisfy a repeatable `FnMut` callback slot
+because it supports the same calls without mutating its captures; the reverse
+conversion is not allowed.
+
 The compiler infers `FnMut` when an ordinary lambda assigns through a captured
 place and implements the capture as one shared mutable cell, so compiled and
 staged execution observe the same updates. `move { ... }` infers `FnOnce`.

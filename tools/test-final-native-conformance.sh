@@ -24,6 +24,7 @@ fixtures=(
     abla-subparser-builder:42
     abla-subparser-import:42
     module-frontend-subparser:42
+    subparser-inferred-lambda:42
     bootstrap-lexer:42
     bootstrap-parser:42
     bootstrap-sema:42

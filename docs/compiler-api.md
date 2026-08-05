@@ -162,6 +162,14 @@ reactive diagnostics. The resulting declaration is still parsed, typed,
 ownership-checked, effect-checked, lowered, and target-verified with its
 generated namespace and originating expression span.
 
+Initial-phase subparsers can construct an ordinary context-typed closure with
+`syntaxInferredLambda(parameterNames, body, moving)`. Its parameters carry the
+same `unknown` type syntax as unannotated source-lambda parameters; the
+surrounding callable use must infer them during normal semantic analysis.
+`syntaxLambda` remains the explicit reflected-type-handle form for phases where
+those handles are available. Both forms pass through the same capture-family,
+ownership, effect, semantic, and IR validation.
+
 Deferred call inspection also exposes
 `typedCallIsContract(expression)`. It reports whether the selected declaration
 came from an `import contract` projection while `typedCallTarget` and all

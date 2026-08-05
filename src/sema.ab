@@ -1266,6 +1266,15 @@ fun bootstrapTypesCompatible(expected: string, actual: string): bool {
         actual == "unknown" || actual == "never" || expected == "any"
     if (bootstrapIsBorrowType(actual) &&
         expected == bootstrapBorrowElementType(actual)) compatible = true
+    // An immutable-repeatable callable can safely satisfy a mutable-repeatable
+    // callback slot: it supports every call that FnMut permits, while simply
+    // declining to mutate its captures.
+    if (bootstrapIsMutableFunctionType(expected) &&
+        bootstrapIsFunctionType(actual) &&
+        !bootstrapIsMutableFunctionType(actual) &&
+        !bootstrapIsOnceFunctionType(actual) &&
+        bootstrapFunctionCoreType(expected) ==
+            bootstrapFunctionCoreType(actual)) compatible = true
     // A string passed to a cstring native parameter is adapted at the ABI
     // boundary. The reverse conversion is never implicit because ownership of
     // a returned native pointer is unknown.
@@ -4907,6 +4916,43 @@ class BootstrapAnalyzer(
         }
     }
 
+    fun contextualizeLambdaParameters(
+        expression: BootstrapExpression,
+        expected: string
+    ): void {
+        if ((expression.kind == "lambda" ||
+             expression.kind == "lambda.move") &&
+            bootstrapIsFunctionType(expected)) {
+            val parameterCount = expression.children.size - 1
+            if (parameterCount ==
+                bootstrapFunctionParameterCount(expected)) {
+                var parameter = 0
+                while (parameter < parameterCount) {
+                    val found = expression.children[parameter]
+                    if (found.kind == "lambda.parameter" &&
+                        found.children.size > 0 &&
+                        bootstrapNormalizeType(found.children[0].text) ==
+                            "unknown") {
+                        val contextual = bootstrapFunctionParameterType(
+                            expected,
+                            parameter
+                        )
+                        if (contextual != "unknown") {
+                            found.children[0] = BootstrapExpression(
+                                "type",
+                                contextual,
+                                found.children[0].begin,
+                                found.children[0].end,
+                                []
+                            )
+                        }
+                    }
+                    parameter = parameter + 1
+                }
+            }
+        }
+    }
+
     fun infer(expression: BootstrapExpression): string {
         this.validateHygiene(expression)
         var result = "unknown"
@@ -5221,6 +5267,40 @@ class BootstrapAnalyzer(
             val resolvedParameterKinds: array<string> = []
             var resolvedInsertedDefaults = 0
             while (argument < expression.children.size) {
+                var expectedArgument = "unknown"
+                if (bootstrapIsFunctionType(functionType)) {
+                    val declaredParameterCount =
+                        this.functionParameterCount(expression.text)
+                    if (declaredParameterCount < 0) {
+                        expectedArgument = bootstrapFunctionParameterType(
+                            functionType,
+                            argument
+                        )
+                    } else if (argument < declaredParameterCount) {
+                        expectedArgument = this.functionParameterType(
+                            expression.text,
+                            argument
+                        )
+                    }
+                } else if (symbolKind == "class") {
+                    var declarationIndex = 0
+                    while (declarationIndex < this.declarations.size) {
+                        val declaration =
+                            this.declarations[declarationIndex]
+                        if (declaration.kind == "class" &&
+                            declaration.name == expression.text &&
+                            argument < declaration.parameterTypes.size) {
+                            expectedArgument = bootstrapNormalizeType(
+                                declaration.parameterTypes[argument]
+                            )
+                        }
+                        declarationIndex = declarationIndex + 1
+                    }
+                }
+                this.contextualizeLambdaParameters(
+                    expression.children[argument],
+                    expectedArgument
+                )
                 resolvedArgumentTypes.append(
                     this.infer(expression.children[argument])
                 )
@@ -5686,12 +5766,16 @@ class BootstrapAnalyzer(
                 val methodKinds: array<string> = [receiverKind]
                 val methodTypes: array<string> = [receiver]
                 while (argument < expression.children.size) {
-                    val actual = this.infer(expression.children[argument])
                     val expected = this.methodParameterType(
                         receiver,
                         expression.text,
                         argument - 1
                     )
+                    this.contextualizeLambdaParameters(
+                        expression.children[argument],
+                        expected
+                    )
+                    val actual = this.infer(expression.children[argument])
                     if (!bootstrapTypesCompatible(expected, actual)) {
                         this.fail("method.argument:${receiver}.${expression.text}")
                     }
