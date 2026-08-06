@@ -4,7 +4,7 @@ COMPILER_PAYLOAD := $(BUILD_DIR)/ablac.bin
 COMPILER_ENTRY := src/orc_main.ab
 COMPILER_SOURCES := $(shell find src stdlib -name '*.ab' -type f | sort) \
 	runtime/abla_runtime.c runtime/abla_runtime.h runtime/abla_runtime_host.c \
-	runtime/abla_runtime_raw.c
+	runtime/abla_runtime_raw.c runtime/abla_llvm_host.c
 
 SOURCE ?=
 OUTPUT ?= $(BUILD_DIR)/program
@@ -18,9 +18,9 @@ all: ablac
 $(BUILD_DIR):
 	mkdir -p $@
 
-# A clean checkout starts with the host compiler published alongside v0.2.0. That
-# compiler immediately rebuilds the current source graph, so src/*.ab remains
-# the only compiler implementation in the repository.
+# A clean checkout starts with the checksum-pinned compiler release selected by
+# tools/bootstrap-compiler.sh. It immediately rebuilds the current source graph,
+# so src/*.ab remains the only compiler implementation in the repository.
 $(COMPILER_PAYLOAD): $(COMPILER_SOURCES) tools/build-self-hosted-release.sh \
 		| $(BUILD_DIR) tools/bootstrap-compiler.sh
 	@if test ! -x $@; then tools/bootstrap-compiler.sh $@; fi

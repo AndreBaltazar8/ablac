@@ -53,19 +53,19 @@ cp "$project_root/tests/cases/modules/contract-provider.ab" "$temporary/provider
 cp "$project_root/tests/cases/modules/contract-backend.ab" "$temporary/backend.ab"
 cp "$project_root/tests/cases/modules/contract-server-support.ab" \
     "$temporary/support.ab"
-sed -i \
-    -e 's/contract-provider\.ab/provider.ab/' \
-    -e 's/contract-backend\.ab/backend.ab/' \
+perl -pi -e \
+    's/contract-provider\.ab/provider.ab/; s/contract-backend\.ab/backend.ab/' \
     "$temporary/root.ab"
-sed -i 's/contract-server-support\.ab/support.ab/' "$temporary/backend.ab"
+perl -pi -e 's/contract-server-support\.ab/support.ab/' \
+    "$temporary/backend.ab"
 "$compiler" --emit-llvm "$temporary/root.ab" > "$temporary/before.ll"
-sed -i 's/serverAdd(value, bonus)/serverAdd(value + 0, bonus)/' \
+perl -pi -e 's/serverAdd\(value, bonus\)/serverAdd(value + 0, bonus)/' \
     "$temporary/backend.ab"
 "$compiler" --emit-llvm "$temporary/root.ab" > "$temporary/after.ll"
 cmp "$temporary/before.ll" "$temporary/after.ll"
 ! grep -Eq 'contract:|remoteIncrement|serverAdd|serverRuntimeState' \
     "$temporary/before.ll"
-sed -i 's/@rpc/@changedContract/' "$temporary/backend.ab"
+perl -pi -e 's/\@rpc/\@changedContract/' "$temporary/backend.ab"
 "$compiler" --emit-llvm "$temporary/root.ab" > "$temporary/changed.ll"
 ! cmp -s "$temporary/before.ll" "$temporary/changed.ll"
 

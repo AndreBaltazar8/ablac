@@ -24,7 +24,7 @@ ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
 # The generated compiler module is produced entirely through LLVM's C API.
 # Its portable value/platform runtime is linked as an ordinary implementation
 # dependency; there is no alternate code-generation backend in that runtime.
-nm "$output" | awk '{print $3}' | rg -q '^abla_runtime_set_arguments$'
+nm "$output" | awk '{print $3}' | rg -q '^_?abla_runtime_set_arguments$'
 
 ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=300 \
     "$project_root/tools/run-limited.sh" \
@@ -37,12 +37,29 @@ ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=300 \
     "$output" --emit-llvm "$entry" > "$self_ir"
 cmp "$reference_ir" "$self_ir"
 
-printf -v probe_build \
-    '%q build %q -o %q --fast --no-cache' \
-    "$output" "$project_root/tests/cases/bootstrap/block.ab" "$probe"
-ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
-    "$project_root/tools/run-limited.sh" \
-    nix-shell "$project_root/shell.nix" --run "$probe_build"
+if [[ $(uname -s) == Darwin ]]; then
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+        brew_command=/opt/homebrew/bin/brew
+    else
+        brew_command=/usr/local/bin/brew
+    fi
+    llvm_prefix=$($brew_command --prefix llvm@21 2>/dev/null ||
+        $brew_command --prefix llvm)
+    lld_prefix=$($brew_command --prefix lld@21 2>/dev/null ||
+        $brew_command --prefix lld)
+    export PATH="$llvm_prefix/bin:$lld_prefix/bin:$PATH"
+    ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
+        "$project_root/tools/run-limited.sh" \
+        "$output" build "$project_root/tests/cases/bootstrap/block.ab" \
+        -o "$probe" --fast --no-cache
+else
+    printf -v probe_build \
+        '%q build %q -o %q --fast --no-cache' \
+        "$output" "$project_root/tests/cases/bootstrap/block.ab" "$probe"
+    ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
+        "$project_root/tools/run-limited.sh" \
+        nix-shell "$project_root/shell.nix" --run "$probe_build"
+fi
 set +e
 ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=20 \
     "$project_root/tools/run-limited.sh" "$probe"

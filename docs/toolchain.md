@@ -44,6 +44,16 @@ artifact. The current WebAssembly linker produces a no-entry module, preserves
 explicit foreign exports, and strips PID-bearing name metadata for byte-level
 reproducibility.
 
+An extension-defined target with linker flavor and emulation `none` may use
+any object triple implemented by the installed LLVM and emit an `object` or
+`static-library`. LLVM target registration is not architecture-specific.
+Executables, shared libraries, and modules require an explicit supported
+runtime/linker contract; a target descriptor cannot silently imply a host ABI,
+startup sequence, sysroot, or platform linker.
+The built-in raw target remains specifically x86-64 Linux and is advertised
+only on hosts with its assembler/linker contract; it is not treated as a
+generic consequence of LLVM supporting the architecture.
+
 Every successful artifact publishes `<output>.abi.json` through the compiler's
 staged-output transaction after linking. The versioned manifest is derived
 from resolved export requests rather than handwritten platform glue and

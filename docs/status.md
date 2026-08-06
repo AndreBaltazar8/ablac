@@ -16,8 +16,8 @@ require libc; hosted facilities are optional capabilities.
 - The self-hosted compiler builds directly through LLVM and reproduces its
   generated LLVM module byte-for-byte at the fixed point.
 - The hosted compiler and ordinary Abla programs build and run natively on
-  x86-64 Linux and Intel macOS; the macOS gate covers Mach-O emission, ORC,
-  console, filesystem, and child-process behavior.
+  x86-64 Linux plus Intel and Apple Silicon macOS; the macOS gate covers
+  Mach-O emission, ORC, console, filesystem, and child-process behavior.
 - The final-native conformance suite covers 55 programs. Focused gates cover
   the raw libc-free target, compiler extensions, programmable builds, Android
   cross-builds, and WASM/MVC modules.
@@ -30,8 +30,11 @@ require libc; hosted facilities are optional capabilities.
 - Foreign exports have a versioned ABI manifest, value-safe scalar and copied
   byte inputs, owned byte results, call-scoped callbacks, and an opt-in checked
   boundary on supported hosted targets.
-- Android and WASM/MVC are extension-owned proofs. The compiler contains only
-  generic target, artifact, ABI, capability, and graph machinery.
+- Android and WASM/MVC are extension-owned proofs. Target extensions may pass
+  any triple supported by the installed LLVM for object or static-library
+  emission; linking remains guarded by an explicit format/linker contract.
+  The compiler contains only generic target, artifact, ABI, capability, and
+  graph machinery.
 - Compile-time import-provider functions resolve Git/GitHub packages through
   immutable commit/tree locks, bounded transactional caches, offline mode, and
   a complete vendor fallback. Root manifests retain dependency capability

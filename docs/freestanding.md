@@ -4,10 +4,13 @@ Direct system calls are useful for small static Linux programs, kernels,
 embedded targets, and eventually replacing the bootstrap C runtime. They are
 not the portable public API.
 
-`ablac build app.ab --target x86_64-linux-raw -o app` now produces a static
-ELF with its own `_start`, raw `exit_group`, `mmap`/`munmap` allocation, and
+On an x86-64 Linux host,
+`ablac build app.ab --target x86_64-linux-raw -o app` produces a static ELF
+with its own `_start`, raw `exit_group`, `mmap`/`munmap` allocation, and
 compiler fallback memory primitives. LLD is invoked without CRT or libc, and
-the driver rejects host or LLVM runtime imports for this profile.
+the driver rejects host or LLVM runtime imports for this profile. Other hosts
+can still use extension-defined LLVM targets for object emission without
+pretending that they have the Linux headers and executable-link contract.
 
 The intended layering is:
 

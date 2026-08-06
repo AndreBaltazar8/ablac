@@ -15,7 +15,13 @@ script_directory=$(cd -- "$(dirname -- "$launcher")" && pwd)
 toolchain_root=$(cd -- "$script_directory/.." && pwd)
 compiler="${0}.bin"
 default_stack_kb=65536
-if [[ $(uname -s) == Darwin ]]; then default_stack_kb=65532; fi
+if [[ $(uname -s) == Darwin ]]; then
+    hard_stack_kb=$(ulimit -H -s)
+    if [[ $hard_stack_kb =~ ^[1-9][0-9]*$ &&
+          $hard_stack_kb -lt $default_stack_kb ]]; then
+        default_stack_kb=$hard_stack_kb
+    fi
+fi
 stack_kb=${ABLA_MAX_STACK_KB:-$default_stack_kb}
 
 # Keep compiler-owned sources independent from the caller's working directory.
@@ -45,8 +51,21 @@ fi
 case ${1:-} in
     build|serve)
         if ! command -v opt >/dev/null 2>&1; then
-            if [[ $(uname -s) == Darwin && -x /usr/local/opt/llvm/bin/opt ]]; then
-                export PATH="/usr/local/opt/llvm/bin:/usr/local/opt/lld/bin:$PATH"
+            if [[ $(uname -s) == Darwin ]]; then
+                if [[ -x /opt/homebrew/bin/brew ]]; then
+                    brew_command=/opt/homebrew/bin/brew
+                elif [[ -x /usr/local/bin/brew ]]; then
+                    brew_command=/usr/local/bin/brew
+                else
+                    brew_command=
+                fi
+                if [[ -n $brew_command ]]; then
+                    llvm_prefix=$($brew_command --prefix llvm@21 \
+                        2>/dev/null || $brew_command --prefix llvm)
+                    lld_prefix=$($brew_command --prefix lld@21 \
+                        2>/dev/null || $brew_command --prefix lld)
+                    export PATH="$llvm_prefix/bin:$lld_prefix/bin:$PATH"
+                fi
             fi
         fi
         if ! command -v opt >/dev/null 2>&1; then

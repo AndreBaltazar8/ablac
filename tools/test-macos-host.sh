@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $(uname -s) != Darwin || $(uname -m) != x86_64 ]]; then
-    printf '%s\n' 'macOS host test requires an x86_64 Darwin host' >&2
+if [[ $(uname -s) != Darwin ]]; then
+    printf '%s\n' 'macOS host test requires a Darwin host' >&2
     exit 2
 fi
+
+case "$(uname -m)" in
+    x86_64) expected_architecture=x86_64 ;;
+    arm64) expected_architecture=arm64 ;;
+    *)
+        printf 'unsupported macOS test architecture: %s\n' "$(uname -m)" >&2
+        exit 2
+        ;;
+esac
 
 compiler=${1:-build/ablac}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -25,7 +34,8 @@ expect_status_42() {
 
 "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
     --fast --no-cache -o "$output_directory/block"
-file "$output_directory/block" | grep -q 'Mach-O 64-bit executable x86_64'
+file "$output_directory/block" |
+    grep -q "Mach-O 64-bit executable $expected_architecture"
 expect_status_42 "$output_directory/block"
 
 "$compiler" build "$project_root/tests/cases/modules/portable-io.ab" \

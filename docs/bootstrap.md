@@ -7,7 +7,10 @@ multi-stage source bootstrap are no longer part of the repository.
 A compiler cannot translate itself on an empty machine without an existing
 executable translator. Clean builds therefore begin with a checksum-pinned
 host artifact from the `v0.2.0` GitHub release: `ablac-x86_64-linux` on Linux
-or `ablac-x86_64-macos` on an Intel Mac.
+or `ablac-x86_64-macos` on Intel macOS. Starting with `v0.2.1`, Apple Silicon
+uses the native `ablac-arm64-macos` seed. The first such artifact was produced
+by emitting the compiler IR on the trusted Intel host and compiling and linking
+that same IR against the native ARM LLVM and runtime on Apple Silicon.
 
 ```text
 published ablac binary
@@ -47,6 +50,6 @@ adapters for generated programs; they are not compiler implementations or a
 compiler bootstrap stage.
 
 LLVM, Clang, and the platform linker remain native toolchain dependencies.
-Linux pins them through Nix; Intel macOS uses Homebrew LLVM and the system
+Linux pins them through Nix; macOS uses Homebrew LLVM and the system
 Mach-O linker. Removing those hosted dependencies is a separate freestanding goal described in
 [full-self-hosting.md](full-self-hosting.md).

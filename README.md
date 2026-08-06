@@ -72,17 +72,19 @@ nix-shell
 make
 ```
 
-On an Intel Mac, install Homebrew LLVM without enabling a blanket package
+On a Mac, install Homebrew LLVM without enabling a blanket package
 upgrade, then build directly from the normal shell:
 
 ```sh
-HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm
+HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@21 lld@21
 make
 ```
 
-The macOS host currently supports x86-64. `make` downloads the matching pinned
-bootstrap compiler, rebuilds the current Abla sources as a Mach-O executable,
-and uses Homebrew LLVM for native object emission and ORC execution.
+The macOS host supports Intel and Apple Silicon. `make` downloads the pinned
+bootstrap compiler, rebuilds the current Abla sources as a native Mach-O
+executable for LLVM's detected host triple, and uses Homebrew LLVM for native
+object emission and ORC execution. Apple Silicon uses the native compiler seed
+published with `v0.2.1`; no Intel toolchain is involved.
 Run `tools/test-macos-host.sh build/ablac` for the focused native host gate.
 
 Run the ordinary test suite with:
@@ -101,7 +103,7 @@ make check
 The build has one compiler and a deliberately small target surface:
 
 ```sh
-make bootstrap     # fetch and verify the published v0.2.0 host compiler
+make bootstrap     # fetch and verify the pinned published host compiler
 make ablac         # rebuild build/ablac from src/*.ab
 make test          # run the self-hosted conformance suite
 make self-rebuild  # prove a byte-identical compiler fixed point
@@ -109,8 +111,9 @@ make check         # test plus fixed point
 make clean         # remove generated files
 ```
 
-On an empty build directory, `make` downloads the checksum-pinned compiler from
-the `v0.2.0` GitHub release and immediately recompiles the current `src/` graph.
+On an empty build directory, `make` downloads a checksum-pinned compiler from
+the `v0.2.0` release on x86-64 Linux/Intel macOS or `v0.2.1` on Apple Silicon,
+then immediately recompiles the current `src/` graph.
 No C++ compiler implementation or generated-C bootstrap is involved.
 
 ## Using the compiler
@@ -120,8 +123,8 @@ No C++ compiler implementation or generated-C bootstrap is involved.
 ```sh
 build/ablac build program.ab -o build/program
 build/ablac build program.ab -o build/program --fast
-build/ablac build program.ab --target x86_64-macos -o build/program
-build/ablac build program.ab --target x86_64-linux-raw -o build/program.raw
+build/ablac build program.ab --target arm64-macos -o build/program # Apple Silicon
+build/ablac build program.ab --target x86_64-linux-raw -o build/program.raw # Linux host
 build/ablac run program.ab
 build/ablac repl
 build/ablac serve program.ab

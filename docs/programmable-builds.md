@@ -72,9 +72,12 @@ instead of silently dropping requests or leaving process-private request data.
 
 The built-in hosted Linux target can emit `executable`, `object`,
 `static-library`, and `shared-library` nodes. The raw Linux target remains
-executable-only. Build libraries may also register bounded ELF or WebAssembly target
-descriptors with `defineTarget`: a name, LLVM triple, linker flavor/emulation,
-and generic hosted/libc-free capabilities. Target descriptions are part of
+executable-only. Build libraries may also register bounded target descriptors
+with `defineTarget`: a name, LLVM triple, object format, linker
+flavor/emulation, and generic hosted/libc-free capabilities. A descriptor with
+linker flavor and emulation `none` can emit objects or static libraries for
+any triple implemented by the installed LLVM; linked artifacts require a
+supported format-specific linker contract. Target descriptions are part of
 the native cache identity. They are limited to 16 per compile-time evaluation
 and 32 across a recursively expanded graph; invalid and duplicate definitions
 fail before their program node is compiled.

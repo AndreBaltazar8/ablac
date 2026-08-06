@@ -15,6 +15,11 @@ case "$platform/$machine" in
         artifact=ablac-x86_64-macos
         platform_sha256=8852cd6c82b77c3e1758122f50ee3f59593767660f134742c66c005da2715caa
         ;;
+    Darwin/arm64)
+        version=v0.2.1
+        artifact=ablac-arm64-macos
+        platform_sha256=6c37454497cadbe8a43263d837b943f61a30edb06051fe865b07508e9106bb1e
+        ;;
     *)
         printf 'unsupported bootstrap host: %s/%s\n' "$platform" "$machine" >&2
         exit 2

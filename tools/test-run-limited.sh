@@ -4,13 +4,20 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 runner="$root/tools/run-limited.sh"
 
+expected_virtual=65536
+if [[ $(uname -s) == Darwin ]]; then
+    # Darwin has no virtual-memory ulimit. The runner deliberately leaves the
+    # caller's existing value unchanged there.
+    expected_virtual=$(ulimit -S -v)
+fi
+
 limits=$(
     ABLA_MAX_MEMORY_MB=64 \
     ABLA_MAX_SECONDS=3 \
     ABLA_MAX_CPU_SECONDS=2 \
         "$runner" bash -c 'ulimit -v; ulimit -t; ulimit -c'
 )
-[[ $limits == $'65536\n2\n0' ]]
+[[ $limits == "$expected_virtual"$'\n2\n0' ]]
 
 set +e
 ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=3 \

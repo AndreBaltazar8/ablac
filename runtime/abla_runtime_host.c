@@ -1037,6 +1037,14 @@ AblaValue ablaHostIsMacOS(void) {
 #endif
 }
 
+AblaValue ablaHostValueArgumentsIndirect(void) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    return host_value_bool(true);
+#else
+    return host_value_bool(false);
+#endif
+}
+
 AblaValue ablaHostArgumentCount(void) {
     return host_value_i64(host_argc > 0 ? (int64_t)(host_argc - 1) : INT64_C(0));
 }
@@ -1926,8 +1934,8 @@ static void host_coroutine_entry(uint32_t low, uint32_t high) {
     const uintptr_t bits = (uintptr_t)low |
         ((uintptr_t)high << 32);
     AblaHostCoroutine* coroutine = (AblaHostCoroutine*)bits;
-    AblaValue result = host_value_void();
-    coroutine->dispatch(&result, &coroutine->closure, NULL, 0);
+    AblaValue result = coroutine->dispatch(
+        &coroutine->closure, NULL, 0);
     coroutine->result = result;
     coroutine->release(&coroutine->closure);
     coroutine->closure = (AblaValue){.tag = ABLA_NULL};
@@ -2090,8 +2098,7 @@ static AblaHostThread* host_as_thread(AblaValue value) {
 
 static void* host_thread_entry(void* opaque) {
     AblaHostThread* thread = (AblaHostThread*)opaque;
-    AblaValue result = host_value_void();
-    thread->dispatch(&result, &thread->closure, NULL, 0);
+    AblaValue result = thread->dispatch(&thread->closure, NULL, 0);
     thread->result = result;
     thread->release(&thread->closure);
     thread->closure = (AblaValue){.tag = ABLA_NULL};

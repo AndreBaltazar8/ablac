@@ -4,6 +4,7 @@ import "abla/sys/linux/fs"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/platform/host"
+import "abla/llvm/orc"
 
 class BootstrapTargetDescriptor(
     val name: string,
@@ -34,7 +35,7 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             true
         )
     }
-    if (name == "x86_64-linux-raw") {
+    if (name == "x86_64-linux-raw" && !ablaHostIsMacOS()) {
         result = BootstrapTargetDescriptor(
             name,
             "x86_64-unknown-linux-gnu",
@@ -47,10 +48,10 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             true
         )
     }
-    if (name == "x86_64-macos" && ablaHostIsMacOS()) {
+    if (ablaHostIsMacOS() && name == bootstrapHostTargetName()) {
         result = BootstrapTargetDescriptor(
             name,
-            "x86_64-apple-macosx14.0",
+            llvmDefaultTargetTriple(),
             "macho",
             true,
             false,
@@ -63,8 +64,21 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
     result
 }
 
-fun bootstrapHostTargetName(): string =
-    if (ablaHostIsMacOS()) "x86_64-macos" else "x86_64-linux"
+fun bootstrapTripleArchitecture(triple: string): string {
+    var end = 0
+    while (end < triple.size && triple[end] != 45) end = end + 1
+    triple.slice(0, end)
+}
+
+fun bootstrapHostTargetName(): string {
+    var result = "x86_64-linux"
+    if (ablaHostIsMacOS()) {
+        result = "${bootstrapTripleArchitecture(
+            llvmDefaultTargetTriple()
+        )}-macos"
+    }
+    result
+}
 
 fun bootstrapTargetIsHost(target: BootstrapTargetDescriptor): bool =
     target.name == bootstrapHostTargetName()
@@ -80,7 +94,13 @@ fun bootstrapDefinedTargetDescriptor(
     "",
     target.linkerFlavor,
     target.linkerEmulation,
-    ((target.objectFormat == "elf" && !target.libcFree &&
+    ((!target.hosted && target.linkerFlavor == "none" &&
+      target.linkerEmulation == "none" &&
+      (target.objectFormat == "elf" ||
+       target.objectFormat == "macho" ||
+       target.objectFormat == "coff" ||
+       target.objectFormat == "wasm")) ||
+     (target.objectFormat == "elf" && !target.libcFree &&
       ((target.hosted &&
         target.llvmTriple == "x86_64-unknown-linux-gnu" &&
         target.linkerFlavor == "host-clang") ||
@@ -90,10 +110,8 @@ fun bootstrapDefinedTargetDescriptor(
 )
 
 fun bootstrapSupportedTargets(): string =
-    if (ablaHostIsMacOS())
-        "x86_64-macos, x86_64-linux-raw"
-    else
-        "x86_64-linux, x86_64-linux-raw"
+    if (ablaHostIsMacOS()) bootstrapHostTargetName()
+    else "x86_64-linux, x86_64-linux-raw"
 
 class BootstrapNativeBuild(
     val status: int,
@@ -739,7 +757,20 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // An entry symbol identifies the latter; external module formats provide
     // their own loader/runtime contract and must not receive the Linux startup.
     val rawTarget = target.libcFree && target.entrySymbol.size > 0
-    val macTarget = target.name == "x86_64-macos"
+    val macTarget = target.objectFormat == "macho"
+    var macSdkRoot = ""
+    if (macTarget && target.hosted) {
+        val discoverSdk = linuxCommand("xcrun")
+        discoverSdk.argument("--sdk")
+        discoverSdk.argument("macosx")
+        discoverSdk.argument("--show-sdk-path")
+        macSdkRoot = discoverSdk.captureText()
+        var sdkEnd = macSdkRoot.size
+        while (sdkEnd > 0 &&
+            (macSdkRoot[sdkEnd - 1] == 10 ||
+             macSdkRoot[sdkEnd - 1] == 13)) sdkEnd = sdkEnd - 1
+        macSdkRoot = macSdkRoot.slice(0, sdkEnd)
+    }
     bootstrapBeginCompileOutputs()
     val modules: array<BootstrapModule> = []
     moduleState.beginBuild()
@@ -764,6 +795,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val llvmPath = "$outputPath.ll"
     val objectPath = "$outputPath.o"
     val hostPath = "$outputPath.host.o"
+    val llvmHostPath = "$outputPath.llvm-host.o"
     val valueRuntimePath = "$outputPath.value-runtime.o"
     val rawAdaptersPath = "$outputPath.raw-adapters.o"
     val rawRuntimePath = "$outputPath.raw-runtime.o"
@@ -827,6 +859,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // before publishing a fresh build.
     Path("$outputPath.runtime.o").remove()
     Path(hostPath).remove()
+    Path(llvmHostPath).remove()
     Path(valueRuntimePath).remove()
     Path(rawAdaptersPath).remove()
     Path(rawRuntimePath).remove()
@@ -892,7 +925,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 refreshedNativePartitions = partitioned.refreshed
             } else if (status == 0) {
                 val llvmInfo = Path(llvmPath).info()
-                if (cacheProfile == "inprocess-o2" && target.hosted &&
+                if (!ablaHostIsMacOS() &&
+                    cacheProfile == "inprocess-o2" && target.hosted &&
                     llvmInfo.isFile() && llvmInfo.size > 8388608 &&
                     bootstrapNativeParallelism() > 1) {
                     status = bootstrapEmitParallelObject(
@@ -998,6 +1032,23 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = 147
         failureKind = "reported"
     }
+    if (status == 0 && !target.hosted && !rawTarget &&
+        artifact == "shared-library" &&
+        target.linkerFlavor != "lld-elf") {
+        linuxPrintStandardError(
+            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target '${target.name}' has no shared-library linker contract\n"
+        )
+        status = 147
+        failureKind = "reported"
+    }
+    if (status == 0 && target.objectFormat == "wasm" &&
+        artifact == "module" && target.linkerFlavor != "wasm-ld") {
+        linuxPrintStandardError(
+            "error[E_BUILD_ARTIFACT_UNSUPPORTED]: target '${target.name}' has no WebAssembly module linker contract\n"
+        )
+        status = 147
+        failureKind = "reported"
+    }
     if (status == 0 && rawTarget && artifact == "executable") {
         val compileRawRuntime = linuxCommand("clang")
         compileRawRuntime.argument("-c")
@@ -1051,6 +1102,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileValueRuntime.argument("-O2")
         compileValueRuntime.argument("-ffunction-sections")
         compileValueRuntime.argument("-fdata-sections")
+        if (macTarget) {
+            compileValueRuntime.argument("-isysroot")
+            compileValueRuntime.argument(macSdkRoot)
+        }
         compileValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
         compileValueRuntime.argument("-c")
         compileValueRuntime.argument(
@@ -1068,6 +1123,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileHost.argument("-ffunction-sections")
         compileHost.argument("-fdata-sections")
         if (macTarget) {
+            compileHost.argument("-isysroot")
+            compileHost.argument(macSdkRoot)
             compileHost.argument("-D_XOPEN_SOURCE=700")
             compileHost.argument("-D_DARWIN_C_SOURCE")
             compileHost.argument("-Wno-deprecated-declarations")
@@ -1080,6 +1137,31 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileHost.argument("-o")
         compileHost.argument(hostPath)
         status = compileHost.run()
+    }
+    if (status == 0 && target.hosted && artifact != "object" && linkLlvm) {
+        val llvmConfig = linuxCommand("llvm-config")
+        llvmConfig.argument("--includedir")
+        var llvmIncludeDirectory = llvmConfig.captureText()
+        var end = llvmIncludeDirectory.size
+        while (end > 0 &&
+            (llvmIncludeDirectory[end - 1] == 10 ||
+             llvmIncludeDirectory[end - 1] == 13)) end = end - 1
+        llvmIncludeDirectory = llvmIncludeDirectory.slice(0, end)
+        val compileLlvmHost = linuxCommand("clang")
+        compileLlvmHost.argument("-std=c11")
+        compileLlvmHost.argument("-O2")
+        if (macTarget) {
+            compileLlvmHost.argument("-isysroot")
+            compileLlvmHost.argument(macSdkRoot)
+        }
+        compileLlvmHost.argument("-I$llvmIncludeDirectory")
+        compileLlvmHost.argument("-c")
+        compileLlvmHost.argument(
+            Path(bootstrapRuntimeRoot()).child("abla_llvm_host.c").text
+        )
+        compileLlvmHost.argument("-o")
+        compileLlvmHost.argument(llvmHostPath)
+        status = compileLlvmHost.run()
     }
     if (status == 0 && rawTarget && artifact == "executable") {
         val linkRaw = linuxCommand("ld.lld")
@@ -1099,7 +1181,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && target.hosted && artifact == "executable") {
         val link = linuxCommand("clang")
         link.argument("-pthread")
-        if (macTarget) link.argument("-Wl,-dead_strip")
+        if (macTarget) {
+            link.argument("-isysroot")
+            link.argument(macSdkRoot)
+            link.argument("-Wl,-dead_strip")
+        }
         else {
             link.argument("-fuse-ld=lld")
             link.argument("-Wl,--threads=1")
@@ -1128,6 +1214,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             link.argument(valueRuntimePath)
             link.argument(hostPath)
         }
+        if (linkLlvm) link.argument(llvmHostPath)
         link.argument("-o")
         link.argument(publishPath)
         status = link.run()
@@ -1145,12 +1232,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             archive.argument(valueRuntimePath)
             archive.argument(hostPath)
         }
+        if (linkLlvm) archive.argument(llvmHostPath)
         status = archive.run()
     }
     if (status == 0 && target.hosted && artifact == "shared-library") {
         val linkShared = linuxCommand("clang")
         linkShared.argument("-pthread")
         if (macTarget) {
+            linkShared.argument("-isysroot")
+            linkShared.argument(macSdkRoot)
             linkShared.argument("-dynamiclib")
             linkShared.argument("-Wl,-dead_strip")
         } else {
@@ -1177,6 +1267,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             linkShared.argument(valueRuntimePath)
             linkShared.argument(hostPath)
         }
+        if (linkLlvm) linkShared.argument(llvmHostPath)
         linkShared.argument("-o")
         linkShared.argument(publishPath)
         status = linkShared.run()
@@ -1422,6 +1513,18 @@ fun bootstrapBuildJitHostLibrary(outputPath: string): int {
     hostCompile.argument("-pthread")
     hostCompile.argument("-fPIC")
     if (ablaHostIsMacOS()) {
+        val discoverSdk = linuxCommand("xcrun")
+        discoverSdk.argument("--sdk")
+        discoverSdk.argument("macosx")
+        discoverSdk.argument("--show-sdk-path")
+        var sdkRoot = discoverSdk.captureText()
+        var sdkEnd = sdkRoot.size
+        while (sdkEnd > 0 &&
+            (sdkRoot[sdkEnd - 1] == 10 ||
+             sdkRoot[sdkEnd - 1] == 13)) sdkEnd = sdkEnd - 1
+        sdkRoot = sdkRoot.slice(0, sdkEnd)
+        hostCompile.argument("-isysroot")
+        hostCompile.argument(sdkRoot)
         hostCompile.argument("-dynamiclib")
         hostCompile.argument("-D_XOPEN_SOURCE=700")
         hostCompile.argument("-D_DARWIN_C_SOURCE")

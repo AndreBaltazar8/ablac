@@ -70,11 +70,15 @@ fixtures=(
 )
 
 available_memory_mb=0
-while read -r memory_key memory_value memory_unit; do
-    if [[ $memory_key == MemAvailable: ]]; then
-        available_memory_mb=$((memory_value / 1024))
-    fi
-done < /proc/meminfo
+if [[ -r /proc/meminfo ]]; then
+    while read -r memory_key memory_value memory_unit; do
+        if [[ $memory_key == MemAvailable: ]]; then
+            available_memory_mb=$((memory_value / 1024))
+        fi
+    done < /proc/meminfo
+elif [[ $(uname -s) == Darwin ]]; then
+    available_memory_mb=$(($(sysctl -n hw.memsize) / 1024 / 1024))
+fi
 processor_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')
 if [[ ! $build_memory_mb =~ ^[1-9][0-9]*$ ]]; then
     printf 'ABLA_CONFORMANCE_BUILD_MEMORY_MB must be a positive integer, got %q\n' \

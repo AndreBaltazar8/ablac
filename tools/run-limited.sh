@@ -41,7 +41,27 @@ if [[ $(uname -s) == Darwin ]]; then
     ulimit -S -t "$cpu_seconds"
     set +e
     /usr/bin/perl -e \
-        'my $seconds = shift; alarm $seconds; exec @ARGV; exit 127' \
+        'my $seconds = shift;
+         my $pid = fork();
+         exit 127 unless defined $pid;
+         if ($pid == 0) {
+             setpgrp(0, 0);
+             exec @ARGV;
+             exit 127;
+         }
+         $SIG{ALRM} = sub {
+             kill "TERM", -$pid;
+             select undef, undef, undef, 0.1;
+             kill "KILL", -$pid;
+             waitpid($pid, 0);
+             exit 124;
+         };
+         alarm $seconds;
+         waitpid($pid, 0);
+         alarm 0;
+         my $status = $?;
+         exit 128 + ($status & 127) if $status & 127;
+         exit $status >> 8;' \
         "$wall_seconds" "$@"
     status=$?
     set -e

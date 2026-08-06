@@ -7,8 +7,7 @@ directory="$project_root/build/target-descriptors-test"
 mkdir -p "$directory"
 
 "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
-    --fast --no-cache --target x86_64-linux \
-    -o "$directory/hosted"
+    --fast --no-cache -o "$directory/hosted"
 set +e
 "$project_root/tools/run-limited.sh" "$directory/hosted"
 hosted_status=$?
@@ -26,5 +25,18 @@ set -e
 grep -q "unsupported target 'imaginary-none'" "$directory/invalid.err"
 [[ ! -e "$directory/invalid" ]]
 
+"$compiler" build \
+    "$project_root/tests/cases/target-descriptors/generic-object-build.ab" \
+    --fast --no-cache -o "$directory/generic-driver"
+set +e
+"$project_root/tools/run-limited.sh" "$directory/generic-driver"
+generic_status=$?
+set -e
+[[ $generic_status -eq 43 ]]
+llvm-readelf -h "$directory/riscv64.o" > "$directory/riscv64.header"
+grep -q 'RISC-V' "$directory/riscv64.header"
+grep -q '"llvmTriple":"riscv64-unknown-elf"' \
+    "$directory/riscv64.o.abi.json"
+
 printf '%s\n' \
-    'target descriptors: explicit hosted target + deterministic unsupported-target diagnostic passed'
+    'target descriptors: hosted, arbitrary LLVM object, and deterministic unsupported-target diagnostics passed'

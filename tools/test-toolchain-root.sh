@@ -25,11 +25,13 @@ test -s "$temporary_directory/stdlib.ll"
     -o "$temporary_directory/host-runtime" --no-cache
 test -x "$temporary_directory/host-runtime"
 
-"$compiler" build \
-    "$project_root/tests/cases/bootstrap/block.ab" \
-    -o "$temporary_directory/raw-runtime" --no-cache \
-    --target x86_64-linux-raw
-test -x "$temporary_directory/raw-runtime"
+if [[ $(uname -s) != Darwin && $(uname -m) == x86_64 ]]; then
+    "$compiler" build \
+        "$project_root/tests/cases/bootstrap/block.ab" \
+        -o "$temporary_directory/raw-runtime" --no-cache \
+        --target x86_64-linux-raw
+    test -x "$temporary_directory/raw-runtime"
+fi
 
 printf '%s\n' \
     'toolchain root: stdlib and runtime resources are independent from cwd'

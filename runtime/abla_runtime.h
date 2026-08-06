@@ -56,8 +56,7 @@ struct AblaValue {
     } as;
 };
 
-typedef void (*AblaDispatch)(
-    AblaValue* output,
+typedef AblaValue (*AblaDispatch)(
     const AblaValue* closure,
     const AblaValue* arguments,
     uint64_t count);
@@ -86,6 +85,7 @@ AblaValue abla_closure(
 
 void abla_runtime_set_arguments(int argc, char** argv);
 AblaValue ablaHostIsMacOS(void);
+AblaValue ablaHostValueArgumentsIndirect(void);
 AblaValue ablaHostArgumentCount(void);
 AblaValue ablaHostArgument(AblaValue index);
 AblaValue ablaHostReadFile(AblaValue path);
