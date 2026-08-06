@@ -34,6 +34,8 @@ set -e
 llvm-readobj --file-headers "$module" | grep -q 'Format: WASM'
 llvm-readobj --file-headers "$module" | grep -q 'Arch: wasm32'
 llvm-readobj --symbols "$module" | grep -q 'Name: abla_mvc_revision'
+[[ ! -e $module.value-runtime.o ]]
+[[ ! -e $module.wasm-platform.o ]]
 grep -q '"schema":"abla.abi.v1"' "$abi_manifest"
 grep -q '"name":"wasm32-module"' "$abi_manifest"
 grep -q '"symbol":"abla_mvc_revision"' "$abi_manifest"

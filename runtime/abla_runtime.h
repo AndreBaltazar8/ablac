@@ -31,9 +31,21 @@ typedef struct AblaRuntimeRootFrame AblaRuntimeRootFrame;
 
 typedef struct AblaString {
     const char* data;
+#ifdef ABLA_WASM32
+    uint32_t data_padding;
+#endif
     size_t length;
+#ifdef ABLA_WASM32
+    uint32_t length_padding;
+#endif
     bool owned;
+#ifdef ABLA_WASM32
+    uint8_t owned_padding[7];
+#endif
     AblaStringRope* rope;
+#ifdef ABLA_WASM32
+    uint32_t rope_padding;
+#endif
 } AblaString;
 
 struct AblaValue {
@@ -43,8 +55,17 @@ struct AblaValue {
         bool boolean;
         struct {
             uint32_t id;
+#ifdef ABLA_WASM32
+            uint32_t id_padding;
+#endif
             size_t capture_count;
+#ifdef ABLA_WASM32
+            uint32_t capture_count_padding;
+#endif
             AblaValue* captures;
+#ifdef ABLA_WASM32
+            uint32_t captures_padding;
+#endif
         } function;
         AblaValue* cell;
         AblaString string;
@@ -55,6 +76,11 @@ struct AblaValue {
         void* concurrent;
     } as;
 };
+
+#ifdef ABLA_WASM32
+_Static_assert(sizeof(AblaString) == 32, "Wasm string ABI must be 32 bytes");
+_Static_assert(sizeof(AblaValue) == 40, "Wasm value ABI must be 40 bytes");
+#endif
 
 typedef AblaValue (*AblaDispatch)(
     const AblaValue* closure,
@@ -70,7 +96,7 @@ struct AblaRuntimeRootFrame {
 
 void* abla_platform_alloc(size_t size);
 void abla_platform_free(void* pointer);
-_Noreturn void abla_platform_panic(const char* message, size_t length);
+_Noreturn void abla_platform_panic(const char* message, uint64_t length);
 
 AblaValue abla_void(void);
 AblaValue abla_null(void);
@@ -81,7 +107,7 @@ AblaValue abla_function(uint32_t function);
 AblaValue abla_closure(
     uint32_t function,
     const AblaValue* captures,
-    size_t capture_count);
+    uint64_t capture_count);
 
 void abla_runtime_set_arguments(int argc, char** argv);
 AblaValue ablaHostIsMacOS(void);
@@ -209,9 +235,9 @@ bool abla_as_bool(AblaValue value);
 const char* abla_as_cstring(AblaValue value);
 const char* abla_string_data(AblaValue value);
 uint32_t abla_as_function(AblaValue value);
-size_t abla_function_capture_count(AblaValue value);
+uint64_t abla_function_capture_count(AblaValue value);
 AblaValue* abla_function_capture_pointer(AblaValue value);
-AblaValue abla_function_capture(AblaValue value, size_t index);
+AblaValue abla_function_capture(AblaValue value, uint64_t index);
 void abla_closure_release(AblaValue value);
 void* abla_owned_bytes_from_value(AblaValue value);
 const uint8_t* abla_owned_bytes_data(void* handle);

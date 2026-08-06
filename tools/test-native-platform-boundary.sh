@@ -25,8 +25,25 @@ rg -q '^declare .*@abla_array_create' \
     "$output_directory/pure-collections.ll"
 rg -q '^declare .*@abla_runtime_set_arguments' \
     "$output_directory/pure-collections.ll"
-[[ -s $pure_output.value-runtime.o ]]
-[[ -s $pure_output.host.o ]]
+[[ -s $pure_output.o ]]
+[[ ! -e $pure_output.value-runtime.o ]]
+[[ ! -e $pure_output.host.o ]]
+if nm -u "$pure_output.o" | awk '{print $2}' | rg -q '^abla_'; then
+    echo 'packaging object retained unresolved Abla runtime symbols' >&2
+    exit 1
+fi
+if nm -u "$pure_output.o" | awk '{print $2}' | rg -q '^__longjmp_chk$'; then
+    echo 'packaging object retained a glibc-only fortified symbol' >&2
+    exit 1
+fi
+clang -fuse-ld=lld -Wl,--gc-sections \
+    "$pure_output.o" -o "$pure_output.relinked"
+set +e
+ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
+    "$project_root/tools/run-limited.sh" "$pure_output.relinked"
+relinked_status=$?
+set -e
+[[ $relinked_status -eq 42 ]]
 nm --defined-only "$pure_output" | awk '{print $3}' |
     rg -q '^abla_platform_alloc$'
 set +e
@@ -52,8 +69,9 @@ rg -q '^abla panic: array index out of bounds$' \
 "$compiler" build \
     "$project_root/tests/cases/modules/linux-filesystem.ab" \
     -o "$linux_filesystem_output"
-[[ -s $linux_filesystem_output.value-runtime.o ]]
-[[ -s $linux_filesystem_output.host.o ]]
+[[ -s $linux_filesystem_output.o ]]
+[[ ! -e $linux_filesystem_output.value-runtime.o ]]
+[[ ! -e $linux_filesystem_output.host.o ]]
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$linux_filesystem_output"
@@ -67,8 +85,9 @@ for fixture in "${fixtures[@]}"; do
     "$compiler" build \
         "$project_root/tests/cases/modules/$fixture.ab" \
         -o "$output"
-    [[ -s $output.value-runtime.o ]]
-    [[ -s $output.host.o ]]
+    [[ -s $output.o ]]
+    [[ ! -e $output.value-runtime.o ]]
+    [[ ! -e $output.host.o ]]
     set +e
     ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
         "$project_root/tools/run-limited.sh" "$output"
@@ -84,7 +103,8 @@ host_output="$output_directory/host-runtime"
 "$compiler" build \
     "$project_root/tests/cases/modules/host-runtime.ab" \
     -o "$host_output"
-[[ -s $host_output.host.o ]]
-[[ -s $host_output.value-runtime.o ]]
+[[ -s $host_output.o ]]
+[[ ! -e $host_output.host.o ]]
+[[ ! -e $host_output.value-runtime.o ]]
 
 echo "native platform boundary: generated modules use one linked portable value/platform runtime"

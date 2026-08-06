@@ -451,7 +451,7 @@ void abla_platform_memory_set_cache_owner(void* pointer, void* owner) {
     header->allocation.cache_owner = (AblaStringRope*)owner;
 }
 
-_Noreturn void abla_platform_panic(const char* message, size_t length) {
+_Noreturn void abla_platform_panic(const char* message, uint64_t length) {
     if (host_checked_frame != NULL) {
         host_checked_frame->message = message;
         host_checked_frame->length = length;

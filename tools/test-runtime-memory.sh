@@ -38,8 +38,13 @@ rg -Fq 'call void @abla_runtime_memory_pressure()' \
     "$directory/pressure.ll"
 "$compiler" build "$project_root/tests/cases/modules/runtime-memory.ab" \
     -o "$program"
-[[ -s $program.value-runtime.o ]]
-[[ -s $program.host.o ]]
+[[ -s $program.o ]]
+[[ ! -e $program.value-runtime.o ]]
+[[ ! -e $program.host.o ]]
+if nm -u "$program.o" | awk '{print $2}' | rg -q '^abla_'; then
+    echo 'packaging object retained unresolved Abla runtime symbols' >&2
+    exit 1
+fi
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$program"

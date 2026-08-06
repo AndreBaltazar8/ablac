@@ -47,8 +47,6 @@ int8_t ablaCompilerTypeNeedsNormalization(
 }
 
 #include <stdatomic.h>
-#include <stdlib.h>
-#include <string.h>
 
 typedef struct AblaField {
     uint32_t symbol;
@@ -74,7 +72,7 @@ struct AblaStringRope {
     char* flattened;
 };
 
-static _Noreturn void panic(const char* message, size_t length) {
+static _Noreturn void panic(const char* message, uint64_t length) {
     abla_platform_panic(message, length);
 }
 
@@ -200,7 +198,7 @@ AblaValue abla_function(uint32_t function) {
 AblaValue abla_closure(
     uint32_t function,
     const AblaValue* captures,
-    size_t capture_count) {
+    uint64_t capture_count) {
     AblaValue* owned_captures = capture_count == 0
         ? (AblaValue*)0
         : (AblaValue*)abla_platform_alloc(sizeof(AblaValue) * capture_count);
@@ -238,7 +236,7 @@ uint32_t abla_as_function(AblaValue value) {
     if (value.tag != ABLA_FUNCTION) panic("expected function", 17);
     return value.as.function.id;
 }
-size_t abla_function_capture_count(AblaValue value) {
+uint64_t abla_function_capture_count(AblaValue value) {
     if (value.tag != ABLA_FUNCTION) panic("expected function", 17);
     return value.as.function.capture_count;
 }
@@ -263,11 +261,11 @@ void* abla_owned_bytes_from_value(AblaValue value) {
     if (length > SIZE_MAX - sizeof(AblaOwnedBytes)) {
         panic("string length overflow", 22);
     }
-    AblaOwnedBytes* handle = (AblaOwnedBytes*)malloc(
+    AblaOwnedBytes* handle = (AblaOwnedBytes*)abla_platform_alloc(
         sizeof(AblaOwnedBytes) + (size_t)length);
     if (handle == NULL) panic("out of memory", 13);
     handle->length = length;
-    if (length != 0) memcpy(handle->data, data, (size_t)length);
+    if (length != 0) copy_bytes((char*)handle->data, data, (size_t)length);
     return handle;
 }
 
@@ -279,8 +277,10 @@ uint64_t abla_owned_bytes_length(void* opaque_handle) {
     return ((const AblaOwnedBytes*)opaque_handle)->length;
 }
 
-void abla_owned_bytes_release(void* handle) { free(handle); }
-AblaValue abla_function_capture(AblaValue value, size_t index) {
+void abla_owned_bytes_release(void* handle) {
+    abla_platform_free(handle);
+}
+AblaValue abla_function_capture(AblaValue value, uint64_t index) {
     if (value.tag != ABLA_FUNCTION) panic("expected function", 17);
     if (index >= value.as.function.capture_count) {
         panic("function capture out of bounds", 30);

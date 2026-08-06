@@ -41,8 +41,10 @@ fi
 rg -q '^declare .*@abla_string_concat' "$output_directory/runtime.ll"
 rg -q '^declare .*@abla_to_string' "$output_directory/runtime.ll"
 rg -q '^declare .*@abla_equal' "$output_directory/runtime.ll"
-[[ -s $output_directory/value-runtime.value-runtime.o ]]
-nm --defined-only "$output_directory/value-runtime.value-runtime.o" |
+[[ -s $output_directory/value-runtime.o ]]
+[[ ! -e $output_directory/value-runtime.value-runtime.o ]]
+[[ ! -e $output_directory/value-runtime.host.o ]]
+nm --defined-only "$output_directory/value-runtime.o" |
     rg -q ' [Tt] abla_string_data$'
 
 echo "portable value runtime: strings, ropes, formatting, equality, and one linked implementation"
