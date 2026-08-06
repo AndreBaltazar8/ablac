@@ -36,21 +36,36 @@ if (( memory_mb > 8796093022207 )); then
 fi
 memory_bytes=$((memory_mb * 1024 * 1024))
 
-set +e
-timeout \
-    --signal=TERM \
-    --kill-after="${kill_grace_seconds}s" \
-    "${wall_seconds}s" \
-    prlimit \
-        --as="${memory_bytes}:${memory_bytes}" \
-        --cpu="${cpu_seconds}:${cpu_seconds}" \
-        --core=0:0 \
-        -- \
-        "$@"
-status=$?
-set -e
+if [[ $(uname -s) == Darwin ]]; then
+    ulimit -S -c 0
+    ulimit -S -t "$cpu_seconds"
+    set +e
+    /usr/bin/perl -e \
+        'my $seconds = shift; alarm $seconds; exec @ARGV; exit 127' \
+        "$wall_seconds" "$@"
+    status=$?
+    set -e
+else
+    set +e
+    timeout \
+        --signal=TERM \
+        --kill-after="${kill_grace_seconds}s" \
+        "${wall_seconds}s" \
+        prlimit \
+            --as="${memory_bytes}:${memory_bytes}" \
+            --cpu="${cpu_seconds}:${cpu_seconds}" \
+            --core=0:0 \
+            -- \
+            "$@"
+    status=$?
+    set -e
+fi
 
 case $status in
+    142)
+        printf '[abla-limit] stopped after %s wall-clock second(s)\n' \
+            "$wall_seconds" >&2
+        ;;
     124)
         printf '[abla-limit] stopped after %s wall-clock second(s)\n' \
             "$wall_seconds" >&2

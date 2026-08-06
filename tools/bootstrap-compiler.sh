@@ -3,10 +3,33 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output=${1:-$project_root/build/ablac.bin}
-version=v0.1.0
-artifact=ablac-x86_64-linux
+version=v0.2.0
+platform=$(uname -s)
+machine=$(uname -m)
+case "$platform/$machine" in
+    Linux/x86_64)
+        artifact=ablac-x86_64-linux
+        platform_sha256=af7de8f3641b6367e7344a99273f5d9beb76bd0286898a7f28d9f1f5ef49bfc9
+        ;;
+    Darwin/x86_64)
+        artifact=ablac-x86_64-macos
+        platform_sha256=8852cd6c82b77c3e1758122f50ee3f59593767660f134742c66c005da2715caa
+        ;;
+    *)
+        printf 'unsupported bootstrap host: %s/%s\n' "$platform" "$machine" >&2
+        exit 2
+        ;;
+esac
 url=${ABLA_BOOTSTRAP_URL:-https://github.com/AndreBaltazar8/ablac/releases/download/$version/$artifact}
-expected_sha256=${ABLA_BOOTSTRAP_SHA256:-e9896ac7b2f0ba96e8e1e78bd81b3b8812f31b2efe152c3d7b60894ec50ff52a}
+expected_sha256=${ABLA_BOOTSTRAP_SHA256:-$platform_sha256}
+
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
 
 mkdir -p -- "$(dirname -- "$output")"
 temporary=$(mktemp "${output}.download.XXXXXX")
@@ -16,7 +39,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ -f $output ]]; then
-    actual_sha256=$(sha256sum "$output" | cut -d' ' -f1)
+    actual_sha256=$(sha256 "$output")
     if [[ $actual_sha256 == "$expected_sha256" ]]; then
         chmod +x "$output"
         exit 0
@@ -27,7 +50,7 @@ fi
 
 printf 'downloading Abla bootstrap compiler %s\n' "$version"
 curl --fail --location --retry 3 --output "$temporary" "$url"
-actual_sha256=$(sha256sum "$temporary" | cut -d' ' -f1)
+actual_sha256=$(sha256 "$temporary")
 if [[ $actual_sha256 != "$expected_sha256" ]]; then
     printf 'bootstrap compiler checksum mismatch: expected %s, got %s\n' \
         "$expected_sha256" "$actual_sha256" >&2

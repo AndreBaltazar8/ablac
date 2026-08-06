@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <setjmp.h>
@@ -17,11 +18,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define ABLA_HOST_FALLBACK __attribute__((weak))
@@ -494,7 +500,11 @@ int32_t abla_checked_invoke(
 void abla_runtime_set_arguments(int argc, char** argv) {
     host_argc = argc;
     host_argv = argv;
+#if defined(__APPLE__)
+    host_envp = *_NSGetEnviron();
+#else
     host_envp = argv == NULL ? NULL : argv + (size_t)argc + 1;
+#endif
 }
 
 AblaValue ablaUnsafeAllocate(AblaValue size_value) {
@@ -600,6 +610,375 @@ AblaValue ablaUnsafeBorrowCString(AblaValue address) {
     return host_value_string_static(text, strlen(text));
 }
 
+#if defined(__APPLE__)
+static int host_linux_errno(int value) {
+    if (value == EINPROGRESS) return 115;
+    if (value == EAGAIN) return 11;
+    if (value == ENOSYS) return 38;
+    return value;
+}
+
+static int host_macos_open_flags(int64_t flags) {
+    int result = 0;
+    if ((flags & 3) == 1) result |= O_WRONLY;
+    if ((flags & 3) == 2) result |= O_RDWR;
+    if ((flags & 64) != 0) result |= O_CREAT;
+    if ((flags & 128) != 0) result |= O_EXCL;
+    if ((flags & 512) != 0) result |= O_TRUNC;
+    if ((flags & 1024) != 0) result |= O_APPEND;
+    if ((flags & 2048) != 0) result |= O_NONBLOCK;
+    if ((flags & 65536) != 0) result |= O_DIRECTORY;
+    if ((flags & 524288) != 0) result |= O_CLOEXEC;
+    return result;
+}
+
+static int host_macos_socket_type(int64_t type) {
+    int result = (int)(type & 15);
+    if (result == 1) result = SOCK_STREAM;
+    return result;
+}
+
+static void host_macos_configure_descriptor(int descriptor, int64_t flags) {
+    if (descriptor < 0) return;
+    if ((flags & 524288) != 0) {
+        (void)fcntl(descriptor, F_SETFD, FD_CLOEXEC);
+    }
+    if ((flags & 2048) != 0) {
+        const int current = fcntl(descriptor, F_GETFL, 0);
+        if (current >= 0) (void)fcntl(descriptor, F_SETFL, current | O_NONBLOCK);
+    }
+}
+
+static void host_store_i64(unsigned char* output, size_t offset, int64_t value) {
+    memcpy(output + offset, &value, sizeof(value));
+}
+
+static void host_store_u32(unsigned char* output, size_t offset, uint32_t value) {
+    memcpy(output + offset, &value, sizeof(value));
+}
+
+static void host_store_u16(unsigned char* output, size_t offset, uint16_t value) {
+    memcpy(output + offset, &value, sizeof(value));
+}
+
+static int host_macos_sockaddr(
+    const void* linux_address,
+    size_t linux_length,
+    struct sockaddr_in* output) {
+    if (linux_address == NULL || linux_length < 8) {
+        errno = EINVAL;
+        return -1;
+    }
+    const unsigned char* input = (const unsigned char*)linux_address;
+    if (input[0] != 2 || input[1] != 0) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+    memset(output, 0, sizeof(*output));
+    output->sin_len = (uint8_t)sizeof(*output);
+    output->sin_family = AF_INET;
+    memcpy(&output->sin_port, input + 2, 2);
+    memcpy(&output->sin_addr, input + 4, 4);
+    return 0;
+}
+
+static long host_macos_getdents(
+    int descriptor,
+    unsigned char* output,
+    size_t capacity) {
+    if (output == NULL || capacity < 24) {
+        errno = EINVAL;
+        return -1;
+    }
+    unsigned char* native = (unsigned char*)malloc(capacity);
+    if (native == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+    off_t base = 0;
+    const long measured = syscall(
+        SYS_getdirentries64, descriptor, native, capacity, &base);
+    if (measured <= 0) {
+        free(native);
+        return (long)measured;
+    }
+    size_t input_offset = 0;
+    size_t output_offset = 0;
+    while (input_offset < (size_t)measured) {
+        const struct dirent* entry =
+            (const struct dirent*)(native + input_offset);
+        if (entry->d_reclen == 0 ||
+            input_offset + entry->d_reclen > (size_t)measured) {
+            free(native);
+            errno = EIO;
+            return -1;
+        }
+        const size_t name_length = strlen(entry->d_name);
+        const size_t record_length = (19 + name_length + 1 + 7) & ~(size_t)7;
+        if (record_length > UINT16_MAX ||
+            output_offset + record_length > capacity) {
+            free(native);
+            errno = EOVERFLOW;
+            return -1;
+        }
+        memset(output + output_offset, 0, record_length);
+        host_store_i64(
+            output, output_offset, (int64_t)entry->d_ino);
+        host_store_i64(output, output_offset + 8, (int64_t)base);
+        host_store_u16(
+            output, output_offset + 16, (uint16_t)record_length);
+        output[output_offset + 18] = entry->d_type;
+        memcpy(output + output_offset + 19, entry->d_name, name_length + 1);
+        output_offset += record_length;
+        input_offset += entry->d_reclen;
+    }
+    free(native);
+    return (long)output_offset;
+}
+
+static long host_macos_linux_syscall(
+    int64_t number,
+    int64_t argument0,
+    int64_t argument1,
+    int64_t argument2,
+    int64_t argument3,
+    int64_t argument4,
+    int64_t argument5) {
+    (void)argument5;
+    long result = -1;
+    switch (number) {
+        case 0:
+            result = (long)read(
+                (int)argument0, (void*)(uintptr_t)argument1, (size_t)argument2);
+            break;
+        case 1:
+            result = (long)write(
+                (int)argument0,
+                (const void*)(uintptr_t)argument1,
+                (size_t)argument2);
+            break;
+        case 3:
+            result = close((int)argument0);
+            break;
+        case 7:
+            result = poll(
+                (struct pollfd*)(uintptr_t)argument0,
+                (nfds_t)argument1,
+                (int)argument2);
+            break;
+        case 14:
+        case 289:
+            errno = ENOSYS;
+            break;
+        case 21:
+            result = access(
+                (const char*)(uintptr_t)argument0, (int)argument1);
+            break;
+        case 33:
+            result = dup2((int)argument0, (int)argument1);
+            break;
+        case 35:
+            result = nanosleep(
+                (const struct timespec*)(uintptr_t)argument0,
+                (struct timespec*)(uintptr_t)argument1);
+            break;
+        case 39:
+            result = (long)getpid();
+            break;
+        case 41: {
+            const int descriptor = socket(
+                (int)argument0, host_macos_socket_type(argument1),
+                (int)argument2);
+            host_macos_configure_descriptor(descriptor, argument1);
+            result = descriptor;
+            break;
+        }
+        case 42:
+        case 49: {
+            struct sockaddr_in address;
+            if (host_macos_sockaddr(
+                    (const void*)(uintptr_t)argument1,
+                    (size_t)argument2,
+                    &address) == 0) {
+                if (number == 42) {
+                    result = connect(
+                        (int)argument0,
+                        (const struct sockaddr*)&address,
+                        (socklen_t)sizeof(address));
+                } else {
+                    result = bind(
+                        (int)argument0,
+                        (const struct sockaddr*)&address,
+                        (socklen_t)sizeof(address));
+                }
+            }
+            break;
+        }
+        case 44:
+            result = (long)send(
+                (int)argument0,
+                (const void*)(uintptr_t)argument1,
+                (size_t)argument2,
+                (int)argument3);
+            break;
+        case 50:
+            result = listen((int)argument0, (int)argument1);
+            break;
+        case 51: {
+            struct sockaddr_in address;
+            socklen_t length = (socklen_t)sizeof(address);
+            result = getsockname(
+                (int)argument0, (struct sockaddr*)&address, &length);
+            if (result == 0 && argument1 != 0 && argument2 != 0) {
+                unsigned char* output = (unsigned char*)(uintptr_t)argument1;
+                uint32_t* output_length = (uint32_t*)(uintptr_t)argument2;
+                if (*output_length < 16) {
+                    errno = EINVAL;
+                    result = -1;
+                } else {
+                    memset(output, 0, 16);
+                    output[0] = 2;
+                    memcpy(output + 2, &address.sin_port, 2);
+                    memcpy(output + 4, &address.sin_addr, 4);
+                    *output_length = 16;
+                }
+            }
+            break;
+        }
+        case 54: {
+            int level = (int)argument1;
+            int option = (int)argument2;
+            if (level == 1) level = SOL_SOCKET;
+            if (level == SOL_SOCKET && option == 2) option = SO_REUSEADDR;
+            result = setsockopt(
+                (int)argument0,
+                level,
+                option,
+                (const void*)(uintptr_t)argument3,
+                (socklen_t)argument4);
+            break;
+        }
+        case 57:
+            result = (long)fork();
+            break;
+        case 59:
+            result = execve(
+                (const char*)(uintptr_t)argument0,
+                (char* const*)(uintptr_t)argument1,
+                (char* const*)(uintptr_t)argument2);
+            break;
+        case 60:
+            _exit((int)argument0);
+        case 61:
+            result = (long)waitpid(
+                (pid_t)argument0,
+                (int*)(uintptr_t)argument1,
+                (int)argument2);
+            break;
+        case 62:
+            result = kill((pid_t)argument0, (int)argument1);
+            break;
+        case 72:
+            result = fcntl(
+                (int)argument0, (int)argument1,
+                argument1 == F_SETFL
+                    ? host_macos_open_flags(argument2)
+                    : (int)argument2);
+            break;
+        case 74:
+            result = fsync((int)argument0);
+            break;
+        case 79: {
+            char* output = (char*)(uintptr_t)argument0;
+            if (getcwd(output, (size_t)argument1) != NULL) {
+                result = (long)(strlen(output) + 1);
+            }
+            break;
+        }
+        case 82:
+            result = rename(
+                (const char*)(uintptr_t)argument0,
+                (const char*)(uintptr_t)argument1);
+            break;
+        case 83:
+            result = mkdir(
+                (const char*)(uintptr_t)argument0, (mode_t)argument1);
+            break;
+        case 84:
+            result = rmdir((const char*)(uintptr_t)argument0);
+            break;
+        case 87:
+            result = unlink((const char*)(uintptr_t)argument0);
+            break;
+        case 217:
+            result = host_macos_getdents(
+                (int)argument0,
+                (unsigned char*)(uintptr_t)argument1,
+                (size_t)argument2);
+            break;
+        case 228:
+            result = clock_gettime(
+                argument0 == 1 ? CLOCK_MONOTONIC : CLOCK_REALTIME,
+                (struct timespec*)(uintptr_t)argument1);
+            break;
+        case 257: {
+            const int directory = argument0 == -100 ? AT_FDCWD : (int)argument0;
+            result = openat(
+                directory,
+                (const char*)(uintptr_t)argument1,
+                host_macos_open_flags(argument2),
+                (mode_t)argument3);
+            break;
+        }
+        case 262: {
+            struct stat information;
+            const int directory = argument0 == -100 ? AT_FDCWD : (int)argument0;
+            result = fstatat(
+                directory,
+                (const char*)(uintptr_t)argument1,
+                &information,
+                (int)argument3);
+            if (result == 0) {
+                unsigned char* output =
+                    (unsigned char*)(uintptr_t)argument2;
+                memset(output, 0, 144);
+                host_store_u32(output, 24, (uint32_t)information.st_mode);
+                host_store_i64(output, 48, (int64_t)information.st_size);
+                host_store_i64(
+                    output, 88, (int64_t)information.st_mtimespec.tv_sec);
+                host_store_i64(
+                    output, 96, (int64_t)information.st_mtimespec.tv_nsec);
+            }
+            break;
+        }
+        case 288: {
+            const int descriptor = accept((int)argument0, NULL, NULL);
+            host_macos_configure_descriptor(descriptor, argument3);
+            result = descriptor;
+            break;
+        }
+        case 293: {
+            int* descriptors = (int*)(uintptr_t)argument0;
+            result = pipe(descriptors);
+            if (result == 0) {
+                host_macos_configure_descriptor(descriptors[0], argument1);
+                host_macos_configure_descriptor(descriptors[1], argument1);
+            }
+            break;
+        }
+        case 318:
+            arc4random_buf((void*)(uintptr_t)argument0, (size_t)argument1);
+            result = argument1;
+            break;
+        default:
+            errno = ENOSYS;
+            break;
+    }
+    if (result == -1) return -(long)host_linux_errno(errno);
+    return result;
+}
+#endif
+
 AblaValue ablaLinuxSyscall(
     AblaValue number,
     AblaValue argument0,
@@ -608,6 +987,17 @@ AblaValue ablaLinuxSyscall(
     AblaValue argument3,
     AblaValue argument4,
     AblaValue argument5) {
+#if defined(__APPLE__)
+    const long result = host_macos_linux_syscall(
+        host_value_as_i64(number),
+        host_value_as_i64(argument0),
+        host_value_as_i64(argument1),
+        host_value_as_i64(argument2),
+        host_value_as_i64(argument3),
+        host_value_as_i64(argument4),
+        host_value_as_i64(argument5));
+    return host_value_i64((int64_t)result);
+#else
     const long result = syscall(
         (long)host_value_as_i64(number),
         (long)host_value_as_i64(argument0),
@@ -618,6 +1008,7 @@ AblaValue ablaLinuxSyscall(
         (long)host_value_as_i64(argument5));
     if (result == -1) return host_value_i64(-(int64_t)errno);
     return host_value_i64((int64_t)result);
+#endif
 }
 
 AblaValue ablaLinuxArgumentCount(void) {
@@ -636,6 +1027,14 @@ AblaValue ablaLinuxArgument(AblaValue index_value) {
 
 AblaValue ablaLinuxEnvironmentPointer(void) {
     return host_value_pointer(host_envp);
+}
+
+AblaValue ablaHostIsMacOS(void) {
+#if defined(__APPLE__)
+    return host_value_bool(true);
+#else
+    return host_value_bool(false);
+#endif
 }
 
 AblaValue ablaHostArgumentCount(void) {

@@ -53,7 +53,7 @@ native cache record, so a cache hit restores a missing sidecar instead of
 silently publishing an undocumented binary. Schema version 1 exposes value
 scalars, copied borrowed-byte inputs, call-scoped non-escaping scalar
 callbacks, and owned-byte result handles. Direct exports honestly mark panics
-as uncontained. Opt-in checked exports on hosted x86-64 Linux publish their
+as uncontained. Opt-in checked exports on hosted x86-64 Linux and macOS publish their
 status/out-pointer/caller-buffer ABI and abortive-cleanup semantics; unsupported
 targets reject them with `E_EXPORT_TARGET_CAPABILITY` rather than silently
 downgrading containment.

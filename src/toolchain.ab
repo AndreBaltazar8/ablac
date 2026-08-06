@@ -3,6 +3,7 @@ import "module.ab"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
+import "abla/platform/host"
 
 class BootstrapTargetDescriptor(
     val name: string,
@@ -20,7 +21,7 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
     var result = BootstrapTargetDescriptor(
         name, "", "", false, false, "", "", "", false
     )
-    if (name == "x86_64-linux") {
+    if (name == "x86_64-linux" && !ablaHostIsMacOS()) {
         result = BootstrapTargetDescriptor(
             name,
             "x86_64-unknown-linux-gnu",
@@ -46,8 +47,27 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             true
         )
     }
+    if (name == "x86_64-macos" && ablaHostIsMacOS()) {
+        result = BootstrapTargetDescriptor(
+            name,
+            "x86_64-apple-macosx14.0",
+            "macho",
+            true,
+            false,
+            "main",
+            "host-clang",
+            "",
+            true
+        )
+    }
     result
 }
+
+fun bootstrapHostTargetName(): string =
+    if (ablaHostIsMacOS()) "x86_64-macos" else "x86_64-linux"
+
+fun bootstrapTargetIsHost(target: BootstrapTargetDescriptor): bool =
+    target.name == bootstrapHostTargetName()
 
 fun bootstrapDefinedTargetDescriptor(
     target: BootstrapDefinedTarget
@@ -70,7 +90,10 @@ fun bootstrapDefinedTargetDescriptor(
 )
 
 fun bootstrapSupportedTargets(): string =
-    "x86_64-linux, x86_64-linux-raw"
+    if (ablaHostIsMacOS())
+        "x86_64-macos, x86_64-linux-raw"
+    else
+        "x86_64-linux, x86_64-linux-raw"
 
 class BootstrapNativeBuild(
     val status: int,
@@ -716,6 +739,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // An entry symbol identifies the latter; external module formats provide
     // their own loader/runtime contract and must not receive the Linux startup.
     val rawTarget = target.libcFree && target.entrySymbol.size > 0
+    val macTarget = target.name == "x86_64-macos"
     bootstrapBeginCompileOutputs()
     val modules: array<BootstrapModule> = []
     moduleState.beginBuild()
@@ -830,8 +854,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             if (bootstrapTextContains(
                 compilation.abiExports,
                 "\"panic\":\"contained\""
-            ) && (!target.hosted ||
-                  target.llvmTriple != "x86_64-unknown-linux-gnu")) {
+            ) && !target.hosted) {
                 linuxPrintStandardError(
                     "error[E_EXPORT_TARGET_CAPABILITY]: target '${target.name}' has no checked-panic containment runtime\n"
                 )
@@ -1044,6 +1067,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileHost.argument("-pthread")
         compileHost.argument("-ffunction-sections")
         compileHost.argument("-fdata-sections")
+        if (macTarget) {
+            compileHost.argument("-D_XOPEN_SOURCE=700")
+            compileHost.argument("-D_DARWIN_C_SOURCE")
+            compileHost.argument("-Wno-deprecated-declarations")
+        }
         compileHost.argument("-I${bootstrapRuntimeRoot()}")
         compileHost.argument("-c")
         compileHost.argument(
@@ -1071,9 +1099,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && target.hosted && artifact == "executable") {
         val link = linuxCommand("clang")
         link.argument("-pthread")
-        link.argument("-fuse-ld=lld")
-        link.argument("-Wl,--threads=1")
-        link.argument("-Wl,--gc-sections")
+        if (macTarget) link.argument("-Wl,-dead_strip")
+        else {
+            link.argument("-fuse-ld=lld")
+            link.argument("-Wl,--threads=1")
+            link.argument("-Wl,--gc-sections")
+        }
         if (linkLlvm) {
             val llvmConfig = linuxCommand("llvm-config")
             llvmConfig.argument("--libdir")
@@ -1083,7 +1114,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 (llvmLibraryDirectory[end - 1] == 10 ||
                  llvmLibraryDirectory[end - 1] == 13)) end = end - 1
             llvmLibraryDirectory = llvmLibraryDirectory.slice(0, end)
-            link.argument("-Wl,--export-dynamic")
+            link.argument(if (macTarget)
+                "-Wl,-export_dynamic"
+            else
+                "-Wl,--export-dynamic"
+            )
             link.argument("-L$llvmLibraryDirectory")
             link.argument("-Wl,-rpath,$llvmLibraryDirectory")
             link.argument("-lLLVM")
@@ -1115,10 +1150,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && target.hosted && artifact == "shared-library") {
         val linkShared = linuxCommand("clang")
         linkShared.argument("-pthread")
-        linkShared.argument("-shared")
-        linkShared.argument("-fuse-ld=lld")
-        linkShared.argument("-Wl,--threads=1")
-        linkShared.argument("-Wl,--gc-sections")
+        if (macTarget) {
+            linkShared.argument("-dynamiclib")
+            linkShared.argument("-Wl,-dead_strip")
+        } else {
+            linkShared.argument("-shared")
+            linkShared.argument("-fuse-ld=lld")
+            linkShared.argument("-Wl,--threads=1")
+            linkShared.argument("-Wl,--gc-sections")
+        }
         if (linkLlvm) {
             val llvmConfig = linuxCommand("llvm-config")
             llvmConfig.argument("--libdir")
@@ -1381,8 +1421,15 @@ fun bootstrapBuildJitHostLibrary(outputPath: string): int {
     hostCompile.argument("-O2")
     hostCompile.argument("-pthread")
     hostCompile.argument("-fPIC")
-    hostCompile.argument("-shared")
-    hostCompile.argument("-Wl,--no-undefined")
+    if (ablaHostIsMacOS()) {
+        hostCompile.argument("-dynamiclib")
+        hostCompile.argument("-D_XOPEN_SOURCE=700")
+        hostCompile.argument("-D_DARWIN_C_SOURCE")
+        hostCompile.argument("-Wno-deprecated-declarations")
+    } else {
+        hostCompile.argument("-shared")
+        hostCompile.argument("-Wl,--no-undefined")
+    }
     hostCompile.argument("-I${bootstrapRuntimeRoot()}")
     hostCompile.argument(
         Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text

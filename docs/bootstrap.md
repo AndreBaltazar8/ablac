@@ -5,8 +5,9 @@ and the production entry point is `src/orc_main.ab`. The former C++ seed and
 multi-stage source bootstrap are no longer part of the repository.
 
 A compiler cannot translate itself on an empty machine without an existing
-executable translator. Clean builds therefore begin with the checksum-pinned
-`ablac-x86_64-linux` artifact from the `v0.1.0` GitHub release:
+executable translator. Clean builds therefore begin with a checksum-pinned
+host artifact from the `v0.2.0` GitHub release: `ablac-x86_64-linux` on Linux
+or `ablac-x86_64-macos` on an Intel Mac.
 
 ```text
 published ablac binary
@@ -18,7 +19,8 @@ current src/*.ab -> build/ablac.bin
 current src/*.ab -> fixed-point compiler
 ```
 
-`make bootstrap` downloads and verifies that artifact. `make ablac` then uses
+`make bootstrap` selects, downloads, and verifies the artifact for the current
+host. `make ablac` then uses
 it to rebuild the current sources. `make self-rebuild` builds another compiler,
 requires byte-identical LLVM IR from both compilers, audits the child for
 project-C host symbols, and uses it to build and run a native probe.
@@ -44,6 +46,7 @@ backend written in Abla. C and assembly files under `runtime/` are target
 adapters for generated programs; they are not compiler implementations or a
 compiler bootstrap stage.
 
-LLVM, Clang, and LLD remain pinned native toolchain dependencies. Removing
-those hosted dependencies is a separate freestanding goal described in
+LLVM, Clang, and the platform linker remain native toolchain dependencies.
+Linux pins them through Nix; Intel macOS uses Homebrew LLVM and the system
+Mach-O linker. Removing those hosted dependencies is a separate freestanding goal described in
 [full-self-hosting.md](full-self-hosting.md).

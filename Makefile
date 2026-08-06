@@ -18,7 +18,7 @@ all: ablac
 $(BUILD_DIR):
 	mkdir -p $@
 
-# A clean checkout starts with the compiler published alongside v0.1.0. That
+# A clean checkout starts with the host compiler published alongside v0.2.0. That
 # compiler immediately rebuilds the current source graph, so src/*.ab remains
 # the only compiler implementation in the repository.
 $(COMPILER_PAYLOAD): $(COMPILER_SOURCES) tools/build-self-hosted-release.sh \

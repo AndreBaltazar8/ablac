@@ -1,11 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-launcher=$(readlink -f -- "${BASH_SOURCE[0]}")
+launcher=${BASH_SOURCE[0]}
+while [[ -L $launcher ]]; do
+    launcher_directory=$(cd -- "$(dirname -- "$launcher")" && pwd)
+    launcher_target=$(readlink "$launcher")
+    if [[ $launcher_target == /* ]]; then
+        launcher=$launcher_target
+    else
+        launcher=$launcher_directory/$launcher_target
+    fi
+done
 script_directory=$(cd -- "$(dirname -- "$launcher")" && pwd)
 toolchain_root=$(cd -- "$script_directory/.." && pwd)
 compiler="${0}.bin"
-stack_kb=${ABLA_MAX_STACK_KB:-65536}
+default_stack_kb=65536
+if [[ $(uname -s) == Darwin ]]; then default_stack_kb=65532; fi
+stack_kb=${ABLA_MAX_STACK_KB:-$default_stack_kb}
 
 # Keep compiler-owned sources independent from the caller's working directory.
 # An explicit sysroot still wins for installed or custom toolchains.
@@ -33,6 +44,11 @@ fi
 # for object emission but still uses the pinned clang/linker toolchain.
 case ${1:-} in
     build|serve)
+        if ! command -v opt >/dev/null 2>&1; then
+            if [[ $(uname -s) == Darwin && -x /usr/local/opt/llvm/bin/opt ]]; then
+                export PATH="/usr/local/opt/llvm/bin:/usr/local/opt/lld/bin:$PATH"
+            fi
+        fi
         if ! command -v opt >/dev/null 2>&1; then
             if [[ -n ${IN_NIX_SHELL:-} ]]; then
                 printf '%s\n' \

@@ -85,6 +85,7 @@ AblaValue abla_closure(
     size_t capture_count);
 
 void abla_runtime_set_arguments(int argc, char** argv);
+AblaValue ablaHostIsMacOS(void);
 AblaValue ablaHostArgumentCount(void);
 AblaValue ablaHostArgument(AblaValue index);
 AblaValue ablaHostReadFile(AblaValue path);

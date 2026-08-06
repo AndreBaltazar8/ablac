@@ -64,13 +64,26 @@ fun main: int {
 
 ## Development
 
-The development shell pins nixpkgs and the native LLVM toolchain. Install Nix,
-then enter the environment and build the compiler:
+On Linux, the development shell pins nixpkgs and the native LLVM toolchain.
+Install Nix, then enter the environment and build the compiler:
 
 ```sh
 nix-shell
 make
 ```
+
+On an Intel Mac, install Homebrew LLVM without enabling a blanket package
+upgrade, then build directly from the normal shell:
+
+```sh
+HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm
+make
+```
+
+The macOS host currently supports x86-64. `make` downloads the matching pinned
+bootstrap compiler, rebuilds the current Abla sources as a Mach-O executable,
+and uses Homebrew LLVM for native object emission and ORC execution.
+Run `tools/test-macos-host.sh build/ablac` for the focused native host gate.
 
 Run the ordinary test suite with:
 
@@ -88,7 +101,7 @@ make check
 The build has one compiler and a deliberately small target surface:
 
 ```sh
-make bootstrap     # fetch and verify the published v0.1.0 compiler
+make bootstrap     # fetch and verify the published v0.2.0 host compiler
 make ablac         # rebuild build/ablac from src/*.ab
 make test          # run the self-hosted conformance suite
 make self-rebuild  # prove a byte-identical compiler fixed point
@@ -97,7 +110,7 @@ make clean         # remove generated files
 ```
 
 On an empty build directory, `make` downloads the checksum-pinned compiler from
-the `v0.1.0` GitHub release and immediately recompiles the current `src/` graph.
+the `v0.2.0` GitHub release and immediately recompiles the current `src/` graph.
 No C++ compiler implementation or generated-C bootstrap is involved.
 
 ## Using the compiler
@@ -107,6 +120,7 @@ No C++ compiler implementation or generated-C bootstrap is involved.
 ```sh
 build/ablac build program.ab -o build/program
 build/ablac build program.ab -o build/program --fast
+build/ablac build program.ab --target x86_64-macos -o build/program
 build/ablac build program.ab --target x86_64-linux-raw -o build/program.raw
 build/ablac run program.ab
 build/ablac repl

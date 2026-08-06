@@ -15,7 +15,10 @@ require libc; hosted facilities are optional capabilities.
 
 - The self-hosted compiler builds directly through LLVM and reproduces its
   generated LLVM module byte-for-byte at the fixed point.
-- The final-native conformance suite covers 49 programs. Focused gates cover
+- The hosted compiler and ordinary Abla programs build and run natively on
+  x86-64 Linux and Intel macOS; the macOS gate covers Mach-O emission, ORC,
+  console, filesystem, and child-process behavior.
+- The final-native conformance suite covers 55 programs. Focused gates cover
   the raw libc-free target, compiler extensions, programmable builds, Android
   cross-builds, and WASM/MVC modules.
 - Compile-time code has bounded effect grants and can inspect resolved types,
