@@ -170,6 +170,12 @@ AblaValue ablaUnsafeLoadU8(AblaValue address);
 AblaValue ablaUnsafeStoreU8(AblaValue address, AblaValue value);
 AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length);
 AblaValue ablaUnsafeBorrowCString(AblaValue address);
+AblaValue ablaBitAnd(AblaValue left, AblaValue right);
+AblaValue ablaBitOr(AblaValue left, AblaValue right);
+AblaValue ablaBitXor(AblaValue left, AblaValue right);
+AblaValue ablaBitNot(AblaValue value);
+AblaValue ablaBitShiftLeft(AblaValue value, AblaValue count);
+AblaValue ablaBitShiftRightUnsigned(AblaValue value, AblaValue count);
 AblaValue ablaLinuxSyscall(
     AblaValue number,
     AblaValue argument0,

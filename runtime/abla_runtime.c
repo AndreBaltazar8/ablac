@@ -625,6 +625,36 @@ AblaValue ablaUtf8EncodeScalar(AblaValue value) {
             .rope = (AblaStringRope*)0}};
 }
 
+AblaValue ablaBitAnd(AblaValue left, AblaValue right) {
+    return abla_i64(abla_as_i64(left) & abla_as_i64(right));
+}
+
+AblaValue ablaBitOr(AblaValue left, AblaValue right) {
+    return abla_i64(abla_as_i64(left) | abla_as_i64(right));
+}
+
+AblaValue ablaBitXor(AblaValue left, AblaValue right) {
+    return abla_i64(abla_as_i64(left) ^ abla_as_i64(right));
+}
+
+AblaValue ablaBitNot(AblaValue value) {
+    return abla_i64(~abla_as_i64(value));
+}
+
+AblaValue ablaBitShiftLeft(AblaValue value, AblaValue count_value) {
+    const int64_t count = abla_as_i64(count_value);
+    if (count < 0 || count >= 64) return abla_i64(0);
+    return abla_i64((int64_t)((uint64_t)abla_as_i64(value) << count));
+}
+
+AblaValue ablaBitShiftRightUnsigned(
+    AblaValue value,
+    AblaValue count_value) {
+    const int64_t count = abla_as_i64(count_value);
+    if (count < 0 || count >= 64) return abla_i64(0);
+    return abla_i64((int64_t)((uint64_t)abla_as_i64(value) >> count));
+}
+
 AblaValue abla_length(AblaValue value) {
     if (value.tag == ABLA_STRING) return abla_string_length(value);
     if (value.tag == ABLA_ARRAY) return abla_array_length(value);
