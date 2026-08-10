@@ -74,11 +74,17 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     index=$((index + 1))
 done
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/delegated-bindings-c-backend.ab" \
-    -o "$output_directory/c-generator" --no-cache
-"$project_root/tools/run-limited.sh" "$output_directory/c-generator" \
-    > "$output_directory/program.c"
+if [[ -x ${ABLA_C_BACKEND_DRIVER:-} ]]; then
+    "$ABLA_C_BACKEND_DRIVER" \
+        "$project_root/tests/cases/c-backend/delegated-bindings.ab" \
+        >"$output_directory/program.c"
+else
+    "$compiler" build \
+        "$project_root/tests/cases/modules/delegated-bindings-c-backend.ab" \
+        -o "$output_directory/c-generator" --no-cache
+    "$project_root/tools/run-limited.sh" "$output_directory/c-generator" \
+        >"$output_directory/program.c"
+fi
 clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
     -I"$project_root/runtime" \
     "$output_directory/program.c" \

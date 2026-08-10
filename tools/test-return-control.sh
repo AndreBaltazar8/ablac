@@ -44,11 +44,17 @@ if [[ -e "$output_directory/invalid" ]]; then
     exit 1
 fi
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/return-c-backend.ab" \
-    -o "$output_directory/c-generator" --no-cache
-"$project_root/tools/run-limited.sh" \
-    "$output_directory/c-generator" >"$output_directory/program.c"
+if [[ -x ${ABLA_C_BACKEND_DRIVER:-} ]]; then
+    "$ABLA_C_BACKEND_DRIVER" \
+        "$project_root/tests/cases/c-backend/return-control.ab" \
+        >"$output_directory/program.c"
+else
+    "$compiler" build \
+        "$project_root/tests/cases/modules/return-c-backend.ab" \
+        -o "$output_directory/c-generator" --no-cache
+    "$project_root/tools/run-limited.sh" \
+        "$output_directory/c-generator" >"$output_directory/program.c"
+fi
 clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
     -I"$project_root/runtime" \
     "$output_directory/program.c" \

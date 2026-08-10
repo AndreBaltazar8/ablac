@@ -68,11 +68,17 @@ for index in "${!defer_fixtures[@]}"; do
     [[ ! -e $output_directory/$fixture ]]
 done
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/concurrency-c-backend.ab" \
-    --fast --no-cache -o "$output_directory/c-generator"
-"$project_root/tools/run-limited.sh" \
-    "$output_directory/c-generator" >"$output_directory/program.c"
+if [[ -x ${ABLA_C_BACKEND_DRIVER:-} ]]; then
+    "$ABLA_C_BACKEND_DRIVER" \
+        "$project_root/tests/cases/c-backend/concurrency.ab" \
+        >"$output_directory/program.c"
+else
+    "$compiler" build \
+        "$project_root/tests/cases/modules/concurrency-c-backend.ab" \
+        --fast --no-cache -o "$output_directory/c-generator"
+    "$project_root/tools/run-limited.sh" \
+        "$output_directory/c-generator" >"$output_directory/program.c"
+fi
 clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror -pthread \
     -I"$project_root/runtime" \
     "$output_directory/program.c" \

@@ -6,12 +6,18 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/bitwise-crypto"
 mkdir -p "$output_directory"
 
-ABLA_MAX_MEMORY_MB=4096 "$compiler" build \
-    "$project_root/tests/cases/modules/bitwise-c-backend.ab" \
-    -o "$output_directory/c-generator" --no-cache
-ABLA_MAX_MEMORY_MB=4096 "$project_root/tools/run-limited.sh" \
-    "$output_directory/c-generator" \
-    >"$output_directory/program.c"
+if [[ -x ${ABLA_C_BACKEND_DRIVER:-} ]]; then
+    "$ABLA_C_BACKEND_DRIVER" \
+        "$project_root/tests/cases/c-backend/bitwise.ab" \
+        >"$output_directory/program.c"
+else
+    ABLA_MAX_MEMORY_MB=4096 "$compiler" build \
+        "$project_root/tests/cases/modules/bitwise-c-backend.ab" \
+        -o "$output_directory/c-generator" --no-cache
+    ABLA_MAX_MEMORY_MB=4096 "$project_root/tools/run-limited.sh" \
+        "$output_directory/c-generator" \
+        >"$output_directory/program.c"
+fi
 clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
     -I"$project_root/runtime" \
     "$output_directory/program.c" \
