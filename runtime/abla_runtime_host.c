@@ -1334,6 +1334,152 @@ AblaValue ablaHostStartProcess(AblaValue arguments) {
     return host_value_i64((int64_t)process);
 }
 
+AblaValue ablaHostStartProcessConfigured(
+    AblaValue directory_value,
+    AblaValue arguments,
+    AblaValue environment_names,
+    AblaValue environment_values,
+    AblaValue output_path_value) {
+    if (directory_value.tag != ABLA_STRING ||
+        output_path_value.tag != ABLA_STRING ||
+        environment_names.tag != ABLA_ARRAY ||
+        environment_values.tag != ABLA_ARRAY) {
+        abla_platform_panic("invalid configured process values", 33);
+    }
+    size_t count = 0;
+    char** values = host_process_arguments(arguments, &count);
+    (void)count;
+    const int64_t environment_count = host_value_as_i64(
+        host_value_array_length(environment_names));
+    const int64_t value_count = host_value_as_i64(
+        host_value_array_length(environment_values));
+    if (environment_count < 0 || environment_count != value_count) {
+        abla_platform_free(values);
+        abla_platform_panic("process environment sizes differ", 32);
+    }
+    for (int64_t index = 0; index < environment_count; ++index) {
+        const AblaValue name = host_value_array_get(
+            environment_names, host_value_i64(index));
+        const AblaValue value = host_value_array_get(
+            environment_values, host_value_i64(index));
+        if (name.tag != ABLA_STRING || value.tag != ABLA_STRING ||
+            name.as.string.length == 0) {
+            abla_platform_free(values);
+            abla_platform_panic("invalid process environment entry", 33);
+        }
+        const char* name_text = host_value_as_cstring(name);
+        for (size_t byte = 0; byte < name.as.string.length; ++byte) {
+            if (name_text[byte] == '=') {
+                abla_platform_free(values);
+                abla_platform_panic("invalid process environment name", 32);
+            }
+        }
+    }
+    const char* directory = host_value_as_cstring(directory_value);
+    const char* output_path = host_value_as_cstring(output_path_value);
+    const pid_t process = fork();
+    if (process < 0) {
+        abla_platform_free(values);
+        abla_platform_panic("cannot start configured process", 31);
+    }
+    if (process == 0) {
+        (void)setpgid(0, 0);
+        if (directory_value.as.string.length > 0 && chdir(directory) != 0) {
+            _exit(126);
+        }
+        if (output_path_value.as.string.length > 0) {
+            const int output = open(
+                output_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (output < 0 || dup2(output, STDOUT_FILENO) < 0 ||
+                dup2(output, STDERR_FILENO) < 0) {
+                if (output >= 0) close(output);
+                _exit(126);
+            }
+            close(output);
+        }
+        for (int64_t index = 0; index < environment_count; ++index) {
+            const AblaValue name = host_value_array_get(
+                environment_names, host_value_i64(index));
+            const AblaValue value = host_value_array_get(
+                environment_values, host_value_i64(index));
+            if (setenv(
+                    host_value_as_cstring(name),
+                    host_value_as_cstring(value),
+                    1) != 0) {
+                _exit(126);
+            }
+        }
+        execvp(values[0], values);
+        _exit(127);
+    }
+    (void)setpgid(process, process);
+    abla_platform_free(values);
+    return host_value_i64((int64_t)process);
+}
+
+AblaValue ablaHostPollProcess(AblaValue process_value) {
+    const int64_t raw = host_value_as_i64(process_value);
+    if (raw <= 0) return host_value_i64(127);
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = waitpid((pid_t)raw, &status, WNOHANG);
+    } while (waited < 0 && errno == EINTR);
+    if (waited == 0) return host_value_i64(-1);
+    if (waited == (pid_t)raw) {
+        return host_value_i64(host_decode_process_status(status));
+    }
+    return host_value_i64(127);
+}
+
+AblaValue ablaHostStopProcessTree(
+    AblaValue process_value,
+    AblaValue grace_value) {
+    const int64_t raw = host_value_as_i64(process_value);
+    const int64_t grace_milliseconds = host_value_as_i64(grace_value);
+    if (raw <= 0) return host_value_i64(0);
+    if (grace_milliseconds < 0 || grace_milliseconds > 60000) {
+        abla_platform_panic("invalid process stop grace period", 33);
+    }
+    const pid_t process = (pid_t)raw;
+    if (kill(-process, SIGTERM) != 0 && errno != ESRCH &&
+        kill(process, SIGTERM) != 0 && errno != ESRCH) {
+        return host_value_i64(127);
+    }
+    int status = 0;
+    int64_t elapsed = 0;
+    while (elapsed < grace_milliseconds) {
+        const pid_t waited = waitpid(process, &status, WNOHANG);
+        if (waited == process) {
+            return host_value_i64(host_decode_process_status(status));
+        }
+        if (waited < 0 && errno == ECHILD) return host_value_i64(0);
+        if (waited < 0 && errno != EINTR) return host_value_i64(127);
+        struct timespec duration = {.tv_sec = 0, .tv_nsec = 10000000};
+        while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {}
+        elapsed += 10;
+    }
+    if (kill(-process, SIGKILL) != 0 && errno != ESRCH) {
+        (void)kill(process, SIGKILL);
+    }
+    return host_value_i64(host_wait_process(process));
+}
+
+AblaValue ablaHostMonotonicMilliseconds(void) {
+    struct timespec timestamp = {.tv_sec = 0, .tv_nsec = 0};
+    if (clock_gettime(CLOCK_MONOTONIC, &timestamp) != 0) {
+        return host_value_i64(0);
+    }
+    return host_value_i64(
+        (int64_t)timestamp.tv_sec * INT64_C(1000) +
+        (int64_t)timestamp.tv_nsec / INT64_C(1000000));
+}
+
+AblaValue ablaHostProcessorCount(void) {
+    const long count = sysconf(_SC_NPROCESSORS_ONLN);
+    return host_value_i64(count > 0 ? (int64_t)count : INT64_C(1));
+}
+
 AblaValue ablaHostRunProcess(AblaValue arguments) {
     const AblaValue process = ablaHostStartProcess(arguments);
     return host_value_i64(host_wait_process((pid_t)host_value_as_i64(process)));

@@ -132,6 +132,18 @@ AblaValue ablaHostWriteStderr(AblaValue text);
 AblaValue ablaHostRunProcess(AblaValue arguments);
 AblaValue ablaHostCaptureProcess(AblaValue arguments);
 AblaValue ablaHostStartProcess(AblaValue arguments);
+AblaValue ablaHostStartProcessConfigured(
+    AblaValue directory,
+    AblaValue arguments,
+    AblaValue environment_names,
+    AblaValue environment_values,
+    AblaValue output_path);
+AblaValue ablaHostPollProcess(AblaValue process);
+AblaValue ablaHostStopProcessTree(
+    AblaValue process,
+    AblaValue grace_milliseconds);
+AblaValue ablaHostMonotonicMilliseconds(void);
+AblaValue ablaHostProcessorCount(void);
 AblaValue ablaHostStopProcess(AblaValue process);
 AblaValue ablaHostStopProcessGracefully(
     AblaValue process,

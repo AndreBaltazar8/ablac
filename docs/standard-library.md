@@ -13,6 +13,7 @@ unrelated policy or compiler machinery into the program:
 | `abla/text` | phase-safe UTF-8 validation, scalar indexing, and slicing |
 | `abla/io` | portable console, EOF-aware line input, and callback-backed buffered text writers |
 | `abla/io/buffered` | opt-in buffered file writer adapter |
+| `abla/process/supervisor` | hosted child-process launch, isolated logs, polling, process-tree termination, monotonic timing, and processor discovery |
 | `abla/fs` | `Path`, metadata, atomic text writes, directory entries, watches |
 | `abla/process` | `Command`, `ChildProcess`, arguments, sleep |
 | `abla/process/arguments`, `/command`, `/time` | size-selectable portable process capabilities |

@@ -42,6 +42,7 @@ fixtures=(
     linux-filesystem:42
     linux-net:42
     process-capture:42
+    host-process-configured:42
     memory-region:42
     bytes:42
     bitwise:42
