@@ -1,0 +1,691 @@
+// Bounded parallel, process-isolated test runner for hosted Abla programs.
+
+import "abla/json"
+import "abla/platform/host"
+import "abla/process/supervisor"
+
+class TestEnvironment(
+    val names: array<string>,
+    val values: array<string>,
+    val error: string
+)
+
+class TestStep(
+    val command: string,
+    val arguments: array<string>,
+    val directory: string,
+    val environmentNames: array<string>,
+    val environmentValues: array<string>,
+    val expectedStatus: int,
+    val timeoutMilliseconds: int
+)
+
+class TestDefinition(
+    val name: string,
+    val steps: array<TestStep>,
+    val exclusive: bool,
+    val platform: string
+)
+
+class TestSuite(
+    val tests: array<TestDefinition>,
+    val environmentNames: array<string>,
+    val environmentValues: array<string>,
+    val jobs: int,
+    val timeoutMilliseconds: int,
+    val logDirectory: string
+)
+
+class TestSuiteLoad(val suite: TestSuite, val error: string)
+
+class TestRunnerOptions(
+    val root: string,
+    val file: string,
+    val jobs: int,
+    val filter: string,
+    val listOnly: bool,
+    val failFast: bool,
+    val variableNames: array<string>,
+    val variableValues: array<string>
+)
+
+class TestSetting(val name: string, val value: string, val valid: bool)
+
+class TestExecution(
+    val test: TestDefinition,
+    val index: int,
+    var state: string,
+    var stepIndex: int,
+    var process: SupervisedProcess,
+    var stepStarted: int,
+    var testStarted: int,
+    var finished: int,
+    var logPath: string,
+    var actualStatus: int,
+    var timedOut: bool
+)
+
+class TestRunSummary(
+    val passed: int,
+    val failed: int,
+    val skipped: int,
+    val durationMilliseconds: int
+)
+
+class TestLaunch(
+    val process: SupervisedProcess,
+    val started: int,
+    val logPath: string
+)
+
+fun testEmptySuite(): TestSuite = TestSuite([], [], [], 0, 300000, "build/test-results")
+
+fun testContains(text: string, needle: string): bool {
+    if (needle == "") return true
+    var found = false
+    var offset = 0
+    while (!found && offset + needle.size <= text.size) {
+        if (text.slice(offset, offset + needle.size) == needle) found = true
+        offset = offset + 1
+    }
+    found
+}
+
+fun testReplace(text: string, needle: string, replacement: string): string {
+    if (needle == "") return text
+    var output = ""
+    var offset = 0
+    while (offset < text.size) {
+        if (offset + needle.size <= text.size &&
+            text.slice(offset, offset + needle.size) == needle) {
+            output = "$output$replacement"
+            offset = offset + needle.size
+        } else {
+            output = "$output${text.slice(offset, offset + 1)}"
+            offset = offset + 1
+        }
+    }
+    output
+}
+
+fun testExpand(
+    value: string,
+    root: string,
+    name: string,
+    logDirectory: string,
+    variableNames: array<string>,
+    variableValues: array<string>
+): string {
+    var output = testReplace(testReplace(testReplace(
+        value, "\${root}", root
+    ), "\${test}", name), "\${log}", logDirectory)
+    var index = 0
+    while (index < variableNames.size && index < variableValues.size) {
+        output = testReplace(
+            output, "@${variableNames[index]}@", variableValues[index]
+        )
+        index = index + 1
+    }
+    output
+}
+
+fun testAbsolute(path: string): bool = path.size > 0 && path[0] == 47
+
+fun testPath(root: string, path: string): string {
+    if (path == "") root
+    else if (testAbsolute(path)) path
+    else "$root/$path"
+}
+
+fun testSafeName(name: string): string {
+    var output = ""
+    var index = 0
+    while (index < name.size) {
+        val byte = name[index]
+        if ((byte >= 48 && byte <= 57) ||
+            (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 45 || byte == 95) {
+            output = "$output${name.slice(index, index + 1)}"
+        } else output = "${output}_"
+        index = index + 1
+    }
+    if (output == "") "test" else output
+}
+
+fun testParseEnvironment(value: Json): TestEnvironment {
+    val names: array<string> = []
+    val values: array<string> = []
+    var error = ""
+    if (!value.isNull() && !value.isObject()) {
+        error = "environment must be a JSON object"
+    }
+    var index = 0
+    while (error == "" && value.isObject() && index < value.keys.size) {
+        val entry = value.values[index]
+        if (!entry.isString() || value.keys[index] == "") {
+            error = "environment names must be non-empty and values must be strings"
+        } else {
+            names.append(value.keys[index])
+            values.append(entry.asString())
+        }
+        index = index + 1
+    }
+    TestEnvironment(names, values, error)
+}
+
+fun testParseStringArray(value: Json): array<string> {
+    val result: array<string> = []
+    var index = 0
+    if (value.isArray()) {
+        while (index < value.size()) {
+            if (value.at(index).isString()) result.append(value.at(index).asString())
+            index = index + 1
+        }
+    }
+    result
+}
+
+fun testStringArrayValid(value: Json): bool {
+    var valid = value.isArray()
+    var index = 0
+    while (valid && index < value.size()) {
+        if (!value.at(index).isString()) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun loadTestSuite(source: string): TestSuiteLoad {
+    val parsed = jsonParse(source)
+    if (!parsed.succeeded) {
+        return TestSuiteLoad(
+            testEmptySuite(),
+            "invalid JSON at ${parsed.error.line}:${parsed.error.column}: ${parsed.error.message}"
+        )
+    }
+    val root = parsed.value
+    if (!root.isObject()) {
+        return TestSuiteLoad(testEmptySuite(), "test manifest root must be an object")
+    }
+    if (!root.get("version").intAvailable() || root.getInt("version") != 1) {
+        return TestSuiteLoad(testEmptySuite(), "test manifest version must be 1")
+    }
+    var jobs = if (root.get("jobs").intAvailable()) root.getInt("jobs") else 0
+    if (jobs < 0 || jobs > 64) {
+        return TestSuiteLoad(testEmptySuite(), "jobs must be between 0 and 64")
+    }
+    val defaultTimeout = if (root.get("timeoutMs").intAvailable()) {
+        root.getInt("timeoutMs")
+    } else 300000
+    if (defaultTimeout < 1 || defaultTimeout > 86400000) {
+        return TestSuiteLoad(
+            testEmptySuite(), "timeoutMs must be between 1 and 86400000"
+        )
+    }
+    val logDirectory = if (root.get("logDirectory").isString()) {
+        root.getString("logDirectory")
+    } else "build/test-results"
+    if (logDirectory == "") {
+        return TestSuiteLoad(testEmptySuite(), "logDirectory cannot be empty")
+    }
+    val environment = testParseEnvironment(root.get("environment"))
+    if (environment.error != "") {
+        return TestSuiteLoad(testEmptySuite(), environment.error)
+    }
+    val testsValue = root.get("tests")
+    if (!testsValue.isArray() || testsValue.size() == 0) {
+        return TestSuiteLoad(testEmptySuite(), "tests must be a non-empty array")
+    }
+    val tests: array<TestDefinition> = []
+    var error = ""
+    var testIndex = 0
+    while (error == "" && testIndex < testsValue.size()) {
+        val candidate = testsValue.at(testIndex)
+        if (!candidate.isObject()) error = "test $testIndex must be an object"
+        val name = candidate.getString("name")
+        if (error == "" && name == "") error = "test $testIndex needs a name"
+        var prior = 0
+        while (error == "" && prior < tests.size) {
+            if (tests[prior].name == name) error = "duplicate test name: $name"
+            prior = prior + 1
+        }
+        val platform = if (candidate.get("platform").isString()) {
+            candidate.getString("platform")
+        } else "any"
+        if (error == "" && platform != "any" && platform != "linux" &&
+            platform != "macos") error = "test $name has an invalid platform"
+        val stepsValue = candidate.get("steps")
+        if (error == "" && (!stepsValue.isArray() || stepsValue.size() == 0)) {
+            error = "test $name needs at least one step"
+        }
+        val steps: array<TestStep> = []
+        var stepIndex = 0
+        while (error == "" && stepIndex < stepsValue.size()) {
+            val step = stepsValue.at(stepIndex)
+            val command = step.getString("command")
+            if (!step.isObject() || command == "") {
+                error = "test $name step $stepIndex needs a command"
+            }
+            val argumentsValue = step.get("args")
+            if (error == "" && !argumentsValue.isNull() &&
+                !testStringArrayValid(argumentsValue)) {
+                error = "test $name step $stepIndex args must be strings"
+            }
+            val stepEnvironment = testParseEnvironment(step.get("environment"))
+            if (error == "" && stepEnvironment.error != "") {
+                error = "test $name step $stepIndex: ${stepEnvironment.error}"
+            }
+            val expected = if (step.get("expect").intAvailable()) {
+                step.getInt("expect")
+            } else 0
+            if (error == "" && (expected < 0 || expected > 255)) {
+                error = "test $name step $stepIndex expect must be 0...255"
+            }
+            val timeout = if (step.get("timeoutMs").intAvailable()) {
+                step.getInt("timeoutMs")
+            } else defaultTimeout
+            if (error == "" && (timeout < 1 || timeout > 86400000)) {
+                error = "test $name step $stepIndex timeoutMs is invalid"
+            }
+            var arguments: array<string> = []
+            if (!argumentsValue.isNull()) {
+                arguments = testParseStringArray(argumentsValue)
+            }
+            if (error == "") steps.append(TestStep(
+                command,
+                arguments,
+                if (step.get("cwd").isString()) step.getString("cwd") else "",
+                stepEnvironment.names,
+                stepEnvironment.values,
+                expected,
+                timeout
+            ))
+            stepIndex = stepIndex + 1
+        }
+        if (error == "") tests.append(TestDefinition(
+            name, steps,
+            candidate.get("exclusive").isBoolean() &&
+                candidate.get("exclusive").asBoolean(),
+            platform
+        ))
+        testIndex = testIndex + 1
+    }
+    if (error != "") TestSuiteLoad(testEmptySuite(), error)
+    else TestSuiteLoad(TestSuite(
+        tests,
+        environment.names,
+        environment.values,
+        jobs,
+        defaultTimeout,
+        logDirectory
+    ), "")
+}
+
+fun testPlatformMatches(platform: string): bool =
+    platform == "any" || (platform == "macos" && ablaHostIsMacOS()) ||
+    (platform == "linux" && !ablaHostIsMacOS())
+
+fun testAppendExpanded(
+    var output: array<string>,
+    values: array<string>,
+    root: string,
+    name: string,
+    logDirectory: string,
+    variableNames: array<string>,
+    variableValues: array<string>
+): void {
+    var index = 0
+    while (index < values.size) {
+        output.append(testExpand(
+            values[index], root, name, logDirectory,
+            variableNames, variableValues
+        ))
+        index = index + 1
+    }
+    return
+}
+
+fun testLaunchStep(
+    execution: TestExecution,
+    suite: TestSuite,
+    options: TestRunnerOptions,
+    logDirectory: string
+): TestLaunch {
+    val step = execution.test.steps[execution.stepIndex]
+    val safeName = testSafeName(execution.test.name)
+    val logPath = "$logDirectory/$safeName.${execution.stepIndex + 1}.log"
+    val arguments: array<string> = [testExpand(
+        step.command, options.root, execution.test.name, logDirectory,
+        options.variableNames, options.variableValues
+    )]
+    testAppendExpanded(
+        arguments, step.arguments, options.root, execution.test.name,
+        logDirectory, options.variableNames, options.variableValues
+    )
+    val environmentNames: array<string> = []
+    val environmentValues: array<string> = []
+    testAppendExpanded(
+        environmentNames, suite.environmentNames,
+        options.root, execution.test.name, logDirectory,
+        options.variableNames, options.variableValues
+    )
+    testAppendExpanded(
+        environmentValues, suite.environmentValues,
+        options.root, execution.test.name, logDirectory,
+        options.variableNames, options.variableValues
+    )
+    testAppendExpanded(
+        environmentNames, step.environmentNames,
+        options.root, execution.test.name, logDirectory,
+        options.variableNames, options.variableValues
+    )
+    testAppendExpanded(
+        environmentValues, step.environmentValues,
+        options.root, execution.test.name, logDirectory,
+        options.variableNames, options.variableValues
+    )
+    val configuredDirectory = testPath(options.root, testExpand(
+        step.directory, options.root, execution.test.name, logDirectory,
+        options.variableNames, options.variableValues
+    ))
+    val now = processMonotonicMilliseconds()
+    val process = startSupervisedProcess(
+        configuredDirectory,
+        arguments,
+        environmentNames,
+        environmentValues,
+        logPath
+    )
+    TestLaunch(process, now, logPath)
+}
+
+fun testStartStep(
+    var execution: TestExecution,
+    suite: TestSuite,
+    options: TestRunnerOptions,
+    logDirectory: string
+): void {
+    val launch = testLaunchStep(execution, suite, options, logDirectory)
+    execution.process = launch.process
+    execution.state = "running"
+    execution.stepStarted = launch.started
+    if (execution.testStarted == 0) execution.testStarted = launch.started
+    execution.logPath = launch.logPath
+    execution.actualStatus = -1
+    execution.timedOut = false
+    return
+}
+
+fun testExecutionTimeout(execution: TestExecution): int =
+    execution.test.steps[execution.stepIndex].timeoutMilliseconds
+
+fun testExecutionExpected(execution: TestExecution): int =
+    execution.test.steps[execution.stepIndex].expectedStatus
+
+fun testExclusiveRunning(executions: array<TestExecution>): bool {
+    var exclusive = false
+    var index = 0
+    while (!exclusive && index < executions.size) {
+        exclusive = executions[index].state == "running" &&
+            executions[index].test.exclusive
+        index = index + 1
+    }
+    exclusive
+}
+
+fun testPollExecution(
+    var execution: TestExecution,
+    suite: TestSuite,
+    options: TestRunnerOptions,
+    logDirectory: string,
+    now: int
+): string {
+    var outcome = "running"
+    var status = execution.process.poll()
+    val timeout = testExecutionTimeout(execution)
+    if (status == -1 && now - execution.stepStarted >= timeout) {
+        execution.process.stop(100)
+        status = 124
+        execution.timedOut = true
+    }
+    if (status != -1) {
+        execution.actualStatus = status
+        val expected = testExecutionExpected(execution)
+        if (status == expected && !execution.timedOut &&
+            execution.stepIndex + 1 < execution.test.steps.size) {
+            execution.stepIndex = execution.stepIndex + 1
+            testStartStep(execution, suite, options, logDirectory)
+        } else {
+            execution.finished = processMonotonicMilliseconds()
+            if (status == expected && !execution.timedOut) {
+                execution.state = "passed"
+                outcome = "passed"
+            } else {
+                execution.state = "failed"
+                outcome = "failed"
+            }
+        }
+    }
+    outcome
+}
+
+fun testPrintFailure(execution: TestExecution): void {
+    val step = execution.test.steps[execution.stepIndex]
+    val duration = execution.finished - execution.testStarted
+    val timeout = if (execution.timedOut) " (timeout)" else ""
+    ablaHostWriteStderr(
+        "FAIL ${execution.test.name} ${duration}ms: step ${execution.stepIndex + 1} expected ${step.expectedStatus}, got ${execution.actualStatus}$timeout\n"
+    )
+    if (ablaHostFileKind(execution.logPath) == 1) {
+        val output = ablaHostReadFile(execution.logPath)
+        if (output != "") {
+            val shown = if (output.size > 4000) output.slice(0, 4000) else output
+            ablaHostWriteStderr("--- ${execution.logPath} ---\n$shown")
+            if (shown[shown.size - 1] != 10) ablaHostWriteStderr("\n")
+            if (output.size > shown.size) ablaHostWriteStderr("... output truncated\n")
+        }
+    }
+    return
+}
+
+fun runTestSuite(
+    suite: TestSuite,
+    options: TestRunnerOptions
+): TestRunSummary {
+    var jobs = if (options.jobs > 0) options.jobs else suite.jobs
+    if (jobs <= 0) jobs = processProcessorCount()
+    if (jobs > 64) jobs = 64
+    val logDirectory = testPath(options.root, suite.logDirectory)
+    ablaHostCreateDirectories(logDirectory)
+    val executions: array<TestExecution> = []
+    var index = 0
+    while (index < suite.tests.size) {
+        val test = suite.tests[index]
+        if (testContains(test.name, options.filter)) executions.append(
+            TestExecution(
+                test, executions.size, "pending", 0,
+                SupervisedProcess(0), 0, 0, 0, "", -1, false
+            )
+        )
+        index = index + 1
+    }
+    if (options.listOnly) {
+        index = 0
+        while (index < executions.size) {
+            ablaHostWriteStdout("${executions[index].test.name}\n")
+            index = index + 1
+        }
+        return TestRunSummary(0, 0, executions.size, 0)
+    }
+    val started = processMonotonicMilliseconds()
+    var nextToStart = 0
+    var running = 0
+    var passed = 0
+    var failed = 0
+    var skipped = 0
+    var completed = 0
+    ablaHostWriteStdout(
+        "abla-test: ${executions.size} test(s), $jobs parallel job(s)\n"
+    )
+    while (completed + skipped < executions.size) {
+        val now = processMonotonicMilliseconds()
+        index = 0
+        while (index < executions.size) {
+            if (executions[index].state == "running") {
+                val outcome = testPollExecution(
+                    executions[index], suite, options, logDirectory, now
+                )
+                if (outcome == "passed" || outcome == "failed") {
+                    running = running - 1
+                    completed = completed + 1
+                    if (outcome == "passed") {
+                        passed = passed + 1
+                        val duration = executions[index].finished -
+                            executions[index].testStarted
+                        val name = executions[index].test.name
+                        ablaHostWriteStdout("PASS $name ${duration}ms\n")
+                    } else {
+                        failed = failed + 1
+                        testPrintFailure(executions[index])
+                    }
+                }
+            }
+            index = index + 1
+        }
+        var filling = !testExclusiveRunning(executions)
+        while (filling && running < jobs && nextToStart < executions.size &&
+            !(options.failFast && failed > 0)) {
+            if (!testPlatformMatches(executions[nextToStart].test.platform)) {
+                executions[nextToStart].state = "skipped"
+                skipped = skipped + 1
+                val name = executions[nextToStart].test.name
+                val platform = executions[nextToStart].test.platform
+                ablaHostWriteStdout("SKIP $name ($platform)\n")
+                nextToStart = nextToStart + 1
+            } else if (executions[nextToStart].test.exclusive && running > 0) {
+                filling = false
+            }
+            else {
+                testStartStep(
+                    executions[nextToStart], suite, options, logDirectory
+                )
+                running = running + 1
+                val exclusive = executions[nextToStart].test.exclusive
+                nextToStart = nextToStart + 1
+                if (exclusive) filling = false
+            }
+        }
+        if (options.failFast && failed > 0 && running == 0) {
+            while (nextToStart < executions.size) {
+                executions[nextToStart].state = "skipped"
+                skipped = skipped + 1
+                nextToStart = nextToStart + 1
+            }
+        }
+        if (running > 0) ablaHostSleep(5)
+    }
+    val duration = processMonotonicMilliseconds() - started
+    ablaHostWriteStdout(
+        "abla-test: $passed passed, $failed failed, $skipped skipped in ${duration}ms\n"
+    )
+    TestRunSummary(passed, failed, skipped, duration)
+}
+
+fun testParsePositive(value: string): int {
+    var result = 0
+    var valid = value.size > 0
+    var index = 0
+    while (valid && index < value.size) {
+        val digit = value[index] - 48
+        if (digit < 0 || digit > 9) valid = false
+        else result = result * 10 + digit
+        index = index + 1
+    }
+    if (valid && result > 0) result else 0
+}
+
+fun testParseSetting(value: string): TestSetting {
+    var separator = -1
+    var index = 0
+    while (separator < 0 && index < value.size) {
+        if (value[index] == 61) separator = index
+        index = index + 1
+    }
+    if (separator <= 0) TestSetting("", "", false)
+    else TestSetting(
+        value.slice(0, separator),
+        value.slice(separator + 1, value.size),
+        true
+    )
+}
+
+fun testRunnerUsage(): string =
+    "usage: abla-test [--file PATH] [--root PATH] [--jobs N] [--filter TEXT] [--set NAME=VALUE] [--list] [--fail-fast]\n"
+
+fun runTestCommand(arguments: array<string>): int {
+    var root = ablaHostCurrentDirectory()
+    var file = "abla-tests.json"
+    var jobs = 0
+    var filter = ""
+    var listOnly = false
+    var failFast = false
+    val variableNames: array<string> = []
+    val variableValues: array<string> = []
+    var error = ""
+    var index = 0
+    while (error == "" && index < arguments.size) {
+        val argument = arguments[index]
+        if (argument == "--list") listOnly = true
+        else if (argument == "--fail-fast") failFast = true
+        else if (argument == "--help" || argument == "-h") {
+            ablaHostWriteStdout(testRunnerUsage())
+            return 0
+        } else if (argument == "--file" || argument == "--root" ||
+            argument == "--jobs" || argument == "--filter" ||
+            argument == "--set") {
+            if (index + 1 >= arguments.size) error = "$argument needs a value"
+            else {
+                index = index + 1
+                val value = arguments[index]
+                if (argument == "--file") file = value
+                if (argument == "--root") root = value
+                if (argument == "--filter") filter = value
+                if (argument == "--set") {
+                    val setting = testParseSetting(value)
+                    if (!setting.valid) error = "--set needs NAME=VALUE"
+                    else {
+                        variableNames.append(setting.name)
+                        variableValues.append(setting.value)
+                    }
+                }
+                if (argument == "--jobs") {
+                    jobs = testParsePositive(value)
+                    if (jobs == 0 || jobs > 64) error = "--jobs must be 1...64"
+                }
+            }
+        } else error = "unknown argument: $argument"
+        index = index + 1
+    }
+    if (error != "") {
+        ablaHostWriteStderr("abla-test: $error\n${testRunnerUsage()}")
+        return 2
+    }
+    val manifestPath = testPath(root, file)
+    if (ablaHostFileKind(manifestPath) != 1) {
+        ablaHostWriteStderr("abla-test: manifest not found: $manifestPath\n")
+        return 2
+    }
+    val loaded = loadTestSuite(ablaHostReadFile(manifestPath))
+    if (loaded.error != "") {
+        ablaHostWriteStderr("abla-test: ${loaded.error}\n")
+        return 2
+    }
+    val summary = runTestSuite(
+        loaded.suite,
+        TestRunnerOptions(
+            root, file, jobs, filter, listOnly, failFast,
+            variableNames, variableValues
+        )
+    )
+    if (summary.failed == 0) 0 else 1
+}

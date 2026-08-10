@@ -20,6 +20,11 @@ make self-rebuild # prove the compiler fixed point
 make check        # both gates
 ```
 
+`make test` uses the locked and vendored `abla-testrunner` package to schedule
+the manifest in `tests/abla-tests.json`. Tests are bounded, process-isolated,
+logged independently, and run with eight jobs by default. Set
+`ABLA_TEST_JOBS` when the host needs a lower concurrency limit.
+
 `tools/build-self-hosted-release.sh` splits compiler LLVM emission, object
 generation, and linking into separate bounded processes to keep peak memory
 predictable. `tools/test-pure-self-rebuild.sh` performs the fixed-point proof

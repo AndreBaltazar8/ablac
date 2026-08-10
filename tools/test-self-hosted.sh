@@ -35,27 +35,22 @@ fi
 
 cd "$project_root"
 export ABLA_MAX_MEMORY_MB=${ABLA_TEST_MEMORY_MB:-4096}
-default_test_seconds=120
-if [[ $(uname -s) == Darwin ]]; then
-    # Intel Macs in particular need more time for large in-process LLVM
-    # optimization while still retaining a finite watchdog.
-    default_test_seconds=300
-fi
+default_test_seconds=300
 export ABLA_MAX_SECONDS=${ABLA_TEST_SECONDS:-$default_test_seconds}
 export ABLA_MAX_CPU_SECONDS=$ABLA_MAX_SECONDS
 
-# One compiler exercises the frontend, both backends, native runtime boundary,
-# package/toolchain lookup, and the public command surface.
-tools/test-run-limited.sh
-tools/test-return-control.sh "$compiler"
-tools/test-bitwise-crypto.sh "$compiler"
-tools/test-concurrency.sh "$compiler"
-tools/test-package-build.sh "$compiler"
-tools/test-toolchain-root.sh "$compiler"
-tools/test-contract-imports.sh "$compiler"
-tools/test-delegated-bindings.sh "$compiler"
-tools/test-reactive-dependency-reflection.sh "$compiler"
-tools/test-inprocess-aot.sh "${compiler}.bin"
-tools/test-final-native-conformance.sh "$compiler"
-
-printf '%s\n' 'self-hosted compiler test suite passed'
+# The small shell boundary only activates the host LLVM toolchain. Test
+# scheduling, timeouts, status checks, logs, and parallelism live in Abla.
+runner_project="$project_root/tools/abla-test-driver"
+"$compiler" build --project "$runner_project" --offline --fast --no-cache
+runner_arguments=(
+    --root "$project_root"
+    --file tests/abla-tests.json
+    --set "compiler=$compiler"
+    --set "memory=$ABLA_MAX_MEMORY_MB"
+    --set "seconds=$ABLA_MAX_SECONDS"
+)
+if [[ -n ${ABLA_TEST_JOBS:-} ]]; then
+    runner_arguments+=(--jobs "$ABLA_TEST_JOBS")
+fi
+exec "$runner_project/build/ablac-test-driver" "${runner_arguments[@]}"

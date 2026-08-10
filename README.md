@@ -93,8 +93,16 @@ Run the ordinary test suite with:
 make test
 ```
 
-The complete test and fixed-point gate is substantially heavier and may use up
-to 4 GiB of memory:
+The suite is scheduled by the vendored
+[`abla-testrunner`](https://github.com/AndreBaltazar8/abla-testrunner)
+package. It runs up to eight isolated test processes in parallel, keeps
+per-step logs under `build/test-results/self-hosted`, and executes entirely
+from the checked-in package lock/vendor tree. Override the concurrency on a
+smaller machine with `ABLA_TEST_JOBS=4 make test`.
+
+The complete test and fixed-point gate is substantially heavier. Each compiler
+worker is bounded to 4 GiB; aggregate pressure depends on the selected job
+count:
 
 ```sh
 make check
