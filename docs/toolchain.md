@@ -204,4 +204,7 @@ The complete compiler rebuild uses
 `tools/build-self-hosted-release.sh build/ablac.bin build/ablac-next`. It splits
 deterministic LLVM emission, object generation, and linking into separate
 bounded processes so the frontend and LLVM object-generation heap peaks do not
-coexist. The release gate verifies byte-identical IR from the rebuilt compiler.
+coexist. After emission it may reuse an optimized executable only from an exact
+content-addressed match over the module, runtime inputs, host, toolchain, and
+release profile. `ABLA_RELEASE_SELFHOST_CACHE=0` forces a cold backend. The
+release gate still verifies byte-identical IR from the rebuilt compiler.

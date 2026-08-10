@@ -34,6 +34,15 @@ immediate; changing compiler inputs performs one fast self-build from the
 promoted compiler. Use `make ablac-force` for the complete bootstrap fixed
 point and conformance proof.
 
+The canonical O2 self-host release builder also has a content-addressed warm
+path. It always emits the compiler LLVM module, then fingerprints that exact
+module together with the linked runtime sources and headers, host, LLVM/Clang
+identity, and release flags. An identical fingerprint reuses the previously
+optimized executable instead of repeating whole-program O2 and LTO. Set
+`ABLA_RELEASE_SELFHOST_CACHE=0` for a deliberately cold backend measurement;
+`make clean` removes the ignored cache. The pure self-rebuild gate still emits
+both generations and compares their LLVM modules byte-for-byte.
+
 The final native conformance programs remain uncached O2 builds, but independent
 fixtures run concurrently under a memory-aware job cap. On the reference
 development machine, all 49 builds and runtime assertions completed in 56.5

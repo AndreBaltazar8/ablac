@@ -69,4 +69,4 @@ set -e
 [[ $status -eq 42 ]]
 
 printf '%s\n' \
-    'pure Abla O2 self-rebuild: uncached full graph -> direct LLVM C API compiler -> byte-identical IR -> native child'
+    'pure Abla O2 self-rebuild: content-addressed release graph -> direct LLVM C API compiler -> byte-identical IR -> native child'

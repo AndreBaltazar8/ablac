@@ -13,6 +13,8 @@ entry=${3:-src/orc_main.ab}
 emit_memory_mb=${ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB:-4096}
 object_memory_mb=${ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB:-4096}
 emit_seconds=${ABLA_FINAL_SELFHOST_EMIT_SECONDS:-300}
+release_cache=${ABLA_RELEASE_SELFHOST_CACHE:-1}
+release_cache_root=${ABLA_RELEASE_SELFHOST_CACHE_DIR:-}
 host_os=$(uname -s)
 host_machine=$(uname -m)
 host_triple=
@@ -58,6 +60,22 @@ run_toolchain_command() {
     fi
 }
 
+hash_stream() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        shasum -a 256 | awk '{print $1}'
+    fi
+}
+
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
 cd "$project_root"
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 mkdir -p -- "$(dirname -- "$output")" "$project_root/build"
@@ -73,6 +91,9 @@ value_runtime_object="$temporary_directory/value-runtime.o"
 host_runtime_object="$temporary_directory/host-runtime.o"
 llvm_host_object="$temporary_directory/llvm-host.o"
 executable="$temporary_directory/compiler"
+if [[ -z $release_cache_root ]]; then
+    release_cache_root="$project_root/build/cache/selfhost-release"
+fi
 
 # Keep the Abla frontend heap and LLVM's optimized-object heap in distinct
 # processes. A complete compiler graph otherwise makes both peaks coexist and
@@ -80,6 +101,46 @@ executable="$temporary_directory/compiler"
 ABLA_MAX_MEMORY_MB=$emit_memory_mb ABLA_MAX_SECONDS=$emit_seconds \
     "$project_root/tools/run-limited.sh" \
     "$compiler" --emit-llvm "$entry" > "$module"
+
+# The optimized whole-compiler backend is intentionally expensive. Reuse it
+# only when every code-generation input is byte-identical: emitted compiler
+# IR, linked runtime sources/headers, host, toolchain, and the exact release
+# profile. The fixed-point gate still emits and compares compiler IR, so this
+# warm path cannot conceal a frontend or deterministic-output regression.
+if [[ $host_os == Darwin ]]; then
+    toolchain_identity=$(printf '%s\n%s\n%s\n%s\n' \
+        "$(clang --version)" "$(llvm-config --version)" \
+        "$host_triple" "$host_sdk")
+else
+    toolchain_identity=$(run_toolchain_command \
+        'printf "%s\n%s\n" "$(clang --version)" "$(llvm-config --version)"')
+fi
+build_key=$(
+    {
+        printf '%s\n' \
+            'abla-selfhost-release-v1' \
+            'clang-O2-full-lto-function-sections-data-sections' \
+            "$host_os" "$host_machine" "$toolchain_identity" \
+            "module $(hash_file "$module")"
+        find "$project_root/runtime" -maxdepth 1 -type f \
+            \( -name '*.h' -o -name 'abla_runtime.c' \
+                -o -name 'abla_runtime_host.c' \
+                -o -name 'abla_llvm_host.c' \) -print |
+            LC_ALL=C sort | while IFS= read -r runtime_input; do
+                printf '%s %s\n' \
+                    "${runtime_input#"$project_root/"}" \
+                    "$(hash_file "$runtime_input")"
+            done
+    } | hash_stream
+)
+cache_entry="$release_cache_root/$build_key/compiler"
+if [[ $release_cache != 0 && -x $cache_entry ]]; then
+    cp -p -- "$cache_entry" "$output"
+    mv -f -- "$module" "$output.ll"
+    printf '[abla-release] reused optimized compiler %s\n' \
+        "${build_key:0:12}" >&2
+    exit 0
+fi
 
 if [[ $host_os == Darwin ]]; then
     printf -v compile_command \
@@ -142,3 +203,11 @@ ABLA_MAX_MEMORY_MB=$object_memory_mb ABLA_MAX_SECONDS=180 \
 [[ -s $module && -s $object && -x $executable ]]
 mv -f -- "$module" "$output.ll"
 mv -f -- "$executable" "$output"
+if [[ $release_cache != 0 ]]; then
+    cache_directory=${cache_entry%/*}
+    mkdir -p -- "$release_cache_root"
+    if mkdir -- "$cache_directory" 2>/dev/null; then
+        cp -p -- "$output" "$cache_directory/compiler.pending"
+        mv -f -- "$cache_directory/compiler.pending" "$cache_entry"
+    fi
+fi
