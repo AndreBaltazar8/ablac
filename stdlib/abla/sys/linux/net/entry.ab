@@ -2,6 +2,8 @@
 // direct syscalls. No libc or project C host capability is required.
 
 import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/net/contracts"
 
 class Ipv4SocketAddress(val address: string, val port: int)
 
@@ -22,6 +24,21 @@ class SocketReadResult(
     fun failed(): bool = this.status == "error"
 }
 
+fun SocketReadResult.networkOutcome(
+    operation: string = "read"
+): NetworkReadOutcome {
+    var state = 6
+    if (this.status == "data") state = 1
+    if (this.status == "eof") state = 2
+    if (this.status == "timeout") state = 3
+    if (this.errorCode == 11) state = 5
+    NetworkReadOutcome(
+        this.bytes,
+        state,
+        networkError(this.errorCode, operation)
+    )
+}
+
 class SocketWriteResult(
     val written: int,
     val status: string,
@@ -30,6 +47,19 @@ class SocketWriteResult(
     fun succeeded(): bool = this.status == "written"
     fun timedOut(): bool = this.status == "timeout"
     fun failed(): bool = this.status == "error"
+}
+
+fun SocketWriteResult.networkOutcome(
+    operation: string = "write"
+): NetworkWriteOutcome {
+    var state = if (this.status == "written") 1 else 6
+    if (this.status == "timeout") state = 3
+    if (this.errorCode == 11) state = 5
+    NetworkWriteOutcome(
+        this.written,
+        state,
+        networkError(this.errorCode, operation)
+    )
 }
 
 class SocketPollResult(
@@ -742,6 +772,41 @@ fun TcpConnection.readWithTimeoutResult(
     result
 }
 
+fun TcpConnection.readNetwork(
+    maximum: int,
+    timeoutMilliseconds: int,
+    cancellation: NetworkCancellation = networkCancellation(),
+    cancellationPollMilliseconds: int = 50
+): NetworkReadOutcome {
+    val started = linuxMonotonicMilliseconds()
+    var result = NetworkReadOutcome(
+        "", 3, networkError(110, "read")
+    )
+    var waiting = timeoutMilliseconds > 0 &&
+        cancellationPollMilliseconds > 0
+    while (waiting && linuxMonotonicMilliseconds() - started <
+        timeoutMilliseconds) {
+        if (cancellation.isRequested()) {
+            result = NetworkReadOutcome(
+                "", 4, networkError(125, "read")
+            )
+            waiting = false
+        } else {
+            var duration = timeoutMilliseconds -
+                (linuxMonotonicMilliseconds() - started)
+            if (duration > cancellationPollMilliseconds) {
+                duration = cancellationPollMilliseconds
+            }
+            val incoming = this.readWithTimeoutResult(maximum, duration)
+            if (!incoming.timedOut()) {
+                result = incoming.networkOutcome()
+                waiting = false
+            }
+        }
+    }
+    result
+}
+
 fun tcpListenAddress(
     socketAddress: Ipv4SocketAddress,
     backlog: int = 128
@@ -1092,6 +1157,63 @@ fun TcpConnection.writeResult(contents: string): SocketWriteResult {
     }
     if (errorCode == 0) SocketWriteResult(written, "written", 0)
     else SocketWriteResult(written, "error", errorCode)
+}
+
+fun TcpConnection.writeNetwork(
+    contents: string,
+    timeoutMilliseconds: int,
+    cancellation: NetworkCancellation = networkCancellation(),
+    cancellationPollMilliseconds: int = 50
+): NetworkWriteOutcome {
+    val started = linuxMonotonicMilliseconds()
+    var offset = 0
+    var result = NetworkWriteOutcome(
+        0, 3, networkError(110, "write")
+    )
+    var writing = this.descriptor >= 0 && timeoutMilliseconds > 0 &&
+        cancellationPollMilliseconds > 0
+    if (!writing && this.descriptor < 0) result = NetworkWriteOutcome(
+        0, 6, networkError(9, "write")
+    )
+    while (writing && offset < contents.size &&
+        linuxMonotonicMilliseconds() - started < timeoutMilliseconds) {
+        if (cancellation.isRequested()) {
+            result = NetworkWriteOutcome(
+                offset, 4, networkError(125, "write")
+            )
+            writing = false
+        } else {
+            var duration = timeoutMilliseconds -
+                (linuxMonotonicMilliseconds() - started)
+            if (duration > cancellationPollMilliseconds) {
+                duration = cancellationPollMilliseconds
+            }
+            val readiness = this.poll(duration, false, true)
+            if (readiness.failed()) {
+                result = NetworkWriteOutcome(
+                    offset, 6, networkError(readiness.errorCode, "poll")
+                )
+                writing = false
+            } else if (readiness.writable) {
+                val attempt = this.writeResult(
+                    contents.slice(offset, contents.size)
+                )
+                offset = offset + attempt.written
+                if (attempt.failed() && attempt.errorCode != 11) {
+                    result = NetworkWriteOutcome(
+                        offset, 6, networkError(attempt.errorCode, "write")
+                    )
+                    writing = false
+                } else if (offset >= contents.size) {
+                    result = NetworkWriteOutcome(
+                        offset, 1, networkNoError("write")
+                    )
+                    writing = false
+                }
+            }
+        }
+    }
+    result
 }
 
 fun TcpConnection.write(contents: string): int {

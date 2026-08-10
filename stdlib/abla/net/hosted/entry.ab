@@ -2,6 +2,7 @@
 // kqueue behind the narrow host ABI. Applications keep descriptors affine.
 
 import "abla/platform/host"
+import "abla/net/contracts"
 
 class HostedSocketReadResult(
     val bytes: string,
@@ -14,6 +15,20 @@ class HostedSocketReadResult(
     fun failed(): bool = this.status == "error"
 }
 
+fun HostedSocketReadResult.networkOutcome(
+    operation: string = "read"
+): NetworkReadOutcome {
+    var state = 6
+    if (this.status == "data") state = 1
+    if (this.status == "eof") state = 2
+    if (this.status == "would-block") state = 5
+    NetworkReadOutcome(
+        this.bytes,
+        state,
+        networkError(this.errorCode, operation)
+    )
+}
+
 class HostedSocketWriteResult(
     val written: int,
     val wouldBlock: bool,
@@ -21,6 +36,18 @@ class HostedSocketWriteResult(
 ) {
     fun succeeded(): bool = this.written >= 0
     fun failed(): bool = this.written < 0 && !this.wouldBlock
+}
+
+fun HostedSocketWriteResult.networkOutcome(
+    operation: string = "write"
+): NetworkWriteOutcome {
+    var state = if (this.written >= 0) 1 else 6
+    if (this.wouldBlock) state = 5
+    NetworkWriteOutcome(
+        this.written,
+        state,
+        networkError(this.errorCode, operation)
+    )
 }
 
 class HostedSocketEvent(
@@ -124,6 +151,49 @@ fun HostedTcpConnection.readResult(
     maximum: int = 65536
 ): HostedSocketReadResult = hostedReadResult(this.descriptor, maximum)
 
+fun HostedTcpConnection.readNetwork(
+    maximum: int,
+    timeoutMilliseconds: int,
+    cancellation: NetworkCancellation = networkCancellation(),
+    cancellationPollMilliseconds: int = 50
+): NetworkReadOutcome {
+    val started = ablaHostMonotonicMilliseconds()
+    var result = NetworkReadOutcome(
+        "", 3, networkError(60, "read")
+    )
+    val poller = hostedSocketPoller()
+    var waiting = poller.descriptor >= 0 && this.descriptor >= 0 &&
+        timeoutMilliseconds > 0 && cancellationPollMilliseconds > 0 &&
+        poller.watchDescriptor(this.descriptor)
+    while (waiting && ablaHostMonotonicMilliseconds() - started <
+        timeoutMilliseconds) {
+        if (cancellation.isRequested()) {
+            result = NetworkReadOutcome(
+                "", 4, networkError(89, "read")
+            )
+            waiting = false
+        } else {
+            var duration = timeoutMilliseconds -
+                (ablaHostMonotonicMilliseconds() - started)
+            if (duration > cancellationPollMilliseconds) {
+                duration = cancellationPollMilliseconds
+            }
+            val ready = poller.wait(1, duration)
+            if (ready.failed()) {
+                result = NetworkReadOutcome(
+                    "", 6, networkError(ready.errorCode, "poll")
+                )
+                waiting = false
+            } else if (ready.events.size > 0) {
+                result = this.readResult(maximum).networkOutcome()
+                waiting = false
+            }
+        }
+    }
+    poller.close()
+    result
+}
+
 fun HostedTcpConnection.writeResult(
     contents: string
 ): HostedSocketWriteResult {
@@ -134,6 +204,66 @@ fun HostedTcpConnection.writeResult(
         error == 11 || error == 35,
         error
     )
+}
+
+fun HostedTcpConnection.writeNetwork(
+    contents: string,
+    timeoutMilliseconds: int,
+    cancellation: NetworkCancellation = networkCancellation(),
+    cancellationPollMilliseconds: int = 50
+): NetworkWriteOutcome {
+    val started = ablaHostMonotonicMilliseconds()
+    var offset = 0
+    var result = NetworkWriteOutcome(
+        0, 3, networkError(60, "write")
+    )
+    val poller = hostedSocketPoller()
+    var writing = poller.descriptor >= 0 && this.descriptor >= 0 &&
+        timeoutMilliseconds > 0 && cancellationPollMilliseconds > 0 &&
+        poller.watchDescriptor(this.descriptor, false, true)
+    if (!writing && this.descriptor < 0) result = NetworkWriteOutcome(
+        0, 6, networkError(9, "write")
+    )
+    while (writing && offset < contents.size &&
+        ablaHostMonotonicMilliseconds() - started < timeoutMilliseconds) {
+        if (cancellation.isRequested()) {
+            result = NetworkWriteOutcome(
+                offset, 4, networkError(89, "write")
+            )
+            writing = false
+        } else {
+            var duration = timeoutMilliseconds -
+                (ablaHostMonotonicMilliseconds() - started)
+            if (duration > cancellationPollMilliseconds) {
+                duration = cancellationPollMilliseconds
+            }
+            val ready = poller.wait(1, duration)
+            if (ready.failed()) {
+                result = NetworkWriteOutcome(
+                    offset, 6, networkError(ready.errorCode, "poll")
+                )
+                writing = false
+            } else if (ready.events.size > 0 && ready.events[0].writable) {
+                val attempt = this.writeResult(
+                    contents.slice(offset, contents.size)
+                )
+                if (attempt.written > 0) offset = offset + attempt.written
+                if (attempt.failed()) {
+                    result = NetworkWriteOutcome(
+                        offset, 6, networkError(attempt.errorCode, "write")
+                    )
+                    writing = false
+                } else if (offset >= contents.size) {
+                    result = NetworkWriteOutcome(
+                        offset, 1, networkNoError("write")
+                    )
+                    writing = false
+                }
+            }
+        }
+    }
+    poller.close()
+    result
 }
 
 fun HostedTcpConnection.close(): bool {

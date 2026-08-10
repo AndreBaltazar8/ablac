@@ -19,6 +19,13 @@ libc-free; hosted executables still use Abla's normal value runtime.
 - bounded TCP connect/read deadlines and UDP receive deadlines; and
 - an epoll-backed multi-socket readiness poller.
 
+`abla/net/contracts` defines backend-neutral `NetworkError`,
+`NetworkReadOutcome`, `NetworkWriteOutcome`, and `NetworkCancellation` values.
+The raw and hosted transports adapt their platform results to this shared
+contract. `readNetwork` and `writeNetwork` enforce monotonic end-to-end
+deadlines and split waits into short poll slices, so cooperative cancellation
+is observed without a separate interruption thread.
+
 `abla/net/hosted` supplies the corresponding hosted resources with DNS-capable
 connect/bind calls. Its runtime adapter selects epoll on Linux and kqueue on
 macOS. This keeps the raw no-libc profile independent from libc while allowing
@@ -131,9 +138,15 @@ provide HTTPS and WSS client transports. Hosted secure random is supplied by
 `abla/http/event` is a single-threaded, bounded HTTP/1.1 connection manager. It
 supports keep-alive and pipelined requests, content-length and chunked request
 bodies, HEAD, gzip negotiation, partial writes, connection/request ceilings,
-and pending-output backpressure. `abla/http/stream` supplies chunk encoders and
-decoders, gzip responses, and Server-Sent Events framing. The base HTTP client
-transparently recognizes complete chunked responses, including HTTPS replies.
+and pending-output backpressure. It can dispatch either an `HttpRouter` or one
+framework callback. On SIGTERM or explicit stop it closes the listener first,
+prevents keep-alive reuse, flushes queued responses up to a configured drain
+deadline, and force-closes stalled peers. The WebSocket event server performs
+the equivalent bounded close-frame drain.
+
+`abla/http/stream` supplies chunk encoders and decoders, gzip responses, and
+Server-Sent Events framing. The base HTTP client transparently recognizes
+complete chunked responses, including HTTPS replies.
 
 ## HTTP upgrade behavior
 
@@ -156,8 +169,10 @@ separate protocols rather than implicit behavior in the HTTP/1.1 APIs.
 ## Tests and benchmark
 
 The conformance suite covers IPv4/IPv6 TCP loopback request/response and EOF,
-UDP loopback/source preservation, DNS wire fixtures, idle deadlines, epoll and
-hosted readiness, gzip round trips, chunked framing, persistent pipelining,
+UDP loopback/source preservation, DNS wire fixtures, typed errors,
+read/write deadlines, cooperative cancellation, epoll and hosted readiness,
+graceful HTTP/WebSocket draining, gzip round trips, chunked framing,
+persistent pipelining,
 SSE encoding, backpressure paths, RFC handshake
 vectors, masked and extended frames, invalid UTF-8/control frames, fragmented
 live messages, ping/pong, routed parameters, replies, and close handshakes.

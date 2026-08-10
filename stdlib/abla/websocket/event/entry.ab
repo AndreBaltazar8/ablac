@@ -4,6 +4,7 @@
 
 import "abla/http"
 import "abla/net"
+import "abla/sys/linux/process"
 import "abla/websocket"
 
 class WebSocketEventReply(
@@ -23,7 +24,8 @@ class WebSocketEventOptions(
     val maximumConnections: int,
     val maximumHeaderBytes: int,
     val maximumMessageBytes: int,
-    val maximumPendingBytes: int
+    val maximumPendingBytes: int,
+    val drainTimeoutMilliseconds: int
 )
 
 resource class WebSocketEventServer(
@@ -41,6 +43,8 @@ resource class WebSocketEventServer(
     val fragmentedOpcodes: array<int>,
     val fragmentedPayloads: array<string>,
     val closing: array<bool>,
+    var draining: bool,
+    var drainDeadlineMilliseconds: int,
     var stopped: bool
 ) {
     fun drop(): void {
@@ -88,7 +92,7 @@ fun WebSocketEventRouter.find(path: string): int {
 }
 
 fun webSocketEventOptions(): WebSocketEventOptions =
-    WebSocketEventOptions(1023, 65536, 1048576, 2097152)
+    WebSocketEventOptions(1023, 65536, 1048576, 2097152, 5000)
 
 fun webSocketEventServer(
     router: WebSocketEventRouter,
@@ -103,7 +107,7 @@ fun webSocketEventServer(
     }
     WebSocketEventServer(
         router, move(listener), move(poller), options,
-        [], [], [], [], [], [], [], [], [], [], false
+        [], [], [], [], [], [], [], [], [], [], false, 0, false
     )
 }
 
@@ -306,7 +310,7 @@ fun WebSocketEventServer.processFrames(slot: int): void {
 }
 
 fun WebSocketEventServer.acceptReady(): void {
-    var accepting = this.activeConnections() <
+    var accepting = !this.draining && this.activeConnections() <
         this.options.maximumConnections
     while (accepting) {
         val connection = this.listener.accept()
@@ -376,7 +380,8 @@ fun WebSocketEventServer.step(timeoutMilliseconds: int = 1000): int {
     var index = 0
     while (index < events.events.size) {
         val event = events.events[index]
-        if (event.descriptor == this.listener.descriptor && event.readable) {
+        if (!this.draining &&
+            event.descriptor == this.listener.descriptor && event.readable) {
             this.acceptReady()
         } else {
             val slot = this.findDescriptor(event.descriptor)
@@ -399,10 +404,60 @@ fun WebSocketEventServer.step(timeoutMilliseconds: int = 1000): int {
 fun WebSocketEventServer.run(): int {
     tcpEnableGracefulShutdown()
     while (!this.stopped && !tcpShutdownRequested()) this.step(1000)
-    0
+    if (!this.stopped) this.drain() else 0
 }
 
 fun WebSocketEventServer.stop(): void {
+    this.beginDrain()
+    return
+}
+
+fun WebSocketEventServer.beginDrain(): void {
+    if (!this.draining) {
+        this.draining = true
+        this.drainDeadlineMilliseconds = linuxMonotonicMilliseconds() +
+            this.options.drainTimeoutMilliseconds
+        if (this.listener.descriptor >= 0) {
+            this.poller.unwatchDescriptor(this.listener.descriptor)
+            this.listener.close()
+        }
+        var slot = 0
+        while (slot < this.descriptors.size) {
+            if (this.descriptors[slot] >= 0) {
+                if (this.upgraded[slot]) {
+                    this.queue(slot, webSocketEncodeFrame(
+                        webSocketClosePayload(1001, "server shutdown"), 8
+                    ))
+                    this.closing[slot] = true
+                } else this.closeSlot(slot)
+            }
+            slot = slot + 1
+        }
+    }
+    return
+}
+
+fun WebSocketEventServer.forceStop(): void {
+    var slot = 0
+    while (slot < this.descriptors.size) {
+        this.closeSlot(slot)
+        slot = slot + 1
+    }
     this.stopped = true
+    return
+}
+
+fun WebSocketEventServer.drain(): int {
+    this.beginDrain()
+    while (this.activeConnections() > 0 &&
+        linuxMonotonicMilliseconds() < this.drainDeadlineMilliseconds) {
+        this.step(50)
+    }
+    this.forceStop()
+    0
+}
+
+fun WebSocketEventServer.stopNow(): void {
+    this.forceStop()
     return
 }
