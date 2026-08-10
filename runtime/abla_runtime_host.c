@@ -5,9 +5,12 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -19,6 +22,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -27,6 +31,9 @@
 
 #if defined(__APPLE__)
 #include <crt_externs.h>
+#include <sys/event.h>
+#else
+#include <sys/epoll.h>
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -40,6 +47,57 @@ static char** host_argv;
 static char** host_envp;
 static bool host_stdin_line_available;
 static volatile sig_atomic_t host_shutdown_requested;
+
+typedef struct ssl_ctx_st HostSslContext;
+typedef struct ssl_st HostSsl;
+typedef const void HostSslMethod;
+
+typedef struct AblaHostTlsConnection {
+    HostSslContext* context;
+    HostSsl* ssl;
+    int descriptor;
+    bool owns_context;
+} AblaHostTlsConnection;
+
+typedef struct AblaHostTlsListener {
+    HostSslContext* context;
+    int descriptor;
+} AblaHostTlsListener;
+
+static void* host_ssl_library;
+static const HostSslMethod* (*host_TLS_client_method)(void);
+static const HostSslMethod* (*host_TLS_server_method)(void);
+static HostSslContext* (*host_SSL_CTX_new)(const HostSslMethod*);
+static void (*host_SSL_CTX_free)(HostSslContext*);
+static int (*host_SSL_CTX_set_default_verify_paths)(HostSslContext*);
+static int (*host_SSL_CTX_load_verify_locations)(
+    HostSslContext*, const char*, const char*);
+static int (*host_SSL_CTX_use_certificate_chain_file)(
+    HostSslContext*, const char*);
+static int (*host_SSL_CTX_use_PrivateKey_file)(
+    HostSslContext*, const char*, int);
+static int (*host_SSL_CTX_check_private_key)(const HostSslContext*);
+static void (*host_SSL_CTX_set_verify)(HostSslContext*, int, void*);
+static HostSsl* (*host_SSL_new)(HostSslContext*);
+static void (*host_SSL_free)(HostSsl*);
+static long (*host_SSL_ctrl)(HostSsl*, int, long, void*);
+static int (*host_SSL_set1_host)(HostSsl*, const char*);
+static int (*host_SSL_set_fd)(HostSsl*, int);
+static int (*host_SSL_connect)(HostSsl*);
+static int (*host_SSL_accept)(HostSsl*);
+static int (*host_SSL_read)(HostSsl*, void*, int);
+static int (*host_SSL_write)(HostSsl*, const void*, int);
+static int (*host_SSL_shutdown)(HostSsl*);
+static long (*host_SSL_get_verify_result)(const HostSsl*);
+static char host_tls_error[256];
+static _Thread_local int host_net_status;
+static _Thread_local int host_net_error;
+static _Thread_local char host_net_source[INET6_ADDRSTRLEN];
+static _Thread_local int host_net_source_port;
+
+static void host_set_tls_error(const char* message) {
+    (void)snprintf(host_tls_error, sizeof(host_tls_error), "%s", message);
+}
 
 typedef union AblaAllocationHeader AblaAllocationHeader;
 union AblaAllocationHeader {
@@ -1607,6 +1665,903 @@ AblaValue ablaHostSleep(AblaValue milliseconds_value) {
         .tv_nsec = (long)((milliseconds % 1000) * 1000000)};
     while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {}
     return host_value_void();
+}
+
+AblaValue ablaHostSecureRandom(AblaValue count_value) {
+    const int64_t count = host_value_as_i64(count_value);
+    if (count < 1 || count > 1024 * 1024) return host_value_string_static("", 0);
+    const int descriptor = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) return host_value_string_static("", 0);
+    char* bytes = (char*)abla_platform_alloc((size_t)count + 1);
+    size_t offset = 0;
+    while (offset < (size_t)count) {
+        const ssize_t measured = read(
+            descriptor, bytes + offset, (size_t)count - offset);
+        if (measured < 0 && errno == EINTR) continue;
+        if (measured <= 0) break;
+        offset += (size_t)measured;
+    }
+    (void)close(descriptor);
+    if (offset != (size_t)count) {
+        abla_platform_free(bytes);
+        return host_value_string_static("", 0);
+    }
+    bytes[offset] = '\0';
+    return (AblaValue){
+        .tag = ABLA_STRING,
+        .as.string = {
+            .data = bytes,
+            .length = offset,
+            .owned = true,
+            .rope = (AblaStringRope*)0}};
+}
+
+static bool host_load_ssl_symbol(void* destination, size_t size, const char* name) {
+    void* symbol = dlsym(host_ssl_library, name);
+    if (symbol == NULL || size != sizeof(symbol)) return false;
+    memcpy(destination, &symbol, size);
+    return true;
+}
+
+static bool host_initialize_ssl(void) {
+    if (host_ssl_library != NULL) return true;
+    const char* configured = getenv("ABLA_OPENSSL_LIBRARY");
+    if (configured != NULL && configured[0] != '\0') {
+        host_ssl_library = dlopen(configured, RTLD_NOW | RTLD_LOCAL);
+    }
+    static const char* candidates[] = {
+#if defined(__APPLE__)
+        "libssl.3.dylib", "libssl.dylib",
+        "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
+        "/usr/local/opt/openssl@3/lib/libssl.3.dylib",
+#else
+        "libssl.so.3", "libssl.so.1.1", "libssl.so",
+#endif
+        NULL};
+    for (size_t index = 0;
+         host_ssl_library == NULL && candidates[index] != NULL;
+         ++index) {
+        host_ssl_library = dlopen(candidates[index], RTLD_NOW | RTLD_LOCAL);
+    }
+    if (host_ssl_library == NULL) {
+        const char* path = getenv("PATH");
+        size_t begin = 0;
+        const size_t path_length = path == NULL ? 0 : strlen(path);
+        while (host_ssl_library == NULL && begin <= path_length) {
+            size_t end = begin;
+            while (end < path_length && path[end] != ':') ++end;
+            const size_t directory_length = end - begin;
+            if (directory_length > 0 && directory_length < PATH_MAX - 16) {
+                char executable[PATH_MAX];
+                memcpy(executable, path + begin, directory_length);
+                memcpy(executable + directory_length, "/openssl", 9);
+                executable[directory_length + 8] = '\0';
+                char resolved[PATH_MAX];
+                if (realpath(executable, resolved) != NULL) {
+                    char* suffix = strstr(resolved, "/bin/openssl");
+                    if (suffix != NULL && suffix[12] == '\0') {
+                        *suffix = '\0';
+                        char library[PATH_MAX];
+                        const int measured = snprintf(
+                            library, sizeof(library),
+#if defined(__APPLE__)
+                            "%s/lib/libssl.3.dylib",
+#else
+                            "%s/lib/libssl.so.3",
+#endif
+                            resolved);
+                        if (measured > 0 &&
+                            (size_t)measured < sizeof(library)) {
+                            host_ssl_library = dlopen(
+                                library, RTLD_NOW | RTLD_LOCAL);
+                        }
+                    }
+                }
+            }
+            begin = end + 1;
+        }
+    }
+    if (host_ssl_library == NULL) {
+        FILE* probe = popen("openssl version -d 2>/dev/null", "r");
+        if (probe != NULL) {
+            char output[PATH_MAX];
+            if (fgets(output, sizeof(output), probe) != NULL) {
+                char* begin = strchr(output, '"');
+                char* end = begin == NULL ? NULL : strchr(begin + 1, '"');
+                if (begin != NULL && end != NULL) {
+                    *end = '\0';
+                    char* suffix = strstr(begin + 1, "/etc/ssl");
+                    if (suffix != NULL && suffix[8] == '\0') {
+                        *suffix = '\0';
+                        char library[PATH_MAX];
+                        const int measured = snprintf(
+                            library, sizeof(library),
+#if defined(__APPLE__)
+                            "%s/lib/libssl.3.dylib",
+#else
+                            "%s/lib/libssl.so.3",
+#endif
+                            begin + 1);
+                        if (measured > 0 &&
+                            (size_t)measured < sizeof(library)) {
+                            host_ssl_library = dlopen(
+                                library, RTLD_NOW | RTLD_LOCAL);
+                        }
+                    }
+                }
+            }
+            (void)pclose(probe);
+        }
+    }
+    if (host_ssl_library == NULL) return false;
+#define ABLA_SSL_LOAD(name) \
+    if (!host_load_ssl_symbol(&host_##name, sizeof(host_##name), #name)) \
+        goto failed
+    ABLA_SSL_LOAD(TLS_client_method);
+    ABLA_SSL_LOAD(TLS_server_method);
+    ABLA_SSL_LOAD(SSL_CTX_new);
+    ABLA_SSL_LOAD(SSL_CTX_free);
+    ABLA_SSL_LOAD(SSL_CTX_set_default_verify_paths);
+    ABLA_SSL_LOAD(SSL_CTX_load_verify_locations);
+    ABLA_SSL_LOAD(SSL_CTX_use_certificate_chain_file);
+    ABLA_SSL_LOAD(SSL_CTX_use_PrivateKey_file);
+    ABLA_SSL_LOAD(SSL_CTX_check_private_key);
+    ABLA_SSL_LOAD(SSL_CTX_set_verify);
+    ABLA_SSL_LOAD(SSL_new);
+    ABLA_SSL_LOAD(SSL_free);
+    ABLA_SSL_LOAD(SSL_ctrl);
+    ABLA_SSL_LOAD(SSL_set1_host);
+    ABLA_SSL_LOAD(SSL_set_fd);
+    ABLA_SSL_LOAD(SSL_connect);
+    ABLA_SSL_LOAD(SSL_accept);
+    ABLA_SSL_LOAD(SSL_read);
+    ABLA_SSL_LOAD(SSL_write);
+    ABLA_SSL_LOAD(SSL_shutdown);
+    ABLA_SSL_LOAD(SSL_get_verify_result);
+#undef ABLA_SSL_LOAD
+    return true;
+failed:
+    (void)dlclose(host_ssl_library);
+    host_ssl_library = NULL;
+    return false;
+}
+
+static int host_tcp_connect_name(
+    const char* host,
+    int port,
+    int timeout_milliseconds) {
+    char service[16];
+    (void)snprintf(service, sizeof(service), "%d", port);
+    const struct addrinfo hints = {
+        .ai_flags = AI_ADDRCONFIG,
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+        .ai_protocol = IPPROTO_TCP};
+    struct addrinfo* addresses = NULL;
+    if (getaddrinfo(host, service, &hints, &addresses) != 0) return -1;
+    int descriptor = -1;
+    for (struct addrinfo* address = addresses;
+         descriptor < 0 && address != NULL;
+         address = address->ai_next) {
+        const int candidate = socket(
+            address->ai_family,
+            address->ai_socktype,
+            address->ai_protocol);
+        if (candidate < 0) continue;
+        const int flags = fcntl(candidate, F_GETFL, 0);
+        if (flags < 0 || fcntl(candidate, F_SETFL, flags | O_NONBLOCK) != 0) {
+            (void)close(candidate);
+            continue;
+        }
+        int connected = connect(
+            candidate, address->ai_addr, address->ai_addrlen);
+        if (connected != 0 && errno == EINPROGRESS) {
+            struct pollfd readiness = {.fd = candidate, .events = POLLOUT};
+            do {
+                connected = poll(&readiness, 1, timeout_milliseconds);
+            } while (connected < 0 && errno == EINTR);
+            if (connected > 0) {
+                int socket_error = 0;
+                socklen_t socket_error_size = sizeof(socket_error);
+                if (getsockopt(
+                        candidate, SOL_SOCKET, SO_ERROR,
+                        &socket_error, &socket_error_size) != 0 ||
+                    socket_error != 0) connected = -1;
+                else connected = 0;
+            } else connected = -1;
+        }
+        if (connected == 0) {
+            (void)fcntl(candidate, F_SETFL, flags);
+            const struct timeval timeout = {
+                .tv_sec = timeout_milliseconds / 1000,
+                .tv_usec =
+                    (timeout_milliseconds % 1000) * 1000};
+            (void)setsockopt(
+                candidate, SOL_SOCKET, SO_RCVTIMEO,
+                &timeout, sizeof(timeout));
+            (void)setsockopt(
+                candidate, SOL_SOCKET, SO_SNDTIMEO,
+                &timeout, sizeof(timeout));
+            descriptor = candidate;
+        } else (void)close(candidate);
+    }
+    freeaddrinfo(addresses);
+    return descriptor;
+}
+
+static bool host_set_nonblocking(int descriptor, bool enabled) {
+    const int flags = fcntl(descriptor, F_GETFL, 0);
+    if (flags < 0) return false;
+    const int next = enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK;
+    return fcntl(descriptor, F_SETFL, next) == 0;
+}
+
+static int host_bind_socket(
+    const char* host,
+    int port,
+    int socket_type,
+    int protocol,
+    int backlog,
+    bool dual_stack) {
+    char service[16];
+    (void)snprintf(service, sizeof(service), "%d", port);
+    const struct addrinfo hints = {
+        .ai_flags = AI_PASSIVE,
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = socket_type,
+        .ai_protocol = protocol};
+    struct addrinfo* addresses = NULL;
+    const char* bind_host = host[0] == '\0' ? NULL : host;
+    if (getaddrinfo(bind_host, service, &hints, &addresses) != 0) return -1;
+    int descriptor = -1;
+    for (struct addrinfo* address = addresses;
+         descriptor < 0 && address != NULL;
+         address = address->ai_next) {
+        const int candidate = socket(
+            address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (candidate < 0) continue;
+        const int enabled = 1;
+        (void)setsockopt(
+            candidate, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+        if (address->ai_family == AF_INET6) {
+            const int only = dual_stack ? 0 : 1;
+            (void)setsockopt(
+                candidate, IPPROTO_IPV6, IPV6_V6ONLY, &only, sizeof(only));
+        }
+        if (bind(candidate, address->ai_addr, address->ai_addrlen) == 0 &&
+            (socket_type != SOCK_STREAM || listen(candidate, backlog) == 0)) {
+            (void)fcntl(candidate, F_SETFD, FD_CLOEXEC);
+            descriptor = candidate;
+        } else (void)close(candidate);
+    }
+    freeaddrinfo(addresses);
+    return descriptor;
+}
+
+AblaValue ablaHostNetConnect(
+    AblaValue host_value,
+    AblaValue port_value,
+    AblaValue timeout_value) {
+    const int64_t port = host_value_as_i64(port_value);
+    const int64_t timeout = host_value_as_i64(timeout_value);
+    if (port < 1 || port > 65535 || timeout < 1 || timeout > 600000) {
+        return host_value_i64(-EINVAL);
+    }
+    const int descriptor = host_tcp_connect_name(
+        host_value_as_cstring(host_value), (int)port, (int)timeout);
+    const int failure = errno == 0 ? EHOSTUNREACH : errno;
+    return host_value_i64(descriptor < 0 ? -failure : descriptor);
+}
+
+AblaValue ablaHostNetListen(
+    AblaValue host_value,
+    AblaValue port_value,
+    AblaValue backlog_value,
+    AblaValue dual_stack_value) {
+    const int64_t port = host_value_as_i64(port_value);
+    const int64_t backlog = host_value_as_i64(backlog_value);
+    if (port < 0 || port > 65535 || backlog < 1 || backlog > 4096 ||
+        dual_stack_value.tag != ABLA_BOOL) return host_value_i64(-EINVAL);
+    const int descriptor = host_bind_socket(
+        host_value_as_cstring(host_value), (int)port,
+        SOCK_STREAM, IPPROTO_TCP, (int)backlog,
+        dual_stack_value.as.boolean);
+    const int failure = errno == 0 ? EADDRNOTAVAIL : errno;
+    return host_value_i64(descriptor < 0 ? -failure : descriptor);
+}
+
+AblaValue ablaHostNetAccept(AblaValue listener_value) {
+    const int listener = (int)host_value_as_i64(listener_value);
+    int descriptor;
+    do descriptor = accept(listener, NULL, NULL);
+    while (descriptor < 0 && errno == EINTR);
+    if (descriptor < 0) return host_value_i64(-errno);
+    (void)fcntl(descriptor, F_SETFD, FD_CLOEXEC);
+    return host_value_i64(descriptor);
+}
+
+AblaValue ablaHostNetSetNonblocking(
+    AblaValue descriptor_value,
+    AblaValue enabled_value) {
+    if (enabled_value.tag != ABLA_BOOL) return host_value_bool(false);
+    return host_value_bool(host_set_nonblocking(
+        (int)host_value_as_i64(descriptor_value),
+        enabled_value.as.boolean));
+}
+
+AblaValue ablaHostNetLocalPort(AblaValue descriptor_value) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    struct sockaddr_storage address;
+    socklen_t length = sizeof(address);
+    if (getsockname(descriptor, (struct sockaddr*)&address, &length) != 0) {
+        return host_value_i64(-errno);
+    }
+    if (address.ss_family == AF_INET) return host_value_i64(ntohs(
+        ((const struct sockaddr_in*)&address)->sin_port));
+    if (address.ss_family == AF_INET6) return host_value_i64(ntohs(
+        ((const struct sockaddr_in6*)&address)->sin6_port));
+    return host_value_i64(-EAFNOSUPPORT);
+}
+
+AblaValue ablaHostNetRead(
+    AblaValue descriptor_value,
+    AblaValue maximum_value) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    const int64_t maximum = host_value_as_i64(maximum_value);
+    host_net_status = 3;
+    host_net_error = EINVAL;
+    if (maximum < 1 || maximum > 16 * 1024 * 1024) {
+        return host_value_string_static("", 0);
+    }
+    char* bytes = (char*)abla_platform_alloc((size_t)maximum + 1);
+    ssize_t measured;
+    do measured = recv(descriptor, bytes, (size_t)maximum, 0);
+    while (measured < 0 && errno == EINTR);
+    if (measured < 0) {
+        host_net_error = errno;
+        host_net_status = errno == EAGAIN || errno == EWOULDBLOCK ? 2 : 3;
+        abla_platform_free(bytes);
+        return host_value_string_static("", 0);
+    }
+    host_net_error = 0;
+    host_net_status = measured == 0 ? 1 : 0;
+    bytes[measured] = '\0';
+    return (AblaValue){
+        .tag = ABLA_STRING,
+        .as.string = {
+            .data = bytes,
+            .length = (size_t)measured,
+            .owned = true,
+            .rope = (AblaStringRope*)0}};
+}
+
+AblaValue ablaHostNetWrite(AblaValue descriptor_value, AblaValue contents) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    if (contents.tag != ABLA_STRING) return host_value_i64(-EINVAL);
+    ssize_t written;
+    do written = send(
+        descriptor, host_value_string_data(contents),
+        contents.as.string.length,
+#if defined(MSG_NOSIGNAL)
+        MSG_NOSIGNAL
+#else
+        0
+#endif
+    ); while (written < 0 && errno == EINTR);
+    return host_value_i64(written < 0 ? -errno : written);
+}
+
+AblaValue ablaHostNetStatus(void) {
+    return host_value_i64(host_net_status);
+}
+
+AblaValue ablaHostNetError(void) {
+    return host_value_i64(host_net_error);
+}
+
+AblaValue ablaHostNetClose(AblaValue descriptor_value) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    return host_value_bool(descriptor < 0 || close(descriptor) == 0);
+}
+
+AblaValue ablaHostNetUdpBind(
+    AblaValue host_value,
+    AblaValue port_value,
+    AblaValue dual_stack_value) {
+    const int64_t port = host_value_as_i64(port_value);
+    if (port < 0 || port > 65535 || dual_stack_value.tag != ABLA_BOOL) {
+        return host_value_i64(-EINVAL);
+    }
+    const int descriptor = host_bind_socket(
+        host_value_as_cstring(host_value), (int)port,
+        SOCK_DGRAM, IPPROTO_UDP, 0, dual_stack_value.as.boolean);
+    const int failure = errno == 0 ? EADDRNOTAVAIL : errno;
+    return host_value_i64(descriptor < 0 ? -failure : descriptor);
+}
+
+AblaValue ablaHostNetUdpSend(
+    AblaValue descriptor_value,
+    AblaValue host_value,
+    AblaValue port_value,
+    AblaValue contents) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    const int64_t port = host_value_as_i64(port_value);
+    if (contents.tag != ABLA_STRING || port < 1 || port > 65535) {
+        return host_value_i64(-EINVAL);
+    }
+    char service[16];
+    (void)snprintf(service, sizeof(service), "%d", (int)port);
+    const struct addrinfo hints = {
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = SOCK_DGRAM,
+        .ai_protocol = IPPROTO_UDP};
+    struct addrinfo* addresses = NULL;
+    if (getaddrinfo(
+            host_value_as_cstring(host_value), service,
+            &hints, &addresses) != 0) return host_value_i64(-EINVAL);
+    ssize_t written = -1;
+    for (struct addrinfo* address = addresses;
+         written < 0 && address != NULL;
+         address = address->ai_next) {
+        do written = sendto(
+            descriptor, host_value_string_data(contents),
+            contents.as.string.length, 0,
+            address->ai_addr, address->ai_addrlen);
+        while (written < 0 && errno == EINTR);
+    }
+    const int saved_error = errno;
+    freeaddrinfo(addresses);
+    return host_value_i64(written < 0 ? -saved_error : written);
+}
+
+AblaValue ablaHostNetUdpReceive(
+    AblaValue descriptor_value,
+    AblaValue maximum_value) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    const int64_t maximum = host_value_as_i64(maximum_value);
+    host_net_status = 3;
+    host_net_error = EINVAL;
+    host_net_source[0] = '\0';
+    host_net_source_port = 0;
+    if (maximum < 1 || maximum > 65535) {
+        return host_value_string_static("", 0);
+    }
+    char* bytes = (char*)abla_platform_alloc((size_t)maximum + 1);
+    struct sockaddr_storage source;
+    socklen_t source_length = sizeof(source);
+    ssize_t measured;
+    do measured = recvfrom(
+        descriptor, bytes, (size_t)maximum, 0,
+        (struct sockaddr*)&source, &source_length);
+    while (measured < 0 && errno == EINTR);
+    if (measured < 0) {
+        host_net_error = errno;
+        host_net_status = errno == EAGAIN || errno == EWOULDBLOCK ? 2 : 3;
+        abla_platform_free(bytes);
+        return host_value_string_static("", 0);
+    }
+    const void* address = NULL;
+    if (source.ss_family == AF_INET) {
+        const struct sockaddr_in* ipv4 = (const struct sockaddr_in*)&source;
+        address = &ipv4->sin_addr;
+        host_net_source_port = ntohs(ipv4->sin_port);
+    } else if (source.ss_family == AF_INET6) {
+        const struct sockaddr_in6* ipv6 = (const struct sockaddr_in6*)&source;
+        address = &ipv6->sin6_addr;
+        host_net_source_port = ntohs(ipv6->sin6_port);
+    }
+    if (address != NULL) (void)inet_ntop(
+        source.ss_family, address, host_net_source, sizeof(host_net_source));
+    host_net_status = 0;
+    host_net_error = 0;
+    bytes[measured] = '\0';
+    return (AblaValue){
+        .tag = ABLA_STRING,
+        .as.string = {
+            .data = bytes,
+            .length = (size_t)measured,
+            .owned = true,
+            .rope = (AblaStringRope*)0}};
+}
+
+AblaValue ablaHostNetSourceAddress(void) {
+    return host_owned_string(host_net_source, strlen(host_net_source));
+}
+
+AblaValue ablaHostNetSourcePort(void) {
+    return host_value_i64(host_net_source_port);
+}
+
+AblaValue ablaHostNetPollerCreate(void) {
+#if defined(__APPLE__)
+    return host_value_i64(kqueue());
+#else
+    return host_value_i64(epoll_create1(EPOLL_CLOEXEC));
+#endif
+}
+
+static bool host_poller_control(
+    int poller,
+    int descriptor,
+    bool readable,
+    bool writable,
+    bool modify,
+    bool remove) {
+#if defined(__APPLE__)
+    struct kevent changes[4];
+    int count = 0;
+    if (modify || remove) {
+        EV_SET(&changes[count++], descriptor, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        EV_SET(&changes[count++], descriptor, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        (void)kevent(poller, changes, count, NULL, 0, NULL);
+        count = 0;
+    }
+    if (!remove && readable) EV_SET(
+        &changes[count++], descriptor, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    if (!remove && writable) EV_SET(
+        &changes[count++], descriptor, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
+    return count == 0 || kevent(poller, changes, count, NULL, 0, NULL) == 0;
+#else
+    struct epoll_event event;
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLRDHUP |
+        (readable ? EPOLLIN : 0) | (writable ? EPOLLOUT : 0);
+    event.data.fd = descriptor;
+    const int operation = remove ? EPOLL_CTL_DEL :
+        (modify ? EPOLL_CTL_MOD : EPOLL_CTL_ADD);
+    return epoll_ctl(poller, operation, descriptor, remove ? NULL : &event) == 0;
+#endif
+}
+
+AblaValue ablaHostNetPollerControl(
+    AblaValue poller_value,
+    AblaValue descriptor_value,
+    AblaValue readable_value,
+    AblaValue writable_value,
+    AblaValue operation_value) {
+    if (readable_value.tag != ABLA_BOOL || writable_value.tag != ABLA_BOOL) {
+        return host_value_bool(false);
+    }
+    const int operation = (int)host_value_as_i64(operation_value);
+    return host_value_bool(host_poller_control(
+        (int)host_value_as_i64(poller_value),
+        (int)host_value_as_i64(descriptor_value),
+        readable_value.as.boolean, writable_value.as.boolean,
+        operation == 1, operation == 2));
+}
+
+static void host_store_u32(char* output, size_t offset, uint32_t value) {
+    output[offset] = (char)(value & 255);
+    output[offset + 1] = (char)((value >> 8) & 255);
+    output[offset + 2] = (char)((value >> 16) & 255);
+    output[offset + 3] = (char)((value >> 24) & 255);
+}
+
+AblaValue ablaHostNetPollerWait(
+    AblaValue poller_value,
+    AblaValue maximum_value,
+    AblaValue timeout_value) {
+    const int poller = (int)host_value_as_i64(poller_value);
+    const int64_t maximum = host_value_as_i64(maximum_value);
+    const int64_t timeout = host_value_as_i64(timeout_value);
+    host_net_error = 0;
+    if (maximum < 1 || maximum > 1024 || timeout < 0 || timeout > 600000) {
+        host_net_error = EINVAL;
+        return host_value_string_static("", 0);
+    }
+    char* encoded = (char*)malloc((size_t)maximum * 8);
+    if (encoded == NULL) {
+        host_net_error = ENOMEM;
+        return host_value_string_static("", 0);
+    }
+    int measured;
+#if defined(__APPLE__)
+    struct kevent* events = (struct kevent*)calloc(
+        (size_t)maximum, sizeof(struct kevent));
+    if (events == NULL) {
+        free(encoded);
+        host_net_error = ENOMEM;
+        return host_value_string_static("", 0);
+    }
+    const struct timespec duration = {
+        .tv_sec = timeout / 1000,
+        .tv_nsec = (timeout % 1000) * 1000000};
+    do measured = kevent(
+        poller, NULL, 0, events, (int)maximum, &duration);
+    while (measured < 0 && errno == EINTR);
+    for (int index = 0; index < measured; ++index) {
+        uint32_t flags = 0;
+        if (events[index].filter == EVFILT_READ) flags |= 1;
+        if (events[index].filter == EVFILT_WRITE) flags |= 2;
+        if ((events[index].flags & EV_EOF) != 0) flags |= 4;
+        if ((events[index].flags & EV_ERROR) != 0) flags |= 8;
+        host_store_u32(encoded, (size_t)index * 8, (uint32_t)events[index].ident);
+        host_store_u32(encoded, (size_t)index * 8 + 4, flags);
+    }
+    free(events);
+#else
+    struct epoll_event* events = (struct epoll_event*)calloc(
+        (size_t)maximum, sizeof(struct epoll_event));
+    if (events == NULL) {
+        free(encoded);
+        host_net_error = ENOMEM;
+        return host_value_string_static("", 0);
+    }
+    do measured = epoll_wait(
+        poller, events, (int)maximum, (int)timeout);
+    while (measured < 0 && errno == EINTR);
+    for (int index = 0; index < measured; ++index) {
+        uint32_t flags = 0;
+        if ((events[index].events & EPOLLIN) != 0) flags |= 1;
+        if ((events[index].events & EPOLLOUT) != 0) flags |= 2;
+        if ((events[index].events & (EPOLLHUP | EPOLLRDHUP)) != 0) flags |= 4;
+        if ((events[index].events & EPOLLERR) != 0) flags |= 8;
+        host_store_u32(encoded, (size_t)index * 8, (uint32_t)events[index].data.fd);
+        host_store_u32(encoded, (size_t)index * 8 + 4, flags);
+    }
+    free(events);
+#endif
+    if (measured < 0) {
+        host_net_error = errno;
+        free(encoded);
+        return host_value_string_static("", 0);
+    }
+    const AblaValue result = host_owned_string(encoded, (size_t)measured * 8);
+    free(encoded);
+    return result;
+}
+
+AblaValue ablaHostTlsAvailable(void) {
+    return host_value_bool(host_initialize_ssl());
+}
+
+static AblaValue host_tls_open(
+    const char* host,
+    int64_t port,
+    int64_t timeout,
+    const char* ca_path) {
+    if (port < 1 || port > 65535 || timeout < 1 || timeout > 600000 ||
+        !host_initialize_ssl()) {
+        host_set_tls_error("TLS runtime is unavailable");
+        return host_value_i64(-1);
+    }
+    const int descriptor = host_tcp_connect_name(
+        host, (int)port, (int)timeout);
+    if (descriptor < 0) {
+        host_set_tls_error("TCP connection failed");
+        return host_value_i64(-1);
+    }
+    AblaHostTlsConnection* connection =
+        (AblaHostTlsConnection*)calloc(1, sizeof(*connection));
+    if (connection == NULL) {
+        (void)close(descriptor);
+        return host_value_i64(-1);
+    }
+    connection->descriptor = descriptor;
+    connection->owns_context = true;
+    connection->context = host_SSL_CTX_new(host_TLS_client_method());
+    if (connection->context != NULL) {
+        host_SSL_CTX_set_verify(connection->context, 1, NULL);
+        const bool default_trust =
+            host_SSL_CTX_set_default_verify_paths(connection->context) == 1;
+        const bool system_trust = host_SSL_CTX_load_verify_locations(
+            connection->context,
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/ssl/certs") == 1;
+        const bool explicit_trust = ca_path != NULL && ca_path[0] != '\0' &&
+            host_SSL_CTX_load_verify_locations(
+                connection->context, ca_path, NULL) == 1;
+        const bool trust_loaded = default_trust || system_trust || explicit_trust;
+        if (trust_loaded) {
+            connection->ssl = host_SSL_new(connection->context);
+        }
+    }
+    bool connected = connection->ssl != NULL;
+    if (connected) connected =
+        host_SSL_ctrl(connection->ssl, 55, 0, (void*)host) == 1;
+    if (connected) connected =
+        host_SSL_set1_host(connection->ssl, host) == 1;
+    if (connected) connected =
+        host_SSL_set_fd(connection->ssl, descriptor) == 1;
+    if (connected) connected = host_SSL_connect(connection->ssl) == 1;
+    if (connected) connected =
+        host_SSL_get_verify_result(connection->ssl) == 0;
+    if (!connected) {
+        if (connection->context == NULL) host_set_tls_error("TLS context failed");
+        else if (connection->ssl == NULL) host_set_tls_error("TLS trust or session failed");
+        else host_set_tls_error("TLS handshake or certificate verification failed");
+        if (connection->ssl != NULL) host_SSL_free(connection->ssl);
+        if (connection->context != NULL) {
+            host_SSL_CTX_free(connection->context);
+        }
+        (void)close(descriptor);
+        free(connection);
+        return host_value_i64(-1);
+    }
+    host_tls_error[0] = '\0';
+    return host_value_i64((int64_t)(intptr_t)connection);
+}
+
+AblaValue ablaHostTlsOpen(
+    AblaValue host_value,
+    AblaValue port_value,
+    AblaValue timeout_value) {
+    return host_tls_open(
+        host_value_as_cstring(host_value),
+        host_value_as_i64(port_value),
+        host_value_as_i64(timeout_value),
+        NULL);
+}
+
+AblaValue ablaHostTlsOpenWithCa(
+    AblaValue host_value,
+    AblaValue port_value,
+    AblaValue timeout_value,
+    AblaValue ca_path_value) {
+    return host_tls_open(
+        host_value_as_cstring(host_value),
+        host_value_as_i64(port_value),
+        host_value_as_i64(timeout_value),
+        host_value_as_cstring(ca_path_value));
+}
+
+AblaValue ablaHostTlsError(void) {
+    return host_owned_string(host_tls_error, strlen(host_tls_error));
+}
+
+AblaValue ablaHostTlsRead(AblaValue handle_value, AblaValue maximum_value) {
+    AblaHostTlsConnection* connection = (AblaHostTlsConnection*)(intptr_t)
+        host_value_as_i64(handle_value);
+    const int64_t maximum = host_value_as_i64(maximum_value);
+    if (connection == NULL || maximum < 1 || maximum > 16 * 1024 * 1024) {
+        return host_value_string_static("", 0);
+    }
+    char* bytes = (char*)abla_platform_alloc((size_t)maximum + 1);
+    const int measured = host_SSL_read(
+        connection->ssl, bytes, (int)maximum);
+    if (measured <= 0) {
+        abla_platform_free(bytes);
+        return host_value_string_static("", 0);
+    }
+    bytes[measured] = '\0';
+    return (AblaValue){
+        .tag = ABLA_STRING,
+        .as.string = {
+            .data = bytes,
+            .length = (size_t)measured,
+            .owned = true,
+            .rope = (AblaStringRope*)0}};
+}
+
+AblaValue ablaHostTlsWrite(AblaValue handle_value, AblaValue contents) {
+    AblaHostTlsConnection* connection = (AblaHostTlsConnection*)(intptr_t)
+        host_value_as_i64(handle_value);
+    if (connection == NULL || contents.tag != ABLA_STRING) {
+        return host_value_i64(-1);
+    }
+    const char* bytes = host_value_string_data(contents);
+    size_t offset = 0;
+    while (offset < contents.as.string.length) {
+        size_t remaining = contents.as.string.length - offset;
+        if (remaining > INT32_MAX) remaining = INT32_MAX;
+        const int written = host_SSL_write(
+            connection->ssl, bytes + offset, (int)remaining);
+        if (written <= 0) return host_value_i64(-1);
+        offset += (size_t)written;
+    }
+    return host_value_i64((int64_t)offset);
+}
+
+AblaValue ablaHostTlsClose(AblaValue handle_value) {
+    AblaHostTlsConnection* connection = (AblaHostTlsConnection*)(intptr_t)
+        host_value_as_i64(handle_value);
+    if (connection == NULL) return host_value_bool(true);
+    (void)host_SSL_shutdown(connection->ssl);
+    host_SSL_free(connection->ssl);
+    if (connection->owns_context) host_SSL_CTX_free(connection->context);
+    const bool closed = close(connection->descriptor) == 0;
+    free(connection);
+    return host_value_bool(closed);
+}
+
+AblaValue ablaHostTlsListen(
+    AblaValue host_value,
+    AblaValue port_value,
+    AblaValue backlog_value,
+    AblaValue dual_stack_value,
+    AblaValue certificate_value,
+    AblaValue private_key_value) {
+    const int64_t port = host_value_as_i64(port_value);
+    const int64_t backlog = host_value_as_i64(backlog_value);
+    if (port < 0 || port > 65535 || backlog < 1 || backlog > 4096 ||
+        dual_stack_value.tag != ABLA_BOOL || !host_initialize_ssl()) {
+        host_set_tls_error("invalid or unavailable TLS listener");
+        return host_value_i64(-1);
+    }
+    AblaHostTlsListener* listener =
+        (AblaHostTlsListener*)calloc(1, sizeof(*listener));
+    if (listener == NULL) return host_value_i64(-1);
+    listener->descriptor = -1;
+    listener->context = host_SSL_CTX_new(host_TLS_server_method());
+    bool ready = listener->context != NULL;
+    if (ready) ready = host_SSL_CTX_use_certificate_chain_file(
+        listener->context, host_value_as_cstring(certificate_value)) == 1;
+    if (ready) ready = host_SSL_CTX_use_PrivateKey_file(
+        listener->context, host_value_as_cstring(private_key_value), 1) == 1;
+    if (ready) ready = host_SSL_CTX_check_private_key(listener->context) == 1;
+    if (ready) {
+        listener->descriptor = host_bind_socket(
+            host_value_as_cstring(host_value), (int)port,
+            SOCK_STREAM, IPPROTO_TCP, (int)backlog,
+            dual_stack_value.as.boolean);
+        ready = listener->descriptor >= 0;
+    }
+    if (!ready) {
+        host_set_tls_error("TLS certificate, private key, or listener failed");
+        if (listener->descriptor >= 0) (void)close(listener->descriptor);
+        if (listener->context != NULL) host_SSL_CTX_free(listener->context);
+        free(listener);
+        return host_value_i64(-1);
+    }
+    host_tls_error[0] = '\0';
+    return host_value_i64((int64_t)(intptr_t)listener);
+}
+
+AblaValue ablaHostTlsListenerPort(AblaValue handle_value) {
+    AblaHostTlsListener* listener = (AblaHostTlsListener*)(intptr_t)
+        host_value_as_i64(handle_value);
+    if (listener == NULL) return host_value_i64(-1);
+    struct sockaddr_storage address;
+    socklen_t length = sizeof(address);
+    if (getsockname(
+            listener->descriptor, (struct sockaddr*)&address, &length) != 0) {
+        return host_value_i64(-1);
+    }
+    if (address.ss_family == AF_INET) return host_value_i64(ntohs(
+        ((const struct sockaddr_in*)&address)->sin_port));
+    if (address.ss_family == AF_INET6) return host_value_i64(ntohs(
+        ((const struct sockaddr_in6*)&address)->sin6_port));
+    return host_value_i64(-1);
+}
+
+AblaValue ablaHostTlsAccept(AblaValue handle_value) {
+    AblaHostTlsListener* listener = (AblaHostTlsListener*)(intptr_t)
+        host_value_as_i64(handle_value);
+    if (listener == NULL) return host_value_i64(-1);
+    int descriptor;
+    do descriptor = accept(listener->descriptor, NULL, NULL);
+    while (descriptor < 0 && errno == EINTR);
+    if (descriptor < 0) return host_value_i64(-1);
+    AblaHostTlsConnection* connection =
+        (AblaHostTlsConnection*)calloc(1, sizeof(*connection));
+    if (connection == NULL) {
+        (void)close(descriptor);
+        return host_value_i64(-1);
+    }
+    connection->context = listener->context;
+    connection->descriptor = descriptor;
+    connection->ssl = host_SSL_new(listener->context);
+    bool accepted = connection->ssl != NULL;
+    if (accepted) accepted = host_SSL_set_fd(connection->ssl, descriptor) == 1;
+    if (accepted) accepted = host_SSL_accept(connection->ssl) == 1;
+    if (!accepted) {
+        host_set_tls_error("TLS server handshake failed");
+        if (connection->ssl != NULL) host_SSL_free(connection->ssl);
+        (void)close(descriptor);
+        free(connection);
+        return host_value_i64(-1);
+    }
+    return host_value_i64((int64_t)(intptr_t)connection);
+}
+
+AblaValue ablaHostTlsListenerClose(AblaValue handle_value) {
+    AblaHostTlsListener* listener = (AblaHostTlsListener*)(intptr_t)
+        host_value_as_i64(handle_value);
+    if (listener == NULL) return host_value_bool(true);
+    const bool closed = close(listener->descriptor) == 0;
+    host_SSL_CTX_free(listener->context);
+    free(listener);
+    return host_value_bool(closed);
 }
 
 AblaValue ablaHostTcpListen(AblaValue port_value, AblaValue backlog_value) {

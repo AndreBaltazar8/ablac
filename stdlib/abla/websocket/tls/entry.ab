@@ -1,0 +1,131 @@
+// WSS client built from the shared RFC 6455 codec and hosted TLS connection.
+
+import "abla/random/hosted"
+import "abla/tls/hosted"
+import "abla/websocket"
+
+resource class TlsWebSocketConnection(
+    val stream: TlsConnection,
+    var buffered: string,
+    val maskingKey: string,
+    var closed: bool
+)
+
+fun webSocketTlsClientConfigured(
+    host: string,
+    path: string,
+    port: int,
+    timeoutMilliseconds: int,
+    caPath: string
+): TlsWebSocketConnection {
+    val stream = if (caPath == "") tlsConnect(
+        host, port, timeoutMilliseconds
+    ) else tlsConnectWithCa(host, caPath, port, timeoutMilliseconds)
+    val entropy = hostedSecureRandomBytes(20)
+    var mask = "mask"
+    var key = ""
+    if (entropy.succeeded) {
+        mask = entropy.bytes.slice(0, 4)
+        key = base64Encode(entropy.bytes.slice(4, 20))
+    }
+    if (stream.handle >= 0 && key != "") {
+        val authority = if (port == 443) host else "$host:$port"
+        val request = "GET $path HTTP/1.1\r\nHost: $authority\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: $key\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        if (stream.write(request) == request.size) {
+            var response = ""
+            var headerEnd = -1
+            while (headerEnd < 0 && response.size < 65536) {
+                val chunk = stream.read(65536 - response.size)
+                if (chunk == "") headerEnd = response.size
+                else {
+                    response = "$response$chunk"
+                    headerEnd = httpHeaderEnd(response)
+                }
+            }
+            val expected = webSocketAccept(key)
+            val parsed = httpParseResponse(response)
+            if (parsed.response.status == 101 &&
+                parsed.response.header("Sec-WebSocket-Accept") == expected) {
+                return TlsWebSocketConnection(
+                    move(stream),
+                    if (headerEnd >= 0) response.slice(
+                        headerEnd, response.size
+                    ) else "",
+                    mask,
+                    false
+                )
+            }
+        }
+    }
+    stream.close()
+    TlsWebSocketConnection(move(stream), "", mask, true)
+}
+
+fun webSocketTlsClient(
+    host: string,
+    path: string,
+    port: int = 443,
+    timeoutMilliseconds: int = 5000
+): TlsWebSocketConnection = webSocketTlsClientConfigured(
+    host, path, port, timeoutMilliseconds, ""
+)
+
+fun webSocketTlsClientWithCa(
+    host: string,
+    path: string,
+    caPath: string,
+    port: int = 443,
+    timeoutMilliseconds: int = 5000
+): TlsWebSocketConnection = webSocketTlsClientConfigured(
+    host, path, port, timeoutMilliseconds, caPath
+)
+
+fun TlsWebSocketConnection.sendText(payload: string): bool {
+    val frame = webSocketEncodeFrame(payload, 1, true, this.maskingKey)
+    !this.closed && webSocketUtf8Valid(payload) &&
+        this.stream.write(frame) == frame.size
+}
+
+fun TlsWebSocketConnection.sendBinary(payload: string): bool {
+    val frame = webSocketEncodeFrame(payload, 2, true, this.maskingKey)
+    !this.closed && this.stream.write(frame) == frame.size
+}
+
+fun TlsWebSocketConnection.readFrame(
+    maximumPayload: int = 1048576
+): WebSocketReadResult {
+    var decoded = webSocketDecodeFrame(this.buffered, maximumPayload, false)
+    var eof = false
+    while (!decoded.complete && !eof && !this.closed) {
+        val chunk = this.stream.read(65536)
+        if (chunk == "") eof = true
+        else {
+            this.buffered = "${this.buffered}$chunk"
+            decoded = webSocketDecodeFrame(
+                this.buffered, maximumPayload, false
+            )
+        }
+    }
+    if (decoded.succeeded()) {
+        this.buffered = this.buffered.slice(
+            decoded.consumed, this.buffered.size
+        )
+    }
+    if (eof) this.closed = true
+    WebSocketReadResult(
+        decoded.frame, decoded.succeeded(), eof, false, decoded.error
+    )
+}
+
+fun TlsWebSocketConnection.close(): bool {
+    var result = this.closed
+    if (!this.closed) {
+        val frame = webSocketEncodeFrame(
+            webSocketClosePayload(1000, ""), 8, true, this.maskingKey
+        )
+        result = this.stream.write(frame) == frame.size
+        this.stream.close()
+        this.closed = true
+    }
+    result
+}

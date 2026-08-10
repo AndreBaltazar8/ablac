@@ -156,6 +156,44 @@ AblaValue ablaHostTcpLocalPort(AblaValue listener);
 AblaValue ablaHostTcpRead(AblaValue connection, AblaValue maximum);
 AblaValue ablaHostTcpWrite(AblaValue connection, AblaValue contents);
 AblaValue ablaHostTcpClose(AblaValue descriptor);
+AblaValue ablaHostNetConnect(AblaValue host, AblaValue port, AblaValue timeout);
+AblaValue ablaHostNetListen(
+    AblaValue host, AblaValue port, AblaValue backlog, AblaValue dual_stack);
+AblaValue ablaHostNetAccept(AblaValue listener);
+AblaValue ablaHostNetSetNonblocking(AblaValue descriptor, AblaValue enabled);
+AblaValue ablaHostNetLocalPort(AblaValue descriptor);
+AblaValue ablaHostNetRead(AblaValue descriptor, AblaValue maximum);
+AblaValue ablaHostNetWrite(AblaValue descriptor, AblaValue contents);
+AblaValue ablaHostNetStatus(void);
+AblaValue ablaHostNetError(void);
+AblaValue ablaHostNetClose(AblaValue descriptor);
+AblaValue ablaHostNetUdpBind(
+    AblaValue host, AblaValue port, AblaValue dual_stack);
+AblaValue ablaHostNetUdpSend(
+    AblaValue descriptor, AblaValue host, AblaValue port, AblaValue contents);
+AblaValue ablaHostNetUdpReceive(AblaValue descriptor, AblaValue maximum);
+AblaValue ablaHostNetSourceAddress(void);
+AblaValue ablaHostNetSourcePort(void);
+AblaValue ablaHostNetPollerCreate(void);
+AblaValue ablaHostNetPollerControl(
+    AblaValue poller, AblaValue descriptor, AblaValue readable,
+    AblaValue writable, AblaValue operation);
+AblaValue ablaHostNetPollerWait(
+    AblaValue poller, AblaValue maximum, AblaValue timeout);
+AblaValue ablaHostTlsAvailable(void);
+AblaValue ablaHostTlsOpen(AblaValue host, AblaValue port, AblaValue timeout);
+AblaValue ablaHostTlsOpenWithCa(
+    AblaValue host, AblaValue port, AblaValue timeout, AblaValue ca_path);
+AblaValue ablaHostTlsRead(AblaValue handle, AblaValue maximum);
+AblaValue ablaHostTlsWrite(AblaValue handle, AblaValue contents);
+AblaValue ablaHostTlsClose(AblaValue handle);
+AblaValue ablaHostTlsError(void);
+AblaValue ablaHostTlsListen(
+    AblaValue host, AblaValue port, AblaValue backlog, AblaValue dual_stack,
+    AblaValue certificate_path, AblaValue private_key_path);
+AblaValue ablaHostTlsListenerPort(AblaValue handle);
+AblaValue ablaHostTlsAccept(AblaValue handle);
+AblaValue ablaHostTlsListenerClose(AblaValue handle);
 AblaValue ablaHostEnableGracefulShutdown(void);
 AblaValue ablaHostShutdownRequested(void);
 AblaValue ablaHostMemoryCheckpoint(void);

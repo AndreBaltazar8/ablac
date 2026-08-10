@@ -35,6 +35,13 @@ class HttpClientResult(
     val complete: bool
 )
 
+class HttpCoreChunkDecode(
+    val body: string,
+    val consumed: int,
+    val complete: bool,
+    val valid: bool
+)
+
 class HttpClient(
     val authority: string,
     val exchange: (string, int, int) -> HttpTransportResult,
@@ -159,6 +166,7 @@ fun httpJson(body: string, status: int = 200): HttpResponse = HttpResponse(
 
 fun httpStatusReason(status: int): string {
     var reason = "Unknown Status"
+    if (status == 101) reason = "Switching Protocols"
     if (status == 200) reason = "OK"
     if (status == 201) reason = "Created"
     if (status == 204) reason = "No Content"
@@ -173,6 +181,7 @@ fun httpStatusReason(status: int): string {
     if (status == 413) reason = "Payload Too Large"
     if (status == 415) reason = "Unsupported Media Type"
     if (status == 422) reason = "Unprocessable Content"
+    if (status == 426) reason = "Upgrade Required"
     if (status == 429) reason = "Too Many Requests"
     if (status == 500) reason = "Internal Server Error"
     if (status == 501) reason = "Not Implemented"
@@ -184,12 +193,27 @@ fun httpStatusReason(status: int): string {
 
 fun HttpResponse.renderHeaders(): string {
     var output = "HTTP/1.1 ${this.status} ${httpStatusReason(this.status)}\r\n"
+    var hasLength = false
+    var hasConnection = false
     var index = 0
     while (index < this.headers.size) {
-        output = "$output${this.headers[index].name}: ${this.headers[index].value}\r\n"
+        val header = this.headers[index]
+        if (httpAsciiEqualInsensitive(header.name, "Content-Length")) {
+            hasLength = true
+        }
+        if (httpAsciiEqualInsensitive(header.name, "Connection")) {
+            hasConnection = true
+        }
+        output = "$output${header.name}: ${header.value}\r\n"
         index = index + 1
     }
-    "${output}Content-Length: ${this.body.size}\r\nConnection: close\r\n"
+    if (!hasLength && this.status != 101) {
+        output = "${output}Content-Length: ${this.body.size}\r\n"
+    }
+    if (!hasConnection && this.status != 101) {
+        output = "${output}Connection: close\r\n"
+    }
+    output
 }
 
 fun HttpResponse.render(): string = "${this.renderHeaders()}\r\n${this.body}"
@@ -278,6 +302,103 @@ fun httpDecimalLength(value: string, maximum: int): int {
     if (valid) result else -1
 }
 
+fun httpCoreHexLength(value: string, maximum: int): int {
+    var result = 0
+    var valid = value.size > 0
+    var index = 0
+    while (valid && index < value.size) {
+        val byte = value[index]
+        var digit = -1
+        if (byte >= 48 && byte <= 57) digit = byte - 48
+        if (byte >= 65 && byte <= 70) digit = byte - 55
+        if (byte >= 97 && byte <= 102) digit = byte - 87
+        if (digit < 0 || result > (maximum - digit) / 16) valid = false
+        else result = result * 16 + digit
+        index = index + 1
+    }
+    if (valid && result <= maximum) result else -1
+}
+
+fun httpCoreHeaderTokenContains(value: string, wanted: string): bool {
+    var matched = false
+    var begin = 0
+    var index = 0
+    while (!matched && index <= value.size) {
+        if (index == value.size || value[index] == 44) {
+            var left = begin
+            var right = index
+            while (left < right && (value[left] == 32 || value[left] == 9)) {
+                left = left + 1
+            }
+            while (right > left &&
+                (value[right - 1] == 32 || value[right - 1] == 9)) {
+                right = right - 1
+            }
+            var semicolon = left
+            while (semicolon < right && value[semicolon] != 59) {
+                semicolon = semicolon + 1
+            }
+            matched = httpAsciiEqualInsensitive(
+                value.slice(left, semicolon), wanted
+            )
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    matched
+}
+
+fun httpCoreDecodeChunked(
+    input: string,
+    maximumBody: int = 1048576
+): HttpCoreChunkDecode {
+    var output = ""
+    var offset = 0
+    var complete = false
+    var valid = true
+    while (!complete && valid && offset < input.size) {
+        val lineEnd = httpLineEnd(input, offset)
+        if (lineEnd >= input.size) offset = input.size
+        else {
+            var extension = offset
+            while (extension < lineEnd && input[extension] != 59) {
+                extension = extension + 1
+            }
+            val length = httpCoreHexLength(
+                input.slice(offset, extension), maximumBody - output.size
+            )
+            if (length < 0) valid = false
+            else if (length == 0) {
+                var trailerEnd = -1
+                var cursor = lineEnd + 2
+                while (trailerEnd < 0 && cursor + 1 < input.size) {
+                    if (input[cursor] == 13 && input[cursor + 1] == 10) {
+                        trailerEnd = cursor + 2
+                    } else {
+                        val next = httpLineEnd(input, cursor)
+                        if (next >= input.size) cursor = input.size
+                        else cursor = next + 2
+                    }
+                }
+                if (trailerEnd >= 0) {
+                    offset = trailerEnd
+                    complete = true
+                } else offset = input.size
+            } else {
+                val body = lineEnd + 2
+                if (body + length + 2 > input.size) offset = input.size
+                else if (input[body + length] != 13 ||
+                    input[body + length + 1] != 10) valid = false
+                else {
+                    output = "$output${input.slice(body, body + length)}"
+                    offset = body + length + 2
+                }
+            }
+        }
+    }
+    HttpCoreChunkDecode(output, offset, complete, valid)
+}
+
 fun httpReadRequest(
     connection: TcpConnection,
     maximumHeader: int = 65536,
@@ -298,11 +419,33 @@ fun httpReadRequest(
     if (headerEnd >= 0) {
         val preliminary = httpParseRequest(input)
         val encodedLength = preliminary.header("Content-Length")
+        val chunked = httpCoreHeaderTokenContains(
+            preliminary.header("Transfer-Encoding"), "chunked"
+        )
         var contentLength = 0
         if (encodedLength != "") {
             contentLength = httpDecimalLength(encodedLength, maximumBody)
         }
-        if (contentLength >= 0) {
+        if (chunked) {
+            var decoded = httpCoreDecodeChunked(
+                input.slice(headerEnd, input.size), maximumBody
+            )
+            var readingBody = decoded.valid && !decoded.complete &&
+                input.size < maximumHeader + maximumBody
+            while (readingBody) {
+                val remaining = maximumHeader + maximumBody - input.size
+                val chunk = connection.read(remaining)
+                if (chunk.size > 0) input = "$input$chunk"
+                decoded = httpCoreDecodeChunked(
+                    input.slice(headerEnd, input.size), maximumBody
+                )
+                readingBody = chunk.size > 0 && decoded.valid &&
+                    !decoded.complete && input.size < maximumHeader + maximumBody
+            }
+            if (decoded.complete && decoded.valid) {
+                input = "${input.slice(0, headerEnd)}${decoded.body}"
+            }
+        } else if (contentLength >= 0) {
             val expected = headerEnd + contentLength
             var readingBody = input.size < expected
             while (readingBody) {
@@ -421,8 +564,15 @@ fun httpParseResponse(input: string): HttpClientResult {
     if (bodyBegin <= input.size) body = input.slice(bodyBegin, input.size)
     val provisional = HttpResponse(status, headers, body)
     val encodedLength = provisional.header("Content-Length")
+    val chunked = httpCoreHeaderTokenContains(
+        provisional.header("Transfer-Encoding"), "chunked"
+    )
     var complete = status >= 100 && bodyBegin <= input.size
-    if (encodedLength != "") {
+    if (chunked) {
+        val decoded = httpCoreDecodeChunked(body, 1048576)
+        complete = complete && decoded.complete && decoded.valid
+        body = decoded.body
+    } else if (encodedLength != "") {
         val expected = httpDecimalLength(encodedLength, 1048576)
         complete = complete && expected >= 0 && body.size >= expected
         if (expected >= 0 && body.size > expected) {

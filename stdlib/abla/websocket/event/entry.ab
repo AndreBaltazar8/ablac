@@ -1,0 +1,408 @@
+// Epoll WebSocket server with bounded connection/input/output state. Message
+// handlers are nonblocking transformations; slow writes remain queued under a
+// configured backpressure ceiling.
+
+import "abla/http"
+import "abla/net"
+import "abla/websocket"
+
+class WebSocketEventReply(
+    val kind: string,
+    val payload: string,
+    val close: bool
+)
+
+class WebSocketEventRoute(
+    val pattern: string,
+    val handler: (string, string, string) -> WebSocketEventReply
+)
+
+class WebSocketEventRouter(val routes: array<WebSocketEventRoute>)
+
+class WebSocketEventOptions(
+    val maximumConnections: int,
+    val maximumHeaderBytes: int,
+    val maximumMessageBytes: int,
+    val maximumPendingBytes: int
+)
+
+resource class WebSocketEventServer(
+    val router: WebSocketEventRouter,
+    val listener: TcpListener,
+    val poller: SocketPoller,
+    val options: WebSocketEventOptions,
+    val descriptors: array<int>,
+    val inputs: array<string>,
+    val outputs: array<string>,
+    val outputOffsets: array<int>,
+    val upgraded: array<bool>,
+    val paths: array<string>,
+    val routeIndexes: array<int>,
+    val fragmentedOpcodes: array<int>,
+    val fragmentedPayloads: array<string>,
+    val closing: array<bool>,
+    var stopped: bool
+) {
+    fun drop(): void {
+        var index = 0
+        while (index < this.descriptors.size) {
+            if (this.descriptors[index] >= 0) {
+                linuxTcpCloseDescriptor(this.descriptors[index])
+                this.descriptors[index] = -1
+            }
+            index = index + 1
+        }
+        this.poller.close()
+        this.listener.close()
+        this.stopped = true
+        return
+    }
+}
+
+fun webSocketEventReply(
+    payload: string,
+    kind: string = "text",
+    close: bool = false
+): WebSocketEventReply = WebSocketEventReply(kind, payload, close)
+
+fun webSocketEventRouter(): WebSocketEventRouter = WebSocketEventRouter([])
+
+fun WebSocketEventRouter.route(
+    pattern: string,
+    handler: (string, string, string) -> WebSocketEventReply
+): WebSocketEventRouter {
+    this.routes.append(WebSocketEventRoute(pattern, handler))
+    this
+}
+
+fun WebSocketEventRouter.find(path: string): int {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < this.routes.size) {
+        if (httpMatchPath(this.routes[index].pattern, path).matched) {
+            found = index
+        }
+        index = index + 1
+    }
+    found
+}
+
+fun webSocketEventOptions(): WebSocketEventOptions =
+    WebSocketEventOptions(1023, 65536, 1048576, 2097152)
+
+fun webSocketEventServer(
+    router: WebSocketEventRouter,
+    address: Ipv4SocketAddress,
+    options: WebSocketEventOptions = webSocketEventOptions()
+): WebSocketEventServer {
+    val listener = tcpListenAddress(address, 1024)
+    listener.setNonblocking()
+    val poller = socketPoller()
+    if (listener.descriptor >= 0 && poller.descriptor >= 0) {
+        poller.watchDescriptor(listener.descriptor)
+    }
+    WebSocketEventServer(
+        router, move(listener), move(poller), options,
+        [], [], [], [], [], [], [], [], [], [], false
+    )
+}
+
+fun WebSocketEventServer.activeConnections(): int {
+    var active = 0
+    var index = 0
+    while (index < this.descriptors.size) {
+        if (this.descriptors[index] >= 0) active = active + 1
+        index = index + 1
+    }
+    active
+}
+
+fun WebSocketEventServer.findDescriptor(descriptor: int): int {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < this.descriptors.size) {
+        if (this.descriptors[index] == descriptor) found = index
+        index = index + 1
+    }
+    found
+}
+
+fun WebSocketEventServer.allocateSlot(descriptor: int): int {
+    var slot = -1
+    var index = 0
+    while (slot < 0 && index < this.descriptors.size) {
+        if (this.descriptors[index] < 0) slot = index
+        index = index + 1
+    }
+    if (slot < 0) {
+        slot = this.descriptors.size
+        this.descriptors.append(descriptor)
+        this.inputs.append("")
+        this.outputs.append("")
+        this.outputOffsets.append(0)
+        this.upgraded.append(false)
+        this.paths.append("")
+        this.routeIndexes.append(-1)
+        this.fragmentedOpcodes.append(0)
+        this.fragmentedPayloads.append("")
+        this.closing.append(false)
+    } else {
+        this.descriptors[slot] = descriptor
+        this.inputs[slot] = ""
+        this.outputs[slot] = ""
+        this.outputOffsets[slot] = 0
+        this.upgraded[slot] = false
+        this.paths[slot] = ""
+        this.routeIndexes[slot] = -1
+        this.fragmentedOpcodes[slot] = 0
+        this.fragmentedPayloads[slot] = ""
+        this.closing[slot] = false
+    }
+    slot
+}
+
+fun WebSocketEventServer.closeSlot(slot: int): void {
+    if (slot >= 0 && slot < this.descriptors.size &&
+        this.descriptors[slot] >= 0) {
+        this.poller.unwatchDescriptor(this.descriptors[slot])
+        linuxTcpCloseDescriptor(this.descriptors[slot])
+        this.descriptors[slot] = -1
+        this.inputs[slot] = ""
+        this.outputs[slot] = ""
+        this.outputOffsets[slot] = 0
+        this.upgraded[slot] = false
+        this.fragmentedOpcodes[slot] = 0
+        this.fragmentedPayloads[slot] = ""
+        this.closing[slot] = false
+    }
+    return
+}
+
+fun WebSocketEventServer.queue(slot: int, bytes: string): bool {
+    var queued = slot >= 0 && this.descriptors[slot] >= 0 &&
+        this.outputs[slot].size + bytes.size <=
+            this.options.maximumPendingBytes
+    if (queued) {
+        this.outputs[slot] = "${this.outputs[slot]}$bytes"
+        this.poller.modifyDescriptor(this.descriptors[slot], true, true)
+    } else if (slot >= 0) this.closeSlot(slot)
+    queued
+}
+
+fun WebSocketEventServer.processHandshake(slot: int): void {
+    val headerEnd = httpHeaderEnd(this.inputs[slot])
+    if (headerEnd < 0 && this.inputs[slot].size >
+        this.options.maximumHeaderBytes) this.closeSlot(slot)
+    if (headerEnd >= 0 && this.descriptors[slot] >= 0) {
+        val request = httpParseRequest(this.inputs[slot].slice(0, headerEnd))
+        val route = this.router.find(request.path)
+        if (route < 0 || !webSocketIsUpgradeRequest(request)) {
+            this.queue(slot, httpText("not found", 404).render())
+            this.closing[slot] = true
+        } else {
+            this.inputs[slot] = this.inputs[slot].slice(
+                headerEnd, this.inputs[slot].size
+            )
+            this.paths[slot] = request.path
+            this.routeIndexes[slot] = route
+            this.upgraded[slot] = true
+            this.queue(slot, webSocketUpgradeResponse(request).render())
+            this.processFrames(slot)
+        }
+    }
+    return
+}
+
+fun WebSocketEventServer.handleMessage(
+    slot: int,
+    opcode: int,
+    payload: string
+): void {
+    var valid = payload.size <= this.options.maximumMessageBytes
+    if (opcode == 1) valid = valid && webSocketUtf8Valid(payload)
+    if (!valid) {
+        this.queue(slot, webSocketEncodeFrame(
+            webSocketClosePayload(1007, "invalid message"), 8
+        ))
+        this.closing[slot] = true
+    } else {
+        val handler = this.router.routes[this.routeIndexes[slot]].handler
+        val reply = handler(
+            this.paths[slot], if (opcode == 1) "text" else "binary", payload
+        )
+        val replyOpcode = if (reply.kind == "binary") 2 else 1
+        if (reply.payload != "") {
+            this.queue(
+                slot, webSocketEncodeFrame(reply.payload, replyOpcode)
+            )
+        }
+        if (reply.close) {
+            this.queue(slot, webSocketEncodeFrame(
+                webSocketClosePayload(1000, ""), 8
+            ))
+            this.closing[slot] = true
+        }
+    }
+    return
+}
+
+fun WebSocketEventServer.processFrames(slot: int): void {
+    var processing = slot >= 0 && this.descriptors[slot] >= 0 &&
+        this.upgraded[slot]
+    while (processing) {
+        val decoded = webSocketDecodeFrame(
+            this.inputs[slot], this.options.maximumMessageBytes, true
+        )
+        if (decoded.error != "") {
+            this.queue(slot, webSocketEncodeFrame(
+                webSocketClosePayload(1002, "protocol error"), 8
+            ))
+            this.closing[slot] = true
+            processing = false
+        } else if (!decoded.complete) processing = false
+        else {
+            this.inputs[slot] = this.inputs[slot].slice(
+                decoded.consumed, this.inputs[slot].size
+            )
+            val frame = decoded.frame
+            if (frame.opcode == 9) {
+                this.queue(slot, webSocketEncodeFrame(frame.payload, 10))
+            } else if (frame.opcode == 8) {
+                this.queue(slot, webSocketEncodeFrame(frame.payload, 8))
+                this.closing[slot] = true
+                processing = false
+            } else if (frame.opcode == 1 || frame.opcode == 2) {
+                if (frame.final) this.handleMessage(
+                    slot, frame.opcode, frame.payload
+                )
+                else {
+                    this.fragmentedOpcodes[slot] = frame.opcode
+                    this.fragmentedPayloads[slot] = frame.payload
+                }
+            } else if (frame.opcode == 0) {
+                if (this.fragmentedOpcodes[slot] == 0) {
+                    this.closing[slot] = true
+                    processing = false
+                } else {
+                    this.fragmentedPayloads[slot] =
+                        "${this.fragmentedPayloads[slot]}${frame.payload}"
+                    if (this.fragmentedPayloads[slot].size >
+                        this.options.maximumMessageBytes) {
+                        this.closing[slot] = true
+                        processing = false
+                    } else if (frame.final) {
+                        val opcode = this.fragmentedOpcodes[slot]
+                        val payload = this.fragmentedPayloads[slot]
+                        this.fragmentedOpcodes[slot] = 0
+                        this.fragmentedPayloads[slot] = ""
+                        this.handleMessage(slot, opcode, payload)
+                    }
+                }
+            }
+            if (this.closing[slot]) processing = false
+        }
+    }
+    return
+}
+
+fun WebSocketEventServer.acceptReady(): void {
+    var accepting = this.activeConnections() <
+        this.options.maximumConnections
+    while (accepting) {
+        val connection = this.listener.accept()
+        if (connection.descriptor < 0) accepting = false
+        else {
+            connection.setNonblocking()
+            val descriptor = connection.descriptor
+            connection.descriptor = -1
+            this.allocateSlot(descriptor)
+            this.poller.watchDescriptor(descriptor)
+            accepting = this.activeConnections() <
+                this.options.maximumConnections
+        }
+    }
+    return
+}
+
+fun WebSocketEventServer.readReady(slot: int): void {
+    if (slot >= 0 && this.descriptors[slot] >= 0) {
+        val connection = TcpConnection(this.descriptors[slot])
+        val incoming = connection.readResult(65536)
+        connection.descriptor = -1
+        if (incoming.hasData()) {
+            this.inputs[slot] = "${this.inputs[slot]}${incoming.bytes}"
+            if (this.inputs[slot].size >
+                this.options.maximumMessageBytes +
+                this.options.maximumHeaderBytes) this.closeSlot(slot)
+            else if (this.upgraded[slot]) this.processFrames(slot)
+            else this.processHandshake(slot)
+        } else if (incoming.reachedEof() ||
+            (incoming.failed() && incoming.errorCode != 11)) {
+            this.closeSlot(slot)
+        }
+    }
+    return
+}
+
+fun WebSocketEventServer.writeReady(slot: int): void {
+    if (slot >= 0 && this.descriptors[slot] >= 0 &&
+        this.outputOffsets[slot] < this.outputs[slot].size) {
+        val connection = TcpConnection(this.descriptors[slot])
+        val remaining = this.outputs[slot].slice(
+            this.outputOffsets[slot], this.outputs[slot].size
+        )
+        val written = connection.writeResult(remaining)
+        connection.descriptor = -1
+        this.outputOffsets[slot] =
+            this.outputOffsets[slot] + written.written
+        if (written.failed() && written.errorCode != 11) this.closeSlot(slot)
+        else if (this.outputOffsets[slot] >= this.outputs[slot].size) {
+            this.outputs[slot] = ""
+            this.outputOffsets[slot] = 0
+            if (this.closing[slot]) this.closeSlot(slot)
+            else this.poller.modifyDescriptor(
+                this.descriptors[slot], true, false
+            )
+        }
+    }
+    return
+}
+
+fun WebSocketEventServer.step(timeoutMilliseconds: int = 1000): int {
+    var maximum = this.options.maximumConnections + 1
+    if (maximum > 1024) maximum = 1024
+    val events = this.poller.wait(maximum, timeoutMilliseconds)
+    var handled = 0
+    var index = 0
+    while (index < events.events.size) {
+        val event = events.events[index]
+        if (event.descriptor == this.listener.descriptor && event.readable) {
+            this.acceptReady()
+        } else {
+            val slot = this.findDescriptor(event.descriptor)
+            if (slot >= 0) {
+                if (event.error || event.closed) this.closeSlot(slot)
+                else {
+                    if (event.readable) this.readReady(slot)
+                    if (event.writable && this.descriptors[slot] >= 0) {
+                        this.writeReady(slot)
+                    }
+                }
+            }
+        }
+        handled = handled + 1
+        index = index + 1
+    }
+    handled
+}
+
+fun WebSocketEventServer.run(): int {
+    tcpEnableGracefulShutdown()
+    while (!this.stopped && !tcpShutdownRequested()) this.step(1000)
+    0
+}
+
+fun WebSocketEventServer.stop(): void {
+    this.stopped = true
+    return
+}

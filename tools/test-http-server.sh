@@ -23,9 +23,9 @@ trap cleanup EXIT
 "$compiler" build "$project_root/tests/cases/modules/http-server.ab" \
     -o "$test_directory/server"
 [[ ! -e $test_directory/server.host.o ]]
-if nm "$test_directory/server" | awk '{print $3}' | \
-    rg -q '^(ablaHost|abla_host_|abla_platform_)'; then
-    printf '%s\n' 'raw HTTP server linked project C capability symbols' >&2
+symbols=$(nm "$test_directory/server" | awk '{print $3}')
+if rg -q '^(ablaHost|abla_host_)' <<< "$symbols"; then
+    printf '%s\n' 'raw HTTP server linked hosted capability symbols' >&2
     exit 1
 fi
 
@@ -62,4 +62,4 @@ server=0
 [[ $(< "$test_directory/v1.txt") == v1:42 ]]
 [[ $(< "$test_directory/latest.txt") == v1:42:v2 ]]
 
-printf 'raw-syscall HTTP server: health + versioned V1 + latest V2; no project C\n'
+printf 'raw-syscall HTTP server: health + versioned V1 + latest V2; no hosted capability\n'

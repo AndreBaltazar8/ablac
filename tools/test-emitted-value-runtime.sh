@@ -45,6 +45,6 @@ rg -q '^declare .*@abla_equal' "$output_directory/runtime.ll"
 [[ ! -e $output_directory/value-runtime.value-runtime.o ]]
 [[ ! -e $output_directory/value-runtime.host.o ]]
 nm --defined-only "$output_directory/value-runtime.o" |
-    rg -q ' [Tt] abla_string_data$'
+    rg ' [Tt] abla_string_data$' >/dev/null
 
 echo "portable value runtime: strings, ropes, formatting, equality, and one linked implementation"

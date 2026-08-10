@@ -16,7 +16,7 @@ set -e
 test "$status" -eq 42
 test ! -e "$output.host.o"
 if nm "$output" | awk '{print $3}' | \
-    rg -q '^(ablaHost|abla_host_|abla_platform_)'; then
+    rg '^(ablaHost|abla_host_|abla_platform_)' >/dev/null; then
     echo "module incremental state unexpectedly linked project C symbols" >&2
     exit 1
 fi

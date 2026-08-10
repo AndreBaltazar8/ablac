@@ -1,0 +1,116 @@
+import "abla/fs"
+import "abla/process"
+import "abla/random/hosted"
+import "abla/tls/hosted"
+import "abla/websocket/tls"
+
+var tlsTestPort = 0
+val tlsTestCertificate = "build/network-test-certificate.pem"
+val tlsTestPrivateKey = "build/network-test-private-key.pem"
+
+fun tlsTestClient(): int {
+    val connection = tlsConnectWithCa(
+        "localhost", tlsTestCertificate, tlsTestPort, 3000
+    )
+    if (connection.handle < 0) return 1
+    val written = connection.write("hello secure")
+    val reply = connection.read(64)
+    connection.close()
+    if (written == 12 && reply == "secure reply") 0 else 2
+}
+
+fun wssTestClient(): int {
+    val socket = webSocketTlsClientWithCa(
+        "localhost", "/echo", tlsTestCertificate, tlsTestPort, 3000
+    )
+    if (socket.closed) return 1
+    val sent = socket.sendText("secure websocket")
+    val reply = socket.readFrame(1024)
+    socket.close()
+    if (sent && reply.available && reply.frame.opcode == 1 &&
+        reply.frame.payload == "wss reply") 0 else 2
+}
+
+fun testWss(): bool {
+    val listener = tlsListen(
+        tlsTestCertificate,
+        tlsTestPrivateKey,
+        "::1",
+        0,
+        8,
+        false
+    )
+    if (listener.handle < 0) return false
+    tlsTestPort = listener.localPort()
+    val child = thread { wssTestClient() }
+    val connection = listener.accept()
+    if (connection.handle < 0) return false
+    val handshake = connection.read(65536)
+    val request = httpParseRequest(handshake)
+    val upgraded = webSocketIsUpgradeRequest(request)
+    val response = webSocketUpgradeResponse(request).render()
+    val responseWritten = connection.write(response) == response.size
+    val frameBytes = connection.read(4096)
+    val frame = webSocketDecodeFrame(frameBytes, 1024, true)
+    val reply = webSocketEncodeFrame("wss reply", 1)
+    val replyWritten = connection.write(reply) == reply.size
+    val childStatus = await child
+    connection.close()
+    listener.close()
+    upgraded && responseWritten && frame.succeeded() &&
+        frame.frame.payload == "secure websocket" && replyWritten &&
+        childStatus == 0
+}
+
+fun tlsCreateCertificate(): bool {
+    Path(tlsTestCertificate).remove()
+    Path(tlsTestPrivateKey).remove()
+    val openssl = command("openssl")
+    openssl.argument("req")
+    openssl.argument("-quiet")
+    openssl.argument("-x509")
+    openssl.argument("-newkey")
+    openssl.argument("rsa:2048")
+    openssl.argument("-nodes")
+    openssl.argument("-days")
+    openssl.argument("1")
+    openssl.argument("-subj")
+    openssl.argument("/CN=localhost")
+    openssl.argument("-addext")
+    openssl.argument("subjectAltName=DNS:localhost")
+    openssl.argument("-keyout")
+    openssl.argument(tlsTestPrivateKey)
+    openssl.argument("-out")
+    openssl.argument(tlsTestCertificate)
+    openssl.run() == 0
+}
+
+fun main: int {
+    val entropy = hostedSecureRandomBytes(32)
+    if (!entropy.succeeded || entropy.bytes.size != 32 ||
+        !tlsAvailable() || !tlsCreateCertificate()) return 1
+    val listener = tlsListen(
+        tlsTestCertificate,
+        tlsTestPrivateKey,
+        "::1",
+        0,
+        8,
+        false
+    )
+    if (listener.handle < 0) return 2
+    tlsTestPort = listener.localPort()
+    val child = thread { tlsTestClient() }
+    val connection = listener.accept()
+    if (connection.handle < 0) return 3
+    val input = connection.read(64)
+    val written = connection.write("secure reply")
+    val childStatus = await child
+    connection.close()
+    listener.close()
+    val wss = testWss()
+    Path(tlsTestCertificate).remove()
+    Path(tlsTestPrivateKey).remove()
+    if (input == "hello secure" && written == 12 && childStatus == 0 &&
+        wss) 42
+    else 4
+}

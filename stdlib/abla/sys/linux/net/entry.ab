@@ -3,9 +3,110 @@
 
 import "abla/sys/linux"
 
-class TcpListener(val descriptor: int)
+class Ipv4SocketAddress(val address: string, val port: int)
 
-class TcpConnection(val descriptor: int)
+class Ipv6SocketAddress(
+    val address: string,
+    val port: int,
+    val scopeId: int
+)
+
+class SocketReadResult(
+    val bytes: string,
+    val status: string,
+    val errorCode: int
+) {
+    fun hasData(): bool = this.status == "data"
+    fun reachedEof(): bool = this.status == "eof"
+    fun timedOut(): bool = this.status == "timeout"
+    fun failed(): bool = this.status == "error"
+}
+
+class SocketWriteResult(
+    val written: int,
+    val status: string,
+    val errorCode: int
+) {
+    fun succeeded(): bool = this.status == "written"
+    fun timedOut(): bool = this.status == "timeout"
+    fun failed(): bool = this.status == "error"
+}
+
+class SocketPollResult(
+    val readable: bool,
+    val writable: bool,
+    val closed: bool,
+    val timedOut: bool,
+    val errorCode: int
+) {
+    fun failed(): bool = this.errorCode != 0
+}
+
+class SocketEvent(
+    val descriptor: int,
+    val readable: bool,
+    val writable: bool,
+    val closed: bool,
+    val error: bool
+)
+
+class SocketEvents(
+    val events: array<SocketEvent>,
+    val timedOut: bool,
+    val errorCode: int
+) {
+    fun failed(): bool = this.errorCode != 0
+}
+
+class UdpDatagram(
+    val bytes: string,
+    val source: Ipv4SocketAddress,
+    val received: bool,
+    val timedOut: bool,
+    val truncated: bool,
+    val errorCode: int
+)
+
+class UdpDatagramIpv6(
+    val bytes: string,
+    val source: Ipv6SocketAddress,
+    val received: bool,
+    val timedOut: bool,
+    val truncated: bool,
+    val errorCode: int
+)
+
+resource class TcpListener(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) linuxSyscall1(3, this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+
+resource class TcpConnection(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) linuxSyscall1(3, this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+
+resource class UdpSocket(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) linuxSyscall1(3, this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+
+resource class SocketPoller(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) linuxSyscall1(3, this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
 
 var linuxTcpShutdownDescriptor: int = -1
 var linuxTcpShutdownSeen: bool = false
@@ -26,6 +127,220 @@ fun linuxNetStoreU32(
 
 fun linuxNetReadU16(buffer: NativeByteBuffer, offset: int): int =
     buffer.load(offset) * 256 + buffer.load(offset + 1)
+
+fun linuxNetReadNativeU16(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) + buffer.load(offset + 1) * 256
+
+fun linuxNetReadNativeU32(buffer: NativeByteBuffer, offset: int): int =
+    linuxNetReadNativeU16(buffer, offset) +
+    linuxNetReadNativeU16(buffer, offset + 2) * 65536
+
+fun ipv4SocketAddress(address: string, port: int): Ipv4SocketAddress =
+    Ipv4SocketAddress(address, port)
+
+fun ipv4Any(port: int): Ipv4SocketAddress =
+    Ipv4SocketAddress("0.0.0.0", port)
+
+fun ipv4Loopback(port: int): Ipv4SocketAddress =
+    Ipv4SocketAddress("127.0.0.1", port)
+
+fun ipv6SocketAddress(
+    address: string,
+    port: int,
+    scopeId: int = 0
+): Ipv6SocketAddress = Ipv6SocketAddress(address, port, scopeId)
+
+fun ipv6Any(port: int): Ipv6SocketAddress = Ipv6SocketAddress("::", port, 0)
+
+fun ipv6Loopback(port: int): Ipv6SocketAddress =
+    Ipv6SocketAddress("::1", port, 0)
+
+fun Ipv4SocketAddress.isValid(): bool =
+    linuxIpv4Octets(this.address).size == 4 &&
+    this.port >= 0 && this.port <= 65535
+
+fun linuxNetHexDigit(byte: int): int {
+    var value = -1
+    if (byte >= 48 && byte <= 57) value = byte - 48
+    if (byte >= 65 && byte <= 70) value = byte - 55
+    if (byte >= 97 && byte <= 102) value = byte - 87
+    value
+}
+
+fun linuxIpv6ParseSide(side: string): array<int> {
+    val words: array<int> = []
+    var begin = 0
+    var index = 0
+    var valid = side.size > 0
+    while (valid && index <= side.size) {
+        if (index == side.size || side[index] == 58) {
+            val length = index - begin
+            if (length < 1 || length > 4) valid = false
+            var value = 0
+            var digit = begin
+            while (valid && digit < index) {
+                val decoded = linuxNetHexDigit(side[digit])
+                if (decoded < 0) valid = false
+                else value = value * 16 + decoded
+                digit = digit + 1
+            }
+            if (valid) words.append(value)
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    if (!valid) words.append(-1)
+    words
+}
+
+fun linuxIpv6Words(address: string): array<int> {
+    val result: array<int> = []
+    var compression = -1
+    var duplicateCompression = false
+    var index = 0
+    while (index + 1 < address.size) {
+        if (address[index] == 58 && address[index + 1] == 58) {
+            if (compression >= 0) duplicateCompression = true
+            else compression = index
+            index = index + 1
+        }
+        index = index + 1
+    }
+    var left: array<int> = []
+    var right: array<int> = []
+    if (!duplicateCompression && compression >= 0) {
+        if (compression > 0) {
+            left = linuxIpv6ParseSide(address.slice(0, compression))
+        }
+        if (compression + 2 < address.size) {
+            right = linuxIpv6ParseSide(
+                address.slice(compression + 2, address.size)
+            )
+        }
+        val valid = (left.size == 0 || left[left.size - 1] >= 0) &&
+            (right.size == 0 || right[right.size - 1] >= 0) &&
+            left.size + right.size < 8
+        if (valid) {
+            var word = 0
+            while (word < left.size) {
+                result.append(left[word])
+                word = word + 1
+            }
+            var zero = left.size + right.size
+            while (zero < 8) {
+                result.append(0)
+                zero = zero + 1
+            }
+            word = 0
+            while (word < right.size) {
+                result.append(right[word])
+                word = word + 1
+            }
+        }
+    } else if (!duplicateCompression && address.size > 0) {
+        left = linuxIpv6ParseSide(address)
+        if (left.size == 8 && left[7] >= 0) {
+            var word = 0
+            while (word < 8) {
+                result.append(left[word])
+                word = word + 1
+            }
+        }
+    }
+    result
+}
+
+fun Ipv6SocketAddress.isValid(): bool =
+    linuxIpv6Words(this.address).size == 8 &&
+    this.port >= 0 && this.port <= 65535 && this.scopeId >= 0
+
+fun linuxNetWriteIpv6Address(
+    var buffer: NativeByteBuffer,
+    address: Ipv6SocketAddress
+): bool {
+    val words = linuxIpv6Words(address.address)
+    var valid = words.size == 8 && address.port >= 0 &&
+        address.port <= 65535 && address.scopeId >= 0
+    if (valid) {
+        linuxNetStoreU16(buffer, 0, 10)
+        buffer.store(2, address.port / 256)
+        buffer.store(3, address.port - address.port / 256 * 256)
+        linuxNetStoreU32(buffer, 4, 0)
+        var word = 0
+        while (word < 8) {
+            buffer.store(8 + word * 2, words[word] / 256)
+            buffer.store(
+                9 + word * 2,
+                words[word] - words[word] / 256 * 256
+            )
+            word = word + 1
+        }
+        linuxNetStoreU32(buffer, 24, address.scopeId)
+    }
+    valid
+}
+
+fun linuxNetHexWord(value: int): string {
+    val digits = "0123456789abcdef"
+    var output = ""
+    var shift = 12
+    var started = false
+    while (shift >= 0) {
+        val divisor = if (shift == 12) 4096 else if (shift == 8) 256
+            else if (shift == 4) 16 else 1
+        val digit = value / divisor - value / (divisor * 16) * 16
+        if (digit != 0 || started || shift == 0) {
+            output = "$output${digits.slice(digit, digit + 1)}"
+            started = true
+        }
+        shift = shift - 4
+    }
+    output
+}
+
+fun linuxNetReadIpv6Address(buffer: NativeByteBuffer): Ipv6SocketAddress {
+    var text = ""
+    var word = 0
+    while (word < 8) {
+        if (word > 0) text = "$text:"
+        text = "$text${linuxNetHexWord(
+            buffer.load(8 + word * 2) * 256 +
+            buffer.load(9 + word * 2)
+        )}"
+        word = word + 1
+    }
+    Ipv6SocketAddress(
+        text,
+        linuxNetReadU16(buffer, 2),
+        linuxNetReadNativeU32(buffer, 24)
+    )
+}
+
+fun linuxNetWriteIpv4Address(
+    var buffer: NativeByteBuffer,
+    address: Ipv4SocketAddress
+): bool {
+    val octets = linuxIpv4Octets(address.address)
+    var valid = octets.size == 4 && address.port >= 0 &&
+        address.port <= 65535
+    if (valid) {
+        linuxNetStoreU16(buffer, 0, 2)
+        buffer.store(2, address.port / 256)
+        buffer.store(3, address.port - address.port / 256 * 256)
+        var index = 0
+        while (index < 4) {
+            valid = buffer.store(4 + index, octets[index]) && valid
+            index = index + 1
+        }
+    }
+    valid
+}
+
+fun linuxNetReadIpv4Address(buffer: NativeByteBuffer): Ipv4SocketAddress =
+    Ipv4SocketAddress(
+        "${buffer.load(4)}.${buffer.load(5)}.${buffer.load(6)}.${buffer.load(7)}",
+        linuxNetReadU16(buffer, 2)
+    )
 
 fun linuxTcpCloseDescriptor(descriptor: int): bool =
     descriptor >= 0 && linuxSyscall1(3, descriptor) == 0
@@ -62,6 +377,181 @@ fun linuxIpv4Octets(address: string): array<int> {
     octets
 }
 
+fun linuxPollSocket(
+    descriptor: int,
+    read: bool,
+    write: bool,
+    timeoutMilliseconds: int
+): SocketPollResult {
+    var readable = false
+    var writable = false
+    var closed = false
+    var timedOut = false
+    var errorCode = 0
+    if (descriptor < 0) {
+        errorCode = if (descriptor < -1) -descriptor else 9
+    } else if (timeoutMilliseconds < 0 || timeoutMilliseconds > 600000) {
+        errorCode = 22
+    } else {
+        var events = 0
+        if (read) events = events | 1
+        if (write) events = events | 4
+        val pollDescriptor = nativeByteBuffer(8)
+        linuxNetStoreU32(pollDescriptor, 0, descriptor)
+        linuxNetStoreU16(pollDescriptor, 4, events)
+        var polled = linuxSyscall3(
+            7,
+            nativePointerAddress(pollDescriptor.address),
+            1,
+            timeoutMilliseconds
+        )
+        while (polled == -4) {
+            polled = linuxSyscall3(
+                7,
+                nativePointerAddress(pollDescriptor.address),
+                1,
+                timeoutMilliseconds
+            )
+        }
+        if (polled == 0) timedOut = true
+        if (polled < 0) errorCode = -polled
+        if (polled > 0) {
+            val returned = linuxNetReadNativeU16(pollDescriptor, 6)
+            readable = (returned & 1) != 0
+            writable = (returned & 4) != 0
+            closed = (returned & 16) != 0 || (returned & 8192) != 0
+            if ((returned & 8) != 0 || (returned & 32) != 0) errorCode = 5
+        }
+        pollDescriptor.close()
+    }
+    SocketPollResult(
+        readable, writable, closed, timedOut, errorCode
+    )
+}
+
+fun TcpConnection.poll(
+    timeoutMilliseconds: int,
+    read: bool = true,
+    write: bool = false
+): SocketPollResult = linuxPollSocket(
+    this.descriptor, read, write, timeoutMilliseconds
+)
+
+fun UdpSocket.poll(
+    timeoutMilliseconds: int,
+    read: bool = true,
+    write: bool = false
+): SocketPollResult = linuxPollSocket(
+    this.descriptor, read, write, timeoutMilliseconds
+)
+
+fun socketPoller(): SocketPoller =
+    SocketPoller(linuxSyscall1(291, 524288))
+
+fun linuxPollerControl(
+    poller: SocketPoller,
+    operation: int,
+    descriptor: int,
+    read: bool,
+    write: bool
+): bool {
+    var succeeded = poller.descriptor >= 0 && descriptor >= 0
+    val event = nativeByteBuffer(12)
+    if (succeeded && operation != 2) {
+        var events = 8192
+        if (read) events = events | 1
+        if (write) events = events | 4
+        linuxNetStoreU32(event, 0, events)
+        linuxNetStoreU32(event, 4, descriptor)
+    }
+    if (succeeded) {
+        val pointer = if (operation == 2) 0
+            else nativePointerAddress(event.address)
+        succeeded = linuxSyscall4(
+            233,
+            poller.descriptor,
+            operation,
+            descriptor,
+            pointer
+        ) == 0
+    }
+    event.close()
+    succeeded
+}
+
+fun SocketPoller.watchDescriptor(
+    descriptor: int,
+    read: bool = true,
+    write: bool = false
+): bool = linuxPollerControl(this, 1, descriptor, read, write)
+
+fun SocketPoller.modifyDescriptor(
+    descriptor: int,
+    read: bool = true,
+    write: bool = false
+): bool = linuxPollerControl(this, 3, descriptor, read, write)
+
+fun SocketPoller.unwatchDescriptor(descriptor: int): bool =
+    linuxPollerControl(this, 2, descriptor, false, false)
+
+fun SocketPoller.wait(
+    maximumEvents: int = 64,
+    timeoutMilliseconds: int = 5000
+): SocketEvents {
+    val events: array<SocketEvent> = []
+    var timedOut = false
+    var errorCode = 0
+    if (this.descriptor < 0) errorCode = 9
+    else if (maximumEvents < 1 || maximumEvents > 1024 ||
+        timeoutMilliseconds < 0 || timeoutMilliseconds > 600000) {
+        errorCode = 22
+    } else {
+        val buffer = nativeByteBuffer(maximumEvents * 12)
+        var measured = linuxSyscall4(
+            232,
+            this.descriptor,
+            nativePointerAddress(buffer.address),
+            maximumEvents,
+            timeoutMilliseconds
+        )
+        while (measured == -4) {
+            measured = linuxSyscall4(
+                232,
+                this.descriptor,
+                nativePointerAddress(buffer.address),
+                maximumEvents,
+                timeoutMilliseconds
+            )
+        }
+        if (measured == 0) timedOut = true
+        if (measured < 0) errorCode = -measured
+        var index = 0
+        while (index < measured) {
+            val offset = index * 12
+            val returned = linuxNetReadNativeU32(buffer, offset)
+            events.append(SocketEvent(
+                linuxNetReadNativeU32(buffer, offset + 4),
+                (returned & 1) != 0,
+                (returned & 4) != 0,
+                (returned & 16) != 0 || (returned & 8192) != 0,
+                (returned & 8) != 0
+            ))
+            index = index + 1
+        }
+        buffer.close()
+    }
+    SocketEvents(events, timedOut, errorCode)
+}
+
+fun SocketPoller.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = linuxTcpCloseDescriptor(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
+
 // Bounded numeric-IPv4 client connection for low-level and compile-provider
 // use. Nonblocking connect + poll prevents an unreachable peer from stalling
 // the compiler or a service indefinitely; DNS remains a portable higher layer.
@@ -94,6 +584,7 @@ fun tcpConnectIpv4(
         )
         socketAddress.close()
         var ready = connected == 0
+        var connectionError = 0
         if (connected == -115) {
             val pollDescriptor = nativeByteBuffer(8)
             linuxNetStoreU32(pollDescriptor, 0, descriptor)
@@ -114,13 +605,94 @@ fun tcpConnectIpv4(
             }
             ready = polled > 0 && pollDescriptor.load(6) != 0
             pollDescriptor.close()
+            if (ready) {
+                val error = nativeByteBuffer(8)
+                val errorLength = nativeByteBuffer(8)
+                linuxNetStoreU32(errorLength, 0, 4)
+                val inspected = linuxSyscall5(
+                    55,
+                    descriptor,
+                    1,
+                    4,
+                    nativePointerAddress(error.address),
+                    nativePointerAddress(errorLength.address)
+                )
+                if (inspected == 0) {
+                    connectionError = linuxNetReadNativeU32(error, 0)
+                } else connectionError = -inspected
+                error.close()
+                errorLength.close()
+                ready = connectionError == 0
+            }
         }
         if (ready) {
             // Clear O_NONBLOCK after the bounded connection phase.
             linuxSyscall3(72, descriptor, 4, 0)
         } else {
             linuxTcpCloseDescriptor(descriptor)
-            descriptor = -1
+            descriptor = if (connectionError > 0) -connectionError else -1
+        }
+    }
+    TcpConnection(descriptor)
+}
+
+fun tcpConnect(
+    address: Ipv4SocketAddress,
+    timeoutMilliseconds: int = 5000
+): TcpConnection = tcpConnectIpv4(
+    address.address, address.port, timeoutMilliseconds
+)
+
+fun tcpConnectIpv6(
+    address: Ipv6SocketAddress,
+    timeoutMilliseconds: int = 5000
+): TcpConnection {
+    var descriptor = -22
+    if (address.isValid() && timeoutMilliseconds > 0 &&
+        timeoutMilliseconds <= 10000) {
+        descriptor = linuxSyscall3(41, 10, 526337, 0)
+    }
+    if (descriptor >= 0) {
+        val socketAddress = nativeByteBuffer(28)
+        linuxNetWriteIpv6Address(socketAddress, address)
+        val connected = linuxSyscall3(
+            42,
+            descriptor,
+            nativePointerAddress(socketAddress.address),
+            28
+        )
+        socketAddress.close()
+        var ready = connected == 0
+        var connectionError = 0
+        if (connected == -115) {
+            val readiness = linuxPollSocket(
+                descriptor, false, true, timeoutMilliseconds
+            )
+            ready = readiness.writable && !readiness.failed()
+            if (ready) {
+                val error = nativeByteBuffer(8)
+                val errorLength = nativeByteBuffer(8)
+                linuxNetStoreU32(errorLength, 0, 4)
+                val inspected = linuxSyscall5(
+                    55,
+                    descriptor,
+                    1,
+                    4,
+                    nativePointerAddress(error.address),
+                    nativePointerAddress(errorLength.address)
+                )
+                if (inspected == 0) {
+                    connectionError = linuxNetReadNativeU32(error, 0)
+                } else connectionError = -inspected
+                error.close()
+                errorLength.close()
+                ready = connectionError == 0
+            }
+        }
+        if (ready) linuxSyscall3(72, descriptor, 4, 0)
+        else {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = if (connectionError > 0) -connectionError else -1
         }
     }
     TcpConnection(descriptor)
@@ -157,9 +729,28 @@ fun TcpConnection.readWithTimeout(
     result
 }
 
-fun tcpListen(port: int, backlog: int = 128): TcpListener {
+fun TcpConnection.readWithTimeoutResult(
+    maximum: int,
+    timeoutMilliseconds: int
+): SocketReadResult {
+    val readiness = this.poll(timeoutMilliseconds)
+    var result = SocketReadResult("", "error", readiness.errorCode)
+    if (readiness.timedOut) result = SocketReadResult("", "timeout", 0)
+    else if (readiness.readable || readiness.closed) {
+        result = this.readResult(maximum)
+    }
+    result
+}
+
+fun tcpListenAddress(
+    socketAddress: Ipv4SocketAddress,
+    backlog: int = 128
+): TcpListener {
     // AF_INET=2, SOCK_STREAM=1, SOCK_CLOEXEC=0x80000.
-    var descriptor = linuxSyscall3(41, 2, 524289, 0)
+    var descriptor = -22
+    if (socketAddress.isValid() && backlog > 0 && backlog <= 4096) {
+        descriptor = linuxSyscall3(41, 2, 524289, 0)
+    }
     if (descriptor >= 0) {
         val enabled = nativeByteBuffer(8)
         linuxNetStoreU32(enabled, 0, 1)
@@ -174,9 +765,91 @@ fun tcpListen(port: int, backlog: int = 128): TcpListener {
         enabled.close()
 
         val address = nativeByteBuffer(16)
-        // sockaddr_in is native-endian for the family and network-endian for
-        // the port/address. INADDR_ANY preserves the portable facade's server
-        // behavior; applications can add an address-selecting overload later.
+        val encoded = linuxNetWriteIpv4Address(address, socketAddress)
+        var bound = -22
+        if (encoded) bound = linuxSyscall3(
+                49,
+                descriptor,
+                nativePointerAddress(address.address),
+                16
+            )
+        address.close()
+        if (bound < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = bound
+        }
+    }
+    if (descriptor >= 0) {
+        val listening = linuxSyscall2(50, descriptor, backlog)
+        if (listening < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = listening
+        }
+    }
+    TcpListener(descriptor)
+}
+
+fun tcpListenIpv6(
+    socketAddress: Ipv6SocketAddress,
+    backlog: int = 128,
+    dualStack: bool = true
+): TcpListener {
+    var descriptor = -22
+    if (socketAddress.isValid() && backlog > 0 && backlog <= 4096) {
+        descriptor = linuxSyscall3(41, 10, 524289, 0)
+    }
+    if (descriptor >= 0) {
+        val enabled = nativeByteBuffer(8)
+        linuxNetStoreU32(enabled, 0, 1)
+        linuxSyscall5(
+            54, descriptor, 1, 2,
+            nativePointerAddress(enabled.address), 4
+        )
+        linuxNetStoreU32(enabled, 0, if (dualStack) 0 else 1)
+        linuxSyscall5(
+            54, descriptor, 41, 26,
+            nativePointerAddress(enabled.address), 4
+        )
+        enabled.close()
+        val address = nativeByteBuffer(28)
+        linuxNetWriteIpv6Address(address, socketAddress)
+        val bound = linuxSyscall3(
+            49,
+            descriptor,
+            nativePointerAddress(address.address),
+            28
+        )
+        address.close()
+        if (bound < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = bound
+        }
+    }
+    if (descriptor >= 0) {
+        val listening = linuxSyscall2(50, descriptor, backlog)
+        if (listening < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = listening
+        }
+    }
+    TcpListener(descriptor)
+}
+
+fun tcpListen(port: int, backlog: int = 128): TcpListener {
+    var descriptor = linuxSyscall3(41, 2, 524289, 0)
+    if (descriptor >= 0) {
+        val enabled = nativeByteBuffer(8)
+        linuxNetStoreU32(enabled, 0, 1)
+        linuxSyscall5(
+            54,
+            descriptor,
+            1,
+            2,
+            nativePointerAddress(enabled.address),
+            4
+        )
+        enabled.close()
+        val address = nativeByteBuffer(16)
         linuxNetStoreU16(address, 0, 2)
         address.store(2, port / 256)
         address.store(3, port - (port / 256) * 256)
@@ -206,12 +879,12 @@ fun tcpListen(port: int, backlog: int = 128): TcpListener {
     TcpListener(descriptor)
 }
 
-fun TcpListener.accept(): TcpConnection {
+fun linuxTcpAcceptDescriptor(listenerDescriptor: int): int {
     var descriptor = -1
-    if (this.descriptor >= 0) {
+    if (listenerDescriptor >= 0) {
         descriptor = linuxSyscall4(
             288,
-            this.descriptor,
+            listenerDescriptor,
             0,
             0,
             524288
@@ -219,15 +892,41 @@ fun TcpListener.accept(): TcpConnection {
         while (descriptor == -4) {
             descriptor = linuxSyscall4(
                 288,
-                this.descriptor,
+                listenerDescriptor,
                 0,
                 0,
                 524288
             )
         }
     }
-    TcpConnection(descriptor)
+    descriptor
 }
+
+fun TcpListener.accept(): TcpConnection =
+    TcpConnection(linuxTcpAcceptDescriptor(this.descriptor))
+
+fun linuxSocketAddress(
+    descriptor: int,
+    peer: bool
+): Ipv4SocketAddress {
+    val address = nativeByteBuffer(16)
+    val length = nativeByteBuffer(8)
+    linuxNetStoreU32(length, 0, 16)
+    val status = linuxSyscall3(
+        if (peer) 52 else 51,
+        descriptor,
+        nativePointerAddress(address.address),
+        nativePointerAddress(length.address)
+    )
+    var result = Ipv4SocketAddress("", -1)
+    if (status == 0) result = linuxNetReadIpv4Address(address)
+    address.close()
+    length.close()
+    result
+}
+
+fun TcpListener.localAddress(): Ipv4SocketAddress =
+    linuxSocketAddress(this.descriptor, false)
 
 fun TcpListener.localPort(): int {
     val address = nativeByteBuffer(16)
@@ -246,9 +945,111 @@ fun TcpListener.localPort(): int {
     port
 }
 
-fun TcpListener.close(): bool =
-    linuxTcpCloseDescriptor(this.descriptor)
+fun TcpConnection.localAddress(): Ipv4SocketAddress =
+    linuxSocketAddress(this.descriptor, false)
 
+fun TcpConnection.peerAddress(): Ipv4SocketAddress =
+    linuxSocketAddress(this.descriptor, true)
+
+fun linuxSocketAddressIpv6(
+    descriptor: int,
+    peer: bool
+): Ipv6SocketAddress {
+    val address = nativeByteBuffer(28)
+    val length = nativeByteBuffer(8)
+    linuxNetStoreU32(length, 0, 28)
+    val status = linuxSyscall3(
+        if (peer) 52 else 51,
+        descriptor,
+        nativePointerAddress(address.address),
+        nativePointerAddress(length.address)
+    )
+    var result = Ipv6SocketAddress("", -1, 0)
+    if (status == 0 && linuxNetReadNativeU16(address, 0) == 10) {
+        result = linuxNetReadIpv6Address(address)
+    }
+    address.close()
+    length.close()
+    result
+}
+
+fun TcpListener.localAddressIpv6(): Ipv6SocketAddress =
+    linuxSocketAddressIpv6(this.descriptor, false)
+
+fun TcpConnection.localAddressIpv6(): Ipv6SocketAddress =
+    linuxSocketAddressIpv6(this.descriptor, false)
+
+fun TcpConnection.peerAddressIpv6(): Ipv6SocketAddress =
+    linuxSocketAddressIpv6(this.descriptor, true)
+
+fun linuxSocketSetNonblocking(descriptor: int, enabled: bool): bool {
+    var succeeded = descriptor >= 0
+    var flags = -1
+    if (succeeded) flags = linuxSyscall3(72, descriptor, 3, 0)
+    if (flags < 0) succeeded = false
+    if (succeeded) {
+        val next = if (enabled) flags | 2048 else flags & -2049
+        succeeded = linuxSyscall3(72, descriptor, 4, next) == 0
+    }
+    succeeded
+}
+
+fun TcpListener.setNonblocking(enabled: bool = true): bool =
+    linuxSocketSetNonblocking(this.descriptor, enabled)
+
+fun TcpConnection.setNonblocking(enabled: bool = true): bool =
+    linuxSocketSetNonblocking(this.descriptor, enabled)
+
+fun UdpSocket.setNonblocking(enabled: bool = true): bool =
+    linuxSocketSetNonblocking(this.descriptor, enabled)
+
+fun TcpListener.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = linuxTcpCloseDescriptor(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
+
+fun TcpConnection.readResult(maximum: int = 65536): SocketReadResult {
+    var result = SocketReadResult("", "error", 22)
+    if (this.descriptor < 0) {
+        result = SocketReadResult(
+            "", "error", if (this.descriptor < -1) -this.descriptor else 9
+        )
+    } else if (maximum > 0 && maximum <= 1048576) {
+        val buffer = nativeByteBuffer(maximum + 1)
+        var measured = linuxSyscall3(
+            0,
+            this.descriptor,
+            nativePointerAddress(buffer.address),
+            maximum
+        )
+        while (measured == -4) {
+            measured = linuxSyscall3(
+                0,
+                this.descriptor,
+                nativePointerAddress(buffer.address),
+                maximum
+            )
+        }
+        if (measured > 0) {
+            result = SocketReadResult(
+                buffer.adoptString(measured), "data", 0
+            )
+        } else {
+            buffer.close()
+            if (measured == 0) result = SocketReadResult("", "eof", 0)
+            else result = SocketReadResult("", "error", -measured)
+        }
+    }
+    result
+}
+
+// Keep the compatibility fast path allocation-free. Besides being cheaper for
+// HTTP, this lets syscall-only servers remain free of hosted capability
+// symbols. Call readResult when EOF/error distinction is required.
 fun TcpConnection.read(maximum: int = 65536): string {
     val buffer = nativeByteBuffer(maximum + 1)
     var measured = linuxSyscall3(
@@ -271,10 +1072,32 @@ fun TcpConnection.read(maximum: int = 65536): string {
     result
 }
 
+fun TcpConnection.writeResult(contents: string): SocketWriteResult {
+    val address = nativeCStringAddress(contents)
+    var written = 0
+    var errorCode = if (this.descriptor >= 0) 0 else 9
+    while (errorCode == 0 && written < contents.size) {
+        val amount = linuxSyscall6(
+            44,
+            this.descriptor,
+            address + written,
+            contents.size - written,
+            16384,
+            0,
+            0
+        )
+        if (amount > 0) written = written + amount
+        if (amount == 0) errorCode = 5
+        if (amount < 0 && amount != -4) errorCode = -amount
+    }
+    if (errorCode == 0) SocketWriteResult(written, "written", 0)
+    else SocketWriteResult(written, "error", errorCode)
+}
+
 fun TcpConnection.write(contents: string): int {
     val address = nativeCStringAddress(contents)
     var written = 0
-    var failed = false
+    var failed = this.descriptor < 0
     while (!failed && written < contents.size) {
         val amount = linuxSyscall6(
             44,
@@ -286,13 +1109,355 @@ fun TcpConnection.write(contents: string): int {
             0
         )
         if (amount > 0) written = written + amount
-        if (amount < 0 && amount != -4) failed = true
+        if (amount == 0 || (amount < 0 && amount != -4)) failed = true
     }
     if (failed) -1 else written
 }
 
-fun TcpConnection.close(): bool =
-    linuxTcpCloseDescriptor(this.descriptor)
+fun TcpConnection.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = linuxTcpCloseDescriptor(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
+
+fun udpBind(
+    address: Ipv4SocketAddress,
+    reuseAddress: bool = true
+): UdpSocket {
+    var descriptor = -22
+    if (address.isValid()) descriptor = linuxSyscall3(41, 2, 524290, 0)
+    if (descriptor >= 0 && reuseAddress) {
+        val enabled = nativeByteBuffer(8)
+        linuxNetStoreU32(enabled, 0, 1)
+        val configured = linuxSyscall5(
+            54,
+            descriptor,
+            1,
+            2,
+            nativePointerAddress(enabled.address),
+            4
+        )
+        enabled.close()
+        if (configured < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = configured
+        }
+    }
+    if (descriptor >= 0) {
+        val socketAddress = nativeByteBuffer(16)
+        val encoded = linuxNetWriteIpv4Address(socketAddress, address)
+        var bound = -22
+        if (encoded) bound = linuxSyscall3(
+            49,
+            descriptor,
+            nativePointerAddress(socketAddress.address),
+            16
+        )
+        socketAddress.close()
+        if (bound < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = bound
+        }
+    }
+    UdpSocket(descriptor)
+}
+
+fun udpBindPort(port: int): UdpSocket = udpBind(ipv4Any(port))
+
+fun udpBindIpv6(
+    address: Ipv6SocketAddress,
+    reuseAddress: bool = true,
+    dualStack: bool = true
+): UdpSocket {
+    var descriptor = -22
+    if (address.isValid()) descriptor = linuxSyscall3(41, 10, 524290, 0)
+    if (descriptor >= 0) {
+        val option = nativeByteBuffer(8)
+        if (reuseAddress) {
+            linuxNetStoreU32(option, 0, 1)
+            linuxSyscall5(
+                54, descriptor, 1, 2,
+                nativePointerAddress(option.address), 4
+            )
+        }
+        linuxNetStoreU32(option, 0, if (dualStack) 0 else 1)
+        linuxSyscall5(
+            54, descriptor, 41, 26,
+            nativePointerAddress(option.address), 4
+        )
+        option.close()
+        val socketAddress = nativeByteBuffer(28)
+        linuxNetWriteIpv6Address(socketAddress, address)
+        val bound = linuxSyscall3(
+            49,
+            descriptor,
+            nativePointerAddress(socketAddress.address),
+            28
+        )
+        socketAddress.close()
+        if (bound < 0) {
+            linuxTcpCloseDescriptor(descriptor)
+            descriptor = bound
+        }
+    }
+    UdpSocket(descriptor)
+}
+
+fun udpBindPortIpv6(port: int): UdpSocket = udpBindIpv6(ipv6Any(port))
+
+fun UdpSocket.localAddress(): Ipv4SocketAddress {
+    val address = nativeByteBuffer(16)
+    val length = nativeByteBuffer(8)
+    linuxNetStoreU32(length, 0, 16)
+    val status = linuxSyscall3(
+        51,
+        this.descriptor,
+        nativePointerAddress(address.address),
+        nativePointerAddress(length.address)
+    )
+    var result = Ipv4SocketAddress("", -1)
+    if (status == 0) result = linuxNetReadIpv4Address(address)
+    address.close()
+    length.close()
+    result
+}
+
+fun UdpSocket.localPort(): int = this.localAddress().port
+
+fun UdpSocket.localAddressIpv6(): Ipv6SocketAddress =
+    linuxSocketAddressIpv6(this.descriptor, false)
+
+fun UdpSocket.sendTo(
+    contents: string,
+    destination: Ipv4SocketAddress
+): SocketWriteResult {
+    var written = 0
+    var errorCode = if (this.descriptor >= 0) 0 else 9
+    val address = nativeByteBuffer(16)
+    if (errorCode == 0 && !linuxNetWriteIpv4Address(address, destination)) {
+        errorCode = 22
+    }
+    if (errorCode == 0) {
+        val source = nativeCStringAddress(contents)
+        var measured = linuxSyscall6(
+            44,
+            this.descriptor,
+            source,
+            contents.size,
+            16384,
+            nativePointerAddress(address.address),
+            16
+        )
+        while (measured == -4) {
+            measured = linuxSyscall6(
+                44,
+                this.descriptor,
+                source,
+                contents.size,
+                16384,
+                nativePointerAddress(address.address),
+                16
+            )
+        }
+        if (measured >= 0) written = measured
+        else errorCode = -measured
+    }
+    address.close()
+    if (errorCode == 0) SocketWriteResult(written, "written", 0)
+    else SocketWriteResult(written, "error", errorCode)
+}
+
+fun UdpSocket.sendToIpv6(
+    contents: string,
+    destination: Ipv6SocketAddress
+): SocketWriteResult {
+    var written = 0
+    var errorCode = if (this.descriptor >= 0) 0 else 9
+    val address = nativeByteBuffer(28)
+    if (errorCode == 0 && !linuxNetWriteIpv6Address(address, destination)) {
+        errorCode = 22
+    }
+    if (errorCode == 0) {
+        var measured = linuxSyscall6(
+            44,
+            this.descriptor,
+            nativeCStringAddress(contents),
+            contents.size,
+            16384,
+            nativePointerAddress(address.address),
+            28
+        )
+        while (measured == -4) {
+            measured = linuxSyscall6(
+                44,
+                this.descriptor,
+                nativeCStringAddress(contents),
+                contents.size,
+                16384,
+                nativePointerAddress(address.address),
+                28
+            )
+        }
+        if (measured >= 0) written = measured
+        else errorCode = -measured
+    }
+    address.close()
+    if (errorCode == 0) SocketWriteResult(written, "written", 0)
+    else SocketWriteResult(written, "error", errorCode)
+}
+
+fun UdpSocket.receiveFromIpv6(maximum: int = 65507): UdpDatagramIpv6 {
+    var result = UdpDatagramIpv6(
+        "", Ipv6SocketAddress("", -1, 0), false, false, false, 22
+    )
+    if (this.descriptor >= 0 && maximum > 0 && maximum <= 65507) {
+        val buffer = nativeByteBuffer(maximum + 1)
+        val source = nativeByteBuffer(28)
+        val sourceLength = nativeByteBuffer(8)
+        linuxNetStoreU32(sourceLength, 0, 28)
+        var measured = linuxSyscall6(
+            45,
+            this.descriptor,
+            nativePointerAddress(buffer.address),
+            maximum,
+            0,
+            nativePointerAddress(source.address),
+            nativePointerAddress(sourceLength.address)
+        )
+        while (measured == -4) {
+            measured = linuxSyscall6(
+                45,
+                this.descriptor,
+                nativePointerAddress(buffer.address),
+                maximum,
+                0,
+                nativePointerAddress(source.address),
+                nativePointerAddress(sourceLength.address)
+            )
+        }
+        if (measured >= 0) {
+            val ipv6 = linuxNetReadIpv6Address(source)
+            result = UdpDatagramIpv6(
+                buffer.adoptString(measured),
+                ipv6,
+                true, false, measured == maximum, 0
+            )
+        } else {
+            buffer.close()
+            result = UdpDatagramIpv6(
+                "", Ipv6SocketAddress("", -1, 0), false, false, false,
+                -measured
+            )
+        }
+        source.close()
+        sourceLength.close()
+    }
+    result
+}
+
+fun UdpSocket.receiveFrom(maximum: int = 65507): UdpDatagram {
+    var result = UdpDatagram(
+        "", Ipv4SocketAddress("", -1), false, false, false, 22
+    )
+    if (this.descriptor < 0) {
+        result = UdpDatagram(
+            "", Ipv4SocketAddress("", -1), false, false, false, 9
+        )
+    } else if (maximum > 0 && maximum <= 65535) {
+        val buffer = nativeByteBuffer(maximum + 1)
+        val source = nativeByteBuffer(16)
+        val sourceLength = nativeByteBuffer(8)
+        linuxNetStoreU32(sourceLength, 0, 16)
+        var measured = linuxSyscall6(
+            45,
+            this.descriptor,
+            nativePointerAddress(buffer.address),
+            maximum,
+            32,
+            nativePointerAddress(source.address),
+            nativePointerAddress(sourceLength.address)
+        )
+        while (measured == -4) {
+            measured = linuxSyscall6(
+                45,
+                this.descriptor,
+                nativePointerAddress(buffer.address),
+                maximum,
+                32,
+                nativePointerAddress(source.address),
+                nativePointerAddress(sourceLength.address)
+            )
+        }
+        if (measured >= 0) {
+            var body = ""
+            var copied = measured
+            if (copied > maximum) copied = maximum
+            if (copied > 0) body = buffer.adoptString(copied)
+            else buffer.close()
+            result = UdpDatagram(
+                body,
+                linuxNetReadIpv4Address(source),
+                true,
+                false,
+                measured > maximum,
+                0
+            )
+        } else {
+            buffer.close()
+            result = UdpDatagram(
+                "", Ipv4SocketAddress("", -1), false, false, false,
+                -measured
+            )
+        }
+        source.close()
+        sourceLength.close()
+    }
+    result
+}
+
+fun UdpSocket.receiveFromWithTimeout(
+    maximum: int = 65507,
+    timeoutMilliseconds: int = 5000
+): UdpDatagram {
+    val readiness = this.poll(timeoutMilliseconds)
+    var result = UdpDatagram(
+        "", Ipv4SocketAddress("", -1), false, false, false,
+        readiness.errorCode
+    )
+    if (readiness.timedOut) result = UdpDatagram(
+        "", Ipv4SocketAddress("", -1), false, true, false, 0
+    )
+    else if (readiness.readable) result = this.receiveFrom(maximum)
+    result
+}
+
+fun UdpSocket.receiveFromIpv6WithTimeout(
+    maximum: int = 65507,
+    timeoutMilliseconds: int = 5000
+): UdpDatagramIpv6 {
+    val readiness = this.poll(timeoutMilliseconds)
+    var result = UdpDatagramIpv6(
+        "", Ipv6SocketAddress("", -1, 0), false, false, false,
+        readiness.errorCode
+    )
+    if (readiness.timedOut) result = UdpDatagramIpv6(
+        "", Ipv6SocketAddress("", -1, 0), false, true, false, 0
+    )
+    else if (readiness.readable) result = this.receiveFromIpv6(maximum)
+    result
+}
+
+fun UdpSocket.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = linuxTcpCloseDescriptor(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
 
 fun tcpEnableGracefulShutdown(): bool {
     var success = linuxTcpShutdownDescriptor >= 0

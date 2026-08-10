@@ -5,6 +5,7 @@ import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/platform/host"
 import "abla/llvm/orc"
+import "abla/unsafe/memory"
 
 class BootstrapTargetDescriptor(
     val name: string,
@@ -402,6 +403,66 @@ fun bootstrapLlvmUserFunctionSymbols(llvm: string): array<string> {
         } else offset = offset + 1
     }
     symbols
+}
+
+// ELF linkers can discard unused functions only when code generation places
+// them in independent sections. Keep this transformation target-aware and
+// bounded: thousands of sections materially increase LLVM's peak memory, and
+// large release modules already use the partitioned/global-DCE path. Mach-O
+// explicit sections require a segment/section pair and Wasm has a different
+// section model, so the platform-neutral backend must not bake in ELF names.
+fun bootstrapAddLlvmElfFunctionSections(llvm: string): string {
+    val prefix = "define hidden void @abla_fn_"
+    val insertionOffsets: array<int> = []
+    val insertionNames: array<string> = []
+    var extraBytes = 0
+    var offset = 0
+    while (offset + prefix.size < llvm.size) {
+        if (llvm.slice(offset, offset + prefix.size) == prefix) {
+            val nameBegin = offset + 20
+            var nameEnd = nameBegin
+            while (nameEnd < llvm.size && llvm[nameEnd] != 40 &&
+                   llvm[nameEnd] != 32 && llvm[nameEnd] != 10 &&
+                   llvm[nameEnd] != 13) nameEnd = nameEnd + 1
+            var body = nameEnd
+            while (body < llvm.size && llvm[body] != 123 &&
+                   llvm[body] != 10 && llvm[body] != 13) body = body + 1
+            if (nameEnd > nameBegin && body < llvm.size &&
+                llvm[body] == 123) {
+                val name = llvm.slice(nameBegin, nameEnd)
+                insertionOffsets.append(body)
+                insertionNames.append(name)
+                extraBytes = extraBytes + 17 + name.size
+            }
+            offset = if (body > offset) body else nameEnd
+        } else offset = offset + 1
+    }
+    val output = nativeByteBuffer(llvm.size + extraBytes + 1)
+    var valid = !pointerIsNull(output.address)
+    var source = 0
+    var destination = 0
+    var insertion = 0
+    while (valid && source < llvm.size) {
+        if (insertion < insertionOffsets.size &&
+            source == insertionOffsets[insertion]) {
+            val section =
+                "section \".text.${insertionNames[insertion]}\" "
+            var byte = 0
+            while (valid && byte < section.size) {
+                valid = output.store(destination, section[byte])
+                destination = destination + 1
+                byte = byte + 1
+            }
+            insertion = insertion + 1
+        }
+        if (valid) valid = output.store(destination, llvm[source])
+        destination = destination + 1
+        source = source + 1
+    }
+    var result = ""
+    if (valid) result = output.adoptString(destination)
+    else output.close()
+    result
 }
 
 fun bootstrapExtractLlvmFunctions(
@@ -906,12 +967,16 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 )
                 status = 154
                 failureKind = "reported"
-            } else if (Path(llvmPath).writeTextAtomic(
-                compilation.output
-            )) status = 0
-            else {
-                status = 145
-                failureKind = "io"
+            } else {
+                val emitted = if (target.objectFormat == "elf" &&
+                    compilation.output.size <= 4194304) {
+                    bootstrapAddLlvmElfFunctionSections(compilation.output)
+                } else compilation.output
+                if (Path(llvmPath).writeTextAtomic(emitted)) status = 0
+                else {
+                    status = 145
+                    failureKind = "io"
+                }
             }
             if (status == 0 && allowCache && compileInputsCacheable &&
                 target.hosted &&

@@ -168,6 +168,14 @@ under `build/`.
   action into a generated click client and a separately compiled native server.
 - [Versioned HTTP server](examples/versioned-http-server.ab) demonstrates
   header-selected endpoint versions on the hosted server stack.
+- [WebSocket echo server](examples/websocket-echo-server.ab) demonstrates
+  routed upgrades, bounded messages, ping/pong, and graceful close handling.
+- [Event HTTP server](examples/event-http-server.ab) demonstrates the bounded
+  persistent-connection manager and output backpressure path.
+- [HTTPS client](examples/https-client.ab) demonstrates certificate-verified
+  TLS with transparent HTTP response framing.
+- [UDP echo](examples/udp-echo-once.ab) demonstrates bounded datagrams and
+  source-address replies.
 
 ## Project principles
 
@@ -188,6 +196,7 @@ under `build/`.
 - [Compiler extension API](docs/compiler-api.md)
 - [Programmable builds](docs/programmable-builds.md)
 - [Package imports](docs/packages.md)
+- [Networking, UDP, WebSockets, and realtime RPC](docs/networking.md)
 - [Bootstrap and trust model](docs/bootstrap.md)
 - [Self-hosting status](docs/self-hosting.md)
 - [Standard library](docs/standard-library.md)

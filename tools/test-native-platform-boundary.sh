@@ -28,11 +28,11 @@ rg -q '^declare .*@abla_runtime_set_arguments' \
 [[ -s $pure_output.o ]]
 [[ ! -e $pure_output.value-runtime.o ]]
 [[ ! -e $pure_output.host.o ]]
-if nm -u "$pure_output.o" | awk '{print $2}' | rg -q '^abla_'; then
+if nm -u "$pure_output.o" | awk '{print $2}' | rg '^abla_' >/dev/null; then
     echo 'packaging object retained unresolved Abla runtime symbols' >&2
     exit 1
 fi
-if nm -u "$pure_output.o" | awk '{print $2}' | rg -q '^__longjmp_chk$'; then
+if nm -u "$pure_output.o" | awk '{print $2}' | rg '^__longjmp_chk$' >/dev/null; then
     echo 'packaging object retained a glibc-only fortified symbol' >&2
     exit 1
 fi
@@ -45,7 +45,7 @@ relinked_status=$?
 set -e
 [[ $relinked_status -eq 42 ]]
 nm --defined-only "$pure_output" | awk '{print $3}' |
-    rg -q '^abla_platform_alloc$'
+    rg '^abla_platform_alloc$' >/dev/null
 set +e
 ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$pure_output"

@@ -1,0 +1,72 @@
+import "abla/bytes"
+import "abla/crypto"
+import "abla/http"
+import "abla/json"
+import "abla/websocket"
+import "abla/websocket/rpc"
+
+fun webSocketTestEcho(parameters: Json): Json = parameters
+
+fun webSocketTestRequest(): HttpRequest = httpParseRequest(
+    "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+)
+
+fun main: int {
+    val key = cryptoByteString([55, 250, 33, 61])
+    val masked = webSocketEncodeFrame("Hello", 1, true, key)
+    val decoded = webSocketDecodeFrame(masked, 1024, true)
+    val partial = webSocketDecodeFrame(masked.slice(0, 4), 1024, true)
+    var longPayload = ""
+    var index = 0
+    while (index < 130) {
+        longPayload = "${longPayload}x"
+        index = index + 1
+    }
+    val extended = webSocketEncodeFrame(longPayload)
+    val extendedDecoded = webSocketDecodeFrame(extended, 1024)
+    val request = webSocketTestRequest()
+    val upgrade = webSocketUpgradeResponse(request)
+    val rendered = upgrade.render()
+    val invalidUtf8 = "${byteEncode(192)}${byteEncode(128)}"
+    val rpc = webSocketRpcRouter()
+    rpc.route("echo", webSocketTestEcho)
+    val rpcResponse = rpc.dispatch(jsonObject(
+        ["id", "method", "params"],
+        [jsonString("request-1"), jsonString("echo"), jsonString("hello")]
+    ))
+    val rpcMissing = rpc.dispatch(jsonObject(
+        ["id", "method"],
+        [jsonInteger(2), jsonString("missing")]
+    ))
+    val invalidClose = webSocketDecodeFrame(webSocketEncodeFrame(
+        cryptoByteString([3, 237]), 8
+    ))
+
+    if (webSocketAccept("dGhlIHNhbXBsZSBub25jZQ==") !=
+        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") 1
+    else if (!webSocketIsUpgradeRequest(request) || upgrade.status != 101 ||
+        upgrade.header("Sec-WebSocket-Accept") !=
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") 2
+    else if (rendered !=
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n") 3
+    else if (hexEncode(webSocketEncodeFrame("Hello")) !=
+        "810548656c6c6f") 4
+    else if (hexEncode(masked) != "818537fa213d7f9f4d5158" ||
+        !decoded.succeeded() || decoded.frame.payload != "Hello" ||
+        !decoded.frame.masked || decoded.consumed != masked.size) 5
+    else if (partial.complete || partial.error != "") 6
+    else if (!extendedDecoded.succeeded() ||
+        extendedDecoded.frame.payload != longPayload ||
+        extendedDecoded.consumed != extended.size) 7
+    else if (webSocketEncodeFrame("bad", 9, false) != "" ||
+        webSocketEncodeFrame(longPayload, 9) != "") 8
+    else if (!webSocketUtf8Valid("hello") ||
+        !webSocketUtf8Valid("\u{20ac}") || webSocketUtf8Valid(invalidUtf8)) 9
+    else if (webSocketDecodeFrame("${byteEncode(193)}\u{0}", 10).error ==
+        "") 10
+    else if (jsonStringify(rpcResponse) !=
+        "{\"id\":\"request-1\",\"result\":\"hello\"}" ||
+        rpcMissing.get("error").getString("code") != "method_not_found") 11
+    else if (invalidClose.error != "invalid close code") 12
+    else 42
+}

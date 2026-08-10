@@ -15,7 +15,7 @@ mkdir -p "$output_directory"
 "$compiler" build "$project_root/tests/cases/modules/linux-sleep.ab" \
     -o "$program"
 if nm --defined-only "$program" | awk '{print $3}' |
-    rg -q '^ablaHost|^abla_host_|^abla_platform_'; then
+    rg '^ablaHost|^abla_host_|^abla_platform_' >/dev/null; then
     echo 'raw Linux sleep linked a project C platform symbol' >&2
     exit 1
 fi

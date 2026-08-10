@@ -1,0 +1,56 @@
+import "abla/bytes"
+import "abla/crypto"
+import "abla/http"
+import "abla/net"
+import "abla/websocket"
+
+var webSocketTestPort = 0
+var webSocketServerValid = false
+
+fun webSocketLiveClient(): int {
+    val connection = tcpConnect(ipv4Loopback(webSocketTestPort), 1000)
+    if (connection.descriptor < 0) return 1
+    val request =
+        "GET /socket/demo HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    if (connection.write(request) != request.size) return 2
+    val responseBytes = connection.readWithTimeoutResult(4096, 1000)
+    if (!responseBytes.hasData() ||
+        httpParseResponse(responseBytes.bytes).response.status != 101) return 3
+
+    val mask = cryptoByteString([55, 250, 33, 61])
+    val socket = webSocketConnection(move(connection), false, mask)
+    if (!socket.sendPing("probe")) return 4
+    if (!socket.sendFrame("hel", 1, false)) return 5
+    if (!socket.sendFrame("lo", 0, true)) return 6
+    val pong = socket.readFrame(1024, 1000)
+    val message = socket.readMessage(1024, 1000)
+    val closed = socket.readFrame(1024, 1000)
+    if (pong.available && pong.frame.opcode == 10 &&
+        pong.frame.payload == "probe" && message.available &&
+        message.kind == "text" && message.payload == "world" &&
+        closed.available && closed.frame.opcode == 8) 0 else 7
+}
+
+fun webSocketLiveHandler(
+    request: HttpRequest,
+    var socket: WebSocketConnection
+): void {
+    val message = socket.readMessage(1024, 1000)
+    webSocketServerValid = request.parameter("room") == "demo" &&
+        message.available && message.kind == "text" &&
+        message.payload == "hello" && socket.sendText("world") &&
+        socket.close(1000, "done")
+    return
+}
+
+fun main: int {
+    val listener = tcpListenAddress(ipv4Loopback(0))
+    webSocketTestPort = listener.localPort()
+    val client = thread { webSocketLiveClient() }
+    val router = webSocketRouter()
+    router.route("/socket/:room", webSocketLiveHandler)
+    val handled = serveWebSocketOnce(router, listener, 4096, 1024)
+    val clientStatus = await client
+    listener.close()
+    if (handled && webSocketServerValid && clientStatus == 0) 42 else 1
+}

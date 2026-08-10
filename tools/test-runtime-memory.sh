@@ -41,7 +41,7 @@ rg -Fq 'call void @abla_runtime_memory_pressure()' \
 [[ -s $program.o ]]
 [[ ! -e $program.value-runtime.o ]]
 [[ ! -e $program.host.o ]]
-if nm -u "$program.o" | awk '{print $2}' | rg -q '^abla_'; then
+if nm -u "$program.o" | awk '{print $2}' | rg '^abla_' >/dev/null; then
     echo 'packaging object retained unresolved Abla runtime symbols' >&2
     exit 1
 fi

@@ -1,0 +1,261 @@
+// Portable hosted TCP/UDP and readiness adapter. Linux uses epoll; macOS uses
+// kqueue behind the narrow host ABI. Applications keep descriptors affine.
+
+import "abla/platform/host"
+
+class HostedSocketReadResult(
+    val bytes: string,
+    val status: string,
+    val errorCode: int
+) {
+    fun hasData(): bool = this.status == "data"
+    fun reachedEof(): bool = this.status == "eof"
+    fun wouldBlock(): bool = this.status == "would-block"
+    fun failed(): bool = this.status == "error"
+}
+
+class HostedSocketWriteResult(
+    val written: int,
+    val wouldBlock: bool,
+    val errorCode: int
+) {
+    fun succeeded(): bool = this.written >= 0
+    fun failed(): bool = this.written < 0 && !this.wouldBlock
+}
+
+class HostedSocketEvent(
+    val descriptor: int,
+    val readable: bool,
+    val writable: bool,
+    val closed: bool,
+    val error: bool
+)
+
+class HostedSocketEvents(
+    val events: array<HostedSocketEvent>,
+    val timedOut: bool,
+    val errorCode: int
+) {
+    fun failed(): bool = this.errorCode != 0
+}
+
+class HostedUdpDatagram(
+    val bytes: string,
+    val sourceAddress: string,
+    val sourcePort: int,
+    val received: bool,
+    val wouldBlock: bool,
+    val errorCode: int
+)
+
+resource class HostedTcpListener(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) ablaHostNetClose(this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+
+resource class HostedTcpConnection(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) ablaHostNetClose(this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+
+resource class HostedUdpSocket(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) ablaHostNetClose(this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+
+resource class HostedSocketPoller(var descriptor: int) {
+    fun drop(): void {
+        if (this.descriptor >= 0) ablaHostNetClose(this.descriptor)
+        this.descriptor = -1
+        return
+    }
+}
+
+fun hostedTcpConnect(
+    host: string,
+    port: int,
+    timeoutMilliseconds: int = 5000
+): HostedTcpConnection = HostedTcpConnection(
+    ablaHostNetConnect(host, port, timeoutMilliseconds)
+)
+
+fun hostedTcpListen(
+    host: string = "::",
+    port: int = 0,
+    backlog: int = 128,
+    dualStack: bool = true
+): HostedTcpListener = HostedTcpListener(
+    ablaHostNetListen(host, port, backlog, dualStack)
+)
+
+fun HostedTcpListener.accept(): HostedTcpConnection =
+    HostedTcpConnection(ablaHostNetAccept(this.descriptor))
+
+fun HostedTcpListener.localPort(): int =
+    ablaHostNetLocalPort(this.descriptor)
+
+fun HostedTcpListener.setNonblocking(enabled: bool = true): bool =
+    ablaHostNetSetNonblocking(this.descriptor, enabled)
+
+fun HostedTcpConnection.setNonblocking(enabled: bool = true): bool =
+    ablaHostNetSetNonblocking(this.descriptor, enabled)
+
+fun hostedReadResult(descriptor: int, maximum: int): HostedSocketReadResult {
+    val bytes = ablaHostNetRead(descriptor, maximum)
+    val state = ablaHostNetStatus()
+    val error = ablaHostNetError()
+    var status = "error"
+    if (state == 0) status = "data"
+    if (state == 1) status = "eof"
+    if (state == 2) status = "would-block"
+    HostedSocketReadResult(bytes, status, error)
+}
+
+fun HostedTcpConnection.readResult(
+    maximum: int = 65536
+): HostedSocketReadResult = hostedReadResult(this.descriptor, maximum)
+
+fun HostedTcpConnection.writeResult(
+    contents: string
+): HostedSocketWriteResult {
+    val written = ablaHostNetWrite(this.descriptor, contents)
+    val error = if (written < 0) -written else 0
+    HostedSocketWriteResult(
+        written,
+        error == 11 || error == 35,
+        error
+    )
+}
+
+fun HostedTcpConnection.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = ablaHostNetClose(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
+
+fun HostedTcpListener.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = ablaHostNetClose(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
+
+fun hostedUdpBind(
+    host: string = "::",
+    port: int = 0,
+    dualStack: bool = true
+): HostedUdpSocket = HostedUdpSocket(
+    ablaHostNetUdpBind(host, port, dualStack)
+)
+
+fun HostedUdpSocket.localPort(): int =
+    ablaHostNetLocalPort(this.descriptor)
+
+fun HostedUdpSocket.setNonblocking(enabled: bool = true): bool =
+    ablaHostNetSetNonblocking(this.descriptor, enabled)
+
+fun HostedUdpSocket.sendTo(
+    contents: string,
+    host: string,
+    port: int
+): int = ablaHostNetUdpSend(this.descriptor, host, port, contents)
+
+fun HostedUdpSocket.receiveFrom(
+    maximum: int = 65535
+): HostedUdpDatagram {
+    val bytes = ablaHostNetUdpReceive(this.descriptor, maximum)
+    val state = ablaHostNetStatus()
+    val error = ablaHostNetError()
+    HostedUdpDatagram(
+        bytes,
+        ablaHostNetSourceAddress(),
+        ablaHostNetSourcePort(),
+        state == 0,
+        state == 2,
+        error
+    )
+}
+
+fun HostedUdpSocket.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = ablaHostNetClose(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}
+
+fun hostedSocketPoller(): HostedSocketPoller =
+    HostedSocketPoller(ablaHostNetPollerCreate())
+
+fun HostedSocketPoller.watchDescriptor(
+    descriptor: int,
+    read: bool = true,
+    write: bool = false
+): bool = ablaHostNetPollerControl(
+    this.descriptor, descriptor, read, write, 0
+)
+
+fun HostedSocketPoller.modifyDescriptor(
+    descriptor: int,
+    read: bool = true,
+    write: bool = false
+): bool = ablaHostNetPollerControl(
+    this.descriptor, descriptor, read, write, 1
+)
+
+fun HostedSocketPoller.unwatchDescriptor(descriptor: int): bool =
+    ablaHostNetPollerControl(
+        this.descriptor, descriptor, false, false, 2
+    )
+
+fun hostedNetReadU32(bytes: string, offset: int): int =
+    bytes[offset] + bytes[offset + 1] * 256 +
+    bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216
+
+fun HostedSocketPoller.wait(
+    maximumEvents: int = 64,
+    timeoutMilliseconds: int = 5000
+): HostedSocketEvents {
+    val encoded = ablaHostNetPollerWait(
+        this.descriptor, maximumEvents, timeoutMilliseconds
+    )
+    val error = ablaHostNetError()
+    val events: array<HostedSocketEvent> = []
+    var offset = 0
+    while (offset + 8 <= encoded.size) {
+        val flags = hostedNetReadU32(encoded, offset + 4)
+        events.append(HostedSocketEvent(
+            hostedNetReadU32(encoded, offset),
+            (flags & 1) != 0,
+            (flags & 2) != 0,
+            (flags & 4) != 0,
+            (flags & 8) != 0
+        ))
+        offset = offset + 8
+    }
+    HostedSocketEvents(events, error == 0 && encoded.size == 0, error)
+}
+
+fun HostedSocketPoller.close(): bool {
+    var closed = this.descriptor < 0
+    if (this.descriptor >= 0) {
+        closed = ablaHostNetClose(this.descriptor)
+        if (closed) this.descriptor = -1
+    }
+    closed
+}

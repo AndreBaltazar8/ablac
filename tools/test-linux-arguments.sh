@@ -17,7 +17,7 @@ mkdir -p "$output_directory"
     -o "$program"
 
 if nm --defined-only "$program" | awk '{print $3}' |
-    rg -q '^ablaHost|^abla_host_|^abla_platform_'; then
+    rg '^ablaHost|^abla_host_|^abla_platform_' >/dev/null; then
     echo 'raw Linux arguments linked a project C platform symbol' >&2
     exit 1
 fi

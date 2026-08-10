@@ -1,0 +1,638 @@
+// RFC 6455 WebSocket handshake, bounded frame codec, and connection lifecycle.
+// The codec is transport-independent; the connection adapter below uses the
+// affine TCP stream from `abla/net` and never exposes its descriptor.
+
+import "abla/bytes"
+import "abla/crypto"
+import "abla/http"
+import "abla/net"
+
+class WebSocketFrame(
+    val final: bool,
+    val opcode: int,
+    val payload: string,
+    val masked: bool
+)
+
+class WebSocketFrameDecode(
+    val frame: WebSocketFrame,
+    val consumed: int,
+    val complete: bool,
+    val error: string
+) {
+    fun succeeded(): bool = this.complete && this.error == ""
+}
+
+class WebSocketReadResult(
+    val frame: WebSocketFrame,
+    val available: bool,
+    val closed: bool,
+    val timedOut: bool,
+    val error: string
+)
+
+class WebSocketMessage(
+    val kind: string,
+    val payload: string,
+    val available: bool,
+    val closed: bool,
+    val timedOut: bool,
+    val error: string
+)
+
+resource class WebSocketConnection(
+    val stream: TcpConnection,
+    var buffered: string,
+    val expectMasked: bool,
+    val outgoingMask: string,
+    var closed: bool,
+    var fragmentedOpcode: int,
+    var fragmentedPayload: string
+)
+
+class WebSocketRoute(
+    val pattern: string,
+    val handler: (HttpRequest, var: WebSocketConnection) -> void
+)
+
+class WebSocketRouter(val routes: array<WebSocketRoute>)
+
+fun webSocketEmptyFrame(): WebSocketFrame =
+    WebSocketFrame(true, 0, "", false)
+
+fun webSocketOpcodeValid(opcode: int): bool =
+    opcode == 0 || opcode == 1 || opcode == 2 || opcode == 8 ||
+    opcode == 9 || opcode == 10
+
+fun webSocketControlOpcode(opcode: int): bool = opcode >= 8
+
+fun webSocketCloseCodeValid(code: int): bool =
+    code == 1000 || code == 1001 || code == 1002 || code == 1003 ||
+    code == 1007 || code == 1008 || code == 1009 || code == 1010 ||
+    code == 1011 || code == 1012 || code == 1013 || code == 1014 ||
+    (code >= 3000 && code <= 4999)
+
+fun webSocketAppendU16(var output: ByteBuffer, value: int): void {
+    output.appendByteValue((value >>> 8) & 255)
+    output.appendByteValue(value & 255)
+    return
+}
+
+fun webSocketAppendU64(var output: ByteBuffer, value: int): void {
+    output.appendByteValue((value >>> 56) & 255)
+    output.appendByteValue((value >>> 48) & 255)
+    output.appendByteValue((value >>> 40) & 255)
+    output.appendByteValue((value >>> 32) & 255)
+    output.appendByteValue((value >>> 24) & 255)
+    output.appendByteValue((value >>> 16) & 255)
+    output.appendByteValue((value >>> 8) & 255)
+    output.appendByteValue(value & 255)
+    return
+}
+
+fun webSocketMask(payload: string, key: string): string {
+    val output = byteBuffer()
+    var index = 0
+    if (key.size == 4) {
+        while (index < payload.size) {
+            val maskIndex = index - index / 4 * 4
+            output.appendByteValue(payload[index] ^ key[maskIndex])
+            index = index + 1
+        }
+    }
+    output.toText()
+}
+
+fun webSocketEncodeFrame(
+    payload: string,
+    opcode: int = 1,
+    final: bool = true,
+    maskingKey: string = ""
+): string {
+    val control = webSocketControlOpcode(opcode)
+    var valid = webSocketOpcodeValid(opcode) &&
+        (!control || (final && payload.size <= 125)) &&
+        (maskingKey == "" || maskingKey.size == 4)
+    val output = byteBuffer()
+    if (valid) {
+        output.appendByteValue((if (final) 128 else 0) | opcode)
+        val mask = if (maskingKey.size == 4) 128 else 0
+        if (payload.size <= 125) {
+            output.appendByteValue(mask | payload.size)
+        } else if (payload.size <= 65535) {
+            output.appendByteValue(mask | 126)
+            webSocketAppendU16(output, payload.size)
+        } else {
+            output.appendByteValue(mask | 127)
+            webSocketAppendU64(output, payload.size)
+        }
+        if (mask != 0) output.appendText(maskingKey)
+        if (mask != 0) output.appendText(webSocketMask(payload, maskingKey))
+        else output.appendText(payload)
+    }
+    if (valid) output.toText() else ""
+}
+
+fun webSocketDecodeFrame(
+    input: string,
+    maximumPayload: int = 1048576,
+    requireMasked: bool = false
+): WebSocketFrameDecode {
+    var frame = webSocketEmptyFrame()
+    var consumed = 0
+    var complete = false
+    var error = ""
+    if (maximumPayload < 0) error = "invalid payload limit"
+    if (error == "" && input.size >= 2) {
+        val first = input[0]
+        val second = input[1]
+        val final = (first & 128) != 0
+        val opcode = first & 15
+        val masked = (second & 128) != 0
+        var length = second & 127
+        var header = 2
+        if ((first & 112) != 0) error = "reserved bits are not supported"
+        if (error == "" && !webSocketOpcodeValid(opcode)) {
+            error = "invalid opcode"
+        }
+        if (error == "" && requireMasked && !masked) {
+            error = "client frame must be masked"
+        }
+        if (error == "" && length == 126) {
+            if (input.size < 4) length = -1
+            else {
+                length = input[2] * 256 + input[3]
+                header = 4
+                if (length < 126) error = "non-canonical payload length"
+            }
+        } else if (error == "" && length == 127) {
+            if (input.size < 10) length = -1
+            else if ((input[2] & 128) != 0) {
+                error = "payload length exceeds signed range"
+            } else {
+                length = 0
+                var index = 2
+                while (index < 10 && error == "") {
+                    if (length > maximumPayload / 256) {
+                        error = "payload exceeds configured limit"
+                    } else length = length * 256 + input[index]
+                    index = index + 1
+                }
+                header = 10
+                if (error == "" && length <= 65535) {
+                    error = "non-canonical payload length"
+                }
+            }
+        }
+        if (length >= 0 && masked) header = header + 4
+        if (error == "" && length > maximumPayload) {
+            error = "payload exceeds configured limit"
+        }
+        if (error == "" && length >= 0 &&
+            webSocketControlOpcode(opcode) && (!final || length > 125)) {
+            error = "invalid control frame"
+        }
+        if (error == "" && length >= 0 && input.size >= header + length) {
+            var payload = input.slice(header, header + length)
+            if (masked) {
+                payload = webSocketMask(
+                    payload, input.slice(header - 4, header)
+                )
+            }
+            if (opcode == 8 && payload.size == 1) {
+                error = "invalid close payload"
+            } else if (opcode == 8 && payload.size >= 2) {
+                val code = payload[0] * 256 + payload[1]
+                val reason = payload.slice(2, payload.size)
+                if (!webSocketCloseCodeValid(code)) {
+                    error = "invalid close code"
+                } else if (!webSocketUtf8Valid(reason)) {
+                    error = "invalid close reason"
+                }
+            }
+            if (error == "") {
+                frame = WebSocketFrame(final, opcode, payload, masked)
+                consumed = header + length
+                complete = true
+            }
+        }
+    }
+    if (error != "") complete = true
+    WebSocketFrameDecode(frame, consumed, complete, error)
+}
+
+fun webSocketUtf8Valid(value: string): bool {
+    var valid = true
+    var remaining = 0
+    var codepoint = 0
+    var minimum = 0
+    var index = 0
+    while (valid && index < value.size) {
+        val byte = value[index]
+        if (remaining == 0) {
+            if (byte <= 127) {
+                codepoint = byte
+            } else if (byte >= 194 && byte <= 223) {
+                codepoint = byte & 31
+                minimum = 128
+                remaining = 1
+            } else if (byte >= 224 && byte <= 239) {
+                codepoint = byte & 15
+                minimum = 2048
+                remaining = 2
+            } else if (byte >= 240 && byte <= 244) {
+                codepoint = byte & 7
+                minimum = 65536
+                remaining = 3
+            } else valid = false
+        } else if (byte < 128 || byte > 191) {
+            valid = false
+        } else {
+            codepoint = codepoint * 64 + (byte & 63)
+            remaining = remaining - 1
+            if (remaining == 0 && (codepoint < minimum ||
+                codepoint > 1114111 ||
+                (codepoint >= 55296 && codepoint <= 57343))) valid = false
+        }
+        index = index + 1
+    }
+    valid && remaining == 0
+}
+
+fun webSocketAccept(key: string): string = base64Encode(sha1(
+    "${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+))
+
+fun webSocketHeaderContainsToken(value: string, wanted: string): bool {
+    var matched = false
+    var begin = 0
+    var index = 0
+    while (!matched && index <= value.size) {
+        if (index == value.size || value[index] == 44) {
+            var left = begin
+            var right = index
+            while (left < right && (value[left] == 32 || value[left] == 9)) {
+                left = left + 1
+            }
+            while (right > left &&
+                (value[right - 1] == 32 || value[right - 1] == 9)) {
+                right = right - 1
+            }
+            matched = httpAsciiEqualInsensitive(
+                value.slice(left, right), wanted
+            )
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    matched
+}
+
+fun webSocketIsUpgradeRequest(request: HttpRequest): bool {
+    val decodedKey = base64Decode(request.header("Sec-WebSocket-Key"))
+    request.method == "GET" &&
+        webSocketHeaderContainsToken(request.header("Upgrade"), "websocket") &&
+        webSocketHeaderContainsToken(request.header("Connection"), "upgrade") &&
+        request.header("Sec-WebSocket-Version") == "13" &&
+        decodedKey.size == 16
+}
+
+fun webSocketUpgradeResponse(request: HttpRequest): HttpResponse {
+    var response = httpText("invalid WebSocket upgrade", 400)
+    if (webSocketIsUpgradeRequest(request)) {
+        response = HttpResponse(101, [
+            HttpHeader("Upgrade", "websocket"),
+            HttpHeader("Connection", "Upgrade"),
+            HttpHeader(
+                "Sec-WebSocket-Accept",
+                webSocketAccept(request.header("Sec-WebSocket-Key"))
+            )
+        ], "")
+    } else if (request.header("Sec-WebSocket-Version") != "13") {
+        response = HttpResponse(426, [
+            HttpHeader("Sec-WebSocket-Version", "13")
+        ], "WebSocket version 13 is required")
+    }
+    response
+}
+
+fun webSocketUpgrade(
+    request: HttpRequest,
+    var stream: TcpConnection
+): bool {
+    val response = webSocketUpgradeResponse(request)
+    stream.write(response.render()) > 0 && response.status == 101
+}
+
+fun webSocketConnection(
+    own stream: TcpConnection,
+    expectMasked: bool = true,
+    outgoingMask: string = ""
+): WebSocketConnection = WebSocketConnection(
+    move(stream), "", expectMasked, outgoingMask, false, 0, ""
+)
+
+fun WebSocketConnection.sendFrame(
+    payload: string,
+    opcode: int,
+    final: bool = true
+): bool {
+    var sent = false
+    if (!this.closed) {
+        val encoded = webSocketEncodeFrame(
+            payload, opcode, final, this.outgoingMask
+        )
+        if (encoded != "") sent = this.stream.write(encoded) == encoded.size
+    }
+    sent
+}
+
+fun WebSocketConnection.sendText(payload: string): bool =
+    webSocketUtf8Valid(payload) && this.sendFrame(payload, 1)
+
+fun WebSocketConnection.sendBinary(payload: string): bool =
+    this.sendFrame(payload, 2)
+
+fun WebSocketConnection.sendPing(payload: string = ""): bool =
+    this.sendFrame(payload, 9)
+
+fun WebSocketConnection.sendPong(payload: string = ""): bool =
+    this.sendFrame(payload, 10)
+
+fun webSocketClosePayload(code: int, reason: string): string {
+    val output = byteBuffer()
+    if (webSocketCloseCodeValid(code) && reason.size <= 123 &&
+        webSocketUtf8Valid(reason)) {
+        output.appendByteValue((code >>> 8) & 255)
+        output.appendByteValue(code & 255)
+        output.appendText(reason)
+    }
+    output.toText()
+}
+
+fun WebSocketConnection.close(
+    code: int = 1000,
+    reason: string = ""
+): bool {
+    var success = this.closed
+    if (!this.closed) {
+        val payload = webSocketClosePayload(code, reason)
+        success = payload != "" && this.sendFrame(payload, 8)
+        this.stream.close()
+        this.closed = true
+    }
+    success
+}
+
+fun WebSocketConnection.readFrame(
+    maximumPayload: int = 1048576,
+    timeoutMilliseconds: int = 30000
+): WebSocketReadResult {
+    var decoded = webSocketDecodeFrame(
+        this.buffered, maximumPayload, this.expectMasked
+    )
+    var timedOut = false
+    var peerClosed = this.closed
+    var error = decoded.error
+    while (!decoded.complete && !peerClosed && !timedOut && error == "") {
+        val incoming = this.stream.readWithTimeoutResult(
+            65536, timeoutMilliseconds
+        )
+        if (incoming.hasData()) {
+            this.buffered = "${this.buffered}${incoming.bytes}"
+            if (this.buffered.size > maximumPayload + 14) {
+                error = "buffer exceeds configured limit"
+            } else decoded = webSocketDecodeFrame(
+                this.buffered, maximumPayload, this.expectMasked
+            )
+        } else if (incoming.timedOut()) timedOut = true
+        else {
+            peerClosed = incoming.reachedEof()
+            if (incoming.failed()) error = "socket read failed"
+        }
+    }
+    var available = decoded.succeeded()
+    if (available) {
+        this.buffered = this.buffered.slice(
+            decoded.consumed, this.buffered.size
+        )
+    }
+    if (peerClosed) this.closed = true
+    WebSocketReadResult(
+        decoded.frame, available, peerClosed, timedOut,
+        if (error != "") error else decoded.error
+    )
+}
+
+fun WebSocketConnection.readMessage(
+    maximumPayload: int = 1048576,
+    timeoutMilliseconds: int = 30000
+): WebSocketMessage {
+    var result = WebSocketMessage("", "", false, false, false, "")
+    var waiting = true
+    while (waiting) {
+        val incoming = this.readFrame(maximumPayload, timeoutMilliseconds)
+        if (!incoming.available) {
+            result = WebSocketMessage(
+                "", "", false, incoming.closed, incoming.timedOut,
+                incoming.error
+            )
+            waiting = false
+        } else {
+            val frame = incoming.frame
+            if (frame.opcode == 9) {
+                if (!this.sendPong(frame.payload)) {
+                    result = WebSocketMessage(
+                        "", "", false, false, false, "cannot send pong"
+                    )
+                    waiting = false
+                }
+            } else if (frame.opcode == 10) {
+            } else if (frame.opcode == 8) {
+                if (!this.closed) this.sendFrame(frame.payload, 8)
+                this.stream.close()
+                this.closed = true
+                result = WebSocketMessage("", "", false, true, false, "")
+                waiting = false
+            } else if (frame.opcode == 1 || frame.opcode == 2) {
+                if (this.fragmentedOpcode != 0) {
+                    result = WebSocketMessage(
+                        "", "", false, false, false,
+                        "new message before fragmented message completed"
+                    )
+                    waiting = false
+                } else if (frame.final) {
+                    val kind = if (frame.opcode == 1) "text" else "binary"
+                    var valid = true
+                    if (frame.opcode == 1) {
+                        valid = webSocketUtf8Valid(frame.payload)
+                    }
+                    result = WebSocketMessage(
+                        kind, frame.payload, valid, false, false,
+                        if (valid) "" else "invalid UTF-8 text message"
+                    )
+                    waiting = false
+                } else {
+                    this.fragmentedOpcode = frame.opcode
+                    this.fragmentedPayload = frame.payload
+                }
+            } else if (frame.opcode == 0) {
+                if (this.fragmentedOpcode == 0) {
+                    result = WebSocketMessage(
+                        "", "", false, false, false,
+                        "continuation without fragmented message"
+                    )
+                    waiting = false
+                } else {
+                    this.fragmentedPayload =
+                        "${this.fragmentedPayload}${frame.payload}"
+                    if (this.fragmentedPayload.size > maximumPayload) {
+                        result = WebSocketMessage(
+                            "", "", false, false, false,
+                            "message exceeds configured limit"
+                        )
+                        waiting = false
+                    } else if (frame.final) {
+                        val opcode = this.fragmentedOpcode
+                        val payload = this.fragmentedPayload
+                        this.fragmentedOpcode = 0
+                        this.fragmentedPayload = ""
+                        val kind = if (opcode == 1) "text" else "binary"
+                        var valid = true
+                        if (opcode == 1) valid = webSocketUtf8Valid(payload)
+                        result = WebSocketMessage(
+                            kind, payload, valid, false, false,
+                            if (valid) "" else "invalid UTF-8 text message"
+                        )
+                        waiting = false
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fun webSocketRouter(): WebSocketRouter = WebSocketRouter([])
+
+fun WebSocketRouter.route(
+    pattern: string,
+    handler: (HttpRequest, var: WebSocketConnection) -> void
+): WebSocketRouter {
+    this.routes.append(WebSocketRoute(pattern, handler))
+    this
+}
+
+fun WebSocketRouter.find(request: HttpRequest): int {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < this.routes.size) {
+        if (httpMatchPath(this.routes[index].pattern, request.path).matched) {
+            found = index
+        }
+        index = index + 1
+    }
+    found
+}
+
+fun WebSocketRouter.routedRequest(
+    routeIndex: int,
+    request: HttpRequest
+): HttpRequest {
+    val matched = httpMatchPath(
+        this.routes[routeIndex].pattern, request.path
+    )
+    HttpRequest(
+        request.method,
+        request.path,
+        request.query,
+        request.headers,
+        request.body,
+        matched.names,
+        matched.values
+    )
+}
+
+fun serveMatchedWebSocket(
+    router: WebSocketRouter,
+    routeIndex: int,
+    request: HttpRequest,
+    own stream: TcpConnection
+): bool {
+    var handled = false
+    val response = webSocketUpgradeResponse(request).render()
+    if (stream.write(response) == response.size) {
+        val connection = webSocketConnection(move(stream))
+        val handler = router.routes[routeIndex].handler
+        handler(router.routedRequest(routeIndex, request), connection)
+        if (!connection.closed) connection.close()
+        handled = true
+    }
+    handled
+}
+
+fun serveWebSocketStream(
+    router: WebSocketRouter,
+    own stream: TcpConnection,
+    maximumHeader: int = 65536,
+    maximumMessage: int = 1048576
+): bool {
+    val request = httpParseRequest(
+        httpReadRequest(stream, maximumHeader, maximumMessage)
+    )
+    val routeIndex = router.find(request)
+    var handled = false
+    if (routeIndex >= 0 && webSocketIsUpgradeRequest(request)) {
+        handled = serveMatchedWebSocket(
+            router, routeIndex, request, move(stream)
+        )
+    } else {
+        val response = if (routeIndex < 0) httpText("not found", 404)
+            else webSocketUpgradeResponse(request)
+        stream.write(response.render())
+    }
+    handled
+}
+
+fun serveWebSocketOnce(
+    router: WebSocketRouter,
+    var listener: TcpListener,
+    maximumHeader: int = 65536,
+    maximumMessage: int = 1048576
+): bool {
+    val stream = listener.accept()
+    serveWebSocketStream(
+        router, move(stream), maximumHeader, maximumMessage
+    )
+}
+
+fun serveWebSocketsOnListener(
+    router: WebSocketRouter,
+    var listener: TcpListener,
+    maximumHeader: int = 65536,
+    maximumMessage: int = 1048576
+): int {
+    tcpEnableGracefulShutdown()
+    while (!tcpShutdownRequested()) {
+        val stream = listener.acceptUntilShutdown()
+        if (stream.descriptor >= 0) {
+            serveWebSocketStream(
+                router, move(stream), maximumHeader, maximumMessage
+            )
+        }
+    }
+    listener.close()
+    0
+}
+
+fun serveWebSockets(
+    router: WebSocketRouter,
+    port: int,
+    maximumHeader: int = 65536,
+    maximumMessage: int = 1048576
+): int {
+    val listener = tcpListen(port)
+    serveWebSocketsOnListener(
+        router, listener, maximumHeader, maximumMessage
+    )
+}

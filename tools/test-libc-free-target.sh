@@ -21,16 +21,16 @@ if [[ -n $(nm -u "$program") ]]; then
     nm -u "$program" >&2
     exit 1
 fi
-if readelf -l "$program" | rg -q 'INTERP'; then
+if readelf -l "$program" | rg 'INTERP' >/dev/null; then
     echo 'libc-free target contains an ELF interpreter' >&2
     exit 1
 fi
-if readelf -d "$program" 2>&1 | rg -q 'NEEDED'; then
+if readelf -d "$program" 2>&1 | rg 'NEEDED' >/dev/null; then
     echo 'libc-free target contains a dynamic dependency' >&2
     exit 1
 fi
 if nm --defined-only "$program" | awk '{print $3}' |
-    rg -q '^ablaHost|^abla_host_|^abla_checked_'; then
+    rg '^ablaHost|^abla_host_|^abla_checked_' >/dev/null; then
     echo 'libc-free target linked a project host capability symbol' >&2
     exit 1
 fi
@@ -53,7 +53,7 @@ set +e
 invalid_status=$?
 set -e
 [[ $invalid_status -ne 0 ]]
-rg -q 'target x86_64-linux-raw does not permit hosted or LLVM runtime imports' \
+rg -q 'E_BUILD_TARGET_CAPABILITY.*x86_64-linux-raw.*does not permit hosted or LLVM runtime imports' \
     "$directory/invalid.err"
 
 printf '%s\n' \

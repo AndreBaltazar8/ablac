@@ -1,0 +1,209 @@
+// Bounded RFC 1951 fixed-Huffman DEFLATE plus RFC 1952 gzip framing. The
+// encoder uses a capped LZ77 search so hostile input cannot create unbounded
+// compression work.
+
+import "abla/bytes"
+
+class DeflateBitWriter(
+    val output: ByteBuffer,
+    var bits: int,
+    var count: int
+)
+
+fun deflateBitWriter(): DeflateBitWriter =
+    DeflateBitWriter(byteBuffer(), 0, 0)
+
+fun DeflateBitWriter.append(value: int, count: int): void {
+    var remaining = count
+    var source = value
+    while (remaining > 0) {
+        this.bits = this.bits | ((source & 1) << this.count)
+        this.count = this.count + 1
+        source = source >>> 1
+        remaining = remaining - 1
+        if (this.count == 8) {
+            this.output.appendByteValue(this.bits & 255)
+            this.bits = 0
+            this.count = 0
+        }
+    }
+    return
+}
+
+fun DeflateBitWriter.finish(): string {
+    if (this.count > 0) this.output.appendByteValue(this.bits & 255)
+    this.bits = 0
+    this.count = 0
+    this.output.toText()
+}
+
+fun deflateReverseBits(value: int, count: int): int {
+    var input = value
+    var output = 0
+    var bit = 0
+    while (bit < count) {
+        output = (output << 1) | (input & 1)
+        input = input >>> 1
+        bit = bit + 1
+    }
+    output
+}
+
+fun deflateWriteFixedSymbol(var writer: DeflateBitWriter, symbol: int): void {
+    var code = 0
+    var count = 0
+    if (symbol >= 0 && symbol <= 143) {
+        code = 48 + symbol
+        count = 8
+    } else if (symbol <= 255) {
+        code = 400 + symbol - 144
+        count = 9
+    } else if (symbol <= 279) {
+        code = symbol - 256
+        count = 7
+    } else if (symbol <= 287) {
+        code = 192 + symbol - 280
+        count = 8
+    }
+    writer.append(deflateReverseBits(code, count), count)
+    return
+}
+
+fun deflateLengthBases(): array<int> = [
+    3, 4, 5, 6, 7, 8, 9, 10,
+    11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115,
+    131, 163, 195, 227, 258
+]
+
+fun deflateLengthExtras(): array<int> = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4,
+    5, 5, 5, 5, 0
+]
+
+fun deflateDistanceBases(): array<int> = [
+    1, 2, 3, 4, 5, 7, 9, 13,
+    17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073,
+    4097, 6145, 8193, 12289, 16385, 24577
+]
+
+fun deflateDistanceExtras(): array<int> = [
+    0, 0, 0, 0, 1, 1, 2, 2,
+    3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10,
+    11, 11, 12, 12, 13, 13
+]
+
+fun deflateWriteLengthDistance(
+    var writer: DeflateBitWriter,
+    length: int,
+    distance: int
+): void {
+    val lengthBases = deflateLengthBases()
+    val lengthExtras = deflateLengthExtras()
+    var lengthCode = 0
+    while (lengthCode + 1 < lengthBases.size &&
+        length >= lengthBases[lengthCode + 1]) {
+        lengthCode = lengthCode + 1
+    }
+    deflateWriteFixedSymbol(writer, 257 + lengthCode)
+    val lengthExtra = lengthExtras[lengthCode]
+    if (lengthExtra > 0) {
+        writer.append(length - lengthBases[lengthCode], lengthExtra)
+    }
+
+    val distanceBases = deflateDistanceBases()
+    val distanceExtras = deflateDistanceExtras()
+    var distanceCode = 0
+    while (distanceCode + 1 < distanceBases.size &&
+        distance >= distanceBases[distanceCode + 1]) {
+        distanceCode = distanceCode + 1
+    }
+    writer.append(deflateReverseBits(distanceCode, 5), 5)
+    val distanceExtra = distanceExtras[distanceCode]
+    if (distanceExtra > 0) {
+        writer.append(
+            distance - distanceBases[distanceCode], distanceExtra
+        )
+    }
+    return
+}
+
+fun deflateFixed(input: string, searchLimit: int = 1024): string {
+    val writer = deflateBitWriter()
+    writer.append(1, 1)
+    writer.append(1, 2)
+    var index = 0
+    while (index < input.size) {
+        var bestLength = 0
+        var bestDistance = 0
+        var distance = 1
+        var maximumDistance = index
+        if (maximumDistance > 32768) maximumDistance = 32768
+        if (maximumDistance > searchLimit) maximumDistance = searchLimit
+        while (distance <= maximumDistance && bestLength < 258) {
+            var length = 0
+            while (length < 258 && index + length < input.size &&
+                input[index + length] ==
+                    input[index + length - distance]) {
+                length = length + 1
+            }
+            if (length >= 3 && length > bestLength) {
+                bestLength = length
+                bestDistance = distance
+            }
+            distance = distance + 1
+        }
+        if (bestLength >= 3) {
+            deflateWriteLengthDistance(writer, bestLength, bestDistance)
+            index = index + bestLength
+        } else {
+            deflateWriteFixedSymbol(writer, input[index])
+            index = index + 1
+        }
+    }
+    deflateWriteFixedSymbol(writer, 256)
+    writer.finish()
+}
+
+fun gzipCrc32(input: string): int {
+    var crc = 4294967295
+    var index = 0
+    while (index < input.size) {
+        crc = crc ^ input[index]
+        var bit = 0
+        while (bit < 8) {
+            if ((crc & 1) != 0) crc = (crc >>> 1) ^ 3988292384
+            else crc = crc >>> 1
+            bit = bit + 1
+        }
+        index = index + 1
+    }
+    crc ^ 4294967295
+}
+
+fun gzipAppendU32Little(var output: ByteBuffer, value: int): void {
+    output.appendByteValue(value & 255)
+    output.appendByteValue((value >>> 8) & 255)
+    output.appendByteValue((value >>> 16) & 255)
+    output.appendByteValue((value >>> 24) & 255)
+    return
+}
+
+fun gzipCompress(input: string, searchLimit: int = 1024): string {
+    val output = byteBuffer()
+    output.appendByteValue(31)
+    output.appendByteValue(139)
+    output.appendByteValue(8)
+    output.appendByteValue(0)
+    gzipAppendU32Little(output, 0)
+    output.appendByteValue(0)
+    output.appendByteValue(255)
+    output.appendText(deflateFixed(input, searchLimit))
+    gzipAppendU32Little(output, gzipCrc32(input))
+    gzipAppendU32Little(output, input.size)
+    output.toText()
+}

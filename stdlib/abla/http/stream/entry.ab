@@ -1,0 +1,248 @@
+// HTTP/1.1 persistent-connection, chunked-transfer, gzip negotiation, and SSE
+// helpers. The base HTTP package remains small; servers opt into this policy.
+
+import "abla/compression/gzip"
+import "abla/http"
+
+class HttpChunkDecode(
+    val body: string,
+    val consumed: int,
+    val complete: bool,
+    val error: string
+)
+
+class ServerSentEvent(
+    val data: string,
+    val event: string,
+    val id: string,
+    val retryMilliseconds: int
+)
+
+fun httpHeaderTokenContains(value: string, wanted: string): bool {
+    var matched = false
+    var begin = 0
+    var index = 0
+    while (!matched && index <= value.size) {
+        if (index == value.size || value[index] == 44) {
+            var left = begin
+            var right = index
+            while (left < right && (value[left] == 32 || value[left] == 9)) {
+                left = left + 1
+            }
+            while (right > left &&
+                (value[right - 1] == 32 || value[right - 1] == 9)) {
+                right = right - 1
+            }
+            var semicolon = left
+            while (semicolon < right && value[semicolon] != 59) {
+                semicolon = semicolon + 1
+            }
+            matched = httpAsciiEqualInsensitive(
+                value.slice(left, semicolon), wanted
+            )
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    matched
+}
+
+fun httpRequestKeepAlive(request: HttpRequest): bool {
+    val connection = request.header("Connection")
+    !httpHeaderTokenContains(connection, "close")
+}
+
+fun httpHexLength(value: string, maximum: int): int {
+    var result = 0
+    var valid = value.size > 0
+    var index = 0
+    while (valid && index < value.size) {
+        val byte = value[index]
+        var digit = -1
+        if (byte >= 48 && byte <= 57) digit = byte - 48
+        if (byte >= 65 && byte <= 70) digit = byte - 55
+        if (byte >= 97 && byte <= 102) digit = byte - 87
+        if (digit < 0 || result > (maximum - digit) / 16) valid = false
+        else result = result * 16 + digit
+        index = index + 1
+    }
+    if (valid && result <= maximum) result else -1
+}
+
+fun httpHex(value: int): string {
+    val digits = "0123456789abcdef"
+    var output = ""
+    var remaining = value
+    if (remaining == 0) output = "0"
+    while (remaining > 0) {
+        val digit = remaining - remaining / 16 * 16
+        output = "${digits.slice(digit, digit + 1)}$output"
+        remaining = remaining / 16
+    }
+    output
+}
+
+fun httpChunkEncode(payload: string): string =
+    "${httpHex(payload.size)}\r\n$payload\r\n"
+
+fun httpChunkEnd(trailers: array<HttpHeader> = []): string {
+    var output = "0\r\n"
+    var index = 0
+    while (index < trailers.size) {
+        output = "$output${trailers[index].name}: ${trailers[index].value}\r\n"
+        index = index + 1
+    }
+    "$output\r\n"
+}
+
+fun httpDecodeChunked(
+    input: string,
+    maximumBody: int = 1048576
+): HttpChunkDecode {
+    var output = ""
+    var offset = 0
+    var complete = false
+    var error = ""
+    while (!complete && error == "" && offset < input.size) {
+        val lineEnd = httpLineEnd(input, offset)
+        if (lineEnd >= input.size) offset = input.size
+        else {
+            var extension = offset
+            while (extension < lineEnd && input[extension] != 59) {
+                extension = extension + 1
+            }
+            val length = httpHexLength(
+                input.slice(offset, extension), maximumBody - output.size
+            )
+            if (length < 0) error = "invalid chunk length"
+            else if (length == 0) {
+                var trailerEnd = -1
+                var cursor = lineEnd + 2
+                while (trailerEnd < 0 && cursor + 1 < input.size) {
+                    if (input[cursor] == 13 && input[cursor + 1] == 10) {
+                        trailerEnd = cursor + 2
+                    } else {
+                        val next = httpLineEnd(input, cursor)
+                        if (next >= input.size) cursor = input.size
+                        else cursor = next + 2
+                    }
+                }
+                if (trailerEnd >= 0) {
+                    offset = trailerEnd
+                    complete = true
+                } else offset = input.size
+            } else {
+                val body = lineEnd + 2
+                if (body + length + 2 > input.size) offset = input.size
+                else if (input[body + length] != 13 ||
+                    input[body + length + 1] != 10) {
+                    error = "chunk is missing terminator"
+                } else {
+                    output = "$output${input.slice(body, body + length)}"
+                    offset = body + length + 2
+                }
+            }
+        }
+    }
+    HttpChunkDecode(output, offset, complete, error)
+}
+
+fun httpChunkedResponse(
+    chunks: array<string>,
+    status: int = 200,
+    headers: array<HttpHeader> = []
+): string {
+    var output = "HTTP/1.1 $status ${httpStatusReason(status)}\r\n"
+    var hasTransfer = false
+    var index = 0
+    while (index < headers.size) {
+        if (httpAsciiEqualInsensitive(
+            headers[index].name, "Transfer-Encoding"
+        )) hasTransfer = true
+        output = "$output${headers[index].name}: ${headers[index].value}\r\n"
+        index = index + 1
+    }
+    if (!hasTransfer) output = "${output}Transfer-Encoding: chunked\r\n"
+    output = "${output}Connection: keep-alive\r\n\r\n"
+    index = 0
+    while (index < chunks.size) {
+        output = "$output${httpChunkEncode(chunks[index])}"
+        index = index + 1
+    }
+    "$output${httpChunkEnd()}"
+}
+
+fun httpGzipResponse(
+    request: HttpRequest,
+    response: HttpResponse,
+    minimumBytes: int = 256
+): HttpResponse {
+    var result = response
+    val accepts = httpHeaderTokenContains(
+        request.header("Accept-Encoding"), "gzip"
+    )
+    if (accepts && response.body.size >= minimumBytes &&
+        response.header("Content-Encoding") == "") {
+        val compressed = gzipCompress(response.body)
+        if (compressed.size < response.body.size) {
+            val headers: array<HttpHeader> = []
+            var index = 0
+            while (index < response.headers.size) {
+                if (!httpAsciiEqualInsensitive(
+                    response.headers[index].name, "Content-Length"
+                )) headers.append(response.headers[index])
+                index = index + 1
+            }
+            headers.append(HttpHeader("Content-Encoding", "gzip"))
+            headers.append(HttpHeader("Vary", "Accept-Encoding"))
+            result = HttpResponse(response.status, headers, compressed)
+        }
+    }
+    result
+}
+
+fun serverSentEvent(
+    data: string,
+    event: string = "",
+    id: string = "",
+    retryMilliseconds: int = 0
+): ServerSentEvent = ServerSentEvent(data, event, id, retryMilliseconds)
+
+fun sseAppendFieldLines(field: string, value: string): string {
+    var output = ""
+    var begin = 0
+    var index = 0
+    while (index <= value.size) {
+        if (index == value.size || value[index] == 10) {
+            var end = index
+            if (end > begin && value[end - 1] == 13) end = end - 1
+            output = "$output$field: ${value.slice(begin, end)}\n"
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    output
+}
+
+fun ServerSentEvent.encode(): string {
+    var output = ""
+    if (this.event != "") output = sseAppendFieldLines("event", this.event)
+    if (this.id != "") output = "$output${sseAppendFieldLines("id", this.id)}"
+    if (this.retryMilliseconds > 0) {
+        output = "${output}retry: ${this.retryMilliseconds}\n"
+    }
+    "$output${sseAppendFieldLines("data", this.data)}\n"
+}
+
+fun sseHeaders(): array<HttpHeader> = [
+    HttpHeader("Content-Type", "text/event-stream"),
+    HttpHeader("Cache-Control", "no-cache"),
+    HttpHeader("X-Accel-Buffering", "no"),
+    HttpHeader("Transfer-Encoding", "chunked"),
+    HttpHeader("Connection", "keep-alive")
+]
+
+fun sseResponseHead(): string =
+    "${HttpResponse(200, sseHeaders(), "").renderHeaders()}\r\n"
+
+fun sseChunk(event: ServerSentEvent): string = httpChunkEncode(event.encode())

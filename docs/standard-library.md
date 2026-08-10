@@ -9,7 +9,7 @@ unrelated policy or compiler machinery into the program:
 | `abla/math` | phase-safe numeric algorithms |
 | `abla/bits` | named compatibility functions for native 64-bit bit operations |
 | `abla/bytes` | phase-safe owned byte buffers, byte encoding, borrowed slices, stable hashing |
-| `abla/crypto` | portable SHA-256, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison, and legacy MD5 |
+| `abla/crypto` | portable SHA-256, protocol SHA-1, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison, and legacy MD5 |
 | `abla/text` | phase-safe UTF-8 validation, scalar indexing, and slicing |
 | `abla/io` | portable console, EOF-aware line input, and callback-backed buffered text writers |
 | `abla/io/buffered` | opt-in buffered file writer adapter |
@@ -17,10 +17,23 @@ unrelated policy or compiler machinery into the program:
 | `abla/fs` | `Path`, metadata, atomic text writes, directory entries, watches |
 | `abla/process` | `Command`, `ChildProcess`, arguments, sleep |
 | `abla/process/arguments`, `/command`, `/time` | size-selectable portable process capabilities |
+| `abla/random` | bounded cryptographic entropy using raw Linux `getrandom` |
+| `abla/random/hosted` | bounded `/dev/urandom` entropy for Linux and macOS hosted programs |
 | `region { ... }` | compiler-checked lexical allocation generation (language construct) |
 | `abla/runtime/memory` | internal emitted checkpoint/live-byte/budget/collection intrinsics used by the portable facade, compiler, and tests |
-| `abla/net` | typed TCP listener/connection facade; raw Linux backend today |
-| `abla/http` | HTTP/1 client/server, pluggable transport, and version-aware routing |
+| `abla/net` | affine dual-stack TCP/UDP sockets, structured I/O results, deadlines, and epoll readiness on raw Linux |
+| `abla/net/hosted` | DNS-capable dual-stack TCP/UDP plus epoll on Linux and kqueue on macOS |
+| `abla/dns` | bounded DNS A/AAAA codec, compression-pointer parser, UDP resolver, and hostname connect helper |
+| `abla/http` | HTTP/1 client/server, chunk-aware client parsing, pluggable transport, and version-aware routing |
+| `abla/http/stream` | keep-alive/chunked policy, gzip negotiation, and Server-Sent Events framing |
+| `abla/http/event` | bounded epoll HTTP/1.1 manager with pipelining, partial writes, and backpressure |
+| `abla/http/tls` | certificate-verified HTTPS client transport |
+| `abla/compression/gzip` | RFC gzip framing, CRC-32, and fixed-Huffman DEFLATE compression |
+| `abla/tls/hosted` | dynamically loaded OpenSSL client/listener transport with hostname and certificate verification |
+| `abla/websocket` | bounded RFC 6455 handshake, framing, connection lifecycle, and routed server helpers |
+| `abla/websocket/json`, `/rpc` | optional bounded JSON messages and transport-neutral RPC method routing |
+| `abla/websocket/event` | bounded epoll WebSocket manager with fragmentation, ping/pong, and output backpressure |
+| `abla/websocket/tls` | certificate-verified WSS client transport |
 | `abla/json` | [bounded JSON parsing, deterministic serialization, and `$json` literals](json.md) |
 | `abla/http/json` | opt-in adapters between JSON values and HTTP requests/responses |
 | `abla/html` | HTML data model and `$html` subparser |
@@ -34,7 +47,7 @@ unrelated policy or compiler machinery into the program:
 | `abla/sys/linux/fs` | raw-kernel `Path`, metadata, atomic writes, entries, and watches |
 | `abla/sys/linux/io` | raw-kernel buffered input lines, polling, and full output writes |
 | `abla/sys/linux/process` | arguments, environment/PATH, sleep, fork/exec, capture, and child lifecycle |
-| `abla/sys/linux/net` | TCP sockets plus poll/signalfd graceful SIGTERM draining |
+| `abla/sys/linux/net` | affine TCP/UDP sockets, poll/epoll readiness, plus signalfd graceful SIGTERM draining |
 | `abla/llvm/aot`, `abla/llvm/orc` | in-process object emission and persistent JIT sessions |
 
 `ByteBuffer` currently uses immutable chunks and `ByteSlice` is a checked view.
@@ -87,13 +100,20 @@ a line terminator, distinguishes EOF from an empty line, accepts CRLF, and can
 poll for readiness. Its stdout/stderr helpers retry interrupted and partial
 writes. Like the raw filesystem profile, it links no project C symbols.
 
-`abla/sys/linux/net` implements TCP listeners and connections with
-`socket`, `setsockopt`, `bind`, `listen`, `getsockname`, `accept4`, `poll`, and
-descriptor I/O syscalls. Graceful service shutdown blocks `SIGTERM`, consumes
+`abla/sys/linux/net` implements affine IPv4/IPv6 TCP listeners/connections, UDP sockets,
+structured I/O outcomes, and single/multi-descriptor readiness with `socket`,
+`setsockopt`, `getsockopt`, `bind`, `listen`, `getsockname`, `getpeername`,
+`accept4`, `sendto`, `recvfrom`, `poll`, and `epoll` syscalls. Graceful service
+shutdown blocks `SIGTERM`, consumes
 it through `signalfd`, and polls the listener and shutdown descriptor together;
 an active HTTP request therefore finishes before the next accept observes the
 drain request. The current `abla/net` facade selects this backend, so AOT and
 JIT HTTP servers link and run without the project C capability adapter.
+Hosted services that need the same transport concepts on macOS can explicitly
+select `abla/net/hosted`; its narrow runtime adapter uses `getaddrinfo`, epoll,
+or kqueue while keeping descriptors inside affine Abla resources.
+The complete contract and current platform boundary are documented in
+[networking.md](networking.md).
 
 Allocation regions are intentionally narrower than a garbage collector.
 `region { ... }` rejects heap-backed results, stores into older locals/objects,

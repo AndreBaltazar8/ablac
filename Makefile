@@ -12,7 +12,8 @@ OUTPUT ?= $(BUILD_DIR)/program
 
 .DEFAULT_GOAL := all
 
-.PHONY: all bootstrap ablac self-rebuild test check compile benchmark clean
+.PHONY: all bootstrap ablac self-rebuild test check compile benchmark \
+	benchmark-network clean
 
 all: ablac
 
@@ -59,6 +60,12 @@ compile: ablac
 
 benchmark: ablac
 	tools/benchmark-selfhost.sh $(COMPILER)
+
+benchmark-network: ablac
+	mkdir -p $(BUILD_DIR)/benchmarks
+	$(COMPILER) build tests/benchmarks/websocket-codec.ab \
+		-o $(BUILD_DIR)/benchmarks/websocket-codec --fast --no-cache
+	$(BUILD_DIR)/benchmarks/websocket-codec
 
 clean:
 	rm -rf -- $(BUILD_DIR)

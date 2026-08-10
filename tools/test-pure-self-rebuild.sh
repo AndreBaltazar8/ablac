@@ -24,7 +24,8 @@ ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
 # The generated compiler module is produced entirely through LLVM's C API.
 # Its portable value/platform runtime is linked as an ordinary implementation
 # dependency; there is no alternate code-generation backend in that runtime.
-nm "$output" | awk '{print $3}' | rg -q '^_?abla_runtime_set_arguments$'
+nm "$output" | awk '{print $3}' |
+    rg '^_?abla_runtime_set_arguments$' >/dev/null
 
 ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=300 \
     "$project_root/tools/run-limited.sh" \
