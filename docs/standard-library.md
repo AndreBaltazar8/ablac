@@ -7,7 +7,9 @@ unrelated policy or compiler machinery into the program:
 |---|---|
 | `abla/core` | phase-safe scalar helpers |
 | `abla/math` | phase-safe numeric algorithms |
-| `abla/bytes` | phase-safe owned byte buffers, borrowed slices, stable hashing |
+| `abla/bits` | named compatibility functions for native 64-bit bit operations |
+| `abla/bytes` | phase-safe owned byte buffers, byte encoding, borrowed slices, stable hashing |
+| `abla/crypto` | portable SHA-256, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison, and legacy MD5 |
 | `abla/text` | phase-safe UTF-8 validation, scalar indexing, and slicing |
 | `abla/io` | portable console, EOF-aware line input, and callback-backed buffered text writers |
 | `abla/io/buffered` | opt-in buffered file writer adapter |

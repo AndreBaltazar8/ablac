@@ -647,12 +647,39 @@ AblaValue ablaBitShiftLeft(AblaValue value, AblaValue count_value) {
     return abla_i64((int64_t)((uint64_t)abla_as_i64(value) << count));
 }
 
+AblaValue ablaBitShiftRight(AblaValue value, AblaValue count_value) {
+    const int64_t count = abla_as_i64(count_value);
+    if (count < 0 || count >= 64) return abla_i64(0);
+    const int64_t input = abla_as_i64(value);
+    if (count == 0 || input >= 0) {
+        return abla_i64((int64_t)((uint64_t)input >> count));
+    }
+    const uint64_t shifted = ((uint64_t)input >> count) |
+        (UINT64_MAX << (64 - count));
+    return abla_i64((int64_t)shifted);
+}
+
 AblaValue ablaBitShiftRightUnsigned(
     AblaValue value,
     AblaValue count_value) {
     const int64_t count = abla_as_i64(count_value);
     if (count < 0 || count >= 64) return abla_i64(0);
     return abla_i64((int64_t)((uint64_t)abla_as_i64(value) >> count));
+}
+
+AblaValue ablaByteEncode(AblaValue value) {
+    const int64_t byte = abla_as_i64(value);
+    if (byte < 0 || byte > 255) return abla_string_static("", 0);
+    char* result = (char*)abla_platform_alloc(2);
+    result[0] = (char)(uint8_t)byte;
+    result[1] = '\0';
+    return (AblaValue){
+        .tag = ABLA_STRING,
+        .as.string = {
+            .data = result,
+            .length = 1,
+            .owned = true,
+            .rope = (AblaStringRope*)0}};
 }
 
 AblaValue abla_length(AblaValue value) {

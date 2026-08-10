@@ -48,6 +48,7 @@ export ABLA_MAX_CPU_SECONDS=$ABLA_MAX_SECONDS
 # package/toolchain lookup, and the public command surface.
 tools/test-run-limited.sh
 tools/test-return-control.sh "$compiler"
+tools/test-bitwise-crypto.sh "$compiler"
 tools/test-concurrency.sh "$compiler"
 tools/test-package-build.sh "$compiler"
 tools/test-toolchain-root.sh "$compiler"

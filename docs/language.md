@@ -554,9 +554,16 @@ Generic arguments use `Type<A, B>`.
 ## Expressions and control flow
 
 Calls, member access, and indexing bind most tightly, followed by unary
-operators, multiplication/division, addition/subtraction, comparison,
-equality, logical conjunction/disjunction, and assignment. Assignment is
-right-associative and produces the assigned value for prototype compatibility.
+operators, multiplication/division, addition/subtraction, shifts, comparison,
+equality, bitwise AND/XOR/OR, logical conjunction/disjunction, and assignment.
+Assignment is right-associative and produces the assigned value for prototype
+compatibility.
+
+Integer bitwise operators use signed 64-bit storage: `&`, `|`, `^`, and `~`
+operate on all 64 bits; `<<` shifts left, `>>` shifts right with sign extension,
+and `>>>` shifts right with zero extension. A negative shift count or one of 64
+or greater produces zero. Prefix `^binding` remains the delegate projection;
+between two integer expressions, `^` is XOR.
 
 `if` and `when` are expressions when all paths yield compatible values:
 

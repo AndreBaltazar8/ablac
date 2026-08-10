@@ -44,6 +44,8 @@ fixtures=(
     process-capture:42
     memory-region:42
     bytes:42
+    bitwise:42
+    crypto:42
     http-router:42
     types-valid:7
     compiler-reflection:42

@@ -175,7 +175,9 @@ AblaValue ablaBitOr(AblaValue left, AblaValue right);
 AblaValue ablaBitXor(AblaValue left, AblaValue right);
 AblaValue ablaBitNot(AblaValue value);
 AblaValue ablaBitShiftLeft(AblaValue value, AblaValue count);
+AblaValue ablaBitShiftRight(AblaValue value, AblaValue count);
 AblaValue ablaBitShiftRightUnsigned(AblaValue value, AblaValue count);
+AblaValue ablaByteEncode(AblaValue value);
 AblaValue ablaLinuxSyscall(
     AblaValue number,
     AblaValue argument0,
