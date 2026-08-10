@@ -23,6 +23,7 @@ class TestStep(
 class TestDefinition(
     val name: string,
     val steps: array<TestStep>,
+    val dependencies: array<string>,
     val exclusive: bool,
     val platform: string
 )
@@ -195,6 +196,89 @@ fun testStringArrayValid(value: Json): bool {
     valid
 }
 
+fun testDefinitionIndex(tests: array<TestDefinition>, name: string): int {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < tests.size) {
+        if (tests[index].name == name) found = index
+        index = index + 1
+    }
+    found
+}
+
+fun testValidateDependencies(tests: array<TestDefinition>): string {
+    var error = ""
+    var testIndex = 0
+    while (error == "" && testIndex < tests.size) {
+        val test = tests[testIndex]
+        var dependencyIndex = 0
+        while (error == "" && dependencyIndex < test.dependencies.size) {
+            val dependency = test.dependencies[dependencyIndex]
+            if (dependency == "") {
+                error = "test ${test.name} dependency names cannot be empty"
+            } else if (dependency == test.name) {
+                error = "test ${test.name} cannot depend on itself"
+            } else if (testDefinitionIndex(tests, dependency) < 0) {
+                error = "test ${test.name} has unknown dependency: $dependency"
+            }
+            var prior = 0
+            while (error == "" && prior < dependencyIndex) {
+                if (test.dependencies[prior] == dependency) {
+                    error = "test ${test.name} repeats dependency: $dependency"
+                }
+                prior = prior + 1
+            }
+            dependencyIndex = dependencyIndex + 1
+        }
+        testIndex = testIndex + 1
+    }
+
+    if (error == "") {
+        val remaining: array<int> = []
+        val removed: array<bool> = []
+        testIndex = 0
+        while (testIndex < tests.size) {
+            remaining.append(tests[testIndex].dependencies.size)
+            removed.append(false)
+            testIndex = testIndex + 1
+        }
+        var removedCount = 0
+        var progress = true
+        while (progress && removedCount < tests.size) {
+            progress = false
+            testIndex = 0
+            while (testIndex < tests.size) {
+                if (!removed[testIndex] && remaining[testIndex] == 0) {
+                    removed[testIndex] = true
+                    removedCount = removedCount + 1
+                    progress = true
+                    var dependentIndex = 0
+                    while (dependentIndex < tests.size) {
+                        if (!removed[dependentIndex]) {
+                            var edgeIndex = 0
+                            while (edgeIndex <
+                                   tests[dependentIndex].dependencies.size) {
+                                if (tests[dependentIndex].dependencies[edgeIndex] ==
+                                    tests[testIndex].name) {
+                                    remaining[dependentIndex] =
+                                        remaining[dependentIndex] - 1
+                                }
+                                edgeIndex = edgeIndex + 1
+                            }
+                        }
+                        dependentIndex = dependentIndex + 1
+                    }
+                }
+                testIndex = testIndex + 1
+            }
+        }
+        if (removedCount != tests.size) {
+            error = "test dependencies contain a cycle"
+        }
+    }
+    error
+}
+
 fun loadTestSuite(source: string): TestSuiteLoad {
     val parsed = jsonParse(source)
     if (!parsed.succeeded) {
@@ -259,6 +343,15 @@ fun loadTestSuite(source: string): TestSuiteLoad {
             error = "test $name needs at least one step"
         }
         val steps: array<TestStep> = []
+        val dependenciesValue = candidate.get("dependsOn")
+        if (error == "" && !dependenciesValue.isNull() &&
+            !testStringArrayValid(dependenciesValue)) {
+            error = "test $name dependsOn must contain only strings"
+        }
+        var dependencies: array<string> = []
+        if (!dependenciesValue.isNull()) {
+            dependencies = testParseStringArray(dependenciesValue)
+        }
         var stepIndex = 0
         while (error == "" && stepIndex < stepsValue.size()) {
             val step = stepsValue.at(stepIndex)
@@ -303,13 +396,14 @@ fun loadTestSuite(source: string): TestSuiteLoad {
             stepIndex = stepIndex + 1
         }
         if (error == "") tests.append(TestDefinition(
-            name, steps,
+            name, steps, dependencies,
             candidate.get("exclusive").isBoolean() &&
                 candidate.get("exclusive").asBoolean(),
             platform
         ))
         testIndex = testIndex + 1
     }
+    if (error == "") error = testValidateDependencies(tests)
     if (error != "") TestSuiteLoad(testEmptySuite(), error)
     else TestSuiteLoad(TestSuite(
         tests,
@@ -433,6 +527,92 @@ fun testExclusiveRunning(executions: array<TestExecution>): bool {
     exclusive
 }
 
+fun testExecutionIndex(
+    executions: array<TestExecution>,
+    name: string
+): int {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < executions.size) {
+        if (executions[index].test.name == name) found = index
+        index = index + 1
+    }
+    found
+}
+
+fun testDependenciesPassed(
+    execution: TestExecution,
+    executions: array<TestExecution>
+): bool {
+    var passed = true
+    var index = 0
+    while (passed && index < execution.test.dependencies.size) {
+        val dependency = testExecutionIndex(
+            executions, execution.test.dependencies[index]
+        )
+        passed = dependency >= 0 && executions[dependency].state == "passed"
+        index = index + 1
+    }
+    passed
+}
+
+fun testBlockingDependency(
+    execution: TestExecution,
+    executions: array<TestExecution>
+): string {
+    var blocked = ""
+    var index = 0
+    while (blocked == "" && index < execution.test.dependencies.size) {
+        val name = execution.test.dependencies[index]
+        val dependency = testExecutionIndex(executions, name)
+        if (dependency >= 0 && (executions[dependency].state == "failed" ||
+            executions[dependency].state == "skipped")) blocked = name
+        index = index + 1
+    }
+    blocked
+}
+
+fun testSelectDefinitions(
+    suite: TestSuite,
+    filter: string
+): array<TestDefinition> {
+    val selected: array<bool> = []
+    var index = 0
+    while (index < suite.tests.size) {
+        selected.append(testContains(suite.tests[index].name, filter))
+        index = index + 1
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        index = 0
+        while (index < suite.tests.size) {
+            if (selected[index]) {
+                var dependencyIndex = 0
+                while (dependencyIndex < suite.tests[index].dependencies.size) {
+                    val dependency = testDefinitionIndex(
+                        suite.tests,
+                        suite.tests[index].dependencies[dependencyIndex]
+                    )
+                    if (dependency >= 0 && !selected[dependency]) {
+                        selected[dependency] = true
+                        changed = true
+                    }
+                    dependencyIndex = dependencyIndex + 1
+                }
+            }
+            index = index + 1
+        }
+    }
+    val definitions: array<TestDefinition> = []
+    index = 0
+    while (index < suite.tests.size) {
+        if (selected[index]) definitions.append(suite.tests[index])
+        index = index + 1
+    }
+    definitions
+}
+
 fun testPollExecution(
     var execution: TestExecution,
     suite: TestSuite,
@@ -498,15 +678,13 @@ fun runTestSuite(
     val logDirectory = testPath(options.root, suite.logDirectory)
     ablaHostCreateDirectories(logDirectory)
     val executions: array<TestExecution> = []
+    val selected = testSelectDefinitions(suite, options.filter)
     var index = 0
-    while (index < suite.tests.size) {
-        val test = suite.tests[index]
-        if (testContains(test.name, options.filter)) executions.append(
-            TestExecution(
-                test, executions.size, "pending", 0,
-                SupervisedProcess(0), 0, 0, 0, "", -1, false
-            )
-        )
+    while (index < selected.size) {
+        executions.append(TestExecution(
+            selected[index], executions.size, "pending", 0,
+            SupervisedProcess(0), 0, 0, 0, "", -1, false
+        ))
         index = index + 1
     }
     if (options.listOnly) {
@@ -518,7 +696,6 @@ fun runTestSuite(
         return TestRunSummary(0, 0, executions.size, 0)
     }
     val started = processMonotonicMilliseconds()
-    var nextToStart = 0
     var running = 0
     var passed = 0
     var failed = 0
@@ -553,33 +730,53 @@ fun runTestSuite(
             index = index + 1
         }
         var filling = !testExclusiveRunning(executions)
-        while (filling && running < jobs && nextToStart < executions.size &&
+        index = 0
+        while (filling && running < jobs && index < executions.size &&
             !(options.failFast && failed > 0)) {
-            if (!testPlatformMatches(executions[nextToStart].test.platform)) {
-                executions[nextToStart].state = "skipped"
-                skipped = skipped + 1
-                val name = executions[nextToStart].test.name
-                val platform = executions[nextToStart].test.platform
-                ablaHostWriteStdout("SKIP $name ($platform)\n")
-                nextToStart = nextToStart + 1
-            } else if (executions[nextToStart].test.exclusive && running > 0) {
-                filling = false
+            if (executions[index].state == "pending") {
+                if (!testPlatformMatches(executions[index].test.platform)) {
+                    executions[index].state = "skipped"
+                    skipped = skipped + 1
+                    val name = executions[index].test.name
+                    val platform = executions[index].test.platform
+                    ablaHostWriteStdout("SKIP $name ($platform)\n")
+                } else {
+                    val blocked = testBlockingDependency(
+                        executions[index], executions
+                    )
+                    if (blocked != "") {
+                        executions[index].state = "skipped"
+                        skipped = skipped + 1
+                        val name = executions[index].test.name
+                        ablaHostWriteStdout(
+                            "SKIP $name (dependency $blocked did not pass)\n"
+                        )
+                    } else if (testDependenciesPassed(
+                        executions[index], executions
+                    )) {
+                        if (executions[index].test.exclusive && running > 0) {
+                            filling = false
+                        } else {
+                            testStartStep(
+                                executions[index], suite, options, logDirectory
+                            )
+                            running = running + 1
+                            val exclusive = executions[index].test.exclusive
+                            if (exclusive) filling = false
+                        }
+                    }
+                }
             }
-            else {
-                testStartStep(
-                    executions[nextToStart], suite, options, logDirectory
-                )
-                running = running + 1
-                val exclusive = executions[nextToStart].test.exclusive
-                nextToStart = nextToStart + 1
-                if (exclusive) filling = false
-            }
+            index = index + 1
         }
         if (options.failFast && failed > 0 && running == 0) {
-            while (nextToStart < executions.size) {
-                executions[nextToStart].state = "skipped"
-                skipped = skipped + 1
-                nextToStart = nextToStart + 1
+            index = 0
+            while (index < executions.size) {
+                if (executions[index].state == "pending") {
+                    executions[index].state = "skipped"
+                    skipped = skipped + 1
+                }
+                index = index + 1
             }
         }
         if (running > 0) ablaHostSleep(5)

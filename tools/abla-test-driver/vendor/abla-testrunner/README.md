@@ -22,6 +22,7 @@ That makes orchestration difficult to reuse and leaves most suites sequential.
 - isolated stdout/stderr logs with failure output surfaced automatically;
 - suite and step environment overrides;
 - working directories without global `cd` state;
+- validated test dependencies with transitive filtered selection;
 - exclusive barriers for memory-heavy or stateful tests;
 - platform selection, name filtering, listing, and fail-fast mode; and
 - JSON manifests that can be generated and consumed on any host.
@@ -73,6 +74,14 @@ Create `abla-tests.json` in the project root:
       ]
     },
     {
+      "name": "crypto-integration",
+      "dependsOn": ["crypto"],
+      "steps": [{
+        "command": "${root}/build/crypto-test",
+        "expect": 42
+      }]
+    },
+    {
       "name": "database-integration",
       "exclusive": true,
       "platform": "linux",
@@ -89,6 +98,21 @@ Supported substitutions in commands, arguments, directories, and environment
 values are `${root}`, `${test}`, and `${log}`. Named `@name@` substitutions can
 be supplied with repeatable `--set name=value` options. `platform` may be
 `any`, `linux`, or `macos`.
+
+`dependsOn` accepts test names declared anywhere in the manifest. Dependencies
+must pass before a dependent can start. Unknown names, duplicates, self
+dependencies, and cycles are manifest errors. When a prerequisite fails or is
+skipped, its dependents are skipped without being launched. Filtering a test
+automatically selects its complete transitive dependency closure, so focused
+runs remain self-contained:
+
+```sh
+abla-test --filter crypto-integration
+```
+
+The command above runs both `crypto` and `crypto-integration`, in dependency
+order. `--list` applies the same closure and prints every test that would be
+needed by the run.
 
 Run it with:
 
@@ -119,8 +143,9 @@ fun main: int = runTestCommand(["--file", "tests/service.json"])
 
 Start by expressing each existing script as a test with direct command steps.
 This immediately centralizes parallelism, timeouts, exit-code checks, and logs.
-Then move shell-only setup into explicit Abla fixtures or reusable package APIs.
-Keep genuinely platform-specific integration tests marked with `platform`
-rather than branching throughout the suite.
+Then move shell-only setup into explicit Abla fixtures or reusable package APIs
+and connect consumers with `dependsOn`. Keep genuinely platform-specific
+integration tests marked with `platform` rather than branching throughout the
+suite.
 
 Licensed under the MIT License.
