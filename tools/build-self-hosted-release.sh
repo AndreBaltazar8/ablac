@@ -12,6 +12,7 @@ output=$2
 entry=${3:-src/orc_main.ab}
 emit_memory_mb=${ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB:-4096}
 object_memory_mb=${ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB:-4096}
+object_seconds=${ABLA_RELEASE_SELFHOST_BUILD_SECONDS:-300}
 emit_seconds=${ABLA_FINAL_SELFHOST_EMIT_SECONDS:-300}
 release_cache=${ABLA_RELEASE_SELFHOST_CACHE:-1}
 release_cache_root=${ABLA_RELEASE_SELFHOST_CACHE_DIR:-}
@@ -151,7 +152,7 @@ else
         'clang -O2 -flto -Wno-unused-command-line-argument -ffunction-sections -fdata-sections -c %q -o %q' \
         "$module" "$object"
 fi
-ABLA_MAX_MEMORY_MB=$object_memory_mb ABLA_MAX_SECONDS=180 \
+ABLA_MAX_MEMORY_MB=$object_memory_mb ABLA_MAX_SECONDS=$object_seconds \
     run_toolchain_command "$compile_command"
 
 if [[ $host_os == Darwin ]]; then
@@ -197,7 +198,7 @@ else
         "$object" "$value_runtime_object" "$host_runtime_object" \
         "$llvm_host_object" "$executable"
 fi
-ABLA_MAX_MEMORY_MB=$object_memory_mb ABLA_MAX_SECONDS=180 \
+ABLA_MAX_MEMORY_MB=$object_memory_mb ABLA_MAX_SECONDS=$object_seconds \
     run_toolchain_command "$link_command"
 
 [[ -s $module && -s $object && -x $executable ]]

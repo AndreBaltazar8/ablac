@@ -42,6 +42,9 @@ optimized executable instead of repeating whole-program O2 and LTO. Set
 `ABLA_RELEASE_SELFHOST_CACHE=0` for a deliberately cold backend measurement;
 `make clean` removes the ignored cache. The pure self-rebuild gate still emits
 both generations and compares their LLVM modules byte-for-byte.
+The separated object and link processes each retain a bounded 300-second
+default through `ABLA_RELEASE_SELFHOST_BUILD_SECONDS`; this is independent of
+the ordinary compiler watchdog and remains paired with the 4 GiB release cap.
 
 The final native conformance programs remain uncached O2 builds, but independent
 fixtures run concurrently under a memory-aware job cap. On the reference
