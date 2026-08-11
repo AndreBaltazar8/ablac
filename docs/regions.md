@@ -64,10 +64,10 @@ asserts that no Abla-managed argument survives the call; it does not grant
 permission to perform unsafe work, so `trusted` remains an independent
 capability boundary. A `noescape` contract on an Abla function or method is
 checked against its inferred effects. These summaries become typed-module
-interface data when separate compilation lands. Calls through function values
-are retaining unless the callable type eventually carries an equally strong
-effect contract; the baseline does not guess which target an arbitrary closure
-contains.
+interface data when separate compilation lands. `FnNoEscape(A) -> R` carries
+the same non-retention guarantee through a function value. Only a checked
+`noescape` declaration can satisfy that slot; ordinary callbacks remain
+conservatively retaining.
 
 ## Control flow and staging
 

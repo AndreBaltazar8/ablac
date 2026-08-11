@@ -27,7 +27,9 @@ class HttpEventFrame(
 resource class HttpEventServer(
     val router: HttpRouter,
     val handler: (HttpRequest) -> HttpResponse,
+    val noEscapeHandler: FnNoEscape(HttpRequest) -> HttpResponse,
     val useHandler: bool,
+    val useNoEscapeHandler: bool,
     val listener: TcpListener,
     val poller: SocketPoller,
     val options: HttpEventServerOptions,
@@ -65,7 +67,7 @@ fun httpEventServerOptions(): HttpEventServerOptions =
         1023, 65536, 1048576, 2097152, 100, 30000, 256, 5000
     )
 
-fun httpEventUnusedHandler(request: HttpRequest): HttpResponse =
+noescape fun httpEventUnusedHandler(request: HttpRequest): HttpResponse =
     httpText("event handler is unavailable", 500)
 
 fun httpEventServer(
@@ -81,7 +83,7 @@ fun httpEventServer(
         poller.watchDescriptor(listener.descriptor)
     }
     HttpEventServer(
-        router, httpEventUnusedHandler, false,
+        router, httpEventUnusedHandler, httpEventUnusedHandler, false, false,
         move(listener), move(poller), options,
         [], [], [], [], [], [], [], [], [], false, 0, false
     )
@@ -100,7 +102,26 @@ fun httpEventServerHandler(
         poller.watchDescriptor(listener.descriptor)
     }
     HttpEventServer(
-        httpRouter(), handler, true,
+        httpRouter(), handler, httpEventUnusedHandler, true, false,
+        move(listener), move(poller), options,
+        [], [], [], [], [], [], [], [], [], false, 0, false
+    )
+}
+
+fun httpEventServerNoEscapeHandler(
+    handler: FnNoEscape(HttpRequest) -> HttpResponse,
+    address: Ipv4SocketAddress,
+    options: HttpEventServerOptions = httpEventServerOptions(),
+    reusePort: bool = false
+): HttpEventServer {
+    val listener = tcpListenAddress(address, 1024, reusePort)
+    listener.setNonblocking()
+    val poller = socketPoller()
+    if (listener.descriptor >= 0 && poller.descriptor >= 0) {
+        poller.watchDescriptor(listener.descriptor)
+    }
+    HttpEventServer(
+        httpRouter(), httpEventUnusedHandler, handler, false, true,
         move(listener), move(poller), options,
         [], [], [], [], [], [], [], [], [], false, 0, false
     )
@@ -310,7 +331,64 @@ fun httpEventResponse(
     output
 }
 
+fun HttpEventServer.processNoEscapeSlot(slot: int): void {
+    var readyToWrite = false
+    var clearInput = false
+    region {
+        val frame = httpEventFrame(
+            this.inputs[slot],
+            this.options.maximumHeaderBytes,
+            this.options.maximumBodyBytes
+        )
+        val length = frame.length
+        if (length < 0) {
+            this.outputs[slot] = memoryPromoteString(
+                httpText("bad request", 400).render()
+            )
+            this.closing[slot] = true
+            readyToWrite = true
+        } else if (length > 0) {
+            var framed = this.inputs[slot]
+            if (length < this.inputs[slot].size) {
+                framed = this.inputs[slot].slice(0, length)
+                this.inputs[slot] = memoryPromoteString(
+                    this.inputs[slot].slice(length, this.inputs[slot].size)
+                )
+            } else clearInput = true
+            val availableRequest = frame.request
+            val request = if (availableRequest != null) availableRequest
+                else httpEventRequest(framed, this.options.maximumBodyBytes)
+            val eventHandler = this.noEscapeHandler
+            val response = eventHandler(request)
+            this.requestCounts[slot] = this.requestCounts[slot] + 1
+            val keepAlive = httpRequestKeepAlive(request) &&
+                !this.draining &&
+                this.requestCounts[slot] <
+                    this.options.maximumRequestsPerConnection
+            this.outputs[slot] = memoryPromoteString(httpEventResponse(
+                request, response, keepAlive,
+                this.options.gzipMinimumBytes
+            ))
+            this.outputOffsets[slot] = 0
+            this.closing[slot] = !keepAlive
+            readyToWrite = true
+        }
+        0
+    }
+    if (clearInput) this.inputs[slot] = ""
+    if (readyToWrite) {
+        if (this.outputs[slot].size > this.options.maximumPendingBytes) {
+            this.closeSlot(slot)
+        } else if (this.descriptors[slot] >= 0) this.writeReady(slot)
+    }
+    return
+}
+
 fun HttpEventServer.processSlot(slot: int): void {
+    if (this.useNoEscapeHandler) {
+        this.processNoEscapeSlot(slot)
+        return
+    }
     var processing = slot >= 0 && slot < this.descriptors.size &&
         this.descriptors[slot] >= 0 && this.outputs[slot] == ""
     while (processing) {

@@ -339,6 +339,13 @@ place and implements the capture as one shared mutable cell, so compiled and
 staged execution observe the same updates. `move { ... }` infers `FnOnce`.
 `FnMut` and `FnOnce` values are affine and cannot be copied accidentally.
 
+`FnNoEscape(A) -> R` is an orthogonal effect-bearing callable type. It proves
+that the callback does not retain any Abla-managed argument, so it may be
+invoked with region-owned values. A named `noescape fun` can satisfy this type;
+an ordinary function cannot be implicitly upgraded to it. The guarantee is
+checked transitively against the declaration's inferred receiver and parameter
+retention effects.
+
 `Cell<T>` is explicit interior mutability for copy scalars. It can be retained
 in a `val` field and changed only through `set`; `get` returns the scalar by
 value. Managed references and affine resources are rejected as cell payloads,
@@ -489,8 +496,9 @@ foreign declarations retain by default. `noescape extern` is the FFI promise
 that Abla-managed arguments do not survive the call; `trusted` separately
 controls whether unsafe operations are authorized. Nested regions reset in
 LIFO order. Arbitrary indirect calls remain conservatively retaining until
-function types carry region effects. Non-local exits are rejected until
-cleanup-bearing edges are part of the exception/control-flow model.
+their type is `FnNoEscape`; ordinary function values remain retaining.
+Non-local exits are rejected until cleanup-bearing edges are part of the
+exception/control-flow model.
 
 All tracked heaps have a hard cumulative allocation budget. The default is one
 GiB and portable `abla/memory` code may change it explicitly. Exceeding it is a

@@ -78,4 +78,22 @@ for fixture in "${fixtures[@]}"; do
     [[ ! -e $output ]]
 done
 
+noescape_callback_output="$output_directory/invalid-noescape-callback-type"
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/bootstrap/invalid-region-noescape-callback-type.ab" \
+    -o "$noescape_callback_output" \
+    >"$noescape_callback_output.out" \
+    2>"$noescape_callback_output.err"
+noescape_callback_status=$?
+set -e
+if [[ $noescape_callback_status -ne 1 ]] ||
+    ! grep -Fq 'function.argument:requireNoEscape' \
+        "$noescape_callback_output.err"; then
+    echo 'scoped region: ordinary callback satisfied FnNoEscape' >&2
+    sed -n '1,80p' "$noescape_callback_output.err" >&2
+    exit 1
+fi
+[[ ! -e $noescape_callback_output ]]
+
 echo 'scoped region: nested LIFO reset + affine drops + compile time + LLVM/C + retention effects passed'

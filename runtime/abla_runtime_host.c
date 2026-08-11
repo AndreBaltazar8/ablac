@@ -170,6 +170,17 @@ static size_t host_collection_index_capacity;
 static AblaAllocationHeader** host_mark_worklist;
 static size_t host_mark_worklist_count;
 
+static bool host_heap_lock_if_shared(void) {
+    if (atomic_load_explicit(
+            &host_active_threads, memory_order_acquire) == 0) return false;
+    (void)pthread_mutex_lock(&host_heap_lock);
+    return true;
+}
+
+static void host_heap_unlock_if_shared(bool locked) {
+    if (locked) (void)pthread_mutex_unlock(&host_heap_lock);
+}
+
 typedef enum AblaHostCoroutineState {
     ABLA_COROUTINE_CREATED,
     ABLA_COROUTINE_RUNNING,
@@ -564,7 +575,7 @@ static bool host_region_reset(uint64_t checkpoint) {
 }
 
 void* abla_platform_alloc(size_t size) {
-    (void)pthread_mutex_lock(&host_heap_lock);
+    const bool heap_locked = host_heap_lock_if_shared();
     host_initialize_allocation_limit();
     const size_t measured = size == 0 ? 1 : size;
     if (measured > SIZE_MAX - sizeof(AblaAllocationHeader) ||
@@ -613,7 +624,7 @@ void* abla_platform_alloc(size_t size) {
     host_allocation_live_bytes += measured;
     memset((void*)(header + 1), 0, measured);
     void* result = (void*)(header + 1);
-    (void)pthread_mutex_unlock(&host_heap_lock);
+    host_heap_unlock_if_shared(heap_locked);
     return result;
 }
 
@@ -645,9 +656,9 @@ static void host_platform_free_unlocked(void* pointer) {
 
 void abla_platform_free(void* pointer) {
     if (pointer == NULL) return;
-    (void)pthread_mutex_lock(&host_heap_lock);
+    const bool heap_locked = host_heap_lock_if_shared();
     host_platform_free_unlocked(pointer);
-    (void)pthread_mutex_unlock(&host_heap_lock);
+    host_heap_unlock_if_shared(heap_locked);
 }
 
 void abla_platform_memory_set_scan(void* pointer, int64_t scan_size) {
