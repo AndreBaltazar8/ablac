@@ -523,26 +523,57 @@ fun bootstrapLlvmDeclareGeneratedFunction(
 fun bootstrapLlvmDirectFunctionSymbol(name: string): string =
     "${name}_direct"
 
+fun bootstrapLlvmDirectScalarType(type: string): string {
+    val normalized = bootstrapNormalizeType(type)
+    if (normalized == "i64") "i64"
+    else if (normalized == "bool") "bool"
+    else ""
+}
+
+fun bootstrapLlvmDirectResultIsScalar(
+    function: BootstrapIrFunction
+): bool = bootstrapLlvmDirectScalarType(function.resultType) != ""
+
+fun bootstrapLlvmDirectParameterScalarType(
+    function: BootstrapIrFunction,
+    parameter: int
+): string {
+    if (parameter < 0 || parameter >= function.parameterTypes.size) ""
+    else bootstrapLlvmDirectScalarType(function.parameterTypes[parameter])
+}
+
 fun bootstrapLlvmDeclareDirectFunction(
     backend: BootstrapLlvmBackend,
     name: string,
-    parameterCount: int
+    function: BootstrapIrFunction
 ): i64* {
-    val parameters: array<i64*> = [
-        backend.pointerType, backend.i64Type
-    ]
+    val scalarResult = bootstrapLlvmDirectScalarType(
+        function.resultType
+    )
+    val parameters: array<i64*> = []
+    if (scalarResult == "") parameters.append(backend.pointerType)
+    parameters.append(backend.i64Type)
     var parameter = 0
-    while (parameter < parameterCount) {
-        parameters.append(backend.pointerType)
+    while (parameter < function.parameters.size) {
+        val scalar = bootstrapLlvmDirectParameterScalarType(
+            function, parameter
+        )
+        parameters.append(
+            if (scalar == "") backend.pointerType
+            else backend.type(scalar)
+        )
         parameter = parameter + 1
     }
-    val function = bootstrapLlvmDeclare(
-        backend, bootstrapLlvmDirectFunctionSymbol(name), backend.voidType,
-        parameters, true, bootstrapLlvmFalseFlags(parameters.size)
+    val declared = bootstrapLlvmDeclare(
+        backend, bootstrapLlvmDirectFunctionSymbol(name),
+        if (scalarResult == "") backend.voidType
+        else backend.type(scalarResult),
+        parameters, scalarResult == "",
+        bootstrapLlvmFalseFlags(parameters.size)
     )
-    LLVMSetLinkage(function, llvmExternalLinkage())
-    LLVMSetVisibility(function, llvmHiddenVisibility())
-    function
+    LLVMSetLinkage(declared, llvmExternalLinkage())
+    LLVMSetVisibility(declared, llvmHiddenVisibility())
+    declared
 }
 
 class BootstrapLlvmFunctionStorage(
@@ -738,7 +769,10 @@ fun bootstrapLlvmInitializeParameters(
     llvmFunction: i64*,
     storage: BootstrapLlvmFunctionStorage
 ): void {
-    val count = LLVMGetParam(llvmFunction, 1)
+    val scalarResult = bootstrapLlvmDirectResultIsScalar(function)
+    val countIndex = if (scalarResult) 0 else 1
+    val parameterBegin = countIndex + 1
+    val count = LLVMGetParam(llvmFunction, countIndex)
     var parameter = 0
     while (parameter < function.parameters.size) {
         val present = LLVMAppendBasicBlockInContext(
@@ -759,10 +793,24 @@ fun bootstrapLlvmInitializeParameters(
         )
         LLVMBuildCondBr(backend.builder, hasArgument, present, missing)
         LLVMPositionBuilderAtEnd(backend.builder, present)
-        val source = LLVMGetParam(llvmFunction, parameter + 2)
-        bootstrapLlvmCopyValue(
-            backend, source, storage.parameters[parameter], "argument"
+        val source = LLVMGetParam(
+            llvmFunction, parameter + parameterBegin
         )
+        val scalar = bootstrapLlvmDirectParameterScalarType(
+            function, parameter
+        )
+        if (scalar == "") {
+            bootstrapLlvmCopyValue(
+                backend, source, storage.parameters[parameter], "argument"
+            )
+        } else {
+            bootstrapLlvmCallNamed(
+                backend,
+                if (scalar == "bool") "abla_bool" else "abla_i64",
+                [storage.parameters[parameter], source],
+                "", true, [false, false]
+            )
+        }
         LLVMBuildBr(backend.builder, ready)
         LLVMPositionBuilderAtEnd(backend.builder, missing)
         bootstrapLlvmRuntimeCall(
@@ -889,17 +937,62 @@ fun bootstrapLlvmDirectCallArguments(
     operands: array<int>,
     output: i64*
 ): array<i64*> {
-    val arguments: array<i64*> = [
-        output, LLVMConstInt(backend.i64Type, operands.size, 0)
-    ]
+    val arguments: array<i64*> = []
+    if (!bootstrapLlvmDirectResultIsScalar(function)) {
+        arguments.append(output)
+    }
+    arguments.append(LLVMConstInt(
+        backend.i64Type, operands.size, 0
+    ))
     var parameter = 0
     while (parameter < function.parameters.size) {
+        val scalar = bootstrapLlvmDirectParameterScalarType(
+            function, parameter
+        )
         if (parameter < operands.size) {
-            arguments.append(storage.values[operands[parameter]])
-        } else arguments.append(LLVMConstNull(backend.pointerType))
+            if (scalar == "") {
+                arguments.append(storage.values[operands[parameter]])
+            } else {
+                arguments.append(bootstrapLlvmCallNamed(
+                    backend,
+                    if (scalar == "bool") "abla_as_bool"
+                    else "abla_as_i64",
+                    [storage.values[operands[parameter]]],
+                    "direct.argument", false, [true]
+                ))
+            }
+        } else {
+            arguments.append(
+                if (scalar == "") LLVMConstNull(backend.pointerType)
+                else LLVMConstInt(backend.type(scalar), 0, 0)
+            )
+        }
         parameter = parameter + 1
     }
     arguments
+}
+
+fun bootstrapLlvmEmitDirectCall(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    target: i64*,
+    arguments: array<i64*>,
+    output: i64*
+): void {
+    val scalar = bootstrapLlvmDirectScalarType(function.resultType)
+    val result = bootstrapLlvmCall(
+        backend, target, arguments,
+        if (scalar == "") "" else "direct.scalar",
+        scalar == "", bootstrapLlvmFalseFlags(arguments.size)
+    )
+    if (scalar != "") {
+        bootstrapLlvmCallNamed(
+            backend,
+            if (scalar == "bool") "abla_bool" else "abla_i64",
+            [output, result], "", true, [false, false]
+        )
+    }
+    return
 }
 
 fun bootstrapLlvmRuntimeOperation(opcode: string): string {
@@ -1113,6 +1206,36 @@ fun bootstrapLlvmLocalPointer(
     result
 }
 
+fun bootstrapLlvmEmitFunctionReturn(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    storage: BootstrapLlvmFunctionStorage,
+    value: int,
+    output: i64*
+): void {
+    val scalar = bootstrapLlvmDirectScalarType(function.resultType)
+    if (scalar != "") {
+        var native = LLVMConstInt(backend.type(scalar), 0, 0)
+        if (value >= 0) native = bootstrapLlvmCallNamed(
+                backend,
+                if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
+                [storage.values[value]], "direct.return", false, [true]
+            )
+        bootstrapLlvmPopRoots(backend, storage)
+        LLVMBuildRet(backend.builder, native)
+    } else {
+        if (value >= 0) bootstrapLlvmCopyValue(
+            backend, storage.values[value], output, "function.result"
+        )
+        else bootstrapLlvmRuntimeCall(
+            backend, "abla_void", output, []
+        )
+        bootstrapLlvmPopRoots(backend, storage)
+        LLVMBuildRetVoid(backend.builder)
+    }
+    return
+}
+
 fun bootstrapLlvmEmitFunction(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -1160,7 +1283,13 @@ fun bootstrapLlvmEmitFunction(
             "", false, []
         )
     }
-    val output = LLVMGetParam(llvmFunction, 0)
+    val scalarResult = bootstrapLlvmDirectResultIsScalar(function)
+    val output = if (scalarResult) {
+        nativeNullPointer()
+    } else LLVMGetParam(llvmFunction, 0)
+    val argumentCount = LLVMGetParam(
+        llvmFunction, if (scalarResult) 0 else 1
+    )
     var errors = 0
     var terminated = false
     var instructionIndex = 0
@@ -1255,7 +1384,7 @@ fun bootstrapLlvmEmitFunction(
                 )
                 val needed = LLVMBuildICmp(
                     backend.builder, llvmIntUnsignedLessOrEqual(),
-                    LLVMGetParam(llvmFunction, 1),
+                    argumentCount,
                     LLVMConstInt(backend.i64Type, instruction.right, 0),
                     "default.needed"
                 )
@@ -1383,15 +1512,16 @@ fun bootstrapLlvmEmitFunction(
                     backend, storage, program.functions[called],
                     [instruction.left], storage.auxiliary[instructionIndex]
                 )
-                bootstrapLlvmCall(
+                bootstrapLlvmEmitDirectCall(
                     backend,
+                    program.functions[called],
                     LLVMGetNamedFunction(
                         backend.module, bootstrapLlvmDirectFunctionSymbol(
                             identities.symbols[called]
                         )
                     ),
-                    arguments, "", true,
-                    bootstrapLlvmFalseFlags(arguments.size)
+                    arguments,
+                    storage.auxiliary[instructionIndex]
                 )
                 LLVMBuildBr(backend.builder, done)
                 LLVMPositionBuilderAtEnd(backend.builder, done)
@@ -1484,12 +1614,9 @@ fun bootstrapLlvmEmitFunction(
         }
         if (reachable && instruction.opcode == "return") {
             matched = true
-            bootstrapLlvmCopyValue(
-                backend, storage.values[instruction.left], output,
-                "early.return"
+            bootstrapLlvmEmitFunctionReturn(
+                backend, function, storage, instruction.left, output
             )
-            bootstrapLlvmPopRoots(backend, storage)
-            LLVMBuildRetVoid(backend.builder)
             terminated = true
         }
         if (reachable && instruction.opcode == "unreachable") {
@@ -1536,15 +1663,16 @@ fun bootstrapLlvmEmitFunction(
                     backend, storage, program.functions[called],
                     instruction.operands, storage.values[instruction.result]
                 )
-                bootstrapLlvmCall(
+                bootstrapLlvmEmitDirectCall(
                     backend,
+                    program.functions[called],
                     LLVMGetNamedFunction(
                         backend.module, bootstrapLlvmDirectFunctionSymbol(
                             identities.symbols[called]
                         )
                     ),
-                    arguments, "", true,
-                    bootstrapLlvmFalseFlags(arguments.size)
+                    arguments,
+                    storage.values[instruction.result]
                 )
             }
         }
@@ -1808,15 +1936,9 @@ fun bootstrapLlvmEmitFunction(
         instructionIndex = instructionIndex + 1
     }
     if (!terminated) {
-        if (function.result >= 0) bootstrapLlvmCopyValue(
-            backend, storage.values[function.result], output,
-            "function.result"
+        bootstrapLlvmEmitFunctionReturn(
+            backend, function, storage, function.result, output
         )
-        else bootstrapLlvmRuntimeCall(
-            backend, "abla_void", output, []
-        )
-        bootstrapLlvmPopRoots(backend, storage)
-        LLVMBuildRetVoid(backend.builder)
     }
     errors
 }
@@ -1835,6 +1957,51 @@ fun bootstrapLlvmAddPhiIncoming(
     blocks.drop()
 }
 
+fun bootstrapLlvmWrapperScalarArgument(
+    backend: BootstrapLlvmBackend,
+    wrapper: i64*,
+    values: i64*,
+    count: i64*,
+    parameter: int,
+    scalar: string
+): i64* {
+    val present = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.argument.present"
+    )
+    val missing = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.argument.missing"
+    )
+    val ready = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.argument.ready"
+    )
+    val available = LLVMBuildICmp(
+        backend.builder, llvmIntUnsignedGreaterThan(), count,
+        LLVMConstInt(backend.i64Type, parameter, 0),
+        "wrapper.argument.available"
+    )
+    LLVMBuildCondBr(backend.builder, available, present, missing)
+    LLVMPositionBuilderAtEnd(backend.builder, present)
+    val boxed = bootstrapLlvmValueElement(
+        backend, values, parameter, "wrapper.argument"
+    )
+    val native = bootstrapLlvmCallNamed(
+        backend,
+        if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
+        [boxed], "wrapper.scalar", false, [true]
+    )
+    LLVMBuildBr(backend.builder, ready)
+    LLVMPositionBuilderAtEnd(backend.builder, missing)
+    val zero = LLVMConstInt(backend.type(scalar), 0, 0)
+    LLVMBuildBr(backend.builder, ready)
+    LLVMPositionBuilderAtEnd(backend.builder, ready)
+    val result = LLVMBuildPhi(
+        backend.builder, backend.type(scalar), "wrapper.argument.scalar"
+    )
+    bootstrapLlvmAddPhiIncoming(result, native, present)
+    bootstrapLlvmAddPhiIncoming(result, zero, missing)
+    result
+}
+
 fun bootstrapLlvmEmitGeneratedWrapper(
     backend: BootstrapLlvmBackend,
     function: BootstrapIrFunction,
@@ -1851,17 +2018,29 @@ fun bootstrapLlvmEmitGeneratedWrapper(
     val output = LLVMGetParam(wrapper, 0)
     val values = LLVMGetParam(wrapper, 1)
     val count = LLVMGetParam(wrapper, 2)
-    val arguments: array<i64*> = [output, count]
+    val arguments: array<i64*> = []
+    if (!bootstrapLlvmDirectResultIsScalar(function)) {
+        arguments.append(output)
+    }
+    arguments.append(count)
     var parameter = 0
     while (parameter < function.parameters.size) {
-        arguments.append(bootstrapLlvmValueElement(
-            backend, values, parameter, "wrapper.argument"
-        ))
+        val scalar = bootstrapLlvmDirectParameterScalarType(
+            function, parameter
+        )
+        if (scalar == "") {
+            arguments.append(bootstrapLlvmValueElement(
+                backend, values, parameter, "wrapper.argument"
+            ))
+        } else {
+            arguments.append(bootstrapLlvmWrapperScalarArgument(
+                backend, wrapper, values, count, parameter, scalar
+            ))
+        }
         parameter = parameter + 1
     }
-    bootstrapLlvmCall(
-        backend, direct, arguments, "", true,
-        bootstrapLlvmFalseFlags(arguments.size)
+    bootstrapLlvmEmitDirectCall(
+        backend, function, direct, arguments, output
     )
     LLVMBuildRetVoid(backend.builder)
     if (false) LLVMDisposeMessage(nativeNullPointer())
@@ -2829,7 +3008,7 @@ fun bootstrapEmitLlvmProgram(
         )
         bootstrapLlvmDeclareDirectFunction(
             backend, identities.symbols[index],
-            program.functions[index].parameters.size
+            program.functions[index]
         )
         index = index + 1
     }
