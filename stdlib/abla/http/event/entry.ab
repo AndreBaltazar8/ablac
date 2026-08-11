@@ -333,6 +333,7 @@ fun httpEventResponse(
 
 fun HttpEventServer.processNoEscapeSlot(slot: int): void {
     var readyToWrite = false
+    var processMore = false
     var clearInput = false
     region {
         val frame = httpEventFrame(
@@ -365,13 +366,36 @@ fun HttpEventServer.processNoEscapeSlot(slot: int): void {
                 !this.draining &&
                 this.requestCounts[slot] <
                     this.options.maximumRequestsPerConnection
-            this.outputs[slot] = memoryPromoteString(httpEventResponse(
+            val framedResponse = httpEventResponse(
                 request, response, keepAlive,
                 this.options.gzipMinimumBytes
-            ))
-            this.outputOffsets[slot] = 0
+            )
             this.closing[slot] = !keepAlive
-            readyToWrite = true
+            if (framedResponse.size > this.options.maximumPendingBytes) {
+                this.closeSlot(slot)
+            } else if (this.descriptors[slot] >= 0) {
+                val connection = TcpConnection(this.descriptors[slot])
+                val written = connection.writeResult(framedResponse)
+                connection.descriptor = -1
+                if (written.written > 0) {
+                    this.lastActivityMilliseconds[slot] =
+                        linuxMonotonicMilliseconds()
+                }
+                if (written.failed() && written.errorCode != 11) {
+                    this.closeSlot(slot)
+                } else if (written.written >= framedResponse.size) {
+                    this.outputOffsets[slot] = 0
+                    if (this.closing[slot]) this.closeSlot(slot)
+                    else processMore = this.descriptors[slot] >= 0
+                } else {
+                    this.outputs[slot] = memoryPromoteString(framedResponse)
+                    this.outputOffsets[slot] = written.written
+                    if (!this.writeWatching[slot] &&
+                        this.poller.modifyDescriptor(
+                            this.descriptors[slot], true, true
+                        )) this.writeWatching[slot] = true
+                }
+            }
         }
         0
     }
@@ -381,6 +405,7 @@ fun HttpEventServer.processNoEscapeSlot(slot: int): void {
             this.closeSlot(slot)
         } else if (this.descriptors[slot] >= 0) this.writeReady(slot)
     }
+    if (processMore && this.descriptors[slot] >= 0) this.processSlot(slot)
     return
 }
 
