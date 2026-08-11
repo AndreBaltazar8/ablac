@@ -200,3 +200,19 @@ AblaValue ablaRuntimeMemorySetLimit(AblaValue limit) {
 AblaValue ablaRuntimeMemoryCollect(void) {
     return abla_i64(abla_platform_memory_collect((void*)0));
 }
+AblaValue ablaRuntimeMemoryPromoteString(AblaValue value) {
+    const char* source = abla_string_data(value);
+    const size_t length = value.as.string.length;
+    char* data = (char*)abla_platform_alloc(length + 1);
+    for (size_t index = 0; index < length; ++index) data[index] = source[index];
+    data[length] = '\0';
+    AblaValue result = abla_string_static(data, length);
+    result.as.string.owner = data;
+    return result;
+}
+AblaValue ablaRuntimeRegionBegin(void) {
+    return ablaRuntimeMemoryCheckpoint();
+}
+AblaValue ablaRuntimeRegionEnd(AblaValue checkpoint) {
+    return ablaRuntimeMemoryReset(checkpoint);
+}

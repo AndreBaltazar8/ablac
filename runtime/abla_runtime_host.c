@@ -99,11 +99,13 @@ static void host_set_tls_error(const char* message) {
     (void)snprintf(host_tls_error, sizeof(host_tls_error), "%s", message);
 }
 
+typedef struct AblaHostRegion AblaHostRegion;
 typedef union AblaAllocationHeader AblaAllocationHeader;
 union AblaAllocationHeader {
     struct {
         AblaAllocationHeader* previous;
         AblaAllocationHeader* next;
+        AblaHostRegion* region;
         uint64_t generation;
         size_t size;
         size_t scan_size;
@@ -111,6 +113,21 @@ union AblaAllocationHeader {
         AblaStringRope* cache_owner;
     } allocation;
     max_align_t alignment;
+};
+
+typedef struct AblaHostRegionPage {
+    struct AblaHostRegionPage* next;
+    size_t used;
+    size_t capacity;
+    unsigned char* data;
+} AblaHostRegionPage;
+
+struct AblaHostRegion {
+    uint64_t checkpoint;
+    AblaAllocationHeader* head;
+    AblaAllocationHeader* tail;
+    AblaHostRegionPage* pages;
+    size_t live_bytes;
 };
 
 static AblaAllocationHeader* host_allocation_head;
@@ -128,6 +145,16 @@ static _Thread_local AblaRuntimeRootFrame* host_root_frame;
 // request-heavy services spend disproportionate time sorting and returning a
 // huge fragmented heap to malloc during each pressure collection.
 static size_t host_collection_threshold = (size_t)32 * 1024 * 1024;
+#define HOST_REGION_MAXIMUM_DEPTH 64
+#define HOST_REGION_PAGE_BYTES ((size_t)1024 * 1024)
+#define HOST_REGION_CACHED_PAGES 32
+static _Thread_local AblaHostRegion
+    host_regions[HOST_REGION_MAXIMUM_DEPTH];
+static _Thread_local size_t host_region_depth;
+static _Thread_local AblaHostRegionPage* host_region_page_cache;
+static _Thread_local size_t host_region_page_cache_count;
+static _Thread_local bool host_region_override_active;
+static _Thread_local AblaHostRegion* host_region_override;
 static pthread_mutex_t host_heap_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_size_t host_active_threads;
 typedef struct AblaCheckedFrame {
@@ -441,6 +468,101 @@ static AblaValue host_owned_string(const char* data, size_t length) {
             .rope = (AblaStringRope*)0}};
 }
 
+static AblaHostRegionPage* host_region_page_acquire(size_t minimum) {
+    AblaHostRegionPage* page = NULL;
+    size_t capacity = HOST_REGION_PAGE_BYTES;
+    if (minimum <= HOST_REGION_PAGE_BYTES &&
+        host_region_page_cache != NULL) {
+        page = host_region_page_cache;
+        host_region_page_cache = page->next;
+        --host_region_page_cache_count;
+    } else {
+        if (capacity < minimum) capacity = minimum;
+        const size_t alignment = _Alignof(max_align_t);
+        if (capacity > SIZE_MAX - sizeof(*page) - alignment) {
+            abla_platform_panic("region allocation overflow", 26);
+        }
+        page = (AblaHostRegionPage*)malloc(
+            sizeof(*page) + capacity + alignment - 1);
+        if (page == NULL) abla_platform_panic("out of memory", 13);
+        const uintptr_t bytes = (uintptr_t)(page + 1);
+        page->data = (unsigned char*)(
+            (bytes + alignment - 1) & ~(uintptr_t)(alignment - 1));
+        page->capacity = capacity;
+    }
+    page->next = NULL;
+    page->used = 0;
+    return page;
+}
+
+static void host_region_pages_release(AblaHostRegionPage* page) {
+    while (page != NULL) {
+        AblaHostRegionPage* next = page->next;
+        if (page->capacity == HOST_REGION_PAGE_BYTES &&
+            host_region_page_cache_count < HOST_REGION_CACHED_PAGES) {
+            page->used = 0;
+            page->next = host_region_page_cache;
+            host_region_page_cache = page;
+            ++host_region_page_cache_count;
+        } else {
+            free(page);
+        }
+        page = next;
+    }
+}
+
+static AblaAllocationHeader* host_region_allocate(
+    AblaHostRegion* region,
+    size_t measured) {
+    const size_t alignment = _Alignof(max_align_t);
+    if (measured > SIZE_MAX - sizeof(AblaAllocationHeader) - alignment) {
+        abla_platform_panic("region allocation overflow", 26);
+    }
+    const size_t required = sizeof(AblaAllocationHeader) + measured;
+    AblaHostRegionPage* page = region->pages;
+    size_t offset = 0;
+    if (page != NULL) {
+        offset = (page->used + alignment - 1) & ~(alignment - 1);
+    }
+    if (page == NULL || offset > page->capacity ||
+        required > page->capacity - offset) {
+        page = host_region_page_acquire(required + alignment - 1);
+        page->next = region->pages;
+        region->pages = page;
+        offset = 0;
+    }
+    AblaAllocationHeader* header =
+        (AblaAllocationHeader*)(void*)(page->data + offset);
+    page->used = offset + required;
+    return header;
+}
+
+static int64_t host_region_begin(void) {
+    if (host_region_depth >= HOST_REGION_MAXIMUM_DEPTH) {
+        abla_platform_panic("region nesting limit exceeded", 29);
+    }
+    AblaHostRegion* region = &host_regions[host_region_depth++];
+    memset(region, 0, sizeof(*region));
+    region->checkpoint = host_allocation_generation;
+    return (int64_t)region->checkpoint;
+}
+
+static bool host_region_reset(uint64_t checkpoint) {
+    if (host_region_depth == 0) return false;
+    AblaHostRegion* region = &host_regions[host_region_depth - 1];
+    if (region->checkpoint != checkpoint) {
+        abla_platform_panic("regions must reset in LIFO order", 32);
+    }
+    if (host_allocation_live_bytes < region->live_bytes) {
+        abla_platform_panic("region accounting underflow", 27);
+    }
+    host_allocation_live_bytes -= region->live_bytes;
+    host_region_pages_release(region->pages);
+    memset(region, 0, sizeof(*region));
+    --host_region_depth;
+    return true;
+}
+
 void* abla_platform_alloc(size_t size) {
     (void)pthread_mutex_lock(&host_heap_lock);
     host_initialize_allocation_limit();
@@ -454,11 +576,21 @@ void* abla_platform_alloc(size_t size) {
         measured > host_allocation_limit - host_allocation_live_bytes) {
         abla_platform_panic("memory limit exceeded", 21);
     }
-    AblaAllocationHeader* header = (AblaAllocationHeader*)malloc(
-        sizeof(AblaAllocationHeader) + measured);
+    AblaHostRegion* region = host_region_override_active
+        ? host_region_override
+        : (host_region_depth == 0
+            ? NULL
+            : &host_regions[host_region_depth - 1]);
+    AblaAllocationHeader* header = region == NULL
+        ? (AblaAllocationHeader*)malloc(
+            sizeof(AblaAllocationHeader) + measured)
+        : host_region_allocate(region, measured);
     if (header == NULL) abla_platform_panic("out of memory", 13);
-    header->allocation.previous = host_allocation_tail;
+    header->allocation.previous = region == NULL
+        ? host_allocation_tail
+        : region->tail;
     header->allocation.next = NULL;
+    header->allocation.region = region;
     header->allocation.generation = ++host_allocation_generation;
     header->allocation.size = measured;
     header->allocation.scan_size = measured;
@@ -466,12 +598,18 @@ void* abla_platform_alloc(size_t size) {
     // managed layout immediately after allocation.
     header->allocation.scan_layout = 1;
     header->allocation.cache_owner = NULL;
-    if (host_allocation_tail != NULL) {
+    if (region != NULL) {
+        if (region->tail != NULL) {
+            region->tail->allocation.next = header;
+        } else region->head = header;
+        region->tail = header;
+        region->live_bytes += measured;
+    } else if (host_allocation_tail != NULL) {
         host_allocation_tail->allocation.next = header;
     } else {
         host_allocation_head = header;
     }
-    host_allocation_tail = header;
+    if (region == NULL) host_allocation_tail = header;
     host_allocation_live_bytes += measured;
     memset((void*)(header + 1), 0, measured);
     void* result = (void*)(header + 1);
@@ -482,19 +620,27 @@ void* abla_platform_alloc(size_t size) {
 static void host_platform_free_unlocked(void* pointer) {
     if (pointer == NULL) return;
     AblaAllocationHeader* header = ((AblaAllocationHeader*)pointer) - 1;
+    AblaHostRegion* region = header->allocation.region;
     if (header->allocation.previous != NULL) {
         header->allocation.previous->allocation.next = header->allocation.next;
     } else {
-        host_allocation_head = header->allocation.next;
+        if (region == NULL) host_allocation_head = header->allocation.next;
+        else region->head = header->allocation.next;
     }
     if (header->allocation.next != NULL) {
         header->allocation.next->allocation.previous =
             header->allocation.previous;
     } else {
-        host_allocation_tail = header->allocation.previous;
+        if (region == NULL) host_allocation_tail =
+            header->allocation.previous;
+        else region->tail = header->allocation.previous;
     }
     host_allocation_live_bytes -= header->allocation.size;
-    free(header);
+    if (region == NULL) free(header);
+    else {
+        region->live_bytes -= header->allocation.size;
+        header->allocation.size = 0;
+    }
 }
 
 void abla_platform_free(void* pointer) {
@@ -3064,6 +3210,17 @@ static bool host_mark_allocation(const AblaAllocationHeader* header) {
     return host_mark_words(payload, size);
 }
 
+static void host_collection_index_add(AblaAllocationHeader* header) {
+    const uintptr_t payload = (uintptr_t)(header + 1);
+    const size_t mask = host_collection_index_capacity - 1;
+    size_t slot = (size_t)((payload >> 4) *
+        UINT64_C(11400714819323198485)) & mask;
+    while (host_collection_index[slot] != NULL) {
+        slot = (slot + 1) & mask;
+    }
+    host_collection_index[slot] = header;
+}
+
 int64_t abla_platform_memory_collect(void* opaque_frames) {
     if (atomic_load_explicit(
             &host_active_threads, memory_order_acquire) != 0) return 0;
@@ -3072,6 +3229,12 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
     for (AblaAllocationHeader* header = host_allocation_tail;
          header != NULL; header = header->allocation.previous) {
         ++allocation_count;
+    }
+    for (size_t depth = 0; depth < host_region_depth; ++depth) {
+        for (AblaAllocationHeader* header = host_regions[depth].tail;
+             header != NULL; header = header->allocation.previous) {
+            ++allocation_count;
+        }
     }
     if (allocation_count > SIZE_MAX / 2) {
         abla_platform_panic("collection index overflow", 25);
@@ -3110,14 +3273,13 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
     host_mark_worklist_count = 0;
     for (AblaAllocationHeader* header = host_allocation_tail;
          header != NULL; header = header->allocation.previous) {
-        const uintptr_t payload = (uintptr_t)(header + 1);
-        const size_t mask = host_collection_index_capacity - 1;
-        size_t slot = (size_t)((payload >> 4) *
-            UINT64_C(11400714819323198485)) & mask;
-        while (host_collection_index[slot] != NULL) {
-            slot = (slot + 1) & mask;
+        host_collection_index_add(header);
+    }
+    for (size_t depth = 0; depth < host_region_depth; ++depth) {
+        for (AblaAllocationHeader* header = host_regions[depth].tail;
+             header != NULL; header = header->allocation.previous) {
+            host_collection_index_add(header);
         }
-        host_collection_index[slot] = header;
     }
     (void)host_mark_root_frames((AblaRuntimeRootFrame*)opaque_frames);
     if (host_current_coroutine != NULL) {
@@ -3139,6 +3301,13 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
             host_platform_free_unlocked((void*)(header + 1));
         }
         header = previous;
+    }
+    for (size_t depth = 0; depth < host_region_depth; ++depth) {
+        for (AblaAllocationHeader* region_header = host_regions[depth].tail;
+             region_header != NULL;
+             region_header = region_header->allocation.previous) {
+            region_header->allocation.generation &= INT64_MAX;
+        }
     }
     free(host_collection_index);
     host_collection_index = NULL;
@@ -3417,6 +3586,36 @@ AblaValue abla_await(AblaValue operation) {
 
 AblaValue ablaRuntimeMemoryCollect(void) {
     return host_value_i64(abla_platform_memory_collect(host_root_frame));
+}
+
+AblaValue ablaRuntimeMemoryPromoteString(AblaValue value) {
+    if (value.tag != ABLA_STRING) {
+        abla_platform_panic("expected string", 15);
+    }
+    const char* data = host_value_string_data(value);
+    const bool previous_active = host_region_override_active;
+    AblaHostRegion* previous_region = host_region_override;
+    host_region_override_active = true;
+    host_region_override = host_region_depth < 2
+        ? NULL
+        : &host_regions[host_region_depth - 2];
+    AblaValue promoted = host_owned_string(data, value.as.string.length);
+    host_region_override = previous_region;
+    host_region_override_active = previous_active;
+    return promoted;
+}
+
+AblaValue ablaRuntimeRegionBegin(void) {
+    return host_value_i64(host_region_begin());
+}
+
+AblaValue ablaRuntimeRegionEnd(AblaValue checkpoint_value) {
+    const int64_t checkpoint = host_value_as_i64(checkpoint_value);
+    if (checkpoint < 0 ||
+        !host_region_reset((uint64_t)checkpoint)) {
+        abla_platform_panic("invalid region checkpoint", 25);
+    }
+    return host_value_void();
 }
 
 ABLA_HOST_FALLBACK void abla_runtime_roots_push(

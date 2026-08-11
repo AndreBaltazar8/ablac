@@ -520,6 +520,31 @@ fun bootstrapLlvmDeclareGeneratedFunction(
     function
 }
 
+fun bootstrapLlvmDirectFunctionSymbol(name: string): string =
+    "${name}_direct"
+
+fun bootstrapLlvmDeclareDirectFunction(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    parameterCount: int
+): i64* {
+    val parameters: array<i64*> = [
+        backend.pointerType, backend.i64Type
+    ]
+    var parameter = 0
+    while (parameter < parameterCount) {
+        parameters.append(backend.pointerType)
+        parameter = parameter + 1
+    }
+    val function = bootstrapLlvmDeclare(
+        backend, bootstrapLlvmDirectFunctionSymbol(name), backend.voidType,
+        parameters, true, bootstrapLlvmFalseFlags(parameters.size)
+    )
+    LLVMSetLinkage(function, llvmExternalLinkage())
+    LLVMSetVisibility(function, llvmHiddenVisibility())
+    function
+}
+
 class BootstrapLlvmFunctionStorage(
     val values: array<i64*>,
     val locals: array<i64*>,
@@ -608,8 +633,7 @@ fun bootstrapLlvmCreateFunctionStorage(
         locals.append(local)
         var storage: i64* = nullPointer
         var storageType: i64* = nullPointer
-        if ((instruction.opcode == "call" ||
-             instruction.opcode == "closure.create" ||
+        if ((instruction.opcode == "closure.create" ||
              instruction.opcode == "array.create") &&
             instruction.operands.size > 0) {
             storageType = LLVMArrayType2(
@@ -628,13 +652,6 @@ fun bootstrapLlvmCreateFunctionStorage(
             )
             storage = LLVMBuildAlloca(
                 backend.builder, storageType, "indirect.arguments"
-            )
-            LLVMSetAlignment(storage, 8)
-        }
-        if (instruction.opcode == "resource.drop") {
-            storageType = LLVMArrayType2(backend.valueType, 1)
-            storage = LLVMBuildAlloca(
-                backend.builder, storageType, "drop.arguments"
             )
             LLVMSetAlignment(storage, 8)
         }
@@ -721,8 +738,7 @@ fun bootstrapLlvmInitializeParameters(
     llvmFunction: i64*,
     storage: BootstrapLlvmFunctionStorage
 ): void {
-    val arguments = LLVMGetParam(llvmFunction, 1)
-    val count = LLVMGetParam(llvmFunction, 2)
+    val count = LLVMGetParam(llvmFunction, 1)
     var parameter = 0
     while (parameter < function.parameters.size) {
         val present = LLVMAppendBasicBlockInContext(
@@ -743,9 +759,7 @@ fun bootstrapLlvmInitializeParameters(
         )
         LLVMBuildCondBr(backend.builder, hasArgument, present, missing)
         LLVMPositionBuilderAtEnd(backend.builder, present)
-        val source = bootstrapLlvmValueElement(
-            backend, arguments, parameter, "argument.pointer"
-        )
+        val source = LLVMGetParam(llvmFunction, parameter + 2)
         bootstrapLlvmCopyValue(
             backend, source, storage.parameters[parameter], "argument"
         )
@@ -866,6 +880,26 @@ fun bootstrapLlvmPrepareArguments(
         )
     }
     result
+}
+
+fun bootstrapLlvmDirectCallArguments(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    function: BootstrapIrFunction,
+    operands: array<int>,
+    output: i64*
+): array<i64*> {
+    val arguments: array<i64*> = [
+        output, LLVMConstInt(backend.i64Type, operands.size, 0)
+    ]
+    var parameter = 0
+    while (parameter < function.parameters.size) {
+        if (parameter < operands.size) {
+            arguments.append(storage.values[operands[parameter]])
+        } else arguments.append(LLVMConstNull(backend.pointerType))
+        parameter = parameter + 1
+    }
+    arguments
 }
 
 fun bootstrapLlvmRuntimeOperation(opcode: string): string {
@@ -1093,13 +1127,22 @@ fun bootstrapLlvmEmitFunction(
     mayCollect: array<bool>
 ): int {
     val llvmFunction = LLVMGetNamedFunction(
-        backend.module, identities.symbols[functionId]
+        backend.module,
+        bootstrapLlvmDirectFunctionSymbol(identities.symbols[functionId])
     )
     val entry = LLVMAppendBasicBlockInContext(
         backend.context, llvmFunction, "entry"
     )
     LLVMPositionBuilderAtEnd(backend.builder, entry)
     val collecting = functionId < mayCollect.size && mayCollect[functionId]
+    var directlyAllocates = false
+    var allocationInstruction = 0
+    while (allocationInstruction < function.instructions.size) {
+        if (bootstrapLlvmInstructionMayAllocate(
+            function.instructions[allocationInstruction]
+        )) directlyAllocates = true
+        allocationInstruction = allocationInstruction + 1
+    }
     var rootValues: array<bool> = []
     if (collecting) rootValues = bootstrapLlvmGcRootPlan(
         function, functionIndex, mayCollect
@@ -1111,7 +1154,7 @@ fun bootstrapLlvmEmitFunction(
         backend, function, llvmFunction, storage
     )
     bootstrapLlvmPushRoots(backend, storage)
-    if (collecting) {
+    if (collecting && directlyAllocates) {
         bootstrapLlvmCallNamed(
             backend, "abla_runtime_memory_pressure", [],
             "", false, []
@@ -1212,7 +1255,7 @@ fun bootstrapLlvmEmitFunction(
                 )
                 val needed = LLVMBuildICmp(
                     backend.builder, llvmIntUnsignedLessOrEqual(),
-                    LLVMGetParam(llvmFunction, 2),
+                    LLVMGetParam(llvmFunction, 1),
                     LLVMConstInt(backend.i64Type, instruction.right, 0),
                     "default.needed"
                 )
@@ -1336,18 +1379,19 @@ fun bootstrapLlvmEmitFunction(
                 )
                 LLVMBuildCondBr(backend.builder, active, run, done)
                 LLVMPositionBuilderAtEnd(backend.builder, run)
-                val argument = bootstrapLlvmPrepareArguments(
-                    backend, storage, instructionIndex,
-                    [instruction.left], 0
+                val arguments = bootstrapLlvmDirectCallArguments(
+                    backend, storage, program.functions[called],
+                    [instruction.left], storage.auxiliary[instructionIndex]
                 )
                 bootstrapLlvmCall(
                     backend,
                     LLVMGetNamedFunction(
-                        backend.module, identities.symbols[called]
+                        backend.module, bootstrapLlvmDirectFunctionSymbol(
+                            identities.symbols[called]
+                        )
                     ),
-                    [storage.auxiliary[instructionIndex], argument,
-                     LLVMConstInt(backend.i64Type, 1, 0)],
-                    "", true, [false, false, false]
+                    arguments, "", true,
+                    bootstrapLlvmFalseFlags(arguments.size)
                 )
                 LLVMBuildBr(backend.builder, done)
                 LLVMPositionBuilderAtEnd(backend.builder, done)
@@ -1488,20 +1532,19 @@ fun bootstrapLlvmEmitFunction(
             val called = functionIndex.find(instruction.text)
             if (called < 0) supported = false
             if (called >= 0) {
-                val arguments = bootstrapLlvmPrepareArguments(
-                    backend, storage, instructionIndex,
-                    instruction.operands, 0
+                val arguments = bootstrapLlvmDirectCallArguments(
+                    backend, storage, program.functions[called],
+                    instruction.operands, storage.values[instruction.result]
                 )
                 bootstrapLlvmCall(
                     backend,
                     LLVMGetNamedFunction(
-                        backend.module, identities.symbols[called]
+                        backend.module, bootstrapLlvmDirectFunctionSymbol(
+                            identities.symbols[called]
+                        )
                     ),
-                    [storage.values[instruction.result], arguments,
-                     LLVMConstInt(
-                         backend.i64Type, instruction.operands.size, 0
-                     )],
-                    "", true, [false, false, false]
+                    arguments, "", true,
+                    bootstrapLlvmFalseFlags(arguments.size)
                 )
             }
         }
@@ -1790,6 +1833,38 @@ fun bootstrapLlvmAddPhiIncoming(
     LLVMAddIncoming(phi, values.pointer(), blocks.pointer(), 1)
     values.drop()
     blocks.drop()
+}
+
+fun bootstrapLlvmEmitGeneratedWrapper(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    symbol: string
+): void {
+    val wrapper = LLVMGetNamedFunction(backend.module, symbol)
+    val direct = LLVMGetNamedFunction(
+        backend.module, bootstrapLlvmDirectFunctionSymbol(symbol)
+    )
+    val entry = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "entry"
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val output = LLVMGetParam(wrapper, 0)
+    val values = LLVMGetParam(wrapper, 1)
+    val count = LLVMGetParam(wrapper, 2)
+    val arguments: array<i64*> = [output, count]
+    var parameter = 0
+    while (parameter < function.parameters.size) {
+        arguments.append(bootstrapLlvmValueElement(
+            backend, values, parameter, "wrapper.argument"
+        ))
+        parameter = parameter + 1
+    }
+    bootstrapLlvmCall(
+        backend, direct, arguments, "", true,
+        bootstrapLlvmFalseFlags(arguments.size)
+    )
+    LLVMBuildRetVoid(backend.builder)
+    if (false) LLVMDisposeMessage(nativeNullPointer())
 }
 
 fun bootstrapLlvmDeclareDispatchers(
@@ -2752,6 +2827,10 @@ fun bootstrapEmitLlvmProgram(
         bootstrapLlvmDeclareGeneratedFunction(
             backend, identities.symbols[index]
         )
+        bootstrapLlvmDeclareDirectFunction(
+            backend, identities.symbols[index],
+            program.functions[index].parameters.size
+        )
         index = index + 1
     }
     var errors = program.errors + identities.collisions +
@@ -2767,6 +2846,13 @@ fun bootstrapEmitLlvmProgram(
         )
         errors = errors + functionErrors
         runtimeMemoryReset(emissionCheckpoint)
+        index = index + 1
+    }
+    index = 0
+    while (index < program.functions.size) {
+        bootstrapLlvmEmitGeneratedWrapper(
+            backend, program.functions[index], identities.symbols[index]
+        )
         index = index + 1
     }
     bootstrapLlvmEmitClosureDispatchers(

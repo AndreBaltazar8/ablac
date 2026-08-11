@@ -9,9 +9,10 @@ mkdir -p "$output_directory"
 
 source_file="$project_root/tests/cases/modules/scoped-region.ab"
 "$compiler" --emit-llvm "$source_file" > "$output_directory/program.ll"
-if ! grep -Fq '@abla_runtime_memory_checkpoint' \
+if ! grep -Eq '@(abla_runtime_memory_checkpoint|ablaRuntimeMemoryCheckpoint|ablaRuntimeRegionBegin)' \
         "$output_directory/program.ll" ||
-    ! grep -Fq '@abla_runtime_memory_reset' "$output_directory/program.ll"; then
+    ! grep -Eq '@(abla_runtime_memory_reset|ablaRuntimeMemoryReset|ablaRuntimeRegionEnd)' \
+        "$output_directory/program.ll"; then
     echo 'scoped region: LLVM cleanup intrinsics were not emitted' >&2
     exit 1
 fi

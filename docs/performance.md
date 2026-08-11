@@ -470,6 +470,36 @@ region placement for non-escaping request graphs, and a generational collector
 with write barriers. Disabling collection or weakening the language model would
 hide rather than solve the measured gap.
 
+### Direct calls and lexical response regions (2026-08-11)
+
+The next measured pass gives compiler-generated direct calls a typed pointer
+ABI while retaining the generic `(output, arguments, count)` wrappers required
+by closures, exports, reflection, and indirect dispatch. It also limits
+function-entry memory-pressure checks to functions that can both reach the
+collector and allocate directly. The comparison server contains 433 static
+pressure calls after this change, down from 544, without weakening collection
+at an allocation boundary.
+
+Abla lexical `region` scopes now use nested, page-backed bump allocation in the
+host runtime. Region exit reclaims its pages in bulk and a bounded thread-local
+page cache reuses them; manually freed region objects are unlinked safely and
+the tracing collector continues to understand live region allocations. A
+separate `memoryPromoteString` operation copies a region-owned string into its
+parent allocation domain when it must escape. Raw targets retain their previous
+no-op region reclamation semantics.
+
+The event HTTP server applies the region only to response construction, after
+the user handler has returned, and promotes the completed wire response before
+storing it in the connection slot. This deliberately leaves request parsing and
+the arbitrary handler outside the region because a handler may retain request
+data. In an isolated A/B run at 64 connections, this safe boundary improved the
+three-run median from **92,273 to 103,428 requests/second** (**12.1%**), p50 from
+0.490 to 0.469 ms, and p99 from 0.969 to 0.932 ms. Retired work fell from about
+83,922 to **75,940 instructions/request**, and from 43,214 to **37,851
+cycles/request**. Allocator-related samples fell from roughly 19% to 13% of the
+profile. The full 73-fixture suite and byte-identical self-rebuild pass with the
+optimization enabled.
+
 ## Reachability and size result
 
 The first LLVM size pass marks Abla implementation functions internal, limits
