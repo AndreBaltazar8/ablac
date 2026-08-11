@@ -220,6 +220,11 @@ AblaValue ablaUnsafeLoadU8(AblaValue address);
 AblaValue ablaUnsafeStoreU8(AblaValue address, AblaValue value);
 AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length);
 AblaValue ablaUnsafeBorrowCString(AblaValue address);
+AblaValue ablaLinuxTcpReadCompact(AblaValue descriptor, AblaValue maximum);
+AblaValue ablaLinuxPollWaitCompact(
+    AblaValue descriptor,
+    AblaValue maximum,
+    AblaValue timeout);
 AblaValue ablaBitAnd(AblaValue left, AblaValue right);
 AblaValue ablaBitOr(AblaValue left, AblaValue right);
 AblaValue ablaBitXor(AblaValue left, AblaValue right);
@@ -343,6 +348,18 @@ AblaValue abla_string_length(AblaValue value);
 AblaValue abla_string_get(AblaValue value, AblaValue index);
 AblaValue abla_string_slice(AblaValue value, AblaValue begin, AblaValue end);
 AblaValue ablaUtf8EncodeScalar(AblaValue value);
+AblaValue ablaTextFindSequence(
+    AblaValue text,
+    AblaValue sequence,
+    AblaValue begin,
+    AblaValue end);
+AblaValue ablaTextFindByte(
+    AblaValue text,
+    AblaValue byte,
+    AblaValue begin,
+    AblaValue end);
+AblaValue ablaTextAsciiEqualInsensitive(AblaValue left, AblaValue right);
+AblaValue ablaTextReadU32LittleEndian(AblaValue text, AblaValue offset);
 AblaValue abla_length(AblaValue value);
 AblaValue abla_index_get(AblaValue value, AblaValue index);
 AblaValue abla_array_create(const AblaValue* values, size_t count);

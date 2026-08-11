@@ -414,6 +414,32 @@ reference LLVM IR byte-for-byte. Large generated runtime strings also exercise
 the new seed-C constant chunking path rather than relying on non-portable C
 translation limits.
 
+## Managed HTTP service result
+
+On 2026-08-11, the single-CPU `abla-compare` HTTP/1.1 keep-alive benchmark
+improved from **4.7 requests/second** with 12.9-second median latency to a
+three-run median of **41,511 requests/second**, **1.085 ms p50**, and **1.325 ms
+p99** at 64 concurrent connections. The response and status are validated
+before every run; Go and Rust use the same endpoint, connection count, CPU
+isolation, warm-up, and measurement intervals.
+
+The principal memory bug was an ownership transition, not inherent collector
+cost. Native socket buffers begin pinned because an integer address is invisible
+to tracing, but adopting one as a managed string failed to change its scan
+layout. Every read therefore retained the old 65,537-byte buffer forever. The
+fix makes adopted storage collectible and covers that transfer with a direct
+collection regression. A sustained two-minute load run is recorded in the
+comparison repository alongside its RSS high-water measurement.
+
+The throughput work also replaces byte-at-a-time Abla HTTP scans with bounded
+text intrinsics, retains slices as collector-safe views, parses each framed
+request once, maps descriptors directly to connection slots, reads exact-size
+4 KiB chunks, consumes packed poll events without a temporary object graph,
+and attempts small writes before requesting another poll wake-up. Partial
+writes retain the existing offset and backpressure behavior. The full
+73-fixture conformance suite, byte-identical self-rebuild, hosted HTTP tests,
+and static raw-target server all pass with these paths enabled.
+
 ## Reachability and size result
 
 The first LLVM size pass marks Abla implementation functions internal, limits

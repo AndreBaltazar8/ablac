@@ -124,7 +124,10 @@ static size_t host_allocation_live_bytes;
 static size_t host_allocation_limit = (size_t)1024 * 1024 * 1024;
 static bool host_allocation_limit_initialized;
 static _Thread_local AblaRuntimeRootFrame* host_root_frame;
-static size_t host_collection_threshold = (size_t)256 * 1024 * 1024;
+// Keep young short-lived allocation batches small. Large 256 MiB batches made
+// request-heavy services spend disproportionate time sorting and returning a
+// huge fragmented heap to malloc during each pressure collection.
+static size_t host_collection_threshold = (size_t)32 * 1024 * 1024;
 static pthread_mutex_t host_heap_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_size_t host_active_threads;
 typedef struct AblaCheckedFrame {
@@ -325,7 +328,12 @@ static const char* host_value_string_data(AblaValue value) {
 }
 
 static const char* host_value_as_cstring(AblaValue value) {
-    return host_value_string_data(value);
+    const char* data = host_value_string_data(value);
+    if (data[value.as.string.length] == '\0') return data;
+    char* terminated = (char*)abla_platform_alloc(value.as.string.length + 1);
+    memcpy(terminated, data, value.as.string.length);
+    terminated[value.as.string.length] = '\0';
+    return terminated;
 }
 
 static void* host_value_as_pointer(AblaValue value) {
@@ -654,6 +662,11 @@ AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length_value) {
     if (length < 0) abla_platform_panic("negative string length", 22);
     char* data = (char*)host_value_as_pointer(address);
     data[(size_t)length] = '\0';
+    // ablaUnsafeAllocate pins native buffers because an integer pointer is not
+    // visible to the managed marker. Adoption transfers that allocation into
+    // a normal string value, so it must become collectible once the string is
+    // unreachable. Leaving layout 10 here leaked every adopted socket read.
+    abla_platform_memory_set_layout(data, 1);
     return (AblaValue){
         .tag = ABLA_STRING,
         .as.string = {
@@ -666,6 +679,90 @@ AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length_value) {
 AblaValue ablaUnsafeBorrowCString(AblaValue address) {
     const char* text = (const char*)host_value_as_pointer(address);
     return host_value_string_static(text, strlen(text));
+}
+
+AblaValue ablaLinuxTcpReadCompact(
+    AblaValue descriptor_value,
+    AblaValue maximum_value) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    const int64_t maximum = host_value_as_i64(maximum_value);
+    if (descriptor < 0 || maximum <= 0 || maximum > 16384) {
+        return host_value_string_static("", 0);
+    }
+    char buffer[16384];
+    ssize_t measured = -1;
+    do {
+        measured = read(descriptor, buffer, (size_t)maximum);
+    } while (measured < 0 && errno == EINTR);
+    if (measured <= 0) return host_value_string_static("", 0);
+    return host_owned_string(buffer, (size_t)measured);
+}
+
+static void host_compact_store_u32(
+    char* output,
+    size_t offset,
+    uint32_t value) {
+    output[offset] = (char)(value & 255);
+    output[offset + 1] = (char)((value >> 8) & 255);
+    output[offset + 2] = (char)((value >> 16) & 255);
+    output[offset + 3] = (char)((value >> 24) & 255);
+}
+
+AblaValue ablaLinuxPollWaitCompact(
+    AblaValue descriptor_value,
+    AblaValue maximum_value,
+    AblaValue timeout_value) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    const int64_t maximum = host_value_as_i64(maximum_value);
+    const int64_t timeout = host_value_as_i64(timeout_value);
+    if (descriptor < 0 || maximum <= 0 || maximum > 1024 ||
+        timeout < 0 || timeout > 600000) {
+        return host_value_string_static("", 0);
+    }
+    char encoded[1024 * 12];
+    int measured = -1;
+#if defined(__APPLE__)
+    struct kevent events[1024];
+    const struct timespec duration = {
+        .tv_sec = timeout / 1000,
+        .tv_nsec = (timeout % 1000) * 1000000};
+    do {
+        measured = kevent(
+            descriptor, NULL, 0, events, (int)maximum, &duration);
+    } while (measured < 0 && errno == EINTR);
+    for (int index = 0; index < measured; ++index) {
+        uint32_t flags = 0;
+        if (events[index].filter == EVFILT_READ) flags |= 1;
+        if (events[index].filter == EVFILT_WRITE) flags |= 4;
+        if ((events[index].flags & EV_EOF) != 0) flags |= 16;
+        if ((events[index].flags & EV_ERROR) != 0) flags |= 8;
+        host_compact_store_u32(encoded, (size_t)index * 12, flags);
+        host_compact_store_u32(
+            encoded, (size_t)index * 12 + 4,
+            (uint32_t)events[index].ident);
+        host_compact_store_u32(encoded, (size_t)index * 12 + 8, 0);
+    }
+#else
+    struct epoll_event events[1024];
+    do {
+        measured = epoll_wait(
+            descriptor, events, (int)maximum, (int)timeout);
+    } while (measured < 0 && errno == EINTR);
+    for (int index = 0; index < measured; ++index) {
+        uint32_t flags = 0;
+        if ((events[index].events & EPOLLIN) != 0) flags |= 1;
+        if ((events[index].events & EPOLLOUT) != 0) flags |= 4;
+        if ((events[index].events & (EPOLLHUP | EPOLLRDHUP)) != 0) flags |= 16;
+        if ((events[index].events & EPOLLERR) != 0) flags |= 8;
+        host_compact_store_u32(encoded, (size_t)index * 12, flags);
+        host_compact_store_u32(
+            encoded, (size_t)index * 12 + 4,
+            (uint32_t)events[index].data.fd);
+        host_compact_store_u32(encoded, (size_t)index * 12 + 8, 0);
+    }
+#endif
+    if (measured <= 0) return host_value_string_static("", 0);
+    return host_owned_string(encoded, (size_t)measured * 12);
 }
 
 #if defined(__APPLE__)
@@ -2779,14 +2876,13 @@ static bool host_mark_pointer(uintptr_t candidate) {
             const size_t middle = begin + (end - begin) / 2;
             const uintptr_t payload =
                 (uintptr_t)(host_collection_index[middle] + 1);
-            if (payload < candidate) begin = middle + 1;
+            if (payload <= candidate) begin = middle + 1;
             else end = middle;
         }
-        if (begin >= host_collection_index_count ||
-            (uintptr_t)(host_collection_index[begin] + 1) != candidate) {
-            return false;
-        }
-        AblaAllocationHeader* header = host_collection_index[begin];
+        if (begin == 0) return false;
+        AblaAllocationHeader* header = host_collection_index[begin - 1];
+        const uintptr_t payload = (uintptr_t)(header + 1);
+        if (candidate - payload >= header->allocation.size) return false;
         if ((header->allocation.generation >> 63) != 0) return false;
         header->allocation.generation |= UINT64_C(1) << 63;
         if (host_mark_worklist_count >= host_collection_index_count) {
@@ -2797,7 +2893,9 @@ static bool host_mark_pointer(uintptr_t candidate) {
     }
     AblaAllocationHeader* header = host_allocation_tail;
     while (header != NULL) {
-        if ((uintptr_t)(header + 1) == candidate) {
+        const uintptr_t payload = (uintptr_t)(header + 1);
+        if (candidate >= payload &&
+            candidate - payload < header->allocation.size) {
             if ((header->allocation.generation >> 63) != 0) return false;
             header->allocation.generation |= UINT64_C(1) << 63;
             return true;

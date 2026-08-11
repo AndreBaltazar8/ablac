@@ -72,6 +72,7 @@ AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length) {
     char* data = (char*)raw_as_pointer(address);
     const int64_t size = abla_as_i64(length);
     data[size] = '\0';
+    abla_platform_memory_set_layout(data, 1);
     AblaValue result = abla_string_static(data, (size_t)size);
     result.as.string.owned = true;
     return result;
@@ -81,6 +82,66 @@ AblaValue ablaUnsafeBorrowCString(AblaValue address) {
     size_t length = 0;
     while (data[length] != '\0') ++length;
     return abla_string_static(data, length);
+}
+
+AblaValue ablaLinuxTcpReadCompact(
+    AblaValue descriptor_value,
+    AblaValue maximum_value) {
+    const int64_t descriptor = abla_as_i64(descriptor_value);
+    const int64_t maximum = abla_as_i64(maximum_value);
+    if (descriptor < 0 || maximum <= 0 || maximum > 16384) {
+        return abla_string_static("", 0);
+    }
+    char buffer[16384];
+    int64_t measured;
+    do {
+        __asm__ volatile(
+            "syscall"
+            : "=a"(measured)
+            : "a"(INT64_C(0)), "D"(descriptor), "S"(buffer), "d"(maximum)
+            : "rcx", "r11", "memory");
+    } while (measured == -4);
+    if (measured <= 0) return abla_string_static("", 0);
+    char* data = (char*)abla_platform_alloc((size_t)measured + 1);
+    for (int64_t index = 0; index < measured; ++index) {
+        data[index] = buffer[index];
+    }
+    data[measured] = '\0';
+    AblaValue result = abla_string_static(data, (size_t)measured);
+    result.as.string.owned = true;
+    return result;
+}
+
+AblaValue ablaLinuxPollWaitCompact(
+    AblaValue descriptor_value,
+    AblaValue maximum_value,
+    AblaValue timeout_value) {
+    const int64_t descriptor = abla_as_i64(descriptor_value);
+    const int64_t maximum = abla_as_i64(maximum_value);
+    const int64_t timeout = abla_as_i64(timeout_value);
+    if (descriptor < 0 || maximum <= 0 || maximum > 1024 ||
+        timeout < 0 || timeout > 600000) {
+        return abla_string_static("", 0);
+    }
+    char events[1024 * 12];
+    int64_t measured;
+    do {
+        register int64_t argument3 __asm__("r10") = timeout;
+        __asm__ volatile(
+            "syscall"
+            : "=a"(measured)
+            : "a"(INT64_C(232)), "D"(descriptor), "S"(events),
+              "d"(maximum), "r"(argument3)
+            : "rcx", "r11", "memory");
+    } while (measured == -4);
+    if (measured <= 0) return abla_string_static("", 0);
+    const size_t length = (size_t)measured * 12;
+    char* data = (char*)abla_platform_alloc(length + 1);
+    for (size_t index = 0; index < length; ++index) data[index] = events[index];
+    data[length] = '\0';
+    AblaValue result = abla_string_static(data, length);
+    result.as.string.owned = true;
+    return result;
 }
 
 AblaValue ablaLinuxSyscall(

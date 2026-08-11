@@ -80,6 +80,12 @@ static void copy_bytes(char* destination, const char* source, size_t count) {
     for (size_t index = 0; index < count; ++index) destination[index] = source[index];
 }
 
+static bool equal_bytes(const char* left, const char* right, size_t count) {
+    size_t index = 0;
+    while (index < count && left[index] == right[index]) ++index;
+    return index == count;
+}
+
 static const char* string_data(AblaString value) {
     if (value.data != (const char*)0) return value.data;
     if (value.rope == (AblaStringRope*)0) {
@@ -226,7 +232,12 @@ bool abla_as_bool(AblaValue value) {
 }
 const char* abla_as_cstring(AblaValue value) {
     if (value.tag != ABLA_STRING) panic("expected string", 15);
-    return string_data(value.as.string);
+    const char* data = string_data(value.as.string);
+    if (data[value.as.string.length] == '\0') return data;
+    char* terminated = (char*)abla_platform_alloc(value.as.string.length + 1);
+    copy_bytes(terminated, data, value.as.string.length);
+    terminated[value.as.string.length] = '\0';
+    return terminated;
 }
 const char* abla_string_data(AblaValue value) {
     if (value.tag != ABLA_STRING) panic("expected string", 15);
@@ -573,16 +584,15 @@ AblaValue abla_string_slice(
     if (begin < 0 || end < begin || (uint64_t)end > value.as.string.length) {
         panic("string slice is out of bounds", 29);
     }
+    if (begin == 0 && (uint64_t)end == value.as.string.length) return value;
     const size_t length = (size_t)(end - begin);
-    char* text = (char*)abla_platform_alloc(length + 1);
-    copy_bytes(text, string_data(value.as.string) + (size_t)begin, length);
-    text[length] = '\0';
+    if (length == 0) return abla_string_static("", 0);
     return (AblaValue){
         .tag = ABLA_STRING,
         .as.string = {
-            .data = text,
+            .data = string_data(value.as.string) + (size_t)begin,
             .length = length,
-            .owned = true,
+            .owned = false,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -623,6 +633,95 @@ AblaValue ablaUtf8EncodeScalar(AblaValue value) {
             .length = length,
             .owned = true,
             .rope = (AblaStringRope*)0}};
+}
+
+AblaValue ablaTextFindSequence(
+    AblaValue text,
+    AblaValue sequence,
+    AblaValue begin_value,
+    AblaValue end_value) {
+    if (text.tag != ABLA_STRING || sequence.tag != ABLA_STRING) {
+        panic("text search expects strings", 27);
+    }
+    const int64_t begin = abla_as_i64(begin_value);
+    const int64_t end = abla_as_i64(end_value);
+    if (begin < 0 || end < begin || (uint64_t)end > text.as.string.length) {
+        return abla_i64(-1);
+    }
+    const size_t first = (size_t)begin;
+    const size_t limit = (size_t)end;
+    const size_t wanted = sequence.as.string.length;
+    if (wanted == 0) return abla_i64(begin);
+    if (wanted > limit - first) return abla_i64(-1);
+    const char* source = string_data(text.as.string);
+    const char* needle = string_data(sequence.as.string);
+    size_t index = first;
+    const size_t last = limit - wanted;
+    while (index <= last) {
+        if (source[index] == needle[0] &&
+            (wanted == 1 || equal_bytes(source + index, needle, wanted))) {
+            return abla_i64((int64_t)index);
+        }
+        ++index;
+    }
+    return abla_i64(-1);
+}
+
+AblaValue ablaTextFindByte(
+    AblaValue text,
+    AblaValue byte_value,
+    AblaValue begin_value,
+    AblaValue end_value) {
+    if (text.tag != ABLA_STRING) panic("byte search expects text", 24);
+    const int64_t byte = abla_as_i64(byte_value);
+    const int64_t begin = abla_as_i64(begin_value);
+    const int64_t end = abla_as_i64(end_value);
+    if (byte < 0 || byte > 255 || begin < 0 || end < begin ||
+        (uint64_t)end > text.as.string.length) {
+        return abla_i64(-1);
+    }
+    const char* source = string_data(text.as.string);
+    size_t index = (size_t)begin;
+    const size_t limit = (size_t)end;
+    while (index < limit && (uint8_t)source[index] != (uint8_t)byte) ++index;
+    return abla_i64(index < limit ? (int64_t)index : -1);
+}
+
+AblaValue ablaTextAsciiEqualInsensitive(AblaValue left, AblaValue right) {
+    if (left.tag != ABLA_STRING || right.tag != ABLA_STRING) {
+        panic("ASCII comparison expects strings", 32);
+    }
+    if (left.as.string.length != right.as.string.length) {
+        return abla_bool(false);
+    }
+    const char* left_data = string_data(left.as.string);
+    const char* right_data = string_data(right.as.string);
+    size_t index = 0;
+    while (index < left.as.string.length) {
+        uint8_t left_byte = (uint8_t)left_data[index];
+        uint8_t right_byte = (uint8_t)right_data[index];
+        if (left_byte >= 'A' && left_byte <= 'Z') left_byte += 'a' - 'A';
+        if (right_byte >= 'A' && right_byte <= 'Z') right_byte += 'a' - 'A';
+        if (left_byte != right_byte) return abla_bool(false);
+        ++index;
+    }
+    return abla_bool(true);
+}
+
+AblaValue ablaTextReadU32LittleEndian(AblaValue text, AblaValue offset_value) {
+    if (text.tag != ABLA_STRING) panic("byte decoding expects text", 26);
+    const int64_t offset = abla_as_i64(offset_value);
+    if (offset < 0 || (uint64_t)offset > text.as.string.length ||
+        text.as.string.length - (size_t)offset < 4) {
+        return abla_i64(-1);
+    }
+    const uint8_t* bytes =
+        (const uint8_t*)string_data(text.as.string) + (size_t)offset;
+    return abla_i64((int64_t)(
+        (uint32_t)bytes[0] |
+        (uint32_t)bytes[1] << 8 |
+        (uint32_t)bytes[2] << 16 |
+        (uint32_t)bytes[3] << 24));
 }
 
 AblaValue ablaBitAnd(AblaValue left, AblaValue right) {

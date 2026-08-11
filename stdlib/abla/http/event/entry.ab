@@ -5,6 +5,7 @@ import "abla/http"
 import "abla/http/stream"
 import "abla/net"
 import "abla/sys/linux/process"
+import "abla/text"
 
 class HttpEventServerOptions(
     val maximumConnections: int,
@@ -17,6 +18,11 @@ class HttpEventServerOptions(
     val drainTimeoutMilliseconds: int
 )
 
+class HttpEventFrame(
+    val length: int,
+    val request: HttpRequest?
+)
+
 resource class HttpEventServer(
     val router: HttpRouter,
     val handler: (HttpRequest) -> HttpResponse,
@@ -25,6 +31,7 @@ resource class HttpEventServer(
     val poller: SocketPoller,
     val options: HttpEventServerOptions,
     val descriptors: array<int>,
+    val descriptorSlots: array<int>,
     val inputs: array<string>,
     val outputs: array<string>,
     val outputOffsets: array<int>,
@@ -73,7 +80,7 @@ fun httpEventServer(
     HttpEventServer(
         router, httpEventUnusedHandler, false,
         move(listener), move(poller), options,
-        [], [], [], [], [], [], [], false, 0, false
+        [], [], [], [], [], [], [], [], false, 0, false
     )
 }
 
@@ -91,7 +98,7 @@ fun httpEventServerHandler(
     HttpEventServer(
         httpRouter(), handler, true,
         move(listener), move(poller), options,
-        [], [], [], [], [], [], [], false, 0, false
+        [], [], [], [], [], [], [], [], false, 0, false
     )
 }
 
@@ -106,13 +113,9 @@ fun HttpEventServer.activeConnections(): int {
 }
 
 fun HttpEventServer.findDescriptor(descriptor: int): int {
-    var found = -1
-    var index = 0
-    while (found < 0 && index < this.descriptors.size) {
-        if (this.descriptors[index] == descriptor) found = index
-        index = index + 1
-    }
-    found
+    if (descriptor >= 0 && descriptor < this.descriptorSlots.size) {
+        this.descriptorSlots[descriptor]
+    } else -1
 }
 
 fun HttpEventServer.allocateSlot(descriptor: int): int {
@@ -140,6 +143,10 @@ fun HttpEventServer.allocateSlot(descriptor: int): int {
         this.closing[slot] = false
         this.lastActivityMilliseconds[slot] = linuxMonotonicMilliseconds()
     }
+    while (this.descriptorSlots.size <= descriptor) {
+        this.descriptorSlots.append(-1)
+    }
+    this.descriptorSlots[descriptor] = slot
     slot
 }
 
@@ -147,6 +154,9 @@ fun HttpEventServer.closeSlot(slot: int): void {
     if (slot >= 0 && slot < this.descriptors.size &&
         this.descriptors[slot] >= 0) {
         this.poller.unwatchDescriptor(this.descriptors[slot])
+        if (this.descriptors[slot] < this.descriptorSlots.size) {
+            this.descriptorSlots[this.descriptors[slot]] = -1
+        }
         linuxTcpCloseDescriptor(this.descriptors[slot])
         this.descriptors[slot] = -1
         this.inputs[slot] = ""
@@ -211,51 +221,114 @@ fun httpEventRequest(
     result
 }
 
+fun httpEventFrame(
+    input: string,
+    maximumHeader: int,
+    maximumBody: int
+): HttpEventFrame {
+    val headerEnd = httpHeaderEnd(input)
+    var length = 0
+    var framedRequest: HttpRequest? = null
+    if (headerEnd < 0 && input.size > maximumHeader) length = -1
+    if (headerEnd >= 0) {
+        // Parse the request head once and retain it for dispatch. The previous
+        // event path parsed every complete request once to discover framing,
+        // discarded that graph, then parsed the same bytes again.
+        val request = httpParseRequest(input)
+        val transfer = request.header("Transfer-Encoding")
+        if (httpHeaderTokenContains(transfer, "chunked")) {
+            val decoded = httpDecodeChunked(
+                input.slice(headerEnd, input.size), maximumBody
+            )
+            if (decoded.error != "") length = -1
+            else if (decoded.complete) {
+                length = headerEnd + decoded.consumed
+                framedRequest = HttpRequest(
+                    request.method, request.path, request.query,
+                    request.headers, decoded.body,
+                    request.parameterNames, request.parameterValues
+                )
+            }
+        } else {
+            var bodyLength = 0
+            val encoded = request.header("Content-Length")
+            if (encoded != "") {
+                bodyLength = httpDecimalLength(encoded, maximumBody)
+            }
+            if (bodyLength < 0) length = -1
+            else if (input.size >= headerEnd + bodyLength) {
+                length = headerEnd + bodyLength
+                if (length == input.size) framedRequest = request
+                else framedRequest = HttpRequest(
+                    request.method, request.path, request.query,
+                    request.headers,
+                    input.slice(headerEnd, length),
+                    request.parameterNames, request.parameterValues
+                )
+            }
+        }
+    }
+    HttpEventFrame(length, framedRequest)
+}
+
 fun httpEventResponse(
     request: HttpRequest,
     response: HttpResponse,
     keepAlive: bool,
     gzipMinimumBytes: int
 ): string {
-    val encoded = httpGzipResponse(request, response, gzipMinimumBytes)
-    val headers: array<HttpHeader> = []
+    var encoded = response
+    if (response.body.size >= gzipMinimumBytes) {
+        encoded = httpGzipResponse(request, response, gzipMinimumBytes)
+    }
+    var output = "HTTP/1.1 ${encoded.status} ${httpStatusReason(encoded.status)}\r\n"
+    var hasLength = false
     var index = 0
     while (index < encoded.headers.size) {
-        if (!httpAsciiEqualInsensitive(
-            encoded.headers[index].name, "Connection"
-        )) headers.append(encoded.headers[index])
+        val header = encoded.headers[index]
+        if (!httpAsciiEqualInsensitive(header.name, "Connection")) {
+            output = "$output${header.name}: ${header.value}\r\n"
+            if (httpAsciiEqualInsensitive(header.name, "Content-Length")) {
+                hasLength = true
+            }
+        }
         index = index + 1
     }
-    headers.append(HttpHeader(
-        "Connection", if (keepAlive) "keep-alive" else "close"
-    ))
-    val finalResponse = HttpResponse(encoded.status, headers, encoded.body)
-    if (request.method == "HEAD") finalResponse.renderHead()
-    else finalResponse.render()
+    output = "${output}Connection: ${if (keepAlive) "keep-alive" else "close"}\r\n"
+    if (!hasLength && encoded.status != 101) {
+        output = "${output}Content-Length: ${encoded.body.size}\r\n"
+    }
+    output = "$output\r\n"
+    if (request.method != "HEAD") output = "$output${encoded.body}"
+    output
 }
 
 fun HttpEventServer.processSlot(slot: int): void {
     var processing = slot >= 0 && slot < this.descriptors.size &&
         this.descriptors[slot] >= 0 && this.outputs[slot] == ""
     while (processing) {
-        val length = httpEventRequestLength(
+        val frame = httpEventFrame(
             this.inputs[slot],
             this.options.maximumHeaderBytes,
             this.options.maximumBodyBytes
         )
+        val length = frame.length
         if (length < 0) {
             this.outputs[slot] = httpText("bad request", 400).render()
             this.closing[slot] = true
             processing = false
         } else if (length == 0) processing = false
         else {
-            val framed = this.inputs[slot].slice(0, length)
-            this.inputs[slot] = this.inputs[slot].slice(
-                length, this.inputs[slot].size
-            )
-            val request = httpEventRequest(
-                framed, this.options.maximumBodyBytes
-            )
+            var framed = this.inputs[slot]
+            if (length < this.inputs[slot].size) {
+                framed = this.inputs[slot].slice(0, length)
+                this.inputs[slot] = this.inputs[slot].slice(
+                    length, this.inputs[slot].size
+                )
+            } else this.inputs[slot] = ""
+            val availableRequest = frame.request
+            val request = if (availableRequest != null) availableRequest
+                else httpEventRequest(framed, this.options.maximumBodyBytes)
             var response = this.router.dispatch(request)
             if (this.useHandler) {
                 val eventHandler = this.handler
@@ -276,9 +349,11 @@ fun HttpEventServer.processSlot(slot: int): void {
                 this.options.maximumPendingBytes) {
                 this.closeSlot(slot)
             } else if (this.descriptors[slot] >= 0) {
-                this.poller.modifyDescriptor(
-                    this.descriptors[slot], true, true
-                )
+                // A small response will normally fit in the socket send
+                // buffer immediately. Try it here instead of always paying
+                // for a second epoll wake-up; writeReady retains the exact
+                // same backpressure path when the write is partial.
+                this.writeReady(slot)
             }
             processing = false
         }
@@ -306,22 +381,26 @@ fun HttpEventServer.acceptReady(): void {
 }
 
 fun HttpEventServer.readReady(slot: int): void {
-    if (slot >= 0 && this.descriptors[slot] >= 0) {
+    var reading = slot >= 0 && this.descriptors[slot] >= 0
+    while (reading) {
         val connection = TcpConnection(this.descriptors[slot])
-        val incoming = connection.readResult(65536)
+        // Most HTTP request heads fit in 4 KiB. Allocating the old 64 KiB
+        // buffer for every small keep-alive request dominated tracked memory
+        // traffic. Continue only after a full chunk so edge-triggered sockets
+        // are still drained for large headers and bodies.
+        val incoming = connection.readCompact(4096)
         connection.descriptor = -1
-        if (incoming.hasData()) {
+        if (incoming.size > 0) {
             this.lastActivityMilliseconds[slot] = linuxMonotonicMilliseconds()
-            this.inputs[slot] = "${this.inputs[slot]}${incoming.bytes}"
+            this.inputs[slot] = "${this.inputs[slot]}$incoming"
             if (this.inputs[slot].size >
                 this.options.maximumHeaderBytes +
                 this.options.maximumBodyBytes) {
                 this.closeSlot(slot)
             } else this.processSlot(slot)
-        } else if (incoming.reachedEof() ||
-            (incoming.failed() && incoming.errorCode != 11)) {
-            this.closeSlot(slot)
-        }
+            reading = incoming.size == 4096 &&
+                this.descriptors[slot] >= 0
+        } else reading = false
     }
     return
 }
@@ -360,30 +439,35 @@ fun HttpEventServer.step(timeoutMilliseconds: int = 1000): int {
     var handled = 0
     var maximumEvents = this.options.maximumConnections + 1
     if (maximumEvents > 1024) maximumEvents = 1024
-    val events = this.poller.wait(
+    val events = this.poller.waitCompact(
         maximumEvents,
         timeoutMilliseconds
     )
     var index = 0
-    while (index < events.events.size) {
-        val event = events.events[index]
+    while (index + 12 <= events.size) {
+        val flags = textReadU32LittleEndian(events, index)
+        val descriptor = textReadU32LittleEndian(events, index + 4)
+        val readable = (flags & 1) != 0
+        val writable = (flags & 4) != 0
+        val closed = (flags & 16) != 0
+        val error = (flags & 8) != 0
         if (!this.draining &&
-            event.descriptor == this.listener.descriptor && event.readable) {
+            descriptor == this.listener.descriptor && readable) {
             this.acceptReady()
             handled = handled + 1
         } else {
-            val slot = this.findDescriptor(event.descriptor)
+            val slot = this.findDescriptor(descriptor)
             if (slot >= 0) {
-                if (event.error || event.closed) this.closeSlot(slot)
+                if (error || closed) this.closeSlot(slot)
                 else {
-                    if (event.readable) this.readReady(slot)
-                    if (event.writable && slot < this.descriptors.size &&
+                    if (readable) this.readReady(slot)
+                    if (writable && slot < this.descriptors.size &&
                         this.descriptors[slot] >= 0) this.writeReady(slot)
                 }
                 handled = handled + 1
             }
         }
-        index = index + 1
+        index = index + 12
     }
     if (this.options.idleTimeoutMilliseconds > 0) {
         val now = linuxMonotonicMilliseconds()
