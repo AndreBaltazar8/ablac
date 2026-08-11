@@ -190,7 +190,7 @@ AblaValue abla_string_static(const char* data, size_t length) {
         .as.string = {
             .data = data,
             .length = length,
-            .owned = false,
+            .owner = (const char*)0,
             .rope = (AblaStringRope*)0}};
 }
 AblaValue abla_function(uint32_t function) {
@@ -527,7 +527,7 @@ AblaValue abla_to_string(AblaValue value) {
         .as.string = {
             .data = text,
             .length = length,
-            .owned = true,
+            .owner = text,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -552,7 +552,7 @@ AblaValue abla_string_concat(AblaValue left, AblaValue right) {
         .as.string = {
             .data = (const char*)0,
             .length = length,
-            .owned = false,
+            .owner = (const char*)0,
             .rope = rope}};
 }
 
@@ -587,12 +587,15 @@ AblaValue abla_string_slice(
     if (begin == 0 && (uint64_t)end == value.as.string.length) return value;
     const size_t length = (size_t)(end - begin);
     if (length == 0) return abla_string_static("", 0);
+    const char* data = string_data(value.as.string);
+    const char* owner = value.as.string.owner;
+    if (owner == (const char*)0 && value.as.string.rope != NULL) owner = data;
     return (AblaValue){
         .tag = ABLA_STRING,
         .as.string = {
-            .data = string_data(value.as.string) + (size_t)begin,
+            .data = data + (size_t)begin,
             .length = length,
-            .owned = false,
+            .owner = owner,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -631,7 +634,7 @@ AblaValue ablaUtf8EncodeScalar(AblaValue value) {
         .as.string = {
             .data = result,
             .length = length,
-            .owned = true,
+            .owner = result,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -777,7 +780,7 @@ AblaValue ablaByteEncode(AblaValue value) {
         .as.string = {
             .data = result,
             .length = 1,
-            .owned = true,
+            .owner = result,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -797,16 +800,12 @@ AblaValue abla_array_create(const AblaValue* values, size_t count) {
     if (count > SIZE_MAX / sizeof(AblaValue)) {
         panic("array allocation overflow", 25);
     }
-    AblaArray* array = (AblaArray*)abla_platform_alloc(sizeof(AblaArray));
+    AblaArray* array = (AblaArray*)abla_platform_alloc(
+        sizeof(AblaArray) + count * sizeof(AblaValue));
     abla_platform_memory_set_layout(array, 4);
     array->length = count;
     array->capacity = count;
-    array->values = count == 0
-        ? (AblaValue*)0
-        : (AblaValue*)abla_platform_alloc(sizeof(AblaValue) * count);
-    if (array->values != (AblaValue*)0) {
-        abla_platform_memory_set_layout(array->values, 2);
-    }
+    array->values = count == 0 ? (AblaValue*)0 : (AblaValue*)(array + 1);
     for (size_t index = 0; index < count; ++index) array->values[index] = values[index];
     return (AblaValue){.tag = ABLA_ARRAY, .as.array = array};
 }
@@ -832,7 +831,10 @@ AblaValue abla_array_append(AblaValue value, AblaValue element) {
         for (size_t index = 0; index < array->length; ++index) {
             values[index] = array->values[index];
         }
-        if (array->values != (AblaValue*)0) abla_platform_free(array->values);
+        if (array->values != (AblaValue*)0 &&
+            array->values != (AblaValue*)(array + 1)) {
+            abla_platform_free(array->values);
+        }
         array->values = values;
         array->capacity = capacity;
     }
@@ -856,13 +858,19 @@ void abla_array_set(AblaValue value, AblaValue index_value, AblaValue element) {
     value.as.array->values[index] = element;
 }
 
-AblaValue abla_object_create(uint32_t type_symbol) {
-    AblaObject* object = (AblaObject*)abla_platform_alloc(sizeof(AblaObject));
+AblaValue abla_object_create(uint32_t type_symbol, size_t field_count) {
+    if (field_count > (SIZE_MAX - sizeof(AblaObject)) / sizeof(AblaField)) {
+        panic("object field count overflow", 27);
+    }
+    AblaObject* object = (AblaObject*)abla_platform_alloc(
+        sizeof(AblaObject) + field_count * sizeof(AblaField));
     abla_platform_memory_set_layout(object, 5);
     object->type_symbol = type_symbol;
     object->count = 0;
-    object->capacity = 0;
-    object->fields = (AblaField*)0;
+    object->capacity = field_count;
+    object->fields = field_count == 0
+        ? (AblaField*)0
+        : (AblaField*)(object + 1);
     return (AblaValue){.tag = ABLA_OBJECT, .as.object = object};
 }
 AblaValue abla_field_get(AblaValue value, uint32_t field_symbol) {
@@ -873,6 +881,17 @@ AblaValue abla_field_get(AblaValue value, uint32_t field_symbol) {
         }
     }
     panic("object field is uninitialized", 29);
+}
+void abla_field_initialize(
+    AblaValue value,
+    uint32_t field_symbol,
+    AblaValue field_value) {
+    if (value.tag != ABLA_OBJECT) panic("expected object", 15);
+    AblaObject* object = value.as.object;
+    if (object->count >= object->capacity) {
+        panic("too many initialized object fields", 34);
+    }
+    object->fields[object->count++] = (AblaField){field_symbol, field_value};
 }
 void abla_field_set(AblaValue value, uint32_t field_symbol, AblaValue field_value) {
     if (value.tag != ABLA_OBJECT) panic("expected object", 15);
@@ -888,7 +907,10 @@ void abla_field_set(AblaValue value, uint32_t field_symbol, AblaValue field_valu
         AblaField* fields = (AblaField*)abla_platform_alloc(sizeof(AblaField) * capacity);
         abla_platform_memory_set_layout(fields, 3);
         for (size_t index = 0; index < object->count; ++index) fields[index] = object->fields[index];
-        if (object->fields != (AblaField*)0) abla_platform_free(object->fields);
+        if (object->fields != (AblaField*)0 &&
+            object->fields != (AblaField*)(object + 1)) {
+            abla_platform_free(object->fields);
+        }
         object->fields = fields;
         object->capacity = capacity;
     }

@@ -139,6 +139,7 @@ typedef struct AblaCheckedFrame {
 static _Thread_local AblaCheckedFrame* host_checked_frame;
 static AblaAllocationHeader** host_collection_index;
 static size_t host_collection_index_count;
+static size_t host_collection_index_capacity;
 static AblaAllocationHeader** host_mark_worklist;
 static size_t host_mark_worklist_count;
 
@@ -213,6 +214,18 @@ struct AblaArray {
     AblaValue* values;
 };
 
+typedef struct AblaField {
+    uint32_t symbol;
+    AblaValue value;
+} AblaField;
+
+struct AblaObject {
+    uint32_t type_symbol;
+    size_t count;
+    size_t capacity;
+    AblaField* fields;
+};
+
 struct AblaStringRope {
     AblaString left;
     AblaString right;
@@ -237,7 +250,7 @@ static AblaValue host_value_string_static(const char* data, size_t length) {
         .as.string = {
             .data = data,
             .length = length,
-            .owned = false,
+            .owner = NULL,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -347,16 +360,15 @@ static AblaValue host_value_pointer(void* value) {
 static AblaValue host_value_array_create(
     const AblaValue* values,
     size_t count) {
-    AblaArray* array = (AblaArray*)abla_platform_alloc(sizeof(AblaArray));
+    if (count > (SIZE_MAX - sizeof(AblaArray)) / sizeof(AblaValue)) {
+        abla_platform_panic("array allocation overflow", 25);
+    }
+    AblaArray* array = (AblaArray*)abla_platform_alloc(
+        sizeof(AblaArray) + count * sizeof(AblaValue));
     abla_platform_memory_set_layout(array, 4);
     array->length = count;
     array->capacity = count;
-    array->values = count == 0
-        ? (AblaValue*)0
-        : (AblaValue*)abla_platform_alloc(sizeof(AblaValue) * count);
-    if (array->values != NULL) {
-        abla_platform_memory_set_layout(array->values, 2);
-    }
+    array->values = count == 0 ? NULL : (AblaValue*)(array + 1);
     if (count != 0) memcpy(array->values, values, sizeof(AblaValue) * count);
     return (AblaValue){.tag = ABLA_ARRAY, .as.array = array};
 }
@@ -392,7 +404,9 @@ static AblaValue host_value_array_append(AblaValue value, AblaValue element) {
         if (array->length != 0) {
             memcpy(next, array->values, sizeof(AblaValue) * array->length);
         }
-        abla_platform_free(array->values);
+        if (array->values != (AblaValue*)(array + 1)) {
+            abla_platform_free(array->values);
+        }
         array->values = next;
         array->capacity = next_capacity;
     }
@@ -423,7 +437,7 @@ static AblaValue host_owned_string(const char* data, size_t length) {
         .as.string = {
             .data = copy,
             .length = length,
-            .owned = true,
+            .owner = copy,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -672,7 +686,7 @@ AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length_value) {
         .as.string = {
             .data = data,
             .length = (size_t)length,
-            .owned = true,
+            .owner = data,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -1262,7 +1276,7 @@ AblaValue ablaHostReadFile(AblaValue path_value) {
         .as.string = {
             .data = text,
             .length = length,
-            .owned = true,
+            .owner = text,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -1789,7 +1803,7 @@ AblaValue ablaHostSecureRandom(AblaValue count_value) {
         .as.string = {
             .data = bytes,
             .length = offset,
-            .owned = true,
+            .owner = bytes,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -2128,7 +2142,7 @@ AblaValue ablaHostNetRead(
         .as.string = {
             .data = bytes,
             .length = (size_t)measured,
-            .owned = true,
+            .owner = bytes,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -2257,7 +2271,7 @@ AblaValue ablaHostNetUdpReceive(
         .as.string = {
             .data = bytes,
             .length = (size_t)measured,
-            .owned = true,
+            .owner = bytes,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -2526,7 +2540,7 @@ AblaValue ablaHostTlsRead(AblaValue handle_value, AblaValue maximum_value) {
         .as.string = {
             .data = bytes,
             .length = (size_t)measured,
-            .owned = true,
+            .owner = bytes,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -2740,7 +2754,7 @@ AblaValue ablaHostTcpRead(AblaValue connection_value, AblaValue maximum_value) {
         .as.string = {
             .data = buffer,
             .length = (size_t)measured,
-            .owned = true,
+            .owner = buffer,
             .rope = (AblaStringRope*)0}};
 }
 
@@ -2870,19 +2884,15 @@ int64_t abla_platform_memory_live_bytes(void) {
 
 static bool host_mark_pointer(uintptr_t candidate) {
     if (host_collection_index != NULL) {
-        size_t begin = 0;
-        size_t end = host_collection_index_count;
-        while (begin < end) {
-            const size_t middle = begin + (end - begin) / 2;
-            const uintptr_t payload =
-                (uintptr_t)(host_collection_index[middle] + 1);
-            if (payload <= candidate) begin = middle + 1;
-            else end = middle;
+        const size_t mask = host_collection_index_capacity - 1;
+        size_t slot = (size_t)((candidate >> 4) *
+            UINT64_C(11400714819323198485)) & mask;
+        AblaAllocationHeader* header = host_collection_index[slot];
+        while (header != NULL && (uintptr_t)(header + 1) != candidate) {
+            slot = (slot + 1) & mask;
+            header = host_collection_index[slot];
         }
-        if (begin == 0) return false;
-        AblaAllocationHeader* header = host_collection_index[begin - 1];
-        const uintptr_t payload = (uintptr_t)(header + 1);
-        if (candidate - payload >= header->allocation.size) return false;
+        if (header == NULL) return false;
         if ((header->allocation.generation >> 63) != 0) return false;
         header->allocation.generation |= UINT64_C(1) << 63;
         if (host_mark_worklist_count >= host_collection_index_count) {
@@ -2894,8 +2904,7 @@ static bool host_mark_pointer(uintptr_t candidate) {
     AblaAllocationHeader* header = host_allocation_tail;
     while (header != NULL) {
         const uintptr_t payload = (uintptr_t)(header + 1);
-        if (candidate >= payload &&
-            candidate - payload < header->allocation.size) {
+        if (payload == candidate) {
             if ((header->allocation.generation >> 63) != 0) return false;
             header->allocation.generation |= UINT64_C(1) << 63;
             return true;
@@ -2903,16 +2912,6 @@ static bool host_mark_pointer(uintptr_t candidate) {
         header = header->allocation.previous;
     }
     return false;
-}
-
-static int host_compare_allocation_payloads(
-    const void* left,
-    const void* right) {
-    const uintptr_t left_payload =
-        (uintptr_t)(*(AblaAllocationHeader* const*)left + 1);
-    const uintptr_t right_payload =
-        (uintptr_t)(*(AblaAllocationHeader* const*)right + 1);
-    return left_payload < right_payload ? -1 : left_payload > right_payload;
 }
 
 static bool host_mark_words(const void* bytes, size_t size) {
@@ -2928,11 +2927,20 @@ static bool host_mark_words(const void* bytes, size_t size) {
     return changed;
 }
 
+static bool host_mark_string(const AblaString* string) {
+    bool changed = false;
+    const char* allocation = string->owner != NULL
+        ? string->owner
+        : string->data;
+    if (host_mark_pointer((uintptr_t)allocation)) changed = true;
+    if (host_mark_pointer((uintptr_t)string->rope)) changed = true;
+    return changed;
+}
+
 static bool host_mark_value(const AblaValue* value) {
     bool changed = false;
     if (value->tag == ABLA_STRING) {
-        if (host_mark_pointer((uintptr_t)value->as.string.data)) changed = true;
-        if (host_mark_pointer((uintptr_t)value->as.string.rope)) changed = true;
+        changed = host_mark_string(&value->as.string);
     } else if (value->tag == ABLA_FUNCTION) {
         changed = host_mark_pointer((uintptr_t)value->as.function.captures);
     } else if (value->tag == ABLA_CELL) {
@@ -2965,18 +2973,15 @@ static bool host_mark_root_frames(AblaRuntimeRootFrame* frame) {
     return changed;
 }
 
-static bool host_mark_pointer_slot(const unsigned char* bytes, size_t offset) {
-    uintptr_t candidate = 0;
-    memcpy(&candidate, bytes + offset, sizeof(candidate));
-    return host_mark_pointer(candidate);
-}
-
 static bool host_mark_allocation(const AblaAllocationHeader* header) {
     const unsigned char* payload = (const unsigned char*)(header + 1);
     const size_t size = header->allocation.scan_size;
     const uint8_t layout = header->allocation.scan_layout;
     bool changed = false;
-    if (layout == 1) return false;
+    if (host_mark_pointer((uintptr_t)header->allocation.cache_owner)) {
+        changed = true;
+    }
+    if (layout == 1) return changed;
     if (layout == 2) {
         for (size_t offset = 0; offset + sizeof(AblaValue) <= size;
              offset += sizeof(AblaValue)) {
@@ -2994,26 +2999,50 @@ static bool host_mark_allocation(const AblaAllocationHeader* header) {
         }
         return changed;
     }
-    if (layout == 4 && size >= 24) return host_mark_pointer_slot(payload, 16);
-    if (layout == 5 && size >= 32) return host_mark_pointer_slot(payload, 24);
-    if (layout == 6 && size >= 72) {
-        const size_t offsets[] = {0, 24, 32, 56, 64};
-        for (size_t index = 0; index < sizeof(offsets) / sizeof(offsets[0]);
-             ++index) {
-            if (host_mark_pointer_slot(payload, offsets[index])) changed = true;
+    if (layout == 4 && size >= sizeof(AblaArray)) {
+        const AblaArray* array = (const AblaArray*)payload;
+        if (array->values == (const AblaValue*)(array + 1)) {
+            for (size_t index = 0; index < array->length; ++index) {
+                if (host_mark_value(&array->values[index])) changed = true;
+            }
+        } else if (host_mark_pointer((uintptr_t)array->values)) {
+            changed = true;
         }
+    }
+    if (layout == 4) return changed;
+    if (layout == 5 && size >= sizeof(AblaObject)) {
+        const AblaObject* object = (const AblaObject*)payload;
+        if (object->fields == (const AblaField*)(object + 1)) {
+            for (size_t index = 0; index < object->count; ++index) {
+                if (host_mark_value(&object->fields[index].value)) {
+                    changed = true;
+                }
+            }
+        } else if (host_mark_pointer((uintptr_t)object->fields)) {
+            changed = true;
+        }
+    }
+    if (layout == 5) return changed;
+    if (layout == 6 && size >= 72) {
+        const AblaStringRope* rope = (const AblaStringRope*)payload;
+        if (host_mark_string(&rope->left)) changed = true;
+        if (host_mark_string(&rope->right)) changed = true;
+        if (host_mark_pointer((uintptr_t)rope->flattened)) changed = true;
         return changed;
     }
     if (layout == 7 && size >= 56) {
-        return host_mark_value((const AblaValue*)(payload + 16));
+        if (host_mark_value((const AblaValue*)(payload + 16))) changed = true;
+        return changed;
     }
     if (layout == 8 && size >= sizeof(AblaValue)) {
-        return host_mark_value((const AblaValue*)payload);
+        if (host_mark_value((const AblaValue*)payload)) changed = true;
+        return changed;
     }
     if (layout == 9) {
         for (size_t offset = 0; offset + 32 <= size; offset += 32) {
-            if (host_mark_pointer_slot(payload, offset)) changed = true;
-            if (host_mark_pointer_slot(payload, offset + 24)) changed = true;
+            if (host_mark_string((const AblaString*)(payload + offset))) {
+                changed = true;
+            }
         }
         return changed;
     }
@@ -3044,13 +3073,25 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
          header != NULL; header = header->allocation.previous) {
         ++allocation_count;
     }
-    if (allocation_count > SIZE_MAX / sizeof(*host_collection_index)) {
+    if (allocation_count > SIZE_MAX / 2) {
         abla_platform_panic("collection index overflow", 25);
     }
-    host_collection_index = allocation_count == 0
+    host_collection_index_capacity = allocation_count == 0 ? 0 : 16;
+    while (host_collection_index_capacity < allocation_count * 2) {
+        if (host_collection_index_capacity > SIZE_MAX / 2) {
+            abla_platform_panic("collection index overflow", 25);
+        }
+        host_collection_index_capacity *= 2;
+    }
+    if (host_collection_index_capacity >
+        SIZE_MAX / sizeof(*host_collection_index)) {
+        abla_platform_panic("collection index overflow", 25);
+    }
+    host_collection_index = host_collection_index_capacity == 0
         ? NULL
-        : (AblaAllocationHeader**)malloc(
-            allocation_count * sizeof(*host_collection_index));
+        : (AblaAllocationHeader**)calloc(
+            host_collection_index_capacity,
+            sizeof(*host_collection_index));
     if (allocation_count != 0 && host_collection_index == NULL) {
         abla_platform_panic("out of memory", 13);
     }
@@ -3063,20 +3104,20 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
         free(host_collection_index);
         host_collection_index = NULL;
         host_collection_index_count = 0;
+        host_collection_index_capacity = 0;
         abla_platform_panic("out of memory", 13);
     }
     host_mark_worklist_count = 0;
-    size_t allocation_index = 0;
     for (AblaAllocationHeader* header = host_allocation_tail;
          header != NULL; header = header->allocation.previous) {
-        host_collection_index[allocation_index++] = header;
-    }
-    if (host_collection_index_count > 1) {
-        qsort(
-            host_collection_index,
-            host_collection_index_count,
-            sizeof(*host_collection_index),
-            host_compare_allocation_payloads);
+        const uintptr_t payload = (uintptr_t)(header + 1);
+        const size_t mask = host_collection_index_capacity - 1;
+        size_t slot = (size_t)((payload >> 4) *
+            UINT64_C(11400714819323198485)) & mask;
+        while (host_collection_index[slot] != NULL) {
+            slot = (slot + 1) & mask;
+        }
+        host_collection_index[slot] = header;
     }
     (void)host_mark_root_frames((AblaRuntimeRootFrame*)opaque_frames);
     if (host_current_coroutine != NULL) {
@@ -3102,6 +3143,7 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
     free(host_collection_index);
     host_collection_index = NULL;
     host_collection_index_count = 0;
+    host_collection_index_capacity = 0;
     free(host_mark_worklist);
     host_mark_worklist = NULL;
     const size_t freed = before - host_allocation_live_bytes;

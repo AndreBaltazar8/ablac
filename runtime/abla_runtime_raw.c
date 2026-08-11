@@ -74,7 +74,7 @@ AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length) {
     data[size] = '\0';
     abla_platform_memory_set_layout(data, 1);
     AblaValue result = abla_string_static(data, (size_t)size);
-    result.as.string.owned = true;
+    result.as.string.owner = data;
     return result;
 }
 AblaValue ablaUnsafeBorrowCString(AblaValue address) {
@@ -108,7 +108,7 @@ AblaValue ablaLinuxTcpReadCompact(
     }
     data[measured] = '\0';
     AblaValue result = abla_string_static(data, (size_t)measured);
-    result.as.string.owned = true;
+    result.as.string.owner = data;
     return result;
 }
 
@@ -140,7 +140,7 @@ AblaValue ablaLinuxPollWaitCompact(
     for (size_t index = 0; index < length; ++index) data[index] = events[index];
     data[length] = '\0';
     AblaValue result = abla_string_static(data, length);
-    result.as.string.owned = true;
+    result.as.string.owner = data;
     return result;
 }
 

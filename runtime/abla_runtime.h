@@ -38,9 +38,9 @@ typedef struct AblaString {
 #ifdef ABLA_WASM32
     uint32_t length_padding;
 #endif
-    bool owned;
+    const char* owner;
 #ifdef ABLA_WASM32
-    uint8_t owned_padding[7];
+    uint32_t owner_padding;
 #endif
     AblaStringRope* rope;
 #ifdef ABLA_WASM32
@@ -367,8 +367,12 @@ AblaValue abla_array_length(AblaValue value);
 AblaValue abla_array_append(AblaValue value, AblaValue element);
 AblaValue abla_array_get(AblaValue array, AblaValue index);
 void abla_array_set(AblaValue array, AblaValue index, AblaValue value);
-AblaValue abla_object_create(uint32_t type_symbol);
+AblaValue abla_object_create(uint32_t type_symbol, size_t field_count);
 AblaValue abla_field_get(AblaValue object, uint32_t field_symbol);
+void abla_field_initialize(
+    AblaValue object,
+    uint32_t field_symbol,
+    AblaValue value);
 void abla_field_set(AblaValue object, uint32_t field_symbol, AblaValue value);
 
 #endif

@@ -418,8 +418,9 @@ translation limits.
 
 On 2026-08-11, the single-CPU `abla-compare` HTTP/1.1 keep-alive benchmark
 improved from **4.7 requests/second** with 12.9-second median latency to a
-three-run median of **41,511 requests/second**, **1.085 ms p50**, and **1.325 ms
-p99** at 64 concurrent connections. The response and status are validated
+three-run median of **86,786 requests/second**, **0.484 ms p50**, and **0.971 ms
+p99** at 64 concurrent connections. This is 2.09 times the previous managed
+baseline of 41,511 requests/second. The response and status are validated
 before every run; Go and Rust use the same endpoint, connection count, CPU
 isolation, warm-up, and measurement intervals.
 
@@ -428,8 +429,9 @@ cost. Native socket buffers begin pinned because an integer address is invisible
 to tracing, but adopting one as a managed string failed to change its scan
 layout. Every read therefore retained the old 65,537-byte buffer forever. The
 fix makes adopted storage collectible and covers that transfer with a direct
-collection regression. A sustained two-minute load run is recorded in the
-comparison repository alongside its RSS high-water measurement.
+collection regression. The final two-minute load completed 11,148,227
+successful requests at 92,900 requests/second, remained alive with 100% success,
+and peaked at 135,080 KiB RSS.
 
 The throughput work also replaces byte-at-a-time Abla HTTP scans with bounded
 text intrinsics, retains slices as collector-safe views, parses each framed
@@ -439,6 +441,34 @@ and attempts small writes before requesting another poll wake-up. Partial
 writes retain the existing offset and backpressure behavior. The full
 73-fixture conformance suite, byte-identical self-rebuild, hosted HTTP tests,
 and static raw-target server all pass with these paths enabled.
+
+The second optimization pass kept those semantics and changed general compiler
+and managed-runtime machinery. Hosted O2 executables now receive whole-program
+LTO across generated LLVM, the value runtime, and the host runtime. Their
+ordinary combined relocatable `.o` remains separately compiled for Icy and
+cross-libc packaging. The native cache stores the generated LLVM module as well
+as the ordinary object, so cache-hit release builds retain LTO; the measured
+cached executable was byte-identical to the uncached one.
+
+Managed arrays and compiler-known class fields now use one allocation for their
+header and initial storage. Constructors initialize their already-sized field
+slots directly, while later reflective or dynamic mutation retains the existing
+symbol-based path. The collector uses an exact-pointer hash index instead of
+sorting every live allocation, and managed string views retain the allocation
+that actually owns their bytes. These changes preserve the boxed value ABI,
+reflection, mutation, raw target, C backend, and managed lifetime rules.
+
+Hardware counters explain why Rust remains faster. In a pinned ten-second run,
+Abla retired approximately **84,115 instructions** and **43,425 cycles** per
+request at **1.94 IPC**. Rust retired **14,017 instructions** and **5,427
+cycles** per request at **2.58 IPC**. Abla therefore executes about six times
+as many instructions and eight times as many cycles per response. Its hottest
+sample was managed memory pressure (24.4%), followed by allocator consolidation
+and allocation; Rust's hottest named samples were HTTP parsing and writing.
+The next parity work is typed-value unboxing and escape analysis, stack or
+region placement for non-escaping request graphs, and a generational collector
+with write barriers. Disabling collection or weakening the language model would
+hide rather than solve the measured gap.
 
 ## Reachability and size result
 

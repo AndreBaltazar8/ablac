@@ -858,6 +858,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val hostPath = "$outputPath.host.o"
     val llvmHostPath = "$outputPath.llvm-host.o"
     val valueRuntimePath = "$outputPath.value-runtime.o"
+    val ltoObjectPath = "$outputPath.lto-program.o"
+    val ltoValueRuntimePath = "$outputPath.lto-value-runtime.o"
+    val ltoHostPath = "$outputPath.lto-host.o"
     val wasmPlatformPath = "$outputPath.wasm-platform.o"
     val rawAdaptersPath = "$outputPath.raw-adapters.o"
     val rawRuntimePath = "$outputPath.raw-runtime.o"
@@ -867,6 +870,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val manifest = manifestPath.readText()
     val targetIdentity = "${target.name}:${target.llvmTriple}:${target.objectFormat}:${target.hosted}:${target.libcFree}:${target.entrySymbol}:${target.linkerFlavor}:${target.linkerEmulation}"
     val sourceIdentity = "$source\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact"
+    // Release hosted executables retain their ordinary relocatable sidecar,
+    // but the executable itself may additionally be optimized across the
+    // generated program and runtime boundary. LLVM-backed compiler programs
+    // remain on the regular path: linking libLLVM into an application-wide
+    // LTO unit is both prohibitively expensive and outside this optimization's
+    // intended runtime boundary.
+    val ltoEligible = target.hosted && artifact == "executable" &&
+        cacheProfile == "inprocess-o2"
     val firstHash = bootstrapNativeCacheHash(
         sourceIdentity, 17, 257, 1000000007
     )
@@ -888,8 +899,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val cacheDirectory = "build/.abla-cache"
     val partitionCacheNamespace =
         "$cacheDirectory/native-partition-${target.name}-llvm21-v1-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
-    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v12-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
+    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v13-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
     val cacheObjectPath = "$cacheStem.o"
+    val cacheLlvmPath = "$cacheStem.ll"
     val cacheSourcePath = "$cacheStem.source"
     val cacheLinkLlvmPath = "$cacheStem.link-llvm"
     val cacheLinkHostPath = "$cacheStem.link-host"
@@ -898,6 +910,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     var cached = false
     if (allowCache && compileInputsCacheable &&
         Path(cacheObjectPath).exists() &&
+        (!ltoEligible || Path(cacheLlvmPath).exists()) &&
         Path(cacheSourcePath).exists() &&
         Path(cacheLinkLlvmPath).exists() &&
         Path(cacheLinkHostPath).exists() &&
@@ -924,6 +937,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     Path(hostPath).remove()
     Path(llvmHostPath).remove()
     Path(valueRuntimePath).remove()
+    Path(ltoObjectPath).remove()
+    Path(ltoValueRuntimePath).remove()
+    Path(ltoHostPath).remove()
     Path(wasmPlatformPath).remove()
     Path(rawAdaptersPath).remove()
     Path(rawRuntimePath).remove()
@@ -934,6 +950,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkHost = Path(cacheLinkHostPath).readText() == "1"
         abiManifest = Path(cacheAbiPath).readText()
         status = bootstrapCopyNativeObject(cacheObjectPath, objectPath)
+        if (status == 0 && ltoEligible) status =
+            bootstrapCopyNativeObject(cacheLlvmPath, llvmPath)
         if (status != 0) failureKind = "io"
     }
     if (!cached) {
@@ -1009,10 +1027,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 // replacing any member so interruption can leave only an
                 // uncommitted record, never a mixed old/new cache hit.
                 Path(cacheSourcePath).remove()
-                val cacheStatus = bootstrapCopyNativeObject(
+                var cacheStatus = bootstrapCopyNativeObject(
                     objectPath,
                     cacheObjectPath
                 )
+                if (cacheStatus == 0 && ltoEligible) cacheStatus =
+                    bootstrapCopyNativeObject(llvmPath, cacheLlvmPath)
                 if (cacheStatus == 0) {
                     val linkText = if (linkLlvm) "1" else "0"
                     val hostText = if (linkHost) "1" else "0"
@@ -1218,6 +1238,69 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileHost.argument(hostPath)
         status = compileHost.run()
     }
+    if (status == 0 && ltoEligible && !linkLlvm) {
+        val compileLtoProgram = linuxCommand("env")
+        compileLtoProgram.argument("NIX_HARDENING_ENABLE=")
+        compileLtoProgram.argument("clang")
+        compileLtoProgram.argument("-O2")
+        compileLtoProgram.argument("-flto")
+        compileLtoProgram.argument("-Wno-unused-command-line-argument")
+        if (macTarget) {
+            compileLtoProgram.argument("-isysroot")
+            compileLtoProgram.argument(macSdkRoot)
+        }
+        compileLtoProgram.argument("-c")
+        compileLtoProgram.argument(llvmPath)
+        compileLtoProgram.argument("-o")
+        compileLtoProgram.argument(ltoObjectPath)
+        status = compileLtoProgram.run()
+    }
+    if (status == 0 && ltoEligible && !linkLlvm) {
+        val compileLtoValueRuntime = linuxCommand("env")
+        compileLtoValueRuntime.argument("NIX_HARDENING_ENABLE=")
+        compileLtoValueRuntime.argument("clang")
+        compileLtoValueRuntime.argument("-std=c11")
+        compileLtoValueRuntime.argument("-O2")
+        compileLtoValueRuntime.argument("-flto")
+        if (macTarget) {
+            compileLtoValueRuntime.argument("-isysroot")
+            compileLtoValueRuntime.argument(macSdkRoot)
+        }
+        compileLtoValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
+        compileLtoValueRuntime.argument("-c")
+        compileLtoValueRuntime.argument(
+            Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
+        )
+        compileLtoValueRuntime.argument("-o")
+        compileLtoValueRuntime.argument(ltoValueRuntimePath)
+        status = compileLtoValueRuntime.run()
+    }
+    if (status == 0 && ltoEligible && !linkLlvm) {
+        val compileLtoHost = linuxCommand("env")
+        compileLtoHost.argument("NIX_HARDENING_ENABLE=")
+        compileLtoHost.argument("clang")
+        compileLtoHost.argument("-std=c11")
+        compileLtoHost.argument("-O2")
+        compileLtoHost.argument("-flto")
+        compileLtoHost.argument("-pthread")
+        if (macTarget) {
+            compileLtoHost.argument("-isysroot")
+            compileLtoHost.argument(macSdkRoot)
+            compileLtoHost.argument("-D_XOPEN_SOURCE=700")
+            compileLtoHost.argument("-D_DARWIN_C_SOURCE")
+            compileLtoHost.argument("-Wno-deprecated-declarations")
+        }
+        compileLtoHost.argument("-I${bootstrapRuntimeRoot()}")
+        compileLtoHost.argument("-c")
+        compileLtoHost.argument(
+            Path(bootstrapRuntimeRoot()).child(
+                "abla_runtime_host.c"
+            ).text
+        )
+        compileLtoHost.argument("-o")
+        compileLtoHost.argument(ltoHostPath)
+        status = compileLtoHost.run()
+    }
     if (status == 0 && target.hosted && artifact != "object" && linkLlvm) {
         val llvmConfig = linuxCommand("llvm-config")
         llvmConfig.argument("--includedir")
@@ -1312,6 +1395,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && target.hosted && artifact == "executable") {
         val link = linuxCommand("clang")
         link.argument("-pthread")
+        if (ltoEligible && !linkLlvm) {
+            link.argument("-O2")
+            link.argument("-flto")
+        }
         if (macTarget) {
             link.argument("-isysroot")
             link.argument(macSdkRoot)
@@ -1340,10 +1427,16 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             link.argument("-Wl,-rpath,$llvmLibraryDirectory")
             link.argument("-lLLVM")
         }
-        link.argument(objectPath)
+        link.argument(if (ltoEligible && !linkLlvm)
+            ltoObjectPath
+        else objectPath)
         if (target.hosted) {
-            link.argument(valueRuntimePath)
-            link.argument(hostPath)
+            link.argument(if (ltoEligible && !linkLlvm)
+                ltoValueRuntimePath
+            else valueRuntimePath)
+            link.argument(if (ltoEligible && !linkLlvm)
+                ltoHostPath
+            else hostPath)
         }
         if (linkLlvm) link.argument(llvmHostPath)
         link.argument("-o")
@@ -1375,6 +1468,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             Path(valueRuntimePath).remove()
             Path(hostPath).remove()
             Path(llvmHostPath).remove()
+            Path(ltoObjectPath).remove()
+            Path(ltoValueRuntimePath).remove()
+            Path(ltoHostPath).remove()
         }
     }
     if (status == 0 && !rawTarget && artifact == "object") {
@@ -1477,6 +1573,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status != 0) bootstrapDiscardCompileOutputs()
     if (status != 0) Path(publishPath).remove()
     if (status != 0) Path(combinedObjectPath).remove()
+    if (status != 0) Path(ltoObjectPath).remove()
+    if (status != 0) Path(ltoValueRuntimePath).remove()
+    if (status != 0) Path(ltoHostPath).remove()
     if (status != 0 && failureKind == "io") {
         linuxPrintStandardError(
             "error[E_BUILD_IO]: native build could not publish an intermediate or output artifact (status $status)\n"
