@@ -88,10 +88,12 @@ static bool equal_bytes(const char* left, const char* right, size_t count) {
 
 static const char* string_data(AblaString value) {
     if (value.data != (const char*)0) return value.data;
-    if (value.rope == (AblaStringRope*)0) {
+    if (ABLA_STRING_ROPE(value) == (AblaStringRope*)0) {
         panic("invalid string storage", 22);
     }
-    if (value.rope->flattened != (char*)0) return value.rope->flattened;
+    if (ABLA_STRING_ROPE(value)->flattened != (char*)0) {
+        return ABLA_STRING_ROPE(value)->flattened;
+    }
 
     size_t capacity = 64;
     size_t count = 1;
@@ -110,8 +112,8 @@ static const char* string_data(AblaString value) {
         const AblaString current = pending[--count];
         const char* current_data = current.data;
         if (current_data == (const char*)0 &&
-            current.rope != (AblaStringRope*)0) {
-            current_data = current.rope->flattened;
+            ABLA_STRING_ROPE(current) != (AblaStringRope*)0) {
+            current_data = ABLA_STRING_ROPE(current)->flattened;
         }
         if (current_data != (const char*)0) {
             if (output > value.length ||
@@ -124,7 +126,7 @@ static const char* string_data(AblaString value) {
             output += current.length;
             continue;
         }
-        if (current.rope == (AblaStringRope*)0) {
+        if (ABLA_STRING_ROPE(current) == (AblaStringRope*)0) {
             abla_platform_free(pending);
             abla_platform_free(flattened);
             panic("invalid string rope", 19);
@@ -152,8 +154,8 @@ static const char* string_data(AblaString value) {
             pending = next;
             capacity = next_capacity;
         }
-        pending[count++] = current.rope->right;
-        pending[count++] = current.rope->left;
+        pending[count++] = ABLA_STRING_ROPE(current)->right;
+        pending[count++] = ABLA_STRING_ROPE(current)->left;
     }
     abla_platform_free(pending);
     if (output != value.length) {
@@ -161,8 +163,8 @@ static const char* string_data(AblaString value) {
         panic("invalid string rope", 19);
     }
     flattened[value.length] = '\0';
-    value.rope->flattened = flattened;
-    abla_platform_memory_set_cache_owner(flattened, value.rope);
+    ABLA_STRING_ROPE(value)->flattened = flattened;
+    abla_platform_memory_set_cache_owner(flattened, ABLA_STRING_ROPE(value));
     return flattened;
 }
 
@@ -190,8 +192,7 @@ AblaValue abla_string_static(const char* data, size_t length) {
         .as.string = {
             .data = data,
             .length = length,
-            .owner = (const char*)0,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = (const char*)0}};
 }
 AblaValue abla_function(uint32_t function) {
     return (AblaValue){
@@ -527,8 +528,7 @@ AblaValue abla_to_string(AblaValue value) {
         .as.string = {
             .data = text,
             .length = length,
-            .owner = text,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = text}};
 }
 
 AblaValue abla_string_concat(AblaValue left, AblaValue right) {
@@ -552,8 +552,7 @@ AblaValue abla_string_concat(AblaValue left, AblaValue right) {
         .as.string = {
             .data = (const char*)0,
             .length = length,
-            .owner = (const char*)0,
-            .rope = rope}};
+            .storage.rope = rope}};
 }
 
 AblaValue abla_string_length(AblaValue value) {
@@ -588,15 +587,15 @@ AblaValue abla_string_slice(
     const size_t length = (size_t)(end - begin);
     if (length == 0) return abla_string_static("", 0);
     const char* data = string_data(value.as.string);
-    const char* owner = value.as.string.owner;
-    if (owner == (const char*)0 && value.as.string.rope != NULL) owner = data;
+    const char* owner = ABLA_STRING_OWNER(value.as.string);
+    if (owner == (const char*)0 &&
+        ABLA_STRING_ROPE(value.as.string) != NULL) owner = data;
     return (AblaValue){
         .tag = ABLA_STRING,
         .as.string = {
             .data = data + (size_t)begin,
             .length = length,
-            .owner = owner,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = owner}};
 }
 
 AblaValue ablaUtf8EncodeScalar(AblaValue value) {
@@ -634,8 +633,7 @@ AblaValue ablaUtf8EncodeScalar(AblaValue value) {
         .as.string = {
             .data = result,
             .length = length,
-            .owner = result,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = result}};
 }
 
 AblaValue ablaTextFindSequence(
@@ -780,8 +778,7 @@ AblaValue ablaByteEncode(AblaValue value) {
         .as.string = {
             .data = result,
             .length = 1,
-            .owner = result,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = result}};
 }
 
 AblaValue abla_length(AblaValue value) {

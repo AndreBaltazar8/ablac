@@ -38,15 +38,17 @@ typedef struct AblaString {
 #ifdef ABLA_WASM32
     uint32_t length_padding;
 #endif
-    const char* owner;
+    union {
+        const char* owner;
+        AblaStringRope* rope;
+    } storage;
 #ifdef ABLA_WASM32
-    uint32_t owner_padding;
-#endif
-    AblaStringRope* rope;
-#ifdef ABLA_WASM32
-    uint32_t rope_padding;
+    uint32_t storage_padding;
 #endif
 } AblaString;
+
+#define ABLA_STRING_OWNER(value) ((value).storage.owner)
+#define ABLA_STRING_ROPE(value) ((value).storage.rope)
 
 struct AblaValue {
     AblaTag tag;
@@ -78,8 +80,11 @@ struct AblaValue {
 };
 
 #ifdef ABLA_WASM32
-_Static_assert(sizeof(AblaString) == 32, "Wasm string ABI must be 32 bytes");
-_Static_assert(sizeof(AblaValue) == 40, "Wasm value ABI must be 40 bytes");
+_Static_assert(sizeof(AblaString) == 24, "Wasm string ABI must be 24 bytes");
+_Static_assert(sizeof(AblaValue) == 32, "Wasm value ABI must be 32 bytes");
+#else
+_Static_assert(sizeof(AblaString) == 24, "Native string ABI must be 24 bytes");
+_Static_assert(sizeof(AblaValue) == 32, "Native value ABI must be 32 bytes");
 #endif
 
 typedef AblaValue (*AblaDispatch)(

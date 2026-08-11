@@ -288,8 +288,7 @@ static AblaValue host_value_string_static(const char* data, size_t length) {
         .as.string = {
             .data = data,
             .length = length,
-            .owner = NULL,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = NULL}};
 }
 
 static int64_t host_value_as_i64(AblaValue value) {
@@ -299,10 +298,12 @@ static int64_t host_value_as_i64(AblaValue value) {
 
 static const char* host_string_storage(AblaString value) {
     if (value.data != (const char*)0) return value.data;
-    if (value.rope == (AblaStringRope*)0) {
+    if (ABLA_STRING_ROPE(value) == (AblaStringRope*)0) {
         abla_platform_panic("invalid string storage", 22);
     }
-    if (value.rope->flattened != (char*)0) return value.rope->flattened;
+    if (ABLA_STRING_ROPE(value)->flattened != (char*)0) {
+        return ABLA_STRING_ROPE(value)->flattened;
+    }
 
     size_t capacity = 64;
     size_t count = 1;
@@ -319,8 +320,9 @@ static const char* host_string_storage(AblaString value) {
     while (count != 0) {
         const AblaString current = pending[--count];
         const char* data = current.data;
-        if (data == (const char*)0 && current.rope != (AblaStringRope*)0) {
-            data = current.rope->flattened;
+        if (data == (const char*)0 &&
+            ABLA_STRING_ROPE(current) != (AblaStringRope*)0) {
+            data = ABLA_STRING_ROPE(current)->flattened;
         }
         if (data != (const char*)0) {
             if (output > value.length ||
@@ -333,7 +335,7 @@ static const char* host_string_storage(AblaString value) {
             output += current.length;
             continue;
         }
-        if (current.rope == (AblaStringRope*)0) {
+        if (ABLA_STRING_ROPE(current) == (AblaStringRope*)0) {
             abla_platform_free(pending);
             abla_platform_free(flattened);
             abla_platform_panic("invalid string rope", 19);
@@ -359,8 +361,8 @@ static const char* host_string_storage(AblaString value) {
             pending = next;
             capacity = next_capacity;
         }
-        pending[count++] = current.rope->right;
-        pending[count++] = current.rope->left;
+        pending[count++] = ABLA_STRING_ROPE(current)->right;
+        pending[count++] = ABLA_STRING_ROPE(current)->left;
     }
     abla_platform_free(pending);
     if (output != value.length) {
@@ -368,8 +370,8 @@ static const char* host_string_storage(AblaString value) {
         abla_platform_panic("invalid string rope", 19);
     }
     flattened[value.length] = '\0';
-    value.rope->flattened = flattened;
-    abla_platform_memory_set_cache_owner(flattened, value.rope);
+    ABLA_STRING_ROPE(value)->flattened = flattened;
+    abla_platform_memory_set_cache_owner(flattened, ABLA_STRING_ROPE(value));
     return flattened;
 }
 
@@ -475,8 +477,7 @@ static AblaValue host_owned_string(const char* data, size_t length) {
         .as.string = {
             .data = copy,
             .length = length,
-            .owner = copy,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = copy}};
 }
 
 static AblaHostRegionPage* host_region_page_acquire(size_t minimum) {
@@ -843,8 +844,7 @@ AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length_value) {
         .as.string = {
             .data = data,
             .length = (size_t)length,
-            .owner = data,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = data}};
 }
 
 AblaValue ablaUnsafeBorrowCString(AblaValue address) {
@@ -1433,8 +1433,7 @@ AblaValue ablaHostReadFile(AblaValue path_value) {
         .as.string = {
             .data = text,
             .length = length,
-            .owner = text,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = text}};
 }
 
 AblaValue ablaHostWriteFile(AblaValue path_value, AblaValue contents) {
@@ -1960,8 +1959,7 @@ AblaValue ablaHostSecureRandom(AblaValue count_value) {
         .as.string = {
             .data = bytes,
             .length = offset,
-            .owner = bytes,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = bytes}};
 }
 
 static bool host_load_ssl_symbol(void* destination, size_t size, const char* name) {
@@ -2299,8 +2297,7 @@ AblaValue ablaHostNetRead(
         .as.string = {
             .data = bytes,
             .length = (size_t)measured,
-            .owner = bytes,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = bytes}};
 }
 
 AblaValue ablaHostNetWrite(AblaValue descriptor_value, AblaValue contents) {
@@ -2428,8 +2425,7 @@ AblaValue ablaHostNetUdpReceive(
         .as.string = {
             .data = bytes,
             .length = (size_t)measured,
-            .owner = bytes,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = bytes}};
 }
 
 AblaValue ablaHostNetSourceAddress(void) {
@@ -2697,8 +2693,7 @@ AblaValue ablaHostTlsRead(AblaValue handle_value, AblaValue maximum_value) {
         .as.string = {
             .data = bytes,
             .length = (size_t)measured,
-            .owner = bytes,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = bytes}};
 }
 
 AblaValue ablaHostTlsWrite(AblaValue handle_value, AblaValue contents) {
@@ -2911,8 +2906,7 @@ AblaValue ablaHostTcpRead(AblaValue connection_value, AblaValue maximum_value) {
         .as.string = {
             .data = buffer,
             .length = (size_t)measured,
-            .owner = buffer,
-            .rope = (AblaStringRope*)0}};
+            .storage.owner = buffer}};
 }
 
 AblaValue ablaHostTcpWrite(AblaValue connection_value, AblaValue contents) {
@@ -3086,11 +3080,15 @@ static bool host_mark_words(const void* bytes, size_t size) {
 
 static bool host_mark_string(const AblaString* string) {
     bool changed = false;
-    const char* allocation = string->owner != NULL
-        ? string->owner
-        : string->data;
-    if (host_mark_pointer((uintptr_t)allocation)) changed = true;
-    if (host_mark_pointer((uintptr_t)string->rope)) changed = true;
+    if (string->data == NULL) {
+        if (host_mark_pointer(
+            (uintptr_t)ABLA_STRING_ROPE(*string))) changed = true;
+    } else {
+        const char* allocation = ABLA_STRING_OWNER(*string) != NULL
+            ? ABLA_STRING_OWNER(*string)
+            : string->data;
+        if (host_mark_pointer((uintptr_t)allocation)) changed = true;
+    }
     return changed;
 }
 
@@ -3149,8 +3147,10 @@ static bool host_mark_allocation(const AblaAllocationHeader* header) {
         return changed;
     }
     if (layout == 3) {
-        for (size_t offset = 0; offset + 48 <= size; offset += 48) {
-            if (host_mark_value((const AblaValue*)(payload + offset + 8))) {
+        for (size_t offset = 0; offset + sizeof(AblaField) <= size;
+             offset += sizeof(AblaField)) {
+            if (host_mark_value((const AblaValue*)(
+                payload + offset + offsetof(AblaField, value)))) {
                 changed = true;
             }
         }
@@ -3180,15 +3180,16 @@ static bool host_mark_allocation(const AblaAllocationHeader* header) {
         }
     }
     if (layout == 5) return changed;
-    if (layout == 6 && size >= 72) {
+    if (layout == 6 && size >= sizeof(AblaStringRope)) {
         const AblaStringRope* rope = (const AblaStringRope*)payload;
         if (host_mark_string(&rope->left)) changed = true;
         if (host_mark_string(&rope->right)) changed = true;
         if (host_mark_pointer((uintptr_t)rope->flattened)) changed = true;
         return changed;
     }
-    if (layout == 7 && size >= 56) {
-        if (host_mark_value((const AblaValue*)(payload + 16))) changed = true;
+    if (layout == 7 && size >= 16 + sizeof(AblaValue)) {
+        if (host_mark_value((const AblaValue*)(
+            payload + 16))) changed = true;
         return changed;
     }
     if (layout == 8 && size >= sizeof(AblaValue)) {
@@ -3196,7 +3197,8 @@ static bool host_mark_allocation(const AblaAllocationHeader* header) {
         return changed;
     }
     if (layout == 9) {
-        for (size_t offset = 0; offset + 32 <= size; offset += 32) {
+        for (size_t offset = 0; offset + sizeof(AblaString) <= size;
+             offset += sizeof(AblaString)) {
             if (host_mark_string((const AblaString*)(payload + offset))) {
                 changed = true;
             }
