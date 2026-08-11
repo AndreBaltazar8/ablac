@@ -144,6 +144,25 @@ prevents keep-alive reuse, flushes queued responses up to a configured drain
 deadline, and force-closes stalled peers. The WebSocket event server performs
 the equivalent bounded close-frame drain.
 
+Linux services can scale that event loop over independent worker processes by
+passing `reusePort = true` to `tcpListenAddress`, `tcpListenIpv6`, `tcpListen`,
+`httpEventServer`, or `httpEventServerHandler`. Every worker binds the same
+address and the kernel distributes new connections with `SO_REUSEPORT`; each
+worker retains its own collector and failure boundary. This is the supported
+parallel service model today. Native `thread` remains appropriate for bounded
+jobs, but a permanently allocating server must not use threads as workers until
+the managed collector can coordinate all thread root stacks.
+
+```abla
+val server = httpEventServerHandler(
+    handleRequest,
+    ipv4Loopback(8080),
+    httpEventServerOptions(),
+    true
+)
+server.run()
+```
+
 `abla/http/stream` supplies chunk encoders and decoders, gzip responses, and
 Server-Sent Events framing. The base HTTP client transparently recognizes
 complete chunked responses, including HTTPS replies.
