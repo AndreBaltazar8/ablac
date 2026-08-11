@@ -345,6 +345,8 @@ AblaValue abla_multiply(AblaValue left, AblaValue right);
 AblaValue abla_divide(AblaValue left, AblaValue right);
 AblaValue abla_equal(AblaValue left, AblaValue right);
 AblaValue abla_not_equal(AblaValue left, AblaValue right);
+AblaValue abla_string_equal(AblaValue left, AblaValue right);
+AblaValue abla_string_not_equal(AblaValue left, AblaValue right);
 AblaValue abla_less(AblaValue left, AblaValue right);
 AblaValue abla_less_equal(AblaValue left, AblaValue right);
 AblaValue abla_greater(AblaValue left, AblaValue right);

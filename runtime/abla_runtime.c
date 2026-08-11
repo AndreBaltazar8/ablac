@@ -482,6 +482,15 @@ AblaValue abla_equal(AblaValue left, AblaValue right) {
 AblaValue abla_not_equal(AblaValue left, AblaValue right) {
     return abla_bool(!abla_as_bool(abla_equal(left, right)));
 }
+AblaValue abla_string_equal(AblaValue left, AblaValue right) {
+    if (left.tag != ABLA_STRING || right.tag != ABLA_STRING) {
+        return abla_bool(false);
+    }
+    return abla_bool(string_equal(left.as.string, right.as.string));
+}
+AblaValue abla_string_not_equal(AblaValue left, AblaValue right) {
+    return abla_bool(!abla_as_bool(abla_string_equal(left, right)));
+}
 AblaValue abla_less(AblaValue left, AblaValue right) {
     return abla_bool(abla_as_i64(left) < abla_as_i64(right));
 }
