@@ -1,10 +1,26 @@
 import "abla/http/event"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
 
 var eventClientDone = false
 var eventPort = 0
+var eventBackpressureClientDone = false
+var eventBackpressurePort = 0
+var eventBackpressureSend = false
+var eventBackpressureRead = false
 
 fun eventOne(request: HttpRequest): HttpResponse = httpText("first")
 fun eventTwo(request: HttpRequest): HttpResponse = httpText("second")
+fun eventLarge(request: HttpRequest): HttpResponse {
+    var body = "x"
+    var iteration = 0
+    while (iteration < 18) {
+        body = "$body$body"
+        iteration = iteration + 1
+    }
+    httpText(body)
+}
 
 fun textContains(input: string, wanted: string): bool {
     var found = false
@@ -50,6 +66,63 @@ fun reusableEventListeners(): bool {
     reusable
 }
 
+fun eventTestSendBuffer(descriptor: int, bytes: int): bool {
+    val buffer = nativeByteBuffer(4)
+    linuxNetStoreU32(buffer, 0, bytes)
+    val status = linuxSyscall5(
+        54, descriptor, 1, 7,
+        nativePointerAddress(buffer.address), 4
+    )
+    buffer.close()
+    status == 0
+}
+
+fun eventBackpressureClient(): int {
+    val connection = tcpConnectIpv4(
+        "127.0.0.1", eventBackpressurePort, 1000
+    )
+    if (connection.descriptor < 0) {
+        eventBackpressureClientDone = true
+        return 1
+    }
+    while (!eventBackpressureSend) linuxSleep(1)
+    val request = "GET /large HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
+    val sent = connection.write(request)
+    while (!eventBackpressureRead) linuxSleep(1)
+    var response = ""
+    var reading = sent == request.size
+    while (reading) {
+        val incoming = connection.readWithTimeoutResult(65536, 2000)
+        if (incoming.hasData()) response = "${response}${incoming.bytes}"
+        else reading = false
+    }
+    connection.close()
+    eventBackpressureClientDone = true
+    if (response.size >= 262144 &&
+        textContains(response, "Connection: close")) 0 else 2
+}
+
+fun eventBackpressure(): bool {
+    val router = httpRouter()
+    router.get("/large", eventLarge)
+    val server = httpEventServer(router, ipv4Loopback(0))
+    eventBackpressurePort = server.listener.localPort()
+    val client = thread { eventBackpressureClient() }
+    while (server.activeConnections() == 0) server.step(100)
+    val sendBufferSet = eventTestSendBuffer(server.descriptors[0], 4096)
+    eventBackpressureSend = true
+    server.step(1000)
+    val writeInterestEnabled = server.writeWatching[0] &&
+        server.outputOffsets[0] > 0 && server.outputs[0] != ""
+    eventBackpressureRead = true
+    while (!eventBackpressureClientDone) server.step(100)
+    val status = await client
+    server.stop()
+    server.drain()
+    sendBufferSet && writeInterestEnabled && status == 0 &&
+        server.activeConnections() == 0
+}
+
 fun main: int {
     val reusable = reusableEventListeners()
     val router = httpRouter()
@@ -63,5 +136,5 @@ fun main: int {
     server.stop()
     val drained = server.drain()
     if (reusable && status == 0 && drained == 0 && server.stopped &&
-        server.activeConnections() == 0) 42 else 1
+        server.activeConnections() == 0 && eventBackpressure()) 42 else 1
 }

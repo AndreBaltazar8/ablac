@@ -500,6 +500,23 @@ cycles/request**. Allocator-related samples fell from roughly 19% to 13% of the
 profile. The full 73-fixture suite and byte-identical self-rebuild pass with the
 optimization enabled.
 
+### Demand-driven writable interest (2026-08-11)
+
+The event HTTP loop previously issued `epoll_ctl(MOD)` after every completed
+response even though readable interest had never been disabled. It also did
+not enable `EPOLLOUT` when an immediate nonblocking write stopped at kernel
+backpressure. Per-connection writable-interest state now changes the poller
+only on the transition into or out of a real pending-write state.
+
+On the same pinned single-worker comparison, three ten-second samples improved
+from a **103,875 requests/second** median to **107,365 requests/second**
+(**3.36%**). Median p50 fell from 0.469 to 0.444 ms and p99 from 0.931 to
+0.875 ms. A five-second syscall audit with 64 persistent connections observed
+only 132 `epoll_ctl` calls, so poller updates now scale with connection
+lifecycle rather than request count. A forced 256 KiB response with a 4 KiB
+server send buffer verifies that the partial-write path registers writable
+interest and drains the complete response before closing.
+
 ## Reachability and size result
 
 The first LLVM size pass marks Abla implementation functions internal, limits

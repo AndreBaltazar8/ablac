@@ -144,6 +144,11 @@ prevents keep-alive reuse, flushes queued responses up to a configured drain
 deadline, and force-closes stalled peers. The WebSocket event server performs
 the equivalent bounded close-frame drain.
 
+The steady-state HTTP path keeps only readable interest registered. A response
+that fills the kernel send buffer enables writable interest exactly once, then
+removes it after the pending output drains. Ordinary complete writes therefore
+do not issue a poller-control syscall per request.
+
 Linux services can scale that event loop over independent worker processes by
 passing `reusePort = true` to `tcpListenAddress`, `tcpListenIpv6`, `tcpListen`,
 `httpEventServer`, or `httpEventServerHandler`. Every worker binds the same
