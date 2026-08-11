@@ -888,6 +888,17 @@ AblaValue abla_field_get(AblaValue value, uint32_t field_symbol) {
     }
     panic("object field is uninitialized", 29);
 }
+AblaValue abla_field_get_indexed(
+    AblaValue value,
+    uint32_t field_symbol,
+    size_t field_index) {
+    if (value.tag == ABLA_OBJECT &&
+        field_index < value.as.object->count &&
+        value.as.object->fields[field_index].symbol == field_symbol) {
+        return value.as.object->fields[field_index].value;
+    }
+    return abla_field_get(value, field_symbol);
+}
 void abla_field_initialize(
     AblaValue value,
     uint32_t field_symbol,
@@ -921,4 +932,17 @@ void abla_field_set(AblaValue value, uint32_t field_symbol, AblaValue field_valu
         object->capacity = capacity;
     }
     object->fields[object->count++] = (AblaField){field_symbol, field_value};
+}
+void abla_field_set_indexed(
+    AblaValue value,
+    uint32_t field_symbol,
+    size_t field_index,
+    AblaValue field_value) {
+    if (value.tag == ABLA_OBJECT &&
+        field_index < value.as.object->count &&
+        value.as.object->fields[field_index].symbol == field_symbol) {
+        value.as.object->fields[field_index].value = field_value;
+        return;
+    }
+    abla_field_set(value, field_symbol, field_value);
 }

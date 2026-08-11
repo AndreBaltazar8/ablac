@@ -34,6 +34,8 @@ rg -q 'call void @abla_string_get' "$typed_ir"
 rg -q 'call void @abla_array_length' "$typed_ir"
 rg -q 'call void @abla_array_get' "$typed_ir"
 rg -q 'call void @abla_string_equal' "$typed_ir"
+rg -q 'call void @abla_field_get_indexed' "$typed_ir"
+rg -q 'call void @abla_field_set_indexed' "$typed_ir"
 if rg -q 'call void @abla_(length|index_get)' "$typed_ir"; then
     printf '%s\n' 'typed collection fixture retained generic dispatch' >&2
     exit 1

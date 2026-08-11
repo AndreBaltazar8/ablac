@@ -379,10 +379,19 @@ AblaValue abla_array_get(AblaValue array, AblaValue index);
 void abla_array_set(AblaValue array, AblaValue index, AblaValue value);
 AblaValue abla_object_create(uint32_t type_symbol, size_t field_count);
 AblaValue abla_field_get(AblaValue object, uint32_t field_symbol);
+AblaValue abla_field_get_indexed(
+    AblaValue object,
+    uint32_t field_symbol,
+    size_t field_index);
 void abla_field_initialize(
     AblaValue object,
     uint32_t field_symbol,
     AblaValue value);
 void abla_field_set(AblaValue object, uint32_t field_symbol, AblaValue value);
+void abla_field_set_indexed(
+    AblaValue object,
+    uint32_t field_symbol,
+    size_t field_index,
+    AblaValue value);
 
 #endif

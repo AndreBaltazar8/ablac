@@ -2823,6 +2823,35 @@ class BootstrapLowerer(
         result
     }
 
+    fun lowerFieldIndex(owner: string, field: string): int {
+        val normalizedOwner = bootstrapBorrowElementType(
+            bootstrapNormalizeType(owner)
+        )
+        var result = -1
+        var declarationIndex = 0
+        while (declarationIndex < this.declarations.size) {
+            val declaration = this.declarations[declarationIndex]
+            if (declaration.kind == "class" &&
+                declaration.name == normalizedOwner) {
+                var parameter = 0
+                var runtimeIndex = 0
+                while (parameter < declaration.parameters.size) {
+                    if (parameter < declaration.parameterKinds.size &&
+                        (declaration.parameterKinds[parameter] == "val" ||
+                         declaration.parameterKinds[parameter] == "var")) {
+                        if (declaration.parameters[parameter] == field) {
+                            result = runtimeIndex
+                        }
+                        runtimeIndex = runtimeIndex + 1
+                    }
+                    parameter = parameter + 1
+                }
+            }
+            declarationIndex = declarationIndex + 1
+        }
+        result
+    }
+
     fun lowerFunctionResultType(name: string): string {
         var result = "unknown"
         var declarationIndex = 0
@@ -3880,10 +3909,9 @@ class BootstrapLowerer(
             result = result
         } else if (expression.kind == "member") {
             val receiver = this.lowerPlaceProjection(expression.children[0])
-            result = this.emit(
-                "field.get",
+            result = this.emitFieldGet(
                 receiver,
-                -1,
+                this.lowerExpressionType(expression.children[0]),
                 expression.text
             )
         } else if (expression.kind == "index") {
@@ -4064,6 +4092,52 @@ class BootstrapLowerer(
             operands
         ))
         result
+    }
+
+    fun emitIndexed(
+        opcode: string,
+        operands: array<int>,
+        text: string,
+        index: int
+    ): int {
+        val result = this.nextValue
+        this.nextValue = this.nextValue + 1
+        var left = -1
+        var right = -1
+        if (operands.size > 0) left = operands[0]
+        if (operands.size > 1) right = operands[1]
+        this.instructions.append(BootstrapInstruction(
+            opcode,
+            result,
+            left,
+            right,
+            text,
+            index,
+            -1,
+            operands
+        ))
+        result
+    }
+
+    fun emitFieldGet(receiver: int, owner: string, field: string): int {
+        val index = this.lowerFieldIndex(owner, field)
+        if (index >= 0) {
+            this.emitIndexed("field.get.indexed", [receiver], field, index)
+        } else this.emit("field.get", receiver, -1, field)
+    }
+
+    fun emitFieldSet(
+        receiver: int,
+        value: int,
+        owner: string,
+        field: string
+    ): int {
+        val index = this.lowerFieldIndex(owner, field)
+        if (index >= 0) {
+            this.emitIndexed(
+                "field.set.indexed", [receiver, value], field, index
+            )
+        } else this.emitMany("field.set", [receiver, value], field)
     }
 
     fun emitEvaluated(value: BootstrapEvalValue): int {
@@ -4254,10 +4328,9 @@ class BootstrapLowerer(
                 if (this.isCapturedParameter("this")) {
                     object = this.emit("cell.get", receiver, -1, "")
                 }
-                result = this.emit(
-                    "field.get",
+                result = this.emitFieldGet(
                     object,
-                    -1,
+                    this.currentOwner,
                     expression.text
                 )
             } else if (this.isParameter(expression.text) ||
@@ -4693,17 +4766,17 @@ class BootstrapLowerer(
                     expression.text
                 )
                 if (this.lowerTypeIsAffine(fieldType)) {
-                    val previous = this.emit(
-                        "field.get",
+                    val previous = this.emitFieldGet(
                         object,
-                        -1,
+                        this.currentOwner,
                         expression.text
                     )
                     this.emitAffineValueDrop(previous, fieldType)
                 }
-                result = this.emitMany(
-                    "field.set",
-                    [object, value],
+                result = this.emitFieldSet(
+                    object,
+                    value,
+                    this.currentOwner,
                     expression.text
                 )
             } else result = this.emit("global.assign", value, -1, expression.text)
@@ -4784,16 +4857,19 @@ class BootstrapLowerer(
                     val receiver = this.lowerPlaceProjection(
                         moved.children[0]
                     )
-                    result = this.emit(
-                        "field.get",
+                    val ownerType = this.lowerExpressionType(
+                        moved.children[0]
+                    )
+                    result = this.emitFieldGet(
                         receiver,
-                        -1,
+                        ownerType,
                         moved.text
                     )
                     val empty = this.emit("const.null", -1, -1, "")
-                    this.emitMany(
-                        "field.set",
-                        [receiver, empty],
+                    this.emitFieldSet(
+                        receiver,
+                        empty,
+                        ownerType,
                         moved.text
                     )
                 } else {
@@ -4969,7 +5045,9 @@ class BootstrapLowerer(
                     "string.length"
                 } else "array.length"
                 result = this.emit(opcode, receiver, -1, "")
-            } else result = this.emit("field.get", receiver, -1, expression.text)
+            } else result = this.emitFieldGet(
+                receiver, receiverType, expression.text
+            )
         }
         if (expression.kind == "index") {
             val place = this.lowerPlacePath(expression)
@@ -5137,22 +5215,23 @@ class BootstrapLowerer(
                 this.lowerPlaceProjection(expression.children[0])
             } else this.lowerExpression(expression.children[0])
             val value = this.lowerExpression(expression.children[1])
+            val ownerType = this.lowerExpressionType(expression.children[0])
             val fieldType = this.lowerFieldType(
-                this.lowerExpressionType(expression.children[0]),
+                ownerType,
                 expression.text
             )
             if (this.lowerTypeIsAffine(fieldType)) {
-                val previous = this.emit(
-                    "field.get",
+                val previous = this.emitFieldGet(
                     receiver,
-                    -1,
+                    ownerType,
                     expression.text
                 )
                 this.emitAffineValueDrop(previous, fieldType)
             }
-            result = this.emitMany(
-                "field.set",
-                [receiver, value],
+            result = this.emitFieldSet(
+                receiver,
+                value,
+                ownerType,
                 expression.text
             )
             if (place != "") {
