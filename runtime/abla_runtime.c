@@ -564,22 +564,28 @@ AblaValue abla_string_concat(AblaValue left, AblaValue right) {
             .storage.rope = rope}};
 }
 
-AblaValue abla_string_length(AblaValue value) {
+int64_t abla_string_length_i64(AblaValue value) {
     if (value.tag != ABLA_STRING) panic("expected string", 15);
     if (value.as.string.length > (size_t)INT64_MAX) {
         panic("string length does not fit in int", 32);
     }
-    return abla_i64((int64_t)value.as.string.length);
+    return (int64_t)value.as.string.length;
 }
 
-AblaValue abla_string_get(AblaValue value, AblaValue index_value) {
+AblaValue abla_string_length(AblaValue value) {
+    return abla_i64(abla_string_length_i64(value));
+}
+
+int64_t abla_string_get_i64(AblaValue value, int64_t index) {
     if (value.tag != ABLA_STRING) panic("expected string", 15);
-    const int64_t index = abla_as_i64(index_value);
     if (index < 0 || (uint64_t)index >= value.as.string.length) {
         panic("string index out of bounds", 26);
     }
-    return abla_i64(
-        (int64_t)(uint8_t)string_data(value.as.string)[(size_t)index]);
+    return (int64_t)(uint8_t)string_data(value.as.string)[(size_t)index];
+}
+
+AblaValue abla_string_get(AblaValue value, AblaValue index_value) {
+    return abla_i64(abla_string_get_i64(value, abla_as_i64(index_value)));
 }
 
 AblaValue abla_string_slice(
@@ -815,12 +821,15 @@ AblaValue abla_array_create(const AblaValue* values, size_t count) {
     for (size_t index = 0; index < count; ++index) array->values[index] = values[index];
     return (AblaValue){.tag = ABLA_ARRAY, .as.array = array};
 }
-AblaValue abla_array_length(AblaValue value) {
+int64_t abla_array_length_i64(AblaValue value) {
     if (value.tag != ABLA_ARRAY) panic("expected array", 14);
     if (value.as.array->length > (size_t)INT64_MAX) {
         panic("array length does not fit in int", 32);
     }
-    return abla_i64((int64_t)value.as.array->length);
+    return (int64_t)value.as.array->length;
+}
+AblaValue abla_array_length(AblaValue value) {
+    return abla_i64(abla_array_length_i64(value));
 }
 AblaValue abla_array_append(AblaValue value, AblaValue element) {
     if (value.tag != ABLA_ARRAY) panic("expected array", 14);

@@ -356,6 +356,8 @@ AblaValue abla_to_string(AblaValue value);
 AblaValue abla_string_concat(AblaValue left, AblaValue right);
 AblaValue abla_string_length(AblaValue value);
 AblaValue abla_string_get(AblaValue value, AblaValue index);
+int64_t abla_string_length_i64(AblaValue value);
+int64_t abla_string_get_i64(AblaValue value, int64_t index);
 AblaValue abla_string_slice(AblaValue value, AblaValue begin, AblaValue end);
 AblaValue ablaUtf8EncodeScalar(AblaValue value);
 AblaValue ablaTextFindSequence(
@@ -374,6 +376,7 @@ AblaValue abla_length(AblaValue value);
 AblaValue abla_index_get(AblaValue value, AblaValue index);
 AblaValue abla_array_create(const AblaValue* values, size_t count);
 AblaValue abla_array_length(AblaValue value);
+int64_t abla_array_length_i64(AblaValue value);
 AblaValue abla_array_append(AblaValue value, AblaValue element);
 AblaValue abla_array_get(AblaValue array, AblaValue index);
 void abla_array_set(AblaValue array, AblaValue index, AblaValue value);
