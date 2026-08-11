@@ -546,6 +546,314 @@ fun bootstrapLlvmParameterId(
     result
 }
 
+class BootstrapLlvmScalarPlan(
+    val valueTypes: array<string>,
+    val localTypes: array<string>,
+    val boxedValues: array<bool>
+)
+
+fun bootstrapLlvmScalarValueCount(function: BootstrapIrFunction): int {
+    var count = 0
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.result >= count) count = candidate.result + 1
+        if (candidate.left >= count) count = candidate.left + 1
+        if (candidate.right >= count) count = candidate.right + 1
+        var operand = 0
+        while (operand < candidate.operands.size) {
+            if (candidate.operands[operand] >= count) {
+                count = candidate.operands[operand] + 1
+            }
+            operand = operand + 1
+        }
+        instruction = instruction + 1
+    }
+    count
+}
+
+fun bootstrapLlvmScalarType(type: string): string {
+    val normalized = bootstrapNormalizeType(type)
+    if (normalized == "i64") "i64"
+    else if (normalized == "bool") "bool"
+    else ""
+}
+
+fun bootstrapLlvmInferScalarValues(
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    functionIndex: BootstrapLlvmNameIndex,
+    nativeIndex: BootstrapLlvmNameIndex,
+    localIndex: BootstrapLlvmNameIndex,
+    localTypes: array<string>
+): array<string> {
+    val types: array<string> = []
+    var value = 0
+    while (value < bootstrapLlvmScalarValueCount(function)) {
+        types.append("")
+        value = value + 1
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        var position = 0
+        while (position < function.instructions.size) {
+            val instruction = function.instructions[position]
+            var inferred = ""
+            if (instruction.opcode == "const.i64") inferred = "i64"
+            if (instruction.opcode == "const.bool") inferred = "bool"
+            if (instruction.opcode == "parameter.load") {
+                val parameter = bootstrapLlvmParameterId(
+                    function, instruction.text
+                )
+                if (parameter >= 0 &&
+                    parameter < function.parameterTypes.size) {
+                    inferred = bootstrapLlvmScalarType(
+                        function.parameterTypes[parameter]
+                    )
+                }
+            }
+            if (instruction.opcode == "local.load" ||
+                instruction.opcode == "resource.peek" ||
+                instruction.opcode == "place.root") {
+                val local = localIndex.find(instruction.text)
+                if (local >= 0 && local < localTypes.size) {
+                    inferred = localTypes[local]
+                }
+            }
+            if (instruction.opcode == "local.declare" ||
+                instruction.opcode == "local.assign") {
+                val local = localIndex.find(instruction.text)
+                if (local >= 0 && local < localTypes.size &&
+                    localTypes[local] != "" &&
+                    instruction.left >= 0 &&
+                    instruction.left < types.size) {
+                    inferred = types[instruction.left]
+                }
+            }
+            if (instruction.opcode == "call") {
+                val called = functionIndex.find(instruction.text)
+                if (called >= 0 && called < program.functions.size) {
+                    inferred = bootstrapLlvmScalarType(
+                        program.functions[called].resultType
+                    )
+                }
+            }
+            if (instruction.opcode == "extern.c") {
+                val native = nativeIndex.find(instruction.text)
+                if (native >= 0 && native < program.natives.size) {
+                    inferred = bootstrapLlvmScalarType(
+                        program.natives[native].resultType
+                    )
+                }
+            }
+            if (instruction.opcode == "+" ||
+                instruction.opcode == "-" ||
+                instruction.opcode == "*" ||
+                instruction.opcode == "neg") inferred = "i64"
+            if (instruction.opcode == "not" ||
+                instruction.opcode == "&&" ||
+                instruction.opcode == "||") inferred = "bool"
+            if (instruction.opcode == "==" ||
+                instruction.opcode == "!=") {
+                if (instruction.left >= 0 && instruction.right >= 0 &&
+                    instruction.left < types.size &&
+                    instruction.right < types.size &&
+                    types[instruction.left] != "" &&
+                    types[instruction.left] == types[instruction.right]) {
+                    inferred = "bool"
+                }
+            }
+            if (instruction.opcode == "<" ||
+                instruction.opcode == "<=" ||
+                instruction.opcode == ">" ||
+                instruction.opcode == ">=") {
+                if (instruction.left >= 0 && instruction.right >= 0 &&
+                    instruction.left < types.size &&
+                    instruction.right < types.size &&
+                    types[instruction.left] == "i64" &&
+                    types[instruction.right] == "i64") inferred = "bool"
+            }
+            if (instruction.result >= 0 &&
+                instruction.result < types.size && inferred != "" &&
+                types[instruction.result] == "") {
+                types[instruction.result] = inferred
+                changed = true
+            }
+            position = position + 1
+        }
+    }
+    types
+}
+
+fun bootstrapLlvmBuildScalarPlan(
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    functionIndex: BootstrapLlvmNameIndex,
+    nativeIndex: BootstrapLlvmNameIndex
+): BootstrapLlvmScalarPlan {
+    val localIndex = bootstrapLlvmLocalIndex(function)
+    val localTypes: array<string> = []
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        localTypes.append("")
+        instruction = instruction + 1
+    }
+    var valueTypes = bootstrapLlvmInferScalarValues(
+        program, function, functionIndex, nativeIndex,
+        localIndex, localTypes
+    )
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "local.zero") {
+            localTypes[instruction] = "i64"
+        }
+        if (candidate.opcode == "local.declare" &&
+            candidate.left >= 0 && candidate.left < valueTypes.size) {
+            localTypes[instruction] = valueTypes[candidate.left]
+        }
+        instruction = instruction + 1
+    }
+    var stable = false
+    while (!stable) {
+        valueTypes = bootstrapLlvmInferScalarValues(
+            program, function, functionIndex, nativeIndex,
+            localIndex, localTypes
+        )
+        stable = true
+        instruction = 0
+        while (instruction < function.instructions.size) {
+            val candidate = function.instructions[instruction]
+            if (candidate.opcode == "local.declare" ||
+                candidate.opcode == "local.assign" ||
+                candidate.opcode == "local.set") {
+                val local = localIndex.find(candidate.text)
+                if (local >= 0 && local < localTypes.size &&
+                    localTypes[local] != "") {
+                    var assigned = ""
+                    if (candidate.left >= 0 &&
+                        candidate.left < valueTypes.size) {
+                        assigned = valueTypes[candidate.left]
+                    }
+                    if (assigned != localTypes[local]) {
+                        localTypes[local] = ""
+                        stable = false
+                    }
+                }
+            }
+            if (candidate.opcode == "local.allocate") {
+                val local = localIndex.find(candidate.text)
+                if (local >= 0 && local < localTypes.size &&
+                    localTypes[local] != "") {
+                    localTypes[local] = ""
+                    stable = false
+                }
+            }
+            instruction = instruction + 1
+        }
+    }
+    valueTypes = bootstrapLlvmInferScalarValues(
+        program, function, functionIndex, nativeIndex,
+        localIndex, localTypes
+    )
+    val boxedValues: array<bool> = []
+    var value = 0
+    while (value < valueTypes.size) {
+        boxedValues.append(false)
+        value = value + 1
+    }
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        var nativeInputs = false
+        if (candidate.opcode == "+" || candidate.opcode == "-" ||
+            candidate.opcode == "*" || candidate.opcode == "neg" ||
+            candidate.opcode == "not" || candidate.opcode == "&&" ||
+            candidate.opcode == "||" || candidate.opcode == "==" ||
+            candidate.opcode == "!=" || candidate.opcode == "<" ||
+            candidate.opcode == "<=" || candidate.opcode == ">" ||
+            candidate.opcode == ">=") {
+            nativeInputs = candidate.result >= 0 &&
+                candidate.result < valueTypes.size &&
+                valueTypes[candidate.result] != ""
+        }
+        if (candidate.opcode == "branch") nativeInputs =
+            candidate.left >= 0 && candidate.left < valueTypes.size &&
+            valueTypes[candidate.left] == "bool"
+        if (candidate.opcode == "return") nativeInputs =
+            bootstrapLlvmScalarType(function.resultType) != ""
+        if (candidate.opcode == "local.declare" ||
+            candidate.opcode == "local.assign" ||
+            candidate.opcode == "local.set") {
+            val local = localIndex.find(candidate.text)
+            nativeInputs = local >= 0 && local < localTypes.size &&
+                localTypes[local] != ""
+        }
+        if (candidate.opcode == "call") {
+            val called = functionIndex.find(candidate.text)
+            var operand = 0
+            while (operand < candidate.operands.size) {
+                val used = candidate.operands[operand]
+                var native = false
+                if (called >= 0 && called < program.functions.size &&
+                    operand < program.functions[called].parameterTypes.size) {
+                    native = bootstrapLlvmScalarType(
+                        program.functions[called].parameterTypes[operand]
+                    ) != ""
+                }
+                if (!native && used >= 0 && used < boxedValues.size) {
+                    boxedValues[used] = true
+                }
+                operand = operand + 1
+            }
+            nativeInputs = true
+        }
+        if (candidate.opcode == "extern.c") {
+            val native = nativeIndex.find(candidate.text)
+            var operand = 0
+            while (operand < candidate.operands.size) {
+                val used = candidate.operands[operand]
+                var direct = false
+                if (native >= 0 && native < program.natives.size &&
+                    operand < program.natives[native].parameterTypes.size) {
+                    direct = bootstrapLlvmScalarType(
+                        program.natives[native].parameterTypes[operand]
+                    ) != ""
+                }
+                if (!direct && used >= 0 && used < boxedValues.size) {
+                    boxedValues[used] = true
+                }
+                operand = operand + 1
+            }
+            nativeInputs = true
+        }
+        if (!nativeInputs) {
+            if (candidate.operands.size > 0) {
+                var operand = 0
+                while (operand < candidate.operands.size) {
+                    val used = candidate.operands[operand]
+                    if (used >= 0 && used < boxedValues.size) {
+                        boxedValues[used] = true
+                    }
+                    operand = operand + 1
+                }
+            } else {
+                if (candidate.left >= 0 &&
+                    candidate.left < boxedValues.size) {
+                    boxedValues[candidate.left] = true
+                }
+                if (candidate.right >= 0 &&
+                    candidate.right < boxedValues.size) {
+                    boxedValues[candidate.right] = true
+                }
+            }
+        }
+        instruction = instruction + 1
+    }
+    BootstrapLlvmScalarPlan(valueTypes, localTypes, boxedValues)
+}
+
 fun bootstrapLlvmLocalIndex(
     function: BootstrapIrFunction
 ): BootstrapLlvmNameIndex {

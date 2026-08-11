@@ -356,7 +356,8 @@ ABI hashes are stable across self-rebuilds.
   unit. Relink only changed units and units whose public interface changed.
 - Separate runtime features into link-selected fragments; do IR-level
   reachability before generating LLVM text.
-- Add unboxed scalar/value layouts, escape analysis, stack promotion, drop
+- Extend the implemented conservative `i64`/`bool` SSA unboxing and checked
+  request-region placement to aggregate layouts, deeper escape analysis, drop
   elimination, specialization, and optional ThinLTO for release builds.
 - Keep fast builds semantically identical to release builds; optimization level
   must never alter compile-time behavior.

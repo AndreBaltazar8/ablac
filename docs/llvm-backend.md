@@ -66,6 +66,15 @@ grow the native stack on every iteration. The native self-host gate compiles
 the complete compiler twice and includes a 250,000-iteration regression under
 a 64 MiB process limit.
 
+Before emission, a conservative scalar plan proves `i64` and `bool` SSA values
+from constants, typed parameters and direct calls, native declarations,
+arithmetic, comparisons, and scalar locals. A local is native only when every
+store agrees on one scalar type. Proven values have no `AblaValue` slot unless
+an actual use crosses a dynamic, aggregate, capture, indirect-call, or other
+boxed boundary. Native local allocas remain in the entry block so LLVM's O2
+promotion turns straight-line and control-flow storage into SSA registers and
+PHI nodes. Unsupported operations retain the boxed runtime path unchanged.
+
 The resulting object backend is used by `ablac build`; the same module is the
 input to the Abla-authored persistent ORC session used by `run` and `repl`.
 The command and capability contract is defined in

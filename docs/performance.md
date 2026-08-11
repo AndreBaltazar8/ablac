@@ -465,10 +465,11 @@ cycles** per request at **2.58 IPC**. Abla therefore executes about six times
 as many instructions and eight times as many cycles per response. Its hottest
 sample was managed memory pressure (24.4%), followed by allocator consolidation
 and allocation; Rust's hottest named samples were HTTP parsing and writing.
-The next parity work is typed-value unboxing and escape analysis, stack or
-region placement for non-escaping request graphs, and a generational collector
-with write barriers. Disabling collection or weakening the language model would
-hide rather than solve the measured gap.
+Later passes below implement checked region placement for non-escaping request
+graphs and conservative scalar unboxing. Remaining parity work includes broader
+typed aggregate specialization, lower-cost collection checks, and collector
+improvements. Disabling collection or weakening the language model would hide
+rather than solve the measured gap.
 
 ### Direct calls and lexical response regions (2026-08-11)
 
@@ -516,6 +517,32 @@ only 132 `epoll_ctl` calls, so poller updates now scale with connection
 lifecycle rather than request count. A forced 256 KiB response with a 4 KiB
 server send buffer verifies that the partial-write path registers writable
 interest and drains the complete response before closing.
+
+### Checked request regions and lazy scalar SSA (2026-08-11)
+
+The checked `FnNoEscape(A) -> R` callable contract lets the event HTTP server
+place parsing, static routing, handler execution, and response framing inside
+one request region. Only the completed wire response and unread connection tail
+are promoted. This moved the canonical single-worker result from 111,030 to
+144,573 requests/second without changing the general escaping handler API.
+
+The following compiler pass infers only proven `i64` and `bool` IR values and
+locals. Arithmetic, comparisons, branches, direct scalar calls, and compatible
+native calls consume LLVM scalar values directly. A value receives boxed
+storage only when a use crosses a dynamic or otherwise unsupported boundary;
+locals are eligible only when every assignment proves the same scalar type.
+Division, shifts, heterogeneous equality, aggregate access, and unproven locals
+remain on their established boxed runtime paths.
+
+Against the checked-region binary, a five-sample isolated A/B improved the
+median from 143,955 to 152,141 requests/second. A separate counter run reduced
+retired instructions from about 49,678 to 46,376 per request and cycles from
+23,114 to 20,597. The optimized HTTP executable shrank from 540 KiB to 471 KiB.
+The canonical cross-language rerun reached 152,868 requests/second, 95.5% of Go
+and 55.2% of Rust on the same pinned setup. All 75 tests and the byte-identical
+self-rebuild pass. Native parameter storage was also tested, but its additional
+missing/default control flow reduced throughput by 0.73%, so that experiment
+was removed.
 
 ## Reachability and size result
 
