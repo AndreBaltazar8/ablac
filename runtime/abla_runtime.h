@@ -295,6 +295,10 @@ AblaValue ablaUnsafeStoreU8(AblaValue address, AblaValue value);
 AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length);
 AblaValue ablaUnsafeBorrowCString(AblaValue address);
 AblaValue ablaLinuxTcpReadCompact(AblaValue descriptor, AblaValue maximum);
+AblaValue ablaLinuxTcpWriteCompact(
+    AblaValue descriptor,
+    AblaValue contents,
+    AblaValue offset);
 AblaValue ablaLinuxPollWaitCompact(
     AblaValue descriptor,
     AblaValue maximum,

@@ -24,6 +24,7 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
@@ -47,6 +48,8 @@ static char** host_argv;
 static char** host_envp;
 static bool host_stdin_line_available;
 static volatile sig_atomic_t host_shutdown_requested;
+
+static void* host_platform_alloc_bytes(size_t size);
 
 typedef struct ssl_ctx_st HostSslContext;
 typedef struct ssl_st HostSsl;
@@ -464,7 +467,7 @@ static void host_request_shutdown(int signal_number) {
 }
 
 static AblaValue host_owned_string(const char* data, size_t length) {
-    char* copy = (char*)abla_platform_alloc(length + 1);
+    char* copy = (char*)host_platform_alloc_bytes(length + 1);
     memcpy(copy, data, length);
     copy[length] = '\0';
     return (AblaValue){
@@ -569,7 +572,7 @@ static bool host_region_reset(uint64_t checkpoint) {
     return true;
 }
 
-void* abla_platform_alloc(size_t size) {
+static void* host_platform_alloc(size_t size, bool initialize) {
     const bool heap_locked = host_heap_lock_if_shared();
     host_initialize_allocation_limit();
     const size_t measured = size == 0 ? 1 : size;
@@ -617,10 +620,20 @@ void* abla_platform_alloc(size_t size) {
     }
     if (region == NULL) host_allocation_tail = header;
     host_allocation_live_bytes += measured;
-    memset((void*)(header + 1), 0, measured);
+    if (initialize) memset((void*)(header + 1), 0, measured);
     void* result = (void*)(header + 1);
     host_heap_unlock_if_shared(heap_locked);
     return result;
+}
+
+void* abla_platform_alloc(size_t size) {
+    return host_platform_alloc(size, true);
+}
+
+// Internal native byte buffers may skip initialization only when the caller
+// overwrites every byte that can become visible before publishing the value.
+static void* host_platform_alloc_bytes(size_t size) {
+    return host_platform_alloc(size, false);
 }
 
 static void host_platform_free_unlocked(void* pointer) {
@@ -853,13 +866,81 @@ AblaValue ablaLinuxTcpReadCompact(
     if (descriptor < 0 || maximum <= 0 || maximum > 32768) {
         return host_value_string_static("", 0);
     }
-    char buffer[32768];
+    char* buffer = (char*)host_platform_alloc_bytes((size_t)maximum + 1);
     ssize_t measured = -1;
     do {
         measured = read(descriptor, buffer, (size_t)maximum);
     } while (measured < 0 && errno == EINTR);
-    if (measured <= 0) return host_value_string_static("", 0);
-    return host_owned_string(buffer, (size_t)measured);
+    if (measured <= 0) {
+        abla_platform_free(buffer);
+        return host_value_string_static("", 0);
+    }
+    buffer[(size_t)measured] = '\0';
+    return (AblaValue){
+        .tag = ABLA_STRING,
+        .as.string = {
+            .data = buffer,
+            .length = (size_t)measured}};
+}
+
+AblaValue ablaLinuxTcpWriteCompact(
+    AblaValue descriptor_value,
+    AblaValue contents,
+    AblaValue offset_value) {
+    const int descriptor = (int)host_value_as_i64(descriptor_value);
+    const int64_t offset = host_value_as_i64(offset_value);
+    if (descriptor < 0 || contents.tag != ABLA_STRING || offset < 0 ||
+        (uint64_t)offset > ABLA_STRING_LENGTH(contents.as.string)) {
+        return host_value_i64(-EINVAL);
+    }
+    const size_t length = ABLA_STRING_LENGTH(contents.as.string);
+    if ((size_t)offset == length) return host_value_i64(0);
+
+    struct iovec vectors[64];
+    size_t count = 0;
+    size_t skipped = (size_t)offset;
+    AblaString pending[64];
+    size_t pending_count = 1;
+    pending[0] = contents.as.string;
+    while (pending_count > 0 && count < 64) {
+        const AblaString current = pending[--pending_count];
+        const size_t current_length = ABLA_STRING_LENGTH(current);
+        if (skipped >= current_length) {
+            skipped -= current_length;
+        } else if (current.data != (const char*)0 ||
+                   ABLA_STRING_ROPE(current)->flattened != (char*)0) {
+            const char* data = current.data;
+            if (data == (const char*)0) {
+                data = ABLA_STRING_ROPE(current)->flattened;
+            }
+            vectors[count].iov_base = (void*)(data + skipped);
+            vectors[count].iov_len = current_length - skipped;
+            ++count;
+            skipped = 0;
+        } else if (pending_count + 2 <= 64) {
+            pending[pending_count++] = ABLA_STRING_ROPE(current)->right;
+            pending[pending_count++] = ABLA_STRING_ROPE(current)->left;
+        } else {
+            return host_value_i64(-E2BIG);
+        }
+    }
+    if (pending_count != 0 || count == 0) return host_value_i64(-E2BIG);
+
+    const struct msghdr message = {
+        .msg_name = NULL,
+        .msg_namelen = 0,
+        .msg_iov = vectors,
+        .msg_iovlen = count,
+        .msg_control = NULL,
+        .msg_controllen = 0,
+        .msg_flags = 0,
+    };
+    ssize_t written = -1;
+    do {
+        written = sendmsg(descriptor, &message, MSG_NOSIGNAL);
+    } while (written < 0 && errno == EINTR);
+    if (written < 0) return host_value_i64(-(int64_t)errno);
+    return host_value_i64((int64_t)written);
 }
 
 static void host_compact_store_u32(

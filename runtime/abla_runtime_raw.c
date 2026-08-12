@@ -108,6 +108,79 @@ AblaValue ablaLinuxTcpReadCompact(
     return abla_string_static(data, (size_t)measured);
 }
 
+AblaValue ablaLinuxTcpWriteCompact(
+    AblaValue descriptor_value,
+    AblaValue contents,
+    AblaValue offset_value) {
+    const int64_t descriptor = abla_as_i64(descriptor_value);
+    const int64_t offset = abla_as_i64(offset_value);
+    if (descriptor < 0 || contents.tag != ABLA_STRING || offset < 0 ||
+        (uint64_t)offset > ABLA_STRING_LENGTH(contents.as.string)) {
+        return abla_i64(-22);
+    }
+    const size_t length = ABLA_STRING_LENGTH(contents.as.string);
+    if ((size_t)offset == length) return abla_i64(0);
+
+    struct RawIovec { void* base; size_t length; } vectors[64];
+    AblaString pending[64];
+    size_t pending_count = 1;
+    size_t count = 0;
+    size_t skipped = (size_t)offset;
+    pending[0] = contents.as.string;
+    while (pending_count > 0 && count < 64) {
+        const AblaString current = pending[--pending_count];
+        const size_t current_length = ABLA_STRING_LENGTH(current);
+        if (skipped >= current_length) skipped -= current_length;
+        else if (current.data != (const char*)0 ||
+                 ABLA_STRING_ROPE(current)->flattened != (char*)0) {
+            const char* data = current.data;
+            if (data == (const char*)0) {
+                data = ABLA_STRING_ROPE(current)->flattened;
+            }
+            vectors[count].base = (void*)(data + skipped);
+            vectors[count].length = current_length - skipped;
+            ++count;
+            skipped = 0;
+        } else if (pending_count + 2 <= 64) {
+            pending[pending_count++] = ABLA_STRING_ROPE(current)->right;
+            pending[pending_count++] = ABLA_STRING_ROPE(current)->left;
+        } else return abla_i64(-7);
+    }
+    if (pending_count != 0 || count == 0) return abla_i64(-7);
+
+    struct RawMessageHeader {
+        void* name;
+        uint32_t name_length;
+        uint32_t padding0;
+        void* iov;
+        size_t iov_length;
+        void* control;
+        size_t control_length;
+        int32_t flags;
+        uint32_t padding1;
+    } message = {
+        .name = (void*)0,
+        .name_length = 0,
+        .padding0 = 0,
+        .iov = vectors,
+        .iov_length = count,
+        .control = (void*)0,
+        .control_length = 0,
+        .flags = 0,
+        .padding1 = 0,
+    };
+    int64_t written;
+    do {
+        __asm__ volatile(
+            "syscall"
+            : "=a"(written)
+            : "a"(INT64_C(46)), "D"(descriptor), "S"(&message),
+              "d"(INT64_C(16384))
+            : "rcx", "r11", "memory");
+    } while (written == -4);
+    return abla_i64(written);
+}
+
 AblaValue ablaLinuxPollWaitCompact(
     AblaValue descriptor_value,
     AblaValue maximum_value,

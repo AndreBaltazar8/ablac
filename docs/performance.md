@@ -587,3 +587,29 @@ requiring a coordinated direct-return rewrite of every runtime, foreign, Wasm,
 Android, and bootstrap boundary. Keeping 24 bytes is therefore the smallest
 validated portable representation in this pass, not a claim that a separately
 benchmarked 16-byte direct-return ABI can never win.
+
+## Segmented large HTTP bodies (2026-08-12)
+
+The 16 KiB echo workload transfers at least 32 KiB per request: one 16 KiB
+request body enters the process and the same payload leaves in the response.
+Its CPU profile was consequently dominated by byte movement rather than the
+dynamic value ABI: `memmove` and `memset` accounted for about 39% of sampled
+cycles before this pass.
+
+The hosted readiness-loop reader now receives directly into an uninitialized
+managed byte allocation and publishes only the bytes actually returned by the
+kernel. Large segmented responses use a bounded 64-entry `sendmsg` scatter
+write, preserving `MSG_NOSIGNAL`; the libc-free runtime provides the equivalent
+raw syscall. Small responses retain the contiguous writer because its lower
+setup cost is faster below 4 KiB. Deep ropes fall back to the established
+flattened writer, and partial writes still promote the response before its
+request region is reset.
+
+In an adjacent five-sample comparison at 64 connections, the body median rose
+from **120,508 to 126,240 requests/second** (**4.76%**). The candidate samples
+were tightly grouped from 125,864 to 127,049 requests/second. The final holistic
+run measured Abla at 124,580, Go at 102,936, and Rust at 155,144 requests/second;
+Abla remained faster than Go in all four workloads. Regression coverage checks
+a nonzero write offset, more than 64 rope leaves, the flattening fallback, and
+the raw libc-free syscall path. All 75 compiler/runtime fixtures and the
+byte-identical self-rebuild pass.
