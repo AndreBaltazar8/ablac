@@ -482,14 +482,20 @@ AblaValue abla_equal(AblaValue left, AblaValue right) {
 AblaValue abla_not_equal(AblaValue left, AblaValue right) {
     return abla_bool(!abla_as_bool(abla_equal(left, right)));
 }
-AblaValue abla_string_equal(AblaValue left, AblaValue right) {
+bool abla_string_equal_bool(AblaValue left, AblaValue right) {
     if (left.tag != ABLA_STRING || right.tag != ABLA_STRING) {
-        return abla_bool(false);
+        return false;
     }
-    return abla_bool(string_equal(left.as.string, right.as.string));
+    return string_equal(left.as.string, right.as.string);
+}
+bool abla_string_not_equal_bool(AblaValue left, AblaValue right) {
+    return !abla_string_equal_bool(left, right);
+}
+AblaValue abla_string_equal(AblaValue left, AblaValue right) {
+    return abla_bool(abla_string_equal_bool(left, right));
 }
 AblaValue abla_string_not_equal(AblaValue left, AblaValue right) {
-    return abla_bool(!abla_as_bool(abla_string_equal(left, right)));
+    return abla_bool(abla_string_not_equal_bool(left, right));
 }
 AblaValue abla_less(AblaValue left, AblaValue right) {
     return abla_bool(abla_as_i64(left) < abla_as_i64(right));
@@ -856,13 +862,21 @@ AblaValue abla_array_append(AblaValue value, AblaValue element) {
     array->values[array->length++] = element;
     return abla_void();
 }
-AblaValue abla_array_get(AblaValue value, AblaValue index_value) {
+static AblaValue abla_array_get_at(AblaValue value, int64_t index) {
     if (value.tag != ABLA_ARRAY) panic("expected array", 14);
-    const int64_t index = abla_as_i64(index_value);
     if (index < 0 || (uint64_t)index >= value.as.array->length) {
         panic("array index out of bounds", 25);
     }
     return value.as.array->values[index];
+}
+AblaValue abla_array_get(AblaValue value, AblaValue index_value) {
+    return abla_array_get_at(value, abla_as_i64(index_value));
+}
+int64_t abla_array_get_i64(AblaValue value, int64_t index) {
+    return abla_as_i64(abla_array_get_at(value, index));
+}
+bool abla_array_get_bool(AblaValue value, int64_t index) {
+    return abla_as_bool(abla_array_get_at(value, index));
 }
 void abla_array_set(AblaValue value, AblaValue index_value, AblaValue element) {
     if (value.tag != ABLA_ARRAY) panic("expected array", 14);
@@ -907,6 +921,20 @@ AblaValue abla_field_get_indexed(
         return value.as.object->fields[field_index].value;
     }
     return abla_field_get(value, field_symbol);
+}
+int64_t abla_field_get_indexed_i64(
+    AblaValue value,
+    uint32_t field_symbol,
+    size_t field_index) {
+    return abla_as_i64(
+        abla_field_get_indexed(value, field_symbol, field_index));
+}
+bool abla_field_get_indexed_bool(
+    AblaValue value,
+    uint32_t field_symbol,
+    size_t field_index) {
+    return abla_as_bool(
+        abla_field_get_indexed(value, field_symbol, field_index));
 }
 void abla_field_initialize(
     AblaValue value,

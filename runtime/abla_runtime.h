@@ -347,6 +347,8 @@ AblaValue abla_equal(AblaValue left, AblaValue right);
 AblaValue abla_not_equal(AblaValue left, AblaValue right);
 AblaValue abla_string_equal(AblaValue left, AblaValue right);
 AblaValue abla_string_not_equal(AblaValue left, AblaValue right);
+bool abla_string_equal_bool(AblaValue left, AblaValue right);
+bool abla_string_not_equal_bool(AblaValue left, AblaValue right);
 AblaValue abla_less(AblaValue left, AblaValue right);
 AblaValue abla_less_equal(AblaValue left, AblaValue right);
 AblaValue abla_greater(AblaValue left, AblaValue right);
@@ -379,10 +381,20 @@ AblaValue abla_array_length(AblaValue value);
 int64_t abla_array_length_i64(AblaValue value);
 AblaValue abla_array_append(AblaValue value, AblaValue element);
 AblaValue abla_array_get(AblaValue array, AblaValue index);
+int64_t abla_array_get_i64(AblaValue array, int64_t index);
+bool abla_array_get_bool(AblaValue array, int64_t index);
 void abla_array_set(AblaValue array, AblaValue index, AblaValue value);
 AblaValue abla_object_create(uint32_t type_symbol, size_t field_count);
 AblaValue abla_field_get(AblaValue object, uint32_t field_symbol);
 AblaValue abla_field_get_indexed(
+    AblaValue object,
+    uint32_t field_symbol,
+    size_t field_index);
+int64_t abla_field_get_indexed_i64(
+    AblaValue object,
+    uint32_t field_symbol,
+    size_t field_index);
+bool abla_field_get_indexed_bool(
     AblaValue object,
     uint32_t field_symbol,
     size_t field_index);
