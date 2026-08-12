@@ -5,7 +5,7 @@ COMPILER_ENTRY := src/orc_main.ab
 COMPILER_SOURCES := $(shell find src stdlib -name '*.ab' -type f | sort) \
 	runtime/abla_runtime.c runtime/abla_runtime.h runtime/abla_runtime_host.c \
 	runtime/abla_runtime_raw.c runtime/abla_runtime_wasm.c \
-	runtime/abla_llvm_host.c
+	runtime/abla_llvm_host.c tools/value-abi-probe.ab
 
 SOURCE ?=
 OUTPUT ?= $(BUILD_DIR)/program
@@ -24,10 +24,11 @@ $(BUILD_DIR):
 # tools/bootstrap-compiler.sh. It immediately rebuilds the current source graph,
 # so src/*.ab remains the only compiler implementation in the repository.
 $(COMPILER_PAYLOAD): $(COMPILER_SOURCES) tools/build-self-hosted-release.sh \
+		tools/build-self-hosted-current.sh \
 		| $(BUILD_DIR) tools/bootstrap-compiler.sh
 	@if test ! -x $@; then tools/bootstrap-compiler.sh $@; fi
 	ln -sfn ../tools/run-limited-compiler.sh $(COMPILER)
-	tools/build-self-hosted-release.sh $@ $(BUILD_DIR)/.ablac-next $(COMPILER_ENTRY)
+	tools/build-self-hosted-current.sh $@ $(BUILD_DIR)/.ablac-next $(COMPILER_ENTRY)
 	mv -f $(BUILD_DIR)/.ablac-next.ll $(BUILD_DIR)/ablac.ll
 	mv -f $(BUILD_DIR)/.ablac-next $@
 
@@ -46,6 +47,7 @@ self-rebuild: ablac
 	tools/test-pure-self-rebuild.sh $(COMPILER_PAYLOAD)
 
 test: ablac
+	tools/test-value-abi.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
 check: test self-rebuild

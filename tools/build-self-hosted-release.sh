@@ -16,10 +16,21 @@ object_seconds=${ABLA_RELEASE_SELFHOST_BUILD_SECONDS:-300}
 emit_seconds=${ABLA_FINAL_SELFHOST_EMIT_SECONDS:-300}
 release_cache=${ABLA_RELEASE_SELFHOST_CACHE:-1}
 release_cache_root=${ABLA_RELEASE_SELFHOST_CACHE_DIR:-}
+value_abi=${ABLA_RELEASE_VALUE_ABI:-24}
 host_os=$(uname -s)
 host_machine=$(uname -m)
 host_triple=
 host_sdk=
+
+case "$value_abi" in
+    24) runtime_abi_flag= ;;
+    32) runtime_abi_flag=-DABLA_VALUE_ABI32=1 ;;
+    40) runtime_abi_flag=-DABLA_VALUE_ABI40=1 ;;
+    *)
+        printf 'unsupported release value ABI: %s\n' "$value_abi" >&2
+        exit 2
+        ;;
+esac
 
 if [[ $host_os == Darwin ]]; then
     case "$host_machine" in
@@ -121,6 +132,7 @@ build_key=$(
         printf '%s\n' \
             'abla-selfhost-release-v1' \
             'clang-O2-full-lto-function-sections-data-sections' \
+            "value-abi-$value_abi" \
             "$host_os" "$host_machine" "$toolchain_identity" \
             "module $(hash_file "$module")"
         find "$project_root/runtime" -maxdepth 1 -type f \
@@ -157,18 +169,18 @@ ABLA_MAX_MEMORY_MB=$object_memory_mb ABLA_MAX_SECONDS=$object_seconds \
 
 if [[ $host_os == Darwin ]]; then
     printf -v runtime_compile_command \
-        'clang -std=c11 -O2 -flto -isysroot %q -ffunction-sections -fdata-sections -I%q -c %q -o %q && clang -std=c11 -O2 -flto -pthread -isysroot %q -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE -Wno-deprecated-declarations -ffunction-sections -fdata-sections -I%q -c %q -o %q' \
-        "$host_sdk" "$project_root/runtime" \
+        'clang -std=c11 -O2 -flto %s -isysroot %q -ffunction-sections -fdata-sections -I%q -c %q -o %q && clang -std=c11 -O2 -flto -pthread %s -isysroot %q -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE -Wno-deprecated-declarations -ffunction-sections -fdata-sections -I%q -c %q -o %q' \
+        "$runtime_abi_flag" "$host_sdk" "$project_root/runtime" \
         "$project_root/runtime/abla_runtime.c" \
-        "$value_runtime_object" "$host_sdk" \
+        "$value_runtime_object" "$runtime_abi_flag" "$host_sdk" \
         "$project_root/runtime" \
         "$project_root/runtime/abla_runtime_host.c" \
         "$host_runtime_object"
 else
     printf -v runtime_compile_command \
-        'clang -std=c11 -O2 -flto -ffunction-sections -fdata-sections -I%q -c %q -o %q && clang -std=c11 -O2 -flto -ffunction-sections -fdata-sections -I%q -c %q -o %q' \
-        "$project_root/runtime" "$project_root/runtime/abla_runtime.c" \
-        "$value_runtime_object" "$project_root/runtime" \
+        'clang -std=c11 -O2 -flto %s -ffunction-sections -fdata-sections -I%q -c %q -o %q && clang -std=c11 -O2 -flto %s -ffunction-sections -fdata-sections -I%q -c %q -o %q' \
+        "$runtime_abi_flag" "$project_root/runtime" "$project_root/runtime/abla_runtime.c" \
+        "$value_runtime_object" "$runtime_abi_flag" "$project_root/runtime" \
         "$project_root/runtime/abla_runtime_host.c" "$host_runtime_object"
 fi
 ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \

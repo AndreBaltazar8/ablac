@@ -73,9 +73,7 @@ AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length) {
     const int64_t size = abla_as_i64(length);
     data[size] = '\0';
     abla_platform_memory_set_layout(data, 1);
-    AblaValue result = abla_string_static(data, (size_t)size);
-    ABLA_STRING_OWNER(result.as.string) = data;
-    return result;
+    return abla_string_static(data, (size_t)size);
 }
 AblaValue ablaUnsafeBorrowCString(AblaValue address) {
     const char* data = (const char*)raw_as_pointer(address);
@@ -107,9 +105,7 @@ AblaValue ablaLinuxTcpReadCompact(
         data[index] = buffer[index];
     }
     data[measured] = '\0';
-    AblaValue result = abla_string_static(data, (size_t)measured);
-    ABLA_STRING_OWNER(result.as.string) = data;
-    return result;
+    return abla_string_static(data, (size_t)measured);
 }
 
 AblaValue ablaLinuxPollWaitCompact(
@@ -139,9 +135,7 @@ AblaValue ablaLinuxPollWaitCompact(
     char* data = (char*)abla_platform_alloc(length + 1);
     for (size_t index = 0; index < length; ++index) data[index] = events[index];
     data[length] = '\0';
-    AblaValue result = abla_string_static(data, length);
-    ABLA_STRING_OWNER(result.as.string) = data;
-    return result;
+    return abla_string_static(data, length);
 }
 
 AblaValue ablaLinuxSyscall(
@@ -202,13 +196,11 @@ AblaValue ablaRuntimeMemoryCollect(void) {
 }
 AblaValue ablaRuntimeMemoryPromoteString(AblaValue value) {
     const char* source = abla_string_data(value);
-    const size_t length = value.as.string.length;
+    const size_t length = ABLA_STRING_LENGTH(value.as.string);
     char* data = (char*)abla_platform_alloc(length + 1);
     for (size_t index = 0; index < length; ++index) data[index] = source[index];
     data[length] = '\0';
-    AblaValue result = abla_string_static(data, length);
-    ABLA_STRING_OWNER(result.as.string) = data;
-    return result;
+    return abla_string_static(data, length);
 }
 AblaValue ablaRuntimeRegionBegin(void) {
     return ablaRuntimeMemoryCheckpoint();

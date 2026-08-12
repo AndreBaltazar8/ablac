@@ -167,6 +167,7 @@ static _Thread_local AblaCheckedFrame* host_checked_frame;
 static AblaAllocationHeader** host_collection_index;
 static size_t host_collection_index_count;
 static size_t host_collection_index_capacity;
+static AblaAllocationHeader** host_collection_ranges;
 static AblaAllocationHeader** host_mark_worklist;
 static size_t host_mark_worklist_count;
 
@@ -264,12 +265,6 @@ struct AblaObject {
     AblaField* fields;
 };
 
-struct AblaStringRope {
-    AblaString left;
-    AblaString right;
-    char* flattened;
-};
-
 static AblaValue host_value_void(void) {
     return (AblaValue){.tag = ABLA_VOID};
 }
@@ -287,8 +282,7 @@ static AblaValue host_value_string_static(const char* data, size_t length) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = data,
-            .length = length,
-            .storage.owner = NULL}};
+            .length = length}};
 }
 
 static int64_t host_value_as_i64(AblaValue value) {
@@ -311,11 +305,12 @@ static const char* host_string_storage(AblaString value) {
         (AblaString*)abla_platform_alloc(sizeof(AblaString) * capacity);
     abla_platform_memory_set_layout(pending, 9);
     pending[0] = value;
-    if (value.length == SIZE_MAX) {
+    const size_t length = ABLA_STRING_LENGTH(value);
+    if (length == SIZE_MAX) {
         abla_platform_free(pending);
         abla_platform_panic("string length overflow", 22);
     }
-    char* flattened = (char*)abla_platform_alloc(value.length + 1);
+    char* flattened = (char*)abla_platform_alloc(length + 1);
     size_t output = 0;
     while (count != 0) {
         const AblaString current = pending[--count];
@@ -325,14 +320,14 @@ static const char* host_string_storage(AblaString value) {
             data = ABLA_STRING_ROPE(current)->flattened;
         }
         if (data != (const char*)0) {
-            if (output > value.length ||
-                current.length > value.length - output) {
+            const size_t current_length = ABLA_STRING_LENGTH(current);
+            if (output > length || current_length > length - output) {
                 abla_platform_free(pending);
                 abla_platform_free(flattened);
                 abla_platform_panic("invalid string rope", 19);
             }
-            memcpy(flattened + output, data, current.length);
-            output += current.length;
+            memcpy(flattened + output, data, current_length);
+            output += current_length;
             continue;
         }
         if (ABLA_STRING_ROPE(current) == (AblaStringRope*)0) {
@@ -365,11 +360,11 @@ static const char* host_string_storage(AblaString value) {
         pending[count++] = ABLA_STRING_ROPE(current)->left;
     }
     abla_platform_free(pending);
-    if (output != value.length) {
+    if (output != length) {
         abla_platform_free(flattened);
         abla_platform_panic("invalid string rope", 19);
     }
-    flattened[value.length] = '\0';
+    flattened[length] = '\0';
     ABLA_STRING_ROPE(value)->flattened = flattened;
     abla_platform_memory_set_cache_owner(flattened, ABLA_STRING_ROPE(value));
     return flattened;
@@ -382,10 +377,10 @@ static const char* host_value_string_data(AblaValue value) {
 
 static const char* host_value_as_cstring(AblaValue value) {
     const char* data = host_value_string_data(value);
-    if (data[value.as.string.length] == '\0') return data;
-    char* terminated = (char*)abla_platform_alloc(value.as.string.length + 1);
-    memcpy(terminated, data, value.as.string.length);
-    terminated[value.as.string.length] = '\0';
+    if (data[ABLA_STRING_LENGTH(value.as.string)] == '\0') return data;
+    char* terminated = (char*)abla_platform_alloc(ABLA_STRING_LENGTH(value.as.string) + 1);
+    memcpy(terminated, data, ABLA_STRING_LENGTH(value.as.string));
+    terminated[ABLA_STRING_LENGTH(value.as.string)] = '\0';
     return terminated;
 }
 
@@ -476,8 +471,7 @@ static AblaValue host_owned_string(const char* data, size_t length) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = copy,
-            .length = length,
-            .storage.owner = copy}};
+            .length = length}};
 }
 
 static AblaHostRegionPage* host_region_page_acquire(size_t minimum) {
@@ -843,8 +837,7 @@ AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length_value) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = data,
-            .length = (size_t)length,
-            .storage.owner = data}};
+            .length = (size_t)length}};
 }
 
 AblaValue ablaUnsafeBorrowCString(AblaValue address) {
@@ -1432,8 +1425,7 @@ AblaValue ablaHostReadFile(AblaValue path_value) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = text,
-            .length = length,
-            .storage.owner = text}};
+            .length = length}};
 }
 
 AblaValue ablaHostWriteFile(AblaValue path_value, AblaValue contents) {
@@ -1444,8 +1436,8 @@ AblaValue ablaHostWriteFile(AblaValue path_value, AblaValue contents) {
     FILE* stream = fopen(path, "wb");
     if (stream == NULL) abla_platform_panic("cannot open output file", 23);
     const char* data = host_value_string_data(contents);
-    if (fwrite(data, 1, contents.as.string.length, stream) !=
-        contents.as.string.length || fclose(stream) != 0) {
+    if (fwrite(data, 1, ABLA_STRING_LENGTH(contents.as.string), stream) !=
+        ABLA_STRING_LENGTH(contents.as.string) || fclose(stream) != 0) {
         abla_platform_panic("cannot write output file", 24);
     }
     return host_value_void();
@@ -1456,7 +1448,7 @@ AblaValue ablaHostWriteFileAtomic(AblaValue path_value, AblaValue contents) {
         abla_platform_panic("expected path and contents", 26);
     }
     const char* path = host_value_as_cstring(path_value);
-    const size_t path_length = path_value.as.string.length;
+    const size_t path_length = ABLA_STRING_LENGTH(path_value.as.string);
     static const char suffix[] = ".tmp.XXXXXX";
     char* temporary = (char*)abla_platform_alloc(path_length + sizeof(suffix));
     memcpy(temporary, path, path_length);
@@ -1469,11 +1461,11 @@ AblaValue ablaHostWriteFileAtomic(AblaValue path_value, AblaValue contents) {
     const char* data = host_value_string_data(contents);
     size_t written = 0;
     bool success = true;
-    while (written < contents.as.string.length) {
+    while (written < ABLA_STRING_LENGTH(contents.as.string)) {
         const ssize_t amount = write(
             descriptor,
             data + written,
-            contents.as.string.length - written);
+            ABLA_STRING_LENGTH(contents.as.string) - written);
         if (amount < 0 && errno == EINTR) continue;
         if (amount <= 0) {
             success = false;
@@ -1512,7 +1504,7 @@ AblaValue ablaHostCreateParentDirectories(AblaValue path_value) {
         abla_platform_panic("expected path", 13);
     }
     const char* path = host_value_as_cstring(path_value);
-    const size_t length = path_value.as.string.length;
+    const size_t length = ABLA_STRING_LENGTH(path_value.as.string);
     char* scratch = (char*)abla_platform_alloc(length + 1);
     memcpy(scratch, path, length + 1);
     for (size_t index = 1; index < length; ++index) {
@@ -1533,7 +1525,7 @@ AblaValue ablaHostCreateDirectories(AblaValue path_value) {
         abla_platform_panic("expected path", 13);
     }
     return host_value_bool(host_create_directories(
-        host_value_as_cstring(path_value), path_value.as.string.length));
+        host_value_as_cstring(path_value), ABLA_STRING_LENGTH(path_value.as.string)));
 }
 
 AblaValue ablaHostFileKind(AblaValue path_value) {
@@ -1688,12 +1680,12 @@ AblaValue ablaHostStartProcessConfigured(
         const AblaValue value = host_value_array_get(
             environment_values, host_value_i64(index));
         if (name.tag != ABLA_STRING || value.tag != ABLA_STRING ||
-            name.as.string.length == 0) {
+            ABLA_STRING_LENGTH(name.as.string) == 0) {
             abla_platform_free(values);
             abla_platform_panic("invalid process environment entry", 33);
         }
         const char* name_text = host_value_as_cstring(name);
-        for (size_t byte = 0; byte < name.as.string.length; ++byte) {
+        for (size_t byte = 0; byte < ABLA_STRING_LENGTH(name.as.string); ++byte) {
             if (name_text[byte] == '=') {
                 abla_platform_free(values);
                 abla_platform_panic("invalid process environment name", 32);
@@ -1709,10 +1701,10 @@ AblaValue ablaHostStartProcessConfigured(
     }
     if (process == 0) {
         (void)setpgid(0, 0);
-        if (directory_value.as.string.length > 0 && chdir(directory) != 0) {
+        if (ABLA_STRING_LENGTH(directory_value.as.string) > 0 && chdir(directory) != 0) {
             _exit(126);
         }
-        if (output_path_value.as.string.length > 0) {
+        if (ABLA_STRING_LENGTH(output_path_value.as.string) > 0) {
             const int output = open(
                 output_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (output < 0 || dup2(output, STDOUT_FILENO) < 0 ||
@@ -1958,8 +1950,7 @@ AblaValue ablaHostSecureRandom(AblaValue count_value) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = bytes,
-            .length = offset,
-            .storage.owner = bytes}};
+            .length = offset}};
 }
 
 static bool host_load_ssl_symbol(void* destination, size_t size, const char* name) {
@@ -2296,8 +2287,7 @@ AblaValue ablaHostNetRead(
         .tag = ABLA_STRING,
         .as.string = {
             .data = bytes,
-            .length = (size_t)measured,
-            .storage.owner = bytes}};
+            .length = (size_t)measured}};
 }
 
 AblaValue ablaHostNetWrite(AblaValue descriptor_value, AblaValue contents) {
@@ -2306,7 +2296,7 @@ AblaValue ablaHostNetWrite(AblaValue descriptor_value, AblaValue contents) {
     ssize_t written;
     do written = send(
         descriptor, host_value_string_data(contents),
-        contents.as.string.length,
+        ABLA_STRING_LENGTH(contents.as.string),
 #if defined(MSG_NOSIGNAL)
         MSG_NOSIGNAL
 #else
@@ -2370,7 +2360,7 @@ AblaValue ablaHostNetUdpSend(
          address = address->ai_next) {
         do written = sendto(
             descriptor, host_value_string_data(contents),
-            contents.as.string.length, 0,
+            ABLA_STRING_LENGTH(contents.as.string), 0,
             address->ai_addr, address->ai_addrlen);
         while (written < 0 && errno == EINTR);
     }
@@ -2424,8 +2414,7 @@ AblaValue ablaHostNetUdpReceive(
         .tag = ABLA_STRING,
         .as.string = {
             .data = bytes,
-            .length = (size_t)measured,
-            .storage.owner = bytes}};
+            .length = (size_t)measured}};
 }
 
 AblaValue ablaHostNetSourceAddress(void) {
@@ -2692,8 +2681,7 @@ AblaValue ablaHostTlsRead(AblaValue handle_value, AblaValue maximum_value) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = bytes,
-            .length = (size_t)measured,
-            .storage.owner = bytes}};
+            .length = (size_t)measured}};
 }
 
 AblaValue ablaHostTlsWrite(AblaValue handle_value, AblaValue contents) {
@@ -2704,8 +2692,8 @@ AblaValue ablaHostTlsWrite(AblaValue handle_value, AblaValue contents) {
     }
     const char* bytes = host_value_string_data(contents);
     size_t offset = 0;
-    while (offset < contents.as.string.length) {
-        size_t remaining = contents.as.string.length - offset;
+    while (offset < ABLA_STRING_LENGTH(contents.as.string)) {
+        size_t remaining = ABLA_STRING_LENGTH(contents.as.string) - offset;
         if (remaining > INT32_MAX) remaining = INT32_MAX;
         const int written = host_SSL_write(
             connection->ssl, bytes + offset, (int)remaining);
@@ -2905,8 +2893,7 @@ AblaValue ablaHostTcpRead(AblaValue connection_value, AblaValue maximum_value) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = buffer,
-            .length = (size_t)measured,
-            .storage.owner = buffer}};
+            .length = (size_t)measured}};
 }
 
 AblaValue ablaHostTcpWrite(AblaValue connection_value, AblaValue contents) {
@@ -2914,11 +2901,11 @@ AblaValue ablaHostTcpWrite(AblaValue connection_value, AblaValue contents) {
     if (contents.tag != ABLA_STRING) abla_platform_panic("expected string", 15);
     const char* data = host_value_string_data(contents);
     size_t written = 0;
-    while (written < contents.as.string.length) {
+    while (written < ABLA_STRING_LENGTH(contents.as.string)) {
         const ssize_t amount = write(
             connection,
             data + written,
-            contents.as.string.length - written);
+            ABLA_STRING_LENGTH(contents.as.string) - written);
         if (amount < 0 && errno == EINTR) continue;
         if (amount <= 0) return host_value_i64((int64_t)written);
         written += (size_t)amount;
@@ -3043,6 +3030,25 @@ static bool host_mark_pointer(uintptr_t candidate) {
             slot = (slot + 1) & mask;
             header = host_collection_index[slot];
         }
+        if (header == NULL && host_collection_ranges != NULL) {
+            size_t lower = 0;
+            size_t upper = host_collection_index_count;
+            while (lower < upper) {
+                const size_t middle = lower + (upper - lower) / 2;
+                const uintptr_t payload =
+                    (uintptr_t)(host_collection_ranges[middle] + 1);
+                if (payload <= candidate) lower = middle + 1;
+                else upper = middle;
+            }
+            if (lower != 0) {
+                AblaAllocationHeader* containing =
+                    host_collection_ranges[lower - 1];
+                const uintptr_t payload = (uintptr_t)(containing + 1);
+                if (candidate - payload < containing->allocation.size) {
+                    header = containing;
+                }
+            }
+        }
         if (header == NULL) return false;
         if ((header->allocation.generation >> 63) != 0) return false;
         header->allocation.generation |= UINT64_C(1) << 63;
@@ -3055,7 +3061,8 @@ static bool host_mark_pointer(uintptr_t candidate) {
     AblaAllocationHeader* header = host_allocation_tail;
     while (header != NULL) {
         const uintptr_t payload = (uintptr_t)(header + 1);
-        if (payload == candidate) {
+        if (candidate >= payload &&
+            candidate - payload < header->allocation.size) {
             if ((header->allocation.generation >> 63) != 0) return false;
             header->allocation.generation |= UINT64_C(1) << 63;
             return true;
@@ -3083,12 +3090,7 @@ static bool host_mark_string(const AblaString* string) {
     if (string->data == NULL) {
         if (host_mark_pointer(
             (uintptr_t)ABLA_STRING_ROPE(*string))) changed = true;
-    } else {
-        const char* allocation = ABLA_STRING_OWNER(*string) != NULL
-            ? ABLA_STRING_OWNER(*string)
-            : string->data;
-        if (host_mark_pointer((uintptr_t)allocation)) changed = true;
-    }
+    } else if (host_mark_pointer((uintptr_t)string->data)) changed = true;
     return changed;
 }
 
@@ -3234,6 +3236,14 @@ static void host_collection_index_add(AblaAllocationHeader* header) {
     host_collection_index[slot] = header;
 }
 
+static int host_collection_range_compare(const void* left, const void* right) {
+    const uintptr_t left_payload =
+        (uintptr_t)(*(AblaAllocationHeader* const*)left + 1);
+    const uintptr_t right_payload =
+        (uintptr_t)(*(AblaAllocationHeader* const*)right + 1);
+    return left_payload < right_payload ? -1 : left_payload > right_payload;
+}
+
 int64_t abla_platform_memory_collect(void* opaque_frames) {
     if (atomic_load_explicit(
             &host_active_threads, memory_order_acquire) != 0) return 0;
@@ -3283,16 +3293,36 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
         host_collection_index_capacity = 0;
         abla_platform_panic("out of memory", 13);
     }
+    host_collection_ranges = allocation_count == 0
+        ? NULL
+        : (AblaAllocationHeader**)malloc(
+            allocation_count * sizeof(*host_collection_ranges));
+    if (allocation_count != 0 && host_collection_ranges == NULL) {
+        free(host_collection_index);
+        free(host_mark_worklist);
+        host_collection_index = NULL;
+        host_mark_worklist = NULL;
+        host_collection_index_count = 0;
+        host_collection_index_capacity = 0;
+        abla_platform_panic("out of memory", 13);
+    }
     host_mark_worklist_count = 0;
+    size_t range = 0;
     for (AblaAllocationHeader* header = host_allocation_tail;
          header != NULL; header = header->allocation.previous) {
         host_collection_index_add(header);
+        host_collection_ranges[range++] = header;
     }
     for (size_t depth = 0; depth < host_region_depth; ++depth) {
         for (AblaAllocationHeader* header = host_regions[depth].tail;
              header != NULL; header = header->allocation.previous) {
             host_collection_index_add(header);
+            host_collection_ranges[range++] = header;
         }
+    }
+    if (allocation_count > 1) {
+        qsort(host_collection_ranges, allocation_count,
+            sizeof(*host_collection_ranges), host_collection_range_compare);
     }
     (void)host_mark_root_frames((AblaRuntimeRootFrame*)opaque_frames);
     if (host_current_coroutine != NULL) {
@@ -3328,6 +3358,8 @@ int64_t abla_platform_memory_collect(void* opaque_frames) {
     host_collection_index_capacity = 0;
     free(host_mark_worklist);
     host_mark_worklist = NULL;
+    free(host_collection_ranges);
+    host_collection_ranges = NULL;
     const size_t freed = before - host_allocation_live_bytes;
     if (freed > (size_t)INT64_MAX) {
         abla_platform_panic("collection size overflow", 24);
@@ -3612,7 +3644,7 @@ AblaValue ablaRuntimeMemoryPromoteString(AblaValue value) {
     host_region_override = host_region_depth < 2
         ? NULL
         : &host_regions[host_region_depth - 2];
-    AblaValue promoted = host_owned_string(data, value.as.string.length);
+    AblaValue promoted = host_owned_string(data, ABLA_STRING_LENGTH(value.as.string));
     host_region_override = previous_region;
     host_region_override_active = previous_active;
     return promoted;
@@ -3673,8 +3705,8 @@ AblaValue ablaHostWriteStdout(AblaValue text) {
     if (text.tag != ABLA_STRING) {
         abla_platform_panic("expected string", 15);
     }
-    if (fwrite(host_value_string_data(text), 1, text.as.string.length, stdout) !=
-        text.as.string.length) {
+    if (fwrite(host_value_string_data(text), 1, ABLA_STRING_LENGTH(text.as.string), stdout) !=
+        ABLA_STRING_LENGTH(text.as.string)) {
         abla_platform_panic("cannot write standard output", 28);
     }
     if (fflush(stdout) != 0) {
@@ -3687,8 +3719,8 @@ AblaValue ablaHostWriteStderr(AblaValue text) {
     if (text.tag != ABLA_STRING) {
         abla_platform_panic("expected string", 15);
     }
-    if (fwrite(host_value_string_data(text), 1, text.as.string.length, stderr) !=
-        text.as.string.length) {
+    if (fwrite(host_value_string_data(text), 1, ABLA_STRING_LENGTH(text.as.string), stderr) !=
+        ABLA_STRING_LENGTH(text.as.string)) {
         abla_platform_panic("cannot write standard error", 27);
     }
     return host_value_void();

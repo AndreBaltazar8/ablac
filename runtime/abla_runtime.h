@@ -34,6 +34,7 @@ typedef struct AblaString {
 #ifdef ABLA_WASM32
     uint32_t data_padding;
 #endif
+#if defined(ABLA_VALUE_ABI32)
     size_t length;
 #ifdef ABLA_WASM32
     uint32_t length_padding;
@@ -41,24 +42,66 @@ typedef struct AblaString {
     union {
         const char* owner;
         AblaStringRope* rope;
-    } storage;
+        uint64_t abi_word;
+    };
+#elif defined(ABLA_VALUE_ABI40)
+    size_t length;
 #ifdef ABLA_WASM32
-    uint32_t storage_padding;
+    uint32_t length_padding;
+#endif
+    const char* owner;
+#ifdef ABLA_WASM32
+    uint32_t owner_padding;
+#endif
+    AblaStringRope* rope;
+#ifdef ABLA_WASM32
+    uint32_t rope_padding;
+#endif
+#else
+    union {
+        size_t length;
+        AblaStringRope* rope;
+        uint64_t abi_word;
+    };
 #endif
 } AblaString;
 
-#define ABLA_STRING_OWNER(value) ((value).storage.owner)
-#define ABLA_STRING_ROPE(value) ((value).storage.rope)
+#define ABLA_STRING_ROPE(value) ((value).rope)
+
+struct AblaStringRope {
+    size_t length;
+    AblaString left;
+    AblaString right;
+    char* flattened;
+};
+
+#if defined(ABLA_VALUE_ABI32) || defined(ABLA_VALUE_ABI40)
+#define ABLA_STRING_LENGTH(value) ((value).length)
+#define ABLA_STRING_ROPE_INITIALIZER(length_value, rope_value) \
+    .data = (const char*)0, .length = (length_value), .rope = (rope_value)
+#else
+#define ABLA_STRING_LENGTH(value) \
+    ((value).data == (const char*)0 \
+        ? ABLA_STRING_ROPE(value)->length \
+        : (value).length)
+#define ABLA_STRING_ROPE_INITIALIZER(length_value, rope_value) \
+    .data = (const char*)0, .rope = (rope_value)
+#endif
 
 struct AblaValue {
     AblaTag tag;
+#if !defined(ABLA_VALUE_ABI32) && !defined(ABLA_VALUE_ABI40)
+    uint32_t auxiliary;
+#endif
     union {
         int64_t i64;
         bool boolean;
         struct {
+#if defined(ABLA_VALUE_ABI32) || defined(ABLA_VALUE_ABI40)
             uint32_t id;
 #ifdef ABLA_WASM32
             uint32_t id_padding;
+#endif
 #endif
             size_t capture_count;
 #ifdef ABLA_WASM32
@@ -79,12 +122,38 @@ struct AblaValue {
     } as;
 };
 
-#ifdef ABLA_WASM32
-_Static_assert(sizeof(AblaString) == 24, "Wasm string ABI must be 24 bytes");
-_Static_assert(sizeof(AblaValue) == 32, "Wasm value ABI must be 32 bytes");
+#if defined(ABLA_VALUE_ABI32) || defined(ABLA_VALUE_ABI40)
+#define ABLA_FUNCTION_ID(value) ((value).as.function.id)
+#define ABLA_VALUE_FUNCTION_INITIALIZER(function) \
+    .as.function = {.id = (function),
 #else
-_Static_assert(sizeof(AblaString) == 24, "Native string ABI must be 24 bytes");
-_Static_assert(sizeof(AblaValue) == 32, "Native value ABI must be 32 bytes");
+#define ABLA_FUNCTION_ID(value) ((value).auxiliary)
+#define ABLA_VALUE_FUNCTION_INITIALIZER(function) \
+    .auxiliary = (function), .as.function = {
+#endif
+
+#ifdef ABLA_WASM32
+#ifdef ABLA_VALUE_ABI40
+_Static_assert(sizeof(AblaString) == 32, "Wasm ABI40 string must be 32 bytes");
+_Static_assert(sizeof(AblaValue) == 40, "Wasm ABI40 value must be 40 bytes");
+#elif defined(ABLA_VALUE_ABI32)
+_Static_assert(sizeof(AblaString) == 24, "Wasm ABI32 string must be 24 bytes");
+_Static_assert(sizeof(AblaValue) == 32, "Wasm ABI32 value must be 32 bytes");
+#else
+_Static_assert(sizeof(AblaString) == 16, "Wasm string ABI must be 16 bytes");
+_Static_assert(sizeof(AblaValue) == 24, "Wasm value ABI must be 24 bytes");
+#endif
+#else
+#ifdef ABLA_VALUE_ABI40
+_Static_assert(sizeof(AblaString) == 32, "Native ABI40 string must be 32 bytes");
+_Static_assert(sizeof(AblaValue) == 40, "Native ABI40 value must be 40 bytes");
+#elif defined(ABLA_VALUE_ABI32)
+_Static_assert(sizeof(AblaString) == 24, "Native ABI32 string must be 24 bytes");
+_Static_assert(sizeof(AblaValue) == 32, "Native ABI32 value must be 32 bytes");
+#else
+_Static_assert(sizeof(AblaString) == 16, "Native string ABI must be 16 bytes");
+_Static_assert(sizeof(AblaValue) == 24, "Native value ABI must be 24 bytes");
+#endif
 #endif
 
 typedef AblaValue (*AblaDispatch)(

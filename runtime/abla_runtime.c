@@ -66,12 +66,6 @@ struct AblaObject {
     AblaField* fields;
 };
 
-struct AblaStringRope {
-    AblaString left;
-    AblaString right;
-    char* flattened;
-};
-
 static _Noreturn void panic(const char* message, uint64_t length) {
     abla_platform_panic(message, length);
 }
@@ -102,11 +96,12 @@ static const char* string_data(AblaString value) {
     abla_platform_memory_set_layout(pending, 9);
     pending[0] = value;
 
-    if (value.length == SIZE_MAX) {
+    const size_t length = ABLA_STRING_LENGTH(value);
+    if (length == SIZE_MAX) {
         abla_platform_free(pending);
         panic("string length overflow", 22);
     }
-    char* flattened = (char*)abla_platform_alloc(value.length + 1);
+    char* flattened = (char*)abla_platform_alloc(length + 1);
     size_t output = 0;
     while (count != 0) {
         const AblaString current = pending[--count];
@@ -116,14 +111,14 @@ static const char* string_data(AblaString value) {
             current_data = ABLA_STRING_ROPE(current)->flattened;
         }
         if (current_data != (const char*)0) {
-            if (output > value.length ||
-                current.length > value.length - output) {
+            const size_t current_length = ABLA_STRING_LENGTH(current);
+            if (output > length || current_length > length - output) {
                 abla_platform_free(pending);
                 abla_platform_free(flattened);
                 panic("invalid string rope", 19);
             }
-            copy_bytes(flattened + output, current_data, current.length);
-            output += current.length;
+            copy_bytes(flattened + output, current_data, current_length);
+            output += current_length;
             continue;
         }
         if (ABLA_STRING_ROPE(current) == (AblaStringRope*)0) {
@@ -158,21 +153,22 @@ static const char* string_data(AblaString value) {
         pending[count++] = ABLA_STRING_ROPE(current)->left;
     }
     abla_platform_free(pending);
-    if (output != value.length) {
+    if (output != length) {
         abla_platform_free(flattened);
         panic("invalid string rope", 19);
     }
-    flattened[value.length] = '\0';
+    flattened[length] = '\0';
     ABLA_STRING_ROPE(value)->flattened = flattened;
     abla_platform_memory_set_cache_owner(flattened, ABLA_STRING_ROPE(value));
     return flattened;
 }
 
 static bool string_equal(AblaString left, AblaString right) {
-    if (left.length != right.length) return false;
+    const size_t length = ABLA_STRING_LENGTH(left);
+    if (length != ABLA_STRING_LENGTH(right)) return false;
     const char* left_data = string_data(left);
     const char* right_data = string_data(right);
-    for (size_t index = 0; index < left.length; ++index) {
+    for (size_t index = 0; index < length; ++index) {
         if (left_data[index] != right_data[index]) return false;
     }
     return true;
@@ -191,14 +187,12 @@ AblaValue abla_string_static(const char* data, size_t length) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = data,
-            .length = length,
-            .storage.owner = (const char*)0}};
+            .length = length}};
 }
 AblaValue abla_function(uint32_t function) {
     return (AblaValue){
         .tag = ABLA_FUNCTION,
-        .as.function = {
-            .id = function,
+        ABLA_VALUE_FUNCTION_INITIALIZER(function)
             .capture_count = 0,
             .captures = (AblaValue*)0}};
 }
@@ -217,8 +211,7 @@ AblaValue abla_closure(
     }
     return (AblaValue){
         .tag = ABLA_FUNCTION,
-        .as.function = {
-            .id = function,
+        ABLA_VALUE_FUNCTION_INITIALIZER(function)
             .capture_count = capture_count,
             .captures = owned_captures}};
 }
@@ -234,10 +227,10 @@ bool abla_as_bool(AblaValue value) {
 const char* abla_as_cstring(AblaValue value) {
     if (value.tag != ABLA_STRING) panic("expected string", 15);
     const char* data = string_data(value.as.string);
-    if (data[value.as.string.length] == '\0') return data;
-    char* terminated = (char*)abla_platform_alloc(value.as.string.length + 1);
-    copy_bytes(terminated, data, value.as.string.length);
-    terminated[value.as.string.length] = '\0';
+    if (data[ABLA_STRING_LENGTH(value.as.string)] == '\0') return data;
+    char* terminated = (char*)abla_platform_alloc(ABLA_STRING_LENGTH(value.as.string) + 1);
+    copy_bytes(terminated, data, ABLA_STRING_LENGTH(value.as.string));
+    terminated[ABLA_STRING_LENGTH(value.as.string)] = '\0';
     return terminated;
 }
 const char* abla_string_data(AblaValue value) {
@@ -246,7 +239,7 @@ const char* abla_string_data(AblaValue value) {
 }
 uint32_t abla_as_function(AblaValue value) {
     if (value.tag != ABLA_FUNCTION) panic("expected function", 17);
-    return value.as.function.id;
+    return ABLA_FUNCTION_ID(value);
 }
 uint64_t abla_function_capture_count(AblaValue value) {
     if (value.tag != ABLA_FUNCTION) panic("expected function", 17);
@@ -269,7 +262,7 @@ typedef struct AblaOwnedBytes {
 
 void* abla_owned_bytes_from_value(AblaValue value) {
     const char* data = abla_string_data(value);
-    const uint64_t length = (uint64_t)value.as.string.length;
+    const uint64_t length = (uint64_t)ABLA_STRING_LENGTH(value.as.string);
     if (length > SIZE_MAX - sizeof(AblaOwnedBytes)) {
         panic("string length overflow", 22);
     }
@@ -465,7 +458,7 @@ AblaValue abla_equal(AblaValue left, AblaValue right) {
     case ABLA_STRING: return abla_bool(string_equal(left.as.string, right.as.string));
     case ABLA_FUNCTION:
         return abla_bool(
-            left.as.function.id == right.as.function.id &&
+            ABLA_FUNCTION_ID(left) == ABLA_FUNCTION_ID(right) &&
             left.as.function.captures == right.as.function.captures);
     case ABLA_CELL: return abla_bool(left.as.cell == right.as.cell);
     case ABLA_ARRAY: return abla_bool(left.as.array == right.as.array);
@@ -542,40 +535,38 @@ AblaValue abla_to_string(AblaValue value) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = text,
-            .length = length,
-            .storage.owner = text}};
+            .length = length}};
 }
 
 AblaValue abla_string_concat(AblaValue left, AblaValue right) {
     if (left.tag != ABLA_STRING || right.tag != ABLA_STRING) {
         panic("concat expects strings", 22);
     }
-    if (left.as.string.length == 0) return right;
-    if (right.as.string.length == 0) return left;
-    if (left.as.string.length > SIZE_MAX - right.as.string.length) {
+    if (ABLA_STRING_LENGTH(left.as.string) == 0) return right;
+    if (ABLA_STRING_LENGTH(right.as.string) == 0) return left;
+    if (ABLA_STRING_LENGTH(left.as.string) > SIZE_MAX - ABLA_STRING_LENGTH(right.as.string)) {
         panic("string length overflow", 22);
     }
-    const size_t length = left.as.string.length + right.as.string.length;
+    const size_t length = ABLA_STRING_LENGTH(left.as.string) + ABLA_STRING_LENGTH(right.as.string);
     AblaStringRope* rope =
         (AblaStringRope*)abla_platform_alloc(sizeof(AblaStringRope));
     abla_platform_memory_set_layout(rope, 6);
+    rope->length = length;
     rope->left = left.as.string;
     rope->right = right.as.string;
     rope->flattened = (char*)0;
     return (AblaValue){
         .tag = ABLA_STRING,
         .as.string = {
-            .data = (const char*)0,
-            .length = length,
-            .storage.rope = rope}};
+            ABLA_STRING_ROPE_INITIALIZER(length, rope)}};
 }
 
 int64_t abla_string_length_i64(AblaValue value) {
     if (value.tag != ABLA_STRING) panic("expected string", 15);
-    if (value.as.string.length > (size_t)INT64_MAX) {
+    if (ABLA_STRING_LENGTH(value.as.string) > (size_t)INT64_MAX) {
         panic("string length does not fit in int", 32);
     }
-    return (int64_t)value.as.string.length;
+    return (int64_t)ABLA_STRING_LENGTH(value.as.string);
 }
 
 AblaValue abla_string_length(AblaValue value) {
@@ -584,7 +575,7 @@ AblaValue abla_string_length(AblaValue value) {
 
 int64_t abla_string_get_i64(AblaValue value, int64_t index) {
     if (value.tag != ABLA_STRING) panic("expected string", 15);
-    if (index < 0 || (uint64_t)index >= value.as.string.length) {
+    if (index < 0 || (uint64_t)index >= ABLA_STRING_LENGTH(value.as.string)) {
         panic("string index out of bounds", 26);
     }
     return (int64_t)(uint8_t)string_data(value.as.string)[(size_t)index];
@@ -601,22 +592,18 @@ AblaValue abla_string_slice(
     if (value.tag != ABLA_STRING) panic("expected string", 15);
     const int64_t begin = abla_as_i64(begin_value);
     const int64_t end = abla_as_i64(end_value);
-    if (begin < 0 || end < begin || (uint64_t)end > value.as.string.length) {
+    if (begin < 0 || end < begin || (uint64_t)end > ABLA_STRING_LENGTH(value.as.string)) {
         panic("string slice is out of bounds", 29);
     }
-    if (begin == 0 && (uint64_t)end == value.as.string.length) return value;
+    if (begin == 0 && (uint64_t)end == ABLA_STRING_LENGTH(value.as.string)) return value;
     const size_t length = (size_t)(end - begin);
     if (length == 0) return abla_string_static("", 0);
     const char* data = string_data(value.as.string);
-    const char* owner = ABLA_STRING_OWNER(value.as.string);
-    if (owner == (const char*)0 &&
-        ABLA_STRING_ROPE(value.as.string) != NULL) owner = data;
     return (AblaValue){
         .tag = ABLA_STRING,
         .as.string = {
             .data = data + (size_t)begin,
-            .length = length,
-            .storage.owner = owner}};
+            .length = length}};
 }
 
 AblaValue ablaUtf8EncodeScalar(AblaValue value) {
@@ -653,8 +640,7 @@ AblaValue ablaUtf8EncodeScalar(AblaValue value) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = result,
-            .length = length,
-            .storage.owner = result}};
+            .length = length}};
 }
 
 AblaValue ablaTextFindSequence(
@@ -667,12 +653,12 @@ AblaValue ablaTextFindSequence(
     }
     const int64_t begin = abla_as_i64(begin_value);
     const int64_t end = abla_as_i64(end_value);
-    if (begin < 0 || end < begin || (uint64_t)end > text.as.string.length) {
+    if (begin < 0 || end < begin || (uint64_t)end > ABLA_STRING_LENGTH(text.as.string)) {
         return abla_i64(-1);
     }
     const size_t first = (size_t)begin;
     const size_t limit = (size_t)end;
-    const size_t wanted = sequence.as.string.length;
+    const size_t wanted = ABLA_STRING_LENGTH(sequence.as.string);
     if (wanted == 0) return abla_i64(begin);
     if (wanted > limit - first) return abla_i64(-1);
     const char* source = string_data(text.as.string);
@@ -699,7 +685,7 @@ AblaValue ablaTextFindByte(
     const int64_t begin = abla_as_i64(begin_value);
     const int64_t end = abla_as_i64(end_value);
     if (byte < 0 || byte > 255 || begin < 0 || end < begin ||
-        (uint64_t)end > text.as.string.length) {
+        (uint64_t)end > ABLA_STRING_LENGTH(text.as.string)) {
         return abla_i64(-1);
     }
     const char* source = string_data(text.as.string);
@@ -713,13 +699,13 @@ AblaValue ablaTextAsciiEqualInsensitive(AblaValue left, AblaValue right) {
     if (left.tag != ABLA_STRING || right.tag != ABLA_STRING) {
         panic("ASCII comparison expects strings", 32);
     }
-    if (left.as.string.length != right.as.string.length) {
+    if (ABLA_STRING_LENGTH(left.as.string) != ABLA_STRING_LENGTH(right.as.string)) {
         return abla_bool(false);
     }
     const char* left_data = string_data(left.as.string);
     const char* right_data = string_data(right.as.string);
     size_t index = 0;
-    while (index < left.as.string.length) {
+    while (index < ABLA_STRING_LENGTH(left.as.string)) {
         uint8_t left_byte = (uint8_t)left_data[index];
         uint8_t right_byte = (uint8_t)right_data[index];
         if (left_byte >= 'A' && left_byte <= 'Z') left_byte += 'a' - 'A';
@@ -733,8 +719,8 @@ AblaValue ablaTextAsciiEqualInsensitive(AblaValue left, AblaValue right) {
 AblaValue ablaTextReadU32LittleEndian(AblaValue text, AblaValue offset_value) {
     if (text.tag != ABLA_STRING) panic("byte decoding expects text", 26);
     const int64_t offset = abla_as_i64(offset_value);
-    if (offset < 0 || (uint64_t)offset > text.as.string.length ||
-        text.as.string.length - (size_t)offset < 4) {
+    if (offset < 0 || (uint64_t)offset > ABLA_STRING_LENGTH(text.as.string) ||
+        ABLA_STRING_LENGTH(text.as.string) - (size_t)offset < 4) {
         return abla_i64(-1);
     }
     const uint8_t* bytes =
@@ -798,8 +784,7 @@ AblaValue ablaByteEncode(AblaValue value) {
         .tag = ABLA_STRING,
         .as.string = {
             .data = result,
-            .length = 1,
-            .storage.owner = result}};
+            .length = 1}};
 }
 
 AblaValue abla_length(AblaValue value) {

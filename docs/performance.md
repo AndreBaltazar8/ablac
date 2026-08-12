@@ -561,3 +561,29 @@ The HTTP result intentionally includes the tagged-value runtime and live TCP
 transport. Further reductions come from IR-level reachability before textual
 emission, a raw-kernel platform profile, specialized/unboxed values, and
 splitting optional HTTP features such as server transport from router-only use.
+
+## Compact 24-byte dynamic values (2026-08-12)
+
+The portable dynamic value ABI now uses an explicit 32-bit tag, a 32-bit
+auxiliary word, and a 16-byte payload. Function identifiers use the auxiliary
+word; a closure keeps its capture count and capture pointer inline. Flat
+strings retain their pointer and full `size_t` length without boxing. Rope
+length moves into the rope allocation, and slices are allocation-interior
+views understood by the tracing collector. This reduces `AblaValue` from 32
+to 24 bytes on native and Wasm targets without narrowing string lengths or
+adding per-string or per-closure allocations.
+
+In the same one-million-element dynamic-array workload, tracked storage fell
+from 33,554,456 to 25,165,848 bytes, exactly 25%. Median process RSS fell from
+about 51 MiB to 38 MiB. The isolated five-sample HTTP comparison reached a
+235,674 requests/second median, up 6.8% from the prior 220,714 baseline; the
+same run measured Go at 164,657 and Rust at 282,480 requests/second.
+
+A 16-byte form was evaluated but not adopted. It cannot retain a pointer plus
+full-width length for strings or a capture count plus pointer for closures,
+so it requires additional boxed descriptors or packed-length fallbacks.
+Sixteen bytes also crosses the x86-64 and AArch64 aggregate return threshold,
+requiring a coordinated direct-return rewrite of every runtime, foreign, Wasm,
+Android, and bootstrap boundary. Keeping 24 bytes is therefore the smallest
+validated portable representation in this pass, not a claim that a separately
+benchmarked 16-byte direct-return ABI can never win.
