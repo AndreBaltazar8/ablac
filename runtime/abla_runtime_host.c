@@ -850,10 +850,10 @@ AblaValue ablaLinuxTcpReadCompact(
     AblaValue maximum_value) {
     const int descriptor = (int)host_value_as_i64(descriptor_value);
     const int64_t maximum = host_value_as_i64(maximum_value);
-    if (descriptor < 0 || maximum <= 0 || maximum > 16384) {
+    if (descriptor < 0 || maximum <= 0 || maximum > 32768) {
         return host_value_string_static("", 0);
     }
-    char buffer[16384];
+    char buffer[32768];
     ssize_t measured = -1;
     do {
         measured = read(descriptor, buffer, (size_t)maximum);
@@ -3637,6 +3637,11 @@ AblaValue ablaRuntimeMemoryPromoteString(AblaValue value) {
     if (value.tag != ABLA_STRING) {
         abla_platform_panic("expected string", 15);
     }
+    // Promotion is a lifetime-boundary operation, not an unconditional copy.
+    // Outside a region the value already belongs to the oldest allocation
+    // domain, so copying it only doubles socket input traffic and collector
+    // pressure without extending its lifetime.
+    if (host_region_depth == 0 && !host_region_override_active) return value;
     const char* data = host_value_string_data(value);
     const bool previous_active = host_region_override_active;
     AblaHostRegion* previous_region = host_region_override;

@@ -443,6 +443,7 @@ AblaValue ablaTextFindByte(
     AblaValue end);
 AblaValue ablaTextAsciiEqualInsensitive(AblaValue left, AblaValue right);
 AblaValue ablaTextReadU32LittleEndian(AblaValue text, AblaValue offset);
+AblaValue ablaTextIsValidUtf8(AblaValue text);
 AblaValue abla_length(AblaValue value);
 AblaValue abla_index_get(AblaValue value, AblaValue index);
 AblaValue abla_array_create(const AblaValue* values, size_t count);

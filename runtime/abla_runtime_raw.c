@@ -87,10 +87,10 @@ AblaValue ablaLinuxTcpReadCompact(
     AblaValue maximum_value) {
     const int64_t descriptor = abla_as_i64(descriptor_value);
     const int64_t maximum = abla_as_i64(maximum_value);
-    if (descriptor < 0 || maximum <= 0 || maximum > 16384) {
+    if (descriptor < 0 || maximum <= 0 || maximum > 32768) {
         return abla_string_static("", 0);
     }
-    char buffer[16384];
+    char buffer[32768];
     int64_t measured;
     do {
         __asm__ volatile(

@@ -65,8 +65,9 @@ permission to perform unsafe work, so `trusted` remains an independent
 capability boundary. A `noescape` contract on an Abla function or method is
 checked against its inferred effects. These summaries become typed-module
 interface data when separate compilation lands. `FnNoEscape(A) -> R` carries
-the same non-retention guarantee through a function value. Only a checked
-`noescape` declaration can satisfy that slot; ordinary callbacks remain
+the same non-retention guarantee through a function value. Ordinary named Abla
+functions and non-capturing lambdas satisfy that slot when their bodies and
+transitive calls prove them non-retaining; opaque callbacks remain
 conservatively retaining.
 
 ## Control flow and staging

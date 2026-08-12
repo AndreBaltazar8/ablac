@@ -341,10 +341,11 @@ staged execution observe the same updates. `move { ... }` infers `FnOnce`.
 
 `FnNoEscape(A) -> R` is an orthogonal effect-bearing callable type. It proves
 that the callback does not retain any Abla-managed argument, so it may be
-invoked with region-owned values. A named `noescape fun` can satisfy this type;
-an ordinary function cannot be implicitly upgraded to it. The guarantee is
-checked transitively against the declaration's inferred receiver and parameter
-retention effects.
+invoked with region-owned values. An ordinary Abla function satisfies this type
+when its inferred transitive receiver and parameter effects prove that it does
+not retain its arguments. The explicit `noescape` spelling remains useful as a
+checked public contract and is required at foreign or opaque boundaries whose
+bodies the compiler cannot inspect.
 
 `Cell<T>` is explicit interior mutability for copy scalars. It can be retained
 in a `val` field and changed only through `set`; `get` returns the scalar by

@@ -732,6 +732,39 @@ AblaValue ablaTextReadU32LittleEndian(AblaValue text, AblaValue offset_value) {
         (uint32_t)bytes[3] << 24));
 }
 
+AblaValue ablaTextIsValidUtf8(AblaValue text) {
+    if (text.tag != ABLA_STRING) panic("UTF-8 validation expects text", 29);
+    const uint8_t* bytes = (const uint8_t*)string_data(text.as.string);
+    const size_t length = ABLA_STRING_LENGTH(text.as.string);
+    size_t offset = 0;
+    while (offset < length) {
+        const uint8_t lead = bytes[offset];
+        if (lead <= 0x7f) {
+            ++offset;
+            continue;
+        }
+        size_t count = 0;
+        if (lead >= 0xc2 && lead <= 0xdf) count = 2;
+        else if (lead >= 0xe0 && lead <= 0xef) count = 3;
+        else if (lead >= 0xf0 && lead <= 0xf4) count = 4;
+        else return abla_bool(false);
+        if (count > length - offset) return abla_bool(false);
+        size_t index = 1;
+        while (index < count) {
+            if (bytes[offset + index] < 0x80 ||
+                bytes[offset + index] > 0xbf) return abla_bool(false);
+            ++index;
+        }
+        const uint8_t second = bytes[offset + 1];
+        if ((lead == 0xe0 && second < 0xa0) ||
+            (lead == 0xed && second > 0x9f) ||
+            (lead == 0xf0 && second < 0x90) ||
+            (lead == 0xf4 && second > 0x8f)) return abla_bool(false);
+        offset += count;
+    }
+    return abla_bool(true);
+}
+
 AblaValue ablaBitAnd(AblaValue left, AblaValue right) {
     return abla_i64(abla_as_i64(left) & abla_as_i64(right));
 }

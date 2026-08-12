@@ -27,20 +27,24 @@ if [[ $native_status -ne 42 ]]; then
     exit 1
 fi
 
-"$c_compiler" "$source_file" > "$output_directory/program.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/program.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/program-c"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/program-c"
-c_status=$?
-set -e
-if [[ $c_status -ne 42 ]]; then
-    echo "scoped region: generated C expected 42, got $c_status" >&2
-    exit 1
+if [[ -x $c_compiler ]]; then
+    "$c_compiler" "$source_file" > "$output_directory/program.c"
+    clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
+        -I"$project_root/runtime" \
+        "$output_directory/program.c" \
+        "$project_root/runtime/abla_runtime.c" \
+        "$project_root/runtime/abla_runtime_host.c" \
+        -o "$output_directory/program-c"
+    set +e
+    "$project_root/tools/run-limited.sh" "$output_directory/program-c"
+    c_status=$?
+    set -e
+    if [[ $c_status -ne 42 ]]; then
+        echo "scoped region: generated C expected 42, got $c_status" >&2
+        exit 1
+    fi
+else
+    echo "scoped region: skipping unavailable optional C differential compiler $c_compiler"
 fi
 
 fixtures=(
@@ -78,22 +82,102 @@ for fixture in "${fixtures[@]}"; do
     [[ ! -e $output ]]
 done
 
-noescape_callback_output="$output_directory/invalid-noescape-callback-type"
-set +e
+inferred_output="$output_directory/inferred-noescape-callback"
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/invalid-region-noescape-callback-type.ab" \
-    -o "$noescape_callback_output" \
-    >"$noescape_callback_output.out" \
-    2>"$noescape_callback_output.err"
-noescape_callback_status=$?
+    -o "$inferred_output"
+set +e
+"$project_root/tools/run-limited.sh" "$inferred_output"
+inferred_status=$?
 set -e
-if [[ $noescape_callback_status -ne 1 ]] ||
-    ! grep -Fq 'function.argument:requireNoEscape' \
-        "$noescape_callback_output.err"; then
-    echo 'scoped region: ordinary callback satisfied FnNoEscape' >&2
-    sed -n '1,80p' "$noescape_callback_output.err" >&2
+if [[ $inferred_status -ne 5 ]]; then
+    echo "scoped region: inferred noescape callback expected 5, got $inferred_status" >&2
     exit 1
 fi
-[[ ! -e $noescape_callback_output ]]
 
-echo 'scoped region: nested LIFO reset + affine drops + compile time + LLVM/C + retention effects passed'
+inferred_lambda_output="$output_directory/inferred-noescape-lambda"
+"$compiler" build \
+    "$project_root/tests/cases/bootstrap/inferred-noescape-lambda.ab" \
+    -o "$inferred_lambda_output"
+set +e
+"$project_root/tools/run-limited.sh" "$inferred_lambda_output"
+inferred_lambda_status=$?
+set -e
+if [[ $inferred_lambda_status -ne 5 ]]; then
+    echo "scoped region: inferred noescape lambda expected 5, got $inferred_lambda_status" >&2
+    exit 1
+fi
+
+retaining_callback_output="$output_directory/invalid-inferred-retaining-callback"
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/bootstrap/invalid-inferred-noescape-retaining-callback.ab" \
+    -o "$retaining_callback_output" \
+    >"$retaining_callback_output.out" \
+    2>"$retaining_callback_output.err"
+retaining_callback_status=$?
+set -e
+if [[ $retaining_callback_status -ne 1 ]] ||
+    ! grep -Fq 'function.argument:requireNoEscape' \
+        "$retaining_callback_output.err"; then
+    echo 'scoped region: retaining callback satisfied FnNoEscape inference' >&2
+    sed -n '1,80p' "$retaining_callback_output.err" >&2
+    exit 1
+fi
+[[ ! -e $retaining_callback_output ]]
+
+retaining_lambda_output="$output_directory/invalid-inferred-retaining-lambda"
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/bootstrap/invalid-inferred-noescape-retaining-lambda.ab" \
+    -o "$retaining_lambda_output" \
+    >"$retaining_lambda_output.out" \
+    2>"$retaining_lambda_output.err"
+retaining_lambda_status=$?
+set -e
+if [[ $retaining_lambda_status -ne 1 ]] ||
+    ! grep -Fq 'function.argument:requireNoEscape' \
+        "$retaining_lambda_output.err"; then
+    echo 'scoped region: retaining lambda satisfied FnNoEscape inference' >&2
+    sed -n '1,80p' "$retaining_lambda_output.err" >&2
+    exit 1
+fi
+[[ ! -e $retaining_lambda_output ]]
+
+retaining_lambda_store_output="$output_directory/invalid-inferred-retaining-lambda-store"
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/bootstrap/invalid-inferred-noescape-retaining-lambda-store.ab" \
+    -o "$retaining_lambda_store_output" \
+    >"$retaining_lambda_store_output.out" \
+    2>"$retaining_lambda_store_output.err"
+retaining_lambda_store_status=$?
+set -e
+if [[ $retaining_lambda_store_status -ne 1 ]] ||
+    ! grep -Fq 'function.argument:requireNoEscape' \
+        "$retaining_lambda_store_output.err"; then
+    echo 'scoped region: storing lambda satisfied FnNoEscape inference' >&2
+    sed -n '1,80p' "$retaining_lambda_store_output.err" >&2
+    exit 1
+fi
+[[ ! -e $retaining_lambda_store_output ]]
+
+retaining_lambda_alias_output="$output_directory/invalid-inferred-retaining-lambda-alias"
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/bootstrap/invalid-inferred-noescape-retaining-lambda-alias.ab" \
+    -o "$retaining_lambda_alias_output" \
+    >"$retaining_lambda_alias_output.out" \
+    2>"$retaining_lambda_alias_output.err"
+retaining_lambda_alias_status=$?
+set -e
+if [[ $retaining_lambda_alias_status -ne 1 ]] ||
+    ! grep -Fq 'function.argument:requireNoEscape' \
+        "$retaining_lambda_alias_output.err"; then
+    echo 'scoped region: aliased storing lambda satisfied FnNoEscape inference' >&2
+    sed -n '1,80p' "$retaining_lambda_alias_output.err" >&2
+    exit 1
+fi
+[[ ! -e $retaining_lambda_alias_output ]]
+
+echo 'scoped region: inferred callback safety + nested LIFO reset + affine drops + compile time + LLVM and available C differential + retention effects passed'
