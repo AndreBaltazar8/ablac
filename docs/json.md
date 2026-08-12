@@ -124,9 +124,21 @@ val literal = $json {
 }
 ```
 
-`$json`, `#$json`, `#jsonParse`, and `#jsonStringify` use the same phase-safe
-implementation as runtime code. For the same tree, compile-time and native
-serialization produce identical bytes.
+`$jsons` uses the same grammar and immediately returns the deterministic
+serialized string. Its staged form is the concise choice for static protocol
+fixtures and headers because validation and serialization both happen during
+compilation:
+
+```abla
+val body = #$jsons {
+    "event": "ready",
+    "attempt": 1
+}
+```
+
+`$json`, `#$json`, `$jsons`, `#$jsons`, `#jsonParse`, and `#jsonStringify` use
+the same phase-safe implementation as runtime code. For the same tree,
+compile-time and native serialization produce identical bytes.
 
 ## HTTP adapter
 

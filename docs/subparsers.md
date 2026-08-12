@@ -13,6 +13,7 @@ An embedded expression begins with `$` and a registered parser name:
 val document = $json {"testKey": "value"}
 val view = $html <div>{count + 20}</div>
 val frozen = #$json {"answer": 42}
+val encoded = #$jsons {"answer": 42}
 ```
 
 The named subparser always runs during compilation because it extends the
@@ -23,7 +24,10 @@ compile-only host values into runtime IR.
 
 The `$json` provider uses the same [JSON model](json.md) as `jsonParse`. It
 accepts integer, fractional, and exponent number forms without converting them
-through floating point, including across formatted multi-line literals.
+through floating point, including across formatted multi-line literals. The
+companion `$jsons` provider delegates to that grammar and wraps the resulting
+tree in deterministic `jsonStringify`; `#$jsons` therefore leaves a validated
+static string in the runtime program.
 
 ## Registration staging
 
