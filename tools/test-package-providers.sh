@@ -46,10 +46,17 @@ compile fun leafDependency(): ImportSource = gitImportSource(
 EOF
 cat > "$repository/src/provider-dep.ab" <<'EOF'
 import "leaf-provider.ab"
+import "literal.ab"
 import leafDependency()
-fun dependencyAnswer: int = 40 + leafAnswer()
+fun dependencyAnswer: int = 38 + leafAnswer() + literalAnswer()
 EOF
-git -C "$repository" add abla.toml src/provider-dep.ab src/leaf-provider.ab
+cat > "$repository/src/literal.ab" <<'EOF'
+import "abla/json"
+val literalBody = #$jsons {"answer": 42}
+fun literalAnswer: int = if (literalBody == "{\"answer\":42}") 2 else 0
+EOF
+git -C "$repository" add abla.toml src/provider-dep.ab src/leaf-provider.ab \
+    src/literal.ab
 git -C "$repository" commit --quiet -m 'initial dependency'
 first_revision=$(git -C "$repository" rev-parse HEAD)
 
@@ -108,8 +115,9 @@ set -e
 
 cat > "$repository/src/provider-dep.ab" <<'EOF'
 import "leaf-provider.ab"
+import "literal.ab"
 import leafDependency()
-fun dependencyAnswer: int = 39 + leafAnswer()
+fun dependencyAnswer: int = 37 + leafAnswer() + literalAnswer()
 EOF
 git -C "$repository" add src/provider-dep.ab
 git -C "$repository" commit --quiet -m 'move mutable branch'
