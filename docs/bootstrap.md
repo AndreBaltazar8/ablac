@@ -6,11 +6,11 @@ multi-stage source bootstrap are no longer part of the repository.
 
 A compiler cannot translate itself on an empty machine without an existing
 executable translator. Clean builds therefore begin with a checksum-pinned
-host artifact from the `v0.2.0` GitHub release: `ablac-x86_64-linux` on Linux
-or `ablac-x86_64-macos` on Intel macOS. Starting with `v0.2.1`, Apple Silicon
-uses the native `ablac-arm64-macos` seed. The first such artifact was produced
-by emitting the compiler IR on the trusted Intel host and compiling and linking
-that same IR against the native ARM LLVM and runtime on Apple Silicon.
+host artifact. Linux x86-64 uses the compact-value compiler from `v0.2.2`,
+Intel macOS uses `v0.2.0`, and Apple Silicon uses its native seed from
+`v0.2.1`. The first Apple Silicon artifact was produced by emitting the
+compiler IR on the trusted Intel host and compiling and linking that same IR
+against the native ARM LLVM and runtime on Apple Silicon.
 
 ```text
 published ablac binary

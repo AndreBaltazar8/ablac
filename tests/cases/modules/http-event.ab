@@ -9,9 +9,16 @@ var eventBackpressureClientDone = false
 var eventBackpressurePort = 0
 var eventBackpressureSend = false
 var eventBackpressureRead = false
+var eventBodyDone = false
+var eventBodyPort = 0
 
 fun eventOne(request: HttpRequest): HttpResponse = httpText("first")
 fun eventTwo(request: HttpRequest): HttpResponse = httpText("second")
+fun eventBody(request: HttpRequest): HttpResponse = HttpResponse(
+    200,
+    [HttpHeader("Content-Type", "application/octet-stream")],
+    request.body
+)
 fun eventLarge(request: HttpRequest): HttpResponse {
     var body = "x"
     var iteration = 0
@@ -20,6 +27,54 @@ fun eventLarge(request: HttpRequest): HttpResponse {
         iteration = iteration + 1
     }
     httpText(body)
+}
+
+fun eventBodyClient(): int {
+    val connection = tcpConnectIpv4("127.0.0.1", eventBodyPort, 1000)
+    if (connection.descriptor < 0) {
+        eventBodyDone = true
+        return 1
+    }
+    var body = "0123456789abcdef"
+    var iteration = 0
+    while (iteration < 9) {
+        body = "$body$body"
+        iteration = iteration + 1
+    }
+    val head = "POST /body HTTP/1.1\r\nHost: local\r\n" +
+        "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n"
+    val sentHead = connection.write(head)
+    var offset = 0
+    while (offset < body.size) {
+        var end = offset + 1024
+        if (end > body.size) end = body.size
+        val sent = connection.write(body.slice(offset, end))
+        if (sent > 0) offset = offset + sent
+        else offset = body.size
+    }
+    var response = ""
+    var reading = sentHead == head.size
+    while (reading) {
+        val incoming = connection.readWithTimeoutResult(16384, 2000)
+        if (incoming.hasData()) response = "${response}${incoming.bytes}"
+        else reading = false
+    }
+    connection.close()
+    eventBodyDone = true
+    if (textContains(response, body)) 0 else 2
+}
+
+fun eventBodyAcrossReads(): bool {
+    val router = httpRouter()
+    router.post("/body", eventBody)
+    val server = httpEventServer(router, ipv4Loopback(0))
+    eventBodyPort = server.listener.localPort()
+    val client = thread { eventBodyClient() }
+    while (!eventBodyDone) server.step(100)
+    val status = await client
+    server.stop()
+    server.drain()
+    status == 0
 }
 
 fun textContains(input: string, wanted: string): bool {
@@ -128,6 +183,7 @@ fun main: int {
     val router = httpRouter()
     router.get("/one", eventOne)
     router.get("/two", eventTwo)
+    router.post("/body", eventBody)
     val server = httpEventServer(router, ipv4Loopback(0))
     eventPort = server.listener.localPort()
     val client = thread { eventClient() }
@@ -136,5 +192,6 @@ fun main: int {
     server.stop()
     val drained = server.drain()
     if (reusable && status == 0 && drained == 0 && server.stopped &&
-        server.activeConnections() == 0 && eventBackpressure()) 42 else 1
+        server.activeConnections() == 0 && eventBackpressure() &&
+        eventBodyAcrossReads()) 42 else 1
 }
