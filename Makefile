@@ -13,7 +13,7 @@ OUTPUT ?= $(BUILD_DIR)/program
 .DEFAULT_GOAL := all
 
 .PHONY: all bootstrap ablac self-rebuild test check compile benchmark \
-	benchmark-network clean
+	benchmark-network clean prepare-test-driver
 
 all: ablac
 
@@ -45,6 +45,9 @@ ablac: $(COMPILER)
 
 self-rebuild: ablac
 	tools/test-pure-self-rebuild.sh $(COMPILER_PAYLOAD)
+
+prepare-test-driver:
+	tools/prepare-abla-test-driver.sh
 
 test: ablac
 	tools/test-value-abi.sh $(COMPILER)

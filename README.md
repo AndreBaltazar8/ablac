@@ -93,11 +93,14 @@ Run the ordinary test suite with:
 make test
 ```
 
-The suite is scheduled by the vendored
-[`abla-testrunner`](https://github.com/AndreBaltazar8/abla-testrunner)
-package. It runs up to eight isolated test processes in parallel, keeps
-per-step logs under `build/test-results/self-hosted`, and executes entirely
-from the checked-in package lock/vendor tree. Override the concurrency on a
+The suite is scheduled by
+[`abla-testrunner`](https://github.com/AndreBaltazar8/abla-testrunner),
+pinned as a git submodule at
+`tools/abla-test-driver/vendor/abla-testrunner`. `make test` initializes that
+checkout, or clones the locked revision when the tree has no git metadata,
+then writes package lock markers so the offline build can use it. A dirty
+submodule working tree is rejected. Clone with `--recurse-submodules`, or let
+the prepare step initialize the submodule. Override the concurrency on a
 smaller machine with `ABLA_TEST_JOBS=4 make test`.
 
 The complete test and fixed-point gate is substantially heavier. Each compiler

@@ -41,6 +41,9 @@ export ABLA_MAX_CPU_SECONDS=$ABLA_MAX_SECONDS
 
 # The small shell boundary only activates the host LLVM toolchain. Test
 # scheduling, timeouts, status checks, logs, and parallelism live in Abla.
+# Prepare initializes the vendor submodule and writes lock markers so the
+# offline github() import never fetches.
+"$project_root/tools/prepare-abla-test-driver.sh"
 runner_project="$project_root/tools/abla-test-driver"
 "$compiler" build --project "$runner_project" --offline --fast --no-cache
 runner_arguments=(
