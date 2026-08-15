@@ -102,6 +102,13 @@ name/debug metadata is stripped from the deployable module because its
 transactional temporary filename is nondeterministic; explicit debug sidecars
 remain roadmap work.
 
+The libc-free platform runtime also implements the allocation, address,
+byte-load/store, and 64-bit-load/store primitives from `abla/unsafe/memory`.
+They let trusted guest adapters exchange bounded data through exported linear
+memory without adding imports. Allocation is monotonic and reclaimed when the
+WebAssembly instance is discarded; unsupported host-specific unsafe operations
+remain unavailable rather than becoming ambient capabilities.
+
 `compilerExportFunction(handle, name)` provides the first stable foreign ABI
 rung. It exports a C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded

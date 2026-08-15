@@ -55,6 +55,28 @@ WebAssembly.instantiate(readFileSync(process.argv[2]), {}).then(({ instance }) =
     }
 });
 NODE
+
+unsafe_module="$output_directory/unsafe-memory.wasm"
+"$compiler" build \
+    "$project_root/tests/cases/wasm-mvc-extension/unsafe-memory-build.ab" \
+    -o "$output_directory/unsafe-memory-driver" --fast --no-cache
+if llvm-readobj --sections "$unsafe_module" | grep -q 'Type: IMPORT'; then
+    echo "WASM unsafe-memory proof unexpectedly requires runtime imports" >&2
+    exit 1
+fi
+node --disable-wasm-trap-handler - "$unsafe_module" <<'NODE'
+const { readFileSync } = require("node:fs");
+WebAssembly.instantiate(readFileSync(process.argv[2]), {}).then(({ instance }) => {
+    const pointer = instance.exports.abla_wasm_allocate(8n);
+    const value = 0x1122334455667788n;
+    if (instance.exports.abla_wasm_store_and_load(pointer, value) !== value) {
+        throw new Error("unexpected unsafe-memory round trip");
+    }
+    if (!(instance.exports.memory instanceof WebAssembly.Memory)) {
+        throw new Error("linear memory was not exported");
+    }
+});
+NODE
 [[ -s $adapter ]]
 grep -q 'WebAssembly.instantiate' "$adapter"
 grep -q 'instance.exports.abla_mvc_revision' "$adapter"
