@@ -176,7 +176,7 @@ AblaValue abla_void(void);
 AblaValue abla_null(void);
 AblaValue abla_i64(int64_t value);
 AblaValue abla_bool(bool value);
-AblaValue abla_string_static(const char* data, size_t length);
+AblaValue abla_string_static(const char* data, uint64_t length);
 AblaValue abla_function(uint32_t function);
 AblaValue abla_closure(
     uint32_t function,
@@ -450,7 +450,7 @@ AblaValue ablaTextReadU32LittleEndian(AblaValue text, AblaValue offset);
 AblaValue ablaTextIsValidUtf8(AblaValue text);
 AblaValue abla_length(AblaValue value);
 AblaValue abla_index_get(AblaValue value, AblaValue index);
-AblaValue abla_array_create(const AblaValue* values, size_t count);
+AblaValue abla_array_create(const AblaValue* values, uint64_t count);
 AblaValue abla_array_length(AblaValue value);
 int64_t abla_array_length_i64(AblaValue value);
 AblaValue abla_array_append(AblaValue value, AblaValue element);
@@ -458,20 +458,20 @@ AblaValue abla_array_get(AblaValue array, AblaValue index);
 int64_t abla_array_get_i64(AblaValue array, int64_t index);
 bool abla_array_get_bool(AblaValue array, int64_t index);
 void abla_array_set(AblaValue array, AblaValue index, AblaValue value);
-AblaValue abla_object_create(uint32_t type_symbol, size_t field_count);
+AblaValue abla_object_create(uint32_t type_symbol, uint64_t field_count);
 AblaValue abla_field_get(AblaValue object, uint32_t field_symbol);
 AblaValue abla_field_get_indexed(
     AblaValue object,
     uint32_t field_symbol,
-    size_t field_index);
+    uint64_t field_index);
 int64_t abla_field_get_indexed_i64(
     AblaValue object,
     uint32_t field_symbol,
-    size_t field_index);
+    uint64_t field_index);
 bool abla_field_get_indexed_bool(
     AblaValue object,
     uint32_t field_symbol,
-    size_t field_index);
+    uint64_t field_index);
 void abla_field_initialize(
     AblaValue object,
     uint32_t field_symbol,
@@ -480,7 +480,7 @@ void abla_field_set(AblaValue object, uint32_t field_symbol, AblaValue value);
 void abla_field_set_indexed(
     AblaValue object,
     uint32_t field_symbol,
-    size_t field_index,
+    uint64_t field_index,
     AblaValue value);
 
 #endif

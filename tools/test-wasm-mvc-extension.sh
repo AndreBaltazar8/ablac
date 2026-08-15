@@ -72,6 +72,9 @@ WebAssembly.instantiate(readFileSync(process.argv[2]), {}).then(({ instance }) =
     if (instance.exports.abla_wasm_store_and_load(pointer, value) !== value) {
         throw new Error("unexpected unsafe-memory round trip");
     }
+    if (instance.exports.abla_wasm_json_length() !== 29n) {
+        throw new Error("unexpected runtime $jsons result");
+    }
     if (!(instance.exports.memory instanceof WebAssembly.Memory)) {
         throw new Error("linear memory was not exported");
     }

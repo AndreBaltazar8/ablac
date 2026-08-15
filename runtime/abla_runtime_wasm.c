@@ -127,3 +127,11 @@ AblaValue ablaUnsafeStoreU8(AblaValue address, AblaValue value) {
         (unsigned char)abla_as_i64(value);
     return abla_void();
 }
+
+AblaValue ablaUnsafeAdoptString(AblaValue address, AblaValue length_value) {
+    const int64_t length = abla_as_i64(length_value);
+    if (length < 0) __builtin_trap();
+    char* data = (char*)wasm_pointer(address);
+    data[(size_t)length] = '\0';
+    return abla_string_static(data, (uint64_t)length);
+}

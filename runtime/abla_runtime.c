@@ -182,7 +182,12 @@ AblaValue abla_i64(int64_t value) {
 AblaValue abla_bool(bool value) {
     return (AblaValue){.tag = ABLA_BOOL, .as.boolean = value};
 }
-AblaValue abla_string_static(const char* data, size_t length) {
+AblaValue abla_string_static(const char* data, uint64_t requested_length) {
+    if (sizeof(size_t) < sizeof(uint64_t) &&
+        requested_length > (uint64_t)SIZE_MAX) {
+        panic("string length overflow", 22);
+    }
+    const size_t length = (size_t)requested_length;
     return (AblaValue){
         .tag = ABLA_STRING,
         .as.string = {
@@ -832,10 +837,11 @@ AblaValue abla_index_get(AblaValue value, AblaValue index) {
     panic("value is not indexable", 22);
 }
 
-AblaValue abla_array_create(const AblaValue* values, size_t count) {
-    if (count > SIZE_MAX / sizeof(AblaValue)) {
+AblaValue abla_array_create(const AblaValue* values, uint64_t requested_count) {
+    if (requested_count > (uint64_t)(SIZE_MAX / sizeof(AblaValue))) {
         panic("array allocation overflow", 25);
     }
+    const size_t count = (size_t)requested_count;
     AblaArray* array = (AblaArray*)abla_platform_alloc(
         sizeof(AblaArray) + count * sizeof(AblaValue));
     abla_platform_memory_set_layout(array, 4);
@@ -905,10 +911,12 @@ void abla_array_set(AblaValue value, AblaValue index_value, AblaValue element) {
     value.as.array->values[index] = element;
 }
 
-AblaValue abla_object_create(uint32_t type_symbol, size_t field_count) {
-    if (field_count > (SIZE_MAX - sizeof(AblaObject)) / sizeof(AblaField)) {
+AblaValue abla_object_create(uint32_t type_symbol, uint64_t requested_count) {
+    if (requested_count >
+        (uint64_t)((SIZE_MAX - sizeof(AblaObject)) / sizeof(AblaField))) {
         panic("object field count overflow", 27);
     }
+    const size_t field_count = (size_t)requested_count;
     AblaObject* object = (AblaObject*)abla_platform_alloc(
         sizeof(AblaObject) + field_count * sizeof(AblaField));
     abla_platform_memory_set_layout(object, 5);
@@ -932,25 +940,25 @@ AblaValue abla_field_get(AblaValue value, uint32_t field_symbol) {
 AblaValue abla_field_get_indexed(
     AblaValue value,
     uint32_t field_symbol,
-    size_t field_index) {
+    uint64_t field_index) {
     if (value.tag == ABLA_OBJECT &&
-        field_index < value.as.object->count &&
-        value.as.object->fields[field_index].symbol == field_symbol) {
-        return value.as.object->fields[field_index].value;
+        field_index < (uint64_t)value.as.object->count &&
+        value.as.object->fields[(size_t)field_index].symbol == field_symbol) {
+        return value.as.object->fields[(size_t)field_index].value;
     }
     return abla_field_get(value, field_symbol);
 }
 int64_t abla_field_get_indexed_i64(
     AblaValue value,
     uint32_t field_symbol,
-    size_t field_index) {
+    uint64_t field_index) {
     return abla_as_i64(
         abla_field_get_indexed(value, field_symbol, field_index));
 }
 bool abla_field_get_indexed_bool(
     AblaValue value,
     uint32_t field_symbol,
-    size_t field_index) {
+    uint64_t field_index) {
     return abla_as_bool(
         abla_field_get_indexed(value, field_symbol, field_index));
 }
@@ -991,12 +999,12 @@ void abla_field_set(AblaValue value, uint32_t field_symbol, AblaValue field_valu
 void abla_field_set_indexed(
     AblaValue value,
     uint32_t field_symbol,
-    size_t field_index,
+    uint64_t field_index,
     AblaValue field_value) {
     if (value.tag == ABLA_OBJECT &&
-        field_index < value.as.object->count &&
-        value.as.object->fields[field_index].symbol == field_symbol) {
-        value.as.object->fields[field_index].value = field_value;
+        field_index < (uint64_t)value.as.object->count &&
+        value.as.object->fields[(size_t)field_index].symbol == field_symbol) {
+        value.as.object->fields[(size_t)field_index].value = field_value;
         return;
     }
     abla_field_set(value, field_symbol, field_value);

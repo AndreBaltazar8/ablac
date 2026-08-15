@@ -100,7 +100,8 @@ across repeated cached builds. The compiler contains WebAssembly object/linker
 support, but no fetch, JavaScript, browser, DOM, rendering, or MVC policy. LLD
 name/debug metadata is stripped from the deployable module because its
 transactional temporary filename is nondeterministic; explicit debug sidecars
-remain roadmap work.
+remain roadmap work. Linking uses one worker so artifact construction stays
+within the same bounded process budget on high-core-count hosts.
 
 The libc-free platform runtime also implements the allocation, address,
 byte-load/store, and 64-bit-load/store primitives from `abla/unsafe/memory`.
@@ -108,6 +109,10 @@ They let trusted guest adapters exchange bounded data through exported linear
 memory without adding imports. Allocation is monotonic and reclaimed when the
 WebAssembly instance is discarded; unsupported host-specific unsafe operations
 remain unavailable rather than becoming ambient capabilities.
+Its C boundary uses fixed-width counts rather than host `size_t`, so managed
+strings, arrays, and objects retain the same generated LLVM contract on wasm32
+and native targets. Trusted adapters can therefore adopt request memory and
+hand ordinary strings to runtime `$json`/`$jsons` code.
 
 `compilerExportFunction(handle, name)` provides the first stable foreign ABI
 rung. It exports a C-identifier symbol for a resolved top-level function while
