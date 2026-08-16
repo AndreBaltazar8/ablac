@@ -276,10 +276,15 @@ files are restored and newly created paths are removed; only a completely
 successful graph commits. The journal accepts at most 512 distinct paths and
 reports transaction and rollback failures with stable build diagnostic codes.
 
-`compilerExportFunction(handle, name)` marks one resolved top-level function
-for a stable foreign adapter. The ABI rung accepts up to 16 value `bool`/`i64`,
+`@export("name")` is the source-level form for marking one resolved top-level
+function for a stable foreign adapter. `@exportChecked("name")` selects the
+contained variant. They perform the same validation and emit the same ABI
+manifest as `compilerExportFunction(handle, name)` and
+`compilerExportCheckedFunction(handle, name)`; those functions remain available
+for compiler extensions that select exports dynamically. The ABI rung accepts
+up to 16 value `bool`, `char`, signed or unsigned 8/16/32/64-bit integer,
 borrowed `string`, or direct non-escaping `(i64) -> i64` callback parameters
-and a `void`, `bool`, `i64`, or owned `string` result in programs without
+and a `void`, supported scalar, or owned `string` result in programs without
 runtime globals. A foreign string lowers to
 `(pointer, u64)`;
 the adapter validates it and copies its exact bytes into tracked Abla-owned

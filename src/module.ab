@@ -292,6 +292,12 @@ fun bootstrapModuleInterfaceIdentity(
         var annotation = 0
         while (annotation < found.annotations.size) {
             identity = "$identity@${found.annotations[annotation]},"
+            if (annotation < found.annotationArguments.size &&
+                found.annotationArguments[annotation].kind != "missing") {
+                identity = "$identity(${bootstrapModuleExpressionIdentity(
+                    found.annotationArguments[annotation]
+                )})"
+            }
             annotation = annotation + 1
         }
         var parameter = 0
@@ -320,6 +326,13 @@ fun bootstrapModuleInterfaceIdentity(
             annotation = 0
             while (annotation < member.annotations.size) {
                 identity = "$identity@${member.annotations[annotation]},"
+                if (annotation < member.annotationArguments.size &&
+                    member.annotationArguments[annotation].kind != "missing") {
+                    identity =
+                        "$identity(${bootstrapModuleExpressionIdentity(
+                            member.annotationArguments[annotation]
+                        )})"
+                }
                 annotation = annotation + 1
             }
             parameter = 0
@@ -391,6 +404,321 @@ class BootstrapModuleFrontendSnapshot(
     val dependencyFingerprint: int,
     val parsed: BootstrapParseResult
 )
+
+class BootstrapNamedArgumentNormalizer(
+    val declarations: array<BootstrapDeclaration>,
+    var errors: int,
+    var diagnostics: string
+) {
+    fun fail(code: string, message: string, expression: BootstrapExpression) {
+        this.errors = this.errors + 1
+        this.diagnostics =
+            "${this.diagnostics}error[E_NAMED_ARGUMENT_$code]: $message\n"
+        this.diagnostics =
+            "${this.diagnostics}source[named-argument]:${expression.begin}:${expression.end}\n"
+    }
+
+    fun target(name: string): int {
+        var result = -1
+        var index = 0
+        while (index < this.declarations.size) {
+            val declaration = this.declarations[index]
+            if (declaration.name == name && declaration.extensionOwner == "" &&
+                (declaration.kind == "fun" ||
+                 declaration.kind == "compile.fun" ||
+                 declaration.kind == "class")) {
+                if (result < 0) result = index
+                else result = -2
+            }
+            index = index + 1
+        }
+        result
+    }
+
+    fun parameter(declaration: BootstrapDeclaration, name: string): int {
+        var result = -1
+        var index = 0
+        while (index < declaration.parameters.size) {
+            if (declaration.parameters[index] == name) result = index
+            index = index + 1
+        }
+        result
+    }
+
+    fun replaceParameterReferences(
+        expression: BootstrapExpression,
+        names: array<string>,
+        replacements: array<string>
+    ): BootstrapExpression {
+        var replacement = ""
+        var index = 0
+        while (expression.kind == "identifier" && index < names.size) {
+            if (names[index] == expression.text &&
+                index < replacements.size) replacement = replacements[index]
+            index = index + 1
+        }
+        val children: array<BootstrapExpression> = []
+        index = 0
+        while (index < expression.children.size) {
+            children.append(this.replaceParameterReferences(
+                expression.children[index], names, replacements
+            ))
+            index = index + 1
+        }
+        BootstrapExpression(
+            expression.kind,
+            if (replacement == "") expression.text else replacement,
+            expression.begin,
+            expression.end,
+            children
+        )
+    }
+
+    fun local(name: string, value: BootstrapExpression): BootstrapExpression =
+        BootstrapExpression(
+            "local.val", name, value.begin, value.end,
+            [
+                value,
+                BootstrapExpression(
+                    "type", "inferred", value.begin, value.begin, []
+                )
+            ]
+        )
+
+    fun normalize(expression: BootstrapExpression): BootstrapExpression {
+        val normalizedChildren: array<BootstrapExpression> = []
+        var child = 0
+        while (child < expression.children.size) {
+            normalizedChildren.append(this.normalize(
+                expression.children[child]
+            ))
+            child = child + 1
+        }
+        var result = BootstrapExpression(
+            expression.kind,
+            expression.text,
+            expression.begin,
+            expression.end,
+            normalizedChildren
+        )
+        var hasNamed = false
+        child = 0
+        while (result.kind == "call" && child < result.children.size) {
+            if (result.children[child].kind == "named.argument") {
+                hasNamed = true
+            }
+            child = child + 1
+        }
+        var normalizeCall = hasNamed
+        var selectedTarget = -1
+        if (result.kind == "call") selectedTarget = this.target(result.text)
+        if (!normalizeCall && selectedTarget >= 0 &&
+            this.declarations[selectedTarget].kind == "class" &&
+            result.children.size <
+                this.declarations[selectedTarget].parameters.size) {
+            normalizeCall = true
+        }
+        if (normalizeCall) {
+            val target = selectedTarget
+            if (target < 0) {
+                this.fail(
+                    "TARGET",
+                    if (target == -2)
+                        "named call `${result.text}` is ambiguous"
+                    else "named call `${result.text}` has no declared function or constructor target",
+                    result
+                )
+            }
+            if (target >= 0) {
+                val declaration = this.declarations[target]
+                val values: array<BootstrapExpression> = []
+                val temporaryNames: array<string> = []
+                var parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    values.append(BootstrapExpression(
+                        "missing", "", result.begin, result.begin, []
+                    ))
+                    temporaryNames.append("")
+                    parameter = parameter + 1
+                }
+                val statements: array<BootstrapExpression> = []
+                var positional = 0
+                var namedSeen = false
+                var argument = 0
+                while (argument < result.children.size) {
+                    val supplied = result.children[argument]
+                    var selected = positional
+                    var value = supplied
+                    if (supplied.kind == "named.argument") {
+                        namedSeen = true
+                        selected = this.parameter(declaration, supplied.text)
+                        if (supplied.children.size == 1) {
+                            value = supplied.children[0]
+                        }
+                        if (selected < 0) this.fail(
+                            "UNKNOWN",
+                            "`${supplied.text}` is not a parameter of `${result.text}`",
+                            supplied
+                        )
+                    } else {
+                        if (namedSeen) this.fail(
+                            "ORDER",
+                            "positional arguments must precede named arguments",
+                            supplied
+                        )
+                        positional = positional + 1
+                    }
+                    if (selected >= declaration.parameters.size) {
+                        this.fail(
+                            "ARITY",
+                            "too many arguments for `${result.text}`",
+                            supplied
+                        )
+                    }
+                    if (selected >= 0 &&
+                        selected < declaration.parameters.size) {
+                        if (temporaryNames[selected] != "") this.fail(
+                            "DUPLICATE",
+                            "parameter `${declaration.parameters[selected]}` is supplied more than once",
+                            supplied
+                        )
+                        if (temporaryNames[selected] == "") {
+                            val temporary =
+                                "__abla_named_${result.begin}_${argument}"
+                            temporaryNames[selected] = temporary
+                            values[selected] = BootstrapExpression(
+                                "identifier", temporary,
+                                value.begin, value.end, []
+                            )
+                            statements.append(this.local(temporary, value))
+                        }
+                    }
+                    argument = argument + 1
+                }
+                parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    if (temporaryNames[parameter] == "") {
+                        var defaultValue = BootstrapExpression(
+                            "missing", "", result.begin, result.begin, []
+                        )
+                        if (parameter < declaration.parameterDefaults.size) {
+                            defaultValue = declaration.parameterDefaults[parameter]
+                        }
+                        if (defaultValue.kind == "missing") this.fail(
+                            "REQUIRED",
+                            "required parameter `${declaration.parameters[parameter]}` is missing from `${result.text}`",
+                            result
+                        )
+                        if (defaultValue.kind != "missing") {
+                            val temporary =
+                                "__abla_named_${result.begin}_default_$parameter"
+                            val substituted = this.replaceParameterReferences(
+                                defaultValue,
+                                declaration.parameters,
+                                temporaryNames
+                            )
+                            val normalizedDefault = this.normalize(substituted)
+                            temporaryNames[parameter] = temporary
+                            values[parameter] = BootstrapExpression(
+                                "identifier", temporary,
+                                defaultValue.begin, defaultValue.end, []
+                            )
+                            statements.append(this.local(
+                                temporary, normalizedDefault
+                            ))
+                        }
+                    }
+                    parameter = parameter + 1
+                }
+                statements.append(BootstrapExpression(
+                    "call", result.text, result.begin, result.end, values
+                ))
+                result = BootstrapExpression(
+                    "block", "", result.begin, result.end, statements
+                )
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapNormalizeNamedDeclaration(
+    var normalizer: BootstrapNamedArgumentNormalizer,
+    declaration: BootstrapDeclaration
+): BootstrapDeclaration {
+    val defaults: array<BootstrapExpression> = []
+    var defaultIndex = 0
+    while (defaultIndex < declaration.parameterDefaults.size) {
+        defaults.append(normalizer.normalize(
+            declaration.parameterDefaults[defaultIndex]
+        ))
+        defaultIndex = defaultIndex + 1
+    }
+    val methods: array<BootstrapDeclaration> = []
+    var method = 0
+    while (method < declaration.methods.size) {
+        methods.append(bootstrapNormalizeNamedDeclaration(
+            normalizer, declaration.methods[method]
+        ))
+        method = method + 1
+    }
+    BootstrapDeclaration(
+        declaration.kind,
+        declaration.name,
+        declaration.begin,
+        declaration.end,
+        normalizer.normalize(declaration.expression),
+        declaration.parameters,
+        declaration.parameterTypes,
+        declaration.resultType,
+        methods,
+        defaults,
+        declaration.externalLibrary,
+        declaration.parameterKinds,
+        declaration.extensionOwner,
+        declaration.isTrusted,
+        declaration.isResource,
+        declaration.isNoEscape,
+        declaration.generatedNamespace,
+        declaration.generatedOriginBegin,
+        declaration.generatedOriginEnd,
+        declaration.annotations,
+        declaration.annotationArguments,
+        declaration.annotationBegins,
+        declaration.annotationEnds
+    )
+}
+
+fun bootstrapNormalizeNamedArguments(
+    parsed: BootstrapParseResult
+): BootstrapParseResult {
+    var normalizer = BootstrapNamedArgumentNormalizer(
+        parsed.declarations, 0, ""
+    )
+    val declarations: array<BootstrapDeclaration> = []
+    var declaration = 0
+    while (declaration < parsed.declarations.size) {
+        declarations.append(bootstrapNormalizeNamedDeclaration(
+            normalizer, parsed.declarations[declaration]
+        ))
+        declaration = declaration + 1
+    }
+    val actions: array<BootstrapExpression> = []
+    var action = 0
+    while (action < parsed.actions.size) {
+        actions.append(normalizer.normalize(parsed.actions[action]))
+        action = action + 1
+    }
+    BootstrapParseResult(
+        declarations,
+        actions,
+        parsed.errors + normalizer.errors,
+        parsed.extensionErrors,
+        parsed.compileInputPaths,
+        parsed.compileInputContents,
+        "${parsed.diagnostics}${normalizer.diagnostics}"
+    )
+}
 
 // Compile inputs use provider-qualified identities. Filesystem paths retain
 // their lexical spelling; deterministic ambient providers use a reserved
@@ -1046,6 +1374,7 @@ fun bootstrapContractDeclaration(
         declaration.generatedOriginBegin,
         declaration.generatedOriginEnd,
         annotations,
+        declaration.annotationArguments,
         declaration.annotationBegins,
         declaration.annotationEnds
     )
@@ -1853,7 +2182,7 @@ class BootstrapModuleGraph(
             ))
             capability = capability + 1
         }
-        BootstrapParseResult(
+        bootstrapNormalizeNamedArguments(BootstrapParseResult(
             declarations,
             actions,
             parseErrors,
@@ -1861,7 +2190,7 @@ class BootstrapModuleGraph(
             compileInputPaths,
             compileInputContents,
             parseDiagnostics
-        )
+        ))
     }
 }
 

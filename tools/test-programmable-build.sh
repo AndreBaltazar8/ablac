@@ -47,6 +47,10 @@ llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_add$'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_i8_identity$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_u64_identity$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_bytes_score$'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_bytes_length$'
@@ -61,6 +65,10 @@ llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
 grep -q '"symbol":"abla_app_add"' \
     "$output_directory/libabla_app.so.abi.json"
 grep -q '"name":"value","abi":"i64","ownership":"value"' \
+    "$output_directory/libabla_app.so.abi.json"
+grep -q '"name":"value","abi":"i8","ownership":"value"' \
+    "$output_directory/libabla_app.so.abi.json"
+grep -q '"name":"value","abi":"u64","ownership":"value"' \
     "$output_directory/libabla_app.so.abi.json"
 grep -q '"name":"value","abi":"bytes","lowering":\["pointer","u64"\],"ownership":"borrowed","calleeAction":"copy"' \
     "$output_directory/libabla_app.so.abi.json"

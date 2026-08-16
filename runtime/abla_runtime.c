@@ -183,6 +183,10 @@ AblaValue abla_bool(bool value) {
     return (AblaValue){.tag = ABLA_BOOL, .as.boolean = value};
 }
 AblaValue abla_string_static(const char* data, uint64_t requested_length) {
+    if (data == (const char*)0) {
+        if (requested_length != 0) panic("null string data", 16);
+        data = "";
+    }
     if (sizeof(size_t) < sizeof(uint64_t) &&
         requested_length > (uint64_t)SIZE_MAX) {
         panic("string length overflow", 22);
@@ -648,6 +652,7 @@ AblaValue ablaUtf8EncodeScalar(AblaValue value) {
             .length = length}};
 }
 
+#ifndef ABLA_SELF_HOSTED_RUNTIME_TEXT
 AblaValue ablaTextFindSequence(
     AblaValue text,
     AblaValue sequence,
@@ -769,6 +774,7 @@ AblaValue ablaTextIsValidUtf8(AblaValue text) {
     }
     return abla_bool(true);
 }
+#endif
 
 AblaValue ablaBitAnd(AblaValue left, AblaValue right) {
     return abla_i64(abla_as_i64(left) & abla_as_i64(right));

@@ -66,6 +66,48 @@ class JsonWriter(
     var valid: bool
 )
 
+// Forward-only, allocation-light object reader. Values are consumed once from
+// the source text; callers choose whether to decode a scalar or retain a
+// validated raw slice. This complements the tree-shaped `Json` API for hot
+// protocol paths that already know their schema.
+class JsonObjectReader(
+    val state: JsonParserState,
+    val keys: array<string>,
+    var first: bool,
+    var done: bool,
+    var expectingValue: bool
+)
+
+// Validated encoded fragments and streaming container builders avoid a
+// temporary `Json` object graph during serialization.
+class JsonEncoded(val text: string, val valid: bool)
+
+class JsonArrayEncoder(
+    val output: ByteBuffer,
+    var count: int,
+    var valid: bool,
+    var finished: bool
+)
+
+class JsonObjectEncoder(
+    val output: ByteBuffer,
+    var count: int,
+    var valid: bool,
+    var finished: bool
+)
+
+// Single-buffer streaming serializer. Container state is held in bitsets, so
+// nesting does not allocate a DOM node, fragment, or context object.
+class JsonEncoder(
+    var output: string,
+    var depth: int,
+    var objectBits: int,
+    var nonEmptyBits: int,
+    var expectingValueBits: int,
+    var rootWritten: bool,
+    var valid: bool
+)
+
 fun jsonDefaultLimits(): JsonLimits = JsonLimits(
     1048576,
     64,
@@ -328,12 +370,15 @@ fun jsonHexQuad(source: string, offset: int): int {
     if (valid) value else -1
 }
 
-fun jsonParseString(var state: JsonParserState): string {
+fun jsonParseEscapedString(
+    var state: JsonParserState,
+    quoteOffset: int,
+    contentBegin: int
+): string {
     val output = byteBuffer()
-    val quoteOffset = state.offset
-    if (state.offset < state.source.size && state.source[state.offset] == 34) {
-        state.offset = state.offset + 1
-    } else state.fail("unexpected_token", "expected JSON string", state.offset)
+    if (state.offset > contentBegin) output.appendText(
+        state.source.slice(contentBegin, state.offset)
+    )
     var closed = false
     while (state.errorCode == "" && !closed &&
            state.offset < state.source.size) {
@@ -441,6 +486,49 @@ fun jsonParseString(var state: JsonParserState): string {
         )
     }
     output.toText()
+}
+
+fun jsonParseString(var state: JsonParserState): string {
+    val quoteOffset = state.offset
+    if (state.offset < state.source.size && state.source[state.offset] == 34) {
+        state.offset = state.offset + 1
+    } else state.fail("unexpected_token", "expected JSON string", state.offset)
+    val contentBegin = state.offset
+    var scanning = state.errorCode == ""
+    var closed = false
+    while (scanning && state.offset < state.source.size) {
+        val byte = state.source[state.offset]
+        if (byte == 34) {
+            closed = true
+            scanning = false
+        } else if (byte == 92 || byte < 32) scanning = false
+        else if (byte < 128) state.offset = state.offset + 1
+        else {
+            val length = utf8SequenceLength(byte)
+            if (!utf8SequenceValid(state.source, state.offset, length)) {
+                state.fail(
+                    "invalid_unicode", "invalid UTF-8 in JSON string",
+                    state.offset
+                )
+                scanning = false
+            } else state.offset = state.offset + length
+        }
+        if (state.errorCode == "" &&
+            state.offset - contentBegin > state.limits.maximumStringBytes) {
+            state.fail(
+                "string_limit", "JSON string exceeds configured limit",
+                quoteOffset
+            )
+            scanning = false
+        }
+    }
+    if (closed && state.errorCode == "") {
+        val result = state.source.slice(contentBegin, state.offset)
+        state.offset = state.offset + 1
+        result
+    } else jsonParseEscapedString(
+        state, quoteOffset, contentBegin
+    )
 }
 
 fun jsonParseNumber(var state: JsonParserState): Json {
@@ -688,38 +776,634 @@ fun jsonParse(
     }
 }
 
+fun jsonReaderConsume(var state: JsonParserState, expected: int): bool {
+    jsonSkipWhitespace(state)
+    val matches = state.errorCode == "" &&
+        state.offset < state.source.size &&
+        state.source[state.offset] == expected
+    if (matches) state.offset = state.offset + 1
+    else state.fail(
+        "unexpected_token", "unexpected token while reading JSON", state.offset
+    )
+    matches
+}
+
+fun jsonScanNumber(var state: JsonParserState): void {
+    val begin = state.offset
+    var scanning = true
+    while (scanning && state.offset < state.source.size) {
+        val byte = state.source[state.offset]
+        scanning = (byte >= 48 && byte <= 57) || byte == 45 ||
+            byte == 43 || byte == 46 || byte == 101 || byte == 69
+        if (scanning) state.offset = state.offset + 1
+    }
+    if (!jsonNumberGrammar(
+        state.source.slice(begin, state.offset)
+    ).valid) state.fail("invalid_number", "invalid JSON number", begin)
+}
+
+fun jsonScanLiteral(var state: JsonParserState, literal: string): void {
+    if (state.offset + literal.size <= state.source.size &&
+        state.source.slice(state.offset, state.offset + literal.size) ==
+            literal) {
+        state.offset = state.offset + literal.size
+    } else state.fail(
+        "unexpected_token", "unexpected token in JSON input", state.offset
+    )
+}
+
+// Validate and consume exactly one value without constructing a `Json` tree.
+// Strings are decoded only while validating escapes and duplicate object keys;
+// the caller may retain the original byte slice through `readRaw` below.
+fun jsonScanValue(var state: JsonParserState, depth: int): void {
+    jsonSkipWhitespace(state)
+    if (state.errorCode == "" && depth > state.limits.maximumDepth) {
+        state.fail(
+            "depth_limit", "JSON nesting exceeds configured limit", state.offset
+        )
+    }
+    if (state.errorCode == "") {
+        state.nodes = state.nodes + 1
+        if (state.nodes > state.limits.maximumNodes) state.fail(
+            "node_limit", "JSON node count exceeds configured limit", state.offset
+        )
+    }
+    if (state.errorCode == "" && state.offset >= state.source.size) {
+        state.fail("unexpected_end", "expected JSON value", state.offset)
+    }
+    if (state.errorCode == "") {
+        val byte = state.source[state.offset]
+        if (byte == 34) jsonParseString(state)
+        else if (byte == 91) {
+            state.offset = state.offset + 1
+            jsonSkipWhitespace(state)
+            var closed = false
+            if (state.offset < state.source.size &&
+                state.source[state.offset] == 93) {
+                state.offset = state.offset + 1
+                closed = true
+            }
+            while (state.errorCode == "" && !closed) {
+                jsonScanValue(state, depth + 1)
+                jsonSkipWhitespace(state)
+                if (state.offset < state.source.size &&
+                    state.source[state.offset] == 93) {
+                    state.offset = state.offset + 1
+                    closed = true
+                } else {
+                    jsonReaderConsume(state, 44)
+                    jsonSkipWhitespace(state)
+                    if (state.offset < state.source.size &&
+                        state.source[state.offset] == 93) state.fail(
+                            "unexpected_token", "trailing comma in JSON array",
+                            state.offset
+                        )
+                }
+            }
+        } else if (byte == 123) {
+            state.offset = state.offset + 1
+            val keys: array<string> = []
+            jsonSkipWhitespace(state)
+            var closed = false
+            if (state.offset < state.source.size &&
+                state.source[state.offset] == 125) {
+                state.offset = state.offset + 1
+                closed = true
+            }
+            while (state.errorCode == "" && !closed) {
+                if (keys.size >= state.limits.maximumObjectMembers) state.fail(
+                    "node_limit", "JSON object member limit exceeded",
+                    state.offset
+                )
+                val key = jsonParseString(state)
+                var duplicate = false
+                var index = 0
+                while (index < keys.size) {
+                    if (keys[index] == key) duplicate = true
+                    index = index + 1
+                }
+                if (duplicate && state.limits.rejectDuplicateKeys) state.fail(
+                    "duplicate_key", "duplicate JSON object key", state.offset
+                )
+                if (state.errorCode == "") keys.append(key)
+                jsonReaderConsume(state, 58)
+                jsonScanValue(state, depth + 1)
+                jsonSkipWhitespace(state)
+                if (state.offset < state.source.size &&
+                    state.source[state.offset] == 125) {
+                    state.offset = state.offset + 1
+                    closed = true
+                } else {
+                    jsonReaderConsume(state, 44)
+                    jsonSkipWhitespace(state)
+                    if (state.offset < state.source.size &&
+                        state.source[state.offset] == 125) state.fail(
+                            "unexpected_token", "trailing comma in JSON object",
+                            state.offset
+                        )
+                }
+            }
+        } else if ((byte >= 48 && byte <= 57) || byte == 45) {
+            jsonScanNumber(state)
+        } else if (byte == 116) jsonScanLiteral(state, "true")
+        else if (byte == 102) jsonScanLiteral(state, "false")
+        else if (byte == 110) jsonScanLiteral(state, "null")
+        else state.fail(
+            "unexpected_token", "unexpected token in JSON input", state.offset
+        )
+    }
+}
+
+fun jsonObjectReader(
+    source: string,
+    limits: JsonLimits = jsonDefaultLimits()
+): JsonObjectReader {
+    val state = JsonParserState(source, limits, 0, 0, "", "", 0)
+    if (!jsonLimitsValid(limits) || source.size > limits.maximumBytes) {
+        state.fail("input_limit", "invalid JSON input limits", 0)
+    }
+    // The forward reader validates every consumed string in place. Bytes
+    // outside strings must match ASCII JSON tokens, so a redundant whole-input
+    // UTF-8 pass would only scan known-schema protocol payloads twice.
+    jsonReaderConsume(state, 123)
+    JsonObjectReader(state, [], true, false, false)
+}
+
+// Advance to the next member and return its decoded key. An empty result is
+// unambiguous when `done` is inspected; empty JSON object keys remain valid.
+fun JsonObjectReader.next(): string {
+    if (this.expectingValue) this.state.fail(
+        "unexpected_token", "previous JSON object value was not consumed",
+        this.state.offset
+    )
+    jsonSkipWhitespace(this.state)
+    if (this.state.errorCode == "" && !this.done &&
+        this.state.offset < this.state.source.size &&
+        this.state.source[this.state.offset] == 125) {
+        this.state.offset = this.state.offset + 1
+        this.done = true
+    }
+    var key = ""
+    if (this.state.errorCode == "" && !this.done) {
+        if (!this.first) jsonReaderConsume(this.state, 44)
+        jsonSkipWhitespace(this.state)
+        if (this.state.offset < this.state.source.size &&
+            this.state.source[this.state.offset] == 125) {
+            this.state.fail(
+                "unexpected_token", "trailing comma in JSON object",
+                this.state.offset
+            )
+        }
+        if (this.state.errorCode == "") key = jsonParseString(this.state)
+        var duplicate = false
+        var index = 0
+        while (index < this.keys.size) {
+            if (this.keys[index] == key) duplicate = true
+            index = index + 1
+        }
+        if (duplicate && this.state.limits.rejectDuplicateKeys) this.state.fail(
+            "duplicate_key", "duplicate JSON object key", this.state.offset
+        )
+        if (this.keys.size >= this.state.limits.maximumObjectMembers) {
+            this.state.fail(
+                "node_limit", "JSON object member limit exceeded",
+                this.state.offset
+            )
+        }
+        if (this.state.errorCode == "") {
+            this.keys.append(key)
+            jsonReaderConsume(this.state, 58)
+            this.expectingValue = true
+            this.first = false
+        }
+    }
+    key
+}
+
+// Order-sensitive lookup is the fast path for canonical protocols. It still
+// parses and unescapes the actual key, but never rewinds or scans for another
+// member when the schema order is known.
+fun JsonObjectReader.nextExpected(name: string): bool {
+    if (this.expectingValue) this.state.fail(
+        "unexpected_token", "previous JSON object value was not consumed",
+        this.state.offset
+    )
+    if (!this.first) jsonReaderConsume(this.state, 44)
+    jsonSkipWhitespace(this.state)
+    var key = ""
+    if (this.state.errorCode == "" &&
+        this.state.offset < this.state.source.size &&
+        this.state.source[this.state.offset] != 125) {
+        key = jsonParseString(this.state)
+    } else if (this.state.errorCode == "") this.state.fail(
+        "unexpected_end", "expected JSON object field", this.state.offset
+    )
+    val matches = this.state.errorCode == "" && key == name
+    if (!matches && this.state.errorCode == "") this.state.fail(
+        "unexpected_token", "unexpected JSON object field", this.state.offset
+    )
+    if (matches) {
+        jsonReaderConsume(this.state, 58)
+        this.expectingValue = true
+        this.first = false
+    }
+    matches
+}
+
+// Fastest canonical-schema lookup: compare an unescaped key directly in the
+// source buffer. Producers using this contract emit ordinary UTF-8 field
+// names; escaped spellings of the same key are deliberately rejected.
+fun JsonObjectReader.nextExpectedRaw(name: string): bool {
+    if (this.expectingValue) this.state.fail(
+        "unexpected_token", "previous JSON object value was not consumed",
+        this.state.offset
+    )
+    if (!this.first) jsonReaderConsume(this.state, 44)
+    jsonSkipWhitespace(this.state)
+    var matches = this.state.errorCode == "" && name.isValidUtf8() &&
+        this.state.offset < this.state.source.size &&
+        this.state.source[this.state.offset] == 34
+    if (matches) this.state.offset = this.state.offset + 1
+    var index = 0
+    while (matches && index < name.size) {
+        matches = this.state.offset < this.state.source.size &&
+            this.state.source[this.state.offset] == name[index]
+        if (matches) {
+            this.state.offset = this.state.offset + 1
+            index = index + 1
+        }
+    }
+    matches = matches && this.state.offset < this.state.source.size &&
+        this.state.source[this.state.offset] == 34
+    if (matches) this.state.offset = this.state.offset + 1
+    else if (this.state.errorCode == "") this.state.fail(
+        "unexpected_token", "unexpected JSON object field", this.state.offset
+    )
+    if (matches) {
+        jsonReaderConsume(this.state, 58)
+        this.expectingValue = true
+        this.first = false
+    }
+    matches
+}
+
+fun JsonObjectReader.readString(): string {
+    var value = ""
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    if (this.state.errorCode == "") value = jsonParseString(this.state)
+    this.expectingValue = false
+    value
+}
+
+fun JsonObjectReader.readRaw(): string {
+    var value = ""
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    jsonSkipWhitespace(this.state)
+    val begin = this.state.offset
+    if (this.state.errorCode == "") jsonScanValue(this.state, 1)
+    if (this.state.errorCode == "") {
+        value = this.state.source.slice(begin, this.state.offset)
+    }
+    this.expectingValue = false
+    value
+}
+
+// Validate an array of two-string tuples and retain its original encoded
+// slice. This common protocol shape (notably HTTP headers) avoids a dynamic
+// tree and avoids pulling the generic recursive scanner into small binaries.
+fun JsonObjectReader.readStringPairsRaw(): string {
+    var value = ""
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    jsonSkipWhitespace(this.state)
+    val begin = this.state.offset
+    jsonReaderConsume(this.state, 91)
+    jsonSkipWhitespace(this.state)
+    var closed = false
+    if (this.state.errorCode == "" &&
+        this.state.offset < this.state.source.size &&
+        this.state.source[this.state.offset] == 93) {
+        this.state.offset = this.state.offset + 1
+        closed = true
+    }
+    while (this.state.errorCode == "" && !closed) {
+        jsonReaderConsume(this.state, 91)
+        jsonParseString(this.state)
+        jsonReaderConsume(this.state, 44)
+        jsonParseString(this.state)
+        jsonReaderConsume(this.state, 93)
+        jsonSkipWhitespace(this.state)
+        if (this.state.offset < this.state.source.size &&
+            this.state.source[this.state.offset] == 93) {
+            this.state.offset = this.state.offset + 1
+            closed = true
+        } else jsonReaderConsume(this.state, 44)
+    }
+    if (this.state.errorCode == "") {
+        value = this.state.source.slice(begin, this.state.offset)
+    }
+    this.expectingValue = false
+    value
+}
+
+fun JsonObjectReader.skip(): void {
+    this.readRaw()
+    jsonSkipWhitespace(this.state)
+}
+
+fun JsonObjectReader.finish(): bool {
+    if (this.expectingValue) this.state.fail(
+        "unexpected_end", "JSON object value was not consumed", this.state.offset
+    )
+    if (!this.done && this.state.errorCode == "") this.next()
+    jsonSkipWhitespace(this.state)
+    this.state.errorCode == "" && this.done &&
+        this.state.offset == this.state.source.size
+}
+
 fun jsonWriteString(var writer: JsonWriter, value: string): void {
-    if (!value.isValidUtf8()) writer.valid = false
-    if (writer.valid) writer.output.appendText("\"")
     var offset = 0
-    val hex = "0123456789abcdef"
-    while (writer.valid && offset < value.size) {
+    var plain = true
+    while (writer.valid && plain && offset < value.size) {
         val byte = value[offset]
-        if (byte == 34) writer.output.appendText("\\\"")
-        else if (byte == 92) writer.output.appendText("\\\\")
-        else if (byte == 8) writer.output.appendText("\\b")
-        else if (byte == 12) writer.output.appendText("\\f")
-        else if (byte == 10) writer.output.appendText("\\n")
-        else if (byte == 13) writer.output.appendText("\\r")
-        else if (byte == 9) writer.output.appendText("\\t")
-        else if (byte < 32) {
-            writer.output.appendText("\\u00")
-            writer.output.appendText(hex.slice(byte / 16, byte / 16 + 1))
-            val low = byte - (byte / 16) * 16
-            writer.output.appendText(hex.slice(low, low + 1))
-        } else if (byte < 128) {
-            writer.output.appendText(value.slice(offset, offset + 1))
-        } else {
+        if (byte == 34 || byte == 92 || byte < 32) plain = false
+        else if (byte < 128) offset = offset + 1
+        else {
             val length = utf8SequenceLength(byte)
             if (!utf8SequenceValid(value, offset, length)) writer.valid = false
-            if (writer.valid) writer.output.appendText(
-                value.slice(offset, offset + length)
-            )
-            offset = offset + length - 1
+            else offset = offset + length
         }
-        offset = offset + 1
     }
-    if (writer.valid) writer.output.appendText("\"")
+    if (writer.valid && plain) {
+        writer.output.appendText("\"")
+        writer.output.appendText(value)
+        writer.output.appendText("\"")
+    } else if (writer.valid) {
+        writer.output.appendText("\"")
+        offset = 0
+        val hex = "0123456789abcdef"
+        while (writer.valid && offset < value.size) {
+            val byte = value[offset]
+            if (byte == 34) writer.output.appendText("\\\"")
+            else if (byte == 92) writer.output.appendText("\\\\")
+            else if (byte == 8) writer.output.appendText("\\b")
+            else if (byte == 12) writer.output.appendText("\\f")
+            else if (byte == 10) writer.output.appendText("\\n")
+            else if (byte == 13) writer.output.appendText("\\r")
+            else if (byte == 9) writer.output.appendText("\\t")
+            else if (byte < 32) {
+                writer.output.appendText("\\u00")
+                writer.output.appendText(hex.slice(byte / 16, byte / 16 + 1))
+                val low = byte - (byte / 16) * 16
+                writer.output.appendText(hex.slice(low, low + 1))
+            } else if (byte < 128) {
+                writer.output.appendText(value.slice(offset, offset + 1))
+            } else {
+                val length = utf8SequenceLength(byte)
+                if (!utf8SequenceValid(value, offset, length)) {
+                    writer.valid = false
+                }
+                if (writer.valid) writer.output.appendText(
+                    value.slice(offset, offset + length)
+                )
+                offset = offset + length - 1
+            }
+            offset = offset + 1
+        }
+        if (writer.valid) writer.output.appendText("\"")
+    }
+}
+
+// Encode one UTF-8 string as a complete JSON string literal without building
+// a dynamic `Json` tree. Protocol adapters can use this for streaming object
+// envelopes while retaining the same escaping and validation rules as
+// `jsonStringify`.
+fun jsonQuote(value: string): string {
+    var offset = 0
+    var plain = true
+    while (plain && offset < value.size) {
+        val byte = value[offset]
+        if (byte == 34 || byte == 92 || byte < 32) plain = false
+        else if (byte < 128) offset = offset + 1
+        else {
+            val length = utf8SequenceLength(byte)
+            if (!utf8SequenceValid(value, offset, length)) plain = false
+            else offset = offset + length
+        }
+    }
+    if (plain) "\"$value\""
+    else {
+        val writer = JsonWriter(byteBuffer(), true)
+        jsonWriteString(writer, value)
+        if (writer.valid) writer.output.toText() else "null"
+    }
+}
+
+fun jsonEncodeNull(): JsonEncoded = JsonEncoded("null", true)
+
+fun jsonEncodeString(value: string): JsonEncoded =
+    JsonEncoded(jsonQuote(value), value.isValidUtf8())
+
+fun jsonEncodeInteger(value: int): JsonEncoded = JsonEncoded("$value", true)
+
+fun jsonEncodeBoolean(value: bool): JsonEncoded =
+    JsonEncoded(if (value) "true" else "false", true)
+
+fun jsonEncoder(): JsonEncoder = JsonEncoder(
+    "", 0, 0, 0, 0, false, true
+)
+
+fun JsonEncoder.prepareValue(): void {
+    if (this.depth == 0) {
+        if (this.rootWritten) this.valid = false
+        this.rootWritten = true
+    } else {
+        val mask = 1 << (this.depth - 1)
+        if ((this.objectBits & mask) != 0) {
+            if ((this.expectingValueBits & mask) == 0) this.valid = false
+            this.expectingValueBits = this.expectingValueBits & ~mask
+        } else {
+            if ((this.nonEmptyBits & mask) != 0) {
+                this.output = "${this.output},"
+            }
+        }
+        this.nonEmptyBits = this.nonEmptyBits | mask
+    }
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.beginObject(): void {
+    this.prepareValue()
+    if (this.depth >= 63) this.valid = false
+    if (this.valid) {
+        this.output = "${this.output}{"
+        val mask = 1 << this.depth
+        this.objectBits = this.objectBits | mask
+        this.nonEmptyBits = this.nonEmptyBits & ~mask
+        this.expectingValueBits = this.expectingValueBits & ~mask
+        this.depth = this.depth + 1
+    }
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.beginArray(): void {
+    this.prepareValue()
+    if (this.depth >= 63) this.valid = false
+    if (this.valid) {
+        this.output = "${this.output}["
+        val mask = 1 << this.depth
+        this.objectBits = this.objectBits & ~mask
+        this.nonEmptyBits = this.nonEmptyBits & ~mask
+        this.expectingValueBits = this.expectingValueBits & ~mask
+        this.depth = this.depth + 1
+    }
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.key(name: string): void {
+    if (this.depth <= 0 || !name.isValidUtf8()) this.valid = false
+    if (this.valid) {
+        val mask = 1 << (this.depth - 1)
+        if ((this.objectBits & mask) == 0 ||
+            (this.expectingValueBits & mask) != 0) this.valid = false
+        if (this.valid && (this.nonEmptyBits & mask) != 0) {
+            this.output = "${this.output},"
+        }
+        if (this.valid) {
+            val quoted = jsonQuote(name)
+            if (quoted == "null") this.valid = false
+            else this.output = "${this.output}$quoted"
+        }
+        if (this.valid) {
+            this.output = "${this.output}:"
+            this.expectingValueBits = this.expectingValueBits | mask
+        }
+    }
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.string(value: string): void {
+    this.prepareValue()
+    if (this.valid) {
+        val quoted = jsonQuote(value)
+        if (quoted == "null") this.valid = false
+        else this.output = "${this.output}$quoted"
+    }
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.integer(value: int): void {
+    this.prepareValue()
+    if (this.valid) this.output = "${this.output}$value"
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.boolean(value: bool): void {
+    this.prepareValue()
+    val encoded = if (value) "true" else "false"
+    if (this.valid) this.output = "${this.output}$encoded"
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.nullValue(): void {
+    this.prepareValue()
+    if (this.valid) this.output = "${this.output}null"
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.endObject(): void {
+    if (this.depth <= 0) this.valid = false
+    if (this.valid) {
+        val mask = 1 << (this.depth - 1)
+        if ((this.objectBits & mask) == 0 ||
+            (this.expectingValueBits & mask) != 0) this.valid = false
+        if (this.valid) this.output = "${this.output}}"
+        this.objectBits = this.objectBits & ~mask
+        this.nonEmptyBits = this.nonEmptyBits & ~mask
+        this.expectingValueBits = this.expectingValueBits & ~mask
+        this.depth = this.depth - 1
+    }
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.endArray(): void {
+    if (this.depth <= 0) this.valid = false
+    if (this.valid) {
+        val mask = 1 << (this.depth - 1)
+        if ((this.objectBits & mask) != 0) this.valid = false
+        if (this.valid) this.output = "${this.output}]"
+        this.objectBits = this.objectBits & ~mask
+        this.nonEmptyBits = this.nonEmptyBits & ~mask
+        this.expectingValueBits = this.expectingValueBits & ~mask
+        this.depth = this.depth - 1
+    }
+    if (!this.valid) this.output = this.output
+}
+
+fun JsonEncoder.finish(): string {
+    if (this.valid && this.rootWritten && this.depth == 0) {
+        this.output
+    } else "null"
+}
+
+fun jsonArrayEncoder(): JsonArrayEncoder {
+    val encoder = JsonArrayEncoder(byteBuffer(), 0, true, false)
+    encoder.output.appendText("[")
+    encoder
+}
+
+fun JsonArrayEncoder.add(value: JsonEncoded): void {
+    if (this.finished || !value.valid) this.valid = false
+    if (this.valid) {
+        if (this.count > 0) this.output.appendText(",")
+        this.output.appendText(value.text)
+        this.count = this.count + 1
+    }
+}
+
+fun JsonArrayEncoder.finish(): JsonEncoded {
+    if (this.finished) this.valid = false
+    if (this.valid) this.output.appendText("]")
+    this.finished = true
+    JsonEncoded(if (this.valid) this.output.toText() else "null", this.valid)
+}
+
+fun jsonObjectEncoder(): JsonObjectEncoder {
+    val encoder = JsonObjectEncoder(byteBuffer(), 0, true, false)
+    encoder.output.appendText("{")
+    encoder
+}
+
+fun JsonObjectEncoder.put(name: string, value: JsonEncoded): void {
+    if (this.finished || !name.isValidUtf8() || !value.valid) {
+        this.valid = false
+    }
+    if (this.valid) {
+        if (this.count > 0) this.output.appendText(",")
+        val writer = JsonWriter(this.output, true)
+        jsonWriteString(writer, name)
+        if (!writer.valid) this.valid = false
+    }
+    if (this.valid) {
+        this.output.appendText(":")
+        this.output.appendText(value.text)
+        this.count = this.count + 1
+    }
+}
+
+fun JsonObjectEncoder.finish(): JsonEncoded {
+    if (this.finished) this.valid = false
+    if (this.valid) this.output.appendText("}")
+    this.finished = true
+    JsonEncoded(if (this.valid) this.output.toText() else "null", this.valid)
 }
 
 fun jsonWriteValue(var writer: JsonWriter, value: Json): void {

@@ -114,13 +114,17 @@ strings, arrays, and objects retain the same generated LLVM contract on wasm32
 and native targets. Trusted adapters can therefore adopt request memory and
 hand ordinary strings to runtime `$json`/`$jsons` code.
 
-`compilerExportFunction(handle, name)` provides the first stable foreign ABI
-rung. It exports a C-identifier symbol for a resolved top-level function while
+`@export("name")` provides the direct source-level form of the first stable
+foreign ABI rung. The equivalent `compilerExportFunction(handle, name)` API is
+retained for extensions that choose a function dynamically. Both export a
+C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded
-surface accepts up to 16 value `bool`/`i64`, borrowed `string`, or direct
+surface accepts up to 16 value `bool`, `char`, signed or unsigned 8/16/32/64-bit
+integer, borrowed `string`, or direct
 non-escaping `(i64) -> i64` callback parameters, no runtime globals, and
-`void`, `bool`, `i64`, or owned `string` results. Adapters box scalars
-without exposing `%AblaValue`. A string lowers to a pointer/`u64` byte slice;
+`void`, any supported scalar, or owned `string` results. Adapters preserve the
+declared width and signedness while boxing scalars without exposing
+`%AblaValue`. A string lowers to a pointer/`u64` byte slice;
 the adapter accepts null only for an empty slice, copies the exact bytes into
 tracked Abla-owned storage, and adds its own terminator before calling user
 code. C conformance covers embedded NUL/non-UTF-8 bytes and the empty-null

@@ -111,6 +111,10 @@ AblaValue ablaUnsafePointerAddress(AblaValue value) {
     return value;
 }
 
+AblaValue ablaUnsafeCStringAddress(AblaValue value) {
+    return wasm_pointer_value((void*)abla_as_cstring(value));
+}
+
 AblaValue ablaUnsafePointerOffset(AblaValue value, AblaValue offset) {
     const uint64_t base = (uint64_t)abla_as_i64(value);
     const int64_t displacement = abla_as_i64(offset);

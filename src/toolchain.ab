@@ -846,7 +846,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         "",
         []
     )
-    val source = graph.load(sourcePath)
+    val selfHostedRuntime = Path(bootstrapStandardLibraryRoot()).child(
+        "abla/runtime/self/entry.ab"
+    ).text
+    val rootSource = graph.load(sourcePath)
+    val source = "${graph.load(selfHostedRuntime)}\n$rootSource"
     // Filesystem-read providers have serialized content identities. Other
     // ambient effects remain uncached because they do not yet have a stable
     // deterministic provider contract.
@@ -861,11 +865,13 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val ltoObjectPath = "$outputPath.lto-program.o"
     val ltoValueRuntimePath = "$outputPath.lto-value-runtime.o"
     val ltoHostPath = "$outputPath.lto-host.o"
+    val ltoWasmPlatformPath = "$outputPath.lto-wasm-platform.o"
     val wasmPlatformPath = "$outputPath.wasm-platform.o"
     val rawAdaptersPath = "$outputPath.raw-adapters.o"
     val rawRuntimePath = "$outputPath.raw-runtime.o"
     val combinedObjectPath = "$outputPath.combined.o"
     val publishPath = "$outputPath.tmp.${linuxProcessId()}"
+    val optimizedWasmPath = "$outputPath.wasm-opt.tmp.${linuxProcessId()}"
     val manifestPath = Path(sourcePath).parent().child("abla.toml")
     val manifest = manifestPath.readText()
     val targetIdentity = "${target.name}:${target.llvmTriple}:${target.objectFormat}:${target.hosted}:${target.libcFree}:${target.entrySymbol}:${target.linkerFlavor}:${target.linkerEmulation}"
@@ -876,8 +882,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // remain on the regular path: linking libLLVM into an application-wide
     // LTO unit is both prohibitively expensive and outside this optimization's
     // intended runtime boundary.
-    val ltoEligible = target.hosted && artifact == "executable" &&
-        cacheProfile == "inprocess-o2"
+    val releaseProfile = cacheProfile == "inprocess-o2" ||
+        cacheProfile == "cross-o2" ||
+        cacheProfile == "raw-inprocess-o2" ||
+        cacheProfile == "raw-cross-o2"
+    val hostedLtoEligible = target.hosted && artifact == "executable" &&
+        releaseProfile
+    val wasmLtoEligible = target.objectFormat == "wasm" &&
+        artifact == "module" && releaseProfile
+    val ltoEligible = hostedLtoEligible || wasmLtoEligible
     val firstHash = bootstrapNativeCacheHash(
         sourceIdentity, 17, 257, 1000000007
     )
@@ -940,11 +953,13 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     Path(ltoObjectPath).remove()
     Path(ltoValueRuntimePath).remove()
     Path(ltoHostPath).remove()
+    Path(ltoWasmPlatformPath).remove()
     Path(wasmPlatformPath).remove()
     Path(rawAdaptersPath).remove()
     Path(rawRuntimePath).remove()
     Path(combinedObjectPath).remove()
     Path(publishPath).remove()
+    Path(optimizedWasmPath).remove()
     if (cached) {
         linkLlvm = Path(cacheLinkLlvmPath).readText() == "1"
         linkHost = Path(cacheLinkHostPath).readText() == "1"
@@ -1157,6 +1172,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileValueRuntime.argument("-O2")
         compileValueRuntime.argument("-ffreestanding")
         compileValueRuntime.argument("-fno-stack-protector")
+        compileValueRuntime.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
         compileValueRuntime.argument("-ffunction-sections")
         compileValueRuntime.argument("-fdata-sections")
         compileValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
@@ -1196,6 +1212,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileValueRuntime.argument("-O2")
         compileValueRuntime.argument("-ffunction-sections")
         compileValueRuntime.argument("-fdata-sections")
+        compileValueRuntime.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
         if (artifact == "shared-library") {
             compileValueRuntime.argument("-fPIC")
         }
@@ -1245,6 +1262,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileLtoProgram.argument("-O2")
         compileLtoProgram.argument("-flto")
         compileLtoProgram.argument("-Wno-unused-command-line-argument")
+        if (wasmLtoEligible) {
+            compileLtoProgram.argument("--target=${target.llvmTriple}")
+            compileLtoProgram.argument("-ffreestanding")
+            compileLtoProgram.argument("-fno-stack-protector")
+        }
         if (macTarget) {
             compileLtoProgram.argument("-isysroot")
             compileLtoProgram.argument(macSdkRoot)
@@ -1262,6 +1284,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileLtoValueRuntime.argument("-std=c11")
         compileLtoValueRuntime.argument("-O2")
         compileLtoValueRuntime.argument("-flto")
+        compileLtoValueRuntime.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
+        if (wasmLtoEligible) {
+            compileLtoValueRuntime.argument("--target=${target.llvmTriple}")
+            compileLtoValueRuntime.argument("-ffreestanding")
+            compileLtoValueRuntime.argument("-fno-stack-protector")
+            compileLtoValueRuntime.argument("-DABLA_WASM32=1")
+            compileLtoValueRuntime.argument("-Wno-unused-command-line-argument")
+        }
         if (macTarget) {
             compileLtoValueRuntime.argument("-isysroot")
             compileLtoValueRuntime.argument(macSdkRoot)
@@ -1275,7 +1305,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileLtoValueRuntime.argument(ltoValueRuntimePath)
         status = compileLtoValueRuntime.run()
     }
-    if (status == 0 && ltoEligible && !linkLlvm) {
+    if (status == 0 && hostedLtoEligible && !linkLlvm) {
         val compileLtoHost = linuxCommand("env")
         compileLtoHost.argument("NIX_HARDENING_ENABLE=")
         compileLtoHost.argument("clang")
@@ -1300,6 +1330,29 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileLtoHost.argument("-o")
         compileLtoHost.argument(ltoHostPath)
         status = compileLtoHost.run()
+    }
+    if (status == 0 && wasmLtoEligible && !linkLlvm) {
+        val compileLtoWasmPlatform = linuxCommand("env")
+        compileLtoWasmPlatform.argument("NIX_HARDENING_ENABLE=")
+        compileLtoWasmPlatform.argument("clang")
+        compileLtoWasmPlatform.argument("--target=${target.llvmTriple}")
+        compileLtoWasmPlatform.argument("-std=c11")
+        compileLtoWasmPlatform.argument("-O2")
+        compileLtoWasmPlatform.argument("-flto")
+        compileLtoWasmPlatform.argument("-ffreestanding")
+        compileLtoWasmPlatform.argument("-fno-stack-protector")
+        compileLtoWasmPlatform.argument("-DABLA_WASM32=1")
+        compileLtoWasmPlatform.argument("-Wno-unused-command-line-argument")
+        compileLtoWasmPlatform.argument("-I${bootstrapRuntimeRoot()}")
+        compileLtoWasmPlatform.argument("-c")
+        compileLtoWasmPlatform.argument(
+            Path(bootstrapRuntimeRoot()).child(
+                "abla_runtime_wasm.c"
+            ).text
+        )
+        compileLtoWasmPlatform.argument("-o")
+        compileLtoWasmPlatform.argument(ltoWasmPlatformPath)
+        status = compileLtoWasmPlatform.run()
     }
     if (status == 0 && target.hosted && artifact != "object" && linkLlvm) {
         val llvmConfig = linuxCommand("llvm-config")
@@ -1342,6 +1395,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileValueRuntime.argument("-ffunction-sections")
         compileValueRuntime.argument("-fdata-sections")
         compileValueRuntime.argument("-DABLA_WASM32=1")
+        compileValueRuntime.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
         compileValueRuntime.argument("-Wno-unused-command-line-argument")
         compileValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
         compileValueRuntime.argument("-c")
@@ -1546,19 +1600,58 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkModule.argument("--no-entry")
         linkModule.argument("--gc-sections")
         linkModule.argument("--export-dynamic")
+        if (wasmLtoEligible) linkModule.argument("--lto-O3")
+        linkModule.argument("-z")
+        // Keep the import-free module's committed linear-memory floor aligned
+        // with ordinary Wasm guests. One MiB remains generous for Abla's
+        // iterative runtime paths while avoiding a two-MiB charge before the
+        // function handles its first request.
+        linkModule.argument("stack-size=1048576")
         // LLD otherwise records the transactional PID-bearing output name in
         // the custom name section. Debug/name data belongs in an explicit
         // sidecar; the published module must be byte reproducible.
         linkModule.argument("--strip-all")
-        linkModule.argument(objectPath)
-        linkModule.argument(valueRuntimePath)
-        linkModule.argument(wasmPlatformPath)
+        linkModule.argument(if (wasmLtoEligible)
+            ltoObjectPath
+        else objectPath)
+        linkModule.argument(if (wasmLtoEligible)
+            ltoValueRuntimePath
+        else valueRuntimePath)
+        linkModule.argument(if (wasmLtoEligible)
+            ltoWasmPlatformPath
+        else wasmPlatformPath)
         linkModule.argument("-o")
         linkModule.argument(publishPath)
         status = linkModule.run()
         if (status == 0) {
             Path(valueRuntimePath).remove()
             Path(wasmPlatformPath).remove()
+            Path(ltoObjectPath).remove()
+            Path(ltoValueRuntimePath).remove()
+            Path(ltoWasmPlatformPath).remove()
+        }
+    }
+    // Release wasm modules receive a target-aware whole-module pass after
+    // LLVM and LLD have exposed the final control-flow and call graph. Fast
+    // builds intentionally skip this work to preserve short edit cycles.
+    if (status == 0 && target.objectFormat == "wasm" &&
+        artifact == "module" && releaseProfile) {
+        val optimizeModule = linuxCommand("env")
+        // Binaryen otherwise sizes its worker pool from every visible host
+        // CPU. That is wasteful for these small modules and can deadlock in
+        // constrained build sandboxes with a very large reported CPU count.
+        optimizeModule.argument("BINARYEN_CORES=1")
+        optimizeModule.argument("wasm-opt")
+        optimizeModule.argument("-O3")
+        optimizeModule.argument(publishPath)
+        optimizeModule.argument("-o")
+        optimizeModule.argument(optimizedWasmPath)
+        status = optimizeModule.run()
+        if (status == 0 && !Path(optimizedWasmPath).moveTo(
+            Path(publishPath)
+        )) {
+            status = 143
+            failureKind = "io"
         }
     }
     if (status == 0) {
@@ -1573,10 +1666,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (status != 0) bootstrapDiscardCompileOutputs()
     if (status != 0) Path(publishPath).remove()
+    Path(optimizedWasmPath).remove()
     if (status != 0) Path(combinedObjectPath).remove()
     if (status != 0) Path(ltoObjectPath).remove()
     if (status != 0) Path(ltoValueRuntimePath).remove()
     if (status != 0) Path(ltoHostPath).remove()
+    if (status != 0) Path(ltoWasmPlatformPath).remove()
     if (status != 0 && failureKind == "io") {
         linuxPrintStandardError(
             "error[E_BUILD_IO]: native build could not publish an intermediate or output artifact (status $status)\n"
@@ -1777,6 +1872,7 @@ fun bootstrapBuildJitHostLibrary(outputPath: string): int {
     hostCompile.argument("-O2")
     hostCompile.argument("-pthread")
     hostCompile.argument("-fPIC")
+    hostCompile.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
     if (ablaHostIsMacOS()) {
         val discoverSdk = linuxCommand("xcrun")
         discoverSdk.argument("--sdk")

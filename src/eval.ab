@@ -353,6 +353,19 @@ fun bootstrapExportNameValid(name: string): bool {
     valid
 }
 
+fun bootstrapExportScalarTypeValid(type: string): bool =
+    type == "bool" || type == "i8" || type == "u8" ||
+    type == "char" || type == "i16" || type == "u16" ||
+    type == "i32" || type == "u32" || type == "i64" || type == "u64"
+
+fun bootstrapExportResultTypeValid(type: string): bool =
+    type == "void" || type == "string" ||
+    bootstrapExportScalarTypeValid(type)
+
+fun bootstrapExportParameterTypeValid(type: string): bool =
+    type == "string" || type == "function:(i64)->i64" ||
+    bootstrapExportScalarTypeValid(type)
+
 fun bootstrapExportCallbackUseValidAt(
     expression: BootstrapExpression,
     name: string,
@@ -384,6 +397,90 @@ fun bootstrapExportCallbackUseValid(
     expression: BootstrapExpression,
     name: string
 ): bool = bootstrapExportCallbackUseValidAt(expression, name, false)
+
+fun bootstrapStageAnnotatedExports(parsed: BootstrapParseResult): int {
+    var errors = 0
+    var declarationIndex = 0
+    while (declarationIndex < parsed.declarations.size) {
+        val declaration = parsed.declarations[declarationIndex]
+        var annotation = 0
+        while (annotation < declaration.annotations.size) {
+            val annotationName = declaration.annotations[annotation]
+            if (annotationName == "export" ||
+                annotationName == "exportChecked") {
+                var exportName = ""
+                var valid = annotation < declaration.annotationArguments.size
+                if (valid) {
+                    val argument = declaration.annotationArguments[annotation]
+                    valid = argument.kind == "string"
+                    if (valid) exportName = argument.text
+                }
+                valid = valid && declaration.kind == "fun" &&
+                    declaration.extensionOwner == "" &&
+                    declaration.parameters.size <= 16 &&
+                    bootstrapExportNameValid(exportName)
+                val resultType = bootstrapNormalizeType(
+                    declaration.resultType
+                )
+                valid = valid && bootstrapExportResultTypeValid(resultType)
+                val parameterNames: array<string> = []
+                val parameterTypes: array<string> = []
+                var parameter = 0
+                while (valid && parameter < declaration.parameters.size) {
+                    val parameterType = bootstrapNormalizeType(
+                        declaration.parameterTypes[parameter]
+                    )
+                    valid = declaration.parameterKinds[parameter] ==
+                        "parameter" &&
+                        bootstrapExportParameterTypeValid(parameterType)
+                    if (valid &&
+                        parameterType == "function:(i64)->i64") {
+                        valid = bootstrapExportCallbackUseValid(
+                            declaration.expression,
+                            declaration.parameters[parameter]
+                        )
+                    }
+                    if (valid) {
+                        parameterNames.append(
+                            declaration.parameters[parameter]
+                        )
+                        parameterTypes.append(parameterType)
+                    }
+                    parameter = parameter + 1
+                }
+                var global = 0
+                while (valid && global < parsed.declarations.size) {
+                    val candidate = parsed.declarations[global]
+                    if (candidate.kind == "var" ||
+                        (candidate.kind == "val" &&
+                         candidate.expression.kind != "compile")) {
+                        valid = false
+                    }
+                    global = global + 1
+                }
+                if (valid) valid = bootstrapStageExportRequest(
+                    BootstrapExportRequest(
+                        declaration.name,
+                        exportName,
+                        resultType,
+                        parameterNames,
+                        parameterTypes,
+                        annotationName == "exportChecked"
+                    )
+                )
+                if (!valid) {
+                    errors = errors + 1
+                    bootstrapStageDriverDiagnostic(
+                        "error[E_EXPORT_ANNOTATION]: @${annotationName} on `${declaration.name}` requires one unique non-reserved string name and a supported top-level export signature without mutable or runtime-initialized globals\n"
+                    )
+                }
+            }
+            annotation = annotation + 1
+        }
+        declarationIndex = declarationIndex + 1
+    }
+    errors
+}
 
 fun bootstrapStageExportRequest(request: BootstrapExportRequest): bool {
     var valid = bootstrapExportRequestCount < 64 &&
@@ -4477,8 +4574,7 @@ class BootstrapEvaluator(
                 resultType = bootstrapNormalizeType(declaration.resultType)
                 valid = declaration.kind == "fun" &&
                     declaration.parameters.size <= 16 &&
-                    (resultType == "void" || resultType == "bool" ||
-                     resultType == "i64" || resultType == "string")
+                    bootstrapExportResultTypeValid(resultType)
                 var parameter = 0
                 while (valid && parameter < declaration.parameters.size) {
                     val parameterType = bootstrapNormalizeType(
@@ -4486,9 +4582,7 @@ class BootstrapEvaluator(
                     )
                     valid = declaration.parameterKinds[parameter] ==
                         "parameter" &&
-                        (parameterType == "bool" || parameterType == "i64" ||
-                         parameterType == "string" ||
-                         parameterType == "function:(i64)->i64")
+                        bootstrapExportParameterTypeValid(parameterType)
                     if (valid &&
                         parameterType == "function:(i64)->i64") {
                         valid = bootstrapExportCallbackUseValid(
@@ -4542,7 +4636,7 @@ class BootstrapEvaluator(
             } else {
                 if (declarationPath == "") {
                     bootstrapStageDriverDiagnostic(
-                        "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: compilerExportFunction rejected $reflectedKind handle ${reflected.integer} (declaration `$declarationKind`, source `$source`, result `$resultType`, export `${exportName.text}`); it requires a unique non-reserved C identifier and a top-level function with at most 16 value bool/i64, copied borrowed-string, or direct non-escaping (i64)->i64 callback parameters, returning void, bool, i64, or owned string, without mutable or runtime-initialized globals\n"
+                        "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: compilerExportFunction rejected $reflectedKind handle ${reflected.integer} (declaration `$declarationKind`, source `$source`, result `$resultType`, export `${exportName.text}`); it requires a unique non-reserved C identifier and a top-level function with at most 16 value bool, fixed-width integer/char, copied borrowed-string, or direct non-escaping (i64)->i64 callback parameters, returning void, a supported scalar, or owned string, without mutable or runtime-initialized globals\n"
                     )
                 } else {
                     bootstrapStageDriverDiagnostic(
@@ -5382,6 +5476,7 @@ class BootstrapEvaluator(
                         originEnd,
                         [],
                         [],
+                        [],
                         []
                     ))
                     module.elements.append(BootstrapEvalValue(
@@ -5499,6 +5594,7 @@ class BootstrapEvaluator(
                     originEnd,
                     [],
                     [],
+                    [],
                     []
                 ))
                 module.elements.append(BootstrapEvalValue(
@@ -5558,6 +5654,7 @@ class BootstrapEvaluator(
                         module.text,
                         module.integer,
                         originEnd,
+                        [],
                         [],
                         [],
                         []

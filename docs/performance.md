@@ -527,12 +527,14 @@ are promoted. This moved the canonical single-worker result from 111,030 to
 144,573 requests/second without changing the general escaping handler API.
 
 The following compiler pass infers only proven `i64` and `bool` IR values and
-locals. Arithmetic, comparisons, branches, direct scalar calls, and compatible
-native calls consume LLVM scalar values directly. A value receives boxed
+locals. Arithmetic, comparisons, bit operations, bounded shifts, branches,
+direct scalar calls, and compatible native calls consume LLVM scalar values
+directly. Declared local types survive lowering, so a scalar stays native even
+when its first assignment is control-flow dependent. A value receives boxed
 storage only when a use crosses a dynamic or otherwise unsupported boundary;
 locals are eligible only when every assignment proves the same scalar type.
-Division, shifts, heterogeneous equality, aggregate access, and unproven locals
-remain on their established boxed runtime paths.
+Division, heterogeneous equality, aggregate access, and unproven locals remain
+on their established boxed runtime paths.
 
 Against the checked-region binary, a five-sample isolated A/B improved the
 median from 143,955 to 152,141 requests/second. A separate counter run reduced

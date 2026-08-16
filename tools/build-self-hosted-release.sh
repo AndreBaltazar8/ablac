@@ -167,10 +167,15 @@ fi
 ABLA_MAX_MEMORY_MB=$object_memory_mb ABLA_MAX_SECONDS=$object_seconds \
     run_toolchain_command "$compile_command"
 
+runtime_self_host_text_flag=
+if grep -Eq '^define .*@ablaTextIsValidUtf8\(' "$module"; then
+    runtime_self_host_text_flag=-DABLA_SELF_HOSTED_RUNTIME_TEXT=1
+fi
+
 if [[ $host_os == Darwin ]]; then
     printf -v runtime_compile_command \
-        'clang -std=c11 -O2 -flto %s -isysroot %q -ffunction-sections -fdata-sections -I%q -c %q -o %q && clang -std=c11 -O2 -flto -pthread %s -isysroot %q -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE -Wno-deprecated-declarations -ffunction-sections -fdata-sections -I%q -c %q -o %q' \
-        "$runtime_abi_flag" "$host_sdk" "$project_root/runtime" \
+        'clang -std=c11 -O2 -flto %s %s -isysroot %q -ffunction-sections -fdata-sections -I%q -c %q -o %q && clang -std=c11 -O2 -flto -pthread %s -isysroot %q -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE -Wno-deprecated-declarations -ffunction-sections -fdata-sections -I%q -c %q -o %q' \
+        "$runtime_self_host_text_flag" "$runtime_abi_flag" "$host_sdk" "$project_root/runtime" \
         "$project_root/runtime/abla_runtime.c" \
         "$value_runtime_object" "$runtime_abi_flag" "$host_sdk" \
         "$project_root/runtime" \
@@ -178,8 +183,8 @@ if [[ $host_os == Darwin ]]; then
         "$host_runtime_object"
 else
     printf -v runtime_compile_command \
-        'clang -std=c11 -O2 -flto %s -ffunction-sections -fdata-sections -I%q -c %q -o %q && clang -std=c11 -O2 -flto %s -ffunction-sections -fdata-sections -I%q -c %q -o %q' \
-        "$runtime_abi_flag" "$project_root/runtime" "$project_root/runtime/abla_runtime.c" \
+        'clang -std=c11 -O2 -flto %s %s -ffunction-sections -fdata-sections -I%q -c %q -o %q && clang -std=c11 -O2 -flto %s -ffunction-sections -fdata-sections -I%q -c %q -o %q' \
+        "$runtime_self_host_text_flag" "$runtime_abi_flag" "$project_root/runtime" "$project_root/runtime/abla_runtime.c" \
         "$value_runtime_object" "$runtime_abi_flag" "$project_root/runtime" \
         "$project_root/runtime/abla_runtime_host.c" "$host_runtime_object"
 fi

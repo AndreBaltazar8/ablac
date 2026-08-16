@@ -105,6 +105,55 @@ return `input_limit`. Duplicate keys are rejected by default. Setting
 `jsonStringify` emits them in that order and `get` observes the last matching
 member.
 
+## Forward-only reading and streaming encoding
+
+Known-schema protocol code does not need to allocate a `Json` tree. An
+`JsonObjectReader` walks the source once, decodes only requested strings, and
+can retain a validated raw value slice:
+
+```abla
+val reader = jsonObjectReader(source)
+reader.nextExpected("method")
+val method = reader.readString()
+reader.nextExpected("headers")
+val headers = reader.readStringPairsRaw()
+val valid = reader.finish()
+```
+
+`nextExpected` is the order-sensitive fast path for canonical producers.
+`nextExpectedRaw` is the still leaner form when the producer guarantees
+ordinary unescaped UTF-8 field names; it compares the source bytes directly.
+`next` supports ordinary member iteration when order is not known; consume its
+current value with `readString`, `readRaw`, or `skip`. `readRaw` validates any
+nested value without materializing it. `readStringPairsRaw` is a smaller fast
+path for the common `[[name, value], ...]` protocol shape. Readers retain the
+same input, UTF-8, depth, node, string, member, duplicate-key, and trailing-byte
+checks as the tree parser.
+
+For output, the single-pass `JsonEncoder` writes one validated stream without
+building fragments or a dynamic tree:
+
+```abla
+val encoder = jsonEncoder()
+encoder.beginObject()
+encoder.key("ok")
+encoder.boolean(true)
+encoder.key("items")
+encoder.beginArray()
+encoder.string("one")
+encoder.integer(2)
+encoder.endArray()
+encoder.endObject()
+val encoded = encoder.finish()
+```
+
+`key`, `string`, `integer`, `boolean`, `nullValue`, `beginObject`,
+`beginArray`, `endObject`, and `endArray` enforce container state while writing.
+The older `JsonEncoded` fragment constructors remain useful when composing
+independently produced values. Both paths avoid handwritten JSON punctuation
+and an intermediate dynamic object graph; LLVM can remove the DOM parser and
+serializer when an application uses only the forward-only APIs.
+
 ## Serialization and literals
 
 `jsonStringify` emits compact deterministic JSON. Object order is stored order,

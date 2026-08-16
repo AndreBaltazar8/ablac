@@ -570,6 +570,72 @@ fun bootstrapLlvmDeclareGeneratedFunction(
     function
 }
 
+fun bootstrapLlvmEmitSelfHostedRuntimeBridges(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    identities: BootstrapLlvmFunctionIdentities
+): void {
+    var index = 0
+    while (index < program.functions.size) {
+        val implementation = program.functions[index]
+        val symbol = bootstrapLlvmSelfHostedRuntimeSymbol(
+            implementation.name
+        )
+        if (symbol != "") {
+            val bridge = bootstrapLlvmDeclareValueRuntime(
+                backend, symbol, implementation.parameters.size
+            )
+            LLVMSetVisibility(bridge, llvmHiddenVisibility())
+            val entry = LLVMAppendBasicBlockInContext(
+                backend.context, bridge, "self.hosted"
+            )
+            LLVMPositionBuilderAtEnd(backend.builder, entry)
+            val arguments: array<i64*> = [LLVMConstInt(
+                backend.i64Type, implementation.parameters.size, 0
+            )]
+            var parameter = 0
+            while (parameter < implementation.parameters.size) {
+                val scalar = bootstrapLlvmDirectScalarType(
+                    implementation.parameterTypes[parameter]
+                )
+                if (scalar == "") {
+                    arguments.append(LLVMGetParam(bridge, parameter + 1))
+                } else arguments.append(bootstrapLlvmCallNamed(
+                        backend,
+                        if (scalar == "bool") "abla_as_bool"
+                        else "abla_as_i64",
+                        [LLVMGetParam(bridge, parameter + 1)],
+                        "self.hosted.argument", false, [true]
+                    ))
+                parameter = parameter + 1
+            }
+            val result = bootstrapLlvmCall(
+                backend,
+                LLVMGetNamedFunction(
+                    backend.module,
+                    bootstrapLlvmDirectFunctionSymbol(
+                        identities.symbols[index]
+                    )
+                ),
+                arguments,
+                "self.hosted.result",
+                false,
+                bootstrapLlvmFalseFlags(arguments.size)
+            )
+            bootstrapLlvmCallNamed(
+                backend,
+                if (bootstrapLlvmDirectScalarType(
+                    implementation.resultType
+                ) == "bool") "abla_bool" else "abla_i64",
+                [LLVMGetParam(bridge, 0), result],
+                "", true, [false, false]
+            )
+            LLVMBuildRetVoid(backend.builder)
+        }
+        index = index + 1
+    }
+}
+
 fun bootstrapLlvmDirectFunctionSymbol(name: string): string =
     "${name}_direct"
 
@@ -1217,6 +1283,81 @@ fun bootstrapLlvmEmitScalarOperation(
             ),
             "scalar.negate"
         )
+        if (instruction.opcode == "&" || instruction.opcode == "|" ||
+            instruction.opcode == "^") {
+            val left = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "i64"
+            )
+            val right = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.right, "i64"
+            )
+            if (!pointerIsNull(left) && !pointerIsNull(right) &&
+                instruction.opcode == "&") native = LLVMBuildAnd(
+                    backend.builder, left, right, "scalar.bit.and"
+                )
+            if (!pointerIsNull(left) && !pointerIsNull(right) &&
+                instruction.opcode == "|") native = LLVMBuildOr(
+                    backend.builder, left, right, "scalar.bit.or"
+                )
+            if (!pointerIsNull(left) && !pointerIsNull(right) &&
+                instruction.opcode == "^") native = LLVMBuildXor(
+                    backend.builder, left, right, "scalar.bit.xor"
+                )
+        }
+        if (instruction.opcode == "bit.not") {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "i64"
+            )
+            if (!pointerIsNull(value)) native = LLVMBuildXor(
+                backend.builder, value,
+                LLVMConstInt(backend.i64Type, -1, 1),
+                "scalar.bit.not"
+            )
+        }
+        if (instruction.opcode == "<<" || instruction.opcode == ">>" ||
+            instruction.opcode == ">>>") {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "i64"
+            )
+            val count = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.right, "i64"
+            )
+            if (!pointerIsNull(value) && !pointerIsNull(count)) {
+                val zero = LLVMConstInt(backend.i64Type, 0, 0)
+                val negative = LLVMBuildICmp(
+                    backend.builder, llvmIntSignedLessThan(), count, zero,
+                    "scalar.shift.negative"
+                )
+                val tooLarge = LLVMBuildICmp(
+                    backend.builder, llvmIntSignedGreaterOrEqual(), count,
+                    LLVMConstInt(backend.i64Type, 64, 0),
+                    "scalar.shift.too.large"
+                )
+                val invalid = LLVMBuildOr(
+                    backend.builder, negative, tooLarge,
+                    "scalar.shift.invalid"
+                )
+                val safeCount = LLVMBuildSelect(
+                    backend.builder, invalid, zero, count,
+                    "scalar.shift.safe.count"
+                )
+                var shifted = nativeNullPointer()
+                if (instruction.opcode == "<<") shifted = LLVMBuildShl(
+                    backend.builder, value, safeCount, "scalar.shift.left"
+                )
+                if (instruction.opcode == ">>") shifted = LLVMBuildAShr(
+                    backend.builder, value, safeCount, "scalar.shift.right"
+                )
+                if (instruction.opcode == ">>>") shifted = LLVMBuildLShr(
+                    backend.builder, value, safeCount,
+                    "scalar.shift.right.unsigned"
+                )
+                native = LLVMBuildSelect(
+                    backend.builder, invalid, zero, shifted,
+                    "scalar.shift.result"
+                )
+            }
+        }
         if (instruction.opcode == "not") native = LLVMBuildXor(
             backend.builder,
             bootstrapLlvmScalarOperand(
@@ -2531,6 +2672,7 @@ fun bootstrapLlvmEmitClosureDispatchers(
     val release = LLVMGetNamedFunction(
         backend.module, "abla_llvm_release_closure"
     )
+    LLVMSetLinkage(release, llvmInternalLinkage())
     val releaseEntry = LLVMAppendBasicBlockInContext(
         backend.context, release, "entry"
     )
@@ -2544,6 +2686,7 @@ fun bootstrapLlvmEmitClosureDispatchers(
     val drop = LLVMGetNamedFunction(
         backend.module, "abla_llvm_drop_closure"
     )
+    LLVMSetLinkage(drop, llvmInternalLinkage())
     val entry = LLVMAppendBasicBlockInContext(
         backend.context, drop, "entry"
     )
@@ -2619,6 +2762,7 @@ fun bootstrapLlvmEmitIndirectDispatcher(
     val function = LLVMGetNamedFunction(
         backend.module, "abla_llvm_call_indirect"
     )
+    LLVMSetLinkage(function, llvmInternalLinkage())
     val output = LLVMGetParam(function, 0)
     val closure = LLVMGetParam(function, 1)
     val arguments = LLVMGetParam(function, 2)
@@ -2918,7 +3062,9 @@ fun bootstrapLlvmExportResultType(
     type: string
 ): i64* {
     var result = backend.voidType
-    if (type == "i64") result = backend.i64Type
+    if (bootstrapExportScalarTypeValid(type) && type != "bool") {
+        result = backend.type(type)
+    }
     if (type == "bool") result = backend.i8Type
     if (type == "string") result = backend.pointerType
     result
@@ -2940,7 +3086,7 @@ fun bootstrapLlvmExportParameterTypes(
             result.append(backend.pointerType)
             result.append(backend.pointerType)
         } else if (type == "bool") result.append(backend.i8Type)
-        else result.append(backend.i64Type)
+        else result.append(backend.type(type))
         parameter = parameter + 1
     }
     if (checked) {
@@ -3053,9 +3199,20 @@ fun bootstrapLlvmBoxExportArguments(
                 callbacks.append(slot)
                 native = native + 2
             } else {
+                var value = LLVMGetParam(function, native)
+                if (bootstrapLlvmIsNarrowNativeInteger(type)) {
+                    value = if (bootstrapLlvmIsUnsignedNativeInteger(type) ||
+                        type == "char") LLVMBuildZExt(
+                        backend.builder, value, backend.i64Type,
+                        "export.integer.zero-extend"
+                    ) else LLVMBuildSExt(
+                        backend.builder, value, backend.i64Type,
+                        "export.integer.sign-extend"
+                    )
+                }
                 bootstrapLlvmCallNamed(
                     backend, "abla_i64",
-                    [slot, LLVMGetParam(function, native)],
+                    [slot, value],
                     "", true, [false, false]
                 )
                 native = native + 1
@@ -3092,10 +3249,18 @@ fun bootstrapLlvmReturnExportValue(
     checked: bool
 ): void {
     var native = nativeNullPointer()
-    if (type == "i64") native = bootstrapLlvmCallNamed(
-        backend, "abla_as_i64", [result],
-        "export.i64", false, [true]
-    )
+    if (bootstrapExportScalarTypeValid(type) && type != "bool") {
+        native = bootstrapLlvmCallNamed(
+            backend, "abla_as_i64", [result],
+            "export.integer", false, [true]
+        )
+        if (bootstrapLlvmIsNarrowNativeInteger(type)) {
+            native = LLVMBuildTrunc(
+                backend.builder, native, backend.type(type),
+                "export.integer.truncate"
+            )
+        }
+    }
     if (type == "bool") {
         val boolean = bootstrapLlvmCallNamed(
             backend, "abla_as_bool", [result],
@@ -3490,6 +3655,9 @@ fun bootstrapEmitLlvmProgram(
         )
         index = index + 1
     }
+    bootstrapLlvmEmitSelfHostedRuntimeBridges(
+        backend, program, identities
+    )
     bootstrapLlvmEmitClosureDispatchers(
         backend, program, functionIndex, identities
     )
@@ -3519,6 +3687,7 @@ fun bootstrapCompileLlvmParsedCached(
     parsed: BootstrapParseResult,
     var cache: BootstrapIrCacheState
 ): BootstrapLlvmCompilation {
+    val annotationErrors = bootstrapStageAnnotatedExports(parsed)
     val analyzed = bootstrapAnalyzeParsed(parsed)
     val program = bootstrapLowerParsedCached(parsed, analyzed, cache)
     val emitted = if (bootstrapParsedHasContractCall(parsed)) {
@@ -3526,6 +3695,7 @@ fun bootstrapCompileLlvmParsedCached(
         BootstrapLlvmEmission("", analyzed.errors, "")
     } else bootstrapEmitLlvmProgram(program)
     val irErrors = emitted.errors - analyzed.errors
+    val totalErrors = emitted.errors + annotationErrors
     var diagnostics = bootstrapEnsurePrimaryDiagnostics(
         analyzed.diagnostics,
         analyzed.errors,
@@ -3543,16 +3713,17 @@ fun bootstrapCompileLlvmParsedCached(
     }
     diagnostics = bootstrapEnsurePrimaryDiagnostics(
         diagnostics,
-        emitted.errors,
+        totalErrors,
         "E_COMPILER_UNCLASSIFIED",
         "LLVM compilation"
     )
     BootstrapLlvmCompilation(
         emitted.output,
-        emitted.errors,
+        totalErrors,
         parsed.errors - parsed.extensionErrors,
         parsed.extensionErrors + analyzed.extensionErrors,
-        analyzed.errors - parsed.errors - analyzed.extensionErrors,
+        analyzed.errors - parsed.errors - analyzed.extensionErrors +
+            annotationErrors,
         irErrors,
         diagnostics,
         bootstrapLlvmNeedsLlvm(program),

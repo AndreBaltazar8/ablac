@@ -132,6 +132,41 @@ closures forward environments transitively, and a captured `var` is one shared
 mutable binding rather than a copied snapshot. Capturing `this` follows the
 same rules.
 
+Function and primary-constructor parameters may have defaults. Calls may bind
+top-level function and constructor parameters by name; positional arguments
+must come first, every argument expression is evaluated once in source order,
+and omitted defaults may refer to earlier parameters:
+
+```abla
+class Window(val width: int = 80, val height: int = width / 2)
+
+fun area(width: int = 80, height: int = width / 2): int =
+    width * height
+
+val window = Window(height = 30)
+val pixels = area(height = 30, width = 100)
+```
+
+Unknown, duplicate, ambiguous, or missing required names are compile-time
+errors. The compiler lowers named calls to the ordinary positional ABI, so
+foreign consumers and generated code do not need a second calling convention.
+
+Annotations accept an optional expression argument. `@export("symbol")` and
+`@exportChecked("symbol")` attach the stable foreign symbol directly to a
+top-level function; the same signature and target validation used by the
+compiler export API still applies:
+
+```abla
+@export("micro_handle")
+fun handle(pointer: int, length: int): int = dispatch(pointer, length)
+```
+
+The direct scalar ABI preserves `bool`, `char`, and every currently lowered
+signed or unsigned 8/16/32/64-bit integer type. WebAssembly represents narrow
+integers in its `i32` lane while the adapter preserves their declared bit
+width; `i64` and `u64` use its `i64` lane. Managed classes and arrays are not
+exported as opaque runtime values.
+
 ## Types
 
 The core types are `void`, `bool`, signed integer types (`i8`, `i16`, `i32`,
@@ -656,6 +691,14 @@ fun main {
     #println("building main")
     use(table)
 }
+```
+
+A top-level `#expression` is also a compile action. Its result is deliberately
+discarded, so registration, generation, and validation calls do not require a
+dummy `val` declaration:
+
+```abla
+#registerRoutes()
 ```
 
 A `compile` declaration is available only during compilation. A normal,
