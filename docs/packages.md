@@ -116,6 +116,30 @@ The entry is a library module and does not need `main`. Relative imports stay
 inside the materialized package. Provider imports in dependency entries are
 discovered transitively; incompatible duplicate names and cycles are rejected.
 
+## Hosted system libraries
+
+A hosted root program may explicitly request installed system/driver libraries:
+
+```toml
+name = "vulkan-application"
+version = "0.1.0"
+entry = "src/main.ab"
+nativeLibraries = ["vulkan"]
+```
+
+Each distinct name becomes one separate `-l<name>` linker argument. The nearest
+ancestor root manifest may list at most 32 names of at most 128 ASCII letters,
+digits, `+`, `-`, `.`, or `_`. Malformed arrays, duplicate names, paths, empty
+entries, and non-hosted targets are rejected with a specific diagnostic. The
+complete manifest is already part of the native cache identity, so changing the
+list cannot reuse an artifact linked under another contract.
+
+This surface is for specification/system boundaries whose entry declarations
+remain ordinary Abla `extern:"c"` declarations, such as an installed Vulkan
+loader. It does not compile foreign project source or introduce implicit
+libraries from source inspection. The root application chooses and audits its
+native dependencies; dependency manifests do not silently add linker inputs.
+
 ## Lock, cache, offline mode, and vendoring
 
 Create or explicitly refresh the lock with:

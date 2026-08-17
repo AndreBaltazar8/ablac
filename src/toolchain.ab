@@ -144,6 +144,123 @@ fun bootstrapModulePaths(graph: BootstrapModuleGraph): array<Path> {
     paths
 }
 
+fun bootstrapRootManifestPath(sourcePath: string): Path {
+    var directory = Path(sourcePath).parent()
+    var result = directory.child("abla.toml")
+    var searching = !result.exists()
+    var depth = 0
+    while (searching && depth < 128) {
+        val parent = directory.parent()
+        if (parent.text == directory.text) searching = false
+        directory = parent
+        val candidate = directory.child("abla.toml")
+        if (candidate.exists()) {
+            result = candidate
+            searching = false
+        }
+        depth = depth + 1
+    }
+    result
+}
+
+fun bootstrapNativeLibraryNameValid(name: string): bool {
+    var valid = name.size > 0 && name.size <= 128
+    var index = 0
+    while (valid && index < name.size) {
+        val byte = name[index]
+        valid = (byte >= 48 && byte <= 57) ||
+            (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) ||
+            byte == 43 || byte == 45 || byte == 46 || byte == 95
+        index = index + 1
+    }
+    valid
+}
+
+class BootstrapNativeLibraries(
+    val values: array<string>,
+    val valid: bool
+)
+
+fun bootstrapNativeManifestLibraries(
+    manifestPath: string
+): BootstrapNativeLibraries {
+    val values: array<string> = []
+    val source = Path(manifestPath).readText()
+    val key = "nativeLibraries"
+    var cursor = -1
+    var occurrences = 0
+    var lineBegin = 0
+    while (lineBegin < source.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < source.size && source[lineEnd] != 10 &&
+               source[lineEnd] != 13) lineEnd = lineEnd + 1
+        var begin = lineBegin
+        while (begin < lineEnd &&
+               (source[begin] == 32 || source[begin] == 9)) begin = begin + 1
+        var keyMatches = begin + key.size <= lineEnd
+        var keyIndex = 0
+        while (keyMatches && keyIndex < key.size) {
+            if (source[begin + keyIndex] != key[keyIndex]) {
+                keyMatches = false
+            }
+            keyIndex = keyIndex + 1
+        }
+        var equals = begin + key.size
+        while (equals < lineEnd &&
+               (source[equals] == 32 || source[equals] == 9)) {
+            equals = equals + 1
+        }
+        if (keyMatches && equals < lineEnd && source[equals] == 61) {
+            occurrences = occurrences + 1
+            var value = equals + 1
+            while (value < lineEnd &&
+                   (source[value] == 32 || source[value] == 9)) {
+                value = value + 1
+            }
+            if (occurrences == 1 && value < lineEnd &&
+                source[value] == 91) cursor = value + 1
+        }
+        lineBegin = lineEnd + 1
+    }
+    val present = occurrences > 0
+    var valid = !present || (occurrences == 1 && cursor >= 0)
+    var complete = false
+    var expectingValue = true
+    while (valid && cursor >= 0 && cursor < source.size && !complete) {
+        while (cursor < source.size &&
+               (source[cursor] == 32 || source[cursor] == 9 ||
+                source[cursor] == 10 || source[cursor] == 13)) {
+            cursor = cursor + 1
+        }
+        if (cursor < source.size && source[cursor] == 35) {
+            while (cursor < source.size && source[cursor] != 10 &&
+                   source[cursor] != 13) cursor = cursor + 1
+        } else if (cursor < source.size && source[cursor] == 93) {
+            complete = true
+        } else if (!expectingValue && cursor < source.size &&
+            source[cursor] == 44) {
+            cursor = cursor + 1
+            expectingValue = true
+        } else if (expectingValue && cursor < source.size &&
+            source[cursor] == 34) {
+            val valueBegin = cursor + 1
+            cursor = valueBegin
+            while (cursor < source.size && source[cursor] != 34 &&
+                   source[cursor] != 10 && source[cursor] != 13) {
+                cursor = cursor + 1
+            }
+            if (cursor < source.size && source[cursor] == 34) {
+                values.append(source.slice(valueBegin, cursor))
+                cursor = cursor + 1
+                expectingValue = false
+            } else valid = false
+        } else valid = false
+    }
+    if (present && !complete) valid = false
+    BootstrapNativeLibraries(values, valid)
+}
+
 // Bootstrap-only object emission. The final compiler replaces this strategy
 // with the in-process LLVM implementation from abla/llvm/aot.
 fun bootstrapExternalEmitObject(
@@ -908,6 +1025,28 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val rootSource = graph.load(sourcePath)
     val runtimePlatformSource = graph.load(runtimePlatform)
     val source = "${graph.load(selfHostedRuntime)}\n$runtimePlatformSource\n$rootSource"
+    val rootManifestPath = bootstrapRootManifestPath(sourcePath)
+    val nativeLibraryManifest =
+        bootstrapNativeManifestLibraries(rootManifestPath.text)
+    val nativeLibraries = nativeLibraryManifest.values
+    var nativeLibrariesValid = nativeLibraryManifest.valid &&
+        nativeLibraries.size <= 32
+    var nativeLibraryIndex = 0
+    while (nativeLibrariesValid &&
+        nativeLibraryIndex < nativeLibraries.size) {
+        nativeLibrariesValid = bootstrapNativeLibraryNameValid(
+            nativeLibraries[nativeLibraryIndex]
+        )
+        var previousNativeLibrary = 0
+        while (nativeLibrariesValid &&
+            previousNativeLibrary < nativeLibraryIndex) {
+            nativeLibrariesValid =
+                nativeLibraries[previousNativeLibrary] !=
+                nativeLibraries[nativeLibraryIndex]
+            previousNativeLibrary = previousNativeLibrary + 1
+        }
+        nativeLibraryIndex = nativeLibraryIndex + 1
+    }
     // Platform libraries remain demand-driven. Detect the narrow TLS ABI in
     // the resolved module graph so programs that do not import hosted TLS do
     // not gain either a dependency or dynamic-loader startup work.
@@ -927,7 +1066,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val combinedObjectPath = "$outputPath.combined.o"
     val publishPath = "$outputPath.tmp.${linuxProcessId()}"
     val optimizedWasmPath = "$outputPath.wasm-opt.tmp.${linuxProcessId()}"
-    val manifestPath = Path(sourcePath).parent().child("abla.toml")
+    val manifestPath = rootManifestPath
     val manifest = manifestPath.readText()
     val targetIdentity = "${target.name}:${target.llvmTriple}:${target.objectFormat}:${target.hosted}:${target.libcFree}:${target.entrySymbol}:${target.linkerFlavor}:${target.linkerEmulation}"
     val sourceIdentity = "$source\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact"
@@ -1167,6 +1306,21 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = 142
         failureKind = "reported"
     }
+    if (status == 0 && !nativeLibrariesValid) {
+        linuxPrintStandardError(
+            "error[E_NATIVE_LIBRARY_MANIFEST]: nativeLibraries must be one valid array of at most 32 distinct non-empty linker names using only letters, digits, '+', '-', '.', or '_'\n"
+        )
+        status = 158
+        failureKind = "reported"
+    }
+    if (status == 0 && nativeLibraries.size > 0 && !target.hosted) {
+        val targetName = target.name
+        linuxPrintStandardError(
+            "error[E_BUILD_TARGET_CAPABILITY]: target '$targetName' cannot link manifest nativeLibraries\n"
+        )
+        status = 152
+        failureKind = "reported"
+    }
     if (status == 0 && !target.hosted && !rawTarget &&
         (linkHost || linkLlvm)) {
         linuxPrintStandardError(
@@ -1265,6 +1419,13 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             link.argument("-lssl")
             link.argument("-lcrypto")
         }
+        nativeLibraryIndex = 0
+        while (nativeLibraryIndex < nativeLibraries.size) {
+            val nativeLibrary = nativeLibraries[nativeLibraryIndex]
+            link.argument("-l")
+            link.argument(nativeLibrary)
+            nativeLibraryIndex = nativeLibraryIndex + 1
+        }
         link.argument("-o")
         link.argument(publishPath)
         status = link.run()
@@ -1316,6 +1477,13 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (linkOpenSsl) {
             linkShared.argument("-lssl")
             linkShared.argument("-lcrypto")
+        }
+        nativeLibraryIndex = 0
+        while (nativeLibraryIndex < nativeLibraries.size) {
+            val nativeLibrary = nativeLibraries[nativeLibraryIndex]
+            linkShared.argument("-l")
+            linkShared.argument(nativeLibrary)
+            nativeLibraryIndex = nativeLibraryIndex + 1
         }
         linkShared.argument("-o")
         linkShared.argument(publishPath)
