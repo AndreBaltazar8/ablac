@@ -160,6 +160,20 @@ WebAssembly.instantiate(readFileSync(process.argv[2]), {}).then(({ instance }) =
     }
 });
 NODE
+
+platform_import_module="$output_directory/platform-import.wasm"
+"$compiler" build \
+    "$project_root/tests/cases/wasm-mvc-extension/platform-import-build.ab" \
+    -o "$output_directory/platform-import-driver"
+node --disable-wasm-trap-handler - "$platform_import_module" <<'NODE'
+const fs = require('fs');
+const module = new WebAssembly.Module(fs.readFileSync(process.argv[2]));
+const imports = WebAssembly.Module.imports(module);
+if (imports.length !== 1 || imports[0].module !== 'env' ||
+    imports[0].name !== 'micro_platform_call' || imports[0].kind !== 'function') {
+    throw new Error(`unexpected platform imports: ${JSON.stringify(imports)}`);
+}
+NODE
 [[ -s $adapter ]]
 grep -q 'WebAssembly.instantiate' "$adapter"
 grep -q 'instance.exports.abla_mvc_revision' "$adapter"

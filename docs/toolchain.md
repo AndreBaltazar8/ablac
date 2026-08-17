@@ -41,8 +41,10 @@ must explicitly publish at least one supported foreign adapter through the
 compiler API; internal Abla symbols remain hidden.
 Programmable external targets can additionally request a generic `module`
 artifact. The current WebAssembly linker produces a no-entry module, preserves
-explicit foreign exports, and strips PID-bearing name metadata for byte-level
-reproducibility.
+explicit foreign exports, retains unresolved symbols from explicit foreign
+declarations as ordinary `env` function imports, and strips PID-bearing name
+metadata for byte-level reproducibility. The embedding runtime must validate
+the imported symbol names and signatures before instantiation.
 
 An extension-defined target with linker flavor and emulation `none` may use
 any object triple implemented by the installed LLVM and emit an `object` or
