@@ -50,6 +50,24 @@ lowered graph remains live in one process. The safe next memory step is
 phase-separated or module-granular retained state, not a lower watchdog that
 only hides the retained graph.
 
+### Follow-up saturation search
+
+A further 20-round search kept the same source module and compared partition
+counts from 32 through 128, 16 through 32 workers, LLVM machine-code levels
+O1 through O3, and focused cleanup combinations using DSE, ADCE, correlated
+propagation, reassociation, aggressive instruction combining, loop deletion,
+global optimization, and the complete O2 pipeline. No candidate produced a
+repeatable end-to-end improvement over the selected O1 plus SCCP/GVN pipeline.
+
+The closest results merely moved time between phases. Eighty partitions saved
+about 0.10 seconds of frontend CPU time through code layout but added about
+0.10 seconds to splitting and combining. Correlated propagation saved about
+0.08 seconds in the frontend while adding about 0.07 seconds to the serial
+optimizer. Both are within run-to-run noise, so neither is part of the release
+configuration. O3 and full O2 produced smaller or differently laid-out
+binaries but regressed total build time. Peak frontend memory remained about
+1.73 GiB throughout.
+
 The first release performance gate is a complete compiler build below 10
 seconds on the reference development machine. After that, the target is a
 sub-second warm/incremental build through cached module interfaces, persistent
