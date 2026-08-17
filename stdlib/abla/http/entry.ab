@@ -65,7 +65,11 @@ class HttpRoute(
 
 class HttpRouter(
     val versionHeader: string,
-    val routes: array<HttpRoute>
+    val routes: array<HttpRoute>,
+    val literalRouteBuckets: array<array<int>> = [],
+    val parameterizedRouteIndexes: array<int> = [],
+    val routeFingerprints: array<int> = [],
+    val indexedRouteMarkers: array<int> = []
 )
 
 class HttpVersionedRouter(
@@ -73,8 +77,15 @@ class HttpVersionedRouter(
     val version: string
 )
 
-fun httpRouter(versionHeader: string = "Abla-Version"): HttpRouter =
-    HttpRouter(versionHeader, [])
+fun httpRouter(versionHeader: string = "Abla-Version"): HttpRouter {
+    val literalRouteBuckets: array<array<int>> = []
+    var bucket = 0
+    while (bucket < 64) {
+        literalRouteBuckets.append([])
+        bucket = bucket + 1
+    }
+    HttpRouter(versionHeader, [], literalRouteBuckets, [], [], [])
+}
 
 fun httpAsciiEqualInsensitive(left: string, right: string): bool {
     textAsciiEqualInsensitive(left, right)
@@ -82,47 +93,148 @@ fun httpAsciiEqualInsensitive(left: string, right: string): bool {
 
 fun HttpRequest.header(name: string): string {
     var result = ""
-    var index = 0
-    while (index < this.headers.size) {
-        if (httpAsciiEqualInsensitive(this.headers[index].name, name)) {
-            result = this.headers[index].value
+    var found = false
+    var index = this.headers.size
+    // Search backward and stop at the first match. This preserves the existing
+    // last-duplicate-wins behavior without scanning the rest of the headers.
+    while (!found && index > 0) {
+        index = index - 1
+        val candidate = this.headers[index]
+        val candidateName = candidate.name
+        if (httpAsciiEqualInsensitive(candidateName, name)) {
+            result = candidate.value
+            found = true
         }
-        index = index + 1
     }
     result
 }
 
 fun HttpRequest.parameter(name: string): string {
     var result = ""
-    var index = 0
-    while (index < this.parameterNames.size) {
-        if (this.parameterNames[index] == name) {
+    var found = false
+    var index = this.parameterNames.size
+    // Search from the end so duplicate route names retain their existing
+    // last-value-wins behavior without traversing earlier entries after a hit.
+    while (!found && index > 0) {
+        index = index - 1
+        val candidateName = this.parameterNames[index]
+        val possible = candidateName.size == name.size &&
+            (name.size == 0 || candidateName[0] == name[0])
+        if (possible && candidateName == name) {
             result = this.parameterValues[index]
+            found = true
         }
-        index = index + 1
     }
-    // Route parameters take precedence. Query lookup is intentionally kept
-    // here so generated clients do not need a second request API for simple
-    // scalar RPC arguments.
-    var fieldBegin = 0
-    var cursor = 0
-    while (result == "" && cursor <= this.query.size) {
-        if (cursor == this.query.size || this.query[cursor] == 38) {
-            var equals = -1
-            var fieldCursor = fieldBegin
-            while (fieldCursor < cursor && equals < 0) {
-                if (this.query[fieldCursor] == 61) equals = fieldCursor
-                fieldCursor = fieldCursor + 1
+    var searchBegin = 0
+    while (!found && name.size > 0 && searchBegin < this.query.size) {
+        val candidate = textFindSequence(
+            this.query, name, searchBegin, this.query.size
+        )
+        if (candidate < 0) searchBegin = this.query.size
+        else {
+            val valueBegin = candidate + name.size + 1
+            val boundary = candidate == 0 || this.query[candidate - 1] == 38
+            if (boundary && valueBegin <= this.query.size &&
+                this.query[valueBegin - 1] == 61) {
+                var fieldEnd = textFindByte(
+                    this.query, 38, valueBegin, this.query.size
+                )
+                if (fieldEnd < 0) fieldEnd = this.query.size
+                result = this.query.slice(valueBegin, fieldEnd)
+                found = result != ""
             }
-            if (equals >= fieldBegin &&
-                this.query.slice(fieldBegin, equals) == name) {
-                result = this.query.slice(equals + 1, cursor)
-            }
-            fieldBegin = cursor + 1
+            searchBegin = candidate + 1
         }
-        cursor = cursor + 1
+    }
+    var fieldBegin = 0
+    while (!found && name.size == 0 && fieldBegin <= this.query.size) {
+        var fieldEnd = textFindByte(this.query, 38, fieldBegin, this.query.size)
+        if (fieldEnd < 0) fieldEnd = this.query.size
+        val equals = textFindByte(this.query, 61, fieldBegin, fieldEnd)
+        if (equals == fieldBegin) {
+            result = this.query.slice(equals + 1, fieldEnd)
+            found = result != ""
+        }
+        fieldBegin = fieldEnd + 1
     }
     result
+}
+
+// Route-only lookup for applications that do not want query fallback.
+fun HttpRequest.routeParameter(name: string): string {
+    var result = ""
+    var found = false
+    var index = this.parameterNames.size
+    while (!found && index > 0) {
+        index = index - 1
+        val candidateName = this.parameterNames[index]
+        val possible = candidateName.size == name.size &&
+            (name.size == 0 || candidateName[0] == name[0])
+        if (possible && candidateName == name) {
+            result = this.parameterValues[index]
+            found = true
+        }
+    }
+    result
+}
+
+// Query-only lookup for applications that do not need the combined
+// route-precedence convenience of parameter().
+fun HttpRequest.queryParameter(name: string): string {
+    var result = ""
+    var found = false
+    var searchBegin = 0
+    while (!found && name.size > 0 && searchBegin < this.query.size) {
+        val candidate = textFindSequence(
+            this.query, name, searchBegin, this.query.size
+        )
+        if (candidate < 0) searchBegin = this.query.size
+        else {
+            val valueBegin = candidate + name.size + 1
+            val boundary = candidate == 0 || this.query[candidate - 1] == 38
+            if (boundary && valueBegin <= this.query.size &&
+                this.query[valueBegin - 1] == 61) {
+                var fieldEnd = textFindByte(
+                    this.query, 38, valueBegin, this.query.size
+                )
+                if (fieldEnd < 0) fieldEnd = this.query.size
+                result = this.query.slice(valueBegin, fieldEnd)
+                found = result != ""
+            }
+            searchBegin = candidate + 1
+        }
+    }
+    var fieldBegin = 0
+    while (!found && name.size == 0 && fieldBegin <= this.query.size) {
+        var fieldEnd = textFindByte(this.query, 38, fieldBegin, this.query.size)
+        if (fieldEnd < 0) fieldEnd = this.query.size
+        val equals = textFindByte(this.query, 61, fieldBegin, fieldEnd)
+        if (equals == fieldBegin) {
+            result = this.query.slice(equals + 1, fieldEnd)
+            found = result != ""
+        }
+        fieldBegin = fieldEnd + 1
+    }
+    result
+}
+
+fun httpCoreRangeEqual(
+    left: string,
+    leftBegin: int,
+    leftEnd: int,
+    right: string,
+    rightBegin: int,
+    rightEnd: int
+): bool {
+    val leftLength = leftEnd - leftBegin
+    val rightLength = rightEnd - rightBegin
+    var equal = leftLength == rightLength
+    var index = 0
+    while (equal && index < leftLength) {
+        equal = left[leftBegin + index] == right[rightBegin + index]
+        index = index + 1
+    }
+    equal
 }
 
 fun httpRequest(
@@ -645,20 +757,37 @@ fun httpPathParts(path: string): array<string> {
 fun httpMatchPath(pattern: string, path: string): HttpPathMatch {
     if (pattern == path) HttpPathMatch(true, [], [])
     else {
-        val expected = httpPathParts(pattern)
-        val actual = httpPathParts(path)
         val names: array<string> = []
         val values: array<string> = []
-        var matched = expected.size == actual.size
-        var index = 0
-        while (index < expected.size && matched) {
-            if (expected[index].size > 0 && expected[index][0] == 58) {
-                names.append(expected[index].slice(1, expected[index].size))
-                values.append(actual[index])
-            } else if (expected[index] != actual[index]) {
-                matched = false
+        var patternBegin = 0
+        var pathBegin = 0
+        if (pattern.size > 0 && pattern[0] == 47) patternBegin = 1
+        if (path.size > 0 && path[0] == 47) pathBegin = 1
+        var matched = true
+        var more = true
+        while (matched && more) {
+            var patternEnd = textFindByte(
+                pattern, 47, patternBegin, pattern.size
+            )
+            var pathEnd = textFindByte(path, 47, pathBegin, path.size)
+            if (patternEnd < 0) patternEnd = pattern.size
+            if (pathEnd < 0) pathEnd = path.size
+            if (patternBegin < patternEnd &&
+                pattern[patternBegin] == 58) {
+                names.append(pattern.slice(patternBegin + 1, patternEnd))
+                values.append(path.slice(pathBegin, pathEnd))
+            } else {
+                matched = httpCoreRangeEqual(
+                    pattern, patternBegin, patternEnd,
+                    path, pathBegin, pathEnd
+                )
             }
-            index = index + 1
+            val patternDone = patternEnd == pattern.size
+            val pathDone = pathEnd == path.size
+            if (matched && patternDone != pathDone) matched = false
+            more = !patternDone && !pathDone
+            patternBegin = patternEnd + 1
+            pathBegin = pathEnd + 1
         }
         HttpPathMatch(matched, names, values)
     }
@@ -689,13 +818,74 @@ fun HttpRouter.get(
     handler: (HttpRequest) -> HttpResponse
 ): HttpRouter = this.route("GET", pattern, handler)
 
+fun httpRoutePatternParameterized(pattern: string): bool {
+    var parameterized = pattern.size > 0 && pattern[0] == 58
+    var index = 1
+    while (!parameterized && index < pattern.size) {
+        parameterized = pattern[index] == 58 && pattern[index - 1] == 47
+        index = index + 1
+    }
+    parameterized
+}
+
+// A collision only admits a route to the full matcher; it cannot change the
+// selected route. Keep the fingerprint bounded so checked integer arithmetic
+// remains valid for arbitrarily long paths.
+fun httpRouteFingerprint(path: string): int {
+    var fingerprint = path.size & 2147483647
+    var index = 0
+    while (index < path.size) {
+        fingerprint = ((fingerprint << 5) ^ path[index]) & 2147483647
+        index = index + 1
+    }
+    fingerprint
+}
+
+fun httpRoute(
+    method: string,
+    pattern: string,
+    version: string,
+    handler: (HttpRequest) -> HttpResponse
+): HttpRoute = HttpRoute(
+    method,
+    pattern,
+    version,
+    handler
+)
+
+fun HttpRouter.addRoute(
+    method: string,
+    pattern: string,
+    version: string,
+    handler: (HttpRequest) -> HttpResponse
+): HttpRouter {
+    val route = httpRoute(method, pattern, version, handler)
+    val parameterized = httpRoutePatternParameterized(pattern)
+    val fingerprint = httpRouteFingerprint(pattern)
+    val routeIndex = this.routes.size
+    this.routes.append(route)
+    this.routeFingerprints.append(fingerprint)
+    // Routers constructed through the public two-argument constructor predate
+    // the index storage. Keep their registration path valid and let dispatch
+    // use its linear compatibility fallback.
+    if (this.literalRouteBuckets.size == 64) {
+        if (parameterized) {
+            this.parameterizedRouteIndexes.append(routeIndex)
+        } else {
+            val bucket = fingerprint & 63
+            this.literalRouteBuckets[bucket].append(routeIndex)
+        }
+    }
+    this.indexedRouteMarkers.append(routeIndex)
+    this
+}
+
 fun HttpRouter.route(
     method: string,
     pattern: string,
     handler: (HttpRequest) -> HttpResponse
 ): HttpRouter {
-    this.routes.append(HttpRoute(method, pattern, "", handler))
-    this
+    this.addRoute(method, pattern, "", handler)
 }
 
 fun HttpRouter.post(
@@ -735,56 +925,98 @@ fun HttpVersionedRouter.get(
     pattern: string,
     handler: (HttpRequest) -> HttpResponse
 ): HttpRouter {
-    this.router.routes.append(HttpRoute("GET", pattern, this.version, handler))
-    this.router
+    this.router.addRoute("GET", pattern, this.version, handler)
 }
 
 fun HttpVersionedRouter.post(
     pattern: string,
     handler: (HttpRequest) -> HttpResponse
 ): HttpRouter {
-    this.router.routes.append(HttpRoute("POST", pattern, this.version, handler))
-    this.router
+    this.router.addRoute("POST", pattern, this.version, handler)
 }
 
 fun HttpVersionedRouter.head(
     pattern: string,
     handler: (HttpRequest) -> HttpResponse
 ): HttpRouter {
-    this.router.routes.append(HttpRoute("HEAD", pattern, this.version, handler))
-    this.router
+    this.router.addRoute("HEAD", pattern, this.version, handler)
 }
 
 fun HttpRouter.dispatch(request: HttpRequest): HttpResponse {
     val requestedVersion = request.header(this.versionHeader)
+    val indexed = this.routes.size > 8 &&
+        this.literalRouteBuckets.size == 64 &&
+        this.routeFingerprints.size == this.routes.size &&
+        this.indexedRouteMarkers.size == this.routes.size
+    val requestFingerprint = if (indexed) {
+        httpRouteFingerprint(request.path)
+    } else 0
+    val literalBucket = requestFingerprint & 63
+    val literalCandidateCount = if (indexed) {
+        this.literalRouteBuckets[literalBucket].size
+    } else 0
     var selected = -1
     var selectedVersion = ""
     var selectedMatch = HttpPathMatch(false, [], [])
     var selectedExactMethod = false
-    var index = 0
-    while (index < this.routes.size) {
+    var routePosition = 0
+    var literalPosition = 0
+    var parameterizedPosition = 0
+    var more = if (indexed) {
+        literalCandidateCount > 0 || this.parameterizedRouteIndexes.size > 0
+    } else this.routes.size > 0
+    while (more) {
+        var index = routePosition
+        var parameterizedCandidate = false
+        if (indexed) {
+            val literalIndex = if (literalPosition < literalCandidateCount) {
+                this.literalRouteBuckets[literalBucket][literalPosition]
+            } else this.routes.size
+            val parameterizedIndex = if (
+                parameterizedPosition < this.parameterizedRouteIndexes.size
+            ) {
+                this.parameterizedRouteIndexes[parameterizedPosition]
+            } else this.routes.size
+            if (literalIndex < parameterizedIndex) {
+                index = literalIndex
+                literalPosition = literalPosition + 1
+            } else {
+                index = parameterizedIndex
+                parameterizedPosition = parameterizedPosition + 1
+                parameterizedCandidate = true
+            }
+        } else {
+            routePosition = routePosition + 1
+        }
         val route = this.routes[index]
-        val match = httpMatchPath(route.pattern, request.path)
         val exactMethod = route.method == request.method
         val headFallback = request.method == "HEAD" && route.method == "GET"
-        var eligible = (exactMethod || headFallback) && match.matched
-        if (eligible && requestedVersion != "" && route.version != "" &&
-            httpVersionCompare(route.version, requestedVersion) > 0) {
-            eligible = false
+        val pathCandidate = !indexed || parameterizedCandidate ||
+            this.routeFingerprints[index] == requestFingerprint
+        if ((exactMethod || headFallback) && pathCandidate) {
+            val match = httpMatchPath(route.pattern, request.path)
+            var eligible = match.matched
+            if (eligible && requestedVersion != "" && route.version != "" &&
+                httpVersionCompare(route.version, requestedVersion) > 0) {
+                eligible = false
+            }
+            val versionComparison = httpVersionCompare(
+                route.version,
+                selectedVersion
+            )
+            if (eligible && (selected < 0 || versionComparison > 0 ||
+                (versionComparison == 0 && exactMethod &&
+                    !selectedExactMethod))) {
+                selected = index
+                selectedVersion = route.version
+                selectedMatch = match
+                selectedExactMethod = exactMethod
+            }
         }
-        val versionComparison = httpVersionCompare(
-            route.version,
-            selectedVersion
-        )
-        if (eligible && (selected < 0 || versionComparison > 0 ||
-            (versionComparison == 0 && exactMethod &&
-                !selectedExactMethod))) {
-            selected = index
-            selectedVersion = route.version
-            selectedMatch = match
-            selectedExactMethod = exactMethod
-        }
-        index = index + 1
+        more = if (indexed) {
+            literalPosition < literalCandidateCount ||
+                parameterizedPosition < this.parameterizedRouteIndexes.size
+        } else routePosition < this.routes.size
     }
     var response = httpText("not found", 404)
     if (selected >= 0) {
