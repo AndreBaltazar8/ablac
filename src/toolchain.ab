@@ -274,7 +274,9 @@ class BootstrapPartitionEmission(
 )
 
 fun bootstrapNativeParallelism(): int {
-    val detected = linuxCommand("nproc").captureText()
+    val configured = linuxEnvironment("ABLA_NATIVE_JOBS")
+    var detected = if (configured.found) configured.value else ""
+    if (detected == "") detected = linuxCommand("nproc").captureText()
     var jobs = 0
     var index = 0
     while (index < detected.size && detected[index] >= 48 &&
@@ -287,12 +289,8 @@ fun bootstrapNativeParallelism(): int {
     jobs
 }
 
-// Explicit @inline functions must be folded before llvm-split/llvm-extract
-// separates them from their callers. Keep this deliberately narrower than a
-// whole-module O1 pipeline: LLVM's heuristic inliner duplicates large Abla
-// helpers across thousands of compiler call sites. The function-local cleanup
-// immediately collapses the scalar/default-argument scaffolding introduced by
-// the forced inline, leaving ordinary non-annotated functions out of line.
+// Cached development partitions only need explicit inline expansion and local
+// cleanup. Keeping this preparation light preserves low-latency --fast misses.
 fun bootstrapPreparePartitionLlvm(
     llvmPath: string,
     preparedPath: string
@@ -309,6 +307,25 @@ fun bootstrapPreparePartitionLlvm(
     prepare.run()
 }
 
+// Release-parallel emission needs interprocedural optimization before
+// llvm-split separates callees from callers. Splitting first leaves recursive
+// semantic and lowering paths behind cross-partition runtime calls and made a
+// complete frontend emission more than an order of magnitude slower. O1 is the
+// measured balance: whole-program propagation first, parallel O2 codegen next.
+fun bootstrapPrepareParallelLlvm(
+    llvmPath: string,
+    preparedPath: string
+): int {
+    val prepare = linuxCommand("opt")
+    prepare.argument("--threads=1")
+    prepare.argument("-passes=default<O1>,globaldce")
+    prepare.argument("-S")
+    prepare.argument(llvmPath)
+    prepare.argument("-o")
+    prepare.argument(preparedPath)
+    prepare.run()
+}
+
 fun bootstrapEmitParallelObject(
     llvmPath: string,
     objectPath: string
@@ -317,7 +334,7 @@ fun bootstrapEmitParallelObject(
     val partCount = jobs * 2
     val prefix = "$objectPath.parallel."
     val preparedPath = "$objectPath.prepartition.ll"
-    var status = bootstrapPreparePartitionLlvm(llvmPath, preparedPath)
+    var status = bootstrapPrepareParallelLlvm(llvmPath, preparedPath)
     val split = linuxCommand("llvm-split")
     split.argument("-j")
     split.argument("$partCount")

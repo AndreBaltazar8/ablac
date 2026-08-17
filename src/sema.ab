@@ -2991,12 +2991,95 @@ fun bootstrapBuildRegionCallSummary(
     summary
 }
 
+class BootstrapFunctionDeclarationIndex(
+    val names: array<string>,
+    val declarationIndices: array<int>,
+    val slots: array<int>
+) {
+    fun find(name: string): int {
+        var result = -1
+        if (this.slots.size > 0) {
+            var slot = bootstrapFunctionDeclarationHash(name)
+            slot = slot - slot / this.slots.size * this.slots.size
+            var probes = 0
+            while (result < 0 && probes < this.slots.size &&
+                   this.slots[slot] >= 0) {
+                val entry = this.slots[slot]
+                if (this.names[entry] == name) {
+                    result = this.declarationIndices[entry]
+                } else {
+                    slot = slot + 1
+                    if (slot == this.slots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapFunctionDeclarationHash(name: string): int {
+    var hash = 0
+    var index = 0
+    while (index < name.size) {
+        hash = hash * 131 + name[index]
+        hash = hash - hash / 2147483647 * 2147483647
+        index = index + 1
+    }
+    hash
+}
+
+fun bootstrapFunctionDeclarationIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapFunctionDeclarationIndex {
+    val names: array<string> = []
+    val declarationIndices: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.extensionOwner == "" &&
+            (candidate.kind == "fun" || candidate.kind == "extern" ||
+             candidate.kind == "compile.fun")) {
+            names.append(candidate.name)
+            declarationIndices.append(declaration)
+        }
+        declaration = declaration + 1
+    }
+    var capacity = 8
+    while (capacity < names.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    var entry = 0
+    while (entry < names.size) {
+        slot = bootstrapFunctionDeclarationHash(names[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0 || names[existing] == names[entry]) {
+                slots[slot] = entry
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    BootstrapFunctionDeclarationIndex(names, declarationIndices, slots)
+}
+
 class BootstrapAnalyzer(
     val symbols: array<BootstrapSymbol>,
     var errors: int,
     var extensionErrors: int,
     var locals: array<BootstrapSymbol>,
     val declarations: array<BootstrapDeclaration>,
+    val functionDeclarations: BootstrapFunctionDeclarationIndex,
     val affineTypes: array<string>,
     val mutableReceivers: BootstrapMutableReceiverSummary,
     val regionCalls: BootstrapRegionCallSummary,
@@ -3905,32 +3988,22 @@ class BootstrapAnalyzer(
 
     fun functionParameterCount(name: string): int {
         var result = -1
-        var index = 0
-        while (index < this.declarations.size) {
-            val declaration = this.declarations[index]
-            if ((declaration.kind == "fun" ||
-                 declaration.kind == "extern" ||
-                 declaration.kind == "compile.fun") &&
-                declaration.extensionOwner == "" &&
-                declaration.name == name) {
-                result = declaration.parameters.size
-            }
-            index = index + 1
+        val index = this.functionDeclarations.find(name)
+        if (index >= 0) {
+            result = this.declarations[index].parameters.size
         }
         result
     }
 
     fun functionRequiresTrust(name: string): bool {
         var requiresTrust = false
-        var index = 0
-        while (index < this.declarations.size) {
+        val index = this.functionDeclarations.find(name)
+        if (index >= 0) {
             val declaration = this.declarations[index]
-            if (declaration.extensionOwner == "" &&
-                declaration.name == name && declaration.kind == "extern" &&
+            if (declaration.kind == "extern" &&
                 declaration.isTrusted) {
                 requiresTrust = true
             }
-            index = index + 1
         }
         requiresTrust
     }
@@ -4365,64 +4438,45 @@ class BootstrapAnalyzer(
 
     fun functionRequiredParameterCount(name: string): int {
         var result = -1
-        var index = 0
-        while (index < this.declarations.size) {
+        val index = this.functionDeclarations.find(name)
+        if (index >= 0) {
             val declaration = this.declarations[index]
-            if ((declaration.kind == "fun" ||
-                 declaration.kind == "extern" ||
-                 declaration.kind == "compile.fun") &&
-                declaration.extensionOwner == "" &&
-                declaration.name == name) {
-                result = 0
-                var parameter = 0
-                while (parameter < declaration.parameters.size) {
-                    if (parameter >= declaration.parameterDefaults.size ||
-                        declaration.parameterDefaults[parameter].kind ==
-                            "missing") {
-                        result = result + 1
-                    }
-                    parameter = parameter + 1
+            result = 0
+            var parameter = 0
+            while (parameter < declaration.parameters.size) {
+                if (parameter >= declaration.parameterDefaults.size ||
+                    declaration.parameterDefaults[parameter].kind ==
+                        "missing") {
+                    result = result + 1
                 }
+                parameter = parameter + 1
             }
-            index = index + 1
         }
         result
     }
 
     fun functionParameterType(name: string, parameter: int): string {
         var result = "unknown"
-        var index = 0
-        while (index < this.declarations.size) {
+        val index = this.functionDeclarations.find(name)
+        if (index >= 0) {
             val declaration = this.declarations[index]
-            if ((declaration.kind == "fun" ||
-                 declaration.kind == "extern" ||
-                 declaration.kind == "compile.fun") &&
-                declaration.extensionOwner == "" &&
-                declaration.name == name &&
-                parameter < declaration.parameterTypes.size) {
+            if (parameter < declaration.parameterTypes.size) {
                 result = bootstrapNormalizeType(
                     declaration.parameterTypes[parameter]
                 )
             }
-            index = index + 1
         }
         result
     }
 
     fun functionParameterKind(name: string, parameter: int): string {
         var result = "parameter"
-        var index = 0
-        while (index < this.declarations.size) {
+        val index = this.functionDeclarations.find(name)
+        if (index >= 0) {
             val declaration = this.declarations[index]
-            if ((declaration.kind == "fun" ||
-                 declaration.kind == "extern" ||
-                 declaration.kind == "compile.fun") &&
-                declaration.extensionOwner == "" &&
-                declaration.name == name &&
-                parameter < declaration.parameterKinds.size) {
+            if (parameter < declaration.parameterKinds.size) {
                 result = declaration.parameterKinds[parameter]
             }
-            index = index + 1
         }
         result
     }
@@ -4457,16 +4511,7 @@ class BootstrapAnalyzer(
     }
 
     fun topLevelFunctionHandle(name: string): int {
-        var handle = -1
-        var declaration = 0
-        while (declaration < this.declarations.size) {
-            val candidate = this.declarations[declaration]
-            if ((candidate.kind == "fun" || candidate.kind == "extern" ||
-                 candidate.kind == "compile.fun") &&
-                candidate.name == name) handle = declaration
-            declaration = declaration + 1
-        }
-        handle
+        this.functionDeclarations.find(name)
     }
 
     fun inherentMethodHandle(owner: int, method: int): int {
@@ -7514,12 +7559,16 @@ fun bootstrapAnalyzeRequestedSpans(
         compileEffectRequests,
         compileEffectAuthorizations
     )
+    val functionDeclarations = bootstrapFunctionDeclarationIndex(
+        parsed.declarations
+    )
     BootstrapAnalyzer(
         symbols,
         0,
         0,
         locals,
         parsed.declarations,
+        functionDeclarations,
         affineTypes,
         mutableReceivers,
         regionCalls,

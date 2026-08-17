@@ -4,14 +4,48 @@ Correctness and full self-hosted conformance come first. Once the pure-Abla
 compiler accepts the complete language surface, optimization proceeds against
 reproducible measurements rather than ad-hoc timings.
 
-Run the current end-to-end baseline with:
+Run the current end-to-end rebuild benchmark with:
 
 ```sh
-make benchmark-selfhost
+make benchmark
 ```
 
-The benchmark reports frontend/LLVM emission, object/link, and combined
-source-to-executable intervals separately.
+The benchmark reports complete source-to-executable time and output size.
+For phase diagnosis, measure `ablac --emit-llvm` separately from the native
+build; the former covers parsing, semantic analysis, lowering, and LLVM text
+emission, while the latter additionally includes LLVM optimization, parallel
+object emission, and linking.
+
+## Pure-Abla runtime rebuild profile (2026-08-17)
+
+Replacing the C runtime exposed a release-builder regression rather than an
+intrinsic cost of the Abla frontend. The builder split the 34.36 MB compiler
+module before ordinary interprocedural optimization. That reduced backend
+latency, but the resulting compiler repeatedly crossed partition boundaries
+for hot semantic/runtime operations. A clean full LLVM emission took 309.5
+seconds and 1,727,684 KiB peak RSS.
+
+The release path now runs whole-module O1 before splitting into twice the
+available worker count, then emits O2 machine code concurrently. The worker
+count defaults to `nproc`, is capped at 32, and can be bounded explicitly with
+`ABLA_NATIVE_JOBS`. A top-level function declaration hash index also replaces
+repeated full declaration scans for parameter metadata in semantic analysis.
+On the same 32-thread i9-13900K host, the selected profile measured:
+
+| Phase | Before | After |
+|---|---:|---:|
+| Compiler frontend and LLVM text emission | 309.5 s | 19.5 s |
+| Optimized parallel backend | n/a | 42.6 s |
+| Steady-state cold source-to-executable rebuild | over 5 min | 62.8 s |
+| Frontend peak RSS | 1,727,684 KiB | 1,727,160 KiB |
+| Backend peak RSS (largest process) | n/a | 595,804 KiB |
+
+The measured reduction is at least 4.9x end to end and 15.9x for frontend
+emission.
+Peak frontend memory is not materially reduced: the full parsed, typed, and
+lowered graph remains live in one process. The safe next memory step is
+phase-separated or module-granular retained state, not a lower watchdog that
+only hides the retained graph.
 
 The first release performance gate is a complete compiler build below 10
 seconds on the reference development machine. After that, the target is a
@@ -24,24 +58,10 @@ behavioral parity, and the byte-identical `ablac2`/`ablac3`
 fixed point unless an explicitly versioned deterministic-output change updates
 both stages together.
 
-The development compiler build is incremental. A successful `make ablac`
-records an ignored content fingerprint covering compiler, runtime, standard
-library, shell and launcher inputs. Repeating it with unchanged inputs is
-immediate; changing compiler inputs performs one fast self-build from the
-promoted compiler. Use `make ablac-force` for the complete bootstrap fixed
-point and conformance proof.
-
-The canonical O2 self-host release builder also has a content-addressed warm
-path. It always emits the compiler LLVM module, then fingerprints that exact
-module together with its Abla runtime sources, host, LLVM/Clang identity, and
-release flags. An identical fingerprint reuses the previously
-optimized executable instead of repeating whole-program O2 and LTO. Set
-`ABLA_RELEASE_SELFHOST_CACHE=0` for a deliberately cold backend measurement;
-`make clean` removes the ignored cache. The pure self-rebuild gate still emits
-both generations and compares their LLVM modules byte-for-byte.
-The separated object and link processes each retain a bounded 300-second
-default through `ABLA_RELEASE_SELFHOST_BUILD_SECONDS`; this is independent of
-the ordinary compiler watchdog and remains paired with the 4 GiB release cap.
+`make ablac` remains timestamp-incremental. A changed compiler graph performs
+an uncached optimized rebuild; `make self-rebuild` then compares consecutive
+LLVM generations byte-for-byte and executes a native child. The build remains
+paired with the four-GiB address-space and bounded-time release watchdogs.
 
 The final native conformance programs remain uncached O2 builds, but independent
 fixtures run concurrently under a memory-aware job cap. On the reference
