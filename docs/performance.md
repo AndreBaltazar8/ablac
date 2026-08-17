@@ -25,22 +25,25 @@ latency, but the resulting compiler repeatedly crossed partition boundaries
 for hot semantic/runtime operations. A clean full LLVM emission took 309.5
 seconds and 1,727,684 KiB peak RSS.
 
-The release path now runs whole-module O1 before splitting into twice the
-available worker count, then emits O2 machine code concurrently. The worker
-count defaults to `nproc`, is capped at 32, and can be bounded explicitly with
-`ABLA_NATIVE_JOBS`. A top-level function declaration hash index also replaces
-repeated full declaration scans for parameter metadata in semantic analysis.
-On the same 32-thread i9-13900K host, the selected profile measured:
+The release path now runs whole-module O1 plus a focused SCCP/GVN cleanup
+before splitting into twice the available worker count, then emits O2 machine
+code concurrently. The worker count defaults to `nproc`, is capped at 32, and
+can be bounded explicitly with `ABLA_NATIVE_JOBS`. A top-level function
+declaration hash index also replaces repeated full declaration scans for
+parameter metadata in semantic analysis. On the same 32-thread i9-13900K host,
+the selected follow-up profile measured a 43.95-second backend and a
+17.47-second generated-compiler frontend. This is statistically tied with the
+61.34-second lowest-total candidate while retaining its faster frontend.
 
 | Phase | Before | After |
 |---|---:|---:|
-| Compiler frontend and LLVM text emission | 309.5 s | 19.5 s |
-| Optimized parallel backend | n/a | 42.6 s |
-| Steady-state cold source-to-executable rebuild | over 5 min | 62.8 s |
-| Frontend peak RSS | 1,727,684 KiB | 1,727,160 KiB |
-| Backend peak RSS (largest process) | n/a | 595,804 KiB |
+| Compiler frontend and LLVM text emission | 309.5 s | 17.5 s |
+| Optimized parallel backend | n/a | 44.0 s |
+| Steady-state cold source-to-executable rebuild | over 5 min | 61.4 s |
+| Frontend peak RSS | 1,727,684 KiB | 1,727,108 KiB |
+| Backend peak RSS (largest process) | n/a | 621,860 KiB |
 
-The measured reduction is at least 4.9x end to end and 15.9x for frontend
+The measured reduction is at least 4.9x end to end and 17.7x for frontend
 emission.
 Peak frontend memory is not materially reduced: the full parsed, typed, and
 lowered graph remains live in one process. The safe next memory step is
