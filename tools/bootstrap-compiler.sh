@@ -8,9 +8,9 @@ platform=$(uname -s)
 machine=$(uname -m)
 case "$platform/$machine" in
     Linux/x86_64)
-        version=v0.2.2
+        version=v0.2.3
         artifact=ablac-x86_64-linux
-        platform_sha256=19496b965c519682e4d278a50f0f9bad59bdb613903e288ac977f0bda4f9c6a2
+        platform_sha256=815cfcb6b496b62aed88c606b9d4faea7dbbdb5caaf50d7bcf4e47b0e31861d0
         ;;
     Darwin/x86_64)
         artifact=ablac-x86_64-macos
