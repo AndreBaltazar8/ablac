@@ -135,7 +135,6 @@ No C++ compiler implementation or generated-C bootstrap is involved.
 build/ablac build program.ab -o build/program
 build/ablac build program.ab -o build/program --fast
 build/ablac build program.ab --target arm64-macos -o build/program # Apple Silicon
-build/ablac build program.ab --target x86_64-linux-raw -o build/program.raw # Linux host
 build/ablac run program.ab
 build/ablac repl
 build/ablac serve program.ab
@@ -154,10 +153,9 @@ use Git or return generated source files directly. See [package
 imports](docs/packages.md) for the `ImportSource` protocol, custom providers,
 and vendoring.
 
-The raw x86-64 Linux target emits a static executable with its own startup,
-allocator, and system-call boundary, without a C runtime, libc, ELF interpreter,
-or dynamic dependency. Hosted LLVM remains available for development, JIT
-execution, and C interoperability.
+Hosted LLVM emits native executables, libraries, and Wasm modules. The former
+raw x86-64 Linux target was retired with its C/assembly startup; a future
+freestanding target must provide startup and allocation from Abla.
 
 Generated files are not committed. Build products and compiler caches stay
 under `build/`.

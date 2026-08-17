@@ -3,7 +3,6 @@ set -euo pipefail
 
 compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-c_compiler=${ABLA_C_DIFFERENTIAL_COMPILER:-$project_root/build/bootstrap/ablac-llvm}
 output_directory="$project_root/build/callable-families"
 source_file="$project_root/tests/cases/modules/callable-families.ab"
 mkdir -p "$output_directory"
@@ -17,22 +16,6 @@ status=$?
 set -e
 if [[ $status -ne 42 ]]; then
     echo "callable families: expected 42, got $status" >&2
-    exit 1
-fi
-
-"$c_compiler" "$source_file" > "$output_directory/program.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/program.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/program-c"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/program-c"
-c_status=$?
-set -e
-if [[ $c_status -ne 42 ]]; then
-    echo "callable families: generated C expected 42, got $c_status" >&2
     exit 1
 fi
 
@@ -68,4 +51,4 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     index=$((index + 1))
 done
 
-echo 'callable families: Fn/FnMut/FnOnce inference, capture, staging, LLVM/C passed'
+echo 'callable families: Fn/FnMut/FnOnce inference, capture, staging, and LLVM passed'

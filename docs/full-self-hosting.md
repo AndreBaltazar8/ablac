@@ -13,7 +13,7 @@ These properties are distinct:
 | One Abla compiler rebuilds the current compiler | complete |
 | Rebuilt compiler reaches byte-identical LLVM IR | complete |
 | Clean checkout needs no alternate compiler implementation | complete |
-| Raw user programs avoid libc | complete for `x86_64-linux-raw` |
+| Freestanding user programs avoid libc | open; old adapter target removed |
 | Compiler executable avoids libLLVM and libc | open |
 | Builds avoid external object, assembler, and linker tools | open |
 
@@ -28,7 +28,7 @@ That backend must eventually provide:
   simple deterministic register allocator;
 - symbols, relocations, sections, and whole-program ELF emission;
 - `_start`, argument/environment decoding, syscalls, allocation, and panic
-  support emitted without compiling runtime C or assembly;
+  support emitted from Abla or compiler intrinsics;
 - compiler filesystem, process, cache, diagnostic, and package I/O through
   typed Abla system modules;
 - `build`, `run`, `repl`, and `serve` behavior without LLVM being available.

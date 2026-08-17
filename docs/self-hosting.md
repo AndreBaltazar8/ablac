@@ -35,15 +35,13 @@ through the public compiler behavior.
 Application builds also compile the portable Abla algorithms in
 `stdlib/abla/runtime/self/entry.ab` into the same LLVM unit as user code. LLVM
 can therefore inline and remove unused text/byte algorithms during LTO. This
-file intentionally does not reimplement arithmetic, comparisons, or bit
-operations: statically typed scalars lower directly to LLVM instructions. The
-small C value-runtime versions are compatibility boundaries for values that
-remain boxed or dynamic; dead ones are removed by LTO and section garbage
-collection. Allocation, tracing, platform startup, and the C-compatible value
-ABI remain the non-circular substrate described below.
+file intentionally does not reimplement arithmetic or bit operations:
+statically typed scalars lower directly to LLVM instructions. Dynamic value
+operations remain Abla functions over compiler-provided value-layout
+intrinsics; dead runtime functions are removed by LTO and section garbage
+collection.
 
 This does not mean the hosted compiler is freestanding. The current production
 backend embeds libLLVM, and native linking uses the pinned Clang/LLD toolchain.
-The `x86_64-linux-raw` output target is already libc-free, while removing LLVM,
-the external linker, hosted libc, and startup adapters from the compiler itself
+Removing LLVM, the external linker, and hosted libc from the compiler itself
 remains follow-on work in [full-self-hosting.md](full-self-hosting.md).

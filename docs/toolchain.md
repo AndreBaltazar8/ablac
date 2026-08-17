@@ -50,9 +50,9 @@ any object triple implemented by the installed LLVM and emit an `object` or
 Executables, shared libraries, and modules require an explicit supported
 runtime/linker contract; a target descriptor cannot silently imply a host ABI,
 startup sequence, sysroot, or platform linker.
-The built-in raw target remains specifically x86-64 Linux and is advertised
-only on hosts with its assembler/linker contract; it is not treated as a
-generic consequence of LLVM supporting the architecture.
+There is currently no built-in freestanding executable target. Defining an
+LLVM object triple does not silently imply a host ABI, startup sequence,
+allocator, sysroot, or executable-link contract.
 
 Every successful artifact publishes `<output>.abi.json` through the compiler's
 staged-output transaction after linking. The versioned manifest is derived

@@ -135,9 +135,9 @@ fun bootstrapLlvmNeedsCollector(program: BootstrapIrProgram): bool {
                program.functions[function].instructions.size) {
             val candidate =
                 program.functions[function].instructions[instruction]
-            if (candidate.opcode == "extern.intrinsic" &&
-                (candidate.text == "ablaRuntimeMemoryCollect" ||
-                 candidate.text == "ablaRuntimeMemorySetLimit")) {
+            if (candidate.opcode == "call" &&
+                (candidate.text == "runtimeMemoryCollect" ||
+                 candidate.text == "runtimeMemorySetLimit")) {
                 needed = true
             }
             if (candidate.opcode == "call") {
@@ -336,8 +336,8 @@ fun bootstrapLlvmInstructionMayCollect(
     mayCollect: array<bool>
 ): bool {
     var result = false
-    if (instruction.opcode == "extern.intrinsic" &&
-        instruction.text == "ablaRuntimeMemoryCollect") result = true
+    if (instruction.opcode == "call" &&
+        instruction.text == "runtimeMemoryCollect") result = true
     if (instruction.opcode == "call.indirect" ||
         instruction.opcode == "call.indirect.once") result = true
     if (instruction.opcode == "generator.create" ||
@@ -384,7 +384,7 @@ fun bootstrapLlvmInstructionMayAllocate(
         instruction.opcode == "string.get" ||
         instruction.opcode == "extern.c" ||
         instruction.opcode == "extern.host") result = true
-    if (instruction.opcode == "extern.intrinsic" &&
+    if (instruction.opcode == "call" &&
         instruction.text == "ablaUnsafeAllocate") result = true
     result
 }
@@ -398,12 +398,13 @@ fun bootstrapLlvmCollectingFunctions(
     val result: array<bool> = []
     var function = 0
     while (function < program.functions.size) {
-        var direct = false
+        var direct = program.functions[function].name ==
+            "runtimeMemoryCollect" ||
+            program.functions[function].name ==
+                "__ablaRuntimePlatformMemoryCollect"
         var instruction = 0
         while (instruction < program.functions[function].instructions.size) {
             val candidate = program.functions[function].instructions[instruction]
-            if (candidate.opcode == "extern.intrinsic" &&
-                candidate.text == "ablaRuntimeMemoryCollect") direct = true
             if (candidate.opcode == "generator.create" ||
                 candidate.opcode == "generator.next" ||
                 candidate.opcode == "generator.yield" ||
@@ -556,6 +557,47 @@ class BootstrapLlvmScalarPlan(
     val boxedValues: array<bool>
 )
 
+fun bootstrapLlvmValueLayoutIntrinsic(name: string): bool =
+    name == "ablaRuntimeValueAddress" ||
+    name == "ablaRuntimeMakeValue" ||
+    name == "ablaRuntimeLoadI32" ||
+    name == "ablaRuntimeStoreI32" ||
+    name == "ablaRuntimeLoadI64" ||
+    name == "ablaRuntimeStoreI64" ||
+    name == "ablaRuntimeLoadU8" ||
+    name == "ablaRuntimeStoreU8"
+
+// These declarations have a direct LLVM lowering. Other
+// extern:"intrinsic" functions are portable boxed runtime bridges.
+fun bootstrapLlvmNativeIntrinsic(name: string): bool =
+    bootstrapLlvmValueLayoutIntrinsic(name) ||
+    name == "ablaRuntimeTrap" ||
+    name == "ablaRuntimePointerAddress" ||
+    name == "ablaRuntimePointerFromAddress" ||
+    name == "ablaUnsafeLoadI64" ||
+    name == "ablaUnsafeStoreI64" ||
+    name == "ablaUnsafeLoadPointer" ||
+    name == "ablaUnsafeStorePointer" ||
+    name == "ablaUnsafeNullPointer" ||
+    name == "ablaUnsafePointerIsNull" ||
+    name == "ablaUnsafeCallMain" ||
+    name == "ablaUnsafeCStringAddress" ||
+    name == "ablaUnsafePointerAddress" ||
+    name == "ablaUnsafePointerOffset" ||
+    name == "ablaUnsafeLoadU8" ||
+    name == "ablaUnsafeStoreU8" ||
+    name == "ablaUnsafeAdoptString" ||
+    name == "ablaUnsafeBorrowCString" ||
+    name == "ablaHostIsMacOS" ||
+    name == "ablaHostValueArgumentsIndirect" ||
+    name == "ablaLinuxArgumentCount" ||
+    name == "ablaLinuxArgument" ||
+    name == "ablaLinuxEnvironmentPointer" ||
+    name == "ablaLinuxSyscall" ||
+    name == "ablaRuntimeWasmHeapBase" ||
+    name == "ablaRuntimeWasmMemorySize" ||
+    name == "ablaRuntimeWasmMemoryGrow"
+
 fun bootstrapLlvmScalarValueCount(function: BootstrapIrFunction): int {
     var count = 0
     var instruction = 0
@@ -617,6 +659,12 @@ fun bootstrapLlvmInferScalarValues(
             if (instruction.opcode == "field.get.indexed.i64") {
                 inferred = "i64"
             }
+            if (instruction.opcode == "field.set.indexed.i64") {
+                inferred = "i64"
+            }
+            if (instruction.opcode == "field.set.indexed.bool") {
+                inferred = "bool"
+            }
             if (instruction.opcode == "parameter.load") {
                 val parameter = bootstrapLlvmParameterId(
                     function, instruction.text
@@ -627,6 +675,13 @@ fun bootstrapLlvmInferScalarValues(
                         function.parameterTypes[parameter]
                     )
                 }
+            }
+            if (instruction.opcode == "global.load" ||
+                instruction.opcode == "global.assign" ||
+                instruction.opcode == "global.store") {
+                inferred = bootstrapLlvmGlobalScalarType(
+                    program, instruction.text
+                )
             }
             if (instruction.opcode == "local.load" ||
                 instruction.opcode == "resource.peek" ||
@@ -654,7 +709,9 @@ fun bootstrapLlvmInferScalarValues(
                     )
                 }
             }
-            if (instruction.opcode == "extern.c") {
+            if (instruction.opcode == "extern.c" ||
+                (instruction.opcode == "extern.intrinsic" &&
+                 bootstrapLlvmNativeIntrinsic(instruction.text))) {
                 val native = nativeIndex.find(instruction.text)
                 if (native >= 0 && native < program.natives.size) {
                     inferred = bootstrapLlvmScalarType(
@@ -665,6 +722,7 @@ fun bootstrapLlvmInferScalarValues(
             if (instruction.opcode == "+" ||
                 instruction.opcode == "-" ||
                 instruction.opcode == "*" ||
+                instruction.opcode == "/" ||
                 instruction.opcode == "neg" ||
                 instruction.opcode == "&" ||
                 instruction.opcode == "|" ||
@@ -739,10 +797,14 @@ fun bootstrapLlvmBuildScalarPlan(
     instruction = 0
     while (instruction < function.instructions.size) {
         val candidate = function.instructions[instruction]
-        if (candidate.opcode == "local.zero") {
+        if (candidate.opcode == "local.zero.i64") {
             localTypes[instruction] = "i64"
         }
+        if (candidate.opcode == "local.zero.bool") {
+            localTypes[instruction] = "bool"
+        }
         if (candidate.opcode == "local.declare" &&
+            localTypes[instruction] == "" &&
             candidate.left >= 0 && candidate.left < valueTypes.size) {
             localTypes[instruction] = valueTypes[candidate.left]
         }
@@ -801,7 +863,12 @@ fun bootstrapLlvmBuildScalarPlan(
         val candidate = function.instructions[instruction]
         var nativeInputs = false
         if (candidate.opcode == "+" || candidate.opcode == "-" ||
-            candidate.opcode == "*" || candidate.opcode == "neg" ||
+            candidate.opcode == "*" || candidate.opcode == "/" ||
+            candidate.opcode == "neg" ||
+            candidate.opcode == "&" || candidate.opcode == "|" ||
+            candidate.opcode == "^" || candidate.opcode == "bit.not" ||
+            candidate.opcode == "<<" || candidate.opcode == ">>" ||
+            candidate.opcode == ">>>" ||
             candidate.opcode == "not" || candidate.opcode == "&&" ||
             candidate.opcode == "||" || candidate.opcode == "==" ||
             candidate.opcode == "!=" || candidate.opcode == "<" ||
@@ -845,6 +912,14 @@ fun bootstrapLlvmBuildScalarPlan(
                 boxedValues[candidate.left] = true
             }
         }
+        if (candidate.opcode == "field.set.indexed.i64" ||
+            candidate.opcode == "field.set.indexed.bool") {
+            nativeInputs = true
+            if (candidate.left >= 0 &&
+                candidate.left < boxedValues.size) {
+                boxedValues[candidate.left] = true
+            }
+        }
         if (candidate.opcode == "return") nativeInputs =
             bootstrapLlvmScalarType(function.resultType) != ""
         if (candidate.opcode == "local.declare" ||
@@ -873,7 +948,9 @@ fun bootstrapLlvmBuildScalarPlan(
             }
             nativeInputs = true
         }
-        if (candidate.opcode == "extern.c") {
+        if (candidate.opcode == "extern.c" ||
+            (candidate.opcode == "extern.intrinsic" &&
+             bootstrapLlvmNativeIntrinsic(candidate.text))) {
             val native = nativeIndex.find(candidate.text)
             var operand = 0
             while (operand < candidate.operands.size) {
@@ -885,6 +962,10 @@ fun bootstrapLlvmBuildScalarPlan(
                         program.natives[native].parameterTypes[operand]
                     ) != ""
                 }
+                if (candidate.opcode == "extern.intrinsic" &&
+                    bootstrapLlvmValueLayoutIntrinsic(candidate.text) &&
+                    used >= 0 && used < valueTypes.size &&
+                    valueTypes[used] != "") direct = true
                 if (!direct && used >= 0 && used < boxedValues.size) {
                     boxedValues[used] = true
                 }
@@ -927,7 +1008,7 @@ fun bootstrapLlvmLocalIndex(
     while (index < function.instructions.size) {
         val instruction = function.instructions[index]
         if (instruction.opcode == "local.declare" ||
-            instruction.opcode == "local.zero" ||
+            bootstrapIrIsLocalZero(instruction.opcode) ||
             instruction.opcode == "local.allocate") {
             names.append(instruction.text)
             values.append(index)
@@ -952,6 +1033,22 @@ fun bootstrapLlvmGlobalIndex(
         index = index + 1
     }
     bootstrapLlvmNameValueIndex(names, values)
+}
+
+fun bootstrapLlvmGlobalScalarType(
+    program: BootstrapIrProgram,
+    name: string
+): string {
+    var result = ""
+    var index = 0
+    while (index < program.globalNames.size &&
+        index < program.globalTypes.size) {
+        if (program.globalNames[index] == name) {
+            result = bootstrapLlvmScalarType(program.globalTypes[index])
+        }
+        index = index + 1
+    }
+    result
 }
 
 fun bootstrapLlvmClassIndex(
@@ -1077,6 +1174,9 @@ fun bootstrapLlvmFunctionFingerprint(
     hash = bootstrapIrHashText(
         hash, function.resultType, factor, modulus
     )
+    hash = bootstrapIrHashText(
+        hash, if (function.inlineHint) "inline" else "call", factor, modulus
+    )
     var local = 0
     while (local < function.localTypes.size) {
         hash = bootstrapIrHashText(
@@ -1149,6 +1249,161 @@ fun bootstrapLlvmFunctionLinkFingerprint(
 
 fun bootstrapLlvmSelfHostedRuntimeSymbol(name: string): string {
     var symbol = ""
+    if (name == "__ablaRuntimeVoid") symbol = "abla_void"
+    if (name == "__ablaRuntimeNull") symbol = "abla_null"
+    if (name == "__ablaRuntimeI64") symbol = "abla_i64"
+    if (name == "__ablaRuntimeBool") symbol = "abla_bool"
+    if (name == "__ablaRuntimeAsI64") symbol = "abla_as_i64"
+    if (name == "__ablaRuntimeAsBool") symbol = "abla_as_bool"
+    if (name == "__ablaRuntimeNegate") symbol = "abla_negate"
+    if (name == "__ablaRuntimeNot") symbol = "abla_not"
+    if (name == "__ablaRuntimeAdd") symbol = "abla_add"
+    if (name == "__ablaRuntimeSubtract") symbol = "abla_subtract"
+    if (name == "__ablaRuntimeMultiply") symbol = "abla_multiply"
+    if (name == "__ablaRuntimeDivide") symbol = "abla_divide"
+    if (name == "__ablaRuntimeBitNot") symbol = "ablaBitNot"
+    if (name == "__ablaRuntimeBitAnd") symbol = "ablaBitAnd"
+    if (name == "__ablaRuntimeBitOr") symbol = "ablaBitOr"
+    if (name == "__ablaRuntimeBitXor") symbol = "ablaBitXor"
+    if (name == "__ablaRuntimeBitShiftLeft") symbol = "ablaBitShiftLeft"
+    if (name == "__ablaRuntimeBitShiftRight") {
+        symbol = "ablaBitShiftRight"
+    }
+    if (name == "__ablaRuntimeBitShiftRightUnsigned") {
+        symbol = "ablaBitShiftRightUnsigned"
+    }
+    if (name == "__ablaRuntimeEqual") symbol = "abla_equal"
+    if (name == "__ablaRuntimeNotEqual") symbol = "abla_not_equal"
+    if (name == "__ablaRuntimeStringEqual") symbol = "abla_string_equal"
+    if (name == "__ablaRuntimeStringNotEqual") {
+        symbol = "abla_string_not_equal"
+    }
+    if (name == "__ablaRuntimeStringEqualBool") {
+        symbol = "abla_string_equal_bool"
+    }
+    if (name == "__ablaRuntimeStringNotEqualBool") {
+        symbol = "abla_string_not_equal_bool"
+    }
+    if (name == "__ablaRuntimeLess") symbol = "abla_less"
+    if (name == "__ablaRuntimeLessEqual") symbol = "abla_less_equal"
+    if (name == "__ablaRuntimeGreater") symbol = "abla_greater"
+    if (name == "__ablaRuntimeGreaterEqual") symbol = "abla_greater_equal"
+    if (name == "__ablaRuntimeFunction") symbol = "abla_function"
+    if (name == "__ablaRuntimeClosure") symbol = "abla_closure"
+    if (name == "__ablaRuntimeAsFunction") symbol = "abla_as_function"
+    if (name == "__ablaRuntimeFunctionCaptureCount") {
+        symbol = "abla_function_capture_count"
+    }
+    if (name == "__ablaRuntimeFunctionCapturePointer") {
+        symbol = "abla_function_capture_pointer"
+    }
+    if (name == "__ablaRuntimeFunctionCapture") {
+        symbol = "abla_function_capture"
+    }
+    if (name == "__ablaRuntimeClosureRelease") {
+        symbol = "abla_closure_release"
+    }
+    if (name == "__ablaRuntimeAsCString") symbol = "abla_as_cstring"
+    if (name == "__ablaRuntimeToString") symbol = "abla_to_string"
+    if (name == "__ablaRuntimeCellCreate") symbol = "abla_cell_create"
+    if (name == "__ablaRuntimeCellGet") symbol = "abla_cell_get"
+    if (name == "__ablaRuntimeCellSet") symbol = "abla_cell_set"
+    if (name == "__ablaRuntimeSharedCreate") symbol = "abla_shared_create"
+    if (name == "__ablaRuntimeSharedClone") symbol = "abla_shared_clone"
+    if (name == "__ablaRuntimeSharedGet") symbol = "abla_shared_get"
+    if (name == "__ablaRuntimeSharedLock") symbol = "abla_shared_lock"
+    if (name == "__ablaRuntimeSharedUnlock") symbol = "abla_shared_unlock"
+    if (name == "__ablaRuntimeSharedRelease") symbol = "abla_shared_release"
+    if (name == "__ablaRuntimeWeakCreate") symbol = "abla_weak_create"
+    if (name == "__ablaRuntimeWeakClone") symbol = "abla_weak_clone"
+    if (name == "__ablaRuntimeWeakUpgrade") symbol = "abla_weak_upgrade"
+    if (name == "__ablaRuntimeWeakAlive") symbol = "abla_weak_alive"
+    if (name == "__ablaRuntimeWeakRelease") symbol = "abla_weak_release"
+    if (name == "__ablaRuntimeGeneratorCreate") {
+        symbol = "abla_generator_create"
+    }
+    if (name == "__ablaRuntimeGeneratorNext") symbol = "abla_generator_next"
+    if (name == "__ablaRuntimeGeneratorValue") {
+        symbol = "abla_generator_value"
+    }
+    if (name == "__ablaRuntimeGeneratorYield") {
+        symbol = "abla_generator_yield"
+    }
+    if (name == "__ablaRuntimeGeneratorDrop") symbol = "abla_generator_drop"
+    if (name == "__ablaRuntimeTaskCreate") symbol = "abla_task_create"
+    if (name == "__ablaRuntimeTaskDrop") symbol = "abla_task_drop"
+    if (name == "__ablaRuntimeThreadCreate") symbol = "abla_thread_create"
+    if (name == "__ablaRuntimeThreadEntry") {
+        symbol = "abla_runtime_thread_entry"
+    }
+    if (name == "__ablaRuntimeThreadDrop") symbol = "abla_thread_drop"
+    if (name == "__ablaRuntimeAwait") symbol = "abla_await"
+    if (name == "__ablaRuntimeByteEncode") symbol = "ablaByteEncode"
+    if (name == "__ablaRuntimeBase64Encode") symbol = "ablaBase64Encode"
+    if (name == "__ablaRuntimeBase64Decode") symbol = "ablaBase64Decode"
+    if (name == "__ablaRuntimeByteChunksJoin") {
+        symbol = "ablaByteChunksJoin"
+    }
+    if (name == "__ablaRuntimeUtf8EncodeScalar") {
+        symbol = "ablaUtf8EncodeScalar"
+    }
+    if (name == "__ablaRuntimePlatformPanic") {
+        symbol = "abla_platform_panic"
+    }
+    if (name == "__ablaRuntimeRootsPush") {
+        symbol = "abla_runtime_roots_push"
+    }
+    if (name == "__ablaRuntimeRootsPop") {
+        symbol = "abla_runtime_roots_pop"
+    }
+    if (name == "__ablaRuntimeMemoryPressure") {
+        symbol = "abla_runtime_memory_pressure"
+    }
+    if (name == "__ablaRuntimeStringStatic") symbol = "abla_string_static"
+    if (name == "__ablaRuntimeStringData") symbol = "abla_string_data"
+    if (name == "__ablaRuntimeStringConcat") symbol = "abla_string_concat"
+    if (name == "__ablaRuntimeStringLengthI64") {
+        symbol = "abla_string_length_i64"
+    }
+    if (name == "__ablaRuntimeStringLength") symbol = "abla_string_length"
+    if (name == "__ablaRuntimeStringGetI64") symbol = "abla_string_get_i64"
+    if (name == "__ablaRuntimeStringGet") symbol = "abla_string_get"
+    if (name == "__ablaRuntimeStringSlice") symbol = "abla_string_slice"
+    if (name == "__ablaRuntimeArrayCreate") symbol = "abla_array_create"
+    if (name == "__ablaRuntimeArrayLengthI64") {
+        symbol = "abla_array_length_i64"
+    }
+    if (name == "__ablaRuntimeArrayLength") symbol = "abla_array_length"
+    if (name == "__ablaRuntimeArrayAppend") symbol = "abla_array_append"
+    if (name == "__ablaRuntimeArrayGet") symbol = "abla_array_get"
+    if (name == "__ablaRuntimeArrayGetI64") symbol = "abla_array_get_i64"
+    if (name == "__ablaRuntimeArrayGetBool") symbol = "abla_array_get_bool"
+    if (name == "__ablaRuntimeIndexGet") symbol = "abla_index_get"
+    if (name == "__ablaRuntimeArraySet") symbol = "abla_array_set"
+    if (name == "__ablaRuntimeObjectCreate") symbol = "abla_object_create"
+    if (name == "__ablaRuntimeFieldGet") symbol = "abla_field_get"
+    if (name == "__ablaRuntimeFieldGetIndexed") {
+        symbol = "abla_field_get_indexed"
+    }
+    if (name == "__ablaRuntimeFieldGetIndexedI64") {
+        symbol = "abla_field_get_indexed_i64"
+    }
+    if (name == "__ablaRuntimeFieldGetIndexedBool") {
+        symbol = "abla_field_get_indexed_bool"
+    }
+    if (name == "__ablaRuntimeFieldInitialize") {
+        symbol = "abla_field_initialize"
+    }
+    if (name == "__ablaRuntimeFieldSet") symbol = "abla_field_set"
+    if (name == "__ablaRuntimeFieldSetIndexed") {
+        symbol = "abla_field_set_indexed"
+    }
+    if (name == "__ablaRuntimeFieldSetIndexedI64") {
+        symbol = "abla_field_set_indexed_i64"
+    }
+    if (name == "__ablaRuntimeFieldSetIndexedBool") {
+        symbol = "abla_field_set_indexed_bool"
+    }
     if (name == "__ablaRuntimeTextFindSequence") {
         symbol = "ablaTextFindSequence"
     }
@@ -1161,6 +1416,12 @@ fun bootstrapLlvmSelfHostedRuntimeSymbol(name: string): string {
     }
     if (name == "__ablaRuntimeTextIsValidUtf8") {
         symbol = "ablaTextIsValidUtf8"
+    }
+    if (name == "__ablaRuntimeJsonStringIsPlain") {
+        symbol = "ablaJsonStringIsPlain"
+    }
+    if (name == "__ablaRuntimeJsonFindPlainStringEnd") {
+        symbol = "ablaJsonFindPlainStringEnd"
     }
     symbol
 }

@@ -1,8 +1,64 @@
 // Portable hosted TCP/UDP and readiness adapter. Linux uses epoll; macOS uses
 // kqueue behind the narrow host ABI. Applications keep descriptors affine.
 
-import "abla/platform/host"
 import "abla/net/contracts"
+import "abla/sys/linux/net"
+import "abla/sys/linux/process"
+
+fun hostedCloseDescriptor(descriptor: int): bool =
+    linuxTcpCloseDescriptor(descriptor)
+
+fun hostedConnectDescriptor(
+    host: string,
+    port: int,
+    timeoutMilliseconds: int
+): int {
+    var socket = if (linuxIpv6Words(host).size == 8) {
+        tcpConnectIpv6(
+            ipv6SocketAddress(host, port), timeoutMilliseconds
+        )
+    } else tcpConnectIpv4(host, port, timeoutMilliseconds)
+    val descriptor = socket.descriptor
+    socket.descriptor = -1
+    descriptor
+}
+
+fun hostedListenDescriptor(
+    host: string,
+    port: int,
+    backlog: int,
+    dualStack: bool
+): int {
+    var listener = if (linuxIpv6Words(host).size == 8) {
+        tcpListenIpv6(
+            ipv6SocketAddress(host, port), backlog, dualStack
+        )
+    } else tcpListenAddress(ipv4SocketAddress(host, port), backlog)
+    val descriptor = listener.descriptor
+    listener.descriptor = -1
+    descriptor
+}
+
+fun hostedLocalPort(descriptor: int): int {
+    var listener = TcpListener(descriptor)
+    val port = listener.localPort()
+    listener.descriptor = -1
+    port
+}
+
+fun hostedReadRaw(descriptor: int, maximum: int): SocketReadResult {
+    var socket = TcpConnection(descriptor)
+    val result = socket.readResult(maximum)
+    socket.descriptor = -1
+    result
+}
+
+fun hostedWriteRaw(descriptor: int, contents: string): SocketWriteResult {
+    var socket = TcpConnection(descriptor)
+    val result = socket.writeResult(contents)
+    socket.descriptor = -1
+    result
+}
 
 class HostedSocketReadResult(
     val bytes: string,
@@ -77,7 +133,7 @@ class HostedUdpDatagram(
 
 resource class HostedTcpListener(var descriptor: int) {
     fun drop(): void {
-        if (this.descriptor >= 0) ablaHostNetClose(this.descriptor)
+        if (this.descriptor >= 0) hostedCloseDescriptor(this.descriptor)
         this.descriptor = -1
         return
     }
@@ -85,7 +141,7 @@ resource class HostedTcpListener(var descriptor: int) {
 
 resource class HostedTcpConnection(var descriptor: int) {
     fun drop(): void {
-        if (this.descriptor >= 0) ablaHostNetClose(this.descriptor)
+        if (this.descriptor >= 0) hostedCloseDescriptor(this.descriptor)
         this.descriptor = -1
         return
     }
@@ -93,7 +149,7 @@ resource class HostedTcpConnection(var descriptor: int) {
 
 resource class HostedUdpSocket(var descriptor: int) {
     fun drop(): void {
-        if (this.descriptor >= 0) ablaHostNetClose(this.descriptor)
+        if (this.descriptor >= 0) hostedCloseDescriptor(this.descriptor)
         this.descriptor = -1
         return
     }
@@ -101,7 +157,7 @@ resource class HostedUdpSocket(var descriptor: int) {
 
 resource class HostedSocketPoller(var descriptor: int) {
     fun drop(): void {
-        if (this.descriptor >= 0) ablaHostNetClose(this.descriptor)
+        if (this.descriptor >= 0) hostedCloseDescriptor(this.descriptor)
         this.descriptor = -1
         return
     }
@@ -112,7 +168,7 @@ fun hostedTcpConnect(
     port: int,
     timeoutMilliseconds: int = 5000
 ): HostedTcpConnection = HostedTcpConnection(
-    ablaHostNetConnect(host, port, timeoutMilliseconds)
+    hostedConnectDescriptor(host, port, timeoutMilliseconds)
 )
 
 fun hostedTcpListen(
@@ -121,30 +177,28 @@ fun hostedTcpListen(
     backlog: int = 128,
     dualStack: bool = true
 ): HostedTcpListener = HostedTcpListener(
-    ablaHostNetListen(host, port, backlog, dualStack)
+    hostedListenDescriptor(host, port, backlog, dualStack)
 )
 
 fun HostedTcpListener.accept(): HostedTcpConnection =
-    HostedTcpConnection(ablaHostNetAccept(this.descriptor))
+    HostedTcpConnection(linuxTcpAcceptDescriptor(this.descriptor))
 
 fun HostedTcpListener.localPort(): int =
-    ablaHostNetLocalPort(this.descriptor)
+    hostedLocalPort(this.descriptor)
 
 fun HostedTcpListener.setNonblocking(enabled: bool = true): bool =
-    ablaHostNetSetNonblocking(this.descriptor, enabled)
+    linuxSocketSetNonblocking(this.descriptor, enabled)
 
 fun HostedTcpConnection.setNonblocking(enabled: bool = true): bool =
-    ablaHostNetSetNonblocking(this.descriptor, enabled)
+    linuxSocketSetNonblocking(this.descriptor, enabled)
 
 fun hostedReadResult(descriptor: int, maximum: int): HostedSocketReadResult {
-    val bytes = ablaHostNetRead(descriptor, maximum)
-    val state = ablaHostNetStatus()
-    val error = ablaHostNetError()
-    var status = "error"
-    if (state == 0) status = "data"
-    if (state == 1) status = "eof"
-    if (state == 2) status = "would-block"
-    HostedSocketReadResult(bytes, status, error)
+    val result = hostedReadRaw(descriptor, maximum)
+    HostedSocketReadResult(
+        result.bytes,
+        if (result.errorCode == 11) "would-block" else result.status,
+        result.errorCode
+    )
 }
 
 fun HostedTcpConnection.readResult(
@@ -157,7 +211,7 @@ fun HostedTcpConnection.readNetwork(
     cancellation: NetworkCancellation = networkCancellation(),
     cancellationPollMilliseconds: int = 50
 ): NetworkReadOutcome {
-    val started = ablaHostMonotonicMilliseconds()
+    val started = linuxMonotonicMilliseconds()
     var result = NetworkReadOutcome(
         "", 3, networkError(60, "read")
     )
@@ -165,7 +219,7 @@ fun HostedTcpConnection.readNetwork(
     var waiting = poller.descriptor >= 0 && this.descriptor >= 0 &&
         timeoutMilliseconds > 0 && cancellationPollMilliseconds > 0 &&
         poller.watchDescriptor(this.descriptor)
-    while (waiting && ablaHostMonotonicMilliseconds() - started <
+    while (waiting && linuxMonotonicMilliseconds() - started <
         timeoutMilliseconds) {
         if (cancellation.isRequested()) {
             result = NetworkReadOutcome(
@@ -174,7 +228,7 @@ fun HostedTcpConnection.readNetwork(
             waiting = false
         } else {
             var duration = timeoutMilliseconds -
-                (ablaHostMonotonicMilliseconds() - started)
+                (linuxMonotonicMilliseconds() - started)
             if (duration > cancellationPollMilliseconds) {
                 duration = cancellationPollMilliseconds
             }
@@ -197,8 +251,9 @@ fun HostedTcpConnection.readNetwork(
 fun HostedTcpConnection.writeResult(
     contents: string
 ): HostedSocketWriteResult {
-    val written = ablaHostNetWrite(this.descriptor, contents)
-    val error = if (written < 0) -written else 0
+    val result = hostedWriteRaw(this.descriptor, contents)
+    val written = if (result.failed()) -result.errorCode else result.written
+    val error = result.errorCode
     HostedSocketWriteResult(
         written,
         error == 11 || error == 35,
@@ -212,7 +267,7 @@ fun HostedTcpConnection.writeNetwork(
     cancellation: NetworkCancellation = networkCancellation(),
     cancellationPollMilliseconds: int = 50
 ): NetworkWriteOutcome {
-    val started = ablaHostMonotonicMilliseconds()
+    val started = linuxMonotonicMilliseconds()
     var offset = 0
     var result = NetworkWriteOutcome(
         0, 3, networkError(60, "write")
@@ -225,7 +280,7 @@ fun HostedTcpConnection.writeNetwork(
         0, 6, networkError(9, "write")
     )
     while (writing && offset < contents.size &&
-        ablaHostMonotonicMilliseconds() - started < timeoutMilliseconds) {
+        linuxMonotonicMilliseconds() - started < timeoutMilliseconds) {
         if (cancellation.isRequested()) {
             result = NetworkWriteOutcome(
                 offset, 4, networkError(89, "write")
@@ -233,7 +288,7 @@ fun HostedTcpConnection.writeNetwork(
             writing = false
         } else {
             var duration = timeoutMilliseconds -
-                (ablaHostMonotonicMilliseconds() - started)
+                (linuxMonotonicMilliseconds() - started)
             if (duration > cancellationPollMilliseconds) {
                 duration = cancellationPollMilliseconds
             }
@@ -269,7 +324,7 @@ fun HostedTcpConnection.writeNetwork(
 fun HostedTcpConnection.close(): bool {
     var closed = this.descriptor < 0
     if (this.descriptor >= 0) {
-        closed = ablaHostNetClose(this.descriptor)
+        closed = hostedCloseDescriptor(this.descriptor)
         if (closed) this.descriptor = -1
     }
     closed
@@ -278,7 +333,7 @@ fun HostedTcpConnection.close(): bool {
 fun HostedTcpListener.close(): bool {
     var closed = this.descriptor < 0
     if (this.descriptor >= 0) {
-        closed = ablaHostNetClose(this.descriptor)
+        closed = hostedCloseDescriptor(this.descriptor)
         if (closed) this.descriptor = -1
     }
     closed
@@ -289,69 +344,100 @@ fun hostedUdpBind(
     port: int = 0,
     dualStack: bool = true
 ): HostedUdpSocket = HostedUdpSocket(
-    ablaHostNetUdpBind(host, port, dualStack)
+    hostedUdpBindDescriptor(host, port, dualStack)
 )
 
+fun hostedUdpBindDescriptor(
+    host: string,
+    port: int,
+    dualStack: bool
+): int {
+    var socket = if (linuxIpv6Words(host).size == 8) {
+        udpBindIpv6(ipv6SocketAddress(host, port), true, dualStack)
+    } else udpBind(ipv4SocketAddress(host, port))
+    val descriptor = socket.descriptor
+    socket.descriptor = -1
+    descriptor
+}
+
 fun HostedUdpSocket.localPort(): int =
-    ablaHostNetLocalPort(this.descriptor)
+    hostedLocalPort(this.descriptor)
 
 fun HostedUdpSocket.setNonblocking(enabled: bool = true): bool =
-    ablaHostNetSetNonblocking(this.descriptor, enabled)
+    linuxSocketSetNonblocking(this.descriptor, enabled)
 
 fun HostedUdpSocket.sendTo(
     contents: string,
     host: string,
     port: int
-): int = ablaHostNetUdpSend(this.descriptor, host, port, contents)
+): int {
+    var socket = UdpSocket(this.descriptor)
+    val result = if (linuxIpv6Words(host).size == 8) {
+        socket.sendToIpv6(contents, ipv6SocketAddress(host, port))
+    } else socket.sendTo(contents, ipv4SocketAddress(host, port))
+    socket.descriptor = -1
+    if (result.failed()) -result.errorCode else result.written
+}
 
 fun HostedUdpSocket.receiveFrom(
     maximum: int = 65535
 ): HostedUdpDatagram {
-    val bytes = ablaHostNetUdpReceive(this.descriptor, maximum)
-    val state = ablaHostNetStatus()
-    val error = ablaHostNetError()
+    var socket = UdpSocket(this.descriptor)
+    val v6 = socket.receiveFromIpv6(maximum)
+    socket.descriptor = -1
+    val sourceAddress = if (
+        v6.source.address == "0:0:0:0:0:0:0:1"
+    ) "::1" else v6.source.address
     HostedUdpDatagram(
-        bytes,
-        ablaHostNetSourceAddress(),
-        ablaHostNetSourcePort(),
-        state == 0,
-        state == 2,
-        error
+        v6.bytes,
+        sourceAddress,
+        v6.source.port,
+        v6.received,
+        v6.errorCode == 11,
+        v6.errorCode
     )
 }
 
 fun HostedUdpSocket.close(): bool {
     var closed = this.descriptor < 0
     if (this.descriptor >= 0) {
-        closed = ablaHostNetClose(this.descriptor)
+        closed = hostedCloseDescriptor(this.descriptor)
         if (closed) this.descriptor = -1
     }
     closed
 }
 
 fun hostedSocketPoller(): HostedSocketPoller =
-    HostedSocketPoller(ablaHostNetPollerCreate())
+    HostedSocketPoller(linuxSyscall1(291, 524288))
 
 fun HostedSocketPoller.watchDescriptor(
     descriptor: int,
     read: bool = true,
     write: bool = false
-): bool = ablaHostNetPollerControl(
-    this.descriptor, descriptor, read, write, 0
-)
+): bool {
+    var poller = SocketPoller(this.descriptor)
+    val result = linuxPollerControl(poller, 1, descriptor, read, write)
+    poller.descriptor = -1
+    result
+}
 
 fun HostedSocketPoller.modifyDescriptor(
     descriptor: int,
     read: bool = true,
     write: bool = false
-): bool = ablaHostNetPollerControl(
-    this.descriptor, descriptor, read, write, 1
-)
+): bool {
+    var poller = SocketPoller(this.descriptor)
+    val result = linuxPollerControl(poller, 3, descriptor, read, write)
+    poller.descriptor = -1
+    result
+}
 
-fun HostedSocketPoller.unwatchDescriptor(descriptor: int): bool =
-    ablaHostNetPollerControl(
-        this.descriptor, descriptor, false, false, 2
-    )
+fun HostedSocketPoller.unwatchDescriptor(descriptor: int): bool {
+    var poller = SocketPoller(this.descriptor)
+    val result = linuxPollerControl(poller, 2, descriptor, false, false)
+    poller.descriptor = -1
+    result
+}
 
 fun hostedNetReadU32(bytes: string, offset: int): int =
     bytes[offset] + bytes[offset + 1] * 256 +
@@ -361,30 +447,29 @@ fun HostedSocketPoller.wait(
     maximumEvents: int = 64,
     timeoutMilliseconds: int = 5000
 ): HostedSocketEvents {
-    val encoded = ablaHostNetPollerWait(
-        this.descriptor, maximumEvents, timeoutMilliseconds
-    )
-    val error = ablaHostNetError()
+    var poller = SocketPoller(this.descriptor)
+    val ready = poller.wait(maximumEvents, timeoutMilliseconds)
+    poller.descriptor = -1
     val events: array<HostedSocketEvent> = []
-    var offset = 0
-    while (offset + 8 <= encoded.size) {
-        val flags = hostedNetReadU32(encoded, offset + 4)
+    var index = 0
+    while (index < ready.events.size) {
+        val event = ready.events[index]
         events.append(HostedSocketEvent(
-            hostedNetReadU32(encoded, offset),
-            (flags & 1) != 0,
-            (flags & 2) != 0,
-            (flags & 4) != 0,
-            (flags & 8) != 0
+            event.descriptor,
+            event.readable,
+            event.writable,
+            event.closed,
+            event.error
         ))
-        offset = offset + 8
+        index = index + 1
     }
-    HostedSocketEvents(events, error == 0 && encoded.size == 0, error)
+    HostedSocketEvents(events, ready.timedOut, ready.errorCode)
 }
 
 fun HostedSocketPoller.close(): bool {
     var closed = this.descriptor < 0
     if (this.descriptor >= 0) {
-        closed = ablaHostNetClose(this.descriptor)
+        closed = hostedCloseDescriptor(this.descriptor)
         if (closed) this.descriptor = -1
     }
     closed

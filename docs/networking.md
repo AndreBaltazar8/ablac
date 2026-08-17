@@ -2,9 +2,8 @@
 
 Abla's networking stack is source-level, bounded, and ownership-safe. The
 current production socket backend issues Linux x86-64 system calls directly,
-so TCP, UDP, HTTP, and WebSocket transports do not require a libc socket shim
-or the project C host adapter. Complete `x86_64-linux-raw` executables are
-libc-free; hosted executables still use Abla's normal value runtime.
+so TCP, UDP, HTTP, and WebSocket transports do not require a project-owned
+socket shim. Hosted executables use Abla's normal value runtime.
 
 ## Socket model
 

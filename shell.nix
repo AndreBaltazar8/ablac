@@ -16,9 +16,11 @@ pkgs.mkShell {
     llvmPackages.lld
     binaryen
     nodejs
+    openssl
   ];
 
   shellHook = ''
     export ABLAC_DEV_SHELL=1
+    export LD_LIBRARY_PATH="${pkgs.openssl.out}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   '';
 }

@@ -36,24 +36,4 @@ for fixture in invalid-unsafe-call invalid-unsafe-function; do
     fi
 done
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/unsafe-boundary-c-backend.ab" \
-    -o "$output_directory/c-generator" --no-cache
-"$project_root/tools/run-limited.sh" "$output_directory/c-generator" \
-    >"$output_directory/program.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/program.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/c-program"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/c-program"
-c_status=$?
-set -e
-if [[ $c_status -ne 42 ]]; then
-    echo "unsafe-boundary: C backend expected 42, got $c_status" >&2
-    exit 1
-fi
-
 echo "native boundary: trusted implementation + raw memory + closed-resource checks passed"

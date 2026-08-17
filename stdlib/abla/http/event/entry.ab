@@ -332,86 +332,105 @@ fun httpEventResponse(
     output
 }
 
-fun HttpEventServer.processNoEscapeSlot(slot: int): void {
+// Process one framed request in the caller's region. Keeping this separate
+// lets readReady place the socket buffer, parser graph, handler result, and
+// response framing in one allocation region. Only an incomplete input or a
+// backpressured output is promoted across that boundary.
+fun HttpEventServer.processNoEscapeInputInRegion(
+    slot: int,
+    input: string
+): int {
     var readyToWrite = false
-    var processMore = false
-    var clearInput = false
-    region {
-        val frame = httpEventFrame(
-            this.inputs[slot],
-            this.options.maximumHeaderBytes,
-            this.options.maximumBodyBytes
+    val frame = httpEventFrame(
+        input,
+        this.options.maximumHeaderBytes,
+        this.options.maximumBodyBytes
+    )
+    val length = frame.length
+    if (length < 0) {
+        this.outputs[slot] = memoryPromoteString(
+            httpText("bad request", 400).render()
         )
-        val length = frame.length
-        if (length < 0) {
-            this.outputs[slot] = memoryPromoteString(
-                httpText("bad request", 400).render()
-            )
-            this.closing[slot] = true
-            readyToWrite = true
-        } else if (length > 0) {
-            var framed = this.inputs[slot]
-            if (length < this.inputs[slot].size) {
-                framed = this.inputs[slot].slice(0, length)
-                this.inputs[slot] = memoryPromoteString(
-                    this.inputs[slot].slice(length, this.inputs[slot].size)
-                )
-            } else clearInput = true
-            val availableRequest = frame.request
-            val request = if (availableRequest != null) availableRequest
-                else httpEventRequest(framed, this.options.maximumBodyBytes)
-            val eventHandler = this.noEscapeHandler
-            val response = eventHandler(request)
-            this.requestCounts[slot] = this.requestCounts[slot] + 1
-            val keepAlive = httpRequestKeepAlive(request) &&
-                !this.draining &&
-                this.requestCounts[slot] <
-                    this.options.maximumRequestsPerConnection
-            val framedResponse = httpEventResponse(
-                request, response, keepAlive,
-                this.options.gzipMinimumBytes
-            )
-            this.closing[slot] = !keepAlive
-            if (framedResponse.size > this.options.maximumPendingBytes) {
+        this.closing[slot] = true
+        readyToWrite = true
+    } else if (length > 0) {
+        val framed = if (length < input.size) input.slice(0, length)
+            else input
+        val availableRequest = frame.request
+        val request = if (availableRequest != null) availableRequest
+            else httpEventRequest(framed, this.options.maximumBodyBytes)
+        val eventHandler = this.noEscapeHandler
+        val response = eventHandler(request)
+        this.requestCounts[slot] = this.requestCounts[slot] + 1
+        val keepAlive = httpRequestKeepAlive(request) &&
+            !this.draining &&
+            this.requestCounts[slot] <
+                this.options.maximumRequestsPerConnection
+        val framedResponse = httpEventResponse(
+            request, response, keepAlive,
+            this.options.gzipMinimumBytes
+        )
+        this.closing[slot] = !keepAlive
+        if (framedResponse.size > this.options.maximumPendingBytes) {
+            this.closeSlot(slot)
+        } else if (this.descriptors[slot] >= 0) {
+            val connection = TcpConnection(this.descriptors[slot])
+            // Scatter/gather avoids copying large segmented bodies, while
+            // the contiguous writer remains cheaper for small responses.
+            val written = if (framedResponse.size >= 4096) {
+                connection.writeCompact(framedResponse)
+            } else connection.writeResult(framedResponse)
+            connection.descriptor = -1
+            if (written.written > 0 &&
+                written.written < framedResponse.size) {
+                this.lastActivityMilliseconds[slot] =
+                    linuxMonotonicMilliseconds()
+            }
+            if (written.failed() && written.errorCode != 11) {
                 this.closeSlot(slot)
-            } else if (this.descriptors[slot] >= 0) {
-                val connection = TcpConnection(this.descriptors[slot])
-                // Scatter/gather avoids copying large segmented bodies, while
-                // the contiguous writer remains cheaper for small responses.
-                val written = if (framedResponse.size >= 4096) {
-                    connection.writeCompact(framedResponse)
-                } else connection.writeResult(framedResponse)
-                connection.descriptor = -1
-                if (written.written > 0 &&
-                    written.written < framedResponse.size) {
-                    this.lastActivityMilliseconds[slot] =
-                        linuxMonotonicMilliseconds()
-                }
-                if (written.failed() && written.errorCode != 11) {
-                    this.closeSlot(slot)
-                } else if (written.written >= framedResponse.size) {
-                    this.outputOffsets[slot] = 0
-                    if (this.closing[slot]) this.closeSlot(slot)
-                    else processMore = this.descriptors[slot] >= 0
-                } else {
-                    this.outputs[slot] = memoryPromoteString(framedResponse)
-                    this.outputOffsets[slot] = written.written
-                    if (!this.writeWatching[slot] &&
-                        this.poller.modifyDescriptor(
-                            this.descriptors[slot], true, true
-                        )) this.writeWatching[slot] = true
-                }
+            } else if (written.written >= framedResponse.size) {
+                this.outputOffsets[slot] = 0
+                if (this.closing[slot]) this.closeSlot(slot)
+            } else {
+                this.outputs[slot] = memoryPromoteString(framedResponse)
+                this.outputOffsets[slot] = written.written
+                if (!this.writeWatching[slot] &&
+                    this.poller.modifyDescriptor(
+                        this.descriptors[slot], true, true
+                    )) this.writeWatching[slot] = true
             }
         }
-        0
     }
-    if (clearInput) this.inputs[slot] = ""
     if (readyToWrite) {
         if (this.outputs[slot].size > this.options.maximumPendingBytes) {
             this.closeSlot(slot)
         } else if (this.descriptors[slot] >= 0) this.writeReady(slot)
     }
-    if (processMore && this.descriptors[slot] >= 0) this.processSlot(slot)
+    length
+}
+
+fun HttpEventServer.processNoEscapeSlot(slot: int): void {
+    var processing = slot >= 0 && slot < this.descriptors.size &&
+        this.descriptors[slot] >= 0 && this.outputs[slot] == ""
+    while (processing) {
+        var consumed = 0
+        var clearInput = false
+        region {
+            val input = this.inputs[slot]
+            consumed = this.processNoEscapeInputInRegion(slot, input)
+            if (consumed < 0 || consumed >= input.size) {
+                clearInput = true
+            } else if (consumed > 0) {
+                this.inputs[slot] = memoryPromoteString(
+                    input.slice(consumed, input.size)
+                )
+            }
+            0
+        }
+        if (clearInput) this.inputs[slot] = ""
+        processing = consumed > 0 &&
+            this.descriptors[slot] >= 0 && this.outputs[slot] == ""
+    }
     return
 }
 
@@ -501,29 +520,68 @@ fun HttpEventServer.acceptReady(): void {
 fun HttpEventServer.readReady(slot: int): void {
     var reading = slot >= 0 && this.descriptors[slot] >= 0
     while (reading) {
-        val connection = TcpConnection(this.descriptors[slot])
-        // Most HTTP request heads fit in 4 KiB. Allocating the old 64 KiB
-        // buffer for every small keep-alive request dominated tracked memory
-        // traffic. Continue only after a full chunk so edge-triggered sockets
-        // are still drained for large headers and bodies.
-        // Read a typical API body and its headers in one receive operation.
-        // The compact primitive remains bounded, so this does not introduce a
-        // request-sized heap allocation into the hot path.
-        val incoming = connection.readCompact(32768)
-        connection.descriptor = -1
-        if (incoming.size > 0) {
-            this.lastActivityMilliseconds[slot] = linuxMonotonicMilliseconds()
-            this.inputs[slot] = memoryPromoteString(
-                "${this.inputs[slot]}$incoming"
-            )
-            if (this.inputs[slot].size >
-                this.options.maximumHeaderBytes +
-                this.options.maximumBodyBytes) {
-                this.closeSlot(slot)
-            } else this.processSlot(slot)
-            reading = incoming.size == 32768 &&
-                this.descriptors[slot] >= 0
-        } else reading = false
+        if (this.useNoEscapeHandler) {
+            var clearInput = false
+            reading = region {
+                val connection = TcpConnection(this.descriptors[slot])
+                val incoming = connection.readCompact(32768)
+                connection.descriptor = -1
+                var continueReading = false
+                if (incoming.size > 0) {
+                    this.lastActivityMilliseconds[slot] =
+                        linuxMonotonicMilliseconds()
+                    val input = "${this.inputs[slot]}$incoming"
+                    if (input.size >
+                        this.options.maximumHeaderBytes +
+                        this.options.maximumBodyBytes) {
+                        this.closeSlot(slot)
+                    } else {
+                        var consumed = 0
+                        var offset = 0
+                        var processing = true
+                        while (processing) {
+                            consumed = this.processNoEscapeInputInRegion(
+                                slot, input.slice(offset, input.size)
+                            )
+                            if (consumed > 0) offset = offset + consumed
+                            processing = consumed > 0 &&
+                                offset < input.size &&
+                                this.descriptors[slot] >= 0 &&
+                                this.outputs[slot] == ""
+                        }
+                        if (this.descriptors[slot] >= 0 && offset < input.size) {
+                            this.inputs[slot] = memoryPromoteString(
+                                input.slice(offset, input.size)
+                            )
+                        } else clearInput = true
+                    }
+                    continueReading = incoming.size == 32768 &&
+                        this.descriptors[slot] >= 0
+                }
+                continueReading
+            }
+            if (clearInput) this.inputs[slot] = ""
+        } else {
+            val connection = TcpConnection(this.descriptors[slot])
+            // Read a typical API body and its headers in one receive
+            // operation, continuing after a full edge-triggered chunk.
+            val incoming = connection.readCompact(32768)
+            connection.descriptor = -1
+            if (incoming.size > 0) {
+                this.lastActivityMilliseconds[slot] =
+                    linuxMonotonicMilliseconds()
+                this.inputs[slot] = memoryPromoteString(
+                    "${this.inputs[slot]}$incoming"
+                )
+                if (this.inputs[slot].size >
+                    this.options.maximumHeaderBytes +
+                    this.options.maximumBodyBytes) {
+                    this.closeSlot(slot)
+                } else this.processSlot(slot)
+                reading = incoming.size == 32768 &&
+                    this.descriptors[slot] >= 0
+            } else reading = false
+        }
     }
     return
 }
@@ -579,7 +637,11 @@ fun HttpEventServer.step(timeoutMilliseconds: int = 1000): int {
         val descriptor = textReadU32LittleEndian(events, index + 4)
         val readable = (flags & 1) != 0
         val writable = (flags & 4) != 0
-        val closed = (flags & 16) != 0
+        // Linux reports an orderly peer half-close as EPOLLRDHUP (8192),
+        // while an abrupt hangup uses EPOLLHUP (16). The former hosted C
+        // adapter normalized both to bit 16; the all-Abla raw epoll path
+        // preserves native flags, so handle both without leaking the slot.
+        val closed = (flags & 16) != 0 || (flags & 8192) != 0
         val error = (flags & 8) != 0
         if (!this.draining &&
             descriptor == this.listener.descriptor && readable) {

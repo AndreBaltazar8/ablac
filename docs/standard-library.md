@@ -61,10 +61,9 @@ strings. Validation rejects overlong encodings, surrogate code points,
 truncation, and values beyond U+10FFFF. It has no locale or large Unicode table
 dependency and works during both staged and runtime execution.
 
-`abla/io` console output and EOF-aware line input now use the selected raw
-Linux descriptor implementation and work unchanged in hosted, JIT, and
-`x86_64-linux-raw` executables. `abla/fs` and `abla/process` now select the
-same complete raw Linux implementations used by the compiler, including
+`abla/io` console output and EOF-aware line input use the Linux descriptor
+implementation and work unchanged in hosted and JIT execution. `abla/fs` and
+`abla/process` use the same Linux implementations as the compiler, including
 atomic files, directory enumeration/watch identities, arguments, sleep, and
 command/child lifecycle. The narrow compatibility ABI remains isolated in
 `BufferedTextWriter` batches text behind an ordinary `(string) -> bool` sink.
@@ -92,7 +91,7 @@ surface: `newfstatat`, `getcwd`, `openat`, `read`, `write`, `fsync`, `mkdir`,
 `rename`, `unlink`/`rmdir`, and `getdents64` are issued from Abla, with owned
 native buffers for kernel out-parameters. The Linux self-hosted compiler uses
 it for module loading, cache files, atomic outputs, and watched graphs. The
-clean seed C backend preserves the same intrinsic contract while final LLVM
+the compiler preserves the same intrinsic contract while final LLVM
 output lowers it directly; portable applications select `abla/fs` explicitly.
 
 `abla/sys/linux/io` adds a stateful input reader that preserves bytes following

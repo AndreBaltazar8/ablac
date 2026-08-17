@@ -74,32 +74,5 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     index=$((index + 1))
 done
 
-if [[ -x ${ABLA_C_BACKEND_DRIVER:-} ]]; then
-    "$ABLA_C_BACKEND_DRIVER" \
-        "$project_root/tests/cases/c-backend/delegated-bindings.ab" \
-        >"$output_directory/program.c"
-else
-    "$compiler" build \
-        "$project_root/tests/cases/modules/delegated-bindings-c-backend.ab" \
-        -o "$output_directory/c-generator" --no-cache
-    "$project_root/tools/run-limited.sh" "$output_directory/c-generator" \
-        >"$output_directory/program.c"
-fi
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/program.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/c-program"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/c-program"
-c_status=$?
-set -e
-if [[ $c_status -ne 42 ]]; then
-    printf 'delegated bindings: generated C expected 42, got %s\n' \
-        "$c_status" >&2
-    exit 1
-fi
-
 printf '%s\n' \
-    'delegated bindings: contracts, projection, replacement, ownership, staging, LLVM, and C passed'
+    'delegated bindings: contracts, projection, replacement, ownership, staging, and LLVM passed'

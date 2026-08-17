@@ -1,0 +1,516 @@
+import "functions.ab"
+
+fun bootstrapLlvmAddPhiIncoming(
+    phi: i64*,
+    value: i64*,
+    block: i64*
+): void {
+    val values = llvmPointerVector(1)
+    val blocks = llvmPointerVector(1)
+    values.set(0, value)
+    blocks.set(0, block)
+    LLVMAddIncoming(phi, values.pointer(), blocks.pointer(), 1)
+    values.drop()
+    blocks.drop()
+}
+
+fun bootstrapLlvmWrapperScalarArgument(
+    backend: BootstrapLlvmBackend,
+    wrapper: i64*,
+    values: i64*,
+    count: i64*,
+    parameter: int,
+    scalar: string
+): i64* {
+    val present = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.argument.present"
+    )
+    val missing = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.argument.missing"
+    )
+    val ready = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.argument.ready"
+    )
+    val available = LLVMBuildICmp(
+        backend.builder, llvmIntUnsignedGreaterThan(), count,
+        LLVMConstInt(backend.i64Type, parameter, 0),
+        "wrapper.argument.available"
+    )
+    LLVMBuildCondBr(backend.builder, available, present, missing)
+    LLVMPositionBuilderAtEnd(backend.builder, present)
+    val boxed = bootstrapLlvmValueElement(
+        backend, values, parameter, "wrapper.argument"
+    )
+    val native = bootstrapLlvmCallNamed(
+        backend,
+        if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
+        [boxed], "wrapper.scalar", false, [true]
+    )
+    LLVMBuildBr(backend.builder, ready)
+    LLVMPositionBuilderAtEnd(backend.builder, missing)
+    val zero = LLVMConstInt(backend.type(scalar), 0, 0)
+    LLVMBuildBr(backend.builder, ready)
+    LLVMPositionBuilderAtEnd(backend.builder, ready)
+    val result = LLVMBuildPhi(
+        backend.builder, backend.type(scalar), "wrapper.argument.scalar"
+    )
+    bootstrapLlvmAddPhiIncoming(result, native, present)
+    bootstrapLlvmAddPhiIncoming(result, zero, missing)
+    result
+}
+
+fun bootstrapLlvmWrapperValueArgument(
+    backend: BootstrapLlvmBackend,
+    wrapper: i64*,
+    values: i64*,
+    count: i64*,
+    parameter: int
+): i64* {
+    val present = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.value.present"
+    )
+    val missing = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.value.missing"
+    )
+    val ready = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "wrapper.value.ready"
+    )
+    val available = LLVMBuildICmp(
+        backend.builder, llvmIntUnsignedGreaterThan(), count,
+        LLVMConstInt(backend.i64Type, parameter, 0),
+        "wrapper.value.available"
+    )
+    LLVMBuildCondBr(backend.builder, available, present, missing)
+    LLVMPositionBuilderAtEnd(backend.builder, present)
+    val supplied = bootstrapLlvmValueElement(
+        backend, values, parameter, "wrapper.argument"
+    )
+    LLVMBuildBr(backend.builder, ready)
+    LLVMPositionBuilderAtEnd(backend.builder, missing)
+    val fallback = LLVMBuildAlloca(
+        backend.builder, backend.valueType, "wrapper.missing.argument"
+    )
+    LLVMSetAlignment(fallback, 8)
+    bootstrapLlvmRuntimeCall(backend, "abla_void", fallback, [])
+    LLVMBuildBr(backend.builder, ready)
+    LLVMPositionBuilderAtEnd(backend.builder, ready)
+    val result = LLVMBuildPhi(
+        backend.builder, backend.pointerType, "wrapper.value.argument"
+    )
+    bootstrapLlvmAddPhiIncoming(result, supplied, present)
+    bootstrapLlvmAddPhiIncoming(result, fallback, missing)
+    result
+}
+
+fun bootstrapLlvmEmitGeneratedWrapper(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    symbol: string
+): void {
+    val wrapper = LLVMGetNamedFunction(backend.module, symbol)
+    val direct = LLVMGetNamedFunction(
+        backend.module, bootstrapLlvmDirectFunctionSymbol(symbol)
+    )
+    val entry = LLVMAppendBasicBlockInContext(
+        backend.context, wrapper, "entry"
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val output = LLVMGetParam(wrapper, 0)
+    val values = LLVMGetParam(wrapper, 1)
+    val count = LLVMGetParam(wrapper, 2)
+    val arguments: array<i64*> = []
+    if (!bootstrapLlvmDirectResultIsScalar(function)) {
+        arguments.append(output)
+    }
+    arguments.append(count)
+    var parameter = 0
+    while (parameter < function.parameters.size) {
+        val scalar = bootstrapLlvmDirectParameterScalarType(
+            function, parameter
+        )
+        if (scalar == "") {
+            arguments.append(bootstrapLlvmWrapperValueArgument(
+                backend, wrapper, values, count, parameter
+            ))
+        } else {
+            arguments.append(bootstrapLlvmWrapperScalarArgument(
+                backend, wrapper, values, count, parameter, scalar
+            ))
+        }
+        parameter = parameter + 1
+    }
+    bootstrapLlvmEmitDirectCall(
+        backend, function, direct, arguments, output
+    )
+    LLVMBuildRetVoid(backend.builder)
+    if (false) LLVMDisposeMessage(nativeNullPointer())
+}
+
+fun bootstrapLlvmDeclareDispatchers(
+    backend: BootstrapLlvmBackend
+): void {
+    bootstrapLlvmDeclare(
+        backend, "abla_llvm_call_indirect", backend.voidType,
+        [backend.pointerType, backend.pointerType,
+         backend.pointerType, backend.i64Type],
+        true, [false, false, false, false]
+    )
+    bootstrapLlvmDeclare(
+        backend, "abla_llvm_release_closure", backend.voidType,
+        [backend.pointerType], false, [false]
+    )
+    bootstrapLlvmDeclare(
+        backend, "abla_llvm_drop_closure", backend.voidType,
+        [backend.pointerType], false, [false]
+    )
+    if (false) LLVMDisposeMessage(nativeNullPointer())
+}
+
+fun bootstrapLlvmEmitClosureDispatchers(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    functionIndex: BootstrapLlvmNameIndex,
+    identities: BootstrapLlvmFunctionIdentities
+): void {
+    val release = LLVMGetNamedFunction(
+        backend.module, "abla_llvm_release_closure"
+    )
+    LLVMSetLinkage(release, llvmInternalLinkage())
+    val releaseEntry = LLVMAppendBasicBlockInContext(
+        backend.context, release, "entry"
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, releaseEntry)
+    bootstrapLlvmCallNamed(
+        backend, "abla_closure_release", [LLVMGetParam(release, 0)],
+        "", false, [true]
+    )
+    LLVMBuildRetVoid(backend.builder)
+
+    val drop = LLVMGetNamedFunction(
+        backend.module, "abla_llvm_drop_closure"
+    )
+    LLVMSetLinkage(drop, llvmInternalLinkage())
+    val entry = LLVMAppendBasicBlockInContext(
+        backend.context, drop, "entry"
+    )
+    val releaseBlock = LLVMAppendBasicBlockInContext(
+        backend.context, drop, "release"
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val dropResult = LLVMBuildAlloca(
+        backend.builder, backend.valueType, "drop.result"
+    )
+    val closure = LLVMGetParam(drop, 0)
+    val functionId = bootstrapLlvmCallNamed(
+        backend, "abla_as_function", [closure],
+        "function.id", false, [true]
+    )
+    val captures = bootstrapLlvmCallNamed(
+        backend, "abla_function_capture_pointer", [closure],
+        "captures", false, [true]
+    )
+    val captureCount = bootstrapLlvmCallNamed(
+        backend, "abla_function_capture_count", [closure],
+        "capture.count", false, [true]
+    )
+    val switch = LLVMBuildSwitch(
+        backend.builder, functionId, releaseBlock, program.functions.size
+    )
+    var original = 0
+    while (original < program.functions.size) {
+        val dropFunction = functionIndex.find(
+            bootstrapClosureDropFunctionName(
+                program.functions[original].name
+            )
+        )
+        if (dropFunction >= 0) {
+            val case = LLVMAppendBasicBlockInContext(
+                backend.context, drop, "drop.captures"
+            )
+            LLVMAddCase(
+                switch,
+                LLVMConstInt(
+                    backend.i32Type, identities.runtimeIds[original], 0
+                ),
+                case
+            )
+            LLVMPositionBuilderAtEnd(backend.builder, case)
+            bootstrapLlvmCall(
+                backend,
+                LLVMGetNamedFunction(
+                    backend.module, identities.symbols[dropFunction]
+                ),
+                [dropResult, captures, captureCount],
+                "", true, [false, false, false]
+            )
+            LLVMBuildBr(backend.builder, releaseBlock)
+        }
+        original = original + 1
+    }
+    LLVMPositionBuilderAtEnd(backend.builder, releaseBlock)
+    bootstrapLlvmCallNamed(
+        backend, "abla_closure_release", [closure],
+        "", false, [true]
+    )
+    LLVMBuildRetVoid(backend.builder)
+    if (false) LLVMDisposeMessage(nativeNullPointer())
+}
+
+fun bootstrapLlvmEmitIndirectDispatcher(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    addressTaken: array<bool>,
+    identities: BootstrapLlvmFunctionIdentities
+): void {
+    val function = LLVMGetNamedFunction(
+        backend.module, "abla_llvm_call_indirect"
+    )
+    LLVMSetLinkage(function, llvmInternalLinkage())
+    val output = LLVMGetParam(function, 0)
+    val closure = LLVMGetParam(function, 1)
+    val arguments = LLVMGetParam(function, 2)
+    val count = LLVMGetParam(function, 3)
+    val entry = LLVMAppendBasicBlockInContext(
+        backend.context, function, "entry"
+    )
+    val captureCondition = LLVMAppendBasicBlockInContext(
+        backend.context, function, "capture.condition"
+    )
+    val captureBody = LLVMAppendBasicBlockInContext(
+        backend.context, function, "capture.body"
+    )
+    val argumentCondition = LLVMAppendBasicBlockInContext(
+        backend.context, function, "argument.condition"
+    )
+    val argumentBody = LLVMAppendBasicBlockInContext(
+        backend.context, function, "argument.body"
+    )
+    val dispatch = LLVMAppendBasicBlockInContext(
+        backend.context, function, "dispatch"
+    )
+    val invalid = LLVMAppendBasicBlockInContext(
+        backend.context, function, "invalid.function"
+    )
+    val foreign = LLVMAppendBasicBlockInContext(
+        backend.context, function, "foreign.callback"
+    )
+    val foreignInvalid = LLVMAppendBasicBlockInContext(
+        backend.context, function, "foreign.invalid"
+    )
+    val done = LLVMAppendBasicBlockInContext(
+        backend.context, function, "done"
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val captureCount = bootstrapLlvmCallNamed(
+        backend, "abla_function_capture_count", [closure],
+        "capture.count", false, [true]
+    )
+    val total = LLVMBuildAdd(
+        backend.builder, captureCount, count, "argument.total"
+    )
+    val merged = LLVMBuildArrayAlloca(
+        backend.builder, backend.valueType, total, "merged.arguments"
+    )
+    LLVMSetAlignment(merged, 8)
+    LLVMBuildBr(backend.builder, captureCondition)
+
+    LLVMPositionBuilderAtEnd(backend.builder, captureCondition)
+    val captureIndex = LLVMBuildPhi(
+        backend.builder, backend.i64Type, "capture.index"
+    )
+    bootstrapLlvmAddPhiIncoming(
+        captureIndex, LLVMConstInt(backend.i64Type, 0, 0), entry
+    )
+    val captureMore = LLVMBuildICmp(
+        backend.builder, llvmIntUnsignedLessThan(),
+        captureIndex, captureCount, "capture.more"
+    )
+    LLVMBuildCondBr(
+        backend.builder, captureMore, captureBody, argumentCondition
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, captureBody)
+    val captureDestinationIndices = llvmPointerVector(1)
+    captureDestinationIndices.set(0, captureIndex)
+    val captureDestination = LLVMBuildGEP2(
+        backend.builder, backend.valueType, merged,
+        captureDestinationIndices.pointer(), 1, "capture.destination"
+    )
+    captureDestinationIndices.drop()
+    bootstrapLlvmCallNamed(
+        backend, "abla_function_capture",
+        [captureDestination, closure, captureIndex],
+        "", true, [false, true, false]
+    )
+    val captureNext = LLVMBuildAdd(
+        backend.builder, captureIndex,
+        LLVMConstInt(backend.i64Type, 1, 0), "capture.next"
+    )
+    LLVMBuildBr(backend.builder, captureCondition)
+    bootstrapLlvmAddPhiIncoming(
+        captureIndex, captureNext, captureBody
+    )
+
+    LLVMPositionBuilderAtEnd(backend.builder, argumentCondition)
+    val argumentIndex = LLVMBuildPhi(
+        backend.builder, backend.i64Type, "argument.index"
+    )
+    bootstrapLlvmAddPhiIncoming(
+        argumentIndex, LLVMConstInt(backend.i64Type, 0, 0), captureCondition
+    )
+    val argumentMore = LLVMBuildICmp(
+        backend.builder, llvmIntUnsignedLessThan(),
+        argumentIndex, count, "argument.more"
+    )
+    LLVMBuildCondBr(
+        backend.builder, argumentMore, argumentBody, dispatch
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, argumentBody)
+    val sourceIndices = llvmPointerVector(1)
+    sourceIndices.set(0, argumentIndex)
+    val source = LLVMBuildGEP2(
+        backend.builder, backend.valueType, arguments,
+        sourceIndices.pointer(), 1, "argument.source"
+    )
+    sourceIndices.drop()
+    val position = LLVMBuildAdd(
+        backend.builder, captureCount, argumentIndex, "argument.position"
+    )
+    val destinationIndices = llvmPointerVector(1)
+    destinationIndices.set(0, position)
+    val destination = LLVMBuildGEP2(
+        backend.builder, backend.valueType, merged,
+        destinationIndices.pointer(), 1, "argument.destination"
+    )
+    destinationIndices.drop()
+    bootstrapLlvmCopyValue(
+        backend, source, destination, "argument.value"
+    )
+    val argumentNext = LLVMBuildAdd(
+        backend.builder, argumentIndex,
+        LLVMConstInt(backend.i64Type, 1, 0), "argument.next"
+    )
+    LLVMBuildBr(backend.builder, argumentCondition)
+    bootstrapLlvmAddPhiIncoming(
+        argumentIndex, argumentNext, argumentBody
+    )
+
+    LLVMPositionBuilderAtEnd(backend.builder, dispatch)
+    val functionId = bootstrapLlvmCallNamed(
+        backend, "abla_as_function", [closure],
+        "function.id", false, [true]
+    )
+    val switch = LLVMBuildSwitch(
+        backend.builder, functionId, invalid, program.functions.size + 1
+    )
+    LLVMAddCase(
+        switch, LLVMConstInt(backend.i32Type, -1, 1), foreign
+    )
+    var functionIndex = 0
+    while (functionIndex < program.functions.size) {
+        if (addressTaken[functionIndex]) {
+            val case = LLVMAppendBasicBlockInContext(
+                backend.context, function, "indirect.call"
+            )
+            LLVMAddCase(
+                switch, LLVMConstInt(
+                    backend.i32Type, identities.runtimeIds[functionIndex], 0
+                ), case
+            )
+            LLVMPositionBuilderAtEnd(backend.builder, case)
+            bootstrapLlvmCall(
+                backend,
+                LLVMGetNamedFunction(
+                    backend.module, identities.symbols[functionIndex]
+                ),
+                [output, merged, total], "", true,
+                [false, false, false]
+            )
+            LLVMBuildBr(backend.builder, done)
+        }
+        functionIndex = functionIndex + 1
+    }
+
+    LLVMPositionBuilderAtEnd(backend.builder, foreign)
+    val captureValid = LLVMBuildICmp(
+        backend.builder, llvmIntEqual(), captureCount,
+        LLVMConstInt(backend.i64Type, 2, 0), "foreign.captures.valid"
+    )
+    val countValid = LLVMBuildICmp(
+        backend.builder, llvmIntEqual(), count,
+        LLVMConstInt(backend.i64Type, 1, 0), "foreign.arguments.valid"
+    )
+    val signatureValid = LLVMBuildAnd(
+        backend.builder, captureValid, countValid, "foreign.valid"
+    )
+    val invoke = LLVMAppendBasicBlockInContext(
+        backend.context, function, "foreign.invoke"
+    )
+    LLVMBuildCondBr(
+        backend.builder, signatureValid, invoke, foreignInvalid
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, invoke)
+    val callbackInteger = bootstrapLlvmCallNamed(
+        backend, "abla_as_i64", [merged],
+        "foreign.callback.address", false, [true]
+    )
+    val contextValue = bootstrapLlvmValueElement(
+        backend, merged, 1, "foreign.context.value"
+    )
+    val contextInteger = bootstrapLlvmCallNamed(
+        backend, "abla_as_i64", [contextValue],
+        "foreign.context.address", false, [true]
+    )
+    val argumentValue = bootstrapLlvmValueElement(
+        backend, merged, 2, "foreign.argument.value"
+    )
+    val argumentInteger = bootstrapLlvmCallNamed(
+        backend, "abla_as_i64", [argumentValue],
+        "foreign.argument", false, [true]
+    )
+    val callbackPointer = LLVMBuildIntToPtr(
+        backend.builder, callbackInteger, backend.pointerType,
+        "foreign.callback"
+    )
+    val contextPointer = LLVMBuildIntToPtr(
+        backend.builder, contextInteger, backend.pointerType,
+        "foreign.context"
+    )
+    val callbackType = bootstrapLlvmFunctionType(
+        backend, backend.i64Type, [backend.pointerType, backend.i64Type]
+    )
+    val callbackResult = bootstrapLlvmCallTyped(
+        backend, callbackType, callbackPointer,
+        [contextPointer, argumentInteger], "foreign.result"
+    )
+    bootstrapLlvmCallNamed(
+        backend, "abla_i64", [output, callbackResult],
+        "", true, [false, false]
+    )
+    LLVMBuildBr(backend.builder, done)
+
+    LLVMPositionBuilderAtEnd(backend.builder, foreignInvalid)
+    val foreignMessage = LLVMBuildGlobalStringPtr(
+        backend.builder, "invalid foreign callback", "foreign.error"
+    )
+    bootstrapLlvmCallNamed(
+        backend, "abla_platform_panic",
+        [foreignMessage, LLVMConstInt(backend.i64Type, 24, 0)],
+        "", false, [false, false]
+    )
+    LLVMBuildUnreachable(backend.builder)
+
+    LLVMPositionBuilderAtEnd(backend.builder, invalid)
+    val invalidMessage = LLVMBuildGlobalStringPtr(
+        backend.builder, "invalid function reference", "function.error"
+    )
+    bootstrapLlvmCallNamed(
+        backend, "abla_platform_panic",
+        [invalidMessage, LLVMConstInt(backend.i64Type, 26, 0)],
+        "", false, [false, false]
+    )
+    LLVMBuildUnreachable(backend.builder)
+
+    LLVMPositionBuilderAtEnd(backend.builder, done)
+    LLVMBuildRetVoid(backend.builder)
+    if (false) LLVMDisposeMessage(nativeNullPointer())
+}

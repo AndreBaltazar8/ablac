@@ -220,7 +220,7 @@ resource class Socket(val descriptor: int) {
 non-`void`/parameterized signature are rejected. The compiler generates one
 verified drop helper per reachable affine type. Direct resources, structural
 wrappers, nested fields, arrays, and nullable resources therefore clean up
-recursively at compile time, in LLVM, and in generated C. Replacing an affine
+recursively at compile time and in LLVM. Replacing an affine
 field or array element drops the previous value first.
 
 Consuming a field or element clears only that slot and leaves the owner
@@ -239,7 +239,7 @@ capture layout. An uninvoked, replaced, returned-from, nested, or
 container-held `FnOnce` recursively destroys its still-owned captures and
 releases its environment; invocation transfers those captures into the lambda
 body and releases the environment afterward. Compile-time evaluation, LLVM,
-and generated C use the same rule.
+and native LLVM execution use the same rule.
 
 `move(local)` transfers an affine local and invalidates the source binding on
 every control-flow path. A subsequent read or second move is rejected by the

@@ -5,7 +5,6 @@ compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/affine-move"
 mkdir -p "$output_directory"
-c_differential_compiler=${ABLA_C_DIFFERENTIAL_COMPILER:-}
 
 "$compiler" build "$project_root/tests/cases/modules/affine-move.ab" \
     -o "$output_directory/program"
@@ -29,26 +28,6 @@ if [[ $owned_status -ne 42 ]]; then
     exit 1
 fi
 
-if [[ -n $c_differential_compiler ]]; then
-    "$c_differential_compiler" \
-        "$project_root/tests/cases/modules/owned-parameters.ab" \
-        > "$output_directory/owned-parameters.c"
-    clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-        -I"$project_root/runtime" \
-        "$output_directory/owned-parameters.c" \
-        "$project_root/runtime/abla_runtime.c" \
-        "$project_root/runtime/abla_runtime_host.c" \
-        -o "$output_directory/owned-parameters-c"
-    set +e
-    "$project_root/tools/run-limited.sh" "$output_directory/owned-parameters-c"
-    owned_c_status=$?
-    set -e
-    if [[ $owned_c_status -ne 42 ]]; then
-        echo "affine move: C owned parameters expected 42, got $owned_c_status" >&2
-        exit 1
-    fi
-fi
-
 "$compiler" build "$project_root/tests/cases/modules/mutable-borrows.ab" \
     -o "$output_directory/mutable-borrows"
 set +e
@@ -58,26 +37,6 @@ set -e
 if [[ $mutable_status -ne 42 ]]; then
     echo "affine move: mutable borrows expected 42, got $mutable_status" >&2
     exit 1
-fi
-
-if [[ -n $c_differential_compiler ]]; then
-    "$c_differential_compiler" \
-        "$project_root/tests/cases/modules/mutable-borrows.ab" \
-        > "$output_directory/mutable-borrows.c"
-    clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-        -I"$project_root/runtime" \
-        "$output_directory/mutable-borrows.c" \
-        "$project_root/runtime/abla_runtime.c" \
-        "$project_root/runtime/abla_runtime_host.c" \
-        -o "$output_directory/mutable-borrows-c"
-    set +e
-    "$project_root/tools/run-limited.sh" "$output_directory/mutable-borrows-c"
-    mutable_c_status=$?
-    set -e
-    if [[ $mutable_c_status -ne 42 ]]; then
-        echo "affine move: C mutable borrows expected 42, got $mutable_c_status" >&2
-        exit 1
-    fi
 fi
 
 "$compiler" build \
@@ -390,119 +349,4 @@ if [[ $result -ne 1 ]] || ! grep -Fq 'move.local' "$output.err"; then
 fi
 [[ ! -e $output ]]
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/affine-move-c-backend.ab" \
-    -o "$output_directory/c-generator" --no-cache
-"$project_root/tools/run-limited.sh" "$output_directory/c-generator" \
-    >"$output_directory/program.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/program.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/c-program"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/c-program"
-c_status=$?
-set -e
-if [[ $c_status -ne 42 ]]; then
-    echo "affine move: C backend expected 42, got $c_status" >&2
-    exit 1
-fi
-
-if [[ -n $c_differential_compiler ]]; then
-"$c_differential_compiler" \
-    "$project_root/tests/cases/modules/resource-lambda-capture.ab" \
-    > "$output_directory/resource-lambda-capture.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/resource-lambda-capture.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/resource-lambda-capture-c"
-set +e
-"$project_root/tools/run-limited.sh" \
-    "$output_directory/resource-lambda-capture-c"
-capture_c_status=$?
-set -e
-if [[ $capture_c_status -ne 42 ]]; then
-    echo "affine move: C owning lambda expected 42, got $capture_c_status" >&2
-    exit 1
-fi
-
-"$c_differential_compiler" \
-    "$project_root/tests/cases/modules/resource-lambda-drop.ab" \
-    > "$output_directory/resource-lambda-drop.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/resource-lambda-drop.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/resource-lambda-drop-c"
-set +e
-"$project_root/tools/run-limited.sh" \
-    "$output_directory/resource-lambda-drop-c"
-lambda_drop_c_status=$?
-set -e
-if [[ $lambda_drop_c_status -ne 42 ]]; then
-    echo "affine move: C FnOnce environment drops expected 42, got $lambda_drop_c_status" >&2
-    exit 1
-fi
-
-"$c_differential_compiler" \
-    "$project_root/tests/cases/modules/place-move.ab" \
-    > "$output_directory/place-move.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/place-move.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/place-move-c"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/place-move-c"
-place_c_status=$?
-set -e
-if [[ $place_c_status -ne 42 ]]; then
-    echo "affine move: C field/index moves expected 42, got $place_c_status" >&2
-    exit 1
-fi
-
-"$c_differential_compiler" \
-    "$project_root/tests/cases/modules/resource-drop.ab" \
-    > "$output_directory/resource-drop.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/resource-drop.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/resource-drop-c"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/resource-drop-c"
-drop_c_status=$?
-set -e
-if [[ $drop_c_status -ne 42 ]]; then
-    echo "affine move: C deterministic drops expected 42, got $drop_c_status" >&2
-    exit 1
-fi
-
-"$c_differential_compiler" \
-    "$project_root/tests/cases/modules/resource-structural-drop.ab" \
-    > "$output_directory/resource-structural-drop.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/resource-structural-drop.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/resource-structural-drop-c"
-set +e
-"$project_root/tools/run-limited.sh" \
-    "$output_directory/resource-structural-drop-c"
-structural_drop_c_status=$?
-set -e
-if [[ $structural_drop_c_status -ne 42 ]]; then
-    echo "affine move: C structural drops expected 42, got $structural_drop_c_status" >&2
-    exit 1
-fi
-fi
-
-echo "affine resources: own/var borrows + mode-bearing callables + FnOnce + partial places + recursive drops + CFG + compile-time/LLVM/C passed"
+echo "affine resources: own/var borrows + mode-bearing callables + FnOnce + partial places + recursive drops + CFG + compile-time/LLVM passed"

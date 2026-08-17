@@ -8,7 +8,7 @@ import "abla/llvm/aot"
 
 fun bootstrapOrcEmit(sourcePath: string): int {
     bootstrapBeginCompileOutputs()
-    val parsed = bootstrapParseModule(sourcePath)
+    val parsed = bootstrapParseHostModuleWithRuntime(sourcePath)
     var status = 1
     val compilation = bootstrapCompileLlvmParsed(parsed)
     val requestedPrograms = bootstrapTakeCompileProgramRequests()
@@ -39,11 +39,6 @@ fun bootstrapOrcEmit(sourcePath: string): int {
 fun bootstrapRunInProcess(sourcePath: string): int {
     val prepared = bootstrapPrepareRun(sourcePath)
     var status = prepared.status
-    if (status == 0) {
-        val hostLibrary = "build/.abla-jit-host.so"
-        status = bootstrapBuildJitHostLibrary(hostLibrary)
-        if (status == 0) status = llvmLoadLibraryPermanently(hostLibrary)
-    }
     if (status == 0) status = llvmOrcRunFile(prepared.llvmPath)
     status
 }
@@ -446,6 +441,7 @@ fun bootstrapReplDeclaration(line: string): bool {
 fun bootstrapRepl(): int {
     val session = llvmOrcCreateSession()
     val standardInput = linuxStandardInput()
+    val sourcePath = "build/.abla-repl-source.ab"
     var declarations = ""
     var status = session.status
     var running = status == 0
@@ -460,42 +456,58 @@ fun bootstrapRepl(): int {
             linuxPrintStandardOutput("reset\n")
         } else if (line != "" && bootstrapReplDeclaration(line)) {
             val source = "$declarations$line\nfun main: int = 0\n"
-            val compilation = bootstrapCompileLlvm(source)
-            if (compilation.errors != 0) {
-                linuxPrintStandardError(compilation.diagnostics)
+            if (!Path(sourcePath).writeTextAtomic(source)) {
+                status = 141
+                running = false
             } else {
-                declarations = "$declarations$line\n"
-                linuxPrintStandardOutput("defined\n")
+                val compilation = bootstrapCompileLlvmParsed(
+                    bootstrapParseHostModuleWithRuntime(sourcePath)
+                )
+                if (compilation.errors != 0) {
+                    linuxPrintStandardError(compilation.diagnostics)
+                } else {
+                    declarations = "$declarations$line\n"
+                    linuxPrintStandardOutput("defined\n")
+                }
             }
         } else if (line != "") {
             region {
                 val source = "$declarations\nfun main: int = $line\n"
-                val compilation = bootstrapCompileLlvm(source)
-                if (compilation.errors != 0) {
-                    linuxPrintStandardError(compilation.diagnostics)
+                if (!Path(sourcePath).writeTextAtomic(source)) {
+                    status = 141
+                    running = false
                 } else {
-                    val llvmPath = "build/.abla-repl.ll"
-                    if (!Path(llvmPath).writeTextAtomic(compilation.output)) {
-                        status = 141
-                        running = false
+                    val compilation = bootstrapCompileLlvmParsed(
+                        bootstrapParseHostModuleWithRuntime(sourcePath)
+                    )
+                    if (compilation.errors != 0) {
+                        linuxPrintStandardError(compilation.diagnostics)
                     } else {
-                        val generation = session.addFile(llvmPath)
-                        if (generation.status != 0) {
-                            status = generation.status
+                        val llvmPath = "build/.abla-repl.ll"
+                        if (!Path(llvmPath).writeTextAtomic(
+                            compilation.output
+                        )) {
+                            status = 141
                             running = false
                         } else {
-                            val lookup = session.lookup("main")
-                            if (lookup.status != 0) {
-                                status = lookup.status
+                            val generation = session.addFile(llvmPath)
+                            if (generation.status != 0) {
+                                status = generation.status
                                 running = false
                             } else {
-                                val value = callNativeMain(lookup.address)
-                                linuxPrintStandardOutput("$value\n")
-                            }
-                            val removeStatus = generation.remove()
-                            if (status == 0 && removeStatus != 0) {
-                                status = removeStatus
-                                running = false
+                                val lookup = session.lookup("main")
+                                if (lookup.status != 0) {
+                                    status = lookup.status
+                                    running = false
+                                } else {
+                                    val value = callNativeMain(lookup.address)
+                                    linuxPrintStandardOutput("$value\n")
+                                }
+                                val removeStatus = generation.remove()
+                                if (status == 0 && removeStatus != 0) {
+                                    status = removeStatus
+                                    running = false
+                                }
                             }
                         }
                     }

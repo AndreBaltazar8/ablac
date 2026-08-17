@@ -19,6 +19,21 @@ class BootstrapTargetDescriptor(
     val valid: bool
 )
 
+// Direct host LLVM emission uses the same source runtime graph as a normal
+// host build. This keeps `--emit-llvm` a faithful diagnostic view instead of
+// silently relying on declarations that only the linker path injects.
+fun bootstrapParseHostModuleWithRuntime(
+    sourcePath: string
+): BootstrapParseResult {
+    val state = bootstrapModuleState()
+    val graph = BootstrapModuleGraph([], 0, state, [], [], "", [])
+    val standardLibrary = Path(bootstrapStandardLibraryRoot())
+    graph.load(standardLibrary.child("abla/runtime/self/entry.ab").text)
+    graph.load(standardLibrary.child("abla/runtime/platform/host.ab").text)
+    graph.load(sourcePath)
+    graph.parse()
+}
+
 fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
     var result = BootstrapTargetDescriptor(
         name, "", "", false, false, "", "", "", false
@@ -32,19 +47,6 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             false,
             "main",
             "host-clang",
-            "elf_x86_64",
-            true
-        )
-    }
-    if (name == "x86_64-linux-raw" && !ablaHostIsMacOS()) {
-        result = BootstrapTargetDescriptor(
-            name,
-            "x86_64-unknown-linux-gnu",
-            "elf",
-            false,
-            true,
-            "_start",
-            "lld-elf",
             "elf_x86_64",
             true
         )
@@ -112,7 +114,7 @@ fun bootstrapDefinedTargetDescriptor(
 
 fun bootstrapSupportedTargets(): string =
     if (ablaHostIsMacOS()) bootstrapHostTargetName()
-    else "x86_64-linux, x86_64-linux-raw"
+    else "x86_64-linux"
 
 class BootstrapNativeBuild(
     val status: int,
@@ -285,6 +287,28 @@ fun bootstrapNativeParallelism(): int {
     jobs
 }
 
+// Explicit @inline functions must be folded before llvm-split/llvm-extract
+// separates them from their callers. Keep this deliberately narrower than a
+// whole-module O1 pipeline: LLVM's heuristic inliner duplicates large Abla
+// helpers across thousands of compiler call sites. The function-local cleanup
+// immediately collapses the scalar/default-argument scaffolding introduced by
+// the forced inline, leaving ordinary non-annotated functions out of line.
+fun bootstrapPreparePartitionLlvm(
+    llvmPath: string,
+    preparedPath: string
+): int {
+    val prepare = linuxCommand("opt")
+    prepare.argument("--threads=1")
+    prepare.argument(
+        "-passes=always-inline,function(sroa,mem2reg,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse,adce),globaldce"
+    )
+    prepare.argument("-S")
+    prepare.argument(llvmPath)
+    prepare.argument("-o")
+    prepare.argument(preparedPath)
+    prepare.run()
+}
+
 fun bootstrapEmitParallelObject(
     llvmPath: string,
     objectPath: string
@@ -292,13 +316,15 @@ fun bootstrapEmitParallelObject(
     val jobs = bootstrapNativeParallelism()
     val partCount = jobs * 2
     val prefix = "$objectPath.parallel."
+    val preparedPath = "$objectPath.prepartition.ll"
+    var status = bootstrapPreparePartitionLlvm(llvmPath, preparedPath)
     val split = linuxCommand("llvm-split")
     split.argument("-j")
     split.argument("$partCount")
     split.argument("-o")
     split.argument(prefix)
-    split.argument(llvmPath)
-    var status = split.run()
+    split.argument(preparedPath)
+    if (status == 0) status = split.run()
     var next = 0
     val children: array<int> = []
     while (status == 0 && next < jobs && next < partCount) {
@@ -367,6 +393,7 @@ fun bootstrapEmitParallelObject(
         Path("$prefix$cleanup.o").remove()
         cleanup = cleanup + 1
     }
+    Path(preparedPath).remove()
     status
 }
 
@@ -493,12 +520,15 @@ fun bootstrapEmitPartitionedObject(
     cacheNamespace: string,
     allowPartitionCache: bool
 ): BootstrapPartitionEmission {
-    val llvm = Path(llvmPath).readText()
+    val preparedPath = "$objectPath.prepartition.ll"
+    var status = bootstrapPreparePartitionLlvm(llvmPath, preparedPath)
+    val llvm = if (status == 0) Path(preparedPath).readText() else ""
     val symbols = bootstrapLlvmUserFunctionSymbols(llvm)
-    var status = 0
     var reused = 0
     var refreshed = 0
-    if (symbols.size <= 1) status = emitObject(llvmPath, objectPath)
+    if (status == 0 && symbols.size <= 1) {
+        status = emitObject(preparedPath, objectPath)
+    }
     if (symbols.size > 1) {
         var bucketCount = (symbols.size + 31) / 32
         if (bucketCount < 1) bucketCount = 1
@@ -524,7 +554,7 @@ fun bootstrapEmitPartitionedObject(
         val rootLlvm = "$objectPath.root.ll"
         val rootObject = "$objectPath.root.o"
         status = bootstrapExtractLlvmFunctions(
-            llvmPath,
+            preparedPath,
             rootLlvm,
             symbols,
             true
@@ -551,16 +581,16 @@ fun bootstrapEmitPartitionedObject(
                 // partition and can otherwise accumulate across every bucket
                 // in a large native build.
                 partBuckets.append(bucket)
-                val partitionCheckpoint = ablaRuntimeMemoryCheckpoint()
+                val partitionCheckpoint = runtimeMemoryCheckpoint()
                 status = bootstrapExtractLlvmFunctions(
-                    llvmPath,
+                    preparedPath,
                     partLlvm,
                     buckets[bucket],
                     false
                 )
                 var identity = ""
                 if (status == 0) {
-                    identity = "partition-v2:$cacheProfile:${Path(
+                    identity = "partition-v3:$cacheProfile:${Path(
                         partLlvm
                     ).readText()}"
                 }
@@ -601,7 +631,7 @@ fun bootstrapEmitPartitionedObject(
                         if (copyStatus != 0) Path(temporary).remove()
                     }
                 }
-                ablaRuntimeMemoryReset(partitionCheckpoint)
+                runtimeMemoryReset(partitionCheckpoint)
             }
             bucket = bucket + 1
         }
@@ -623,6 +653,7 @@ fun bootstrapEmitPartitionedObject(
             status = combine.run()
         }
     }
+    Path(preparedPath).remove()
     BootstrapPartitionEmission(status, reused, refreshed)
 }
 
@@ -849,8 +880,20 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val selfHostedRuntime = Path(bootstrapStandardLibraryRoot()).child(
         "abla/runtime/self/entry.ab"
     ).text
+    val runtimePlatform = Path(bootstrapStandardLibraryRoot()).child(
+        if (target.objectFormat == "wasm") {
+            "abla/runtime/platform/wasm.ab"
+        } else "abla/runtime/platform/host.ab"
+    ).text
     val rootSource = graph.load(sourcePath)
-    val source = "${graph.load(selfHostedRuntime)}\n$rootSource"
+    val runtimePlatformSource = graph.load(runtimePlatform)
+    val source = "${graph.load(selfHostedRuntime)}\n$runtimePlatformSource\n$rootSource"
+    // Platform libraries remain demand-driven. Detect the narrow TLS ABI in
+    // the resolved module graph so programs that do not import hosted TLS do
+    // not gain either a dependency or dynamic-loader startup work.
+    val linkOpenSsl = bootstrapTextContains(
+        source, "fun OpenSSL_version_num()"
+    )
     // Filesystem-read providers have serialized content identities. Other
     // ambient effects remain uncached because they do not yet have a stable
     // deterministic provider contract.
@@ -860,15 +903,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val llvmPath = "$outputPath.ll"
     val objectPath = "$outputPath.o"
     val hostPath = "$outputPath.host.o"
-    val llvmHostPath = "$outputPath.llvm-host.o"
-    val valueRuntimePath = "$outputPath.value-runtime.o"
     val ltoObjectPath = "$outputPath.lto-program.o"
-    val ltoValueRuntimePath = "$outputPath.lto-value-runtime.o"
-    val ltoHostPath = "$outputPath.lto-host.o"
-    val ltoWasmPlatformPath = "$outputPath.lto-wasm-platform.o"
-    val wasmPlatformPath = "$outputPath.wasm-platform.o"
-    val rawAdaptersPath = "$outputPath.raw-adapters.o"
-    val rawRuntimePath = "$outputPath.raw-runtime.o"
     val combinedObjectPath = "$outputPath.combined.o"
     val publishPath = "$outputPath.tmp.${linuxProcessId()}"
     val optimizedWasmPath = "$outputPath.wasm-opt.tmp.${linuxProcessId()}"
@@ -911,7 +946,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     )
     val cacheDirectory = "build/.abla-cache"
     val partitionCacheNamespace =
-        "$cacheDirectory/native-partition-${target.name}-llvm21-v1-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
+        "$cacheDirectory/native-partition-${target.name}-llvm21-v2-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
     val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v13-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
     val cacheObjectPath = "$cacheStem.o"
     val cacheLlvmPath = "$cacheStem.ll"
@@ -948,15 +983,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // before publishing a fresh build.
     Path("$outputPath.runtime.o").remove()
     Path(hostPath).remove()
-    Path(llvmHostPath).remove()
-    Path(valueRuntimePath).remove()
     Path(ltoObjectPath).remove()
-    Path(ltoValueRuntimePath).remove()
-    Path(ltoHostPath).remove()
-    Path(ltoWasmPlatformPath).remove()
-    Path(wasmPlatformPath).remove()
-    Path(rawAdaptersPath).remove()
-    Path(rawRuntimePath).remove()
     Path(combinedObjectPath).remove()
     Path(publishPath).remove()
     Path(optimizedWasmPath).remove()
@@ -1153,108 +1180,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = 147
         failureKind = "reported"
     }
-    if (status == 0 && rawTarget && artifact == "executable") {
-        val compileRawRuntime = linuxCommand("clang")
-        compileRawRuntime.argument("-c")
-        compileRawRuntime.argument("-nostdlib")
-        compileRawRuntime.argument(
-            Path(bootstrapRuntimeRoot()).child(
-                "abla_linux_raw_x86_64.S"
-            ).text
-        )
-        compileRawRuntime.argument("-o")
-        compileRawRuntime.argument(rawRuntimePath)
-        status = compileRawRuntime.run()
-    }
-    if (status == 0 && rawTarget && artifact == "executable") {
-        val compileValueRuntime = linuxCommand("clang")
-        compileValueRuntime.argument("-std=c11")
-        compileValueRuntime.argument("-O2")
-        compileValueRuntime.argument("-ffreestanding")
-        compileValueRuntime.argument("-fno-stack-protector")
-        compileValueRuntime.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
-        compileValueRuntime.argument("-ffunction-sections")
-        compileValueRuntime.argument("-fdata-sections")
-        compileValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
-        compileValueRuntime.argument("-c")
-        compileValueRuntime.argument(
-            Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
-        )
-        compileValueRuntime.argument("-o")
-        compileValueRuntime.argument(valueRuntimePath)
-        status = compileValueRuntime.run()
-    }
-    if (status == 0 && rawTarget && artifact == "executable") {
-        val compileRawAdapters = linuxCommand("clang")
-        compileRawAdapters.argument("-std=c11")
-        compileRawAdapters.argument("-O2")
-        compileRawAdapters.argument("-ffreestanding")
-        compileRawAdapters.argument("-fno-stack-protector")
-        compileRawAdapters.argument("-ffunction-sections")
-        compileRawAdapters.argument("-fdata-sections")
-        compileRawAdapters.argument("-I${bootstrapRuntimeRoot()}")
-        compileRawAdapters.argument("-c")
-        compileRawAdapters.argument(
-            Path(bootstrapRuntimeRoot()).child("abla_runtime_raw.c").text
-        )
-        compileRawAdapters.argument("-o")
-        compileRawAdapters.argument(rawAdaptersPath)
-        status = compileRawAdapters.run()
-    }
-    if (status == 0 && target.hosted && artifact != "object") {
-        val compileValueRuntime = linuxCommand("env")
-        // Packaged relocatable objects may be linked against a different libc
-        // (for example Nix/glibc locally and Alpine/musl in Icy). Do not let a
-        // host compiler wrapper rewrite portable calls to private libc symbols.
-        compileValueRuntime.argument("NIX_HARDENING_ENABLE=")
-        compileValueRuntime.argument("clang")
-        compileValueRuntime.argument("-std=c11")
-        compileValueRuntime.argument("-O2")
-        compileValueRuntime.argument("-ffunction-sections")
-        compileValueRuntime.argument("-fdata-sections")
-        compileValueRuntime.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
-        if (artifact == "shared-library") {
-            compileValueRuntime.argument("-fPIC")
-        }
-        if (macTarget) {
-            compileValueRuntime.argument("-isysroot")
-            compileValueRuntime.argument(macSdkRoot)
-        }
-        compileValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
-        compileValueRuntime.argument("-c")
-        compileValueRuntime.argument(
-            Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
-        )
-        compileValueRuntime.argument("-o")
-        compileValueRuntime.argument(valueRuntimePath)
-        status = compileValueRuntime.run()
-    }
-    if (status == 0 && target.hosted && artifact != "object") {
-        val compileHost = linuxCommand("env")
-        compileHost.argument("NIX_HARDENING_ENABLE=")
-        compileHost.argument("clang")
-        compileHost.argument("-std=c11")
-        compileHost.argument("-O2")
-        compileHost.argument("-pthread")
-        compileHost.argument("-ffunction-sections")
-        compileHost.argument("-fdata-sections")
-        if (artifact == "shared-library") compileHost.argument("-fPIC")
-        if (macTarget) {
-            compileHost.argument("-isysroot")
-            compileHost.argument(macSdkRoot)
-            compileHost.argument("-D_XOPEN_SOURCE=700")
-            compileHost.argument("-D_DARWIN_C_SOURCE")
-            compileHost.argument("-Wno-deprecated-declarations")
-        }
-        compileHost.argument("-I${bootstrapRuntimeRoot()}")
-        compileHost.argument("-c")
-        compileHost.argument(
-            Path(bootstrapRuntimeRoot()).child("abla_runtime_host.c").text
-        )
-        compileHost.argument("-o")
-        compileHost.argument(hostPath)
-        status = compileHost.run()
-    }
     if (status == 0 && ltoEligible && !linkLlvm) {
         val compileLtoProgram = linuxCommand("env")
         compileLtoProgram.argument("NIX_HARDENING_ENABLE=")
@@ -1277,175 +1202,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileLtoProgram.argument(ltoObjectPath)
         status = compileLtoProgram.run()
     }
-    if (status == 0 && ltoEligible && !linkLlvm) {
-        val compileLtoValueRuntime = linuxCommand("env")
-        compileLtoValueRuntime.argument("NIX_HARDENING_ENABLE=")
-        compileLtoValueRuntime.argument("clang")
-        compileLtoValueRuntime.argument("-std=c11")
-        compileLtoValueRuntime.argument("-O2")
-        compileLtoValueRuntime.argument("-flto")
-        compileLtoValueRuntime.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
-        if (wasmLtoEligible) {
-            compileLtoValueRuntime.argument("--target=${target.llvmTriple}")
-            compileLtoValueRuntime.argument("-ffreestanding")
-            compileLtoValueRuntime.argument("-fno-stack-protector")
-            compileLtoValueRuntime.argument("-DABLA_WASM32=1")
-            compileLtoValueRuntime.argument("-Wno-unused-command-line-argument")
-        }
-        if (macTarget) {
-            compileLtoValueRuntime.argument("-isysroot")
-            compileLtoValueRuntime.argument(macSdkRoot)
-        }
-        compileLtoValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
-        compileLtoValueRuntime.argument("-c")
-        compileLtoValueRuntime.argument(
-            Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
-        )
-        compileLtoValueRuntime.argument("-o")
-        compileLtoValueRuntime.argument(ltoValueRuntimePath)
-        status = compileLtoValueRuntime.run()
-    }
-    if (status == 0 && hostedLtoEligible && !linkLlvm) {
-        val compileLtoHost = linuxCommand("env")
-        compileLtoHost.argument("NIX_HARDENING_ENABLE=")
-        compileLtoHost.argument("clang")
-        compileLtoHost.argument("-std=c11")
-        compileLtoHost.argument("-O2")
-        compileLtoHost.argument("-flto")
-        compileLtoHost.argument("-pthread")
-        if (macTarget) {
-            compileLtoHost.argument("-isysroot")
-            compileLtoHost.argument(macSdkRoot)
-            compileLtoHost.argument("-D_XOPEN_SOURCE=700")
-            compileLtoHost.argument("-D_DARWIN_C_SOURCE")
-            compileLtoHost.argument("-Wno-deprecated-declarations")
-        }
-        compileLtoHost.argument("-I${bootstrapRuntimeRoot()}")
-        compileLtoHost.argument("-c")
-        compileLtoHost.argument(
-            Path(bootstrapRuntimeRoot()).child(
-                "abla_runtime_host.c"
-            ).text
-        )
-        compileLtoHost.argument("-o")
-        compileLtoHost.argument(ltoHostPath)
-        status = compileLtoHost.run()
-    }
-    if (status == 0 && wasmLtoEligible && !linkLlvm) {
-        val compileLtoWasmPlatform = linuxCommand("env")
-        compileLtoWasmPlatform.argument("NIX_HARDENING_ENABLE=")
-        compileLtoWasmPlatform.argument("clang")
-        compileLtoWasmPlatform.argument("--target=${target.llvmTriple}")
-        compileLtoWasmPlatform.argument("-std=c11")
-        compileLtoWasmPlatform.argument("-O2")
-        compileLtoWasmPlatform.argument("-flto")
-        compileLtoWasmPlatform.argument("-ffreestanding")
-        compileLtoWasmPlatform.argument("-fno-stack-protector")
-        compileLtoWasmPlatform.argument("-DABLA_WASM32=1")
-        compileLtoWasmPlatform.argument("-Wno-unused-command-line-argument")
-        compileLtoWasmPlatform.argument("-I${bootstrapRuntimeRoot()}")
-        compileLtoWasmPlatform.argument("-c")
-        compileLtoWasmPlatform.argument(
-            Path(bootstrapRuntimeRoot()).child(
-                "abla_runtime_wasm.c"
-            ).text
-        )
-        compileLtoWasmPlatform.argument("-o")
-        compileLtoWasmPlatform.argument(ltoWasmPlatformPath)
-        status = compileLtoWasmPlatform.run()
-    }
-    if (status == 0 && target.hosted && artifact != "object" && linkLlvm) {
-        val llvmConfig = linuxCommand("llvm-config")
-        llvmConfig.argument("--includedir")
-        var llvmIncludeDirectory = llvmConfig.captureText()
-        var end = llvmIncludeDirectory.size
-        while (end > 0 &&
-            (llvmIncludeDirectory[end - 1] == 10 ||
-             llvmIncludeDirectory[end - 1] == 13)) end = end - 1
-        llvmIncludeDirectory = llvmIncludeDirectory.slice(0, end)
-        val compileLlvmHost = linuxCommand("env")
-        compileLlvmHost.argument("NIX_HARDENING_ENABLE=")
-        compileLlvmHost.argument("clang")
-        compileLlvmHost.argument("-std=c11")
-        compileLlvmHost.argument("-O2")
-        if (artifact == "shared-library") compileLlvmHost.argument("-fPIC")
-        if (macTarget) {
-            compileLlvmHost.argument("-isysroot")
-            compileLlvmHost.argument(macSdkRoot)
-        }
-        compileLlvmHost.argument("-I$llvmIncludeDirectory")
-        compileLlvmHost.argument("-c")
-        compileLlvmHost.argument(
-            Path(bootstrapRuntimeRoot()).child("abla_llvm_host.c").text
-        )
-        compileLlvmHost.argument("-o")
-        compileLlvmHost.argument(llvmHostPath)
-        status = compileLlvmHost.run()
-    }
-    if (status == 0 && target.objectFormat == "wasm" &&
-        artifact == "module") {
-        val compileValueRuntime = linuxCommand("env")
-        compileValueRuntime.argument("NIX_HARDENING_ENABLE=")
-        compileValueRuntime.argument("clang")
-        compileValueRuntime.argument("--target=${target.llvmTriple}")
-        compileValueRuntime.argument("-std=c11")
-        compileValueRuntime.argument("-O2")
-        compileValueRuntime.argument("-ffreestanding")
-        compileValueRuntime.argument("-fno-stack-protector")
-        compileValueRuntime.argument("-ffunction-sections")
-        compileValueRuntime.argument("-fdata-sections")
-        compileValueRuntime.argument("-DABLA_WASM32=1")
-        compileValueRuntime.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
-        compileValueRuntime.argument("-Wno-unused-command-line-argument")
-        compileValueRuntime.argument("-I${bootstrapRuntimeRoot()}")
-        compileValueRuntime.argument("-c")
-        compileValueRuntime.argument(
-            Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
-        )
-        compileValueRuntime.argument("-o")
-        compileValueRuntime.argument(valueRuntimePath)
-        status = compileValueRuntime.run()
-    }
-    if (status == 0 && target.objectFormat == "wasm" &&
-        artifact == "module") {
-        val compileWasmPlatform = linuxCommand("env")
-        compileWasmPlatform.argument("NIX_HARDENING_ENABLE=")
-        compileWasmPlatform.argument("clang")
-        compileWasmPlatform.argument("--target=${target.llvmTriple}")
-        compileWasmPlatform.argument("-std=c11")
-        compileWasmPlatform.argument("-O2")
-        compileWasmPlatform.argument("-ffreestanding")
-        compileWasmPlatform.argument("-fno-stack-protector")
-        compileWasmPlatform.argument("-ffunction-sections")
-        compileWasmPlatform.argument("-fdata-sections")
-        compileWasmPlatform.argument("-DABLA_WASM32=1")
-        compileWasmPlatform.argument("-Wno-unused-command-line-argument")
-        compileWasmPlatform.argument("-I${bootstrapRuntimeRoot()}")
-        compileWasmPlatform.argument("-c")
-        compileWasmPlatform.argument(
-            Path(bootstrapRuntimeRoot()).child(
-                "abla_runtime_wasm.c"
-            ).text
-        )
-        compileWasmPlatform.argument("-o")
-        compileWasmPlatform.argument(wasmPlatformPath)
-        status = compileWasmPlatform.run()
-    }
-    if (status == 0 && rawTarget && artifact == "executable") {
-        val linkRaw = linuxCommand("ld.lld")
-        linkRaw.argument("--threads=1")
-        linkRaw.argument("--gc-sections")
-        linkRaw.argument("-static")
-        linkRaw.argument("-e")
-        linkRaw.argument("_start")
-        linkRaw.argument(objectPath)
-        linkRaw.argument(valueRuntimePath)
-        linkRaw.argument(rawAdaptersPath)
-        linkRaw.argument(rawRuntimePath)
-        linkRaw.argument("-o")
-        linkRaw.argument(publishPath)
-        status = linkRaw.run()
-    }
     if (status == 0 && target.hosted && artifact == "executable") {
         val link = linuxCommand("clang")
         link.argument("-pthread")
@@ -1462,6 +1218,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             link.argument("-fuse-ld=lld")
             link.argument("-Wl,--threads=1")
             link.argument("-Wl,--gc-sections")
+            link.argument("-Wl,--error-limit=0")
         }
         if (linkLlvm) {
             val llvmConfig = linuxCommand("llvm-config")
@@ -1484,48 +1241,18 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         link.argument(if (ltoEligible && !linkLlvm)
             ltoObjectPath
         else objectPath)
-        if (target.hosted) {
-            link.argument(if (ltoEligible && !linkLlvm)
-                ltoValueRuntimePath
-            else valueRuntimePath)
-            link.argument(if (ltoEligible && !linkLlvm)
-                ltoHostPath
-            else hostPath)
+        if (linkOpenSsl) {
+            link.argument("-lssl")
+            link.argument("-lcrypto")
         }
-        if (linkLlvm) link.argument(llvmHostPath)
         link.argument("-o")
         link.argument(publishPath)
         status = link.run()
     }
-    // Executable builds intentionally retain an object sidecar for packaging
-    // systems such as Icy. Since the value runtime moved out of generated LLVM
-    // in ed62fa6, publish that sidecar as one relocatable object rather than a
-    // program object with undocumented runtime companions.
+    // The Abla runtime is part of the program LLVM unit, so its ordinary
+    // object is already the complete packageable sidecar.
     if (status == 0 && target.hosted && artifact == "executable") {
-        val combine = linuxCommand(if (macTarget) "ld" else "ld.lld")
-        combine.argument("-r")
-        if (!macTarget) combine.argument("--threads=1")
-        combine.argument(objectPath)
-        combine.argument(valueRuntimePath)
-        combine.argument(hostPath)
-        if (linkLlvm) combine.argument(llvmHostPath)
-        combine.argument("-o")
-        combine.argument(combinedObjectPath)
-        status = combine.run()
-        if (status == 0 && !Path(combinedObjectPath).moveTo(
-            Path(objectPath)
-        )) {
-            status = 153
-            failureKind = "io"
-        }
-        if (status == 0) {
-            Path(valueRuntimePath).remove()
-            Path(hostPath).remove()
-            Path(llvmHostPath).remove()
-            Path(ltoObjectPath).remove()
-            Path(ltoValueRuntimePath).remove()
-            Path(ltoHostPath).remove()
-        }
+        Path(ltoObjectPath).remove()
     }
     if (status == 0 && !rawTarget && artifact == "object") {
         status = bootstrapCopyNativeObject(objectPath, publishPath)
@@ -1536,11 +1263,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         archive.argument("rcs")
         archive.argument(publishPath)
         archive.argument(objectPath)
-        if (target.hosted) {
-            archive.argument(valueRuntimePath)
-            archive.argument(hostPath)
-        }
-        if (linkLlvm) archive.argument(llvmHostPath)
         status = archive.run()
     }
     if (status == 0 && target.hosted && artifact == "shared-library") {
@@ -1571,11 +1293,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             linkShared.argument("-lLLVM")
         }
         linkShared.argument(objectPath)
-        if (target.hosted) {
-            linkShared.argument(valueRuntimePath)
-            linkShared.argument(hostPath)
+        if (linkOpenSsl) {
+            linkShared.argument("-lssl")
+            linkShared.argument("-lcrypto")
         }
-        if (linkLlvm) linkShared.argument(llvmHostPath)
         linkShared.argument("-o")
         linkShared.argument(publishPath)
         status = linkShared.run()
@@ -1614,21 +1335,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkModule.argument(if (wasmLtoEligible)
             ltoObjectPath
         else objectPath)
-        linkModule.argument(if (wasmLtoEligible)
-            ltoValueRuntimePath
-        else valueRuntimePath)
-        linkModule.argument(if (wasmLtoEligible)
-            ltoWasmPlatformPath
-        else wasmPlatformPath)
         linkModule.argument("-o")
         linkModule.argument(publishPath)
         status = linkModule.run()
         if (status == 0) {
-            Path(valueRuntimePath).remove()
-            Path(wasmPlatformPath).remove()
             Path(ltoObjectPath).remove()
-            Path(ltoValueRuntimePath).remove()
-            Path(ltoWasmPlatformPath).remove()
         }
     }
     // Release wasm modules receive a target-aware whole-module pass after
@@ -1669,9 +1380,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     Path(optimizedWasmPath).remove()
     if (status != 0) Path(combinedObjectPath).remove()
     if (status != 0) Path(ltoObjectPath).remove()
-    if (status != 0) Path(ltoValueRuntimePath).remove()
-    if (status != 0) Path(ltoHostPath).remove()
-    if (status != 0) Path(ltoWasmPlatformPath).remove()
     if (status != 0 && failureKind == "io") {
         linuxPrintStandardError(
             "error[E_BUILD_IO]: native build could not publish an intermediate or output artifact (status $status)\n"
@@ -1771,28 +1479,6 @@ fun bootstrapNativeBuildUncachedWithEmitter(
     )
 }
 
-fun bootstrapNativeRawBuildWithEmitter(
-    sourcePath: string,
-    outputPath: string,
-    emitObject: (string, string) -> int,
-    cacheProfile: string,
-    useCache: bool
-): BootstrapNativeBuild {
-    val moduleState = bootstrapModuleState()
-    val irCache = bootstrapIrTransientState()
-    bootstrapNativeBuildWithEmitterStateCache(
-        sourcePath,
-        outputPath,
-        emitObject,
-        "raw-$cacheProfile",
-        moduleState,
-        irCache,
-        useCache,
-        bootstrapTargetDescriptor("x86_64-linux-raw"),
-        "executable"
-    )
-}
-
 fun bootstrapNativeArtifactBuildWithEmitter(
     sourcePath: string,
     outputPath: string,
@@ -1837,7 +1523,7 @@ fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
     bootstrapBeginCompileOutputs()
     val llvmPath = "build/.abla-run.ll"
     val compilation = bootstrapCompileLlvmParsed(
-        bootstrapParseModule(sourcePath)
+        bootstrapParseHostModuleWithRuntime(sourcePath)
     )
     val requestedPrograms = bootstrapTakeCompileProgramRequests()
     val definedTargets = bootstrapTakeDefinedTargets()
@@ -1864,46 +1550,6 @@ fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
         )
     }
     BootstrapRunIr(status, llvmPath, compilation.linkHost)
-}
-
-fun bootstrapBuildJitHostLibrary(outputPath: string): int {
-    val hostCompile = linuxCommand("clang")
-    hostCompile.argument("-std=c11")
-    hostCompile.argument("-O2")
-    hostCompile.argument("-pthread")
-    hostCompile.argument("-fPIC")
-    hostCompile.argument("-DABLA_SELF_HOSTED_RUNTIME_TEXT=1")
-    if (ablaHostIsMacOS()) {
-        val discoverSdk = linuxCommand("xcrun")
-        discoverSdk.argument("--sdk")
-        discoverSdk.argument("macosx")
-        discoverSdk.argument("--show-sdk-path")
-        var sdkRoot = discoverSdk.captureText()
-        var sdkEnd = sdkRoot.size
-        while (sdkEnd > 0 &&
-            (sdkRoot[sdkEnd - 1] == 10 ||
-             sdkRoot[sdkEnd - 1] == 13)) sdkEnd = sdkEnd - 1
-        sdkRoot = sdkRoot.slice(0, sdkEnd)
-        hostCompile.argument("-isysroot")
-        hostCompile.argument(sdkRoot)
-        hostCompile.argument("-dynamiclib")
-        hostCompile.argument("-D_XOPEN_SOURCE=700")
-        hostCompile.argument("-D_DARWIN_C_SOURCE")
-        hostCompile.argument("-Wno-deprecated-declarations")
-    } else {
-        hostCompile.argument("-shared")
-        hostCompile.argument("-Wl,--no-undefined")
-    }
-    hostCompile.argument("-I${bootstrapRuntimeRoot()}")
-    hostCompile.argument(
-        Path(bootstrapRuntimeRoot()).child("abla_runtime.c").text
-    )
-    hostCompile.argument(
-        Path(bootstrapRuntimeRoot()).child("abla_runtime_host.c").text
-    )
-    hostCompile.argument("-o")
-    hostCompile.argument(outputPath)
-    hostCompile.run()
 }
 
 fun bootstrapRun(sourcePath: string): int {

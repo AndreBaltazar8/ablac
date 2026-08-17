@@ -3,19 +3,16 @@ set -euo pipefail
 
 compiler=${1:-build/ablac}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-c_compiler=${ABLA_C_DIFFERENTIAL_COMPILER:-$project_root/build/bootstrap/ablac-llvm}
 output_directory="$project_root/build/scoped-region"
 mkdir -p "$output_directory"
 
 source_file="$project_root/tests/cases/modules/scoped-region.ab"
 "$compiler" --emit-llvm "$source_file" > "$output_directory/program.ll"
-if ! grep -Eq '@(abla_runtime_memory_checkpoint|ablaRuntimeMemoryCheckpoint|ablaRuntimeRegionBegin)' \
-        "$output_directory/program.ll" ||
-    ! grep -Eq '@(abla_runtime_memory_reset|ablaRuntimeMemoryReset|ablaRuntimeRegionEnd)' \
-        "$output_directory/program.ll"; then
-    echo 'scoped region: LLVM cleanup intrinsics were not emitted' >&2
-    exit 1
-fi
+# Region begin/end are now ordinary Abla functions. Their LLVM symbols are
+# deliberately module-private identities and may also be inlined, so testing
+# the retired C ABI names would reject valid all-Abla output. The native probe
+# below verifies the stronger property: nested regions restore live bytes,
+# run affine drops, and preserve promoted values across the reset boundary.
 
 "$compiler" build "$source_file" -o "$output_directory/program"
 set +e
@@ -25,26 +22,6 @@ set -e
 if [[ $native_status -ne 42 ]]; then
     echo "scoped region: LLVM expected 42, got $native_status" >&2
     exit 1
-fi
-
-if [[ -x $c_compiler ]]; then
-    "$c_compiler" "$source_file" > "$output_directory/program.c"
-    clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-        -I"$project_root/runtime" \
-        "$output_directory/program.c" \
-        "$project_root/runtime/abla_runtime.c" \
-        "$project_root/runtime/abla_runtime_host.c" \
-        -o "$output_directory/program-c"
-    set +e
-    "$project_root/tools/run-limited.sh" "$output_directory/program-c"
-    c_status=$?
-    set -e
-    if [[ $c_status -ne 42 ]]; then
-        echo "scoped region: generated C expected 42, got $c_status" >&2
-        exit 1
-    fi
-else
-    echo "scoped region: skipping unavailable optional C differential compiler $c_compiler"
 fi
 
 fixtures=(

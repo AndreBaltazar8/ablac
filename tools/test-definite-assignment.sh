@@ -44,24 +44,4 @@ check_rejected invalid-definite-assignment ir.verification
 check_rejected invalid-uninitialized-val local.uninitialized-val
 check_rejected invalid-uninitialized-type local.uninitialized-type
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/definite-assignment-c-backend.ab" \
-    -o "$output_directory/c-generator" --no-cache
-"$project_root/tools/run-limited.sh" \
-    "$output_directory/c-generator" >"$output_directory/program.c"
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/program.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/c-program"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/c-program"
-c_status=$?
-set -e
-if [[ $c_status -ne 42 ]]; then
-    echo "definite-assignment: C backend expected 42, got $c_status" >&2
-    exit 1
-fi
-
-echo "definite-assignment: CFG paths + compile-time + LLVM/C checks passed"
+echo "definite-assignment: CFG paths + compile-time + LLVM checks passed"

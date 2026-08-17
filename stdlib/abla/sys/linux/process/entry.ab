@@ -219,6 +219,102 @@ fun LinuxCommand.start(): LinuxChildProcess {
     LinuxChildProcess(process)
 }
 
+// Starts a process in its own process group. Environment entries override the
+// inherited environment through the system `env` utility, while directory and
+// descriptor setup happen directly in the forked child. Keeping this in Abla
+// makes hosted build tools independent of a project-specific C launcher.
+fun linuxStartConfiguredProcess(
+    directory: string,
+    arguments: array<string>,
+    environmentNames: array<string> = [],
+    environmentValues: array<string> = [],
+    outputPath: string = ""
+): LinuxChildProcess {
+    var process = -1
+    if (arguments.size > 0 &&
+        environmentNames.size == environmentValues.size) {
+        val launched: array<string> = []
+        var executable = arguments[0]
+        if (environmentNames.size > 0) {
+            executable = linuxExecutablePath("env")
+            launched.append(executable)
+            var environmentIndex = 0
+            while (environmentIndex < environmentNames.size) {
+                launched.append(
+                    "${environmentNames[environmentIndex]}=${environmentValues[environmentIndex]}"
+                )
+                environmentIndex = environmentIndex + 1
+            }
+        }
+        var argumentIndex = 0
+        while (argumentIndex < arguments.size) {
+            launched.append(arguments[argumentIndex])
+            argumentIndex = argumentIndex + 1
+        }
+        if (environmentNames.size == 0) {
+            executable = linuxExecutablePath(arguments[0])
+        }
+        val vector = linuxArgumentVector(launched)
+        process = linuxSyscall0(57)
+        if (process == 0) {
+            // setpgid(0, 0): the whole test process tree can be terminated on
+            // timeout without affecting the parent test runner.
+            linuxSyscall2(109, 0, 0)
+            var ready = true
+            if (directory != "") {
+                ready = linuxSyscall1(
+                    80,
+                    nativeCStringAddress(directory)
+                ) == 0
+            }
+            if (ready && outputPath != "") {
+                val output = linuxOpen(outputPath, 577, 438).descriptor
+                ready = output >= 0
+                if (ready) {
+                    ready = linuxSyscall2(33, output, 1) >= 0 &&
+                        linuxSyscall2(33, output, 2) >= 0
+                }
+                if (output > 2) linuxSyscall1(3, output)
+            }
+            if (ready) linuxExecPrepared(executable, vector)
+            linuxSyscall1(60, 127)
+        }
+        if (process > 0) linuxSyscall2(109, process, process)
+        vector.close()
+    }
+    LinuxChildProcess(process)
+}
+
+fun LinuxChildProcess.poll(): int =
+    linuxWaitProcess(this.process, true).status
+
+fun LinuxChildProcess.stopTree(graceMilliseconds: int = 100): int {
+    var result = -1
+    if (this.process > 0) {
+        linuxSyscall2(62, 0 - this.process, 15)
+        var remaining = graceMilliseconds
+        var waiting = true
+        while (waiting && remaining > 0) {
+            val observed = linuxWaitProcess(this.process, true)
+            if (observed.output != "pending") {
+                result = observed.status
+                waiting = false
+            }
+            if (waiting) {
+                var slice = 10
+                if (remaining < slice) slice = remaining
+                linuxSleepMillisecondsChecked(slice)
+                remaining = remaining - slice
+            }
+        }
+        if (waiting) {
+            linuxSyscall2(62, 0 - this.process, 9)
+            result = linuxWaitProcess(this.process).status
+        }
+    }
+    result
+}
+
 fun LinuxChildProcess.stop(graceMilliseconds: int = 5000): int {
     var result = -1
     if (this.process > 0) {

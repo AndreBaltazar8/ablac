@@ -10,10 +10,10 @@ reference_ir="$project_root/build/ablac-pure-self.reference.ll"
 self_ir="$project_root/build/ablac-pure-self.fixed.ll"
 probe="$project_root/build/ablac-pure-self-probe"
 final_emit_memory_mb=${ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB:-4096}
+compiler_ir="${compiler}.ll"
+if [[ $compiler == *.bin ]]; then compiler_ir="${compiler%.bin}.ll"; fi
 
-# Keep frontend emission and LLVM object generation in separate bounded
-# processes. This canonical release path avoids making both heap peaks coexist
-# during a complete compiler rebuild.
+# Build through the same LLVM-native path used for every Abla program.
 ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
     "$project_root/tools/build-self-hosted-release.sh" \
     "$compiler" "$output" "$entry"
@@ -21,21 +21,23 @@ ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
 [[ -s $output ]]
 [[ -s $output.ll ]]
 [[ ! -e $output.host.o ]]
-# The generated compiler module is produced entirely through LLVM's C API.
-# Its portable value/platform runtime is linked as an ordinary implementation
-# dependency; there is no alternate code-generation backend in that runtime.
+# Runtime code is emitted from Abla source into the compiler module itself.
 nm "$output" | awk '{print $3}' |
     rg '^_?abla_runtime_set_arguments$' >/dev/null
 
-ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=300 \
-    "$project_root/tools/run-limited.sh" \
-    "$compiler" --emit-llvm "$entry" > "$reference_ir"
-# The canonical self-rebuild is the production O2 compiler. Fast AOT remains a
-# separate small-program gate; using a complete unoptimized compiler here adds
-# a large code mapping without strengthening the fixed-point proof.
-ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=300 \
-    "$project_root/tools/run-limited.sh" \
-    "$output" --emit-llvm "$entry" > "$self_ir"
+# The input compiler's production module is generation one; the module emitted
+# while it builds `output` is generation two. Compare those existing artifacts
+# directly instead of redundantly emitting the complete compiler graph twice.
+# Installed/bootstrap compilers may not retain their module, so keep one
+# bounded generation-one emission as a fallback.
+if [[ -s $compiler_ir ]]; then
+    cp -- "$compiler_ir" "$reference_ir"
+else
+    ABLA_MAX_MEMORY_MB=$final_emit_memory_mb ABLA_MAX_SECONDS=300 \
+        "$project_root/tools/run-limited.sh" \
+        "$compiler" --emit-llvm "$entry" > "$reference_ir"
+fi
+cp -- "$output.ll" "$self_ir"
 cmp "$reference_ir" "$self_ir"
 
 if [[ $(uname -s) == Darwin ]]; then

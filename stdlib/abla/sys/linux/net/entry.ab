@@ -1136,16 +1136,70 @@ fun TcpConnection.readResult(maximum: int = 65536): SocketReadResult {
     result
 }
 
-noescape extern:"intrinsic" fun ablaLinuxTcpReadCompact(
+fun ablaLinuxTcpReadCompact(
     descriptor: int,
     maximum: int
-): string
+): string {
+    val buffer = nativeByteBuffer(maximum + 1)
+    var measured = linuxSyscall3(
+        0, descriptor, nativePointerAddress(buffer.address), maximum
+    )
+    while (measured == -4) measured = linuxSyscall3(
+        0, descriptor, nativePointerAddress(buffer.address), maximum
+    )
+    var result = ""
+    if (measured > 0) result = buffer.adoptString(measured)
+    else buffer.close()
+    result
+}
 
-noescape extern:"intrinsic" fun ablaLinuxTcpWriteCompact(
+fun ablaLinuxTcpWriteCompact(
     descriptor: int,
     contents: string,
     offset: int
-): int
+): int {
+    var written = 0
+    if (offset < contents.size) {
+        // One region-local workspace holds 64 iovecs, 64 pending rope
+        // segments, and the 56-byte Linux msghdr. Keeping these together
+        // removes two managed resource objects and allocator operations from
+        // every large response.
+        val workspace = nativeByteBuffer(2104)
+        val workspaceAddress = nativePointerAddress(workspace.address)
+        val pendingAddress = workspaceAddress + 1024
+        val messageAddress = workspaceAddress + 2048
+        val count = __ablaRuntimeStringWriteVectors(
+            contents,
+            workspaceAddress,
+            pendingAddress,
+            64,
+            offset
+        )
+        if (count > 0) {
+            workspace.storeI64(2048, 0)
+            workspace.storeI64(2056, 0)
+            workspace.storeI64(2064, workspaceAddress)
+            workspace.storeI64(2072, count)
+            workspace.storeI64(2080, 0)
+            workspace.storeI64(2088, 0)
+            workspace.storeI64(2096, 0)
+            written = linuxSyscall3(
+                46,
+                descriptor,
+                messageAddress,
+                16384
+            )
+            while (written == -4) written = linuxSyscall3(
+                46,
+                descriptor,
+                messageAddress,
+                16384
+            )
+        } else written = count
+        workspace.close()
+    }
+    written
+}
 
 // Optimized readiness-loop read: it uses a bounded native stack buffer and
 // returns one exactly sized managed string. Empty output represents EOF or a
@@ -1171,11 +1225,31 @@ fun TcpConnection.writeCompact(
     else SocketWriteResult(0, "error", -amount)
 }
 
-noescape extern:"intrinsic" fun ablaLinuxPollWaitCompact(
+fun ablaLinuxPollWaitCompact(
     descriptor: int,
     maximumEvents: int,
     timeoutMilliseconds: int
-): string
+): string {
+    val buffer = nativeByteBuffer(maximumEvents * 12 + 1)
+    var measured = linuxSyscall4(
+        232,
+        descriptor,
+        nativePointerAddress(buffer.address),
+        maximumEvents,
+        timeoutMilliseconds
+    )
+    while (measured == -4) measured = linuxSyscall4(
+        232,
+        descriptor,
+        nativePointerAddress(buffer.address),
+        maximumEvents,
+        timeoutMilliseconds
+    )
+    var result = ""
+    if (measured > 0) result = buffer.adoptString(measured * 12)
+    else buffer.close()
+    result
+}
 
 // Packed 12-byte epoll-compatible records for allocation-sensitive event
 // loops. The regular wait method remains the structured public interface.

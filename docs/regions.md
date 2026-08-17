@@ -96,6 +96,6 @@ it deliberately persists unread bytes between expressions.
 The baseline gate covers direct and transitive calls, outer locals, globals,
 fields, arrays, receiver methods, control-flow exits, result escape, false
 `noescape` contracts, nested compile-time/runtime regions, destruction before
-reset, LLVM/C parity, and 128 bounded REPL JIT generations. Explicit promotion,
+reset, native/evaluator parity, and 128 bounded REPL JIT generations. Explicit promotion,
 cleanup-bearing non-local exits, exceptions, and persistence of effect summaries
 in separately compiled interfaces remain later extensions.

@@ -68,30 +68,4 @@ for index in "${!defer_fixtures[@]}"; do
     [[ ! -e $output_directory/$fixture ]]
 done
 
-if [[ -x ${ABLA_C_BACKEND_DRIVER:-} ]]; then
-    "$ABLA_C_BACKEND_DRIVER" \
-        "$project_root/tests/cases/c-backend/concurrency.ab" \
-        >"$output_directory/program.c"
-else
-    "$compiler" build \
-        "$project_root/tests/cases/modules/concurrency-c-backend.ab" \
-        --fast --no-cache -o "$output_directory/c-generator"
-    "$project_root/tools/run-limited.sh" \
-        "$output_directory/c-generator" >"$output_directory/program.c"
-fi
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror -pthread \
-    -I"$project_root/runtime" \
-    "$output_directory/program.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/c-program"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/c-program"
-c_status=$?
-set -e
-if [[ $c_status -ne 42 ]]; then
-    echo "concurrency: C program expected 42, got $c_status" >&2
-    exit 1
-fi
-
-echo 'concurrency: defer/generator/task/thread LLVM/C/diagnostic checks passed'
+echo 'concurrency: defer/generator/task/thread LLVM/diagnostic checks passed'

@@ -451,9 +451,13 @@ fun bootstrapStageAnnotatedExports(parsed: BootstrapParseResult): int {
                 var global = 0
                 while (valid && global < parsed.declarations.size) {
                     val candidate = parsed.declarations[global]
-                    if (candidate.kind == "var" ||
+                    val runtimeInternal =
+                        candidate.name.size >= 13 &&
+                        candidate.name.slice(0, 13) == "__ablaRuntime"
+                    if (!runtimeInternal &&
+                        (candidate.kind == "var" ||
                         (candidate.kind == "val" &&
-                         candidate.expression.kind != "compile")) {
+                         candidate.expression.kind != "compile"))) {
                         valid = false
                     }
                     global = global + 1
@@ -720,8 +724,10 @@ fun bootstrapBeginBuildTransaction(): void {
 }
 
 fun bootstrapRecordBuildTransactionPath(path: string): bool {
-    var valid = bootstrapBuildTransactionActive && path.size > 0 &&
-        path.size <= 4096
+    // Callers only journal while a transaction is active. Keeping the active
+    // flag out of this leaf also avoids making filesystem safety depend on a
+    // managed global surviving a compiler memory-region boundary.
+    var valid = path.size > 0 && path.size <= 4096
     val root = bootstrapBuildTransactionRoot()
     var recorded = false
     var index = 0
@@ -935,6 +941,96 @@ fun bootstrapEvalBoolean(value: bool): BootstrapEvalValue =
 fun bootstrapEvalString(value: string): BootstrapEvalValue =
     BootstrapEvalValue("string", 0, false, value, [], "", [])
 
+fun bootstrapEvalBase64Encode(value: string): string {
+    val alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var output = ""
+    var index = 0
+    while (index < value.size) {
+        val remaining = value.size - index
+        val first = value[index]
+        val second = if (remaining > 1) value[index + 1] else 0
+        val third = if (remaining > 2) value[index + 2] else 0
+        val combined = (first << 16) | (second << 8) | third
+        output = "$output${alphabet.slice(
+            (combined >>> 18) & 63,
+            ((combined >>> 18) & 63) + 1
+        )}${alphabet.slice(
+            (combined >>> 12) & 63,
+            ((combined >>> 12) & 63) + 1
+        )}"
+        if (remaining > 1) output = "$output${alphabet.slice(
+            (combined >>> 6) & 63,
+            ((combined >>> 6) & 63) + 1
+        )}"
+        else output = "${output}="
+        if (remaining > 2) output = "$output${alphabet.slice(
+            combined & 63,
+            (combined & 63) + 1
+        )}"
+        else output = "${output}="
+        index = index + 3
+    }
+    output
+}
+
+fun bootstrapEvalBase64DecodeDigit(value: int): int {
+    if (value >= 65 && value <= 90) value - 65
+    else if (value >= 97 && value <= 122) value - 71
+    else if (value >= 48 && value <= 57) value + 4
+    else if (value == 43) 62
+    else if (value == 47) 63
+    else -1
+}
+
+fun bootstrapEvalBase64Decode(value: string): string {
+    var output = ""
+    var valid = value.size > 0 && (value.size & 3) == 0
+    var index = 0
+    while (valid && index < value.size) {
+        val byte2 = value[index + 2]
+        val byte3 = value[index + 3]
+        val padded2 = byte2 == 61
+        val padded3 = byte3 == 61
+        val a = bootstrapEvalBase64DecodeDigit(value[index])
+        val b = bootstrapEvalBase64DecodeDigit(value[index + 1])
+        val c = if (padded2) 0 else bootstrapEvalBase64DecodeDigit(byte2)
+        val d = if (padded3) 0 else bootstrapEvalBase64DecodeDigit(byte3)
+        valid = a >= 0 && b >= 0 && c >= 0 && d >= 0 &&
+            (!padded2 || padded3) &&
+            (!(padded2 || padded3) || index + 4 == value.size)
+        if (valid) {
+            val combined = (a << 18) | (b << 12) | (c << 6) | d
+            output = "$output${byteEncode((combined >>> 16) & 255)}"
+            if (!padded2) {
+                output = "$output${byteEncode((combined >>> 8) & 255)}"
+            }
+            if (!padded3) output = "$output${byteEncode(combined & 255)}"
+        }
+        index = index + 4
+    }
+    if (valid) output else ""
+}
+
+fun bootstrapEvalByteChunksJoin(
+    chunks: BootstrapEvalValue,
+    byteCount: int
+): BootstrapEvalValue {
+    val values = bootstrapEvalUnwrapBorrow(chunks)
+    var output = ""
+    var valid = values.kind == "array" && byteCount >= 0
+    var index = 0
+    while (valid && index < values.elements.size) {
+        val chunk = bootstrapEvalUnwrapBorrow(values.elements[index])
+        valid = chunk.kind == "string" &&
+            output.size + chunk.text.size <= byteCount
+        if (valid) output = "$output${chunk.text}"
+        index = index + 1
+    }
+    if (valid && output.size == byteCount) bootstrapEvalString(output)
+    else bootstrapEvalInvalid()
+}
+
 fun bootstrapEvalNull(): BootstrapEvalValue =
     BootstrapEvalValue("null", 0, false, "", [], "", [])
 
@@ -1045,9 +1141,13 @@ fun bootstrapEvalDelegate(
     "delegate", 0, mutable, "", [value], "", []
 )
 
-fun bootstrapEvalUnwrapBorrow(value: BootstrapEvalValue): BootstrapEvalValue =
-    if (value.kind == "borrow" && value.elements.size == 1) value.elements[0]
-    else value
+fun bootstrapEvalUnwrapBorrow(value: BootstrapEvalValue): BootstrapEvalValue {
+    var result = value
+    while (result.kind == "borrow" && result.elements.size == 1) {
+        result = result.elements[0]
+    }
+    result
+}
 
 // Compiler-owned, pointer-free dependency metadata. Paths are materialized as
 // opaque evaluator values only while a finalizer is inspecting one typed
@@ -1263,34 +1363,56 @@ class BootstrapEvaluator(
     fun accessContainingHandle(expression: BootstrapExpression): int {
         var result = -1
         var bestSpan = 2147483647
+        var bestPriority = 2
+        var sourceIdentity = ""
+        var request = 0
+        while (request < this.extensionRequests.size) {
+            val candidate = this.extensionRequests[request]
+            if (candidate.expression.begin == expression.begin &&
+                candidate.expression.end == expression.end &&
+                candidate.expression.kind == expression.kind) {
+                sourceIdentity = candidate.sourceIdentity
+            }
+            request = request + 1
+        }
         var declaration = 0
         while (declaration < this.declarations.size) {
             val candidate = this.declarations[declaration]
+            val moduleIdentity =
+                bootstrapCanonicalDeclarationModuleIdentity(candidate.name)
+            var priority = 2
+            if (sourceIdentity != "" &&
+                candidate.sourceIdentity == sourceIdentity) priority = 0
+            else if (sourceIdentity != "" &&
+                candidate.sourceIdentity == "" &&
+                moduleIdentity == sourceIdentity) priority = 0
+            else if (candidate.sourceIdentity == "" &&
+                moduleIdentity == "") priority = 1
             if ((candidate.kind == "fun" ||
                  candidate.kind == "compile.fun") &&
                 candidate.generatedNamespace == "" &&
-                bootstrapCanonicalDeclarationModuleIdentity(
-                    candidate.name
-                ) == "" &&
+                priority < 2 &&
                 candidate.expression.begin <= expression.begin &&
                 candidate.expression.end >= expression.end) {
                 val span = candidate.expression.end - candidate.expression.begin
-                if (span < bestSpan) {
+                if (priority < bestPriority ||
+                    (priority == bestPriority && span < bestSpan)) {
                     result = declaration
                     bestSpan = span
+                    bestPriority = priority
                 }
             }
             var method = 0
-            while (bootstrapCanonicalDeclarationModuleIdentity(
-                    candidate.name
-                ) == "" && method < candidate.methods.size) {
+            while (priority < 2 && method < candidate.methods.size) {
                 val found = candidate.methods[method]
                 if (found.expression.begin <= expression.begin &&
                     found.expression.end >= expression.end) {
                     val span = found.expression.end - found.expression.begin
-                    if (span < bestSpan) {
+                    if (priority < bestPriority ||
+                        (priority == bestPriority && span < bestSpan)) {
                         result = this.methodHandle(declaration, method)
                         bestSpan = span
+                        bestPriority = priority
                     }
                 }
                 method = method + 1
@@ -4005,12 +4127,6 @@ class BootstrapEvaluator(
                 result = bootstrapEvalArray(handles)
             } else this.errors = this.errors + 1
         }
-        if (targetName == "ablaRuntimeMemoryCollect") {
-            // The tree evaluator uses host-managed BootstrapEvalValue graphs;
-            // native collection belongs to the generated program. Treat the
-            // explicit safe point as a successful no-op while staging.
-            result = bootstrapEvalInteger(0)
-        }
         if (targetName == "ablaUtf8EncodeScalar") {
             val scalar = this.evaluate(expression.children[0])
             if (scalar.kind == "integer") {
@@ -4023,11 +4139,278 @@ class BootstrapEvaluator(
                 result = bootstrapEvalString(byteEncode(byte.integer))
             } else this.errors = this.errors + 1
         }
+        if (targetName == "ablaTextFindSequence") {
+            val text = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            val sequence = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[1])
+            )
+            val begin = this.evaluate(expression.children[2])
+            val end = this.evaluate(expression.children[3])
+            if (text.kind == "string" && sequence.kind == "string" &&
+                begin.kind == "integer" && end.kind == "integer") {
+                var found = -1
+                val beginOffset = begin.integer
+                val endOffset = end.integer
+                val sequenceLength = sequence.text.size
+                if (beginOffset >= 0 && endOffset >= beginOffset &&
+                    endOffset <= text.text.size) {
+                    if (sequenceLength == 0) found = beginOffset
+                    else if (sequenceLength <= endOffset - beginOffset) {
+                        var offset = beginOffset
+                        val last = endOffset - sequenceLength
+                        while (found < 0 && offset <= last) {
+                            var equal = true
+                            var index = 0
+                            while (equal && index < sequenceLength) {
+                                equal = text.text[offset + index] ==
+                                    sequence.text[index]
+                                index = index + 1
+                            }
+                            if (equal) found = offset
+                            offset = offset + 1
+                        }
+                    }
+                }
+                result = bootstrapEvalInteger(found)
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaTextFindSequence expected two strings and two integer bounds"
+                )
+            }
+        }
+        if (targetName == "ablaTextFindByte") {
+            val text = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            val byte = this.evaluate(expression.children[1])
+            val begin = this.evaluate(expression.children[2])
+            val end = this.evaluate(expression.children[3])
+            if (text.kind == "string" && byte.kind == "integer" &&
+                begin.kind == "integer" && end.kind == "integer") {
+                var found = -1
+                var offset = begin.integer
+                if (byte.integer >= 0 && byte.integer <= 255 &&
+                    offset >= 0 && end.integer >= offset &&
+                    end.integer <= text.text.size) {
+                    while (found < 0 && offset < end.integer) {
+                        if (text.text[offset] == byte.integer) found = offset
+                        offset = offset + 1
+                    }
+                }
+                result = bootstrapEvalInteger(found)
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaTextFindByte expected a string and three integer arguments"
+                )
+            }
+        }
+        if (targetName == "ablaTextAsciiEqualInsensitive") {
+            val left = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            val right = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[1])
+            )
+            if (left.kind == "string" && right.kind == "string") {
+                var equal = left.text.size == right.text.size
+                var index = 0
+                while (equal && index < left.text.size) {
+                    var leftByte = left.text[index]
+                    var rightByte = right.text[index]
+                    if (leftByte >= 65 && leftByte <= 90) {
+                        leftByte = leftByte + 32
+                    }
+                    if (rightByte >= 65 && rightByte <= 90) {
+                        rightByte = rightByte + 32
+                    }
+                    equal = leftByte == rightByte
+                    index = index + 1
+                }
+                result = bootstrapEvalBoolean(equal)
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaTextAsciiEqualInsensitive expected two strings"
+                )
+            }
+        }
+        if (targetName == "ablaTextReadU32LittleEndian") {
+            val text = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            val offset = this.evaluate(expression.children[1])
+            if (text.kind == "string" && offset.kind == "integer") {
+                var value = -1
+                if (offset.integer >= 0 &&
+                    offset.integer + 4 <= text.text.size) {
+                    value = bitOr(
+                        bitOr(
+                            text.text[offset.integer],
+                            bitShiftLeft(text.text[offset.integer + 1], 8)
+                        ),
+                        bitOr(
+                            bitShiftLeft(text.text[offset.integer + 2], 16),
+                            bitShiftLeft(text.text[offset.integer + 3], 24)
+                        )
+                    )
+                }
+                result = bootstrapEvalInteger(value)
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaTextReadU32LittleEndian expected a string and integer offset"
+                )
+            }
+        }
+        if (targetName == "ablaBase64Encode") {
+            val text = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            if (text.kind == "string") {
+                result = bootstrapEvalString(
+                    bootstrapEvalBase64Encode(text.text)
+                )
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaBase64Encode expected string, got ${text.kind}"
+                )
+            }
+        }
+        if (targetName == "ablaBase64Decode") {
+            val text = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            if (text.kind == "string") {
+                result = bootstrapEvalString(
+                    bootstrapEvalBase64Decode(text.text)
+                )
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaBase64Decode expected string, got ${text.kind}"
+                )
+            }
+        }
+        if (targetName == "ablaByteChunksJoin") {
+            val chunks = this.evaluate(expression.children[0])
+            val byteCount = this.evaluate(expression.children[1])
+            if (byteCount.kind == "integer") {
+                result = bootstrapEvalByteChunksJoin(
+                    chunks, byteCount.integer
+                )
+                if (result.kind == "invalid") {
+                    this.errors = this.errors + 1
+                    this.recordEvaluatorDiagnostic(
+                        "E_EVAL_INTRINSIC_ARGUMENT",
+                        "ablaByteChunksJoin received inconsistent chunks"
+                    )
+                }
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaByteChunksJoin expected integer byte count, got ${byteCount.kind}"
+                )
+            }
+        }
         if (targetName == "ablaTextIsValidUtf8") {
-            val text = this.evaluate(expression.children[0])
+            val text = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
             if (text.kind == "string") {
                 result = bootstrapEvalBoolean(utf8Info(text.text).valid)
-            } else this.errors = this.errors + 1
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaTextIsValidUtf8 expected string, got ${text.kind}"
+                )
+            }
+        }
+        if (targetName == "ablaJsonFindPlainStringEnd") {
+            val text = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            val begin = this.evaluate(expression.children[1])
+            val end = this.evaluate(expression.children[2])
+            if (text.kind == "string" && begin.kind == "integer" &&
+                end.kind == "integer") {
+                var found = -1
+                var offset = begin.integer
+                var plain = offset >= 0 && end.integer >= offset &&
+                    end.integer <= text.text.size
+                while (plain && found < 0 && offset < end.integer) {
+                    val lead = text.text[offset]
+                    if (lead == 34) found = offset
+                    else if (lead == 92 || lead < 32) plain = false
+                    else if (lead < 128) offset = offset + 1
+                    else {
+                        var count = 0
+                        if (lead >= 194 && lead <= 223) count = 2
+                        if (lead >= 224 && lead <= 239) count = 3
+                        if (lead >= 240 && lead <= 244) count = 4
+                        plain = count > 0 && offset + count <= end.integer
+                        var index = 1
+                        while (plain && index < count) {
+                            val byte = text.text[offset + index]
+                            plain = byte >= 128 && byte <= 191
+                            index = index + 1
+                        }
+                        if (plain && count == 3 && lead == 224) {
+                            plain = text.text[offset + 1] >= 160
+                        }
+                        if (plain && count == 3 && lead == 237) {
+                            plain = text.text[offset + 1] <= 159
+                        }
+                        if (plain && count == 4 && lead == 240) {
+                            plain = text.text[offset + 1] >= 144
+                        }
+                        if (plain && count == 4 && lead == 244) {
+                            plain = text.text[offset + 1] <= 143
+                        }
+                        if (plain) offset = offset + count
+                    }
+                }
+                result = bootstrapEvalInteger(found)
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaJsonFindPlainStringEnd expected a string and two integer bounds"
+                )
+            }
+        }
+        if (targetName == "ablaJsonStringIsPlain") {
+            val text = bootstrapEvalUnwrapBorrow(
+                this.evaluate(expression.children[0])
+            )
+            if (text.kind == "string") {
+                var plain = utf8Info(text.text).valid
+                var index = 0
+                while (plain && index < text.text.size) {
+                    val byte = text.text[index]
+                    plain = byte >= 32 && byte != 34 && byte != 92
+                    index = index + 1
+                }
+                result = bootstrapEvalBoolean(plain)
+            } else {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "ablaJsonStringIsPlain expected string, got ${text.kind}"
+                )
+            }
         }
         if (targetName == "compilerFindFunction") {
             val name = this.evaluate(expression.children[0])
@@ -5477,7 +5860,8 @@ class BootstrapEvaluator(
                         [],
                         [],
                         [],
-                        []
+                        [],
+                        ""
                     ))
                     module.elements.append(BootstrapEvalValue(
                         "generated.declaration",
@@ -5595,7 +5979,8 @@ class BootstrapEvaluator(
                     [],
                     [],
                     [],
-                    []
+                    [],
+                    ""
                 ))
                 module.elements.append(BootstrapEvalValue(
                     "generated.declaration",
@@ -5657,7 +6042,8 @@ class BootstrapEvaluator(
                         [],
                         [],
                         [],
-                        []
+                        [],
+                        ""
                     ))
                     module.elements.append(BootstrapEvalValue(
                         "generated.declaration",
@@ -6508,6 +6894,8 @@ class BootstrapEvaluator(
     }
 
     fun evaluate(expression: BootstrapExpression): BootstrapEvalValue {
+        val errorsBefore = this.errors
+        val diagnosticsBefore = this.diagnostics.size
         this.steps = this.steps + 1
         if (this.steps > 100000) this.errors = this.errors + 1
         var result = bootstrapEvalInvalid()
@@ -7325,6 +7713,13 @@ class BootstrapEvaluator(
             this.values[iteratorIndex] = this.uninitializedValue()
             this.names[iteratorIndex] = ""
         }
+        if (this.errors > errorsBefore &&
+            this.diagnostics.size == diagnosticsBefore) {
+            this.recordEvaluatorDiagnostic(
+                "E_EVAL_EXPRESSION",
+                "compile-time evaluation failed while evaluating `${expression.kind}` `${expression.text}` at ${expression.begin}:${expression.end}"
+            )
+        }
         result
     }
 }
@@ -7480,7 +7875,10 @@ fun bootstrapInvokeExtensionFinalizer(
     val cursors: array<BootstrapSubparserCursor> = []
     val syntax: array<BootstrapExpression> = [request.expression]
     val generatedDeclarations: array<BootstrapDeclaration> = []
-    val extensionRequests: array<BootstrapExtensionRequest> = []
+    // Access/effect reflection must resolve the deferred syntax inside the
+    // module that produced it. Preserve the active request in the evaluator;
+    // an empty list forced ambiguous source-offset fallback after flattening.
+    val extensionRequests: array<BootstrapExtensionRequest> = [request]
     val compileInputPaths: array<string> = []
     val compileInputContents: array<string> = []
     val evaluator = BootstrapEvaluator(

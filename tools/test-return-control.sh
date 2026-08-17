@@ -44,30 +44,4 @@ if [[ -e "$output_directory/invalid" ]]; then
     exit 1
 fi
 
-if [[ -x ${ABLA_C_BACKEND_DRIVER:-} ]]; then
-    "$ABLA_C_BACKEND_DRIVER" \
-        "$project_root/tests/cases/c-backend/return-control.ab" \
-        >"$output_directory/program.c"
-else
-    "$compiler" build \
-        "$project_root/tests/cases/modules/return-c-backend.ab" \
-        -o "$output_directory/c-generator" --no-cache
-    "$project_root/tools/run-limited.sh" \
-        "$output_directory/c-generator" >"$output_directory/program.c"
-fi
-clang -std=c11 -Wall -Wextra -Wpedantic -Wconversion -Werror \
-    -I"$project_root/runtime" \
-    "$output_directory/program.c" \
-    "$project_root/runtime/abla_runtime.c" \
-    "$project_root/runtime/abla_runtime_host.c" \
-    -o "$output_directory/c-program"
-set +e
-"$project_root/tools/run-limited.sh" "$output_directory/c-program"
-c_status=$?
-set -e
-if [[ $c_status -ne 42 ]]; then
-    echo "return-control: C backend expected 42, got $c_status" >&2
-    exit 1
-fi
-
-echo "return-control: LLVM/C runtime, compile-time, lambda, method, void, and diagnostic checks passed"
+echo "return-control: Abla runtime, LLVM, compile-time, lambda, method, void, and diagnostic checks passed"

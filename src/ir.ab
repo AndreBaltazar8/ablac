@@ -61,6 +61,8 @@ class BootstrapIrProgram(
     val functions: array<BootstrapIrFunction>,
     val classes: array<BootstrapIrClass>,
     val natives: array<BootstrapIrNative>,
+    val globalNames: array<string>,
+    val globalTypes: array<string>,
     val compileInputPaths: array<string>,
     val compileInputContents: array<string>,
     val errors: int
@@ -102,6 +104,7 @@ class BootstrapIrFunction(
     val localTypes: array<string>,
     val parameterTypes: array<string>,
     val resultType: string,
+    val inlineHint: bool,
     val verificationErrors: int
 )
 
@@ -257,6 +260,7 @@ fun bootstrapCloneIrFunction(
         bootstrapCloneIrStrings(function.localTypes),
         bootstrapCloneIrStrings(function.parameterTypes),
         function.resultType,
+        function.inlineHint,
         function.verificationErrors
     )
 }
@@ -385,6 +389,19 @@ fun bootstrapIrHashDeclaration(
         parameter = parameter + 1
     }
     hash
+}
+
+fun bootstrapDeclarationHasAnnotation(
+    declaration: BootstrapDeclaration,
+    name: string
+): bool {
+    var found = false
+    var index = 0
+    while (index < declaration.annotations.size) {
+        if (declaration.annotations[index] == name) found = true
+        index = index + 1
+    }
+    found
 }
 
 fun bootstrapIrContextFingerprint(
@@ -941,12 +958,23 @@ fun bootstrapVerifyIrDominance(
     errors
 }
 
+fun bootstrapIrIsLocalZero(opcode: string): bool =
+    opcode == "local.zero" || opcode == "local.zero.i64" ||
+    opcode == "local.zero.bool"
+
+fun bootstrapIrLocalZeroOpcode(type: string): string {
+    val normalized = bootstrapNormalizeType(type)
+    if (normalized == "i64") "local.zero.i64"
+    else if (normalized == "bool") "local.zero.bool"
+    else "local.zero"
+}
+
 fun bootstrapIrDeclaresLocal(opcode: string): bool =
-    opcode == "local.declare" || opcode == "local.zero" ||
+    opcode == "local.declare" || bootstrapIrIsLocalZero(opcode) ||
     opcode == "local.allocate"
 
 fun bootstrapIrWritesLocal(opcode: string): bool =
-    opcode == "local.declare" || opcode == "local.zero" ||
+    opcode == "local.declare" || bootstrapIrIsLocalZero(opcode) ||
     opcode == "local.set" || opcode == "local.assign"
 
 fun bootstrapBuildIrLocals(
@@ -1371,7 +1399,7 @@ fun bootstrapDeclarationMayBindBorrow(
     declaration: BootstrapDeclaration,
     globalNames: array<string>
 ): bool {
-    val checkpoint = ablaRuntimeMemoryCheckpoint()
+    val checkpoint = runtimeMemoryCheckpoint()
     val names: array<string> = []
     var index = 0
     while (index < globalNames.size) {
@@ -1892,7 +1920,8 @@ fun bootstrapFinalizeIrFunction(
     parameterTypes: array<string> = [],
     resultType: string = "unknown",
     declaredLocalNames: array<string> = [],
-    declaredLocalTypes: array<string> = []
+    declaredLocalTypes: array<string> = [],
+    inlineHint: bool = false
 ): BootstrapIrFunction {
     val canonical: array<BootstrapInstruction> = []
     var terminated = false
@@ -1924,7 +1953,7 @@ fun bootstrapFinalizeIrFunction(
     ))
 
     val initialBlocks = bootstrapBuildIrBlocks(canonical)
-    val initialVerificationCheckpoint = ablaRuntimeMemoryCheckpoint()
+    val initialVerificationCheckpoint = runtimeMemoryCheckpoint()
     val initialErrors = bootstrapVerifyIrFunction(canonical, initialBlocks)
     bootstrapSemanticUnit()
     val reachableInstructions: array<BootstrapInstruction> = []
@@ -1963,7 +1992,7 @@ fun bootstrapFinalizeIrFunction(
         local = local + 1
     }
     var errors = initialErrors
-    val verificationCheckpoint = ablaRuntimeMemoryCheckpoint()
+    val verificationCheckpoint = runtimeMemoryCheckpoint()
     errors = errors + bootstrapVerifyIrFunction(
         reachableInstructions,
         blocks
@@ -1982,7 +2011,7 @@ fun bootstrapFinalizeIrFunction(
         immediateDominators
     )
     bootstrapPrepareIrBorrowMetadata(reachableInstructions)
-    val placeVerificationCheckpoint = ablaRuntimeMemoryCheckpoint()
+    val placeVerificationCheckpoint = runtimeMemoryCheckpoint()
     errors = errors + bootstrapVerifyIrPlaces(
         reachableInstructions,
         blocks
@@ -2003,6 +2032,7 @@ fun bootstrapFinalizeIrFunction(
         localTypes,
         parameterTypes,
         bootstrapNormalizeType(resultType),
+        inlineHint,
         errors
     )
 }
@@ -2231,7 +2261,7 @@ fun bootstrapBuildDropFunction(
     } else if (bootstrapIsArrayType(normalized)) {
         val length = builder.emit("array.length", value, -1, "")
         val indexStorage = "drop_index"
-        builder.emitControl("local.zero", -1, -1, -1, indexStorage)
+        builder.emitControl("local.zero.i64", -1, -1, -1, indexStorage)
         val conditionLabel = builder.label()
         val bodyLabel = builder.label()
         val incrementLabel = builder.label()
@@ -4188,8 +4218,14 @@ class BootstrapLowerer(
     ): int {
         val index = this.lowerFieldIndex(owner, field)
         if (index >= 0) {
+            val fieldType = this.lowerFieldType(
+                bootstrapBorrowElementType(owner), field
+            )
+            var opcode = "field.set.indexed"
+            if (fieldType == "i64") opcode = "field.set.indexed.i64"
+            if (fieldType == "bool") opcode = "field.set.indexed.bool"
             this.emitIndexed(
-                "field.set.indexed", [receiver, value], field, index
+                opcode, [receiver, value], field, index
             )
         } else this.emitMany("field.set", [receiver, value], field)
     }
@@ -4305,7 +4341,7 @@ class BootstrapLowerer(
             val elements: array<int> = []
             result = this.emitMany("array.create", elements, "")
             val temporary = "range_current_${this.nextLabel}"
-            this.emitControl("local.zero", -1, -1, -1, temporary)
+            this.emitControl("local.zero.i64", -1, -1, -1, temporary)
             this.emitControl("local.set", begin, -1, -1, temporary)
             val conditionLabel = this.allocateLabel()
             val bodyLabel = this.allocateLabel()
@@ -4356,21 +4392,24 @@ class BootstrapLowerer(
                     this.declarations
                 )
                 this.recordCompileInputs(evaluated)
+                if (evaluated.diagnostics != "") {
+                    bootstrapStageDriverDiagnostic(evaluated.diagnostics)
+                }
                 this.errors = this.errors + evaluated.errors
                 result = this.emitEvaluated(evaluated.value)
             }
         }
         if (expression.kind == "region") {
             val checkpoint = this.emitMany(
-                "extern.intrinsic",
+                "call",
                 [],
-                "ablaRuntimeRegionBegin"
+                "__ablaRuntimePlatformRegionBegin"
             )
             result = this.lowerExpression(expression.children[0])
             this.emitMany(
-                "extern.intrinsic",
+                "call",
                 [checkpoint],
-                "ablaRuntimeRegionEnd"
+                "__ablaRuntimePlatformRegionEnd"
             )
         }
         if (expression.kind == "identifier") {
@@ -5336,7 +5375,7 @@ class BootstrapLowerer(
         if (expression.kind == "&&" || expression.kind == "||") {
             val temporaryId = this.allocateLabel()
             val temporary = "logical_result_$temporaryId"
-            this.emitControl("local.zero", -1, -1, -1, temporary)
+            this.emitControl("local.zero.bool", -1, -1, -1, temporary)
             val left = this.lowerExpression(expression.children[0])
             val evaluateLabel = this.allocateLabel()
             val shortcutLabel = this.allocateLabel()
@@ -5385,7 +5424,10 @@ class BootstrapLowerer(
         }
         if (expression.kind == "if") {
             val temporary = "if_result_${this.nextLabel}"
-            this.emitControl("local.zero", -1, -1, -1, temporary)
+            this.emitControl(
+                bootstrapIrLocalZeroOpcode(this.lowerExpressionType(expression)),
+                -1, -1, -1, temporary
+            )
             val condition = this.lowerExpression(expression.children[0])
             val thenLabel = this.allocateLabel()
             val elseLabel = this.allocateLabel()
@@ -5484,7 +5526,9 @@ class BootstrapLowerer(
                 } else "array.length"
                 length = this.emit(lengthOpcode, source, -1, "")
                 indexStorage = "for_index_${this.nextLabel}"
-                this.emitControl("local.zero", -1, -1, -1, indexStorage)
+                this.emitControl(
+                    "local.zero.i64", -1, -1, -1, indexStorage
+                )
                 val zero = this.emit("const.i64", -1, -1, "0")
                 this.emitControl("local.set", zero, -1, -1, indexStorage)
             }
@@ -5571,7 +5615,10 @@ class BootstrapLowerer(
         if (expression.kind == "when") {
             val temporaryId = this.allocateLabel()
             val temporary = "when_result_$temporaryId"
-            this.emitControl("local.zero", -1, -1, -1, temporary)
+            this.emitControl(
+                bootstrapIrLocalZeroOpcode(this.lowerExpressionType(expression)),
+                -1, -1, -1, temporary
+            )
             val subject = this.lowerExpression(expression.children[0])
             val mergeLabel = this.allocateLabel()
             var branch = 1
@@ -5771,7 +5818,8 @@ class BootstrapLowerer(
                 "unknown"
             } else declaration.resultType,
             functionLowerer.localStorage,
-            functionLowerer.localTypes
+            functionLowerer.localTypes,
+            bootstrapDeclarationHasAnnotation(declaration, "inline")
         )
         val loweringErrors = functionLowerer.errors - this.errors
         val reportedFunction = BootstrapIrFunction(
@@ -5784,6 +5832,7 @@ class BootstrapLowerer(
             loweredFunction.localTypes,
             loweredFunction.parameterTypes,
             loweredFunction.resultType,
+            loweredFunction.inlineHint,
             loweredFunction.verificationErrors + loweringErrors
         )
         functionSink.append(reportedFunction)
@@ -5894,7 +5943,8 @@ class BootstrapLowerer(
                 "unknown"
             } else method.resultType,
             methodLowerer.localStorage,
-            methodLowerer.localTypes
+            methodLowerer.localTypes,
+            bootstrapDeclarationHasAnnotation(method, "inline")
         )
         val loweringErrors = methodLowerer.errors - this.errors
         val reportedMethod = BootstrapIrFunction(
@@ -5907,6 +5957,7 @@ class BootstrapLowerer(
             loweredMethod.localTypes,
             loweredMethod.parameterTypes,
             loweredMethod.resultType,
+            loweredMethod.inlineHint,
             loweredMethod.verificationErrors + loweringErrors
         )
         functionSink.append(reportedMethod)
@@ -6058,8 +6109,13 @@ class BootstrapLowerer(
                     fieldParameters
                 ))
             }
+            // Native signatures are also the scalar ABI source of truth for
+            // compiler intrinsics.  Keeping only C declarations here forced
+            // inferred intrinsic results through the universal boxed-value
+            // path even when the declaration returned int or bool.
             if (declaration.kind == "extern" &&
-                declaration.externalLibrary == "c") {
+                (declaration.externalLibrary == "c" ||
+                 declaration.externalLibrary == "intrinsic")) {
                 val nativeParameters: array<string> = []
                 var nativeParameter = 0
                 while (nativeParameter < declaration.parameterTypes.size) {
@@ -6089,7 +6145,7 @@ class BootstrapLowerer(
                     declaration,
                     borrowReturnCallNames
                 ) || this.declarationHasManagedAlias(declaration))) {
-                val checkpoint = ablaRuntimeMemoryCheckpoint()
+                val checkpoint = runtimeMemoryCheckpoint()
                 val validationErrors = this.lowerFunctionDeclaration(
                     declaration,
                     true
@@ -6105,7 +6161,7 @@ class BootstrapLowerer(
                         method,
                         borrowReturnCallNames
                     ) || this.declarationHasManagedAlias(method)) {
-                    val checkpoint = ablaRuntimeMemoryCheckpoint()
+                    val checkpoint = runtimeMemoryCheckpoint()
                     val validationErrors = this.lowerMethodDeclaration(
                         declaration,
                         method,
@@ -6173,11 +6229,27 @@ class BootstrapLowerer(
             parsed.declarations,
             this.affineTypes
         )
+        val globalNames: array<string> = []
+        val globalTypes: array<string> = []
+        var global = 0
+        while (global < parsed.declarations.size) {
+            val declaration = parsed.declarations[global]
+            if (declaration.kind == "val" || declaration.kind == "var") {
+                globalNames.append(declaration.name)
+                // A delegated binding exposes the getter result but stores
+                // its delegate object. The backend must size and classify the
+                // global from that storage type, not the exposed scalar type.
+                globalTypes.append(this.lowerStorageType(declaration.name))
+            }
+            global = global + 1
+        }
         BootstrapIrProgram(
             this.instructions,
             this.functions,
             classes,
             natives,
+            globalNames,
+            globalTypes,
             this.compileInputPaths,
             this.compileInputContents,
             this.errors
@@ -6267,6 +6339,8 @@ fun bootstrapLowerParsedCached(
     if (bootstrapParsedHasContractCall(parsed)) BootstrapIrProgram(
         instructions,
         functions,
+        [],
+        [],
         [],
         [],
         compileInputPaths,

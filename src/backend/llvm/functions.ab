@@ -1,0 +1,2699 @@
+import "runtime.ab"
+
+fun bootstrapLlvmDirectFunctionSymbol(name: string): string =
+    "${name}_direct"
+
+fun bootstrapLlvmDirectScalarType(type: string): string {
+    val normalized = bootstrapNormalizeType(type)
+    if (normalized == "i64") "i64"
+    else if (normalized == "bool") "bool"
+    else ""
+}
+
+fun bootstrapLlvmDirectResultIsScalar(
+    function: BootstrapIrFunction
+): bool = bootstrapLlvmDirectScalarType(function.resultType) != ""
+
+fun bootstrapLlvmDirectParameterScalarType(
+    function: BootstrapIrFunction,
+    parameter: int
+): string {
+    if (parameter < 0 || parameter >= function.parameterTypes.size) ""
+    else bootstrapLlvmDirectScalarType(function.parameterTypes[parameter])
+}
+
+fun bootstrapLlvmDeclareDirectFunction(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    function: BootstrapIrFunction
+): i64* {
+    val scalarResult = bootstrapLlvmDirectScalarType(
+        function.resultType
+    )
+    val parameters: array<i64*> = []
+    if (scalarResult == "") parameters.append(backend.pointerType)
+    parameters.append(backend.i64Type)
+    var parameter = 0
+    while (parameter < function.parameters.size) {
+        val scalar = bootstrapLlvmDirectParameterScalarType(
+            function, parameter
+        )
+        parameters.append(
+            if (scalar == "") backend.pointerType
+            else backend.type(scalar)
+        )
+        parameter = parameter + 1
+    }
+    val declared = bootstrapLlvmDeclare(
+        backend, bootstrapLlvmDirectFunctionSymbol(name),
+        if (scalarResult == "") backend.voidType
+        else backend.type(scalarResult),
+        parameters, scalarResult == "",
+        bootstrapLlvmFalseFlags(parameters.size)
+    )
+    LLVMSetLinkage(declared, llvmExternalLinkage())
+    LLVMSetVisibility(declared, llvmHiddenVisibility())
+    if (function.inlineHint) {
+        bootstrapLlvmAddFunctionAttribute(
+            backend, declared, "alwaysinline"
+        )
+    }
+    declared
+}
+
+class BootstrapLlvmFunctionStorage(
+    val values: array<i64*>,
+    val nativeValues: array<i64*>,
+    val valueTypes: array<string>,
+    val locals: array<i64*>,
+    val nativeLocals: array<i64*>,
+    val localTypes: array<string>,
+    val parameters: array<i64*>,
+    val scratch: array<i64*>,
+    val scratchTypes: array<i64*>,
+    val auxiliary: array<i64*>,
+    val rootValues: array<bool>,
+    val localIndex: BootstrapLlvmNameIndex,
+    val labels: array<int>,
+    val blocks: array<i64*>,
+    val gcFrame: i64*,
+    val gcRoots: i64*,
+    val gcRootsType: i64*,
+    val gcRootCount: int
+)
+
+fun BootstrapLlvmFunctionStorage.block(label: int): i64* {
+    var result = nativeNullPointer()
+    var index = 0
+    while (index < this.labels.size) {
+        if (this.labels[index] == label) result = this.blocks[index]
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapLlvmValueCount(function: BootstrapIrFunction): int {
+    var count = 0
+    var index = 0
+    while (index < function.instructions.size) {
+        val instruction = function.instructions[index]
+        if (instruction.result >= count) count = instruction.result + 1
+        if (instruction.left >= count) count = instruction.left + 1
+        if (instruction.right >= count) count = instruction.right + 1
+        var operand = 0
+        while (operand < instruction.operands.size) {
+            if (instruction.operands[operand] >= count) {
+                count = instruction.operands[operand] + 1
+            }
+            operand = operand + 1
+        }
+        index = index + 1
+    }
+    count
+}
+
+fun bootstrapLlvmCreateFunctionStorage(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    llvmFunction: i64*,
+    collecting: bool,
+    rootValues: array<bool>,
+    scalarPlan: BootstrapLlvmScalarPlan
+): BootstrapLlvmFunctionStorage {
+    val values: array<i64*> = []
+    val nativeValues: array<i64*> = []
+    val locals: array<i64*> = []
+    val nativeLocals: array<i64*> = []
+    val parameters: array<i64*> = []
+    val scratch: array<i64*> = []
+    val scratchTypes: array<i64*> = []
+    val auxiliary: array<i64*> = []
+    val labels: array<int> = []
+    val blocks: array<i64*> = []
+    val nullPointer = nativeNullPointer()
+    val valueCount = bootstrapLlvmValueCount(function)
+    var index = 0
+    while (index < valueCount) {
+        var slot: i64* = nullPointer
+        if (index >= scalarPlan.valueTypes.size ||
+            scalarPlan.valueTypes[index] == "" ||
+            (index < scalarPlan.boxedValues.size &&
+             scalarPlan.boxedValues[index])) {
+            slot = LLVMBuildAlloca(
+                backend.builder, backend.valueType, "value"
+            )
+            LLVMSetAlignment(slot, 8)
+        }
+        values.append(slot)
+        nativeValues.append(nullPointer)
+        index = index + 1
+    }
+    index = 0
+    while (index < function.instructions.size) {
+        val instruction = function.instructions[index]
+        var local: i64* = nullPointer
+        var nativeLocal: i64* = nullPointer
+        if (instruction.opcode == "local.declare" ||
+            bootstrapIrIsLocalZero(instruction.opcode) ||
+            instruction.opcode == "local.allocate") {
+            val scalar = if (index < scalarPlan.localTypes.size)
+                scalarPlan.localTypes[index] else ""
+            if (scalar == "") {
+                local = LLVMBuildAlloca(
+                    backend.builder, backend.valueType, "local"
+                )
+                LLVMSetAlignment(local, 8)
+            } else {
+                nativeLocal = LLVMBuildAlloca(
+                    backend.builder, backend.type(scalar), "scalar.local"
+                )
+                LLVMSetAlignment(nativeLocal, if (scalar == "bool") 1 else 8)
+            }
+        }
+        locals.append(local)
+        nativeLocals.append(nativeLocal)
+        var storage: i64* = nullPointer
+        var storageType: i64* = nullPointer
+        if ((instruction.opcode == "closure.create" ||
+             instruction.opcode == "array.create") &&
+            instruction.operands.size > 0) {
+            storageType = LLVMArrayType2(
+                backend.valueType, instruction.operands.size
+            )
+            storage = LLVMBuildAlloca(
+                backend.builder, storageType, "arguments"
+            )
+            LLVMSetAlignment(storage, 8)
+        }
+        if ((instruction.opcode == "call.indirect" ||
+             instruction.opcode == "call.indirect.once") &&
+            instruction.operands.size > 1) {
+            storageType = LLVMArrayType2(
+                backend.valueType, instruction.operands.size - 1
+            )
+            storage = LLVMBuildAlloca(
+                backend.builder, storageType, "indirect.arguments"
+            )
+            LLVMSetAlignment(storage, 8)
+        }
+        scratch.append(storage)
+        scratchTypes.append(storageType)
+        var extra: i64* = nullPointer
+        if (instruction.opcode == "resource.drop") {
+            extra = LLVMBuildAlloca(
+                backend.builder, backend.valueType, "drop.result"
+            )
+            LLVMSetAlignment(extra, 8)
+        }
+        auxiliary.append(extra)
+        if (instruction.opcode == "label") {
+            labels.append(instruction.target)
+            blocks.append(LLVMAppendBasicBlockInContext(
+                backend.context,
+                llvmFunction,
+                "source.label"
+            ))
+        }
+        index = index + 1
+    }
+    index = 0
+    val scalarResult = bootstrapLlvmDirectResultIsScalar(function)
+    val parameterBegin = (if (scalarResult) 0 else 1) + 1
+    while (index < function.parameters.size) {
+        var slot: i64* = nullPointer
+        if (bootstrapLlvmParameterHasDefault(
+            function, function.parameters[index]
+        )) {
+            slot = LLVMBuildAlloca(
+                backend.builder, backend.valueType, "parameter"
+            )
+            LLVMSetAlignment(slot, 8)
+        } else if (bootstrapLlvmDirectParameterScalarType(
+            function, index
+        ) == "") {
+            // Required arguments are guaranteed by semantic analysis. Keep
+            // their incoming AblaValue pointer directly instead of copying a
+            // 24-byte value through a second stack slot in every call.
+            slot = LLVMGetParam(llvmFunction, index + parameterBegin)
+        }
+        parameters.append(slot)
+        index = index + 1
+    }
+    index = 0
+    val zero = LLVMConstNull(backend.valueType)
+    while (index < values.size) {
+        if (!pointerIsNull(values[index])) {
+            val stored = LLVMBuildStore(backend.builder, zero, values[index])
+            LLVMSetAlignment(stored, 8)
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < locals.size) {
+        if (!pointerIsNull(locals[index])) {
+            val stored = LLVMBuildStore(backend.builder, zero, locals[index])
+            LLVMSetAlignment(stored, 8)
+        }
+        index = index + 1
+    }
+    var rootCount = 0
+    if (collecting) {
+        index = 0
+        while (index < parameters.size) {
+            if (!pointerIsNull(parameters[index])) rootCount = rootCount + 1
+            index = index + 1
+        }
+        index = 0
+        while (index < values.size && index < rootValues.size) {
+            if (rootValues[index] &&
+                !pointerIsNull(values[index])) rootCount = rootCount + 1
+            index = index + 1
+        }
+        index = 0
+        while (index < locals.size) {
+            if (!pointerIsNull(locals[index])) rootCount = rootCount + 1
+            index = index + 1
+        }
+    }
+    var gcFrame: i64* = nullPointer
+    var gcRoots: i64* = nullPointer
+    var gcRootsType: i64* = nullPointer
+    if (rootCount > 0) {
+        gcFrame = LLVMBuildAlloca(
+            backend.builder, backend.rootFrameType, "gc.frame"
+        )
+        gcRootsType = LLVMArrayType2(backend.pointerType, rootCount)
+        gcRoots = LLVMBuildAlloca(
+            backend.builder, gcRootsType, "gc.roots"
+        )
+    }
+    BootstrapLlvmFunctionStorage(
+        values, nativeValues, scalarPlan.valueTypes,
+        locals, nativeLocals, scalarPlan.localTypes,
+        parameters, scratch, scratchTypes, auxiliary,
+        rootValues, bootstrapLlvmLocalIndex(function),
+        labels, blocks, gcFrame, gcRoots, gcRootsType, rootCount
+    )
+}
+
+fun bootstrapLlvmInitializeParameters(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    llvmFunction: i64*,
+    storage: BootstrapLlvmFunctionStorage
+): void {
+    val scalarResult = bootstrapLlvmDirectResultIsScalar(function)
+    val countIndex = if (scalarResult) 0 else 1
+    val parameterBegin = countIndex + 1
+    val count = LLVMGetParam(llvmFunction, countIndex)
+    var parameter = 0
+    while (parameter < function.parameters.size) {
+        val hasDefault = bootstrapLlvmParameterHasDefault(
+            function, function.parameters[parameter]
+        )
+        if (!hasDefault) {
+            // Required direct-call arguments are already either native LLVM
+            // scalars or incoming AblaValue pointers in function storage.
+            parameter = parameter + 1
+            continue
+        }
+        val present = LLVMAppendBasicBlockInContext(
+            backend.context, llvmFunction, "argument.present"
+        )
+        val missing = LLVMAppendBasicBlockInContext(
+            backend.context, llvmFunction, "argument.missing"
+        )
+        val ready = LLVMAppendBasicBlockInContext(
+            backend.context, llvmFunction, "argument.ready"
+        )
+        val hasArgument = LLVMBuildICmp(
+            backend.builder,
+            llvmIntUnsignedGreaterThan(),
+            count,
+            LLVMConstInt(backend.i64Type, parameter, 0),
+            "argument.available"
+        )
+        LLVMBuildCondBr(backend.builder, hasArgument, present, missing)
+        LLVMPositionBuilderAtEnd(backend.builder, present)
+        val source = LLVMGetParam(
+            llvmFunction, parameter + parameterBegin
+        )
+        val scalar = bootstrapLlvmDirectParameterScalarType(
+            function, parameter
+        )
+        if (scalar == "") {
+            bootstrapLlvmCopyValue(
+                backend, source, storage.parameters[parameter], "argument"
+            )
+        } else {
+            bootstrapLlvmStoreTaggedWordValue(
+                backend,
+                storage.parameters[parameter],
+                if (scalar == "bool") 3 else 2,
+                if (scalar == "bool") LLVMBuildZExt(
+                    backend.builder, source, backend.i64Type,
+                    "argument.bool.word"
+                ) else source
+            )
+        }
+        LLVMBuildBr(backend.builder, ready)
+        LLVMPositionBuilderAtEnd(backend.builder, missing)
+        bootstrapLlvmRuntimeCall(
+            backend, "abla_void", storage.parameters[parameter], []
+        )
+        LLVMBuildBr(backend.builder, ready)
+        LLVMPositionBuilderAtEnd(backend.builder, ready)
+        parameter = parameter + 1
+    }
+}
+
+fun bootstrapLlvmParameterHasDefault(
+    function: BootstrapIrFunction,
+    name: string
+): bool {
+    var found = false
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "parameter.default" &&
+            candidate.text == name) found = true
+        instruction = instruction + 1
+    }
+    found
+}
+
+fun bootstrapLlvmPushRoots(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage
+): void {
+    if (storage.gcRootCount > 0) {
+        var root = 0
+        var index = 0
+        while (index < storage.values.size) {
+            if (index < storage.rootValues.size &&
+                storage.rootValues[index] &&
+                !pointerIsNull(storage.values[index])) {
+                val destination = bootstrapLlvmArrayElement(
+                    backend, storage.gcRootsType, storage.gcRoots,
+                    root, "gc.root"
+                )
+                LLVMBuildStore(
+                    backend.builder, storage.values[index], destination
+                )
+                root = root + 1
+            }
+            index = index + 1
+        }
+        index = 0
+        while (index < storage.parameters.size) {
+            if (!pointerIsNull(storage.parameters[index])) {
+                val destination = bootstrapLlvmArrayElement(
+                    backend, storage.gcRootsType, storage.gcRoots,
+                    root, "gc.root"
+                )
+                LLVMBuildStore(
+                    backend.builder, storage.parameters[index], destination
+                )
+                root = root + 1
+            }
+            index = index + 1
+        }
+        index = 0
+        while (index < storage.locals.size) {
+            if (!pointerIsNull(storage.locals[index])) {
+                val destination = bootstrapLlvmArrayElement(
+                    backend, storage.gcRootsType, storage.gcRoots,
+                    root, "gc.root"
+                )
+                LLVMBuildStore(
+                    backend.builder, storage.locals[index], destination
+                )
+                root = root + 1
+            }
+            index = index + 1
+        }
+        val first = bootstrapLlvmArrayElement(
+            backend, storage.gcRootsType, storage.gcRoots, 0, "gc.roots.pointer"
+        )
+        bootstrapLlvmCallNamed(
+            backend,
+            "abla_runtime_roots_push",
+            [storage.gcFrame, first,
+             LLVMConstInt(backend.i64Type, storage.gcRootCount, 0)],
+            "", false, [false, false, false]
+        )
+    }
+}
+
+fun bootstrapLlvmPopRoots(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage
+): void {
+    if (storage.gcRootCount > 0) {
+        bootstrapLlvmCallNamed(
+            backend, "abla_runtime_roots_pop", [storage.gcFrame],
+            "", false, [false]
+        )
+    }
+}
+
+fun bootstrapLlvmNativeValue(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    value: int
+): i64* {
+    var result = nativeNullPointer()
+    if (value >= 0 && value < storage.nativeValues.size) {
+        result = storage.nativeValues[value]
+        if (pointerIsNull(result) &&
+            value < storage.valueTypes.size &&
+            storage.valueTypes[value] != "" &&
+            !pointerIsNull(storage.values[value])) {
+            val scalar = storage.valueTypes[value]
+            result = bootstrapLlvmCallNamed(
+                backend,
+                if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
+                [storage.values[value]], "scalar.unbox", false, [true]
+            )
+        }
+    }
+    result
+}
+
+fun bootstrapLlvmSetNativeValue(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    value: int,
+    native: i64*
+): void {
+    if (value >= 0 && value < storage.nativeValues.size) {
+        storage.nativeValues[value] = native
+        if (!pointerIsNull(storage.values[value])) {
+            val scalar = storage.valueTypes[value]
+            bootstrapLlvmCallNamed(
+                backend,
+                if (scalar == "bool") "abla_bool" else "abla_i64",
+                [storage.values[value], native], "", true, [false, false]
+            )
+        }
+    }
+}
+
+fun bootstrapLlvmNativeLocalPointer(
+    storage: BootstrapLlvmFunctionStorage,
+    name: string
+): i64* {
+    var result = nativeNullPointer()
+    val local = storage.localIndex.find(name)
+    if (local >= 0 && local < storage.nativeLocals.size) {
+        result = storage.nativeLocals[local]
+    }
+    result
+}
+
+fun bootstrapLlvmPrepareArguments(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    instructionIndex: int,
+    operands: array<int>,
+    skip: int
+): i64* {
+    var result = LLVMConstNull(backend.pointerType)
+    val count = operands.size - skip
+    if (count > 0) {
+        var operand = skip
+        while (operand < operands.size) {
+            val position = operand - skip
+            val destination = bootstrapLlvmArrayElement(
+                backend,
+                storage.scratchTypes[instructionIndex],
+                storage.scratch[instructionIndex],
+                position,
+                "call.argument"
+            )
+            bootstrapLlvmCopyValue(
+                backend, storage.values[operands[operand]], destination,
+                "call.argument.value"
+            )
+            operand = operand + 1
+        }
+        result = bootstrapLlvmArrayElement(
+            backend,
+            storage.scratchTypes[instructionIndex],
+            storage.scratch[instructionIndex],
+            0,
+            "call.arguments"
+        )
+    }
+    result
+}
+
+fun bootstrapLlvmDirectCallArguments(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    function: BootstrapIrFunction,
+    operands: array<int>,
+    output: i64*
+): array<i64*> {
+    val arguments: array<i64*> = []
+    if (!bootstrapLlvmDirectResultIsScalar(function)) {
+        arguments.append(output)
+    }
+    arguments.append(LLVMConstInt(
+        backend.i64Type, operands.size, 0
+    ))
+    var parameter = 0
+    while (parameter < function.parameters.size) {
+        val scalar = bootstrapLlvmDirectParameterScalarType(
+            function, parameter
+        )
+        if (parameter < operands.size) {
+            if (scalar == "") {
+                arguments.append(storage.values[operands[parameter]])
+            } else {
+                var native = bootstrapLlvmNativeValue(
+                    backend, storage, operands[parameter]
+                )
+                if (pointerIsNull(native)) native = bootstrapLlvmCallNamed(
+                        backend,
+                        if (scalar == "bool") "abla_as_bool"
+                        else "abla_as_i64",
+                        [storage.values[operands[parameter]]],
+                        "direct.argument", false, [true]
+                    )
+                arguments.append(native)
+            }
+        } else {
+            arguments.append(
+                if (scalar == "") LLVMConstNull(backend.pointerType)
+                else LLVMConstInt(backend.type(scalar), 0, 0)
+            )
+        }
+        parameter = parameter + 1
+    }
+    arguments
+}
+
+fun bootstrapLlvmEmitDirectCall(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    target: i64*,
+    arguments: array<i64*>,
+    output: i64*
+): i64* {
+    val scalar = bootstrapLlvmDirectScalarType(function.resultType)
+    val result = bootstrapLlvmCall(
+        backend, target, arguments,
+        if (scalar == "") "" else "direct.scalar",
+        scalar == "", bootstrapLlvmFalseFlags(arguments.size)
+    )
+    if (scalar != "" && !pointerIsNull(output)) {
+        bootstrapLlvmCallNamed(
+            backend,
+            if (scalar == "bool") "abla_bool" else "abla_i64",
+            [output, result], "", true, [false, false]
+        )
+    }
+    result
+}
+
+fun bootstrapLlvmRuntimeOperation(opcode: string): string {
+    var name = bootstrapLlvmRuntimeBinary(opcode)
+    if (opcode == "neg") name = "abla_negate"
+    if (opcode == "not") name = "abla_not"
+    if (opcode == "bit.not") name = "ablaBitNot"
+    if (opcode == "cell.create") name = "abla_cell_create"
+    if (opcode == "cell.get") name = "abla_cell_get"
+    if (opcode == "cell.set") name = "abla_cell_set"
+    if (opcode == "shared.create") name = "abla_shared_create"
+    if (opcode == "shared.clone") name = "abla_shared_clone"
+    if (opcode == "shared.get") name = "abla_shared_get"
+    if (opcode == "shared.lock") name = "abla_shared_lock"
+    if (opcode == "shared.release") name = "abla_shared_release"
+    if (opcode == "weak.create") name = "abla_weak_create"
+    if (opcode == "weak.clone") name = "abla_weak_clone"
+    if (opcode == "weak.upgrade") name = "abla_weak_upgrade"
+    if (opcode == "weak.alive") name = "abla_weak_alive"
+    if (opcode == "weak.release") name = "abla_weak_release"
+    if (opcode == "length") name = "abla_length"
+    if (opcode == "index.get") name = "abla_index_get"
+    if (opcode == "string.length") name = "abla_string_length"
+    if (opcode == "string.get") name = "abla_string_get"
+    if (opcode == "array.length") name = "abla_array_length"
+    if (opcode == "array.get") name = "abla_array_get"
+    if (opcode == "string.equal") name = "abla_string_equal"
+    if (opcode == "string.not.equal") name = "abla_string_not_equal"
+    if (opcode == "array.append") name = "abla_array_append"
+    if (opcode == "string.slice") name = "abla_string_slice"
+    if (opcode == "string.concat") name = "abla_string_concat"
+    if (opcode == "to.string") name = "abla_to_string"
+    name
+}
+
+fun bootstrapLlvmScalarOperand(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    value: int,
+    scalar: string
+): i64* {
+    var result = bootstrapLlvmNativeValue(backend, storage, value)
+    if (pointerIsNull(result)) result = bootstrapLlvmCallNamed(
+            backend,
+            if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
+            [storage.values[value]], "scalar.boundary", false, [true]
+        )
+    result
+}
+
+fun bootstrapLlvmEmitScalarOperation(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): bool {
+    var emitted = false
+    if (instruction.result >= 0 &&
+        instruction.result < storage.valueTypes.size &&
+        storage.valueTypes[instruction.result] != "") {
+        var native = nativeNullPointer()
+        if (instruction.opcode == "+" || instruction.opcode == "-" ||
+            instruction.opcode == "*" || instruction.opcode == "/") {
+            val left = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "i64"
+            )
+            val right = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.right, "i64"
+            )
+            if (instruction.opcode == "+") native = LLVMBuildAdd(
+                backend.builder, left, right, "scalar.add"
+            )
+            if (instruction.opcode == "-") native = LLVMBuildSub(
+                backend.builder, left, right, "scalar.subtract"
+            )
+            if (instruction.opcode == "*") native = LLVMBuildMul(
+                backend.builder, left, right, "scalar.multiply"
+            )
+            if (instruction.opcode == "/") native = LLVMBuildSDiv(
+                backend.builder, left, right, "scalar.divide"
+            )
+        }
+        if (instruction.opcode == "neg") native = LLVMBuildNeg(
+            backend.builder,
+            bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "i64"
+            ),
+            "scalar.negate"
+        )
+        if (instruction.opcode == "&" || instruction.opcode == "|" ||
+            instruction.opcode == "^") {
+            val left = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "i64"
+            )
+            val right = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.right, "i64"
+            )
+            if (!pointerIsNull(left) && !pointerIsNull(right) &&
+                instruction.opcode == "&") native = LLVMBuildAnd(
+                    backend.builder, left, right, "scalar.bit.and"
+                )
+            if (!pointerIsNull(left) && !pointerIsNull(right) &&
+                instruction.opcode == "|") native = LLVMBuildOr(
+                    backend.builder, left, right, "scalar.bit.or"
+                )
+            if (!pointerIsNull(left) && !pointerIsNull(right) &&
+                instruction.opcode == "^") native = LLVMBuildXor(
+                    backend.builder, left, right, "scalar.bit.xor"
+                )
+        }
+        if (instruction.opcode == "bit.not") {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "i64"
+            )
+            if (!pointerIsNull(value)) native = LLVMBuildXor(
+                backend.builder, value,
+                LLVMConstInt(backend.i64Type, -1, 1),
+                "scalar.bit.not"
+            )
+        }
+        if (instruction.opcode == "<<" || instruction.opcode == ">>" ||
+            instruction.opcode == ">>>") {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "i64"
+            )
+            val count = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.right, "i64"
+            )
+            if (!pointerIsNull(value) && !pointerIsNull(count)) {
+                val zero = LLVMConstInt(backend.i64Type, 0, 0)
+                val negative = LLVMBuildICmp(
+                    backend.builder, llvmIntSignedLessThan(), count, zero,
+                    "scalar.shift.negative"
+                )
+                val tooLarge = LLVMBuildICmp(
+                    backend.builder, llvmIntSignedGreaterOrEqual(), count,
+                    LLVMConstInt(backend.i64Type, 64, 0),
+                    "scalar.shift.too.large"
+                )
+                val invalid = LLVMBuildOr(
+                    backend.builder, negative, tooLarge,
+                    "scalar.shift.invalid"
+                )
+                val safeCount = LLVMBuildSelect(
+                    backend.builder, invalid, zero, count,
+                    "scalar.shift.safe.count"
+                )
+                var shifted = nativeNullPointer()
+                if (instruction.opcode == "<<") shifted = LLVMBuildShl(
+                    backend.builder, value, safeCount, "scalar.shift.left"
+                )
+                if (instruction.opcode == ">>") shifted = LLVMBuildAShr(
+                    backend.builder, value, safeCount, "scalar.shift.right"
+                )
+                if (instruction.opcode == ">>>") shifted = LLVMBuildLShr(
+                    backend.builder, value, safeCount,
+                    "scalar.shift.right.unsigned"
+                )
+                native = LLVMBuildSelect(
+                    backend.builder, invalid, zero, shifted,
+                    "scalar.shift.result"
+                )
+            }
+        }
+        if (instruction.opcode == "not") native = LLVMBuildXor(
+            backend.builder,
+            bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "bool"
+            ),
+            LLVMConstInt(backend.i1Type, 1, 0), "scalar.not"
+        )
+        if (instruction.opcode == "string.length" ||
+            instruction.opcode == "array.length") {
+            native = bootstrapLlvmCallNamed(
+                backend,
+                if (instruction.opcode == "string.length") {
+                    "abla_string_length_i64"
+                } else "abla_array_length_i64",
+                [storage.values[instruction.left]],
+                "scalar.length", false, [true]
+            )
+        }
+        if (instruction.opcode == "string.get") {
+            native = bootstrapLlvmCallNamed(
+                backend, "abla_string_get_i64",
+                [storage.values[instruction.left],
+                 bootstrapLlvmScalarOperand(
+                    backend, storage, instruction.right, "i64"
+                 )],
+                "scalar.string.get", false, [true, false]
+            )
+        }
+        if (instruction.opcode == "array.get.i64" ||
+            instruction.opcode == "array.get.bool") {
+            native = bootstrapLlvmCallNamed(
+                backend,
+                if (instruction.opcode == "array.get.bool") {
+                    "abla_array_get_bool"
+                } else "abla_array_get_i64",
+                [storage.values[instruction.left],
+                 bootstrapLlvmScalarOperand(
+                    backend, storage, instruction.right, "i64"
+                 )],
+                "scalar.array.get", false, [true, false]
+            )
+        }
+        if (instruction.opcode == "string.equal" ||
+            instruction.opcode == "string.not.equal") {
+            native = bootstrapLlvmCallNamed(
+                backend,
+                if (instruction.opcode == "string.equal") {
+                    "abla_string_equal_bool"
+                } else "abla_string_not_equal_bool",
+                [storage.values[instruction.left],
+                 storage.values[instruction.right]],
+                "scalar.string.equal", false, [true, true]
+            )
+        }
+        if (instruction.opcode == "field.get.indexed.i64" ||
+            instruction.opcode == "field.get.indexed.bool") {
+            native = bootstrapLlvmCallNamed(
+                backend,
+                if (instruction.opcode == "field.get.indexed.bool") {
+                    "abla_field_get_indexed_bool"
+                } else "abla_field_get_indexed_i64",
+                [storage.values[instruction.left], LLVMConstInt(
+                    backend.i32Type,
+                    bootstrapLlvmStableNameId(instruction.text), 0
+                 ), LLVMConstInt(
+                    backend.i64Type, instruction.target, 0
+                 )],
+                "scalar.field.get", false, [true, false, false]
+            )
+        }
+        if (instruction.opcode == "&&" || instruction.opcode == "||") {
+            val left = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, "bool"
+            )
+            val right = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.right, "bool"
+            )
+            native = if (instruction.opcode == "&&") LLVMBuildAnd(
+                backend.builder, left, right, "scalar.and"
+            ) else LLVMBuildOr(
+                backend.builder, left, right, "scalar.or"
+            )
+        }
+        if (instruction.opcode == "==" || instruction.opcode == "!=" ||
+            instruction.opcode == "<" || instruction.opcode == "<=" ||
+            instruction.opcode == ">" || instruction.opcode == ">=") {
+            var operandType = "i64"
+            if (instruction.left >= 0 &&
+                instruction.left < storage.valueTypes.size &&
+                storage.valueTypes[instruction.left] == "bool") {
+                operandType = "bool"
+            }
+            val left = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, operandType
+            )
+            val right = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.right, operandType
+            )
+            var predicate = llvmIntEqual()
+            if (instruction.opcode == "!=") predicate = llvmIntNotEqual()
+            if (instruction.opcode == "<") predicate = llvmIntSignedLessThan()
+            if (instruction.opcode == "<=") {
+                predicate = llvmIntSignedLessOrEqual()
+            }
+            if (instruction.opcode == ">") {
+                predicate = llvmIntSignedGreaterThan()
+            }
+            if (instruction.opcode == ">=") {
+                predicate = llvmIntSignedGreaterOrEqual()
+            }
+            native = LLVMBuildICmp(
+                backend.builder, predicate, left, right, "scalar.compare"
+            )
+        }
+        if (!pointerIsNull(native)) {
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, native
+            )
+            emitted = true
+        }
+    }
+    emitted
+}
+
+fun bootstrapLlvmParseInteger(text: string): int {
+    var sign = 1
+    var index = 0
+    if (text.size > 0 && text[0] == 45) {
+        sign = -1
+        index = 1
+    }
+    var result = 0
+    while (index < text.size) {
+        result = result * 10 + text[index] - 48
+        index = index + 1
+    }
+    result * sign
+}
+
+fun bootstrapLlvmInstructionInputs(
+    storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): array<i64*> {
+    val inputs: array<i64*> = []
+    if (instruction.operands.size > 0) {
+        var index = 0
+        while (index < instruction.operands.size) {
+            inputs.append(storage.values[instruction.operands[index]])
+            index = index + 1
+        }
+    } else {
+        if (instruction.left >= 0) inputs.append(
+            storage.values[instruction.left]
+        )
+        if (instruction.right >= 0) inputs.append(
+            storage.values[instruction.right]
+        )
+    }
+    inputs
+}
+
+fun bootstrapLlvmNativeArgument(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    value: int,
+    type: string
+): i64* {
+    var result = nativeNullPointer()
+    var scalar = nativeNullPointer()
+    if (value >= 0 && value < storage.valueTypes.size &&
+        storage.valueTypes[value] != "") {
+        scalar = bootstrapLlvmNativeValue(backend, storage, value)
+    }
+    if (type == "bool" && !pointerIsNull(scalar)) {
+        result = scalar
+    } else if (type == "bool") {
+        result = bootstrapLlvmCallNamed(
+            backend, "abla_as_bool", [storage.values[value]],
+            "native.bool", false, [true]
+        )
+    } else if (type == "cstring") {
+        result = bootstrapLlvmCallNamed(
+            backend, "abla_as_cstring", [storage.values[value]],
+            "native.cstring", false, [true]
+        )
+    } else {
+        val integer = if (!pointerIsNull(scalar)) scalar
+            else bootstrapLlvmCallNamed(
+                backend, "abla_as_i64", [storage.values[value]],
+                "native.integer", false, [true]
+            )
+        result = integer
+        if (bootstrapLlvmIsNarrowNativeInteger(type)) {
+            result = LLVMBuildTrunc(
+                backend.builder, integer, backend.type(type), "native.narrow"
+            )
+        }
+        if (bootstrapLlvmIsPointerType(type)) {
+            result = LLVMBuildIntToPtr(
+                backend.builder, integer, backend.pointerType,
+                "native.pointer"
+            )
+        }
+    }
+    result
+}
+
+fun bootstrapLlvmStoreNativeResult(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    output: int,
+    value: i64*,
+    type: string
+): void {
+    if (type == "void") {
+        bootstrapLlvmRuntimeCall(
+            backend, "abla_void", storage.values[output], []
+        )
+    }
+    if (type == "bool") {
+        bootstrapLlvmCallNamed(
+            backend, "abla_bool", [storage.values[output], value],
+            "", true, [false, false]
+        )
+    }
+    if (bootstrapLlvmIsNativeInteger(type)) {
+        var integer = value
+        if (bootstrapLlvmIsNarrowNativeInteger(type)) {
+            if (bootstrapLlvmIsUnsignedNativeInteger(type)) {
+                integer = LLVMBuildZExt(
+                    backend.builder, value, backend.i64Type, "native.wide"
+                )
+            } else {
+                integer = LLVMBuildSExt(
+                    backend.builder, value, backend.i64Type, "native.wide"
+                )
+            }
+        }
+        bootstrapLlvmCallNamed(
+            backend, "abla_i64", [storage.values[output], integer],
+            "", true, [false, false]
+        )
+    }
+    if (bootstrapLlvmIsPointerType(type)) {
+        val integer = LLVMBuildPtrToInt(
+            backend.builder, value, backend.i64Type, "native.address"
+        )
+        bootstrapLlvmCallNamed(
+            backend, "abla_i64", [storage.values[output], integer],
+            "", true, [false, false]
+        )
+    }
+}
+
+fun bootstrapLlvmEmitNativeCall(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    nativeIndex: BootstrapLlvmNameIndex,
+    var storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): bool {
+    var supported = true
+    val arguments: array<i64*> = []
+    val parameterTypes: array<i64*> = []
+    val byval: array<bool> = []
+    var operand = 0
+    while (operand < instruction.operands.size) {
+        val type = bootstrapLlvmNativeParameterType(
+            program, nativeIndex, instruction.text, operand
+        )
+        val nativeType = bootstrapLlvmNativeType(type)
+        if (nativeType == "unknown") supported = false
+        arguments.append(bootstrapLlvmNativeArgument(
+            backend, storage, instruction.operands[operand], type
+        ))
+        parameterTypes.append(backend.type(nativeType))
+        byval.append(false)
+        operand = operand + 1
+    }
+    val resultType = bootstrapLlvmNativeResultType(
+        program, nativeIndex, instruction.text
+    )
+    val nativeResultType = bootstrapLlvmNativeType(resultType)
+    if (nativeResultType == "unknown" || resultType == "cstring") {
+        supported = false
+    }
+    if (supported) {
+        val native = bootstrapLlvmDeclare(
+            backend, instruction.text, backend.type(nativeResultType),
+            parameterTypes, false, byval
+        )
+        val result = bootstrapLlvmCall(
+            backend, native, arguments,
+            if (resultType == "void") "" else "native.result",
+            false, byval
+        )
+        if (instruction.result >= 0 &&
+            instruction.result < storage.valueTypes.size &&
+            storage.valueTypes[instruction.result] != "") {
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, result
+            )
+        } else {
+            bootstrapLlvmStoreNativeResult(
+                backend, storage, instruction.result, result, resultType
+            )
+        }
+    }
+    supported
+}
+
+fun bootstrapLlvmCoreIntrinsic(name: string): bool =
+    name == "ablaRuntimeValueAddress" ||
+    name == "ablaRuntimeMakeValue" ||
+    name == "ablaRuntimeLoadI32" ||
+    name == "ablaRuntimeStoreI32" ||
+    name == "ablaRuntimeLoadI64" ||
+    name == "ablaRuntimeStoreI64" ||
+    name == "ablaRuntimeLoadU8" ||
+    name == "ablaRuntimeStoreU8" ||
+    name == "ablaRuntimeTrap" ||
+    name == "ablaRuntimePointerAddress" ||
+    name == "ablaRuntimePointerFromAddress" ||
+    name == "ablaUnsafeLoadI64" ||
+    name == "ablaUnsafeStoreI64" ||
+    name == "ablaUnsafeLoadPointer" ||
+    name == "ablaUnsafeStorePointer" ||
+    name == "ablaUnsafeNullPointer" ||
+    name == "ablaUnsafePointerIsNull" ||
+    name == "ablaUnsafeCallMain" ||
+    name == "ablaUnsafeCStringAddress" ||
+    name == "ablaUnsafePointerAddress" ||
+    name == "ablaUnsafePointerOffset" ||
+    name == "ablaUnsafeLoadU8" ||
+    name == "ablaUnsafeStoreU8" ||
+    name == "ablaUnsafeAdoptString" ||
+    name == "ablaUnsafeBorrowCString" ||
+    name == "ablaHostIsMacOS" ||
+    name == "ablaHostValueArgumentsIndirect" ||
+    name == "ablaLinuxArgumentCount" ||
+    name == "ablaLinuxArgument" ||
+    name == "ablaLinuxEnvironmentPointer" ||
+    name == "ablaLinuxSyscall" ||
+    name == "ablaRuntimeWasmHeapBase" ||
+    name == "ablaRuntimeWasmMemorySize" ||
+    name == "ablaRuntimeWasmMemoryGrow"
+
+fun bootstrapLlvmCoreIntrinsicInteger(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    value: int
+): i64* {
+    var result = bootstrapLlvmNativeValue(backend, storage, value)
+    if (pointerIsNull(result)) result = bootstrapLlvmCallNamed(
+        backend, "abla_as_i64", [storage.values[value]],
+        "runtime.intrinsic.integer", false, [true]
+    )
+    result
+}
+
+fun bootstrapLlvmInitializeVoidValue(
+    backend: BootstrapLlvmBackend,
+    destination: i64*
+): void {
+    val stored = LLVMBuildStore(
+        backend.builder, LLVMConstNull(backend.valueType), destination
+    )
+    LLVMSetAlignment(stored, 8)
+}
+
+fun bootstrapLlvmEmitCoreIntrinsic(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): bool {
+    var supported = bootstrapLlvmCoreIntrinsic(instruction.text)
+    if (!supported) return supported
+
+    val name = instruction.text
+    if (name == "ablaRuntimeValueAddress") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val address = LLVMBuildPtrToInt(
+                backend.builder,
+                storage.values[instruction.operands[0]],
+                backend.i64Type,
+                "runtime.value.address"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, address
+            )
+        }
+    }
+    if (name == "ablaRuntimeMakeValue") {
+        if (instruction.operands.size != 4) supported = false
+        if (instruction.operands.size == 4) {
+            val destination = storage.values[instruction.result]
+            val tag = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[0]
+            )
+            val auxiliary = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[1]
+            )
+            val word0 = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[2]
+            )
+            val word1 = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[3]
+            )
+            val tagPointer = LLVMBuildStructGEP2(
+                backend.builder, backend.valueType,
+                destination, 0, "runtime.value.tag"
+            )
+            val auxiliaryPointer = LLVMBuildStructGEP2(
+                backend.builder, backend.valueType,
+                destination, 1, "runtime.value.auxiliary"
+            )
+            val payload = LLVMBuildStructGEP2(
+                backend.builder, backend.valueType,
+                destination, 2, "runtime.value.payload"
+            )
+            val word0Pointer = LLVMBuildStructGEP2(
+                backend.builder, backend.payloadType,
+                payload, 0, "runtime.value.word0"
+            )
+            val word1Pointer = LLVMBuildStructGEP2(
+                backend.builder, backend.payloadType,
+                payload, 1, "runtime.value.word1"
+            )
+            LLVMBuildStore(
+                backend.builder,
+                LLVMBuildTrunc(
+                    backend.builder, tag, backend.i32Type,
+                    "runtime.value.tag.i32"
+                ),
+                tagPointer
+            )
+            LLVMBuildStore(
+                backend.builder,
+                LLVMBuildTrunc(
+                    backend.builder, auxiliary, backend.i32Type,
+                    "runtime.value.auxiliary.i32"
+                ),
+                auxiliaryPointer
+            )
+            LLVMBuildStore(backend.builder, word0, word0Pointer)
+            LLVMBuildStore(backend.builder, word1, word1Pointer)
+        }
+    }
+    if (name == "ablaRuntimeLoadI32" ||
+        name == "ablaRuntimeLoadI64" ||
+        name == "ablaRuntimeLoadU8") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val address = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[0]
+            )
+            val pointer = LLVMBuildIntToPtr(
+                backend.builder, address, backend.pointerType,
+                "runtime.load.pointer"
+            )
+            var type = backend.i64Type
+            if (name == "ablaRuntimeLoadI32") type = backend.i32Type
+            if (name == "ablaRuntimeLoadU8") type = backend.i8Type
+            var loaded = LLVMBuildLoad2(
+                backend.builder, type, pointer, "runtime.load"
+            )
+            if (name != "ablaRuntimeLoadI64") loaded = LLVMBuildZExt(
+                backend.builder, loaded, backend.i64Type,
+                "runtime.load.wide"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, loaded
+            )
+        }
+    }
+    if (name == "ablaRuntimeStoreI32" ||
+        name == "ablaRuntimeStoreI64" ||
+        name == "ablaRuntimeStoreU8") {
+        if (instruction.operands.size != 2) supported = false
+        if (instruction.operands.size == 2) {
+            val address = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[0]
+            )
+            var value = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[1]
+            )
+            val pointer = LLVMBuildIntToPtr(
+                backend.builder, address, backend.pointerType,
+                "runtime.store.pointer"
+            )
+            if (name == "ablaRuntimeStoreI32") value = LLVMBuildTrunc(
+                backend.builder, value, backend.i32Type,
+                "runtime.store.i32"
+            )
+            if (name == "ablaRuntimeStoreU8") value = LLVMBuildTrunc(
+                backend.builder, value, backend.i8Type,
+                "runtime.store.i8"
+            )
+            LLVMBuildStore(backend.builder, value, pointer)
+            bootstrapLlvmInitializeVoidValue(
+                backend, storage.values[instruction.result]
+            )
+        }
+    }
+    if (name == "ablaRuntimeTrap") {
+        if (instruction.operands.size != 0) supported = false
+        if (instruction.operands.size == 0) {
+            val trap = bootstrapLlvmDeclare(
+                backend, "llvm.trap", backend.voidType,
+                [], false, []
+            )
+            bootstrapLlvmCall(
+                backend, trap, [], "", false, []
+            )
+            bootstrapLlvmInitializeVoidValue(
+                backend, storage.values[instruction.result]
+            )
+        }
+    }
+    if (name == "ablaRuntimePointerAddress") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) bootstrapLlvmSetNativeValue(
+            backend, storage, instruction.result,
+            bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[0]
+            )
+        )
+    }
+    if (name == "ablaRuntimePointerFromAddress") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) bootstrapLlvmStoreTaggedWordValue(
+            backend, storage.values[instruction.result], 2,
+            bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[0]
+            )
+        )
+    }
+    if (name == "ablaUnsafeLoadI64" ||
+        name == "ablaUnsafeLoadPointer" ||
+        name == "ablaUnsafeLoadU8") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val pointer = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType, "unsafe.load.pointer"
+            )
+            val type = if (name == "ablaUnsafeLoadU8") {
+                backend.i8Type
+            } else if (name == "ablaUnsafeLoadPointer") {
+                backend.pointerType
+            } else backend.i64Type
+            var loaded = LLVMBuildLoad2(
+                backend.builder, type, pointer, "unsafe.load"
+            )
+            if (name == "ablaUnsafeLoadU8") loaded = LLVMBuildZExt(
+                backend.builder, loaded, backend.i64Type, "unsafe.load.u8"
+            )
+            if (name == "ablaUnsafeLoadPointer") loaded = LLVMBuildPtrToInt(
+                backend.builder, loaded, backend.i64Type,
+                "unsafe.load.pointer.address"
+            )
+            if (name == "ablaUnsafeLoadPointer") {
+                bootstrapLlvmStoreTaggedWordValue(
+                    backend, storage.values[instruction.result], 2, loaded
+                )
+            } else bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, loaded
+            )
+        }
+    }
+    if (name == "ablaUnsafeStoreI64" ||
+        name == "ablaUnsafeStorePointer" ||
+        name == "ablaUnsafeStoreU8") {
+        if (instruction.operands.size != 2) supported = false
+        if (instruction.operands.size == 2) {
+            val pointer = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType, "unsafe.store.pointer"
+            )
+            var stored = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[1]
+            )
+            if (name == "ablaUnsafeStorePointer") stored = LLVMBuildIntToPtr(
+                backend.builder, stored, backend.pointerType,
+                "unsafe.store.pointer.value"
+            )
+            if (name == "ablaUnsafeStoreU8") stored = LLVMBuildTrunc(
+                backend.builder, stored, backend.i8Type,
+                "unsafe.store.u8"
+            )
+            LLVMBuildStore(backend.builder, stored, pointer)
+            bootstrapLlvmInitializeVoidValue(
+                backend, storage.values[instruction.result]
+            )
+        }
+    }
+    if (name == "ablaUnsafeNullPointer") {
+        if (instruction.operands.size != 0) supported = false
+        if (instruction.operands.size == 0) bootstrapLlvmStoreTaggedWordValue(
+            backend, storage.values[instruction.result], 2,
+            LLVMConstInt(backend.i64Type, 0, 0)
+        )
+    }
+    if (name == "ablaUnsafePointerIsNull") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val equal = LLVMBuildICmp(
+                backend.builder, llvmIntEqual(),
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                LLVMConstInt(backend.i64Type, 0, 0), "unsafe.pointer.null"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, equal
+            )
+        }
+    }
+    if (name == "ablaUnsafePointerAddress" ||
+        name == "ablaUnsafePointerOffset") {
+        val expected = if (name == "ablaUnsafePointerOffset") 2 else 1
+        if (instruction.operands.size != expected) supported = false
+        if (instruction.operands.size == expected) {
+            var address = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[0]
+            )
+            if (expected == 2) address = LLVMBuildAdd(
+                backend.builder, address,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[1]
+                ), "unsafe.pointer.offset"
+            )
+            if (name == "ablaUnsafePointerAddress") {
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result, address
+                )
+            } else bootstrapLlvmStoreTaggedWordValue(
+                backend, storage.values[instruction.result], 2, address
+            )
+        }
+    }
+    if (name == "ablaUnsafeCStringAddress") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val pointer = bootstrapLlvmCallNamed(
+                backend, "abla_as_cstring",
+                [storage.values[instruction.operands[0]]],
+                "unsafe.cstring", false, [true]
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, pointer, backend.i64Type,
+                    "unsafe.cstring.address"
+                )
+            )
+        }
+    }
+    if (name == "ablaUnsafeAdoptString" ||
+        name == "ablaUnsafeBorrowCString") {
+        val expected = if (name == "ablaUnsafeAdoptString") 2 else 1
+        if (instruction.operands.size != expected) supported = false
+        if (instruction.operands.size == expected) {
+            val pointer = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType, "unsafe.string.pointer"
+            )
+            var length = LLVMConstInt(backend.i64Type, 0, 0)
+            if (expected == 2) length = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[1]
+            )
+            else {
+                val strlen = bootstrapLlvmDeclare(
+                    backend, "strlen", backend.i64Type,
+                    [backend.pointerType], false, [false]
+                )
+                length = bootstrapLlvmCall(
+                    backend, strlen, [pointer], "unsafe.string.length",
+                    false, [false]
+                )
+            }
+            bootstrapLlvmCallNamed(
+                backend, "abla_string_static",
+                [storage.values[instruction.result], pointer, length],
+                "", true, [false, false, false]
+            )
+        }
+    }
+    if (name == "ablaUnsafeCallMain") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val type = bootstrapLlvmFunctionType(
+                backend, backend.i32Type,
+                [backend.i32Type, backend.pointerType]
+            )
+            val function = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType, "unsafe.main"
+            )
+            val status = bootstrapLlvmCallTyped(
+                backend, type, function,
+                [LLVMConstInt(backend.i32Type, 0, 0),
+                 LLVMConstNull(backend.pointerType)],
+                "unsafe.main.status"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildSExt(
+                    backend.builder, status, backend.i64Type,
+                    "unsafe.main.status.i64"
+                )
+            )
+        }
+    }
+    if (name == "ablaHostIsMacOS" ||
+        name == "ablaHostValueArgumentsIndirect") {
+        if (instruction.operands.size != 0) supported = false
+        if (instruction.operands.size == 0) bootstrapLlvmSetNativeValue(
+            backend, storage, instruction.result,
+            LLVMConstInt(backend.i1Type, 0, 0)
+        )
+    }
+    if (name == "ablaLinuxArgumentCount") {
+        if (instruction.operands.size != 0) supported = false
+        if (instruction.operands.size == 0) {
+            val count = LLVMBuildLoad2(
+                backend.builder, backend.i32Type,
+                LLVMGetNamedGlobal(
+                    backend.module, "abla_runtime_argument_count"
+                ), "runtime.arguments.count"
+            )
+            val positive = LLVMBuildICmp(
+                backend.builder, llvmIntSignedGreaterThan(), count,
+                LLVMConstInt(backend.i32Type, 0, 0),
+                "runtime.arguments.positive"
+            )
+            val userCount = LLVMBuildSelect(
+                backend.builder, positive,
+                LLVMBuildSub(
+                    backend.builder, count,
+                    LLVMConstInt(backend.i32Type, 1, 0),
+                    "runtime.arguments.user.count"
+                ),
+                LLVMConstInt(backend.i32Type, 0, 0),
+                "runtime.arguments.safe.count"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildZExt(
+                    backend.builder, userCount, backend.i64Type,
+                    "runtime.arguments.user.count.i64"
+                )
+            )
+        }
+    }
+    if (name == "ablaLinuxArgument") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val vector = LLVMBuildLoad2(
+                backend.builder, backend.pointerType,
+                LLVMGetNamedGlobal(
+                    backend.module, "abla_runtime_argument_vector"
+                ), "runtime.arguments.vector"
+            )
+            val indices = llvmPointerVector(1)
+            indices.set(
+                0,
+                LLVMBuildAdd(
+                    backend.builder,
+                    bootstrapLlvmCoreIntrinsicInteger(
+                        backend, storage, instruction.operands[0]
+                    ),
+                    LLVMConstInt(backend.i64Type, 1, 0),
+                    "runtime.argument.index"
+                )
+            )
+            val slot = LLVMBuildGEP2(
+                backend.builder, backend.pointerType, vector,
+                indices.pointer(), 1, "runtime.argument.slot"
+            )
+            indices.drop()
+            val text = LLVMBuildLoad2(
+                backend.builder, backend.pointerType, slot,
+                "runtime.argument.text"
+            )
+            val strlen = bootstrapLlvmDeclare(
+                backend, "strlen", backend.i64Type,
+                [backend.pointerType], false, [false]
+            )
+            val length = bootstrapLlvmCall(
+                backend, strlen, [text], "runtime.argument.length",
+                false, [false]
+            )
+            bootstrapLlvmCallNamed(
+                backend, "abla_string_static",
+                [storage.values[instruction.result], text, length],
+                "", true, [false, false, false]
+            )
+        }
+    }
+    if (name == "ablaLinuxEnvironmentPointer") {
+        if (instruction.operands.size != 0) supported = false
+        if (instruction.operands.size == 0) {
+            val environment = LLVMBuildLoad2(
+                backend.builder, backend.pointerType,
+                LLVMGetNamedGlobal(
+                    backend.module, "abla_runtime_environment_vector"
+                ), "runtime.environment.vector"
+            )
+            bootstrapLlvmStoreTaggedWordValue(
+                backend, storage.values[instruction.result], 2,
+                LLVMBuildPtrToInt(
+                    backend.builder, environment, backend.i64Type,
+                    "runtime.environment.address"
+                )
+            )
+        }
+    }
+    if (name == "ablaLinuxSyscall") {
+        if (instruction.operands.size != 7) supported = false
+        if (instruction.operands.size == 7) {
+            val types: array<i64*> = []
+            val arguments: array<i64*> = []
+            var operand = 0
+            while (operand < 7) {
+                types.append(backend.i64Type)
+                arguments.append(bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[operand]
+                ))
+                operand = operand + 1
+            }
+            val syscall = bootstrapLlvmDeclare(
+                backend, "syscall", backend.i64Type,
+                types, false, bootstrapLlvmFalseFlags(7)
+            )
+            val raw = bootstrapLlvmCall(
+                backend, syscall, arguments, "linux.syscall",
+                false, bootstrapLlvmFalseFlags(7)
+            )
+            val failed = LLVMBuildICmp(
+                backend.builder, llvmIntEqual(), raw,
+                LLVMConstInt(backend.i64Type, -1, 1),
+                "linux.syscall.failed"
+            )
+            val errnoLocation = bootstrapLlvmDeclare(
+                backend, "__errno_location", backend.pointerType,
+                [], false, []
+            )
+            val errnoPointer = bootstrapLlvmCall(
+                backend, errnoLocation, [], "linux.errno.pointer",
+                false, []
+            )
+            val errno = LLVMBuildLoad2(
+                backend.builder, backend.i32Type, errnoPointer,
+                "linux.errno"
+            )
+            val negativeErrno = LLVMBuildNeg(
+                backend.builder,
+                LLVMBuildZExt(
+                    backend.builder, errno, backend.i64Type,
+                    "linux.errno.i64"
+                ),
+                "linux.errno.negative"
+            )
+            val result = LLVMBuildSelect(
+                backend.builder, failed, negativeErrno, raw,
+                "linux.syscall.result"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, result
+            )
+        }
+    }
+    if (name == "ablaRuntimeWasmHeapBase") {
+        if (instruction.operands.size != 0) supported = false
+        if (instruction.operands.size == 0) {
+            var heapBase = LLVMGetNamedGlobal(
+                backend.module, "__heap_base"
+            )
+            if (pointerIsNull(heapBase)) heapBase = LLVMAddGlobal(
+                backend.module, backend.i8Type, "__heap_base"
+            )
+            LLVMSetLinkage(heapBase, llvmExternalLinkage())
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, heapBase, backend.i64Type,
+                    "runtime.wasm.heap.base"
+                )
+            )
+        }
+    }
+    if (name == "ablaRuntimeWasmMemorySize" ||
+        name == "ablaRuntimeWasmMemoryGrow") {
+        val expected = if (name == "ablaRuntimeWasmMemoryGrow") 1 else 0
+        if (instruction.operands.size != expected) supported = false
+        if (instruction.operands.size == expected) {
+            val parameters: array<i64*> = [backend.i32Type]
+            if (name == "ablaRuntimeWasmMemoryGrow") {
+                parameters.append(backend.i32Type)
+            }
+            val intrinsic = bootstrapLlvmDeclare(
+                backend,
+                if (name == "ablaRuntimeWasmMemoryGrow") {
+                    "llvm.wasm.memory.grow.i32"
+                } else "llvm.wasm.memory.size.i32",
+                backend.i32Type, parameters, false, [false]
+            )
+            val arguments: array<i64*> = []
+            arguments.append(LLVMConstInt(backend.i32Type, 0, 0))
+            if (name == "ablaRuntimeWasmMemoryGrow") {
+                arguments.append(
+                    LLVMBuildTrunc(
+                        backend.builder,
+                        bootstrapLlvmCoreIntrinsicInteger(
+                            backend, storage, instruction.operands[0]
+                        ),
+                        backend.i32Type, "runtime.wasm.pages"
+                    )
+                )
+            }
+            val result = bootstrapLlvmCall(
+                backend, intrinsic, arguments,
+                "runtime.wasm.memory", false, [false]
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                if (name == "ablaRuntimeWasmMemoryGrow") LLVMBuildSExt(
+                    backend.builder, result, backend.i64Type,
+                    "runtime.wasm.memory.result"
+                ) else LLVMBuildZExt(
+                    backend.builder, result, backend.i64Type,
+                    "runtime.wasm.memory.result"
+                )
+            )
+        }
+    }
+    supported
+}
+
+fun bootstrapLlvmLocalPointer(
+    storage: BootstrapLlvmFunctionStorage,
+    function: BootstrapIrFunction,
+    name: string
+): i64* {
+    var result = nativeNullPointer()
+    val parameter = bootstrapLlvmParameterId(function, name)
+    val local = storage.localIndex.find(name)
+    if (parameter >= 0) result = storage.parameters[parameter]
+    if (parameter < 0 && local >= 0) result = storage.locals[local]
+    result
+}
+
+fun bootstrapLlvmEmitFunctionReturn(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    storage: BootstrapLlvmFunctionStorage,
+    value: int,
+    output: i64*
+): void {
+    val scalar = bootstrapLlvmDirectScalarType(function.resultType)
+    if (scalar != "") {
+        var native = LLVMConstInt(backend.type(scalar), 0, 0)
+        if (value >= 0) {
+            native = bootstrapLlvmNativeValue(backend, storage, value)
+            if (pointerIsNull(native)) native = bootstrapLlvmCallNamed(
+                    backend,
+                    if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
+                    [storage.values[value]], "direct.return", false, [true]
+                )
+        }
+        bootstrapLlvmPopRoots(backend, storage)
+        LLVMBuildRet(backend.builder, native)
+    } else {
+        if (value >= 0) bootstrapLlvmCopyValue(
+            backend, storage.values[value], output, "function.result"
+        )
+        else bootstrapLlvmRuntimeCall(
+            backend, "abla_void", output, []
+        )
+        bootstrapLlvmPopRoots(backend, storage)
+        LLVMBuildRetVoid(backend.builder)
+    }
+    return
+}
+
+fun bootstrapLlvmEmitFunction(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    functionId: int,
+    functionIndex: BootstrapLlvmNameIndex,
+    identities: BootstrapLlvmFunctionIdentities,
+    nativeIndex: BootstrapLlvmNameIndex,
+    globalIndex: BootstrapLlvmNameIndex,
+    classIndex: BootstrapLlvmNameIndex,
+    fieldIndex: BootstrapLlvmNameIndex,
+    mayCollect: array<bool>
+): int {
+    val llvmFunction = LLVMGetNamedFunction(
+        backend.module,
+        bootstrapLlvmDirectFunctionSymbol(identities.symbols[functionId])
+    )
+    val entry = LLVMAppendBasicBlockInContext(
+        backend.context, llvmFunction, "entry"
+    )
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val runtimePrefix = "__ablaRuntime"
+    val runtimeImplementation =
+        function.name.size >= runtimePrefix.size &&
+        function.name.slice(0, runtimePrefix.size) == runtimePrefix
+    val collecting = functionId < mayCollect.size &&
+        mayCollect[functionId] && !runtimeImplementation
+    var directlyAllocates = false
+    var allocationInstruction = 0
+    while (allocationInstruction < function.instructions.size) {
+        if (bootstrapLlvmInstructionMayAllocate(
+            function.instructions[allocationInstruction]
+        )) directlyAllocates = true
+        allocationInstruction = allocationInstruction + 1
+    }
+    var rootValues: array<bool> = []
+    if (collecting) rootValues = bootstrapLlvmGcRootPlan(
+        function, functionIndex, mayCollect
+    )
+    val scalarPlan = bootstrapLlvmBuildScalarPlan(
+        program, function, functionIndex, nativeIndex
+    )
+    var storage = bootstrapLlvmCreateFunctionStorage(
+        backend, function, llvmFunction, collecting, rootValues,
+        scalarPlan
+    )
+    bootstrapLlvmInitializeParameters(
+        backend, function, llvmFunction, storage
+    )
+    bootstrapLlvmPushRoots(backend, storage)
+    if (collecting && directlyAllocates && !runtimeImplementation &&
+        function.name != "__bootstrap_globals") {
+        bootstrapLlvmCallNamed(
+            backend, "abla_runtime_memory_pressure", [],
+            "", false, []
+        )
+    }
+    val scalarResult = bootstrapLlvmDirectResultIsScalar(function)
+    val output = if (scalarResult) {
+        nativeNullPointer()
+    } else LLVMGetParam(llvmFunction, 0)
+    val argumentCount = LLVMGetParam(
+        llvmFunction, if (scalarResult) 0 else 1
+    )
+    var errors = 0
+    var terminated = false
+    var instructionIndex = 0
+    while (instructionIndex < function.instructions.size) {
+        val instruction = function.instructions[instructionIndex]
+        var matched = false
+        var supported = true
+        val reachable = !terminated || instruction.opcode == "label"
+        if (!reachable) matched = true
+        if (reachable && instruction.opcode == "label") {
+            matched = true
+            if (!terminated) LLVMBuildBr(
+                backend.builder, storage.block(instruction.target)
+            )
+            LLVMPositionBuilderAtEnd(
+                backend.builder, storage.block(instruction.target)
+            )
+            terminated = false
+        }
+        if (reachable && instruction.opcode == "const.i64") {
+            matched = true
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMConstInt(
+                    backend.i64Type,
+                    bootstrapLlvmParseInteger(instruction.text), 1
+                )
+            )
+        }
+        if (reachable && instruction.opcode == "const.bool") {
+            matched = true
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, LLVMConstInt(
+                    backend.i1Type,
+                    if (instruction.text == "true") 1 else 0,
+                    0
+                )
+            )
+        }
+        if (reachable && instruction.opcode == "const.string") {
+            matched = true
+            val pointer = LLVMBuildGlobalStringPtr(
+                backend.builder,
+                instruction.text,
+                bootstrapLlvmStringSymbolFrom(
+                    identities.symbols[functionId], instruction.result
+                )
+            )
+            bootstrapLlvmCallNamed(
+                backend, "abla_string_static",
+                [storage.values[instruction.result], pointer,
+                 LLVMConstInt(backend.i64Type, instruction.text.size, 0)],
+                "", true, [false, false, false]
+            )
+        }
+        if (reachable && (instruction.opcode == "const.null" ||
+                          instruction.opcode == "const.void")) {
+            matched = true
+            bootstrapLlvmRuntimeCall(
+                backend,
+                if (instruction.opcode == "const.null")
+                    "abla_null" else "abla_void",
+                storage.values[instruction.result], []
+            )
+        }
+        if (reachable && instruction.opcode == "parameter.load") {
+            matched = true
+            val found = bootstrapLlvmParameterId(function, instruction.text)
+            if (found < 0) supported = false
+            if (found >= 0) {
+                if (instruction.result < storage.valueTypes.size &&
+                    storage.valueTypes[instruction.result] != "") {
+                    val scalar = storage.valueTypes[instruction.result]
+                    if (!bootstrapLlvmParameterHasDefault(
+                        function, instruction.text
+                    )) {
+                        val scalarResult =
+                            bootstrapLlvmDirectResultIsScalar(function)
+                        val parameterBegin =
+                            (if (scalarResult) 0 else 1) + 1
+                        bootstrapLlvmSetNativeValue(
+                            backend, storage, instruction.result,
+                            LLVMGetParam(
+                                llvmFunction, found + parameterBegin
+                            )
+                        )
+                    } else bootstrapLlvmSetNativeValue(
+                        backend, storage, instruction.result,
+                        bootstrapLlvmCallNamed(
+                            backend,
+                            if (scalar == "bool") "abla_as_bool"
+                            else "abla_as_i64",
+                            [storage.parameters[found]], "parameter.load",
+                            false, [true]
+                        )
+                    )
+                } else bootstrapLlvmCopyValue(
+                    backend, storage.parameters[found],
+                    storage.values[instruction.result], "parameter.load"
+                )
+            }
+        }
+        if (reachable && instruction.opcode == "parameter.default") {
+            matched = true
+            val found = bootstrapLlvmParameterId(function, instruction.text)
+            if (found < 0) supported = false
+            if (found >= 0) {
+                val useDefault = LLVMAppendBasicBlockInContext(
+                    backend.context, llvmFunction, "default.use"
+                )
+                val keep = LLVMAppendBasicBlockInContext(
+                    backend.context, llvmFunction, "default.keep"
+                )
+                val ready = LLVMAppendBasicBlockInContext(
+                    backend.context, llvmFunction, "default.ready"
+                )
+                val needed = LLVMBuildICmp(
+                    backend.builder, llvmIntUnsignedLessOrEqual(),
+                    argumentCount,
+                    LLVMConstInt(backend.i64Type, instruction.right, 0),
+                    "default.needed"
+                )
+                LLVMBuildCondBr(backend.builder, needed, useDefault, keep)
+                LLVMPositionBuilderAtEnd(backend.builder, useDefault)
+                bootstrapLlvmCopyValue(
+                    backend, storage.values[instruction.left],
+                    storage.parameters[found], "default.value"
+                )
+                LLVMBuildBr(backend.builder, ready)
+                LLVMPositionBuilderAtEnd(backend.builder, keep)
+                LLVMBuildBr(backend.builder, ready)
+                LLVMPositionBuilderAtEnd(backend.builder, ready)
+                bootstrapLlvmCopyValue(
+                    backend, storage.parameters[found],
+                    storage.values[instruction.result], "default.result"
+                )
+            }
+        }
+        if (reachable && (instruction.opcode == "local.declare" ||
+                          instruction.opcode == "local.assign")) {
+            matched = true
+            val found = storage.localIndex.find(
+                instruction.text
+            )
+            if (found < 0) supported = false
+            if (found >= 0) {
+                val nativeLocal = storage.nativeLocals[found]
+                if (!pointerIsNull(nativeLocal)) {
+                    val native = bootstrapLlvmNativeValue(
+                        backend, storage, instruction.left
+                    )
+                    LLVMBuildStore(backend.builder, native, nativeLocal)
+                    bootstrapLlvmSetNativeValue(
+                        backend, storage, instruction.result, native
+                    )
+                } else {
+                    bootstrapLlvmCopyValue(
+                        backend, storage.values[instruction.left],
+                        storage.locals[found], "local.value"
+                    )
+                    bootstrapLlvmCopyValue(
+                        backend, storage.locals[found],
+                        storage.values[instruction.result], "local.result"
+                    )
+                }
+            }
+        }
+        if (reachable && (instruction.opcode == "local.load" ||
+                          instruction.opcode == "local.set" ||
+                          instruction.opcode == "resource.peek" ||
+                          instruction.opcode == "place.root")) {
+            matched = true
+            val local = bootstrapLlvmLocalPointer(
+                storage, function, instruction.text
+            )
+            if (pointerIsNull(local)) supported = false
+            val nativeLocal = bootstrapLlvmNativeLocalPointer(
+                storage, instruction.text
+            )
+            if (!pointerIsNull(nativeLocal)) {
+                if (instruction.opcode == "local.set") {
+                    LLVMBuildStore(
+                        backend.builder,
+                        bootstrapLlvmNativeValue(
+                            backend, storage, instruction.left
+                        ),
+                        nativeLocal
+                    )
+                } else {
+                    val native = LLVMBuildLoad2(
+                        backend.builder,
+                        backend.type(storage.valueTypes[instruction.result]),
+                        nativeLocal, "scalar.local.load"
+                    )
+                    bootstrapLlvmSetNativeValue(
+                        backend, storage, instruction.result, native
+                    )
+                }
+                supported = true
+            } else if (!pointerIsNull(local)) {
+                if (instruction.opcode == "local.set") {
+                    bootstrapLlvmCopyValue(
+                        backend, storage.values[instruction.left], local,
+                        "local.set"
+                    )
+                } else bootstrapLlvmCopyValue(
+                    backend, local, storage.values[instruction.result],
+                    "local.load"
+                )
+            }
+        }
+        if (reachable && (instruction.opcode == "place.load" ||
+                          instruction.opcode == "place.move" ||
+                          instruction.opcode == "place.set" ||
+                          instruction.opcode == "borrow.bind" ||
+                          instruction.opcode == "borrow.mutate")) {
+            matched = true
+        }
+        if (reachable && (bootstrapIrIsLocalZero(instruction.opcode) ||
+                          instruction.opcode == "local.allocate")) {
+            matched = true
+            val local = storage.localIndex.find(
+                instruction.text
+            )
+            if (local < 0) supported = false
+            if (local >= 0) {
+                if (!pointerIsNull(storage.nativeLocals[local])) {
+                    val scalarType = storage.localTypes[local]
+                    LLVMBuildStore(
+                        backend.builder,
+                        LLVMConstInt(backend.type(scalarType), 0, 0),
+                        storage.nativeLocals[local]
+                    )
+                } else if (bootstrapIrIsLocalZero(instruction.opcode)) {
+                    bootstrapLlvmCallNamed(
+                        backend, "abla_i64",
+                        [storage.locals[local],
+                         LLVMConstInt(backend.i64Type, 0, 0)],
+                        "", true, [false, false]
+                    )
+                } else bootstrapLlvmRuntimeCall(
+                    backend, "abla_null", storage.locals[local], []
+                )
+            }
+        }
+        if (reachable && (instruction.opcode == "local.move" ||
+                          instruction.opcode == "resource.clear")) {
+            matched = true
+            val local = bootstrapLlvmLocalPointer(
+                storage, function, instruction.text
+            )
+            if (pointerIsNull(local)) supported = false
+            if (!pointerIsNull(local)) bootstrapLlvmRuntimeCall(
+                backend, "abla_null", local, []
+            )
+        }
+        if (reachable && instruction.opcode == "resource.drop") {
+            matched = true
+            val called = functionIndex.find(
+                bootstrapDropFunctionName(instruction.text)
+            )
+            if (called < 0) supported = false
+            if (called >= 0) {
+                val run = LLVMAppendBasicBlockInContext(
+                    backend.context, llvmFunction, "drop.run"
+                )
+                val done = LLVMAppendBasicBlockInContext(
+                    backend.context, llvmFunction, "drop.done"
+                )
+                val tagPointer = LLVMBuildStructGEP2(
+                    backend.builder, backend.valueType,
+                    storage.values[instruction.left], 0, "drop.tag.pointer"
+                )
+                val tag = LLVMBuildLoad2(
+                    backend.builder, backend.i32Type,
+                    tagPointer, "drop.tag"
+                )
+                val active = LLVMBuildICmp(
+                    backend.builder, llvmIntNotEqual(), tag,
+                    LLVMConstInt(backend.i32Type, 1, 0), "drop.active"
+                )
+                LLVMBuildCondBr(backend.builder, active, run, done)
+                LLVMPositionBuilderAtEnd(backend.builder, run)
+                val arguments = bootstrapLlvmDirectCallArguments(
+                    backend, storage, program.functions[called],
+                    [instruction.left], storage.auxiliary[instructionIndex]
+                )
+                bootstrapLlvmEmitDirectCall(
+                    backend,
+                    program.functions[called],
+                    LLVMGetNamedFunction(
+                        backend.module, bootstrapLlvmDirectFunctionSymbol(
+                            identities.symbols[called]
+                        )
+                    ),
+                    arguments,
+                    storage.auxiliary[instructionIndex]
+                )
+                LLVMBuildBr(backend.builder, done)
+                LLVMPositionBuilderAtEnd(backend.builder, done)
+            }
+        }
+        if (reachable && instruction.opcode == "closure.drop") {
+            matched = true
+            bootstrapLlvmCallNamed(
+                backend, "abla_llvm_drop_closure",
+                [storage.values[instruction.left]], "", false, [false]
+            )
+        }
+        if (reachable && instruction.opcode == "function.ref") {
+            matched = true
+            val found = functionIndex.find(instruction.text)
+            if (found < 0) supported = false
+            if (found >= 0) bootstrapLlvmCallNamed(
+                backend, "abla_function",
+                [storage.values[instruction.result], LLVMConstInt(
+                    backend.i32Type, identities.runtimeIds[found], 0
+                )],
+                "", true, [false, false]
+            )
+        }
+        if (reachable && instruction.opcode == "closure.create") {
+            matched = true
+            val found = functionIndex.find(instruction.text)
+            if (found < 0) supported = false
+            if (found >= 0 && instruction.operands.size == 0) {
+                bootstrapLlvmCallNamed(
+                    backend, "abla_function",
+                    [storage.values[instruction.result], LLVMConstInt(
+                        backend.i32Type, identities.runtimeIds[found], 0
+                    )],
+                    "", true, [false, false]
+                )
+            }
+            if (found >= 0 && instruction.operands.size > 0) {
+                val captures = bootstrapLlvmPrepareArguments(
+                    backend, storage, instructionIndex,
+                    instruction.operands, 0
+                )
+                bootstrapLlvmCallNamed(
+                    backend, "abla_closure",
+                    [storage.values[instruction.result], LLVMConstInt(
+                        backend.i32Type, identities.runtimeIds[found], 0
+                     ), captures, LLVMConstInt(
+                        backend.i64Type, instruction.operands.size, 0
+                     )],
+                    "", true, [false, false, false, false]
+                )
+            }
+        }
+        if (reachable && instruction.opcode == "shared.unlock") {
+            matched = true
+            bootstrapLlvmCallNamed(
+                backend, "abla_shared_unlock",
+                [storage.values[instruction.left]], "", false, [true]
+            )
+        }
+        var scalarOperation = false
+        if (reachable) scalarOperation = bootstrapLlvmEmitScalarOperation(
+            backend, storage, instruction
+        )
+        if (scalarOperation) matched = true
+        val runtime = bootstrapLlvmRuntimeOperation(instruction.opcode)
+        if (reachable && runtime != "" &&
+            instruction.opcode != "&&" && instruction.opcode != "||" &&
+            !scalarOperation) {
+            matched = true
+            bootstrapLlvmRuntimeCall(
+                backend, runtime, storage.values[instruction.result],
+                bootstrapLlvmInstructionInputs(storage, instruction)
+            )
+        }
+        if (reachable && (instruction.opcode == "&&" ||
+                          instruction.opcode == "||") &&
+            !scalarOperation) {
+            matched = true
+            val left = bootstrapLlvmCallNamed(
+                backend, "abla_as_bool", [storage.values[instruction.left]],
+                "boolean.left", false, [true]
+            )
+            val right = bootstrapLlvmCallNamed(
+                backend, "abla_as_bool", [storage.values[instruction.right]],
+                "boolean.right", false, [true]
+            )
+            val result = if (instruction.opcode == "&&") LLVMBuildAnd(
+                backend.builder, left, right, "boolean.and"
+            ) else LLVMBuildOr(
+                backend.builder, left, right, "boolean.or"
+            )
+            bootstrapLlvmCallNamed(
+                backend, "abla_bool", [storage.values[instruction.result], result],
+                "", true, [false, false]
+            )
+        }
+        if (reachable && instruction.opcode == "return") {
+            matched = true
+            bootstrapLlvmEmitFunctionReturn(
+                backend, function, storage, instruction.left, output
+            )
+            terminated = true
+        }
+        if (reachable && instruction.opcode == "unreachable") {
+            matched = true
+            val message = LLVMBuildGlobalStringPtr(
+                backend.builder, "non-exhaustive when", "abla.when.error"
+            )
+            bootstrapLlvmCallNamed(
+                backend, "abla_platform_panic",
+                [message, LLVMConstInt(backend.i64Type, 19, 0)],
+                "", false, [false, false]
+            )
+            LLVMBuildUnreachable(backend.builder)
+            terminated = true
+        }
+        if (reachable && instruction.opcode == "jump") {
+            matched = true
+            val target = storage.block(instruction.target)
+            if (pointerIsNull(target)) supported = false
+            if (!pointerIsNull(target)) LLVMBuildBr(backend.builder, target)
+            terminated = true
+        }
+        if (reachable && instruction.opcode == "branch") {
+            matched = true
+            val yes = storage.block(instruction.target)
+            val no = storage.block(instruction.alternate)
+            if (pointerIsNull(yes) || pointerIsNull(no)) supported = false
+            if (!pointerIsNull(yes) && !pointerIsNull(no)) {
+                var condition = bootstrapLlvmNativeValue(
+                    backend, storage, instruction.left
+                )
+                if (pointerIsNull(condition)) {
+                    condition = bootstrapLlvmCallNamed(
+                        backend, "abla_as_bool",
+                        [storage.values[instruction.left]],
+                        "branch.condition", false, [true]
+                    )
+                }
+                LLVMBuildCondBr(backend.builder, condition, yes, no)
+            }
+            terminated = true
+        }
+        if (reachable && instruction.opcode == "call") {
+            matched = true
+            val called = functionIndex.find(instruction.text)
+            if (called < 0) supported = false
+            if (called >= 0) {
+                val calledIsScalar = bootstrapLlvmDirectResultIsScalar(
+                    program.functions[called]
+                )
+                val callOutput = if (calledIsScalar) nativeNullPointer()
+                    else storage.values[instruction.result]
+                val arguments = bootstrapLlvmDirectCallArguments(
+                    backend, storage, program.functions[called],
+                    instruction.operands, callOutput
+                )
+                val directResult = bootstrapLlvmEmitDirectCall(
+                    backend,
+                    program.functions[called],
+                    LLVMGetNamedFunction(
+                        backend.module, bootstrapLlvmDirectFunctionSymbol(
+                            identities.symbols[called]
+                        )
+                    ),
+                    arguments,
+                    callOutput
+                )
+                if (calledIsScalar) bootstrapLlvmSetNativeValue(
+                        backend, storage, instruction.result, directResult
+                    )
+            }
+        }
+        if (reachable && (instruction.opcode == "generator.create" ||
+                          instruction.opcode == "task.create" ||
+                          instruction.opcode == "thread.create")) {
+            matched = true
+            val createArguments: array<i64*> =
+                [storage.values[instruction.result],
+                 storage.values[instruction.left],
+                 LLVMGetNamedFunction(
+                    backend.module, "abla_llvm_call_indirect"
+                 ),
+                 LLVMGetNamedFunction(
+                    backend.module, "abla_llvm_release_closure"
+                 ),
+                 LLVMGetNamedFunction(
+                    backend.module, "abla_llvm_drop_closure"
+                 )]
+            if (instruction.opcode == "thread.create") {
+                createArguments.append(LLVMGetNamedFunction(
+                    backend.module, "abla_runtime_thread_entry"
+                ))
+            }
+            bootstrapLlvmCallNamed(
+                backend,
+                "abla_${instruction.opcode.slice(
+                    0, instruction.opcode.size - 7
+                )}_create",
+                createArguments,
+                "", true, bootstrapLlvmFalseFlags(createArguments.size)
+            )
+        }
+        if (reachable && (instruction.opcode == "generator.next" ||
+                          instruction.opcode == "generator.value" ||
+                          instruction.opcode == "generator.yield" ||
+                          instruction.opcode == "generator.drop" ||
+                          instruction.opcode == "task.drop" ||
+                          instruction.opcode == "thread.drop" ||
+                          instruction.opcode == "await")) {
+            matched = true
+            var runtimeName = "abla_await"
+            if (instruction.opcode == "generator.next") {
+                runtimeName = "abla_generator_next"
+            }
+            if (instruction.opcode == "generator.value") {
+                runtimeName = "abla_generator_value"
+            }
+            if (instruction.opcode == "generator.yield") {
+                runtimeName = "abla_generator_yield"
+            }
+            if (instruction.opcode == "generator.drop") {
+                runtimeName = "abla_generator_drop"
+            }
+            if (instruction.opcode == "task.drop") {
+                runtimeName = "abla_task_drop"
+            }
+            if (instruction.opcode == "thread.drop") {
+                runtimeName = "abla_thread_drop"
+            }
+            bootstrapLlvmRuntimeCall(
+                backend, runtimeName, storage.values[instruction.result],
+                [storage.values[instruction.left]]
+            )
+        }
+        if (reachable && instruction.opcode == "extern.host") {
+            matched = true
+            bootstrapLlvmRuntimeCall(
+                backend, instruction.text,
+                storage.values[instruction.result],
+                bootstrapLlvmInstructionInputs(storage, instruction)
+            )
+        }
+        if (reachable && instruction.opcode == "extern.c") {
+            matched = true
+            supported = bootstrapLlvmEmitNativeCall(
+                backend, program, nativeIndex, storage, instruction
+            )
+        }
+        if (reachable && instruction.opcode == "extern.intrinsic") {
+            matched = true
+            if (bootstrapLlvmCoreIntrinsic(instruction.text)) {
+                supported = bootstrapLlvmEmitCoreIntrinsic(
+                    backend, storage, instruction
+                )
+            } else bootstrapLlvmRuntimeCall(
+                    backend, instruction.text,
+                    storage.values[instruction.result],
+                    bootstrapLlvmInstructionInputs(storage, instruction)
+                )
+        }
+        if (reachable && (instruction.opcode == "call.indirect" ||
+                          instruction.opcode == "call.indirect.once")) {
+            matched = true
+            if (instruction.operands.size < 1) supported = false
+            if (instruction.operands.size >= 1) {
+                val arguments = bootstrapLlvmPrepareArguments(
+                    backend, storage, instructionIndex,
+                    instruction.operands, 1
+                )
+                bootstrapLlvmCallNamed(
+                    backend, "abla_llvm_call_indirect",
+                    [storage.values[instruction.result],
+                     storage.values[instruction.operands[0]], arguments,
+                     LLVMConstInt(
+                         backend.i64Type, instruction.operands.size - 1, 0
+                     )],
+                    "", true, [false, false, false, false]
+                )
+                if (instruction.opcode == "call.indirect.once") {
+                    bootstrapLlvmCallNamed(
+                        backend, "abla_llvm_release_closure",
+                        [storage.values[instruction.operands[0]]],
+                        "", false, [false]
+                    )
+                }
+            }
+        }
+        if (reachable && instruction.opcode == "array.create") {
+            matched = true
+            val values = bootstrapLlvmPrepareArguments(
+                backend, storage, instructionIndex,
+                instruction.operands, 0
+            )
+            bootstrapLlvmCallNamed(
+                backend, "abla_array_create",
+                [storage.values[instruction.result], values,
+                 LLVMConstInt(
+                     backend.i64Type, instruction.operands.size, 0
+                 )],
+                "", true, [false, false, false]
+            )
+        }
+        if (reachable && instruction.opcode == "index.set") {
+            matched = true
+            if (instruction.operands.size != 3) supported = false
+            if (instruction.operands.size == 3) {
+                bootstrapLlvmCallNamed(
+                    backend, "abla_array_set",
+                    [storage.values[instruction.operands[0]],
+                     storage.values[instruction.operands[1]],
+                     storage.values[instruction.operands[2]]],
+                    "", false, [true, true, true]
+                )
+                bootstrapLlvmCopyValue(
+                    backend, storage.values[instruction.operands[2]],
+                    storage.values[instruction.result], "index.set"
+                )
+            }
+        }
+        if (reachable && (instruction.opcode == "object.allocate" ||
+                          instruction.opcode == "object.create")) {
+            matched = true
+            val found = classIndex.find(instruction.text)
+            if (found < 0) supported = false
+            if (found >= 0) {
+                bootstrapLlvmCallNamed(
+                    backend, "abla_object_create",
+                    [storage.values[instruction.result], LLVMConstInt(
+                        backend.i32Type,
+                        bootstrapLlvmStableNameId(instruction.text), 0
+                    ), LLVMConstInt(
+                        backend.i64Type,
+                        program.classes[found].fields.size, 0
+                    )],
+                    "", true, [false, false, false]
+                )
+                if (instruction.opcode == "object.create") {
+                    var classPosition = 0
+                    while (classPosition < program.classes.size) {
+                        val foundClass = program.classes[classPosition]
+                        if (foundClass.name == instruction.text) {
+                            var field = 0
+                            while (field < foundClass.fields.size &&
+                                   field < foundClass.fieldParameters.size) {
+                                val argument =
+                                    foundClass.fieldParameters[field]
+                                if (argument < instruction.operands.size) {
+                                    bootstrapLlvmCallNamed(
+                                        backend, "abla_field_initialize",
+                                        [storage.values[instruction.result],
+                                         LLVMConstInt(
+                                            backend.i32Type,
+                                            bootstrapLlvmStableNameId(
+                                                foundClass.fields[field]
+                                            ), 0
+                                         ),
+                                         storage.values[
+                                            instruction.operands[argument]
+                                         ]],
+                                        "", false, [true, false, true]
+                                    )
+                                }
+                                field = field + 1
+                            }
+                        }
+                        classPosition = classPosition + 1
+                    }
+                }
+            }
+        }
+        if (reachable && instruction.opcode == "field.get") {
+            matched = true
+            val found = fieldIndex.find(instruction.text)
+            if (found < 0) supported = false
+            if (found >= 0) bootstrapLlvmCallNamed(
+                backend, "abla_field_get",
+                [storage.values[instruction.result],
+                 storage.values[instruction.left],
+                 LLVMConstInt(
+                    backend.i32Type,
+                    bootstrapLlvmStableNameId(instruction.text), 0
+                 )],
+                "", true, [false, true, false]
+            )
+        }
+        if (reachable && instruction.opcode == "field.get.indexed") {
+            matched = true
+            val found = fieldIndex.find(instruction.text)
+            if (found < 0 || instruction.target < 0) supported = false
+            if (found >= 0 && instruction.target >= 0) {
+                bootstrapLlvmCallNamed(
+                    backend, "abla_field_get_indexed",
+                    [storage.values[instruction.result],
+                     storage.values[instruction.left],
+                     LLVMConstInt(
+                        backend.i32Type,
+                        bootstrapLlvmStableNameId(instruction.text), 0
+                     ),
+                     LLVMConstInt(
+                        backend.i64Type, instruction.target, 0
+                     )],
+                    "", true, [false, true, false, false]
+                )
+            }
+        }
+        if (reachable && instruction.opcode == "field.set") {
+            matched = true
+            val found = fieldIndex.find(instruction.text)
+            if (found < 0 || instruction.operands.size != 2) {
+                supported = false
+            }
+            if (found >= 0 && instruction.operands.size == 2) {
+                bootstrapLlvmCallNamed(
+                    backend, "abla_field_set",
+                    [storage.values[instruction.operands[0]], LLVMConstInt(
+                        backend.i32Type,
+                        bootstrapLlvmStableNameId(instruction.text), 0
+                     ), storage.values[instruction.operands[1]]],
+                    "", false, [true, false, true]
+                )
+                bootstrapLlvmCopyValue(
+                    backend, storage.values[instruction.operands[1]],
+                    storage.values[instruction.result], "field.set"
+                )
+            }
+        }
+        if (reachable && (instruction.opcode == "field.set.indexed.i64" ||
+                          instruction.opcode == "field.set.indexed.bool")) {
+            matched = true
+            val found = fieldIndex.find(instruction.text)
+            if (found < 0 || instruction.target < 0 ||
+                instruction.operands.size != 2) supported = false
+            if (found >= 0 && instruction.target >= 0 &&
+                instruction.operands.size == 2) {
+                val scalar = if (
+                    instruction.opcode == "field.set.indexed.bool"
+                ) "bool" else "i64"
+                val native = bootstrapLlvmScalarOperand(
+                    backend, storage, instruction.operands[1], scalar
+                )
+                bootstrapLlvmCallNamed(
+                    backend,
+                    if (scalar == "bool") {
+                        "abla_field_set_indexed_bool"
+                    } else "abla_field_set_indexed_i64",
+                    [storage.values[instruction.operands[0]], LLVMConstInt(
+                        backend.i32Type,
+                        bootstrapLlvmStableNameId(instruction.text), 0
+                     ), LLVMConstInt(
+                        backend.i64Type, instruction.target, 0
+                     ), native],
+                    "", false, [true, false, false, false]
+                )
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result, native
+                )
+            }
+        }
+        if (reachable && instruction.opcode == "field.set.indexed") {
+            matched = true
+            val found = fieldIndex.find(instruction.text)
+            if (found < 0 || instruction.target < 0 ||
+                instruction.operands.size != 2) supported = false
+            if (found >= 0 && instruction.target >= 0 &&
+                instruction.operands.size == 2) {
+                bootstrapLlvmCallNamed(
+                    backend, "abla_field_set_indexed",
+                    [storage.values[instruction.operands[0]], LLVMConstInt(
+                        backend.i32Type,
+                        bootstrapLlvmStableNameId(instruction.text), 0
+                     ), LLVMConstInt(
+                        backend.i64Type, instruction.target, 0
+                     ), storage.values[instruction.operands[1]]],
+                    "", false, [true, false, false, true]
+                )
+                bootstrapLlvmCopyValue(
+                    backend, storage.values[instruction.operands[1]],
+                    storage.values[instruction.result], "field.set.indexed"
+                )
+            }
+        }
+        if (reachable && instruction.opcode == "global.load") {
+            matched = true
+            val found = globalIndex.find(instruction.text)
+            if (found < 0) supported = false
+            if (found >= 0) {
+                val global = LLVMGetNamedGlobal(
+                    backend.module,
+                    bootstrapLlvmGlobalSymbol(instruction.text)
+                )
+                val scalar = bootstrapLlvmGlobalScalarType(
+                    program, instruction.text
+                )
+                if (scalar == "") bootstrapLlvmCopyValue(
+                    backend, global,
+                    storage.values[instruction.result], "global.load"
+                )
+                else bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result,
+                    LLVMBuildLoad2(
+                        backend.builder, backend.type(scalar), global,
+                        "global.scalar.load"
+                    )
+                )
+            }
+        }
+        if (reachable && (instruction.opcode == "global.assign" ||
+                          instruction.opcode == "global.store")) {
+            matched = true
+            val found = globalIndex.find(instruction.text)
+            if (found < 0) supported = false
+            if (found >= 0) {
+                val global = LLVMGetNamedGlobal(
+                    backend.module,
+                    bootstrapLlvmGlobalSymbol(instruction.text)
+                )
+                val scalar = bootstrapLlvmGlobalScalarType(
+                    program, instruction.text
+                )
+                if (scalar == "") {
+                    bootstrapLlvmCopyValue(
+                        backend, storage.values[instruction.left], global,
+                        "global.store"
+                    )
+                    bootstrapLlvmCopyValue(
+                        backend, global, storage.values[instruction.result],
+                        "global.result"
+                    )
+                } else {
+                    var native = bootstrapLlvmNativeValue(
+                        backend, storage, instruction.left
+                    )
+                    if (pointerIsNull(native)) native =
+                        bootstrapLlvmCallNamed(
+                            backend,
+                            if (scalar == "bool") "abla_as_bool"
+                            else "abla_as_i64",
+                            [storage.values[instruction.left]],
+                            "global.scalar.value", false, [true]
+                        )
+                    LLVMBuildStore(backend.builder, native, global)
+                    bootstrapLlvmSetNativeValue(
+                        backend, storage, instruction.result, native
+                    )
+                }
+            }
+        }
+        if (!matched || !supported) errors = errors + 1
+        instructionIndex = instructionIndex + 1
+    }
+    if (!terminated) {
+        bootstrapLlvmEmitFunctionReturn(
+            backend, function, storage, function.result, output
+        )
+    }
+    errors
+}

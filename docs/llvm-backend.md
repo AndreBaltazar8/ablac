@@ -6,8 +6,7 @@ libc, it cannot prove the final freestanding self-host goal. The required
 baseline Abla machine-code/ELF backend is planned in
 [full-self-hosting.md](full-self-hosting.md).
 
-The generated-C backend is a bootstrap and differential-testing backend. It is
-not the destination of the self-hosted compiler. The normal native pipeline is:
+The compiler has one production pipeline:
 
 ```text
 Abla source
@@ -21,7 +20,7 @@ Abla source
 The bootstrap form emits deterministic textual LLVM IR and invokes `llc`.
 The final compiler binds LLVM 21's C API from Abla, runs the O2 pipeline, and
 emits the object in-process. Both consume the same verified `BootstrapProgram`
-and tagged-value ABI as the interpreter and bootstrap C backend. Production
+and tagged-value ABI as the compile-time evaluator. Production
 LLVM modules contain the value runtime itself: scalars, closures/cells, arrays,
 objects, strings, formatting, equality, and non-recursive rope flattening are
 emitted by Abla. Programs without host-capability imports also emit their own
@@ -39,8 +38,8 @@ grown and reset.
 - LLVM optimization level and pipeline are versioned compiler inputs.
 - Object and executable comparisons normalize platform metadata that is not
   semantically controlled; LLVM IR snapshots remain byte-identical.
-- Every native fixture must agree with the VM and bootstrap-C result before the
-  C path can be retired.
+- Every native fixture must agree with compile-time evaluation where both
+  execution modes are defined.
 
 ## Bootstrap handoff
 
@@ -48,12 +47,12 @@ grown and reset.
    up.
 2. The Abla compiler emits LLVM IR for ordinary fixtures and then for its own
    complete source graph.
-3. `llc` emits objects and `ld.lld` links the compiler with the native runtime.
+3. LLVM emits objects and the host linker links the compiler; its Abla runtime
+   is already part of the program object.
 4. That compiler repeats the build and produces equivalent LLVM/object output.
 5. The in-process LLVM binding replaces the `opt` and `llc` subprocesses.
-6. Replace the selected host/linker surface with Abla platform modules; the
-   generated-C backend then becomes optional compatibility tooling. The pure
-   allocator/panic path has already crossed this boundary.
+6. The selected host/linker surface is expressed by Abla platform modules;
+   only the operating-system and LLVM foreign ABIs remain external.
 
 The guarded compiler launcher remains mandatory throughout this process. A
 backend or optimizer defect must fail at its address-space or time limit rather

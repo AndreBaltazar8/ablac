@@ -1,0 +1,832 @@
+trusted noescape extern:"c" fun malloc(size: int): i64*
+trusted noescape extern:"c" fun free(pointer: i64*): void
+trusted noescape extern:"c" fun write(
+    descriptor: int,
+    data: i64*,
+    length: int
+): int
+trusted noescape extern:"c" fun abort(): void
+trusted noescape extern:"c" fun pthread_mutex_init(
+    mutex: i64*,
+    attributes: i64*
+): int
+trusted noescape extern:"c" fun pthread_mutex_lock(mutex: i64*): int
+trusted noescape extern:"c" fun pthread_mutex_unlock(mutex: i64*): int
+trusted noescape extern:"c" fun pthread_mutex_destroy(mutex: i64*): int
+trusted noescape extern:"c" fun pthread_create(
+    handle: i64*,
+    attributes: i64*,
+    entry: i64*,
+    argument: i64*
+): int
+trusted noescape extern:"c" fun pthread_join(
+    handle: int,
+    result: i64*
+): int
+
+trusted fun __ablaRuntimePlatformMutexInitialize(address: int): void {
+    if (pthread_mutex_init(
+        ablaRuntimePointerFromAddress(address),
+        ablaRuntimePointerFromAddress(0)
+    ) != 0) ablaRuntimeTrap()
+}
+
+trusted fun __ablaRuntimePlatformMutexLock(address: int): void {
+    if (pthread_mutex_lock(
+        ablaRuntimePointerFromAddress(address)
+    ) != 0) ablaRuntimeTrap()
+}
+
+trusted fun __ablaRuntimePlatformMutexUnlock(address: int): void {
+    if (pthread_mutex_unlock(
+        ablaRuntimePointerFromAddress(address)
+    ) != 0) ablaRuntimeTrap()
+}
+
+trusted fun __ablaRuntimePlatformMutexDestroy(address: int): void {
+    if (pthread_mutex_destroy(
+        ablaRuntimePointerFromAddress(address)
+    ) != 0) ablaRuntimeTrap()
+}
+
+// The tracked heap stays lock-free until a program actually starts an Abla
+// thread. Thread creation happens before the worker can run, so this one-time
+// transition does not add a synchronization branch to initialization.
+var __ablaRuntimeHostHeapMutex: int = 0
+
+trusted fun __ablaRuntimePlatformThreadsEnable(): void {
+    if (__ablaRuntimeHostHeapMutex == 0) {
+        val mutex = ablaRuntimePointerAddress(malloc(40))
+        if (mutex == 0) ablaRuntimeTrap()
+        __ablaRuntimePlatformMutexInitialize(mutex)
+        __ablaRuntimeHostHeapMutex = mutex
+    }
+}
+
+@inline
+trusted fun __ablaRuntimeHostHeapLock(): int {
+    val mutex = __ablaRuntimeHostHeapMutex
+    if (mutex != 0) __ablaRuntimePlatformMutexLock(mutex)
+    mutex
+}
+
+@inline
+trusted fun __ablaRuntimeHostHeapUnlock(mutex: int): void {
+    if (mutex != 0) __ablaRuntimePlatformMutexUnlock(mutex)
+}
+
+trusted fun __ablaRuntimePlatformThreadCreate(
+    handle: int,
+    entry: int,
+    argument: int
+): bool = pthread_create(
+    ablaRuntimePointerFromAddress(handle),
+    ablaRuntimePointerFromAddress(0),
+    ablaRuntimePointerFromAddress(entry),
+    ablaRuntimePointerFromAddress(argument)
+) == 0
+
+trusted fun __ablaRuntimePlatformThreadJoin(handle: int): bool =
+    pthread_join(
+        ablaRuntimeLoadI64(handle),
+        ablaRuntimePointerFromAddress(0)
+    ) == 0
+// Host allocations form an intrusive list. Checkpoints are list positions, so
+// a region or compiler phase can release its complete allocation suffix in
+// one bounded walk without involving the LLVM backend.
+var __ablaRuntimeHostAllocationHead: int = 0
+var __ablaRuntimeHostAllocationTail: int = 0
+var __ablaRuntimeHostAllocationCount: int = 0
+var __ablaRuntimeHostLiveBytes: int = 0
+var __ablaRuntimeHostLimit: int = 4611686018427387903
+var __ablaRuntimeHostRegion: int = 0
+var __ablaRuntimeHostRegionCache: int = 0
+var __ablaRuntimeHostRegionCacheCount: int = 0
+var __ablaRuntimeHostRegionPageCache: int = 0
+var __ablaRuntimeHostRegionPageCacheCount: int = 0
+var __ablaRuntimeHostRootFrame: int = 0
+var __ablaRuntimeHostCollectionEnabled: bool = false
+var __ablaRuntimeHostCollectionThreshold: int = 33554432
+var __ablaRuntimeHostCollectionIndex: int = 0
+var __ablaRuntimeHostCollectionCount: int = 0
+var __ablaRuntimeHostCollectionIndexCapacity: int = 0
+var __ablaRuntimeHostCollectionMinimum: int = 0
+var __ablaRuntimeHostCollectionMaximum: int = 0
+var __ablaRuntimeHostCollectionWorklist: int = 0
+var __ablaRuntimeHostCollectionWorklistCount: int = 0
+var __ablaRuntimeHostCollectionRanges: int = 0
+
+val __ablaRuntimeHostRegionCachedDescriptors: int = 64
+val __ablaRuntimeHostRegionPageBytes: int = 1048576
+val __ablaRuntimeHostRegionCachedPages: int = 32
+
+trusted fun __ablaRuntimeHostUnlink(header: int): void {
+    val previous = ablaRuntimeLoadI64(header)
+    val next = ablaRuntimeLoadI64(header + 8)
+    if (previous == 0) __ablaRuntimeHostAllocationHead = next
+    else ablaRuntimeStoreI64(previous + 8, next)
+    if (next == 0) __ablaRuntimeHostAllocationTail = previous
+    else ablaRuntimeStoreI64(next, previous)
+}
+
+@inline
+trusted fun __ablaRuntimeHostCollectionIndexSlot(payload: int): int =
+    ((payload >> 4) * -7046029254386353131) &
+        (__ablaRuntimeHostCollectionIndexCapacity - 1)
+
+@inline
+trusted fun __ablaRuntimeHostCollectionIndexInsert(header: int): void {
+    val mask = __ablaRuntimeHostCollectionIndexCapacity - 1
+    var slot = __ablaRuntimeHostCollectionIndexSlot(header + 32)
+    while (ablaRuntimeLoadI64(
+        __ablaRuntimeHostCollectionIndex + slot * 8
+    ) != 0) slot = (slot + 1) & mask
+    ablaRuntimeStoreI64(
+        __ablaRuntimeHostCollectionIndex + slot * 8, header
+    )
+}
+
+trusted fun __ablaRuntimeHostCollectionIndexEnsure(): void {
+    var capacity = __ablaRuntimeHostCollectionIndexCapacity
+    if (capacity == 0) capacity = 16
+    while (capacity < __ablaRuntimeHostAllocationCount * 2) {
+        if (capacity > 576460752303423487) ablaRuntimeTrap()
+        capacity = capacity * 2
+    }
+    if (capacity != __ablaRuntimeHostCollectionIndexCapacity) {
+        val replacement = ablaRuntimePointerAddress(malloc(capacity * 8))
+        if (replacement == 0) ablaRuntimeTrap()
+        var slot: int = 0
+        while (slot < capacity) {
+            ablaRuntimeStoreI64(replacement + slot * 8, 0)
+            slot = slot + 1
+        }
+        val retired = __ablaRuntimeHostCollectionIndex
+        __ablaRuntimeHostCollectionIndex = replacement
+        __ablaRuntimeHostCollectionIndexCapacity = capacity
+        var header = __ablaRuntimeHostAllocationTail
+        while (header != 0) {
+            __ablaRuntimeHostCollectionIndexInsert(header)
+            header = ablaRuntimeLoadI64(header)
+        }
+        if (retired != 0) free(ablaRuntimePointerFromAddress(retired))
+    }
+}
+
+trusted fun __ablaRuntimeHostCollectionIndexRemove(header: int): void {
+    val mask = __ablaRuntimeHostCollectionIndexCapacity - 1
+    var slot = __ablaRuntimeHostCollectionIndexSlot(header + 32)
+    var indexed = ablaRuntimeLoadI64(
+        __ablaRuntimeHostCollectionIndex + slot * 8
+    )
+    while (indexed != 0 && indexed != header) {
+        slot = (slot + 1) & mask
+        indexed = ablaRuntimeLoadI64(
+            __ablaRuntimeHostCollectionIndex + slot * 8
+        )
+    }
+    if (indexed == 0) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(
+        __ablaRuntimeHostCollectionIndex + slot * 8, 0
+    )
+    slot = (slot + 1) & mask
+    indexed = ablaRuntimeLoadI64(
+        __ablaRuntimeHostCollectionIndex + slot * 8
+    )
+    while (indexed != 0) {
+        ablaRuntimeStoreI64(
+            __ablaRuntimeHostCollectionIndex + slot * 8, 0
+        )
+        __ablaRuntimeHostCollectionIndexInsert(indexed)
+        slot = (slot + 1) & mask
+        indexed = ablaRuntimeLoadI64(
+            __ablaRuntimeHostCollectionIndex + slot * 8
+        )
+    }
+}
+
+@inline
+trusted fun __ablaRuntimeHostCollectionRangeSwap(
+    left: int,
+    right: int
+): void {
+    val temporary = ablaRuntimeLoadI64(
+        __ablaRuntimeHostCollectionRanges + left * 8
+    )
+    ablaRuntimeStoreI64(
+        __ablaRuntimeHostCollectionRanges + left * 8,
+        ablaRuntimeLoadI64(__ablaRuntimeHostCollectionRanges + right * 8)
+    )
+    ablaRuntimeStoreI64(
+        __ablaRuntimeHostCollectionRanges + right * 8, temporary
+    )
+}
+
+// Heap sort gives the conservative marker an address-ordered allocation
+// index without another allocation or recursion. Interior string/array
+// pointers can then be resolved in logarithmic time instead of walking every
+// live allocation. This is especially important for long-running servers:
+// request garbage intentionally accumulates between bounded collections.
+trusted fun __ablaRuntimeHostCollectionRangeSift(
+    rootIndex: int,
+    count: int
+): void {
+    var root = rootIndex
+    var searching = true
+    while (searching) {
+        val left = root * 2 + 1
+        if (left >= count) searching = false
+        else {
+            var largest = left
+            val right = left + 1
+            if (right < count && ablaRuntimeLoadI64(
+                __ablaRuntimeHostCollectionRanges + right * 8
+            ) > ablaRuntimeLoadI64(
+                __ablaRuntimeHostCollectionRanges + left * 8
+            )) largest = right
+            if (ablaRuntimeLoadI64(
+                __ablaRuntimeHostCollectionRanges + largest * 8
+            ) <= ablaRuntimeLoadI64(
+                __ablaRuntimeHostCollectionRanges + root * 8
+            )) searching = false
+            else {
+                __ablaRuntimeHostCollectionRangeSwap(root, largest)
+                root = largest
+            }
+        }
+    }
+}
+
+trusted fun __ablaRuntimeHostCollectionRangesSort(count: int): void {
+    var root = count / 2
+    while (root > 0) {
+        root = root - 1
+        __ablaRuntimeHostCollectionRangeSift(root, count)
+    }
+    var remaining = count
+    while (remaining > 1) {
+        remaining = remaining - 1
+        __ablaRuntimeHostCollectionRangeSwap(0, remaining)
+        __ablaRuntimeHostCollectionRangeSift(0, remaining)
+    }
+}
+
+@inline
+trusted fun __ablaRuntimeHostCollectionContaining(
+    candidate: int
+): int {
+    var lower = 0
+    var upper = __ablaRuntimeHostCollectionCount
+    while (lower < upper) {
+        val middle = lower + (upper - lower) / 2
+        val header = ablaRuntimeLoadI64(
+            __ablaRuntimeHostCollectionRanges + middle * 8
+        )
+        if (header + 32 <= candidate) lower = middle + 1
+        else upper = middle
+    }
+    var containing = 0
+    if (lower > 0) {
+        val header = ablaRuntimeLoadI64(
+            __ablaRuntimeHostCollectionRanges + (lower - 1) * 8
+        )
+        val payload = header + 32
+        val size = ablaRuntimeLoadI64(header + 16)
+        if (candidate >= payload && candidate - payload < size) {
+            containing = header
+        }
+    }
+    containing
+}
+
+// Region pages are ordinary native allocations with a 32-byte control header:
+// next, capacity, used, and reserved. Request-local objects are bump-allocated
+// after that header and reclaimed together when their region ends.
+trusted fun __ablaRuntimeHostRegionPageAcquire(minimum: int): int {
+    var page: int = 0
+    var capacity: int = __ablaRuntimeHostRegionPageBytes
+    if (minimum <= __ablaRuntimeHostRegionPageBytes &&
+        __ablaRuntimeHostRegionPageCache != 0) {
+        page = __ablaRuntimeHostRegionPageCache
+        __ablaRuntimeHostRegionPageCache = ablaRuntimeLoadI64(page)
+        __ablaRuntimeHostRegionPageCacheCount =
+            __ablaRuntimeHostRegionPageCacheCount - 1
+    } else {
+        if (minimum > capacity) capacity = minimum
+        if (capacity > 4611686018427387871) ablaRuntimeTrap()
+        page = ablaRuntimePointerAddress(malloc(capacity + 32))
+        if (page == 0) ablaRuntimeTrap()
+        ablaRuntimeStoreI64(page + 8, capacity)
+    }
+    ablaRuntimeStoreI64(page, 0)
+    ablaRuntimeStoreI64(page + 16, 0)
+    page
+}
+
+trusted fun __ablaRuntimeHostRegionPagesRelease(pageAddress: int): void {
+    var page: int = pageAddress
+    while (page != 0) {
+        val next = ablaRuntimeLoadI64(page)
+        val capacity = ablaRuntimeLoadI64(page + 8)
+        if (capacity == __ablaRuntimeHostRegionPageBytes &&
+            __ablaRuntimeHostRegionPageCacheCount <
+                __ablaRuntimeHostRegionCachedPages) {
+            ablaRuntimeStoreI64(page + 16, 0)
+            ablaRuntimeStoreI64(page, __ablaRuntimeHostRegionPageCache)
+            __ablaRuntimeHostRegionPageCache = page
+            __ablaRuntimeHostRegionPageCacheCount =
+                __ablaRuntimeHostRegionPageCacheCount + 1
+        } else free(ablaRuntimePointerFromAddress(page))
+        page = next
+    }
+}
+
+trusted fun __ablaRuntimeHostRegionAllocate(size: int): int {
+    val required = size + 32
+    if (required < size || required > 4611686018427387888) {
+        ablaRuntimeTrap()
+    }
+    var page: int = ablaRuntimeLoadI64(__ablaRuntimeHostRegion + 8)
+    var offset: int = 0
+    if (page != 0) {
+        offset = (ablaRuntimeLoadI64(page + 16) + 15) & -16
+    }
+    if (page == 0 || offset > ablaRuntimeLoadI64(page + 8) ||
+        required > ablaRuntimeLoadI64(page + 8) - offset) {
+        page = __ablaRuntimeHostRegionPageAcquire(required + 15)
+        ablaRuntimeStoreI64(
+            page, ablaRuntimeLoadI64(__ablaRuntimeHostRegion + 8)
+        )
+        ablaRuntimeStoreI64(__ablaRuntimeHostRegion + 8, page)
+        offset = 0
+    }
+    val header = page + 32 + offset
+    ablaRuntimeStoreI64(page + 16, offset + required)
+    ablaRuntimeStoreI64(header, 0)
+    ablaRuntimeStoreI64(header + 8, 0)
+    ablaRuntimeStoreI64(header + 16, size)
+    ablaRuntimeStoreI64(header + 24, __ablaRuntimeHostRegion)
+    ablaRuntimeStoreI64(
+        __ablaRuntimeHostRegion + 16,
+        ablaRuntimeLoadI64(__ablaRuntimeHostRegion + 16) + size
+    )
+    header + 32
+}
+
+trusted fun __ablaRuntimeHostTrackedAllocate(size: int, layout: int): int {
+    if (size > 4611686018427387871) ablaRuntimeTrap()
+    val header = ablaRuntimePointerAddress(malloc(size + 32))
+    if (header == 0) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(header, __ablaRuntimeHostAllocationTail)
+    ablaRuntimeStoreI64(header + 8, 0)
+    ablaRuntimeStoreI64(header + 16, size)
+    ablaRuntimeStoreI64(header + 24, layout)
+    if (__ablaRuntimeHostAllocationTail == 0) {
+        __ablaRuntimeHostAllocationHead = header
+    } else {
+        ablaRuntimeStoreI64(__ablaRuntimeHostAllocationTail + 8, header)
+    }
+    __ablaRuntimeHostAllocationTail = header
+    __ablaRuntimeHostAllocationCount =
+        __ablaRuntimeHostAllocationCount + 1
+    val payload = header + 32
+    val end = payload + size
+    if (__ablaRuntimeHostCollectionMinimum == 0 ||
+        payload < __ablaRuntimeHostCollectionMinimum) {
+        __ablaRuntimeHostCollectionMinimum = payload
+    }
+    if (end > __ablaRuntimeHostCollectionMaximum) {
+        __ablaRuntimeHostCollectionMaximum = end
+    }
+    __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
+    header + 32
+}
+
+@inline
+trusted fun __ablaRuntimePlatformAllocateLayout(
+    requested: int,
+    layout: int
+): int {
+    val mutex = __ablaRuntimeHostHeapLock()
+    val size: int = if (requested <= 0) 1 else requested
+    val limit: int = if (__ablaRuntimeHostLimit == 0) {
+        4611686018427387903
+    } else __ablaRuntimeHostLimit
+    if (size > limit - __ablaRuntimeHostLiveBytes) {
+        __ablaRuntimePlatformPanic(
+            __ablaRuntimeStringData("memory limit exceeded"), 21
+        )
+    }
+    val result = if (__ablaRuntimeHostRegion != 0) {
+        val result: int = __ablaRuntimeHostRegionAllocate(size)
+        __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
+        result
+    } else __ablaRuntimeHostTrackedAllocate(size, layout)
+    __ablaRuntimeHostHeapUnlock(mutex)
+    result
+}
+
+@inline
+trusted fun __ablaRuntimePlatformAllocate(requested: int): int =
+    __ablaRuntimePlatformAllocateLayout(requested, 0)
+
+trusted fun __ablaRuntimeHostFreeUnlocked(address: int): void {
+    if (address != 0) {
+        val header = address - 32
+        val size = ablaRuntimeLoadI64(header + 16)
+        if (size != 0) {
+            val owner = ablaRuntimeLoadI64(header + 24)
+            if (owner >= 0 && owner < 48) {
+                __ablaRuntimeHostUnlink(header)
+                free(ablaRuntimePointerFromAddress(header))
+                __ablaRuntimeHostAllocationCount =
+                    __ablaRuntimeHostAllocationCount - 1
+            } else {
+                ablaRuntimeStoreI64(
+                    owner + 16,
+                    ablaRuntimeLoadI64(owner + 16) - size
+                )
+                ablaRuntimeStoreI64(header + 16, 0)
+            }
+            __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - size
+        }
+    }
+}
+
+trusted fun __ablaRuntimePlatformFree(address: int): void {
+    val mutex = __ablaRuntimeHostHeapLock()
+    __ablaRuntimeHostFreeUnlocked(address)
+    __ablaRuntimeHostHeapUnlock(mutex)
+}
+
+trusted fun __ablaRuntimePlatformMemoryCheckpoint(): int =
+    __ablaRuntimeHostAllocationTail
+
+trusted fun __ablaRuntimePlatformMemoryReset(checkpoint: int): void {
+    while (__ablaRuntimeHostAllocationTail != checkpoint) {
+        if (__ablaRuntimeHostAllocationTail == 0) ablaRuntimeTrap()
+        __ablaRuntimePlatformFree(__ablaRuntimeHostAllocationTail + 32)
+    }
+}
+
+trusted fun __ablaRuntimePlatformMemoryLiveBytes(): int =
+    __ablaRuntimeHostLiveBytes
+
+trusted fun __ablaRuntimePlatformMemoryLimit(): int =
+    if (__ablaRuntimeHostLimit == 0) 4611686018427387903
+    else __ablaRuntimeHostLimit
+
+trusted fun __ablaRuntimePlatformMemorySetLimit(limit: int): void {
+    if (limit < 0 || limit < __ablaRuntimeHostLiveBytes) ablaRuntimeTrap()
+    __ablaRuntimeHostLimit = limit
+    __ablaRuntimeHostCollectionEnabled = true
+    val latest = limit - limit / 4
+    if (__ablaRuntimeHostCollectionThreshold > latest) {
+        __ablaRuntimeHostCollectionThreshold = latest
+    }
+    return
+}
+
+trusted fun __ablaRuntimePlatformMemorySetLayout(
+    address: int,
+    layout: int
+): void {
+    if (address == 0 || layout < 0 || layout >= 16) ablaRuntimeTrap()
+    val header = address - 32
+    val owner = ablaRuntimeLoadI64(header + 24)
+    if (owner >= 0 && owner < 48) {
+        ablaRuntimeStoreI64(header + 24, layout)
+    }
+}
+
+trusted fun __ablaRuntimeHostMarkPointer(candidate: int): bool {
+    if (candidate == 0 || __ablaRuntimeHostCollectionCount == 0) {
+        return false
+    }
+    val mask = __ablaRuntimeHostCollectionIndexCapacity - 1
+    var slot = ((candidate >> 4) * -7046029254386353131) & mask
+    var header = ablaRuntimeLoadI64(
+        __ablaRuntimeHostCollectionIndex + slot * 8
+    )
+    while (header != 0 && header + 32 != candidate) {
+        slot = (slot + 1) & mask
+        header = ablaRuntimeLoadI64(
+            __ablaRuntimeHostCollectionIndex + slot * 8
+        )
+    }
+    if (header == 0 &&
+        candidate >= __ablaRuntimeHostCollectionMinimum &&
+        candidate < __ablaRuntimeHostCollectionMaximum) {
+        header = __ablaRuntimeHostCollectionContaining(candidate)
+    }
+    if (header == 0) return false
+    val payload = header + 32
+    val size = ablaRuntimeLoadI64(header + 16)
+    val layout = ablaRuntimeLoadI64(header + 24)
+    if (candidate < payload || candidate - payload >= size ||
+        layout < 0 || layout >= 16) return false
+    ablaRuntimeStoreI64(header + 24, layout + 16)
+    val work = __ablaRuntimeHostCollectionWorklistCount
+    if (work >= __ablaRuntimeHostCollectionCount) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(
+        __ablaRuntimeHostCollectionWorklist + work * 8, header
+    )
+    __ablaRuntimeHostCollectionWorklistCount = work + 1
+    true
+}
+
+@inline
+trusted fun __ablaRuntimeHostMarkValue(value: int): void {
+    val tag = ablaRuntimeLoadI32(value)
+    if (tag == 4) {
+        __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(value + 8))
+        __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(value + 16))
+    }
+    if (tag == 5) {
+        __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(value + 16))
+    }
+    if (tag >= 6 && tag <= 13) {
+        __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(value + 8))
+    }
+}
+
+trusted fun __ablaRuntimeHostMarkRootValues(): void {
+    var frame: int = __ablaRuntimeHostRootFrame
+    while (frame != 0) {
+        val roots = ablaRuntimeLoadI64(frame + 8)
+        val count = ablaRuntimeLoadI64(frame + 16)
+        var index: int = 0
+        while (index < count) {
+            val value = ablaRuntimeLoadI64(roots + index * 8)
+            if (value != 0) __ablaRuntimeHostMarkValue(value)
+            index = index + 1
+        }
+        frame = ablaRuntimeLoadI64(frame)
+    }
+}
+
+trusted fun __ablaRuntimeHostTraceMarkedAllocations(): void {
+    while (__ablaRuntimeHostCollectionWorklistCount != 0) {
+        __ablaRuntimeHostCollectionWorklistCount =
+            __ablaRuntimeHostCollectionWorklistCount - 1
+        val header = ablaRuntimeLoadI64(
+            __ablaRuntimeHostCollectionWorklist +
+                __ablaRuntimeHostCollectionWorklistCount * 8
+        )
+        val layout = ablaRuntimeLoadI64(header + 24) - 16
+        ablaRuntimeStoreI64(header + 24, layout + 32)
+        val size = ablaRuntimeLoadI64(header + 16)
+        val payload = header + 32
+        if (layout == 0) {
+            var offset: int = 0
+            while (offset + 8 <= size) {
+                __ablaRuntimeHostMarkPointer(
+                    ablaRuntimeLoadI64(payload + offset)
+                )
+                offset = offset + 8
+            }
+        }
+        if (layout == 2) {
+            var offset: int = 0
+            while (offset + 24 <= size) {
+                __ablaRuntimeHostMarkValue(payload + offset)
+                offset = offset + 24
+            }
+        }
+        if (layout == 3) {
+            var offset: int = 0
+            while (offset + 32 <= size) {
+                __ablaRuntimeHostMarkValue(payload + offset + 8)
+                offset = offset + 32
+            }
+        }
+        if (layout == 4 && size >= 24) {
+            val count = ablaRuntimeLoadI64(payload)
+            val values = ablaRuntimeLoadI64(payload + 16)
+            if (values == payload + 24) {
+                var index: int = 0
+                while (index < count) {
+                    __ablaRuntimeHostMarkValue(values + index * 24)
+                    index = index + 1
+                }
+            } else __ablaRuntimeHostMarkPointer(values)
+        }
+        if (layout == 5 && size >= 32) {
+            val count = ablaRuntimeLoadI64(payload + 8)
+            val fields = ablaRuntimeLoadI64(payload + 24)
+            if (fields == payload + 32) {
+                var index: int = 0
+                while (index < count) {
+                    __ablaRuntimeHostMarkValue(fields + index * 32 + 8)
+                    index = index + 1
+                }
+            } else __ablaRuntimeHostMarkPointer(fields)
+        }
+        if (layout == 6 && size >= 48) {
+            __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(payload + 8))
+            __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(payload + 16))
+            __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(payload + 24))
+            __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(payload + 32))
+            __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(payload + 40))
+        }
+        if (layout == 7 && size >= 24) {
+            __ablaRuntimeHostMarkValue(payload + 16)
+        }
+        if (layout == 11 && size >= 48) {
+            __ablaRuntimeHostMarkValue(payload)
+            __ablaRuntimeHostMarkValue(payload + 24)
+        }
+    }
+}
+
+trusted fun __ablaRuntimePlatformMemoryCollect(): int {
+    // Region pages are reclaimed as a unit and may contain references into
+    // the persistent heap. Defer collection until the outermost region ends,
+    // when compiler-published stack/global roots are sufficient.
+    val mutex = __ablaRuntimeHostHeapLock()
+    if (__ablaRuntimeHostRegion != 0) {
+        __ablaRuntimeHostHeapUnlock(mutex)
+        return 0
+    }
+    val before = __ablaRuntimeHostLiveBytes
+    val allocationCount = __ablaRuntimeHostAllocationCount
+    if (allocationCount == 0) {
+        __ablaRuntimeHostHeapUnlock(mutex)
+        return 0
+    }
+    __ablaRuntimeHostCollectionWorklist = ablaRuntimePointerAddress(
+        malloc(allocationCount * 8)
+    )
+    if (__ablaRuntimeHostCollectionWorklist == 0) ablaRuntimeTrap()
+    __ablaRuntimeHostCollectionRanges = ablaRuntimePointerAddress(
+        malloc(allocationCount * 8)
+    )
+    if (__ablaRuntimeHostCollectionRanges == 0) ablaRuntimeTrap()
+    var indexCapacity = 16
+    while (indexCapacity < allocationCount * 2) {
+        if (indexCapacity > 576460752303423487) ablaRuntimeTrap()
+        indexCapacity = indexCapacity * 2
+    }
+    __ablaRuntimeHostCollectionIndex = ablaRuntimePointerAddress(
+        malloc(indexCapacity * 8)
+    )
+    if (__ablaRuntimeHostCollectionIndex == 0) ablaRuntimeTrap()
+    __ablaRuntimeHostCollectionIndexCapacity = indexCapacity
+    var indexSlot = 0
+    while (indexSlot < indexCapacity) {
+        ablaRuntimeStoreI64(
+            __ablaRuntimeHostCollectionIndex + indexSlot * 8, 0
+        )
+        indexSlot = indexSlot + 1
+    }
+    __ablaRuntimeHostCollectionCount = allocationCount
+    __ablaRuntimeHostCollectionWorklistCount = 0
+    var range = 0
+    var indexedHeader = __ablaRuntimeHostAllocationTail
+    while (indexedHeader != 0) {
+        ablaRuntimeStoreI64(
+            __ablaRuntimeHostCollectionRanges + range * 8, indexedHeader
+        )
+        __ablaRuntimeHostCollectionIndexInsert(indexedHeader)
+        range = range + 1
+        indexedHeader = ablaRuntimeLoadI64(indexedHeader)
+    }
+    if (range != allocationCount) ablaRuntimeTrap()
+    __ablaRuntimeHostCollectionRangesSort(allocationCount)
+    __ablaRuntimeHostMarkRootValues()
+    __ablaRuntimeHostTraceMarkedAllocations()
+    var header: int = __ablaRuntimeHostAllocationTail
+    while (header != 0) {
+        val previous = ablaRuntimeLoadI64(header)
+        val state = ablaRuntimeLoadI64(header + 24)
+        if (state == 10) {
+            ablaRuntimeStoreI64(header + 24, 10)
+        } else if (state >= 0 && state < 16) {
+            __ablaRuntimeHostFreeUnlocked(header + 32)
+        } else ablaRuntimeStoreI64(header + 24, state - 32)
+        header = previous
+    }
+    free(ablaRuntimePointerFromAddress(
+        __ablaRuntimeHostCollectionWorklist
+    ))
+    free(ablaRuntimePointerFromAddress(
+        __ablaRuntimeHostCollectionRanges
+    ))
+    free(ablaRuntimePointerFromAddress(
+        __ablaRuntimeHostCollectionIndex
+    ))
+    __ablaRuntimeHostCollectionCount = 0
+    __ablaRuntimeHostCollectionWorklist = 0
+    __ablaRuntimeHostCollectionWorklistCount = 0
+    __ablaRuntimeHostCollectionRanges = 0
+    __ablaRuntimeHostCollectionIndex = 0
+    __ablaRuntimeHostCollectionIndexCapacity = 0
+    val freed = before - __ablaRuntimeHostLiveBytes
+    __ablaRuntimeHostHeapUnlock(mutex)
+    freed
+}
+
+trusted fun __ablaRuntimeRootsPush(
+    frame: int,
+    roots: int,
+    count: int
+): int {
+    ablaRuntimeStoreI64(frame, __ablaRuntimeHostRootFrame)
+    ablaRuntimeStoreI64(frame + 8, roots)
+    ablaRuntimeStoreI64(frame + 16, count)
+    __ablaRuntimeHostRootFrame = frame
+    0
+}
+
+trusted fun __ablaRuntimeRootsPop(frame: int): int {
+    if (__ablaRuntimeHostRootFrame != frame) ablaRuntimeTrap()
+    __ablaRuntimeHostRootFrame = ablaRuntimeLoadI64(frame)
+    0
+}
+
+trusted fun __ablaRuntimeMemoryPressure(): int {
+    if (!__ablaRuntimeHostCollectionEnabled ||
+        __ablaRuntimeHostRegion != 0 ||
+        __ablaRuntimeHostLiveBytes <
+            __ablaRuntimeHostCollectionThreshold) return 0
+    __ablaRuntimePlatformMemoryCollect()
+    val reserve = 67108864
+    val growth = if (__ablaRuntimeHostLiveBytes / 2 > reserve) {
+        __ablaRuntimeHostLiveBytes / 2
+    } else reserve
+    var next = __ablaRuntimeHostLiveBytes + growth
+    val latest = __ablaRuntimeHostLimit -
+        if (__ablaRuntimeHostLimit / 4 < reserve) {
+            __ablaRuntimeHostLimit / 4
+        } else reserve
+    if (next < 33554432) next = 33554432
+    if (next > latest) next = latest
+    __ablaRuntimeHostCollectionThreshold = next
+    0
+}
+
+trusted fun __ablaRuntimePlatformRegionBegin(): int {
+    var regionAddress: int = __ablaRuntimeHostRegionCache
+    if (regionAddress != 0) {
+        __ablaRuntimeHostRegionCache = ablaRuntimeLoadI64(regionAddress)
+        __ablaRuntimeHostRegionCacheCount =
+            __ablaRuntimeHostRegionCacheCount - 1
+    } else {
+        regionAddress = ablaRuntimePointerAddress(malloc(24))
+        if (regionAddress == 0) ablaRuntimeTrap()
+    }
+    ablaRuntimeStoreI64(regionAddress, __ablaRuntimeHostRegion)
+    ablaRuntimeStoreI64(regionAddress + 8, 0)
+    ablaRuntimeStoreI64(regionAddress + 16, 0)
+    __ablaRuntimeHostRegion = regionAddress
+    regionAddress
+}
+
+trusted fun __ablaRuntimePlatformRegionEnd(regionAddress: int): void {
+    if (regionAddress == 0 ||
+        regionAddress != __ablaRuntimeHostRegion) ablaRuntimeTrap()
+    val parent = ablaRuntimeLoadI64(regionAddress)
+    val pages = ablaRuntimeLoadI64(regionAddress + 8)
+    val live = ablaRuntimeLoadI64(regionAddress + 16)
+    if (live < 0 || live > __ablaRuntimeHostLiveBytes) ablaRuntimeTrap()
+    __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - live
+    __ablaRuntimeHostRegionPagesRelease(pages)
+    __ablaRuntimeHostRegion = parent
+    if (__ablaRuntimeHostRegionCacheCount <
+        __ablaRuntimeHostRegionCachedDescriptors) {
+        ablaRuntimeStoreI64(regionAddress, __ablaRuntimeHostRegionCache)
+        __ablaRuntimeHostRegionCache = regionAddress
+        __ablaRuntimeHostRegionCacheCount =
+            __ablaRuntimeHostRegionCacheCount + 1
+    } else free(ablaRuntimePointerFromAddress(regionAddress))
+}
+
+trusted fun __ablaRuntimePlatformRegionActive(): bool =
+    __ablaRuntimeHostRegion != 0
+
+// Return an equivalent allocation owned by the parent region. This is the
+// uncommon backpressure/lifetime boundary; ordinary request allocations stay
+// on the zero-malloc bump path.
+trusted fun __ablaRuntimePlatformPromoteAllocation(address: int): int {
+    if (__ablaRuntimeHostRegion == 0) return address
+    val size = ablaRuntimeLoadI64(address - 16)
+    val child = __ablaRuntimeHostRegion
+    __ablaRuntimeHostRegion = ablaRuntimeLoadI64(child)
+    val promoted = __ablaRuntimePlatformAllocate(size)
+    __ablaRuntimeHostRegion = child
+    var index: int = 0
+    while (index < size) {
+        ablaRuntimeStoreU8(
+            promoted + index, ablaRuntimeLoadU8(address + index)
+        )
+        index = index + 1
+    }
+    __ablaRuntimePlatformFree(address)
+    promoted
+}
+
+trusted fun __ablaRuntimePlatformPanic(data: int, length: int): int {
+    write(2, ablaRuntimePointerFromAddress(data), length)
+    abort()
+    0
+}

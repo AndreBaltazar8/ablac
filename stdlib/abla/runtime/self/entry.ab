@@ -1,60 +1,1630 @@
-// Portable algorithms implemented in Abla and linked into the application's
-// LLVM unit. Arithmetic, comparisons, and bit operations deliberately do not
-// live here: they are language primitives and the LLVM backend lowers typed
-// scalar uses directly to native instructions.
+// Portable runtime semantics implemented in Abla and compiled into the same
+// LLVM unit as the application. Typed scalar expressions lower through the
+// compiler's normal scalar path; the functions below handle boxed/dynamic
+// values at the universal-value ABI boundary.
 
-fun __ablaRuntimeTextFindSequence(
+// These are the irreducible value-layout and raw-memory operations used by
+// the runtime below. They are the temporary boundary until Abla has an
+// unboxed tagged-union/record representation. Collection, strings, arrays,
+// objects, arithmetic, comparisons, and ownership policy are ordinary Abla.
+trusted noescape extern:"intrinsic" fun ablaRuntimeValueAddress(
+    value: any
+): int
+
+trusted noescape extern:"intrinsic" fun ablaRuntimeMakeValue(
+    tag: int,
+    auxiliary: int,
+    word0: int,
+    word1: int
+): any
+
+trusted noescape extern:"intrinsic" fun ablaRuntimeLoadI32(address: int): int
+trusted noescape extern:"intrinsic" fun ablaRuntimeStoreI32(
+    address: int,
+    value: int
+): void
+trusted noescape extern:"intrinsic" fun ablaRuntimeLoadI64(address: int): int
+trusted noescape extern:"intrinsic" fun ablaRuntimeStoreI64(
+    address: int,
+    value: int
+): void
+trusted noescape extern:"intrinsic" fun ablaRuntimeLoadU8(address: int): int
+trusted noescape extern:"intrinsic" fun ablaRuntimeStoreU8(
+    address: int,
+    value: int
+): void
+trusted noescape extern:"intrinsic" fun ablaRuntimePointerAddress(
+    pointer: i64*
+): int
+trusted noescape extern:"intrinsic" fun ablaRuntimePointerFromAddress(
+    address: int
+): i64*
+@inline
+trusted fun __ablaRuntimeAllocate(size: int): int =
+    __ablaRuntimePlatformAllocate(size)
+
+@inline
+trusted fun __ablaRuntimeAllocateLayout(size: int, layout: int): int =
+    __ablaRuntimePlatformAllocateLayout(size, layout)
+
+trusted fun __ablaRuntimeFree(address: int): void =
+    __ablaRuntimePlatformFree(address)
+trusted noescape extern:"intrinsic" fun ablaRuntimeTrap(): void
+
+// These dispatchers are generated in the same LLVM module. Declaring their C
+// ABI here lets ordinary Abla runtime code invoke a closure without embedding
+// closure semantics in the backend or a C runtime.
+trusted noescape extern:"c" fun abla_llvm_call_indirect(
+    output: i64*,
+    closure: i64*,
+    arguments: i64*,
+    count: int
+): void
+trusted noescape extern:"c" fun abla_llvm_release_closure(
+    closure: i64*
+): void
+trusted noescape extern:"c" fun abla_llvm_drop_closure(
+    closure: i64*
+): void
+
+@inline
+trusted fun __ablaRuntimeValueAt(address: int): any =
+    ablaRuntimeMakeValue(
+        ablaRuntimeLoadI32(address),
+        ablaRuntimeLoadI32(address + 4),
+        ablaRuntimeLoadI64(address + 8),
+        ablaRuntimeLoadI64(address + 16)
+    )
+
+trusted fun __ablaRuntimeCopyValue(value: any, destination: int): void {
+    val source = ablaRuntimeValueAddress(value)
+    ablaRuntimeStoreI64(destination, ablaRuntimeLoadI64(source))
+    ablaRuntimeStoreI64(destination + 8, ablaRuntimeLoadI64(source + 8))
+    ablaRuntimeStoreI64(destination + 16, ablaRuntimeLoadI64(source + 16))
+}
+
+@inline
+trusted fun __ablaRuntimeTag(value: any): int =
+    ablaRuntimeLoadI32(ablaRuntimeValueAddress(value))
+
+@inline
+trusted fun __ablaRuntimeWord0(value: any): int =
+    ablaRuntimeLoadI64(ablaRuntimeValueAddress(value) + 8)
+
+@inline
+trusted fun __ablaRuntimeWord1(value: any): int =
+    ablaRuntimeLoadI64(ablaRuntimeValueAddress(value) + 16)
+
+@inline
+trusted fun __ablaRuntimeAuxiliary(value: any): int =
+    ablaRuntimeLoadI32(ablaRuntimeValueAddress(value) + 4)
+
+@inline
+trusted fun __ablaRuntimeRequire(value: any, tag: int): bool {
+    val valid = __ablaRuntimeTag(value) == tag
+    if (!valid) ablaRuntimeTrap()
+    valid
+}
+
+trusted fun __ablaRuntimeVoid(): any =
+    ablaRuntimeMakeValue(0, 0, 0, 0)
+
+trusted fun __ablaRuntimeNull(): any =
+    ablaRuntimeMakeValue(1, 0, 0, 0)
+
+@inline
+trusted fun __ablaRuntimeI64(value: int): any =
+    ablaRuntimeMakeValue(2, 0, value, 0)
+
+@inline
+trusted fun __ablaRuntimeBool(value: bool): any =
+    ablaRuntimeMakeValue(3, 0, if (value) 1 else 0, 0)
+
+@inline
+trusted fun __ablaRuntimeStringStatic(data: int, length: int): any {
+    if (data == 0 && length != 0) ablaRuntimeTrap()
+    ablaRuntimeMakeValue(4, 0, data, length)
+}
+
+@inline
+trusted fun __ablaRuntimeAsI64(value: any): int {
+    __ablaRuntimeRequire(value, 2)
+    __ablaRuntimeWord0(value)
+}
+
+@inline
+trusted fun __ablaRuntimeAsBool(value: any): bool {
+    __ablaRuntimeRequire(value, 3)
+    __ablaRuntimeWord0(value) != 0
+}
+
+trusted fun __ablaRuntimeFunction(function: int): any =
+    ablaRuntimeMakeValue(5, function, 0, 0)
+
+trusted fun __ablaRuntimeClosure(
+    function: int,
+    captures: int,
+    count: int
+): any {
+    if (count < 0) ablaRuntimeTrap()
+    var owned: int = 0
+    if (count > 0) {
+        owned = __ablaRuntimeAllocateLayout(count * 24, 2)
+        var index: int = 0
+        while (index < count) {
+            val source = captures + index * 24
+            val destination = owned + index * 24
+            ablaRuntimeStoreI64(destination, ablaRuntimeLoadI64(source))
+            ablaRuntimeStoreI64(
+                destination + 8, ablaRuntimeLoadI64(source + 8)
+            )
+            ablaRuntimeStoreI64(
+                destination + 16, ablaRuntimeLoadI64(source + 16)
+            )
+            index = index + 1
+        }
+    }
+    ablaRuntimeMakeValue(5, function, count, owned)
+}
+
+trusted fun __ablaRuntimeAsFunction(value: any): int {
+    if (!__ablaRuntimeRequire(value, 5)) 0
+    else __ablaRuntimeAuxiliary(value)
+}
+
+trusted fun __ablaRuntimeFunctionCaptureCount(value: any): int {
+    if (!__ablaRuntimeRequire(value, 5)) 0
+    else __ablaRuntimeWord0(value)
+}
+
+trusted fun __ablaRuntimeFunctionCapturePointer(value: any): int {
+    if (!__ablaRuntimeRequire(value, 5)) 0
+    else __ablaRuntimeWord1(value)
+}
+
+trusted fun __ablaRuntimeFunctionCapture(value: any, index: int): any {
+    val count = __ablaRuntimeFunctionCaptureCount(value)
+    if (index < 0 || index >= count) {
+        ablaRuntimeTrap()
+        __ablaRuntimeNull()
+    } else __ablaRuntimeValueAt(
+        __ablaRuntimeFunctionCapturePointer(value) + index * 24
+    )
+}
+
+trusted fun __ablaRuntimeClosureRelease(value: any): int {
+    __ablaRuntimeFree(__ablaRuntimeFunctionCapturePointer(value))
+    0
+}
+
+trusted fun __ablaRuntimeCellCreate(value: any): any {
+    val cell = __ablaRuntimeAllocateLayout(24, 2)
+    __ablaRuntimeCopyValue(value, cell)
+    ablaRuntimeMakeValue(6, 0, cell, 0)
+}
+
+trusted fun __ablaRuntimeCellAddress(value: any): int {
+    if (!__ablaRuntimeRequire(value, 6)) 0
+    else __ablaRuntimeWord0(value)
+}
+
+trusted fun __ablaRuntimeCellGet(value: any): any =
+    __ablaRuntimeValueAt(__ablaRuntimeCellAddress(value))
+
+trusted fun __ablaRuntimeCellSet(cell: any, value: any): any {
+    __ablaRuntimeCopyValue(value, __ablaRuntimeCellAddress(cell))
+    value
+}
+
+// Shared/Weak control blocks are ordinary Abla-owned memory. Two platform
+// mutexes keep reference counts and user mutation independent: the platform
+// supplies scheduling primitives, while ownership semantics remain here.
+trusted fun __ablaRuntimeSharedControl(value: any, tag: int): int {
+    if (!__ablaRuntimeRequire(value, tag)) 0
+    else __ablaRuntimeWord0(value)
+}
+
+trusted fun __ablaRuntimeSharedCountLock(control: int): void =
+    __ablaRuntimePlatformMutexLock(control + 48)
+
+trusted fun __ablaRuntimeSharedCountUnlock(control: int): void =
+    __ablaRuntimePlatformMutexUnlock(control + 48)
+
+trusted fun __ablaRuntimeSharedCreate(value: any): any {
+    val control = __ablaRuntimeAllocateLayout(128, 7)
+    ablaRuntimeStoreI64(control, 1)
+    ablaRuntimeStoreI64(control + 8, 1)
+    __ablaRuntimeCopyValue(value, control + 16)
+    __ablaRuntimePlatformMutexInitialize(control + 48)
+    __ablaRuntimePlatformMutexInitialize(control + 88)
+    ablaRuntimeMakeValue(9, 0, control, 0)
+}
+
+trusted fun __ablaRuntimeSharedClone(value: any): any {
+    val control = __ablaRuntimeSharedControl(value, 9)
+    __ablaRuntimeSharedCountLock(control)
+    val strong = ablaRuntimeLoadI64(control)
+    if (strong <= 0 || strong == 9223372036854775807) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(control, strong + 1)
+    __ablaRuntimeSharedCountUnlock(control)
+    value
+}
+
+trusted fun __ablaRuntimeSharedGet(value: any): any =
+    __ablaRuntimeValueAt(__ablaRuntimeSharedControl(value, 9) + 16)
+
+trusted fun __ablaRuntimeSharedLock(value: any): any {
+    val control = __ablaRuntimeSharedControl(value, 9)
+    __ablaRuntimePlatformMutexLock(control + 88)
+    __ablaRuntimeValueAt(control + 16)
+}
+
+trusted fun __ablaRuntimeSharedUnlock(value: any): int {
+    __ablaRuntimePlatformMutexUnlock(__ablaRuntimeWord0(value) + 88)
+    0
+}
+
+trusted fun __ablaRuntimeSharedRelease(value: any): any {
+    val control = __ablaRuntimeSharedControl(value, 9)
+    __ablaRuntimeSharedCountLock(control)
+    val strong = ablaRuntimeLoadI64(control)
+    if (strong <= 0) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(control, strong - 1)
+    var released = __ablaRuntimeNull()
+    var freeControl = false
+    if (strong == 1) {
+        released = __ablaRuntimeValueAt(control + 16)
+        __ablaRuntimeCopyValue(__ablaRuntimeNull(), control + 16)
+        val weak = ablaRuntimeLoadI64(control + 8) - 1
+        ablaRuntimeStoreI64(control + 8, weak)
+        freeControl = weak == 0
+    }
+    __ablaRuntimeSharedCountUnlock(control)
+    if (freeControl) {
+        __ablaRuntimePlatformMutexDestroy(control + 48)
+        __ablaRuntimePlatformMutexDestroy(control + 88)
+        __ablaRuntimeFree(control)
+    }
+    released
+}
+
+trusted fun __ablaRuntimeWeakCreate(value: any): any {
+    val control = __ablaRuntimeSharedControl(value, 9)
+    __ablaRuntimeSharedCountLock(control)
+    val weak = ablaRuntimeLoadI64(control + 8)
+    if (weak == 9223372036854775807) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(control + 8, weak + 1)
+    __ablaRuntimeSharedCountUnlock(control)
+    ablaRuntimeMakeValue(10, 0, control, 0)
+}
+
+trusted fun __ablaRuntimeWeakClone(value: any): any {
+    val control = __ablaRuntimeSharedControl(value, 10)
+    __ablaRuntimeSharedCountLock(control)
+    val weak = ablaRuntimeLoadI64(control + 8)
+    if (weak <= 0 || weak == 9223372036854775807) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(control + 8, weak + 1)
+    __ablaRuntimeSharedCountUnlock(control)
+    value
+}
+
+trusted fun __ablaRuntimeWeakUpgrade(value: any): any {
+    val control = __ablaRuntimeSharedControl(value, 10)
+    __ablaRuntimeSharedCountLock(control)
+    val strong = ablaRuntimeLoadI64(control)
+    var result = __ablaRuntimeNull()
+    if (strong > 0) {
+        if (strong == 9223372036854775807) ablaRuntimeTrap()
+        ablaRuntimeStoreI64(control, strong + 1)
+        result = ablaRuntimeMakeValue(9, 0, control, 0)
+    }
+    __ablaRuntimeSharedCountUnlock(control)
+    result
+}
+
+trusted fun __ablaRuntimeWeakAlive(value: any): any {
+    val control = __ablaRuntimeSharedControl(value, 10)
+    __ablaRuntimeSharedCountLock(control)
+    val alive = ablaRuntimeLoadI64(control) > 0
+    __ablaRuntimeSharedCountUnlock(control)
+    __ablaRuntimeBool(alive)
+}
+
+trusted fun __ablaRuntimeWeakRelease(value: any): any {
+    val control = __ablaRuntimeSharedControl(value, 10)
+    __ablaRuntimeSharedCountLock(control)
+    val weak = ablaRuntimeLoadI64(control + 8)
+    if (weak <= 0) ablaRuntimeTrap()
+    ablaRuntimeStoreI64(control + 8, weak - 1)
+    val freeControl = weak == 1
+    __ablaRuntimeSharedCountUnlock(control)
+    if (freeControl) {
+        __ablaRuntimePlatformMutexDestroy(control + 48)
+        __ablaRuntimePlatformMutexDestroy(control + 88)
+        __ablaRuntimeFree(control)
+    }
+    __ablaRuntimeNull()
+}
+
+var __ablaRuntimeCurrentGenerator: int = 0
+
+trusted fun __ablaRuntimeDispatchClosure(
+    closure: int,
+    output: int
+): void = abla_llvm_call_indirect(
+    ablaRuntimePointerFromAddress(output),
+    ablaRuntimePointerFromAddress(closure),
+    ablaRuntimePointerFromAddress(0),
+    0
+)
+
+trusted fun __ablaRuntimeReleaseClosure(closure: int): void =
+    abla_llvm_release_closure(ablaRuntimePointerFromAddress(closure))
+
+trusted fun __ablaRuntimeDropClosure(closure: int): void =
+    abla_llvm_drop_closure(ablaRuntimePointerFromAddress(closure))
+
+trusted fun __ablaRuntimeGeneratorCreate(
+    closure: any,
+    dispatch: int,
+    release: int,
+    drop: int
+): any {
+    val control = __ablaRuntimeAllocateLayout(64, 2)
+    val values = __ablaRuntimeArrayCreate(0, 0)
+    __ablaRuntimeCopyValue(closure, control)
+    __ablaRuntimeCopyValue(values, control + 24)
+    ablaRuntimeStoreI64(control + 48, 0)
+    ablaRuntimeStoreI64(control + 56, 0)
+    ablaRuntimeMakeValue(11, 0, control, 0)
+}
+
+trusted fun __ablaRuntimeGeneratorExecute(control: int): void {
+    if (ablaRuntimeLoadI64(control + 56) == 0) {
+        if (__ablaRuntimeCurrentGenerator != 0) ablaRuntimeTrap()
+        __ablaRuntimeCurrentGenerator = control
+        val ignored = __ablaRuntimeAllocateLayout(24, 2)
+        __ablaRuntimeDispatchClosure(control, ignored)
+        __ablaRuntimeReleaseClosure(control)
+        __ablaRuntimeCopyValue(__ablaRuntimeNull(), control)
+        __ablaRuntimeFree(ignored)
+        __ablaRuntimeCurrentGenerator = 0
+        ablaRuntimeStoreI64(control + 56, 1)
+    }
+}
+
+trusted fun __ablaRuntimeGeneratorNext(handle: any): any {
+    val control = __ablaRuntimeSharedControl(handle, 11)
+    __ablaRuntimeGeneratorExecute(control)
+    val index = ablaRuntimeLoadI64(control + 48)
+    val values = __ablaRuntimeValueAt(control + 24)
+    val available = index < __ablaRuntimeArrayLengthI64(values)
+    if (available) ablaRuntimeStoreI64(control + 48, index + 1)
+    __ablaRuntimeBool(available)
+}
+
+trusted fun __ablaRuntimeGeneratorValue(handle: any): any {
+    val control = __ablaRuntimeSharedControl(handle, 11)
+    val index = ablaRuntimeLoadI64(control + 48) - 1
+    __ablaRuntimeArrayGet(
+        __ablaRuntimeValueAt(control + 24),
+        __ablaRuntimeI64(index)
+    )
+}
+
+trusted fun __ablaRuntimeGeneratorYield(value: any): any {
+    val control = __ablaRuntimeCurrentGenerator
+    if (control == 0) ablaRuntimeTrap()
+    __ablaRuntimeArrayAppend(
+        __ablaRuntimeValueAt(control + 24), value
+    )
+    __ablaRuntimeBool(true)
+}
+
+trusted fun __ablaRuntimeGeneratorDrop(handle: any): any {
+    val control = __ablaRuntimeSharedControl(handle, 11)
+    if (ablaRuntimeLoadI64(control + 56) == 0) {
+        __ablaRuntimeDropClosure(control)
+    }
+    __ablaRuntimeFree(control)
+    __ablaRuntimeVoid()
+}
+
+trusted fun __ablaRuntimeTaskCreate(
+    closure: any,
+    dispatch: int,
+    release: int,
+    drop: int
+): any {
+    val control = __ablaRuntimeAllocateLayout(48, 2)
+    __ablaRuntimeCopyValue(closure, control)
+    __ablaRuntimeCopyValue(__ablaRuntimeVoid(), control + 24)
+    ablaRuntimeMakeValue(12, 0, control, 0)
+}
+
+trusted fun __ablaRuntimeTaskDrop(handle: any): any {
+    val control = __ablaRuntimeSharedControl(handle, 12)
+    __ablaRuntimeDropClosure(control)
+    __ablaRuntimeFree(control)
+    __ablaRuntimeVoid()
+}
+
+trusted fun __ablaRuntimeThreadEntry(control: int): int {
+    __ablaRuntimeDispatchClosure(control, control + 24)
+    __ablaRuntimeReleaseClosure(control)
+    __ablaRuntimeCopyValue(__ablaRuntimeNull(), control)
+    0
+}
+
+trusted fun __ablaRuntimeThreadCreate(
+    closure: any,
+    dispatch: int,
+    release: int,
+    drop: int,
+    entry: int
+): any {
+    __ablaRuntimePlatformThreadsEnable()
+    val control = __ablaRuntimeAllocateLayout(88, 11)
+    __ablaRuntimeCopyValue(closure, control)
+    __ablaRuntimeCopyValue(__ablaRuntimeVoid(), control + 24)
+    ablaRuntimeStoreI64(control + 48, dispatch)
+    ablaRuntimeStoreI64(control + 56, release)
+    ablaRuntimeStoreI64(control + 64, drop)
+    ablaRuntimeStoreI64(control + 72, 0)
+    ablaRuntimeStoreI64(control + 80, 0)
+    if (!__ablaRuntimePlatformThreadCreate(
+        control + 72, entry, control
+    )) ablaRuntimeTrap()
+    ablaRuntimeMakeValue(13, 0, control, 0)
+}
+
+trusted fun __ablaRuntimeThreadJoin(control: int): void {
+    if (ablaRuntimeLoadI64(control + 80) == 0) {
+        if (!__ablaRuntimePlatformThreadJoin(control + 72)) {
+            ablaRuntimeTrap()
+        }
+        ablaRuntimeStoreI64(control + 80, 1)
+    }
+}
+
+trusted fun __ablaRuntimeThreadDrop(handle: any): any {
+    val control = __ablaRuntimeSharedControl(handle, 13)
+    __ablaRuntimeThreadJoin(control)
+    __ablaRuntimeFree(control)
+    __ablaRuntimeVoid()
+}
+
+trusted fun __ablaRuntimeAwait(operation: any): any {
+    val tag = __ablaRuntimeTag(operation)
+    val control = __ablaRuntimeWord0(operation)
+    var result = __ablaRuntimeNull()
+    if (tag == 12) {
+        __ablaRuntimeDispatchClosure(control, control + 24)
+        __ablaRuntimeReleaseClosure(control)
+        result = __ablaRuntimeValueAt(control + 24)
+        __ablaRuntimeFree(control)
+    } else if (tag == 13) {
+        __ablaRuntimeThreadJoin(control)
+        result = __ablaRuntimeValueAt(control + 24)
+        __ablaRuntimeFree(control)
+    } else ablaRuntimeTrap()
+    result
+}
+
+trusted fun __ablaRuntimeNegate(value: any): any =
+    __ablaRuntimeI64(0 - __ablaRuntimeAsI64(value))
+
+trusted fun __ablaRuntimeNot(value: any): any =
+    __ablaRuntimeBool(!__ablaRuntimeAsBool(value))
+
+trusted fun __ablaRuntimeAdd(left: any, right: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeAsI64(left) + __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeSubtract(left: any, right: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeAsI64(left) - __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeMultiply(left: any, right: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeAsI64(left) * __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeDivide(left: any, right: any): any {
+    val leftAddress = ablaRuntimeValueAddress(left)
+    val rightAddress = ablaRuntimeValueAddress(right)
+    if (ablaRuntimeLoadI32(leftAddress) != 2 ||
+        ablaRuntimeLoadI32(rightAddress) != 2) ablaRuntimeTrap()
+    if (ablaRuntimeLoadI64(rightAddress + 8) == 0) ablaRuntimeTrap()
+    __ablaRuntimeI64(
+        ablaRuntimeLoadI64(leftAddress + 8) /
+        ablaRuntimeLoadI64(rightAddress + 8)
+    )
+}
+
+trusted fun __ablaRuntimeBitNot(value: any): any =
+    __ablaRuntimeI64(~__ablaRuntimeAsI64(value))
+
+trusted fun __ablaRuntimeBitAnd(left: any, right: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeAsI64(left) & __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeBitOr(left: any, right: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeAsI64(left) | __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeBitXor(left: any, right: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeAsI64(left) ^ __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeBitShiftLeft(left: any, right: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeAsI64(left) << __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeBitShiftRight(left: any, right: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeAsI64(left) >> __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeBitShiftRightUnsigned(
+    left: any,
+    right: any
+): any = __ablaRuntimeI64(
+    __ablaRuntimeAsI64(left) >>> __ablaRuntimeAsI64(right)
+)
+
+trusted fun __ablaRuntimeStringEqualBool(left: any, right: any): bool {
+    val leftLength = __ablaRuntimeStringLengthValue(left)
+    val rightLength = __ablaRuntimeStringLengthValue(right)
+    var equal = leftLength == rightLength
+    val leftData: int = if (equal && leftLength > 0) {
+        __ablaRuntimeStringData(left)
+    } else 0
+    val rightData: int = if (equal && rightLength > 0) {
+        __ablaRuntimeStringData(right)
+    } else 0
+    var index: int = 0
+    while (equal && index < leftLength) {
+        equal = ablaRuntimeLoadU8(leftData + index) ==
+            ablaRuntimeLoadU8(rightData + index)
+        index = index + 1
+    }
+    equal
+}
+
+trusted fun __ablaRuntimeEqual(left: any, right: any): any {
+    val leftTag: int = __ablaRuntimeTag(left)
+    val rightTag: int = __ablaRuntimeTag(right)
+    val equal: bool = if (leftTag != rightTag) false
+        else if (leftTag < 2) true
+        else if (leftTag == 4) __ablaRuntimeStringEqualBool(left, right)
+        else __ablaRuntimeWord0(left) == __ablaRuntimeWord0(right) &&
+            (leftTag != 5 ||
+             __ablaRuntimeWord1(left) == __ablaRuntimeWord1(right))
+    __ablaRuntimeBool(equal)
+}
+
+trusted fun __ablaRuntimeNotEqual(left: any, right: any): any =
+    __ablaRuntimeBool(!__ablaRuntimeAsBool(__ablaRuntimeEqual(left, right)))
+
+trusted fun __ablaRuntimeStringNotEqualBool(left: any, right: any): bool =
+    !__ablaRuntimeStringEqualBool(left, right)
+
+trusted fun __ablaRuntimeStringEqual(left: any, right: any): any =
+    __ablaRuntimeBool(__ablaRuntimeStringEqualBool(left, right))
+
+trusted fun __ablaRuntimeStringNotEqual(left: any, right: any): any =
+    __ablaRuntimeBool(!__ablaRuntimeStringEqualBool(left, right))
+
+trusted fun __ablaRuntimeLess(left: any, right: any): any =
+    __ablaRuntimeBool(
+        __ablaRuntimeAsI64(left) < __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeLessEqual(left: any, right: any): any =
+    __ablaRuntimeBool(
+        __ablaRuntimeAsI64(left) <= __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeGreater(left: any, right: any): any =
+    __ablaRuntimeBool(
+        __ablaRuntimeAsI64(left) > __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeGreaterEqual(left: any, right: any): any =
+    __ablaRuntimeBool(
+        __ablaRuntimeAsI64(left) >= __ablaRuntimeAsI64(right)
+    )
+
+trusted fun __ablaRuntimeStringLengthValue(value: any): int {
+    var length: int = 0
+    val data = __ablaRuntimeWord0(value)
+    val storage = __ablaRuntimeWord1(value)
+    if (data != 0) length = storage
+    else if (storage != 0) length = ablaRuntimeLoadI64(storage)
+    // The canonical empty string has neither static data nor rope storage.
+    length
+}
+
+trusted fun __ablaRuntimeCopyString(
+    value: any,
+    destination: int,
+    offset: int
+): int {
+    var written: int = offset
+    var capacity: int = 64
+    var stack = __ablaRuntimeAllocateLayout(capacity * 16, 0)
+    var count: int = 1
+    ablaRuntimeStoreI64(stack, __ablaRuntimeWord0(value))
+    ablaRuntimeStoreI64(stack + 8, __ablaRuntimeWord1(value))
+    while (count > 0) {
+        count = count - 1
+        val data = ablaRuntimeLoadI64(stack + count * 16)
+        val storage = ablaRuntimeLoadI64(stack + count * 16 + 8)
+        if (data != 0) {
+            var index: int = 0
+            while (index < storage) {
+                ablaRuntimeStoreU8(
+                    destination + written,
+                    ablaRuntimeLoadU8(data + index)
+                )
+                index = index + 1
+                written = written + 1
+            }
+        } else if (storage != 0) {
+            if (count + 2 > capacity) {
+                val nextCapacity = capacity * 2
+                val replacement = __ablaRuntimeAllocateLayout(
+                    nextCapacity * 16, 0
+                )
+                var index: int = 0
+                while (index < count * 16) {
+                    ablaRuntimeStoreU8(
+                        replacement + index,
+                        ablaRuntimeLoadU8(stack + index)
+                    )
+                    index = index + 1
+                }
+                __ablaRuntimeFree(stack)
+                stack = replacement
+                capacity = nextCapacity
+            }
+            // LIFO: push right first so left is flattened first.
+            ablaRuntimeStoreI64(
+                stack + count * 16,
+                ablaRuntimeLoadI64(storage + 24)
+            )
+            ablaRuntimeStoreI64(
+                stack + count * 16 + 8,
+                ablaRuntimeLoadI64(storage + 32)
+            )
+            count = count + 1
+            ablaRuntimeStoreI64(
+                stack + count * 16,
+                ablaRuntimeLoadI64(storage + 8)
+            )
+            ablaRuntimeStoreI64(
+                stack + count * 16 + 8,
+                ablaRuntimeLoadI64(storage + 16)
+            )
+            count = count + 1
+        }
+    }
+    __ablaRuntimeFree(stack)
+    written
+}
+
+trusted fun __ablaRuntimeStringDataSlow(value: any, rope: int): int {
+    val cached = ablaRuntimeLoadI64(rope + 40)
+    if (cached != 0) cached
+    else {
+        val length = ablaRuntimeLoadI64(rope)
+        val allocated = __ablaRuntimeAllocateLayout(length + 1, 1)
+        __ablaRuntimeCopyString(value, allocated, 0)
+        ablaRuntimeStoreU8(allocated + length, 0)
+        ablaRuntimeStoreI64(rope + 40, allocated)
+        allocated
+    }
+}
+
+// Keep the overwhelmingly common flat/static path small enough to inline.
+// Rope flattening remains an ordinary out-of-line Abla function so callers do
+// not duplicate allocation and recursive-copy machinery.
+trusted fun __ablaRuntimeStringData(value: any): int {
+    val direct: int = __ablaRuntimeWord0(value)
+    val rope: int = __ablaRuntimeWord1(value)
+    if (direct != 0 || rope == 0) direct
+    else __ablaRuntimeStringDataSlow(value, rope)
+}
+
+// Fill native iovec pairs from a flat or rope-backed string without
+// flattening it. The Linux networking layer owns the two fixed-capacity
+// buffers and performs the platform syscall; string layout and traversal stay
+// here with the rest of the all-Abla value runtime.
+trusted fun __ablaRuntimeStringWriteVectors(
+    value: any,
+    vectors: int,
+    pending: int,
+    maximum: int,
+    offset: int
+): int {
+    val length = __ablaRuntimeStringLengthValue(value)
+    if (maximum <= 0 || offset < 0 || offset > length) return -22
+    if (offset == length) return 0
+    var count = 0
+    var skipped = offset
+    var pendingCount = 1
+    ablaRuntimeStoreI64(pending, __ablaRuntimeWord0(value))
+    ablaRuntimeStoreI64(pending + 8, __ablaRuntimeWord1(value))
+    while (pendingCount > 0 && count < maximum) {
+        pendingCount = pendingCount - 1
+        var data = ablaRuntimeLoadI64(pending + pendingCount * 16)
+        val storage = ablaRuntimeLoadI64(
+            pending + pendingCount * 16 + 8
+        )
+        val currentLength = if (data != 0) storage
+            else if (storage != 0) ablaRuntimeLoadI64(storage)
+            else 0
+        if (skipped >= currentLength) skipped = skipped - currentLength
+        else {
+            if (data == 0 && storage != 0) {
+                data = ablaRuntimeLoadI64(storage + 40)
+            }
+            if (data != 0) {
+                ablaRuntimeStoreI64(
+                    vectors + count * 16, data + skipped
+                )
+                ablaRuntimeStoreI64(
+                    vectors + count * 16 + 8,
+                    currentLength - skipped
+                )
+                count = count + 1
+                skipped = 0
+            } else if (storage != 0 && pendingCount + 2 <= maximum) {
+                // LIFO: push right first so the left segment is emitted first.
+                ablaRuntimeStoreI64(
+                    pending + pendingCount * 16,
+                    ablaRuntimeLoadI64(storage + 24)
+                )
+                ablaRuntimeStoreI64(
+                    pending + pendingCount * 16 + 8,
+                    ablaRuntimeLoadI64(storage + 32)
+                )
+                pendingCount = pendingCount + 1
+                ablaRuntimeStoreI64(
+                    pending + pendingCount * 16,
+                    ablaRuntimeLoadI64(storage + 8)
+                )
+                ablaRuntimeStoreI64(
+                    pending + pendingCount * 16 + 8,
+                    ablaRuntimeLoadI64(storage + 16)
+                )
+                pendingCount = pendingCount + 1
+            } else return -7
+        }
+    }
+    if (pendingCount != 0 || count == 0) -7 else count
+}
+
+trusted fun __ablaRuntimeAsCString(value: any): int {
+    val length = __ablaRuntimeStringLengthValue(value)
+    val result = __ablaRuntimeAllocateLayout(length + 1, 1)
+    val source = if (length == 0) 0 else __ablaRuntimeStringData(value)
+    var index: int = 0
+    while (index < length) {
+        ablaRuntimeStoreU8(result + index, ablaRuntimeLoadU8(source + index))
+        index = index + 1
+    }
+    ablaRuntimeStoreU8(result + length, 0)
+    result
+}
+
+trusted fun __ablaRuntimeToString(value: any): any {
+    val tag = __ablaRuntimeTag(value)
+    var result: any = value
+    if (tag == 1) result = "null"
+    if (tag == 3) {
+        if (__ablaRuntimeAsBool(value)) result = "true"
+        else result = "false"
+    }
+    if (tag == 2) {
+        val buffer = __ablaRuntimeAllocateLayout(32, 1)
+        var cursor: int = 31
+        var number: int = __ablaRuntimeAsI64(value)
+        val negative = number < 0
+        if (number > 0) number = 0 - number
+        if (number == 0) {
+            cursor = cursor - 1
+            ablaRuntimeStoreU8(buffer + cursor, 48)
+        }
+        while (number < 0) {
+            val quotient = number / 10
+            val digit = 0 - (number - quotient * 10)
+            cursor = cursor - 1
+            ablaRuntimeStoreU8(buffer + cursor, 48 + digit)
+            number = quotient
+        }
+        if (negative) {
+            cursor = cursor - 1
+            ablaRuntimeStoreU8(buffer + cursor, 45)
+        }
+        result = __ablaRuntimeStringStatic(buffer + cursor, 31 - cursor)
+    }
+    if (tag != 1 && tag != 2 && tag != 3 && tag != 4) ablaRuntimeTrap()
+    result
+}
+
+trusted fun __ablaRuntimeStringConcat(left: any, right: any): any {
+    val leftLength = __ablaRuntimeStringLengthValue(left)
+    val rightLength = __ablaRuntimeStringLengthValue(right)
+    if (leftLength == 0) right
+    else if (rightLength == 0) left
+    else {
+        val rope = __ablaRuntimeAllocateLayout(48, 6)
+        ablaRuntimeStoreI64(rope, leftLength + rightLength)
+        ablaRuntimeStoreI64(rope + 8, __ablaRuntimeWord0(left))
+        ablaRuntimeStoreI64(rope + 16, __ablaRuntimeWord1(left))
+        ablaRuntimeStoreI64(rope + 24, __ablaRuntimeWord0(right))
+        ablaRuntimeStoreI64(rope + 32, __ablaRuntimeWord1(right))
+        ablaRuntimeStoreI64(rope + 40, 0)
+        ablaRuntimeMakeValue(4, 0, 0, rope)
+    }
+}
+
+trusted fun __ablaRuntimeStringLengthI64(value: any): int =
+    __ablaRuntimeStringLengthValue(value)
+
+trusted fun __ablaRuntimeStringLength(value: any): any =
+    __ablaRuntimeI64(__ablaRuntimeStringLengthValue(value))
+
+trusted fun __ablaRuntimeStringGetI64(value: any, index: int): int {
+    val length = __ablaRuntimeStringLengthValue(value)
+    if (index < 0 || index >= length) {
+        ablaRuntimeTrap()
+        0
+    } else ablaRuntimeLoadU8(__ablaRuntimeStringData(value) + index)
+}
+
+trusted fun __ablaRuntimeStringGet(value: any, index: any): any =
+    __ablaRuntimeI64(
+        __ablaRuntimeStringGetI64(value, __ablaRuntimeAsI64(index))
+    )
+
+trusted fun __ablaRuntimeStringSlice(
+    value: any,
+    beginValue: any,
+    endValue: any
+): any {
+    val begin = __ablaRuntimeAsI64(beginValue)
+    val end = __ablaRuntimeAsI64(endValue)
+    val length = __ablaRuntimeStringLengthValue(value)
+    if (begin < 0 || end < begin || end > length) {
+        ablaRuntimeTrap()
+        __ablaRuntimeStringStatic(0, 0)
+    } else if (begin == 0 && end == length) value
+    else if (begin == end) __ablaRuntimeStringStatic(0, 0)
+    else __ablaRuntimeStringStatic(
+            __ablaRuntimeStringData(value) + begin,
+            end - begin
+        )
+}
+
+trusted fun __ablaRuntimeByteEncode(value: int): any {
+    var result: any = ""
+    if (value >= 0 && value <= 255) {
+        val data = __ablaRuntimeAllocateLayout(2, 1)
+        ablaRuntimeStoreU8(data, value)
+        ablaRuntimeStoreU8(data + 1, 0)
+        result = __ablaRuntimeStringStatic(data, 1)
+    }
+    result
+}
+
+@inline
+trusted fun __ablaRuntimeBase64Digit(value: int): int {
+    if (value < 26) value + 65
+    else if (value < 52) value + 71
+    else if (value < 62) value - 4
+    else if (value == 62) 43
+    else 47
+}
+
+// Base64 is emitted directly into one owned string allocation. Keeping this
+// implementation in Abla avoids the tiny-slice and rope churn of the portable
+// staged algorithm without introducing a C/runtime-library dependency.
+trusted fun __ablaRuntimeBase64Encode(value: string): any {
+    val length: int = __ablaRuntimeStringLengthValue(value)
+    if (length == 0) return ""
+    val outputLength: int = ((length + 2) / 3) * 4
+    val output: int = __ablaRuntimeAllocateLayout(outputLength + 1, 1)
+    val input: int = __ablaRuntimeStringData(value)
+    var source: int = 0
+    var destination: int = 0
+    while (source < length) {
+        val remaining: int = length - source
+        val first: int = ablaRuntimeLoadU8(input + source)
+        val second: int = if (remaining > 1) {
+            ablaRuntimeLoadU8(input + source + 1)
+        } else 0
+        val third: int = if (remaining > 2) {
+            ablaRuntimeLoadU8(input + source + 2)
+        } else 0
+        val combined: int = (first << 16) | (second << 8) | third
+        ablaRuntimeStoreU8(
+            output + destination,
+            __ablaRuntimeBase64Digit((combined >>> 18) & 63)
+        )
+        ablaRuntimeStoreU8(
+            output + destination + 1,
+            __ablaRuntimeBase64Digit((combined >>> 12) & 63)
+        )
+        ablaRuntimeStoreU8(
+            output + destination + 2,
+            if (remaining > 1) {
+                __ablaRuntimeBase64Digit((combined >>> 6) & 63)
+            } else 61
+        )
+        ablaRuntimeStoreU8(
+            output + destination + 3,
+            if (remaining > 2) {
+                __ablaRuntimeBase64Digit(combined & 63)
+            } else 61
+        )
+        source = source + 3
+        destination = destination + 4
+    }
+    ablaRuntimeStoreU8(output + outputLength, 0)
+    __ablaRuntimeStringStatic(output, outputLength)
+}
+
+@inline
+trusted fun __ablaRuntimeBase64DecodeDigit(value: int): int {
+    if (value >= 65 && value <= 90) value - 65
+    else if (value >= 97 && value <= 122) value - 71
+    else if (value >= 48 && value <= 57) value + 4
+    else if (value == 43) 62
+    else if (value == 47) 63
+    else -1
+}
+
+trusted fun __ablaRuntimeBase64Decode(value: string): any {
+    val length: int = __ablaRuntimeStringLengthValue(value)
+    if (length == 0 || (length & 3) != 0) return ""
+    val input: int = __ablaRuntimeStringData(value)
+    val padded2: bool = ablaRuntimeLoadU8(input + length - 2) == 61
+    val padded3: bool = ablaRuntimeLoadU8(input + length - 1) == 61
+    val outputLength: int = (length / 4) * 3 -
+        (if (padded3) 1 else 0) - (if (padded2) 1 else 0)
+    val output: int = __ablaRuntimeAllocateLayout(outputLength + 1, 1)
+    var source: int = 0
+    var destination: int = 0
+    var valid: bool = true
+    while (valid && source < length) {
+        val byte2: int = ablaRuntimeLoadU8(input + source + 2)
+        val byte3: int = ablaRuntimeLoadU8(input + source + 3)
+        val groupPadded2: bool = byte2 == 61
+        val groupPadded3: bool = byte3 == 61
+        val a: int = __ablaRuntimeBase64DecodeDigit(
+            ablaRuntimeLoadU8(input + source)
+        )
+        val b: int = __ablaRuntimeBase64DecodeDigit(
+            ablaRuntimeLoadU8(input + source + 1)
+        )
+        val c: int = if (groupPadded2) 0
+            else __ablaRuntimeBase64DecodeDigit(byte2)
+        val d: int = if (groupPadded3) 0
+            else __ablaRuntimeBase64DecodeDigit(byte3)
+        valid = a >= 0 && b >= 0 && c >= 0 && d >= 0 &&
+            (!groupPadded2 || groupPadded3) &&
+            (!(groupPadded2 || groupPadded3) || source + 4 == length)
+        if (valid) {
+            val combined: int = (a << 18) | (b << 12) | (c << 6) | d
+            ablaRuntimeStoreU8(
+                output + destination, (combined >>> 16) & 255
+            )
+            destination = destination + 1
+            if (!groupPadded2) {
+                ablaRuntimeStoreU8(
+                    output + destination, (combined >>> 8) & 255
+                )
+                destination = destination + 1
+            }
+            if (!groupPadded3) {
+                ablaRuntimeStoreU8(output + destination, combined & 255)
+                destination = destination + 1
+            }
+        }
+        source = source + 4
+    }
+    if (valid && destination == outputLength) {
+        ablaRuntimeStoreU8(output + outputLength, 0)
+        __ablaRuntimeStringStatic(output, outputLength)
+    } else {
+        __ablaRuntimeFree(output)
+        ""
+    }
+}
+
+// Flatten immutable byte chunks into exactly one owned allocation. ByteBuffer
+// remains an ordinary phase-safe Abla class; only the final contiguous storage
+// operation lives at the raw-memory runtime boundary.
+trusted fun __ablaRuntimeByteChunksJoin(
+    chunks: array<string>,
+    byteCount: int
+): any {
+    if (byteCount < 0) {
+        ablaRuntimeTrap()
+        return ""
+    }
+    if (byteCount == 0) return ""
+    val output: int = __ablaRuntimeAllocateLayout(byteCount + 1, 1)
+    var destination: int = 0
+    var index: int = 0
+    while (index < chunks.size) {
+        val chunk: string = chunks[index]
+        val length: int = __ablaRuntimeStringLengthValue(chunk)
+        if (length < 0 || length > byteCount - destination) {
+            ablaRuntimeTrap()
+            return ""
+        }
+        val source: int = if (length == 0) 0
+            else __ablaRuntimeStringData(chunk)
+        var offset: int = 0
+        while (offset < length) {
+            ablaRuntimeStoreU8(
+                output + destination + offset,
+                ablaRuntimeLoadU8(source + offset)
+            )
+            offset = offset + 1
+        }
+        destination = destination + length
+        index = index + 1
+    }
+    if (destination != byteCount) {
+        ablaRuntimeTrap()
+        return ""
+    }
+    ablaRuntimeStoreU8(output + byteCount, 0)
+    __ablaRuntimeStringStatic(output, byteCount)
+}
+
+trusted fun __ablaRuntimeUtf8EncodeScalar(value: int): any {
+    var length: int = 0
+    if (value >= 0 && value <= 127) length = 1
+    if (value >= 128 && value <= 2047) length = 2
+    if (value >= 2048 && value <= 65535 &&
+        (value < 55296 || value > 57343)) length = 3
+    if (value >= 65536 && value <= 1114111) length = 4
+    var result: any = ""
+    if (length > 0) {
+        val data = __ablaRuntimeAllocateLayout(length + 1, 1)
+        if (length == 1) ablaRuntimeStoreU8(data, value)
+        if (length == 2) {
+            ablaRuntimeStoreU8(data, 192 | (value >> 6))
+            ablaRuntimeStoreU8(data + 1, 128 | (value & 63))
+        }
+        if (length == 3) {
+            ablaRuntimeStoreU8(data, 224 | (value >> 12))
+            ablaRuntimeStoreU8(data + 1, 128 | ((value >> 6) & 63))
+            ablaRuntimeStoreU8(data + 2, 128 | (value & 63))
+        }
+        if (length == 4) {
+            ablaRuntimeStoreU8(data, 240 | (value >> 18))
+            ablaRuntimeStoreU8(data + 1, 128 | ((value >> 12) & 63))
+            ablaRuntimeStoreU8(data + 2, 128 | ((value >> 6) & 63))
+            ablaRuntimeStoreU8(data + 3, 128 | (value & 63))
+        }
+        ablaRuntimeStoreU8(data + length, 0)
+        result = __ablaRuntimeStringStatic(data, length)
+    }
+    result
+}
+
+// Arrays use the native 64-bit header layout on every target: length,
+// capacity, and values pointer. This makes the runtime ABI deterministic and
+// keeps the same optimized layout used by native Abla Web services.
+trusted fun __ablaRuntimeArrayCreate(values: int, count: int): any {
+    if (count < 0) ablaRuntimeTrap()
+    val array = __ablaRuntimeAllocateLayout(24 + count * 24, 4)
+    val destination = if (count == 0) 0 else array + 24
+    ablaRuntimeStoreI64(array, count)
+    ablaRuntimeStoreI64(array + 8, count)
+    ablaRuntimeStoreI64(array + 16, destination)
+    var index: int = 0
+    while (index < count) {
+        val source = values + index * 24
+        ablaRuntimeStoreI64(destination + index * 24, ablaRuntimeLoadI64(source))
+        ablaRuntimeStoreI64(
+            destination + index * 24 + 8,
+            ablaRuntimeLoadI64(source + 8)
+        )
+        ablaRuntimeStoreI64(
+            destination + index * 24 + 16,
+            ablaRuntimeLoadI64(source + 16)
+        )
+        index = index + 1
+    }
+    ablaRuntimeMakeValue(7, 0, array, 0)
+}
+
+trusted fun __ablaRuntimeArrayAddress(value: any): int {
+    val array = __ablaRuntimeWord0(value)
+    if (array == 0) ablaRuntimeTrap()
+    array
+}
+
+trusted fun __ablaRuntimeArrayLengthI64(value: any): int =
+    ablaRuntimeLoadI64(__ablaRuntimeArrayAddress(value))
+
+trusted fun __ablaRuntimeArrayLength(value: any): any =
+    __ablaRuntimeI64(__ablaRuntimeArrayLengthI64(value))
+
+trusted fun __ablaRuntimeArrayValueAddress(value: any, index: int): int {
+    val array = __ablaRuntimeArrayAddress(value)
+    val length = ablaRuntimeLoadI64(array)
+    if (index < 0 || index >= length) {
+        ablaRuntimeTrap()
+        0
+    } else ablaRuntimeLoadI64(array + 16) + index * 24
+}
+
+trusted fun __ablaRuntimeArrayAppend(value: any, element: any): any {
+    val array = __ablaRuntimeArrayAddress(value)
+    val length = ablaRuntimeLoadI64(array)
+    val capacity = ablaRuntimeLoadI64(array + 8)
+    var values: int = ablaRuntimeLoadI64(array + 16)
+    if (length == capacity) {
+        val next = if (capacity == 0) 4 else capacity * 2
+        val replacement = __ablaRuntimeAllocateLayout(next * 24, 2)
+        var index: int = 0
+        while (index < length) {
+            ablaRuntimeStoreI64(
+                replacement + index * 24,
+                ablaRuntimeLoadI64(values + index * 24)
+            )
+            ablaRuntimeStoreI64(
+                replacement + index * 24 + 8,
+                ablaRuntimeLoadI64(values + index * 24 + 8)
+            )
+            ablaRuntimeStoreI64(
+                replacement + index * 24 + 16,
+                ablaRuntimeLoadI64(values + index * 24 + 16)
+            )
+            index = index + 1
+        }
+        if (values != 0 && values != array + 24) {
+            __ablaRuntimeFree(values)
+        }
+        values = replacement
+        ablaRuntimeStoreI64(array + 8, next)
+        ablaRuntimeStoreI64(array + 16, values)
+    }
+    __ablaRuntimeCopyValue(element, values + length * 24)
+    ablaRuntimeStoreI64(array, length + 1)
+    __ablaRuntimeVoid()
+}
+
+trusted fun __ablaRuntimeArrayGet(value: any, indexValue: any): any =
+    __ablaRuntimeValueAt(
+        __ablaRuntimeArrayValueAddress(value, __ablaRuntimeAsI64(indexValue))
+    )
+
+trusted fun __ablaRuntimeArrayGetI64(value: any, index: int): int {
+    val element = __ablaRuntimeArrayValueAddress(value, index)
+    if (ablaRuntimeLoadI32(element) != 2) ablaRuntimeTrap()
+    ablaRuntimeLoadI64(element + 8)
+}
+
+trusted fun __ablaRuntimeArrayGetBool(value: any, index: int): bool {
+    val element = __ablaRuntimeArrayValueAddress(value, index)
+    if (ablaRuntimeLoadI32(element) != 3) ablaRuntimeTrap()
+    ablaRuntimeLoadI64(element + 8) != 0
+}
+
+trusted fun __ablaRuntimeIndexGet(value: any, index: any): any {
+    val tag = __ablaRuntimeTag(value)
+    if (tag == 4) __ablaRuntimeStringGet(value, index)
+    else if (tag == 7) __ablaRuntimeArrayGet(value, index)
+    else {
+        ablaRuntimeTrap()
+        __ablaRuntimeNull()
+    }
+}
+
+trusted fun __ablaRuntimeArraySet(
+    value: any,
+    indexValue: any,
+    element: any
+): int {
+    __ablaRuntimeCopyValue(
+        element,
+        __ablaRuntimeArrayValueAddress(value, __ablaRuntimeAsI64(indexValue))
+    )
+    0
+}
+
+trusted fun __ablaRuntimeObjectCreate(typeSymbol: int, count: int): any {
+    if (count < 0) ablaRuntimeTrap()
+    val object = __ablaRuntimeAllocateLayout(32 + count * 32, 5)
+    ablaRuntimeStoreI32(object, typeSymbol)
+    ablaRuntimeStoreI64(object + 8, 0)
+    ablaRuntimeStoreI64(object + 16, count)
+    ablaRuntimeStoreI64(object + 24, if (count == 0) 0 else object + 32)
+    ablaRuntimeMakeValue(8, 0, object, 0)
+}
+
+trusted fun __ablaRuntimeObjectAddress(value: any): int {
+    if (!__ablaRuntimeRequire(value, 8)) 0 else __ablaRuntimeWord0(value)
+}
+
+trusted fun __ablaRuntimeFieldAddressScan(
+    fields: int,
+    count: int,
+    symbol: int,
+    begin: int
+): int {
+    var index: int = begin
+    while (index < count) {
+        val address: int = fields + index * 32
+        if (ablaRuntimeLoadI32(address) == symbol) return address
+        index = index + 1
+    }
+    ablaRuntimeTrap()
+    0
+}
+
+trusted fun __ablaRuntimeFieldAddress(
+    value: any,
+    symbol: int,
+    preferred: int
+): int {
+    val object: int = __ablaRuntimeObjectAddress(value)
+    val count: int = ablaRuntimeLoadI64(object + 8)
+    val fields: int = ablaRuntimeLoadI64(object + 24)
+    val preferredMatches: bool = preferred >= 0 && preferred < count &&
+        ablaRuntimeLoadI32(fields + preferred * 32) == symbol
+    if (preferredMatches) fields + preferred * 32
+    else __ablaRuntimeFieldAddressScan(fields, count, symbol, 0)
+}
+
+trusted fun __ablaRuntimeFieldGet(value: any, symbol: int): any =
+    __ablaRuntimeValueAt(__ablaRuntimeFieldAddress(value, symbol, -1) + 8)
+
+trusted fun __ablaRuntimeFieldGetIndexed(
+    value: any,
+    symbol: int,
+    index: int
+): any = __ablaRuntimeValueAt(
+    __ablaRuntimeFieldAddressIndexed(value, index) + 8
+)
+
+// Typed IR supplies the declaration-order index for scalar class fields. Such
+// fields cannot move or be added dynamically, so do not rescan their symbols
+// and rebuild a universal value on every cursor/count/flag access.
+trusted fun __ablaRuntimeFieldAddressIndexed(
+    value: any,
+    index: int
+): int {
+    val object = __ablaRuntimeWord0(value)
+    if (object == 0 || index < 0) ablaRuntimeTrap()
+    ablaRuntimeLoadI64(object + 24) + index * 32
+}
+
+trusted fun __ablaRuntimeFieldGetIndexedI64(
+    value: any,
+    symbol: int,
+    index: int
+): int {
+    val field = __ablaRuntimeFieldAddressIndexed(value, index)
+    if (ablaRuntimeLoadI32(field + 8) != 2) ablaRuntimeTrap()
+    ablaRuntimeLoadI64(field + 16)
+}
+
+trusted fun __ablaRuntimeFieldGetIndexedBool(
+    value: any,
+    symbol: int,
+    index: int
+): bool {
+    val field = __ablaRuntimeFieldAddressIndexed(value, index)
+    if (ablaRuntimeLoadI32(field + 8) != 3) ablaRuntimeTrap()
+    ablaRuntimeLoadI64(field + 16) != 0
+}
+
+trusted fun __ablaRuntimeFieldInitialize(
+    value: any,
+    symbol: int,
+    fieldValue: any
+): int {
+    val object = __ablaRuntimeObjectAddress(value)
+    val count = ablaRuntimeLoadI64(object + 8)
+    val capacity = ablaRuntimeLoadI64(object + 16)
+    if (count >= capacity) ablaRuntimeTrap()
+    val field = ablaRuntimeLoadI64(object + 24) + count * 32
+    ablaRuntimeStoreI32(field, symbol)
+    __ablaRuntimeCopyValue(fieldValue, field + 8)
+    ablaRuntimeStoreI64(object + 8, count + 1)
+    0
+}
+
+trusted fun __ablaRuntimeFieldSet(
+    value: any,
+    symbol: int,
+    fieldValue: any
+): int {
+    val object = __ablaRuntimeObjectAddress(value)
+    val count = ablaRuntimeLoadI64(object + 8)
+    var capacity: int = ablaRuntimeLoadI64(object + 16)
+    var fields: int = ablaRuntimeLoadI64(object + 24)
+    var field: int = 0
+    var index: int = 0
+    while (field == 0 && index < count) {
+        if (ablaRuntimeLoadI32(fields + index * 32) == symbol) {
+            field = fields + index * 32
+        }
+        index = index + 1
+    }
+    if (field == 0) {
+        if (count == capacity) {
+            val next = if (capacity == 0) 4 else capacity * 2
+            val replacement = __ablaRuntimeAllocateLayout(next * 32, 3)
+            index = 0
+            while (index < count) {
+                var word: int = 0
+                while (word < 4) {
+                    ablaRuntimeStoreI64(
+                        replacement + index * 32 + word * 8,
+                        ablaRuntimeLoadI64(fields + index * 32 + word * 8)
+                    )
+                    word = word + 1
+                }
+                index = index + 1
+            }
+            if (fields != 0 && fields != object + 32) {
+                __ablaRuntimeFree(fields)
+            }
+            fields = replacement
+            capacity = next
+            ablaRuntimeStoreI64(object + 16, capacity)
+            ablaRuntimeStoreI64(object + 24, fields)
+        }
+        field = fields + count * 32
+        ablaRuntimeStoreI32(field, symbol)
+        ablaRuntimeStoreI64(object + 8, count + 1)
+    }
+    __ablaRuntimeCopyValue(fieldValue, field + 8)
+    0
+}
+
+trusted fun __ablaRuntimeFieldSetIndexed(
+    value: any,
+    symbol: int,
+    index: int,
+    fieldValue: any
+): int {
+    val field = __ablaRuntimeFieldAddressIndexed(value, index)
+    __ablaRuntimeCopyValue(fieldValue, field + 8)
+    0
+}
+
+trusted fun __ablaRuntimeFieldSetIndexedI64(
+    value: any,
+    symbol: int,
+    index: int,
+    fieldValue: int
+): int {
+    val field = __ablaRuntimeFieldAddressIndexed(value, index)
+    ablaRuntimeStoreI32(field + 8, 2)
+    ablaRuntimeStoreI32(field + 12, 0)
+    ablaRuntimeStoreI64(field + 16, fieldValue)
+    ablaRuntimeStoreI64(field + 24, 0)
+    0
+}
+
+trusted fun __ablaRuntimeFieldSetIndexedBool(
+    value: any,
+    symbol: int,
+    index: int,
+    fieldValue: bool
+): int {
+    val field = __ablaRuntimeFieldAddressIndexed(value, index)
+    ablaRuntimeStoreI32(field + 8, 3)
+    ablaRuntimeStoreI32(field + 12, 0)
+    ablaRuntimeStoreI64(field + 16, if (fieldValue) 1 else 0)
+    ablaRuntimeStoreI64(field + 24, 0)
+    0
+}
+
+trusted fun __ablaRuntimeJsonStringIsPlain(value: string): bool {
+    val size = __ablaRuntimeStringLengthValue(value)
+    val data = if (size == 0) 0 else __ablaRuntimeStringData(value)
+    var offset = 0
+    var plain = true
+    while (plain && offset < size) {
+        val lead = ablaRuntimeLoadU8(data + offset)
+        if (lead == 34 || lead == 92 || lead < 32) plain = false
+        else if (lead < 128) offset = offset + 1
+        else {
+            var count = 0
+            if (lead >= 194 && lead <= 223) count = 2
+            if (lead >= 224 && lead <= 239) count = 3
+            if (lead >= 240 && lead <= 244) count = 4
+            plain = count > 0 && offset + count <= size
+            var index = 1
+            while (plain && index < count) {
+                val byte = ablaRuntimeLoadU8(data + offset + index)
+                plain = byte >= 128 && byte <= 191
+                index = index + 1
+            }
+            if (plain && count == 3 && lead == 224) {
+                plain = ablaRuntimeLoadU8(data + offset + 1) >= 160
+            }
+            if (plain && count == 3 && lead == 237) {
+                plain = ablaRuntimeLoadU8(data + offset + 1) <= 159
+            }
+            if (plain && count == 4 && lead == 240) {
+                plain = ablaRuntimeLoadU8(data + offset + 1) >= 144
+            }
+            if (plain && count == 4 && lead == 244) {
+                plain = ablaRuntimeLoadU8(data + offset + 1) <= 143
+            }
+            if (plain) offset = offset + count
+        }
+    }
+    plain
+}
+
+trusted fun __ablaRuntimeJsonFindPlainStringEnd(
+    value: string,
+    begin: int,
+    end: int
+): int {
+    val size = __ablaRuntimeStringLengthValue(value)
+    if (begin < 0 || end < begin || end > size) return -1
+    val data = if (size == 0) 0 else __ablaRuntimeStringData(value)
+    var offset = begin
+    var found = -1
+    var plain = true
+    while (plain && found < 0 && offset < end) {
+        val lead = ablaRuntimeLoadU8(data + offset)
+        if (lead == 34) found = offset
+        else if (lead == 92 || lead < 32) plain = false
+        else if (lead < 128) offset = offset + 1
+        else {
+            var count = 0
+            if (lead >= 194 && lead <= 223) count = 2
+            if (lead >= 224 && lead <= 239) count = 3
+            if (lead >= 240 && lead <= 244) count = 4
+            plain = count > 0 && offset + count <= end
+            var index = 1
+            while (plain && index < count) {
+                val byte = ablaRuntimeLoadU8(data + offset + index)
+                plain = byte >= 128 && byte <= 191
+                index = index + 1
+            }
+            if (plain && count == 3 && lead == 224) {
+                plain = ablaRuntimeLoadU8(data + offset + 1) >= 160
+            }
+            if (plain && count == 3 && lead == 237) {
+                plain = ablaRuntimeLoadU8(data + offset + 1) <= 159
+            }
+            if (plain && count == 4 && lead == 240) {
+                plain = ablaRuntimeLoadU8(data + offset + 1) >= 144
+            }
+            if (plain && count == 4 && lead == 244) {
+                plain = ablaRuntimeLoadU8(data + offset + 1) <= 143
+            }
+            if (plain) offset = offset + count
+        }
+    }
+    found
+}
+
+trusted fun __ablaRuntimeTextFindSequence(
     text: string,
     sequence: string,
     begin: int,
     end: int
 ): int {
-    var result = -1
-    if (begin >= 0 && end >= begin && end <= text.size) {
-        if (sequence.size == 0) result = begin
-        var index = begin
-        while (result < 0 && sequence.size > 0 &&
-            index + sequence.size <= end) {
-            var equal = true
-            var offset = 0
-            while (equal && offset < sequence.size) {
-                equal = text[index + offset] == sequence[offset]
-                offset = offset + 1
-            }
-            if (equal) result = index
+    val textLength: int = __ablaRuntimeStringLengthValue(text)
+    val sequenceLength: int = __ablaRuntimeStringLengthValue(sequence)
+    if (begin < 0 || end < begin || end > textLength) return -1
+    if (sequenceLength == 0) return begin
+    if (sequenceLength > end - begin) return -1
+
+    val textData: int = __ablaRuntimeStringData(text)
+    val sequenceData: int = __ablaRuntimeStringData(sequence)
+    val first: int = ablaRuntimeLoadU8(sequenceData)
+    val last: int = end - sequenceLength
+    var index: int = begin
+
+    if (sequenceLength == 1) {
+        while (index <= last) {
+            if (ablaRuntimeLoadU8(textData + index) == first) return index
             index = index + 1
         }
+        return -1
     }
-    result
+
+    if (sequenceLength == 2) {
+        val second: int = ablaRuntimeLoadU8(sequenceData + 1)
+        while (index <= last) {
+            if (ablaRuntimeLoadU8(textData + index) == first &&
+                ablaRuntimeLoadU8(textData + index + 1) == second) return index
+            index = index + 1
+        }
+        return -1
+    }
+
+    if (sequenceLength == 4) {
+        val second: int = ablaRuntimeLoadU8(sequenceData + 1)
+        val third: int = ablaRuntimeLoadU8(sequenceData + 2)
+        val fourth: int = ablaRuntimeLoadU8(sequenceData + 3)
+        while (index <= last) {
+            if (ablaRuntimeLoadU8(textData + index) == first &&
+                ablaRuntimeLoadU8(textData + index + 1) == second &&
+                ablaRuntimeLoadU8(textData + index + 2) == third &&
+                ablaRuntimeLoadU8(textData + index + 3) == fourth) return index
+            index = index + 1
+        }
+        return -1
+    }
+
+    while (index <= last) {
+        if (ablaRuntimeLoadU8(textData + index) == first) {
+            var equal: bool = true
+            var offset: int = 1
+            while (equal && offset < sequenceLength) {
+                equal = ablaRuntimeLoadU8(textData + index + offset) ==
+                    ablaRuntimeLoadU8(sequenceData + offset)
+                offset = offset + 1
+            }
+            if (equal) return index
+        }
+        index = index + 1
+    }
+    -1
 }
 
-fun __ablaRuntimeTextFindByte(
+trusted fun __ablaRuntimeTextFindByte(
     text: string,
     byte: int,
     begin: int,
     end: int
 ): int {
-    var result = -1
-    if (byte >= 0 && byte <= 255 && begin >= 0 && end >= begin &&
-        end <= text.size) {
-        var index = begin
-        while (result < 0 && index < end) {
-            if (text[index] == byte) result = index
-            index = index + 1
-        }
+    val textLength: int = __ablaRuntimeStringLengthValue(text)
+    if (byte < 0 || byte > 255 || begin < 0 || end < begin ||
+        end > textLength) return -1
+    if (begin == end) return -1
+    val data: int = __ablaRuntimeStringData(text)
+    var index: int = begin
+    while (index < end) {
+        if (ablaRuntimeLoadU8(data + index) == byte) return index
+        index = index + 1
     }
-    result
+    -1
 }
 
-fun __ablaRuntimeTextAsciiEqualInsensitive(
+trusted fun __ablaRuntimeTextAsciiEqualInsensitive(
     left: string,
     right: string
 ): bool {
-    var equal = left.size == right.size
-    var index = 0
-    while (equal && index < left.size) {
-        var leftByte = left[index]
-        var rightByte = right[index]
+    val leftLength: int = __ablaRuntimeStringLengthValue(left)
+    val rightLength: int = __ablaRuntimeStringLengthValue(right)
+    val leftData: int = if (leftLength == 0) 0
+        else __ablaRuntimeStringData(left)
+    val rightData: int = if (rightLength == 0) 0
+        else __ablaRuntimeStringData(right)
+    var equal: bool = leftLength == rightLength
+    var index: int = 0
+    while (equal && index < leftLength) {
+        var leftByte: int = ablaRuntimeLoadU8(leftData + index)
+        var rightByte: int = ablaRuntimeLoadU8(rightData + index)
         if (leftByte >= 65 && leftByte <= 90) leftByte = leftByte + 32
         if (rightByte >= 65 && rightByte <= 90) rightByte = rightByte + 32
         equal = leftByte == rightByte
@@ -63,31 +1633,38 @@ fun __ablaRuntimeTextAsciiEqualInsensitive(
     equal
 }
 
-fun __ablaRuntimeTextReadU32LittleEndian(text: string, offset: int): int {
-    var result = -1
-    if (offset >= 0 && offset + 4 <= text.size) {
-        result = text[offset] |
-            (text[offset + 1] << 8) |
-            (text[offset + 2] << 16) |
-            (text[offset + 3] << 24)
+trusted fun __ablaRuntimeTextReadU32LittleEndian(
+    text: string,
+    offset: int
+): int {
+    var result: int = -1
+    val length: int = __ablaRuntimeStringLengthValue(text)
+    if (offset >= 0 && offset + 4 <= length) {
+        val data: int = __ablaRuntimeStringData(text) + offset
+        result = ablaRuntimeLoadU8(data) |
+            (ablaRuntimeLoadU8(data + 1) << 8) |
+            (ablaRuntimeLoadU8(data + 2) << 16) |
+            (ablaRuntimeLoadU8(data + 3) << 24)
     }
     result
 }
 
-fun __ablaRuntimeTextIsValidUtf8(text: string): bool {
-    var valid = true
-    var offset = 0
-    while (valid && offset < text.size) {
-        val lead = text[offset]
-        var count = 0
+trusted fun __ablaRuntimeTextIsValidUtf8(text: string): bool {
+    var valid: bool = true
+    val length: int = __ablaRuntimeStringLengthValue(text)
+    val data: int = if (length == 0) 0 else __ablaRuntimeStringData(text)
+    var offset: int = 0
+    while (valid && offset < length) {
+        val lead: int = ablaRuntimeLoadU8(data + offset)
+        var count: int = 0
         if (lead <= 127) count = 1
         if (lead >= 194 && lead <= 223) count = 2
         if (lead >= 224 && lead <= 239) count = 3
         if (lead >= 240 && lead <= 244) count = 4
-        valid = count > 0 && offset + count <= text.size
-        var index = 1
+        valid = count > 0 && offset + count <= length
+        var index: int = 1
         while (valid && index < count) {
-            val byte = text[offset + index]
+            val byte: int = ablaRuntimeLoadU8(data + offset + index)
             valid = byte >= 128 && byte <= 191
             index = index + 1
         }

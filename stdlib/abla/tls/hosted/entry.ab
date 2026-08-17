@@ -1,12 +1,50 @@
-// Certificate-verified hosted TLS client. The host adapter dynamically loads
-// OpenSSL 1.1+/3 so importing the module is optional and ordinary/raw programs
-// do not acquire a TLS dependency.
+// Certificate-verified TLS implemented in Abla over the raw Linux networking
+// package. OpenSSL is a platform-library boundary, like libc and pthreads; no
+// C runtime source or host-value adapter participates in this path.
 
-import "abla/platform/host"
+import "openssl.ab"
+import "abla/dns"
+import "abla/sys/linux/net"
+import "abla/unsafe/memory"
+
+var hostedTlsError: string = ""
+
+// Connection control: context pointer, SSL pointer, descriptor, owns-context.
+// Listener control: context pointer, descriptor.
+trusted fun tlsAllocateConnection(
+    context: i64*,
+    session: i64*,
+    descriptor: int,
+    ownsContext: bool
+): int {
+    val control = ablaUnsafeAllocate(32)
+    ablaUnsafeStorePointer(control, context)
+    ablaUnsafeStorePointer(ablaUnsafePointerOffset(control, 8), session)
+    ablaUnsafeStoreI64(ablaUnsafePointerOffset(control, 16), descriptor)
+    ablaUnsafeStoreI64(
+        ablaUnsafePointerOffset(control, 24), if (ownsContext) 1 else 0
+    )
+    nativePointerAddress(control)
+}
+
+trusted fun tlsAllocateListener(context: i64*, descriptor: int): int {
+    val control = ablaUnsafeAllocate(16)
+    ablaUnsafeStorePointer(control, context)
+    ablaUnsafeStoreI64(ablaUnsafePointerOffset(control, 8), descriptor)
+    nativePointerAddress(control)
+}
+
+trusted fun tlsControl(handle: int): i64* = nativePointerFromAddress(handle)
+
+trusted fun tlsControlPointer(handle: int, offset: int): i64* =
+    ablaUnsafeLoadPointer(ablaUnsafePointerOffset(tlsControl(handle), offset))
+
+trusted fun tlsControlInt(handle: int, offset: int): int =
+    ablaUnsafeLoadI64(ablaUnsafePointerOffset(tlsControl(handle), offset))
 
 resource class TlsConnection(var handle: int) {
     fun drop(): void {
-        if (this.handle >= 0) ablaHostTlsClose(this.handle)
+        if (this.handle >= 0) tlsCloseHandle(this.handle)
         this.handle = -1
         return
     }
@@ -14,22 +52,80 @@ resource class TlsConnection(var handle: int) {
 
 resource class TlsListener(var handle: int) {
     fun drop(): void {
-        if (this.handle >= 0) ablaHostTlsListenerClose(this.handle)
+        if (this.handle >= 0) tlsCloseListenerHandle(this.handle)
         this.handle = -1
         return
     }
 }
 
-fun tlsAvailable(): bool = ablaHostTlsAvailable()
+trusted fun tlsAvailable(): bool = OpenSSL_version_num() > 0
 
-fun tlsLastError(): string = ablaHostTlsError()
+fun tlsLastError(): string = hostedTlsError
+
+trusted fun tlsOpen(
+    host: string,
+    caPath: string,
+    port: int,
+    timeoutMilliseconds: int
+): int {
+    var handle = -1
+    var connection = TcpConnection(-1)
+    var context = nativeNullPointer()
+    var session = nativeNullPointer()
+    var ready = port > 0 && port <= 65535 &&
+        timeoutMilliseconds > 0 && timeoutMilliseconds <= 600000 &&
+        tlsAvailable()
+    if (ready) {
+        // Local development certificates conventionally identify
+        // `localhost`; avoid a DNS round-trip and preserve the listener's
+        // IPv6 loopback choice while still verifying the original host name.
+        connection = if (host == "localhost") tcpConnectIpv6(
+            ipv6Loopback(port), timeoutMilliseconds
+        ) else tcpConnectHost(host, port, timeoutMilliseconds)
+        ready = connection.descriptor >= 0
+    }
+    if (ready) {
+        context = SSL_CTX_new(TLS_client_method())
+        ready = !pointerIsNull(context)
+    }
+    if (ready) {
+        SSL_CTX_set_verify(context, 1, nativeNullPointer())
+        val trustLoaded = if (caPath != "")
+            SSL_CTX_load_verify_locations(
+                context, caPath, nativeNullPointer()
+            ) == 1
+        else SSL_CTX_set_default_verify_paths(context) == 1
+        ready = trustLoaded
+    }
+    if (ready) {
+        session = SSL_new(context)
+        ready = !pointerIsNull(session)
+    }
+    if (ready) ready = SSL_ctrl(session, 55, 0, host) == 1
+    if (ready) ready = SSL_set1_host(session, host) == 1
+    if (ready) ready = SSL_set_fd(session, connection.descriptor) == 1
+    if (ready) ready = SSL_connect(session) == 1
+    if (ready) ready = SSL_get_verify_result(session) == 0
+    if (ready) {
+        handle = tlsAllocateConnection(
+            context, session, connection.descriptor, true
+        )
+        connection.descriptor = -1
+        hostedTlsError = ""
+    } else {
+        if (!pointerIsNull(session)) SSL_free(session)
+        if (!pointerIsNull(context)) SSL_CTX_free(context)
+        hostedTlsError = "TLS connection, trust, or handshake failed"
+    }
+    handle
+}
 
 fun tlsConnect(
     host: string,
     port: int = 443,
     timeoutMilliseconds: int = 5000
 ): TlsConnection = TlsConnection(
-    ablaHostTlsOpen(host, port, timeoutMilliseconds)
+    tlsOpen(host, "", port, timeoutMilliseconds)
 )
 
 fun tlsConnectWithCa(
@@ -38,8 +134,49 @@ fun tlsConnectWithCa(
     port: int = 443,
     timeoutMilliseconds: int = 5000
 ): TlsConnection = TlsConnection(
-    ablaHostTlsOpenWithCa(host, port, timeoutMilliseconds, caPath)
+    tlsOpen(host, caPath, port, timeoutMilliseconds)
 )
+
+trusted fun tlsListenHandle(
+    certificatePath: string,
+    privateKeyPath: string,
+    host: string,
+    port: int,
+    backlog: int,
+    dualStack: bool
+): int {
+    var handle = -1
+    var context = nativeNullPointer()
+    var listener = TcpListener(-1)
+    var ready = port >= 0 && port <= 65535 && backlog > 0 &&
+        backlog <= 4096 && tlsAvailable()
+    if (ready) {
+        context = SSL_CTX_new(TLS_server_method())
+        ready = !pointerIsNull(context)
+    }
+    if (ready) ready = SSL_CTX_use_certificate_chain_file(
+        context, certificatePath
+    ) == 1
+    if (ready) ready = SSL_CTX_use_PrivateKey_file(
+        context, privateKeyPath, 1
+    ) == 1
+    if (ready) ready = SSL_CTX_check_private_key(context) == 1
+    if (ready) {
+        listener = if (linuxIpv6Words(host).size == 8)
+            tcpListenIpv6(ipv6SocketAddress(host, port), backlog, dualStack)
+        else tcpListenAddress(ipv4SocketAddress(host, port), backlog)
+        ready = listener.descriptor >= 0
+    }
+    if (ready) {
+        handle = tlsAllocateListener(context, listener.descriptor)
+        listener.descriptor = -1
+        hostedTlsError = ""
+    } else {
+        if (!pointerIsNull(context)) SSL_CTX_free(context)
+        hostedTlsError = "TLS certificate, private key, or listener failed"
+    }
+    handle
+}
 
 fun tlsListen(
     certificatePath: string,
@@ -48,34 +185,97 @@ fun tlsListen(
     port: int = 443,
     backlog: int = 128,
     dualStack: bool = true
-): TlsListener = TlsListener(ablaHostTlsListen(
-    host,
-    port,
-    backlog,
-    dualStack,
-    certificatePath,
-    privateKeyPath
+): TlsListener = TlsListener(tlsListenHandle(
+    certificatePath, privateKeyPath, host, port, backlog, dualStack
 ))
 
-fun TlsListener.localPort(): int =
-    if (this.handle >= 0) ablaHostTlsListenerPort(this.handle) else -1
+trusted fun TlsListener.localPort(): int = if (this.handle >= 0) {
+    var listener = TcpListener(tlsControlInt(this.handle, 8))
+    val port = listener.localPort()
+    listener.descriptor = -1
+    port
+} else -1
 
-// The listener owns the shared certificate context and must outlive accepted
-// connections.
-fun TlsListener.accept(): TlsConnection = TlsConnection(
-    if (this.handle >= 0) ablaHostTlsAccept(this.handle) else -1
-)
+trusted fun TlsListener.accept(): TlsConnection {
+    var handle = -1
+    if (this.handle >= 0) {
+        val context = tlsControlPointer(this.handle, 0)
+        val descriptor = linuxTcpAcceptDescriptor(
+            tlsControlInt(this.handle, 8)
+        )
+        var session = nativeNullPointer()
+        var ready = descriptor >= 0
+        if (ready) {
+            session = SSL_new(context)
+            ready = !pointerIsNull(session)
+        }
+        if (ready) ready = SSL_set_fd(session, descriptor) == 1
+        if (ready) ready = SSL_accept(session) == 1
+        if (ready) handle = tlsAllocateConnection(
+            context, session, descriptor, false
+        )
+        else {
+            if (!pointerIsNull(session)) SSL_free(session)
+            if (descriptor >= 0) linuxTcpCloseDescriptor(descriptor)
+            hostedTlsError = "TLS server handshake failed"
+        }
+    }
+    TlsConnection(handle)
+}
 
-fun TlsConnection.read(maximum: int = 65536): string =
-    if (this.handle >= 0) ablaHostTlsRead(this.handle, maximum) else ""
+trusted fun TlsConnection.read(maximum: int = 65536): string {
+    var result = ""
+    if (this.handle >= 0 && maximum > 0 && maximum <= 16777216) {
+        val buffer = nativeByteBuffer(maximum + 1)
+        val measured: int = SSL_read(
+            tlsControlPointer(this.handle, 8), buffer.address, maximum
+        )
+        if (measured > 0) result = buffer.adoptString(measured)
+        else buffer.close()
+    }
+    result
+}
 
-fun TlsConnection.write(contents: string): int =
-    if (this.handle >= 0) ablaHostTlsWrite(this.handle, contents) else -1
+trusted fun TlsConnection.write(contents: string): int {
+    var offset = 0
+    var writing = this.handle >= 0
+    while (writing && offset < contents.size) {
+        var length = contents.size - offset
+        if (length > 2147483647) length = 2147483647
+        val written: int = SSL_write(
+            tlsControlPointer(this.handle, 8),
+            contents.slice(offset, offset + length),
+            length
+        )
+        if (written <= 0) writing = false
+        else offset = offset + written
+    }
+    if (writing) offset else -1
+}
+
+trusted fun tlsCloseHandle(handle: int): bool {
+    val session = tlsControlPointer(handle, 8)
+    SSL_shutdown(session)
+    SSL_free(session)
+    if (tlsControlInt(handle, 24) != 0) {
+        SSL_CTX_free(tlsControlPointer(handle, 0))
+    }
+    val closed = linuxTcpCloseDescriptor(tlsControlInt(handle, 16))
+    ablaUnsafeFree(tlsControl(handle))
+    closed
+}
+
+trusted fun tlsCloseListenerHandle(handle: int): bool {
+    val closed = linuxTcpCloseDescriptor(tlsControlInt(handle, 8))
+    SSL_CTX_free(tlsControlPointer(handle, 0))
+    ablaUnsafeFree(tlsControl(handle))
+    closed
+}
 
 fun TlsConnection.close(): bool {
     var closed = this.handle < 0
     if (this.handle >= 0) {
-        closed = ablaHostTlsClose(this.handle)
+        closed = tlsCloseHandle(this.handle)
         this.handle = -1
     }
     closed
@@ -84,7 +284,7 @@ fun TlsConnection.close(): bool {
 fun TlsListener.close(): bool {
     var closed = this.handle < 0
     if (this.handle >= 0) {
-        closed = ablaHostTlsListenerClose(this.handle)
+        closed = tlsCloseListenerHandle(this.handle)
         this.handle = -1
     }
     closed

@@ -56,7 +56,7 @@ Before expanding the type system, make failures measurable and reproducible.
 - Add coverage-guided fuzz targets for UTF-8 lexing, parsing, module graphs,
   staged subparsers, semantic analysis, cache decoding, and LLVM emission.
 - Differentially execute generated programs in compile-time evaluation, ORC,
-  O2 AOT, fast AOT, and generated C. Minimize and retain every mismatch.
+  O2 AOT, and fast AOT. Minimize and retain every mismatch.
 - Add malformed-module, allocation-failure, interrupted-syscall, short-I/O,
   child-process, cache-corruption, and hot-reload fault injection.
 - Run seed code under ASan/UBSan and native Abla gates under LLVM sanitizers
@@ -174,7 +174,7 @@ resource bindings may define a reserved
 `drop(): void`; verified IR now inserts conditional, reverse-order drops for
 normal scope exit, reassignment, early return, `break`, `continue`, and owned
 parameter exit, with runtime storage clearing preventing double drops in LLVM
-and generated C, and matching compile-time evaluator cleanup. Deterministic
+and native LLVM, and matching compile-time evaluator cleanup. Deterministic
 per-type IR helpers now recurse through structural fields, arrays, and nullable
 values; affine field/index replacement drops the old value, and consuming
 projections clear the extracted slot while field-sensitive CFG facts preserve
@@ -210,7 +210,7 @@ post-last-use mutation at runtime and compile time. Transitive `val`-contained
 mutable payloads and non-fresh returned/stored references remain before the
 default sharing model is complete. The
 first `Shared<T>`/`Weak<T>` rung is now implemented for affine payloads across
-compile-time evaluation, LLVM, and generated C. Both handle kinds are affine,
+compile-time evaluation and LLVM. Both handle kinds are affine,
 so reference-count increments require an explicit `clone()`. `Shared.get()`
 produces a compiler-only non-escaping borrow. A direct `get()` from a stable
 local/parameter-rooted place may initialize an inferred `val` borrow local.
@@ -247,7 +247,7 @@ payloads remain rejected until immutable/reference semantics can make their
 sharing contract sound; general mutable-place refinement is a later rung. Stable nullable locals
 and parameters now refine on proven `== null`/`!= null` branch polarity,
 including negation and logically guaranteed short-circuit paths, across the
-semantic analyzer, typed IR, compile-time evaluator, LLVM, and generated C.
+semantic analyzer, typed IR, compile-time evaluator, and LLVM.
 The refinement cannot escape its branch and is not granted to mutable locals
 or receiver fields. The
 trusted native memory wrappers use idempotent inherent destructors, so explicit

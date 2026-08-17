@@ -10,11 +10,8 @@ Run the current end-to-end baseline with:
 make benchmark-selfhost
 ```
 
-The benchmark reports two independently useful intervals:
-
-- Abla compiler source to generated C (`ablac2` front/middle/backend work);
-- generated C to optimized native executable;
-- their combined source-to-executable time.
+The benchmark reports frontend/LLVM emission, object/link, and combined
+source-to-executable intervals separately.
 
 The first release performance gate is a complete compiler build below 10
 seconds on the reference development machine. After that, the target is a
@@ -22,8 +19,8 @@ sub-second warm/incremental build through cached module interfaces, persistent
 compiler state, and minimal invalidation. Cold and clean builds remain reported
 separately so caching cannot disguise front-end regressions.
 
-Every optimization must preserve strict-C output, the conformance suite,
-stage-1/stage-2 behavioral parity, and the byte-identical `ablac2`/`ablac3`
+Every optimization must preserve the conformance suite, stage-1/stage-2
+behavioral parity, and the byte-identical `ablac2`/`ablac3`
 fixed point unless an explicitly versioned deterministic-output change updates
 both stages together.
 
@@ -36,8 +33,8 @@ point and conformance proof.
 
 The canonical O2 self-host release builder also has a content-addressed warm
 path. It always emits the compiler LLVM module, then fingerprints that exact
-module together with the linked runtime sources and headers, host, LLVM/Clang
-identity, and release flags. An identical fingerprint reuses the previously
+module together with its Abla runtime sources, host, LLVM/Clang identity, and
+release flags. An identical fingerprint reuses the previously
 optimized executable instead of repeating whole-program O2 and LTO. Set
 `ABLA_RELEASE_SELFHOST_CACHE=0` for a deliberately cold backend measurement;
 `make clean` removes the ignored cache. The pure self-rebuild gate still emits
@@ -444,7 +441,7 @@ and static raw-target server all pass with these paths enabled.
 
 The second optimization pass kept those semantics and changed general compiler
 and managed-runtime machinery. Hosted O2 executables now receive whole-program
-LTO across generated LLVM, the value runtime, and the host runtime. Their
+LTO across generated LLVM and the Abla runtime. Their
 ordinary combined relocatable `.o` remains separately compiled for Icy and
 cross-libc packaging. The native cache stores the generated LLVM module as well
 as the ordinary object, so cache-hit release builds retain LTO; the measured
@@ -456,7 +453,7 @@ slots directly, while later reflective or dynamic mutation retains the existing
 symbol-based path. The collector uses an exact-pointer hash index instead of
 sorting every live allocation, and managed string views retain the allocation
 that actually owns their bytes. These changes preserve the boxed value ABI,
-reflection, mutation, raw target, C backend, and managed lifetime rules.
+reflection, mutation, foreign ABI, and managed lifetime rules.
 
 Hardware counters explain why Rust remains faster. In a pinned ten-second run,
 Abla retired approximately **84,115 instructions** and **43,425 cycles** per

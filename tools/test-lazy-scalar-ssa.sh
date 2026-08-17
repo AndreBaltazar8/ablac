@@ -38,7 +38,11 @@ rg -q 'call i1 @abla_string_equal_bool' "$typed_ir"
 rg -q 'call void @abla_field_get_indexed' "$typed_ir"
 rg -q 'call i64 @abla_field_get_indexed_i64' "$typed_ir"
 rg -q 'call i1 @abla_field_get_indexed_bool' "$typed_ir"
-rg -q 'call void @abla_field_set_indexed' "$typed_ir"
+rg -q 'call void @abla_field_set_indexed_i64' "$typed_ir"
+if rg -q 'call void @abla_field_set_indexed\(' "$typed_ir"; then
+    printf '%s\n' 'typed scalar field store retained generic dispatch' >&2
+    exit 1
+fi
 if rg -q 'call void @abla_(length|index_get)' "$typed_ir"; then
     printf '%s\n' 'typed collection fixture retained generic dispatch' >&2
     exit 1

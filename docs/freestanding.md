@@ -1,16 +1,10 @@
 # Freestanding and raw-kernel profile
 
-Direct system calls are useful for small static Linux programs, kernels,
-embedded targets, and eventually replacing the bootstrap C runtime. They are
-not the portable public API.
-
-On an x86-64 Linux host,
-`ablac build app.ab --target x86_64-linux-raw -o app` produces a static ELF
-with its own `_start`, raw `exit_group`, `mmap`/`munmap` allocation, and
-compiler fallback memory primitives. LLD is invoked without CRT or libc, and
-the driver rejects host or LLVM runtime imports for this profile. Other hosts
-can still use extension-defined LLVM targets for object emission without
-pretending that they have the Linux headers and executable-link contract.
+Direct system calls are useful for small static Linux programs, kernels, and
+embedded targets, but they are not yet a public executable target. The former
+raw Linux target was removed with its project-owned C and assembly startup.
+It will return only when startup, allocation, panic, and process entry are
+expressed by Abla source or compiler intrinsics.
 
 The intended layering is:
 
@@ -22,9 +16,9 @@ abla/fs, abla/process, abla/net
 ```
 
 The phase-safe `ByteBuffer`/`ByteSlice` API and opt-in native word/pointer cells
-now exist. Raw Linux filesystem, terminal, process, TCP, polling, and graceful
-signal-drain implementations are built on them and pass no-project-C native
-gates. The pointer cells provide explicit lifetime and LLVM-lowered
+now exist. Linux filesystem, terminal, process, TCP, polling, and graceful
+signal-drain implementations are built on them. The pointer cells provide
+explicit lifetime and LLVM-lowered
 load/store operations for out-parameters, but ownership is not yet enforced by
 the type system. A target-specific kernel intrinsic remains gated on:
 

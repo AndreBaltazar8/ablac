@@ -19,20 +19,24 @@ mkdir -p "$directory"
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/runtime-memory-no-collector.ab" \
     > "$plain_ir"
-if rg -q '^define .*@abla_(runtime|platform)_memory_' "$plain_ir"; then
+if rg -q '^define .*@abla_(runtime|platform)_memory_(checkpoint|reset|live_bytes|limit|set_limit|collect)' "$plain_ir"; then
     echo 'generated module duplicated the portable memory runtime' >&2
     exit 1
 fi
-rg -q '^declare .*@abla_runtime_memory_pressure' "$plain_ir"
+rg -q '^define (hidden|internal) void @abla_runtime_roots_push\(' "$plain_ir"
+rg -q '^define (hidden|internal) void @abla_runtime_roots_pop\(' "$plain_ir"
+rg -q '^define (hidden|internal) void @abla_runtime_memory_pressure\(\)' "$plain_ir"
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/runtime-memory-collect.ab" \
     > "$collector_ir"
-rg -q '^declare .*@ablaRuntimeMemoryCollect' "$collector_ir"
-rg -q 'call .*@ablaRuntimeMemoryCollect' "$collector_ir"
+if rg -q '^declare .*@ablaRuntimeMemoryCollect' "$collector_ir"; then
+    echo 'collector retained the retired external runtime boundary' >&2
+    exit 1
+fi
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/runtime-memory-pressure.ab" \
     > "$directory/pressure.ll"
-rg -Fq 'declare void @abla_runtime_memory_pressure()' \
+rg -q '^define (hidden|internal) void @abla_runtime_memory_pressure\(\)' \
     "$directory/pressure.ll"
 rg -Fq 'call void @abla_runtime_memory_pressure()' \
     "$directory/pressure.ll"
@@ -61,7 +65,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
 limited_status=$?
 set -e
 [[ $limited_status -eq 134 ]]
-rg -q 'abla panic: memory limit exceeded' "$directory/limited.err"
+rg -q 'memory limit exceeded' "$directory/limited.err"
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-collect.ab" \
     -o "$collector_program"

@@ -96,10 +96,19 @@ class JsonObjectEncoder(
     var finished: bool
 )
 
+// Returns the closing quote for an unescaped, valid UTF-8 JSON string, or -1
+// when the input needs the precise escaped-string decoder. This fuses the
+// common path's delimiter search and validation into one raw-memory pass.
+noescape extern:"intrinsic" fun ablaJsonFindPlainStringEnd(
+    value: string,
+    begin: int,
+    end: int
+): int
+
 // Single-buffer streaming serializer. Container state is held in bitsets, so
 // nesting does not allocate a DOM node, fragment, or context object.
 class JsonEncoder(
-    var output: string,
+    val output: ByteBuffer,
     var depth: int,
     var objectBits: int,
     var nonEmptyBits: int,
@@ -496,6 +505,19 @@ fun jsonParseString(var state: JsonParserState): string {
     val contentBegin = state.offset
     var scanning = state.errorCode == ""
     var closed = false
+    // Canonical protocol strings overwhelmingly contain neither escapes nor
+    // controls. Locate the closing quote with the raw text scanner, then
+    // validate that bounded slice in one raw pass. Escaped/invalid input falls
+    // through to the precise existing decoder and diagnostics below.
+    val plainEnd = if (scanning) ablaJsonFindPlainStringEnd(
+        state.source, contentBegin, state.source.size
+    ) else -1
+    if (plainEnd >= contentBegin &&
+        plainEnd - contentBegin <= state.limits.maximumStringBytes) {
+        state.offset = plainEnd
+        scanning = false
+        closed = true
+    }
     while (scanning && state.offset < state.source.size) {
         val byte = state.source[state.offset]
         if (byte == 34) {
@@ -1020,22 +1042,19 @@ fun JsonObjectReader.nextExpectedRaw(name: string): bool {
     )
     if (!this.first) jsonReaderConsume(this.state, 44)
     jsonSkipWhitespace(this.state)
-    var matches = this.state.errorCode == "" && name.isValidUtf8() &&
+    // This canonical-schema path compares every expected byte directly. A
+    // separate UTF-8 pass over the same trusted schema name only duplicated
+    // work; callers needing decoded/untrusted names use nextExpected().
+    var matches = this.state.errorCode == "" &&
         this.state.offset < this.state.source.size &&
         this.state.source[this.state.offset] == 34
     if (matches) this.state.offset = this.state.offset + 1
-    var index = 0
-    while (matches && index < name.size) {
-        matches = this.state.offset < this.state.source.size &&
-            this.state.source[this.state.offset] == name[index]
-        if (matches) {
-            this.state.offset = this.state.offset + 1
-            index = index + 1
-        }
-    }
-    matches = matches && this.state.offset < this.state.source.size &&
-        this.state.source[this.state.offset] == 34
-    if (matches) this.state.offset = this.state.offset + 1
+    val begin = this.state.offset
+    val end = begin + name.size
+    matches = matches && end < this.state.source.size &&
+        this.state.source.slice(begin, end) == name &&
+        this.state.source[end] == 34
+    if (matches) this.state.offset = end + 1
     else if (this.state.errorCode == "") this.state.fail(
         "unexpected_token", "unexpected JSON object field", this.state.offset
     )
@@ -1129,57 +1148,63 @@ fun JsonObjectReader.finish(): bool {
         this.state.offset == this.state.source.size
 }
 
-fun jsonWriteString(var writer: JsonWriter, value: string): void {
+// One raw pass handles the common JSON-string case. Keeping the source data
+// pointer and length outside the loop avoids re-entering generic string
+// indexing for every byte while preserving the full UTF-8 boundary checks.
+noescape extern:"intrinsic" fun ablaJsonStringIsPlain(
+    value: string
+): bool
+
+fun jsonStringIsPlain(value: string): bool =
+    ablaJsonStringIsPlain(value)
+
+fun jsonAppendString(var output: ByteBuffer, value: string): bool {
     var offset = 0
-    var plain = true
-    while (writer.valid && plain && offset < value.size) {
-        val byte = value[offset]
-        if (byte == 34 || byte == 92 || byte < 32) plain = false
-        else if (byte < 128) offset = offset + 1
-        else {
-            val length = utf8SequenceLength(byte)
-            if (!utf8SequenceValid(value, offset, length)) writer.valid = false
-            else offset = offset + length
-        }
-    }
-    if (writer.valid && plain) {
-        writer.output.appendText("\"")
-        writer.output.appendText(value)
-        writer.output.appendText("\"")
-    } else if (writer.valid) {
-        writer.output.appendText("\"")
+    var valid = jsonStringIsPlain(value)
+    if (valid) {
+        output.appendText("\"")
+        output.appendText(value)
+        output.appendText("\"")
+    } else {
+        valid = true
+        output.appendText("\"")
         offset = 0
         val hex = "0123456789abcdef"
-        while (writer.valid && offset < value.size) {
+        while (valid && offset < value.size) {
             val byte = value[offset]
-            if (byte == 34) writer.output.appendText("\\\"")
-            else if (byte == 92) writer.output.appendText("\\\\")
-            else if (byte == 8) writer.output.appendText("\\b")
-            else if (byte == 12) writer.output.appendText("\\f")
-            else if (byte == 10) writer.output.appendText("\\n")
-            else if (byte == 13) writer.output.appendText("\\r")
-            else if (byte == 9) writer.output.appendText("\\t")
+            if (byte == 34) output.appendText("\\\"")
+            else if (byte == 92) output.appendText("\\\\")
+            else if (byte == 8) output.appendText("\\b")
+            else if (byte == 12) output.appendText("\\f")
+            else if (byte == 10) output.appendText("\\n")
+            else if (byte == 13) output.appendText("\\r")
+            else if (byte == 9) output.appendText("\\t")
             else if (byte < 32) {
-                writer.output.appendText("\\u00")
-                writer.output.appendText(hex.slice(byte / 16, byte / 16 + 1))
+                output.appendText("\\u00")
+                output.appendText(hex.slice(byte / 16, byte / 16 + 1))
                 val low = byte - (byte / 16) * 16
-                writer.output.appendText(hex.slice(low, low + 1))
+                output.appendText(hex.slice(low, low + 1))
             } else if (byte < 128) {
-                writer.output.appendText(value.slice(offset, offset + 1))
+                output.appendText(value.slice(offset, offset + 1))
             } else {
                 val length = utf8SequenceLength(byte)
                 if (!utf8SequenceValid(value, offset, length)) {
-                    writer.valid = false
+                    valid = false
                 }
-                if (writer.valid) writer.output.appendText(
+                if (valid) output.appendText(
                     value.slice(offset, offset + length)
                 )
                 offset = offset + length - 1
             }
             offset = offset + 1
         }
-        if (writer.valid) writer.output.appendText("\"")
+        if (valid) output.appendText("\"")
     }
+    valid
+}
+
+fun jsonWriteString(var writer: JsonWriter, value: string): void {
+    if (writer.valid) writer.valid = jsonAppendString(writer.output, value)
 }
 
 // Encode one UTF-8 string as a complete JSON string literal without building
@@ -1187,19 +1212,7 @@ fun jsonWriteString(var writer: JsonWriter, value: string): void {
 // envelopes while retaining the same escaping and validation rules as
 // `jsonStringify`.
 fun jsonQuote(value: string): string {
-    var offset = 0
-    var plain = true
-    while (plain && offset < value.size) {
-        val byte = value[offset]
-        if (byte == 34 || byte == 92 || byte < 32) plain = false
-        else if (byte < 128) offset = offset + 1
-        else {
-            val length = utf8SequenceLength(byte)
-            if (!utf8SequenceValid(value, offset, length)) plain = false
-            else offset = offset + length
-        }
-    }
-    if (plain) "\"$value\""
+    if (jsonStringIsPlain(value)) "\"$value\""
     else {
         val writer = JsonWriter(byteBuffer(), true)
         jsonWriteString(writer, value)
@@ -1218,7 +1231,7 @@ fun jsonEncodeBoolean(value: bool): JsonEncoded =
     JsonEncoded(if (value) "true" else "false", true)
 
 fun jsonEncoder(): JsonEncoder = JsonEncoder(
-    "", 0, 0, 0, 0, false, true
+    byteBuffer(), 0, 0, 0, 0, false, true
 )
 
 fun JsonEncoder.prepareValue(): void {
@@ -1232,91 +1245,75 @@ fun JsonEncoder.prepareValue(): void {
             this.expectingValueBits = this.expectingValueBits & ~mask
         } else {
             if ((this.nonEmptyBits & mask) != 0) {
-                this.output = "${this.output},"
+                this.output.appendText(",")
             }
         }
         this.nonEmptyBits = this.nonEmptyBits | mask
     }
-    if (!this.valid) this.output = this.output
 }
 
 fun JsonEncoder.beginObject(): void {
     this.prepareValue()
     if (this.depth >= 63) this.valid = false
     if (this.valid) {
-        this.output = "${this.output}{"
+        this.output.appendText("{")
         val mask = 1 << this.depth
         this.objectBits = this.objectBits | mask
         this.nonEmptyBits = this.nonEmptyBits & ~mask
         this.expectingValueBits = this.expectingValueBits & ~mask
         this.depth = this.depth + 1
     }
-    if (!this.valid) this.output = this.output
 }
 
 fun JsonEncoder.beginArray(): void {
     this.prepareValue()
     if (this.depth >= 63) this.valid = false
     if (this.valid) {
-        this.output = "${this.output}["
+        this.output.appendText("[")
         val mask = 1 << this.depth
         this.objectBits = this.objectBits & ~mask
         this.nonEmptyBits = this.nonEmptyBits & ~mask
         this.expectingValueBits = this.expectingValueBits & ~mask
         this.depth = this.depth + 1
     }
-    if (!this.valid) this.output = this.output
 }
 
 fun JsonEncoder.key(name: string): void {
-    if (this.depth <= 0 || !name.isValidUtf8()) this.valid = false
+    if (this.depth <= 0) this.valid = false
     if (this.valid) {
         val mask = 1 << (this.depth - 1)
         if ((this.objectBits & mask) == 0 ||
             (this.expectingValueBits & mask) != 0) this.valid = false
         if (this.valid && (this.nonEmptyBits & mask) != 0) {
-            this.output = "${this.output},"
+            this.output.appendText(",")
         }
+        if (this.valid) this.valid = jsonAppendString(this.output, name)
         if (this.valid) {
-            val quoted = jsonQuote(name)
-            if (quoted == "null") this.valid = false
-            else this.output = "${this.output}$quoted"
-        }
-        if (this.valid) {
-            this.output = "${this.output}:"
+            this.output.appendText(":")
             this.expectingValueBits = this.expectingValueBits | mask
         }
     }
-    if (!this.valid) this.output = this.output
 }
 
 fun JsonEncoder.string(value: string): void {
     this.prepareValue()
-    if (this.valid) {
-        val quoted = jsonQuote(value)
-        if (quoted == "null") this.valid = false
-        else this.output = "${this.output}$quoted"
-    }
-    if (!this.valid) this.output = this.output
+    if (this.valid) this.valid = jsonAppendString(this.output, value)
 }
 
 fun JsonEncoder.integer(value: int): void {
     this.prepareValue()
-    if (this.valid) this.output = "${this.output}$value"
-    if (!this.valid) this.output = this.output
+    if (this.valid) this.output.appendText("$value")
 }
 
 fun JsonEncoder.boolean(value: bool): void {
     this.prepareValue()
     val encoded = if (value) "true" else "false"
-    if (this.valid) this.output = "${this.output}$encoded"
-    if (!this.valid) this.output = this.output
+    if (this.valid) this.output.appendText(encoded)
 }
 
 fun JsonEncoder.nullValue(): void {
     this.prepareValue()
-    if (this.valid) this.output = "${this.output}null"
-    if (!this.valid) this.output = this.output
+    if (this.valid) this.output.appendText("null")
 }
 
 fun JsonEncoder.endObject(): void {
@@ -1325,13 +1322,12 @@ fun JsonEncoder.endObject(): void {
         val mask = 1 << (this.depth - 1)
         if ((this.objectBits & mask) == 0 ||
             (this.expectingValueBits & mask) != 0) this.valid = false
-        if (this.valid) this.output = "${this.output}}"
+        if (this.valid) this.output.appendText("}")
         this.objectBits = this.objectBits & ~mask
         this.nonEmptyBits = this.nonEmptyBits & ~mask
         this.expectingValueBits = this.expectingValueBits & ~mask
         this.depth = this.depth - 1
     }
-    if (!this.valid) this.output = this.output
 }
 
 fun JsonEncoder.endArray(): void {
@@ -1339,18 +1335,17 @@ fun JsonEncoder.endArray(): void {
     if (this.valid) {
         val mask = 1 << (this.depth - 1)
         if ((this.objectBits & mask) != 0) this.valid = false
-        if (this.valid) this.output = "${this.output}]"
+        if (this.valid) this.output.appendText("]")
         this.objectBits = this.objectBits & ~mask
         this.nonEmptyBits = this.nonEmptyBits & ~mask
         this.expectingValueBits = this.expectingValueBits & ~mask
         this.depth = this.depth - 1
     }
-    if (!this.valid) this.output = this.output
 }
 
 fun JsonEncoder.finish(): string {
     if (this.valid && this.rootWritten && this.depth == 0) {
-        this.output
+        this.output.toText()
     } else "null"
 }
 

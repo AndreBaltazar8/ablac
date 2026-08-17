@@ -1,0 +1,343 @@
+import "analysis.ab"
+import "bindings.ab"
+import "abla/platform/host"
+
+// The direct backend owns one LLVM context and constructs every declaration,
+// global, block, and instruction through LLVM's C API. Text is produced only
+// as the serialized view of the finished, verified module.
+class BootstrapLlvmBackend(
+    val context: i64*,
+    val module: i64*,
+    val builder: i64*,
+    val voidType: i64*,
+    val i1Type: i64*,
+    val i8Type: i64*,
+    val i32Type: i64*,
+    val i64Type: i64*,
+    val pointerType: i64*,
+    val payloadType: i64*,
+    val valueType: i64*,
+    val rootFrameType: i64*
+)
+
+fun bootstrapLlvmBackend(): BootstrapLlvmBackend {
+    val context = LLVMContextCreate()
+    val module = LLVMModuleCreateWithNameInContext("abla", context)
+    val builder = LLVMCreateBuilderInContext(context)
+    val voidType = LLVMVoidTypeInContext(context)
+    val i1Type = LLVMInt1TypeInContext(context)
+    val i8Type = LLVMInt8TypeInContext(context)
+    val i32Type = LLVMInt32TypeInContext(context)
+    val i64Type = LLVMInt64TypeInContext(context)
+    val pointerType = LLVMPointerTypeInContext(context, 0)
+    val payloadType = LLVMStructCreateNamed(context, "AblaPayload")
+    val payloadFields = llvmPointerVector(2)
+    var field = 0
+    while (field < 2) {
+        payloadFields.set(field, i64Type)
+        field = field + 1
+    }
+    LLVMStructSetBody(payloadType, payloadFields.pointer(), 2, 0)
+    payloadFields.drop()
+    val valueType = LLVMStructCreateNamed(context, "AblaValue")
+    val valueFields = llvmPointerVector(3)
+    valueFields.set(0, i32Type)
+    valueFields.set(1, i32Type)
+    valueFields.set(2, payloadType)
+    LLVMStructSetBody(valueType, valueFields.pointer(), 3, 0)
+    valueFields.drop()
+    val rootFrameType = LLVMStructCreateNamed(context, "AblaRootFrame")
+    val rootFields = llvmPointerVector(3)
+    rootFields.set(0, pointerType)
+    rootFields.set(1, pointerType)
+    rootFields.set(2, i64Type)
+    LLVMStructSetBody(rootFrameType, rootFields.pointer(), 3, 0)
+    rootFields.drop()
+    BootstrapLlvmBackend(
+        context, module, builder, voidType, i1Type, i8Type, i32Type,
+        i64Type, pointerType, payloadType, valueType, rootFrameType
+    )
+}
+
+fun BootstrapLlvmBackend.type(code: string): i64* {
+    var result = this.pointerType
+    if (code == "void") result = this.voidType
+    if (code == "i1" || code == "bool") result = this.i1Type
+    if (code == "i8" || code == "u8" || code == "char") {
+        result = this.i8Type
+    }
+    if (code == "i16" || code == "u16") {
+        result = LLVMIntTypeInContext(this.context, 16)
+    }
+    if (code == "i32" || code == "u32") result = this.i32Type
+    if (code == "i64" || code == "u64" || code == "int") {
+        result = this.i64Type
+    }
+    result
+}
+
+fun bootstrapLlvmFunctionType(
+    backend: BootstrapLlvmBackend,
+    result: i64*,
+    parameters: array<i64*>
+): i64* {
+    val types = llvmPointerVector(parameters.size)
+    var index = 0
+    while (index < parameters.size) {
+        types.set(index, parameters[index])
+        index = index + 1
+    }
+    val resultType = LLVMFunctionType(
+        result, types.pointer(), parameters.size, 0
+    )
+    types.drop()
+    resultType
+}
+
+fun bootstrapLlvmAttributeKind(name: string): int =
+    LLVMGetEnumAttributeKindForName(name, name.size)
+
+fun bootstrapLlvmAddFunctionAttribute(
+    backend: BootstrapLlvmBackend,
+    value: i64*,
+    name: string
+): void {
+    val attribute = LLVMCreateEnumAttribute(
+        backend.context,
+        bootstrapLlvmAttributeKind(name),
+        0
+    )
+    // LLVMAttributeFunctionIndex is the all-ones unsigned index. The C API
+    // accepts the same bit pattern through its signed i32 binding.
+    LLVMAddAttributeAtIndex(value, -1, attribute)
+}
+
+fun bootstrapLlvmAddSret(
+    backend: BootstrapLlvmBackend,
+    value: i64*,
+    callSite: bool
+): void {
+    val attribute = LLVMCreateTypeAttribute(
+        backend.context,
+        bootstrapLlvmAttributeKind("sret"),
+        backend.valueType
+    )
+    if (callSite) LLVMAddCallSiteAttribute(value, 1, attribute)
+    else LLVMAddAttributeAtIndex(value, 1, attribute)
+}
+
+fun bootstrapLlvmAddByval(
+    backend: BootstrapLlvmBackend,
+    value: i64*,
+    parameter: int,
+    callSite: bool
+): void {
+    if (!ablaHostValueArgumentsIndirect()) {
+        val attribute = LLVMCreateTypeAttribute(
+            backend.context,
+            bootstrapLlvmAttributeKind("byval"),
+            backend.valueType
+        )
+        if (callSite) {
+            LLVMAddCallSiteAttribute(value, parameter + 1, attribute)
+        } else LLVMAddAttributeAtIndex(value, parameter + 1, attribute)
+    }
+}
+
+fun bootstrapLlvmDeclare(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    result: i64*,
+    parameters: array<i64*>,
+    sret: bool,
+    byval: array<bool>
+): i64* {
+    var function = LLVMGetNamedFunction(backend.module, name)
+    if (pointerIsNull(function)) {
+        function = LLVMAddFunction(
+            backend.module,
+            name,
+            bootstrapLlvmFunctionType(backend, result, parameters)
+        )
+        if (sret) bootstrapLlvmAddSret(backend, function, false)
+        var parameter = 0
+        while (parameter < byval.size) {
+            if (byval[parameter]) {
+                bootstrapLlvmAddByval(
+                    backend, function, parameter, false
+                )
+            }
+            parameter = parameter + 1
+        }
+    }
+    function
+}
+
+fun bootstrapLlvmCall(
+    backend: BootstrapLlvmBackend,
+    function: i64*,
+    arguments: array<i64*>,
+    name: string,
+    sret: bool,
+    byval: array<bool>
+): i64* {
+    val values = llvmPointerVector(arguments.size)
+    var index = 0
+    while (index < arguments.size) {
+        values.set(index, arguments[index])
+        index = index + 1
+    }
+    val call = LLVMBuildCall2(
+        backend.builder,
+        LLVMGlobalGetValueType(function),
+        function,
+        values.pointer(),
+        arguments.size,
+        name
+    )
+    values.drop()
+    if (sret) bootstrapLlvmAddSret(backend, call, true)
+    index = 0
+    while (index < byval.size) {
+        if (byval[index]) bootstrapLlvmAddByval(backend, call, index, true)
+        index = index + 1
+    }
+    call
+}
+
+fun bootstrapLlvmCallTyped(
+    backend: BootstrapLlvmBackend,
+    type: i64*,
+    function: i64*,
+    arguments: array<i64*>,
+    name: string
+): i64* {
+    val values = llvmPointerVector(arguments.size)
+    var index = 0
+    while (index < arguments.size) {
+        values.set(index, arguments[index])
+        index = index + 1
+    }
+    val call = LLVMBuildCall2(
+        backend.builder, type, function, values.pointer(),
+        arguments.size, name
+    )
+    values.drop()
+    call
+}
+
+fun bootstrapLlvmCallNamed(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    arguments: array<i64*>,
+    resultName: string,
+    sret: bool,
+    byval: array<bool>
+): i64* = bootstrapLlvmCall(
+    backend,
+    LLVMGetNamedFunction(backend.module, name),
+    arguments,
+    resultName,
+    sret,
+    byval
+)
+
+fun bootstrapLlvmValueParameters(
+    backend: BootstrapLlvmBackend,
+    count: int
+): array<i64*> {
+    val result: array<i64*> = []
+    var index = 0
+    while (index < count) {
+        result.append(backend.pointerType)
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapLlvmValueByval(count: int, sret: bool): array<bool> {
+    val result: array<bool> = []
+    var index = 0
+    while (index < count) {
+        result.append(!sret || index > 0)
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapLlvmDeclareValueRuntime(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    inputs: int
+): i64* {
+    val parameters = bootstrapLlvmValueParameters(backend, inputs + 1)
+    bootstrapLlvmDeclare(
+        backend, name, backend.voidType, parameters, true,
+        bootstrapLlvmValueByval(inputs + 1, true)
+    )
+}
+
+fun bootstrapLlvmRuntimeCall(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    output: i64*,
+    inputs: array<i64*>
+): i64* {
+    val arguments: array<i64*> = [output]
+    var index = 0
+    while (index < inputs.size) {
+        arguments.append(inputs[index])
+        index = index + 1
+    }
+    bootstrapLlvmCallNamed(
+        backend, name, arguments, "", true,
+        bootstrapLlvmValueByval(arguments.size, true)
+    )
+}
+
+fun bootstrapLlvmCopyValue(
+    backend: BootstrapLlvmBackend,
+    source: i64*,
+    destination: i64*,
+    name: string
+): void {
+    val value = LLVMBuildLoad2(
+        backend.builder, backend.valueType, source, name
+    )
+    LLVMSetAlignment(value, 8)
+    val stored = LLVMBuildStore(backend.builder, value, destination)
+    LLVMSetAlignment(stored, 8)
+}
+
+fun bootstrapLlvmArrayElement(
+    backend: BootstrapLlvmBackend,
+    arrayType: i64*,
+    storage: i64*,
+    index: int,
+    name: string
+): i64* {
+    val indices = llvmPointerVector(2)
+    indices.set(0, LLVMConstInt(backend.i64Type, 0, 0))
+    indices.set(1, LLVMConstInt(backend.i64Type, index, 0))
+    val result = LLVMBuildGEP2(
+        backend.builder, arrayType, storage, indices.pointer(), 2, name
+    )
+    indices.drop()
+    result
+}
+
+fun bootstrapLlvmValueElement(
+    backend: BootstrapLlvmBackend,
+    storage: i64*,
+    index: int,
+    name: string
+): i64* {
+    val indices = llvmPointerVector(1)
+    indices.set(0, LLVMConstInt(backend.i64Type, index, 0))
+    val result = LLVMBuildGEP2(
+        backend.builder, backend.valueType, storage,
+        indices.pointer(), 1, name
+    )
+    indices.drop()
+    result
+}

@@ -26,7 +26,7 @@ current src/*.ab -> fixed-point compiler
 host. `make ablac` then uses
 it to rebuild the current sources. `make self-rebuild` builds another compiler,
 requires byte-identical LLVM IR from both compilers, audits the child for
-project-C host symbols, and uses it to build and run a native probe.
+unresolved Abla runtime symbols, and uses it to build and run a native probe.
 
 The published binary is trusted only as the initial translator. The readable
 Abla source graph and fixed-point check define the maintained compiler. A
@@ -38,16 +38,16 @@ reintroducing a second compiler implementation.
 ```text
 src/       compiler implementation and command-line entry points, all Abla
 stdlib/    standard library written in Abla
-runtime/   target startup and hosted platform adapters
+stdlib/abla/runtime/   portable runtime and target platform modules, all Abla
 tests/     language, diagnostic, conformance, and execution fixtures
 tools/     bootstrap, test, benchmark, and release utilities
 docs/      language and architecture contracts
 ```
 
-The C backend in `src/backend_c.ab` is an optional diagnostic and differential
-backend written in Abla. C and assembly files under `runtime/` are target
-adapters for generated programs; they are not compiler implementations or a
-compiler bootstrap stage.
+There is no generated-C backend or separately compiled project runtime. The
+portable runtime is Abla source compiled into the same LLVM unit as each
+program. Platform calls such as allocation and LLVM's API are declared from
+Abla at their foreign ABI boundary.
 
 LLVM, Clang, and the platform linker remain native toolchain dependencies.
 Linux pins them through Nix; macOS uses Homebrew LLVM and the system
