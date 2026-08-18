@@ -38,7 +38,7 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
     var result = BootstrapTargetDescriptor(
         name, "", "", false, false, "", "", "", false
     )
-    if (name == "x86_64-linux" && !ablaHostIsMacOS()) {
+    if (name == "x86_64-linux") {
         result = BootstrapTargetDescriptor(
             name,
             "x86_64-unknown-linux-gnu",
@@ -51,10 +51,11 @@ fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
             true
         )
     }
-    if (ablaHostIsMacOS() && name == bootstrapHostTargetName()) {
+    if (name == "x86_64-macos" || name == "arm64-macos") {
         result = BootstrapTargetDescriptor(
             name,
-            llvmDefaultTargetTriple(),
+            if (name == "arm64-macos") "arm64-apple-macosx11.0.0"
+            else "x86_64-apple-macosx11.0.0",
             "macho",
             true,
             false,
@@ -113,8 +114,7 @@ fun bootstrapDefinedTargetDescriptor(
 )
 
 fun bootstrapSupportedTargets(): string =
-    if (ablaHostIsMacOS()) bootstrapHostTargetName()
-    else "x86_64-linux"
+    "x86_64-linux, x86_64-macos, arm64-macos"
 
 class BootstrapNativeBuild(
     val status: int,
@@ -987,13 +987,22 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // their own loader/runtime contract and must not receive the Linux startup.
     val rawTarget = target.libcFree && target.entrySymbol.size > 0
     val macTarget = target.objectFormat == "macho"
+    val configuredMacClang = linuxEnvironment("ABLA_MACOS_CLANG")
+    val macClang = if (configuredMacClang.found &&
+        configuredMacClang.value != "") configuredMacClang.value
+        else "clang"
     var macSdkRoot = ""
     if (macTarget && target.hosted) {
-        val discoverSdk = linuxCommand("xcrun")
-        discoverSdk.argument("--sdk")
-        discoverSdk.argument("macosx")
-        discoverSdk.argument("--show-sdk-path")
-        macSdkRoot = discoverSdk.captureText()
+        val configuredSdk = linuxEnvironment("ABLA_MACOS_SDK")
+        if (configuredSdk.found && configuredSdk.value != "") {
+            macSdkRoot = configuredSdk.value
+        } else if (ablaHostIsMacOS()) {
+            val discoverSdk = linuxCommand("xcrun")
+            discoverSdk.argument("--sdk")
+            discoverSdk.argument("macosx")
+            discoverSdk.argument("--show-sdk-path")
+            macSdkRoot = discoverSdk.captureText()
+        }
         var sdkEnd = macSdkRoot.size
         while (sdkEnd > 0 &&
             (macSdkRoot[sdkEnd - 1] == 10 ||
@@ -1158,7 +1167,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (!cached) {
         val compilation = bootstrapCompileLlvmParsedCached(
             graph.parse(),
-            irCache
+            irCache,
+            target.llvmTriple
         )
         linkLlvm = compilation.linkLlvm
         linkHost = compilation.linkHost
@@ -1354,10 +1364,34 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = 147
         failureKind = "reported"
     }
+    if (status == 0 && macTarget && macSdkRoot == "") {
+        linuxPrintStandardError(
+            "error[E_MACOS_SDK]: set ABLA_MACOS_SDK to a macOS SDK when building Mach-O artifacts away from macOS\n"
+        )
+        status = 159
+        failureKind = "reported"
+    }
+    if (status == 0 && macTarget) {
+        val compileAdapter = linuxCommand(macClang)
+        compileAdapter.argument("--target=${target.llvmTriple}")
+        compileAdapter.argument("-O2")
+        compileAdapter.argument("-isysroot")
+        compileAdapter.argument(macSdkRoot)
+        compileAdapter.argument("-c")
+        compileAdapter.argument(
+            Path(bootstrapRuntimeRoot()).child("abla_darwin_compat.c").text
+        )
+        compileAdapter.argument("-o")
+        compileAdapter.argument(hostPath)
+        status = compileAdapter.run()
+    }
     if (status == 0 && ltoEligible && !linkLlvm) {
-        val compileLtoProgram = linuxCommand("env")
-        compileLtoProgram.argument("NIX_HARDENING_ENABLE=")
-        compileLtoProgram.argument("clang")
+        val compileLtoProgram = if (macTarget) linuxCommand(macClang)
+            else linuxCommand("env")
+        if (!macTarget) {
+            compileLtoProgram.argument("NIX_HARDENING_ENABLE=")
+            compileLtoProgram.argument("clang")
+        }
         compileLtoProgram.argument("-O2")
         compileLtoProgram.argument("-flto")
         compileLtoProgram.argument("-Wno-unused-command-line-argument")
@@ -1367,6 +1401,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             compileLtoProgram.argument("-fno-stack-protector")
         }
         if (macTarget) {
+            compileLtoProgram.argument("--target=${target.llvmTriple}")
             compileLtoProgram.argument("-isysroot")
             compileLtoProgram.argument(macSdkRoot)
         }
@@ -1377,13 +1412,18 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = compileLtoProgram.run()
     }
     if (status == 0 && target.hosted && artifact == "executable") {
-        val link = linuxCommand("clang")
+        val link = linuxCommand(if (macTarget) macClang else "clang")
         link.argument("-pthread")
         if (ltoEligible && !linkLlvm) {
             link.argument("-O2")
             link.argument("-flto")
         }
         if (macTarget) {
+            link.argument("--target=${target.llvmTriple}")
+            if (!ablaHostIsMacOS()) {
+                link.argument("-fuse-ld=lld")
+                link.argument("-Wl,--threads=1")
+            }
             link.argument("-isysroot")
             link.argument(macSdkRoot)
             link.argument("-Wl,-dead_strip")
@@ -1395,9 +1435,13 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             link.argument("-Wl,--error-limit=0")
         }
         if (linkLlvm) {
+            val configuredLlvm = linuxEnvironment("ABLA_MACOS_LLVM_LIB")
             val llvmConfig = linuxCommand("llvm-config")
             llvmConfig.argument("--libdir")
-            var llvmLibraryDirectory = llvmConfig.captureText()
+            var llvmLibraryDirectory = if (macTarget &&
+                configuredLlvm.found && configuredLlvm.value != "") {
+                configuredLlvm.value
+            } else llvmConfig.captureText()
             var end = llvmLibraryDirectory.size
             while (end > 0 &&
                 (llvmLibraryDirectory[end - 1] == 10 ||
@@ -1409,13 +1453,32 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 "-Wl,--export-dynamic"
             )
             link.argument("-L$llvmLibraryDirectory")
-            link.argument("-Wl,-rpath,$llvmLibraryDirectory")
+            if (!macTarget || !configuredLlvm.found ||
+                configuredLlvm.value == "") {
+                link.argument("-Wl,-rpath,$llvmLibraryDirectory")
+            }
             link.argument("-lLLVM")
         }
         link.argument(if (ltoEligible && !linkLlvm)
             ltoObjectPath
         else objectPath)
+        if (macTarget) link.argument(hostPath)
         if (linkOpenSsl) {
+            val configuredOpenSsl = linuxEnvironment("ABLA_MACOS_OPENSSL_LIB")
+            var openSslLibraryDirectory = ""
+            if (macTarget && configuredOpenSsl.found &&
+                configuredOpenSsl.value != "") {
+                openSslLibraryDirectory = configuredOpenSsl.value
+            } else if (macTarget && ablaHostIsMacOS()) {
+                openSslLibraryDirectory = if (
+                    bootstrapTripleArchitecture(llvmDefaultTargetTriple()) ==
+                    "arm64"
+                ) "/opt/homebrew/opt/openssl@3/lib"
+                else "/usr/local/opt/openssl@3/lib"
+            }
+            if (openSslLibraryDirectory != "") {
+                link.argument("-L$openSslLibraryDirectory")
+            }
             link.argument("-lssl")
             link.argument("-lcrypto")
         }
@@ -1447,9 +1510,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = archive.run()
     }
     if (status == 0 && target.hosted && artifact == "shared-library") {
-        val linkShared = linuxCommand("clang")
+        val linkShared = linuxCommand(if (macTarget) macClang else "clang")
         linkShared.argument("-pthread")
         if (macTarget) {
+            linkShared.argument("--target=${target.llvmTriple}")
+            if (!ablaHostIsMacOS()) {
+                linkShared.argument("-fuse-ld=lld")
+                linkShared.argument("-Wl,--threads=1")
+            }
             linkShared.argument("-isysroot")
             linkShared.argument(macSdkRoot)
             linkShared.argument("-dynamiclib")
@@ -1461,20 +1529,43 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             linkShared.argument("-Wl,--gc-sections")
         }
         if (linkLlvm) {
+            val configuredLlvm = linuxEnvironment("ABLA_MACOS_LLVM_LIB")
             val llvmConfig = linuxCommand("llvm-config")
             llvmConfig.argument("--libdir")
-            var llvmLibraryDirectory = llvmConfig.captureText()
+            var llvmLibraryDirectory = if (macTarget &&
+                configuredLlvm.found && configuredLlvm.value != "") {
+                configuredLlvm.value
+            } else llvmConfig.captureText()
             var end = llvmLibraryDirectory.size
             while (end > 0 &&
                 (llvmLibraryDirectory[end - 1] == 10 ||
                  llvmLibraryDirectory[end - 1] == 13)) end = end - 1
             llvmLibraryDirectory = llvmLibraryDirectory.slice(0, end)
             linkShared.argument("-L$llvmLibraryDirectory")
-            linkShared.argument("-Wl,-rpath,$llvmLibraryDirectory")
+            if (!macTarget || !configuredLlvm.found ||
+                configuredLlvm.value == "") {
+                linkShared.argument("-Wl,-rpath,$llvmLibraryDirectory")
+            }
             linkShared.argument("-lLLVM")
         }
         linkShared.argument(objectPath)
+        if (macTarget) linkShared.argument(hostPath)
         if (linkOpenSsl) {
+            val configuredOpenSsl = linuxEnvironment("ABLA_MACOS_OPENSSL_LIB")
+            var openSslLibraryDirectory = ""
+            if (macTarget && configuredOpenSsl.found &&
+                configuredOpenSsl.value != "") {
+                openSslLibraryDirectory = configuredOpenSsl.value
+            } else if (macTarget && ablaHostIsMacOS()) {
+                openSslLibraryDirectory = if (
+                    bootstrapTripleArchitecture(llvmDefaultTargetTriple()) ==
+                    "arm64"
+                ) "/opt/homebrew/opt/openssl@3/lib"
+                else "/usr/local/opt/openssl@3/lib"
+            }
+            if (openSslLibraryDirectory != "") {
+                linkShared.argument("-L$openSslLibraryDirectory")
+            }
             linkShared.argument("-lssl")
             linkShared.argument("-lcrypto")
         }

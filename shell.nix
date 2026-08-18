@@ -21,6 +21,8 @@ pkgs.mkShell {
 
   shellHook = ''
     export ABLAC_DEV_SHELL=1
+    export ABLA_MACOS_CLANG="${pkgs.llvmPackages.clang-unwrapped}/bin/clang"
+    export ABLA_LINUX_OPENSSL_LIB="${pkgs.openssl.out}/lib"
     export LD_LIBRARY_PATH="${pkgs.openssl.out}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   '';
 }

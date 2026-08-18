@@ -23,8 +23,8 @@ printf -v build_command \
     "$compiler" "$entry" "$output"
 
 # A self-hosted compiler is built through the same LLVM-native path as every
-# other Abla executable. The runtime sources are part of that LLVM module; no
-# separately compiled runtime object, header, shim, or adapter exists.
+# other Abla executable. The Abla runtime sources are part of that LLVM module;
+# Mach-O additionally links only the narrow Darwin syscall adapter.
 if [[ $host_os == Darwin ]]; then
     ABLA_MAX_MEMORY_MB=$build_memory_mb ABLA_MAX_SECONDS=$build_seconds \
         "$project_root/tools/run-limited.sh" /bin/bash -c "$build_command"

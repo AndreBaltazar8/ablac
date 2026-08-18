@@ -20,6 +20,12 @@ ablac repl
 ablac serve app.ab
 ```
 
+Built-in hosted targets are `x86_64-linux`, `x86_64-macos`, and
+`arm64-macos`. Cross-linking Mach-O on Linux requires `ABLA_MACOS_SDK`; optional
+`ABLA_MACOS_LLVM_LIB` and `ABLA_MACOS_OPENSSL_LIB` select directories holding
+target dylibs or `.tbd` stubs. `tools/build-macos-from-linux.sh` prepares the
+stubs from the pinned target-library ABIs and builds both Mac architectures.
+
 ## Packages
 
 `ablac package update --project <dir>` evaluates typed `ImportSource`
@@ -95,8 +101,8 @@ module finalizers merge their transaction-local read journals into the same
 artifact identity. Persistent frontend snapshots revalidate those inputs
 before reusing staged syntax. A hit skips
 frontend and LLVM work, restores the recorded
-libLLVM/host-adapter link decisions, recompiles the C adapter only when the
-program imports a host capability, and relinks. Local adapter changes are never hidden. The
+libLLVM/host-adapter link decisions, recompiles the Darwin adapter for Mach-O,
+and relinks. Local adapter changes are never hidden. The
 cache ABI tag in `src/toolchain.ab` must be bumped whenever
 object semantics change without a corresponding source-graph change.
 `--no-cache` bypasses both lookup and publication while still emitting the

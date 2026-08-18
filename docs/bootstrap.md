@@ -6,11 +6,10 @@ multi-stage source bootstrap are no longer part of the repository.
 
 A compiler cannot translate itself on an empty machine without an existing
 executable translator. Clean builds therefore begin with a checksum-pinned
-host artifact. Linux x86-64 uses the compact-value compiler from `v0.2.2`,
-Intel macOS uses `v0.2.0`, and Apple Silicon uses its native seed from
-`v0.2.1`. The first Apple Silicon artifact was produced by emitting the
-compiler IR on the trusted Intel host and compiling and linking that same IR
-against the native ARM LLVM and runtime on Apple Silicon.
+native `v0.2.4` host artifact for Linux x86-64, Intel macOS, or Apple Silicon.
+Mach-O artifacts can be emitted and linked on Linux with LLVM, an Apple SDK,
+and ABI stubs for the target libraries. The resulting artifact is then
+executed by the matching Mac release gate.
 
 ```text
 published ablac binary
@@ -39,15 +38,18 @@ reintroducing a second compiler implementation.
 src/       compiler implementation and command-line entry points, all Abla
 stdlib/    standard library written in Abla
 stdlib/abla/runtime/   portable runtime and target platform modules, all Abla
+runtime/   narrow Darwin translation adapter used only by Mach-O artifacts
 tests/     language, diagnostic, conformance, and execution fixtures
 tools/     bootstrap, test, benchmark, and release utilities
 docs/      language and architecture contracts
 ```
 
-There is no generated-C backend or separately compiled project runtime. The
-portable runtime is Abla source compiled into the same LLVM unit as each
-program. Platform calls such as allocation and LLVM's API are declared from
-Abla at their foreign ABI boundary.
+There is no generated-C backend or second compiler runtime. The portable
+runtime is Abla source compiled into the same LLVM unit as each program.
+Mach-O artifacts additionally link `runtime/abla_darwin_compat.c`, a narrow
+adapter that translates the standard library's stable Linux-style syscall
+contract to Darwin libc, socket, and kqueue APIs. It contains no Abla value,
+allocation, evaluator, or compiler implementation.
 
 LLVM, Clang, and the platform linker remain native toolchain dependencies.
 Linux pins them through Nix; macOS uses Homebrew LLVM and the system

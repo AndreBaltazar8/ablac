@@ -76,16 +76,31 @@ On a Mac, install Homebrew LLVM without enabling a blanket package
 upgrade, then build directly from the normal shell:
 
 ```sh
-HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@21 lld@21
+HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@21 lld@21 openssl@3
 make
 ```
 
 The macOS host supports Intel and Apple Silicon. `make` downloads the pinned
 bootstrap compiler, rebuilds the current Abla sources as a native Mach-O
 executable for LLVM's detected host triple, and uses Homebrew LLVM for native
-object emission and ORC execution. Apple Silicon uses the native compiler seed
-published with `v0.2.1`; no Intel toolchain is involved.
+object emission and ORC execution. Each host uses its native compiler artifact
+published with `v0.2.4`; no Intel translation is involved on Apple Silicon.
 Run `tools/test-macos-host.sh build/ablac` for the focused native host gate.
+
+Linux can also emit and link both macOS architectures. Point
+`ABLA_MACOS_SDK` at an extracted Apple SDK and use the repository helper; it
+derives target-library `.tbd` stubs from the pinned LLVM/OpenSSL ABIs and
+links with LLVM's Mach-O linker:
+
+```sh
+ABLA_MACOS_SDK=/path/to/MacOSX.sdk \
+  tools/build-macos-from-linux.sh \
+  build/ablac src/orc_main.ab build/release/ablac
+```
+
+The produced compiler binaries load Homebrew `llvm@21`; programs that import
+TLS additionally load Homebrew `openssl@3`. The helper creates only ignored
+files under `build/` and never modifies the SDK.
 
 Run the ordinary test suite with:
 
@@ -122,9 +137,9 @@ make check         # test plus fixed point
 make clean         # remove generated files
 ```
 
-On an empty build directory, `make` downloads a checksum-pinned compiler from
-the `v0.2.0` release on x86-64 Linux/Intel macOS or `v0.2.1` on Apple Silicon,
-then immediately recompiles the current `src/` graph.
+On an empty build directory, `make` downloads the checksum-pinned native
+compiler for the host from `v0.2.4`, then immediately recompiles the current
+`src/` graph.
 No C++ compiler implementation or generated-C bootstrap is involved.
 
 ## Using the compiler
@@ -134,7 +149,8 @@ No C++ compiler implementation or generated-C bootstrap is involved.
 ```sh
 build/ablac build program.ab -o build/program
 build/ablac build program.ab -o build/program --fast
-build/ablac build program.ab --target arm64-macos -o build/program # Apple Silicon
+ABLA_MACOS_SDK=/path/to/MacOSX.sdk \
+  build/ablac build program.ab --target arm64-macos -o build/program
 build/ablac run program.ab
 build/ablac repl
 build/ablac serve program.ab
