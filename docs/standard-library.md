@@ -15,8 +15,8 @@ unrelated policy or compiler machinery into the program:
 | `abla/io/buffered` | opt-in buffered file writer adapter |
 | `abla/process/supervisor` | hosted child-process launch, isolated logs, polling, process-tree termination, monotonic timing, and processor discovery |
 | `abla/fs` | `Path`, metadata, atomic text writes, directory entries, watches |
-| `abla/process` | `Command`, `ChildProcess`, arguments, sleep |
-| `abla/process/arguments`, `/command`, `/time` | size-selectable portable process capabilities |
+| `abla/process` | `Command`, `ChildProcess`, arguments, sleep, and monotonic timing |
+| `abla/process/arguments`, `/command`, `/time` | size-selectable portable process capabilities, including an affine allocation-free clock |
 | `abla/random` | bounded cryptographic entropy using raw Linux `getrandom` |
 | `abla/random/hosted` | bounded `/dev/urandom` entropy for Linux and macOS hosted programs |
 | `region { ... }` | compiler-checked lexical allocation generation (language construct) |
@@ -66,7 +66,11 @@ dependency and works during both staged and runtime execution.
 implementation and work unchanged in hosted and JIT execution. `abla/fs` and
 `abla/process` use the same Linux implementations as the compiler, including
 atomic files, directory enumeration/watch identities, arguments, sleep, and
-command/child lifecycle. The narrow compatibility ABI remains isolated in
+command/child lifecycle. `abla/process/time` exposes millisecond/nanosecond
+monotonic values, checked nanosecond sleep, and an affine `MonotonicClock` that
+reuses its three kernel buffers in hot loops. Linux lowers these operations to
+`clock_gettime` and `nanosleep` syscalls without libc. The narrow compatibility
+ABI remains isolated in
 `BufferedTextWriter` batches text behind an ordinary `(string) -> bool` sink.
 Its stdout/stderr constructors stay in `abla/io`; the file adapter is a
 separate `abla/io/buffered` import and flushes through append-only atomic kernel

@@ -48,6 +48,9 @@ require libc; hosted facilities are optional capabilities.
   macOS. The bounded event HTTP/WebSocket managers support persistent requests,
   chunked bodies, gzip, SSE framing, partial writes, and output backpressure;
   JSON/RPC routing remains transport-neutral.
+- Portable process timing now exposes monotonic millisecond/nanosecond values,
+  checked nanosecond sleep, and an affine reusable clock whose hot read/sleep
+  path issues raw Linux syscalls without allocating or linking libc.
 - Application-sized ELF modules place generated functions in independent text
   sections, allowing the existing linker garbage collection to discard unused
   imported APIs. The transformation is bounded so large compiler modules keep

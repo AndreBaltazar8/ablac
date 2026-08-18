@@ -342,15 +342,19 @@ fun LinuxChildProcess.stop(graceMilliseconds: int = 5000): int {
     result
 }
 
-fun linuxSleepMillisecondsChecked(milliseconds: int): bool {
-    var success = milliseconds >= 0
+fun linuxSleepNanosecondsWithBuffers(
+    nanoseconds: int,
+    var requested: NativeByteBuffer,
+    var remaining: NativeByteBuffer
+): bool {
+    var success = nanoseconds >= 0 && !requested.closed &&
+        requested.capacity >= 16 && !remaining.closed &&
+        remaining.capacity >= 16
     if (success) {
-        val requested = nativeByteBuffer(16)
-        val remaining = nativeByteBuffer(16)
-        requested.storeI64(0, milliseconds / 1000)
+        requested.storeI64(0, nanoseconds / 1000000000)
         requested.storeI64(
             8,
-            (milliseconds - milliseconds / 1000 * 1000) * 1000000
+            nanoseconds - nanoseconds / 1000000000 * 1000000000
         )
         var waiting = true
         while (waiting) {
@@ -369,11 +373,26 @@ fun linuxSleepMillisecondsChecked(milliseconds: int): bool {
                 waiting = false
             }
         }
-        requested.close()
-        remaining.close()
     }
     success
 }
+
+fun linuxSleepNanosecondsChecked(nanoseconds: int): bool {
+    val requested = nativeByteBuffer(16)
+    val remaining = nativeByteBuffer(16)
+    val succeeded = linuxSleepNanosecondsWithBuffers(
+        nanoseconds,
+        requested,
+        remaining
+    )
+    requested.close()
+    remaining.close()
+    succeeded
+}
+
+fun linuxSleepMillisecondsChecked(milliseconds: int): bool =
+    milliseconds >= 0 && milliseconds <= 9223372036854 &&
+    linuxSleepNanosecondsChecked(milliseconds * 1000000)
 
 fun linuxProcessUnit(): void {}
 
@@ -382,11 +401,17 @@ fun linuxSleep(milliseconds: int): void {
     linuxProcessUnit()
 }
 
-// Ambient providers used by the compiler stay on the same libc-free syscall
-// layer as ordinary Abla programs. These helpers expose values, while compile
-// capability policy remains the compiler evaluator's responsibility.
-fun linuxMonotonicMilliseconds(): int {
-    val timestamp = nativeByteBuffer(16)
+fun linuxSleepNanoseconds(nanoseconds: int): bool {
+    val succeeded = linuxSleepNanosecondsChecked(nanoseconds)
+    linuxProcessUnit()
+    succeeded
+}
+
+fun linuxMonotonicNanosecondsWithBuffer(
+    var timestamp: NativeByteBuffer
+): int {
+    var result = 0
+    if (timestamp.closed || timestamp.capacity < 16) return result
     timestamp.storeI64(0, 0)
     timestamp.storeI64(8, 0)
     val status = linuxSyscall2(
@@ -394,14 +419,64 @@ fun linuxMonotonicMilliseconds(): int {
         1,
         nativePointerAddress(timestamp.address)
     )
-    var result = 0
     if (status == 0) {
-        result = timestamp.loadI64(0) * 1000 +
-            timestamp.loadI64(8) / 1000000
+        val seconds = timestamp.loadI64(0)
+        val nanoseconds = timestamp.loadI64(8)
+        if (seconds >= 0 && seconds <= 9223372035 &&
+            nanoseconds >= 0 && nanoseconds < 1000000000 &&
+            seconds <= (9223372036854775807 - nanoseconds) / 1000000000) {
+            result = seconds * 1000000000 + nanoseconds
+        }
     }
+    result
+}
+
+resource class LinuxMonotonicClock(
+    var timestamp: NativeByteBuffer,
+    var requested: NativeByteBuffer,
+    var remaining: NativeByteBuffer
+) {
+    fun valid(): bool = !this.timestamp.closed &&
+        this.timestamp.capacity >= 16 && !this.requested.closed &&
+        this.requested.capacity >= 16 && !this.remaining.closed &&
+        this.remaining.capacity >= 16
+
+    fun nanoseconds(): int =
+        linuxMonotonicNanosecondsWithBuffer(this.timestamp)
+
+    fun sleepNanoseconds(nanoseconds: int): bool =
+        linuxSleepNanosecondsWithBuffers(
+            nanoseconds,
+            this.requested,
+            this.remaining
+        )
+
+    fun drop(): void {
+        this.timestamp.close()
+        this.requested.close()
+        this.remaining.close()
+        return
+    }
+}
+
+fun linuxMonotonicClock(): LinuxMonotonicClock = LinuxMonotonicClock(
+    nativeByteBuffer(16),
+    nativeByteBuffer(16),
+    nativeByteBuffer(16)
+)
+
+// Ambient providers used by the compiler stay on the same libc-free syscall
+// layer as ordinary Abla programs. These helpers expose values, while compile
+// capability policy remains the compiler evaluator's responsibility.
+fun linuxMonotonicNanoseconds(): int {
+    val timestamp = nativeByteBuffer(16)
+    val result = linuxMonotonicNanosecondsWithBuffer(timestamp)
     timestamp.close()
     result
 }
+
+fun linuxMonotonicMilliseconds(): int =
+    linuxMonotonicNanoseconds() / 1000000
 
 fun linuxRandomInteger(maxExclusive: int): int {
     var result = 0
