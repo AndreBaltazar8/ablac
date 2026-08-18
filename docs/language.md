@@ -29,8 +29,9 @@ Integer literals are decimal or hexadecimal (`0x2a`) and may contain `_`
 between digits. Floating literals are decimal, default to `f64`, and require a
 fractional digit or a valid decimal exponent (`1.5`, `2e3`, `1.25e-2`); `_` may
 separate their digits. Floating literals and arithmetic are currently runtime
-only, operands must have the same width, and explicit `f32` conversion remains
-forthcoming. Strings use `"..."` and support the escapes `\t`, `\b`, `\r`,
+only, operands must have the same width, and `abla/float` provides the explicit
+signed `int` to `f64` numerical conversion `f64FromInt`. Explicit `f32`
+conversion remains forthcoming. Strings use `"..."` and support the escapes `\t`, `\b`, `\r`,
 `\n`, `\'`, `\"`, `\\`, `\$`, and `\uXXXX`. `$name` and `${expression}` are
 string interpolation.
 

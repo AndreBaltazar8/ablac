@@ -35,7 +35,7 @@ unrelated policy or compiler machinery into the program:
 | `abla/websocket/event` | bounded epoll WebSocket manager with fragmentation, ping/pong, and output backpressure |
 | `abla/websocket/tls` | certificate-verified WSS client transport |
 | `abla/json` | [bounded JSON parsing, deterministic serialization, and `$json` literals](json.md) |
-| `abla/float` | runtime `f64` to/from IEEE-754 bit-pattern conversion without numerical casts |
+| `abla/float` | runtime `f64` bit-pattern access and explicit signed `int` to `f64` numerical conversion |
 | `abla/http/json` | opt-in adapters between JSON values and HTTP requests/responses |
 | `abla/html` | HTML data model and `$html` subparser |
 | `abla/compiler/*` | compile-time parser/reflection APIs only |
