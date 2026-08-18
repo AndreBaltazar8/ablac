@@ -207,6 +207,13 @@ under `build/`.
 The [original implementation audit](docs/original-audit.md) separates behavior
 that was demonstrated by the prototype from incomplete or aspirational design.
 
+## Community
+
+Join the [Abla Discord community](https://discord.gg/qxrQyJBxtK) to ask
+questions, share experiments, and discuss the language, compiler, and
+ecosystem. Discord is for conversation; bugs and durable design decisions
+should remain in the repository.
+
 ## Contributing
 
 The language is still defining its safety, bootstrap, package, and extension
