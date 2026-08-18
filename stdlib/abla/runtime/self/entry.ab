@@ -579,6 +579,7 @@ trusted fun __ablaRuntimeBitShiftRightUnsigned(
     __ablaRuntimeAsI64(left) >>> __ablaRuntimeAsI64(right)
 )
 
+@inline
 trusted fun __ablaRuntimeStringEqualBool(left: any, right: any): bool {
     val leftLength = __ablaRuntimeStringLengthValue(left)
     val rightLength = __ablaRuntimeStringLengthValue(right)
@@ -883,6 +884,7 @@ trusted fun __ablaRuntimeStringLengthI64(value: any): int =
 trusted fun __ablaRuntimeStringLength(value: any): any =
     __ablaRuntimeI64(__ablaRuntimeStringLengthValue(value))
 
+@inline
 trusted fun __ablaRuntimeStringGetI64(value: any, index: int): int {
     val length = __ablaRuntimeStringLengthValue(value)
     if (index < 0 || index >= length) {
@@ -896,6 +898,7 @@ trusted fun __ablaRuntimeStringGet(value: any, index: any): any =
         __ablaRuntimeStringGetI64(value, __ablaRuntimeAsI64(index))
     )
 
+@inline
 trusted fun __ablaRuntimeStringSlice(
     value: any,
     beginValue: any,
@@ -1523,6 +1526,156 @@ trusted fun __ablaRuntimeJsonFindPlainStringEnd(
         }
     }
     found
+}
+
+trusted fun __ablaRuntimeJsonMatchCompactObjectField(
+    value: string,
+    offset: int,
+    name: string,
+    comma: bool
+): int {
+    val size = __ablaRuntimeStringLengthValue(value)
+    val nameSize = __ablaRuntimeStringLengthValue(name)
+    val fixed = if (comma) 4 else 3
+    var result = -1
+    var valid = offset >= 0 && offset <= size &&
+        size - offset >= fixed && nameSize <= size - offset - fixed
+    val data = if (size == 0) 0 else __ablaRuntimeStringData(value)
+    val nameData = if (nameSize == 0) 0 else __ablaRuntimeStringData(name)
+    var cursor = offset
+    if (valid && comma) {
+        valid = ablaRuntimeLoadU8(data + cursor) == 44
+        cursor = cursor + 1
+    }
+    if (valid) {
+        valid = ablaRuntimeLoadU8(data + cursor) == 34
+        cursor = cursor + 1
+    }
+    var index = 0
+    while (valid && index < nameSize) {
+        valid = ablaRuntimeLoadU8(data + cursor + index) ==
+            ablaRuntimeLoadU8(nameData + index)
+        index = index + 1
+    }
+    cursor = cursor + nameSize
+    if (valid) {
+        valid = ablaRuntimeLoadU8(data + cursor) == 34 &&
+            ablaRuntimeLoadU8(data + cursor + 1) == 58
+    }
+    if (valid) result = cursor + 2
+    result
+}
+
+// Fast state transition for a compact JSON array. Positive results encode the
+// next value offset plus one; negative results encode the offset after an
+// empty-array closing bracket. Zero asks the checked whitespace-aware reader
+// to preserve its full diagnostics.
+trusted fun __ablaRuntimeJsonCompactArrayNext(
+    value: string,
+    offset: int,
+    first: bool
+): int {
+    val size = __ablaRuntimeStringLengthValue(value)
+    if (offset < 0 || offset >= size) return 0
+    val data = __ablaRuntimeStringData(value)
+    var cursor = offset
+    if (!first) {
+        if (ablaRuntimeLoadU8(data + cursor) != 44) return 0
+        cursor = cursor + 1
+        if (cursor >= size) return 0
+    }
+    val byte = ablaRuntimeLoadU8(data + cursor)
+    if (byte == 93) {
+        if (!first) return 0
+        return 0 - cursor - 2
+    }
+    if (byte == 32 || byte == 9 || byte == 10 || byte == 13) return 0
+    cursor + 1
+}
+
+trusted fun __ablaRuntimeJsonAvailableIntegerEnd(
+    value: string,
+    begin: int
+): int {
+    val size = __ablaRuntimeStringLengthValue(value)
+    if (begin < 0 || begin >= size) return -1
+    val data = __ablaRuntimeStringData(value)
+    var cursor = begin
+    val negative = ablaRuntimeLoadU8(data + cursor) == 45
+    if (negative) cursor = cursor + 1
+    if (cursor >= size) return -1
+    val digitBegin = cursor
+    val first = ablaRuntimeLoadU8(data + cursor)
+    if (first == 48) {
+        cursor = cursor + 1
+        if (cursor < size) {
+            val next = ablaRuntimeLoadU8(data + cursor)
+            if (next >= 48 && next <= 57) return -1
+        }
+    } else if (first >= 49 && first <= 57) {
+        var scanning = true
+        while (scanning && cursor < size) {
+            val byte = ablaRuntimeLoadU8(data + cursor)
+            scanning = byte >= 48 && byte <= 57
+            if (scanning) cursor = cursor + 1
+        }
+    } else return -1
+    if (cursor < size) {
+        val suffix = ablaRuntimeLoadU8(data + cursor)
+        if (suffix == 43 || suffix == 45 || suffix == 46 ||
+            suffix == 101 || suffix == 69) return -1
+    }
+    val digits = cursor - digitBegin
+    if (digits > 19) return -1
+    if (digits < 19) return cursor
+    var accumulator = 0
+    var index = digitBegin
+    var available = true
+    while (available && index < cursor) {
+        val digit = ablaRuntimeLoadU8(data + index) - 48
+        if (accumulator < -922337203685477580 ||
+            (accumulator == -922337203685477580 &&
+             digit > (if (negative) 8 else 7))) {
+            available = false
+        } else accumulator = accumulator * 10 - digit
+        index = index + 1
+    }
+    if (available) cursor else -1
+}
+
+trusted fun __ablaRuntimeJsonIntegerValueAt(
+    value: string,
+    begin: int,
+    end: int
+): int {
+    val size = __ablaRuntimeStringLengthValue(value)
+    if (begin < 0 || end <= begin || end > size) return 0
+    val data = __ablaRuntimeStringData(value)
+    val negative = ablaRuntimeLoadU8(data + begin) == 45
+    var cursor = if (negative) begin + 1 else begin
+    var result = 0
+    while (cursor < end) {
+        result = result * 10 - (ablaRuntimeLoadU8(data + cursor) - 48)
+        cursor = cursor + 1
+    }
+    if (negative) result else 0 - result
+}
+
+trusted fun __ablaRuntimeJsonWhitespaceEnd(
+    value: string,
+    begin: int
+): int {
+    val size = __ablaRuntimeStringLengthValue(value)
+    if (begin < 0 || begin > size) return begin
+    val data = if (size == 0) 0 else __ablaRuntimeStringData(value)
+    var cursor = begin
+    var scanning = true
+    while (scanning && cursor < size) {
+        val byte = ablaRuntimeLoadU8(data + cursor)
+        scanning = byte == 32 || byte == 9 || byte == 10 || byte == 13
+        if (scanning) cursor = cursor + 1
+    }
+    cursor
 }
 
 trusted fun __ablaRuntimeTextFindSequence(

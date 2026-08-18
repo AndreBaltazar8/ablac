@@ -115,6 +115,44 @@ noescape extern:"intrinsic" fun ablaJsonFindPlainStringEnd(
     end: int
 ): int
 
+// Return the offset after a compact `,"name":` (or first-field `"name":`)
+// token, or -1 when the source needs the whitespace-aware raw fallback.
+// One checked raw-memory pass avoids constructing a slice and then comparing
+// that slice through the general string ABI.
+noescape extern:"intrinsic" fun ablaJsonMatchCompactObjectField(
+    value: string,
+    offset: int,
+    name: string,
+    comma: bool
+): int
+
+// Encodes a compact array transition without allocating or repeatedly crossing
+// the checked string-index ABI. Zero selects the complete diagnostic path.
+noescape extern:"intrinsic" fun ablaJsonCompactArrayNext(
+    value: string,
+    offset: int,
+    first: bool
+): int
+
+// Compact signed-64-bit integer decoding uses raw source bytes and returns -1
+// for fractions, exponents, malformed grammar, or overflow. Callers retain the
+// full scanner as an exact diagnostic fallback for those inputs.
+noescape extern:"intrinsic" fun ablaJsonAvailableIntegerEnd(
+    value: string,
+    begin: int
+): int
+
+noescape extern:"intrinsic" fun ablaJsonIntegerValueAt(
+    value: string,
+    begin: int,
+    end: int
+): int
+
+noescape extern:"intrinsic" fun ablaJsonWhitespaceEnd(
+    value: string,
+    begin: int
+): int
+
 // Single-buffer streaming serializer. Container state is held in bitsets, so
 // nesting does not allocate a DOM node, fragment, or context object.
 class JsonEncoder(
@@ -361,7 +399,7 @@ fun JsonParserState.fail(
     message: string,
     offset: int
 ): void {
-    if (this.errorCode == "") {
+    if (this.errorCode.size == 0) {
         this.errorCode = code
         this.errorMessage = message
         this.errorOffset = offset
@@ -369,12 +407,8 @@ fun JsonParserState.fail(
 }
 
 fun jsonSkipWhitespace(var state: JsonParserState): void {
-    var scanning = true
-    while (scanning && state.offset < state.source.size) {
-        val byte = state.source[state.offset]
-        scanning = byte == 32 || byte == 9 || byte == 10 || byte == 13
-        if (scanning) state.offset = state.offset + 1
-    }
+    state.offset = ablaJsonWhitespaceEnd(state.source, state.offset)
+    return
 }
 
 fun jsonHexValue(byte: int): int {
@@ -408,7 +442,7 @@ fun jsonParseEscapedString(
         state.source.slice(contentBegin, state.offset)
     )
     var closed = false
-    while (state.errorCode == "" && !closed &&
+    while (state.errorCode.size == 0 && !closed &&
            state.offset < state.source.size) {
         val byte = state.source[state.offset]
         if (byte == 34) {
@@ -471,7 +505,7 @@ fun jsonParseEscapedString(
                                 unicodeOffset
                             )
                         }
-                        if (state.errorCode == "") {
+                        if (state.errorCode.size == 0) {
                             output.appendText(utf8Encode(scalar))
                         }
                     }
@@ -501,14 +535,14 @@ fun jsonParseEscapedString(
                 state.offset = state.offset + length
             }
         }
-        if (state.errorCode == "" &&
+        if (state.errorCode.size == 0 &&
             output.size() > state.limits.maximumStringBytes) {
             state.fail(
                 "string_limit", "JSON string exceeds configured limit", quoteOffset
             )
         }
     }
-    if (state.errorCode == "" && !closed) {
+    if (state.errorCode.size == 0 && !closed) {
         state.fail(
             "unexpected_end", "unterminated JSON string", state.source.size
         )
@@ -516,27 +550,14 @@ fun jsonParseEscapedString(
     output.toText()
 }
 
-fun jsonParseString(var state: JsonParserState): string {
-    val quoteOffset = state.offset
-    if (state.offset < state.source.size && state.source[state.offset] == 34) {
-        state.offset = state.offset + 1
-    } else state.fail("unexpected_token", "expected JSON string", state.offset)
-    val contentBegin = state.offset
-    var scanning = state.errorCode == ""
+fun jsonParseStringFallback(
+    var state: JsonParserState,
+    quoteOffset: int,
+    contentBegin: int
+): string {
+    state.offset = contentBegin
+    var scanning = state.errorCode.size == 0
     var closed = false
-    // Canonical protocol strings overwhelmingly contain neither escapes nor
-    // controls. Locate the closing quote with the raw text scanner, then
-    // validate that bounded slice in one raw pass. Escaped/invalid input falls
-    // through to the precise existing decoder and diagnostics below.
-    val plainEnd = if (scanning) ablaJsonFindPlainStringEnd(
-        state.source, contentBegin, state.source.size
-    ) else -1
-    if (plainEnd >= contentBegin &&
-        plainEnd - contentBegin <= state.limits.maximumStringBytes) {
-        state.offset = plainEnd
-        scanning = false
-        closed = true
-    }
     while (scanning && state.offset < state.source.size) {
         val byte = state.source[state.offset]
         if (byte == 34) {
@@ -554,7 +575,7 @@ fun jsonParseString(var state: JsonParserState): string {
                 scanning = false
             } else state.offset = state.offset + length
         }
-        if (state.errorCode == "" &&
+        if (state.errorCode.size == 0 &&
             state.offset - contentBegin > state.limits.maximumStringBytes) {
             state.fail(
                 "string_limit", "JSON string exceeds configured limit",
@@ -563,13 +584,33 @@ fun jsonParseString(var state: JsonParserState): string {
             scanning = false
         }
     }
-    if (closed && state.errorCode == "") {
+    if (closed && state.errorCode.size == 0) {
         val result = state.source.slice(contentBegin, state.offset)
         state.offset = state.offset + 1
         result
     } else jsonParseEscapedString(
         state, quoteOffset, contentBegin
     )
+}
+
+fun jsonParseString(var state: JsonParserState): string {
+    val quoteOffset = state.offset
+    if (state.offset < state.source.size && state.source[state.offset] == 34) {
+        state.offset = state.offset + 1
+    } else state.fail("unexpected_token", "expected JSON string", state.offset)
+    val contentBegin = state.offset
+    // Keep the overwhelmingly common unescaped path in a small function. The
+    // precise escape and Unicode diagnostics live out of line so they do not
+    // force their large temporary state into every ordinary string read.
+    val plainEnd = if (state.errorCode.size == 0) ablaJsonFindPlainStringEnd(
+        state.source, contentBegin, state.source.size
+    ) else -1
+    if (plainEnd >= contentBegin &&
+        plainEnd - contentBegin <= state.limits.maximumStringBytes) {
+        val result = state.source.slice(contentBegin, plainEnd)
+        state.offset = plainEnd + 1
+        result
+    } else jsonParseStringFallback(state, quoteOffset, contentBegin)
 }
 
 fun jsonParseNumber(var state: JsonParserState): Json {
@@ -592,19 +633,19 @@ fun jsonParseNumber(var state: JsonParserState): Json {
 fun jsonParseValue(var state: JsonParserState, depth: int): Json {
     jsonSkipWhitespace(state)
     var result = jsonNull()
-    if (state.errorCode == "" && depth > state.limits.maximumDepth) {
+    if (state.errorCode.size == 0 && depth > state.limits.maximumDepth) {
         state.fail("depth_limit", "JSON nesting exceeds configured limit", state.offset)
     }
-    if (state.errorCode == "") {
+    if (state.errorCode.size == 0) {
         state.nodes = state.nodes + 1
         if (state.nodes > state.limits.maximumNodes) {
             state.fail("node_limit", "JSON node count exceeds configured limit", state.offset)
         }
     }
-    if (state.errorCode == "" && state.offset >= state.source.size) {
+    if (state.errorCode.size == 0 && state.offset >= state.source.size) {
         state.fail("unexpected_end", "expected JSON value", state.offset)
     }
-    if (state.errorCode == "") {
+    if (state.errorCode.size == 0) {
         val byte = state.source[state.offset]
         if (byte == 34) result = jsonString(jsonParseString(state))
         else if (byte == 91) {
@@ -617,7 +658,7 @@ fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                 state.offset = state.offset + 1
                 closed = true
             }
-            while (state.errorCode == "" && !closed) {
+            while (state.errorCode.size == 0 && !closed) {
                 values.append(jsonParseValue(state, depth + 1))
                 jsonSkipWhitespace(state)
                 if (state.offset >= state.source.size) {
@@ -656,7 +697,7 @@ fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                 state.offset = state.offset + 1
                 closed = true
             }
-            while (state.errorCode == "" && !closed) {
+            while (state.errorCode.size == 0 && !closed) {
                 if (state.offset >= state.source.size) {
                     state.fail(
                         "unexpected_end", "unterminated JSON object", state.offset
@@ -669,8 +710,8 @@ fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                     )
                 }
                 var key = ""
-                if (state.errorCode == "") key = jsonParseString(state)
-                if (state.errorCode == "" &&
+                if (state.errorCode.size == 0) key = jsonParseString(state)
+                if (state.errorCode.size == 0 &&
                     keys.size >= state.limits.maximumObjectMembers) {
                     state.fail(
                         "node_limit",
@@ -684,14 +725,14 @@ fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                     if (keys[keyIndex] == key) duplicate = true
                     keyIndex = keyIndex + 1
                 }
-                if (state.errorCode == "" && duplicate &&
+                if (state.errorCode.size == 0 && duplicate &&
                     state.limits.rejectDuplicateKeys) {
                     state.fail(
                         "duplicate_key", "duplicate JSON object key", state.offset
                     )
                 }
                 jsonSkipWhitespace(state)
-                if (state.errorCode == "" &&
+                if (state.errorCode.size == 0 &&
                     (state.offset >= state.source.size ||
                      state.source[state.offset] != 58)) {
                     state.fail(
@@ -700,26 +741,26 @@ fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                         state.offset
                     )
                 }
-                if (state.errorCode == "") state.offset = state.offset + 1
+                if (state.errorCode.size == 0) state.offset = state.offset + 1
                 var value = jsonNull()
-                if (state.errorCode == "") {
+                if (state.errorCode.size == 0) {
                     value = jsonParseValue(state, depth + 1)
                 }
-                if (state.errorCode == "") {
+                if (state.errorCode.size == 0) {
                     keys.append(key)
                     values.append(value)
                 }
                 jsonSkipWhitespace(state)
-                if (state.errorCode == "" &&
+                if (state.errorCode.size == 0 &&
                     state.offset >= state.source.size) {
                     state.fail(
                         "unexpected_end", "unterminated JSON object", state.offset
                     )
-                } else if (state.errorCode == "" &&
+                } else if (state.errorCode.size == 0 &&
                     state.source[state.offset] == 125) {
                     state.offset = state.offset + 1
                     closed = true
-                } else if (state.errorCode == "" &&
+                } else if (state.errorCode.size == 0 &&
                     state.source[state.offset] == 44) {
                     state.offset = state.offset + 1
                     jsonSkipWhitespace(state)
@@ -731,7 +772,7 @@ fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                             state.offset
                         )
                     }
-                } else if (state.errorCode == "") state.fail(
+                } else if (state.errorCode.size == 0) state.fail(
                     "unexpected_token",
                     "expected comma or closing brace",
                     state.offset
@@ -781,25 +822,25 @@ fun jsonParse(
     if (!jsonLimitsValid(limits)) {
         state.fail("input_limit", "invalid JSON parser limits", 0)
     }
-    if (state.errorCode == "" && source.size > limits.maximumBytes) {
+    if (state.errorCode.size == 0 && source.size > limits.maximumBytes) {
         state.fail(
             "input_limit", "JSON input exceeds configured byte limit",
             limits.maximumBytes
         )
     }
-    if (state.errorCode == "") {
+    if (state.errorCode.size == 0) {
         val utf8 = utf8Info(source)
         if (!utf8.valid) {
             state.fail("invalid_unicode", "JSON input is not valid UTF-8", utf8.errorOffset)
         }
     }
     var value = jsonNull()
-    if (state.errorCode == "") value = jsonParseValue(state, 1)
+    if (state.errorCode.size == 0) value = jsonParseValue(state, 1)
     jsonSkipWhitespace(state)
-    if (state.errorCode == "" && state.offset != source.size) {
+    if (state.errorCode.size == 0 && state.offset != source.size) {
         state.fail("trailing_input", "trailing input after JSON value", state.offset)
     }
-    if (state.errorCode == "") {
+    if (state.errorCode.size == 0) {
         JsonParseResult(value, true, JsonError("", "", 0, 1, 1))
     } else {
         val location = jsonErrorLocation(source, state.errorOffset)
@@ -819,7 +860,7 @@ fun jsonParse(
 
 fun jsonReaderConsume(var state: JsonParserState, expected: int): bool {
     jsonSkipWhitespace(state)
-    val matches = state.errorCode == "" &&
+    val matches = state.errorCode.size == 0 &&
         state.offset < state.source.size &&
         state.source[state.offset] == expected
     if (matches) state.offset = state.offset + 1
@@ -858,21 +899,21 @@ fun jsonScanLiteral(var state: JsonParserState, literal: string): void {
 // the caller may retain the original byte slice through `readRaw` below.
 fun jsonScanValue(var state: JsonParserState, depth: int): void {
     jsonSkipWhitespace(state)
-    if (state.errorCode == "" && depth > state.limits.maximumDepth) {
+    if (state.errorCode.size == 0 && depth > state.limits.maximumDepth) {
         state.fail(
             "depth_limit", "JSON nesting exceeds configured limit", state.offset
         )
     }
-    if (state.errorCode == "") {
+    if (state.errorCode.size == 0) {
         state.nodes = state.nodes + 1
         if (state.nodes > state.limits.maximumNodes) state.fail(
             "node_limit", "JSON node count exceeds configured limit", state.offset
         )
     }
-    if (state.errorCode == "" && state.offset >= state.source.size) {
+    if (state.errorCode.size == 0 && state.offset >= state.source.size) {
         state.fail("unexpected_end", "expected JSON value", state.offset)
     }
-    if (state.errorCode == "") {
+    if (state.errorCode.size == 0) {
         val byte = state.source[state.offset]
         if (byte == 34) jsonParseString(state)
         else if (byte == 91) {
@@ -884,7 +925,7 @@ fun jsonScanValue(var state: JsonParserState, depth: int): void {
                 state.offset = state.offset + 1
                 closed = true
             }
-            while (state.errorCode == "" && !closed) {
+            while (state.errorCode.size == 0 && !closed) {
                 jsonScanValue(state, depth + 1)
                 jsonSkipWhitespace(state)
                 if (state.offset < state.source.size &&
@@ -911,7 +952,7 @@ fun jsonScanValue(var state: JsonParserState, depth: int): void {
                 state.offset = state.offset + 1
                 closed = true
             }
-            while (state.errorCode == "" && !closed) {
+            while (state.errorCode.size == 0 && !closed) {
                 if (keys.size >= state.limits.maximumObjectMembers) state.fail(
                     "node_limit", "JSON object member limit exceeded",
                     state.offset
@@ -926,7 +967,7 @@ fun jsonScanValue(var state: JsonParserState, depth: int): void {
                 if (duplicate && state.limits.rejectDuplicateKeys) state.fail(
                     "duplicate_key", "duplicate JSON object key", state.offset
                 )
-                if (state.errorCode == "") keys.append(key)
+                if (state.errorCode.size == 0) keys.append(key)
                 jsonReaderConsume(state, 58)
                 jsonScanValue(state, depth + 1)
                 jsonSkipWhitespace(state)
@@ -978,14 +1019,14 @@ fun JsonObjectReader.next(): string {
         this.state.offset
     )
     jsonSkipWhitespace(this.state)
-    if (this.state.errorCode == "" && !this.done &&
+    if (this.state.errorCode.size == 0 && !this.done &&
         this.state.offset < this.state.source.size &&
         this.state.source[this.state.offset] == 125) {
         this.state.offset = this.state.offset + 1
         this.done = true
     }
     var key = ""
-    if (this.state.errorCode == "" && !this.done) {
+    if (this.state.errorCode.size == 0 && !this.done) {
         if (!this.first) jsonReaderConsume(this.state, 44)
         jsonSkipWhitespace(this.state)
         if (this.state.offset < this.state.source.size &&
@@ -995,7 +1036,7 @@ fun JsonObjectReader.next(): string {
                 this.state.offset
             )
         }
-        if (this.state.errorCode == "") key = jsonParseString(this.state)
+        if (this.state.errorCode.size == 0) key = jsonParseString(this.state)
         var duplicate = false
         var index = 0
         while (index < this.keys.size) {
@@ -1011,7 +1052,7 @@ fun JsonObjectReader.next(): string {
                 this.state.offset
             )
         }
-        if (this.state.errorCode == "") {
+        if (this.state.errorCode.size == 0) {
             this.keys.append(key)
             jsonReaderConsume(this.state, 58)
             this.expectingValue = true
@@ -1032,15 +1073,15 @@ fun JsonObjectReader.nextExpected(name: string): bool {
     if (!this.first) jsonReaderConsume(this.state, 44)
     jsonSkipWhitespace(this.state)
     var key = ""
-    if (this.state.errorCode == "" &&
+    if (this.state.errorCode.size == 0 &&
         this.state.offset < this.state.source.size &&
         this.state.source[this.state.offset] != 125) {
         key = jsonParseString(this.state)
-    } else if (this.state.errorCode == "") this.state.fail(
+    } else if (this.state.errorCode.size == 0) this.state.fail(
         "unexpected_end", "expected JSON object field", this.state.offset
     )
-    val matches = this.state.errorCode == "" && key == name
-    if (!matches && this.state.errorCode == "") this.state.fail(
+    val matches = this.state.errorCode.size == 0 && key == name
+    if (!matches && this.state.errorCode.size == 0) this.state.fail(
         "unexpected_token", "unexpected JSON object field", this.state.offset
     )
     if (matches) {
@@ -1060,23 +1101,14 @@ fun JsonObjectReader.nextExpectedRaw(name: string): bool {
         this.state.offset
     )
     val originalOffset = this.state.offset
-    var cursor = originalOffset
-    var matches = this.state.errorCode == ""
-    if (matches && !this.first) {
-        matches = cursor < this.state.source.size &&
-            this.state.source[cursor] == 44
-        if (matches) cursor = cursor + 1
-    }
-    val compactBegin = cursor + 1
-    val compactEnd = compactBegin + name.size
-    matches = matches && cursor < this.state.source.size &&
-        this.state.source[cursor] == 34 &&
-        compactEnd + 1 < this.state.source.size &&
-        this.state.source.slice(compactBegin, compactEnd) == name &&
-        this.state.source[compactEnd] == 34 &&
-        this.state.source[compactEnd + 1] == 58
+    val compactEnd = if (this.state.errorCode.size == 0) {
+        ablaJsonMatchCompactObjectField(
+            this.state.source, originalOffset, name, !this.first
+        )
+    } else -1
+    var matches = compactEnd >= 0
     if (matches) {
-        this.state.offset = compactEnd + 2
+        this.state.offset = compactEnd
         this.expectingValue = true
         this.first = false
     } else {
@@ -1084,7 +1116,7 @@ fun JsonObjectReader.nextExpectedRaw(name: string): bool {
         if (!this.first) jsonReaderConsume(this.state, 44)
         jsonSkipWhitespace(this.state)
         // The fallback preserves whitespace handling and precise diagnostics.
-        matches = this.state.errorCode == "" &&
+        matches = this.state.errorCode.size == 0 &&
             this.state.offset < this.state.source.size &&
             this.state.source[this.state.offset] == 34
         if (matches) this.state.offset = this.state.offset + 1
@@ -1094,7 +1126,7 @@ fun JsonObjectReader.nextExpectedRaw(name: string): bool {
             this.state.source.slice(begin, end) == name &&
             this.state.source[end] == 34
         if (matches) this.state.offset = end + 1
-        else if (this.state.errorCode == "") this.state.fail(
+        else if (this.state.errorCode.size == 0) this.state.fail(
             "unexpected_token", "unexpected JSON object field",
             this.state.offset
         )
@@ -1113,7 +1145,7 @@ fun JsonObjectReader.readString(): string {
         "unexpected_token", "JSON object reader has no current value",
         this.state.offset
     )
-    if (this.state.errorCode == "") value = jsonParseString(this.state)
+    if (this.state.errorCode.size == 0) value = jsonParseString(this.state)
     this.expectingValue = false
     value
 }
@@ -1126,15 +1158,23 @@ fun JsonObjectReader.readInteger(): int {
     )
     jsonSkipWhitespace(this.state)
     val begin = this.state.offset
-    if (this.state.errorCode == "") jsonScanNumber(this.state)
-    val text = this.state.source.slice(begin, this.state.offset)
-    val grammar = jsonNumberGrammar(text)
-    if (this.state.errorCode == "" && grammar.integer &&
-        jsonIntegerTextAvailable(text)) {
-        value = jsonIntegerTextValue(text)
-    } else if (this.state.errorCode == "") this.state.fail(
-        "invalid_number", "expected available JSON integer", begin
-    )
+    val fastEnd = if (this.state.errorCode.size == 0) {
+        ablaJsonAvailableIntegerEnd(this.state.source, begin)
+    } else -1
+    if (fastEnd >= begin) {
+        this.state.offset = fastEnd
+        value = ablaJsonIntegerValueAt(this.state.source, begin, fastEnd)
+    } else {
+        if (this.state.errorCode.size == 0) jsonScanNumber(this.state)
+        val text = this.state.source.slice(begin, this.state.offset)
+        val grammar = jsonNumberGrammar(text)
+        if (this.state.errorCode.size == 0 && grammar.integer &&
+            jsonIntegerTextAvailable(text)) {
+            value = jsonIntegerTextValue(text)
+        } else if (this.state.errorCode.size == 0) this.state.fail(
+            "invalid_number", "expected available JSON integer", begin
+        )
+    }
     this.expectingValue = false
     value
 }
@@ -1146,12 +1186,12 @@ fun JsonObjectReader.readBoolean(): bool {
         this.state.offset
     )
     jsonSkipWhitespace(this.state)
-    if (this.state.errorCode == "" &&
+    if (this.state.errorCode.size == 0 &&
         this.state.offset < this.state.source.size &&
         this.state.source[this.state.offset] == 116) {
         jsonScanLiteral(this.state, "true")
         value = true
-    } else if (this.state.errorCode == "") {
+    } else if (this.state.errorCode.size == 0) {
         jsonScanLiteral(this.state, "false")
     }
     this.expectingValue = false
@@ -1186,8 +1226,8 @@ fun JsonObjectReader.readRaw(): string {
     )
     jsonSkipWhitespace(this.state)
     val begin = this.state.offset
-    if (this.state.errorCode == "") jsonScanValue(this.state, 1)
-    if (this.state.errorCode == "") {
+    if (this.state.errorCode.size == 0) jsonScanValue(this.state, 1)
+    if (this.state.errorCode.size == 0) {
         value = this.state.source.slice(begin, this.state.offset)
     }
     this.expectingValue = false
@@ -1208,13 +1248,13 @@ fun JsonObjectReader.readStringPairsRaw(): string {
     jsonReaderConsume(this.state, 91)
     jsonSkipWhitespace(this.state)
     var closed = false
-    if (this.state.errorCode == "" &&
+    if (this.state.errorCode.size == 0 &&
         this.state.offset < this.state.source.size &&
         this.state.source[this.state.offset] == 93) {
         this.state.offset = this.state.offset + 1
         closed = true
     }
-    while (this.state.errorCode == "" && !closed) {
+    while (this.state.errorCode.size == 0 && !closed) {
         jsonReaderConsume(this.state, 91)
         jsonParseString(this.state)
         jsonReaderConsume(this.state, 44)
@@ -1227,7 +1267,7 @@ fun JsonObjectReader.readStringPairsRaw(): string {
             closed = true
         } else jsonReaderConsume(this.state, 44)
     }
-    if (this.state.errorCode == "") {
+    if (this.state.errorCode.size == 0) {
         value = this.state.source.slice(begin, this.state.offset)
     }
     this.expectingValue = false
@@ -1243,9 +1283,9 @@ fun JsonObjectReader.finish(): bool {
     if (this.expectingValue) this.state.fail(
         "unexpected_end", "JSON object value was not consumed", this.state.offset
     )
-    if (!this.done && this.state.errorCode == "") this.next()
+    if (!this.done && this.state.errorCode.size == 0) this.next()
     jsonSkipWhitespace(this.state)
-    this.state.errorCode == "" && this.done &&
+    this.state.errorCode.size == 0 && this.done &&
         this.state.offset == this.state.source.size
 }
 
@@ -1253,8 +1293,8 @@ fun JsonObjectReader.finishNested(): bool {
     if (this.expectingValue) this.state.fail(
         "unexpected_end", "JSON object value was not consumed", this.state.offset
     )
-    if (!this.done && this.state.errorCode == "") this.next()
-    this.state.errorCode == "" && this.done
+    if (!this.done && this.state.errorCode.size == 0) this.next()
+    this.state.errorCode.size == 0 && this.done
 }
 
 fun jsonArrayReader(
@@ -1274,14 +1314,31 @@ fun JsonArrayReader.next(): bool {
         "unexpected_token", "previous JSON array value was not consumed",
         this.state.offset
     )
+    if (this.state.errorCode.size == 0 && !this.done &&
+        !this.expectingValue) {
+        val compact = ablaJsonCompactArrayNext(
+            this.state.source, this.state.offset, this.first
+        )
+        if (compact > 0) {
+            this.state.offset = compact - 1
+            this.expectingValue = true
+            this.first = false
+            return true
+        }
+        if (compact < 0) {
+            this.state.offset = 0 - compact - 1
+            this.done = true
+            return false
+        }
+    }
     jsonSkipWhitespace(this.state)
-    if (this.state.errorCode == "" && !this.done &&
+    if (this.state.errorCode.size == 0 && !this.done &&
         this.state.offset < this.state.source.size &&
         this.state.source[this.state.offset] == 93) {
         this.state.offset = this.state.offset + 1
         this.done = true
     }
-    if (this.state.errorCode == "" && !this.done) {
+    if (this.state.errorCode.size == 0 && !this.done) {
         if (!this.first) jsonReaderConsume(this.state, 44)
         jsonSkipWhitespace(this.state)
         if (this.state.offset < this.state.source.size &&
@@ -1291,7 +1348,7 @@ fun JsonArrayReader.next(): bool {
                 this.state.offset
             )
         }
-        if (this.state.errorCode == "") {
+        if (this.state.errorCode.size == 0) {
             this.expectingValue = true
             this.first = false
         }
@@ -1305,7 +1362,7 @@ fun JsonArrayReader.readString(): string {
         "unexpected_token", "JSON array reader has no current value",
         this.state.offset
     )
-    if (this.state.errorCode == "") value = jsonParseString(this.state)
+    if (this.state.errorCode.size == 0) value = jsonParseString(this.state)
     this.expectingValue = false
     value
 }
@@ -1318,15 +1375,23 @@ fun JsonArrayReader.readInteger(): int {
     )
     jsonSkipWhitespace(this.state)
     val begin = this.state.offset
-    if (this.state.errorCode == "") jsonScanNumber(this.state)
-    val text = this.state.source.slice(begin, this.state.offset)
-    val grammar = jsonNumberGrammar(text)
-    if (this.state.errorCode == "" && grammar.integer &&
-        jsonIntegerTextAvailable(text)) {
-        value = jsonIntegerTextValue(text)
-    } else if (this.state.errorCode == "") this.state.fail(
-        "invalid_number", "expected available JSON integer", begin
-    )
+    val fastEnd = if (this.state.errorCode.size == 0) {
+        ablaJsonAvailableIntegerEnd(this.state.source, begin)
+    } else -1
+    if (fastEnd >= begin) {
+        this.state.offset = fastEnd
+        value = ablaJsonIntegerValueAt(this.state.source, begin, fastEnd)
+    } else {
+        if (this.state.errorCode.size == 0) jsonScanNumber(this.state)
+        val text = this.state.source.slice(begin, this.state.offset)
+        val grammar = jsonNumberGrammar(text)
+        if (this.state.errorCode.size == 0 && grammar.integer &&
+            jsonIntegerTextAvailable(text)) {
+            value = jsonIntegerTextValue(text)
+        } else if (this.state.errorCode.size == 0) this.state.fail(
+            "invalid_number", "expected available JSON integer", begin
+        )
+    }
     this.expectingValue = false
     value
 }
@@ -1338,12 +1403,12 @@ fun JsonArrayReader.readBoolean(): bool {
         this.state.offset
     )
     jsonSkipWhitespace(this.state)
-    if (this.state.errorCode == "" &&
+    if (this.state.errorCode.size == 0 &&
         this.state.offset < this.state.source.size &&
         this.state.source[this.state.offset] == 116) {
         jsonScanLiteral(this.state, "true")
         value = true
-    } else if (this.state.errorCode == "") {
+    } else if (this.state.errorCode.size == 0) {
         jsonScanLiteral(this.state, "false")
     }
     this.expectingValue = false
@@ -1375,7 +1440,7 @@ fun JsonArrayReader.skip(): void {
         "unexpected_token", "JSON array reader has no current value",
         this.state.offset
     )
-    if (this.state.errorCode == "") jsonScanValue(this.state, 1)
+    if (this.state.errorCode.size == 0) jsonScanValue(this.state, 1)
     this.expectingValue = false
     jsonSkipWhitespace(this.state)
 }
@@ -1384,9 +1449,9 @@ fun JsonArrayReader.finish(): bool {
     if (this.expectingValue) this.state.fail(
         "unexpected_end", "JSON array value was not consumed", this.state.offset
     )
-    if (!this.done && this.state.errorCode == "") this.next()
+    if (!this.done && this.state.errorCode.size == 0) this.next()
     jsonSkipWhitespace(this.state)
-    this.state.errorCode == "" && this.done &&
+    this.state.errorCode.size == 0 && this.done &&
         this.state.offset == this.state.source.size
 }
 
@@ -1394,8 +1459,8 @@ fun JsonArrayReader.finishNested(): bool {
     if (this.expectingValue) this.state.fail(
         "unexpected_end", "JSON array value was not consumed", this.state.offset
     )
-    if (!this.done && this.state.errorCode == "") this.next()
-    this.state.errorCode == "" && this.done
+    if (!this.done && this.state.errorCode.size == 0) this.next()
+    this.state.errorCode.size == 0 && this.done
 }
 
 // One raw pass handles the common JSON-string case. Keeping the source data
@@ -1474,6 +1539,14 @@ fun jsonEncodeNull(): JsonEncoded = JsonEncoded("null", true)
 
 fun jsonEncodeString(value: string): JsonEncoded =
     JsonEncoded(jsonQuote(value), value.isValidUtf8())
+
+// Static schemas can precompute the complete quoted-key-and-colon token. This
+// preserves ordinary JSON escaping while requiring one output append instead
+// of separate key and colon fragments at runtime.
+fun jsonEncodeObjectKey(value: string): JsonEncoded {
+    val encoded = jsonEncodeString(value)
+    JsonEncoded("${encoded.text}:", encoded.valid)
+}
 
 fun jsonEncodeInteger(value: int): JsonEncoded = JsonEncoded("$value", true)
 
@@ -1560,6 +1633,22 @@ fun JsonEncoder.encodedKey(key: JsonEncoded): void {
         if (this.valid) {
             this.output.appendText(key.text)
             this.output.appendText(":")
+            this.expectingValueBits = this.expectingValueBits | mask
+        }
+    }
+}
+
+fun JsonEncoder.encodedObjectKey(key: JsonEncoded): void {
+    if (this.depth <= 0 || !key.valid) this.valid = false
+    if (this.valid) {
+        val mask = 1 << (this.depth - 1)
+        if ((this.objectBits & mask) == 0 ||
+            (this.expectingValueBits & mask) != 0) this.valid = false
+        if (this.valid && (this.nonEmptyBits & mask) != 0) {
+            this.output.appendText(",")
+        }
+        if (this.valid) {
+            this.output.appendText(key.text)
             this.expectingValueBits = this.expectingValueBits | mask
         }
     }
