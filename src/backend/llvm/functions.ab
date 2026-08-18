@@ -7,6 +7,7 @@ fun bootstrapLlvmDirectScalarType(type: string): string {
     val normalized = bootstrapNormalizeType(type)
     if (normalized == "i64") "i64"
     else if (normalized == "bool") "bool"
+    else if (normalized == "f64") "f64"
     else ""
 }
 
@@ -346,14 +347,8 @@ fun bootstrapLlvmInitializeParameters(
                 backend, source, storage.parameters[parameter], "argument"
             )
         } else {
-            bootstrapLlvmStoreTaggedWordValue(
-                backend,
-                storage.parameters[parameter],
-                if (scalar == "bool") 3 else 2,
-                if (scalar == "bool") LLVMBuildZExt(
-                    backend.builder, source, backend.i64Type,
-                    "argument.bool.word"
-                ) else source
+            bootstrapLlvmBoxScalar(
+                backend, storage.parameters[parameter], source, scalar
             )
         }
         LLVMBuildBr(backend.builder, ready)
@@ -470,14 +465,47 @@ fun bootstrapLlvmNativeValue(
             storage.valueTypes[value] != "" &&
             !pointerIsNull(storage.values[value])) {
             val scalar = storage.valueTypes[value]
-            result = bootstrapLlvmCallNamed(
-                backend,
-                if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
-                [storage.values[value]], "scalar.unbox", false, [true]
+            result = bootstrapLlvmUnboxScalar(
+                backend, storage.values[value], scalar, "scalar.unbox"
             )
         }
     }
     result
+}
+
+fun bootstrapLlvmUnboxScalar(
+    backend: BootstrapLlvmBackend,
+    boxed: i64*,
+    scalar: string,
+    name: string
+): i64* {
+    var result = bootstrapLlvmCallNamed(
+        backend,
+        if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
+        [boxed], name, false, [true]
+    )
+    if (scalar == "f64") result = LLVMBuildBitCast(
+        backend.builder, result, backend.f64Type, "$name.f64"
+    )
+    result
+}
+
+fun bootstrapLlvmBoxScalar(
+    backend: BootstrapLlvmBackend,
+    destination: i64*,
+    native: i64*,
+    scalar: string
+): void {
+    var stored = native
+    if (scalar == "f64") stored = LLVMBuildBitCast(
+        backend.builder, native, backend.i64Type, "scalar.f64.bits"
+    )
+    bootstrapLlvmCallNamed(
+        backend,
+        if (scalar == "bool") "abla_bool" else "abla_i64",
+        [destination, stored], "", true, [false, false]
+    )
+    return
 }
 
 fun bootstrapLlvmSetNativeValue(
@@ -490,10 +518,8 @@ fun bootstrapLlvmSetNativeValue(
         storage.nativeValues[value] = native
         if (!pointerIsNull(storage.values[value])) {
             val scalar = storage.valueTypes[value]
-            bootstrapLlvmCallNamed(
-                backend,
-                if (scalar == "bool") "abla_bool" else "abla_i64",
-                [storage.values[value], native], "", true, [false, false]
+            bootstrapLlvmBoxScalar(
+                backend, storage.values[value], native, scalar
             )
         }
     }
@@ -574,19 +600,16 @@ fun bootstrapLlvmDirectCallArguments(
                 var native = bootstrapLlvmNativeValue(
                     backend, storage, operands[parameter]
                 )
-                if (pointerIsNull(native)) native = bootstrapLlvmCallNamed(
-                        backend,
-                        if (scalar == "bool") "abla_as_bool"
-                        else "abla_as_i64",
-                        [storage.values[operands[parameter]]],
-                        "direct.argument", false, [true]
-                    )
+                if (pointerIsNull(native)) native = bootstrapLlvmUnboxScalar(
+                    backend, storage.values[operands[parameter]], scalar,
+                    "direct.argument"
+                )
                 arguments.append(native)
             }
         } else {
             arguments.append(
                 if (scalar == "") LLVMConstNull(backend.pointerType)
-                else LLVMConstInt(backend.type(scalar), 0, 0)
+                else LLVMConstNull(backend.type(scalar))
             )
         }
         parameter = parameter + 1
@@ -608,11 +631,7 @@ fun bootstrapLlvmEmitDirectCall(
         scalar == "", bootstrapLlvmFalseFlags(arguments.size)
     )
     if (scalar != "" && !pointerIsNull(output)) {
-        bootstrapLlvmCallNamed(
-            backend,
-            if (scalar == "bool") "abla_bool" else "abla_i64",
-            [output, result], "", true, [false, false]
-        )
+        bootstrapLlvmBoxScalar(backend, output, result, scalar)
     }
     result
 }
@@ -657,11 +676,9 @@ fun bootstrapLlvmScalarOperand(
     scalar: string
 ): i64* {
     var result = bootstrapLlvmNativeValue(backend, storage, value)
-    if (pointerIsNull(result)) result = bootstrapLlvmCallNamed(
-            backend,
-            if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
-            [storage.values[value]], "scalar.boundary", false, [true]
-        )
+    if (pointerIsNull(result)) result = bootstrapLlvmUnboxScalar(
+        backend, storage.values[value], scalar, "scalar.boundary"
+    )
     result
 }
 
@@ -677,32 +694,50 @@ fun bootstrapLlvmEmitScalarOperation(
         var native = nativeNullPointer()
         if (instruction.opcode == "+" || instruction.opcode == "-" ||
             instruction.opcode == "*" || instruction.opcode == "/") {
+            val scalar = storage.valueTypes[instruction.result]
             val left = bootstrapLlvmScalarOperand(
-                backend, storage, instruction.left, "i64"
+                backend, storage, instruction.left, scalar
             )
             val right = bootstrapLlvmScalarOperand(
-                backend, storage, instruction.right, "i64"
+                backend, storage, instruction.right, scalar
             )
-            if (instruction.opcode == "+") native = LLVMBuildAdd(
-                backend.builder, left, right, "scalar.add"
-            )
-            if (instruction.opcode == "-") native = LLVMBuildSub(
-                backend.builder, left, right, "scalar.subtract"
-            )
-            if (instruction.opcode == "*") native = LLVMBuildMul(
-                backend.builder, left, right, "scalar.multiply"
-            )
-            if (instruction.opcode == "/") native = LLVMBuildSDiv(
-                backend.builder, left, right, "scalar.divide"
-            )
+            if (scalar == "f32" || scalar == "f64") {
+                if (instruction.opcode == "+") native = LLVMBuildFAdd(
+                    backend.builder, left, right, "scalar.fadd"
+                )
+                if (instruction.opcode == "-") native = LLVMBuildFSub(
+                    backend.builder, left, right, "scalar.fsubtract"
+                )
+                if (instruction.opcode == "*") native = LLVMBuildFMul(
+                    backend.builder, left, right, "scalar.fmultiply"
+                )
+                if (instruction.opcode == "/") native = LLVMBuildFDiv(
+                    backend.builder, left, right, "scalar.fdivide"
+                )
+            } else {
+                if (instruction.opcode == "+") native = LLVMBuildAdd(
+                    backend.builder, left, right, "scalar.add"
+                )
+                if (instruction.opcode == "-") native = LLVMBuildSub(
+                    backend.builder, left, right, "scalar.subtract"
+                )
+                if (instruction.opcode == "*") native = LLVMBuildMul(
+                    backend.builder, left, right, "scalar.multiply"
+                )
+                if (instruction.opcode == "/") native = LLVMBuildSDiv(
+                    backend.builder, left, right, "scalar.divide"
+                )
+            }
         }
-        if (instruction.opcode == "neg") native = LLVMBuildNeg(
-            backend.builder,
-            bootstrapLlvmScalarOperand(
-                backend, storage, instruction.left, "i64"
-            ),
-            "scalar.negate"
-        )
+        if (instruction.opcode == "neg") {
+            val scalar = storage.valueTypes[instruction.result]
+            val operand = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.left, scalar
+            )
+            native = if (scalar == "f32" || scalar == "f64") LLVMBuildFNeg(
+                backend.builder, operand, "scalar.fnegate"
+            ) else LLVMBuildNeg(backend.builder, operand, "scalar.negate")
+        }
         if (instruction.opcode == "&" || instruction.opcode == "|" ||
             instruction.opcode == "^") {
             val left = bootstrapLlvmScalarOperand(
@@ -807,7 +842,8 @@ fun bootstrapLlvmEmitScalarOperation(
             )
         }
         if (instruction.opcode == "array.get.i64" ||
-            instruction.opcode == "array.get.bool") {
+            instruction.opcode == "array.get.bool" ||
+            instruction.opcode == "array.get.f64") {
             native = bootstrapLlvmCallNamed(
                 backend,
                 if (instruction.opcode == "array.get.bool") {
@@ -819,6 +855,12 @@ fun bootstrapLlvmEmitScalarOperation(
                  )],
                 "scalar.array.get", false, [true, false]
             )
+            if (instruction.opcode == "array.get.f64") {
+                native = LLVMBuildBitCast(
+                    backend.builder, native, backend.f64Type,
+                    "scalar.array.get.f64"
+                )
+            }
         }
         if (instruction.opcode == "string.equal" ||
             instruction.opcode == "string.not.equal") {
@@ -833,7 +875,8 @@ fun bootstrapLlvmEmitScalarOperation(
             )
         }
         if (instruction.opcode == "field.get.indexed.i64" ||
-            instruction.opcode == "field.get.indexed.bool") {
+            instruction.opcode == "field.get.indexed.bool" ||
+            instruction.opcode == "field.get.indexed.f64") {
             native = bootstrapLlvmCallNamed(
                 backend,
                 if (instruction.opcode == "field.get.indexed.bool") {
@@ -847,6 +890,12 @@ fun bootstrapLlvmEmitScalarOperation(
                  )],
                 "scalar.field.get", false, [true, false, false]
             )
+            if (instruction.opcode == "field.get.indexed.f64") {
+                native = LLVMBuildBitCast(
+                    backend.builder, native, backend.f64Type,
+                    "scalar.field.get.f64"
+                )
+            }
         }
         if (instruction.opcode == "&&" || instruction.opcode == "||") {
             val left = bootstrapLlvmScalarOperand(
@@ -867,8 +916,8 @@ fun bootstrapLlvmEmitScalarOperation(
             var operandType = "i64"
             if (instruction.left >= 0 &&
                 instruction.left < storage.valueTypes.size &&
-                storage.valueTypes[instruction.left] == "bool") {
-                operandType = "bool"
+                storage.valueTypes[instruction.left] != "") {
+                operandType = storage.valueTypes[instruction.left]
             }
             val left = bootstrapLlvmScalarOperand(
                 backend, storage, instruction.left, operandType
@@ -876,21 +925,47 @@ fun bootstrapLlvmEmitScalarOperation(
             val right = bootstrapLlvmScalarOperand(
                 backend, storage, instruction.right, operandType
             )
-            var predicate = llvmIntEqual()
-            if (instruction.opcode == "!=") predicate = llvmIntNotEqual()
-            if (instruction.opcode == "<") predicate = llvmIntSignedLessThan()
-            if (instruction.opcode == "<=") {
-                predicate = llvmIntSignedLessOrEqual()
+            if (operandType == "f32" || operandType == "f64") {
+                var predicate = llvmRealOrderedEqual()
+                if (instruction.opcode == "!=") {
+                    predicate = llvmRealUnorderedNotEqual()
+                }
+                if (instruction.opcode == "<") {
+                    predicate = llvmRealOrderedLessThan()
+                }
+                if (instruction.opcode == "<=") {
+                    predicate = llvmRealOrderedLessOrEqual()
+                }
+                if (instruction.opcode == ">") {
+                    predicate = llvmRealOrderedGreaterThan()
+                }
+                if (instruction.opcode == ">=") {
+                    predicate = llvmRealOrderedGreaterOrEqual()
+                }
+                native = LLVMBuildFCmp(
+                    backend.builder, predicate, left, right,
+                    "scalar.fcompare"
+                )
+            } else {
+                var predicate = llvmIntEqual()
+                if (instruction.opcode == "!=") predicate = llvmIntNotEqual()
+                if (instruction.opcode == "<") {
+                    predicate = llvmIntSignedLessThan()
+                }
+                if (instruction.opcode == "<=") {
+                    predicate = llvmIntSignedLessOrEqual()
+                }
+                if (instruction.opcode == ">") {
+                    predicate = llvmIntSignedGreaterThan()
+                }
+                if (instruction.opcode == ">=") {
+                    predicate = llvmIntSignedGreaterOrEqual()
+                }
+                native = LLVMBuildICmp(
+                    backend.builder, predicate, left, right,
+                    "scalar.compare"
+                )
             }
-            if (instruction.opcode == ">") {
-                predicate = llvmIntSignedGreaterThan()
-            }
-            if (instruction.opcode == ">=") {
-                predicate = llvmIntSignedGreaterOrEqual()
-            }
-            native = LLVMBuildICmp(
-                backend.builder, predicate, left, right, "scalar.compare"
-            )
         }
         if (!pointerIsNull(native)) {
             bootstrapLlvmSetNativeValue(
@@ -957,6 +1032,12 @@ fun bootstrapLlvmNativeArgument(
         result = bootstrapLlvmCallNamed(
             backend, "abla_as_bool", [storage.values[value]],
             "native.bool", false, [true]
+        )
+    } else if (type == "f64" && !pointerIsNull(scalar)) {
+        result = scalar
+    } else if (type == "f64") {
+        result = bootstrapLlvmUnboxScalar(
+            backend, storage.values[value], type, "native.f64"
         )
     } else if (type == "cstring") {
         result = bootstrapLlvmCallNamed(
@@ -1028,6 +1109,11 @@ fun bootstrapLlvmStoreNativeResult(
         bootstrapLlvmCallNamed(
             backend, "abla_i64", [storage.values[output], integer],
             "", true, [false, false]
+        )
+    }
+    if (type == "f64") {
+        bootstrapLlvmBoxScalar(
+            backend, storage.values[output], value, type
         )
     }
 }
@@ -1753,14 +1839,12 @@ fun bootstrapLlvmEmitFunctionReturn(
 ): void {
     val scalar = bootstrapLlvmDirectScalarType(function.resultType)
     if (scalar != "") {
-        var native = LLVMConstInt(backend.type(scalar), 0, 0)
+        var native = LLVMConstNull(backend.type(scalar))
         if (value >= 0) {
             native = bootstrapLlvmNativeValue(backend, storage, value)
-            if (pointerIsNull(native)) native = bootstrapLlvmCallNamed(
-                    backend,
-                    if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
-                    [storage.values[value]], "direct.return", false, [true]
-                )
+            if (pointerIsNull(native)) native = bootstrapLlvmUnboxScalar(
+                backend, storage.values[value], scalar, "direct.return"
+            )
         }
         bootstrapLlvmPopRoots(backend, storage)
         LLVMBuildRet(backend.builder, native)
@@ -1870,6 +1954,17 @@ fun bootstrapLlvmEmitFunction(
                 )
             )
         }
+        if (reachable && instruction.opcode == "const.f64") {
+            matched = true
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMConstRealOfStringAndSize(
+                    backend.f64Type,
+                    instruction.text,
+                    instruction.text.size
+                )
+            )
+        }
         if (reachable && instruction.opcode == "const.bool") {
             matched = true
             bootstrapLlvmSetNativeValue(
@@ -1929,12 +2024,9 @@ fun bootstrapLlvmEmitFunction(
                         )
                     } else bootstrapLlvmSetNativeValue(
                         backend, storage, instruction.result,
-                        bootstrapLlvmCallNamed(
-                            backend,
-                            if (scalar == "bool") "abla_as_bool"
-                            else "abla_as_i64",
-                            [storage.parameters[found]], "parameter.load",
-                            false, [true]
+                        bootstrapLlvmUnboxScalar(
+                            backend, storage.parameters[found], scalar,
+                            "parameter.load"
                         )
                     )
                 } else bootstrapLlvmCopyValue(
@@ -2567,7 +2659,8 @@ fun bootstrapLlvmEmitFunction(
             }
         }
         if (reachable && (instruction.opcode == "field.set.indexed.i64" ||
-                          instruction.opcode == "field.set.indexed.bool")) {
+                          instruction.opcode == "field.set.indexed.bool" ||
+                          instruction.opcode == "field.set.indexed.f64")) {
             matched = true
             val found = fieldIndex.find(instruction.text)
             if (found < 0 || instruction.target < 0 ||
@@ -2576,10 +2669,16 @@ fun bootstrapLlvmEmitFunction(
                 instruction.operands.size == 2) {
                 val scalar = if (
                     instruction.opcode == "field.set.indexed.bool"
-                ) "bool" else "i64"
-                val native = bootstrapLlvmScalarOperand(
+                ) "bool" else if (
+                    instruction.opcode == "field.set.indexed.f64"
+                ) "f64" else "i64"
+                val scalarValue = bootstrapLlvmScalarOperand(
                     backend, storage, instruction.operands[1], scalar
                 )
+                val native = if (scalar == "f64") LLVMBuildBitCast(
+                    backend.builder, scalarValue, backend.i64Type,
+                    "scalar.field.set.f64"
+                ) else scalarValue
                 bootstrapLlvmCallNamed(
                     backend,
                     if (scalar == "bool") {
@@ -2594,7 +2693,7 @@ fun bootstrapLlvmEmitFunction(
                     "", false, [true, false, false, false]
                 )
                 bootstrapLlvmSetNativeValue(
-                    backend, storage, instruction.result, native
+                    backend, storage, instruction.result, scalarValue
                 )
             }
         }
@@ -2673,12 +2772,9 @@ fun bootstrapLlvmEmitFunction(
                         backend, storage, instruction.left
                     )
                     if (pointerIsNull(native)) native =
-                        bootstrapLlvmCallNamed(
-                            backend,
-                            if (scalar == "bool") "abla_as_bool"
-                            else "abla_as_i64",
-                            [storage.values[instruction.left]],
-                            "global.scalar.value", false, [true]
+                        bootstrapLlvmUnboxScalar(
+                            backend, storage.values[instruction.left],
+                            scalar, "global.scalar.value"
                         )
                     LLVMBuildStore(backend.builder, native, global)
                     bootstrapLlvmSetNativeValue(
