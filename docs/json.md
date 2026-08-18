@@ -130,6 +130,15 @@ path for the common `[[name, value], ...]` protocol shape. Readers retain the
 same input, UTF-8, depth, node, string, member, duplicate-key, and trailing-byte
 checks as the tree parser.
 
+Schema readers can also traverse nested data without rescanning a retained raw
+slice. `readObject` and `readArray` return readers sharing the same forward
+parser state. Object readers additionally expose `readInteger` and
+`readBoolean`; array readers use `next` with `readString`, `readInteger`,
+`readBoolean`, `readObject`, `readArray`, or `skip`. Call `finishNested` before
+continuing in the parent and `finish` on the root reader. The canonical
+`nextExpectedRaw` path fuses compact `,"name":` tokens while preserving the
+whitespace-aware diagnostic fallback.
+
 For output, the single-pass `JsonEncoder` writes one validated stream without
 building fragments or a dynamic tree:
 
@@ -146,6 +155,10 @@ encoder.endArray()
 encoder.endObject()
 val encoded = encoder.finish()
 ```
+
+For a static protocol key, `encodedKey(#jsonEncodeString("ok"))` moves quoting
+and UTF-8 validation to compile time. Dynamic or untrusted keys continue to use
+`key`.
 
 `key`, `string`, `integer`, `boolean`, `nullValue`, `beginObject`,
 `beginArray`, `endObject`, and `endArray` enforce container state while writing.

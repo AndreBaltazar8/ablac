@@ -78,6 +78,16 @@ class JsonObjectReader(
     var expectingValue: bool
 )
 
+// Forward-only array companion for schema-aware nested JSON. Object and array
+// readers may share one parser state, so nested values are validated exactly
+// once without materializing a Json tree or retaining raw substrings.
+class JsonArrayReader(
+    val state: JsonParserState,
+    var first: bool,
+    var done: bool,
+    var expectingValue: bool
+)
+
 // Validated encoded fragments and streaming container builders avoid a
 // temporary `Json` object graph during serialization.
 class JsonEncoded(val text: string, val valid: bool)
@@ -307,10 +317,19 @@ fun Json.intAvailable(): bool =
 
 fun Json.get(key: string): Json {
     var value = jsonNull()
-    var index = 0
-    while (index < this.keys.size && index < this.values.size) {
-        if (this.keys[index] == key) value = this.values[index]
-        index = index + 1
+    var found = false
+    var index = if (this.keys.size < this.values.size) {
+        this.keys.size
+    } else this.values.size
+    while (!found && index > 0) {
+        index = index - 1
+        val candidate = this.keys[index]
+        val possible = candidate.size == key.size &&
+            (key.size == 0 || candidate[0] == key[0])
+        if (possible && candidate == key) {
+            value = this.values[index]
+            found = true
+        }
     }
     value
 }
@@ -1040,28 +1059,50 @@ fun JsonObjectReader.nextExpectedRaw(name: string): bool {
         "unexpected_token", "previous JSON object value was not consumed",
         this.state.offset
     )
-    if (!this.first) jsonReaderConsume(this.state, 44)
-    jsonSkipWhitespace(this.state)
-    // This canonical-schema path compares every expected byte directly. A
-    // separate UTF-8 pass over the same trusted schema name only duplicated
-    // work; callers needing decoded/untrusted names use nextExpected().
-    var matches = this.state.errorCode == "" &&
-        this.state.offset < this.state.source.size &&
-        this.state.source[this.state.offset] == 34
-    if (matches) this.state.offset = this.state.offset + 1
-    val begin = this.state.offset
-    val end = begin + name.size
-    matches = matches && end < this.state.source.size &&
-        this.state.source.slice(begin, end) == name &&
-        this.state.source[end] == 34
-    if (matches) this.state.offset = end + 1
-    else if (this.state.errorCode == "") this.state.fail(
-        "unexpected_token", "unexpected JSON object field", this.state.offset
-    )
+    val originalOffset = this.state.offset
+    var cursor = originalOffset
+    var matches = this.state.errorCode == ""
+    if (matches && !this.first) {
+        matches = cursor < this.state.source.size &&
+            this.state.source[cursor] == 44
+        if (matches) cursor = cursor + 1
+    }
+    val compactBegin = cursor + 1
+    val compactEnd = compactBegin + name.size
+    matches = matches && cursor < this.state.source.size &&
+        this.state.source[cursor] == 34 &&
+        compactEnd + 1 < this.state.source.size &&
+        this.state.source.slice(compactBegin, compactEnd) == name &&
+        this.state.source[compactEnd] == 34 &&
+        this.state.source[compactEnd + 1] == 58
     if (matches) {
-        jsonReaderConsume(this.state, 58)
+        this.state.offset = compactEnd + 2
         this.expectingValue = true
         this.first = false
+    } else {
+        this.state.offset = originalOffset
+        if (!this.first) jsonReaderConsume(this.state, 44)
+        jsonSkipWhitespace(this.state)
+        // The fallback preserves whitespace handling and precise diagnostics.
+        matches = this.state.errorCode == "" &&
+            this.state.offset < this.state.source.size &&
+            this.state.source[this.state.offset] == 34
+        if (matches) this.state.offset = this.state.offset + 1
+        val begin = this.state.offset
+        val end = begin + name.size
+        matches = matches && end < this.state.source.size &&
+            this.state.source.slice(begin, end) == name &&
+            this.state.source[end] == 34
+        if (matches) this.state.offset = end + 1
+        else if (this.state.errorCode == "") this.state.fail(
+            "unexpected_token", "unexpected JSON object field",
+            this.state.offset
+        )
+        if (matches) {
+            jsonReaderConsume(this.state, 58)
+            this.expectingValue = true
+            this.first = false
+        }
     }
     matches
 }
@@ -1075,6 +1116,66 @@ fun JsonObjectReader.readString(): string {
     if (this.state.errorCode == "") value = jsonParseString(this.state)
     this.expectingValue = false
     value
+}
+
+fun JsonObjectReader.readInteger(): int {
+    var value = 0
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    jsonSkipWhitespace(this.state)
+    val begin = this.state.offset
+    if (this.state.errorCode == "") jsonScanNumber(this.state)
+    val text = this.state.source.slice(begin, this.state.offset)
+    val grammar = jsonNumberGrammar(text)
+    if (this.state.errorCode == "" && grammar.integer &&
+        jsonIntegerTextAvailable(text)) {
+        value = jsonIntegerTextValue(text)
+    } else if (this.state.errorCode == "") this.state.fail(
+        "invalid_number", "expected available JSON integer", begin
+    )
+    this.expectingValue = false
+    value
+}
+
+fun JsonObjectReader.readBoolean(): bool {
+    var value = false
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    jsonSkipWhitespace(this.state)
+    if (this.state.errorCode == "" &&
+        this.state.offset < this.state.source.size &&
+        this.state.source[this.state.offset] == 116) {
+        jsonScanLiteral(this.state, "true")
+        value = true
+    } else if (this.state.errorCode == "") {
+        jsonScanLiteral(this.state, "false")
+    }
+    this.expectingValue = false
+    value
+}
+
+fun JsonObjectReader.readObject(): JsonObjectReader {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    jsonReaderConsume(this.state, 123)
+    this.expectingValue = false
+    JsonObjectReader(this.state, [], true, false, false)
+}
+
+fun JsonObjectReader.readArray(): JsonArrayReader {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    jsonReaderConsume(this.state, 91)
+    this.expectingValue = false
+    JsonArrayReader(this.state, true, false, false)
 }
 
 fun JsonObjectReader.readRaw(): string {
@@ -1146,6 +1247,155 @@ fun JsonObjectReader.finish(): bool {
     jsonSkipWhitespace(this.state)
     this.state.errorCode == "" && this.done &&
         this.state.offset == this.state.source.size
+}
+
+fun JsonObjectReader.finishNested(): bool {
+    if (this.expectingValue) this.state.fail(
+        "unexpected_end", "JSON object value was not consumed", this.state.offset
+    )
+    if (!this.done && this.state.errorCode == "") this.next()
+    this.state.errorCode == "" && this.done
+}
+
+fun jsonArrayReader(
+    source: string,
+    limits: JsonLimits = jsonDefaultLimits()
+): JsonArrayReader {
+    val state = JsonParserState(source, limits, 0, 0, "", "", 0)
+    if (!jsonLimitsValid(limits) || source.size > limits.maximumBytes) {
+        state.fail("input_limit", "invalid JSON input limits", 0)
+    }
+    jsonReaderConsume(state, 91)
+    JsonArrayReader(state, true, false, false)
+}
+
+fun JsonArrayReader.next(): bool {
+    if (this.expectingValue) this.state.fail(
+        "unexpected_token", "previous JSON array value was not consumed",
+        this.state.offset
+    )
+    jsonSkipWhitespace(this.state)
+    if (this.state.errorCode == "" && !this.done &&
+        this.state.offset < this.state.source.size &&
+        this.state.source[this.state.offset] == 93) {
+        this.state.offset = this.state.offset + 1
+        this.done = true
+    }
+    if (this.state.errorCode == "" && !this.done) {
+        if (!this.first) jsonReaderConsume(this.state, 44)
+        jsonSkipWhitespace(this.state)
+        if (this.state.offset < this.state.source.size &&
+            this.state.source[this.state.offset] == 93) {
+            this.state.fail(
+                "unexpected_token", "trailing comma in JSON array",
+                this.state.offset
+            )
+        }
+        if (this.state.errorCode == "") {
+            this.expectingValue = true
+            this.first = false
+        }
+    }
+    this.expectingValue
+}
+
+fun JsonArrayReader.readString(): string {
+    var value = ""
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON array reader has no current value",
+        this.state.offset
+    )
+    if (this.state.errorCode == "") value = jsonParseString(this.state)
+    this.expectingValue = false
+    value
+}
+
+fun JsonArrayReader.readInteger(): int {
+    var value = 0
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON array reader has no current value",
+        this.state.offset
+    )
+    jsonSkipWhitespace(this.state)
+    val begin = this.state.offset
+    if (this.state.errorCode == "") jsonScanNumber(this.state)
+    val text = this.state.source.slice(begin, this.state.offset)
+    val grammar = jsonNumberGrammar(text)
+    if (this.state.errorCode == "" && grammar.integer &&
+        jsonIntegerTextAvailable(text)) {
+        value = jsonIntegerTextValue(text)
+    } else if (this.state.errorCode == "") this.state.fail(
+        "invalid_number", "expected available JSON integer", begin
+    )
+    this.expectingValue = false
+    value
+}
+
+fun JsonArrayReader.readBoolean(): bool {
+    var value = false
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON array reader has no current value",
+        this.state.offset
+    )
+    jsonSkipWhitespace(this.state)
+    if (this.state.errorCode == "" &&
+        this.state.offset < this.state.source.size &&
+        this.state.source[this.state.offset] == 116) {
+        jsonScanLiteral(this.state, "true")
+        value = true
+    } else if (this.state.errorCode == "") {
+        jsonScanLiteral(this.state, "false")
+    }
+    this.expectingValue = false
+    value
+}
+
+fun JsonArrayReader.readObject(): JsonObjectReader {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON array reader has no current value",
+        this.state.offset
+    )
+    jsonReaderConsume(this.state, 123)
+    this.expectingValue = false
+    JsonObjectReader(this.state, [], true, false, false)
+}
+
+fun JsonArrayReader.readArray(): JsonArrayReader {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON array reader has no current value",
+        this.state.offset
+    )
+    jsonReaderConsume(this.state, 91)
+    this.expectingValue = false
+    JsonArrayReader(this.state, true, false, false)
+}
+
+fun JsonArrayReader.skip(): void {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON array reader has no current value",
+        this.state.offset
+    )
+    if (this.state.errorCode == "") jsonScanValue(this.state, 1)
+    this.expectingValue = false
+    jsonSkipWhitespace(this.state)
+}
+
+fun JsonArrayReader.finish(): bool {
+    if (this.expectingValue) this.state.fail(
+        "unexpected_end", "JSON array value was not consumed", this.state.offset
+    )
+    if (!this.done && this.state.errorCode == "") this.next()
+    jsonSkipWhitespace(this.state)
+    this.state.errorCode == "" && this.done &&
+        this.state.offset == this.state.source.size
+}
+
+fun JsonArrayReader.finishNested(): bool {
+    if (this.expectingValue) this.state.fail(
+        "unexpected_end", "JSON array value was not consumed", this.state.offset
+    )
+    if (!this.done && this.state.errorCode == "") this.next()
+    this.state.errorCode == "" && this.done
 }
 
 // One raw pass handles the common JSON-string case. Keeping the source data
@@ -1289,6 +1539,26 @@ fun JsonEncoder.key(name: string): void {
         }
         if (this.valid) this.valid = jsonAppendString(this.output, name)
         if (this.valid) {
+            this.output.appendText(":")
+            this.expectingValueBits = this.expectingValueBits | mask
+        }
+    }
+}
+
+// Static protocol schemas may quote and validate a key at compile time with
+// #jsonEncodeString, then append that trusted fragment without rescanning it
+// for every encoded object.
+fun JsonEncoder.encodedKey(key: JsonEncoded): void {
+    if (this.depth <= 0 || !key.valid) this.valid = false
+    if (this.valid) {
+        val mask = 1 << (this.depth - 1)
+        if ((this.objectBits & mask) == 0 ||
+            (this.expectingValueBits & mask) != 0) this.valid = false
+        if (this.valid && (this.nonEmptyBits & mask) != 0) {
+            this.output.appendText(",")
+        }
+        if (this.valid) {
+            this.output.appendText(key.text)
             this.output.appendText(":")
             this.expectingValueBits = this.expectingValueBits | mask
         }
