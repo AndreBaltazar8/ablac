@@ -27,4 +27,13 @@ check_failure invalid-named-argument-unknown.ab UNKNOWN
 check_failure invalid-named-argument-duplicate.ab DUPLICATE
 check_failure invalid-named-argument-order.ab ORDER
 
-echo "named/default arguments: invalid name, duplicate, and order diagnostics passed"
+"$compiler" build \
+    "$project_root/tests/cases/modules/named-many-default-arguments.ab" \
+    -o "$output_directory/named-many-default-arguments" --fast --no-cache
+set +e
+"$output_directory/named-many-default-arguments"
+named_many_status=$?
+set -e
+[[ $named_many_status -eq 42 ]]
+
+echo "named/default arguments: extension defaults and invalid diagnostics passed"
