@@ -78,7 +78,7 @@ set +e
 invalid_raw_literal_status=$?
 set -e
 [[ $invalid_raw_literal_status -ne 0 ]]
-grep -Fq 'error[E_SUBPARSER_INVOCATION]' \
+grep -Fq 'error[E_SUBPARSER_FAILURE]: raw literal tag mismatch' \
     "$output_directory/invalid-raw-extension-literal.err"
 grep -Fq 'source[extension-expression]:' \
     "$output_directory/invalid-raw-extension-literal.err"
