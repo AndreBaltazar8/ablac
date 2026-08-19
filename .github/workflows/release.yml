@@ -19,12 +19,15 @@ jobs:
         include:
           - runner: ubuntu-24.04
             asset: ablac-x86_64-linux
+            architecture: x86_64
             platform: linux
           - runner: macos-15
             asset: ablac-arm64-macos
+            architecture: arm64
             platform: macos
           - runner: macos-15-intel
             asset: ablac-x86_64-macos
+            architecture: x86_64
             platform: macos
     runs-on: ${{ matrix.runner }}
     steps:
@@ -62,12 +65,66 @@ jobs:
           else
             (cd build/release && shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
           fi
+      - if: matrix.platform == 'linux'
+        name: Package the portable Linux toolchain
+        run: |
+          docker run --rm \
+            -v "$PWD:/abla" \
+            ubuntu:22.04@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f \
+            bash -ceu '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                binaryen ca-certificates curl gnupg patchelf
+              curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm.asc
+              fingerprint=$(gpg --show-keys --with-colons /tmp/llvm.asc |
+                awk -F: '\''$1 == "fpr" { print $10; exit }'\'')
+              test "$fingerprint" = 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+              gpg --dearmor -o /usr/share/keyrings/apt.llvm.org.gpg /tmp/llvm.asc
+              echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" \
+                > /etc/apt/sources.list.d/llvm.list
+              apt-get update
+              apt-get install -y --no-install-recommends clang-21 llvm-21 lld-21 libssl3
+              export PATH=/usr/lib/llvm-21/bin:$PATH
+              /abla/tools/package-linux-toolchain.sh \
+                /abla/build/release/ablac-x86_64-linux \
+                /abla \
+                /abla/build/release/abla-toolchain-x86_64-linux.tar.gz
+            '
+      - if: matrix.platform == 'macos'
+        name: Package the macOS toolchain
+        run: |
+          tools/package-macos-toolchain.sh \
+            '${{ matrix.architecture }}' \
+            'build/release/${{ matrix.asset }}' \
+            . \
+            'build/release/abla-toolchain-${{ matrix.architecture }}-macos.tar.gz'
+      - name: Exercise the packaged toolchain
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          archive="build/release/abla-toolchain-${{ matrix.architecture }}-${{ matrix.platform }}.tar.gz"
+          install_root="$RUNNER_TEMP/abla-toolchain"
+          mkdir -p "$install_root" "$RUNNER_TEMP/abla-smoke"
+          tar -xzf "$archive" -C "$install_root" --strip-components=1
+          export PATH="$install_root/bin:$PATH"
+          if [[ '${{ matrix.platform }}' == macos ]]; then
+            llvm_bin=$(brew --prefix llvm@21)/bin
+            lld_bin=$(brew --prefix lld@21)/bin
+            export PATH="$llvm_bin:$lld_bin:$PATH"
+          fi
+          test "$(ablac --version)" = "ablac ${RELEASE_TAG#v}"
+          printf 'fun main: int = 0\n' > "$RUNNER_TEMP/abla-smoke/main.ab"
+          (cd "$RUNNER_TEMP/abla-smoke" && ablac build main.ab -o hello)
+          "$RUNNER_TEMP/abla-smoke/hello"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.asset }}
           path: |
             build/release/${{ matrix.asset }}
             build/release/${{ matrix.asset }}.sha256
+            build/release/abla-toolchain-${{ matrix.architecture }}-${{ matrix.platform }}.tar.gz
+            build/release/abla-toolchain-${{ matrix.architecture }}-${{ matrix.platform }}.tar.gz.sha256
           if-no-files-found: error
 
   publish:
