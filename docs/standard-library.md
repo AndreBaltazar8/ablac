@@ -83,7 +83,10 @@ with checked operations and idempotent `close`; the LLVM backend lowers their
 trusted implementation directly instead of routing it through C. They are the
 out-parameter and bounded-buffer building blocks used by LLVM ORC and raw
 platform APIs. Raw intrinsics are callable only from a function-level trusted
-implementation; ordinary consumers borrow the checked resources.
+implementation; ordinary consumers borrow the checked resources. The trusted
+boundary also provides fixed-signature call-through-address operations for
+native extension entry points. Each operation encodes its exact pointer and
+integer lanes; there is no unchecked variadic call surface.
 
 `abla/sys/linux` is likewise explicit and target-specific. Its current
 x86-64 implementation lowers `openat`, `read`, `write`, `close`, and `getpid`
