@@ -62,6 +62,24 @@ fun main: int {
 }
 ```
 
+## GitHub Actions
+
+Use [`setup-abla`](https://github.com/AndreBaltazar8/setup-abla) to install a
+checksum-verified released toolchain without rebuilding the compiler in every
+workflow:
+
+```yaml
+steps:
+  - uses: actions/checkout@v6
+  - uses: AndreBaltazar8/setup-abla@v1
+    with:
+      version: '0.2.10'
+  - run: ablac build app.ab -o build/app
+```
+
+The action supports Linux x86-64 and both Apple Silicon and Intel macOS. Pin it
+to a full commit SHA when an immutable action reference is required.
+
 ## Development
 
 On Linux, the development shell pins nixpkgs and the native LLVM toolchain.
