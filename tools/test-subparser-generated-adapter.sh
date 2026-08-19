@@ -82,6 +82,8 @@ grep -Fq 'error[E_SUBPARSER_FAILURE]: raw literal tag mismatch' \
     "$output_directory/invalid-raw-extension-literal.err"
 grep -Fq 'source[extension-expression]:' \
     "$output_directory/invalid-raw-extension-literal.err"
+grep -Fq 'source[subparser]:' \
+    "$output_directory/invalid-raw-extension-literal.err"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-deferred-source-identity.ab" \
