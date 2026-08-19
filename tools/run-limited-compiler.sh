@@ -14,7 +14,11 @@ done
 script_directory=$(cd -- "$(dirname -- "$launcher")" && pwd)
 toolchain_root=$(cd -- "$script_directory/.." && pwd)
 compiler="${0}.bin"
-default_stack_kb=65536
+# Large pure-Abla applications can make the self-hosted frontend traverse
+# deeply nested typed source graphs. Reserve enough stack and virtual address
+# space for those builds while retaining the launcher's hard process bounds.
+default_stack_kb=131072
+default_memory_mb=4096
 if [[ $(uname -s) == Darwin ]]; then
     hard_stack_kb=$(ulimit -H -s)
     if [[ $hard_stack_kb =~ ^[1-9][0-9]*$ &&
@@ -23,6 +27,7 @@ if [[ $(uname -s) == Darwin ]]; then
     fi
 fi
 stack_kb=${ABLA_MAX_STACK_KB:-$default_stack_kb}
+export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-$default_memory_mb}
 
 # Keep compiler-owned sources independent from the caller's working directory.
 # An explicit sysroot still wins for installed or custom toolchains.
@@ -35,12 +40,10 @@ if [[ ! $stack_kb =~ ^[1-9][0-9]*$ ]]; then
 fi
 ulimit -S -s "$stack_kb"
 
-# A full compiler graph legitimately needs room for the pure-Abla frontend and
-# LLVM O2 in one process. Keep the ordinary ceiling small, but make the public
-# self-build command work without secret environment tuning.
+# A compiler self-build also needs a longer explicit wall-clock allowance for
+# the pure-Abla frontend and LLVM O2 in one process.
 if [[ ${1:-} == build && ${2:-} == *src/orc_main.ab &&
-      -z ${ABLA_MAX_MEMORY_MB:-} ]]; then
-    export ABLA_MAX_MEMORY_MB=4096
+      -z ${ABLA_MAX_SECONDS:-} ]]; then
     export ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-240}
 fi
 
