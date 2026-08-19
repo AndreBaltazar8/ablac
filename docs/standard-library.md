@@ -87,6 +87,8 @@ implementation; ordinary consumers borrow the checked resources. The trusted
 boundary also provides fixed-signature call-through-address operations for
 native extension entry points. Each operation encodes its exact pointer and
 integer lanes; there is no unchecked variadic call surface.
+Native counter integrations can use the monotonic atomic `i64` fetch-add
+operation instead of introducing a foreign runtime helper or data race.
 
 `abla/sys/linux` is likewise explicit and target-specific. Its current
 x86-64 implementation lowers `openat`, `read`, `write`, `close`, and `getpid`

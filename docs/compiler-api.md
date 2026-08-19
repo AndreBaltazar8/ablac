@@ -285,7 +285,8 @@ for compiler extensions that select exports dynamically. The ABI rung accepts
 up to 16 value `bool`, `char`, signed or unsigned 8/16/32/64-bit integer,
 borrowed `string`, or direct non-escaping `(i64) -> i64` callback parameters
 and a `void`, supported scalar, or owned `string` result in programs without
-runtime globals. A foreign string lowers to
+mutable globals. Immutable runtime globals are initialized exactly once before
+the first exported call. A foreign string lowers to
 `(pointer, u64)`;
 the adapter validates it and copies its exact bytes into tracked Abla-owned
 storage before invoking user code. Empty input permits a null pointer. A

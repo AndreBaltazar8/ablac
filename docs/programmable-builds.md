@@ -121,7 +121,7 @@ C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded
 surface accepts up to 16 value `bool`, `char`, signed or unsigned 8/16/32/64-bit
 integer, borrowed `string`, or direct
-non-escaping `(i64) -> i64` callback parameters, no runtime globals, and
+non-escaping `(i64) -> i64` callback parameters, no mutable globals, and
 `void`, any supported scalar, or owned `string` results. Adapters preserve the
 declared width and signedness while boxing scalars without exposing
 `%AblaValue`. A string lowers to a pointer/`u64` byte slice;
