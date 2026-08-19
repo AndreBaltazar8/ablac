@@ -295,8 +295,9 @@ synchronously borrowed for the exported call. It may be called directly but
 not stored, returned, captured, or forwarded; export validation rejects a
 source use that could escape that lifetime. The callback must return normally.
 The backend emits only the requested C symbol; internal Abla function symbols
-stay hidden. Hosted executables with exports publish those requested symbols
-through the process dynamic-symbol table, so a native API may retain an
+stay hidden. Hosted executables with exports publish only those requested
+symbols and required owned-result helpers through the process dynamic-symbol
+table, so a native API may retain an
 Abla-authored callback without a foreign-language trampoline. A string result
 becomes a non-null opaque owned-bytes handle with
 generated data/length accessors and an exactly-once release operation. This

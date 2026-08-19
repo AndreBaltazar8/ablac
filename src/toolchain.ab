@@ -852,6 +852,49 @@ fun bootstrapNativeAbiManifest(
     "{\n  \"schema\":\"abla.abi.v1\",\n  \"target\":{\"name\":\"${target.name}\",\"llvmTriple\":\"${target.llvmTriple}\",\"objectFormat\":\"${target.objectFormat}\",\"hosted\":$hosted,\"libcFree\":$libcFree,\"panicContainment\":\"$panicContainment\"},\n  \"artifact\":\"$artifact\",\n  \"exports\":$exports\n}\n"
 }
 
+fun bootstrapNativeAbiExportSymbols(abi: string): array<string> {
+    val symbols: array<string> = []
+    val marker = "\"symbol\":\""
+    var begin = 0
+    while (begin + marker.size <= abi.size) {
+        var matches = true
+        var markerIndex = 0
+        while (matches && markerIndex < marker.size) {
+            if (abi[begin + markerIndex] != marker[markerIndex]) {
+                matches = false
+            }
+            markerIndex = markerIndex + 1
+        }
+        if (matches) {
+            val symbolBegin = begin + marker.size
+            var symbolEnd = symbolBegin
+            while (symbolEnd < abi.size && abi[symbolEnd] != 34) {
+                symbolEnd = symbolEnd + 1
+            }
+            if (symbolEnd < abi.size) {
+                val symbol = abi.slice(symbolBegin, symbolEnd)
+                var exists = false
+                var existing = 0
+                while (!exists && existing < symbols.size) {
+                    exists = symbols[existing] == symbol
+                    existing = existing + 1
+                }
+                if (bootstrapExportNameValid(symbol) && !exists) {
+                    symbols.append(symbol)
+                }
+                begin = symbolEnd
+            }
+        }
+        begin = begin + 1
+    }
+    if (bootstrapTextContains(abi, "\"owned-bytes-handle\"")) {
+        symbols.append("abla_owned_bytes_data")
+        symbols.append("abla_owned_bytes_length")
+        symbols.append("abla_owned_bytes_release")
+    }
+    symbols
+}
+
 fun bootstrapExpressionContainsCall(
     expression: BootstrapExpression,
     name: string
@@ -1144,7 +1187,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     var failureKind = ""
     var linkLlvm = false
     var linkHost = false
-    var exportsNativeSymbols = false
     var abiManifest = ""
     var reusedNativePartitions = 0
     var refreshedNativePartitions = 0
@@ -1160,10 +1202,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkLlvm = Path(cacheLinkLlvmPath).readText() == "1"
         linkHost = Path(cacheLinkHostPath).readText() == "1"
         abiManifest = Path(cacheAbiPath).readText()
-        exportsNativeSymbols = !bootstrapTextContains(
-            abiManifest,
-            "\"exports\":[]"
-        )
         status = bootstrapCopyNativeObject(cacheObjectPath, objectPath)
         if (status == 0 && ltoEligible) status =
             bootstrapCopyNativeObject(cacheLlvmPath, llvmPath)
@@ -1182,7 +1220,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             artifact,
             compilation.abiExports
         )
-        exportsNativeSymbols = compilation.abiExports != "[]"
         if (compilation.errors == 0) {
             if (bootstrapTextContains(
                 compilation.abiExports,
@@ -1440,12 +1477,26 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             link.argument("-Wl,--gc-sections")
             link.argument("-Wl,--error-limit=0")
         }
-        if (linkLlvm || exportsNativeSymbols) {
+        if (linkLlvm) {
             link.argument(if (macTarget)
                 "-Wl,-export_dynamic"
             else
                 "-Wl,--export-dynamic"
             )
+        }
+        if (!linkLlvm) {
+            val exportedSymbols = bootstrapNativeAbiExportSymbols(
+                abiManifest
+            )
+            var exportedSymbol = 0
+            while (exportedSymbol < exportedSymbols.size) {
+                link.argument(if (macTarget)
+                    "-Wl,-exported_symbol,_${exportedSymbols[exportedSymbol]}"
+                else
+                    "-Wl,--export-dynamic-symbol=${exportedSymbols[exportedSymbol]}"
+                )
+                exportedSymbol = exportedSymbol + 1
+            }
         }
         if (linkLlvm) {
             val configuredLlvm = linuxEnvironment("ABLA_MACOS_LLVM_LIB")
