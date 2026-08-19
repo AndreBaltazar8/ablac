@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  compiler:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset: ablac-x86_64-linux
+            platform: linux
+          - runner: macos-15
+            asset: ablac-arm64-macos
+            platform: macos
+          - runner: macos-15-intel
+            asset: ablac-x86_64-macos
+            platform: macos
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - if: matrix.platform == 'linux'
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - if: matrix.platform == 'macos'
+        name: Install the native toolchain
+        run: |
+          brew install llvm@21 lld@21 openssl@3
+          echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld@21)/bin" >> "$GITHUB_PATH"
+      - name: Build the tagged compiler from the pinned bootstrap
+        run: |
+          tools/bootstrap-compiler.sh build/bootstrap-ablac
+          tools/build-self-hosted-current.sh \
+            build/bootstrap-ablac build/release/${{ matrix.asset }}
+      - name: Verify and checksum
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          test "$(build/release/${{ matrix.asset }} --version)" = \
+            "ablac ${RELEASE_TAG#v}"
+          build/release/${{ matrix.asset }} --version
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd build/release && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          else
+            (cd build/release && shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            build/release/${{ matrix.asset }}
+            build/release/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: compiler
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Publish the immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" release/* \
+            --verify-tag \
+            --generate-notes \
+            --title "Abla ${RELEASE_TAG#v}"

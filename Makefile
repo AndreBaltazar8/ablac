@@ -48,6 +48,7 @@ prepare-test-driver:
 	tools/prepare-abla-test-driver.sh
 
 test: ablac
+	tools/test-version.sh $(COMPILER)
 	tools/test-value-abi.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
