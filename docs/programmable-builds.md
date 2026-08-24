@@ -24,6 +24,30 @@ val app = #compilerBuildProgram(
 fun main: int = if (app) 0 else 1
 ```
 
+For a program assembled from declarations in the current compilation, the
+higher-level independent-module surface owns entry generation and the child
+node:
+
+```abla
+compile fun buildHelper(): void {
+    val helper = compiler.newModule("helper")
+    helper.use(compiler.function("sharedLogic"))
+    helper.declare {
+        fun main: int = sharedLogic()
+    }
+    helper.emit("build/helper")
+    return
+}
+
+#buildHelper()
+```
+
+The declaration block is syntax, not source text passed by the application.
+The destination is compiled as a fresh program, and only reachable code is
+retained in its native artifact. Use the low-level node API when an entry file
+already exists; use an independent module when compile-time code is declaring
+that entry.
+
 Resolved declarations can also become roots of a named target artifact:
 
 ```abla

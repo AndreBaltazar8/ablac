@@ -138,6 +138,62 @@ fun bootstrapDeclarationWithName(
     declaration.sourceIdentity
 )
 
+fun bootstrapIndependentEntryIdentity(identity: string): bool {
+    val suffix = ".abla-independent.ab"
+    identity.size >= suffix.size &&
+        identity.slice(identity.size - suffix.size, identity.size) == suffix
+}
+
+fun bootstrapDeclarationWithAnnotation(
+    declaration: BootstrapDeclaration,
+    annotation: string
+): BootstrapDeclaration {
+    val annotations: array<string> = []
+    val arguments: array<BootstrapExpression> = []
+    val begins: array<int> = []
+    val ends: array<int> = []
+    var index = 0
+    while (index < declaration.annotations.size) {
+        annotations.append(declaration.annotations[index])
+        arguments.append(declaration.annotationArguments[index])
+        begins.append(declaration.annotationBegins[index])
+        ends.append(declaration.annotationEnds[index])
+        index = index + 1
+    }
+    annotations.append(annotation)
+    arguments.append(BootstrapExpression(
+        "missing", "", declaration.begin, declaration.begin, []
+    ))
+    begins.append(declaration.begin)
+    ends.append(declaration.begin)
+    BootstrapDeclaration(
+        declaration.kind,
+        declaration.name,
+        declaration.begin,
+        declaration.end,
+        declaration.expression,
+        declaration.parameters,
+        declaration.parameterTypes,
+        declaration.resultType,
+        declaration.methods,
+        declaration.parameterDefaults,
+        declaration.externalLibrary,
+        declaration.parameterKinds,
+        declaration.extensionOwner,
+        declaration.isTrusted,
+        declaration.isResource,
+        declaration.isNoEscape,
+        declaration.generatedNamespace,
+        declaration.generatedOriginBegin,
+        declaration.generatedOriginEnd,
+        annotations,
+        arguments,
+        begins,
+        ends,
+        declaration.sourceIdentity
+    )
+}
+
 fun bootstrapApplyFunctionBodyReplacement(
     var declarations: array<BootstrapDeclaration>,
     replacement: BootstrapFunctionBodyReplacement
@@ -166,6 +222,80 @@ fun bootstrapApplyFunctionBodyReplacement(
     valid
 }
 
+fun bootstrapApplyFunctionAnnotationAddition(
+    var declarations: array<BootstrapDeclaration>,
+    addition: BootstrapFunctionAnnotationAddition
+): bool {
+    var valid = addition.handle >= 0 &&
+        addition.handle < declarations.size
+    if (valid) {
+        val declaration = declarations[addition.handle]
+        valid = declaration.kind == "fun" &&
+            declaration.extensionOwner == ""
+        var annotation = 0
+        while (valid && annotation < declaration.annotations.size) {
+            if (declaration.annotations[annotation] == addition.annotation) {
+                valid = false
+            }
+            annotation = annotation + 1
+        }
+        if (valid) {
+            bootstrapPendingFunctionAnnotationKeys.append(
+                "${declaration.sourceIdentity}:${declaration.extensionOwner}:${declaration.name}"
+            )
+            bootstrapPendingFunctionAnnotationNames.append(addition.annotation)
+            declarations[addition.handle] = bootstrapDeclarationWithAnnotation(
+                declaration, addition.annotation
+            )
+        }
+    }
+    valid
+}
+
+fun bootstrapResetPendingFunctionAnnotations(): void {
+    bootstrapPendingFunctionAnnotationKeys = []
+    bootstrapPendingFunctionAnnotationNames = []
+    return
+}
+
+fun bootstrapApplyPendingFunctionAnnotations(
+    var declarations: array<BootstrapDeclaration>
+): int {
+    var errors = 0
+    var pending = 0
+    while (pending < bootstrapPendingFunctionAnnotationKeys.size) {
+        var matches = 0
+        var declaration = 0
+        while (declaration < declarations.size) {
+            val candidate = declarations[declaration]
+            val key =
+                "${candidate.sourceIdentity}:${candidate.extensionOwner}:${candidate.name}"
+            if (key == bootstrapPendingFunctionAnnotationKeys[pending]) {
+                matches = matches + 1
+                var present = false
+                var annotation = 0
+                while (annotation < candidate.annotations.size) {
+                    if (candidate.annotations[annotation] ==
+                        bootstrapPendingFunctionAnnotationNames[pending]) {
+                        present = true
+                    }
+                    annotation = annotation + 1
+                }
+                if (!present) declarations[declaration] =
+                    bootstrapDeclarationWithAnnotation(
+                        candidate,
+                        bootstrapPendingFunctionAnnotationNames[pending]
+                    )
+            }
+            declaration = declaration + 1
+        }
+        if (matches != 1) errors = errors + 1
+        pending = pending + 1
+    }
+    bootstrapResetPendingFunctionAnnotations()
+    errors
+}
+
 fun bootstrapApplyCompilerTransforms(
     var declarations: array<BootstrapDeclaration>,
     actions: array<BootstrapExpression>,
@@ -174,6 +304,7 @@ fun bootstrapApplyCompilerTransforms(
     // A failed earlier compilation must never leak staged requests into this
     // candidate transaction.
     bootstrapTakeFunctionBodyReplacements()
+    bootstrapTakeFunctionAnnotationAdditions()
     var errors = 0
     var diagnostics = ""
     val compileInputPaths: array<string> = []
@@ -240,6 +371,19 @@ fun bootstrapApplyCompilerTransforms(
                 "${diagnostics}error[E_COMPILER_TRANSFORM_BODY]: replacement body did not parse as exactly one compatible top-level function body\n"
         }
         replacement = replacement + 1
+    }
+    val annotationAdditions = bootstrapTakeFunctionAnnotationAdditions()
+    var annotationAddition = 0
+    while (annotationAddition < annotationAdditions.size) {
+        if (!bootstrapApplyFunctionAnnotationAddition(
+            declarations,
+            annotationAdditions[annotationAddition]
+        )) {
+            errors = errors + 1
+            diagnostics =
+                "${diagnostics}error[E_COMPILER_TRANSFORM_ANNOTATION]: annotation addition requires one compatible top-level runtime function and cannot duplicate an existing annotation\n"
+        }
+        annotationAddition = annotationAddition + 1
     }
     BootstrapEvalResult(
         bootstrapEvalVoid(),
@@ -602,7 +746,10 @@ fun bootstrapApplyGeneratedModules(
         while (sliceDeclaration < declarations.size) {
             if (declarations[sliceDeclaration].kind == "fun" &&
                 declarations[sliceDeclaration].name == "main" &&
-                declarations[sliceDeclaration].extensionOwner == "") {
+                declarations[sliceDeclaration].extensionOwner == "" &&
+                !bootstrapIndependentEntryIdentity(
+                    declarations[sliceDeclaration].sourceIdentity
+                )) {
                 declarations[sliceDeclaration] = bootstrapDeclarationWithName(
                     declarations[sliceDeclaration],
                     "__abla_slice_excluded_main"

@@ -73,6 +73,62 @@ candidate. A failure publishes no artifact. The service object itself is a
 `compile val`; referring to it from runtime code is a phase diagnostic and it
 creates no runtime global.
 
+## Independent modules and declaration blocks
+
+`compiler.function(name)` turns a resolved function declaration into a
+`FunctionReference`. Unlike a bare integer handle, the wrapper can carry
+immutable destination metadata with `.annotated(name)`. The annotation is not
+added to the source declaration; it is applied and revalidated only while the
+destination program is compiled.
+
+`compiler.newModule(name)` creates an independent program builder. `use`
+accepts only one unique, top-level runtime function reference and records its
+origin module. `declare { ... }` accepts a compile-time-only declaration block,
+not a closure or a string. The parser validates all declarations when the quote
+is created, retains their exact syntax and source provenance, and the child
+compilation parses, resolves, types, ownership-checks, optimizes, and verifies
+the complete destination again. Normal reachability optimization retains the
+selected functions' transitive globals, types, and callees in the final
+artifact while removing unreachable source declarations.
+
+```abla
+import "abla/compiler"
+
+val offset = 2
+fun existing(): int = 40 + offset
+
+compile fun buildTool(): void {
+    val tool = compiler.newModule("answer-tool")
+    tool.use(compiler.function("existing").annotated("copied"))
+    tool.declare {
+        fun main: int = existing()
+    }
+    tool.emit("build/answer-tool")
+    return
+}
+
+#buildTool()
+
+fun main: int = 0
+```
+
+The emitted program is a normal standalone build node, not a child runtime or
+a link back to the parent executable. `emit` defaults to the current host,
+`executable`, optimized mode, and cache reuse where its compile actions permit
+it; named/default arguments can override any of those choices. Module names,
+outputs, declaration counts,
+annotation names, source identities, and recursively emitted programs are
+bounded. Invalid/stale references, duplicate annotations, runtime declaration
+blocks, repeated emission, and graph conflicts have stable diagnostics and
+publish no partial artifact. Independent-module construction calls inherited
+from source modules become bounded no-ops in the child, preventing recursive
+self-emission, while actions explicitly declared in its own declaration block
+still execute.
+
+Top-level compile expressions are executable actions. A value binding is not
+required merely to retain the result, so `#buildTool()` intentionally evaluates
+and drops the returned value after its compile-time effects are staged.
+
 Function handles now cover top-level, extension, and inherent methods. They
 expose canonical owner/name identity, source parameter names, normalized
 parameter/result types, phase/trust/native flags, and class-field metadata.

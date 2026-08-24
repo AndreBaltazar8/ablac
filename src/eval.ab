@@ -30,6 +30,21 @@ class BootstrapFunctionBodyReplacement(
     val body: string
 )
 
+class BootstrapFunctionAnnotationAddition(
+    val handle: int,
+    val annotation: string
+)
+
+class BootstrapIndependentModuleState(
+    val name: string,
+    val functionNames: array<string>,
+    val sourceIdentities: array<string>,
+    val functionAnnotations: array<array<string>>,
+    val declarationSources: array<string>,
+    val declarationSourceIdentities: array<string>,
+    var emitted: bool
+)
+
 class BootstrapArtifactRootRequest(
     val name: string,
     val target: string,
@@ -65,9 +80,13 @@ var bootstrapDriverDiagnosticCount: int = 0
 var bootstrapExportRequestCount: int = 0
 var bootstrapDefinedTargetCount: int = 0
 var bootstrapFunctionBodyReplacementCount: int = 0
+var bootstrapFunctionAnnotationAdditionCount: int = 0
 var bootstrapCompilerTransformActive: bool = false
 var bootstrapArtifactRootRequestCount: int = 0
 var bootstrapArtifactSliceActive: bool = false
+var bootstrapIndependentModules: array<BootstrapIndependentModuleState> = []
+var bootstrapPendingFunctionAnnotationKeys: array<string> = []
+var bootstrapPendingFunctionAnnotationNames: array<string> = []
 
 fun bootstrapArtifactRootRequestRoot(): string =
     "build/.abla-artifact-root-requests-${linuxProcessId()}"
@@ -234,6 +253,58 @@ fun bootstrapTakeFunctionBodyReplacements(
     replacements
 }
 
+fun bootstrapFunctionAnnotationAdditionRoot(): string =
+    "build/.abla-function-annotation-additions-${linuxProcessId()}"
+
+fun bootstrapStageFunctionAnnotationAddition(
+    addition: BootstrapFunctionAnnotationAddition
+): bool {
+    var valid = bootstrapCompilerTransformActive && addition.handle >= 0 &&
+        bootstrapTargetTokenValid(addition.annotation) &&
+        bootstrapFunctionAnnotationAdditionCount < 128
+    val root = bootstrapFunctionAnnotationAdditionRoot()
+    var index = 0
+    while (valid && index < bootstrapFunctionAnnotationAdditionCount) {
+        if (Path("$root/$index.handle").readText() == "${addition.handle}" &&
+            Path("$root/$index.annotation").readText() ==
+                addition.annotation) valid = false
+        index = index + 1
+    }
+    if (valid) valid = Path(root).createDirectories()
+    val request = bootstrapFunctionAnnotationAdditionCount
+    if (valid) valid = Path("$root/$request.handle").writeTextAtomic(
+        "${addition.handle}"
+    )
+    if (valid) valid = Path("$root/$request.annotation").writeTextAtomic(
+        addition.annotation
+    )
+    if (valid) bootstrapFunctionAnnotationAdditionCount = request + 1
+    if (!valid) {
+        Path("$root/$request.handle").remove()
+        Path("$root/$request.annotation").remove()
+    }
+    valid
+}
+
+fun bootstrapTakeFunctionAnnotationAdditions(
+): array<BootstrapFunctionAnnotationAddition> {
+    val additions: array<BootstrapFunctionAnnotationAddition> = []
+    val root = bootstrapFunctionAnnotationAdditionRoot()
+    var index = 0
+    while (index < bootstrapFunctionAnnotationAdditionCount) {
+        additions.append(BootstrapFunctionAnnotationAddition(
+            bootstrapDecimalIndex(Path("$root/$index.handle").readText()),
+            Path("$root/$index.annotation").readText()
+        ))
+        Path("$root/$index.handle").remove()
+        Path("$root/$index.annotation").remove()
+        index = index + 1
+    }
+    bootstrapFunctionAnnotationAdditionCount = 0
+    Path(root).remove()
+    additions
+}
+
 fun bootstrapDefinedTargetRoot(): string =
     "build/.abla-defined-targets-${linuxProcessId()}"
 
@@ -251,6 +322,41 @@ fun bootstrapTargetTokenValid(value: string): bool {
         index = index + 1
     }
     valid
+}
+
+fun bootstrapIndependentModuleHandleValid(handle: int): bool =
+    handle >= 0 && handle < bootstrapIndependentModules.size
+
+fun bootstrapIndependentModuleSourceValid(source: string): bool {
+    var valid = source.size > 0 && source.size <= 4096 && source[0] != 60
+    var index = 0
+    while (valid && index < source.size) {
+        if (source[index] == 0 || source[index] == 10 ||
+            source[index] == 13) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun bootstrapIndependentModuleHasSource(
+    sources: array<string>,
+    source: string
+): bool {
+    var found = false
+    var index = 0
+    while (index < sources.size) {
+        if (sources[index] == source) found = true
+        index = index + 1
+    }
+    found
+}
+
+fun bootstrapIndependentModuleSourcePath(source: string): string {
+    var result = source
+    if (source.size > 0 && source[0] != 47) {
+        result = currentDirectory().child(source).text
+    }
+    result
 }
 
 fun bootstrapStageDefinedTarget(target: BootstrapDefinedTarget): bool {
@@ -4077,7 +4183,9 @@ class BootstrapEvaluator(
                 val declaration = this.declarations[declarationIndex]
                 if ((declaration.kind == "fun" ||
                      declaration.kind == "compile.fun") &&
-                    declaration.extensionOwner != "Compiler") {
+                    declaration.extensionOwner != "Compiler" &&
+                    declaration.extensionOwner != "FunctionReference" &&
+                    declaration.extensionOwner != "IndependentModule") {
                     handles.append(bootstrapEvalInteger(declarationIndex))
                 }
                 var method = 0
@@ -4931,6 +5039,31 @@ class BootstrapEvaluator(
                 result = bootstrapEvalBoolean(false)
             }
         }
+        if (targetName == "compilerAddFunctionAnnotation") {
+            val reflected = this.evaluate(expression.children[0])
+            val annotation = this.evaluate(expression.children[1])
+            var valid = reflected.kind == "integer" &&
+                annotation.kind == "string" &&
+                this.functionHandleValid(reflected.integer) &&
+                reflected.integer < this.declarations.size &&
+                this.declarations[reflected.integer].kind == "fun"
+            if (valid) valid = bootstrapStageFunctionAnnotationAddition(
+                BootstrapFunctionAnnotationAddition(
+                    reflected.integer,
+                    annotation.text
+                )
+            )
+            if (valid) {
+                result = bootstrapEvalBoolean(true)
+            } else {
+                this.recordEvaluatorDiagnostic(
+                    "E_COMPILER_TRANSFORM_ANNOTATION",
+                    "compiler.addFunctionAnnotation requires a unique top-level runtime function, a valid annotation name, and compiler.transform context"
+                )
+                this.errors = this.errors + 1
+                result = bootstrapEvalBoolean(false)
+            }
+        }
         if (targetName == "compilerApplyTransform") {
             // This marker is consumed before final semantic analysis. Reaching
             // it in an ordinary evaluator is always a staging error.
@@ -5021,6 +5154,248 @@ class BootstrapEvaluator(
                         "compiler.contributeArtifactRoot requires a unique top-level bool/int function and one consistent bounded artifact contribution"
                     )
                 }
+                this.errors = this.errors + 1
+                result = bootstrapEvalBoolean(false)
+            }
+        }
+        if (targetName == "compilerNewIndependentModule") {
+            val name = this.evaluate(expression.children[0])
+            var handle = -1
+            var valid = bootstrapArtifactSliceActive ||
+                (name.kind == "string" &&
+                 bootstrapTargetTokenValid(name.text) &&
+                 bootstrapIndependentModules.size < 32)
+            var module = 0
+            while (valid && !bootstrapArtifactSliceActive &&
+                   module < bootstrapIndependentModules.size) {
+                if (bootstrapIndependentModules[module].name == name.text) {
+                    valid = false
+                }
+                module = module + 1
+            }
+            if (valid && !bootstrapArtifactSliceActive) {
+                handle = bootstrapIndependentModules.size
+                bootstrapIndependentModules.append(
+                    BootstrapIndependentModuleState(
+                        name.text, [], [], [], [], [], false
+                    )
+                )
+            }
+            if (valid) {
+                result = bootstrapEvalInteger(handle)
+            } else {
+                this.recordEvaluatorDiagnostic(
+                    "E_INDEPENDENT_MODULE_CREATE",
+                    "compiler.newModule requires a unique bounded module name"
+                )
+                this.errors = this.errors + 1
+            }
+        }
+        if (targetName == "compilerIndependentModuleUse") {
+            val module = this.evaluate(expression.children[0])
+            val reflected = this.evaluate(expression.children[1])
+            val annotations = this.evaluate(expression.children[2])
+            var valid = bootstrapArtifactSliceActive ||
+                (module.kind == "integer" &&
+                 reflected.kind == "integer" &&
+                 annotations.kind == "array" &&
+                 bootstrapIndependentModuleHandleValid(module.integer) &&
+                 reflected.integer >= 0 &&
+                 reflected.integer < this.declarations.size)
+            var functionName = ""
+            var sourceIdentity = ""
+            if (valid && !bootstrapArtifactSliceActive) {
+                val declaration = this.declarations[reflected.integer]
+                functionName = declaration.name
+                sourceIdentity = declaration.sourceIdentity
+                valid = declaration.kind == "fun" &&
+                    declaration.extensionOwner == "" &&
+                    bootstrapIndependentModuleSourceValid(sourceIdentity)
+                var matches = 0
+                var candidate = 0
+                while (candidate < this.declarations.size) {
+                    val found = this.declarations[candidate]
+                    if ((found.kind == "fun" || found.kind == "extern" ||
+                         found.kind == "compile.fun") &&
+                        found.extensionOwner == "" &&
+                        found.name == functionName) matches = matches + 1
+                    candidate = candidate + 1
+                }
+                valid = valid && matches == 1
+                var annotation = 0
+                while (valid && annotation < annotations.elements.size) {
+                    val addition = annotations.elements[annotation]
+                    valid = addition.kind == "string" &&
+                        bootstrapTargetTokenValid(addition.text)
+                    var existing = 0
+                    while (valid && existing < declaration.annotations.size) {
+                        if (declaration.annotations[existing] == addition.text) {
+                            valid = false
+                        }
+                        existing = existing + 1
+                    }
+                    var previous = 0
+                    while (valid && previous < annotation) {
+                        if (annotations.elements[previous].text ==
+                            addition.text) valid = false
+                        previous = previous + 1
+                    }
+                    annotation = annotation + 1
+                }
+            }
+            if (valid && !bootstrapArtifactSliceActive) {
+                val state = bootstrapIndependentModules[module.integer]
+                valid = !state.emitted && state.functionNames.size < 128
+                if (valid) {
+                    val additions: array<string> = []
+                    var annotation = 0
+                    while (annotation < annotations.elements.size) {
+                        additions.append(annotations.elements[annotation].text)
+                        annotation = annotation + 1
+                    }
+                    state.functionNames.append(functionName)
+                    state.sourceIdentities.append(sourceIdentity)
+                    state.functionAnnotations.append(additions)
+                }
+            }
+            if (valid) {
+                result = bootstrapEvalBoolean(true)
+            } else {
+                this.recordEvaluatorDiagnostic(
+                    "E_INDEPENDENT_MODULE_USE",
+                    "independent module use requires a live module and one unique top-level runtime function reference; annotations must be new identifiers"
+                )
+                this.errors = this.errors + 1
+                result = bootstrapEvalBoolean(false)
+            }
+        }
+        if (targetName == "compilerIndependentModuleDeclare") {
+            val module = this.evaluate(expression.children[0])
+            val declarations = this.evaluate(expression.children[1])
+            var valid = bootstrapArtifactSliceActive ||
+                (module.kind == "integer" &&
+                 declarations.kind == "declaration.block" &&
+                 bootstrapIndependentModuleHandleValid(module.integer) &&
+                 declarations.text.size > 0 &&
+                 declarations.text.size <= 1048576 &&
+                 bootstrapIndependentModuleSourceValid(declarations.owner))
+            if (valid && !bootstrapArtifactSliceActive) {
+                val state = bootstrapIndependentModules[module.integer]
+                valid = !state.emitted && state.declarationSources.size < 32
+                if (valid) {
+                    state.declarationSources.append(declarations.text)
+                    state.declarationSourceIdentities.append(declarations.owner)
+                }
+            }
+            if (valid) {
+                result = bootstrapEvalBoolean(true)
+            } else {
+                this.recordEvaluatorDiagnostic(
+                    "E_INDEPENDENT_MODULE_DECLARE",
+                    "independent module declare requires a declaration block owned by compile-time source and a live un-emitted module"
+                )
+                this.errors = this.errors + 1
+                result = bootstrapEvalBoolean(false)
+            }
+        }
+        if (targetName == "compilerIndependentModuleEmit") {
+            val module = this.evaluate(expression.children[0])
+            val output = this.evaluate(expression.children[1])
+            val target = this.evaluate(expression.children[2])
+            val artifact = this.evaluate(expression.children[3])
+            val fast = this.evaluate(expression.children[4])
+            val cache = this.evaluate(expression.children[5])
+            var valid = bootstrapArtifactSliceActive ||
+                (module.kind == "integer" &&
+                 bootstrapIndependentModuleHandleValid(module.integer) &&
+                 output.kind == "string" &&
+                 bootstrapCompileOutputPathValid(output.text) &&
+                 target.kind == "string" &&
+                 bootstrapTargetTokenValid(target.text) &&
+                 artifact.kind == "string" &&
+                 bootstrapTargetTokenValid(artifact.text) &&
+                 fast.kind == "boolean" && cache.kind == "boolean")
+            if (valid && !bootstrapArtifactSliceActive) {
+                val state = bootstrapIndependentModules[module.integer]
+                valid = !state.emitted && state.declarationSources.size > 0
+                val sources: array<string> = []
+                var used = 0
+                while (valid && used < state.sourceIdentities.size) {
+                    val source = bootstrapIndependentModuleSourcePath(
+                        state.sourceIdentities[used]
+                    )
+                    if (!bootstrapIndependentModuleHasSource(sources, source)) {
+                        sources.append(source)
+                    }
+                    used = used + 1
+                }
+                var block = 0
+                while (valid && block <
+                       state.declarationSourceIdentities.size) {
+                    val source = bootstrapIndependentModuleSourcePath(
+                        state.declarationSourceIdentities[block]
+                    )
+                    if (!bootstrapIndependentModuleHasSource(sources, source)) {
+                        sources.append(source)
+                    }
+                    block = block + 1
+                }
+                var source = ""
+                var imported = 0
+                while (valid && imported < sources.size) {
+                    source = "${source}import ${this.generatedStringLiteral(sources[imported])}\n"
+                    imported = imported + 1
+                }
+                var annotationCount = 0
+                used = 0
+                while (used < state.functionAnnotations.size) {
+                    annotationCount = annotationCount +
+                        state.functionAnnotations[used].size
+                    used = used + 1
+                }
+                if (annotationCount > 0) {
+                    source = "${source}import \"abla/compiler\"\ncompile fun __abla_independent_annotations(): void {\n"
+                    used = 0
+                    while (used < state.functionNames.size) {
+                        var annotation = 0
+                        while (annotation <
+                               state.functionAnnotations[used].size) {
+                            val functionLiteral = this.generatedStringLiteral(
+                                state.functionNames[used]
+                            )
+                            val annotationLiteral = this.generatedStringLiteral(
+                                state.functionAnnotations[used][annotation]
+                            )
+                            source = "${source}    compiler.addFunctionAnnotation(compiler.findFunction($functionLiteral), $annotationLiteral)\n"
+                            annotation = annotation + 1
+                        }
+                        used = used + 1
+                    }
+                    source = "${source}    return\n}\n#compiler.transform(__abla_independent_annotations)\n"
+                }
+                block = 0
+                while (block < state.declarationSources.size) {
+                    source = "${source}${state.declarationSources[block]}\n"
+                    block = block + 1
+                }
+                val entry =
+                    "build/.abla-independent/${state.name}.abla-independent.ab"
+                if (valid) valid = bootstrapStageToolchainOutput(entry, source)
+                if (valid) valid = bootstrapStageCompileProgramRequest(
+                    BootstrapCompileProgramRequest(
+                        state.name, entry, output.text, target.text,
+                        artifact.text, fast.boolean, cache.boolean
+                    )
+                )
+                if (valid) state.emitted = true
+            }
+            if (valid) {
+                result = bootstrapEvalBoolean(true)
+            } else {
+                this.recordEvaluatorDiagnostic(
+                    "E_INDEPENDENT_MODULE_EMIT",
+                    "independent module emit requires a live module with declarations and one valid, unique program output"
+                )
                 this.errors = this.errors + 1
                 result = bootstrapEvalBoolean(false)
             }
@@ -6852,6 +7227,9 @@ class BootstrapEvaluator(
             if (expression.text == "replaceFunctionBody") {
                 target = "compilerReplaceFunctionBody"
             }
+            if (expression.text == "addFunctionAnnotation") {
+                target = "compilerAddFunctionAnnotation"
+            }
             if (expression.text == "generateModule") {
                 target = "compilerGenerateModule"
             }
@@ -7091,6 +7469,22 @@ class BootstrapEvaluator(
         }
         if (expression.kind == "string") {
             result = bootstrapEvalString(expression.text)
+        }
+        if (expression.kind == "declaration.block") {
+            var sourceIdentity = ""
+            if (expression.children.size == 1 &&
+                expression.children[0].kind == "declaration.block.source") {
+                sourceIdentity = expression.children[0].text
+            }
+            result = BootstrapEvalValue(
+                "declaration.block",
+                0,
+                false,
+                expression.text,
+                [],
+                sourceIdentity,
+                []
+            )
         }
         if (expression.kind == "null") result = bootstrapEvalNull()
         if (expression.kind == "delegate.initializer" &&
