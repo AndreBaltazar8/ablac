@@ -42,6 +42,31 @@ compile fun buildHelper(): void {
 #buildHelper()
 ```
 
+The same builder can emit a function-only module. A lifted reference carries
+its destination annotation and foreign name, while the Wasm package owns the
+target descriptor and `emitWasm` convenience:
+
+```abla
+import "abla/compiler"
+import "abla/wasm/build"
+
+compile fun buildClient(): void {
+    val client = compiler.newModule("client")
+    val answer = compiler.function("answer").annotated("client-copy")
+    client.use(answer.exported("app_answer"))
+    client.emitWasm("build/client.wasm", fast = true)
+    return
+}
+
+#buildClient()
+```
+
+`compiler.reference(handle)` is the no-relookup form for a reflected function.
+Generated adapters can be added through `declareGenerated(builder)` and
+selected with `export(generatedName, foreignName)`. Both paths use the same
+checked child compilation and graph-wide transactional publication; no
+extension-authored entry file is involved.
+
 The declaration block is syntax, not source text passed by the application.
 The destination is compiled as a fresh program, and only reachable code is
 retained in its native artifact. Use the low-level node API when an entry file

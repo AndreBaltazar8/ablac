@@ -42,6 +42,10 @@ class BootstrapIndependentModuleState(
     val functionAnnotations: array<array<string>>,
     val declarationSources: array<string>,
     val declarationSourceIdentities: array<string>,
+    val generatedDeclarationSources: array<string>,
+    val exportSourceNames: array<string>,
+    val exportNames: array<string>,
+    val checkedExports: array<bool>,
     var emitted: bool
 )
 
@@ -357,6 +361,20 @@ fun bootstrapIndependentModuleSourcePath(source: string): string {
         result = currentDirectory().child(source).text
     }
     result
+}
+
+fun bootstrapIndependentDeclarationNameValid(name: string): bool {
+    var valid = name.size > 0 && name.size <= 128
+    var index = 0
+    while (valid && index < name.size) {
+        val byte = name[index]
+        val alpha = (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 95
+        val digit = byte >= 48 && byte <= 57
+        if (!alpha && !(index > 0 && digit)) valid = false
+        index = index + 1
+    }
+    valid
 }
 
 fun bootstrapStageDefinedTarget(target: BootstrapDefinedTarget): bool {
@@ -5177,7 +5195,9 @@ class BootstrapEvaluator(
                 handle = bootstrapIndependentModules.size
                 bootstrapIndependentModules.append(
                     BootstrapIndependentModuleState(
-                        name.text, [], [], [], [], [], false
+                        name.text,
+                        [], [], [], [], [], [], [], [], [],
+                        false
                     )
                 )
             }
@@ -5195,10 +5215,14 @@ class BootstrapEvaluator(
             val module = this.evaluate(expression.children[0])
             val reflected = this.evaluate(expression.children[1])
             val annotations = this.evaluate(expression.children[2])
+            val exportName = this.evaluate(expression.children[3])
+            val checkedExport = this.evaluate(expression.children[4])
             var valid = bootstrapArtifactSliceActive ||
                 (module.kind == "integer" &&
                  reflected.kind == "integer" &&
                  annotations.kind == "array" &&
+                 exportName.kind == "string" &&
+                 checkedExport.kind == "boolean" &&
                  bootstrapIndependentModuleHandleValid(module.integer) &&
                  reflected.integer >= 0 &&
                  reflected.integer < this.declarations.size)
@@ -5211,6 +5235,9 @@ class BootstrapEvaluator(
                 valid = declaration.kind == "fun" &&
                     declaration.extensionOwner == "" &&
                     bootstrapIndependentModuleSourceValid(sourceIdentity)
+                if (valid && exportName.text != "") {
+                    valid = bootstrapExportNameValid(exportName.text)
+                }
                 var matches = 0
                 var candidate = 0
                 while (candidate < this.declarations.size) {
@@ -5246,6 +5273,14 @@ class BootstrapEvaluator(
             if (valid && !bootstrapArtifactSliceActive) {
                 val state = bootstrapIndependentModules[module.integer]
                 valid = !state.emitted && state.functionNames.size < 128
+                var exported = 0
+                while (valid && exportName.text != "" &&
+                       exported < state.exportNames.size) {
+                    if (state.exportNames[exported] == exportName.text) {
+                        valid = false
+                    }
+                    exported = exported + 1
+                }
                 if (valid) {
                     val additions: array<string> = []
                     var annotation = 0
@@ -5256,6 +5291,11 @@ class BootstrapEvaluator(
                     state.functionNames.append(functionName)
                     state.sourceIdentities.append(sourceIdentity)
                     state.functionAnnotations.append(additions)
+                    if (exportName.text != "") {
+                        state.exportSourceNames.append(functionName)
+                        state.exportNames.append(exportName.text)
+                        state.checkedExports.append(checkedExport.boolean)
+                    }
                 }
             }
             if (valid) {
@@ -5263,7 +5303,47 @@ class BootstrapEvaluator(
             } else {
                 this.recordEvaluatorDiagnostic(
                     "E_INDEPENDENT_MODULE_USE",
-                    "independent module use requires a live module and one unique top-level runtime function reference; annotations must be new identifiers"
+                    "independent module use requires a live module, one unique top-level runtime function reference, new annotation identifiers, and an optional unique valid export"
+                )
+                this.errors = this.errors + 1
+                result = bootstrapEvalBoolean(false)
+            }
+        }
+        if (targetName == "compilerIndependentModuleExport") {
+            val module = this.evaluate(expression.children[0])
+            val sourceName = this.evaluate(expression.children[1])
+            val exportName = this.evaluate(expression.children[2])
+            val checked = this.evaluate(expression.children[3])
+            var valid = bootstrapArtifactSliceActive ||
+                (module.kind == "integer" &&
+                 bootstrapIndependentModuleHandleValid(module.integer) &&
+                 sourceName.kind == "string" &&
+                 bootstrapIndependentDeclarationNameValid(sourceName.text) &&
+                 exportName.kind == "string" &&
+                 bootstrapExportNameValid(exportName.text) &&
+                 checked.kind == "boolean")
+            if (valid && !bootstrapArtifactSliceActive) {
+                val state = bootstrapIndependentModules[module.integer]
+                valid = !state.emitted && state.exportNames.size < 128
+                var existing = 0
+                while (valid && existing < state.exportNames.size) {
+                    if (state.exportNames[existing] == exportName.text) {
+                        valid = false
+                    }
+                    existing = existing + 1
+                }
+                if (valid) {
+                    state.exportSourceNames.append(sourceName.text)
+                    state.exportNames.append(exportName.text)
+                    state.checkedExports.append(checked.boolean)
+                }
+            }
+            if (valid) {
+                result = bootstrapEvalBoolean(true)
+            } else {
+                this.recordEvaluatorDiagnostic(
+                    "E_INDEPENDENT_MODULE_EXPORT",
+                    "independent module export requires a live un-emitted module, one declaration identifier, and one unique valid foreign export name"
                 )
                 this.errors = this.errors + 1
                 result = bootstrapEvalBoolean(false)
@@ -5298,6 +5378,40 @@ class BootstrapEvaluator(
                 result = bootstrapEvalBoolean(false)
             }
         }
+        if (targetName == "compilerIndependentModuleDeclareGenerated") {
+            val module = this.evaluate(expression.children[0])
+            val declarations = this.evaluate(expression.children[1])
+            var source = ""
+            var valid = bootstrapArtifactSliceActive ||
+                (module.kind == "integer" &&
+                 declarations.kind == "generated.module" &&
+                 bootstrapIndependentModuleHandleValid(module.integer))
+            if (valid && !bootstrapArtifactSliceActive) {
+                var declaration = 0
+                while (declaration < declarations.elements.size) {
+                    if (declarations.elements[declaration].kind ==
+                        "generated.declaration") {
+                        source = "$source${declarations.elements[declaration].text}"
+                    }
+                    declaration = declaration + 1
+                }
+                val state = bootstrapIndependentModules[module.integer]
+                valid = !state.emitted && source.size > 0 &&
+                    source.size <= 1048576 &&
+                    state.generatedDeclarationSources.size < 32
+                if (valid) state.generatedDeclarationSources.append(source)
+            }
+            if (valid) {
+                result = bootstrapEvalBoolean(true)
+            } else {
+                this.recordEvaluatorDiagnostic(
+                    "E_INDEPENDENT_MODULE_DECLARE_GENERATED",
+                    "independent module generated declarations require a non-empty compiler-owned builder and a live un-emitted module"
+                )
+                this.errors = this.errors + 1
+                result = bootstrapEvalBoolean(false)
+            }
+        }
         if (targetName == "compilerIndependentModuleEmit") {
             val module = this.evaluate(expression.children[0])
             val output = this.evaluate(expression.children[1])
@@ -5317,7 +5431,10 @@ class BootstrapEvaluator(
                  fast.kind == "boolean" && cache.kind == "boolean")
             if (valid && !bootstrapArtifactSliceActive) {
                 val state = bootstrapIndependentModules[module.integer]
-                valid = !state.emitted && state.declarationSources.size > 0
+                valid = !state.emitted &&
+                    (state.declarationSources.size > 0 ||
+                     state.generatedDeclarationSources.size > 0 ||
+                     state.exportNames.size > 0)
                 val sources: array<string> = []
                 var used = 0
                 while (valid && used < state.sourceIdentities.size) {
@@ -5353,8 +5470,11 @@ class BootstrapEvaluator(
                         state.functionAnnotations[used].size
                     used = used + 1
                 }
+                if (annotationCount > 0 || state.exportNames.size > 0) {
+                    source = "${source}import \"abla/compiler\"\n"
+                }
                 if (annotationCount > 0) {
-                    source = "${source}import \"abla/compiler\"\ncompile fun __abla_independent_annotations(): void {\n"
+                    source = "${source}compile fun __abla_independent_annotations(): void {\n"
                     used = 0
                     while (used < state.functionNames.size) {
                         var annotation = 0
@@ -5377,6 +5497,28 @@ class BootstrapEvaluator(
                 while (block < state.declarationSources.size) {
                     source = "${source}${state.declarationSources[block]}\n"
                     block = block + 1
+                }
+                block = 0
+                while (block < state.generatedDeclarationSources.size) {
+                    source = "${source}${state.generatedDeclarationSources[block]}\n"
+                    block = block + 1
+                }
+                if (state.exportNames.size > 0) {
+                    var exported = 0
+                    while (exported < state.exportNames.size) {
+                        val sourceLiteral = this.generatedStringLiteral(
+                            state.exportSourceNames[exported]
+                        )
+                        val exportLiteral = this.generatedStringLiteral(
+                            state.exportNames[exported]
+                        )
+                        var method = "exportFunction"
+                        if (state.checkedExports[exported]) {
+                            method = "exportCheckedFunction"
+                        }
+                        source = "${source}#compiler.$method(compiler.findFunction($sourceLiteral), $exportLiteral)\n"
+                        exported = exported + 1
+                    }
                 }
                 val entry =
                     "build/.abla-independent/${state.name}.abla-independent.ab"

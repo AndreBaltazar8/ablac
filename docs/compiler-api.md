@@ -112,6 +112,32 @@ compile fun buildTool(): void {
 fun main: int = 0
 ```
 
+A reference may also carry foreign export metadata. The source declaration
+keeps its Abla name; `.exported(name)` names only the destination module's
+bounded foreign symbol. `compiler.reference(handle)` preserves a handle from
+annotation or typed-expression reflection without resolving it again by name:
+
+```abla
+val client = compiler.newModule("client")
+val functions = compiler.functionsAnnotated("client")
+val action = compiler.reference(functions[0]).annotated("browser-copy")
+client.use(action.exported("app_client_action"))
+client.emit("build/client.wasm", "wasm32-module", "module")
+```
+
+An exported function is a sufficient root, so a function-only module does not
+need a synthetic `main`. Duplicate or invalid export names fail during module
+construction. `.checkedExported(name)` requests the same contained boundary as
+`compiler.exportCheckedFunction` and remains conditional on target support.
+
+Extensions importing `abla/compiler/parser` may attach a compiler-owned
+`GeneratedModuleBuilder` through `declareGenerated`. The builder stays opaque;
+the compiler publishes its declarations into the standalone child without the
+extension rendering or writing an entry source. The name returned by
+`compilerGeneratedFunction` can then be selected with
+`module.export(sourceName, foreignName)`. Ordinary quoted declarations continue
+to use `declare { ... }`.
+
 The emitted program is a normal standalone build node, not a child runtime or
 a link back to the parent executable. `emit` defaults to the current host,
 `executable`, optimized mode, and cache reuse where its compile actions permit
