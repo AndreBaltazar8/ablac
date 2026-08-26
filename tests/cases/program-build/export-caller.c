@@ -3,6 +3,8 @@
 #include <string.h>
 
 extern int64_t abla_app_answer(void);
+extern int64_t abla_app_next(void);
+extern int64_t abla_app_resource_next(void);
 extern int64_t abla_app_add(int64_t value, int64_t delta);
 extern uint8_t abla_app_bool_identity(uint8_t value);
 extern int8_t abla_app_i8_identity(int8_t value);
@@ -71,7 +73,10 @@ int main(void) {
         abla_owned_bytes_length(echo) == 3 &&
         memcmp(abla_owned_bytes_data(echo), bytes, 3) == 0;
     abla_owned_bytes_release(echo);
-    return valid && abla_app_answer() == 42 &&
+    return valid && abla_app_next() == 41 && abla_app_next() == 42 &&
+        abla_app_resource_next() == 51 &&
+        abla_app_resource_next() == 52 &&
+        abla_app_answer() == 42 &&
         abla_app_add(19, 23) == 42 &&
         abla_app_bool_identity(1) == 1 &&
         abla_app_i8_identity(-100) == -100 &&

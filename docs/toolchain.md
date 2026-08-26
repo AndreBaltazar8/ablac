@@ -79,11 +79,14 @@ The current owned-byte result handle is available only when the target provides
 the libc allocation contract; libc-free module targets reject it before object
 emission.
 
-The default release profile runs the deterministic `default<O2>,globaldce`
-pipeline. Hosted `--fast` skips whole-module optimization and selects LLVM's
-low-latency code generator for edit/build cycles. External cross targets run a
-bounded `default<O1>,globaldce` pass even in fast mode, because target lowering
-must not validate unreachable host-only runtime assembly. It still runs the complete
+The default hosted release profile runs the deterministic
+`default<O2>,globaldce` pipeline. Release builds for MCU triples use
+`default<Oz>,globaldce`; the target still receives LLVM's optimized machine-code
+generator, while whole-program optimization prioritizes constrained flash.
+Hosted `--fast` skips whole-module optimization and selects LLVM's low-latency
+code generator for edit/build cycles. External cross targets run a bounded
+`default<O1>,globaldce` pass in fast mode, because target lowering must not
+validate unreachable host-only runtime assembly. It still runs the complete
 frontend, compile-time evaluator, verifier, object emitter, and linker; it is
 not a cached or partial build. The default output is a native executable under
 `build/`.

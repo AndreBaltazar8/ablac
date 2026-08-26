@@ -45,6 +45,10 @@ llvm-readelf -h "$output_directory/libabla_app.so" | \
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_answer$'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_next$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_app_resource_next$'
+llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_add$'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_i8_identity$'
@@ -62,6 +66,11 @@ llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_app_checked_divide$'
 llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
     grep -q ' abla_owned_bytes_release$'
+if llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
+    grep -q ' abla_global_'; then
+    echo "internal Abla global escaped the shared-library ABI" >&2
+    exit 1
+fi
 grep -q '"symbol":"abla_app_add"' \
     "$output_directory/libabla_app.so.abi.json"
 grep -q '"name":"value","abi":"i64","ownership":"value"' \

@@ -15,6 +15,15 @@ fun bootstrapLlvmDirectResultIsScalar(
     function: BootstrapIrFunction
 ): bool = bootstrapLlvmDirectScalarType(function.resultType) != ""
 
+fun bootstrapLlvmDirectResultIsVoid(
+    function: BootstrapIrFunction
+): bool = bootstrapNormalizeType(function.resultType) == "void"
+
+fun bootstrapLlvmDirectResultUsesOutput(
+    function: BootstrapIrFunction
+): bool = !bootstrapLlvmDirectResultIsScalar(function) &&
+    !bootstrapLlvmDirectResultIsVoid(function)
+
 fun bootstrapLlvmDirectParameterScalarType(
     function: BootstrapIrFunction,
     parameter: int
@@ -32,7 +41,9 @@ fun bootstrapLlvmDeclareDirectFunction(
         function.resultType
     )
     val parameters: array<i64*> = []
-    if (scalarResult == "") parameters.append(backend.pointerType)
+    if (scalarResult == "" && !bootstrapLlvmDirectResultIsVoid(function)) {
+        parameters.append(backend.pointerType)
+    }
     parameters.append(backend.i64Type)
     var parameter = 0
     while (parameter < function.parameters.size) {
@@ -49,12 +60,14 @@ fun bootstrapLlvmDeclareDirectFunction(
         backend, bootstrapLlvmDirectFunctionSymbol(name),
         if (scalarResult == "") backend.voidType
         else backend.type(scalarResult),
-        parameters, scalarResult == "",
+        parameters, bootstrapLlvmDirectResultUsesOutput(function),
         bootstrapLlvmFalseFlags(parameters.size)
     )
     LLVMSetLinkage(declared, llvmExternalLinkage())
     LLVMSetVisibility(declared, llvmHiddenVisibility())
-    if (function.inlineHint) {
+    if (function.inlineHint || bootstrapLlvmMcuRuntimeInline(
+        backend.targetTriple, function.name
+    )) {
         bootstrapLlvmAddFunctionAttribute(
             backend, declared, "alwaysinline"
         )
@@ -218,8 +231,8 @@ fun bootstrapLlvmCreateFunctionStorage(
         index = index + 1
     }
     index = 0
-    val scalarResult = bootstrapLlvmDirectResultIsScalar(function)
-    val parameterBegin = (if (scalarResult) 0 else 1) + 1
+    val resultUsesOutput = bootstrapLlvmDirectResultUsesOutput(function)
+    val parameterBegin = (if (resultUsesOutput) 1 else 0) + 1
     while (index < function.parameters.size) {
         var slot: i64* = nullPointer
         if (bootstrapLlvmParameterHasDefault(
@@ -303,8 +316,8 @@ fun bootstrapLlvmInitializeParameters(
     llvmFunction: i64*,
     storage: BootstrapLlvmFunctionStorage
 ): void {
-    val scalarResult = bootstrapLlvmDirectResultIsScalar(function)
-    val countIndex = if (scalarResult) 0 else 1
+    val resultUsesOutput = bootstrapLlvmDirectResultUsesOutput(function)
+    val countIndex = if (resultUsesOutput) 1 else 0
     val parameterBegin = countIndex + 1
     val count = LLVMGetParam(llvmFunction, countIndex)
     var parameter = 0
@@ -582,7 +595,7 @@ fun bootstrapLlvmDirectCallArguments(
     output: i64*
 ): array<i64*> {
     val arguments: array<i64*> = []
-    if (!bootstrapLlvmDirectResultIsScalar(function)) {
+    if (bootstrapLlvmDirectResultUsesOutput(function)) {
         arguments.append(output)
     }
     arguments.append(LLVMConstInt(
@@ -625,10 +638,12 @@ fun bootstrapLlvmEmitDirectCall(
     output: i64*
 ): i64* {
     val scalar = bootstrapLlvmDirectScalarType(function.resultType)
+    val returnsVoid = bootstrapLlvmDirectResultIsVoid(function)
     val result = bootstrapLlvmCall(
         backend, target, arguments,
         if (scalar == "") "" else "direct.scalar",
-        scalar == "", bootstrapLlvmFalseFlags(arguments.size)
+        scalar == "" && !returnsVoid,
+        bootstrapLlvmFalseFlags(arguments.size)
     )
     if (scalar != "" && !pointerIsNull(output)) {
         bootstrapLlvmBoxScalar(backend, output, result, scalar)
@@ -1187,6 +1202,7 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "ablaRuntimeTrap" ||
     name == "ablaRuntimePointerAddress" ||
     name == "ablaRuntimePointerFromAddress" ||
+    name == "ablaUnsafeStackAllocate" ||
     name == "ablaUnsafeLoadI64" ||
     name == "ablaUnsafeStoreI64" ||
     name == "ablaUnsafeAtomicFetchAddI64" ||
@@ -1202,7 +1218,20 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "ablaUnsafePointerAddress" ||
     name == "ablaUnsafePointerOffset" ||
     name == "ablaUnsafeLoadU8" ||
+    name == "ablaUnsafeLoadU16" ||
+    name == "ablaUnsafeLoadU32" ||
     name == "ablaUnsafeStoreU8" ||
+    name == "ablaUnsafeStoreU16" ||
+    name == "ablaUnsafeStoreU32" ||
+    name == "ablaUnsafeSetMemory" ||
+    name == "ablaUnsafeVolatileLoadU8" ||
+    name == "ablaUnsafeVolatileLoadU16" ||
+    name == "ablaUnsafeVolatileLoadU32" ||
+    name == "ablaUnsafeVolatileLoadU64" ||
+    name == "ablaUnsafeVolatileStoreU8" ||
+    name == "ablaUnsafeVolatileStoreU16" ||
+    name == "ablaUnsafeVolatileStoreU32" ||
+    name == "ablaUnsafeVolatileStoreU64" ||
     name == "ablaUnsafeCopyMemory" ||
     name == "ablaUnsafeAdoptString" ||
     name == "ablaUnsafeBorrowCString" ||
@@ -1455,9 +1484,30 @@ fun bootstrapLlvmEmitCoreIntrinsic(
             )
         )
     }
+    if (name == "ablaUnsafeStackAllocate") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val size = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[0]
+            )
+            val pointer = LLVMBuildArrayAlloca(
+                backend.builder, backend.i8Type, size,
+                "unsafe.stack.allocation"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, pointer, backend.i64Type,
+                    "unsafe.stack.address"
+                )
+            )
+        }
+    }
     if (name == "ablaUnsafeLoadI64" ||
         name == "ablaUnsafeLoadPointer" ||
-        name == "ablaUnsafeLoadU8") {
+        name == "ablaUnsafeLoadU8" ||
+        name == "ablaUnsafeLoadU16" ||
+        name == "ablaUnsafeLoadU32") {
         if (instruction.operands.size != 1) supported = false
         if (instruction.operands.size == 1) {
             val pointer = LLVMBuildIntToPtr(
@@ -1469,13 +1519,19 @@ fun bootstrapLlvmEmitCoreIntrinsic(
             )
             val type = if (name == "ablaUnsafeLoadU8") {
                 backend.i8Type
+            } else if (name == "ablaUnsafeLoadU16") {
+                LLVMIntTypeInContext(backend.context, 16)
+            } else if (name == "ablaUnsafeLoadU32") {
+                backend.i32Type
             } else if (name == "ablaUnsafeLoadPointer") {
                 backend.pointerType
             } else backend.i64Type
             var loaded = LLVMBuildLoad2(
                 backend.builder, type, pointer, "unsafe.load"
             )
-            if (name == "ablaUnsafeLoadU8") loaded = LLVMBuildZExt(
+            if (name == "ablaUnsafeLoadU8" ||
+                name == "ablaUnsafeLoadU16" ||
+                name == "ablaUnsafeLoadU32") loaded = LLVMBuildZExt(
                 backend.builder, loaded, backend.i64Type, "unsafe.load.u8"
             )
             if (name == "ablaUnsafeLoadPointer") loaded = LLVMBuildPtrToInt(
@@ -1493,7 +1549,9 @@ fun bootstrapLlvmEmitCoreIntrinsic(
     }
     if (name == "ablaUnsafeStoreI64" ||
         name == "ablaUnsafeStorePointer" ||
-        name == "ablaUnsafeStoreU8") {
+        name == "ablaUnsafeStoreU8" ||
+        name == "ablaUnsafeStoreU16" ||
+        name == "ablaUnsafeStoreU32") {
         if (instruction.operands.size != 2) supported = false
         if (instruction.operands.size == 2) {
             val pointer = LLVMBuildIntToPtr(
@@ -1514,7 +1572,86 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 backend.builder, stored, backend.i8Type,
                 "unsafe.store.u8"
             )
+            if (name == "ablaUnsafeStoreU16") stored = LLVMBuildTrunc(
+                backend.builder, stored,
+                LLVMIntTypeInContext(backend.context, 16),
+                "unsafe.store.u16"
+            )
+            if (name == "ablaUnsafeStoreU32") stored = LLVMBuildTrunc(
+                backend.builder, stored, backend.i32Type,
+                "unsafe.store.u32"
+            )
             LLVMBuildStore(backend.builder, stored, pointer)
+            bootstrapLlvmInitializeVoidValue(
+                backend, storage.values[instruction.result]
+            )
+        }
+    }
+    if (name == "ablaUnsafeVolatileLoadU8" ||
+        name == "ablaUnsafeVolatileLoadU16" ||
+        name == "ablaUnsafeVolatileLoadU32" ||
+        name == "ablaUnsafeVolatileLoadU64") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val pointer = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType, "unsafe.volatile.load.pointer"
+            )
+            var type = backend.i64Type
+            if (name == "ablaUnsafeVolatileLoadU8") type = backend.i8Type
+            if (name == "ablaUnsafeVolatileLoadU16") {
+                type = LLVMIntTypeInContext(backend.context, 16)
+            }
+            if (name == "ablaUnsafeVolatileLoadU32") type = backend.i32Type
+            var loaded = LLVMBuildLoad2(
+                backend.builder, type, pointer, "unsafe.volatile.load"
+            )
+            LLVMSetVolatile(loaded, 1)
+            if (name != "ablaUnsafeVolatileLoadU64") loaded = LLVMBuildZExt(
+                backend.builder, loaded, backend.i64Type,
+                "unsafe.volatile.load.wide"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, loaded
+            )
+        }
+    }
+    if (name == "ablaUnsafeVolatileStoreU8" ||
+        name == "ablaUnsafeVolatileStoreU16" ||
+        name == "ablaUnsafeVolatileStoreU32" ||
+        name == "ablaUnsafeVolatileStoreU64") {
+        if (instruction.operands.size != 2) supported = false
+        if (instruction.operands.size == 2) {
+            val pointer = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType, "unsafe.volatile.store.pointer"
+            )
+            var stored = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[1]
+            )
+            if (name == "ablaUnsafeVolatileStoreU8") stored = LLVMBuildTrunc(
+                backend.builder, stored, backend.i8Type,
+                "unsafe.volatile.store.u8"
+            )
+            if (name == "ablaUnsafeVolatileStoreU16") stored = LLVMBuildTrunc(
+                backend.builder, stored,
+                LLVMIntTypeInContext(backend.context, 16),
+                "unsafe.volatile.store.u16"
+            )
+            if (name == "ablaUnsafeVolatileStoreU32") stored = LLVMBuildTrunc(
+                backend.builder, stored, backend.i32Type,
+                "unsafe.volatile.store.u32"
+            )
+            val operation = LLVMBuildStore(
+                backend.builder, stored, pointer
+            )
+            LLVMSetVolatile(operation, 1)
             bootstrapLlvmInitializeVoidValue(
                 backend, storage.values[instruction.result]
             )
@@ -1574,6 +1711,38 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 source,
                 1,
                 size
+            )
+            bootstrapLlvmInitializeVoidValue(
+                backend, storage.values[instruction.result]
+            )
+        }
+    }
+    if (name == "ablaUnsafeSetMemory") {
+        if (instruction.operands.size != 3) supported = false
+        if (instruction.operands.size == 3) {
+            val destination = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType, "unsafe.set.destination"
+            )
+            val value = LLVMBuildTrunc(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[1]
+                ),
+                backend.i8Type, "unsafe.set.value"
+            )
+            val size = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[2]
+            )
+            LLVMBuildMemSet(
+                backend.builder,
+                destination,
+                value,
+                size,
+                1
             )
             bootstrapLlvmInitializeVoidValue(
                 backend, storage.values[instruction.result]
@@ -2120,7 +2289,10 @@ fun bootstrapLlvmEmitFunctionReturn(
     output: i64*
 ): void {
     val scalar = bootstrapLlvmDirectScalarType(function.resultType)
-    if (scalar != "") {
+    if (bootstrapLlvmDirectResultIsVoid(function)) {
+        bootstrapLlvmPopRoots(backend, storage)
+        LLVMBuildRetVoid(backend.builder)
+    } else if (scalar != "") {
         var native = LLVMConstNull(backend.type(scalar))
         if (value >= 0) {
             native = bootstrapLlvmNativeValue(backend, storage, value)
@@ -2200,12 +2372,11 @@ fun bootstrapLlvmEmitFunction(
             "", false, []
         )
     }
-    val scalarResult = bootstrapLlvmDirectResultIsScalar(function)
-    val output = if (scalarResult) {
-        nativeNullPointer()
-    } else LLVMGetParam(llvmFunction, 0)
+    val resultUsesOutput = bootstrapLlvmDirectResultUsesOutput(function)
+    val output = if (resultUsesOutput) LLVMGetParam(llvmFunction, 0)
+        else nativeNullPointer()
     val argumentCount = LLVMGetParam(
-        llvmFunction, if (scalarResult) 0 else 1
+        llvmFunction, if (resultUsesOutput) 1 else 0
     )
     var errors = 0
     var terminated = false
@@ -2294,10 +2465,10 @@ fun bootstrapLlvmEmitFunction(
                     if (!bootstrapLlvmParameterHasDefault(
                         function, instruction.text
                     )) {
-                        val scalarResult =
-                            bootstrapLlvmDirectResultIsScalar(function)
+                        val resultUsesOutput =
+                            bootstrapLlvmDirectResultUsesOutput(function)
                         val parameterBegin =
-                            (if (scalarResult) 0 else 1) + 1
+                            (if (resultUsesOutput) 1 else 0) + 1
                         bootstrapLlvmSetNativeValue(
                             backend, storage, instruction.result,
                             LLVMGetParam(
@@ -2664,8 +2835,12 @@ fun bootstrapLlvmEmitFunction(
                 val calledIsScalar = bootstrapLlvmDirectResultIsScalar(
                     program.functions[called]
                 )
-                val callOutput = if (calledIsScalar) nativeNullPointer()
-                    else storage.values[instruction.result]
+                val calledUsesOutput = bootstrapLlvmDirectResultUsesOutput(
+                    program.functions[called]
+                )
+                val callOutput = if (calledUsesOutput)
+                    storage.values[instruction.result]
+                    else nativeNullPointer()
                 val arguments = bootstrapLlvmDirectCallArguments(
                     backend, storage, program.functions[called],
                     instruction.operands, callOutput
@@ -3065,7 +3240,12 @@ fun bootstrapLlvmEmitFunction(
                 }
             }
         }
-        if (!matched || !supported) errors = errors + 1
+        if (!matched || !supported) {
+            linuxPrintStandardError(
+                "error[E_LLVM_INSTRUCTION_UNSUPPORTED]: function `${function.name}` cannot lower `${instruction.opcode}` target `${instruction.text}`\n"
+            )
+            errors = errors + 1
+        }
         instructionIndex = instructionIndex + 1
     }
     if (!terminated) {

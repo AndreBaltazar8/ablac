@@ -50,6 +50,9 @@ prepare-test-driver:
 test: ablac
 	tools/test-version.sh $(COMPILER)
 	tools/test-value-abi.sh $(COMPILER)
+	tools/test-unsafe-mmio.sh $(COMPILER)
+	tools/test-unsafe-stack-memory.sh $(COMPILER)
+	tools/test-nominal-scalars.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
 check: test self-rebuild

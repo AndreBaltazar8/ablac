@@ -2,6 +2,24 @@ import "eval.ab"
 import "staged_parser.ab"
 import "abla/runtime/memory"
 
+fun bootstrapGlobalCallResultType(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): string {
+    var result = name
+    var index = 0
+    while (index < declarations.size) {
+        val declaration = declarations[index]
+        if (declaration.name == name &&
+            (declaration.kind == "fun" || declaration.kind == "extern") &&
+            declaration.resultType != "inferred") {
+            result = bootstrapNormalizeType(declaration.resultType)
+        }
+        index = index + 1
+    }
+    result
+}
+
 fun bootstrapGlobalValueType(
     declarations: array<BootstrapDeclaration>,
     name: string
@@ -33,14 +51,45 @@ fun bootstrapGlobalValueType(
                             result = "array:bool"
                         }
                         if (first.kind == "string") result = "array:string"
-                        if (first.kind == "call") {
-                            result = "array:${first.text}"
-                        }
+                        if (first.kind == "call") result =
+                            "array:${bootstrapGlobalCallResultType(
+                                declarations, first.text
+                            )}"
                     }
                 }
-                if (expression.kind == "call") result = expression.text
+                if (expression.kind == "call") result =
+                    bootstrapGlobalCallResultType(
+                        declarations, expression.text
+                    )
             }
         }
+        index = index + 1
+    }
+    result
+}
+
+// Nominal scalar types remain distinct through parsing, semantic analysis,
+// overload resolution, and extension lookup. Once calls have been resolved,
+// their IR storage is exactly the declared primitive representation.
+fun bootstrapIrRuntimeType(
+    declarations: array<BootstrapDeclaration>,
+    type: string
+): string {
+    val normalized = bootstrapNormalizeType(type)
+    val underlying = bootstrapScalarTypeUnderlying(
+        declarations, normalized
+    )
+    if (underlying == "") normalized else underlying
+}
+
+fun bootstrapIrRuntimeTypes(
+    declarations: array<BootstrapDeclaration>,
+    types: array<string>
+): array<string> {
+    val result: array<string> = []
+    var index = 0
+    while (index < types.size) {
+        result.append(bootstrapIrRuntimeType(declarations, types[index]))
         index = index + 1
     }
     result
@@ -3099,7 +3148,10 @@ class BootstrapLowerer(
                     expression.children[0]
                 )}"
             }
-            else if (this.isClass(expression.text)) result = expression.text
+            else if (this.isClass(expression.text) ||
+                     this.isScalarType(expression.text)) {
+                result = expression.text
+            }
             else if (this.isParameter(expression.text)) {
                 result = bootstrapFunctionResultType(
                     this.lowerParameterType(expression.text)
@@ -3213,7 +3265,9 @@ class BootstrapLowerer(
         }
         if (expression.kind == "+" || expression.kind == "-" ||
             expression.kind == "*" || expression.kind == "/") {
-            result = this.lowerExpressionType(expression.children[0])
+            val operand = this.lowerExpressionType(expression.children[0])
+            val underlying = this.scalarTypeUnderlying(operand)
+            result = if (underlying == "") operand else underlying
         }
         if (expression.kind == "&" || expression.kind == "|" ||
             expression.kind == "^" || expression.kind == "<<" ||
@@ -4020,6 +4074,12 @@ class BootstrapLowerer(
         }
         found
     }
+
+    fun isScalarType(name: string): bool =
+        bootstrapScalarTypeUnderlying(this.declarations, name) != ""
+
+    fun scalarTypeUnderlying(name: string): string =
+        bootstrapScalarTypeUnderlying(this.declarations, name)
 
     fun isExternal(name: string): bool {
         var found = false
@@ -5139,9 +5199,15 @@ class BootstrapLowerer(
                     )
                 }
                 result = result
+            } else if (this.isScalarType(expression.text) &&
+                arguments.size == 1) {
+                result = arguments[0]
             } else result = this.emitMany(opcode, arguments, expression.text)
         }
         if (expression.kind == "member") {
+            val receiverType = bootstrapBorrowElementType(
+                this.lowerExpressionType(expression.children[0])
+            )
             val place = this.lowerPlacePath(expression)
             if (place != "") {
                 this.emitControl("place.load", -1, -1, -1, place)
@@ -5149,9 +5215,6 @@ class BootstrapLowerer(
             val receiver = if (place != "") {
                 this.lowerPlaceProjection(expression.children[0])
             } else this.lowerExpression(expression.children[0])
-            val receiverType = bootstrapBorrowElementType(
-                this.lowerExpressionType(expression.children[0])
-            )
             if (expression.text == "size" &&
                 (receiverType == "string" ||
                  bootstrapIsArrayType(receiverType))) {
@@ -6129,7 +6192,8 @@ class BootstrapLowerer(
                 val nativeParameters: array<string> = []
                 var nativeParameter = 0
                 while (nativeParameter < declaration.parameterTypes.size) {
-                    nativeParameters.append(bootstrapNormalizeType(
+                    nativeParameters.append(bootstrapIrRuntimeType(
+                        parsed.declarations,
                         declaration.parameterTypes[nativeParameter]
                     ))
                     nativeParameter = nativeParameter + 1
@@ -6137,7 +6201,9 @@ class BootstrapLowerer(
                 natives.append(BootstrapIrNative(
                     declaration.name,
                     nativeParameters,
-                    bootstrapNormalizeType(declaration.resultType)
+                    bootstrapIrRuntimeType(
+                        parsed.declarations, declaration.resultType
+                    )
                 ))
             }
             index = index + 1
@@ -6249,13 +6315,41 @@ class BootstrapLowerer(
                 // A delegated binding exposes the getter result but stores
                 // its delegate object. The backend must size and classify the
                 // global from that storage type, not the exposed scalar type.
-                globalTypes.append(this.lowerStorageType(declaration.name))
+                globalTypes.append(bootstrapIrRuntimeType(
+                    parsed.declarations,
+                    this.lowerStorageType(declaration.name)
+                ))
             }
             global = global + 1
         }
+        val runtimeFunctions: array<BootstrapIrFunction> = []
+        var runtimeFunction = 0
+        while (runtimeFunction < this.functions.size) {
+            val function = this.functions[runtimeFunction]
+            runtimeFunctions.append(BootstrapIrFunction(
+                function.name,
+                function.parameters,
+                function.instructions,
+                function.result,
+                function.blocks,
+                function.locals,
+                bootstrapIrRuntimeTypes(
+                    parsed.declarations, function.localTypes
+                ),
+                bootstrapIrRuntimeTypes(
+                    parsed.declarations, function.parameterTypes
+                ),
+                bootstrapIrRuntimeType(
+                    parsed.declarations, function.resultType
+                ),
+                function.inlineHint,
+                function.verificationErrors
+            ))
+            runtimeFunction = runtimeFunction + 1
+        }
         BootstrapIrProgram(
             this.instructions,
-            this.functions,
+            runtimeFunctions,
             classes,
             natives,
             globalNames,

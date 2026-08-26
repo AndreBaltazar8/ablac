@@ -44,6 +44,7 @@ unrelated policy or compiler machinery into the program:
 | `abla/wasm/build` | WebAssembly-owned wasm32 target and no-entry module request |
 | `abla/mvc/wasm/build` | MVC composition that generates a thin browser loader around the WASM module |
 | `abla/unsafe/memory` | internal trusted native boundary plus checked pointer cells/buffers; retained at this legacy import path while typed resource modules stabilize |
+| `abla/unsafe/mmio` | trusted volatile 8/16/32/64-bit memory-mapped I/O primitives for platform frameworks and device drivers |
 | `abla/sys/linux` | opt-in raw x86-64 Linux syscall and native descriptor APIs |
 | `abla/sys/linux/fs` | raw-kernel `Path`, metadata, atomic writes, entries, and watches |
 | `abla/sys/linux/io` | raw-kernel buffered input lines, polling, and full output writes |
@@ -89,6 +90,12 @@ native extension entry points. Each operation encodes its exact pointer and
 integer lanes; there is no unchecked variadic call surface.
 Native counter integrations can use the monotonic atomic `i64` fetch-add
 operation instead of introducing a foreign runtime helper or data race.
+Trusted embedded drivers can also request function-scoped native storage with
+`nativeStackAllocate`; LLVM lowers it to `alloca`, and the unsafe 8/16/32/64-bit
+loads, stores, copy, and memory-set operations lower directly to LLVM memory
+instructions. The address must not escape its calling function. Persistent or
+ordinary application storage should continue to use ownership-checked resource
+types instead.
 
 `abla/sys/linux` is likewise explicit and target-specific. Its current
 x86-64 implementation lowers `openat`, `read`, `write`, `close`, and `getpid`

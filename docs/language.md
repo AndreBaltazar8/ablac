@@ -178,6 +178,27 @@ The core types are `void`, `bool`, signed integer types (`i8`, `i16`, `i32`,
 `i64`, with `int` aliasing `i64`), unsigned counterparts, floating types
 (`f32`, `f64`), `char`, `string`, `array<T>`, and `any`.
 
+A nominal scalar gives a primitive value a distinct source type without adding
+runtime storage:
+
+```abla
+type Pin = int
+
+fun Pin.next(): Pin = Pin(this + 1)
+fun pinNumber(pin: Pin): int = pin
+```
+
+`Pin(4)` is the explicit conversion from the underlying integer. The reverse
+direction is implicit: inside an extension, `this` is the integer itself, and a
+`Pin` can be consumed wherever its underlying integer is accepted. A plain
+integer is not accepted where `Pin` is required. Arithmetic uses the primitive
+value and produces the underlying primitive type, so constructing a new `Pin`
+remains explicit. Extensions still resolve against the nominal `Pin` type.
+After semantic resolution the typed IR erases the nominal spelling to its
+primitive representation; there is no allocation, object header, or dynamic
+dispatch. `type` is contextual at declaration position and remains available
+as an ordinary identifier elsewhere.
+
 `T?` is nullable. Nullability is part of every type and is not represented by a
 sentinel integer. `T*` is a native pointer type confined to trusted platform
 implementations and does not implicitly transfer ownership.
@@ -270,6 +291,10 @@ reset(socket)            // exclusively borrowed; available after the call
 close(move(socket))      // ownership transferred; socket is invalid
 close(Socket(otherFd))   // a fresh value transfers directly
 ```
+
+The same call-scoped rule applies when the borrowed place is rooted in a
+module-level `val` or `var`: the binding remains module-owned, the callee may
+mutate through the exclusive borrow, and it cannot retain or return that borrow.
 
 `own` is valid only on an affine function, extension, or method parameter;
 using it on a scalar or another freely copyable type is a compile error. Class

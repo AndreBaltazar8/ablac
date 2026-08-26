@@ -1271,6 +1271,29 @@ fun bootstrapDeclarationIsValue(kind: string): bool =
     kind == "val" || kind == "var" ||
     kind == "compile.val" || kind == "compile.var"
 
+fun bootstrapScalarTypeUnderlying(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): string {
+    var result = ""
+    var index = 0
+    while (index < declarations.size) {
+        val declaration = declarations[index]
+        if (declaration.kind == "type" && declaration.name == name) {
+            result = bootstrapNormalizeType(declaration.resultType)
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapScalarTypeUnderlyingValid(type: string): bool =
+    type == "bool" || type == "char" ||
+    type == "i8" || type == "u8" ||
+    type == "i16" || type == "u16" ||
+    type == "i32" || type == "u32" ||
+    type == "i64" || type == "u64" || type == "f64"
+
 fun bootstrapGlobalFunctionType(
     declarations: array<BootstrapDeclaration>,
     name: string
@@ -1361,6 +1384,12 @@ fun bootstrapTypesCompatibleWithInferredNoEscape(
     declarations: array<BootstrapDeclaration>
 ): bool {
     var compatible = bootstrapTypesCompatible(expected, actual)
+    val scalarUnderlying = bootstrapScalarTypeUnderlying(
+        declarations, actual
+    )
+    if (!compatible && scalarUnderlying != "") {
+        compatible = bootstrapTypesCompatible(expected, scalarUnderlying)
+    }
     if (!compatible && bootstrapIsNoEscapeFunctionType(expected) &&
         bootstrapIsFunctionType(actual) &&
         bootstrapFunctionCoreType(expected) ==
@@ -3123,6 +3152,24 @@ class BootstrapAnalyzer(
     var yieldedType: string,
     val allowContractCalls: bool
 ) {
+    fun typesCompatible(expected: string, actual: string): bool {
+        var compatible = bootstrapTypesCompatible(expected, actual)
+        val underlying = bootstrapScalarTypeUnderlying(
+            this.declarations, actual
+        )
+        if (!compatible && underlying != "") {
+            compatible = bootstrapTypesCompatible(expected, underlying)
+        }
+        compatible
+    }
+
+    fun scalarValueType(type: string): string {
+        val underlying = bootstrapScalarTypeUnderlying(
+            this.declarations, type
+        )
+        if (underlying == "") type else underlying
+    }
+
     fun expressionCompileEffects(expression: BootstrapExpression): int {
         val delegatedNames: array<string> = []
         var declaration = 0
@@ -4344,7 +4391,10 @@ class BootstrapAnalyzer(
             val rootKind = this.visibleLocalKind(values[0])
             if (rootKind == "parameter") valid = false
             if (bootstrapIsBorrowType(this.findType(values[0]))) valid = false
-        } else if (values.size > 0) valid = false
+        } else if (values.size > 0) {
+            val rootKind = this.findKind(values[0])
+            valid = rootKind == "val" || rootKind == "var"
+        }
         if (!valid && expression.kind == "array") valid = true
         if (!valid && expression.kind == "lambda") valid = true
         if (!valid && expression.kind == "call" &&
@@ -5675,7 +5725,7 @@ class BootstrapAnalyzer(
                 this.fail("region.indirect-call-retention:${expression.text}")
             }
             if (!bootstrapIsFunctionType(functionType) &&
-                symbolKind != "class") {
+                symbolKind != "class" && symbolKind != "type") {
                 this.fail("call.target:${expression.text}")
             }
             var argument = 0
@@ -5713,6 +5763,10 @@ class BootstrapAnalyzer(
                         }
                         declarationIndex = declarationIndex + 1
                     }
+                } else if (symbolKind == "type") {
+                    expectedArgument = bootstrapScalarTypeUnderlying(
+                        this.declarations, expression.text
+                    )
                 }
                 this.contextualizeLambdaParameters(
                     expression.children[argument],
@@ -5858,7 +5912,21 @@ class BootstrapAnalyzer(
                     declarationIndex = declarationIndex + 1
                 }
             }
-            if (symbolKind == "class") {
+            if (symbolKind == "type") {
+                val underlying = bootstrapScalarTypeUnderlying(
+                    this.declarations, expression.text
+                )
+                if (expression.children.size != 1) {
+                    this.fail("type.constructor-arity:${expression.text}")
+                }
+                if (expression.children.size == 1 &&
+                    !bootstrapTypesCompatible(
+                        underlying, resolvedArgumentTypes[0]
+                    )) {
+                    this.fail("type.constructor-argument:${expression.text}")
+                }
+                result = expression.text
+            } else if (symbolKind == "class") {
                 result = expression.text
                 val storedSource = this.constructorStoredBorrowSource(
                     expression
@@ -6434,7 +6502,7 @@ class BootstrapAnalyzer(
             }
             if (this.currentResultType != "" &&
                 this.currentResultType != "inferred" &&
-                !bootstrapTypesCompatible(this.currentResultType, returned)) {
+                !this.typesCompatible(this.currentResultType, returned)) {
                 this.fail("return.type")
             }
             if (this.currentResultType != "" &&
@@ -6909,8 +6977,12 @@ class BootstrapAnalyzer(
             expression.kind == "^" || expression.kind == "<<" ||
             expression.kind == ">>" || expression.kind == ">>>"
         ) {
-            val left = this.infer(expression.children[0])
-            val right = this.infer(expression.children[1])
+            val left = this.scalarValueType(
+                this.infer(expression.children[0])
+            )
+            val right = this.scalarValueType(
+                this.infer(expression.children[1])
+            )
             val arithmetic = expression.kind == "+" ||
                 expression.kind == "-" || expression.kind == "*" ||
                 expression.kind == "/"
@@ -6933,8 +7005,8 @@ class BootstrapAnalyzer(
         ) {
             val left = this.infer(expression.children[0])
             val right = this.infer(expression.children[1])
-            if (!bootstrapTypesCompatible(left, right) &&
-                !bootstrapTypesCompatible(right, left)) {
+            if (!this.typesCompatible(left, right) &&
+                !this.typesCompatible(right, left)) {
                 this.fail("comparison.type")
             }
             result = "bool"
@@ -7005,6 +7077,10 @@ class BootstrapAnalyzer(
                 type = declaration.name
                 publish = true
             }
+            if (declaration.kind == "type") {
+                type = declaration.name
+                publish = true
+            }
             if (publish) {
                 if (this.hasSymbol(symbolName)) {
                     this.fail("symbol.duplicate:$symbolName")
@@ -7035,6 +7111,7 @@ class BootstrapAnalyzer(
                 declaration.kind == "compile.fun" ||
                 declaration.kind == "class" ||
                 declaration.kind == "interface" ||
+                declaration.kind == "type" ||
                 (bootstrapDeclarationIsValue(declaration.kind) &&
                  declaration.resultType != "inferred")
             if (!predeclared && this.hasSymbol(symbolName)) {
@@ -7099,6 +7176,15 @@ class BootstrapAnalyzer(
                 declaration.kind == "class" ||
                 declaration.kind == "interface"
             ) type = declaration.name
+            if (declaration.kind == "type") {
+                type = declaration.name
+                val underlying = bootstrapNormalizeType(
+                    declaration.resultType
+                )
+                if (!bootstrapScalarTypeUnderlyingValid(underlying)) {
+                    this.fail("type.underlying:${declaration.name}:$underlying")
+                }
+            }
             if (!predeclared) {
                 this.symbols.append(BootstrapSymbol(
                     symbolName,
@@ -7341,7 +7427,7 @@ class BootstrapAnalyzer(
                         val parameterType = bootstrapNormalizeType(
                             declaration.parameterTypes[parameter]
                         )
-                        if (!bootstrapTypesCompatible(
+                        if (!this.typesCompatible(
                             parameterType,
                             defaultType
                         )) this.fail(
@@ -7357,7 +7443,7 @@ class BootstrapAnalyzer(
                     "function.${declaration.name}"
                 )
                 if (declaration.resultType != "inferred" &&
-                    !bootstrapTypesCompatible(
+                    !this.typesCompatible(
                         bootstrapNormalizeType(declaration.resultType),
                         actual
                     )) {
@@ -7483,7 +7569,7 @@ class BootstrapAnalyzer(
                         val parameterType = bootstrapNormalizeType(
                             method.parameterTypes[parameter]
                         )
-                        if (!bootstrapTypesCompatible(
+                        if (!this.typesCompatible(
                             parameterType,
                             defaultType
                         )) this.fail(
@@ -7515,7 +7601,7 @@ class BootstrapAnalyzer(
                     "method.${owner.name}.${method.name}"
                 )
                 if (method.resultType != "inferred" &&
-                    !bootstrapTypesCompatible(
+                    !this.typesCompatible(
                         bootstrapNormalizeType(method.resultType),
                         actual
                     )) {
