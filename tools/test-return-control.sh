@@ -20,6 +20,19 @@ if [[ $status -ne 42 ]]; then
     exit 1
 fi
 
+nested_program="$output_directory/nested-if-expression"
+"$compiler" build \
+    "$project_root/tests/cases/modules/nested-if-expression.ab" \
+    -o "$nested_program" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" "$nested_program"
+nested_status=$?
+set -e
+if [[ $nested_status -ne 42 ]]; then
+    echo "return-control: nested if expression expected 42, got $nested_status" >&2
+    exit 1
+fi
+
 rm -f "$output_directory/invalid"
 set +e
 "$compiler" build \
@@ -44,4 +57,4 @@ if [[ -e "$output_directory/invalid" ]]; then
     exit 1
 fi
 
-echo "return-control: Abla runtime, LLVM, compile-time, lambda, method, void, and diagnostic checks passed"
+echo "return-control: Abla runtime, LLVM, nested expressions, compile-time, lambda, method, void, and diagnostic checks passed"
