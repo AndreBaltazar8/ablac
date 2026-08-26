@@ -62,6 +62,8 @@ fi
     >"$output_directory/module-val-constant.ll"
 grep -Eq '= internal constant i64 42(,|$)' \
     "$output_directory/module-val-constant.ll"
+grep -Eq '= internal constant i64 128(,|$)' \
+    "$output_directory/module-val-constant.ll"
 grep -Eq '= internal global i64 0(,|$)' \
     "$output_directory/module-val-constant.ll"
 

@@ -1148,47 +1148,95 @@ fun bootstrapLlvmInstructionProducing(
     result
 }
 
-// A scalar module val initialized directly from a literal is immutable for
-// the entire program. Emit it as an LLVM constant initializer instead of a
-// zero-filled cell plus a lazy first-call store. More involved expressions
-// deliberately remain runtime initialized until the constant evaluator can
-// prove their complete dependency graph.
-fun bootstrapLlvmScalarGlobalConstant(
+fun bootstrapLlvmScalarInstructionConstant(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
-    name: string
+    valueId: int,
+    scalar: string,
+    depth: int
+): i64* {
+    var result = nativeNullPointer()
+    if (depth > program.globalNames.size + 1) return result
+    val valueIndex = bootstrapLlvmInstructionProducing(program, valueId)
+    if (valueIndex < 0) return result
+    val value = program.instructions[valueIndex]
+    if (scalar == "i64" && value.opcode == "const.i64") result =
+        LLVMConstInt(
+            backend.i64Type,
+            bootstrapLlvmParseInteger(value.text), 1
+        )
+    if (scalar == "bool" && value.opcode == "const.bool") result =
+        LLVMConstInt(
+            backend.i1Type,
+            if (value.text == "true") 1 else 0, 0
+        )
+    if (scalar == "f64" && value.opcode == "const.f64") result =
+        LLVMConstRealOfStringAndSize(
+            backend.f64Type, value.text, value.text.size
+        )
+    if (value.opcode == "global.load" &&
+        bootstrapLlvmGlobalScalarType(program, value.text) == scalar) {
+        result = bootstrapLlvmScalarGlobalConstantAtDepth(
+            backend, program, value.text, depth + 1
+        )
+    }
+    if ((scalar == "i64" || scalar == "bool") &&
+        (value.opcode == "neg" || value.opcode == "bit.not" ||
+         value.opcode == "not")) {
+        val operand = bootstrapLlvmScalarInstructionConstant(
+            backend, program, value.left, scalar, depth + 1
+        )
+        if (!pointerIsNull(operand)) result =
+            if (value.opcode == "neg") LLVMConstNeg(operand)
+            else LLVMConstNot(operand)
+    }
+    if (scalar == "i64" &&
+        (value.opcode == "+" || value.opcode == "-" ||
+         value.opcode == "^")) {
+        val left = bootstrapLlvmScalarInstructionConstant(
+            backend, program, value.left, scalar, depth + 1
+        )
+        val right = bootstrapLlvmScalarInstructionConstant(
+            backend, program, value.right, scalar, depth + 1
+        )
+        if (!pointerIsNull(left) && !pointerIsNull(right)) {
+            if (value.opcode == "+") result = LLVMConstAdd(left, right)
+            if (value.opcode == "-") result = LLVMConstSub(left, right)
+            if (value.opcode == "^") result = LLVMConstXor(left, right)
+        }
+    }
+    result
+}
+
+fun bootstrapLlvmScalarGlobalConstantAtDepth(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    name: string,
+    depth: int
 ): i64* {
     var result = nativeNullPointer()
     val scalar = bootstrapLlvmGlobalScalarType(program, name)
     val storeIndex = bootstrapLlvmGlobalStoreInstruction(program, name)
     if (scalar != "" && bootstrapLlvmGlobalKind(program, name) == "val" &&
         storeIndex >= 0) {
-        val valueIndex = bootstrapLlvmInstructionProducing(
-            program, program.instructions[storeIndex].left
+        result = bootstrapLlvmScalarInstructionConstant(
+            backend, program, program.instructions[storeIndex].left,
+            scalar, depth
         )
-        if (valueIndex >= 0) {
-            val value = program.instructions[valueIndex]
-            if (scalar == "i64" && value.opcode == "const.i64") {
-                result = LLVMConstInt(
-                    backend.i64Type,
-                    bootstrapLlvmParseInteger(value.text), 1
-                )
-            }
-            if (scalar == "bool" && value.opcode == "const.bool") {
-                result = LLVMConstInt(
-                    backend.i1Type,
-                    if (value.text == "true") 1 else 0, 0
-                )
-            }
-            if (scalar == "f64" && value.opcode == "const.f64") {
-                result = LLVMConstRealOfStringAndSize(
-                    backend.f64Type, value.text, value.text.size
-                )
-            }
-        }
     }
     result
 }
+
+// A scalar module val whose complete initializer graph is proven constant is
+// immutable for the entire program. Emit it as an LLVM constant initializer
+// instead of a zero-filled cell plus a lazy first-call store.
+fun bootstrapLlvmScalarGlobalConstant(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    name: string
+): i64* = bootstrapLlvmScalarGlobalConstantAtDepth(
+    backend, program, name, 0
+)
 
 fun bootstrapLlvmHasRuntimeGlobals(
     backend: BootstrapLlvmBackend,
