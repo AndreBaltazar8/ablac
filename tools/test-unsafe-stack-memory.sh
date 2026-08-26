@@ -13,6 +13,7 @@ grep -Fq 'store i32' "$output"
 grep -Fq 'load i16' "$output"
 grep -Fq 'load i32' "$output"
 grep -Fq '@llvm.memset' "$output"
+grep -Fq '@llvm.memcpy' "$output"
 if grep -Fq 'ret i64 %unsafe.stack.address' "$output"; then
     echo 'stack allocation escaped through a helper frame' >&2
     exit 1
