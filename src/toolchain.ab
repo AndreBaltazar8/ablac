@@ -453,6 +453,26 @@ fun bootstrapPrepareParallelLlvm(
     prepare.run()
 }
 
+fun bootstrapPrepareLtoLlvm(
+    llvmPath: string,
+    preparedPath: string
+): int {
+    val visiblePath = "$preparedPath.visible.ll"
+    var status = bootstrapPrepareParallelLlvm(llvmPath, visiblePath)
+    if (status == 0) {
+        val visible = Path(visiblePath).readText()
+        val internal = bootstrapInternalizeLlvmUserFunctionWrappers(
+            visible
+        )
+        if (internal != "" && Path(preparedPath).writeTextAtomic(
+            internal
+        )) status = 0
+        else status = 145
+    }
+    Path(visiblePath).remove()
+    status
+}
+
 fun bootstrapEmitParallelObject(
     llvmPath: string,
     objectPath: string
@@ -574,6 +594,61 @@ fun bootstrapLlvmUserFunctionSymbols(llvm: string): array<string> {
         } else offset = offset + 1
     }
     symbols
+}
+
+// Hosted LTO first specializes the universal ABI wrappers while they are
+// visible, then makes them private before whole-program dead-code elimination.
+// Doing both at initial IR emission changes LLVM's inlining order and can leave
+// boxed runtime work on hot indirect-call paths.
+fun bootstrapInternalizeLlvmUserFunctionWrappers(llvm: string): string {
+    val prefix = "define hidden void @abla_fn_"
+    val replacement = "define internal void @abla_fn_"
+    val directSuffix = "_direct"
+    val offsets: array<int> = []
+    var offset = 0
+    while (offset + prefix.size < llvm.size) {
+        if (llvm.slice(offset, offset + prefix.size) == prefix) {
+            val nameBegin = offset + prefix.size
+            var nameEnd = nameBegin
+            while (nameEnd < llvm.size && llvm[nameEnd] != 40 &&
+                   llvm[nameEnd] != 32 && llvm[nameEnd] != 10 &&
+                   llvm[nameEnd] != 13) nameEnd = nameEnd + 1
+            val nameSize = nameEnd - nameBegin
+            val direct = nameSize >= directSuffix.size &&
+                llvm.slice(
+                    nameEnd - directSuffix.size, nameEnd
+                ) == directSuffix
+            if (!direct) offsets.append(offset)
+            offset = nameEnd
+        } else offset = offset + 1
+    }
+    val extraBytes = offsets.size * (replacement.size - prefix.size)
+    val output = nativeByteBuffer(llvm.size + extraBytes + 1)
+    var valid = !pointerIsNull(output.address)
+    var source = 0
+    var destination = 0
+    var replacementIndex = 0
+    while (valid && source < llvm.size) {
+        if (replacementIndex < offsets.size &&
+            source == offsets[replacementIndex]) {
+            var byte = 0
+            while (valid && byte < replacement.size) {
+                valid = output.store(destination, replacement[byte])
+                destination = destination + 1
+                byte = byte + 1
+            }
+            source = source + prefix.size
+            replacementIndex = replacementIndex + 1
+        } else {
+            valid = output.store(destination, llvm[source])
+            destination = destination + 1
+            source = source + 1
+        }
+    }
+    var result = ""
+    if (valid) result = output.adoptString(destination)
+    else output.close()
+    result
 }
 
 // ELF linkers can discard unused functions only when code generation places
@@ -1138,6 +1213,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val objectPath = "$outputPath.o"
     val hostPath = "$outputPath.host.o"
     val ltoObjectPath = "$outputPath.lto-program.o"
+    val ltoPreparedPath = "$outputPath.lto-prepared.ll"
     val combinedObjectPath = "$outputPath.combined.o"
     val publishPath = "$outputPath.tmp.${linuxProcessId()}"
     val optimizedWasmPath = "$outputPath.wasm-opt.tmp.${linuxProcessId()}"
@@ -1218,6 +1294,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     Path("$outputPath.runtime.o").remove()
     Path(hostPath).remove()
     Path(ltoObjectPath).remove()
+    Path(ltoPreparedPath).remove()
     Path(combinedObjectPath).remove()
     Path(publishPath).remove()
     Path(optimizedWasmPath).remove()
@@ -1455,6 +1532,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         status = compileAdapter.run()
     }
     if (status == 0 && ltoEligible && !linkLlvm) {
+        status = bootstrapPrepareLtoLlvm(llvmPath, ltoPreparedPath)
+    }
+    if (status == 0 && ltoEligible && !linkLlvm) {
         val compileLtoProgram = if (macTarget) linuxCommand(macClang)
             else linuxCommand("env")
         if (!macTarget) {
@@ -1475,7 +1555,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             compileLtoProgram.argument(macSdkRoot)
         }
         compileLtoProgram.argument("-c")
-        compileLtoProgram.argument(llvmPath)
+        compileLtoProgram.argument(ltoPreparedPath)
         compileLtoProgram.argument("-o")
         compileLtoProgram.argument(ltoObjectPath)
         status = compileLtoProgram.run()
@@ -1583,6 +1663,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && target.hosted && artifact == "executable") {
         Path(ltoObjectPath).remove()
     }
+    Path(ltoPreparedPath).remove()
     if (status == 0 && !rawTarget && artifact == "object") {
         status = bootstrapCopyNativeObject(objectPath, publishPath)
         if (status != 0) failureKind = "io"
@@ -1752,6 +1833,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     Path(optimizedWasmPath).remove()
     if (status != 0) Path(combinedObjectPath).remove()
     if (status != 0) Path(ltoObjectPath).remove()
+    if (status != 0) Path(ltoPreparedPath).remove()
     if (status != 0 && failureKind == "io") {
         linuxPrintStandardError(
             "error[E_BUILD_IO]: native build could not publish an intermediate or output artifact (status $status)\n"

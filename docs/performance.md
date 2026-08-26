@@ -586,7 +586,7 @@ was removed.
 
 ## Reachability and size result
 
-The first LLVM size pass marks Abla implementation functions internal, limits
+The LLVM size path marks Abla implementation functions internal, limits
 the indirect dispatcher to address-taken functions, runs LLVM O2/global DCE,
 and links function-sectioned runtime shims with LLD garbage collection. On the
 same 2026-07-31 development session:
@@ -601,6 +601,14 @@ The HTTP result intentionally includes the tagged-value runtime and live TCP
 transport. Further reductions come from IR-level reachability before textual
 emission, a raw-kernel platform profile, specialized/unboxed values, and
 splitting optional HTTP features such as server transport from router-only use.
+
+Generated direct scalar implementations use internal linkage. Size-oriented
+MCU builds also make their universal-value wrappers internal immediately.
+Hosted release LTO preserves the wrappers as hidden during its early O1
+specialization, then internalizes them before O2/LTO dead-code elimination.
+This ordering retains profitable scalarization across hot indirect ABI calls
+while still removing unreachable imported implementations before machine-code
+emission; explicit export thunks remain the only public object boundary.
 
 ## Compact 24-byte dynamic values (2026-08-12)
 

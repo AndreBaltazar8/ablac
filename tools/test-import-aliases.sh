@@ -22,9 +22,11 @@ set -e
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/import-aliases-renamed.ab" \
     > "$output/renamed.ll"
-rg '^define hidden void @abla_fn_' "$output/original.ll" \
+rg '^define hidden void @abla_fn_' "$output/original.ll" >/dev/null
+rg '^define internal .* @abla_fn_.*_direct\(' "$output/original.ll" \
     | sed -E 's/\(.*//' | sort > "$output/original-symbols"
-rg '^define hidden void @abla_fn_' "$output/renamed.ll" \
+rg '^define hidden void @abla_fn_' "$output/renamed.ll" >/dev/null
+rg '^define internal .* @abla_fn_.*_direct\(' "$output/renamed.ll" \
     | sed -E 's/\(.*//' | sort > "$output/renamed-symbols"
 cmp "$output/original-symbols" "$output/renamed-symbols"
 [[ $(wc -l < "$output/original-symbols") -gt 2 ]]
