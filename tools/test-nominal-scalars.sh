@@ -31,6 +31,19 @@ if [[ $status -ne 42 ]]; then
     exit 1
 fi
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/nominal-global-extension-name.ab" \
+    -o "$output_directory/nominal-global-extension-name" --no-cache
+set +e
+"$output_directory/nominal-global-extension-name"
+status=$?
+set -e
+if [[ $status -ne 42 ]]; then
+    printf 'same-name global/extension fixture returned %d, expected 42\n' \
+        "$status" >&2
+    exit 1
+fi
+
 if "$compiler" build \
     "$project_root/tests/cases/modules/invalid-nominal-scalar-conversion.ab" \
     -o "$output_directory/invalid" --no-cache \
