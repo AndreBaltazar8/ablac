@@ -7,7 +7,7 @@ binary=build/tests/unsafe-stack-memory
 mkdir -p "$(dirname "$output")"
 "$compiler" --emit-llvm tests/cases/modules/unsafe-stack-memory.ab > "$output"
 
-grep -Eq 'alloca i8, i64 (8|%[^, ]+)' "$output"
+grep -Eq 'alloca i8, i64 (8|%[^, ]+), align 16' "$output"
 grep -Fq 'store i16' "$output"
 grep -Fq 'store i32' "$output"
 grep -Fq 'load i16' "$output"
