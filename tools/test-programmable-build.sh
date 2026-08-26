@@ -15,6 +15,10 @@ mkdir -p "$output_directory"
 "$compiler" build \
     "$project_root/tests/cases/program-build/artifacts-root.ab" \
     -o "$output_directory/artifacts-root" --fast --no-cache
+"$compiler" build \
+    "$project_root/tests/cases/program-build/exported-scalar-only.ab" \
+    --emit shared-library -o "$output_directory/libabla_scalar.so" \
+    --fast --no-cache
 
 set +e
 "$output_directory/program-root"
@@ -37,6 +41,16 @@ set -e
 [[ $generated_root_status -eq 39 ]]
 [[ $generated_child_status -eq 43 ]]
 [[ $artifacts_root_status -eq 38 ]]
+
+if grep -q '@abla.exports.initialized' \
+    "$output_directory/libabla_scalar.so.ll"; then
+    echo "constant scalar globals retained the lazy export guard" >&2
+    exit 1
+fi
+clang "$project_root/tests/cases/program-build/export-scalar-caller.c" \
+    -L"$output_directory" -Wl,-rpath,"$output_directory" -labla_scalar \
+    -o "$output_directory/export-scalar-caller"
+"$output_directory/export-scalar-caller"
 
 llvm-readelf -h "$output_directory/program.o" | grep -q 'REL (Relocatable file)'
 llvm-ar t "$output_directory/libprogram.a" | grep -q '.o$'

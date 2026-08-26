@@ -172,7 +172,11 @@ surface accepts up to 16 value `bool`, `char`, signed or unsigned 8/16/32/64-bit
 integer, borrowed `string`, or direct
 non-escaping `(i64) -> i64` callback parameters and `void`, any supported
 scalar, or owned `string` results. Runtime globals initialize once and retain
-state between calls; direct exports do not add synchronization. Adapters
+state between calls; direct exports do not add synchronization. When every
+module global is a scalar with a compile-time-proven initializer, the compiler
+places those initial values directly in the artifact and removes the lazy
+first-export guard automatically. Mutable `var` globals remain mutable after
+startup and need no source annotation for this optimization. Adapters
 preserve the declared width and signedness while boxing scalars without exposing
 `%AblaValue`. A string lowers to a pointer/`u64` byte slice;
 the adapter accepts null only for an empty slice, copies the exact bytes into

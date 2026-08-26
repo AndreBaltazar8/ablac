@@ -1157,7 +1157,8 @@ fun bootstrapLlvmScalarInstructionConstant(
     program: BootstrapIrProgram,
     valueId: int,
     scalar: string,
-    depth: int
+    depth: int,
+    initializing: bool
 ): i64* {
     var result = nativeNullPointer()
     if (depth > program.globalNames.size + 1) return result
@@ -1180,7 +1181,11 @@ fun bootstrapLlvmScalarInstructionConstant(
         )
     if (value.opcode == "global.load" &&
         bootstrapLlvmGlobalScalarType(program, value.text) == scalar) {
-        result = bootstrapLlvmScalarGlobalConstantAtDepth(
+        result = if (initializing) {
+            bootstrapLlvmScalarGlobalInitializerAtDepth(
+                backend, program, value.text, depth + 1
+            )
+        } else bootstrapLlvmScalarGlobalConstantAtDepth(
             backend, program, value.text, depth + 1
         )
     }
@@ -1188,7 +1193,7 @@ fun bootstrapLlvmScalarInstructionConstant(
         (value.opcode == "neg" || value.opcode == "bit.not" ||
          value.opcode == "not")) {
         val operand = bootstrapLlvmScalarInstructionConstant(
-            backend, program, value.left, scalar, depth + 1
+            backend, program, value.left, scalar, depth + 1, initializing
         )
         if (!pointerIsNull(operand)) result =
             if (value.opcode == "neg") LLVMConstNeg(operand)
@@ -1198,10 +1203,10 @@ fun bootstrapLlvmScalarInstructionConstant(
         (value.opcode == "+" || value.opcode == "-" ||
          value.opcode == "^")) {
         val left = bootstrapLlvmScalarInstructionConstant(
-            backend, program, value.left, scalar, depth + 1
+            backend, program, value.left, scalar, depth + 1, initializing
         )
         val right = bootstrapLlvmScalarInstructionConstant(
-            backend, program, value.right, scalar, depth + 1
+            backend, program, value.right, scalar, depth + 1, initializing
         )
         if (!pointerIsNull(left) && !pointerIsNull(right)) {
             if (value.opcode == "+") result = LLVMConstAdd(left, right)
@@ -1225,7 +1230,7 @@ fun bootstrapLlvmScalarGlobalConstantAtDepth(
         storeIndex >= 0) {
         result = bootstrapLlvmScalarInstructionConstant(
             backend, program, program.instructions[storeIndex].left,
-            scalar, depth
+            scalar, depth, false
         )
     }
     result
@@ -1242,6 +1247,36 @@ fun bootstrapLlvmScalarGlobalConstant(
     backend, program, name, 0
 )
 
+fun bootstrapLlvmScalarGlobalInitializerAtDepth(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    name: string,
+    depth: int
+): i64* {
+    var result = nativeNullPointer()
+    val scalar = bootstrapLlvmGlobalScalarType(program, name)
+    val storeIndex = bootstrapLlvmGlobalStoreInstruction(program, name)
+    if (scalar != "" && storeIndex >= 0) {
+        result = bootstrapLlvmScalarInstructionConstant(
+            backend, program, program.instructions[storeIndex].left,
+            scalar, depth, true
+        )
+    }
+    result
+}
+
+// A scalar module var is still mutable after startup, but a proven constant
+// initializer belongs in its ELF/Wasm data initializer rather than a lazy
+// first-export store. This removes the export initialization guard only when
+// every module global can be initialized without executing Abla code.
+fun bootstrapLlvmScalarGlobalInitializer(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    name: string
+): i64* = bootstrapLlvmScalarGlobalInitializerAtDepth(
+    backend, program, name, 0
+)
+
 fun bootstrapLlvmHasRuntimeGlobals(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram
@@ -1249,9 +1284,15 @@ fun bootstrapLlvmHasRuntimeGlobals(
     var found = false
     var index = 0
     while (!found && index < program.globalNames.size) {
-        found = pointerIsNull(bootstrapLlvmScalarGlobalConstant(
-            backend, program, program.globalNames[index]
-        ))
+        found = pointerIsNull(
+            if (backend.constantScalarVarInitializers) {
+                bootstrapLlvmScalarGlobalInitializer(
+                    backend, program, program.globalNames[index]
+                )
+            } else bootstrapLlvmScalarGlobalConstant(
+                backend, program, program.globalNames[index]
+            )
+        )
         index = index + 1
     }
     found
