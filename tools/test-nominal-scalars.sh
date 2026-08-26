@@ -18,6 +18,19 @@ if [[ $status -ne 42 ]]; then
     exit 1
 fi
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/inferred-nominal-global-method.ab" \
+    -o "$output_directory/inferred-nominal-global-method" --no-cache
+set +e
+"$output_directory/inferred-nominal-global-method"
+status=$?
+set -e
+if [[ $status -ne 42 ]]; then
+    printf 'inferred nominal global fixture returned %d, expected 42\n' \
+        "$status" >&2
+    exit 1
+fi
+
 if "$compiler" build \
     "$project_root/tests/cases/modules/invalid-nominal-scalar-conversion.ab" \
     -o "$output_directory/invalid" --no-cache \
