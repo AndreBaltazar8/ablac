@@ -173,6 +173,12 @@ constants through normal loads while preserving full module-level mutation.
 It also removes the export initialization guard when every module value is
 provably static; no source annotation is required.
 
+Fixed-width native integer results remain unboxed after an exact-width C ABI
+call. The backend sign- or zero-extends them once into Abla's scalar integer
+SSA representation, so status checks and control flow do not allocate dynamic
+values or call generic equality. Native integer arguments are truncated back
+to their declared width only at the foreign-call boundary.
+
 Profiling the full compiler exposed a quadratic backend scan: for every
 function, address-taken discovery rescanned every instruction twice. A single
 address-taken pass reduced deterministic LLVM emission from 7.369 s to 3.949 s.

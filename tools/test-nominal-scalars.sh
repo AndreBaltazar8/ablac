@@ -67,6 +67,23 @@ grep -Eq '= internal constant i64 128(,|$)' \
 grep -Eq '= internal global i64 0(,|$)' \
     "$output_directory/module-val-constant.ll"
 
+"$compiler" --emit-llvm \
+    "$project_root/tests/cases/modules/native-narrow-scalar.ab" \
+    >"$output_directory/native-narrow-scalar.ll"
+grep -Fq 'call i32 @narrowSignedStatus()' \
+    "$output_directory/native-narrow-scalar.ll"
+grep -Fq 'sext i32 %native.result to i64' \
+    "$output_directory/native-narrow-scalar.ll"
+grep -Fq 'call i8 @narrowUnsignedValue()' \
+    "$output_directory/native-narrow-scalar.ll"
+grep -Fq 'zext i8 %native.result' \
+    "$output_directory/native-narrow-scalar.ll"
+if grep -Fq 'call void @abla_equal' \
+    "$output_directory/native-narrow-scalar.ll"; then
+    echo 'native narrow scalar comparison used boxed equality' >&2
+    exit 1
+fi
+
 if "$compiler" build \
     "$project_root/tests/cases/modules/invalid-nominal-scalar-conversion.ab" \
     -o "$output_directory/invalid" --no-cache \
