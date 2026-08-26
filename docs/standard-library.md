@@ -83,19 +83,23 @@ Native memory is deliberately outside `abla/core`. `NativeI64Cell`,
 with checked operations and idempotent `close`; the LLVM backend lowers their
 trusted implementation directly instead of routing it through C. They are the
 out-parameter and bounded-buffer building blocks used by LLVM ORC and raw
-platform APIs. Raw intrinsics are callable only from a function-level trusted
-implementation; ordinary consumers borrow the checked resources. The trusted
-boundary also provides fixed-signature call-through-address operations for
-native extension entry points. Each operation encodes its exact pointer and
-integer lanes; there is no unchecked variadic call surface.
+platform APIs. Raw dereference and call intrinsics are callable only from a
+function-level trusted implementation; ordinary consumers borrow the checked
+resources. A static reservation only produces an opaque integer address, while
+using that address as memory remains trusted. The trusted boundary also
+provides fixed-signature call-through-address operations for native extension
+entry points. Each operation encodes its exact pointer and integer lanes; there
+is no unchecked variadic call surface.
 Native counter integrations can use the monotonic atomic `i64` fetch-add
 operation instead of introducing a foreign runtime helper or data race.
 Trusted embedded drivers can also request function-scoped native storage with
-`nativeStackAllocate`; LLVM lowers it to `alloca`, and the unsafe 8/16/32/64-bit
-loads, stores, copy, and memory-set operations lower directly to LLVM memory
-instructions. The address must not escape its calling function. Persistent or
-ordinary application storage should continue to use ownership-checked resource
-types instead.
+`nativeStackAllocate`; LLVM lowers the intrinsic directly in its caller to
+`alloca`, and the unsafe 8/16/32/64-bit loads, stores, copy, and memory-set
+operations lower directly to LLVM memory instructions. The address must not
+escape its calling function. `nativeStaticAllocate` reserves one
+zero-initialized LLVM global per constant-sized call site for process-lifetime
+driver storage. Higher-level packages should wrap that raw address in a checked
+nominal handle or an ownership-checked resource type.
 
 `abla/sys/linux` is likewise explicit and target-specific. Its current
 x86-64 implementation lowers `openat`, `read`, `write`, `close`, and `getpid`

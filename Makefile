@@ -52,6 +52,7 @@ test: ablac
 	tools/test-value-abi.sh $(COMPILER)
 	tools/test-unsafe-mmio.sh $(COMPILER)
 	tools/test-unsafe-stack-memory.sh $(COMPILER)
+	tools/test-unsafe-static-memory.sh $(COMPILER)
 	tools/test-nominal-scalars.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
