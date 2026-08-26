@@ -7,6 +7,8 @@ output_directory="$project_root/build/tests"
 llvm_ir="$output_directory/native-cstring-lifetime.ll"
 program="$output_directory/native-cstring-lifetime"
 escaping_ir="$output_directory/native-cstring-escaping.ll"
+borrowed_ir="$output_directory/native-string-address.ll"
+borrowed_program="$output_directory/native-string-address"
 mkdir -p "$output_directory"
 
 "$compiler" --emit-llvm \
@@ -26,6 +28,12 @@ if rg -q 'call void @abla_platform_free\(ptr %native.cstring\)' \
 fi
 opt --threads=1 -passes=verify -disable-output "$escaping_ir"
 
+"$compiler" --emit-llvm \
+    "$project_root/tests/cases/modules/native-string-address.ab" \
+    > "$borrowed_ir"
+rg -q 'call ptr @abla_string_data' "$borrowed_ir"
+opt --threads=1 -passes=verify -disable-output "$borrowed_ir"
+
 "$compiler" build \
     "$project_root/tests/cases/modules/native-c-string.ab" -o "$program"
 set +e
@@ -34,4 +42,13 @@ status=$?
 set -e
 [[ $status -eq 42 ]]
 
-echo "native C-string lifetime follows the noescape contract"
+"$compiler" build \
+    "$project_root/tests/cases/modules/native-string-address.ab" \
+    -o "$borrowed_program"
+set +e
+"$borrowed_program"
+status=$?
+set -e
+[[ $status -eq 42 ]]
+
+echo "native C-string lifetime and borrowed string data contracts hold"

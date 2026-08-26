@@ -31,9 +31,9 @@ fractional digit or a valid decimal exponent (`1.5`, `2e3`, `1.25e-2`); `_` may
 separate their digits. Floating literals and arithmetic are currently runtime
 only, operands must have the same width, and `abla/float` provides the explicit
 signed `int` to `f64` numerical conversion `f64FromInt`. Explicit `f32`
-conversion remains forthcoming. Strings use `"..."` and support the escapes `\t`, `\b`, `\r`,
-`\n`, `\'`, `\"`, `\\`, `\$`, and `\uXXXX`. `$name` and `${expression}` are
-string interpolation.
+conversion remains forthcoming. Strings use `"..."` and support the escapes
+`\t`, `\b`, `\r`, `\n`, `\'`, `\"`, `\\`, `\$`, byte-preserving `\xNN`, and
+ASCII `\uXXXX`. `$name` and `${expression}` are string interpolation.
 
 The compiler accepts `;` as an explicit separator, but never requires it.
 
