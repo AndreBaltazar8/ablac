@@ -163,6 +163,14 @@ object emission. A negative dependency gate places failing `opt` and `llc`
 executables first on `PATH`; `ablac build` must still produce a working native
 program. The final link remains an external Clang/LLD handoff.
 
+Immutable scalar module values whose initializer is a literal are emitted as
+internal LLVM constants. Mutable module `var`s and effectful or not-yet-proven
+`val` initializers retain lazy runtime initialization. This distinction lets
+LLVM fold board IDs, pins, register addresses, and other nominal scalar
+constants through normal loads while preserving full module-level mutation.
+It also removes the export initialization guard when every module value is
+provably static; no source annotation is required.
+
 Profiling the full compiler exposed a quadratic backend scan: for every
 function, address-taken discovery rescanned every instruction twice. A single
 address-taken pass reduced deterministic LLVM emission from 7.369 s to 3.949 s.

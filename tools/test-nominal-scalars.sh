@@ -44,6 +44,27 @@ if [[ $status -ne 42 ]]; then
     exit 1
 fi
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/module-val-constant.ab" \
+    -o "$output_directory/module-val-constant" --no-cache
+set +e
+"$output_directory/module-val-constant"
+status=$?
+set -e
+if [[ $status -ne 42 ]]; then
+    printf 'module val constant fixture returned %d, expected 42\n' \
+        "$status" >&2
+    exit 1
+fi
+
+"$compiler" --emit-llvm \
+    "$project_root/tests/cases/modules/module-val-constant.ab" \
+    >"$output_directory/module-val-constant.ll"
+grep -Eq '= internal constant i64 42(,|$)' \
+    "$output_directory/module-val-constant.ll"
+grep -Eq '= internal global i64 0(,|$)' \
+    "$output_directory/module-val-constant.ll"
+
 if "$compiler" build \
     "$project_root/tests/cases/modules/invalid-nominal-scalar-conversion.ab" \
     -o "$output_directory/invalid" --no-cache \
