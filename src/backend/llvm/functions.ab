@@ -1388,6 +1388,10 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "nativeXtensaInterruptsEnable" ||
     name == "nativeXtensaInterruptsDisable" ||
     name == "nativeXtensaInterruptTableAddress" ||
+    name == "nativeXtensaExceptionTableAddress" ||
+    name == "nativeXtensaInterruptLevelTableAddress" ||
+    name == "nativeXtensaUnhandledInterruptAddress" ||
+    name == "nativeXtensaUnhandledExceptionAddress" ||
     name == "nativeXtensaOwnedDispatcherTableAddress" ||
     name == "ablaUnsafeLoadI64" ||
     name == "ablaUnsafeStoreI64" ||
@@ -2093,14 +2097,96 @@ fun bootstrapLlvmEmitCoreIntrinsic(
             )
         }
     }
+    if (name == "nativeXtensaExceptionTableAddress") {
+        if (instruction.operands.size != 0 ||
+            !bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            supported = false
+        }
+        if (instruction.operands.size == 0 &&
+            bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            var table = LLVMGetNamedGlobal(
+                backend.module, "_xt_exception_table"
+            )
+            if (pointerIsNull(table)) table = LLVMAddGlobal(
+                backend.module,
+                LLVMArrayType2(backend.i32Type, 128),
+                "_xt_exception_table"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, table, backend.i32Type,
+                    "xtensa.exception.table.address"
+                )
+            )
+        }
+    }
+    if (name == "nativeXtensaInterruptLevelTableAddress") {
+        if (instruction.operands.size != 0 ||
+            !bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            supported = false
+        }
+        if (instruction.operands.size == 0 &&
+            bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            var table = LLVMGetNamedGlobal(
+                backend.module, "Xthal_intlevel"
+            )
+            if (pointerIsNull(table)) table = LLVMAddGlobal(
+                backend.module,
+                LLVMArrayType2(backend.i8Type, 32),
+                "Xthal_intlevel"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, table, backend.i32Type,
+                    "xtensa.interrupt.level.table.address"
+                )
+            )
+        }
+    }
+    if (name == "nativeXtensaUnhandledInterruptAddress" ||
+        name == "nativeXtensaUnhandledExceptionAddress") {
+        if (instruction.operands.size != 0 ||
+            !bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            supported = false
+        }
+        if (instruction.operands.size == 0 &&
+            bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            val interrupt = name ==
+                "nativeXtensaUnhandledInterruptAddress"
+            val symbol = if (interrupt) "xt_unhandled_interrupt"
+                else "xt_unhandled_exception"
+            val parameter = if (interrupt) backend.i32Type
+                else backend.pointerType
+            var handler = LLVMGetNamedFunction(backend.module, symbol)
+            if (pointerIsNull(handler)) handler = LLVMAddFunction(
+                backend.module,
+                symbol,
+                bootstrapLlvmFunctionType(
+                    backend, backend.voidType, [parameter]
+                )
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, handler, backend.i32Type,
+                    if (interrupt) "xtensa.unhandled.interrupt.address"
+                    else "xtensa.unhandled.exception.address"
+                )
+            )
+        }
+    }
     if (name == "nativeXtensaOwnedDispatcherTableAddress") {
         if (instruction.operands.size != 0 ||
-            !bootstrapTextContains(backend.targetTriple, "xtensa") ||
-            !pointerIsNull(LLVMGetNamedGlobal(
-                backend.module, "_xt_exception_table"
-            ))) supported = false
+            !bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            supported = false
+        }
         if (supported) {
-            val unhandledType = bootstrapLlvmFunctionType(
+            val unhandledInterruptType = bootstrapLlvmFunctionType(
+                backend, backend.voidType, [backend.i32Type]
+            )
+            val unhandledExceptionType = bootstrapLlvmFunctionType(
                 backend, backend.voidType, [backend.pointerType]
             )
             var unhandledInterrupt = LLVMGetNamedFunction(
@@ -2110,7 +2196,7 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 unhandledInterrupt = LLVMAddFunction(
                     backend.module,
                     "xt_unhandled_interrupt",
-                    unhandledType
+                    unhandledInterruptType
                 )
             }
             var unhandledException = LLVMGetNamedFunction(
@@ -2120,7 +2206,7 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 unhandledException = LLVMAddFunction(
                     backend.module,
                     "xt_unhandled_exception",
-                    unhandledType
+                    unhandledExceptionType
                 )
             }
 
@@ -2169,13 +2255,46 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 backend.i32Type, exceptionValues.pointer(), 128
             )
             exceptionValues.drop()
-            val exceptionTable = LLVMAddGlobal(
-                backend.module,
-                exceptionType,
-                "_xt_exception_table"
+            var exceptionTable = LLVMGetNamedGlobal(
+                backend.module, "_xt_exception_table"
+            )
+            if (pointerIsNull(exceptionTable)) exceptionTable = LLVMAddGlobal(
+                backend.module, exceptionType, "_xt_exception_table"
             )
             LLVMSetInitializer(exceptionTable, exceptionInitializer)
             LLVMSetAlignment(exceptionTable, 8)
+
+            val interruptLevels = [
+                1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 3, 1, 7, 3, 5,
+                1, 1, 1, 2, 2, 2, 3, 3,
+                4, 4, 5, 3, 4, 3, 4, 5
+            ]
+            val levelValues = llvmPointerVector(32)
+            entry = 0
+            while (entry < 32) {
+                levelValues.set(
+                    entry,
+                    LLVMConstInt(
+                        backend.i8Type, interruptLevels[entry], 0
+                    )
+                )
+                entry = entry + 1
+            }
+            val levelType = LLVMArrayType2(backend.i8Type, 32)
+            val levelInitializer = LLVMConstArray2(
+                backend.i8Type, levelValues.pointer(), 32
+            )
+            levelValues.drop()
+            var levelTable = LLVMGetNamedGlobal(
+                backend.module, "Xthal_intlevel"
+            )
+            if (pointerIsNull(levelTable)) levelTable = LLVMAddGlobal(
+                backend.module, levelType, "Xthal_intlevel"
+            )
+            LLVMSetInitializer(levelTable, levelInitializer)
+            LLVMSetGlobalConstant(levelTable, 1)
+            LLVMSetAlignment(levelTable, 4)
 
             bootstrapLlvmSetNativeValue(
                 backend, storage, instruction.result,
