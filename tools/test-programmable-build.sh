@@ -52,6 +52,11 @@ if grep -q 'export.arguments' \
     echo "scalar-only export retained boxed argument storage" >&2
     exit 1
 fi
+if grep -q '^define .*@abla_runtime_set_arguments' \
+    "$output_directory/libabla_scalar.so.ll"; then
+    echo "export-only module retained the hosted argument setter" >&2
+    exit 1
+fi
 clang "$project_root/tests/cases/program-build/export-scalar-caller.c" \
     -L"$output_directory" -Wl,-rpath,"$output_directory" -labla_scalar \
     -o "$output_directory/export-scalar-caller"
