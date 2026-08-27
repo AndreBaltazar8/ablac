@@ -105,6 +105,14 @@ exports the symbol nor names an architecture; `@export` and target-owned
 subparsers remain separate. This keeps the ABI escape hatch explicit while all
 architecture syntax stays in importable Abla modules.
 
+`@section("name")` is the independent, target-neutral object-section policy.
+It applies to a top-level runtime function and, when that function is exported,
+to its foreign ABI entry as well. A target package can therefore keep a
+cache-critical or startup leaf resident in a linker-defined code section
+without teaching the compiler any platform name. It does not export or retain
+the function by itself, so internal functions remain eligible for inlining and
+dead-code elimination.
+
 The current `build/ablac run` path drives LLVM ORC in-process through the typed
 C ABI. It resolves the exported Abla runtime, looks up `main`, and invokes it
 without AOT object emission or linking. The bootstrap compiler uses the same
