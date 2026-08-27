@@ -152,11 +152,13 @@ registers. Adding an operation therefore changes only the architecture
 package. The package may expose normal Abla functions or a richer
 `$architecture` grammar while both lower to ordinary LLVM inline assembly.
 
-Whole ABI leaves can instead use `extern:"naked-inline-assembly"`. That form
-accepts no value operands and must be the only executable expression in its
-Abla function; its template owns the complete prologue, return convention, and
-return instruction. It exists for context-switch and interrupt leaves, not as
-the default for individual instructions.
+Whole ABI leaves put the generic `@naked` annotation on an ordinary Abla
+function whose sole expression calls the same `extern:"inline-assembly"`
+boundary. `@naked` is a function code-generation property: it is independent
+from the architecture provider and from `@export` or other linkage policy. A
+naked body accepts no assembly value operands and owns the complete prologue,
+return convention, and return instruction. It is intended for context-switch
+and interrupt leaves, not individual instructions.
 
 ## Parser stack and safety
 

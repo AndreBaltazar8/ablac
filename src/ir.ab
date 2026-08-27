@@ -291,6 +291,9 @@ class BootstrapIrFunction(
     val parameterTypes: array<string>,
     val resultType: string,
     val inlineHint: bool,
+    // Function code-generation policy is independent from body operations and
+    // from symbol linkage/export policy.
+    val naked: bool,
     val verificationErrors: int
 )
 
@@ -448,6 +451,7 @@ fun bootstrapCloneIrFunction(
         bootstrapCloneIrStrings(function.parameterTypes),
         function.resultType,
         function.inlineHint,
+        function.naked,
         function.verificationErrors
     )
 }
@@ -2114,7 +2118,8 @@ fun bootstrapFinalizeIrFunction(
     resultType: string = "unknown",
     declaredLocalNames: array<string> = [],
     declaredLocalTypes: array<string> = [],
-    inlineHint: bool = false
+    inlineHint: bool = false,
+    naked: bool = false
 ): BootstrapIrFunction {
     val canonical: array<BootstrapInstruction> = []
     var terminated = false
@@ -2215,6 +2220,22 @@ fun bootstrapFinalizeIrFunction(
         blocks,
         locals
     )
+    if (naked) {
+        var assemblyCount = 0
+        var nakedValid = true
+        index = 0
+        while (index < reachableInstructions.size) {
+            val instruction = reachableInstructions[index]
+            if (instruction.opcode == "inline.assembly") {
+                assemblyCount = assemblyCount + 1
+                if (instruction.operands.size != 0) nakedValid = false
+            } else if (instruction.opcode != "return") {
+                nakedValid = false
+            }
+            index = index + 1
+        }
+        if (!nakedValid || assemblyCount != 1) errors = errors + 1
+    }
     BootstrapIrFunction(
         name,
         parameters,
@@ -2226,6 +2247,7 @@ fun bootstrapFinalizeIrFunction(
         parameterTypes,
         bootstrapNormalizeType(resultType),
         inlineHint,
+        naked,
         errors
     )
 }
@@ -5352,9 +5374,7 @@ class BootstrapLowerer(
         }
         if (expression.kind == "call" &&
             this.isExternal(expression.text) &&
-            (this.externalLibrary(expression.text) == "inline-assembly" ||
-             this.externalLibrary(expression.text) ==
-                "naked-inline-assembly")) {
+            this.externalLibrary(expression.text) == "inline-assembly") {
             val valid = expression.children.size >= 2 &&
                 expression.children[0].kind == "string" &&
                 expression.children[1].kind == "string"
@@ -5372,10 +5392,7 @@ class BootstrapLowerer(
                     this.lowerFunctionResultType(expression.text)
                 )
                 result = this.emitManyTexts(
-                    if (this.externalLibrary(expression.text) ==
-                        "naked-inline-assembly") {
-                        "naked.inline.assembly"
-                    } else "inline.assembly",
+                    "inline.assembly",
                     operands,
                     resultType,
                     [
@@ -5395,9 +5412,7 @@ class BootstrapLowerer(
             expression.text != "Cell" &&
             expression.text != "nativeXtensaInterruptHandlerAddress" &&
             (!this.isExternal(expression.text) ||
-             (this.externalLibrary(expression.text) != "inline-assembly" &&
-              this.externalLibrary(expression.text) !=
-                "naked-inline-assembly"))) {
+             this.externalLibrary(expression.text) != "inline-assembly")) {
             val arguments: array<int> = []
             var argument = 0
             while (argument < expression.children.size) {
@@ -6187,7 +6202,8 @@ class BootstrapLowerer(
             bootstrapIrRuntimeTypes(
                 this.declarations, functionLowerer.localTypes
             ),
-            bootstrapDeclarationHasAnnotation(declaration, "inline")
+            bootstrapDeclarationHasAnnotation(declaration, "inline"),
+            bootstrapDeclarationHasAnnotation(declaration, "naked")
         )
         val loweringErrors = functionLowerer.errors - this.errors
         val reportedFunction = BootstrapIrFunction(
@@ -6201,6 +6217,7 @@ class BootstrapLowerer(
             loweredFunction.parameterTypes,
             loweredFunction.resultType,
             loweredFunction.inlineHint,
+            loweredFunction.naked,
             loweredFunction.verificationErrors + loweringErrors
         )
         functionSink.append(reportedFunction)
@@ -6332,6 +6349,7 @@ class BootstrapLowerer(
             loweredMethod.parameterTypes,
             loweredMethod.resultType,
             loweredMethod.inlineHint,
+            loweredMethod.naked,
             loweredMethod.verificationErrors + loweringErrors
         )
         functionSink.append(reportedMethod)
@@ -6647,6 +6665,7 @@ class BootstrapLowerer(
                     parsed.declarations, function.resultType
                 ),
                 function.inlineHint,
+                function.naked,
                 function.verificationErrors
             ))
             runtimeFunction = runtimeFunction + 1

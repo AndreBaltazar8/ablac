@@ -97,12 +97,13 @@ LLVM sees a side-effecting inline-assembly call and can still inline callers,
 remove unreachable package functions, and optimize the surrounding scalar
 graph. The compiler contains no opcode or register-name table.
 
-`extern:"naked-inline-assembly"` is the constrained whole-function variant.
-It has no assembly operands, suppresses LLVM inlining and generated function
-entry/exit code, and requires the assembly to perform its own return. A naked
-body may contain only that operation and the IR return marker. This keeps ABI
-escape hatches explicit while leaving architecture-specific parsing and all
-instruction text in importable Abla modules.
+`@naked` is the constrained top-level whole-function code-generation
+annotation. A naked function's sole expression must call the same generic
+inline-assembly boundary without value operands. LLVM then suppresses generated
+entry/exit code and the assembly performs its own return. `@naked` neither
+exports the symbol nor names an architecture; `@export` and target-owned
+subparsers remain separate. This keeps the ABI escape hatch explicit while all
+architecture syntax stays in importable Abla modules.
 
 The current `build/ablac run` path drives LLVM ORC in-process through the typed
 C ABI. It resolves the exported Abla runtime, looks up `main`, and invokes it
