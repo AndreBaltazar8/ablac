@@ -13,7 +13,12 @@ while [[ -L $launcher ]]; do
 done
 script_directory=$(cd -- "$(dirname -- "$launcher")" && pwd)
 toolchain_root=$(cd -- "$script_directory/.." && pwd)
-compiler="${0}.bin"
+compiler=${ABLA_COMPILER_PAYLOAD:-"${0}.bin"}
+if [[ ! -x $compiler ]]; then
+    printf '[abla-limit] compiler payload is not executable: %q\n' \
+        "$compiler" >&2
+    exit 127
+fi
 # Large pure-Abla applications can make the self-hosted frontend traverse
 # deeply nested typed source graphs. Reserve enough stack and virtual address
 # space for those builds while retaining the launcher's hard process bounds.
