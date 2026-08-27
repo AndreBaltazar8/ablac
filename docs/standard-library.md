@@ -110,6 +110,12 @@ responsible for installing that address and for keeping every indirectly
 reached function and datum interrupt-safe. The same module exposes the
 linker-provided Xtensa dispatcher-table address as a native scalar so a
 framework can install entries directly without calling a C registration ABI.
+For a framework that owns the classic dual-core dispatcher ABI,
+`nativeXtensaOwnedDispatcherTableAddress` emits initialized 64-entry interrupt
+and 128-entry exception tables as native globals and returns the interrupt
+table address. It adds no runtime initializer or allocation. Platform code
+must still provide the ABI's unhandled routines and vector path, and must not
+combine this ownership primitive with a competing table definition.
 
 `abla/sys/linux` is likewise explicit and target-specific. Its current
 x86-64 implementation lowers `openat`, `read`, `write`, `close`, and `getpid`
