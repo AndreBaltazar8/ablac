@@ -124,6 +124,40 @@ declaration references already carry unforgeable hygiene marks. The raw operatio
 enough for embedded text containing bytes that are not Abla tokens, while the
 base parser remains responsible for `{...}` hand-offs.
 
+### Target assembly providers
+
+Architecture packages can use the same mechanism to own assembly syntax. A
+provider such as `$xtensa` parses register operations or instruction blocks and
+returns calls to generic typed compiler boundaries:
+
+```abla
+trusted noescape extern:"inline-assembly" fun assemblyReadU32(
+    template: string,
+    constraints: string
+): u32
+
+compile fun parseXtensa(cursor: ParserCursor): SyntaxExpression {
+    syntaxCall(
+        "assemblyReadU32",
+        [syntaxString("rsr.intenable $0"), syntaxString("=a")]
+    )
+}
+
+#compilerRegisterSubparser("xtensa", parseXtensa)
+```
+
+`ablac` validates literal templates and constraints plus scalar operand and
+result types, but it does not enumerate architecture instructions or
+registers. Adding an operation therefore changes only the architecture
+package. The package may expose normal Abla functions or a richer
+`$architecture` grammar while both lower to ordinary LLVM inline assembly.
+
+Whole ABI leaves can instead use `extern:"naked-inline-assembly"`. That form
+accepts no value operands and must be the only executable expression in its
+Abla function; its template owns the complete prologue, return convention, and
+return instruction. It exists for context-switch and interrupt leaves, not as
+the default for individual instructions.
+
 ## Parser stack and safety
 
 Subparsers form an explicit stack. Stage 0 enforces a depth limit of 64 and the

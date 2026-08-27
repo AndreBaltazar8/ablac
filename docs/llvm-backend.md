@@ -87,6 +87,23 @@ functions cannot call raw pointer intrinsics; checked buffers currently enforce
 bounds and closed state while affine ownership, borrowed views, and automatic
 drop insertion are completed.
 
+## Typed inline assembly
+
+Target packages may declare a `trusted noescape extern:"inline-assembly"`
+function whose first two parameters are literal template and LLVM-constraint
+strings. Any remaining parameters and the result must be native scalar types.
+The typed IR stores result type, constraints, and template as separate fields;
+LLVM sees a side-effecting inline-assembly call and can still inline callers,
+remove unreachable package functions, and optimize the surrounding scalar
+graph. The compiler contains no opcode or register-name table.
+
+`extern:"naked-inline-assembly"` is the constrained whole-function variant.
+It has no assembly operands, suppresses LLVM inlining and generated function
+entry/exit code, and requires the assembly to perform its own return. A naked
+body may contain only that operation and the IR return marker. This keeps ABI
+escape hatches explicit while leaving architecture-specific parsing and all
+instruction text in importable Abla modules.
+
 The current `build/ablac run` path drives LLVM ORC in-process through the typed
 C ABI. It resolves the exported Abla runtime, looks up `main`, and invokes it
 without AOT object emission or linking. The bootstrap compiler uses the same

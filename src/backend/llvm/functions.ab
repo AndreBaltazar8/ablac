@@ -80,9 +80,10 @@ fun bootstrapLlvmDeclareDirectFunction(
     // inside this module. Internal linkage lets LLVM remove imported runtime
     // and library implementations which are not reachable from the artifact.
     LLVMSetLinkage(declared, llvmInternalLinkage())
-    if (function.inlineHint || bootstrapLlvmMcuRuntimeInline(
-        backend.targetTriple, function.name
-    )) {
+    if (bootstrapLlvmNakedAssemblyIndex(function) < 0 &&
+        (function.inlineHint || bootstrapLlvmMcuRuntimeInline(
+            backend.targetTriple, function.name
+        ))) {
         bootstrapLlvmAddFunctionAttribute(
             backend, declared, "alwaysinline"
         )
@@ -1470,6 +1471,125 @@ fun bootstrapLlvmInitializeVoidValue(
         backend.builder, LLVMConstNull(backend.valueType), destination
     )
     LLVMSetAlignment(stored, 8)
+}
+
+fun bootstrapLlvmEmitInlineAssembly(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): bool {
+    val resultCode = instruction.text
+    val constraints = if (instruction.texts.size > 0)
+        instruction.texts[0] else ""
+    val assembly = if (instruction.texts.size > 1)
+        instruction.texts[1] else ""
+    val resultType = if (resultCode == "void") backend.voidType
+        else backend.type(bootstrapLlvmScalarType(resultCode))
+    var supported = resultCode == "void" ||
+        bootstrapLlvmScalarType(resultCode) != ""
+    val parameterTypes: array<i64*> = []
+    val arguments: array<i64*> = []
+    var operand = 0
+    while (operand < instruction.operands.size) {
+        val value = instruction.operands[operand]
+        var code = ""
+        if (value >= 0 && value < storage.valueTypes.size) {
+            code = bootstrapLlvmScalarType(storage.valueTypes[value])
+        }
+        if (code == "") supported = false
+        if (code != "") {
+            parameterTypes.append(backend.type(code))
+            val argument = bootstrapLlvmNativeValue(
+                backend, storage, value
+            )
+            if (pointerIsNull(argument)) supported = false
+            arguments.append(argument)
+        }
+        operand = operand + 1
+    }
+    if (supported) {
+        val type = bootstrapLlvmFunctionType(
+            backend, resultType, parameterTypes
+        )
+        val operation = LLVMGetInlineAsm(
+            type,
+            assembly,
+            assembly.size,
+            constraints,
+            constraints.size,
+            1,
+            0,
+            0,
+            0
+        )
+        val result = bootstrapLlvmCallTyped(
+            backend,
+            type,
+            operation,
+            arguments,
+            if (resultCode == "void") "" else "inline.assembly.result"
+        )
+        if (resultCode == "void") {
+            bootstrapLlvmInitializeVoidValue(
+                backend, storage.values[instruction.result]
+            )
+        } else bootstrapLlvmSetNativeValue(
+            backend, storage, instruction.result, result
+        )
+    }
+    supported
+}
+
+fun bootstrapLlvmNakedAssemblyIndex(
+    function: BootstrapIrFunction
+): int {
+    var found = -1
+    var valid = true
+    var index = 0
+    while (index < function.instructions.size) {
+        val opcode = function.instructions[index].opcode
+        if (opcode == "naked.inline.assembly") {
+            if (found < 0) found = index else found = -2
+        }
+        if (opcode != "naked.inline.assembly" && opcode != "return") {
+            valid = false
+        }
+        index = index + 1
+    }
+    if (valid) found else -2
+}
+
+fun bootstrapLlvmEmitNakedAssemblyBody(
+    backend: BootstrapLlvmBackend,
+    function: i64*,
+    instruction: BootstrapInstruction
+): void {
+    bootstrapLlvmAddFunctionAttribute(backend, function, "naked")
+    bootstrapLlvmAddFunctionAttribute(backend, function, "noinline")
+    bootstrapLlvmAddFunctionAttribute(backend, function, "nounwind")
+    val constraints = if (instruction.texts.size > 0)
+        instruction.texts[0] else ""
+    val assembly = if (instruction.texts.size > 1)
+        instruction.texts[1] else ""
+    val type = bootstrapLlvmFunctionType(
+        backend, backend.voidType, []
+    )
+    val operation = LLVMGetInlineAsm(
+        type,
+        assembly,
+        assembly.size,
+        constraints,
+        constraints.size,
+        1,
+        0,
+        0,
+        0
+    )
+    bootstrapLlvmCallTyped(
+        backend, type, operation, [], ""
+    )
+    LLVMBuildUnreachable(backend.builder)
+    return
 }
 
 // Exact native ABI kinds: pointer, i32, i64, f32, and i16. Keeping this table in
@@ -4515,6 +4635,15 @@ fun bootstrapLlvmEmitFunction(
         backend.context, llvmFunction, "entry"
     )
     LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val nakedAssembly = bootstrapLlvmNakedAssemblyIndex(function)
+    if (nakedAssembly >= 0) {
+        bootstrapLlvmEmitNakedAssemblyBody(
+            backend,
+            llvmFunction,
+            function.instructions[nakedAssembly]
+        )
+        return 0
+    }
     val runtimePrefix = "__ablaRuntime"
     val runtimeImplementation =
         function.name.size >= runtimePrefix.size &&
@@ -5166,6 +5295,12 @@ fun bootstrapLlvmEmitFunction(
             matched = true
             supported = bootstrapLlvmEmitNativeCall(
                 backend, program, nativeIndex, storage, instruction
+            )
+        }
+        if (reachable && instruction.opcode == "inline.assembly") {
+            matched = true
+            supported = bootstrapLlvmEmitInlineAssembly(
+                backend, storage, instruction
             )
         }
         if (reachable && instruction.opcode == "extern.intrinsic") {

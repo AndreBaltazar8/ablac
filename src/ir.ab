@@ -234,7 +234,10 @@ class BootstrapInstruction(
     val text: string,
     val target: int,
     val alternate: int,
-    val operands: array<int>
+    val operands: array<int>,
+    // Structured string operands avoid flattening and re-slicing large text
+    // payloads such as architecture-owned assembly blocks.
+    val texts: array<string>
 )
 
 class BootstrapIrProgram(
@@ -403,7 +406,8 @@ fun bootstrapCloneIrFunction(
             instruction.text,
             instruction.target,
             instruction.alternate,
-            bootstrapCloneIrIntegers(instruction.operands)
+            bootstrapCloneIrIntegers(instruction.operands),
+            bootstrapCloneIrStrings(instruction.texts)
         ))
         index = index + 1
     }
@@ -2120,7 +2124,7 @@ fun bootstrapFinalizeIrFunction(
         if (instruction.opcode == "label") {
             if (canonical.size > 0 && !terminated) {
                 canonical.append(BootstrapInstruction(
-                    "jump", -1, -1, -1, "", instruction.target, -1, []
+                    "jump", -1, -1, -1, "", instruction.target, -1, [], []
                 ))
             }
             canonical.append(instruction)
@@ -2138,7 +2142,7 @@ fun bootstrapFinalizeIrFunction(
         index = index + 1
     }
     if (!terminated) canonical.append(BootstrapInstruction(
-        "return", -1, result, -1, "", -1, -1, []
+        "return", -1, result, -1, "", -1, -1, [], []
     ))
 
     val initialBlocks = bootstrapBuildIrBlocks(canonical)
@@ -2339,7 +2343,7 @@ class BootstrapDropBuilder(
         val result = this.nextValue
         this.nextValue = this.nextValue + 1
         this.instructions.append(BootstrapInstruction(
-            opcode, result, left, right, text, -1, -1, []
+            opcode, result, left, right, text, -1, -1, [], []
         ))
         result
     }
@@ -2352,7 +2356,7 @@ class BootstrapDropBuilder(
         if (operands.size > 0) left = operands[0]
         if (operands.size > 1) right = operands[1]
         this.instructions.append(BootstrapInstruction(
-            opcode, result, left, right, text, -1, -1, operands
+            opcode, result, left, right, text, -1, -1, operands, []
         ))
         result
     }
@@ -2365,7 +2369,7 @@ class BootstrapDropBuilder(
         text: string
     ): void {
         this.instructions.append(BootstrapInstruction(
-            opcode, -1, value, -1, text, target, alternate, []
+            opcode, -1, value, -1, text, target, alternate, [], []
         ))
     }
 
@@ -4356,6 +4360,7 @@ class BootstrapLowerer(
             text,
             -1,
             -1,
+            [],
             []
         ))
         result
@@ -4376,6 +4381,7 @@ class BootstrapLowerer(
             text,
             target,
             alternate,
+            [],
             []
         ))
     }
@@ -4399,7 +4405,34 @@ class BootstrapLowerer(
             text,
             -1,
             -1,
-            operands
+            operands,
+            []
+        ))
+        result
+    }
+
+    fun emitManyTexts(
+        opcode: string,
+        operands: array<int>,
+        text: string,
+        texts: array<string>
+    ): int {
+        val result = this.nextValue
+        this.nextValue = this.nextValue + 1
+        var left = -1
+        var right = -1
+        if (operands.size > 0) left = operands[0]
+        if (operands.size > 1) right = operands[1]
+        this.instructions.append(BootstrapInstruction(
+            opcode,
+            result,
+            left,
+            right,
+            text,
+            -1,
+            -1,
+            operands,
+            texts
         ))
         result
     }
@@ -4424,7 +4457,8 @@ class BootstrapLowerer(
             text,
             index,
             -1,
-            operands
+            operands,
+            []
         ))
         result
     }
@@ -5316,10 +5350,54 @@ class BootstrapLowerer(
                 )
             }
         }
+        if (expression.kind == "call" &&
+            this.isExternal(expression.text) &&
+            (this.externalLibrary(expression.text) == "inline-assembly" ||
+             this.externalLibrary(expression.text) ==
+                "naked-inline-assembly")) {
+            val valid = expression.children.size >= 2 &&
+                expression.children[0].kind == "string" &&
+                expression.children[1].kind == "string"
+            if (valid) {
+                val operands: array<int> = []
+                var operand = 2
+                while (operand < expression.children.size) {
+                    operands.append(this.lowerExpression(
+                        expression.children[operand]
+                    ))
+                    operand = operand + 1
+                }
+                val resultType = bootstrapIrRuntimeType(
+                    this.declarations,
+                    this.lowerFunctionResultType(expression.text)
+                )
+                result = this.emitManyTexts(
+                    if (this.externalLibrary(expression.text) ==
+                        "naked-inline-assembly") {
+                        "naked.inline.assembly"
+                    } else "inline.assembly",
+                    operands,
+                    resultType,
+                    [
+                        expression.children[1].text,
+                        expression.children[0].text
+                    ]
+                )
+            } else {
+                this.errors = this.errors + 1
+                result = this.emit(
+                    "invalid", -1, -1, "inline-assembly.literal"
+                )
+            }
+        }
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
             expression.text != "Cell" &&
-            expression.text != "nativeXtensaInterruptHandlerAddress") {
+            expression.text != "nativeXtensaInterruptHandlerAddress" &&
+            (!this.isExternal(expression.text) ||
+             (this.externalLibrary(expression.text) != "inline-assembly" &&
+              this.externalLibrary(expression.text) !=
+                "naked-inline-assembly"))) {
             val arguments: array<int> = []
             var argument = 0
             while (argument < expression.children.size) {

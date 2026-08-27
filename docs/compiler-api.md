@@ -363,7 +363,10 @@ function for a stable foreign adapter. `@exportChecked("name")` selects the
 contained variant. They perform the same validation and emit the same ABI
 manifest as `compilerExportFunction(handle, name)` and
 `compilerExportCheckedFunction(handle, name)`; those functions remain available
-for compiler extensions that select exports dynamically. The ABI rung accepts
+for compiler extensions that select exports dynamically.
+`@export(["primary", "compatibility"])` publishes multiple native names for
+one source implementation; naked assembly definitions use LLVM aliases so the
+body is emitted once. The ABI rung accepts
 up to 16 value `bool`, `char`, `f32`, `f64`, signed or unsigned
 8/16/32/64-bit integer,
 borrowed `string`, or direct non-escaping `(i64) -> i64` callback parameters

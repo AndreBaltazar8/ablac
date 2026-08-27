@@ -166,6 +166,17 @@ compiler export API still applies:
 fun handle(pointer: int, length: int): int = dispatch(pointer, length)
 ```
 
+An array publishes ABI aliases for the same implementation without repeating
+the annotation:
+
+```abla
+@export(["current_name", "compatibility_name"])
+fun handle(pointer: int, length: int): int = dispatch(pointer, length)
+```
+
+Native naked-assembly exports coalesce those names to one LLVM definition.
+Other exports retain ordinary adapters for each public name.
+
 The direct scalar ABI preserves `bool`, `char`, `f32`, `f64`, and every
 currently lowered signed or unsigned 8/16/32/64-bit integer type. WebAssembly
 represents narrow integers in its `i32` lane while the adapter preserves their
