@@ -101,6 +101,14 @@ zero-initialized LLVM global per constant-sized call site for process-lifetime
 driver storage. Higher-level packages should wrap that raw address in a checked
 nominal handle or an ownership-checked resource type.
 
+`abla/unsafe/xtensa` can also turn a named top-level `() -> void` function into
+a native Xtensa interrupt-entry address. This is a compiler operation, not a
+boxed `Fn` conversion: closures and local aliases are rejected, the entry uses
+the target's native calling convention, and its directly reachable Abla code
+is placed in `.iram1.text` automatically. The platform framework remains
+responsible for installing that address and for keeping every indirectly
+reached function and datum interrupt-safe.
+
 `abla/sys/linux` is likewise explicit and target-specific. Its current
 x86-64 implementation lowers `openat`, `read`, `write`, `close`, and `getpid`
 through LLVM inline `syscall` assembly and offers checked descriptor and native
