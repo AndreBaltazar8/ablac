@@ -174,7 +174,8 @@ their matching native lane. Managed classes and arrays are not exported as
 opaque runtime values.
 Unchecked exports whose complete signature is scalar call the typed direct ABI
 without constructing universal runtime values. Checked exports retain their
-panic-containing status ABI.
+panic-containing status ABI. A program may publish up to 128 explicitly named
+exports; larger surfaces should be split at package or artifact boundaries.
 
 ## Types
 
