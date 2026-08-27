@@ -1398,6 +1398,8 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "nativeXtensaUnhandledInterruptAddress" ||
     name == "nativeXtensaUnhandledExceptionAddress" ||
     name == "nativeXtensaOwnedDispatcherTableAddress" ||
+    name == "nativeXtensaOwnedInterruptRegisterAbiAddress" ||
+    name == "nativeXtensaOwnedExtraStateAddress" ||
     name == "ablaUnsafeLoadI64" ||
     name == "ablaUnsafeStoreI64" ||
     name == "ablaUnsafeAtomicFetchAddI64" ||
@@ -1685,6 +1687,56 @@ fun bootstrapLlvmUnsafeExactI64Call(name: string): bool =
 
 fun bootstrapLlvmUnsafeExactAddressCall(name: string): bool =
     name == "ablaUnsafeCallAddressPointerPointer"
+
+// Emit an exact call0-style Xtensa ABI leaf whose assembly owns its return.
+// The naked attribute prevents LLVM from adding a windowed entry/return pair;
+// the unreachable terminator exists only to make the LLVM block well formed.
+fun bootstrapLlvmEmitXtensaNakedAssembly(
+    backend: BootstrapLlvmBackend,
+    function: i64*,
+    assembly: string
+): void {
+    bootstrapLlvmAddFunctionAttribute(backend, function, "naked")
+    bootstrapLlvmAddFunctionAttribute(backend, function, "noinline")
+    bootstrapLlvmAddFunctionAttribute(backend, function, "nounwind")
+    val block = LLVMAppendBasicBlockInContext(
+        backend.context, function, "entry"
+    )
+    val builder = llvmBuilder(backend.context)
+    builder.position(block)
+    val type = bootstrapLlvmFunctionType(
+        backend, backend.voidType, []
+    )
+    val operation = LLVMGetInlineAsm(
+        type, assembly, assembly.size, "", 0,
+        1, 0, 0, 0
+    )
+    LLVMBuildCall2(
+        builder.raw, type, operation, nativeNullPointer(), 0, ""
+    )
+    LLVMBuildUnreachable(builder.raw)
+    builder.drop()
+}
+
+fun bootstrapLlvmOwnXtensaNakedAssembly(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    result: i64*,
+    parameters: array<i64*>,
+    assembly: string
+): i64* {
+    var function = LLVMGetNamedFunction(backend.module, name)
+    if (pointerIsNull(function)) {
+        function = LLVMAddFunction(
+            backend.module, name,
+            bootstrapLlvmFunctionType(backend, result, parameters)
+        )
+        bootstrapLlvmEmitXtensaNakedAssembly(
+            backend, function, assembly
+        )
+    }
+    function
+}
 
 fun bootstrapLlvmEmitCoreIntrinsic(
     backend: BootstrapLlvmBackend,
@@ -2505,6 +2557,92 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                     interruptTable,
                     backend.i32Type,
                     "xtensa.owned.interrupt.table.address"
+                )
+            )
+        }
+    }
+    if (name == "nativeXtensaOwnedInterruptRegisterAbiAddress") {
+        if (instruction.operands.size != 0 ||
+            !bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            supported = false
+        }
+        if (supported) {
+            val getEnable = bootstrapLlvmOwnXtensaNakedAssembly(
+                backend, "xthal_get_intenable", backend.i32Type, [],
+                "entry a1, 16\nrsr.intenable a2\nretw.n"
+            )
+            bootstrapLlvmOwnXtensaNakedAssembly(
+                backend, "xthal_set_intenable", backend.voidType,
+                [backend.i32Type],
+                "entry a1, 16\nwsr.intenable a2\nretw.n"
+            )
+            bootstrapLlvmOwnXtensaNakedAssembly(
+                backend, "xthal_get_intread", backend.i32Type, [],
+                "entry a1, 16\nrsr.interrupt a2\nretw.n"
+            )
+            bootstrapLlvmOwnXtensaNakedAssembly(
+                backend, "xthal_get_interrupt", backend.i32Type, [],
+                "entry a1, 16\nrsr.interrupt a2\nretw.n"
+            )
+            bootstrapLlvmOwnXtensaNakedAssembly(
+                backend, "xthal_set_intset", backend.voidType,
+                [backend.i32Type],
+                "entry a1, 16\nwsr.intset a2\nretw.n"
+            )
+            bootstrapLlvmOwnXtensaNakedAssembly(
+                backend, "xthal_set_intclear", backend.voidType,
+                [backend.i32Type],
+                "entry a1, 16\nwsr.intclear a2\nretw.n"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, getEnable, backend.i32Type,
+                    "xtensa.interrupt.register.abi.address"
+                )
+            )
+        }
+    }
+    if (name == "nativeXtensaOwnedExtraStateAddress") {
+        if (instruction.operands.size != 0 ||
+            !bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            supported = false
+        }
+        if (supported) {
+            val type = bootstrapLlvmFunctionType(
+                backend, backend.voidType, [backend.i32Type]
+            )
+            var save = LLVMGetNamedFunction(
+                backend.module, "xthal_save_extra_nw"
+            )
+            if (pointerIsNull(save)) {
+                save = LLVMAddFunction(
+                    backend.module, "xthal_save_extra_nw", type
+                )
+                bootstrapLlvmEmitXtensaNakedAssembly(
+                    backend,
+                    save,
+                    "rur.threadptr a3\ns32i.n a3, a2, 0\nrsr.acclo a3\ns32i.n a3, a2, 4\nrsr.acchi a3\ns32i.n a3, a2, 8\nrsr.br a3\ns32i.n a3, a2, 12\nrsr.scompare1 a3\ns32i.n a3, a2, 16\nrsr.m0 a3\ns32i.n a3, a2, 20\nrsr.m1 a3\ns32i.n a3, a2, 24\nrsr.m2 a3\ns32i.n a3, a2, 28\nrsr.m3 a3\ns32i.n a3, a2, 32\nrur.f64r_lo a3\ns32i.n a3, a2, 36\nrur.f64r_hi a3\ns32i.n a3, a2, 40\nrur.f64s a3\ns32i.n a3, a2, 44\nret.n"
+                )
+            }
+            var restore = LLVMGetNamedFunction(
+                backend.module, "xthal_restore_extra_nw"
+            )
+            if (pointerIsNull(restore)) {
+                restore = LLVMAddFunction(
+                    backend.module, "xthal_restore_extra_nw", type
+                )
+                bootstrapLlvmEmitXtensaNakedAssembly(
+                    backend,
+                    restore,
+                    "l32i.n a3, a2, 0\nwur.threadptr a3\nl32i.n a3, a2, 4\nwsr.acclo a3\nl32i.n a3, a2, 8\nwsr.acchi a3\nl32i.n a3, a2, 12\nwsr.br a3\nl32i.n a3, a2, 16\nwsr.scompare1 a3\nl32i.n a3, a2, 20\nwsr.m0 a3\nl32i.n a3, a2, 24\nwsr.m1 a3\nl32i.n a3, a2, 28\nwsr.m2 a3\nl32i.n a3, a2, 32\nwsr.m3 a3\nl32i.n a3, a2, 36\nwur.f64r_lo a3\nl32i.n a3, a2, 40\nwur.f64r_hi a3\nl32i.n a3, a2, 44\nwur.f64s a3\nret.n"
+                )
+            }
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, save, backend.i32Type,
+                    "xtensa.extra.state.address"
                 )
             )
         }
