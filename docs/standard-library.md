@@ -107,7 +107,9 @@ boxed `Fn` conversion: closures and local aliases are rejected, the entry uses
 the target's native calling convention, and its directly reachable Abla code
 is placed in `.iram1.text` automatically. The platform framework remains
 responsible for installing that address and for keeping every indirectly
-reached function and datum interrupt-safe.
+reached function and datum interrupt-safe. The same module exposes the
+linker-provided Xtensa dispatcher-table address as a native scalar so a
+framework can install entries directly without calling a C registration ABI.
 
 `abla/sys/linux` is likewise explicit and target-specific. Its current
 x86-64 implementation lowers `openat`, `read`, `write`, `close`, and `getpid`
