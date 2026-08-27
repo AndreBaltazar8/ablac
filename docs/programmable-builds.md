@@ -168,8 +168,8 @@ foreign ABI rung. The equivalent `compilerExportFunction(handle, name)` API is
 retained for extensions that choose a function dynamically. Both export a
 C-identifier symbol for a resolved top-level function while
 keeping internal Abla symbols and value layouts hidden. This initial bounded
-surface accepts up to 16 value `bool`, `char`, signed or unsigned 8/16/32/64-bit
-integer, borrowed `string`, or direct
+surface accepts up to 16 value `bool`, `char`, `f32`, `f64`, signed or unsigned
+8/16/32/64-bit integer, borrowed `string`, or direct
 non-escaping `(i64) -> i64` callback parameters and `void`, any supported
 scalar, or owned `string` results. Runtime globals initialize once and retain
 state between calls; direct exports do not add synchronization. When every

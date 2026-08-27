@@ -364,7 +364,8 @@ contained variant. They perform the same validation and emit the same ABI
 manifest as `compilerExportFunction(handle, name)` and
 `compilerExportCheckedFunction(handle, name)`; those functions remain available
 for compiler extensions that select exports dynamically. The ABI rung accepts
-up to 16 value `bool`, `char`, signed or unsigned 8/16/32/64-bit integer,
+up to 16 value `bool`, `char`, `f32`, `f64`, signed or unsigned
+8/16/32/64-bit integer,
 borrowed `string`, or direct non-escaping `(i64) -> i64` callback parameters
 and a `void`, supported scalar, or owned `string` result. Runtime globals are
 initialized exactly once before the first exported call and retain their state

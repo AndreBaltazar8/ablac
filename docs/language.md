@@ -166,11 +166,12 @@ compiler export API still applies:
 fun handle(pointer: int, length: int): int = dispatch(pointer, length)
 ```
 
-The direct scalar ABI preserves `bool`, `char`, and every currently lowered
-signed or unsigned 8/16/32/64-bit integer type. WebAssembly represents narrow
-integers in its `i32` lane while the adapter preserves their declared bit
-width; `i64` and `u64` use its `i64` lane. Managed classes and arrays are not
-exported as opaque runtime values.
+The direct scalar ABI preserves `bool`, `char`, `f32`, `f64`, and every
+currently lowered signed or unsigned 8/16/32/64-bit integer type. WebAssembly
+represents narrow integers in its `i32` lane while the adapter preserves their
+declared bit width; `i64` and `u64` use its `i64` lane, and floating values use
+their matching native lane. Managed classes and arrays are not exported as
+opaque runtime values.
 Unchecked exports whose complete signature is scalar call the typed direct ABI
 without constructing universal runtime values. Checked exports retain their
 panic-containing status ABI.
