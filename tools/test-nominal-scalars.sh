@@ -100,5 +100,26 @@ if grep -Eq '%(Pin|Nominal)' "$output_directory/nominal-scalar.ll"; then
     echo 'nominal scalar leaked a wrapper type into LLVM IR' >&2
     exit 1
 fi
+grep -Fq 'define i64 @nominal_pin_round_trip(i64' \
+    "$output_directory/nominal-scalar.ll"
+if grep -Eq 'define void @nominal_pin_round_trip\(ptr sret' \
+    "$output_directory/nominal-scalar.ll"; then
+    echo 'nominal scalar crossed a boxed function ABI' >&2
+    exit 1
+fi
+opt --threads=1 -passes=default\<O2\> -S \
+    "$output_directory/nominal-scalar.ll" \
+    -o "$output_directory/nominal-scalar-optimized.ll"
+awk '
+    /define .*@nominal_pin_choose\(/ { inside = 1 }
+    inside { print }
+    inside && /^}/ { exit }
+' "$output_directory/nominal-scalar-optimized.ll" \
+    >"$output_directory/nominal-pin-choose.ll"
+grep -Fq 'select i1' "$output_directory/nominal-pin-choose.ll"
+if grep -Fq '%AblaValue' "$output_directory/nominal-pin-choose.ll"; then
+    echo 'nominal scalar conditional retained a boxed temporary' >&2
+    exit 1
+fi
 
 echo 'nominal scalar typing and zero-cost lowering passed'
