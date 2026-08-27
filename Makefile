@@ -57,6 +57,7 @@ test: ablac
 	tools/test-nominal-scalars.sh $(COMPILER)
 	tools/test-native-width-integers.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
+	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
 check: test self-rebuild
