@@ -1400,6 +1400,7 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "nativeXtensaOwnedDispatcherTableAddress" ||
     name == "nativeXtensaOwnedInterruptRegisterAbiAddress" ||
     name == "nativeXtensaOwnedExtraStateAddress" ||
+    name == "nativeXtensaOwnedWindowSpillAddress" ||
     name == "ablaUnsafeLoadI64" ||
     name == "ablaUnsafeStoreI64" ||
     name == "ablaUnsafeAtomicFetchAddI64" ||
@@ -1736,6 +1737,43 @@ fun bootstrapLlvmOwnXtensaNakedAssembly(
         )
     }
     function
+}
+
+// Exact classic-ESP32 implementation of the Xtensa HAL window-spill ABI.
+// This is module assembly because the compatibility alias must share the
+// primary entry address and the routine deliberately rotates register windows.
+// The instruction sequence follows Tensilica's permissively licensed HAL
+// source for the ESP32's 64 physical registers and windowed ABI.
+//
+// Copyright (c) 1999-2010 Tensilica Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to
+// deal in the Software without restriction, including without limitation the
+// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+// sell copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+fun bootstrapLlvmXtensaWindowSpillAssembly(): string {
+    val header = ".global xthal_spill_registers_into_stack_nw\n.text\n.align 4\n.global xthal_window_spill_nw\nxthal_window_spill_nw:\nxthal_spill_registers_into_stack_nw:\n"
+    val rotate = "rsr.windowbase a2\naddi.n a2, a2, 1\nssr a2\nrsr.windowstart a3\nsrl a2, a3\nsll a3, a3\nbgez a3, .Linvalid_ws\nsrli a3, a3, 16\nor a2, a2, a3\nneg a3, a2\nand a3, a3, a2\nnsau a3, a3\nssl a3\nsrl a2, a2\nwsr.windowstart a2\nrsr.windowbase a2\naddi a2, a2, 31\nsub a3, a2, a3\nwsr.windowbase a3\nrsync\nrsr.windowstart a2\n"
+    val spill4 = ".Lspill_loop:\nbeqz a2, .Ldone\nbbsi.l a2, 0, .Lspill4\nbbsi.l a2, 1, .Lspill8\nbbsi.l a2, 2, .Lspill12\nj .Linvalid_window\n.Lspill4:\naddi a3, a9, -16\ns32i.n a4, a3, 0\ns32i.n a5, a3, 4\ns32i.n a6, a3, 8\ns32i.n a7, a3, 12\nsrli a6, a2, 1\nrotw 1\nj .Lspill_loop\n"
+    val spill8 = ".Lspill8:\naddi a3, a13, -16\ns32i.n a4, a3, 0\ns32i.n a5, a3, 4\ns32i.n a6, a3, 8\ns32i.n a7, a3, 12\naddi a3, a5, -12\nl32i.n a3, a3, 0\naddi a3, a3, -32\ns32i.n a8, a3, 0\ns32i.n a9, a3, 4\ns32i.n a10, a3, 8\ns32i.n a11, a3, 12\nsrli a10, a2, 2\nrotw 2\nj .Lspill_loop\n"
+    val spill12 = ".Lspill12:\nrotw 1\naddi a13, a13, -16\ns32i.n a0, a13, 0\ns32i.n a1, a13, 4\ns32i.n a2, a13, 8\ns32i.n a3, a13, 12\naddi a3, a1, -12\nl32i.n a3, a3, 0\naddi a13, a13, 16\naddi a3, a3, -48\ns32i.n a4, a3, 0\ns32i.n a5, a3, 4\ns32i.n a6, a3, 8\ns32i.n a7, a3, 12\ns32i.n a8, a3, 16\ns32i.n a9, a3, 20\ns32i.n a10, a3, 24\ns32i.n a11, a3, 28\nrotw -1\nsrli a14, a2, 3\nrotw 3\nj .Lspill_loop\n.byte 0\n.byte 0\n"
+    val finish = ".Ldone:\nrotw 1\nrsr.windowbase a2\nssl a2\nmovi.n a2, 1\nsll a2, a2\nwsr.windowstart a2\nrsync\nmovi.n a2, 0\nret.n\n.Linvalid_ws:\nmovi.n a2, 1\nret.n\n.byte 0\n.byte 0\n"
+    val invalid = ".Linvalid_window:\nslli a2, a2, 1\naddi.n a2, a2, 1\nrsr.windowbase a3\nbbsi.l a2, 15, 2f\n1: addi.n a3, a3, -1\nslli a2, a2, 1\nbbci.l a2, 15, 1b\nextui a3, a3, 0, 4\n2: ssl a3\nslli a3, a2, 16\nsrc a2, a2, a3\nextui a2, a2, 0, 16\nwsr.windowstart a2\nrsr.sar a3\nmovi.n a2, 32\nsub a3, a2, a3\nwsr.windowbase a3\nrsync\nmovi.n a2, 2\nret.n\n.size xthal_window_spill_nw, . - xthal_window_spill_nw\n"
+    val wrapper = ".byte 0\n.byte 0\n.byte 0\n.text\n.global xthal_window_spill\n.type xthal_window_spill,@function\nxthal_window_spill:\nentry a1, 16\nmovi a6, -262160\nrsr.ps a5\nmov.n a4, a0\nand a2, a5, a6\naddi.n a2, a2, 3\nwsr.ps a2\nrsync\ncall0 xthal_window_spill_nw\nmov.n a0, a4\nwsr.ps a5\nrsync\nretw.n\n.size xthal_window_spill, . - xthal_window_spill\n"
+    "$header$rotate$spill4$spill8$spill12$finish$invalid$wrapper"
 }
 
 fun bootstrapLlvmEmitCoreIntrinsic(
@@ -2643,6 +2681,37 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 LLVMBuildPtrToInt(
                     backend.builder, save, backend.i32Type,
                     "xtensa.extra.state.address"
+                )
+            )
+        }
+    }
+    if (name == "nativeXtensaOwnedWindowSpillAddress") {
+        if (instruction.operands.size != 0 ||
+            !bootstrapTextContains(backend.targetTriple, "xtensa")) {
+            supported = false
+        }
+        if (supported) {
+            var spill = LLVMGetNamedFunction(
+                backend.module, "xthal_window_spill_nw"
+            )
+            if (pointerIsNull(spill)) {
+                spill = LLVMAddFunction(
+                    backend.module,
+                    "xthal_window_spill_nw",
+                    bootstrapLlvmFunctionType(
+                        backend, backend.i32Type, []
+                    )
+                )
+                val assembly = bootstrapLlvmXtensaWindowSpillAssembly()
+                LLVMAppendModuleInlineAsm(
+                    backend.module, assembly, assembly.size
+                )
+            }
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, spill, backend.i32Type,
+                    "xtensa.window.spill.address"
                 )
             )
         }
