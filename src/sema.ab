@@ -1294,6 +1294,25 @@ fun bootstrapScalarTypeUnderlyingValid(type: string): bool =
     type == "i32" || type == "u32" ||
     type == "i64" || type == "u64" || type == "f64"
 
+fun bootstrapIsIntegerScalarType(type: string): bool {
+    val normalized = bootstrapNormalizeType(type)
+    normalized == "char" || normalized == "i8" || normalized == "u8" ||
+    normalized == "i16" || normalized == "u16" ||
+    normalized == "i32" || normalized == "u32" ||
+    normalized == "i64" || normalized == "u64"
+}
+
+fun bootstrapIsNumericScalarType(type: string): bool =
+    bootstrapIsIntegerScalarType(type) ||
+    bootstrapNormalizeType(type) == "f64"
+
+fun bootstrapScalarConversionCompatible(
+    target: string,
+    source: string
+): bool = (bootstrapIsIntegerScalarType(target) &&
+    bootstrapIsIntegerScalarType(source)) ||
+    bootstrapNormalizeType(target) == bootstrapNormalizeType(source)
+
 fun bootstrapGlobalFunctionType(
     declarations: array<BootstrapDeclaration>,
     name: string
@@ -5709,6 +5728,9 @@ class BootstrapAnalyzer(
             }
             val functionType = this.findType(expression.text)
             val symbolKind = this.findKind(expression.text)
+            val primitiveType = if (bootstrapScalarTypeUnderlyingValid(
+                bootstrapNormalizeType(expression.text)
+            )) bootstrapNormalizeType(expression.text) else ""
             val contractModule = this.contractModuleForFunction(
                 expression.text
             )
@@ -5726,7 +5748,8 @@ class BootstrapAnalyzer(
                 this.fail("region.indirect-call-retention:${expression.text}")
             }
             if (!bootstrapIsFunctionType(functionType) &&
-                symbolKind != "class" && symbolKind != "type") {
+                symbolKind != "class" && symbolKind != "type" &&
+                primitiveType == "") {
                 this.fail("call.target:${expression.text}")
             }
             var argument = 0
@@ -5764,10 +5787,11 @@ class BootstrapAnalyzer(
                         }
                         declarationIndex = declarationIndex + 1
                     }
-                } else if (symbolKind == "type") {
+                } else if (symbolKind == "type" || primitiveType != "") {
                     expectedArgument = bootstrapScalarTypeUnderlying(
                         this.declarations, expression.text
                     )
+                    if (primitiveType != "") expectedArgument = primitiveType
                 }
                 this.contextualizeLambdaParameters(
                     expression.children[argument],
@@ -5913,20 +5937,22 @@ class BootstrapAnalyzer(
                     declarationIndex = declarationIndex + 1
                 }
             }
-            if (symbolKind == "type") {
-                val underlying = bootstrapScalarTypeUnderlying(
+            if (symbolKind == "type" || primitiveType != "") {
+                var underlying = bootstrapScalarTypeUnderlying(
                     this.declarations, expression.text
                 )
+                if (primitiveType != "") underlying = primitiveType
                 if (expression.children.size != 1) {
                     this.fail("type.constructor-arity:${expression.text}")
                 }
                 if (expression.children.size == 1 &&
-                    !bootstrapTypesCompatible(
+                    !bootstrapScalarConversionCompatible(
                         underlying, resolvedArgumentTypes[0]
                     )) {
                     this.fail("type.constructor-argument:${expression.text}")
                 }
-                result = expression.text
+                result = if (primitiveType == "") expression.text
+                    else primitiveType
             } else if (symbolKind == "class") {
                 result = expression.text
                 val storedSource = this.constructorStoredBorrowSource(
@@ -6826,8 +6852,8 @@ class BootstrapAnalyzer(
             expression.kind == "unary-" ||
             expression.kind == "unary+"
         ) {
-            result = this.infer(expression.children[0])
-            if (result != "i64" && result != "f64") {
+            result = this.scalarValueType(this.infer(expression.children[0]))
+            if (!bootstrapIsNumericScalarType(result)) {
                 this.fail("unary.numeric")
             }
         }
@@ -6837,8 +6863,10 @@ class BootstrapAnalyzer(
             result = "bool"
         }
         if (expression.kind == "unary~") {
-            result = this.infer(expression.children[0])
-            if (result != "i64") this.fail("bitwise.type")
+            result = this.scalarValueType(this.infer(expression.children[0]))
+            if (!bootstrapIsIntegerScalarType(result)) {
+                this.fail("bitwise.type")
+            }
         }
         if (expression.kind == "&&" || expression.kind == "||") {
             val left = this.infer(expression.children[0])
@@ -6988,15 +7016,15 @@ class BootstrapAnalyzer(
                 expression.kind == "-" || expression.kind == "*" ||
                 expression.kind == "/"
             if (arithmetic) {
-                if (left != right || (left != "i64" && left != "f64")) {
+                if (left != right || !bootstrapIsNumericScalarType(left)) {
                     this.fail("arithmetic.type")
                 }
                 result = left
             } else {
-                if (left != "i64" || right != "i64") {
+                if (left != right || !bootstrapIsIntegerScalarType(left)) {
                     this.fail("bitwise.type")
                 }
-                result = "i64"
+                result = left
             }
         }
         if (

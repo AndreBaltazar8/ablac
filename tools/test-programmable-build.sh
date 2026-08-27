@@ -47,6 +47,11 @@ if grep -q '@abla.exports.initialized' \
     echo "constant scalar globals retained the lazy export guard" >&2
     exit 1
 fi
+if grep -q 'export.arguments' \
+    "$output_directory/libabla_scalar.so.ll"; then
+    echo "scalar-only export retained boxed argument storage" >&2
+    exit 1
+fi
 clang "$project_root/tests/cases/program-build/export-scalar-caller.c" \
     -L"$output_directory" -Wl,-rpath,"$output_directory" -labla_scalar \
     -o "$output_directory/export-scalar-caller"

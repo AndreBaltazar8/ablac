@@ -171,6 +171,9 @@ signed or unsigned 8/16/32/64-bit integer type. WebAssembly represents narrow
 integers in its `i32` lane while the adapter preserves their declared bit
 width; `i64` and `u64` use its `i64` lane. Managed classes and arrays are not
 exported as opaque runtime values.
+Unchecked exports whose complete signature is scalar call the typed direct ABI
+without constructing universal runtime values. Checked exports retain their
+panic-containing status ABI.
 
 ## Types
 
@@ -198,6 +201,13 @@ After semantic resolution the typed IR erases the nominal spelling to its
 primitive representation; there is no allocation, object header, or dynamic
 dispatch. `type` is contextual at declaration position and remains available
 as an ordinary identifier elsewhere.
+
+Primitive integer conversions are also explicit calls: `u32(value)`,
+`i16(value)`, and the other integer spellings convert without allocating.
+Narrowing keeps the low bits; widening sign-extends a signed source and
+zero-extends an unsigned source. This makes register-width intent visible and
+lets fixed-width values remain native through locals, calls, globals, branches,
+and exports.
 
 `T?` is nullable. Nullability is part of every type and is not represented by a
 sentinel integer. `T*` is a native pointer type confined to trusted platform
@@ -633,11 +643,15 @@ equality, bitwise AND/XOR/OR, logical conjunction/disjunction, and assignment.
 Assignment is right-associative and produces the assigned value for prototype
 compatibility.
 
-Integer bitwise operators use signed 64-bit storage: `&`, `|`, `^`, and `~`
-operate on all 64 bits; `<<` shifts left, `>>` shifts right with sign extension,
-and `>>>` shifts right with zero extension. A negative shift count or one of 64
-or greater produces zero. Prefix `^binding` remains the delegate projection;
-between two integer expressions, `^` is XOR.
+Integer arithmetic and bitwise operators preserve their common declared width.
+Fixed-width addition, subtraction, and multiplication wrap at that width;
+division and ordered comparisons use the type's signedness. `&`, `|`, `^`, and
+`~` operate on every bit in that width. `<<` shifts left, `>>` is arithmetic for
+signed types and logical for unsigned types, and `>>>` is always logical. A
+negative signed shift count or a count greater than or equal to the type width
+produces zero. Both operands must have the same integer type; use an explicit
+primitive conversion when widths differ. Prefix `^binding` remains the delegate
+projection; between two integer expressions, `^` is XOR.
 
 `if` and `when` are expressions when all paths yield compatible values:
 

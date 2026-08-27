@@ -311,7 +311,23 @@ fun bootstrapLlvmIsNativeInteger(type: string): bool =
     type == "i64" || type == "u64"
 
 fun bootstrapLlvmIsUnsignedNativeInteger(type: string): bool =
-    type == "u8" || type == "u16" || type == "u32" || type == "u64"
+    type == "char" || type == "u8" || type == "u16" ||
+    type == "u32" || type == "u64"
+
+fun bootstrapLlvmScalarBitWidth(type: string): int {
+    var result = 0
+    if (type == "bool") result = 1
+    if (type == "i8" || type == "u8" || type == "char") result = 8
+    if (type == "i16" || type == "u16") result = 16
+    if (type == "i32" || type == "u32" || type == "f32") result = 32
+    if (type == "i64" || type == "u64" || type == "f64") result = 64
+    result
+}
+
+fun bootstrapLlvmScalarAlignment(type: string): int {
+    val width = bootstrapLlvmScalarBitWidth(type)
+    if (width <= 8) 1 else if (width <= 16) 2 else if (width <= 32) 4 else 8
+}
 
 fun bootstrapLlvmAddressTaken(
     program: BootstrapIrProgram,
@@ -667,10 +683,7 @@ fun bootstrapLlvmScalarValueCount(function: BootstrapIrFunction): int {
 
 fun bootstrapLlvmScalarType(type: string): string {
     val normalized = bootstrapNormalizeType(type)
-    if (normalized == "i64" || normalized == "i8" ||
-        normalized == "u8" || normalized == "char" ||
-        normalized == "i16" || normalized == "u16" ||
-        normalized == "i32" || normalized == "u32") "i64"
+    if (bootstrapIsIntegerScalarType(normalized)) normalized
     else if (normalized == "bool") "bool"
     else if (normalized == "f64") "f64"
     else ""
@@ -700,6 +713,9 @@ fun bootstrapLlvmInferScalarValues(
             if (instruction.opcode == "const.i64") inferred = "i64"
             if (instruction.opcode == "const.f64") inferred = "f64"
             if (instruction.opcode == "const.bool") inferred = "bool"
+            if (instruction.opcode == "scalar.cast") {
+                inferred = bootstrapLlvmScalarType(instruction.text)
+            }
             if (instruction.opcode == "string.length" ||
                 instruction.opcode == "string.get" ||
                 instruction.opcode == "array.length" ||
@@ -785,7 +801,7 @@ fun bootstrapLlvmInferScalarValues(
                 instruction.opcode == "neg") {
                 if (instruction.left >= 0 &&
                     instruction.left < types.size &&
-                    (types[instruction.left] == "i64" ||
+                    (bootstrapIsIntegerScalarType(types[instruction.left]) ||
                      types[instruction.left] == "f64")) {
                     inferred = types[instruction.left]
                 }
@@ -796,7 +812,13 @@ fun bootstrapLlvmInferScalarValues(
                 instruction.opcode == "bit.not" ||
                 instruction.opcode == "<<" ||
                 instruction.opcode == ">>" ||
-                instruction.opcode == ">>>") inferred = "i64"
+                instruction.opcode == ">>>") {
+                if (instruction.left >= 0 &&
+                    instruction.left < types.size &&
+                    bootstrapIsIntegerScalarType(types[instruction.left])) {
+                    inferred = types[instruction.left]
+                }
+            }
             if (instruction.opcode == "not" ||
                 instruction.opcode == "&&" ||
                 instruction.opcode == "||") inferred = "bool"
@@ -806,7 +828,12 @@ fun bootstrapLlvmInferScalarValues(
                     instruction.left < types.size &&
                     instruction.right < types.size &&
                     types[instruction.left] != "" &&
-                    types[instruction.left] == types[instruction.right]) {
+                    (types[instruction.left] == types[instruction.right] ||
+                     (bootstrapIsIntegerScalarType(
+                        types[instruction.left]
+                      ) && bootstrapIsIntegerScalarType(
+                        types[instruction.right]
+                      )))) {
                     inferred = "bool"
                 }
             }
@@ -817,9 +844,12 @@ fun bootstrapLlvmInferScalarValues(
                 if (instruction.left >= 0 && instruction.right >= 0 &&
                     instruction.left < types.size &&
                     instruction.right < types.size &&
-                    types[instruction.left] == types[instruction.right] &&
-                    (types[instruction.left] == "i64" ||
-                     types[instruction.left] == "f64")) inferred = "bool"
+                    ((types[instruction.left] == types[instruction.right] &&
+                      types[instruction.left] == "f64") ||
+                     (bootstrapIsIntegerScalarType(types[instruction.left]) &&
+                      bootstrapIsIntegerScalarType(
+                        types[instruction.right]
+                      )))) inferred = "bool"
             }
             if (instruction.result >= 0 &&
                 instruction.result < types.size && inferred != "" &&
@@ -866,6 +896,30 @@ fun bootstrapLlvmBuildScalarPlan(
         val candidate = function.instructions[instruction]
         if (candidate.opcode == "local.zero.i64") {
             localTypes[instruction] = "i64"
+        }
+        if (candidate.opcode == "local.zero.u64") {
+            localTypes[instruction] = "u64"
+        }
+        if (candidate.opcode == "local.zero.i32") {
+            localTypes[instruction] = "i32"
+        }
+        if (candidate.opcode == "local.zero.u32") {
+            localTypes[instruction] = "u32"
+        }
+        if (candidate.opcode == "local.zero.i16") {
+            localTypes[instruction] = "i16"
+        }
+        if (candidate.opcode == "local.zero.u16") {
+            localTypes[instruction] = "u16"
+        }
+        if (candidate.opcode == "local.zero.i8") {
+            localTypes[instruction] = "i8"
+        }
+        if (candidate.opcode == "local.zero.u8") {
+            localTypes[instruction] = "u8"
+        }
+        if (candidate.opcode == "local.zero.char") {
+            localTypes[instruction] = "char"
         }
         if (candidate.opcode == "local.zero.bool") {
             localTypes[instruction] = "bool"
@@ -945,6 +999,7 @@ fun bootstrapLlvmBuildScalarPlan(
                 candidate.result < valueTypes.size &&
                 valueTypes[candidate.result] != ""
         }
+        if (candidate.opcode == "scalar.cast") nativeInputs = true
         if (candidate.opcode == "branch") nativeInputs =
             candidate.left >= 0 && candidate.left < valueTypes.size &&
             valueTypes[candidate.left] == "bool"
@@ -1178,11 +1233,27 @@ fun bootstrapLlvmScalarInstructionConstant(
     val valueIndex = bootstrapLlvmInstructionProducing(program, valueId)
     if (valueIndex < 0) return result
     val value = program.instructions[valueIndex]
-    if (scalar == "i64" && value.opcode == "const.i64") result =
+    if (bootstrapIsIntegerScalarType(scalar) &&
+        value.opcode == "const.i64") result =
         LLVMConstInt(
-            backend.i64Type,
+            backend.type(scalar),
             bootstrapLlvmParseInteger(value.text), 1
         )
+    if (value.opcode == "scalar.cast" && value.text == scalar) {
+        val operandIndex = bootstrapLlvmInstructionProducing(
+            program, value.left
+        )
+        if (operandIndex >= 0) {
+            val operand = program.instructions[operandIndex]
+            if (bootstrapIsIntegerScalarType(scalar) &&
+                operand.opcode == "const.i64") {
+                result = LLVMConstInt(
+                    backend.type(scalar),
+                    bootstrapLlvmParseInteger(operand.text), 1
+                )
+            }
+        }
+    }
     if (scalar == "bool" && value.opcode == "const.bool") result =
         LLVMConstInt(
             backend.i1Type,
@@ -1202,7 +1273,7 @@ fun bootstrapLlvmScalarInstructionConstant(
             backend, program, value.text, depth + 1
         )
     }
-    if ((scalar == "i64" || scalar == "bool") &&
+    if ((bootstrapIsIntegerScalarType(scalar) || scalar == "bool") &&
         (value.opcode == "neg" || value.opcode == "bit.not" ||
          value.opcode == "not")) {
         val operand = bootstrapLlvmScalarInstructionConstant(
@@ -1212,7 +1283,7 @@ fun bootstrapLlvmScalarInstructionConstant(
             if (value.opcode == "neg") LLVMConstNeg(operand)
             else LLVMConstNot(operand)
     }
-    if (scalar == "i64" &&
+    if (bootstrapIsIntegerScalarType(scalar) &&
         (value.opcode == "+" || value.opcode == "-" ||
          value.opcode == "^")) {
         val left = bootstrapLlvmScalarInstructionConstant(

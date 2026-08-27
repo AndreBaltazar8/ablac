@@ -61,7 +61,9 @@ fun bootstrapLlvmEmitGlobals(
                     ) == "val") {
                     LLVMSetGlobalConstant(global, 1)
                 }
-                LLVMSetAlignment(global, if (scalar == "bool") 1 else 8)
+                LLVMSetAlignment(
+                    global, bootstrapLlvmScalarAlignment(scalar)
+                )
                 LLVMSetLinkage(global, llvmInternalLinkage())
             }
         }
@@ -121,6 +123,57 @@ fun bootstrapLlvmFalseFlags(count: int): array<bool> {
         index = index + 1
     }
     result
+}
+
+fun bootstrapLlvmExportUsesDirectScalarAbi(
+    request: BootstrapExportRequest
+): bool {
+    var direct = !request.checked &&
+        (request.resultType == "void" ||
+         bootstrapExportScalarTypeValid(request.resultType))
+    var parameter = 0
+    while (direct && parameter < request.parameterTypes.size) {
+        direct = bootstrapExportScalarTypeValid(
+            request.parameterTypes[parameter]
+        )
+        parameter = parameter + 1
+    }
+    direct
+}
+
+fun bootstrapLlvmEmitDirectScalarExport(
+    backend: BootstrapLlvmBackend,
+    request: BootstrapExportRequest,
+    function: i64*,
+    direct: i64*
+): void {
+    val arguments: array<i64*> = [LLVMConstInt(
+        backend.i64Type, request.parameterTypes.size, 0
+    )]
+    var parameter = 0
+    while (parameter < request.parameterTypes.size) {
+        val type = request.parameterTypes[parameter]
+        var value = LLVMGetParam(function, parameter)
+        if (type == "bool") value = LLVMBuildTrunc(
+            backend.builder, value, backend.i1Type, "export.bool"
+        )
+        arguments.append(value)
+        parameter = parameter + 1
+    }
+    val returnsVoid = request.resultType == "void"
+    var result = bootstrapLlvmCall(
+        backend, direct, arguments,
+        if (returnsVoid) "" else "export.direct.scalar",
+        false, bootstrapLlvmFalseFlags(arguments.size)
+    )
+    if (returnsVoid) LLVMBuildRetVoid(backend.builder)
+    else {
+        if (request.resultType == "bool") result = LLVMBuildZExt(
+            backend.builder, result, backend.i8Type, "export.u8"
+        )
+        LLVMBuildRet(backend.builder, result)
+    }
+    return
 }
 
 class BootstrapLlvmExportArguments(
@@ -404,12 +457,24 @@ fun bootstrapLlvmEmitExports(
                 backend, "abla_export_ensure_initialized", [],
                 "", false, []
             )
-            val boxed = bootstrapLlvmBoxExportArguments(
-                backend, request, function
-            )
-            val result = LLVMBuildAlloca(
-                backend.builder, backend.valueType, "export.result"
-            )
+            val directScalar = bootstrapLlvmExportUsesDirectScalarAbi(request)
+            if (directScalar) {
+                bootstrapLlvmEmitDirectScalarExport(
+                    backend, request, function,
+                    LLVMGetNamedFunction(
+                        backend.module,
+                        bootstrapLlvmDirectFunctionSymbol(
+                            identities.symbols[source]
+                        )
+                    )
+                )
+            } else {
+                val boxed = bootstrapLlvmBoxExportArguments(
+                    backend, request, function
+                )
+                val result = LLVMBuildAlloca(
+                    backend.builder, backend.valueType, "export.result"
+                )
             if (!request.checked) {
                 bootstrapLlvmCall(
                     backend,
@@ -496,6 +561,7 @@ fun bootstrapLlvmEmitExports(
                         status, "failure.status"
                     )
                 )
+            }
             }
         }
         index = index + 1
