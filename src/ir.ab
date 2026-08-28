@@ -4649,6 +4649,68 @@ class BootstrapLowerer(
         result
     }
 
+    fun appendLogicalOperands(
+        expression: BootstrapExpression,
+        operation: string,
+        var operands: array<BootstrapExpression>
+    ): void {
+        if (expression.kind == operation && expression.children.size == 2) {
+            this.appendLogicalOperands(
+                expression.children[0], operation, operands
+            )
+            this.appendLogicalOperands(
+                expression.children[1], operation, operands
+            )
+        } else operands.append(expression)
+    }
+
+    // Generated syntax may associate binary chains differently from the
+    // parser. Flatten either shape, then lower left-to-right without recursing
+    // through lowerExpression's large general-purpose stack frame.
+    fun lowerLogicalExpression(expression: BootstrapExpression): int {
+        val operation = expression.kind
+        val operands: array<BootstrapExpression> = []
+        this.appendLogicalOperands(expression, operation, operands)
+
+        val temporaryId = this.allocateLabel()
+        val temporary = "logical_result_$temporaryId"
+        this.emitControl("local.zero.bool", -1, -1, -1, temporary)
+        val shortcutLabel = this.allocateLabel()
+        val mergeLabel = this.allocateLabel()
+        var current = this.lowerExpression(operands[0])
+        val previousLogicalScope = this.enterLocalScope()
+        var operand = 1
+        while (operand < operands.size) {
+            val evaluateLabel = this.allocateLabel()
+            if (operation == "&&") {
+                this.emitControl(
+                    "branch", current, evaluateLabel, shortcutLabel, ""
+                )
+            } else {
+                this.emitControl(
+                    "branch", current, shortcutLabel, evaluateLabel, ""
+                )
+            }
+            this.emitControl("label", -1, evaluateLabel, -1, "")
+            this.addNullableRefinements(
+                operands[operand - 1], operation == "&&"
+            )
+            current = this.lowerExpression(operands[operand])
+            operand = operand + 1
+        }
+        this.leaveLocalScope(previousLogicalScope)
+        this.emitControl("local.set", current, -1, -1, temporary)
+        this.emitControl("jump", -1, mergeLabel, -1, "")
+        this.emitControl("label", -1, shortcutLabel, -1, "")
+        val shortcut = this.emit(
+            "const.bool", -1, -1, if (operation == "&&") "false" else "true"
+        )
+        this.emitControl("local.set", shortcut, -1, -1, temporary)
+        this.emitControl("jump", -1, mergeLabel, -1, "")
+        this.emitControl("label", -1, mergeLabel, -1, "")
+        this.emit("local.load", -1, -1, temporary)
+    }
+
     fun lowerExpression(expression: BootstrapExpression): int {
         var result = -1
         if (expression.kind == "integer") {
@@ -5818,54 +5880,7 @@ class BootstrapLowerer(
             result = this.emit(opcode, left, right, "")
         }
         if (expression.kind == "&&" || expression.kind == "||") {
-            val temporaryId = this.allocateLabel()
-            val temporary = "logical_result_$temporaryId"
-            this.emitControl("local.zero.bool", -1, -1, -1, temporary)
-            val left = this.lowerExpression(expression.children[0])
-            val evaluateLabel = this.allocateLabel()
-            val shortcutLabel = this.allocateLabel()
-            val mergeLabel = this.allocateLabel()
-            if (expression.kind == "&&") {
-                this.emitControl(
-                    "branch",
-                    left,
-                    evaluateLabel,
-                    shortcutLabel,
-                    ""
-                )
-            } else {
-                this.emitControl(
-                    "branch",
-                    left,
-                    shortcutLabel,
-                    evaluateLabel,
-                    ""
-                )
-            }
-            this.emitControl("label", -1, evaluateLabel, -1, "")
-            val previousLogicalScope = this.enterLocalScope()
-            this.addNullableRefinements(
-                expression.children[0],
-                expression.kind == "&&"
-            )
-            val right = this.lowerExpression(expression.children[1])
-            this.leaveLocalScope(previousLogicalScope)
-            this.emitControl("local.set", right, -1, -1, temporary)
-            this.emitControl("jump", -1, mergeLabel, -1, "")
-            this.emitControl("label", -1, shortcutLabel, -1, "")
-            var shortcutText = "true"
-            if (expression.kind == "&&") shortcutText = "false"
-            else shortcutText = shortcutText
-            val shortcut = this.emit(
-                "const.bool",
-                -1,
-                -1,
-                shortcutText
-            )
-            this.emitControl("local.set", shortcut, -1, -1, temporary)
-            this.emitControl("jump", -1, mergeLabel, -1, "")
-            this.emitControl("label", -1, mergeLabel, -1, "")
-            result = this.emit("local.load", -1, -1, temporary)
+            result = this.lowerLogicalExpression(expression)
         }
         if (expression.kind == "if") {
             // Reserve the result name before lowering the condition. The

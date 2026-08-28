@@ -49,6 +49,7 @@ prepare-test-driver:
 
 test: ablac
 	tools/test-version.sh $(COMPILER)
+	tools/test-deep-logical.sh $(COMPILER)
 	tools/test-value-abi.sh $(COMPILER)
 	tools/test-unsafe-mmio.sh $(COMPILER)
 	tools/test-unsafe-stack-memory.sh $(COMPILER)

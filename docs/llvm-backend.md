@@ -65,6 +65,13 @@ grow the native stack on every iteration. The native self-host gate compiles
 the complete compiler twice and includes a 250,000-iteration regression under
 a 64 MiB process limit.
 
+Semantic inference and IR lowering flatten same-operator `&&` and `||` trees
+before visiting their operands. This accepts parser- or subparser-generated
+left/right association, preserves left-to-right short-circuit behavior and
+cumulative nullable refinements, and avoids recursively entering the large
+general expression frames once per operand. `tools/test-deep-logical.sh`
+generates 2,048 ordered operands and verifies the exact short-circuit index.
+
 Before emission, a conservative scalar plan proves `i64` and `bool` SSA values
 from constants, typed parameters and direct calls, native declarations,
 arithmetic, comparisons, and scalar locals. A local is native only when every
