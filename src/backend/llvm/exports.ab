@@ -141,15 +141,42 @@ fun bootstrapLlvmExportUsesDirectScalarAbi(
     direct
 }
 
+// When the native ABI and direct Abla ABI are identical, the linker name can
+// be an alias of the implementation. This avoids a call-only entry thunk while
+// retaining exactly the linkage requested by exportFunction/internalFunction.
+// Defaults and bool use different native representations and still need their
+// adapters; runtime-initialized paths still need the initialization guard.
+fun bootstrapLlvmExportCanAliasDirect(
+    request: BootstrapExportRequest,
+    function: BootstrapIrFunction,
+    initializationRequired: bool
+): bool {
+    var exact = !initializationRequired && !function.naked &&
+        bootstrapLlvmExportUsesDirectScalarAbi(request) &&
+        !bootstrapLlvmDirectNeedsArgumentCount(function) &&
+        request.name != "xt_unhandled_interrupt" &&
+        request.resultType != "bool"
+    var parameter = 0
+    while (exact && parameter < request.parameterTypes.size) {
+        exact = request.parameterTypes[parameter] != "bool"
+        parameter = parameter + 1
+    }
+    exact
+}
+
 fun bootstrapLlvmEmitDirectScalarExport(
     backend: BootstrapLlvmBackend,
     request: BootstrapExportRequest,
     function: i64*,
-    direct: i64*
+    direct: i64*,
+    sourceFunction: BootstrapIrFunction
 ): void {
-    val arguments: array<i64*> = [LLVMConstInt(
-        backend.i64Type, request.parameterTypes.size, 0
-    )]
+    val arguments: array<i64*> = []
+    if (bootstrapLlvmDirectNeedsArgumentCount(sourceFunction)) {
+        arguments.append(LLVMConstInt(
+            backend.i64Type, request.parameterTypes.size, 0
+        ))
+    }
     var parameter = 0
     while (parameter < request.parameterTypes.size) {
         val type = request.parameterTypes[parameter]
@@ -353,7 +380,7 @@ fun bootstrapLlvmEmitNativeFunctionAdapters(
                     bootstrapLlvmDirectFunctionSymbol(
                         identities.symbols[index]
                     )
-                )
+                ), program.functions[index]
             )
         }
         index = index + 1
@@ -637,6 +664,12 @@ fun bootstrapLlvmEmitExports(
                 }
                 previous = previous + 1
             }
+            val directAlias = bootstrapLlvmExportCanAliasDirect(
+                request,
+                program.functions[source],
+                source < initializationRequired.size &&
+                    initializationRequired[source]
+            )
             if (nakedAlias >= 0 && !request.internal) {
                 val aliasee = LLVMGetNamedFunction(
                     backend.module, exports[nakedAlias].name
@@ -648,6 +681,24 @@ fun bootstrapLlvmEmitExports(
                     aliasee,
                     request.name
                 )
+            } else if (directAlias) {
+                val direct = LLVMGetNamedFunction(
+                    backend.module,
+                    bootstrapLlvmDirectFunctionSymbol(
+                        identities.symbols[source]
+                    )
+                )
+                val alias = LLVMAddAlias2(
+                    backend.module,
+                    LLVMGlobalGetValueType(direct),
+                    0,
+                    direct,
+                    request.name
+                )
+                if (request.internal) {
+                    LLVMSetLinkage(alias, llvmInternalLinkage())
+                    retained.append(alias)
+                }
             } else {
             val parameters = bootstrapLlvmExportParameterTypes(
                 backend, request, request.checked
@@ -700,7 +751,7 @@ fun bootstrapLlvmEmitExports(
                         bootstrapLlvmDirectFunctionSymbol(
                             identities.symbols[source]
                         )
-                    )
+                    ), program.functions[source]
                 )
             } else {
                 val boxed = bootstrapLlvmBoxExportArguments(

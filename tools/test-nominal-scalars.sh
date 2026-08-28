@@ -100,7 +100,7 @@ if grep -Eq '%(Pin|Nominal)' "$output_directory/nominal-scalar.ll"; then
     echo 'nominal scalar leaked a wrapper type into LLVM IR' >&2
     exit 1
 fi
-grep -Fq 'define i64 @nominal_pin_round_trip(i64' \
+grep -Eq '^@nominal_pin_round_trip = alias i64 \(i64\), ptr @abla_fn_.*_direct$' \
     "$output_directory/nominal-scalar.ll"
 if grep -Eq 'define void @nominal_pin_round_trip\(ptr sret' \
     "$output_directory/nominal-scalar.ll"; then
