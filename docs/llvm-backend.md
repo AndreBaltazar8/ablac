@@ -112,6 +112,16 @@ mixed integer/float state layouts. Each normalized signature retains its own
 intrinsic name and LLVM function type; no variadic or width-erasing fallback is
 used.
 
+Generated native surfaces can use the closed
+`ablaUnsafeCallExact_<Result>_<Argument>...` intrinsic grammar instead of
+adding every new layout to a compiler allowlist. Results are one of `Void`,
+`I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `I64`, `U64`, or `Address`; arguments
+are one of `Pointer`, `I8`, `I16`, `I32`, `I64`, `F32`, or `F64`, with at most
+32 arguments. The compiler validates every token, emits a non-variadic LLVM
+function type, performs explicit native-width truncation, and applies the
+declared result extension. This is an unsafe code-generation boundary, not a
+dynamic FFI: ordinary runtime strings cannot choose a signature.
+
 Unsafe pointer offsets lower through integer address arithmetic for every
 offset, including zero. This keeps boxed `AblaValue` storage out of native
 structure addressing and is covered by a zero-offset store regression.
