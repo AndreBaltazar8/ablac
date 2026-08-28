@@ -94,6 +94,18 @@ functions cannot call raw pointer intrinsics; checked buffers currently enforce
 bounds and closed state while affine ownership, borrowed views, and automatic
 drop insertion are completed.
 
+Trusted native dispatch includes exact void-call families for graphics ABIs:
+pure `i32` arguments through six lanes and a trailing pointer after as many as
+four `i32` lanes. The standard-library wrapper name, semantic allowlist, and
+LLVM signature classifier must agree exactly; callers cannot select a wider or
+shape-compatible approximation. Boundary tests call exported Abla functions by
+their dynamic addresses and verify native-width truncation plus pointer
+position.
+
+Unsafe pointer offsets lower through integer address arithmetic for every
+offset, including zero. This keeps boxed `AblaValue` storage out of native
+structure addressing and is covered by a zero-offset store regression.
+
 ## Typed inline assembly
 
 Target packages may declare a `trusted noescape extern:"inline-assembly"`
