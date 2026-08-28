@@ -19,6 +19,10 @@ mkdir -p "$output_directory"
     "$project_root/tests/cases/program-build/exported-scalar-only.ab" \
     --emit shared-library -o "$output_directory/libabla_scalar.so" \
     --fast --no-cache
+"$compiler" build \
+    "$project_root/tests/cases/program-build/export-initialization-slice.ab" \
+    --emit shared-library -o "$output_directory/libabla_init_slice.so" \
+    --fast --no-cache
 
 set +e
 "$output_directory/program-root"
@@ -57,6 +61,21 @@ if grep -q '^define .*@abla_runtime_set_arguments' \
     echo "export-only module retained the hosted argument setter" >&2
     exit 1
 fi
+if awk '
+    /^define .*@abla_guardless_add\(/ { inside = 1 }
+    inside && /@abla_export_ensure_initialized/ { found = 1 }
+    inside && /^}/ { exit found ? 0 : 1 }
+    END { if (!inside || !found) exit 1 }
+' "$output_directory/libabla_init_slice.so.ll"; then
+    echo "pure export retained an unrelated lazy-global guard" >&2
+    exit 1
+fi
+awk '
+    /^define .*@abla_guarded_value\(/ { inside = 1 }
+    inside && /@abla_export_ensure_initialized/ { found = 1 }
+    inside && /^}/ { exit found ? 0 : 1 }
+    END { if (!inside || !found) exit 1 }
+' "$output_directory/libabla_init_slice.so.ll"
 clang "$project_root/tests/cases/program-build/export-scalar-caller.c" \
     -L"$output_directory" -Wl,-rpath,"$output_directory" -labla_scalar \
     -o "$output_directory/export-scalar-caller"

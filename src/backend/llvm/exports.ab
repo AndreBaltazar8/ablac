@@ -240,11 +240,87 @@ fun bootstrapLlvmDeclareNativeFunctionAdapters(
     return
 }
 
+fun bootstrapLlvmGlobalNeedsRuntimeInitialization(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    name: string
+): bool = pointerIsNull(
+    if (backend.constantScalarVarInitializers) {
+        bootstrapLlvmScalarGlobalInitializer(backend, program, name)
+    } else bootstrapLlvmScalarGlobalConstant(backend, program, name)
+)
+
+// Export initialization is a property of the reachable function path, not of
+// the whole linked Abla program. A pure firmware ABI entry should not pay a
+// lazy-global guard because some unrelated application module owns state.
+// Indirect calls remain conservative; direct calls and captured function
+// references propagate the requirement to their callers.
+fun bootstrapLlvmExportInitializationRequirements(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    functionIndex: BootstrapLlvmNameIndex
+): array<bool> {
+    val required: array<bool> = []
+    var function = 0
+    while (function < program.functions.size) {
+        var needsInitialization = false
+        var instruction = 0
+        while (instruction <
+               program.functions[function].instructions.size) {
+            val candidate =
+                program.functions[function].instructions[instruction]
+            if ((candidate.opcode == "global.load" ||
+                 candidate.opcode == "global.assign" ||
+                 candidate.opcode == "global.store") &&
+                bootstrapLlvmGlobalNeedsRuntimeInitialization(
+                    backend, program, candidate.text
+                )) needsInitialization = true
+            if (candidate.opcode == "call.indirect" ||
+                candidate.opcode == "call.indirect.once") {
+                needsInitialization = true
+            }
+            instruction = instruction + 1
+        }
+        required.append(needsInitialization)
+        function = function + 1
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        function = 0
+        while (function < program.functions.size) {
+            if (!required[function]) {
+                var instruction = 0
+                while (instruction <
+                       program.functions[function].instructions.size) {
+                    val candidate =
+                        program.functions[function].instructions[instruction]
+                    if (candidate.opcode == "call" ||
+                        candidate.opcode == "function.ref" ||
+                        candidate.opcode == "closure.create" ||
+                        candidate.opcode == "native.function.address") {
+                        val target = functionIndex.find(candidate.text)
+                        if (target >= 0 && target < required.size &&
+                            required[target]) {
+                            required[function] = true
+                            changed = true
+                        }
+                    }
+                    instruction = instruction + 1
+                }
+            }
+            function = function + 1
+        }
+    }
+    required
+}
+
 fun bootstrapLlvmEmitNativeFunctionAdapters(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
     roots: array<bool>,
-    identities: BootstrapLlvmFunctionIdentities
+    identities: BootstrapLlvmFunctionIdentities,
+    initializationRequired: array<bool>
 ): void {
     var index = 0
     while (index < program.functions.size) {
@@ -262,7 +338,9 @@ fun bootstrapLlvmEmitNativeFunctionAdapters(
                 backend.context, adapter, "entry"
             )
             LLVMPositionBuilderAtEnd(backend.builder, entry)
-            if (!pointerIsNull(LLVMGetNamedFunction(
+            if (index < initializationRequired.size &&
+                initializationRequired[index] &&
+                !pointerIsNull(LLVMGetNamedFunction(
                 backend.module, "abla_export_ensure_initialized"
             ))) bootstrapLlvmCallNamed(
                 backend, "abla_export_ensure_initialized", [],
@@ -532,7 +610,8 @@ fun bootstrapLlvmEmitExports(
     program: BootstrapIrProgram,
     exports: array<BootstrapExportRequest>,
     functionIndex: BootstrapLlvmNameIndex,
-    identities: BootstrapLlvmFunctionIdentities
+    identities: BootstrapLlvmFunctionIdentities,
+    initializationRequired: array<bool>
 ): int {
     var errors = 0
     if (exports.size > 0) bootstrapLlvmEmitExportInitializer(
@@ -599,7 +678,9 @@ fun bootstrapLlvmEmitExports(
                     program.functions[source].instructions[nakedAssembly]
                 )
             } else {
-            if (!pointerIsNull(LLVMGetNamedFunction(
+            if (source < initializationRequired.size &&
+                initializationRequired[source] &&
+                !pointerIsNull(LLVMGetNamedFunction(
                 backend.module, "abla_export_ensure_initialized"
             ))) bootstrapLlvmCallNamed(
                 backend, "abla_export_ensure_initialized", [],
