@@ -537,6 +537,9 @@ fun bootstrapLlvmUnboxScalar(
             backend.builder, result, backend.type(scalar), "$name.narrow"
         )
     }
+    if (scalar == "ptr") result = LLVMBuildIntToPtr(
+        backend.builder, result, backend.pointerType, "$name.pointer"
+    )
     result
 }
 
@@ -593,6 +596,9 @@ fun bootstrapLlvmBoxScalar(
             backend, native, scalar, "i64", "scalar.box"
         )
     }
+    if (scalar == "ptr") stored = LLVMBuildPtrToInt(
+        backend.builder, native, backend.i64Type, "scalar.pointer.address"
+    )
     bootstrapLlvmCallNamed(
         backend,
         if (scalar == "bool") "abla_bool" else "abla_i64",
@@ -1217,6 +1223,9 @@ fun bootstrapLlvmNativeArgument(
             backend, "abla_as_cstring", [storage.values[value]],
             "native.cstring", false, [true]
         )
+    } else if (bootstrapLlvmIsPointerType(type) && scalarType == "ptr" &&
+        !pointerIsNull(scalar)) {
+        result = scalar
     } else {
         val integer = if (!pointerIsNull(scalar)) scalar
             else bootstrapLlvmCallNamed(
@@ -1249,7 +1258,7 @@ fun bootstrapLlvmNativeArgument(
 
 fun bootstrapLlvmStoreNativeResult(
     backend: BootstrapLlvmBackend,
-    storage: BootstrapLlvmFunctionStorage,
+    var storage: BootstrapLlvmFunctionStorage,
     output: int,
     value: i64*,
     type: string
@@ -1284,13 +1293,18 @@ fun bootstrapLlvmStoreNativeResult(
         )
     }
     if (bootstrapLlvmIsPointerType(type)) {
-        val integer = LLVMBuildPtrToInt(
-            backend.builder, value, backend.i64Type, "native.address"
-        )
-        bootstrapLlvmCallNamed(
-            backend, "abla_i64", [storage.values[output], integer],
-            "", true, [false, false]
-        )
+        if (output >= 0 && output < storage.valueTypes.size &&
+            storage.valueTypes[output] == "ptr") {
+            bootstrapLlvmSetNativeValue(backend, storage, output, value)
+        } else {
+            val integer = LLVMBuildPtrToInt(
+                backend.builder, value, backend.i64Type, "native.address"
+            )
+            bootstrapLlvmCallNamed(
+                backend, "abla_i64", [storage.values[output], integer],
+                "", true, [false, false]
+            )
+        }
     }
     if (type == "f32" || type == "f64") {
         bootstrapLlvmBoxScalar(
@@ -1461,12 +1475,35 @@ fun bootstrapLlvmCoreIntrinsicInteger(
             backend.builder, result, backend.i64Type,
             "runtime.intrinsic.integer"
         )
+        if (type == "ptr") result = LLVMBuildPtrToInt(
+            backend.builder, result, backend.i64Type,
+            "runtime.intrinsic.pointer.address"
+        )
     }
     if (pointerIsNull(result)) result = bootstrapLlvmCallNamed(
         backend, "abla_as_i64", [storage.values[value]],
         "runtime.intrinsic.integer", false, [true]
     )
     result
+}
+
+fun bootstrapLlvmStorePointerIntrinsic(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    result: int,
+    pointer: i64*
+): void {
+    if (result >= 0 && result < storage.valueTypes.size &&
+        storage.valueTypes[result] == "ptr") {
+        bootstrapLlvmSetNativeValue(backend, storage, result, pointer)
+    } else bootstrapLlvmStoreTaggedWordValue(
+        backend, storage.values[result], 2,
+        LLVMBuildPtrToInt(
+            backend.builder, pointer, backend.i64Type,
+            "pointer.intrinsic.address"
+        )
+    )
+    return
 }
 
 fun bootstrapLlvmInitializeVoidValue(
@@ -2119,12 +2156,17 @@ fun bootstrapLlvmEmitCoreIntrinsic(
     }
     if (name == "ablaRuntimePointerFromAddress") {
         if (instruction.operands.size != 1) supported = false
-        if (instruction.operands.size == 1) bootstrapLlvmStoreTaggedWordValue(
-            backend, storage.values[instruction.result], 2,
-            bootstrapLlvmCoreIntrinsicInteger(
-                backend, storage, instruction.operands[0]
+        if (instruction.operands.size == 1) {
+            bootstrapLlvmStorePointerIntrinsic(
+                backend, storage, instruction.result,
+                LLVMBuildIntToPtr(
+                    backend.builder,
+                    bootstrapLlvmCoreIntrinsicInteger(
+                        backend, storage, instruction.operands[0]
+                    ), backend.pointerType, "runtime.pointer"
+                )
             )
-        )
+        }
     }
     if (name == "nativeStackAllocate") {
         if (instruction.operands.size != 1) supported = false
@@ -2591,13 +2633,9 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 name == "ablaUnsafeLoadU32") loaded = LLVMBuildZExt(
                 backend.builder, loaded, backend.i64Type, "unsafe.load.u8"
             )
-            if (name == "ablaUnsafeLoadPointer") loaded = LLVMBuildPtrToInt(
-                backend.builder, loaded, backend.i64Type,
-                "unsafe.load.pointer.address"
-            )
             if (name == "ablaUnsafeLoadPointer") {
-                bootstrapLlvmStoreTaggedWordValue(
-                    backend, storage.values[instruction.result], 2, loaded
+                bootstrapLlvmStorePointerIntrinsic(
+                    backend, storage, instruction.result, loaded
                 )
             } else bootstrapLlvmSetNativeValue(
                 backend, storage, instruction.result, loaded
@@ -2808,10 +2846,12 @@ fun bootstrapLlvmEmitCoreIntrinsic(
     }
     if (name == "ablaUnsafeNullPointer") {
         if (instruction.operands.size != 0) supported = false
-        if (instruction.operands.size == 0) bootstrapLlvmStoreTaggedWordValue(
-            backend, storage.values[instruction.result], 2,
-            LLVMConstInt(backend.i64Type, 0, 0)
-        )
+        if (instruction.operands.size == 0) {
+            bootstrapLlvmStorePointerIntrinsic(
+                backend, storage, instruction.result,
+                LLVMConstNull(backend.pointerType)
+            )
+        }
     }
     if (name == "ablaUnsafePointerIsNull") {
         if (instruction.operands.size != 1) supported = false
@@ -2833,22 +2873,51 @@ fun bootstrapLlvmEmitCoreIntrinsic(
         val expected = if (name == "ablaUnsafePointerOffset") 2 else 1
         if (instruction.operands.size != expected) supported = false
         if (instruction.operands.size == expected) {
-            var address = bootstrapLlvmCoreIntrinsicInteger(
-                backend, storage, instruction.operands[0]
-            )
-            if (expected == 2) address = LLVMBuildAdd(
-                backend.builder, address,
-                bootstrapLlvmCoreIntrinsicInteger(
-                    backend, storage, instruction.operands[1]
-                ), "unsafe.pointer.offset"
-            )
-            if (name == "ablaUnsafePointerAddress") {
+            val input = instruction.operands[0]
+            var directPointer = nativeNullPointer()
+            if (input >= 0 && input < storage.valueTypes.size &&
+                storage.valueTypes[input] == "ptr") {
+                directPointer = storage.values[input]
+            }
+            if (name == "ablaUnsafePointerOffset" &&
+                !pointerIsNull(directPointer)) {
+                val indices = llvmPointerVector(1)
+                indices.set(
+                    0,
+                    bootstrapLlvmCoreIntrinsicInteger(
+                        backend, storage, instruction.operands[1]
+                    )
+                )
+                val offset = LLVMBuildGEP2(
+                    backend.builder, backend.i8Type, directPointer,
+                    indices.pointer(), 1, "unsafe.pointer.offset"
+                )
+                indices.drop()
+                bootstrapLlvmStorePointerIntrinsic(
+                    backend, storage, instruction.result, offset
+                )
+            } else {
+                var address = bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, input
+                )
+                if (expected == 2) address = LLVMBuildAdd(
+                    backend.builder, address,
+                    bootstrapLlvmCoreIntrinsicInteger(
+                        backend, storage, instruction.operands[1]
+                    ), "unsafe.pointer.offset"
+                )
+                if (name == "ablaUnsafePointerAddress") {
                 bootstrapLlvmSetNativeValue(
                     backend, storage, instruction.result, address
                 )
-            } else bootstrapLlvmStoreTaggedWordValue(
-                backend, storage.values[instruction.result], 2, address
-            )
+                } else bootstrapLlvmStorePointerIntrinsic(
+                    backend, storage, instruction.result,
+                    LLVMBuildIntToPtr(
+                        backend.builder, address, backend.pointerType,
+                        "unsafe.pointer.offset.value"
+                    )
+                )
+            }
         }
     }
     if (name == "ablaUnsafeCStringAddress" ||
@@ -4431,12 +4500,8 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                     backend.module, "abla_runtime_environment_vector"
                 ), "runtime.environment.vector"
             )
-            bootstrapLlvmStoreTaggedWordValue(
-                backend, storage.values[instruction.result], 2,
-                LLVMBuildPtrToInt(
-                    backend.builder, environment, backend.i64Type,
-                    "runtime.environment.address"
-                )
+            bootstrapLlvmStorePointerIntrinsic(
+                backend, storage, instruction.result, environment
             )
         }
     }
