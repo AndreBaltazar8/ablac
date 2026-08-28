@@ -98,11 +98,13 @@ Trusted native dispatch includes exact void-call families for graphics ABIs:
 pure `i32` arguments through six lanes and a trailing pointer after as many as
 four `i32` lanes. Pure `f32` arguments and one- or two-`i32` prefixes cover up
 to four float lanes; public wrappers take ordinary Abla `f64` values and the
-intrinsic performs the explicit native `f32` truncation. The standard-library
-wrapper name, semantic allowlist, and LLVM signature classifier must agree
-exactly; callers cannot select a wider or shape-compatible approximation.
-Boundary tests call exported Abla functions by their dynamic addresses and
-verify native-width truncation plus argument position.
+intrinsic performs the explicit native `f32` truncation. Matching `f64`
+families pass one through four double lanes without truncation. The
+standard-library wrapper name, semantic allowlist, and LLVM signature
+classifier must agree exactly; callers cannot select a wider or
+shape-compatible approximation. Boundary tests call exported Abla functions
+by their dynamic addresses and verify native-width truncation plus argument
+position.
 
 Unsafe pointer offsets lower through integer address arithmetic for every
 offset, including zero. This keeps boxed `AblaValue` storage out of native
