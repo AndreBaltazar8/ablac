@@ -106,6 +106,12 @@ shape-compatible approximation. Boundary tests call exported Abla functions
 by their dynamic addresses and verify native-width truncation plus argument
 position.
 
+The wider OpenGL registry batch extends that same exact lowering through eleven
+`i32` lanes, trailing and grouped pointers, 64-bit offset/size arguments, and
+mixed integer/float state layouts. Each normalized signature retains its own
+intrinsic name and LLVM function type; no variadic or width-erasing fallback is
+used.
+
 Unsafe pointer offsets lower through integer address arithmetic for every
 offset, including zero. This keeps boxed `AblaValue` storage out of native
 structure addressing and is covered by a zero-offset store regression.
