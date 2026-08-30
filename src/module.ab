@@ -431,8 +431,97 @@ class BootstrapModuleFrontendSnapshot(
     val parsed: BootstrapParseResult
 )
 
+class BootstrapNamedTargetIndex(
+    val names: array<string>,
+    var values: array<int>,
+    val slots: array<int>
+) {
+    fun find(name: string): int {
+        var result = -1
+        if (this.slots.size > 0) {
+            var slot = bootstrapNamedTargetHash(name)
+            slot = slot - slot / this.slots.size * this.slots.size
+            var probes = 0
+            while (result == -1 && probes < this.slots.size &&
+                   this.slots[slot] >= 0) {
+                val entry = this.slots[slot]
+                if (this.names[entry] == name) {
+                    result = this.values[entry]
+                } else {
+                    slot = slot + 1
+                    if (slot == this.slots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapNamedTargetHash(name: string): int {
+    var hash = 0
+    var index = 0
+    while (index < name.size) {
+        hash = hash * 131 + name[index]
+        hash = hash - hash / 2147483647 * 2147483647
+        index = index + 1
+    }
+    hash
+}
+
+fun bootstrapNamedTargetIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapNamedTargetIndex {
+    val names: array<string> = []
+    val values: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.extensionOwner == "" &&
+            (candidate.kind == "fun" ||
+             candidate.kind == "compile.fun" ||
+             candidate.kind == "class")) {
+            names.append(candidate.name)
+            values.append(declaration)
+        }
+        declaration = declaration + 1
+    }
+    var capacity = 8
+    while (capacity < names.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    var entry = 0
+    while (entry < names.size) {
+        slot = bootstrapNamedTargetHash(names[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0) {
+                slots[slot] = entry
+                placed = true
+            } else if (names[existing] == names[entry]) {
+                // Preserve the normalizer's existing ambiguity result without
+                // retaining or rescanning a list of duplicate declarations.
+                values[existing] = -2
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    BootstrapNamedTargetIndex(names, values, slots)
+}
+
 class BootstrapNamedArgumentNormalizer(
     val declarations: array<BootstrapDeclaration>,
+    val targets: BootstrapNamedTargetIndex,
     var errors: int,
     var diagnostics: string
 ) {
@@ -444,22 +533,7 @@ class BootstrapNamedArgumentNormalizer(
             "${this.diagnostics}source[named-argument]:${expression.begin}:${expression.end}\n"
     }
 
-    fun target(name: string): int {
-        var result = -1
-        var index = 0
-        while (index < this.declarations.size) {
-            val declaration = this.declarations[index]
-            if (declaration.name == name && declaration.extensionOwner == "" &&
-                (declaration.kind == "fun" ||
-                 declaration.kind == "compile.fun" ||
-                 declaration.kind == "class")) {
-                if (result < 0) result = index
-                else result = -2
-            }
-            index = index + 1
-        }
-        result
-    }
+    fun target(name: string): int = this.targets.find(name)
 
     fun extensionTarget(
         name: string,
@@ -771,7 +845,10 @@ fun bootstrapNormalizeNamedArguments(
     parsed: BootstrapParseResult
 ): BootstrapParseResult {
     var normalizer = BootstrapNamedArgumentNormalizer(
-        parsed.declarations, 0, ""
+        parsed.declarations,
+        bootstrapNamedTargetIndex(parsed.declarations),
+        0,
+        ""
     )
     val declarations: array<BootstrapDeclaration> = []
     var declaration = 0

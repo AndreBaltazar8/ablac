@@ -5603,8 +5603,67 @@ class BootstrapAnalyzer(
         "bool"
     }
 
+    fun scalarBinaryExpression(expression: BootstrapExpression): bool =
+        expression.kind == "+" || expression.kind == "-" ||
+        expression.kind == "*" || expression.kind == "/" ||
+        expression.kind == "&" || expression.kind == "|" ||
+        expression.kind == "^" || expression.kind == "<<" ||
+        expression.kind == ">>" || expression.kind == ">>>"
+
+    // Reconstructed low-level sources naturally contain long address and mask
+    // expressions. Re-entering infer() for every binary node also re-enters
+    // its complete semantic implementation and, in the self-hosted compiler,
+    // reserves that large function's stack frame at every level. Walk binary
+    // subtrees through this focused helper instead. Expression grouping and
+    // per-node typed records remain identical, while only non-binary leaves
+    // enter the general inference function.
+    fun inferScalarBinaryExpression(
+        expression: BootstrapExpression
+    ): string {
+        this.validateHygiene(expression)
+        if (expression.children.size != 2) {
+            this.fail("binary.arity")
+            return "unknown"
+        }
+        val leftExpression = expression.children[0]
+        val rightExpression = expression.children[1]
+        val rawLeft = if (this.scalarBinaryExpression(leftExpression))
+            this.inferScalarBinaryExpression(leftExpression)
+        else this.infer(leftExpression)
+        val rawRight = if (this.scalarBinaryExpression(rightExpression))
+            this.inferScalarBinaryExpression(rightExpression)
+        else this.infer(rightExpression)
+        val staticStringConcatenation = expression.kind == "+" &&
+            rawLeft == "string" && rawRight == "string" &&
+            bootstrapStaticString(expression).valid
+        val left = this.scalarValueType(rawLeft)
+        val right = this.scalarValueType(rawRight)
+        val arithmetic = expression.kind == "+" ||
+            expression.kind == "-" || expression.kind == "*" ||
+            expression.kind == "/"
+        var result = "unknown"
+        if (staticStringConcatenation) {
+            result = "string"
+        } else if (arithmetic) {
+            if (left != right || !bootstrapIsNumericScalarType(left)) {
+                this.fail("arithmetic.type")
+            }
+            result = left
+        } else {
+            if (left != right || !bootstrapIsIntegerScalarType(left)) {
+                this.fail("bitwise.type")
+            }
+            result = left
+        }
+        this.recordTypedExpression(expression, result)
+        result
+    }
+
     fun infer(expression: BootstrapExpression): string {
         this.validateHygiene(expression)
+        if (this.scalarBinaryExpression(expression)) {
+            return this.inferScalarBinaryExpression(expression)
+        }
         var result = "unknown"
         if (expression.kind == "integer") result = "i64"
         if (expression.kind == "float") {
@@ -7203,37 +7262,6 @@ class BootstrapAnalyzer(
                 this.fail("when.non-exhaustive:$subject")
             }
             result = branchType
-        }
-        if (
-            expression.kind == "+" || expression.kind == "-" ||
-            expression.kind == "*" || expression.kind == "/" ||
-            expression.kind == "&" || expression.kind == "|" ||
-            expression.kind == "^" || expression.kind == "<<" ||
-            expression.kind == ">>" || expression.kind == ">>>"
-        ) {
-            val rawLeft = this.infer(expression.children[0])
-            val rawRight = this.infer(expression.children[1])
-            val staticStringConcatenation = expression.kind == "+" &&
-                rawLeft == "string" && rawRight == "string" &&
-                bootstrapStaticString(expression).valid
-            val left = this.scalarValueType(rawLeft)
-            val right = this.scalarValueType(rawRight)
-            val arithmetic = expression.kind == "+" ||
-                expression.kind == "-" || expression.kind == "*" ||
-                expression.kind == "/"
-            if (staticStringConcatenation) {
-                result = "string"
-            } else if (arithmetic) {
-                if (left != right || !bootstrapIsNumericScalarType(left)) {
-                    this.fail("arithmetic.type")
-                }
-                result = left
-            } else {
-                if (left != right || !bootstrapIsIntegerScalarType(left)) {
-                    this.fail("bitwise.type")
-                }
-                result = left
-            }
         }
         if (
             expression.kind == "==" || expression.kind == "!=" ||
