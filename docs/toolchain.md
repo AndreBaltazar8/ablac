@@ -58,6 +58,10 @@ any object triple implemented by the installed LLVM and emit an `object` or
 The same generic contract is available directly from the CLI with
 `--target-triple <triple> --object-format <format>`; it defaults to an object
 artifact and deliberately cannot request an executable or shared library.
+An object or static library does not require a hosted `main`; freestanding
+startup code and interrupt vectors may provide their own roots and entry
+symbols. A hosted executable continues to require `main` unless it publishes a
+supported foreign entry adapter.
 Executables, shared libraries, and modules require an explicit supported
 runtime/linker contract; a target descriptor cannot silently imply a host ABI,
 startup sequence, sysroot, or platform linker.

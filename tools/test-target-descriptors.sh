@@ -48,6 +48,15 @@ grep -q 'RISC-V' "$directory/raw-riscv64.header"
 grep -q '"llvmTriple":"riscv64-unknown-elf"' \
     "$directory/raw-riscv64.o.abi.json"
 
+"$compiler" build \
+    "$project_root/tests/cases/target-descriptors/freestanding-object.ab" \
+    --fast --no-cache \
+    --target-triple riscv64-unknown-elf --object-format elf \
+    -o "$directory/freestanding-riscv64.o"
+llvm-nm "$directory/freestanding-riscv64.o" \
+    > "$directory/freestanding-riscv64.symbols"
+grep -q ' T firmware_entry$' "$directory/freestanding-riscv64.symbols"
+
 set +e
 "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
     --fast --no-cache \
@@ -63,4 +72,4 @@ grep -q 'emits only object or static-library artifacts' \
 [[ ! -e "$directory/raw-executable" ]]
 
 printf '%s\n' \
-    'target descriptors: hosted, extension-defined and raw LLVM objects, and deterministic unsupported-target diagnostics passed'
+    'target descriptors: hosted, freestanding, extension-defined and raw LLVM objects, and deterministic unsupported-target diagnostics passed'
