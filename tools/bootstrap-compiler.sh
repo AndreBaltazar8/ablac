@@ -13,11 +13,11 @@ case "$platform/$machine" in
         ;;
     Darwin/x86_64)
         artifact=ablac-x86_64-macos
-        platform_sha256=76b6711e6251d6f07ea4b80f7a95cefe232702cbcbffc868a52bff4c7e0c022f
+        platform_sha256=e31de4e1e6847c71e8247c88e4d06ff48e6aeb4cddab7e7f56ed5cd56dcb5b7f
         ;;
     Darwin/arm64)
         artifact=ablac-arm64-macos
-        platform_sha256=5a77adf12e95a9d2d3e7d9095b75675b64ac802dc4442877ba31debc28da66c6
+        platform_sha256=70d7951ed8ffe76129aa33f003517ab885e4a64ba7c3e2a203809666bcb77fc1
         ;;
     *)
         printf 'unsupported bootstrap host: %s/%s\n' "$platform" "$machine" >&2
