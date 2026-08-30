@@ -73,7 +73,7 @@ steps:
   - uses: actions/checkout@v6
   - uses: AndreBaltazar8/setup-abla@v1
     with:
-      version: '0.2.10'
+      version: '0.2.11'
   - run: ablac build app.ab -o build/app
 ```
 
@@ -102,7 +102,7 @@ The macOS host supports Intel and Apple Silicon. `make` downloads the pinned
 bootstrap compiler, rebuilds the current Abla sources as a native Mach-O
 executable for LLVM's detected host triple, and uses Homebrew LLVM for native
 object emission and ORC execution. Each host uses its native compiler artifact
-published with `v0.2.4`; no Intel translation is involved on Apple Silicon.
+published with `v0.2.10`; no Intel translation is involved on Apple Silicon.
 Run `tools/test-macos-host.sh build/ablac` for the focused native host gate.
 
 Linux can also emit and link both macOS architectures. Point
@@ -156,7 +156,7 @@ make clean         # remove generated files
 ```
 
 On an empty build directory, `make` downloads the checksum-pinned native
-compiler for the host from `v0.2.4`, then immediately recompiles the current
+compiler for the host from `v0.2.10`, then immediately recompiles the current
 `src/` graph.
 No C++ compiler implementation or generated-C bootstrap is involved.
 

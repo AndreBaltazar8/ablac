@@ -7,6 +7,15 @@ on:
         description: Existing release tag
         required: true
         type: string
+      bridge_release:
+        description: Optional draft release containing checksum-pinned bridge artifacts
+        required: false
+        type: string
+      publish_release:
+        description: Publish after building and validating artifacts
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -43,9 +52,45 @@ jobs:
           brew install llvm@21 lld@21 openssl@3
           echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix lld@21)/bin" >> "$GITHUB_PATH"
-      - name: Build the tagged compiler from the pinned bootstrap
+      - name: Prepare the bootstrap compiler
+        env:
+          BRIDGE_RELEASE: ${{ inputs.bridge_release }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          tools/bootstrap-compiler.sh build/bootstrap-ablac
+          if [[ -z "$BRIDGE_RELEASE" ]]; then
+            tools/bootstrap-compiler.sh build/bootstrap-ablac
+          else
+            mkdir -p build/bridge
+            if [[ "${{ matrix.platform }}" == linux ]]; then
+              bridge=ablac-x86_64-linux.bridge
+              gh release download "$BRIDGE_RELEASE" \
+                --pattern "$bridge" --pattern "$bridge.sha256" \
+                --dir build/bridge
+              (cd build/bridge && sha256sum --check "$bridge.sha256")
+              cp "build/bridge/$bridge" build/bootstrap-ablac
+            else
+              bridge=${{ matrix.asset }}.o
+              gh release download "$BRIDGE_RELEASE" \
+                --pattern "$bridge" --pattern "$bridge.sha256" \
+                --dir build/bridge
+              (cd build/bridge && shasum -a 256 --check "$bridge.sha256")
+              llvm_prefix=$(brew --prefix llvm@21)
+              openssl_prefix=$(brew --prefix openssl@3)
+              tools/macos-clang.sh -O2 -c runtime/abla_darwin_compat.c \
+                -o build/bridge/abla-darwin-compat.o
+              tools/macos-clang.sh -pthread -Wl,-dead_strip \
+                "build/bridge/$bridge" build/bridge/abla-darwin-compat.o \
+                -L"$llvm_prefix/lib" -Wl,-rpath,"$llvm_prefix/lib" -lLLVM \
+                -L"$openssl_prefix/lib" -Wl,-rpath,"$openssl_prefix/lib" \
+                -lssl -lcrypto -o build/bootstrap-ablac
+            fi
+            chmod +x build/bootstrap-ablac
+            test "$(build/bootstrap-ablac --version)" = \
+              "ablac ${RELEASE_TAG#v}"
+          fi
+      - name: Build the tagged compiler from the prepared bootstrap
+        run: |
           tools/build-self-hosted-current.sh \
             build/bootstrap-ablac build/release/${{ matrix.asset }}
       - name: Verify and checksum
@@ -128,6 +173,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: ${{ inputs.publish_release }}
     needs: compiler
     runs-on: ubuntu-24.04
     permissions:
@@ -147,7 +193,24 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
-          gh release create "$RELEASE_TAG" release/* \
-            --verify-tag \
-            --generate-notes \
-            --title "Abla ${RELEASE_TAG#v}"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+            for bridge in \
+              ablac-x86_64-linux.bridge \
+              ablac-x86_64-linux.bridge.sha256 \
+              ablac-x86_64-macos.o \
+              ablac-x86_64-macos.o.sha256 \
+              ablac-arm64-macos.o \
+              ablac-arm64-macos.o.sha256
+            do
+              gh release delete-asset "$RELEASE_TAG" "$bridge" --yes \
+                >/dev/null 2>&1 || true
+            done
+            gh release edit "$RELEASE_TAG" --draft=false --latest \
+              --verify-tag --title "Abla ${RELEASE_TAG#v}"
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Abla ${RELEASE_TAG#v}"
+          fi
