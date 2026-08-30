@@ -662,9 +662,12 @@ division and ordered comparisons use the type's signedness. `&`, `|`, `^`, and
 `~` operate on every bit in that width. `<<` shifts left, `>>` is arithmetic for
 signed types and logical for unsigned types, and `>>>` is always logical. A
 negative signed shift count or a count greater than or equal to the type width
-produces zero. Both operands must have the same integer type; use an explicit
-primitive conversion when widths differ. Prefix `^binding` remains the delegate
-projection; between two integer expressions, `^` is XOR.
+produces zero. Arithmetic and `&`, `|`, and `^` operands must have the same
+integer type. A shift count may use any integer type and is converted to the
+shifted value's width before the range check, so `i32(value) >> 24` does not
+need a redundant `i32(24)`. Use an explicit primitive conversion for other
+mixed-width operations. Prefix `^binding` remains the delegate projection;
+between two integer expressions, `^` is XOR.
 
 `if` and `when` are expressions when all paths yield compatible values:
 

@@ -1315,7 +1315,8 @@ fun bootstrapScalarTypeUnderlyingValid(type: string): bool =
     type == "i8" || type == "u8" ||
     type == "i16" || type == "u16" ||
     type == "i32" || type == "u32" ||
-    type == "i64" || type == "u64" || type == "f64"
+    type == "i64" || type == "u64" ||
+    type == "f32" || type == "f64"
 
 fun bootstrapIsIntegerScalarType(type: string): bool {
     val normalized = bootstrapNormalizeType(type)
@@ -1327,6 +1328,7 @@ fun bootstrapIsIntegerScalarType(type: string): bool {
 
 fun bootstrapIsNumericScalarType(type: string): bool =
     bootstrapIsIntegerScalarType(type) ||
+    bootstrapNormalizeType(type) == "f32" ||
     bootstrapNormalizeType(type) == "f64"
 
 fun bootstrapScalarConversionCompatible(
@@ -3646,6 +3648,20 @@ class BootstrapAnalyzer(
         bootstrapSemanticUnit()
     }
 
+    // Keep location-rich scalar diagnostics out of the recursive inference
+    // frame. Recovered low-level modules can contain very deep expression
+    // trees, so building the diagnostic only on the failing edge avoids
+    // increasing the normal-path stack and allocation cost.
+    fun failScalarExpression(
+        code: string,
+        expression: BootstrapExpression,
+        left: string,
+        right: string
+    ): void {
+        this.fail("$code@${expression.begin}:$left:$right")
+        return
+    }
+
     fun contractModuleForFunction(name: string): string {
         var moduleIdentity = ""
         val index = this.functionDeclarations.find(name)
@@ -5805,17 +5821,25 @@ class BootstrapAnalyzer(
         val arithmetic = expression.kind == "+" ||
             expression.kind == "-" || expression.kind == "*" ||
             expression.kind == "/" || expression.kind == "%"
+        val shift = expression.kind == "<<" ||
+            expression.kind == ">>" || expression.kind == ">>>"
         var result = "unknown"
         if (staticStringConcatenation) {
             result = "string"
         } else if (arithmetic) {
             if (left != right || !bootstrapIsNumericScalarType(left)) {
-                this.fail("arithmetic.type")
+                this.failScalarExpression(
+                    "arithmetic.type", expression, left, right
+                )
             }
             result = left
         } else {
-            if (left != right || !bootstrapIsIntegerScalarType(left)) {
-                this.fail("bitwise.type")
+            if (!bootstrapIsIntegerScalarType(left) ||
+                (!shift && left != right) ||
+                (shift && !bootstrapIsIntegerScalarType(right))) {
+                this.failScalarExpression(
+                    "bitwise.type", expression, left, right
+                )
             }
             result = left
         }
@@ -7277,7 +7301,9 @@ class BootstrapAnalyzer(
         ) {
             result = this.scalarValueType(this.infer(expression.children[0]))
             if (!bootstrapIsNumericScalarType(result)) {
-                this.fail("unary.numeric")
+                this.failScalarExpression(
+                    "unary.numeric", expression, result, ""
+                )
             }
         }
         if (expression.kind == "unary!") {
