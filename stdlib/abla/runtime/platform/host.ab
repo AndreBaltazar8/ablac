@@ -1,3 +1,5 @@
+import "abla/unsafe/memory"
+
 trusted noescape extern:"c" fun malloc(size: int): i64*
 trusted noescape extern:"c" fun free(pointer: i64*): void
 trusted noescape extern:"c" fun write(
@@ -53,6 +55,7 @@ trusted fun __ablaRuntimePlatformMutexDestroy(address: int): void {
 // thread. Thread creation happens before the worker can run, so this one-time
 // transition does not add a synchronization branch to initialization.
 var __ablaRuntimeHostHeapMutex: int = 0
+var __ablaRuntimeHostActiveThreads: int = 0
 
 trusted fun __ablaRuntimePlatformThreadsEnable(): void {
     if (__ablaRuntimeHostHeapMutex == 0) {
@@ -79,18 +82,38 @@ trusted fun __ablaRuntimePlatformThreadCreate(
     handle: int,
     entry: int,
     argument: int
-): bool = pthread_create(
-    ablaRuntimePointerFromAddress(handle),
-    ablaRuntimePointerFromAddress(0),
-    ablaRuntimePointerFromAddress(entry),
-    ablaRuntimePointerFromAddress(argument)
-) == 0
+): bool {
+    val mutex = __ablaRuntimeHostHeapLock()
+    __ablaRuntimeHostActiveThreads = __ablaRuntimeHostActiveThreads + 1
+    __ablaRuntimeHostHeapUnlock(mutex)
+    val created = pthread_create(
+        ablaRuntimePointerFromAddress(handle),
+        ablaRuntimePointerFromAddress(0),
+        ablaRuntimePointerFromAddress(entry),
+        ablaRuntimePointerFromAddress(argument)
+    ) == 0
+    if (!created) {
+        val rollbackMutex = __ablaRuntimeHostHeapLock()
+        __ablaRuntimeHostActiveThreads =
+            __ablaRuntimeHostActiveThreads - 1
+        __ablaRuntimeHostHeapUnlock(rollbackMutex)
+    }
+    created
+}
 
-trusted fun __ablaRuntimePlatformThreadJoin(handle: int): bool =
-    pthread_join(
+trusted fun __ablaRuntimePlatformThreadJoin(handle: int): bool {
+    val joined = pthread_join(
         ablaRuntimeLoadI64(handle),
         ablaRuntimePointerFromAddress(0)
     ) == 0
+    if (joined) {
+        val mutex = __ablaRuntimeHostHeapLock()
+        if (__ablaRuntimeHostActiveThreads <= 0) ablaRuntimeTrap()
+        __ablaRuntimeHostActiveThreads = __ablaRuntimeHostActiveThreads - 1
+        __ablaRuntimeHostHeapUnlock(mutex)
+    }
+    joined
+}
 // Host allocations form an intrusive list. Checkpoints are list positions, so
 // a region or compiler phase can release its complete allocation suffix in
 // one bounded walk without involving the LLVM backend.
@@ -99,12 +122,10 @@ var __ablaRuntimeHostAllocationTail: int = 0
 var __ablaRuntimeHostAllocationCount: int = 0
 var __ablaRuntimeHostLiveBytes: int = 0
 var __ablaRuntimeHostLimit: int = 4611686018427387903
-var __ablaRuntimeHostRegion: int = 0
 var __ablaRuntimeHostRegionCache: int = 0
 var __ablaRuntimeHostRegionCacheCount: int = 0
 var __ablaRuntimeHostRegionPageCache: int = 0
 var __ablaRuntimeHostRegionPageCacheCount: int = 0
-var __ablaRuntimeHostRootFrame: int = 0
 var __ablaRuntimeHostCollectionEnabled: bool = false
 var __ablaRuntimeHostCollectionThreshold: int = 33554432
 var __ablaRuntimeHostCollectionIndex: int = 0
@@ -119,6 +140,38 @@ var __ablaRuntimeHostCollectionRanges: int = 0
 val __ablaRuntimeHostRegionCachedDescriptors: int = 64
 val __ablaRuntimeHostRegionPageBytes: int = 1048576
 val __ablaRuntimeHostRegionCachedPages: int = 32
+
+// Stack roots form a strict LIFO within one native thread. Sharing the head
+// between workers lets their push/pop sequences interleave and makes a valid
+// pop look corrupt. Resolve this address at each use so LLVM's local-exec TLS
+// model selects the calling thread's independent head cell.
+@inline
+trusted fun __ablaRuntimeHostRootFrameAddress(): int =
+    nativeThreadLocalBytes(
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    )
+
+@inline
+trusted fun __ablaRuntimeHostRootFrameLoad(): int =
+    ablaRuntimeLoadI64(__ablaRuntimeHostRootFrameAddress())
+
+@inline
+trusted fun __ablaRuntimeHostRootFrameStore(frame: int): void {
+    ablaRuntimeStoreI64(__ablaRuntimeHostRootFrameAddress(), frame)
+}
+
+@inline
+trusted fun __ablaRuntimeHostRegionAddress(): int =
+    __ablaRuntimeHostRootFrameAddress() + 8
+
+@inline
+trusted fun __ablaRuntimeHostRegionLoad(): int =
+    ablaRuntimeLoadI64(__ablaRuntimeHostRegionAddress())
+
+@inline
+trusted fun __ablaRuntimeHostRegionStore(regionAddress: int): void {
+    ablaRuntimeStoreI64(__ablaRuntimeHostRegionAddress(), regionAddress)
+}
 
 trusted fun __ablaRuntimeHostUnlink(header: int): void {
     val previous = ablaRuntimeLoadI64(header)
@@ -346,7 +399,8 @@ trusted fun __ablaRuntimeHostRegionAllocate(size: int): int {
     if (required < size || required > 4611686018427387888) {
         ablaRuntimeTrap()
     }
-    var page: int = ablaRuntimeLoadI64(__ablaRuntimeHostRegion + 8)
+    val regionState = __ablaRuntimeHostRegionLoad()
+    var page: int = ablaRuntimeLoadI64(regionState + 8)
     var offset: int = 0
     if (page != 0) {
         offset = (ablaRuntimeLoadI64(page + 16) + 15) & -16
@@ -355,9 +409,9 @@ trusted fun __ablaRuntimeHostRegionAllocate(size: int): int {
         required > ablaRuntimeLoadI64(page + 8) - offset) {
         page = __ablaRuntimeHostRegionPageAcquire(required + 15)
         ablaRuntimeStoreI64(
-            page, ablaRuntimeLoadI64(__ablaRuntimeHostRegion + 8)
+            page, ablaRuntimeLoadI64(regionState + 8)
         )
-        ablaRuntimeStoreI64(__ablaRuntimeHostRegion + 8, page)
+        ablaRuntimeStoreI64(regionState + 8, page)
         offset = 0
     }
     val header = page + 32 + offset
@@ -365,10 +419,10 @@ trusted fun __ablaRuntimeHostRegionAllocate(size: int): int {
     ablaRuntimeStoreI64(header, 0)
     ablaRuntimeStoreI64(header + 8, 0)
     ablaRuntimeStoreI64(header + 16, size)
-    ablaRuntimeStoreI64(header + 24, __ablaRuntimeHostRegion)
+    ablaRuntimeStoreI64(header + 24, regionState)
     ablaRuntimeStoreI64(
-        __ablaRuntimeHostRegion + 16,
-        ablaRuntimeLoadI64(__ablaRuntimeHostRegion + 16) + size
+        regionState + 16,
+        ablaRuntimeLoadI64(regionState + 16) + size
     )
     header + 32
 }
@@ -417,7 +471,7 @@ trusted fun __ablaRuntimePlatformAllocateLayout(
             __ablaRuntimeStringData("memory limit exceeded"), 21
         )
     }
-    val result = if (__ablaRuntimeHostRegion != 0) {
+    val result = if (__ablaRuntimeHostRegionLoad() != 0) {
         val result: int = __ablaRuntimeHostRegionAllocate(size)
         __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes + size
         result
@@ -551,7 +605,7 @@ trusted fun __ablaRuntimeHostMarkValue(value: int): void {
 }
 
 trusted fun __ablaRuntimeHostMarkRootValues(): void {
-    var frame: int = __ablaRuntimeHostRootFrame
+    var frame: int = __ablaRuntimeHostRootFrameLoad()
     while (frame != 0) {
         val roots = ablaRuntimeLoadI64(frame + 8)
         val count = ablaRuntimeLoadI64(frame + 16)
@@ -644,7 +698,8 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     // the persistent heap. Defer collection until the outermost region ends,
     // when compiler-published stack/global roots are sufficient.
     val mutex = __ablaRuntimeHostHeapLock()
-    if (__ablaRuntimeHostRegion != 0) {
+    if (__ablaRuntimeHostRegionLoad() != 0 ||
+        __ablaRuntimeHostActiveThreads != 0) {
         __ablaRuntimeHostHeapUnlock(mutex)
         return 0
     }
@@ -731,22 +786,22 @@ trusted fun __ablaRuntimeRootsPush(
     roots: int,
     count: int
 ): int {
-    ablaRuntimeStoreI64(frame, __ablaRuntimeHostRootFrame)
+    ablaRuntimeStoreI64(frame, __ablaRuntimeHostRootFrameLoad())
     ablaRuntimeStoreI64(frame + 8, roots)
     ablaRuntimeStoreI64(frame + 16, count)
-    __ablaRuntimeHostRootFrame = frame
+    __ablaRuntimeHostRootFrameStore(frame)
     0
 }
 
 trusted fun __ablaRuntimeRootsPop(frame: int): int {
-    if (__ablaRuntimeHostRootFrame != frame) ablaRuntimeTrap()
-    __ablaRuntimeHostRootFrame = ablaRuntimeLoadI64(frame)
+    if (__ablaRuntimeHostRootFrameLoad() != frame) ablaRuntimeTrap()
+    __ablaRuntimeHostRootFrameStore(ablaRuntimeLoadI64(frame))
     0
 }
 
 trusted fun __ablaRuntimeMemoryPressure(): int {
     if (!__ablaRuntimeHostCollectionEnabled ||
-        __ablaRuntimeHostRegion != 0 ||
+        __ablaRuntimeHostRegionLoad() != 0 ||
         __ablaRuntimeHostLiveBytes <
             __ablaRuntimeHostCollectionThreshold) return 0
     __ablaRuntimePlatformMemoryCollect()
@@ -766,6 +821,7 @@ trusted fun __ablaRuntimeMemoryPressure(): int {
 }
 
 trusted fun __ablaRuntimePlatformRegionBegin(): int {
+    val mutex = __ablaRuntimeHostHeapLock()
     var regionAddress: int = __ablaRuntimeHostRegionCache
     if (regionAddress != 0) {
         __ablaRuntimeHostRegionCache = ablaRuntimeLoadI64(regionAddress)
@@ -775,23 +831,25 @@ trusted fun __ablaRuntimePlatformRegionBegin(): int {
         regionAddress = ablaRuntimePointerAddress(malloc(24))
         if (regionAddress == 0) ablaRuntimeTrap()
     }
-    ablaRuntimeStoreI64(regionAddress, __ablaRuntimeHostRegion)
+    ablaRuntimeStoreI64(regionAddress, __ablaRuntimeHostRegionLoad())
     ablaRuntimeStoreI64(regionAddress + 8, 0)
     ablaRuntimeStoreI64(regionAddress + 16, 0)
-    __ablaRuntimeHostRegion = regionAddress
+    __ablaRuntimeHostRegionStore(regionAddress)
+    __ablaRuntimeHostHeapUnlock(mutex)
     regionAddress
 }
 
 trusted fun __ablaRuntimePlatformRegionEnd(regionAddress: int): void {
+    val mutex = __ablaRuntimeHostHeapLock()
     if (regionAddress == 0 ||
-        regionAddress != __ablaRuntimeHostRegion) ablaRuntimeTrap()
+        regionAddress != __ablaRuntimeHostRegionLoad()) ablaRuntimeTrap()
     val parent = ablaRuntimeLoadI64(regionAddress)
     val pages = ablaRuntimeLoadI64(regionAddress + 8)
     val live = ablaRuntimeLoadI64(regionAddress + 16)
     if (live < 0 || live > __ablaRuntimeHostLiveBytes) ablaRuntimeTrap()
     __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - live
     __ablaRuntimeHostRegionPagesRelease(pages)
-    __ablaRuntimeHostRegion = parent
+    __ablaRuntimeHostRegionStore(parent)
     if (__ablaRuntimeHostRegionCacheCount <
         __ablaRuntimeHostRegionCachedDescriptors) {
         ablaRuntimeStoreI64(regionAddress, __ablaRuntimeHostRegionCache)
@@ -799,21 +857,22 @@ trusted fun __ablaRuntimePlatformRegionEnd(regionAddress: int): void {
         __ablaRuntimeHostRegionCacheCount =
             __ablaRuntimeHostRegionCacheCount + 1
     } else free(ablaRuntimePointerFromAddress(regionAddress))
+    __ablaRuntimeHostHeapUnlock(mutex)
 }
 
 trusted fun __ablaRuntimePlatformRegionActive(): bool =
-    __ablaRuntimeHostRegion != 0
+    __ablaRuntimeHostRegionLoad() != 0
 
 // Return an equivalent allocation owned by the parent region. This is the
 // uncommon backpressure/lifetime boundary; ordinary request allocations stay
 // on the zero-malloc bump path.
 trusted fun __ablaRuntimePlatformPromoteAllocation(address: int): int {
-    if (__ablaRuntimeHostRegion == 0) return address
+    if (__ablaRuntimeHostRegionLoad() == 0) return address
     val size = ablaRuntimeLoadI64(address - 16)
-    val child = __ablaRuntimeHostRegion
-    __ablaRuntimeHostRegion = ablaRuntimeLoadI64(child)
+    val child = __ablaRuntimeHostRegionLoad()
+    __ablaRuntimeHostRegionStore(ablaRuntimeLoadI64(child))
     val promoted = __ablaRuntimePlatformAllocate(size)
-    __ablaRuntimeHostRegion = child
+    __ablaRuntimeHostRegionStore(child)
     var index: int = 0
     while (index < size) {
         ablaRuntimeStoreU8(

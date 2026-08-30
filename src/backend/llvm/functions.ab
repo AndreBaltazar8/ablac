@@ -99,7 +99,7 @@ fun bootstrapLlvmDeclareDirectFunction(
     // inside this module. Internal linkage lets LLVM remove imported runtime
     // and library implementations which are not reachable from the artifact.
     LLVMSetLinkage(declared, llvmInternalLinkage())
-    if (!function.naked &&
+    if (!function.naked && !function.noinlineHint &&
         (function.inlineHint || bootstrapLlvmMcuRuntimeInline(
             backend.targetTriple, function.name
         ))) {
@@ -109,6 +109,16 @@ fun bootstrapLlvmDeclareDirectFunction(
     }
     if (!function.naked && function.noinlineHint) {
         bootstrapLlvmAddFunctionAttribute(backend, declared, "noinline")
+    }
+    // ESP-IDF disables jump tables for Xtensa. Small embedded switches often
+    // otherwise gain a larger read-only dispatch table than the code they
+    // replace. Make this target policy automatic instead of requiring a
+    // source-level optimization annotation.
+    if (!function.naked &&
+        bootstrapTextContains(backend.targetTriple, "xtensa")) {
+        bootstrapLlvmAddStringFunctionAttribute(
+            backend, declared, "no-jump-tables", "true"
+        )
     }
     declared
 }
@@ -1414,6 +1424,7 @@ fun bootstrapLlvmEmitNativeCall(
 }
 
 fun bootstrapLlvmCoreIntrinsic(name: string): bool =
+    name == "ablaCountLeadingZerosU32" ||
     name == "ablaRuntimeValueAddress" ||
     name == "ablaRuntimeMakeValue" ||
     name == "ablaRuntimeLoadI32" ||
@@ -1427,6 +1438,10 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "ablaRuntimePointerFromAddress" ||
     name == "nativeStackAllocate" ||
     name == "nativeStaticAllocate" ||
+    name == "nativeLinkerSymbolAddress" ||
+    name == "nativeLinkedStaticAllocate" ||
+    name == "nativeLinkedThreadLocalAllocate" ||
+    name == "nativeThreadLocalBytes" ||
     name == "nativeXtensaCoreId" ||
     name == "nativeXtensaCycleCounter" ||
     name == "nativeXtensaDelayCycles" ||
@@ -1471,6 +1486,12 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "ablaBitF64ToI64" ||
     name == "ablaBitI64ToF64" ||
     name == "ablaConvertI64ToF64" ||
+    name == "ablaBitF32ToI32" ||
+    name == "ablaBitI32ToF32" ||
+    name == "ablaConvertU32ToF32" ||
+    name == "ablaConvertI32ToF32" ||
+    name == "ablaConvertF32ToU32" ||
+    name == "ablaConvertF32ToI32" ||
     name == "ablaHostIsMacOS" ||
     name == "ablaHostValueArgumentsIndirect" ||
     name == "ablaLinuxArgumentCount" ||
@@ -1508,6 +1529,22 @@ fun bootstrapLlvmCoreIntrinsicInteger(
         backend, "abla_as_i64", [storage.values[value]],
         "runtime.intrinsic.integer", false, [true]
     )
+    result
+}
+
+fun bootstrapLlvmCoreIntrinsicConstantString(
+    function: BootstrapIrFunction,
+    value: int
+): string {
+    var result = ""
+    var index = 0
+    while (result == "" && index < function.instructions.size) {
+        val candidate = function.instructions[index]
+        if (candidate.result == value && candidate.opcode == "const.string") {
+            result = candidate.text
+        }
+        index = index + 1
+    }
     result
 }
 
@@ -1627,18 +1664,126 @@ fun bootstrapLlvmNakedAssemblyIndex(
     if (valid) found else -2
 }
 
-fun bootstrapLlvmEmitNakedAssemblyBody(
+fun bootstrapLlvmAssemblyDirectiveAt(
+    assembly: string,
+    offset: int,
+    end: int,
+    directive: string
+): bool {
+    var matches = offset + directive.size <= end
+    var index = 0
+    while (matches && index < directive.size) {
+        matches = assembly[offset + index] == directive[index]
+        index = index + 1
+    }
+    if (matches && offset + directive.size < end) {
+        val next = assembly[offset + directive.size]
+        matches = next == 32 || next == 9 || next == 10 || next == 13
+    }
+    matches
+}
+
+// Reconstructed native sources can place many independently collectable
+// functions and data records in one inline-assembly string. The reachability
+// graph decides which pushsection regions are live; omit the dead regions
+// before assembly so their unresolved relocations cannot pull archive members
+// before the ELF linker's section garbage collection runs. This is still one
+// LLVM module and one native object.
+fun bootstrapLlvmFilterAssemblyRegions(
+    assembly: string,
+    instructionIndex: int,
+    regionBegin: int,
+    regionEnd: int,
+    regionInstructions: array<int>,
+    regionOrdinals: array<int>,
+    regionReachable: array<bool>
+): string {
+    if (regionBegin < 0 || regionEnd <= regionBegin) return assembly
+    val keep: array<bool> = []
+    var regionIndex = regionBegin
+    var applicable = false
+    while (regionIndex < regionEnd) {
+        if (regionInstructions[regionIndex] == instructionIndex) {
+            applicable = true
+            val ordinal = regionOrdinals[regionIndex]
+            while (keep.size <= ordinal) keep.append(false)
+            keep[ordinal] = regionReachable[regionIndex]
+        }
+        regionIndex = regionIndex + 1
+    }
+    if (!applicable) return assembly
+
+    val output = nativeByteBuffer(assembly.size + 1)
+    if (pointerIsNull(output.address)) return assembly
+    val regionStack: array<int> = []
+    var regionDepth = 0
+    var nextRegion = 0
+    var source = 0
+    var destination = 0
+    var valid = true
+    while (valid && source < assembly.size) {
+        var lineEnd = source
+        while (lineEnd < assembly.size && assembly[lineEnd] != 10) {
+            lineEnd = lineEnd + 1
+        }
+        if (lineEnd < assembly.size) lineEnd = lineEnd + 1
+        var directive = source
+        while (directive < lineEnd &&
+               (assembly[directive] == 32 || assembly[directive] == 9)) {
+            directive = directive + 1
+        }
+        val push = bootstrapLlvmAssemblyDirectiveAt(
+            assembly, directive, lineEnd, ".pushsection"
+        )
+        val pop = bootstrapLlvmAssemblyDirectiveAt(
+            assembly, directive, lineEnd, ".popsection"
+        )
+        var include = regionDepth == 0 ||
+            (regionStack[regionDepth - 1] < keep.size &&
+             keep[regionStack[regionDepth - 1]])
+        if (push) {
+            if (regionDepth < regionStack.size) {
+                regionStack[regionDepth] = nextRegion
+            } else regionStack.append(nextRegion)
+            regionDepth = regionDepth + 1
+            include = nextRegion < keep.size && keep[nextRegion]
+            nextRegion = nextRegion + 1
+        } else if (pop) {
+            include = regionDepth > 0 &&
+                regionStack[regionDepth - 1] < keep.size &&
+                keep[regionStack[regionDepth - 1]]
+        }
+        if (include) {
+            var byte = source
+            while (valid && byte < lineEnd) {
+                valid = output.store(destination, assembly[byte])
+                destination = destination + 1
+                byte = byte + 1
+            }
+        }
+        if (pop && regionDepth > 0) regionDepth = regionDepth - 1
+        source = lineEnd
+    }
+    if (!valid) {
+        output.close()
+        return assembly
+    }
+    if (destination == assembly.size) {
+        output.close()
+        return assembly
+    }
+    output.adoptString(destination)
+}
+
+fun bootstrapLlvmEmitNakedAssemblyText(
     backend: BootstrapLlvmBackend,
     function: i64*,
-    instruction: BootstrapInstruction
+    constraints: string,
+    assembly: string
 ): void {
     bootstrapLlvmAddFunctionAttribute(backend, function, "naked")
     bootstrapLlvmAddFunctionAttribute(backend, function, "noinline")
     bootstrapLlvmAddFunctionAttribute(backend, function, "nounwind")
-    val constraints = if (instruction.texts.size > 0)
-        instruction.texts[0] else ""
-    val assembly = if (instruction.texts.size > 1)
-        instruction.texts[1] else ""
     val type = bootstrapLlvmFunctionType(
         backend, backend.voidType, []
     )
@@ -1660,12 +1805,52 @@ fun bootstrapLlvmEmitNakedAssemblyBody(
     return
 }
 
+fun bootstrapLlvmEmitNakedAssemblyBody(
+    backend: BootstrapLlvmBackend,
+    function: i64*,
+    instruction: BootstrapInstruction
+): void {
+    val constraints = if (instruction.texts.size > 0)
+        instruction.texts[0] else ""
+    val assembly = if (instruction.texts.size > 1)
+        instruction.texts[1] else ""
+    bootstrapLlvmEmitNakedAssemblyText(
+        backend, function, constraints, assembly
+    )
+}
+
 // Exact native ABI kinds: pointer, i32, i64, f32, i16, and f64. Keeping this
 // table in one place lets coherent specification families share one lowering
 // without weakening the function type emitted at each call site.
 fun bootstrapLlvmUnsafeExactCallKinds(name: string): array<int> {
     if (bootstrapLlvmUnsafeEncodedExactIntrinsic(name)) {
         return bootstrapLlvmUnsafeEncodedExactCallKinds(name)
+    }
+    if (name == "ablaUnsafeCallI32I32") return [1]
+    if (name == "ablaUnsafeCallI32I32I32") return [1, 1]
+    if (name == "ablaUnsafeCallI32I32I32I32") return [1, 1, 1]
+    if (name == "ablaUnsafeCallI32I32I32I32I32") return [1, 1, 1, 1]
+    if (name == "ablaUnsafeCallI32I32I32I32I32I32") {
+        return [1, 1, 1, 1, 1]
+    }
+    if (name == "ablaUnsafeCallI32I32I32I32I32I32I32") {
+        return [1, 1, 1, 1, 1, 1]
+    }
+    if (name == "ablaUnsafeCallI32I32I32I32I32I32I32I32") {
+        return [1, 1, 1, 1, 1, 1, 1]
+    }
+    if (name == "ablaUnsafeCallI64I32") return [1]
+    if (name == "ablaUnsafeCallI64I32I32") return [1, 1]
+    if (name == "ablaUnsafeCallI64I32I32I32") return [1, 1, 1]
+    if (name == "ablaUnsafeCallI64I32I32I32I32") return [1, 1, 1, 1]
+    if (name == "ablaUnsafeCallI64I32I32I32I32I32") {
+        return [1, 1, 1, 1, 1]
+    }
+    if (name == "ablaUnsafeCallI64I32I32I32I32I32I32") {
+        return [1, 1, 1, 1, 1, 1]
+    }
+    if (name == "ablaUnsafeCallI64I32I32I32I32I32I32I32") {
+        return [1, 1, 1, 1, 1, 1, 1]
     }
     if (name == "ablaUnsafeCallVoidI32I32I32") return [1, 1, 1]
     if (name == "ablaUnsafeCallVoidI32I32I32I32") return [1, 1, 1, 1]
@@ -2060,6 +2245,7 @@ fun bootstrapLlvmUnsafeExactStatusCall(name: string): bool =
     name == "ablaUnsafeCallI32Zero" ||
     name == "ablaUnsafeCallI32I32Pointer" ||
     name == "ablaUnsafeCallI32I32I32Pointer" ||
+    bootstrapLlvmUnsafeI32StatusCallIntrinsic(name) ||
     name == "ablaUnsafeCallI32PointerI64I32I32I64Pointer" ||
     name == "ablaUnsafeCallI32PointerI32PointerPointerPointer" ||
     name == "ablaUnsafeCallI32PointerI32PointerI32I64" ||
@@ -2075,7 +2261,8 @@ fun bootstrapLlvmUnsafeExactI64Call(name: string): bool =
     bootstrapLlvmUnsafeEncodedExactResultKind(name) == 7 ||
     name == "ablaUnsafeCallI64PointerI64I32I32" ||
     name == "ablaUnsafeCallI64PointerI64I64" ||
-    name == "ablaUnsafeCallI64PointerI32"
+    name == "ablaUnsafeCallI64PointerI32" ||
+    bootstrapLlvmUnsafeI64ScalarCallIntrinsic(name)
 
 fun bootstrapLlvmUnsafeExactAddressCall(name: string): bool =
     bootstrapLlvmUnsafeEncodedExactResultKind(name) == 8 ||
@@ -2112,6 +2299,7 @@ fun bootstrapLlvmUnsafeExactZeroArgumentCall(name: string): bool =
 fun bootstrapLlvmEmitCoreIntrinsic(
     backend: BootstrapLlvmBackend,
     var storage: BootstrapLlvmFunctionStorage,
+    irFunction: BootstrapIrFunction,
     instruction: BootstrapInstruction
 ): bool {
     var supported = bootstrapLlvmCoreIntrinsic(instruction.text)
@@ -2275,6 +2463,73 @@ fun bootstrapLlvmEmitCoreIntrinsic(
             )
         }
     }
+    if (name == "ablaCountLeadingZerosU32") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = LLVMBuildTrunc(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.i32Type,
+                "integer.clz.value"
+            )
+            // Xtensa's NSA extension implements these exact zero-defined
+            // semantics in one instruction. Espressif LLVM currently expands
+            // llvm.ctlz.i32 into a software popcount sequence even for
+            // -mcpu=esp32,+nsa, so select the instruction here. The assembly
+            // has no side effects or memory clobber: LLVM can still delete and
+            // move unused operations. Every other target retains the semantic
+            // LLVM intrinsic and all of its normal folding opportunities.
+            val result = if (bootstrapTextContains(
+                backend.targetTriple, "xtensa"
+            )) {
+                val type = bootstrapLlvmFunctionType(
+                    backend, backend.i32Type, [backend.i32Type]
+                )
+                val assembly = "nsau $0, $1"
+                val constraints = "=a,a"
+                val operation = LLVMGetInlineAsm(
+                    type,
+                    assembly,
+                    assembly.size,
+                    constraints,
+                    constraints.size,
+                    0,
+                    0,
+                    0,
+                    0
+                )
+                bootstrapLlvmCallTyped(
+                    backend,
+                    type,
+                    operation,
+                    [value],
+                    "integer.clz.xtensa"
+                )
+            } else {
+                val intrinsic = bootstrapLlvmDeclare(
+                    backend,
+                    "llvm.ctlz.i32",
+                    backend.i32Type,
+                    [backend.i32Type, backend.i1Type],
+                    false,
+                    [false, false]
+                )
+                bootstrapLlvmCall(
+                    backend,
+                    intrinsic,
+                    [value, LLVMConstInt(backend.i1Type, 0, 0)],
+                    "integer.clz",
+                    false,
+                    [false, false]
+                )
+            }
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, result
+            )
+        }
+    }
     if (name == "ablaBitF64ToI64") {
         if (instruction.operands.size != 1) supported = false
         if (instruction.operands.size == 1) {
@@ -2316,6 +2571,85 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 LLVMBuildSIToFP(
                     backend.builder, value, backend.f64Type,
                     "convert.i64.to.f64"
+                )
+            )
+        }
+    }
+    if (name == "ablaBitF32ToI32") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.operands[0], "f32"
+            )
+            val bits = LLVMBuildBitCast(
+                backend.builder, value, backend.i32Type, "bit.f32.to.i32"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildZExt(
+                    backend.builder, bits, backend.i64Type,
+                    "bit.f32.to.i32.i64"
+                )
+            )
+        }
+    }
+    if (name == "ablaBitI32ToF32") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = LLVMBuildTrunc(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.i32Type, "bit.i32.to.f32.i32"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildBitCast(
+                    backend.builder, value, backend.f32Type,
+                    "bit.i32.to.f32"
+                )
+            )
+        }
+    }
+    if (name == "ablaConvertU32ToF32" ||
+        name == "ablaConvertI32ToF32") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = LLVMBuildTrunc(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.i32Type, "convert.i32.to.f32.value"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                if (name == "ablaConvertU32ToF32") LLVMBuildUIToFP(
+                    backend.builder, value, backend.f32Type,
+                    "convert.u32.to.f32"
+                ) else LLVMBuildSIToFP(
+                    backend.builder, value, backend.f32Type,
+                    "convert.i32.to.f32"
+                )
+            )
+        }
+    }
+    if (name == "ablaConvertF32ToU32" ||
+        name == "ablaConvertF32ToI32") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.operands[0], "f32"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                if (name == "ablaConvertF32ToU32") LLVMBuildFPToUI(
+                    backend.builder, value, backend.i32Type,
+                    "convert.f32.to.u32"
+                ) else LLVMBuildFPToSI(
+                    backend.builder, value, backend.i32Type,
+                    "convert.f32.to.i32"
                 )
             )
         }
@@ -2546,6 +2880,106 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                     )
                 }
             }
+        }
+    }
+    if (name == "nativeLinkerSymbolAddress") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val linkName = bootstrapLlvmCoreIntrinsicConstantString(
+                irFunction, instruction.operands[0]
+            )
+            if (linkName == "") supported = false
+            if (linkName != "") {
+                var global = LLVMGetNamedGlobal(backend.module, linkName)
+                if (pointerIsNull(global)) {
+                    global = LLVMAddGlobal(
+                        backend.module, backend.i8Type, linkName
+                    )
+                    LLVMSetLinkage(global, llvmExternalLinkage())
+                }
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result,
+                    LLVMBuildPtrToInt(
+                        backend.builder, global, backend.i64Type,
+                        "unsafe.linker.symbol.address"
+                    )
+                )
+            }
+        }
+    }
+    if (name == "nativeLinkedStaticAllocate" ||
+        name == "nativeLinkedThreadLocalAllocate") {
+        if (instruction.operands.size != 2) supported = false
+        if (instruction.operands.size == 2) {
+            val requested = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[0]
+            )
+            val constant = LLVMIsAConstantInt(requested)
+            val linkName = bootstrapLlvmCoreIntrinsicConstantString(
+                irFunction, instruction.operands[1]
+            )
+            if (pointerIsNull(constant) || linkName == "") supported = false
+            if (!pointerIsNull(constant) && linkName != "") {
+                var size = LLVMConstIntGetSExtValue(constant)
+                if (size < 1) size = 1
+                if (size > 2147483647) supported = false
+                if (size <= 2147483647) {
+                    val type = LLVMArrayType2(backend.i8Type, size)
+                    var global = LLVMGetNamedGlobal(backend.module, linkName)
+                    if (pointerIsNull(global)) {
+                        global = LLVMAddGlobal(backend.module, type, linkName)
+                        LLVMSetInitializer(global, LLVMConstNull(type))
+                        LLVMSetAlignment(global, 8)
+                        LLVMSetLinkage(global, llvmExternalLinkage())
+                        if (name == "nativeLinkedThreadLocalAllocate") {
+                            LLVMSetThreadLocal(global, 1)
+                            // LLVM's target-independent local-exec TLS model.
+                            LLVMSetThreadLocalMode(global, 4)
+                        }
+                    }
+                    bootstrapLlvmSetNativeValue(
+                        backend, storage, instruction.result,
+                        LLVMBuildPtrToInt(
+                            backend.builder, global, backend.i64Type,
+                            "unsafe.linked.static.address"
+                        )
+                    )
+                }
+            }
+        }
+    }
+    if (name == "nativeThreadLocalBytes") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val contents = bootstrapLlvmCoreIntrinsicConstantString(
+                irFunction, instruction.operands[0]
+            )
+            // Empty storage still needs an addressable byte, matching the
+            // allocation intrinsics' minimum-capacity behavior.
+            val initializedContents = if (contents.size == 0) "\x00" else contents
+            val initializer = LLVMConstStringInContext2(
+                backend.context,
+                initializedContents,
+                initializedContents.size,
+                1
+            )
+            val type = LLVMTypeOf(initializer)
+            val global = LLVMAddGlobal(
+                backend.module, type, "abla.thread.local.bytes"
+            )
+            LLVMSetInitializer(global, initializer)
+            LLVMSetAlignment(global, 8)
+            LLVMSetLinkage(global, llvmInternalLinkage())
+            LLVMSetThreadLocal(global, 1)
+            // LLVM's target-independent local-exec TLS model.
+            LLVMSetThreadLocalMode(global, 4)
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, global, backend.i64Type,
+                    "unsafe.thread.local.bytes.address"
+                )
+            )
         }
     }
     if (name == "nativeXtensaCoreId") {
@@ -3249,14 +3683,21 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 backend, storage, instruction.operands[1]
             )
             else {
+                val nativeSizeType = backend.nativeSizeType()
                 val strlen = bootstrapLlvmDeclare(
-                    backend, "strlen", backend.i64Type,
+                    backend, "strlen", nativeSizeType,
                     [backend.pointerType], false, [false]
                 )
-                length = bootstrapLlvmCall(
+                val nativeLength = bootstrapLlvmCall(
                     backend, strlen, [pointer], "unsafe.string.length",
                     false, [false]
                 )
+                length = if (bootstrapLlvmTargetUses32BitPointers(
+                    backend.targetTriple
+                )) LLVMBuildZExt(
+                    backend.builder, nativeLength, backend.i64Type,
+                    "unsafe.string.length.i64"
+                ) else nativeLength
             }
             bootstrapLlvmCallNamed(
                 backend, "abla_string_static",
@@ -3291,6 +3732,54 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                     backend.builder, status, backend.i64Type,
                     "unsafe.main.status.i64"
                 )
+            )
+        }
+    }
+    if (name == "ablaUnsafeCallI32") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val type = bootstrapLlvmFunctionType(
+                backend, backend.i32Type, []
+            )
+            val function = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType,
+                "unsafe.call.i32"
+            )
+            val status = bootstrapLlvmCallTyped(
+                backend, type, function, [], "unsafe.call.i32.status"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildSExt(
+                    backend.builder, status, backend.i64Type,
+                    "unsafe.call.i32.status.i64"
+                )
+            )
+        }
+    }
+    if (name == "ablaUnsafeCallI64") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val type = bootstrapLlvmFunctionType(
+                backend, backend.i64Type, []
+            )
+            val function = LLVMBuildIntToPtr(
+                backend.builder,
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[0]
+                ),
+                backend.pointerType,
+                "unsafe.call.i64"
+            )
+            val result = bootstrapLlvmCallTyped(
+                backend, type, function, [], "unsafe.call.i64.result"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result, result
             )
         }
     }
@@ -4768,14 +5257,21 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 backend.builder, backend.pointerType, slot,
                 "runtime.argument.text"
             )
+            val nativeSizeType = backend.nativeSizeType()
             val strlen = bootstrapLlvmDeclare(
-                backend, "strlen", backend.i64Type,
+                backend, "strlen", nativeSizeType,
                 [backend.pointerType], false, [false]
             )
-            val length = bootstrapLlvmCall(
+            val nativeLength = bootstrapLlvmCall(
                 backend, strlen, [text], "runtime.argument.length",
                 false, [false]
             )
+            val length = if (bootstrapLlvmTargetUses32BitPointers(
+                backend.targetTriple
+            )) LLVMBuildZExt(
+                backend.builder, nativeLength, backend.i64Type,
+                "runtime.argument.length.i64"
+            ) else nativeLength
             bootstrapLlvmCallNamed(
                 backend, "abla_string_static",
                 [storage.values[instruction.result], text, length],
@@ -4989,7 +5485,12 @@ fun bootstrapLlvmEmitFunction(
     globalIndex: BootstrapLlvmNameIndex,
     classIndex: BootstrapLlvmNameIndex,
     fieldIndex: BootstrapLlvmNameIndex,
-    mayCollect: array<bool>
+    mayCollect: array<bool>,
+    assemblyRegionBegin: int,
+    assemblyRegionEnd: int,
+    assemblyRegionInstructions: array<int>,
+    assemblyRegionOrdinals: array<int>,
+    assemblyRegionReachable: array<bool>
 ): int {
     val llvmFunction = LLVMGetNamedFunction(
         backend.module,
@@ -5001,10 +5502,17 @@ fun bootstrapLlvmEmitFunction(
     LLVMPositionBuilderAtEnd(backend.builder, entry)
     val nakedAssembly = bootstrapLlvmNakedAssemblyIndex(function)
     if (nakedAssembly >= 0) {
-        bootstrapLlvmEmitNakedAssemblyBody(
-            backend,
-            llvmFunction,
-            function.instructions[nakedAssembly]
+        val instruction = function.instructions[nakedAssembly]
+        val constraints = if (instruction.texts.size > 0)
+            instruction.texts[0] else ""
+        val assembly = bootstrapLlvmFilterAssemblyRegions(
+            if (instruction.texts.size > 1) instruction.texts[1] else "",
+            nakedAssembly, assemblyRegionBegin, assemblyRegionEnd,
+            assemblyRegionInstructions, assemblyRegionOrdinals,
+            assemblyRegionReachable
+        )
+        bootstrapLlvmEmitNakedAssemblyText(
+            backend, llvmFunction, constraints, assembly
         )
         return 0
     }
@@ -5456,6 +5964,22 @@ fun bootstrapLlvmEmitFunction(
                 )
             }
         }
+        if (reachable && instruction.opcode == "native.static.bytes") {
+            matched = true
+            val name = "${bootstrapLlvmStringSymbolFrom(
+                identities.symbols[functionId], instruction.result
+            )}.native.bytes"
+            val pointer = bootstrapLlvmGlobalBytesPointer(
+                backend, instruction.text, name
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildPtrToInt(
+                    backend.builder, pointer, backend.i64Type,
+                    "native.static.bytes.address"
+                )
+            )
+        }
         if (reachable && instruction.opcode == "closure.create") {
             matched = true
             val found = functionIndex.find(instruction.text)
@@ -5696,7 +6220,7 @@ fun bootstrapLlvmEmitFunction(
             matched = true
             if (bootstrapLlvmCoreIntrinsic(instruction.text)) {
                 supported = bootstrapLlvmEmitCoreIntrinsic(
-                    backend, storage, instruction
+                    backend, storage, function, instruction
                 )
             } else bootstrapLlvmRuntimeCall(
                     backend, instruction.text,

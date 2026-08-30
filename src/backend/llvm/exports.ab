@@ -2,8 +2,16 @@ import "dispatch.ab"
 
 fun bootstrapLlvmDeclareProgramBoundaries(
     backend: BootstrapLlvmBackend,
-    program: BootstrapIrProgram
+    program: BootstrapIrProgram,
+    exports: array<BootstrapExportRequest>
 ): void {
+    val exportNames: array<string> = []
+    var export = 0
+    while (export < exports.size) {
+        exportNames.append(exports[export].name)
+        export = export + 1
+    }
+    val exportIndex = bootstrapLlvmNameIndex(exportNames)
     var function = 0
     while (function < program.functions.size) {
         var instruction = 0
@@ -13,7 +21,24 @@ fun bootstrapLlvmDeclareProgramBoundaries(
             if (candidate.opcode == "extern.host" ||
                 (candidate.opcode == "extern.intrinsic" &&
                  !bootstrapLlvmCoreIntrinsic(candidate.text))) {
-                bootstrapLlvmDeclareValueRuntime(
+                val requestIndex = exportIndex.find(candidate.text)
+                if (requestIndex >= 0) {
+                    val request = exports[requestIndex]
+                    val parameters = bootstrapLlvmExportParameterTypes(
+                        backend, request, request.checked
+                    )
+                    bootstrapLlvmDeclare(
+                        backend,
+                        request.name,
+                        if (request.checked) backend.i32Type else
+                            bootstrapLlvmExportResultType(
+                                backend, request.resultType
+                            ),
+                        parameters,
+                        false,
+                        bootstrapLlvmFalseFlags(parameters.size)
+                    )
+                } else bootstrapLlvmDeclareValueRuntime(
                     backend, candidate.text, candidate.operands.size
                 )
             }
@@ -151,7 +176,12 @@ fun bootstrapLlvmExportCanAliasDirect(
     function: BootstrapIrFunction,
     initializationRequired: bool
 ): bool {
-    var exact = !initializationRequired && !function.naked &&
+    // A naked function's direct LLVM signature still uses the same scalar
+    // target ABI as its foreign entry name.  Alias that one definition rather
+    // than copying its inline assembly into an export thunk: recovered
+    // assembly commonly owns local labels and data which may only be defined
+    // once in a monolithic module.
+    var exact = !initializationRequired &&
         bootstrapLlvmExportUsesDirectScalarAbi(request) &&
         !bootstrapLlvmDirectNeedsArgumentCount(function) &&
         request.name != "xt_unhandled_interrupt" &&
@@ -235,6 +265,561 @@ fun bootstrapLlvmNativeFunctionRequest(
     function.name, "", function.resultType,
     function.parameters, function.parameterTypes, false, false
 )
+
+fun bootstrapLlvmAssemblySymbolByte(byte: int): bool =
+    (byte >= 65 && byte <= 90) ||
+    (byte >= 97 && byte <= 122) ||
+    (byte >= 48 && byte <= 57) ||
+    byte == 95 || byte == 46 || byte == 36
+
+fun bootstrapLlvmAssemblyTokenEquals(
+    assembly: string,
+    begin: int,
+    end: int,
+    expected: string
+): bool {
+    if (end - begin != expected.size) return false
+    var index = 0
+    while (index < expected.size) {
+        if (assembly[begin + index] != expected[index]) return false
+        index = index + 1
+    }
+    true
+}
+
+fun bootstrapLlvmAssemblyLinkerName(token: string): string {
+    // LLVM inline assembly spells a literal `$` as `$$`, while the object
+    // symbol itself contains one dollar. Collapse that quoting before looking
+    // up the exact linker identifier. No other assembler syntax is accepted
+    // by internalFunction, so tokenization remains target-neutral.
+    var escapedDollar = false
+    var probe = 0
+    while (!escapedDollar && probe + 1 < token.size) {
+        escapedDollar = token[probe] == 36 && token[probe + 1] == 36
+        probe = probe + 1
+    }
+    // Assembly overwhelmingly consists of ordinary tokens. Preserve their
+    // existing string view instead of rebuilding every byte into a fresh
+    // allocation during both definition indexing and graph traversal.
+    if (!escapedDollar) return token
+    var result = ""
+    var index = 0
+    while (index < token.size) {
+        result = "$result${token.slice(index, index + 1)}"
+        if (token[index] == 36 && index + 1 < token.size &&
+            token[index + 1] == 36) index = index + 1
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapLlvmAssemblyTokenHash(
+    assembly: string,
+    begin: int,
+    end: int
+): int {
+    var hash = 0
+    var index = begin
+    while (index < end) {
+        hash = hash * 131 + assembly[index]
+        hash = hash - hash / 2147483647 * 2147483647
+        if (assembly[index] == 36 && index + 1 < end &&
+            assembly[index + 1] == 36) index = index + 1
+        index = index + 1
+    }
+    hash
+}
+
+fun bootstrapLlvmAssemblyTokenMatchesName(
+    assembly: string,
+    begin: int,
+    end: int,
+    name: string
+): bool {
+    var source = begin
+    var target = 0
+    while (source < end && target < name.size) {
+        if (assembly[source] != name[target]) return false
+        if (assembly[source] == 36 && source + 1 < end &&
+            assembly[source + 1] == 36) source = source + 1
+        source = source + 1
+        target = target + 1
+    }
+    source == end && target == name.size
+}
+
+// Look up a token directly in the assembly buffer. Recovered firmware has
+// millions of mnemonic/register tokens; allocating a temporary string for
+// each one made reachability's peak memory proportional to all scanned text.
+fun BootstrapLlvmNameIndex.findAssemblyToken(
+    assembly: string,
+    begin: int,
+    end: int
+): int {
+    var result = -1
+    var slot = bootstrapLlvmAssemblyTokenHash(assembly, begin, end)
+    slot = slot - slot / this.slots.size * this.slots.size
+    var probes = 0
+    var searching = true
+    while (searching && probes < this.slots.size) {
+        val existing = this.slots[slot]
+        if (existing < 0) {
+            searching = false
+        } else if (bootstrapLlvmAssemblyTokenMatchesName(
+            assembly, begin, end, this.names[existing]
+        )) {
+            result = this.values[existing]
+            searching = false
+        } else {
+            slot = slot + 1
+            if (slot == this.slots.size) slot = 0
+            probes = probes + 1
+        }
+    }
+    result
+}
+
+class BootstrapLlvmExportReachability(
+    val exports: array<BootstrapExportRequest>,
+    val functions: array<bool>,
+    // A reachable assembly block can refer to a label defined inside another
+    // Abla function's assembly block without going through an exported linker
+    // name. Keep that owning function internal, but alive, so its section-local
+    // code or data is emitted into the same module.
+    val assemblyOwners: array<bool>,
+    val assemblyRegionInstructions: array<int>,
+    val assemblyRegionOrdinals: array<int>,
+    val assemblyRegionReachable: array<bool>,
+    val assemblyRegionStarts: array<int>,
+    val assemblyRegionEnds: array<int>
+)
+
+class BootstrapLlvmAssemblyRegion(
+    val assembly: string,
+    val ordinal: int,
+    val owner: int,
+    val instruction: int,
+    val begin: int,
+    var end: int
+)
+
+fun bootstrapLlvmTraverseAssemblyRegion(
+    assembly: string,
+    selectedRegion: int,
+    scanBegin: int,
+    scanEnd: int,
+    exportIndex: BootstrapLlvmNameIndex,
+    exports: array<BootstrapExportRequest>,
+    functionIndex: BootstrapLlvmNameIndex,
+    assemblyDefinitionIndex: BootstrapLlvmNameIndex,
+    assemblyRegions: array<BootstrapLlvmAssemblyRegion>,
+    var reachableExports: array<bool>,
+    var reachableFunctions: array<bool>,
+    var reachableAssemblyOwners: array<bool>,
+    var reachableAssemblyRegions: array<bool>,
+    var pendingFunctions: array<int>,
+    var pendingRegions: array<int>
+): void {
+    val regionStack: array<int> = []
+    var regionDepth = 0
+    // A selected collectable region starts at its own pushsection. Start its
+    // ordinal counter there instead of rescanning the complete (potentially
+    // multi-megabyte) recovered source for every live function/data record.
+    // Besides being linear rather than quadratic, this avoids retaining an
+    // arena allocation for every token in every repeated whole-string scan.
+    var nextRegion = if (selectedRegion >= 0) selectedRegion else 0
+    var begin = scanBegin
+    var offset = scanBegin
+    while (offset <= scanEnd) {
+        val symbolByte = offset < scanEnd &&
+            bootstrapLlvmAssemblySymbolByte(assembly[offset])
+        if (!symbolByte) {
+            if (offset > begin) {
+                if (bootstrapLlvmAssemblyTokenEquals(
+                    assembly, begin, offset, ".pushsection"
+                )) {
+                    if (regionDepth < regionStack.size) {
+                        regionStack[regionDepth] = nextRegion
+                    } else regionStack.append(nextRegion)
+                    regionDepth = regionDepth + 1
+                    nextRegion = nextRegion + 1
+                } else if (bootstrapLlvmAssemblyTokenEquals(
+                    assembly, begin, offset, ".popsection"
+                )) {
+                    if (regionDepth > 0) regionDepth = regionDepth - 1
+                } else {
+                    val activeRegion = if (regionDepth == 0) -1
+                        else regionStack[regionDepth - 1]
+                    if (activeRegion == selectedRegion) {
+                        val request = exportIndex.findAssemblyToken(
+                            assembly, begin, offset
+                        )
+                        if (request >= 0 && !reachableExports[request]) {
+                            reachableExports[request] = true
+                            val source = functionIndex.find(
+                                exports[request].source
+                            )
+                            if (source >= 0 &&
+                                !reachableFunctions[source]) {
+                                reachableFunctions[source] = true
+                                pendingFunctions.append(source)
+                            }
+                        }
+                        val definition =
+                            assemblyDefinitionIndex.findAssemblyToken(
+                                assembly, begin, offset
+                            )
+                        if (definition >= 0) {
+                            // Root-region definitions are encoded as their
+                            // function owner. Pushsection definitions use a
+                            // negative region id so only that independently
+                            // collectable section contributes dependencies.
+                            if (!reachableFunctions[definition]) {
+                                reachableFunctions[definition] = true
+                                pendingFunctions.append(definition)
+                            }
+                            reachableAssemblyOwners[definition] = true
+                        } else if (definition < -1) {
+                            val regionIndex = -definition - 2
+                            if (!reachableAssemblyRegions[regionIndex]) {
+                                reachableAssemblyRegions[regionIndex] = true
+                                pendingRegions.append(regionIndex)
+                                val owner =
+                                    assemblyRegions[regionIndex].owner
+                                reachableAssemblyOwners[owner] = true
+                                if (!reachableFunctions[owner]) {
+                                    reachableFunctions[owner] = true
+                                    pendingFunctions.append(owner)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            begin = offset + 1
+        }
+        offset = offset + 1
+    }
+}
+
+// Inline assembly references are opaque to LLVM's ordinary call graph. Build
+// the missing edges from exact linker-symbol tokens so internalFunction keeps
+// only symbols reachable from a real program/public root. This is what makes
+// internal linkage useful in one large firmware module: unused reconstructed
+// functions can be removed by globaldce instead of all being pinned in
+// llvm.compiler.used.
+fun bootstrapLlvmReachableExports(
+    program: BootstrapIrProgram,
+    exports: array<BootstrapExportRequest>,
+    functionIndex: BootstrapLlvmNameIndex,
+    addressTaken: array<bool>,
+    interruptRoots: array<bool>,
+    nativeRoots: array<bool>
+): BootstrapLlvmExportReachability {
+    val exportNames: array<string> = []
+    val reachableExports: array<bool> = []
+    var index = 0
+    while (index < exports.size) {
+        exportNames.append(exports[index].name)
+        reachableExports.append(!exports[index].internal)
+        index = index + 1
+    }
+    val exportIndex = bootstrapLlvmNameIndex(exportNames)
+    val assemblyDefinitionNames: array<string> = []
+    val assemblyDefinitionOwners: array<int> = []
+    val assemblyRegions: array<BootstrapLlvmAssemblyRegion> = []
+    val assemblyRegionStarts: array<int> = []
+    val assemblyRegionEnds: array<int> = []
+    while (assemblyRegionStarts.size < program.functions.size) {
+        assemblyRegionStarts.append(-1)
+        assemblyRegionEnds.append(-1)
+    }
+    index = 0
+    while (index < program.functions.size) {
+        var instructionIndex = 0
+        while (instructionIndex <
+               program.functions[index].instructions.size) {
+            val instruction =
+                program.functions[index].instructions[instructionIndex]
+            if (instruction.opcode == "inline.assembly" &&
+                instruction.texts.size > 1) {
+                val assembly = instruction.texts[1]
+                val regionStack: array<int> = []
+                var regionDepth = 0
+                var nextRegion = 0
+                var sectionNameExpected = false
+                var aliasNameExpected = false
+                var begin = 0
+                var offset = 0
+                while (offset <= assembly.size) {
+                    val symbolByte = offset < assembly.size &&
+                        bootstrapLlvmAssemblySymbolByte(assembly[offset])
+                    if (!symbolByte) {
+                        if (offset > begin) {
+                            if (bootstrapLlvmAssemblyTokenEquals(
+                                assembly, begin, offset, ".pushsection"
+                            )) {
+                                val regionIndex = assemblyRegions.size
+                                assemblyRegions.append(
+                                    BootstrapLlvmAssemblyRegion(
+                                        assembly, nextRegion, index,
+                                        instructionIndex, begin,
+                                        assembly.size
+                                    )
+                                )
+                                if (assemblyRegionStarts[index] < 0) {
+                                    assemblyRegionStarts[index] = regionIndex
+                                }
+                                assemblyRegionEnds[index] = regionIndex + 1
+                                if (regionDepth < regionStack.size) {
+                                    regionStack[regionDepth] = regionIndex
+                                } else regionStack.append(regionIndex)
+                                regionDepth = regionDepth + 1
+                                nextRegion = nextRegion + 1
+                                sectionNameExpected = true
+                                aliasNameExpected = false
+                            } else if (bootstrapLlvmAssemblyTokenEquals(
+                                assembly, begin, offset, ".popsection"
+                            )) {
+                                if (regionDepth > 0) {
+                                    assemblyRegions[
+                                        regionStack[regionDepth - 1]
+                                    ].end = offset
+                                    regionDepth = regionDepth - 1
+                                }
+                                sectionNameExpected = false
+                                aliasNameExpected = false
+                            } else if (bootstrapLlvmAssemblyTokenEquals(
+                                assembly, begin, offset, ".set"
+                            ) || bootstrapLlvmAssemblyTokenEquals(
+                                assembly, begin, offset, ".equ"
+                            )) {
+                                // A generic assembler alias is a real symbol
+                                // definition too. Index its first operand so
+                                // one collectable region can publish another
+                                // region's data without copying it or forcing
+                                // a separate object-file boundary.
+                                aliasNameExpected = true
+                            } else if (sectionNameExpected &&
+                                       regionDepth > 0) {
+                                // ELF permits relocations against a section
+                                // symbol (for example `.bss.cache$2`) rather
+                                // than a label inside it. Treat the section
+                                // name as another definition owned by this
+                                // collectable assembly region.
+                                assemblyDefinitionNames.append(
+                                    bootstrapLlvmAssemblyLinkerName(
+                                        assembly.slice(begin, offset)
+                                    )
+                                )
+                                assemblyDefinitionOwners.append(
+                                    -regionStack[regionDepth - 1] - 2
+                                )
+                                sectionNameExpected = false
+                            } else if (aliasNameExpected) {
+                                assemblyDefinitionNames.append(
+                                    bootstrapLlvmAssemblyLinkerName(
+                                        assembly.slice(begin, offset)
+                                    )
+                                )
+                                if (regionDepth == 0) {
+                                    assemblyDefinitionOwners.append(index)
+                                } else {
+                                    assemblyDefinitionOwners.append(
+                                        -regionStack[regionDepth - 1] - 2
+                                    )
+                                }
+                                aliasNameExpected = false
+                            } else if (offset < assembly.size &&
+                                       assembly[offset] == 58) {
+                                // An assembler label is the exact preceding
+                                // token. References omit the trailing colon.
+                                assemblyDefinitionNames.append(
+                                    bootstrapLlvmAssemblyLinkerName(
+                                        assembly.slice(begin, offset)
+                                    )
+                                )
+                                if (regionDepth == 0) {
+                                    assemblyDefinitionOwners.append(index)
+                                } else {
+                                    // -1 is the name index's not-found value,
+                                    // so region zero begins at -2.
+                                    assemblyDefinitionOwners.append(
+                                        -regionStack[regionDepth - 1] - 2
+                                    )
+                                }
+                            }
+                        }
+                        begin = offset + 1
+                    }
+                    offset = offset + 1
+                }
+            }
+            instructionIndex = instructionIndex + 1
+        }
+        index = index + 1
+    }
+    val assemblyDefinitionIndex = bootstrapLlvmNameValueIndex(
+        assemblyDefinitionNames, assemblyDefinitionOwners
+    )
+    val reachableFunctions: array<bool> = []
+    val reachableAssemblyOwners: array<bool> = []
+    val reachableAssemblyRegions: array<bool> = []
+    val pending: array<int> = []
+    val pendingRegions: array<int> = []
+    while (reachableAssemblyRegions.size < assemblyRegions.size) {
+        reachableAssemblyRegions.append(false)
+    }
+    index = 0
+    while (index < program.functions.size) {
+        val runtimePrefix = "__ablaRuntime"
+        val functionName = program.functions[index].name
+        val runtimeImplementation =
+            functionName.size >= runtimePrefix.size &&
+            functionName.slice(0, runtimePrefix.size) == runtimePrefix
+        val root = program.functions[index].name == "main" ||
+            program.functions[index].name == "__bootstrap_globals" ||
+            runtimeImplementation ||
+            (index < interruptRoots.size && interruptRoots[index]) ||
+            (index < nativeRoots.size && nativeRoots[index])
+        reachableFunctions.append(root)
+        reachableAssemblyOwners.append(false)
+        if (root) pending.append(index)
+        index = index + 1
+    }
+    index = 0
+    while (index < exports.size) {
+        if (reachableExports[index]) {
+            val source = functionIndex.find(exports[index].source)
+            if (source >= 0 && !reachableFunctions[source]) {
+                reachableFunctions[source] = true
+                pending.append(source)
+            }
+        }
+        index = index + 1
+    }
+    var cursor = 0
+    var regionCursor = 0
+    while (cursor < pending.size || regionCursor < pendingRegions.size) {
+        if (cursor >= pending.size) {
+            val regionIndex = pendingRegions[regionCursor]
+            regionCursor = regionCursor + 1
+            bootstrapLlvmTraverseAssemblyRegion(
+                assemblyRegions[regionIndex].assembly,
+                assemblyRegions[regionIndex].ordinal,
+                assemblyRegions[regionIndex].begin,
+                assemblyRegions[regionIndex].end,
+                exportIndex, exports, functionIndex,
+                assemblyDefinitionIndex, assemblyRegions,
+                reachableExports, reachableFunctions,
+                reachableAssemblyOwners, reachableAssemblyRegions,
+                pending, pendingRegions
+            )
+            continue
+        }
+        val owner = pending[cursor]
+        cursor = cursor + 1
+        var instructionIndex = 0
+        while (instructionIndex <
+               program.functions[owner].instructions.size) {
+            val instruction =
+                program.functions[owner].instructions[instructionIndex]
+            if (instruction.opcode == "call" ||
+                instruction.opcode == "function.ref" ||
+                instruction.opcode == "closure.create") {
+                val target = functionIndex.find(instruction.text)
+                if (target >= 0 && !reachableFunctions[target]) {
+                    reachableFunctions[target] = true
+                    pending.append(target)
+                }
+                if (instruction.opcode == "closure.create") {
+                    val drop = functionIndex.find(
+                        bootstrapClosureDropFunctionName(instruction.text)
+                    )
+                    if (drop >= 0 && !reachableFunctions[drop]) {
+                        reachableFunctions[drop] = true
+                        pending.append(drop)
+                    }
+                }
+            }
+            if (instruction.opcode == "call.indirect" ||
+                instruction.opcode == "call.indirect.once") {
+                var target = 0
+                while (target < addressTaken.size) {
+                    if (addressTaken[target] &&
+                        !reachableFunctions[target]) {
+                        reachableFunctions[target] = true
+                        pending.append(target)
+                    }
+                    target = target + 1
+                }
+            }
+            // Native declarations are another exact-symbol edge inside a
+            // monolithic module. If internalFunction owns that name, bind the
+            // declaration to the Abla definition instead of leaving an
+            // unresolved foreign call or forcing public linkage merely to
+            // make two parts of the same LLVM module meet.
+            if (instruction.opcode == "extern.c" ||
+                instruction.opcode == "extern.host" ||
+                (instruction.opcode == "extern.intrinsic" &&
+                 !bootstrapLlvmCoreIntrinsic(instruction.text))) {
+                val request = exportIndex.find(instruction.text)
+                if (request >= 0 && !reachableExports[request]) {
+                    reachableExports[request] = true
+                    val source = functionIndex.find(
+                        exports[request].source
+                    )
+                    if (source >= 0 && !reachableFunctions[source]) {
+                        reachableFunctions[source] = true
+                        pending.append(source)
+                    }
+                }
+            }
+            if (instruction.opcode == "inline.assembly" &&
+                instruction.texts.size > 1) {
+                bootstrapLlvmTraverseAssemblyRegion(
+                    instruction.texts[1], -1,
+                    0, instruction.texts[1].size,
+                    exportIndex, exports, functionIndex,
+                    assemblyDefinitionIndex, assemblyRegions,
+                    reachableExports, reachableFunctions,
+                    reachableAssemblyOwners, reachableAssemblyRegions,
+                    pending, pendingRegions
+                )
+            }
+            instructionIndex = instructionIndex + 1
+        }
+    }
+    val selected: array<BootstrapExportRequest> = []
+    index = 0
+    while (index < exports.size) {
+        if (reachableExports[index]) {
+            selected.append(exports[index])
+            // The selected export already retains or materializes this naked
+            // source. Keeping its direct function as an additional assembly
+            // owner would emit the same local labels twice.
+            val source = functionIndex.find(exports[index].source)
+            if (source >= 0) reachableAssemblyOwners[source] = false
+        }
+        index = index + 1
+    }
+    val assemblyRegionInstructions: array<int> = []
+    val assemblyRegionOrdinals: array<int> = []
+    index = 0
+    while (index < assemblyRegions.size) {
+        assemblyRegionInstructions.append(
+            assemblyRegions[index].instruction
+        )
+        assemblyRegionOrdinals.append(assemblyRegions[index].ordinal)
+        index = index + 1
+    }
+    BootstrapLlvmExportReachability(
+        selected, reachableFunctions, reachableAssemblyOwners,
+        assemblyRegionInstructions, assemblyRegionOrdinals,
+        reachableAssemblyRegions,
+        assemblyRegionStarts, assemblyRegionEnds
+    )
+}
 
 fun bootstrapLlvmDeclareNativeFunctionAdapters(
     backend: BootstrapLlvmBackend,
@@ -638,10 +1223,23 @@ fun bootstrapLlvmEmitExports(
     exports: array<BootstrapExportRequest>,
     functionIndex: BootstrapLlvmNameIndex,
     identities: BootstrapLlvmFunctionIdentities,
-    initializationRequired: array<bool>
+    initializationRequired: array<bool>,
+    assemblyOwners: array<bool>
 ): int {
     var errors = 0
     val retained: array<i64*> = []
+    var owner = 0
+    while (owner < assemblyOwners.size) {
+        if (assemblyOwners[owner]) retained.append(
+            LLVMGetNamedFunction(
+                backend.module,
+                bootstrapLlvmDirectFunctionSymbol(
+                    identities.symbols[owner]
+                )
+            )
+        )
+        owner = owner + 1
+    }
     if (exports.size > 0) bootstrapLlvmEmitExportInitializer(
         backend, program, functionIndex, identities
     )
@@ -671,16 +1269,21 @@ fun bootstrapLlvmEmitExports(
                     initializationRequired[source]
             )
             if (nakedAlias >= 0 && !request.internal) {
-                val aliasee = LLVMGetNamedFunction(
+                val aliasName = exports[nakedAlias].name
+                var aliasee = LLVMGetNamedGlobalAlias(
+                    backend.module, aliasName, aliasName.size
+                )
+                if (pointerIsNull(aliasee)) aliasee = LLVMGetNamedFunction(
                     backend.module, exports[nakedAlias].name
                 )
-                LLVMAddAlias2(
-                    backend.module,
-                    LLVMGlobalGetValueType(aliasee),
-                    0,
-                    aliasee,
-                    request.name
-                )
+                if (pointerIsNull(aliasee)) errors = errors + 1
+                else LLVMAddAlias2(
+                        backend.module,
+                        LLVMGlobalGetValueType(aliasee),
+                        0,
+                        aliasee,
+                        request.name
+                    )
             } else if (directAlias) {
                 val direct = LLVMGetNamedFunction(
                     backend.module,
@@ -688,13 +1291,46 @@ fun bootstrapLlvmEmitExports(
                         identities.symbols[source]
                     )
                 )
-                val alias = LLVMAddAlias2(
-                    backend.module,
-                    LLVMGlobalGetValueType(direct),
-                    0,
-                    direct,
-                    request.name
+                // Native calls may have introduced a declaration with the
+                // public name before late export materialization. Preserve
+                // that declaration's function type on the alias: naked
+                // assembly receives its real ABI through target registers,
+                // so its intentionally argument-free Abla signature need not
+                // describe the foreign entry type.
+                val shadow = LLVMGetNamedFunction(
+                    backend.module, request.name
                 )
+                var alias: i64* = nativeNullPointer()
+                if (!pointerIsNull(shadow) &&
+                    (nakedAssembly >= 0 ||
+                     bootstrapLlvmTargetUses32BitPointers(
+                         backend.targetTriple
+                     ) ||
+                     nativePointerAddress(LLVMGlobalGetValueType(shadow)) ==
+                     nativePointerAddress(LLVMGlobalGetValueType(direct)))) {
+                    val shadowType = LLVMGlobalGetValueType(shadow)
+                    val temporaryName =
+                        "abla.export.shadow.${index}"
+                    LLVMSetValueName2(
+                        shadow, temporaryName, temporaryName.size
+                    )
+                    alias = LLVMAddAlias2(
+                        backend.module,
+                        shadowType,
+                        0,
+                        direct,
+                        request.name
+                    )
+                    LLVMReplaceAllUsesWith(shadow, alias)
+                    LLVMDeleteFunction(shadow)
+                }
+                if (pointerIsNull(alias)) alias = LLVMAddAlias2(
+                        backend.module,
+                        LLVMGlobalGetValueType(direct),
+                        0,
+                        direct,
+                        request.name
+                    )
                 if (request.internal) {
                     LLVMSetLinkage(alias, llvmInternalLinkage())
                     retained.append(alias)

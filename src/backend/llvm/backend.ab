@@ -1,10 +1,20 @@
 import "exports.ab"
 
+fun bootstrapLlvmTraceMemory(label: string): void {
+    val configured = linuxEnvironment("ABLA_COMPILER_MEMORY_TRACE")
+    if (configured.found && configured.value != "") {
+        linuxWriteStandardError(
+            "abla-llvm-memory $label ${runtimeMemoryLiveBytes()}\n"
+        )
+    }
+}
+
 fun bootstrapEmitLlvmProgram(
     program: BootstrapIrProgram,
     targetTriple: string
 ): BootstrapLlvmEmission {
-    val exports = bootstrapTakeExportRequests()
+    bootstrapLlvmTraceMemory("program.begin")
+    var exports = bootstrapTakeExportRequests()
     val functionNames: array<string> = []
     val nativeNames: array<string> = []
     var index = 0
@@ -33,6 +43,23 @@ fun bootstrapEmitLlvmProgram(
     val nativeFunctionRoots = bootstrapLlvmNativeFunctionAddressRoots(
         program, functionIndex
     )
+    val exportReachability = bootstrapLlvmReachableExports(
+        program, exports, functionIndex, addressTaken,
+        interruptHandlerRoots, nativeFunctionRoots
+    )
+    val emittedFunctions: array<bool> = []
+    val closedProgram = bootstrapLlvmTargetHasClosedProgramBoundary(
+        targetTriple
+    )
+    index = 0
+    while (index < program.functions.size) {
+        emittedFunctions.append(
+            !closedProgram || exportReachability.functions[index]
+        )
+        index = index + 1
+    }
+    exports = exportReachability.exports
+    bootstrapLlvmTraceMemory("reachability.end")
     val interruptCode = bootstrapLlvmXtensaInterruptCode(
         program, functionIndex, interruptHandlerRoots, exports
     )
@@ -49,6 +76,7 @@ fun bootstrapEmitLlvmProgram(
                 backend, program, functionIndex
             )
     }
+    bootstrapLlvmTraceMemory("initialization-analysis.end")
     LLVMSetTarget(
         backend.module,
         nativePointerFromAddress(nativeCStringAddress(
@@ -63,17 +91,31 @@ fun bootstrapEmitLlvmProgram(
         backend, functionIndex.find("main") >= 0
     )
     bootstrapLlvmDeclareDispatchers(backend)
-    bootstrapLlvmDeclareProgramBoundaries(backend, program)
+    bootstrapLlvmDeclareProgramBoundaries(backend, program, exports)
     bootstrapLlvmEmitGlobals(backend, program)
     index = 0
     while (index < program.functions.size) {
-        bootstrapLlvmDeclareGeneratedFunction(
+        // Declare the complete typed call graph before selecting bodies. A
+        // declaration is metadata only and is discarded when unused; keeping
+        // it available makes a missed reachability edge a verifier error
+        // instead of passing a null LLVMValueRef to LLVMBuildCall2.
+        val generatedFunction = bootstrapLlvmDeclareGeneratedFunction(
             backend, identities.symbols[index]
         )
         val directFunction = bootstrapLlvmDeclareDirectFunction(
             backend, identities.symbols[index],
             program.functions[index]
         )
+        if (!emittedFunctions[index]) {
+            // LLVM rejects declaration-only values with internal linkage.
+            // Leave dormant declarations external and hidden; if a missed
+            // edge references one, verification succeeds and the native link
+            // reports the precise unresolved symbol instead of crashing.
+            LLVMSetLinkage(generatedFunction, llvmExternalLinkage())
+            LLVMSetVisibility(generatedFunction, llvmHiddenVisibility())
+            LLVMSetLinkage(directFunction, llvmExternalLinkage())
+            LLVMSetVisibility(directFunction, llvmHiddenVisibility())
+        }
         if (index < interruptCode.size && interruptCode[index]) {
             LLVMSetSection(directFunction, ".iram1.text")
         } else if (program.functions[index].section != "") {
@@ -87,6 +129,7 @@ fun bootstrapEmitLlvmProgram(
     bootstrapLlvmDeclareNativeFunctionAdapters(
         backend, program, nativeFunctionRoots, identities
     )
+    bootstrapLlvmTraceMemory("declarations.end")
     index = 0
     while (index < program.functions.size) {
         if (index < interruptHandlerRoots.size &&
@@ -97,28 +140,40 @@ fun bootstrapEmitLlvmProgram(
         }
         index = index + 1
     }
+    bootstrapLlvmTraceMemory("entry-declarations.end")
     var errors = program.errors + identities.collisions +
         bootstrapLlvmStableNameCollisions(classIndex.names) +
         bootstrapLlvmStableNameCollisions(fieldIndex.names)
     index = 0
     while (index < program.functions.size) {
-        val emissionCheckpoint = runtimeMemoryCheckpoint()
-        val functionErrors = bootstrapLlvmEmitFunction(
-            backend, program, program.functions[index], index,
-            functionIndex, identities, nativeIndex, globalIndex,
-            classIndex, fieldIndex, mayCollect
-        )
-        errors = errors + functionErrors
-        runtimeMemoryReset(emissionCheckpoint)
+        if (emittedFunctions[index]) {
+            val emissionCheckpoint = runtimeMemoryCheckpoint()
+            val functionErrors = bootstrapLlvmEmitFunction(
+                backend, program, program.functions[index], index,
+                functionIndex, identities, nativeIndex, globalIndex,
+                classIndex, fieldIndex, mayCollect,
+                exportReachability.assemblyRegionStarts[index],
+                exportReachability.assemblyRegionEnds[index],
+                exportReachability.assemblyRegionInstructions,
+                exportReachability.assemblyRegionOrdinals,
+                exportReachability.assemblyRegionReachable
+            )
+            errors = errors + functionErrors
+            runtimeMemoryReset(emissionCheckpoint)
+        }
         index = index + 1
     }
+    bootstrapLlvmTraceMemory("functions.end")
     index = 0
     while (index < program.functions.size) {
-        bootstrapLlvmEmitGeneratedWrapper(
-            backend, program.functions[index], identities.symbols[index]
-        )
+        if (emittedFunctions[index]) {
+            bootstrapLlvmEmitGeneratedWrapper(
+                backend, program.functions[index], identities.symbols[index]
+            )
+        }
         index = index + 1
     }
+    bootstrapLlvmTraceMemory("wrappers.end")
     index = 0
     while (index < program.functions.size) {
         if (index < interruptHandlerRoots.size &&
@@ -153,34 +208,45 @@ fun bootstrapEmitLlvmProgram(
         }
         index = index + 1
     }
+    bootstrapLlvmTraceMemory("interrupt-entries.end")
     bootstrapLlvmEmitSelfHostedRuntimeBridges(
         backend, program, identities
     )
+    bootstrapLlvmTraceMemory("runtime-bridges.end")
     bootstrapLlvmEmitClosureDispatchers(
-        backend, program, functionIndex, identities
+        backend, program, functionIndex, identities,
+        emittedFunctions
     )
     bootstrapLlvmEmitIndirectDispatcher(
-        backend, program, addressTaken, identities
+        backend, program, addressTaken, identities,
+        emittedFunctions
     )
+    bootstrapLlvmTraceMemory("dispatchers.end")
     errors = errors + bootstrapLlvmEmitExports(
         backend, program, exports, functionIndex, identities,
-        exportInitializationRequired
+        exportInitializationRequired, exportReachability.assemblyOwners
     )
+    bootstrapLlvmTraceMemory("exports.end")
     bootstrapLlvmEmitNativeFunctionAdapters(
         backend, program, nativeFunctionRoots, identities,
         exportInitializationRequired
     )
+    bootstrapLlvmTraceMemory("native-adapters.end")
     errors = errors + bootstrapLlvmEmitMain(
         backend, program, functionIndex, identities, globalIndex, exports
     )
+    bootstrapLlvmTraceMemory("module.end")
     LLVMDisposeBuilder(backend.builder)
     var owned = LlvmOwnedModule(
         backend.context, backend.module, 0, false
     )
     val verification = owned.verify()
+    bootstrapLlvmTraceMemory("verification.end")
     if (verification != 0) errors = errors + 1
     val output = owned.render()
+    bootstrapLlvmTraceMemory("render.end")
     owned.drop()
+    bootstrapLlvmTraceMemory("module.drop")
     BootstrapLlvmEmission(
         output, errors, bootstrapLlvmExportAbi(exports)
     )
@@ -191,8 +257,12 @@ fun bootstrapCompileLlvmParsedCached(
     var cache: BootstrapIrCacheState,
     targetTriple: string
 ): BootstrapLlvmCompilation {
+    bootstrapLlvmTraceMemory("frontend.annotations.begin")
     val annotationErrors = bootstrapStageAnnotatedExports(parsed)
+    bootstrapLlvmTraceMemory("frontend.annotations.end")
+    bootstrapLlvmTraceMemory("frontend.semantic.begin")
     val analyzed = bootstrapAnalyzeParsed(parsed)
+    bootstrapLlvmTraceMemory("frontend.semantic.end")
     val actionInputPaths: array<string> = []
     val actionInputContents: array<string> = []
     var actionErrors = 0
@@ -233,7 +303,12 @@ fun bootstrapCompileLlvmParsedCached(
         }
         action = action + 1
     }
+    bootstrapLlvmTraceMemory("frontend.actions.end")
+    bootstrapLlvmTraceMemory("frontend.lowering.begin")
     val program = bootstrapLowerParsedCached(parsed, analyzed, cache)
+    bootstrapLlvmTraceMemory(
+        "frontend.lowering.end:${program.functions.size}"
+    )
     bootstrapMergeCompileInputs(
         program.compileInputPaths,
         program.compileInputContents,

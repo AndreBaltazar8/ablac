@@ -76,6 +76,34 @@ fun bootstrapLlvmBackend(targetTriple: string): BootstrapLlvmBackend {
     )
 }
 
+// LLVM's opaque pointer type does not expose the target address width. Keep
+// the small set of 32-bit triples in one target-neutral predicate so C ABI
+// helpers use size_t rather than accidentally retaining the host's i64 ABI.
+fun bootstrapLlvmTargetUses32BitPointers(targetTriple: string): bool =
+    bootstrapTextContains(targetTriple, "xtensa") ||
+    bootstrapTextContains(targetTriple, "riscv32") ||
+    bootstrapTextContains(targetTriple, "thumb") ||
+    bootstrapTextContains(targetTriple, "wasm32") ||
+    bootstrapTextContains(targetTriple, "i386") ||
+    bootstrapTextContains(targetTriple, "i486") ||
+    bootstrapTextContains(targetTriple, "i586") ||
+    bootstrapTextContains(targetTriple, "i686")
+
+// Hosted programs can reach methods through runtime-owned reflection tables
+// that are deliberately broader than the static call graph. Freestanding ELF
+// and bare Wasm artifacts have a closed program boundary, so they can safely
+// omit unreachable functions before asking LLVM to build the module.
+fun bootstrapLlvmTargetHasClosedProgramBoundary(
+    targetTriple: string
+): bool = bootstrapTextContains(targetTriple, "unknown-elf") ||
+    bootstrapTextContains(targetTriple, "unknown-none") ||
+    bootstrapTextContains(targetTriple, "wasm32-unknown-unknown")
+
+fun BootstrapLlvmBackend.nativeSizeType(): i64* =
+    if (bootstrapLlvmTargetUses32BitPointers(this.targetTriple)) {
+        this.i32Type
+    } else this.i64Type
+
 fun BootstrapLlvmBackend.type(code: string): i64* {
     var result = this.pointerType
     if (code == "void") result = this.voidType
@@ -129,6 +157,18 @@ fun bootstrapLlvmAddFunctionAttribute(
     // LLVMAttributeFunctionIndex is the all-ones unsigned index. The C API
     // accepts the same bit pattern through its signed i32 binding.
     LLVMAddAttributeAtIndex(value, -1, attribute)
+}
+
+fun bootstrapLlvmAddStringFunctionAttribute(
+    backend: BootstrapLlvmBackend,
+    function: i64*,
+    name: string,
+    value: string
+): void {
+    val attribute = LLVMCreateStringAttribute(
+        backend.context, name, name.size, value, value.size
+    )
+    LLVMAddAttributeAtIndex(function, -1, attribute)
 }
 
 fun bootstrapLlvmAddSret(
@@ -356,6 +396,35 @@ fun bootstrapLlvmGlobalStringPointer(
 ): i64* {
     val constant = LLVMConstStringInContext2(
         backend.context, value, value.size, 0
+    )
+    val constantType = LLVMTypeOf(constant)
+    val global = LLVMAddGlobal(backend.module, constantType, name)
+    LLVMSetInitializer(global, constant)
+    LLVMSetGlobalConstant(global, 1)
+    LLVMSetAlignment(global, 1)
+    LLVMSetUnnamedAddress(global, llvmHiddenVisibilityUnnamedAddress())
+    LLVMSetLinkage(global, llvmPrivateLinkage())
+    val indices = llvmPointerVector(2)
+    indices.set(0, LLVMConstInt(backend.i64Type, 0, 0))
+    indices.set(1, LLVMConstInt(backend.i64Type, 0, 0))
+    val pointer = LLVMBuildGEP2(
+        backend.builder, constantType, global, indices.pointer(), 2,
+        "$name.data"
+    )
+    indices.drop()
+    pointer
+}
+
+// The raw-data counterpart to bootstrapLlvmGlobalStringPointer. LLVM string
+// constants are a convenient byte container, but native static data must not
+// gain the implicit C terminator used by an Abla string literal.
+fun bootstrapLlvmGlobalBytesPointer(
+    backend: BootstrapLlvmBackend,
+    value: string,
+    name: string
+): i64* {
+    val constant = LLVMConstStringInContext2(
+        backend.context, value, value.size, 1
     )
     val constantType = LLVMTypeOf(constant)
     val global = LLVMAddGlobal(backend.module, constantType, name)
