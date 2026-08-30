@@ -1995,7 +1995,11 @@ class BootstrapSemanticResult(
 class BootstrapCompileEffectSummary(
     val names: array<string>,
     val methodNames: array<string>,
-    val masks: array<int>
+    val masks: array<int>,
+    val nameSlots: array<int>,
+    val nameNext: array<int>,
+    val methodSlots: array<int>,
+    val methodNext: array<int>
 )
 
 fun bootstrapCompileEffectHas(mask: int, effect: int): bool =
@@ -2118,16 +2122,19 @@ fun bootstrapCompileEffectLookup(
          name == "runtimeMemorySetLimit" ||
          name == "runtimeMemoryCollect")
     if (runtimeMemoryBuiltin) return 1
-    var index = 0
-    while (index < summary.names.size) {
-        val matches = if (method) {
-            summary.methodNames[index] == name
-        } else summary.names[index] == name
-        if (matches) mask = bootstrapCompileEffectMerge(
-            mask,
-            summary.masks[index]
-        )
-        index = index + 1
+    val slots = if (method) summary.methodSlots else summary.nameSlots
+    val next = if (method) summary.methodNext else summary.nameNext
+    if (slots.size == 0) return mask
+    var slot = bootstrapFunctionDeclarationHash(name)
+    slot = slot - slot / slots.size * slots.size
+    var index = slots[slot]
+    while (index >= 0) {
+        val matches = if (method) summary.methodNames[index] == name
+            else summary.names[index] == name
+        if (matches) {
+            mask = bootstrapCompileEffectMerge(mask, summary.masks[index])
+        }
+        index = next[index]
     }
     mask
 }
@@ -2275,7 +2282,50 @@ fun bootstrapBuildCompileEffectSummary(
         }
         declarationIndex = declarationIndex + 1
     }
-    val summary = BootstrapCompileEffectSummary(names, methodNames, masks)
+    var effectIndexCapacity = 8
+    while (effectIndexCapacity < names.size * 2 + 1) {
+        effectIndexCapacity = effectIndexCapacity * 2
+    }
+    val nameSlots: array<int> = []
+    val methodSlots: array<int> = []
+    var effectSlot = 0
+    while (effectSlot < effectIndexCapacity) {
+        nameSlots.append(-1)
+        methodSlots.append(-1)
+        effectSlot = effectSlot + 1
+    }
+    val nameNext: array<int> = []
+    val methodNext: array<int> = []
+    var effectEntry = 0
+    while (effectEntry < names.size) {
+        var nameSlot = bootstrapFunctionDeclarationHash(names[effectEntry])
+        nameSlot = nameSlot - nameSlot / effectIndexCapacity *
+            effectIndexCapacity
+        nameNext.append(nameSlots[nameSlot])
+        nameSlots[nameSlot] = effectEntry
+
+        var methodNextEntry = -1
+        if (methodNames[effectEntry] != "") {
+            var methodSlot = bootstrapFunctionDeclarationHash(
+                methodNames[effectEntry]
+            )
+            methodSlot = methodSlot - methodSlot / effectIndexCapacity *
+                effectIndexCapacity
+            methodNextEntry = methodSlots[methodSlot]
+            methodSlots[methodSlot] = effectEntry
+        }
+        methodNext.append(methodNextEntry)
+        effectEntry = effectEntry + 1
+    }
+    val summary = BootstrapCompileEffectSummary(
+        names,
+        methodNames,
+        masks,
+        nameSlots,
+        nameNext,
+        methodSlots,
+        methodNext
+    )
     val globalDelegatedNames: array<string> = []
     declarationIndex = 0
     while (declarationIndex < declarations.size) {
@@ -3199,6 +3249,8 @@ class BootstrapMethodDeclarationIndex(
     val keys: array<string>,
     val declarations: array<BootstrapDeclaration>,
     val handles: array<int>,
+    val inherentCompileOnly: array<bool>,
+    val inherentTrusted: array<bool>,
     val slots: array<int>
 ) {
     fun find(owner: string, name: string): int {
@@ -3233,6 +3285,8 @@ fun bootstrapMethodDeclarationIndex(
     val keys: array<string> = []
     val methods: array<BootstrapDeclaration> = []
     val handles: array<int> = []
+    val inherentCompileOnly: array<bool> = []
+    val inherentTrusted: array<bool> = []
     var nextMethodHandle = declarations.size
     var declaration = 0
     while (declaration < declarations.size) {
@@ -3255,6 +3309,10 @@ fun bootstrapMethodDeclarationIndex(
             ))
             methods.append(candidate.methods[method])
             handles.append(nextMethodHandle)
+            inherentCompileOnly.append(
+                candidate.methods[method].kind == "compile.fun"
+            )
+            inherentTrusted.append(candidate.methods[method].isTrusted)
             nextMethodHandle = nextMethodHandle + 1
             method = method + 1
         }
@@ -3287,7 +3345,14 @@ fun bootstrapMethodDeclarationIndex(
         }
         entry = entry + 1
     }
-    BootstrapMethodDeclarationIndex(keys, methods, handles, slots)
+    BootstrapMethodDeclarationIndex(
+        keys,
+        methods,
+        handles,
+        inherentCompileOnly,
+        inherentTrusted,
+        slots
+    )
 }
 
 class BootstrapAnalyzer(
@@ -4264,32 +4329,70 @@ class BootstrapAnalyzer(
     fun typeIsAffine(type: string): bool =
         bootstrapSummaryTypeIsAffine(type, this.affineTypes)
 
-    fun typeIsManagedReference(type: string): bool {
+    fun typeIsManagedReferenceAt(type: string, depth: int): bool {
         val normalized = bootstrapNormalizeType(type)
         if (bootstrapScalarTypeUnderlyingValid(normalized) ||
             normalized == "void" || normalized == "never" ||
             normalized == "unknown" || normalized == "string" ||
             normalized == "cstring" ||
             bootstrapIsFunctionType(normalized) ||
-            bootstrapIsBorrowType(normalized)) false else
-            bootstrapSummaryTypeIsManagedReference(
-                normalized, this.declarations
+            bootstrapIsBorrowType(normalized)) return false
+        if (bootstrapIsArrayType(normalized) ||
+            bootstrapIsCellType(normalized)) return true
+        val declaration = this.typeDeclarations.find(normalized)
+        if (declaration >= 0) {
+            val kind = this.declarations[declaration].kind
+            if (kind == "class" || kind == "interface") return true
+        }
+        if (depth < 32 && bootstrapIsNullableType(normalized)) {
+            return this.typeIsManagedReferenceAt(
+                bootstrapNullableElementType(normalized), depth + 1
             )
+        }
+        false
     }
 
-    fun typeNeedsManagedAliasTracking(type: string): bool {
+    fun typeIsManagedReference(type: string): bool =
+        this.typeIsManagedReferenceAt(type, 0)
+
+    fun typeNeedsManagedAliasTrackingAt(type: string, depth: int): bool {
         val normalized = bootstrapNormalizeType(type)
         if (bootstrapScalarTypeUnderlyingValid(normalized) ||
             normalized == "void" || normalized == "never" ||
             normalized == "unknown" || normalized == "string" ||
             normalized == "cstring" ||
             bootstrapIsFunctionType(normalized) ||
-            bootstrapIsBorrowType(normalized)) false else
-            bootstrapSummaryTypeNeedsManagedAliasTracking(
-                normalized,
-                this.declarations
+            bootstrapIsBorrowType(normalized)) return false
+        var element = normalized
+        var nullableDepth = 0
+        while (nullableDepth < 32 && bootstrapIsNullableType(element)) {
+            element = bootstrapNullableElementType(element)
+            nullableDepth = nullableDepth + 1
+        }
+        if (depth == 0 && bootstrapIsArrayType(element)) return true
+        if (depth >= 32) return false
+        val declaration = this.typeDeclarations.find(element)
+        if (declaration < 0 ||
+            this.declarations[declaration].kind != "class") return false
+        val candidate = this.declarations[declaration]
+        var field = 0
+        while (field < candidate.parameterTypes.size) {
+            if (field < candidate.parameterKinds.size &&
+                candidate.parameterKinds[field] == "var") return true
+            val fieldType = bootstrapNormalizeType(
+                candidate.parameterTypes[field]
             )
+            if (!bootstrapIsArrayType(fieldType) &&
+                this.typeNeedsManagedAliasTrackingAt(
+                    fieldType, depth + 1
+                )) return true
+            field = field + 1
+        }
+        false
     }
+
+    fun typeNeedsManagedAliasTracking(type: string): bool =
+        this.typeNeedsManagedAliasTrackingAt(type, 0)
 
     fun typeIsBorrowTracked(type: string): bool {
         this.typeIsAffine(type) || this.typeIsManagedReference(type)
@@ -4307,12 +4410,10 @@ class BootstrapAnalyzer(
         expression: BootstrapExpression
     ): string {
         var source = ""
-        var declaration = 0
-        while (declaration < this.declarations.size) {
+        val declaration = this.typeDeclarations.find(expression.text)
+        if (declaration >= 0) {
             val candidate = this.declarations[declaration]
-            if (candidate.kind == "class" &&
-                !candidate.isResource &&
-                candidate.name == expression.text) {
+            if (candidate.kind == "class" && !candidate.isResource) {
                 var mutableContainer = false
                 var field = 0
                 while (!mutableContainer &&
@@ -4347,7 +4448,6 @@ class BootstrapAnalyzer(
                     parameter = parameter + 1
                 }
             }
-            declaration = declaration + 1
         }
         source
     }
@@ -4431,8 +4531,10 @@ class BootstrapAnalyzer(
             )
         }
         if (!fresh && expression.kind == "call" && depth < 32) {
-            var declaration = 0
-            while (!fresh && declaration < this.declarations.size) {
+            val declaration = this.functionDeclarations.find(
+                expression.text
+            )
+            if (declaration >= 0) {
                 val candidate = this.declarations[declaration]
                 if ((candidate.kind == "fun" ||
                      candidate.kind == "compile.fun") &&
@@ -4444,7 +4546,6 @@ class BootstrapAnalyzer(
                         false
                     )
                 }
-                declaration = declaration + 1
             }
         }
         fresh
@@ -4497,23 +4598,20 @@ class BootstrapAnalyzer(
                 this.ownershipExpressionType(expression.children[0])
             )
         }
-        var declaration = 0
-        while (!fresh && declaration < this.declarations.size) {
-            val candidate = this.declarations[declaration]
-            if (candidate.extensionOwner != "" &&
-                bootstrapNormalizeType(candidate.extensionOwner) == owner &&
-                candidate.name == expression.text &&
-                bootstrapTypesCompatible(
+        val entry = this.methodDeclarations.find(owner, expression.text)
+        if (entry >= 0) {
+            val found = this.methodDeclarations.declarations[entry]
+            if (bootstrapTypesCompatible(
                     expected,
-                    bootstrapNormalizeType(candidate.resultType)
+                    bootstrapNormalizeType(found.resultType)
                 )) {
                 fresh = this.expressionProducesFreshManagedReference(
-                    candidate.expression,
+                    found.expression,
                     0,
                     false
                 )
                 if (!fresh && this.expressionReturnsReceiver(
-                        candidate.expression
+                        found.expression
                     )) {
                     val receiver = expression.children[0]
                     fresh = this.expressionProducesFreshManagedReference(
@@ -4529,40 +4627,6 @@ class BootstrapAnalyzer(
                     }
                 }
             }
-            var method = 0
-            while (!fresh && candidate.name == owner &&
-                   method < candidate.methods.size) {
-                val found = candidate.methods[method]
-                if (found.name == expression.text &&
-                    bootstrapTypesCompatible(
-                        expected,
-                        bootstrapNormalizeType(found.resultType)
-                    )) {
-                    fresh = this.expressionProducesFreshManagedReference(
-                        found.expression,
-                        0,
-                        false
-                    )
-                    if (!fresh && this.expressionReturnsReceiver(
-                            found.expression
-                        )) {
-                        val receiver = expression.children[0]
-                        fresh = this.expressionProducesFreshManagedReference(
-                            receiver,
-                            0,
-                            true
-                        )
-                        if (!fresh && receiver.kind == "member.call") {
-                            fresh = this.memberCallProducesFreshManagedReference(
-                                receiver,
-                                owner
-                            )
-                        }
-                    }
-                }
-                method = method + 1
-            }
-            declaration = declaration + 1
         }
         fresh
     }
@@ -4807,15 +4871,10 @@ class BootstrapAnalyzer(
             result = this.declarations[handle].kind == "compile.fun"
         }
         if (handle >= this.declarations.size) {
-            var cursor = this.declarations.size
-            var owner = 0
-            while (owner < this.declarations.size) {
-                val next = cursor + this.declarations[owner].methods.size
-                if (handle >= cursor && handle < next) {
-                    result = this.declarations[owner].methods[handle - cursor].kind == "compile.fun"
-                }
-                cursor = next
-                owner = owner + 1
+            val method = handle - this.declarations.size
+            if (method >= 0 &&
+                method < this.methodDeclarations.inherentCompileOnly.size) {
+                result = this.methodDeclarations.inherentCompileOnly[method]
             }
         }
         result
@@ -4827,15 +4886,10 @@ class BootstrapAnalyzer(
             result = this.declarations[handle].isTrusted
         }
         if (handle >= this.declarations.size) {
-            var cursor = this.declarations.size
-            var owner = 0
-            while (owner < this.declarations.size) {
-                val next = cursor + this.declarations[owner].methods.size
-                if (handle >= cursor && handle < next) {
-                    result = this.declarations[owner].methods[handle - cursor].isTrusted
-                }
-                cursor = next
-                owner = owner + 1
+            val method = handle - this.declarations.size
+            if (method >= 0 &&
+                method < this.methodDeclarations.inherentTrusted.size) {
+                result = this.methodDeclarations.inherentTrusted[method]
             }
         }
         result
