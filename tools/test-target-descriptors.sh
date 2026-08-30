@@ -38,5 +38,29 @@ grep -q 'RISC-V' "$directory/riscv64.header"
 grep -q '"llvmTriple":"riscv64-unknown-elf"' \
     "$directory/riscv64.o.abi.json"
 
+"$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
+    --fast --no-cache \
+    --target-triple riscv64-unknown-elf --object-format elf \
+    -o "$directory/raw-riscv64.o"
+llvm-readelf -h "$directory/raw-riscv64.o" \
+    > "$directory/raw-riscv64.header"
+grep -q 'RISC-V' "$directory/raw-riscv64.header"
+grep -q '"llvmTriple":"riscv64-unknown-elf"' \
+    "$directory/raw-riscv64.o.abi.json"
+
+set +e
+"$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
+    --fast --no-cache \
+    --target-triple riscv64-unknown-elf --object-format elf \
+    --emit executable -o "$directory/raw-executable" \
+    >"$directory/raw-executable.out" \
+    2>"$directory/raw-executable.err"
+raw_executable_status=$?
+set -e
+[[ $raw_executable_status -eq 2 ]]
+grep -q 'emits only object or static-library artifacts' \
+    "$directory/raw-executable.err"
+[[ ! -e "$directory/raw-executable" ]]
+
 printf '%s\n' \
-    'target descriptors: hosted, arbitrary LLVM object, and deterministic unsupported-target diagnostics passed'
+    'target descriptors: hosted, extension-defined and raw LLVM objects, and deterministic unsupported-target diagnostics passed'
