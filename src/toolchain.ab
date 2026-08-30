@@ -343,6 +343,12 @@ fun bootstrapExternalEmitObjectForTarget(
     } else if (mcuTarget) {
         "-passes=default<Oz>,globaldce"
     } else "-passes=default<O2>,globaldce")
+    // LLVM can still expand constant-trip loops under Oz. On MCUs this often
+    // duplicates MMIO and call sequences (for example one copy per byte or
+    // digit), increasing both flash use and instruction-cache pressure. Make
+    // the size policy automatic for every supported MCU target instead of
+    // requiring source annotations on individual loops.
+    if (mcuTarget && !fast) optimize.argument("--disable-loop-unrolling")
     optimize.argument(optimizationSource)
     optimize.argument("-o")
     optimize.argument(inputPath)
@@ -1172,9 +1178,19 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "abla/runtime/platform/wasm.ab"
         } else "abla/runtime/platform/host.ab"
     ).text
-    val rootSource = graph.load(sourcePath)
-    val runtimePlatformSource = graph.load(runtimePlatform)
-    val source = "${graph.load(selfHostedRuntime)}\n$runtimePlatformSource\n$rootSource"
+    bootstrapLlvmTraceMemory("frontend.graph-load.begin")
+    graph.load(sourcePath)
+    bootstrapLlvmTraceMemory(
+        "frontend.graph-load.source:${orderedSnapshots.size}"
+    )
+    graph.load(runtimePlatform)
+    bootstrapLlvmTraceMemory(
+        "frontend.graph-load.platform:${orderedSnapshots.size}"
+    )
+    graph.load(selfHostedRuntime)
+    bootstrapLlvmTraceMemory(
+        "frontend.graph-load.end:${orderedSnapshots.size}"
+    )
     val rootManifestPath = bootstrapRootManifestPath(sourcePath)
     val nativeLibraryManifest =
         bootstrapNativeManifestLibraries(rootManifestPath.text)
@@ -1200,9 +1216,15 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // Platform libraries remain demand-driven. Detect the narrow TLS ABI in
     // the resolved module graph so programs that do not import hosted TLS do
     // not gain either a dependency or dynamic-loader startup work.
-    val linkOpenSsl = bootstrapTextContains(
-        source, "fun OpenSSL_version_num()"
-    )
+    var linkOpenSsl = false
+    var sourceModule = 0
+    while (!linkOpenSsl && sourceModule < orderedSnapshots.size) {
+        linkOpenSsl = bootstrapTextContains(
+            orderedSnapshots[sourceModule].source,
+            "fun OpenSSL_version_num()"
+        )
+        sourceModule = sourceModule + 1
+    }
     // Filesystem-read providers have serialized content identities. Other
     // ambient effects remain uncached because they do not yet have a stable
     // deterministic provider contract.
@@ -1220,7 +1242,18 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val manifestPath = rootManifestPath
     val manifest = manifestPath.readText()
     val targetIdentity = "${target.name}:${target.llvmTriple}:${target.objectFormat}:${target.hosted}:${target.libcFree}:${target.entrySymbol}:${target.linkerFlavor}:${target.linkerEmulation}"
-    val sourceIdentity = "$source\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact"
+    // Cache identity needs stable content identity, not a materialized copy of
+    // every imported source. Module snapshots already carry two independent
+    // content fingerprints plus size and canonical path.
+    var graphIdentity = "abla-module-graph-v1"
+    var identityModule = 0
+    while (identityModule < orderedSnapshots.size) {
+        val snapshot = orderedSnapshots[identityModule]
+        graphIdentity =
+            "$graphIdentity\n${snapshot.path}:${snapshot.size}:${snapshot.firstFingerprint}:${snapshot.secondFingerprint}"
+        identityModule = identityModule + 1
+    }
+    val sourceIdentity = "$graphIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact"
     // Release hosted executables retain their ordinary relocatable sidecar,
     // but the executable itself may additionally be optimized across the
     // generated program and runtime boundary. LLVM-backed compiler programs
@@ -1308,8 +1341,13 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (status != 0) failureKind = "io"
     }
     if (!cached) {
+        bootstrapLlvmTraceMemory("frontend.parse.begin")
+        val parsedGraph = graph.parse()
+        bootstrapLlvmTraceMemory(
+            "frontend.parse.end:${parsedGraph.declarations.size}"
+        )
         val compilation = bootstrapCompileLlvmParsedCached(
-            graph.parse(),
+            parsedGraph,
             irCache,
             target.llvmTriple
         )

@@ -3,6 +3,32 @@ import "package.ab"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
 
+fun bootstrapFrontendTraceMemory(label: string): void {
+    val configured = linuxEnvironment("ABLA_COMPILER_MEMORY_TRACE")
+    if (configured.found && configured.value != "") {
+        linuxWriteStandardError(
+            "abla-frontend-memory $label ${runtimeMemoryLiveBytes()}\n"
+        )
+    }
+}
+
+fun bootstrapActionsRegisterSubparser(
+    actions: array<BootstrapExpression>
+): bool {
+    var found = false
+    var index = 0
+    while (!found && index < actions.size) {
+        var expression = actions[index]
+        if (expression.kind == "compile" && expression.children.size == 1) {
+            expression = expression.children[0]
+        }
+        found = expression.kind == "call" &&
+            expression.text == "compilerRegisterSubparser"
+        index = index + 1
+    }
+    found
+}
+
 // Module identity is lexical and deterministic: it does not consult the host
 // filesystem or resolve symlinks. This keeps absent generated inputs, caches,
 // and watched builds reproducible while collapsing path aliases.
@@ -1823,17 +1849,19 @@ class BootstrapModuleGraph(
         var unqualifiedAmbiguities = 0
         var ambiguityDiagnostics = ""
         if (edge.alias == "") {
-            val targetDeclarations = bootstrapParseWithIdentity(
-                Path(target).readText(), target
-            ).declarations
+            // Import discovery already parsed every module into the shared
+            // snapshot. Reuse it here instead of reparsing the target and all
+            // preceding imports for every edge.
+            val targetDeclarations =
+                this.state.acquire(target).discovery.declarations
             index = 0
             while (index < this.aliases.size) {
                 val found = this.aliases[index]
                 if (found.importer == importer.path && found.alias == "" &&
                     found.target != target) {
-                    val foundDeclarations = bootstrapParseWithIdentity(
-                        Path(found.target).readText(), found.target
-                    ).declarations
+                    val foundDeclarations = this.state.acquire(
+                        found.target
+                    ).discovery.declarations
                     var targetDeclaration = 0
                     while (targetDeclaration < targetDeclarations.size) {
                         var foundDeclaration = 0
@@ -1963,6 +1991,7 @@ class BootstrapModuleGraph(
         var output = ""
         if (!this.contains(identity)) {
             val snapshot = this.state.acquire(identity)
+            bootstrapFrontendTraceMemory("graph.acquire:$identity")
             this.errors = this.errors + snapshot.importErrors
             this.diagnostics =
                 "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
@@ -1981,8 +2010,8 @@ class BootstrapModuleGraph(
                         bootstrapImportAliasExposedTarget(imported)
                     )
                     if (edge.contractOnly) {
-                        output = "$output${this.loadContract(imported)}\n"
-                    } else output = "$output${this.load(imported)}\n"
+                        this.loadContract(imported)
+                    } else this.load(imported)
                 } else {
                     val provider = bootstrapEvaluateImportProvider(
                         edge.source, this.orderedSnapshots,
@@ -1999,9 +2028,8 @@ class BootstrapModuleGraph(
                                 bootstrapImportAliasExposedTarget(imported)
                             )
                             if (edge.contractOnly) {
-                                output =
-                                    "$output${this.loadContract(imported)}\n"
-                            } else output = "$output${this.load(imported)}\n"
+                                this.loadContract(imported)
+                            } else this.load(imported)
                         } else {
                             this.errors = this.errors + 1
                             this.diagnostics =
@@ -2016,13 +2044,23 @@ class BootstrapModuleGraph(
                 index = index + 1
             }
             this.orderedSnapshots.append(snapshot)
-            output = "$output${snapshot.source}\n"
+            // parse() consumes orderedSnapshots. Return only this requested
+            // module instead of rebuilding the transitive graph as text at
+            // each recursion level.
+            output = snapshot.source
         }
         output
     }
 
     fun parse(): BootstrapParseResult {
+        bootstrapFrontendTraceMemory(
+            "parse.begin:${this.orderedSnapshots.size}"
+        )
         bootstrapResetPendingFunctionAnnotations()
+        // Clear transactional transform requests once per candidate graph.
+        // Ordinary modules now bypass transform processing entirely.
+        bootstrapTakeFunctionBodyReplacements()
+        bootstrapTakeFunctionAnnotationAdditions()
         val declarations: array<BootstrapDeclaration> = []
         val actions: array<BootstrapExpression> = []
         val compileInputPaths: array<string> = []
@@ -2038,9 +2076,13 @@ class BootstrapModuleGraph(
             ))
             preparedIndex = preparedIndex + 1
         }
+        bootstrapFrontendTraceMemory(
+            "parse.prepared:${preparedSnapshots.size}"
+        )
         val aliasValidation = bootstrapValidateImportAliases(
             this.aliases, this.state
         )
+        bootstrapFrontendTraceMemory("parse.aliases")
         var parseErrors = this.errors + aliasValidation.errors
         var extensionErrors = 0
         var parseDiagnostics =
@@ -2093,6 +2135,9 @@ class BootstrapModuleGraph(
                     1000000007
             requestedModule = requestedModule + 1
         }
+        bootstrapFrontendTraceMemory(
+            "parse.interfaces:${completeDeclarations.size}"
+        )
         val allowedCompileEffects = bootstrapBuildCompileEffectGrants(
             requestedEffects,
             authorizedEffects
@@ -2103,38 +2148,47 @@ class BootstrapModuleGraph(
         var currentDeclarationBegin = 0
         while (moduleIndex < preparedSnapshots.size) {
             val snapshot = preparedSnapshots[moduleIndex]
-            val visibleDeclarations: array<BootstrapDeclaration> = []
-            var declarationIndex = 0
-            while (declarationIndex < handlerDeclarations.size) {
-                visibleDeclarations.append(
-                    handlerDeclarations[declarationIndex]
-                )
-                declarationIndex = declarationIndex + 1
-            }
-            declarationIndex = 0
-            while (declarationIndex < snapshot.discovery.declarations.size) {
-                visibleDeclarations.append(
-                    snapshot.discovery.declarations[declarationIndex]
-                )
-                declarationIndex = declarationIndex + 1
-            }
-
-            val localRegistry = bootstrapBuildSubparserRegistry(
-                BootstrapParseResult(
-                    visibleDeclarations,
-                    snapshot.discovery.actions,
-                    snapshot.discovery.errors,
-                    snapshot.discovery.extensionErrors,
-                    [],
-                    [],
-                    snapshot.discovery.diagnostics
-                )
+            bootstrapFrontendTraceMemory(
+                "parse.module.begin:$moduleIndex:${snapshot.path}"
             )
+            var localRegistry = BootstrapSubparserRegistry([], 0, "")
+            if (bootstrapActionsRegisterSubparser(
+                snapshot.discovery.actions
+            )) {
+                val visibleDeclarations: array<BootstrapDeclaration> = []
+                var visibleDeclaration = 0
+                while (visibleDeclaration < handlerDeclarations.size) {
+                    visibleDeclarations.append(
+                        handlerDeclarations[visibleDeclaration]
+                    )
+                    visibleDeclaration = visibleDeclaration + 1
+                }
+                visibleDeclaration = 0
+                while (visibleDeclaration <
+                    snapshot.discovery.declarations.size) {
+                    visibleDeclarations.append(
+                        snapshot.discovery.declarations[visibleDeclaration]
+                    )
+                    visibleDeclaration = visibleDeclaration + 1
+                }
+                localRegistry = bootstrapBuildSubparserRegistry(
+                    BootstrapParseResult(
+                        visibleDeclarations,
+                        snapshot.discovery.actions,
+                        snapshot.discovery.errors,
+                        snapshot.discovery.extensionErrors,
+                        [],
+                        [],
+                        snapshot.discovery.diagnostics
+                    )
+                )
+            }
             parseErrors = parseErrors + localRegistry.errors
             extensionErrors = extensionErrors + localRegistry.errors
             parseDiagnostics =
                 "$parseDiagnostics${localRegistry.diagnostics}"
             val moduleRegistrations: array<BootstrapSubparserRegistration> = []
+            var declarationIndex = 0
             var registrationIndex = 0
             while (registrationIndex < importedRegistrations.size) {
                 moduleRegistrations.append(
@@ -2184,6 +2238,9 @@ class BootstrapModuleGraph(
                 BootstrapSubparserRegistry(moduleRegistrations, 0, ""),
                 allowedCompileEffects
             )
+            bootstrapFrontendTraceMemory(
+                "parse.module.end:$moduleIndex:${parsed.declarations.size}"
+            )
             val interfaceIdentity = bootstrapModuleInterfaceIdentity(
                 parsed,
                 snapshot.firstFingerprint,
@@ -2225,6 +2282,9 @@ class BootstrapModuleGraph(
             currentDeclarationBegin = currentDeclarationBegin +
                 snapshot.discovery.declarations.size
         }
+        bootstrapFrontendTraceMemory(
+            "parse.modules.end:${declarations.size}"
+        )
         var capability = 0
         while (capability < this.authorizedCompileCapabilities.size) {
             actions.append(BootstrapExpression(
@@ -2242,7 +2302,8 @@ class BootstrapModuleGraph(
         extensionErrors = extensionErrors + pendingAnnotationErrors
         if (pendingAnnotationErrors > 0) parseDiagnostics =
             "${parseDiagnostics}error[E_COMPILER_TRANSFORM_ANNOTATION_TARGET]: transformed annotation target was not unique in the complete module graph\n"
-        bootstrapNormalizeNamedArguments(BootstrapParseResult(
+        bootstrapFrontendTraceMemory("parse.normalize.begin")
+        val normalized = bootstrapNormalizeNamedArguments(BootstrapParseResult(
             declarations,
             actions,
             parseErrors,
@@ -2251,6 +2312,8 @@ class BootstrapModuleGraph(
             compileInputContents,
             parseDiagnostics
         ))
+        bootstrapFrontendTraceMemory("parse.normalize.end")
+        normalized
     }
 }
 

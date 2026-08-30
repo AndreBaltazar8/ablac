@@ -2,6 +2,29 @@ import "subparser.ab"
 
 fun bootstrapSemanticUnit(): void {}
 
+class BootstrapStaticString(
+    val text: string,
+    val valid: bool
+)
+
+// Inline assembly requires compile-time text, but source authors should be
+// able to split a long template or constraint list into adjacent constant
+// additions for readability. This remains a compile-time value and introduces
+// no runtime string work in the emitted program.
+fun bootstrapStaticString(expression: BootstrapExpression): BootstrapStaticString {
+    var result = BootstrapStaticString("", false)
+    if (expression.kind == "string") {
+        result = BootstrapStaticString(expression.text, true)
+    } else if (expression.kind == "+" && expression.children.size == 2) {
+        val left = bootstrapStaticString(expression.children[0])
+        val right = bootstrapStaticString(expression.children[1])
+        if (left.valid && right.valid) {
+            result = BootstrapStaticString("${left.text}${right.text}", true)
+        }
+    }
+    result
+}
+
 fun bootstrapPlaceRootName(expression: BootstrapExpression): string {
     var root = ""
     if (expression.kind == "identifier") root = expression.text
@@ -1403,11 +1426,13 @@ fun bootstrapTypesCompatibleWithInferredNoEscape(
     declarations: array<BootstrapDeclaration>
 ): bool {
     var compatible = bootstrapTypesCompatible(expected, actual)
-    val scalarUnderlying = bootstrapScalarTypeUnderlying(
-        declarations, actual
-    )
-    if (!compatible && scalarUnderlying != "") {
-        compatible = bootstrapTypesCompatible(expected, scalarUnderlying)
+    if (!compatible) {
+        val scalarUnderlying = bootstrapScalarTypeUnderlying(
+            declarations, actual
+        )
+        if (scalarUnderlying != "") {
+            compatible = bootstrapTypesCompatible(expected, scalarUnderlying)
+        }
     }
     if (!compatible && bootstrapIsNoEscapeFunctionType(expected) &&
         bootstrapIsFunctionType(actual) &&
@@ -3129,6 +3154,7 @@ fun bootstrapFunctionDeclarationIndex(
 
 class BootstrapAnalyzer(
     val symbols: array<BootstrapSymbol>,
+    var symbolSlots: array<int>,
     var errors: int,
     var extensionErrors: int,
     var locals: array<BootstrapSymbol>,
@@ -3171,22 +3197,111 @@ class BootstrapAnalyzer(
     var yieldedType: string,
     val allowContractCalls: bool
 ) {
+    fun prepareSymbolIndex(expectedSymbols: int): void {
+        var capacity = 8
+        while (capacity < expectedSymbols * 2 + 1) {
+            capacity = capacity * 2
+        }
+        val slots: array<int> = []
+        var slot = 0
+        while (slot < capacity) {
+            slots.append(-1)
+            slot = slot + 1
+        }
+        this.symbolSlots = slots
+        return
+    }
+
+    fun indexSymbol(symbol: int): void {
+        if (this.symbolSlots.size == 0) {
+            this.prepareSymbolIndex(this.symbols.size)
+        }
+        var slot = bootstrapFunctionDeclarationHash(
+            this.symbols[symbol].name
+        )
+        slot = slot - slot / this.symbolSlots.size *
+            this.symbolSlots.size
+        var placed = false
+        while (!placed) {
+            val existing = this.symbolSlots[slot]
+            if (existing < 0 ||
+                this.symbols[existing].name ==
+                    this.symbols[symbol].name) {
+                this.symbolSlots[slot] = symbol
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == this.symbolSlots.size) slot = 0
+            }
+        }
+        return
+    }
+
+    fun appendSymbol(symbol: BootstrapSymbol): void {
+        this.symbols.append(symbol)
+        this.indexSymbol(this.symbols.size - 1)
+        return
+    }
+
+    fun rebuildSymbolIndex(): void {
+        this.prepareSymbolIndex(this.symbols.size)
+        var symbol = 0
+        while (symbol < this.symbols.size) {
+            this.indexSymbol(symbol)
+            symbol = symbol + 1
+        }
+        return
+    }
+
+    fun symbolIndex(name: string): int {
+        var result = -1
+        if (this.symbolSlots.size > 0) {
+            var slot = bootstrapFunctionDeclarationHash(name)
+            slot = slot - slot / this.symbolSlots.size *
+                this.symbolSlots.size
+            var probes = 0
+            while (result < 0 && probes < this.symbolSlots.size &&
+                   this.symbolSlots[slot] >= 0) {
+                val candidate = this.symbolSlots[slot]
+                if (this.symbols[candidate].name == name) {
+                    result = candidate
+                } else {
+                    slot = slot + 1
+                    if (slot == this.symbolSlots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        } else {
+            var candidate = 0
+            while (candidate < this.symbols.size && result < 0) {
+                if (this.symbols[candidate].name == name) result = candidate
+                candidate = candidate + 1
+            }
+        }
+        result
+    }
+
     fun typesCompatible(expected: string, actual: string): bool {
         var compatible = bootstrapTypesCompatible(expected, actual)
-        val underlying = bootstrapScalarTypeUnderlying(
-            this.declarations, actual
-        )
-        if (!compatible && underlying != "") {
-            compatible = bootstrapTypesCompatible(expected, underlying)
+        if (!compatible) {
+            val underlying = bootstrapScalarTypeUnderlying(
+                this.declarations, actual
+            )
+            if (underlying != "") {
+                compatible = bootstrapTypesCompatible(expected, underlying)
+            }
         }
         compatible
     }
 
     fun scalarValueType(type: string): string {
-        val underlying = bootstrapScalarTypeUnderlying(
-            this.declarations, type
-        )
-        if (underlying == "") type else underlying
+        val normalized = bootstrapNormalizeType(type)
+        if (bootstrapScalarTypeUnderlyingValid(normalized)) normalized else {
+            val underlying = bootstrapScalarTypeUnderlying(
+                this.declarations, normalized
+            )
+            if (underlying == "") normalized else underlying
+        }
     }
 
     fun expressionCompileEffects(expression: BootstrapExpression): int {
@@ -3254,8 +3369,8 @@ class BootstrapAnalyzer(
 
     fun contractModuleForFunction(name: string): string {
         var moduleIdentity = ""
-        var index = 0
-        while (index < this.declarations.size && moduleIdentity == "") {
+        val index = this.functionDeclarations.find(name)
+        if (index >= 0) {
             val declaration = this.declarations[index]
             val prefix = "contract:"
             if (declaration.extensionOwner == "" &&
@@ -3266,7 +3381,6 @@ class BootstrapAnalyzer(
                     prefix.size, declaration.externalLibrary.size
                 )
             }
-            index = index + 1
         }
         moduleIdentity
     }
@@ -3313,12 +3427,9 @@ class BootstrapAnalyzer(
             }
             refinementIndex = refinementIndex + 1
         }
-        var index = 0
-        while (index < this.symbols.size) {
-            if (result == "unknown" && this.symbols[index].name == name) {
-                result = this.symbols[index].type
-            }
-            index = index + 1
+        if (result == "unknown") {
+            val index = this.symbolIndex(name)
+            if (index >= 0) result = this.symbols[index].type
         }
         if (result == "unknown" && this.currentOwner != "") {
             result = this.fieldType(this.currentOwner, name)
@@ -3354,12 +3465,9 @@ class BootstrapAnalyzer(
             }
             localIndex = localIndex + 1
         }
-        var index = 0
-        while (index < this.symbols.size) {
-            if (result == "unknown" && this.symbols[index].name == name) {
-                result = this.symbols[index].type
-            }
-            index = index + 1
+        if (result == "unknown") {
+            val index = this.symbolIndex(name)
+            if (index >= 0) result = this.symbols[index].type
         }
         result
     }
@@ -3697,13 +3805,8 @@ class BootstrapAnalyzer(
 
     fun findKind(name: string): string {
         var result = "unknown"
-        var index = 0
-        while (index < this.symbols.size) {
-            if (this.symbols[index].name == name) {
-                result = this.symbols[index].kind
-            }
-            index = index + 1
-        }
+        val index = this.symbolIndex(name)
+        if (index >= 0) result = this.symbols[index].kind
         if (result == "unknown" &&
             (name == "github" || name == "gitImportSource" ||
              name == "importFile" || name == "resolvedImport" ||
@@ -4103,14 +4206,30 @@ class BootstrapAnalyzer(
         bootstrapSummaryTypeIsAffine(type, this.affineTypes)
 
     fun typeIsManagedReference(type: string): bool {
-        bootstrapSummaryTypeIsManagedReference(type, this.declarations)
+        val normalized = bootstrapNormalizeType(type)
+        if (bootstrapScalarTypeUnderlyingValid(normalized) ||
+            normalized == "void" || normalized == "never" ||
+            normalized == "unknown" || normalized == "string" ||
+            normalized == "cstring" ||
+            bootstrapIsFunctionType(normalized) ||
+            bootstrapIsBorrowType(normalized)) false else
+            bootstrapSummaryTypeIsManagedReference(
+                normalized, this.declarations
+            )
     }
 
     fun typeNeedsManagedAliasTracking(type: string): bool {
-        bootstrapSummaryTypeNeedsManagedAliasTracking(
-            type,
-            this.declarations
-        )
+        val normalized = bootstrapNormalizeType(type)
+        if (bootstrapScalarTypeUnderlyingValid(normalized) ||
+            normalized == "void" || normalized == "never" ||
+            normalized == "unknown" || normalized == "string" ||
+            normalized == "cstring" ||
+            bootstrapIsFunctionType(normalized) ||
+            bootstrapIsBorrowType(normalized)) false else
+            bootstrapSummaryTypeNeedsManagedAliasTracking(
+                normalized,
+                this.declarations
+            )
     }
 
     fun typeIsBorrowTracked(type: string): bool {
@@ -4721,6 +4840,7 @@ class BootstrapAnalyzer(
         parameterKinds: array<string>,
         insertedDefaults: int
     ): void {
+        if (this.typedRequestBegins.size == 0) return
         val request = this.typedRequestIndex(expression)
         var already = false
         var existing = 0
@@ -4770,6 +4890,7 @@ class BootstrapAnalyzer(
         expression: BootstrapExpression,
         type: string
     ): void {
+        if (this.typedRequestBegins.size == 0) return
         val request = this.typedRequestIndex(expression)
         var already = false
         var existing = 0
@@ -4854,7 +4975,7 @@ class BootstrapAnalyzer(
         }
     }
 
-    fun hasSymbol(name: string): bool = this.findType(name) != "unknown"
+    fun hasSymbol(name: string): bool = this.symbolIndex(name) >= 0
 
     fun appendUniqueCaptureName(var names: array<string>, name: string) {
         var found = false
@@ -5784,13 +5905,18 @@ class BootstrapAnalyzer(
                 expression.text
             )
             if (externalLibrary == "inline-assembly") {
+                val assemblyTemplate = if (expression.children.size > 0) {
+                    bootstrapStaticString(expression.children[0])
+                } else BootstrapStaticString("", false)
+                val assemblyConstraints = if (expression.children.size > 1) {
+                    bootstrapStaticString(expression.children[1])
+                } else BootstrapStaticString("", false)
                 if (!this.functionRequiresTrust(expression.text) ||
                     !this.functionIsNoEscape(expression.text)) {
                     this.fail("inline-assembly.trusted-noescape")
                 }
                 if (expression.children.size < 2 ||
-                    expression.children[0].kind != "string" ||
-                    expression.children[1].kind != "string") {
+                    !assemblyTemplate.valid || !assemblyConstraints.valid) {
                     this.fail("inline-assembly.literal-template-constraints")
                 }
                 val assemblyResult = bootstrapNormalizeType(
@@ -7085,16 +7211,19 @@ class BootstrapAnalyzer(
             expression.kind == "^" || expression.kind == "<<" ||
             expression.kind == ">>" || expression.kind == ">>>"
         ) {
-            val left = this.scalarValueType(
-                this.infer(expression.children[0])
-            )
-            val right = this.scalarValueType(
-                this.infer(expression.children[1])
-            )
+            val rawLeft = this.infer(expression.children[0])
+            val rawRight = this.infer(expression.children[1])
+            val staticStringConcatenation = expression.kind == "+" &&
+                rawLeft == "string" && rawRight == "string" &&
+                bootstrapStaticString(expression).valid
+            val left = this.scalarValueType(rawLeft)
+            val right = this.scalarValueType(rawRight)
             val arithmetic = expression.kind == "+" ||
                 expression.kind == "-" || expression.kind == "*" ||
                 expression.kind == "/"
-            if (arithmetic) {
+            if (staticStringConcatenation) {
+                result = "string"
+            } else if (arithmetic) {
                 if (left != right || !bootstrapIsNumericScalarType(left)) {
                     this.fail("arithmetic.type")
                 }
@@ -7125,6 +7254,7 @@ class BootstrapAnalyzer(
 
     fun analyze(parsed: BootstrapParseResult): BootstrapSemanticResult {
         this.errors = this.errors + parsed.errors
+        this.prepareSymbolIndex(parsed.declarations.size)
         var capabilityAction = 0
         while (capabilityAction < parsed.actions.size) {
             val staged = parsed.actions[capabilityAction]
@@ -7191,9 +7321,25 @@ class BootstrapAnalyzer(
             }
             if (publish) {
                 if (this.hasSymbol(symbolName)) {
-                    this.fail("symbol.duplicate:$symbolName")
+                    var previousSource = "unknown"
+                    var previous = 0
+                    while (previous < index && previousSource == "unknown") {
+                        val candidate = parsed.declarations[previous]
+                        var candidateName = candidate.name
+                        if (candidate.extensionOwner != "") {
+                            candidateName =
+                                "${candidate.extensionOwner}.${candidate.name}"
+                        }
+                        if (candidateName == symbolName) {
+                            previousSource = candidate.sourceIdentity
+                        }
+                        previous = previous + 1
+                    }
+                    this.fail(
+                        "symbol.duplicate:$symbolName:$previousSource:${declaration.sourceIdentity}"
+                    )
                 }
-                this.symbols.append(BootstrapSymbol(
+                this.appendSymbol(BootstrapSymbol(
                     symbolName,
                     declaration.kind,
                     type,
@@ -7294,7 +7440,7 @@ class BootstrapAnalyzer(
                 }
             }
             if (!predeclared) {
-                this.symbols.append(BootstrapSymbol(
+                this.appendSymbol(BootstrapSymbol(
                     symbolName,
                     declaration.kind,
                     type,
@@ -7866,6 +8012,7 @@ fun bootstrapAnalyzeRequestedSpans(
     )
     BootstrapAnalyzer(
         symbols,
+        [],
         0,
         0,
         locals,

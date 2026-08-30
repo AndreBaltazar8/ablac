@@ -1,5 +1,6 @@
 import "lexer.ab"
 import "abla/bytes"
+import "abla/unsafe/memory"
 
 class BootstrapExpression(
     val kind: string,
@@ -106,54 +107,87 @@ fun bootstrapAsciiCodepoint(codepoint: int): string {
 }
 
 fun bootstrapDecodeString(raw: string): string {
-    var output = ""
-    var segment = 0
+    // A decoded literal can never exceed its source byte length. Decode into
+    // one owned buffer instead of repeatedly concatenating immutable strings;
+    // generated inline assembly contains thousands of `\n` escapes, for
+    // which the old loop retained quadratic transient copies.
+    val output = nativeByteBuffer(raw.size + 1)
+    var valid = !pointerIsNull(output.address)
     var index = 0
-    while (index < raw.size) {
+    var destination = 0
+    while (valid && index < raw.size) {
         if (raw[index] == 92 && index + 1 < raw.size) {
-            output = "$output${raw.slice(segment, index)}"
             val escaped = raw[index + 1]
-            if (escaped == 110) output = "$output\n"
-            else if (escaped == 114) output = "$output\r"
-            else if (escaped == 116) output = "$output\t"
-            else if (escaped == 98) output = "$output${byteEncode(8)}"
+            var decoded = -1
+            var consumed = 2
+            if (escaped == 110) decoded = 10
+            else if (escaped == 114) decoded = 13
+            else if (escaped == 116) decoded = 9
+            else if (escaped == 98) decoded = 8
             else if (escaped == 48) {
-                output = "$output${raw.slice(index, index + 2)}"
+                valid = output.store(destination, 92)
+                destination = destination + 1
+                if (valid) valid = output.store(destination, 48)
+                destination = destination + 1
             }
-            else if (escaped == 34) output = "$output\""
-            else if (escaped == 39) output = "$output'"
-            else if (escaped == 92) output = "$output\\"
-            else if (escaped == 36) output = "$output$"
+            else if (escaped == 34) decoded = 34
+            else if (escaped == 39) decoded = 39
+            else if (escaped == 92) decoded = 92
+            else if (escaped == 36) decoded = 36
             else if (escaped == 120 && index + 3 < raw.size) {
                 val high = bootstrapHexValue(raw[index + 2])
                 val low = bootstrapHexValue(raw[index + 3])
                 if (high >= 0 && low >= 0) {
-                    output = "$output${byteEncode(high * 16 + low)}"
-                    index = index + 2
-                } else output = "$output${raw.slice(index, index + 2)}"
+                    decoded = high * 16 + low
+                    consumed = 4
+                }
             }
             else if (escaped == 117 && index + 5 < raw.size) {
                 var codepoint = 0
                 var digit = 0
-                var valid = true
+                var unicodeValid = true
                 while (digit < 4) {
                     val value = bootstrapHexValue(raw[index + 2 + digit])
-                    if (value < 0) valid = false
+                    if (value < 0) unicodeValid = false
                     if (value >= 0) codepoint = codepoint * 16 + value
                     digit = digit + 1
                 }
-                val decoded = bootstrapAsciiCodepoint(codepoint)
-                if (valid && decoded != "") output = "$output$decoded"
-                else output = "$output${raw.slice(index, index + 6)}"
-                index = index + 4
-                output = output
+                val unicode = bootstrapAsciiCodepoint(codepoint)
+                if (unicodeValid && unicode != "") {
+                    decoded = unicode[0]
+                } else {
+                    var rawByte = 0
+                    while (valid && rawByte < 6) {
+                        valid = output.store(
+                            destination, raw[index + rawByte]
+                        )
+                        destination = destination + 1
+                        rawByte = rawByte + 1
+                    }
+                }
+                consumed = 6
             }
-            else output = "$output${raw.slice(index, index + 2)}"
-            index = index + 2
-            segment = index
-        } else index = index + 1
+            if (decoded >= 0) {
+                valid = output.store(destination, decoded)
+                destination = destination + 1
+            } else if (escaped != 48 &&
+                       !(escaped == 117 && consumed == 6)) {
+                valid = output.store(destination, 92)
+                destination = destination + 1
+                if (valid) valid = output.store(destination, escaped)
+                destination = destination + 1
+            }
+            index = index + consumed
+        } else {
+            valid = output.store(destination, raw[index])
+            destination = destination + 1
+            index = index + 1
+        }
     }
-    "$output${raw.slice(segment, raw.size)}"
+    var result = ""
+    if (valid) result = output.adoptString(destination)
+    else output.close()
+    result
 }
 
 class BootstrapParser(
@@ -224,6 +258,18 @@ class BootstrapParser(
             this.position = this.position + 1
             more = this.at("newline") || this.at(";")
         }
+    }
+
+    // A leading binary operator is an unambiguous continuation of the
+    // preceding expression. Keep semicolons as hard statement boundaries,
+    // but allow generated and hand-written constants to put `+` or `-` at the
+    // beginning of the next line without requiring parentheses.
+    fun continueAdditiveExpression(): bool {
+        val before = this.position
+        while (this.at("newline")) this.position = this.position + 1
+        val continued = this.at("+") || this.at("-")
+        if (!continued) this.position = before
+        continued
     }
 
     fun skipBalanced(open: string, close: string) {
@@ -885,6 +931,46 @@ class BootstrapParser(
         }
     }
 
+    // Module discovery runs before imported compile-time subparsers are
+    // registered. Preserve a `$name ...` invocation as one opaque expression
+    // in that preliminary pass instead of reporting `$` as an invalid primary
+    // and recovering through the surrounding function body. The staged pass
+    // later replaces this exact source range with the handler's typed syntax,
+    // so this placeholder neither interprets nor authorizes target syntax.
+    fun parseDeferredSubparserPlaceholder(): BootstrapExpression {
+        val start = this.tokens[this.position]
+        this.expect("$")
+        var name = ""
+        var end = start.end
+        if (this.at("identifier")) {
+            name = bootstrapTokenText(
+                this.source, this.tokens[this.position]
+            )
+            end = this.tokens[this.position].end
+            this.position = this.position + 1
+        }
+        var finished = false
+        while (!finished && !this.at("end")) {
+            if (this.at("(") || this.at("[") || this.at("{")) {
+                val open = this.tokens[this.position].kind
+                val close = if (open == "(") ")" else
+                    if (open == "[") "]" else "}"
+                this.skipBalanced(open, close)
+                end = this.tokens[this.position - 1].end
+            } else if (this.at("newline") || this.at(";") ||
+                       this.at(")") || this.at("]") ||
+                       this.at("}") || this.at(",")) {
+                finished = true
+            } else {
+                end = this.tokens[this.position].end
+                this.position = this.position + 1
+            }
+        }
+        BootstrapExpression(
+            "subparser.placeholder", name, start.begin, end, []
+        )
+    }
+
     fun parsePrimary(): BootstrapExpression {
         val token = this.tokens[this.position]
         val expansion = this.expansionAt(token.begin)
@@ -896,6 +982,8 @@ class BootstrapParser(
                 this.position = this.position + 1
             }
             this.expansionExpressions[expansion]
+        } else if (this.at("$")) {
+            this.parseDeferredSubparserPlaceholder()
         } else if (this.at("if")) {
             this.parseIf()
         } else if (this.at("when")) {
@@ -1236,7 +1324,7 @@ class BootstrapParser(
 
     fun parseTerm(): BootstrapExpression {
         var expression = this.parseFactor()
-        var more = this.at("+") || this.at("-")
+        var more = this.continueAdditiveExpression()
         while (more) {
             val operation = this.tokens[this.position]
             this.position = this.position + 1
@@ -1249,7 +1337,7 @@ class BootstrapParser(
                 right.end,
                 [expression, right]
             )
-            more = this.at("+") || this.at("-")
+            more = this.continueAdditiveExpression()
         }
         expression
     }

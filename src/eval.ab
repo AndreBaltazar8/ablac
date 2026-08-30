@@ -461,11 +461,18 @@ fun bootstrapTakeDefinedTargets(): array<BootstrapDefinedTarget> {
 fun bootstrapExportRequestRoot(): string =
     "build/.abla-export-requests-${linuxProcessId()}"
 
+fun bootstrapForeignSymbolNameAvailable(name: string): bool =
+    name != "main" &&
+    name != "abla_owned_bytes_data" &&
+    name != "abla_owned_bytes_length" &&
+    name != "abla_owned_bytes_release"
+
 fun bootstrapExportNameValid(name: string): bool {
-    var valid = name.size > 0 && name.size <= 128 && name != "main" &&
-        name != "abla_owned_bytes_data" &&
-        name != "abla_owned_bytes_length" &&
-        name != "abla_owned_bytes_release"
+    // LLVM and native object formats permit long linker identifiers; C++
+    // template mangling routinely exceeds 128 bytes. Keep input bounded for
+    // compile-time evaluation without rejecting valid ABI names.
+    var valid = name.size > 0 && name.size <= 4096 &&
+        bootstrapForeignSymbolNameAvailable(name)
     var index = 0
     while (valid && index < name.size) {
         val byte = name[index]
@@ -473,6 +480,30 @@ fun bootstrapExportNameValid(name: string): bool {
             (byte >= 97 && byte <= 122) || byte == 95
         val digit = byte >= 48 && byte <= 57
         if (!alpha && !(index > 0 && digit)) valid = false
+        index = index + 1
+    }
+    valid
+}
+
+fun bootstrapLinkerSymbolNameValid(name: string): bool {
+    // internalFunction names an object-format symbol, not a C declaration.
+    // Accept the portable unquoted ELF/assembler spelling shared by LLVM and
+    // GNU-family assemblers. In particular, compiler-created local helpers
+    // conventionally contain `.` and `$`. Keep whitespace, quoting, version
+    // suffixes, and assembler punctuation out so this remains data, never
+    // injected syntax.
+    var valid = name.size > 0 && name.size <= 4096 &&
+        bootstrapForeignSymbolNameAvailable(name)
+    var index = 0
+    while (valid && index < name.size) {
+        val byte = name[index]
+        val alpha = (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 95
+        val digit = byte >= 48 && byte <= 57
+        val linkerPunctuation = byte == 46 || byte == 36
+        if (!alpha && !linkerPunctuation && !(index > 0 && digit)) {
+            valid = false
+        }
         index = index + 1
     }
     valid
@@ -638,12 +669,75 @@ fun bootstrapStageAnnotatedExports(parsed: BootstrapParseResult): int {
     errors
 }
 
+fun bootstrapExportRequestsEqual(
+    left: BootstrapExportRequest,
+    right: BootstrapExportRequest
+): bool {
+    var equal = left.source == right.source &&
+        left.name == right.name &&
+        left.resultType == right.resultType &&
+        left.checked == right.checked &&
+        left.internal == right.internal &&
+        left.parameterNames.size == right.parameterNames.size &&
+        left.parameterTypes.size == right.parameterTypes.size
+    var index = 0
+    while (equal && index < left.parameterNames.size) {
+        equal = left.parameterNames[index] == right.parameterNames[index]
+        index = index + 1
+    }
+    index = 0
+    while (equal && index < left.parameterTypes.size) {
+        equal = left.parameterTypes[index] == right.parameterTypes[index]
+        index = index + 1
+    }
+    equal
+}
+
+fun bootstrapExportRequestAt(
+    root: string,
+    index: int
+): BootstrapExportRequest {
+    val parameterNames: array<string> = []
+    val parameterTypes: array<string> = []
+    val parameterCount = bootstrapDecimalIndex(
+        Path("$root/$index.parameters").readText()
+    )
+    var parameter = 0
+    while (parameter < parameterCount) {
+        parameterNames.append(Path(
+            "$root/$index.parameter-$parameter-name"
+        ).readText())
+        parameterTypes.append(Path(
+            "$root/$index.parameter-$parameter-type"
+        ).readText())
+        parameter = parameter + 1
+    }
+    BootstrapExportRequest(
+        Path("$root/$index.source").readText(),
+        Path("$root/$index.name").readText(),
+        Path("$root/$index.result").readText(),
+        parameterNames,
+        parameterTypes,
+        Path("$root/$index.checked").readText() == "1",
+        Path("$root/$index.internal").readText() == "1"
+    )
+}
+
 fun bootstrapStageExportRequest(request: BootstrapExportRequest): bool {
-    var valid = bootstrapExportNameValid(request.name)
+    var valid = if (request.internal) {
+        bootstrapLinkerSymbolNameValid(request.name)
+    } else bootstrapExportNameValid(request.name)
     val root = bootstrapExportRequestRoot()
     var index = 0
     while (valid && index < bootstrapExportRequestCount) {
         if (Path("$root/$index.name").readText() == request.name) {
+            // Framework aggregators may independently discover the same
+            // monolithic link edge. Repeating an identical request is
+            // idempotent; a different source, ABI, or linkage for the same
+            // object symbol remains a real collision.
+            if (bootstrapExportRequestsEqual(
+                bootstrapExportRequestAt(root, index), request
+            )) return true
             valid = false
         }
         index = index + 1
@@ -5653,7 +5747,9 @@ class BootstrapEvaluator(
             val exportName = this.evaluate(expression.children[1])
             var valid = reflected.kind == "integer" &&
                 exportName.kind == "string" &&
-                bootstrapExportNameValid(exportName.text) &&
+                (if (targetName == "compilerInternalFunction") {
+                    bootstrapLinkerSymbolNameValid(exportName.text)
+                } else bootstrapExportNameValid(exportName.text)) &&
                 this.functionHandleValid(reflected.integer) &&
                 reflected.integer >= 0 &&
                 reflected.integer < this.declarations.size
@@ -5729,8 +5825,12 @@ class BootstrapEvaluator(
                 result = bootstrapEvalBoolean(true)
             } else {
                 if (declarationPath == "") {
+                    val symbolRequirement =
+                        if (targetName == "compilerInternalFunction") {
+                            "a unique bounded linker symbol name"
+                        } else "a unique non-reserved C identifier"
                     bootstrapStageDriverDiagnostic(
-                        "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: compilerExportFunction rejected $reflectedKind handle ${reflected.integer} (declaration `$declarationKind`, source `$source`, result `$resultType`, export `${exportName.text}`); it requires a unique non-reserved C identifier and a top-level function with at most 16 value bool, fixed-width integer/char/f32/f64, copied borrowed-string, or direct non-escaping (i64)->i64 callback parameters, returning void, a supported scalar, or owned string\n"
+                        "error[E_EXPORT_SIGNATURE_UNSUPPORTED]: $targetName rejected $reflectedKind handle ${reflected.integer} (declaration `$declarationKind`, source `$source`, result `$resultType`, export `${exportName.text}`); it requires $symbolRequirement and a top-level function with at most 16 value bool, fixed-width integer/char/f32/f64, copied borrowed-string, or direct non-escaping (i64)->i64 callback parameters, returning void, a supported scalar, or owned string\n"
                     )
                 } else {
                     bootstrapStageDriverDiagnostic(
@@ -6004,6 +6104,68 @@ class BootstrapEvaluator(
             val delimiters = this.evaluate(expression.children[1])
             result = bootstrapEvalString(
                 this.cursors[cursor.integer].rawTakeUntil(delimiters.text)
+            )
+        }
+        if (targetName == "parserRawTakeUntilText") {
+            val cursor = this.evaluate(expression.children[0])
+            val delimiter = this.evaluate(expression.children[1])
+            result = bootstrapEvalString(
+                this.cursors[cursor.integer].rawTakeUntilText(delimiter.text)
+            )
+        }
+        if (targetName == "parserRawLineRecordsValid") {
+            val source = this.evaluate(expression.children[0])
+            val directiveCatalog = this.evaluate(expression.children[1])
+            result = bootstrapEvalBoolean(bootstrapRawLineRecordsValid(
+                source.text, directiveCatalog.text
+            ))
+        }
+        if (targetName == "parserRawInsertAfterTopLevelRecord") {
+            val source = this.evaluate(expression.children[0])
+            val record = this.evaluate(expression.children[1])
+            val insertion = this.evaluate(expression.children[2])
+            result = bootstrapEvalString(
+                bootstrapRawInsertAfterTopLevelRecord(
+                    source.text, record.text, insertion.text
+                )
+            )
+        }
+        if (targetName == "parserRawInsertBeforeTopLevelRecord") {
+            val source = this.evaluate(expression.children[0])
+            val record = this.evaluate(expression.children[1])
+            val insertion = this.evaluate(expression.children[2])
+            result = bootstrapEvalString(
+                bootstrapRawInsertBeforeTopLevelRecord(
+                    source.text, record.text, insertion.text
+                )
+            )
+        }
+        if (targetName == "parserRawGuardNestedEntries") {
+            val source = this.evaluate(expression.children[0])
+            val entryRecord = this.evaluate(expression.children[1])
+            val beforeEntry = this.evaluate(expression.children[2])
+            val afterEntry = this.evaluate(expression.children[3])
+            result = bootstrapEvalString(
+                bootstrapRawGuardNestedEntries(
+                    source.text,
+                    entryRecord.text,
+                    beforeEntry.text,
+                    afterEntry.text
+                )
+            )
+        }
+        if (targetName == "parserRawWrapTopLevelRecord") {
+            val source = this.evaluate(expression.children[0])
+            val record = this.evaluate(expression.children[1])
+            val beforeRecord = this.evaluate(expression.children[2])
+            val afterRecord = this.evaluate(expression.children[3])
+            result = bootstrapEvalString(
+                bootstrapRawWrapTopLevelRecord(
+                    source.text,
+                    record.text,
+                    beforeRecord.text,
+                    afterRecord.text
+                )
             )
         }
         if (targetName == "parserRawTakeName") {

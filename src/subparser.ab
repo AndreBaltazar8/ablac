@@ -1,5 +1,354 @@
 import "parser.ab"
 
+fun bootstrapRawRecordTokenByte(byte: int): bool =
+    (byte >= 65 && byte <= 90) ||
+    (byte >= 97 && byte <= 122) ||
+    (byte >= 48 && byte <= 57) ||
+    byte == 46 || byte == 95 || byte == 36
+
+fun bootstrapRawRecordCatalogContains(
+    source: string,
+    begin: int,
+    end: int,
+    catalog: string
+): bool {
+    var found = false
+    var record = 0
+    while (!found && record < catalog.size) {
+        var recordEnd = record
+        while (recordEnd < catalog.size && catalog[recordEnd] != 10) {
+            recordEnd = recordEnd + 1
+        }
+        if (recordEnd - record == end - begin) {
+            found = true
+            var index = 0
+            while (found && begin + index < end) {
+                found = source[begin + index] == catalog[record + index]
+                index = index + 1
+            }
+        }
+        record = if (recordEnd < catalog.size) recordEnd + 1 else recordEnd
+    }
+    found
+}
+
+fun bootstrapRawRecordEquals(
+    source: string,
+    begin: int,
+    end: int,
+    expected: string
+): bool {
+    var equal = end - begin == expected.size
+    var index = 0
+    while (equal && index < expected.size) {
+        equal = source[begin + index] == expected[index]
+        index = index + 1
+    }
+    equal
+}
+
+// Native compiler-side scanner for line-oriented sublanguages. This keeps a
+// multi-megabyte recovered target corpus linear without executing one staged
+// evaluator operation per source byte.
+fun bootstrapRawLineRecordsValid(
+    source: string,
+    directiveCatalog: string
+): bool {
+    var valid = source.size > 0
+    var line = 0
+    while (valid && line < source.size) {
+        var end = line
+        while (end < source.size && source[end] != 10) end = end + 1
+        var token = line
+        while (token < end &&
+               (source[token] == 32 || source[token] == 9 ||
+                source[token] == 13)) token = token + 1
+        if (token < end && source[token] != 35) {
+            var tokenEnd = token
+            while (tokenEnd < end &&
+                   bootstrapRawRecordTokenByte(source[tokenEnd])) {
+                tokenEnd = tokenEnd + 1
+            }
+            valid = tokenEnd > token
+            val label = valid && tokenEnd < end && source[tokenEnd] == 58
+            if (valid && !label && source[token] == 46) {
+                // An empty catalog requests structural directive validation;
+                // a non-empty one additionally restricts directive names.
+                valid = directiveCatalog.size == 0 ||
+                    bootstrapRawRecordCatalogContains(
+                        source, token, tokenEnd, directiveCatalog
+                    )
+            }
+            if (valid && !label && source[token] != 46) {
+                val first = source[token]
+                valid = (first >= 65 && first <= 90) ||
+                    (first >= 97 && first <= 122)
+            }
+            if (valid && !label && tokenEnd < end) {
+                val separator = source[tokenEnd]
+                valid = separator == 32 || separator == 9 ||
+                    separator == 13
+            }
+        }
+        line = if (end < source.size) end + 1 else end
+    }
+    valid
+}
+
+// Insert text after the first matching top-level record in a line-oriented
+// sublanguage. `.pushsection`/`.popsection` regions are treated as nested
+// records, allowing a target parser to distinguish an owning body from helper
+// definitions without the compiler knowing the target instruction set.
+fun bootstrapRawInsertAfterTopLevelRecord(
+    source: string,
+    record: string,
+    insertion: string
+): string {
+    var depth = 0
+    var line = 0
+    var insertionPoint = -1
+    while (insertionPoint < 0 && line < source.size) {
+        var end = line
+        while (end < source.size && source[end] != 10) end = end + 1
+        var token = line
+        while (token < end &&
+               (source[token] == 32 || source[token] == 9 ||
+                source[token] == 13)) token = token + 1
+        var tokenEnd = token
+        while (tokenEnd < end &&
+               bootstrapRawRecordTokenByte(source[tokenEnd])) {
+            tokenEnd = tokenEnd + 1
+        }
+        val push = bootstrapRawRecordEquals(
+            source, token, tokenEnd, ".pushsection"
+        )
+        val pop = bootstrapRawRecordEquals(
+            source, token, tokenEnd, ".popsection"
+        )
+        if (pop && depth > 0) depth = depth - 1
+        if (depth == 0 && bootstrapRawRecordEquals(
+                source, token, tokenEnd, record
+            )) {
+            insertionPoint = if (end < source.size) end + 1 else end
+        }
+        if (push) depth = depth + 1
+        line = if (end < source.size) end + 1 else end
+    }
+    if (insertionPoint < 0) return source
+    val prefix = source.slice(0, insertionPoint)
+    val suffix = source.slice(insertionPoint, source.size)
+    "$prefix$insertion$suffix"
+}
+
+fun bootstrapRawInsertBeforeTopLevelRecord(
+    source: string,
+    record: string,
+    insertion: string
+): string {
+    var depth = 0
+    var line = 0
+    var insertionPoint = -1
+    while (insertionPoint < 0 && line < source.size) {
+        var end = line
+        while (end < source.size && source[end] != 10) end = end + 1
+        var token = line
+        while (token < end &&
+               (source[token] == 32 || source[token] == 9 ||
+                source[token] == 13)) token = token + 1
+        var tokenEnd = token
+        while (tokenEnd < end &&
+               bootstrapRawRecordTokenByte(source[tokenEnd])) {
+            tokenEnd = tokenEnd + 1
+        }
+        val push = bootstrapRawRecordEquals(
+            source, token, tokenEnd, ".pushsection"
+        )
+        val pop = bootstrapRawRecordEquals(
+            source, token, tokenEnd, ".popsection"
+        )
+        if (pop && depth > 0) depth = depth - 1
+        if (depth == 0 && bootstrapRawRecordEquals(
+                source, token, tokenEnd, record
+            )) insertionPoint = line
+        if (push) depth = depth + 1
+        line = if (end < source.size) end + 1 else end
+    }
+    if (insertionPoint < 0) return source
+    val prefix = source.slice(0, insertionPoint)
+    val suffix = source.slice(insertionPoint, source.size)
+    "$prefix$insertion$suffix"
+}
+
+fun bootstrapRawWrapRecordOffsets(
+    source: string,
+    recordOffsets: array<int>,
+    afterRecordOffsets: array<int>,
+    beforeRecord: string,
+    afterRecord: string
+): string {
+    if (recordOffsets.size == 0) return source
+    val extra = recordOffsets.size *
+        (beforeRecord.size + afterRecord.size)
+    val output = nativeByteBuffer(source.size + extra + 1)
+    var valid = !pointerIsNull(output.address)
+    var sourceOffset = 0
+    var destination = 0
+    var record = 0
+    while (valid && record < recordOffsets.size) {
+        while (valid && sourceOffset < recordOffsets[record]) {
+            valid = output.store(destination, source[sourceOffset])
+            destination = destination + 1
+            sourceOffset = sourceOffset + 1
+        }
+        var byte = 0
+        while (valid && byte < beforeRecord.size) {
+            valid = output.store(destination, beforeRecord[byte])
+            destination = destination + 1
+            byte = byte + 1
+        }
+        while (valid && sourceOffset < afterRecordOffsets[record]) {
+            valid = output.store(destination, source[sourceOffset])
+            destination = destination + 1
+            sourceOffset = sourceOffset + 1
+        }
+        byte = 0
+        while (valid && byte < afterRecord.size) {
+            valid = output.store(destination, afterRecord[byte])
+            destination = destination + 1
+            byte = byte + 1
+        }
+        record = record + 1
+    }
+    while (valid && sourceOffset < source.size) {
+        valid = output.store(destination, source[sourceOffset])
+        destination = destination + 1
+        sourceOffset = sourceOffset + 1
+    }
+    if (!valid) {
+        output.close()
+        return source
+    }
+    output.adoptString(destination)
+}
+
+fun bootstrapRawWrapTopLevelRecord(
+    source: string,
+    record: string,
+    beforeRecord: string,
+    afterRecord: string
+): string {
+    val recordOffsets: array<int> = []
+    val afterRecordOffsets: array<int> = []
+    var depth = 0
+    var line = 0
+    while (recordOffsets.size == 0 && line < source.size) {
+        var end = line
+        while (end < source.size && source[end] != 10) end = end + 1
+        val after = if (end < source.size) end + 1 else end
+        var token = line
+        while (token < end &&
+               (source[token] == 32 || source[token] == 9 ||
+                source[token] == 13)) token = token + 1
+        var tokenEnd = token
+        while (tokenEnd < end &&
+               bootstrapRawRecordTokenByte(source[tokenEnd])) {
+            tokenEnd = tokenEnd + 1
+        }
+        val push = bootstrapRawRecordEquals(
+            source, token, tokenEnd, ".pushsection"
+        )
+        val pop = bootstrapRawRecordEquals(
+            source, token, tokenEnd, ".popsection"
+        )
+        if (pop && depth > 0) depth = depth - 1
+        if (depth == 0 && bootstrapRawRecordEquals(
+                source, token, tokenEnd, record
+            )) {
+            recordOffsets.append(line)
+            afterRecordOffsets.append(after)
+        }
+        if (push) depth = depth + 1
+        line = after
+    }
+    bootstrapRawWrapRecordOffsets(
+        source, recordOffsets, afterRecordOffsets,
+        beforeRecord, afterRecord
+    )
+}
+
+// Wrap the next entry record in a nested line-oriented function region.
+// The most recent label may be followed by assembler directives (for example
+// literal declarations) but not by an instruction. Keeping both insertions as
+// caller-provided text makes this primitive independent of the target
+// instruction set, ABI, and assembler syntax.
+fun bootstrapRawGuardNestedEntries(
+    source: string,
+    entryRecord: string,
+    beforeEntry: string,
+    afterEntry: string
+): string {
+    val entryOffsets: array<int> = []
+    val afterEntryOffsets: array<int> = []
+    var depth = 0
+    var line = 0
+    var candidateAfter = -1
+    var candidateDepth = -1
+    while (line < source.size) {
+        var end = line
+        while (end < source.size && source[end] != 10) end = end + 1
+        val after = if (end < source.size) end + 1 else end
+        var token = line
+        while (token < end &&
+               (source[token] == 32 || source[token] == 9 ||
+                source[token] == 13)) token = token + 1
+        var tokenEnd = token
+        while (tokenEnd < end &&
+               bootstrapRawRecordTokenByte(source[tokenEnd])) {
+            tokenEnd = tokenEnd + 1
+        }
+        val push = bootstrapRawRecordEquals(
+            source, token, tokenEnd, ".pushsection"
+        )
+        val pop = bootstrapRawRecordEquals(
+            source, token, tokenEnd, ".popsection"
+        )
+        if (pop && depth > 0) {
+            depth = depth - 1
+            candidateAfter = -1
+            candidateDepth = -1
+        }
+        if (depth > 0 && token < end && source[token] != 35) {
+            val label = tokenEnd < end && source[tokenEnd] == 58
+            val directive = source[token] == 46
+            if (label) {
+                candidateAfter = after
+                candidateDepth = depth
+            } else if (candidateAfter >= 0 && candidateDepth == depth &&
+                       bootstrapRawRecordEquals(
+                           source, token, tokenEnd, entryRecord
+                       )) {
+                entryOffsets.append(line)
+                afterEntryOffsets.append(after)
+                candidateAfter = -1
+                candidateDepth = -1
+            } else if (!directive) {
+                candidateAfter = -1
+                candidateDepth = -1
+            }
+        }
+        if (push) {
+            depth = depth + 1
+            candidateAfter = -1
+            candidateDepth = -1
+        }
+        line = after
+    }
+    bootstrapRawWrapRecordOffsets(
+        source, entryOffsets, afterEntryOffsets,
+        beforeEntry, afterEntry
+    )
+}
+
 class BootstrapExtensionRequest(
     val namespace: string,
     val payload: string,
@@ -124,6 +473,28 @@ class BootstrapSubparserCursor(
                 delimiter = delimiter + 1
             }
             if (!found) this.rawPosition = this.rawPosition + 1
+        }
+        this.syncTokensFromRaw()
+        this.source.slice(begin, this.rawPosition)
+    }
+
+    fun rawTakeUntilText(delimiter: string): string {
+        val begin = this.rawPosition
+        var found = delimiter.size == 0
+        while (!found &&
+               this.rawPosition + delimiter.size <= this.source.size) {
+            found = true
+            var index = 0
+            while (found && index < delimiter.size) {
+                found = this.source[this.rawPosition + index] ==
+                    delimiter[index]
+                index = index + 1
+            }
+            if (!found) this.rawPosition = this.rawPosition + 1
+        }
+        if (!found) {
+            this.rawPosition = this.source.size
+            this.errors = this.errors + 1
         }
         this.syncTokensFromRaw()
         this.source.slice(begin, this.rawPosition)

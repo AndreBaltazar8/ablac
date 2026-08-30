@@ -16,6 +16,18 @@ status=$?
 set -e
 [[ $status -eq 42 ]]
 
+# A target subparser is registered only during the staged module pass. Locals
+# following its raw invocation must never leak into the preliminary module
+# interface or collide across otherwise independent unqualified imports.
+"$compiler" build \
+    "$project_root/tests/cases/modules/subparser-discovery-locals.ab" \
+    -o "$output/subparser-discovery-locals" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" "$output/subparser-discovery-locals"
+subparser_discovery_status=$?
+set -e
+[[ $subparser_discovery_status -eq 33 ]]
+
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/import-aliases.ab" \
     > "$output/original.ll"
