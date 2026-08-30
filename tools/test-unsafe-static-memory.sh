@@ -5,6 +5,7 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=${1:-$project_root/build/ablac}
 output_directory=$project_root/build/tests/unsafe-static-memory
 source_file=$project_root/tests/cases/modules/unsafe-static-memory.ab
+linked_source=$project_root/tests/cases/native/internal-linked-static.ab
 mkdir -p "$output_directory"
 
 "$compiler" --emit-llvm "$source_file" > "$output_directory/program.ll"
@@ -14,6 +15,15 @@ if grep -Fq '@__ablaRuntimeAllocateLayout' "$output_directory/program.ll"; then
     echo 'static storage unexpectedly calls the runtime allocator' >&2
     exit 1
 fi
+
+"$compiler" --emit-llvm "$linked_source" \
+    > "$output_directory/internal-linked.ll"
+grep -Eq \
+    '^@abla_test_internal_storage = internal global \[8 x i8\] zeroinitializer' \
+    "$output_directory/internal-linked.ll"
+grep -Eq \
+    '^@llvm\.compiler\.used = .*@abla_test_internal_storage' \
+    "$output_directory/internal-linked.ll"
 
 "$compiler" build "$source_file" -o "$output_directory/program" --no-cache
 set +e
