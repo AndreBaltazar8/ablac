@@ -6,7 +6,7 @@ multi-stage source bootstrap are no longer part of the repository.
 
 A compiler cannot translate itself on an empty machine without an existing
 executable translator. Clean builds therefore begin with a checksum-pinned
-native `v0.2.10` host artifact for Linux x86-64, Intel macOS, or Apple Silicon.
+native `v0.2.11` host artifact for Linux x86-64, Intel macOS, or Apple Silicon.
 Mach-O artifacts can be emitted and linked on Linux with LLVM, an Apple SDK,
 and ABI stubs for the target libraries. The resulting artifact is then
 executed by the matching Mac release gate.
