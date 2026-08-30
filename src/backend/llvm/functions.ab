@@ -1450,11 +1450,14 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "ablaRuntimePointerFromAddress" ||
     name == "nativeStackAllocate" ||
     name == "nativeStaticAllocate" ||
+    name == "nativeInternalSectionBytes" ||
     name == "nativeInitializeGlobals" ||
     name == "nativeLinkerSymbolAddress" ||
     name == "nativeLinkedStaticAllocate" ||
     name == "nativeInternalLinkedStaticAllocate" ||
     name == "nativeLinkedThreadLocalAllocate" ||
+    name == "nativeSectionLinkedThreadLocalAllocate" ||
+    name == "nativeInternalSectionThreadLocalAllocate" ||
     name == "nativeThreadLocalBytes" ||
     name == "nativeXtensaCoreId" ||
     name == "nativeXtensaCycleCounter" ||
@@ -2914,6 +2917,63 @@ fun bootstrapLlvmEmitCoreIntrinsic(
             }
         }
     }
+    if (name == "nativeInternalSectionBytes") {
+        if (instruction.operands.size != 4) supported = false
+        if (instruction.operands.size == 4) {
+            val contents = bootstrapLlvmCoreIntrinsicConstantString(
+                irFunction, instruction.operands[0]
+            )
+            val linkName = bootstrapLlvmCoreIntrinsicConstantString(
+                irFunction, instruction.operands[1]
+            )
+            val section = bootstrapLlvmCoreIntrinsicConstantString(
+                irFunction, instruction.operands[2]
+            )
+            val requestedAlignment = bootstrapLlvmCoreIntrinsicInteger(
+                backend, storage, instruction.operands[3]
+            )
+            val alignmentConstant = LLVMIsAConstantInt(requestedAlignment)
+            if (contents.size < 1 || linkName == "" || section == "" ||
+                pointerIsNull(alignmentConstant)) supported = false
+            if (contents.size > 0 && linkName != "" && section != "" &&
+                !pointerIsNull(alignmentConstant)) {
+                val alignment = LLVMConstIntGetSExtValue(alignmentConstant)
+                if (alignment < 1 || alignment > 1073741824 ||
+                    (alignment & (alignment - 1)) != 0) supported = false
+                if (alignment >= 1 && alignment <= 1073741824 &&
+                    (alignment & (alignment - 1)) == 0) {
+                    val initializer = LLVMConstStringInContext2(
+                        backend.context, contents, contents.size, 1
+                    )
+                    val type = LLVMTypeOf(initializer)
+                    var global = LLVMGetNamedGlobal(backend.module, linkName)
+                    if (pointerIsNull(global)) {
+                        global = LLVMAddGlobal(backend.module, type, linkName)
+                        LLVMSetInitializer(global, initializer)
+                        LLVMSetGlobalConstant(global, 1)
+                        LLVMSetAlignment(global, i32(alignment))
+                        LLVMSetLinkage(global, llvmInternalLinkage())
+                        LLVMSetSection(global, section)
+                        var retainedSlot = 0
+                        while (retainedSlot < retainedLinkedData.size &&
+                            !pointerIsNull(retainedLinkedData[retainedSlot])) {
+                            retainedSlot = retainedSlot + 1
+                        }
+                        if (retainedSlot < retainedLinkedData.size) {
+                            retainedLinkedData[retainedSlot] = global
+                        } else supported = false
+                    }
+                    bootstrapLlvmSetNativeValue(
+                        backend, storage, instruction.result,
+                        LLVMBuildPtrToInt(
+                            backend.builder, global, backend.i64Type,
+                            "unsafe.internal.section.bytes.address"
+                        )
+                    )
+                }
+            }
+        }
+    }
     if (name == "nativeLinkerSymbolAddress") {
         if (instruction.operands.size != 1) supported = false
         if (instruction.operands.size == 1) {
@@ -2941,9 +3001,14 @@ fun bootstrapLlvmEmitCoreIntrinsic(
     }
     if (name == "nativeLinkedStaticAllocate" ||
         name == "nativeInternalLinkedStaticAllocate" ||
-        name == "nativeLinkedThreadLocalAllocate") {
-        if (instruction.operands.size != 2) supported = false
-        if (instruction.operands.size == 2) {
+        name == "nativeLinkedThreadLocalAllocate" ||
+        name == "nativeSectionLinkedThreadLocalAllocate" ||
+        name == "nativeInternalSectionThreadLocalAllocate") {
+        val sectioned = name == "nativeSectionLinkedThreadLocalAllocate" ||
+            name == "nativeInternalSectionThreadLocalAllocate"
+        val expectedOperands = if (sectioned) 4 else 2
+        if (instruction.operands.size != expectedOperands) supported = false
+        if (instruction.operands.size == expectedOperands) {
             val requested = bootstrapLlvmCoreIntrinsicInteger(
                 backend, storage, instruction.operands[0]
             )
@@ -2951,25 +3016,52 @@ fun bootstrapLlvmEmitCoreIntrinsic(
             val linkName = bootstrapLlvmCoreIntrinsicConstantString(
                 irFunction, instruction.operands[1]
             )
-            if (pointerIsNull(constant) || linkName == "") supported = false
-            if (!pointerIsNull(constant) && linkName != "") {
+            val section = if (sectioned)
+                bootstrapLlvmCoreIntrinsicConstantString(
+                    irFunction, instruction.operands[2]
+                )
+            else ""
+            val requestedAlignment = if (sectioned)
+                bootstrapLlvmCoreIntrinsicInteger(
+                    backend, storage, instruction.operands[3]
+                )
+            else LLVMConstInt(backend.i64Type, 8, 0)
+            val alignmentConstant = LLVMIsAConstantInt(requestedAlignment)
+            if (pointerIsNull(constant) || linkName == "" ||
+                (sectioned && (section == "" ||
+                    pointerIsNull(alignmentConstant)))) supported = false
+            if (!pointerIsNull(constant) && linkName != "" &&
+                (!sectioned || (section != "" &&
+                    !pointerIsNull(alignmentConstant)))) {
                 var size = LLVMConstIntGetSExtValue(constant)
+                var alignment = if (sectioned)
+                    LLVMConstIntGetSExtValue(alignmentConstant)
+                else 8
                 if (size < 1) size = 1
                 if (size > 2147483647) supported = false
-                if (size <= 2147483647) {
+                if (alignment < 1 || alignment > 1073741824 ||
+                    (alignment & (alignment - 1)) != 0) supported = false
+                if (size <= 2147483647 && alignment >= 1 &&
+                    alignment <= 1073741824 &&
+                    (alignment & (alignment - 1)) == 0) {
                     val type = LLVMArrayType2(backend.i8Type, size)
                     var global = LLVMGetNamedGlobal(backend.module, linkName)
                     if (pointerIsNull(global)) {
                         global = LLVMAddGlobal(backend.module, type, linkName)
                         LLVMSetInitializer(global, LLVMConstNull(type))
-                        LLVMSetAlignment(global, 8)
+                        LLVMSetAlignment(global, i32(alignment))
                         LLVMSetLinkage(
                             global,
-                            if (name == "nativeInternalLinkedStaticAllocate")
+                            if (name == "nativeInternalLinkedStaticAllocate" ||
+                                name ==
+                                    "nativeInternalSectionThreadLocalAllocate")
                                 llvmInternalLinkage()
                             else llvmExternalLinkage()
                         )
-                        if (name == "nativeInternalLinkedStaticAllocate") {
+                        if (sectioned) LLVMSetSection(global, section)
+                        if (name == "nativeInternalLinkedStaticAllocate" ||
+                            name ==
+                                "nativeInternalSectionThreadLocalAllocate") {
                             var retainedSlot = 0
                             while (retainedSlot < retainedLinkedData.size &&
                                 !pointerIsNull(
@@ -2979,7 +3071,8 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                                 retainedLinkedData[retainedSlot] = global
                             } else supported = false
                         }
-                        if (name == "nativeLinkedThreadLocalAllocate") {
+                        if (name == "nativeLinkedThreadLocalAllocate" ||
+                            sectioned) {
                             LLVMSetThreadLocal(global, 1)
                             // Keep linked TLS valid when this object is
                             // packaged into either an executable or a shared

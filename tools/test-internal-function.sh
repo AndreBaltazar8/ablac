@@ -9,9 +9,9 @@ required_native=$project_root/build/required-internal-function-test
 
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/internal-function.ab" >"$ir"
-rg -q '^@llvm\.compiler\.used = .*@abla_test_increment' "$ir"
+rg -q '^@llvm\.used = .*@abla_test_increment' "$ir"
 rg -q '^@abla_test_increment = internal alias i32 \(i32\), ptr @abla_fn_.*_direct$' "$ir"
-rg -q '^@llvm\.compiler\.used = .*@abla_test_choose' "$ir"
+rg -q '^@llvm\.used = .*@abla_test_choose' "$ir"
 rg -q '^define internal i32 @abla_test_choose\(' "$ir"
 if rg -q '^define (external |private )?i32 @abla_test_increment\(' "$ir"; then
     exit 1
