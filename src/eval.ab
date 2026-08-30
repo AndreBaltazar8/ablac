@@ -67,7 +67,10 @@ class BootstrapExportRequest(
     val parameterNames: array<string>,
     val parameterTypes: array<string>,
     val checked: bool,
-    val internal: bool
+    val internal: bool,
+    // Backend lowering can introduce calls after source reachability closes.
+    // Required definitions stay local, but must still be materialized.
+    val required: bool
 )
 
 class BootstrapDefinedTarget(
@@ -647,6 +650,7 @@ fun bootstrapStageAnnotatedExports(parsed: BootstrapParseResult): int {
                             parameterNames,
                             parameterTypes,
                             annotationName == "exportChecked",
+                            false,
                             false
                         )
                     )
@@ -678,6 +682,7 @@ fun bootstrapExportRequestsEqual(
         left.resultType == right.resultType &&
         left.checked == right.checked &&
         left.internal == right.internal &&
+        left.required == right.required &&
         left.parameterNames.size == right.parameterNames.size &&
         left.parameterTypes.size == right.parameterTypes.size
     var index = 0
@@ -719,7 +724,8 @@ fun bootstrapExportRequestAt(
         parameterNames,
         parameterTypes,
         Path("$root/$index.checked").readText() == "1",
-        Path("$root/$index.internal").readText() == "1"
+        Path("$root/$index.internal").readText() == "1",
+        Path("$root/$index.required").readText() == "1"
     )
 }
 
@@ -759,6 +765,9 @@ fun bootstrapStageExportRequest(request: BootstrapExportRequest): bool {
     if (valid) valid = Path("$root/$requestIndex.internal").writeTextAtomic(
         if (request.internal) "1" else "0"
     )
+    if (valid) valid = Path("$root/$requestIndex.required").writeTextAtomic(
+        if (request.required) "1" else "0"
+    )
     if (valid) valid = Path("$root/$requestIndex.parameters").writeTextAtomic(
         "${request.parameterTypes.size}"
     )
@@ -779,6 +788,7 @@ fun bootstrapStageExportRequest(request: BootstrapExportRequest): bool {
         Path("$root/$requestIndex.result").remove()
         Path("$root/$requestIndex.checked").remove()
         Path("$root/$requestIndex.internal").remove()
+        Path("$root/$requestIndex.required").remove()
         Path("$root/$requestIndex.parameters").remove()
         parameter = 0
         while (parameter < request.parameterTypes.size) {
@@ -819,19 +829,38 @@ fun bootstrapTakeExportRequests(): array<BootstrapExportRequest> {
             parameterNames,
             parameterTypes,
             Path("$root/$index.checked").readText() == "1",
-            Path("$root/$index.internal").readText() == "1"
+            Path("$root/$index.internal").readText() == "1",
+            Path("$root/$index.required").readText() == "1"
         ))
         Path("$root/$index.source").remove()
         Path("$root/$index.name").remove()
         Path("$root/$index.result").remove()
         Path("$root/$index.checked").remove()
         Path("$root/$index.internal").remove()
+        Path("$root/$index.required").remove()
         Path("$root/$index.parameters").remove()
         index = index + 1
     }
     bootstrapExportRequestCount = 0
     Path(root).remove()
     requests
+}
+
+// Required internal definitions must enter source lowering before the LLVM
+// reachability pass consumes the staged requests. Ordinary internalFunction
+// mappings deliberately do not become roots here: their native/assembly edges
+// remain responsible for retaining them.
+fun bootstrapRequiredInternalFunctionSources(): array<string> {
+    val sources: array<string> = []
+    val root = bootstrapExportRequestRoot()
+    var index = 0
+    while (index < bootstrapExportRequestCount) {
+        if (Path("$root/$index.required").readText() == "1") {
+            sources.append(Path("$root/$index.source").readText())
+        }
+        index = index + 1
+    }
+    sources
 }
 
 fun bootstrapDriverDiagnosticRoot(): string =
@@ -5743,12 +5772,14 @@ class BootstrapEvaluator(
         }
         if (targetName == "compilerExportFunction" ||
             targetName == "compilerInternalFunction" ||
+            targetName == "compilerRequiredInternalFunction" ||
             targetName == "compilerExportCheckedFunction") {
             val reflected = this.evaluate(expression.children[0])
             val exportName = this.evaluate(expression.children[1])
             var valid = reflected.kind == "integer" &&
                 exportName.kind == "string" &&
-                (if (targetName == "compilerInternalFunction") {
+                (if (targetName == "compilerInternalFunction" ||
+                    targetName == "compilerRequiredInternalFunction") {
                     bootstrapLinkerSymbolNameValid(exportName.text)
                 } else bootstrapExportNameValid(exportName.text)) &&
                 this.functionHandleValid(reflected.integer) &&
@@ -5819,7 +5850,9 @@ class BootstrapEvaluator(
                     parameterNames,
                     parameterTypes,
                     targetName == "compilerExportCheckedFunction",
-                    targetName == "compilerInternalFunction"
+                    targetName == "compilerInternalFunction" ||
+                        targetName == "compilerRequiredInternalFunction",
+                    targetName == "compilerRequiredInternalFunction"
                 )
             )
             if (valid) {
@@ -5827,7 +5860,8 @@ class BootstrapEvaluator(
             } else {
                 if (declarationPath == "") {
                     val symbolRequirement =
-                        if (targetName == "compilerInternalFunction") {
+                        if (targetName == "compilerInternalFunction" ||
+                            targetName == "compilerRequiredInternalFunction") {
                             "a unique bounded linker symbol name"
                         } else "a unique non-reserved C identifier"
                     bootstrapStageDriverDiagnostic(
@@ -7592,6 +7626,9 @@ class BootstrapEvaluator(
             }
             if (expression.text == "internalFunction") {
                 target = "compilerInternalFunction"
+            }
+            if (expression.text == "requiredInternalFunction") {
+                target = "compilerRequiredInternalFunction"
             }
             if (expression.text == "exportCheckedFunction") {
                 target = "compilerExportCheckedFunction"

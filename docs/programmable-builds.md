@@ -243,3 +243,11 @@ compatibility/convenience façade over these
 compiler services. Its `buildProgram`, `defineTarget`, and `exportFunction`
 helpers contain no platform policy; Android and WASM/MVC extensions wrap them
 with their own typed descriptors and generated artifacts.
+
+`internalFunction(source, symbol)` gives inline or module assembly a locally
+linked name and remains prunable when no reachable source, native, or assembly
+edge uses it. `requiredInternalFunction(source, symbol)` covers the narrower
+case where LLVM or a target backend can introduce the symbol only after that
+reachability pass, such as freestanding memory or integer-division helpers. It
+retains a local definition without adding a public ABI export. Both operations
+are target-neutral linking mechanisms; frameworks choose the concrete symbols.
