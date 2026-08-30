@@ -873,14 +873,21 @@ fun bootstrapLlvmExportInitializationRequirements(
     functionIndex: BootstrapLlvmNameIndex
 ): array<bool> {
     val required: array<bool> = []
+    val initializesGlobals: array<bool> = []
     var function = 0
     while (function < program.functions.size) {
         var needsInitialization = false
+        var initializes = false
         var instruction = 0
         while (instruction <
                program.functions[function].instructions.size) {
             val candidate =
                 program.functions[function].instructions[instruction]
+            if ((candidate.opcode == "call" ||
+                 candidate.opcode == "extern.intrinsic") &&
+                candidate.text == "nativeInitializeGlobals") {
+                initializes = true
+            }
             if ((candidate.opcode == "global.load" ||
                  candidate.opcode == "global.assign" ||
                  candidate.opcode == "global.store") &&
@@ -893,7 +900,8 @@ fun bootstrapLlvmExportInitializationRequirements(
             }
             instruction = instruction + 1
         }
-        required.append(needsInitialization)
+        initializesGlobals.append(initializes)
+        required.append(needsInitialization && !initializes)
         function = function + 1
     }
     var changed = true
@@ -901,7 +909,7 @@ fun bootstrapLlvmExportInitializationRequirements(
         changed = false
         function = 0
         while (function < program.functions.size) {
-            if (!required[function]) {
+            if (!required[function] && !initializesGlobals[function]) {
                 var instruction = 0
                 while (instruction <
                        program.functions[function].instructions.size) {
@@ -1213,6 +1221,18 @@ fun bootstrapLlvmEmitExportInitializer(
         LLVMBuildBr(backend.builder, done)
         LLVMPositionBuilderAtEnd(backend.builder, done)
         LLVMBuildRetVoid(backend.builder)
+    } else {
+        val initialize = LLVMGetNamedFunction(
+            backend.module, "abla_export_ensure_initialized"
+        )
+        if (!pointerIsNull(initialize)) {
+            LLVMSetLinkage(initialize, llvmInternalLinkage())
+            val entry = LLVMAppendBasicBlockInContext(
+                backend.context, initialize, "entry"
+            )
+            LLVMPositionBuilderAtEnd(backend.builder, entry)
+            LLVMBuildRetVoid(backend.builder)
+        }
     }
     if (false) LLVMDisposeMessage(nativeNullPointer())
 }
@@ -1240,9 +1260,6 @@ fun bootstrapLlvmEmitExports(
         )
         owner = owner + 1
     }
-    if (exports.size > 0) bootstrapLlvmEmitExportInitializer(
-        backend, program, functionIndex, identities
-    )
     var index = 0
     while (index < exports.size) {
         val request = exports[index]

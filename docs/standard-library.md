@@ -101,6 +101,12 @@ zero-initialized LLVM global per constant-sized call site for process-lifetime
 driver storage. Higher-level packages should wrap that raw address in a checked
 nominal handle or an ownership-checked resource type.
 
+Freestanding startup code that owns writable-memory preparation can call
+`nativeInitializeGlobals()` after data and BSS are ready. The call runs the
+same once-only initializer used by ordinary foreign entries. Its presence also
+tells the compiler that this entry owns initialization, so LLVM does not insert
+an unsafe earlier guard ahead of a kernel or firmware boot function.
+
 `abla/unsafe/xtensa` can also turn a named top-level `() -> void` function into
 a native Xtensa interrupt-entry address. This is a compiler operation, not a
 boxed `Fn` conversion: closures and local aliases are rejected, the entry uses

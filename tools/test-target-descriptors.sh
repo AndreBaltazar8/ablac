@@ -57,6 +57,18 @@ llvm-nm "$directory/freestanding-riscv64.o" \
     > "$directory/freestanding-riscv64.symbols"
 grep -q ' T firmware_entry$' "$directory/freestanding-riscv64.symbols"
 
+"$compiler" build \
+    "$project_root/tests/cases/native/manual-global-initialization.ab" \
+    --fast --no-cache \
+    --target-triple x86_64-unknown-linux-gnu --object-format elf \
+    -o "$directory/manual-global-initialization.o"
+llvm-nm "$directory/manual-global-initialization.o" \
+    > "$directory/manual-global-initialization.symbols"
+grep -q ' T freestanding_entry$' \
+    "$directory/manual-global-initialization.symbols"
+grep -q ' t abla_export_ensure_initialized$' \
+    "$directory/manual-global-initialization.symbols"
+
 set +e
 "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
     --fast --no-cache \
