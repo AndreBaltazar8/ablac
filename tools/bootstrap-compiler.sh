@@ -9,15 +9,15 @@ machine=$(uname -m)
 case "$platform/$machine" in
     Linux/x86_64)
         artifact=ablac-x86_64-linux
-        platform_sha256=db9b8283f3d1f16ef14176b407b04fec3e0e22818a7cf84c4fefd65d612949f2
+        platform_sha256=3fed1fbd402c03864375cfbbda13e84a332058cb6b3141a7b0d546eb58480f01
         ;;
     Darwin/x86_64)
         artifact=ablac-x86_64-macos
-        platform_sha256=cf6c22cedff20116518e7d30d78e6a6ea59ccf857e05f1b2838e65eafdf3a576
+        platform_sha256=76b6711e6251d6f07ea4b80f7a95cefe232702cbcbffc868a52bff4c7e0c022f
         ;;
     Darwin/arm64)
         artifact=ablac-arm64-macos
-        platform_sha256=f9218049dc6278f13841c346f1a78e4beb70153482284a06fc93a8b823f0188a
+        platform_sha256=5a77adf12e95a9d2d3e7d9095b75675b64ac802dc4442877ba31debc28da66c6
         ;;
     *)
         printf 'unsupported bootstrap host: %s/%s\n' "$platform" "$machine" >&2
