@@ -2,6 +2,22 @@ import "eval.ab"
 import "staged_parser.ab"
 import "abla/runtime/memory"
 
+fun bootstrapIrTraceMemory(label: string): void {
+    val configured = linuxEnvironment("ABLA_COMPILER_MEMORY_TRACE")
+    if (configured.found && configured.value != "") {
+        linuxWriteStandardError(
+            "abla-ir-memory $label ${runtimeMemoryLiveBytes()}\n"
+        )
+    }
+}
+
+fun bootstrapIrTraceReachability(label: string): void {
+    val configured = linuxEnvironment("ABLA_COMPILER_REACHABILITY_TRACE")
+    if (configured.found && configured.value != "") {
+        linuxWriteStandardError("abla-ir-reachability $label\n")
+    }
+}
+
 fun bootstrapGlobalCallResultType(
     declarations: array<BootstrapDeclaration>,
     name: string
@@ -2671,6 +2687,548 @@ fun bootstrapAppendDropFunctions(
     errors
 }
 
+fun bootstrapMarkSourceDeclaration(
+    var reachable: array<bool>,
+    var pending: array<int>,
+    declaration: int
+): void {
+    if (declaration >= 0 && declaration < reachable.size &&
+        !reachable[declaration]) {
+        reachable[declaration] = true
+        pending.append(declaration)
+    }
+    return
+}
+
+fun bootstrapCollectSourceReachability(
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>,
+    functionDeclarations: BootstrapFunctionDeclarationIndex,
+    typeDeclarations: BootstrapFunctionDeclarationIndex,
+    valueDeclarations: BootstrapFunctionDeclarationIndex,
+    methodDeclarations: BootstrapMethodDeclarationIndex,
+    var reachable: array<bool>,
+    var pending: array<int>
+): void {
+    if (expression.kind == "call") {
+        bootstrapMarkSourceDeclaration(
+            reachable,
+            pending,
+            functionDeclarations.find(expression.text)
+        )
+        // An exported ABI name is a root by definition. An internal alias is
+        // only metadata for a declaration that is already reachable; rooting
+        // it here would retain every reconstructed implementation merely
+        // because the source gives it an assembler-visible local name.
+        if (expression.text == "exportFunction" &&
+            expression.children.size > 0 &&
+            expression.children[0].kind == "string") {
+            bootstrapMarkSourceDeclaration(
+                reachable,
+                pending,
+                functionDeclarations.find(expression.children[0].text)
+            )
+        }
+        val constructed = typeDeclarations.find(expression.text)
+        if (constructed >= 0 &&
+            declarations[constructed].kind == "class") {
+            bootstrapMarkSourceDeclaration(
+                reachable, pending, constructed
+            )
+        }
+    }
+    if (expression.kind == "identifier") {
+        bootstrapMarkSourceDeclaration(
+            reachable,
+            pending,
+            functionDeclarations.find(expression.text)
+        )
+        bootstrapMarkSourceDeclaration(
+            reachable,
+            pending,
+            valueDeclarations.find(expression.text)
+        )
+    }
+    if (expression.kind == "member.call" &&
+        (expression.text == "findFunction" ||
+         expression.text == "function")) {
+        var argument = 1
+        while (argument < expression.children.size) {
+            if (expression.children[argument].kind == "string") {
+                bootstrapMarkSourceDeclaration(
+                    reachable,
+                    pending,
+                    functionDeclarations.find(
+                        expression.children[argument].text
+                    )
+                )
+            }
+            argument = argument + 1
+        }
+    }
+    if (expression.kind == "assign") {
+        bootstrapMarkSourceDeclaration(
+            reachable,
+            pending,
+            valueDeclarations.find(expression.text)
+        )
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapCollectSourceReachability(
+            expression.children[child],
+            declarations,
+            functionDeclarations,
+            typeDeclarations,
+            valueDeclarations,
+            methodDeclarations,
+            reachable,
+            pending
+        )
+        child = child + 1
+    }
+    return
+}
+
+fun bootstrapSourceInitializerWritesGlobal(
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>,
+    functionDeclarations: BootstrapFunctionDeclarationIndex,
+    typeDeclarations: BootstrapFunctionDeclarationIndex,
+    valueDeclarations: BootstrapFunctionDeclarationIndex,
+    var functionStates: array<int>
+): bool {
+    if (expression.kind == "assign" &&
+        valueDeclarations.find(expression.text) >= 0) return true
+    if (expression.kind == "call") {
+        if (expression.text == "internalFunction" ||
+            expression.text == "exportFunction") return false
+        val function = functionDeclarations.find(expression.text)
+        if (function >= 0) {
+            val declaration = declarations[function]
+            if (declaration.kind == "extern") {
+                return declaration.externalLibrary != "intrinsic" &&
+                    declaration.externalLibrary != "compiler"
+            }
+            if (functionStates[function] == 1) return true
+            if (functionStates[function] == 0 ||
+                functionStates[function] == -2) return false
+            functionStates[function] = -2
+            val writes = bootstrapSourceInitializerWritesGlobal(
+                declaration.expression,
+                declarations,
+                functionDeclarations,
+                typeDeclarations,
+                valueDeclarations,
+                functionStates
+            )
+            functionStates[function] = if (writes) 1 else 0
+            if (writes) {
+                return true
+            }
+        } else {
+            val normalized = bootstrapNormalizeType(expression.text)
+            var scalarConstruction =
+                bootstrapScalarTypeUnderlyingValid(normalized)
+            val typeDeclaration = typeDeclarations.find(expression.text)
+            if (typeDeclaration >= 0 &&
+                declarations[typeDeclaration].kind == "type") {
+                scalarConstruction = bootstrapScalarTypeUnderlyingValid(
+                    bootstrapNormalizeType(
+                        declarations[typeDeclaration].resultType
+                    )
+                )
+            }
+            if (!scalarConstruction) return true
+        }
+    }
+    if (expression.kind == "member.call") return true
+    var child = 0
+    while (child < expression.children.size) {
+        if (bootstrapSourceInitializerWritesGlobal(
+                expression.children[child],
+                declarations,
+                functionDeclarations,
+                typeDeclarations,
+                valueDeclarations,
+                functionStates
+            )) return true
+        child = child + 1
+    }
+    false
+}
+
+fun bootstrapSourceReachableDeclarations(
+    parsed: BootstrapParseResult,
+    functionDeclarations: BootstrapFunctionDeclarationIndex,
+    typeDeclarations: BootstrapFunctionDeclarationIndex,
+    valueDeclarations: BootstrapFunctionDeclarationIndex,
+    methodDeclarations: BootstrapMethodDeclarationIndex
+): array<bool> {
+    val reachable: array<bool> = []
+    val pending: array<int> = []
+    val initializerWriteStates: array<int> = []
+    var mainRoots = 0
+    var nakedRoots = 0
+    var exportedRoots = 0
+    var initializerRoots = 0
+    var state = 0
+    while (state < parsed.declarations.size) {
+        initializerWriteStates.append(-1)
+        state = state + 1
+    }
+    var declaration = 0
+    while (declaration < parsed.declarations.size) {
+        reachable.append(false)
+        val candidate = parsed.declarations[declaration]
+        val initializerRoot = bootstrapDeclarationIsValue(candidate.kind) &&
+            bootstrapSourceInitializerWritesGlobal(
+                candidate.expression,
+                parsed.declarations,
+                functionDeclarations,
+                typeDeclarations,
+                valueDeclarations,
+                initializerWriteStates
+            )
+        if (candidate.name == "main") mainRoots = mainRoots + 1
+        if (bootstrapDeclarationHasAnnotation(candidate, "naked")) {
+            nakedRoots = nakedRoots + 1
+        }
+        if (bootstrapDeclarationHasAnnotation(candidate, "export") ||
+            bootstrapDeclarationHasAnnotation(candidate, "exportChecked")) {
+            exportedRoots = exportedRoots + 1
+        }
+        if (initializerRoot) {
+            initializerRoots = initializerRoots + 1
+            bootstrapIrTraceReachability(
+                "initializer:${candidate.name}"
+            )
+        }
+        if (candidate.name == "main" ||
+            bootstrapDeclarationHasAnnotation(candidate, "naked") ||
+            bootstrapDeclarationHasAnnotation(candidate, "export") ||
+            bootstrapDeclarationHasAnnotation(candidate, "exportChecked") ||
+            initializerRoot) {
+            bootstrapMarkSourceDeclaration(
+                reachable, pending, declaration
+            )
+        }
+        declaration = declaration + 1
+    }
+    bootstrapIrTraceReachability(
+        "roots:main=$mainRoots:naked=$nakedRoots:exported=$exportedRoots:initializer=$initializerRoots"
+    )
+    var action = 0
+    while (action < parsed.actions.size) {
+        bootstrapCollectSourceReachability(
+            parsed.actions[action],
+            parsed.declarations,
+            functionDeclarations,
+            typeDeclarations,
+            valueDeclarations,
+            methodDeclarations,
+            reachable,
+            pending
+        )
+        action = action + 1
+    }
+    var cursor = 0
+    while (cursor < pending.size) {
+        declaration = pending[cursor]
+        cursor = cursor + 1
+        val candidate = parsed.declarations[declaration]
+        bootstrapCollectSourceReachability(
+            candidate.expression,
+            parsed.declarations,
+            functionDeclarations,
+            typeDeclarations,
+            valueDeclarations,
+            methodDeclarations,
+            reachable,
+            pending
+        )
+        var method = 0
+        while (method < candidate.methods.size) {
+            bootstrapCollectSourceReachability(
+                candidate.methods[method].expression,
+                parsed.declarations,
+                functionDeclarations,
+                typeDeclarations,
+                valueDeclarations,
+                methodDeclarations,
+                reachable,
+                pending
+            )
+            method = method + 1
+        }
+    }
+    bootstrapIrTraceMemory("lower.reachable:${pending.size}")
+    reachable
+}
+
+fun bootstrapLoweredFunctionDeclarationIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapFunctionDeclarationIndex {
+    val names: array<string> = []
+    val indices: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.kind == "fun") {
+            val name = if (candidate.extensionOwner == "") candidate.name
+                else "extension_${candidate.extensionOwner}_${candidate.name}"
+            names.append(name)
+            indices.append(declaration)
+        }
+        var method = 0
+        while (method < candidate.methods.size) {
+            names.append("${candidate.name}_${candidate.methods[method].name}")
+            indices.append(declaration)
+            method = method + 1
+        }
+        declaration = declaration + 1
+    }
+    var capacity = 8
+    while (capacity < names.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    var entry = 0
+    while (entry < names.size) {
+        slot = bootstrapFunctionDeclarationHash(names[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0 || names[existing] == names[entry]) {
+                slots[slot] = entry
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    BootstrapFunctionDeclarationIndex(names, indices, slots)
+}
+
+fun bootstrapCollectInternalFunctionAliasEntries(
+    expression: BootstrapExpression,
+    functions: BootstrapFunctionDeclarationIndex,
+    var names: array<string>,
+    var declarations: array<int>
+): void {
+    if (expression.kind == "call" &&
+        expression.text == "internalFunction" &&
+        expression.children.size >= 2) {
+        val source = bootstrapStaticString(expression.children[0])
+        val alias = bootstrapStaticString(expression.children[1])
+        if (source.valid && alias.valid) {
+            val declaration = functions.find(source.text)
+            if (declaration >= 0) {
+                names.append(alias.text)
+                declarations.append(declaration)
+            }
+        }
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapCollectInternalFunctionAliasEntries(
+            expression.children[child], functions, names, declarations
+        )
+        child = child + 1
+    }
+    return
+}
+
+// Build the exact local-linker-name -> source declaration relation before
+// demand lowering. LLVM performs the same graph walk later, but by then a
+// declaration omitted here no longer exists in the IR program. This index is
+// target-neutral: aliases are compiler metadata and assembly is tokenized
+// using the portable linker-name alphabet accepted by internalFunction.
+fun bootstrapInternalFunctionAliasDeclarationIndex(
+    parsed: BootstrapParseResult,
+    functions: BootstrapFunctionDeclarationIndex
+): BootstrapFunctionDeclarationIndex {
+    val names: array<string> = []
+    val declarations: array<int> = []
+    var action = 0
+    while (action < parsed.actions.size) {
+        bootstrapCollectInternalFunctionAliasEntries(
+            parsed.actions[action], functions, names, declarations
+        )
+        action = action + 1
+    }
+    var declaration = 0
+    while (declaration < parsed.declarations.size) {
+        val candidate = parsed.declarations[declaration]
+        bootstrapCollectInternalFunctionAliasEntries(
+            candidate.expression, functions, names, declarations
+        )
+        var method = 0
+        while (method < candidate.methods.size) {
+            bootstrapCollectInternalFunctionAliasEntries(
+                candidate.methods[method].expression,
+                functions,
+                names,
+                declarations
+            )
+            method = method + 1
+        }
+        declaration = declaration + 1
+    }
+    var capacity = 8
+    while (capacity < names.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    var entry = 0
+    while (entry < names.size) {
+        slot = bootstrapFunctionDeclarationHash(names[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0 || names[existing] == names[entry]) {
+                slots[slot] = entry
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    BootstrapFunctionDeclarationIndex(names, declarations, slots)
+}
+
+fun bootstrapIrAssemblySymbolByte(byte: int): bool =
+    (byte >= 65 && byte <= 90) ||
+    (byte >= 97 && byte <= 122) ||
+    (byte >= 48 && byte <= 57) ||
+    byte == 95 || byte == 46 || byte == 36
+
+fun bootstrapIrAssemblyLinkerName(
+    assembly: string,
+    begin: int,
+    end: int
+): string {
+    var escapedDollar = false
+    var probe = begin
+    while (!escapedDollar && probe + 1 < end) {
+        escapedDollar = assembly[probe] == 36 && assembly[probe + 1] == 36
+        probe = probe + 1
+    }
+    if (!escapedDollar) return assembly.slice(begin, end)
+    var result = ""
+    var index = begin
+    while (index < end) {
+        result = "$result${assembly.slice(index, index + 1)}"
+        if (assembly[index] == 36 && index + 1 < end &&
+            assembly[index + 1] == 36) index = index + 1
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapCollectInlineAssemblyDeclarationTargets(
+    assembly: string,
+    loweredTargets: BootstrapFunctionDeclarationIndex,
+    internalAliases: BootstrapFunctionDeclarationIndex,
+    var reachable: array<bool>,
+    var pending: array<int>
+): void {
+    var offset = 0
+    while (offset < assembly.size) {
+        while (offset < assembly.size &&
+               !bootstrapIrAssemblySymbolByte(assembly[offset])) {
+            offset = offset + 1
+        }
+        val begin = offset
+        while (offset < assembly.size &&
+               bootstrapIrAssemblySymbolByte(assembly[offset])) {
+            offset = offset + 1
+        }
+        if (begin < offset) {
+            val token = bootstrapIrAssemblyLinkerName(
+                assembly, begin, offset
+            )
+            bootstrapMarkSourceDeclaration(
+                reachable, pending, loweredTargets.find(token)
+            )
+            bootstrapMarkSourceDeclaration(
+                reachable, pending, internalAliases.find(token)
+            )
+        }
+    }
+    return
+}
+
+fun bootstrapCollectLoweredFunctionTargets(
+    functions: array<BootstrapIrFunction>,
+    begin: int,
+    targets: BootstrapFunctionDeclarationIndex,
+    internalAliases: BootstrapFunctionDeclarationIndex,
+    values: BootstrapFunctionDeclarationIndex,
+    var reachable: array<bool>,
+    var pending: array<int>
+): void {
+    var function = begin
+    while (function < functions.size) {
+        var instruction = 0
+        while (instruction < functions[function].instructions.size) {
+            val candidate = functions[function].instructions[instruction]
+            if (candidate.opcode == "call" ||
+                candidate.opcode == "function.ref" ||
+                candidate.opcode == "closure.create" ||
+                candidate.opcode == "native.function.address") {
+                bootstrapMarkSourceDeclaration(
+                    reachable,
+                    pending,
+                    targets.find(candidate.text)
+                )
+            }
+            if (candidate.opcode == "extern.c" ||
+                candidate.opcode == "extern.host" ||
+                candidate.opcode == "extern.intrinsic") {
+                bootstrapMarkSourceDeclaration(
+                    reachable,
+                    pending,
+                    internalAliases.find(candidate.text)
+                )
+            }
+            if (candidate.opcode == "global.load" ||
+                candidate.opcode == "global.assign") {
+                bootstrapMarkSourceDeclaration(
+                    reachable,
+                    pending,
+                    values.find(candidate.text)
+                )
+            }
+            if (candidate.opcode == "inline.assembly" &&
+                candidate.texts.size > 1) {
+                bootstrapCollectInlineAssemblyDeclarationTargets(
+                    candidate.texts[1],
+                    targets,
+                    internalAliases,
+                    reachable,
+                    pending
+                )
+            }
+            instruction = instruction + 1
+        }
+        function = function + 1
+    }
+    return
+}
+
 fun bootstrapBuildNeverCallNames(
     declarations: array<BootstrapDeclaration>
 ): array<string> {
@@ -4418,12 +4976,15 @@ class BootstrapLowerer(
 
     fun methodOwner(name: string): string {
         var result = ""
-        var entry = 0
-        while (entry < this.methodDeclarations.declarations.size) {
+        var slot = bootstrapFunctionDeclarationHash(name)
+        slot = slot - slot / this.methodDeclarations.nameSlots.size *
+            this.methodDeclarations.nameSlots.size
+        var entry = this.methodDeclarations.nameSlots[slot]
+        while (entry >= 0) {
             if (this.methodDeclarations.declarations[entry].name == name) {
                 result = this.methodDeclarations.owners[entry]
             }
-            entry = entry + 1
+            entry = this.methodDeclarations.nameNext[entry]
         }
         result
     }
@@ -6348,6 +6909,11 @@ class BootstrapLowerer(
             loweredFunction.section,
             loweredFunction.verificationErrors + loweringErrors
         )
+        if (reportedFunction.verificationErrors > 0) {
+            bootstrapIrTraceMemory(
+                "verification.function:${reportedFunction.name}:${reportedFunction.verificationErrors}"
+            )
+        }
         functionSink.append(reportedFunction)
         if (!validationOnly) {
             var emitted = 0
@@ -6486,6 +7052,11 @@ class BootstrapLowerer(
             loweredMethod.section,
             loweredMethod.verificationErrors + loweringErrors
         )
+        if (reportedMethod.verificationErrors > 0) {
+            bootstrapIrTraceMemory(
+                "verification.method:${reportedMethod.name}:${reportedMethod.verificationErrors}"
+            )
+        }
         functionSink.append(reportedMethod)
         if (!validationOnly) {
             var emitted = 0
@@ -6608,7 +7179,8 @@ class BootstrapLowerer(
         parsed: BootstrapParseResult,
         contextFirst: int,
         contextSecond: int,
-        var cache: BootstrapIrCacheState
+        var cache: BootstrapIrCacheState,
+        pruneUnused: bool
     ): BootstrapIrProgram {
         val classes: array<BootstrapIrClass> = []
         val natives: array<BootstrapIrNative> = []
@@ -6666,8 +7238,77 @@ class BootstrapLowerer(
         val borrowReturnCallNames = bootstrapBuildBorrowReturnCallNames(
             parsed.declarations
         )
+        val sourceReachable: array<bool> = []
+        if (pruneUnused) {
+            val found = bootstrapSourceReachableDeclarations(
+                parsed,
+                this.functionDeclarations,
+                this.typeDeclarations,
+                this.valueDeclarations,
+                this.methodDeclarations
+            )
+            var reachableIndex = 0
+            while (reachableIndex < found.size) {
+                sourceReachable.append(found[reachableIndex])
+                reachableIndex = reachableIndex + 1
+            }
+        } else {
+            var reachableIndex = 0
+            while (reachableIndex < parsed.declarations.size) {
+                sourceReachable.append(true)
+                reachableIndex = reachableIndex + 1
+            }
+        }
+        val loweredTargets = bootstrapLoweredFunctionDeclarationIndex(
+            parsed.declarations
+        )
+        val internalAliases =
+            bootstrapInternalFunctionAliasDeclarationIndex(
+                parsed,
+                this.functionDeclarations
+            )
+        val loweredDeclarations: array<bool> = []
+        val pendingDeclarations: array<int> = []
+        index = 0
         while (index < parsed.declarations.size) {
+            loweredDeclarations.append(false)
+            if (sourceReachable[index]) pendingDeclarations.append(index)
+            index = index + 1
+        }
+        var pendingDeclaration = 0
+        while (pendingDeclaration < pendingDeclarations.size) {
+            index = pendingDeclarations[pendingDeclaration]
+            pendingDeclaration = pendingDeclaration + 1
+            if (loweredDeclarations[index]) continue
+            loweredDeclarations[index] = true
             val declaration = parsed.declarations[index]
+            bootstrapCollectSourceReachability(
+                declaration.expression,
+                parsed.declarations,
+                this.functionDeclarations,
+                this.typeDeclarations,
+                this.valueDeclarations,
+                this.methodDeclarations,
+                sourceReachable,
+                pendingDeclarations
+            )
+            var sourceMethod = 0
+            while (sourceMethod < declaration.methods.size) {
+                bootstrapCollectSourceReachability(
+                    declaration.methods[sourceMethod].expression,
+                    parsed.declarations,
+                    this.functionDeclarations,
+                    this.typeDeclarations,
+                    this.valueDeclarations,
+                    this.methodDeclarations,
+                    sourceReachable,
+                    pendingDeclarations
+                )
+                sourceMethod = sourceMethod + 1
+            }
+
+            val functionBegin = this.functions.size
+            val instructionBegin = this.instructions.size
             if ((declaration.kind == "fun" ||
                  declaration.kind == "compile.fun") &&
                 declaration.expression.kind != "missing" &&
@@ -6683,14 +7324,14 @@ class BootstrapLowerer(
                 bootstrapSemanticUnit()
                 this.errors = validationErrors
             }
-            var validationMethodIndex = 0
-            while (validationMethodIndex < declaration.methods.size) {
-                val method = declaration.methods[validationMethodIndex]
+            var methodIndex = 0
+            while (methodIndex < declaration.methods.size) {
+                val method = declaration.methods[methodIndex]
                 if (method.expression.kind != "missing" &&
-                    bootstrapDeclarationMayBindBorrow(
+                    (bootstrapDeclarationMayBindBorrow(
                         method,
                         borrowReturnCallNames
-                    ) || this.declarationHasManagedAlias(method)) {
+                    ) || this.declarationHasManagedAlias(method))) {
                     val checkpoint = runtimeMemoryCheckpoint()
                     val validationErrors = this.lowerMethodDeclaration(
                         declaration,
@@ -6700,21 +7341,14 @@ class BootstrapLowerer(
                     bootstrapSemanticUnit()
                     this.errors = validationErrors
                 }
-                validationMethodIndex = validationMethodIndex + 1
+                methodIndex = methodIndex + 1
             }
-            index = index + 1
-        }
-        index = 0
-        while (index < parsed.declarations.size) {
-            val declaration = parsed.declarations[index]
             if (declaration.kind == "val" || declaration.kind == "var") {
                 val value = this.lowerExpression(declaration.expression)
                 this.emit("global.store", value, -1, declaration.name)
             }
-            if (
-                declaration.kind == "fun" &&
-                declaration.expression.kind != "missing"
-            ) {
+            if (declaration.kind == "fun" &&
+                declaration.expression.kind != "missing") {
                 this.errors = this.lowerCachedFunction(
                     declaration,
                     "function:${declaration.extensionOwner}:${declaration.name}",
@@ -6723,7 +7357,7 @@ class BootstrapLowerer(
                     cache
                 )
             }
-            var methodIndex = 0
+            methodIndex = 0
             while (methodIndex < declaration.methods.size) {
                 val method = declaration.methods[methodIndex]
                 if (method.expression.kind != "missing") {
@@ -6738,8 +7372,61 @@ class BootstrapLowerer(
                 }
                 methodIndex = methodIndex + 1
             }
-            index = index + 1
+            bootstrapCollectLoweredFunctionTargets(
+                this.functions,
+                functionBegin,
+                loweredTargets,
+                internalAliases,
+                this.valueDeclarations,
+                sourceReachable,
+                pendingDeclarations
+            )
+            var instruction = instructionBegin
+            while (instruction < this.instructions.size) {
+                val candidate = this.instructions[instruction]
+                if (candidate.opcode == "call" ||
+                    candidate.opcode == "function.ref" ||
+                    candidate.opcode == "closure.create" ||
+                    candidate.opcode == "native.function.address") {
+                    bootstrapMarkSourceDeclaration(
+                        sourceReachable,
+                        pendingDeclarations,
+                        loweredTargets.find(candidate.text)
+                    )
+                }
+                if (candidate.opcode == "extern.c" ||
+                    candidate.opcode == "extern.host" ||
+                    candidate.opcode == "extern.intrinsic") {
+                    bootstrapMarkSourceDeclaration(
+                        sourceReachable,
+                        pendingDeclarations,
+                        internalAliases.find(candidate.text)
+                    )
+                }
+                if (candidate.opcode == "global.load" ||
+                    candidate.opcode == "global.assign") {
+                    bootstrapMarkSourceDeclaration(
+                        sourceReachable,
+                        pendingDeclarations,
+                        this.valueDeclarations.find(candidate.text)
+                    )
+                }
+                if (candidate.opcode == "inline.assembly" &&
+                    candidate.texts.size > 1) {
+                    bootstrapCollectInlineAssemblyDeclarationTargets(
+                        candidate.texts[1],
+                        loweredTargets,
+                        internalAliases,
+                        sourceReachable,
+                        pendingDeclarations
+                    )
+                }
+                instruction = instruction + 1
+            }
         }
+        bootstrapIrTraceMemory(
+            "lower.demanded:${pendingDeclarations.size}"
+        )
         if (this.functions.size > 0 && this.instructions.size > 0) {
             val result = this.emit("const.void", -1, -1, "")
             val globalParameters: array<string> = []
@@ -6751,6 +7438,11 @@ class BootstrapLowerer(
                 [],
                 "void"
             )
+            if (globalFunction.verificationErrors > 0) {
+                bootstrapIrTraceMemory(
+                    "verification.globals:${globalFunction.verificationErrors}"
+                )
+            }
             this.errors = this.errors + globalFunction.verificationErrors
             this.functions.append(globalFunction)
         }
@@ -6765,7 +7457,9 @@ class BootstrapLowerer(
         var global = 0
         while (global < parsed.declarations.size) {
             val declaration = parsed.declarations[global]
-            if (declaration.kind == "val" || declaration.kind == "var") {
+            if (sourceReachable[global] &&
+                (declaration.kind == "val" ||
+                 declaration.kind == "var")) {
                 globalNames.append(declaration.name)
                 globalKinds.append(declaration.kind)
                 // A delegated binding exposes the getter result but stores
@@ -6874,7 +7568,8 @@ fun bootstrapParsedHasContractCall(parsed: BootstrapParseResult): bool {
 fun bootstrapLowerParsedCached(
     parsed: BootstrapParseResult,
     analyzed: BootstrapSemanticResult,
-    var cache: BootstrapIrCacheState
+    var cache: BootstrapIrCacheState,
+    pruneUnused: bool = false
 ): BootstrapIrProgram {
     val instructions: array<BootstrapInstruction> = []
     val functions: array<BootstrapIrFunction> = []
@@ -6955,7 +7650,7 @@ fun bootstrapLowerParsedCached(
         -1,
         false,
         analyzed.errors
-    ).lower(parsed, contextFirst, contextSecond, cache)
+    ).lower(parsed, contextFirst, contextSecond, cache, pruneUnused)
 }
 
 fun bootstrapLowerParsed(
