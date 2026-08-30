@@ -3152,6 +3152,144 @@ fun bootstrapFunctionDeclarationIndex(
     BootstrapFunctionDeclarationIndex(names, declarationIndices, slots)
 }
 
+fun bootstrapTypeDeclarationIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapFunctionDeclarationIndex {
+    val names: array<string> = []
+    val declarationIndices: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.kind == "class" || candidate.kind == "interface" ||
+            candidate.kind == "type") {
+            names.append(candidate.name)
+            declarationIndices.append(declaration)
+        }
+        declaration = declaration + 1
+    }
+    var capacity = 8
+    while (capacity < names.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    var entry = 0
+    while (entry < names.size) {
+        slot = bootstrapFunctionDeclarationHash(names[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0 || names[existing] == names[entry]) {
+                slots[slot] = entry
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    BootstrapFunctionDeclarationIndex(names, declarationIndices, slots)
+}
+
+class BootstrapMethodDeclarationIndex(
+    val keys: array<string>,
+    val declarations: array<BootstrapDeclaration>,
+    val handles: array<int>,
+    val slots: array<int>
+) {
+    fun find(owner: string, name: string): int {
+        val key = bootstrapMethodDeclarationKey(owner, name)
+        var result = -1
+        if (this.slots.size > 0) {
+            var slot = bootstrapFunctionDeclarationHash(key)
+            slot = slot - slot / this.slots.size * this.slots.size
+            var probes = 0
+            while (result < 0 && probes < this.slots.size &&
+                   this.slots[slot] >= 0) {
+                val entry = this.slots[slot]
+                if (this.keys[entry] == key) {
+                    result = entry
+                } else {
+                    slot = slot + 1
+                    if (slot == this.slots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapMethodDeclarationKey(owner: string, name: string): string =
+    "${owner.size}:$owner$name"
+
+fun bootstrapMethodDeclarationIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapMethodDeclarationIndex {
+    val keys: array<string> = []
+    val methods: array<BootstrapDeclaration> = []
+    val handles: array<int> = []
+    var nextMethodHandle = declarations.size
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.extensionOwner != "" &&
+            (candidate.kind == "fun" ||
+             candidate.kind == "compile.fun")) {
+            keys.append(bootstrapMethodDeclarationKey(
+                bootstrapNormalizeType(candidate.extensionOwner),
+                candidate.name
+            ))
+            methods.append(candidate)
+            handles.append(declaration)
+        }
+        var method = 0
+        while (method < candidate.methods.size) {
+            keys.append(bootstrapMethodDeclarationKey(
+                bootstrapNormalizeType(candidate.name),
+                candidate.methods[method].name
+            ))
+            methods.append(candidate.methods[method])
+            handles.append(nextMethodHandle)
+            nextMethodHandle = nextMethodHandle + 1
+            method = method + 1
+        }
+        declaration = declaration + 1
+    }
+    var capacity = 8
+    while (capacity < keys.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    var entry = 0
+    while (entry < keys.size) {
+        slot = bootstrapFunctionDeclarationHash(keys[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0 || keys[existing] == keys[entry]) {
+                // The pre-indexed resolver, like the previous linear scan,
+                // selects the last matching inherent/extension declaration.
+                slots[slot] = entry
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    BootstrapMethodDeclarationIndex(keys, methods, handles, slots)
+}
+
 class BootstrapAnalyzer(
     val symbols: array<BootstrapSymbol>,
     var symbolSlots: array<int>,
@@ -3160,6 +3298,8 @@ class BootstrapAnalyzer(
     var locals: array<BootstrapSymbol>,
     val declarations: array<BootstrapDeclaration>,
     val functionDeclarations: BootstrapFunctionDeclarationIndex,
+    val typeDeclarations: BootstrapFunctionDeclarationIndex,
+    val methodDeclarations: BootstrapMethodDeclarationIndex,
     val affineTypes: array<string>,
     val mutableReceivers: BootstrapMutableReceiverSummary,
     val regionCalls: BootstrapRegionCallSummary,
@@ -3284,9 +3424,7 @@ class BootstrapAnalyzer(
     fun typesCompatible(expected: string, actual: string): bool {
         var compatible = bootstrapTypesCompatible(expected, actual)
         if (!compatible) {
-            val underlying = bootstrapScalarTypeUnderlying(
-                this.declarations, actual
-            )
+            val underlying = this.scalarTypeUnderlying(actual)
             if (underlying != "") {
                 compatible = bootstrapTypesCompatible(expected, underlying)
             }
@@ -3294,12 +3432,22 @@ class BootstrapAnalyzer(
         compatible
     }
 
+    fun scalarTypeUnderlying(name: string): string {
+        var result = ""
+        val declaration = this.typeDeclarations.find(name)
+        if (declaration >= 0 &&
+            this.declarations[declaration].kind == "type") {
+            result = bootstrapNormalizeType(
+                this.declarations[declaration].resultType
+            )
+        }
+        result
+    }
+
     fun scalarValueType(type: string): string {
         val normalized = bootstrapNormalizeType(type)
         if (bootstrapScalarTypeUnderlyingValid(normalized)) normalized else {
-            val underlying = bootstrapScalarTypeUnderlying(
-                this.declarations, normalized
-            )
+            val underlying = this.scalarTypeUnderlying(normalized)
             if (underlying == "") normalized else underlying
         }
     }
@@ -3818,8 +3966,8 @@ class BootstrapAnalyzer(
 
     fun fieldType(owner: string, field: string): string {
         var result = "unknown"
-        var declarationIndex = 0
-        while (declarationIndex < this.declarations.size) {
+        val declarationIndex = this.typeDeclarations.find(owner)
+        if (declarationIndex >= 0) {
             val declaration = this.declarations[declarationIndex]
             if ((declaration.kind == "class" ||
                  declaration.kind == "interface") &&
@@ -3838,15 +3986,14 @@ class BootstrapAnalyzer(
                     fieldIndex = fieldIndex + 1
                 }
             }
-            declarationIndex = declarationIndex + 1
         }
         result
     }
 
     fun fieldIsMutable(owner: string, field: string): bool {
         var result = false
-        var declarationIndex = 0
-        while (declarationIndex < this.declarations.size) {
+        val declarationIndex = this.typeDeclarations.find(owner)
+        if (declarationIndex >= 0) {
             val declaration = this.declarations[declarationIndex]
             if (declaration.name == owner) {
                 var fieldIndex = 0
@@ -3858,7 +4005,6 @@ class BootstrapAnalyzer(
                     fieldIndex = fieldIndex + 1
                 }
             }
-            declarationIndex = declarationIndex + 1
         }
         result
     }
@@ -3866,8 +4012,8 @@ class BootstrapAnalyzer(
     fun typeHasDrop(type: string): bool {
         val normalized = bootstrapNormalizeType(type)
         var found = false
-        var declarationIndex = 0
-        while (declarationIndex < this.declarations.size) {
+        val declarationIndex = this.typeDeclarations.find(normalized)
+        if (declarationIndex >= 0) {
             val declaration = this.declarations[declarationIndex]
             if (declaration.kind == "class" &&
                 declaration.name == normalized) {
@@ -3879,103 +4025,46 @@ class BootstrapAnalyzer(
                     methodIndex = methodIndex + 1
                 }
             }
-            declarationIndex = declarationIndex + 1
         }
         found
     }
 
     fun methodResultType(owner: string, method: string): string {
         var result = "unknown"
-        var declarationIndex = 0
-        while (declarationIndex < this.declarations.size) {
-            val declaration = this.declarations[declarationIndex]
-            if (bootstrapNormalizeType(declaration.extensionOwner) == owner &&
-                declaration.name == method) {
-                if (declaration.resultType != "inferred") {
-                    result = bootstrapNormalizeType(declaration.resultType)
-                }
+        val entry = this.methodDeclarations.find(owner, method)
+        if (entry >= 0) {
+            val declaration = this.methodDeclarations.declarations[entry]
+            if (declaration.resultType != "inferred") {
+                result = bootstrapNormalizeType(declaration.resultType)
             }
-            if (declaration.name == owner &&
-                (declaration.kind == "class" ||
-                 declaration.kind == "interface")) {
-                var methodIndex = 0
-                while (methodIndex < declaration.methods.size) {
-                    val found = declaration.methods[methodIndex]
-                    if (found.name == method) {
-                        if (found.resultType != "inferred") {
-                            result = bootstrapNormalizeType(found.resultType)
-                        }
-                    }
-                    methodIndex = methodIndex + 1
-                }
-            }
-            declarationIndex = declarationIndex + 1
         }
         result
     }
 
     fun methodParameterCount(owner: string, method: string): int {
         var result = -1
-        var declarationIndex = 0
-        while (declarationIndex < this.declarations.size) {
-            val declaration = this.declarations[declarationIndex]
-            if (bootstrapNormalizeType(declaration.extensionOwner) == owner &&
-                declaration.name == method) {
-                result = declaration.parameters.size
-            }
-            if (declaration.name == owner) {
-                var methodIndex = 0
-                while (methodIndex < declaration.methods.size) {
-                    if (declaration.methods[methodIndex].name == method) {
-                        result = declaration.methods[methodIndex].parameters.size
-                    }
-                    methodIndex = methodIndex + 1
-                }
-            }
-            declarationIndex = declarationIndex + 1
+        val entry = this.methodDeclarations.find(owner, method)
+        if (entry >= 0) {
+            result = this.methodDeclarations.declarations[entry].parameters.size
         }
         result
     }
 
     fun methodRequiredParameterCount(owner: string, method: string): int {
         var result = -1
-        var declarationIndex = 0
-        while (declarationIndex < this.declarations.size) {
-            val declaration = this.declarations[declarationIndex]
-            if (bootstrapNormalizeType(declaration.extensionOwner) == owner &&
-                declaration.name == method) {
-                result = 0
-                var extensionParameter = 0
-                while (extensionParameter < declaration.parameters.size) {
-                    if (extensionParameter >=
-                            declaration.parameterDefaults.size ||
-                        declaration.parameterDefaults[extensionParameter].kind ==
-                            "missing") {
-                        result = result + 1
-                    }
-                    extensionParameter = extensionParameter + 1
+        val entry = this.methodDeclarations.find(owner, method)
+        if (entry >= 0) {
+            val declaration = this.methodDeclarations.declarations[entry]
+            result = 0
+            var parameter = 0
+            while (parameter < declaration.parameters.size) {
+                if (parameter >= declaration.parameterDefaults.size ||
+                    declaration.parameterDefaults[parameter].kind ==
+                        "missing") {
+                    result = result + 1
                 }
+                parameter = parameter + 1
             }
-            if (declaration.name == owner) {
-                var methodIndex = 0
-                while (methodIndex < declaration.methods.size) {
-                    val found = declaration.methods[methodIndex]
-                    if (found.name == method) {
-                        result = 0
-                        var parameter = 0
-                        while (parameter < found.parameters.size) {
-                            if (parameter >= found.parameterDefaults.size ||
-                                found.parameterDefaults[parameter].kind ==
-                                    "missing") {
-                                result = result + 1
-                            }
-                            parameter = parameter + 1
-                        }
-                    }
-                    methodIndex = methodIndex + 1
-                }
-            }
-            declarationIndex = declarationIndex + 1
         }
         result
     }
@@ -3986,30 +4075,14 @@ class BootstrapAnalyzer(
         parameter: int
     ): string {
         var result = "unknown"
-        var declarationIndex = 0
-        while (declarationIndex < this.declarations.size) {
-            val declaration = this.declarations[declarationIndex]
-            if (bootstrapNormalizeType(declaration.extensionOwner) == owner &&
-                declaration.name == method &&
-                parameter < declaration.parameterTypes.size) {
+        val entry = this.methodDeclarations.find(owner, method)
+        if (entry >= 0) {
+            val declaration = this.methodDeclarations.declarations[entry]
+            if (parameter < declaration.parameterTypes.size) {
                 result = bootstrapNormalizeType(
                     declaration.parameterTypes[parameter]
                 )
             }
-            if (declaration.name == owner) {
-                var methodIndex = 0
-                while (methodIndex < declaration.methods.size) {
-                    val found = declaration.methods[methodIndex]
-                    if (found.name == method &&
-                        parameter < found.parameterTypes.size) {
-                        result = bootstrapNormalizeType(
-                            found.parameterTypes[parameter]
-                        )
-                    }
-                    methodIndex = methodIndex + 1
-                }
-            }
-            declarationIndex = declarationIndex + 1
         }
         result
     }
@@ -4020,26 +4093,12 @@ class BootstrapAnalyzer(
         parameter: int
     ): string {
         var result = "parameter"
-        var declarationIndex = 0
-        while (declarationIndex < this.declarations.size) {
-            val declaration = this.declarations[declarationIndex]
-            if (bootstrapNormalizeType(declaration.extensionOwner) == owner &&
-                declaration.name == method &&
-                parameter < declaration.parameterKinds.size) {
+        val entry = this.methodDeclarations.find(owner, method)
+        if (entry >= 0) {
+            val declaration = this.methodDeclarations.declarations[entry]
+            if (parameter < declaration.parameterKinds.size) {
                 result = declaration.parameterKinds[parameter]
             }
-            if (declaration.name == owner) {
-                var methodIndex = 0
-                while (methodIndex < declaration.methods.size) {
-                    val found = declaration.methods[methodIndex]
-                    if (found.name == method &&
-                        parameter < found.parameterKinds.size) {
-                        result = found.parameterKinds[parameter]
-                    }
-                    methodIndex = methodIndex + 1
-                }
-            }
-            declarationIndex = declarationIndex + 1
         }
         result
     }
@@ -4738,24 +4797,8 @@ class BootstrapAnalyzer(
     }
 
     fun selectedMethodHandle(owner: string, name: string): int {
-        var handle = -1
-        var declaration = 0
-        while (declaration < this.declarations.size) {
-            val candidate = this.declarations[declaration]
-            if (bootstrapNormalizeType(candidate.extensionOwner) == owner &&
-                candidate.name == name) handle = declaration
-            if (candidate.name == owner) {
-                var method = 0
-                while (method < candidate.methods.size) {
-                    if (candidate.methods[method].name == name) {
-                        handle = this.inherentMethodHandle(declaration, method)
-                    }
-                    method = method + 1
-                }
-            }
-            declaration = declaration + 1
-        }
-        handle
+        val entry = this.methodDeclarations.find(owner, name)
+        if (entry < 0) -1 else this.methodDeclarations.handles[entry]
     }
 
     fun selectedHandleIsCompileOnly(handle: int): bool {
@@ -6030,6 +6073,9 @@ class BootstrapAnalyzer(
             val resolvedParameterTypes: array<string> = []
             val resolvedParameterKinds: array<string> = []
             var resolvedInsertedDefaults = 0
+            val classDeclarationIndex = if (symbolKind == "class")
+                this.typeDeclarations.find(expression.text)
+            else -1
             while (argument < expression.children.size) {
                 var expectedArgument = "unknown"
                 if (bootstrapIsFunctionType(functionType)) {
@@ -6047,22 +6093,18 @@ class BootstrapAnalyzer(
                         )
                     }
                 } else if (symbolKind == "class") {
-                    var declarationIndex = 0
-                    while (declarationIndex < this.declarations.size) {
+                    if (classDeclarationIndex >= 0) {
                         val declaration =
-                            this.declarations[declarationIndex]
-                        if (declaration.kind == "class" &&
-                            declaration.name == expression.text &&
-                            argument < declaration.parameterTypes.size) {
+                            this.declarations[classDeclarationIndex]
+                        if (argument < declaration.parameterTypes.size) {
                             expectedArgument = bootstrapNormalizeType(
                                 declaration.parameterTypes[argument]
                             )
                         }
-                        declarationIndex = declarationIndex + 1
                     }
                 } else if (symbolKind == "type" || primitiveType != "") {
-                    expectedArgument = bootstrapScalarTypeUnderlying(
-                        this.declarations, expression.text
+                    expectedArgument = this.scalarTypeUnderlying(
+                        expression.text
                     )
                     if (primitiveType != "") expectedArgument = primitiveType
                 }
@@ -6163,57 +6205,44 @@ class BootstrapAnalyzer(
                     "function.${expression.text}"
                 )
             }
-            if (symbolKind == "class") {
-                var declarationIndex = 0
-                while (declarationIndex < this.declarations.size) {
-                    val declaration = this.declarations[declarationIndex]
-                    if (declaration.kind == "class" &&
-                        declaration.name == expression.text) {
-                        if (declaration.parameters.size !=
-                            expression.children.size) {
-                            this.fail("constructor.arity:${expression.text}")
-                        }
-                        var parameter = 0
-                        while (parameter < declaration.parameters.size &&
-                               parameter < expression.children.size) {
-                            val actual = this.infer(
-                                expression.children[parameter]
-                            )
-                            val expected = bootstrapNormalizeType(
-                                declaration.parameterTypes[parameter]
-                            )
-                            if (!bootstrapTypesCompatible(expected, actual)) {
-                                this.fail("constructor.argument:${expression.text}")
-                            }
-                            if (parameter < declaration.parameterKinds.size &&
-                                (declaration.parameterKinds[parameter] == "val" ||
-                                 declaration.parameterKinds[parameter] == "var" ||
-                                 declaration.parameterKinds[parameter] == "own")) {
-                                if (bootstrapIsBorrowType(actual) &&
-                                    (this.typeIsAffine(expected) ||
-                                     !this.typeNeedsManagedAliasTracking(
-                                         expected
-                                     ))) {
-                                    this.fail(
-                                        "ownership.borrow-store:${expression.text}"
-                                    )
-                                }
-                                this.validateOwnershipTransfer(
-                                    expected,
-                                    expression.children[parameter],
-                                    "argument.constructor.${expression.text}"
-                                )
-                            }
-                            parameter = parameter + 1
-                        }
+            if (symbolKind == "class" && classDeclarationIndex >= 0) {
+                val declaration = this.declarations[classDeclarationIndex]
+                if (declaration.parameters.size !=
+                    expression.children.size) {
+                    this.fail("constructor.arity:${expression.text}")
+                }
+                var parameter = 0
+                while (parameter < declaration.parameters.size &&
+                       parameter < expression.children.size) {
+                    val actual = resolvedArgumentTypes[parameter]
+                    val expected = bootstrapNormalizeType(
+                        declaration.parameterTypes[parameter]
+                    )
+                    if (!bootstrapTypesCompatible(expected, actual)) {
+                        this.fail("constructor.argument:${expression.text}")
                     }
-                    declarationIndex = declarationIndex + 1
+                    if (parameter < declaration.parameterKinds.size &&
+                        (declaration.parameterKinds[parameter] == "val" ||
+                         declaration.parameterKinds[parameter] == "var" ||
+                         declaration.parameterKinds[parameter] == "own")) {
+                        if (bootstrapIsBorrowType(actual) &&
+                            (this.typeIsAffine(expected) ||
+                             !this.typeNeedsManagedAliasTracking(expected))) {
+                            this.fail(
+                                "ownership.borrow-store:${expression.text}"
+                            )
+                        }
+                        this.validateOwnershipTransfer(
+                            expected,
+                            expression.children[parameter],
+                            "argument.constructor.${expression.text}"
+                        )
+                    }
+                    parameter = parameter + 1
                 }
             }
             if (symbolKind == "type" || primitiveType != "") {
-                var underlying = bootstrapScalarTypeUnderlying(
-                    this.declarations, expression.text
-                )
+                var underlying = this.scalarTypeUnderlying(expression.text)
                 if (primitiveType != "") underlying = primitiveType
                 if (expression.children.size != 1) {
                     this.fail("type.constructor-arity:${expression.text}")
@@ -8038,6 +8067,12 @@ fun bootstrapAnalyzeRequestedSpans(
     val functionDeclarations = bootstrapFunctionDeclarationIndex(
         parsed.declarations
     )
+    val typeDeclarations = bootstrapTypeDeclarationIndex(
+        parsed.declarations
+    )
+    val methodDeclarations = bootstrapMethodDeclarationIndex(
+        parsed.declarations
+    )
     BootstrapAnalyzer(
         symbols,
         [],
@@ -8046,6 +8081,8 @@ fun bootstrapAnalyzeRequestedSpans(
         locals,
         parsed.declarations,
         functionDeclarations,
+        typeDeclarations,
+        methodDeclarations,
         affineTypes,
         mutableReceivers,
         regionCalls,
