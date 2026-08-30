@@ -8,6 +8,9 @@ mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/unsafe-boundary.ab" \
     -o "$output_directory/program" --no-cache
+grep -Eq 'cmpxchg .* seq_cst seq_cst' "$output_directory/program.ll"
+grep -Eq 'cmpxchg .* monotonic monotonic' "$output_directory/program.ll"
+grep -Eq '^  fence seq_cst$' "$output_directory/program.ll"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
