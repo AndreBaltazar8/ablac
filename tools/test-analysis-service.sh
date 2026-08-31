@@ -15,13 +15,15 @@ responses=$(
         '{"schema":1,"id":4,"method":"document/open","params":{"uri":"file:///tmp/abla-analysis-broken.ab","version":1,"text":"fun broken: int = missing\n"}}' \
         '{"schema":1,"id":5,"method":"analyze","params":{}}' \
         '{"schema":1,"id":6,"method":"document/change","params":{"uri":"file:///tmp/abla-analysis-overlay.ab","version":6,"text":"fun stale: int = 0\n"}}' \
-        '{"schema":1,"id":7,"method":"shutdown","params":{}}' |
+        '{"schema":1,"id":7,"method":"refactor/validate","params":{"baseRevision":"4","edits":[{"uri":"file:///tmp/abla-analysis-broken.ab","start":18,"end":25,"newText":"1"}],"invariants":["no-new-errors"]}}' \
+        '{"schema":1,"id":8,"method":"refactor/validate","params":{"baseRevision":"4","edits":[{"uri":"file:///tmp/abla-analysis-caller.ab","start":15,"end":20,"newText":"unknownName"}],"invariants":["no-new-errors"]}}' \
+        '{"schema":1,"id":9,"method":"shutdown","params":{}}' |
         "$compiler" analyze --stdio
 )
 
 node -e '
 const lines = require("node:fs").readFileSync(0, "utf8").trim().split("\n").map(JSON.parse);
-if (lines.length !== 7) throw new Error(`expected 7 responses, got ${lines.length}`);
+if (lines.length !== 9) throw new Error(`expected 9 responses, got ${lines.length}`);
 const initialized = lines[0].result;
 if (initialized.protocolVersion !== 1 || !initialized.capabilities.includes("declarations")) {
   throw new Error("analysis protocol negotiation failed");
@@ -55,6 +57,12 @@ if (semantic?.code !== "E_SEMANTIC" || semantic.range.start !== 18) {
 }
 if (lines[5].error?.code !== "stale_document") {
   throw new Error("stale overlay version was accepted");
+}
+if (lines[6].result?.valid !== true || !lines[6].result?.snapshot) {
+  throw new Error("a diagnostic-removing prospective edit was rejected");
+}
+if (lines[7].result?.valid !== false) {
+  throw new Error("a diagnostic-introducing prospective edit was accepted");
 }
 ' <<<"$responses"
 

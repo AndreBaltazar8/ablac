@@ -912,6 +912,127 @@ fun BootstrapAnalysisService.snapshot(): Json {
     )
 }
 
+fun bootstrapAnalysisSnapshotDiagnosticCount(snapshot: Json): int {
+    var count = 0
+    val documents = snapshot.get("documents")
+    var document = 0
+    while (documents.isArray() && document < documents.size()) {
+        count = count + documents.at(document).get("diagnostics").size()
+        document = document + 1
+    }
+    count
+}
+
+fun bootstrapAnalysisOwnedString(value: string): string = "$value"
+
+fun BootstrapAnalysisService.validateEdit(params: Json): Json {
+    var valid = params.getString("baseRevision") == "${this.revision}"
+    var reason = if (valid) "" else "analysis revision is stale"
+    val candidate = BootstrapAnalysisService([], [], this.revision, true, true)
+    var root = 0
+    while (root < this.roots.size) {
+        candidate.roots.append(bootstrapAnalysisOwnedString(this.roots[root]))
+        root = root + 1
+    }
+    val documents = this.documents()
+    var document = 0
+    while (document < documents.size) {
+        val found = documents[document]
+        candidate.overlays.append(BootstrapAnalysisDocument(
+            bootstrapAnalysisOwnedString(found.uri),
+            bootstrapAnalysisOwnedString(found.path),
+            found.version,
+            bootstrapAnalysisOwnedString(found.text),
+            true
+        ))
+        document = document + 1
+    }
+
+    val edits = params.get("edits")
+    if (!edits.isArray()) {
+        valid = false
+        reason = "edits must be an array"
+    }
+    document = 0
+    var edit = 0
+    while (valid && document < candidate.overlays.size) {
+        val uri = candidate.overlays[document].uri
+        var text = bootstrapAnalysisOwnedString(
+            candidate.overlays[document].text
+        )
+        val applied: array<bool> = []
+        edit = 0
+        while (edit < edits.size()) {
+            applied.append(edits.at(edit).getString("uri") != uri)
+            edit = edit + 1
+        }
+        var remaining = true
+        while (valid && remaining) {
+            remaining = false
+            var selected = -1
+            var selectedStart = -1
+            edit = 0
+            while (edit < edits.size()) {
+                if (!applied[edit]) {
+                    remaining = true
+                    val start = edits.at(edit).getInt("start")
+                    if (start > selectedStart) {
+                        selected = edit
+                        selectedStart = start
+                    }
+                }
+                edit = edit + 1
+            }
+            if (selected >= 0) {
+                val requested = edits.at(selected)
+                val start = requested.getInt("start")
+                val end = requested.getInt("end")
+                if (start < 0 || end < start || end > text.size) {
+                    valid = false
+                    reason = "edit range is outside its document"
+                } else text = "${text.slice(0, start)}${requested.getString(
+                    "newText"
+                )}${text.slice(end, text.size)}"
+                applied[selected] = true
+            }
+        }
+        if (valid && text != candidate.overlays[document].text) {
+            val previous = candidate.overlays[document]
+            candidate.overlays[document] = BootstrapAnalysisDocument(
+                bootstrapAnalysisOwnedString(previous.uri),
+                bootstrapAnalysisOwnedString(previous.path),
+                previous.version + 1,
+                text,
+                true
+            )
+        }
+        document = document + 1
+    }
+    edit = 0
+    while (valid && edit < edits.size()) {
+        if (candidate.overlayIndex(edits.at(edit).getString("uri")) < 0) {
+            valid = false
+            reason = "edit targets an unanalyzed document"
+        }
+        edit = edit + 1
+    }
+
+    val baseline = this.snapshot()
+    val prospective = if (valid) candidate.snapshot() else jsonNull()
+    if (valid && bootstrapAnalysisSnapshotDiagnosticCount(prospective) >
+        bootstrapAnalysisSnapshotDiagnosticCount(baseline)) {
+        valid = false
+        reason = "prospective edit introduces compiler diagnostics"
+    }
+    if (valid) jsonObject(
+        ["valid", "snapshot"],
+        [jsonBoolean(true), prospective]
+    ) else jsonObject(
+        ["valid", "reason"],
+        [jsonBoolean(false), jsonString(reason)]
+    )
+}
+
 fun bootstrapAnalysisResponse(id: int, result: Json): string =
     jsonStringify(jsonObject(
         ["schema", "id", "result"],
@@ -992,13 +1113,7 @@ fun BootstrapAnalysisService.handle(request: Json): string {
     } else if (method == "analyze") {
         response = bootstrapAnalysisResponse(id, this.snapshot())
     } else if (method == "refactor/validate") {
-        response = bootstrapAnalysisResponse(id, jsonObject(
-            ["valid", "reason"],
-            [
-                jsonBoolean(false),
-                jsonString("semantic edit validation is not available yet")
-            ]
-        ))
+        response = bootstrapAnalysisResponse(id, this.validateEdit(params))
     } else if (method == "shutdown") {
         this.running = false
         response = bootstrapAnalysisResponse(id, jsonNull())
