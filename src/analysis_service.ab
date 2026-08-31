@@ -1,0 +1,528 @@
+// Persistent, editor-independent compiler analysis protocol.
+// Editors talk to the standalone language server; compiler clients consume
+// immutable source snapshots over this versioned JSON-lines service.
+
+import "module.ab"
+import "abla/json"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+
+val ABLA_ANALYSIS_PROTOCOL_VERSION: int = 1
+val ABLA_ANALYSIS_MAX_DOCUMENTS: int = 20000
+val ABLA_COMPILER_VERSION: string = "0.2.11"
+
+class BootstrapAnalysisDocument(
+    val uri: string,
+    val path: string,
+    val version: int,
+    val text: string,
+    var active: bool
+)
+
+class BootstrapAnalysisService(
+    val roots: array<string>,
+    val overlays: array<BootstrapAnalysisDocument>,
+    var revision: int,
+    var initialized: bool,
+    var running: bool
+)
+
+fun bootstrapAnalysisHexDigit(value: int): int {
+    var result = -1
+    if (value >= 48 && value <= 57) result = value - 48
+    if (value >= 65 && value <= 70) result = value - 65 + 10
+    if (value >= 97 && value <= 102) result = value - 97 + 10
+    result
+}
+
+fun bootstrapAnalysisUriPath(uri: string): string {
+    var begin = 0
+    if (uri.size >= 7 && uri.slice(0, 7) == "file://") begin = 7
+    var output = ""
+    var index = begin
+    while (index < uri.size) {
+        if (uri[index] == 37 && index + 2 < uri.size) {
+            val high = bootstrapAnalysisHexDigit(uri[index + 1])
+            val low = bootstrapAnalysisHexDigit(uri[index + 2])
+            if (high >= 0 && low >= 0) {
+                output = "$output${byteEncode(high * 16 + low)}"
+                index = index + 3
+            } else {
+                output = "$output${uri.slice(index, index + 1)}"
+                index = index + 1
+            }
+        } else {
+            output = "$output${uri.slice(index, index + 1)}"
+            index = index + 1
+        }
+    }
+    output
+}
+
+fun bootstrapAnalysisPathUri(path: string): string = "file://$path"
+
+fun BootstrapAnalysisService.overlayIndex(uri: string): int {
+    var result = -1
+    var index = 0
+    while (result < 0 && index < this.overlays.size) {
+        if (this.overlays[index].uri == uri) result = index
+        index = index + 1
+    }
+    result
+}
+
+fun BootstrapAnalysisService.storeOverlay(
+    uri: string,
+    version: int,
+    text: string
+): bool {
+    val index = this.overlayIndex(uri)
+    var accepted = true
+    if (index >= 0 && version < this.overlays[index].version) accepted = false
+    if (accepted) {
+        val document = BootstrapAnalysisDocument(
+            uri, bootstrapAnalysisUriPath(uri), version, text, true
+        )
+        if (index >= 0) this.overlays[index] = document
+        else this.overlays.append(document)
+        this.revision = this.revision + 1
+    }
+    accepted
+}
+
+fun BootstrapAnalysisService.closeOverlay(uri: string): void {
+    val index = this.overlayIndex(uri)
+    if (index >= 0) {
+        this.overlays[index].active = false
+        this.revision = this.revision + 1
+    }
+}
+
+fun bootstrapAnalysisIgnoredDirectory(name: string): bool =
+    name == ".git" || name == "build" || name == "dist" ||
+    name == "node_modules" || name == ".cache" || name == ".direnv"
+
+fun bootstrapAnalysisHasPath(
+    documents: array<BootstrapAnalysisDocument>,
+    path: string
+): bool {
+    var found = false
+    var index = 0
+    while (!found && index < documents.size) {
+        if (documents[index].path == path) found = true
+        index = index + 1
+    }
+    found
+}
+
+fun bootstrapAnalysisCollectDirectory(
+    directory: Path,
+    var documents: array<BootstrapAnalysisDocument>
+): void {
+    if (documents.size >= ABLA_ANALYSIS_MAX_DOCUMENTS) return
+    val entries = directory.entries()
+    var index = 0
+    while (index < entries.size &&
+           documents.size < ABLA_ANALYSIS_MAX_DOCUMENTS) {
+        val entry = entries[index]
+        val info = entry.info()
+        if (info.isDirectory() &&
+            !bootstrapAnalysisIgnoredDirectory(entry.name())) {
+            bootstrapAnalysisCollectDirectory(entry, documents)
+        }
+        if (info.isFile() && entry.extension() == "ab" &&
+            !bootstrapAnalysisHasPath(documents, entry.text)) {
+            documents.append(BootstrapAnalysisDocument(
+                bootstrapAnalysisPathUri(entry.text),
+                entry.text,
+                0,
+                entry.readText(),
+                true
+            ))
+        }
+        index = index + 1
+    }
+}
+
+fun BootstrapAnalysisService.documents(): array<BootstrapAnalysisDocument> {
+    val documents: array<BootstrapAnalysisDocument> = []
+    var overlay = 0
+    while (overlay < this.overlays.size) {
+        if (this.overlays[overlay].active) {
+            documents.append(this.overlays[overlay])
+        }
+        overlay = overlay + 1
+    }
+    var root = 0
+    while (root < this.roots.size &&
+           documents.size < ABLA_ANALYSIS_MAX_DOCUMENTS) {
+        val path = Path(this.roots[root])
+        val info = path.info()
+        if (info.isDirectory()) {
+            bootstrapAnalysisCollectDirectory(path, documents)
+        }
+        if (info.isFile() && path.extension() == "ab" &&
+            !bootstrapAnalysisHasPath(documents, path.text)) {
+            documents.append(BootstrapAnalysisDocument(
+                bootstrapAnalysisPathUri(path.text),
+                path.text,
+                0,
+                path.readText(),
+                true
+            ))
+        }
+        root = root + 1
+    }
+    documents
+}
+
+fun bootstrapAnalysisSymbolKind(kind: string): string {
+    var result = "function"
+    if (kind == "class" || kind == "interface") result = "class"
+    if (kind == "enum") result = "enum"
+    if (kind == "val" || kind == "compile.val") result = "value"
+    if (kind == "var" || kind == "compile.var") result = "variable"
+    result
+}
+
+fun bootstrapAnalysisDeclarationId(
+    declaration: BootstrapDeclaration
+): string = "abla:${declaration.sourceIdentity}:${declaration.begin}:${declaration.name}"
+
+fun bootstrapAnalysisNameRange(
+    tokens: array<BootstrapToken>,
+    source: string,
+    declaration: BootstrapDeclaration
+): array<int> {
+    var begin = declaration.begin
+    var end = declaration.begin
+    var found = false
+    var index = 0
+    while (!found && index < tokens.size) {
+        val token = tokens[index]
+        if (token.begin >= declaration.begin && token.end <= declaration.end &&
+            token.kind == "identifier" &&
+            bootstrapTokenText(source, token) == declaration.name) {
+            begin = token.begin
+            end = token.end
+            found = true
+        }
+        index = index + 1
+    }
+    [begin, end]
+}
+
+fun bootstrapAnalysisSymbolJson(
+    tokens: array<BootstrapToken>,
+    source: string,
+    uri: string,
+    declaration: BootstrapDeclaration,
+    topLevel: bool,
+    containerId: string
+): Json {
+    val selection = bootstrapAnalysisNameRange(tokens, source, declaration)
+    val keys = [
+        "id", "name", "kind", "uri", "range", "selectionRange",
+        "detail", "topLevel"
+    ]
+    val values = [
+        jsonString(bootstrapAnalysisDeclarationId(declaration)),
+        jsonString(declaration.name),
+        jsonString(bootstrapAnalysisSymbolKind(declaration.kind)),
+        jsonString(uri),
+        jsonObject(
+            ["start", "end"],
+            [jsonInteger(declaration.begin), jsonInteger(declaration.end)]
+        ),
+        jsonObject(
+            ["start", "end"],
+            [jsonInteger(selection[0]), jsonInteger(selection[1])]
+        ),
+        jsonString("${declaration.kind} ${declaration.resultType}"),
+        jsonBoolean(topLevel)
+    ]
+    if (containerId != "") {
+        keys.append("containerId")
+        values.append(jsonString(containerId))
+    }
+    jsonObject(keys, values)
+}
+
+fun bootstrapAnalysisSymbolsJson(
+    source: string,
+    uri: string,
+    parsed: BootstrapParseResult
+): Json {
+    val values: array<Json> = []
+    val tokens = bootstrapLex(source)
+    var declaration = 0
+    while (declaration < parsed.declarations.size) {
+        val found = parsed.declarations[declaration]
+        val id = bootstrapAnalysisDeclarationId(found)
+        values.append(bootstrapAnalysisSymbolJson(
+            tokens, source, uri, found, true, ""
+        ))
+        var method = 0
+        while (method < found.methods.size) {
+            values.append(bootstrapAnalysisSymbolJson(
+                tokens, source, uri, found.methods[method], false, id
+            ))
+            method = method + 1
+        }
+        declaration = declaration + 1
+    }
+    jsonArray(values)
+}
+
+fun bootstrapAnalysisOccurrencesJson(
+    source: string,
+    parsed: BootstrapParseResult
+): Json {
+    val values: array<Json> = []
+    val tokens = bootstrapLex(source)
+    val declarationBegins: array<int> = []
+    val declarationEnds: array<int> = []
+    val declarationIds: array<string> = []
+    var declaration = 0
+    while (declaration < parsed.declarations.size) {
+        val found = parsed.declarations[declaration]
+        val selection = bootstrapAnalysisNameRange(tokens, source, found)
+        declarationBegins.append(selection[0])
+        declarationEnds.append(selection[1])
+        declarationIds.append(bootstrapAnalysisDeclarationId(found))
+        var method = 0
+        while (method < found.methods.size) {
+            val member = found.methods[method]
+            val memberSelection = bootstrapAnalysisNameRange(
+                tokens, source, member
+            )
+            declarationBegins.append(memberSelection[0])
+            declarationEnds.append(memberSelection[1])
+            declarationIds.append(bootstrapAnalysisDeclarationId(member))
+            method = method + 1
+        }
+        declaration = declaration + 1
+    }
+    var index = 0
+    while (index < tokens.size) {
+        val token = tokens[index]
+        if (token.kind == "identifier") {
+            val name = bootstrapTokenText(source, token)
+            val keys = ["name", "range"]
+            val occurrenceValues = [
+                jsonString(name),
+                jsonObject(
+                    ["start", "end"],
+                    [jsonInteger(token.begin), jsonInteger(token.end)]
+                )
+            ]
+            declaration = 0
+            var declarationId = ""
+            while (declaration < declarationIds.size) {
+                if (declarationBegins[declaration] == token.begin &&
+                    declarationEnds[declaration] == token.end) {
+                    declarationId = declarationIds[declaration]
+                }
+                declaration = declaration + 1
+            }
+            if (declarationId != "") {
+                keys.append("declarationId")
+                occurrenceValues.append(jsonString(declarationId))
+            }
+            values.append(jsonObject(keys, occurrenceValues))
+        }
+        index = index + 1
+    }
+    jsonArray(values)
+}
+
+fun bootstrapAnalysisDiagnosticCode(diagnostics: string): string {
+    var code = "E_ANALYSIS"
+    var begin = -1
+    var end = -1
+    var index = 0
+    while (begin < 0 && index + 6 < diagnostics.size) {
+        if (diagnostics.slice(index, index + 6) == "error[") begin = index + 6
+        index = index + 1
+    }
+    if (begin >= 0) {
+        end = begin
+        while (end < diagnostics.size && diagnostics[end] != 93) end = end + 1
+        if (end < diagnostics.size) code = diagnostics.slice(begin, end)
+    }
+    code
+}
+
+fun bootstrapAnalysisDiagnosticsJson(
+    text: string,
+    parsed: BootstrapParseResult
+): Json {
+    val values: array<Json> = []
+    if (parsed.errors > 0 || parsed.extensionErrors > 0 ||
+        parsed.diagnostics != "") {
+        values.append(jsonObject(
+            ["code", "message", "range"],
+            [
+                jsonString(bootstrapAnalysisDiagnosticCode(
+                    parsed.diagnostics
+                )),
+                jsonString(parsed.diagnostics),
+                jsonObject(
+                    ["start", "end"],
+                    [jsonInteger(0), jsonInteger(if (text.size > 0) 1 else 0)]
+                )
+            ]
+        ))
+    }
+    jsonArray(values)
+}
+
+fun bootstrapAnalysisDocumentJson(
+    document: BootstrapAnalysisDocument
+): Json {
+    val parsed = bootstrapParseWithIdentity(document.text, document.path)
+    jsonObject(
+        [
+            "uri", "version", "text", "symbols", "occurrences",
+            "diagnostics"
+        ],
+        [
+            jsonString(document.uri),
+            jsonInteger(document.version),
+            jsonString(document.text),
+            bootstrapAnalysisSymbolsJson(document.text, document.uri, parsed),
+            bootstrapAnalysisOccurrencesJson(document.text, parsed),
+            bootstrapAnalysisDiagnosticsJson(document.text, parsed)
+        ]
+    )
+}
+
+fun BootstrapAnalysisService.snapshot(): Json {
+    val documents = this.documents()
+    val values: array<Json> = []
+    var index = 0
+    while (index < documents.size) {
+        values.append(bootstrapAnalysisDocumentJson(documents[index]))
+        index = index + 1
+    }
+    jsonObject(
+        ["revision", "documents"],
+        [jsonString("${this.revision}"), jsonArray(values)]
+    )
+}
+
+fun bootstrapAnalysisResponse(id: int, result: Json): string =
+    jsonStringify(jsonObject(
+        ["schema", "id", "result"],
+        [jsonInteger(ABLA_ANALYSIS_PROTOCOL_VERSION), jsonInteger(id), result]
+    ))
+
+fun bootstrapAnalysisError(id: int, code: string, message: string): string =
+    jsonStringify(jsonObject(
+        ["schema", "id", "error"],
+        [
+            jsonInteger(ABLA_ANALYSIS_PROTOCOL_VERSION),
+            jsonInteger(id),
+            jsonObject(
+                ["code", "message"],
+                [jsonString(code), jsonString(message)]
+            )
+        ]
+    ))
+
+fun BootstrapAnalysisService.initialize(params: Json): Json {
+    val requestedRoots = params.get("workspaceRoots")
+    var index = 0
+    if (requestedRoots.isArray()) {
+        while (index < requestedRoots.size()) {
+            val root = requestedRoots.at(index)
+            if (root.isString()) this.roots.append(root.asString())
+            index = index + 1
+        }
+    }
+    this.initialized = true
+    jsonObject(
+        ["compilerVersion", "protocolVersion", "capabilities"],
+        [
+            jsonString(ABLA_COMPILER_VERSION),
+            jsonInteger(ABLA_ANALYSIS_PROTOCOL_VERSION),
+            jsonArray([
+                jsonString("document-overlays"),
+                jsonString("parser-diagnostics"),
+                jsonString("declarations")
+            ])
+        ]
+    )
+}
+
+fun BootstrapAnalysisService.handle(request: Json): string {
+    val id = request.getInt("id")
+    val schema = request.getInt("schema")
+    val method = request.getString("method")
+    val params = request.get("params")
+    var response = ""
+    if (schema != ABLA_ANALYSIS_PROTOCOL_VERSION) {
+        response = bootstrapAnalysisError(
+            id, "unsupported_schema", "unsupported analysis protocol schema"
+        )
+    } else if (method == "initialize") {
+        response = bootstrapAnalysisResponse(id, this.initialize(params))
+    } else if (!this.initialized) {
+        response = bootstrapAnalysisError(
+            id, "not_initialized", "initialize must be the first request"
+        )
+    } else if (method == "document/open" || method == "document/change") {
+        val uri = params.getString("uri")
+        val accepted = this.storeOverlay(
+            uri, params.getInt("version"), params.getString("text")
+        )
+        if (uri == "") response = bootstrapAnalysisError(
+            id, "invalid_params", "document uri must not be empty"
+        )
+        else if (!accepted) response = bootstrapAnalysisError(
+            id, "stale_document", "document version is older than the overlay"
+        )
+        else response = bootstrapAnalysisResponse(id, jsonNull())
+    } else if (method == "document/close") {
+        this.closeOverlay(params.getString("uri"))
+        response = bootstrapAnalysisResponse(id, jsonNull())
+    } else if (method == "analyze") {
+        response = bootstrapAnalysisResponse(id, this.snapshot())
+    } else if (method == "refactor/validate") {
+        response = bootstrapAnalysisResponse(id, jsonObject(
+            ["valid", "reason"],
+            [
+                jsonBoolean(false),
+                jsonString("semantic edit validation is not available yet")
+            ]
+        ))
+    } else if (method == "shutdown") {
+        this.running = false
+        response = bootstrapAnalysisResponse(id, jsonNull())
+    } else if (method == "cancel") {
+        response = ""
+    } else response = bootstrapAnalysisError(
+        id, "method_not_found", "unsupported analysis method `$method`"
+    )
+    response
+}
+
+fun bootstrapAnalysisService(): int {
+    val service = BootstrapAnalysisService([], [], 1, false, true)
+    val standardInput = linuxStandardInput()
+    while (service.running) {
+        val input = standardInput.readLine()
+        if (!input.available) service.running = false
+        else if (input.text != "") {
+            val parsed = jsonParse(input.text)
+            var response = ""
+            if (!parsed.succeeded || !parsed.value.isObject()) {
+                response = bootstrapAnalysisError(
+                    0, "parse_error", "invalid JSON request"
+                )
+            } else response = service.handle(parsed.value)
+            if (response != "") linuxPrintStandardOutput("$response\n")
+        }
+    }
+    0
+}

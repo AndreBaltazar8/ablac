@@ -38,12 +38,35 @@ export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-$default_memory_mb}
 # An explicit sysroot still wins for installed or custom toolchains.
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$toolchain_root}
 
+run_in_toolchain_shell() {
+    invocation=()
+    printf -v invoked_path '%q' "$0"
+    invocation+=("$invoked_path")
+    for argument in "$@"; do
+        printf -v escaped_argument '%q' "$argument"
+        invocation+=("$escaped_argument")
+    done
+    shell_command=${invocation[*]}
+    exec nix-shell "$toolchain_root/shell.nix" --run "$shell_command"
+}
+
 if [[ ! $stack_kb =~ ^[1-9][0-9]*$ ]]; then
     printf '[abla-limit] ABLA_MAX_STACK_KB must be a positive integer, got %q\n' \
         "$stack_kb" >&2
     exit 2
 fi
 ulimit -S -s "$stack_kb"
+
+# A freshly linked compiler on NixOS may refer to development-shell shared
+# libraries which are deliberately absent from the global loader path. Enter
+# the pinned shell for every command when that is the case, including cheap
+# commands such as --version and the long-lived analysis service.
+if [[ $(uname -s) == Linux && -z ${IN_NIX_SHELL:-} ]]; then
+    runtime_dependencies=$(ldd "$compiler" 2>/dev/null || true)
+    if [[ $runtime_dependencies == *'not found'* ]]; then
+        run_in_toolchain_shell "$@"
+    fi
+fi
 
 # A compiler self-build also needs a longer explicit wall-clock allowance for
 # the pure-Abla frontend and LLVM O2 in one process.
@@ -57,7 +80,7 @@ fi
 # invoked from a plain NixOS terminal. The final compiler calls LLVM in-process
 # for object emission but still uses the pinned clang/linker toolchain.
 case ${1:-} in
-    build|serve)
+    build|serve|analyze)
         if ! command -v opt >/dev/null 2>&1; then
             if [[ $(uname -s) == Darwin ]]; then
                 if [[ -x /opt/homebrew/bin/brew ]]; then
@@ -82,15 +105,7 @@ case ${1:-} in
                     '[abla-limit] LLVM tools are missing from the active nix-shell' >&2
                 exit 127
             fi
-            invocation=()
-            printf -v invoked_path '%q' "$0"
-            invocation+=("$invoked_path")
-            for argument in "$@"; do
-                printf -v escaped_argument '%q' "$argument"
-                invocation+=("$escaped_argument")
-            done
-            shell_command=${invocation[*]}
-            exec nix-shell "$toolchain_root/shell.nix" --run "$shell_command"
+            run_in_toolchain_shell "$@"
         fi
         ;;
 esac
