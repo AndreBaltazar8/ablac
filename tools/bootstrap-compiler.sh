@@ -3,21 +3,21 @@ set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output=${1:-$project_root/build/ablac.bin}
-version=v0.2.11
+version=v0.2.12
 platform=$(uname -s)
 machine=$(uname -m)
 case "$platform/$machine" in
     Linux/x86_64)
         artifact=ablac-x86_64-linux
-        platform_sha256=3fed1fbd402c03864375cfbbda13e84a332058cb6b3141a7b0d546eb58480f01
+        platform_sha256=67a90211dafd2f78b582195019422cfb6c40f7684e8062ff2c7c378789fff059
         ;;
     Darwin/x86_64)
         artifact=ablac-x86_64-macos
-        platform_sha256=e31de4e1e6847c71e8247c88e4d06ff48e6aeb4cddab7e7f56ed5cd56dcb5b7f
+        platform_sha256=76e3ee75b503f676a0817568729b0b5f345fd04d143be0ce0bb9f3fd421d91f6
         ;;
     Darwin/arm64)
         artifact=ablac-arm64-macos
-        platform_sha256=70d7951ed8ffe76129aa33f003517ab885e4a64ba7c3e2a203809666bcb77fc1
+        platform_sha256=8246421518ccc3c274087b42776b2584e7703210c62b6f0fe1e964568ea84610
         ;;
     *)
         printf 'unsupported bootstrap host: %s/%s\n' "$platform" "$machine" >&2
