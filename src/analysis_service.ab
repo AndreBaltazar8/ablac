@@ -276,7 +276,10 @@ fun bootstrapAnalysisSymbolsJson(
 
 fun bootstrapAnalysisOccurrencesJson(
     source: string,
-    parsed: BootstrapParseResult
+    sourceIdentity: string,
+    parsed: BootstrapParseResult,
+    declarations: array<BootstrapDeclaration>,
+    semantic: BootstrapSemanticResult
 ): Json {
     val values: array<Json> = []
     val tokens = bootstrapLex(source)
@@ -325,6 +328,25 @@ fun bootstrapAnalysisOccurrencesJson(
                 }
                 declaration = declaration + 1
             }
+            var call = 0
+            while (declarationId == "" && call < semantic.typedCalls.size) {
+                val typed = semantic.typedCalls[call]
+                var matches = typed.sourceIdentity == sourceIdentity &&
+                    typed.name == name && token.begin >= typed.begin &&
+                    token.end <= typed.end
+                if (matches && typed.kind == "call") {
+                    matches = token.begin == typed.begin
+                }
+                if (matches && typed.kind == "member.call") {
+                    matches = index > 0 && tokens[index - 1].kind == "."
+                }
+                if (matches) {
+                    declarationId = bootstrapAnalysisHandleId(
+                        declarations, typed.target
+                    )
+                }
+                call = call + 1
+            }
             if (declarationId != "") {
                 keys.append("declarationId")
                 occurrenceValues.append(jsonString(declarationId))
@@ -334,6 +356,93 @@ fun bootstrapAnalysisOccurrencesJson(
         index = index + 1
     }
     jsonArray(values)
+}
+
+fun bootstrapAnalysisHandleId(
+    declarations: array<BootstrapDeclaration>,
+    handle: int
+): string {
+    var id = ""
+    if (handle >= 0 && handle < declarations.size) {
+        id = bootstrapAnalysisDeclarationId(declarations[handle])
+    }
+    if (handle >= declarations.size) {
+        val requested = handle - declarations.size
+        var current = 0
+        var owner = 0
+        while (id == "" && owner < declarations.size) {
+            var method = 0
+            while (id == "" && method < declarations[owner].methods.size) {
+                if (current == requested) id = bootstrapAnalysisDeclarationId(
+                    declarations[owner].methods[method]
+                )
+                current = current + 1
+                method = method + 1
+            }
+            owner = owner + 1
+        }
+    }
+    id
+}
+
+fun bootstrapAnalysisCollectTypedRequests(
+    expression: BootstrapExpression,
+    sourceIdentity: string,
+    var begins: array<int>,
+    var ends: array<int>,
+    var kinds: array<string>,
+    var sources: array<string>
+): void {
+    if (expression.kind == "call" || expression.kind == "member.call") {
+        begins.append(expression.begin)
+        ends.append(expression.end)
+        kinds.append(expression.kind)
+        sources.append(sourceIdentity)
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapAnalysisCollectTypedRequests(
+            expression.children[child], sourceIdentity,
+            begins, ends, kinds, sources
+        )
+        child = child + 1
+    }
+}
+
+fun bootstrapAnalysisCollectDeclarationRequests(
+    declaration: BootstrapDeclaration,
+    var begins: array<int>,
+    var ends: array<int>,
+    var kinds: array<string>,
+    var sources: array<string>
+): void {
+    bootstrapAnalysisCollectTypedRequests(
+        declaration.expression, declaration.sourceIdentity,
+        begins, ends, kinds, sources
+    )
+    var value = 0
+    while (value < declaration.parameterDefaults.size) {
+        bootstrapAnalysisCollectTypedRequests(
+            declaration.parameterDefaults[value], declaration.sourceIdentity,
+            begins, ends, kinds, sources
+        )
+        value = value + 1
+    }
+    value = 0
+    while (value < declaration.annotationArguments.size) {
+        bootstrapAnalysisCollectTypedRequests(
+            declaration.annotationArguments[value], declaration.sourceIdentity,
+            begins, ends, kinds, sources
+        )
+        value = value + 1
+    }
+    var method = 0
+    while (method < declaration.methods.size) {
+        bootstrapAnalysisCollectDeclarationRequests(
+            declaration.methods[method], begins, ends, kinds, sources
+        )
+        method = method + 1
+    }
 }
 
 fun bootstrapAnalysisDiagnosticCode(diagnostics: string): string {
@@ -378,9 +487,11 @@ fun bootstrapAnalysisDiagnosticsJson(
 }
 
 fun bootstrapAnalysisDocumentJson(
-    document: BootstrapAnalysisDocument
+    document: BootstrapAnalysisDocument,
+    parsed: BootstrapParseResult,
+    declarations: array<BootstrapDeclaration>,
+    semantic: BootstrapSemanticResult
 ): Json {
-    val parsed = bootstrapParseWithIdentity(document.text, document.path)
     jsonObject(
         [
             "uri", "version", "text", "symbols", "occurrences",
@@ -391,7 +502,9 @@ fun bootstrapAnalysisDocumentJson(
             jsonInteger(document.version),
             jsonString(document.text),
             bootstrapAnalysisSymbolsJson(document.text, document.uri, parsed),
-            bootstrapAnalysisOccurrencesJson(document.text, parsed),
+            bootstrapAnalysisOccurrencesJson(
+                document.text, document.path, parsed, declarations, semantic
+            ),
             bootstrapAnalysisDiagnosticsJson(document.text, parsed)
         ]
     )
@@ -399,10 +512,61 @@ fun bootstrapAnalysisDocumentJson(
 
 fun BootstrapAnalysisService.snapshot(): Json {
     val documents = this.documents()
+    val parsedDocuments: array<BootstrapParseResult> = []
+    val declarations: array<BootstrapDeclaration> = []
+    val actions: array<BootstrapExpression> = []
+    val compileInputPaths: array<string> = []
+    val compileInputContents: array<string> = []
+    var errors = 0
+    var extensionErrors = 0
+    var diagnostics = ""
+    val typedBegins: array<int> = []
+    val typedEnds: array<int> = []
+    val typedKinds: array<string> = []
+    val typedSources: array<string> = []
+    var documentIndex = 0
+    while (documentIndex < documents.size) {
+        val parsed = bootstrapParseWithIdentity(
+            documents[documentIndex].text,
+            documents[documentIndex].path
+        )
+        parsedDocuments.append(parsed)
+        errors = errors + parsed.errors
+        extensionErrors = extensionErrors + parsed.extensionErrors
+        diagnostics = "$diagnostics${parsed.diagnostics}"
+        var declaration = 0
+        while (declaration < parsed.declarations.size) {
+            declarations.append(parsed.declarations[declaration])
+            bootstrapAnalysisCollectDeclarationRequests(
+                parsed.declarations[declaration],
+                typedBegins, typedEnds, typedKinds, typedSources
+            )
+            declaration = declaration + 1
+        }
+        var action = 0
+        while (action < parsed.actions.size) {
+            actions.append(parsed.actions[action])
+            bootstrapAnalysisCollectTypedRequests(
+                parsed.actions[action], documents[documentIndex].path,
+                typedBegins, typedEnds, typedKinds, typedSources
+            )
+            action = action + 1
+        }
+        documentIndex = documentIndex + 1
+    }
+    val merged = BootstrapParseResult(
+        declarations, actions, errors, extensionErrors,
+        compileInputPaths, compileInputContents, diagnostics
+    )
+    val semantic = bootstrapAnalyzeRequestedSourceSpans(
+        merged, typedBegins, typedEnds, typedKinds, typedSources
+    )
     val values: array<Json> = []
     var index = 0
     while (index < documents.size) {
-        values.append(bootstrapAnalysisDocumentJson(documents[index]))
+        values.append(bootstrapAnalysisDocumentJson(
+            documents[index], parsedDocuments[index], declarations, semantic
+        ))
         index = index + 1
     }
     jsonObject(
@@ -449,7 +613,8 @@ fun BootstrapAnalysisService.initialize(params: Json): Json {
             jsonArray([
                 jsonString("document-overlays"),
                 jsonString("parser-diagnostics"),
-                jsonString("declarations")
+                jsonString("declarations"),
+                jsonString("semantic-call-references")
             ])
         ]
     )
