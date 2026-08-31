@@ -2803,6 +2803,11 @@ fun bootstrapSourceInitializerWritesGlobal(
     if (expression.kind == "assign" &&
         valueDeclarations.find(expression.text) >= 0) return true
     if (expression.kind == "call") {
+        // Exact internal sections are linker-visible declarations even when
+        // ordinary Abla control flow never reads their addresses. Root their
+        // initializers so section registries and executable metadata reach
+        // LLVM, where llvm.used and the linker script retain them precisely.
+        if (expression.text == "nativeInternalSectionU32s") return true
         if (expression.text == "internalFunction" ||
             expression.text == "requiredInternalFunction" ||
             expression.text == "exportFunction") return false
@@ -6424,20 +6429,84 @@ class BootstrapLowerer(
             }
         }
         if (expression.kind == "call" &&
-            expression.text == "nativeStaticBytes") {
+            (expression.text == "nativeStaticBytes" ||
+             expression.text == "nativeStaticMutableBytes")) {
             val validIntrinsic = this.isExternal(expression.text) &&
                 this.externalLibrary(expression.text) == "intrinsic"
             val contents = if (expression.children.size == 1) {
                 bootstrapStaticString(expression.children[0])
             } else BootstrapStaticString("", false)
             if (validIntrinsic && contents.valid) {
+                val opcode = if (
+                    expression.text == "nativeStaticMutableBytes"
+                ) "native.static.mutable.bytes" else "native.static.bytes"
+                result = this.emit(opcode, -1, -1, contents.text)
+            } else {
+                this.errors = this.errors + 1
                 result = this.emit(
-                    "native.static.bytes", -1, -1, contents.text
+                    "invalid", -1, -1, expression.text
+                )
+            }
+        }
+        if (expression.kind == "call" &&
+            (expression.text == "nativeStaticU32s" ||
+             expression.text == "nativeStaticMutableU32s")) {
+            val validIntrinsic = this.isExternal(expression.text) &&
+                this.externalLibrary(expression.text) == "intrinsic"
+            val validValues = expression.children.size == 1 &&
+                expression.children[0].kind == "array" &&
+                expression.children[0].children.size > 0
+            if (validIntrinsic && validValues) {
+                val values: array<int> = []
+                var value = 0
+                while (value < expression.children[0].children.size) {
+                    values.append(this.lowerExpression(
+                        expression.children[0].children[value]
+                    ))
+                    value = value + 1
+                }
+                val opcode = if (
+                    expression.text == "nativeStaticMutableU32s"
+                ) "native.static.mutable.u32s" else "native.static.u32s"
+                result = this.emitMany(opcode, values, "")
+            } else {
+                this.errors = this.errors + 1
+                result = this.emit(
+                    "invalid", -1, -1, expression.text
+                )
+            }
+        }
+        if (expression.kind == "call" &&
+            expression.text == "nativeInternalSectionU32s") {
+            val validIntrinsic = this.isExternal(expression.text) &&
+                this.externalLibrary(expression.text) == "intrinsic"
+            val validValues = expression.children.size == 3 &&
+                expression.children[0].kind == "array" &&
+                expression.children[0].children.size > 0
+            val linkName = if (expression.children.size == 3) {
+                bootstrapStaticString(expression.children[1])
+            } else BootstrapStaticString("", false)
+            val section = if (expression.children.size == 3) {
+                bootstrapStaticString(expression.children[2])
+            } else BootstrapStaticString("", false)
+            if (validIntrinsic && validValues && linkName.valid &&
+                linkName.text != "" && section.valid && section.text != "") {
+                val values: array<int> = []
+                var value = 0
+                while (value < expression.children[0].children.size) {
+                    values.append(this.lowerExpression(
+                        expression.children[0].children[value]
+                    ))
+                    value = value + 1
+                }
+                result = this.emitManyTexts(
+                    "native.internal.section.u32s", values, "",
+                    [linkName.text, section.text]
                 )
             } else {
                 this.errors = this.errors + 1
                 result = this.emit(
-                    "invalid", -1, -1, "nativeStaticBytes"
+                    "invalid", -1, -1, expression.text
                 )
             }
         }
@@ -6504,6 +6573,10 @@ class BootstrapLowerer(
             expression.text != "Cell" &&
             expression.text != "nativeXtensaInterruptHandlerAddress" &&
             expression.text != "nativeStaticBytes" &&
+            expression.text != "nativeStaticMutableBytes" &&
+            expression.text != "nativeStaticU32s" &&
+            expression.text != "nativeStaticMutableU32s" &&
+            expression.text != "nativeInternalSectionU32s" &&
             expression.text != "nativeFunctionAddress" &&
             (!this.isExternal(expression.text) ||
              this.externalLibrary(expression.text) != "inline-assembly")) {

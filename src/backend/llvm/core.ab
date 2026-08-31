@@ -418,6 +418,50 @@ fun bootstrapLlvmGlobalStringPointer(
 // The raw-data counterpart to bootstrapLlvmGlobalStringPointer. LLVM string
 // constants are a convenient byte container, but native static data must not
 // gain the implicit C terminator used by an Abla string literal.
+fun bootstrapLlvmGlobalBytes(
+    backend: BootstrapLlvmBackend,
+    value: string,
+    name: string
+): i64* {
+    val constant = LLVMConstStringInContext2(
+        backend.context, value, value.size, 1
+    )
+    val constantType = LLVMTypeOf(constant)
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, constantType, name)
+        LLVMSetInitializer(global, constant)
+        LLVMSetGlobalConstant(global, 1)
+        // Native byte regions are routinely consumed through typed
+        // 16/32/64-bit loads after reconstruction. Match
+        // nativeStaticAllocate's alignment so immutable flash data preserves
+        // those accesses without target-specific unaligned-load assumptions.
+        LLVMSetAlignment(global, 8)
+        LLVMSetUnnamedAddress(global, llvmHiddenVisibilityUnnamedAddress())
+        LLVMSetLinkage(global, llvmPrivateLinkage())
+    }
+    global
+}
+
+fun bootstrapLlvmGlobalMutableBytes(
+    backend: BootstrapLlvmBackend,
+    value: string,
+    name: string
+): i64* {
+    val initializer = LLVMConstStringInContext2(
+        backend.context, value, value.size, 1
+    )
+    val type = LLVMTypeOf(initializer)
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, type, name)
+        LLVMSetInitializer(global, initializer)
+        LLVMSetAlignment(global, 8)
+        LLVMSetLinkage(global, llvmPrivateLinkage())
+    }
+    global
+}
+
 fun bootstrapLlvmGlobalBytesPointer(
     backend: BootstrapLlvmBackend,
     value: string,
@@ -427,16 +471,7 @@ fun bootstrapLlvmGlobalBytesPointer(
         backend.context, value, value.size, 1
     )
     val constantType = LLVMTypeOf(constant)
-    val global = LLVMAddGlobal(backend.module, constantType, name)
-    LLVMSetInitializer(global, constant)
-    LLVMSetGlobalConstant(global, 1)
-    // Native byte regions are routinely consumed through typed 16/32/64-bit
-    // loads after reconstruction. Match nativeStaticAllocate's alignment so
-    // immutable flash data preserves those accesses without target-specific
-    // unaligned-load assumptions.
-    LLVMSetAlignment(global, 8)
-    LLVMSetUnnamedAddress(global, llvmHiddenVisibilityUnnamedAddress())
-    LLVMSetLinkage(global, llvmPrivateLinkage())
+    val global = bootstrapLlvmGlobalBytes(backend, value, name)
     val indices = llvmPointerVector(2)
     indices.set(0, LLVMConstInt(backend.i64Type, 0, 0))
     indices.set(1, LLVMConstInt(backend.i64Type, 0, 0))
@@ -446,6 +481,134 @@ fun bootstrapLlvmGlobalBytesPointer(
     )
     indices.drop()
     pointer
+}
+
+// Construct a relocation-capable native word table. LLVM constants retain
+// pointer-to-integer expressions as object relocations, so an immutable Abla
+// table does not need writable BSS plus a startup store for every entry.
+fun bootstrapLlvmGlobalU32s(
+    backend: BootstrapLlvmBackend,
+    values: array<i64*>,
+    name: string
+): i64* {
+    val type = LLVMArrayType2(backend.i32Type, values.size)
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        val nativeValues = llvmPointerVector(values.size)
+        var value = 0
+        while (value < values.size) {
+            nativeValues.set(value, values[value])
+            value = value + 1
+        }
+        val initializer = LLVMConstArray2(
+            backend.i32Type, nativeValues.pointer(), values.size
+        )
+        nativeValues.drop()
+        global = LLVMAddGlobal(backend.module, type, name)
+        LLVMSetInitializer(global, initializer)
+        LLVMSetGlobalConstant(global, 1)
+        LLVMSetAlignment(global, 4)
+        LLVMSetUnnamedAddress(global, llvmHiddenVisibilityUnnamedAddress())
+        LLVMSetLinkage(global, llvmPrivateLinkage())
+    }
+    global
+}
+
+// Mutable counterpart used for compile-time initialized native state. It has
+// private linkage but deliberately no unnamed_addr promise: callers may keep
+// and compare the stable address while mutating the words.
+fun bootstrapLlvmGlobalMutableU32s(
+    backend: BootstrapLlvmBackend,
+    values: array<i64*>,
+    name: string
+): i64* {
+    val type = LLVMArrayType2(backend.i32Type, values.size)
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        val nativeValues = llvmPointerVector(values.size)
+        var value = 0
+        while (value < values.size) {
+            nativeValues.set(value, values[value])
+            value = value + 1
+        }
+        val initializer = LLVMConstArray2(
+            backend.i32Type, nativeValues.pointer(), values.size
+        )
+        nativeValues.drop()
+        global = LLVMAddGlobal(backend.module, type, name)
+        LLVMSetInitializer(global, initializer)
+        LLVMSetAlignment(global, 4)
+        LLVMSetLinkage(global, llvmPrivateLinkage())
+    }
+    global
+}
+
+fun bootstrapLlvmGlobalZeroBytes(
+    backend: BootstrapLlvmBackend,
+    size: int,
+    name: string
+): i64* {
+    val type = LLVMArrayType2(backend.i8Type, size)
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, type, name)
+        LLVMSetInitializer(global, LLVMConstNull(type))
+        LLVMSetAlignment(global, 8)
+        LLVMSetLinkage(global, llvmInternalLinkage())
+    }
+    global
+}
+
+fun bootstrapLlvmInternalSectionBytesGlobal(
+    backend: BootstrapLlvmBackend,
+    contents: string,
+    name: string,
+    section: string,
+    alignment: int
+): i64* {
+    val initializer = LLVMConstStringInContext2(
+        backend.context, contents, contents.size, 1
+    )
+    val type = LLVMTypeOf(initializer)
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, type, name)
+        LLVMSetInitializer(global, initializer)
+        LLVMSetGlobalConstant(global, 1)
+        LLVMSetAlignment(global, i32(alignment))
+        LLVMSetLinkage(global, llvmInternalLinkage())
+        LLVMSetSection(global, section)
+    }
+    global
+}
+
+fun bootstrapLlvmInternalSectionU32sGlobal(
+    backend: BootstrapLlvmBackend,
+    values: array<i64*>,
+    name: string,
+    section: string
+): i64* {
+    val type = LLVMArrayType2(backend.i32Type, values.size)
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        val nativeValues = llvmPointerVector(values.size)
+        var value = 0
+        while (value < values.size) {
+            nativeValues.set(value, values[value])
+            value = value + 1
+        }
+        val initializer = LLVMConstArray2(
+            backend.i32Type, nativeValues.pointer(), values.size
+        )
+        nativeValues.drop()
+        global = LLVMAddGlobal(backend.module, type, name)
+        LLVMSetInitializer(global, initializer)
+        LLVMSetGlobalConstant(global, 1)
+        LLVMSetAlignment(global, 4)
+        LLVMSetLinkage(global, llvmInternalLinkage())
+        LLVMSetSection(global, section)
+    }
+    global
 }
 
 fun bootstrapLlvmStringNeedsExplicitLength(value: string): bool {

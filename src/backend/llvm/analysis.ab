@@ -1110,6 +1110,7 @@ fun bootstrapLlvmNativeIntrinsic(name: string): bool =
     name == "nativeStackAllocate" ||
     name == "nativeStaticAllocate" ||
     name == "nativeInternalSectionBytes" ||
+    name == "nativeInternalSectionU32s" ||
     name == "nativeInitializeGlobals" ||
     name == "nativeLinkerSymbolAddress" ||
     name == "nativeLinkedStaticAllocate" ||
@@ -1311,9 +1312,16 @@ fun bootstrapLlvmInferScalarValues(
             if (instruction.opcode == "native.function.address") {
                 inferred = "i64"
             }
-            if (instruction.opcode == "native.static.bytes") {
+            if (instruction.opcode == "native.static.bytes" ||
+                instruction.opcode == "native.static.mutable.bytes") {
                 inferred = "i64"
             }
+            if (instruction.opcode == "native.static.u32s" ||
+                instruction.opcode == "native.static.mutable.u32s") {
+                inferred = "i64"
+            }
+            if (instruction.opcode ==
+                "native.internal.section.u32s") inferred = "i64"
             if (instruction.opcode == "inline.assembly") {
                 inferred = bootstrapLlvmScalarType(instruction.text)
             }
@@ -1769,6 +1777,138 @@ fun bootstrapLlvmInstructionProducing(
     result
 }
 
+fun bootstrapLlvmBootstrapGlobalsSymbol(
+    program: BootstrapIrProgram
+): string {
+    var result = ""
+    var function = 0
+    while (result == "" && function < program.functions.size) {
+        if (program.functions[function].name == "__bootstrap_globals") {
+            result = bootstrapLlvmFunctionSymbol(program.functions[function])
+        }
+        function = function + 1
+    }
+    result
+}
+
+fun bootstrapLlvmConstantInstructionScalarType(
+    program: BootstrapIrProgram,
+    instruction: BootstrapInstruction
+): string {
+    var result = ""
+    if (instruction.opcode == "const.i64" ||
+        instruction.opcode == "native.static.bytes" ||
+        instruction.opcode == "native.static.mutable.bytes" ||
+        instruction.opcode == "native.static.u32s" ||
+        instruction.opcode == "native.static.mutable.u32s" ||
+        instruction.opcode == "native.internal.section.u32s" ||
+        instruction.opcode == "native.function.address" ||
+        (instruction.opcode == "extern.intrinsic" &&
+         (instruction.text == "nativeStaticAllocate" ||
+          instruction.text == "nativeLinkerSymbolAddress"))) result = "i64"
+    if (instruction.opcode == "const.bool") result = "bool"
+    if (instruction.opcode == "const.f64") result = "f64"
+    if (instruction.opcode == "scalar.cast") result = instruction.text
+    if (instruction.opcode == "global.load") result =
+        bootstrapLlvmGlobalScalarType(program, instruction.text)
+    if (instruction.opcode == "+" || instruction.opcode == "-" ||
+        instruction.opcode == "*" || instruction.opcode == "^" ||
+        instruction.opcode == "neg" || instruction.opcode == "bit.not") {
+        val operand = bootstrapLlvmInstructionProducing(
+            program, instruction.left
+        )
+        if (operand >= 0) result =
+            bootstrapLlvmConstantInstructionScalarType(
+                program, program.instructions[operand]
+            )
+    }
+    result
+}
+
+fun bootstrapLlvmInstructionConstantString(
+    program: BootstrapIrProgram,
+    value: int
+): string {
+    var result = ""
+    val instruction = bootstrapLlvmInstructionProducing(program, value)
+    if (instruction >= 0 &&
+        program.instructions[instruction].opcode == "const.string") {
+        result = program.instructions[instruction].text
+    }
+    result
+}
+
+fun bootstrapLlvmConstantIntegerCast(
+    backend: BootstrapLlvmBackend,
+    value: i64*,
+    source: string,
+    target: string
+): i64* {
+    var result = nativeNullPointer()
+    if (bootstrapLlvmIsNativeInteger(source) &&
+        bootstrapLlvmIsNativeInteger(target)) {
+        result = value
+        val sourceWidth = bootstrapLlvmScalarBitWidth(source)
+        val targetWidth = bootstrapLlvmScalarBitWidth(target)
+        if (sourceWidth > targetWidth) result = LLVMConstTrunc(
+            value, backend.type(target)
+        )
+        if (sourceWidth < targetWidth) result =
+            if (pointerIsNull(LLVMIsAConstantInt(value))) {
+                nativeNullPointer()
+            } else LLVMConstInt(
+                backend.type(target),
+                if (bootstrapLlvmIsUnsignedNativeInteger(source))
+                    LLVMConstIntGetZExtValue(value)
+                else LLVMConstIntGetSExtValue(value),
+                if (bootstrapLlvmIsUnsignedNativeInteger(source)) 0 else 1
+            )
+    }
+    result
+}
+
+// A nativeStaticU32s element is observed only after truncation to one word.
+// Evaluate an explicit widening cast through its narrower source expression;
+// LLVM 21 can represent symbolic truncation constants but intentionally no
+// longer exposes a constant ZExt constructor. This preserves the exact modulo
+// 2^32 result for pointer/addend relocations without generating instructions.
+fun bootstrapLlvmStaticU32OperandConstant(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    valueId: int,
+    depth: int,
+    initializing: bool
+): i64* {
+    var sourceId = valueId
+    var sourceScalar = "i64"
+    val valueIndex = bootstrapLlvmInstructionProducing(program, valueId)
+    if (valueIndex >= 0) {
+        val value = program.instructions[valueIndex]
+        if (value.opcode == "scalar.cast" && value.text == "i64") {
+            val operandIndex = bootstrapLlvmInstructionProducing(
+                program, value.left
+            )
+            if (operandIndex >= 0) {
+                val operandScalar =
+                    bootstrapLlvmConstantInstructionScalarType(
+                        program, program.instructions[operandIndex]
+                    )
+                if (bootstrapLlvmIsNativeInteger(operandScalar)) {
+                    sourceId = value.left
+                    sourceScalar = operandScalar
+                }
+            }
+        }
+    }
+    val constant = bootstrapLlvmScalarInstructionConstant(
+        backend, program, sourceId, sourceScalar, depth + 1, initializing
+    )
+    if (pointerIsNull(constant)) return nativeNullPointer()
+    bootstrapLlvmConstantIntegerCast(
+        backend, constant, sourceScalar, "i32"
+    )
+}
+
 fun bootstrapLlvmScalarInstructionConstant(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -1794,11 +1934,225 @@ fun bootstrapLlvmScalarInstructionConstant(
         )
         if (operandIndex >= 0) {
             val operand = program.instructions[operandIndex]
-            if (bootstrapIsIntegerScalarType(scalar) &&
-                operand.opcode == "const.i64") {
-                result = LLVMConstInt(
-                    backend.type(scalar),
-                    bootstrapLlvmParseInteger(operand.text), 1
+            val sourceScalar = bootstrapLlvmConstantInstructionScalarType(
+                program, operand
+            )
+            if (bootstrapLlvmIsNativeInteger(scalar) &&
+                bootstrapLlvmIsNativeInteger(sourceScalar)) {
+                val operandConstant =
+                    bootstrapLlvmScalarInstructionConstant(
+                        backend, program, value.left, sourceScalar,
+                        depth + 1, initializing
+                    )
+                if (!pointerIsNull(operandConstant)) result =
+                    bootstrapLlvmConstantIntegerCast(
+                        backend, operandConstant, sourceScalar, scalar
+                    )
+            }
+        }
+    }
+    if (bootstrapLlvmIsNativeInteger(scalar) &&
+        (value.opcode == "native.static.bytes" ||
+         value.opcode == "native.static.mutable.bytes")) {
+        val globalsSymbol = bootstrapLlvmBootstrapGlobalsSymbol(program)
+        if (globalsSymbol != "") {
+            val mutable =
+                value.opcode == "native.static.mutable.bytes"
+            val suffix = if (mutable) ".native.mutable.bytes"
+                else ".native.bytes"
+            val name = "${bootstrapLlvmStringSymbolFrom(
+                globalsSymbol, value.result
+            )}$suffix"
+            val global = if (mutable) bootstrapLlvmGlobalMutableBytes(
+                backend, value.text, name
+            ) else bootstrapLlvmGlobalBytes(
+                backend, value.text, name
+            )
+            result = LLVMConstPtrToInt(global, backend.type(scalar))
+        }
+    }
+    if (bootstrapLlvmIsNativeInteger(scalar) &&
+        (value.opcode == "native.static.u32s" ||
+         value.opcode == "native.static.mutable.u32s") &&
+        value.operands.size > 0) {
+        val words: array<i64*> = []
+        var operand = 0
+        var valid = true
+        while (operand < value.operands.size) {
+            val word = bootstrapLlvmStaticU32OperandConstant(
+                backend, program, value.operands[operand],
+                depth + 1, initializing
+            )
+            if (pointerIsNull(word)) valid = false
+            if (!pointerIsNull(word)) words.append(word)
+            operand = operand + 1
+        }
+        if (valid) {
+            val globalsSymbol = bootstrapLlvmBootstrapGlobalsSymbol(program)
+            if (globalsSymbol != "") {
+                val mutable =
+                    value.opcode == "native.static.mutable.u32s"
+                val suffix = if (mutable) ".native.mutable.u32s"
+                    else ".native.u32s"
+                val name = "${bootstrapLlvmStringSymbolFrom(
+                    globalsSymbol, value.result
+                )}$suffix"
+                val global = if (mutable) {
+                    bootstrapLlvmGlobalMutableU32s(
+                        backend, words, name
+                    )
+                } else bootstrapLlvmGlobalU32s(
+                    backend, words, name
+                )
+                result = LLVMConstPtrToInt(
+                    global, backend.type(scalar)
+                )
+            }
+        }
+    }
+    if (bootstrapLlvmIsNativeInteger(scalar) &&
+        value.opcode == "native.internal.section.u32s" &&
+        value.operands.size > 0 && value.texts.size == 2) {
+        val words: array<i64*> = []
+        var operand = 0
+        var valid = true
+        while (operand < value.operands.size) {
+            val word = bootstrapLlvmStaticU32OperandConstant(
+                backend, program, value.operands[operand],
+                depth + 1, initializing
+            )
+            if (pointerIsNull(word)) valid = false
+            if (!pointerIsNull(word)) words.append(word)
+            operand = operand + 1
+        }
+        if (valid && value.texts[0] != "" && value.texts[1] != "") {
+            val global = bootstrapLlvmInternalSectionU32sGlobal(
+                backend, words, value.texts[0], value.texts[1]
+            )
+            result = LLVMConstPtrToInt(global, backend.type(scalar))
+        }
+    }
+    if (bootstrapLlvmIsNativeInteger(scalar) &&
+        value.opcode == "native.function.address") {
+        var function = 0
+        while (function < program.functions.size &&
+            program.functions[function].name != value.text) {
+            function = function + 1
+        }
+        if (function < program.functions.size) {
+            val addressFunction = LLVMGetNamedFunction(
+                backend.module,
+                bootstrapLlvmNativeFunctionAddressSymbol(
+                    program.functions[function],
+                    bootstrapLlvmFunctionSymbol(program.functions[function])
+                )
+            )
+            if (!pointerIsNull(addressFunction)) result = LLVMConstPtrToInt(
+                addressFunction, backend.type(scalar)
+            )
+        }
+    }
+    if (bootstrapLlvmIsNativeInteger(scalar) &&
+        value.opcode == "extern.intrinsic" &&
+        value.text == "nativeStaticAllocate" &&
+        value.operands.size == 1) {
+        val requested = bootstrapLlvmScalarInstructionConstant(
+            backend, program, value.operands[0], "i64",
+            depth + 1, initializing
+        )
+        val constant = LLVMIsAConstantInt(requested)
+        if (!pointerIsNull(constant)) {
+            var size = LLVMConstIntGetSExtValue(constant)
+            if (size < 1) size = 1
+            if (size <= 2147483647) {
+                val globalsSymbol = bootstrapLlvmBootstrapGlobalsSymbol(
+                    program
+                )
+                if (globalsSymbol != "") {
+                    val global = bootstrapLlvmGlobalZeroBytes(
+                        backend, size,
+                        bootstrapLlvmStaticAllocationSymbol(
+                            globalsSymbol, value.result
+                        )
+                    )
+                    result = LLVMConstPtrToInt(
+                        global, backend.type(scalar)
+                    )
+                }
+            }
+        }
+    }
+    if (bootstrapLlvmIsNativeInteger(scalar) &&
+        value.opcode == "extern.intrinsic" &&
+        value.text == "nativeLinkerSymbolAddress" &&
+        value.operands.size == 1) {
+        val linkName = bootstrapLlvmInstructionConstantString(
+            program, value.operands[0]
+        )
+        if (linkName != "") {
+            var global = LLVMGetNamedGlobal(backend.module, linkName)
+            if (pointerIsNull(global)) {
+                global = LLVMAddGlobal(
+                    backend.module, backend.i8Type, linkName
+                )
+                LLVMSetLinkage(global, llvmExternalLinkage())
+            }
+            result = LLVMConstPtrToInt(global, backend.type(scalar))
+        }
+    }
+    if (bootstrapLlvmIsNativeInteger(scalar) &&
+        value.opcode == "extern.intrinsic" &&
+        value.text == "nativeInternalSectionBytes" &&
+        value.operands.size == 4) {
+        val contents = bootstrapLlvmInstructionConstantString(
+            program, value.operands[0]
+        )
+        val linkName = bootstrapLlvmInstructionConstantString(
+            program, value.operands[1]
+        )
+        val section = bootstrapLlvmInstructionConstantString(
+            program, value.operands[2]
+        )
+        val requestedAlignment = bootstrapLlvmScalarInstructionConstant(
+            backend, program, value.operands[3], "i64",
+            depth + 1, initializing
+        )
+        val alignmentConstant = LLVMIsAConstantInt(requestedAlignment)
+        if (contents.size > 0 && linkName != "" && section != "" &&
+            !pointerIsNull(alignmentConstant)) {
+            val alignment = LLVMConstIntGetSExtValue(alignmentConstant)
+            if (alignment >= 1 && alignment <= 1073741824 &&
+                (alignment & (alignment - 1)) == 0) {
+                val global = bootstrapLlvmInternalSectionBytesGlobal(
+                    backend, contents, linkName, section, alignment
+                )
+                result = LLVMConstPtrToInt(
+                    global, backend.type(scalar)
+                )
+            }
+        }
+    }
+    if (bootstrapLlvmIsNativeInteger(scalar) &&
+        value.opcode == "extern.intrinsic" &&
+        value.text == "nativeInternalLinkedStaticAllocate" &&
+        value.operands.size == 2) {
+        val requested = bootstrapLlvmScalarInstructionConstant(
+            backend, program, value.operands[0], "i64",
+            depth + 1, initializing
+        )
+        val constant = LLVMIsAConstantInt(requested)
+        val linkName = bootstrapLlvmInstructionConstantString(
+            program, value.operands[1]
+        )
+        if (!pointerIsNull(constant) && linkName != "") {
+            var size = LLVMConstIntGetSExtValue(constant)
+            if (size < 1) size = 1
+            if (size <= 2147483647) {
+                val global = bootstrapLlvmGlobalZeroBytes(
+                    backend, size, linkName
+                )
+                result = LLVMConstPtrToInt(
+                    global, backend.type(scalar)
                 )
             }
         }
@@ -2345,6 +2699,11 @@ fun bootstrapLlvmFunctionSymbol(function: BootstrapIrFunction): string =
     )}_${bootstrapLlvmFunctionLinkFingerprint(
         function, 101, 271, 1000000009
     )}"
+
+fun bootstrapLlvmStaticAllocationSymbol(
+    functionSymbol: string,
+    result: int
+): string = "abla_static_${functionSymbol}_$result"
 
 fun bootstrapLlvmFunctionRuntimeId(function: BootstrapIrFunction): int =
     bootstrapLlvmFunctionLinkFingerprint(function, 151, 277, 1000000007)

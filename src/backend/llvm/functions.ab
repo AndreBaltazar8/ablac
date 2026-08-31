@@ -9,6 +9,37 @@ fun bootstrapLlvmXtensaInterruptEntrySymbol(name: string): string =
 fun bootstrapLlvmNativeFunctionAdapterSymbol(name: string): string =
     "${name}_native_adapter"
 
+// A sectioned scalar function is already a native ABI entry. Returning its
+// direct address preserves the requested placement and avoids a lazy-module
+// initialization thunk on interrupt, ROM, and secondary-core entry paths.
+// Managed values, bool's distinct foreign representation, and variadic direct
+// ABIs continue to use the adapter automatically.
+fun bootstrapLlvmNativeFunctionAddressUsesDirect(
+    function: BootstrapIrFunction
+): bool {
+    var exact = function.section != "" &&
+        !bootstrapLlvmDirectNeedsArgumentCount(function) &&
+        (bootstrapLlvmDirectResultIsVoid(function) ||
+         bootstrapLlvmDirectResultIsScalar(function)) &&
+        function.resultType != "bool"
+    var parameter = 0
+    while (exact && parameter < function.parameterTypes.size) {
+        exact = function.parameterTypes[parameter] != "bool" &&
+            bootstrapLlvmScalarType(
+                function.parameterTypes[parameter]
+            ) != ""
+        parameter = parameter + 1
+    }
+    exact
+}
+
+fun bootstrapLlvmNativeFunctionAddressSymbol(
+    function: BootstrapIrFunction,
+    symbol: string
+): string = if (bootstrapLlvmNativeFunctionAddressUsesDirect(function))
+    bootstrapLlvmDirectFunctionSymbol(symbol)
+else bootstrapLlvmNativeFunctionAdapterSymbol(symbol)
+
 fun bootstrapLlvmDeclareXtensaInterruptEntry(
     backend: BootstrapLlvmBackend,
     name: string
@@ -1451,6 +1482,7 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "nativeStackAllocate" ||
     name == "nativeStaticAllocate" ||
     name == "nativeInternalSectionBytes" ||
+    name == "nativeInternalSectionU32s" ||
     name == "nativeInitializeGlobals" ||
     name == "nativeLinkerSymbolAddress" ||
     name == "nativeLinkedStaticAllocate" ||
@@ -2899,13 +2931,13 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 if (size < 1) size = 1
                 if (size > 2147483647) supported = false
                 if (size <= 2147483647) {
-                    val type = LLVMArrayType2(backend.i8Type, size)
-                    val global = LLVMAddGlobal(
-                        backend.module, type, "abla.static.allocation"
+                    val global = bootstrapLlvmGlobalZeroBytes(
+                        backend, size,
+                        bootstrapLlvmStaticAllocationSymbol(
+                            bootstrapLlvmFunctionSymbol(irFunction),
+                            instruction.result
+                        )
                     )
-                    LLVMSetInitializer(global, LLVMConstNull(type))
-                    LLVMSetAlignment(global, 8)
-                    LLVMSetLinkage(global, llvmInternalLinkage())
                     bootstrapLlvmSetNativeValue(
                         backend, storage, instruction.result,
                         LLVMBuildPtrToInt(
@@ -2942,27 +2974,17 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                     (alignment & (alignment - 1)) != 0) supported = false
                 if (alignment >= 1 && alignment <= 1073741824 &&
                     (alignment & (alignment - 1)) == 0) {
-                    val initializer = LLVMConstStringInContext2(
-                        backend.context, contents, contents.size, 1
+                    val global = bootstrapLlvmInternalSectionBytesGlobal(
+                        backend, contents, linkName, section, alignment
                     )
-                    val type = LLVMTypeOf(initializer)
-                    var global = LLVMGetNamedGlobal(backend.module, linkName)
-                    if (pointerIsNull(global)) {
-                        global = LLVMAddGlobal(backend.module, type, linkName)
-                        LLVMSetInitializer(global, initializer)
-                        LLVMSetGlobalConstant(global, 1)
-                        LLVMSetAlignment(global, i32(alignment))
-                        LLVMSetLinkage(global, llvmInternalLinkage())
-                        LLVMSetSection(global, section)
-                        var retainedSlot = 0
-                        while (retainedSlot < retainedLinkedData.size &&
-                            !pointerIsNull(retainedLinkedData[retainedSlot])) {
-                            retainedSlot = retainedSlot + 1
-                        }
-                        if (retainedSlot < retainedLinkedData.size) {
-                            retainedLinkedData[retainedSlot] = global
-                        } else supported = false
+                    var retainedSlot = 0
+                    while (retainedSlot < retainedLinkedData.size &&
+                        !pointerIsNull(retainedLinkedData[retainedSlot])) {
+                        retainedSlot = retainedSlot + 1
                     }
+                    if (retainedSlot < retainedLinkedData.size) {
+                        retainedLinkedData[retainedSlot] = global
+                    } else supported = false
                     bootstrapLlvmSetNativeValue(
                         backend, storage, instruction.result,
                         LLVMBuildPtrToInt(
@@ -3059,18 +3081,6 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                             else llvmExternalLinkage()
                         )
                         if (sectioned) LLVMSetSection(global, section)
-                        if (name == "nativeInternalLinkedStaticAllocate" ||
-                            name ==
-                                "nativeInternalSectionThreadLocalAllocate") {
-                            var retainedSlot = 0
-                            while (retainedSlot < retainedLinkedData.size &&
-                                !pointerIsNull(
-                                    retainedLinkedData[retainedSlot]
-                                )) retainedSlot = retainedSlot + 1
-                            if (retainedSlot < retainedLinkedData.size) {
-                                retainedLinkedData[retainedSlot] = global
-                            } else supported = false
-                        }
                         if (name == "nativeLinkedThreadLocalAllocate" ||
                             sectioned) {
                             LLVMSetThreadLocal(global, 1)
@@ -3080,6 +3090,18 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                             // into an ELF .so or a Mach-O dylib.
                             LLVMSetThreadLocalMode(global, 1)
                         }
+                    }
+                    if (name == "nativeInternalLinkedStaticAllocate" ||
+                        name ==
+                            "nativeInternalSectionThreadLocalAllocate") {
+                        var retainedSlot = 0
+                        while (retainedSlot < retainedLinkedData.size &&
+                            !pointerIsNull(
+                                retainedLinkedData[retainedSlot]
+                            )) retainedSlot = retainedSlot + 1
+                        if (retainedSlot < retainedLinkedData.size) {
+                            retainedLinkedData[retainedSlot] = global
+                        } else supported = false
                     }
                     bootstrapLlvmSetNativeValue(
                         backend, storage, instruction.result,
@@ -6162,37 +6184,149 @@ fun bootstrapLlvmEmitFunction(
             val found = functionIndex.find(instruction.text)
             if (found < 0) supported = false
             if (found >= 0) {
-                val adapter = LLVMGetNamedFunction(
+                val addressFunction = LLVMGetNamedFunction(
                     backend.module,
-                    bootstrapLlvmNativeFunctionAdapterSymbol(
-                        identities.symbols[found]
+                    bootstrapLlvmNativeFunctionAddressSymbol(
+                        program.functions[found], identities.symbols[found]
                     )
                 )
-                if (pointerIsNull(adapter)) supported = false
-                if (!pointerIsNull(adapter)) bootstrapLlvmSetNativeValue(
+                if (pointerIsNull(addressFunction)) supported = false
+                if (!pointerIsNull(addressFunction)) bootstrapLlvmSetNativeValue(
                     backend, storage, instruction.result,
                     LLVMBuildPtrToInt(
-                        backend.builder, adapter, backend.i64Type,
+                        backend.builder, addressFunction, backend.i64Type,
                         "native.function.address"
                     )
                 )
             }
         }
-        if (reachable && instruction.opcode == "native.static.bytes") {
+        if (reachable &&
+            (instruction.opcode == "native.static.bytes" ||
+             instruction.opcode == "native.static.mutable.bytes")) {
             matched = true
+            val mutable =
+                instruction.opcode == "native.static.mutable.bytes"
+            val suffix = if (mutable) ".native.mutable.bytes"
+                else ".native.bytes"
             val name = "${bootstrapLlvmStringSymbolFrom(
                 identities.symbols[functionId], instruction.result
-            )}.native.bytes"
-            val pointer = bootstrapLlvmGlobalBytesPointer(
+            )}$suffix"
+            val global = if (mutable) bootstrapLlvmGlobalMutableBytes(
+                backend, instruction.text, name
+            ) else bootstrapLlvmGlobalBytes(
                 backend, instruction.text, name
             )
             bootstrapLlvmSetNativeValue(
                 backend, storage, instruction.result,
                 LLVMBuildPtrToInt(
-                    backend.builder, pointer, backend.i64Type,
-                    "native.static.bytes.address"
+                    backend.builder, global, backend.i64Type,
+                    if (mutable) "native.static.mutable.bytes.address"
+                    else "native.static.bytes.address"
                 )
             )
+        }
+        if (reachable &&
+            (instruction.opcode == "native.static.u32s" ||
+             instruction.opcode == "native.static.mutable.u32s")) {
+            matched = true
+            val words: array<i64*> = []
+            var operand = 0
+            while (operand < instruction.operands.size) {
+                val word = bootstrapLlvmStaticU32OperandConstant(
+                    backend, program, instruction.operands[operand],
+                    0, true
+                )
+                if (pointerIsNull(word)) {
+                    val producerIndex = bootstrapLlvmInstructionProducing(
+                        program, instruction.operands[operand]
+                    )
+                    if (producerIndex >= 0) {
+                        val producer = program.instructions[producerIndex]
+                        val sourceIndex = bootstrapLlvmInstructionProducing(
+                            program, producer.left
+                        )
+                        if (sourceIndex >= 0) {
+                            val source = program.instructions[sourceIndex]
+                            linuxPrintStandardError(
+                                "error[E_LLVM_STATIC_INITIALIZER]: result `${instruction.result}` word `${operand}` cannot materialize `${producer.opcode}` target `${producer.text}` from `${source.opcode}` target `${source.text}`\n"
+                            )
+                        } else linuxPrintStandardError(
+                            "error[E_LLVM_STATIC_INITIALIZER]: result `${instruction.result}` word `${operand}` cannot materialize `${producer.opcode}` target `${producer.text}`\n"
+                        )
+                    } else linuxPrintStandardError(
+                        "error[E_LLVM_STATIC_INITIALIZER]: result `${instruction.result}` word `${operand}` has no producing instruction\n"
+                    )
+                    supported = false
+                }
+                if (!pointerIsNull(word)) words.append(word)
+                operand = operand + 1
+            }
+            if (instruction.operands.size < 1) supported = false
+            if (supported) {
+                val mutable =
+                    instruction.opcode == "native.static.mutable.u32s"
+                val suffix = if (mutable) ".native.mutable.u32s"
+                    else ".native.u32s"
+                val name = "${bootstrapLlvmStringSymbolFrom(
+                    identities.symbols[functionId], instruction.result
+                )}$suffix"
+                val global = if (mutable) {
+                    bootstrapLlvmGlobalMutableU32s(
+                        backend, words, name
+                    )
+                } else bootstrapLlvmGlobalU32s(
+                    backend, words, name
+                )
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result,
+                    LLVMBuildPtrToInt(
+                        backend.builder, global, backend.i64Type,
+                        if (mutable) "native.static.mutable.u32s.address"
+                        else "native.static.u32s.address"
+                    )
+                )
+            }
+        }
+        if (reachable && instruction.opcode ==
+            "native.internal.section.u32s") {
+            matched = true
+            val words: array<i64*> = []
+            var operand = 0
+            while (operand < instruction.operands.size) {
+                val word = bootstrapLlvmStaticU32OperandConstant(
+                    backend, program, instruction.operands[operand],
+                    0, true
+                )
+                if (pointerIsNull(word)) supported = false
+                if (!pointerIsNull(word)) words.append(word)
+                operand = operand + 1
+            }
+            if (instruction.operands.size < 1 ||
+                instruction.texts.size != 2 ||
+                (instruction.texts.size == 2 &&
+                 (instruction.texts[0] == "" ||
+                  instruction.texts[1] == ""))) supported = false
+            if (supported) {
+                val global = bootstrapLlvmInternalSectionU32sGlobal(
+                    backend, words, instruction.texts[0],
+                    instruction.texts[1]
+                )
+                var retainedSlot = 0
+                while (retainedSlot < retainedLinkedData.size &&
+                    !pointerIsNull(retainedLinkedData[retainedSlot])) {
+                    retainedSlot = retainedSlot + 1
+                }
+                if (retainedSlot < retainedLinkedData.size) {
+                    retainedLinkedData[retainedSlot] = global
+                } else supported = false
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result,
+                    LLVMBuildPtrToInt(
+                        backend.builder, global, backend.i64Type,
+                        "unsafe.internal.section.u32s.address"
+                    )
+                )
+            }
         }
         if (reachable && instruction.opcode == "closure.create") {
             matched = true
@@ -6758,7 +6892,7 @@ fun bootstrapLlvmEmitFunction(
         }
         if (!matched || !supported) {
             linuxPrintStandardError(
-                "error[E_LLVM_INSTRUCTION_UNSUPPORTED]: function `${function.name}` cannot lower `${instruction.opcode}` target `${instruction.text}`\n"
+                "error[E_LLVM_INSTRUCTION_UNSUPPORTED]: function `${function.name}` cannot lower result `${instruction.result}` `${instruction.opcode}` target `${instruction.text}`\n"
             )
             errors = errors + 1
         }
