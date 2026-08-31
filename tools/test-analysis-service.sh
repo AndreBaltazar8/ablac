@@ -20,13 +20,16 @@ responses=$(
         '{"schema":1,"id":9,"method":"refactor/validate","params":{"baseRevision":"6","edits":[{"uri":"file:///tmp/abla-analysis-broken.ab","start":18,"end":25,"newText":"1"}],"invariants":["no-new-errors"]}}' \
         '{"schema":1,"id":10,"method":"refactor/validate","params":{"baseRevision":"6","edits":[{"uri":"file:///tmp/abla-analysis-caller.ab","start":49,"end":54,"newText":"unknownName"}],"invariants":["no-new-errors"]}}' \
         '{"schema":1,"id":11,"method":"refactor/validate","params":{"baseRevision":"6","edits":[{"uri":"file:///tmp/abla-analysis-broken.ab","start":18,"end":25,"newText":"otherMissing"}],"invariants":["no-new-errors"]}}' \
-        '{"schema":1,"id":12,"method":"shutdown","params":{}}' |
+        '{"schema":1,"id":12,"method":"refactor/validate","params":{"baseRevision":"6","createdDocuments":[{"uri":"file:///tmp/abla-analysis-created.ab","text":""}],"edits":[{"uri":"file:///tmp/abla-analysis-created.ab","start":0,"end":0,"newText":"fun created: int = 42\n"}],"invariants":["no-new-errors"]}}' \
+        '{"schema":1,"id":13,"method":"refactor/validate","params":{"baseRevision":"6","edits":[{"uri":"file:///tmp/abla-analysis-undeclared.ab","start":0,"end":0,"newText":"fun undeclared: int = 42\n"}],"invariants":["no-new-errors"]}}' \
+        '{"schema":1,"id":14,"method":"refactor/validate","params":{"baseRevision":"6","createdDocuments":[{"uri":"file:///tmp/abla-analysis-invalid-created.ab","text":""}],"edits":[{"uri":"file:///tmp/abla-analysis-invalid-created.ab","start":0,"end":0,"newText":"fun invalid: int = missing\n"}],"invariants":["no-new-errors"]}}' \
+        '{"schema":1,"id":15,"method":"shutdown","params":{}}' |
         "$compiler" analyze --stdio
 )
 
 node -e '
 const lines = require("node:fs").readFileSync(0, "utf8").trim().split("\n").map(JSON.parse);
-if (lines.length !== 12) throw new Error(`expected 12 responses, got ${lines.length}`);
+if (lines.length !== 15) throw new Error(`expected 15 responses, got ${lines.length}`);
 const initialized = lines[0].result;
 if (initialized.protocolVersion !== 1 || !initialized.capabilities.includes("declarations")) {
   throw new Error("analysis protocol negotiation failed");
@@ -78,6 +81,15 @@ if (lines[9].result?.valid !== false) {
 if (lines[10].result?.valid !== false) {
   throw new Error("a replacement diagnostic was hidden by an unchanged total error count");
 }
+if (lines[11].result?.valid !== true || lines[11].result?.snapshot?.documents.at(-1)?.symbols[0]?.name !== "created") {
+  throw new Error("an explicitly created document was not included in prospective analysis");
+}
+if (lines[12].result?.valid !== false || lines[12].result?.reason !== "edit targets an unanalyzed document") {
+  throw new Error("an edit created an undeclared document implicitly");
+}
+if (lines[13].result?.valid !== false) {
+  throw new Error("a diagnostic-introducing created document was accepted");
+}
 ' <<<"$responses"
 
-printf '%s\n' 'analysis service: protocol, overlays, UTF-8 spans, semantic calls/diagnostics, stale versions passed'
+printf '%s\n' 'analysis service: protocol, overlays, UTF-8 spans, semantic calls/diagnostics, created documents, stale versions passed'
