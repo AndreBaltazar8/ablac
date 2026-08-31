@@ -27,6 +27,11 @@ class BootstrapAnalysisService(
     var running: bool
 )
 
+class BootstrapAnalysisSemanticGroup(
+    val declarations: array<BootstrapDeclaration>,
+    val semantic: BootstrapSemanticResult
+)
+
 fun bootstrapAnalysisHexDigit(value: int): int {
     var result = -1
     if (value >= 48 && value <= 57) result = value - 48
@@ -174,6 +179,71 @@ fun BootstrapAnalysisService.documents(): array<BootstrapAnalysisDocument> {
         root = root + 1
     }
     documents
+}
+
+fun bootstrapAnalysisDocumentPathIndex(
+    documents: array<BootstrapAnalysisDocument>,
+    requested: string
+): int {
+    val normalized = bootstrapNormalizeModulePath(requested)
+    var result = -1
+    var index = 0
+    while (result < 0 && index < documents.size) {
+        if (bootstrapNormalizeModulePath(documents[index].path) == normalized) {
+            result = index
+        }
+        index = index + 1
+    }
+    result
+}
+
+// A workspace may contain independent projects, examples, fixtures, and test
+// cases with intentionally repeated declaration names. Only modules connected
+// by a real import edge share a semantic universe. Keeping those components
+// separate prevents an unrelated `main`, helper, or fixture from making an
+// otherwise valid open document ambiguous.
+fun bootstrapAnalysisComponentIds(
+    documents: array<BootstrapAnalysisDocument>
+): array<int> {
+    val components: array<int> = []
+    var document = 0
+    while (document < documents.size) {
+        components.append(document)
+        document = document + 1
+    }
+    document = 0
+    while (document < documents.size) {
+        val scan = bootstrapScanImports(documents[document].text)
+        var edge = 0
+        while (edge < scan.edges.size) {
+            if (!scan.edges[edge].provider) {
+                val resolved = bootstrapImportAliasExposedTarget(
+                    bootstrapResolveImport(
+                        documents[document].path,
+                        scan.edges[edge].source
+                    )
+                )
+                val imported = bootstrapAnalysisDocumentPathIndex(
+                    documents, resolved
+                )
+                if (imported >= 0 &&
+                    components[document] != components[imported]) {
+                    val replaced = components[imported]
+                    val retained = components[document]
+                    var index = 0
+                    while (index < components.size) {
+                        if (components[index] == replaced) {
+                            components[index] = retained
+                        }
+                        index = index + 1
+                    }
+                }
+            }
+            edge = edge + 1
+        }
+        document = document + 1
+    }
+    components
 }
 
 fun bootstrapAnalysisSymbolKind(kind: string): string {
@@ -847,9 +917,12 @@ fun bootstrapAnalysisDocumentJson(
     )
 }
 
-fun BootstrapAnalysisService.snapshot(): Json {
-    val documents = this.documents()
-    val parsedDocuments: array<BootstrapParseResult> = []
+fun bootstrapAnalysisSemanticGroup(
+    documents: array<BootstrapAnalysisDocument>,
+    parsedDocuments: array<BootstrapParseResult>,
+    components: array<int>,
+    requestedComponent: int
+): BootstrapAnalysisSemanticGroup {
     val declarations: array<BootstrapDeclaration> = []
     val actions: array<BootstrapExpression> = []
     val compileInputPaths: array<string> = []
@@ -861,6 +934,49 @@ fun BootstrapAnalysisService.snapshot(): Json {
     val typedEnds: array<int> = []
     val typedKinds: array<string> = []
     val typedSources: array<string> = []
+    var document = 0
+    while (document < documents.size) {
+        if (components[document] == requestedComponent) {
+            val parsed = parsedDocuments[document]
+            errors = errors + parsed.errors
+            extensionErrors = extensionErrors + parsed.extensionErrors
+            diagnostics = "$diagnostics${parsed.diagnostics}"
+            var declaration = 0
+            while (declaration < parsed.declarations.size) {
+                declarations.append(parsed.declarations[declaration])
+                bootstrapAnalysisCollectDeclarationRequests(
+                    parsed.declarations[declaration],
+                    typedBegins, typedEnds, typedKinds, typedSources
+                )
+                declaration = declaration + 1
+            }
+            var action = 0
+            while (action < parsed.actions.size) {
+                actions.append(parsed.actions[action])
+                bootstrapAnalysisCollectTypedRequests(
+                    parsed.actions[action], documents[document].path,
+                    typedBegins, typedEnds, typedKinds, typedSources
+                )
+                action = action + 1
+            }
+        }
+        document = document + 1
+    }
+    val merged = BootstrapParseResult(
+        declarations, actions, errors, extensionErrors,
+        compileInputPaths, compileInputContents, diagnostics
+    )
+    BootstrapAnalysisSemanticGroup(
+        declarations,
+        bootstrapAnalyzeRequestedSourceSpans(
+            merged, typedBegins, typedEnds, typedKinds, typedSources
+        )
+    )
+}
+
+fun BootstrapAnalysisService.snapshot(): Json {
+    val documents = this.documents()
+    val parsedDocuments: array<BootstrapParseResult> = []
     var documentIndex = 0
     while (documentIndex < documents.size) {
         val parsed = bootstrapParseWithIdentity(
@@ -868,41 +984,30 @@ fun BootstrapAnalysisService.snapshot(): Json {
             documents[documentIndex].path
         )
         parsedDocuments.append(parsed)
-        errors = errors + parsed.errors
-        extensionErrors = extensionErrors + parsed.extensionErrors
-        diagnostics = "$diagnostics${parsed.diagnostics}"
-        var declaration = 0
-        while (declaration < parsed.declarations.size) {
-            declarations.append(parsed.declarations[declaration])
-            bootstrapAnalysisCollectDeclarationRequests(
-                parsed.declarations[declaration],
-                typedBegins, typedEnds, typedKinds, typedSources
-            )
-            declaration = declaration + 1
-        }
-        var action = 0
-        while (action < parsed.actions.size) {
-            actions.append(parsed.actions[action])
-            bootstrapAnalysisCollectTypedRequests(
-                parsed.actions[action], documents[documentIndex].path,
-                typedBegins, typedEnds, typedKinds, typedSources
-            )
-            action = action + 1
-        }
         documentIndex = documentIndex + 1
     }
-    val merged = BootstrapParseResult(
-        declarations, actions, errors, extensionErrors,
-        compileInputPaths, compileInputContents, diagnostics
-    )
-    val semantic = bootstrapAnalyzeRequestedSourceSpans(
-        merged, typedBegins, typedEnds, typedKinds, typedSources
-    )
+    val components = bootstrapAnalysisComponentIds(documents)
+    val groupIds: array<int> = []
+    val groups: array<BootstrapAnalysisSemanticGroup> = []
     val values: array<Json> = []
     var index = 0
     while (index < documents.size) {
+        var group = -1
+        var candidate = 0
+        while (group < 0 && candidate < groupIds.size) {
+            if (groupIds[candidate] == components[index]) group = candidate
+            candidate = candidate + 1
+        }
+        if (group < 0) {
+            groupIds.append(components[index])
+            groups.append(bootstrapAnalysisSemanticGroup(
+                documents, parsedDocuments, components, components[index]
+            ))
+            group = groups.size - 1
+        }
         values.append(bootstrapAnalysisDocumentJson(
-            documents[index], parsedDocuments[index], declarations, semantic
+            documents[index], parsedDocuments[index],
+            groups[group].declarations, groups[group].semantic
         ))
         index = index + 1
     }
@@ -912,15 +1017,106 @@ fun BootstrapAnalysisService.snapshot(): Json {
     )
 }
 
-fun bootstrapAnalysisSnapshotDiagnosticCount(snapshot: Json): int {
+fun bootstrapAnalysisSnapshotDiagnosticCount(
+    snapshot: Json,
+    uri: string,
+    code: string,
+    message: string
+): int {
     var count = 0
     val documents = snapshot.get("documents")
     var document = 0
     while (documents.isArray() && document < documents.size()) {
-        count = count + documents.at(document).get("diagnostics").size()
+        val found = documents.at(document)
+        if (uri == "" || found.getString("uri") == uri) {
+            val diagnostics = found.get("diagnostics")
+            var diagnostic = 0
+            while (diagnostics.isArray() && diagnostic < diagnostics.size()) {
+                val candidate = diagnostics.at(diagnostic)
+                if ((code == "" || candidate.getString("code") == code) &&
+                    (message == "" ||
+                     candidate.getString("message") == message)) {
+                    count = count + 1
+                }
+                diagnostic = diagnostic + 1
+            }
+        }
         document = document + 1
     }
     count
+}
+
+fun bootstrapAnalysisSnapshotIntroducesDiagnostic(
+    baseline: Json,
+    prospective: Json
+): bool {
+    var introduced = false
+    val documents = prospective.get("documents")
+    var document = 0
+    while (!introduced && documents.isArray() && document < documents.size()) {
+        val found = documents.at(document)
+        val uri = found.getString("uri")
+        val diagnostics = found.get("diagnostics")
+        var diagnostic = 0
+        while (!introduced && diagnostics.isArray() &&
+            diagnostic < diagnostics.size()) {
+            val candidate = diagnostics.at(diagnostic)
+            val code = candidate.getString("code")
+            val message = candidate.getString("message")
+            val candidateCount = bootstrapAnalysisSnapshotDiagnosticCount(
+                prospective, uri, code, message
+            )
+            val baselineCount = bootstrapAnalysisSnapshotDiagnosticCount(
+                baseline, uri, code, message
+            )
+            if (candidateCount > baselineCount) introduced = true
+            diagnostic = diagnostic + 1
+        }
+        document = document + 1
+    }
+    introduced
+}
+
+fun bootstrapAnalysisEditsUri(edits: Json, uri: string): bool {
+    var found = false
+    var edit = 0
+    while (!found && edits.isArray() && edit < edits.size()) {
+        if (edits.at(edit).getString("uri") == uri) found = true
+        edit = edit + 1
+    }
+    found
+}
+
+fun bootstrapAnalysisSnapshotPreservesUneditedSymbols(
+    baseline: Json,
+    prospective: Json,
+    edits: Json
+): bool {
+    var preserved = true
+    val baselineDocuments = baseline.get("documents")
+    val prospectiveDocuments = prospective.get("documents")
+    var document = 0
+    while (preserved && baselineDocuments.isArray() &&
+        document < baselineDocuments.size()) {
+        val before = baselineDocuments.at(document)
+        val uri = before.getString("uri")
+        if (!bootstrapAnalysisEditsUri(edits, uri)) {
+            var afterIndex = 0
+            var matched = false
+            while (!matched && prospectiveDocuments.isArray() &&
+                afterIndex < prospectiveDocuments.size()) {
+                val after = prospectiveDocuments.at(afterIndex)
+                if (after.getString("uri") == uri) {
+                    matched = jsonStringify(before.get("symbols")) ==
+                        jsonStringify(after.get("symbols"))
+                }
+                afterIndex = afterIndex + 1
+            }
+            if (!matched) preserved = false
+        }
+        document = document + 1
+    }
+    preserved
 }
 
 fun bootstrapAnalysisOwnedString(value: string): string = "$value"
@@ -1019,10 +1215,17 @@ fun BootstrapAnalysisService.validateEdit(params: Json): Json {
 
     val baseline = this.snapshot()
     val prospective = if (valid) candidate.snapshot() else jsonNull()
-    if (valid && bootstrapAnalysisSnapshotDiagnosticCount(prospective) >
-        bootstrapAnalysisSnapshotDiagnosticCount(baseline)) {
+    if (valid && bootstrapAnalysisSnapshotIntroducesDiagnostic(
+        baseline, prospective
+    )) {
         valid = false
         reason = "prospective edit introduces compiler diagnostics"
+    }
+    if (valid && !bootstrapAnalysisSnapshotPreservesUneditedSymbols(
+        baseline, prospective, edits
+    )) {
+        valid = false
+        reason = "prospective edit changes symbols outside edited documents"
     }
     if (valid) jsonObject(
         ["valid", "snapshot"],
