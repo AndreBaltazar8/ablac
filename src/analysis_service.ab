@@ -178,8 +178,10 @@ fun BootstrapAnalysisService.documents(): array<BootstrapAnalysisDocument> {
 
 fun bootstrapAnalysisSymbolKind(kind: string): string {
     var result = "function"
-    if (kind == "class" || kind == "interface") result = "class"
+    if (kind == "class") result = "class"
+    if (kind == "interface") result = "interface"
     if (kind == "enum") result = "enum"
+    if (kind == "type") result = "type"
     if (kind == "val" || kind == "compile.val") result = "value"
     if (kind == "var" || kind == "compile.var") result = "variable"
     result
@@ -221,24 +223,52 @@ fun bootstrapAnalysisSymbolJson(
     containerId: string
 ): Json {
     val selection = bootstrapAnalysisNameRange(tokens, source, declaration)
+    bootstrapAnalysisNamedSymbolJson(
+        bootstrapAnalysisDeclarationId(declaration),
+        declaration.name,
+        bootstrapAnalysisSymbolKind(declaration.kind),
+        uri,
+        declaration.begin,
+        declaration.end,
+        selection[0],
+        selection[1],
+        "${declaration.kind} ${declaration.resultType}",
+        topLevel,
+        containerId
+    )
+}
+
+fun bootstrapAnalysisNamedSymbolJson(
+    id: string,
+    name: string,
+    kind: string,
+    uri: string,
+    begin: int,
+    end: int,
+    selectionBegin: int,
+    selectionEnd: int,
+    detail: string,
+    topLevel: bool,
+    containerId: string
+): Json {
     val keys = [
         "id", "name", "kind", "uri", "range", "selectionRange",
         "detail", "topLevel"
     ]
     val values = [
-        jsonString(bootstrapAnalysisDeclarationId(declaration)),
-        jsonString(declaration.name),
-        jsonString(bootstrapAnalysisSymbolKind(declaration.kind)),
+        jsonString(id),
+        jsonString(name),
+        jsonString(kind),
         jsonString(uri),
         jsonObject(
             ["start", "end"],
-            [jsonInteger(declaration.begin), jsonInteger(declaration.end)]
+            [jsonInteger(begin), jsonInteger(end)]
         ),
         jsonObject(
             ["start", "end"],
-            [jsonInteger(selection[0]), jsonInteger(selection[1])]
+            [jsonInteger(selectionBegin), jsonInteger(selectionEnd)]
         ),
-        jsonString("${declaration.kind} ${declaration.resultType}"),
+        jsonString(detail),
         jsonBoolean(topLevel)
     ]
     if (containerId != "") {
@@ -246,6 +276,155 @@ fun bootstrapAnalysisSymbolJson(
         values.append(jsonString(containerId))
     }
     jsonObject(keys, values)
+}
+
+fun bootstrapAnalysisExpressionNameRange(
+    tokens: array<BootstrapToken>,
+    source: string,
+    name: string,
+    begin: int,
+    end: int
+): array<int> {
+    var selectionBegin = begin
+    var selectionEnd = begin
+    var found = false
+    var index = 0
+    while (!found && index < tokens.size) {
+        val token = tokens[index]
+        if (token.begin >= begin && token.end <= end &&
+            token.kind == "identifier" &&
+            bootstrapTokenText(source, token) == name) {
+            selectionBegin = token.begin
+            selectionEnd = token.end
+            found = true
+        }
+        index = index + 1
+    }
+    [selectionBegin, selectionEnd]
+}
+
+fun bootstrapAnalysisParameterRange(
+    tokens: array<BootstrapToken>,
+    source: string,
+    declaration: BootstrapDeclaration,
+    parameter: int
+): array<int> {
+    val name = declaration.parameters[parameter]
+    var selection = [declaration.begin, declaration.begin]
+    var found = false
+    val headerEnd = if (declaration.expression.begin > declaration.begin) {
+        declaration.expression.begin
+    } else declaration.end
+    var index = 1
+    while (!found && index < tokens.size) {
+        val token = tokens[index]
+        val previous = tokens[index - 1]
+        val introducer = previous.kind == "(" || previous.kind == "," ||
+            previous.kind == "own" || previous.kind == "val" ||
+            previous.kind == "var"
+        if (token.begin >= declaration.begin &&
+            token.end <= headerEnd && introducer &&
+            token.kind == "identifier" &&
+            bootstrapTokenText(source, token) == name) {
+            selection = [token.begin, token.end]
+            found = true
+        }
+        index = index + 1
+    }
+    [selection[0], selection[1]]
+}
+
+fun bootstrapAnalysisCollectLocalSymbols(
+    tokens: array<BootstrapToken>,
+    source: string,
+    uri: string,
+    sourceIdentity: string,
+    expression: BootstrapExpression,
+    containerId: string,
+    var values: array<Json>
+): void {
+    var kind = ""
+    var identityKind = "local"
+    if (expression.kind == "local.val") kind = "value"
+    if (expression.kind == "local.var") kind = "variable"
+    if (expression.kind == "for") {
+        kind = "value"
+        identityKind = "for"
+    }
+    if (expression.kind == "lambda.parameter") {
+        kind = "parameter"
+        identityKind = "parameter"
+    }
+    if (kind != "" && expression.text != "") {
+        val selection = bootstrapAnalysisExpressionNameRange(
+            tokens, source, expression.text, expression.begin, expression.end
+        )
+        values.append(bootstrapAnalysisNamedSymbolJson(
+            "abla:$sourceIdentity:${expression.begin}:$identityKind:${expression.text}",
+            expression.text,
+            kind,
+            uri,
+            expression.begin,
+            expression.end,
+            selection[0],
+            selection[1],
+            expression.kind,
+            false,
+            containerId
+        ))
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapAnalysisCollectLocalSymbols(
+            tokens, source, uri, sourceIdentity,
+            expression.children[child], containerId, values
+        )
+        child = child + 1
+    }
+}
+
+fun bootstrapAnalysisCollectDeclarationSymbols(
+    tokens: array<BootstrapToken>,
+    source: string,
+    uri: string,
+    declaration: BootstrapDeclaration,
+    containerId: string,
+    var values: array<Json>
+): void {
+    var parameter = 0
+    while (parameter < declaration.parameters.size) {
+        val name = declaration.parameters[parameter]
+        val selection = bootstrapAnalysisParameterRange(
+            tokens, source, declaration, parameter
+        )
+        var kind = "parameter"
+        var identityKind = "parameter"
+        if (parameter < declaration.parameterKinds.size &&
+            (declaration.parameterKinds[parameter] == "val" ||
+             declaration.parameterKinds[parameter] == "var")) {
+            kind = "property"
+            identityKind = "field"
+        }
+        values.append(bootstrapAnalysisNamedSymbolJson(
+            "abla:${declaration.sourceIdentity}:${declaration.begin}:$identityKind:$parameter:$name",
+            name,
+            kind,
+            uri,
+            selection[0],
+            selection[1],
+            selection[0],
+            selection[1],
+            if (parameter < declaration.parameterTypes.size)
+                declaration.parameterTypes[parameter] else "unknown",
+            false,
+            containerId
+        ))
+        parameter = parameter + 1
+    }
+    bootstrapAnalysisCollectLocalSymbols(
+        tokens, source, uri, declaration.sourceIdentity,
+        declaration.expression, containerId, values
+    )
 }
 
 fun bootstrapAnalysisSymbolsJson(
@@ -262,16 +441,92 @@ fun bootstrapAnalysisSymbolsJson(
         values.append(bootstrapAnalysisSymbolJson(
             tokens, source, uri, found, true, ""
         ))
+        bootstrapAnalysisCollectDeclarationSymbols(
+            tokens, source, uri, found, id, values
+        )
         var method = 0
         while (method < found.methods.size) {
+            val methodId = bootstrapAnalysisDeclarationId(
+                found.methods[method]
+            )
             values.append(bootstrapAnalysisSymbolJson(
                 tokens, source, uri, found.methods[method], false, id
             ))
+            bootstrapAnalysisCollectDeclarationSymbols(
+                tokens, source, uri, found.methods[method], methodId, values
+            )
             method = method + 1
         }
         declaration = declaration + 1
     }
     jsonArray(values)
+}
+
+fun bootstrapAnalysisCollectLocalIdentities(
+    tokens: array<BootstrapToken>,
+    source: string,
+    sourceIdentity: string,
+    expression: BootstrapExpression,
+    var begins: array<int>,
+    var ends: array<int>,
+    var ids: array<string>
+): void {
+    var identityKind = ""
+    if (expression.kind == "local.val" || expression.kind == "local.var") {
+        identityKind = "local"
+    }
+    if (expression.kind == "for") identityKind = "for"
+    if (expression.kind == "lambda.parameter") identityKind = "parameter"
+    if (identityKind != "" && expression.text != "") {
+        val selection = bootstrapAnalysisExpressionNameRange(
+            tokens, source, expression.text, expression.begin, expression.end
+        )
+        begins.append(selection[0])
+        ends.append(selection[1])
+        ids.append(
+            "abla:$sourceIdentity:${expression.begin}:$identityKind:${expression.text}"
+        )
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapAnalysisCollectLocalIdentities(
+            tokens, source, sourceIdentity, expression.children[child],
+            begins, ends, ids
+        )
+        child = child + 1
+    }
+}
+
+fun bootstrapAnalysisCollectDeclarationIdentities(
+    tokens: array<BootstrapToken>,
+    source: string,
+    declaration: BootstrapDeclaration,
+    var begins: array<int>,
+    var ends: array<int>,
+    var ids: array<string>
+): void {
+    var parameter = 0
+    while (parameter < declaration.parameters.size) {
+        val selection = bootstrapAnalysisParameterRange(
+            tokens, source, declaration, parameter
+        )
+        var identityKind = "parameter"
+        if (parameter < declaration.parameterKinds.size &&
+            (declaration.parameterKinds[parameter] == "val" ||
+             declaration.parameterKinds[parameter] == "var")) {
+            identityKind = "field"
+        }
+        begins.append(selection[0])
+        ends.append(selection[1])
+        ids.append(
+            "abla:${declaration.sourceIdentity}:${declaration.begin}:$identityKind:$parameter:${declaration.parameters[parameter]}"
+        )
+        parameter = parameter + 1
+    }
+    bootstrapAnalysisCollectLocalIdentities(
+        tokens, source, declaration.sourceIdentity, declaration.expression,
+        begins, ends, ids
+    )
 }
 
 fun bootstrapAnalysisOccurrencesJson(
@@ -293,6 +548,10 @@ fun bootstrapAnalysisOccurrencesJson(
         declarationBegins.append(selection[0])
         declarationEnds.append(selection[1])
         declarationIds.append(bootstrapAnalysisDeclarationId(found))
+        bootstrapAnalysisCollectDeclarationIdentities(
+            tokens, source, found,
+            declarationBegins, declarationEnds, declarationIds
+        )
         var method = 0
         while (method < found.methods.size) {
             val member = found.methods[method]
@@ -302,6 +561,10 @@ fun bootstrapAnalysisOccurrencesJson(
             declarationBegins.append(memberSelection[0])
             declarationEnds.append(memberSelection[1])
             declarationIds.append(bootstrapAnalysisDeclarationId(member))
+            bootstrapAnalysisCollectDeclarationIdentities(
+                tokens, source, member,
+                declarationBegins, declarationEnds, declarationIds
+            )
             method = method + 1
         }
         declaration = declaration + 1
@@ -321,12 +584,25 @@ fun bootstrapAnalysisOccurrencesJson(
             ]
             declaration = 0
             var declarationId = ""
+            var resolvedType = ""
             while (declaration < declarationIds.size) {
                 if (declarationBegins[declaration] == token.begin &&
                     declarationEnds[declaration] == token.end) {
                     declarationId = declarationIds[declaration]
                 }
                 declaration = declaration + 1
+            }
+            var resolvedName = 0
+            while (declarationId == "" &&
+                resolvedName < semantic.resolvedNames.size) {
+                val resolved = semantic.resolvedNames[resolvedName]
+                if (resolved.sourceIdentity == sourceIdentity &&
+                    resolved.begin == token.begin &&
+                    resolved.end == token.end && resolved.name == name) {
+                    declarationId = resolved.declarationIdentity
+                    resolvedType = resolved.type
+                }
+                resolvedName = resolvedName + 1
             }
             var call = 0
             while (declarationId == "" && call < semantic.typedCalls.size) {
@@ -344,12 +620,17 @@ fun bootstrapAnalysisOccurrencesJson(
                     declarationId = bootstrapAnalysisHandleId(
                         declarations, typed.target
                     )
+                    resolvedType = typed.type
                 }
                 call = call + 1
             }
             if (declarationId != "") {
                 keys.append("declarationId")
                 occurrenceValues.append(jsonString(declarationId))
+            }
+            if (resolvedType != "") {
+                keys.append("type")
+                occurrenceValues.append(jsonString(resolvedType))
             }
             values.append(jsonObject(keys, occurrenceValues))
         }
@@ -670,7 +951,8 @@ fun BootstrapAnalysisService.initialize(params: Json): Json {
                 jsonString("document-overlays"),
                 jsonString("parser-diagnostics"),
                 jsonString("declarations"),
-                jsonString("semantic-call-references")
+                jsonString("semantic-call-references"),
+                jsonString("semantic-name-references")
             ])
         ]
     )

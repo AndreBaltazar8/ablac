@@ -11,7 +11,7 @@ responses=$(
     printf '%s\n' \
         '{"schema":1,"id":1,"method":"initialize","params":{"workspaceRoots":[],"clientName":"analysis-test","clientVersion":"1"}}' \
         '{"schema":1,"id":2,"method":"document/open","params":{"uri":"file:///tmp/abla-analysis-overlay.ab","version":7,"text":"// café\nfun greet(name: string): string = name\n"}}' \
-        '{"schema":1,"id":3,"method":"document/open","params":{"uri":"file:///tmp/abla-analysis-caller.ab","version":2,"text":"fun main: string = greet(\"Abla\")\n"}}' \
+        '{"schema":1,"id":3,"method":"document/open","params":{"uri":"file:///tmp/abla-analysis-caller.ab","version":2,"text":"val callback = greet\nfun main(input: string): string {\n    val message = greet(input)\n    message\n}\n"}}' \
         '{"schema":1,"id":4,"method":"document/open","params":{"uri":"file:///tmp/abla-analysis-broken.ab","version":1,"text":"fun broken: int = missing\n"}}' \
         '{"schema":1,"id":5,"method":"analyze","params":{}}' \
         '{"schema":1,"id":6,"method":"document/change","params":{"uri":"file:///tmp/abla-analysis-overlay.ab","version":6,"text":"fun stale: int = 0\n"}}' \
@@ -37,6 +37,17 @@ const caller = lines[4].result.documents[1];
 const call = caller.occurrences.find((occurrence) => occurrence.name === "greet");
 if (call?.declarationId !== document.symbols[0].id) {
   throw new Error("semantic call was not linked to its cross-file declaration");
+}
+const greetReferences = caller.occurrences.filter((occurrence) => occurrence.name === "greet");
+if (greetReferences.length !== 2 || greetReferences.some((occurrence) => occurrence.declarationId !== document.symbols[0].id)) {
+  throw new Error("semantic function-value reference was not linked to its declaration");
+}
+for (const localName of ["input", "message"]) {
+  const symbol = caller.symbols.find((candidate) => candidate.name === localName);
+  const occurrences = caller.occurrences.filter((occurrence) => occurrence.name === localName);
+  if (!symbol || occurrences.length !== 2 || occurrences.some((occurrence) => occurrence.declarationId !== symbol.id)) {
+    throw new Error(`local symbol ${localName} did not retain one lexical identity`);
+  }
 }
 const semantic = lines[4].result.documents[2].diagnostics[0];
 if (semantic?.code !== "E_SEMANTIC" || semantic.range.start !== 18) {

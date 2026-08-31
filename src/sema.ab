@@ -1952,7 +1952,8 @@ class BootstrapSymbol(
     val kind: string,
     val type: string,
     val scope: int,
-    val borrowSource: string
+    val borrowSource: string,
+    val identity: string
 )
 
 // Compact, pointer-free semantic record retained only for expressions named by
@@ -1978,6 +1979,16 @@ class BootstrapTypedCall(
     val isContract: bool
 )
 
+class BootstrapResolvedName(
+    val sourceIdentity: string,
+    val begin: int,
+    val end: int,
+    val name: string,
+    val declarationIdentity: string,
+    val type: string,
+    val kind: string
+)
+
 class BootstrapSemanticResult(
     val symbols: array<BootstrapSymbol>,
     val errors: int,
@@ -1986,6 +1997,7 @@ class BootstrapSemanticResult(
     val mutableReceivers: BootstrapMutableReceiverSummary,
     val compileEffects: BootstrapCompileEffectSummary,
     val typedCalls: array<BootstrapTypedCall>,
+    val resolvedNames: array<BootstrapResolvedName>,
     val managedAliasBegins: array<int>,
     val managedAliasEnds: array<int>,
     val managedAliasSources: array<string>
@@ -3445,6 +3457,7 @@ class BootstrapAnalyzer(
     val typedRequestKinds: array<string>,
     val typedRequestSources: array<string>,
     val typedCalls: array<BootstrapTypedCall>,
+    val resolvedNames: array<BootstrapResolvedName>,
     val managedAliasBegins: array<int>,
     val managedAliasEnds: array<int>,
     val managedAliasSources: array<string>,
@@ -3772,6 +3785,56 @@ class BootstrapAnalyzer(
         result
     }
 
+    fun topLevelDeclarationIdentity(name: string): string {
+        var identity = ""
+        var matches = 0
+        var index = 0
+        while (index < this.declarations.size) {
+            val declaration = this.declarations[index]
+            if (declaration.extensionOwner == "" &&
+                declaration.name == name) {
+                identity = "abla:${declaration.sourceIdentity}:${declaration.begin}:${declaration.name}"
+                matches = matches + 1
+            }
+            index = index + 1
+        }
+        if (matches == 1) identity else ""
+    }
+
+    fun recordResolvedName(
+        expression: BootstrapExpression,
+        type: string
+    ): void {
+        var identity = this.visibleLocalIdentity(expression.text)
+        var kind = this.visibleLocalKind(expression.text)
+        val fieldIdentity = if (this.currentOwner != "") {
+            this.fieldDeclarationIdentity(
+                this.currentOwner, expression.text
+            )
+        } else ""
+        if (identity == "" && fieldIdentity != "") {
+            identity = fieldIdentity
+            kind = "field"
+        }
+        if (identity == "") {
+            identity = this.topLevelDeclarationIdentity(expression.text)
+            kind = this.findKind(expression.text)
+        }
+        if (identity != "") {
+            this.resolvedNames.append(
+                BootstrapResolvedName(
+                    this.currentSourceIdentity,
+                    expression.begin,
+                    expression.begin + expression.text.size,
+                    expression.text,
+                    identity,
+                    bootstrapNormalizeType(type),
+                    kind
+                )
+            )
+        }
+    }
+
     fun findStorageType(name: string): string {
         var result = "unknown"
         var localIndex = 0
@@ -3808,7 +3871,8 @@ class BootstrapAnalyzer(
                     symbol.kind,
                     type,
                     symbol.scope,
-                    symbol.borrowSource
+                    symbol.borrowSource,
+                    symbol.identity
                 )
             }
             index = index + 1
@@ -3886,6 +3950,19 @@ class BootstrapAnalyzer(
             if (this.locals[index].name == name &&
                 this.scopeIsVisible(this.locals[index].scope)) {
                 result = this.locals[index].kind
+            }
+            index = index + 1
+        }
+        result
+    }
+
+    fun visibleLocalIdentity(name: string): string {
+        var result = ""
+        var index = 0
+        while (index < this.locals.size) {
+            if (this.locals[index].name == name &&
+                this.scopeIsVisible(this.locals[index].scope)) {
+                result = this.locals[index].identity
             }
             index = index + 1
         }
@@ -4157,6 +4234,25 @@ class BootstrapAnalyzer(
             }
         }
         result
+    }
+
+    fun fieldDeclarationIdentity(owner: string, field: string): string {
+        var identity = ""
+        val declarationIndex = this.typeDeclarations.find(owner)
+        if (declarationIndex >= 0) {
+            val declaration = this.declarations[declarationIndex]
+            var fieldIndex = 0
+            while (fieldIndex < declaration.parameters.size) {
+                if (declaration.parameters[fieldIndex] == field &&
+                    fieldIndex < declaration.parameterKinds.size &&
+                    (declaration.parameterKinds[fieldIndex] == "val" ||
+                     declaration.parameterKinds[fieldIndex] == "var")) {
+                    identity = "abla:${declaration.sourceIdentity}:${declaration.begin}:field:$fieldIndex:$field"
+                }
+                fieldIndex = fieldIndex + 1
+            }
+        }
+        identity
     }
 
     fun fieldIsMutable(owner: string, field: string): bool {
@@ -5988,6 +6084,9 @@ class BootstrapAnalyzer(
                 this.nameIsDelegated(expression.text)) {
                 this.validateDelegatedRead(expression, expression.text)
             }
+            if (result != "unknown") {
+                this.recordResolvedName(expression, result)
+            }
         }
         if (expression.kind == "lambda" ||
             expression.kind == "lambda.move" ||
@@ -6026,7 +6125,8 @@ class BootstrapAnalyzer(
                         "parameter",
                         parameterType,
                         this.currentScope,
-                        ""
+                        "",
+                        "abla:${this.currentSourceIdentity}:${found.begin}:parameter:${found.text}"
                     ))
                 }
                 parameter = parameter + 1
@@ -6501,6 +6601,20 @@ class BootstrapAnalyzer(
                 }
                 result = result
             }
+            val identity = this.fieldDeclarationIdentity(
+                receiver, expression.text
+            )
+            if (identity != "") this.resolvedNames.append(
+                BootstrapResolvedName(
+                    this.currentSourceIdentity,
+                    expression.end - expression.text.size,
+                    expression.end,
+                    expression.text,
+                    identity,
+                    bootstrapNormalizeType(result),
+                    "field"
+                )
+            )
         }
         if (expression.kind == "index") {
             val rawReceiver = this.infer(expression.children[0])
@@ -7052,7 +7166,8 @@ class BootstrapAnalyzer(
                     kind,
                     type,
                     this.currentScope,
-                    ""
+                    "",
+                    "abla:${this.currentSourceIdentity}:${expression.begin}:local:${expression.text}"
                 ))
                 if (this.regionDepth > 0 &&
                     this.regionExpressionIsOwned(initializer.children[0])) {
@@ -7169,7 +7284,8 @@ class BootstrapAnalyzer(
                 kind,
                 type,
                 this.currentScope,
-                borrowSource
+                borrowSource,
+                "abla:${this.currentSourceIdentity}:${expression.begin}:local:${expression.text}"
             ))
             if (this.regionDepth > 0 && hasInitializer &&
                 this.regionExpressionIsOwned(expression.children[0])) {
@@ -7182,6 +7298,9 @@ class BootstrapAnalyzer(
             val delegated = this.nameIsDelegated(expression.text)
             val target = this.findType(expression.text)
             val value = this.infer(expression.children[0])
+            if (target != "unknown") {
+                this.recordResolvedName(expression, target)
+            }
             if (bootstrapIsBorrowType(value)) {
                 this.fail("ownership.borrow-store:assignment.${expression.text}")
             }
@@ -7410,7 +7529,8 @@ class BootstrapAnalyzer(
                 "val",
                 elementType,
                 this.currentScope,
-                ""
+                "",
+                "abla:${this.currentSourceIdentity}:${expression.begin}:for:${expression.text}"
             ))
             this.loopDepth = this.loopDepth + 1
             this.infer(expression.children[1])
@@ -7579,7 +7699,8 @@ class BootstrapAnalyzer(
                     declaration.kind,
                     type,
                     -1,
-                    ""
+                    "",
+                    "abla:${declaration.sourceIdentity}:${declaration.begin}:${declaration.name}"
                 ))
             }
             index = index + 1
@@ -7681,7 +7802,8 @@ class BootstrapAnalyzer(
                     declaration.kind,
                     type,
                     -1,
-                    ""
+                    "",
+                    "abla:${declaration.sourceIdentity}:${declaration.begin}:${declaration.name}"
                 ))
             }
             if (declaration.kind == "fun" ||
@@ -7921,6 +8043,7 @@ class BootstrapAnalyzer(
                         receiverKind,
                         bootstrapNormalizeType(declaration.extensionOwner),
                         0,
+                        "",
                         ""
                     ))
                 }
@@ -7954,7 +8077,8 @@ class BootstrapAnalyzer(
                         parameterKind,
                         parameterType,
                         0,
-                        ""
+                        "",
+                        "abla:${declaration.sourceIdentity}:${declaration.begin}:parameter:$parameter:${declaration.parameters[parameter]}"
                     ))
                     parameter = parameter + 1
                 }
@@ -8072,6 +8196,7 @@ class BootstrapAnalyzer(
                     receiverKind,
                     owner.name,
                     0,
+                    "",
                     ""
                 ))
                 var parameter = 0
@@ -8104,7 +8229,8 @@ class BootstrapAnalyzer(
                         parameterKind,
                         parameterType,
                         0,
-                        ""
+                        "",
+                        "abla:${method.sourceIdentity}:${method.begin}:parameter:$parameter:${method.parameters[parameter]}"
                     ))
                     parameter = parameter + 1
                 }
@@ -8203,6 +8329,7 @@ class BootstrapAnalyzer(
             this.mutableReceivers,
             this.compileEffects,
             this.typedCalls,
+            this.resolvedNames,
             this.managedAliasBegins,
             this.managedAliasEnds,
             this.managedAliasSources
@@ -8289,6 +8416,7 @@ fun bootstrapAnalyzeRequestedSourceSpans(
         typedRequestEnds,
         typedRequestKinds,
         typedRequestSources,
+        [],
         [],
         [],
         [],
