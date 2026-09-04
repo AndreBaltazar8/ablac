@@ -9,21 +9,24 @@ fun bootstrapLlvmXtensaInterruptEntrySymbol(name: string): string =
 fun bootstrapLlvmNativeFunctionAdapterSymbol(name: string): string =
     "${name}_native_adapter"
 
-// A sectioned scalar function is already a native ABI entry. Returning its
-// direct address preserves the requested placement and avoids a lazy-module
-// initialization thunk on interrupt, ROM, and secondary-core entry paths.
-// Managed values, bool's distinct foreign representation, and variadic direct
-// ABIs continue to use the adapter automatically.
+// A scalar function with no default-argument count already has the native ABI.
+// Sectioned hardware entries and closed freestanding programs can expose that
+// direct address without duplicating the body in a native adapter. Hosted
+// programs retain the adapter's lazy-module initialization boundary. Managed
+// values, bool's distinct foreign representation, and variadic direct ABIs
+// continue to use the adapter automatically.
 fun bootstrapLlvmNativeFunctionAddressUsesDirect(
-    function: BootstrapIrFunction
+    function: BootstrapIrFunction,
+    closedProgram: bool = false
 ): bool {
-    var exact = function.section != "" &&
+    var exact = (function.section != "" || closedProgram) &&
         !bootstrapLlvmDirectNeedsArgumentCount(function) &&
         (bootstrapLlvmDirectResultIsVoid(function) ||
          bootstrapLlvmDirectResultIsScalar(function)) &&
         function.resultType != "bool"
     var parameter = 0
-    while (exact && parameter < function.parameterTypes.size) {
+    val parameterCount = bootstrapLlvmDirectParameterCount(function)
+    while (exact && parameter < parameterCount) {
         exact = function.parameterTypes[parameter] != "bool" &&
             bootstrapLlvmScalarType(
                 function.parameterTypes[parameter]
@@ -35,8 +38,11 @@ fun bootstrapLlvmNativeFunctionAddressUsesDirect(
 
 fun bootstrapLlvmNativeFunctionAddressSymbol(
     function: BootstrapIrFunction,
-    symbol: string
-): string = if (bootstrapLlvmNativeFunctionAddressUsesDirect(function))
+    symbol: string,
+    closedProgram: bool = false
+): string = if (bootstrapLlvmNativeFunctionAddressUsesDirect(
+    function, closedProgram
+))
     bootstrapLlvmDirectFunctionSymbol(symbol)
 else bootstrapLlvmNativeFunctionAdapterSymbol(symbol)
 
@@ -92,6 +98,31 @@ fun bootstrapLlvmDirectNeedsArgumentCount(
     needed
 }
 
+// Direct bodies do not need trailing source parameters which their typed IR
+// never loads. Public exports, native callbacks, closures, and generic Abla
+// wrappers retain their declared signatures and forward only this live prefix.
+// Keeping an uninterrupted prefix preserves every native register position;
+// only surplus trailing arguments disappear.
+fun bootstrapLlvmDirectParameterCount(
+    function: BootstrapIrFunction
+): int {
+    if (bootstrapLlvmDirectNeedsArgumentCount(function)) {
+        return function.parameters.size
+    }
+    var count = 0
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        // parameter.load reads a value, while ownership operations such as
+        // place.root name the parameter directly. Resolve every textual IR
+        // target against the parameter table; unrelated names simply miss.
+        val parameter = bootstrapLlvmParameterId(function, candidate.text)
+        if (parameter + 1 > count) count = parameter + 1
+        instruction = instruction + 1
+    }
+    count
+}
+
 fun bootstrapLlvmDeclareDirectFunction(
     backend: BootstrapLlvmBackend,
     name: string,
@@ -108,7 +139,8 @@ fun bootstrapLlvmDeclareDirectFunction(
         parameters.append(backend.i64Type)
     }
     var parameter = 0
-    while (parameter < function.parameters.size) {
+    val parameterCount = bootstrapLlvmDirectParameterCount(function)
+    while (parameter < parameterCount) {
         val scalar = bootstrapLlvmDirectParameterScalarType(
             function, parameter
         )
@@ -242,6 +274,7 @@ fun bootstrapLlvmCreateFunctionStorage(
         index = index + 1
     }
     index = 0
+    val directParameterCount = bootstrapLlvmDirectParameterCount(function)
     while (index < function.instructions.size) {
         val instruction = function.instructions[index]
         var local: i64* = nullPointer
@@ -324,9 +357,8 @@ fun bootstrapLlvmCreateFunctionStorage(
                 backend.builder, backend.valueType, "parameter"
             )
             LLVMSetAlignment(slot, 8)
-        } else if (bootstrapLlvmDirectParameterScalarType(
-            function, index
-        ) == "") {
+        } else if (index < directParameterCount &&
+            bootstrapLlvmDirectParameterScalarType(function, index) == "") {
             // Required arguments are guaranteed by semantic analysis. Keep
             // their incoming AblaValue pointer directly instead of copying a
             // 24-byte value through a second stack slot in every call.
@@ -408,7 +440,8 @@ fun bootstrapLlvmInitializeParameters(
         backend.i64Type, function.parameters.size, 0
     )
     var parameter = 0
-    while (parameter < function.parameters.size) {
+    val parameterCount = bootstrapLlvmDirectParameterCount(function)
+    while (parameter < parameterCount) {
         val hasDefault = bootstrapLlvmParameterHasDefault(
             function, function.parameters[parameter]
         )
@@ -753,7 +786,8 @@ fun bootstrapLlvmDirectCallArguments(
         ))
     }
     var parameter = 0
-    while (parameter < function.parameters.size) {
+    val parameterCount = bootstrapLlvmDirectParameterCount(function)
+    while (parameter < parameterCount) {
         val scalar = bootstrapLlvmDirectParameterScalarType(
             function, parameter
         )
@@ -6187,7 +6221,10 @@ fun bootstrapLlvmEmitFunction(
                 val addressFunction = LLVMGetNamedFunction(
                     backend.module,
                     bootstrapLlvmNativeFunctionAddressSymbol(
-                        program.functions[found], identities.symbols[found]
+                        program.functions[found], identities.symbols[found],
+                        bootstrapLlvmTargetHasClosedProgramBoundary(
+                            backend.targetTriple
+                        )
                     )
                 )
                 if (pointerIsNull(addressFunction)) supported = false
