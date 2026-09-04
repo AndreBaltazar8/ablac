@@ -407,6 +407,80 @@ fun bootstrapModuleInterfaceIdentity(
     identity
 }
 
+// Import discovery needs declaration interfaces, compile-time definitions,
+// defaults, annotations, and class member signatures. It does not need to
+// retain ordinary runtime function bodies: staged parsing reads each module
+// again with the complete visible declaration set before semantic analysis.
+// Keeping those bodies in every module snapshot duplicates the dominant AST
+// payload for large source-only frameworks such as abla-embedded.
+fun bootstrapModuleDiscoveryDeclaration(
+    declaration: BootstrapDeclaration
+): BootstrapDeclaration {
+    val methods: array<BootstrapDeclaration> = []
+    var method = 0
+    while (method < declaration.methods.size) {
+        methods.append(bootstrapModuleDiscoveryDeclaration(
+            declaration.methods[method]
+        ))
+        method = method + 1
+    }
+    val expression = if (declaration.kind == "fun")
+        BootstrapExpression(
+            "missing", "", declaration.begin, declaration.begin, []
+        )
+    else declaration.expression
+    return BootstrapDeclaration(
+        declaration.kind,
+        declaration.name,
+        declaration.begin,
+        declaration.end,
+        expression,
+        declaration.parameters,
+        declaration.parameterTypes,
+        declaration.resultType,
+        methods,
+        declaration.parameterDefaults,
+        declaration.externalLibrary,
+        declaration.parameterKinds,
+        declaration.extensionOwner,
+        declaration.isTrusted,
+        declaration.isResource,
+        declaration.isNoEscape,
+        declaration.generatedNamespace,
+        declaration.generatedOriginBegin,
+        declaration.generatedOriginEnd,
+        declaration.annotations,
+        declaration.annotationArguments,
+        declaration.annotationBegins,
+        declaration.annotationEnds,
+        declaration.sourceIdentity
+    )
+}
+
+fun bootstrapModuleDiscovery(
+    source: string,
+    sourceIdentity: string
+): BootstrapParseResult {
+    val parsed = bootstrapParseWithIdentity(source, sourceIdentity)
+    val declarations: array<BootstrapDeclaration> = []
+    var declaration = 0
+    while (declaration < parsed.declarations.size) {
+        declarations.append(bootstrapModuleDiscoveryDeclaration(
+            parsed.declarations[declaration]
+        ))
+        declaration = declaration + 1
+    }
+    return BootstrapParseResult(
+        declarations,
+        parsed.actions,
+        parsed.errors,
+        parsed.extensionErrors,
+        parsed.compileInputPaths,
+        parsed.compileInputContents,
+        parsed.diagnostics
+    )
+}
+
 // A snapshot is the reusable, module-local part of graph loading. Keeping the
 // source and import scan together is important: publishing a new source with
 // stale dependency edges would make incremental invalidation unsound.
@@ -573,6 +647,38 @@ class BootstrapNamedArgumentNormalizer(
             index = index + 1
         }
         result
+    }
+
+    fun requiresNormalization(expression: BootstrapExpression): bool {
+        var required = false
+        var child = 0
+        while (!required && child < expression.children.size) {
+            required = this.requiresNormalization(
+                expression.children[child]
+            )
+            child = child + 1
+        }
+        var hasNamed = false
+        child = 0
+        while ((expression.kind == "call" ||
+                expression.kind == "member.call") &&
+               child < expression.children.size) {
+            if (expression.children[child].kind == "named.argument") {
+                hasNamed = true
+            }
+            child = child + 1
+        }
+        if (hasNamed) required = true
+        if (!required && expression.kind == "call") {
+            val selectedTarget = this.target(expression.text)
+            if (selectedTarget >= 0 &&
+                this.declarations[selectedTarget].kind == "class" &&
+                expression.children.size <
+                    this.declarations[selectedTarget].parameters.size) {
+                required = true
+            }
+        }
+        required
     }
 
     fun replaceParameterReferences(
@@ -841,6 +947,31 @@ fun bootstrapNormalizeNamedDeclaration(
     )
 }
 
+fun bootstrapDeclarationRequiresNamedNormalization(
+    normalizer: BootstrapNamedArgumentNormalizer,
+    declaration: BootstrapDeclaration
+): bool {
+    var required = normalizer.requiresNormalization(
+        declaration.expression
+    )
+    var defaultIndex = 0
+    while (!required &&
+           defaultIndex < declaration.parameterDefaults.size) {
+        required = normalizer.requiresNormalization(
+            declaration.parameterDefaults[defaultIndex]
+        )
+        defaultIndex = defaultIndex + 1
+    }
+    var method = 0
+    while (!required && method < declaration.methods.size) {
+        required = bootstrapDeclarationRequiresNamedNormalization(
+            normalizer, declaration.methods[method]
+        )
+        method = method + 1
+    }
+    required
+}
+
 fun bootstrapNormalizeNamedArguments(
     parsed: BootstrapParseResult
 ): BootstrapParseResult {
@@ -853,15 +984,23 @@ fun bootstrapNormalizeNamedArguments(
     val declarations: array<BootstrapDeclaration> = []
     var declaration = 0
     while (declaration < parsed.declarations.size) {
-        declarations.append(bootstrapNormalizeNamedDeclaration(
-            normalizer, parsed.declarations[declaration]
-        ))
+        val candidate = parsed.declarations[declaration]
+        if (bootstrapDeclarationRequiresNamedNormalization(
+            normalizer, candidate
+        )) {
+            declarations.append(bootstrapNormalizeNamedDeclaration(
+                normalizer, candidate
+            ))
+        } else declarations.append(candidate)
         declaration = declaration + 1
     }
     val actions: array<BootstrapExpression> = []
     var action = 0
     while (action < parsed.actions.size) {
-        actions.append(normalizer.normalize(parsed.actions[action]))
+        val candidate = parsed.actions[action]
+        if (normalizer.requiresNormalization(candidate)) {
+            actions.append(normalizer.normalize(candidate))
+        } else actions.append(candidate)
         action = action + 1
     }
     BootstrapParseResult(
@@ -997,7 +1136,7 @@ class BootstrapModuleState(
                 bootstrapModuleFingerprint(
                     source, 97, 263, 1000000009
                 ),
-                bootstrapParseWithIdentity(source, modulePath)
+                bootstrapModuleDiscovery(source, modulePath)
             )
             if (existing >= 0) {
                 this.snapshots[existing] = result
@@ -1778,8 +1917,12 @@ fun bootstrapPrepareModuleSnapshot(
     aliases: array<BootstrapModuleAlias>
 ): BootstrapModuleSnapshot {
     val source = bootstrapRewriteModuleSource(snapshot, aliases)
-    var discovery = bootstrapParseWithIdentity(source, snapshot.path)
     val contractOnly = bootstrapModuleIsContractTarget(aliases, snapshot.path)
+    // The common unaliased module needs no rewritten-source snapshot. Reuse
+    // its already compact discovery record instead of parsing and retaining a
+    // second interface AST for the duration of the build.
+    if (!contractOnly && source == snapshot.source) return snapshot
+    var discovery = bootstrapModuleDiscovery(source, snapshot.path)
     if (contractOnly) {
         discovery = bootstrapProjectContract(discovery, snapshot.path)
     }
@@ -2349,6 +2492,27 @@ class BootstrapModuleGraph(
                 declarations.append(parsed.declarations[declarationIndex])
                 handlerDeclarations.append(parsed.declarations[declarationIndex])
                 declarationIndex = declarationIndex + 1
+            }
+            // Later modules may inspect imported function bodies through typed
+            // reflection. Replace discovery placeholders with the declarations
+            // already parsed here, preserving the discovery slots used by the
+            // staged parser even when expansion inserts generated declarations.
+            var discovered = 0
+            while (discovered < snapshot.discovery.declarations.size) {
+                val original = snapshot.discovery.declarations[discovered]
+                var resolved = 0
+                var found = false
+                while (!found && resolved < parsed.declarations.size) {
+                    val candidate = parsed.declarations[resolved]
+                    if (candidate.name == original.name &&
+                        candidate.kind == original.kind) {
+                        completeDeclarations[currentDeclarationBegin +
+                            discovered] = candidate
+                        found = true
+                    }
+                    resolved = resolved + 1
+                }
+                discovered = discovered + 1
             }
             var actionIndex = 0
             while (actionIndex < parsed.actions.size) {
