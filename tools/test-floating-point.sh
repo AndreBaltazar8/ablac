@@ -15,6 +15,15 @@ floating_status=$?
 set -e
 test "$floating_status" -eq 42
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/floating-math.ab" \
+    -o "$output_root/floating-math" --no-cache
+set +e
+"$output_root/floating-math"
+math_status=$?
+set -e
+test "$math_status" -eq 42
+
 "$compiler" build --project \
     "$project_root/tests/cases/floating-native" \
     -o "$output_root/floating-native" --no-cache

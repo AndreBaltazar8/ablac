@@ -1578,6 +1578,15 @@ fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "ablaConvertI32ToF32" ||
     name == "ablaConvertF32ToU32" ||
     name == "ablaConvertF32ToI32" ||
+    name == "ablaConvertF64ToF32" ||
+    name == "ablaConvertF32ToF64" ||
+    name == "ablaConvertF64ToI64" ||
+    name == "ablaF64Sqrt" ||
+    name == "ablaF64Floor" ||
+    name == "ablaF64Ceil" ||
+    name == "ablaF64Trunc" ||
+    name == "ablaF64Abs" ||
+    name == "ablaF64RoundEven" ||
     name == "ablaHostIsMacOS" ||
     name == "ablaHostValueArgumentsIndirect" ||
     name == "ablaLinuxArgumentCount" ||
@@ -2751,6 +2760,87 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 ) else LLVMBuildFPToSI(
                     backend.builder, value, backend.i32Type,
                     "convert.f32.to.i32"
+                )
+            )
+        }
+    }
+    // Float width conversions and the IEEE-exact f64 operations. sqrt and the
+    // rounding family are correctly rounded by IEEE 754, so they lower to the
+    // LLVM intrinsics (single instructions on x86-64, AArch64, and Wasm) and stay
+    // bit-identical across native and Wasm builds.
+    if (name == "ablaConvertF64ToF32") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.operands[0], "f64"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildFPTrunc(
+                    backend.builder, value, backend.f32Type,
+                    "convert.f64.to.f32"
+                )
+            )
+        }
+    }
+    if (name == "ablaConvertF32ToF64") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.operands[0], "f32"
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildFPExt(
+                    backend.builder, value, backend.f64Type,
+                    "convert.f32.to.f64"
+                )
+            )
+        }
+    }
+    if (name == "ablaConvertF64ToI64") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.operands[0], "f64"
+            )
+            // fptosi is poison out of range; saturate like Wasm's
+            // i64.trunc_sat so every target agrees on NaN (0) and overflow.
+            val intrinsic = bootstrapLlvmDeclare(
+                backend, "llvm.fptosi.sat.i64.f64", backend.i64Type,
+                [backend.f64Type], false, [false]
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                bootstrapLlvmCall(
+                    backend, intrinsic, [value], "convert.f64.to.i64",
+                    false, [false]
+                )
+            )
+        }
+    }
+    if (name == "ablaF64Sqrt" || name == "ablaF64Floor" ||
+        name == "ablaF64Ceil" || name == "ablaF64Trunc" ||
+        name == "ablaF64Abs" || name == "ablaF64RoundEven") {
+        if (instruction.operands.size != 1) supported = false
+        if (instruction.operands.size == 1) {
+            val value = bootstrapLlvmScalarOperand(
+                backend, storage, instruction.operands[0], "f64"
+            )
+            val symbol = if (name == "ablaF64Sqrt") "llvm.sqrt.f64"
+                else if (name == "ablaF64Floor") "llvm.floor.f64"
+                else if (name == "ablaF64Ceil") "llvm.ceil.f64"
+                else if (name == "ablaF64Trunc") "llvm.trunc.f64"
+                else if (name == "ablaF64Abs") "llvm.fabs.f64"
+                else "llvm.roundeven.f64"
+            val intrinsic = bootstrapLlvmDeclare(
+                backend, symbol, backend.f64Type,
+                [backend.f64Type], false, [false]
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                bootstrapLlvmCall(
+                    backend, intrinsic, [value], "f64.unary", false, [false]
                 )
             )
         }
@@ -6094,7 +6184,11 @@ fun bootstrapLlvmEmitFunction(
                     val scalarType = storage.localTypes[local]
                     LLVMBuildStore(
                         backend.builder,
-                        LLVMConstInt(backend.type(scalarType), 0, 0),
+                        if (scalarType == "f64" || scalarType == "f32") {
+                            LLVMConstRealOfStringAndSize(
+                                backend.type(scalarType), "0.0", 3
+                            )
+                        } else LLVMConstInt(backend.type(scalarType), 0, 0),
                         storage.nativeLocals[local]
                     )
                 } else if (bootstrapIrIsLocalZero(instruction.opcode)) {

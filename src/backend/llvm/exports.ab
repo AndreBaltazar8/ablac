@@ -747,6 +747,18 @@ fun bootstrapLlvmReachableExports(
                     }
                 }
             }
+            // A resource.drop invokes the type's generated drop helper (not
+            // a `call`), so closed-boundary modules (bare Wasm) must keep it
+            // reachable or the helper becomes an unresolved import.
+            if (instruction.opcode == "resource.drop") {
+                val drop = functionIndex.find(
+                    bootstrapDropFunctionName(instruction.text)
+                )
+                if (drop >= 0 && !reachableFunctions[drop]) {
+                    reachableFunctions[drop] = true
+                    pending.append(drop)
+                }
+            }
             if (instruction.opcode == "call.indirect" ||
                 instruction.opcode == "call.indirect.once") {
                 var target = 0
@@ -1196,6 +1208,64 @@ fun bootstrapLlvmReturnExportValue(
     if (false) LLVMDisposeMessage(nativeNullPointer())
 }
 
+// A Wasm module has no `main` to publish its globals as collector roots, so
+// its lazy export initializer does it once globals exist: a static frame whose
+// constant array points at every non-scalar global. The frame is never popped;
+// the Wasm runtime unlinks outer frames from beneath it when they pop.
+fun bootstrapLlvmEmitWasmGlobalRoots(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram
+): void {
+    val globalIndex = bootstrapLlvmGlobalIndex(program)
+    val roots: array<i64*> = []
+    var global = 0
+    while (global < globalIndex.names.size) {
+        if (bootstrapLlvmGlobalScalarType(
+            program, globalIndex.names[global]
+        ) == "") {
+            val symbol = LLVMGetNamedGlobal(
+                backend.module,
+                bootstrapLlvmGlobalSymbol(globalIndex.names[global])
+            )
+            if (!pointerIsNull(symbol)) roots.append(symbol)
+        }
+        global = global + 1
+    }
+    if (roots.size > 0) {
+        val values = llvmPointerVector(roots.size)
+        var root = 0
+        while (root < roots.size) {
+            values.set(root, roots[root])
+            root = root + 1
+        }
+        val rootsType = LLVMArrayType2(backend.pointerType, roots.size)
+        val rootsGlobal = LLVMAddGlobal(
+            backend.module, rootsType, "abla.wasm.global.gc.roots"
+        )
+        LLVMSetInitializer(rootsGlobal, LLVMConstArray2(
+            backend.pointerType, values.pointer(), roots.size
+        ))
+        values.drop()
+        LLVMSetLinkage(rootsGlobal, llvmInternalLinkage())
+        val frame = LLVMAddGlobal(
+            backend.module, backend.rootFrameType, "abla.wasm.global.gc.frame"
+        )
+        LLVMSetInitializer(frame, LLVMConstNull(backend.rootFrameType))
+        LLVMSetLinkage(frame, llvmInternalLinkage())
+        val push = bootstrapLlvmDeclare(
+            backend, "abla_runtime_roots_push", backend.voidType,
+            [backend.pointerType, backend.pointerType, backend.i64Type],
+            false, [false, false, false]
+        )
+        bootstrapLlvmCall(
+            backend, push,
+            [frame, rootsGlobal,
+             LLVMConstInt(backend.i64Type, roots.size, 0)],
+            "", false, [false, false, false]
+        )
+    }
+}
+
 fun bootstrapLlvmEmitExportInitializer(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -1244,6 +1314,9 @@ fun bootstrapLlvmEmitExportInitializer(
              LLVMConstInt(backend.i64Type, 0, 0)],
             "", true, [false, false, false]
         )
+        if (bootstrapTextContains(backend.targetTriple, "wasm32")) {
+            bootstrapLlvmEmitWasmGlobalRoots(backend, program)
+        }
         LLVMBuildBr(backend.builder, done)
         LLVMPositionBuilderAtEnd(backend.builder, done)
         LLVMBuildRetVoid(backend.builder)

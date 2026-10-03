@@ -10,7 +10,7 @@ OUTPUT ?= $(BUILD_DIR)/program
 
 .DEFAULT_GOAL := all
 
-.PHONY: all bootstrap ablac self-rebuild test check compile benchmark \
+.PHONY: all bootstrap ablac ablac-dev self-rebuild test check compile benchmark \
 	benchmark-network clean prepare-test-driver
 
 all: ablac
@@ -40,6 +40,13 @@ bootstrap: | $(BUILD_DIR)
 	ln -sfn ../tools/run-limited-compiler.sh $(COMPILER)
 
 ablac: $(COMPILER)
+
+# Compiler-development loop: rebuild the current sources with --fast (skips the
+# whole-module O2 pipeline, ~20s instead of ~3min). The result compiles programs
+# several times slower than the release compiler, so ship with `make ablac`.
+ablac-dev: $(COMPILER)
+	ABLA_SYSROOT=$(CURDIR) $(COMPILER_PAYLOAD) build $(COMPILER_ENTRY) \
+		-o $(BUILD_DIR)/ablac-dev --no-cache --fast
 
 self-rebuild: ablac
 	tools/test-pure-self-rebuild.sh $(COMPILER_PAYLOAD)
