@@ -118,6 +118,79 @@ pong, and close frames while enforcing per-message and pending-output ceilings.
 Partial writes remain queued and readable interest is restored only after the
 backlog drains.
 
+### Connection-oriented server
+
+`abla/websocket/server` is the multiplexed host for real-time services such as
+authoritative game servers. Instead of mapping each message to a reply, it
+assigns every connection a stable, never-reused integer id and surfaces
+`request`, `open`, `message`, `close`, and plain `http` events through a queue.
+`step(timeoutMilliseconds)` performs one bounded poll (accepts, reads,
+heartbeat and deadline sweep, flush), so a fixed-step simulation interleaves
+it with ticks and sends, broadcasts, or closes whenever it likes:
+
+```abla
+import "abla/websocket/server"
+
+val server = webSocketServer(
+    ipv4Any(9001), WebSocketServerOptions(manualAdmission = true)
+)
+server.enableGracefulShutdown()
+while (!server.shutdownRequested()) {
+    server.step(millisecondsUntilNextTick())
+    val events = server.takeEvents()
+    var index = 0
+    while (index < events.size) {
+        val event = events[index]
+        if (event.isRequest()) {
+            if (tokenValid(event.query("at"))) server.accept(event.id)
+            else server.reject(event.id, 401, "auth failed")
+        } else if (event.isMessage()) handleInput(event.id, event.payload)
+        else if (event.isClose()) removePlayer(event.id)
+        else if (event.isHttp()) server.respond(event.id, httpJson(stats()))
+        index = index + 1
+    }
+    runDueTicks(server) // sendBinary/broadcastEncoded snapshots
+    server.flush()
+}
+server.drain()
+```
+
+Manual admission keeps an upgrade pending until `accept` or `reject`, which
+may happen on a later step after asynchronous verification. Each id that was
+surfaced receives exactly one close event, whichever side or timer ended it.
+Outbound frames are corked per connection and written with one vectored
+syscall by `flush` (and every `step`); `webSocketServerEncode` frames a shared
+payload once for `broadcastEncoded`. The server answers pings and close
+frames, pings quiet peers every `pingIntervalMilliseconds`, closes them after
+`idleTimeoutMilliseconds`, terminates a peer whose send backlog exceeds
+`maximumPendingBytes` (close code 1013), sets `TCP_NODELAY`, and sheds new
+connections beyond `maximumConnections`. Descriptor and id lookups are O(1).
+It runs on Linux epoll and on macOS through the Darwin kqueue adapter.
+
+`tests/benchmarks/websocket-server-load.ab` with
+`tools/websocket-load-client.ts` (Bun) measures a 20 Hz broadcast. On an Apple
+Silicon laptop over loopback, 1000 sockets receiving a 1 KiB snapshot per tick
+(20,000 frames and about 20 MiB per second) while sending 20,000 input
+messages per second cost about 3.7 ms per tick for broadcast and flush and
+kept the event loop about 8% busy.
+
+### JSON Web Tokens
+
+`abla/jwt` verifies compact JWS tokens signed with RS256 or ES256 against a
+JSON Web Key Set. Keys are imported once from their JWK parameters; encoding,
+key selection by `kid`, and `exp`/`nbf`/`iss`/`aud`/`sub` checks are Abla, and
+only the signature primitive uses OpenSSL libcrypto. `abla/jwt/remote` fetches
+a JWKS over HTTPS, caches it for a day, and refetches at most once per
+cooldown when a token names an unknown key:
+
+```abla
+import "abla/jwt/remote"
+
+val jwks = jwksCache("https://auth.example.com/.well-known/jwks.json")
+val result = jwks.verify(token, JwtOptions(issuer = "Example"))
+if (result.valid) admit(result.subject) else refuse(result.error)
+```
+
 ## DNS and TLS
 
 `abla/dns` encodes bounded A/AAAA queries and parses compressed response names

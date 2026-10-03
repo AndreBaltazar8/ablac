@@ -1,0 +1,64 @@
+import "abla/io"
+import "abla/jwt/remote"
+import "abla/websocket/server"
+
+// The JWKS endpoint is served by this process (abla/websocket/server answers
+// plain HTTP); the cache runs in a forked child because its fetch blocks.
+val remoteTestKeys = "{\"keys\":[{\"kty\":\"RSA\",\"n\":\"m_rnVgF9pSE1UCrJEQwWupUur65twAz5IvMFrzlDZDPETiMntDVQXY9f35xDhj4Cip2kqV0MSx7-tumgKd-RaFAxH0YAl600_OfDu0Y-PaH3cZHQ1eAg-m8DfoBfFARs7XP7OikVt8UAPQdHrQ7PasE6qrLs2cqyx7Bhp5eSW-dAuiS4m0lsMc9Wj5gY7neRmofZB3trZtqGv1CsTBJvp75Exq9wGeWmLTZw6jJSGIY0etiZdnVJSf6QRLXIqLn2EUgcIx1RL9fmg34wgL8UDKhFej2nbSlA3ueRQj8OMpT-NMpi93qk_tw78hJMXteSv51rkDlcCApPwfliOCeG5w\",\"e\":\"AQAB\",\"kid\":\"rsa-1\",\"alg\":\"RS256\",\"use\":\"sig\"},{\"kty\":\"EC\",\"x\":\"m8w8ainreQcAWItPCTE7beCaMJ9kivm_WhG3h3Qk6io\",\"y\":\"3ndvwZTS_BTo8MTCPShOmqH6racp5g_j7FgZK9uxhTQ\",\"crv\":\"P-256\",\"kid\":\"ec-1\",\"alg\":\"ES256\"},{\"kty\":\"oct\",\"k\":\"AAAA\",\"kid\":\"hmac\"}]}"
+val remoteTestToken = "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0xIiwidHlwIjoiSldUIn0.eyJzdWIiOiJwbGF5ZXItNDIiLCJpc3MiOiJFeGFtcGxlIiwiYXVkIjpbImFwcCIsIm90aGVyIl0sImV4cCI6MTkwMDAwMDYwMCwiaWF0IjoxODk5OTk5OTkwLCJleHRyYSI6eyJwbGF0Zm9ybSI6IndlYiJ9fQ.HN0X6CAZFhd4l0z8sFFiurNcxmkmdCjdnW2G5EFQDxA3PcPg-DcjarMMoIigjR0lnj-K5n20Eo_UbmrPQUtgK8ARPi1zHMbpk3UsTQ-m7wV3FkrYjF9E-Qs4bkaUbEDANbx52EJLBoKF1CyLSk-Bi6GmzSNcsZf5bbQ-9-moMMFSc2-E8lMBDa95I70LUQkcm7oVuSS3-RSFcmMNB1z06VTRIP_6-vAQl7GXJo1EqaFM9kGdYWT4e3-ZsDFfi-xC_-tVzrOPECe46olk6xpikKr3c01ZElXfcx8Z9Z2aftUyC0mt3Mjb5fem9Mt-vk2B_j0HX9qKzQf8ndq0eAecUg"
+val remoteTestUnknownKid = "eyJhbGciOiJSUzI1NiIsImtpZCI6InJzYS0yIn0.eyJzdWIiOiJwbGF5ZXItNDIiLCJpc3MiOiJFeGFtcGxlIiwiYXVkIjpbImFwcCIsIm90aGVyIl0sImV4cCI6MTkwMDAwMDYwMCwiaWF0IjoxODk5OTk5OTkwLCJleHRyYSI6eyJwbGF0Zm9ybSI6IndlYiJ9fQ.h2l5ZtAZg7XbFarXBUN2c65JGPIkq_lxLKo7xClWJbQgSMkidfu-9WHdS06Bul9xJra6jV856Zx4LPBckFBVjSATzS7d3-o6VkVS0_53bxTUqyAxAexnX7ncpweACz_vUYBQBVRK_IfRAKZjn_MGFExL6O3LjB6LSTQlXWpAQFPCUOIgffI00SqrZ0Vtc9Pvq6rWPDxxm4Puaplq6romfzTC5jhtoCZRacp6ZMx0CH-paE4YZu50Bs5CN9R6vbgaVhSdiHyexEn7XIFvqpVvPhzba_4YmkNNSZoWjFDnXpxcnHHBF53eWsnv16GOT_gKcV7Tv3xebIed_LqAx6Ntog"
+
+fun remoteTestClient(port: int): int {
+    val options = JwtOptions(issuer = "Example", nowSeconds = 1900000000)
+    val cache = jwksCache("http://127.0.0.1:$port/v1/jwks/public/jwks.json", 86400, 0, 2000)
+    if (cache.keyCount() != 2 || cache.lastError != "") return 2
+    val first = cache.verify(remoteTestToken, options)
+    if (!first.valid || first.subject != "player-42") return 3
+    // Unknown kid: a rotation refetch when the cooldown allows it ...
+    val unknown = cache.verify(remoteTestUnknownKid, options)
+    if (unknown.valid || unknown.error != "no matching key" || cache.fetches != 2) return 4
+    // ... and none within the cooldown after a fetch.
+    val cooled = jwksCache("http://127.0.0.1:$port/v1/jwks/public/jwks.json", 86400, 30, 2000)
+    cooled.verify(remoteTestUnknownKid, options)
+    if (cooled.fetches != 1) return 5
+    val missing = jwksCache("http://127.0.0.1:$port/missing", 86400, 30, 2000)
+    if (missing.keyCount() != 0 || missing.lastError != "JWKS request returned 404") return 6
+    if (!jwksCacheFromDocument(remoteTestKeys).verify(remoteTestToken, options).valid) return 7
+    if (jwksParseLocation("https://example.com:8443/a/b").port != 8443) return 8
+    0
+}
+
+fun main: int {
+    val server = webSocketServer(ipv4Loopback(0))
+    val port = server.localPort()
+    val process = linuxSyscall0(57)
+    if (process == 0) linuxSyscall1(60, remoteTestClient(port))
+    var requests = 0
+    var status = -1
+    var loops = 0
+    while (status < 0 && loops < 3000) {
+        server.step(5)
+        val events = server.takeEvents()
+        var index = 0
+        while (index < events.size) {
+            val event = events[index]
+            if (event.isHttp()) {
+                requests = requests + 1
+                if (event.path() == "/v1/jwks/public/jwks.json") {
+                    server.respond(event.id, httpJson(remoteTestKeys))
+                } else server.respond(event.id, httpText("missing", 404))
+            }
+            index = index + 1
+        }
+        val waited = linuxWaitProcess(process, true)
+        if (waited.output != "pending") status = waited.status
+        loops = loops + 1
+    }
+    server.step(5)
+    server.drain()
+    if (status == 0 && requests == 4) 42
+    else {
+        println("status=$status requests=$requests")
+        1
+    }
+}

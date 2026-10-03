@@ -1,0 +1,443 @@
+// JSON Web Token (JWS compact) verification against a JSON Web Key Set.
+//
+// Supports RS256 (RSASSA-PKCS1-v1_5 with SHA-256) and ES256 (ECDSA P-256
+// with SHA-256). Keys are imported once from their JWK parameters (n/e or
+// crv/x/y) into OpenSSL public keys; parsing, key encoding, and claim checks
+// are Abla, and only the signature primitive is delegated to libcrypto.
+//
+//     val keys = jwtKeySet(jwksJson)            // e.g. fetched by abla/jwt/remote
+//     val result = keys.verify(token, JwtOptions(issuer = "Example"))
+//     if (result.valid) admit(result.subject) else reject(result.error)
+//
+// Claim checks follow the JOSE reference behavior: `exp` must be later than
+// now minus the clock tolerance, `nbf` must not be later than now plus the
+// tolerance, `iss`/`aud` must match when configured, and the token's `alg`
+// must match the selected key (the "none" algorithm is never accepted).
+
+import "libcrypto.ab"
+import "abla/crypto"
+import "abla/json"
+import "abla/net"
+
+class JwtKey(
+    val kid: string,
+    val kty: string,
+    val alg: string,
+    val handle: int
+)
+
+// Owns the imported OpenSSL keys; they are freed when the set is dropped.
+resource class JwtKeySet(val keys: array<JwtKey>, val error: string) {
+    trusted fun drop(): void {
+        var index = 0
+        while (index < this.keys.size) {
+            if (this.keys[index].handle != 0) {
+                EVP_PKEY_free(nativePointerFromAddress(this.keys[index].handle))
+            }
+            index = index + 1
+        }
+        return
+    }
+}
+
+class JwtOptions(
+    val issuer: string = "",
+    val audience: string = "",
+    val clockToleranceSeconds: int = 0,
+    val requireSubject: bool = true,
+    // Seconds since the Unix epoch; a negative value reads the system clock.
+    val nowSeconds: int = -1
+)
+
+class JwtVerification(
+    val valid: bool,
+    val error: string,
+    val subject: string,
+    val kid: string,
+    val header: Json,
+    val claims: Json
+)
+
+class JwtBase64(val bytes: string, val valid: bool)
+
+// ---------------------------------------------------------------------------
+// Encoding helpers
+
+fun jwtBase64UrlDigit(byte: int): int {
+    if (byte >= 65 && byte <= 90) byte - 65
+    else if (byte >= 97 && byte <= 122) byte - 71
+    else if (byte >= 48 && byte <= 57) byte + 4
+    else if (byte == 45) 62
+    else if (byte == 95) 63
+    else -1
+}
+
+// Unpadded base64url (RFC 7515 section 2); trailing '=' padding is tolerated.
+fun jwtBase64UrlDecode(text: string): JwtBase64 {
+    var end = text.size
+    while (end > 0 && text[end - 1] == 61) end = end - 1
+    var valid = end - end / 4 * 4 != 1
+    val output = byteBuffer()
+    var accumulator = 0
+    var bits = 0
+    var index = 0
+    while (valid && index < end) {
+        val digit = jwtBase64UrlDigit(text[index])
+        if (digit < 0) valid = false
+        else {
+            accumulator = ((accumulator << 6) | digit) & 16777215
+            bits = bits + 6
+            if (bits >= 8) {
+                bits = bits - 8
+                output.appendByteValue((accumulator >>> bits) & 255)
+            }
+        }
+        index = index + 1
+    }
+    if (valid) JwtBase64(output.toText(), true) else JwtBase64("", false)
+}
+
+fun jwtBase64UrlEncode(bytes: string): string {
+    val alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    val output = byteBuffer()
+    var index = 0
+    while (index + 3 <= bytes.size) {
+        val value = (bytes[index] << 16) | (bytes[index + 1] << 8) |
+            bytes[index + 2]
+        output.appendByteValue(alphabet[(value >>> 18) & 63])
+        output.appendByteValue(alphabet[(value >>> 12) & 63])
+        output.appendByteValue(alphabet[(value >>> 6) & 63])
+        output.appendByteValue(alphabet[value & 63])
+        index = index + 3
+    }
+    val remaining = bytes.size - index
+    if (remaining == 1) {
+        val value = bytes[index] << 16
+        output.appendByteValue(alphabet[(value >>> 18) & 63])
+        output.appendByteValue(alphabet[(value >>> 12) & 63])
+    } else if (remaining == 2) {
+        val value = (bytes[index] << 16) | (bytes[index + 1] << 8)
+        output.appendByteValue(alphabet[(value >>> 18) & 63])
+        output.appendByteValue(alphabet[(value >>> 12) & 63])
+        output.appendByteValue(alphabet[(value >>> 6) & 63])
+    }
+    output.toText()
+}
+
+fun jwtDerLength(length: int): string {
+    val output = byteBuffer()
+    if (length < 128) output.appendByteValue(length)
+    else if (length < 256) {
+        output.appendByteValue(129)
+        output.appendByteValue(length)
+    } else {
+        output.appendByteValue(130)
+        output.appendByteValue((length >>> 8) & 255)
+        output.appendByteValue(length & 255)
+    }
+    output.toText()
+}
+
+fun jwtDer(tag: int, contents: string): string =
+    "${byteEncode(tag)}${jwtDerLength(contents.size)}$contents"
+
+// Unsigned big-endian magnitude as a DER INTEGER.
+fun jwtDerUnsignedInteger(magnitude: string): string {
+    var begin = 0
+    while (begin + 1 < magnitude.size && magnitude[begin] == 0) begin = begin + 1
+    var digits = magnitude.slice(begin, magnitude.size)
+    if (digits.size == 0) digits = byteEncode(0)
+    if (digits[0] >= 128) digits = "${byteEncode(0)}$digits"
+    jwtDer(2, digits)
+}
+
+// SubjectPublicKeyInfo for an RSA public key (rsaEncryption, NULL params).
+fun jwtRsaSubjectPublicKeyInfo(modulus: string, exponent: string): string {
+    val algorithm = jwtDer(
+        48, "${jwtDer(6, "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01")}\x05\x00"
+    )
+    val key = jwtDer(
+        48,
+        "${jwtDerUnsignedInteger(modulus)}${jwtDerUnsignedInteger(exponent)}"
+    )
+    jwtDer(48, "$algorithm${jwtDer(3, "${byteEncode(0)}$key")}")
+}
+
+// SubjectPublicKeyInfo for an uncompressed P-256 point.
+fun jwtEcSubjectPublicKeyInfo(x: string, y: string): string {
+    val algorithm = jwtDer(
+        48,
+        "${jwtDer(6, "\x2a\x86\x48\xce\x3d\x02\x01")}${jwtDer(6, "\x2a\x86\x48\xce\x3d\x03\x01\x07")}"
+    )
+    jwtDer(48, "$algorithm${jwtDer(3, "${byteEncode(0)}${byteEncode(4)}$x$y")}")
+}
+
+// JOSE ECDSA signatures are r || s; OpenSSL expects a DER Ecdsa-Sig-Value.
+fun jwtEcdsaSignatureDer(raw: string): string {
+    val half = raw.size / 2
+    jwtDer(
+        48,
+        "${jwtDerUnsignedInteger(raw.slice(0, half))}${jwtDerUnsignedInteger(raw.slice(half, raw.size))}"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// OpenSSL boundary
+
+trusted fun jwtImportPublicKey(der: string): int {
+    val cursor = nativeByteBuffer(8)
+    cursor.storeI64(0, nativeStringAddress(der))
+    val key = d2i_PUBKEY(nativeNullPointer(), cursor.address, der.size)
+    cursor.close()
+    if (pointerIsNull(key)) {
+        ERR_clear_error()
+        0
+    } else nativePointerAddress(key)
+}
+
+trusted fun jwtVerifySha256Signature(
+    handle: int,
+    message: string,
+    signature: string
+): bool {
+    if (handle == 0 || signature.size == 0) return false
+    val context = EVP_MD_CTX_new()
+    if (pointerIsNull(context)) return false
+    var verified = EVP_DigestVerifyInit(
+        context, nativeNullPointer(), EVP_sha256(), nativeNullPointer(),
+        nativePointerFromAddress(handle)
+    ) == i32(1)
+    if (verified) {
+        verified = EVP_DigestVerify(
+            context,
+            nativePointerFromAddress(nativeStringAddress(signature)),
+            signature.size,
+            nativePointerFromAddress(nativeStringAddress(message)),
+            message.size
+        ) == i32(1)
+    }
+    EVP_MD_CTX_free(context)
+    ERR_clear_error()
+    verified
+}
+
+// ---------------------------------------------------------------------------
+// Keys
+
+fun jwtImportJwk(jwk: Json): JwtKey {
+    val kty = jwk.getString("kty")
+    var alg = jwk.getString("alg")
+    var handle = 0
+    val use = jwk.getString("use")
+    if (use == "" || use == "sig") {
+        if (kty == "RSA" && (alg == "" || alg == "RS256")) {
+            val modulus = jwtBase64UrlDecode(jwk.getString("n"))
+            val exponent = jwtBase64UrlDecode(jwk.getString("e"))
+            if (modulus.valid && exponent.valid && modulus.bytes.size >= 256 &&
+                exponent.bytes.size > 0) {
+                handle = jwtImportPublicKey(
+                    jwtRsaSubjectPublicKeyInfo(modulus.bytes, exponent.bytes)
+                )
+            }
+            if (alg == "") alg = "RS256"
+        } else if (kty == "EC" && jwk.getString("crv") == "P-256" &&
+            (alg == "" || alg == "ES256")) {
+            val x = jwtBase64UrlDecode(jwk.getString("x"))
+            val y = jwtBase64UrlDecode(jwk.getString("y"))
+            if (x.valid && y.valid && x.bytes.size == 32 && y.bytes.size == 32) {
+                handle = jwtImportPublicKey(
+                    jwtEcSubjectPublicKeyInfo(x.bytes, y.bytes)
+                )
+            }
+            if (alg == "") alg = "ES256"
+        }
+    }
+    JwtKey(jwk.getString("kid"), kty, alg, handle)
+}
+
+// Parses a JWKS document. Keys with unsupported types or algorithms are
+// skipped; `error` is set when the document itself is unusable.
+fun jwtKeySet(jwks: string): JwtKeySet {
+    val keys: array<JwtKey> = []
+    var error = ""
+    val parsed = jsonParse(jwks)
+    if (!parsed.succeeded || !parsed.value.isObject() ||
+        !parsed.value.get("keys").isArray()) {
+        error = "invalid JWKS document"
+    } else {
+        val entries = parsed.value.get("keys")
+        var index = 0
+        while (index < entries.size()) {
+            val key = jwtImportJwk(entries.at(index))
+            if (key.handle != 0) keys.append(key)
+            index = index + 1
+        }
+        if (keys.size == 0) error = "JWKS contains no usable keys"
+    }
+    JwtKeySet(keys, error)
+}
+
+fun JwtKeySet.size(): int = this.keys.size
+
+fun JwtKeySet.hasKey(kid: string): bool {
+    var found = false
+    var index = 0
+    while (!found && index < this.keys.size) {
+        found = this.keys[index].kid == kid
+        index = index + 1
+    }
+    found
+}
+
+// Selects by kid when the token names one; otherwise the token's algorithm
+// must identify exactly one key.
+fun JwtKeySet.select(kid: string, alg: string): int {
+    var selected = -1
+    var matches = 0
+    var index = 0
+    while (index < this.keys.size) {
+        val key = this.keys[index]
+        if (key.alg == alg && (kid == "" || key.kid == kid)) {
+            if (selected < 0) selected = index
+            matches = matches + 1
+        }
+        index = index + 1
+    }
+    if (kid == "" && matches > 1) -2 else selected
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+
+fun jwtNowSeconds(): int {
+    val timestamp = nativeByteBuffer(16)
+    timestamp.storeI64(0, 0)
+    // CLOCK_REALTIME
+    linuxSyscall2(228, 0, nativePointerAddress(timestamp.address))
+    val seconds = timestamp.loadI64(0)
+    timestamp.close()
+    seconds
+}
+
+fun jwtFailure(error: string, header: Json, claims: Json): JwtVerification =
+    JwtVerification(false, error, "", header.getString("kid"), header, claims)
+
+fun jwtAudienceMatches(claim: Json, audience: string): bool {
+    var matched = claim.isString() && claim.asString() == audience
+    if (claim.isArray()) {
+        var index = 0
+        while (!matched && index < claim.size()) {
+            matched = claim.at(index).isString() &&
+                claim.at(index).asString() == audience
+            index = index + 1
+        }
+    }
+    matched
+}
+
+fun JwtKeySet.verify(
+    token: string,
+    options: JwtOptions = JwtOptions()
+): JwtVerification {
+    val empty = jsonNull()
+    val firstDot = textFindByte(token, 46, 0, token.size)
+    val secondDot = if (firstDot < 0) -1
+        else textFindByte(token, 46, firstDot + 1, token.size)
+    if (token.size == 0 || token.size > 16384 || firstDot <= 0 ||
+        secondDot <= firstDot + 1 ||
+        textFindByte(token, 46, secondDot + 1, token.size) >= 0) {
+        return jwtFailure("malformed token", empty, empty)
+    }
+    val headerBytes = jwtBase64UrlDecode(token.slice(0, firstDot))
+    val claimsBytes = jwtBase64UrlDecode(token.slice(firstDot + 1, secondDot))
+    val signature = jwtBase64UrlDecode(token.slice(secondDot + 1, token.size))
+    if (!headerBytes.valid || !claimsBytes.valid || !signature.valid) {
+        return jwtFailure("malformed token encoding", empty, empty)
+    }
+    val headerParse = jsonParse(headerBytes.bytes)
+    if (!headerParse.succeeded || !headerParse.value.isObject()) {
+        return jwtFailure("malformed token header", empty, empty)
+    }
+    val header = headerParse.value
+    val claimsParse = jsonParse(claimsBytes.bytes)
+    if (!claimsParse.succeeded || !claimsParse.value.isObject()) {
+        return jwtFailure("malformed token claims", header, empty)
+    }
+    val claims = claimsParse.value
+    val alg = header.getString("alg")
+    if (alg != "RS256" && alg != "ES256") {
+        return jwtFailure("unsupported algorithm", header, claims)
+    }
+    if (header.has("crit")) {
+        return jwtFailure("unsupported critical header", header, claims)
+    }
+    val kid = header.getString("kid")
+    val selected = this.select(kid, alg)
+    if (selected == -2) {
+        return jwtFailure("multiple matching keys", header, claims)
+    }
+    if (selected < 0) return jwtFailure("no matching key", header, claims)
+    var signatureBytes = signature.bytes
+    if (alg == "ES256") {
+        if (signatureBytes.size != 64) {
+            return jwtFailure("invalid signature", header, claims)
+        }
+        signatureBytes = jwtEcdsaSignatureDer(signatureBytes)
+    }
+    if (!jwtVerifySha256Signature(
+        this.keys[selected].handle, token.slice(0, secondDot), signatureBytes
+    )) return jwtFailure("signature verification failed", header, claims)
+
+    val now = if (options.nowSeconds >= 0) options.nowSeconds else jwtNowSeconds()
+    val tolerance = options.clockToleranceSeconds
+    if (claims.has("exp")) {
+        val exp = claims.get("exp")
+        if (!exp.isNumber() || !exp.intAvailable()) {
+            return jwtFailure("invalid exp claim", header, claims)
+        }
+        if (exp.asInt() <= now - tolerance) {
+            return jwtFailure("token expired", header, claims)
+        }
+    }
+    if (claims.has("nbf")) {
+        val nbf = claims.get("nbf")
+        if (!nbf.isNumber() || !nbf.intAvailable()) {
+            return jwtFailure("invalid nbf claim", header, claims)
+        }
+        if (nbf.asInt() > now + tolerance) {
+            return jwtFailure("token not yet valid", header, claims)
+        }
+    }
+    if (claims.has("iat") && !claims.get("iat").isNumber()) {
+        return jwtFailure("invalid iat claim", header, claims)
+    }
+    if (options.issuer != "" && claims.getString("iss") != options.issuer) {
+        return jwtFailure("unexpected issuer", header, claims)
+    }
+    if (options.audience != "" &&
+        !jwtAudienceMatches(claims.get("aud"), options.audience)) {
+        return jwtFailure("unexpected audience", header, claims)
+    }
+    val subject = claims.getString("sub")
+    if (options.requireSubject && subject == "") {
+        return jwtFailure("subject not found in token", header, claims)
+    }
+    JwtVerification(true, "", subject, kid, header, claims)
+}
+
+// Decodes claims without verifying anything (diagnostics only).
+fun jwtDecodeUnverified(token: string): Json {
+    val firstDot = textFindByte(token, 46, 0, token.size)
+    val secondDot = if (firstDot < 0) -1
+        else textFindByte(token, 46, firstDot + 1, token.size)
+    var claims = jsonNull()
+    if (firstDot > 0 && secondDot > firstDot) {
+        val bytes = jwtBase64UrlDecode(token.slice(firstDot + 1, secondDot))
+        if (bytes.valid) {
+            val parsed = jsonParse(bytes.bytes)
+            if (parsed.succeeded) claims = parsed.value
+        }
+    }
+    claims
+}

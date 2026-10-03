@@ -1,0 +1,154 @@
+// Remote JWKS retrieval with caching, mirroring the JOSE remote key-set
+// policy: keys are reused for `maxAgeSeconds`, and a token naming an unknown
+// `kid` triggers at most one refetch per `cooldownSeconds` (key rotation).
+//
+//     val jwks = jwksCache("https://auth.example.com/.well-known/jwks.json")
+//     val result = jwks.verify(token, JwtOptions(issuer = "Example"))
+//
+// Fetches are synchronous HTTPS requests bounded by `timeoutMilliseconds`;
+// they happen at construction, on expiry, and on rotation, never per token.
+
+import "abla/http/tls"
+import "abla/jwt"
+
+class JwksLocation(
+    val secure: bool,
+    val host: string,
+    val port: int,
+    val path: string,
+    val valid: bool
+)
+
+class JwksFetch(val body: string, val error: string)
+
+resource class JwksCache(
+    val url: string,
+    var keys: JwtKeySet,
+    var fetchedAtMilliseconds: int,
+    var lastAttemptMilliseconds: int,
+    var lastError: string,
+    val maxAgeMilliseconds: int,
+    val cooldownMilliseconds: int,
+    val timeoutMilliseconds: int,
+    var fetches: int
+)
+
+fun jwksParseLocation(url: string): JwksLocation {
+    var secure = true
+    var rest = url
+    if (textFindSequence(url, "https://", 0, url.size) == 0) {
+        rest = url.slice(8, url.size)
+    } else if (textFindSequence(url, "http://", 0, url.size) == 0) {
+        secure = false
+        rest = url.slice(7, url.size)
+    } else return JwksLocation(true, "", 0, "", false)
+    var slash = textFindByte(rest, 47, 0, rest.size)
+    if (slash < 0) slash = rest.size
+    val authority = rest.slice(0, slash)
+    val path = if (slash < rest.size) rest.slice(slash, rest.size) else "/"
+    var host = authority
+    var port = if (secure) 443 else 80
+    val colon = textFindByte(authority, 58, 0, authority.size)
+    if (colon >= 0) {
+        host = authority.slice(0, colon)
+        port = httpDecimalLength(authority.slice(colon + 1, authority.size), 65535)
+    }
+    JwksLocation(secure, host, port, path, host != "" && port > 0)
+}
+
+// Downloads a JWKS document. Plain http is accepted for numeric or
+// localhost development endpoints only.
+fun jwksFetch(url: string, timeoutMilliseconds: int = 10000): JwksFetch {
+    val location = jwksParseLocation(url)
+    if (!location.valid) return JwksFetch("", "invalid JWKS URL")
+    val request = httpGet(location.path, [HttpHeader("Accept", "application/json")])
+    val result = if (location.secure) {
+        val client = httpsClient(
+            location.host, location.port, 1048576, timeoutMilliseconds
+        )
+        client.send(request)
+    } else {
+        val address = if (location.host == "localhost") "127.0.0.1" else location.host
+        val client = httpIpv4Client(
+            if (location.port == 80) location.host
+            else "${location.host}:${location.port}",
+            address, location.port, 1048576, timeoutMilliseconds
+        )
+        client.send(request)
+    }
+    if (!result.succeeded) JwksFetch("", "JWKS request failed")
+    else if (result.response.status != 200) {
+        JwksFetch("", "JWKS request returned ${result.response.status}")
+    } else JwksFetch(result.response.body, "")
+}
+
+fun jwksCache(
+    url: string,
+    maxAgeSeconds: int = 86400,
+    cooldownSeconds: int = 30,
+    timeoutMilliseconds: int = 10000
+): JwksCache {
+    val cache = JwksCache(
+        url, jwtKeySet(""), 0, 0, "", maxAgeSeconds * 1000,
+        cooldownSeconds * 1000, timeoutMilliseconds, 0
+    )
+    cache.refresh()
+    cache
+}
+
+// Builds a cache from an already available document (tests, pinned keys).
+fun jwksCacheFromDocument(document: string, maxAgeSeconds: int = 86400): JwksCache {
+    val now = linuxMonotonicMilliseconds()
+    val keys = jwtKeySet(document)
+    JwksCache(
+        "", move(keys), now, now, "", maxAgeSeconds * 1000, 30000, 10000, 0
+    )
+}
+
+// Fetches now. On failure the previous keys stay in service.
+fun JwksCache.refresh(): bool {
+    val now = linuxMonotonicMilliseconds()
+    this.lastAttemptMilliseconds = now
+    this.fetches = this.fetches + 1
+    if (this.url == "") {
+        this.lastError = "no JWKS URL"
+        return false
+    }
+    val fetched = jwksFetch(this.url, this.timeoutMilliseconds)
+    if (fetched.error != "") {
+        this.lastError = fetched.error
+        return false
+    }
+    val keys = jwtKeySet(fetched.body)
+    if (keys.error != "") {
+        this.lastError = keys.error
+        return false
+    }
+    this.keys = move(keys)
+    this.fetchedAtMilliseconds = now
+    this.lastError = ""
+    true
+}
+
+fun JwksCache.coolingDown(now: int): bool =
+    this.lastAttemptMilliseconds > 0 &&
+        now - this.lastAttemptMilliseconds < this.cooldownMilliseconds
+
+fun JwksCache.verify(
+    token: string,
+    options: JwtOptions = JwtOptions()
+): JwtVerification {
+    val now = linuxMonotonicMilliseconds()
+    if ((this.keys.size() == 0 ||
+        now - this.fetchedAtMilliseconds >= this.maxAgeMilliseconds) &&
+        !this.coolingDown(now)) this.refresh()
+    var result = this.keys.verify(token, options)
+    if (!result.valid && result.error == "no matching key" &&
+        result.kid != "" && !this.keys.hasKey(result.kid) &&
+        !this.coolingDown(linuxMonotonicMilliseconds())) {
+        if (this.refresh()) result = this.keys.verify(token, options)
+    }
+    result
+}
+
+fun JwksCache.keyCount(): int = this.keys.size()
