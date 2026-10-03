@@ -18,6 +18,18 @@ if [[ $status -ne 42 ]]; then
     exit 1
 fi
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/thread-heap-mutex.ab" \
+    --no-cache -o "$output_directory/thread-heap-mutex"
+set +e
+"$project_root/tools/run-limited.sh" "$output_directory/thread-heap-mutex"
+status=$?
+set -e
+if [[ $status -ne 42 ]]; then
+    echo "concurrency: mutex slots must hold the platform pthread_mutex_t (expected 42, got $status)" >&2
+    exit 1
+fi
+
 rm -f "$output_directory/invalid"
 set +e
 "$compiler" build \

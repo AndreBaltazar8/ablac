@@ -1,0 +1,58 @@
+import "abla/unsafe/memory"
+
+// Every runtime mutex slot must hold the platform's whole pthread_mutex_t.
+// The slots were 40 bytes (Linux's size); Darwin's mutex is 64 bytes and its
+// init/lock/unlock write all of it, so the heap lock and Shared/Mutex control
+// blocks wrote past their allocations and corrupted malloc's free lists
+// under threads. Probe the real footprint against a canary-filled buffer.
+
+trusted fun mutexFootprintFits(): bool {
+    val size = 256
+    val buffer = ablaUnsafeAllocate(size)
+    ablaUnsafeSetMemory(buffer, 170, size)
+    val address = ablaUnsafePointerAddress(buffer)
+    __ablaRuntimePlatformMutexInitialize(address)
+    __ablaRuntimePlatformMutexLock(address)
+    __ablaRuntimePlatformMutexUnlock(address)
+    __ablaRuntimePlatformMutexDestroy(address)
+    var fits = true
+    var offset = __ablaRuntimePlatformMutexBytes()
+    while (offset < size) {
+        if (ablaUnsafeLoadU8(ablaUnsafePointerOffset(buffer, offset)) != 170) fits = false
+        offset = offset + 1
+    }
+    ablaUnsafeFree(buffer)
+    fits
+}
+
+resource class Tally(var count: int)
+
+fun bump(var tally: Tally): int {
+    tally.count = tally.count + 1
+    tally.count
+}
+
+fun churn(seed: int): int {
+    var total = 0
+    var index = 0
+    while (index < 4000) {
+        val text = "w$seed-$index-${index * 7}"
+        total = total + text.size
+        index = index + 1
+    }
+    total
+}
+
+fun main: int {
+    if (!mutexFootprintFits()) return 2
+    val tally = Mutex(Tally(0))
+    val first = tally.clone()
+    val second = tally.clone()
+    val a = thread { churn(1) + first.with(bump) * 0 }
+    val b = thread { churn(2) + second.with(bump) * 0 }
+    val local = churn(3)
+    val left = await a
+    val right = await b
+    val count = tally.with(bump)
+    if (left > 0 && right > 0 && local > 0 && count == 3) 42 else 1
+}
