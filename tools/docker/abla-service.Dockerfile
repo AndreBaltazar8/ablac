@@ -5,7 +5,12 @@
 #       --build-context ablac=/path/to/ablac \
 #       --build-context app=/path/to/app-sources \
 #       --build-arg ENTRY=server/main.ab \
+#       --build-arg ASSETS="data/maps" --build-arg APP_WORKDIR=. \
 #       -t my-service .
+#
+# ASSETS lists app-context paths (files or directories) copied into the
+# image under /app, and APP_WORKDIR (relative to /app) is the service's
+# working directory, so relative runtime paths resolve as in development.
 #
 # Stage 1 bootstraps the pinned release compiler and rebuilds the compiler
 # from the `ablac` context so the service compiles with the same sources it
@@ -46,20 +51,29 @@ RUN rm -rf build && tools/bootstrap-compiler.sh build/ablac.bin \
 FROM compiler AS build
 ARG ENTRY=main.ab
 ARG OUTPUT=service
+ARG ASSETS=""
 COPY --from=app . /src
 WORKDIR /src
 RUN ABLA_SYSROOT=/opt/ablac ABLA_MAX_MEMORY_MB=6000 ABLA_MAX_SECONDS=1800 \
         /opt/ablac/tools/run-limited.sh /opt/ablac/build/ablac.bin \
         build "${ENTRY}" -o "/out/${OUTPUT}" --no-cache \
-    && ldd "/out/${OUTPUT}" || true
+    && test -x "/out/${OUTPUT}" \
+    && ldd "/out/${OUTPUT}" \
+    && mkdir -p /out/app \
+    && for asset in ${ASSETS}; do \
+           mkdir -p "/out/app/$(dirname "$asset")" && cp -R "/src/$asset" "/out/app/$asset"; \
+       done
 
 FROM ubuntu:24.04 AS runtime
 ARG OUTPUT=service
+ARG APP_WORKDIR=.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 abla
 COPY --from=build /out/${OUTPUT} /usr/local/bin/service
+COPY --from=build /out/app/ /app/
+WORKDIR /app/${APP_WORKDIR}
 USER abla
 # Abla services drain on SIGTERM (WebSocketServer.enableGracefulShutdown).
 STOPSIGNAL SIGTERM
