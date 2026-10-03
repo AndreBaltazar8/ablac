@@ -5237,6 +5237,78 @@ class BootstrapAnalyzer(
         source
     }
 
+    /** Whether `name` (an identifier at the tail of `block`, or an argument of
+     *  its tail call) is a `val` of that block initialized with a fresh managed
+     *  reference — the block's locals are out of scope once its value is checked. */
+    fun blockLocalIsFresh(
+        block: BootstrapExpression,
+        name: BootstrapExpression,
+        depth: int
+    ): bool {
+        var fresh = false
+        if (name.kind == "identifier") {
+            var statement = block.children.size - 1
+            while (!fresh && statement > 0) {
+                statement = statement - 1
+                val candidate = block.children[statement]
+                if (candidate.kind == "local.val" &&
+                    candidate.text == name.text &&
+                    candidate.children.size > 0) {
+                    fresh = this.expressionProducesFreshManagedReference(
+                        candidate.children[0], depth, false
+                    )
+                }
+            }
+        }
+        fresh
+    }
+
+    /** A constructor (at the tail of `block`, or `block` itself) whose stored
+     *  references are all fresh: constructed inline, or fresh locals — visible
+     *  ones, or `val`s of the block (see constructorStoredBorrowSource for
+     *  which arguments count as stored). */
+    fun constructorStoresOnlyFreshLocals(
+        block: BootstrapExpression,
+        call: BootstrapExpression,
+        depth: int
+    ): bool {
+        val declaration = this.typeDeclarations.find(call.text)
+        if (declaration < 0) return false
+        val candidate = this.declarations[declaration]
+        if (candidate.kind != "class" || candidate.isResource) return false
+        var fresh = true
+        var parameter = 0
+        while (fresh &&
+               parameter < candidate.parameterTypes.size &&
+               parameter < call.children.size) {
+            val expected = bootstrapNormalizeType(
+                candidate.parameterTypes[parameter]
+            )
+            if (!this.typeIsAffine(expected) &&
+                !bootstrapIsArrayType(expected) &&
+                this.typeNeedsManagedAliasTracking(expected)) {
+                val argument = call.children[parameter]
+                fresh = this.expressionProducesFreshManagedReference(
+                    argument, depth + 1, true
+                ) || this.blockLocalIsFresh(block, argument, depth + 1)
+            }
+            parameter = parameter + 1
+        }
+        fresh
+    }
+
+    /** A returned borrow that only stores the function's own fresh locals
+     *  (`val box = Box(); Pair(box, 1)`): those locals end at the return, so
+     *  nothing they alias outlives it and the borrow is not an escape. */
+    fun borrowsOnlyFreshLocals(expression: BootstrapExpression): bool {
+        var call = expression
+        if (expression.kind == "block" && expression.children.size > 0) {
+            call = expression.children[expression.children.size - 1]
+        }
+        call.kind == "call" && this.findKind(call.text) == "class" &&
+            this.constructorStoresOnlyFreshLocals(expression, call, 0)
+    }
+
     fun expressionProducesFreshManagedReference(
         expression: BootstrapExpression,
         depth: int,
@@ -5268,18 +5340,7 @@ class BootstrapAnalyzer(
                 tail, depth, allowVisibleLocals
             )
             if (!fresh && tail.kind == "identifier") {
-                var statement = expression.children.size - 1
-                while (!fresh && statement > 0) {
-                    statement = statement - 1
-                    val candidate = expression.children[statement]
-                    if (candidate.kind == "local.val" &&
-                        candidate.text == tail.text &&
-                        candidate.children.size > 0) {
-                        fresh = this.expressionProducesFreshManagedReference(
-                            candidate.children[0], depth, false
-                        )
-                    }
-                }
+                fresh = this.blockLocalIsFresh(expression, tail, depth)
             }
         }
         if (!fresh && expression.kind == "if" &&
@@ -6343,7 +6404,9 @@ class BootstrapAnalyzer(
     ): void {
         if (bootstrapIsBorrowType(actual)) {
             if (this.currentBorrowResultSource == "") {
-                this.fail("ownership.borrow-escape:$context")
+                if (!this.borrowsOnlyFreshLocals(expression)) {
+                    this.fail("ownership.borrow-escape:$context")
+                }
             } else {
                 val source = this.borrowExpressionSource(expression)
                 if (!bootstrapBorrowSourceMatchesContract(
