@@ -2189,6 +2189,214 @@ fun bootstrapExpressionCompileEffects(
     mask
 }
 
+// Syntactic receiver typing for compile-effect summaries. Method effects were
+// merged across every method sharing a name, so ByteBuffer.appendText (used
+// by jsonStringify) inherited Path.appendText's native filesystem effect and
+// `#$jsons` was denied whenever abla/fs was in the graph. When a receiver's
+// type can be read from syntax (this, typed parameters and locals, fields,
+// constructor or declared-result calls) and names a concrete class or a
+// builtin, the summary now resolves exactly `Type.method`; anything else
+// (interfaces, generics, lambdas) keeps the conservative name-wide merge.
+class BootstrapEffectTypeMap(
+    val keys: array<string>,
+    val values: array<string>,
+    val slots: array<int>,
+    val next: array<int>
+)
+
+fun bootstrapEffectTypeMapGet(map: BootstrapEffectTypeMap, key: string): string {
+    var result = ""
+    if (map.slots.size > 0) {
+        var slot = bootstrapFunctionDeclarationHash(key)
+        slot = slot - slot / map.slots.size * map.slots.size
+        var index = map.slots[slot]
+        while (index >= 0) {
+            if (map.keys[index] == key) result = map.values[index]
+            index = map.next[index]
+        }
+    }
+    result
+}
+
+// Records key -> value in a hashed map that grows by rehashing; a key seen
+// with two different values becomes ambiguous ("?") so it never resolves.
+fun bootstrapEffectTypeMapPut(var map: BootstrapEffectTypeMap, key: string, value: string): void {
+    if (map.keys.size * 2 + 1 > map.slots.size) {
+        var capacity = if (map.slots.size == 0) 64 else map.slots.size * 2
+        while (map.slots.size < capacity) map.slots.append(-1)
+        var slot = 0
+        while (slot < map.slots.size) {
+            map.slots[slot] = -1
+            slot = slot + 1
+        }
+        var entry = 0
+        while (entry < map.keys.size) {
+            var hashed = bootstrapFunctionDeclarationHash(map.keys[entry])
+            hashed = hashed - hashed / map.slots.size * map.slots.size
+            map.next[entry] = map.slots[hashed]
+            map.slots[hashed] = entry
+            entry = entry + 1
+        }
+    }
+    var slot = bootstrapFunctionDeclarationHash(key)
+    slot = slot - slot / map.slots.size * map.slots.size
+    var index = map.slots[slot]
+    var found = false
+    while (!found && index >= 0) {
+        if (map.keys[index] == key) {
+            found = true
+            if (map.values[index] != value) map.values[index] = "?"
+        }
+        index = map.next[index]
+    }
+    if (!found) {
+        map.keys.append(key)
+        map.values.append(value)
+        map.next.append(map.slots[slot])
+        map.slots[slot] = map.keys.size - 1
+    }
+    return
+}
+
+fun bootstrapEffectNormalizeType(type: string): string {
+    var result = type
+    while (result.size > 0 && (result[result.size - 1] == 63 ||
+        result[result.size - 1] == 32)) result = result.slice(0, result.size - 1)
+    while (result.size > 0 && result[0] == 32) result = result.slice(1, result.size)
+    result
+}
+
+fun bootstrapBuildEffectTypeMap(
+    declarations: array<BootstrapDeclaration>
+): BootstrapEffectTypeMap {
+    val map = BootstrapEffectTypeMap([], [], [], [])
+    var index = 0
+    while (index < declarations.size) {
+        val declaration = declarations[index]
+        if (declaration.kind == "class" || declaration.kind == "interface" ||
+            declaration.kind == "type") {
+            bootstrapEffectTypeMapPut(map, "type:${declaration.name}", declaration.kind)
+            var field = 0
+            while (field < declaration.parameters.size &&
+                field < declaration.parameterTypes.size) {
+                if (field < declaration.parameterKinds.size &&
+                    (declaration.parameterKinds[field] == "val" ||
+                     declaration.parameterKinds[field] == "var")) {
+                    bootstrapEffectTypeMapPut(
+                        map,
+                        "field:${declaration.name}.${declaration.parameters[field]}",
+                        bootstrapEffectNormalizeType(declaration.parameterTypes[field])
+                    )
+                }
+                field = field + 1
+            }
+            var method = 0
+            while (method < declaration.methods.size) {
+                bootstrapEffectTypeMapPut(
+                    map,
+                    "method:${declaration.name}.${declaration.methods[method].name}",
+                    bootstrapEffectNormalizeType(declaration.methods[method].resultType)
+                )
+                method = method + 1
+            }
+        }
+        if (declaration.kind == "fun" || declaration.kind == "compile.fun" ||
+            declaration.kind == "extern") {
+            val result = bootstrapEffectNormalizeType(declaration.resultType)
+            if (declaration.extensionOwner != "") {
+                bootstrapEffectTypeMapPut(
+                    map,
+                    "method:${declaration.extensionOwner}.${declaration.name}", result
+                )
+            } else bootstrapEffectTypeMapPut(map, "fun:${declaration.name}", result)
+        }
+        index = index + 1
+    }
+    map
+}
+
+fun bootstrapEffectUsableType(type: string): bool =
+    type != "" && type != "?" && type != "any" && type != "void"
+
+// Concrete receivers whose method calls dispatch statically.
+fun bootstrapEffectPreciseType(map: BootstrapEffectTypeMap, type: string): bool {
+    if (!bootstrapEffectUsableType(type)) return false
+    val kind = bootstrapEffectTypeMapGet(map, "type:$type")
+    if (kind == "class" || kind == "type") return true
+    type == "string" || type == "int" || type == "bool" || type == "char" ||
+        type == "i8" || type == "i16" || type == "i32" || type == "i64" ||
+        type == "u8" || type == "u16" || type == "u32" || type == "u64" ||
+        type == "f32" || type == "f64" ||
+        (type.size > 6 && type.slice(0, 6) == "array<")
+}
+
+fun bootstrapEffectScopeType(names: array<string>, types: array<string>, name: string): string {
+    var result = ""
+    var index = 0
+    while (index < names.size) {
+        if (names[index] == name) {
+            result = if (result == "" || result == types[index]) types[index] else "?"
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapEffectExpressionType(
+    expression: BootstrapExpression,
+    map: BootstrapEffectTypeMap,
+    names: array<string>,
+    types: array<string>,
+    owner: string
+): string {
+    var result = ""
+    if (expression.kind == "identifier") {
+        result = if (expression.text == "this") owner
+            else bootstrapEffectScopeType(names, types, expression.text)
+    } else if (expression.kind == "string" || expression.kind == "string.template") {
+        result = "string"
+    } else if (expression.kind == "member" && expression.children.size == 1) {
+        val base = bootstrapEffectExpressionType(expression.children[0], map, names, types, owner)
+        if (bootstrapEffectUsableType(base)) {
+            result = bootstrapEffectTypeMapGet(map, "field:$base.${expression.text}")
+        }
+    } else if (expression.kind == "call") {
+        val kind = bootstrapEffectTypeMapGet(map, "type:${expression.text}")
+        result = if (kind == "class") expression.text
+            else bootstrapEffectTypeMapGet(map, "fun:${expression.text}")
+    } else if (expression.kind == "member.call" && expression.children.size > 0) {
+        val base = bootstrapEffectExpressionType(expression.children[0], map, names, types, owner)
+        if (bootstrapEffectUsableType(base)) {
+            result = bootstrapEffectTypeMapGet(map, "method:$base.${expression.text}")
+        }
+    }
+    if (bootstrapEffectUsableType(result)) result else ""
+}
+
+// Parameters plus every local of a body with a declared or inferable type.
+fun bootstrapCollectEffectLocals(
+    expression: BootstrapExpression,
+    map: BootstrapEffectTypeMap,
+    var names: array<string>,
+    var types: array<string>,
+    owner: string
+): void {
+    if ((expression.kind == "local.val" || expression.kind == "local.var") &&
+        expression.children.size >= 2) {
+        var type = bootstrapEffectNormalizeType(expression.children[1].text)
+        if (type == "") {
+            type = bootstrapEffectExpressionType(expression.children[0], map, names, types, owner)
+        }
+        names.append(expression.text)
+        types.append(if (type == "") "?" else type)
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapCollectEffectLocals(expression.children[child], map, names, types, owner)
+        child = child + 1
+    }
+}
+
 fun bootstrapCollectDelegatedNames(
     expression: BootstrapExpression,
     var names: array<string>
@@ -2210,7 +2418,11 @@ fun bootstrapCollectDelegatedNames(
 fun bootstrapExpressionDelegatedCompileEffects(
     expression: BootstrapExpression,
     summary: BootstrapCompileEffectSummary,
-    delegatedNames: array<string>
+    delegatedNames: array<string>,
+    typeMap: BootstrapEffectTypeMap = BootstrapEffectTypeMap([], [], [], []),
+    scopeNames: array<string> = [],
+    scopeTypes: array<string> = [],
+    owner: string = ""
 ): int {
     var mask = 0
     if (expression.kind == "identifier" &&
@@ -2231,7 +2443,15 @@ fun bootstrapExpressionDelegatedCompileEffects(
         ))
     }
     if (expression.kind == "member.call") {
-        mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
+        val receiver = if (expression.children.size > 0) bootstrapEffectExpressionType(
+            expression.children[0], typeMap, scopeNames, scopeTypes, owner
+        ) else ""
+        if (bootstrapEffectPreciseType(typeMap, receiver)) {
+            mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectMerge(
+                bootstrapCompileBuiltinEffect(expression.text),
+                bootstrapCompileEffectLookup(summary, "$receiver.${expression.text}", false)
+            ))
+        } else mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,
             expression.text,
             true
@@ -2249,7 +2469,11 @@ fun bootstrapExpressionDelegatedCompileEffects(
             bootstrapExpressionDelegatedCompileEffects(
                 expression.children[child],
                 summary,
-                delegatedNames
+                delegatedNames,
+                typeMap,
+                scopeNames,
+                scopeTypes,
+                owner
             )
         )
         child = child + 1
@@ -2351,6 +2575,68 @@ fun bootstrapBuildCompileEffectSummary(
         }
         declarationIndex = declarationIndex + 1
     }
+    // Receiver-typing scopes, one per summary entry (same order as `masks`).
+    val typeMap = bootstrapBuildEffectTypeMap(declarations)
+    val entryScopeNames: array<array<string>> = []
+    val entryScopeTypes: array<array<string>> = []
+    val entryOwners: array<string> = []
+    declarationIndex = 0
+    while (declarationIndex < declarations.size) {
+        val declaration = declarations[declarationIndex]
+        if (declaration.kind == "fun" ||
+            declaration.kind == "compile.fun" ||
+            declaration.kind == "extern") {
+            val scopeNames: array<string> = []
+            val scopeTypes: array<string> = []
+            var parameter = 0
+            while (parameter < declaration.parameters.size &&
+                parameter < declaration.parameterTypes.size) {
+                scopeNames.append(declaration.parameters[parameter])
+                scopeTypes.append(bootstrapEffectNormalizeType(declaration.parameterTypes[parameter]))
+                parameter = parameter + 1
+            }
+            if (declaration.kind != "extern") {
+                bootstrapCollectEffectLocals(
+                    declaration.expression, typeMap, scopeNames, scopeTypes,
+                    declaration.extensionOwner
+                )
+            }
+            entryScopeNames.append(scopeNames)
+            entryScopeTypes.append(scopeTypes)
+            entryOwners.append(declaration.extensionOwner)
+        }
+        var methodIndex = 0
+        while (methodIndex < declaration.methods.size) {
+            val method = declaration.methods[methodIndex]
+            val scopeNames: array<string> = []
+            val scopeTypes: array<string> = []
+            var parameter = 0
+            while (parameter < method.parameters.size &&
+                parameter < method.parameterTypes.size) {
+                scopeNames.append(method.parameters[parameter])
+                scopeTypes.append(bootstrapEffectNormalizeType(method.parameterTypes[parameter]))
+                parameter = parameter + 1
+            }
+            // Class fields are in scope inside methods, as `this.x` or `x`.
+            var field = 0
+            while (field < declaration.parameters.size &&
+                field < declaration.parameterTypes.size) {
+                scopeNames.append(declaration.parameters[field])
+                scopeTypes.append(bootstrapEffectNormalizeType(declaration.parameterTypes[field]))
+                field = field + 1
+            }
+            if (method.kind != "extern") {
+                bootstrapCollectEffectLocals(
+                    method.expression, typeMap, scopeNames, scopeTypes, declaration.name
+                )
+            }
+            entryScopeNames.append(scopeNames)
+            entryScopeTypes.append(scopeTypes)
+            entryOwners.append(declaration.name)
+            methodIndex = methodIndex + 1
+        }
+        declarationIndex = declarationIndex + 1
+    }
     var changed = true
     var round = 0
     while (changed && round <= names.size) {
@@ -2378,7 +2664,11 @@ fun bootstrapBuildCompileEffectSummary(
                     val inferred = bootstrapExpressionDelegatedCompileEffects(
                         declaration.expression,
                         summary,
-                        delegatedNames
+                        delegatedNames,
+                        typeMap,
+                        entryScopeNames[entry],
+                        entryScopeTypes[entry],
+                        entryOwners[entry]
                     )
                     val merged = bootstrapCompileEffectMerge(
                         masks[entry],
@@ -2408,7 +2698,11 @@ fun bootstrapBuildCompileEffectSummary(
                     val inferred = bootstrapExpressionDelegatedCompileEffects(
                         method.expression,
                         summary,
-                        delegatedNames
+                        delegatedNames,
+                        typeMap,
+                        entryScopeNames[entry],
+                        entryScopeTypes[entry],
+                        entryOwners[entry]
                     )
                     val merged = bootstrapCompileEffectMerge(
                         masks[entry],
