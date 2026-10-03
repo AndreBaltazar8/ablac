@@ -174,6 +174,29 @@ Silicon laptop over loopback, 1000 sockets receiving a 1 KiB snapshot per tick
 messages per second cost about 3.7 ms per tick for broadcast and flush and
 kept the event loop about 8% busy.
 
+### Nonblocking HTTP client
+
+`abla/http/async` issues HTTP/1.1 and HTTPS requests from an event loop.
+`request(method, url, headers, body, timeoutMilliseconds)` returns an id;
+DNS (cached A records over nonblocking UDP), TCP connect, the OpenSSL
+handshake with peer/SNI/hostname verification, writes, and reads advance only
+inside `step`, and finished requests come back from `takeCompletions` as
+`HttpAsyncCompletion(id, status, headers, body, error, elapsedMilliseconds)`.
+Connections are kept alive and pooled per scheme, host, and port up to
+`maximumConnectionsPerHost`; a request whose pooled connection was closed by
+the peer is retried once on a fresh connection. Register `pollDescriptor()`
+with `WebSocketServer.watchExternal` so a blocking server `step` wakes when a
+reply arrives:
+
+```abla
+val http = httpAsyncClient()
+server.watchExternal(http.pollDescriptor())
+val grant = http.postJson(economyUrl, body, [HttpHeader("X-API-KEY", key)])
+// each loop iteration, after server.step(...):
+http.step(0)
+val replies = http.takeCompletions()
+```
+
 ### JSON Web Tokens
 
 `abla/jwt` verifies compact JWS tokens signed with RS256 or ES256 against a

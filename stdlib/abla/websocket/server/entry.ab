@@ -165,6 +165,7 @@ resource class WebSocketServer(
     var draining: bool,
     var drainDeadlineMilliseconds: int,
     var stopped: bool,
+    var externalWakeups: int,
     val stats: WebSocketServerStats
 ) {
     fun drop(): void {
@@ -216,7 +217,7 @@ fun webSocketServerOnListener(
         chunk,
         [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
         [], [], [], 0, [], 0, [], 0, 0, 1, linuxMonotonicMilliseconds(),
-        false, 0, false,
+        false, 0, false, 0,
         WebSocketServerStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     )
 }
@@ -979,7 +980,8 @@ fun WebSocketServer.step(timeoutMilliseconds: int = 0): int {
             if (readable) this.acceptReady()
         } else if (descriptor >= 0 && descriptor < this.slotsByDescriptor.size) {
             val slot = this.slotsByDescriptor[descriptor]
-            if (slot >= 0) {
+            if (slot == -2) this.externalWakeups = this.externalWakeups + 1
+            else if (slot >= 0) {
                 if (readable) this.readSlot(slot)
                 if (writable && this.states[slot] != 0) this.writeSlot(slot)
                 if ((error || (closed && !readable)) && this.states[slot] != 0) {
@@ -1148,6 +1150,26 @@ fun WebSocketServer.isOpen(id: int): bool {
 fun WebSocketServer.bufferedAmount(id: int): int {
     val slot = this.slotOf(id)
     if (slot >= 0) this.outputs[slot].size - this.outputOffsets[slot] else 0
+}
+
+// Adds another readiness source (for example an HttpAsyncClient poller) so a
+// blocking `step` returns as soon as it has work. The server never reads it;
+// the owner drives it after `step` returns.
+fun WebSocketServer.watchExternal(descriptor: int): bool {
+    if (descriptor < 0) return false
+    while (this.slotsByDescriptor.size <= descriptor) {
+        this.slotsByDescriptor.append(-1)
+    }
+    if (this.slotsByDescriptor[descriptor] != -1) return false
+    this.slotsByDescriptor[descriptor] = -2
+    this.poller.watchDescriptor(descriptor)
+}
+
+fun WebSocketServer.unwatchExternal(descriptor: int): bool {
+    if (descriptor < 0 || descriptor >= this.slotsByDescriptor.size ||
+        this.slotsByDescriptor[descriptor] != -2) return false
+    this.slotsByDescriptor[descriptor] = -1
+    this.poller.unwatchDescriptor(descriptor)
 }
 
 fun WebSocketServer.connectionCount(): int = this.activeCount

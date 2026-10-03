@@ -1,0 +1,1038 @@
+// Nonblocking HTTP/1.1 client for event-loop services. Requests progress only
+// inside `step`, so a game loop can issue backend calls (economy, matchmaking)
+// without stalling a tick:
+//
+//     val http = httpAsyncClient()
+//     server.watchExternal(http.pollDescriptor())   // optional: wake on replies
+//     val id = http.request("POST", "https://api.example.com/v1/grant",
+//         [HttpHeader("Content-Type", "application/json")], body)
+//     ...each loop iteration:
+//     http.step(0)
+//     val done = http.takeCompletions()   // HttpAsyncCompletion(id, status, ...)
+//
+// DNS (A records, cached), TCP connect, the TLS handshake (OpenSSL with peer,
+// SNI, and hostname verification), request writes, and response reads are all
+// nonblocking state machines over one poller. Connections are kept alive and
+// pooled per scheme/host/port; a request that finds a pooled connection
+// already closed by the peer is retried once on a fresh connection.
+
+import "openssl-nonblocking.ab"
+import "abla/dns"
+import "abla/http"
+import "abla/net"
+import "abla/random"
+import "abla/text"
+
+class HttpAsyncOptions(
+    val maximumConnectionsPerHost: int = 8,
+    val maximumResponseBytes: int = 8388608,
+    val idleTimeoutMilliseconds: int = 30000,
+    val dnsTimeoutMilliseconds: int = 3000,
+    val dnsCacheSeconds: int = 60,
+    // Empty uses the system trust store.
+    val caPath: string = "",
+    val nameserver: string = ""
+)
+
+class HttpAsyncCompletion(
+    val id: int,
+    val status: int,
+    val headers: array<HttpHeader>,
+    val body: string,
+    val error: string,
+    val elapsedMilliseconds: int
+) {
+    fun succeeded(): bool = this.error == ""
+}
+
+fun HttpAsyncCompletion.header(name: string): string {
+    var result = ""
+    var index = 0
+    while (index < this.headers.size) {
+        if (httpAsciiEqualInsensitive(this.headers[index].name, name)) {
+            result = this.headers[index].value
+        }
+        index = index + 1
+    }
+    result
+}
+
+class HttpAsyncTarget(
+    val secure: bool,
+    val host: string,
+    val port: int,
+    val path: string,
+    val valid: bool
+)
+
+class HttpAsyncRead(var text: string, var status: int)
+
+// Request states.
+val httpAsyncRequestFree = 0
+val httpAsyncRequestQueued = 1
+val httpAsyncRequestActive = 2
+
+// Connection states.
+val httpAsyncConnectionFree = 0
+val httpAsyncConnectionResolving = 1
+val httpAsyncConnectionConnecting = 2
+val httpAsyncConnectionHandshaking = 3
+val httpAsyncConnectionWriting = 4
+val httpAsyncConnectionReading = 5
+val httpAsyncConnectionIdle = 6
+
+resource class HttpAsyncClient(
+    val poller: SocketPoller,
+    val options: HttpAsyncOptions,
+    var sslContext: int,
+    var nameserver: string,
+    val reader: HttpAsyncRead,
+    // requests
+    val requestIds: array<int>,
+    val requestStates: array<int>,
+    val requestKeys: array<string>,
+    val requestHosts: array<string>,
+    val requestPorts: array<int>,
+    val requestSecure: array<bool>,
+    val requestPayloads: array<string>,
+    val requestDeadlines: array<int>,
+    val requestStarted: array<int>,
+    val requestRetried: array<bool>,
+    val freeRequests: array<int>,
+    var freeRequestCount: int,
+    // connections
+    val connectionDescriptors: array<int>,
+    val connectionSessions: array<int>,
+    val connectionKeys: array<string>,
+    val connectionHosts: array<string>,
+    val connectionPorts: array<int>,
+    val connectionSecure: array<bool>,
+    val connectionStates: array<int>,
+    val connectionRequests: array<int>,
+    val connectionOutputs: array<string>,
+    val connectionOutputOffsets: array<int>,
+    val connectionInputs: array<string>,
+    val connectionHeaderEnds: array<int>,
+    val connectionUsed: array<int>,
+    val connectionIdleSince: array<int>,
+    val connectionDnsDescriptors: array<int>,
+    val connectionDnsIdentifiers: array<int>,
+    val connectionDnsDeadlines: array<int>,
+    val connectionDnsResent: array<int>,
+    val connectionWriteInterest: array<bool>,
+    val freeConnections: array<int>,
+    var freeConnectionCount: int,
+    // descriptor -> connection slot * 2 + role (0 socket, 1 dns)
+    val routes: array<int>,
+    // DNS cache
+    val dnsHosts: array<string>,
+    val dnsAddresses: array<string>,
+    val dnsExpires: array<int>,
+    var completions: array<HttpAsyncCompletion>,
+    var nextId: int,
+    var activeRequests: int,
+    var connectionsOpened: int
+) {
+    trusted fun drop(): void {
+        var slot = 0
+        while (slot < this.connectionStates.size) {
+            if (this.connectionStates[slot] != 0) {
+                if (this.connectionSessions[slot] != 0) {
+                    SSL_free(nativePointerFromAddress(this.connectionSessions[slot]))
+                    this.connectionSessions[slot] = 0
+                }
+                if (this.connectionDescriptors[slot] >= 0) {
+                    linuxTcpCloseDescriptor(this.connectionDescriptors[slot])
+                }
+                if (this.connectionDnsDescriptors[slot] >= 0) {
+                    linuxTcpCloseDescriptor(this.connectionDnsDescriptors[slot])
+                }
+                this.connectionStates[slot] = 0
+            }
+            slot = slot + 1
+        }
+        if (this.sslContext != 0) {
+            SSL_CTX_free(nativePointerFromAddress(this.sslContext))
+            this.sslContext = 0
+        }
+        this.poller.close()
+        return
+    }
+}
+
+fun httpAsyncClient(options: HttpAsyncOptions = HttpAsyncOptions()): HttpAsyncClient =
+    HttpAsyncClient(
+        socketPoller(), options, 0, options.nameserver, HttpAsyncRead("", 0),
+        [], [], [], [], [], [], [], [], [], [], [], 0,
+        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
+        [], [], [], 0,
+        [], [], [], [], [], 1, 0, 0
+    )
+
+// ---------------------------------------------------------------------------
+// Parsing and native helpers
+
+fun httpAsyncParseUrl(url: string): HttpAsyncTarget {
+    var secure = true
+    var rest = url
+    if (textFindSequence(url, "https://", 0, url.size) == 0) {
+        rest = url.slice(8, url.size)
+    } else if (textFindSequence(url, "http://", 0, url.size) == 0) {
+        secure = false
+        rest = url.slice(7, url.size)
+    } else return HttpAsyncTarget(true, "", 0, "", false)
+    var slash = textFindByte(rest, 47, 0, rest.size)
+    if (slash < 0) slash = rest.size
+    val authority = rest.slice(0, slash)
+    val path = if (slash < rest.size) rest.slice(slash, rest.size) else "/"
+    var host = authority
+    var port = if (secure) 443 else 80
+    val colon = textFindByte(authority, 58, 0, authority.size)
+    if (colon >= 0) {
+        host = authority.slice(0, colon)
+        port = httpDecimalLength(authority.slice(colon + 1, authority.size), 65535)
+    }
+    HttpAsyncTarget(secure, host, port, path, host != "" && port > 0)
+}
+
+fun httpAsyncRender(
+    method: string,
+    target: HttpAsyncTarget,
+    headers: array<HttpHeader>,
+    body: string
+): string {
+    var output = "$method ${target.path} HTTP/1.1\r\n"
+    var hasHost = false
+    var hasLength = false
+    var index = 0
+    while (index < headers.size) {
+        val header = headers[index]
+        if (httpAsciiEqualInsensitive(header.name, "Host")) hasHost = true
+        if (httpAsciiEqualInsensitive(header.name, "Content-Length")) hasLength = true
+        output = "$output${header.name}: ${header.value}\r\n"
+        index = index + 1
+    }
+    if (!hasHost) {
+        val defaultPort = if (target.secure) 443 else 80
+        output = if (target.port == defaultPort) "${output}Host: ${target.host}\r\n"
+            else "${output}Host: ${target.host}:${target.port}\r\n"
+    }
+    if (!hasLength && (body.size > 0 || method == "POST" || method == "PUT" ||
+        method == "PATCH")) output = "${output}Content-Length: ${body.size}\r\n"
+    "$output\r\n$body"
+}
+
+fun httpAsyncNumericIpv4(host: string): string =
+    if (host == "localhost") "127.0.0.1"
+    else if (ipv4SocketAddress(host, 1).isValid()) host
+    else ""
+
+// Starts a nonblocking IPv4 connect. Returns the descriptor (connected or in
+// progress) or a negative errno.
+fun httpAsyncConnect(address: string, port: int): int {
+    val octets = linuxIpv4Octets(address)
+    if (octets.size != 4) return -22
+    // AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC
+    val descriptor = linuxSyscall3(41, 2, 526337, 0)
+    if (descriptor < 0) return descriptor
+    val socketAddress = nativeByteBuffer(16)
+    linuxNetStoreU16(socketAddress, 0, 2)
+    socketAddress.store(2, port / 256)
+    socketAddress.store(3, port - port / 256 * 256)
+    var octet = 0
+    while (octet < 4) {
+        socketAddress.store(4 + octet, octets[octet])
+        octet = octet + 1
+    }
+    var connected = linuxSyscall3(
+        42, descriptor, nativePointerAddress(socketAddress.address), 16
+    )
+    while (connected == -4) connected = linuxSyscall3(
+        42, descriptor, nativePointerAddress(socketAddress.address), 16
+    )
+    socketAddress.close()
+    if (connected == 0 || connected == -115) {
+        // TCP_NODELAY: requests are written in one piece.
+        val enabled = nativeByteBuffer(8)
+        linuxNetStoreU32(enabled, 0, 1)
+        linuxSyscall5(54, descriptor, 6, 1, nativePointerAddress(enabled.address), 4)
+        enabled.close()
+        descriptor
+    } else {
+        linuxTcpCloseDescriptor(descriptor)
+        connected
+    }
+}
+
+fun httpAsyncSocketError(descriptor: int): int {
+    val error = nativeByteBuffer(8)
+    val errorLength = nativeByteBuffer(8)
+    linuxNetStoreU32(error, 0, 0)
+    linuxNetStoreU32(errorLength, 0, 4)
+    val inspected = linuxSyscall5(
+        55, descriptor, 1, 4,
+        nativePointerAddress(error.address),
+        nativePointerAddress(errorLength.address)
+    )
+    val result = if (inspected == 0) linuxNetReadNativeU32(error, 0) else -inspected
+    error.close()
+    errorLength.close()
+    result
+}
+
+trusted fun httpAsyncPlainRead(descriptor: int, var result: HttpAsyncRead): void {
+    val stack = nativeStackAllocate(65536)
+    var measured = linuxSyscall3(0, descriptor, stack, 65536)
+    while (measured == -4) measured = linuxSyscall3(0, descriptor, stack, 65536)
+    result.status = measured
+    if (measured > 0) {
+        val target = nativeByteBuffer(measured + 1)
+        ablaUnsafeCopyMemory(nativePointerAddress(target.address), stack, measured)
+        result.text = target.adoptString(measured)
+    } else result.text = ""
+    return
+}
+
+// Status > 0: bytes read. Otherwise -(SSL_get_error) so 2 = want read,
+// 3 = want write, 6 = clean close, other values are failures.
+trusted fun httpAsyncTlsRead(session: int, var result: HttpAsyncRead): void {
+    val stack = nativeStackAllocate(16384)
+    val pointer = nativePointerFromAddress(session)
+    val measured: int = SSL_read(pointer, nativePointerFromAddress(stack), 16384)
+    if (measured > 0) {
+        val target = nativeByteBuffer(measured + 1)
+        ablaUnsafeCopyMemory(nativePointerAddress(target.address), stack, measured)
+        result.text = target.adoptString(measured)
+        result.status = measured
+    } else {
+        result.text = ""
+        val code: int = SSL_get_error(pointer, i32(measured))
+        result.status = -code
+    }
+    return
+}
+
+// Returns bytes written, or -(SSL_get_error).
+trusted fun httpAsyncTlsWrite(session: int, contents: string, offset: int): int {
+    val pointer = nativePointerFromAddress(session)
+    val length = contents.size - offset
+    val written: int = SSL_write(pointer, contents.slice(offset, contents.size), length)
+    if (written > 0) written
+    else {
+        val code: int = SSL_get_error(pointer, i32(written))
+        0 - code
+    }
+}
+
+// Returns 1 when complete, -(SSL_get_error) while in progress or failed.
+trusted fun httpAsyncTlsHandshake(session: int): int {
+    val pointer = nativePointerFromAddress(session)
+    val result: int = SSL_connect(pointer)
+    if (result == 1) {
+        if (SSL_get_verify_result(pointer) == 0) 1 else -100
+    } else {
+        val code: int = SSL_get_error(pointer, i32(result))
+        0 - code
+    }
+}
+
+trusted fun httpAsyncTlsSession(context: int, host: string, descriptor: int): int {
+    val session = SSL_new(nativePointerFromAddress(context))
+    if (pointerIsNull(session)) return 0
+    var ready = SSL_ctrl(session, 55, 0, host) == 1 &&
+        SSL_set1_host(session, host) == i32(1) &&
+        SSL_set_fd(session, descriptor) == i32(1)
+    // SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER
+    if (ready) SSL_ctrl(session, 33, 3, "")
+    if (!ready) {
+        SSL_free(session)
+        0
+    } else nativePointerAddress(session)
+}
+
+trusted fun httpAsyncTlsContext(caPath: string): int {
+    val context = SSL_CTX_new(TLS_client_method())
+    if (pointerIsNull(context)) return 0
+    SSL_CTX_set_verify(context, 1, nativeNullPointer())
+    val loaded = if (caPath != "")
+        SSL_CTX_load_verify_locations(context, caPath, nativeNullPointer()) == i32(1)
+    else SSL_CTX_set_default_verify_paths(context) == i32(1)
+    if (!loaded) {
+        SSL_CTX_free(context)
+        0
+    } else nativePointerAddress(context)
+}
+
+trusted fun httpAsyncTlsFree(session: int): void {
+    if (session != 0) {
+        val pointer = nativePointerFromAddress(session)
+        SSL_shutdown(pointer)
+        SSL_free(pointer)
+    }
+    return
+}
+
+// ---------------------------------------------------------------------------
+// Bookkeeping
+
+fun HttpAsyncClient.route(descriptor: int, value: int): void {
+    while (this.routes.size <= descriptor) this.routes.append(-1)
+    this.routes[descriptor] = value
+    return
+}
+
+fun HttpAsyncClient.unroute(descriptor: int): void {
+    if (descriptor >= 0 && descriptor < this.routes.size) this.routes[descriptor] = -1
+    return
+}
+
+fun HttpAsyncClient.complete(
+    request: int,
+    status: int,
+    headers: array<HttpHeader>,
+    body: string,
+    error: string
+): void {
+    if (request >= 0 && this.requestStates[request] != 0) {
+        this.completions.append(HttpAsyncCompletion(
+            this.requestIds[request], status, headers, body, error,
+            linuxMonotonicMilliseconds() - this.requestStarted[request]
+        ))
+        this.requestStates[request] = httpAsyncRequestFree
+        this.requestPayloads[request] = ""
+        if (this.freeRequestCount < this.freeRequests.size) {
+            this.freeRequests[this.freeRequestCount] = request
+        } else this.freeRequests.append(request)
+        this.freeRequestCount = this.freeRequestCount + 1
+        this.activeRequests = this.activeRequests - 1
+    }
+    return
+}
+
+fun HttpAsyncClient.closeConnection(slot: int): void {
+    if (slot >= 0 && this.connectionStates[slot] != 0) {
+        httpAsyncTlsFree(this.connectionSessions[slot])
+        this.connectionSessions[slot] = 0
+        val descriptor = this.connectionDescriptors[slot]
+        if (descriptor >= 0) {
+            this.poller.unwatchDescriptor(descriptor)
+            this.unroute(descriptor)
+            linuxTcpCloseDescriptor(descriptor)
+            this.connectionDescriptors[slot] = -1
+        }
+        val dns = this.connectionDnsDescriptors[slot]
+        if (dns >= 0) {
+            this.poller.unwatchDescriptor(dns)
+            this.unroute(dns)
+            linuxTcpCloseDescriptor(dns)
+            this.connectionDnsDescriptors[slot] = -1
+        }
+        this.connectionStates[slot] = httpAsyncConnectionFree
+        this.connectionRequests[slot] = -1
+        this.connectionOutputs[slot] = ""
+        this.connectionInputs[slot] = ""
+        if (this.freeConnectionCount < this.freeConnections.size) {
+            this.freeConnections[this.freeConnectionCount] = slot
+        } else this.freeConnections.append(slot)
+        this.freeConnectionCount = this.freeConnectionCount + 1
+    }
+    return
+}
+
+// Fails the connection's request (if any) and closes the connection. A
+// request whose reused keep-alive connection died before any response byte
+// is requeued once instead.
+fun HttpAsyncClient.fail(slot: int, error: string): void {
+    val request = this.connectionRequests[slot]
+    val retry = request >= 0 && this.connectionUsed[slot] > 1 &&
+        this.connectionInputs[slot] == "" && !this.requestRetried[request] &&
+        this.connectionStates[slot] >= httpAsyncConnectionWriting
+    this.closeConnection(slot)
+    if (retry) {
+        this.requestRetried[request] = true
+        this.requestStates[request] = httpAsyncRequestQueued
+    } else if (request >= 0) this.complete(request, 0, [], "", error)
+    return
+}
+
+fun HttpAsyncClient.interest(slot: int, write: bool): void {
+    if (this.connectionWriteInterest[slot] != write) {
+        this.poller.modifyDescriptor(this.connectionDescriptors[slot], true, write)
+        this.connectionWriteInterest[slot] = write
+    }
+    return
+}
+
+fun HttpAsyncClient.allocateConnection(request: int): int {
+    var slot = -1
+    if (this.freeConnectionCount > 0) {
+        this.freeConnectionCount = this.freeConnectionCount - 1
+        slot = this.freeConnections[this.freeConnectionCount]
+    } else {
+        slot = this.connectionStates.size
+        this.connectionDescriptors.append(-1)
+        this.connectionSessions.append(0)
+        this.connectionKeys.append("")
+        this.connectionHosts.append("")
+        this.connectionPorts.append(0)
+        this.connectionSecure.append(false)
+        this.connectionStates.append(0)
+        this.connectionRequests.append(-1)
+        this.connectionOutputs.append("")
+        this.connectionOutputOffsets.append(0)
+        this.connectionInputs.append("")
+        this.connectionHeaderEnds.append(-1)
+        this.connectionUsed.append(0)
+        this.connectionIdleSince.append(0)
+        this.connectionDnsDescriptors.append(-1)
+        this.connectionDnsIdentifiers.append(0)
+        this.connectionDnsDeadlines.append(0)
+        this.connectionDnsResent.append(0)
+        this.connectionWriteInterest.append(false)
+    }
+    this.connectionDescriptors[slot] = -1
+    this.connectionSessions[slot] = 0
+    this.connectionKeys[slot] = this.requestKeys[request]
+    this.connectionHosts[slot] = this.requestHosts[request]
+    this.connectionPorts[slot] = this.requestPorts[request]
+    this.connectionSecure[slot] = this.requestSecure[request]
+    this.connectionRequests[slot] = -1
+    this.connectionOutputs[slot] = ""
+    this.connectionOutputOffsets[slot] = 0
+    this.connectionInputs[slot] = ""
+    this.connectionHeaderEnds[slot] = -1
+    this.connectionUsed[slot] = 0
+    this.connectionDnsDescriptors[slot] = -1
+    this.connectionWriteInterest[slot] = false
+    slot
+}
+
+// ---------------------------------------------------------------------------
+// Connection state machine
+
+fun HttpAsyncClient.cachedAddress(host: string): string {
+    val numeric = httpAsyncNumericIpv4(host)
+    if (numeric != "") return numeric
+    val now = linuxMonotonicMilliseconds()
+    var result = ""
+    var index = 0
+    while (result == "" && index < this.dnsHosts.size) {
+        if (this.dnsHosts[index] == host && this.dnsExpires[index] > now) {
+            result = this.dnsAddresses[index]
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun HttpAsyncClient.remember(host: string, address: string, ttlSeconds: int): void {
+    var ttl = ttlSeconds
+    if (ttl > this.options.dnsCacheSeconds) ttl = this.options.dnsCacheSeconds
+    if (ttl < 1) ttl = 1
+    val expires = linuxMonotonicMilliseconds() + ttl * 1000
+    var index = 0
+    var stored = false
+    while (!stored && index < this.dnsHosts.size) {
+        if (this.dnsHosts[index] == host) {
+            this.dnsAddresses[index] = address
+            this.dnsExpires[index] = expires
+            stored = true
+        }
+        index = index + 1
+    }
+    if (!stored) {
+        this.dnsHosts.append(host)
+        this.dnsAddresses.append(address)
+        this.dnsExpires.append(expires)
+    }
+    return
+}
+
+fun HttpAsyncClient.sendDnsQuery(slot: int): bool {
+    if (this.nameserver == "") this.nameserver = dnsConfiguredServer()
+    var socket = UdpSocket(this.connectionDnsDescriptors[slot])
+    val sent = socket.sendTo(
+        dnsQuery(this.connectionHosts[slot], 1, this.connectionDnsIdentifiers[slot]),
+        ipv4SocketAddress(this.nameserver, 53)
+    )
+    socket.descriptor = -1
+    sent.succeeded()
+}
+
+fun HttpAsyncClient.startResolve(slot: int): void {
+    var socket = udpBindPort(0)
+    socket.setNonblocking()
+    val descriptor = socket.descriptor
+    socket.descriptor = -1
+    if (descriptor < 0) {
+        this.fail(slot, "dns socket failed")
+        return
+    }
+    val entropy = secureRandomBytes(2)
+    this.connectionDnsIdentifiers[slot] = if (entropy.succeeded)
+        entropy.bytes[0] * 256 + entropy.bytes[1] else 4242
+    this.connectionDnsDescriptors[slot] = descriptor
+    this.connectionDnsDeadlines[slot] = linuxMonotonicMilliseconds() +
+        this.options.dnsTimeoutMilliseconds
+    this.connectionDnsResent[slot] = linuxMonotonicMilliseconds()
+    this.connectionStates[slot] = httpAsyncConnectionResolving
+    this.route(descriptor, slot * 2 + 1)
+    this.poller.watchDescriptor(descriptor)
+    if (!this.sendDnsQuery(slot)) this.fail(slot, "dns send failed")
+    return
+}
+
+fun HttpAsyncClient.dnsReady(slot: int): void {
+    var socket = UdpSocket(this.connectionDnsDescriptors[slot])
+    val datagram = socket.receiveFrom(4096)
+    socket.descriptor = -1
+    if (!datagram.received) return
+    val resolution = dnsParseResponse(datagram.bytes, this.connectionDnsIdentifiers[slot])
+    if (!resolution.succeeded) return
+    var address = ""
+    var ttl = 0
+    var index = 0
+    while (address == "" && index < resolution.addresses.size) {
+        if (resolution.addresses[index].family == 4) {
+            address = resolution.addresses[index].address
+            ttl = resolution.addresses[index].ttlSeconds
+        }
+        index = index + 1
+    }
+    val dns = this.connectionDnsDescriptors[slot]
+    this.poller.unwatchDescriptor(dns)
+    this.unroute(dns)
+    linuxTcpCloseDescriptor(dns)
+    this.connectionDnsDescriptors[slot] = -1
+    if (address == "") this.fail(slot, "dns: no IPv4 address for ${this.connectionHosts[slot]}")
+    else {
+        this.remember(this.connectionHosts[slot], address, ttl)
+        this.startConnect(slot, address)
+    }
+    return
+}
+
+fun HttpAsyncClient.startConnect(slot: int, address: string): void {
+    val descriptor = httpAsyncConnect(address, this.connectionPorts[slot])
+    if (descriptor < 0) {
+        this.fail(slot, "connect failed (errno ${-descriptor})")
+        return
+    }
+    this.connectionDescriptors[slot] = descriptor
+    this.connectionsOpened = this.connectionsOpened + 1
+    this.connectionStates[slot] = httpAsyncConnectionConnecting
+    this.route(descriptor, slot * 2)
+    this.poller.watchDescriptor(descriptor, true, true)
+    this.connectionWriteInterest[slot] = true
+    return
+}
+
+fun HttpAsyncClient.connected(slot: int): void {
+    if (this.connectionSecure[slot]) {
+        if (this.sslContext == 0) {
+            this.sslContext = httpAsyncTlsContext(this.options.caPath)
+        }
+        val session = if (this.sslContext == 0) 0 else httpAsyncTlsSession(
+            this.sslContext, this.connectionHosts[slot], this.connectionDescriptors[slot]
+        )
+        if (session == 0) {
+            this.fail(slot, "tls setup failed")
+            return
+        }
+        this.connectionSessions[slot] = session
+        this.connectionStates[slot] = httpAsyncConnectionHandshaking
+        this.handshake(slot)
+    } else this.beginWrite(slot)
+    return
+}
+
+fun HttpAsyncClient.handshake(slot: int): void {
+    val result = httpAsyncTlsHandshake(this.connectionSessions[slot])
+    if (result == 1) this.beginWrite(slot)
+    else if (result == -2) this.interest(slot, false)
+    else if (result == -3) this.interest(slot, true)
+    else if (result == -100) this.fail(slot, "tls certificate verification failed")
+    else this.fail(slot, "tls handshake failed")
+    return
+}
+
+// Moves a connected (or pooled idle) connection onto its assigned request.
+fun HttpAsyncClient.beginWrite(slot: int): void {
+    val request = this.connectionRequests[slot]
+    if (request < 0) {
+        this.connectionStates[slot] = httpAsyncConnectionIdle
+        this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
+        this.interest(slot, false)
+        return
+    }
+    this.connectionStates[slot] = httpAsyncConnectionWriting
+    this.connectionOutputs[slot] = this.requestPayloads[request]
+    this.connectionOutputOffsets[slot] = 0
+    this.connectionInputs[slot] = ""
+    this.connectionHeaderEnds[slot] = -1
+    this.connectionUsed[slot] = this.connectionUsed[slot] + 1
+    this.writeReady(slot)
+    return
+}
+
+fun HttpAsyncClient.writeReady(slot: int): void {
+    var writing = true
+    while (writing && this.connectionStates[slot] == httpAsyncConnectionWriting) {
+        val offset = this.connectionOutputOffsets[slot]
+        val output = this.connectionOutputs[slot]
+        if (offset >= output.size) {
+            this.connectionOutputs[slot] = ""
+            this.connectionStates[slot] = httpAsyncConnectionReading
+            this.interest(slot, false)
+            writing = false
+        } else if (this.connectionSecure[slot]) {
+            val written = httpAsyncTlsWrite(this.connectionSessions[slot], output, offset)
+            if (written > 0) this.connectionOutputOffsets[slot] = offset + written
+            else if (written == -3 || written == -2) {
+                this.interest(slot, written == -3)
+                writing = false
+            } else {
+                this.fail(slot, "tls write failed")
+                writing = false
+            }
+        } else {
+            var connection = TcpConnection(this.connectionDescriptors[slot])
+            val result = connection.writeCompact(output, offset)
+            connection.descriptor = -1
+            if (result.written > 0) {
+                this.connectionOutputOffsets[slot] = offset + result.written
+            }
+            if (result.status == "error") {
+                if (result.errorCode == 11) this.interest(slot, true)
+                else this.fail(slot, "write failed")
+                writing = false
+            }
+        }
+    }
+    return
+}
+
+// Inspects buffered response bytes; completes the request when the message
+// is whole. Returns true when the response finished.
+fun HttpAsyncClient.parseResponse(slot: int, eof: bool): bool {
+    val input = this.connectionInputs[slot]
+    if (this.connectionHeaderEnds[slot] < 0) {
+        this.connectionHeaderEnds[slot] = httpHeaderEnd(input)
+        if (this.connectionHeaderEnds[slot] < 0) {
+            if (eof) this.fail(slot, "connection closed before response")
+            else if (input.size > 65536) this.fail(slot, "response header too large")
+            return false
+        }
+    }
+    val headerEnd = this.connectionHeaderEnds[slot]
+    val head = httpParseResponseBounded(input.slice(0, headerEnd), 0)
+    val response = head.response
+    val bodyBytes = input.size - headerEnd
+    val maximum = this.options.maximumResponseBytes
+    val chunked = httpCoreHeaderTokenContains(
+        response.header("Transfer-Encoding"), "chunked"
+    )
+    val lengthHeader = response.header("Content-Length")
+    var complete = false
+    var body = ""
+    var keepAlive = !httpCoreHeaderTokenContains(response.header("Connection"), "close") &&
+        textFindSequence(input, "HTTP/1.1", 0, 8) == 0
+    if (response.status == 204 || response.status == 304) complete = true
+    else if (chunked) {
+        val decoded = httpCoreDecodeChunked(input.slice(headerEnd, input.size), maximum)
+        if (!decoded.valid) {
+            this.fail(slot, "invalid chunked response")
+            return false
+        }
+        complete = decoded.complete
+        body = decoded.body
+    } else if (lengthHeader != "") {
+        val expected = httpDecimalLength(lengthHeader, maximum)
+        if (expected < 0) {
+            this.fail(slot, "response too large")
+            return false
+        }
+        if (bodyBytes >= expected) {
+            complete = true
+            body = input.slice(headerEnd, headerEnd + expected)
+        }
+    } else {
+        keepAlive = false
+        complete = eof
+        body = input.slice(headerEnd, input.size)
+    }
+    if (!complete) {
+        if (eof) this.fail(slot, "connection closed mid-response")
+        else if (bodyBytes > maximum) this.fail(slot, "response too large")
+        return false
+    }
+    val request = this.connectionRequests[slot]
+    this.connectionRequests[slot] = -1
+    this.connectionInputs[slot] = ""
+    this.complete(request, response.status, response.headers, body, "")
+    if (keepAlive && !eof) {
+        this.connectionStates[slot] = httpAsyncConnectionIdle
+        this.connectionIdleSince[slot] = linuxMonotonicMilliseconds()
+    } else this.closeConnection(slot)
+    true
+}
+
+fun HttpAsyncClient.readReady(slot: int): void {
+    var reading = true
+    while (reading && this.connectionStates[slot] != 0) {
+        if (this.connectionSecure[slot]) {
+            httpAsyncTlsRead(this.connectionSessions[slot], this.reader)
+        } else httpAsyncPlainRead(this.connectionDescriptors[slot], this.reader)
+        val status = this.reader.status
+        val chunk = this.reader.text
+        this.reader.text = ""
+        val state = this.connectionStates[slot]
+        if (status > 0) {
+            if (state == httpAsyncConnectionIdle) {
+                // Unsolicited bytes on a pooled connection: drop it.
+                this.closeConnection(slot)
+                reading = false
+            } else if (state == httpAsyncConnectionReading) {
+                this.connectionInputs[slot] = if (this.connectionInputs[slot] == "")
+                    chunk else "${this.connectionInputs[slot]}$chunk"
+                if (this.parseResponse(slot, false)) reading = false
+            }
+        } else {
+            val secure = this.connectionSecure[slot]
+            val wouldBlock = if (secure) status == -2 || status == -3
+                else status == -11
+            if (wouldBlock) {
+                if (secure && status == -3) this.interest(slot, true)
+                reading = false
+            } else {
+                // EOF, clean TLS close, or error.
+                if (state == httpAsyncConnectionReading) this.parseResponse(slot, true)
+                else if (state == httpAsyncConnectionIdle) this.closeConnection(slot)
+                else this.fail(slot, "connection closed")
+                reading = false
+            }
+        }
+    }
+    return
+}
+
+fun HttpAsyncClient.socketReady(slot: int, readable: bool, writable: bool, failed: bool): void {
+    val state = this.connectionStates[slot]
+    if (state == httpAsyncConnectionConnecting) {
+        if (writable || failed) {
+            val error = httpAsyncSocketError(this.connectionDescriptors[slot])
+            if (error != 0) this.fail(slot, "connect failed (errno $error)")
+            else {
+                this.interest(slot, false)
+                this.connected(slot)
+            }
+        }
+    } else if (state == httpAsyncConnectionHandshaking) this.handshake(slot)
+    else if (state == httpAsyncConnectionWriting) {
+        if (this.connectionSecure[slot] || writable) this.writeReady(slot)
+        else if (failed) this.fail(slot, "connection lost")
+    } else if (state == httpAsyncConnectionReading ||
+        state == httpAsyncConnectionIdle) {
+        if (readable || failed) this.readReady(slot)
+        else if (writable && this.connectionSecure[slot]) this.readReady(slot)
+    }
+    return
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch, timers, and the public API
+
+fun HttpAsyncClient.connectionsFor(key: string): int {
+    var count = 0
+    var slot = 0
+    while (slot < this.connectionStates.size) {
+        if (this.connectionStates[slot] != 0 && this.connectionKeys[slot] == key) {
+            count = count + 1
+        }
+        slot = slot + 1
+    }
+    count
+}
+
+fun HttpAsyncClient.idleConnection(key: string): int {
+    var found = -1
+    var slot = 0
+    while (found < 0 && slot < this.connectionStates.size) {
+        if (this.connectionStates[slot] == httpAsyncConnectionIdle &&
+            this.connectionKeys[slot] == key) found = slot
+        slot = slot + 1
+    }
+    found
+}
+
+fun HttpAsyncClient.dispatch(): void {
+    var request = 0
+    while (request < this.requestStates.size) {
+        if (this.requestStates[request] == httpAsyncRequestQueued) {
+            val key = this.requestKeys[request]
+            val idle = this.idleConnection(key)
+            if (idle >= 0) {
+                this.requestStates[request] = httpAsyncRequestActive
+                this.connectionRequests[idle] = request
+                this.beginWrite(idle)
+            } else if (this.connectionsFor(key) < this.options.maximumConnectionsPerHost) {
+                this.requestStates[request] = httpAsyncRequestActive
+                val slot = this.allocateConnection(request)
+                this.connectionRequests[slot] = request
+                val address = this.cachedAddress(this.requestHosts[request])
+                if (address != "") this.startConnect(slot, address)
+                else this.startResolve(slot)
+            }
+        }
+        request = request + 1
+    }
+    return
+}
+
+fun HttpAsyncClient.sweep(now: int): void {
+    var request = 0
+    while (request < this.requestStates.size) {
+        if (this.requestStates[request] != 0 && now >= this.requestDeadlines[request]) {
+            var owner = -1
+            var slot = 0
+            while (owner < 0 && slot < this.connectionStates.size) {
+                if (this.connectionStates[slot] != 0 &&
+                    this.connectionRequests[slot] == request) owner = slot
+                slot = slot + 1
+            }
+            if (owner >= 0) {
+                this.connectionRequests[owner] = -1
+                this.closeConnection(owner)
+            }
+            this.complete(request, 0, [], "", "timeout")
+        }
+        request = request + 1
+    }
+    var slot = 0
+    while (slot < this.connectionStates.size) {
+        val state = this.connectionStates[slot]
+        if (state == httpAsyncConnectionResolving) {
+            if (now >= this.connectionDnsDeadlines[slot]) this.fail(slot, "dns timeout")
+            else if (now - this.connectionDnsResent[slot] >= 1000) {
+                this.connectionDnsResent[slot] = now
+                this.sendDnsQuery(slot)
+            }
+        } else if (state == httpAsyncConnectionIdle &&
+            now - this.connectionIdleSince[slot] >= this.options.idleTimeoutMilliseconds) {
+            this.closeConnection(slot)
+        }
+        slot = slot + 1
+    }
+    return
+}
+
+// Queues a request and returns its id; the completion carries the same id.
+fun HttpAsyncClient.request(
+    method: string,
+    url: string,
+    headers: array<HttpHeader> = [],
+    body: string = "",
+    timeoutMilliseconds: int = 10000
+): int {
+    val id = this.nextId
+    this.nextId = this.nextId + 1
+    val target = httpAsyncParseUrl(url)
+    var slot = -1
+    if (this.freeRequestCount > 0) {
+        this.freeRequestCount = this.freeRequestCount - 1
+        slot = this.freeRequests[this.freeRequestCount]
+    } else {
+        slot = this.requestStates.size
+        this.requestIds.append(0)
+        this.requestStates.append(0)
+        this.requestKeys.append("")
+        this.requestHosts.append("")
+        this.requestPorts.append(0)
+        this.requestSecure.append(false)
+        this.requestPayloads.append("")
+        this.requestDeadlines.append(0)
+        this.requestStarted.append(0)
+        this.requestRetried.append(false)
+    }
+    val now = linuxMonotonicMilliseconds()
+    this.requestIds[slot] = id
+    this.requestStates[slot] = httpAsyncRequestQueued
+    this.requestKeys[slot] = "${if (target.secure) "https" else "http"}://${target.host}:${target.port}"
+    this.requestHosts[slot] = target.host
+    this.requestPorts[slot] = target.port
+    this.requestSecure[slot] = target.secure
+    this.requestPayloads[slot] = httpAsyncRender(method, target, headers, body)
+    this.requestDeadlines[slot] = now + timeoutMilliseconds
+    this.requestStarted[slot] = now
+    this.requestRetried[slot] = false
+    this.activeRequests = this.activeRequests + 1
+    if (!target.valid) this.complete(slot, 0, [], "", "invalid URL")
+    else this.dispatch()
+    id
+}
+
+fun HttpAsyncClient.get(url: string, headers: array<HttpHeader> = [], timeoutMilliseconds: int = 10000): int =
+    this.request("GET", url, headers, "", timeoutMilliseconds)
+
+fun HttpAsyncClient.postJson(url: string, json: string, headers: array<HttpHeader> = [], timeoutMilliseconds: int = 10000): int {
+    val all: array<HttpHeader> = [HttpHeader("Content-Type", "application/json")]
+    var index = 0
+    while (index < headers.size) {
+        all.append(headers[index])
+        index = index + 1
+    }
+    this.request("POST", url, all, json, timeoutMilliseconds)
+}
+
+// Progresses every request for up to `timeoutMilliseconds` (0 never blocks).
+fun HttpAsyncClient.step(timeoutMilliseconds: int = 0): int {
+    var timeout = timeoutMilliseconds
+    if (timeout < 0) timeout = 0
+    if (this.activeRequests > 0 && timeout > 50) timeout = 50
+    val records = this.poller.waitCompact(256, timeout)
+    var handled = 0
+    var index = 0
+    while (index + 12 <= records.size) {
+        val flags = textReadU32LittleEndian(records, index)
+        val descriptor = textReadU32LittleEndian(records, index + 4)
+        if (descriptor >= 0 && descriptor < this.routes.size) {
+            val route = this.routes[descriptor]
+            if (route >= 0) {
+                val slot = route / 2
+                val readable = (flags & 1) != 0
+                val writable = (flags & 4) != 0
+                val failed = (flags & 8) != 0 || (flags & 16) != 0 ||
+                    (flags & 8192) != 0
+                if (route - slot * 2 == 1) {
+                    if (this.connectionStates[slot] == httpAsyncConnectionResolving) {
+                        this.dnsReady(slot)
+                    }
+                } else if (this.connectionStates[slot] != 0) {
+                    this.socketReady(slot, readable, writable, failed)
+                }
+                handled = handled + 1
+            }
+        }
+        index = index + 12
+    }
+    this.sweep(linuxMonotonicMilliseconds())
+    this.dispatch()
+    handled
+}
+
+fun HttpAsyncClient.takeCompletions(): array<HttpAsyncCompletion> {
+    val taken: array<HttpAsyncCompletion> = []
+    var index = 0
+    while (index < this.completions.size) {
+        taken.append(this.completions[index])
+        index = index + 1
+    }
+    this.completions = []
+    taken
+}
+
+fun HttpAsyncClient.pending(): int = this.activeRequests
+
+// The poller descriptor; register it with another event loop (for example
+// WebSocketServer.watchExternal) to wake when any request makes progress.
+fun HttpAsyncClient.pollDescriptor(): int = this.poller.descriptor

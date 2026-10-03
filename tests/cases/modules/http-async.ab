@@ -1,0 +1,125 @@
+import "abla/io"
+import "abla/http/async"
+import "abla/http/event"
+
+// A keep-alive HTTP server runs in a forked child; the nonblocking client is
+// driven from this process. A listener that never answers covers timeouts.
+
+fun asyncTestHandler(request: HttpRequest): HttpResponse {
+    if (request.path == "/echo") {
+        HttpResponse(200, [
+            HttpHeader("Content-Type", "application/json"),
+            HttpHeader("X-Seen-Key", request.header("X-API-KEY"))
+        ], request.body)
+    } else if (request.path == "/big") {
+        val output = byteBuffer()
+        var index = 0
+        while (index < 200000) {
+            output.appendByteValue(97 + index % 26)
+            index = index + 1
+        }
+        httpText(output.toText())
+    } else httpText("world:${request.path}")
+}
+
+fun asyncTestServe(port: int): int {
+    val server = httpEventServerHandler(asyncTestHandler, ipv4Loopback(port))
+    var loops = 0
+    while (loops < 3000) {
+        server.step(10)
+        loops = loops + 1
+    }
+    0
+}
+
+fun main: int {
+    // Reserve a port, release it, and let the child bind it.
+    var probe = tcpListenAddress(ipv4Loopback(0))
+    val port = probe.localPort()
+    probe.close()
+    val child = linuxSyscall0(57)
+    if (child == 0) linuxSyscall1(60, asyncTestServe(port))
+    linuxSleepMillisecondsChecked(200)
+
+    val silent = tcpListenAddress(ipv4Loopback(0))
+    val silentPort = silent.localPort()
+    var refused = tcpListenAddress(ipv4Loopback(0))
+    val refusedPort = refused.localPort()
+    refused.close()
+
+    val client = httpAsyncClient(HttpAsyncOptions(maximumConnectionsPerHost = 4))
+    val base = "http://127.0.0.1:$port"
+    val ids: array<int> = []
+    var index = 0
+    while (index < 12) {
+        ids.append(client.get("$base/hello$index"))
+        index = index + 1
+    }
+    val echo = client.postJson(
+        "$base/echo", "{\"grant\":42}",
+        [HttpHeader("X-API-KEY", "secret"), HttpHeader("Idempotency-Key", "k-1")]
+    )
+    val big = client.get("$base/big")
+    val timeout = client.request("GET", "http://127.0.0.1:$silentPort/", [], "", 300)
+    val refusal = client.get("http://127.0.0.1:$refusedPort/")
+    val invalid = client.get("ftp://nowhere")
+
+    var failures = 0
+    var helloes = 0
+    var received = 0
+    var loops = 0
+    while (received < 17 && loops < 2000) {
+        client.step(10)
+        val done = client.takeCompletions()
+        var item = 0
+        while (item < done.size) {
+            val completion = done[item]
+            received = received + 1
+            if (completion.id == echo) {
+                if (completion.status != 200 || completion.body != "{\"grant\":42}" ||
+                    completion.header("X-Seen-Key") != "secret") {
+                    println("echo: ${completion.status} ${completion.error} ${completion.body}")
+                    failures = failures + 1
+                }
+            } else if (completion.id == big) {
+                if (completion.status != 200 || completion.body.size != 200000) {
+                    println("big: ${completion.status} ${completion.error} ${completion.body.size}")
+                    failures = failures + 1
+                }
+            } else if (completion.id == timeout) {
+                if (completion.error != "timeout") failures = failures + 1
+            } else if (completion.id == refusal) {
+                if (completion.succeeded()) failures = failures + 1
+            } else if (completion.id == invalid) {
+                if (completion.error != "invalid URL") failures = failures + 1
+            } else {
+                val position = completion.id - ids[0]
+                if (completion.status == 200 &&
+                    completion.body == "world:/hello$position") helloes = helloes + 1
+                else println("hello: ${completion.status} ${completion.error} ${completion.body}")
+            }
+            item = item + 1
+        }
+        loops = loops + 1
+    }
+    // Keep-alive: a second wave reuses pooled connections.
+    val opened = client.connectionsOpened
+    val again = client.get("$base/again")
+    var reused = false
+    loops = 0
+    while (!reused && loops < 500) {
+        client.step(10)
+        val done = client.takeCompletions()
+        if (done.size == 1 && done[0].id == again && done[0].status == 200) reused = true
+        loops = loops + 1
+    }
+    val pooled = client.connectionsOpened == opened
+    linuxSyscall2(62, child, 9)
+    linuxWaitProcess(child)
+    if (failures == 0 && helloes == 12 && received == 17 && reused && pooled &&
+        opened <= 6 && client.pending() == 0) 42
+    else {
+        println("failures=$failures helloes=$helloes received=$received reused=$reused pooled=$pooled opened=$opened pending=${client.pending()}")
+        1
+    }
+}
