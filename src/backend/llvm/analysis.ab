@@ -634,6 +634,75 @@ fun bootstrapLlvmGcRootPlan(
         instruction = instruction + 1
     }
 
+    // A value defined before a loop and used inside it stays live around the
+    // back-edge: the next iteration reads it again after every collector in
+    // the loop body ran. Linear (definition, last textual use) intervals miss
+    // that, so `for (e in makeEvents()) { allocate(); use(e) }` left the
+    // iterated array unrooted and a collection mid-loop freed it. Extend such
+    // intervals to the back-edge, to a fixpoint for nested loops.
+    var maximumLabel = -1
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "label" && candidate.target > maximumLabel) {
+            maximumLabel = candidate.target
+        }
+        instruction = instruction + 1
+    }
+    val labelAt: array<int> = []
+    while (labelAt.size <= maximumLabel) labelAt.append(-1)
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "label" && candidate.target >= 0) {
+            labelAt[candidate.target] = instruction
+        }
+        instruction = instruction + 1
+    }
+    val loopStarts: array<int> = []
+    val loopEnds: array<int> = []
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "jump" || candidate.opcode == "branch") {
+            var edge = 0
+            while (edge < 2) {
+                val label = if (edge == 0) candidate.target
+                    else if (candidate.opcode == "branch") candidate.alternate
+                    else -1
+                if (label >= 0 && label <= maximumLabel) {
+                    val start = labelAt[label]
+                    if (start >= 0 && start <= instruction) {
+                        loopStarts.append(start)
+                        loopEnds.append(instruction)
+                    }
+                }
+                edge = edge + 1
+            }
+        }
+        instruction = instruction + 1
+    }
+    var extended = loopStarts.size > 0
+    while (extended) {
+        extended = false
+        var loop = 0
+        while (loop < loopStarts.size) {
+            val start = loopStarts[loop]
+            val end = loopEnds[loop]
+            value = 0
+            while (value < valueCount) {
+                val definition = definitions[value]
+                if (definition >= 0 && definition < start &&
+                    lastUses[value] >= start && lastUses[value] < end) {
+                    lastUses[value] = end
+                    extended = true
+                }
+                value = value + 1
+            }
+            loop = loop + 1
+        }
+    }
+
     value = 0
     while (value < valueCount) {
         val definition = definitions[value]

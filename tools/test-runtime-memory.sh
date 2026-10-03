@@ -40,6 +40,16 @@ rg -q '^define (hidden|internal) void @abla_runtime_memory_pressure\(\)' \
     "$directory/pressure.ll"
 rg -Fq 'call void @abla_runtime_memory_pressure()' \
     "$directory/pressure.ll"
+loop_roots_program="$directory/loop-roots-program"
+"$compiler" build \
+    "$project_root/tests/cases/modules/runtime-memory-loop-roots.ab" \
+    -o "$loop_roots_program" --no-cache
+set +e
+ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=60 \
+    "$project_root/tools/run-limited.sh" "$loop_roots_program"
+status=$?
+set -e
+[[ $status -eq 42 ]]
 "$compiler" build "$project_root/tests/cases/modules/runtime-memory.ab" \
     -o "$program"
 [[ -s $program.o ]]
