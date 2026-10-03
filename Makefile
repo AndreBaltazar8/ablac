@@ -44,7 +44,9 @@ ablac: $(COMPILER)
 # Compiler-development loop: rebuild the current sources with --fast (skips the
 # whole-module O2 pipeline, ~20s instead of ~3min). The result compiles programs
 # several times slower than the release compiler, so ship with `make ablac`.
-ablac-dev: $(COMPILER)
+# Depends only on *a* compiler existing (bootstrap), never on rebuilding the
+# release payload from the changed sources first.
+ablac-dev: bootstrap
 	ABLA_SYSROOT=$(CURDIR) $(COMPILER_PAYLOAD) build $(COMPILER_ENTRY) \
 		-o $(BUILD_DIR)/ablac-dev --no-cache --fast
 
@@ -69,6 +71,7 @@ test: ablac
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)
 	tools/test-internal-function.sh $(COMPILER)
+	tools/test-static-strings.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
 check: test self-rebuild
