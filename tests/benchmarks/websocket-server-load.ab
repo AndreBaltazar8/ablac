@@ -1,0 +1,126 @@
+// Load harness for abla/websocket/server shaped like an authoritative game
+// host: a fixed 20 Hz tick broadcasts a ~1 KiB snapshot to every open
+// connection while client input messages are drained between ticks.
+//
+//     websocket-server-load [port=9101] [seconds=20] [tickHz=20] [bytes=1024]
+//         [collect=1]
+//
+// Drive it with tools/websocket-load-client.ts (Bun). One summary line per
+// second reports open sockets, inbound messages, outbound frames/bytes, the
+// cost of the tick (broadcast + flush) and the event-loop share of wall time.
+
+import "abla/io"
+import "abla/memory"
+import "abla/process/arguments"
+import "abla/websocket/server"
+
+fun loadArgument(index: int, fallback: int): int {
+    if (processArgumentCount() > index) {
+        val parsed = httpDecimalLength(processArgument(index), 1000000000)
+        if (parsed > 0) parsed else fallback
+    } else fallback
+}
+
+fun loadFiller(size: int): string {
+    val output = byteBuffer()
+    var index = 0
+    while (index < size) {
+        output.appendByteValue(97 + index % 26)
+        index = index + 1
+    }
+    output.toText()
+}
+
+fun main: int {
+    val port = loadArgument(0, 9101)
+    val seconds = loadArgument(1, 20)
+    val tickHz = loadArgument(2, 20)
+    val bytes = loadArgument(3, 1024)
+    // Enables automatic collection safe points (0 leaves the heap growing).
+    if (loadArgument(4, 1) == 1) memorySetLimit(1073741824)
+    val server = webSocketServer(
+        ipv4Any(port),
+        WebSocketServerOptions(maximumConnections = 20000, backlog = 4096)
+    )
+    server.enableGracefulShutdown()
+    println("listening on $port for ${seconds}s, tick ${tickHz}Hz, payload ${bytes}B")
+    val filler = loadFiller(bytes - 32)
+    val tickMicros = 1000000 / tickHz
+    var now = linuxMonotonicNanoseconds() / 1000
+    val end = now + seconds * 1000000
+    var nextTick = now + tickMicros
+    var nextReport = now + 1000000
+    var tick = 0
+    var inbound = 0
+    var opened = 0
+    var closed = 0
+    var tickCostTotal = 0
+    var tickCostMax = 0
+    var ticksInWindow = 0
+    var busyMicros = 0
+    var lastFrames = 0
+    var lastBytes = 0
+    var lastWrites = 0
+    var lateTicks = 0
+    while (!server.shutdownRequested() && now < end) {
+        var waitMicros = nextTick - now
+        if (waitMicros < 0) waitMicros = 0
+        server.step(waitMicros / 1000)
+        val busyStart = linuxMonotonicNanoseconds() / 1000
+        val events = server.takeEvents()
+        var index = 0
+        while (index < events.size) {
+            val event = events[index]
+            if (event.isMessage()) inbound = inbound + 1
+            else if (event.isOpen()) opened = opened + 1
+            else if (event.isClose()) {
+                closed = closed + 1
+                if (now < end - 2000000) {
+                    println("close id=${event.id} code=${event.code} reason=${event.reason}")
+                }
+            }
+            index = index + 1
+        }
+        now = linuxMonotonicNanoseconds() / 1000
+        if (now >= nextTick) {
+            if (now - nextTick > tickMicros) lateTicks = lateTicks + 1
+            val started = now
+            tick = tick + 1
+            val frame = webSocketServerEncode(
+                "{\"t\":$tick,\"us\":$now,\"d\":\"$filler\"}", false
+            )
+            server.broadcastEncoded(frame)
+            server.flush()
+            val cost = linuxMonotonicNanoseconds() / 1000 - started
+            tickCostTotal = tickCostTotal + cost
+            if (cost > tickCostMax) tickCostMax = cost
+            ticksInWindow = ticksInWindow + 1
+            nextTick = nextTick + tickMicros
+            if (nextTick < now) nextTick = now + tickMicros
+        }
+        now = linuxMonotonicNanoseconds() / 1000
+        busyMicros = busyMicros + (now - busyStart)
+        if (now >= nextReport) {
+            val stats = server.stats
+            val frames = stats.framesOut - lastFrames
+            val sent = stats.bytesOut - lastBytes
+            val writes = stats.writeCalls - lastWrites
+            lastFrames = stats.framesOut
+            lastBytes = stats.bytesOut
+            lastWrites = stats.writeCalls
+            val average = if (ticksInWindow > 0) tickCostTotal / ticksInWindow else 0
+            println("open=${server.openCount()} opened=$opened closed=$closed in=$inbound/s framesOut=$frames/s out=${sent / 1024}KiB/s writes=$writes/s ticks=$ticksInWindow tickAvg=${average}us tickMax=${tickCostMax}us late=$lateTicks loopBusy=${busyMicros / 10000}% live=${memoryLiveBytes() / 1048576}MiB backpressure=${stats.backpressureCloses}")
+            inbound = 0
+            opened = 0
+            closed = 0
+            tickCostTotal = 0
+            tickCostMax = 0
+            ticksInWindow = 0
+            busyMicros = 0
+            nextReport = nextReport + 1000000
+        }
+    }
+    server.drain()
+    println("drained: accepted=${server.stats.accepted} released=${server.stats.released}")
+    0
+}

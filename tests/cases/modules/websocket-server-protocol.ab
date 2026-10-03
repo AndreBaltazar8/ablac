@@ -1,0 +1,188 @@
+import "abla/io"
+import "abla/websocket/server"
+
+// Clients run in forked child processes: Abla threads that allocate
+// concurrently are not yet safe on every host runtime.
+
+val protocolUpgrade = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+
+fun protocolPattern(size: int): string {
+    val output = byteBuffer()
+    var index = 0
+    while (index < size) {
+        output.appendByteValue((index * 31 + 7) & 255)
+        index = index + 1
+    }
+    output.toText()
+}
+
+// Reads frames after the 101 response until `count` frames are decoded.
+fun protocolFrames(
+    var connection: TcpConnection,
+    count: int,
+    handshakeFirst: bool
+): array<WebSocketFrame> {
+    val frames: array<WebSocketFrame> = []
+    var buffered = ""
+    var handshake = handshakeFirst
+    var reading = true
+    while (reading) {
+        val incoming = connection.readWithTimeoutResult(65536, 2000)
+        if (!incoming.hasData()) reading = false
+        else {
+            buffered = "$buffered${incoming.bytes}"
+            if (handshake) {
+                val end = httpHeaderEnd(buffered)
+                if (end > 0) {
+                    buffered = buffered.slice(end, buffered.size)
+                    handshake = false
+                }
+            }
+            var decoding = !handshake
+            while (decoding) {
+                val decoded = webSocketDecodeFrame(buffered, 4194304)
+                if (decoded.succeeded()) {
+                    frames.append(decoded.frame)
+                    buffered = buffered.slice(decoded.consumed, buffered.size)
+                } else decoding = false
+            }
+            reading = frames.size < count
+        }
+    }
+    frames
+}
+
+// Fragmented text, ping, 1000-byte and 70000-byte binary echoes, then an
+// invalid UTF-8 text frame that must be closed with 1007.
+fun protocolClient(port: int): int {
+    var connection = tcpConnectIpv4("127.0.0.1", port, 1000)
+    if (connection.descriptor < 0) return 1
+    val medium = protocolPattern(1000)
+    val large = protocolPattern(70000)
+    connection.write("$protocolUpgrade${webSocketEncodeFrame("frag", 1, false, "abcd")}${webSocketEncodeFrame("ment", 0, true, "efgh")}${webSocketEncodeFrame("p!", 9, true, "ijkl")}${webSocketEncodeFrame(medium, 2, true, "m\xffn\x01")}")
+    connection.write(webSocketEncodeFrame(large, 2, true, "\x10\x20\x30\x40"))
+    val frames = protocolFrames(connection, 4, true)
+    // Only after the echoes: once the server sends its close frame, RFC 6455
+    // forbids further data frames, so replies queued later are dropped.
+    connection.write(webSocketEncodeFrame("\xc3\x28", 1, true, "qrst"))
+    val closing = protocolFrames(connection, 1, false)
+    if (closing.size == 1) frames.append(closing[0])
+    connection.close()
+    if (frames.size != 5) return 10 + frames.size
+    // The pong is written while the read is processed; echoes follow once the
+    // application handles the message events.
+    if (frames[0].opcode != 10 || frames[0].payload != "p!") return 21
+    if (frames[1].opcode != 1 || frames[1].payload != "fragment") return 20
+    if (frames[2].opcode != 2 || frames[2].payload != medium) return 22
+    if (frames[3].opcode != 2 || frames[3].payload != large) return 23
+    if (frames[4].opcode != 8 || frames[4].payload.size < 2 ||
+        frames[4].payload[0] * 256 + frames[4].payload[1] != 1007) return 24
+    0
+}
+
+// Never answers pings: the idle timer must release it.
+fun protocolSilentClient(port: int): int {
+    var connection = tcpConnectIpv4("127.0.0.1", port, 1000)
+    if (connection.descriptor < 0) return 1
+    connection.write(protocolUpgrade)
+    val frames = protocolFrames(connection, 100, true)
+    connection.close()
+    var pings = 0
+    var index = 0
+    while (index < frames.size) {
+        if (frames[index].opcode == 9) pings = pings + 1
+        index = index + 1
+    }
+    if (pings >= 1) 0 else 30
+}
+
+// Never reads: the server's send backlog must exceed its cap.
+fun protocolStalledClient(port: int): int {
+    var connection = tcpConnectIpv4("127.0.0.1", port, 1000)
+    if (connection.descriptor < 0) return 1
+    connection.write("${protocolUpgrade}${webSocketEncodeFrame("flood", 1, true, "abcd")}")
+    linuxSleepMillisecondsChecked(1500)
+    connection.close()
+    0
+}
+
+fun protocolSpawn(role: int, port: int): LinuxChildProcess {
+    val process = linuxSyscall0(57)
+    if (process == 0) {
+        val status = if (role == 0) protocolClient(port)
+            else if (role == 1) protocolSilentClient(port)
+            else protocolStalledClient(port)
+        linuxSyscall1(60, status)
+    }
+    LinuxChildProcess(process)
+}
+
+fun main: int {
+    val server = webSocketServer(
+        ipv4Loopback(0),
+        WebSocketServerOptions(
+            pingIntervalMilliseconds = 100,
+            idleTimeoutMilliseconds = 400,
+            maximumPendingBytes = 262144
+        )
+    )
+    val port = server.localPort()
+    val children = [
+        protocolSpawn(0, port), protocolSpawn(1, port), protocolSpawn(2, port)
+    ]
+    val statuses = [-1, -1, -1]
+    var finished = 0
+    var idleClosed = 0
+    var backpressureClosed = 0
+    var invalidClosed = 0
+    var echoed = 0
+    var flooding = -1
+    var loops = 0
+    val chunk = protocolPattern(65536)
+    while (finished < 3 && loops < 4000) {
+        server.step(2)
+        val events = server.takeEvents()
+        var index = 0
+        while (index < events.size) {
+            val event = events[index]
+            if (event.isMessage()) {
+                if (event.payload == "flood") flooding = event.id
+                else {
+                    server.send(event.id, event.payload, event.binary)
+                    echoed = echoed + 1
+                }
+            } else if (event.isClose()) {
+                if (event.reason == "idle timeout") idleClosed = idleClosed + 1
+                if (event.code == 1013) backpressureClosed = backpressureClosed + 1
+                if (event.code == 1007) invalidClosed = invalidClosed + 1
+                if (event.id == flooding) flooding = -1
+            }
+            index = index + 1
+        }
+        if (flooding > 0) server.send(flooding, chunk, true)
+        var child = 0
+        while (child < 3) {
+            if (statuses[child] < 0) {
+                val waited = linuxWaitProcess(children[child].process, true)
+                if (waited.output != "pending") {
+                    statuses[child] = waited.status
+                    finished = finished + 1
+                }
+            }
+            child = child + 1
+        }
+        loops = loops + 1
+    }
+    val a = statuses[0]
+    val b = statuses[1]
+    val c = statuses[2]
+    server.step(10)
+    server.drain()
+    if (a == 0 && b == 0 && c == 0 && echoed == 3 && idleClosed == 1 &&
+        backpressureClosed == 1 && invalidClosed == 1 &&
+        server.connectionCount() == 0) 42
+    else {
+        println("a=$a b=$b c=$c echoed=$echoed idle=$idleClosed backpressure=$backpressureClosed invalid=$invalidClosed active=${server.connectionCount()}")
+        1
+    }
+}

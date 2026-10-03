@@ -1,0 +1,164 @@
+import "abla/websocket/server"
+import "abla/io"
+
+// Clients run in forked child processes: Abla threads that allocate
+// concurrently are not yet safe on every host runtime.
+
+val serverTestUpgrade = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+
+fun serverTestRead(var connection: TcpConnection, wanted: int): string {
+    var response = ""
+    var reading = true
+    while (reading) {
+        val incoming = connection.readWithTimeoutResult(65536, 2000)
+        if (incoming.hasData()) {
+            response = "${response}${incoming.bytes}"
+            reading = response.size < wanted
+        } else reading = false
+    }
+    response
+}
+
+// Admitted client: handshake with a query token, one text message, expects a
+// direct reply plus a broadcast, then performs the closing handshake.
+fun serverTestAdmittedClient(port: int): int {
+    var connection = tcpConnectIpv4("127.0.0.1", port, 1000)
+    if (connection.descriptor < 0) return 1
+    val request = "GET /ws?at=tok%2Ben&tk=7 HTTP/1.1\r\nHost: localhost\r\n$serverTestUpgrade"
+    connection.write(
+        "$request${webSocketEncodeFrame("hello", 1, true, "mask")}"
+    )
+    val response = serverTestRead(connection, 129 + 7 + 11)
+    var status = 0
+    val headerEnd = httpHeaderEnd(response)
+    if (headerEnd < 0 || response.slice(0, 12) != "HTTP/1.1 101") status = 2
+    if (status == 0) {
+        val first = webSocketDecodeFrame(response.slice(headerEnd, response.size))
+        if (!first.succeeded() || first.frame.payload != "re:hello") status = 3
+        else {
+            val second = webSocketDecodeFrame(
+                response.slice(headerEnd + first.consumed, response.size)
+            )
+            if (!second.succeeded() || second.frame.payload != "all" ||
+                second.frame.opcode != 2) status = 4
+        }
+    }
+    connection.write(webSocketEncodeFrame(
+        webSocketClosePayload(1000, "bye"), 8, true, "mask"
+    ))
+    val closing = serverTestRead(connection, 4)
+    val echo = webSocketDecodeFrame(closing)
+    if (status == 0 && (!echo.succeeded() || echo.frame.opcode != 8)) status = 5
+    connection.close()
+    status
+}
+
+fun serverTestRejectedClient(port: int): int {
+    var connection = tcpConnectIpv4("127.0.0.1", port, 1000)
+    if (connection.descriptor < 0) return 1
+    connection.write("GET /ws HTTP/1.1\r\nHost: localhost\r\n$serverTestUpgrade")
+    val response = serverTestRead(connection, 1000000)
+    connection.close()
+    if (response.slice(0, 12) == "HTTP/1.1 401" &&
+        textFindSequence(response, "no token", 0, response.size) > 0) 0 else 6
+}
+
+fun serverTestHttpClient(port: int): int {
+    var connection = tcpConnectIpv4("127.0.0.1", port, 1000)
+    if (connection.descriptor < 0) return 1
+    connection.write("POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nping")
+    val response = serverTestRead(connection, 1000000)
+    connection.close()
+    if (response.slice(0, 12) == "HTTP/1.1 200" &&
+        textFindSequence(response, "{\"body\":\"ping\"}", 0, response.size) > 0
+    ) 0 else 7
+}
+
+fun serverTestSpawn(role: string, port: int): LinuxChildProcess {
+    val process = linuxSyscall0(57)
+    if (process == 0) {
+        val status = if (role == "admitted") serverTestAdmittedClient(port)
+            else if (role == "rejected") serverTestRejectedClient(port)
+            else serverTestHttpClient(port)
+        linuxSyscall1(60, status)
+    }
+    LinuxChildProcess(process)
+}
+
+fun serverTestRunning(child: LinuxChildProcess, var statuses: array<int>): bool {
+    val waited = linuxWaitProcess(child.process, true)
+    if (waited.output != "pending") statuses.append(waited.status)
+    waited.output == "pending"
+}
+
+fun main: int {
+    val server = webSocketServer(
+        ipv4Loopback(0), WebSocketServerOptions(manualAdmission = true)
+    )
+    val port = server.localPort()
+    val children = [
+        serverTestSpawn("admitted", port),
+        serverTestSpawn("rejected", port),
+        serverTestSpawn("http", port)
+    ]
+    val statuses: array<int> = []
+    val running = [true, true, true]
+    var failures = 0
+    var opened = 0
+    var messages = 0
+    var closes = 0
+    var closeCode = 0
+    var loops = 0
+    while (statuses.size < 3 && loops < 3000) {
+        server.step(5)
+        val events = server.takeEvents()
+        var index = 0
+        while (index < events.size) {
+            val event = events[index]
+            if (event.isRequest()) {
+                if (event.query("at") == "") {
+                    server.reject(event.id, 401, "no token")
+                } else if (event.query("at") == "tok+en" &&
+                    event.query("tk") == "7" && event.path() == "/ws") {
+                    if (server.accept(event.id)) opened = opened + 1
+                } else failures = failures + 1
+            } else if (event.isMessage()) {
+                messages = messages + 1
+                if (event.payload != "hello" || event.binary) failures = failures + 1
+                server.sendText(event.id, "re:${event.payload}")
+                server.broadcast("all", true)
+            } else if (event.isHttp()) {
+                server.respond(
+                    event.id, httpJson("{\"body\":\"${event.body()}\"}")
+                )
+            } else if (event.isClose()) {
+                closes = closes + 1
+                if (event.code == 1000) closeCode = event.code
+            }
+            index = index + 1
+        }
+        var child = 0
+        while (child < 3) {
+            if (running[child]) {
+                running[child] = serverTestRunning(children[child], statuses)
+            }
+            child = child + 1
+        }
+        loops = loops + 1
+    }
+    server.step(10)
+    server.drain()
+    var clientFailures = 0
+    var index = 0
+    while (index < statuses.size) {
+        if (statuses[index] != 0) clientFailures = clientFailures + 1
+        index = index + 1
+    }
+    if (statuses.size == 3 && clientFailures == 0 && failures == 0 &&
+        opened == 1 && messages == 1 && closeCode == 1000 &&
+        server.connectionCount() == 0 && server.stopped) 42
+    else {
+        println("statuses=${statuses.size} clientFailures=$clientFailures failures=$failures opened=$opened messages=$messages closes=$closes code=$closeCode active=${server.connectionCount()}")
+        1
+    }
+}
