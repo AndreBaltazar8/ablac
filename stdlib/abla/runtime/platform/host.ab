@@ -139,6 +139,8 @@ var __ablaRuntimeHostRegionPageCache: int = 0
 var __ablaRuntimeHostRegionPageCacheCount: int = 0
 var __ablaRuntimeHostCollectionEnabled: bool = false
 var __ablaRuntimeHostCollectionThreshold: int = 33554432
+// Least growth of the tracked heap past what a collection kept before the next.
+var __ablaRuntimeHostCollectionGrowth: int = 67108864
 var __ablaRuntimeHostCollectionIndex: int = 0
 var __ablaRuntimeHostCollectionCount: int = 0
 var __ablaRuntimeHostCollectionIndexCapacity: int = 0
@@ -537,6 +539,11 @@ trusted fun __ablaRuntimePlatformMemoryReset(checkpoint: int): void {
 trusted fun __ablaRuntimePlatformMemoryLiveBytes(): int =
     __ablaRuntimeHostLiveBytes
 
+// Allocator numbers for diagnostics (see the wasm platform); the host's
+// system allocator reports only 4, tracked live bytes.
+trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int =
+    if (which == 4) __ablaRuntimeHostLiveBytes else 0
+
 trusted fun __ablaRuntimePlatformMemoryLimit(): int =
     if (__ablaRuntimeHostLimit == 0) 4611686018427387903
     else __ablaRuntimeHostLimit
@@ -548,6 +555,23 @@ trusted fun __ablaRuntimePlatformMemorySetLimit(limit: int): void {
     val latest = limit - limit / 4
     if (__ablaRuntimeHostCollectionThreshold > latest) {
         __ablaRuntimeHostCollectionThreshold = latest
+    }
+    return
+}
+
+// Collect under allocation pressure once the tracked heap has grown `bytes`
+// (or half again, if more) past what the last collection kept.
+trusted fun __ablaRuntimePlatformMemorySetCollectionGrowth(bytes: int): void {
+    if (bytes <= 0) ablaRuntimeTrap()
+    __ablaRuntimeHostCollectionGrowth = bytes
+    // Pressure collection caps its threshold below the limit: give it one.
+    if (__ablaRuntimeHostLimit == 0) {
+        __ablaRuntimeHostLimit = __ablaRuntimePlatformMemoryLimit()
+    }
+    __ablaRuntimeHostCollectionEnabled = true
+    val next = __ablaRuntimeHostLiveBytes + bytes
+    if (__ablaRuntimeHostCollectionThreshold > next) {
+        __ablaRuntimeHostCollectionThreshold = next
     }
     return
 }
@@ -817,15 +841,16 @@ trusted fun __ablaRuntimeMemoryPressure(): int {
             __ablaRuntimeHostCollectionThreshold) return 0
     __ablaRuntimePlatformMemoryCollect()
     val reserve = 67108864
-    val growth = if (__ablaRuntimeHostLiveBytes / 2 > reserve) {
+    val least = __ablaRuntimeHostCollectionGrowth
+    val growth = if (__ablaRuntimeHostLiveBytes / 2 > least) {
         __ablaRuntimeHostLiveBytes / 2
-    } else reserve
+    } else least
     var next = __ablaRuntimeHostLiveBytes + growth
     val latest = __ablaRuntimeHostLimit -
         if (__ablaRuntimeHostLimit / 4 < reserve) {
             __ablaRuntimeHostLimit / 4
         } else reserve
-    if (next < 33554432) next = 33554432
+    if (next < least / 2) next = least / 2
     if (next > latest) next = latest
     __ablaRuntimeHostCollectionThreshold = next
     0

@@ -103,7 +103,10 @@ fun bootstrapLlvmNeedsSharedRuntime(program: BootstrapIrProgram): bool {
     needed
 }
 
-fun bootstrapLlvmNeedsCollector(program: BootstrapIrProgram): bool {
+fun bootstrapLlvmNeedsCollector(
+    program: BootstrapIrProgram,
+    exports: array<BootstrapExportRequest>
+): bool {
     val names: array<string> = []
     var function = 0
     while (function < program.functions.size) {
@@ -112,22 +115,58 @@ fun bootstrapLlvmNeedsCollector(program: BootstrapIrProgram): bool {
     }
     val functionIndex = bootstrapLlvmNameIndex(names)
     val addressTaken = bootstrapLlvmAddressTaken(program, functionIndex)
-    val reachable: array<bool> = []
+    val fromMain: array<bool> = []
     function = 0
     while (function < program.functions.size) {
-        reachable.append(program.functions[function].name == "main" ||
+        fromMain.append(program.functions[function].name == "main" ||
             program.functions[function].name == "__bootstrap_globals")
         function = function + 1
     }
-    val pending: array<int> = []
+    if (bootstrapLlvmReachesCall(program, functionIndex, addressTaken, fromMain, [
+        "runtimeMemoryCollect", "runtimeMemorySetLimit", "runtimeMemorySetCollectionGrowth"
+    ])) return true
+    // A module's exports are entry points too (a wasm host calls them, not main),
+    // but there only an explicit opt-in turns on collection under pressure: an
+    // export that just collects (between frames, say) keeps its callees unrooted.
+    val fromExports: array<bool> = []
     function = 0
-    while (function < reachable.size) {
-        if (reachable[function]) pending.append(function)
+    while (function < program.functions.size) {
+        fromExports.append(false)
+        function = function + 1
+    }
+    var entryIndex = 0
+    while (entryIndex < exports.size) {
+        if (!exports[entryIndex].internal) {
+            val entry = functionIndex.find(exports[entryIndex].source)
+            if (entry >= 0) fromExports[entry] = true
+            val named = functionIndex.find(exports[entryIndex].name)
+            if (named >= 0) fromExports[named] = true
+        }
+        entryIndex = entryIndex + 1
+    }
+    bootstrapLlvmReachesCall(program, functionIndex, addressTaken, fromExports, [
+        "runtimeMemorySetLimit", "runtimeMemorySetCollectionGrowth"
+    ])
+}
+
+// Does any function reachable from `seeds` call one of `targets`?
+fun bootstrapLlvmReachesCall(
+    program: BootstrapIrProgram,
+    functionIndex: BootstrapLlvmNameIndex,
+    addressTaken: array<bool>,
+    seeds: array<bool>,
+    targets: array<string>
+): bool {
+    val reachable: array<bool> = []
+    val pending: array<int> = []
+    var function = 0
+    while (function < seeds.size) {
+        reachable.append(seeds[function])
+        if (seeds[function]) pending.append(function)
         function = function + 1
     }
     var cursor = 0
-    var needed = false
-    while (cursor < pending.size && !needed) {
+    while (cursor < pending.size) {
         function = pending[cursor]
         cursor = cursor + 1
         var instruction = 0
@@ -135,12 +174,12 @@ fun bootstrapLlvmNeedsCollector(program: BootstrapIrProgram): bool {
                program.functions[function].instructions.size) {
             val candidate =
                 program.functions[function].instructions[instruction]
-            if (candidate.opcode == "call" &&
-                (candidate.text == "runtimeMemoryCollect" ||
-                 candidate.text == "runtimeMemorySetLimit")) {
-                needed = true
-            }
             if (candidate.opcode == "call") {
+                var target = 0
+                while (target < targets.size) {
+                    if (candidate.text == targets[target]) return true
+                    target = target + 1
+                }
                 val called = functionIndex.find(candidate.text)
                 if (called >= 0 && !reachable[called]) {
                     reachable[called] = true
@@ -161,7 +200,7 @@ fun bootstrapLlvmNeedsCollector(program: BootstrapIrProgram): bool {
             instruction = instruction + 1
         }
     }
-    needed
+    false
 }
 
 class BootstrapLlvmNameIndex(
@@ -501,9 +540,10 @@ fun bootstrapLlvmInstructionMayAllocate(
 fun bootstrapLlvmCollectingFunctions(
     program: BootstrapIrProgram,
     functionIndex: BootstrapLlvmNameIndex,
-    addressTaken: array<bool>
+    addressTaken: array<bool>,
+    exports: array<BootstrapExportRequest>
 ): array<bool> {
-    val automaticPressure = bootstrapLlvmNeedsCollector(program)
+    val automaticPressure = bootstrapLlvmNeedsCollector(program, exports)
     val result: array<bool> = []
     var function = 0
     while (function < program.functions.size) {

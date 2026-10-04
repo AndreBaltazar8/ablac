@@ -74,13 +74,16 @@ trusted fun __ablaRuntimeWasmBump(bytes: int): int {
     if (end > __ablaRuntimeWasmHeapLimit) {
         val currentPages = __ablaRuntimeWasmHeapLimit >>> 16
         val requiredPages = (end + 65535) >>> 16
-        // Grow at least geometrically so a stream of small blocks does not
-        // pay one memory.grow per page.
+        // Grow by at least an eighth (1-16 MiB) so a stream of small blocks
+        // does not pay one memory.grow per page; linear memory never shrinks,
+        // so a big heap must not overshoot by half of itself.
         var growth = requiredPages - currentPages
-        val doubling = currentPages / 2
-        if (growth < doubling &&
-            ((currentPages + doubling) << 16) <=
-                __ablaRuntimeWasmMemoryMaximum) growth = doubling
+        var step = currentPages / 8
+        if (step < 16) step = 16
+        if (step > 256) step = 256
+        if (growth < step &&
+            ((currentPages + step) << 16) <=
+                __ablaRuntimeWasmMemoryMaximum) growth = step
         val previous = ablaRuntimeWasmMemoryGrow(growth)
         if (previous < 0) ablaRuntimeTrap()
         __ablaRuntimeWasmHeapLimit = (previous + growth) << 16
@@ -183,6 +186,8 @@ var __ablaRuntimeWasmAllocationHead: int = 0
 var __ablaRuntimeWasmAllocationTail: int = 0
 var __ablaRuntimeWasmAllocationCount: int = 0
 var __ablaRuntimeWasmLiveBytes: int = 0
+var __ablaRuntimeWasmLivePeak: int = 0
+var __ablaRuntimeWasmCollections: int = 0
 var __ablaRuntimeWasmLimit: int = 4294967295
 var __ablaRuntimeWasmRegionCache: int = 0
 var __ablaRuntimeWasmRegionCacheCount: int = 0
@@ -190,6 +195,8 @@ var __ablaRuntimeWasmRegionPageCache: int = 0
 var __ablaRuntimeWasmRegionPageCacheCount: int = 0
 var __ablaRuntimeWasmCollectionEnabled: bool = false
 var __ablaRuntimeWasmCollectionThreshold: int = 33554432
+// Least growth of the tracked heap past what a collection kept before the next.
+var __ablaRuntimeWasmCollectionGrowth: int = 67108864
 var __ablaRuntimeWasmCollectionIndex: int = 0
 var __ablaRuntimeWasmCollectionCount: int = 0
 var __ablaRuntimeWasmCollectionIndexCapacity: int = 0
@@ -417,6 +424,9 @@ trusted fun __ablaRuntimeWasmTrackedAllocate(size: int, layout: int): int {
         __ablaRuntimeWasmCollectionMaximum = end
     }
     __ablaRuntimeWasmLiveBytes = __ablaRuntimeWasmLiveBytes + size
+    if (__ablaRuntimeWasmLiveBytes > __ablaRuntimeWasmLivePeak) {
+        __ablaRuntimeWasmLivePeak = __ablaRuntimeWasmLiveBytes
+    }
     payload
 }
 
@@ -478,6 +488,55 @@ trusted fun __ablaRuntimePlatformMemoryReset(checkpoint: int): void {
 trusted fun __ablaRuntimePlatformMemoryLiveBytes(): int =
     __ablaRuntimeWasmLiveBytes
 
+// Allocator numbers for diagnostics: 0 linear memory bytes, 1 bytes the bump
+// cursor has handed out, 2 bytes parked on the small free lists, 3 bytes parked
+// on the large free list (both with headers), 4 tracked live bytes,
+// 5 collections run, 6 the most tracked bytes ever live at once.
+trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int {
+    if (which == 0) return ablaRuntimeWasmMemorySize() << 16
+    if (which == 1) {
+        if (__ablaRuntimeWasmHeapCursor == 0) return 0
+        return __ablaRuntimeWasmHeapCursor - ((ablaRuntimeWasmHeapBase() + 15) & -16)
+    }
+    if (which == 2) {
+        if (__ablaRuntimeWasmFreeLists == 0) return 0
+        var total = 0
+        var sizeClass = 0
+        while (sizeClass < __ablaRuntimeWasmClassCount) {
+            var block = ablaRuntimeLoadI64(__ablaRuntimeWasmFreeLists + sizeClass * 8)
+            while (block != 0) {
+                total = total + 16 + __ablaRuntimeWasmClassBytes(sizeClass)
+                block = ablaRuntimeLoadI64(block)
+            }
+            sizeClass = sizeClass + 1
+        }
+        return total
+    }
+    if (which == 3) {
+        var total = 0
+        var block = __ablaRuntimeWasmLargeFree
+        while (block != 0) {
+            total = total + 16 + ablaRuntimeLoadI64(block - 16)
+            block = ablaRuntimeLoadI64(block)
+        }
+        return total
+    }
+    if (which == 4) return __ablaRuntimeWasmLiveBytes
+    if (which == 5) return __ablaRuntimeWasmCollections
+    if (which == 6) return __ablaRuntimeWasmLivePeak
+    // 16 + k: bytes parked on size class k's free list.
+    if (which >= 16 && which < 16 + __ablaRuntimeWasmClassCount && __ablaRuntimeWasmFreeLists != 0) {
+        var total = 0
+        var block = ablaRuntimeLoadI64(__ablaRuntimeWasmFreeLists + (which - 16) * 8)
+        while (block != 0) {
+            total = total + 16 + __ablaRuntimeWasmClassBytes(which - 16)
+            block = ablaRuntimeLoadI64(block)
+        }
+        return total
+    }
+    0
+}
+
 trusted fun __ablaRuntimePlatformMemoryLimit(): int = __ablaRuntimeWasmLimit
 
 trusted fun __ablaRuntimePlatformMemorySetLimit(limit: int): void {
@@ -488,6 +547,19 @@ trusted fun __ablaRuntimePlatformMemorySetLimit(limit: int): void {
     val latest = limit - limit / 4
     if (__ablaRuntimeWasmCollectionThreshold > latest) {
         __ablaRuntimeWasmCollectionThreshold = latest
+    }
+    return
+}
+
+// Collect under allocation pressure once the tracked heap has grown `bytes`
+// (or half again, if more) past what the last collection kept.
+trusted fun __ablaRuntimePlatformMemorySetCollectionGrowth(bytes: int): void {
+    if (bytes <= 0) ablaRuntimeTrap()
+    __ablaRuntimeWasmCollectionGrowth = bytes
+    __ablaRuntimeWasmCollectionEnabled = true
+    val next = __ablaRuntimeWasmLiveBytes + bytes
+    if (__ablaRuntimeWasmCollectionThreshold > next) {
+        __ablaRuntimeWasmCollectionThreshold = next
     }
     return
 }
@@ -655,6 +727,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     // Region pages are reclaimed as a unit and may hold references into the
     // tracked heap, so collection waits for the outermost region to end.
     if (__ablaRuntimeWasmRegion != 0) return 0
+    __ablaRuntimeWasmCollections = __ablaRuntimeWasmCollections + 1
     val before = __ablaRuntimeWasmLiveBytes
     val allocationCount = __ablaRuntimeWasmAllocationCount
     if (allocationCount == 0) return 0
@@ -758,15 +831,16 @@ trusted fun __ablaRuntimeMemoryPressure(): int {
             __ablaRuntimeWasmCollectionThreshold) return 0
     __ablaRuntimePlatformMemoryCollect()
     val reserve = 67108864
-    val growth = if (__ablaRuntimeWasmLiveBytes / 2 > reserve) {
+    val least = __ablaRuntimeWasmCollectionGrowth
+    val growth = if (__ablaRuntimeWasmLiveBytes / 2 > least) {
         __ablaRuntimeWasmLiveBytes / 2
-    } else reserve
+    } else least
     var next = __ablaRuntimeWasmLiveBytes + growth
     val latest = __ablaRuntimeWasmLimit -
         if (__ablaRuntimeWasmLimit / 4 < reserve) {
             __ablaRuntimeWasmLimit / 4
         } else reserve
-    if (next < 33554432) next = 33554432
+    if (next < least / 2) next = least / 2
     if (next > latest) next = latest
     __ablaRuntimeWasmCollectionThreshold = next
     0
