@@ -2707,6 +2707,24 @@ fun bootstrapMarkSourceDeclaration(
     return
 }
 
+// The module values an initializer reads directly (identifiers naming a val / var).
+fun bootstrapCollectValueReads(
+    expression: BootstrapExpression,
+    valueDeclarations: BootstrapFunctionDeclarationIndex,
+    var reads: array<int>
+): void {
+    if (expression.kind == "identifier") {
+        val value = valueDeclarations.find(expression.text)
+        if (value >= 0) reads.append(value)
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapCollectValueReads(expression.children[child], valueDeclarations, reads)
+        child = child + 1
+    }
+    return
+}
+
 fun bootstrapCollectSourceReachability(
     expression: BootstrapExpression,
     declarations: array<BootstrapDeclaration>,
@@ -7726,10 +7744,12 @@ class BootstrapLowerer(
                 this.functionDeclarations
             )
         val loweredDeclarations: array<bool> = []
+        val deferredDeclarations: array<int> = []
         val pendingDeclarations: array<int> = []
         index = 0
         while (index < parsed.declarations.size) {
             loweredDeclarations.append(false)
+            deferredDeclarations.append(0)
             if (sourceReachable[index]) pendingDeclarations.append(index)
             index = index + 1
         }
@@ -7738,6 +7758,34 @@ class BootstrapLowerer(
             index = pendingDeclarations[pendingDeclaration]
             pendingDeclaration = pendingDeclaration + 1
             if (loweredDeclarations[index]) continue
+            // Global initializers run in the order they are lowered. A value first
+            // demanded while lowering (not source-reachable up front) can read
+            // module values that are not lowered yet: lower those first, then come
+            // back to it, so each initializer sees its inputs stored. (Bounded, so a
+            // cycle between initializers still terminates.)
+            val candidateKind = parsed.declarations[index].kind
+            if ((candidateKind == "val" || candidateKind == "var") &&
+                deferredDeclarations[index] < 16) {
+                val reads: array<int> = []
+                bootstrapCollectValueReads(
+                    parsed.declarations[index].expression,
+                    this.valueDeclarations,
+                    reads
+                )
+                var unlowered = 0
+                for (read in reads) {
+                    if (read != index && !loweredDeclarations[read]) {
+                        if (!sourceReachable[read]) sourceReachable[read] = true
+                        pendingDeclarations.append(read)
+                        unlowered = unlowered + 1
+                    }
+                }
+                if (unlowered > 0) {
+                    deferredDeclarations[index] = deferredDeclarations[index] + 1
+                    pendingDeclarations.append(index)
+                    continue
+                }
+            }
             loweredDeclarations[index] = true
             val declaration = parsed.declarations[index]
             bootstrapCollectSourceReachability(
