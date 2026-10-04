@@ -429,6 +429,8 @@ fun bootstrapBuildMutableReceiverSummary(
     affineTypes: array<string>
 ): BootstrapMutableReceiverSummary {
     val summary = BootstrapMutableReceiverSummary([], [])
+    // Asked for every declaration on every pass: index the class/interface names once.
+    val managedTypes = bootstrapManagedTypeIndex(declarations)
     var changed = true
     while (changed) {
         changed = false
@@ -440,9 +442,10 @@ fun bootstrapBuildMutableReceiverSummary(
             )
             if (extensionOwner != "" &&
                 (bootstrapSummaryTypeIsAffine(extensionOwner, affineTypes) ||
-                 bootstrapSummaryTypeIsManagedReference(
+                 bootstrapSummaryTypeIsManagedReferenceIn(
                     extensionOwner,
-                    declarations
+                    managedTypes,
+                    0
                  )) &&
                 !bootstrapMutableReceiverContains(
                     summary,
@@ -459,9 +462,10 @@ fun bootstrapBuildMutableReceiverSummary(
                 changed = true
             }
             if (bootstrapSummaryTypeIsAffine(candidate.name, affineTypes) ||
-                bootstrapSummaryTypeIsManagedReference(
+                bootstrapSummaryTypeIsManagedReferenceIn(
                     candidate.name,
-                    declarations
+                    managedTypes,
+                    0
                 )) {
                 var method = 0
                 while (method < candidate.methods.size) {
@@ -1298,6 +1302,9 @@ fun bootstrapScalarTypeUnderlying(
     declarations: array<BootstrapDeclaration>,
     name: string
 ): string {
+    // Only a plain identifier can name a scalar type declaration: builtin and
+    // compound types (array:…, function:…, nullable) skip the scan.
+    if (!bootstrapCouldNameScalarType(name)) return ""
     var result = ""
     var index = 0
     while (index < declarations.size) {
@@ -1308,6 +1315,20 @@ fun bootstrapScalarTypeUnderlying(
         index = index + 1
     }
     result
+}
+
+fun bootstrapCouldNameScalarType(name: string): bool {
+    if (name.size == 0 || bootstrapScalarTypeUnderlyingValid(name)) return false
+    if (name == "int" || name == "string" || name == "void" || name == "unknown" || name == "float") return false
+    var index = 0
+    while (index < name.size) {
+        val c = name[index]
+        val letter = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c == 46 || c == 36
+        val digit = c >= 48 && c <= 57
+        if (!letter && !(digit && index > 0)) return false
+        index = index + 1
+    }
+    true
 }
 
 fun bootstrapScalarTypeUnderlyingValid(type: string): bool =
@@ -1849,6 +1870,70 @@ fun bootstrapSummaryTypeIsManagedReference(
     type: string,
     declarations: array<BootstrapDeclaration>
 ): bool = bootstrapSummaryTypeIsManagedReferenceAt(type, declarations, 0)
+
+/** bootstrapSummaryTypeIsManagedReferenceAt over an index of the class and
+ *  interface names (bootstrapManagedTypeIndex). */
+fun bootstrapSummaryTypeIsManagedReferenceIn(
+    type: string,
+    managedTypes: BootstrapFunctionDeclarationIndex,
+    depth: int
+): bool {
+    val normalized = bootstrapNormalizeType(type)
+    var managed = bootstrapIsArrayType(normalized) ||
+        bootstrapIsCellType(normalized) ||
+        managedTypes.find(normalized) >= 0
+    if (!managed && depth < 32 && bootstrapIsNullableType(normalized)) {
+        managed = bootstrapSummaryTypeIsManagedReferenceIn(
+            bootstrapNullableElementType(normalized),
+            managedTypes,
+            depth + 1
+        )
+    }
+    managed
+}
+
+/** The class and interface declarations by name. */
+fun bootstrapManagedTypeIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapFunctionDeclarationIndex {
+    val names: array<string> = []
+    val declarationIndices: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.kind == "class" || candidate.kind == "interface") {
+            names.append(candidate.name)
+            declarationIndices.append(declaration)
+        }
+        declaration = declaration + 1
+    }
+    var capacity = 8
+    while (capacity < names.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    var entry = 0
+    while (entry < names.size) {
+        slot = bootstrapFunctionDeclarationHash(names[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0 || names[existing] == names[entry]) {
+                slots[slot] = entry
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    BootstrapFunctionDeclarationIndex(names, declarationIndices, slots)
+}
 
 // A stable alias must become a source-linked read-only view whenever mutation
 // can be observed through nested class fields. `val` remains Kotlin-like (the
@@ -3490,6 +3575,79 @@ fun bootstrapFunctionDeclarationHash(name: string): int {
     hash
 }
 
+// Top-level (non-extension) declarations by name: how many share each name and
+// the index of the first. Name resolution asks this for every identifier.
+class BootstrapTopLevelNameIndex(
+    val names: array<string>,
+    val firsts: array<int>,
+    val counts: array<int>,
+    val slots: array<int>
+) {
+    fun find(name: string): int {
+        var result = -1
+        if (this.slots.size > 0) {
+            var slot = bootstrapFunctionDeclarationHash(name)
+            slot = slot - slot / this.slots.size * this.slots.size
+            var probes = 0
+            while (result < 0 && probes < this.slots.size &&
+                   this.slots[slot] >= 0) {
+                val entry = this.slots[slot]
+                if (this.names[entry] == name) {
+                    result = entry
+                } else {
+                    slot = slot + 1
+                    if (slot == this.slots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapTopLevelNameIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapTopLevelNameIndex {
+    var capacity = 8
+    while (capacity < declarations.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    val names: array<string> = []
+    val firsts: array<int> = []
+    val counts: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.extensionOwner == "") {
+            slot = bootstrapFunctionDeclarationHash(candidate.name)
+            slot = slot - slot / capacity * capacity
+            var placed = false
+            while (!placed) {
+                val existing = slots[slot]
+                if (existing < 0) {
+                    slots[slot] = names.size
+                    names.append(candidate.name)
+                    firsts.append(declaration)
+                    counts.append(1)
+                    placed = true
+                } else if (names[existing] == candidate.name) {
+                    counts[existing] = counts[existing] + 1
+                    placed = true
+                } else {
+                    slot = slot + 1
+                    if (slot == capacity) slot = 0
+                }
+            }
+        }
+        declaration = declaration + 1
+    }
+    BootstrapTopLevelNameIndex(names, firsts, counts, slots)
+}
+
 fun bootstrapFunctionDeclarationIndex(
     declarations: array<BootstrapDeclaration>
 ): BootstrapFunctionDeclarationIndex {
@@ -3801,7 +3959,8 @@ class BootstrapAnalyzer(
     var compileDepth: int,
     var generatorDepth: int,
     var yieldedType: string,
-    val allowContractCalls: bool
+    val allowContractCalls: bool,
+    val topLevelNames: BootstrapTopLevelNameIndex
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -4103,19 +4262,10 @@ class BootstrapAnalyzer(
     }
 
     fun topLevelDeclarationIdentity(name: string): string {
-        var identity = ""
-        var matches = 0
-        var index = 0
-        while (index < this.declarations.size) {
-            val declaration = this.declarations[index]
-            if (declaration.extensionOwner == "" &&
-                declaration.name == name) {
-                identity = "abla:${declaration.sourceIdentity}:${declaration.begin}:${declaration.name}"
-                matches = matches + 1
-            }
-            index = index + 1
-        }
-        if (matches == 1) identity else ""
+        val entry = this.topLevelNames.find(name)
+        if (entry < 0 || this.topLevelNames.counts[entry] != 1) return ""
+        val declaration = this.declarations[this.topLevelNames.firsts[entry]]
+        "abla:${declaration.sourceIdentity}:${declaration.begin}:${declaration.name}"
     }
 
     fun recordResolvedName(
@@ -8776,7 +8926,8 @@ fun bootstrapAnalyzeRequestedSourceSpans(
         0,
         0,
         "unknown",
-        typedRequestBegins.size > 0
+        typedRequestBegins.size > 0,
+        bootstrapTopLevelNameIndex(parsed.declarations)
     ).analyze(parsed)
 }
 

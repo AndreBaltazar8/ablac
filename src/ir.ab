@@ -267,8 +267,149 @@ class BootstrapIrProgram(
     val globalKinds: array<string>,
     val compileInputPaths: array<string>,
     val compileInputContents: array<string>,
-    val errors: int
+    val errors: int,
+    val lookup: BootstrapIrLookup
 )
+
+// The instruction indices the LLVM backend looks up by key: each module
+// global's (last) store and each value's (last) producer. Built once per
+// program; scanning every instruction per query made emission quadratic.
+class BootstrapIrLookup(
+    val storeNames: array<string>,
+    val storeIndices: array<int>,
+    val storeSlots: array<int>,
+    val valueKeys: array<int>,
+    val valueIndices: array<int>,
+    val valueSlots: array<int>
+) {
+    fun storeOf(name: string): int {
+        var result = -1
+        if (this.storeSlots.size > 0) {
+            var slot = bootstrapIrLookupHash(name)
+            slot = slot - slot / this.storeSlots.size * this.storeSlots.size
+            var probes = 0
+            while (result < 0 && probes < this.storeSlots.size &&
+                   this.storeSlots[slot] >= 0) {
+                val entry = this.storeSlots[slot]
+                if (this.storeNames[entry] == name) {
+                    result = this.storeIndices[entry]
+                } else {
+                    slot = slot + 1
+                    if (slot == this.storeSlots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+
+    fun producerOf(value: int): int {
+        var result = -1
+        if (this.valueSlots.size > 0) {
+            var slot = bootstrapIrLookupIntHash(value, this.valueSlots.size)
+            var probes = 0
+            while (result < 0 && probes < this.valueSlots.size &&
+                   this.valueSlots[slot] >= 0) {
+                val entry = this.valueSlots[slot]
+                if (this.valueKeys[entry] == value) {
+                    result = this.valueIndices[entry]
+                } else {
+                    slot = slot + 1
+                    if (slot == this.valueSlots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapIrLookupHash(name: string): int {
+    var hash = 0
+    var index = 0
+    while (index < name.size) {
+        hash = hash * 131 + name[index]
+        hash = hash - hash / 2147483647 * 2147483647
+        index = index + 1
+    }
+    hash
+}
+
+fun bootstrapIrLookupIntHash(value: int, size: int): int {
+    var hash = value * 40503 + 12345
+    if (hash < 0) hash = 0 - hash
+    hash - hash / size * size
+}
+
+fun bootstrapIrLookupSlots(count: int): array<int> {
+    var capacity = 8
+    while (capacity < count * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    slots
+}
+
+fun bootstrapIrLookupOf(instructions: array<BootstrapInstruction>): BootstrapIrLookup {
+    val storeNames: array<string> = []
+    val storeIndices: array<int> = []
+    val valueKeys: array<int> = []
+    val valueIndices: array<int> = []
+    var stores = 0
+    var index = 0
+    while (index < instructions.size) {
+        if (instructions[index].opcode == "global.store") stores = stores + 1
+        index = index + 1
+    }
+    val storeSlots = bootstrapIrLookupSlots(stores)
+    val valueSlots = bootstrapIrLookupSlots(instructions.size)
+    index = 0
+    while (index < instructions.size) {
+        val instruction = instructions[index]
+        if (instruction.opcode == "global.store") {
+            var slot = bootstrapIrLookupHash(instruction.text)
+            slot = slot - slot / storeSlots.size * storeSlots.size
+            var placed = false
+            while (!placed) {
+                val existing = storeSlots[slot]
+                if (existing < 0) {
+                    storeSlots[slot] = storeNames.size
+                    storeNames.append(instruction.text)
+                    storeIndices.append(index)
+                    placed = true
+                } else if (storeNames[existing] == instruction.text) {
+                    storeIndices[existing] = index
+                    placed = true
+                } else {
+                    slot = slot + 1
+                    if (slot == storeSlots.size) slot = 0
+                }
+            }
+        }
+        var slot = bootstrapIrLookupIntHash(instruction.result, valueSlots.size)
+        var placed = false
+        while (!placed) {
+            val existing = valueSlots[slot]
+            if (existing < 0) {
+                valueSlots[slot] = valueKeys.size
+                valueKeys.append(instruction.result)
+                valueIndices.append(index)
+                placed = true
+            } else if (valueKeys[existing] == instruction.result) {
+                valueIndices[existing] = index
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == valueSlots.size) slot = 0
+            }
+        }
+        index = index + 1
+    }
+    BootstrapIrLookup(storeNames, storeIndices, storeSlots, valueKeys, valueIndices, valueSlots)
+}
 
 class BootstrapIrNative(
     val name: string,
@@ -7984,7 +8125,8 @@ class BootstrapLowerer(
             globalKinds,
             this.compileInputPaths,
             this.compileInputContents,
-            this.errors
+            this.errors,
+            bootstrapIrLookupOf(this.instructions)
         )
     }
 }
@@ -8079,7 +8221,8 @@ fun bootstrapLowerParsedCached(
         [],
         compileInputPaths,
         compileInputContents,
-        analyzed.errors
+        analyzed.errors,
+        bootstrapIrLookupOf(instructions)
     ) else BootstrapLowerer(
         instructions,
         functions,
