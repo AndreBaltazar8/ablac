@@ -237,13 +237,237 @@ fun bootstrapLlvmValueCount(function: BootstrapIrFunction): int {
     count
 }
 
+// Array literals made only of constants (the tables generated catalogs are full
+// of) are built from a static table instead of boxing every element into its
+// own slot and copying it into an argument block: a module's global
+// initialiser otherwise grows by tens of thousands of instructions that the
+// optimizer and instruction selection then spend seconds on. `table` marks such
+// array.create instructions; `elided` the constants used by nothing else, which
+// then get no slot and no boxing at all.
+class BootstrapLlvmConstantTables(
+    val table: array<bool>,
+    val elided: array<bool>,
+    val producer: array<int>,
+    val strings: array<i64*>
+)
+
+fun bootstrapLlvmIsTableConstant(opcode: string): bool =
+    opcode == "const.i64" || opcode == "const.f64" ||
+    opcode == "const.bool" || opcode == "const.string"
+
+fun bootstrapLlvmConstantTables(
+    function: BootstrapIrFunction,
+    valueCount: int
+): BootstrapLlvmConstantTables {
+    val producer: array<int> = []
+    val definitions: array<int> = []
+    val uses: array<int> = []
+    val tableUses: array<int> = []
+    val strings: array<i64*> = []
+    val nullPointer = nativeNullPointer()
+    var index = 0
+    while (index < valueCount) {
+        producer.append(0 - 1)
+        definitions.append(0)
+        uses.append(0)
+        tableUses.append(0)
+        strings.append(nullPointer)
+        index = index + 1
+    }
+    index = 0
+    while (index < function.instructions.size) {
+        val instruction = function.instructions[index]
+        val result = instruction.result
+        if (result >= 0 && result < valueCount) {
+            definitions[result] = definitions[result] + 1
+            if (bootstrapLlvmIsTableConstant(instruction.opcode)) {
+                producer[result] = index
+            }
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < valueCount) {
+        if (definitions[index] != 1) producer[index] = 0 - 1
+        index = index + 1
+    }
+    val table: array<bool> = []
+    index = 0
+    while (index < function.instructions.size) {
+        val instruction = function.instructions[index]
+        var constant = instruction.opcode == "array.create" &&
+            instruction.operands.size >= 2
+        var operand = 0
+        while (constant && operand < instruction.operands.size) {
+            val value = instruction.operands[operand]
+            if (value < 0 || value >= valueCount || producer[value] < 0) {
+                constant = false
+            }
+            operand = operand + 1
+        }
+        table.append(constant)
+        val left = instruction.left
+        val right = instruction.right
+        if (left >= 0 && left < valueCount) uses[left] = uses[left] + 1
+        if (right >= 0 && right < valueCount) uses[right] = uses[right] + 1
+        operand = 0
+        while (operand < instruction.operands.size) {
+            val value = instruction.operands[operand]
+            if (value >= 0 && value < valueCount) {
+                uses[value] = uses[value] + 1
+                if (constant) tableUses[value] = tableUses[value] + 1
+            }
+            operand = operand + 1
+        }
+        index = index + 1
+    }
+    val elided: array<bool> = []
+    index = 0
+    while (index < valueCount) {
+        elided.append(
+            producer[index] >= 0 && uses[index] > 0 &&
+            uses[index] == tableUses[index]
+        )
+        index = index + 1
+    }
+    BootstrapLlvmConstantTables(table, elided, producer, strings)
+}
+
+// A constant string's address, as const.string makes it.
+fun bootstrapLlvmConstStringPointer(
+    backend: BootstrapLlvmBackend,
+    text: string,
+    name: string
+): i64* =
+    if (bootstrapLlvmStringNeedsExplicitLength(text)) {
+        bootstrapLlvmGlobalStringPointer(backend, text, name)
+    } else LLVMBuildGlobalStringPtr(backend.builder, text, name)
+
+// The static AblaValue of constant `value` (made by a const.* instruction):
+// the layouts of __ablaRuntimeI64 (f64 boxes its bits the same way),
+// __ablaRuntimeBool and __ablaRuntimeStringStatic. On 32-bit targets a string's
+// address can only be a 32-bit relocation, so there each element is laid out
+// as { i32 tag, i32 0, i32 low, i32 high, i64 word1 }: AblaValue's bytes, word0
+// in two halves.
+fun bootstrapLlvmTableElement(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    var tables: BootstrapLlvmConstantTables,
+    symbol: string,
+    value: int
+): i64* {
+    val instruction = function.instructions[tables.producer[value]]
+    val split = bootstrapLlvmTargetUses32BitPointers(backend.targetTriple)
+    var tag = 2
+    var bits = 0
+    var address = nativeNullPointer()
+    var word1 = 0
+    if (instruction.opcode == "const.i64") bits = bootstrapLlvmParseInteger(instruction.text)
+    if (instruction.opcode == "const.f64") {
+        bits = LLVMConstIntGetZExtValue(LLVMConstBitCast(
+            LLVMConstRealOfStringAndSize(
+                backend.f64Type, instruction.text, instruction.text.size
+            ),
+            backend.i64Type
+        ))
+    }
+    if (instruction.opcode == "const.bool") {
+        tag = 3
+        bits = if (instruction.text == "true") 1 else 0
+    }
+    if (instruction.opcode == "const.string") {
+        tag = 4
+        address = tables.strings[value]
+        if (pointerIsNull(address)) {
+            address = bootstrapLlvmConstStringPointer(
+                backend, instruction.text,
+                bootstrapLlvmStringSymbolFrom(symbol, value)
+            )
+            tables.strings[value] = address
+        }
+        word1 = instruction.text.size
+    }
+    val strung = !pointerIsNull(address)
+    if (split) {
+        val fields = llvmPointerVector(5)
+        fields.set(0, LLVMConstInt(backend.i32Type, tag, 0))
+        fields.set(1, LLVMConstInt(backend.i32Type, 0, 0))
+        fields.set(2, if (strung) LLVMConstPtrToInt(address, backend.i32Type)
+            else LLVMConstInt(backend.i32Type, bits & 4294967295, 0))
+        fields.set(3, LLVMConstInt(backend.i32Type, if (strung) 0 else (bits >> 32) & 4294967295, 0))
+        fields.set(4, LLVMConstInt(backend.i64Type, word1, 0))
+        val element = LLVMConstStructInContext(backend.context, fields.pointer(), 5, 0)
+        fields.drop()
+        return element
+    }
+    val payload = llvmPointerVector(2)
+    payload.set(0, if (strung) LLVMConstPtrToInt(address, backend.i64Type)
+        else LLVMConstInt(backend.i64Type, bits, 1))
+    payload.set(1, LLVMConstInt(backend.i64Type, word1, 0))
+    val words = LLVMConstNamedStruct(backend.payloadType, payload.pointer(), 2)
+    payload.drop()
+    val fields = llvmPointerVector(3)
+    fields.set(0, LLVMConstInt(backend.i32Type, tag, 0))
+    fields.set(1, LLVMConstInt(backend.i32Type, 0, 0))
+    fields.set(2, words)
+    val element = LLVMConstNamedStruct(backend.valueType, fields.pointer(), 3)
+    fields.drop()
+    element
+}
+
+// A table element's type: AblaValue, or its split form on 32-bit targets.
+fun bootstrapLlvmTableElementType(backend: BootstrapLlvmBackend): i64* {
+    if (!bootstrapLlvmTargetUses32BitPointers(backend.targetTriple)) return backend.valueType
+    val fields = llvmPointerVector(5)
+    fields.set(0, backend.i32Type)
+    fields.set(1, backend.i32Type)
+    fields.set(2, backend.i32Type)
+    fields.set(3, backend.i32Type)
+    fields.set(4, backend.i64Type)
+    val type = LLVMStructTypeInContext(backend.context, fields.pointer(), 5, 0)
+    fields.drop()
+    type
+}
+
+// A private constant [count x AblaValue] of array literal `instruction`'s elements.
+fun bootstrapLlvmConstantTable(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    var tables: BootstrapLlvmConstantTables,
+    symbol: string,
+    instruction: BootstrapInstruction
+): i64* {
+    val count = instruction.operands.size
+    val elements = llvmPointerVector(count)
+    var index = 0
+    while (index < count) {
+        elements.set(index, bootstrapLlvmTableElement(
+            backend, function, tables, symbol, instruction.operands[index]
+        ))
+        index = index + 1
+    }
+    val elementType = bootstrapLlvmTableElementType(backend)
+    val type = LLVMArrayType2(elementType, count)
+    val global = LLVMAddGlobal(backend.module, type, "abla.table")
+    LLVMSetInitializer(
+        global, LLVMConstArray2(elementType, elements.pointer(), count)
+    )
+    elements.drop()
+    LLVMSetGlobalConstant(global, 1)
+    LLVMSetLinkage(global, llvmPrivateLinkage())
+    LLVMSetUnnamedAddress(global, llvmHiddenVisibilityUnnamedAddress())
+    LLVMSetAlignment(global, 8)
+    global
+}
+
 fun bootstrapLlvmCreateFunctionStorage(
     backend: BootstrapLlvmBackend,
     function: BootstrapIrFunction,
     llvmFunction: i64*,
     collecting: bool,
     rootValues: array<bool>,
-    scalarPlan: BootstrapLlvmScalarPlan
+    scalarPlan: BootstrapLlvmScalarPlan,
+    tables: BootstrapLlvmConstantTables
 ): BootstrapLlvmFunctionStorage {
     val values: array<i64*> = []
     val nativeValues: array<i64*> = []
@@ -260,10 +484,11 @@ fun bootstrapLlvmCreateFunctionStorage(
     var index = 0
     while (index < valueCount) {
         var slot: i64* = nullPointer
-        if (index >= scalarPlan.valueTypes.size ||
+        val elided = index < tables.elided.size && tables.elided[index]
+        if (!elided && (index >= scalarPlan.valueTypes.size ||
             scalarPlan.valueTypes[index] == "" ||
             (index < scalarPlan.boxedValues.size &&
-             scalarPlan.boxedValues[index])) {
+             scalarPlan.boxedValues[index]))) {
             slot = LLVMBuildAlloca(
                 backend.builder, backend.valueType, "value"
             )
@@ -304,7 +529,8 @@ fun bootstrapLlvmCreateFunctionStorage(
         var storageType: i64* = nullPointer
         if ((instruction.opcode == "closure.create" ||
              instruction.opcode == "array.create") &&
-            instruction.operands.size > 0) {
+            instruction.operands.size > 0 &&
+            !(index < tables.table.size && tables.table[index])) {
             storageType = LLVMArrayType2(
                 backend.valueType, instruction.operands.size
             )
@@ -5924,9 +6150,12 @@ fun bootstrapLlvmEmitFunction(
     val scalarPlan = bootstrapLlvmBuildScalarPlan(
         program, function, functionIndex, nativeIndex
     )
+    var tables = bootstrapLlvmConstantTables(
+        function, bootstrapLlvmValueCount(function)
+    )
     var storage = bootstrapLlvmCreateFunctionStorage(
         backend, function, llvmFunction, collecting, rootValues,
-        scalarPlan
+        scalarPlan, tables
     )
     bootstrapLlvmInitializeParameters(
         backend, function, llvmFunction, storage
@@ -6003,14 +6232,14 @@ fun bootstrapLlvmEmitFunction(
             val name = bootstrapLlvmStringSymbolFrom(
                 identities.symbols[functionId], instruction.result
             )
-            val pointer = if (bootstrapLlvmStringNeedsExplicitLength(
-                instruction.text
-            )) bootstrapLlvmGlobalStringPointer(
+            val pointer = bootstrapLlvmConstStringPointer(
                 backend, instruction.text, name
-            ) else LLVMBuildGlobalStringPtr(
-                backend.builder, instruction.text, name
             )
-            bootstrapLlvmCallNamed(
+            // A string only a constant table holds is made there, from this address.
+            if (instruction.result < tables.elided.size &&
+                tables.elided[instruction.result]) {
+                tables.strings[instruction.result] = pointer
+            } else bootstrapLlvmCallNamed(
                 backend, "abla_string_static",
                 [storage.values[instruction.result], pointer,
                  LLVMConstInt(backend.i64Type, instruction.text.size, 0)],
@@ -6764,7 +6993,12 @@ fun bootstrapLlvmEmitFunction(
         }
         if (reachable && instruction.opcode == "array.create") {
             matched = true
-            val values = bootstrapLlvmPrepareArguments(
+            val values = if (tables.table[instructionIndex]) {
+                bootstrapLlvmConstantTable(
+                    backend, function, tables,
+                    identities.symbols[functionId], instruction
+                )
+            } else bootstrapLlvmPrepareArguments(
                 backend, storage, instructionIndex,
                 instruction.operands, 0
             )
