@@ -2,6 +2,7 @@
 // ownership transfer follows LLVM's documented C API exactly.
 
 import "abla/unsafe/memory"
+import "abla/sys/linux/process"
 
 noescape extern:"c" fun LLVMInitializeX86TargetInfo(): void
 noescape extern:"c" fun LLVMInitializeX86Target(): void
@@ -299,16 +300,63 @@ fun LlvmOrcSession.close(): int {
     status
 }
 
+trusted noescape extern:"intrinsic" fun ablaUnsafeCallExact_I32_I32_Pointer(address: int, count: int, vector: i64*): int
+
+// Calls a JIT-compiled `main(argc, argv)` with a process-start style block: argv =
+// [program, arguments…, NULL] followed by the host's envp (the runtime finds its
+// environment right after argv's NULL, as on the initial process stack), so the
+// program reads processArgument()/linuxEnvironment() as a built executable would.
+trusted fun llvmOrcCallMain(address: int, program: string, arguments: array<string>): int {
+    val argc = arguments.size + 1
+    val environment = linuxEnvironmentPointer()
+    var environmentCount = 0
+    if (!pointerIsNull(environment)) {
+        while (!pointerIsNull(NativePointerCell(ablaUnsafePointerOffset(environment, environmentCount * 8), false, false).load())) {
+            environmentCount = environmentCount + 1
+        }
+    }
+    val table = (argc + 1 + environmentCount + 1) * 8
+    var bytes = program.size + 1
+    for (argument in arguments) bytes = bytes + argument.size + 1
+    var block = nativeByteBuffer(table + bytes)
+    var text = table
+    var slot = 0
+    while (slot < argc) {
+        val value = if (slot == 0) program else arguments[slot - 1]
+        block.storePointer(slot * 8, ablaUnsafePointerOffset(block.address, text))
+        var index = 0
+        while (index < value.size) {
+            block.store(text + index, value[index])
+            index = index + 1
+        }
+        block.store(text + value.size, 0)
+        text = text + value.size + 1
+        slot = slot + 1
+    }
+    block.storePointer(argc * 8, nativeNullPointer())
+    var entry = 0
+    while (entry < environmentCount) {
+        block.storePointer((argc + 1 + entry) * 8, NativePointerCell(ablaUnsafePointerOffset(environment, entry * 8), false, false).load())
+        entry = entry + 1
+    }
+    block.storePointer((argc + 1 + environmentCount) * 8, nativeNullPointer())
+    val status = ablaUnsafeCallExact_I32_I32_Pointer(address, argc, block.address)
+    block.close()
+    status
+}
+
 // Returns the JIT-compiled program's main result. Infrastructure failures use
-// 120-128, keeping them distinct from normal compiler diagnostics.
-fun llvmOrcRunFile(path: string): int {
+// 120-128, keeping them distinct from normal compiler diagnostics. `arguments`
+// reach the program as processArgument(0…), with `program` (default: `path`) as
+// its argv[0].
+fun llvmOrcRunFile(path: string, program: string = "", arguments: array<string> = []): int {
     val session = llvmOrcCreateSession()
     val generation = session.addFile(path)
     var result = generation.status
     if (result == 0) {
         val lookup = session.lookup("main")
         result = lookup.status
-        if (result == 0) result = callNativeMain(lookup.address)
+        if (result == 0) result = llvmOrcCallMain(lookup.address, if (program == "") path else program, arguments)
     }
     val removeStatus = generation.remove()
     if (result == 0 && removeStatus != 0) result = removeStatus
