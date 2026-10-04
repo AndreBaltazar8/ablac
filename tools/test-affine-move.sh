@@ -196,6 +196,8 @@ for fixture in \
     invalid-index-extraction \
     invalid-affine-wrapper-copy \
     invalid-borrowed-field-move \
+    invalid-global-resource-move \
+    invalid-global-resource-return \
     invalid-drop-field-projection; do
     output="$output_directory/$fixture"
     rm -f "$output"
