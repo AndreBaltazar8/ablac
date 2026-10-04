@@ -50,11 +50,27 @@ trusted fun __ablaRuntimePlatformThreadsEnable(): void {}
 // powers of two up to 1 MiB. Larger requests are 64 KiB-granular blocks kept
 // on a first-fit list that splits oversized hits. Fresh blocks come from a bump
 // cursor that grows linear memory; freed blocks are only ever reused, because
-// Wasm memory cannot shrink.
+// Wasm memory cannot shrink. Before a small request would grow memory while
+// much is parked on the class lists, those blocks are sorted by address and
+// physically adjacent runs merge into spans any class can carve from (a burst
+// of one size, freed, then serves the others instead of memory growing).
 var __ablaRuntimeWasmHeapCursor: int = 0
 var __ablaRuntimeWasmHeapLimit: int = 0
 var __ablaRuntimeWasmFreeLists: int = 0
 var __ablaRuntimeWasmLargeFree: int = 0
+
+// Bytes (with headers) parked on the free lists (small and large), and the
+// parked level at which the next reclaim runs.
+var __ablaRuntimeWasmParked: int = 0
+var __ablaRuntimeWasmReclaimAt: int = 4194304
+var __ablaRuntimeWasmReclaims: int = 0
+var __ablaRuntimeWasmReclaimMerged: int = 0
+// The span being carved [cursor, end) and the list of further spans, each
+// starting with [next span, end].
+var __ablaRuntimeWasmSpanCursor: int = 0
+var __ablaRuntimeWasmSpanEnd: int = 0
+var __ablaRuntimeWasmSpans: int = 0
+val __ablaRuntimeWasmSpanMinimum: int = 65536
 
 val __ablaRuntimeWasmClassCount: int = 28
 val __ablaRuntimeWasmLargeMinimum: int = 1048576
@@ -97,6 +113,11 @@ trusted fun __ablaRuntimeWasmClassBytes(sizeClass: int): int =
     if (sizeClass < 16) (sizeClass + 1) * 16
     else 512 << (sizeClass - 16)
 
+// A block's payload bytes from its header word (a size class or a large capacity).
+@inline
+trusted fun __ablaRuntimeWasmBlockBytes(kind: int): int =
+    if (kind < 64) __ablaRuntimeWasmClassBytes(kind) else kind
+
 trusted fun __ablaRuntimeWasmClassOf(size: int): int {
     if (size <= 256) return (size + 15) / 16 - 1
     var sizeClass = 16
@@ -106,6 +127,184 @@ trusted fun __ablaRuntimeWasmClassOf(size: int): int {
         sizeClass = sizeClass + 1
     }
     sizeClass
+}
+
+// Park [begin, end) on the class lists as the largest blocks that fit.
+trusted fun __ablaRuntimeWasmShatter(begin: int, end: int): void {
+    var at = begin
+    while (end - at >= 32) {
+        val room = end - at - 16
+        var sizeClass = if (room <= 256) room / 16 - 1 else 15
+        if (room >= 512) {
+            sizeClass = 16
+            while (sizeClass + 1 < __ablaRuntimeWasmClassCount &&
+                __ablaRuntimeWasmClassBytes(sizeClass + 1) <= room) {
+                sizeClass = sizeClass + 1
+            }
+        }
+        val bytes = 16 + __ablaRuntimeWasmClassBytes(sizeClass)
+        val head = __ablaRuntimeWasmFreeLists + sizeClass * 8
+        ablaRuntimeStoreI64(at, sizeClass)
+        ablaRuntimeStoreI64(at + 16, ablaRuntimeLoadI64(head))
+        ablaRuntimeStoreI64(head, at + 16)
+        __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + bytes
+        at = at + bytes
+    }
+}
+
+// A block of `bytes` from the reclaimed spans (0 when they are used up).
+trusted fun __ablaRuntimeWasmSpanCarve(bytes: int): int {
+    while (true) {
+        if (__ablaRuntimeWasmSpanCursor != 0 &&
+            __ablaRuntimeWasmSpanCursor + bytes <= __ablaRuntimeWasmSpanEnd) {
+            val block = __ablaRuntimeWasmSpanCursor
+            __ablaRuntimeWasmSpanCursor = block + bytes
+            return block
+        }
+        if (__ablaRuntimeWasmSpanCursor != 0) {
+            __ablaRuntimeWasmShatter(__ablaRuntimeWasmSpanCursor, __ablaRuntimeWasmSpanEnd)
+            __ablaRuntimeWasmSpanCursor = 0
+        }
+        if (__ablaRuntimeWasmSpans != 0) {
+            val span = __ablaRuntimeWasmSpans
+            __ablaRuntimeWasmSpans = ablaRuntimeLoadI64(span)
+            __ablaRuntimeWasmSpanEnd = ablaRuntimeLoadI64(span + 8)
+            __ablaRuntimeWasmSpanCursor = span
+        } else if (__ablaRuntimeWasmLargeFree != 0) {
+            // A parked large block serves small requests before memory grows.
+            val large = __ablaRuntimeWasmLargeFree
+            __ablaRuntimeWasmLargeFree = ablaRuntimeLoadI64(large)
+            val capacity = ablaRuntimeLoadI64(large - 16)
+            __ablaRuntimeWasmParked = __ablaRuntimeWasmParked - 16 - capacity
+            __ablaRuntimeWasmSpanCursor = large - 16
+            __ablaRuntimeWasmSpanEnd = large + capacity
+        } else return 0
+    }
+    0
+}
+
+// Sort a list of free payloads (linked through their first word) by address.
+trusted fun __ablaRuntimeWasmSortFree(list: int): int {
+    if (list == 0) return 0
+    var head = list
+    var size = 1
+    while (true) {
+        var p = head
+        head = 0
+        var tail = 0
+        var merges = 0
+        while (p != 0) {
+            merges = merges + 1
+            var q = p
+            var pSize = 0
+            while (pSize < size && q != 0) {
+                pSize = pSize + 1
+                q = ablaRuntimeLoadI64(q)
+            }
+            var qSize = size
+            while (pSize > 0 || (qSize > 0 && q != 0)) {
+                var picked = 0
+                if (pSize == 0) {
+                    picked = q
+                    q = ablaRuntimeLoadI64(q)
+                    qSize = qSize - 1
+                } else if (qSize == 0 || q == 0 || p <= q) {
+                    picked = p
+                    p = ablaRuntimeLoadI64(p)
+                    pSize = pSize - 1
+                } else {
+                    picked = q
+                    q = ablaRuntimeLoadI64(q)
+                    qSize = qSize - 1
+                }
+                if (tail == 0) {
+                    head = picked
+                } else {
+                    ablaRuntimeStoreI64(tail, picked)
+                }
+                tail = picked
+            }
+            p = q
+        }
+        ablaRuntimeStoreI64(tail, 0)
+        if (merges <= 1) return head
+        size = size * 2
+    }
+    head
+}
+
+// Merge physically adjacent parked blocks (small and large): runs of a large
+// block or more become one large free block, runs of a span or more spans, and
+// shorter runs go back on their class lists.
+trusted fun __ablaRuntimeWasmReclaim(): void {
+    if (__ablaRuntimeWasmSpanCursor != 0) {
+        __ablaRuntimeWasmShatter(__ablaRuntimeWasmSpanCursor, __ablaRuntimeWasmSpanEnd)
+        __ablaRuntimeWasmSpanCursor = 0
+    }
+    var all = 0
+    var sizeClass = 0
+    while (sizeClass < __ablaRuntimeWasmClassCount) {
+        val head = __ablaRuntimeWasmFreeLists + sizeClass * 8
+        var block = ablaRuntimeLoadI64(head)
+        ablaRuntimeStoreI64(head, 0)
+        while (block != 0) {
+            val next = ablaRuntimeLoadI64(block)
+            ablaRuntimeStoreI64(block, all)
+            all = block
+            block = next
+        }
+        sizeClass = sizeClass + 1
+    }
+    var large = __ablaRuntimeWasmLargeFree
+    __ablaRuntimeWasmLargeFree = 0
+    while (large != 0) {
+        val next = ablaRuntimeLoadI64(large)
+        ablaRuntimeStoreI64(large, all)
+        all = large
+        large = next
+    }
+    __ablaRuntimeWasmParked = 0
+    __ablaRuntimeWasmReclaims = __ablaRuntimeWasmReclaims + 1
+    var block = __ablaRuntimeWasmSortFree(all)
+    while (block != 0) {
+        val first = block
+        val runBegin = block - 16
+        var runEnd = block + __ablaRuntimeWasmBlockBytes(ablaRuntimeLoadI64(block - 16))
+        var count = 1
+        block = ablaRuntimeLoadI64(block)
+        while (block != 0 && block - 16 == runEnd) {
+            runEnd = block + __ablaRuntimeWasmBlockBytes(ablaRuntimeLoadI64(block - 16))
+            count = count + 1
+            block = ablaRuntimeLoadI64(block)
+        }
+        if (runEnd - runBegin >= 16 + __ablaRuntimeWasmLargeMinimum) {
+            ablaRuntimeStoreI64(runBegin, runEnd - runBegin - 16)
+            ablaRuntimeStoreI64(runBegin + 16, __ablaRuntimeWasmLargeFree)
+            __ablaRuntimeWasmLargeFree = runBegin + 16
+            __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + runEnd - runBegin
+            __ablaRuntimeWasmReclaimMerged = __ablaRuntimeWasmReclaimMerged + runEnd - runBegin
+        } else if (runEnd - runBegin >= __ablaRuntimeWasmSpanMinimum) {
+            ablaRuntimeStoreI64(runBegin, __ablaRuntimeWasmSpans)
+            ablaRuntimeStoreI64(runBegin + 8, runEnd)
+            __ablaRuntimeWasmSpans = runBegin
+            __ablaRuntimeWasmReclaimMerged = __ablaRuntimeWasmReclaimMerged + runEnd - runBegin
+        } else {
+            var each = first
+            while (count > 0) {
+                val next = ablaRuntimeLoadI64(each)
+                val kind = ablaRuntimeLoadI64(each - 16)
+                val head = __ablaRuntimeWasmFreeLists + kind * 8
+                ablaRuntimeStoreI64(each, ablaRuntimeLoadI64(head))
+                ablaRuntimeStoreI64(head, each)
+                __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + 16 + __ablaRuntimeWasmClassBytes(kind)
+                each = next
+                count = count - 1
+            }
+        }
+    }
+    // The next growth reclaims again once another MiB has been freed.
+    __ablaRuntimeWasmReclaimAt = __ablaRuntimeWasmParked + 1048576
+    return
 }
 
 trusted fun __ablaRuntimeWasmMalloc(requested: int): int {
@@ -118,41 +317,58 @@ trusted fun __ablaRuntimeWasmMalloc(requested: int): int {
     if (size <= __ablaRuntimeWasmLargeMinimum) {
         val sizeClass = __ablaRuntimeWasmClassOf(size)
         val head = __ablaRuntimeWasmFreeLists + sizeClass * 8
-        val reused = ablaRuntimeLoadI64(head)
+        val bytes = 16 + __ablaRuntimeWasmClassBytes(sizeClass)
+        var reused = ablaRuntimeLoadI64(head)
+        if (reused == 0 && __ablaRuntimeWasmHeapCursor + bytes > __ablaRuntimeWasmHeapLimit &&
+            __ablaRuntimeWasmParked >= __ablaRuntimeWasmReclaimAt) {
+            __ablaRuntimeWasmReclaim()
+            reused = ablaRuntimeLoadI64(head)
+        }
         if (reused != 0) {
             ablaRuntimeStoreI64(head, ablaRuntimeLoadI64(reused))
+            __ablaRuntimeWasmParked = __ablaRuntimeWasmParked - bytes
             return reused
         }
-        val block = __ablaRuntimeWasmBump(
-            16 + __ablaRuntimeWasmClassBytes(sizeClass)
-        )
+        var block = __ablaRuntimeWasmSpanCarve(bytes)
+        if (block == 0) block = __ablaRuntimeWasmBump(bytes)
         ablaRuntimeStoreI64(block, sizeClass)
         return block + 16
     }
     if (size > __ablaRuntimeWasmMemoryMaximum) ablaRuntimeTrap()
     val capacity = (size + __ablaRuntimeWasmLargeGranule - 1) &
         -__ablaRuntimeWasmLargeGranule
-    var previous: int = 0
-    var candidate = __ablaRuntimeWasmLargeFree
-    while (candidate != 0) {
-        val next = ablaRuntimeLoadI64(candidate)
-        val available = ablaRuntimeLoadI64(candidate - 16)
-        if (available >= capacity) {
-            if (previous == 0) __ablaRuntimeWasmLargeFree = next
-            else ablaRuntimeStoreI64(previous, next)
-            val remainder = available - capacity - 16
-            if (remainder >= __ablaRuntimeWasmLargeMinimum) {
-                // Split: the tail becomes its own free large block.
-                val tail = candidate + capacity + 16
-                ablaRuntimeStoreI64(tail - 16, remainder)
-                ablaRuntimeStoreI64(tail, __ablaRuntimeWasmLargeFree)
-                __ablaRuntimeWasmLargeFree = tail
-                ablaRuntimeStoreI64(candidate - 16, capacity)
+    var attempt = 0
+    while (attempt < 2) {
+        var previous: int = 0
+        var candidate = __ablaRuntimeWasmLargeFree
+        while (candidate != 0) {
+            val next = ablaRuntimeLoadI64(candidate)
+            val available = ablaRuntimeLoadI64(candidate - 16)
+            if (available >= capacity) {
+                if (previous == 0) __ablaRuntimeWasmLargeFree = next
+                else ablaRuntimeStoreI64(previous, next)
+                __ablaRuntimeWasmParked = __ablaRuntimeWasmParked - 16 - available
+                val remainder = available - capacity - 16
+                if (remainder >= __ablaRuntimeWasmLargeMinimum) {
+                    // Split: the tail becomes its own free large block.
+                    val tail = candidate + capacity + 16
+                    ablaRuntimeStoreI64(tail - 16, remainder)
+                    ablaRuntimeStoreI64(tail, __ablaRuntimeWasmLargeFree)
+                    __ablaRuntimeWasmLargeFree = tail
+                    __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + 16 + remainder
+                    ablaRuntimeStoreI64(candidate - 16, capacity)
+                }
+                return candidate
             }
-            return candidate
+            previous = candidate
+            candidate = next
         }
-        previous = candidate
-        candidate = next
+        // Nothing fits: merge what is parked before growing memory.
+        if (attempt == 0 && __ablaRuntimeWasmHeapCursor + 16 + capacity > __ablaRuntimeWasmHeapLimit &&
+            __ablaRuntimeWasmParked >= __ablaRuntimeWasmReclaimAt) {
+            __ablaRuntimeWasmReclaim()
+            attempt = 1
+        } else attempt = 2
     }
     val block = __ablaRuntimeWasmBump(16 + capacity)
     ablaRuntimeStoreI64(block, capacity)
@@ -169,10 +385,13 @@ trusted fun __ablaRuntimeWasmMallocFree(address: int): void {
         val head = __ablaRuntimeWasmFreeLists + kind * 8
         ablaRuntimeStoreI64(address, ablaRuntimeLoadI64(head))
         ablaRuntimeStoreI64(head, address)
+        __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + 16 + __ablaRuntimeWasmClassBytes(kind)
     } else {
         ablaRuntimeStoreI64(address, __ablaRuntimeWasmLargeFree)
         __ablaRuntimeWasmLargeFree = address
+        __ablaRuntimeWasmParked = __ablaRuntimeWasmParked + 16 + kind
     }
+    return
 }
 
 // --- tracked heap + precise collector ----------------------------------------
@@ -212,7 +431,9 @@ var __ablaRuntimeWasmRegion: int = 0
 
 val __ablaRuntimeWasmRegionCachedDescriptors: int = 64
 val __ablaRuntimeWasmRegionPageBytes: int = 1048576
-val __ablaRuntimeWasmRegionCachedPages: int = 32
+// A few pages stay cached for the next region; more go back to the allocator
+// (a burst's pages would otherwise stay pinned, as linear memory never shrinks).
+val __ablaRuntimeWasmRegionCachedPages: int = 4
 
 trusted fun __ablaRuntimeWasmUnlink(header: int): void {
     val previous = ablaRuntimeLoadI64(header)
@@ -491,7 +712,9 @@ trusted fun __ablaRuntimePlatformMemoryLiveBytes(): int =
 // Allocator numbers for diagnostics: 0 linear memory bytes, 1 bytes the bump
 // cursor has handed out, 2 bytes parked on the small free lists, 3 bytes parked
 // on the large free list (both with headers), 4 tracked live bytes,
-// 5 collections run, 6 the most tracked bytes ever live at once.
+// 5 collections run, 6 the most tracked bytes ever live at once, 7 reclaims
+// run, 8 bytes they merged into spans and large blocks, 9 bytes parked,
+// 10 region pages cached.
 trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int {
     if (which == 0) return ablaRuntimeWasmMemorySize() << 16
     if (which == 1) {
@@ -524,6 +747,10 @@ trusted fun __ablaRuntimePlatformMemoryHeapStat(which: int): int {
     if (which == 4) return __ablaRuntimeWasmLiveBytes
     if (which == 5) return __ablaRuntimeWasmCollections
     if (which == 6) return __ablaRuntimeWasmLivePeak
+    if (which == 7) return __ablaRuntimeWasmReclaims
+    if (which == 8) return __ablaRuntimeWasmReclaimMerged
+    if (which == 9) return __ablaRuntimeWasmParked
+    if (which == 10) return __ablaRuntimeWasmRegionPageCacheCount
     // 16 + k: bytes parked on size class k's free list.
     if (which >= 16 && which < 16 + __ablaRuntimeWasmClassCount && __ablaRuntimeWasmFreeLists != 0) {
         var total = 0
