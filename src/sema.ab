@@ -340,11 +340,122 @@ fun bootstrapMethodArgumentIsExclusive(
     exclusive
 }
 
+// Which argument positions of each function / method name take `var` or `own`
+// (a bitmask per name; positions past 61 fall back to the scans above).
+class BootstrapExclusiveArguments(
+    val functionNames: array<string>,
+    val functionMasks: array<int>,
+    val functionSlots: array<int>,
+    val methodNames: array<string>,
+    val methodMasks: array<int>,
+    val methodSlots: array<int>
+)
+
+fun bootstrapExclusiveMask(kinds: array<string>): int {
+    var mask = 0
+    var argument = 0
+    while (argument < kinds.size && argument < 62) {
+        if (kinds[argument] == "var" || kinds[argument] == "own") {
+            mask = mask | (1 << argument)
+        }
+        argument = argument + 1
+    }
+    mask
+}
+
+fun bootstrapExclusiveSlot(names: array<string>, slots: array<int>, name: string): int {
+    var slot = bootstrapFunctionDeclarationHash(name)
+    slot = slot - slot / slots.size * slots.size
+    var probes = 0
+    while (probes < slots.size && slots[slot] >= 0 &&
+           names[slots[slot]] != name) {
+        slot = slot + 1
+        if (slot == slots.size) slot = 0
+        probes = probes + 1
+    }
+    slot
+}
+
+fun bootstrapExclusiveAdd(var names: array<string>, var masks: array<int>, var slots: array<int>, name: string, mask: int): void {
+    val slot = bootstrapExclusiveSlot(names, slots, name)
+    if (slots[slot] >= 0) {
+        masks[slots[slot]] = masks[slots[slot]] | mask
+    } else {
+        slots[slot] = names.size
+        names.append(name)
+        masks.append(mask)
+    }
+    return
+}
+
+fun bootstrapExclusiveArgumentsOf(
+    declarations: array<BootstrapDeclaration>
+): BootstrapExclusiveArguments {
+    var capacity = 8
+    while (capacity < declarations.size * 4 + 1) capacity = capacity * 2
+    var functionNames: array<string> = []
+    var functionMasks: array<int> = []
+    var functionSlots: array<int> = []
+    var methodNames: array<string> = []
+    var methodMasks: array<int> = []
+    var methodSlots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        functionSlots.append(-1)
+        methodSlots.append(-1)
+        slot = slot + 1
+    }
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        val mask = bootstrapExclusiveMask(candidate.parameterKinds)
+        if (candidate.extensionOwner == "") {
+            bootstrapExclusiveAdd(functionNames, functionMasks, functionSlots, candidate.name, mask)
+        } else {
+            bootstrapExclusiveAdd(methodNames, methodMasks, methodSlots, candidate.name, mask)
+        }
+        var method = 0
+        while (method < candidate.methods.size) {
+            val found = candidate.methods[method]
+            bootstrapExclusiveAdd(methodNames, methodMasks, methodSlots, found.name,
+                bootstrapExclusiveMask(found.parameterKinds))
+            method = method + 1
+        }
+        declaration = declaration + 1
+    }
+    BootstrapExclusiveArguments(functionNames, functionMasks, functionSlots, methodNames, methodMasks, methodSlots)
+}
+
+fun bootstrapFunctionArgumentIsExclusiveIn(
+    exclusive: BootstrapExclusiveArguments,
+    declarations: array<BootstrapDeclaration>,
+    name: string,
+    argument: int
+): bool {
+    if (argument >= 62) return bootstrapFunctionArgumentIsExclusive(declarations, name, argument)
+    val slot = bootstrapExclusiveSlot(exclusive.functionNames, exclusive.functionSlots, name)
+    val entry = exclusive.functionSlots[slot]
+    entry >= 0 && ((exclusive.functionMasks[entry] >> argument) & 1) != 0
+}
+
+fun bootstrapMethodArgumentIsExclusiveIn(
+    exclusive: BootstrapExclusiveArguments,
+    declarations: array<BootstrapDeclaration>,
+    name: string,
+    argument: int
+): bool {
+    if (argument >= 62) return bootstrapMethodArgumentIsExclusive(declarations, name, argument)
+    val slot = bootstrapExclusiveSlot(exclusive.methodNames, exclusive.methodSlots, name)
+    val entry = exclusive.methodSlots[slot]
+    entry >= 0 && ((exclusive.methodMasks[entry] >> argument) & 1) != 0
+}
+
 fun bootstrapExpressionMayMutateReceiver(
     expression: BootstrapExpression,
     declarations: array<BootstrapDeclaration>,
     owner: string,
-    summary: BootstrapMutableReceiverSummary
+    summary: BootstrapMutableReceiverSummary,
+    exclusive: BootstrapExclusiveArguments
 ): bool {
     var mutates = expression.kind == "assign" &&
         bootstrapOwnerHasField(declarations, owner, expression.text)
@@ -384,7 +495,8 @@ fun bootstrapExpressionMayMutateReceiver(
             )) mutates = true
         var argument = 1
         while (!mutates && argument < expression.children.size) {
-            if (bootstrapMethodArgumentIsExclusive(
+            if (bootstrapMethodArgumentIsExclusiveIn(
+                    exclusive,
                     declarations,
                     expression.text,
                     argument - 1
@@ -399,7 +511,8 @@ fun bootstrapExpressionMayMutateReceiver(
     if (!mutates && expression.kind == "call") {
         var argument = 0
         while (!mutates && argument < expression.children.size) {
-            if (bootstrapFunctionArgumentIsExclusive(
+            if (bootstrapFunctionArgumentIsExclusiveIn(
+                    exclusive,
                     declarations,
                     expression.text,
                     argument
@@ -417,7 +530,8 @@ fun bootstrapExpressionMayMutateReceiver(
             expression.children[child],
             declarations,
             owner,
-            summary
+            summary,
+            exclusive
         )
         child = child + 1
     }
@@ -429,8 +543,10 @@ fun bootstrapBuildMutableReceiverSummary(
     affineTypes: array<string>
 ): BootstrapMutableReceiverSummary {
     val summary = BootstrapMutableReceiverSummary([], [])
-    // Asked for every declaration on every pass: index the class/interface names once.
+    // Asked for every declaration on every pass: index the class/interface names
+    // and the exclusive argument positions once.
     val managedTypes = bootstrapManagedTypeIndex(declarations)
+    val exclusive = bootstrapExclusiveArgumentsOf(declarations)
     var changed = true
     while (changed) {
         changed = false
@@ -455,7 +571,8 @@ fun bootstrapBuildMutableReceiverSummary(
                     candidate.expression,
                     declarations,
                     extensionOwner,
-                    summary
+                    summary,
+                    exclusive
                 )) {
                 summary.owners.append(extensionOwner)
                 summary.methods.append(candidate.name)
@@ -478,7 +595,8 @@ fun bootstrapBuildMutableReceiverSummary(
                             found.expression,
                             declarations,
                             candidate.name,
-                            summary
+                            summary,
+                            exclusive
                         )) {
                         summary.owners.append(candidate.name)
                         summary.methods.append(found.name)
