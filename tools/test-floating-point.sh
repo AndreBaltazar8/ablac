@@ -24,6 +24,15 @@ math_status=$?
 set -e
 test "$math_status" -eq 42
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/floating-f32-storage.ab" \
+    -o "$output_root/floating-f32-storage" --no-cache
+set +e
+"$output_root/floating-f32-storage"
+f32_status=$?
+set -e
+test "$f32_status" -eq 42
+
 "$compiler" build --project \
     "$project_root/tests/cases/floating-native" \
     -o "$output_root/floating-native" --no-cache
