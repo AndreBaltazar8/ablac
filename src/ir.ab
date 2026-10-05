@@ -7186,13 +7186,28 @@ class BootstrapLowerer(
             if (bootstrapIsGeneratorType(sourceType)) {
                 elementType = bootstrapGeneratorElementType(sourceType)
             }
-            val source = this.lowerExpression(expression.children[0])
+            // `for (i in a until b)` / `a..b` count in place: the range is
+            // never materialised as an array. Both bounds are evaluated once.
+            val rangeKind = expression.children[0].kind
+            val range = rangeKind == "range.until" || rangeKind == "range.closed"
+            var source = -1
+            var length = -1
+            var indexStorage = ""
+            if (range) {
+                val begin = this.lowerExpression(expression.children[0].children[0])
+                length = this.lowerExpression(expression.children[0].children[1])
+                indexStorage = "for_index_${this.nextLabel}"
+                this.emitControl(
+                    "local.zero.i64", -1, -1, -1, indexStorage
+                )
+                this.emitControl("local.set", begin, -1, -1, indexStorage)
+            } else {
+                source = this.lowerExpression(expression.children[0])
+            }
             if (bootstrapIsGeneratorType(sourceType)) {
                 this.emitResultMove(expression.children[0])
             }
-            var length = -1
-            var indexStorage = ""
-            if (!bootstrapIsGeneratorType(sourceType)) {
+            if (!range && !bootstrapIsGeneratorType(sourceType)) {
                 val lengthOpcode = if (sourceType == "string") {
                     "string.length"
                 } else "array.length"
@@ -7239,11 +7254,13 @@ class BootstrapLowerer(
                 more = this.emit("generator.next", source, -1, "")
             } else {
                 index = this.emit("local.load", -1, -1, indexStorage)
-                more = this.emit("<", index, length, "")
+                val compare = if (rangeKind == "range.closed") "<=" else "<"
+                more = this.emit(compare, index, length, "")
             }
             this.emitControl("branch", more, bodyLabel, mergeLabel, "")
             this.emitControl("label", -1, bodyLabel, -1, "")
-            val value = if (bootstrapIsGeneratorType(sourceType))
+            val value = if (range) index
+            else if (bootstrapIsGeneratorType(sourceType))
                 this.emit("generator.value", source, -1, "")
             else if (sourceType == "string")
                 this.emit("string.get", source, index, "")
@@ -7264,6 +7281,13 @@ class BootstrapLowerer(
             this.emitControl("label", -1, incrementLabel, -1, "")
             if (!bootstrapIsGeneratorType(sourceType)) {
                 val current = this.emit("local.load", -1, -1, indexStorage)
+                if (rangeKind == "range.closed") {
+                    // `a..b` stops at b itself, so b == i64 max cannot overflow.
+                    val stepLabel = this.allocateLabel()
+                    val complete = this.emit("==", current, length, "")
+                    this.emitControl("branch", complete, mergeLabel, stepLabel, "")
+                    this.emitControl("label", -1, stepLabel, -1, "")
+                }
                 val one = this.emit("const.i64", -1, -1, "1")
                 val next = this.emit("+", current, one, "")
                 this.emitControl("local.set", next, -1, -1, indexStorage)
