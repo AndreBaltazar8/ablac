@@ -33,7 +33,9 @@ only, operands must have the same width, and `abla/float` provides the explicit
 signed `int` to `f64` numerical conversion `f64FromInt`. Explicit `f32`
 conversion remains forthcoming. Strings use `"..."` and support the escapes
 `\t`, `\b`, `\r`, `\n`, `\'`, `\"`, `\\`, `\$`, byte-preserving `\xNN`, and
-ASCII `\uXXXX`. `$name` and `${expression}` are string interpolation.
+ASCII `\uXXXX`. `$name` and `${expression}` are string interpolation. A
+template made only of literal text and module `val`s that hold such strings is
+one compile-time constant, so composing text from named pieces costs nothing.
 
 The compiler accepts `;` as an explicit separator, but never requires it.
 

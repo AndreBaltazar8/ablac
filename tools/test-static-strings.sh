@@ -14,3 +14,15 @@ set +e
 status=$?
 set -e
 test "$status" -eq 42
+
+"$compiler" build \
+    "$project_root/tests/cases/modules/static-string-template.ab" \
+    -o "$output_root/static-string-template" --no-cache
+set +e
+"$output_root/static-string-template"
+status=$?
+set -e
+test "$status" -eq 42
+# C is one constant: its text appears in the IR only when folded.
+grep -q 'c"<alpha-beta|alpha>' "$output_root/static-string-template.ll"
+echo "static strings: literal concatenation + constant templates passed"
