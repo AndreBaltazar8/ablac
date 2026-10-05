@@ -190,6 +190,36 @@ without constructing universal runtime values. Checked exports retain their
 panic-containing status ABI. A program may publish up to 128 explicitly named
 exports; larger surfaces should be split at package or artifact boundaries.
 
+### Overloads and operator functions
+
+Functions, extension functions and methods may share a name when their
+parameter types differ. Each call is resolved statically to one declaration:
+the candidate whose parameters accept the argument types, preferring the one
+with the most exact type matches. Two equally good candidates are rejected as
+`call.overload-ambiguous`, and a call no candidate accepts as
+`call.overload-no-match`; two declarations with the same parameter types remain
+`symbol.duplicate`.
+
+```abla
+fun N.mul(other: N): N = …
+fun N.mul(k: f64): N = …
+operator fun N.plus(other: N): N = …
+operator fun N.unaryMinus(): N = …
+operator fun f64.times(n: N): N = …
+
+val sum = a + b * 0.5 - -c        // a.plus(b.times(0.5)).minus(c.unaryMinus())
+val scaled = 0.5 * a              // the receiver may be a scalar
+```
+
+`operator fun` on a receiver gives an arithmetic operator meaning for that
+type: `plus` (`+`), `minus` (`-`), `times` (`*`), `div` (`/`), `rem` (`%`)
+and `unaryMinus` (prefix `-`). An operator applies when its receiver is the
+left operand's type and a candidate accepts the right operand; otherwise the
+expression is ordinary scalar arithmetic, whose code is unchanged. Overloaded
+declarations are published under distinct internal names before semantic
+analysis, so overloading adds no dispatch at runtime. Named arguments and
+function references do not select among overloads.
+
 ## Types
 
 The core types are `void`, `bool`, signed integer types (`i8`, `i16`, `i32`,

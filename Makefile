@@ -72,6 +72,7 @@ test: ablac
 	tools/test-native-initialize-globals.sh $(COMPILER)
 	tools/test-internal-function.sh $(COMPILER)
 	tools/test-static-strings.sh $(COMPILER)
+	tools/test-overloads.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
 check: test self-rebuild

@@ -4029,6 +4029,67 @@ fun bootstrapMethodDeclarationIndex(
     )
 }
 
+// Overloads and operator functions, for the probe pass of overload.ab. Each
+// candidate is one declaration under its final (possibly mangled) name; `key`
+// is the source spelling it answers to: `name` for a free function,
+// `Owner.name` for a method or extension.
+class BootstrapOverloadTable(
+    val keys: array<string>,
+    val names: array<string>,
+    val owners: array<string>,
+    val operators: array<bool>
+) {
+    fun has(key: string, operatorOnly: bool): bool {
+        var index = 0
+        while (index < this.keys.size) {
+            if (this.keys[index] == key && (!operatorOnly || this.operators[index])) return true
+            index = index + 1
+        }
+        false
+    }
+}
+
+fun bootstrapNoOverloads(): BootstrapOverloadTable =
+    BootstrapOverloadTable([], [], [], [])
+
+// A call (or an operator on a non-scalar operand) the probe pass resolved: the
+// node at `begin..end` in `sourceIdentity` becomes `kind` naming `name`.
+class BootstrapOverloadResolution(
+    val sourceIdentity: string,
+    val begin: int,
+    val end: int,
+    val originalKind: string,
+    val kind: string,
+    val name: string
+)
+
+/** Two functions of one name whose parameter types differ: an overload. */
+fun bootstrapDeclarationsOverload(
+    first: BootstrapDeclaration,
+    second: BootstrapDeclaration
+): bool {
+    if (first.kind != "fun" || second.kind != "fun") return false
+    if (first.parameterTypes.size != second.parameterTypes.size) return true
+    var index = 0
+    while (index < first.parameterTypes.size) {
+        if (bootstrapNormalizeType(first.parameterTypes[index]) !=
+            bootstrapNormalizeType(second.parameterTypes[index])) return true
+        index = index + 1
+    }
+    false
+}
+
+// The operator a binary or unary expression may name, or "".
+fun bootstrapOperatorFunctionName(kind: string): string = when (kind) {
+    "+" -> "plus"
+    "-" -> "minus"
+    "*" -> "times"
+    "/" -> "div"
+    "%" -> "rem"
+    "unary-" -> "unaryMinus"
+    else -> ""
+}
+
 class BootstrapAnalyzer(
     val symbols: array<BootstrapSymbol>,
     var symbolSlots: array<int>,
@@ -4078,7 +4139,10 @@ class BootstrapAnalyzer(
     var generatorDepth: int,
     var yieldedType: string,
     val allowContractCalls: bool,
-    val topLevelNames: BootstrapTopLevelNameIndex
+    val topLevelNames: BootstrapTopLevelNameIndex,
+    val overloads: BootstrapOverloadTable = bootstrapNoOverloads(),
+    val overloadResolutions: array<BootstrapOverloadResolution> = [],
+    var overloadFailures: string = ""
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -4951,6 +5015,145 @@ class BootstrapAnalyzer(
             }
         }
         result
+    }
+
+    // The probe pass of overload.ab: which candidate an overloaded call, or an
+    // operator on an operand with operator functions, selects. Candidates are
+    // read through the same declaration tables as ordinary calls; `owner` is
+    // "" for a free function.
+    fun overloadDeclarationIndex(owner: string, name: string): int =
+        if (owner == "") this.functionDeclarations.find(name)
+        else this.methodDeclarations.find(owner, name)
+
+    fun overloadDeclaration(owner: string, index: int): BootstrapDeclaration =
+        if (owner == "") this.declarations[index]
+        else this.methodDeclarations.declarations[index]
+
+    /** The candidate for `key` (as spelled at the call) accepting
+     *  `argumentTypes`, preferring the most exact parameter matches; "" when
+     *  none fits or two fit equally (recorded in overloadFailures). */
+    fun chooseOverload(
+        owner: string,
+        key: string,
+        argumentTypes: array<string>,
+        operatorOnly: bool
+    ): string {
+        var best = ""
+        var bestExact = -1
+        var ambiguous = false
+        var candidate = 0
+        while (candidate < this.overloads.keys.size) {
+            val name = this.overloads.names[candidate]
+            val index = this.overloadDeclarationIndex(owner, name)
+            if (this.overloads.keys[candidate] == key && index >= 0 &&
+                (!operatorOnly || this.overloads.operators[candidate])) {
+                val declaration = this.overloadDeclaration(owner, index)
+                var required = 0
+                var parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    if (parameter >= declaration.parameterDefaults.size ||
+                        declaration.parameterDefaults[parameter].kind == "missing") {
+                        required = required + 1
+                    }
+                    parameter = parameter + 1
+                }
+                var fits = argumentTypes.size >= required &&
+                    argumentTypes.size <= declaration.parameterTypes.size
+                var exact = 0
+                var argument = 0
+                while (fits && argument < argumentTypes.size) {
+                    val expected = bootstrapNormalizeType(declaration.parameterTypes[argument])
+                    val actual = bootstrapBorrowElementType(argumentTypes[argument])
+                    // An operator applies only to operands known to fit it.
+                    if (expected == actual) exact = exact + 1
+                    else if ((operatorOnly && (actual == "unknown" || actual == "any")) ||
+                             !bootstrapTypesCompatible(expected, actual)) fits = false
+                    argument = argument + 1
+                }
+                if (fits && exact > bestExact) {
+                    best = name
+                    bestExact = exact
+                    ambiguous = false
+                } else if (fits && exact == bestExact) ambiguous = true
+            }
+            candidate = candidate + 1
+        }
+        if (ambiguous || (best == "" && !operatorOnly)) {
+            var types = ""
+            for (type in argumentTypes) types = if (types == "") type else "$types,$type"
+            val reason = if (ambiguous) "ambiguous" else "no-match"
+            this.overloadFailures = "${this.overloadFailures}error[E_SEMANTIC]: call.overload-$reason:$key($types)\n"
+            return ""
+        }
+        best
+    }
+
+    /** Record that the node `expression` becomes `kind` calling `name`, and
+     *  return that call's type. */
+    fun resolveOverload(
+        expression: BootstrapExpression,
+        kind: string,
+        owner: string,
+        name: string,
+        children: array<BootstrapExpression>
+    ): string {
+        this.overloadResolutions.append(BootstrapOverloadResolution(
+            this.currentSourceIdentity, expression.begin, expression.end,
+            expression.kind, kind, name
+        ))
+        val index = this.overloadDeclarationIndex(owner, name)
+        val declaration = this.overloadDeclaration(owner, index)
+        if (declaration.resultType != "inferred") {
+            return bootstrapNormalizeType(declaration.resultType)
+        }
+        // An inferred result: analyze the call as it will be written.
+        this.infer(BootstrapExpression(kind, name, expression.begin, expression.end, children))
+    }
+
+    /** The type of an overloaded free call, else "" (nothing inferred). */
+    fun inferOverloadedCall(expression: BootstrapExpression): string {
+        if (!this.overloads.has(expression.text, false) ||
+            this.hasVisibleLocal(expression.text)) return ""
+        val types: array<string> = []
+        for (child in expression.children) types.append(this.infer(child))
+        val chosen = this.chooseOverload("", expression.text, types, false)
+        if (chosen == "") return "unknown"
+        this.resolveOverload(expression, "call", "", chosen, expression.children)
+    }
+
+    /** The type of an overloaded method call on `receiver` (already inferred),
+     *  else "" (nothing more inferred). */
+    fun inferOverloadedMethodCall(expression: BootstrapExpression, receiver: string): string {
+        val key = "$receiver.${expression.text}"
+        if (!this.overloads.has(key, false)) return ""
+        val types: array<string> = []
+        var argument = 1
+        while (argument < expression.children.size) {
+            types.append(this.infer(expression.children[argument]))
+            argument = argument + 1
+        }
+        val chosen = this.chooseOverload(receiver, key, types, false)
+        if (chosen == "") return "unknown"
+        this.resolveOverload(expression, "member.call", receiver, chosen, expression.children)
+    }
+
+    /** An operator on operand types with an operator function: `a + b` calls
+     *  `A.plus(b)`, `-a` calls `A.unaryMinus()`. "" when no operator applies. */
+    fun inferOperatorCall(expression: BootstrapExpression, operandTypes: array<string>): string {
+        val operator = bootstrapOperatorFunctionName(expression.kind)
+        if (operator == "" || this.overloads.keys.size == 0) return ""
+        val receiver = bootstrapBorrowElementType(operandTypes[0])
+        val key = "$receiver.$operator"
+        if (!this.overloads.has(key, true)) return ""
+        val arguments: array<string> = []
+        var operand = 1
+        while (operand < operandTypes.size) {
+            arguments.append(operandTypes[operand])
+            operand = operand + 1
+        }
+        val chosen = this.chooseOverload(receiver, key, arguments, true)
+        if (chosen == "") return ""
+        this.resolveOverload(expression, "member.call", receiver, chosen, expression.children)
     }
 
     fun delegatedInitializerType(
@@ -6600,6 +6803,10 @@ class BootstrapAnalyzer(
         val rawRight = if (this.scalarBinaryExpression(rightExpression))
             this.inferScalarBinaryExpression(rightExpression)
         else this.infer(rightExpression)
+        if (this.overloads.keys.size > 0) {
+            val operated = this.inferOperatorCall(expression, [rawLeft, rawRight])
+            if (operated != "") return operated
+        }
         val staticStringConcatenation = expression.kind == "+" &&
             rawLeft == "string" && rawRight == "string" &&
             bootstrapStaticString(expression).valid
@@ -6912,6 +7119,10 @@ class BootstrapAnalyzer(
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
             expression.text != "Cell") {
+            if (this.overloads.keys.size > 0) {
+                val overloaded = this.inferOverloadedCall(expression)
+                if (overloaded != "") return overloaded
+            }
             if (this.regionDepth > 0 &&
                 bootstrapRegionCallIsUnsafe(
                     this.regionCalls,
@@ -7330,6 +7541,10 @@ class BootstrapAnalyzer(
         if (expression.kind == "member.call") {
             val rawReceiver = this.infer(expression.children[0])
             val receiver = bootstrapBorrowElementType(rawReceiver)
+            if (this.overloads.keys.size > 0) {
+                val overloaded = this.inferOverloadedMethodCall(expression, receiver)
+                if (overloaded != "") return overloaded
+            }
             if (this.regionDepth > 0 &&
                 bootstrapRegionMemberCallIsUnsafe(
                     this.regionCalls,
@@ -8111,7 +8326,12 @@ class BootstrapAnalyzer(
             expression.kind == "unary-" ||
             expression.kind == "unary+"
         ) {
-            result = this.scalarValueType(this.infer(expression.children[0]))
+            val operand = this.infer(expression.children[0])
+            if (this.overloads.keys.size > 0) {
+                val operated = this.inferOperatorCall(expression, [operand])
+                if (operated != "") return operated
+            }
+            result = this.scalarValueType(operand)
             if (!bootstrapIsNumericScalarType(result)) {
                 this.failScalarExpression(
                     "unary.numeric", expression, result, ""
@@ -8337,26 +8557,31 @@ class BootstrapAnalyzer(
                 type = declaration.name
                 publish = true
             }
-            if (publish) {
-                if (this.hasSymbol(symbolName)) {
-                    var previousSource = "unknown"
-                    var previous = 0
-                    while (previous < index && previousSource == "unknown") {
-                        val candidate = parsed.declarations[previous]
-                        var candidateName = candidate.name
-                        if (candidate.extensionOwner != "") {
-                            candidateName =
-                                "${candidate.extensionOwner}.${candidate.name}"
-                        }
-                        if (candidateName == symbolName) {
-                            previousSource = candidate.sourceIdentity
-                        }
-                        previous = previous + 1
+            // An overload (same name, other parameter types) is published by
+            // overload.ab under its own name before the build's analysis; a
+            // module analyzed on its own keeps the first one.
+            var overload = false
+            if (publish && this.hasSymbol(symbolName)) {
+                var previousSource = "unknown"
+                var previous = 0
+                while (previous < index && previousSource == "unknown") {
+                    val candidate = parsed.declarations[previous]
+                    var candidateName = candidate.name
+                    if (candidate.extensionOwner != "") {
+                        candidateName =
+                            "${candidate.extensionOwner}.${candidate.name}"
                     }
-                    this.fail(
-                        "symbol.duplicate:$symbolName:$previousSource:${declaration.sourceIdentity}"
-                    )
+                    if (candidateName == symbolName) {
+                        previousSource = candidate.sourceIdentity
+                        overload = bootstrapDeclarationsOverload(candidate, declaration)
+                    }
+                    previous = previous + 1
                 }
+                if (!overload) this.fail(
+                    "symbol.duplicate:$symbolName:$previousSource:${declaration.sourceIdentity}"
+                )
+            }
+            if (publish && !overload) {
                 this.appendSymbol(BootstrapSymbol(
                     symbolName,
                     declaration.kind,
@@ -9032,6 +9257,25 @@ fun bootstrapAnalyzeRequestedSourceSpans(
     typedRequestKinds: array<string>,
     typedRequestSources: array<string>
 ): BootstrapSemanticResult {
+    var analyzer = bootstrapAnalyzer(
+        parsed,
+        typedRequestBegins,
+        typedRequestEnds,
+        typedRequestKinds,
+        typedRequestSources,
+        bootstrapNoOverloads()
+    )
+    analyzer.analyze(parsed)
+}
+
+fun bootstrapAnalyzer(
+    parsed: BootstrapParseResult,
+    typedRequestBegins: array<int>,
+    typedRequestEnds: array<int>,
+    typedRequestKinds: array<string>,
+    typedRequestSources: array<string>,
+    overloads: BootstrapOverloadTable
+): BootstrapAnalyzer {
     val symbols: array<BootstrapSymbol> = []
     val locals: array<BootstrapSymbol> = []
     val affineTypes = bootstrapBuildAffineTypeNames(parsed.declarations)
@@ -9108,8 +9352,9 @@ fun bootstrapAnalyzeRequestedSourceSpans(
         0,
         "unknown",
         typedRequestBegins.size > 0,
-        bootstrapTopLevelNameIndex(parsed.declarations)
-    ).analyze(parsed)
+        bootstrapTopLevelNameIndex(parsed.declarations),
+        overloads
+    )
 }
 
 fun bootstrapAnalyze(source: string): BootstrapSemanticResult =

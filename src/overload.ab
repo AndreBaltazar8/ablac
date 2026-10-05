@@ -1,0 +1,356 @@
+// Overloading by parameter types, and operator functions.
+//
+//   fun N.mul(other: N): N = …
+//   fun N.mul(k: f64): N = …            // an overload: same name, other parameter types
+//   operator fun N.plus(other: N): N = …
+//   operator fun f64.times(n: N): N = … // 0.5 * node
+//
+// Every later stage names a function by its spelling, so overloads are given
+// distinct names before the build's semantic analysis: each member of an
+// overload set becomes `name__<parameter types>`. A probe analysis then types
+// every call that may name one (a call or method call spelled like an
+// overload set, an arithmetic operator or unary minus whose left operand has
+// an `operator` function) and picks the candidate whose parameters accept the
+// arguments, preferring exact matches. Those nodes are rewritten into calls of
+// the chosen declaration, and the program continues as if it had been written
+// that way. A program without overloads or operator functions is returned
+// unchanged, without the probe.
+
+import "staged_parser.ab"
+
+class BootstrapOverloadMember(
+    val owner: string,
+    val name: string,
+    val signature: string,
+    val isOperator: bool
+)
+
+/** `name`, or `Owner.name` for a method / extension: how a call spells it. */
+fun bootstrapOverloadKey(owner: string, name: string): string =
+    if (owner == "") name else "$owner.$name"
+
+/** The parameter types as an identifier fragment: `f64_array_i64`. */
+fun bootstrapOverloadSignature(declaration: BootstrapDeclaration): string {
+    var signature = ""
+    var parameter = 0
+    while (parameter < declaration.parameterTypes.size) {
+        val type = bootstrapNormalizeType(declaration.parameterTypes[parameter])
+        var part = ""
+        var index = 0
+        while (index < type.size) {
+            val byte = type[index]
+            val word = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+                (byte >= 97 && byte <= 122)
+            part = if (word) "$part${type.slice(index, index + 1)}" else "${part}_"
+            index = index + 1
+        }
+        signature = if (parameter == 0) part else "${signature}_$part"
+        parameter = parameter + 1
+    }
+    signature
+}
+
+fun bootstrapIsOperatorDeclaration(declaration: BootstrapDeclaration): bool {
+    for (annotation in declaration.annotations) if (annotation == "operator") return true
+    false
+}
+
+fun bootstrapOverloadMember(owner: string, declaration: BootstrapDeclaration): BootstrapOverloadMember =
+    BootstrapOverloadMember(
+        owner,
+        declaration.name,
+        bootstrapOverloadSignature(declaration),
+        bootstrapIsOperatorDeclaration(declaration)
+    )
+
+/** Every function that may be overloaded: free functions, extensions, methods. */
+fun bootstrapOverloadMembers(declarations: array<BootstrapDeclaration>): array<BootstrapOverloadMember> {
+    val members: array<BootstrapOverloadMember> = []
+    for (declaration in declarations) {
+        if (declaration.kind == "fun") {
+            val owner = if (declaration.extensionOwner == "") ""
+                else bootstrapNormalizeType(declaration.extensionOwner)
+            members.append(bootstrapOverloadMember(owner, declaration))
+        }
+        if (declaration.kind == "class") {
+            for (method in declaration.methods) {
+                if (method.kind == "fun") members.append(bootstrapOverloadMember(
+                    bootstrapNormalizeType(declaration.name), method
+                ))
+            }
+        }
+    }
+    members
+}
+
+/** How many members answer to `key`, and whether their signatures differ. */
+fun bootstrapOverloadCount(members: array<BootstrapOverloadMember>, key: string): int {
+    var count = 0
+    for (member in members) {
+        if (bootstrapOverloadKey(member.owner, member.name) == key) count = count + 1
+    }
+    count
+}
+
+fun bootstrapOverloadSignaturesDistinct(members: array<BootstrapOverloadMember>, key: string): bool {
+    val seen: array<string> = []
+    for (member in members) {
+        if (bootstrapOverloadKey(member.owner, member.name) == key) {
+            for (signature in seen) if (signature == member.signature) return false
+            seen.append(member.signature)
+        }
+    }
+    true
+}
+
+/** The name a declaration is published under: mangled when it is overloaded. */
+fun bootstrapOverloadedName(
+    members: array<BootstrapOverloadMember>,
+    owner: string,
+    declaration: BootstrapDeclaration
+): string {
+    val key = bootstrapOverloadKey(owner, declaration.name)
+    if (declaration.kind != "fun" || bootstrapOverloadCount(members, key) < 2 ||
+        !bootstrapOverloadSignaturesDistinct(members, key)) return declaration.name
+    "${declaration.name}__${bootstrapOverloadSignature(declaration)}"
+}
+
+fun bootstrapOverloadRenamed(
+    members: array<BootstrapOverloadMember>,
+    declaration: BootstrapDeclaration
+): BootstrapDeclaration {
+    if (declaration.kind == "fun") {
+        val owner = if (declaration.extensionOwner == "") ""
+            else bootstrapNormalizeType(declaration.extensionOwner)
+        val name = bootstrapOverloadedName(members, owner, declaration)
+        return if (name == declaration.name) declaration
+            else bootstrapDeclarationWithName(declaration, name)
+    }
+    if (declaration.kind != "class") return declaration
+    val owner = bootstrapNormalizeType(declaration.name)
+    var renamed = false
+    val methods: array<BootstrapDeclaration> = []
+    for (method in declaration.methods) {
+        val name = bootstrapOverloadedName(members, owner, method)
+        if (name != method.name) renamed = true
+        methods.append(if (name == method.name) method else bootstrapDeclarationWithName(method, name))
+    }
+    if (renamed) bootstrapDeclarationWithMethods(declaration, methods) else declaration
+}
+
+fun bootstrapDeclarationWithMethods(
+    declaration: BootstrapDeclaration,
+    methods: array<BootstrapDeclaration>
+): BootstrapDeclaration = BootstrapDeclaration(
+    declaration.kind,
+    declaration.name,
+    declaration.begin,
+    declaration.end,
+    declaration.expression,
+    declaration.parameters,
+    declaration.parameterTypes,
+    declaration.resultType,
+    methods,
+    declaration.parameterDefaults,
+    declaration.externalLibrary,
+    declaration.parameterKinds,
+    declaration.extensionOwner,
+    declaration.isTrusted,
+    declaration.isResource,
+    declaration.isNoEscape,
+    declaration.generatedNamespace,
+    declaration.generatedOriginBegin,
+    declaration.generatedOriginEnd,
+    declaration.annotations,
+    declaration.annotationArguments,
+    declaration.annotationBegins,
+    declaration.annotationEnds,
+    declaration.sourceIdentity
+)
+
+val BOOTSTRAP_OPERATOR_NAMES = ["plus", "minus", "times", "div", "rem", "unaryMinus"]
+
+fun bootstrapIsOperatorName(name: string): bool {
+    for (operator in BOOTSTRAP_OPERATOR_NAMES) if (operator == name) return true
+    false
+}
+
+// Resolutions indexed by node: "<source>:<begin>:<end>:<kind>" → resolution.
+class BootstrapOverloadIndex(
+    val keys: array<string>,
+    val slots: array<int>
+) {
+    fun find(key: string): int {
+        var slot = bootstrapFunctionDeclarationHash(key)
+        slot = slot - slot / this.slots.size * this.slots.size
+        var probes = 0
+        while (probes < this.slots.size && this.slots[slot] >= 0) {
+            if (this.keys[this.slots[slot]] == key) return this.slots[slot]
+            slot = slot + 1
+            if (slot == this.slots.size) slot = 0
+            probes = probes + 1
+        }
+        -1
+    }
+}
+
+fun bootstrapOverloadNodeKey(source: string, begin: int, end: int, kind: string): string =
+    "$source:$begin:$end:$kind"
+
+fun bootstrapOverloadIndex(resolutions: array<BootstrapOverloadResolution>): BootstrapOverloadIndex {
+    val keys: array<string> = []
+    for (resolution in resolutions) keys.append(bootstrapOverloadNodeKey(
+        resolution.sourceIdentity, resolution.begin, resolution.end, resolution.originalKind
+    ))
+    var capacity = 8
+    while (capacity < keys.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    for (slot in 0 until capacity) slots.append(-1)
+    var entry = 0
+    while (entry < keys.size) {
+        var slot = bootstrapFunctionDeclarationHash(keys[entry])
+        slot = slot - slot / capacity * capacity
+        while (slots[slot] >= 0 && keys[slots[slot]] != keys[entry]) {
+            slot = slot + 1
+            if (slot == capacity) slot = 0
+        }
+        slots[slot] = entry
+        entry = entry + 1
+    }
+    BootstrapOverloadIndex(keys, slots)
+}
+
+/** `expression` with every resolved node rewritten into its call. */
+fun bootstrapOverloadRewrite(
+    expression: BootstrapExpression,
+    source: string,
+    resolutions: array<BootstrapOverloadResolution>,
+    index: BootstrapOverloadIndex
+): BootstrapExpression {
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapOverloadRewrite(child, source, resolutions, index))
+    val found = index.find(bootstrapOverloadNodeKey(source, expression.begin, expression.end, expression.kind))
+    if (found >= 0) {
+        val resolution = resolutions[found]
+        return BootstrapExpression(resolution.kind, resolution.name, expression.begin, expression.end, children)
+    }
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
+fun bootstrapOverloadRewriteDeclaration(
+    declaration: BootstrapDeclaration,
+    resolutions: array<BootstrapOverloadResolution>,
+    index: BootstrapOverloadIndex
+): BootstrapDeclaration {
+    var rewritten = bootstrapDeclarationWithExpression(
+        declaration,
+        bootstrapOverloadRewrite(declaration.expression, declaration.sourceIdentity, resolutions, index)
+    )
+    if (declaration.methods.size > 0) {
+        val methods: array<BootstrapDeclaration> = []
+        for (method in declaration.methods) methods.append(bootstrapOverloadRewriteDeclaration(method, resolutions, index))
+        rewritten = bootstrapDeclarationWithMethods(rewritten, methods)
+    }
+    rewritten
+}
+
+/** Whether any resolution lies in `declaration`'s source span. */
+fun bootstrapOverloadTouches(
+    declaration: BootstrapDeclaration,
+    resolutions: array<BootstrapOverloadResolution>
+): bool {
+    for (resolution in resolutions) {
+        if (resolution.sourceIdentity == declaration.sourceIdentity &&
+            resolution.begin >= declaration.begin && resolution.end <= declaration.end) return true
+    }
+    false
+}
+
+/** `parsed` with overloads published under distinct names and every call of
+ *  one (and every operator use) rewritten to name its declaration. */
+fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResult {
+    val members = bootstrapOverloadMembers(parsed.declarations)
+    var diagnostics = ""
+    var errors = 0
+    var active = false
+    for (member in members) {
+        val key = bootstrapOverloadKey(member.owner, member.name)
+        if (member.isOperator) {
+            active = true
+            if (member.owner == "" || !bootstrapIsOperatorName(member.name)) {
+                diagnostics = "${diagnostics}error[E_SEMANTIC]: operator.declaration:$key: an operator function is plus, minus, times, div, rem or unaryMinus on a receiver\n"
+                errors = errors + 1
+            }
+        } else if (bootstrapOverloadCount(members, key) > 1 &&
+                   bootstrapOverloadSignaturesDistinct(members, key)) active = true
+    }
+    if (!active) return parsed
+
+    // Publish overloads under distinct names, then type every call naming one.
+    val renamed: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) renamed.append(bootstrapOverloadRenamed(members, declaration))
+    val keys: array<string> = []
+    val names: array<string> = []
+    val owners: array<string> = []
+    val operators: array<bool> = []
+    var position = 0
+    while (position < renamed.size) {
+        val original = parsed.declarations[position]
+        val declaration = renamed[position]
+        if (declaration.kind == "fun") {
+            val owner = if (declaration.extensionOwner == "") ""
+                else bootstrapNormalizeType(declaration.extensionOwner)
+            val operator = bootstrapIsOperatorDeclaration(declaration)
+            if (declaration.name != original.name || operator) {
+                keys.append(bootstrapOverloadKey(owner, original.name))
+                names.append(declaration.name)
+                owners.append(owner)
+                operators.append(operator)
+            }
+        }
+        if (declaration.kind == "class") {
+            val owner = bootstrapNormalizeType(declaration.name)
+            var method = 0
+            while (method < declaration.methods.size) {
+                val renamedMethod = declaration.methods[method]
+                val operator = bootstrapIsOperatorDeclaration(renamedMethod)
+                if (renamedMethod.kind == "fun" &&
+                    (renamedMethod.name != original.methods[method].name || operator)) {
+                    keys.append(bootstrapOverloadKey(owner, original.methods[method].name))
+                    names.append(renamedMethod.name)
+                    owners.append(owner)
+                    operators.append(operator)
+                }
+                method = method + 1
+            }
+        }
+        position = position + 1
+    }
+    val probeInput = BootstrapParseResult(
+        renamed, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+    var probe = bootstrapAnalyzer(
+        probeInput, [], [], [], [], BootstrapOverloadTable(keys, names, owners, operators)
+    )
+    probe.analyze(probeInput)
+    val resolutions = probe.overloadResolutions
+    if (probe.overloadFailures != "") {
+        diagnostics = "$diagnostics${probe.overloadFailures}"
+        errors = errors + 1
+    }
+
+    val index = bootstrapOverloadIndex(resolutions)
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in renamed) {
+        declarations.append(
+            if (bootstrapOverloadTouches(declaration, resolutions))
+                bootstrapOverloadRewriteDeclaration(declaration, resolutions, index)
+            else declaration
+        )
+    }
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors + errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, "${parsed.diagnostics}$diagnostics"
+    )
+}
