@@ -686,7 +686,10 @@ Calls, member access, and indexing bind most tightly, followed by unary
 operators, multiplication/division, addition/subtraction, shifts, comparison,
 equality, bitwise AND/XOR/OR, logical conjunction/disjunction, and assignment.
 Assignment is right-associative and produces the assigned value for prototype
-compatibility.
+compatibility. Compound assignment `place op= value` (`+=`, `-=`, `*=`, `/=`,
+`%=`) means `place = place op value`, so an operator function applies to it as
+well. Its place is evaluated twice and therefore may contain only names,
+literals, fields and indexes, never a call.
 
 Integer arithmetic and bitwise operators preserve their common declared width.
 Fixed-width addition, subtraction, and multiplication wrap at that width;

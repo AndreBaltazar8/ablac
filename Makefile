@@ -74,6 +74,7 @@ test: ablac
 	tools/test-static-strings.sh $(COMPILER)
 	tools/test-overloads.sh $(COMPILER)
 	tools/test-argument-diagnostics.sh $(COMPILER)
+	tools/test-compound-assignment.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
 check: test self-rebuild
