@@ -13,6 +13,7 @@ limited_program="$directory/limited-program"
 collector_program="$directory/collector-program"
 host_collector_program="$directory/host-collector-program"
 pressure_program="$directory/pressure-program"
+global_container_program="$directory/global-container-program"
 plain_ir="$directory/plain.ll"
 collector_ir="$directory/collector.ll"
 mkdir -p "$directory"
@@ -26,6 +27,15 @@ fi
 rg -q '^define (hidden|internal) void @abla_runtime_roots_push\(' "$plain_ir"
 rg -q '^define (hidden|internal) void @abla_runtime_roots_pop\(' "$plain_ir"
 rg -q '^define (hidden|internal) void @abla_runtime_memory_pressure\(\)' "$plain_ir"
+"$compiler" build \
+    "$project_root/tests/cases/modules/runtime-memory-global-container.ab" \
+    -o "$global_container_program" --no-cache
+set +e
+ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
+    "$project_root/tools/run-limited.sh" "$global_container_program"
+global_container_status=$?
+set -e
+[[ $global_container_status -eq 42 ]]
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/runtime-memory-collect.ab" \
     > "$collector_ir"
@@ -104,4 +114,4 @@ host_collector_status=$?
 set -e
 [[ $host_collector_status -eq 42 ]]
 printf '%s\n' \
-    'portable memory runtime: direct declarations + pressure safe points + limits + pure/host collection passed'
+    'portable memory runtime: direct declarations + pressure safe points + limits + pure/host collection + bootstrapped global containers passed'
