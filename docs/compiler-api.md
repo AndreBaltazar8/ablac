@@ -355,7 +355,7 @@ The root and recursively registered program nodes share one bounded output
 transaction. Artifacts, generated source, and compiler-owned sidecars journal
 their prior filesystem entry before replacement. If any later node fails, old
 files are restored and newly created paths are removed; only a completely
-successful graph commits. The journal accepts at most 512 distinct paths and
+successful graph commits. The journal accepts at most 4096 distinct paths and
 reports transaction and rollback failures with stable build diagnostic codes.
 
 `@export("name")` is the source-level form for marking one resolved top-level

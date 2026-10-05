@@ -12,6 +12,9 @@ import "abla/bytes"
 // independent from compile-driver bookkeeping.
 var bootstrapCompileOutputCount: int = 0
 var bootstrapCompileOutputBytes: int = 0
+// Compile-time globals kept between evaluations (bootstrapCompileGlobalsKeep): how many
+// the per-process journal holds.
+var bootstrapCompileGlobalCount: int = 0
 var bootstrapBuildTransactionActive: bool = false
 var bootstrapBuildTransactionCount: int = 0
 
@@ -984,7 +987,7 @@ fun bootstrapBuildTransactionRoot(): string =
 fun bootstrapClearBuildTransactionJournal(): void {
     val root = bootstrapBuildTransactionRoot()
     var index = 0
-    while (index < 512) {
+    while (index < bootstrapBuildTransactionCount) {
         Path("$root/$index.path").remove()
         Path("$root/$index.existed").remove()
         Path("$root/$index.data").remove()
@@ -1015,7 +1018,7 @@ fun bootstrapRecordBuildTransactionPath(path: string): bool {
         index = index + 1
     }
     if (recorded) return true
-    if (bootstrapBuildTransactionCount >= 512) valid = false
+    if (bootstrapBuildTransactionCount >= BOOTSTRAP_COMPILE_OUTPUT_LIMIT) valid = false
     val destination = Path(path)
     val existed = destination.exists()
     val journalIndex = bootstrapBuildTransactionCount
@@ -1073,10 +1076,17 @@ fun bootstrapRollbackBuildTransaction(): bool {
     restored
 }
 
+/** A compilation starts: no outputs staged, no compile-time globals kept. */
 fun bootstrapBeginCompileOutputs(): void {
+    bootstrapClearCompileOutputs()
+    bootstrapForgetCompileGlobals()
+    bootstrapSemanticUnit()
+}
+
+fun bootstrapClearCompileOutputs(): void {
     val root = bootstrapCompileOutputRoot()
     var index = 0
-    while (index < 64) {
+    while (index < bootstrapCompileOutputCount) {
         Path("$root/$index.path").remove()
         Path("$root/$index.data").remove()
         index = index + 1
@@ -1087,8 +1097,204 @@ fun bootstrapBeginCompileOutputs(): void {
     bootstrapSemanticUnit()
 }
 
+// --- compile-time globals ------------------------------------------------------
+//
+// A `compile val` / `compile var` holds one value for a whole compilation: the first
+// reference evaluates its initializer, and what any evaluation changes through it (an
+// object's fields, an array's elements, a var's assignment) is what every later one sees —
+// parser handlers, finalizers, transforms and compile expressions alike, across modules.
+// Between evaluations the values live in a per-process journal (like the compile outputs:
+// only scalar counters are process globals), so a kept value holds data only — integers,
+// booleans, strings, null, arrays and objects. A value holding anything else (a closure,
+// a handle) is evaluated afresh at each evaluation, as before.
+
+fun bootstrapCompileGlobalRoot(): string =
+    "build/.abla-compile-globals-${linuxProcessId()}"
+
+fun bootstrapCompileGlobalKey(declaration: BootstrapDeclaration): string =
+    "${declaration.sourceIdentity}:${declaration.name}"
+
+fun bootstrapForgetCompileGlobals(): void {
+    val root = bootstrapCompileGlobalRoot()
+    var index = 0
+    while (index < bootstrapCompileGlobalCount) {
+        Path("$root/$index.key").remove()
+        Path("$root/$index.value").remove()
+        index = index + 1
+    }
+    Path(root).remove()
+    bootstrapCompileGlobalCount = 0
+    bootstrapSemanticUnit()
+}
+
+fun bootstrapCompileGlobalSlot(key: string): int {
+    val root = bootstrapCompileGlobalRoot()
+    var found = -1
+    var index = 0
+    while (found < 0 && index < bootstrapCompileGlobalCount) {
+        if (Path("$root/$index.key").readText() == key) found = index
+        index = index + 1
+    }
+    found
+}
+
+/** What an earlier evaluation kept under `key` (invalid when none). */
+fun bootstrapCompileGlobalLoad(key: string): BootstrapEvalValue {
+    val slot = bootstrapCompileGlobalSlot(key)
+    if (slot < 0) return bootstrapEvalInvalid()
+    val reader = BootstrapCompileGlobalReader(
+        Path("${bootstrapCompileGlobalRoot()}/$slot.value").readText(), 0, true
+    )
+    val value = reader.value()
+    if (!reader.ok) return bootstrapEvalInvalid()
+    value
+}
+
+/** Keep the globals an evaluation read (and possibly changed) for the next ones. */
+fun bootstrapCompileGlobalsKeep(
+    keys: array<string>,
+    values: array<BootstrapEvalValue>
+): void {
+    val root = bootstrapCompileGlobalRoot()
+    var index = 0
+    while (index < keys.size) {
+        val encoded = bootstrapCompileGlobalEncode(values[index])
+        var slot = bootstrapCompileGlobalSlot(keys[index])
+        if (encoded == "") {
+            if (slot >= 0) Path("$root/$slot.value").writeTextAtomic("")
+        } else {
+            var written = true
+            if (slot < 0) {
+                slot = bootstrapCompileGlobalCount
+                written = Path(root).createDirectories() &&
+                    Path("$root/$slot.key").writeTextAtomic(keys[index])
+                if (written) bootstrapCompileGlobalCount = slot + 1
+            }
+            if (written) Path("$root/$slot.value").writeTextAtomic(encoded)
+        }
+        index = index + 1
+    }
+    bootstrapSemanticUnit()
+}
+
+fun bootstrapCompileGlobalToken(text: string): string = "${text.size}:$text"
+
+/** Bytewise `a < b`. */
+fun bootstrapTextBefore(a: string, b: string): bool {
+    var index = 0
+    while (index < a.size && index < b.size) {
+        if (a[index] != b[index]) return a[index] < b[index]
+        index = index + 1
+    }
+    a.size < b.size
+}
+
+/** The names in directory `path` ("." and ".." left out), sorted bytewise. */
+fun bootstrapSortedEntryNames(path: string): array<string> {
+    val names: array<string> = []
+    for (entry in Path(path).entries()) {
+        val name = entry.name()
+        if (name != "." && name != "..") {
+            names.append(name)
+            var at = names.size - 1
+            while (at > 0 && bootstrapTextBefore(names[at], names[at - 1])) {
+                val swap = names[at - 1]
+                names[at - 1] = names[at]
+                names[at] = swap
+                at = at - 1
+            }
+        }
+    }
+    names
+}
+
+/** A data value's journal text: "" when it holds anything but data. */
+fun bootstrapCompileGlobalEncode(value: BootstrapEvalValue): string {
+    val kind = value.kind
+    if (kind != "integer" && kind != "boolean" && kind != "string" &&
+        kind != "null" && kind != "void" && kind != "array" &&
+        kind != "object") return ""
+    var out = "${bootstrapCompileGlobalToken(kind)}${bootstrapCompileGlobalToken("${value.integer}")}${bootstrapCompileGlobalToken(if (value.boolean) "1" else "0")}${bootstrapCompileGlobalToken(value.text)}${bootstrapCompileGlobalToken(value.owner)}${bootstrapCompileGlobalToken("${value.fieldNames.size}")}"
+    var index = 0
+    while (index < value.fieldNames.size) {
+        out = "$out${bootstrapCompileGlobalToken(value.fieldNames[index])}"
+        index = index + 1
+    }
+    out = "$out${bootstrapCompileGlobalToken("${value.elements.size}")}"
+    index = 0
+    while (index < value.elements.size) {
+        val element = bootstrapCompileGlobalEncode(value.elements[index])
+        if (element == "") return ""
+        out = "$out$element"
+        index = index + 1
+    }
+    out
+}
+
+class BootstrapCompileGlobalReader(val text: string, var at: int, var ok: bool) {
+    fun token(): string {
+        var length = 0
+        var digits = 0
+        while (this.ok && this.at < this.text.size && this.text[this.at] != 58) {
+            val digit = this.text[this.at] - 48
+            if (digit < 0 || digit > 9) this.ok = false
+            length = length * 10 + digit
+            digits = digits + 1
+            this.at = this.at + 1
+        }
+        if (digits == 0 || this.at >= this.text.size) this.ok = false
+        if (!this.ok || this.at + 1 + length > this.text.size) {
+            this.ok = false
+            return ""
+        }
+        val begin = this.at + 1
+        this.at = begin + length
+        this.text.slice(begin, begin + length)
+    }
+
+    fun number(): int {
+        val text = this.token()
+        var negative = false
+        var value = 0
+        var index = 0
+        if (text.size > 0 && text[0] == 45) {
+            negative = true
+            index = 1
+        }
+        if (index >= text.size) this.ok = false
+        while (index < text.size) {
+            val digit = text[index] - 48
+            if (digit < 0 || digit > 9) this.ok = false
+            value = value * 10 + digit
+            index = index + 1
+        }
+        if (negative) 0 - value else value
+    }
+
+    fun value(): BootstrapEvalValue {
+        val kind = this.token()
+        val integer = this.number()
+        val boolean = this.token() == "1"
+        val text = this.token()
+        val owner = this.token()
+        val fieldNames: array<string> = []
+        var count = this.number()
+        while (this.ok && count > 0) {
+            fieldNames.append(this.token())
+            count = count - 1
+        }
+        val elements: array<BootstrapEvalValue> = []
+        count = this.number()
+        while (this.ok && count > 0) {
+            elements.append(this.value())
+            count = count - 1
+        }
+        BootstrapEvalValue(kind, integer, boolean, text, elements, owner, fieldNames)
+    }
+}
+
 fun bootstrapDiscardCompileOutputs(): void {
-    bootstrapBeginCompileOutputs()
+    bootstrapClearCompileOutputs()
     bootstrapSemanticUnit()
 }
 
@@ -1111,14 +1317,42 @@ fun bootstrapCompileOutputPathValid(path: string): bool {
     valid
 }
 
+// How many distinct paths one compilation may stage, and how many bytes in all.
+val BOOTSTRAP_COMPILE_OUTPUT_LIMIT = 4096
+val BOOTSTRAP_COMPILE_OUTPUT_BYTES = 268435456
+
+/** The slot already staging `path`, -1 none. */
+fun bootstrapCompileOutputSlot(path: string): int {
+    val root = bootstrapCompileOutputRoot()
+    var found = -1
+    var index = 0
+    while (found < 0 && index < bootstrapCompileOutputCount) {
+        if (Path("$root/$index.path").readText() == path) found = index
+        index = index + 1
+    }
+    found
+}
+
 fun bootstrapStageCompileOutput(path: string, contents: string): bool {
     var valid = bootstrapCompileOutputPathValid(path) &&
         contents.size <= 16777216
+    // A path written again in the same compilation: the last contents win, in its slot.
+    val slot = if (valid) bootstrapCompileOutputSlot(path) else -1
+    if (slot >= 0) {
+        val dataFile = Path("${bootstrapCompileOutputRoot()}/$slot.data")
+        val previous = dataFile.readText().size
+        val nextBytes = bootstrapCompileOutputBytes - previous + contents.size
+        if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
+        if (!dataFile.writeTextAtomic(contents)) return false
+        bootstrapCompileOutputBytes = nextBytes
+        return true
+    }
     val nextBytes = bootstrapCompileOutputBytes + contents.size
-    if (nextBytes > 67108864) valid = false
-    if (bootstrapCompileOutputCount >= 64) valid = false
+    if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) valid = false
+    if (bootstrapCompileOutputCount >= BOOTSTRAP_COMPILE_OUTPUT_LIMIT) valid = false
     if (valid) {
         val root = bootstrapCompileOutputRoot()
+        valid = Path(root).createDirectories()
         val pathFile = Path("$root/$bootstrapCompileOutputCount.path")
         val dataFile = Path("$root/$bootstrapCompileOutputCount.data")
         valid = pathFile.writeTextAtomic(path)
@@ -1147,8 +1381,8 @@ fun bootstrapStageToolchainOutput(path: string, contents: string): bool {
         index = index + 1
     }
     val nextBytes = bootstrapCompileOutputBytes + contents.size
-    if (nextBytes > 67108864) valid = false
-    if (bootstrapCompileOutputCount >= 64) valid = false
+    if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) valid = false
+    if (bootstrapCompileOutputCount >= BOOTSTRAP_COMPILE_OUTPUT_LIMIT) valid = false
     if (valid) {
         val root = bootstrapCompileOutputRoot()
         val pathFile = Path("$root/$bootstrapCompileOutputCount.path")
@@ -1601,6 +1835,10 @@ class BootstrapEvaluator(
     val extensionRequests: array<BootstrapExtensionRequest>,
     val compileInputPaths: array<string>,
     val compileInputContents: array<string>,
+    // The compile-time globals this evaluation has read (`compile val` / `compile var`), by
+    // key, shared with the evaluations it calls; kept for the compilation at its end.
+    val globalKeys: array<string>,
+    val globalValues: array<BootstrapEvalValue>,
     val allowedCompileEffects: int,
     var errors: int,
     var steps: int,
@@ -2624,6 +2862,35 @@ class BootstrapEvaluator(
                 this.values[valueIndex] = this.uninitializedValue()
             }
         }
+    }
+
+    /** A `compile val` / `compile var`'s value: one for the whole compilation. The first
+     *  reference evaluates its initializer (or takes what an earlier evaluation kept);
+     *  changes through it last for every later evaluation. */
+    fun compileGlobal(declaration: BootstrapDeclaration): BootstrapEvalValue {
+        val key = bootstrapCompileGlobalKey(declaration)
+        var index = 0
+        while (index < this.globalKeys.size) {
+            if (this.globalKeys[index] == key) return this.globalValues[index]
+            index = index + 1
+        }
+        var value = bootstrapCompileGlobalLoad(key)
+        if (value.kind == "invalid") value = this.evaluate(declaration.expression)
+        this.globalKeys.append(key)
+        this.globalValues.append(value)
+        value
+    }
+
+    /** The `compile var` declaration named `name`, -1 none. */
+    fun compileVar(name: string): int {
+        var result = -1
+        var index = 0
+        while (index < this.declarations.size) {
+            if (this.declarations[index].kind == "compile.var" &&
+                this.declarations[index].name == name) result = index
+            index = index + 1
+        }
+        result
     }
 
     fun find(name: string): int {
@@ -4020,6 +4287,8 @@ class BootstrapEvaluator(
                 this.extensionRequests,
                 this.compileInputPaths,
                 this.compileInputContents,
+                this.globalKeys,
+                this.globalValues,
                 this.allowedCompileEffects,
                 this.errors,
                 this.steps,
@@ -5953,6 +6222,27 @@ class BootstrapEvaluator(
                 result = bootstrapEvalInvalid()
             }
         }
+        if (targetName == "ablaHostListDirectory") {
+            // A directory's entry names, sorted (bytewise) so a build sees the same order
+            // on every host; [] when it doesn't exist.
+            if (bootstrapCompileEffectHas(this.allowedCompileEffects, 4)) {
+                val path = this.evaluate(expression.children[0])
+                val names = bootstrapSortedEntryNames(path.text)
+                var listing = ""
+                val elements: array<BootstrapEvalValue> = []
+                var index = 0
+                while (index < names.size) {
+                    elements.append(bootstrapEvalString(names[index]))
+                    listing = "$listing${names[index]}\n"
+                    index = index + 1
+                }
+                this.recordCompileInput("abla-input:directory:${path.text}", listing)
+                result = bootstrapEvalArray(elements)
+            } else {
+                this.errors = this.errors + 1
+                result = bootstrapEvalInvalid()
+            }
+        }
         if (targetName == "compilerWriteFile") {
             val path = this.evaluate(expression.children[0])
             val contents = this.evaluate(expression.children[1])
@@ -7485,6 +7775,8 @@ class BootstrapEvaluator(
                             this.extensionRequests,
                             this.compileInputPaths,
                             this.compileInputContents,
+                            this.globalKeys,
+                            this.globalValues,
                             this.allowedCompileEffects,
                             this.errors,
                             this.steps,
@@ -7517,6 +7809,8 @@ class BootstrapEvaluator(
                     this.extensionRequests,
                     this.compileInputPaths,
                     this.compileInputContents,
+                    this.globalKeys,
+                    this.globalValues,
                     this.allowedCompileEffects,
                     this.errors,
                     this.steps,
@@ -7685,6 +7979,8 @@ class BootstrapEvaluator(
                             this.extensionRequests,
                             this.compileInputPaths,
                             this.compileInputContents,
+                            this.globalKeys,
+                            this.globalValues,
                             this.allowedCompileEffects,
                             this.errors,
                             this.steps,
@@ -7717,6 +8013,8 @@ class BootstrapEvaluator(
                     this.extensionRequests,
                     this.compileInputPaths,
                     this.compileInputContents,
+                    this.globalKeys,
+                    this.globalValues,
                     this.allowedCompileEffects,
                     this.errors,
                     this.steps,
@@ -7770,6 +8068,8 @@ class BootstrapEvaluator(
                                     this.extensionRequests,
                                     this.compileInputPaths,
                                     this.compileInputContents,
+                                    this.globalKeys,
+                                    this.globalValues,
                                     this.allowedCompileEffects,
                                     this.errors,
                                     this.steps,
@@ -7802,6 +8102,8 @@ class BootstrapEvaluator(
                         this.extensionRequests,
                             this.compileInputPaths,
                             this.compileInputContents,
+                            this.globalKeys,
+                            this.globalValues,
                             this.allowedCompileEffects,
                             this.errors,
                             this.steps,
@@ -7960,6 +8262,9 @@ class BootstrapEvaluator(
                         if (declaration.expression.kind ==
                             "delegate.initializer") {
                             result = this.delegatedSlot(expression.text)
+                        } else if (declaration.kind == "compile.val" ||
+                            declaration.kind == "compile.var") {
+                            result = this.compileGlobal(declaration)
                         } else result = this.evaluate(declaration.expression)
                     }
                     if ((declaration.kind == "fun" ||
@@ -8213,7 +8518,25 @@ class BootstrapEvaluator(
             this.mutable.append(expression.kind == "local.var")
             result = BootstrapEvalValue("void", 0, false, "", [], "", [])
         }
-        if (expression.kind == "assign") {
+        if (expression.kind == "assign" && this.find(expression.text) < 0 &&
+            this.compileVar(expression.text) >= 0) {
+            // A `compile var` takes the new value for the rest of the compilation.
+            val declaration = this.declarations[this.compileVar(expression.text)]
+            val key = bootstrapCompileGlobalKey(declaration)
+            val value = this.evaluate(expression.children[0])
+            var slot = -1
+            var index = 0
+            while (index < this.globalKeys.size) {
+                if (this.globalKeys[index] == key) slot = index
+                index = index + 1
+            }
+            if (slot >= 0) this.globalValues[slot] = value
+            else {
+                this.globalKeys.append(key)
+                this.globalValues.append(value)
+            }
+            result = value
+        } else if (expression.kind == "assign") {
             var found = this.find(expression.text)
             if (found < 0) {
                 val global = this.delegatedSlot(expression.text)
@@ -8737,6 +9060,8 @@ fun bootstrapEvaluateWithEffects(
     val extensionRequests: array<BootstrapExtensionRequest> = []
     val compileInputPaths: array<string> = []
     val compileInputContents: array<string> = []
+    val globalKeys: array<string> = []
+    val globalValues: array<BootstrapEvalValue> = []
     val evaluator = BootstrapEvaluator(
         declarations,
         bootstrapBuildAffineTypeNames(declarations),
@@ -8751,12 +9076,15 @@ fun bootstrapEvaluateWithEffects(
         extensionRequests,
         compileInputPaths,
         compileInputContents,
+        globalKeys,
+        globalValues,
         allowedCompileEffects,
         0,
         0,
         ""
     )
     val result = evaluator.evaluate(expression)
+    bootstrapCompileGlobalsKeep(globalKeys, globalValues)
     BootstrapEvalResult(
         result,
         evaluator.errors,
@@ -8806,6 +9134,8 @@ fun bootstrapInvokeSubparserHandler(
     val extensionRequests: array<BootstrapExtensionRequest> = []
     val compileInputPaths: array<string> = []
     val compileInputContents: array<string> = []
+    val globalKeys: array<string> = []
+    val globalValues: array<BootstrapEvalValue> = []
     val evaluator = BootstrapEvaluator(
         declarations,
         bootstrapBuildAffineTypeNames(declarations),
@@ -8820,6 +9150,8 @@ fun bootstrapInvokeSubparserHandler(
         extensionRequests,
         compileInputPaths,
         compileInputContents,
+        globalKeys,
+        globalValues,
         allowedCompileEffects,
         0,
         0,
@@ -8849,6 +9181,7 @@ fun bootstrapInvokeSubparserHandler(
         result.integer < syntax.size) {
         expression = syntax[result.integer]
     }
+    bootstrapCompileGlobalsKeep(globalKeys, globalValues)
     BootstrapSubparserInvocation(
         expression,
         evaluator.errors + cursor.errors,
@@ -8880,6 +9213,8 @@ fun bootstrapInvokeExtensionFinalizer(
     val extensionRequests: array<BootstrapExtensionRequest> = [request]
     val compileInputPaths: array<string> = []
     val compileInputContents: array<string> = []
+    val globalKeys: array<string> = []
+    val globalValues: array<BootstrapEvalValue> = []
     val evaluator = BootstrapEvaluator(
         declarations,
         bootstrapBuildAffineTypeNames(declarations),
@@ -8894,6 +9229,8 @@ fun bootstrapInvokeExtensionFinalizer(
         extensionRequests,
         compileInputPaths,
         compileInputContents,
+        globalKeys,
+        globalValues,
         allowedCompileEffects,
         0,
         0,
@@ -8915,6 +9252,7 @@ fun bootstrapInvokeExtensionFinalizer(
             )
         ]
     ))
+    bootstrapCompileGlobalsKeep(globalKeys, globalValues)
     BootstrapEvalResult(
         result,
         evaluator.errors,
@@ -8935,6 +9273,8 @@ fun bootstrapInvokeCompilerTransform(
     val generatedDeclarations: array<BootstrapDeclaration> = []
     val compileInputPaths: array<string> = []
     val compileInputContents: array<string> = []
+    val globalKeys: array<string> = []
+    val globalValues: array<BootstrapEvalValue> = []
     val evaluator = BootstrapEvaluator(
         declarations,
         bootstrapBuildAffineTypeNames(declarations),
@@ -8949,6 +9289,8 @@ fun bootstrapInvokeCompilerTransform(
         [],
         compileInputPaths,
         compileInputContents,
+        globalKeys,
+        globalValues,
         allowedCompileEffects,
         0,
         0,
@@ -8963,6 +9305,7 @@ fun bootstrapInvokeCompilerTransform(
         []
     ))
     bootstrapCompilerTransformActive = false
+    bootstrapCompileGlobalsKeep(globalKeys, globalValues)
     BootstrapEvalResult(
         result,
         evaluator.errors,

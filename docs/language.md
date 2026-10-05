@@ -861,6 +861,36 @@ checked before parser evaluation, since that phase precedes complete semantic
 analysis. Manifest authorization is injected as
 an internal AST marker that ordinary source cannot construct.
 
+`ablaHostListDirectory(path)` (also `filesystem.read`) lists a directory's entry names,
+sorted bytewise so every host sees the same order; the listing is journaled like a read.
+`compilerWriteFile(path, contents)` (`filesystem.write`) stages an output published with
+the compilation; writing the same path again replaces its staged contents, so a handler
+can rewrite one generated file as it learns more. A compilation stages at most 4096
+distinct paths and 256 MiB.
+
+Compile-time globals (`compile val` / `compile var`) hold one value for a whole
+compilation. The first reference evaluates the initializer; what any evaluation then
+changes through it — an object's fields, an array's elements, a `compile var`'s
+assignment — is what every later evaluation sees: parser handlers, finalizers,
+transforms and compile expressions alike, across every module of the compilation. A
+provider can therefore collect what its uses contribute (a table of generated entries,
+say) and write the result once it has it all. Between evaluations the values are kept
+as data, so a kept global holds integers, booleans, strings, null, arrays and objects; a
+value holding anything else (a closure, a handle) is evaluated afresh at each evaluation.
+A module the native cache skips runs no handlers, so a provider that collects from its
+uses wants `--no-cache` builds.
+
+```abla
+class Seen(val names: array<string>)
+compile val seen: Seen = Seen([])
+
+compile fun parseTag(cursor: ParserCursor): SyntaxExpression {
+    seen.names.append(parserRawTakeName(cursor))
+    val unused = compilerWriteFile("build/tags.txt", "${seen.names.size}")
+    syntaxInteger(seen.names.size)
+}
+```
+
 The compiler module also provides bounded clock, random-integer, and process
 execution operations. These require explicit `clock`, `random`, or
 `process.io` grants and always disable native-object cache hits and publication.

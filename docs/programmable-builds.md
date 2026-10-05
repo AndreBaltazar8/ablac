@@ -104,7 +104,7 @@ Publication is graph-transactional across the root, every recursively
 discovered artifact, ABI/LLVM/object sidecars, and compile-time generated
 file. Before a path is changed, an existing file is atomically renamed into a
 private bounded journal; a later node failure restores prior files and removes
-new ones in reverse order. A successful graph discards the journal. At most 512
+new ones in reverse order. A successful graph discards the journal. At most 4096
 distinct output paths may participate, and exceeding that bound fails with
 `E_BUILD_GRAPH_TRANSACTION` before the unjournaled path is modified. A
 rollback failure is reported separately as `E_BUILD_GRAPH_ROLLBACK`.
