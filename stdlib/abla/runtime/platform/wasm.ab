@@ -421,6 +421,8 @@ var __ablaRuntimeWasmCollectionMaximum: int = 0
 var __ablaRuntimeWasmCollectionWorklist: int = 0
 var __ablaRuntimeWasmCollectionWorklistCount: int = 0
 var __ablaRuntimeWasmCollectionRanges: int = 0
+var __ablaRuntimeWasmCollectionScratch: int = 0
+var __ablaRuntimeWasmCollectionScratchBytes: int = 0
 // Head of the compiler's root-frame chain and the active region. The guest has
 // one thread, so these are plain globals rather than thread-local cells.
 var __ablaRuntimeWasmRootFrame: int = 0
@@ -441,6 +443,16 @@ trusted fun __ablaRuntimeWasmUnlink(header: int): void {
     else ablaRuntimeStoreI64(next, previous)
 }
 
+// Collector scratch entries are wasm32 addresses, 4 bytes each.
+@inline
+trusted fun __ablaRuntimeWasmScratchAt(base: int, index: int): int =
+    ablaRuntimeLoadI32(base + index * 4) & 4294967295
+
+@inline
+trusted fun __ablaRuntimeWasmScratchPut(base: int, index: int, value: int): void {
+    ablaRuntimeStoreI32(base + index * 4, value)
+}
+
 @inline
 trusted fun __ablaRuntimeWasmCollectionIndexSlot(payload: int): int =
     ((payload >> 4) * -7046029254386353131) &
@@ -450,12 +462,8 @@ trusted fun __ablaRuntimeWasmCollectionIndexSlot(payload: int): int =
 trusted fun __ablaRuntimeWasmCollectionIndexInsert(header: int): void {
     val mask = __ablaRuntimeWasmCollectionIndexCapacity - 1
     var slot = __ablaRuntimeWasmCollectionIndexSlot(header + 32)
-    while (ablaRuntimeLoadI64(
-        __ablaRuntimeWasmCollectionIndex + slot * 8
-    ) != 0) slot = (slot + 1) & mask
-    ablaRuntimeStoreI64(
-        __ablaRuntimeWasmCollectionIndex + slot * 8, header
-    )
+    while (__ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionIndex, slot) != 0) slot = (slot + 1) & mask
+    __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionIndex, slot, header)
 }
 
 @inline
@@ -463,16 +471,12 @@ trusted fun __ablaRuntimeWasmCollectionRangeSwap(
     left: int,
     right: int
 ): void {
-    val temporary = ablaRuntimeLoadI64(
-        __ablaRuntimeWasmCollectionRanges + left * 8
+    val temporary = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, left)
+    __ablaRuntimeWasmScratchPut(
+        __ablaRuntimeWasmCollectionRanges, left,
+        __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, right)
     )
-    ablaRuntimeStoreI64(
-        __ablaRuntimeWasmCollectionRanges + left * 8,
-        ablaRuntimeLoadI64(__ablaRuntimeWasmCollectionRanges + right * 8)
-    )
-    ablaRuntimeStoreI64(
-        __ablaRuntimeWasmCollectionRanges + right * 8, temporary
-    )
+    __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionRanges, right, temporary)
 }
 
 // Heap sort gives the marker an address-ordered allocation index without
@@ -489,16 +493,8 @@ trusted fun __ablaRuntimeWasmCollectionRangeSift(
         else {
             var largest = left
             val right = left + 1
-            if (right < count && ablaRuntimeLoadI64(
-                __ablaRuntimeWasmCollectionRanges + right * 8
-            ) > ablaRuntimeLoadI64(
-                __ablaRuntimeWasmCollectionRanges + left * 8
-            )) largest = right
-            if (ablaRuntimeLoadI64(
-                __ablaRuntimeWasmCollectionRanges + largest * 8
-            ) <= ablaRuntimeLoadI64(
-                __ablaRuntimeWasmCollectionRanges + root * 8
-            )) searching = false
+            if (right < count && __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, right) > __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, left)) largest = right
+            if (__ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, largest) <= __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, root)) searching = false
             else {
                 __ablaRuntimeWasmCollectionRangeSwap(root, largest)
                 root = largest
@@ -527,17 +523,13 @@ trusted fun __ablaRuntimeWasmCollectionContaining(candidate: int): int {
     var upper = __ablaRuntimeWasmCollectionCount
     while (lower < upper) {
         val middle = lower + (upper - lower) / 2
-        val header = ablaRuntimeLoadI64(
-            __ablaRuntimeWasmCollectionRanges + middle * 8
-        )
+        val header = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, middle)
         if (header + 32 <= candidate) lower = middle + 1
         else upper = middle
     }
     var containing = 0
     if (lower > 0) {
-        val header = ablaRuntimeLoadI64(
-            __ablaRuntimeWasmCollectionRanges + (lower - 1) * 8
-        )
+        val header = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionRanges, (lower - 1))
         val payload = header + 32
         val size = ablaRuntimeLoadI64(header + 16)
         if (candidate >= payload && candidate - payload < size) {
@@ -806,14 +798,10 @@ trusted fun __ablaRuntimeWasmMarkPointer(candidate: int): bool {
     }
     val mask = __ablaRuntimeWasmCollectionIndexCapacity - 1
     var slot = ((candidate >> 4) * -7046029254386353131) & mask
-    var header = ablaRuntimeLoadI64(
-        __ablaRuntimeWasmCollectionIndex + slot * 8
-    )
+    var header = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionIndex, slot)
     while (header != 0 && header + 32 != candidate) {
         slot = (slot + 1) & mask
-        header = ablaRuntimeLoadI64(
-            __ablaRuntimeWasmCollectionIndex + slot * 8
-        )
+        header = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionIndex, slot)
     }
     if (header == 0 &&
         candidate >= __ablaRuntimeWasmCollectionMinimum &&
@@ -829,9 +817,7 @@ trusted fun __ablaRuntimeWasmMarkPointer(candidate: int): bool {
     ablaRuntimeStoreI64(header + 24, layout + 16)
     val work = __ablaRuntimeWasmCollectionWorklistCount
     if (work >= __ablaRuntimeWasmCollectionCount) ablaRuntimeTrap()
-    ablaRuntimeStoreI64(
-        __ablaRuntimeWasmCollectionWorklist + work * 8, header
-    )
+    __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionWorklist, work, header)
     __ablaRuntimeWasmCollectionWorklistCount = work + 1
     true
 }
@@ -877,10 +863,7 @@ trusted fun __ablaRuntimeWasmTraceMarkedAllocations(): void {
     while (__ablaRuntimeWasmCollectionWorklistCount != 0) {
         __ablaRuntimeWasmCollectionWorklistCount =
             __ablaRuntimeWasmCollectionWorklistCount - 1
-        val header = ablaRuntimeLoadI64(
-            __ablaRuntimeWasmCollectionWorklist +
-                __ablaRuntimeWasmCollectionWorklistCount * 8
-        )
+        val header = __ablaRuntimeWasmScratchAt(__ablaRuntimeWasmCollectionWorklist, __ablaRuntimeWasmCollectionWorklistCount)
         val layout = ablaRuntimeLoadI64(header + 24) - 16
         ablaRuntimeStoreI64(header + 24, layout + 32)
         val size = ablaRuntimeLoadI64(header + 16)
@@ -955,22 +938,30 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     val before = __ablaRuntimeWasmLiveBytes
     val allocationCount = __ablaRuntimeWasmAllocationCount
     if (allocationCount == 0) return 0
-    __ablaRuntimeWasmCollectionWorklist =
-        __ablaRuntimeWasmMalloc(allocationCount * 8)
-    __ablaRuntimeWasmCollectionRanges =
-        __ablaRuntimeWasmMalloc(allocationCount * 8)
     var indexCapacity = 16
     while (indexCapacity < allocationCount * 2) {
         indexCapacity = indexCapacity * 2
     }
+    // The worklist, the sorted ranges and the index share one scratch block
+    // that stays between collections (a quarter more than asked when it
+    // grows): freed after each, it was carved up by small blocks, and every
+    // collection grew linear memory by its size again.
+    val scratchBytes = (allocationCount * 2 + indexCapacity) * 4
+    if (scratchBytes > __ablaRuntimeWasmCollectionScratchBytes) {
+        __ablaRuntimeWasmMallocFree(__ablaRuntimeWasmCollectionScratch)
+        __ablaRuntimeWasmCollectionScratchBytes = scratchBytes + scratchBytes / 4
+        __ablaRuntimeWasmCollectionScratch =
+            __ablaRuntimeWasmMalloc(__ablaRuntimeWasmCollectionScratchBytes)
+    }
+    __ablaRuntimeWasmCollectionWorklist = __ablaRuntimeWasmCollectionScratch
+    __ablaRuntimeWasmCollectionRanges =
+        __ablaRuntimeWasmCollectionWorklist + allocationCount * 4
     __ablaRuntimeWasmCollectionIndex =
-        __ablaRuntimeWasmMalloc(indexCapacity * 8)
+        __ablaRuntimeWasmCollectionRanges + allocationCount * 4
     __ablaRuntimeWasmCollectionIndexCapacity = indexCapacity
     var indexSlot = 0
     while (indexSlot < indexCapacity) {
-        ablaRuntimeStoreI64(
-            __ablaRuntimeWasmCollectionIndex + indexSlot * 8, 0
-        )
+        __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionIndex, indexSlot, 0)
         indexSlot = indexSlot + 1
     }
     __ablaRuntimeWasmCollectionCount = allocationCount
@@ -978,9 +969,7 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     var range = 0
     var indexedHeader = __ablaRuntimeWasmAllocationTail
     while (indexedHeader != 0) {
-        ablaRuntimeStoreI64(
-            __ablaRuntimeWasmCollectionRanges + range * 8, indexedHeader
-        )
+        __ablaRuntimeWasmScratchPut(__ablaRuntimeWasmCollectionRanges, range, indexedHeader)
         __ablaRuntimeWasmCollectionIndexInsert(indexedHeader)
         range = range + 1
         indexedHeader = ablaRuntimeLoadI64(indexedHeader)
@@ -1002,9 +991,6 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
         } else ablaRuntimeStoreI64(header + 24, state - 32)
         header = previous
     }
-    __ablaRuntimeWasmMallocFree(__ablaRuntimeWasmCollectionWorklist)
-    __ablaRuntimeWasmMallocFree(__ablaRuntimeWasmCollectionRanges)
-    __ablaRuntimeWasmMallocFree(__ablaRuntimeWasmCollectionIndex)
     __ablaRuntimeWasmCollectionCount = 0
     __ablaRuntimeWasmCollectionWorklist = 0
     __ablaRuntimeWasmCollectionWorklistCount = 0
