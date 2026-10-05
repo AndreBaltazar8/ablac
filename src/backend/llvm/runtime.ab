@@ -586,6 +586,65 @@ fun bootstrapLlvmRuntimeBridgeUsed(
     used
 }
 
+// A self-hosted runtime bridge forwards its value arguments to a direct
+// function. When LLVM finds every value parameter of the bridge read-only
+// (function-attrs follows the forwarding calls; an `own` parameter the callee
+// clears is not), callers pass their own slots instead of a byval copy of
+// each. Only a bridge whose every use is a direct call changes, since caller
+// and callee must agree on byval (on native targets it changes how the
+// argument is passed).
+fun bootstrapLlvmBridgeValuesByPointer(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram
+): void {
+    val options = LLVMCreatePassBuilderOptions()
+    val error = LLVMRunPasses(backend.module, "cgscc(function-attrs)", nativeNullPointer(), options)
+    LLVMDisposePassBuilderOptions(options)
+    if (!pointerIsNull(error)) {
+        LLVMConsumeError(error)
+        return
+    }
+    val byvalKind = i32(bootstrapLlvmAttributeKind("byval"))
+    val readonlyKind = i32(bootstrapLlvmAttributeKind("readonly"))
+    for (implementation in program.functions) {
+        val symbol = bootstrapLlvmSelfHostedRuntimeSymbol(implementation.name)
+        if (symbol == "" || !bootstrapLlvmRuntimeBridgeUsed(program, symbol)) continue
+        val bridge = LLVMGetNamedFunction(backend.module, symbol)
+        if (pointerIsNull(bridge)) continue
+        val count = int(LLVMCountParams(bridge))
+        var readOnly = true
+        for (parameter in 0 until count) {
+            val index = i32(parameter + 1)
+            if (!pointerIsNull(LLVMGetEnumAttributeAtIndex(bridge, index, byvalKind)) &&
+                pointerIsNull(LLVMGetEnumAttributeAtIndex(bridge, index, readonlyKind))) {
+                readOnly = false
+            }
+        }
+        var calledOnly = true
+        var use = LLVMGetFirstUse(bridge)
+        while (!pointerIsNull(use)) {
+            val user = LLVMGetUser(use)
+            if (pointerIsNull(LLVMIsACallInst(user)) || LLVMGetCalledValue(user) != bridge) {
+                calledOnly = false
+            }
+            use = LLVMGetNextUse(use)
+        }
+        if (!readOnly || !calledOnly) continue
+        for (parameter in 0 until count) {
+            LLVMRemoveEnumAttributeAtIndex(bridge, i32(parameter + 1), byvalKind)
+        }
+        use = LLVMGetFirstUse(bridge)
+        while (!pointerIsNull(use)) {
+            val call = LLVMGetUser(use)
+            for (parameter in 0 until count) {
+                LLVMRemoveCallSiteEnumAttribute(call, i32(parameter + 1), byvalKind)
+            }
+            use = LLVMGetNextUse(use)
+        }
+    }
+    return
+}
+
 fun bootstrapLlvmEmitSelfHostedRuntimeBridges(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
