@@ -235,7 +235,9 @@ fun f64BigCompare(a: array<int>, b: array<int>): int {
  *  ".5", "5."; "Infinity" and "-Infinity"; NaN for anything else (and for "NaN"). */
 fun f64Parse(text: string): f64 = f64ParseRange(text, 0, text.size)
 
-/** f64Parse of text[begin, end), without copying it. */
+/** f64Parse of text[begin, end), without copying it. Up to 18 significant digits scaled
+ *  by 10^±22 (any JSON a program writes: coordinates, angles, money) read without
+ *  allocating; anything longer or farther out is read exactly on big integers. */
 fun f64ParseRange(text: string, begin: int, end: int): f64 {
     var i = begin
     var negative = false
@@ -243,20 +245,28 @@ fun f64ParseRange(text: string, begin: int, end: int): f64 {
         negative = text[i] == 45
         i += 1
     }
-    if (end - i == 8 && text.slice(i, end) == "Infinity") return if (negative) -1.0 / 0.0 else 1.0 / 0.0
-    // The significant digits (leading zeros dropped), and the power of ten they scale by.
-    val digits: array<int> = []
+    if (end - i == 8 && text[i] == 73 && text.slice(i, end) == "Infinity") return if (negative) -1.0 / 0.0 else 1.0 / 0.0
+    // The significant digits as an integer (while they fit 18), how many there are, and the
+    // power of ten they scale by.
+    var m = 0
+    var count = 0
     var exponent = 0
     var seen = false
     while (i < end && text[i] >= 48 && text[i] <= 57) {
-        if (digits.size > 0 || text[i] != 48) digits.append(text[i] - 48)
+        if (count > 0 || text[i] != 48) {
+            if (count < 18) m = m * 10 + text[i] - 48
+            count += 1
+        }
         seen = true
         i += 1
     }
     if (i < end && text[i] == 46) {
         i += 1
         while (i < end && text[i] >= 48 && text[i] <= 57) {
-            if (digits.size > 0 || text[i] != 48) digits.append(text[i] - 48)
+            if (count > 0 || text[i] != 48) {
+                if (count < 18) m = m * 10 + text[i] - 48
+                count += 1
+            }
             exponent -= 1
             seen = true
             i += 1
@@ -270,7 +280,7 @@ fun f64ParseRange(text: string, begin: int, end: int): f64 {
             exponentNegative = text[i] == 45
             i += 1
         }
-        if (i >= end) return 0.0 / 0.0
+        if (i >= end || text[i] < 48 || text[i] > 57) return 0.0 / 0.0
         var e = 0
         while (i < end && text[i] >= 48 && text[i] <= 57) {
             if (e < 100000) e = e * 10 + text[i] - 48
@@ -279,14 +289,125 @@ fun f64ParseRange(text: string, begin: int, end: int): f64 {
         exponent += if (exponentNegative) 0 - e else e
     }
     if (i != end) return 0.0 / 0.0
-    // Trailing zeros carry no precision: fold them into the exponent.
+    var magnitude = 0.0
+    if (count > 0 && count <= 18) {
+        // Trailing zeros carry no precision: fold them into the exponent.
+        while (m % 10 == 0) {
+            m = m / 10
+            exponent += 1
+        }
+        if (exponent >= 0 && exponent <= 22 && m < 9007199254740992) magnitude = f64FromInt(m) * F64_PARSE_TENS[exponent]
+        else if (exponent < 0 && exponent >= -22) magnitude = f64ParseQuotient(m, 0 - exponent)
+        else magnitude = f64ParseExact(text, begin, end)
+    } else if (count > 18) magnitude = f64ParseExact(text, begin, end)
+    if (negative) f64FromBits(f64ToBits(magnitude) | (1 << 63)) else magnitude
+}
+
+/** m / 10^k correctly rounded (0 < m < 10^18, 1 <= k <= 22). Below 2^53 that is one exact
+ *  IEEE division; above, the division lands within an ulp or so and the exact midpoints
+ *  settle which neighbour the quotient rounds to. */
+fun f64ParseQuotient(m: int, k: int): f64 {
+    if (m < 9007199254740992) return f64FromInt(m) / F64_PARSE_TENS[k]
+    var bits = f64ToBits(f64FromInt(m) / F64_PARSE_TENS[k])
+    var steps = 0
+    while (steps < 4) {
+        val above = f64ParseMidpoint(m, k, bits) // the quotient vs the midpoint above `bits`
+        val below = f64ParseMidpoint(m, k, bits - 1) // … and the one below
+        if (above > 0 || (above == 0 && (bits & 1) == 1)) bits += 1
+        else if (below < 0 || (below == 0 && (bits & 1) == 1)) bits -= 1
+        else return f64FromBits(bits)
+        steps += 1
+    }
+    f64FromBits(bits)
+}
+
+/** m / 10^k against the midpoint between the positive normal f64 `bits` and the next one
+ *  up: -1 below, 0 on it, 1 above, exactly in 128-bit integers. With a = ma·2^ea the
+ *  midpoint is (2ma + 1)·2^(ea - 1), so compare m·2^(1 - ea - k) with (2ma + 1)·5^k. */
+fun f64ParseMidpoint(m: int, k: int, bits: int): int {
+    val ma = (bits & 4503599627370495) | 4503599627370496
+    val ea = ((bits >> 52) & 2047) - 1075
+    val shift = 1 - ea - k
+    // (2ma + 1)·5^k: a 64 × 64 → 128-bit product (it fits 106 bits).
+    val p = u64(2 * ma + 1)
+    val q = u64(F64_PARSE_FIVES[k])
+    val mask = u64(4294967295)
+    val p00 = (p & mask) * (q & mask)
+    val p01 = (p & mask) * (q >>> 32)
+    val p10 = (p >>> 32) * (q & mask)
+    val p11 = (p >>> 32) * (q >>> 32)
+    val mid = (p00 >>> 32) + (p01 & mask) + (p10 & mask)
+    var rlo = (p00 & mask) | (mid << 32)
+    var rhi = p11 + (p01 >>> 32) + (p10 >>> 32) + (mid >>> 32)
+    // m, shifted onto the same scale (whichever side the shift falls on).
+    var llo = u64(m)
+    var lhi = u64(0)
+    if (shift > 0) {
+        if (shift >= 64) {
+            lhi = llo << (shift - 64)
+            llo = u64(0)
+        } else {
+            lhi = llo >>> (64 - shift)
+            llo = llo << shift
+        }
+    } else if (shift < 0) {
+        val t = 0 - shift
+        if (t >= 64) {
+            rhi = rlo << (t - 64)
+            rlo = u64(0)
+        } else {
+            rhi = (rhi << t) | (rlo >>> (64 - t))
+            rlo = rlo << t
+        }
+    }
+    if (lhi != rhi) return if (lhi < rhi) -1 else 1
+    if (llo != rlo) return if (llo < rlo) -1 else 1
+    0
+}
+
+val F64_PARSE_FIVES: array<int> = [1, 5, 25, 125, 625, 3125, 15625, 78125, 390625, 1953125,
+    9765625, 48828125, 244140625, 1220703125, 6103515625, 30517578125, 152587890625,
+    762939453125, 3814697265625, 19073486328125, 95367431640625, 476837158203125,
+    2384185791015625]
+
+/** The exact reading of an already validated number: its digits on big integers. */
+fun f64ParseExact(text: string, begin: int, end: int): f64 {
+    var i = begin
+    if (text[i] == 45 || text[i] == 43) i += 1
+    val digits: array<int> = []
+    var exponent = 0
+    while (i < end && text[i] >= 48 && text[i] <= 57) {
+        if (digits.size > 0 || text[i] != 48) digits.append(text[i] - 48)
+        i += 1
+    }
+    if (i < end && text[i] == 46) {
+        i += 1
+        while (i < end && text[i] >= 48 && text[i] <= 57) {
+            if (digits.size > 0 || text[i] != 48) digits.append(text[i] - 48)
+            exponent -= 1
+            i += 1
+        }
+    }
+    if (i < end) {
+        i += 1
+        var exponentNegative = false
+        if (text[i] == 45 || text[i] == 43) {
+            exponentNegative = text[i] == 45
+            i += 1
+        }
+        var e = 0
+        while (i < end) {
+            if (e < 100000) e = e * 10 + text[i] - 48
+            i += 1
+        }
+        exponent += if (exponentNegative) 0 - e else e
+    }
     var count = digits.size
     while (count > 0 && digits[count - 1] == 0) {
         count -= 1
         exponent += 1
     }
-    val magnitude = if (count == 0) 0.0 else f64ParseDigits(digits, count, exponent)
-    if (negative) f64FromBits(f64ToBits(magnitude) | (1 << 63)) else magnitude
+    if (count == 0) 0.0 else f64ParseDigits(digits, count, exponent)
 }
 
 val F64_PARSE_TENS: array<f64> = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0,
