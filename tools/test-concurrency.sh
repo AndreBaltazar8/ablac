@@ -56,7 +56,7 @@ diagnostics=(
 for diagnostic in "${diagnostics[@]}"; do
     grep -Fq "$diagnostic" "$output_directory/invalid.err"
 done
-[[ ! -e $output_directory/invalid ]]
+[[ ! -e $output_directory/invalid ]] || exit 1
 
 defer_fixtures=(invalid-defer-result invalid-defer-control)
 defer_diagnostics=(defer.result defer.control)
@@ -77,7 +77,7 @@ for index in "${!defer_fixtures[@]}"; do
     fi
     grep -Fq "${defer_diagnostics[$index]}" \
         "$output_directory/$fixture.err"
-    [[ ! -e $output_directory/$fixture ]]
+    [[ ! -e $output_directory/$fixture ]] || exit 1
 done
 
 echo 'concurrency: defer/generator/task/thread LLVM/diagnostic checks passed'

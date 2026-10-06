@@ -38,6 +38,6 @@ EOF
 "$output_directory/many-exports-root"
 count=$(llvm-nm -D --defined-only \
     "$output_directory/libmany_exports.so" | grep -c ' abla_many_')
-[[ $count -eq 129 ]]
+[[ $count -eq 129 ]] || exit 1
 
 echo 'unbounded staged exports: 129 unique ABI definitions passed'

@@ -29,6 +29,6 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$output"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' 'in-process LLVM AOT test passed'

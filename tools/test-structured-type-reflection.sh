@@ -20,7 +20,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 set +e
 "$compiler" build \
@@ -29,7 +29,7 @@ set +e
     > "$directory/invalid.out" 2> "$directory/invalid.err"
 invalid_status=$?
 set -e
-[[ $invalid_status -ne 0 ]]
+[[ $invalid_status -ne 0 ]] || exit 1
 
 printf '%s\n' \
     'structured type reflection: compound/function/nominal/affine + invalid handle passed'

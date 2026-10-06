@@ -44,7 +44,7 @@ set +e
 "$output_directory/portable-io" > "$output_directory/portable-io.txt"
 io_status=$?
 set -e
-[[ $io_status -eq 42 ]]
+[[ $io_status -eq 42 ]] || exit 1
 printf 'Hello, world!\nportable io\n' > "$output_directory/portable-io.expected"
 cmp "$output_directory/portable-io.expected" \
     "$output_directory/portable-io.txt"

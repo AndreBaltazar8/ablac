@@ -23,9 +23,9 @@ borrowed_status=$?
     --no-cache > "$output_directory/size.err" 2>&1
 size_status=$?
 set -e
-[[ $status -eq 42 ]]
-[[ $trap_status -ne 0 ]]
-[[ $borrowed_status -ne 0 && $size_status -ne 0 ]]
+[[ $status -eq 42 ]] || exit 1
+[[ $trap_status -ne 0 ]] || exit 1
+[[ $borrowed_status -ne 0 && $size_status -ne 0 ]] || exit 1
 grep -q 'ownership.borrow-mutation:clear' "$output_directory/borrowed.err"
 grep -q 'truncate.size' "$output_directory/size.err"
 grep -q 'clear.arity' "$output_directory/size.err"

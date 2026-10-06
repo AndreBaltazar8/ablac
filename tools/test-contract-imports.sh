@@ -14,7 +14,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output/contract-program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/contract-effect-import.ab" \
@@ -23,7 +23,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output/effect-program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/contract-import-ordinary.ab" \
@@ -32,7 +32,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output/ordinary-program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 set +e
 "$compiler" --emit-llvm \
@@ -40,7 +40,7 @@ set +e
     > "$output/unconsumed.ll" 2> "$output/unconsumed.err"
 invalid_status=$?
 set -e
-[[ $invalid_status -ne 0 ]]
+[[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'error\[E_CONTRACT_CALL_NOT_CONSUMED\]:' \
     "$output/unconsumed.err"
 grep -q 'remoteIncrement' "$output/unconsumed.err"

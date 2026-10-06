@@ -49,7 +49,7 @@ supervisor=$!
 
 wait_for_log 'reloaded generation 1'
 port=$(grep -E '^[0-9]+$' "$test_directory/stderr.txt" | tail -1)
-[[ $port =~ ^[0-9]+$ ]]
+[[ $port =~ ^[0-9]+$ ]] || exit 1
 
 curl --silent --fail --max-time 6 "http://127.0.0.1:$port/slow" \
     > "$test_directory/v1.txt" &
@@ -61,12 +61,12 @@ cp "$project_root/tests/cases/bootstrap/graceful-http-v2.ab" \
 wait_for_log 'reloaded generation 2'
 wait "$request"
 request=0
-[[ $(< "$test_directory/v1.txt") == slow-v1 ]]
+[[ $(< "$test_directory/v1.txt") == slow-v1 ]] || exit 1
 
 next_port=$(grep -E '^[0-9]+$' "$test_directory/stderr.txt" | tail -1)
-[[ $next_port =~ ^[0-9]+$ ]]
+[[ $next_port =~ ^[0-9]+$ ]] || exit 1
 curl --silent --fail --max-time 6 \
     "http://127.0.0.1:$next_port/slow" > "$test_directory/v2.txt"
-[[ $(< "$test_directory/v2.txt") == slow-v2 ]]
+[[ $(< "$test_directory/v2.txt") == slow-v2 ]] || exit 1
 
 printf '%s\n' 'graceful reload: active V1 request drained before V2 handoff'

@@ -132,7 +132,7 @@ set +e
     "$application/build/generated-package-app"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' \
     'generated references: locked package + @client annotation + canonical target identity passed'

@@ -31,9 +31,9 @@ printf 'alpha\r\n\nbeta' | \
 status=$?
 set -e
 
-[[ $status -eq 42 ]]
-[[ $(<"$output_directory/stdout.txt") == 'alpha||beta' ]]
-[[ $(<"$output_directory/stderr.txt") == 'linux-io-stderr' ]]
+[[ $status -eq 42 ]] || exit 1
+[[ $(<"$output_directory/stdout.txt") == 'alpha||beta' ]] || exit 1
+[[ $(<"$output_directory/stderr.txt") == 'linux-io-stderr' ]] || exit 1
 
 printf '%s\n' \
     'raw Linux I/O: poll + buffered CRLF/empty/unterminated lines + full writes'

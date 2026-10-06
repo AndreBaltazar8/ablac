@@ -19,6 +19,6 @@ status=$?
     > "$output_directory/invalid.ll" 2> "$output_directory/invalid.err"
 invalid=$?
 set -e
-[[ $status -eq 42 && $invalid -ne 0 ]]
+[[ $status -eq 42 && $invalid -ne 0 ]] || exit 1
 grep -q 'E_IMPORT_UNQUALIFIED_AMBIGUOUS' "$output_directory/invalid.err"
 echo "module shadowing: own declarations shadow imports, runtime externs private"

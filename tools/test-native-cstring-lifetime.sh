@@ -40,7 +40,7 @@ set +e
 "$program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/native-string-address.ab" \
@@ -49,6 +49,6 @@ set +e
 "$borrowed_program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 echo "native C-string lifetime and borrowed string data contracts hold"

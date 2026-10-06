@@ -20,8 +20,8 @@ output=$(ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$program")
 status=$?
 set -e
-[[ $status -eq 42 ]]
-[[ $output == direct-syscall ]]
+[[ $status -eq 42 ]] || exit 1
+[[ $output == direct-syscall ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/native-byte-buffer.ab" \
@@ -31,7 +31,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$buffer_program"
 buffer_status=$?
 set -e
-[[ $buffer_status -eq 42 ]]
+[[ $buffer_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/unsafe-copy-memory.ab" \
@@ -41,7 +41,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$copy_program"
 copy_status=$?
 set -e
-[[ $copy_status -eq 42 ]]
+[[ $copy_status -eq 42 ]] || exit 1
 
 printf '%s\n' \
     'direct Linux syscalls: open/read/write/close/getpid + native byte buffer + intrinsic memory copy'

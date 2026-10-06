@@ -35,7 +35,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$global_container_program"
 global_container_status=$?
 set -e
-[[ $global_container_status -eq 42 ]]
+[[ $global_container_status -eq 42 ]] || exit 1
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/runtime-memory-collect.ab" \
     > "$collector_ir"
@@ -59,12 +59,12 @@ ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=60 \
     "$project_root/tools/run-limited.sh" "$loop_roots_program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 "$compiler" build "$project_root/tests/cases/modules/runtime-memory.ab" \
     -o "$program"
-[[ -s $program.o ]]
-[[ ! -e $program.value-runtime.o ]]
-[[ ! -e $program.host.o ]]
+[[ -s $program.o ]] || exit 1
+[[ ! -e $program.value-runtime.o ]] || exit 1
+[[ ! -e $program.host.o ]] || exit 1
 if nm -u "$program.o" | awk '{print $2}' | rg '^abla_' >/dev/null; then
     echo 'packaging object retained unresolved Abla runtime symbols' >&2
     exit 1
@@ -74,7 +74,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-limit.ab" \
     -o "$limited_program"
@@ -84,7 +84,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     > "$directory/limited.out" 2> "$directory/limited.err"
 limited_status=$?
 set -e
-[[ $limited_status -eq 134 ]]
+[[ $limited_status -eq 134 ]] || exit 1
 rg -q 'memory limit exceeded' "$directory/limited.err"
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-collect.ab" \
@@ -94,7 +94,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$collector_program"
 collector_status=$?
 set -e
-[[ $collector_status -eq 42 ]]
+[[ $collector_status -eq 42 ]] || exit 1
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-pressure.ab" \
     -o "$pressure_program"
@@ -103,7 +103,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$pressure_program"
 pressure_status=$?
 set -e
-[[ $pressure_status -eq 42 ]]
+[[ $pressure_status -eq 42 ]] || exit 1
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-collect-host.ab" \
     --no-cache -o "$host_collector_program"
@@ -112,6 +112,6 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$host_collector_program"
 host_collector_status=$?
 set -e
-[[ $host_collector_status -eq 42 ]]
+[[ $host_collector_status -eq 42 ]] || exit 1
 printf '%s\n' \
     'portable memory runtime: direct declarations + pressure safe points + limits + pure/host collection + bootstrapped global containers passed'

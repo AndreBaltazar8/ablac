@@ -19,7 +19,7 @@ set +e
     "$project_root/tests/cases/modules/compiler-service-transform.ab"
 transform_status=$?
 set -e
-[[ $transform_status -eq 42 ]]
+[[ $transform_status -eq 42 ]] || exit 1
 
 set +e
 "$compiler" run \
@@ -33,8 +33,8 @@ invalid_body_status=$?
     2>"$output_directory/invalid-runtime.err"
 invalid_runtime_status=$?
 set -e
-[[ $invalid_body_status -ne 0 ]]
-[[ $invalid_runtime_status -ne 0 ]]
+[[ $invalid_body_status -ne 0 ]] || exit 1
+[[ $invalid_runtime_status -ne 0 ]] || exit 1
 grep -q 'function.result:answer:i64:string' \
     "$output_directory/invalid-body.err"
 grep -q 'compile.value-runtime:compiler' \
@@ -56,7 +56,7 @@ build_slice
 first_identity=$(sha256sum "$module" | cut -d' ' -f1)
 build_slice
 second_identity=$(sha256sum "$module" | cut -d' ' -f1)
-[[ $first_identity == "$second_identity" ]]
+[[ $first_identity == "$second_identity" ]] || exit 1
 
 "$output_directory/server"
 llvm-readobj --file-headers "$module" | grep -q 'Format: WASM'
@@ -87,7 +87,7 @@ build_stateful_slice
 stateful_first_identity=$(sha256sum "$stateful_module" | cut -d' ' -f1)
 build_stateful_slice
 stateful_second_identity=$(sha256sum "$stateful_module" | cut -d' ' -f1)
-[[ $stateful_first_identity == "$stateful_second_identity" ]]
+[[ $stateful_first_identity == "$stateful_second_identity" ]] || exit 1
 
 llvm-readobj --symbols "$stateful_module" | grep -q 'Name: client_increment'
 llvm-readobj --symbols "$stateful_module" | grep -q 'Name: client_double'
@@ -129,7 +129,7 @@ set +e
     2>"$stateful_output_directory/stateful-invalid.err"
 invalid_stateful_status=$?
 set -e
-[[ $invalid_stateful_status -ne 0 ]]
+[[ $invalid_stateful_status -ne 0 ]] || exit 1
 grep -Fq 'error[E_ARTIFACT_SLICE_REACHABILITY]' \
     "$stateful_output_directory/stateful-invalid.err"
 if grep -Fq 'error[E_EXPORT_SIGNATURE_UNSUPPORTED]' \
@@ -149,11 +149,11 @@ set +e
     2>"$stateful_conflict_output/conflict.err"
 conflict_status=$?
 set -e
-[[ $conflict_status -ne 0 ]]
+[[ $conflict_status -ne 0 ]] || exit 1
 grep -Fq 'error[E_ARTIFACT_ROOT_CONFLICT]' \
     "$stateful_conflict_output/conflict.err"
-[[ ! -e "$stateful_conflict_output/server" ]]
-[[ ! -e "$stateful_conflict_output/client.wasm" ]]
-[[ ! -e "$stateful_conflict_output/client.wasm.abi.json" ]]
+[[ ! -e "$stateful_conflict_output/server" ]] || exit 1
+[[ ! -e "$stateful_conflict_output/client.wasm" ]] || exit 1
+[[ ! -e "$stateful_conflict_output/client.wasm.abi.json" ]] || exit 1
 
 echo "compiler service: annotations + validated self-transform + aggregated wasm artifact slices passed"

@@ -12,7 +12,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$directory/hosted"
 hosted_status=$?
 set -e
-[[ $hosted_status -eq 42 ]]
+[[ $hosted_status -eq 42 ]] || exit 1
 
 set +e
 "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
@@ -21,9 +21,9 @@ set +e
     >"$directory/invalid.out" 2>"$directory/invalid.err"
 invalid_status=$?
 set -e
-[[ $invalid_status -eq 2 ]]
+[[ $invalid_status -eq 2 ]] || exit 1
 grep -q "unsupported target 'imaginary-none'" "$directory/invalid.err"
-[[ ! -e "$directory/invalid" ]]
+[[ ! -e "$directory/invalid" ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/target-descriptors/generic-object-build.ab" \
@@ -32,7 +32,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$directory/generic-driver"
 generic_status=$?
 set -e
-[[ $generic_status -eq 43 ]]
+[[ $generic_status -eq 43 ]] || exit 1
 llvm-readelf -h "$directory/riscv64.o" > "$directory/riscv64.header"
 grep -q 'RISC-V' "$directory/riscv64.header"
 grep -q '"llvmTriple":"riscv64-unknown-elf"' \
@@ -78,10 +78,10 @@ set +e
     2>"$directory/raw-executable.err"
 raw_executable_status=$?
 set -e
-[[ $raw_executable_status -eq 2 ]]
+[[ $raw_executable_status -eq 2 ]] || exit 1
 grep -q 'emits only object or static-library artifacts' \
     "$directory/raw-executable.err"
-[[ ! -e "$directory/raw-executable" ]]
+[[ ! -e "$directory/raw-executable" ]] || exit 1
 
 printf '%s\n' \
     'target descriptors: hosted, freestanding, extension-defined and raw LLVM objects, and deterministic unsupported-target diagnostics passed'

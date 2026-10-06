@@ -14,5 +14,5 @@ set +e
 "$output_directory/program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 echo "memory checkpoint: survives a collection, resets only what came after"

@@ -15,8 +15,8 @@ ABLA_MAX_MEMORY_MB=512 ABLA_MAX_SECONDS=30 \
     "$project_root/tests/cases/bootstrap/block.ab"
 status=$?
 set -e
-[[ $status -eq 42 ]]
-[[ ! -e $library ]]
+[[ $status -eq 42 ]] || exit 1
+[[ ! -e $library ]] || exit 1
 
 set +e
 ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=30 \
@@ -24,8 +24,8 @@ ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=30 \
     "$project_root/tests/cases/modules/filesystem.ab"
 status=$?
 set -e
-[[ $status -eq 42 ]]
-[[ ! -e $library ]]
+[[ $status -eq 42 ]] || exit 1
+[[ ! -e $library ]] || exit 1
 
 set +e
 ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=30 \
@@ -33,7 +33,7 @@ ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=30 \
     "$project_root/tests/cases/modules/host-runtime.ab"
 status=$?
 set -e
-[[ $status -eq 42 ]]
-[[ -s $library ]]
+[[ $status -eq 42 ]] || exit 1
+[[ -s $library ]] || exit 1
 printf '%s\n' \
     'JIT host selection: pure/portable-raw runs skipped and explicit host capability loaded the C adapter'

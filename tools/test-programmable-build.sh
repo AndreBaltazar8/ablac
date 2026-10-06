@@ -39,12 +39,12 @@ generated_child_status=$?
 artifacts_root_status=$?
 set -e
 
-[[ $root_status -eq 40 ]]
-[[ $child_status -eq 41 ]]
-[[ $grandchild_status -eq 42 ]]
-[[ $generated_root_status -eq 39 ]]
-[[ $generated_child_status -eq 43 ]]
-[[ $artifacts_root_status -eq 38 ]]
+[[ $root_status -eq 40 ]] || exit 1
+[[ $child_status -eq 41 ]] || exit 1
+[[ $grandchild_status -eq 42 ]] || exit 1
+[[ $generated_root_status -eq 39 ]] || exit 1
+[[ $generated_child_status -eq 43 ]] || exit 1
+[[ $artifacts_root_status -eq 38 ]] || exit 1
 
 if grep -q '@abla.exports.initialized' \
     "$output_directory/libabla_scalar.so.ll"; then
@@ -158,8 +158,8 @@ rm -f "$output_directory/program-child" \
 "$compiler" build \
     "$project_root/tests/cases/program-build/program-root.ab" \
     -o "$output_directory/program-root" --fast
-[[ -x "$output_directory/program-child" ]]
-[[ -x "$output_directory/program-grandchild" ]]
+[[ -x "$output_directory/program-child" ]] || exit 1
+[[ -x "$output_directory/program-grandchild" ]] || exit 1
 
 set +e
 "$compiler" build \
@@ -176,10 +176,10 @@ invalid_request_status=$?
 unsupported_artifact_status=$?
 set -e
 
-[[ $invalid_request_status -ne 0 ]]
+[[ $invalid_request_status -ne 0 ]] || exit 1
 grep -q 'error\[E_BUILD_PROGRAM_REQUEST\]' \
     "$output_directory/invalid-request.err"
-[[ $unsupported_artifact_status -ne 0 ]]
+[[ $unsupported_artifact_status -ne 0 ]] || exit 1
 grep -q 'error\[E_BUILD_ARTIFACT_UNSUPPORTED\]' \
     "$output_directory/unsupported-artifact.err"
 
@@ -195,9 +195,9 @@ set +e
     2>"$output_directory/rollback.err"
 rollback_status=$?
 set -e
-[[ $rollback_status -ne 0 ]]
+[[ $rollback_status -ne 0 ]] || exit 1
 grep -q '^previous-root-artifact$' "$output_directory/rollback-root"
-[[ ! -e $output_directory/rollback-generated.ab ]]
+[[ ! -e $output_directory/rollback-generated.ab ]] || exit 1
 grep -q 'error\[E_EXPORT_SIGNATURE_UNSUPPORTED\]' \
     "$output_directory/rollback.err"
 
@@ -215,10 +215,10 @@ invalid_export_status=$?
     2>"$output_directory/invalid-callback-export.err"
 invalid_callback_export_status=$?
 set -e
-[[ $invalid_export_status -ne 0 ]]
+[[ $invalid_export_status -ne 0 ]] || exit 1
 grep -q 'error\[E_EXPORT_SIGNATURE_UNSUPPORTED\]' \
     "$output_directory/invalid-export.err"
-[[ $invalid_callback_export_status -ne 0 ]]
+[[ $invalid_callback_export_status -ne 0 ]] || exit 1
 grep -q 'error\[E_EXPORT_SIGNATURE_UNSUPPORTED\]' \
     "$output_directory/invalid-callback-export.err"
 
@@ -229,7 +229,7 @@ set +e
     2>"$output_directory/emit-build-plan.err"
 emit_plan_status=$?
 set -e
-[[ $emit_plan_status -ne 0 ]]
+[[ $emit_plan_status -ne 0 ]] || exit 1
 grep -q 'error\[E_BUILD_COMMAND_UNSUPPORTED\]' \
     "$output_directory/emit-build-plan.err"
 

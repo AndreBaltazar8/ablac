@@ -25,7 +25,7 @@ fi
 choose_call=$(sed -n \
     '/^define internal i32 @abla_test_choose(/,/^}/p' "$ir" |
     rg 'call i32 @abla_fn_.*_direct')
-[[ $choose_call =~ _direct\(i64\ 2,\ i32\ %0,\ i32\ %1\) ]]
+[[ $choose_call =~ _direct\(i64\ 2,\ i32\ %0,\ i32\ %1\) ]] || exit 1
 
 # Demand lowering must treat exact linker-symbol tokens in reachable inline
 # assembly as edges to internalFunction declarations. An unrelated internal

@@ -32,21 +32,21 @@ before=$(partition_count)
 "$compiler" build "$source_file" -o "$program" --fast
 after_first=$(partition_count)
 first_added=$((after_first - before))
-[[ $first_added -ge 4 ]]
+[[ $first_added -ge 4 ]] || exit 1
 
 sed -i 's/partitionFunction0: int = 1/partitionFunction0: int = 2/' \
     "$source_file"
 "$compiler" build "$source_file" -o "$program" --fast
 after_second=$(partition_count)
 second_added=$((after_second - after_first))
-[[ $second_added -ge 1 ]]
-[[ $second_added -lt $first_added ]]
+[[ $second_added -ge 1 ]] || exit 1
+[[ $second_added -lt $first_added ]] || exit 1
 
 set +e
 "$project_root/tools/run-limited.sh" "$program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf 'native partition cache: first=%s refreshed edit=%s; unchanged buckets reused\n' \
     "$first_added" "$second_added"

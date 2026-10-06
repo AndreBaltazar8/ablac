@@ -56,7 +56,7 @@ for fixture in "${fixtures[@]}"; do
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
-    [[ ! -e $output ]]
+    [[ ! -e $output ]] || exit 1
 done
 
 inferred_output="$output_directory/inferred-noescape-callback"
@@ -101,7 +101,7 @@ if [[ $retaining_callback_status -ne 1 ]] ||
     sed -n '1,80p' "$retaining_callback_output.err" >&2
     exit 1
 fi
-[[ ! -e $retaining_callback_output ]]
+[[ ! -e $retaining_callback_output ]] || exit 1
 
 retaining_lambda_output="$output_directory/invalid-inferred-retaining-lambda"
 set +e
@@ -119,7 +119,7 @@ if [[ $retaining_lambda_status -ne 1 ]] ||
     sed -n '1,80p' "$retaining_lambda_output.err" >&2
     exit 1
 fi
-[[ ! -e $retaining_lambda_output ]]
+[[ ! -e $retaining_lambda_output ]] || exit 1
 
 retaining_lambda_store_output="$output_directory/invalid-inferred-retaining-lambda-store"
 set +e
@@ -137,7 +137,7 @@ if [[ $retaining_lambda_store_status -ne 1 ]] ||
     sed -n '1,80p' "$retaining_lambda_store_output.err" >&2
     exit 1
 fi
-[[ ! -e $retaining_lambda_store_output ]]
+[[ ! -e $retaining_lambda_store_output ]] || exit 1
 
 retaining_lambda_alias_output="$output_directory/invalid-inferred-retaining-lambda-alias"
 set +e
@@ -155,6 +155,6 @@ if [[ $retaining_lambda_alias_status -ne 1 ]] ||
     sed -n '1,80p' "$retaining_lambda_alias_output.err" >&2
     exit 1
 fi
-[[ ! -e $retaining_lambda_alias_output ]]
+[[ ! -e $retaining_lambda_alias_output ]] || exit 1
 
 echo 'scoped region: inferred callback safety + nested LIFO reset + affine drops + compile time + LLVM and available C differential + retention effects passed'

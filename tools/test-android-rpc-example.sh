@@ -19,7 +19,7 @@ invalid_output="$output_directory/invalid-click"
     "$output_directory/server.ab" \
     -o "$server" --fast --no-cache
 
-[[ -x $server && -s $library && -s $action_manifest ]]
+[[ -x $server && -s $library && -s $action_manifest ]] || exit 1
 llvm-readelf -h "$library" | grep -q 'AArch64'
 if llvm-nm --defined-only "$library" | grep -q 'incrementCounter'; then
     echo "server action leaked into the Android native slice" >&2
@@ -32,7 +32,7 @@ grep -q 'setOnClickListener' \
 grep -q '\$androidclick { incrementCounter(initialCounter()) }' \
     "$project_root/examples/android-rpc/main.ab"
 action=$(<"$action_manifest")
-[[ $action == abla_android_rpc_incrementCounter ]]
+[[ $action == abla_android_rpc_incrementCounter ]] || exit 1
 grep -q "/rpc/$action" \
     "$output_directory/src/main/kotlin/org/abla/rpc/example/MainActivity.kt"
 grep -q 'argument = next' \
@@ -50,7 +50,7 @@ set +e
     >"$invalid_output.out" 2>"$invalid_output.err"
 invalid_status=$?
 set -e
-[[ $invalid_status -ne 0 ]]
+[[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'MissingAndroidRpcActionType' "$invalid_output.err"
 
 "$server" &
@@ -68,9 +68,9 @@ for _ in 1 2 3 4 5; do
         break
     fi
 done
-[[ $first_response == 41 ]]
+[[ $first_response == 41 ]] || exit 1
 second_response=$(curl --fail --silent --request POST \
     "http://127.0.0.1:18080/rpc/$action?current=$first_response")
-[[ $second_response == 42 ]]
+[[ $second_response == 42 ]] || exit 1
 
 echo "Android RPC example: typed click-call discovery generated a client and native server passed"

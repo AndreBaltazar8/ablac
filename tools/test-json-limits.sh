@@ -13,5 +13,5 @@ set +e
 "$output_directory/program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 echo "json limits: per call, above the defaults, depth bounded"

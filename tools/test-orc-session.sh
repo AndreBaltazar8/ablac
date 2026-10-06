@@ -27,6 +27,6 @@ ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=30 \
     "$runner" "$first_ir" "$second_ir"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' 'persistent ORC session: load 41 -> reclaim -> load 42'

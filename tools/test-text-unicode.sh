@@ -11,6 +11,6 @@ set +e
 "$project_root/tools/run-limited.sh" "$program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' 'UTF-8 text: compile/runtime validation + scalar indexing/slicing passed'

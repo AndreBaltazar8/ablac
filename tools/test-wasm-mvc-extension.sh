@@ -22,20 +22,20 @@ rm -f "$abi_manifest"
 build_once
 second_identity=$(sha256sum "$module" | cut -d' ' -f1)
 second_abi_identity=$(sha256sum "$abi_manifest" | cut -d' ' -f1)
-[[ $first_identity == "$second_identity" ]]
-[[ $first_abi_identity == "$second_abi_identity" ]]
+[[ $first_identity == "$second_identity" ]] || exit 1
+[[ $first_abi_identity == "$second_abi_identity" ]] || exit 1
 
 set +e
 "$output_directory/build-driver"
 driver_status=$?
 set -e
-[[ $driver_status -eq 36 ]]
+[[ $driver_status -eq 36 ]] || exit 1
 
 llvm-readobj --file-headers "$module" | grep -q 'Format: WASM'
 llvm-readobj --file-headers "$module" | grep -q 'Arch: wasm32'
 llvm-readobj --symbols "$module" | grep -q 'Name: abla_mvc_revision'
-[[ ! -e $module.value-runtime.o ]]
-[[ ! -e $module.wasm-platform.o ]]
+[[ ! -e $module.value-runtime.o ]] || exit 1
+[[ ! -e $module.wasm-platform.o ]] || exit 1
 grep -q '"schema":"abla.abi.v1"' "$abi_manifest"
 grep -q '"name":"wasm32-module"' "$abi_manifest"
 grep -q '"symbol":"abla_mvc_revision"' "$abi_manifest"
@@ -174,7 +174,7 @@ if (imports.length !== 1 || imports[0].module !== 'env' ||
     throw new Error(`unexpected platform imports: ${JSON.stringify(imports)}`);
 }
 NODE
-[[ -s $adapter ]]
+[[ -s $adapter ]] || exit 1
 grep -q 'WebAssembly.instantiate' "$adapter"
 grep -q 'instance.exports.abla_mvc_revision' "$adapter"
 
@@ -192,10 +192,10 @@ owned_result_status=$?
     2>"$output_directory/checked-export.err"
 checked_export_status=$?
 set -e
-[[ $owned_result_status -ne 0 ]]
+[[ $owned_result_status -ne 0 ]] || exit 1
 grep -q 'error\[E_EXPORT_TARGET_CAPABILITY\]' \
     "$output_directory/owned-result.err"
-[[ $checked_export_status -ne 0 ]]
+[[ $checked_export_status -ne 0 ]] || exit 1
 grep -q 'error\[E_EXPORT_TARGET_CAPABILITY\]' \
     "$output_directory/checked-export.err"
 

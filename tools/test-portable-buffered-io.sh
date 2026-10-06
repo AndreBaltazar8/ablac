@@ -14,6 +14,6 @@ set +e
 "$project_root/tools/run-limited.sh" "$program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' 'portable buffered I/O: callback sink + truncate/append file adapter passed'

@@ -148,7 +148,7 @@ for fixture in \
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
-    [[ ! -e $output ]]
+    [[ ! -e $output ]] || exit 1
 done
 
 for fixture in \
@@ -216,7 +216,7 @@ for fixture in \
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
-    [[ ! -e $output ]]
+    [[ ! -e $output ]] || exit 1
 done
 
 owned_contract_fixtures=(
@@ -246,7 +246,7 @@ while [[ $owned_contract -lt ${#owned_contract_fixtures[@]} ]]; do
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
-    [[ ! -e $output ]]
+    [[ ! -e $output ]] || exit 1
     owned_contract=$((owned_contract + 1))
 done
 
@@ -263,7 +263,7 @@ if [[ $result -ne 1 ]] || ! grep -Fq 'function.argument:' "$output.err"; then
     sed -n '1,80p' "$output.err" >&2
     exit 1
 fi
-[[ ! -e $output ]]
+[[ ! -e $output ]] || exit 1
 
 output="$output_directory/invalid-mutable-callable-mode-mismatch"
 rm -f "$output"
@@ -278,7 +278,7 @@ if [[ $result -ne 1 ]] || ! grep -Fq 'function.argument:' "$output.err"; then
     sed -n '1,80p' "$output.err" >&2
     exit 1
 fi
-[[ ! -e $output ]]
+[[ ! -e $output ]] || exit 1
 
 for fixture in \
     invalid-resource-drop-signature \
@@ -295,7 +295,7 @@ for fixture in \
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
-    [[ ! -e $output ]]
+    [[ ! -e $output ]] || exit 1
 done
 
 
@@ -312,7 +312,7 @@ if [[ $result -ne 1 ]] || ! grep -Fq 'ir.verification:' "$output.err"; then
     sed -n '1,80p' "$output.err" >&2
     exit 1
 fi
-[[ ! -e $output ]]
+[[ ! -e $output ]] || exit 1
 
 for fixture in \
     invalid-capture-use-after-move \
@@ -334,7 +334,7 @@ for fixture in \
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
-    [[ ! -e $output ]]
+    [[ ! -e $output ]] || exit 1
 done
 
 output="$output_directory/invalid-move-expression"
@@ -349,6 +349,6 @@ if [[ $result -ne 1 ]] || ! grep -Fq 'move.local' "$output.err"; then
     echo "affine move: non-local move was accepted" >&2
     exit 1
 fi
-[[ ! -e $output ]]
+[[ ! -e $output ]] || exit 1
 
 echo "affine resources: own/var borrows + mode-bearing callables + FnOnce + partial places + recursive drops + CFG + compile-time/LLVM passed"

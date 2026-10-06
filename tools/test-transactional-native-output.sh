@@ -23,16 +23,16 @@ set +e
     > "$directory/invalid.out" 2> "$directory/invalid.err"
 invalid_status=$?
 set -e
-[[ $invalid_status -ne 0 ]]
+[[ $invalid_status -ne 0 ]] || exit 1
 after=$(sha256sum "$program")
-[[ $before == "$after" ]]
+[[ $before == "$after" ]] || exit 1
 
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$program"
 program_status=$?
 set -e
-[[ $program_status -eq 42 ]]
+[[ $program_status -eq 42 ]] || exit 1
 
 if compgen -G "$program.tmp.*" > /dev/null; then
     echo 'transactional native build left a publish temporary behind' >&2

@@ -25,7 +25,7 @@ set +e
     > "$output_directory/invalid.out" 2>&1
 invalid_status=$?
 set -e
-[[ $invalid_status -ne 0 ]]
+[[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'ownership.mutable-borrow:receiver.Obj.sneaky' \
     "$output_directory/invalid.out"
 
@@ -36,7 +36,7 @@ for invalid in invalid-move-used-after invalid-move-in-loop; do
         > "$output_directory/$invalid.out" 2>&1
     move_status=$?
     set -e
-    [[ $move_status -ne 0 ]]
+    [[ $move_status -ne 0 ]] || exit 1
     grep -q 'ownership\.' "$output_directory/$invalid.out"
 done
 
@@ -46,7 +46,7 @@ set +e
 "$output_directory/stores-parameter"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 for invalid in invalid-constructor-stores-var-parameter \
     invalid-constructor-stores-shadowed-parameter; do
@@ -56,7 +56,7 @@ for invalid in invalid-constructor-stores-var-parameter \
         > "$output_directory/$invalid.out" 2>&1
     stores_status=$?
     set -e
-    [[ $stores_status -ne 0 ]]
+    [[ $stores_status -ne 0 ]] || exit 1
     grep -q 'ownership.borrow-escape' "$output_directory/$invalid.out"
 done
 
@@ -66,7 +66,7 @@ set +e
     > "$output_directory/borrow-conflict.out" 2>&1
 conflict_status=$?
 set -e
-[[ $conflict_status -ne 0 ]]
+[[ $conflict_status -ne 0 ]] || exit 1
 grep -q 'E_BORROW_CONFLICT\]: in `main`, `nums\[0\]` is changed while `first`' \
     "$output_directory/borrow-conflict.out"
 grep -q 'in `Box.grow`, `this.items` is changed while `shared`' \
@@ -79,7 +79,7 @@ set +e
 "$output_directory/shared-loop"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 for invalid in invalid-shared-loop-append invalid-shared-loop-nested \
     invalid-shared-loop-var-argument; do
@@ -89,7 +89,7 @@ for invalid in invalid-shared-loop-append invalid-shared-loop-nested \
         > "$output_directory/$invalid.out" 2>&1
     loop_status=$?
     set -e
-    [[ $loop_status -ne 0 ]]
+    [[ $loop_status -ne 0 ]] || exit 1
     grep -q 'ownership\.\(borrow-mutation\|mutable-borrow\)' \
         "$output_directory/$invalid.out"
 done

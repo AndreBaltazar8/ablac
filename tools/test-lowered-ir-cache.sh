@@ -12,6 +12,6 @@ ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
     "$project_root/tools/run-limited.sh" "$program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' 'lowered IR cache: identical/body/signature invalidation + lambda group reuse passed'

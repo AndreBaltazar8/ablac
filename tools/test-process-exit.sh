@@ -18,7 +18,7 @@ exited=$?
     2> "$output_directory/panic.err"
 panicked=$?
 set -e
-[[ $plain -eq 42 && $exited -eq 7 && $panicked -eq 101 ]]
+[[ $plain -eq 42 && $exited -eq 7 && $panicked -eq 101 ]] || exit 1
 grep -q '^start$' "$output_directory/exit.out"
 grep -qx 'panic: deep failure' "$output_directory/panic.err"
 echo "process exit: exit(code) and panic(message) from any depth"

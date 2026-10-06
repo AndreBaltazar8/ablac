@@ -18,7 +18,7 @@ check_failure() {
         2>"$output_directory/$stem.err"
     local status=$?
     set -e
-    [[ $status -ne 0 ]]
+    [[ $status -ne 0 ]] || exit 1
     grep -q "error\[E_NAMED_ARGUMENT_${diagnostic}\]" \
         "$output_directory/$stem.err"
 }
@@ -34,7 +34,7 @@ set +e
 "$output_directory/named-many-default-arguments"
 named_many_status=$?
 set -e
-[[ $named_many_status -eq 42 ]]
+[[ $named_many_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/named-var-arguments.ab" \
@@ -43,6 +43,6 @@ set +e
 "$output_directory/named-var-arguments"
 named_var_status=$?
 set -e
-[[ $named_var_status -eq 42 ]]
+[[ $named_var_status -eq 42 ]] || exit 1
 
 echo "named/default arguments: extension defaults, var parameters and invalid diagnostics passed"

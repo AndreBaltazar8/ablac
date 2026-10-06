@@ -23,8 +23,8 @@ first_wasm_identity=$(sha256sum "$wasm_output" | cut -d' ' -f1)
 build_independent
 second_child_identity=$(sha256sum "$child_output" | cut -d' ' -f1)
 second_wasm_identity=$(sha256sum "$wasm_output" | cut -d' ' -f1)
-[[ $first_child_identity == "$second_child_identity" ]]
-[[ $first_wasm_identity == "$second_wasm_identity" ]]
+[[ $first_child_identity == "$second_child_identity" ]] || exit 1
+[[ $first_wasm_identity == "$second_wasm_identity" ]] || exit 1
 
 set +e
 "$root_output"
@@ -32,8 +32,8 @@ root_status=$?
 "$child_output"
 child_status=$?
 set -e
-[[ $root_status -eq 0 ]]
-[[ $child_status -eq 8 ]]
+[[ $root_status -eq 0 ]] || exit 1
+[[ $child_status -eq 8 ]] || exit 1
 grep -Fq 'compiler.addFunctionAnnotation' "$generated_entry"
 grep -Fq 'fun main: int = lifted() + annotatedLift()' "$generated_entry"
 grep -Fq 'compiler.exportFunction' "$wasm_entry"
@@ -71,9 +71,9 @@ invalid_runtime_status=$?
 invalid_export_status=$?
 set -e
 
-[[ $invalid_reference_status -ne 0 ]]
-[[ $invalid_runtime_status -ne 0 ]]
-[[ $invalid_export_status -ne 0 ]]
+[[ $invalid_reference_status -ne 0 ]] || exit 1
+[[ $invalid_runtime_status -ne 0 ]] || exit 1
+[[ $invalid_export_status -ne 0 ]] || exit 1
 grep -Fq 'error[E_INDEPENDENT_MODULE_USE]' \
     "$output_directory/invalid-reference.err"
 grep -Fq 'declaration.block.compile-only' \

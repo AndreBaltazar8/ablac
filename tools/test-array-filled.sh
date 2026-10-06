@@ -20,9 +20,9 @@ trap_status=$?
     --no-cache > "$output_directory/invalid.err" 2>&1
 invalid_status=$?
 set -e
-[[ $status -eq 42 ]]
-[[ $trap_status -ne 0 ]]
-[[ $invalid_status -ne 0 ]]
+[[ $status -eq 42 ]] || exit 1
+[[ $trap_status -ne 0 ]] || exit 1
+[[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'filledArray.element:Node' "$output_directory/invalid.err"
 grep -q 'filledArray.count' "$output_directory/invalid.err"
 grep -q 'filledArray.arity' "$output_directory/invalid.err"

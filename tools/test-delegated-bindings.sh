@@ -70,7 +70,7 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
-    [[ ! -e $output ]]
+    [[ ! -e $output ]] || exit 1
     index=$((index + 1))
 done
 

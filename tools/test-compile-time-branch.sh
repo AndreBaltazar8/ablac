@@ -25,8 +25,8 @@ set +e
 "$output_directory/global-type"
 global_status=$?
 set -e
-[[ $status -eq 42 ]]
-[[ $global_status -eq 42 ]]
-[[ $invalid_status -ne 0 ]]
+[[ $status -eq 42 ]] || exit 1
+[[ $global_status -eq 42 ]] || exit 1
+[[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'compile.effect-denied:trusted.native' "$output_directory/invalid.err"
 echo "compile-time branch: buffers match, the reachable branch is still checked"

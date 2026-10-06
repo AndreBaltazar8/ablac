@@ -39,7 +39,7 @@ for fixture in "${fixtures[@]}"; do
         sed -n '1,80p' "$output.err" >&2
         exit 1
     fi
-    [[ ! -e $output ]]
+    [[ ! -e $output ]] || exit 1
 done
 
 echo "nullable refinement: stable locals/parameters + branch polarity + compile-time/LLVM passed"

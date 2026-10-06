@@ -84,17 +84,17 @@ missing_output=$(ABLA_PACKAGE_CACHE="$cache" "$compiler" build \
     --project "$application" --fast --no-cache --offline 2>&1)
 missing_status=$?
 set -e
-[[ $missing_status -ne 0 ]]
-[[ $missing_output == *'E_PACKAGE_LOCK_MISSING'* ]]
+[[ $missing_status -ne 0 ]] || exit 1
+[[ $missing_output == *'E_PACKAGE_LOCK_MISSING'* ]] || exit 1
 
 set +e
 capability_output=$(ABLA_PACKAGE_CACHE="$cache" "$compiler" package update \
     --project "$application" 2>&1)
 capability_status=$?
 set -e
-[[ $capability_status -ne 0 ]]
-[[ $capability_output == *'E_PACKAGE_CAPABILITY_DENIED'* ]]
-[[ $capability_output == *"dependency 'provider-leaf'"* ]]
+[[ $capability_status -ne 0 ]] || exit 1
+[[ $capability_output == *'E_PACKAGE_CAPABILITY_DENIED'* ]] || exit 1
+[[ $capability_output == *"dependency 'provider-leaf'"* ]] || exit 1
 
 cat >> "$application/abla.toml" <<'EOF'
 compileCapabilities = ["network"]
@@ -111,7 +111,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$application/build/provider-app"
 first_status=$?
 set -e
-[[ $first_status -eq 42 ]]
+[[ $first_status -eq 42 ]] || exit 1
 
 cat > "$repository/src/provider-dep.ab" <<'EOF'
 import "leaf-provider.ab"
@@ -130,7 +130,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$application/build/provider-app"
 locked_status=$?
 set -e
-[[ $locked_status -eq 42 ]]
+[[ $locked_status -eq 42 ]] || exit 1
 grep -q "revision = \"$first_revision\"" "$application/abla.lock"
 
 ABLA_PACKAGE_CACHE="$cache" "$compiler" package update \
@@ -145,7 +145,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$application/build/provider-app"
 vendored_status=$?
 set -e
-[[ $vendored_status -eq 41 ]]
+[[ $vendored_status -eq 41 ]] || exit 1
 
 github_application="$test_root/github-application"
 mkdir -p -- "$github_application/src"
@@ -162,8 +162,8 @@ github_output=$(ABLA_PACKAGE_CACHE="$cache" "$compiler" build \
     --project "$github_application" --offline --fast --no-cache 2>&1)
 github_status=$?
 set -e
-[[ $github_status -ne 0 ]]
-[[ $github_output == *'E_PACKAGE_LOCK_MISSING'* ]]
+[[ $github_status -ne 0 ]] || exit 1
+[[ $github_output == *'E_PACKAGE_LOCK_MISSING'* ]] || exit 1
 
 generated_application="$test_root/generated-application"
 generated_cache="$test_root/generated-cache"
@@ -211,8 +211,8 @@ generated_denied_output=$(ABLA_GENERATED_REVISION=generated-v1 \
     --project "$generated_application" 2>&1)
 generated_denied_status=$?
 set -e
-[[ $generated_denied_status -ne 0 ]]
-[[ $generated_denied_output == *'E_IMPORT_PROVIDER_EFFECT_DENIED'* ]]
+[[ $generated_denied_status -ne 0 ]] || exit 1
+[[ $generated_denied_output == *'E_IMPORT_PROVIDER_EFFECT_DENIED'* ]] || exit 1
 
 cat >> "$generated_application/abla.toml" <<'EOF'
 compileCapabilities = ["environment"]
@@ -231,7 +231,7 @@ set +e
     "$generated_application/build/generated-provider-app"
 generated_first_status=$?
 set -e
-[[ $generated_first_status -eq 42 ]]
+[[ $generated_first_status -eq 42 ]] || exit 1
 
 # Changing the deferred resolver cannot move an existing lock during a build,
 # and a build does not require the environment input used only by the resolver.
@@ -245,7 +245,7 @@ set +e
     "$generated_application/build/generated-provider-app"
 generated_locked_status=$?
 set -e
-[[ $generated_locked_status -eq 42 ]]
+[[ $generated_locked_status -eq 42 ]] || exit 1
 grep -q 'revision = "generated-v1"' "$generated_application/abla.lock"
 
 ABLA_GENERATED_REVISION=generated-v2 \
@@ -262,7 +262,7 @@ set +e
     "$generated_application/build/generated-provider-app"
 generated_vendored_status=$?
 set -e
-[[ $generated_vendored_status -eq 41 ]]
+[[ $generated_vendored_status -eq 41 ]] || exit 1
 
 printf '%s\n' \
     'package providers: typed Git and generated sources, immutable lock, offline cache, explicit update, and vendor fallback passed'

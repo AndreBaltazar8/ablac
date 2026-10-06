@@ -22,7 +22,7 @@ trap cleanup EXIT
 
 "$compiler" build "$project_root/tests/cases/modules/http-server.ab" \
     -o "$test_directory/server"
-[[ ! -e $test_directory/server.host.o ]]
+[[ ! -e $test_directory/server.host.o ]] || exit 1
 symbols=$(nm "$test_directory/server" | awk '{print $3}')
 if rg -q '^(ablaHost|abla_host_)' <<< "$symbols"; then
     printf '%s\n' 'raw HTTP server linked hosted capability symbols' >&2
@@ -42,7 +42,7 @@ for attempt in {1..100}; do
     fi
     sleep 0.05
 done
-[[ $port =~ ^[0-9]+$ ]]
+[[ $port =~ ^[0-9]+$ ]] || exit 1
 
 curl --silent --fail --max-time 2 \
     "http://127.0.0.1:$port/health" > "$test_directory/health.txt"
@@ -57,9 +57,9 @@ status=$?
 set -e
 server=0
 
-[[ $status -eq 42 ]]
-[[ $(< "$test_directory/health.txt") == healthy ]]
-[[ $(< "$test_directory/v1.txt") == v1:42 ]]
-[[ $(< "$test_directory/latest.txt") == v1:42:v2 ]]
+[[ $status -eq 42 ]] || exit 1
+[[ $(< "$test_directory/health.txt") == healthy ]] || exit 1
+[[ $(< "$test_directory/v1.txt") == v1:42 ]] || exit 1
+[[ $(< "$test_directory/latest.txt") == v1:42:v2 ]] || exit 1
 
 printf 'raw-syscall HTTP server: health + versioned V1 + latest V2; no hosted capability\n'

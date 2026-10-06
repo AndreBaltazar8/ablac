@@ -16,7 +16,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 set +e
 "$compiler" --emit-llvm \
@@ -24,7 +24,7 @@ set +e
     > "$output_directory/invalid.ll" 2> "$output_directory/invalid.err"
 invalid_status=$?
 set -e
-[[ $invalid_status -ne 0 ]]
+[[ $invalid_status -ne 0 ]] || exit 1
 grep -Eq 'type|identifier|function.argument' "$output_directory/invalid.err"
 
 printf '%s\n' 'generated virtual module: bounded deterministic transaction + rollback diagnostic passed'

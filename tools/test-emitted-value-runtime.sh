@@ -41,9 +41,9 @@ fi
 rg -q '^declare .*@abla_string_concat' "$output_directory/runtime.ll"
 rg -q '^declare .*@abla_to_string' "$output_directory/runtime.ll"
 rg -q '^declare .*@abla_equal' "$output_directory/runtime.ll"
-[[ -s $output_directory/value-runtime.o ]]
-[[ ! -e $output_directory/value-runtime.value-runtime.o ]]
-[[ ! -e $output_directory/value-runtime.host.o ]]
+[[ -s $output_directory/value-runtime.o ]] || exit 1
+[[ ! -e $output_directory/value-runtime.value-runtime.o ]] || exit 1
+[[ ! -e $output_directory/value-runtime.host.o ]] || exit 1
 nm --defined-only "$output_directory/value-runtime.o" |
     rg ' [Tt] abla_string_data$' >/dev/null
 

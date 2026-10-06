@@ -34,4 +34,4 @@ else
         nix-shell "$project_root/shell.nix" --run "$build_command"
 fi
 
-[[ -x $output && -s $output.ll ]]
+[[ -x $output && -s $output.ll ]] || exit 1

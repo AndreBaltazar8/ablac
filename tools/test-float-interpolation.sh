@@ -27,7 +27,7 @@ set +e
     > "$output_directory/invalid.out" 2>&1
 invalid_status=$?
 set -e
-[[ $invalid_status -ne 0 ]]
+[[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'import "abla/float/text" to interpolate a float' \
     "$output_directory/invalid.out"
 

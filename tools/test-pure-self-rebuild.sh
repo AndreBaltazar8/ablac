@@ -18,9 +18,9 @@ ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
     "$project_root/tools/build-self-hosted-release.sh" \
     "$compiler" "$output" "$entry"
 
-[[ -s $output ]]
-[[ -s $output.ll ]]
-[[ ! -e $output.host.o ]]
+[[ -s $output ]] || exit 1
+[[ -s $output.ll ]] || exit 1
+[[ ! -e $output.host.o ]] || exit 1
 # Runtime code is emitted from Abla source into the compiler module itself.
 nm "$output" | awk '{print $3}' |
     rg '^_?abla_runtime_set_arguments$' >/dev/null
@@ -68,7 +68,7 @@ ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=20 \
     "$project_root/tools/run-limited.sh" "$probe"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' \
     'pure Abla O2 self-rebuild: content-addressed release graph -> direct LLVM C API compiler -> byte-identical IR -> native child'

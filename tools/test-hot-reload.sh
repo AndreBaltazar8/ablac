@@ -55,7 +55,7 @@ pkill -TERM -s "$server"
 wait "$server" 2>/dev/null || true
 server=0
 
-[[ $(grep -c 'reloaded generation' "$test_directory/stderr.txt") -ge 2 ]]
+[[ $(grep -c 'reloaded generation' "$test_directory/stderr.txt") -ge 2 ]] || exit 1
 grep -q 'reload rejected; previous generation remains active' \
     "$test_directory/stderr.txt"
 if ! grep -Eq \

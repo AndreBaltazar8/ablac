@@ -24,9 +24,9 @@ assert_compiler_diagnostic_accounting() {
             's/.*: ([0-9]+) parser, ([0-9]+) extension, ([0-9]+) semantic, ([0-9]+) IR, ([0-9]+) total.*/\1 \2 \3 \4 \5/' \
             <<<"$summary"
     )
-    [[ $((parser + extension + semantic + ir)) -eq $total ]]
+    [[ $((parser + extension + semantic + ir)) -eq $total ]] || exit 1
     primary=$(grep -c '^error\[' "$diagnostic_file")
-    [[ $primary -eq $total ]]
+    [[ $primary -eq $total ]] || exit 1
     ! grep -q 'error\[E_NATIVE_TOOLCHAIN\]' "$diagnostic_file"
 }
 
@@ -39,7 +39,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/subparser-typed-conversion.ab" \
@@ -48,7 +48,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output_directory/conversion-program"
 conversion_status=$?
 set -e
-[[ $conversion_status -eq 42 ]]
+[[ $conversion_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-deferred-request.ab" \
@@ -58,7 +58,7 @@ set +e
     "$output_directory/nested-deferred-program"
 nested_deferred_status=$?
 set -e
-[[ $nested_deferred_status -eq 42 ]]
+[[ $nested_deferred_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/raw-extension-literal.ab" \
@@ -68,7 +68,7 @@ set +e
     "$output_directory/raw-extension-literal-program"
 raw_literal_status=$?
 set -e
-[[ $raw_literal_status -eq 42 ]]
+[[ $raw_literal_status -eq 42 ]] || exit 1
 
 set +e
 "$compiler" --emit-llvm \
@@ -77,7 +77,7 @@ set +e
     2> "$output_directory/invalid-raw-extension-literal.err"
 invalid_raw_literal_status=$?
 set -e
-[[ $invalid_raw_literal_status -ne 0 ]]
+[[ $invalid_raw_literal_status -ne 0 ]] || exit 1
 grep -Fq 'error[E_SUBPARSER_FAILURE]: raw literal tag mismatch' \
     "$output_directory/invalid-raw-extension-literal.err"
 grep -Fq 'source[extension-expression]:' \
@@ -93,7 +93,7 @@ set +e
     "$output_directory/nested-deferred-identity-program"
 nested_deferred_identity_status=$?
 set -e
-[[ $nested_deferred_identity_status -eq 42 ]]
+[[ $nested_deferred_identity_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-deferred-nominal-action.ab" \
@@ -103,7 +103,7 @@ set +e
     "$output_directory/nested-deferred-nominal-program"
 nominal_status=$?
 set -e
-[[ $nominal_status -eq 42 ]]
+[[ $nominal_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-generated-subparser.ab" \
@@ -119,7 +119,7 @@ set +e
     "$output_directory/late-nominal-program"
 late_nominal_status=$?
 set -e
-[[ $late_nominal_status -eq 42 ]]
+[[ $late_nominal_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/cross-late-root.ab" \
@@ -129,7 +129,7 @@ set +e
     "$output_directory/cross-late-program"
 cross_late_status=$?
 set -e
-[[ $cross_late_status -eq 42 ]]
+[[ $cross_late_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/cross-late-root-reversed.ab" \
@@ -139,7 +139,7 @@ set +e
     "$output_directory/cross-late-reversed-program"
 cross_late_reversed_status=$?
 set -e
-[[ $cross_late_reversed_status -eq 42 ]]
+[[ $cross_late_reversed_status -eq 42 ]] || exit 1
 
 set +e
 "$compiler" --emit-llvm \
@@ -148,7 +148,7 @@ set +e
     2> "$output_directory/invalid-builder.err"
 invalid_status=$?
 set -e
-[[ $invalid_status -ne 0 ]]
+[[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'LLVM compilation failed:' "$output_directory/invalid-builder.err"
 
 set +e
@@ -158,7 +158,7 @@ set +e
     2> "$output_directory/invalid-export.err"
 invalid_export_status=$?
 set -e
-[[ $invalid_export_status -ne 0 ]]
+[[ $invalid_export_status -ne 0 ]] || exit 1
 grep -q 'LLVM compilation failed:' "$output_directory/invalid-export.err"
 
 set +e
@@ -168,7 +168,7 @@ set +e
     2> "$output_directory/invalid-semantic.err"
 invalid_semantic_status=$?
 set -e
-[[ $invalid_semantic_status -ne 0 ]]
+[[ $invalid_semantic_status -ne 0 ]] || exit 1
 grep -q 'function.result:' "$output_directory/invalid-semantic.err"
 grep -q 'error\[E_EXT_GENERATED_SEMANTIC\]:' \
     "$output_directory/invalid-semantic.err"
@@ -186,7 +186,7 @@ set +e
     2> "$output_directory/invalid-early-typed.err"
 invalid_early_typed_status=$?
 set -e
-[[ $invalid_early_typed_status -ne 0 ]]
+[[ $invalid_early_typed_status -ne 0 ]] || exit 1
 grep -q 'error\[E_EXT_TYPED_QUERY_BEFORE_RESOLUTION\]:' \
     "$output_directory/invalid-early-typed.err"
 grep -q 'context\[subparser\]: `parseEarlyTyped`' \
@@ -205,7 +205,7 @@ set +e
     2> "$output_directory/invalid-request-result.err"
 invalid_request_result_status=$?
 set -e
-[[ $invalid_request_result_status -ne 0 ]]
+[[ $invalid_request_result_status -ne 0 ]] || exit 1
 grep -q 'error\[E_EXT_FINALIZER_RESULT\]:' \
     "$output_directory/invalid-request-result.err"
 grep -q 'context\[generated-namespace\]: expected.request.namespace' \
@@ -224,7 +224,7 @@ set +e
     2> "$output_directory/invalid-function-handle.err"
 invalid_function_handle_status=$?
 set -e
-[[ $invalid_function_handle_status -ne 0 ]]
+[[ $invalid_function_handle_status -ne 0 ]] || exit 1
 grep -q 'error\[E_EXT_FUNCTION_HANDLE_OUT_OF_RANGE\]:' \
     "$output_directory/invalid-function-handle.err"
 grep -q 'compiler API `compilerFunctionName` received invalid function handle 999999' \
@@ -247,7 +247,7 @@ set +e
     2> "$output_directory/invalid-parser.err"
 invalid_parser_status=$?
 set -e
-[[ $invalid_parser_status -ne 0 ]]
+[[ $invalid_parser_status -ne 0 ]] || exit 1
 grep -q 'error\[E_PARSE_PARAMETER_SEPARATOR\]:' \
     "$output_directory/invalid-parser.err"
 grep -Fq \
@@ -268,7 +268,7 @@ set +e
     "$output_directory/ir-diagnostic-fallback"
 ir_diagnostic_status=$?
 set -e
-[[ $ir_diagnostic_status -eq 42 ]]
+[[ $ir_diagnostic_status -eq 42 ]] || exit 1
 
 set +e
 PATH="$missing_toolchain_path" "$compiler" build \
@@ -278,7 +278,7 @@ PATH="$missing_toolchain_path" "$compiler" build \
     2> "$output_directory/invalid-compiler.err"
 invalid_compiler_status=$?
 set -e
-[[ $invalid_compiler_status -ne 0 ]]
+[[ $invalid_compiler_status -ne 0 ]] || exit 1
 grep -q 'error\[E_SEMANTIC\]:' \
     "$output_directory/invalid-compiler.err"
 grep -q '0 parser, 0 extension, 4 semantic, 0 IR, 4 total error' \
@@ -293,7 +293,7 @@ set +e
     2> "$output_directory/invalid-function-handle-states.err"
 invalid_function_handle_states_status=$?
 set -e
-[[ $invalid_function_handle_states_status -ne 0 ]]
+[[ $invalid_function_handle_states_status -ne 0 ]] || exit 1
 grep -q 'error\[E_EXT_FUNCTION_HANDLE_UNKNOWN\]:' \
     "$output_directory/invalid-function-handle-states.err"
 grep -q 'error\[E_EXT_FUNCTION_HANDLE_WRONG_KIND\]:' \
@@ -309,7 +309,7 @@ PATH="$missing_toolchain_path" "$compiler" build \
     2> "$output_directory/invalid-native-toolchain.err"
 invalid_native_toolchain_status=$?
 set -e
-[[ $invalid_native_toolchain_status -ne 0 ]]
+[[ $invalid_native_toolchain_status -ne 0 ]] || exit 1
 grep -q 'error\[E_NATIVE_TOOLCHAIN\]: native toolchain failed with status' \
     "$output_directory/invalid-native-toolchain.err"
 

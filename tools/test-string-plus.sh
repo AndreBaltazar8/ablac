@@ -17,6 +17,6 @@ status=$?
     > "$output_directory/invalid.ll" 2> "$output_directory/invalid.err"
 invalid=$?
 set -e
-[[ $status -eq 42 && $invalid -ne 0 ]]
+[[ $status -eq 42 && $invalid -ne 0 ]] || exit 1
 grep -q 'arithmetic.type' "$output_directory/invalid.err"
 echo "string plus: concatenation at run time and compile time"

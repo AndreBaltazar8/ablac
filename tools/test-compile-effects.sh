@@ -31,7 +31,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     2> "$output_directory/denied.err"
 denied_status=$?
 set -e
-[[ $denied_status -ne 0 ]]
+[[ $denied_status -ne 0 ]] || exit 1
 grep -q 'compile.effect-denied:filesystem.read:loadBuildInput->readBuildInput->ablaHostReadFile' \
     "$output_directory/denied.err"
 
@@ -44,7 +44,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     2> "$output_directory/environment-denied.err"
 environment_denied_status=$?
 set -e
-[[ $environment_denied_status -ne 0 ]]
+[[ $environment_denied_status -ne 0 ]] || exit 1
 grep -q 'compile.effect-denied:environment:readBuildEnvironment->compilerEnvironment' \
     "$output_directory/environment-denied.err"
 
@@ -56,7 +56,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     2> "$output_directory/clock-denied.err"
 clock_denied_status=$?
 set -e
-[[ $clock_denied_status -ne 0 ]]
+[[ $clock_denied_status -ne 0 ]] || exit 1
 grep -q 'compile.effect-denied:clock:currentBuildClock->compilerClockMilliseconds' \
     "$output_directory/clock-denied.err"
 
@@ -68,7 +68,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     2> "$output_directory/write-denied.err"
 write_denied_status=$?
 set -e
-[[ $write_denied_status -ne 0 ]]
+[[ $write_denied_status -ne 0 ]] || exit 1
 grep -q 'compile.effect-denied:filesystem.write:compilerWriteFile' \
     "$output_directory/write-denied.err"
 
@@ -80,7 +80,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     2> "$output_directory/network-denied.err"
 network_denied_status=$?
 set -e
-[[ $network_denied_status -ne 0 ]]
+[[ $network_denied_status -ne 0 ]] || exit 1
 grep -q 'compile.effect-denied:network:compilerTcpExchange' \
     "$output_directory/network-denied.err"
 
@@ -92,7 +92,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     2> "$output_directory/unauthorized.err"
 unauthorized_status=$?
 set -e
-[[ $unauthorized_status -ne 0 ]]
+[[ $unauthorized_status -ne 0 ]] || exit 1
 grep -q 'compile.capability-not-authorized:filesystem.read' \
     "$output_directory/unauthorized.err"
 
@@ -104,7 +104,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     2> "$output_directory/subparser-denied.err"
 subparser_denied_status=$?
 set -e
-[[ $subparser_denied_status -ne 0 ]]
+[[ $subparser_denied_status -ne 0 ]] || exit 1
 grep -q 'LLVM compilation failed:' \
     "$output_directory/subparser-denied.err"
 
@@ -133,7 +133,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/granted"
 granted_status=$?
 set -e
-[[ $granted_status -eq 42 ]]
+[[ $granted_status -eq 42 ]] || exit 1
 
 input_cache=''
 while IFS= read -r -d '' input_record; do
@@ -143,7 +143,7 @@ while IFS= read -r -d '' input_record; do
     fi
 done < <(find "$project_root/build/.abla-cache" -type f \
     -name '*.inputs' -print0)
-[[ -n $input_cache ]]
+[[ -n $input_cache ]] || exit 1
 printf '%s\n' 'corrupt-input-record' > "$input_cache"
 "$compiler" build \
     "$project_root/tests/cases/capabilities/entry.ab" \
@@ -167,7 +167,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/granted"
 changed_status=$?
 set -e
-[[ $changed_status -eq 7 ]]
+[[ $changed_status -eq 7 ]] || exit 1
 
 # Parser handlers execute before ordinary lowering, but their filesystem
 # journal is still part of the final artifact identity.
@@ -196,7 +196,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/subparser-input"
 subparser_changed_status=$?
 set -e
-[[ $subparser_changed_status -eq 7 ]]
+[[ $subparser_changed_status -eq 7 ]] || exit 1
 
 # The environment provider is deterministic: its named observation is
 # journaled, cacheable while unchanged, and invalidates on value changes.
@@ -224,7 +224,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/environment"
 environment_status=$?
 set -e
-[[ $environment_status -eq 7 ]]
+[[ $environment_status -eq 7 ]] || exit 1
 
 # Process, clock, and randomness are deliberately ambient. Even when granted,
 # their presence disables native-object reuse/publication.
@@ -244,7 +244,7 @@ ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/ambient"
 ambient_status=$?
 set -e
-[[ $ambient_status -eq 42 ]]
+[[ $ambient_status -eq 42 ]] || exit 1
 
 # File outputs stay in memory until the complete compiler/toolchain succeeds.
 # A failed compilation must therefore leave no externally visible output.
@@ -258,8 +258,8 @@ set +e
     2> "$output_directory/write-output-failure.err"
 write_failure_status=$?
 set -e
-[[ $write_failure_status -ne 0 ]]
-[[ ! -e $transaction_output ]]
+[[ $write_failure_status -ne 0 ]] || exit 1
+[[ ! -e $transaction_output ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/capabilities/write-output.ab" \
@@ -274,8 +274,8 @@ set +e
     "$output_directory/write-output-invalid-path"
 invalid_path_status=$?
 set -e
-[[ $invalid_path_status -eq 42 ]]
-[[ ! -e "$project_root/../outside-project.txt" ]]
+[[ $invalid_path_status -eq 42 ]] || exit 1
+[[ ! -e "$project_root/../outside-project.txt" ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/capabilities/network-bounded.ab" \
@@ -311,7 +311,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output_directory/network-live"
 network_live_status=$?
 set -e
-[[ $network_live_status -eq 42 ]]
+[[ $network_live_status -eq 42 ]] || exit 1
 
 printf '%s\n' 'compileCapabilities = []' > "$manifest"
 set +e
@@ -322,7 +322,7 @@ set +e
     2> "$output_directory/manifest-denied.err"
 manifest_status=$?
 set -e
-[[ $manifest_status -ne 0 ]]
+[[ $manifest_status -ne 0 ]] || exit 1
 grep -q 'compile.capability-not-authorized:filesystem.read' \
     "$output_directory/manifest-denied.err"
 

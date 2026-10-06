@@ -15,6 +15,6 @@ set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' 'global arrays: direct/field/alias append + complete var replacement passed verified LLVM'

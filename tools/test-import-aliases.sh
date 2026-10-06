@@ -14,7 +14,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output/program"
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 # A target subparser is registered only during the staged module pass. Locals
 # following its raw invocation must never leak into the preliminary module
@@ -26,7 +26,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output/subparser-discovery-locals"
 subparser_discovery_status=$?
 set -e
-[[ $subparser_discovery_status -eq 33 ]]
+[[ $subparser_discovery_status -eq 33 ]] || exit 1
 
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/import-aliases.ab" \
@@ -41,7 +41,7 @@ rg '^define hidden void @abla_fn_' "$output/renamed.ll" >/dev/null
 rg '^define internal .* @abla_fn_.*_direct\(' "$output/renamed.ll" \
     | sed -E 's/\(.*//' | sort > "$output/renamed-symbols"
 cmp "$output/original-symbols" "$output/renamed-symbols"
-[[ $(wc -l < "$output/original-symbols") -gt 2 ]]
+[[ $(wc -l < "$output/original-symbols") -gt 2 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/import-alias-externs.ab" \
@@ -50,7 +50,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output/import-alias-externs"
 alias_externs_status=$?
 set -e
-[[ $alias_externs_status -eq 42 ]]
+[[ $alias_externs_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/modules/import-alias-plain.ab" \
@@ -59,7 +59,7 @@ set +e
 "$project_root/tools/run-limited.sh" "$output/import-alias-plain"
 alias_plain_status=$?
 set -e
-[[ $alias_plain_status -eq 42 ]]
+[[ $alias_plain_status -eq 42 ]] || exit 1
 
 check_invalid() {
     local fixture=$1
@@ -70,7 +70,7 @@ check_invalid() {
         > "$output/$fixture.ll" 2> "$output/$fixture.err"
     local invalid_status=$?
     set -e
-    [[ $invalid_status -ne 0 ]]
+    [[ $invalid_status -ne 0 ]] || exit 1
     grep -q "error\[$code\]:" "$output/$fixture.err"
 }
 
@@ -88,7 +88,7 @@ set +e
     > "$output/transitive.ll" 2> "$output/transitive.err"
 transitive_status=$?
 set -e
-[[ $transitive_status -ne 0 ]]
+[[ $transitive_status -ne 0 ]] || exit 1
 grep -q 'identifier:privateLeft' "$output/transitive.err"
 
 "$project_root/tools/test-generated-cross-module-diagnostics.sh" "$compiler"

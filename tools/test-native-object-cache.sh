@@ -15,7 +15,7 @@ mkdir -p "$output_directory"
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/cache-grant-text.ab" \
     -o "$output" --fast
-[[ ! -e $output.host.o ]]
+[[ ! -e $output.host.o ]] || exit 1
 
 # A cache hit must not regenerate LLVM. Keeping this marker also avoids using
 # timing as a correctness assertion on slower or heavily loaded machines.
@@ -24,7 +24,7 @@ begin=$(date +%s%N)
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/cache-grant-text.ab" \
     -o "$output" --fast
-[[ ! -e $output.host.o ]]
+[[ ! -e $output.host.o ]] || exit 1
 end=$(date +%s%N)
 elapsed_ms=$(((end - begin) / 1000000))
 rg -q '^native-object-cache-hit$' "$output.ll"
@@ -34,7 +34,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$output"
 cached_status=$?
 set -e
-[[ $cached_status -eq 42 ]]
+[[ $cached_status -eq 42 ]] || exit 1
 
 # A byte-distinct compiler must not reuse an object made by another compiler,
 # even for identical program source. Add an inert ELF section so behavior is
@@ -60,19 +60,19 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$output"
 variant_status=$?
 set -e
-[[ $variant_status -eq 42 ]]
+[[ $variant_status -eq 42 ]] || exit 1
 
 # Exact bundled source, not merely the output path, selects an object.
 "$compiler" build \
     "$project_root/tests/cases/modules/types-valid.ab" \
     -o "$output" --fast
-[[ ! -e $output.host.o ]]
+[[ ! -e $output.host.o ]] || exit 1
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$output"
 changed_status=$?
 set -e
-[[ $changed_status -eq 7 ]]
+[[ $changed_status -eq 7 ]] || exit 1
 
 printf 'native object cache: parsed capability eligibility + exact-source hit in %s ms; compiler/source identity invalidated\n' \
     "$elapsed_ms"

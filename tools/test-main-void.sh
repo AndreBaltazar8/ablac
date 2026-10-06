@@ -13,5 +13,5 @@ set +e
 output=$("$output_directory/program")
 status=$?
 set -e
-[[ $status -eq 0 && $output == "void main" ]]
+[[ $status -eq 0 && $output == "void main" ]] || exit 1
 echo "main void: exits 0"

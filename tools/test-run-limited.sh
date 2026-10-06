@@ -17,14 +17,14 @@ limits=$(
     ABLA_MAX_CPU_SECONDS=2 \
         "$runner" bash -c 'ulimit -v; ulimit -t; ulimit -c'
 )
-[[ $limits == "$expected_virtual"$'\n2\n0' ]]
+[[ $limits == "$expected_virtual"$'\n2\n0' ]] || exit 1
 
 set +e
 ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=3 \
     "$runner" bash -c 'exit 42'
 status=$?
 set -e
-[[ $status -eq 42 ]]
+[[ $status -eq 42 ]] || exit 1
 
 marker="abla-limit-test-$$"
 set +e
@@ -36,8 +36,8 @@ timeout_output=$(
 )
 status=$?
 set -e
-[[ $status -eq 124 ]]
-[[ $timeout_output == *'stopped after 1 wall-clock second(s)'* ]]
+[[ $status -eq 124 ]] || exit 1
+[[ $timeout_output == *'stopped after 1 wall-clock second(s)'* ]] || exit 1
 if pgrep -f "$marker-child" >/dev/null; then
     printf '[test-run-limited] descendant process leaked after timeout\n' >&2
     pgrep -af "$marker-child" >&2
@@ -48,7 +48,7 @@ set +e
 invalid_output=$(ABLA_MAX_MEMORY_MB=unlimited "$runner" true 2>&1)
 status=$?
 set -e
-[[ $status -eq 2 ]]
-[[ $invalid_output == *'must be a positive integer'* ]]
+[[ $status -eq 2 ]] || exit 1
+[[ $invalid_output == *'must be a positive integer'* ]] || exit 1
 
 printf '%s\n' 'limited runner tests passed'

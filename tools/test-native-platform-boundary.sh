@@ -25,9 +25,9 @@ rg -q '^declare .*@abla_array_create' \
     "$output_directory/pure-collections.ll"
 rg -q '^declare .*@abla_runtime_set_arguments' \
     "$output_directory/pure-collections.ll"
-[[ -s $pure_output.o ]]
-[[ ! -e $pure_output.value-runtime.o ]]
-[[ ! -e $pure_output.host.o ]]
+[[ -s $pure_output.o ]] || exit 1
+[[ ! -e $pure_output.value-runtime.o ]] || exit 1
+[[ ! -e $pure_output.host.o ]] || exit 1
 if nm -u "$pure_output.o" | awk '{print $2}' | rg '^abla_' >/dev/null; then
     echo 'packaging object retained unresolved Abla runtime symbols' >&2
     exit 1
@@ -43,7 +43,7 @@ ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$pure_output.relinked"
 relinked_status=$?
 set -e
-[[ $relinked_status -eq 42 ]]
+[[ $relinked_status -eq 42 ]] || exit 1
 nm --defined-only "$pure_output" | awk '{print $3}' |
     rg '^abla_platform_alloc$' >/dev/null
 set +e
@@ -51,7 +51,7 @@ ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$pure_output"
 pure_status=$?
 set -e
-[[ $pure_status -eq 42 ]]
+[[ $pure_status -eq 42 ]] || exit 1
 
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/emitted-runtime-panic.ab" \
@@ -62,22 +62,22 @@ ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
     2> "$output_directory/pure-panic-errors.txt"
 panic_status=$?
 set -e
-[[ $panic_status -eq 134 ]]
+[[ $panic_status -eq 134 ]] || exit 1
 rg -q '^abla panic: array index out of bounds$' \
     "$output_directory/pure-panic-errors.txt"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/linux-filesystem.ab" \
     -o "$linux_filesystem_output"
-[[ -s $linux_filesystem_output.o ]]
-[[ ! -e $linux_filesystem_output.value-runtime.o ]]
-[[ ! -e $linux_filesystem_output.host.o ]]
+[[ -s $linux_filesystem_output.o ]] || exit 1
+[[ ! -e $linux_filesystem_output.value-runtime.o ]] || exit 1
+[[ ! -e $linux_filesystem_output.host.o ]] || exit 1
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$linux_filesystem_output"
 linux_filesystem_status=$?
 set -e
-[[ $linux_filesystem_status -eq 42 ]]
+[[ $linux_filesystem_status -eq 42 ]] || exit 1
 
 fixtures=(filesystem process-capture)
 for fixture in "${fixtures[@]}"; do
@@ -85,9 +85,9 @@ for fixture in "${fixtures[@]}"; do
     "$compiler" build \
         "$project_root/tests/cases/modules/$fixture.ab" \
         -o "$output"
-    [[ -s $output.o ]]
-    [[ ! -e $output.value-runtime.o ]]
-    [[ ! -e $output.host.o ]]
+    [[ -s $output.o ]] || exit 1
+    [[ ! -e $output.value-runtime.o ]] || exit 1
+    [[ ! -e $output.host.o ]] || exit 1
     set +e
     ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
         "$project_root/tools/run-limited.sh" "$output"
@@ -103,8 +103,8 @@ host_output="$output_directory/host-runtime"
 "$compiler" build \
     "$project_root/tests/cases/modules/host-runtime.ab" \
     -o "$host_output"
-[[ -s $host_output.o ]]
-[[ ! -e $host_output.host.o ]]
-[[ ! -e $host_output.value-runtime.o ]]
+[[ -s $host_output.o ]] || exit 1
+[[ ! -e $host_output.host.o ]] || exit 1
+[[ ! -e $host_output.value-runtime.o ]] || exit 1
 
 echo "native platform boundary: generated modules use one linked portable value/platform runtime"

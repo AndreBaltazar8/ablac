@@ -21,14 +21,14 @@ rm -f "$abi_manifest"
 build_once
 second_identity=$(sha256sum "$library" | cut -d' ' -f1)
 second_abi_identity=$(sha256sum "$abi_manifest" | cut -d' ' -f1)
-[[ $first_identity == "$second_identity" ]]
-[[ $first_abi_identity == "$second_abi_identity" ]]
+[[ $first_identity == "$second_identity" ]] || exit 1
+[[ $first_abi_identity == "$second_abi_identity" ]] || exit 1
 
 set +e
 "$output_directory/build-driver"
 driver_status=$?
 set -e
-[[ $driver_status -eq 37 ]]
+[[ $driver_status -eq 37 ]] || exit 1
 
 llvm-readelf -h "$library" | grep -q 'AArch64'
 llvm-readelf -h "$library" | grep -q 'DYN (Shared object file)'
@@ -46,7 +46,7 @@ jni="$output_directory/src/main/cpp/abla_jni.c"
 kotlin="$output_directory/src/main/kotlin/org/abla/generated/AblaApp.kt"
 cmake="$output_directory/src/main/cpp/CMakeLists.txt"
 gradle="$output_directory/abla.gradle.kts"
-[[ -s $header && -s $jni && -s $kotlin && -s $cmake && -s $gradle ]]
+[[ -s $header && -s $jni && -s $kotlin && -s $cmake && -s $gradle ]] || exit 1
 grep -q 'int64_t abla_app_answer(void)' "$header"
 grep -q 'Java_org_abla_generated_AblaApp_answer' "$jni"
 grep -q 'external fun answer(): Long' "$kotlin"
@@ -62,7 +62,7 @@ set +e
     2>"$output_directory/invalid-target.err"
 invalid_target_status=$?
 set -e
-[[ $invalid_target_status -ne 0 ]]
+[[ $invalid_target_status -ne 0 ]] || exit 1
 grep -q 'error\[E_BUILD_TARGET_DEFINITION\]' \
     "$output_directory/invalid-target.err"
 
@@ -76,11 +76,11 @@ example_root="$project_root/build/examples/android"
 "$compiler" build \
     "$project_root/examples/android/build.ab" \
     -o "$example_root/build-driver" --fast --no-cache
-[[ -s $example_root/build.gradle.kts ]]
-[[ -s $example_root/settings.gradle.kts ]]
-[[ -s $example_root/src/main/AndroidManifest.xml ]]
-[[ -s $example_root/src/main/kotlin/org/abla/example/MainActivity.kt ]]
-[[ -s $example_root/src/main/jniLibs/arm64-v8a/libabla_app.so ]]
+[[ -s $example_root/build.gradle.kts ]] || exit 1
+[[ -s $example_root/settings.gradle.kts ]] || exit 1
+[[ -s $example_root/src/main/AndroidManifest.xml ]] || exit 1
+[[ -s $example_root/src/main/kotlin/org/abla/example/MainActivity.kt ]] || exit 1
+[[ -s $example_root/src/main/jniLibs/arm64-v8a/libabla_app.so ]] || exit 1
 grep -q 'abiFilters += "arm64-v8a"' "$example_root/build.gradle.kts"
 grep -q 'Hello from Abla:' \
     "$example_root/src/main/kotlin/org/abla/example/MainActivity.kt"
