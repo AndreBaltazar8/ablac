@@ -1340,10 +1340,26 @@ fun bootstrapIrIsLocalZero(opcode: string): bool =
     opcode == "local.zero.bool" || opcode == "local.zero.f64" ||
     opcode == "local.zero.f32"
 
-// Arithmetic over these types wraps at their width; boxed values are 64-bit.
-fun bootstrapIrFixedWidthInteger(type: string): bool =
+// A boxed value is a 64-bit integer: these types lose their width, their
+// sign or (a float's raw bits) their meaning in boxed arithmetic.
+fun bootstrapIrNeedsNativeArithmetic(type: string): bool =
     type == "i8" || type == "u8" || type == "i16" || type == "u16" ||
-    type == "i32" || type == "u32" || type == "u64"
+    type == "i32" || type == "u32" || type == "u64" ||
+    type == "f32" || type == "f64"
+
+// The type both sides of a comparison are cast to, or "" to compare boxed:
+// a float's bits compare wrongly below zero, and a u64 compares signed.
+fun bootstrapIrNativeComparisonType(
+    kind: string,
+    left: string,
+    right: string
+): string {
+    val ordering = kind == "<" || kind == "<=" || kind == ">" || kind == ">="
+    if (left == "f64" || right == "f64") "f64"
+    else if (left == "f32" || right == "f32") "f32"
+    else if (ordering && (left == "u64" || right == "u64")) "u64"
+    else ""
+}
 
 fun bootstrapIrLocalZeroOpcode(type: string): string {
     val normalized = bootstrapNormalizeType(type)
@@ -5335,12 +5351,13 @@ class BootstrapLowerer(
 
     // The backend types an arithmetic result by its left operand, and a
     // field, an element or a call reaches it boxed: an i32 field times an
-    // i32 multiplied as 64 bits and never wrapped. Casting a fixed-width
-    // operand to its type keeps the operation at that width.
+    // i32 multiplied as 64 bits and never wrapped, and a closure's f64 plus
+    // 1.0 added raw bits. Casting the operand to its type keeps the
+    // operation native at that type.
     fun lowerArithmeticOperand(expression: BootstrapExpression): int {
         val type = this.lowerRuntimeType(this.lowerExpressionType(expression))
         val value = this.lowerExpression(expression)
-        if (bootstrapIrFixedWidthInteger(type)) {
+        if (bootstrapIrNeedsNativeArithmetic(type)) {
             this.emit("scalar.cast", value, -1, type)
         } else value
     }
@@ -7166,14 +7183,30 @@ class BootstrapLowerer(
                     "string.equal"
                 } else "string.not.equal"
             }
-            val arithmetic = opcode == expression.kind &&
-                expression.kind != "==" && expression.kind != "!=" &&
-                expression.kind != "<" && expression.kind != "<=" &&
-                expression.kind != ">" && expression.kind != ">="
-            val left = if (arithmetic) {
+            val comparison = expression.kind == "==" ||
+                expression.kind == "!=" || expression.kind == "<" ||
+                expression.kind == "<=" || expression.kind == ">" ||
+                expression.kind == ">="
+            val arithmetic = opcode == expression.kind && !comparison
+            val comparisonType = if (opcode == expression.kind && comparison) {
+                bootstrapIrNativeComparisonType(
+                    expression.kind,
+                    this.lowerRuntimeType(this.lowerExpressionType(
+                        expression.children[0]
+                    )),
+                    this.lowerRuntimeType(this.lowerExpressionType(
+                        expression.children[1]
+                    ))
+                )
+            } else ""
+            var left = if (arithmetic) {
                 this.lowerArithmeticOperand(expression.children[0])
             } else this.lowerExpression(expression.children[0])
-            val right = this.lowerExpression(expression.children[1])
+            var right = this.lowerExpression(expression.children[1])
+            if (comparisonType != "") {
+                left = this.emit("scalar.cast", left, -1, comparisonType)
+                right = this.emit("scalar.cast", right, -1, comparisonType)
+            }
             result = this.emit(opcode, left, right, "")
         }
         if (expression.kind == "&&" || expression.kind == "||") {
