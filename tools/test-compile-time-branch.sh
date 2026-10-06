@@ -19,7 +19,14 @@ status=$?
     > "$output_directory/invalid.ll" 2> "$output_directory/invalid.err"
 invalid_status=$?
 set -e
+"$compiler" build "$project_root/tests/cases/compile-time-branch/global-type.ab" \
+    -o "$output_directory/global-type" --no-cache
+set +e
+"$output_directory/global-type"
+global_status=$?
+set -e
 [[ $status -eq 42 ]]
+[[ $global_status -eq 42 ]]
 [[ $invalid_status -ne 0 ]]
 grep -q 'compile.effect-denied:trusted.native' "$output_directory/invalid.err"
 echo "compile-time branch: buffers match, the reachable branch is still checked"
