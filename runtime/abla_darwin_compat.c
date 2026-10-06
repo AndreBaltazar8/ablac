@@ -20,6 +20,7 @@
 #include <sys/event.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -598,6 +599,34 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
         darwin_getdents((int)argument0, (unsigned char *)(uintptr_t)argument1,
                         (size_t)argument2);
     break;
+  case 97:
+  case 160: {
+    // getrlimit/setrlimit of RLIMIT_STACK (3 on both); Linux writes an
+    // unlimited value as all ones, Darwin as RLIM_INFINITY.
+    struct rlimit limits;
+    int64_t *linux_limits = (int64_t *)(uintptr_t)argument1;
+    if (argument0 != 3) {
+      result = -1;
+      errno = EINVAL;
+    } else if (number == 97) {
+      result = getrlimit(RLIMIT_STACK, &limits);
+      if (result == 0) {
+        linux_limits[0] = limits.rlim_cur == RLIM_INFINITY
+                              ? -1
+                              : (int64_t)limits.rlim_cur;
+        linux_limits[1] = limits.rlim_max == RLIM_INFINITY
+                              ? -1
+                              : (int64_t)limits.rlim_max;
+      }
+    } else {
+      limits.rlim_cur =
+          linux_limits[0] < 0 ? RLIM_INFINITY : (rlim_t)linux_limits[0];
+      limits.rlim_max =
+          linux_limits[1] < 0 ? RLIM_INFINITY : (rlim_t)linux_limits[1];
+      result = setrlimit(RLIMIT_STACK, &limits);
+    }
+    break;
+  }
   case 228:
     result = clock_gettime(argument0 == 1 ? CLOCK_MONOTONIC : CLOCK_REALTIME,
                            (struct timespec *)(uintptr_t)argument1);
