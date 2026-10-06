@@ -554,6 +554,9 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
       result = (long)strlen(output) + 1;
     break;
   }
+  case 80:
+    result = chdir((const char *)(uintptr_t)argument0);
+    break;
   case 82:
     result = rename((const char *)(uintptr_t)argument0,
                     (const char *)(uintptr_t)argument1);
