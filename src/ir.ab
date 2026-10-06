@@ -5005,6 +5005,33 @@ class BootstrapLowerer(
         captured
     }
 
+    // Every name a closure under `expression` captures.
+    fun collectCapturedNames(
+        expression: BootstrapExpression,
+        var captured: array<string>
+    ): void {
+        if (expression.kind == "lambda" ||
+            expression.kind == "lambda.move" ||
+            expression.kind == "lambda.generator") {
+            val bound: array<string> = []
+            var parameter = 0
+            while (parameter + 1 < expression.children.size) {
+                bound.append(expression.children[parameter].text)
+                parameter = parameter + 1
+            }
+            val body = expression.children[expression.children.size - 1]
+            this.collectLambdaLocals(body, bound)
+            this.collectLambdaFreeNames(body, bound, captured)
+        } else {
+            var child = 0
+            while (child < expression.children.size) {
+                this.collectCapturedNames(expression.children[child], captured)
+                child = child + 1
+            }
+        }
+        return
+    }
+
     fun isLocal(name: string): bool {
         var found = false
         var index = 0
@@ -6254,9 +6281,27 @@ class BootstrapLowerer(
         }
         if (expression.kind == "block") {
             val previousScope = this.enterLocalScope()
+            // A local a closure captures lives in a cell from its declaration
+            // on. Converting it where the closure was built ran again on each
+            // pass of a loop and wrapped the cell in a second cell; inside one
+            // `if` arm it converted one path only.
+            var captured: array<string> = []
+            var capturesCollected = false
             var statement = 0
             while (statement < expression.children.size) {
-                result = this.lowerExpression(expression.children[statement])
+                val lowered = expression.children[statement]
+                result = this.lowerExpression(lowered)
+                if (lowered.kind == "local.val" || lowered.kind == "local.var") {
+                    if (!capturesCollected) {
+                        this.collectCapturedNames(expression, captured)
+                        capturesCollected = true
+                    }
+                    if (this.nameIsBound(captured, lowered.text) &&
+                        !this.lowerNameIsDelegated(lowered.text) &&
+                        !this.lowerTypeIsAffine(bootstrapDelegatedStorageOrSelf(
+                            this.lowerLocalType(lowered.text)
+                        ))) this.captureCell(lowered.text)
+                }
                 statement = statement + 1
             }
             if (result < 0) result = this.emit("const.void", -1, -1, "")
