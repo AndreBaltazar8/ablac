@@ -73,6 +73,7 @@ test: ablac
 	tools/test-line-continuation.sh $(COMPILER)
 	tools/test-ownership-shadows-and-globals.sh $(COMPILER)
 	tools/test-wasm-export-extern.sh $(COMPILER)
+	tools/test-float-interpolation.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)
