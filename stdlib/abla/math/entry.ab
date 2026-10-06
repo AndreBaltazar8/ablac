@@ -286,3 +286,407 @@ fun atan2(y: f64, x: f64): f64 {
     else if (m == 2) mathPi - (z - __mathPiLo)
     else (z - __mathPiLo) - mathPi
 }
+
+// --- exponential, logarithm, power -------------------------------------------
+// Ports of FreeBSD msun's e_exp.c, e_log.c and e_pow.c (fdlibm), built like the
+// trigonometry above from +, -, *, / and exact operations, so native and Wasm
+// builds agree bit for bit. V8 computes Math.exp, Math.log and Math.pow with the
+// same code, so results match JavaScript's (in V8) exactly; pow follows C where
+// the two differ: pow(1, y) is 1 for every y and pow(-1, ±inf) is 1, where
+// JavaScript gives NaN.
+
+// e
+val mathE: f64 = f64FromBits(4613303445314885481)
+// ln 2
+val mathLn2: f64 = f64FromBits(4604418534313441775)
+// exp overflows above this (709.782712893384)
+val __mathExpOverflow: f64 = f64FromBits(4649454530587146735)
+// exp underflows below this (-745.1332191019411)
+val __mathExpUnderflow: f64 = f64FromBits(-4573606559926636463)
+// ln 2, its high part (low 32 bits zero)
+val __mathLn2Hi: f64 = f64FromBits(4604418534311723008)
+// ln 2 - __mathLn2Hi
+val __mathLn2Lo: f64 = f64FromBits(4461442080421002358)
+// 1 / ln 2
+val __mathInvLn2: f64 = f64FromBits(4609176140021203710)
+// exp polynomial (also pow's)
+val __mathP1: f64 = f64FromBits(4595172819793696062)
+// exp polynomial
+val __mathP2: f64 = f64FromBits(-4654820494858601069)
+// exp polynomial
+val __mathP3: f64 = f64FromBits(4544508515198557740)
+// exp polynomial
+val __mathP4: f64 = f64FromBits(-4702957295668925455)
+// exp polynomial
+val __mathP5: f64 = f64FromBits(4496342204012209360)
+// 1e300: squared, an overflow to infinity
+val __mathHuge: f64 = f64FromBits(9094988921128908188)
+// 1e-300: squared, an underflow to zero
+val __mathTiny: f64 = f64FromBits(118622047889322841)
+// 2^-1000
+val __mathTwoM1000: f64 = f64FromBits(103582791429521408)
+// 2^54
+val __mathTwo54: f64 = f64FromBits(4850376798678024192)
+// 2^53
+val __mathTwo53: f64 = f64FromBits(4845873199050653696)
+// 2^-54
+val __mathTwoM54: f64 = f64FromBits(4363988038922010624)
+// 2^1023
+val __mathTwo1023: f64 = f64FromBits(9214364837600034816)
+// 1/3
+val __mathThird: f64 = f64FromBits(4599676419421066581)
+// log polynomial
+val __mathLg1: f64 = f64FromBits(4604180019048437139)
+// log polynomial
+val __mathLg2: f64 = f64FromBits(4600877379321592324)
+// log polynomial
+val __mathLg3: f64 = f64FromBits(4598818590951641945)
+// log polynomial
+val __mathLg4: f64 = f64FromBits(4597174411056806063)
+// log polynomial
+val __mathLg5: f64 = f64FromBits(4595719342595441630)
+// log polynomial
+val __mathLg6: f64 = f64FromBits(4594685411790997151)
+// log polynomial
+val __mathLg7: f64 = f64FromBits(4594499633228436036)
+// log2(1.5), its high part
+val __mathDpH: f64 = f64FromBits(4603444093224222720)
+// log2(1.5) - __mathDpH
+val __mathDpL: f64 = f64FromBits(4489242115478376454)
+// pow's log polynomial
+val __mathL1: f64 = f64FromBits(4603579539098120963)
+// pow's log polynomial
+val __mathL2: f64 = f64FromBits(4601392076422097919)
+// pow's log polynomial
+val __mathL3: f64 = f64FromBits(4599676419357746765)
+// pow's log polynomial
+val __mathL4: f64 = f64FromBits(4598584653024936193)
+// pow's log polynomial
+val __mathL5: f64 = f64FromBits(4597478449480325989)
+// pow's log polynomial
+val __mathL6: f64 = f64FromBits(4596625081194860271)
+// ln 2, its high 21 bits
+val __mathLg2H: f64 = f64FromBits(4604418534330597376)
+// ln 2 - __mathLg2H
+val __mathLg2L: f64 = f64FromBits(-4746692435354555335)
+// 2 / (3 ln 2)
+val __mathCp: f64 = f64FromBits(4606838314010018813)
+// __mathCp rounded to a float
+val __mathCpH: f64 = f64FromBits(4606838314073325568)
+// __mathCp - __mathCpH
+val __mathCpL: f64 = f64FromBits(-4738297118486494731)
+// 1 / ln 2, its high 24 bits
+val __mathIvLn2H: f64 = f64FromBits(4609176139934466048)
+// 1 / ln 2 - __mathIvLn2H
+val __mathIvLn2L: f64 = f64FromBits(4491406094830001988)
+// pow overflows when its log2 passes 1024 by more than this
+val __mathPowOvt: f64 = f64FromBits(4365981760143196926)
+
+@inline
+fun __mathLow(value: f64): int = f64ToBits(value) & 0xffffffff
+
+// The f64 whose high and low 32-bit words are these.
+fun __mathWords(high: int, low: int): f64 =
+    f64FromBits(((high & 0xffffffff) << 32) | (low & 0xffffffff))
+
+// `value` with its low 32 bits cleared.
+fun __mathClearLow(value: f64): f64 =
+    f64FromBits(f64ToBits(value) & -4294967296)
+
+// x · 2^n for a normal x (msun's scalbn, for the results that need it).
+fun __mathScalbn(x: f64, n: int): f64 {
+    val hx = __mathHigh(x)
+    val k = ((hx & 0x7ff00000) >> 20) + n
+    if (k > 0) return __mathWords((hx & 0x800fffff) | (k << 20), __mathLow(x))
+    if (k <= -54) return __mathTiny * (if (hx < 0) -__mathTiny else __mathTiny)
+    __mathWords((hx & 0x800fffff) | ((k + 54) << 20), __mathLow(x)) * __mathTwoM54
+}
+
+/** e raised to x. */
+fun exp(value: f64): f64 {
+    var x = value
+    val negative = __mathHigh(x) < 0
+    val hx = __mathHigh(x) & 0x7fffffff
+    if (hx >= 0x40862E42) {
+        // |x| >= 709.78...
+        if (hx >= 0x7ff00000) {
+            if (((hx & 0xfffff) | __mathLow(x)) != 0) return x + x
+            return if (negative) 0.0 else x
+        }
+        if (x > __mathExpOverflow) return __mathHuge * __mathHuge
+        if (x < __mathExpUnderflow) return __mathTwoM1000 * __mathTwoM1000
+    }
+    // The reduction below gives 2.7182818284590455; e itself is closer.
+    if (x == 1.0) return mathE
+    var hi = 0.0
+    var lo = 0.0
+    var k = 0
+    if (hx > 0x3fd62e42) {
+        // |x| > ln2 / 2: x = k·ln2 + r, |r| <= ln2 / 2
+        if (hx < 0x3FF0A2B2) {
+            if (negative) {
+                hi = x + __mathLn2Hi
+                lo = -__mathLn2Lo
+                k = -1
+            } else {
+                hi = x - __mathLn2Hi
+                lo = __mathLn2Lo
+                k = 1
+            }
+        } else {
+            k = f64ToInt(__mathInvLn2 * x + (if (negative) -0.5 else 0.5))
+            val kf = f64FromInt(k)
+            hi = x - kf * __mathLn2Hi
+            lo = kf * __mathLn2Lo
+        }
+        x = hi - lo
+    } else if (hx < 0x3e300000) {
+        // |x| < 2^-28
+        return 1.0 + x
+    }
+    val t = x * x
+    val c = x - t * (__mathP1 + t * (__mathP2 + t * (__mathP3 + t * (__mathP4 +
+        t * __mathP5))))
+    if (k == 0) return 1.0 - ((x * c) / (c - 2.0) - x)
+    val y = 1.0 - ((lo - (x * c) / (2.0 - c)) - hi)
+    if (k >= -1021) {
+        if (k == 1024) return y * 2.0 * __mathTwo1023
+        return y * __mathWords((0x3ff + k) << 20, 0)
+    }
+    y * __mathWords((0x3ff + k + 1000) << 20, 0) * __mathTwoM1000
+}
+
+/** The natural logarithm of x: -inf at 0, NaN below. */
+fun log(value: f64): f64 {
+    var x = value
+    var hx = __mathHigh(x)
+    var k = 0
+    if (hx < 0x00100000) {
+        // x < 2^-1022: zero, negative or subnormal
+        if (((hx & 0x7fffffff) | __mathLow(x)) == 0) return -__mathTwo54 / 0.0
+        if (hx < 0) return (x - x) / 0.0
+        k = -54
+        x = x * __mathTwo54
+        hx = __mathHigh(x)
+    }
+    if (hx >= 0x7ff00000) return x + x
+    k = k + (hx >> 20) - 1023
+    hx = hx & 0x000fffff
+    // x = 2^k · m with m in [sqrt(2)/2, sqrt(2))
+    val half = (hx + 0x95f64) & 0x100000
+    x = __mathWords(hx | (half ^ 0x3ff00000), __mathLow(x))
+    k = k + (half >> 20)
+    val f = x - 1.0
+    if ((0x000fffff & (2 + hx)) < 3) {
+        // -2^-20 <= f < 2^-20
+        if (f == 0.0) {
+            if (k == 0) return 0.0
+            val dk = f64FromInt(k)
+            return dk * __mathLn2Hi + dk * __mathLn2Lo
+        }
+        val r = f * f * (0.5 - __mathThird * f)
+        if (k == 0) return f - r
+        val dk = f64FromInt(k)
+        return dk * __mathLn2Hi - ((r - dk * __mathLn2Lo) - f)
+    }
+    val s = f / (2.0 + f)
+    val dk = f64FromInt(k)
+    val z = s * s
+    val w = z * z
+    val t1 = w * (__mathLg2 + w * (__mathLg4 + w * __mathLg6))
+    val t2 = z * (__mathLg1 + w * (__mathLg3 + w * (__mathLg5 + w * __mathLg7)))
+    val r = t2 + t1
+    if (((hx - 0x6147a) | (0x6b851 - hx)) > 0) {
+        val hfsq = 0.5 * f * f
+        if (k == 0) return f - (hfsq - s * (hfsq + r))
+        return dk * __mathLn2Hi - ((hfsq - (s * (hfsq + r) + dk * __mathLn2Lo)) - f)
+    }
+    if (k == 0) return f - s * (f - r)
+    dk * __mathLn2Hi - ((s * (f - r) - dk * __mathLn2Lo) - f)
+}
+
+/** x raised to y, as C's pow: pow(x, ±0) and pow(1, y) are 1 even for a NaN,
+ *  a negative x needs an integer y (NaN otherwise), and integer powers of
+ *  integers are exact while representable. */
+fun pow(x: f64, y: f64): f64 {
+    val hx = __mathHigh(x)
+    val lx = __mathLow(x)
+    val hy = __mathHigh(y)
+    val ly = __mathLow(y)
+    var ix = hx & 0x7fffffff
+    val iy = hy & 0x7fffffff
+    if ((iy | ly) == 0) return 1.0
+    if (hx == 0x3ff00000 && lx == 0) return 1.0
+    if (ix > 0x7ff00000 || (ix == 0x7ff00000 && lx != 0) ||
+        iy > 0x7ff00000 || (iy == 0x7ff00000 && ly != 0)) return x + y
+    // For a negative x: 0 when y is not an integer, 1 when odd, 2 when even.
+    var yisint = 0
+    if (hx < 0) {
+        if (iy >= 0x43400000) yisint = 2
+        else if (iy >= 0x3ff00000) {
+            val e = (iy >> 20) - 0x3ff
+            if (e > 20) {
+                val j = ly >> (52 - e)
+                if ((j << (52 - e)) == ly) yisint = 2 - (j & 1)
+            } else if (ly == 0) {
+                val j = iy >> (20 - e)
+                if ((j << (20 - e)) == iy) yisint = 2 - (j & 1)
+            }
+        }
+    }
+    if (ly == 0) {
+        if (iy == 0x7ff00000) {
+            // y is ±inf
+            if (((ix - 0x3ff00000) | lx) == 0) return 1.0
+            if (ix >= 0x3ff00000) return if (hy >= 0) y else 0.0
+            return if (hy < 0) -y else 0.0
+        }
+        if (iy == 0x3ff00000) return if (hy < 0) 1.0 / x else x
+        if (hy == 0x40000000) return x * x
+        if (hy == 0x3fe00000 && hx >= 0) return sqrt(x)
+    }
+    var ax = fabs(x)
+    if (lx == 0 && (ix == 0x7ff00000 || ix == 0 || ix == 0x3ff00000)) {
+        // x is ±0, ±inf or ±1
+        var z = ax
+        if (hy < 0) z = 1.0 / z
+        if (hx < 0) {
+            if (((ix - 0x3ff00000) | yisint) == 0) z = (z - z) / (z - z)
+            else if (yisint == 1) z = -z
+        }
+        return z
+    }
+    // n is 0 for a negative x, -1 otherwise
+    var n = (if (hx < 0) 1 else 0) - 1
+    if ((n | yisint) == 0) return (x - x) / (x - x)
+    // the sign of the result: negative for a negative x to an odd power
+    val s = if ((n | (yisint - 1)) == 0) -1.0 else 1.0
+    // log2(|x|) = t1 + t2
+    var t1 = 0.0
+    var t2 = 0.0
+    if (iy > 0x41e00000) {
+        // |y| > 2^31
+        if (iy > 0x43f00000) {
+            // |y| > 2^64: over- or underflows
+            if (ix <= 0x3fefffff) {
+                return if (hy < 0) __mathHuge * __mathHuge
+                    else __mathTiny * __mathTiny
+            }
+            if (ix >= 0x3ff00000) {
+                return if (hy > 0) __mathHuge * __mathHuge
+                    else __mathTiny * __mathTiny
+            }
+        }
+        if (ix < 0x3fefffff) {
+            return if (hy < 0) s * __mathHuge * __mathHuge
+                else s * __mathTiny * __mathTiny
+        }
+        if (ix > 0x3ff00000) {
+            return if (hy > 0) s * __mathHuge * __mathHuge
+                else s * __mathTiny * __mathTiny
+        }
+        // |1 - x| <= 2^-20: log(x) by x - x^2/2 + x^3/3 - x^4/4
+        val t = ax - 1.0
+        val w = (t * t) * (0.5 - t * (__mathThird - t * 0.25))
+        val u = __mathIvLn2H * t
+        val v = t * __mathIvLn2L - w * __mathInvLn2
+        t1 = __mathClearLow(u + v)
+        t2 = v - (t1 - u)
+    } else {
+        n = 0
+        if (ix < 0x00100000) {
+            // subnormal x
+            ax = ax * __mathTwo53
+            n = n - 53
+            ix = __mathHigh(ax)
+        }
+        n = n + (ix >> 20) - 0x3ff
+        val j = ix & 0x000fffff
+        ix = j | 0x3ff00000
+        // |x| < sqrt(3/2): k = 0; < sqrt(3): k = 1; else halve it
+        var k = 0
+        if (j > 0x3988E) {
+            if (j < 0xBB67A) k = 1
+            else {
+                n = n + 1
+                ix = ix - 0x00100000
+            }
+        }
+        ax = __mathWords(ix, __mathLow(ax))
+        val bp = if (k == 0) 1.0 else 1.5
+        val dpH = if (k == 0) 0.0 else __mathDpH
+        val dpL = if (k == 0) 0.0 else __mathDpL
+        // ss = sH + sL = (x - 1) / (x + 1) or (x - 1.5) / (x + 1.5)
+        var u = ax - bp
+        var v = 1.0 / (ax + bp)
+        val ss = u * v
+        val sH = __mathClearLow(ss)
+        var tH = __mathWords(((ix >> 1) | 0x20000000) + 0x00080000 + (k << 18), 0)
+        var tL = ax - (tH - bp)
+        val sL = v * ((u - sH * tH) - sH * tL)
+        // log(ax)
+        var s2 = ss * ss
+        var r = s2 * s2 * (__mathL1 + s2 * (__mathL2 + s2 * (__mathL3 +
+            s2 * (__mathL4 + s2 * (__mathL5 + s2 * __mathL6)))))
+        r = r + sL * (sH + ss)
+        s2 = sH * sH
+        tH = __mathClearLow(3.0 + s2 + r)
+        tL = r - ((tH - 3.0) - s2)
+        u = sH * tH
+        v = sL * tH + tL * ss
+        // 2 / (3 log 2) · (ss + ...)
+        val logH = __mathClearLow(u + v)
+        val logL = v - (logH - u)
+        val zH = __mathCpH * logH
+        val zL = __mathCpL * logH + logL * __mathCp + dpL
+        // log2(ax) = n + dpH + zH + zL
+        val tn = f64FromInt(n)
+        t1 = __mathClearLow(((zH + zL) + dpH) + tn)
+        t2 = zL - (((t1 - tn) - dpH) - zH)
+    }
+    // (y1 + y2) · (t1 + t2), with y1 the high part of y
+    val y1 = __mathClearLow(y)
+    val pL = (y - y1) * t1 + y * t2
+    var pH = y1 * t1
+    var z = pL + pH
+    var j = __mathHigh(z)
+    val i = __mathLow(z)
+    if (j >= 0x40900000) {
+        // z >= 1024
+        if (((j - 0x40900000) | i) != 0) return s * __mathHuge * __mathHuge
+        if (pL + __mathPowOvt > z - pH) return s * __mathHuge * __mathHuge
+    } else if ((j & 0x7fffffff) >= 0x4090cc00) {
+        // z <= -1075
+        if ((((j & 0xffffffff) - 0xc090cc00) | i) != 0) {
+            return s * __mathTiny * __mathTiny
+        }
+        if (pL <= z - pH) return s * __mathTiny * __mathTiny
+    }
+    // 2^(pH + pL)
+    val ia = j & 0x7fffffff
+    var k = (ia >> 20) - 0x3ff
+    n = 0
+    if (ia > 0x3fe00000) {
+        // |z| > 0.5: n = [z + 0.5]
+        n = j + (0x00100000 >> (k + 1))
+        k = ((n & 0x7fffffff) >> 20) - 0x3ff
+        val t = __mathWords(n & ~(0x000fffff >> k), 0)
+        n = ((n & 0x000fffff) | 0x00100000) >> (20 - k)
+        if (j < 0) n = 0 - n
+        pH = pH - t
+    }
+    var t = __mathClearLow(pL + pH)
+    val u = t * __mathLg2H
+    val v = (pL - (t - pH)) * mathLn2 + t * __mathLg2L
+    z = u + v
+    val w = v - (z - u)
+    t = z * z
+    val c = z - t * (__mathP1 + t * (__mathP2 + t * (__mathP3 + t * (__mathP4 +
+        t * __mathP5))))
+    val r = (z * c) / (c - 2.0) - (w + z * w)
+    z = 1.0 - (r - z)
+    j = __mathHigh(z) + (n << 20)
+    if ((j >> 20) <= 0) z = __mathScalbn(z, n)
+    else z = __mathWords(j, __mathLow(z))
+    s * z
+}

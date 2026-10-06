@@ -50,8 +50,12 @@ set +e
 native_status=$?
 set -e
 test "$native_status" -eq 42
-llvm-readelf -d "$output_root/floating-native" |
-    rg -q 'Shared library: \[libm'
+# On Linux the libm dependency is a shared library of its own; macOS keeps
+# libm inside libSystem.
+if [[ $(uname -s) == Linux ]]; then
+    llvm-readelf -d "$output_root/floating-native" |
+        rg -q 'Shared library: \[libm'
+fi
 
 if "$compiler" build \
     "$project_root/tests/cases/modules/invalid-floating-mixed.ab" \
