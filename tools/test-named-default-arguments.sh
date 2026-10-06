@@ -36,4 +36,13 @@ named_many_status=$?
 set -e
 [[ $named_many_status -eq 42 ]]
 
-echo "named/default arguments: extension defaults and invalid diagnostics passed"
+"$compiler" build \
+    "$project_root/tests/cases/modules/named-var-arguments.ab" \
+    -o "$output_directory/named-var-arguments" --fast --no-cache
+set +e
+"$output_directory/named-var-arguments"
+named_var_status=$?
+set -e
+[[ $named_var_status -eq 42 ]]
+
+echo "named/default arguments: extension defaults, var parameters and invalid diagnostics passed"
