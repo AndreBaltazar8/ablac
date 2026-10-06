@@ -60,4 +60,17 @@ for invalid in invalid-constructor-stores-var-parameter \
     grep -q 'ownership.borrow-escape' "$output_directory/$invalid.out"
 done
 
-printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return; returned objects may store parameters'
+set +e
+"$compiler" build "$cases/invalid-borrow-conflict.ab" \
+    -o "$output_directory/borrow-conflict" --no-cache --fast \
+    > "$output_directory/borrow-conflict.out" 2>&1
+conflict_status=$?
+set -e
+[[ $conflict_status -ne 0 ]]
+grep -q 'E_BORROW_CONFLICT\]: in `main`, `nums\[0\]` is changed while `first`' \
+    "$output_directory/borrow-conflict.out"
+grep -q 'in `Box.grow`, `this.items` is changed while `shared`' \
+    "$output_directory/borrow-conflict.out"
+grep -q '0 semantic, 2 IR, 2 total error' "$output_directory/borrow-conflict.out"
+
+printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return; returned objects may store parameters; borrow conflicts are named'

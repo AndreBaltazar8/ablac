@@ -1854,9 +1854,18 @@ fun bootstrapVerifyIrBorrows(
     instructions: array<BootstrapInstruction>,
     blocks: array<BootstrapIrBlock>,
     locals: array<BootstrapIrLocal>
-): int {
+): int = bootstrapIrBorrowConflicts(instructions, blocks, locals).size
+
+/** One entry per borrow error: "storage\tsource" when `source` is changed
+ *  while the local `storage` that borrows it is still used afterwards, ""
+ *  for a malformed binding. */
+fun bootstrapIrBorrowConflicts(
+    instructions: array<BootstrapInstruction>,
+    blocks: array<BootstrapIrBlock>,
+    locals: array<BootstrapIrLocal>
+): array<string> {
     val bindings: array<BootstrapIrBorrowBinding> = []
-    var errors = 0
+    val conflicts: array<string> = []
     var instructionIndex = 0
     while (instructionIndex < instructions.size) {
         val instruction = instructions[instructionIndex]
@@ -1867,7 +1876,7 @@ fun bootstrapVerifyIrBorrows(
             if (storage == "" || source == "" || storage == sourceRoot ||
                 bootstrapIrLocalIndex(locals, storage) < 0 ||
                 bootstrapIrLocalIndex(locals, sourceRoot) < 0) {
-                errors = errors + 1
+                conflicts.append("")
                 bootstrapSemanticUnit()
             } else {
                 bindings.append(BootstrapIrBorrowBinding(
@@ -1944,7 +1953,9 @@ fun bootstrapVerifyIrBorrows(
                 if (bootstrapIrInstructionInvalidatesBorrow(
                     instruction,
                     binding.source
-                ) && live) errors = errors + 1
+                ) && live) {
+                    conflicts.append("${binding.storage}\t${binding.source}")
+                }
                 if (instruction.opcode == "borrow.bind" &&
                     bootstrapIrBorrowStorage(instruction.text) ==
                         binding.storage) {
@@ -1962,7 +1973,7 @@ fun bootstrapVerifyIrBorrows(
         }
         bindingIndex = bindingIndex + 1
     }
-    errors
+    conflicts
 }
 
 class BootstrapIrPlaceState(var values: array<string>)
@@ -8237,7 +8248,9 @@ class BootstrapLowerer(
                     true
                 )
                 bootstrapSemanticUnit()
-                this.errors = validationErrors
+                // A `fun` is lowered again below and reports its errors there;
+                // counting them here too doubled every borrow error.
+                if (declaration.kind != "fun") this.errors = validationErrors
             }
             var methodIndex = 0
             while (methodIndex < declaration.methods.size) {
@@ -8247,14 +8260,10 @@ class BootstrapLowerer(
                         method,
                         borrowReturnCallNames
                     ) || this.declarationHasManagedAlias(method))) {
+                    // Lowered again below, which reports its errors.
                     val checkpoint = runtimeMemoryCheckpoint()
-                    val validationErrors = this.lowerMethodDeclaration(
-                        declaration,
-                        method,
-                        true
-                    )
+                    this.lowerMethodDeclaration(declaration, method, true)
                     bootstrapSemanticUnit()
-                    this.errors = validationErrors
                 }
                 methodIndex = methodIndex + 1
             }
@@ -8611,6 +8620,31 @@ fun bootstrapIrFunctionContainsDelegateReplacement(
     found
 }
 
+// A place as the source wrote it: IR locals are named `local_<n>_<name>`.
+fun bootstrapIrSourcePlace(place: string): string {
+    var result = ""
+    var index = 0
+    while (index < place.size) {
+        var skip = 0
+        if ((index == 0 || place[index - 1] == 46 || place[index - 1] == 91) &&
+            index + 6 < place.size && place.slice(index, index + 6) == "local_") {
+            var digit = index + 6
+            while (digit < place.size && place[digit] >= 48 && place[digit] <= 57) {
+                digit = digit + 1
+            }
+            if (digit > index + 6 && digit < place.size && place[digit] == 95) {
+                skip = digit + 1 - index
+            }
+        }
+        if (skip > 0) index = index + skip
+        else {
+            result = "$result${place.slice(index, index + 1)}"
+            index = index + 1
+        }
+    }
+    result
+}
+
 fun bootstrapIrVerificationDiagnostics(
     program: BootstrapIrProgram,
     parsed: BootstrapParseResult,
@@ -8627,10 +8661,38 @@ fun bootstrapIrVerificationDiagnostics(
                 parsed,
                 function.name
             )
+        // Name the borrow conflicts among the function's errors: a place
+        // changed while a local that borrows it is used again later.
+        val conflicts: array<string> = []
+        if (function.verificationErrors > 0) {
+            for (conflict in bootstrapIrBorrowConflicts(
+                function.instructions, function.blocks, function.locals
+            )) if (conflict != "") conflicts.append(conflict)
+        }
         var functionError = 0
         while (functionError < function.verificationErrors &&
             classified < totalIrErrors) {
-            if (delegatedReplacement && functionError == 0) {
+            if (functionError < conflicts.size &&
+                !(delegatedReplacement && functionError == 0)) {
+                val conflict = conflicts[functionError]
+                var tab = 0
+                while (conflict[tab] != 9) tab = tab + 1
+                val source = bootstrapIrSourcePlace(
+                    conflict.slice(tab + 1, conflict.size)
+                )
+                val borrower = bootstrapIrSourcePlace(conflict.slice(0, tab))
+                var where = function.name
+                if (where.size > 10 && where.slice(0, 10) == "extension_") {
+                    where = where.slice(10, where.size)
+                    var cut = 0
+                    while (cut < where.size && where[cut] != 95) cut = cut + 1
+                    if (cut < where.size) {
+                        where = "${where.slice(0, cut)}.${where.slice(cut + 1, where.size)}"
+                    }
+                }
+                diagnostics =
+                    "${diagnostics}error[E_BORROW_CONFLICT]: in `$where`, `$source` is changed while `$borrower`, which borrows it, is still used afterwards\n"
+            } else if (delegatedReplacement && functionError == 0) {
                 diagnostics =
                     "${diagnostics}error[E_DELEGATE_BORROW_CONFLICT]: delegate replacement in `${function.name}` conflicts with a live projected view\n"
             } else diagnostics =
