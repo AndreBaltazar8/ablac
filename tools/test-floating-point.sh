@@ -67,13 +67,12 @@ if "$compiler" build \
 fi
 rg -q 'arithmetic.type' "$output_root/invalid-mixed.stderr"
 
-if "$compiler" build \
-    "$project_root/tests/cases/modules/invalid-floating-compile-time.ab" \
-    -o "$output_root/invalid-compile-time" --no-cache \
-    >"$output_root/invalid-compile-time.stdout" \
-    2>"$output_root/invalid-compile-time.stderr"; then
-    echo 'compile-time floating evaluation unexpectedly compiled' >&2
-    exit 1
-fi
-rg -q 'float.compile-time.unsupported' \
-    "$output_root/invalid-compile-time.stderr"
+# Floats evaluate at compile time (see test-compile-time-floats).
+"$compiler" build \
+    "$project_root/tests/cases/modules/floating-compile-time.ab" \
+    -o "$output_root/compile-time" --no-cache
+set +e
+"$output_root/compile-time"
+compile_time_status=$?
+set -e
+[[ $compile_time_status -eq 42 ]] || exit 1

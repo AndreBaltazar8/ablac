@@ -5,6 +5,9 @@ import "abla/sys/linux/net"
 import "abla/text"
 import "abla/bits"
 import "abla/bytes"
+import "abla/float"
+import "abla/float/text"
+import "abla/math"
 
 // Parser handlers, finalizers, and ordinary staged expressions use separate
 // evaluator objects. Keep their transaction in a private per-process staging
@@ -1213,7 +1216,7 @@ fun bootstrapCompileGlobalEncode(value: BootstrapEvalValue): string {
     val kind = value.kind
     if (kind != "integer" && kind != "boolean" && kind != "string" &&
         kind != "null" && kind != "void" && kind != "array" &&
-        kind != "object") return ""
+        kind != "object" && kind != "f64" && kind != "f32") return ""
     var out = "${bootstrapCompileGlobalToken(kind)}${bootstrapCompileGlobalToken("${value.integer}")}${bootstrapCompileGlobalToken(if (value.boolean) "1" else "0")}${bootstrapCompileGlobalToken(value.text)}${bootstrapCompileGlobalToken(value.owner)}${bootstrapCompileGlobalToken("${value.fieldNames.size}")}"
     var index = 0
     while (index < value.fieldNames.size) {
@@ -1552,6 +1555,23 @@ fun bootstrapEvalNull(): BootstrapEvalValue =
 fun bootstrapEvalVoid(): BootstrapEvalValue =
     BootstrapEvalValue("void", 0, false, "", [], "", [])
 
+// A float at compile time keeps its IEEE bits in `integer` (an f32's in the
+// low 32), so arithmetic on it is the target's own f64/f32 arithmetic.
+fun bootstrapEvalF64(value: f64): BootstrapEvalValue =
+    BootstrapEvalValue("f64", ablaBitF64ToI64(value), false, "", [], "", [])
+
+fun bootstrapEvalF32(value: f32): BootstrapEvalValue =
+    BootstrapEvalValue("f32", ablaBitF32ToI32(value), false, "", [], "", [])
+
+fun bootstrapEvalAsF64(value: BootstrapEvalValue): f64 =
+    ablaBitI64ToF64(value.integer)
+
+fun bootstrapEvalAsF32(value: BootstrapEvalValue): f32 =
+    ablaBitI32ToF32(value.integer)
+
+fun bootstrapEvalFloat(value: BootstrapEvalValue): bool =
+    value.kind == "f64" || value.kind == "f32"
+
 fun bootstrapEvalEqual(
     left: BootstrapEvalValue,
     right: BootstrapEvalValue
@@ -1559,6 +1579,12 @@ fun bootstrapEvalEqual(
     var equal = left.kind == right.kind
     if (left.kind == "integer") {
         equal = equal && left.integer == right.integer
+    }
+    if (left.kind == "f64" && right.kind == "f64") {
+        equal = bootstrapEvalAsF64(left) == bootstrapEvalAsF64(right)
+    }
+    if (left.kind == "f32" && right.kind == "f32") {
+        equal = bootstrapEvalAsF32(left) == bootstrapEvalAsF32(right)
     }
     if (left.kind == "boolean") {
         equal = equal && left.boolean == right.boolean
@@ -1568,6 +1594,116 @@ fun bootstrapEvalEqual(
         equal = equal && left.elements[0] == right.elements[0]
     }
     equal
+}
+
+fun bootstrapEvalF64Arithmetic(operation: string, left: f64, right: f64): f64 =
+    when (operation) {
+        "+" -> left + right
+        "-" -> left - right
+        "*" -> left * right
+        "/" -> left / right
+        else -> left % right
+    }
+
+fun bootstrapEvalF32Arithmetic(operation: string, left: f32, right: f32): f32 =
+    when (operation) {
+        "+" -> left + right
+        "-" -> left - right
+        "*" -> left * right
+        "/" -> left / right
+        else -> left % right
+    }
+
+// An f32 widens to f64 exactly, so comparing the widened values is the same.
+fun bootstrapEvalF64Compare(operation: string, left: f64, right: f64): bool =
+    when (operation) {
+        "<" -> left < right
+        "<=" -> left <= right
+        ">" -> left > right
+        else -> left >= right
+    }
+
+fun bootstrapEvalFloatIntrinsic(name: string): bool =
+    name == "ablaBitF64ToI64" || name == "ablaBitI64ToF64" ||
+    name == "ablaConvertI64ToF64" || name == "ablaConvertF64ToI64" ||
+    name == "ablaBitF32ToI32" || name == "ablaBitI32ToF32" ||
+    name == "ablaConvertU32ToF32" || name == "ablaConvertI32ToF32" ||
+    name == "ablaConvertF32ToU32" || name == "ablaConvertF32ToI32" ||
+    name == "ablaConvertF64ToF32" || name == "ablaConvertF32ToF64" ||
+    name == "ablaF64Sqrt" || name == "ablaF64Floor" ||
+    name == "ablaF64Ceil" || name == "ablaF64Trunc" ||
+    name == "ablaF64Abs" || name == "ablaF64RoundEven"
+
+// The float intrinsics of abla/float and abla/math at compile time, computed
+// by the same operations the compiled program uses.
+fun bootstrapEvalFloatCall(
+    name: string,
+    argument: BootstrapEvalValue
+): BootstrapEvalValue {
+    val integer = argument.kind == "integer"
+    val double = argument.kind == "f64"
+    val single = argument.kind == "f32"
+    var result = BootstrapEvalValue("invalid", 0, false, "", [], "", [])
+    if (name == "ablaBitF64ToI64" && double) {
+        result = bootstrapEvalInteger(argument.integer)
+    }
+    if (name == "ablaBitI64ToF64" && integer) {
+        result = BootstrapEvalValue(
+            "f64", argument.integer, false, "", [], "", []
+        )
+    }
+    if (name == "ablaConvertI64ToF64" && integer) {
+        result = bootstrapEvalF64(ablaConvertI64ToF64(argument.integer))
+    }
+    if (name == "ablaConvertF64ToI64" && double) {
+        result = bootstrapEvalInteger(
+            ablaConvertF64ToI64(bootstrapEvalAsF64(argument))
+        )
+    }
+    if (name == "ablaBitF32ToI32" && single) {
+        result = bootstrapEvalInteger(argument.integer)
+    }
+    if (name == "ablaBitI32ToF32" && integer) {
+        result = bootstrapEvalF32(ablaBitI32ToF32(argument.integer))
+    }
+    if (name == "ablaConvertU32ToF32" && integer) {
+        result = bootstrapEvalF32(ablaConvertU32ToF32(u32(argument.integer)))
+    }
+    if (name == "ablaConvertI32ToF32" && integer) {
+        result = bootstrapEvalF32(ablaConvertI32ToF32(i32(argument.integer)))
+    }
+    if (name == "ablaConvertF32ToU32" && single) {
+        result = bootstrapEvalInteger(
+            i64(ablaConvertF32ToU32(bootstrapEvalAsF32(argument)))
+        )
+    }
+    if (name == "ablaConvertF32ToI32" && single) {
+        result = bootstrapEvalInteger(
+            i64(ablaConvertF32ToI32(bootstrapEvalAsF32(argument)))
+        )
+    }
+    if (name == "ablaConvertF64ToF32" && double) {
+        result = bootstrapEvalF32(
+            ablaConvertF64ToF32(bootstrapEvalAsF64(argument))
+        )
+    }
+    if (name == "ablaConvertF32ToF64" && single) {
+        result = bootstrapEvalF64(
+            ablaConvertF32ToF64(bootstrapEvalAsF32(argument))
+        )
+    }
+    if (double) {
+        val value = bootstrapEvalAsF64(argument)
+        if (name == "ablaF64Sqrt") result = bootstrapEvalF64(ablaF64Sqrt(value))
+        if (name == "ablaF64Floor") result = bootstrapEvalF64(ablaF64Floor(value))
+        if (name == "ablaF64Ceil") result = bootstrapEvalF64(ablaF64Ceil(value))
+        if (name == "ablaF64Trunc") result = bootstrapEvalF64(ablaF64Trunc(value))
+        if (name == "ablaF64Abs") result = bootstrapEvalF64(ablaF64Abs(value))
+        if (name == "ablaF64RoundEven") {
+            result = bootstrapEvalF64(ablaF64RoundEven(value))
+        }
+    }
+    result
 }
 
 fun bootstrapEvalReturn(value: BootstrapEvalValue): BootstrapEvalValue =
@@ -2975,6 +3111,10 @@ class BootstrapEvaluator(
     fun printable(value: BootstrapEvalValue): string {
         var result = value.text
         if (value.kind == "integer") result = "${value.integer}"
+        if (value.kind == "f64") result = f64Text(bootstrapEvalAsF64(value))
+        if (value.kind == "f32") {
+            result = f64Text(f32ToF64(bootstrapEvalAsF32(value)))
+        }
         if (value.kind == "boolean") {
             result = if (value.boolean) "true" else "false"
         }
@@ -4689,6 +4829,19 @@ class BootstrapEvaluator(
         // Compile-time code cannot reach raw memory; ablaAtCompileTime lets the
         // standard library take a plain path here.
         if (targetName == "ablaAtCompileTime") result = bootstrapEvalBoolean(true)
+        val floatIntrinsic = bootstrapEvalFloatIntrinsic(targetName)
+        if (floatIntrinsic && expression.children.size == 1) {
+            result = bootstrapEvalFloatCall(
+                targetName, this.evaluate(expression.children[0])
+            )
+            if (result.kind == "invalid") {
+                this.errors = this.errors + 1
+                this.recordEvaluatorDiagnostic(
+                    "E_EVAL_INTRINSIC_ARGUMENT",
+                    "$targetName expected a number"
+                )
+            }
+        }
         if (targetName == "ablaByteEncode") {
             val byte = this.evaluate(expression.children[0])
             if (byte.kind == "integer") {
@@ -8866,7 +9019,18 @@ class BootstrapEvaluator(
             val value = this.evaluate(expression.children[0])
             var integer = value.integer
             if (expression.kind == "unary-") integer = -integer
-            result = bootstrapEvalInteger(integer)
+            result = if (value.kind == "f64") {
+                if (expression.kind == "unary-") {
+                    bootstrapEvalF64(-bootstrapEvalAsF64(value))
+                } else value
+            } else if (value.kind == "f32") {
+                if (expression.kind == "unary-") {
+                    bootstrapEvalF32(-bootstrapEvalAsF32(value))
+                } else value
+            } else bootstrapEvalInteger(integer)
+        }
+        if (expression.kind == "float") {
+            result = bootstrapEvalF64(f64Parse(expression.text))
         }
         if (expression.kind == "unary!") {
             val value = this.evaluate(expression.children[0])
@@ -8893,6 +9057,18 @@ class BootstrapEvaluator(
             result = if (expression.kind == "+" && leftValue.kind == "string" &&
                 rightValue.kind == "string") {
                 bootstrapEvalString("${leftValue.text}${rightValue.text}")
+            } else if (leftValue.kind == "f64" && rightValue.kind == "f64") {
+                bootstrapEvalF64(bootstrapEvalF64Arithmetic(
+                    expression.kind,
+                    bootstrapEvalAsF64(leftValue),
+                    bootstrapEvalAsF64(rightValue)
+                ))
+            } else if (leftValue.kind == "f32" && rightValue.kind == "f32") {
+                bootstrapEvalF32(bootstrapEvalF32Arithmetic(
+                    expression.kind,
+                    bootstrapEvalAsF32(leftValue),
+                    bootstrapEvalAsF32(rightValue)
+                ))
             } else bootstrapEvalInteger(value)
         }
         if (expression.kind == "&" || expression.kind == "|" ||
@@ -8919,12 +9095,25 @@ class BootstrapEvaluator(
         }
         if (expression.kind == "<" || expression.kind == "<=" ||
             expression.kind == ">" || expression.kind == ">=") {
-            val left = this.evaluate(expression.children[0]).integer
-            val right = this.evaluate(expression.children[1]).integer
+            val leftValue = this.evaluate(expression.children[0])
+            val rightValue = this.evaluate(expression.children[1])
+            val left = leftValue.integer
+            val right = rightValue.integer
             var value = left < right
             if (expression.kind == "<=") value = left <= right
             if (expression.kind == ">") value = left > right
             if (expression.kind == ">=") value = left >= right
+            if (bootstrapEvalFloat(leftValue) && bootstrapEvalFloat(rightValue)) {
+                value = bootstrapEvalF64Compare(
+                    expression.kind,
+                    if (leftValue.kind == "f32") {
+                        f32ToF64(bootstrapEvalAsF32(leftValue))
+                    } else bootstrapEvalAsF64(leftValue),
+                    if (rightValue.kind == "f32") {
+                        f32ToF64(bootstrapEvalAsF32(rightValue))
+                    } else bootstrapEvalAsF64(rightValue)
+                )
+            }
             result = bootstrapEvalBoolean(value)
         }
         if (expression.kind == "&&") {
