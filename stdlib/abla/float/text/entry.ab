@@ -1,0 +1,230 @@
+// f64 as text: the shortest decimal that reads back as exactly the value, written the
+// way JavaScript's Number#toString writes it, so text a program writes matches what a
+// JavaScript tool wrote before it.
+
+import "abla/float"
+
+/** `value` as the shortest decimal that reads back as exactly it, written the way
+ *  JavaScript's Number#toString writes it: "0.1", "100", "1.5e-7", "1e+21", "-0.25";
+ *  NaN, "Infinity", "-Infinity", and "0" for both zeros. */
+fun f64Text(value: f64): string {
+    if (value != value) return "NaN"
+    val bits = f64ToBits(value)
+    val negative = bits < 0
+    val exponentBits = (bits >> 52) & 2047
+    val fractionBits = bits & 4503599627370495
+    if (exponentBits == 2047) return if (negative) "-Infinity" else "Infinity"
+    if (exponentBits == 0 && fractionBits == 0) return "0"
+    // A whole number below 2^53 is its integer.
+    val whole = f64ToInt(value)
+    if (f64FromInt(whole) == value && whole < 9007199254740992 && whole > -9007199254740992) return "$whole"
+    val digits = f64TextDigits(exponentBits, fractionBits)
+    // digits[0] is the decimal point's position n (value = 0.d1d2… × 10^n); the rest the digits.
+    val n = digits[0]
+    var text = ""
+    for (i in 1 until digits.size) text = "$text${digits[i]}"
+    val count = digits.size - 1
+    val sign = if (negative) "-" else ""
+    if (count <= n && n <= 21) {
+        var zeros = ""
+        for (i in 0 until n - count) zeros = "${zeros}0"
+        return "$sign$text$zeros"
+    }
+    if (0 < n && n <= 21) return "$sign${text.slice(0, n)}.${text.slice(n, count)}"
+    if (-6 < n && n <= 0) {
+        var zeros = ""
+        for (i in 0 until 0 - n) zeros = "${zeros}0"
+        return "${sign}0.$zeros$text"
+    }
+    val power = n - 1
+    val mantissa = if (count == 1) text else "${text.slice(0, 1)}.${text.slice(1, count)}"
+    "$sign${mantissa}e${if (power < 0) "-" else "+"}${if (power < 0) 0 - power else power}"
+}
+
+// The shortest digits (Steele & White / Burger & Dybvig's free-format algorithm on exact
+// big integers): [the point's position, digit, digit, …].
+fun f64TextDigits(exponentBits: int, fractionBits: int): array<int> {
+    val f = if (exponentBits == 0) fractionBits else fractionBits + 4503599627370496
+    val e = if (exponentBits == 0) -1074 else exponentBits - 1075
+    // The bounds are halfway to the neighbours; at a power of two the one below is closer.
+    val unequal = exponentBits > 1 && fractionBits == 0
+    var r: array<int> = []
+    var s: array<int> = []
+    var mPlus: array<int> = []
+    var mMinus: array<int> = []
+    if (e >= 0) {
+        if (!unequal) {
+            r = f64BigShift(f64BigOf(f), e + 1)
+            s = f64BigOf(2)
+            mPlus = f64BigShift(f64BigOf(1), e)
+            mMinus = f64BigShift(f64BigOf(1), e)
+        } else {
+            r = f64BigShift(f64BigOf(f), e + 2)
+            s = f64BigOf(4)
+            mPlus = f64BigShift(f64BigOf(1), e + 1)
+            mMinus = f64BigShift(f64BigOf(1), e)
+        }
+    } else {
+        if (!unequal) {
+            r = f64BigOf(f * 2)
+            s = f64BigShift(f64BigOf(1), 1 - e)
+            mPlus = f64BigOf(1)
+            mMinus = f64BigOf(1)
+        } else {
+            r = f64BigOf(f * 4)
+            s = f64BigShift(f64BigOf(1), 2 - e)
+            mPlus = f64BigOf(2)
+            mMinus = f64BigOf(1)
+        }
+    }
+    // An even significand may land on its bounds (round half to even reads back to it).
+    val even = (f & 1) == 0
+    // The point's position: start from log10 of the binary exponent, then settle it.
+    var bitLength = 0
+    var probe = f
+    while (probe > 0) {
+        bitLength += 1
+        probe = probe >> 1
+    }
+    var k = ((e + bitLength - 1) * 315653) >> 20
+    if (k >= 0) s = f64BigTimesTen(s, k)
+    else {
+        r = f64BigTimesTen(r, 0 - k)
+        mPlus = f64BigTimesTen(mPlus, 0 - k)
+        mMinus = f64BigTimesTen(mMinus, 0 - k)
+    }
+    var settling = true
+    while (settling) {
+        val high = f64BigCompare(f64BigAdd(r, mPlus), s)
+        if (high > 0 || (even && high == 0)) {
+            s = f64BigTimesTen(s, 1)
+            k += 1
+        } else settling = false
+    }
+    settling = true
+    while (settling) {
+        val high = f64BigCompare(f64BigTimesTen(f64BigAdd(r, mPlus), 1), s)
+        if (high < 0 || (!even && high == 0)) {
+            r = f64BigTimesTen(r, 1)
+            mPlus = f64BigTimesTen(mPlus, 1)
+            mMinus = f64BigTimesTen(mMinus, 1)
+            k -= 1
+        } else settling = false
+    }
+    val out: array<int> = [k]
+    var generating = true
+    while (generating) {
+        r = f64BigTimesTen(r, 1)
+        mPlus = f64BigTimesTen(mPlus, 1)
+        mMinus = f64BigTimesTen(mMinus, 1)
+        var digit = 0
+        while (f64BigCompare(r, s) >= 0) {
+            r = f64BigSubtract(r, s)
+            digit += 1
+        }
+        val low = f64BigCompare(r, mMinus)
+        val high = f64BigCompare(f64BigAdd(r, mPlus), s)
+        val tc1 = low < 0 || (even && low == 0)
+        val tc2 = high > 0 || (even && high == 0)
+        if (!tc1 && !tc2) out.append(digit)
+        else {
+            generating = false
+            if (tc1 && !tc2) out.append(digit)
+            else if (!tc1 && tc2) out.append(digit + 1)
+            else {
+                // Both ends reach: the nearer digit, the even one on a tie.
+                val twice = f64BigCompare(f64BigShift(r, 1), s)
+                out.append(if (twice < 0 || (twice == 0 && digit % 2 == 0)) digit else digit + 1)
+            }
+        }
+    }
+    out
+}
+
+// Little-endian base 2^32 naturals.
+
+fun f64BigOf(value: int): array<int> {
+    val out: array<int> = []
+    var v = value
+    while (v > 0) {
+        out.append(v & 4294967295)
+        v = v >> 32
+    }
+    out
+}
+
+fun f64BigShift(value: array<int>, bits: int): array<int> {
+    val out: array<int> = []
+    for (i in 0 until bits / 32) out.append(0)
+    val shift = bits % 32
+    var carry = 0
+    for (limb in value) {
+        out.append(((limb << shift) & 4294967295) | carry)
+        carry = if (shift == 0) 0 else limb >> (32 - shift)
+    }
+    if (carry > 0) out.append(carry)
+    out
+}
+
+fun f64BigTimesTen(value: array<int>, times: int): array<int> {
+    val out: array<int> = []
+    for (limb in value) out.append(limb)
+    for (t in 0 until times) {
+        var carry = 0
+        for (i in 0 until out.size) {
+            val product = out[i] * 10 + carry
+            out[i] = product & 4294967295
+            carry = product >> 32
+        }
+        if (carry > 0) out.append(carry)
+    }
+    out
+}
+
+fun f64BigAdd(a: array<int>, b: array<int>): array<int> {
+    val out: array<int> = []
+    var carry = 0
+    var i = 0
+    while (i < a.size || i < b.size || carry > 0) {
+        val sum = (if (i < a.size) a[i] else 0) + (if (i < b.size) b[i] else 0) + carry
+        out.append(sum & 4294967295)
+        carry = sum >> 32
+        i += 1
+    }
+    out
+}
+
+/** a - b, for a >= b. */
+fun f64BigSubtract(a: array<int>, b: array<int>): array<int> {
+    val out: array<int> = []
+    var borrow = 0
+    for (i in 0 until a.size) {
+        var difference = a[i] - (if (i < b.size) b[i] else 0) - borrow
+        borrow = 0
+        if (difference < 0) {
+            difference += 4294967296
+            borrow = 1
+        }
+        out.append(difference)
+    }
+    var size = out.size
+    while (size > 0 && out[size - 1] == 0) size -= 1
+    if (size == out.size) return out
+    val trimmed: array<int> = []
+    for (i in 0 until size) trimmed.append(out[i])
+    trimmed
+}
+
+fun f64BigCompare(a: array<int>, b: array<int>): int {
+    var sa = a.size
+    while (sa > 0 && a[sa - 1] == 0) sa -= 1
+    var sb = b.size
+    while (sb > 0 && b[sb - 1] == 0) sb -= 1
+    if (sa != sb) return if (sa < sb) -1 else 1
+    var i = sa - 1
+    while (i >= 0) {
+        if (a[i] != b[i]) return if (a[i] < b[i]) -1 else 1
+        i -= 1
+    }
+    0
+}

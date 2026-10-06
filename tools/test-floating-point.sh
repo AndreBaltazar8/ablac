@@ -25,6 +25,15 @@ set -e
 test "$math_status" -eq 42
 
 "$compiler" build \
+    "$project_root/tests/cases/modules/floating-text.ab" \
+    -o "$output_root/floating-text" --no-cache
+set +e
+"$output_root/floating-text"
+text_status=$?
+set -e
+test "$text_status" -eq 42
+
+"$compiler" build \
     "$project_root/tests/cases/modules/floating-f32-storage.ab" \
     -o "$output_root/floating-f32-storage" --no-cache
 set +e
