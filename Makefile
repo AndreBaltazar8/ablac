@@ -80,6 +80,7 @@ test: ablac
 	tools/test-array-filled.sh $(COMPILER)
 	tools/test-memory-checkpoint.sh $(COMPILER)
 	tools/test-arrays-dense.sh $(COMPILER)
+	tools/test-json-limits.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)
