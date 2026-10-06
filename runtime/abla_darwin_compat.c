@@ -591,6 +591,9 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 90:
     result = chmod((const char *)(uintptr_t)argument0, (mode_t)argument1);
     break;
+  case 95:
+    result = umask((mode_t)argument0);
+    break;
   case 109:
     result = setpgid((pid_t)argument0, (pid_t)argument1);
     break;

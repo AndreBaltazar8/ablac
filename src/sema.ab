@@ -3228,16 +3228,47 @@ fun bootstrapFirstCompileEffect(mask: int): int {
     result
 }
 
-// Explains a denied compile effect as a call path. `visited` holds the
-// declarations already explored: without it the depth-bounded search is
-// exponential in shared callees (abla/fs alone made `#$jsons` never finish).
+// Search a call graph rather than expanding every recursive call path. A
+// declaration reached at an equal or greater depth cannot reveal a new path;
+// revisit it only when a shorter route leaves more of the diagnostic depth budget.
+fun bootstrapCompileEffectPathVisit(
+    key: string,
+    depth: int,
+    var keys: array<string>,
+    var depths: array<int>
+): bool {
+    var index = 0
+    while (index < keys.size) {
+        if (keys[index] == key) {
+            if (depth >= depths[index]) return false
+            depths[index] = depth
+            return true
+        }
+        index = index + 1
+    }
+    keys.append(key)
+    depths.append(depth)
+    true
+}
+
 fun bootstrapCompileEffectPath(
     expression: BootstrapExpression,
     declarations: array<BootstrapDeclaration>,
     summary: BootstrapCompileEffectSummary,
     effect: int,
+    depth: int
+): string = bootstrapCompileEffectPathSearch(
+    expression, declarations, summary, effect, depth, [], []
+)
+
+fun bootstrapCompileEffectPathSearch(
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>,
+    summary: BootstrapCompileEffectSummary,
+    effect: int,
     depth: int,
-    var visited: array<string>
+    var visitedKeys: array<string>,
+    var visitedDepths: array<int>
 ): string {
     var path = ""
     if (depth < 32 && expression.kind == "call") {
@@ -3253,7 +3284,6 @@ fun bootstrapCompileEffectPath(
                     )) path = candidate.name
                 if ((candidate.kind == "fun" ||
                      candidate.kind == "compile.fun") &&
-                    !bootstrapCompileEffectVisited(visited, candidate.name) &&
                     bootstrapCompileEffectHas(
                         bootstrapCompileEffectLookup(
                             summary,
@@ -3261,15 +3291,17 @@ fun bootstrapCompileEffectPath(
                             false
                         ),
                         effect
+                    ) && bootstrapCompileEffectPathVisit(
+                        "function:$declaration", depth, visitedKeys, visitedDepths
                     )) {
-                    visited.append(candidate.name)
-                    val nested = bootstrapCompileEffectPath(
+                    val nested = bootstrapCompileEffectPathSearch(
                         candidate.expression,
                         declarations,
                         summary,
                         effect,
                         depth + 1,
-                        visited
+                        visitedKeys,
+                        visitedDepths
                     )
                     if (nested != "") path = "${candidate.name}->$nested"
                 }
@@ -3286,9 +3318,6 @@ fun bootstrapCompileEffectPath(
             while (path == "" && method < owner.methods.size) {
                 val candidate = owner.methods[method]
                 if (candidate.name == expression.text &&
-                    !bootstrapCompileEffectVisited(
-                        visited, "${owner.name}.${candidate.name}"
-                    ) &&
                     bootstrapCompileEffectHas(
                         bootstrapCompileEffectLookup(
                             summary,
@@ -3296,15 +3325,17 @@ fun bootstrapCompileEffectPath(
                             true
                         ),
                         effect
+                    ) && bootstrapCompileEffectPathVisit(
+                        "method:$declaration:$method", depth, visitedKeys, visitedDepths
                     )) {
-                    visited.append("${owner.name}.${candidate.name}")
-                    val nested = bootstrapCompileEffectPath(
+                    val nested = bootstrapCompileEffectPathSearch(
                         candidate.expression,
                         declarations,
                         summary,
                         effect,
                         depth + 1,
-                        visited
+                        visitedKeys,
+                        visitedDepths
                     )
                     if (nested != "") {
                         path = "${owner.name}.${candidate.name}->$nested"
@@ -3317,27 +3348,18 @@ fun bootstrapCompileEffectPath(
     }
     var child = 0
     while (path == "" && child < bootstrapCompileTimeChildEnd(expression)) {
-        path = bootstrapCompileEffectPath(
+        path = bootstrapCompileEffectPathSearch(
             expression.children[child],
             declarations,
             summary,
             effect,
             depth,
-            visited
+            visitedKeys,
+            visitedDepths
         )
         child = child + 1
     }
     path
-}
-
-fun bootstrapCompileEffectVisited(visited: array<string>, name: string): bool {
-    var found = false
-    var index = 0
-    while (!found && index < visited.size) {
-        found = visited[index] == name
-        index = index + 1
-    }
-    found
 }
 
 fun bootstrapCompileEffectFromName(name: string): int {
@@ -7496,14 +7518,12 @@ class BootstrapAnalyzer(
             )
             val denied = bootstrapCompileEffectName(deniedEffects)
             if (denied != "") {
-                val visited: array<string> = []
                 val path = bootstrapCompileEffectPath(
                     expression.children[0],
                     this.declarations,
                     this.compileEffects,
                     bootstrapFirstCompileEffect(deniedEffects),
-                    0,
-                    visited
+                    0
                 )
                 this.fail("compile.effect-denied:$denied:$path")
             }
