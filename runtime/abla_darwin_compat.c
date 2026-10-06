@@ -9,6 +9,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -365,6 +367,17 @@ static long darwin_epoll_wait(int descriptor, unsigned char *output,
   return measured;
 }
 
+// Darwin has no procfs. The one path the toolchain reads, `/proc/self/exe`
+// (its own image, for the build cache identity and to re-run itself), names
+// the running executable.
+static const char *darwin_linux_path(const char *path, char *buffer) {
+  uint32_t size = PATH_MAX;
+  if (path != NULL && strcmp(path, "/proc/self/exe") == 0 &&
+      _NSGetExecutablePath(buffer, &size) == 0)
+    return buffer;
+  return path;
+}
+
 int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                                   int64_t argument1, int64_t argument2,
                                   int64_t argument3, int64_t argument4,
@@ -523,11 +536,14 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 57:
     result = fork();
     break;
-  case 59:
-    result = execve((const char *)(uintptr_t)argument0,
-                    (char *const *)(uintptr_t)argument1,
-                    (char *const *)(uintptr_t)argument2);
+  case 59: {
+    char executable[PATH_MAX];
+    result = execve(
+        darwin_linux_path((const char *)(uintptr_t)argument0, executable),
+        (char *const *)(uintptr_t)argument1,
+        (char *const *)(uintptr_t)argument2);
     break;
+  }
   case 60:
   case 231:
     _exit((int)argument0);
@@ -596,16 +612,21 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
         darwin_epoll_control((int)argument0, (int)argument1, (int)argument2,
                              (const void *)(uintptr_t)argument3);
     break;
-  case 257:
-    result = openat(argument0 == -100 ? AT_FDCWD : (int)argument0,
-                    (const char *)(uintptr_t)argument1,
-                    darwin_open_flags(argument2), (mode_t)argument3);
+  case 257: {
+    char executable[PATH_MAX];
+    result = openat(
+        argument0 == -100 ? AT_FDCWD : (int)argument0,
+        darwin_linux_path((const char *)(uintptr_t)argument1, executable),
+        darwin_open_flags(argument2), (mode_t)argument3);
     break;
+  }
   case 262: {
     struct stat information;
-    result = fstatat(argument0 == -100 ? AT_FDCWD : (int)argument0,
-                     (const char *)(uintptr_t)argument1, &information,
-                     (int)argument3);
+    char executable[PATH_MAX];
+    result = fstatat(
+        argument0 == -100 ? AT_FDCWD : (int)argument0,
+        darwin_linux_path((const char *)(uintptr_t)argument1, executable),
+        &information, (int)argument3);
     if (result == 0) {
       unsigned char *output = (unsigned char *)(uintptr_t)argument2;
       memset(output, 0, 144);

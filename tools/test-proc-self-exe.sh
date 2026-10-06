@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# `/proc/self/exe` reads the running program's image (on Darwin too), so the
+# build cache keys on the compiler that built an object.
+set -euo pipefail
+
+compiler=${1:-build/ablac.bin}
+project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+output_directory="$project_root/build/proc-self-exe"
+mkdir -p "$output_directory"
+
+"$compiler" build "$project_root/tests/cases/modules/proc-self-exe.ab" \
+    -o "$output_directory/program" --no-cache
+size=$(wc -c < "$output_directory/program" | tr -d ' ')
+output=$("$output_directory/program")
+[[ $output == "$size $size" ]] || exit 1
+echo "proc self exe: the program reads its own $size-byte image"

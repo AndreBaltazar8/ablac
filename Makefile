@@ -86,6 +86,7 @@ test: ablac
 	tools/test-main-void.sh $(COMPILER)
 	tools/test-module-shadowing.sh $(COMPILER)
 	tools/test-string-helpers.sh $(COMPILER)
+	tools/test-proc-self-exe.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)
