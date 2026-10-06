@@ -43,6 +43,15 @@ rg '^define internal .* @abla_fn_.*_direct\(' "$output/renamed.ll" \
 cmp "$output/original-symbols" "$output/renamed-symbols"
 [[ $(wc -l < "$output/original-symbols") -gt 2 ]]
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/import-alias-externs.ab" \
+    -o "$output/import-alias-externs" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" "$output/import-alias-externs"
+alias_externs_status=$?
+set -e
+[[ $alias_externs_status -eq 42 ]]
+
 check_invalid() {
     local fixture=$1
     local code=$2
