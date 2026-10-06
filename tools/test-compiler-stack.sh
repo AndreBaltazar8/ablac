@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The compiler raises its own stack limit: a deeply nested program builds
-# under the default 8 MB soft limit without the build/ablac launcher.
+# under the default 8 MB soft limit without the build/ablac launcher. A
+# program without `fun main` is named as such.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -20,6 +21,11 @@ mkdir -p "$output_directory"
 set +e
 "$output_directory/program"
 status=$?
+"$compiler" build "$project_root/tests/cases/modules/invalid-no-main.ab" \
+    -o "$output_directory/no-main" --no-cache \
+    > "$output_directory/no-main.out" 2> "$output_directory/no-main.err"
+no_main=$?
 set -e
-[[ $status -eq 42 ]] || exit 1
-echo "compiler stack: deep nesting builds on an 8 MB soft limit"
+[[ $status -eq 42 && $no_main -ne 0 ]] || exit 1
+grep -q 'E_NO_MAIN' "$output_directory/no-main.err"
+echo "compiler stack: deep nesting builds on an 8 MB soft limit; no main is named"
