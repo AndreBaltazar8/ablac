@@ -69,6 +69,7 @@ test: ablac
 	tools/test-native-width-integers.sh $(COMPILER)
 	tools/test-fixed-width-boxed-arithmetic.sh $(COMPILER)
 	tools/test-closure-captures.sh $(COMPILER)
+	tools/test-narrowing-and-branches.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)
