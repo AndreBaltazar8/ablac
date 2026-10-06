@@ -39,6 +39,13 @@ fun bootstrapPlaceRootName(expression: BootstrapExpression): string {
     root
 }
 
+// The name a place key (`rows`, `h.items[0]`, `b.list`) starts with.
+fun bootstrapOwnershipKeyRoot(key: string): string {
+    var end = 0
+    while (end < key.size && key[end] != 46 && key[end] != 91) end = end + 1
+    key.slice(0, end)
+}
+
 fun bootstrapOwnershipPlaceKey(expression: BootstrapExpression): string {
     var key = ""
     var place = expression
@@ -197,15 +204,19 @@ fun bootstrapOwnerHasField(
 }
 
 // `this`, or a bare field name no parameter or local shadows here.
+// `aliases` are loop variables over the receiver's arrays (`for (n in
+// this.nodes)`): mutating through them mutates the receiver.
 fun bootstrapReceiverPlaceRoot(
     expression: BootstrapExpression,
     declarations: array<BootstrapDeclaration>,
     owner: string,
-    shadowed: array<string>
+    shadowed: array<string>,
+    aliases: array<string>
 ): bool {
     val root = bootstrapPlaceRootName(expression)
     root == "this" || (!bootstrapAffineNamesContain(shadowed, root) &&
-        bootstrapOwnerHasField(declarations, owner, root))
+        (bootstrapAffineNamesContain(aliases, root) ||
+         bootstrapOwnerHasField(declarations, owner, root)))
 }
 
 fun bootstrapNamesWith(names: array<string>, more: array<string>): array<string> {
@@ -469,7 +480,8 @@ fun bootstrapExpressionMayMutateReceiver(
     owner: string,
     summary: BootstrapMutableReceiverSummary,
     exclusive: BootstrapExclusiveArguments,
-    shadowed: array<string>
+    shadowed: array<string>,
+    aliases: array<string>
 ): bool {
     var mutates = expression.kind == "assign" &&
         !bootstrapAffineNamesContain(shadowed, expression.text) &&
@@ -480,7 +492,8 @@ fun bootstrapExpressionMayMutateReceiver(
             expression.children[0],
             declarations,
             owner,
-            shadowed
+            shadowed,
+            aliases
         )
     }
     if (!mutates && expression.kind == "index.assign" &&
@@ -489,7 +502,8 @@ fun bootstrapExpressionMayMutateReceiver(
             expression.children[0],
             declarations,
             owner,
-            shadowed
+            shadowed,
+            aliases
         )
     }
     if (!mutates && expression.kind == "member.call" &&
@@ -510,7 +524,8 @@ fun bootstrapExpressionMayMutateReceiver(
                 expression.children[0],
                 declarations,
                 owner,
-                shadowed
+                shadowed,
+                aliases
             )) mutates = true
         var argument = 1
         while (!mutates && argument < expression.children.size) {
@@ -523,7 +538,8 @@ fun bootstrapExpressionMayMutateReceiver(
                     expression.children[argument],
                     declarations,
                     owner,
-                    shadowed
+                    shadowed,
+                    aliases
                 )) mutates = true
             argument = argument + 1
         }
@@ -540,7 +556,8 @@ fun bootstrapExpressionMayMutateReceiver(
                     expression.children[argument],
                     declarations,
                     owner,
-                    shadowed
+                    shadowed,
+                    aliases
                 )) mutates = true
             argument = argument + 1
         }
@@ -560,17 +577,27 @@ fun bootstrapExpressionMayMutateReceiver(
         }
         scope = bootstrapNamesWith(shadowed, parameters)
     }
+    // A loop over the receiver's array aliases it; any other loop variable
+    // shadows a field of its name.
+    val aliasing = expression.kind == "for" && expression.children.size > 1 &&
+        bootstrapReceiverPlaceRoot(
+            expression.children[0], declarations, owner, shadowed, aliases
+        )
     while (!mutates && child < expression.children.size) {
         val found = expression.children[child]
+        val body = expression.kind == "for" && child == 1
         mutates = bootstrapExpressionMayMutateReceiver(
             found,
             declarations,
             owner,
             summary,
             exclusive,
-            if (expression.kind == "for" && child == 1) {
+            if (body && !aliasing) {
                 bootstrapNamesWith(scope, [expression.text])
-            } else scope
+            } else scope,
+            if (body && aliasing) {
+                bootstrapNamesWith(aliases, [expression.text])
+            } else aliases
         )
         if (expression.kind == "block" &&
             (found.kind == "local.val" || found.kind == "local.var")) {
@@ -616,7 +643,8 @@ fun bootstrapBuildMutableReceiverSummary(
                     extensionOwner,
                     summary,
                     exclusive,
-                    candidate.parameters
+                    candidate.parameters,
+                    []
                 )) {
                 summary.owners.append(extensionOwner)
                 summary.methods.append(candidate.name)
@@ -641,7 +669,8 @@ fun bootstrapBuildMutableReceiverSummary(
                             candidate.name,
                             summary,
                             exclusive,
-                            found.parameters
+                            found.parameters,
+                            []
                         )) {
                         summary.owners.append(candidate.name)
                         summary.methods.append(found.name)
@@ -6009,6 +6038,7 @@ class BootstrapAnalyzer(
             val rootKind = this.visibleLocalKind(values[0])
             if (rootKind == "parameter") valid = false
             if (bootstrapIsBorrowType(this.findType(values[0]))) valid = false
+            if (this.isSharedLoopElement(values[0])) valid = false
         } else if (values.size > 0) {
             val rootKind = this.findKind(values[0])
             valid = rootKind == "val" || rootKind == "var"
@@ -6034,14 +6064,42 @@ class BootstrapAnalyzer(
         if (!valid) this.fail("ownership.mutable-borrow:$context")
     }
 
+    /** Whether the local `name` is a loop element of a shared parameter. */
+    fun isSharedLoopElement(name: string): bool {
+        val source = this.visibleBorrowSource(name)
+        source.size > 7 && source.slice(0, 7) == "shared:"
+    }
+
+    /** The shared (not `var`) parameter or receiver that `place` reads from,
+     *  through borrowed locals and loop elements (`val b = rows; for (r in b)`),
+     *  or "" when it reads from none. */
+    fun sharedParameterRoot(place: BootstrapExpression): string {
+        var root = bootstrapPlaceRootName(place)
+        var depth = 0
+        while (root != "" && depth < 16 && this.hasVisibleLocal(root) &&
+               this.visibleLocalKind(root) != "parameter") {
+            val source = this.visibleBorrowSource(root)
+            if (source.size > 7 && source.slice(0, 7) == "shared:") {
+                root = source.slice(7, source.size)
+            } else if (bootstrapIsBorrowType(this.findType(root))) {
+                root = bootstrapOwnershipKeyRoot(source)
+            } else root = ""
+            depth = depth + 1
+        }
+        if (root != "" && this.hasVisibleLocal(root) &&
+            this.visibleLocalKind(root) == "parameter" &&
+            this.typeIsBorrowTracked(this.findType(root))) root else ""
+    }
+
     fun validateBorrowMutation(
         receiver: BootstrapExpression,
         context: string
     ): void {
         val root = bootstrapPlaceRootName(receiver)
         if (root != "" && this.hasVisibleLocal(root) &&
-            this.visibleLocalKind(root) == "parameter" &&
-            this.typeIsBorrowTracked(this.findType(root))) {
+            ((this.visibleLocalKind(root) == "parameter" &&
+              this.typeIsBorrowTracked(this.findType(root))) ||
+             this.isSharedLoopElement(root))) {
             this.fail("ownership.borrow-mutation:$context:$root")
         }
     }
@@ -8822,10 +8880,16 @@ class BootstrapAnalyzer(
             }
             if (sourceType == "string") elementType = "i64"
             if (elementType == "unknown") this.fail("for.source")
-            // An element of a global's array is as lasting as the global.
+            // An element of a global's array is as lasting as the global; one
+            // of a shared parameter's array is read-only like the parameter
+            // (`for (row in rows) row.append(x)` mutates the caller's rows).
+            val sharedRoot = this.sharedParameterRoot(expression.children[0])
             val elementSource =
                 if (this.managedReferenceIsStatic(expression.children[0])) {
                     "managed.static"
+                } else if (sharedRoot != "" &&
+                           this.typeNeedsManagedAliasTracking(elementType)) {
+                    "shared:$sharedRoot"
                 } else ""
             val previousScope = this.enterScope()
             this.locals.append(BootstrapSymbol(

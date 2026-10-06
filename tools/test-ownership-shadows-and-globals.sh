@@ -73,4 +73,25 @@ grep -q 'in `Box.grow`, `this.items` is changed while `shared`' \
     "$output_directory/borrow-conflict.out"
 grep -q '0 semantic, 2 IR, 2 total error' "$output_directory/borrow-conflict.out"
 
-printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return; returned objects may store parameters; borrow conflicts are named'
+"$compiler" build "$cases/shared-loop-elements.ab" \
+    -o "$output_directory/shared-loop" --no-cache --fast
+set +e
+"$output_directory/shared-loop"
+status=$?
+set -e
+[[ $status -eq 42 ]]
+
+for invalid in invalid-shared-loop-append invalid-shared-loop-nested \
+    invalid-shared-loop-var-argument; do
+    set +e
+    "$compiler" build "$cases/$invalid.ab" \
+        -o "$output_directory/$invalid" --no-cache --fast \
+        > "$output_directory/$invalid.out" 2>&1
+    loop_status=$?
+    set -e
+    [[ $loop_status -ne 0 ]]
+    grep -q 'ownership\.\(borrow-mutation\|mutable-borrow\)' \
+        "$output_directory/$invalid.out"
+done
+
+printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return; returned objects may store parameters; borrow conflicts are named; shared loop elements stay read-only'
