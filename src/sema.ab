@@ -6712,7 +6712,8 @@ class BootstrapAnalyzer(
     ): void {
         if (bootstrapIsBorrowType(actual)) {
             if (this.currentBorrowResultSource == "") {
-                if (!this.borrowsOnlyFreshLocals(expression)) {
+                if (!this.borrowsOnlyFreshLocals(expression) &&
+                    !this.managedReferenceIsStatic(expression)) {
                     this.fail("ownership.borrow-escape:$context")
                 }
             } else {
@@ -6731,13 +6732,62 @@ class BootstrapAnalyzer(
                        expression,
                        0,
                        true
-                   )) {
+                   ) && !this.managedReferenceIsStatic(expression)) {
             var source = this.managedReturnParameterSource(expression)
             if (source == "") source = "nonfresh"
             this.fail(
                 "ownership.managed-return-borrow-contract:$context:$source"
             )
         }
+    }
+
+    // A place rooted in a global (`store.rows[i]`), or in a local read from
+    // one: the global outlives every call, so a reference into it may be
+    // returned without a borrow contract.
+    fun managedReferenceIsStatic(expression: BootstrapExpression): bool {
+        if (expression.kind == "block" && expression.children.size > 0) {
+            return this.blockValueIsStatic(
+                expression, expression.children[expression.children.size - 1]
+            )
+        }
+        if (expression.kind == "if" && expression.children.size > 2 &&
+            expression.children[2].kind != "missing") {
+            return this.managedReferenceIsStatic(expression.children[1]) &&
+                this.managedReferenceIsStatic(expression.children[2])
+        }
+        var root = ""
+        if (expression.kind == "identifier" || expression.kind == "member" ||
+            expression.kind == "index") {
+            root = bootstrapPlaceRootName(expression)
+        }
+        if (root == "") false
+        else if (this.hasVisibleLocal(root)) {
+            this.visibleBorrowSource(root) == "managed.static"
+        } else this.findKind(root) == "val" || this.findKind(root) == "var"
+    }
+
+    // A block's value read, through its own `val` locals, from a global.
+    fun blockValueIsStatic(
+        block: BootstrapExpression,
+        value: BootstrapExpression
+    ): bool {
+        if (value.kind == "identifier" || value.kind == "member" ||
+            value.kind == "index") {
+            val root = bootstrapPlaceRootName(value)
+            var statement = block.children.size - 1
+            while (statement >= 0) {
+                val found = block.children[statement]
+                if (found.kind == "local.val" && found.text == root &&
+                    found.children.size > 0) {
+                    return this.blockValueIsStatic(block, found.children[0])
+                }
+                if (found.kind == "local.var" && found.text == root) {
+                    return false
+                }
+                statement = statement - 1
+            }
+        }
+        this.managedReferenceIsStatic(value)
     }
 
     fun managedReturnParameterSource(
@@ -8253,6 +8303,11 @@ class BootstrapAnalyzer(
                         0,
                         true
                     )) borrowSource = "managed.fresh"
+                if (borrowSource == "" && expression.kind == "local.val" &&
+                    !bootstrapIsBorrowType(type) &&
+                    this.managedReferenceIsStatic(expression.children[0])) {
+                    borrowSource = "managed.static"
+                }
                 this.validateOwnershipTransfer(
                     type,
                     expression.children[0],
@@ -8521,13 +8576,18 @@ class BootstrapAnalyzer(
             }
             if (sourceType == "string") elementType = "i64"
             if (elementType == "unknown") this.fail("for.source")
+            // An element of a global's array is as lasting as the global.
+            val elementSource =
+                if (this.managedReferenceIsStatic(expression.children[0])) {
+                    "managed.static"
+                } else ""
             val previousScope = this.enterScope()
             this.locals.append(BootstrapSymbol(
                 expression.text,
                 "val",
                 elementType,
                 this.currentScope,
-                "",
+                elementSource,
                 "abla:${this.currentSourceIdentity}:${expression.begin}:for:${expression.text}"
             ))
             this.loopDepth = this.loopDepth + 1
