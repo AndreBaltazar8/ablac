@@ -1,6 +1,7 @@
-// f64 as text: the shortest decimal that reads back as exactly the value, written the
-// way JavaScript's Number#toString writes it, so text a program writes matches what a
-// JavaScript tool wrote before it.
+// f64 as text and back: the shortest decimal that reads back as exactly the value,
+// written the way JavaScript's Number#toString writes it (f64Text), and decimal text
+// read as the nearest f64 the way Number() and JSON.parse read it (f64Parse), so text a
+// program reads and writes matches what JavaScript does with it.
 
 import "abla/float"
 
@@ -227,4 +228,172 @@ fun f64BigCompare(a: array<int>, b: array<int>): int {
         i -= 1
     }
     0
+}
+
+/** The decimal number in `text` as the nearest f64 (round half to even), the way
+ *  JavaScript's Number() and JSON.parse read it: "0.1", "-12", "1.5e-7", "1E+21",
+ *  ".5", "5."; "Infinity" and "-Infinity"; NaN for anything else (and for "NaN"). */
+fun f64Parse(text: string): f64 = f64ParseRange(text, 0, text.size)
+
+/** f64Parse of text[begin, end), without copying it. */
+fun f64ParseRange(text: string, begin: int, end: int): f64 {
+    var i = begin
+    var negative = false
+    if (i < end && (text[i] == 45 || text[i] == 43)) {
+        negative = text[i] == 45
+        i += 1
+    }
+    if (end - i == 8 && text.slice(i, end) == "Infinity") return if (negative) -1.0 / 0.0 else 1.0 / 0.0
+    // The significant digits (leading zeros dropped), and the power of ten they scale by.
+    val digits: array<int> = []
+    var exponent = 0
+    var seen = false
+    while (i < end && text[i] >= 48 && text[i] <= 57) {
+        if (digits.size > 0 || text[i] != 48) digits.append(text[i] - 48)
+        seen = true
+        i += 1
+    }
+    if (i < end && text[i] == 46) {
+        i += 1
+        while (i < end && text[i] >= 48 && text[i] <= 57) {
+            if (digits.size > 0 || text[i] != 48) digits.append(text[i] - 48)
+            exponent -= 1
+            seen = true
+            i += 1
+        }
+    }
+    if (!seen) return 0.0 / 0.0
+    if (i < end && (text[i] == 101 || text[i] == 69)) {
+        i += 1
+        var exponentNegative = false
+        if (i < end && (text[i] == 45 || text[i] == 43)) {
+            exponentNegative = text[i] == 45
+            i += 1
+        }
+        if (i >= end) return 0.0 / 0.0
+        var e = 0
+        while (i < end && text[i] >= 48 && text[i] <= 57) {
+            if (e < 100000) e = e * 10 + text[i] - 48
+            i += 1
+        }
+        exponent += if (exponentNegative) 0 - e else e
+    }
+    if (i != end) return 0.0 / 0.0
+    // Trailing zeros carry no precision: fold them into the exponent.
+    var count = digits.size
+    while (count > 0 && digits[count - 1] == 0) {
+        count -= 1
+        exponent += 1
+    }
+    val magnitude = if (count == 0) 0.0 else f64ParseDigits(digits, count, exponent)
+    if (negative) f64FromBits(f64ToBits(magnitude) | (1 << 63)) else magnitude
+}
+
+val F64_PARSE_TENS: array<f64> = [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0,
+    100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0, 10000000000000.0,
+    100000000000000.0, 1000000000000000.0, 10000000000000000.0, 100000000000000000.0,
+    1000000000000000000.0, 10000000000000000000.0, 100000000000000000000.0,
+    1000000000000000000000.0, 10000000000000000000000.0]
+
+// digits[0, count) × 10^exponent (count >= 1, no leading or trailing zero digit).
+fun f64ParseDigits(digits: array<int>, count: int, exponent: int): f64 {
+    // Out of range either way, whatever the digits.
+    if (count + exponent > 310) return 1.0 / 0.0
+    if (count + exponent < -330) return 0.0
+    // Exactly representable operands: one correctly rounded IEEE operation.
+    if (count <= 15 && exponent >= -22 && exponent <= 22) {
+        var whole = 0
+        for (k in 0 until count) whole = whole * 10 + digits[k]
+        val w = f64FromInt(whole)
+        return if (exponent >= 0) w * F64_PARSE_TENS[exponent] else w / F64_PARSE_TENS[0 - exponent]
+    }
+    // Exactly, on big integers: the value is n / d.
+    var n = f64BigOf(0)
+    var chunk = 0
+    var chunkDigits = 0
+    for (k in 0 until count) {
+        chunk = chunk * 10 + digits[k]
+        chunkDigits += 1
+        if (chunkDigits == 9 || k == count - 1) {
+            n = f64BigAdd(f64BigTimesTen(n, chunkDigits), f64BigOf(chunk))
+            chunk = 0
+            chunkDigits = 0
+        }
+    }
+    var d = f64BigOf(1)
+    if (exponent >= 0) n = f64BigTimesTen(n, exponent)
+    else d = f64BigTimesTen(d, 0 - exponent)
+    // Scale by 2^k so the quotient has 54 bits: q = floor(n·2^k / d), 2^53 <= q < 2^54
+    // (the bit lengths put it in (2^52, 2^54); one more bit when it lands below 2^53).
+    var k = 53 - (f64BigBits(n) - f64BigBits(d))
+    var top = if (k >= 0) f64BigShift(n, k) else n
+    var bottom = if (k >= 0) d else f64BigShift(d, 0 - k)
+    var q = f64BigQuotient(top, bottom)
+    if (q < 9007199254740992) {
+        k += 1
+        top = if (k >= 0) f64BigShift(n, k) else n
+        bottom = if (k >= 0) d else f64BigShift(d, 0 - k)
+        q = f64BigQuotient(top, bottom)
+    }
+    val inexact = !f64BigDivides(top, bottom)
+    // q·2^-k keeping 53 bits (fewer below 2^-1022: the lowest kept bit is at least 2^-1074),
+    // rounded half to even.
+    val drop = if (k - 1074 > 1) k - 1074 else 1
+    if (drop > 55) return 0.0
+    var out = q >> drop
+    val dropped = q & ((1 << drop) - 1)
+    val half = 1 << (drop - 1)
+    if (dropped > half || (dropped == half && (inexact || (out & 1) == 1))) out += 1
+    var scale = drop - k
+    if (out >= 9007199254740992) {
+        out = out >> 1
+        scale += 1
+    }
+    if (scale > 971) return 1.0 / 0.0
+    if (scale < -1022) return f64FromInt(out) * f64ParsePowerOfTwo(scale + 600) * f64ParsePowerOfTwo(-600)
+    f64FromInt(out) * f64ParsePowerOfTwo(scale)
+}
+
+/** 2^p for a normal exponent (-1022..1023). */
+fun f64ParsePowerOfTwo(p: int): f64 = f64FromBits((p + 1023) << 52)
+
+fun f64BigBits(value: array<int>): int {
+    var size = value.size
+    while (size > 0 && value[size - 1] == 0) size -= 1
+    if (size == 0) return 0
+    var top = value[size - 1]
+    var bits = (size - 1) * 32
+    while (top > 0) {
+        bits += 1
+        top = top >> 1
+    }
+    bits
+}
+
+/** floor(a / b) for a quotient below 2^62. */
+fun f64BigQuotient(a: array<int>, b: array<int>): int {
+    var q = 0
+    var rest = f64BigAdd(a, [])
+    var bit = 62
+    while (bit >= 0) {
+        val shifted = f64BigShift(b, bit)
+        if (f64BigCompare(shifted, rest) <= 0) {
+            rest = f64BigSubtract(rest, shifted)
+            q = q | (1 << bit)
+        }
+        bit -= 1
+    }
+    q
+}
+
+/** Whether b divides a (for a quotient below 2^62). */
+fun f64BigDivides(a: array<int>, b: array<int>): bool {
+    var rest = f64BigAdd(a, [])
+    var bit = 62
+    while (bit >= 0) {
+        val shifted = f64BigShift(b, bit)
+        if (f64BigCompare(shifted, rest) <= 0) rest = f64BigSubtract(rest, shifted)
+        bit -= 1
+    }
+    f64BigCompare(rest, []) == 0
 }
