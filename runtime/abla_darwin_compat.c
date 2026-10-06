@@ -529,6 +529,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                     (char *const *)(uintptr_t)argument2);
     break;
   case 60:
+  case 231:
     _exit((int)argument0);
   case 61:
     result =
