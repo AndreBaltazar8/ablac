@@ -12,10 +12,20 @@ noescape extern:"intrinsic" fun ablaByteChunksJoin(
 // range. Unlike UTF-8 scalar encoding, values above 127 remain one byte.
 fun byteEncode(value: int): string = ablaByteEncode(value)
 
+// Small appends collect in `pending` and join into one chunk every
+// BYTE_BUFFER_PENDING pieces: a document written a token at a time (a JSON
+// encoder's punctuation, keys and numbers) otherwise kept a string and an
+// array slot per token alive until toText. Large appends stay their own
+// chunk, uncopied.
 class ByteBuffer(
     val chunks: array<string>,
-    var byteCount: int
+    var byteCount: int,
+    var pending: array<string> = [],
+    var pendingBytes: int = 0
 )
+
+val BYTE_BUFFER_PENDING = 256
+val BYTE_BUFFER_LARGE = 256
 
 class ByteSlice(
     val buffer: ByteBuffer,
@@ -40,11 +50,33 @@ fun bytes(text: string): ByteBuffer {
 fun ByteBuffer.size(): int = this.byteCount
 
 fun ByteBuffer.appendText(text: string): void {
-    if (text.size > 0) {
+    if (text.size >= BYTE_BUFFER_LARGE) {
+        this.coalesce()
         this.chunks.append(text)
         this.byteCount = this.byteCount + text.size
+    } else if (text.size > 0) {
+        this.pending.append(text)
+        this.pendingBytes = this.pendingBytes + text.size
+        this.byteCount = this.byteCount + text.size
+        if (this.pending.size >= BYTE_BUFFER_PENDING) this.coalesce()
     }
 }
+
+// Joins the pending small appends into one chunk.
+fun ByteBuffer.coalesce(): void {
+    if (this.pending.size > 0) {
+        this.chunks.append(ablaByteChunksJoin(this.pending, this.pendingBytes))
+        this.pending = []
+        this.pendingBytes = 0
+    }
+}
+
+// The buffer's pieces in order: its chunks, then the pending appends.
+fun ByteBuffer.pieceCount(): int = this.chunks.size + this.pending.size
+
+fun ByteBuffer.piece(index: int): string =
+    if (index < this.chunks.size) this.chunks[index]
+    else this.pending[index - this.chunks.size]
 
 // A byte is represented by a one-byte string at the portable language layer.
 // This preserves all 256 values, including bytes originating in files/sockets,
@@ -52,8 +84,7 @@ fun ByteBuffer.appendText(text: string): void {
 fun ByteBuffer.appendByte(byte: string): bool {
     var appended = false
     if (byte.size == 1) {
-        this.chunks.append(byte)
-        this.byteCount = this.byteCount + 1
+        this.appendText(byte)
         appended = true
     }
     appended
@@ -64,8 +95,8 @@ fun ByteBuffer.appendByteValue(value: int): bool =
 
 fun ByteBuffer.appendBuffer(other: ByteBuffer): void {
     var index = 0
-    while (index < other.chunks.size) {
-        this.appendText(other.chunks[index])
+    while (index < other.pieceCount()) {
+        this.appendText(other.piece(index))
         index = index + 1
     }
 }
@@ -74,8 +105,8 @@ fun ByteBuffer.byteAt(index: int): int {
     var result = -1
     var offset = index
     var chunk = 0
-    while (result < 0 && offset >= 0 && chunk < this.chunks.size) {
-        val text = this.chunks[chunk]
+    while (result < 0 && offset >= 0 && chunk < this.pieceCount()) {
+        val text = this.piece(chunk)
         if (offset < text.size) result = text[offset]
         else offset = offset - text.size
         chunk = chunk + 1
@@ -86,8 +117,13 @@ fun ByteBuffer.byteAt(index: int): int {
 fun ByteBuffer.slice(begin: int, end: int): borrow(this) ByteSlice =
     ByteSlice(this, begin, end)
 
-fun ByteBuffer.toText(): string =
-    ablaByteChunksJoin(this.chunks, this.byteCount)
+fun ByteBuffer.toText(): string {
+    if (this.pending.size == 0) return ablaByteChunksJoin(this.chunks, this.byteCount)
+    val pieces: array<string> = []
+    for (chunk in this.chunks) pieces.append(chunk)
+    pieces.append(ablaByteChunksJoin(this.pending, this.pendingBytes))
+    ablaByteChunksJoin(pieces, this.byteCount)
+}
 
 fun ByteSlice.byteAt(index: int): int {
     var result = -1
@@ -102,8 +138,8 @@ fun ByteSlice.toText(): string {
     if (this.isValid()) {
         var chunkBegin = 0
         var index = 0
-        while (index < this.buffer.chunks.size && chunkBegin < this.end) {
-            val chunk = this.buffer.chunks[index]
+        while (index < this.buffer.pieceCount() && chunkBegin < this.end) {
+            val chunk = this.buffer.piece(index)
             val chunkEnd = chunkBegin + chunk.size
             var overlapBegin = this.begin
             if (overlapBegin < chunkBegin) overlapBegin = chunkBegin
