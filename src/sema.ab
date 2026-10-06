@@ -5669,7 +5669,9 @@ class BootstrapAnalyzer(
     fun constructorStoresOnlyFreshLocals(
         block: BootstrapExpression,
         call: BootstrapExpression,
-        depth: int
+        depth: int,
+        allowLocals: bool,
+        allowParameters: bool
     ): bool {
         val declaration = this.typeDeclarations.find(call.text)
         if (declaration < 0) return false
@@ -5689,23 +5691,68 @@ class BootstrapAnalyzer(
                 val argument = call.children[parameter]
                 fresh = this.expressionProducesFreshManagedReference(
                     argument, depth + 1, true
-                ) || this.blockLocalIsFresh(block, argument, depth + 1)
+                ) || (allowLocals &&
+                    this.blockLocalIsFresh(block, argument, depth + 1)) ||
+                    (allowParameters && this.placeOfParameter(block, argument))
             }
             parameter = parameter + 1
         }
         fresh
     }
 
-    /** A returned borrow that only stores the function's own fresh locals
-     *  (`val box = Box(); Pair(box, 1)`): those locals end at the return, so
-     *  nothing they alias outlives it and the borrow is not an escape. */
-    fun borrowsOnlyFreshLocals(expression: BootstrapExpression): bool {
+    /** A returned borrow that is a new object storing only the function's own
+     *  fresh locals (`val box = Box(); Pair(box, 1)`) or its parameters
+     *  (`fun still(root: N): B = B(root)`). The locals end at the return, and a
+     *  stored parameter is shared with the caller as a class with a `var` field
+     *  (or one assigned after construction) already shares it, so the borrow is
+     *  not an escape. */
+    fun returnedBorrowIsOwned(expression: BootstrapExpression): bool {
         var call = expression
+        var allowLocals = true
         if (expression.kind == "block" && expression.children.size > 0) {
             call = expression.children[expression.children.size - 1]
+            // `val b = B(root); b`: the block's own `val` holding such an object.
+            // Its locals may be used after the constructor, so only parameters
+            // and fresh values count there.
+            if (call.kind == "identifier") {
+                allowLocals = false
+                var statement = expression.children.size - 1
+                while (statement > 0) {
+                    statement = statement - 1
+                    val candidate = expression.children[statement]
+                    if (candidate.kind == "local.val" &&
+                        candidate.text == call.text &&
+                        candidate.children.size > 0) {
+                        call = candidate.children[0]
+                        statement = 0
+                    }
+                }
+            }
         }
         call.kind == "call" && this.findKind(call.text) == "class" &&
-            this.constructorStoresOnlyFreshLocals(expression, call, 0)
+            this.constructorStoresOnlyFreshLocals(
+                expression, call, 0, allowLocals, true
+            )
+    }
+
+    /** Whether `expression`, at the tail of `block`, is a parameter, the
+     *  receiver, or a place under one (`h.n`, `h.items[i]`), borrowed shared
+     *  or owned but not `var`, and not shadowed by a local of the block. */
+    fun placeOfParameter(
+        block: BootstrapExpression,
+        expression: BootstrapExpression
+    ): bool {
+        val root = bootstrapPlaceRootName(expression)
+        if (root == "") return false
+        if (block.kind == "block") {
+            for (statement in block.children) {
+                if ((statement.kind == "local.val" ||
+                     statement.kind == "local.var") &&
+                    statement.text == root) return false
+            }
+        }
+        val kind = this.visibleLocalKind(root)
+        kind == "parameter" || kind == "owned.parameter"
     }
 
     // A block's value is fresh when it is fresh itself, a fresh local of the
@@ -5725,7 +5772,9 @@ class BootstrapAnalyzer(
         }
         // `val x = M(); val y = M(); Pair(x, y)`: the locals move into it.
         if (value.kind == "call" && this.findKind(value.text) == "class") {
-            return this.constructorStoresOnlyFreshLocals(block, value, depth)
+            return this.constructorStoresOnlyFreshLocals(
+                block, value, depth, true, false
+            )
         }
         if (value.kind == "if" && value.children.size > 2 &&
             value.children[2].kind != "missing") {
@@ -6844,7 +6893,7 @@ class BootstrapAnalyzer(
     ): void {
         if (bootstrapIsBorrowType(actual)) {
             if (this.currentBorrowResultSource == "") {
-                if (!this.borrowsOnlyFreshLocals(expression) &&
+                if (!this.returnedBorrowIsOwned(expression) &&
                     !this.managedReferenceIsStatic(expression)) {
                     this.fail("ownership.borrow-escape:$context")
                 }

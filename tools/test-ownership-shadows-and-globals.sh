@@ -40,4 +40,24 @@ for invalid in invalid-move-used-after invalid-move-in-loop; do
     grep -q 'ownership\.' "$output_directory/$invalid.out"
 done
 
-printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return'
+"$compiler" build "$cases/constructor-stores-parameter.ab" \
+    -o "$output_directory/stores-parameter" --no-cache --fast
+set +e
+"$output_directory/stores-parameter"
+status=$?
+set -e
+[[ $status -eq 42 ]]
+
+for invalid in invalid-constructor-stores-var-parameter \
+    invalid-constructor-stores-shadowed-parameter; do
+    set +e
+    "$compiler" build "$cases/$invalid.ab" \
+        -o "$output_directory/$invalid" --no-cache --fast \
+        > "$output_directory/$invalid.out" 2>&1
+    stores_status=$?
+    set -e
+    [[ $stores_status -ne 0 ]]
+    grep -q 'ownership.borrow-escape' "$output_directory/$invalid.out"
+done
+
+printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return; returned objects may store parameters'
