@@ -216,6 +216,201 @@ trusted fun __ablaRuntimeCellSet(cell: any, value: any): any {
     value
 }
 
+// Map<K, V> (K string or int) is an ordinary array the collector already
+// traces: [keys, values, slots, live count]. Entries keep insertion order in
+// keys/values; a removed entry's key becomes null. `slots` (dense ints, a
+// power of two, at most half used) holds entry index + 1 per occupied slot,
+// found by linear probing from the key's hash.
+@inline
+trusted fun __ablaRuntimeMapPart(map: any, part: int): any =
+    __ablaRuntimeArrayGet(map, __ablaRuntimeI64(part))
+
+trusted fun __ablaRuntimeMapEmpty(capacity: int): any {
+    val map = __ablaRuntimeArrayFilled(__ablaRuntimeI64(4), __ablaRuntimeNull())
+    __ablaRuntimeArraySet(map, __ablaRuntimeI64(0),
+        __ablaRuntimeArrayFilled(__ablaRuntimeI64(0), __ablaRuntimeNull()))
+    __ablaRuntimeArraySet(map, __ablaRuntimeI64(1),
+        __ablaRuntimeArrayFilled(__ablaRuntimeI64(0), __ablaRuntimeNull()))
+    __ablaRuntimeArraySet(map, __ablaRuntimeI64(2),
+        __ablaRuntimeArrayFilled(__ablaRuntimeI64(capacity), __ablaRuntimeI64(0)))
+    __ablaRuntimeArraySet(map, __ablaRuntimeI64(3), __ablaRuntimeI64(0))
+    map
+}
+
+trusted fun __ablaRuntimeMapCreate(): any = __ablaRuntimeMapEmpty(8)
+
+// FNV-1a over a string's bytes; an int (or bool) through splitmix64's
+// finalizer.
+trusted fun __ablaRuntimeMapHash(key: any): int {
+    var hash = 0
+    if (__ablaRuntimeTag(key) == 4) {
+        hash = -3750763034362895579
+        val data = __ablaRuntimeStringData(key)
+        val length = __ablaRuntimeStringLengthValue(key)
+        var index = 0
+        while (index < length) {
+            hash = (hash ^ ablaRuntimeLoadU8(data + index)) * 1099511628211
+            index = index + 1
+        }
+    } else {
+        hash = __ablaRuntimeWord0(key)
+        hash = (hash ^ (hash >>> 30)) * -4658895280553007687
+        hash = (hash ^ (hash >>> 27)) * -7723592293110705685
+        hash = hash ^ (hash >>> 31)
+    }
+    hash
+}
+
+trusted fun __ablaRuntimeMapKeyEqual(left: any, right: any): bool {
+    val tag = __ablaRuntimeTag(left)
+    if (tag != __ablaRuntimeTag(right)) false
+    else if (tag == 4) __ablaRuntimeStringEqualBool(left, right)
+    else __ablaRuntimeWord0(left) == __ablaRuntimeWord0(right)
+}
+
+// The entry index of `key`, or -1.
+trusted fun __ablaRuntimeMapEntry(map: any, key: any): int {
+    val keys = __ablaRuntimeMapPart(map, 0)
+    val slots = __ablaRuntimeMapPart(map, 2)
+    val mask = __ablaRuntimeArrayLengthI64(slots) - 1
+    var slot = __ablaRuntimeMapHash(key) & mask
+    var found = -1
+    var probing = true
+    while (probing) {
+        val entry = __ablaRuntimeArrayGetI64(slots, slot)
+        if (entry == 0) probing = false
+        else if (__ablaRuntimeMapKeyEqual(
+            __ablaRuntimeArrayGet(keys, __ablaRuntimeI64(entry - 1)), key
+        )) {
+            found = entry - 1
+            probing = false
+        } else slot = (slot + 1) & mask
+    }
+    found
+}
+
+// Points the first free slot for `key` at entry `entry`.
+trusted fun __ablaRuntimeMapPlace(slots: any, key: any, entry: int): int {
+    val mask = __ablaRuntimeArrayLengthI64(slots) - 1
+    var slot = __ablaRuntimeMapHash(key) & mask
+    while (__ablaRuntimeArrayGetI64(slots, slot) != 0) slot = (slot + 1) & mask
+    __ablaRuntimeArraySet(slots, __ablaRuntimeI64(slot), __ablaRuntimeI64(entry + 1))
+}
+
+// Rebuilds the map from its live entries with room for `extra` more.
+trusted fun __ablaRuntimeMapRehash(map: any, extra: int): int {
+    val keys = __ablaRuntimeMapPart(map, 0)
+    val values = __ablaRuntimeMapPart(map, 1)
+    val live = __ablaRuntimeAsI64(__ablaRuntimeMapPart(map, 3))
+    var capacity = 8
+    while (capacity < (live + extra) * 2 + 2) capacity = capacity * 2
+    val rebuilt = __ablaRuntimeMapEmpty(capacity)
+    val liveKeys = __ablaRuntimeMapPart(rebuilt, 0)
+    val liveValues = __ablaRuntimeMapPart(rebuilt, 1)
+    val slots = __ablaRuntimeMapPart(rebuilt, 2)
+    val count = __ablaRuntimeArrayLengthI64(keys)
+    var index = 0
+    var kept = 0
+    while (index < count) {
+        val key = __ablaRuntimeArrayGet(keys, __ablaRuntimeI64(index))
+        if (__ablaRuntimeTag(key) != 1) {
+            __ablaRuntimeArrayAppend(liveKeys, key)
+            __ablaRuntimeArrayAppend(
+                liveValues, __ablaRuntimeArrayGet(values, __ablaRuntimeI64(index))
+            )
+            __ablaRuntimeMapPlace(slots, key, kept)
+            kept = kept + 1
+        }
+        index = index + 1
+    }
+    __ablaRuntimeArraySet(map, __ablaRuntimeI64(0), liveKeys)
+    __ablaRuntimeArraySet(map, __ablaRuntimeI64(1), liveValues)
+    __ablaRuntimeArraySet(map, __ablaRuntimeI64(2), slots)
+}
+
+trusted fun __ablaRuntimeMapGet(map: any, key: any): any {
+    val entry = __ablaRuntimeMapEntry(map, key)
+    if (entry < 0) __ablaRuntimeNull()
+    else __ablaRuntimeArrayGet(__ablaRuntimeMapPart(map, 1), __ablaRuntimeI64(entry))
+}
+
+trusted fun __ablaRuntimeMapHas(map: any, key: any): any =
+    __ablaRuntimeBool(__ablaRuntimeMapEntry(map, key) >= 0)
+
+trusted fun __ablaRuntimeMapSet(map: any, key: any, value: any): any {
+    val entry = __ablaRuntimeMapEntry(map, key)
+    if (entry >= 0) {
+        __ablaRuntimeArraySet(
+            __ablaRuntimeMapPart(map, 1), __ablaRuntimeI64(entry), value
+        )
+    } else {
+        val used = __ablaRuntimeArrayLengthI64(__ablaRuntimeMapPart(map, 0))
+        val capacity = __ablaRuntimeArrayLengthI64(__ablaRuntimeMapPart(map, 2))
+        if ((used + 1) * 2 > capacity) __ablaRuntimeMapRehash(map, 1)
+        val keys = __ablaRuntimeMapPart(map, 0)
+        val added = __ablaRuntimeArrayLengthI64(keys)
+        __ablaRuntimeArrayAppend(keys, key)
+        __ablaRuntimeArrayAppend(__ablaRuntimeMapPart(map, 1), value)
+        __ablaRuntimeMapPlace(__ablaRuntimeMapPart(map, 2), key, added)
+        __ablaRuntimeArraySet(map, __ablaRuntimeI64(3), __ablaRuntimeI64(
+            __ablaRuntimeAsI64(__ablaRuntimeMapPart(map, 3)) + 1
+        ))
+    }
+    __ablaRuntimeVoid()
+}
+
+trusted fun __ablaRuntimeMapRemove(map: any, key: any): any {
+    val entry = __ablaRuntimeMapEntry(map, key)
+    if (entry >= 0) {
+        __ablaRuntimeArraySet(
+            __ablaRuntimeMapPart(map, 0), __ablaRuntimeI64(entry), __ablaRuntimeNull()
+        )
+        __ablaRuntimeArraySet(
+            __ablaRuntimeMapPart(map, 1), __ablaRuntimeI64(entry), __ablaRuntimeNull()
+        )
+        __ablaRuntimeArraySet(map, __ablaRuntimeI64(3), __ablaRuntimeI64(
+            __ablaRuntimeAsI64(__ablaRuntimeMapPart(map, 3)) - 1
+        ))
+    }
+    __ablaRuntimeBool(entry >= 0)
+}
+
+trusted fun __ablaRuntimeMapSize(map: any): any = __ablaRuntimeMapPart(map, 3)
+
+// The live keys (part 0) or values (part 1), in insertion order.
+trusted fun __ablaRuntimeMapEntries(map: any, part: int): any {
+    val keys = __ablaRuntimeMapPart(map, 0)
+    val source = __ablaRuntimeMapPart(map, part)
+    val result = __ablaRuntimeArrayFilled(__ablaRuntimeI64(0), __ablaRuntimeNull())
+    val count = __ablaRuntimeArrayLengthI64(keys)
+    var index = 0
+    while (index < count) {
+        if (__ablaRuntimeTag(__ablaRuntimeArrayGet(keys, __ablaRuntimeI64(index))) != 1) {
+            __ablaRuntimeArrayAppend(
+                result, __ablaRuntimeArrayGet(source, __ablaRuntimeI64(index))
+            )
+        }
+        index = index + 1
+    }
+    result
+}
+
+trusted fun __ablaRuntimeMapKeys(map: any): any = __ablaRuntimeMapEntries(map, 0)
+
+trusted fun __ablaRuntimeMapValues(map: any): any = __ablaRuntimeMapEntries(map, 1)
+
+trusted fun __ablaRuntimeMapClear(map: any): any {
+    val empty = __ablaRuntimeMapEmpty(8)
+    var part = 0
+    while (part < 4) {
+        __ablaRuntimeArraySet(
+            map, __ablaRuntimeI64(part), __ablaRuntimeMapPart(empty, part)
+        )
+        part = part + 1
+    }
+    __ablaRuntimeVoid()
+}
+
 // Shared/Weak control blocks are ordinary Abla-owned memory. Two platform
 // mutexes keep reference counts and user mutation independent: the platform
 // supplies scheduling primitives, while ownership semantics remain here.

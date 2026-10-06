@@ -95,6 +95,7 @@ test: ablac
 	tools/test-compiler-stack.sh $(COMPILER)
 	tools/test-compile-time-floats.sh $(COMPILER)
 	tools/test-optimize-o1.sh $(COMPILER)
+	tools/test-map.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)

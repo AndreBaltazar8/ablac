@@ -515,6 +515,8 @@ fun bootstrapExpressionMayMutateReceiver(
         )
         if ((expression.text == "append" || expression.text == "truncate" ||
              expression.text == "clear" ||
+             (bootstrapIsMapType(receiverType) &&
+              (expression.text == "set" || expression.text == "remove")) ||
              bootstrapMutableReceiverContains(
                 summary,
                 receiverType,
@@ -1048,6 +1050,17 @@ fun bootstrapNormalizeTypeSlow(type: string): string {
         val element = bootstrapNormalizeType(type.slice(5, type.size - 1))
         result = "cell:$element"
     }
+    if (type.size >= 8 && type.slice(0, 4) == "Map<" &&
+        type.slice(type.size - 1, type.size) == ">") {
+        val comma = bootstrapTypeArgumentComma(type, 4, type.size - 1)
+        if (comma > 4) {
+            val key = bootstrapNormalizeType(type.slice(4, comma))
+            val value = bootstrapNormalizeType(
+                type.slice(comma + 1, type.size - 1)
+            )
+            result = "map:$key:$value"
+        }
+    }
     if (type.size >= 12 && type.slice(0, 10) == "Generator<" &&
         type.slice(type.size - 1, type.size) == ">") {
         val element = bootstrapNormalizeType(type.slice(10, type.size - 1))
@@ -1095,6 +1108,9 @@ fun ablaCompilerTypeNeedsNormalization(type: string): bool {
         needed = true
     }
     if (!needed && type.size >= 5 && type.slice(0, 5) == "Cell<") {
+        needed = true
+    }
+    if (!needed && type.size >= 4 && type.slice(0, 4) == "Map<") {
         needed = true
     }
     if (!needed && type.size >= 10 && type.slice(0, 10) == "Generator<") {
@@ -1249,6 +1265,44 @@ fun bootstrapMutexElementType(type: string): string {
 
 fun bootstrapIsCellType(type: string): bool =
     type.size >= 5 && type.slice(0, 5) == "cell:"
+
+// Map<K, V> is `map:K:V`; K is string or i64 (or unknown for an untyped
+// `Map()`), so the colon after it always ends the key.
+fun bootstrapIsMapType(type: string): bool =
+    type.size >= 4 && type.slice(0, 4) == "map:"
+
+fun bootstrapMapKeyEnd(type: string): int {
+    var index = 4
+    while (index < type.size && type[index] != 58) index = index + 1
+    index
+}
+
+fun bootstrapMapKeyType(type: string): string =
+    if (bootstrapIsMapType(type)) type.slice(4, bootstrapMapKeyEnd(type))
+    else "unknown"
+
+fun bootstrapMapValueType(type: string): string {
+    val end = bootstrapMapKeyEnd(type)
+    if (bootstrapIsMapType(type) && end < type.size) {
+        type.slice(end + 1, type.size)
+    } else "unknown"
+}
+
+// The comma between a two-argument type's arguments in type[begin, end), or
+// -1: the first one outside nested <> and ().
+fun bootstrapTypeArgumentComma(type: string, begin: int, end: int): int {
+    var depth = 0
+    var found = -1
+    var index = begin
+    while (index < end && found < 0) {
+        val byte = type[index]
+        if (byte == 60 || byte == 40) depth = depth + 1
+        if (byte == 62 || byte == 41) depth = depth - 1
+        if (byte == 44 && depth == 0) found = index
+        index = index + 1
+    }
+    found
+}
 
 fun bootstrapCellElementType(type: string): string {
     if (bootstrapIsCellType(type)) type.slice(5, type.size)
@@ -1624,6 +1678,10 @@ fun bootstrapTypesCompatible(expected: string, actual: string): bool {
             compatible = true
         }
     }
+    // `Map()` is a map of nothing yet: it takes the declared map type.
+    if (bootstrapIsMapType(expected) && actual == "map:unknown:unknown") {
+        compatible = true
+    }
     if (bootstrapIsNullableType(expected)) {
         val element = bootstrapNullableElementType(expected)
         if (actual == "null" || actual == element) compatible = true
@@ -1797,7 +1855,8 @@ fun bootstrapLambdaParameterStoredOutside(
         ) >= 0) stored = true
     }
     if (expression.kind == "member.call" &&
-        expression.text == "append" && expression.children.size > 1 &&
+        (expression.text == "append" || expression.text == "set") &&
+        expression.children.size > 1 &&
         !bootstrapAffineNamesContain(
             localNames,
             bootstrapPlaceRootName(expression.children[0])
@@ -2134,7 +2193,7 @@ fun bootstrapSummaryTypeIsManagedReferenceAt(
 ): bool {
     val normalized = bootstrapNormalizeType(type)
     var managed = bootstrapIsArrayType(normalized) ||
-        bootstrapIsCellType(normalized)
+        bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized)
     var declaration = 0
     while (!managed && declaration < declarations.size) {
         val candidate = declarations[declaration]
@@ -2166,7 +2225,7 @@ fun bootstrapSummaryTypeIsManagedReferenceIn(
 ): bool {
     val normalized = bootstrapNormalizeType(type)
     var managed = bootstrapIsArrayType(normalized) ||
-        bootstrapIsCellType(normalized) ||
+        bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized) ||
         managedTypes.find(normalized) >= 0
     if (!managed && depth < 32 && bootstrapIsNullableType(normalized)) {
         managed = bootstrapSummaryTypeIsManagedReferenceIn(
@@ -2548,7 +2607,7 @@ fun bootstrapExpressionCompileEffects(
     var mask = 0
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
-        expression.text != "Cell") {
+        expression.text != "Cell" && expression.text != "Map") {
         mask = bootstrapCompileEffectLookup(
             summary,
             expression.text,
@@ -2822,7 +2881,7 @@ fun bootstrapExpressionDelegatedCompileEffects(
     }
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
-        expression.text != "Cell") {
+        expression.text != "Cell" && expression.text != "Map") {
         mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,
             expression.text,
@@ -3540,11 +3599,16 @@ fun bootstrapRegionExpressionRetainsParameters(
             receiverType = bootstrapNormalizeType(
                 parameterTypes[receiverParameter]
             )
-            if (expression.text == "append" &&
-                bootstrapIsArrayType(receiverType) &&
-                !bootstrapRegionResultIsIndependent(
-                    bootstrapArrayElementType(receiverType)
-                )) {
+            if ((expression.text == "append" &&
+                 bootstrapIsArrayType(receiverType) &&
+                 !bootstrapRegionResultIsIndependent(
+                     bootstrapArrayElementType(receiverType)
+                 )) ||
+                (expression.text == "set" &&
+                 bootstrapIsMapType(receiverType) &&
+                 !bootstrapRegionResultIsIndependent(
+                     bootstrapMapValueType(receiverType)
+                 ))) {
                 changed = bootstrapRegionMarkRetainingParameter(
                     summary,
                     declarationName,
@@ -3630,7 +3694,11 @@ fun bootstrapRegionExpressionRetainsReceiver(
     }
     if (expression.kind == "member.call" &&
         bootstrapPlaceRootName(expression.children[0]) == "this") {
-        if (expression.text == "append") retaining = true
+        // A map field's set keeps its value too (a method named set is
+        // treated the same way: conservative).
+        if (expression.text == "append" || expression.text == "set") {
+            retaining = true
+        }
         if (bootstrapRegionReceiverCallIsRetaining(
             summary,
             owner,
@@ -4940,7 +5008,7 @@ class BootstrapAnalyzer(
                     expression.children.size == 1
                 val promoting = expression.text == "memoryPromoteString"
                 val constructing = expression.text == "Shared" ||
-                    expression.text == "Cell" ||
+                    expression.text == "Cell" || expression.text == "Map" ||
                     this.findKind(expression.text) == "class"
                 if (moving) {
                     owned = this.regionExpressionIsOwned(
@@ -5528,7 +5596,8 @@ class BootstrapAnalyzer(
             bootstrapIsFunctionType(normalized) ||
             bootstrapIsBorrowType(normalized)) return false
         if (bootstrapIsArrayType(normalized) ||
-            bootstrapIsCellType(normalized)) return true
+            bootstrapIsCellType(normalized) ||
+            bootstrapIsMapType(normalized)) return true
         val declaration = this.typeDeclarations.find(normalized)
         if (declaration >= 0) {
             val kind = this.declarations[declaration].kind
@@ -7105,6 +7174,73 @@ class BootstrapAnalyzer(
         }
     }
 
+    // A Map<K, V> method: get (V or null), has, set, remove, keys, values,
+    // clear. The map's own type must be known (declared) and its key a string
+    // or an int.
+    fun inferMapCall(
+        expression: BootstrapExpression,
+        rawReceiver: string,
+        receiver: string
+    ): string {
+        val key = bootstrapMapKeyType(receiver)
+        val value = bootstrapMapValueType(receiver)
+        val method = expression.text
+        if (key == "unknown") {
+            this.fail(
+                "map.untyped: declare its type, as in val m: Map<string, int> = Map()"
+            )
+        } else if (key != "string" && key != "i64") {
+            this.fail("map.key-type:$key")
+        }
+        if (method == "set" || method == "remove" || method == "clear") {
+            if (bootstrapIsBorrowType(rawReceiver)) {
+                this.fail("ownership.borrow-mutation:map.$method")
+            }
+            this.validateBorrowMutation(expression.children[0], "map.$method")
+        }
+        val arity = if (method == "set") 3
+            else if (method == "get" || method == "has" ||
+                method == "remove") 2
+            else 1
+        var result = "unknown"
+        if (method != "get" && method != "has" && method != "set" &&
+            method != "remove" && method != "keys" && method != "values" &&
+            method != "clear") {
+            this.fail("map.member:$method")
+        } else if (expression.children.size != arity) {
+            this.fail("map.$method.arity")
+        } else {
+            if (arity >= 2) {
+                val keyType = this.infer(expression.children[1])
+                if (!bootstrapTypesCompatible(key, keyType)) {
+                    this.fail("map.$method.key:$key:$keyType")
+                }
+            }
+            if (method == "set") {
+                val stored = this.infer(expression.children[2])
+                if (bootstrapIsBorrowType(stored)) {
+                    this.fail("ownership.borrow-store:map.set")
+                }
+                if (!bootstrapTypesCompatible(value, stored)) {
+                    this.fail("map.set.value:$value:$stored")
+                }
+                this.validateOwnershipTransfer(
+                    value, expression.children[2], "argument.map.set"
+                )
+            }
+            result = when (method) {
+                "get" -> if (bootstrapIsNullableType(value)) value
+                    else "nullable:$value"
+                "has" -> "bool"
+                "remove" -> "bool"
+                "keys" -> "array:$key"
+                "values" -> "array:$value"
+                else -> "void"
+            }
+        }
+        return result
+    }
+
     fun contextualizeLambdaParameters(
         expression: BootstrapExpression,
         expected: string
@@ -7549,6 +7685,14 @@ class BootstrapAnalyzer(
                 result = "mutex:$element"
             }
         }
+        // `Map()` is an empty map whose type comes from where it is stored
+        // (a declared local, field, parameter or result).
+        if (expression.kind == "call" && expression.text == "Map") {
+            if (expression.children.size != 0) {
+                this.fail("map.arity")
+                result = "unknown"
+            } else result = "map:unknown:unknown"
+        }
         if (expression.kind == "call" && expression.text == "Cell") {
             if (expression.children.size != 1) {
                 this.fail("cell.arity")
@@ -7586,7 +7730,8 @@ class BootstrapAnalyzer(
         }
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
-            expression.text != "Cell" && expression.text != "filledArray") {
+            expression.text != "Cell" && expression.text != "filledArray" &&
+            expression.text != "Map") {
             if (this.overloads.keys.size > 0) {
                 val overloaded = this.inferOverloadedCall(expression)
                 if (overloaded != "") return overloaded
@@ -7930,7 +8075,8 @@ class BootstrapAnalyzer(
             val rawReceiver = this.infer(expression.children[0])
             val receiver = bootstrapBorrowElementType(rawReceiver)
             if (expression.text == "size" &&
-                (receiver == "string" || bootstrapIsArrayType(receiver))) {
+                (receiver == "string" || bootstrapIsArrayType(receiver) ||
+                 bootstrapIsMapType(receiver))) {
                 result = "i64"
             } else {
                 result = this.fieldType(receiver, expression.text)
@@ -8049,7 +8195,9 @@ class BootstrapAnalyzer(
                     retainedParameter = retainedParameter + 1
                 }
             }
-            if (bootstrapIsCellType(receiver)) {
+            if (bootstrapIsMapType(receiver)) {
+                result = this.inferMapCall(expression, rawReceiver, receiver)
+            } else if (bootstrapIsCellType(receiver)) {
                 val element = bootstrapCellElementType(receiver)
                 if (expression.text == "get") {
                     if (expression.children.size != 1) {
