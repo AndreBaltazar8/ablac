@@ -29,4 +29,15 @@ set -e
 grep -q 'ownership.mutable-borrow:receiver.Obj.sneaky' \
     "$output_directory/invalid.out"
 
+for invalid in invalid-move-used-after invalid-move-in-loop; do
+    set +e
+    "$compiler" build "$cases/$invalid.ab" \
+        -o "$output_directory/$invalid" --no-cache --fast \
+        > "$output_directory/$invalid.out" 2>&1
+    move_status=$?
+    set -e
+    [[ $move_status -ne 0 ]]
+    grep -q 'ownership\.' "$output_directory/$invalid.out"
+done
+
 printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return'

@@ -1974,6 +1974,54 @@ fun bootstrapExpressionAssigns(expression: BootstrapExpression, name: string): b
     false
 }
 
+// References to `name` under `expression` starting at or after `from`
+// (`from` 0: all of them). A node without a source position counts as late.
+fun bootstrapNameReferences(
+    expression: BootstrapExpression,
+    name: string,
+    from: int
+): int {
+    var count = if (expression.kind == "identifier" && expression.text == name &&
+        (expression.begin >= from || expression.begin <= 0)) 1 else 0
+    for (child in expression.children) {
+        count = count + bootstrapNameReferences(child, name, from)
+    }
+    count
+}
+
+// Where the last `val name` before `before` is declared under `expression`.
+fun bootstrapLocalDeclarationBefore(
+    expression: BootstrapExpression,
+    name: string,
+    before: int
+): int {
+    var found = if (expression.kind == "local.val" && expression.text == name &&
+        expression.begin < before) expression.begin else -1
+    for (child in expression.children) {
+        val inner = bootstrapLocalDeclarationBefore(child, name, before)
+        if (inner > found) found = inner
+    }
+    found
+}
+
+// A loop or lambda that encloses `call` but starts after `declared`: it can
+// run the call more than once with the same local.
+fun bootstrapRepeatsBetween(
+    expression: BootstrapExpression,
+    declared: int,
+    call: BootstrapExpression
+): bool {
+    val repeats = expression.kind == "while" || expression.kind == "do.while" ||
+        expression.kind == "for" || expression.kind == "lambda" ||
+        expression.kind == "lambda.move" || expression.kind == "lambda.generator"
+    if (repeats && expression.begin > declared &&
+        expression.begin <= call.begin && call.end <= expression.end) return true
+    for (child in expression.children) {
+        if (bootstrapRepeatsBetween(child, declared, call)) return true
+    }
+    false
+}
+
 fun bootstrapExpressionContainsDeferredControl(
     expression: BootstrapExpression
 ): bool {
@@ -4232,7 +4280,12 @@ class BootstrapAnalyzer(
     // Where inference last was: a diagnostic without its own `@offset`
     // points there instead of at the start of the file.
     var inferBegin: int = 0,
-    var inferSource: string = ""
+    var inferSource: string = "",
+    // The body being checked (a function's, a method's or a lambda's): a
+    // fresh local passed to a constructor is moved when this body never
+    // reads it again.
+    var currentBody: BootstrapExpression =
+        BootstrapExpression("missing", "", 0, 0, [])
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -5492,6 +5545,33 @@ class BootstrapAnalyzer(
         )) "var" else "parameter"
     }
 
+    // A fresh `val` passed to a constructor moves into it when the body never
+    // reads it again: it appears once among the arguments, nothing refers to
+    // it after the call, and no loop or lambda between its declaration and
+    // the call could run the call again. `val x = M("x"); Pair(x, y)` then
+    // stores fresh objects instead of borrowing two locals.
+    fun localMovesInto(
+        call: BootstrapExpression,
+        argument: BootstrapExpression
+    ): bool {
+        if (argument.kind != "identifier" ||
+            !this.hasVisibleLocal(argument.text) ||
+            this.visibleLocalKind(argument.text) != "val" ||
+            this.visibleBorrowSource(argument.text) != "managed.fresh" ||
+            this.currentBody.kind == "missing" || call.end <= call.begin) {
+            return false
+        }
+        val name = argument.text
+        if (bootstrapNameReferences(call, name, 0) != 1) return false
+        if (bootstrapNameReferences(this.currentBody, name, call.end) > 0) {
+            return false
+        }
+        val declared = bootstrapLocalDeclarationBefore(
+            this.currentBody, name, call.begin
+        )
+        declared >= 0 && !bootstrapRepeatsBetween(this.currentBody, declared, call)
+    }
+
     fun constructorStoredBorrowSource(
         expression: BootstrapExpression
     ): string {
@@ -5523,6 +5603,8 @@ class BootstrapAnalyzer(
                             expression.children[parameter],
                             0,
                             false
+                        ) && !this.localMovesInto(
+                            expression, expression.children[parameter]
                         )) {
                         var found = this.borrowArgumentSource(
                             expression.children[parameter]
@@ -5628,6 +5710,10 @@ class BootstrapAnalyzer(
         )) return true
         if (value.kind == "identifier") {
             return this.blockLocalIsFresh(block, value, depth)
+        }
+        // `val x = M(); val y = M(); Pair(x, y)`: the locals move into it.
+        if (value.kind == "call" && this.findKind(value.text) == "class") {
+            return this.constructorStoresOnlyFreshLocals(block, value, depth)
         }
         if (value.kind == "if" && value.children.size > 2 &&
             value.children[2].kind != "missing") {
@@ -7171,6 +7257,8 @@ class BootstrapAnalyzer(
             val previousLoopDepth = this.loopDepth
             val previousGeneratorDepth = this.generatorDepth
             val previousYieldedType = this.yieldedType
+            val previousBody = this.currentBody
+            this.currentBody = expression
             this.currentResultType = "inferred"
             this.currentBorrowResultSource = ""
             this.returnedType = "unknown"
@@ -7215,6 +7303,7 @@ class BootstrapAnalyzer(
                 } else bodyType = bodyType
             }
             this.currentResultType = previousResultType
+            this.currentBody = previousBody
             this.currentBorrowResultSource = previousBorrowResultSource
             this.returnedType = previousReturnedType
             this.loopDepth = previousLoopDepth
@@ -9201,6 +9290,7 @@ class BootstrapAnalyzer(
                 this.scopeParents = [-1]
                 this.currentScope = 0
                 this.currentOwner = ""
+                this.currentBody = declaration.expression
                 this.currentResultType = "inferred"
                 this.currentBorrowResultSource = bootstrapBorrowResultSource(
                     declaration.resultType
@@ -9353,6 +9443,7 @@ class BootstrapAnalyzer(
                 this.scopeParents = [-1]
                 this.currentScope = 0
                 this.currentOwner = owner.name
+                this.currentBody = method.expression
                 this.currentResultType = "inferred"
                 this.currentBorrowResultSource = bootstrapBorrowResultSource(
                     method.resultType
