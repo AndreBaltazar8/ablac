@@ -652,10 +652,11 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   case 262: {
     struct stat information;
     char executable[PATH_MAX];
+    // Linux's AT_SYMLINK_NOFOLLOW (0x100) is Darwin's AT_SYMLINK_NOFOLLOW.
     result = fstatat(
         argument0 == -100 ? AT_FDCWD : (int)argument0,
         darwin_linux_path((const char *)(uintptr_t)argument1, executable),
-        &information, (int)argument3);
+        &information, (argument3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
     if (result == 0) {
       unsigned char *output = (unsigned char *)(uintptr_t)argument2;
       memset(output, 0, 144);
