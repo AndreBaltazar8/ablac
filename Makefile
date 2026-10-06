@@ -93,6 +93,7 @@ test: ablac
 	tools/test-lambda-void-assignment.sh $(COMPILER)
 	tools/test-process-environment.sh $(COMPILER)
 	tools/test-compiler-stack.sh $(COMPILER)
+	tools/test-ablac-test.sh $(COMPILER)
 	tools/test-compile-time-floats.sh $(COMPILER)
 	tools/test-optimize-o1.sh $(COMPILER)
 	tools/test-map.sh $(COMPILER)
