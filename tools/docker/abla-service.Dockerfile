@@ -14,7 +14,11 @@
 #
 # Stage 1 bootstraps the pinned release compiler and rebuilds the compiler
 # from the `ablac` context so the service compiles with the same sources it
-# was developed against. Stage 2 compiles the service. The runtime stage
+# was developed against. When the sources need a newer compiler than the
+# pinned release, stage intermediate compiler source trees in the `ablac`
+# context as `bootstrap-chain/<NN>-<name>/`: each is built in order (--fast)
+# by the one before it, and the last builds the current sources. Stage 2
+# compiles the service. The runtime stage
 # carries only the binary plus the system libraries it links: glibc, and
 # OpenSSL when the program imports TLS, JWT, or the async HTTPS client.
 
@@ -42,6 +46,14 @@ RUN rm -rf build && tools/bootstrap-compiler.sh build/ablac.bin \
            mkdir -p "$(dirname "$interpreter")" \
            && ln -s /lib64/ld-linux-x86-64.so.2 "$interpreter"; \
        fi \
+    && for step in $(ls -d bootstrap-chain/*/ 2>/dev/null | sort); do \
+           echo "bootstrap chain: $step" \
+           && (cd "$step" && ABLA_SYSROOT="$PWD" ABLA_MAX_MEMORY_MB=6000 ABLA_MAX_SECONDS=3000 \
+               /opt/ablac/tools/run-limited.sh /opt/ablac/build/ablac.bin build src/orc_main.ab \
+               -o /opt/ablac/build/ablac-step --no-cache --fast) \
+           && mv build/ablac-step build/ablac.bin && rm -f build/ablac-step.ll || exit 1; \
+       done \
+    && rm -rf bootstrap-chain \
     && ABLA_SYSROOT=/opt/ablac ABLA_MAX_MEMORY_MB=6000 ABLA_MAX_SECONDS=3000 \
         tools/run-limited.sh build/ablac.bin build src/orc_main.ab \
         -o build/ablac-current --no-cache \
