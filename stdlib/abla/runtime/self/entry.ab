@@ -1156,25 +1156,66 @@ trusted fun __ablaRuntimeUtf8EncodeScalar(value: int): any {
 // Arrays use the native 64-bit header layout on every target: length,
 // capacity, and values pointer. This makes the runtime ABI deterministic and
 // keeps the same optimized layout used by native Abla Web services.
+//
+// The capacity word's top byte says how the elements are stored: 0 as boxed
+// 24-byte values, 1 as dense 8-byte words (numbers: tag 2), 2 as dense bools
+// (tag 3). An array whose elements are all numbers or all bools is dense, a
+// third of the memory; storing any other value boxes it first.
+@inline
+trusted fun __ablaRuntimeArrayKind(array: int): int =
+    ablaRuntimeLoadI64(array + 8) >> 56
+
+@inline
+trusted fun __ablaRuntimeArrayCapacity(array: int): int =
+    ablaRuntimeLoadI64(array + 8) & 72057594037927935
+
+@inline
+trusted fun __ablaRuntimeArraySetCapacity(
+    array: int,
+    kind: int,
+    capacity: int
+): void {
+    ablaRuntimeStoreI64(array + 8, (kind << 56) | capacity)
+}
+
+// The dense kind the value at `address` can be stored as, or 0.
+@inline
+trusted fun __ablaRuntimeDenseKind(address: int): int {
+    val tag = ablaRuntimeLoadI32(address)
+    if ((tag == 2 || tag == 3) && ablaRuntimeLoadI32(address + 4) == 0 &&
+        ablaRuntimeLoadI64(address + 16) == 0) tag - 1 else 0
+}
+
 trusted fun __ablaRuntimeArrayCreate(values: int, count: int): any {
     if (count < 0) ablaRuntimeTrap()
-    val array = __ablaRuntimeAllocateLayout(24 + count * 24, 4)
+    var kind = if (count == 0) 0 else __ablaRuntimeDenseKind(values)
+    var index: int = 1
+    while (kind != 0 && index < count) {
+        if (__ablaRuntimeDenseKind(values + index * 24) != kind) kind = 0
+        index = index + 1
+    }
+    val width = if (kind == 0) 24 else 8
+    val array = __ablaRuntimeAllocateLayout(24 + count * width, 4)
     val destination = if (count == 0) 0 else array + 24
     ablaRuntimeStoreI64(array, count)
-    ablaRuntimeStoreI64(array + 8, count)
+    __ablaRuntimeArraySetCapacity(array, kind, count)
     ablaRuntimeStoreI64(array + 16, destination)
-    var index: int = 0
+    index = 0
     while (index < count) {
         val source = values + index * 24
-        ablaRuntimeStoreI64(destination + index * 24, ablaRuntimeLoadI64(source))
-        ablaRuntimeStoreI64(
-            destination + index * 24 + 8,
-            ablaRuntimeLoadI64(source + 8)
-        )
-        ablaRuntimeStoreI64(
-            destination + index * 24 + 16,
-            ablaRuntimeLoadI64(source + 16)
-        )
+        if (kind != 0) {
+            ablaRuntimeStoreI64(destination + index * 8, ablaRuntimeLoadI64(source + 8))
+        } else {
+            ablaRuntimeStoreI64(destination + index * 24, ablaRuntimeLoadI64(source))
+            ablaRuntimeStoreI64(
+                destination + index * 24 + 8,
+                ablaRuntimeLoadI64(source + 8)
+            )
+            ablaRuntimeStoreI64(
+                destination + index * 24 + 16,
+                ablaRuntimeLoadI64(source + 16)
+            )
+        }
         index = index + 1
     }
     ablaRuntimeMakeValue(7, 0, array, 0)
@@ -1184,14 +1225,19 @@ trusted fun __ablaRuntimeArrayCreate(values: int, count: int): any {
 trusted fun __ablaRuntimeArrayFilled(countValue: any, element: any): any {
     val count = __ablaRuntimeAsI64(countValue)
     if (count < 0) ablaRuntimeTrap()
-    val array = __ablaRuntimeAllocateLayout(24 + count * 24, 4)
+    val source = ablaRuntimeValueAddress(element)
+    val kind = if (count == 0) 0 else __ablaRuntimeDenseKind(source)
+    val width = if (kind == 0) 24 else 8
+    val array = __ablaRuntimeAllocateLayout(24 + count * width, 4)
     val values = if (count == 0) 0 else array + 24
     ablaRuntimeStoreI64(array, count)
-    ablaRuntimeStoreI64(array + 8, count)
+    __ablaRuntimeArraySetCapacity(array, kind, count)
     ablaRuntimeStoreI64(array + 16, values)
+    val word = ablaRuntimeLoadI64(source + 8)
     var index: int = 0
     while (index < count) {
-        __ablaRuntimeCopyValue(element, values + index * 24)
+        if (kind != 0) ablaRuntimeStoreI64(values + index * 8, word)
+        else __ablaRuntimeCopyValue(element, values + index * 24)
         index = index + 1
     }
     ablaRuntimeMakeValue(7, 0, array, 0)
@@ -1209,49 +1255,103 @@ trusted fun __ablaRuntimeArrayLengthI64(value: any): int =
 trusted fun __ablaRuntimeArrayLength(value: any): any =
     __ablaRuntimeI64(__ablaRuntimeArrayLengthI64(value))
 
-trusted fun __ablaRuntimeArrayValueAddress(value: any, index: int): int {
-    val array = __ablaRuntimeArrayAddress(value)
-    val length = ablaRuntimeLoadI64(array)
-    if (index < 0 || index >= length) {
+// `index` after checking it is within the array.
+trusted fun __ablaRuntimeArrayIndex(array: int, index: int): int {
+    if (index < 0 || index >= ablaRuntimeLoadI64(array)) {
         ablaRuntimeTrap()
         0
-    } else ablaRuntimeLoadI64(array + 16) + index * 24
+    } else index
+}
+
+// Rewrites a dense array's elements as boxed values, in place of its buffer.
+@noinline
+trusted fun __ablaRuntimeArrayBox(array: int): void {
+    val kind = __ablaRuntimeArrayKind(array)
+    if (kind != 0) {
+        val length = ablaRuntimeLoadI64(array)
+        val capacity = __ablaRuntimeArrayCapacity(array)
+        val values = ablaRuntimeLoadI64(array + 16)
+        val boxed = if (capacity == 0) 0
+            else __ablaRuntimeAllocateLayout(capacity * 24, 2)
+        var index: int = 0
+        while (index < length) {
+            ablaRuntimeStoreI32(boxed + index * 24, kind + 1)
+            ablaRuntimeStoreI32(boxed + index * 24 + 4, 0)
+            ablaRuntimeStoreI64(
+                boxed + index * 24 + 8,
+                ablaRuntimeLoadI64(values + index * 8)
+            )
+            ablaRuntimeStoreI64(boxed + index * 24 + 16, 0)
+            index = index + 1
+        }
+        if (values != 0 && values != array + 24) __ablaRuntimeFree(values)
+        ablaRuntimeStoreI64(array + 16, boxed)
+        __ablaRuntimeArraySetCapacity(array, 0, capacity)
+    }
 }
 
 trusted fun __ablaRuntimeArrayAppend(value: any, element: any): any {
     val array = __ablaRuntimeArrayAddress(value)
     val length = ablaRuntimeLoadI64(array)
-    val capacity = ablaRuntimeLoadI64(array + 8)
+    val kind = __ablaRuntimeArrayKind(array)
+    val source = ablaRuntimeValueAddress(element)
+    // Room left and an element of the array's storage: store it here.
+    if (length < __ablaRuntimeArrayCapacity(array) &&
+        (kind == 0 || __ablaRuntimeDenseKind(source) == kind)) {
+        val values = ablaRuntimeLoadI64(array + 16)
+        if (kind != 0) {
+            ablaRuntimeStoreI64(values + length * 8, ablaRuntimeLoadI64(source + 8))
+        } else __ablaRuntimeCopyValue(element, values + length * 24)
+        ablaRuntimeStoreI64(array, length + 1)
+    } else __ablaRuntimeArrayAppendGrowing(array, element)
+    __ablaRuntimeVoid()
+}
+
+// Append when the array must grow or change its storage first: a fresh array
+// takes the storage of its first element; a dense one is boxed before it
+// stores anything else.
+@noinline
+trusted fun __ablaRuntimeArrayAppendGrowing(array: int, element: any): void {
+    val length = ablaRuntimeLoadI64(array)
+    val source = ablaRuntimeValueAddress(element)
+    val elementKind = __ablaRuntimeDenseKind(source)
+    var kind = __ablaRuntimeArrayKind(array)
+    var capacity = __ablaRuntimeArrayCapacity(array)
+    if (kind == 0 && length == 0 && capacity == 0 && elementKind != 0) {
+        kind = elementKind
+        __ablaRuntimeArraySetCapacity(array, kind, 0)
+    } else if (kind != 0 && elementKind != kind) {
+        __ablaRuntimeArrayBox(array)
+        kind = 0
+    }
+    val width = if (kind == 0) 24 else 8
     var values: int = ablaRuntimeLoadI64(array + 16)
     if (length == capacity) {
         val next = if (capacity == 0) 4 else capacity * 2
-        val replacement = __ablaRuntimeAllocateLayout(next * 24, 2)
-        var index: int = 0
-        while (index < length) {
+        val replacement = __ablaRuntimeAllocateLayout(
+            next * width, if (kind == 0) 2 else 1
+        )
+        var offset: int = 0
+        while (offset < length * width) {
             ablaRuntimeStoreI64(
-                replacement + index * 24,
-                ablaRuntimeLoadI64(values + index * 24)
+                replacement + offset,
+                ablaRuntimeLoadI64(values + offset)
             )
-            ablaRuntimeStoreI64(
-                replacement + index * 24 + 8,
-                ablaRuntimeLoadI64(values + index * 24 + 8)
-            )
-            ablaRuntimeStoreI64(
-                replacement + index * 24 + 16,
-                ablaRuntimeLoadI64(values + index * 24 + 16)
-            )
-            index = index + 1
+            offset = offset + 8
         }
         if (values != 0 && values != array + 24) {
             __ablaRuntimeFree(values)
         }
         values = replacement
-        ablaRuntimeStoreI64(array + 8, next)
+        capacity = next
+        __ablaRuntimeArraySetCapacity(array, kind, next)
         ablaRuntimeStoreI64(array + 16, values)
     }
-    __ablaRuntimeCopyValue(element, values + length * 24)
+    if (kind != 0) {
+        ablaRuntimeStoreI64(values + length * 8, ablaRuntimeLoadI64(source + 8))
+    } else __ablaRuntimeCopyValue(element, values + length * 24)
     ablaRuntimeStoreI64(array, length + 1)
-    __ablaRuntimeVoid()
+    return
 }
 
 // Keeps the first `count` elements; the slots past them are zeroed so they hold
@@ -1262,32 +1362,67 @@ trusted fun __ablaRuntimeArrayTruncate(value: any, countValue: any): any {
     val count = __ablaRuntimeAsI64(countValue)
     if (count < 0 || count > length) ablaRuntimeTrap()
     val values = ablaRuntimeLoadI64(array + 16)
-    var index = count
-    while (index < length) {
-        ablaRuntimeStoreI64(values + index * 24, 0)
-        ablaRuntimeStoreI64(values + index * 24 + 8, 0)
-        ablaRuntimeStoreI64(values + index * 24 + 16, 0)
-        index = index + 1
+    val width = if (__ablaRuntimeArrayKind(array) == 0) 24 else 8
+    var offset = count * width
+    while (offset < length * width) {
+        ablaRuntimeStoreI64(values + offset, 0)
+        offset = offset + 8
     }
     ablaRuntimeStoreI64(array, count)
     __ablaRuntimeVoid()
 }
 
-trusted fun __ablaRuntimeArrayGet(value: any, indexValue: any): any =
-    __ablaRuntimeValueAt(
-        __ablaRuntimeArrayValueAddress(value, __ablaRuntimeAsI64(indexValue))
-    )
+// Readers: the common case (in bounds, the storage the caller expects) stays
+// small where it is inlined; the rest is one shared call.
+trusted fun __ablaRuntimeArrayGet(value: any, indexValue: any): any {
+    val array = __ablaRuntimeArrayAddress(value)
+    val index = __ablaRuntimeAsI64(indexValue)
+    if (__ablaRuntimeArrayKind(array) == 0 && index >= 0 &&
+        index < ablaRuntimeLoadI64(array)) {
+        __ablaRuntimeValueAt(ablaRuntimeLoadI64(array + 16) + index * 24)
+    } else __ablaRuntimeArrayGetOther(array, index)
+}
+
+@noinline
+trusted fun __ablaRuntimeArrayGetOther(array: int, index: int): any {
+    val checked = __ablaRuntimeArrayIndex(array, index)
+    val kind = __ablaRuntimeArrayKind(array)
+    val values = ablaRuntimeLoadI64(array + 16)
+    if (kind == 0) __ablaRuntimeValueAt(values + checked * 24)
+    else ablaRuntimeMakeValue(kind + 1, 0, ablaRuntimeLoadI64(values + checked * 8), 0)
+}
 
 trusted fun __ablaRuntimeArrayGetI64(value: any, index: int): int {
-    val element = __ablaRuntimeArrayValueAddress(value, index)
-    if (ablaRuntimeLoadI32(element) != 2) ablaRuntimeTrap()
-    ablaRuntimeLoadI64(element + 8)
+    val array = __ablaRuntimeArrayAddress(value)
+    if (__ablaRuntimeArrayKind(array) == 1 && index >= 0 &&
+        index < ablaRuntimeLoadI64(array)) {
+        ablaRuntimeLoadI64(ablaRuntimeLoadI64(array + 16) + index * 8)
+    } else __ablaRuntimeArrayGetWordOther(array, index, 2)
 }
 
 trusted fun __ablaRuntimeArrayGetBool(value: any, index: int): bool {
-    val element = __ablaRuntimeArrayValueAddress(value, index)
-    if (ablaRuntimeLoadI32(element) != 3) ablaRuntimeTrap()
-    ablaRuntimeLoadI64(element + 8) != 0
+    val array = __ablaRuntimeArrayAddress(value)
+    if (__ablaRuntimeArrayKind(array) == 2 && index >= 0 &&
+        index < ablaRuntimeLoadI64(array)) {
+        ablaRuntimeLoadI64(ablaRuntimeLoadI64(array + 16) + index * 8) != 0
+    } else __ablaRuntimeArrayGetWordOther(array, index, 3) != 0
+}
+
+// A boxed array's element `index` as a word of type `tag` (trapping on
+// another tag or out of bounds).
+@noinline
+trusted fun __ablaRuntimeArrayGetWordOther(array: int, index: int, tag: int): int {
+    val checked = __ablaRuntimeArrayIndex(array, index)
+    val kind = __ablaRuntimeArrayKind(array)
+    val values = ablaRuntimeLoadI64(array + 16)
+    if (kind != 0) {
+        if (kind + 1 != tag) ablaRuntimeTrap()
+        ablaRuntimeLoadI64(values + checked * 8)
+    } else {
+        val element = values + checked * 24
+        if (ablaRuntimeLoadI32(element) != tag) ablaRuntimeTrap()
+        ablaRuntimeLoadI64(element + 8)
+    }
 }
 
 trusted fun __ablaRuntimeIndexGet(value: any, index: any): any {
@@ -1305,11 +1440,38 @@ trusted fun __ablaRuntimeArraySet(
     indexValue: any,
     element: any
 ): int {
-    __ablaRuntimeCopyValue(
-        element,
-        __ablaRuntimeArrayValueAddress(value, __ablaRuntimeAsI64(indexValue))
-    )
+    val array = __ablaRuntimeArrayAddress(value)
+    val index = __ablaRuntimeAsI64(indexValue)
+    val source = ablaRuntimeValueAddress(element)
+    val kind = __ablaRuntimeArrayKind(array)
+    val inBounds = index >= 0 && index < ablaRuntimeLoadI64(array)
+    if (inBounds && kind == 0) {
+        __ablaRuntimeCopyValue(element, ablaRuntimeLoadI64(array + 16) + index * 24)
+    } else if (inBounds && __ablaRuntimeDenseKind(source) == kind) {
+        ablaRuntimeStoreI64(
+            ablaRuntimeLoadI64(array + 16) + index * 8,
+            ablaRuntimeLoadI64(source + 8)
+        )
+    } else __ablaRuntimeArraySetOther(array, index, element)
     0
+}
+
+// Stores into a boxed array, boxing a dense one first when the value needs it.
+@noinline
+trusted fun __ablaRuntimeArraySetOther(array: int, index: int, element: any): void {
+    val checked = __ablaRuntimeArrayIndex(array, index)
+    val source = ablaRuntimeValueAddress(element)
+    val kind = __ablaRuntimeArrayKind(array)
+    if (kind != 0 && __ablaRuntimeDenseKind(source) == kind) {
+        ablaRuntimeStoreI64(
+            ablaRuntimeLoadI64(array + 16) + checked * 8,
+            ablaRuntimeLoadI64(source + 8)
+        )
+    } else {
+        if (kind != 0) __ablaRuntimeArrayBox(array)
+        __ablaRuntimeCopyValue(element, ablaRuntimeLoadI64(array + 16) + checked * 24)
+    }
+    return
 }
 
 trusted fun __ablaRuntimeObjectCreate(typeSymbol: int, count: int): any {
