@@ -1216,7 +1216,8 @@ fun bootstrapCompileGlobalEncode(value: BootstrapEvalValue): string {
     val kind = value.kind
     if (kind != "integer" && kind != "boolean" && kind != "string" &&
         kind != "null" && kind != "void" && kind != "array" &&
-        kind != "object" && kind != "f64" && kind != "f32") return ""
+        kind != "object" && kind != "f64" && kind != "f32" &&
+        kind != "map") return ""
     var out = "${bootstrapCompileGlobalToken(kind)}${bootstrapCompileGlobalToken("${value.integer}")}${bootstrapCompileGlobalToken(if (value.boolean) "1" else "0")}${bootstrapCompileGlobalToken(value.text)}${bootstrapCompileGlobalToken(value.owner)}${bootstrapCompileGlobalToken("${value.fieldNames.size}")}"
     var index = 0
     while (index < value.fieldNames.size) {
@@ -8295,6 +8296,66 @@ class BootstrapEvaluator(
         result
     }
 
+    fun evaluateMapCall(
+        map: BootstrapEvalValue,
+        expression: BootstrapExpression
+    ): BootstrapEvalValue {
+        val keys = map.elements[0]
+        val values = map.elements[1]
+        val method = expression.text
+        val key = if (expression.children.size > 1) {
+            bootstrapEvalUnwrapBorrow(this.evaluate(expression.children[1]))
+        } else bootstrapEvalNull()
+        var entry = -1
+        var index = 0
+        while (expression.children.size > 1 && entry < 0 &&
+            index < keys.elements.size) {
+            if (bootstrapEvalEqual(keys.elements[index], key)) entry = index
+            index = index + 1
+        }
+        var result = bootstrapEvalVoid()
+        if (method == "get") {
+            result = if (entry >= 0) values.elements[entry] else bootstrapEvalNull()
+        } else if (method == "has") {
+            result = bootstrapEvalBoolean(entry >= 0)
+        } else if (method == "set" && expression.children.size == 3) {
+            val value = this.evaluate(expression.children[2])
+            if (entry >= 0) values.elements[entry] = value
+            else {
+                keys.elements.append(key)
+                values.elements.append(value)
+            }
+        } else if (method == "remove") {
+            if (entry >= 0) {
+                var shift = entry
+                while (shift + 1 < keys.elements.size) {
+                    keys.elements[shift] = keys.elements[shift + 1]
+                    values.elements[shift] = values.elements[shift + 1]
+                    shift = shift + 1
+                }
+                keys.elements.truncate(keys.elements.size - 1)
+                values.elements.truncate(values.elements.size - 1)
+            }
+            result = bootstrapEvalBoolean(entry >= 0)
+        } else if (method == "keys" || method == "values") {
+            val source = if (method == "keys") keys else values
+            val copy: array<BootstrapEvalValue> = []
+            var element = 0
+            while (element < source.elements.size) {
+                copy.append(source.elements[element])
+                element = element + 1
+            }
+            result = bootstrapEvalArray(copy)
+        } else if (method == "clear") {
+            keys.elements.truncate(0)
+            values.elements.truncate(0)
+        } else {
+            this.errors = this.errors + 1
+            result = bootstrapEvalInvalid()
+        }
+        result
+    }
+
     fun evaluate(expression: BootstrapExpression): BootstrapEvalValue {
         val errorsBefore = this.errors
         val diagnosticsBefore = this.diagnostics.size
@@ -8532,6 +8593,13 @@ class BootstrapEvaluator(
                 result = bootstrapEvalInvalid()
             }
         }
+        // A compile-time map: its keys and values in insertion order.
+        if (expression.kind == "call" && expression.text == "Map") {
+            result = BootstrapEvalValue(
+                "map", 0, false, "", [bootstrapEvalArray([]),
+                    bootstrapEvalArray([])], "", []
+            )
+        }
         if (expression.kind == "call" && expression.text == "Cell") {
             if (expression.children.size == 1) {
                 result = bootstrapEvalCell(
@@ -8562,7 +8630,8 @@ class BootstrapEvaluator(
         }
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
-            expression.text != "Cell" && expression.text != "filledArray") {
+            expression.text != "Cell" && expression.text != "filledArray" &&
+            expression.text != "Map") {
             result = this.evaluateCall(expression)
         }
         if (expression.kind == "compile") {
@@ -8858,6 +8927,10 @@ class BootstrapEvaluator(
                     result = bootstrapEvalInteger(receiver.text.size)
                 } else if (receiver.kind == "array") {
                     result = bootstrapEvalInteger(receiver.elements.size)
+                } else if (receiver.kind == "map") {
+                    result = bootstrapEvalInteger(
+                        receiver.elements[0].elements.size
+                    )
                 } else {
                     this.errors = this.errors + 1
                     result = result
@@ -8994,6 +9067,8 @@ class BootstrapEvaluator(
                 result = bootstrapEvalBoolean(
                     receiver.elements[0].elements[1].integer > 0
                 )
+            } else if (receiver.kind == "map") {
+                result = this.evaluateMapCall(receiver, expression)
             } else if (expression.text == "append" &&
                 receiver.kind == "array" &&
                 expression.children.size == 2) {

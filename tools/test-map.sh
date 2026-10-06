@@ -25,4 +25,13 @@ set +e
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
-echo "map: keys, values, removal, growth, under collection"
+# A map built at compile time.
+"$compiler" build \
+    "$project_root/tests/cases/modules/map-compile-time.ab" \
+    -o "$output_directory/compile-time" --no-cache
+set +e
+"$output_directory/compile-time"
+status=$?
+set -e
+[[ $status -eq 42 ]] || exit 1
+echo "map: keys, values, removal, growth, under collection, at compile time"
