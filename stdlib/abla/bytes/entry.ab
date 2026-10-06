@@ -2,6 +2,8 @@
 // chunks so converting to and from strings does not copy every byte. Backends
 // may specialize this public API to contiguous storage without changing users.
 
+import "abla/unsafe/memory"
+
 noescape extern:"intrinsic" fun ablaByteEncode(value: int): string
 noescape extern:"intrinsic" fun ablaByteChunksJoin(
     chunks: array<string>,
@@ -12,19 +14,29 @@ noescape extern:"intrinsic" fun ablaByteChunksJoin(
 // range. Unlike UTF-8 scalar encoding, values above 127 remain one byte.
 fun byteEncode(value: int): string = ablaByteEncode(value)
 
-// Small appends collect in `pending` and join into one chunk every
-// BYTE_BUFFER_PENDING pieces: a document written a token at a time (a JSON
-// encoder's punctuation, keys and numbers) otherwise kept a string and an
-// array slot per token alive until toText. Large appends stay their own
-// chunk, uncopied.
+// Small appends are copied into `stage`, a string the buffer alone owns and
+// writes in place; a full stage becomes a chunk as it is. Stages grow with the
+// buffer, from BYTE_BUFFER_FIRST bytes to BYTE_BUFFER_STAGE, so a buffer that
+// only ever holds a few bytes stays small. A document written a token at a time (a JSON
+// encoder's punctuation, keys and numbers) used to keep a string and an array
+// slot per token, and numbers are written without making a string at all
+// (appendInt, appendFixed).
+// Appends of BYTE_BUFFER_LARGE bytes or more stay their own chunk, uncopied.
 class ByteBuffer(
     val chunks: array<string>,
     var byteCount: int,
-    var pending: array<string> = [],
-    var pendingBytes: int = 0
+    var stage: string = "",
+    var staged: int = 0
 )
 
-val BYTE_BUFFER_PENDING = 256
+// True while ablac's compile-time evaluator runs the caller: the evaluator
+// answers this call itself, takes only the `then` branch of an
+// `if (ablaAtCompileTime())`, and counts the effects of that branch alone, so
+// the `else` may use raw memory it cannot. Compiled code always sees false.
+fun ablaAtCompileTime(): bool = false
+
+val BYTE_BUFFER_FIRST = 64
+val BYTE_BUFFER_STAGE = 4096
 val BYTE_BUFFER_LARGE = 256
 
 class ByteSlice(
@@ -50,33 +62,116 @@ fun bytes(text: string): ByteBuffer {
 fun ByteBuffer.size(): int = this.byteCount
 
 fun ByteBuffer.appendText(text: string): void {
-    if (text.size >= BYTE_BUFFER_LARGE) {
-        this.coalesce()
+    if (ablaAtCompileTime()) this.appendChunk(text)
+    else this.stageText(text)
+}
+
+fun ByteBuffer.appendChunk(text: string): void {
+    if (text.size > 0) {
+        this.seal()
         this.chunks.append(text)
         this.byteCount = this.byteCount + text.size
-    } else if (text.size > 0) {
-        this.pending.append(text)
-        this.pendingBytes = this.pendingBytes + text.size
+    }
+}
+
+trusted fun ByteBuffer.stageText(text: string): void {
+    if (text.size >= BYTE_BUFFER_LARGE) this.appendChunk(text)
+    else if (text.size > 0) {
+        ablaUnsafeCopyMemory(
+            this.stageReserve(text.size), ablaUnsafeStringAddress(text), text.size
+        )
+        this.staged = this.staged + text.size
         this.byteCount = this.byteCount + text.size
-        if (this.pending.size >= BYTE_BUFFER_PENDING) this.coalesce()
     }
 }
 
-// Joins the pending small appends into one chunk.
-fun ByteBuffer.coalesce(): void {
-    if (this.pending.size > 0) {
-        this.chunks.append(ablaByteChunksJoin(this.pending, this.pendingBytes))
-        this.pending = []
-        this.pendingBytes = 0
+// The address where `bytes` more bytes can be written into the stage, which
+// the caller then counts in `staged` and `byteCount`.
+trusted fun ByteBuffer.stageReserve(bytes: int): int {
+    if (this.staged + bytes > this.stage.size) {
+        this.seal()
+        var capacity = this.byteCount
+        if (capacity < BYTE_BUFFER_FIRST) capacity = BYTE_BUFFER_FIRST
+        if (capacity > BYTE_BUFFER_STAGE) capacity = BYTE_BUFFER_STAGE
+        if (capacity < bytes) capacity = bytes
+        this.stage = adoptNativeString(
+            ablaUnsafePointerAddress(ablaUnsafeAllocate(capacity + 1)), capacity
+        )
     }
+    ablaUnsafeStringAddress(this.stage) + this.staged
 }
 
-// The buffer's pieces in order: its chunks, then the pending appends.
-fun ByteBuffer.pieceCount(): int = this.chunks.size + this.pending.size
+// Moves the staged bytes into a chunk of their own.
+fun ByteBuffer.seal(): void {
+    if (this.staged > 0) this.chunks.append(this.stagedText())
+    this.stage = ""
+    this.staged = 0
+    return
+}
+
+fun ByteBuffer.stagedText(): string =
+    if (this.staged == this.stage.size) this.stage
+    else this.stage.slice(0, this.staged)
+
+// `value` in decimal, as "$value" writes it, straight into the stage.
+fun ByteBuffer.appendInt(value: int): void = this.appendFixed(value, 0)
+
+// `value` / 10^decimals in decimal with exactly `decimals` digits after the
+// point: (15, 1) "1.5", (5, 3) "0.005", (-25, 2) "-0.25", (7, 0) "7".
+fun ByteBuffer.appendFixed(value: int, decimals: int): void {
+    if (ablaAtCompileTime()) this.appendChunk(byteFixedText(value, decimals))
+    else this.stageFixed(value, decimals)
+}
+
+trusted fun ByteBuffer.stageFixed(value: int, decimals: int): void {
+    var digits = 1
+    var rest = value / 10
+    while (rest != 0) {
+        digits = digits + 1
+        rest = rest / 10
+    }
+    val sign = if (value < 0) 1 else 0
+    val whole = if (digits > decimals) digits - decimals else 1
+    val point = if (decimals > 0) sign + whole else -1
+    val length = sign + whole + (if (decimals > 0) 1 + decimals else 0)
+    val address = this.stageReserve(length)
+    if (sign == 1) ablaUnsafeStoreU8(nativePointerFromAddress(address), 45)
+    var remaining = value
+    var position = length - 1
+    while (position >= sign) {
+        if (position == point) {
+            ablaUnsafeStoreU8(nativePointerFromAddress(address + position), 46)
+        } else {
+            var digit = remaining - remaining / 10 * 10
+            if (digit < 0) digit = 0 - digit
+            ablaUnsafeStoreU8(nativePointerFromAddress(address + position), 48 + digit)
+            remaining = remaining / 10
+        }
+        position = position - 1
+    }
+    this.staged = this.staged + length
+    this.byteCount = this.byteCount + length
+    return
+}
+
+// appendFixed's text, made as a string.
+fun byteFixedText(value: int, decimals: int): string {
+    val text = "$value"
+    if (decimals <= 0) return text
+    val sign = if (value < 0) "-" else ""
+    var digits = if (value < 0) text.slice(1, text.size) else text
+    while (digits.size <= decimals) digits = "0$digits"
+    val point = digits.size - decimals
+    "$sign${digits.slice(0, point)}.${digits.slice(point, digits.size)}"
+}
+
+// The buffer's pieces in order: its chunks, then the staged bytes.
+fun ByteBuffer.pieceCount(): int =
+    this.chunks.size + (if (this.staged > 0) 1 else 0)
 
 fun ByteBuffer.piece(index: int): string =
     if (index < this.chunks.size) this.chunks[index]
-    else this.pending[index - this.chunks.size]
+    else this.stagedText()
 
 // A byte is represented by a one-byte string at the portable language layer.
 // This preserves all 256 values, including bytes originating in files/sockets,
@@ -102,26 +197,23 @@ fun ByteBuffer.appendBuffer(other: ByteBuffer): void {
 }
 
 fun ByteBuffer.byteAt(index: int): int {
-    var result = -1
+    if (index < 0 || index >= this.byteCount) return -1
     var offset = index
-    var chunk = 0
-    while (result < 0 && offset >= 0 && chunk < this.pieceCount()) {
-        val text = this.piece(chunk)
-        if (offset < text.size) result = text[offset]
-        else offset = offset - text.size
-        chunk = chunk + 1
+    for (chunk in this.chunks) {
+        if (offset < chunk.size) return chunk[offset]
+        offset = offset - chunk.size
     }
-    result
+    this.stage[offset]
 }
 
 fun ByteBuffer.slice(begin: int, end: int): borrow(this) ByteSlice =
     ByteSlice(this, begin, end)
 
 fun ByteBuffer.toText(): string {
-    if (this.pending.size == 0) return ablaByteChunksJoin(this.chunks, this.byteCount)
+    if (this.staged == 0) return ablaByteChunksJoin(this.chunks, this.byteCount)
     val pieces: array<string> = []
     for (chunk in this.chunks) pieces.append(chunk)
-    pieces.append(ablaByteChunksJoin(this.pending, this.pendingBytes))
+    pieces.append(this.stagedText())
     ablaByteChunksJoin(pieces, this.byteCount)
 }
 
