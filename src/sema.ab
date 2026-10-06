@@ -196,13 +196,23 @@ fun bootstrapOwnerHasField(
     found
 }
 
+// `this`, or a bare field name no parameter or local shadows here.
 fun bootstrapReceiverPlaceRoot(
     expression: BootstrapExpression,
     declarations: array<BootstrapDeclaration>,
-    owner: string
+    owner: string,
+    shadowed: array<string>
 ): bool {
     val root = bootstrapPlaceRootName(expression)
-    root == "this" || bootstrapOwnerHasField(declarations, owner, root)
+    root == "this" || (!bootstrapAffineNamesContain(shadowed, root) &&
+        bootstrapOwnerHasField(declarations, owner, root))
+}
+
+fun bootstrapNamesWith(names: array<string>, more: array<string>): array<string> {
+    val result: array<string> = []
+    for (name in names) result.append(name)
+    for (name in more) result.append(name)
+    result
 }
 
 fun bootstrapSummaryFieldType(
@@ -455,16 +465,19 @@ fun bootstrapExpressionMayMutateReceiver(
     declarations: array<BootstrapDeclaration>,
     owner: string,
     summary: BootstrapMutableReceiverSummary,
-    exclusive: BootstrapExclusiveArguments
+    exclusive: BootstrapExclusiveArguments,
+    shadowed: array<string>
 ): bool {
     var mutates = expression.kind == "assign" &&
+        !bootstrapAffineNamesContain(shadowed, expression.text) &&
         bootstrapOwnerHasField(declarations, owner, expression.text)
     if (!mutates && expression.kind == "member.assign" &&
         expression.children.size > 0) {
         mutates = bootstrapReceiverPlaceRoot(
             expression.children[0],
             declarations,
-            owner
+            owner,
+            shadowed
         )
     }
     if (!mutates && expression.kind == "index.assign" &&
@@ -472,7 +485,8 @@ fun bootstrapExpressionMayMutateReceiver(
         mutates = bootstrapReceiverPlaceRoot(
             expression.children[0],
             declarations,
-            owner
+            owner,
+            shadowed
         )
     }
     if (!mutates && expression.kind == "member.call" &&
@@ -491,7 +505,8 @@ fun bootstrapExpressionMayMutateReceiver(
             bootstrapReceiverPlaceRoot(
                 expression.children[0],
                 declarations,
-                owner
+                owner,
+                shadowed
             )) mutates = true
         var argument = 1
         while (!mutates && argument < expression.children.size) {
@@ -503,7 +518,8 @@ fun bootstrapExpressionMayMutateReceiver(
                 ) && bootstrapReceiverPlaceRoot(
                     expression.children[argument],
                     declarations,
-                    owner
+                    owner,
+                    shadowed
                 )) mutates = true
             argument = argument + 1
         }
@@ -519,20 +535,43 @@ fun bootstrapExpressionMayMutateReceiver(
                 ) && bootstrapReceiverPlaceRoot(
                     expression.children[argument],
                     declarations,
-                    owner
+                    owner,
+                    shadowed
                 )) mutates = true
             argument = argument + 1
         }
     }
+    // A parameter or local named like a field shadows it from its
+    // declaration on: `val keys = []; keys.append(k)` leaves `this` alone.
+    var scope = bootstrapNamesWith(shadowed, [])
     var child = 0
+    val lambda = expression.kind == "lambda" ||
+        expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator"
+    if (lambda) {
+        val parameters: array<string> = []
+        while (child + 1 < expression.children.size) {
+            parameters.append(expression.children[child].text)
+            child = child + 1
+        }
+        scope = bootstrapNamesWith(shadowed, parameters)
+    }
     while (!mutates && child < expression.children.size) {
+        val found = expression.children[child]
         mutates = bootstrapExpressionMayMutateReceiver(
-            expression.children[child],
+            found,
             declarations,
             owner,
             summary,
-            exclusive
+            exclusive,
+            if (expression.kind == "for" && child == 1) {
+                bootstrapNamesWith(scope, [expression.text])
+            } else scope
         )
+        if (expression.kind == "block" &&
+            (found.kind == "local.val" || found.kind == "local.var")) {
+            scope = bootstrapNamesWith(scope, [found.text])
+        }
         child = child + 1
     }
     mutates
@@ -572,7 +611,8 @@ fun bootstrapBuildMutableReceiverSummary(
                     declarations,
                     extensionOwner,
                     summary,
-                    exclusive
+                    exclusive,
+                    candidate.parameters
                 )) {
                 summary.owners.append(extensionOwner)
                 summary.methods.append(candidate.name)
@@ -596,7 +636,8 @@ fun bootstrapBuildMutableReceiverSummary(
                             declarations,
                             candidate.name,
                             summary,
-                            exclusive
+                            exclusive,
+                            found.parameters
                         )) {
                         summary.owners.append(candidate.name)
                         summary.methods.append(found.name)
