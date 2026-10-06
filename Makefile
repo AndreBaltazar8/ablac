@@ -89,6 +89,7 @@ test: ablac
 	tools/test-proc-self-exe.sh $(COMPILER)
 	tools/test-date.sh $(COMPILER)
 	tools/test-interpolate-fixed-width.sh $(COMPILER)
+	tools/test-contextual-keywords.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)
