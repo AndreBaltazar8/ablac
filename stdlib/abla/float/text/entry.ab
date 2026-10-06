@@ -19,12 +19,11 @@ fun f64Text(value: f64): string {
     // A whole number below 2^53 is its integer.
     val whole = f64ToInt(value)
     if (f64FromInt(whole) == value && whole < 9007199254740992 && whole > -9007199254740992) return "$whole"
-    // A short decimal: the fewest decimals k whose integer N = |value|·10^k (below 2^53)
-    // reads back as exactly the value, when no other k-decimal integer does — then N's
-    // digits are the shortest that round-trip and the nearest, which is what JavaScript
-    // writes. One exact IEEE division checks each candidate, so no big integers.
+    // Below 2^53 a fraction's shortest text has its fewest decimals k: found exactly in
+    // 128-bit arithmetic (f64TextShort), so no big integers. (Above, values are whole and
+    // JavaScript may shorten them to digits and zeros: the big-integer path below.)
     val magnitude = if (negative) 0.0 - value else value
-    if (magnitude >= 0.000001 && magnitude < 1000000000000000000000.0) {
+    if (magnitude >= 0.000001 && magnitude < 9007199254740992.0) {
         val short = f64TextShort(magnitude)
         if (short != "") return if (negative) "-$short" else short
     }
@@ -51,16 +50,20 @@ fun f64Text(value: f64): string {
     "$sign${mantissa}e${if (power < 0) "-" else "+"}${if (power < 0) 0 - power else power}"
 }
 
-/** |value| (1e-6 <= value < 1e21) as its shortest decimal when a small k finds it, else "". */
+/** |value| (1e-6 <= value < 2^53, not whole) as its shortest decimal, without big integers:
+ *  for k = 1, 2, … decimals, the integer nearest to value·10^k (exact, in 128-bit
+ *  arithmetic) is the closest k-decimal text, and the first that reads back as exactly
+ *  the value (f64ParseQuotient, also exact) is what JavaScript writes. "" when k would
+ *  pass 22 or the integer 10^18 (the big-integer path takes those). */
 fun f64TextShort(value: f64): string {
+    val bits = f64ToBits(value)
+    val ma = (bits & 4503599627370495) | 4503599627370496
+    val ea = ((bits >> 52) & 2047) - 1075
     var k = 1
     while (k <= 22) {
-        val scaled = value * F64_PARSE_TENS[k]
-        if (scaled >= 9007199254740992.0) return ""
-        val n = f64ToInt(scaled + 0.5)
-        val ten = F64_PARSE_TENS[k]
-        if (f64FromInt(n) / ten == value) {
-            if (f64FromInt(n - 1) / ten == value || f64FromInt(n + 1) / ten == value) return ""
+        val n = f64TextNearest(ma, ea, k)
+        if (n < 0) return ""
+        if (f64ParseQuotient(n, k) == value) {
             val digits = "$n"
             val point = digits.size - k
             if (point > 0) return "${digits.slice(0, point)}.${digits.slice(point, digits.size)}"
@@ -71,6 +74,56 @@ fun f64TextShort(value: f64): string {
         k += 1
     }
     ""
+}
+
+/** The integer nearest to ma·2^ea·10^k (ties to even), or -1 when it reaches 10^18. */
+fun f64TextNearest(ma: int, ea: int, k: int): int {
+    // ma·5^k: a 64 × 64 → 128-bit product (it fits 105 bits); then ·2^(ea + k).
+    val p = u64(ma)
+    val q = u64(F64_PARSE_FIVES[k])
+    val mask = u64(4294967295)
+    val p00 = (p & mask) * (q & mask)
+    val p01 = (p & mask) * (q >>> 32)
+    val p10 = (p >>> 32) * (q & mask)
+    val p11 = (p >>> 32) * (q >>> 32)
+    val mid = (p00 >>> 32) + (p01 & mask) + (p10 & mask)
+    val lo = (p00 & mask) | (mid << 32)
+    val hi = p11 + (p01 >>> 32) + (p10 >>> 32) + (mid >>> 32)
+    val shift = ea + k
+    if (shift >= 0) {
+        // Already whole: it must stay below 10^18 after the shift.
+        if (hi != u64(0) || shift >= 4 || lo >= (u64(1000000000000000000) >>> shift)) return -1
+        return int(lo << shift)
+    }
+    val t = 0 - shift
+    if (t >= 128) return 0
+    // n = floor(P / 2^t), the remainder against half of 2^t.
+    var n = u64(0)
+    var nHigh = u64(0)
+    if (t >= 64) {
+        n = if (t == 64) hi else hi >>> (t - 64)
+    } else {
+        n = (lo >>> t) | (hi << (64 - t))
+        nHigh = hi >>> t
+    }
+    if (nHigh != u64(0)) return -1
+    // Compare the dropped bits with 2^(t-1).
+    var above = false
+    var exact = false
+    if (t <= 64) {
+        val dropped = if (t == 64) lo else lo & ((u64(1) << t) - u64(1))
+        val half = u64(1) << (t - 1)
+        above = dropped > half
+        exact = dropped == half
+    } else {
+        val droppedHi = hi & ((u64(1) << (t - 64)) - u64(1))
+        val halfHi = u64(1) << (t - 65)
+        above = droppedHi > halfHi || (droppedHi == halfHi && lo != u64(0))
+        exact = droppedHi == halfHi && lo == u64(0)
+    }
+    if (above || (exact && (n & u64(1)) == u64(1))) n = n + u64(1)
+    if (n >= u64(1000000000000000000)) return -1
+    int(n)
 }
 
 // The shortest digits (Steele & White / Burger & Dybvig's free-format algorithm on exact
