@@ -1886,10 +1886,270 @@ fun bootstrapAliasShadowedAt(
     shadowed
 }
 
+// A module's top-level declaration shadows a same-named declaration of a
+// module it imports, directly or through others: it carries its module prefix
+// in the module and in the modules that import it plainly, so the two are not
+// duplicates. A same-named function with other parameters is an overload, not
+// a shadow. A runtime platform module's own names (the C externs `malloc`,
+// `write`, `pthread_*`) are private the same way, so a program may declare
+// them. Two modules that both declare a name and neither imports the other
+// stay a duplicate.
+class BootstrapModuleShadow(
+    val module: string,
+    val names: array<string>
+)
+
+fun bootstrapModuleShadowIndex(
+    shadows: array<BootstrapModuleShadow>,
+    module: string
+): int {
+    var result = -1
+    var index = 0
+    while (index < shadows.size && result < 0) {
+        if (shadows[index].module == module) result = index
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapRuntimePlatformModule(path: string): bool {
+    val platform = Path(bootstrapStandardLibraryRoot()).child(
+        "abla/runtime/platform"
+    )
+    path == bootstrapNormalizeModulePath(platform.child("host.ab").text) ||
+        path == bootstrapNormalizeModulePath(platform.child("wasm.ab").text)
+}
+
+fun bootstrapModuleShadowable(declaration: BootstrapDeclaration): bool =
+    declaration.name != "" && declaration.extensionOwner == "" &&
+    (declaration.kind == "fun" || declaration.kind == "extern" ||
+     declaration.kind == "compile.fun" || declaration.kind == "class" ||
+     declaration.kind == "interface" || declaration.kind == "type" ||
+     bootstrapDeclarationIsValue(declaration.kind))
+
+fun bootstrapModuleDeclares(
+    discovery: BootstrapParseResult,
+    name: string
+): bool {
+    var found = false
+    var declaration = 0
+    while (declaration < discovery.declarations.size && !found) {
+        if (discovery.declarations[declaration].extensionOwner == "" &&
+            discovery.declarations[declaration].name == name) found = true
+        declaration = declaration + 1
+    }
+    found
+}
+
+// Whether module `from` imports module `to`, directly or through others.
+fun bootstrapModuleReaches(
+    from: int,
+    to: int,
+    edgeImporters: array<int>,
+    edgeTargets: array<int>,
+    moduleCount: int
+): bool {
+    val visited = filledArray(moduleCount, false)
+    val pending: array<int> = [from]
+    visited[from] = true
+    var found = false
+    while (pending.size > 0 && !found) {
+        val module = pending[pending.size - 1]
+        pending.truncate(pending.size - 1)
+        var edge = 0
+        while (edge < edgeImporters.size) {
+            val target = edgeTargets[edge]
+            if (edgeImporters[edge] == module && target >= 0 &&
+                !visited[target]) {
+                if (target == to) found = true
+                visited[target] = true
+                pending.append(target)
+            }
+            edge = edge + 1
+        }
+    }
+    found
+}
+
+fun bootstrapCollectShadowEntries(
+    snapshot: BootstrapModuleSnapshot,
+    module: int,
+    var shadowModules: array<int>,
+    var shadowNames: array<string>,
+    var entryModules: array<int>,
+    var entryDeclarations: array<int>,
+    var entryNames: array<string>
+): void {
+    val platform = bootstrapRuntimePlatformModule(snapshot.path)
+    var declaration = 0
+    while (declaration < snapshot.discovery.declarations.size) {
+        val candidate = snapshot.discovery.declarations[declaration]
+        val name = candidate.name
+        if (bootstrapModuleShadowable(candidate)) {
+            if (platform && !(name.size >= 6 &&
+                name.slice(0, 6) == "__abla")) {
+                shadowModules.append(module)
+                shadowNames.append(name)
+            } else {
+                entryModules.append(module)
+                entryDeclarations.append(declaration)
+                entryNames.append(name)
+            }
+        }
+        declaration = declaration + 1
+    }
+    return
+}
+
+fun bootstrapAppendShadowNames(
+    shadow: BootstrapModuleShadow,
+    prefix: string,
+    importer: BootstrapParseResult,
+    skipDeclared: bool,
+    var names: array<string>,
+    var replacements: array<string>
+): void {
+    var index = 0
+    while (index < shadow.names.size) {
+        val name = shadow.names[index]
+        if (!skipDeclared || !bootstrapModuleDeclares(importer, name)) {
+            names.append(name)
+            replacements.append("$prefix$name")
+        }
+        index = index + 1
+    }
+    return
+}
+
+fun bootstrapModuleShadows(
+    aliases: array<BootstrapModuleAlias>,
+    snapshots: array<BootstrapModuleSnapshot>
+): array<BootstrapModuleShadow> {
+    val shadowModules: array<int> = []
+    val shadowNames: array<string> = []
+    val entryModules: array<int> = []
+    val entryDeclarations: array<int> = []
+    val entryNames: array<string> = []
+    var module = 0
+    while (module < snapshots.size) {
+        // An aliased module's names all carry its prefix already.
+        if (bootstrapModuleAliasTargetPrefix(
+            aliases, snapshots[module].path
+        ) == "") {
+            bootstrapCollectShadowEntries(
+                snapshots[module], module, shadowModules, shadowNames,
+                entryModules, entryDeclarations, entryNames
+            )
+        }
+        module = module + 1
+    }
+    // Chain the entries of each name: `heads` holds a name's first entry,
+    // `chains` the next entry of the same name.
+    var capacity = 8
+    while (capacity < entryNames.size * 2 + 1) capacity = capacity * 2
+    val heads = filledArray(capacity, -1)
+    val chains = filledArray(entryNames.size, -1)
+    val shared: array<int> = []
+    var entry = 0
+    while (entry < entryNames.size) {
+        var slot = bootstrapNamedTargetHash(entryNames[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val head = heads[slot]
+            if (head < 0) {
+                heads[slot] = entry
+                placed = true
+            } else if (entryNames[head] == entryNames[entry]) {
+                if (chains[head] < 0) shared.append(head)
+                chains[entry] = chains[head]
+                chains[head] = entry
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    if (shared.size > 0) {
+        val edgeImporters: array<int> = []
+        val edgeTargets: array<int> = []
+        var edge = 0
+        while (edge < aliases.size) {
+            var importer = -1
+            var target = -1
+            var candidate = 0
+            while (candidate < snapshots.size) {
+                if (snapshots[candidate].path == aliases[edge].importer) {
+                    importer = candidate
+                }
+                if (snapshots[candidate].path == aliases[edge].target) {
+                    target = candidate
+                }
+                candidate = candidate + 1
+            }
+            edgeImporters.append(importer)
+            edgeTargets.append(target)
+            edge = edge + 1
+        }
+        var group = 0
+        while (group < shared.size) {
+            var first = shared[group]
+            while (first >= 0) {
+                val firstDeclaration = snapshots[entryModules[first]]
+                    .discovery.declarations[entryDeclarations[first]]
+                var shadows = false
+                var second = shared[group]
+                while (second >= 0 && !shadows) {
+                    if (entryModules[second] != entryModules[first] &&
+                        !bootstrapDeclarationsOverload(
+                            firstDeclaration,
+                            snapshots[entryModules[second]]
+                                .discovery.declarations[
+                                    entryDeclarations[second]
+                                ]
+                        ) &&
+                        bootstrapModuleReaches(
+                            entryModules[first], entryModules[second],
+                            edgeImporters, edgeTargets, snapshots.size
+                        )) shadows = true
+                    second = chains[second]
+                }
+                if (shadows) {
+                    shadowModules.append(entryModules[first])
+                    shadowNames.append(entryNames[first])
+                }
+                first = chains[first]
+            }
+            group = group + 1
+        }
+    }
+    val result: array<BootstrapModuleShadow> = []
+    module = 0
+    while (module < snapshots.size) {
+        val names: array<string> = []
+        var index = 0
+        while (index < shadowModules.size) {
+            if (shadowModules[index] == module &&
+                !bootstrapAffineNamesContain(names, shadowNames[index])) {
+                names.append(shadowNames[index])
+            }
+            index = index + 1
+        }
+        if (names.size > 0) {
+            result.append(BootstrapModuleShadow(snapshots[module].path, names))
+        }
+        module = module + 1
+    }
+    result
+}
+
 fun bootstrapRewriteModuleSource(
     snapshot: BootstrapModuleSnapshot,
     aliases: array<BootstrapModuleAlias>,
-    snapshots: array<BootstrapModuleSnapshot>
+    snapshots: array<BootstrapModuleSnapshot>,
+    shadows: array<BootstrapModuleShadow>
 ): string {
     val names: array<string> = []
     val replacements: array<string> = []
@@ -1899,6 +2159,18 @@ fun bootstrapRewriteModuleSource(
     if (ownPrefix != "") {
         bootstrapAppendPrefixedNames(
             snapshot.discovery, ownPrefix, names, replacements
+        )
+    }
+    // This module's shadowing declarations, named with its prefix except
+    // inside a declaration that binds the name itself (a field, parameter or
+    // local) other than the shadowing declaration.
+    val shadowedFrom = names.size
+    val ownShadows = bootstrapModuleShadowIndex(shadows, snapshot.path)
+    if (ownPrefix == "" && ownShadows >= 0) {
+        bootstrapAppendShadowNames(
+            shadows[ownShadows],
+            bootstrapModuleCanonicalPrefix(snapshot.path),
+            snapshot.discovery, false, names, replacements
         )
     }
     // A module imported plainly here but under an alias elsewhere carries its
@@ -1923,9 +2195,22 @@ fun bootstrapRewriteModuleSource(
             }
             target = target + 1
         }
+        // A plainly imported module's shadowing declarations, unless this
+        // module declares the name itself.
+        val targetShadows = if (edge.importer == snapshot.path &&
+            edge.alias == "" && targetPrefix == "") {
+            bootstrapModuleShadowIndex(shadows, edge.target)
+        } else -1
+        if (targetShadows >= 0) {
+            bootstrapAppendShadowNames(
+                shadows[targetShadows],
+                bootstrapModuleCanonicalPrefix(edge.target),
+                snapshot.discovery, true, names, replacements
+            )
+        }
         edgeIndex = edgeIndex + 1
     }
-    val declarationBounds = if (importedFrom < names.size) {
+    val declarationBounds = if (shadowedFrom < names.size) {
         bootstrapDeclarationBoundNames(snapshot.source, snapshot.discovery)
     } else []
     val localAliases: array<string> = []
@@ -1989,13 +2274,24 @@ fun bootstrapRewriteModuleSource(
                         candidate = candidate + 1
                     }
                 }
-                val enclosing = if (replacement >= importedFrom) {
+                val enclosing = if (replacement >= shadowedFrom) {
                     bootstrapDeclarationAt(snapshot.discovery, token.begin)
                 } else -1
-                if (enclosing >= 0 && enclosing < declarationBounds.size &&
-                    bootstrapAffineNamesContain(
-                        declarationBounds[enclosing], names[replacement]
-                    )) replacement = -1
+                // In the shadowing declaration itself the name is that
+                // declaration; elsewhere a `fun` of that name is a method.
+                val declaring = enclosing >= 0 &&
+                    replacement < importedFrom &&
+                    snapshot.discovery.declarations[enclosing].name ==
+                        names[replacement]
+                if (enclosing >= 0 && !declaring &&
+                    ((enclosing < declarationBounds.size &&
+                      bootstrapAffineNamesContain(
+                          declarationBounds[enclosing], names[replacement]
+                      )) ||
+                     (tokenIndex > 0 &&
+                      tokens[tokenIndex - 1].kind == "fun"))) {
+                    replacement = -1
+                }
                 if (replacement >= 0) {
                     output =
                         "$output${snapshot.source.slice(cursor, token.begin)}${replacements[replacement]}"
@@ -2081,9 +2377,12 @@ fun bootstrapAppendPrefixedNames(
 fun bootstrapPrepareModuleSnapshot(
     snapshot: BootstrapModuleSnapshot,
     aliases: array<BootstrapModuleAlias>,
-    snapshots: array<BootstrapModuleSnapshot>
+    snapshots: array<BootstrapModuleSnapshot>,
+    shadows: array<BootstrapModuleShadow>
 ): BootstrapModuleSnapshot {
-    val source = bootstrapRewriteModuleSource(snapshot, aliases, snapshots)
+    val source = bootstrapRewriteModuleSource(
+        snapshot, aliases, snapshots, shadows
+    )
     val contractOnly = bootstrapModuleIsContractTarget(aliases, snapshot.path)
     // The common unaliased module needs no rewritten-source snapshot. Reuse
     // its already compact discovery record instead of parsing and retaining a
@@ -2455,12 +2754,16 @@ class BootstrapModuleGraph(
         val handlerDeclarations: array<BootstrapDeclaration> = []
         val importedRegistrations: array<BootstrapSubparserRegistration> = []
         val preparedSnapshots: array<BootstrapModuleSnapshot> = []
+        val shadows = bootstrapModuleShadows(
+            this.aliases, this.orderedSnapshots
+        )
         var preparedIndex = 0
         while (preparedIndex < this.orderedSnapshots.size) {
             preparedSnapshots.append(bootstrapPrepareModuleSnapshot(
                 this.orderedSnapshots[preparedIndex],
                 this.aliases,
-                this.orderedSnapshots
+                this.orderedSnapshots,
+                shadows
             ))
             preparedIndex = preparedIndex + 1
         }
