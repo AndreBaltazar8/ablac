@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fixed-width integers (i8 to u64) interpolate as their decimal values.
+# Fixed-width integers (i8 to u64) interpolate as their decimal values, and
+# a string read through a borrowed alias interpolates.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -15,4 +16,14 @@ set +e
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
-echo "interpolate fixed width: i8 to u64"
+
+# A string reached through a borrowed alias interpolates too.
+"$compiler" build \
+    "$project_root/tests/cases/modules/interpolate-borrowed.ab" \
+    -o "$output_directory/borrowed" --no-cache
+set +e
+"$output_directory/borrowed"
+status=$?
+set -e
+[[ $status -eq 42 ]] || exit 1
+echo "interpolate fixed width: i8 to u64, borrowed strings"
