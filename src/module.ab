@@ -1888,7 +1888,8 @@ fun bootstrapAliasShadowedAt(
 
 fun bootstrapRewriteModuleSource(
     snapshot: BootstrapModuleSnapshot,
-    aliases: array<BootstrapModuleAlias>
+    aliases: array<BootstrapModuleAlias>,
+    snapshots: array<BootstrapModuleSnapshot>
 ): string {
     val names: array<string> = []
     val replacements: array<string> = []
@@ -1896,16 +1897,37 @@ fun bootstrapRewriteModuleSource(
         aliases, snapshot.path
     )
     if (ownPrefix != "") {
-        var declaration = 0
-        while (declaration < snapshot.discovery.declarations.size) {
-            val name = snapshot.discovery.declarations[declaration].name
-            if (name != "") {
-                names.append(name)
-                replacements.append("$ownPrefix$name")
-            }
-            declaration = declaration + 1
-        }
+        bootstrapAppendPrefixedNames(
+            snapshot.discovery, ownPrefix, names, replacements
+        )
     }
+    // A module imported plainly here but under an alias elsewhere carries its
+    // module prefix everywhere: its bare names in this module mean those,
+    // except inside a declaration that binds the name itself (a field,
+    // parameter or local), where it is shadowed as it would be unaliased.
+    val importedFrom = names.size
+    var edgeIndex = 0
+    while (edgeIndex < aliases.size) {
+        val edge = aliases[edgeIndex]
+        val targetPrefix = if (edge.importer == snapshot.path &&
+            edge.alias == "") {
+            bootstrapModuleAliasTargetPrefix(aliases, edge.target)
+        } else ""
+        var target = 0
+        while (targetPrefix != "" && target < snapshots.size) {
+            if (snapshots[target].path == edge.target) {
+                bootstrapAppendPrefixedNames(
+                    snapshots[target].discovery, targetPrefix,
+                    names, replacements
+                )
+            }
+            target = target + 1
+        }
+        edgeIndex = edgeIndex + 1
+    }
+    val declarationBounds = if (importedFrom < names.size) {
+        bootstrapDeclarationBoundNames(snapshot.source, snapshot.discovery)
+    } else []
     val localAliases: array<string> = []
     val aliasPrefixes: array<string> = []
     var aliasIndex = 0
@@ -1967,6 +1989,13 @@ fun bootstrapRewriteModuleSource(
                         candidate = candidate + 1
                     }
                 }
+                val enclosing = if (replacement >= importedFrom) {
+                    bootstrapDeclarationAt(snapshot.discovery, token.begin)
+                } else -1
+                if (enclosing >= 0 && enclosing < declarationBounds.size &&
+                    bootstrapAffineNamesContain(
+                        declarationBounds[enclosing], names[replacement]
+                    )) replacement = -1
                 if (replacement >= 0) {
                     output =
                         "$output${snapshot.source.slice(cursor, token.begin)}${replacements[replacement]}"
@@ -1979,11 +2008,82 @@ fun bootstrapRewriteModuleSource(
     }
 }
 
+// For each top-level declaration, the names it binds inside itself:
+// declared with `val`/`var`/`own`, typed (`name: T`, a field or a
+// parameter), a lambda's parameters (`{ a, b ->`) or a `for` variable.
+fun bootstrapDeclarationBoundNames(
+    source: string,
+    discovery: BootstrapParseResult
+): array<array<string>> {
+    val tokens = bootstrapLex(source)
+    val result: array<array<string>> = []
+    var declaration = 0
+    while (declaration < discovery.declarations.size) {
+        result.append([])
+        declaration = declaration + 1
+    }
+    var index = 0
+    var current = 0
+    while (index < tokens.size) {
+        while (current < discovery.declarations.size &&
+            discovery.declarations[current].end <= tokens[index].begin) {
+            current = current + 1
+        }
+        val inside = current < discovery.declarations.size &&
+            discovery.declarations[current].begin <= tokens[index].begin
+        if (inside && tokens[index].kind == "identifier") {
+            val previous = if (index > 0) tokens[index - 1].kind else ""
+            val next = if (index + 1 < tokens.size) tokens[index + 1].kind else ""
+            if (previous == "val" || previous == "var" || previous == "own" ||
+                next == ":" || next == "->" ||
+                (previous == "{" && next == ",") ||
+                (previous == "(" && next == "in")) {
+                result[current].append(bootstrapTokenText(source, tokens[index]))
+            }
+        }
+        index = index + 1
+    }
+    result
+}
+
+// The top-level declaration spanning `offset`, or -1.
+fun bootstrapDeclarationAt(discovery: BootstrapParseResult, offset: int): int {
+    var result = -1
+    var declaration = 0
+    while (declaration < discovery.declarations.size) {
+        if (discovery.declarations[declaration].begin <= offset &&
+            offset < discovery.declarations[declaration].end) {
+            result = declaration
+        }
+        declaration = declaration + 1
+    }
+    result
+}
+
+fun bootstrapAppendPrefixedNames(
+    discovery: BootstrapParseResult,
+    prefix: string,
+    var names: array<string>,
+    var replacements: array<string>
+): void {
+    var declaration = 0
+    while (declaration < discovery.declarations.size) {
+        val name = discovery.declarations[declaration].name
+        if (name != "") {
+            names.append(name)
+            replacements.append("$prefix$name")
+        }
+        declaration = declaration + 1
+    }
+    return
+}
+
 fun bootstrapPrepareModuleSnapshot(
     snapshot: BootstrapModuleSnapshot,
-    aliases: array<BootstrapModuleAlias>
+    aliases: array<BootstrapModuleAlias>,
+    snapshots: array<BootstrapModuleSnapshot>
 ): BootstrapModuleSnapshot {
-    val source = bootstrapRewriteModuleSource(snapshot, aliases)
+    val source = bootstrapRewriteModuleSource(snapshot, aliases, snapshots)
     val contractOnly = bootstrapModuleIsContractTarget(aliases, snapshot.path)
     // The common unaliased module needs no rewritten-source snapshot. Reuse
     // its already compact discovery record instead of parsing and retaining a
@@ -2359,7 +2459,8 @@ class BootstrapModuleGraph(
         while (preparedIndex < this.orderedSnapshots.size) {
             preparedSnapshots.append(bootstrapPrepareModuleSnapshot(
                 this.orderedSnapshots[preparedIndex],
-                this.aliases
+                this.aliases,
+                this.orderedSnapshots
             ))
             preparedIndex = preparedIndex + 1
         }

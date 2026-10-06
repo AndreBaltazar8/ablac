@@ -52,6 +52,15 @@ alias_externs_status=$?
 set -e
 [[ $alias_externs_status -eq 42 ]]
 
+"$compiler" build \
+    "$project_root/tests/cases/modules/import-alias-plain.ab" \
+    -o "$output/import-alias-plain" --no-cache
+set +e
+"$project_root/tools/run-limited.sh" "$output/import-alias-plain"
+alias_plain_status=$?
+set -e
+[[ $alias_plain_status -eq 42 ]]
+
 check_invalid() {
     local fixture=$1
     local code=$2
