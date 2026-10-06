@@ -67,6 +67,7 @@ test: ablac
 	tools/test-native-cstring-lifetime.sh $(COMPILER)
 	tools/test-nominal-scalars.sh $(COMPILER)
 	tools/test-native-width-integers.sh $(COMPILER)
+	tools/test-fixed-width-boxed-arithmetic.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)

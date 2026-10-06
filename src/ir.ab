@@ -1340,6 +1340,11 @@ fun bootstrapIrIsLocalZero(opcode: string): bool =
     opcode == "local.zero.bool" || opcode == "local.zero.f64" ||
     opcode == "local.zero.f32"
 
+// Arithmetic over these types wraps at their width; boxed values are 64-bit.
+fun bootstrapIrFixedWidthInteger(type: string): bool =
+    type == "i8" || type == "u8" || type == "i16" || type == "u16" ||
+    type == "i32" || type == "u32" || type == "u64"
+
 fun bootstrapIrLocalZeroOpcode(type: string): string {
     val normalized = bootstrapNormalizeType(type)
     if (bootstrapIsIntegerScalarType(normalized)) {
@@ -5328,6 +5333,18 @@ class BootstrapLowerer(
         if (underlying == normalized) normalized else underlying
     }
 
+    // The backend types an arithmetic result by its left operand, and a
+    // field, an element or a call reaches it boxed: an i32 field times an
+    // i32 multiplied as 64 bits and never wrapped. Casting a fixed-width
+    // operand to its type keeps the operation at that width.
+    fun lowerArithmeticOperand(expression: BootstrapExpression): int {
+        val type = this.lowerRuntimeType(this.lowerExpressionType(expression))
+        val value = this.lowerExpression(expression)
+        if (bootstrapIrFixedWidthInteger(type)) {
+            this.emit("scalar.cast", value, -1, type)
+        } else value
+    }
+
     fun lowerGlobalFunctionType(name: string): string {
         var result = "unknown"
         var current = name
@@ -7110,7 +7127,9 @@ class BootstrapLowerer(
         }
         if (!negativeLiteral && (expression.kind == "unary-" ||
             expression.kind == "unary!" || expression.kind == "unary~")) {
-            val operand = this.lowerExpression(expression.children[0])
+            val operand = if (expression.kind == "unary!") {
+                this.lowerExpression(expression.children[0])
+            } else this.lowerArithmeticOperand(expression.children[0])
             var opcode = if (expression.kind == "unary-") "neg" else "not"
             if (expression.kind == "unary~") opcode = "bit.not"
             result = this.emit(opcode, operand, -1, "")
@@ -7147,7 +7166,13 @@ class BootstrapLowerer(
                     "string.equal"
                 } else "string.not.equal"
             }
-            val left = this.lowerExpression(expression.children[0])
+            val arithmetic = opcode == expression.kind &&
+                expression.kind != "==" && expression.kind != "!=" &&
+                expression.kind != "<" && expression.kind != "<=" &&
+                expression.kind != ">" && expression.kind != ">="
+            val left = if (arithmetic) {
+                this.lowerArithmeticOperand(expression.children[0])
+            } else this.lowerExpression(expression.children[0])
             val right = this.lowerExpression(expression.children[1])
             result = this.emit(opcode, left, right, "")
         }
