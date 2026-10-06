@@ -83,6 +83,7 @@ test: ablac
 	tools/test-json-limits.sh $(COMPILER)
 	tools/test-string-plus.sh $(COMPILER)
 	tools/test-process-exit.sh $(COMPILER)
+	tools/test-main-void.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
 	tools/test-native-function-address.sh $(COMPILER)
 	tools/test-native-initialize-globals.sh $(COMPILER)
