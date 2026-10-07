@@ -255,8 +255,44 @@ class BootstrapInstruction(
     val operands: array<int>,
     // Structured string operands avoid flattening and re-slicing large text
     // payloads such as architecture-owned assembly blocks.
-    val texts: array<string>
+    val texts: array<string>,
+    // The source position the instruction was lowered from (see
+    // bootstrapIrSourcePositionOf), or -1. Debug information maps it to a file,
+    // line and column; nothing else reads it.
+    val position: int
 )
+
+// Source files that lowered positions refer to, by index. A position packs
+// the file index above the byte offset: file * 2^32 + offset.
+var bootstrapIrSourceFiles: array<string> = []
+// The position the lowerer is at (the expression it is lowering), the file of
+// the declaration being lowered, and that function's readable name.
+var bootstrapIrSourcePosition: int = -1
+var bootstrapIrSourceFile: int = -1
+var bootstrapIrSourceLabel: string = ""
+
+fun bootstrapIrSourceFileIndex(path: string): int {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < bootstrapIrSourceFiles.size) {
+        if (bootstrapIrSourceFiles[index] == path) found = index
+        index = index + 1
+    }
+    if (found < 0 && path != "") {
+        found = bootstrapIrSourceFiles.size
+        bootstrapIrSourceFiles.append(path)
+    }
+    found
+}
+
+fun bootstrapIrSourcePositionOf(file: int, offset: int): int =
+    if (file < 0 || offset < 0) -1 else file * 4294967296 + offset
+
+fun bootstrapIrSourcePositionFile(position: int): int =
+    if (position < 0) -1 else position / 4294967296
+
+fun bootstrapIrSourcePositionOffset(position: int): int =
+    if (position < 0) -1 else position - (position / 4294967296) * 4294967296
 
 class BootstrapIrProgram(
     val instructions: array<BootstrapInstruction>,
@@ -457,7 +493,11 @@ class BootstrapIrFunction(
     // Optional target object-file section. This is a generic linker/codegen
     // property; target packages choose section names and policies.
     val section: string,
-    val verificationErrors: int
+    val verificationErrors: int,
+    // Debug information: the readable name ("Owner.method") and the source
+    // position of the declaration (bootstrapIrSourcePositionOf), or -1.
+    val label: string,
+    val position: int
 )
 
 class BootstrapIrFunctionSnapshot(
@@ -573,7 +613,8 @@ fun bootstrapCloneIrFunction(
             instruction.target,
             instruction.alternate,
             bootstrapCloneIrIntegers(instruction.operands),
-            bootstrapCloneIrStrings(instruction.texts)
+            bootstrapCloneIrStrings(instruction.texts),
+            instruction.position
         ))
         index = index + 1
     }
@@ -617,7 +658,9 @@ fun bootstrapCloneIrFunction(
         function.noinlineHint,
         function.naked,
         function.section,
-        function.verificationErrors
+        function.verificationErrors,
+        function.label,
+        function.position
     )
 }
 
@@ -2362,7 +2405,9 @@ fun bootstrapFinalizeIrFunction(
     inlineHint: bool = false,
     noinlineHint: bool = false,
     naked: bool = false,
-    section: string = ""
+    section: string = "",
+    label: string = "",
+    position: int = -1
 ): BootstrapIrFunction {
     val canonical: array<BootstrapInstruction> = []
     var terminated = false
@@ -2372,7 +2417,8 @@ fun bootstrapFinalizeIrFunction(
         if (instruction.opcode == "label") {
             if (canonical.size > 0 && !terminated) {
                 canonical.append(BootstrapInstruction(
-                    "jump", -1, -1, -1, "", instruction.target, -1, [], []
+                    "jump", -1, -1, -1, "", instruction.target, -1, [], [],
+                    instruction.position
                 ))
             }
             canonical.append(instruction)
@@ -2389,8 +2435,11 @@ fun bootstrapFinalizeIrFunction(
         }
         index = index + 1
     }
+    // An implicit return belongs to the body's last line.
     if (!terminated) canonical.append(BootstrapInstruction(
-        "return", -1, result, -1, "", -1, -1, [], []
+        "return", -1, result, -1, "", -1, -1, [], [],
+        if (canonical.size > 0) canonical[canonical.size - 1].position
+        else bootstrapIrSourcePosition
     ))
 
     val initialBlocks = bootstrapBuildIrBlocks(canonical)
@@ -2490,7 +2539,9 @@ fun bootstrapFinalizeIrFunction(
         noinlineHint,
         naked,
         section,
-        errors
+        errors,
+        label,
+        position
     )
 }
 
@@ -2607,7 +2658,8 @@ class BootstrapDropBuilder(
         val result = this.nextValue
         this.nextValue = this.nextValue + 1
         this.instructions.append(BootstrapInstruction(
-            opcode, result, left, right, text, -1, -1, [], []
+            opcode, result, left, right, text, -1, -1, [], [],
+            bootstrapIrSourcePosition
         ))
         result
     }
@@ -2620,7 +2672,8 @@ class BootstrapDropBuilder(
         if (operands.size > 0) left = operands[0]
         if (operands.size > 1) right = operands[1]
         this.instructions.append(BootstrapInstruction(
-            opcode, result, left, right, text, -1, -1, operands, []
+            opcode, result, left, right, text, -1, -1, operands, [],
+            bootstrapIrSourcePosition
         ))
         result
     }
@@ -2633,7 +2686,8 @@ class BootstrapDropBuilder(
         text: string
     ): void {
         this.instructions.append(BootstrapInstruction(
-            opcode, -1, value, -1, text, target, alternate, [], []
+            opcode, -1, value, -1, text, target, alternate, [], [],
+            bootstrapIrSourcePosition
         ))
     }
 
@@ -5761,7 +5815,8 @@ class BootstrapLowerer(
             -1,
             -1,
             [],
-            []
+            [],
+            bootstrapIrSourcePosition
         ))
         result
     }
@@ -5782,7 +5837,8 @@ class BootstrapLowerer(
             target,
             alternate,
             [],
-            []
+            [],
+            bootstrapIrSourcePosition
         ))
     }
 
@@ -5806,7 +5862,8 @@ class BootstrapLowerer(
             -1,
             -1,
             operands,
-            []
+            [],
+            bootstrapIrSourcePosition
         ))
         result
     }
@@ -5832,7 +5889,8 @@ class BootstrapLowerer(
             -1,
             -1,
             operands,
-            texts
+            texts,
+            bootstrapIrSourcePosition
         ))
         result
     }
@@ -5858,7 +5916,8 @@ class BootstrapLowerer(
             index,
             -1,
             operands,
-            []
+            [],
+            bootstrapIrSourcePosition
         ))
         result
     }
@@ -6075,7 +6134,22 @@ class BootstrapLowerer(
         this.emit("local.load", -1, -1, temporary)
     }
 
+    // Lowers an expression with the source position at it, so the
+    // instructions it emits map back to it (debug information).
     fun lowerExpression(expression: BootstrapExpression): int {
+        val savedPosition = bootstrapIrSourcePosition
+        if (bootstrapIrSourceFile >= 0 && expression.begin >= 0 &&
+            expression.end > expression.begin) {
+            bootstrapIrSourcePosition = bootstrapIrSourcePositionOf(
+                bootstrapIrSourceFile, expression.begin
+            )
+        }
+        val result = this.lowerExpressionAt(expression)
+        bootstrapIrSourcePosition = savedPosition
+        result
+    }
+
+    fun lowerExpressionAt(expression: BootstrapExpression): int {
         var result = -1
         if (expression.kind == "integer") {
             result = this.emit("const.i64", -1, -1, expression.text)
@@ -6435,6 +6509,15 @@ class BootstrapLowerer(
                 lambdaLowerer.localStorage,
                 bootstrapIrRuntimeTypes(
                     this.declarations, lambdaLowerer.localTypes
+                ),
+                false,
+                false,
+                false,
+                "",
+                if (bootstrapIrSourceLabel == "") "lambda"
+                    else "${bootstrapIrSourceLabel}.lambda",
+                bootstrapIrSourcePositionOf(
+                    bootstrapIrSourceFile, expression.begin
                 )
             )
             this.errors = this.errors + lambdaFunction.verificationErrors
@@ -7834,6 +7917,19 @@ class BootstrapLowerer(
             declaration.expression,
             functionImplicitResults
         )
+        val savedSourceFile = bootstrapIrSourceFile
+        val savedSourcePosition = bootstrapIrSourcePosition
+        val savedSourceLabel = bootstrapIrSourceLabel
+        bootstrapIrSourceFile = if (declaration.generatedNamespace != "") -1
+            else bootstrapIrSourceFileIndex(declaration.sourceIdentity)
+        val functionPosition = bootstrapIrSourcePositionOf(
+            bootstrapIrSourceFile, declaration.begin
+        )
+        val functionLabel = if (declaration.extensionOwner != "")
+            "${declaration.extensionOwner}.${declaration.name}"
+            else declaration.name
+        bootstrapIrSourcePosition = functionPosition
+        bootstrapIrSourceLabel = functionLabel
         val functionParameters: array<string> = []
         val functionParameterTypes: array<string> = []
         val functionOwnedParameters: array<string> = []
@@ -7947,8 +8043,13 @@ class BootstrapLowerer(
             bootstrapDeclarationHasAnnotation(declaration, "inline"),
             bootstrapDeclarationHasAnnotation(declaration, "noinline"),
             bootstrapDeclarationHasAnnotation(declaration, "naked"),
-            bootstrapDeclarationStringAnnotation(declaration, "section")
+            bootstrapDeclarationStringAnnotation(declaration, "section"),
+            functionLabel,
+            functionPosition
         )
+        bootstrapIrSourceFile = savedSourceFile
+        bootstrapIrSourcePosition = savedSourcePosition
+        bootstrapIrSourceLabel = savedSourceLabel
         val loweringErrors = functionLowerer.errors - this.errors
         val reportedFunction = BootstrapIrFunction(
             loweredFunction.name,
@@ -7964,7 +8065,9 @@ class BootstrapLowerer(
             loweredFunction.noinlineHint,
             loweredFunction.naked,
             loweredFunction.section,
-            loweredFunction.verificationErrors + loweringErrors
+            loweredFunction.verificationErrors + loweringErrors,
+            loweredFunction.label,
+            loweredFunction.position
         )
         if (reportedFunction.verificationErrors > 0) {
             bootstrapIrTraceMemory(
@@ -7997,6 +8100,21 @@ class BootstrapLowerer(
         val functionEvaluatedResults: array<int> = []
         val methodImplicitResults: array<BootstrapExpression> = []
         this.collectImplicitResults(method.expression, methodImplicitResults)
+        val savedSourceFile = bootstrapIrSourceFile
+        val savedSourcePosition = bootstrapIrSourcePosition
+        val savedSourceLabel = bootstrapIrSourceLabel
+        bootstrapIrSourceFile = if (method.generatedNamespace != "" ||
+            owner.generatedNamespace != "") -1
+            else bootstrapIrSourceFileIndex(
+                if (method.sourceIdentity != "") method.sourceIdentity
+                else owner.sourceIdentity
+            )
+        val methodPosition = bootstrapIrSourcePositionOf(
+            bootstrapIrSourceFile, method.begin
+        )
+        val methodLabel = "${owner.name}.${method.name}"
+        bootstrapIrSourcePosition = methodPosition
+        bootstrapIrSourceLabel = methodLabel
         val methodParameters: array<string> = ["this"]
         val methodParameterTypes: array<string> = [owner.name]
         val methodOwnedParameters: array<string> = []
@@ -8090,8 +8208,16 @@ class BootstrapLowerer(
             bootstrapIrRuntimeTypes(
                 this.declarations, methodLowerer.localTypes
             ),
-            bootstrapDeclarationHasAnnotation(method, "inline")
+            bootstrapDeclarationHasAnnotation(method, "inline"),
+            false,
+            false,
+            "",
+            methodLabel,
+            methodPosition
         )
+        bootstrapIrSourceFile = savedSourceFile
+        bootstrapIrSourcePosition = savedSourcePosition
+        bootstrapIrSourceLabel = savedSourceLabel
         val loweringErrors = methodLowerer.errors - this.errors
         val reportedMethod = BootstrapIrFunction(
             loweredMethod.name,
@@ -8107,7 +8233,9 @@ class BootstrapLowerer(
             loweredMethod.noinlineHint,
             loweredMethod.naked,
             loweredMethod.section,
-            loweredMethod.verificationErrors + loweringErrors
+            loweredMethod.verificationErrors + loweringErrors,
+            loweredMethod.label,
+            loweredMethod.position
         )
         if (reportedMethod.verificationErrors > 0) {
             bootstrapIrTraceMemory(
@@ -8427,8 +8555,16 @@ class BootstrapLowerer(
                 methodIndex = methodIndex + 1
             }
             if (declaration.kind == "val" || declaration.kind == "var") {
+                bootstrapIrSourceFile =
+                    if (declaration.generatedNamespace != "") -1
+                    else bootstrapIrSourceFileIndex(declaration.sourceIdentity)
+                bootstrapIrSourcePosition = bootstrapIrSourcePositionOf(
+                    bootstrapIrSourceFile, declaration.begin
+                )
                 val value = this.lowerExpression(declaration.expression)
                 this.emit("global.store", value, -1, declaration.name)
+                bootstrapIrSourceFile = -1
+                bootstrapIrSourcePosition = -1
             }
             if (declaration.kind == "fun" &&
                 declaration.expression.kind != "missing") {
@@ -8547,7 +8683,9 @@ class BootstrapLowerer(
                 function.noinlineHint,
                 function.naked,
                 function.section,
-                function.verificationErrors
+                function.verificationErrors,
+                function.label,
+                function.position
             ))
             runtimeFunction = runtimeFunction + 1
         }

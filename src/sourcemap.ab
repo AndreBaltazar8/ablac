@@ -1,0 +1,738 @@
+// Debug artifacts of a WebAssembly module built with debug information:
+//
+//   <module>.debug.wasm  the module with its DWARF, for debuggers that read it
+//                        (browser developer tools' DWARF support);
+//   <module>.map         a source map from code offsets to Abla file:line:col,
+//                        with the sources inlined, for developer tools without
+//                        DWARF support and for symbolizing stacks at run time;
+//   <module>             the module itself keeps its name section, loses the
+//                        DWARF and names both files in custom sections
+//                        (sourceMappingURL, external_debug_info), as URLs
+//                        relative to the module's own.
+//
+// The line table comes from llvm-dwarfdump; the module's sections are
+// rewritten here.
+
+import "abla/bytes"
+import "abla/json"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
+
+class BootstrapSourceMapRows(
+    val addresses: array<int>,
+    val files: array<int>,
+    val lines: array<int>,
+    val columns: array<int>,
+    // The absolute path of each file index used by `files`.
+    val paths: array<string>
+)
+
+fun bootstrapSourceMapParseInt(text: string, begin: int, end: int): int {
+    var value = 0
+    var index = begin
+    while (index < end && text[index] >= 48 && text[index] <= 57) {
+        value = value * 10 + text[index] - 48
+        index = index + 1
+    }
+    value
+}
+
+fun bootstrapSourceMapParseHex(text: string, begin: int, end: int): int {
+    var value = 0
+    var index = begin
+    if (index + 1 < end && text[index] == 48 &&
+        (text[index + 1] == 120 || text[index + 1] == 88)) index = index + 2
+    var digits = true
+    while (digits && index < end) {
+        val c = text[index]
+        if (c >= 48 && c <= 57) value = value * 16 + c - 48
+        else if (c >= 97 && c <= 102) value = value * 16 + c - 87
+        else if (c >= 65 && c <= 70) value = value * 16 + c - 55
+        else digits = false
+        index = index + 1
+    }
+    value
+}
+
+// The fields of one line, split on spaces.
+fun bootstrapSourceMapFields(text: string, begin: int, end: int): array<string> {
+    val fields: array<string> = []
+    var index = begin
+    while (index < end) {
+        while (index < end && (text[index] == 32 || text[index] == 9)) {
+            index = index + 1
+        }
+        val fieldBegin = index
+        while (index < end && text[index] != 32 && text[index] != 9) {
+            index = index + 1
+        }
+        if (index > fieldBegin) fields.append(text.slice(fieldBegin, index))
+    }
+    fields
+}
+
+// The quoted value in `name: "value"` / `[  1] = "value"`.
+fun bootstrapSourceMapQuoted(text: string, begin: int, end: int): string {
+    var open = begin
+    while (open < end && text[open] != 34) open = open + 1
+    var close = end - 1
+    while (close > open && text[close] != 34) close = close - 1
+    if (close > open) text.slice(open + 1, close) else ""
+}
+
+fun bootstrapSourceMapStartsWith(
+    text: string,
+    begin: int,
+    end: int,
+    prefix: string
+): bool = end - begin >= prefix.size &&
+    text.slice(begin, begin + prefix.size) == prefix
+
+fun bootstrapSourceMapJoin(directory: string, name: string): string =
+    if (name.size > 0 && name[0] == 47) name
+    else if (directory == "") name
+    else "$directory/$name"
+
+// Reads `llvm-dwarfdump --debug-line` output: every row with a line, its
+// address (relative to the code section) and absolute file.
+fun bootstrapSourceMapReadLineTables(dump: string): BootstrapSourceMapRows {
+    val rows = BootstrapSourceMapRows([], [], [], [], [])
+    var directories: array<string> = []
+    var fileNames: array<string> = []
+    var fileDirectories: array<int> = []
+    // Per table: the global path index of each of its file indices.
+    var fileIndices: array<int> = []
+    var resolved = false
+    var lineBegin = 0
+    while (lineBegin < dump.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < dump.size && dump[lineEnd] != 10) lineEnd = lineEnd + 1
+        var begin = lineBegin
+        while (begin < lineEnd && (dump[begin] == 32 || dump[begin] == 9)) {
+            begin = begin + 1
+        }
+        if (bootstrapSourceMapStartsWith(dump, begin, lineEnd, "debug_line[")) {
+            directories = []
+            fileNames = []
+            fileDirectories = []
+            fileIndices = []
+            resolved = false
+        } else if (bootstrapSourceMapStartsWith(
+            dump, begin, lineEnd, "include_directories["
+        )) {
+            var close = begin
+            while (close < lineEnd && dump[close] != 93) close = close + 1
+            var number = begin + 20
+            while (number < close && dump[number] == 32) number = number + 1
+            val index = bootstrapSourceMapParseInt(dump, number, close)
+            while (directories.size <= index) directories.append("")
+            directories[index] =
+                bootstrapSourceMapQuoted(dump, close, lineEnd)
+        } else if (bootstrapSourceMapStartsWith(
+            dump, begin, lineEnd, "file_names["
+        )) {
+            var close = begin
+            while (close < lineEnd && dump[close] != 93) close = close + 1
+            var number = begin + 11
+            while (number < close && dump[number] == 32) number = number + 1
+            val index = bootstrapSourceMapParseInt(dump, number, close)
+            while (fileNames.size <= index) {
+                fileNames.append("")
+                fileDirectories.append(0)
+            }
+        } else if (bootstrapSourceMapStartsWith(
+            dump, begin, lineEnd, "name:"
+        ) && fileNames.size > 0) {
+            fileNames[fileNames.size - 1] =
+                bootstrapSourceMapQuoted(dump, begin, lineEnd)
+        } else if (bootstrapSourceMapStartsWith(
+            dump, begin, lineEnd, "dir_index:"
+        ) && fileDirectories.size > 0) {
+            fileDirectories[fileDirectories.size - 1] =
+                bootstrapSourceMapParseInt(
+                    dump, begin + 11, lineEnd
+                )
+        } else if (bootstrapSourceMapStartsWith(dump, begin, lineEnd, "0x")) {
+            if (!resolved) {
+                var file = 0
+                while (file < fileNames.size) {
+                    val directory = if (fileDirectories[file] <
+                        directories.size) directories[fileDirectories[file]]
+                    else ""
+                    val path = bootstrapSourceMapJoin(
+                        directory, fileNames[file]
+                    )
+                    var found = -1
+                    var known = 0
+                    while (found < 0 && known < rows.paths.size) {
+                        if (rows.paths[known] == path) found = known
+                        known = known + 1
+                    }
+                    if (found < 0 && fileNames[file] != "") {
+                        found = rows.paths.size
+                        rows.paths.append(path)
+                    }
+                    fileIndices.append(found)
+                    file = file + 1
+                }
+                resolved = true
+            }
+            val fields = bootstrapSourceMapFields(dump, begin, lineEnd)
+            var endSequence = false
+            for (field in fields) {
+                if (field == "end_sequence") endSequence = true
+            }
+            if (fields.size >= 4 && !endSequence) {
+                val line = bootstrapSourceMapParseInt(
+                    fields[1], 0, fields[1].size
+                )
+                val file = bootstrapSourceMapParseInt(
+                    fields[3], 0, fields[3].size
+                )
+                if (line > 0 && file < fileIndices.size &&
+                    fileIndices[file] >= 0) {
+                    rows.addresses.append(bootstrapSourceMapParseHex(
+                        fields[0], 0, fields[0].size
+                    ))
+                    rows.files.append(fileIndices[file])
+                    rows.lines.append(line)
+                    rows.columns.append(bootstrapSourceMapParseInt(
+                        fields[2], 0, fields[2].size
+                    ))
+                }
+            }
+        }
+        lineBegin = lineEnd + 1
+    }
+    rows
+}
+
+// The row indices in address order (a stable merge sort).
+fun bootstrapSourceMapOrder(addresses: array<int>): array<int> {
+    val order: array<int> = []
+    val scratch: array<int> = []
+    var sorted = true
+    var index = 0
+    while (index < addresses.size) {
+        order.append(index)
+        scratch.append(index)
+        if (index > 0 && addresses[index] < addresses[index - 1]) sorted = false
+        index = index + 1
+    }
+    var width = if (sorted) order.size else 1
+    while (width < order.size) {
+        var begin = 0
+        while (begin < order.size) {
+            val middle = if (begin + width < order.size) begin + width
+                else order.size
+            val end = if (begin + 2 * width < order.size) begin + 2 * width
+                else order.size
+            var left = begin
+            var right = middle
+            var out = begin
+            while (out < end) {
+                if (left < middle && (right >= end ||
+                    addresses[order[left]] <= addresses[order[right]])) {
+                    scratch[out] = order[left]
+                    left = left + 1
+                } else {
+                    scratch[out] = order[right]
+                    right = right + 1
+                }
+                out = out + 1
+            }
+            begin = end
+        }
+        index = 0
+        while (index < order.size) {
+            order[index] = scratch[index]
+            index = index + 1
+        }
+        width = width * 2
+    }
+    order
+}
+
+val bootstrapSourceMapBase64: string =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fun bootstrapSourceMapAppendVlq(var output: ByteBuffer, value: int): void {
+    var remaining = if (value < 0) ((0 - value) * 2) + 1 else value * 2
+    var more = true
+    while (more) {
+        var digit = remaining - (remaining / 32) * 32
+        remaining = remaining / 32
+        if (remaining > 0) digit = digit + 32 else more = false
+        output.appendByteValue(bootstrapSourceMapBase64[digit])
+    }
+    return
+}
+
+// The source map JSON for `rows`, with code offsets moved by `codeOffset`.
+fun bootstrapSourceMapJson(
+    rows: BootstrapSourceMapRows,
+    codeOffset: int,
+    file: string
+): string {
+    val order = bootstrapSourceMapOrder(rows.addresses)
+    var mappings = byteBuffer()
+    var previousColumn = 0
+    var previousSource = 0
+    var previousLine = 0
+    var previousOriginalColumn = 0
+    var lastSource = -1
+    var lastLine = -1
+    var lastColumn = -1
+    var first = true
+    for (row in order) {
+        val source = rows.files[row]
+        val line = rows.lines[row] - 1
+        val column = if (rows.columns[row] > 0) rows.columns[row] - 1 else 0
+        // Consecutive rows at one source position collapse to the first.
+        if (source != lastSource || line != lastLine || column != lastColumn) {
+            if (!first) mappings.appendText(",")
+            first = false
+            val generated = codeOffset + rows.addresses[row]
+            bootstrapSourceMapAppendVlq(mappings, generated - previousColumn)
+            bootstrapSourceMapAppendVlq(mappings, source - previousSource)
+            bootstrapSourceMapAppendVlq(mappings, line - previousLine)
+            bootstrapSourceMapAppendVlq(
+                mappings, column - previousOriginalColumn
+            )
+            previousColumn = generated
+            previousSource = source
+            previousLine = line
+            previousOriginalColumn = column
+            lastSource = source
+            lastLine = line
+            lastColumn = column
+        }
+    }
+    var json = byteBuffer()
+    json.appendText("{\"version\":3,\"file\":")
+    json.appendText(jsonQuote(file))
+    json.appendText(",\"sources\":[")
+    var index = 0
+    while (index < rows.paths.size) {
+        if (index > 0) json.appendText(",")
+        json.appendText(jsonQuote("file://${rows.paths[index]}"))
+        index = index + 1
+    }
+    json.appendText("],\"sourcesContent\":[")
+    index = 0
+    while (index < rows.paths.size) {
+        if (index > 0) json.appendText(",")
+        val source = Path(rows.paths[index])
+        json.appendText(
+            if (source.exists()) jsonQuote(source.readText()) else "null"
+        )
+        index = index + 1
+    }
+    json.appendText("],\"names\":[],\"mappings\":\"")
+    json.appendBuffer(mappings)
+    json.appendText("\"}\n")
+    json.toText()
+}
+
+fun bootstrapSourceMapAppendLeb(var output: ByteBuffer, value: int): void {
+    var remaining = value
+    var more = true
+    while (more) {
+        var byte = remaining - (remaining / 128) * 128
+        remaining = remaining / 128
+        if (remaining > 0) byte = byte + 128 else more = false
+        output.appendByteValue(byte)
+    }
+    return
+}
+
+// A custom section `name` holding one string (its length, then its bytes).
+fun bootstrapSourceMapAppendStringSection(
+    var output: ByteBuffer,
+    name: string,
+    value: string
+): void {
+    var payload = byteBuffer()
+    bootstrapSourceMapAppendLeb(payload, name.size)
+    payload.appendText(name)
+    bootstrapSourceMapAppendLeb(payload, value.size)
+    payload.appendText(value)
+    output.appendByteValue(0)
+    bootstrapSourceMapAppendLeb(output, payload.size())
+    output.appendBuffer(payload)
+    return
+}
+
+class BootstrapSourceMapLeb(val value: int, val end: int)
+
+fun bootstrapSourceMapReadLeb(bytes: string, begin: int): BootstrapSourceMapLeb {
+    var value = 0
+    var factor = 1
+    var index = begin
+    var more = true
+    while (more && index < bytes.size) {
+        val byte = bytes[index]
+        value = value + (byte - (byte / 128) * 128) * factor
+        factor = factor * 128
+        more = byte >= 128
+        index = index + 1
+    }
+    BootstrapSourceMapLeb(value, index)
+}
+
+class BootstrapSourceMapModule(val bytes: string, val codeOffset: int)
+
+// The module without its DWARF sections and without the name section's
+// module name (engines prefix every frame's function name with it), with
+// the sourceMappingURL and external_debug_info sections added; and where its
+// code section's contents begin (-1 when the bytes are no module).
+fun bootstrapSourceMapRewriteModule(
+    module: string,
+    mapUrl: string,
+    debugUrl: string
+): BootstrapSourceMapModule {
+    var output = byteBuffer()
+    var valid = module.size >= 8 && module[0] == 0 && module[1] == 97 &&
+        module[2] == 115 && module[3] == 109
+    if (valid) output.appendText(module.slice(0, 8))
+    var codeOffset = -1
+    var cursor = 8
+    while (valid && cursor < module.size) {
+        val id = module[cursor]
+        val size = bootstrapSourceMapReadLeb(module, cursor + 1)
+        val payloadEnd = size.end + size.value
+        if (payloadEnd > module.size) valid = false
+        else if (id == 0) {
+            val nameLength = bootstrapSourceMapReadLeb(module, size.end)
+            val name = module.slice(
+                nameLength.end, nameLength.end + nameLength.value
+            )
+            if (name == "name") {
+                // Subsections: an id, a size and the contents; 0 is the
+                // module's name.
+                var kept = byteBuffer()
+                bootstrapSourceMapAppendLeb(kept, 4)
+                kept.appendText("name")
+                var subsection = nameLength.end + nameLength.value
+                while (subsection < payloadEnd) {
+                    val subsectionSize = bootstrapSourceMapReadLeb(
+                        module, subsection + 1
+                    )
+                    val subsectionEnd =
+                        subsectionSize.end + subsectionSize.value
+                    if (module[subsection] != 0) {
+                        kept.appendText(module.slice(subsection, subsectionEnd))
+                    }
+                    subsection = subsectionEnd
+                }
+                output.appendByteValue(0)
+                bootstrapSourceMapAppendLeb(output, kept.size())
+                output.appendBuffer(kept)
+            } else if (name.size < 7 || name.slice(0, 7) != ".debug_") {
+                output.appendText(module.slice(cursor, payloadEnd))
+            }
+        } else {
+            // Sections are copied with their headers as they are, so the
+            // code's offset is its header's end in the output.
+            if (id == 10) codeOffset = output.size() + (size.end - cursor)
+            output.appendText(module.slice(cursor, payloadEnd))
+        }
+        cursor = payloadEnd
+    }
+    if (valid) {
+        bootstrapSourceMapAppendStringSection(
+            output, "sourceMappingURL", mapUrl
+        )
+        bootstrapSourceMapAppendStringSection(
+            output, "external_debug_info", debugUrl
+        )
+    }
+    BootstrapSourceMapModule(
+        if (valid) output.toText() else "",
+        if (valid) codeOffset else -1
+    )
+}
+
+fun bootstrapSourceMapBaseName(path: string): string {
+    var slash = path.size - 1
+    while (slash >= 0 && path[slash] != 47) slash = slash - 1
+    path.slice(slash + 1, path.size)
+}
+
+// Splits the debug information of the module at `modulePath` (to be
+// published as `outputPath`) into the artifacts described above. 0 on
+// success.
+fun bootstrapWasmDebugArtifacts(modulePath: string, outputPath: string): int {
+    val name = bootstrapSourceMapBaseName(outputPath)
+    val debugPath = "$outputPath.debug.wasm"
+    val mapPath = "$outputPath.map"
+    val dumpPath = "$modulePath.debug-line"
+    val infoPath = "$modulePath.debug-info"
+    val module = Path(modulePath).readText()
+    var status = if (Path(debugPath).writeTextAtomic(module)) 0 else 1
+    val rewritten = bootstrapSourceMapRewriteModule(
+        module, "$name.map", "$name.debug.wasm"
+    )
+    if (status == 0 && rewritten.codeOffset < 0) status = 1
+    if (status == 0 && !Path(modulePath).writeTextAtomic(rewritten.bytes)) {
+        status = 1
+    }
+    if (status == 0) {
+        val dump = linuxCommand("llvm-dwarfdump")
+        dump.argument("--debug-line")
+        dump.argument("-o")
+        dump.argument(dumpPath)
+        dump.argument(debugPath)
+        status = dump.run()
+    }
+    if (status == 0) {
+        val info = linuxCommand("llvm-dwarfdump")
+        info.argument("--debug-info")
+        info.argument("-o")
+        info.argument(infoPath)
+        info.argument(debugPath)
+        status = info.run()
+    }
+    if (status == 0) {
+        var rows = bootstrapSourceMapReadLineTables(Path(dumpPath).readText())
+        bootstrapSourceMapApplyCalls(
+            rows,
+            bootstrapSourceMapReadInlineCalls(
+                Path(infoPath).readText(), rows.paths
+            )
+        )
+        if (!Path(mapPath).writeTextAtomic(
+            bootstrapSourceMapJson(rows, rewritten.codeOffset, name)
+        )) status = 1
+    }
+    Path(dumpPath).remove()
+    Path(infoPath).remove()
+    if (status != 0) {
+        linuxPrintStandardError(
+            "error[E_DEBUG_INFO]: could not write the WebAssembly debug files for $outputPath\n"
+        )
+    }
+    status
+}
+
+// Where each function's top-level inlined calls were made: code ranges
+// [begins, ends) with the call's position. A caller's frame inside one maps to
+// its own line (the call) rather than to the inlined body's.
+class BootstrapSourceMapCalls(
+    val begins: array<int>,
+    val ends: array<int>,
+    val files: array<int>,
+    val lines: array<int>,
+    val columns: array<int>
+)
+
+fun bootstrapSourceMapPathIndex(var paths: array<string>, path: string): int {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < paths.size) {
+        if (paths[index] == path) found = index
+        index = index + 1
+    }
+    if (found < 0) {
+        found = paths.size
+        paths.append(path)
+    }
+    found
+}
+
+// The value in parentheses after an attribute name ("DW_AT_call_line (12)").
+fun bootstrapSourceMapAttribute(text: string, begin: int, end: int): string {
+    var open = begin
+    while (open < end && text[open] != 40) open = open + 1
+    var close = end - 1
+    while (close > open && text[close] != 41) close = close - 1
+    if (close > open) text.slice(open + 1, close) else ""
+}
+
+fun bootstrapSourceMapSetRange(
+    var begins: array<int>,
+    var ends: array<int>,
+    index: int,
+    begin: int,
+    end: int
+): void {
+    if (index < begins.size) {
+        begins[index] = begin
+        ends[index] = end
+    } else {
+        begins.append(begin)
+        ends.append(end)
+    }
+    return
+}
+
+// Reads `llvm-dwarfdump --debug-info` output for the inlined calls made
+// directly in a function's body (an inlined subroutine whose parent is a
+// subprogram).
+fun bootstrapSourceMapReadInlineCalls(
+    dump: string,
+    var paths: array<string>
+): BootstrapSourceMapCalls {
+    val calls = BootstrapSourceMapCalls([], [], [], [], [])
+    val stackIndents: array<int> = []
+    val stackTags: array<string> = []
+    var depth = 0
+    var collecting = false
+    var inRanges = false
+    val rangeBegins: array<int> = []
+    val rangeEnds: array<int> = []
+    var rangeCount = 0
+    var lowPc = -1
+    var highPc = -1
+    var callFile = ""
+    var callLine = 0
+    var callColumn = 0
+    var lineBegin = 0
+    while (lineBegin <= dump.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < dump.size && dump[lineEnd] != 10) lineEnd = lineEnd + 1
+        var begin = lineBegin
+        while (begin < lineEnd && (dump[begin] == 32 || dump[begin] == 9)) {
+            begin = begin + 1
+        }
+        // An entry starts "0x0000002a:   DW_TAG_…" (or NULL); its depth is
+        // its tag's indentation.
+        var tagAt = -1
+        if (bootstrapSourceMapStartsWith(dump, begin, lineEnd, "0x")) {
+            var colon = begin
+            while (colon < lineEnd && dump[colon] != 58) colon = colon + 1
+            if (colon < lineEnd) {
+                tagAt = colon + 1
+                while (tagAt < lineEnd && dump[tagAt] == 32) tagAt = tagAt + 1
+                if (!bootstrapSourceMapStartsWith(dump, tagAt, lineEnd, "DW_TAG_") &&
+                    !bootstrapSourceMapStartsWith(dump, tagAt, lineEnd, "NULL")) {
+                    tagAt = -1
+                }
+            }
+        }
+        if (tagAt >= 0 || lineBegin >= dump.size) {
+            // The previous entry ends: keep it if it was a top-level call.
+            if (collecting && callLine > 0) {
+                if (lowPc >= 0 && highPc > lowPc) {
+                    bootstrapSourceMapSetRange(
+                        rangeBegins, rangeEnds, rangeCount, lowPc, highPc
+                    )
+                    rangeCount = rangeCount + 1
+                }
+                val file = bootstrapSourceMapPathIndex(paths, callFile)
+                var range = 0
+                while (range < rangeCount) {
+                    calls.begins.append(rangeBegins[range])
+                    calls.ends.append(rangeEnds[range])
+                    calls.files.append(file)
+                    calls.lines.append(callLine)
+                    calls.columns.append(callColumn)
+                    range = range + 1
+                }
+            }
+            collecting = false
+            inRanges = false
+            rangeCount = 0
+            lowPc = -1
+            highPc = -1
+            callFile = ""
+            callLine = 0
+            callColumn = 0
+        }
+        if (tagAt >= 0) {
+            val indent = tagAt - lineBegin
+            while (depth > 0 && stackIndents[depth - 1] >= indent) depth = depth - 1
+            var tagEnd = tagAt
+            while (tagEnd < lineEnd && dump[tagEnd] != 32 &&
+                dump[tagEnd] != 9 && dump[tagEnd] != 13) tagEnd = tagEnd + 1
+            val tag = dump.slice(tagAt, tagEnd)
+            collecting = tag == "DW_TAG_inlined_subroutine" && depth > 0 &&
+                stackTags[depth - 1] == "DW_TAG_subprogram"
+            if (tag != "NULL") {
+                if (depth < stackIndents.size) {
+                    stackIndents[depth] = indent
+                    stackTags[depth] = tag
+                } else {
+                    stackIndents.append(indent)
+                    stackTags.append(tag)
+                }
+                depth = depth + 1
+            }
+        } else if (collecting) {
+            if (bootstrapSourceMapStartsWith(dump, begin, lineEnd, "DW_AT_low_pc")) {
+                val value = bootstrapSourceMapAttribute(dump, begin, lineEnd)
+                lowPc = bootstrapSourceMapParseHex(value, 0, value.size)
+            } else if (bootstrapSourceMapStartsWith(
+                dump, begin, lineEnd, "DW_AT_high_pc"
+            )) {
+                val value = bootstrapSourceMapAttribute(dump, begin, lineEnd)
+                highPc = bootstrapSourceMapParseHex(value, 0, value.size)
+            } else if (bootstrapSourceMapStartsWith(
+                dump, begin, lineEnd, "DW_AT_ranges"
+            )) {
+                inRanges = true
+            } else if (inRanges && begin < lineEnd && dump[begin] == 91) {
+                // "[0x00000002, 0x00000021)"
+                var comma = begin
+                while (comma < lineEnd && dump[comma] != 44) comma = comma + 1
+                var second = comma + 1
+                while (second < lineEnd && dump[second] == 32) second = second + 1
+                bootstrapSourceMapSetRange(
+                    rangeBegins, rangeEnds, rangeCount,
+                    bootstrapSourceMapParseHex(dump, begin + 1, comma),
+                    bootstrapSourceMapParseHex(dump, second, lineEnd)
+                )
+                rangeCount = rangeCount + 1
+            } else if (bootstrapSourceMapStartsWith(
+                dump, begin, lineEnd, "DW_AT_call_file"
+            )) {
+                inRanges = false
+                callFile = bootstrapSourceMapQuoted(dump, begin, lineEnd)
+            } else if (bootstrapSourceMapStartsWith(
+                dump, begin, lineEnd, "DW_AT_call_line"
+            )) {
+                val value = bootstrapSourceMapAttribute(dump, begin, lineEnd)
+                callLine = bootstrapSourceMapParseInt(value, 0, value.size)
+            } else if (bootstrapSourceMapStartsWith(
+                dump, begin, lineEnd, "DW_AT_call_column"
+            )) {
+                val value = bootstrapSourceMapAttribute(dump, begin, lineEnd)
+                callColumn = bootstrapSourceMapParseInt(value, 0, value.size)
+            } else if (bootstrapSourceMapStartsWith(dump, begin, lineEnd, "DW_AT_")) {
+                inRanges = false
+            }
+        }
+        lineBegin = lineEnd + 1
+    }
+    calls
+}
+
+// Moves the rows inside a top-level inlined call to the call's position.
+fun bootstrapSourceMapApplyCalls(
+    var rows: BootstrapSourceMapRows,
+    calls: BootstrapSourceMapCalls
+): void {
+    val order = bootstrapSourceMapOrder(calls.begins)
+    var row = 0
+    while (row < rows.addresses.size) {
+        val address = rows.addresses[row]
+        var low = 0
+        var high = order.size - 1
+        var found = -1
+        while (low <= high) {
+            val middle = (low + high) / 2
+            if (calls.begins[order[middle]] <= address) {
+                found = middle
+                low = middle + 1
+            } else high = middle - 1
+        }
+        if (found >= 0 && address < calls.ends[order[found]]) {
+            val call = order[found]
+            rows.files[row] = calls.files[call]
+            rows.lines[row] = calls.lines[call]
+            rows.columns[row] = calls.columns[call]
+        }
+        row = row + 1
+    }
+    return
+}

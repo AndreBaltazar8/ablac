@@ -15,6 +15,7 @@ invocation-relative paths.
 ablac build app.ab -o build/app
 ablac build app.ab -o build/app --fast
 ablac build app.ab -o build/app --fast --no-cache
+ablac build app.ab -o build/app -g        # debug information in a release build
 ablac run app.ab
 ablac repl
 ablac serve app.ab
@@ -49,7 +50,14 @@ Programmable external targets can additionally request a generic `module`
 artifact. The current WebAssembly linker produces a no-entry module, preserves
 explicit foreign exports, retains unresolved symbols from explicit foreign
 declarations as ordinary `env` function imports, and strips PID-bearing name
-metadata for byte-level reproducibility. The embedding runtime must validate
+metadata for byte-level reproducibility. A build with debug information keeps
+the function names and publishes `<module>.map` and `<module>.debug.wasm`
+beside the module.
+
+Development (`--fast`) builds carry debug information: DWARF line tables,
+readable function symbols and, natively, frame pointers and a printed stack on
+a crash. Release builds don't; `-g`/`--debug`, `--no-debug` and
+`ABLA_DEBUG=1|0` override either. See [debugging.md](debugging.md). The embedding runtime must validate
 the imported symbol names and signatures before instantiation.
 
 An extension-defined target with linker flavor and emulation `none` may use

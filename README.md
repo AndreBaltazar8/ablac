@@ -228,6 +228,7 @@ under `build/`.
 
 - [Language contract](docs/language.md)
 - [Toolchain interface](docs/toolchain.md)
+- [Debugging: lldb, crash stacks, browser developer tools](docs/debugging.md)
 - [Compiler extension API](docs/compiler-api.md)
 - [Programmable builds](docs/programmable-builds.md)
 - [Package imports](docs/packages.md)

@@ -1,5 +1,6 @@
 import "backend/llvm/backend.ab"
 import "module.ab"
+import "sourcemap.ab"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
@@ -753,7 +754,17 @@ fun bootstrapAddLlvmElfFunctionSections(llvm: string): string {
             if (nameEnd > nameBegin && body < llvm.size &&
                 llvm[body] == 123) {
                 val name = llvm.slice(nameBegin, nameEnd)
-                insertionOffsets.append(body)
+                // The section goes before metadata attachments (a debug
+                // build's `!dbg !N`), which must come last.
+                var sectionAt = body
+                var attachment = nameEnd
+                while (attachment + 5 < body) {
+                    if (llvm.slice(attachment, attachment + 5) == " !dbg") {
+                        sectionAt = attachment + 1
+                    }
+                    attachment = attachment + 1
+                }
+                insertionOffsets.append(sectionAt)
                 insertionNames.append(name)
                 extraBytes = extraBytes + 17 + name.size
             }
@@ -1340,7 +1351,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "$graphIdentity\n${snapshot.path}:${snapshot.size}:${snapshot.firstFingerprint}:${snapshot.secondFingerprint}"
         identityModule = identityModule + 1
     }
-    val sourceIdentity = "$graphIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact"
+    val sourceIdentity = "$graphIdentity\nabla-manifest:${manifest.size}\n$manifest\nabla-target:$targetIdentity\nabla-artifact:$artifact\nabla-debug:$bootstrapLlvmDebugInfo"
     // Release hosted executables retain their ordinary relocatable sidecar,
     // but the executable itself may additionally be optimized across the
     // generated program and runtime boundary. LLVM-backed compiler programs
@@ -1395,7 +1406,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     )
     val cacheDirectory = "build/.abla-cache"
     val partitionCacheNamespace =
-        "$cacheDirectory/native-partition-${target.name}-llvm21-v2-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
+        "$cacheDirectory/native-partition-${target.name}-llvm21-v2-$cacheProfile${if (bootstrapLlvmDebugInfo) "-g" else ""}-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
     val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v13-$cacheProfile-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
     val cacheObjectPath = "$cacheStem.o"
     val cacheLlvmPath = "$cacheStem.ll"
@@ -1919,9 +1930,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         // function handles its first request.
         linkModule.argument("stack-size=1048576")
         // LLD otherwise records the transactional PID-bearing output name in
-        // the custom name section. Debug/name data belongs in an explicit
-        // sidecar; the published module must be byte reproducible.
-        linkModule.argument("--strip-all")
+        // the custom name section. A build without debug information
+        // publishes a byte-reproducible module; a debug build keeps the name
+        // section and DWARF (and gets a source map below).
+        if (!bootstrapLlvmDebugInfo) linkModule.argument("--strip-all")
         linkModule.argument(if (wasmLtoEligible)
             ltoObjectPath
         else objectPath)
@@ -1934,9 +1946,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     // Release wasm modules receive a target-aware whole-module pass after
     // LLVM and LLD have exposed the final control-flow and call graph. Fast
-    // builds intentionally skip this work to preserve short edit cycles.
+    // builds intentionally skip this work to preserve short edit cycles, and
+    // so does a release build with debug information: Binaryen's rewrite
+    // would not keep the DWARF line tables (or keeps them very slowly).
     if (status == 0 && target.objectFormat == "wasm" &&
-        artifact == "module" && releaseProfile) {
+        artifact == "module" && releaseProfile && !bootstrapLlvmDebugInfo) {
         val optimizeModule = linuxCommand("env")
         // Binaryen otherwise sizes its worker pool from every visible host
         // CPU. That is wasteful for these small modules and can deadlock in
@@ -1962,6 +1976,17 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             status = 143
             failureKind = "io"
         }
+    }
+    if (status == 0 && target.objectFormat == "wasm" &&
+        artifact == "module" && bootstrapLlvmDebugInfo) {
+        status = bootstrapWasmDebugArtifacts(publishPath, outputPath)
+        if (status != 0) failureKind = "reported"
+    } else if (status == 0 && target.objectFormat == "wasm" &&
+        artifact == "module") {
+        // A module without debug information must not sit beside an earlier
+        // build's map and DWARF, which no longer describe it.
+        Path("$outputPath.map").remove()
+        Path("$outputPath.debug.wasm").remove()
     }
     if (status == 0) {
         if (!Path(publishPath).moveTo(Path(outputPath))) {

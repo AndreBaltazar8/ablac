@@ -1,0 +1,806 @@
+// Debug information: DWARF line tables, readable function symbols and frame
+// pointers. A build with debug information on (bootstrapLlvmDebugInfo) maps
+// every lowered instruction back to its Abla file, line and column, names each
+// emitted function after its Abla declaration ("Owner.method" qualified by its
+// module), and keeps a frame-pointer chain on native targets, so debuggers,
+// crash reports and browser developer tools show Abla stacks.
+
+import "core.ab"
+
+// Set by the driver for one build (on by default for development builds).
+var bootstrapLlvmDebugInfo: bool = false
+// Set with bootstrapLlvmDebugInfo: whether the module is optimized (release).
+var bootstrapLlvmDebugOptimized: bool = false
+// Set with bootstrapLlvmDebugInfo: the program's entry source, which names
+// the compile unit.
+var bootstrapLlvmDebugEntry: string = ""
+
+noescape extern:"c" fun LLVMCreateDIBuilder(module: i64*): i64*
+noescape extern:"c" fun LLVMDisposeDIBuilder(builder: i64*): void
+noescape extern:"c" fun LLVMDIBuilderFinalize(builder: i64*): void
+noescape extern:"c" fun LLVMDIBuilderCreateFile(
+    builder: i64*,
+    name: cstring,
+    nameLength: int,
+    directory: cstring,
+    directoryLength: int
+): i64*
+noescape extern:"c" fun LLVMDIBuilderCreateCompileUnit(
+    builder: i64*,
+    language: i32,
+    file: i64*,
+    producer: cstring,
+    producerLength: int,
+    optimized: i32,
+    flags: cstring,
+    flagsLength: int,
+    runtimeVersion: i32,
+    splitName: cstring,
+    splitNameLength: int,
+    kind: i32,
+    dwoId: i32,
+    splitDebugInlining: i32,
+    debugInfoForProfiling: i32,
+    sysroot: cstring,
+    sysrootLength: int,
+    sdk: cstring,
+    sdkLength: int
+): i64*
+noescape extern:"c" fun LLVMDIBuilderCreateSubroutineType(
+    builder: i64*,
+    file: i64*,
+    parameterTypes: i64*,
+    parameterCount: i32,
+    flags: i32
+): i64*
+noescape extern:"c" fun LLVMDIBuilderCreateFunction(
+    builder: i64*,
+    scope: i64*,
+    name: cstring,
+    nameLength: int,
+    linkageName: cstring,
+    linkageNameLength: int,
+    file: i64*,
+    line: i32,
+    type: i64*,
+    localToUnit: i32,
+    definition: i32,
+    scopeLine: i32,
+    flags: i32,
+    optimized: i32
+): i64*
+noescape extern:"c" fun LLVMSetSubprogram(function: i64*, subprogram: i64*): void
+noescape extern:"c" fun LLVMGetSubprogram(function: i64*): i64*
+noescape extern:"c" fun LLVMDIBuilderCreateDebugLocation(
+    context: i64*,
+    line: i32,
+    column: i32,
+    scope: i64*,
+    inlinedAt: i64*
+): i64*
+noescape extern:"c" fun LLVMSetCurrentDebugLocation2(
+    builder: i64*,
+    location: i64*
+): void
+noescape extern:"c" fun LLVMInstructionGetDebugLoc(instruction: i64*): i64*
+noescape extern:"c" fun LLVMInstructionSetDebugLoc(
+    instruction: i64*,
+    location: i64*
+): void
+noescape extern:"c" fun LLVMDILocationGetScope(location: i64*): i64*
+noescape extern:"c" fun LLVMAddModuleFlag(
+    module: i64*,
+    behavior: i32,
+    key: cstring,
+    keyLength: int,
+    value: i64*
+): void
+noescape extern:"c" fun LLVMValueAsMetadata(value: i64*): i64*
+noescape extern:"c" fun LLVMGetFirstFunction(module: i64*): i64*
+noescape extern:"c" fun LLVMGetNextFunction(function: i64*): i64*
+noescape extern:"c" fun LLVMIsDeclaration(global: i64*): i32
+noescape extern:"c" fun LLVMGetLinkage(global: i64*): i32
+noescape extern:"c" fun LLVMGetFirstBasicBlock(function: i64*): i64*
+noescape extern:"c" fun LLVMGetNextBasicBlock(block: i64*): i64*
+noescape extern:"c" fun LLVMGetFirstInstruction(block: i64*): i64*
+noescape extern:"c" fun LLVMGetNextInstruction(instruction: i64*): i64*
+noescape extern:"c" fun LLVMGetValueName2(value: i64*, length: i64*): i64*
+
+trusted fun bootstrapLlvmDebugAddress(pointer: i64*): int =
+    nativePointerAddress(pointer)
+
+fun bootstrapLlvmDebugSame(left: i64*, right: i64*): bool =
+    bootstrapLlvmDebugAddress(left) == bootstrapLlvmDebugAddress(right)
+
+class BootstrapLlvmDebug(
+    val enabled: bool,
+    val builder: i64*,
+    val unit: i64*,
+    val unitFile: i64*,
+    val subroutineType: i64*,
+    // Per source file (bootstrapIrSourceFiles): its DIFile and the byte offset
+    // each line starts at.
+    val files: array<i64*>,
+    val lineStarts: array<array<int>>,
+    // Per lowered function: its DISubprogram (null when it has none) and the
+    // file index of its declaration.
+    val subprograms: array<i64*>,
+    val functionFiles: array<int>,
+    val functionLines: array<int>,
+    // The addresses of emitted Abla functions with no source position (the
+    // global initializers, generated drops): they get no subprogram. One
+    // would only add line-0 rows, and WebAssembly code generation scans each
+    // block of a function with debug information once per value, which the
+    // initializers' one huge block makes quadratic.
+    val undescribed: array<int>,
+    // The location the builder currently carries.
+    var currentScope: i64*,
+    var currentLine: int,
+    var currentColumn: int
+)
+
+fun bootstrapLlvmDebugDisabled(): BootstrapLlvmDebug =
+    BootstrapLlvmDebug(
+        false, nativeNullPointer(), nativeNullPointer(),
+        nativeNullPointer(), nativeNullPointer(), [], [], [], [], [], [],
+        nativeNullPointer(), -1, -1
+    )
+
+// The directory and name parts of a path, for a DIFile.
+fun bootstrapLlvmDebugSplitPath(path: string): array<string> {
+    var slash = path.size - 1
+    while (slash >= 0 && path[slash] != 47) slash = slash - 1
+    if (slash < 0) ["", path]
+    else if (slash == 0) ["/", path.slice(1, path.size)]
+    else [path.slice(0, slash), path.slice(slash + 1, path.size)]
+}
+
+// An absolute, normalized path ("a/./b/../c" → "a/c") for a source identity.
+fun bootstrapLlvmDebugAbsolutePath(path: string, directory: string): string {
+    val joined = if (path.size > 0 && path[0] == 47) path
+        else "$directory/$path"
+    val parts: array<string> = []
+    var depth = 0
+    var begin = 0
+    var index = 0
+    while (index <= joined.size) {
+        if (index == joined.size || joined[index] == 47) {
+            val part = joined.slice(begin, index)
+            if (part == "..") {
+                if (depth > 0) depth = depth - 1
+            } else if (part != "" && part != ".") {
+                if (depth < parts.size) parts[depth] = part
+                else parts.append(part)
+                depth = depth + 1
+            }
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    var result = ""
+    index = 0
+    while (index < depth) {
+        result = "$result/${parts[index]}"
+        index = index + 1
+    }
+    if (result == "") "/" else result
+}
+
+// The module a source file names, for qualified symbols: "renderer" for
+// .../renderer.ab, "exit" for .../exit/entry.ab.
+fun bootstrapLlvmDebugModuleName(path: string): string {
+    val parts = bootstrapLlvmDebugSplitPath(path)
+    var name = parts[1]
+    if (name.size > 3 && name.slice(name.size - 3, name.size) == ".ab") {
+        name = name.slice(0, name.size - 3)
+    }
+    if (name == "entry" && parts[0] != "") {
+        name = bootstrapLlvmDebugSplitPath(parts[0])[1]
+    }
+    name
+}
+
+fun bootstrapLlvmDebugLineStarts(source: string): array<int> {
+    val starts: array<int> = [0]
+    var index = 0
+    while (index < source.size) {
+        if (source[index] == 10) starts.append(index + 1)
+        index = index + 1
+    }
+    starts
+}
+
+// The 1-based line holding `offset` (binary search over line starts).
+fun bootstrapLlvmDebugLine(starts: array<int>, offset: int): int {
+    var low = 0
+    var high = starts.size - 1
+    while (low < high) {
+        val middle = (low + high + 1) / 2
+        if (starts[middle] <= offset) low = middle else high = middle - 1
+    }
+    low + 1
+}
+
+fun bootstrapLlvmDebugBegin(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram
+): BootstrapLlvmDebug {
+    if (!bootstrapLlvmDebugInfo) return bootstrapLlvmDebugDisabled()
+    val directory = currentDirectory().text
+    val builder = LLVMCreateDIBuilder(backend.module)
+    val files: array<i64*> = []
+    val lineStarts: array<array<int>> = []
+    var file = 0
+    while (file < bootstrapIrSourceFiles.size) {
+        val path = bootstrapLlvmDebugAbsolutePath(
+            bootstrapIrSourceFiles[file], directory
+        )
+        val parts = bootstrapLlvmDebugSplitPath(path)
+        files.append(LLVMDIBuilderCreateFile(
+            builder, parts[1], parts[1].size, parts[0], parts[0].size
+        ))
+        val source = Path(path)
+        lineStarts.append(if (source.exists())
+            bootstrapLlvmDebugLineStarts(source.readText())
+            else [0])
+        file = file + 1
+    }
+    // The unit is named after the program's entry source.
+    val entry = bootstrapLlvmDebugSplitPath(bootstrapLlvmDebugAbsolutePath(
+        if (bootstrapLlvmDebugEntry != "") bootstrapLlvmDebugEntry
+        else "<abla>", directory
+    ))
+    val unitFile = LLVMDIBuilderCreateFile(
+        builder, entry[1], entry[1].size, entry[0], entry[0].size
+    )
+    var function = 0
+    val producer = "ablac"
+    // DW_LANG_C (the C API's enumerator 1) and line tables only (2): the
+    // tables, subprograms and their names, without types or variables.
+    val unit = LLVMDIBuilderCreateCompileUnit(
+        builder, 1, unitFile, producer, producer.size,
+        if (bootstrapLlvmDebugOptimized) 1 else 0, "", 0, 0, "", 0, 2, 0,
+        0, 0, "", 0, "", 0
+    )
+    LLVMAddModuleFlag(
+        backend.module, 1, "Debug Info Version", 18,
+        LLVMValueAsMetadata(LLVMConstInt(backend.i32Type, 3, 0))
+    )
+    LLVMAddModuleFlag(
+        backend.module, 1, "Dwarf Version", 13,
+        LLVMValueAsMetadata(LLVMConstInt(backend.i32Type, 5, 0))
+    )
+    val subroutineType = LLVMDIBuilderCreateSubroutineType(
+        builder, unitFile, nativeNullPointer(), 0, 0
+    )
+    val subprograms: array<i64*> = []
+    val functionFiles: array<int> = []
+    val functionLines: array<int> = []
+    function = 0
+    while (function < program.functions.size) {
+        subprograms.append(nativeNullPointer())
+        val position = program.functions[function].position
+        val positionFile = bootstrapIrSourcePositionFile(position)
+        functionFiles.append(positionFile)
+        functionLines.append(
+            if (positionFile >= 0 && positionFile < lineStarts.size)
+                bootstrapLlvmDebugLine(
+                    lineStarts[positionFile],
+                    bootstrapIrSourcePositionOffset(position)
+                )
+            else 0
+        )
+        function = function + 1
+    }
+    BootstrapLlvmDebug(
+        true, builder, unit, unitFile, subroutineType, files, lineStarts,
+        subprograms, functionFiles, functionLines, [], nativeNullPointer(),
+        -1, -1
+    )
+}
+
+// The readable name of a lowered function, qualified by its module.
+fun bootstrapLlvmDebugFunctionName(
+    function: BootstrapIrFunction,
+    file: int
+): string {
+    val label = if (function.label != "") function.label else function.name
+    if (file >= 0 && file < bootstrapIrSourceFiles.size)
+        "${bootstrapLlvmDebugModuleName(bootstrapIrSourceFiles[file])}.$label"
+    else label
+}
+
+// Gives a lowered function's LLVM body its subprogram. Called before its
+// body is emitted, outside the per-function memory checkpoint.
+fun bootstrapLlvmDebugDeclareFunction(
+    var debug: BootstrapLlvmDebug,
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    functionId: int,
+    llvmFunction: i64*,
+    linkageName: string
+): void {
+    if (!debug.enabled || pointerIsNull(llvmFunction)) return
+    if (function.position < 0) {
+        debug.undescribed.append(bootstrapLlvmDebugAddress(llvmFunction))
+        return
+    }
+    val file = debug.functionFiles[functionId]
+    val scopeFile = if (file >= 0 && file < debug.files.size)
+        debug.files[file] else debug.unitFile
+    val name = bootstrapLlvmDebugFunctionName(function, file)
+    val line = debug.functionLines[functionId]
+    // DIFlagArtificial (1 << 6) for what no declaration wrote.
+    val subprogram = LLVMDIBuilderCreateFunction(
+        debug.builder, scopeFile, name, name.size, linkageName,
+        linkageName.size, scopeFile, line, debug.subroutineType, 1, 1, line,
+        if (file >= 0) 0 else 64,
+        if (bootstrapLlvmDebugOptimized) 1 else 0
+    )
+    LLVMSetSubprogram(llvmFunction, subprogram)
+    debug.subprograms[functionId] = subprogram
+    return
+}
+
+// Points the builder at an instruction's source position (inside function
+// `functionId`). Positions in another file than the function's keep the
+// previous location.
+fun bootstrapLlvmDebugLocate(
+    var debug: BootstrapLlvmDebug,
+    backend: BootstrapLlvmBackend,
+    functionId: int,
+    position: int
+): void {
+    if (!debug.enabled) return
+    val subprogram = debug.subprograms[functionId]
+    if (pointerIsNull(subprogram)) return
+    val file = debug.functionFiles[functionId]
+    var line = debug.currentLine
+    var column = debug.currentColumn
+    if (!bootstrapLlvmDebugSame(debug.currentScope, subprogram)) {
+        line = debug.functionLines[functionId]
+        column = 0
+    }
+    if (position >= 0 && file >= 0 &&
+        bootstrapIrSourcePositionFile(position) == file) {
+        val starts = debug.lineStarts[file]
+        val offset = bootstrapIrSourcePositionOffset(position)
+        if (starts.size > 1 || offset == 0) {
+            line = bootstrapLlvmDebugLine(starts, offset)
+            column = offset - starts[line - 1] + 1
+        }
+    }
+    if (!bootstrapLlvmDebugSame(debug.currentScope, subprogram) ||
+        line != debug.currentLine || column != debug.currentColumn) {
+        LLVMSetCurrentDebugLocation2(
+            backend.builder,
+            LLVMDIBuilderCreateDebugLocation(
+                backend.context, line, column, subprogram,
+                nativeNullPointer()
+            )
+        )
+        debug.currentScope = subprogram
+        debug.currentLine = line
+        debug.currentColumn = column
+    }
+    return
+}
+
+// Clears the builder's location (after a function body).
+fun bootstrapLlvmDebugClear(
+    var debug: BootstrapLlvmDebug,
+    backend: BootstrapLlvmBackend
+): void {
+    if (!debug.enabled) return
+    LLVMSetCurrentDebugLocation2(backend.builder, nativeNullPointer())
+    debug.currentScope = nativeNullPointer()
+    debug.currentLine = -1
+    debug.currentColumn = -1
+    return
+}
+
+trusted fun bootstrapLlvmDebugValueName(value: i64*): string {
+    val length = nativeByteBuffer(8)
+    val name = LLVMGetValueName2(value, length.pointerAt(0))
+    val size = length.loadI64(0)
+    length.close()
+    var result = ""
+    if (!pointerIsNull(name) && size > 0) {
+        val copy = nativeByteBuffer(size + 1)
+        var index = 0
+        while (index < size) {
+            copy.store(index, ablaUnsafeLoadU8(
+                ablaUnsafePointerOffset(name, index)
+            ))
+            index = index + 1
+        }
+        copy.store(size, 0)
+        result = copy.adoptString(size)
+    }
+    result
+}
+
+// Completes the module's debug information once every body is emitted:
+// gives each remaining defined function an artificial subprogram, puts every
+// instruction in its own function's scope (LLVM requires a location on each
+// inlinable call of a function with debug information), renames emitted
+// Abla functions after their declarations and, on native targets, keeps
+// frame pointers.
+fun bootstrapLlvmDebugFinish(
+    debug: BootstrapLlvmDebug,
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    identities: BootstrapLlvmFunctionIdentities,
+    emittedFunctions: array<bool>
+): void {
+    if (!debug.enabled) return
+    LLVMSetCurrentDebugLocation2(backend.builder, nativeNullPointer())
+    val wasm = bootstrapTextContains(backend.targetTriple, "wasm")
+    val optimized = if (bootstrapLlvmDebugOptimized) 1 else 0
+    var function = LLVMGetFirstFunction(backend.module)
+    while (!pointerIsNull(function)) {
+        var undescribed = false
+        for (address in debug.undescribed) {
+            if (address == bootstrapLlvmDebugAddress(function)) undescribed = true
+        }
+        if (undescribed) {
+            var block = LLVMGetFirstBasicBlock(function)
+            while (!pointerIsNull(block)) {
+                var instruction = LLVMGetFirstInstruction(block)
+                while (!pointerIsNull(instruction)) {
+                    if (!pointerIsNull(LLVMInstructionGetDebugLoc(instruction))) {
+                        LLVMInstructionSetDebugLoc(
+                            instruction, nativeNullPointer()
+                        )
+                    }
+                    instruction = LLVMGetNextInstruction(instruction)
+                }
+                block = LLVMGetNextBasicBlock(block)
+            }
+            if (!wasm) bootstrapLlvmAddStringFunctionAttribute(
+                backend, function, "frame-pointer", "all"
+            )
+        } else if (LLVMIsDeclaration(function) == 0) {
+            var subprogram = LLVMGetSubprogram(function)
+            var line = 0
+            if (pointerIsNull(subprogram)) {
+                val name = bootstrapLlvmDebugValueName(function)
+                subprogram = LLVMDIBuilderCreateFunction(
+                    debug.builder, debug.unitFile, name, name.size, name,
+                    name.size, debug.unitFile, 0, debug.subroutineType,
+                    if (LLVMGetLinkage(function) == llvmExternalLinkage())
+                        0 else 1,
+                    1, 0, 64, optimized
+                )
+                LLVMSetSubprogram(function, subprogram)
+            }
+            val fallback = LLVMDIBuilderCreateDebugLocation(
+                backend.context, 0, 0, subprogram, nativeNullPointer()
+            )
+            var block = LLVMGetFirstBasicBlock(function)
+            while (!pointerIsNull(block)) {
+                var instruction = LLVMGetFirstInstruction(block)
+                while (!pointerIsNull(instruction)) {
+                    val location = LLVMInstructionGetDebugLoc(instruction)
+                    if (pointerIsNull(location) || !bootstrapLlvmDebugSame(
+                        LLVMDILocationGetScope(location), subprogram
+                    )) LLVMInstructionSetDebugLoc(instruction, fallback)
+                    instruction = LLVMGetNextInstruction(instruction)
+                }
+                block = LLVMGetNextBasicBlock(block)
+            }
+            if (!wasm) bootstrapLlvmAddStringFunctionAttribute(
+                backend, function, "frame-pointer", "all"
+            )
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    // Readable symbols: the module-qualified Abla name on the body, and with
+    // a ".boxed" suffix on its value-ABI wrapper. Only internal definitions
+    // are renamed; LLVM makes repeated names unique.
+    var index = 0
+    while (index < program.functions.size) {
+        if (index < emittedFunctions.size && emittedFunctions[index]) {
+            val name = bootstrapLlvmDebugFunctionName(
+                program.functions[index], debug.functionFiles[index]
+            )
+            val direct = LLVMGetNamedFunction(
+                backend.module,
+                "${identities.symbols[index]}_direct"
+            )
+            if (!pointerIsNull(direct) && LLVMIsDeclaration(direct) == 0 &&
+                LLVMGetLinkage(direct) == llvmInternalLinkage()) {
+                LLVMSetValueName2(direct, name, name.size)
+            }
+            val wrapper = LLVMGetNamedFunction(
+                backend.module, identities.symbols[index]
+            )
+            if (!pointerIsNull(wrapper) && LLVMIsDeclaration(wrapper) == 0 &&
+                LLVMGetLinkage(wrapper) == llvmInternalLinkage()) {
+                val boxed = "$name.boxed"
+                LLVMSetValueName2(wrapper, boxed, boxed.size)
+            }
+        }
+        index = index + 1
+    }
+    LLVMDIBuilderFinalize(debug.builder)
+    LLVMDisposeDIBuilder(debug.builder)
+}
+
+// --- stacks at run time -----------------------------------------------------
+// A debug build of a hosted executable prints the stack when it dies: Abla's
+// `panic` calls abla_runtime_print_stack, and fault signals (a trap, a bad
+// access, an abort) run abla_runtime_fault, which prints it and lets the
+// signal take its default course (the exit status and the system's crash
+// report stay as they were). The frames are named by the symbol table; lldb or
+// atos map them to file:line through the debug information. Other builds keep
+// abla_runtime_print_stack as an empty function, so code can always call it.
+
+fun bootstrapLlvmDebugHostedRuntime(backend: BootstrapLlvmBackend): bool =
+    bootstrapLlvmDebugInfo &&
+    !bootstrapTextContains(backend.targetTriple, "wasm") &&
+    (backend.macOS || bootstrapTextContains(backend.targetTriple, "linux"))
+
+// SIGILL, SIGTRAP, SIGABRT, SIGFPE, SIGBUS, SIGSEGV.
+fun bootstrapLlvmDebugFaultSignals(backend: BootstrapLlvmBackend): array<int> =
+    if (backend.macOS) [4, 5, 6, 8, 10, 11] else [4, 5, 6, 8, 7, 11]
+
+// The address of element `index` (a value) of a pointer array.
+fun bootstrapLlvmDebugPointerElement(
+    backend: BootstrapLlvmBackend,
+    pointers: i64*,
+    index: i64*
+): i64* {
+    val indices = llvmPointerVector(1)
+    indices.set(0, index)
+    val element = LLVMBuildGEP2(
+        backend.builder, backend.pointerType, pointers, indices.pointer(), 1,
+        ""
+    )
+    indices.drop()
+    element
+}
+
+fun bootstrapLlvmDebugCall(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    result: i64*,
+    parameters: array<i64*>,
+    arguments: array<i64*>
+): i64* = bootstrapLlvmCall(
+    backend,
+    bootstrapLlvmDeclare(backend, name, result, parameters, false, []),
+    arguments, "", false, []
+)
+
+// In the C `main` of a debug build, before any Abla code runs: route the
+// fault signals to abla_runtime_fault (defined at the end of the module).
+fun bootstrapLlvmDebugInstallFaultHandlers(
+    backend: BootstrapLlvmBackend
+): void {
+    if (!bootstrapLlvmDebugHostedRuntime(backend)) return
+    val fault = bootstrapLlvmDeclare(
+        backend, "abla_runtime_fault", backend.voidType, [backend.i64Type],
+        false, []
+    )
+    LLVMSetLinkage(fault, llvmInternalLinkage())
+    for (signal in bootstrapLlvmDebugFaultSignals(backend)) {
+        bootstrapLlvmDebugCall(
+            backend, "signal", backend.pointerType,
+            [backend.i64Type, backend.pointerType],
+            [LLVMConstInt(backend.i64Type, signal, 0), fault]
+        )
+    }
+    return
+}
+
+fun bootstrapLlvmDebugWrite(
+    backend: BootstrapLlvmBackend,
+    text: string,
+    name: string
+): void {
+    bootstrapLlvmDebugCall(
+        backend, "write", backend.i64Type,
+        [backend.i64Type, backend.pointerType, backend.i64Type],
+        [LLVMConstInt(backend.i64Type, 2, 0),
+         bootstrapLlvmGlobalStringPointer(backend, text, name),
+         LLVMConstInt(backend.i64Type, text.size, 0)]
+    )
+    return
+}
+
+// Writes `value` to standard error as 0x and sixteen hexadecimal digits.
+fun bootstrapLlvmDebugWriteHex(
+    backend: BootstrapLlvmBackend,
+    value: i64*
+): void {
+    val bufferType = LLVMArrayType2(backend.i8Type, 18)
+    val buffer = LLVMBuildAlloca(backend.builder, bufferType, "hex")
+    var digit = 0
+    while (digit < 18) {
+        val byte = if (digit == 0) LLVMConstInt(backend.i8Type, 48, 0)
+        else if (digit == 1) LLVMConstInt(backend.i8Type, 120, 0)
+        else {
+            val shift = 60 - 4 * (digit - 2)
+            val nibble = LLVMBuildTrunc(
+                backend.builder,
+                LLVMBuildAnd(
+                    backend.builder,
+                    LLVMBuildLShr(
+                        backend.builder, value,
+                        LLVMConstInt(backend.i64Type, shift, 0), ""
+                    ),
+                    LLVMConstInt(backend.i64Type, 15, 0), ""
+                ),
+                backend.i8Type, ""
+            )
+            // ULT (36): a digit below ten is '0' + n, else 'a' + n - 10.
+            LLVMBuildSelect(
+                backend.builder,
+                LLVMBuildICmp(
+                    backend.builder, 36, nibble,
+                    LLVMConstInt(backend.i8Type, 10, 0), ""
+                ),
+                LLVMBuildAdd(
+                    backend.builder, nibble,
+                    LLVMConstInt(backend.i8Type, 48, 0), ""
+                ),
+                LLVMBuildAdd(
+                    backend.builder, nibble,
+                    LLVMConstInt(backend.i8Type, 87, 0), ""
+                ),
+                ""
+            )
+        }
+        LLVMBuildStore(
+            backend.builder, byte,
+            bootstrapLlvmArrayElement(backend, bufferType, buffer, digit, "")
+        )
+        digit = digit + 1
+    }
+    bootstrapLlvmDebugCall(
+        backend, "write", backend.i64Type,
+        [backend.i64Type, backend.pointerType, backend.i64Type],
+        [LLVMConstInt(backend.i64Type, 2, 0), buffer,
+         LLVMConstInt(backend.i64Type, 18, 0)]
+    )
+    return
+}
+
+// Defines abla_runtime_print_stack (when the program calls it or a debug
+// build needs it) and, in a debug build of a hosted executable,
+// abla_runtime_fault. Runs after every other body is emitted.
+fun bootstrapLlvmEmitDebugRuntime(backend: BootstrapLlvmBackend): void {
+    val hosted = bootstrapLlvmDebugHostedRuntime(backend)
+    var printStack = LLVMGetNamedFunction(
+        backend.module, "abla_runtime_print_stack"
+    )
+    val fault = LLVMGetNamedFunction(backend.module, "abla_runtime_fault")
+    val faultNeeded = hosted && !pointerIsNull(fault) &&
+        LLVMIsDeclaration(fault) != 0
+    if (pointerIsNull(printStack) && !faultNeeded) return
+    if (pointerIsNull(printStack)) printStack = bootstrapLlvmDeclare(
+        backend, "abla_runtime_print_stack", backend.voidType, [], false, []
+    )
+    if (LLVMIsDeclaration(printStack) != 0) {
+        LLVMSetLinkage(printStack, llvmInternalLinkage())
+        LLVMPositionBuilderAtEnd(
+            backend.builder,
+            LLVMAppendBasicBlockInContext(backend.context, printStack, "entry")
+        )
+        if (hosted) {
+            val framesType = LLVMArrayType2(backend.pointerType, 64)
+            val frames = LLVMBuildAlloca(backend.builder, framesType, "frames")
+            bootstrapLlvmDebugWrite(
+                backend,
+                "stack (lldb on the program, or atos/addr2line with the addresses, gives file:line):\n",
+                "abla.stack.header"
+            )
+            val count = bootstrapLlvmDebugCall(
+                backend, "backtrace", backend.i64Type,
+                [backend.pointerType, backend.i64Type],
+                [frames, LLVMConstInt(backend.i64Type, 64, 0)]
+            )
+            // Every frame but the innermost holds a return address: step it
+            // back into the call, so its line is the call's line.
+            val cursor = LLVMBuildAlloca(backend.builder, backend.i64Type, "i")
+            LLVMBuildStore(
+                backend.builder, LLVMConstInt(backend.i64Type, 1, 0), cursor
+            )
+            val loop = LLVMAppendBasicBlockInContext(
+                backend.context, printStack, "loop"
+            )
+            val body = LLVMAppendBasicBlockInContext(
+                backend.context, printStack, "body"
+            )
+            val done = LLVMAppendBasicBlockInContext(
+                backend.context, printStack, "done"
+            )
+            LLVMBuildBr(backend.builder, loop)
+            LLVMPositionBuilderAtEnd(backend.builder, loop)
+            val index = LLVMBuildLoad2(
+                backend.builder, backend.i64Type, cursor, ""
+            )
+            // SLT (40).
+            LLVMBuildCondBr(
+                backend.builder,
+                LLVMBuildICmp(backend.builder, 40, index, count, ""),
+                body, done
+            )
+            LLVMPositionBuilderAtEnd(backend.builder, body)
+            val slot = bootstrapLlvmDebugPointerElement(
+                backend, frames, index
+            )
+            val address = LLVMBuildPtrToInt(
+                backend.builder,
+                LLVMBuildLoad2(backend.builder, backend.pointerType, slot, ""),
+                backend.i64Type, ""
+            )
+            LLVMBuildStore(
+                backend.builder,
+                LLVMBuildIntToPtr(
+                    backend.builder,
+                    LLVMBuildSub(
+                        backend.builder, address,
+                        LLVMConstInt(backend.i64Type, 1, 0), ""
+                    ),
+                    backend.pointerType, ""
+                ),
+                slot
+            )
+            LLVMBuildStore(
+                backend.builder,
+                LLVMBuildAdd(
+                    backend.builder, index,
+                    LLVMConstInt(backend.i64Type, 1, 0), ""
+                ),
+                cursor
+            )
+            LLVMBuildBr(backend.builder, loop)
+            LLVMPositionBuilderAtEnd(backend.builder, done)
+            bootstrapLlvmDebugCall(
+                backend, "backtrace_symbols_fd", backend.voidType,
+                [backend.pointerType, backend.i64Type, backend.i64Type],
+                [frames, count, LLVMConstInt(backend.i64Type, 2, 0)]
+            )
+            if (backend.macOS) {
+                // atos -o <program> -l <load address> <address>...
+                bootstrapLlvmDebugWrite(
+                    backend, "load address ", "abla.stack.load"
+                )
+                val header = bootstrapLlvmDebugCall(
+                    backend, "_dyld_get_image_header", backend.pointerType,
+                    [backend.i64Type], [LLVMConstInt(backend.i64Type, 0, 0)]
+                )
+                bootstrapLlvmDebugWriteHex(
+                    backend,
+                    LLVMBuildPtrToInt(
+                        backend.builder, header, backend.i64Type, ""
+                    )
+                )
+                bootstrapLlvmDebugWrite(backend, "\n", "abla.stack.end")
+            }
+        }
+        LLVMBuildRetVoid(backend.builder)
+    }
+    if (faultNeeded) {
+        LLVMPositionBuilderAtEnd(
+            backend.builder,
+            LLVMAppendBasicBlockInContext(backend.context, fault, "entry")
+        )
+        bootstrapLlvmDebugWrite(
+            backend, "\nfatal signal: a trap, a bad memory access or an abort\n",
+            "abla.fault.header"
+        )
+        bootstrapLlvmCall(backend, printStack, [], "", false, [])
+        // Back to the default action: returning re-runs the faulting
+        // instruction (or abort raises again), which now ends the process.
+        bootstrapLlvmDebugCall(
+            backend, "signal", backend.pointerType,
+            [backend.i64Type, backend.pointerType],
+            [LLVMGetParam(fault, 0), LLVMConstNull(backend.pointerType)]
+        )
+        LLVMBuildRetVoid(backend.builder)
+    }
+    return
+}
