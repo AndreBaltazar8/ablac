@@ -103,9 +103,17 @@ fun bootstrapLlvmNeedsSharedRuntime(program: BootstrapIrProgram): bool {
     needed
 }
 
+// Does the program collect under allocation pressure, which makes every
+// allocating function a rooted safe point? A hosted native program with `main`
+// does by default; it opts out (manual collection: only `memoryCollect()`
+// collects) by calling `memorySetManualCollection()` anywhere main can reach.
+// Wasm and freestanding programs, and modules entered through their exports,
+// are manual by default. In every mode, a reachable `memorySetLimit` or
+// `memorySetCollectionGrowth` asks for pressure collection.
 fun bootstrapLlvmNeedsCollector(
     program: BootstrapIrProgram,
-    exports: array<BootstrapExportRequest>
+    exports: array<BootstrapExportRequest>,
+    targetTriple: string
 ): bool {
     val names: array<string> = []
     var function = 0
@@ -116,15 +124,24 @@ fun bootstrapLlvmNeedsCollector(
     val functionIndex = bootstrapLlvmNameIndex(names)
     val addressTaken = bootstrapLlvmAddressTaken(program, functionIndex)
     val fromMain: array<bool> = []
+    var hasMain = false
     function = 0
     while (function < program.functions.size) {
+        if (program.functions[function].name == "main") hasMain = true
         fromMain.append(program.functions[function].name == "main" ||
             program.functions[function].name == "__bootstrap_globals")
         function = function + 1
     }
     if (bootstrapLlvmReachesCall(program, functionIndex, addressTaken, fromMain, [
-        "runtimeMemoryCollect", "runtimeMemorySetLimit", "runtimeMemorySetCollectionGrowth"
+        "runtimeMemorySetLimit", "runtimeMemorySetCollectionGrowth"
     ])) return true
+    val automaticByDefault = hasMain &&
+        !bootstrapTextContains(targetTriple, "wasm") &&
+        !bootstrapLlvmTargetHasClosedProgramBoundary(targetTriple)
+    if (automaticByDefault &&
+        !bootstrapLlvmReachesCall(program, functionIndex, addressTaken, fromMain, [
+            "runtimeMemorySetManualCollection"
+        ])) return true
     // A module's exports are entry points too (a wasm host calls them, not main),
     // but there only an explicit opt-in turns on collection under pressure: an
     // export that just collects (between frames, say) keeps its callees unrooted.
@@ -548,9 +565,8 @@ fun bootstrapLlvmCollectingFunctions(
     program: BootstrapIrProgram,
     functionIndex: BootstrapLlvmNameIndex,
     addressTaken: array<bool>,
-    exports: array<BootstrapExportRequest>
+    automaticPressure: bool
 ): array<bool> {
-    val automaticPressure = bootstrapLlvmNeedsCollector(program, exports)
     val result: array<bool> = []
     var function = 0
     while (function < program.functions.size) {

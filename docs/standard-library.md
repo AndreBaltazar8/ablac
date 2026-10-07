@@ -173,7 +173,8 @@ generation; HTTP handlers can adopt it once their response promotion and
 long-lived-state policy is explicit.
 
 `abla/memory` exposes `memoryLiveBytes()`, `memoryLimit()`,
-`memorySetLimit(bytes)`, and the explicit `memoryCollect()` safe point. The
+`memorySetLimit(bytes)`, `memorySetCollectionGrowth(bytes)`,
+`memorySetManualCollection()`, and the explicit `memoryCollect()` safe point. The
 collector returns reclaimed bytes, preserves compiler-rooted locals,
 parameters, globals, affine/native payloads, and higher-order call buffers, and
 reclaims unreachable cyclic arrays/objects using precise allocation layouts.
@@ -181,9 +182,35 @@ Compile-time tree evaluation treats the safe point as a successful no-op. The
 limit accounts for cumulative payload bytes of
 all tracked runtime allocations, defaults to one GiB on every target, rejects
 negative values or a value below current live usage, and fails before asking
-the platform allocator for memory. Installing a limit also selects bounded
-function-entry pressure safe points. Native resource allocations are pinned
+the platform allocator for memory. Native resource allocations are pinned
 until explicit ownership drop or region reset.
+
+Collection has two modes:
+
+- **Pressure collection** (the default for hosted native programs with
+  `main`). Every allocating function is a safe point: on entry it collects
+  once the tracked heap has grown past a threshold. The first collection runs
+  at 32 MiB; each later one once the heap has grown by
+  `max(64 MiB, half of what the last collection kept)`, capped below the limit.
+  `memorySetCollectionGrowth(bytes)` lowers the least growth for programs that
+  care about their footprint.
+- **Manual collection** (the default for wasm and freestanding targets, and
+  for modules entered through their exports). Only an explicit
+  `memoryCollect()` frees cyclic garbage. The compiler roots only the
+  functions that can reach that call, so the program carries no safe-point
+  code. A hosted program opts into it with `memorySetManualCollection()`: a
+  call anywhere `main` can reach compiles it without pressure safe points, and
+  at run time the call stops pressure collection.
+
+`memorySetLimit(bytes)` and `memorySetCollectionGrowth(bytes)` select pressure
+collection in either mode: a program that can reach either is compiled with
+pressure safe points, and the call turns collection under pressure on at run
+time (after `memorySetManualCollection()` too).
+
+| Program | Default | Opt out / in |
+| --- | --- | --- |
+| hosted native, with `main` | pressure | `memorySetManualCollection()` |
+| wasm, freestanding, export-only modules | manual | `memorySetLimit` / `memorySetCollectionGrowth` |
 
 ## HTTP versioning
 

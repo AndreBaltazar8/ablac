@@ -81,6 +81,7 @@ test: ablac
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
 	tools/test-memory-checkpoint.sh $(COMPILER)
+	tools/test-collection-modes.sh $(COMPILER)
 	tools/test-arrays-dense.sh $(COMPILER)
 	tools/test-json-limits.sh $(COMPILER)
 	tools/test-string-plus.sh $(COMPILER)

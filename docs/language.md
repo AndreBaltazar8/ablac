@@ -627,8 +627,13 @@ controlled runtime panic before the platform allocation occurs. Ordinary
 freely aliased objects can be reclaimed, including cycles, at an explicit
 `memoryCollect()` safe point. The compiler emits liveness-compressed shadow
 roots through direct and higher-order calls and traces precise allocation
-layouts. `memorySetLimit` selects automatic function-entry pressure safe
-points. Affine native buffers are pinned until deterministic destruction or
+layouts. Hosted native programs collect under allocation pressure by default:
+every allocating function is a function-entry safe point. A program opts out
+with `memorySetManualCollection()` (a call that `main` can reach compiles it
+without those safe points, and it collects only at `memoryCollect()`); wasm and
+freestanding programs are manual by default. `memorySetLimit` and
+`memorySetCollectionGrowth` select pressure collection on every target (see
+[the standard library](standard-library.md)). Affine native buffers are pinned until deterministic destruction or
 region reset.
 
 Reusable lambdas cannot implicitly capture affine values. `move { ... }`
