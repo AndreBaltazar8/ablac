@@ -180,6 +180,67 @@ trusted fun __ablaRuntimeWasmSpanCarve(bytes: int): int {
     0
 }
 
+// The reclaim's address buckets: [head, tail] list pairs, bumped once and reused.
+var __ablaRuntimeWasmSortBuckets: int = 0
+val __ablaRuntimeWasmSortBucketCount: int = 4096
+
+// Sort a list of free payloads (linked through their first word) by address:
+// dealt into buckets that each cover a narrow slice of the heap, each bucket
+// merge-sorted, the buckets joined in order. One merge sort over the whole list
+// chased every block across the heap once per pass; a bucket's blocks sit close
+// together, so its passes stay in cache.
+trusted fun __ablaRuntimeWasmSortByAddress(list: int): int {
+    if (list == 0) return 0
+    val count = __ablaRuntimeWasmSortBucketCount
+    if (__ablaRuntimeWasmSortBuckets == 0) {
+        __ablaRuntimeWasmSortBuckets = __ablaRuntimeWasmBump(count * 16)
+    }
+    val buckets = __ablaRuntimeWasmSortBuckets
+    var i = 0
+    while (i < count * 2) {
+        ablaRuntimeStoreI64(buckets + i * 8, 0)
+        i = i + 1
+    }
+    val low = (ablaRuntimeWasmHeapBase() + 15) & -16
+    val span = __ablaRuntimeWasmHeapCursor - low + 1
+    var block = list
+    while (block != 0) {
+        val next = ablaRuntimeLoadI64(block)
+        val slot = buckets + ((block - low) * count / span) * 16
+        ablaRuntimeStoreI64(block, 0)
+        val tail = ablaRuntimeLoadI64(slot + 8)
+        if (tail == 0) {
+            ablaRuntimeStoreI64(slot, block)
+        } else {
+            ablaRuntimeStoreI64(tail, block)
+        }
+        ablaRuntimeStoreI64(slot + 8, block)
+        block = next
+    }
+    var head = 0
+    var last = 0
+    i = 0
+    while (i < count) {
+        val bucket = ablaRuntimeLoadI64(buckets + i * 16)
+        if (bucket != 0) {
+            val sorted = __ablaRuntimeWasmSortFree(bucket)
+            if (last == 0) {
+                head = sorted
+            } else {
+                ablaRuntimeStoreI64(last, sorted)
+            }
+            last = sorted
+            var next = ablaRuntimeLoadI64(last)
+            while (next != 0) {
+                last = next
+                next = ablaRuntimeLoadI64(last)
+            }
+        }
+        i = i + 1
+    }
+    head
+}
+
 // Sort a list of free payloads (linked through their first word) by address.
 trusted fun __ablaRuntimeWasmSortFree(list: int): int {
     if (list == 0) return 0
@@ -262,7 +323,7 @@ trusted fun __ablaRuntimeWasmReclaim(): void {
     }
     __ablaRuntimeWasmParked = 0
     __ablaRuntimeWasmReclaims = __ablaRuntimeWasmReclaims + 1
-    var block = __ablaRuntimeWasmSortFree(all)
+    var block = __ablaRuntimeWasmSortByAddress(all)
     while (block != 0) {
         val first = block
         val runBegin = block - 16
