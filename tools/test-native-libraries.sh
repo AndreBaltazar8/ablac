@@ -18,8 +18,12 @@ if [[ $status -ne 42 ]]; then
         "$status" >&2
     exit 1
 fi
-llvm-readelf -d "$output_directory/valid" |
-    rg -q 'Shared library: \[libssl'
+if [[ $(uname -s) == Darwin ]]; then
+    otool -L "$output_directory/valid" | rg -q '/libssl[.0-9]*\.dylib' || exit 1
+else
+    llvm-readelf -d "$output_directory/valid" |
+        rg -q 'Shared library: \[libssl' || exit 1
+fi
 
 if "$compiler" build --project \
     "$project_root/tests/cases/native-library-invalid" \

@@ -429,6 +429,34 @@ fun bootstrapCopyNativeObject(source: string, destination: string): int {
     copy.run()
 }
 
+// Where a Darwin link finds OpenSSL: ABLA_MACOS_OPENSSL_LIB, else Homebrew's
+// openssl@3 on a macOS host; empty when the target is not Darwin.
+fun bootstrapMacOpenSslLibraryDirectory(macTarget: bool): string {
+    val configured = linuxEnvironment("ABLA_MACOS_OPENSSL_LIB")
+    var directory = ""
+    if (macTarget && configured.found && configured.value != "") {
+        directory = configured.value
+    } else if (macTarget && ablaHostIsMacOS()) {
+        directory = if (
+            bootstrapTripleArchitecture(llvmDefaultTargetTriple()) == "arm64"
+        ) "/opt/homebrew/opt/openssl@3/lib"
+        else "/usr/local/opt/openssl@3/lib"
+    }
+    directory
+}
+
+fun bootstrapNamesOpenSsl(libraries: array<string>): bool {
+    var names = false
+    var index = 0
+    while (index < libraries.size) {
+        if (libraries[index] == "ssl" || libraries[index] == "crypto") {
+            names = true
+        }
+        index = index + 1
+    }
+    names
+}
+
 // A cache member is replaced whole (a copy beside it, then a rename): another
 // build that already validated the record reads the old file or the new one,
 // never a partial copy.
@@ -1287,7 +1315,16 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val ltoObjectPath = "$outputPath.lto-program.o"
     val ltoPreparedPath = "$outputPath.lto-prepared.ll"
     val combinedObjectPath = "$outputPath.combined.o"
-    val publishPath = "$outputPath.tmp.${linuxProcessId()}"
+    // The artifact is written beside its output and renamed over it. Darwin's
+    // linker signs an image with its file name as the identifier, so there it
+    // is written under its final name in a private directory: a temporary
+    // name would make every build of the same program differ.
+    val publishDirectory = if (macTarget)
+        "$outputPath.publish.${linuxProcessId()}" else ""
+    val publishPath = if (macTarget)
+        "$publishDirectory/${Path(outputPath).name()}"
+    else "$outputPath.tmp.${linuxProcessId()}"
+    if (macTarget) Path(publishDirectory).createDirectories()
     val optimizedWasmPath = "$outputPath.wasm-opt.tmp.${linuxProcessId()}"
     val manifestPath = rootManifestPath
     val manifest = manifestPath.readText()
@@ -1740,22 +1777,16 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             ltoObjectPath
         else objectPath)
         if (macTarget) link.argument(hostPath)
+        // OpenSSL is not on Darwin's default library path, whether the graph
+        // links it for TLS or the manifest names it.
+        val openSslLibraryDirectory = bootstrapMacOpenSslLibraryDirectory(
+            macTarget
+        )
+        if (openSslLibraryDirectory != "" && (linkOpenSsl ||
+            bootstrapNamesOpenSsl(nativeLibraries))) {
+            link.argument("-L$openSslLibraryDirectory")
+        }
         if (linkOpenSsl) {
-            val configuredOpenSsl = linuxEnvironment("ABLA_MACOS_OPENSSL_LIB")
-            var openSslLibraryDirectory = ""
-            if (macTarget && configuredOpenSsl.found &&
-                configuredOpenSsl.value != "") {
-                openSslLibraryDirectory = configuredOpenSsl.value
-            } else if (macTarget && ablaHostIsMacOS()) {
-                openSslLibraryDirectory = if (
-                    bootstrapTripleArchitecture(llvmDefaultTargetTriple()) ==
-                    "arm64"
-                ) "/opt/homebrew/opt/openssl@3/lib"
-                else "/usr/local/opt/openssl@3/lib"
-            }
-            if (openSslLibraryDirectory != "") {
-                link.argument("-L$openSslLibraryDirectory")
-            }
             link.argument("-lssl")
             link.argument("-lcrypto")
         }
@@ -1831,22 +1862,16 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
         linkShared.argument(objectPath)
         if (macTarget) linkShared.argument(hostPath)
+        // OpenSSL is not on Darwin's default library path, whether the graph
+        // links it for TLS or the manifest names it.
+        val openSslLibraryDirectory = bootstrapMacOpenSslLibraryDirectory(
+            macTarget
+        )
+        if (openSslLibraryDirectory != "" && (linkOpenSsl ||
+            bootstrapNamesOpenSsl(nativeLibraries))) {
+            linkShared.argument("-L$openSslLibraryDirectory")
+        }
         if (linkOpenSsl) {
-            val configuredOpenSsl = linuxEnvironment("ABLA_MACOS_OPENSSL_LIB")
-            var openSslLibraryDirectory = ""
-            if (macTarget && configuredOpenSsl.found &&
-                configuredOpenSsl.value != "") {
-                openSslLibraryDirectory = configuredOpenSsl.value
-            } else if (macTarget && ablaHostIsMacOS()) {
-                openSslLibraryDirectory = if (
-                    bootstrapTripleArchitecture(llvmDefaultTargetTriple()) ==
-                    "arm64"
-                ) "/opt/homebrew/opt/openssl@3/lib"
-                else "/usr/local/opt/openssl@3/lib"
-            }
-            if (openSslLibraryDirectory != "") {
-                linkShared.argument("-L$openSslLibraryDirectory")
-            }
             linkShared.argument("-lssl")
             linkShared.argument("-lcrypto")
         }
@@ -1950,6 +1975,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     }
     if (status != 0) bootstrapDiscardCompileOutputs()
     if (status != 0) Path(publishPath).remove()
+    if (macTarget) Path(publishDirectory).remove()
     Path(optimizedWasmPath).remove()
     if (status != 0) Path(combinedObjectPath).remove()
     if (status != 0) Path(ltoObjectPath).remove()
