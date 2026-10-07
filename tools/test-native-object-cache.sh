@@ -65,23 +65,50 @@ run_program 42 || exit 1
 # image (an inert ELF section, or a Mach-O signature identifier) differs.
 compiler_payload=$compiler
 if [[ -x $compiler.bin ]]; then compiler_payload=$compiler.bin; fi
+# `make_variant <path> <identity>`: a copy of the compiler whose image differs.
+make_variant() {
+    cp -- "$compiler_payload" "$1" || return 1
+    if [[ $host_os == Darwin ]]; then
+        codesign --force --sign - --identifier "$2" "$1" 2>/dev/null ||
+            return 1
+    else
+        printf '%s\n' "$2" > "$output_directory/compiler-identity" || return 1
+        llvm-objcopy --add-section \
+            ".abla-cache-identity=$output_directory/compiler-identity" \
+            "$1" || return 1
+    fi
+    if cmp -s -- "$compiler_payload" "$1"; then return 1; fi
+}
 compiler_variant="$output_directory/compiler-variant"
-variant_identity="abla-cache-variant-$$-$RANDOM"
-cp -- "$compiler_payload" "$compiler_variant" || exit 1
-if [[ $host_os == Darwin ]]; then
-    codesign --force --sign - --identifier "$variant_identity" \
-        "$compiler_variant" 2>/dev/null || exit 1
-else
-    printf '%s\n' "$variant_identity" > "$output_directory/compiler-identity"
-    llvm-objcopy --add-section \
-        ".abla-cache-identity=$output_directory/compiler-identity" \
-        "$compiler_variant" || exit 1
-fi
-cmp -s -- "$compiler_payload" "$compiler_variant" && exit 1
+make_variant "$compiler_variant" "abla-cache-variant-$$-$RANDOM" || exit 1
 printf '%s\n' 'native-object-cache-hit' > "$output.ll"
 ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root} \
     "$compiler_variant" build "$source_file" -o "$output" --fast || exit 1
 expect_miss 'compilers' || exit 1
+run_program 42 || exit 1
+
+# An install renames another compiler over the same path. The next build from
+# that path must miss, and renaming the first compiler back must hit again: the
+# key is the image, never the path it runs from.
+installed="$output_directory/installed-compiler"
+cp -- "$compiler_payload" "$installed.next" || exit 1
+mv -f -- "$installed.next" "$installed" || exit 1
+ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root} \
+    "$installed" build "$source_file" -o "$output" --fast || exit 1
+# (A variant no build has run yet: its image has no entries of its own.)
+make_variant "$installed.next" "abla-cache-installed-$$-$RANDOM" || exit 1
+mv -f -- "$installed.next" "$installed" || exit 1
+printf '%s\n' 'native-object-cache-hit' > "$output.ll"
+ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root} \
+    "$installed" build "$source_file" -o "$output" --fast || exit 1
+expect_miss 'an install over the same path' || exit 1
+run_program 42 || exit 1
+cp -- "$compiler_payload" "$installed.next" || exit 1
+mv -f -- "$installed.next" "$installed" || exit 1
+printf '%s\n' 'native-object-cache-hit' > "$output.ll"
+ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root} \
+    "$installed" build "$source_file" -o "$output" --fast || exit 1
+expect_hit || exit 1
 run_program 42 || exit 1
 
 # The program imports nothing, but every hosted program compiles the standard
