@@ -10,6 +10,18 @@ OUTPUT ?= $(BUILD_DIR)/program
 
 .DEFAULT_GOAL := all
 
+# Installs replace build/ablac and build/ablac.bin by a rename in the same
+# directory, never by writing or unlinking in place, so a build running
+# concurrently always finds a complete compiler. `ln -sfn` unlinks before it
+# links; the launcher link is made beside it and renamed over it instead.
+define install_launcher
+	@if test "$$(readlink $(COMPILER) 2>/dev/null)" != \
+		../tools/run-limited-compiler.sh; then \
+		ln -sfn ../tools/run-limited-compiler.sh $(COMPILER).next.$$$$ && \
+		mv -f $(COMPILER).next.$$$$ $(COMPILER); \
+	fi
+endef
+
 .PHONY: all bootstrap ablac ablac-dev self-rebuild test check compile benchmark \
 	benchmark-network clean prepare-test-driver
 
@@ -25,19 +37,19 @@ $(COMPILER_PAYLOAD): $(COMPILER_SOURCES) tools/build-self-hosted-release.sh \
 		tools/build-self-hosted-current.sh \
 		| $(BUILD_DIR) tools/bootstrap-compiler.sh
 	@if test ! -x $@; then tools/bootstrap-compiler.sh $@; fi
-	ln -sfn ../tools/run-limited-compiler.sh $(COMPILER)
+	$(install_launcher)
 	tools/build-self-hosted-current.sh $@ $(BUILD_DIR)/.ablac-next $(COMPILER_ENTRY)
 	mv -f $(BUILD_DIR)/.ablac-next.ll $(BUILD_DIR)/ablac.ll
 	mv -f $(BUILD_DIR)/.ablac-next $@
 
 $(COMPILER): $(COMPILER_PAYLOAD) tools/run-limited-compiler.sh
-	ln -sfn ../tools/run-limited-compiler.sh $@
+	$(install_launcher)
 
 bootstrap: | $(BUILD_DIR)
 	@if test ! -x $(COMPILER_PAYLOAD); then \
 		tools/bootstrap-compiler.sh $(COMPILER_PAYLOAD); \
 	fi
-	ln -sfn ../tools/run-limited-compiler.sh $(COMPILER)
+	$(install_launcher)
 
 ablac: $(COMPILER)
 
