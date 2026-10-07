@@ -64,8 +64,14 @@ set -e
     -o "$program"
 [[ -s $program.o ]] || exit 1
 [[ ! -e $program.value-runtime.o ]] || exit 1
-[[ ! -e $program.host.o ]] || exit 1
-if nm -u "$program.o" | awk '{print $2}' | rg '^abla_' >/dev/null; then
+# Mach-O programs link the Darwin syscall adapter as their host object; no
+# other host emits one.
+if [[ $(uname -s) != Darwin ]]; then
+    [[ ! -e $program.host.o ]] || exit 1
+fi
+# The last field is the symbol name; Mach-O prefixes C symbols with `_`.
+if nm -u "$program.o" | awk '{print $NF}' | sed 's/^_//' |
+    rg '^abla_' >/dev/null; then
     echo 'packaging object retained unresolved Abla runtime symbols' >&2
     exit 1
 fi

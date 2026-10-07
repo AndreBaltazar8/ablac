@@ -56,7 +56,9 @@ grep -Eq \
     '^@llvm\.used = .*@abla_test_internal_section_bytes.*@abla_test_internal_section_words.*@abla_test_internal_section_tls' \
     "$output_directory/section-linked-thread-local.ll"
 
-"$compiler" build "$section_tls_source" --emit object \
+# Section names and flags are ELF semantics (a Mach-O section specifier is
+# "segment,section"), so the object is emitted for the ELF target on any host.
+"$compiler" build "$section_tls_source" --target x86_64-linux --emit object \
     -o "$output_directory/section-linked-thread-local.o" --no-cache
 llvm-readelf -SW "$output_directory/section-linked-thread-local.o" \
     > "$output_directory/section-linked-thread-local.sections"
