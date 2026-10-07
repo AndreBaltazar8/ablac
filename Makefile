@@ -122,6 +122,11 @@ test: ablac
 	tools/test-overloads.sh $(COMPILER)
 	tools/test-argument-diagnostics.sh $(COMPILER)
 	tools/test-compound-assignment.sh $(COMPILER)
+	tools/test-runtime-memory.sh $(COMPILER)
+	tools/test-native-object-cache.sh $(COMPILER)
+	tools/test-native-partition-cache.sh $(COMPILER)
+	tools/test-lowered-ir-cache.sh $(COMPILER)
+	tools/test-determinism.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
 
 check: test self-rebuild

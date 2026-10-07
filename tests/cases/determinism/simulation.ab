@@ -1,0 +1,153 @@
+// A small fixed-step simulation whose state hash must not depend on how it was
+// compiled: native at every optimization level, WebAssembly, and the
+// compile-time evaluator. It mixes integer arithmetic (signed division and
+// remainder of negative values), f64 and f32 arithmetic, sqrt, floor, sin,
+// cos, atan2, float <-> integer conversions, arrays, objects and a Map whose
+// iteration order feeds the hash.
+import "abla/float"
+import "abla/math"
+
+class Body(
+    var x: f64,
+    var y: f64,
+    var vx: f64,
+    var vy: f64,
+    var heading: f64,
+    var charge: f32,
+    var score: int
+)
+
+// A 31-bit linear congruential generator: every product stays below 2^62, so
+// no target can disagree on overflow.
+class Sequence(var state: int) {
+    fun next(): int {
+        this.state = (this.state * 1103515245 + 12345) % 2147483648
+        this.state
+    }
+
+    fun unit(): f64 = f64FromInt(this.next()) / 2147483648.0
+}
+
+val worldSize = 512.0
+val cellSize = 32.0
+
+// Folds a 64-bit value into a hash kept below 2^31.
+fun mixHash(hash: int, value: int): int {
+    val low = value & 4294967295
+    val high = (value >> 32) & 4294967295
+    val first = (hash * 31 + low) % 2147483647
+    (first * 31 + high) % 2147483647
+}
+
+fun mixFloat(hash: int, value: f64): int = mixHash(hash, f64ToBits(value))
+
+fun wrap(value: f64): f64 {
+    var result = value
+    if (result < 0.0) result = result + worldSize
+    if (result >= worldSize) result = result - worldSize
+    result
+}
+
+fun cellOf(body: Body): int =
+    f64ToInt(floor(body.x / cellSize)) * 64 + f64ToInt(floor(body.y / cellSize))
+
+fun spawn(count: int, var sequence: Sequence): array<Body> {
+    val bodies: array<Body> = []
+    var index = 0
+    while (index < count) {
+        bodies.append(Body(
+            sequence.unit() * worldSize,
+            sequence.unit() * worldSize,
+            0.0,
+            0.0,
+            (sequence.unit() - 0.5) * 6.283185307179586,
+            f64ToF32(sequence.unit()),
+            index * 7 - 100
+        ))
+        index = index + 1
+    }
+    bodies
+}
+
+fun steer(var body: Body, var sequence: Sequence, tick: int, index: int): void {
+    body.heading = body.heading + (sequence.unit() - 0.5) * 0.35
+    if (tick % 16 == index % 16) {
+        // Steer half way toward the centre.
+        val toward = atan2(256.0 - body.y, 256.0 - body.x)
+        body.heading = body.heading * 0.5 + toward * 0.5
+    }
+    val speed = 1.5 + sin(body.heading * 3.0) * 0.5
+    body.vx = body.vx * 0.9 + cos(body.heading) * speed * 0.1
+    body.vy = body.vy * 0.9 + sin(body.heading) * speed * 0.1
+    body.x = wrap(body.x + body.vx)
+    body.y = wrap(body.y + body.vy)
+    body.charge = body.charge * f64ToF32(0.98) + f64ToF32(speed * 0.01)
+    return
+}
+
+fun separate(var body: Body, crowd: int, tick: int): void {
+    if (crowd > 1) {
+        // Push away from the cell's centre, harder when close to it.
+        val centreX = (floor(body.x / cellSize) + 0.5) * cellSize
+        val centreY = (floor(body.y / cellSize) + 0.5) * cellSize
+        val dx = body.x - centreX
+        val dy = body.y - centreY
+        val distance = sqrt(dx * dx + dy * dy) + 0.001
+        val push = f64FromInt(crowd) * 0.25 / distance
+        body.x = wrap(body.x + dx * push * 0.1)
+        body.y = wrap(body.y + dy * push * 0.1)
+        body.score = (body.score * 7 - tick - crowd * 13) / 3 % 100003
+    } else {
+        body.score = body.score - f64ToInt(body.vx * 10.0) % 7
+    }
+    return
+}
+
+fun mixBody(hash: int, body: Body): int {
+    var result = mixFloat(hash, body.x)
+    result = mixFloat(result, body.y)
+    result = mixFloat(result, body.vx)
+    result = mixFloat(result, body.vy)
+    result = mixFloat(result, body.heading)
+    result = mixHash(result, int(f32ToBits(body.charge)))
+    mixHash(result, body.score)
+}
+
+fun advance(var bodies: array<Body>, var sequence: Sequence, tick: int): int {
+    var hash = tick
+    val occupancy: Map<int, int> = Map()
+    var index = 0
+    while (index < bodies.size) {
+        steer(bodies[index], sequence, tick, index)
+        val cell = cellOf(bodies[index])
+        val held = occupancy.get(cell)
+        occupancy.set(cell, if (held == null) 1 else held + 1)
+        index = index + 1
+    }
+    index = 0
+    while (index < bodies.size) {
+        val crowd = occupancy.get(cellOf(bodies[index]))
+        separate(bodies[index], if (crowd == null) 0 else crowd, tick)
+        hash = mixBody(hash, bodies[index])
+        index = index + 1
+    }
+    for (cell in occupancy.keys()) {
+        val count = occupancy.get(cell)
+        hash = mixHash(hash, cell)
+        if (count != null) hash = mixHash(hash, count)
+    }
+    hash
+}
+
+// The state hash after `steps` fixed steps of 64 bodies.
+fun simulate(steps: int): int {
+    var sequence = Sequence(20261007)
+    var bodies = spawn(64, sequence)
+    var hash = 17
+    var tick = 0
+    while (tick < steps) {
+        hash = mixHash(hash, advance(bodies, sequence, tick))
+        tick = tick + 1
+    }
+    hash
+}
