@@ -147,6 +147,51 @@ vendored_status=$?
 set -e
 [[ $vendored_status -eq 41 ]] || exit 1
 
+# A single-file build (no --project: nothing is prepared) resolves the provider
+# imports, transitive ones included, from the checked-in vendor tree that
+# abla.lock locks, with no cache and no materialized copy.
+rm -rf -- "$cache" "$application/.abla"
+ABLA_PACKAGE_CACHE="$cache" "$compiler" build "$application/src/main.ab" \
+    -o "$test_root/single-file" --fast --no-cache
+[[ ! -e "$application/.abla" ]] || exit 1
+set +e
+"$project_root/tools/run-limited.sh" "$test_root/single-file"
+single_status=$?
+set -e
+[[ $single_status -eq 41 ]] || exit 1
+
+# A materialized copy at another revision than the lock is stale: the vendor
+# tree wins over it.
+mkdir -p -- "$application/.abla/packages/provider-dep/source/src"
+printf '%s' "$first_revision" \
+    > "$application/.abla/packages/provider-dep/revision"
+printf '%s\n' 'import "source/src/provider-dep.ab"' \
+    > "$application/.abla/packages/provider-dep/entry.ab"
+printf '%s\n' 'fun dependencyAnswer: int = 7' \
+    > "$application/.abla/packages/provider-dep/source/src/provider-dep.ab"
+ABLA_PACKAGE_CACHE="$cache" "$compiler" build "$application/src/main.ab" \
+    -o "$test_root/single-file-stale" --fast --no-cache
+set +e
+"$project_root/tools/run-limited.sh" "$test_root/single-file-stale"
+stale_status=$?
+set -e
+[[ $stale_status -eq 41 ]] || exit 1
+rm -rf -- "$application/.abla"
+
+# A vendor tree whose markers disagree with the lock is not used.
+cp "$application/vendor/provider-dep/.abla-revision" "$test_root/revision"
+printf '%s' "$first_revision" \
+    > "$application/vendor/provider-dep/.abla-revision"
+set +e
+mismatch_output=$(ABLA_PACKAGE_CACHE="$cache" "$compiler" build \
+    "$application/src/main.ab" -o "$test_root/single-file-mismatch" \
+    --fast --no-cache 2>&1)
+mismatch_status=$?
+set -e
+[[ $mismatch_status -ne 0 ]] || exit 1
+[[ $mismatch_output == *'E_PACKAGE_IMPORT'* ]] || exit 1
+cp "$test_root/revision" "$application/vendor/provider-dep/.abla-revision"
+
 github_application="$test_root/github-application"
 mkdir -p -- "$github_application/src"
 cat > "$github_application/abla.toml" <<'EOF'
@@ -235,8 +280,9 @@ set -e
 
 # Changing the deferred resolver cannot move an existing lock during a build,
 # and a build does not require the environment input used only by the resolver.
-sed -i 's/generatedAnswer: int = 42/generatedAnswer: int = 41/' \
+sed -i.orig 's/generatedAnswer: int = 42/generatedAnswer: int = 41/' \
     "$generated_application/src/provider.ab"
+rm -f -- "$generated_application/src/provider.ab.orig"
 rm -rf -- "$generated_application/.abla"
 ABLA_PACKAGE_CACHE="$generated_cache" "$compiler" build \
     --project "$generated_application" --fast --no-cache --offline

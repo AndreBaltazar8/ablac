@@ -1691,9 +1691,19 @@ fun bootstrapPackageVendor(
     projectRoot, BootstrapPackageDependencies([], 0, ""), offline
 )
 
-// `package/name` is resolved through the nearest prepared project package
-// graph. Package sources are copied below the project, so transitive imports
-// reach the same root while relative imports remain inside their package.
+// `package/name` is resolved through the nearest project package graph, from
+// the importer's directory upward. Package sources are copied below the
+// project, so transitive imports reach the same root while relative imports
+// remain inside their package. At each directory:
+//
+//  - a prepared package (`.abla/packages/name`, materialized by a project build
+//    or `package update`) is used, unless that directory's abla.lock locks the
+//    name at another revision (a stale copy after the lock moved);
+//  - otherwise, where abla.lock locks the name, the checked-in vendor tree
+//    (`vendor/name`, from `package vendor`) is used when its revision and digest
+//    markers match the lock. This lets a single-file build (no `--project`, so
+//    nothing is prepared) of a project that checks its graph in resolve offline,
+//    without a cache. A directory whose lock names the package ends the search.
 fun bootstrapResolvePackageImport(importer: string, requested: string): string {
     var result = ""
     val prefix = "package/"
@@ -1705,9 +1715,35 @@ fun bootstrapResolvePackageImport(importer: string, requested: string): string {
             var searching = true
             var depth = 0
             while (searching && depth < 128) {
-                val candidate = directory.child(".abla").child("packages").child(name).child("entry.ab")
-                if (candidate.exists()) {
+                val prepared = directory.child(".abla").child("packages").child(name)
+                val candidate = prepared.child("entry.ab")
+                val lockPath = directory.child("abla.lock")
+                var lockedIndex = -1
+                var lock = BootstrapPackageLock([], false, "")
+                if (lockPath.exists()) {
+                    lock = bootstrapPackageReadLock(lockPath.text)
+                    if (lock.valid) {
+                        lockedIndex = bootstrapPackageLockIndex(lock.packages, name)
+                    }
+                }
+                val preparedCurrent = lockedIndex < 0 ||
+                    prepared.child("revision").readText() ==
+                        lock.packages[lockedIndex].revision
+                if (candidate.exists() && preparedCurrent) {
                     result = candidate.text
+                    searching = false
+                } else if (lockedIndex >= 0) {
+                    val package = lock.packages[lockedIndex]
+                    val vendored = directory.child("vendor").child(name)
+                    val entry = vendored.child(package.entry)
+                    if (vendored.child(".abla-revision").readText() ==
+                        package.revision &&
+                        vendored.child(".abla-digest").readText() ==
+                            package.digest &&
+                        bootstrapPackageRelativePathValid(package.entry) &&
+                        entry.exists()) {
+                        result = entry.text
+                    }
                     searching = false
                 } else {
                     val parent = directory.parent()

@@ -182,6 +182,24 @@ ablac package vendor --project .
 This publishes `vendor/<package>` with revision/digest markers. Offline builds
 prefer a matching vendor tree when the external cache is unavailable.
 
+A single-file build (`ablac build path/to/program.ab`, no `--project`) prepares
+nothing; it resolves each provider import from the importer's directory upward.
+At each directory it uses the prepared copy under `.abla/packages/<package>`,
+unless that directory's `abla.lock` locks the package at another revision (a
+stale copy left behind after the lock moved), and otherwise, where `abla.lock`
+locks the package, the checked-in `vendor/<package>` whose revision and digest
+markers match the lock. The first directory whose lock names the package ends
+the search. So a repository that commits `abla.toml`, `abla.lock`, and
+`vendor/` builds every program under it offline, with no cache and no prepare
+step, for example from a source archive in a container image:
+
+```text
+abla.toml         entry lists (or imports) the modules with provider imports
+abla.lock         the locked graph
+vendor/<package>  `ablac package vendor` output
+tools/gen.ab      import github("owner/package") — resolves from vendor/
+```
+
 ## Capability policy
 
 Dependency manifests may list `compileCapabilities`, but only the root
