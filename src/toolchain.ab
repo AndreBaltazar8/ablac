@@ -429,6 +429,17 @@ fun bootstrapCopyNativeObject(source: string, destination: string): int {
     copy.run()
 }
 
+// A cache member is replaced whole (a copy beside it, then a rename): another
+// build that already validated the record reads the old file or the new one,
+// never a partial copy.
+fun bootstrapPublishCacheFile(source: string, destination: string): int {
+    val temporary = "$destination.tmp.${linuxProcessId()}"
+    var status = bootstrapCopyNativeObject(source, temporary)
+    if (status == 0 && !Path(temporary).moveTo(Path(destination))) status = 145
+    if (status != 0) Path(temporary).remove()
+    status
+}
+
 class BootstrapPartitionEmission(
     val status: int,
     val reused: int,
@@ -1319,7 +1330,26 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // input program is byte-identical. Hash the executable that is performing
     // this build so cache correctness does not depend on remembering a manual
     // version bump for every compiler change.
-    val compilerImage = Path("/proc/self/exe").readText()
+    //
+    // An image that cannot be read has no identity, and keying it as empty
+    // would let every such compiler share entries: that build runs uncached.
+    // The image does not contain a shared LLVM library, nor the external opt
+    // and llc that emit cross-target objects, so their versions join it.
+    val compilerImageRead = Path("/proc/self/exe").readText()
+    val cacheEnabled = allowCache && compilerImageRead.size > 0
+    var backendIdentity = ""
+    if (cacheEnabled) {
+        backendIdentity = "abla-backend\nllvm-library:${llvmLibraryVersion()}"
+        if (bootstrapTextContains(cacheProfile, "cross-")) {
+            backendIdentity =
+                "$backendIdentity\nopt:${linuxCommand("opt").argument(
+                    "--version"
+                ).captureText()}\nllc:${linuxCommand("llc").argument(
+                    "--version"
+                ).captureText()}"
+        }
+    }
+    val compilerImage = "$compilerImageRead\n$backendIdentity"
     val compilerFirstHash = bootstrapNativeCacheHash(
         compilerImage, 41, 269, 1000000007
     )
@@ -1338,7 +1368,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val cacheInputsPath = "$cacheStem.inputs"
     val cacheAbiPath = "$cacheStem.abi.json"
     var cached = false
-    if (allowCache && compileInputsCacheable &&
+    if (cacheEnabled && compileInputsCacheable &&
         Path(cacheObjectPath).exists() &&
         (!ltoEligible || Path(cacheLlvmPath).exists()) &&
         Path(cacheSourcePath).exists() &&
@@ -1432,7 +1462,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             // The partition combiner is the ELF relocatable linker. Mach-O
             // keeps the proven single-object path until it has a native
             // format-aware combiner; feeding Mach-O parts to ld.lld fails.
-            if (status == 0 && allowCache && compileInputsCacheable &&
+            if (status == 0 && cacheEnabled && compileInputsCacheable &&
                 target.hosted && target.objectFormat == "elf" &&
                 Path(cacheDirectory).createDirectories()) {
                 val partitioned = bootstrapEmitPartitionedObject(
@@ -1457,18 +1487,18 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     )
                 } else status = emitObject(llvmPath, objectPath)
             }
-            if (status == 0 && allowCache && compileInputsCacheable &&
+            if (status == 0 && cacheEnabled && compileInputsCacheable &&
                 Path(cacheDirectory).createDirectories()) {
                 // The source identity is the commit marker. Remove it before
                 // replacing any member so interruption can leave only an
                 // uncommitted record, never a mixed old/new cache hit.
                 Path(cacheSourcePath).remove()
-                var cacheStatus = bootstrapCopyNativeObject(
+                var cacheStatus = bootstrapPublishCacheFile(
                     objectPath,
                     cacheObjectPath
                 )
                 if (cacheStatus == 0 && ltoEligible) cacheStatus =
-                    bootstrapCopyNativeObject(llvmPath, cacheLlvmPath)
+                    bootstrapPublishCacheFile(llvmPath, cacheLlvmPath)
                 if (cacheStatus == 0) {
                     val linkText = if (linkLlvm) "1" else "0"
                     val hostText = if (linkHost) "1" else "0"

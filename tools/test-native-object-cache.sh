@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# The native object cache reuses an object only for the same program built by
+# the same compiler against the same standard library: a byte-distinct
+# compiler, an edited standard library or another sysroot must miss.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -10,69 +13,106 @@ compiler=$1
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/native-object-cache-test"
 output="$output_directory/program"
-mkdir -p "$output_directory"
+source_file="$project_root/tests/cases/bootstrap/cache-grant-text.ab"
+mkdir -p "$output_directory" || exit 1
+host_os=$(uname -s)
 
-"$compiler" build \
-    "$project_root/tests/cases/bootstrap/cache-grant-text.ab" \
-    -o "$output" --fast
-[[ ! -e $output.host.o ]] || exit 1
+milliseconds() {
+    perl -MTime::HiRes=time -e 'printf "%d\n", time() * 1000'
+}
 
-# A cache hit must not regenerate LLVM. Keeping this marker also avoids using
-# timing as a correctness assertion on slower or heavily loaded machines.
+# Mach-O programs link the Darwin syscall adapter as their host object.
+no_host_object() {
+    [[ $host_os == Darwin || ! -e $output.host.o ]]
+}
+
+run_program() {
+    local status
+    set +e
+    ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
+        "$project_root/tools/run-limited.sh" "$output"
+    status=$?
+    set -e
+    [[ $status -eq $1 ]]
+}
+
+# A hit does not regenerate LLVM: a marker left in the .ll survives it.
+expect_hit() {
+    rg -q '^native-object-cache-hit$' "$output.ll"
+}
+
+expect_miss() {
+    if rg -q '^native-object-cache-hit$' "$output.ll"; then
+        printf 'native object cache reused an object across %s\n' "$1" >&2
+        return 1
+    fi
+}
+
+"$compiler" build "$source_file" -o "$output" --fast || exit 1
+no_host_object || exit 1
+
 printf '%s\n' 'native-object-cache-hit' > "$output.ll"
-begin=$(date +%s%N)
-"$compiler" build \
-    "$project_root/tests/cases/bootstrap/cache-grant-text.ab" \
-    -o "$output" --fast
-[[ ! -e $output.host.o ]] || exit 1
-end=$(date +%s%N)
-elapsed_ms=$(((end - begin) / 1000000))
-rg -q '^native-object-cache-hit$' "$output.ll"
-
-set +e
-ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
-    "$project_root/tools/run-limited.sh" "$output"
-cached_status=$?
-set -e
-[[ $cached_status -eq 42 ]] || exit 1
+begin=$(milliseconds)
+"$compiler" build "$source_file" -o "$output" --fast || exit 1
+end=$(milliseconds)
+elapsed_ms=$((end - begin))
+no_host_object || exit 1
+expect_hit || exit 1
+run_program 42 || exit 1
 
 # A byte-distinct compiler must not reuse an object made by another compiler,
-# even for identical program source. Add an inert ELF section so behavior is
-# unchanged while /proc/self/exe identity is observably different.
+# even for identical program source. The variant behaves the same; only its
+# image (an inert ELF section, or a Mach-O signature identifier) differs.
+compiler_payload=$compiler
+if [[ -x $compiler.bin ]]; then compiler_payload=$compiler.bin; fi
 compiler_variant="$output_directory/compiler-variant"
-compiler_identity="$output_directory/compiler-identity"
-cp -- "$compiler" "$compiler_variant"
-printf '%s-%s\n' "$$" "$(date +%s%N)" > "$compiler_identity"
-llvm-objcopy \
-    --add-section \
-    ".abla-cache-identity=$compiler_identity" \
-    "$compiler_variant"
-printf '%s\n' 'compiler-identity-must-miss' > "$output.ll"
-"$compiler_variant" build \
-    "$project_root/tests/cases/bootstrap/cache-grant-text.ab" \
-    -o "$output" --fast
-if rg -q '^compiler-identity-must-miss$' "$output.ll"; then
-    echo 'native object cache reused an object from a different compiler' >&2
-    exit 1
+variant_identity="abla-cache-variant-$$-$RANDOM"
+cp -- "$compiler_payload" "$compiler_variant" || exit 1
+if [[ $host_os == Darwin ]]; then
+    codesign --force --sign - --identifier "$variant_identity" \
+        "$compiler_variant" 2>/dev/null || exit 1
+else
+    printf '%s\n' "$variant_identity" > "$output_directory/compiler-identity"
+    llvm-objcopy --add-section \
+        ".abla-cache-identity=$output_directory/compiler-identity" \
+        "$compiler_variant" || exit 1
 fi
-set +e
-ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
-    "$project_root/tools/run-limited.sh" "$output"
-variant_status=$?
-set -e
-[[ $variant_status -eq 42 ]] || exit 1
+cmp -s -- "$compiler_payload" "$compiler_variant" && exit 1
+printf '%s\n' 'native-object-cache-hit' > "$output.ll"
+ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root} \
+    "$compiler_variant" build "$source_file" -o "$output" --fast || exit 1
+expect_miss 'compilers' || exit 1
+run_program 42 || exit 1
+
+# The program imports nothing, but every hosted program compiles the standard
+# library's runtime modules: editing one in another sysroot must miss, and so
+# must the unedited copy (another sysroot's modules are other files).
+sysroot="$output_directory/sysroot"
+rm -rf -- "$sysroot" || exit 1
+mkdir -p -- "$sysroot" || exit 1
+cp -R -- "$project_root/stdlib" "$project_root/runtime" "$sysroot/" || exit 1
+printf '%s\n' 'native-object-cache-hit' > "$output.ll"
+ABLA_SYSROOT=$sysroot "$compiler" build "$source_file" -o "$output" --fast ||
+    exit 1
+expect_miss 'sysroots' || exit 1
+printf '%s\n' 'native-object-cache-hit' > "$output.ll"
+ABLA_SYSROOT=$sysroot "$compiler" build "$source_file" -o "$output" --fast ||
+    exit 1
+expect_hit || exit 1
+printf '\n// An edit that changes no behavior.\n' \
+    >> "$sysroot/stdlib/abla/runtime/self/entry.ab" || exit 1
+printf '%s\n' 'native-object-cache-hit' > "$output.ll"
+ABLA_SYSROOT=$sysroot "$compiler" build "$source_file" -o "$output" --fast ||
+    exit 1
+expect_miss 'standard library edits' || exit 1
+run_program 42 || exit 1
 
 # Exact bundled source, not merely the output path, selects an object.
 "$compiler" build \
     "$project_root/tests/cases/modules/types-valid.ab" \
-    -o "$output" --fast
-[[ ! -e $output.host.o ]] || exit 1
-set +e
-ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
-    "$project_root/tools/run-limited.sh" "$output"
-changed_status=$?
-set -e
-[[ $changed_status -eq 7 ]] || exit 1
+    -o "$output" --fast || exit 1
+no_host_object || exit 1
+run_program 7 || exit 1
 
-printf 'native object cache: parsed capability eligibility + exact-source hit in %s ms; compiler/source identity invalidated\n' \
+printf 'native object cache: exact-source hit in %s ms; compiler, sysroot, standard library and source identity invalidated\n' \
     "$elapsed_ms"

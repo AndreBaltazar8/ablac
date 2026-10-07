@@ -370,13 +370,49 @@ static long darwin_epoll_wait(int descriptor, unsigned char *output,
 
 // Darwin has no procfs. The one path the toolchain reads, `/proc/self/exe`
 // (its own image, for the build cache identity and to re-run itself), names
-// the running executable.
+// the running executable. Linux resolves that link to the image the process
+// was started from even after the file is replaced; Darwin only has the path.
+// The image's identity is therefore recorded before main, and a path that no
+// longer names that image (an install renamed a new file over it) does not
+// resolve: the caller sees ENOENT instead of another program's bytes.
+static int darwin_image_known;
+static dev_t darwin_image_device;
+static ino_t darwin_image_inode;
+
+__attribute__((constructor)) static void darwin_record_image(void) {
+  char path[PATH_MAX];
+  uint32_t size = PATH_MAX;
+  struct stat information;
+  if (_NSGetExecutablePath(path, &size) == 0 &&
+      stat(path, &information) == 0) {
+    darwin_image_device = information.st_dev;
+    darwin_image_inode = information.st_ino;
+    darwin_image_known = 1;
+  }
+}
+
+static int darwin_is_image(const struct stat *information) {
+  return darwin_image_known && information->st_dev == darwin_image_device &&
+         information->st_ino == darwin_image_inode;
+}
+
+static int darwin_names_image(const char *path) {
+  return path != NULL && strcmp(path, "/proc/self/exe") == 0;
+}
+
+// The running executable's path for `/proc/self/exe` (NULL with errno set when
+// that path no longer names the running image); any other path unchanged.
 static const char *darwin_linux_path(const char *path, char *buffer) {
   uint32_t size = PATH_MAX;
-  if (path != NULL && strcmp(path, "/proc/self/exe") == 0 &&
-      _NSGetExecutablePath(buffer, &size) == 0)
-    return buffer;
-  return path;
+  struct stat information;
+  if (!darwin_names_image(path))
+    return path;
+  if (_NSGetExecutablePath(buffer, &size) != 0 ||
+      stat(buffer, &information) != 0 || !darwin_is_image(&information)) {
+    errno = ENOENT;
+    return NULL;
+  }
+  return buffer;
 }
 
 int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
@@ -539,10 +575,11 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     break;
   case 59: {
     char executable[PATH_MAX];
-    result = execve(
-        darwin_linux_path((const char *)(uintptr_t)argument0, executable),
-        (char *const *)(uintptr_t)argument1,
-        (char *const *)(uintptr_t)argument2);
+    const char *path =
+        darwin_linux_path((const char *)(uintptr_t)argument0, executable);
+    if (path != NULL)
+      result = execve(path, (char *const *)(uintptr_t)argument1,
+                      (char *const *)(uintptr_t)argument2);
     break;
   }
   case 60:
@@ -646,20 +683,34 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     break;
   case 257: {
     char executable[PATH_MAX];
-    result = openat(
-        argument0 == -100 ? AT_FDCWD : (int)argument0,
-        darwin_linux_path((const char *)(uintptr_t)argument1, executable),
-        darwin_open_flags(argument2), (mode_t)argument3);
+    const char *requested = (const char *)(uintptr_t)argument1;
+    const char *path = darwin_linux_path(requested, executable);
+    if (path != NULL)
+      result = openat(argument0 == -100 ? AT_FDCWD : (int)argument0, path,
+                      darwin_open_flags(argument2), (mode_t)argument3);
+    // The file opened is the one checked: a rename between the path check and
+    // the open must not hand out the replacement's bytes.
+    if (result >= 0 && darwin_names_image(requested)) {
+      struct stat information;
+      if (fstat((int)result, &information) != 0 ||
+          !darwin_is_image(&information)) {
+        close((int)result);
+        errno = ENOENT;
+        result = -1;
+      }
+    }
     break;
   }
   case 262: {
     struct stat information;
     char executable[PATH_MAX];
     // Linux's AT_SYMLINK_NOFOLLOW (0x100) is Darwin's AT_SYMLINK_NOFOLLOW.
-    result = fstatat(
-        argument0 == -100 ? AT_FDCWD : (int)argument0,
-        darwin_linux_path((const char *)(uintptr_t)argument1, executable),
-        &information, (argument3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
+    const char *path =
+        darwin_linux_path((const char *)(uintptr_t)argument1, executable);
+    if (path != NULL)
+      result = fstatat(argument0 == -100 ? AT_FDCWD : (int)argument0, path,
+                       &information,
+                       (argument3 & 0x100) ? AT_SYMLINK_NOFOLLOW : 0);
     if (result == 0) {
       unsigned char *output = (unsigned char *)(uintptr_t)argument2;
       memset(output, 0, 144);
