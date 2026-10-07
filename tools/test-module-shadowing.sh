@@ -20,5 +20,14 @@ status=$?
 invalid=$?
 set -e
 [[ $status -eq 42 && $invalid -ne 0 ]] || exit 1
-grep -q 'E_IMPORT_UNQUALIFIED_AMBIGUOUS' "$output_directory/invalid.err"
-echo "module shadowing: own declarations shadow imports, runtime externs private"
+grep -q 'E_IMPORT_UNQUALIFIED_AMBIGUOUS' "$output_directory/invalid.err" || exit 1
+
+# An imported module's `main` does not replace the program's.
+"$compiler" build "$project_root/tests/cases/modules/shadow-main.ab" \
+    -o "$output_directory/main" --no-cache || exit 1
+set +e
+"$output_directory/main"
+status=$?
+set -e
+[[ $status -eq 42 ]] || exit 1
+echo "module shadowing: own declarations shadow imports, runtime externs private, the entry keeps main"
