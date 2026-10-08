@@ -4187,9 +4187,13 @@ class BootstrapLowerer(
         var index = this.ownedParameters.size
         while (index > 0) {
             index = index - 1
+            val name = this.ownedParameters[index]
+            val metadata = this.lowerParameterMetadataType(name)
             this.emitAffineDrop(
-                this.ownedParameters[index],
-                this.lowerStorageType(this.ownedParameters[index])
+                name,
+                if (bootstrapIsDelegatedType(metadata)) {
+                    bootstrapDelegatedStorageType(metadata)
+                } else this.lowerParameterType(name)
             )
         }
     }
@@ -4212,11 +4216,14 @@ class BootstrapLowerer(
         result
     }
 
-    fun lowerRefinedType(name: string): string {
+    // Refinements are recorded under the binding they narrow: a local's
+    // storage, or a parameter's name. A local shadowing a refined name in a
+    // nested block is not narrowed with it.
+    fun lowerRefinedType(binding: string): string {
         var result = "unknown"
         var index = 0
         while (index < this.refinementNames.size) {
-            if (this.refinementNames[index] == name &&
+            if (this.refinementNames[index] == binding &&
                 index < this.refinementTypes.size &&
                 index < this.refinementScopes.size &&
                 this.localScopeVisible(this.refinementScopes[index])) {
@@ -4245,7 +4252,9 @@ class BootstrapLowerer(
             if (bootstrapIsNullableType(element) &&
                 conditionIsTrue == nonNullWhenTrue) {
                 val refined = bootstrapNullableElementType(element)
-                this.refinementNames.append(name)
+                this.refinementNames.append(
+                    if (this.isLocal(name)) this.storageFor(name) else name
+                )
                 this.refinementTypes.append(
                     if (borrowed) "borrow:$refined" else refined
                 )
@@ -4292,7 +4301,7 @@ class BootstrapLowerer(
             }
             index = index + 1
         }
-        val refined = this.lowerRefinedType(name)
+        val refined = this.lowerRefinedType(this.storageFor(name))
         if (refined != "unknown") result = refined
         result
     }
@@ -4882,6 +4891,8 @@ class BootstrapLowerer(
         this.currentScope = previous
     }
 
+    // A parameter is the name's binding unless a local of a nested block,
+    // still in scope, shadows it.
     fun isParameter(name: string): bool {
         var found = false
         var index = 0
@@ -4889,7 +4900,7 @@ class BootstrapLowerer(
             if (this.parameters[index] == name) found = true
             index = index + 1
         }
-        found
+        found && !this.isLocal(name)
     }
 
     fun isCapturedParameter(name: string): bool {
@@ -4899,7 +4910,7 @@ class BootstrapLowerer(
             if (this.capturedParameters[index] == name) found = true
             index = index + 1
         }
-        found
+        found && !this.isLocal(name)
     }
 
     fun localIsCell(name: string): bool {
@@ -4977,25 +4988,6 @@ class BootstrapLowerer(
         if (!found) names.append(name)
     }
 
-    fun collectLambdaLocals(
-        expression: BootstrapExpression,
-        var names: array<string>
-    ): void {
-        if (expression.kind == "local.val" ||
-            expression.kind == "local.var") {
-            this.appendUniqueName(names, expression.text)
-        }
-        if (expression.kind != "lambda" &&
-            expression.kind != "lambda.move" &&
-            expression.kind != "lambda.generator") {
-            var child = 0
-            while (child < expression.children.size) {
-                this.collectLambdaLocals(expression.children[child], names)
-                child = child + 1
-            }
-        }
-    }
-
     fun nameIsBound(names: array<string>, name: string): bool {
         var found = false
         var index = 0
@@ -5031,7 +5023,6 @@ class BootstrapLowerer(
                 parameter = parameter + 1
             }
             val body = expression.children[expression.children.size - 1]
-            this.collectLambdaLocals(body, nestedBound)
             this.collectLambdaFreeNames(body, nestedBound, free)
         }
         if (!nested) {
@@ -5043,14 +5034,27 @@ class BootstrapLowerer(
                 !this.nameIsBound(bound, expression.text)) {
                 this.appendUniqueName(free, expression.text)
             }
-            var child = 0
-            while (child < expression.children.size) {
-                this.collectLambdaFreeNames(
-                    expression.children[child],
-                    bound,
-                    free
-                )
-                child = child + 1
+            if (expression.kind == "block") {
+                val scoped = bootstrapCopyBoundNames(bound)
+                var child = 0
+                while (child < expression.children.size) {
+                    val statement = expression.children[child]
+                    this.collectLambdaFreeNames(statement, scoped, free)
+                    if (bootstrapStatementDeclaresLocal(statement)) {
+                        scoped.append(statement.text)
+                    }
+                    child = child + 1
+                }
+            } else {
+                var child = 0
+                while (child < expression.children.size) {
+                    this.collectLambdaFreeNames(
+                        expression.children[child],
+                        bound,
+                        free
+                    )
+                    child = child + 1
+                }
             }
         }
     }
@@ -5111,7 +5115,18 @@ class BootstrapLowerer(
                     expression.text
                 )) mutates = true
         }
-        if (expression.kind != "lambda" &&
+        if (expression.kind == "block") {
+            val scoped = bootstrapCopyBoundNames(bound)
+            var child = 0
+            while (!mutates && child < expression.children.size) {
+                val statement = expression.children[child]
+                mutates = this.lambdaMutatesCapturedPlace(statement, scoped)
+                if (bootstrapStatementDeclaresLocal(statement)) {
+                    scoped.append(statement.text)
+                }
+                child = child + 1
+            }
+        } else if (expression.kind != "lambda" &&
             expression.kind != "lambda.move" &&
             expression.kind != "lambda.generator") {
             var child = 0
@@ -5136,7 +5151,6 @@ class BootstrapLowerer(
             parameter = parameter + 1
         }
         val body = expression.children[expression.children.size - 1]
-        this.collectLambdaLocals(body, bound)
         this.lambdaMutatesCapturedPlace(body, bound)
     }
 
@@ -5155,7 +5169,6 @@ class BootstrapLowerer(
                 parameter = parameter + 1
             }
             val body = expression.children[expression.children.size - 1]
-            this.collectLambdaLocals(body, bound)
             val free: array<string> = []
             this.collectLambdaFreeNames(body, bound, free)
             captured = this.nameIsBound(free, name)
@@ -5188,7 +5201,6 @@ class BootstrapLowerer(
                 parameter = parameter + 1
             }
             val body = expression.children[expression.children.size - 1]
-            this.collectLambdaLocals(body, bound)
             this.collectLambdaFreeNames(body, bound, captured)
         } else {
             var child = 0
@@ -6378,7 +6390,6 @@ class BootstrapLowerer(
                 bound.append(explicitParameters[parameter])
                 parameter = parameter + 1
             }
-            this.collectLambdaLocals(body, bound)
             val free: array<string> = []
             this.collectLambdaFreeNames(body, bound, free)
             val captureNames: array<string> = []

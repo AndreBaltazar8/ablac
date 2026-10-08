@@ -4735,17 +4735,22 @@ class BootstrapAnalyzer(
     }
     fun findType(name: string): string {
         var result = "unknown"
+        var binding = ""
         var localIndex = 0
         while (localIndex < this.locals.size) {
             if (this.locals[localIndex].name == name &&
                 this.scopeIsVisible(this.locals[localIndex].scope)) {
                 result = this.locals[localIndex].type
+                binding = bootstrapRefinementBinding(this.locals[localIndex])
             }
             localIndex = localIndex + 1
         }
+        // A refinement narrows the declaration it was made for, never a
+        // local that shadows it in a nested block.
         var refinementIndex = 0
-        while (refinementIndex < this.refinementNames.size) {
-            if (this.refinementNames[refinementIndex] == name &&
+        while (binding != "" &&
+               refinementIndex < this.refinementNames.size) {
+            if (this.refinementNames[refinementIndex] == binding &&
                 refinementIndex < this.refinementTypes.size &&
                 refinementIndex < this.refinementScopes.size &&
                 this.scopeIsVisible(
@@ -4885,13 +4890,46 @@ class BootstrapAnalyzer(
             if (bootstrapIsNullableType(element) &&
                 conditionIsTrue == nonNullWhenTrue) {
                 val refined = bootstrapNullableElementType(element)
-                this.refinementNames.append(name)
+                this.refinementNames.append(this.visibleRefinementBinding(name))
                 this.refinementTypes.append(
                     if (borrowed) "borrow:$refined" else refined
                 )
                 this.refinementScopes.append(this.currentScope)
             }
         }
+    }
+
+    fun visibleRefinementBinding(name: string): string {
+        var result = ""
+        var index = 0
+        while (index < this.locals.size) {
+            if (this.locals[index].name == name &&
+                this.scopeIsVisible(this.locals[index].scope)) {
+                result = bootstrapRefinementBinding(this.locals[index])
+            }
+            index = index + 1
+        }
+        result
+    }
+
+    // A local redeclaring a parameter in the block that is the body of its
+    // function or lambda, the scope the parameters are declared for.
+    fun redeclaresParameter(name: string): bool {
+        var kind = ""
+        var scope = -1
+        var index = 0
+        while (index < this.locals.size) {
+            if (this.locals[index].name == name &&
+                this.scopeIsVisible(this.locals[index].scope)) {
+                kind = this.locals[index].kind
+                scope = this.locals[index].scope
+            }
+            index = index + 1
+        }
+        (kind == "parameter" || kind == "owned.parameter" ||
+         kind == "mutable.parameter") &&
+            this.currentScope > 0 &&
+            this.scopeParents[this.currentScope] == scope
     }
 
     fun addNullableRefinements(
@@ -6653,25 +6691,6 @@ class BootstrapAnalyzer(
         if (!found) names.append(name)
     }
 
-    fun collectLambdaLocalNames(
-        expression: BootstrapExpression,
-        var names: array<string>
-    ): void {
-        if (expression.kind == "local.val" ||
-            expression.kind == "local.var") {
-            this.appendUniqueCaptureName(names, expression.text)
-        }
-        if (expression.kind != "lambda" &&
-            expression.kind != "lambda.move" &&
-            expression.kind != "lambda.generator") {
-            var child = 0
-            while (child < expression.children.size) {
-                this.collectLambdaLocalNames(expression.children[child], names)
-                child = child + 1
-            }
-        }
-    }
-
     fun captureNameIsBound(names: array<string>, name: string): bool {
         var found = false
         var index = 0
@@ -6707,7 +6726,6 @@ class BootstrapAnalyzer(
                 parameter = parameter + 1
             }
             val body = expression.children[expression.children.size - 1]
-            this.collectLambdaLocalNames(body, nestedBound)
             this.collectLambdaCaptureNames(body, nestedBound, captures)
         }
         if (!nested) {
@@ -6719,14 +6737,27 @@ class BootstrapAnalyzer(
                 !this.captureNameIsBound(bound, expression.text)) {
                 this.appendUniqueCaptureName(captures, expression.text)
             }
-            var child = 0
-            while (child < expression.children.size) {
-                this.collectLambdaCaptureNames(
-                    expression.children[child],
-                    bound,
-                    captures
-                )
-                child = child + 1
+            if (expression.kind == "block") {
+                val scoped = bootstrapCopyBoundNames(bound)
+                var child = 0
+                while (child < expression.children.size) {
+                    val statement = expression.children[child]
+                    this.collectLambdaCaptureNames(statement, scoped, captures)
+                    if (bootstrapStatementDeclaresLocal(statement)) {
+                        scoped.append(statement.text)
+                    }
+                    child = child + 1
+                }
+            } else {
+                var child = 0
+                while (child < expression.children.size) {
+                    this.collectLambdaCaptureNames(
+                        expression.children[child],
+                        bound,
+                        captures
+                    )
+                    child = child + 1
+                }
             }
         }
     }
@@ -6786,7 +6817,18 @@ class BootstrapAnalyzer(
                     expression.text
                 )) mutates = true
         }
-        if (expression.kind != "lambda" &&
+        if (expression.kind == "block") {
+            val scoped = bootstrapCopyBoundNames(bound)
+            var child = 0
+            while (!mutates && child < expression.children.size) {
+                val statement = expression.children[child]
+                mutates = this.lambdaMutatesCapturedPlace(statement, scoped)
+                if (bootstrapStatementDeclaresLocal(statement)) {
+                    scoped.append(statement.text)
+                }
+                child = child + 1
+            }
+        } else if (expression.kind != "lambda" &&
             expression.kind != "lambda.move") {
             var child = 0
             while (!mutates && child < expression.children.size) {
@@ -6810,7 +6852,6 @@ class BootstrapAnalyzer(
             parameter = parameter + 1
         }
         val body = expression.children[expression.children.size - 1]
-        this.collectLambdaLocalNames(body, bound)
         this.lambdaMutatesCapturedPlace(body, bound)
     }
 
@@ -6822,7 +6863,6 @@ class BootstrapAnalyzer(
             parameter = parameter + 1
         }
         val body = expression.children[expression.children.size - 1]
-        this.collectLambdaLocalNames(body, bound)
         val captures: array<string> = []
         this.collectLambdaCaptureNames(body, bound, captures)
         var capture = 0
@@ -6865,7 +6905,6 @@ class BootstrapAnalyzer(
 
     fun validateThreadCaptures(body: BootstrapExpression): void {
         val bound: array<string> = []
-        this.collectLambdaLocalNames(body, bound)
         if (this.lambdaMutatesCapturedPlace(body, bound)) {
             this.fail("thread.capture-mutation")
         }
@@ -8743,6 +8782,8 @@ class BootstrapAnalyzer(
         ) {
             if (this.hasLocal(expression.text)) {
                 this.fail("local.duplicate:${expression.text}")
+            } else if (this.redeclaresParameter(expression.text)) {
+                this.fail("local.shadows-parameter:${expression.text}")
             }
             val delegated = expression.children.size > 0 &&
                 expression.children[0].kind == "delegate.initializer"
@@ -9975,6 +10016,27 @@ class BootstrapAnalyzer(
         )
     }
 }
+
+// The names a block's statements see bound: the enclosing ones, then each
+// local the block declares, from the statement after it to the block's end,
+// the scope the checker gives a local.
+fun bootstrapCopyBoundNames(bound: array<string>): array<string> {
+    val names: array<string> = []
+    var index = 0
+    while (index < bound.size) {
+        names.append(bound[index])
+        index = index + 1
+    }
+    names
+}
+
+fun bootstrapStatementDeclaresLocal(statement: BootstrapExpression): bool =
+    statement.kind == "local.val" || statement.kind == "local.var"
+
+// The key a nullable refinement is recorded under: the declaration it
+// narrows, so a same-named local of a nested block is not narrowed with it.
+fun bootstrapRefinementBinding(symbol: BootstrapSymbol): string =
+    if (symbol.identity != "") symbol.identity else "name:${symbol.name}"
 
 fun bootstrapAnalyzeParsed(parsed: BootstrapParseResult): BootstrapSemanticResult {
     val typedRequestBegins: array<int> = []

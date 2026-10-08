@@ -81,6 +81,26 @@ before a read. An untyped deferred declaration and a deferred `val` are
 rejected; `val` continues to receive its value at its declaration until
 single-assignment path merging is implemented.
 
+A local is in scope from its declaration to the end of its block. A local of a
+nested block may shadow a parameter, an outer local, or a field; the outer
+binding is visible again once that block ends, including to a lambda that
+captures it:
+
+```abla
+fun scaled(width: f64, flag: bool): f64 {
+    var result = width
+    if (flag) {
+        val flag = 0.5      // shadows the parameter inside this block
+        result = width * flag
+    }
+    if (flag) result else 0.0   // the parameter again
+}
+```
+
+Two locals of one block may not share a name (`local.duplicate`), and a local
+of a function's or lambda's body block may not redeclare one of its parameters
+(`local.shadows-parameter`): the parameters are declared in that scope.
+
 ### Delegated bindings
 
 A local or top-level `val`/`var` may store a policy object while exposing the
