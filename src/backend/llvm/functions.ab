@@ -734,19 +734,81 @@ fun bootstrapLlvmInitializeParameters(
     }
 }
 
+// Each function's parameters with a default (the `parameter.default` instructions), found once
+// per function in a program's emission: every call site asks about its callee's parameters.
+class BootstrapLlvmParameterDefaults(
+    val keys: array<string>,
+    val starts: array<int>,
+    val counts: array<int>,
+    val names: array<string>,
+    var slots: array<int>
+)
+
+var bootstrapLlvmParameterDefaults = BootstrapLlvmParameterDefaults([], [], [], [], bootstrapIrLookupSlots(1024))
+
+/** Forget the last program's functions (emission of another program begins). */
+fun bootstrapLlvmParameterDefaultsReset(): void {
+    bootstrapLlvmParameterDefaults = BootstrapLlvmParameterDefaults([], [], [], [], bootstrapIrLookupSlots(1024))
+    return
+}
+
+fun bootstrapLlvmParameterDefaultsSlot(key: string): int {
+    val capacity = bootstrapLlvmParameterDefaults.slots.size
+    var slot = bootstrapIrLookupHash(key)
+    slot = slot - slot / capacity * capacity
+    while (bootstrapLlvmParameterDefaults.slots[slot] >= 0 &&
+           bootstrapLlvmParameterDefaults.keys[bootstrapLlvmParameterDefaults.slots[slot]] != key) {
+        slot = slot + 1
+        if (slot == capacity) slot = 0
+    }
+    slot
+}
+
+/** The entry for `function`'s defaults, found (and recorded) on its first query. */
+fun bootstrapLlvmParameterDefaultsOf(function: BootstrapIrFunction): int {
+    val key = "${function.name}#${function.parameters.size}#${function.instructions.size}"
+    var slot = bootstrapLlvmParameterDefaultsSlot(key)
+    if (bootstrapLlvmParameterDefaults.slots[slot] >= 0) return bootstrapLlvmParameterDefaults.slots[slot]
+    // Half full at most: grow the table first.
+    if ((bootstrapLlvmParameterDefaults.keys.size + 1) * 2 >= bootstrapLlvmParameterDefaults.slots.size) {
+        bootstrapLlvmParameterDefaults.slots = bootstrapIrLookupSlots(bootstrapLlvmParameterDefaults.slots.size)
+        var entry = 0
+        while (entry < bootstrapLlvmParameterDefaults.keys.size) {
+            bootstrapLlvmParameterDefaults.slots[bootstrapLlvmParameterDefaultsSlot(bootstrapLlvmParameterDefaults.keys[entry])] = entry
+            entry = entry + 1
+        }
+        slot = bootstrapLlvmParameterDefaultsSlot(key)
+    }
+    val entry = bootstrapLlvmParameterDefaults.keys.size
+    bootstrapLlvmParameterDefaults.slots[slot] = entry
+    bootstrapLlvmParameterDefaults.keys.append(key)
+    bootstrapLlvmParameterDefaults.starts.append(bootstrapLlvmParameterDefaults.names.size)
+    var count = 0
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "parameter.default") {
+            bootstrapLlvmParameterDefaults.names.append(candidate.text)
+            count = count + 1
+        }
+        instruction = instruction + 1
+    }
+    bootstrapLlvmParameterDefaults.counts.append(count)
+    entry
+}
+
 fun bootstrapLlvmParameterHasDefault(
     function: BootstrapIrFunction,
     name: string
 ): bool {
-    var found = false
-    var instruction = 0
-    while (instruction < function.instructions.size) {
-        val candidate = function.instructions[instruction]
-        if (candidate.opcode == "parameter.default" &&
-            candidate.text == name) found = true
-        instruction = instruction + 1
+    val entry = bootstrapLlvmParameterDefaultsOf(function)
+    var index = bootstrapLlvmParameterDefaults.starts[entry]
+    val end = index + bootstrapLlvmParameterDefaults.counts[entry]
+    while (index < end) {
+        if (bootstrapLlvmParameterDefaults.names[index] == name) return true
+        index = index + 1
     }
-    found
+    false
 }
 
 fun bootstrapLlvmPushRoots(
@@ -1084,7 +1146,33 @@ fun bootstrapLlvmEmitDirectCall(
     result
 }
 
+// The runtime entry each opcode lowers to, remembered per opcode: the spelling chain below
+// compares dozens of strings, and every instruction asks.
+class BootstrapLlvmOpcodeNames(val opcodes: array<string>, val names: array<string>, val slots: array<int>)
+
+var bootstrapLlvmOpcodeNames = BootstrapLlvmOpcodeNames([], [], bootstrapIrLookupSlots(256))
+
 fun bootstrapLlvmRuntimeOperation(opcode: string): string {
+    val capacity = bootstrapLlvmOpcodeNames.slots.size
+    var slot = bootstrapIrLookupHash(opcode)
+    slot = slot - slot / capacity * capacity
+    while (bootstrapLlvmOpcodeNames.slots[slot] >= 0) {
+        val entry = bootstrapLlvmOpcodeNames.slots[slot]
+        if (bootstrapLlvmOpcodeNames.opcodes[entry] == opcode) return bootstrapLlvmOpcodeNames.names[entry]
+        slot = slot + 1
+        if (slot == capacity) slot = 0
+    }
+    val name = bootstrapLlvmRuntimeOperationOf(opcode)
+    // (Half full at most, so a probe always ends; past that, opcodes are looked up afresh.)
+    if (bootstrapLlvmOpcodeNames.opcodes.size * 2 < capacity) {
+        bootstrapLlvmOpcodeNames.slots[slot] = bootstrapLlvmOpcodeNames.opcodes.size
+        bootstrapLlvmOpcodeNames.opcodes.append(opcode)
+        bootstrapLlvmOpcodeNames.names.append(name)
+    }
+    name
+}
+
+fun bootstrapLlvmRuntimeOperationOf(opcode: string): string {
     var name = bootstrapLlvmRuntimeBinary(opcode)
     if (opcode == "neg") name = "abla_negate"
     if (opcode == "not") name = "abla_not"
