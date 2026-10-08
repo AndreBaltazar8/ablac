@@ -83,46 +83,92 @@ fun bootstrapOverloadMembers(declarations: array<BootstrapDeclaration>): array<B
     members
 }
 
-/** How many members answer to `key`, and whether their signatures differ. */
-fun bootstrapOverloadCount(members: array<BootstrapOverloadMember>, key: string): int {
-    var count = 0
-    for (member in members) {
-        if (bootstrapOverloadKey(member.owner, member.name) == key) count = count + 1
-    }
-    count
+/** Strings to dense indices, open-addressed; sized for `most` entries up front. */
+class BootstrapOverloadStrings(val keys: array<string>, val slots: array<int>)
+
+fun bootstrapOverloadStrings(most: int): BootstrapOverloadStrings {
+    var capacity = 8
+    while (capacity < most * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    for (slot in 0 until capacity) slots.append(-1)
+    BootstrapOverloadStrings([], slots)
 }
 
-fun bootstrapOverloadSignaturesDistinct(members: array<BootstrapOverloadMember>, key: string): bool {
-    val seen: array<string> = []
-    for (member in members) {
-        if (bootstrapOverloadKey(member.owner, member.name) == key) {
-            for (signature in seen) if (signature == member.signature) return false
-            seen.append(member.signature)
-        }
+/** The slot `key` occupies, or the empty one where it would go. */
+fun bootstrapOverloadStringSlot(strings: BootstrapOverloadStrings, key: string): int {
+    val capacity = strings.slots.size
+    var slot = bootstrapFunctionDeclarationHash(key)
+    slot = slot - slot / capacity * capacity
+    while (strings.slots[slot] >= 0 && strings.keys[strings.slots[slot]] != key) {
+        slot = slot + 1
+        if (slot == capacity) slot = 0
     }
-    true
+    slot
+}
+
+/** The index of `key`, or -1. */
+fun bootstrapOverloadStringFind(strings: BootstrapOverloadStrings, key: string): int =
+    strings.slots[bootstrapOverloadStringSlot(strings, key)]
+
+/** The index of `key`, added when absent. */
+fun bootstrapOverloadStringAdd(var strings: BootstrapOverloadStrings, key: string): int {
+    val slot = bootstrapOverloadStringSlot(strings, key)
+    if (strings.slots[slot] >= 0) return strings.slots[slot]
+    strings.slots[slot] = strings.keys.size
+    strings.keys.append(key)
+    strings.keys.size - 1
+}
+
+/** Every key's overload set, counted once: how many members answer to it, and whether their
+ *  signatures all differ (an overload set needs both). */
+class BootstrapOverloadSets(val names: BootstrapOverloadStrings, val counts: array<int>, val distinct: array<bool>)
+
+fun bootstrapOverloadSets(members: array<BootstrapOverloadMember>): BootstrapOverloadSets {
+    var names = bootstrapOverloadStrings(members.size)
+    var signed = bootstrapOverloadStrings(members.size)
+    val counts: array<int> = []
+    val distinct: array<bool> = []
+    for (member in members) {
+        val key = bootstrapOverloadKey(member.owner, member.name)
+        val set = bootstrapOverloadStringAdd(names, key)
+        if (set == counts.size) {
+            counts.append(0)
+            distinct.append(true)
+        }
+        counts[set] = counts[set] + 1
+        // A second member of the set with this signature: not distinct.
+        val known = signed.keys.size
+        val unused = bootstrapOverloadStringAdd(signed, "$key(${member.signature})")
+        if (signed.keys.size == known) distinct[set] = false
+    }
+    BootstrapOverloadSets(names, counts, distinct)
+}
+
+/** Whether `key` names an overload set: two or more members, their signatures distinct. */
+fun bootstrapOverloadSetOf(sets: BootstrapOverloadSets, key: string): bool {
+    val set = bootstrapOverloadStringFind(sets.names, key)
+    set >= 0 && sets.counts[set] > 1 && sets.distinct[set]
 }
 
 /** The name a declaration is published under: mangled when it is overloaded. */
 fun bootstrapOverloadedName(
-    members: array<BootstrapOverloadMember>,
+    sets: BootstrapOverloadSets,
     owner: string,
     declaration: BootstrapDeclaration
 ): string {
-    val key = bootstrapOverloadKey(owner, declaration.name)
-    if (declaration.kind != "fun" || bootstrapOverloadCount(members, key) < 2 ||
-        !bootstrapOverloadSignaturesDistinct(members, key)) return declaration.name
+    if (declaration.kind != "fun" ||
+        !bootstrapOverloadSetOf(sets, bootstrapOverloadKey(owner, declaration.name))) return declaration.name
     "${declaration.name}__${bootstrapOverloadSignature(declaration)}"
 }
 
 fun bootstrapOverloadRenamed(
-    members: array<BootstrapOverloadMember>,
+    sets: BootstrapOverloadSets,
     declaration: BootstrapDeclaration
 ): BootstrapDeclaration {
     if (declaration.kind == "fun") {
         val owner = if (declaration.extensionOwner == "") ""
             else bootstrapNormalizeType(declaration.extensionOwner)
-        val name = bootstrapOverloadedName(members, owner, declaration)
+        val name = bootstrapOverloadedName(sets, owner, declaration)
         return if (name == declaration.name) declaration
             else bootstrapDeclarationWithName(declaration, name)
     }
@@ -131,7 +177,7 @@ fun bootstrapOverloadRenamed(
     var renamed = false
     val methods: array<BootstrapDeclaration> = []
     for (method in declaration.methods) {
-        val name = bootstrapOverloadedName(members, owner, method)
+        val name = bootstrapOverloadedName(sets, owner, method)
         if (name != method.name) renamed = true
         methods.append(if (name == method.name) method else bootstrapDeclarationWithName(method, name))
     }
@@ -254,14 +300,37 @@ fun bootstrapOverloadRewriteDeclaration(
     rewritten
 }
 
+/** The resolutions by source: each source's most recent one, and each one's previous in the
+ *  same source (-1 ends a chain). */
+class BootstrapOverloadBySource(val sources: BootstrapOverloadStrings, val last: array<int>, val previous: array<int>)
+
+fun bootstrapOverloadBySource(resolutions: array<BootstrapOverloadResolution>): BootstrapOverloadBySource {
+    var sources = bootstrapOverloadStrings(resolutions.size)
+    val last: array<int> = []
+    val previous: array<int> = []
+    var index = 0
+    while (index < resolutions.size) {
+        val source = bootstrapOverloadStringAdd(sources, resolutions[index].sourceIdentity)
+        if (source == last.size) last.append(-1)
+        previous.append(last[source])
+        last[source] = index
+        index = index + 1
+    }
+    BootstrapOverloadBySource(sources, last, previous)
+}
+
 /** Whether any resolution lies in `declaration`'s source span. */
 fun bootstrapOverloadTouches(
     declaration: BootstrapDeclaration,
-    resolutions: array<BootstrapOverloadResolution>
+    resolutions: array<BootstrapOverloadResolution>,
+    bySource: BootstrapOverloadBySource
 ): bool {
-    for (resolution in resolutions) {
-        if (resolution.sourceIdentity == declaration.sourceIdentity &&
-            resolution.begin >= declaration.begin && resolution.end <= declaration.end) return true
+    val source = bootstrapOverloadStringFind(bySource.sources, declaration.sourceIdentity)
+    var index = if (source >= 0) bySource.last[source] else -1
+    while (index >= 0) {
+        val resolution = resolutions[index]
+        if (resolution.begin >= declaration.begin && resolution.end <= declaration.end) return true
+        index = bySource.previous[index]
     }
     false
 }
@@ -270,6 +339,7 @@ fun bootstrapOverloadTouches(
  *  one (and every operator use) rewritten to name its declaration. */
 fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResult {
     val members = bootstrapOverloadMembers(parsed.declarations)
+    val sets = bootstrapOverloadSets(members)
     var diagnostics = ""
     var errors = 0
     var active = false
@@ -281,14 +351,13 @@ fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResul
                 diagnostics = "${diagnostics}error[E_SEMANTIC]: operator.declaration:$key: an operator function is plus, minus, times, div, rem or unaryMinus on a receiver\n"
                 errors = errors + 1
             }
-        } else if (bootstrapOverloadCount(members, key) > 1 &&
-                   bootstrapOverloadSignaturesDistinct(members, key)) active = true
+        } else if (bootstrapOverloadSetOf(sets, key)) active = true
     }
     if (!active) return parsed
 
     // Publish overloads under distinct names, then type every call naming one.
     val renamed: array<BootstrapDeclaration> = []
-    for (declaration in parsed.declarations) renamed.append(bootstrapOverloadRenamed(members, declaration))
+    for (declaration in parsed.declarations) renamed.append(bootstrapOverloadRenamed(sets, declaration))
     val keys: array<string> = []
     val names: array<string> = []
     val owners: array<string> = []
@@ -341,10 +410,11 @@ fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResul
     }
 
     val index = bootstrapOverloadIndex(resolutions)
+    val bySource = bootstrapOverloadBySource(resolutions)
     val declarations: array<BootstrapDeclaration> = []
     for (declaration in renamed) {
         declarations.append(
-            if (bootstrapOverloadTouches(declaration, resolutions))
+            if (bootstrapOverloadTouches(declaration, resolutions, bySource))
                 bootstrapOverloadRewriteDeclaration(declaration, resolutions, index)
             else declaration
         )
