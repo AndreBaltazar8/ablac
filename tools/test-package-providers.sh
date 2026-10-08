@@ -119,7 +119,12 @@ import "literal.ab"
 import leafDependency()
 fun dependencyAnswer: int = 37 + leafAnswer() + literalAnswer()
 EOF
-git -C "$repository" add src/provider-dep.ab
+# A dependency may publish its own abla.lock. Its copy (prepared or vendored)
+# still resolves its own dependencies through the application's graph.
+awk 'BEGIN { RS = ""; ORS = "\n\n" } NR == 1 || /name = "provider-leaf"/' \
+    "$application/abla.lock" > "$repository/abla.lock"
+grep -q 'name = "provider-leaf"' "$repository/abla.lock"
+git -C "$repository" add src/provider-dep.ab abla.lock
 git -C "$repository" commit --quiet -m 'move mutable branch'
 second_revision=$(git -C "$repository" rev-parse HEAD)
 
