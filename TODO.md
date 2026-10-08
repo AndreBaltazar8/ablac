@@ -81,6 +81,38 @@ Package-side work (not changed from ablac):
   (`abla/io`), `currentDirectory().text` and `path(p).readText()` (`abla/fs`).
   Checked on a scratch copy: with this and the item above, `make check` passes.
 
+## Compile time and memory
+
+Measured on a 10K-function Wasm application (86 MB of LLVM IR; a dev build's compiler takes
+about 23 CPU seconds). Not yet done:
+
+- [ ] **Without a launcher budget the compiler never collects.** Its footprint grows to what
+  it allocates: 10 GB for that dev build, nearly all of it garbage. Collecting each time
+  the heap grows by 256 MiB keeps it at 1.4 GB, but today's collector makes that about
+  15 CPU seconds slower (see the next item).
+
+- [ ] **The LLVM IR is handed to `opt` as text.** The module is rendered (1-1.6 s), written,
+  read back for the target-neutral panic patch, and parsed again by `opt` (1.6 s), which
+  writes bitcode for `llc` (1.9 s). Passing bitcode (with the panic patch made on the
+  module, not its text), or running the passes and code generation in process for Wasm,
+  would save 3-5 s and several 86 MB copies of the text.
+- [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
+  `alloca %AblaValue` (146K in that program), with as many stores and loads around them
+  and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
+  undoing it. Passing and returning scalars unboxed would shrink opt and llc time, the Wasm
+  and run time together; it is the largest lever left, and a large change.
+- [ ] **The overload probe is a second semantic analysis.** Once a program has operator
+  functions the probe analyzes the whole program again to type the calls that may name
+  them (about 4 s and 1.8 GB of garbage in that program). Typing candidate calls inside the
+  main analysis would remove it.
+- [ ] **A collection still walks every allocation.** Each one lists all allocations through
+  their linked list, sorts them by address (a radix sort), and sweeps and frees them one at
+  a time, garbage and live alike. A collector whose cost followed what is live (pages with
+  mark bits, or generations) would make frequent collections cheap.
+- [ ] **A hosted release executable is optimized twice.** Its relocatable object sidecar
+  (O2) is built beside the LTO executable (about 50 CPU seconds for a large server); a
+  build that asked for no sidecar could skip it.
+
 ## Not checked
 
 Linux-only linking and running (abla-graphics, abla-doom, the X11/Wayland
