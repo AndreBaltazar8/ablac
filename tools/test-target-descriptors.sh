@@ -38,6 +38,20 @@ grep -q 'RISC-V' "$directory/riscv64.header"
 grep -q '"llvmTriple":"riscv64-unknown-elf"' \
     "$directory/riscv64.o.abi.json"
 
+# A non-hosted target with a C library gets the runtime (the standard
+# library's memory module type-checks), and a value-bound export is kept.
+"$compiler" build \
+    "$project_root/tests/cases/target-descriptors/libc-object-build.ab" \
+    --fast --no-cache -o "$directory/libc-driver"
+set +e
+"$project_root/tools/run-limited.sh" "$directory/libc-driver"
+libc_status=$?
+set -e
+[[ $libc_status -eq 44 ]] || exit 1
+llvm-nm "$directory/riscv64-libc.o" > "$directory/riscv64-libc.symbols"
+grep -q ' T libc_object_answer$' "$directory/riscv64-libc.symbols"
+grep -q '"symbol":"libc_object_answer"' "$directory/riscv64-libc.o.abi.json"
+
 "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
     --fast --no-cache \
     --target-triple riscv64-unknown-elf --object-format elf \
