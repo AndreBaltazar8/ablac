@@ -83,13 +83,9 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
-Measured on a 10K-function Wasm application (86 MB of LLVM IR; a dev build's compiler takes
-about 23 CPU seconds). Not yet done:
-
-- [ ] **Without a launcher budget the compiler never collects.** Its footprint grows to what
-  it allocates: 10 GB for that dev build, nearly all of it garbage. Collecting each time
-  the heap grows by 256 MiB keeps it at 1.4 GB, but today's collector makes that about
-  15 CPU seconds slower (see the next item).
+Measured on a 10K-function Wasm application (86 MB of LLVM IR). Its dev build's compiler,
+collecting each time its heap grows by 256 MiB, peaks at 1.4 GB and takes about 38 CPU
+seconds; never collecting, it takes about 26 and peaks at 10 GB. Not yet done:
 
 - [ ] **The LLVM IR is handed to `opt` as text.** The module is rendered (1-1.6 s), written,
   read back for the target-neutral panic patch, and parsed again by `opt` (1.6 s), which
@@ -107,8 +103,9 @@ about 23 CPU seconds). Not yet done:
   main analysis would remove it.
 - [ ] **A collection still walks every allocation.** Each one lists all allocations through
   their linked list, sorts them by address (a radix sort), and sweeps and frees them one at
-  a time, garbage and live alike. A collector whose cost followed what is live (pages with
-  mark bits, or generations) would make frequent collections cheap.
+  a time, garbage and live alike: about 12 of that build's 38 seconds. A collector whose
+  cost followed what is live (pages with mark bits, or generations) would make frequent
+  collections cheap.
 - [ ] **A hosted release executable is optimized twice.** Its relocatable object sidecar
   (O2) is built beside the LTO executable (about 50 CPU seconds for a large server); a
   build that asked for no sidecar could skip it.
