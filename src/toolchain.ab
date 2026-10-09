@@ -310,6 +310,11 @@ fun bootstrapExternalEmitObject(
     status
 }
 
+fun bootstrapKeepLlvmText(): bool {
+    val configured = linuxEnvironment("ABLA_KEEP_LLVM_TEXT")
+    configured.found && configured.value == "1"
+}
+
 fun bootstrapTargetNeutralPanicRuntime(llvm: string): string {
     val signature =
         "define internal void @abla_runtime_panic(ptr %message, i64 %length) noreturn {\n"
@@ -351,7 +356,10 @@ fun bootstrapExternalEmitObjectForTarget(
         bootstrapTextContains(llvmTriple, "thumb")
     var optimizationSource = llvmPath
     var prepared = true
-    if (llvmTriple != "x86_64-unknown-linux-gnu") {
+    // Bitcode comes straight from the module, which defines no runtime panic to patch.
+    val bitcodeInput = llvmPath.size > 3 &&
+        llvmPath.slice(llvmPath.size - 3, llvmPath.size) == ".bc"
+    if (llvmTriple != "x86_64-unknown-linux-gnu" && !bitcodeInput) {
         prepared = Path(targetLlvmPath).writeTextAtomic(
             bootstrapTargetNeutralPanicRuntime(Path(llvmPath).readText())
         )
@@ -1381,6 +1389,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // (A hosted executable still emits it: that object is its relocatable
     // sidecar.)
     val wasmObjectUnused = wasmLtoEligible
+    // A Wasm development build hands its module to opt as bitcode written in process:
+    // rendering about 100 MB of LLVM text, reading it back and parsing it again cost
+    // seconds, and nothing reads that text. ABLA_KEEP_LLVM_TEXT=1 keeps it (beside the
+    // module, as `<module>.ll`).
+    val bitcodeHandoff = target.objectFormat == "wasm" && !ltoEligible &&
+        (cacheProfile == "cross-fast" || cacheProfile == "raw-cross-fast") &&
+        !bootstrapKeepLlvmText()
+    val bitcodePath = if (bitcodeHandoff) "$outputPath.input.bc" else ""
     val firstHash = bootstrapNativeCacheHash(
         sourceIdentity, 17, 257, 1000000007
     )
@@ -1480,6 +1496,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmTraceMemory(
             "frontend.parse.end:${parsedGraph.declarations.size}"
         )
+        val enclosingBitcodePath = bootstrapLlvmBitcodePath
+        bootstrapLlvmBitcodePath = bitcodePath
         val compilation = bootstrapCompileLlvmParsedCached(
             parsedGraph,
             irCache,
@@ -1487,6 +1505,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             true,
             target.hosted && artifact == "executable"
         )
+        bootstrapLlvmBitcodePath = enclosingBitcodePath
         linkLlvm = compilation.linkLlvm
         linkHost = compilation.linkHost
         abiManifest = bootstrapNativeAbiManifest(
@@ -1514,14 +1533,20 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 status = 154
                 failureKind = "reported"
             } else {
-                val emitted = if (target.objectFormat == "elf" &&
-                    compilation.output.size <= 4194304) {
-                    bootstrapAddLlvmElfFunctionSections(compilation.output)
-                } else compilation.output
-                if (Path(llvmPath).writeTextAtomic(emitted)) status = 0
-                else {
-                    status = 145
-                    failureKind = "io"
+                if (bitcodeHandoff) {
+                    // A text of an earlier build would no longer match the module.
+                    Path(llvmPath).remove()
+                    status = 0
+                } else {
+                    val emitted = if (target.objectFormat == "elf" &&
+                        compilation.output.size <= 4194304) {
+                        bootstrapAddLlvmElfFunctionSections(compilation.output)
+                    } else compilation.output
+                    if (Path(llvmPath).writeTextAtomic(emitted)) status = 0
+                    else {
+                        status = 145
+                        failureKind = "io"
+                    }
                 }
             }
             // The partition combiner is the ELF relocatable linker. Mach-O
@@ -1550,6 +1575,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     status = bootstrapEmitParallelObject(
                         llvmPath, objectPath
                     )
+                } else if (bitcodeHandoff) {
+                    status = emitObject(bitcodePath, objectPath)
+                    Path(bitcodePath).remove()
                 } else status = emitObject(llvmPath, objectPath)
             }
             if (status == 0 && cacheEnabled && compileInputsCacheable &&

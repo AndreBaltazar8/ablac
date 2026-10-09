@@ -89,11 +89,15 @@ seconds (88 G cycles); never collecting, it takes about 24 (73 G cycles) and pea
 10 GB. (Plain globals for the root frame until threads are enabled were tried: 5% faster
 compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not yet done:
 
-- [ ] **The LLVM IR is handed to `opt` as text.** The module is rendered (1-1.6 s), written,
-  read back for the target-neutral panic patch, and parsed again by `opt` (1.6 s), which
-  writes bitcode for `llc` (1.9 s). Passing bitcode (with the panic patch made on the
-  module, not its text), or running the passes and code generation in process for Wasm,
-  would save 3-5 s and several 86 MB copies of the text.
+- [ ] **`opt` and `llc` run one after the other on one module.** In that dev build they are
+  22.6 of its 54 wall seconds (opt 11.6, llc 11.0). Emitting the module as N partitions
+  during emission (llvm-split on the finished module cost 3.6 s, more than it saved) and
+  running N opt/llc pairs at once would cut most of that wall time on a multi-core
+  machine; the partitions must then link as before (wasm-ld takes several objects).
+  Release (LTO) and native builds still pass LLVM text between their steps.
+- [ ] **A debug Wasm module is not byte-reproducible.** `<module>.debug.wasm` keeps the
+  linker's temporary output name (`<module>.tmp.<pid>`) in its name section; the module
+  itself strips it.
 - [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
   `alloca %AblaValue` (146K in that program), with as many stores and loads around them
   and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA

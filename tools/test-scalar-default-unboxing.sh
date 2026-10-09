@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# This test reads the module's LLVM text, which a development build keeps only when asked.
+export ABLA_KEEP_LLVM_TEXT=1
 compiler=${1:-build/ablac}
 fixture=tests/cases/modules/scalar-default-unboxing.ab
 output=build/tests/scalar-default-unboxing

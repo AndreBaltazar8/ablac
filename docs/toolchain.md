@@ -60,6 +60,11 @@ a crash. Release builds don't; `-g`/`--debug`, `--no-debug` and
 `ABLA_DEBUG=1|0` override either. See [debugging.md](debugging.md). The embedding runtime must validate
 the imported symbol names and signatures before instantiation.
 
+A development (`--fast`) WebAssembly build hands its module to `opt` as bitcode
+and keeps no LLVM text; `ABLA_KEEP_LLVM_TEXT=1` keeps it, as `<module>.ll`
+beside the module. Release builds always write that text (their LTO step reads
+it), and so do native builds.
+
 An extension-defined target with linker flavor and emulation `none` may use
 any object triple implemented by the installed LLVM and emit an `object` or
 `static-library`. LLVM target registration is not architecture-specific.
