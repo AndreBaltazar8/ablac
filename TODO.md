@@ -60,12 +60,6 @@ is a regression of `1a90db5`.
   `llvm-readobj --symbols` for `abla_mvc_revision`, but a linked module's symbol table
   lists name-section names (`app.revision`); the export itself is present. Check the
   export section instead. (Before `087b3b6` the build failed earlier.)
-- [ ] **A diagnostic in a rewritten module names the wrong place.** A module whose names
-  are rewritten with a module prefix (imported under an alias, or shadowing a name) is
-  parsed from the rewritten text, so its diagnostics' offsets count the prefixes before
-  them (which spell the module's path): `val text: int = "…"` at offset 127 of such a
-  module is reported at 283. Debug information maps its positions back through
-  `BootstrapSourceRewrite`; diagnostics could do the same where they are reported.
 - [ ] **An operator in a parameter default is not rewritten.** `fun f(b: N = N(1) + N(2))`
   with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
   `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
@@ -142,6 +136,14 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   1.8 GB of garbage in that program before it skipped the others). With `f64` operator
   functions declared, any arithmetic is such a node, so most bodies are still typed twice.
   Typing candidate calls inside the main analysis would remove it.
+- [ ] **String helpers carry a root frame.** With automatic pressure, any function with an
+  instruction that may allocate collects and roots its values, and so do its callers.
+  String inspection counts (`string.get`, `index.get`, `==`/`!=`: a rope may be
+  flattened), so a byte-comparing helper like `hasPrefix(text, prefix)` gets a 4-slot
+  frame and a pressure check; called on every type normalization it cost the compiler 7 G
+  instructions. Excluding `==`/`!=` of two native scalars changes almost nothing (306 of
+  4,053 client functions collect either way; 1,745 → 1,737 in a server): what decides is
+  the possible rope flattening, a collection-placement policy.
 - [ ] **A collection still visits every allocation.** It builds the page bitmaps from the
   whole registry and sweeps it all, garbage and live alike, freeing garbage one block at a
   time. Of that build's active time the marker is about 8%, free() 4% and the page release

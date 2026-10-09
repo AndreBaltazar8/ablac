@@ -998,6 +998,22 @@ class BootstrapSourceRewrite(
         if (offset < this.rewrittenEnds[edit]) this.originalBegins[edit]
         else this.originalEnds[edit] + offset - this.rewrittenEnds[edit]
     }
+
+    // The file offset of a parsed-source end offset (exclusive): an end inside
+    // or at the end of a rewritten name is that name's end.
+    fun originalEnd(offset: int): int {
+        var low = 0
+        var high = this.rewrittenBegins.size
+        while (low < high) {
+            val middle = (low + high) / 2
+            if (this.rewrittenBegins[middle] < offset) low = middle + 1
+            else high = middle
+        }
+        if (low == 0) return offset
+        val edit = low - 1
+        if (offset <= this.rewrittenEnds[edit]) this.originalEnds[edit]
+        else this.originalEnds[edit] + offset - this.rewrittenEnds[edit]
+    }
 }
 
 var bootstrapSourceRewrites: array<BootstrapSourceRewrite> = []
@@ -1026,4 +1042,104 @@ fun bootstrapSourceRewriteOf(path: string): BootstrapSourceRewrite {
         index = index + 1
     }
     BootstrapSourceRewrite(path, [], [], [], [])
+}
+
+// The decimal at `text[begin until end]` when it is one (only digits), else -1.
+fun bootstrapSourceRewriteDecimal(text: string, begin: int, end: int): int {
+    if (end <= begin) return -1
+    var value = 0
+    var index = begin
+    while (index < end) {
+        val byte = text[index]
+        if (byte < 48 || byte > 57) return -1
+        value = value * 10 + byte - 48
+        index = index + 1
+    }
+    value
+}
+
+// `line` with each `@<offset>` mapped through `rewrite`.
+fun bootstrapSourceRewriteAtOffsets(
+    line: string,
+    rewrite: BootstrapSourceRewrite
+): string {
+    var output = ""
+    var cursor = 0
+    var index = 0
+    while (index < line.size) {
+        if (line[index] == 64) {
+            var end = index + 1
+            while (end < line.size && line[end] >= 48 && line[end] <= 57) {
+                end = end + 1
+            }
+            val offset = bootstrapSourceRewriteDecimal(line, index + 1, end)
+            if (offset >= 0) {
+                output = "$output${line.slice(cursor, index + 1)}${rewrite.original(offset)}"
+                cursor = end
+            }
+            index = end
+        } else index = index + 1
+    }
+    "$output${line.slice(cursor, line.size)}"
+}
+
+// Diagnostics place an error with a `source[kind]:path:begin:end` line after it
+// (and `@offset`s in its text). Those the parse, semantic analysis and
+// extensions report are offsets into the source the module was parsed from:
+// for a module whose names were rewritten, they are mapped back to its file
+// here. Other diagnostics are returned unchanged.
+fun bootstrapSourceRewriteDiagnostics(diagnostics: string): string {
+    if (bootstrapSourceRewrites.size == 0) return diagnostics
+    val pending: array<string> = []
+    var output = ""
+    var lineBegin = 0
+    while (lineBegin < diagnostics.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < diagnostics.size && diagnostics[lineEnd] != 10) {
+            lineEnd = lineEnd + 1
+        }
+        val line = diagnostics.slice(lineBegin, lineEnd)
+        val newline = if (lineEnd < diagnostics.size) "\n" else ""
+        var mapped = line
+        var rewritten = false
+        if (line.size > 7 && line.slice(0, 7) == "source[") {
+            // The path runs from after `]:` to the second colon from the end.
+            var close = 7
+            while (close < line.size && line[close] != 93) close = close + 1
+            var last = line.size - 1
+            while (last > close && line[last] != 58) last = last - 1
+            var middle = last - 1
+            while (middle > close && line[middle] != 58) middle = middle - 1
+            val begin = bootstrapSourceRewriteDecimal(line, middle + 1, last)
+            val end = bootstrapSourceRewriteDecimal(line, last + 1, line.size)
+            // Positions the parse took (parser, semantic and extension
+            // diagnostics); import diagnostics already name the file's own.
+            val kind = line.slice(7, close)
+            val parsed = kind == "semantic" || kind == "parser" ||
+                kind == "extension-expression" ||
+                kind == "extension-request" || kind == "subparser"
+            if (parsed && close + 2 < middle && begin >= 0 && end >= 0) {
+                val rewrite = bootstrapSourceRewriteOf(line.slice(close + 2, middle))
+                if (rewrite.rewrittenBegins.size > 0) {
+                    mapped = "${line.slice(0, middle + 1)}${rewrite.original(begin)}:${rewrite.originalEnd(end)}"
+                    rewritten = true
+                    for (text in pending) {
+                        output = "$output${bootstrapSourceRewriteAtOffsets(text, rewrite)}\n"
+                    }
+                }
+            }
+            if (!rewritten) {
+                for (text in pending) output = "$output$text\n"
+            }
+            pending.clear()
+            output = "$output$mapped$newline"
+        } else if (newline == "") {
+            for (text in pending) output = "$output$text\n"
+            pending.clear()
+            output = "$output$line"
+        } else pending.append(line)
+        lineBegin = lineEnd + 1
+    }
+    for (text in pending) output = "$output$text\n"
+    output
 }
