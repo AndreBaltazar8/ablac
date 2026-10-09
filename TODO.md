@@ -101,10 +101,19 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
 - [ ] **`opt` and `llc` run one after the other on one module.** In that dev build they are
   22.6 of its 54 wall seconds (opt 11.6, llc 11.0). Emitting the module as N partitions
-  during emission (llvm-split on the finished module cost 3.6 s, more than it saved) and
-  running N opt/llc pairs at once would cut most of that wall time on a multi-core
-  machine; the partitions must then link as before (wasm-ld takes several objects).
+  during emission and running N opt/llc pairs at once would cut most of that wall time on a
+  multi-core machine; the partitions must then link as before (wasm-ld takes several
+  objects). Splitting the finished module does not pay: with 4 parts, llvm-split takes
+  6.5 s while llc drops 11.0 → 3.5 s, so wall time is unchanged, total cycles grow 16% and
+  the dev wasm grows 240 KB of data (constants stop merging across parts).
   Release (LTO) and native builds still pass LLVM text between their steps.
+- [ ] **`llc`'s peak on a large Wasm module** (~1.9 GB for that client's 31 MB of bitcode,
+  most of the build's peak): loading the module takes 0.5 GB, and the rest is machine code
+  for every function held at once, because WebAssembly's code generation runs a module pass
+  (`WebAssemblyMCLowerPrePass`) that needs all functions' machine code before any is freed.
+  Writing no object (`-filetype=null`) still peaks at 1.93 GB, and without debug
+  information at 1.84 GB, so no `llc` option cuts it. Smaller functions (the boxing item
+  below) or fewer functions per `llc` (partitions, above) would.
 - [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
   `alloca %AblaValue` (146K in that program), with as many stores and loads around them
   and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
