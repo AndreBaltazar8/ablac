@@ -63,7 +63,11 @@ the imported symbol names and signatures before instantiation.
 A development (`--fast`) WebAssembly build hands its module to `opt` as bitcode
 and keeps no LLVM text; `ABLA_KEEP_LLVM_TEXT=1` keeps it, as `<module>.ll`
 beside the module. Release builds always write that text (their LTO step reads
-it), and so do native builds.
+it), and so do native builds. Handed over as bitcode, the module also loses the
+names of its local values in `opt` and `llc` (nothing after them reads those
+names; functions and globals keep theirs), and neither tool verifies it again,
+since the compiler verified it as it emitted it. With `ABLA_KEEP_LLVM_TEXT=1` the
+names stay; `ABLA_LLVM_VERIFY=1` turns LLVM's verifiers back on.
 
 An extension-defined target with linker flavor and emulation `none` may use
 any object triple implemented by the installed LLVM and emit an `object` or
