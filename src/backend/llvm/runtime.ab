@@ -574,22 +574,75 @@ fun bootstrapLlvmRuntimeBridgeInstructionSymbol(
     symbol
 }
 
+// The runtime symbols the program's instructions call, gathered in one pass over the program
+// on the emission's first question (each question used to rescan every instruction, and one
+// about a symbol the program never uses read all of them). A symbol depends only on its
+// instruction, so the set answers exactly as the scans did.
+class BootstrapLlvmBridgeSymbols(val names: array<string>, var slots: array<int>, var ready: bool)
+
+var bootstrapLlvmBridgeSymbols = BootstrapLlvmBridgeSymbols([], bootstrapIrLookupSlots(64), false)
+
+/** Forget the last program's symbols (emission of another program begins). */
+fun bootstrapLlvmBridgeSymbolsReset(): void {
+    bootstrapLlvmBridgeSymbols = BootstrapLlvmBridgeSymbols([], bootstrapIrLookupSlots(64), false)
+    return
+}
+
+/** The slot `symbol` occupies, or the empty one where it would go. */
+fun bootstrapLlvmBridgeSymbolSlot(symbol: string): int {
+    val capacity = bootstrapLlvmBridgeSymbols.slots.size
+    var slot = bootstrapIrLookupHash(symbol)
+    slot = slot - slot / capacity * capacity
+    while (bootstrapLlvmBridgeSymbols.slots[slot] >= 0 &&
+           bootstrapLlvmBridgeSymbols.names[bootstrapLlvmBridgeSymbols.slots[slot]] != symbol) {
+        slot = slot + 1
+        if (slot == capacity) slot = 0
+    }
+    slot
+}
+
+fun bootstrapLlvmBridgeSymbolsGather(program: BootstrapIrProgram): void {
+    var previous = ""
+    var gathered = false
+    for (function in program.functions) {
+        for (instruction in function.instructions) {
+            val symbol = bootstrapLlvmRuntimeBridgeInstructionSymbol(instruction)
+            // (Runs of one symbol are common: only a new one is looked up.)
+            if (!gathered || symbol != previous) {
+                var slot = bootstrapLlvmBridgeSymbolSlot(symbol)
+                if (bootstrapLlvmBridgeSymbols.slots[slot] < 0) {
+                    // Half full at most: grow the table first.
+                    if ((bootstrapLlvmBridgeSymbols.names.size + 1) * 2 >= bootstrapLlvmBridgeSymbols.slots.size) {
+                        bootstrapLlvmBridgeSymbols.slots = bootstrapIrLookupSlots(bootstrapLlvmBridgeSymbols.slots.size)
+                        var entry = 0
+                        while (entry < bootstrapLlvmBridgeSymbols.names.size) {
+                            bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot(
+                                bootstrapLlvmBridgeSymbols.names[entry]
+                            )] = entry
+                            entry = entry + 1
+                        }
+                        slot = bootstrapLlvmBridgeSymbolSlot(symbol)
+                    }
+                    bootstrapLlvmBridgeSymbols.slots[slot] = bootstrapLlvmBridgeSymbols.names.size
+                    bootstrapLlvmBridgeSymbols.names.append(symbol)
+                }
+                previous = symbol
+                gathered = true
+            }
+        }
+    }
+    bootstrapLlvmBridgeSymbols.ready = true
+    return
+}
+
 fun bootstrapLlvmRuntimeBridgeUsed(
     program: BootstrapIrProgram,
     symbol: string
 ): bool {
     var used = !bootstrapLlvmOptionalRuntimeBridge(symbol)
-    var functionIndex = 0
-    while (!used && functionIndex < program.functions.size) {
-        val function = program.functions[functionIndex]
-        var instructionIndex = 0
-        while (!used && instructionIndex < function.instructions.size) {
-            used = bootstrapLlvmRuntimeBridgeInstructionSymbol(
-                function.instructions[instructionIndex]
-            ) == symbol
-            instructionIndex = instructionIndex + 1
-        }
-        functionIndex = functionIndex + 1
+    if (!used) {
+        if (!bootstrapLlvmBridgeSymbols.ready) bootstrapLlvmBridgeSymbolsGather(program)
+        used = bootstrapLlvmBridgeSymbols.slots[bootstrapLlvmBridgeSymbolSlot(symbol)] >= 0
     }
     if (!used && symbol == "abla_runtime_thread_entry") {
         used = bootstrapLlvmRuntimeBridgeUsed(program, "abla_thread_create")
