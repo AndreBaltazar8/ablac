@@ -131,6 +131,12 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   boxed argument ABI: string concatenation, field and array stores lead) and most of the
   rest were pinned by the runtime reading a value through `ablaRuntimeValueAddress`; the
   backend now addresses the slot itself there, which freed 21% of the kept slots.
+  Tried and dropped: boxing constants by copying a private constant value (instcombine
+  then passes the constant itself to read-only parameters) and copying values with
+  `memcpy`. Fewer slots survived, yet the Wasm grew 0.5% to 15%. A string's static value
+  holds its address in two 32-bit halves there, which LLVM cannot read back as one
+  constant word, so checks on it stop folding, and the module initializer is never
+  optimized, so its copies stay copies. Kept slots are a poor proxy; measure the output.
 - [ ] **The overload probe is a second semantic analysis.** Once a program has operator
   functions the probe types every body holding a node that may name one (about 4 s and
   1.8 GB of garbage in that program before it skipped the others). With `f64` operator
