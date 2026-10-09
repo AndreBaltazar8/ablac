@@ -60,6 +60,12 @@ is a regression of `1a90db5`.
   `llvm-readobj --symbols` for `abla_mvc_revision`, but a linked module's symbol table
   lists name-section names (`app.revision`); the export itself is present. Check the
   export section instead. (Before `087b3b6` the build failed earlier.)
+- [ ] **A diagnostic in a rewritten module names the wrong place.** A module whose names
+  are rewritten with a module prefix (imported under an alias, or shadowing a name) is
+  parsed from the rewritten text, so its diagnostics' offsets count the prefixes before
+  them (which spell the module's path): `val text: int = "…"` at offset 127 of such a
+  module is reported at 283. Debug information maps its positions back through
+  `BootstrapSourceRewrite`; diagnostics could do the same where they are reported.
 - [ ] **An operator in a parameter default is not rewritten.** `fun f(b: N = N(1) + N(2))`
   with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
   `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
@@ -99,14 +105,6 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   running N opt/llc pairs at once would cut most of that wall time on a multi-core
   machine; the partitions must then link as before (wasm-ld takes several objects).
   Release (LTO) and native builds still pass LLVM text between their steps.
-- [ ] **A debug Wasm module is not byte-reproducible.** `<module>.debug.wasm` keeps the
-  linker's temporary output name (`<module>.tmp.<pid>`) in its name section; the module
-  itself strips it.
-- [ ] **A Wasm module's debug lines depend on the sysroot's path.** The `DISubprogram` and
-  `DILocation` lines of `stdlib/abla/runtime/platform/wasm.ab` grow with the length of
-  `ABLA_SYSROOT`: one tree reached through paths of 23, 108 and 138 characters puts
-  `__ablaRuntimeWasmBump` (line 82) at lines 90, 100 and 105. The `.ll` and `.map` differ
-  between two installs of one compiler; the module does not.
 - [ ] **Per-call boxing in the lowering.** 17% of the IR's instructions are
   `alloca %AblaValue` (146K in that program), with as many stores and loads around them
   and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
