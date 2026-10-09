@@ -60,16 +60,25 @@ a crash. Release builds don't; `-g`/`--debug`, `--no-debug` and
 `ABLA_DEBUG=1|0` override either. See [debugging.md](debugging.md). The embedding runtime must validate
 the imported symbol names and signatures before instantiation.
 
-A development (`--fast`) WebAssembly build hands its module to `opt` as bitcode
-and keeps no LLVM text; `ABLA_KEEP_LLVM_TEXT=1` keeps it, as `<module>.ll`
-beside the module. Release builds always write that text (their LTO step reads
-it), and so do native builds. Handed over as bitcode, the module also loses the
-names of its local values in `opt` and `llc` (nothing after them reads those
-names; functions and globals keep theirs), and neither tool verifies it again,
-since the compiler verified it as it emitted it. With `ABLA_KEEP_LLVM_TEXT=1` the
-names stay; `ABLA_LLVM_VERIFY=1` turns LLVM's verifiers back on. Its object is
-compiled with static relocations: a module links as one static image, so
-position-independent code would only reach its globals through the GOT.
+A development (`--fast`) WebAssembly build optimizes its module and writes its object
+in the compiler's own process, with the passes and options `opt` and `llc -O0` would
+use, and keeps no LLVM text. Before writing the object it moves the optimized module
+into a fresh LLVM context (as in-memory bitcode), so what building and optimizing it
+left in the old context is freed and the build's peak memory stays below that of a
+separate `opt` and `llc`. `ABLA_KEEP_LLVM_TEXT=1` keeps the text, as
+`<module>.ll` beside the module, and runs `opt` and `llc` on it;
+`ABLA_LLVM_OUT_OF_PROCESS=1` runs them on the module as bitcode instead. Release
+builds always write that text (their LTO step reads it), and so do native builds.
+Handed over as bitcode, the module also loses the names of its local values in `opt`
+and `llc` (nothing after them reads those names; functions and globals keep theirs),
+and neither tool verifies it again, since the compiler verified it as it emitted it.
+With `ABLA_KEEP_LLVM_TEXT=1` the names stay; `ABLA_LLVM_VERIFY=1` turns LLVM's
+verifiers back on. Its object is compiled with static relocations: a module links as
+one static image, so position-independent code would only reach its globals through
+the GOT. Its inliner works to a threshold of 100 rather than LLVM's 225 (each
+function carries it as `function-inline-threshold`), which takes a large program's
+optimization and code generation about 14% less work for a run time within a percent
+or two; `ABLA_FAST_INLINE_THRESHOLD=<n>` sets it.
 
 A release WebAssembly module ends with Binaryen's `wasm-opt -O3`, run with as many
 workers as the online CPUs, up to 4 (its output does not depend on the count);
@@ -114,10 +123,7 @@ The default hosted release profile runs the deterministic
 `default<Oz>,globaldce`; the target still receives LLVM's optimized machine-code
 generator, while whole-program optimization prioritizes constrained flash.
 Hosted `--fast` skips whole-module optimization and selects LLVM's low-latency
-code generator for edit/build cycles. Its inliner works to a threshold of 100
-rather than LLVM's 225, which takes a large program's `opt` and `llc` about 14%
-less work for a run time within a percent or two; `ABLA_FAST_INLINE_THRESHOLD=<n>`
-sets it. A hosted release executable is linked from
+code generator for edit/build cycles. A hosted release executable is linked from
 its own whole-program (LTO) object; its ordinary object is still built beside it, as
 `<output>.o`, the relocatable sidecar. `build --no-sidecar` (or `ABLA_NO_SIDECAR=1`)
 skips that object and its whole second optimization (most of a large program's release

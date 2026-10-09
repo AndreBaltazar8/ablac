@@ -6,6 +6,7 @@ import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/platform/host"
 import "abla/llvm/orc"
+import "abla/llvm/aot"
 import "abla/unsafe/memory"
 
 class BootstrapTargetDescriptor(
@@ -351,6 +352,98 @@ fun bootstrapTargetNeutralPanicRuntime(llvm: string): string {
     result
 }
 
+fun bootstrapLlvmOutOfProcess(): bool {
+    val configured = linuxEnvironment("ABLA_LLVM_OUT_OF_PROCESS")
+    configured.found && configured.value == "1"
+}
+
+// Optimizes the module the backend kept (bootstrapLlvmHoldModule) with a fast build's
+// passes and writes its WebAssembly object, as opt and llc -O0 would: the target
+// machine's data layout (which opt gives a module without one), static relocations
+// (a module links as one static image), no verification (the compiler verified the
+// module as it emitted it). The module is disposed either way.
+trusted fun bootstrapEmitHeldWasmObject(llvmTriple: string, objectPath: string): int {
+    val nullPointer = nativeNullPointer()
+    val module = bootstrapLlvmHeldModule
+    var status = if (pointerIsNull(module)) 165 else 0
+    LLVMInitializeWebAssemblyTargetInfo()
+    LLVMInitializeWebAssemblyTarget()
+    LLVMInitializeWebAssemblyTargetMC()
+    LLVMInitializeWebAssemblyAsmPrinter()
+    val triple = LLVMNormalizeTargetTriple(llvmTriple)
+    val target = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    if (status == 0 && LLVMGetTargetFromTriple(triple, target.address, message.address) != 0) {
+        status = 166
+    }
+    var machine = nullPointer
+    var layout = nullPointer
+    var options = nullPointer
+    if (status == 0) {
+        machine = LLVMCreateTargetMachine(target.load(), triple, "", "", 0, 1, 0)
+        if (pointerIsNull(machine)) status = 166
+    }
+    if (status == 0) {
+        layout = LLVMCreateTargetDataLayout(machine)
+        LLVMSetModuleDataLayout(module, layout)
+        options = LLVMCreatePassBuilderOptions()
+        status = llvmConsumeError(
+            LLVMRunPasses(module, bootstrapFastPasses(), machine, options), 167
+        )
+    }
+    // Codegen starts from a fresh context: the old one still holds what building
+    // and optimizing the module left behind, which kept the tree's peak above
+    // that of a separate opt and llc.
+    if (status == 0) status = bootstrapRebuildHeldModule()
+    val emitted = bootstrapLlvmHeldModule
+    if (status == 0 && LLVMTargetMachineEmitToFile(
+        machine, emitted, objectPath, 1, message.address
+    ) != 0) status = 168
+    if (status != 0 && !pointerIsNull(message.load())) {
+        linuxPrintStandardError(
+            "error[E_LLVM_CODEGEN]: ${borrowNativeCString(message.load())}\n"
+        )
+    }
+    if (!pointerIsNull(options)) LLVMDisposePassBuilderOptions(options)
+    if (!pointerIsNull(layout)) LLVMDisposeTargetData(layout)
+    if (!pointerIsNull(machine)) LLVMDisposeTargetMachine(machine)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    LLVMDisposeMessage(triple)
+    target.close()
+    message.close()
+    bootstrapDisposeHeldModule()
+    status
+}
+
+// Moves the held module into a fresh context through in-memory bitcode and
+// disposes the old context (status 169 when LLVM cannot write or read it back).
+trusted fun bootstrapRebuildHeldModule(): int {
+    val nullPointer = nativeNullPointer()
+    val buffer = LLVMWriteBitcodeToMemoryBuffer(bootstrapLlvmHeldModule)
+    bootstrapDisposeHeldModule()
+    if (pointerIsNull(buffer)) return 169
+    val context = LLVMContextCreate()
+    LLVMContextSetDiscardValueNames(context, 1)
+    val module = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    var status = LLVMParseIRInContext(context, buffer, module.address, message.address)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    bootstrapLlvmHeldContext = context
+    bootstrapLlvmHeldModule = if (status == 0) module.load() else nullPointer
+    module.close()
+    message.close()
+    if (status != 0) status = 169
+    status
+}
+
+fun bootstrapDisposeHeldModule(): void {
+    if (!pointerIsNull(bootstrapLlvmHeldModule)) LLVMDisposeModule(bootstrapLlvmHeldModule)
+    if (!pointerIsNull(bootstrapLlvmHeldContext)) LLVMContextDispose(bootstrapLlvmHeldContext)
+    bootstrapLlvmHeldModule = nativeNullPointer()
+    bootstrapLlvmHeldContext = nativeNullPointer()
+    return
+}
+
 fun bootstrapExternalEmitObjectForTarget(
     llvmPath: string,
     objectPath: string,
@@ -384,7 +477,7 @@ fun bootstrapExternalEmitObjectForTarget(
         // global passes: on a large wasm module opt + llc drop from ~13s to ~7s
         // while keeping most of O1's runtime speed. Before inlining only
         // mem2reg + simplifycfg run (SROA and instcombine run after it anyway).
-        "-passes=function(mem2reg,simplifycfg),cgscc(inline,function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg)),globaldce"
+        "-passes=${bootstrapFastPasses()}"
     } else if (mcuTarget) {
         // Freestanding bindings often keep a wide callback ABI for an
         // address-taken entry while ordinary direct calls supply constant
@@ -395,9 +488,6 @@ fun bootstrapExternalEmitObjectForTarget(
         // platform-specific annotation.
         "-passes=default<Oz>,ipsccp<func-spec>,deadargelim,globaldce"
     } else "-passes=default<O2>,globaldce")
-    if (fast) {
-        optimize.argument("-inline-threshold=${bootstrapFastInlineThreshold()}")
-    }
     // LLVM can still expand constant-trip loops under Oz. On MCUs this often
     // duplicates MMIO and call sequences (for example one copy per byte or
     // digit), increasing both flash use and instruction-cache pressure. Make
@@ -524,9 +614,14 @@ fun bootstrapNativeSidecarWanted(): bool {
     bootstrapNativeSidecarRequested && !(configured.found && configured.value == "1")
 }
 
+// A fast build's optimization pipeline (opt's, or the same passes in process).
+fun bootstrapFastPasses(): string =
+    "function(mem2reg,simplifycfg),cgscc(inline,function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg)),globaldce"
+
 // The inliner's threshold in fast builds: ABLA_FAST_INLINE_THRESHOLD, else 100
 // (LLVM's default is 225). The inliner's cost analysis is the largest part of a
-// fast build's opt, and what it inlines the code generator compiles again.
+// fast build's opt, and what it inlines the code generator compiles again. The
+// backend gives it to each function (bootstrapLlvmFastInlineThreshold).
 fun bootstrapFastInlineThreshold(): int {
     val configured = linuxEnvironment("ABLA_FAST_INLINE_THRESHOLD")
     var threshold = 0
@@ -1476,6 +1571,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         (cacheProfile == "cross-fast" || cacheProfile == "raw-cross-fast") &&
         !bootstrapKeepLlvmText()
     val bitcodePath = if (bitcodeHandoff) "$outputPath.input.bc" else ""
+    // A Wasm development module goes on to optimization and code generation in this
+    // process, after the collection below, rather than through bitcode, opt and llc
+    // (the same passes and options, so the same object). ABLA_LLVM_OUT_OF_PROCESS=1
+    // keeps the separate tools.
+    val inProcessCodegen = bitcodeHandoff && !bootstrapLlvmOutOfProcess()
+    val fastCross = cacheProfile == "cross-fast" || cacheProfile == "raw-cross-fast"
     val firstHash = bootstrapNativeCacheHash(
         sourceIdentity, 17, 257, 1000000007
     )
@@ -1580,7 +1681,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             "frontend.parse.end:${parsedGraph.declarations.size}"
         )
         val enclosingBitcodePath = bootstrapLlvmBitcodePath
-        bootstrapLlvmBitcodePath = bitcodePath
+        val enclosingInlineThreshold = bootstrapLlvmFastInlineThreshold
+        val enclosingHoldModule = bootstrapLlvmHoldModule
+        bootstrapLlvmBitcodePath = if (inProcessCodegen) "" else bitcodePath
+        bootstrapLlvmFastInlineThreshold =
+            if (fastCross) bootstrapFastInlineThreshold() else 0
+        bootstrapLlvmHoldModule = inProcessCodegen
         val compilation = bootstrapCompileLlvmParsedCached(
             parsedGraph,
             irCache,
@@ -1589,6 +1695,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             target.hosted && artifact == "executable"
         )
         bootstrapLlvmBitcodePath = enclosingBitcodePath
+        bootstrapLlvmFastInlineThreshold = enclosingInlineThreshold
+        bootstrapLlvmHoldModule = enclosingHoldModule
         linkLlvm = compilation.linkLlvm
         linkHost = compilation.linkHost
         abiManifest = bootstrapNativeAbiManifest(
@@ -1666,11 +1774,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     status = bootstrapEmitParallelObject(
                         llvmPath, objectPath
                     )
+                } else if (inProcessCodegen) {
+                    status = bootstrapEmitHeldWasmObject(target.llvmTriple, objectPath)
                 } else if (bitcodeHandoff) {
                     status = emitObject(bitcodePath, objectPath)
                     Path(bitcodePath).remove()
                 } else status = emitObject(llvmPath, objectPath)
             }
+            bootstrapDisposeHeldModule()
             if (status == 0 && cacheEnabled && compileInputsCacheable &&
                 Path(cacheDirectory).createDirectories()) {
                 // The source identity is the commit marker. Remove it before
