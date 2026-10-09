@@ -126,6 +126,7 @@ test: ablac
 	tools/test-internal-function.sh $(COMPILER)
 	tools/test-static-strings.sh $(COMPILER)
 	tools/test-overloads.sh $(COMPILER)
+	tools/test-overload-probe-filter.sh $(COMPILER)
 	tools/test-argument-diagnostics.sh $(COMPILER)
 	tools/test-compound-assignment.sh $(COMPILER)
 	tools/test-runtime-memory.sh $(COMPILER)

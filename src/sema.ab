@@ -4486,12 +4486,16 @@ fun bootstrapMethodDeclarationIndex(
 // candidate is one declaration under its final (possibly mangled) name; `key`
 // is the source spelling it answers to: `name` for a free function,
 // `Owner.name` for a method or extension; `spelling` is its `name` part.
+// With `bodies` (filtered), the probe types just the bodies whose
+// `bootstrapOverloadBodyKey` it holds (bootstrapOverloadProbedBodies).
 class BootstrapOverloadTable(
     val keys: array<string>,
     val names: array<string>,
     val owners: array<string>,
     val operators: array<bool>,
-    val spellings: array<string>
+    val spellings: array<string>,
+    val filtered: bool = false,
+    val bodies: BootstrapStringSet = bootstrapStringSet()
 ) {
     fun has(key: string, operatorOnly: bool): bool {
         var index = 0
@@ -4524,15 +4528,20 @@ class BootstrapOverloadTable(
         false
     }
 
-    /** Whether the probe types a body (with its parameter defaults): only
-     *  where it may resolve something. A body is typed apart from every other,
-     *  so one it skips changes no other's types. */
-    fun probes(body: BootstrapExpression, defaults: array<BootstrapExpression>): bool {
-        if (this.mayResolve(body)) return true
-        for (value in defaults) if (this.mayResolve(value)) return true
+    /** Whether the probe types a function's body (with its parameter
+     *  defaults): only where it may resolve something. A body is typed apart
+     *  from every other, so one it skips changes no other's types. */
+    fun probes(declaration: BootstrapDeclaration): bool {
+        if (this.filtered) return this.bodies.contains(bootstrapOverloadBodyKey(declaration))
+        if (this.mayResolve(declaration.expression)) return true
+        for (value in declaration.parameterDefaults) if (this.mayResolve(value)) return true
         false
     }
 }
+
+/** A function's place in its source, which names its body for the probe. */
+fun bootstrapOverloadBodyKey(declaration: BootstrapDeclaration): string =
+    "${declaration.sourceIdentity}:${declaration.begin}:${declaration.end}"
 
 fun bootstrapNoOverloads(): BootstrapOverloadTable =
     BootstrapOverloadTable([], [], [], [], [])
@@ -9866,9 +9875,7 @@ class BootstrapAnalyzer(
                 (declaration.kind == "fun" ||
                  declaration.kind == "compile.fun") &&
                 declaration.expression.kind != "missing" &&
-                (this.overloads.keys.size == 0 || this.overloads.probes(
-                    declaration.expression, declaration.parameterDefaults
-                ))
+                (this.overloads.keys.size == 0 || this.overloads.probes(declaration))
             ) {
                 val functionLocals: array<BootstrapSymbol> = []
                 if (declaration.extensionOwner != "") {
@@ -10028,9 +10035,7 @@ class BootstrapAnalyzer(
                     }
                     methodAnnotation = methodAnnotation + 1
                 }
-                if (this.overloads.keys.size > 0 && !this.overloads.probes(
-                    method.expression, method.parameterDefaults
-                )) {
+                if (this.overloads.keys.size > 0 && !this.overloads.probes(method)) {
                     methodIndex = methodIndex + 1
                     continue
                 }
@@ -10256,8 +10261,13 @@ fun bootstrapAnalyzer(
     typedRequestEnds: array<int>,
     typedRequestKinds: array<string>,
     typedRequestSources: array<string>,
-    overloads: BootstrapOverloadTable
+    overloads: BootstrapOverloadTable,
+    // Without them (the overload probe: overload.ab), no compile effect, and
+    // no region retention, is reported.
+    effects: bool = true,
+    regions: bool = true
 ): BootstrapAnalyzer {
+    val none: array<BootstrapDeclaration> = []
     val symbols: array<BootstrapSymbol> = []
     val locals: array<BootstrapSymbol> = []
     val affineTypes = bootstrapBuildAffineTypeNames(parsed.declarations)
@@ -10265,9 +10275,11 @@ fun bootstrapAnalyzer(
         parsed.declarations,
         affineTypes
     )
-    val regionCalls = bootstrapBuildRegionCallSummary(parsed.declarations)
+    val regionCalls = bootstrapBuildRegionCallSummary(
+        if (regions) parsed.declarations else none
+    )
     val compileEffects = bootstrapBuildCompileEffectSummary(
-        parsed.declarations
+        if (effects) parsed.declarations else none
     )
     val compileEffectRequests = bootstrapBuildCompileEffectRequests(parsed)
     val compileEffectAuthorizations =

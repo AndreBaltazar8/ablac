@@ -11,13 +11,17 @@
 // every call that may name one (a call or method call spelled like an
 // overload set, an arithmetic operator or unary minus whose left operand has
 // an `operator` function) and picks the candidate whose parameters accept the
-// arguments, preferring exact matches. It types only the bodies that hold such
-// a node (BootstrapOverloadTable.probes). Those nodes are rewritten into calls of
-// the chosen declaration, and the program continues as if it had been written
-// that way. A program without overloads or operator functions is returned
-// unchanged, without the probe.
+// arguments, preferring exact matches. It types only the bodies that may hold
+// such a node (bootstrapOverloadProbedBodies). Those nodes are rewritten into
+// calls of the chosen declaration, and the program continues as if it had been
+// written that way. A program without overloads or operator functions is
+// returned unchanged, without the probe.
+//
+// ABLA_OVERLOAD_CHECK=1 also runs the probe over every body that holds a node
+// spelled like a candidate, and fails the build unless both find the same.
 
 import "staged_parser.ab"
+import "abla/sys/linux/process"
 
 class BootstrapOverloadMember(
     val owner: string,
@@ -336,6 +340,405 @@ fun bootstrapOverloadTouches(
     false
 }
 
+/** Whether `byte` continues a name: a letter, a digit or `_`. */
+fun bootstrapOverloadNameByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+        (byte >= 97 && byte <= 122) || byte == 95
+
+/** Adds each name in `text` (a run of letters, digits and `_`) to `names`; a
+ *  module-prefixed one (`__abla_module_<hex>__Name`) also as `Name`. */
+fun bootstrapOverloadAddNames(text: string, var names: BootstrapStringSet): void {
+    var index = 0
+    while (index < text.size) {
+        while (index < text.size && !bootstrapOverloadNameByte(text[index])) index = index + 1
+        val begin = index
+        while (index < text.size && bootstrapOverloadNameByte(text[index])) index = index + 1
+        if (index > begin) {
+            val name = if (begin == 0 && index == text.size) text else text.slice(begin, index)
+            names.add(name)
+            val delimiter = bootstrapCanonicalNameDelimiter(name)
+            if (delimiter >= 0) names.add(name.slice(delimiter + 2, name.size))
+        }
+    }
+    return
+}
+
+/** For each spelling of a candidate, what a node spelled so may resolve: 1 when
+ *  a candidate the probe types everywhere answers to it, 2 when one typed only
+ *  where its owner type is named, 4 (an operator) when one typed only where
+ *  its operand's type is named, unless the operand may be `never`
+ *  (bootstrapOverloadProbedBodies). */
+class BootstrapOverloadSpellings(
+    val names: BootstrapStringSet,
+    val calls: array<int>,
+    val members: array<int>,
+    val operators: array<int>
+)
+
+/** Adds every name `expression` mentions to `names` (literals aside) and
+ *  returns what its nodes may resolve (BootstrapOverloadSpellings). */
+fun bootstrapOverloadScan(
+    expression: BootstrapExpression,
+    spellings: BootstrapOverloadSpellings,
+    var names: BootstrapStringSet
+): int {
+    var matches = 0
+    val kind = expression.kind
+    val operator = bootstrapOperatorFunctionName(kind)
+    if (operator != "") {
+        val spelling = spellings.names.indexOf(operator)
+        if (spelling >= 0) {
+            val found = spellings.operators[spelling]
+            matches = found & 3
+            if ((found & 4) != 0) {
+                matches = matches | (
+                    if (expression.children.size > 1 && bootstrapOverloadMayBeNever(expression.children[1])) 1
+                    else 2
+                )
+            }
+        }
+    } else if (kind == "call" || kind == "member.call") {
+        val spelling = spellings.names.indexOf(expression.text)
+        if (spelling >= 0) {
+            matches = if (kind == "call") spellings.calls[spelling] else spellings.members[spelling]
+        }
+    }
+    if (kind == "region") matches = matches | 8
+    if (kind != "string" && kind != "integer" && kind != "float" && expression.text != "") {
+        bootstrapOverloadAddNames(expression.text, names)
+    }
+    for (child in expression.children) matches = matches | bootstrapOverloadScan(child, spellings, names)
+    matches
+}
+
+/** Whether `expression` holds a `region` block. */
+fun bootstrapOverloadHoldsRegion(expression: BootstrapExpression): bool {
+    if (expression.kind == "region") return true
+    for (child in expression.children) if (bootstrapOverloadHoldsRegion(child)) return true
+    false
+}
+
+/** The bodies the probe types, and whether any `region` block is in the
+ *  program (bootstrapOverloadProbedBodies). */
+class BootstrapOverloadProbedBodies(val bodies: BootstrapStringSet, val regions: bool)
+
+/** Whether `expression` may be typed `never` other than by a name (a call,
+ *  a variable, a member) whose type says so: a jump, an endless loop, a
+ *  branch or block (each of whose ends may be one), or arithmetic, which is
+ *  typed as its left operand. */
+fun bootstrapOverloadMayBeNever(expression: BootstrapExpression): bool {
+    val kind = expression.kind
+    if (kind == "integer" || kind == "float" || kind == "string" || kind == "string.template" ||
+        kind == "true" || kind == "false" || kind == "null" || kind == "identifier" ||
+        kind == "call" || kind == "member.call" || kind == "member" || kind == "index" ||
+        kind == "lambda" || kind == "lambda.move" || kind == "lambda.generator" || kind == "array" ||
+        kind == "==" || kind == "!=" || kind == "<" || kind == "<=" || kind == ">" || kind == ">=" ||
+        kind == "unary!" || kind == "&&" || kind == "||") return false
+    if ((kind == "+" || kind == "-" || kind == "*" || kind == "/" || kind == "%" || kind == "&" ||
+         kind == "|" || kind == "^" || kind == "<<" || kind == ">>" || kind == ">>>" ||
+         kind == "unary-" || kind == "unary+") && expression.children.size > 0) {
+        return bootstrapOverloadMayBeNever(expression.children[0])
+    }
+    true
+}
+
+/** Whether `type` is a function type (`(A) -> B`, `FnOnce(A) -> B`, …). */
+fun bootstrapOverloadIsFunctionType(type: string): bool {
+    var index = 0
+    while (index + 1 < type.size) {
+        if (type[index] == 45 && type[index + 1] == 62) return true
+        index = index + 1
+    }
+    false
+}
+
+/** Adds the names in the types a call of `declaration` gives its caller: the
+ *  result, and each parameter of function type (a lambda passed there takes
+ *  its parameters' types from it). */
+fun bootstrapOverloadAddTypingNames(declaration: BootstrapDeclaration, var names: BootstrapStringSet): void {
+    bootstrapOverloadAddNames(declaration.resultType, names)
+    for (type in declaration.parameterTypes) {
+        if (bootstrapOverloadIsFunctionType(type)) bootstrapOverloadAddNames(type, names)
+    }
+    return
+}
+
+/** Adds the names in a function's parameter and result types (and an
+ *  extension's receiver type) to `names`. */
+fun bootstrapOverloadAddSignatureNames(declaration: BootstrapDeclaration, var names: BootstrapStringSet): void {
+    for (type in declaration.parameterTypes) bootstrapOverloadAddNames(type, names)
+    bootstrapOverloadAddNames(declaration.resultType, names)
+    bootstrapOverloadAddNames(declaration.extensionOwner, names)
+    return
+}
+
+/** Which function bodies the probe types (each `bootstrapOverloadBodyKey`).
+ *
+ *  A node may resolve to a candidate only as spelled like it. A free
+ *  function's candidates answer to their spelling alone, so a body with a
+ *  call so spelled is typed. A method or operator candidate whose receiver is
+ *  a declared type (a class, interface or type of the program) applies only
+ *  to a receiver of exactly that type, and an operator on a built-in type
+ *  whose one parameter is a declared type (`f64.times(node: N)`) only to an
+ *  operand of exactly that type, or one typed `never`. Such a body must come
+ *  by a value of the type, and any value is named in the body somehow: as
+ *  the type (a parameter, local, lambda or receiver type, a constructor), or
+ *  as a declaration whose type names it (a function's or method's result, or
+ *  a parameter of function type, which types a lambda's parameters; a field;
+ *  a global), or whose inferred type might (a function, method or global
+ *  with no declared type whose own text names one). A member of such a type
+ *  needs a receiver of it, named already. Those names are gathered to a
+ *  fixpoint, with `never`'s for the
+ *  operators (bootstrapOverloadMayBeNever covers the rest); a body naming
+ *  none of them is skipped. Every other candidate (a unary operator or a
+ *  method call on a built-in type, where any argument may fit) is resolved
+ *  wherever it is spelled. */
+fun bootstrapOverloadProbedBodies(
+    declarations: array<BootstrapDeclaration>,
+    owners: array<string>,
+    operators: array<bool>,
+    spellings: array<string>,
+    candidates: array<BootstrapDeclaration>
+): BootstrapOverloadProbedBodies {
+    var declaredTypes = bootstrapStringSet()
+    for (declaration in declarations) {
+        if (declaration.kind == "class" || declaration.kind == "interface" || declaration.kind == "type") {
+            bootstrapOverloadAddNames(declaration.name, declaredTypes)
+        }
+    }
+    // The candidates' spellings, and the declared types they are owned by.
+    var owned = bootstrapStringSet()
+    var spelled = bootstrapStringSet()
+    val calls: array<int> = []
+    val members: array<int> = []
+    val operatorMatches: array<int> = []
+    var candidate = 0
+    while (candidate < spellings.size) {
+        var match = 1
+        var operatorMatch = 1
+        if (owners[candidate] != "") {
+            var ownerNames = bootstrapStringSet()
+            bootstrapOverloadAddNames(owners[candidate], ownerNames)
+            for (name in ownerNames.keys) {
+                if (declaredTypes.contains(name)) {
+                    owned.add(name)
+                    match = 2
+                }
+            }
+            operatorMatch = match
+            // An operator on a built-in type (`f64.times(node: N)`) applies
+            // only to an operand of exactly its parameter's declared type, or
+            // one typed `never`.
+            val parameters = candidates[candidate].parameterTypes
+            if (match == 1 && operators[candidate] && parameters.size == 1) {
+                val parameter = bootstrapNormalizeType(parameters[0])
+                if (declaredTypes.contains(parameter)) {
+                    owned.add(parameter)
+                    owned.add("never")
+                    operatorMatch = 4
+                }
+            }
+        }
+        var index = spelled.indexOf(spellings[candidate])
+        if (index < 0) {
+            spelled.add(spellings[candidate])
+            calls.append(0)
+            members.append(0)
+            operatorMatches.append(0)
+            index = spelled.keys.size - 1
+        }
+        if (owners[candidate] == "") calls[index] = calls[index] | match
+        else {
+            members[index] = members[index] | match
+            if (operators[candidate]) operatorMatches[index] = operatorMatches[index] | operatorMatch
+        }
+        candidate = candidate + 1
+    }
+    val table = BootstrapOverloadSpellings(spelled, calls, members, operatorMatches)
+
+    // Every function body: what it names (with its signature) and may resolve;
+    // and every declaration that may type a value of an owned type: its name
+    // and the names in that type. That is a function's or method's result,
+    // and a parameter of function type (it types a lambda's parameters); a
+    // field; a global; a constructor's parameters of function type. A member
+    // of an owned type (a method, field or extension) needs a receiver of it,
+    // which the body must name already, so it adds nothing.
+    val bodyKeys: array<string> = []
+    val bodyNames: array<BootstrapStringSet> = []
+    val bodyMatches: array<int> = []
+    var regions = false
+    val entryNames: array<string> = []
+    val entryReads: array<BootstrapStringSet> = []
+    for (declaration in declarations) {
+        val kind = declaration.kind
+        if (kind == "fun" || kind == "compile.fun" || kind == "extern") {
+            var receiver = bootstrapStringSet()
+            bootstrapOverloadAddNames(declaration.extensionOwner, receiver)
+            var member = false
+            for (name in receiver.keys) if (owned.contains(name)) member = true
+            if (!member) {
+                var typing = bootstrapStringSet()
+                bootstrapOverloadAddTypingNames(declaration, typing)
+                if (declaration.resultType == "inferred" && kind != "extern") {
+                    bootstrapOverloadScan(declaration.expression, table, typing)
+                }
+                entryNames.append(declaration.name)
+                entryReads.append(typing)
+            }
+            if (kind != "extern") {
+                var names = bootstrapStringSet()
+                bootstrapOverloadAddSignatureNames(declaration, names)
+                var matches = bootstrapOverloadScan(declaration.expression, table, names)
+                for (value in declaration.parameterDefaults) matches = matches | bootstrapOverloadScan(value, table, names)
+                bodyKeys.append(bootstrapOverloadBodyKey(declaration))
+                bodyNames.append(names)
+                bodyMatches.append(matches)
+            }
+        } else if (kind == "val" || kind == "var" || kind == "compile.val" || kind == "compile.var") {
+            var names = bootstrapStringSet()
+            bootstrapOverloadAddNames(declaration.resultType, names)
+            if (declaration.resultType == "inferred") {
+                if ((bootstrapOverloadScan(declaration.expression, table, names) & 8) != 0) regions = true
+            } else if (bootstrapOverloadHoldsRegion(declaration.expression)) regions = true
+            entryNames.append(declaration.name)
+            entryReads.append(names)
+        } else if (kind == "type") {
+            var names = bootstrapStringSet()
+            bootstrapOverloadAddSignatureNames(declaration, names)
+            entryNames.append(declaration.name)
+            entryReads.append(names)
+        } else if (kind == "class" || kind == "interface") {
+            var ownerNames = bootstrapStringSet()
+            bootstrapOverloadAddNames(declaration.name, ownerNames)
+            var member = false
+            for (name in ownerNames.keys) if (owned.contains(name)) member = true
+            for (value in declaration.parameterDefaults) if (bootstrapOverloadHoldsRegion(value)) regions = true
+            var construction = bootstrapStringSet()
+            var parameter = 0
+            while (parameter < declaration.parameterTypes.size) {
+                val type = declaration.parameterTypes[parameter]
+                if (bootstrapOverloadIsFunctionType(type)) bootstrapOverloadAddNames(type, construction)
+                if (!member && parameter < declaration.parameters.size) {
+                    var field = bootstrapStringSet()
+                    bootstrapOverloadAddNames(type, field)
+                    entryNames.append(declaration.parameters[parameter])
+                    entryReads.append(field)
+                }
+                parameter = parameter + 1
+            }
+            entryNames.append(declaration.name)
+            entryReads.append(construction)
+            for (method in declaration.methods) {
+                if (!member) {
+                    var typing = bootstrapStringSet()
+                    bootstrapOverloadAddTypingNames(method, typing)
+                    if (method.resultType == "inferred") bootstrapOverloadScan(method.expression, table, typing)
+                    entryNames.append(method.name)
+                    entryReads.append(typing)
+                }
+                if (method.expression.kind != "missing") {
+                    var names = bootstrapStringSet()
+                    bootstrapOverloadAddSignatureNames(method, names)
+                    bootstrapOverloadAddNames(declaration.name, names)
+                    var matches = bootstrapOverloadScan(method.expression, table, names)
+                    for (value in method.parameterDefaults) matches = matches | bootstrapOverloadScan(value, table, names)
+                    bodyKeys.append(bootstrapOverloadBodyKey(method))
+                    bodyNames.append(names)
+                    bodyMatches.append(matches)
+                }
+            }
+        }
+    }
+
+    // The names a value of an owned type may be come by through: the owned
+    // types, then (to a fixpoint) every declaration whose type reads one.
+    var readIds = bootstrapStringSet()
+    val heads: array<int> = []
+    val nexts: array<int> = []
+    val edgeEntries: array<int> = []
+    var entry = 0
+    while (entry < entryReads.size) {
+        for (name in entryReads[entry].keys) {
+            var id = readIds.indexOf(name)
+            if (id < 0) {
+                readIds.add(name)
+                heads.append(-1)
+                id = heads.size - 1
+            }
+            nexts.append(heads[id])
+            edgeEntries.append(entry)
+            heads[id] = nexts.size - 1
+        }
+        entry = entry + 1
+    }
+    val reached: array<bool> = []
+    for (name in entryNames) reached.append(false)
+    var named = bootstrapStringSet()
+    val queue: array<string> = []
+    for (name in owned.keys) {
+        named.add(name)
+        queue.append(name)
+    }
+    var next = 0
+    while (next < queue.size) {
+        val id = readIds.indexOf(queue[next])
+        next = next + 1
+        var edge = if (id >= 0) heads[id] else -1
+        while (edge >= 0) {
+            val found = edgeEntries[edge]
+            if (!reached[found]) {
+                reached[found] = true
+                var added = bootstrapStringSet()
+                bootstrapOverloadAddNames(entryNames[found], added)
+                for (name in added.keys) {
+                    if (!named.contains(name)) {
+                        named.add(name)
+                        queue.append(name)
+                    }
+                }
+            }
+            edge = nexts[edge]
+        }
+    }
+
+    var bodies = bootstrapStringSet()
+    var body = 0
+    while (body < bodyKeys.size) {
+        if ((bodyMatches[body] & 8) != 0) regions = true
+        var probed = (bodyMatches[body] & 1) != 0
+        if (!probed && (bodyMatches[body] & 2) != 0) {
+            for (name in bodyNames[body].keys) if (named.contains(name)) probed = true
+        }
+        if (probed) bodies.add(bodyKeys[body])
+        body = body + 1
+    }
+    BootstrapOverloadProbedBodies(bodies, regions)
+}
+
+fun bootstrapOverloadCheckEnabled(): bool {
+    val configured = linuxEnvironment("ABLA_OVERLOAD_CHECK")
+    configured.found && configured.value == "1"
+}
+
+/** Where two probes' resolutions or failures differ, else "". */
+fun bootstrapOverloadProbeDifference(filtered: BootstrapAnalyzer, full: BootstrapAnalyzer): string {
+    val a = filtered.overloadResolutions
+    val b = full.overloadResolutions
+    var index = 0
+    while (index < a.size && index < b.size) {
+        val x = a[index]
+        val y = b[index]
+        if (x.sourceIdentity != y.sourceIdentity || x.begin != y.begin || x.end != y.end ||
+            x.originalKind != y.originalKind || x.kind != y.kind || x.name != y.name) {
+            return "resolution $index: ${x.sourceIdentity}:${x.begin}:${x.end} ${x.name} vs ${y.sourceIdentity}:${y.begin}:${y.end} ${y.name}"
+        }
+        index = index + 1
+    }
+    if (a.size != b.size) return "${a.size} resolutions vs ${b.size}"
+    if (filtered.overloadFailures != full.overloadFailures) return "failures differ"
+    ""
+}
+
 /** `parsed` with overloads published under distinct names and every call of
  *  one (and every operator use) rewritten to name its declaration. */
 fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResult {
@@ -364,6 +767,7 @@ fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResul
     val owners: array<string> = []
     val operators: array<bool> = []
     val spellings: array<string> = []
+    val candidates: array<BootstrapDeclaration> = []
     var position = 0
     while (position < renamed.size) {
         val original = parsed.declarations[position]
@@ -378,6 +782,7 @@ fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResul
                 owners.append(owner)
                 operators.append(operator)
                 spellings.append(original.name)
+                candidates.append(declaration)
             }
         }
         if (declaration.kind == "class") {
@@ -393,6 +798,7 @@ fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResul
                     owners.append(owner)
                     operators.append(operator)
                     spellings.append(original.methods[method].name)
+                    candidates.append(renamedMethod)
                 }
                 method = method + 1
             }
@@ -403,14 +809,30 @@ fun bootstrapResolveOverloads(parsed: BootstrapParseResult): BootstrapParseResul
         renamed, parsed.actions, parsed.errors, parsed.extensionErrors,
         parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
     )
+    // The probe keeps only types: no compile effect is reported (nor region
+    // retention, which a program without regions never checks).
+    val probed = bootstrapOverloadProbedBodies(parsed.declarations, owners, operators, spellings, candidates)
     var probe = bootstrapAnalyzer(
-        probeInput, [], [], [], [], BootstrapOverloadTable(keys, names, owners, operators, spellings)
+        probeInput, [], [], [], [],
+        BootstrapOverloadTable(keys, names, owners, operators, spellings, true, probed.bodies),
+        false, probed.regions
     )
     probe.analyze(probeInput)
     val resolutions = probe.overloadResolutions
     if (probe.overloadFailures != "") {
         diagnostics = "$diagnostics${probe.overloadFailures}"
         errors = errors + 1
+    }
+    if (bootstrapOverloadCheckEnabled()) {
+        var full = bootstrapAnalyzer(
+            probeInput, [], [], [], [], BootstrapOverloadTable(keys, names, owners, operators, spellings)
+        )
+        full.analyze(probeInput)
+        val difference = bootstrapOverloadProbeDifference(probe, full)
+        if (difference != "") {
+            diagnostics = "${diagnostics}error[E_INTERNAL]: overload.check: the filtered probe differs: $difference\n"
+            errors = errors + 1
+        }
     }
 
     val index = bootstrapOverloadIndex(resolutions)

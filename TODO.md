@@ -137,11 +137,14 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   holds its address in two 32-bit halves there, which LLVM cannot read back as one
   constant word, so checks on it stop folding, and the module initializer is never
   optimized, so its copies stay copies. Kept slots are a poor proxy; measure the output.
-- [ ] **The overload probe is a second semantic analysis.** Once a program has operator
-  functions the probe types every body holding a node that may name one (about 4 s and
-  1.8 GB of garbage in that program before it skipped the others). With `f64` operator
-  functions declared, any arithmetic is such a node, so most bodies are still typed twice.
-  Typing candidate calls inside the main analysis would remove it.
+- [ ] **The overload probe is a second semantic analysis.** It types only the bodies that
+  may come by a value of a candidate's owner type (647 of a 4,979-body client, 38 of which
+  resolve something) and builds no compile-effect summary (nor, without regions, a region
+  summary): about 1.2 s, against 3.2 s before. What is left is typing those bodies and
+  every global. Typing candidate calls inside the main analysis instead was weighed and
+  dropped: the analyzer reads other bodies syntactically (fresh values, borrow sources,
+  region retention, no-escape inference), and in one pass those would see `a + b` where
+  the rewritten program has `a.plus__N(b)`, with no cheap way to notice.
 - [ ] **String helpers carry a root frame.** With automatic pressure, any function with an
   instruction that may allocate collects and roots its values, and so do its callers.
   String inspection counts (`string.get`, `index.get`, `==`/`!=`: a rope may be
