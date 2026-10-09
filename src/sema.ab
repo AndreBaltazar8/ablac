@@ -4358,12 +4358,13 @@ fun bootstrapMethodDeclarationIndex(
 // Overloads and operator functions, for the probe pass of overload.ab. Each
 // candidate is one declaration under its final (possibly mangled) name; `key`
 // is the source spelling it answers to: `name` for a free function,
-// `Owner.name` for a method or extension.
+// `Owner.name` for a method or extension; `spelling` is its `name` part.
 class BootstrapOverloadTable(
     val keys: array<string>,
     val names: array<string>,
     val owners: array<string>,
-    val operators: array<bool>
+    val operators: array<bool>,
+    val spellings: array<string>
 ) {
     fun has(key: string, operatorOnly: bool): bool {
         var index = 0
@@ -4373,10 +4374,41 @@ class BootstrapOverloadTable(
         }
         false
     }
+
+    /** Whether `expression` holds a node the probe may resolve: a call spelled
+     *  like a free candidate, a method call named like a method candidate, or
+     *  an operator an operator function is named for. Whatever the operand
+     *  types, nothing else is resolved. */
+    fun mayResolve(expression: BootstrapExpression): bool {
+        val operator = bootstrapOperatorFunctionName(expression.kind)
+        val call = expression.kind == "call"
+        val methodCall = expression.kind == "member.call"
+        if (operator != "" || call || methodCall) {
+            var index = 0
+            while (index < this.keys.size) {
+                if (operator != "") {
+                    if (this.operators[index] && this.spellings[index] == operator) return true
+                } else if (this.spellings[index] == expression.text &&
+                    (this.owners[index] == "") == call) return true
+                index = index + 1
+            }
+        }
+        for (child in expression.children) if (this.mayResolve(child)) return true
+        false
+    }
+
+    /** Whether the probe types a body (with its parameter defaults): only
+     *  where it may resolve something. A body is typed apart from every other,
+     *  so one it skips changes no other's types. */
+    fun probes(body: BootstrapExpression, defaults: array<BootstrapExpression>): bool {
+        if (this.mayResolve(body)) return true
+        for (value in defaults) if (this.mayResolve(value)) return true
+        false
+    }
 }
 
 fun bootstrapNoOverloads(): BootstrapOverloadTable =
-    BootstrapOverloadTable([], [], [], [])
+    BootstrapOverloadTable([], [], [], [], [])
 
 // A call (or an operator on a non-scalar operand) the probe pass resolved: the
 // node at `begin..end` in `sourceIdentity` becomes `kind` naming `name`.
@@ -9702,10 +9734,14 @@ class BootstrapAnalyzer(
                     this.fail("naked.inline-assembly-body:${declaration.name}")
                 }
             }
+            // The probe (overload.ab) types only the bodies it may resolve in.
             if (
                 (declaration.kind == "fun" ||
                  declaration.kind == "compile.fun") &&
-                declaration.expression.kind != "missing"
+                declaration.expression.kind != "missing" &&
+                (this.overloads.keys.size == 0 || this.overloads.probes(
+                    declaration.expression, declaration.parameterDefaults
+                ))
             ) {
                 val functionLocals: array<BootstrapSymbol> = []
                 if (declaration.extensionOwner != "") {
@@ -9864,6 +9900,12 @@ class BootstrapAnalyzer(
                         this.fail("naked.function:${owner.name}.${method.name}")
                     }
                     methodAnnotation = methodAnnotation + 1
+                }
+                if (this.overloads.keys.size > 0 && !this.overloads.probes(
+                    method.expression, method.parameterDefaults
+                )) {
+                    methodIndex = methodIndex + 1
+                    continue
                 }
                 val methodLocals: array<BootstrapSymbol> = []
                 var receiverKind = "parameter"
