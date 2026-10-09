@@ -167,6 +167,10 @@ var __ablaRuntimeHostCollectionLargeCount: int = 0
 var __ablaRuntimeHostCollectionPages: int = 0
 var __ablaRuntimeHostCollectionPageMask: int = 0
 var __ablaRuntimeHostCollectionBitmaps: int = 0
+// The page looked up last (page + 1, 0 for none) and its bitmap: a scan meets runs of
+// pointers into one page.
+var __ablaRuntimeHostCollectionCachedPage: int = 0
+var __ablaRuntimeHostCollectionCachedBitmap: int = 0
 val __ablaRuntimeHostCollectionSmallBytes: int = 32768
 
 val __ablaRuntimeHostRegionCachedDescriptors: int = 64
@@ -591,14 +595,18 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
     if (table == 0) ablaRuntimeTrap()
     var pages = 0
     var large = 0
+    // Allocations next to each other in the registry mostly share a page: the
+    // page entered last needs no probe.
+    var lastPage = -1
     var slot = 0
     while (slot < __ablaRuntimeHostRegistrySlots) {
         val header = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
         if (header != 0) {
             if (ablaRuntimeLoadI64(header + 16) > largest) {
                 large = large + 1
-            } else {
+            } else if (header >> 16 != lastPage) {
                 val page = header >> 16
+                lastPage = page
                 val at = __ablaRuntimeHostCollectionPageSlot(table, capacity - 1, page)
                 if (ablaRuntimeLoadI64(table + at * 16) == 0) {
                     ablaRuntimeStoreI64(table + at * 16, page + 1)
@@ -626,6 +634,8 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
     val list = ablaRuntimePointerAddress(malloc((if (large > 0) large else 1) * 8))
     if (list == 0) ablaRuntimeTrap()
     var listed = 0
+    lastPage = -1
+    var lastBitmap = 0
     slot = 0
     while (slot < __ablaRuntimeHostRegistrySlots) {
         val header = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
@@ -634,9 +644,13 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
                 ablaRuntimeStoreI64(list + listed * 8, header)
                 listed = listed + 1
             } else {
-                val at = __ablaRuntimeHostCollectionPageSlot(table, capacity - 1, header >> 16)
+                if (header >> 16 != lastPage) {
+                    lastPage = header >> 16
+                    val at = __ablaRuntimeHostCollectionPageSlot(table, capacity - 1, lastPage)
+                    lastBitmap = ablaRuntimeLoadI64(table + at * 16 + 8)
+                }
                 val bit = (header & 65535) >> 4
-                val word = ablaRuntimeLoadI64(table + at * 16 + 8) + (bit >> 6) * 8
+                val word = lastBitmap + (bit >> 6) * 8
                 ablaRuntimeStoreI64(word, ablaRuntimeLoadI64(word) | (1 << (bit & 63)))
             }
         }
@@ -644,6 +658,7 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
     }
     __ablaRuntimeHostCollectionPages = table
     __ablaRuntimeHostCollectionPageMask = capacity - 1
+    __ablaRuntimeHostCollectionCachedPage = 0
     __ablaRuntimeHostCollectionBitmaps = bitmaps
     __ablaRuntimeHostCollectionRanges = list
     __ablaRuntimeHostCollectionLargeCount = listed
@@ -654,12 +669,18 @@ trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
 // The bitmap of `page`, or 0 when no small allocation starts in it.
 @inline
 trusted fun __ablaRuntimeHostCollectionBitmapOf(page: int): int {
+    if (page + 1 == __ablaRuntimeHostCollectionCachedPage) {
+        return __ablaRuntimeHostCollectionCachedBitmap
+    }
     val table = __ablaRuntimeHostCollectionPages
     val slot = __ablaRuntimeHostCollectionPageSlot(
         table, __ablaRuntimeHostCollectionPageMask, page
     )
-    if (ablaRuntimeLoadI64(table + slot * 16) == 0) 0
-    else ablaRuntimeLoadI64(table + slot * 16 + 8)
+    val bitmap = if (ablaRuntimeLoadI64(table + slot * 16) == 0) 0
+        else ablaRuntimeLoadI64(table + slot * 16 + 8)
+    __ablaRuntimeHostCollectionCachedPage = page + 1
+    __ablaRuntimeHostCollectionCachedBitmap = bitmap
+    bitmap
 }
 
 // The index of the highest set bit of a nonzero word.
@@ -708,6 +729,17 @@ trusted fun __ablaRuntimeHostCollectionNearest(bitmap: int, page: int, bit: int)
 // one that can. Otherwise a large allocation may: the last whose payload starts at or before
 // the candidate.
 trusted fun __ablaRuntimeHostCollectionLocate(candidate: int): int {
+    // Most references point at a payload's start, 32 bytes past its header: when a small
+    // allocation's header starts there (its bit), that allocation holds the candidate unless
+    // its payload is empty, and no backward scan is needed.
+    val start = candidate - 32
+    if ((start & 15) == 0) {
+        val startBitmap = __ablaRuntimeHostCollectionBitmapOf(start >> 16)
+        val startBit = (start & 65535) >> 4
+        if (startBitmap != 0 &&
+            ((ablaRuntimeLoadI64(startBitmap + (startBit >> 6) * 8) >>> (startBit & 63)) & 1) != 0 &&
+            ablaRuntimeLoadI64(start + 16) > 0) return start
+    }
     val page = candidate >> 16
     var header = 0
     val bitmap = __ablaRuntimeHostCollectionBitmapOf(page)

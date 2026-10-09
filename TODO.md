@@ -150,7 +150,12 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   free() triggers (madvise) 3%. A collector whose cost followed what is live (pages with
   mark bits, or generations) would make frequent collections cheap. Tried and dropped:
   size-class free lists inside the runtime (35 G fewer instructions, no fewer cycles, and a
-  2.9 GB peak from per-class fragmentation).
+  2.9 GB peak from per-class fragmentation). Sampled over a game client's dev build's front
+  end, the collector is about 13% of samples, the page directory's build alone about 7%:
+  each collection builds it afresh from the whole registry. Keeping it across collections
+  (the sweep clears the bits of what it frees; a collection adds only what was registered
+  since) would save part of that 7%, against the risk of a directory out of step with the
+  heap.
 
 ## Not checked
 
