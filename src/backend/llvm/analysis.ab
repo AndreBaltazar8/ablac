@@ -599,51 +599,101 @@ fun bootstrapLlvmCollectingFunctions(
         result.append(direct)
         function = function + 1
     }
-    var changed = true
-    while (changed) {
-        changed = false
-        var indirectMayCollect = false
-        function = 0
-        while (function < result.size && function < addressTaken.size) {
-            if (result[function] && addressTaken[function]) {
-                indirectMayCollect = true
+    // A function may collect when it calls one that may (directly, or through a drop), and
+    // every function making an indirect call may once any function that may is address-taken.
+    // The callers of each function are gathered once, and the set grows from the functions
+    // that collect themselves through a worklist: the least such set, as rounds over every
+    // instruction reached it.
+    val edgeCallees: array<int> = []
+    val edgeCallers: array<int> = []
+    val indirectCallers: array<int> = []
+    function = 0
+    while (function < program.functions.size) {
+        var indirect = false
+        var instruction = 0
+        while (instruction < program.functions[function].instructions.size) {
+            val candidate = program.functions[function].instructions[instruction]
+            var called = -1
+            if (candidate.opcode == "call") called = functionIndex.find(candidate.text)
+            if (candidate.opcode == "resource.drop") {
+                called = functionIndex.find(bootstrapDropFunctionName(candidate.text))
             }
-            function = function + 1
+            if (called >= 0) {
+                edgeCallees.append(called)
+                edgeCallers.append(function)
+            }
+            if (candidate.opcode == "call.indirect" ||
+                candidate.opcode == "call.indirect.once") indirect = true
+            instruction = instruction + 1
         }
-        function = 0
-        while (function < program.functions.size) {
-            if (!result[function]) {
-                var instruction = 0
-                while (instruction <
-                       program.functions[function].instructions.size) {
-                    val candidate =
-                        program.functions[function].instructions[instruction]
-                    if (candidate.opcode == "call") {
-                        val called = functionIndex.find(candidate.text)
-                        if (called >= 0 && result[called]) {
-                            result[function] = true
-                            changed = true
-                        }
-                    }
-                    if (candidate.opcode == "resource.drop") {
-                        val called = functionIndex.find(
-                            bootstrapDropFunctionName(candidate.text)
-                        )
-                        if (called >= 0 && result[called]) {
-                            result[function] = true
-                            changed = true
-                        }
-                    }
-                    if ((candidate.opcode == "call.indirect" ||
-                         candidate.opcode == "call.indirect.once") &&
-                        indirectMayCollect) {
-                        result[function] = true
-                        changed = true
-                    }
-                    instruction = instruction + 1
-                }
+        if (indirect) indirectCallers.append(function)
+        function = function + 1
+    }
+    // The callers of function f are callers[callerStarts[f] until callerStarts[f + 1]].
+    val callerStarts: array<int> = []
+    function = 0
+    while (function <= program.functions.size) {
+        callerStarts.append(0)
+        function = function + 1
+    }
+    var edge = 0
+    while (edge < edgeCallees.size) {
+        callerStarts[edgeCallees[edge] + 1] = callerStarts[edgeCallees[edge] + 1] + 1
+        edge = edge + 1
+    }
+    function = 0
+    while (function < program.functions.size) {
+        callerStarts[function + 1] = callerStarts[function + 1] + callerStarts[function]
+        function = function + 1
+    }
+    val callers: array<int> = []
+    val filled: array<int> = []
+    edge = 0
+    while (edge < edgeCallees.size) {
+        callers.append(0)
+        edge = edge + 1
+    }
+    function = 0
+    while (function < program.functions.size) {
+        filled.append(callerStarts[function])
+        function = function + 1
+    }
+    edge = 0
+    while (edge < edgeCallees.size) {
+        callers[filled[edgeCallees[edge]]] = edgeCallers[edge]
+        filled[edgeCallees[edge]] = filled[edgeCallees[edge]] + 1
+        edge = edge + 1
+    }
+    val pending: array<int> = []
+    function = 0
+    while (function < result.size) {
+        if (result[function]) pending.append(function)
+        function = function + 1
+    }
+    var indirectMayCollect = false
+    var next = 0
+    while (next < pending.size) {
+        val collecting = pending[next]
+        next = next + 1
+        var caller = callerStarts[collecting]
+        while (caller < callerStarts[collecting + 1]) {
+            if (!result[callers[caller]]) {
+                result[callers[caller]] = true
+                pending.append(callers[caller])
             }
-            function = function + 1
+            caller = caller + 1
+        }
+        if (!indirectMayCollect && collecting < addressTaken.size &&
+            addressTaken[collecting]) {
+            indirectMayCollect = true
+            var indirect = 0
+            while (indirect < indirectCallers.size) {
+                if (!result[indirectCallers[indirect]]) {
+                    result[indirectCallers[indirect]] = true
+                    pending.append(indirectCallers[indirect])
+                }
+                indirect = indirect + 1
+            }
         }
     }
     result
