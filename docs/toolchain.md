@@ -114,7 +114,10 @@ The default hosted release profile runs the deterministic
 `default<Oz>,globaldce`; the target still receives LLVM's optimized machine-code
 generator, while whole-program optimization prioritizes constrained flash.
 Hosted `--fast` skips whole-module optimization and selects LLVM's low-latency
-code generator for edit/build cycles. A hosted release executable is linked from
+code generator for edit/build cycles. Its inliner works to a threshold of 100
+rather than LLVM's 225, which takes a large program's `opt` and `llc` about 14%
+less work for a run time within a percent or two; `ABLA_FAST_INLINE_THRESHOLD=<n>`
+sets it. A hosted release executable is linked from
 its own whole-program (LTO) object; its ordinary object is still built beside it, as
 `<output>.o`, the relocatable sidecar. `build --no-sidecar` (or `ABLA_NO_SIDECAR=1`)
 skips that object and its whole second optimization (most of a large program's release
