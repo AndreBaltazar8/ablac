@@ -67,7 +67,9 @@ it), and so do native builds. Handed over as bitcode, the module also loses the
 names of its local values in `opt` and `llc` (nothing after them reads those
 names; functions and globals keep theirs), and neither tool verifies it again,
 since the compiler verified it as it emitted it. With `ABLA_KEEP_LLVM_TEXT=1` the
-names stay; `ABLA_LLVM_VERIFY=1` turns LLVM's verifiers back on.
+names stay; `ABLA_LLVM_VERIFY=1` turns LLVM's verifiers back on. Its object is
+compiled with static relocations: a module links as one static image, so
+position-independent code would only reach its globals through the GOT.
 
 A release WebAssembly module ends with Binaryen's `wasm-opt -O3`, run with as many
 workers as the online CPUs, up to 4 (its output does not depend on the count);
