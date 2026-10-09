@@ -131,9 +131,6 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   mark bits, or generations) would make frequent collections cheap. Tried and dropped:
   size-class free lists inside the runtime (35 G fewer instructions, no fewer cycles, and a
   2.9 GB peak from per-class fragmentation).
-- [ ] **A hosted release executable is optimized twice.** Its relocatable object sidecar
-  (O2) is built beside the LTO executable (about 50 CPU seconds for a large server); a
-  build that asked for no sidecar could skip it.
 
 ## Not checked
 

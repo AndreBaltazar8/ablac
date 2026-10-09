@@ -505,6 +505,15 @@ class BootstrapPartitionEmission(
 // Binaryen's worker threads for a release Wasm module's wasm-opt: ABLA_WASM_OPT_CORES, else the
 // online CPUs up to 4. Its output does not depend on how many run; uncapped, it sizes the pool
 // from every CPU a sandbox reports, which can be very many.
+// `build --no-sidecar` (or ABLA_NO_SIDECAR=1): a hosted release executable, which links its
+// own LTO object, does not also build its relocatable object sidecar.
+var bootstrapNativeSidecarRequested: bool = true
+
+fun bootstrapNativeSidecarWanted(): bool {
+    val configured = linuxEnvironment("ABLA_NO_SIDECAR")
+    bootstrapNativeSidecarRequested && !(configured.found && configured.value == "1")
+}
+
 fun bootstrapWasmOptCores(): int {
     val configured = linuxEnvironment("ABLA_WASM_OPT_CORES")
     var detected = if (configured.found) configured.value else ""
@@ -1430,6 +1439,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // (A hosted executable still emits it: that object is its relocatable
     // sidecar.)
     val wasmObjectUnused = wasmLtoEligible
+    // A hosted release executable links its LTO object, so its ordinary object is only the
+    // sidecar, which a build may decline. (A program that links LLVM links the ordinary
+    // object instead and still emits it: that is known once the program is compiled.)
+    val sidecarDeclined = hostedLtoEligible && !bootstrapNativeSidecarWanted()
     // A Wasm development build hands its module to opt as bitcode written in process:
     // rendering about 100 MB of LLVM text, reading it back and parsing it again cost
     // seconds, and nothing reads that text. ABLA_KEEP_LLVM_TEXT=1 keeps it (beside the
@@ -1488,7 +1501,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val cacheAbiPath = "$cacheStem.abi.json"
     var cached = false
     if (cacheEnabled && compileInputsCacheable &&
-        (wasmObjectUnused || Path(cacheObjectPath).exists()) &&
+        (wasmObjectUnused || sidecarDeclined || Path(cacheObjectPath).exists()) &&
         (!ltoEligible || Path(cacheLlvmPath).exists()) &&
         Path(cacheSourcePath).exists() &&
         Path(cacheLinkLlvmPath).exists() &&
@@ -1519,9 +1532,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     Path(combinedObjectPath).remove()
     Path(publishPath).remove()
     Path(optimizedWasmPath).remove()
-    // (No stale object beside a module that emits none: the build's transaction would
-    // otherwise put an earlier build's back.)
-    if (wasmObjectUnused) {
+    // (No stale object beside a module that emits none, or a declined sidecar: the
+    // build's transaction would otherwise put an earlier build's back.)
+    if (wasmObjectUnused || sidecarDeclined) {
         Path(objectPath).remove()
         bootstrapDropBuildTransactionPath(objectPath)
     }
@@ -1529,7 +1542,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         linkLlvm = Path(cacheLinkLlvmPath).readText() == "1"
         linkHost = Path(cacheLinkHostPath).readText() == "1"
         abiManifest = Path(cacheAbiPath).readText()
-        status = if (wasmObjectUnused) 0
+        status = if (wasmObjectUnused || (sidecarDeclined && !linkLlvm)) 0
             else bootstrapCopyNativeObject(cacheObjectPath, objectPath)
         if (status == 0 && ltoEligible) status =
             bootstrapCopyNativeObject(cacheLlvmPath, llvmPath)
@@ -1601,10 +1614,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 runtimeMemoryCollect()
                 bootstrapLlvmTraceMemory("emit.collected")
             }
+            val objectSkipped = wasmObjectUnused || (sidecarDeclined && !linkLlvm)
             // The partition combiner is the ELF relocatable linker. Mach-O
             // keeps the proven single-object path until it has a native
             // format-aware combiner; feeding Mach-O parts to ld.lld fails.
-            if (status == 0 && cacheEnabled && compileInputsCacheable &&
+            if (status == 0 && !objectSkipped && cacheEnabled && compileInputsCacheable &&
                 target.hosted && target.objectFormat == "elf" &&
                 Path(cacheDirectory).createDirectories()) {
                 val partitioned = bootstrapEmitPartitionedObject(
@@ -1618,7 +1632,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 status = partitioned.status
                 reusedNativePartitions = partitioned.reused
                 refreshedNativePartitions = partitioned.refreshed
-            } else if (status == 0 && !wasmObjectUnused) {
+            } else if (status == 0 && !objectSkipped) {
                 val llvmInfo = Path(llvmPath).info()
                 if (target.objectFormat == "elf" && !ablaHostIsMacOS() &&
                     cacheProfile == "inprocess-o2" && target.hosted &&
@@ -1638,7 +1652,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 // replacing any member so interruption can leave only an
                 // uncommitted record, never a mixed old/new cache hit.
                 Path(cacheSourcePath).remove()
-                var cacheStatus = if (wasmObjectUnused) 0
+                // (An entry without the object serves only builds that need none: one
+                // that wants the sidecar finds no object there and builds afresh.)
+                var cacheStatus = if (objectSkipped) 0
                     else bootstrapPublishCacheFile(objectPath, cacheObjectPath)
                 if (cacheStatus == 0 && ltoEligible) cacheStatus =
                     bootstrapPublishCacheFile(llvmPath, cacheLlvmPath)
