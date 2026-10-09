@@ -84,8 +84,9 @@ Package-side work (not changed from ablac):
 ## Compile time and memory
 
 Measured on a 10K-function Wasm application (86 MB of LLVM IR). Its dev build's compiler,
-collecting each time its heap grows by 256 MiB, peaks at 1.4 GB and takes about 38 CPU
-seconds; never collecting, it takes about 26 and peaks at 10 GB. Not yet done:
+collecting each time its heap grows by 256 MiB, peaks at about 1 GB and takes about 30 CPU
+seconds (93 G cycles); never collecting, it takes about 24 (73 G cycles) and peaks at
+10 GB. Not yet done:
 
 - [ ] **The LLVM IR is handed to `opt` as text.** The module is rendered (1-1.6 s), written,
   read back for the target-neutral panic patch, and parsed again by `opt` (1.6 s), which
@@ -101,11 +102,21 @@ seconds; never collecting, it takes about 26 and peaks at 10 GB. Not yet done:
   functions the probe analyzes the whole program again to type the calls that may name
   them (about 4 s and 1.8 GB of garbage in that program). Typing candidate calls inside the
   main analysis would remove it.
-- [ ] **A collection still walks every allocation.** Each one lists all allocations through
-  their linked list, sorts them by address (a radix sort), and sweeps and frees them one at
-  a time, garbage and live alike: about 12 of that build's 38 seconds. A collector whose
-  cost followed what is live (pages with mark bits, or generations) would make frequent
-  collections cheap.
+- [ ] **A collection still visits every allocation.** It builds the page bitmaps from the
+  whole registry and sweeps it all, garbage and live alike, freeing garbage one block at a
+  time. Of that build's active time the marker is about 8%, free() 4% and the page release
+  free() triggers (madvise) 3%. A collector whose cost followed what is live (pages with
+  mark bits, or generations) would make frequent collections cheap. Tried and dropped:
+  size-class free lists inside the runtime (35 G fewer instructions, no fewer cycles, and a
+  2.9 GB peak from per-class fragmentation).
+- [ ] **Every function with roots reaches a thread-local word twice or more.** The root
+  frame's push and pop each read or write it, and on Darwin every thread-local access is a
+  call (9% of that build's active time). Computing the slot's address once per function
+  call (`llvm.threadlocal.address` in the prologue, passed to push and pop) would remove
+  most of it; a frame never moves between threads (tasks run on the awaiting thread,
+  generators run eagerly), so holding the address for the call is sound. Tried and dropped:
+  plain globals until threads are enabled (5% faster compiler, but a fixed-step simulation
+  1% slower from the branch on every push and pop; branch `perf/compile-memory-v2`).
 - [ ] **A hosted release executable is optimized twice.** Its relocatable object sidecar
   (O2) is built beside the LTO executable (about 50 CPU seconds for a large server); a
   build that asked for no sidecar could skip it.
