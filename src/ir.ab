@@ -4068,6 +4068,64 @@ fun bootstrapBuildNeverCallNames(
     names
 }
 
+// A lowerer's locals by name: each name's last local, and each local's previous one of the
+// same name, so a name's locals are walked newest first. The locals only grow (whoever
+// appends), and the index catches up on the next question.
+class BootstrapIrLocalNames(
+    var slots: array<int>,
+    val keys: array<string>,
+    val lastIndex: array<int>,
+    val previous: array<int>,
+    var indexed: int
+) {
+    fun slotOf(name: string): int {
+        val capacity = this.slots.size
+        var slot = bootstrapIrLookupHash(name)
+        slot = slot - slot / capacity * capacity
+        while (this.slots[slot] >= 0 && this.keys[this.slots[slot]] != name) {
+            slot = slot + 1
+            if (slot == capacity) slot = 0
+        }
+        slot
+    }
+
+    fun catchUp(locals: array<string>): void {
+        while (this.indexed < locals.size) {
+            val name = locals[this.indexed]
+            var slot = this.slotOf(name)
+            if (this.slots[slot] < 0) {
+                // Half full at most: grow the table first.
+                if ((this.keys.size + 1) * 2 >= this.slots.size) {
+                    this.slots = bootstrapIrLookupSlots(this.slots.size)
+                    var key = 0
+                    while (key < this.keys.size) {
+                        this.slots[this.slotOf(this.keys[key])] = key
+                        key = key + 1
+                    }
+                    slot = this.slotOf(name)
+                }
+                this.slots[slot] = this.keys.size
+                this.keys.append(name)
+                this.lastIndex.append(-1)
+            }
+            val key = this.slots[slot]
+            this.previous.append(this.lastIndex[key])
+            this.lastIndex[key] = this.indexed
+            this.indexed = this.indexed + 1
+        }
+        return
+    }
+
+    /** The newest local named `name`, or -1. */
+    fun newest(name: string): int {
+        val key = this.slots[this.slotOf(name)]
+        if (key >= 0) this.lastIndex[key] else -1
+    }
+}
+
+fun bootstrapIrLocalNames(): BootstrapIrLocalNames =
+    BootstrapIrLocalNames(bootstrapIrLookupSlots(16), [], [], [], 0)
+
 class BootstrapLowerer(
     val instructions: array<BootstrapInstruction>,
     val functions: array<BootstrapIrFunction>,
@@ -4111,8 +4169,20 @@ class BootstrapLowerer(
     var breakScope: int,
     var continueScope: int,
     val validationOnly: bool,
-    var errors: int
+    var errors: int,
+    val localNames: BootstrapIrLocalNames
 ) {
+    /** The newest visible local named `name` (with a type, when `typed`), or -1. */
+    fun visibleLocal(name: string, typed: bool): int {
+        this.localNames.catchUp(this.locals)
+        var index = this.localNames.newest(name)
+        while (index >= 0 && !((!typed || index < this.localTypes.size) &&
+                               this.localScopeVisible(this.localScopes[index]))) {
+            index = this.localNames.previous[index]
+        }
+        index
+    }
+
     fun isManagedAlias(expression: BootstrapExpression): bool {
         var found = false
         var index = 0
@@ -4401,20 +4471,15 @@ class BootstrapLowerer(
 
     fun lowerLocalType(name: string): string {
         var result = "unknown"
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index] == name &&
-                index < this.localTypes.size &&
-                this.localScopeVisible(this.localScopes[index])) {
-                result = this.localTypes[index]
-                if (result.size > 5 && result.slice(0, 5) == "cell:") {
-                    result = result.slice(5, result.size)
-                }
-                if (bootstrapIsDelegatedType(result)) {
-                    result = bootstrapDelegatedExposedType(result)
-                }
+        val index = this.visibleLocal(name, true)
+        if (index >= 0) {
+            result = this.localTypes[index]
+            if (result.size > 5 && result.slice(0, 5) == "cell:") {
+                result = result.slice(5, result.size)
             }
-            index = index + 1
+            if (bootstrapIsDelegatedType(result)) {
+                result = bootstrapDelegatedExposedType(result)
+            }
         }
         val refined = this.lowerRefinedType(this.storageFor(name))
         if (refined != "unknown") result = refined
@@ -4423,17 +4488,12 @@ class BootstrapLowerer(
 
     fun lowerLocalMetadataType(name: string): string {
         var result = "unknown"
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index] == name &&
-                index < this.localTypes.size &&
-                this.localScopeVisible(this.localScopes[index])) {
-                result = this.localTypes[index]
-                if (result.size > 5 && result.slice(0, 5) == "cell:") {
-                    result = result.slice(5, result.size)
-                }
+        val index = this.visibleLocal(name, true)
+        if (index >= 0) {
+            result = this.localTypes[index]
+            if (result.size > 5 && result.slice(0, 5) == "cell:") {
+                result = result.slice(5, result.size)
             }
-            index = index + 1
         }
         result
     }
@@ -4987,12 +5047,11 @@ class BootstrapLowerer(
 
     fun localScopeVisible(scope: int): bool {
         var candidate = this.currentScope
-        var visible = false
         while (candidate >= 0) {
-            if (candidate == scope) visible = true
+            if (candidate == scope) return true
             candidate = this.scopeParents[candidate]
         }
-        visible
+        false
     }
 
     fun enterLocalScope(): int {
@@ -5327,28 +5386,11 @@ class BootstrapLowerer(
         return
     }
 
-    fun isLocal(name: string): bool {
-        var found = false
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index] == name &&
-                this.localScopeVisible(this.localScopes[index])) found = true
-            index = index + 1
-        }
-        found
-    }
+    fun isLocal(name: string): bool = this.visibleLocal(name, false) >= 0
 
     fun storageFor(name: string): string {
-        var result = name
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index] == name &&
-                this.localScopeVisible(this.localScopes[index])) {
-                result = this.localStorage[index]
-            }
-            index = index + 1
-        }
-        result
+        val index = this.visibleLocal(name, false)
+        if (index >= 0) this.localStorage[index] else name
     }
 
     fun lowerDelegateSlot(name: string): int {
@@ -6613,7 +6655,8 @@ class BootstrapLowerer(
                 -1,
                 -1,
                 this.validationOnly,
-                this.errors
+                this.errors,
+                bootstrapIrLocalNames()
             )
             val lambdaResult = lambdaLowerer.lowerExpression(body)
             lambdaLowerer.emitOwnedParameterDrops()
@@ -8124,7 +8167,8 @@ class BootstrapLowerer(
             -1,
             -1,
             validationOnly,
-            this.errors
+            this.errors,
+            bootstrapIrLocalNames()
         )
         var defaultIndex = 0
         while (defaultIndex < declaration.parameterDefaults.size) {
@@ -8297,7 +8341,8 @@ class BootstrapLowerer(
             -1,
             -1,
             validationOnly,
-            this.errors
+            this.errors,
+            bootstrapIrLocalNames()
         )
         var defaultIndex = 0
         while (defaultIndex < method.parameterDefaults.size) {
@@ -8966,7 +9011,8 @@ fun bootstrapLowerParsedCached(
         -1,
         -1,
         false,
-        analyzed.errors
+        analyzed.errors,
+        bootstrapIrLocalNames()
     ).lower(parsed, contextFirst, contextSecond, cache, pruneUnused)
 }
 
