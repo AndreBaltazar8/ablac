@@ -415,6 +415,41 @@ fun bootstrapIrLookupSlots(count: int): array<int> {
     slots
 }
 
+/** Names to integers, open-addressed and sized up front for at most `most` names. */
+class BootstrapIrNameTable(val names: array<string>, val values: array<int>, val slots: array<int>) {
+    /** The slot `name` occupies, or the empty one where it would go. */
+    fun slotOf(name: string): int {
+        val capacity = this.slots.size
+        var slot = bootstrapIrLookupHash(name)
+        slot = slot - slot / capacity * capacity
+        while (this.slots[slot] >= 0 && this.names[this.slots[slot]] != name) {
+            slot = slot + 1
+            if (slot == capacity) slot = 0
+        }
+        slot
+    }
+
+    /** The value `name` was last put with, or `absent`. */
+    fun find(name: string, absent: int): int {
+        val entry = this.slots[this.slotOf(name)]
+        if (entry >= 0) this.values[entry] else absent
+    }
+
+    fun put(name: string, value: int): void {
+        val slot = this.slotOf(name)
+        if (this.slots[slot] >= 0) this.values[this.slots[slot]] = value
+        else {
+            this.slots[slot] = this.names.size
+            this.names.append(name)
+            this.values.append(value)
+        }
+        return
+    }
+}
+
+fun bootstrapIrNameTable(most: int): BootstrapIrNameTable =
+    BootstrapIrNameTable([], [], bootstrapIrLookupSlots(most))
+
 fun bootstrapIrLookupOf(
     instructions: array<BootstrapInstruction>,
     globalNames: array<string>
@@ -1566,15 +1601,13 @@ fun bootstrapIrHasUninitializedPath(
     loadInstruction: int,
     instructions: array<BootstrapInstruction>,
     blocks: array<BootstrapIrBlock>,
-    var visited: array<bool>,
+    var visited: array<int>,
+    generation: int,
     var stack: array<int>
 ): bool {
+    // A block is visited in this search when it holds this search's generation.
     var block = 0
-    while (block < visited.size) {
-        visited[block] = false
-        block = block + 1
-    }
-    visited[loadBlock] = true
+    visited[loadBlock] = generation
     stack[0] = loadBlock
     var stackSize = 1
     var uninitialized = false
@@ -1605,8 +1638,8 @@ fun bootstrapIrHasUninitializedPath(
             var predecessor = 0
             while (predecessor < blocks[block].predecessors.size) {
                 val source = blocks[block].predecessors[predecessor]
-                if (!visited[source]) {
-                    visited[source] = true
+                if (visited[source] != generation) {
+                    visited[source] = generation
                     stack[stackSize] = source
                     stackSize = stackSize + 1
                 }
@@ -2285,23 +2318,42 @@ fun bootstrapVerifyIrLocals(
     immediateDominators: array<int>
 ): int {
     var errors = 0
+    // Each local named like an earlier one is an error per earlier one; the table also
+    // keeps each name's last local, the one an instruction naming it refers to.
+    val seen = bootstrapIrNameTable(locals.size)
+    val last = bootstrapIrNameTable(locals.size)
     var localIndex = 0
     while (localIndex < locals.size) {
-        var previous = 0
-        while (previous < localIndex) {
-            if (locals[previous].name == locals[localIndex].name) {
-                errors = errors + 1
-            }
-            previous = previous + 1
-        }
+        val earlier = seen.find(locals[localIndex].name, 0)
+        errors = errors + earlier
+        seen.put(locals[localIndex].name, earlier + 1)
+        last.put(locals[localIndex].name, localIndex)
         localIndex = localIndex + 1
     }
+    // A search for an uninitialized path can only succeed through a move of the local or
+    // the declaration of one that starts uninitialized: an initialized local nothing moves
+    // has none, and is not searched.
+    var moves = 0
+    var instruction = 0
+    while (instruction < instructions.size) {
+        if (instructions[instruction].opcode == "local.move") moves = moves + 1
+        instruction = instruction + 1
+    }
+    val moved = bootstrapIrNameTable(moves)
+    instruction = 0
+    while (instruction < instructions.size) {
+        if (instructions[instruction].opcode == "local.move") {
+            moved.put(instructions[instruction].text, 1)
+        }
+        instruction = instruction + 1
+    }
 
-    val visited: array<bool> = []
+    val visited: array<int> = []
     val stack: array<int> = []
+    var generation = 0
     var block = 0
     while (block < blocks.size) {
-        visited.append(false)
+        visited.append(0)
         stack.append(0)
         block = block + 1
     }
@@ -2318,7 +2370,7 @@ fun bootstrapVerifyIrLocals(
                 instruction.opcode == "local.set" ||
                 instruction.opcode == "local.assign" ||
                 instruction.opcode == "local.move") {
-                localIndex = bootstrapIrLocalIndex(locals, instruction.text)
+                localIndex = last.find(instruction.text, -1)
                 if (localIndex < 0) {
                     errors = errors + 1
                     bootstrapSemanticUnit()
@@ -2339,15 +2391,19 @@ fun bootstrapVerifyIrLocals(
                          instruction.opcode == "parameter.load" ||
                          instruction.opcode == "place.root" ||
                          instruction.opcode == "local.move") &&
-                        bootstrapIrHasUninitializedPath(
+                        (!local.initialized || moved.find(local.name, 0) == 1)) {
+                        generation = generation + 1
+                        if (bootstrapIrHasUninitializedPath(
                             local,
                             block,
                             instructionIndex,
                             instructions,
                             blocks,
                             visited,
+                            generation,
                             stack
                         )) errors = errors + 1
+                    }
                     bootstrapSemanticUnit()
                 }
             }
@@ -2517,21 +2573,22 @@ fun bootstrapFinalizeIrFunction(
         blocks,
         parameters
     )
+    // Each local's type is the last one declared under its name.
+    val declaredCount = if (declaredLocalNames.size < declaredLocalTypes.size)
+        declaredLocalNames.size else declaredLocalTypes.size
+    val lastDeclared = bootstrapIrNameTable(declaredCount)
+    var declared = 0
+    while (declared < declaredCount) {
+        lastDeclared.put(declaredLocalNames[declared], declared)
+        declared = declared + 1
+    }
     val localTypes: array<string> = []
     var local = 0
     while (local < locals.size) {
-        var localType = "unknown"
-        var declared = 0
-        while (declared < declaredLocalNames.size) {
-            if (declaredLocalNames[declared] == locals[local].name &&
-                declared < declaredLocalTypes.size) {
-                localType = bootstrapNormalizeType(
-                    declaredLocalTypes[declared]
-                )
-            }
-            declared = declared + 1
-        }
-        localTypes.append(localType)
+        declared = lastDeclared.find(locals[local].name, -1)
+        localTypes.append(if (declared >= 0) bootstrapNormalizeType(
+            declaredLocalTypes[declared]
+        ) else "unknown")
         local = local + 1
     }
     var errors = initialErrors
