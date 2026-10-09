@@ -1766,7 +1766,12 @@ fun bootstrapCopyRegionCallSummary(
         index = index + 1
     }
     BootstrapRegionCallSummary(
-        unsafeNames, retainingReceiverNames, retainingParameterKeys
+        unsafeNames, retainingReceiverNames, retainingParameterKeys,
+        bootstrapStringSetCopy(source.unsafe),
+        bootstrapStringSetCopy(source.unsafeMembers),
+        bootstrapStringSetCopy(source.retainingReceivers),
+        bootstrapStringSetCopy(source.retainingParameters),
+        source.heapFields
     )
 }
 
@@ -3514,50 +3519,103 @@ fun bootstrapDeniedCompileEffects(effects: int, grants: int): int {
     denied
 }
 
+// A set of strings, open-addressed (keys in insertion order, slots hold their indices).
+class BootstrapStringSet(val keys: array<string>, var slots: array<int>) {
+    fun slotOf(key: string): int {
+        var slot = bootstrapFunctionDeclarationHash(key)
+        slot = slot - slot / this.slots.size * this.slots.size
+        while (this.slots[slot] >= 0 && this.keys[this.slots[slot]] != key) {
+            slot = slot + 1
+            if (slot == this.slots.size) slot = 0
+        }
+        slot
+    }
+
+    fun contains(key: string): bool = this.slots[this.slotOf(key)] >= 0
+
+    fun add(key: string): void {
+        if ((this.keys.size + 1) * 2 >= this.slots.size) {
+            val grown: array<int> = []
+            var slot = 0
+            while (slot < this.slots.size * 2) {
+                grown.append(-1)
+                slot = slot + 1
+            }
+            this.slots = grown
+            var entry = 0
+            while (entry < this.keys.size) {
+                this.slots[this.slotOf(this.keys[entry])] = entry
+                entry = entry + 1
+            }
+        }
+        val slot = this.slotOf(key)
+        if (this.slots[slot] < 0) {
+            this.slots[slot] = this.keys.size
+            this.keys.append(key)
+        }
+        return
+    }
+}
+
+fun bootstrapStringSet(): BootstrapStringSet =
+    BootstrapStringSet([], [-1, -1, -1, -1, -1, -1, -1, -1])
+
+fun bootstrapStringSetCopy(source: BootstrapStringSet): BootstrapStringSet {
+    val keys: array<string> = []
+    for (key in source.keys) keys.append(key)
+    val slots: array<int> = []
+    for (slot in source.slots) slots.append(slot)
+    BootstrapStringSet(keys, slots)
+}
+
+// The names lists keep their order; the sets beside them answer membership:
+// `unsafe` holds unsafeNames, `unsafeMembers` every part of one after a dot
+// (a member call `x.name` is unsafe when some unsafe `….name` is), and
+// `heapFields` the `owner\nfield` pairs whose field holds heap memory
+// (bootstrapRegionHeapFields).
 class BootstrapRegionCallSummary(
     val unsafeNames: array<string>,
     val retainingReceiverNames: array<string>,
-    val retainingParameterKeys: array<string>
+    val retainingParameterKeys: array<string>,
+    val unsafe: BootstrapStringSet,
+    val unsafeMembers: BootstrapStringSet,
+    val retainingReceivers: BootstrapStringSet,
+    val retainingParameters: BootstrapStringSet,
+    val heapFields: BootstrapStringSet
 )
+
+fun bootstrapRegionAddUnsafe(var summary: BootstrapRegionCallSummary, name: string): void {
+    summary.unsafeNames.append(name)
+    summary.unsafe.add(name)
+    var dot = 1
+    while (dot < name.size) {
+        if (name[dot] == 46) summary.unsafeMembers.add(name.slice(dot + 1, name.size))
+        dot = dot + 1
+    }
+    return
+}
+
+fun bootstrapRegionAddRetainingReceiver(var summary: BootstrapRegionCallSummary, name: string): void {
+    summary.retainingReceiverNames.append(name)
+    summary.retainingReceivers.add(name)
+    return
+}
 
 fun bootstrapRegionCallIsUnsafe(
     summary: BootstrapRegionCallSummary,
     name: string
-): bool {
-    var unsafe = false
-    var index = 0
-    while (index < summary.unsafeNames.size) {
-        if (summary.unsafeNames[index] == name) unsafe = true
-        index = index + 1
-    }
-    unsafe
-}
+): bool = summary.unsafe.contains(name)
 
 fun bootstrapRegionMemberCallIsUnsafe(
     summary: BootstrapRegionCallSummary,
     name: string
-): bool {
-    var unsafe = false
-    var index = 0
-    while (index < summary.unsafeNames.size) {
-        val candidate = summary.unsafeNames[index]
-        val suffix = ".$name"
-        if (candidate.size > suffix.size &&
-            candidate.slice(candidate.size - suffix.size, candidate.size) ==
-                suffix) unsafe = true
-        index = index + 1
-    }
-    unsafe
-}
+): bool = summary.unsafeMembers.contains(name)
 
 fun bootstrapRegionReceiverCallIsRetaining(
     summary: BootstrapRegionCallSummary,
     owner: string,
     method: string
-): bool = bootstrapAffineNamesContain(
-    summary.retainingReceiverNames,
-    "$owner.$method"
-)
+): bool = summary.retainingReceivers.contains("$owner.$method")
 
 fun bootstrapRegionParameterKey(name: string, parameter: int): string =
     "$name#$parameter"
@@ -3566,8 +3624,7 @@ fun bootstrapRegionParameterIsRetaining(
     summary: BootstrapRegionCallSummary,
     name: string,
     parameter: int
-): bool = bootstrapAffineNamesContain(
-    summary.retainingParameterKeys,
+): bool = summary.retainingParameters.contains(
     bootstrapRegionParameterKey(name, parameter)
 )
 
@@ -3577,11 +3634,11 @@ fun bootstrapRegionMarkRetainingParameter(
     parameter: int
 ): bool {
     val key = bootstrapRegionParameterKey(name, parameter)
-    val changed = !bootstrapAffineNamesContain(
-        summary.retainingParameterKeys,
-        key
-    )
-    if (changed) summary.retainingParameterKeys.append(key)
+    val changed = !summary.retainingParameters.contains(key)
+    if (changed) {
+        summary.retainingParameterKeys.append(key)
+        summary.retainingParameters.add(key)
+    }
     changed
 }
 
@@ -3616,36 +3673,49 @@ fun bootstrapRegionParameterIndex(
     result
 }
 
-fun bootstrapRegionOwnerFieldIsHeap(
-    declarations: array<BootstrapDeclaration>,
-    owner: string,
-    field: string
-): bool {
-    var heap = false
-    var declarationIndex = 0
-    while (declarationIndex < declarations.size) {
-        val declaration = declarations[declarationIndex]
-        if (declaration.name == owner) {
-            var fieldIndex = 0
-            while (fieldIndex < declaration.parameters.size) {
-                if (declaration.parameters[fieldIndex] == field &&
-                    fieldIndex < declaration.parameterTypes.size &&
-                    fieldIndex < declaration.parameterKinds.size &&
-                    (declaration.parameterKinds[fieldIndex] == "val" ||
-                     declaration.parameterKinds[fieldIndex] == "var")) {
-                    heap = !bootstrapRegionResultIsIndependent(
+// Every `owner\nfield` pair whose field holds heap memory (a `val`/`var` field
+// whose type is not independent of a region): the last declaration of that
+// name and its last field of that name decide.
+fun bootstrapRegionHeapFields(
+    declarations: array<BootstrapDeclaration>
+): BootstrapStringSet {
+    val pairs = bootstrapStringSet()
+    val heap: array<bool> = []
+    for (declaration in declarations) {
+        var fieldIndex = 0
+        while (fieldIndex < declaration.parameters.size) {
+            if (fieldIndex < declaration.parameterTypes.size &&
+                fieldIndex < declaration.parameterKinds.size &&
+                (declaration.parameterKinds[fieldIndex] == "val" ||
+                 declaration.parameterKinds[fieldIndex] == "var")) {
+                val key = "${declaration.name}\n${declaration.parameters[fieldIndex]}"
+                val known = pairs.keys.size
+                pairs.add(key)
+                if (pairs.keys.size > known) heap.append(false)
+                heap[pairs.slots[pairs.slotOf(key)]] =
+                    !bootstrapRegionResultIsIndependent(
                         bootstrapNormalizeType(
                             declaration.parameterTypes[fieldIndex]
                         )
                     )
-                }
-                fieldIndex = fieldIndex + 1
             }
+            fieldIndex = fieldIndex + 1
         }
-        declarationIndex = declarationIndex + 1
     }
-    heap
+    val result = bootstrapStringSet()
+    var pair = 0
+    while (pair < pairs.keys.size) {
+        if (heap[pair]) result.add(pairs.keys[pair])
+        pair = pair + 1
+    }
+    result
 }
+
+fun bootstrapRegionFieldIsHeap(
+    summary: BootstrapRegionCallSummary,
+    owner: string,
+    field: string
+): bool = summary.heapFields.contains("$owner\n$field")
 
 fun bootstrapRegionExpressionRetainsParameters(
     expression: BootstrapExpression,
@@ -3660,8 +3730,8 @@ fun bootstrapRegionExpressionRetainsParameters(
         val root = bootstrapPlaceRootName(expression.children[0])
         val parameter = bootstrapRegionParameterIndex(parameters, root)
         if (parameter >= 0 && parameter < parameterTypes.size &&
-            bootstrapRegionOwnerFieldIsHeap(
-                declarations,
+            bootstrapRegionFieldIsHeap(
+                summary,
                 bootstrapNormalizeType(parameterTypes[parameter]),
                 expression.text
             )) {
@@ -3804,15 +3874,15 @@ fun bootstrapRegionExpressionRetainsReceiver(
 ): bool {
     var retaining = false
     if (expression.kind == "assign" &&
-        bootstrapRegionOwnerFieldIsHeap(
-            declarations,
+        bootstrapRegionFieldIsHeap(
+            summary,
             owner,
             expression.text
         )) retaining = true
     if (expression.kind == "member.assign" &&
         bootstrapPlaceRootName(expression.children[0]) == "this" &&
-        bootstrapRegionOwnerFieldIsHeap(
-            declarations,
+        bootstrapRegionFieldIsHeap(
+            summary,
             owner,
             expression.text
         )) retaining = true
@@ -3941,32 +4011,36 @@ fun bootstrapRegionExpressionCallsFunctionParameter(
 fun bootstrapBuildRegionCallSummary(
     declarations: array<BootstrapDeclaration>
 ): BootstrapRegionCallSummary {
-    val summary = BootstrapRegionCallSummary([], [], [])
+    val summary = BootstrapRegionCallSummary(
+        [], [], [], bootstrapStringSet(), bootstrapStringSet(),
+        bootstrapStringSet(), bootstrapStringSet(),
+        bootstrapRegionHeapFields(declarations)
+    )
     var declarationIndex = 0
     while (declarationIndex < declarations.size) {
         val declaration = declarations[declarationIndex]
         if (declaration.kind == "extern" && !declaration.isNoEscape) {
-            summary.unsafeNames.append(declaration.name)
+            bootstrapRegionAddUnsafe(summary, declaration.name)
         }
         if (bootstrapRegionExpressionCallsFunctionParameter(
             declaration.expression,
             declaration.parameters,
             declaration.parameterTypes
-        )) summary.unsafeNames.append(declaration.name)
+        )) bootstrapRegionAddUnsafe(summary, declaration.name)
         var methodIndex = 0
         while (methodIndex < declaration.methods.size) {
             val method = declaration.methods[methodIndex]
             if (method.kind == "extern" && !method.isNoEscape) {
-                summary.unsafeNames.append(
-                    "${declaration.name}.${method.name}"
+                bootstrapRegionAddUnsafe(
+                    summary, "${declaration.name}.${method.name}"
                 )
             }
             if (bootstrapRegionExpressionCallsFunctionParameter(
                 method.expression,
                 method.parameters,
                 method.parameterTypes
-            )) summary.unsafeNames.append(
-                "${declaration.name}.${method.name}"
+            )) bootstrapRegionAddUnsafe(
+                summary, "${declaration.name}.${method.name}"
             )
             methodIndex = methodIndex + 1
         }
@@ -3993,7 +4067,7 @@ fun bootstrapBuildRegionCallSummary(
                     declaration.expression,
                     summary
                 )) {
-                summary.unsafeNames.append(declaration.name)
+                bootstrapRegionAddUnsafe(summary, declaration.name)
                 changed = true
             }
             var methodIndex = 0
@@ -4008,16 +4082,14 @@ fun bootstrapBuildRegionCallSummary(
                     declarations,
                     summary
                 )) changed = true
-                if (!bootstrapAffineNamesContain(
-                    summary.retainingReceiverNames,
-                    name
-                ) && bootstrapRegionExpressionRetainsReceiver(
+                if (!summary.retainingReceivers.contains(name) &&
+                    bootstrapRegionExpressionRetainsReceiver(
                     method.expression,
                     declaration.name,
                     declarations,
                     summary
                 )) {
-                    summary.retainingReceiverNames.append(name)
+                    bootstrapRegionAddRetainingReceiver(summary, name)
                     changed = true
                 }
                 if (!bootstrapRegionCallIsUnsafe(summary, name) &&
@@ -4025,7 +4097,7 @@ fun bootstrapBuildRegionCallSummary(
                         method.expression,
                         summary
                     )) {
-                    summary.unsafeNames.append(name)
+                    bootstrapRegionAddUnsafe(summary, name)
                     changed = true
                 }
                 methodIndex = methodIndex + 1
