@@ -2608,6 +2608,15 @@ fun bootstrapCompileExternalEffect(
     effect
 }
 
+// While a compile-effect summary is built, the entry whose body is being
+// walked (-1 otherwise), and each entry read during the first pass as edges
+// (reader, read), at most once per pair: bootstrapBuildCompileEffectSummary
+// walks again only the readers of an entry whose effects grew.
+var bootstrapCompileEffectReading: int = -1
+var bootstrapCompileEffectLastReader: array<int> = []
+var bootstrapCompileEffectEdgeReaders: array<int> = []
+var bootstrapCompileEffectEdgeReads: array<int> = []
+
 fun bootstrapCompileEffectLookup(
     summary: BootstrapCompileEffectSummary,
     name: string,
@@ -2633,6 +2642,12 @@ fun bootstrapCompileEffectLookup(
             else summary.names[index] == name
         if (matches) {
             mask = bootstrapCompileEffectMerge(mask, summary.masks[index])
+            val reader = bootstrapCompileEffectReading
+            if (reader >= 0 && bootstrapCompileEffectLastReader[index] != reader) {
+                bootstrapCompileEffectLastReader[index] = reader
+                bootstrapCompileEffectEdgeReaders.append(reader)
+                bootstrapCompileEffectEdgeReads.append(index)
+            }
         }
         index = next[index]
     }
@@ -3077,6 +3092,8 @@ fun bootstrapBuildCompileEffectSummary(
     val entryScopeNames: array<array<string>> = []
     val entryScopeTypes: array<array<string>> = []
     val entryOwners: array<string> = []
+    val entryExpressions: array<BootstrapExpression> = []
+    val entryWalked: array<bool> = []
     declarationIndex = 0
     while (declarationIndex < declarations.size) {
         val declaration = declarations[declarationIndex]
@@ -3101,6 +3118,8 @@ fun bootstrapBuildCompileEffectSummary(
             entryScopeNames.append(scopeNames)
             entryScopeTypes.append(scopeTypes)
             entryOwners.append(declaration.extensionOwner)
+            entryExpressions.append(declaration.expression)
+            entryWalked.append(declaration.kind != "extern")
         }
         var methodIndex = 0
         while (methodIndex < declaration.methods.size) {
@@ -3130,91 +3149,127 @@ fun bootstrapBuildCompileEffectSummary(
             entryScopeNames.append(scopeNames)
             entryScopeTypes.append(scopeTypes)
             entryOwners.append(declaration.name)
+            entryExpressions.append(method.expression)
+            entryWalked.append(method.kind != "extern")
             methodIndex = methodIndex + 1
         }
         declarationIndex = declarationIndex + 1
     }
-    var changed = true
-    var round = 0
-    while (changed && round <= names.size) {
-        changed = false
-        var entry = 0
-        declarationIndex = 0
-        while (declarationIndex < declarations.size) {
-            val declaration = declarations[declarationIndex]
-            if (declaration.kind == "fun" ||
-                declaration.kind == "compile.fun" ||
-                declaration.kind == "extern") {
-                if (declaration.kind != "extern") {
-                    val delegatedNames: array<string> = []
-                    var globalDelegate = 0
-                    while (globalDelegate < globalDelegatedNames.size) {
-                        delegatedNames.append(
-                            globalDelegatedNames[globalDelegate]
-                        )
-                        globalDelegate = globalDelegate + 1
-                    }
-                    bootstrapCollectDelegatedNames(
-                        declaration.expression,
-                        delegatedNames
-                    )
-                    val inferred = bootstrapExpressionDelegatedCompileEffects(
-                        declaration.expression,
-                        summary,
-                        delegatedNames,
-                        typeMap,
-                        entryScopeNames[entry],
-                        entryScopeTypes[entry],
-                        entryOwners[entry]
-                    )
-                    val merged = bootstrapCompileEffectMerge(
-                        masks[entry],
-                        inferred
-                    )
-                    if (merged != masks[entry]) changed = true
-                    masks[entry] = merged
-                }
-                entry = entry + 1
-            }
-            var methodIndex = 0
-            while (methodIndex < declaration.methods.size) {
-                val method = declaration.methods[methodIndex]
-                if (method.kind != "extern") {
-                    val delegatedNames: array<string> = []
-                    var globalDelegate = 0
-                    while (globalDelegate < globalDelegatedNames.size) {
-                        delegatedNames.append(
-                            globalDelegatedNames[globalDelegate]
-                        )
-                        globalDelegate = globalDelegate + 1
-                    }
-                    bootstrapCollectDelegatedNames(
-                        method.expression,
-                        delegatedNames
-                    )
-                    val inferred = bootstrapExpressionDelegatedCompileEffects(
-                        method.expression,
-                        summary,
-                        delegatedNames,
-                        typeMap,
-                        entryScopeNames[entry],
-                        entryScopeTypes[entry],
-                        entryOwners[entry]
-                    )
-                    val merged = bootstrapCompileEffectMerge(
-                        masks[entry],
-                        inferred
-                    )
-                    if (merged != masks[entry]) changed = true
-                    masks[entry] = merged
-                }
-                entry = entry + 1
-                methodIndex = methodIndex + 1
-            }
-            declarationIndex = declarationIndex + 1
-        }
-        round = round + 1
+    // Effects flow from callees to their callers until nothing changes. The
+    // first pass walks every body in order and records which entries each
+    // walk read; after it, only the readers of an entry whose effects grew
+    // are walked again. A walk only merges what it reads, so this reaches the
+    // fixed point that walking every body until a pass changes nothing does.
+    val entries = masks.size
+    bootstrapCompileEffectLastReader = []
+    bootstrapCompileEffectEdgeReaders = []
+    bootstrapCompileEffectEdgeReads = []
+    val schedule: array<int> = []
+    val queued: array<bool> = []
+    var entry = 0
+    while (entry < entries) {
+        bootstrapCompileEffectLastReader.append(-1)
+        schedule.append(entry)
+        queued.append(true)
+        entry = entry + 1
     }
+    val grewFirst: array<int> = []
+    val readerStarts: array<int> = []
+    val readers: array<int> = []
+    var head = 0
+    while (head < schedule.size) {
+        entry = schedule[head]
+        head = head + 1
+        queued[entry] = false
+        var grew = false
+        if (entryWalked[entry]) {
+            bootstrapCompileEffectReading = if (head <= entries) entry else -1
+            val expression = entryExpressions[entry]
+            val delegatedNames: array<string> = []
+            var globalDelegate = 0
+            while (globalDelegate < globalDelegatedNames.size) {
+                delegatedNames.append(globalDelegatedNames[globalDelegate])
+                globalDelegate = globalDelegate + 1
+            }
+            bootstrapCollectDelegatedNames(expression, delegatedNames)
+            val inferred = bootstrapExpressionDelegatedCompileEffects(
+                expression,
+                summary,
+                delegatedNames,
+                typeMap,
+                entryScopeNames[entry],
+                entryScopeTypes[entry],
+                entryOwners[entry]
+            )
+            val merged = bootstrapCompileEffectMerge(masks[entry], inferred)
+            grew = merged != masks[entry]
+            masks[entry] = merged
+        }
+        if (grew && head <= entries) grewFirst.append(entry)
+        else if (grew) {
+            var reader = readerStarts[entry]
+            while (reader < readerStarts[entry + 1]) {
+                if (!queued[readers[reader]]) {
+                    queued[readers[reader]] = true
+                    schedule.append(readers[reader])
+                }
+                reader = reader + 1
+            }
+        }
+        if (head == entries) {
+            // The first pass is over: index the readers of each entry, then
+            // queue those of the entries that grew in it.
+            bootstrapCompileEffectReading = -1
+            var start = 0
+            while (start <= entries) {
+                readerStarts.append(0)
+                start = start + 1
+            }
+            var edge = 0
+            while (edge < bootstrapCompileEffectEdgeReads.size) {
+                val read = bootstrapCompileEffectEdgeReads[edge]
+                readerStarts[read + 1] = readerStarts[read + 1] + 1
+                edge = edge + 1
+            }
+            start = 0
+            while (start < entries) {
+                readerStarts[start + 1] = readerStarts[start + 1] + readerStarts[start]
+                start = start + 1
+            }
+            val filled: array<int> = []
+            start = 0
+            while (start < entries) {
+                filled.append(readerStarts[start])
+                start = start + 1
+            }
+            edge = 0
+            while (edge < bootstrapCompileEffectEdgeReads.size) {
+                readers.append(0)
+                edge = edge + 1
+            }
+            edge = 0
+            while (edge < bootstrapCompileEffectEdgeReads.size) {
+                val read = bootstrapCompileEffectEdgeReads[edge]
+                readers[filled[read]] = bootstrapCompileEffectEdgeReaders[edge]
+                filled[read] = filled[read] + 1
+                edge = edge + 1
+            }
+            for (first in grewFirst) {
+                var reader = readerStarts[first]
+                while (reader < readerStarts[first + 1]) {
+                    if (!queued[readers[reader]]) {
+                        queued[readers[reader]] = true
+                        schedule.append(readers[reader])
+                    }
+                    reader = reader + 1
+                }
+            }
+        }
+    }
+    bootstrapCompileEffectReading = -1
+    bootstrapCompileEffectLastReader = []
+    bootstrapCompileEffectEdgeReaders = []
+    bootstrapCompileEffectEdgeReads = []
     summary
 }
 
