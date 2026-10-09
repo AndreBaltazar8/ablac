@@ -573,37 +573,89 @@ fun bootstrapPreparePartitionLlvm(
 // propagation and redundant-load elimination first, parallel O2 codegen next.
 fun bootstrapPrepareParallelLlvm(
     llvmPath: string,
-    preparedPath: string
+    preparedPath: string,
+    text: bool = true
 ): int {
     val prepare = linuxCommand("opt")
     prepare.argument("--threads=1")
     prepare.argument(
         "-passes=default<O1>,function(sccp,gvn,instcombine<no-verify-fixpoint>,simplifycfg),globaldce"
     )
-    prepare.argument("-S")
+    if (text) prepare.argument("-S")
     prepare.argument(llvmPath)
     prepare.argument("-o")
     prepare.argument(preparedPath)
     prepare.run()
 }
 
+// The LTO input: the module after the O1 cleanup, its user-function wrappers internal.
+// Hosted LTO first specializes the universal ABI wrappers while they are
+// visible, then makes them private before whole-program dead-code elimination.
+// Doing both at initial IR emission changes LLVM's inlining order and can leave
+// boxed runtime work on hot indirect-call paths. Bitcode throughout: printing,
+// reading back and parsing well over 100 MB of text cost seconds.
 fun bootstrapPrepareLtoLlvm(
     llvmPath: string,
     preparedPath: string
 ): int {
-    val visiblePath = "$preparedPath.visible.ll"
-    var status = bootstrapPrepareParallelLlvm(llvmPath, visiblePath)
+    val visiblePath = "$preparedPath.visible.bc"
+    var status = bootstrapPrepareParallelLlvm(llvmPath, visiblePath, false)
     if (status == 0) {
-        val visible = Path(visiblePath).readText()
-        val internal = bootstrapInternalizeLlvmUserFunctionWrappers(
-            visible
-        )
-        if (internal != "" && Path(preparedPath).writeTextAtomic(
-            internal
-        )) status = 0
-        else status = 145
+        status = bootstrapInternalizeLlvmUserFunctionWrapperBitcode(visiblePath, preparedPath)
     }
     Path(visiblePath).remove()
+    status
+}
+
+// A user function's wrapper becomes internal once whole-module optimization has seen it: every
+// `abla_fn_` function the backend defined hidden, with external linkage, the C calling
+// convention and a void result and no result attributes, except its direct body
+// (`<name>_direct`), which stays visible. (In text, each `define hidden void @abla_fn_...`
+// that is no `_direct` becomes `define internal void @abla_fn_...`.) Local value names are
+// dropped on the way: nothing after this reads them.
+trusted fun bootstrapInternalizeLlvmUserFunctionWrapperBitcode(
+    inputPath: string,
+    outputPath: string
+): int {
+    val nullPointer = nativeNullPointer()
+    val buffer = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    val module = nativePointerCell(nullPointer)
+    val context = LLVMContextCreate()
+    LLVMContextSetDiscardValueNames(context, i32(1))
+    var status = 0
+    if (LLVMCreateMemoryBufferWithContentsOfFile(
+        inputPath, buffer.address, message.address
+    ) != 0) status = 145
+    // (The module takes the buffer.)
+    if (status == 0 && LLVMParseIRInContext(
+        context, buffer.load(), module.address, message.address
+    ) != 0) status = 145
+    if (status == 0) {
+        var function = LLVMGetFirstFunction(module.load())
+        while (!pointerIsNull(function)) {
+            val name = bootstrapLlvmDebugValueName(function)
+            if (name.size > 8 && name.slice(0, 8) == "abla_fn_" &&
+                !(name.size >= 15 && name.slice(name.size - 7, name.size) == "_direct") &&
+                LLVMIsDeclaration(function) == i32(0) &&
+                LLVMGetLinkage(function) == i32(0) &&
+                LLVMGetVisibility(function) == i32(llvmHiddenVisibility()) &&
+                LLVMGetDLLStorageClass(function) == i32(0) &&
+                LLVMGetFunctionCallConv(function) == i32(0) &&
+                LLVMGetAttributeCountAtIndex(function, i32(0)) == i32(0) &&
+                LLVMGetTypeKind(LLVMGetReturnType(LLVMGlobalGetValueType(function))) == i32(0)) {
+                LLVMSetLinkage(function, i32(llvmInternalLinkage()))
+            }
+            function = LLVMGetNextFunction(function)
+        }
+        if (LLVMWriteBitcodeToFile(module.load(), outputPath) != 0) status = 145
+    }
+    if (!pointerIsNull(module.load())) LLVMDisposeModule(module.load())
+    LLVMContextDispose(context)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    buffer.close()
+    message.close()
+    module.close()
     status
 }
 
@@ -728,61 +780,6 @@ fun bootstrapLlvmUserFunctionSymbols(llvm: string): array<string> {
         } else offset = offset + 1
     }
     symbols
-}
-
-// Hosted LTO first specializes the universal ABI wrappers while they are
-// visible, then makes them private before whole-program dead-code elimination.
-// Doing both at initial IR emission changes LLVM's inlining order and can leave
-// boxed runtime work on hot indirect-call paths.
-fun bootstrapInternalizeLlvmUserFunctionWrappers(llvm: string): string {
-    val prefix = "define hidden void @abla_fn_"
-    val replacement = "define internal void @abla_fn_"
-    val directSuffix = "_direct"
-    val offsets: array<int> = []
-    var offset = 0
-    while (offset + prefix.size < llvm.size) {
-        if (llvm.slice(offset, offset + prefix.size) == prefix) {
-            val nameBegin = offset + prefix.size
-            var nameEnd = nameBegin
-            while (nameEnd < llvm.size && llvm[nameEnd] != 40 &&
-                   llvm[nameEnd] != 32 && llvm[nameEnd] != 10 &&
-                   llvm[nameEnd] != 13) nameEnd = nameEnd + 1
-            val nameSize = nameEnd - nameBegin
-            val direct = nameSize >= directSuffix.size &&
-                llvm.slice(
-                    nameEnd - directSuffix.size, nameEnd
-                ) == directSuffix
-            if (!direct) offsets.append(offset)
-            offset = nameEnd
-        } else offset = offset + 1
-    }
-    val extraBytes = offsets.size * (replacement.size - prefix.size)
-    val output = nativeByteBuffer(llvm.size + extraBytes + 1)
-    var valid = !pointerIsNull(output.address)
-    var source = 0
-    var destination = 0
-    var replacementIndex = 0
-    while (valid && source < llvm.size) {
-        if (replacementIndex < offsets.size &&
-            source == offsets[replacementIndex]) {
-            var byte = 0
-            while (valid && byte < replacement.size) {
-                valid = output.store(destination, replacement[byte])
-                destination = destination + 1
-                byte = byte + 1
-            }
-            source = source + prefix.size
-            replacementIndex = replacementIndex + 1
-        } else {
-            valid = output.store(destination, llvm[source])
-            destination = destination + 1
-            source = source + 1
-        }
-    }
-    var result = ""
-    if (valid) result = output.adoptString(destination)
-    else output.close()
-    result
 }
 
 // ELF linkers can discard unused functions only when code generation places
@@ -1388,7 +1385,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val objectPath = "$outputPath.o"
     val hostPath = "$outputPath.host.o"
     val ltoObjectPath = "$outputPath.lto-program.o"
-    val ltoPreparedPath = "$outputPath.lto-prepared.ll"
+    val ltoPreparedPath = "$outputPath.lto-prepared.bc"
     val combinedObjectPath = "$outputPath.combined.o"
     // The artifact is written beside its output and renamed over it. Darwin's
     // linker signs an image with its file name as the identifier, and a Wasm
