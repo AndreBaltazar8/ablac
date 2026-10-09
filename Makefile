@@ -90,6 +90,7 @@ test: ablac
 	tools/test-wasm-export-extern.sh $(COMPILER)
 	tools/test-wasm-debug-reproducible.sh $(COMPILER)
 	tools/test-build-removed-outputs.sh $(COMPILER)
+	tools/test-value-slot-addresses.sh $(COMPILER)
 	tools/test-float-interpolation.sh $(COMPILER)
 	tools/test-compile-time-branch.sh $(COMPILER)
 	tools/test-floating-point.sh $(COMPILER)

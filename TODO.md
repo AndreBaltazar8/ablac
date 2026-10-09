@@ -133,6 +133,10 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   and 29K `abla_i64` boxing calls. `opt`'s time is mostly the inliner, instcombine and SROA
   undoing it. Passing and returning scalars unboxed would shrink opt and llc time, the Wasm
   and run time together; it is the largest lever left, and a large change.
+  Of the slots `opt` keeps in a 6.7K-function client, two thirds are passed to calls (the
+  boxed argument ABI: string concatenation, field and array stores lead) and most of the
+  rest were pinned by the runtime reading a value through `ablaRuntimeValueAddress`; the
+  backend now addresses the slot itself there, which freed 21% of the kept slots.
 - [ ] **The overload probe is a second semantic analysis.** Once a program has operator
   functions the probe types every body holding a node that may name one (about 4 s and
   1.8 GB of garbage in that program before it skipped the others). With `f64` operator

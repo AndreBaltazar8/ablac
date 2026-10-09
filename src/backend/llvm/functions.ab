@@ -6249,6 +6249,159 @@ fun bootstrapLlvmEmitFunctionReturn(
     return
 }
 
+fun bootstrapLlvmIntegerAccessBytes(type: i64*): int =
+    if (int(LLVMGetTypeKind(type)) == 8) int(LLVMGetIntTypeWidth(type)) / 8
+    else 0
+
+// The runtime reads a value's tag and payload as ablaRuntimeValueAddress plus
+// raw loads, and that ptrtoint pins the value's stack slot: LLVM keeps every
+// slot such a helper is inlined into. Where an address provably is the slot
+// plus a constant (directly, or through a scalar local stored only once) and
+// every access stays inside the slot, address the slot itself: the address is
+// the same and the slot stays promotable. One use of the integer that is not
+// such an access leaves its whole chain as written.
+fun bootstrapLlvmFoldValueSlotAddresses(
+    backend: BootstrapLlvmBackend,
+    llvmFunction: i64*
+): void {
+    var instruction = LLVMGetFirstInstruction(
+        LLVMGetEntryBasicBlock(llvmFunction)
+    )
+    while (!pointerIsNull(instruction)) {
+        val next = LLVMGetNextInstruction(instruction)
+        if (!pointerIsNull(LLVMIsAAllocaInst(instruction)) &&
+            LLVMGetAllocatedType(instruction) == backend.valueType) {
+            var use = LLVMGetFirstUse(instruction)
+            while (!pointerIsNull(use)) {
+                val user = LLVMGetUser(use)
+                use = LLVMGetNextUse(use)
+                if (int(LLVMGetInstructionOpcode(user)) == 39) {
+                    bootstrapLlvmFoldValueSlotAddress(backend, instruction, user)
+                }
+            }
+        }
+        instruction = next
+    }
+}
+
+fun bootstrapLlvmFoldValueSlotAddress(
+    backend: BootstrapLlvmBackend,
+    slot: i64*,
+    address: i64*
+): void {
+    val valueBytes = 24
+    var values: array<i64*> = [address]
+    var offsets: array<int> = [0]
+    var accesses: array<i64*> = []
+    var accessOffsets: array<int> = []
+    var stores: array<i64*> = []
+    var folds = true
+    var index = 0
+    while (folds && index < values.size) {
+        val value = values[index]
+        val offset = offsets[index]
+        var use = LLVMGetFirstUse(value)
+        while (folds && !pointerIsNull(use)) {
+            val user = LLVMGetUser(use)
+            val opcode = int(LLVMGetInstructionOpcode(user))
+            if (opcode == 8) {
+                val left = LLVMGetOperand(user, 0)
+                val other = if (left == value) LLVMGetOperand(user, 1) else left
+                if (other != value && !pointerIsNull(LLVMIsAConstantInt(other))) {
+                    values.append(user)
+                    offsets.append(offset + LLVMConstIntGetSExtValue(other))
+                } else folds = false
+            } else if (opcode == 40) {
+                var accessUse = LLVMGetFirstUse(user)
+                if (pointerIsNull(accessUse)) folds = false
+                while (folds && !pointerIsNull(accessUse)) {
+                    val access = LLVMGetUser(accessUse)
+                    val accessOpcode = int(LLVMGetInstructionOpcode(access))
+                    var bytes = 0
+                    if (accessOpcode == 27) {
+                        bytes = bootstrapLlvmIntegerAccessBytes(LLVMTypeOf(access))
+                    } else if (accessOpcode == 28 &&
+                               LLVMGetOperand(access, 1) == user &&
+                               LLVMGetOperand(access, 0) != user) {
+                        bytes = bootstrapLlvmIntegerAccessBytes(
+                            LLVMTypeOf(LLVMGetOperand(access, 0))
+                        )
+                    }
+                    if (bytes == 0 || offset < 0 || offset + bytes > valueBytes) {
+                        folds = false
+                    }
+                    accessUse = LLVMGetNextUse(accessUse)
+                }
+                accesses.append(user)
+                accessOffsets.append(offset)
+            } else if (opcode == 28 && LLVMGetOperand(user, 0) == value &&
+                       !pointerIsNull(LLVMIsAAllocaInst(LLVMGetOperand(user, 1)))) {
+                val local = LLVMGetOperand(user, 1)
+                var localStores = 0
+                var localUse = LLVMGetFirstUse(local)
+                while (!pointerIsNull(localUse)) {
+                    val localUser = LLVMGetUser(localUse)
+                    val localOpcode = int(LLVMGetInstructionOpcode(localUser))
+                    if (localOpcode == 28 && LLVMGetOperand(localUser, 1) == local &&
+                        LLVMGetOperand(localUser, 0) != local) {
+                        localStores = localStores + 1
+                    } else if (localOpcode != 27) folds = false
+                    localUse = LLVMGetNextUse(localUse)
+                }
+                if (localStores != 1) folds = false
+                if (folds) {
+                    stores.append(user)
+                    localUse = LLVMGetFirstUse(local)
+                    while (!pointerIsNull(localUse)) {
+                        val localUser = LLVMGetUser(localUse)
+                        if (int(LLVMGetInstructionOpcode(localUser)) == 27) {
+                            values.append(localUser)
+                            offsets.append(offset)
+                        }
+                        localUse = LLVMGetNextUse(localUse)
+                    }
+                }
+            } else folds = false
+            use = LLVMGetNextUse(use)
+        }
+        index = index + 1
+    }
+    if (!folds) return
+    index = 0
+    while (index < accesses.size) {
+        val access = accesses[index]
+        LLVMPositionBuilderBefore(backend.builder, access)
+        val indices = llvmPointerVector(1)
+        indices.set(0, LLVMConstInt(backend.i64Type, accessOffsets[index], 1))
+        val field = LLVMBuildGEP2(
+            backend.builder, backend.i8Type, slot, indices.pointer(), 1,
+            "runtime.value.field"
+        )
+        indices.drop()
+        LLVMInstructionSetDebugLoc(field, LLVMInstructionGetDebugLoc(access))
+        LLVMReplaceAllUsesWith(access, field)
+        LLVMInstructionEraseFromParent(access)
+        index = index + 1
+    }
+    // Newest first: a scalar local's loads go before its store, and the
+    // store before the integer it stored.
+    index = values.size - 1
+    while (index >= 0) {
+        val value = values[index]
+        var store = 0
+        while (store < stores.size) {
+            if (!pointerIsNull(stores[store]) &&
+                LLVMGetOperand(stores[store], 0) == value) {
+                LLVMInstructionEraseFromParent(stores[store])
+                stores[store] = nativeNullPointer()
+            }
+            store = store + 1
+        }
+        LLVMInstructionEraseFromParent(value)
+        index = index - 1
+    }
+}
+
 fun bootstrapLlvmEmitFunction(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -7490,6 +7643,13 @@ fun bootstrapLlvmEmitFunction(
         bootstrapLlvmEmitFunctionReturn(
             backend, function, storage, function.result, output
         )
+    }
+    var addressesValues = false
+    for (instruction in function.instructions) {
+        if (instruction.text == "ablaRuntimeValueAddress") addressesValues = true
+    }
+    if (addressesValues && errors == 0) {
+        bootstrapLlvmFoldValueSlotAddresses(backend, llvmFunction)
     }
     errors
 }
