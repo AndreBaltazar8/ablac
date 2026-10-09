@@ -177,38 +177,12 @@ fun bootstrapOwnershipPlacesConflict(
     conflict
 }
 
-fun bootstrapOwnerHasField(
-    declarations: array<BootstrapDeclaration>,
-    owner: string,
-    name: string
-): bool {
-    var found = false
-    var declaration = 0
-    while (declaration < declarations.size) {
-        val candidate = declarations[declaration]
-        if (candidate.name == owner) {
-            var field = 0
-            while (field < candidate.parameters.size) {
-                if (candidate.parameters[field] == name &&
-                    field < candidate.parameterKinds.size &&
-                    (candidate.parameterKinds[field] == "val" ||
-                     candidate.parameterKinds[field] == "var")) {
-                    found = true
-                }
-                field = field + 1
-            }
-        }
-        declaration = declaration + 1
-    }
-    found
-}
-
 // `this`, or a bare field name no parameter or local shadows here.
 // `aliases` are loop variables over the receiver's arrays (`for (n in
 // this.nodes)`): mutating through them mutates the receiver.
 fun bootstrapReceiverPlaceRoot(
     expression: BootstrapExpression,
-    declarations: array<BootstrapDeclaration>,
+    fields: BootstrapSummaryFields,
     owner: string,
     shadowed: array<string>,
     aliases: array<string>
@@ -216,7 +190,7 @@ fun bootstrapReceiverPlaceRoot(
     val root = bootstrapPlaceRootName(expression)
     root == "this" || (!bootstrapAffineNamesContain(shadowed, root) &&
         (bootstrapAffineNamesContain(aliases, root) ||
-         bootstrapOwnerHasField(declarations, owner, root)))
+         fields.stored.contains("$owner\n$root")))
 }
 
 fun bootstrapNamesWith(names: array<string>, more: array<string>): array<string> {
@@ -226,35 +200,55 @@ fun bootstrapNamesWith(names: array<string>, more: array<string>): array<string>
     result
 }
 
+// The fields of every declaration by `owner\nfield`: the normalized type of
+// the field (the last declaration and field of the name decide) and whether a
+// declaration of that name has it as a `val`/`var` field. The receiver-mutation
+// summary asks for every member of every body, every pass.
+class BootstrapSummaryFields(
+    val typed: BootstrapStringSet,
+    val types: array<string>,
+    val stored: BootstrapStringSet
+)
+
+fun bootstrapSummaryFields(
+    declarations: array<BootstrapDeclaration>
+): BootstrapSummaryFields {
+    val typed = bootstrapStringSet()
+    val types: array<string> = []
+    val stored = bootstrapStringSet()
+    for (candidate in declarations) {
+        var index = 0
+        while (index < candidate.parameters.size) {
+            val key = "${candidate.name}\n${candidate.parameters[index]}"
+            if (index < candidate.parameterTypes.size) {
+                val known = typed.keys.size
+                typed.add(key)
+                if (typed.keys.size > known) types.append("")
+                types[typed.indexOf(key)] = bootstrapNormalizeType(
+                    candidate.parameterTypes[index]
+                )
+            }
+            if (index < candidate.parameterKinds.size &&
+                (candidate.parameterKinds[index] == "val" ||
+                 candidate.parameterKinds[index] == "var")) stored.add(key)
+            index = index + 1
+        }
+    }
+    BootstrapSummaryFields(typed, types, stored)
+}
+
 fun bootstrapSummaryFieldType(
-    declarations: array<BootstrapDeclaration>,
+    fields: BootstrapSummaryFields,
     owner: string,
     field: string
 ): string {
-    var result = "unknown"
-    var declaration = 0
-    while (declaration < declarations.size) {
-        val candidate = declarations[declaration]
-        if (candidate.name == owner) {
-            var index = 0
-            while (index < candidate.parameters.size &&
-                   index < candidate.parameterTypes.size) {
-                if (candidate.parameters[index] == field) {
-                    result = bootstrapNormalizeType(
-                        candidate.parameterTypes[index]
-                    )
-                }
-                index = index + 1
-            }
-        }
-        declaration = declaration + 1
-    }
-    result
+    val key = fields.typed.indexOf("$owner\n$field")
+    if (key >= 0) fields.types[key] else "unknown"
 }
 
 fun bootstrapSummaryReceiverType(
     expression: BootstrapExpression,
-    declarations: array<BootstrapDeclaration>,
+    fields: BootstrapSummaryFields,
     owner: string
 ): string {
     var result = "unknown"
@@ -264,12 +258,12 @@ fun bootstrapSummaryReceiverType(
     if (expression.kind == "member" && expression.children.size > 0) {
         val receiver = bootstrapSummaryReceiverType(
             expression.children[0],
-            declarations,
+            fields,
             owner
         )
         if (receiver != "unknown") {
             result = bootstrapSummaryFieldType(
-                declarations,
+                fields,
                 receiver,
                 expression.text
             )
@@ -480,17 +474,18 @@ fun bootstrapExpressionMayMutateReceiver(
     owner: string,
     summary: BootstrapMutableReceiverSummary,
     exclusive: BootstrapExclusiveArguments,
+    fields: BootstrapSummaryFields,
     shadowed: array<string>,
     aliases: array<string>
 ): bool {
     var mutates = expression.kind == "assign" &&
         !bootstrapAffineNamesContain(shadowed, expression.text) &&
-        bootstrapOwnerHasField(declarations, owner, expression.text)
+        fields.stored.contains("$owner\n${expression.text}")
     if (!mutates && expression.kind == "member.assign" &&
         expression.children.size > 0) {
         mutates = bootstrapReceiverPlaceRoot(
             expression.children[0],
-            declarations,
+            fields,
             owner,
             shadowed,
             aliases
@@ -500,7 +495,7 @@ fun bootstrapExpressionMayMutateReceiver(
         expression.children.size > 0) {
         mutates = bootstrapReceiverPlaceRoot(
             expression.children[0],
-            declarations,
+            fields,
             owner,
             shadowed,
             aliases
@@ -510,7 +505,7 @@ fun bootstrapExpressionMayMutateReceiver(
         expression.children.size > 0) {
         val receiverType = bootstrapSummaryReceiverType(
             expression.children[0],
-            declarations,
+            fields,
             owner
         )
         if ((expression.text == "append" || expression.text == "truncate" ||
@@ -524,7 +519,7 @@ fun bootstrapExpressionMayMutateReceiver(
              )) &&
             bootstrapReceiverPlaceRoot(
                 expression.children[0],
-                declarations,
+                fields,
                 owner,
                 shadowed,
                 aliases
@@ -538,7 +533,7 @@ fun bootstrapExpressionMayMutateReceiver(
                     argument - 1
                 ) && bootstrapReceiverPlaceRoot(
                     expression.children[argument],
-                    declarations,
+                    fields,
                     owner,
                     shadowed,
                     aliases
@@ -556,7 +551,7 @@ fun bootstrapExpressionMayMutateReceiver(
                     argument
                 ) && bootstrapReceiverPlaceRoot(
                     expression.children[argument],
-                    declarations,
+                    fields,
                     owner,
                     shadowed,
                     aliases
@@ -583,7 +578,7 @@ fun bootstrapExpressionMayMutateReceiver(
     // shadows a field of its name.
     val aliasing = expression.kind == "for" && expression.children.size > 1 &&
         bootstrapReceiverPlaceRoot(
-            expression.children[0], declarations, owner, shadowed, aliases
+            expression.children[0], fields, owner, shadowed, aliases
         )
     while (!mutates && child < expression.children.size) {
         val found = expression.children[child]
@@ -594,6 +589,7 @@ fun bootstrapExpressionMayMutateReceiver(
             owner,
             summary,
             exclusive,
+            fields,
             if (body && !aliasing) {
                 bootstrapNamesWith(scope, [expression.text])
             } else scope,
@@ -619,6 +615,7 @@ fun bootstrapBuildMutableReceiverSummary(
     // and the exclusive argument positions once.
     val managedTypes = bootstrapManagedTypeIndex(declarations)
     val exclusive = bootstrapExclusiveArgumentsOf(declarations)
+    val fields = bootstrapSummaryFields(declarations)
     var changed = true
     while (changed) {
         changed = false
@@ -645,6 +642,7 @@ fun bootstrapBuildMutableReceiverSummary(
                     extensionOwner,
                     summary,
                     exclusive,
+                    fields,
                     candidate.parameters,
                     []
                 )) {
@@ -671,6 +669,7 @@ fun bootstrapBuildMutableReceiverSummary(
                             candidate.name,
                             summary,
                             exclusive,
+                            fields,
                             found.parameters,
                             []
                         )) {
