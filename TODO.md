@@ -107,6 +107,20 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   6.5 s while llc drops 11.0 → 3.5 s, so wall time is unchanged, total cycles grow 16% and
   the dev wasm grows 240 KB of data (constants stop merging across parts).
   Release (LTO) and native builds still pass LLVM text between their steps.
+- [ ] **A release Wasm module is optimized four times** (`opt` O1, clang's O2 pre-link,
+  wasm-ld's LTO O3, wasm-opt -O3; for a large game client about 28, 27, 70 and 35 s of a
+  165 s build). Dropping a pre-link stage does not pay: its work moves into the later ones.
+  Measured on that client (two alternating rounds; runtime from a simulation module's
+  ticks, three rounds of nine):
+
+  | Path | Total | Client size | Runtime |
+  |---|---|---|---|
+  | as built (A) | 169 s | 6,423,340 B | baseline |
+  | no clang O2 pre-link (B) | 167 s | +0.15% | same within noise |
+  | no `opt` O1 (C) | 169 s | −1.8% | same within noise |
+
+  C is a possible free size win; it would need a native release build's and a client's
+  frame-time check before it changes anything.
 - [ ] **`llc`'s peak on a large Wasm module** (~1.9 GB for that client's 31 MB of bitcode,
   most of the build's peak): loading the module takes 0.5 GB, and the rest is machine code
   for every function held at once, because WebAssembly's code generation runs a module pass
