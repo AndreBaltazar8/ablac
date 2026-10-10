@@ -1,4 +1,6 @@
 import "subparser.ab"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
 
 fun bootstrapSemanticUnit(): void {}
 
@@ -892,6 +894,37 @@ fun bootstrapBorrowSourceMatchesContract(
     matches
 }
 
+/** What `declaration` makes bootstrapBorrowCallResultSource's `source` (a later match wins). */
+fun bootstrapBorrowCallResultSourceAt(
+    declaration: BootstrapDeclaration,
+    owner: string,
+    name: string,
+    source: string
+): string {
+    var result = source
+    if (owner == "" && declaration.extensionOwner == "" &&
+        declaration.name == name && (declaration.kind == "fun" ||
+        declaration.kind == "compile.fun")) {
+        result = bootstrapBorrowResultSource(declaration.resultType)
+    }
+    if (owner != "" && declaration.name == name &&
+        bootstrapNormalizeType(declaration.extensionOwner) == owner) {
+        result = bootstrapBorrowResultSource(declaration.resultType)
+    }
+    if (owner != "" && declaration.name == owner) {
+        var method = 0
+        while (method < declaration.methods.size) {
+            if (declaration.methods[method].name == name) {
+                result = bootstrapBorrowResultSource(
+                    declaration.methods[method].resultType
+                )
+            }
+            method = method + 1
+        }
+    }
+    result
+}
+
 fun bootstrapBorrowCallResultSource(
     declarations: array<BootstrapDeclaration>,
     owner: string,
@@ -900,30 +933,64 @@ fun bootstrapBorrowCallResultSource(
     var source = ""
     var declarationIndex = 0
     while (declarationIndex < declarations.size) {
-        val declaration = declarations[declarationIndex]
-        if (owner == "" && declaration.extensionOwner == "" &&
-            declaration.name == name && (declaration.kind == "fun" ||
-            declaration.kind == "compile.fun")) {
-            source = bootstrapBorrowResultSource(declaration.resultType)
-        }
-        if (owner != "" && declaration.name == name &&
-            bootstrapNormalizeType(declaration.extensionOwner) == owner) {
-            source = bootstrapBorrowResultSource(declaration.resultType)
-        }
-        if (owner != "" && declaration.name == owner) {
-            var method = 0
-            while (method < declaration.methods.size) {
-                if (declaration.methods[method].name == name) {
-                    source = bootstrapBorrowResultSource(
-                        declaration.methods[method].resultType
-                    )
-                }
-                method = method + 1
-            }
-        }
+        source = bootstrapBorrowCallResultSourceAt(
+            declarations[declarationIndex], owner, name, source
+        )
         declarationIndex = declarationIndex + 1
     }
     source
+}
+
+/** The index of `parameters`' last entry equal to `source`, else `result`. */
+fun bootstrapBorrowParameterMatch(
+    parameters: array<string>,
+    source: string,
+    result: int
+): int {
+    var found = result
+    var parameter = 0
+    while (parameter < parameters.size) {
+        if (parameters[parameter] == source) found = parameter
+        parameter = parameter + 1
+    }
+    found
+}
+
+/** What `declaration` makes bootstrapBorrowCallResultParameter's `result` (a later match wins). */
+fun bootstrapBorrowCallResultParameterAt(
+    declaration: BootstrapDeclaration,
+    owner: string,
+    name: string,
+    source: string,
+    result: int
+): int {
+    var found = result
+    if (owner == "" && declaration.extensionOwner == "" &&
+        declaration.name == name && (declaration.kind == "fun" ||
+        declaration.kind == "compile.fun")) {
+        found = bootstrapBorrowParameterMatch(
+            declaration.parameters, source, found
+        )
+    }
+    if (owner != "" && declaration.name == name &&
+        bootstrapNormalizeType(declaration.extensionOwner) == owner) {
+        found = bootstrapBorrowParameterMatch(
+            declaration.parameters, source, found
+        )
+    }
+    if (owner != "" && declaration.name == owner) {
+        var method = 0
+        while (method < declaration.methods.size) {
+            val candidate = declaration.methods[method]
+            if (candidate.name == name) {
+                found = bootstrapBorrowParameterMatch(
+                    candidate.parameters, source, found
+                )
+            }
+            method = method + 1
+        }
+    }
+    found
 }
 
 fun bootstrapBorrowCallResultParameter(
@@ -935,45 +1002,81 @@ fun bootstrapBorrowCallResultParameter(
     var result = -1
     var declarationIndex = 0
     while (declarationIndex < declarations.size) {
-        val declaration = declarations[declarationIndex]
-        if (owner == "" && declaration.extensionOwner == "" &&
-            declaration.name == name && (declaration.kind == "fun" ||
-            declaration.kind == "compile.fun")) {
-            var parameter = 0
-            while (parameter < declaration.parameters.size) {
-                if (declaration.parameters[parameter] == source) {
-                    result = parameter
-                }
-                parameter = parameter + 1
-            }
-        }
-        if (owner != "" && declaration.name == name &&
-            bootstrapNormalizeType(declaration.extensionOwner) == owner) {
-            var parameter = 0
-            while (parameter < declaration.parameters.size) {
-                if (declaration.parameters[parameter] == source) {
-                    result = parameter
-                }
-                parameter = parameter + 1
-            }
-        }
-        if (owner != "" && declaration.name == owner) {
-            var method = 0
-            while (method < declaration.methods.size) {
-                val found = declaration.methods[method]
-                if (found.name == name) {
-                    var parameter = 0
-                    while (parameter < found.parameters.size) {
-                        if (found.parameters[parameter] == source) {
-                            result = parameter
-                        }
-                        parameter = parameter + 1
-                    }
-                }
-                method = method + 1
-            }
-        }
+        result = bootstrapBorrowCallResultParameterAt(
+            declarations[declarationIndex], owner, name, source, result
+        )
         declarationIndex = declarationIndex + 1
+    }
+    result
+}
+
+// A declaration matters to a call's borrow result only when it is named like
+// the call or like its owner, so the indexed lookups visit just those two
+// lists of `names`, merged in declaration order: the scans' order, so a later
+// match still wins.
+class BootstrapBorrowCandidates(
+    val names: BootstrapDeclarationNameIndex,
+    var nameNode: int,
+    var ownerNode: int
+) {
+    /** The next candidate's declaration index, or -1. */
+    fun next(): int {
+        var node = this.nameNode
+        if (node < 0 || (this.ownerNode >= 0 &&
+            this.names.nodeDeclarations[this.ownerNode] <
+                this.names.nodeDeclarations[node])) {
+            node = this.ownerNode
+            if (node >= 0) this.ownerNode = this.names.nodeNexts[node]
+        } else this.nameNode = this.names.nodeNexts[node]
+        if (node >= 0) this.names.nodeDeclarations[node] else -1
+    }
+}
+
+fun bootstrapBorrowCandidates(
+    names: BootstrapDeclarationNameIndex,
+    owner: string,
+    name: string
+): BootstrapBorrowCandidates = BootstrapBorrowCandidates(
+    names,
+    names.first(name),
+    if (owner != "" && owner != name) names.first(owner) else -1
+)
+
+/** bootstrapBorrowCallResultSource through `names`, the index of `declarations`. */
+fun bootstrapBorrowCallResultSourceIndexed(
+    declarations: array<BootstrapDeclaration>,
+    names: BootstrapDeclarationNameIndex,
+    owner: string,
+    name: string
+): string {
+    var source = ""
+    val candidates = bootstrapBorrowCandidates(names, owner, name)
+    var declaration = candidates.next()
+    while (declaration >= 0) {
+        source = bootstrapBorrowCallResultSourceAt(
+            declarations[declaration], owner, name, source
+        )
+        declaration = candidates.next()
+    }
+    source
+}
+
+/** bootstrapBorrowCallResultParameter through `names`, the index of `declarations`. */
+fun bootstrapBorrowCallResultParameterIndexed(
+    declarations: array<BootstrapDeclaration>,
+    names: BootstrapDeclarationNameIndex,
+    owner: string,
+    name: string,
+    source: string
+): int {
+    var result = -1
+    val candidates = bootstrapBorrowCandidates(names, owner, name)
+    var declaration = candidates.next()
+    while (declaration >= 0) {
+        result = bootstrapBorrowCallResultParameterAt(
+            declarations[declaration], owner, name, source, result
+        )
+        declaration = candidates.next()
     }
     result
 }
@@ -4157,6 +4260,88 @@ fun bootstrapFunctionDeclarationHash(name: string): int {
     hash
 }
 
+// Every declaration's index by name, in declaration order. A lookup walks a name's
+// list where it scanned every declaration (the evaluator's globals, the borrow
+// checker's call results); each still checks its own kinds, so it meets the same
+// declarations in the same order.
+class BootstrapDeclarationNameIndex(
+    val names: array<string>,
+    val firsts: array<int>,
+    val lasts: array<int>,
+    val nodeDeclarations: array<int>,
+    val nodeNexts: array<int>,
+    val slots: array<int>
+) {
+    /** The first node of `name`'s list, or -1. */
+    fun first(name: string): int {
+        var result = -1
+        if (this.slots.size > 0) {
+            var slot = bootstrapFunctionDeclarationHash(name)
+            slot = slot - slot / this.slots.size * this.slots.size
+            var probes = 0
+            while (result < 0 && probes < this.slots.size &&
+                   this.slots[slot] >= 0) {
+                val entry = this.slots[slot]
+                if (this.names[entry] == name) {
+                    result = this.firsts[entry]
+                } else {
+                    slot = slot + 1
+                    if (slot == this.slots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapDeclarationNameIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapDeclarationNameIndex {
+    var capacity = 8
+    while (capacity < declarations.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    val names: array<string> = []
+    val firsts: array<int> = []
+    val lasts: array<int> = []
+    val nodeDeclarations: array<int> = []
+    val nodeNexts: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val name = declarations[declaration].name
+        val node = nodeDeclarations.size
+        nodeDeclarations.append(declaration)
+        nodeNexts.append(-1)
+        slot = bootstrapFunctionDeclarationHash(name)
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0) {
+                slots[slot] = names.size
+                names.append(name)
+                firsts.append(node)
+                lasts.append(node)
+                placed = true
+            } else if (names[existing] == name) {
+                nodeNexts[lasts[existing]] = node
+                lasts[existing] = node
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        declaration = declaration + 1
+    }
+    BootstrapDeclarationNameIndex(names, firsts, lasts, nodeDeclarations, nodeNexts, slots)
+}
+
 // Top-level (non-extension) declarations by name: how many share each name and
 // the index of the first. Name resolution asks this for every identifier.
 class BootstrapTopLevelNameIndex(
@@ -4632,6 +4817,10 @@ class BootstrapAnalyzer(
     val functionDeclarations: BootstrapFunctionDeclarationIndex,
     val typeDeclarations: BootstrapFunctionDeclarationIndex,
     val methodDeclarations: BootstrapMethodDeclarationIndex,
+    // Every declaration by name; ABLA_BORROW_INDEX_CHECK=1 checks the borrow
+    // lookups that use it against a scan of every declaration.
+    val declarationNames: BootstrapDeclarationNameIndex,
+    val borrowIndexCheck: bool,
     val affineTypes: array<string>,
     val mutableReceivers: BootstrapMutableReceiverSummary,
     val regionCalls: BootstrapRegionCallSummary,
@@ -7160,6 +7349,51 @@ class BootstrapAnalyzer(
         found
     }
 
+    // A call's borrow result contract and the parameter it names, through
+    // declarationNames while it covers every declaration (else by a scan).
+    fun borrowCallResultSource(owner: string, name: string): string {
+        val indexed =
+            this.declarationNames.nodeDeclarations.size == this.declarations.size
+        val source = if (indexed) bootstrapBorrowCallResultSourceIndexed(
+            this.declarations, this.declarationNames, owner, name
+        ) else bootstrapBorrowCallResultSource(this.declarations, owner, name)
+        if (this.borrowIndexCheck) {
+            val scanned =
+                bootstrapBorrowCallResultSource(this.declarations, owner, name)
+            if (scanned != source) {
+                linuxPrintStandardError(
+                    "error[E_INTERNAL]: borrow.index-check: the result source of `$owner`.`$name` is `$source`, a scan finds `$scanned`\n"
+                )
+            }
+        }
+        source
+    }
+
+    fun borrowCallResultParameter(
+        owner: string,
+        name: string,
+        source: string
+    ): int {
+        val indexed =
+            this.declarationNames.nodeDeclarations.size == this.declarations.size
+        val parameter = if (indexed) bootstrapBorrowCallResultParameterIndexed(
+            this.declarations, this.declarationNames, owner, name, source
+        ) else bootstrapBorrowCallResultParameter(
+            this.declarations, owner, name, source
+        )
+        if (this.borrowIndexCheck) {
+            val scanned = bootstrapBorrowCallResultParameter(
+                this.declarations, owner, name, source
+            )
+            if (scanned != parameter) {
+                linuxPrintStandardError(
+                    "error[E_INTERNAL]: borrow.index-check: the result parameter of `$owner`.`$name` for `$source` is $parameter, a scan finds $scanned\n"
+                )
+            }
+        }
+        parameter
+    }
+
     fun borrowArgumentSource(expression: BootstrapExpression): string {
         var source = this.borrowExpressionSource(expression)
         if (source == "") {
@@ -7188,17 +7422,11 @@ class BootstrapAnalyzer(
             }
         }
         if (expression.kind == "call") {
-            val contract = bootstrapBorrowCallResultSource(
-                this.declarations,
-                "",
-                expression.text
-            )
-            val parameter = bootstrapBorrowCallResultParameter(
-                this.declarations,
-                "",
-                expression.text,
-                contract
-            )
+            val contract = this.borrowCallResultSource("", expression.text)
+            // With no contract the parameter is never read.
+            val parameter = if (contract != "") this.borrowCallResultParameter(
+                "", expression.text, contract
+            ) else -1
             if (contract != "" && parameter >= 0 &&
                 parameter < expression.children.size) {
                 source = this.borrowArgumentSource(
@@ -7227,20 +7455,14 @@ class BootstrapAnalyzer(
             val receiverType = bootstrapBorrowElementType(
                 this.infer(expression.children[0])
             )
-            val contract = bootstrapBorrowCallResultSource(
-                this.declarations,
-                receiverType,
-                expression.text
-            )
+            val contract =
+                this.borrowCallResultSource(receiverType, expression.text)
             if (contract == "this") {
                 source = this.borrowArgumentSource(expression.children[0])
             }
             if (contract != "" && contract != "this") {
-                val parameter = bootstrapBorrowCallResultParameter(
-                    this.declarations,
-                    receiverType,
-                    expression.text,
-                    contract
+                val parameter = this.borrowCallResultParameter(
+                    receiverType, expression.text, contract
                 )
                 if (parameter >= 0 &&
                     parameter + 1 < expression.children.size) {
@@ -10335,6 +10557,7 @@ fun bootstrapAnalyzer(
     val methodDeclarations = bootstrapMethodDeclarationIndex(
         parsed.declarations
     )
+    val borrowIndexCheck = linuxEnvironment("ABLA_BORROW_INDEX_CHECK")
     BootstrapAnalyzer(
         symbols,
         [],
@@ -10345,6 +10568,8 @@ fun bootstrapAnalyzer(
         functionDeclarations,
         typeDeclarations,
         methodDeclarations,
+        bootstrapDeclarationNameIndex(parsed.declarations),
+        borrowIndexCheck.found && borrowIndexCheck.value == "1",
         affineTypes,
         mutableReceivers,
         regionCalls,
