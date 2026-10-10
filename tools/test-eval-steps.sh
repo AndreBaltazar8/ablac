@@ -43,4 +43,47 @@ if [[ $status -ne 105 ]]; then
     exit 1
 fi
 
-echo "eval-steps: the program takes exactly $steps compile-time steps"
+# Past the limit the evaluator evaluates nothing more: a loop the limit cuts
+# short is not followed by code that would fault on what it left behind
+# (stopped.ab), and a value it never finished still lowers (partial.ab).
+for case in stopped partial; do
+    source="$project_root/tests/cases/eval-steps/$case.ab"
+    set +e
+    ABLA_EVAL_STEP_LIMIT=100 "$compiler" --emit-llvm "$source" \
+        >"$output_directory/$case.out" 2>&1
+    status=$?
+    set -e
+    if [[ $status -ne 1 ]] ||
+        ! grep -Fq "error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past 100 steps" \
+            "$output_directory/$case.out"; then
+        echo "eval-steps: $case.ab stopped at the limit exited $status without reporting it" >&2
+        sed -n '1,20p' "$output_directory/$case.out" >&2
+        exit 1
+    fi
+    "$compiler" build "$source" -o "$output_directory/$case" --no-cache
+    set +e
+    "$project_root/tools/run-limited.sh" "$output_directory/$case"
+    status=$?
+    set -e
+    if [[ $status -ne 42 ]]; then
+        echo "eval-steps: $case.ab without the limit: expected 42, got $status" >&2
+        exit 1
+    fi
+done
+
+# The same missing element without any limit: a compile-time index out of
+# range is reported, not a backend fault.
+element="$project_root/tests/cases/eval-steps/element.ab"
+set +e
+"$compiler" --emit-llvm "$element" >"$output_directory/element.out" 2>&1
+status=$?
+set -e
+if [[ $status -ne 1 ]] ||
+    ! grep -Fq "error[E_EVAL_EXPRESSION]: compile-time evaluation failed while evaluating \`index\`" \
+        "$output_directory/element.out"; then
+    echo "eval-steps: element.ab exited $status without reporting the failed index" >&2
+    sed -n '1,20p' "$output_directory/element.out" >&2
+    exit 1
+fi
+
+echo "eval-steps: the program takes exactly $steps compile-time steps; the limit stops evaluation"
