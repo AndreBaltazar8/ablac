@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <malloc/malloc.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -762,4 +763,12 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
   if (result == -1)
     return -(int64_t)linux_errno(errno);
   return (int64_t)result;
+}
+
+// glibc's malloc_trim, which the compiler calls once a build's front-end heap is
+// collected: here every malloc zone gives its free pages back.
+int malloc_trim(size_t pad) {
+  (void)pad;
+  malloc_zone_pressure_relief(NULL, 0);
+  return 1;
 }
