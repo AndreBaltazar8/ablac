@@ -48,6 +48,7 @@ fixtures=(
     invalid-staged-method-borrow-active-move
     invalid-staged-borrow-return-active-move
     invalid-staged-indirect-borrow-return-active-move
+    invalid-borrow-mutating-receiver-later-extension
 )
 diagnostics=(
     'error[E_BORROW_CONFLICT]: in `main`, `owner` is changed while `view`'
@@ -75,6 +76,7 @@ diagnostics=(
     'error[E_BORROW_CONFLICT]: in `Inspector_invalidBorrowLifetime`, `owner` is changed while `view`'
     'error[E_BORROW_CONFLICT]: in `invalidReturnedBorrowLifetime`, `owner` is changed while `borrowed`'
     'error[E_BORROW_CONFLICT]: in `invalidIndirectBorrowLifetime`, `owner` is changed while `borrowed`'
+    'error[E_BORROW_CONFLICT]: in `main`, `holder.handle` is changed while `view`'
 )
 
 index=0

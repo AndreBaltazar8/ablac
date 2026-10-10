@@ -274,22 +274,85 @@ fun bootstrapSummaryReceiverType(
     bootstrapBorrowElementType(result)
 }
 
+// The owner and method pairs whose receiver may be mutated, in the order they were
+// found. `keys` holds their bootstrapMethodDeclarationKey and `slots` an open-addressed
+// table of them that grows in place, so a membership question needs no scan.
+// ABLA_RECEIVER_INDEX_CHECK=1 checks each answer against one.
 class BootstrapMutableReceiverSummary(
     val owners: array<string>,
-    val methods: array<string>
+    val methods: array<string>,
+    val keys: array<string>,
+    val slots: array<int>,
+    val check: bool
 )
+
+/** The slot of `key` in `summary`'s table, or the empty one where it would go. */
+fun bootstrapMutableReceiverSlot(
+    summary: BootstrapMutableReceiverSummary,
+    key: string
+): int {
+    var slot = bootstrapFunctionDeclarationHash(key)
+    slot = slot - slot / summary.slots.size * summary.slots.size
+    while (summary.slots[slot] >= 0 && summary.keys[summary.slots[slot]] != key) {
+        slot = slot + 1
+        if (slot == summary.slots.size) slot = 0
+    }
+    slot
+}
+
+fun bootstrapMutableReceiverAdd(
+    var summary: BootstrapMutableReceiverSummary,
+    owner: string,
+    method: string
+): void {
+    summary.owners.append(owner)
+    summary.methods.append(method)
+    if ((summary.keys.size + 1) * 2 >= summary.slots.size) {
+        val capacity = summary.slots.size * 2
+        while (summary.slots.size < capacity) summary.slots.append(-1)
+        var slot = 0
+        while (slot < summary.slots.size) {
+            summary.slots[slot] = -1
+            slot = slot + 1
+        }
+        var entry = 0
+        while (entry < summary.keys.size) {
+            summary.slots[
+                bootstrapMutableReceiverSlot(summary, summary.keys[entry])
+            ] = entry
+            entry = entry + 1
+        }
+    }
+    val key = bootstrapMethodDeclarationKey(owner, method)
+    val slot = bootstrapMutableReceiverSlot(summary, key)
+    if (summary.slots[slot] < 0) {
+        summary.slots[slot] = summary.keys.size
+        summary.keys.append(key)
+    }
+    return
+}
 
 fun bootstrapMutableReceiverContains(
     summary: BootstrapMutableReceiverSummary,
     owner: string,
     method: string
 ): bool {
-    var found = false
-    var index = 0
-    while (!found && index < summary.owners.size) {
-        if (summary.owners[index] == owner &&
-            summary.methods[index] == method) found = true
-        index = index + 1
+    val found = summary.slots[bootstrapMutableReceiverSlot(
+        summary, bootstrapMethodDeclarationKey(owner, method)
+    )] >= 0
+    if (summary.check) {
+        var scanned = false
+        var index = 0
+        while (!scanned && index < summary.owners.size) {
+            if (summary.owners[index] == owner &&
+                summary.methods[index] == method) scanned = true
+            index = index + 1
+        }
+        if (scanned != found) {
+            linuxPrintStandardError(
+                "error[E_INTERNAL]: receiver.index-check: `$owner`.`$method` is $found, a scan finds $scanned\n"
+            )
+        }
     }
     found
 }
@@ -612,7 +675,11 @@ fun bootstrapBuildMutableReceiverSummary(
     declarations: array<BootstrapDeclaration>,
     affineTypes: array<string>
 ): BootstrapMutableReceiverSummary {
-    val summary = BootstrapMutableReceiverSummary([], [])
+    val check = linuxEnvironment("ABLA_RECEIVER_INDEX_CHECK")
+    val summary = BootstrapMutableReceiverSummary(
+        [], [], [], [-1, -1, -1, -1, -1, -1, -1, -1],
+        check.found && check.value == "1"
+    )
     // Asked for every declaration on every pass: index the class/interface names
     // and the exclusive argument positions once.
     val managedTypes = bootstrapManagedTypeIndex(declarations)
@@ -648,8 +715,7 @@ fun bootstrapBuildMutableReceiverSummary(
                     candidate.parameters,
                     []
                 )) {
-                summary.owners.append(extensionOwner)
-                summary.methods.append(candidate.name)
+                bootstrapMutableReceiverAdd(summary, extensionOwner, candidate.name)
                 changed = true
             }
             if (bootstrapSummaryTypeIsAffine(candidate.name, affineTypes) ||
@@ -675,8 +741,7 @@ fun bootstrapBuildMutableReceiverSummary(
                             found.parameters,
                             []
                         )) {
-                        summary.owners.append(candidate.name)
-                        summary.methods.append(found.name)
+                        bootstrapMutableReceiverAdd(summary, candidate.name, found.name)
                         changed = true
                     }
                     method = method + 1
@@ -4254,7 +4319,11 @@ fun bootstrapFunctionDeclarationHash(name: string): int {
     var index = 0
     while (index < name.size) {
         hash = hash * 131 + name[index]
-        hash = hash - hash / 2147483647 * 2147483647
+        // The remainder modulo 2^31 - 1 without a division (as bootstrapIrLookupHash):
+        // hash * 131 + byte is below 2^39, and 2^31 is 1, so one fold and at most one
+        // subtraction give the same value, so every table keeps its slots.
+        hash = (hash & 2147483647) + (hash >>> 31)
+        if (hash >= 2147483647) hash = hash - 2147483647
         index = index + 1
     }
     hash
