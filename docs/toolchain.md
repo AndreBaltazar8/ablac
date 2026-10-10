@@ -50,7 +50,15 @@ Programmable external targets can additionally request a generic `module`
 artifact. The current WebAssembly linker produces a no-entry module, preserves
 explicit foreign exports, retains unresolved symbols from explicit foreign
 declarations as ordinary `env` function imports, and strips PID-bearing name
-metadata for byte-level reproducibility. A build with debug information keeps
+metadata for byte-level reproducibility. `@wasmImport("module")` on an
+`extern:"c"` declaration imports it from that module instead of `env`;
+`@wasmImport(["module", "field"])` also renames the import field, which
+otherwise is the symbol name. Other targets ignore the annotation:
+
+```abla
+@wasmImport("wasi_snapshot_preview1")
+trusted noescape extern:"c" fun fd_write(fd: i32, iovs: i32, count: i32, written: i32): i32
+``` A build with debug information keeps
 the function names and publishes `<module>.map` and `<module>.debug.wasm`
 beside the module.
 

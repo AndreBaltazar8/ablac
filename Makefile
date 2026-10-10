@@ -91,6 +91,7 @@ test: ablac
 	tools/test-line-continuation.sh $(COMPILER)
 	tools/test-ownership-shadows-and-globals.sh $(COMPILER)
 	tools/test-wasm-export-extern.sh $(COMPILER)
+	tools/test-wasm-import-module.sh $(COMPILER)
 	tools/test-wasm-debug-reproducible.sh $(COMPILER)
 	tools/test-rewritten-module-diagnostics.sh $(COMPILER)
 	tools/test-build-removed-outputs.sh $(COMPILER)
