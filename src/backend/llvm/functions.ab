@@ -6402,6 +6402,25 @@ fun bootstrapLlvmFoldValueSlotAddress(
     }
 }
 
+// The release WebAssembly module initializer is optnone and straight-line, and
+// WebAssembly's register stackifier (which runs on it all the same) is quadratic in a
+// block's length: on a large client one 71K-instruction block took a quarter of the
+// link's code generation. Plain branches into fresh blocks bound that. The body has no
+// phis, so a cut between two IR instructions changes no value.
+fun bootstrapLlvmInitializerChunkFor(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction
+): int {
+    if (function.name != "__bootstrap_globals" ||
+        !bootstrapTextContains(backend.targetTriple, "wasm32") ||
+        function.instructions.size < BOOTSTRAP_LLVM_INITIALIZER_CHUNKED_FROM) return 0
+    bootstrapLlvmInitializerChunk
+}
+
+// A smaller initializer is cut into no blocks: its stackifier cost is small, and a cut
+// costs bytes there (frame addresses recomputed per block instead of kept in a local).
+val BOOTSTRAP_LLVM_INITIALIZER_CHUNKED_FROM = 10000
+
 fun bootstrapLlvmEmitFunction(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -6509,12 +6528,21 @@ fun bootstrapLlvmEmitFunction(
     )
     var errors = 0
     var terminated = false
+    val chunk = bootstrapLlvmInitializerChunkFor(backend, function)
     var instructionIndex = 0
     while (instructionIndex < function.instructions.size) {
         val instruction = function.instructions[instructionIndex]
         bootstrapLlvmDebugLocate(
             debug, backend, functionId, instruction.position
         )
+        if (chunk > 0 && !terminated && instructionIndex > 0 &&
+            instructionIndex % chunk == 0 && instruction.opcode != "label") {
+            val next = LLVMAppendBasicBlockInContext(
+                backend.context, llvmFunction, "init.chunk"
+            )
+            LLVMBuildBr(backend.builder, next)
+            LLVMPositionBuilderAtEnd(backend.builder, next)
+        }
         var matched = false
         var supported = true
         val reachable = !terminated || instruction.opcode == "label"
