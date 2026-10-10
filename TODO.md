@@ -115,6 +115,13 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 
   C is a possible free size win; it would need a native release build's and a client's
   frame-time check before it changes anything.
+  With the LTO link in 4 partitions and wasm-opt sorting functions first (2026-10-10), the
+  pre-link is the cheapest lever left in that stage. Without it, the link stage (pre-link,
+  wasm-ld, wasm-opt) of the same client takes 756 G instructions instead of 925 G
+  (−18%) and 73 s instead of 96 s, and the client is still 0.14% smaller than before
+  partitions. It is blocked on runtime: the simulation module's fixed step is about 1.7%
+  slower (best of five, two rounds: 655/659 µs against 644/646), and a HUD function grows
+  1.8%. A pre-link at O1, or one limited to the functions it changes most, might recover it.
 - [ ] **`llc`'s peak on a large Wasm module** (~1.9 GB for that client's 31 MB of bitcode,
   most of the build's peak): loading the module takes 0.5 GB, and the rest is machine code
   for every function held at once, because WebAssembly's code generation runs a module pass
