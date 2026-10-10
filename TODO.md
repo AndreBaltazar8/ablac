@@ -159,7 +159,13 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   free() triggers (madvise) 3%. A collector whose cost followed what is live (pages with
   mark bits, or generations) would make frequent collections cheap. Tried and dropped:
   size-class free lists inside the runtime (35 G fewer instructions, no fewer cycles, and a
-  2.9 GB peak from per-class fragmentation). Sampled over a game client's dev build's front
+  2.9 GB peak from per-class fragmentation). A capped version of it was weighed and dropped too: on
+  a game client's dev build the madvise of emptied nano blocks after the sweep is about 2.7%
+  of samples and the page faults that follow stay low (~3.6k), so 2.7% is the most any
+  retention could win, while the nano allocator already holds 450-550 MB above the live heap
+  (partly used 16 KB blocks; 1.1-1.4 GB peak at ~665 MB live) that retained objects would
+  only pin further. Without the nano zone (`MallocNanoZone=0`) that peak is 0.94 GB, but
+  the compiler runs 17% more instructions and 15% more cycles. Sampled over a game client's dev build's front
   end, the collector is about 13% of samples, the page directory's build alone about 7%:
   each collection builds it afresh from the whole registry. Keeping it across collections
   (the sweep clears the bits of what it frees; a collection adds only what was registered
