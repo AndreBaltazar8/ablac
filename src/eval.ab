@@ -1,4 +1,5 @@
 import "sema.ab"
+import "abla/sys/linux/io"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
 import "abla/sys/linux/net"
@@ -1969,9 +1970,145 @@ fun bootstrapEvalWeakUpgrade(value: BootstrapEvalValue): BootstrapEvalValue {
     result
 }
 
+// Every declaration's index by name, in declaration order. The evaluator's global
+// lookups walk a name's list where they scanned every declaration; each still checks
+// its own kinds, so it meets the same declarations in the same order.
+class BootstrapEvalNameIndex(
+    val names: array<string>,
+    val firsts: array<int>,
+    val lasts: array<int>,
+    val nodeDeclarations: array<int>,
+    val nodeNexts: array<int>,
+    val slots: array<int>
+) {
+    /** The first node of `name`'s list, or -1. */
+    fun first(name: string): int {
+        var result = -1
+        if (this.slots.size > 0) {
+            var slot = bootstrapFunctionDeclarationHash(name)
+            slot = slot - slot / this.slots.size * this.slots.size
+            var probes = 0
+            while (result < 0 && probes < this.slots.size &&
+                   this.slots[slot] >= 0) {
+                val entry = this.slots[slot]
+                if (this.names[entry] == name) {
+                    result = this.firsts[entry]
+                } else {
+                    slot = slot + 1
+                    if (slot == this.slots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapEvalNameIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapEvalNameIndex {
+    var capacity = 8
+    while (capacity < declarations.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    val names: array<string> = []
+    val firsts: array<int> = []
+    val lasts: array<int> = []
+    val nodeDeclarations: array<int> = []
+    val nodeNexts: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val name = declarations[declaration].name
+        val node = nodeDeclarations.size
+        nodeDeclarations.append(declaration)
+        nodeNexts.append(-1)
+        slot = bootstrapFunctionDeclarationHash(name)
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0) {
+                slots[slot] = names.size
+                names.append(name)
+                firsts.append(node)
+                lasts.append(node)
+                placed = true
+            } else if (names[existing] == name) {
+                nodeNexts[lasts[existing]] = node
+                lasts[existing] = node
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        declaration = declaration + 1
+    }
+    BootstrapEvalNameIndex(names, firsts, lasts, nodeDeclarations, nodeNexts, slots)
+}
+
+// What every evaluation over one declarations array shares: its affine type names and
+// its name index. A caller that evaluates many times reuses a context while the array
+// keeps its size (bootstrapEvalContextFor); a subparser stage that grows it gets a new
+// one. ABLA_EVAL_INDEX_CHECK=1 checks each lookup against a scan of every declaration.
+class BootstrapEvalContext(
+    val size: int,
+    val affineTypes: array<string>,
+    val index: BootstrapEvalNameIndex,
+    val check: bool,
+    val stepLimit: int
+)
+
+// ABLA_EVAL_STEP_LIMIT lowers the step limit (never raises it), so a test can
+// pin how many steps a program takes without running fifty million of them.
+fun bootstrapEvalStepLimit(): int {
+    val configured = linuxEnvironment("ABLA_EVAL_STEP_LIMIT")
+    var limit = BOOTSTRAP_EVAL_STEP_LIMIT
+    if (configured.found && configured.value.size <= 9) {
+        val parsed = bootstrapDecimalIndex(configured.value)
+        if (parsed > 0 && parsed < limit) limit = parsed
+    }
+    limit
+}
+
+fun bootstrapEvalContext(
+    declarations: array<BootstrapDeclaration>
+): BootstrapEvalContext {
+    val configured = linuxEnvironment("ABLA_EVAL_INDEX_CHECK")
+    BootstrapEvalContext(
+        declarations.size,
+        bootstrapBuildAffineTypeNames(declarations),
+        bootstrapEvalNameIndex(declarations),
+        configured.found && configured.value == "1",
+        bootstrapEvalStepLimit()
+    )
+}
+
+/** Under ABLA_EVAL_INDEX_CHECK, a lookup that a scan of every declaration contradicts. */
+fun bootstrapEvalIndexCheckFailed(message: string): void {
+    linuxPrintStandardError("error[E_INTERNAL]: eval.index-check: $message\n")
+}
+
+/** No context yet: its size never matches an array's. */
+fun bootstrapEvalNoContext(): BootstrapEvalContext =
+    BootstrapEvalContext(-1, [], BootstrapEvalNameIndex([], [], [], [], [], []), false, BOOTSTRAP_EVAL_STEP_LIMIT)
+
+/** `context` while it was built for `declarations`' size, else a new one. */
+fun bootstrapEvalContextFor(
+    context: BootstrapEvalContext,
+    declarations: array<BootstrapDeclaration>
+): BootstrapEvalContext =
+    if (context.size == declarations.size) context
+    else bootstrapEvalContext(declarations)
+
 class BootstrapEvaluator(
     val declarations: array<BootstrapDeclaration>,
     val affineTypes: array<string>,
+    val context: BootstrapEvalContext,
     val names: array<string>,
     val values: array<BootstrapEvalValue>,
     val mutable: array<bool>,
@@ -2129,8 +2266,9 @@ class BootstrapEvaluator(
         before: int
     ): string {
         var result = "unknown"
-        var declaration = 0
-        while (declaration < this.declarations.size) {
+        var declarationNode = this.firstNamed(name)
+        while (declarationNode >= 0) {
+            val declaration = this.namedDeclaration(declarationNode)
             val candidate = this.declarations[declaration]
             if (bootstrapDeclarationIsValue(candidate.kind) &&
                 candidate.name == name &&
@@ -2140,7 +2278,7 @@ class BootstrapEvaluator(
                     candidate.expression.children[0]
                 )
             }
-            declaration = declaration + 1
+            declarationNode = this.nextNamed(declarationNode)
         }
         if (context >= 0 && this.functionHandleValid(context)) {
             val local = this.accessDelegatedTypeInExpression(
@@ -2212,9 +2350,10 @@ class BootstrapEvaluator(
                     parameter = -1
                 }
             }
-            var declarationIndex = 0
+            var declarationIndexNode = this.firstNamed(name)
             while (rootKind == "unknown" &&
-                declarationIndex < this.declarations.size) {
+                declarationIndexNode >= 0) {
+                val declarationIndex = this.namedDeclaration(declarationIndexNode)
                 val declaration = this.declarations[declarationIndex]
                 if (bootstrapDeclarationIsValue(declaration.kind) &&
                     declaration.name == name) {
@@ -2223,7 +2362,7 @@ class BootstrapEvaluator(
                         declaration.name
                     )}:${declaration.name}"
                 }
-                declarationIndex = declarationIndex + 1
+                declarationIndexNode = this.nextNamed(declarationIndexNode)
             }
             if (rootKind == "unknown" && context >= 0 &&
                 this.functionHandleOwner(context) >= 0) {
@@ -3041,15 +3180,55 @@ class BootstrapEvaluator(
         result
     }
 
+    // The last binding of `name`: scanned from the end, the first match.
     fun find(name: string): int {
         var result = -1
-        var index = 0
-        while (index < this.names.size) {
+        var index = this.names.size - 1
+        while (result < 0 && index >= 0) {
             if (this.names[index] == name) result = index
-            index = index + 1
+            index = index - 1
+        }
+        if (this.context.check) {
+            var scanned = -1
+            index = 0
+            while (index < this.names.size) {
+                if (this.names[index] == name) scanned = index
+                index = index + 1
+            }
+            if (scanned != result) {
+                bootstrapEvalIndexCheckFailed("find `$name`: $result, a scan finds $scanned")
+            }
         }
         result
     }
+
+    // The first node of the declarations named `name` (BootstrapEvalNameIndex); walk on
+    // with nextNamed and read each with namedDeclaration.
+    fun firstNamed(name: string): int {
+        val first = this.context.index.first(name)
+        if (this.context.check) {
+            var node = first
+            var declaration = 0
+            var same = this.context.size == this.declarations.size
+            while (same && declaration < this.declarations.size) {
+                if (this.declarations[declaration].name == name) {
+                    same = node >= 0 &&
+                        this.context.index.nodeDeclarations[node] == declaration
+                    if (same) node = this.context.index.nodeNexts[node]
+                }
+                declaration = declaration + 1
+            }
+            if (!same || node >= 0) {
+                bootstrapEvalIndexCheckFailed("the declarations named `$name` differ from a scan")
+            }
+        }
+        first
+    }
+
+    fun nextNamed(node: int): int = this.context.index.nodeNexts[node]
+
+    fun namedDeclaration(node: int): int = this.context.index.nodeDeclarations[node]
+
 
     fun invokeDelegateMethod(
         delegate: BootstrapEvalValue,
@@ -3101,8 +3280,9 @@ class BootstrapEvaluator(
             result = this.values[cached]
         }
         if (result.kind == "invalid") {
-            var declaration = 0
-            while (declaration < this.declarations.size) {
+            var declarationNode = this.firstNamed(name)
+            while (declarationNode >= 0) {
+                val declaration = this.namedDeclaration(declarationNode)
                 val candidate = this.declarations[declaration]
                 if (bootstrapDeclarationIsValue(candidate.kind) &&
                     candidate.name == name &&
@@ -3112,7 +3292,7 @@ class BootstrapEvaluator(
                     this.values.append(result)
                     this.mutable.append(false)
                 }
-                declaration = declaration + 1
+                declarationNode = this.nextNamed(declarationNode)
             }
         }
         result
@@ -3986,8 +4166,9 @@ class BootstrapEvaluator(
                 expression.begin,
                 depth + 1
             )
-            var declaration = 0
-            while (declaration < this.declarations.size) {
+            var declarationNode = this.firstNamed(expression.text)
+            while (declarationNode >= 0) {
+                val declaration = this.namedDeclaration(declarationNode)
                 val candidate = this.declarations[declaration]
                 if (bootstrapDeclarationIsValue(candidate.kind) &&
                     candidate.name == expression.text && result == "unknown") {
@@ -4006,7 +4187,7 @@ class BootstrapEvaluator(
                     candidate.name == expression.text && result == "unknown") {
                     result = bootstrapDeclarationFunctionType(candidate)
                 }
-                declaration = declaration + 1
+                declarationNode = this.nextNamed(declarationNode)
             }
         }
         if (depth < 8 && expression.kind == "array") {
@@ -4398,15 +4579,16 @@ class BootstrapEvaluator(
         var callable = bootstrapEvalInvalid()
         if (target >= 0) callable = this.values[target]
         if (target < 0) {
-            var global = 0
+            var globalNode = this.firstNamed(expression.text)
             while (callable.kind == "invalid" &&
-                   global < this.declarations.size) {
+                   globalNode >= 0) {
+                val global = this.namedDeclaration(globalNode)
                 val declaration = this.declarations[global]
                 if (bootstrapDeclarationIsValue(declaration.kind) &&
                     declaration.name == expression.text) {
                     callable = this.evaluate(declaration.expression)
                 }
-                global = global + 1
+                globalNode = this.nextNamed(globalNode)
             }
         }
         if (callable.kind == "function") targetName = callable.text
@@ -4443,6 +4625,7 @@ class BootstrapEvaluator(
             val invocation = BootstrapEvaluator(
                 this.declarations,
                 this.affineTypes,
+                this.context,
                 callNames,
                 callValues,
                 callMutable,
@@ -7906,9 +8089,10 @@ class BootstrapEvaluator(
                 }
             } else this.errors = this.errors + 1
         }
-        var declarationIndex = 0
+        var declarationIndexNode = this.firstNamed(targetName)
         while (result.kind == "invalid" &&
-               declarationIndex < this.declarations.size) {
+               declarationIndexNode >= 0) {
+            val declarationIndex = this.namedDeclaration(declarationIndexNode)
             val declaration = this.declarations[declarationIndex]
             if (declaration.kind == "class" &&
                 declaration.name == targetName) {
@@ -7964,6 +8148,7 @@ class BootstrapEvaluator(
                         val defaults = BootstrapEvaluator(
                             this.declarations,
                             this.affineTypes,
+                            this.context,
                             callNames,
                             callValues,
                             callMutable,
@@ -7998,6 +8183,7 @@ class BootstrapEvaluator(
                 val invocation = BootstrapEvaluator(
                     this.declarations,
                     this.affineTypes,
+                    this.context,
                     callNames,
                     callValues,
                     callMutable,
@@ -8029,7 +8215,7 @@ class BootstrapEvaluator(
                 this.steps = invocation.steps
                 this.diagnostics = invocation.diagnostics
             }
-            declarationIndex = declarationIndex + 1
+            declarationIndexNode = this.nextNamed(declarationIndexNode)
         }
         if (result.kind == "invalid") this.errors = this.errors + 1
         result
@@ -8168,6 +8354,7 @@ class BootstrapEvaluator(
                         val defaults = BootstrapEvaluator(
                             this.declarations,
                             this.affineTypes,
+                            this.context,
                             extensionNames,
                             extensionValues,
                             extensionMutable,
@@ -8202,6 +8389,7 @@ class BootstrapEvaluator(
                 val invocation = BootstrapEvaluator(
                     this.declarations,
                     this.affineTypes,
+                    this.context,
                     extensionNames,
                     extensionValues,
                     extensionMutable,
@@ -8257,6 +8445,7 @@ class BootstrapEvaluator(
                                 val defaults = BootstrapEvaluator(
                                     this.declarations,
                                     this.affineTypes,
+                                    this.context,
                                     methodNames,
                                     methodValues,
                                     methodMutable,
@@ -8291,6 +8480,7 @@ class BootstrapEvaluator(
                         val invocation = BootstrapEvaluator(
                             this.declarations,
                             this.affineTypes,
+                            this.context,
                             methodNames,
                             methodValues,
                             methodMutable,
@@ -8396,11 +8586,12 @@ class BootstrapEvaluator(
         val errorsBefore = this.errors
         val diagnosticsBefore = this.diagnostics.size
         this.steps = this.steps + 1
-        if (this.steps > BOOTSTRAP_EVAL_STEP_LIMIT) {
-            if (this.steps == BOOTSTRAP_EVAL_STEP_LIMIT + 1) {
+        val stepLimit = this.context.stepLimit
+        if (this.steps > stepLimit) {
+            if (this.steps == stepLimit + 1) {
                 this.recordEvaluatorDiagnostic(
                     "E_EVAL_STEP_LIMIT",
-                    "compile-time evaluation ran past $BOOTSTRAP_EVAL_STEP_LIMIT steps (an endless loop?)"
+                    "compile-time evaluation ran past $stepLimit steps (an endless loop?)"
                 )
             }
             this.errors = this.errors + 1
@@ -8520,9 +8711,10 @@ class BootstrapEvaluator(
                         field = field + 1
                     }
                 }
-                var declarationIndex = 0
+                var declarationIndexNode = this.firstNamed(expression.text)
                 while (result.kind == "invalid" &&
-                       declarationIndex < this.declarations.size) {
+                       declarationIndexNode >= 0) {
+                    val declarationIndex = this.namedDeclaration(declarationIndexNode)
                     val declaration = this.declarations[declarationIndex]
                     if (bootstrapDeclarationIsValue(declaration.kind) &&
                         declaration.name == expression.text) {
@@ -8539,7 +8731,7 @@ class BootstrapEvaluator(
                         declaration.name == expression.text) {
                         result = bootstrapEvalFunction(declaration.name)
                     }
-                    declarationIndex = declarationIndex + 1
+                    declarationIndexNode = this.nextNamed(declarationIndexNode)
                 }
                 if (result.kind == "invalid") {
                     this.errors = this.errors + 1
@@ -8945,7 +9137,7 @@ class BootstrapEvaluator(
             var current = begin
             var more = current < end
             if (expression.kind == "range.closed") more = current <= end
-            while (more && this.steps <= BOOTSTRAP_EVAL_STEP_LIMIT) {
+            while (more && this.steps <= this.context.stepLimit) {
                 elements.append(bootstrapEvalInteger(current))
                 current = current + 1
                 more = current < end
@@ -9325,7 +9517,7 @@ class BootstrapEvaluator(
             result = bootstrapEvalVoid()
             while (looping &&
                    this.evaluate(expression.children[0]).boolean &&
-                   this.steps <= BOOTSTRAP_EVAL_STEP_LIMIT) {
+                   this.steps <= this.context.stepLimit) {
                 result = this.evaluate(expression.children[1])
                 if (result.kind == "return") looping = false
                 if (result.kind == "break") {
@@ -9341,7 +9533,7 @@ class BootstrapEvaluator(
             var more = true
             var looping = true
             result = bootstrapEvalVoid()
-            while (more && looping && this.steps <= BOOTSTRAP_EVAL_STEP_LIMIT) {
+            while (more && looping && this.steps <= this.context.stepLimit) {
                 result = this.evaluate(expression.children[0])
                 if (result.kind == "return") looping = false
                 if (result.kind == "break") {
@@ -9367,7 +9559,7 @@ class BootstrapEvaluator(
             result = bootstrapEvalVoid()
             var count = source.elements.size
             if (source.kind == "string") count = source.text.size
-            while (element < count && looping && this.steps <= BOOTSTRAP_EVAL_STEP_LIMIT) {
+            while (element < count && looping && this.steps <= this.context.stepLimit) {
                 if (source.kind == "string") {
                     this.values[iteratorIndex] = bootstrapEvalInteger(
                         source.text[element]
@@ -9404,6 +9596,15 @@ fun bootstrapEvaluateWithEffects(
     expression: BootstrapExpression,
     declarations: array<BootstrapDeclaration>,
     allowedCompileEffects: int
+): BootstrapEvalResult = bootstrapEvaluateWithEffectsIn(
+    bootstrapEvalContext(declarations), expression, declarations, allowedCompileEffects
+)
+
+fun bootstrapEvaluateWithEffectsIn(
+    context: BootstrapEvalContext,
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>,
+    allowedCompileEffects: int
 ): BootstrapEvalResult {
     val names: array<string> = []
     val values: array<BootstrapEvalValue> = []
@@ -9418,7 +9619,8 @@ fun bootstrapEvaluateWithEffects(
     val globalValues: array<BootstrapEvalValue> = []
     val evaluator = BootstrapEvaluator(
         declarations,
-        bootstrapBuildAffineTypeNames(declarations),
+        context.affineTypes,
+        context,
         names,
         values,
         mutable,
@@ -9470,6 +9672,16 @@ fun bootstrapInvokeSubparserHandler(
     handler: string,
     cursor: BootstrapSubparserCursor,
     allowedCompileEffects: int
+): BootstrapSubparserInvocation = bootstrapInvokeSubparserHandlerIn(
+    bootstrapEvalContext(declarations), declarations, handler, cursor, allowedCompileEffects
+)
+
+fun bootstrapInvokeSubparserHandlerIn(
+    context: BootstrapEvalContext,
+    declarations: array<BootstrapDeclaration>,
+    handler: string,
+    cursor: BootstrapSubparserCursor,
+    allowedCompileEffects: int
 ): BootstrapSubparserInvocation {
     val names: array<string> = ["cursor"]
     val values: array<BootstrapEvalValue> = [BootstrapEvalValue(
@@ -9492,7 +9704,8 @@ fun bootstrapInvokeSubparserHandler(
     val globalValues: array<BootstrapEvalValue> = []
     val evaluator = BootstrapEvaluator(
         declarations,
-        bootstrapBuildAffineTypeNames(declarations),
+        context.affineTypes,
+        context,
         names,
         values,
         mutable,
@@ -9551,6 +9764,16 @@ fun bootstrapInvokeExtensionFinalizer(
     request: BootstrapExtensionRequest,
     typedCalls: array<BootstrapTypedCall>,
     allowedCompileEffects: int
+): BootstrapEvalResult = bootstrapInvokeExtensionFinalizerIn(
+    bootstrapEvalContext(declarations), declarations, request, typedCalls, allowedCompileEffects
+)
+
+fun bootstrapInvokeExtensionFinalizerIn(
+    context: BootstrapEvalContext,
+    declarations: array<BootstrapDeclaration>,
+    request: BootstrapExtensionRequest,
+    typedCalls: array<BootstrapTypedCall>,
+    allowedCompileEffects: int
 ): BootstrapEvalResult {
     val names: array<string> = ["payload", "expression"]
     val values: array<BootstrapEvalValue> = [
@@ -9571,7 +9794,8 @@ fun bootstrapInvokeExtensionFinalizer(
     val globalValues: array<BootstrapEvalValue> = []
     val evaluator = BootstrapEvaluator(
         declarations,
-        bootstrapBuildAffineTypeNames(declarations),
+        context.affineTypes,
+        context,
         names,
         values,
         mutable,
@@ -9623,6 +9847,17 @@ fun bootstrapInvokeCompilerTransform(
     begin: int,
     end: int,
     allowedCompileEffects: int
+): BootstrapEvalResult = bootstrapInvokeCompilerTransformIn(
+    bootstrapEvalContext(declarations), declarations, handler, begin, end, allowedCompileEffects
+)
+
+fun bootstrapInvokeCompilerTransformIn(
+    context: BootstrapEvalContext,
+    declarations: array<BootstrapDeclaration>,
+    handler: string,
+    begin: int,
+    end: int,
+    allowedCompileEffects: int
 ): BootstrapEvalResult {
     val generatedDeclarations: array<BootstrapDeclaration> = []
     val compileInputPaths: array<string> = []
@@ -9631,7 +9866,8 @@ fun bootstrapInvokeCompilerTransform(
     val globalValues: array<BootstrapEvalValue> = []
     val evaluator = BootstrapEvaluator(
         declarations,
-        bootstrapBuildAffineTypeNames(declarations),
+        context.affineTypes,
+        context,
         [],
         [],
         [],

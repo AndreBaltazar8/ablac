@@ -84,6 +84,7 @@ test: ablac
 	tools/test-fixed-width-boxed-arithmetic.sh $(COMPILER)
 	tools/test-closure-captures.sh $(COMPILER)
 	tools/test-local-shadowing.sh $(COMPILER)
+	tools/test-eval-steps.sh $(COMPILER)
 	tools/test-narrowing-and-branches.sh $(COMPILER)
 	tools/test-line-continuation.sh $(COMPILER)
 	tools/test-ownership-shadows-and-globals.sh $(COMPILER)
