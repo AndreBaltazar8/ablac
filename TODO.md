@@ -128,6 +128,9 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   partitions. It is blocked on runtime: the simulation module's fixed step is about 1.7%
   slower (best of five, two rounds: 655/659 µs against 644/646), and a HUD function grows
   1.8%. A pre-link at O1, or one limited to the functions it changes most, might recover it.
+  A native server's release LTO link gains little from partitions: its time is the serial O2
+  pipeline on the merged module, and code generation is 4-5 of its 36 s (ld.lld, 4
+  partitions: 33 s, +4% instructions, +0.14 GB peak). It stays at one partition.
 - [ ] **`llc`'s peak on a large Wasm module** (~1.9 GB for that client's 31 MB of bitcode,
   most of the build's peak): loading the module takes 0.5 GB, and the rest is machine code
   for every function held at once, because WebAssembly's code generation runs a module pass
