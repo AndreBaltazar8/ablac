@@ -216,7 +216,8 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
     (21's tools, 23's libLLVM), and `tools/docker/abla-service.Dockerfile` installs both LLVMs.
     A bootstrap release built on 23 drops the handoff and `llvm@21`.
   - Linux (the Nix pin, LLVM 21.1.1) and the portable Linux package stay on 21; the sources build
-    with either. The service image build on 23 is not yet verified.
+    with either. The service image builds on 23 (verified 2026-10-11, linux/amd64: the v0.2.15
+    bootstrap on 21, the handoff to libLLVM.so.23.1, a service built on 23 runs).
 
 ## Not checked
 
