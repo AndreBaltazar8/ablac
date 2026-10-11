@@ -198,6 +198,42 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   instructions unchanged, peak +90 MB). Candidates: the directory kept across collections
   (above), and freeing a sweep's garbage in batches (Darwin's `malloc_zone_batch_free`)
   instead of one `free` each.
+- [ ] **LLVM 23 (evaluated 2026-10-11, not adopted).** LLVM 23.1.3 (macOS arm64 release) against 21,
+  with `a223373` built against each. Instructions retired by the compiler and every LLVM tool and
+  wasm-opt, on a game's builds (one round; walls were inflated by external load):
+
+  | Build | LLVM 21 | LLVM 23 | Peak (tree RSS) |
+  |---|---|---|---|
+  | release Wasm client | 1,260 G | 1,000 G (−21%) | 1.77 → 1.64 GB |
+  | development Wasm client | 269 G | 228 G (−15%) | 2.06 → 2.11 GB (compiler) |
+  | release native server | 345 G | 248 G (−28%) | 0.99 → 0.96 GB |
+  | release simulation module | 93 G | 77 G (−18%) | 0.52 → 0.53 GB |
+
+  Per tool on the release client: opt −29%, clang's O2 pre-link −32%, wasm-ld −40%, wasm-opt
+  −4%. Sizes: client −1.67% after wasm-opt, simulation module +0.31%, server −0.48%,
+  development client +0.05%. Runtime unchanged: the simulation's hashes match, natively and in
+  Wasm, and its instructions per run are within 0.2% (native and under node). The initializer
+  chunks and 4 LTO partitions still pay under 23 (wasm-ld −26% instructions; 4 partitions −32%
+  wall, lower peak). Under 23 the compiler is a fixed point (`.ll` and binary).
+
+  Before a switch:
+  - opt and llc no longer take `--threads=1` (`src/toolchain.ab` 316, 325, 497, 533, 704, 727).
+    The linkers still take it.
+  - `default<Oz>` is gone ("use O2 with the minsize attribute"): the microcontroller pipeline,
+    `src/toolchain.ab:513`. `test-scalar-default-unboxing` fails on it.
+  - The compiler and the tools must move together. The compiler reads opt's bitcode back in
+    process (`LLVMParseIRInContext`, `src/toolchain.ab` 453, 778), so a libLLVM 21 compiler cannot
+    read 23's bitcode, and 23's text (`target_mem`) does not parse in 21's opt.
+  - These hardcode `llvm@21`: `tools/test-self-hosted.sh`, `tools/run-limited-compiler.sh`,
+    `tools/macos-clang.sh`, `tools/test-pure-self-rebuild.sh`, `tools/prepare-macos-link-stubs.sh`.
+
+  Installing it: Homebrew had no `llvm@23` yet (its `llvm` was 22.1.8). The release tarball has
+  no shared libLLVM, only static archives of LTO bitcode; a `libLLVM.dylib` linked from them
+  (with Polly and libedit, `-all_load`) took 6.4 minutes. So the options are Homebrew's `llvm@23`
+  once it ships, or a self-built libLLVM at a fixed path. A Linux image would take apt.llvm.org's
+  `llvm-23` and `lld-23` (with `libLLVM.so`).
+  Not measured: walls and frame times on a quiet machine, a game's HUD frame timing, the full
+  suite with scripts that know 23, and a Linux image build.
 
 ## Not checked
 
