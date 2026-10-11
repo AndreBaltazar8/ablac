@@ -309,7 +309,9 @@ class BootstrapIrProgram(
     val compileInputPaths: array<string>,
     val compileInputContents: array<string>,
     val errors: int,
-    val lookup: BootstrapIrLookup
+    val lookup: BootstrapIrLookup,
+    // Lowered only to be validated, and failed: named in diagnostics, never emitted.
+    val validationFailures: array<BootstrapIrFunction> = []
 )
 
 // The instruction indices the LLVM backend looks up by key: each module
@@ -4178,7 +4180,10 @@ class BootstrapLowerer(
     var continueScope: int,
     val validationOnly: bool,
     var errors: int,
-    val localNames: BootstrapIrLocalNames
+    val localNames: BootstrapIrLocalNames,
+    // Compile functions whose validation-only lowering failed: never emitted,
+    // but their errors are named like any function's (bootstrapIrVerificationDiagnostics).
+    val validationFailures: array<BootstrapIrFunction> = []
 ) {
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     fun visibleLocal(name: string, typed: bool): int {
@@ -8262,6 +8267,12 @@ class BootstrapLowerer(
             )
         }
         functionSink.append(reportedFunction)
+        // A compile fun is lowered only to validate it, so its errors would have
+        // no function to name them; a `fun`'s are named when it is lowered again.
+        if (validationOnly && declaration.kind == "compile.fun" &&
+            reportedFunction.verificationErrors > 0) {
+            this.validationFailures.append(reportedFunction)
+        }
         if (!validationOnly) {
             var emitted = 0
             while (emitted < functionSink.size) {
@@ -8889,7 +8900,8 @@ class BootstrapLowerer(
             this.compileInputPaths,
             this.compileInputContents,
             this.errors,
-            bootstrapIrLookupOf(this.instructions, globalNames)
+            bootstrapIrLookupOf(this.instructions, globalNames),
+            this.validationFailures
         )
     }
 }
@@ -8961,6 +8973,7 @@ fun bootstrapLowerParsedCached(
     val evaluatedValues: array<BootstrapEvalValue> = []
     val evaluatedResults: array<int> = []
     val compileInputPaths: array<string> = []
+    val validationFailures: array<BootstrapIrFunction> = []
     val compileInputContents: array<string> = []
     bootstrapMergeCompileInputs(
         compileInputPaths,
@@ -9031,7 +9044,8 @@ fun bootstrapLowerParsedCached(
         -1,
         false,
         analyzed.errors,
-        bootstrapIrLocalNames()
+        bootstrapIrLocalNames(),
+        validationFailures
     ).lower(parsed, contextFirst, contextSecond, cache, pruneUnused)
 }
 
@@ -9142,8 +9156,10 @@ fun bootstrapIrVerificationDiagnostics(
     var diagnostics = ""
     var classified = 0
     var index = 0
-    while (index < program.functions.size) {
-        val function = program.functions[index]
+    val named = program.functions.size + program.validationFailures.size
+    while (index < named) {
+        val function = if (index < program.functions.size) program.functions[index]
+            else program.validationFailures[index - program.functions.size]
         val delegatedReplacement =
             bootstrapIrFunctionContainsDelegateReplacement(
                 parsed,

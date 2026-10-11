@@ -64,12 +64,6 @@ is a regression of `1a90db5`.
   with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
   `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
   not `parameterDefaults` (a method's defaults likewise).
-- [ ] **A compile-time function's borrow conflict has no borrow diagnostic.**
-  `tests/cases/bootstrap/invalid-compile-borrow-active-move.ab` (a `compile fun` that
-  moves a `Shared` while a view of it is still used, called through `#…`) is rejected
-  only with `E_IR_UNCLASSIFIED` ("typed IR lowering failed without a named function
-  invariant"); the same body as a runtime function reports `E_BORROW_CONFLICT`.
-  `tools/test-borrow-lifetimes.sh` leaves the fixture out until the diagnostic is named.
 
 ## Packages
 

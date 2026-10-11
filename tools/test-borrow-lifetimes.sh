@@ -20,8 +20,6 @@ if [[ $native_status -ne 42 ]]; then
     exit 1
 fi
 
-# invalid-compile-borrow-active-move is left out: a compile-time function's borrow
-# conflict surfaces only as E_IR_UNCLASSIFIED (TODO.md).
 fixtures=(
     invalid-borrow-active-move
     invalid-borrow-conditional-move
@@ -49,6 +47,7 @@ fixtures=(
     invalid-staged-borrow-return-active-move
     invalid-staged-indirect-borrow-return-active-move
     invalid-borrow-mutating-receiver-later-extension
+    invalid-compile-borrow-active-move
 )
 diagnostics=(
     'error[E_BORROW_CONFLICT]: in `main`, `owner` is changed while `view`'
@@ -77,6 +76,7 @@ diagnostics=(
     'error[E_BORROW_CONFLICT]: in `invalidReturnedBorrowLifetime`, `owner` is changed while `borrowed`'
     'error[E_BORROW_CONFLICT]: in `invalidIndirectBorrowLifetime`, `owner` is changed while `borrowed`'
     'error[E_BORROW_CONFLICT]: in `main`, `holder.handle` is changed while `view`'
+    'error[E_BORROW_CONFLICT]: in `invalidBorrowLifetime`, `owner` is changed while `view`'
 )
 
 index=0
@@ -99,5 +99,21 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     [[ ! -e $output ]] || exit 1
     index=$((index + 1))
 done
+
+# A compile fun nothing calls: `build` prunes it, but --emit-llvm checks every
+# body, and its conflict is named like a called one's.
+uncalled="$output_directory/invalid-compile-borrow-active-move-uncalled"
+set +e
+"$compiler" --emit-llvm \
+    "$project_root/tests/cases/bootstrap/invalid-compile-borrow-active-move-uncalled.ab" \
+    >"$uncalled.out" 2>"$uncalled.err"
+status=$?
+set -e
+if [[ $status -ne 1 ]] ||
+    ! grep -Fq 'error[E_BORROW_CONFLICT]: in `invalidBorrowLifetime`, `owner` is changed while `view`' "$uncalled.err"; then
+    echo "borrow lifetimes: the uncalled compile fun's conflict was not named (exit $status)" >&2
+    sed -n '1,20p' "$uncalled.err" >&2
+    exit 1
+fi
 
 echo 'borrow lifetimes: direct/indirect/global/returned callable contracts + stored/chained views + CFG/staged verification + LLVM passed'
