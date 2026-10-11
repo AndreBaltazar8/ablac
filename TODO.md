@@ -93,6 +93,13 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
+- [ ] **In-process Wasm optimization changes later native objects with LLVM 21.**
+  `tools/test-build-same-process.sh` fails on Linux when
+  `ABLA_LLVM_OUT_OF_PROCESS=0`: identical native input IR gives different objects
+  after a development Wasm build. A standalone LLVM C API reproducer also differs
+  after running the Wasm passes. The isolated `opt`/`llc` path is the release default
+  until the LLVM state interaction is resolved; the in-process path is opt-in.
+
 Measured on a 10K-function Wasm application (86 MB of LLVM IR). Its dev build's compiler,
 collecting each time its heap grows by 256 MiB, peaks at about 1 GB and takes about 28 CPU
 seconds (88 G cycles); never collecting, it takes about 24 (73 G cycles) and peaks at

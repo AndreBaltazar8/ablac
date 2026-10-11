@@ -6,7 +6,7 @@ multi-stage source bootstrap are no longer part of the repository.
 
 A compiler cannot translate itself on an empty machine without an existing
 executable translator. Clean builds therefore begin with a checksum-pinned
-native `v0.2.13` host artifact for Linux x86-64, Intel macOS, or Apple Silicon.
+native `v0.2.14` host artifact for Linux x86-64, Intel macOS, or Apple Silicon.
 Mach-O artifacts can be emitted and linked on Linux with LLVM, an Apple SDK,
 and ABI stubs for the target libraries. The resulting artifact is then
 executed by the matching Mac release gate.
@@ -55,3 +55,14 @@ LLVM, Clang, and the platform linker remain native toolchain dependencies.
 Linux pins them through Nix; macOS uses Homebrew LLVM and the system
 Mach-O linker. Removing those hosted dependencies is a separate freestanding goal described in
 [full-self-hosting.md](full-self-hosting.md).
+
+## Word-zero intrinsic transition
+
+The v0.2.14 release is the bootstrap bridge for `ablaRuntimeValueWord0`.
+The compiler sources now use that intrinsic, which v0.2.13 cannot compile.
+Clean builds therefore start from the checksum-pinned v0.2.14 host binaries;
+v0.2.15 is built from the current source graph using that bridge.
+
+The v0.2.14 tag preserves the bridge source and its reproducible source chain
+from v0.2.13 in `tools/bootstrap-word0-bridge.sh`. The temporary bridge branch
+is not needed once those artifacts are published.
