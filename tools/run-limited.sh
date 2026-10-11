@@ -35,6 +35,9 @@ if (( memory_mb > 8796093022207 )); then
     exit 2
 fi
 memory_bytes=$((memory_mb * 1024 * 1024))
+# Nested compiler launchers must inherit this cap instead of choosing a larger
+# default and trying to raise the hard limit installed by this runner.
+export ABLA_MAX_MEMORY_MB=$memory_mb
 
 if [[ $(uname -s) == Darwin ]]; then
     ulimit -S -c 0

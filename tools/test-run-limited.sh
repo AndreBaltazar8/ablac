@@ -26,6 +26,15 @@ status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
 
+nested_memory=$(
+    unset ABLA_MAX_MEMORY_MB
+    "$runner" bash -c '
+        export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096}
+        exec "$1" printenv ABLA_MAX_MEMORY_MB
+    ' _ "$runner"
+)
+[[ $nested_memory == 2048 ]] || exit 1
+
 marker="abla-limit-test-$$"
 set +e
 timeout_output=$(
