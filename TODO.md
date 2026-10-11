@@ -181,6 +181,17 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   (the sweep clears the bits of what it frees; a collection adds only what was registered
   since) would save part of that 7%, against the risk of a directory out of step with the
   heap.
+  Measured again at `49e37da` with a collection trace (one line per collection): a game
+  client's dev build collects 15 times and its release build 17 (two explicit), live
+  before 269-651 MB, kept 13-505 MB. Over the dev build the page directory's builds take
+  about 1.2 s (each walks the whole registry, garbage included, up to 7.8 M slots, and
+  callocs a 512-byte bitmap per page), the sweeps about 1.3 s (up to 5.6 M `free` calls
+  each; the nano allocator's madvise on emptied blocks is under them, not `8a1e627`'s
+  pressure relief, which is about 6 ms) and marking and tracing 0.6 s. A larger collection
+  step does not help: every garbage object is freed once whatever the step (256 → 512 MiB:
+  instructions unchanged, peak +90 MB). Candidates: the directory kept across collections
+  (above), and freeing a sweep's garbage in batches (Darwin's `malloc_zone_batch_free`)
+  instead of one `free` each.
 
 ## Not checked
 
