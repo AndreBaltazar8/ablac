@@ -59,8 +59,12 @@ Mach-O linker. Removing those hosted dependencies is a separate freestanding goa
 ## Word-zero intrinsic transition
 
 Version 0.2.14 is the intermediate compiler from `bootstrap/word0-bridge`.
-Its standard library reads the value payload through its address so the pinned
-v0.2.13 compiler can build it. The resulting compiler understands
+Its standard library reads the value payload through its address so an older
+compiler can build it. A clean v0.2.13 seed first builds the two pinned source
+snapshots in `tools/bootstrap-word0-bridge.sh`, which add compound assignment
+and array truncation. The array snapshot receives an explicit type annotation
+for an empty array so its predecessor can type it. These intermediate compilers
+use `--fast`; the released compiler uses the default O2 profile. The resulting compiler understands
 `ablaRuntimeValueWord0` and can bootstrap the newer compiler sources.
 Release this bridge on all three hosts before updating the newer sources'
 bootstrap version and checksums.
