@@ -198,6 +198,18 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   instructions unchanged, peak +90 MB). Candidates: the directory kept across collections
   (above), and freeing a sweep's garbage in batches (Darwin's `malloc_zone_batch_free`)
   instead of one `free` each.
+- [ ] **Name lookups in lowering.** Sampled over a game client's dev build at `d39b14d`,
+  `BootstrapFunctionDeclarationIndex.find` and the name hash under it are about 450 ms
+  together, about 1% of the compiler's samples (an index lookup each time, but many of
+  them), and `bootstrapIrRuntimeOperationDeclaration` about 100 ms: it compares an
+  instruction's opcode with some 80 strings, one after another and all of them, for every
+  lowered instruction (`bootstrapCollectLoweredInstructionTargets`). The callers of `find`
+  are not in the sample: lowering's recursion is deeper than its stacks. Next: count the
+  lookups per call site, then remember a callee's declaration where the same name is
+  looked up again (`lowerFunctionResultType`, `lowerFunctionType`,
+  `lowerGlobalFunctionType` each look it up afresh), and dispatch the opcode table on the
+  opcode's first byte. Worth perhaps 0.3-0.6% of a dev build; not measurable on a loaded
+  machine.
 - [ ] **LLVM 23 (evaluated 2026-10-11, not adopted).** LLVM 23.1.3 (macOS arm64 release) against 21,
   with `a223373` built against each. Instructions retired by the compiler and every LLVM tool and
   wasm-opt, on a game's builds (one round; walls were inflated by external load):
