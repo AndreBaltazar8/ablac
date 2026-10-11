@@ -75,30 +75,34 @@ if [[ ${1:-} == build && ${2:-} == *src/orc_main.ab &&
     export ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-240}
 fi
 
+# The compiler holds libLLVM in process and reads opt's bitcode back, so on a
+# Mac it runs with the tools of the Homebrew LLVM it links (llvm@N and lld@N),
+# first on PATH whatever else the caller's PATH holds. ABLA_LLVM and ABLA_LLD
+# name other prefixes of that LLVM.
+if [[ $(uname -s) == Darwin ]]; then
+    linked_llvm=$(otool -L "$compiler" 2>/dev/null | sed -n \
+        's/^[[:space:]]*\([^ ]*libLLVM[^ ]*\) (.*current version \([0-9][0-9]*\)\..*/\1 \2/p' |
+        sed -n 1p)
+    if [[ $linked_llvm == */opt/llvm*' '* ]]; then
+        llvm_major=${linked_llvm##* }
+        homebrew_prefix=${linked_llvm%%/opt/llvm*}
+        llvm_prefix=${ABLA_LLVM:-$homebrew_prefix/opt/llvm@$llvm_major}
+        lld_prefix=${ABLA_LLD:-$homebrew_prefix/opt/lld@$llvm_major}
+        if [[ ! -x $llvm_prefix/bin/opt || ! -x $lld_prefix/bin/wasm-ld ]]; then
+            printf '[abla-limit] %s links LLVM %s; install its tools with `brew install llvm@%s lld@%s` or set ABLA_LLVM/ABLA_LLD\n' \
+                "$compiler" "$llvm_major" "$llvm_major" "$llvm_major" >&2
+            exit 127
+        fi
+        export PATH="$llvm_prefix/bin:$lld_prefix/bin:$PATH"
+    fi
+fi
+
 # The repository compiler intentionally relies on the pinned LLVM toolchain.
 # Emission-only commands need no shell, while build/serve enter it lazily when
 # invoked from a plain NixOS terminal. The final compiler calls LLVM in-process
 # for object emission but still uses the pinned clang/linker toolchain.
 case ${1:-} in
     build|serve|analyze)
-        if ! command -v opt >/dev/null 2>&1; then
-            if [[ $(uname -s) == Darwin ]]; then
-                if [[ -x /opt/homebrew/bin/brew ]]; then
-                    brew_command=/opt/homebrew/bin/brew
-                elif [[ -x /usr/local/bin/brew ]]; then
-                    brew_command=/usr/local/bin/brew
-                else
-                    brew_command=
-                fi
-                if [[ -n $brew_command ]]; then
-                    llvm_prefix=${ABLA_LLVM:-$($brew_command --prefix llvm@23 \
-                        2>/dev/null || $brew_command --prefix llvm)}
-                    lld_prefix=${ABLA_LLD:-$($brew_command --prefix lld@23 \
-                        2>/dev/null || $brew_command --prefix lld)}
-                    export PATH="$llvm_prefix/bin:$lld_prefix/bin:$PATH"
-                fi
-            fi
-        fi
         if ! command -v opt >/dev/null 2>&1; then
             if [[ -n ${IN_NIX_SHELL:-} ]]; then
                 printf '%s\n' \

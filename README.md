@@ -80,6 +80,13 @@ steps:
 The action supports Linux x86-64 and both Apple Silicon and Intel macOS. Pin it
 to a full commit SHA when an immutable action reference is required.
 
+The Linux toolchain archive bundles its LLVM tools. A macOS archive runs with
+Homebrew's, which must be the LLVM its compiler links, since the compiler reads
+`opt`'s bitcode back with its own libLLVM. From the release after 0.2.15, install
+`brew install llvm@23 lld@23 openssl@3` (plus `binaryen` for Wasm), and
+`bin/ablac` puts `llvm@23` and `lld@23` first on PATH itself, whatever else PATH
+holds; `ABLA_LLVM` and `ABLA_LLD` name other prefixes of the same LLVM.
+
 ## Development
 
 On Linux, the development shell pins nixpkgs and the native LLVM toolchain.
@@ -105,7 +112,9 @@ object emission and ORC execution. Each host uses its native compiler artifact
 published with `v0.2.15`; no Intel translation is involved on Apple Silicon.
 That artifact links `llvm@21`, so its first rebuild runs `llvm@21`'s tools and
 links the result against `llvm@23` (`tools/build-self-hosted-release.sh`),
-which runs with `llvm@23`'s tools from then on.
+which runs with `llvm@23`'s tools from then on. `build/ablac` puts the tools of
+the LLVM `build/ablac.bin` links first on PATH (`ABLA_LLVM` and `ABLA_LLD` name
+other prefixes).
 Run `tools/test-macos-host.sh build/ablac` for the focused native host gate.
 
 Linux can also emit and link both macOS architectures. Point

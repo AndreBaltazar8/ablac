@@ -47,7 +47,27 @@ chmod 0755 "$bundle/libexec/ablac.bin" "$bundle"/libexec/*
 cat > "$bundle/bin/ablac" <<'SH'
 #!/bin/sh
 set -eu
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# Resolve links to the launcher (a bin directory elsewhere may link to it), so
+# the root and its sysroot are the toolchain's own.
+launcher=$0
+while [ -L "$launcher" ]; do
+    target=$(readlink "$launcher")
+    case $target in
+        /*) launcher=$target ;;
+        *) launcher=$(dirname -- "$launcher")/$target ;;
+    esac
+done
+root=$(CDPATH= cd -- "$(dirname -- "$launcher")/.." && pwd)
+# Deeply nested programs (large JSON literals, typed source graphs) need more
+# than the default stack: take up to 128 MiB, within the hard limit, as the
+# repository launcher does. ABLA_MAX_STACK_KB chooses another size.
+stack_kb=${ABLA_MAX_STACK_KB:-131072}
+hard_stack_kb=$(ulimit -H -s)
+case $hard_stack_kb in
+    ''|*[!0-9]*) ;;
+    *) if [ "$hard_stack_kb" -lt "$stack_kb" ]; then stack_kb=$hard_stack_kb; fi ;;
+esac
+ulimit -S -s "$stack_kb" 2>/dev/null || :
 export ABLA_SYSROOT="$root/share/abla"
 export PATH="$root/bin:$PATH"
 exec "$root/libexec/ablac.bin" "$@"
