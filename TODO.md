@@ -223,8 +223,6 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   - Drop the handoff from `tools/build-self-hosted-release.sh`, the previous nixpkgs pin
     (`bootstrapPkgs`) from `shell.nix`, `llvm@21` from `release.yml` and the README, and
     `BOOTSTRAP_LLVM_VERSION` from `tools/docker/abla-service.Dockerfile`.
-  - The glibc 2.38 floor: binding `fmod`/`fmodf` to their `GLIBC_2.2.5` versions (a `.symver`
-    in the hosted link) would bring the Linux package back to glibc 2.35.
 
 ## Not checked
 
