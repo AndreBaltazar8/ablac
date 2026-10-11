@@ -127,8 +127,9 @@ the libc allocation contract; libc-free module targets reject it before object
 emission.
 
 The default hosted release profile runs the deterministic
-`default<O2>,globaldce` pipeline. Release builds for MCU triples use
-`default<Oz>,globaldce`; the target still receives LLVM's optimized machine-code
+`default<O2>,globaldce` pipeline. Release builds for MCU triples run
+`default<O2>,globaldce` on functions marked `minsize` (LLVM 23 has no
+`default<Oz>`); the target still receives LLVM's optimized machine-code
 generator, while whole-program optimization prioritizes constrained flash.
 Hosted `--fast` skips whole-module optimization and selects LLVM's low-latency
 code generator for edit/build cycles. A hosted release executable is linked from

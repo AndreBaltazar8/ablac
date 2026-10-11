@@ -8,7 +8,7 @@ mkdir -p "$output_directory"
 
 source_file="$project_root/tests/cases/modules/exhaustive-when.ab"
 "$compiler" --emit-llvm "$source_file" > "$output_directory/program.ll"
-opt --threads=1 -passes=verify -disable-output "$output_directory/program.ll"
+opt -passes=verify -disable-output "$output_directory/program.ll"
 
 "$compiler" build "$source_file" -o "$output_directory/program"
 set +e

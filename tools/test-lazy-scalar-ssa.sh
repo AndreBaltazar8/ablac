@@ -17,7 +17,7 @@ typed_ir="$output_directory/typed-collection-ops.ll"
 typed_executable="$output_directory/typed-collection-ops"
 
 "$compiler" --emit-llvm "$source_file" > "$llvm_ir"
-opt --threads=1 -passes=verify -disable-output "$llvm_ir"
+opt -passes=verify -disable-output "$llvm_ir"
 
 # Proven scalar arithmetic and mutable locals stay native in the generated
 # function body. The same fixture also passes a function through Fn(int)->int,
@@ -28,7 +28,7 @@ rg -q '@abla_llvm_call_indirect' "$llvm_ir"
 rg -q 'call void @abla_i64' "$llvm_ir"
 
 "$compiler" --emit-llvm "$typed_source" > "$typed_ir"
-opt --threads=1 -passes=verify -disable-output "$typed_ir"
+opt -passes=verify -disable-output "$typed_ir"
 rg -q 'call i64 @abla_string_length_i64' "$typed_ir"
 rg -q 'call i64 @abla_string_get_i64' "$typed_ir"
 rg -q 'call i64 @abla_array_length_i64' "$typed_ir"

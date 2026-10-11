@@ -158,7 +158,7 @@ module.
 
 ## In-process AOT and indexed-backend result
 
-The final compiler calls LLVM 21 directly for `default<O2>,globaldce` and
+The final compiler calls LLVM 23 directly for `default<O2>,globaldce` and
 object emission. A negative dependency gate places failing `opt` and `llc`
 executables first on `PATH`; `ablac build` must still produce a working native
 program. The final link remains an external Clang/LLD handoff.

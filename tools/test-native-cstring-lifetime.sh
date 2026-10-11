@@ -15,7 +15,7 @@ mkdir -p "$output_directory"
     "$project_root/tests/cases/modules/native-c-string.ab" > "$llvm_ir"
 rg -q 'call ptr @abla_as_cstring' "$llvm_ir"
 rg -q 'call void @abla_platform_free\(ptr %native.cstring\)' "$llvm_ir"
-opt --threads=1 -passes=verify -disable-output "$llvm_ir"
+opt -passes=verify -disable-output "$llvm_ir"
 
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/native-c-string-escaping.ab" \
@@ -26,13 +26,13 @@ if rg -q 'call void @abla_platform_free\(ptr %native.cstring\)' \
     echo "escaping native C string was released after its call" >&2
     exit 1
 fi
-opt --threads=1 -passes=verify -disable-output "$escaping_ir"
+opt -passes=verify -disable-output "$escaping_ir"
 
 "$compiler" --emit-llvm \
     "$project_root/tests/cases/modules/native-string-address.ab" \
     > "$borrowed_ir"
 rg -q 'call ptr @abla_string_data' "$borrowed_ir"
-opt --threads=1 -passes=verify -disable-output "$borrowed_ir"
+opt -passes=verify -disable-output "$borrowed_ir"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/native-c-string.ab" -o "$program"

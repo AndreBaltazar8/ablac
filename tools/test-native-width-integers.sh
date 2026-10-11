@@ -10,7 +10,7 @@ program=$output_directory/program
 
 mkdir -p "$output_directory"
 "$compiler" --emit-llvm "$source_file" >"$llvm_ir"
-opt --threads=1 -passes=verify -disable-output "$llvm_ir"
+opt -passes=verify -disable-output "$llvm_ir"
 
 grep -Eq 'add i8 .*' "$llvm_ir"
 grep -Eq 'add i16 .*' "$llvm_ir"

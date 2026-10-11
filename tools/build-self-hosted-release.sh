@@ -18,6 +18,27 @@ cd "$project_root"
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 mkdir -p -- "$(dirname -- "$output")"
 
+# A compiler holds libLLVM in process and reads opt's bitcode back, so it runs
+# with the tools of the LLVM it links. One linked against another LLVM than the
+# one on PATH (the pinned bootstrap release links llvm@21) builds with its own
+# LLVM's tools and links the result against PATH's libLLVM, so the result runs
+# with PATH's tools. ABLA_BOOTSTRAP_LLVM names the builder's LLVM prefix.
+if [[ $host_os == Darwin ]]; then
+    builder_llvm=$(otool -L "$compiler" |
+        sed -n 's/.*libLLVM.*current version \([0-9][0-9]*\)\..*/\1/p' | sed -n 1p)
+    target_llvm=$(llvm-config --version 2>/dev/null | cut -d. -f1)
+    if [[ -n $builder_llvm && -n $target_llvm && $builder_llvm != "$target_llvm" ]]; then
+        builder_prefix=${ABLA_BOOTSTRAP_LLVM:-$(brew --prefix "llvm@$builder_llvm")}
+        if [[ ! -x $builder_prefix/bin/opt ]]; then
+            printf '%s links LLVM %s: install llvm@%s or set ABLA_BOOTSTRAP_LLVM\n' \
+                "$compiler" "$builder_llvm" "$builder_llvm" >&2
+            exit 1
+        fi
+        export ABLA_MACOS_LLVM_LIB=${ABLA_MACOS_LLVM_LIB:-$(llvm-config --libdir)}
+        export PATH="$builder_prefix/bin:$PATH"
+    fi
+fi
+
 printf -v build_command \
     '%q build %q -o %q --no-cache' \
     "$compiler" "$entry" "$output"

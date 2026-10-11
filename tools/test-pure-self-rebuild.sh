@@ -67,10 +67,10 @@ if [[ $(uname -s) == Darwin ]]; then
     else
         brew_command=/usr/local/bin/brew
     fi
-    llvm_prefix=$($brew_command --prefix llvm@21 2>/dev/null ||
-        $brew_command --prefix llvm)
-    lld_prefix=$($brew_command --prefix lld@21 2>/dev/null ||
-        $brew_command --prefix lld)
+    llvm_prefix=${ABLA_LLVM:-$($brew_command --prefix llvm@23 2>/dev/null ||
+        $brew_command --prefix llvm)}
+    lld_prefix=${ABLA_LLD:-$($brew_command --prefix lld@23 2>/dev/null ||
+        $brew_command --prefix lld)}
     export PATH="$llvm_prefix/bin:$lld_prefix/bin:$PATH"
     ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
         "$project_root/tools/run-limited.sh" \

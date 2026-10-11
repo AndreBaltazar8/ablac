@@ -15,8 +15,8 @@ else
     exit 127
 fi
 
-llvm_prefix=$($brew_command --prefix llvm@21 2>/dev/null ||
-    $brew_command --prefix llvm)
+llvm_prefix=${ABLA_LLVM:-$($brew_command --prefix llvm@23 2>/dev/null ||
+    $brew_command --prefix llvm)}
 sdk_root=$(xcrun --sdk macosx --show-sdk-path)
 exec "$llvm_prefix/bin/clang" \
     -isysroot "$sdk_root" \

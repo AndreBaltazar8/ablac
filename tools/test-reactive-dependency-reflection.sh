@@ -24,7 +24,7 @@ fi
 "$compiler" --emit-llvm "$source_file" > "$output_directory/first.ll"
 "$compiler" --emit-llvm "$source_file" > "$output_directory/second.ll"
 cmp "$output_directory/first.ll" "$output_directory/second.ll"
-opt --threads=1 -passes=verify -disable-output "$output_directory/first.ll"
+opt -passes=verify -disable-output "$output_directory/first.ll"
 
 fixtures=(
     invalid-reactive-early-query

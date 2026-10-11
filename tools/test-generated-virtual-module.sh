@@ -10,7 +10,7 @@ mkdir -p "$output_directory"
 "$compiler" --emit-llvm "$source_file" > "$output_directory/first.ll"
 "$compiler" --emit-llvm "$source_file" > "$output_directory/second.ll"
 cmp "$output_directory/first.ll" "$output_directory/second.ll"
-opt --threads=1 -passes=verify -disable-output "$output_directory/first.ll"
+opt -passes=verify -disable-output "$output_directory/first.ll"
 "$compiler" build "$source_file" -o "$output_directory/program" --no-cache
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"

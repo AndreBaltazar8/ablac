@@ -94,7 +94,7 @@ On a Mac, install Homebrew LLVM without enabling a blanket package
 upgrade, then build directly from the normal shell:
 
 ```sh
-HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@21 lld@21 openssl@3
+HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@23 lld@23 llvm@21 openssl@3
 make
 ```
 
@@ -103,6 +103,9 @@ bootstrap compiler, rebuilds the current Abla sources as a native Mach-O
 executable for LLVM's detected host triple, and uses Homebrew LLVM for native
 object emission and ORC execution. Each host uses its native compiler artifact
 published with `v0.2.15`; no Intel translation is involved on Apple Silicon.
+That artifact links `llvm@21`, so its first rebuild runs `llvm@21`'s tools and
+links the result against `llvm@23` (`tools/build-self-hosted-release.sh`),
+which runs with `llvm@23`'s tools from then on.
 Run `tools/test-macos-host.sh build/ablac` for the focused native host gate.
 
 Linux can also emit and link both macOS architectures. Point
@@ -116,7 +119,7 @@ ABLA_MACOS_SDK=/path/to/MacOSX.sdk \
   build/ablac src/orc_main.ab build/release/ablac
 ```
 
-The produced compiler binaries load Homebrew `llvm@21`; programs that import
+The produced compiler binaries load Homebrew `llvm@23`; programs that import
 TLS additionally load Homebrew `openssl@3`. The helper creates only ignored
 files under `build/` and never modifies the SDK.
 

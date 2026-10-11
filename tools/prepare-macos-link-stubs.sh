@@ -70,7 +70,7 @@ make_stub() {
 make_stub \
     "$llvm_library_directory/libLLVM.so" \
     "$output_directory/libLLVM.tbd" \
-    "$homebrew_prefix/opt/llvm@21/lib/libLLVM.dylib"
+    "$homebrew_prefix/opt/llvm/lib/libLLVM.23.1.dylib"
 make_stub \
     "$openssl_library_directory/libssl.so" \
     "$output_directory/libssl.tbd" \

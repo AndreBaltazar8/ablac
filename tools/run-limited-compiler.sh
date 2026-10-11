@@ -91,10 +91,10 @@ case ${1:-} in
                     brew_command=
                 fi
                 if [[ -n $brew_command ]]; then
-                    llvm_prefix=$($brew_command --prefix llvm@21 \
-                        2>/dev/null || $brew_command --prefix llvm)
-                    lld_prefix=$($brew_command --prefix lld@21 \
-                        2>/dev/null || $brew_command --prefix lld)
+                    llvm_prefix=${ABLA_LLVM:-$($brew_command --prefix llvm@23 \
+                        2>/dev/null || $brew_command --prefix llvm)}
+                    lld_prefix=${ABLA_LLD:-$($brew_command --prefix lld@23 \
+                        2>/dev/null || $brew_command --prefix lld)}
                     export PATH="$llvm_prefix/bin:$lld_prefix/bin:$PATH"
                 fi
             fi

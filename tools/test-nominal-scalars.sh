@@ -107,7 +107,7 @@ if grep -Eq 'define void @nominal_pin_round_trip\(ptr sret' \
     echo 'nominal scalar crossed a boxed function ABI' >&2
     exit 1
 fi
-opt --threads=1 -passes=default\<O2\> -S \
+opt -passes=default\<O2\> -S \
     "$output_directory/nominal-scalar.ll" \
     -o "$output_directory/nominal-scalar-optimized.ll"
 awk '

@@ -10,7 +10,7 @@ mkdir -p build/tests
 for triple in x86_64-unknown-linux-gnu i386-unknown-linux-gnu; do
     "$compiler" build "$fixture" -o "$output-$triple.o" \
         --target-triple "$triple" --object-format elf --emit object
-    opt '-passes=default<Oz>,globaldce' -S "$output-$triple.o.ll" -o "$output-$triple.opt.ll"
+    opt '-passes=default<O2>,globaldce' --force-attribute=minsize -S "$output-$triple.o.ll" -o "$output-$triple.opt.ll"
     # Dynamic input must reduce to an integer add, without boxing or calls.
     symbol=abla_scalar_default_unboxing
     alias_target=$(sed -n 's/^@abla_scalar_default_unboxing = alias .*ptr @\([^ ,]*\).*/\1/p' "$output-$triple.opt.ll")

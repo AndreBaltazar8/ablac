@@ -18,7 +18,7 @@ Abla source
 ```
 
 The bootstrap form emits deterministic textual LLVM IR and invokes `llc`.
-The final compiler binds LLVM 21's C API from Abla, runs the O2 pipeline, and
+The final compiler binds LLVM 23's C API from Abla, runs the O2 pipeline, and
 emits the object in-process. Both consume the same verified `BootstrapProgram`
 and tagged-value ABI as the compile-time evaluator. Production
 LLVM modules contain the value runtime itself: scalars, closures/cells, arrays,

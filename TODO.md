@@ -184,7 +184,7 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `lowerGlobalFunctionType` each look it up afresh), and dispatch the opcode table on the
   opcode's first byte. Worth perhaps 0.3-0.6% of a dev build; not measurable on a loaded
   machine.
-- [ ] **LLVM 23 (evaluated 2026-10-11, not adopted).** LLVM 23.1.3 (macOS arm64 release) against 21,
+- [ ] **LLVM 23 (macOS adopted 2026-10-11; Linux still on 21).** Evaluated with LLVM 23.1.3 (macOS arm64 release) against 21,
   with `a223373` built against each. Instructions retired by the compiler and every LLVM tool and
   wasm-opt, on a game's builds (one round; walls were inflated by external load):
 
@@ -202,24 +202,21 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   chunks and 4 LTO partitions still pay under 23 (wasm-ld −26% instructions; 4 partitions −32%
   wall, lower peak). Under 23 the compiler is a fixed point (`.ll` and binary).
 
-  Before a switch:
-  - opt and llc no longer take `--threads=1` (`src/toolchain.ab` 316, 325, 497, 533, 704, 727).
-    The linkers still take it.
-  - `default<Oz>` is gone ("use O2 with the minsize attribute"): the microcontroller pipeline,
-    `src/toolchain.ab:513`. `test-scalar-default-unboxing` fails on it.
-  - The compiler and the tools must move together. The compiler reads opt's bitcode back in
-    process (`LLVMParseIRInContext`, `src/toolchain.ab` 453, 778), so a libLLVM 21 compiler cannot
-    read 23's bitcode, and 23's text (`target_mem`) does not parse in 21's opt.
-  - These hardcode `llvm@21`: `tools/test-self-hosted.sh`, `tools/run-limited-compiler.sh`,
-    `tools/macos-clang.sh`, `tools/test-pure-self-rebuild.sh`, `tools/prepare-macos-link-stubs.sh`.
+  The switch: macOS uses Homebrew `llvm@23`/`lld@23` (23.1.2; `ABLA_LLVM`/`ABLA_LLD` override
+  the tool scripts' prefixes). The microcontroller pipeline is `default<O2>` with every
+  function `minsize` (23 has no `default<Oz>`). opt and llc no longer get `--threads=1` (ThinLTO's
+  option, a no-op there; a statically linked opt doesn't have it). The C API calls and the opcode
+  and type-kind numbers the compiler reads are unchanged in 23 (only `Br` was split). Verified:
+  a fixed point under 23 (also reached from the v0.2.15 bootstrap through the handoff), the
+  suite the same as under 21 (71/71), and a game's simulation hashes natively and in Wasm.
 
-  Installing it: Homebrew had no `llvm@23` yet (its `llvm` was 22.1.8). The release tarball has
-  no shared libLLVM, only static archives of LTO bitcode; a `libLLVM.dylib` linked from them
-  (with Polly and libedit, `-all_load`) took 6.4 minutes. So the options are Homebrew's `llvm@23`
-  once it ships, or a self-built libLLVM at a fixed path. A Linux image would take apt.llvm.org's
-  `llvm-23` and `lld-23` (with `libLLVM.so`).
-  Not measured: walls and frame times on a quiet machine, a game's HUD frame timing, the full
-  suite with scripts that know 23, and a Linux image build.
+  Still open:
+  - The bootstrap releases through v0.2.15 link libLLVM 21 and read opt's bitcode in process,
+    so they run with LLVM 21's tools. `tools/build-self-hosted-release.sh` hands over on macOS
+    (21's tools, 23's libLLVM), and `tools/docker/abla-service.Dockerfile` installs both LLVMs.
+    A bootstrap release built on 23 drops the handoff and `llvm@21`.
+  - Linux (the Nix pin, LLVM 21.1.1) and the portable Linux package stay on 21; the sources build
+    with either. The service image build on 23 is not yet verified.
 
 ## Not checked
 
