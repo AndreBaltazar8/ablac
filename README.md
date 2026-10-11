@@ -73,17 +73,17 @@ steps:
   - uses: actions/checkout@v6
   - uses: AndreBaltazar8/setup-abla@v1
     with:
-      version: '0.2.15'
+      version: '0.2.16'
   - run: ablac build app.ab -o build/app
 ```
 
 The action supports Linux x86-64 and both Apple Silicon and Intel macOS. Pin it
 to a full commit SHA when an immutable action reference is required.
 
-The Linux toolchain archive bundles its LLVM tools; from the release after 0.2.15
+The Linux toolchain archive bundles its LLVM tools; from v0.2.16
 it needs glibc 2.38 or later (Ubuntu 24.04, Debian 13). A macOS archive runs with
 Homebrew's, which must be the LLVM its compiler links, since the compiler reads
-`opt`'s bitcode back with its own libLLVM. From the release after 0.2.15, install
+`opt`'s bitcode back with its own libLLVM. From v0.2.16, install
 `brew install llvm@23 lld@23 openssl@3` (plus `binaryen` for Wasm), and
 `bin/ablac` puts `llvm@23` and `lld@23` first on PATH itself, whatever else PATH
 holds; `ABLA_LLVM` and `ABLA_LLD` name other prefixes of the same LLVM.
