@@ -184,7 +184,7 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `lowerGlobalFunctionType` each look it up afresh), and dispatch the opcode table on the
   opcode's first byte. Worth perhaps 0.3-0.6% of a dev build; not measurable on a loaded
   machine.
-- [ ] **LLVM 23 (macOS adopted 2026-10-11; Linux still on 21).** Evaluated with LLVM 23.1.3 (macOS arm64 release) against 21,
+- [ ] **LLVM 23 (adopted 2026-10-11 on macOS and Linux).** Evaluated with LLVM 23.1.3 (macOS arm64 release) against 21,
   with `a223373` built against each. Instructions retired by the compiler and every LLVM tool and
   wasm-opt, on a game's builds (one round; walls were inflated by external load):
 
@@ -210,14 +210,21 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   a fixed point under 23 (also reached from the v0.2.15 bootstrap through the handoff), the
   suite the same as under 21 (71/71), and a game's simulation hashes natively and in Wasm.
 
-  Still open:
-  - The bootstrap releases through v0.2.15 link libLLVM 21 and read opt's bitcode in process,
-    so they run with LLVM 21's tools. `tools/build-self-hosted-release.sh` hands over on macOS
-    (21's tools, 23's libLLVM), and `tools/docker/abla-service.Dockerfile` installs both LLVMs.
-    A bootstrap release built on 23 drops the handoff and `llvm@21`.
-  - Linux (the Nix pin, LLVM 21.1.1) and the portable Linux package stay on 21; the sources build
-    with either. The service image builds on 23 (verified 2026-10-11, linux/amd64: the v0.2.15
-    bootstrap on 21, the handoff to libLLVM.so.23.1, a service built on 23 runs).
+  Linux followed the same day: the development shell pins a nixpkgs with `llvmPackages_23`
+  (23.1.3), and the portable package bundles apt.llvm.org's LLVM 23. The Nix-built compiler binds
+  glibc 2.38's `fmod`/`fmodf`, so the Linux package needs glibc 2.38 or later (Ubuntu 24.04, Debian
+  13); 2.35 ran the LLVM 21 one. LLVM 23's wasm-ld also exports the mutable `__stack_pointer` under
+  `--export-dynamic`, so wasm-opt gets `--enable-mutable-globals` (older Binaryen rejects the
+  module otherwise; Homebrew's output is unchanged). Verified (linux/amd64): the v0.2.15 bootstrap
+  hands over to libLLVM.so.23.1, the result is a fixed point, the self-rebuild test's IR matches,
+  and the package runs native, Wasm and `run` builds on a clean Ubuntu 24.04 with no LLVM.
+
+  Still open, once a release built on 23 is the bootstrap (`tools/bootstrap-compiler.sh`):
+  - Drop the handoff from `tools/build-self-hosted-release.sh`, the previous nixpkgs pin
+    (`bootstrapPkgs`) from `shell.nix`, `llvm@21` from `release.yml` and the README, and
+    `BOOTSTRAP_LLVM_VERSION` from `tools/docker/abla-service.Dockerfile`.
+  - The glibc 2.38 floor: binding `fmod`/`fmodf` to their `GLIBC_2.2.5` versions (a `.symver`
+    in the hosted link) would bring the Linux package back to glibc 2.35.
 
 ## Not checked
 

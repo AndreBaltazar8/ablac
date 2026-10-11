@@ -116,8 +116,8 @@ if [[ -d $resource_dir ]]; then
     cp -R "$resource_dir" "$bundle/lib/clang/$resource_version"
 fi
 
-for package in binaryen clang-21 libbsd0 libedit2 libffi8 libgcc-s1 \
-    libicu70 libllvm21 liblzma5 libmd0 libssl3 libstdc++6 libtinfo6 \
+for package in binaryen clang-23 libbsd0 libedit2 libffi8 libgcc-s1 \
+    libicu70 libllvm23 liblzma5 libmd0 libssl3 libstdc++6 libtinfo6 \
     libxml2 libzstd1 zlib1g; do
     copyright="/usr/share/doc/$package/copyright"
     if [[ -r $copyright ]]; then

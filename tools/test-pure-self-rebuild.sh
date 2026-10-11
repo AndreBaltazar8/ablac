@@ -77,12 +77,12 @@ if [[ $(uname -s) == Darwin ]]; then
         "$output" build "$project_root/tests/cases/bootstrap/block.ab" \
         -o "$probe" --fast --no-cache || exit 1
 else
+    # The limits bound the compiler, not the shell's evaluation of nixpkgs.
     printf -v probe_build \
-        '%q build %q -o %q --fast --no-cache' \
-        "$output" "$project_root/tests/cases/bootstrap/block.ab" "$probe"
-    ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
+        'ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 %q %q build %q -o %q --fast --no-cache' \
         "$project_root/tools/run-limited.sh" \
-        nix-shell "$project_root/shell.nix" --run "$probe_build" || exit 1
+        "$output" "$project_root/tests/cases/bootstrap/block.ab" "$probe"
+    nix-shell "$project_root/shell.nix" --run "$probe_build" || exit 1
 fi
 set +e
 ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=20 \
