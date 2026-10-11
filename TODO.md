@@ -218,11 +218,7 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   module otherwise; Homebrew's output is unchanged). Verified (linux/amd64): the v0.2.15 bootstrap
   hands over to libLLVM.so.23.1, the result is a fixed point, the self-rebuild test's IR matches,
   and the package runs native, Wasm and `run` builds on a clean Ubuntu 24.04 with no LLVM.
-
-  Still open, once a release built on 23 is the bootstrap (`tools/bootstrap-compiler.sh`):
-  - Drop the handoff from `tools/build-self-hosted-release.sh`, the previous nixpkgs pin
-    (`bootstrapPkgs`) from `shell.nix`, `llvm@21` from `release.yml` and the README, and
-    `BOOTSTRAP_LLVM_VERSION` from `tools/docker/abla-service.Dockerfile`.
+  v0.2.16, built on 23, is the bootstrap since, so the LLVM 21 handoff is gone.
 
 ## Not checked
 

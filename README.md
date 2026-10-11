@@ -102,7 +102,7 @@ On a Mac, install Homebrew LLVM without enabling a blanket package
 upgrade, then build directly from the normal shell:
 
 ```sh
-HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@23 lld@23 llvm@21 openssl@3
+HOMEBREW_NO_AUTO_UPDATE=1 brew install llvm@23 lld@23 openssl@3
 make
 ```
 
@@ -110,13 +110,9 @@ The macOS host supports Intel and Apple Silicon. `make` downloads the pinned
 bootstrap compiler, rebuilds the current Abla sources as a native Mach-O
 executable for LLVM's detected host triple, and uses Homebrew LLVM for native
 object emission and ORC execution. Each host uses its native compiler artifact
-published with `v0.2.15`; no Intel translation is involved on Apple Silicon.
-That artifact links LLVM 21, so its first rebuild runs LLVM 21's tools and
-links the result against LLVM 23 (`tools/build-self-hosted-release.sh`), which
-runs with LLVM 23's tools from then on: `llvm@21` on a Mac, and on Linux the
-development shell's previous nixpkgs pin. `build/ablac` puts the tools of
-the LLVM `build/ablac.bin` links first on PATH (`ABLA_LLVM` and `ABLA_LLD` name
-other prefixes).
+published with `v0.2.16`; no Intel translation is involved on Apple Silicon.
+`build/ablac` puts the tools of the LLVM `build/ablac.bin` links first on PATH
+(`ABLA_LLVM` and `ABLA_LLD` name other prefixes), and the rebuilds run through it.
 Run `tools/test-macos-host.sh build/ablac` for the focused native host gate.
 
 Linux can also emit and link both macOS architectures. Point
@@ -170,7 +166,7 @@ make clean         # remove generated files
 ```
 
 On an empty build directory, `make` downloads the checksum-pinned native
-compiler for the host from `v0.2.15`, then immediately recompiles the current
+compiler for the host from `v0.2.16`, then immediately recompiles the current
 `src/` graph.
 No C++ compiler implementation or generated-C bootstrap is involved.
 

@@ -17,17 +17,14 @@
 # was developed against. When the sources need a newer compiler than the
 # pinned release, stage intermediate compiler source trees in the `ablac`
 # context as `bootstrap-chain/<NN>-<name>/`: each is built in order (--fast)
-# by the one before it, and the last builds the current sources. The pinned
-# release links LLVM BOOTSTRAP_LLVM_VERSION and reads that LLVM's opt output in
-# process, so it and the chain run with those tools; the current sources'
-# build links LLVM_VERSION's libLLVM, whose tools then build the service. Stage 2
-# compiles the service. The runtime stage
-# carries only the binary plus the system libraries it links: glibc, and
-# OpenSSL when the program imports TLS, JWT, or the async HTTPS client.
+# by the one before it, and the last builds the current sources. Every step
+# links LLVM_VERSION's libLLVM and runs with its tools. Stage 2 compiles the
+# service. The runtime stage carries only the binary plus the system libraries
+# it links: glibc, and OpenSSL when the program imports TLS, JWT, or the async
+# HTTPS client.
 
 FROM ubuntu:24.04 AS toolchain
 ARG LLVM_VERSION=23
-ARG BOOTSTRAP_LLVM_VERSION=21
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg lsb-release wget software-properties-common \
@@ -36,25 +33,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && bash llvm.sh ${LLVM_VERSION} \
     && apt-get install -y --no-install-recommends \
         lld-${LLVM_VERSION} llvm-${LLVM_VERSION}-dev libllvm${LLVM_VERSION} \
-    && if [ "${BOOTSTRAP_LLVM_VERSION}" != "${LLVM_VERSION}" ]; then \
-           bash llvm.sh ${BOOTSTRAP_LLVM_VERSION} \
-           && apt-get install -y --no-install-recommends \
-               llvm-${BOOTSTRAP_LLVM_VERSION} lld-${BOOTSTRAP_LLVM_VERSION} \
-               libllvm${BOOTSTRAP_LLVM_VERSION}; \
-       fi \
-    && mkdir -p /opt/llvm-link \
-    && ln -s /usr/lib/llvm-${LLVM_VERSION}/bin/llvm-config /opt/llvm-link/llvm-config \
     && rm -rf /var/lib/apt/lists/* llvm.sh
 ENV PATH=/usr/lib/llvm-${LLVM_VERSION}/bin:$PATH
 
 FROM toolchain AS compiler
-ARG BOOTSTRAP_LLVM_VERSION=21
 COPY --from=ablac . /opt/ablac
 WORKDIR /opt/ablac
 # The published bootstrap compiler was linked inside the Nix toolchain shell;
 # point its ELF interpreter path at the system loader.
-RUN bootstrap_path=/usr/lib/llvm-${BOOTSTRAP_LLVM_VERSION}/bin:$PATH \
-    && rm -rf build && tools/bootstrap-compiler.sh build/ablac.bin \
+RUN rm -rf build && tools/bootstrap-compiler.sh build/ablac.bin \
     && interpreter=$(readelf -l build/ablac.bin | sed -n 's/.*interpreter: \(.*\)]/\1/p') \
     && if [ -n "$interpreter" ] && [ ! -e "$interpreter" ]; then \
            mkdir -p "$(dirname "$interpreter")" \
@@ -62,14 +49,13 @@ RUN bootstrap_path=/usr/lib/llvm-${BOOTSTRAP_LLVM_VERSION}/bin:$PATH \
        fi \
     && for step in $(ls -d bootstrap-chain/*/ 2>/dev/null | sort); do \
            echo "bootstrap chain: $step" \
-           && (cd "$step" && PATH="$bootstrap_path" ABLA_SYSROOT="$PWD" ABLA_MAX_MEMORY_MB=6000 ABLA_MAX_SECONDS=3000 \
+           && (cd "$step" && ABLA_SYSROOT="$PWD" ABLA_MAX_MEMORY_MB=6000 ABLA_MAX_SECONDS=3000 \
                /opt/ablac/tools/run-limited.sh /opt/ablac/build/ablac.bin build src/orc_main.ab \
                -o /opt/ablac/build/ablac-step --no-cache --fast) \
            && mv build/ablac-step build/ablac.bin && rm -f build/ablac-step.ll || exit 1; \
        done \
     && rm -rf bootstrap-chain \
-    && PATH="/opt/llvm-link:$bootstrap_path" \
-        ABLA_SYSROOT=/opt/ablac ABLA_MAX_MEMORY_MB=6000 ABLA_MAX_SECONDS=3000 \
+    && ABLA_SYSROOT=/opt/ablac ABLA_MAX_MEMORY_MB=6000 ABLA_MAX_SECONDS=3000 \
         tools/run-limited.sh build/ablac.bin build src/orc_main.ab \
         -o build/ablac-current --no-cache \
     && mv build/ablac-current build/ablac.bin \
