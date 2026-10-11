@@ -55,3 +55,12 @@ LLVM, Clang, and the platform linker remain native toolchain dependencies.
 Linux pins them through Nix; macOS uses Homebrew LLVM and the system
 Mach-O linker. Removing those hosted dependencies is a separate freestanding goal described in
 [full-self-hosting.md](full-self-hosting.md).
+
+## Word-zero intrinsic transition
+
+Version 0.2.14 is the intermediate compiler from `bootstrap/word0-bridge`.
+Its standard library reads the value payload through its address so the pinned
+v0.2.13 compiler can build it. The resulting compiler understands
+`ablaRuntimeValueWord0` and can bootstrap the newer compiler sources.
+Release this bridge on all three hosts before updating the newer sources'
+bootstrap version and checksums.
