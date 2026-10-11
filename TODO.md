@@ -64,6 +64,12 @@ is a regression of `1a90db5`.
   with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
   `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
   not `parameterDefaults` (a method's defaults likewise).
+- [ ] **`tools/test-affine-move.sh` is stale.** It is in neither the Makefile nor
+  `abla-tests.json`, and fails on master before its fixtures: one of its native builds
+  stops at the link (`_abla_array_get` undefined). Its CFG-ownership fixtures still expect
+  `ir.verification:`; borrow conflicts are reported as `E_BORROW_CONFLICT` now (including
+  the three `invalid-compile-*-active-mutation` ones, named since a compile fun's validation
+  failures are). Update it as `test-borrow-lifetimes.sh` was, then run it in the suite.
 
 ## Packages
 
