@@ -23,7 +23,7 @@ ABLA_FINAL_SELFHOST_EMIT_MEMORY_MB=$final_emit_memory_mb \
 [[ ! -e $output.host.o ]] || exit 1
 # Runtime code is emitted from Abla source into the compiler module itself.
 nm "$output" | awk '{print $3}' |
-    rg '^_?abla_runtime_set_arguments$' >/dev/null
+    grep -E '^_?abla_runtime_set_arguments$' >/dev/null
 
 # The input compiler's production module is generation one; the module emitted
 # while it builds `output` is generation two. Compare those existing artifacts
