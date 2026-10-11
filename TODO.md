@@ -1,55 +1,12 @@
 # TODO
 
-Known failures found by compiling every `abla-*` package against ablac `1a90db5`
-(2026-10-08). Every item below fails with the previous compiler (`f49012f`) too: none
-is a regression of `1a90db5`.
+Open compiler, package, and performance work. The package audit began at
+`1a90db5` (2026-10-08); resolved entries were removed after the v0.2.15 Linux
+release checks on 2026-10-11. Platform and package checks still missing are
+called out below.
 
 ## Compiler and stdlib
 
-- [ ] **`utcIso8601Parse` fails IR verification.** `stdlib/abla/date/entry.ab`
-  `utcIso8601Parse` (line ~173) breaks an LLVM function check
-  (`E_IR_FUNCTION_VERIFICATION`). Any program that imports `abla/date` and reaches it
-  fails to build. Seen in most abla-graphics targets and in abla-doom's `src/main.ab`;
-  both pass the semantic pass first.
-  Not reproducible at `baccfbd` on macOS: abla-doom `src/main.ab`, abla-graphics
-  `examples/buffer-pool/main.ab` and a program calling `utcIso8601Parse` directly
-  pass the IR pass (with and without `--fast`) and stop only at the link (`-lvulkan`
-  isn't installed). The failing logs probably came from another compiler build or
-  stdlib tree; recheck on Linux before closing.
-- [x] **`ablaRuntimePointerFromAddress` is missing for the Android and embedded
-  targets.** Fixed in `314c080`: a non-hosted target that links a C library
-  (`libcFree` false: Android, ESP-IDF) gets the runtime and the libc platform again
-  (`bootstrapNativeBuildWithEmitterStateCache`); since `ca65e9a` only hosted and Wasm
-  targets got them. Libc-free targets stay runtime-neutral.
-  - abla-mobile's Android drivers and abla-food's `android_build.ab` now build both
-    objects (arm64, x86_64) and the packaging files; they stop at Gradle/the NDK (not
-    installed here). Package-side: abla-mobile's `runtime/native/CMakeLists.txt` still
-    compiles ablac's `runtime/abla_runtime.c` (removed in `93ce196`) and its C platform
-    layer implements that old C runtime ABI. The objects now carry the Abla runtime
-    (it calls `malloc`/`free`/`pthread_*`/`write`/`abort`; emulated TLS on Android),
-    so that native layer needs updating.
-  - abla-embedded: the ESP32-C6 (RISC-V) drivers build their objects; the Xtensa
-    drivers pass the compiler and stop at `llc` (no ESP LLVM with the Xtensa target
-    here). Untested at the ESP-IDF link: the runtime's thread-local is general-dynamic
-    TLS (`0dcbd67`), so an object that reaches the runtime references
-    `__tls_get_addr`, which ESP-IDF may not provide; a static-only target could use
-    local-exec.
-- [x] **Packages of packages don't resolve.** Fixed in `4e5fa1a`
-  (`bootstrapResolvePackageImport`): in a dependency's own copy (prepared
-  `.abla/packages/<dep>/source` or vendored `vendor/<dep>`), the dependency's own
-  `abla.lock` no longer ends the search; it continues to the enclosing project.
-  abla-compare's `servers/abla/main.ab`, `diagnostics/http_pipeline_memory.ab` and
-  `--project .` build offline.
-- [x] **xtensa intrinsics on the host target.** The crash is fixed in `d32ab95`: after a
-  lowering error the backend skips the passes, verifier and printer over the partial
-  module, so `dispatcher.ab` and `interrupt.ab` report
-  `E_LLVM_INSTRUCTION_UNSUPPORTED` and exit 1 instead of 139. Building them still needs
-  an Xtensa target, and `radio-mac-registers/build.ab` an `llc` with it.
-- [x] **`val x = #exportFunction(...)` exported nothing.** Found with the Android
-  objects: since `9ba9ab9` such a value wasn't a reachability root, so neither the
-  export nor the function reached LLVM (`exportCheckedFunction` was unaffected).
-  abla-mobile's apps and `tools/test-android-extension.sh` use this form. Fixed in
-  `087b3b6` (`bootstrapSourceInitializerWritesGlobal`).
 - [ ] **`abla/platform/host`'s `extern:"host"` functions have no native
   implementation.** They lived in the C host runtime removed in `93ce196`; only the
   compile-time evaluator implements a few. A native program that calls one fails at
@@ -74,6 +31,17 @@ is a regression of `1a90db5`.
 ## Packages
 
 Package-side work (not changed from ablac):
+
+- [ ] **abla-mobile's native layer still targets the removed C runtime.**
+  `runtime/native/CMakeLists.txt` compiles ablac's `runtime/abla_runtime.c`
+  (removed in `93ce196`), and the C platform layer implements that old ABI.
+  Compiler-side Android objects now contain the Abla runtime; update the package's
+  native layer and verify a complete Gradle/NDK build on both architectures.
+- [ ] **Verify abla-embedded's runtime at the ESP-IDF link.** RISC-V objects
+  compiled in the original audit; Xtensa builds still needed a matching ESP LLVM.
+  The audit also found general-dynamic TLS references (`__tls_get_addr`), which
+  ESP-IDF may not supply. Recheck the current TLS lowering with the actual target
+  toolchains and complete the ESP-IDF links before closing this item.
 
 - [ ] **abla-testrunner: `ablaHostIsMacOS` is ambiguous.** The package and the
   stdlib both define it, so `tests/parser_test.ab` and `tests/integration_test.ab`
@@ -113,7 +81,6 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   objects). Splitting the finished module does not pay: with 4 parts, llvm-split takes
   6.5 s while llc drops 11.0 → 3.5 s, so wall time is unchanged, total cycles grow 16% and
   the dev wasm grows 240 KB of data (constants stop merging across parts).
-  Release (LTO) and native builds still pass LLVM text between their steps.
 - [ ] **A release Wasm module is optimized four times** (`opt` O1, clang's O2 pre-link,
   wasm-ld's LTO O3, wasm-opt -O3; for a large game client about 28, 27, 70 and 35 s of a
   165 s build). Dropping a pre-link stage does not pay: its work moves into the later ones.
