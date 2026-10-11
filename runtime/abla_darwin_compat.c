@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <mach-o/dyld.h>
 #include <poll.h>
 #include <signal.h>
@@ -31,6 +32,22 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+
+// LLVM lowers llvm.roundeven.f64 to a libcall on baseline Intel Macs,
+// whose libSystem does not export roundeven. Unlike nearbyint this must not
+// depend on the caller's floating-point rounding mode.
+#if defined(__x86_64__)
+double roundeven(double value) {
+  if (!isfinite(value) || fabs(value) >= 0x1p52 || value == 0.0)
+    return value;
+  double lower = floor(value);
+  double fraction = value - lower;
+  double rounded = lower;
+  if (fraction > 0.5 || (fraction == 0.5 && fmod(lower, 2.0) != 0.0))
+    rounded = lower + 1.0;
+  return copysign(rounded == 0.0 ? 0.0 : fabs(rounded), value);
+}
+#endif
 
 static int linux_errno(int value) {
   switch (value) {
