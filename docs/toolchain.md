@@ -205,9 +205,8 @@ code generation today.
 `run` executes the same verified IR without compiling through C. The current
 bootstrap milestone executes textual LLVM IR with the Abla-authored ORC binding
 inside the final compiler process, avoiding object emission and native linking.
-When that IR selects a portable host capability, `run` builds and permanently
-loads a small PIC adapter before creating the ORC generation; host-free runs
-skip the adapter entirely.
+A program that selects a host capability resolves its host functions from the
+compiler process; no adapter library is built for the JIT.
 The bootstrap compiler retains a separate runner until the C bootstrap path is
 retired. The current `repl` retains one LLJIT session, compiles integer
 expressions transactionally, unloads each generation through an ORC resource

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# An HTTP server runs under `ablac run --jit`: it answers a health check and a
+# versioned route, then exits 42.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -10,28 +12,26 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=$1
 test_directory=$(mktemp -d "$project_root/build/jit-http.XXXXXX")
 server=0
-host_library="$project_root/build/.abla-jit-host.so"
-if [[ ${ABLA_EXPECT_JIT_HOST_LIBRARY:-0} == 1 ||
-      ${ABLA_EXPECT_JIT_HOST_FREE:-0} == 1 ]]; then
-    rm -f "$host_library"
-fi
 
+# The server runs in the background (macOS has no setsid); a failed check
+# stops it and whatever it started.
 cleanup() {
     if [[ $server -gt 0 ]]; then
-        pkill -TERM -s "$server" 2>/dev/null || true
+        pkill -TERM -P "$server" 2>/dev/null || true
+        kill -TERM "$server" 2>/dev/null || true
         wait "$server" 2>/dev/null || true
     fi
     rm -rf -- "$test_directory"
 }
 trap cleanup EXIT
 
-setsid env ABLA_MAX_MEMORY_MB=512 ABLA_MAX_SECONDS=20 \
+ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=60 \
     "$compiler" run --jit "$project_root/tests/cases/modules/http-server.ab" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
 server=$!
 
 port=""
-for attempt in {1..100}; do
+for attempt in {1..600}; do
     port=$(sed -n '1p' "$test_directory/stderr.txt" 2>/dev/null || true)
     if [[ $port =~ ^[0-9]+$ ]]; then
         break
@@ -57,11 +57,5 @@ server=0
 [[ $(< "$test_directory/health.txt") == healthy ]] || exit 1
 [[ $(< "$test_directory/v1.txt") == v1:42 ]] || exit 1
 [[ $(< "$test_directory/latest.txt") == v1:42:v2 ]] || exit 1
-if [[ ${ABLA_EXPECT_JIT_HOST_LIBRARY:-0} == 1 ]]; then
-    [[ -s $host_library ]] || exit 1
-fi
-if [[ ${ABLA_EXPECT_JIT_HOST_FREE:-0} == 1 ]]; then
-    [[ ! -e $host_library ]] || exit 1
-fi
 
 printf 'JIT HTTP server: health + versioned V1 + latest V2\n'

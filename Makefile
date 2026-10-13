@@ -112,6 +112,8 @@ test: ablac
 	tools/test-process-exit.sh $(COMPILER)
 	tools/test-main-void.sh $(COMPILER)
 	tools/test-run-built.sh $(COMPILER)
+	tools/test-jit-host-selection.sh $(COMPILER)
+	tools/test-jit-http.sh $(COMPILER)
 	tools/test-module-shadowing.sh $(COMPILER)
 	tools/test-string-helpers.sh $(COMPILER)
 	tools/test-proc-self-exe.sh $(COMPILER)
