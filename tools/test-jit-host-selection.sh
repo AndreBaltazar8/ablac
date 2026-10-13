@@ -11,7 +11,7 @@ library="$project_root/build/.abla-jit-host.so"
 rm -f "$library"
 set +e
 ABLA_MAX_MEMORY_MB=512 ABLA_MAX_SECONDS=30 \
-    "$project_root/tools/run-limited.sh" "$compiler" run \
+    "$project_root/tools/run-limited.sh" "$compiler" run --jit \
     "$project_root/tests/cases/bootstrap/block.ab"
 status=$?
 set -e
@@ -20,7 +20,7 @@ set -e
 
 set +e
 ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=30 \
-    "$project_root/tools/run-limited.sh" "$compiler" run \
+    "$project_root/tools/run-limited.sh" "$compiler" run --jit \
     "$project_root/tests/cases/modules/filesystem.ab"
 status=$?
 set -e
@@ -29,7 +29,7 @@ set -e
 
 set +e
 ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=30 \
-    "$project_root/tools/run-limited.sh" "$compiler" run \
+    "$project_root/tools/run-limited.sh" "$compiler" run --jit \
     "$project_root/tests/cases/modules/host-runtime.ab"
 status=$?
 set -e

@@ -135,7 +135,7 @@ no project-C host/platform symbols. Run current measurements independently
 with `make benchmark-native`.
 
 The final compiler now executes ORC in-process. A warm guarded
-`build/ablac run tests/cases/bootstrap/block.ab` measured 27 ms on the same
+`build/ablac run --jit tests/cases/bootstrap/block.ab` measured 27 ms on the same
 machine, including source loading, frontend work, LLVM IR generation, JIT
 materialization, and execution. A persistent REPL stress gate compiled,
 executed, unloaded, and allocation-reset 128 generations in 1.5 seconds.

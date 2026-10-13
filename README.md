@@ -179,7 +179,7 @@ build/ablac build program.ab -o build/program
 build/ablac build program.ab -o build/program --fast
 ABLA_MACOS_SDK=/path/to/MacOSX.sdk \
   build/ablac build program.ab --target arm64-macos -o build/program
-build/ablac run program.ab
+build/ablac run program.ab -- arguments
 build/ablac repl
 build/ablac serve program.ab
 ```

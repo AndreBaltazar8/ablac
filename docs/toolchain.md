@@ -16,10 +16,19 @@ ablac build app.ab -o build/app
 ablac build app.ab -o build/app --fast
 ablac build app.ab -o build/app --fast --no-cache
 ablac build app.ab -o build/app -g        # debug information in a release build
-ablac run app.ab
+ablac run app.ab -- arguments  # built (--o1, cached) and exec'd
+ablac run --jit app.ab     # compiled in process and called there
 ablac repl
 ablac serve app.ab
 ```
+
+`ablac run` builds the program through the build cache and execs it in its
+place, so an unchanged program starts without compiling and none of the
+compiler's memory stays behind. It takes the `--o1` profile; `--fast` and
+`--release` pick the others. The executable is kept as
+`build/.abla-run/<source path>`. The program keeps the standard streams, the
+working directory and the environment, and its `argv[0]` is the source path.
+`--jit` compiles it in process without optimization and calls it there.
 
 Built-in hosted targets are `x86_64-linux`, `x86_64-macos`, and
 `arm64-macos`. Cross-linking Mach-O on Linux requires `ABLA_MACOS_SDK`; optional

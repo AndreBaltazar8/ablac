@@ -7,6 +7,7 @@ import "abla/sys/linux/process"
 import "abla/llvm/orc"
 import "abla/llvm/aot"
 import "abla/runtime/memory"
+import "abla/bytes"
 
 // The guarded compiler launcher already supplies its process memory budget.
 // Feed a conservative portion of the same budget to Abla's tracked allocator
@@ -87,6 +88,63 @@ fun bootstrapRunInProcess(sourcePath: string, arguments: array<string> = []): in
     val prepared = bootstrapPrepareRun(sourcePath)
     var status = prepared.status
     if (status == 0) status = llvmOrcRunFile(prepared.llvmPath, sourcePath, arguments)
+    status
+}
+
+// The executable `ablac run` keeps for an entry: build/.abla-run/ and the
+// source path with every byte outside [A-Za-z0-9._-] as '_'.
+fun bootstrapRunExecutablePath(sourcePath: string): string {
+    val name = byteBuffer()
+    var index = 0
+    while (index < sourcePath.size) {
+        val byte = sourcePath[index]
+        val kept = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 46 || byte == 45 || byte == 95
+        name.appendByteValue(if (kept) byte else 95)
+        index = index + 1
+    }
+    "build/.abla-run/${name.toText()}"
+}
+
+// `ablac run` (unless --jit): builds the entry through the build cache, in the
+// --o1 profile unless `profile` is "fast" or "release", and execs the result.
+// The object cache is keyed by the compiler's image, the LLVM library and the
+// profile, so an unchanged program skips compiling, and a new compiler or
+// profile never reuses an old object. The executable is linked under a name
+// of this process's own and renamed into place: a run that overlaps another
+// of the same entry never rewrites a binary that is executing. The program
+// replaces this process, so it keeps the standard streams, the working
+// directory and the environment, and none of the compiler's memory; its
+// argv[0] is the source path, as under --jit.
+fun bootstrapRunBuilt(
+    sourcePath: string,
+    arguments: array<string>,
+    profile: string
+): int {
+    val output = bootstrapRunExecutablePath(sourcePath)
+    val staged = "$output.${linuxProcessId()}"
+    bootstrapOrcBalanced = profile == "o1"
+    bootstrapNativeSidecarRequested = false
+    var status = bootstrapOrcBuild(
+        sourcePath, staged, profile == "fast", true,
+        bootstrapTargetDescriptor(bootstrapHostTargetName()), "executable"
+    )
+    for (suffix in [".abi.json", ".ll", ".o", ".host.o", ".runtime.o",
+                    ".raw-runtime.o", ".o.bc"]) {
+        Path("$staged$suffix").remove()
+    }
+    if (status == 0 && !Path(staged).moveTo(Path(output))) {
+        linuxPrintStandardError("error: cannot place the program at $output\n")
+        status = 1
+    }
+    if (status != 0) {
+        Path(staged).remove()
+        return status
+    }
+    val argv: array<string> = [sourcePath]
+    for (argument in arguments) argv.append(argument)
+    status = linuxExecute(output, argv)
+    linuxPrintStandardError("error: cannot execute $output\n")
     status
 }
 
@@ -674,7 +732,7 @@ fun bootstrapRepl(): int {
 
 fun bootstrapOrcUsage(): int {
     linuxPrintStandardError(
-        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--no-sidecar] [--offline] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--o1] [--no-cache]  # build and run test programs (abla/test)\n       ablac run [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC execution\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
+        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--no-sidecar] [--offline] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--o1] [--no-cache]  # build and run test programs (abla/test)\n       ablac run [--o1 | --fast | --release | --jit] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # cached build, exec'd (--jit: in-process LLVM ORC)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
     )
     2
 }
@@ -935,8 +993,11 @@ fun main: int {
         var runValid = true
         var runProject = ""
         var runOffline = false
-        // `ablac run <file> -- a b …`: everything after `--` is the program's own
-        // arguments (processArgument(0…)); the run options come before it.
+        // `ablac run [--o1|--fast|--release|--jit] <file> -- a b …`: everything
+        // after `--` is the program's own arguments (processArgument(0…)); the
+        // run options come before it. The program is built (--o1 by default) and
+        // exec'd (bootstrapRunBuilt); --jit compiles it in process, unoptimized,
+        // and calls it there.
         var runCount = argumentCount
         val runArguments: array<string> = []
         var scan = 1
@@ -949,31 +1010,43 @@ fun main: int {
             runArguments.append(linuxArgument(scan))
             scan = scan + 1
         }
-        if (runCount == 2) runSource = argument1
-        if (runCount == 1) {
+        var runProfile = "o1"
+        val runOptions: array<string> = []
+        scan = 1
+        while (scan < runCount) {
+            val option = linuxArgument(scan)
+            if (option == "--o1") runProfile = "o1"
+            else if (option == "--fast") runProfile = "fast"
+            else if (option == "--release") runProfile = "release"
+            else if (option == "--jit") runProfile = "jit"
+            else runOptions.append(option)
+            scan = scan + 1
+        }
+        if (runOptions.size == 1) runSource = runOptions[0]
+        if (runOptions.size == 0) {
             val project = bootstrapProjectDescriptor(".")
             runValid = project.valid
             runSource = project.entry
             runProject = "."
             if (!runValid) linuxPrintStandardError("${project.diagnostic}\n")
         }
-        if (runCount == 3 && argument1 == "--project") {
-            val project = bootstrapProjectDescriptor(linuxArgument(2))
+        if (runOptions.size == 2 && runOptions[0] == "--project") {
+            val project = bootstrapProjectDescriptor(runOptions[1])
             runValid = project.valid
             runSource = project.entry
-            runProject = linuxArgument(2)
+            runProject = runOptions[1]
             if (!runValid) linuxPrintStandardError("${project.diagnostic}\n")
         }
-        if (runCount == 4 && argument1 == "--project" &&
-            linuxArgument(3) == "--offline") {
-            val project = bootstrapProjectDescriptor(linuxArgument(2))
+        if (runOptions.size == 3 && runOptions[0] == "--project" &&
+            runOptions[2] == "--offline") {
+            val project = bootstrapProjectDescriptor(runOptions[1])
             runValid = project.valid
             runSource = project.entry
-            runProject = linuxArgument(2)
+            runProject = runOptions[1]
             runOffline = true
             if (!runValid) linuxPrintStandardError("${project.diagnostic}\n")
         }
-        if (runCount > 4 || runSource == "") runValid = false
+        if (runOptions.size > 3 || runSource == "") runValid = false
         if (runValid && runProject != "") {
             val imported = bootstrapDiscoverImportProviders(runSource)
             if (imported.errors != 0) {
@@ -990,7 +1063,11 @@ fun main: int {
                 }
             }
         }
-        if (runValid) status = bootstrapRunInProcess(runSource, runArguments)
+        if (runValid && runProfile == "jit") {
+            status = bootstrapRunInProcess(runSource, runArguments)
+        } else if (runValid) {
+            status = bootstrapRunBuilt(runSource, runArguments, runProfile)
+        }
     }
     if (argumentCount >= 1 && argument0 == "serve") {
         var serveSource = ""

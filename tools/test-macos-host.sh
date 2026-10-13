@@ -58,7 +58,7 @@ expect_status_42 "$output_directory/filesystem"
 expect_status_42 "$output_directory/process-capture"
 
 expect_status_42 \
-    "$compiler" run "$project_root/tests/cases/bootstrap/block.ab"
+    "$compiler" run --jit "$project_root/tests/cases/bootstrap/block.ab"
 
 printf '%s\n' \
     'macOS host: Mach-O build, console, filesystem, process, and ORC paths passed'

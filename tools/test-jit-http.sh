@@ -26,7 +26,7 @@ cleanup() {
 trap cleanup EXIT
 
 setsid env ABLA_MAX_MEMORY_MB=512 ABLA_MAX_SECONDS=20 \
-    "$compiler" run "$project_root/tests/cases/modules/http-server.ab" \
+    "$compiler" run --jit "$project_root/tests/cases/modules/http-server.ab" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
 server=$!
 

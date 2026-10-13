@@ -110,6 +110,7 @@ test: ablac
 	tools/test-string-plus.sh $(COMPILER)
 	tools/test-process-exit.sh $(COMPILER)
 	tools/test-main-void.sh $(COMPILER)
+	tools/test-run-built.sh $(COMPILER)
 	tools/test-module-shadowing.sh $(COMPILER)
 	tools/test-string-helpers.sh $(COMPILER)
 	tools/test-proc-self-exe.sh $(COMPILER)
