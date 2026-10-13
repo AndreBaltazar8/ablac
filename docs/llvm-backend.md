@@ -153,7 +153,7 @@ without teaching the compiler any platform name. It does not export or retain
 the function by itself, so internal functions remain eligible for inlining and
 dead-code elimination.
 
-The `build/ablac run --jit` path drives LLVM ORC in-process through the typed
+The `build/ablac run` path drives LLVM ORC in-process through the typed
 C ABI. It resolves the exported Abla runtime, looks up `main`, and invokes it
 without AOT object emission or linking. The bootstrap compiler uses the same
 Abla binding in a separate runner until the C bootstrap path is retired. The

@@ -16,9 +16,9 @@ show Abla stacks and sources.
 | `--no-debug` | off, for any build |
 | `ABLA_DEBUG=1` / `ABLA_DEBUG=0` | on / off when no flag says otherwise; also reaches the programs a build program (`buildProgram`, `wasmBuildModule`) builds |
 
-`ablac run` builds as `ablac build` does in its profile (`--o1` by default),
-with debug information for `--fast` or when `ABLA_DEBUG` asks; `ablac run --jit`
-and `ablac serve` execute without debug information. The setting is
+`ablac run --built` builds as `ablac build` does in its profile (`--o1` by
+default), with debug information for `--fast` or when `ABLA_DEBUG` asks;
+`ablac run` (in process) and `ablac serve` execute without debug information. The setting is
 part of the build cache's identity, so switching it never reuses the other
 kind of object.
 

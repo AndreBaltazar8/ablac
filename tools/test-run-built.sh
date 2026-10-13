@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# `ablac run` builds the entry through the build cache (--o1 unless told
-# otherwise) and execs it: the program gets its arguments, the caller's
-# environment, working directory and standard input, and its exit status. A
-# second run reuses the cached object, --fast keeps a cache entry of its own,
-# and --jit (compiled in process) runs the same program.
+# `ablac run` compiles the program in process with the --o1 IR pipeline (--fast:
+# the fast one; --jit names the default) and calls it there; `run --built`
+# builds the entry through the build cache and execs it. Either way the program
+# gets its arguments, the caller's environment, working directory and standard
+# input, and its exit status. A second --built run reuses the cached object,
+# and --built --fast keeps a cache entry of its own.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -30,17 +31,23 @@ entries() {
 }
 
 rm -f "$executable"
+# In process: nothing is built.
 check
+check --fast
+check --jit
+[[ ! -e $executable ]] || exit 1
+# Built and exec'd.
+check --built
 [[ -x $executable ]] || exit 1
 before=$(entries inprocess-o1)
 [[ -n $before ]] || exit 1
-check
+check --built
 [[ $(entries inprocess-o1) == "$before" ]] || exit 1
-check --fast
+check --built --fast
 [[ -n $(entries inprocess-fast) ]] || exit 1
-check --jit
 # Nothing staged is left behind.
 [[ -z $(find build/.abla-run -name 'tests_cases_modules_run-built.ab.*') ]] || exit 1
-# An unannotated main exits 0 through run as well.
+# An unannotated main exits 0 either way.
 "$compiler" run tests/cases/modules/main-unannotated.ab > /dev/null
-echo "run built: cached build, exec'd with arguments, environment, directory and input"
+"$compiler" run --built tests/cases/modules/main-unannotated.ab > /dev/null
+echo "run: in process (--o1, --fast) and built (cached, exec'd), with arguments, environment, directory and input"

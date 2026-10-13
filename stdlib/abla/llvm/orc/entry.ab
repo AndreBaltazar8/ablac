@@ -26,6 +26,14 @@ noescape extern:"c" fun LLVMCreateMemoryBufferWithContentsOfFile(
 ): i32
 noescape extern:"c" fun LLVMDisposeMemoryBuffer(buffer: i64*): void
 noescape extern:"c" fun LLVMDisposeMessage(message: i64*): void
+noescape extern:"c" fun LLVMCreatePassBuilderOptions(): i64*
+noescape extern:"c" fun LLVMDisposePassBuilderOptions(options: i64*): void
+noescape extern:"c" fun LLVMRunPasses(
+    module: i64*,
+    passes: cstring,
+    machine: i64*,
+    options: i64*
+): i64*
 noescape extern:"c" fun LLVMParseIRInContext(
     context: i64*,
     buffer: i64*,
@@ -201,7 +209,18 @@ fun llvmOrcCreateSession(): LlvmOrcSession {
     session
 }
 
-fun LlvmOrcSession.addFile(path: string): LlvmOrcGeneration {
+// The IR pipelines of the middle profile (--o1: scalar promotion, the inliner
+// and local cleanup, without O2's loop and global passes) and of the fast one
+// (scalar promotion and CFG cleanup). The ahead-of-time profiles and the JIT
+// (`ablac run`) share them.
+fun llvmPassesBalanced(): string =
+    "function(mem2reg,simplifycfg),cgscc(inline,function(sroa,early-cse,instcombine<no-verify-fixpoint>,simplifycfg)),globaldce"
+
+fun llvmPassesFast(): string = "function(mem2reg,simplifycfg)"
+
+// Adds the module in `path`, after running the IR pipeline `passes` on it
+// (none when empty: the frontend's IR as it is).
+fun LlvmOrcSession.addFile(path: string, passes: string = ""): LlvmOrcGeneration {
     val nullPointer = nativeNullPointer()
     val buffer = nativePointerCell(nullPointer)
     val message = nativePointerCell(nullPointer)
@@ -229,6 +248,13 @@ fun LlvmOrcSession.addFile(path: string): LlvmOrcGeneration {
         if (status != 0) status = 121
     }
     if (status != 0 && status != 128 && status != 121) status = 120
+    if (status == 0 && passes != "") {
+        val options = LLVMCreatePassBuilderOptions()
+        status = llvmConsumeError(
+            LLVMRunPasses(module.load(), passes, nullPointer, options), 129
+        )
+        LLVMDisposePassBuilderOptions(options)
+    }
     var threadContext = nullPointer
     var threadModule = nullPointer
     var tracker = nullPointer
@@ -361,12 +387,18 @@ trusted fun llvmOrcCallMain(address: int, program: string, arguments: array<stri
 }
 
 // Returns the JIT-compiled program's main result. Infrastructure failures use
-// 120-128, keeping them distinct from normal compiler diagnostics. `arguments`
-// reach the program as processArgument(0…), with `program` (default: `path`) as
-// its argv[0].
-fun llvmOrcRunFile(path: string, program: string = "", arguments: array<string> = []): int {
+// 120-129 (129: the IR pipeline failed), keeping them distinct from normal
+// compiler diagnostics. `arguments` reach the program as processArgument(0…),
+// with `program` (default: `path`) as its argv[0]. `passes` is the IR pipeline
+// the module gets first (none when empty).
+fun llvmOrcRunFile(
+    path: string,
+    program: string = "",
+    arguments: array<string> = [],
+    passes: string = ""
+): int {
     val session = llvmOrcCreateSession()
-    val generation = session.addFile(path)
+    val generation = session.addFile(path, passes)
     var result = generation.status
     if (result == 0) {
         val lookup = session.lookup("main")

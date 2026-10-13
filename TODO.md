@@ -7,18 +7,16 @@ called out below.
 
 ## Compiler and stdlib
 
-- [ ] **`ablac run` returns to an in-process JIT.** The direction for `run` is a live JIT: a
-  running program loads code and redefines its own functions while it runs. Until the JIT path
-  is faster than building and executing, `run` builds through the cache and execs the result
-  (`1409c65`); `run --jit` keeps the JIT path, and its tests keep it working. What the JIT path
-  needs: the `--o1` IR pipeline on the module before it is added (`LLVMRunPasses`, as the build's
-  balanced profile does; today it gets no IR passes), a per-module object cache keyed like the
-  build cache (cached objects added with `LLVMOrcLLJITAddObjectFile`), and indirection stubs (ORC
-  lazy reexports or an indirect stubs manager) so a function can be redefined while the program
-  runs. `run` switches back to it once it beats build + exec. A scratch prototype of the first
-  step (the pipeline run on the JIT module, nothing cached) on 2026-10-13, against build + exec
-  cold/warm: a map exporter 5.98 s (JIT today 13.94 s; built 15.45/6.39 s), a map
-  builder 10.90 s (86.76 s; 10.58/9.52 s), a model generator 57.75 s (over 9 min; 62.4/62.0 s).
+- [ ] **`ablac run` becomes a live JIT.** The direction for `run` is a live in-process JIT: a
+  running program loads code and redefines its own functions while it runs. Done: the JIT
+  module gets the `--o1` IR pipeline (`--fast`: the fast one), which made `run` the in-process
+  path again; `run --built` builds through the cache and execs the result. Measured on
+  2026-10-13 against build + exec cold/warm: a map exporter 5.98 s (13.94 s without the
+  pipeline; built 15.45/6.39 s), a map builder 10.90 s (86.76 s; 10.58/9.52 s), a model
+  generator 57.75 s (over 9 min; 62.4/62.0 s). Next: a per-module object cache keyed like the
+  build cache (cached objects added with `LLVMOrcLLJITAddObjectFile`), so a rerun skips
+  compiling, and indirection stubs (ORC lazy reexports or an indirect stubs manager) so a
+  function can be redefined while the program runs.
 
 - [ ] **Flattening a rope clears its children without a fence.** `__ablaRuntimeStringDataSlow`
   (`stdlib/abla/runtime/self/entry.ab`) stores the flat copy at +40, then zeroes the four child

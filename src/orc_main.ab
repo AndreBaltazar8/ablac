@@ -84,10 +84,19 @@ fun bootstrapOrcEmit(sourcePath: string): int {
     status
 }
 
-fun bootstrapRunInProcess(sourcePath: string, arguments: array<string> = []): int {
+// `ablac run` (the default, and --jit): compiles the program in process, runs
+// the IR pipeline `passes` on it (the --o1 one unless --fast), and calls it
+// there through LLVM ORC.
+fun bootstrapRunInProcess(
+    sourcePath: string,
+    arguments: array<string> = [],
+    passes: string = ""
+): int {
     val prepared = bootstrapPrepareRun(sourcePath)
     var status = prepared.status
-    if (status == 0) status = llvmOrcRunFile(prepared.llvmPath, sourcePath, arguments)
+    if (status == 0) {
+        status = llvmOrcRunFile(prepared.llvmPath, sourcePath, arguments, passes)
+    }
     status
 }
 
@@ -106,8 +115,8 @@ fun bootstrapRunExecutablePath(sourcePath: string): string {
     "build/.abla-run/${name.toText()}"
 }
 
-// `ablac run` (unless --jit): builds the entry through the build cache, in the
-// --o1 profile unless `profile` is "fast" or "release", and execs the result.
+// `ablac run --built`: builds the entry through the build cache, in the --o1
+// profile unless `profile` is "fast" or "release", and execs the result.
 // The object cache is keyed by the compiler's image, the LLVM library and the
 // profile, so an unchanged program skips compiling, and a new compiler or
 // profile never reuses an old object. The executable is linked under a name
@@ -732,7 +741,7 @@ fun bootstrapRepl(): int {
 
 fun bootstrapOrcUsage(): int {
     linuxPrintStandardError(
-        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--no-sidecar] [--offline] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--o1] [--no-cache]  # build and run test programs (abla/test)\n       ablac run [--o1 | --fast | --release | --jit] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # cached build, exec'd (--jit: in-process LLVM ORC)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
+        "usage: ablac build [<file.ab> | --project <dir>] [-o output] [--emit executable|object|static-library|shared-library] [--fast | --o1] [-g | --debug | --no-debug] [--no-cache] [--no-sidecar] [--offline] [--target <name> | --target-triple <triple> --object-format <elf|macho|coff|wasm>]\n       targets: ${bootstrapSupportedTargets()}\n       ablac package update [--project <dir>]\n       ablac package vendor [--project <dir>] [--offline]\n       ablac test <file.ab>... [--o1] [--no-cache]  # build and run test programs (abla/test)\n       ablac run [--o1 | --fast] [--built | --release] [<file.ab> | --project <dir>] [--offline] [-- <program arguments>] # in-process LLVM ORC (--built: cached build, exec'd)\n       ablac repl                                # persistent definitions + expressions\n       ablac serve [<file.ab> | --project <dir>] # watched fast-build service\n       ablac analyze --stdio                     # persistent JSON-lines analysis service\n       ablac --emit-llvm <file.ab>\n"
     )
     2
 }
@@ -993,11 +1002,13 @@ fun main: int {
         var runValid = true
         var runProject = ""
         var runOffline = false
-        // `ablac run [--o1|--fast|--release|--jit] <file> -- a b …`: everything
-        // after `--` is the program's own arguments (processArgument(0…)); the
-        // run options come before it. The program is built (--o1 by default) and
-        // exec'd (bootstrapRunBuilt); --jit compiles it in process, unoptimized,
-        // and calls it there.
+        // `ablac run [--o1|--fast|--release|--jit|--built] <file> -- a b …`:
+        // everything after `--` is the program's own arguments
+        // (processArgument(0…)); the run options come before it. The program is
+        // compiled in process with the --o1 IR pipeline (--fast: the fast one)
+        // and called there (bootstrapRunInProcess; --jit names that default).
+        // --built builds it through the build cache and execs it
+        // (bootstrapRunBuilt), as --release always does.
         var runCount = argumentCount
         val runArguments: array<string> = []
         var scan = 1
@@ -1011,14 +1022,18 @@ fun main: int {
             scan = scan + 1
         }
         var runProfile = "o1"
+        var runBuilt = false
         val runOptions: array<string> = []
         scan = 1
         while (scan < runCount) {
             val option = linuxArgument(scan)
             if (option == "--o1") runProfile = "o1"
             else if (option == "--fast") runProfile = "fast"
-            else if (option == "--release") runProfile = "release"
-            else if (option == "--jit") runProfile = "jit"
+            else if (option == "--release") {
+                runProfile = "release"
+                runBuilt = true
+            } else if (option == "--built") runBuilt = true
+            else if (option == "--jit") runBuilt = false
             else runOptions.append(option)
             scan = scan + 1
         }
@@ -1063,8 +1078,11 @@ fun main: int {
                 }
             }
         }
-        if (runValid && runProfile == "jit") {
-            status = bootstrapRunInProcess(runSource, runArguments)
+        if (runValid && !runBuilt) {
+            status = bootstrapRunInProcess(
+                runSource, runArguments,
+                if (runProfile == "fast") llvmPassesFast() else llvmPassesBalanced()
+            )
         } else if (runValid) {
             status = bootstrapRunBuilt(runSource, runArguments, runProfile)
         }
