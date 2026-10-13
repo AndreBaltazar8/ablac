@@ -7,6 +7,14 @@ called out below.
 
 ## Compiler and stdlib
 
+- [ ] **Flattening a rope clears its children without a fence.** `__ablaRuntimeStringDataSlow`
+  (`stdlib/abla/runtime/self/entry.ab`) stores the flat copy at +40, then zeroes the four child
+  words so the collector frees the pieces. The readers (`__ablaRuntimeCopyString`,
+  `__ablaRuntimeStringWriteVectors`) load +40 before the children. That is enough while one
+  thread touches a string; before threads share strings, publish +40 with a release store and
+  load it with an acquire load (or flatten under the node's lock), so no reader loads the
+  children after another thread cleared them.
+
 - [ ] **`abla/platform/host`'s `extern:"host"` functions have no native
   implementation.** They lived in the C host runtime removed in `93ce196`; only the
   compile-time evaluator implements a few. A native program that calls one fails at

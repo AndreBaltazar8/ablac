@@ -838,8 +838,17 @@ trusted fun __ablaRuntimeCopyString(
     ablaRuntimeStoreI64(stack + 8, __ablaRuntimeWord1(value))
     while (count > 0) {
         count = count - 1
-        val data = ablaRuntimeLoadI64(stack + count * 16)
-        val storage = ablaRuntimeLoadI64(stack + count * 16 + 8)
+        var data = ablaRuntimeLoadI64(stack + count * 16)
+        var storage = ablaRuntimeLoadI64(stack + count * 16 + 8)
+        // A rope node that has its flat copy (+40) is read through the copy:
+        // flattening drops the node's children. Load +40 before them.
+        if (data == 0 && storage != 0) {
+            val flat = ablaRuntimeLoadI64(storage + 40)
+            if (flat != 0) {
+                data = flat
+                storage = ablaRuntimeLoadI64(storage)
+            }
+        }
         if (data != 0) {
             var index: int = 0
             while (index < storage) {
@@ -902,6 +911,15 @@ trusted fun __ablaRuntimeStringDataSlow(value: any, rope: int): int {
         __ablaRuntimeCopyString(value, allocated, 0)
         ablaRuntimeStoreU8(allocated + length, 0)
         ablaRuntimeStoreI64(rope + 40, allocated)
+        // The copy stands for the whole tree now: drop the children so the
+        // collector frees the pieces, and the node keeps only the copy. Every
+        // reader (CopyString, WriteVectors) loads +40 before the children.
+        // Single-threaded only (TODO.md): a concurrent reader could load the
+        // children after this clears them.
+        ablaRuntimeStoreI64(rope + 8, 0)
+        ablaRuntimeStoreI64(rope + 16, 0)
+        ablaRuntimeStoreI64(rope + 24, 0)
+        ablaRuntimeStoreI64(rope + 32, 0)
         allocated
     }
 }
@@ -946,6 +964,8 @@ trusted fun __ablaRuntimeStringWriteVectors(
             else 0
         if (skipped >= currentLength) skipped = skipped - currentLength
         else {
+            // A flattened node's copy (+40) is loaded before its children,
+            // which flattening drops.
             if (data == 0 && storage != 0) {
                 data = ablaRuntimeLoadI64(storage + 40)
             }
@@ -1033,12 +1053,44 @@ trusted fun __ablaRuntimeToString(value: any): any {
     result
 }
 
+// A concatenation of at most this many bytes is copied into one flat buffer
+// rather than joined by a rope node. A node costs 48 bytes before its header
+// and keeps both pieces alive (a string built by += kept every piece); a short
+// copy keeps only itself, and reading it takes the flat path. Longer results
+// stay ropes, so building a large string piece by piece stays linear.
+@inline
+trusted fun __ablaRuntimeStringFlatLimit(): int = 64
+
+// Copies a string's bytes to `destination`: a flat string directly, a rope
+// through CopyString.
+trusted fun __ablaRuntimeCopyStringBytes(value: any, destination: int): void {
+    val data = __ablaRuntimeWord0(value)
+    if (data != 0) {
+        val length = __ablaRuntimeWord1(value)
+        var index: int = 0
+        while (index < length) {
+            ablaRuntimeStoreU8(destination + index, ablaRuntimeLoadU8(data + index))
+            index = index + 1
+        }
+    } else if (__ablaRuntimeWord1(value) != 0) {
+        __ablaRuntimeCopyString(value, destination, 0)
+    }
+    return
+}
+
 trusted fun __ablaRuntimeStringConcat(left: any, right: any): any {
     val leftLength = __ablaRuntimeStringLengthValue(left)
     val rightLength = __ablaRuntimeStringLengthValue(right)
     if (leftLength == 0) right
     else if (rightLength == 0) left
-    else {
+    else if (leftLength + rightLength <= __ablaRuntimeStringFlatLimit()) {
+        val length = leftLength + rightLength
+        val data = __ablaRuntimeAllocateLayout(length + 1, 1)
+        __ablaRuntimeCopyStringBytes(left, data)
+        __ablaRuntimeCopyStringBytes(right, data + leftLength)
+        ablaRuntimeStoreU8(data + length, 0)
+        __ablaRuntimeStringStatic(data, length)
+    } else {
         val rope = __ablaRuntimeAllocateLayout(48, 6)
         ablaRuntimeStoreI64(rope, leftLength + rightLength)
         ablaRuntimeStoreI64(rope + 8, __ablaRuntimeWord0(left))
