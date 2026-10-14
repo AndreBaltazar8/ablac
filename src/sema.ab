@@ -8017,6 +8017,9 @@ class BootstrapAnalyzer(
         if (this.scalarBinaryExpression(expression)) {
             return this.inferScalarBinaryExpression(expression)
         }
+        // Each larger case is a @noinline function of its own, so an expression
+        // nested N deep holds N frames of this dispatch rather than of every
+        // case's locals.
         var result = "unknown"
         if (expression.kind == "integer") result = "i64"
         if (expression.kind == "float") result = "f64"
@@ -8024,318 +8027,51 @@ class BootstrapAnalyzer(
         if (expression.kind == "null") result = "null"
         if (expression.kind == "string") result = "string"
         if (expression.kind == "declaration.block") {
-            result = "DeclarationBlock"
-            if (this.compileDepth == 0) {
-                this.fail("declaration.block.compile-only")
-            }
+            result = bootstrapInferDeclarationBlock(this, expression, result)
         }
         if (expression.kind == "string.template") {
-            var part = 0
-            while (part < expression.children.size) {
-                // A borrowed part (a field read through an alias) is copied
-                // into the text there and then, so it is its element type.
-                val partType = bootstrapBorrowElementType(
-                    this.infer(expression.children[part])
-                )
-                // A float is written by abla/float/text's f64Text, the
-                // shortest text that reads back as it (as JavaScript does).
-                val float = partType == "f64" || partType == "f32"
-                if (float && this.findKind("f64Text") != "fun") {
-                    this.fail(
-                        "string.interpolation:$partType: import \"abla/float/text\" to interpolate a float"
-                    )
-                }
-                // A fixed-width integer is written as its decimal value.
-                val integer = bootstrapIsIntegerScalarType(partType) &&
-                    bootstrapNormalizeType(partType) != "char"
-                if (!float && !integer && partType != "string" &&
-                    partType != "bool" && partType != "null" &&
-                    partType != "any") {
-                    this.fail("string.interpolation:$partType")
-                }
-                part = part + 1
-            }
-            result = "string"
+            result = bootstrapInferStringTemplate(this, expression, result)
         }
         if (expression.kind == "compile") {
-            val effects = this.expressionCompileEffects(
-                expression.children[0]
-            )
-            val deniedEffects = bootstrapDeniedCompileEffects(
-                effects,
-                this.compileEffectGrants
-            )
-            val denied = bootstrapCompileEffectName(deniedEffects)
-            if (denied != "") {
-                val path = bootstrapCompileEffectPath(
-                    expression.children[0],
-                    this.declarations,
-                    this.compileEffects,
-                    bootstrapFirstCompileEffect(deniedEffects),
-                    0
-                )
-                this.fail("compile.effect-denied:$denied:$path")
-            }
-            this.compileDepth = this.compileDepth + 1
-            result = this.infer(expression.children[0])
-            this.compileDepth = this.compileDepth - 1
-            // f32 math runs at compile time, but its result becomes a
-            // program constant only as an f64.
-            val staged = bootstrapNormalizeType(result)
-            if (staged == "f32" || staged == "array:f32") {
-                this.fail(
-                    "compile.result:f32: return an f64 and narrow it with f64ToF32"
-                )
-            }
+            result = bootstrapInferCompile(this, expression, result)
         }
         if (expression.kind == "region") {
-            val previousScope = this.enterScope()
-            val previousRegionScope = this.regionScope
-            this.regionDepth = this.regionDepth + 1
-            this.regionScope = this.currentScope
-            result = this.infer(expression.children[0])
-            this.regionScope = previousRegionScope
-            this.regionDepth = this.regionDepth - 1
-            this.leaveScope(previousScope)
-            if (!bootstrapRegionResultIsIndependent(result) &&
-                !this.regionExpressionIsPromotion(expression.children[0])) {
-                this.fail("region.result:$result")
-            }
+            result = bootstrapInferRegion(this, expression, result)
         }
         if (expression.kind == "array") {
-            var elementType = "unknown"
-            var element = 0
-            while (element < expression.children.size) {
-                val found = this.infer(expression.children[element])
-                if (bootstrapIsBorrowType(found)) {
-                    this.fail("ownership.borrow-store:array")
-                }
-                if (elementType != "unknown" && elementType != found) {
-                    this.fail("array.element-type")
-                }
-                if (elementType == "unknown") elementType = found
-                element = element + 1
-            }
-            result = "array:$elementType"
+            result = bootstrapInferArray(this, expression, result)
         }
         if (expression.kind == "range.closed" ||
             expression.kind == "range.until") {
-            val beginType = this.infer(expression.children[0])
-            val endType = this.infer(expression.children[1])
-            if (beginType != "i64" || endType != "i64") {
-                this.fail("range.bound-type")
-            }
-            result = "array:i64"
+            result = bootstrapInferRange(this, expression, result)
         }
         if (expression.kind == "identifier") {
-            result = this.findType(expression.text)
-            val kind = this.findKind(expression.text)
-            if ((kind == "compile.val" || kind == "compile.var") &&
-                this.compileDepth == 0) {
-                this.fail("compile.value-runtime:${expression.text}")
-            }
-            if (result == "unknown") this.fail(
-                "identifier:${expression.text}@${expression.begin}"
-            )
-            if (result != "unknown" &&
-                this.nameIsDelegated(expression.text)) {
-                this.validateDelegatedRead(expression, expression.text)
-            }
-            if (result != "unknown") {
-                this.recordResolvedName(expression, result)
-            }
+            result = bootstrapInferIdentifier(this, expression, result)
         }
         if (expression.kind == "lambda" ||
             expression.kind == "lambda.move" ||
             expression.kind == "lambda.generator") {
-            this.validateLambdaCaptures(expression)
-            val previousScope = this.enterScope()
-            val previousResultType = this.currentResultType
-            val previousBorrowResultSource =
-                this.currentBorrowResultSource
-            val previousReturnedType = this.returnedType
-            val previousLoopDepth = this.loopDepth
-            val previousGeneratorDepth = this.generatorDepth
-            val previousYieldedType = this.yieldedType
-            val previousBody = this.currentBody
-            this.currentBody = expression
-            this.currentResultType = "inferred"
-            this.currentBorrowResultSource = ""
-            this.returnedType = "unknown"
-            this.loopDepth = 0
-            if (expression.kind != "lambda.generator") {
-                this.generatorDepth = 0
-                this.yieldedType = "unknown"
-            }
-            var parameters = ""
-            var parameter = 0
-            while (parameter + 1 < expression.children.size) {
-                val found = expression.children[parameter]
-                var parameterType = "unknown"
-                if (found.kind == "lambda.parameter" &&
-                    found.children.size > 0) {
-                    parameterType = bootstrapNormalizeType(
-                        found.children[0].text
-                    )
-                    if (parameter > 0) parameters = "$parameters,"
-                    parameters = "$parameters$parameterType"
-                    this.locals.append(BootstrapSymbol(
-                        found.text,
-                        "parameter",
-                        parameterType,
-                        this.currentScope,
-                        "",
-                        "abla:${this.currentSourceIdentity}:${found.begin}:parameter:${found.text}"
-                    ))
-                }
-                parameter = parameter + 1
-            }
-            val body = expression.children[expression.children.size - 1]
-            var bodyType = this.infer(body)
-            if (bootstrapIsBorrowType(bodyType)) {
-                this.fail("ownership.borrow-escape:lambda")
-            }
-            if (bodyType == "never") {
-                bodyType = this.returnedType
-            } else {
-                if (this.returnedType != "unknown") {
-                    bodyType = bootstrapJoinTypes(bodyType, this.returnedType)
-                } else bodyType = bodyType
-            }
-            this.currentResultType = previousResultType
-            this.currentBody = previousBody
-            this.currentBorrowResultSource = previousBorrowResultSource
-            this.returnedType = previousReturnedType
-            this.loopDepth = previousLoopDepth
-            if (expression.kind != "lambda.generator") {
-                this.generatorDepth = previousGeneratorDepth
-                this.yieldedType = previousYieldedType
-            }
-            this.leaveScope(previousScope)
-            val functionType = "function:($parameters)->$bodyType"
-            if (expression.kind == "lambda.move" ||
-                expression.kind == "lambda.generator") {
-                result = "once:$functionType"
-            } else if (this.lambdaRequiresMutableCall(expression)) {
-                result = "mut:$functionType"
-            } else result = functionType
+            result = bootstrapInferLambda(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "move") {
-            if (expression.children.size != 1) {
-                this.fail("move.arity")
-                result = "unknown"
-            } else {
-                val moved = expression.children[0]
-                if (moved.kind == "identifier") {
-                    if (bootstrapIsBorrowType(this.findType(moved.text))) {
-                        this.fail("ownership.borrow-move:${moved.text}")
-                    } else if (!this.hasMovableLocal(moved.text)) {
-                        this.fail("move.local")
-                    }
-                } else if (moved.kind == "delegate.project") {
-                    this.fail("delegate.move-projection")
-                } else if (moved.kind == "member" ||
-                           moved.kind == "index") {
-                    val root = bootstrapPlaceRootName(moved)
-                    if (root == "" || !this.hasMovableLocal(root)) {
-                        this.fail("ownership.place-owner:$root")
-                    }
-                    if (root != "" && this.typeHasDrop(this.findType(root))) {
-                        this.fail("ownership.place-drop:$root")
-                    }
-                } else {
-                    this.fail("move.local-or-place")
-                }
-                result = this.infer(moved)
-                if ((moved.kind == "member" || moved.kind == "index") &&
-                    !this.typeIsAffine(result)) {
-                    this.fail("ownership.place-non-affine")
-                }
-                result = result
-            }
+            result = bootstrapInferCallMove(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "Shared") {
-            if (expression.children.size != 1) {
-                this.fail("shared.arity")
-                result = "unknown"
-            } else {
-                val element = this.infer(expression.children[0])
-                if (bootstrapIsBorrowType(element)) {
-                    this.fail("ownership.borrow-store:Shared")
-                }
-                if (!this.typeIsAffine(element)) {
-                    this.fail("shared.element-affine:$element")
-                }
-                this.validateOwnershipTransfer(
-                    element,
-                    expression.children[0],
-                    "argument.Shared"
-                )
-                result = "shared:$element"
-            }
+            result = bootstrapInferCallShared(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "Mutex") {
-            if (expression.children.size != 1) {
-                this.fail("mutex.arity")
-                result = "unknown"
-            } else {
-                val element = this.infer(expression.children[0])
-                if (bootstrapIsBorrowType(element)) {
-                    this.fail("ownership.borrow-store:Mutex")
-                }
-                if (!this.typeIsAffine(element)) {
-                    this.fail("mutex.element-affine:$element")
-                }
-                this.validateOwnershipTransfer(
-                    element,
-                    expression.children[0],
-                    "argument.Mutex"
-                )
-                result = "mutex:$element"
-            }
+            result = bootstrapInferCallMutex(this, expression, result)
         }
         // `Map()` is an empty map whose type comes from where it is stored
         // (a declared local, field, parameter or result).
         if (expression.kind == "call" && expression.text == "Map") {
-            if (expression.children.size != 0) {
-                this.fail("map.arity")
-                result = "unknown"
-            } else result = "map:unknown:unknown"
+            result = bootstrapInferCallMap(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "Cell") {
-            if (expression.children.size != 1) {
-                this.fail("cell.arity")
-                result = "unknown"
-            } else {
-                val element = this.infer(expression.children[0])
-                if (!bootstrapCellElementIsCopy(element)) {
-                    this.fail("cell.element-copy:$element")
-                }
-                result = "cell:$element"
-            }
+            result = bootstrapInferCallCell(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "filledArray") {
-            // `filledArray(count, value)`: count copies of a value, in one
-            // allocation. Every slot holds the same value, so it must be one
-            // without identity: a number, a bool or a string.
-            if (expression.children.size != 2) {
-                this.fail("filledArray.arity")
-                result = "unknown"
-            } else {
-                if (this.infer(expression.children[0]) != "i64") {
-                    this.fail("filledArray.count")
-                }
-                val element = bootstrapNormalizeType(
-                    this.infer(expression.children[1])
-                )
-                if (element == "void" || element == "never" ||
-                    element == "null" ||
-                    (element != "string" &&
-                     !bootstrapRegionResultIsIndependent(element))) {
-                    this.fail("filledArray.element:$element")
-                }
-                result = "array:$element"
-            }
+            result = bootstrapInferCallFilledArray(this, expression, result)
         }
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
@@ -8345,421 +8081,16 @@ class BootstrapAnalyzer(
                 val overloaded = this.inferOverloadedCall(expression)
                 if (overloaded != "") return overloaded
             }
-            if (this.regionDepth > 0 &&
-                bootstrapRegionCallIsUnsafe(
-                    this.regionCalls,
-                    expression.text
-                )) {
-                this.fail("region.call-retention:${expression.text}")
-            }
-            if (this.regionDepth > 0) {
-                var retainedParameter = 0
-                while (retainedParameter < expression.children.size) {
-                    if (bootstrapRegionParameterIsRetaining(
-                        this.regionCalls,
-                        expression.text,
-                        retainedParameter
-                    ) && !this.regionExpressionIsOwned(
-                        expression.children[retainedParameter]
-                    )) {
-                        this.fail(
-                            "region.parameter-retention:${expression.text}#$retainedParameter"
-                        )
-                    }
-                    retainedParameter = retainedParameter + 1
-                }
-            }
-            if (this.functionRequiresTrust(expression.text) &&
-                this.trustedDepth == 0) {
-                this.fail("native.trust:${expression.text}")
-            }
-            val functionType = this.findType(expression.text)
-            val externalLibrary = this.functionExternalLibrary(
-                expression.text
-            )
-            if (externalLibrary == "inline-assembly") {
-                val assemblyTemplate = if (expression.children.size > 0) {
-                    bootstrapStaticString(expression.children[0])
-                } else BootstrapStaticString("", false)
-                val assemblyConstraints = if (expression.children.size > 1) {
-                    bootstrapStaticString(expression.children[1])
-                } else BootstrapStaticString("", false)
-                if (!this.functionRequiresTrust(expression.text) ||
-                    !this.functionIsNoEscape(expression.text)) {
-                    this.fail("inline-assembly.trusted-noescape")
-                }
-                if (expression.children.size < 2 ||
-                    !assemblyTemplate.valid || !assemblyConstraints.valid) {
-                    this.fail("inline-assembly.literal-template-constraints")
-                }
-                val assemblyResult = bootstrapNormalizeType(
-                    bootstrapFunctionResultType(functionType)
-                )
-                if (!bootstrapScalarTypeUnderlyingValid(assemblyResult) &&
-                    assemblyResult != "void") {
-                    this.fail("inline-assembly.scalar-result")
-                }
-                var assemblyParameter = 2
-                while (assemblyParameter <
-                       bootstrapFunctionParameterCount(functionType)) {
-                    if (!bootstrapScalarTypeUnderlyingValid(
-                        bootstrapNormalizeType(
-                            bootstrapFunctionParameterType(
-                                functionType, assemblyParameter
-                            )
-                        )
-                    )) {
-                        this.fail("inline-assembly.scalar-parameter")
-                    }
-                    assemblyParameter = assemblyParameter + 1
-                }
-            }
-            val symbolKind = this.findKind(expression.text)
-            val primitiveType = if (bootstrapScalarTypeUnderlyingValid(
-                bootstrapNormalizeType(expression.text)
-            )) bootstrapNormalizeType(expression.text) else ""
-            val contractModule = this.contractModuleForFunction(
-                expression.text
-            )
-            if (contractModule != "" && !this.allowContractCalls) {
-                this.fail(
-                    "contract.call.not-consumed:$contractModule::${bootstrapCanonicalDeclarationSourceName(expression.text)}"
-                )
-            }
-            if (this.regionDepth > 0 &&
-                bootstrapIsFunctionType(functionType) &&
-                symbolKind != "fun" && symbolKind != "extern" &&
-                symbolKind != "compile.fun" &&
-                !bootstrapIsNoEscapeFunctionType(functionType) &&
-                !this.regionNameIsOwned(expression.text)) {
-                this.fail("region.indirect-call-retention:${expression.text}")
-            }
-            if (!bootstrapIsFunctionType(functionType) &&
-                symbolKind != "class" && symbolKind != "type" &&
-                primitiveType == "") {
-                this.fail("call.target:${expression.text}")
-            }
-            var argument = 0
-            val resolvedArgumentTypes: array<string> = []
-            val resolvedParameterTypes: array<string> = []
-            val resolvedParameterKinds: array<string> = []
-            var resolvedInsertedDefaults = 0
-            val classDeclarationIndex = if (symbolKind == "class")
-                this.typeDeclarations.find(expression.text)
-            else -1
-            while (argument < expression.children.size) {
-                var expectedArgument = "unknown"
-                if (bootstrapIsFunctionType(functionType)) {
-                    val declaredParameterCount =
-                        this.functionParameterCount(expression.text)
-                    if (declaredParameterCount < 0) {
-                        expectedArgument = bootstrapFunctionParameterType(
-                            functionType,
-                            argument
-                        )
-                    } else if (argument < declaredParameterCount) {
-                        expectedArgument = this.functionParameterType(
-                            expression.text,
-                            argument
-                        )
-                    }
-                } else if (symbolKind == "class") {
-                    if (classDeclarationIndex >= 0) {
-                        val declaration =
-                            this.declarations[classDeclarationIndex]
-                        if (argument < declaration.parameterTypes.size) {
-                            expectedArgument = bootstrapNormalizeType(
-                                declaration.parameterTypes[argument]
-                            )
-                        }
-                    }
-                } else if (symbolKind == "type" || primitiveType != "") {
-                    expectedArgument = this.scalarTypeUnderlying(
-                        expression.text
-                    )
-                    if (primitiveType != "") expectedArgument = primitiveType
-                }
-                this.contextualizeLambdaParameters(
-                    expression.children[argument],
-                    expectedArgument
-                )
-                resolvedArgumentTypes.append(
-                    this.infer(expression.children[argument])
-                )
-                argument = argument + 1
-            }
-            if (bootstrapIsFunctionType(functionType)) {
-                val parameterCount = this.functionParameterCount(
-                    expression.text
-                )
-                var effectiveParameterCount = parameterCount
-                var requiredCount = this.functionRequiredParameterCount(
-                    expression.text
-                )
-                if (effectiveParameterCount < 0) {
-                    effectiveParameterCount =
-                        bootstrapFunctionParameterCount(functionType)
-                    requiredCount = effectiveParameterCount
-                }
-                if (effectiveParameterCount < 0 ||
-                    expression.children.size > effectiveParameterCount ||
-                    expression.children.size < requiredCount) {
-                    this.fail("function.arity:${expression.text}")
-                }
-                resolvedInsertedDefaults =
-                    effectiveParameterCount - expression.children.size
-                argument = 0
-                val argumentKinds: array<string> = []
-                val argumentTypes: array<string> = []
-                while (argument < expression.children.size &&
-                       argument < effectiveParameterCount) {
-                    val actual = resolvedArgumentTypes[argument]
-                    var expected = this.functionParameterType(
-                        expression.text,
-                        argument
-                    )
-                    if (parameterCount < 0) {
-                        expected = bootstrapFunctionParameterType(
-                            functionType,
-                            argument
-                        )
-                    }
-                    if (!bootstrapTypesCompatibleWithInferredNoEscape(
-                        expected,
-                        actual,
-                        expression.children[argument],
-                        this.regionCalls,
-                        this.declarations
-                    )) this.fail("function.argument:${expression.text}@${expression.children[argument].begin}:$expected:$actual")
-                    var parameterKind = "parameter"
-                    if (parameterCount >= 0) {
-                        parameterKind = this.functionParameterKind(
-                            expression.text,
-                            argument
-                        )
-                    } else {
-                        parameterKind = bootstrapFunctionParameterKind(
-                            functionType,
-                            argument
-                        )
-                    }
-                    if (parameterKind == "own") {
-                        if (bootstrapIsBorrowType(actual)) {
-                            this.fail("ownership.borrow-exclusive:${expression.text}")
-                        }
-                        this.validateOwnershipTransfer(
-                            expected,
-                            expression.children[argument],
-                            "argument.function.${expression.text}"
-                        )
-                    }
-                    if (parameterKind == "var") {
-                        if (bootstrapIsBorrowType(actual)) {
-                            this.fail("ownership.borrow-exclusive:${expression.text}")
-                        }
-                        this.validateMutableBorrowArgument(
-                            expression.children[argument],
-                            expected,
-                            "function.${expression.text}"
-                        )
-                    }
-                    argumentKinds.append(parameterKind)
-                    argumentTypes.append(expected)
-                    resolvedParameterKinds.append(parameterKind)
-                    resolvedParameterTypes.append(expected)
-                    argument = argument + 1
-                }
-                this.validateCallAliases(
-                    expression.children,
-                    argumentKinds,
-                    argumentTypes,
-                    "function.${expression.text}"
-                )
-            }
-            if (symbolKind == "class" && classDeclarationIndex >= 0) {
-                val declaration = this.declarations[classDeclarationIndex]
-                if (declaration.parameters.size !=
-                    expression.children.size) {
-                    this.fail("constructor.arity:${expression.text}")
-                }
-                var parameter = 0
-                while (parameter < declaration.parameters.size &&
-                       parameter < expression.children.size) {
-                    val actual = resolvedArgumentTypes[parameter]
-                    val expected = bootstrapNormalizeType(
-                        declaration.parameterTypes[parameter]
-                    )
-                    if (!bootstrapTypesCompatible(expected, actual)) {
-                        this.fail("constructor.argument:${expression.text}")
-                    }
-                    if (parameter < declaration.parameterKinds.size &&
-                        (declaration.parameterKinds[parameter] == "val" ||
-                         declaration.parameterKinds[parameter] == "var" ||
-                         declaration.parameterKinds[parameter] == "own")) {
-                        if (bootstrapIsBorrowType(actual) &&
-                            (this.typeIsAffine(expected) ||
-                             !this.typeNeedsManagedAliasTracking(expected))) {
-                            this.fail(
-                                "ownership.borrow-store:${expression.text}"
-                            )
-                        }
-                        this.validateOwnershipTransfer(
-                            expected,
-                            expression.children[parameter],
-                            "argument.constructor.${expression.text}"
-                        )
-                    }
-                    parameter = parameter + 1
-                }
-            }
-            if (symbolKind == "type" || primitiveType != "") {
-                var underlying = this.scalarTypeUnderlying(expression.text)
-                if (primitiveType != "") underlying = primitiveType
-                if (expression.children.size != 1) {
-                    this.fail("type.constructor-arity:${expression.text}")
-                }
-                if (expression.children.size == 1 &&
-                    !bootstrapScalarConversionCompatible(
-                        underlying, resolvedArgumentTypes[0]
-                    )) {
-                    this.fail("type.constructor-argument:${expression.text}")
-                }
-                result = if (primitiveType == "") expression.text
-                    else primitiveType
-            } else if (symbolKind == "class") {
-                result = expression.text
-                val storedSource = this.constructorStoredBorrowSource(
-                    expression
-                )
-                if (storedSource == "managed.unknown") {
-                    this.fail(
-                        "ownership.stored-reference-provenance:${expression.text}"
-                    )
-                } else if (storedSource == "managed.multiple") {
-                    this.fail(
-                        "ownership.stored-reference-multiple:${expression.text}"
-                    )
-                } else if (storedSource != "") {
-                    result = "borrow:$result"
-                }
-            } else {
-                result = bootstrapFunctionResultType(functionType)
-                if (bootstrapIsBorrowType(result) &&
-                    symbolKind != "fun" &&
-                    symbolKind != "compile.fun") {
-                    val sourceParameter =
-                        bootstrapFunctionBorrowResultParameter(functionType)
-                    if (sourceParameter < 0 ||
-                        sourceParameter >= expression.children.size) {
-                        this.fail(
-                            "ownership.borrow-return-indirect-source:${expression.text}"
-                        )
-                    }
-                    if (sourceParameter >= 0 &&
-                        bootstrapFunctionParameterKind(
-                            functionType,
-                            sourceParameter
-                        ) != "parameter") {
-                        this.fail(
-                            "ownership.borrow-return-indirect-mode:${expression.text}"
-                        )
-                    }
-                }
-                result = result
-            }
-            if (bootstrapIsFunctionType(functionType)) {
-                this.recordTypedCall(
-                    expression,
-                    result,
-                    "",
-                    this.topLevelFunctionHandle(expression.text),
-                    resolvedArgumentTypes,
-                    resolvedParameterTypes,
-                    resolvedParameterKinds,
-                    resolvedInsertedDefaults
-                )
-            }
+            result = bootstrapInferCall(this, expression, result)
         }
         if (expression.kind == "member") {
-            val rawReceiver = this.infer(expression.children[0])
-            val receiver = bootstrapBorrowElementType(rawReceiver)
-            if (expression.text == "size" &&
-                (receiver == "string" || bootstrapIsArrayType(receiver) ||
-                 bootstrapIsMapType(receiver))) {
-                result = "i64"
-            } else {
-                result = this.fieldType(receiver, expression.text)
-                if (result == "unknown") {
-                    this.fail("member:${receiver}.${expression.text}")
-                }
-                if (bootstrapIsBorrowType(rawReceiver) &&
-                    !bootstrapRegionResultIsIndependent(result)) {
-                    result = "borrow:$result"
-                }
-                result = result
-            }
-            val identity = this.fieldDeclarationIdentity(
-                receiver, expression.text
-            )
-            if (identity != "") this.resolvedNames.append(
-                BootstrapResolvedName(
-                    this.currentSourceIdentity,
-                    expression.end - expression.text.size,
-                    expression.end,
-                    expression.text,
-                    identity,
-                    bootstrapNormalizeType(result),
-                    "field"
-                )
-            )
+            result = bootstrapInferMember(this, expression, result)
         }
         if (expression.kind == "index") {
-            val rawReceiver = this.infer(expression.children[0])
-            val receiver = bootstrapBorrowElementType(rawReceiver)
-            val index = this.infer(expression.children[1])
-            if (index != "i64") this.fail("index.type")
-            if (receiver == "string") result = "i64"
-            else if (bootstrapIsArrayType(receiver)) {
-                result = bootstrapArrayElementType(receiver)
-                if (bootstrapIsBorrowType(rawReceiver) &&
-                    !bootstrapRegionResultIsIndependent(result)) {
-                    result = "borrow:$result"
-                }
-                result = result
-            } else {
-                this.fail("index.receiver:$receiver")
-                result = "unknown"
-            }
+            result = bootstrapInferIndex(this, expression, result)
         }
         if (expression.kind == "index.assign") {
-            this.validateBorrowMutation(
-                expression.children[0],
-                "index.assign"
-            )
-            val rawReceiver = this.infer(expression.children[0])
-            if (bootstrapIsBorrowType(rawReceiver)) {
-                this.fail("ownership.borrow-mutation:index.assign")
-            }
-            val receiver = bootstrapBorrowElementType(rawReceiver)
-            val index = this.infer(expression.children[1])
-            val value = this.infer(expression.children[2])
-            if (bootstrapIsBorrowType(value)) {
-                this.fail("ownership.borrow-store:index.assign")
-            }
-            if (index != "i64") this.fail("index.assign-index")
-            if (!bootstrapIsArrayType(receiver) ||
-                !bootstrapTypesCompatible(
-                    bootstrapArrayElementType(receiver),
-                    value
-                )) {
-                this.fail("index.assign-value")
-            }
-            this.validateRegionStore(
-                expression.children[0],
-                expression.children[2],
-                "index.assign"
-            )
-            result = value
+            result = bootstrapInferIndexAssign(this, expression, result)
         }
         if (expression.kind == "member.call") {
             val rawReceiver = this.infer(expression.children[0])
@@ -8768,831 +8099,48 @@ class BootstrapAnalyzer(
                 val overloaded = this.inferOverloadedMethodCall(expression, receiver)
                 if (overloaded != "") return overloaded
             }
-            if (this.regionDepth > 0 &&
-                bootstrapRegionMemberCallIsUnsafe(
-                    this.regionCalls,
-                    expression.text
-                )) {
-                this.fail("region.call-retention:${expression.text}")
-            }
-            if (this.regionDepth > 0 &&
-                bootstrapRegionReceiverCallIsRetaining(
-                    this.regionCalls,
-                    receiver,
-                    expression.text
-                ) &&
-                !this.regionExpressionIsOwned(expression.children[0])) {
-                this.fail(
-                    "region.receiver-retention:${receiver}.${expression.text}"
-                )
-            }
-            if (this.regionDepth > 0) {
-                val methodName = "$receiver.${expression.text}"
-                var retainedParameter = 1
-                while (retainedParameter < expression.children.size) {
-                    if (bootstrapRegionParameterIsRetaining(
-                        this.regionCalls,
-                        methodName,
-                        retainedParameter - 1
-                    ) && !this.regionExpressionIsOwned(
-                        expression.children[retainedParameter]
-                    )) {
-                        this.fail(
-                            "region.parameter-retention:$methodName#${retainedParameter - 1}"
-                        )
-                    }
-                    retainedParameter = retainedParameter + 1
-                }
-            }
-            if (bootstrapIsMapType(receiver)) {
-                result = this.inferMapCall(expression, rawReceiver, receiver)
-            } else if (bootstrapIsCellType(receiver)) {
-                val element = bootstrapCellElementType(receiver)
-                if (expression.text == "get") {
-                    if (expression.children.size != 1) {
-                        this.fail("cell.get.arity")
-                    }
-                    result = element
-                } else if (expression.text == "set") {
-                    if (expression.children.size != 2) {
-                        this.fail("cell.set.arity")
-                    } else {
-                        val value = this.infer(expression.children[1])
-                        if (!bootstrapTypesCompatible(element, value)) {
-                            this.fail("cell.set.value:$element:$value")
-                        }
-                    }
-                    result = "void"
-                } else {
-                    this.fail("cell.member:${expression.text}")
-                    result = "unknown"
-                }
-            } else if (bootstrapIsMutexType(receiver)) {
-                if (expression.text == "clone") {
-                    if (expression.children.size != 1) {
-                        this.fail("mutex.clone.arity")
-                    }
-                    result = receiver
-                } else if (expression.text == "with") {
-                    if (expression.children.size != 2) {
-                        this.fail("mutex.with.arity")
-                        result = "unknown"
-                    } else {
-                        val callbackExpression = expression.children[1]
-                        val callback = this.infer(callbackExpression)
-                        if (callbackExpression.kind != "identifier" ||
-                            !bootstrapIsFunctionType(callback) ||
-                            bootstrapFunctionParameterCount(callback) != 1) {
-                            this.fail("mutex.with.callback")
-                        }
-                        if (bootstrapIsFunctionType(callback) &&
-                            bootstrapFunctionParameterCount(callback) == 1) {
-                            if (bootstrapFunctionParameterKind(callback, 0) !=
-                                "var") {
-                                this.fail("mutex.with.callback-mode")
-                            }
-                            if (!bootstrapTypesCompatible(
-                                bootstrapMutexElementType(receiver),
-                                bootstrapFunctionParameterType(callback, 0)
-                            )) this.fail("mutex.with.callback-type")
-                            result = bootstrapFunctionResultType(callback)
-                            if (!bootstrapRegionResultIsIndependent(result)) {
-                                this.fail("mutex.with.result:$result")
-                            }
-                        }
-                    }
-                } else {
-                    this.fail("mutex.member:${expression.text}")
-                    result = "unknown"
-                }
-            } else if (bootstrapIsSharedType(receiver)) {
-                if (expression.children.size != 1) {
-                    this.fail("shared.${expression.text}.arity")
-                }
-                if (expression.text == "clone") result = receiver
-                else if (expression.text == "get") {
-                    result = "borrow:${bootstrapSharedElementType(receiver)}"
-                } else if (expression.text == "downgrade") {
-                    result = "weak:${bootstrapSharedElementType(receiver)}"
-                } else {
-                    this.fail("shared.member:${expression.text}")
-                    result = "unknown"
-                }
-            } else if (bootstrapIsWeakType(receiver)) {
-                if (expression.children.size != 1) {
-                    this.fail("weak.${expression.text}.arity")
-                }
-                if (expression.text == "clone") result = receiver
-                else if (expression.text == "upgrade") {
-                    result = "nullable:shared:${bootstrapWeakElementType(receiver)}"
-                } else if (expression.text == "isAlive") result = "bool"
-                else {
-                    this.fail("weak.member:${expression.text}")
-                    result = "unknown"
-                }
-            } else
-            if (expression.text == "append" &&
-                bootstrapIsArrayType(receiver)) {
-                if (bootstrapIsBorrowType(rawReceiver)) {
-                    this.fail("ownership.borrow-mutation:append")
-                }
-                this.validateBorrowMutation(
-                    expression.children[0],
-                    "append"
-                )
-                if (expression.children.size != 2) {
-                    this.fail("append.arity")
-                } else {
-                    val value = this.infer(expression.children[1])
-                    if (bootstrapIsBorrowType(value)) {
-                        this.fail("ownership.borrow-store:append")
-                    }
-                    if (!bootstrapTypesCompatible(
-                        bootstrapArrayElementType(receiver),
-                        value
-                    )) {
-                        this.fail("append.value")
-                    }
-                    this.validateOwnershipTransfer(
-                        bootstrapArrayElementType(receiver),
-                        expression.children[1],
-                        "append"
-                    )
-                    this.validateRegionStore(
-                        expression.children[0],
-                        expression.children[1],
-                        "append"
-                    )
-                }
-                result = "void"
-            } else if ((expression.text == "truncate" ||
-                        expression.text == "clear") &&
-                       bootstrapIsArrayType(receiver)) {
-                // `items.truncate(n)` keeps the first n elements (0 <= n <=
-                // size, else a trap) and `items.clear()` keeps none; the
-                // array keeps its capacity for what is appended next.
-                if (bootstrapIsBorrowType(rawReceiver)) {
-                    this.fail("ownership.borrow-mutation:${expression.text}")
-                }
-                this.validateBorrowMutation(
-                    expression.children[0],
-                    expression.text
-                )
-                val arity = if (expression.text == "clear") 1 else 2
-                if (expression.children.size != arity) {
-                    this.fail("${expression.text}.arity")
-                } else if (arity == 2 &&
-                           this.infer(expression.children[1]) != "i64") {
-                    this.fail("truncate.size")
-                }
-                if (this.typeIsAffine(bootstrapArrayElementType(receiver))) {
-                    this.fail("ownership.affine-drop:${expression.text}")
-                }
-                result = "void"
-            } else if (expression.text == "slice" && receiver == "string") {
-                if (expression.children.size != 3) {
-                    this.fail("slice.arity")
-                } else {
-                    val begin = this.infer(expression.children[1])
-                    val end = this.infer(expression.children[2])
-                    if (begin != "i64" || end != "i64") {
-                        this.fail("slice.index")
-                    }
-                }
-                result = "string"
-            } else {
-                val receiverKind = this.methodReceiverKind(
-                    receiver,
-                    expression.text
-                )
-                if (receiverKind == "var") {
-                    if (bootstrapIsBorrowType(rawReceiver)) {
-                        this.fail(
-                            "ownership.borrow-exclusive:${receiver}.${expression.text}"
-                        )
-                    }
-                    this.validateMutableBorrowArgument(
-                        expression.children[0],
-                        receiver,
-                        "receiver.${receiver}.${expression.text}"
-                    )
-                }
-                val parameterCount = this.methodParameterCount(
-                    receiver,
-                    expression.text
-                )
-                val requiredCount = this.methodRequiredParameterCount(
-                    receiver,
-                    expression.text
-                )
-                val suppliedCount = expression.children.size - 1
-                if (parameterCount < 0 || suppliedCount > parameterCount ||
-                    suppliedCount < requiredCount) {
-                    this.fail("method.arity:${receiver}.${expression.text}")
-                }
-                var argument = 1
-                val resolvedArgumentTypes: array<string> = []
-                val resolvedParameterTypes: array<string> = []
-                val resolvedParameterKinds: array<string> = []
-                val methodArguments: array<BootstrapExpression> = [
-                    expression.children[0]
-                ]
-                val methodKinds: array<string> = [receiverKind]
-                val methodTypes: array<string> = [receiver]
-                while (argument < expression.children.size) {
-                    val expected = this.methodParameterType(
-                        receiver,
-                        expression.text,
-                        argument - 1
-                    )
-                    this.contextualizeLambdaParameters(
-                        expression.children[argument],
-                        expected
-                    )
-                    val actual = this.infer(expression.children[argument])
-                    if (!bootstrapTypesCompatibleWithInferredNoEscape(
-                        expected,
-                        actual,
-                        expression.children[argument],
-                        this.regionCalls,
-                        this.declarations
-                    )) {
-                        this.fail("method.argument:${receiver}.${expression.text}@${expression.children[argument].begin}:$expected:$actual")
-                    }
-                    if (this.methodParameterKind(
-                            receiver,
-                            expression.text,
-                            argument - 1
-                        ) == "own") {
-                        if (bootstrapIsBorrowType(actual)) {
-                            this.fail(
-                                "ownership.borrow-exclusive:${receiver}.${expression.text}"
-                            )
-                        }
-                        this.validateOwnershipTransfer(
-                            expected,
-                            expression.children[argument],
-                            "argument.method.${receiver}.${expression.text}"
-                        )
-                    }
-                    if (this.methodParameterKind(
-                            receiver,
-                            expression.text,
-                            argument - 1
-                        ) == "var") {
-                        if (bootstrapIsBorrowType(actual)) {
-                            this.fail(
-                                "ownership.borrow-exclusive:${receiver}.${expression.text}"
-                            )
-                        }
-                        this.validateMutableBorrowArgument(
-                            expression.children[argument],
-                            expected,
-                            "method.${receiver}.${expression.text}"
-                        )
-                    }
-                    methodArguments.append(expression.children[argument])
-                    val selectedKind = this.methodParameterKind(
-                        receiver,
-                        expression.text,
-                        argument - 1
-                    )
-                    methodKinds.append(selectedKind)
-                    methodTypes.append(expected)
-                    resolvedArgumentTypes.append(actual)
-                    resolvedParameterTypes.append(expected)
-                    resolvedParameterKinds.append(selectedKind)
-                    argument = argument + 1
-                }
-                this.validateCallAliases(
-                    methodArguments,
-                    methodKinds,
-                    methodTypes,
-                    "method.${receiver}.${expression.text}"
-                )
-                result = this.methodResultType(receiver, expression.text)
-                this.recordTypedCall(
-                    expression,
-                    result,
-                    receiver,
-                    this.selectedMethodHandle(receiver, expression.text),
-                    resolvedArgumentTypes,
-                    resolvedParameterTypes,
-                    resolvedParameterKinds,
-                    parameterCount - suppliedCount
-                )
-            }
+            result = bootstrapInferMemberCall(
+                this, expression, rawReceiver, receiver, result
+            )
         }
         if (expression.kind == "member.assign") {
-            this.validateBorrowMutation(
-                expression.children[0],
-                "member.assign.${expression.text}"
-            )
-            val rawReceiver = this.infer(expression.children[0])
-            if (bootstrapIsBorrowType(rawReceiver)) {
-                this.fail("ownership.borrow-mutation:member.assign")
-            }
-            val receiver = bootstrapBorrowElementType(rawReceiver)
-            val expected = this.fieldType(receiver, expression.text)
-            val actual = this.infer(expression.children[1])
-            if (bootstrapIsBorrowType(actual)) {
-                this.fail("ownership.borrow-store:field.${expression.text}")
-            }
-            if (expected == "unknown" ||
-                !bootstrapTypesCompatible(expected, actual)) {
-                this.fail("member.assign:${receiver}.${expression.text}")
-            }
-            this.validateOwnershipTransfer(
-                expected,
-                expression.children[1],
-                "field.${expression.text}"
-            )
-            if (!this.fieldIsMutable(receiver, expression.text)) {
-                this.fail("member.immutable:${receiver}.${expression.text}")
-            }
-            this.validateRegionStore(
-                expression.children[0],
-                expression.children[1],
-                "field.${expression.text}"
-            )
-            result = actual
+            result = bootstrapInferMemberAssign(this, expression, result)
         }
         if (expression.kind == "block") {
-            val previousScope = this.enterScope()
-            result = "void"
-            var statement = 0
-            while (statement < expression.children.size) {
-                val inferred = expression.children[statement]
-                result = this.infer(inferred)
-                // After `if (x == null) return …` the rest of the block knows
-                // x is not null.
-                val after = bootstrapConditionAfterIf(inferred)
-                if (after != "") this.addNullableRefinements(
-                    inferred.children[0], after == "true"
-                )
-                statement = statement + 1
-            }
-            this.leaveScope(previousScope)
+            result = bootstrapInferBlock(this, expression, result)
         }
         if (expression.kind == "defer") {
-            if (expression.children.size != 1 ||
-                expression.children[0].kind == "missing") {
-                this.fail("defer.body")
-            }
-            if (expression.children.size == 1 &&
-                bootstrapExpressionContainsDeferredControl(
-                    expression.children[0]
-                )) this.fail("defer.control")
-            var deferredType = "once:function:()->void"
-            if (expression.children.size == 1 &&
-                expression.children[0].kind != "missing") {
-                deferredType = this.infer(BootstrapExpression(
-                    "lambda.move",
-                    "",
-                    expression.begin,
-                    expression.end,
-                    [expression.children[0]]
-                ))
-            }
-            if (deferredType != "once:function:()->void") {
-                this.fail("defer.result")
-            }
-            result = "void"
+            result = bootstrapInferDefer(this, expression, result)
         }
         if (expression.kind == "generator") {
-            if (expression.children.size != 1 ||
-                expression.children[0].kind == "missing") {
-                this.fail("generator.body")
-                result = "generator:unknown"
-            } else {
-                val previousGeneratorDepth = this.generatorDepth
-                val previousYieldedType = this.yieldedType
-                this.generatorDepth = this.generatorDepth + 1
-                this.yieldedType = "unknown"
-                val callable = this.infer(BootstrapExpression(
-                    "lambda.generator",
-                    "",
-                    expression.begin,
-                    expression.end,
-                    [expression.children[0]]
-                ))
-                val element = this.yieldedType
-                this.generatorDepth = previousGeneratorDepth
-                this.yieldedType = previousYieldedType
-                if (bootstrapFunctionResultType(callable) != "void") {
-                    this.fail("generator.result")
-                }
-                if (element == "unknown") this.fail("generator.empty")
-                result = "generator:$element"
-            }
+            result = bootstrapInferGenerator(this, expression, result)
         }
         if (expression.kind == "yield") {
-            if (this.generatorDepth <= 0) this.fail("yield.outside-generator")
-            var found = "unknown"
-            if (expression.children.size == 1) {
-                found = this.infer(expression.children[0])
-            } else this.fail("yield.value")
-            if (bootstrapIsBorrowType(found) || this.typeIsAffine(found)) {
-                this.fail("yield.affine:$found")
-            }
-            if (this.yieldedType == "unknown") this.yieldedType = found
-            else if (!bootstrapTypesCompatible(this.yieldedType, found)) {
-                this.fail("yield.type")
-            }
-            result = "void"
+            result = bootstrapInferYield(this, expression, result)
         }
         if (expression.kind == "task" || expression.kind == "thread") {
-            if (expression.children.size != 1 ||
-                expression.children[0].kind == "missing") {
-                this.fail("${expression.kind}.body")
-                result = "${expression.kind}:unknown"
-            } else {
-                if (expression.kind == "thread") {
-                    this.validateThreadCaptures(expression.children[0])
-                }
-                val callable = this.infer(BootstrapExpression(
-                    "lambda.move",
-                    "",
-                    expression.begin,
-                    expression.end,
-                    [expression.children[0]]
-                ))
-                val found = bootstrapFunctionResultType(callable)
-                if (bootstrapIsBorrowType(found) || this.typeIsAffine(found)) {
-                    this.fail("${expression.kind}.affine-result:$found")
-                }
-                result = "${expression.kind}:$found"
-            }
+            result = bootstrapInferTask(this, expression, result)
         }
         if (expression.kind == "await") {
-            var operation = "unknown"
-            if (expression.children.size == 1) {
-                operation = this.infer(expression.children[0])
-            } else this.fail("await.operation")
-            if (bootstrapIsTaskType(operation)) {
-                result = bootstrapTaskResultType(operation)
-            } else if (bootstrapIsThreadType(operation)) {
-                result = bootstrapThreadResultType(operation)
-            } else {
-                this.fail("await.type:$operation")
-                result = "unknown"
-            }
+            result = bootstrapInferAwait(this, expression, result)
         }
         if (expression.kind == "return") {
-            if (this.regionDepth > 0) this.fail("region.control:return")
-            var returned = "void"
-            if (expression.children[0].kind != "missing") {
-                returned = this.infer(expression.children[0])
-            }
-            this.validateBorrowReturn(
-                expression.children[0],
-                returned,
-                "return"
-            )
-            if (this.currentResultType == "") {
-                this.fail("return.outside-function")
-            }
-            if (this.currentResultType != "" &&
-                this.currentResultType != "inferred" &&
-                !this.typesCompatible(this.currentResultType, returned)) {
-                this.fail("return.type")
-            }
-            if (this.currentResultType != "" &&
-                this.currentResultType != "inferred" &&
-                !bootstrapIsBorrowType(this.currentResultType)) {
-                this.validateOwnershipTransfer(
-                    this.currentResultType,
-                    expression.children[0],
-                    "return"
-                )
-            }
-            if (this.returnedType == "unknown") this.returnedType = returned
-            else this.returnedType = bootstrapJoinTypes(
-                this.returnedType,
-                returned
-            )
-            result = "never"
+            result = bootstrapInferReturn(this, expression, result)
         }
         if (
             expression.kind == "local.val" ||
             expression.kind == "local.var"
         ) {
-            if (this.hasLocal(expression.text)) {
-                this.fail("local.duplicate:${expression.text}")
-            } else if (this.redeclaresParameter(expression.text)) {
-                this.fail("local.shadows-parameter:${expression.text}")
-            }
-            val delegated = expression.children.size > 0 &&
-                expression.children[0].kind == "delegate.initializer"
-            if (delegated) {
-                val initializer = expression.children[0]
-                val type = this.delegatedInitializerType(
-                    initializer,
-                    expression.text
-                )
-                val delegateType = bootstrapDelegatedStorageType(type)
-                this.validateOwnershipTransfer(
-                    delegateType,
-                    initializer.children[0],
-                    "delegate.${expression.text}"
-                )
-                val kind = if (expression.kind == "local.var") "var" else "val"
-                this.locals.append(BootstrapSymbol(
-                    expression.text,
-                    kind,
-                    type,
-                    this.currentScope,
-                    "",
-                    "abla:${this.currentSourceIdentity}:${expression.begin}:local:${expression.text}"
-                ))
-                if (this.regionDepth > 0 &&
-                    this.regionExpressionIsOwned(initializer.children[0])) {
-                    this.markRegionOwned(expression.text, this.currentScope)
-                }
-                result = "void"
-            } else {
-            val hasInitializer = expression.children[0].kind != "missing"
-            var initializerType = "unknown"
-            var borrowSource = ""
-            if (hasInitializer) {
-                // A lambda takes its parameter types from a declared
-                // function type, as an argument does from its parameter.
-                if (expression.children.size > 1 &&
-                    expression.children[1].text != "inferred") {
-                    this.contextualizeLambdaParameters(
-                        expression.children[0],
-                        bootstrapNormalizeType(expression.children[1].text)
-                    )
-                }
-                initializerType = this.infer(expression.children[0])
-                if (!bootstrapIsBorrowType(initializerType) &&
-                    this.typeNeedsManagedAliasTracking(initializerType) &&
-                    (expression.children[0].kind == "identifier" ||
-                     expression.children[0].kind == "member" ||
-                     expression.children[0].kind == "index" ||
-                     expression.children[0].kind == "delegate.project")) {
-                    val managedSource = this.borrowArgumentSource(
-                        expression.children[0]
-                    )
-                    if (managedSource != "") {
-                        initializerType = "borrow:$initializerType"
-                        borrowSource = managedSource
-                        this.managedAliasBegins.append(expression.begin)
-                        this.managedAliasEnds.append(expression.end)
-                        this.managedAliasSources.append(managedSource)
-                    }
-                }
-                if (bootstrapIsBorrowType(initializerType) &&
-                    expression.kind == "local.var") {
-                    this.fail(
-                        "ownership.borrow-mutable-local:${expression.text}"
-                    )
-                }
-                if (bootstrapIsBorrowType(initializerType)) {
-                    if (borrowSource == "" &&
-                        expression.children[0].kind == "identifier" &&
-                        this.nameIsDelegated(
-                            expression.children[0].text
-                        )) {
-                        borrowSource = expression.children[0].text
-                    }
-                    if (borrowSource == "") {
-                        borrowSource = this.borrowExpressionSource(
-                            expression.children[0]
-                        )
-                    }
-                    if (borrowSource == "") {
-                        this.fail("ownership.borrow-source:${expression.text}")
-                    }
-                    if (expression.children[0].kind == "call" &&
-                        this.findKind(expression.children[0].text) == "class") {
-                        this.managedAliasBegins.append(expression.begin)
-                        this.managedAliasEnds.append(expression.end)
-                        this.managedAliasSources.append(borrowSource)
-                    }
-                }
-            }
-            var type = initializerType
-            if (expression.children.size > 1 &&
-                expression.children[1].text != "inferred") {
-                val declaredType = bootstrapNormalizeType(
-                    expression.children[1].text
-                )
-                if (bootstrapIsBorrowType(initializerType)) {
-                    if (declaredType != initializerType &&
-                        declaredType != bootstrapBorrowElementType(
-                            initializerType
-                        )) {
-                        this.fail(
-                            "ownership.borrow-annotation:${expression.text}"
-                        )
-                    }
-                    type = initializerType
-                    bootstrapSemanticUnit()
-                } else {
-                    type = declaredType
-                    if (hasInitializer &&
-                        !bootstrapTypesCompatible(type, initializerType)) {
-                        this.fail("local.initializer:${expression.text}")
-                    }
-                    bootstrapSemanticUnit()
-                }
-                type = type
-            }
-            if (hasInitializer) {
-                if (expression.kind == "local.val" &&
-                    !bootstrapIsBorrowType(type) &&
-                    this.typeNeedsManagedAliasTracking(type) &&
-                    this.expressionProducesFreshManagedReference(
-                        expression.children[0],
-                        0,
-                        true
-                    )) borrowSource = "managed.fresh"
-                if (borrowSource == "" && expression.kind == "local.val" &&
-                    !bootstrapIsBorrowType(type) &&
-                    this.managedReferenceIsStatic(expression.children[0])) {
-                    borrowSource = "managed.static"
-                }
-                this.validateOwnershipTransfer(
-                    type,
-                    expression.children[0],
-                    "local.${expression.text}"
-                )
-            }
-            if (!hasInitializer) {
-                if (expression.kind != "local.var") {
-                    this.fail("local.uninitialized-val:${expression.text}")
-                }
-                if (expression.children.size < 2 ||
-                    expression.children[1].text == "inferred") {
-                    this.fail("local.uninitialized-type:${expression.text}")
-                }
-            }
-            val kind = if (expression.kind == "local.var") "var" else "val"
-            this.locals.append(BootstrapSymbol(
-                expression.text,
-                kind,
-                type,
-                this.currentScope,
-                borrowSource,
-                "abla:${this.currentSourceIdentity}:${expression.begin}:local:${expression.text}"
-            ))
-            if (this.regionDepth > 0 && hasInitializer &&
-                this.regionExpressionIsOwned(expression.children[0])) {
-                this.markRegionOwned(expression.text, this.currentScope)
-            }
-            result = "void"
-            }
+            result = bootstrapInferLocal(this, expression, result)
         }
         if (expression.kind == "assign") {
-            val delegated = this.nameIsDelegated(expression.text)
-            val target = this.findType(expression.text)
-            val value = this.infer(expression.children[0])
-            if (target != "unknown") {
-                this.recordResolvedName(expression, target)
-            }
-            if (bootstrapIsBorrowType(value)) {
-                this.fail("ownership.borrow-store:assignment.${expression.text}")
-            }
-            if (target == "unknown" ||
-                !bootstrapTypesCompatible(target, value)) {
-                this.fail(
-                    "assignment.type:${expression.text}@${expression.begin}"
-                )
-            }
-            if (delegated) {
-                val delegateType = this.delegateType(expression.text)
-                val setterInput = this.methodParameterType(
-                    delegateType,
-                    "setValue",
-                    0
-                )
-                this.validateOwnershipTransfer(
-                    setterInput,
-                    expression.children[0],
-                    "delegate.setter.${expression.text}"
-                )
-                this.validateBorrowMutation(
-                    BootstrapExpression(
-                        "identifier",
-                        expression.text,
-                        expression.begin,
-                        expression.end,
-                        []
-                    ),
-                    "delegate.setter.${expression.text}"
-                )
-                this.recordTypedCall(
-                    expression,
-                    "void",
-                    delegateType,
-                    this.selectedMethodHandle(delegateType, "setValue"),
-                    [value],
-                    [setterInput],
-                    [this.methodParameterKind(
-                        delegateType,
-                        "setValue",
-                        0
-                    )],
-                    0
-                )
-            } else this.validateOwnershipTransfer(
-                    target,
-                    expression.children[0],
-                    "assignment.${expression.text}"
-                )
-            if (this.hasVisibleLocal(expression.text) &&
-                !this.localIsMutable(expression.text)) {
-                this.fail("assignment.immutable:${expression.text}")
-            }
-            if (!this.hasVisibleLocal(expression.text) &&
-                this.currentOwner != "" &&
-                this.fieldType(this.currentOwner, expression.text) != "unknown" &&
-                !this.fieldIsMutable(this.currentOwner, expression.text)) {
-                this.fail("field.immutable:${expression.text}")
-            }
-            if (!this.hasVisibleLocal(expression.text) &&
-                this.findKind(expression.text) == "val") {
-                this.fail("global.immutable:${expression.text}")
-            }
-            val assignmentTarget = BootstrapExpression(
-                "identifier",
-                expression.text,
-                expression.begin,
-                expression.end,
-                []
-            )
-            if (!delegated) this.validateRegionStore(
-                    assignmentTarget,
-                    expression.children[0],
-                    "assignment.${expression.text}"
-                )
-            if (this.regionDepth > 0 &&
-                this.hasVisibleLocal(expression.text) &&
-                this.scopeIsWithin(
-                    this.visibleLocalScope(expression.text),
-                    this.regionScope
-                ) && this.regionExpressionIsOwned(expression.children[0])) {
-                this.markRegionOwned(
-                    expression.text,
-                    this.visibleLocalScope(expression.text)
-                )
-            }
-            result = value
+            result = bootstrapInferAssign(this, expression, result)
         }
         if (expression.kind == "delegate.project") {
-            if (expression.children.size != 1 ||
-                expression.children[0].kind != "identifier") {
-                this.fail(
-                    "delegate.not-delegated:delegate projection requires an addressable delegated binding"
-                )
-                result = "unknown"
-            } else {
-                val name = expression.children[0].text
-                if (!this.nameIsDelegated(name)) {
-                    this.fail("delegate.not-delegated:`$name` has ordinary storage")
-                    result = "unknown"
-                } else result = this.delegateType(name)
-            }
+            result = bootstrapInferDelegateProject(this, expression, result)
         }
         if (expression.kind == "delegate.assign") {
-            var name = ""
-            if (expression.children.size == 2 &&
-                expression.children[0].kind == "identifier") {
-                name = expression.children[0].text
-            }
-            if (name == "" || !this.nameIsDelegated(name)) {
-                this.fail("delegate.not-delegated:projection target has ordinary storage")
-                if (expression.children.size > 1) {
-                    result = this.infer(expression.children[1])
-                }
-            } else {
-                val expected = this.delegateType(name)
-                val actual = this.infer(expression.children[1])
-                if (!this.delegatedNameIsMutable(name)) {
-                    this.fail("delegate.replace-val:`$name` is declared `val`")
-                }
-                if (!bootstrapTypesCompatible(expected, actual)) {
-                    this.fail(
-                        "delegate.type-mismatch:`^$name` stores `$expected`, not `$actual`"
-                    )
-                }
-                this.validateOwnershipTransfer(
-                    expected,
-                    expression.children[1],
-                    "delegate.replace.$name"
-                )
-                this.validateBorrowMutation(
-                    expression.children[0],
-                    "delegate.replace.$name"
-                )
-                this.validateRegionStore(
-                    expression.children[0],
-                    expression.children[1],
-                    "delegate.replace.$name"
-                )
-                result = actual
-            }
+            result = bootstrapInferDelegateAssign(this, expression, result)
         }
         if (
             expression.kind == "unary-" ||
@@ -9603,12 +8151,7 @@ class BootstrapAnalyzer(
                 val operated = this.inferOperatorCall(expression, [operand])
                 if (operated != "") return operated
             }
-            result = this.scalarValueType(operand)
-            if (!bootstrapIsNumericScalarType(result)) {
-                this.failScalarExpression(
-                    "unary.numeric", expression, result, ""
-                )
-            }
+            result = bootstrapInferNegate(this, expression, operand, result)
         }
         if (expression.kind == "unary!") {
             result = this.infer(expression.children[0])
@@ -9616,161 +8159,35 @@ class BootstrapAnalyzer(
             result = "bool"
         }
         if (expression.kind == "unary~") {
-            result = this.scalarValueType(this.infer(expression.children[0]))
-            if (!bootstrapIsIntegerScalarType(result)) {
-                this.fail("bitwise.type")
-            }
+            result = bootstrapInferComplement(this, expression, result)
         }
         if (expression.kind == "&&" || expression.kind == "||") {
             result = this.inferLogicalExpression(expression)
         }
         if (expression.kind == "if") {
-            val condition = this.infer(expression.children[0])
-            if (condition != "bool") this.fail("if.condition")
-            val previousThenScope = this.enterScope()
-            this.addNullableRefinements(expression.children[0], true)
-            val thenType = this.infer(expression.children[1])
-            this.leaveScope(previousThenScope)
-            if (expression.children[2].kind == "missing") {
-                result = "void"
-            } else {
-                val previousElseScope = this.enterScope()
-                this.addNullableRefinements(expression.children[0], false)
-                val elseType = this.infer(expression.children[2])
-                this.leaveScope(previousElseScope)
-                result = bootstrapJoinTypes(thenType, elseType)
-            }
+            result = bootstrapInferIf(this, expression, result)
         }
         if (expression.kind == "while") {
-            val condition = this.infer(expression.children[0])
-            if (condition != "bool") this.fail("while.condition")
-            this.loopDepth = this.loopDepth + 1
-            this.infer(expression.children[1])
-            this.loopDepth = this.loopDepth - 1
-            result = "void"
-            if (expression.children[0].kind == "true" &&
-                !bootstrapExpressionBreaksCurrentLoop(
-                    expression.children[1],
-                    0
-                )) result = "never"
+            result = bootstrapInferWhile(this, expression, result)
         }
         if (expression.kind == "do.while") {
-            this.loopDepth = this.loopDepth + 1
-            this.infer(expression.children[0])
-            this.loopDepth = this.loopDepth - 1
-            val condition = this.infer(expression.children[1])
-            if (condition != "bool") this.fail("do-while.condition")
-            result = "void"
-            if (expression.children[1].kind == "true" &&
-                !bootstrapExpressionBreaksCurrentLoop(
-                    expression.children[0],
-                    0
-                )) result = "never"
+            result = bootstrapInferDoWhile(this, expression, result)
         }
         if (expression.kind == "for") {
-            // `val b = a; for (n in b)`: a borrowed array iterates as one.
-            val sourceType = bootstrapBorrowElementType(
-                this.infer(expression.children[0])
-            )
-            var elementType = "unknown"
-            if (bootstrapIsArrayType(sourceType)) {
-                elementType = bootstrapArrayElementType(sourceType)
-            }
-            if (bootstrapIsGeneratorType(sourceType)) {
-                elementType = bootstrapGeneratorElementType(sourceType)
-            }
-            if (sourceType == "string") elementType = "i64"
-            if (elementType == "unknown") this.fail("for.source")
-            // An element of a global's array is as lasting as the global; one
-            // of a shared parameter's array is read-only like the parameter
-            // (`for (row in rows) row.append(x)` mutates the caller's rows).
-            val sharedRoot = this.sharedParameterRoot(expression.children[0])
-            val elementSource =
-                if (this.managedReferenceIsStatic(expression.children[0])) {
-                    "managed.static"
-                } else if (sharedRoot != "" &&
-                           this.typeNeedsManagedAliasTracking(elementType)) {
-                    "shared:$sharedRoot"
-                } else ""
-            val previousScope = this.enterScope()
-            this.locals.append(BootstrapSymbol(
-                expression.text,
-                "val",
-                elementType,
-                this.currentScope,
-                elementSource,
-                "abla:${this.currentSourceIdentity}:${expression.begin}:for:${expression.text}"
-            ))
-            this.loopDepth = this.loopDepth + 1
-            this.infer(expression.children[1])
-            this.loopDepth = this.loopDepth - 1
-            this.leaveScope(previousScope)
-            result = "void"
+            result = bootstrapInferFor(this, expression, result)
         }
         if (expression.kind == "break" || expression.kind == "continue") {
-            if (this.regionDepth > 0) {
-                this.fail("region.control:${expression.kind}")
-            }
-            if (this.loopDepth <= 0) this.fail(
-                "${expression.kind}.outside-loop"
-            )
-            result = "never"
+            result = bootstrapInferBreak(this, expression, result)
         }
         if (expression.kind == "when") {
-            val subject = this.infer(expression.children[0])
-            var branchType = "unknown"
-            var hasElse = false
-            var hasTrue = false
-            var hasFalse = false
-            val literalKeys: array<string> = []
-            if (expression.children.size == 1) this.fail("when.empty")
-            var branch = 1
-            while (branch + 1 < expression.children.size) {
-                val match = expression.children[branch]
-                if (match.kind == "missing") {
-                    if (hasElse) this.fail("when.else-duplicate")
-                    if (branch + 2 < expression.children.size) {
-                        this.fail("when.else-last")
-                    }
-                    hasElse = true
-                    bootstrapSemanticUnit()
-                } else {
-                    val matchType = this.infer(match)
-                    if (!bootstrapTypesCompatible(subject, matchType)) {
-                        this.fail("when.match")
-                    }
-                    if (match.kind == "true") hasTrue = true
-                    if (match.kind == "false") hasFalse = true
-                    val key = bootstrapWhenLiteralKey(match)
-                    if (key != "") {
-                        if (bootstrapAffineNamesContain(literalKeys, key)) {
-                            this.fail("when.duplicate:$key")
-                        } else literalKeys.append(key)
-                    }
-                    bootstrapSemanticUnit()
-                }
-                val found = this.infer(expression.children[branch + 1])
-                branchType = bootstrapJoinTypes(branchType, found)
-                branch = branch + 2
-            }
-            if (!hasElse && !(subject == "bool" && hasTrue && hasFalse)) {
-                this.fail("when.non-exhaustive:$subject")
-            }
-            result = branchType
+            result = bootstrapInferWhen(this, expression, result)
         }
         if (
             expression.kind == "==" || expression.kind == "!=" ||
             expression.kind == "<" || expression.kind == "<=" ||
             expression.kind == ">" || expression.kind == ">="
         ) {
-            // A borrow compares as what it borrows (`borrowed != null`).
-            val left = bootstrapBorrowElementType(this.infer(expression.children[0]))
-            val right = bootstrapBorrowElementType(this.infer(expression.children[1]))
-            if (!this.typesCompatible(left, right) &&
-                !this.typesCompatible(right, left)) {
-                this.fail("comparison.type")
-            }
-            result = "bool"
+            result = bootstrapInferComparison(this, expression, result)
         }
         this.recordTypedExpression(expression, result)
         result
@@ -10549,6 +8966,2037 @@ class BootstrapAnalyzer(
             this.managedAliasSources
         )
     }
+}
+
+@noinline
+fun bootstrapInferDeclarationBlock(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    result = "DeclarationBlock"
+    if (analyzer.compileDepth == 0) {
+        analyzer.fail("declaration.block.compile-only")
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferStringTemplate(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    var part = 0
+    while (part < expression.children.size) {
+        // A borrowed part (a field read through an alias) is copied
+        // into the text there and then, so it is its element type.
+        val partType = bootstrapBorrowElementType(
+            analyzer.infer(expression.children[part])
+        )
+        // A float is written by abla/float/text's f64Text, the
+        // shortest text that reads back as it (as JavaScript does).
+        val float = partType == "f64" || partType == "f32"
+        if (float && analyzer.findKind("f64Text") != "fun") {
+            analyzer.fail(
+                "string.interpolation:$partType: import \"abla/float/text\" to interpolate a float"
+            )
+        }
+        // A fixed-width integer is written as its decimal value.
+        val integer = bootstrapIsIntegerScalarType(partType) &&
+            bootstrapNormalizeType(partType) != "char"
+        if (!float && !integer && partType != "string" &&
+            partType != "bool" && partType != "null" &&
+            partType != "any") {
+            analyzer.fail("string.interpolation:$partType")
+        }
+        part = part + 1
+    }
+    result = "string"
+    result
+}
+
+@noinline
+fun bootstrapInferCompile(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val effects = analyzer.expressionCompileEffects(
+        expression.children[0]
+    )
+    val deniedEffects = bootstrapDeniedCompileEffects(
+        effects,
+        analyzer.compileEffectGrants
+    )
+    val denied = bootstrapCompileEffectName(deniedEffects)
+    if (denied != "") {
+        val path = bootstrapCompileEffectPath(
+            expression.children[0],
+            analyzer.declarations,
+            analyzer.compileEffects,
+            bootstrapFirstCompileEffect(deniedEffects),
+            0
+        )
+        analyzer.fail("compile.effect-denied:$denied:$path")
+    }
+    analyzer.compileDepth = analyzer.compileDepth + 1
+    result = analyzer.infer(expression.children[0])
+    analyzer.compileDepth = analyzer.compileDepth - 1
+    // f32 math runs at compile time, but its result becomes a
+    // program constant only as an f64.
+    val staged = bootstrapNormalizeType(result)
+    if (staged == "f32" || staged == "array:f32") {
+        analyzer.fail(
+            "compile.result:f32: return an f64 and narrow it with f64ToF32"
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferRegion(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val previousScope = analyzer.enterScope()
+    val previousRegionScope = analyzer.regionScope
+    analyzer.regionDepth = analyzer.regionDepth + 1
+    analyzer.regionScope = analyzer.currentScope
+    result = analyzer.infer(expression.children[0])
+    analyzer.regionScope = previousRegionScope
+    analyzer.regionDepth = analyzer.regionDepth - 1
+    analyzer.leaveScope(previousScope)
+    if (!bootstrapRegionResultIsIndependent(result) &&
+        !analyzer.regionExpressionIsPromotion(expression.children[0])) {
+        analyzer.fail("region.result:$result")
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferArray(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    var elementType = "unknown"
+    var element = 0
+    while (element < expression.children.size) {
+        val found = analyzer.infer(expression.children[element])
+        if (bootstrapIsBorrowType(found)) {
+            analyzer.fail("ownership.borrow-store:array")
+        }
+        if (elementType != "unknown" && elementType != found) {
+            analyzer.fail("array.element-type")
+        }
+        if (elementType == "unknown") elementType = found
+        element = element + 1
+    }
+    result = "array:$elementType"
+    result
+}
+
+@noinline
+fun bootstrapInferRange(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val beginType = analyzer.infer(expression.children[0])
+    val endType = analyzer.infer(expression.children[1])
+    if (beginType != "i64" || endType != "i64") {
+        analyzer.fail("range.bound-type")
+    }
+    result = "array:i64"
+    result
+}
+
+@noinline
+fun bootstrapInferIdentifier(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    result = analyzer.findType(expression.text)
+    val kind = analyzer.findKind(expression.text)
+    if ((kind == "compile.val" || kind == "compile.var") &&
+        analyzer.compileDepth == 0) {
+        analyzer.fail("compile.value-runtime:${expression.text}")
+    }
+    if (result == "unknown") analyzer.fail(
+        "identifier:${expression.text}@${expression.begin}"
+    )
+    if (result != "unknown" &&
+        analyzer.nameIsDelegated(expression.text)) {
+        analyzer.validateDelegatedRead(expression, expression.text)
+    }
+    if (result != "unknown") {
+        analyzer.recordResolvedName(expression, result)
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferLambda(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    analyzer.validateLambdaCaptures(expression)
+    val previousScope = analyzer.enterScope()
+    val previousResultType = analyzer.currentResultType
+    val previousBorrowResultSource =
+        analyzer.currentBorrowResultSource
+    val previousReturnedType = analyzer.returnedType
+    val previousLoopDepth = analyzer.loopDepth
+    val previousGeneratorDepth = analyzer.generatorDepth
+    val previousYieldedType = analyzer.yieldedType
+    val previousBody = analyzer.currentBody
+    analyzer.currentBody = expression
+    analyzer.currentResultType = "inferred"
+    analyzer.currentBorrowResultSource = ""
+    analyzer.returnedType = "unknown"
+    analyzer.loopDepth = 0
+    if (expression.kind != "lambda.generator") {
+        analyzer.generatorDepth = 0
+        analyzer.yieldedType = "unknown"
+    }
+    var parameters = ""
+    var parameter = 0
+    while (parameter + 1 < expression.children.size) {
+        val found = expression.children[parameter]
+        var parameterType = "unknown"
+        if (found.kind == "lambda.parameter" &&
+            found.children.size > 0) {
+            parameterType = bootstrapNormalizeType(
+                found.children[0].text
+            )
+            if (parameter > 0) parameters = "$parameters,"
+            parameters = "$parameters$parameterType"
+            analyzer.locals.append(BootstrapSymbol(
+                found.text,
+                "parameter",
+                parameterType,
+                analyzer.currentScope,
+                "",
+                "abla:${analyzer.currentSourceIdentity}:${found.begin}:parameter:${found.text}"
+            ))
+        }
+        parameter = parameter + 1
+    }
+    val body = expression.children[expression.children.size - 1]
+    var bodyType = analyzer.infer(body)
+    if (bootstrapIsBorrowType(bodyType)) {
+        analyzer.fail("ownership.borrow-escape:lambda")
+    }
+    if (bodyType == "never") {
+        bodyType = analyzer.returnedType
+    } else {
+        if (analyzer.returnedType != "unknown") {
+            bodyType = bootstrapJoinTypes(bodyType, analyzer.returnedType)
+        } else bodyType = bodyType
+    }
+    analyzer.currentResultType = previousResultType
+    analyzer.currentBody = previousBody
+    analyzer.currentBorrowResultSource = previousBorrowResultSource
+    analyzer.returnedType = previousReturnedType
+    analyzer.loopDepth = previousLoopDepth
+    if (expression.kind != "lambda.generator") {
+        analyzer.generatorDepth = previousGeneratorDepth
+        analyzer.yieldedType = previousYieldedType
+    }
+    analyzer.leaveScope(previousScope)
+    val functionType = "function:($parameters)->$bodyType"
+    if (expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator") {
+        result = "once:$functionType"
+    } else if (analyzer.lambdaRequiresMutableCall(expression)) {
+        result = "mut:$functionType"
+    } else result = functionType
+    result
+}
+
+@noinline
+fun bootstrapInferCallMove(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1) {
+        analyzer.fail("move.arity")
+        result = "unknown"
+    } else {
+        val moved = expression.children[0]
+        if (moved.kind == "identifier") {
+            if (bootstrapIsBorrowType(analyzer.findType(moved.text))) {
+                analyzer.fail("ownership.borrow-move:${moved.text}")
+            } else if (!analyzer.hasMovableLocal(moved.text)) {
+                analyzer.fail("move.local")
+            }
+        } else if (moved.kind == "delegate.project") {
+            analyzer.fail("delegate.move-projection")
+        } else if (moved.kind == "member" ||
+                   moved.kind == "index") {
+            val root = bootstrapPlaceRootName(moved)
+            if (root == "" || !analyzer.hasMovableLocal(root)) {
+                analyzer.fail("ownership.place-owner:$root")
+            }
+            if (root != "" && analyzer.typeHasDrop(analyzer.findType(root))) {
+                analyzer.fail("ownership.place-drop:$root")
+            }
+        } else {
+            analyzer.fail("move.local-or-place")
+        }
+        result = analyzer.infer(moved)
+        if ((moved.kind == "member" || moved.kind == "index") &&
+            !analyzer.typeIsAffine(result)) {
+            analyzer.fail("ownership.place-non-affine")
+        }
+        result = result
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferCallShared(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1) {
+        analyzer.fail("shared.arity")
+        result = "unknown"
+    } else {
+        val element = analyzer.infer(expression.children[0])
+        if (bootstrapIsBorrowType(element)) {
+            analyzer.fail("ownership.borrow-store:Shared")
+        }
+        if (!analyzer.typeIsAffine(element)) {
+            analyzer.fail("shared.element-affine:$element")
+        }
+        analyzer.validateOwnershipTransfer(
+            element,
+            expression.children[0],
+            "argument.Shared"
+        )
+        result = "shared:$element"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferCallMutex(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1) {
+        analyzer.fail("mutex.arity")
+        result = "unknown"
+    } else {
+        val element = analyzer.infer(expression.children[0])
+        if (bootstrapIsBorrowType(element)) {
+            analyzer.fail("ownership.borrow-store:Mutex")
+        }
+        if (!analyzer.typeIsAffine(element)) {
+            analyzer.fail("mutex.element-affine:$element")
+        }
+        analyzer.validateOwnershipTransfer(
+            element,
+            expression.children[0],
+            "argument.Mutex"
+        )
+        result = "mutex:$element"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferCallMap(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 0) {
+        analyzer.fail("map.arity")
+        result = "unknown"
+    } else result = "map:unknown:unknown"
+    result
+}
+
+@noinline
+fun bootstrapInferCallCell(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1) {
+        analyzer.fail("cell.arity")
+        result = "unknown"
+    } else {
+        val element = analyzer.infer(expression.children[0])
+        if (!bootstrapCellElementIsCopy(element)) {
+            analyzer.fail("cell.element-copy:$element")
+        }
+        result = "cell:$element"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferCallFilledArray(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    // `filledArray(count, value)`: count copies of a value, in one
+    // allocation. Every slot holds the same value, so it must be one
+    // without identity: a number, a bool or a string.
+    if (expression.children.size != 2) {
+        analyzer.fail("filledArray.arity")
+        result = "unknown"
+    } else {
+        if (analyzer.infer(expression.children[0]) != "i64") {
+            analyzer.fail("filledArray.count")
+        }
+        val element = bootstrapNormalizeType(
+            analyzer.infer(expression.children[1])
+        )
+        if (element == "void" || element == "never" ||
+            element == "null" ||
+            (element != "string" &&
+             !bootstrapRegionResultIsIndependent(element))) {
+            analyzer.fail("filledArray.element:$element")
+        }
+        result = "array:$element"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferCall(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (analyzer.regionDepth > 0 &&
+        bootstrapRegionCallIsUnsafe(
+            analyzer.regionCalls,
+            expression.text
+        )) {
+        analyzer.fail("region.call-retention:${expression.text}")
+    }
+    if (analyzer.regionDepth > 0) {
+        var retainedParameter = 0
+        while (retainedParameter < expression.children.size) {
+            if (bootstrapRegionParameterIsRetaining(
+                analyzer.regionCalls,
+                expression.text,
+                retainedParameter
+            ) && !analyzer.regionExpressionIsOwned(
+                expression.children[retainedParameter]
+            )) {
+                analyzer.fail(
+                    "region.parameter-retention:${expression.text}#$retainedParameter"
+                )
+            }
+            retainedParameter = retainedParameter + 1
+        }
+    }
+    if (analyzer.functionRequiresTrust(expression.text) &&
+        analyzer.trustedDepth == 0) {
+        analyzer.fail("native.trust:${expression.text}")
+    }
+    val functionType = analyzer.findType(expression.text)
+    val externalLibrary = analyzer.functionExternalLibrary(
+        expression.text
+    )
+    if (externalLibrary == "inline-assembly") {
+        val assemblyTemplate = if (expression.children.size > 0) {
+            bootstrapStaticString(expression.children[0])
+        } else BootstrapStaticString("", false)
+        val assemblyConstraints = if (expression.children.size > 1) {
+            bootstrapStaticString(expression.children[1])
+        } else BootstrapStaticString("", false)
+        if (!analyzer.functionRequiresTrust(expression.text) ||
+            !analyzer.functionIsNoEscape(expression.text)) {
+            analyzer.fail("inline-assembly.trusted-noescape")
+        }
+        if (expression.children.size < 2 ||
+            !assemblyTemplate.valid || !assemblyConstraints.valid) {
+            analyzer.fail("inline-assembly.literal-template-constraints")
+        }
+        val assemblyResult = bootstrapNormalizeType(
+            bootstrapFunctionResultType(functionType)
+        )
+        if (!bootstrapScalarTypeUnderlyingValid(assemblyResult) &&
+            assemblyResult != "void") {
+            analyzer.fail("inline-assembly.scalar-result")
+        }
+        var assemblyParameter = 2
+        while (assemblyParameter <
+               bootstrapFunctionParameterCount(functionType)) {
+            if (!bootstrapScalarTypeUnderlyingValid(
+                bootstrapNormalizeType(
+                    bootstrapFunctionParameterType(
+                        functionType, assemblyParameter
+                    )
+                )
+            )) {
+                analyzer.fail("inline-assembly.scalar-parameter")
+            }
+            assemblyParameter = assemblyParameter + 1
+        }
+    }
+    val symbolKind = analyzer.findKind(expression.text)
+    val primitiveType = if (bootstrapScalarTypeUnderlyingValid(
+        bootstrapNormalizeType(expression.text)
+    )) bootstrapNormalizeType(expression.text) else ""
+    val contractModule = analyzer.contractModuleForFunction(
+        expression.text
+    )
+    if (contractModule != "" && !analyzer.allowContractCalls) {
+        analyzer.fail(
+            "contract.call.not-consumed:$contractModule::${bootstrapCanonicalDeclarationSourceName(expression.text)}"
+        )
+    }
+    if (analyzer.regionDepth > 0 &&
+        bootstrapIsFunctionType(functionType) &&
+        symbolKind != "fun" && symbolKind != "extern" &&
+        symbolKind != "compile.fun" &&
+        !bootstrapIsNoEscapeFunctionType(functionType) &&
+        !analyzer.regionNameIsOwned(expression.text)) {
+        analyzer.fail("region.indirect-call-retention:${expression.text}")
+    }
+    if (!bootstrapIsFunctionType(functionType) &&
+        symbolKind != "class" && symbolKind != "type" &&
+        primitiveType == "") {
+        analyzer.fail("call.target:${expression.text}")
+    }
+    var argument = 0
+    val resolvedArgumentTypes: array<string> = []
+    val resolvedParameterTypes: array<string> = []
+    val resolvedParameterKinds: array<string> = []
+    var resolvedInsertedDefaults = 0
+    val classDeclarationIndex = if (symbolKind == "class")
+        analyzer.typeDeclarations.find(expression.text)
+    else -1
+    while (argument < expression.children.size) {
+        var expectedArgument = "unknown"
+        if (bootstrapIsFunctionType(functionType)) {
+            val declaredParameterCount =
+                analyzer.functionParameterCount(expression.text)
+            if (declaredParameterCount < 0) {
+                expectedArgument = bootstrapFunctionParameterType(
+                    functionType,
+                    argument
+                )
+            } else if (argument < declaredParameterCount) {
+                expectedArgument = analyzer.functionParameterType(
+                    expression.text,
+                    argument
+                )
+            }
+        } else if (symbolKind == "class") {
+            if (classDeclarationIndex >= 0) {
+                val declaration =
+                    analyzer.declarations[classDeclarationIndex]
+                if (argument < declaration.parameterTypes.size) {
+                    expectedArgument = bootstrapNormalizeType(
+                        declaration.parameterTypes[argument]
+                    )
+                }
+            }
+        } else if (symbolKind == "type" || primitiveType != "") {
+            expectedArgument = analyzer.scalarTypeUnderlying(
+                expression.text
+            )
+            if (primitiveType != "") expectedArgument = primitiveType
+        }
+        analyzer.contextualizeLambdaParameters(
+            expression.children[argument],
+            expectedArgument
+        )
+        resolvedArgumentTypes.append(
+            analyzer.infer(expression.children[argument])
+        )
+        argument = argument + 1
+    }
+    if (bootstrapIsFunctionType(functionType)) {
+        val parameterCount = analyzer.functionParameterCount(
+            expression.text
+        )
+        var effectiveParameterCount = parameterCount
+        var requiredCount = analyzer.functionRequiredParameterCount(
+            expression.text
+        )
+        if (effectiveParameterCount < 0) {
+            effectiveParameterCount =
+                bootstrapFunctionParameterCount(functionType)
+            requiredCount = effectiveParameterCount
+        }
+        if (effectiveParameterCount < 0 ||
+            expression.children.size > effectiveParameterCount ||
+            expression.children.size < requiredCount) {
+            analyzer.fail("function.arity:${expression.text}")
+        }
+        resolvedInsertedDefaults =
+            effectiveParameterCount - expression.children.size
+        argument = 0
+        val argumentKinds: array<string> = []
+        val argumentTypes: array<string> = []
+        while (argument < expression.children.size &&
+               argument < effectiveParameterCount) {
+            val actual = resolvedArgumentTypes[argument]
+            var expected = analyzer.functionParameterType(
+                expression.text,
+                argument
+            )
+            if (parameterCount < 0) {
+                expected = bootstrapFunctionParameterType(
+                    functionType,
+                    argument
+                )
+            }
+            if (!bootstrapTypesCompatibleWithInferredNoEscape(
+                expected,
+                actual,
+                expression.children[argument],
+                analyzer.regionCalls,
+                analyzer.declarations
+            )) analyzer.fail("function.argument:${expression.text}@${expression.children[argument].begin}:$expected:$actual")
+            var parameterKind = "parameter"
+            if (parameterCount >= 0) {
+                parameterKind = analyzer.functionParameterKind(
+                    expression.text,
+                    argument
+                )
+            } else {
+                parameterKind = bootstrapFunctionParameterKind(
+                    functionType,
+                    argument
+                )
+            }
+            if (parameterKind == "own") {
+                if (bootstrapIsBorrowType(actual)) {
+                    analyzer.fail("ownership.borrow-exclusive:${expression.text}")
+                }
+                analyzer.validateOwnershipTransfer(
+                    expected,
+                    expression.children[argument],
+                    "argument.function.${expression.text}"
+                )
+            }
+            if (parameterKind == "var") {
+                if (bootstrapIsBorrowType(actual)) {
+                    analyzer.fail("ownership.borrow-exclusive:${expression.text}")
+                }
+                analyzer.validateMutableBorrowArgument(
+                    expression.children[argument],
+                    expected,
+                    "function.${expression.text}"
+                )
+            }
+            argumentKinds.append(parameterKind)
+            argumentTypes.append(expected)
+            resolvedParameterKinds.append(parameterKind)
+            resolvedParameterTypes.append(expected)
+            argument = argument + 1
+        }
+        analyzer.validateCallAliases(
+            expression.children,
+            argumentKinds,
+            argumentTypes,
+            "function.${expression.text}"
+        )
+    }
+    if (symbolKind == "class" && classDeclarationIndex >= 0) {
+        val declaration = analyzer.declarations[classDeclarationIndex]
+        if (declaration.parameters.size !=
+            expression.children.size) {
+            analyzer.fail("constructor.arity:${expression.text}")
+        }
+        var parameter = 0
+        while (parameter < declaration.parameters.size &&
+               parameter < expression.children.size) {
+            val actual = resolvedArgumentTypes[parameter]
+            val expected = bootstrapNormalizeType(
+                declaration.parameterTypes[parameter]
+            )
+            if (!bootstrapTypesCompatible(expected, actual)) {
+                analyzer.fail("constructor.argument:${expression.text}")
+            }
+            if (parameter < declaration.parameterKinds.size &&
+                (declaration.parameterKinds[parameter] == "val" ||
+                 declaration.parameterKinds[parameter] == "var" ||
+                 declaration.parameterKinds[parameter] == "own")) {
+                if (bootstrapIsBorrowType(actual) &&
+                    (analyzer.typeIsAffine(expected) ||
+                     !analyzer.typeNeedsManagedAliasTracking(expected))) {
+                    analyzer.fail(
+                        "ownership.borrow-store:${expression.text}"
+                    )
+                }
+                analyzer.validateOwnershipTransfer(
+                    expected,
+                    expression.children[parameter],
+                    "argument.constructor.${expression.text}"
+                )
+            }
+            parameter = parameter + 1
+        }
+    }
+    if (symbolKind == "type" || primitiveType != "") {
+        var underlying = analyzer.scalarTypeUnderlying(expression.text)
+        if (primitiveType != "") underlying = primitiveType
+        if (expression.children.size != 1) {
+            analyzer.fail("type.constructor-arity:${expression.text}")
+        }
+        if (expression.children.size == 1 &&
+            !bootstrapScalarConversionCompatible(
+                underlying, resolvedArgumentTypes[0]
+            )) {
+            analyzer.fail("type.constructor-argument:${expression.text}")
+        }
+        result = if (primitiveType == "") expression.text
+            else primitiveType
+    } else if (symbolKind == "class") {
+        result = expression.text
+        val storedSource = analyzer.constructorStoredBorrowSource(
+            expression
+        )
+        if (storedSource == "managed.unknown") {
+            analyzer.fail(
+                "ownership.stored-reference-provenance:${expression.text}"
+            )
+        } else if (storedSource == "managed.multiple") {
+            analyzer.fail(
+                "ownership.stored-reference-multiple:${expression.text}"
+            )
+        } else if (storedSource != "") {
+            result = "borrow:$result"
+        }
+    } else {
+        result = bootstrapFunctionResultType(functionType)
+        if (bootstrapIsBorrowType(result) &&
+            symbolKind != "fun" &&
+            symbolKind != "compile.fun") {
+            val sourceParameter =
+                bootstrapFunctionBorrowResultParameter(functionType)
+            if (sourceParameter < 0 ||
+                sourceParameter >= expression.children.size) {
+                analyzer.fail(
+                    "ownership.borrow-return-indirect-source:${expression.text}"
+                )
+            }
+            if (sourceParameter >= 0 &&
+                bootstrapFunctionParameterKind(
+                    functionType,
+                    sourceParameter
+                ) != "parameter") {
+                analyzer.fail(
+                    "ownership.borrow-return-indirect-mode:${expression.text}"
+                )
+            }
+        }
+        result = result
+    }
+    if (bootstrapIsFunctionType(functionType)) {
+        analyzer.recordTypedCall(
+            expression,
+            result,
+            "",
+            analyzer.topLevelFunctionHandle(expression.text),
+            resolvedArgumentTypes,
+            resolvedParameterTypes,
+            resolvedParameterKinds,
+            resolvedInsertedDefaults
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferMember(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val rawReceiver = analyzer.infer(expression.children[0])
+    val receiver = bootstrapBorrowElementType(rawReceiver)
+    if (expression.text == "size" &&
+        (receiver == "string" || bootstrapIsArrayType(receiver) ||
+         bootstrapIsMapType(receiver))) {
+        result = "i64"
+    } else {
+        result = analyzer.fieldType(receiver, expression.text)
+        if (result == "unknown") {
+            analyzer.fail("member:${receiver}.${expression.text}")
+        }
+        if (bootstrapIsBorrowType(rawReceiver) &&
+            !bootstrapRegionResultIsIndependent(result)) {
+            result = "borrow:$result"
+        }
+        result = result
+    }
+    val identity = analyzer.fieldDeclarationIdentity(
+        receiver, expression.text
+    )
+    if (identity != "") analyzer.resolvedNames.append(
+        BootstrapResolvedName(
+            analyzer.currentSourceIdentity,
+            expression.end - expression.text.size,
+            expression.end,
+            expression.text,
+            identity,
+            bootstrapNormalizeType(result),
+            "field"
+        )
+    )
+    result
+}
+
+@noinline
+fun bootstrapInferIndex(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val rawReceiver = analyzer.infer(expression.children[0])
+    val receiver = bootstrapBorrowElementType(rawReceiver)
+    val index = analyzer.infer(expression.children[1])
+    if (index != "i64") analyzer.fail("index.type")
+    if (receiver == "string") result = "i64"
+    else if (bootstrapIsArrayType(receiver)) {
+        result = bootstrapArrayElementType(receiver)
+        if (bootstrapIsBorrowType(rawReceiver) &&
+            !bootstrapRegionResultIsIndependent(result)) {
+            result = "borrow:$result"
+        }
+        result = result
+    } else {
+        analyzer.fail("index.receiver:$receiver")
+        result = "unknown"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferIndexAssign(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    analyzer.validateBorrowMutation(
+        expression.children[0],
+        "index.assign"
+    )
+    val rawReceiver = analyzer.infer(expression.children[0])
+    if (bootstrapIsBorrowType(rawReceiver)) {
+        analyzer.fail("ownership.borrow-mutation:index.assign")
+    }
+    val receiver = bootstrapBorrowElementType(rawReceiver)
+    val index = analyzer.infer(expression.children[1])
+    val value = analyzer.infer(expression.children[2])
+    if (bootstrapIsBorrowType(value)) {
+        analyzer.fail("ownership.borrow-store:index.assign")
+    }
+    if (index != "i64") analyzer.fail("index.assign-index")
+    if (!bootstrapIsArrayType(receiver) ||
+        !bootstrapTypesCompatible(
+            bootstrapArrayElementType(receiver),
+            value
+        )) {
+        analyzer.fail("index.assign-value")
+    }
+    analyzer.validateRegionStore(
+        expression.children[0],
+        expression.children[2],
+        "index.assign"
+    )
+    result = value
+    result
+}
+
+@noinline
+fun bootstrapInferMemberCall(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    rawReceiver: string,
+    receiver: string,
+    initial: string
+): string {
+    var result = initial
+    if (analyzer.regionDepth > 0 &&
+        bootstrapRegionMemberCallIsUnsafe(
+            analyzer.regionCalls,
+            expression.text
+        )) {
+        analyzer.fail("region.call-retention:${expression.text}")
+    }
+    if (analyzer.regionDepth > 0 &&
+        bootstrapRegionReceiverCallIsRetaining(
+            analyzer.regionCalls,
+            receiver,
+            expression.text
+        ) &&
+        !analyzer.regionExpressionIsOwned(expression.children[0])) {
+        analyzer.fail(
+            "region.receiver-retention:${receiver}.${expression.text}"
+        )
+    }
+    if (analyzer.regionDepth > 0) {
+        val methodName = "$receiver.${expression.text}"
+        var retainedParameter = 1
+        while (retainedParameter < expression.children.size) {
+            if (bootstrapRegionParameterIsRetaining(
+                analyzer.regionCalls,
+                methodName,
+                retainedParameter - 1
+            ) && !analyzer.regionExpressionIsOwned(
+                expression.children[retainedParameter]
+            )) {
+                analyzer.fail(
+                    "region.parameter-retention:$methodName#${retainedParameter - 1}"
+                )
+            }
+            retainedParameter = retainedParameter + 1
+        }
+    }
+    if (bootstrapIsMapType(receiver)) {
+        result = analyzer.inferMapCall(expression, rawReceiver, receiver)
+    } else if (bootstrapIsCellType(receiver)) {
+        val element = bootstrapCellElementType(receiver)
+        if (expression.text == "get") {
+            if (expression.children.size != 1) {
+                analyzer.fail("cell.get.arity")
+            }
+            result = element
+        } else if (expression.text == "set") {
+            if (expression.children.size != 2) {
+                analyzer.fail("cell.set.arity")
+            } else {
+                val value = analyzer.infer(expression.children[1])
+                if (!bootstrapTypesCompatible(element, value)) {
+                    analyzer.fail("cell.set.value:$element:$value")
+                }
+            }
+            result = "void"
+        } else {
+            analyzer.fail("cell.member:${expression.text}")
+            result = "unknown"
+        }
+    } else if (bootstrapIsMutexType(receiver)) {
+        if (expression.text == "clone") {
+            if (expression.children.size != 1) {
+                analyzer.fail("mutex.clone.arity")
+            }
+            result = receiver
+        } else if (expression.text == "with") {
+            if (expression.children.size != 2) {
+                analyzer.fail("mutex.with.arity")
+                result = "unknown"
+            } else {
+                val callbackExpression = expression.children[1]
+                val callback = analyzer.infer(callbackExpression)
+                if (callbackExpression.kind != "identifier" ||
+                    !bootstrapIsFunctionType(callback) ||
+                    bootstrapFunctionParameterCount(callback) != 1) {
+                    analyzer.fail("mutex.with.callback")
+                }
+                if (bootstrapIsFunctionType(callback) &&
+                    bootstrapFunctionParameterCount(callback) == 1) {
+                    if (bootstrapFunctionParameterKind(callback, 0) !=
+                        "var") {
+                        analyzer.fail("mutex.with.callback-mode")
+                    }
+                    if (!bootstrapTypesCompatible(
+                        bootstrapMutexElementType(receiver),
+                        bootstrapFunctionParameterType(callback, 0)
+                    )) analyzer.fail("mutex.with.callback-type")
+                    result = bootstrapFunctionResultType(callback)
+                    if (!bootstrapRegionResultIsIndependent(result)) {
+                        analyzer.fail("mutex.with.result:$result")
+                    }
+                }
+            }
+        } else {
+            analyzer.fail("mutex.member:${expression.text}")
+            result = "unknown"
+        }
+    } else if (bootstrapIsSharedType(receiver)) {
+        if (expression.children.size != 1) {
+            analyzer.fail("shared.${expression.text}.arity")
+        }
+        if (expression.text == "clone") result = receiver
+        else if (expression.text == "get") {
+            result = "borrow:${bootstrapSharedElementType(receiver)}"
+        } else if (expression.text == "downgrade") {
+            result = "weak:${bootstrapSharedElementType(receiver)}"
+        } else {
+            analyzer.fail("shared.member:${expression.text}")
+            result = "unknown"
+        }
+    } else if (bootstrapIsWeakType(receiver)) {
+        if (expression.children.size != 1) {
+            analyzer.fail("weak.${expression.text}.arity")
+        }
+        if (expression.text == "clone") result = receiver
+        else if (expression.text == "upgrade") {
+            result = "nullable:shared:${bootstrapWeakElementType(receiver)}"
+        } else if (expression.text == "isAlive") result = "bool"
+        else {
+            analyzer.fail("weak.member:${expression.text}")
+            result = "unknown"
+        }
+    } else
+    if (expression.text == "append" &&
+        bootstrapIsArrayType(receiver)) {
+        if (bootstrapIsBorrowType(rawReceiver)) {
+            analyzer.fail("ownership.borrow-mutation:append")
+        }
+        analyzer.validateBorrowMutation(
+            expression.children[0],
+            "append"
+        )
+        if (expression.children.size != 2) {
+            analyzer.fail("append.arity")
+        } else {
+            val value = analyzer.infer(expression.children[1])
+            if (bootstrapIsBorrowType(value)) {
+                analyzer.fail("ownership.borrow-store:append")
+            }
+            if (!bootstrapTypesCompatible(
+                bootstrapArrayElementType(receiver),
+                value
+            )) {
+                analyzer.fail("append.value")
+            }
+            analyzer.validateOwnershipTransfer(
+                bootstrapArrayElementType(receiver),
+                expression.children[1],
+                "append"
+            )
+            analyzer.validateRegionStore(
+                expression.children[0],
+                expression.children[1],
+                "append"
+            )
+        }
+        result = "void"
+    } else if ((expression.text == "truncate" ||
+                expression.text == "clear") &&
+               bootstrapIsArrayType(receiver)) {
+        // `items.truncate(n)` keeps the first n elements (0 <= n <=
+        // size, else a trap) and `items.clear()` keeps none; the
+        // array keeps its capacity for what is appended next.
+        if (bootstrapIsBorrowType(rawReceiver)) {
+            analyzer.fail("ownership.borrow-mutation:${expression.text}")
+        }
+        analyzer.validateBorrowMutation(
+            expression.children[0],
+            expression.text
+        )
+        val arity = if (expression.text == "clear") 1 else 2
+        if (expression.children.size != arity) {
+            analyzer.fail("${expression.text}.arity")
+        } else if (arity == 2 &&
+                   analyzer.infer(expression.children[1]) != "i64") {
+            analyzer.fail("truncate.size")
+        }
+        if (analyzer.typeIsAffine(bootstrapArrayElementType(receiver))) {
+            analyzer.fail("ownership.affine-drop:${expression.text}")
+        }
+        result = "void"
+    } else if (expression.text == "slice" && receiver == "string") {
+        if (expression.children.size != 3) {
+            analyzer.fail("slice.arity")
+        } else {
+            val begin = analyzer.infer(expression.children[1])
+            val end = analyzer.infer(expression.children[2])
+            if (begin != "i64" || end != "i64") {
+                analyzer.fail("slice.index")
+            }
+        }
+        result = "string"
+    } else {
+        val receiverKind = analyzer.methodReceiverKind(
+            receiver,
+            expression.text
+        )
+        if (receiverKind == "var") {
+            if (bootstrapIsBorrowType(rawReceiver)) {
+                analyzer.fail(
+                    "ownership.borrow-exclusive:${receiver}.${expression.text}"
+                )
+            }
+            analyzer.validateMutableBorrowArgument(
+                expression.children[0],
+                receiver,
+                "receiver.${receiver}.${expression.text}"
+            )
+        }
+        val parameterCount = analyzer.methodParameterCount(
+            receiver,
+            expression.text
+        )
+        val requiredCount = analyzer.methodRequiredParameterCount(
+            receiver,
+            expression.text
+        )
+        val suppliedCount = expression.children.size - 1
+        if (parameterCount < 0 || suppliedCount > parameterCount ||
+            suppliedCount < requiredCount) {
+            analyzer.fail("method.arity:${receiver}.${expression.text}")
+        }
+        var argument = 1
+        val resolvedArgumentTypes: array<string> = []
+        val resolvedParameterTypes: array<string> = []
+        val resolvedParameterKinds: array<string> = []
+        val methodArguments: array<BootstrapExpression> = [
+            expression.children[0]
+        ]
+        val methodKinds: array<string> = [receiverKind]
+        val methodTypes: array<string> = [receiver]
+        while (argument < expression.children.size) {
+            val expected = analyzer.methodParameterType(
+                receiver,
+                expression.text,
+                argument - 1
+            )
+            analyzer.contextualizeLambdaParameters(
+                expression.children[argument],
+                expected
+            )
+            val actual = analyzer.infer(expression.children[argument])
+            if (!bootstrapTypesCompatibleWithInferredNoEscape(
+                expected,
+                actual,
+                expression.children[argument],
+                analyzer.regionCalls,
+                analyzer.declarations
+            )) {
+                analyzer.fail("method.argument:${receiver}.${expression.text}@${expression.children[argument].begin}:$expected:$actual")
+            }
+            if (analyzer.methodParameterKind(
+                    receiver,
+                    expression.text,
+                    argument - 1
+                ) == "own") {
+                if (bootstrapIsBorrowType(actual)) {
+                    analyzer.fail(
+                        "ownership.borrow-exclusive:${receiver}.${expression.text}"
+                    )
+                }
+                analyzer.validateOwnershipTransfer(
+                    expected,
+                    expression.children[argument],
+                    "argument.method.${receiver}.${expression.text}"
+                )
+            }
+            if (analyzer.methodParameterKind(
+                    receiver,
+                    expression.text,
+                    argument - 1
+                ) == "var") {
+                if (bootstrapIsBorrowType(actual)) {
+                    analyzer.fail(
+                        "ownership.borrow-exclusive:${receiver}.${expression.text}"
+                    )
+                }
+                analyzer.validateMutableBorrowArgument(
+                    expression.children[argument],
+                    expected,
+                    "method.${receiver}.${expression.text}"
+                )
+            }
+            methodArguments.append(expression.children[argument])
+            val selectedKind = analyzer.methodParameterKind(
+                receiver,
+                expression.text,
+                argument - 1
+            )
+            methodKinds.append(selectedKind)
+            methodTypes.append(expected)
+            resolvedArgumentTypes.append(actual)
+            resolvedParameterTypes.append(expected)
+            resolvedParameterKinds.append(selectedKind)
+            argument = argument + 1
+        }
+        analyzer.validateCallAliases(
+            methodArguments,
+            methodKinds,
+            methodTypes,
+            "method.${receiver}.${expression.text}"
+        )
+        result = analyzer.methodResultType(receiver, expression.text)
+        analyzer.recordTypedCall(
+            expression,
+            result,
+            receiver,
+            analyzer.selectedMethodHandle(receiver, expression.text),
+            resolvedArgumentTypes,
+            resolvedParameterTypes,
+            resolvedParameterKinds,
+            parameterCount - suppliedCount
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferMemberAssign(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    analyzer.validateBorrowMutation(
+        expression.children[0],
+        "member.assign.${expression.text}"
+    )
+    val rawReceiver = analyzer.infer(expression.children[0])
+    if (bootstrapIsBorrowType(rawReceiver)) {
+        analyzer.fail("ownership.borrow-mutation:member.assign")
+    }
+    val receiver = bootstrapBorrowElementType(rawReceiver)
+    val expected = analyzer.fieldType(receiver, expression.text)
+    val actual = analyzer.infer(expression.children[1])
+    if (bootstrapIsBorrowType(actual)) {
+        analyzer.fail("ownership.borrow-store:field.${expression.text}")
+    }
+    if (expected == "unknown" ||
+        !bootstrapTypesCompatible(expected, actual)) {
+        analyzer.fail("member.assign:${receiver}.${expression.text}")
+    }
+    analyzer.validateOwnershipTransfer(
+        expected,
+        expression.children[1],
+        "field.${expression.text}"
+    )
+    if (!analyzer.fieldIsMutable(receiver, expression.text)) {
+        analyzer.fail("member.immutable:${receiver}.${expression.text}")
+    }
+    analyzer.validateRegionStore(
+        expression.children[0],
+        expression.children[1],
+        "field.${expression.text}"
+    )
+    result = actual
+    result
+}
+
+@noinline
+fun bootstrapInferBlock(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val previousScope = analyzer.enterScope()
+    result = "void"
+    var statement = 0
+    while (statement < expression.children.size) {
+        val inferred = expression.children[statement]
+        result = analyzer.infer(inferred)
+        // After `if (x == null) return …` the rest of the block knows
+        // x is not null.
+        val after = bootstrapConditionAfterIf(inferred)
+        if (after != "") analyzer.addNullableRefinements(
+            inferred.children[0], after == "true"
+        )
+        statement = statement + 1
+    }
+    analyzer.leaveScope(previousScope)
+    result
+}
+
+@noinline
+fun bootstrapInferDefer(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1 ||
+        expression.children[0].kind == "missing") {
+        analyzer.fail("defer.body")
+    }
+    if (expression.children.size == 1 &&
+        bootstrapExpressionContainsDeferredControl(
+            expression.children[0]
+        )) analyzer.fail("defer.control")
+    var deferredType = "once:function:()->void"
+    if (expression.children.size == 1 &&
+        expression.children[0].kind != "missing") {
+        deferredType = analyzer.infer(BootstrapExpression(
+            "lambda.move",
+            "",
+            expression.begin,
+            expression.end,
+            [expression.children[0]]
+        ))
+    }
+    if (deferredType != "once:function:()->void") {
+        analyzer.fail("defer.result")
+    }
+    result = "void"
+    result
+}
+
+@noinline
+fun bootstrapInferGenerator(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1 ||
+        expression.children[0].kind == "missing") {
+        analyzer.fail("generator.body")
+        result = "generator:unknown"
+    } else {
+        val previousGeneratorDepth = analyzer.generatorDepth
+        val previousYieldedType = analyzer.yieldedType
+        analyzer.generatorDepth = analyzer.generatorDepth + 1
+        analyzer.yieldedType = "unknown"
+        val callable = analyzer.infer(BootstrapExpression(
+            "lambda.generator",
+            "",
+            expression.begin,
+            expression.end,
+            [expression.children[0]]
+        ))
+        val element = analyzer.yieldedType
+        analyzer.generatorDepth = previousGeneratorDepth
+        analyzer.yieldedType = previousYieldedType
+        if (bootstrapFunctionResultType(callable) != "void") {
+            analyzer.fail("generator.result")
+        }
+        if (element == "unknown") analyzer.fail("generator.empty")
+        result = "generator:$element"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferYield(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (analyzer.generatorDepth <= 0) analyzer.fail("yield.outside-generator")
+    var found = "unknown"
+    if (expression.children.size == 1) {
+        found = analyzer.infer(expression.children[0])
+    } else analyzer.fail("yield.value")
+    if (bootstrapIsBorrowType(found) || analyzer.typeIsAffine(found)) {
+        analyzer.fail("yield.affine:$found")
+    }
+    if (analyzer.yieldedType == "unknown") analyzer.yieldedType = found
+    else if (!bootstrapTypesCompatible(analyzer.yieldedType, found)) {
+        analyzer.fail("yield.type")
+    }
+    result = "void"
+    result
+}
+
+@noinline
+fun bootstrapInferTask(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1 ||
+        expression.children[0].kind == "missing") {
+        analyzer.fail("${expression.kind}.body")
+        result = "${expression.kind}:unknown"
+    } else {
+        if (expression.kind == "thread") {
+            analyzer.validateThreadCaptures(expression.children[0])
+        }
+        val callable = analyzer.infer(BootstrapExpression(
+            "lambda.move",
+            "",
+            expression.begin,
+            expression.end,
+            [expression.children[0]]
+        ))
+        val found = bootstrapFunctionResultType(callable)
+        if (bootstrapIsBorrowType(found) || analyzer.typeIsAffine(found)) {
+            analyzer.fail("${expression.kind}.affine-result:$found")
+        }
+        result = "${expression.kind}:$found"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferAwait(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    var operation = "unknown"
+    if (expression.children.size == 1) {
+        operation = analyzer.infer(expression.children[0])
+    } else analyzer.fail("await.operation")
+    if (bootstrapIsTaskType(operation)) {
+        result = bootstrapTaskResultType(operation)
+    } else if (bootstrapIsThreadType(operation)) {
+        result = bootstrapThreadResultType(operation)
+    } else {
+        analyzer.fail("await.type:$operation")
+        result = "unknown"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferReturn(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (analyzer.regionDepth > 0) analyzer.fail("region.control:return")
+    var returned = "void"
+    if (expression.children[0].kind != "missing") {
+        returned = analyzer.infer(expression.children[0])
+    }
+    analyzer.validateBorrowReturn(
+        expression.children[0],
+        returned,
+        "return"
+    )
+    if (analyzer.currentResultType == "") {
+        analyzer.fail("return.outside-function")
+    }
+    if (analyzer.currentResultType != "" &&
+        analyzer.currentResultType != "inferred" &&
+        !analyzer.typesCompatible(analyzer.currentResultType, returned)) {
+        analyzer.fail("return.type")
+    }
+    if (analyzer.currentResultType != "" &&
+        analyzer.currentResultType != "inferred" &&
+        !bootstrapIsBorrowType(analyzer.currentResultType)) {
+        analyzer.validateOwnershipTransfer(
+            analyzer.currentResultType,
+            expression.children[0],
+            "return"
+        )
+    }
+    if (analyzer.returnedType == "unknown") analyzer.returnedType = returned
+    else analyzer.returnedType = bootstrapJoinTypes(
+        analyzer.returnedType,
+        returned
+    )
+    result = "never"
+    result
+}
+
+@noinline
+fun bootstrapInferLocal(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (analyzer.hasLocal(expression.text)) {
+        analyzer.fail("local.duplicate:${expression.text}")
+    } else if (analyzer.redeclaresParameter(expression.text)) {
+        analyzer.fail("local.shadows-parameter:${expression.text}")
+    }
+    val delegated = expression.children.size > 0 &&
+        expression.children[0].kind == "delegate.initializer"
+    if (delegated) {
+        val initializer = expression.children[0]
+        val type = analyzer.delegatedInitializerType(
+            initializer,
+            expression.text
+        )
+        val delegateType = bootstrapDelegatedStorageType(type)
+        analyzer.validateOwnershipTransfer(
+            delegateType,
+            initializer.children[0],
+            "delegate.${expression.text}"
+        )
+        val kind = if (expression.kind == "local.var") "var" else "val"
+        analyzer.locals.append(BootstrapSymbol(
+            expression.text,
+            kind,
+            type,
+            analyzer.currentScope,
+            "",
+            "abla:${analyzer.currentSourceIdentity}:${expression.begin}:local:${expression.text}"
+        ))
+        if (analyzer.regionDepth > 0 &&
+            analyzer.regionExpressionIsOwned(initializer.children[0])) {
+            analyzer.markRegionOwned(expression.text, analyzer.currentScope)
+        }
+        result = "void"
+    } else {
+    val hasInitializer = expression.children[0].kind != "missing"
+    var initializerType = "unknown"
+    var borrowSource = ""
+    if (hasInitializer) {
+        // A lambda takes its parameter types from a declared
+        // function type, as an argument does from its parameter.
+        if (expression.children.size > 1 &&
+            expression.children[1].text != "inferred") {
+            analyzer.contextualizeLambdaParameters(
+                expression.children[0],
+                bootstrapNormalizeType(expression.children[1].text)
+            )
+        }
+        initializerType = analyzer.infer(expression.children[0])
+        if (!bootstrapIsBorrowType(initializerType) &&
+            analyzer.typeNeedsManagedAliasTracking(initializerType) &&
+            (expression.children[0].kind == "identifier" ||
+             expression.children[0].kind == "member" ||
+             expression.children[0].kind == "index" ||
+             expression.children[0].kind == "delegate.project")) {
+            val managedSource = analyzer.borrowArgumentSource(
+                expression.children[0]
+            )
+            if (managedSource != "") {
+                initializerType = "borrow:$initializerType"
+                borrowSource = managedSource
+                analyzer.managedAliasBegins.append(expression.begin)
+                analyzer.managedAliasEnds.append(expression.end)
+                analyzer.managedAliasSources.append(managedSource)
+            }
+        }
+        if (bootstrapIsBorrowType(initializerType) &&
+            expression.kind == "local.var") {
+            analyzer.fail(
+                "ownership.borrow-mutable-local:${expression.text}"
+            )
+        }
+        if (bootstrapIsBorrowType(initializerType)) {
+            if (borrowSource == "" &&
+                expression.children[0].kind == "identifier" &&
+                analyzer.nameIsDelegated(
+                    expression.children[0].text
+                )) {
+                borrowSource = expression.children[0].text
+            }
+            if (borrowSource == "") {
+                borrowSource = analyzer.borrowExpressionSource(
+                    expression.children[0]
+                )
+            }
+            if (borrowSource == "") {
+                analyzer.fail("ownership.borrow-source:${expression.text}")
+            }
+            if (expression.children[0].kind == "call" &&
+                analyzer.findKind(expression.children[0].text) == "class") {
+                analyzer.managedAliasBegins.append(expression.begin)
+                analyzer.managedAliasEnds.append(expression.end)
+                analyzer.managedAliasSources.append(borrowSource)
+            }
+        }
+    }
+    var type = initializerType
+    if (expression.children.size > 1 &&
+        expression.children[1].text != "inferred") {
+        val declaredType = bootstrapNormalizeType(
+            expression.children[1].text
+        )
+        if (bootstrapIsBorrowType(initializerType)) {
+            if (declaredType != initializerType &&
+                declaredType != bootstrapBorrowElementType(
+                    initializerType
+                )) {
+                analyzer.fail(
+                    "ownership.borrow-annotation:${expression.text}"
+                )
+            }
+            type = initializerType
+            bootstrapSemanticUnit()
+        } else {
+            type = declaredType
+            if (hasInitializer &&
+                !bootstrapTypesCompatible(type, initializerType)) {
+                analyzer.fail("local.initializer:${expression.text}")
+            }
+            bootstrapSemanticUnit()
+        }
+        type = type
+    }
+    if (hasInitializer) {
+        if (expression.kind == "local.val" &&
+            !bootstrapIsBorrowType(type) &&
+            analyzer.typeNeedsManagedAliasTracking(type) &&
+            analyzer.expressionProducesFreshManagedReference(
+                expression.children[0],
+                0,
+                true
+            )) borrowSource = "managed.fresh"
+        if (borrowSource == "" && expression.kind == "local.val" &&
+            !bootstrapIsBorrowType(type) &&
+            analyzer.managedReferenceIsStatic(expression.children[0])) {
+            borrowSource = "managed.static"
+        }
+        analyzer.validateOwnershipTransfer(
+            type,
+            expression.children[0],
+            "local.${expression.text}"
+        )
+    }
+    if (!hasInitializer) {
+        if (expression.kind != "local.var") {
+            analyzer.fail("local.uninitialized-val:${expression.text}")
+        }
+        if (expression.children.size < 2 ||
+            expression.children[1].text == "inferred") {
+            analyzer.fail("local.uninitialized-type:${expression.text}")
+        }
+    }
+    val kind = if (expression.kind == "local.var") "var" else "val"
+    analyzer.locals.append(BootstrapSymbol(
+        expression.text,
+        kind,
+        type,
+        analyzer.currentScope,
+        borrowSource,
+        "abla:${analyzer.currentSourceIdentity}:${expression.begin}:local:${expression.text}"
+    ))
+    if (analyzer.regionDepth > 0 && hasInitializer &&
+        analyzer.regionExpressionIsOwned(expression.children[0])) {
+        analyzer.markRegionOwned(expression.text, analyzer.currentScope)
+    }
+    result = "void"
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferAssign(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val delegated = analyzer.nameIsDelegated(expression.text)
+    val target = analyzer.findType(expression.text)
+    val value = analyzer.infer(expression.children[0])
+    if (target != "unknown") {
+        analyzer.recordResolvedName(expression, target)
+    }
+    if (bootstrapIsBorrowType(value)) {
+        analyzer.fail("ownership.borrow-store:assignment.${expression.text}")
+    }
+    if (target == "unknown" ||
+        !bootstrapTypesCompatible(target, value)) {
+        analyzer.fail(
+            "assignment.type:${expression.text}@${expression.begin}"
+        )
+    }
+    if (delegated) {
+        val delegateType = analyzer.delegateType(expression.text)
+        val setterInput = analyzer.methodParameterType(
+            delegateType,
+            "setValue",
+            0
+        )
+        analyzer.validateOwnershipTransfer(
+            setterInput,
+            expression.children[0],
+            "delegate.setter.${expression.text}"
+        )
+        analyzer.validateBorrowMutation(
+            BootstrapExpression(
+                "identifier",
+                expression.text,
+                expression.begin,
+                expression.end,
+                []
+            ),
+            "delegate.setter.${expression.text}"
+        )
+        analyzer.recordTypedCall(
+            expression,
+            "void",
+            delegateType,
+            analyzer.selectedMethodHandle(delegateType, "setValue"),
+            [value],
+            [setterInput],
+            [analyzer.methodParameterKind(
+                delegateType,
+                "setValue",
+                0
+            )],
+            0
+        )
+    } else analyzer.validateOwnershipTransfer(
+            target,
+            expression.children[0],
+            "assignment.${expression.text}"
+        )
+    if (analyzer.hasVisibleLocal(expression.text) &&
+        !analyzer.localIsMutable(expression.text)) {
+        analyzer.fail("assignment.immutable:${expression.text}")
+    }
+    if (!analyzer.hasVisibleLocal(expression.text) &&
+        analyzer.currentOwner != "" &&
+        analyzer.fieldType(analyzer.currentOwner, expression.text) != "unknown" &&
+        !analyzer.fieldIsMutable(analyzer.currentOwner, expression.text)) {
+        analyzer.fail("field.immutable:${expression.text}")
+    }
+    if (!analyzer.hasVisibleLocal(expression.text) &&
+        analyzer.findKind(expression.text) == "val") {
+        analyzer.fail("global.immutable:${expression.text}")
+    }
+    val assignmentTarget = BootstrapExpression(
+        "identifier",
+        expression.text,
+        expression.begin,
+        expression.end,
+        []
+    )
+    if (!delegated) analyzer.validateRegionStore(
+            assignmentTarget,
+            expression.children[0],
+            "assignment.${expression.text}"
+        )
+    if (analyzer.regionDepth > 0 &&
+        analyzer.hasVisibleLocal(expression.text) &&
+        analyzer.scopeIsWithin(
+            analyzer.visibleLocalScope(expression.text),
+            analyzer.regionScope
+        ) && analyzer.regionExpressionIsOwned(expression.children[0])) {
+        analyzer.markRegionOwned(
+            expression.text,
+            analyzer.visibleLocalScope(expression.text)
+        )
+    }
+    result = value
+    result
+}
+
+@noinline
+fun bootstrapInferDelegateProject(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1 ||
+        expression.children[0].kind != "identifier") {
+        analyzer.fail(
+            "delegate.not-delegated:delegate projection requires an addressable delegated binding"
+        )
+        result = "unknown"
+    } else {
+        val name = expression.children[0].text
+        if (!analyzer.nameIsDelegated(name)) {
+            analyzer.fail("delegate.not-delegated:`$name` has ordinary storage")
+            result = "unknown"
+        } else result = analyzer.delegateType(name)
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferDelegateAssign(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    var name = ""
+    if (expression.children.size == 2 &&
+        expression.children[0].kind == "identifier") {
+        name = expression.children[0].text
+    }
+    if (name == "" || !analyzer.nameIsDelegated(name)) {
+        analyzer.fail("delegate.not-delegated:projection target has ordinary storage")
+        if (expression.children.size > 1) {
+            result = analyzer.infer(expression.children[1])
+        }
+    } else {
+        val expected = analyzer.delegateType(name)
+        val actual = analyzer.infer(expression.children[1])
+        if (!analyzer.delegatedNameIsMutable(name)) {
+            analyzer.fail("delegate.replace-val:`$name` is declared `val`")
+        }
+        if (!bootstrapTypesCompatible(expected, actual)) {
+            analyzer.fail(
+                "delegate.type-mismatch:`^$name` stores `$expected`, not `$actual`"
+            )
+        }
+        analyzer.validateOwnershipTransfer(
+            expected,
+            expression.children[1],
+            "delegate.replace.$name"
+        )
+        analyzer.validateBorrowMutation(
+            expression.children[0],
+            "delegate.replace.$name"
+        )
+        analyzer.validateRegionStore(
+            expression.children[0],
+            expression.children[1],
+            "delegate.replace.$name"
+        )
+        result = actual
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferNegate(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    operand: string,
+    initial: string
+): string {
+    var result = initial
+    result = analyzer.scalarValueType(operand)
+    if (!bootstrapIsNumericScalarType(result)) {
+        analyzer.failScalarExpression(
+            "unary.numeric", expression, result, ""
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferComplement(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    result = analyzer.scalarValueType(analyzer.infer(expression.children[0]))
+    if (!bootstrapIsIntegerScalarType(result)) {
+        analyzer.fail("bitwise.type")
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferIf(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val condition = analyzer.infer(expression.children[0])
+    if (condition != "bool") analyzer.fail("if.condition")
+    val previousThenScope = analyzer.enterScope()
+    analyzer.addNullableRefinements(expression.children[0], true)
+    val thenType = analyzer.infer(expression.children[1])
+    analyzer.leaveScope(previousThenScope)
+    if (expression.children[2].kind == "missing") {
+        result = "void"
+    } else {
+        val previousElseScope = analyzer.enterScope()
+        analyzer.addNullableRefinements(expression.children[0], false)
+        val elseType = analyzer.infer(expression.children[2])
+        analyzer.leaveScope(previousElseScope)
+        result = bootstrapJoinTypes(thenType, elseType)
+    }
+    result
+}
+
+@noinline
+fun bootstrapInferWhile(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val condition = analyzer.infer(expression.children[0])
+    if (condition != "bool") analyzer.fail("while.condition")
+    analyzer.loopDepth = analyzer.loopDepth + 1
+    analyzer.infer(expression.children[1])
+    analyzer.loopDepth = analyzer.loopDepth - 1
+    result = "void"
+    if (expression.children[0].kind == "true" &&
+        !bootstrapExpressionBreaksCurrentLoop(
+            expression.children[1],
+            0
+        )) result = "never"
+    result
+}
+
+@noinline
+fun bootstrapInferDoWhile(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    analyzer.loopDepth = analyzer.loopDepth + 1
+    analyzer.infer(expression.children[0])
+    analyzer.loopDepth = analyzer.loopDepth - 1
+    val condition = analyzer.infer(expression.children[1])
+    if (condition != "bool") analyzer.fail("do-while.condition")
+    result = "void"
+    if (expression.children[1].kind == "true" &&
+        !bootstrapExpressionBreaksCurrentLoop(
+            expression.children[0],
+            0
+        )) result = "never"
+    result
+}
+
+@noinline
+fun bootstrapInferFor(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    // `val b = a; for (n in b)`: a borrowed array iterates as one.
+    val sourceType = bootstrapBorrowElementType(
+        analyzer.infer(expression.children[0])
+    )
+    var elementType = "unknown"
+    if (bootstrapIsArrayType(sourceType)) {
+        elementType = bootstrapArrayElementType(sourceType)
+    }
+    if (bootstrapIsGeneratorType(sourceType)) {
+        elementType = bootstrapGeneratorElementType(sourceType)
+    }
+    if (sourceType == "string") elementType = "i64"
+    if (elementType == "unknown") analyzer.fail("for.source")
+    // An element of a global's array is as lasting as the global; one
+    // of a shared parameter's array is read-only like the parameter
+    // (`for (row in rows) row.append(x)` mutates the caller's rows).
+    val sharedRoot = analyzer.sharedParameterRoot(expression.children[0])
+    val elementSource =
+        if (analyzer.managedReferenceIsStatic(expression.children[0])) {
+            "managed.static"
+        } else if (sharedRoot != "" &&
+                   analyzer.typeNeedsManagedAliasTracking(elementType)) {
+            "shared:$sharedRoot"
+        } else ""
+    val previousScope = analyzer.enterScope()
+    analyzer.locals.append(BootstrapSymbol(
+        expression.text,
+        "val",
+        elementType,
+        analyzer.currentScope,
+        elementSource,
+        "abla:${analyzer.currentSourceIdentity}:${expression.begin}:for:${expression.text}"
+    ))
+    analyzer.loopDepth = analyzer.loopDepth + 1
+    analyzer.infer(expression.children[1])
+    analyzer.loopDepth = analyzer.loopDepth - 1
+    analyzer.leaveScope(previousScope)
+    result = "void"
+    result
+}
+
+@noinline
+fun bootstrapInferBreak(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (analyzer.regionDepth > 0) {
+        analyzer.fail("region.control:${expression.kind}")
+    }
+    if (analyzer.loopDepth <= 0) analyzer.fail(
+        "${expression.kind}.outside-loop"
+    )
+    result = "never"
+    result
+}
+
+@noinline
+fun bootstrapInferWhen(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val subject = analyzer.infer(expression.children[0])
+    var branchType = "unknown"
+    var hasElse = false
+    var hasTrue = false
+    var hasFalse = false
+    val literalKeys: array<string> = []
+    if (expression.children.size == 1) analyzer.fail("when.empty")
+    var branch = 1
+    while (branch + 1 < expression.children.size) {
+        val match = expression.children[branch]
+        if (match.kind == "missing") {
+            if (hasElse) analyzer.fail("when.else-duplicate")
+            if (branch + 2 < expression.children.size) {
+                analyzer.fail("when.else-last")
+            }
+            hasElse = true
+            bootstrapSemanticUnit()
+        } else {
+            val matchType = analyzer.infer(match)
+            if (!bootstrapTypesCompatible(subject, matchType)) {
+                analyzer.fail("when.match")
+            }
+            if (match.kind == "true") hasTrue = true
+            if (match.kind == "false") hasFalse = true
+            val key = bootstrapWhenLiteralKey(match)
+            if (key != "") {
+                if (bootstrapAffineNamesContain(literalKeys, key)) {
+                    analyzer.fail("when.duplicate:$key")
+                } else literalKeys.append(key)
+            }
+            bootstrapSemanticUnit()
+        }
+        val found = analyzer.infer(expression.children[branch + 1])
+        branchType = bootstrapJoinTypes(branchType, found)
+        branch = branch + 2
+    }
+    if (!hasElse && !(subject == "bool" && hasTrue && hasFalse)) {
+        analyzer.fail("when.non-exhaustive:$subject")
+    }
+    result = branchType
+    result
+}
+
+@noinline
+fun bootstrapInferComparison(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    // A borrow compares as what it borrows (`borrowed != null`).
+    val left = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
+    val right = bootstrapBorrowElementType(analyzer.infer(expression.children[1]))
+    if (!analyzer.typesCompatible(left, right) &&
+        !analyzer.typesCompatible(right, left)) {
+        analyzer.fail("comparison.type")
+    }
+    result = "bool"
+    result
 }
 
 // The names a block's statements see bound: the enclosing ones, then each
