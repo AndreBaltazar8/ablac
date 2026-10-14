@@ -86,6 +86,16 @@ Package-side work (not changed from ablac):
   after a development Wasm build. A standalone LLVM C API reproducer also differs
   after running the Wasm passes. The isolated `opt`/`llc` path is the release default
   until the LLVM state interaction is resolved; the in-process path is opt-in.
+- [ ] **Temporaries never share a stack slot.** Every IR value that is not a scalar gets
+  its own 24-byte slot, and the backend emits no `llvm.lifetime` markers, so LLVM keeps
+  them all apart: a frame grows with its function's size, not with what is live at once.
+  `BootstrapEvaluator.evaluate`, a `when` of 25 calls, still holds about 180 slots
+  (2.3 KB), of which a few are live at a time. Moving the evaluator's, the analyzer's and
+  the lowerer's cases into `@noinline` functions took a nested JSON literal from about
+  420 KB of stack per level to 28 KB. Markers for the values defined and last used inside
+  one IR block (the GC root plan already finds each value's definition and last use)
+  would shrink every frame, programs' too. First, audit the emitter for value reads that
+  do not come from an instruction's `left`, `right` or `operands`.
 
 Measured on a 10K-function Wasm application (86 MB of LLVM IR). Its dev build's compiler,
 collecting each time its heap grows by 256 MiB, peaks at about 1 GB and takes about 28 CPU
