@@ -6378,6 +6378,9 @@ class BootstrapLowerer(
     }
 
     fun lowerExpressionAt(expression: BootstrapExpression): int {
+        // Each larger case is a @noinline function of its own, so an expression
+        // nested N deep holds N frames of this dispatch rather than of every
+        // case's locals.
         var result = -1
         if (expression.kind == "integer") {
             result = this.emit("const.i64", -1, -1, expression.text)
@@ -6400,96 +6403,14 @@ class BootstrapLowerer(
             )
         }
         if (expression.kind == "string.template" && !staticTemplate) {
-            result = this.emit("const.string", -1, -1, "")
-            var part = 0
-            while (part < expression.children.size) {
-                val child = expression.children[part]
-                val childType = this.lowerRuntimeType(
-                    bootstrapBorrowElementType(this.lowerExpressionType(child))
-                )
-                // Floats are written by abla/float/text's f64Text (sema
-                // requires it to be imported); an f32 widens first through
-                // abla/float's f32ToF64, which that module imports.
-                val float = if (childType == "f32") BootstrapExpression(
-                    "call", "f32ToF64", child.begin, child.end, [child]
-                ) else child
-                // A narrower integer widens to i64; a u64 is written
-                // unsigned by the runtime's __ablaRuntimeU64Text.
-                val narrow = childType == "i8" || childType == "u8" ||
-                    childType == "i16" || childType == "u16" ||
-                    childType == "i32" || childType == "u32"
-                val text = if (childType == "f64" || childType == "f32") {
-                    this.lowerExpression(BootstrapExpression(
-                        "call", "f64Text", child.begin, child.end, [float]
-                    ))
-                } else if (childType == "u64") {
-                    this.lowerExpression(BootstrapExpression(
-                        "call", "__ablaRuntimeU64Text", child.begin,
-                        child.end, [child]
-                    ))
-                } else if (narrow) {
-                    this.emit("to.string", this.lowerExpression(
-                        BootstrapExpression(
-                            "call", "i64", child.begin, child.end, [child]
-                        )
-                    ), -1, "")
-                } else if (childType == "string") {
-                    this.lowerExpression(child)
-                } else this.emit("to.string", this.lowerExpression(child), -1, "")
-                result = this.emit("string.concat", result, text, "")
-                part = part + 1
-            }
+            result = bootstrapLowerStringTemplate(this, expression, result)
         }
         if (expression.kind == "array") {
-            val elements: array<int> = []
-            var element = 0
-            while (element < expression.children.size) {
-                elements.append(this.lowerExpression(expression.children[element]))
-                element = element + 1
-            }
-            result = this.emitMany("array.create", elements, "")
+            result = bootstrapLowerArray(this, expression, result)
         }
         if (expression.kind == "range.closed" ||
             expression.kind == "range.until") {
-            val begin = this.lowerExpression(expression.children[0])
-            val end = this.lowerExpression(expression.children[1])
-            val elements: array<int> = []
-            result = this.emitMany("array.create", elements, "")
-            val temporary = "range_current_${this.nextLabel}"
-            this.emitControl("local.zero.i64", -1, -1, -1, temporary)
-            this.emitControl("local.set", begin, -1, -1, temporary)
-            val conditionLabel = this.allocateLabel()
-            val bodyLabel = this.allocateLabel()
-            val incrementLabel = this.allocateLabel()
-            val mergeLabel = this.allocateLabel()
-            this.emitControl("jump", -1, conditionLabel, -1, "")
-            this.emitControl("label", -1, conditionLabel, -1, "")
-            val current = this.emit("local.load", -1, -1, temporary)
-            var operation = "<"
-            if (expression.kind == "range.closed") operation = "<="
-            val more = this.emit(operation, current, end, "")
-            this.emitControl("branch", more, bodyLabel, mergeLabel, "")
-            this.emitControl("label", -1, bodyLabel, -1, "")
-            val appendOperands: array<int> = [result, current]
-            this.emitMany("array.append", appendOperands, "")
-            if (expression.kind == "range.closed") {
-                val complete = this.emit("==", current, end, "")
-                this.emitControl(
-                    "branch",
-                    complete,
-                    mergeLabel,
-                    incrementLabel,
-                    ""
-                )
-            } else {
-                this.emitControl("jump", -1, incrementLabel, -1, "")
-            }
-            this.emitControl("label", -1, incrementLabel, -1, "")
-            val one = this.emit("const.i64", -1, -1, "1")
-            val next = this.emit("+", current, one, "")
-            this.emitControl("local.set", next, -1, -1, temporary)
-            this.emitControl("jump", -1, conditionLabel, -1, "")
-            this.emitControl("label", -1, mergeLabel, -1, "")
+            result = bootstrapLowerRange(this, expression, result)
         }
         if (expression.kind == "null") {
             result = this.emit("const.null", -1, -1, "")
@@ -6499,371 +6420,34 @@ class BootstrapLowerer(
             result = this.lowerExpression(expression.children[0])
         }
         if (expression.kind == "compile") {
-            if (this.validationOnly) {
-                result = this.emit("const.void", -1, -1, "")
-            } else {
-                val evaluated = bootstrapEvaluate(
-                    expression.children[0],
-                    this.declarations
-                )
-                this.recordCompileInputs(evaluated)
-                if (evaluated.diagnostics != "") {
-                    bootstrapStageDriverDiagnostic(evaluated.diagnostics)
-                }
-                this.errors = this.errors + evaluated.errors
-                result = this.emitEvaluated(evaluated.value)
-            }
+            result = bootstrapLowerCompile(this, expression, result)
         }
         if (expression.kind == "region") {
-            val checkpoint = this.emitMany(
-                "call",
-                [],
-                "__ablaRuntimePlatformRegionBegin"
-            )
-            result = this.lowerExpression(expression.children[0])
-            this.emitMany(
-                "call",
-                [checkpoint],
-                "__ablaRuntimePlatformRegionEnd"
-            )
+            result = bootstrapLowerRegion(this, expression, result)
         }
         if (expression.kind == "identifier") {
-            if (this.lowerNameIsDelegated(expression.text)) {
-                result = this.emitDelegatedMethod(
-                    expression.text,
-                    "getValue",
-                    [],
-                    expression.begin,
-                    expression.end
-                )
-            } else if (this.isField(expression.text) &&
-                !this.isParameter(expression.text) &&
-                !this.isLocal(expression.text)) {
-                val receiver = this.emit(
-                    "parameter.load",
-                    -1,
-                    -1,
-                    "this"
-                )
-                var object = receiver
-                if (this.isCapturedParameter("this")) {
-                    object = this.emit("cell.get", receiver, -1, "")
-                }
-                result = this.emitFieldGet(
-                    object,
-                    this.currentOwner,
-                    expression.text
-                )
-            } else if (this.isParameter(expression.text) ||
-                       this.isLocal(expression.text) ||
-                       this.isGlobal(expression.text)) {
-                val opcode =
-                    if (this.isParameter(expression.text)) "parameter.load"
-                    else if (this.isLocal(expression.text)) "local.load"
-                    else "global.load"
-                val storage =
-                    if (opcode == "local.load") this.storageFor(expression.text)
-                    else expression.text
-                result = this.emit(opcode, -1, -1, storage)
-                if ((opcode == "local.load" &&
-                     this.localIsCell(expression.text)) ||
-                    (opcode == "parameter.load" &&
-                     this.isCapturedParameter(expression.text))) {
-                    result = this.emit("cell.get", result, -1, "")
-                } else result = result
-            } else if (this.isFunction(expression.text)) {
-                result = this.emit("function.ref", -1, -1, expression.text)
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit("invalid", -1, -1, expression.text)
-            }
-            if (this.isImplicitResult(expression)) {
-                this.emitResultMove(expression)
-            }
+            result = bootstrapLowerIdentifier(this, expression, result)
         }
         if (expression.kind == "lambda" ||
             expression.kind == "lambda.move" ||
             expression.kind == "lambda.generator") {
-            val lambdaInstructions: array<BootstrapInstruction> = []
-            val lambdaParameters: array<string> = []
-            val lambdaParameterTypes: array<string> = []
-            val lambdaAbiParameterTypes: array<string> = []
-            val explicitParameters: array<string> = []
-            val explicitParameterTypes: array<string> = []
-            var parameter = 0
-            while (parameter + 1 < expression.children.size) {
-                val found = expression.children[parameter]
-                explicitParameters.append(found.text)
-                if (found.children.size > 0) {
-                    explicitParameterTypes.append(found.children[0].text)
-                } else explicitParameterTypes.append("unknown")
-                parameter = parameter + 1
-            }
-            val body = expression.children[expression.children.size - 1]
-            val bound: array<string> = []
-            parameter = 0
-            while (parameter < explicitParameters.size) {
-                bound.append(explicitParameters[parameter])
-                parameter = parameter + 1
-            }
-            val free: array<string> = []
-            this.collectLambdaFreeNames(body, bound, free)
-            val captureNames: array<string> = []
-            val capturedCells: array<string> = []
-            val ownedCaptures: array<string> = []
-            val captureValues: array<int> = []
-            var freeIndex = 0
-            while (freeIndex < free.size) {
-                var captureName = free[freeIndex]
-                if (this.isField(captureName) && this.currentOwner != "") {
-                    captureName = "this"
-                }
-                if ((this.isParameter(captureName) ||
-                     this.isLocal(captureName)) &&
-                    !this.nameIsBound(captureNames, captureName)) {
-                    captureNames.append(captureName)
-                    var captureType = this.lowerLocalType(captureName)
-                    if (this.isParameter(captureName)) {
-                        captureType = this.lowerParameterType(captureName)
-                    }
-                    if (this.lowerNameIsDelegated(captureName)) {
-                        captureType = this.lowerDelegatedMetadataType(
-                            captureName
-                        )
-                    }
-                    val captureStorageType =
-                        bootstrapDelegatedStorageOrSelf(captureType)
-                    if (this.lowerTypeIsAffine(captureStorageType) &&
-                        (expression.kind == "lambda.move" ||
-                         expression.kind == "lambda.generator")) {
-                        captureValues.append(this.captureOwned(captureName))
-                        ownedCaptures.append(captureName)
-                        lambdaAbiParameterTypes.append(captureType)
-                    } else {
-                        if (this.lowerTypeIsAffine(captureStorageType)) {
-                            this.errors = this.errors + 1
-                        }
-                        capturedCells.append(captureName)
-                        captureValues.append(this.captureCell(captureName))
-                        // Ordinary captures are passed as cell objects even
-                        // when the captured source value is scalar.
-                        lambdaAbiParameterTypes.append("unknown")
-                    }
-                    lambdaParameterTypes.append(captureType)
-                    lambdaParameters.append(captureName)
-                }
-                freeIndex = freeIndex + 1
-            }
-            parameter = 0
-            while (parameter < explicitParameters.size) {
-                lambdaParameters.append(explicitParameters[parameter])
-                lambdaParameterTypes.append(explicitParameterTypes[parameter])
-                lambdaAbiParameterTypes.append(
-                    explicitParameterTypes[parameter]
-                )
-                parameter = parameter + 1
-            }
-            val lambdaLocals: array<string> = []
-            val lambdaLocalTypes: array<string> = []
-            val lambdaStorage: array<string> = []
-            val lambdaScopes: array<int> = []
-            val lambdaEvaluatedValues: array<BootstrapEvalValue> = []
-            val lambdaEvaluatedResults: array<int> = []
-            val lambdaImplicitResults: array<BootstrapExpression> = []
-            this.collectImplicitResults(body, lambdaImplicitResults)
-            val lambdaLowerer = BootstrapLowerer(
-                lambdaInstructions,
-                this.functions,
-                lambdaParameters,
-                lambdaParameterTypes,
-                ownedCaptures,
-                capturedCells,
-                lambdaLocals,
-                lambdaLocalTypes,
-                lambdaStorage,
-                lambdaScopes,
-                [],
-                [],
-                [],
-                [-1],
-                0,
-                this.declarations,
-                this.functionDeclarations,
-                this.typeDeclarations,
-                this.scalarTypeDeclarations,
-                this.valueDeclarations,
-                this.methodDeclarations,
-                this.affineTypes,
-                this.neverCallNames,
-                this.mutableReceivers,
-                this.managedAliasBegins,
-                this.managedAliasEnds,
-                this.managedAliasSources,
-                [],
-                [],
-                [],
-                lambdaImplicitResults,
-                this.currentOwner,
-                lambdaEvaluatedValues,
-                lambdaEvaluatedResults,
-                this.compileInputPaths,
-                this.compileInputContents,
-                0,
-                0,
-                -1,
-                -1,
-                -1,
-                -1,
-                this.validationOnly,
-                this.errors,
-                bootstrapIrLocalNames()
-            )
-            val lambdaResult = lambdaLowerer.lowerExpression(body)
-            lambdaLowerer.emitOwnedParameterDrops()
-            this.errors = lambdaLowerer.errors
-            // Transactional declaration sinks restart their local function
-            // index. Source spans keep lambda symbols deterministic and unique
-            // across independently committed declarations.
-            val lambdaName =
-                "lambda_${expression.begin}_${expression.end}_${this.functions.size}"
-            val lambdaFunction = bootstrapFinalizeIrFunction(
-                lambdaName,
-                lambdaParameters,
-                lambdaInstructions,
-                lambdaResult,
-                bootstrapIrRuntimeTypes(
-                    this.declarations, this.scalarTypeDeclarations, lambdaAbiParameterTypes
-                ),
-                "unknown",
-                lambdaLowerer.localStorage,
-                bootstrapIrRuntimeTypes(
-                    this.declarations, this.scalarTypeDeclarations, lambdaLowerer.localTypes
-                ),
-                false,
-                false,
-                false,
-                "",
-                if (bootstrapIrSourceLabel == "") "lambda"
-                    else "${bootstrapIrSourceLabel}.lambda",
-                bootstrapIrSourcePositionOf(
-                    bootstrapIrSourceFile, expression.begin
-                )
-            )
-            this.errors = this.errors + lambdaFunction.verificationErrors
-            this.functions.append(lambdaFunction)
-            if (expression.kind == "lambda.move" ||
-                expression.kind == "lambda.generator") {
-                val lambdaDropTypes: array<string> = []
-                var dropType = 0
-                while (dropType < lambdaParameterTypes.size) {
-                    lambdaDropTypes.append(bootstrapDelegatedStorageOrSelf(
-                        lambdaParameterTypes[dropType]
-                    ))
-                    dropType = dropType + 1
-                }
-                val closureDrop = bootstrapBuildClosureDropFunction(
-                    lambdaName,
-                    captureNames,
-                    lambdaDropTypes,
-                    this.affineTypes
-                )
-                this.errors =
-                    this.errors + closureDrop.verificationErrors
-                this.functions.append(closureDrop)
-            }
-            result = this.emitMany("closure.create", captureValues, lambdaName)
+            result = bootstrapLowerLambda(this, expression, result)
         }
         if (expression.kind == "block") {
-            val previousScope = this.enterLocalScope()
-            // A local a closure captures lives in a cell from its declaration
-            // on. Converting it where the closure was built ran again on each
-            // pass of a loop and wrapped the cell in a second cell; inside one
-            // `if` arm it converted one path only.
-            var captured: array<string> = []
-            var capturesCollected = false
-            var statement = 0
-            while (statement < expression.children.size) {
-                val lowered = expression.children[statement]
-                result = this.lowerExpression(lowered)
-                val after = bootstrapConditionAfterIf(lowered)
-                if (after != "") this.addNullableRefinements(
-                    lowered.children[0], after == "true"
-                )
-                if (lowered.kind == "local.val" || lowered.kind == "local.var") {
-                    if (!capturesCollected) {
-                        this.collectCapturedNames(expression, captured)
-                        capturesCollected = true
-                    }
-                    if (this.nameIsBound(captured, lowered.text) &&
-                        !this.lowerNameIsDelegated(lowered.text) &&
-                        !this.lowerTypeIsAffine(bootstrapDelegatedStorageOrSelf(
-                            this.lowerLocalType(lowered.text)
-                        ))) this.captureCell(lowered.text)
-                }
-                statement = statement + 1
-            }
-            if (result < 0) result = this.emit("const.void", -1, -1, "")
-            this.emitScopeDrops(this.currentScope)
-            this.leaveLocalScope(previousScope)
+            result = bootstrapLowerBlock(this, expression, result)
         }
         if (expression.kind == "defer") {
-            if (expression.children.size == 1) {
-                val closure = this.lowerExpression(BootstrapExpression(
-                    "lambda.move",
-                    "",
-                    expression.begin,
-                    expression.end,
-                    [expression.children[0]]
-                ))
-                val name = "defer_${this.nextValue}"
-                val storage = "local_${this.nextValue}_$name"
-                this.locals.append(name)
-                this.localTypes.append("once:function:()->void")
-                this.localStorage.append(storage)
-                this.localScopes.append(this.currentScope)
-                this.localBorrowSources.append("")
-                this.emit("local.declare", closure, -1, storage)
-                this.deferredScopes.append(this.currentScope)
-                this.deferredStorage.append(storage)
-            } else this.errors = this.errors + 1
-            result = this.emit("const.void", -1, -1, "")
+            result = bootstrapLowerDefer(this, expression, result)
         }
         if (expression.kind == "generator" && expression.children.size == 1) {
-            val closure = this.lowerExpression(BootstrapExpression(
-                "lambda.generator",
-                "",
-                expression.begin,
-                expression.end,
-                [expression.children[0]]
-            ))
-            result = this.emit("generator.create", closure, -1, "")
+            result = bootstrapLowerGenerator(this, expression, result)
         }
         if ((expression.kind == "task" || expression.kind == "thread") &&
             expression.children.size == 1) {
-            val closure = this.lowerExpression(BootstrapExpression(
-                "lambda.move",
-                "",
-                expression.begin,
-                expression.end,
-                [expression.children[0]]
-            ))
-            result = this.emit("${expression.kind}.create", closure, -1, "")
+            result = bootstrapLowerTask(this, expression, result)
         }
         if (expression.kind == "yield" && expression.children.size == 1) {
-            val value = this.lowerExpression(expression.children[0])
-            val keepRunning = this.emit("generator.yield", value, -1, "")
-            val continueLabel = this.allocateLabel()
-            val cancelLabel = this.allocateLabel()
-            this.emitControl(
-                "branch", keepRunning, continueLabel, cancelLabel, ""
-            )
-            this.emitControl("label", -1, cancelLabel, -1, "")
-            this.emitDropsThroughScope(-1)
-            this.emitOwnedParameterDrops()
-            val cancelled = this.emit("const.void", -1, -1, "")
-            this.emitControl("return", cancelled, -1, -1, "")
-            this.emitControl("label", -1, continueLabel, -1, "")
-            result = this.emit("const.void", -1, -1, "")
+            result = bootstrapLowerYield(this, expression, result)
         }
         if (expression.kind == "await" && expression.children.size == 1) {
             val operation = this.lowerExpression(expression.children[0])
@@ -6871,517 +6455,78 @@ class BootstrapLowerer(
             this.emitResultMove(expression.children[0])
         }
         if (expression.kind == "return") {
-            if (expression.children[0].kind == "missing") {
-                result = this.emit("const.void", -1, -1, "")
-            } else {
-                result = this.lowerExpression(expression.children[0])
-                this.emitResultMove(expression.children[0])
-                result = result
-            }
-            this.emitDropsThroughScope(-1)
-            this.emitOwnedParameterDrops()
-            this.emitControl("return", result, -1, -1, "")
+            result = bootstrapLowerReturn(this, expression, result)
         }
         if (
             expression.kind == "local.val" ||
             expression.kind == "local.var"
         ) {
-            val hasInitializer = expression.children[0].kind != "missing"
-            val delegated = hasInitializer &&
-                expression.children[0].kind == "delegate.initializer" &&
-                expression.children[0].children.size > 1
-            val initializer = if (delegated) {
-                expression.children[0].children[0]
-            } else expression.children[0]
-            val managedAlias = !delegated && this.isManagedAlias(expression)
-            var value = -1
-            var localType = "unknown"
-            if (hasInitializer) {
-                value = this.lowerExpression(initializer)
-                localType = this.lowerExpressionType(initializer)
-            }
-            if (delegated) {
-                val delegateType = localType
-                var exposedType = this.lowerMethodResultType(
-                    delegateType,
-                    "getValue"
-                )
-                val declared = expression.children[0].children[1].text
-                if (declared != "inferred") {
-                    exposedType = bootstrapNormalizeType(declared)
-                }
-                localType = bootstrapDelegatedType(
-                    expression.kind == "local.var",
-                    delegateType,
-                    exposedType
-                )
-            }
-            if (managedAlias && !bootstrapIsBorrowType(localType)) {
-                localType = "borrow:$localType"
-            }
-            if (!delegated && expression.children.size > 1 &&
-                expression.children[1].text != "inferred") {
-                val declaredType = bootstrapNormalizeType(
-                    expression.children[1].text
-                )
-                if (!managedAlias ||
-                    (declaredType != bootstrapBorrowElementType(localType) &&
-                     declaredType != localType)) localType = declaredType
-            }
-            val storage = "local_${this.nextValue}_${expression.text}"
-            this.locals.append(expression.text)
-            this.localTypes.append(localType)
-            this.localStorage.append(storage)
-            this.localScopes.append(this.currentScope)
-            this.localBorrowSources.append("")
-            if (hasInitializer) {
-                result = this.emit("local.declare", value, -1, storage)
-                if (!delegated && bootstrapIsBorrowType(localType)) {
-                    val constructorAlias = managedAlias &&
-                        expression.children[0].kind == "call" &&
-                        this.isClass(expression.children[0].text)
-                    val source = if (constructorAlias) {
-                        this.lowerManagedAliasSource(
-                            expression.children[0],
-                            this.managedAliasSource(expression)
-                        )
-                    } else if (managedAlias) {
-                        this.lowerBorrowArgumentSource(expression.children[0])
-                    } else if (expression.children[0].kind == "identifier" &&
-                        this.lowerNameIsDelegated(
-                            expression.children[0].text
-                        )) {
-                        this.lowerPlacePath(expression.children[0])
-                    } else this.lowerBorrowSource(expression.children[0])
-                    if (source == "") {
-                        this.errors = this.errors + 1
-                        bootstrapSemanticUnit()
-                    } else {
-                        this.localBorrowSources[this.localBorrowSources.size - 1] =
-                            source
-                        this.emitControl(
-                            "borrow.bind",
-                            -1,
-                            -1,
-                            -1,
-                            "$storage|$source"
-                        )
-                        bootstrapSemanticUnit()
-                    }
-                }
-                result = result
-            } else {
-                this.emitControl("local.allocate", -1, -1, -1, storage)
-                result = this.emit("const.void", -1, -1, "")
-            }
+            result = bootstrapLowerLocal(this, expression, result)
         }
         if (expression.kind == "assign") {
-            val value = this.lowerExpression(expression.children[0])
-            if (this.lowerNameIsDelegated(expression.text)) {
-                this.emitDelegatedMethod(
-                    expression.text,
-                    "setValue",
-                    [value],
-                    expression.begin,
-                    expression.end
-                )
-                result = value
-            } else if (this.isLocal(expression.text)) {
-                this.emitAffineDrop(
-                    this.storageFor(expression.text),
-                    this.lowerLocalType(expression.text)
-                )
-                if (this.localIsCell(expression.text)) {
-                    val cell = this.emit(
-                        "local.load",
-                        -1,
-                        -1,
-                        this.storageFor(expression.text)
-                    )
-                    result = this.emitMany("cell.set", [cell, value], "")
-                } else result = this.emit(
-                        "local.assign",
-                        value,
-                        -1,
-                        this.storageFor(expression.text)
-                    )
-            } else if (this.isCapturedParameter(expression.text)) {
-                val cell = this.emit(
-                    "parameter.load",
-                    -1,
-                    -1,
-                    expression.text
-                )
-                result = this.emitMany("cell.set", [cell, value], "")
-            } else if (this.isField(expression.text)) {
-                val receiver = this.emit(
-                    "parameter.load",
-                    -1,
-                    -1,
-                    "this"
-                )
-                var object = receiver
-                if (this.isCapturedParameter("this")) {
-                    object = this.emit("cell.get", receiver, -1, "")
-                }
-                val fieldType = this.lowerFieldType(
-                    this.currentOwner,
-                    expression.text
-                )
-                if (this.lowerTypeIsAffine(fieldType)) {
-                    val previous = this.emitFieldGet(
-                        object,
-                        this.currentOwner,
-                        expression.text
-                    )
-                    this.emitAffineValueDrop(previous, fieldType)
-                }
-                result = this.emitFieldSet(
-                    object,
-                    value,
-                    this.currentOwner,
-                    expression.text
-                )
-            } else result = this.emit("global.assign", value, -1, expression.text)
+            result = bootstrapLowerAssign(this, expression, result)
         }
         if (expression.kind == "delegate.project" &&
             expression.children.size == 1 &&
             expression.children[0].kind == "identifier") {
-            val name = expression.children[0].text
-            val place = this.lowerPlacePath(expression)
-            if (place != "") {
-                this.emitControl("place.load", -1, -1, -1, place)
-            }
-            result = this.lowerDelegateSlot(name)
+            result = bootstrapLowerDelegateProject(this, expression, result)
         }
         if (expression.kind == "delegate.assign" &&
             expression.children.size == 2 &&
             expression.children[0].kind == "identifier") {
-            val name = expression.children[0].text
-            val value = this.lowerExpression(expression.children[1])
-            val storageType = this.lowerStorageType(name)
-            if (this.isLocal(name)) {
-                if (this.localIsCell(name)) {
-                    val cell = this.emit(
-                        "local.load", -1, -1, this.storageFor(name)
-                    )
-                    if (this.lowerTypeIsAffine(storageType)) {
-                        val previous = this.emit("cell.get", cell, -1, "")
-                        this.emitAffineValueDrop(previous, storageType)
-                    }
-                    this.emitMany("cell.set", [cell, value], "")
-                } else {
-                    this.emitAffineDrop(this.storageFor(name), storageType)
-                    this.emit("local.assign", value, -1, this.storageFor(name))
-                }
-            } else if (this.isCapturedParameter(name)) {
-                val cell = this.emit("parameter.load", -1, -1, name)
-                if (this.lowerTypeIsAffine(storageType)) {
-                    val previous = this.emit("cell.get", cell, -1, "")
-                    this.emitAffineValueDrop(previous, storageType)
-                }
-                this.emitMany("cell.set", [cell, value], "")
-            } else if (this.isGlobal(name)) {
-                if (this.lowerTypeIsAffine(storageType)) {
-                    val previous = this.emit("global.load", -1, -1, name)
-                    this.emitAffineValueDrop(previous, storageType)
-                }
-                this.emit("global.assign", value, -1, name)
-            } else this.errors = this.errors + 1
-            val place = this.lowerPlacePath(expression.children[0])
-            if (place != "") {
-                this.emitControl("place.set", -1, -1, -1, place)
-            }
-            result = value
+            result = bootstrapLowerDelegateAssign(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "move") {
-            if (expression.children.size == 1 &&
-                expression.children[0].kind == "identifier" &&
-                (this.isLocal(expression.children[0].text) ||
-                 this.isParameter(expression.children[0].text))) {
-                val moved = expression.children[0]
-                result = this.lowerExpression(moved)
-                this.emitControl(
-                    "local.move",
-                    -1,
-                    -1,
-                    -1,
-                    this.storageFor(moved.text)
-                )
-                bootstrapSemanticUnit()
-            } else if (expression.children.size == 1 &&
-                (expression.children[0].kind == "member" ||
-                 expression.children[0].kind == "index")) {
-                val moved = expression.children[0]
-                val root = bootstrapPlaceRootName(moved)
-                val place = this.lowerPlacePath(moved)
-                this.emitControl("place.load", -1, -1, -1, place)
-                if (moved.kind == "member") {
-                    val receiver = this.lowerPlaceProjection(
-                        moved.children[0]
-                    )
-                    val ownerType = this.lowerExpressionType(
-                        moved.children[0]
-                    )
-                    result = this.emitFieldGet(
-                        receiver,
-                        ownerType,
-                        moved.text
-                    )
-                    val empty = this.emit("const.null", -1, -1, "")
-                    this.emitFieldSet(
-                        receiver,
-                        empty,
-                        ownerType,
-                        moved.text
-                    )
-                } else {
-                    val receiver = this.lowerPlaceProjection(
-                        moved.children[0]
-                    )
-                    val index = this.lowerExpression(moved.children[1])
-                    val receiverType = bootstrapBorrowElementType(
-                        this.lowerExpressionType(moved.children[0])
-                    )
-                    val opcode = this.lowerIndexGetOpcode(receiverType)
-                    result = this.emit(opcode, receiver, index, "")
-                    val empty = this.emit("const.null", -1, -1, "")
-                    this.emitMany("index.set", [receiver, index, empty], "")
-                }
-                if ((this.isLocal(root) || this.isParameter(root)) &&
-                    this.lowerTypeIsAffine(
-                        this.lowerExpressionType(moved)
-                    )) {
-                    this.emitControl(
-                        "place.move",
-                        -1,
-                        -1,
-                        -1,
-                        place
-                    )
-                } else {
-                    this.errors = this.errors + 1
-                    bootstrapSemanticUnit()
-                }
-                bootstrapSemanticUnit()
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit("invalid", -1, -1, "move")
-                bootstrapSemanticUnit()
-            }
+            result = bootstrapLowerCallMove(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "Shared") {
-            if (expression.children.size == 1) {
-                val value = this.lowerExpression(expression.children[0])
-                result = this.emit(
-                    "shared.create",
-                    value,
-                    -1,
-                    this.lowerExpressionType(expression.children[0])
-                )
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit("invalid", -1, -1, "Shared")
-            }
+            result = bootstrapLowerCallShared(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "Mutex") {
-            if (expression.children.size == 1) {
-                val value = this.lowerExpression(expression.children[0])
-                result = this.emit(
-                    "shared.create",
-                    value,
-                    -1,
-                    this.lowerExpressionType(expression.children[0])
-                )
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit("invalid", -1, -1, "Mutex")
-            }
+            result = bootstrapLowerCallMutex(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "filledArray") {
-            if (expression.children.size == 2) {
-                val count = this.lowerExpression(expression.children[0])
-                val value = this.lowerExpression(expression.children[1])
-                result = this.emitMany("array.filled", [count, value], "")
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit("invalid", -1, -1, "filledArray")
-            }
+            result = bootstrapLowerCallFilledArray(this, expression, result)
         }
         if (expression.kind == "call" && expression.text == "Map") {
             val none: array<int> = []
             result = this.emitMany("map.create", none, "")
         }
         if (expression.kind == "call" && expression.text == "Cell") {
-            if (expression.children.size == 1) {
-                val value = this.lowerExpression(expression.children[0])
-                result = this.emit("cell.create", value, -1, "")
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit("invalid", -1, -1, "Cell")
-            }
+            result = bootstrapLowerCallCell(this, expression, result)
         }
         if (expression.kind == "call" &&
             expression.text == "nativeXtensaInterruptHandlerAddress") {
-            val validIntrinsic = this.isExternal(expression.text) &&
-                this.externalLibrary(expression.text) == "intrinsic"
-            val validHandler = expression.children.size == 1 &&
-                expression.children[0].kind == "identifier" &&
-                this.isNativeInterruptHandler(expression.children[0].text)
-            if (validIntrinsic && validHandler) {
-                result = this.emit(
-                    "native.xtensa.interrupt.handler.address",
-                    -1,
-                    -1,
-                    expression.children[0].text
-                )
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit(
-                    "invalid", -1, -1,
-                    "nativeXtensaInterruptHandlerAddress"
-                )
-            }
+            result = bootstrapLowerCallXtensaInterruptHandler(
+                this, expression, result
+            )
         }
         if (expression.kind == "call" &&
             (expression.text == "nativeStaticBytes" ||
              expression.text == "nativeStaticMutableBytes")) {
-            val validIntrinsic = this.isExternal(expression.text) &&
-                this.externalLibrary(expression.text) == "intrinsic"
-            val contents = if (expression.children.size == 1) {
-                bootstrapStaticString(expression.children[0])
-            } else BootstrapStaticString("", false)
-            if (validIntrinsic && contents.valid) {
-                val opcode = if (
-                    expression.text == "nativeStaticMutableBytes"
-                ) "native.static.mutable.bytes" else "native.static.bytes"
-                result = this.emit(opcode, -1, -1, contents.text)
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit(
-                    "invalid", -1, -1, expression.text
-                )
-            }
+            result = bootstrapLowerCallNativeStaticBytes(
+                this, expression, result
+            )
         }
         if (expression.kind == "call" &&
             (expression.text == "nativeStaticU32s" ||
              expression.text == "nativeStaticMutableU32s")) {
-            val validIntrinsic = this.isExternal(expression.text) &&
-                this.externalLibrary(expression.text) == "intrinsic"
-            val validValues = expression.children.size == 1 &&
-                expression.children[0].kind == "array" &&
-                expression.children[0].children.size > 0
-            if (validIntrinsic && validValues) {
-                val values: array<int> = []
-                var value = 0
-                while (value < expression.children[0].children.size) {
-                    values.append(this.lowerExpression(
-                        expression.children[0].children[value]
-                    ))
-                    value = value + 1
-                }
-                val opcode = if (
-                    expression.text == "nativeStaticMutableU32s"
-                ) "native.static.mutable.u32s" else "native.static.u32s"
-                result = this.emitMany(opcode, values, "")
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit(
-                    "invalid", -1, -1, expression.text
-                )
-            }
+            result = bootstrapLowerCallNativeStaticU32s(
+                this, expression, result
+            )
         }
         if (expression.kind == "call" &&
             expression.text == "nativeInternalSectionU32s") {
-            val validIntrinsic = this.isExternal(expression.text) &&
-                this.externalLibrary(expression.text) == "intrinsic"
-            val validValues = expression.children.size == 3 &&
-                expression.children[0].kind == "array" &&
-                expression.children[0].children.size > 0
-            val linkName = if (expression.children.size == 3) {
-                bootstrapStaticString(expression.children[1])
-            } else BootstrapStaticString("", false)
-            val section = if (expression.children.size == 3) {
-                bootstrapStaticString(expression.children[2])
-            } else BootstrapStaticString("", false)
-            if (validIntrinsic && validValues && linkName.valid &&
-                linkName.text != "" && section.valid && section.text != "") {
-                val values: array<int> = []
-                var value = 0
-                while (value < expression.children[0].children.size) {
-                    values.append(this.lowerExpression(
-                        expression.children[0].children[value]
-                    ))
-                    value = value + 1
-                }
-                result = this.emitManyTexts(
-                    "native.internal.section.u32s", values, "",
-                    [linkName.text, section.text]
-                )
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit(
-                    "invalid", -1, -1, expression.text
-                )
-            }
+            result = bootstrapLowerCallNativeInternalSectionU32s(this, expression, result)
         }
         if (expression.kind == "call" &&
             expression.text == "nativeFunctionAddress") {
-            val validIntrinsic = this.isExternal(expression.text) &&
-                this.externalLibrary(expression.text) == "intrinsic"
-            val validFunction = expression.children.size == 1 &&
-                expression.children[0].kind == "identifier" &&
-                this.isNativeAddressableFunction(expression.children[0].text)
-            if (validIntrinsic && validFunction) {
-                result = this.emit(
-                    "native.function.address", -1, -1,
-                    expression.children[0].text
-                )
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit(
-                    "invalid", -1, -1, "nativeFunctionAddress"
-                )
-            }
+            result = bootstrapLowerCallNativeFunctionAddress(this, expression, result)
         }
         if (expression.kind == "call" &&
             this.isExternal(expression.text) &&
             this.externalLibrary(expression.text) == "inline-assembly") {
-            val assemblyTemplate = if (expression.children.size > 0) {
-                bootstrapStaticString(expression.children[0])
-            } else BootstrapStaticString("", false)
-            val assemblyConstraints = if (expression.children.size > 1) {
-                bootstrapStaticString(expression.children[1])
-            } else BootstrapStaticString("", false)
-            val valid = expression.children.size >= 2 &&
-                assemblyTemplate.valid && assemblyConstraints.valid
-            if (valid) {
-                val operands: array<int> = []
-                var operand = 2
-                while (operand < expression.children.size) {
-                    operands.append(this.lowerExpression(
-                        expression.children[operand]
-                    ))
-                    operand = operand + 1
-                }
-                val resultType = this.lowerRuntimeType(
-                    this.lowerFunctionResultType(expression.text)
-                )
-                result = this.emitManyTexts(
-                    "inline.assembly",
-                    operands,
-                    resultType,
-                    [
-                        assemblyConstraints.text,
-                        assemblyTemplate.text
-                    ]
-                )
-            } else {
-                this.errors = this.errors + 1
-                result = this.emit(
-                    "invalid", -1, -1, "inline-assembly.literal"
-                )
-            }
+            result = bootstrapLowerInlineAssembly(this, expression, result)
         }
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
@@ -7396,324 +6541,22 @@ class BootstrapLowerer(
             expression.text != "nativeFunctionAddress" &&
             (!this.isExternal(expression.text) ||
              this.externalLibrary(expression.text) != "inline-assembly")) {
-            val arguments: array<int> = []
-            var argument = 0
-            while (argument < expression.children.size) {
-                arguments.append(this.lowerExpression(
-                    expression.children[argument]
-                ))
-                argument = argument + 1
-            }
-            var callableType = "unknown"
-            if (this.isParameter(expression.text)) {
-                callableType = this.lowerParameterType(expression.text)
-            }
-            if (this.isLocal(expression.text)) {
-                callableType = this.lowerLocalType(expression.text)
-            }
-            if (this.isGlobal(expression.text)) {
-                callableType = this.lowerGlobalFunctionType(expression.text)
-            }
-            argument = 0
-            while (argument < expression.children.size) {
-                var parameterKind = this.lowerFunctionParameterKind(
-                    expression.text,
-                    argument
-                )
-                if (bootstrapIsFunctionType(callableType)) {
-                    parameterKind = bootstrapFunctionParameterKind(
-                        callableType,
-                        argument
-                    )
-                }
-                if (parameterKind == "var") {
-                    this.emitBorrowMutation(expression.children[argument])
-                }
-                argument = argument + 1
-            }
-            var opcode = "call"
-            if (this.isClass(expression.text)) opcode = "object.create"
-            if (this.isExternal(expression.text)) {
-                opcode = "extern.${this.externalLibrary(expression.text)}"
-            }
-            if (this.isParameter(expression.text) ||
-                this.isLocal(expression.text) ||
-                this.isGlobal(expression.text)) {
-                val operands: array<int> = []
-                operands.append(this.lowerExpression(BootstrapExpression(
-                    "identifier",
-                    expression.text,
-                    expression.begin,
-                    expression.begin,
-                    []
-                )))
-                var indirectArgument = 0
-                while (indirectArgument < arguments.size) {
-                    operands.append(arguments[indirectArgument])
-                    indirectArgument = indirectArgument + 1
-                }
-                val indirectOpcode =
-                    if (bootstrapIsOnceFunctionType(callableType)) {
-                        "call.indirect.once"
-                    } else "call.indirect"
-                result = this.emitMany(indirectOpcode, operands, "")
-                if (bootstrapIsOnceFunctionType(callableType)) {
-                    this.emitControl(
-                        "local.move",
-                        -1,
-                        -1,
-                        -1,
-                        this.storageFor(expression.text)
-                    )
-                }
-                result = result
-            } else if (this.isScalarType(expression.text) &&
-                arguments.size == 1) {
-                result = this.emit(
-                    "scalar.cast",
-                    arguments[0],
-                    -1,
-                    this.lowerRuntimeType(expression.text)
-                )
-            } else result = this.emitMany(
-                opcode,
-                arguments,
-                // An extern is linked (or an intrinsic recognized) by its
-                // source name, also when its module is imported under an
-                // alias and its declaration carries the module prefix.
-                if (opcode == "call" || opcode == "object.create") {
-                    expression.text
-                } else bootstrapCanonicalDeclarationSourceName(expression.text)
-            )
+            result = bootstrapLowerCall(this, expression, result)
         }
         if (expression.kind == "member") {
-            val receiverType = bootstrapBorrowElementType(
-                this.lowerExpressionType(expression.children[0])
-            )
-            val place = this.lowerPlacePath(expression)
-            if (place != "") {
-                this.emitControl("place.load", -1, -1, -1, place)
-            }
-            val receiver = if (place != "") {
-                this.lowerPlaceProjection(expression.children[0])
-            } else this.lowerExpression(expression.children[0])
-            if (expression.text == "size" &&
-                (receiverType == "string" ||
-                 bootstrapIsArrayType(receiverType) ||
-                 bootstrapIsMapType(receiverType))) {
-                val opcode = if (receiverType == "string") {
-                    "string.length"
-                } else if (bootstrapIsMapType(receiverType)) "map.size"
-                else "array.length"
-                result = this.emit(opcode, receiver, -1, "")
-            } else result = this.emitFieldGet(
-                receiver, receiverType, expression.text
-            )
+            result = bootstrapLowerMember(this, expression, result)
         }
         if (expression.kind == "index") {
-            val place = this.lowerPlacePath(expression)
-            if (place != "") {
-                this.emitControl("place.load", -1, -1, -1, place)
-            }
-            val receiver = if (place != "") {
-                this.lowerPlaceProjection(expression.children[0])
-            } else this.lowerExpression(expression.children[0])
-            val index = this.lowerExpression(expression.children[1])
-            val receiverType = bootstrapBorrowElementType(
-                this.lowerExpressionType(expression.children[0])
-            )
-            val opcode = this.lowerIndexGetOpcode(receiverType)
-            result = this.emit(opcode, receiver, index, "")
+            result = bootstrapLowerIndex(this, expression, result)
         }
         if (expression.kind == "index.assign") {
-            val ownerPlace = this.lowerPlacePath(expression.children[0])
-            var place = ""
-            if (ownerPlace != "") {
-                var indexText = "*"
-                if (expression.children[1].kind == "integer") {
-                    indexText = expression.children[1].text
-                }
-                place = "$ownerPlace[$indexText]"
-            }
-            val receiver = if (place != "") {
-                this.lowerPlaceProjection(expression.children[0])
-            } else this.lowerExpression(expression.children[0])
-            val index = this.lowerExpression(expression.children[1])
-            val value = this.lowerExpression(expression.children[2])
-            val elementType = bootstrapArrayElementType(
-                this.lowerExpressionType(expression.children[0])
-            )
-            if (this.lowerTypeIsAffine(elementType)) {
-                val previous = this.emit("array.get", receiver, index, "")
-                this.emitAffineValueDrop(previous, elementType)
-            }
-            result = this.emitMany(
-                "index.set",
-                [receiver, index, value],
-                ""
-            )
-            if (place != "") {
-                this.emitControl("place.set", -1, -1, -1, place)
-            }
+            result = bootstrapLowerIndexAssign(this, expression, result)
         }
         if (expression.kind == "member.call") {
-            val owner = bootstrapBorrowElementType(
-                this.lowerExpressionType(expression.children[0])
-            )
-            val arguments: array<int> = []
-            var argument = 0
-            while (argument < expression.children.size) {
-                arguments.append(this.lowerExpression(
-                    expression.children[argument]
-                ))
-                argument = argument + 1
-            }
-            if (((expression.text == "append" ||
-                  expression.text == "truncate" ||
-                  expression.text == "clear") &&
-                 bootstrapIsArrayType(owner)) ||
-                bootstrapMutableReceiverContains(
-                    this.mutableReceivers,
-                    owner,
-                    expression.text
-                )) {
-                this.emitBorrowMutation(expression.children[0])
-            }
-            argument = 1
-            while (argument < expression.children.size) {
-                if (this.lowerMethodParameterKind(
-                    owner,
-                    expression.text,
-                    argument - 1
-                ) == "var") {
-                    this.emitBorrowMutation(expression.children[argument])
-                }
-                argument = argument + 1
-            }
-            if (bootstrapIsMapType(owner) &&
-                (expression.text == "set" || expression.text == "clear")) {
-                this.emitMany("map.${expression.text}", arguments, "")
-                result = this.emit("const.void", -1, -1, "")
-            } else if (bootstrapIsMapType(owner)) {
-                result = this.emitMany("map.${expression.text}", arguments, "")
-            } else if (bootstrapIsCellType(owner) &&
-                expression.text == "get") {
-                result = this.emit("cell.get", arguments[0], -1, "")
-            } else if (bootstrapIsCellType(owner) &&
-                       expression.text == "set" &&
-                       arguments.size == 2) {
-                this.emitMany("cell.set", [arguments[0], arguments[1]], "")
-                result = this.emit("const.void", -1, -1, "")
-            } else if (bootstrapIsMutexType(owner) &&
-                expression.text == "clone") {
-                result = this.emit("shared.clone", arguments[0], -1, "")
-            } else if (bootstrapIsMutexType(owner) &&
-                       expression.text == "with" &&
-                       arguments.size == 2) {
-                val payload = this.emit(
-                    "shared.lock",
-                    arguments[0],
-                    -1,
-                    bootstrapMutexElementType(owner)
-                )
-                result = this.emitMany(
-                    "call.indirect",
-                    [arguments[1], payload],
-                    ""
-                )
-                this.emitControl(
-                    "shared.unlock",
-                    arguments[0],
-                    -1,
-                    -1,
-                    ""
-                )
-            } else if (bootstrapIsSharedType(owner) &&
-                expression.text == "clone") {
-                result = this.emit("shared.clone", arguments[0], -1, "")
-            } else if (bootstrapIsSharedType(owner) &&
-                       expression.text == "get") {
-                result = this.emit("shared.get", arguments[0], -1, "")
-            } else if (bootstrapIsSharedType(owner) &&
-                       expression.text == "downgrade") {
-                result = this.emit("weak.create", arguments[0], -1, "")
-            } else if (bootstrapIsWeakType(owner) &&
-                       expression.text == "clone") {
-                result = this.emit("weak.clone", arguments[0], -1, "")
-            } else if (bootstrapIsWeakType(owner) &&
-                       expression.text == "upgrade") {
-                result = this.emit("weak.upgrade", arguments[0], -1, "")
-            } else if (bootstrapIsWeakType(owner) &&
-                       expression.text == "isAlive") {
-                result = this.emit("weak.alive", arguments[0], -1, "")
-            } else if (expression.text == "append" &&
-                       bootstrapIsArrayType(owner)) {
-                result = this.emitMany("array.append", arguments, "")
-            } else if (expression.text == "truncate" &&
-                       bootstrapIsArrayType(owner)) {
-                result = this.emitMany("array.truncate", arguments, "")
-            } else if (expression.text == "clear" &&
-                       bootstrapIsArrayType(owner)) {
-                result = this.emitMany(
-                    "array.truncate",
-                    [arguments[0], this.emit("const.i64", -1, -1, "0")],
-                    ""
-                )
-            } else if (expression.text == "slice" && owner == "string") {
-                result = this.emitMany("string.slice", arguments, "")
-            } else {
-                var methodOwner = owner
-                if (methodOwner == "unknown") {
-                    methodOwner = this.methodOwner(expression.text)
-                }
-                val extensionOwner = this.lowerExtensionOwner(
-                    methodOwner,
-                    expression.text
-                )
-                if (extensionOwner != "") {
-                    result = this.emitMany(
-                        "call",
-                        arguments,
-                        "extension_${extensionOwner}_${expression.text}"
-                    )
-                } else if (methodOwner == "") this.errors = this.errors + 1
-                else result = this.emitMany(
-                    "call",
-                    arguments,
-                    "${methodOwner}_${expression.text}"
-                )
-            }
+            result = bootstrapLowerMemberCall(this, expression, result)
         }
         if (expression.kind == "member.assign") {
-            val ownerPlace = this.lowerPlacePath(expression.children[0])
-            val place = if (ownerPlace == "") ""
-                else "$ownerPlace.${expression.text}"
-            val receiver = if (place != "") {
-                this.lowerPlaceProjection(expression.children[0])
-            } else this.lowerExpression(expression.children[0])
-            val value = this.lowerExpression(expression.children[1])
-            val ownerType = this.lowerExpressionType(expression.children[0])
-            val fieldType = this.lowerFieldType(
-                ownerType,
-                expression.text
-            )
-            if (this.lowerTypeIsAffine(fieldType)) {
-                val previous = this.emitFieldGet(
-                    receiver,
-                    ownerType,
-                    expression.text
-                )
-                this.emitAffineValueDrop(previous, fieldType)
-            }
-            result = this.emitFieldSet(
-                receiver,
-                value,
-                ownerType,
-                expression.text
-            )
-            if (place != "") {
-                this.emitControl("place.set", -1, -1, -1, place)
-            }
+            result = bootstrapLowerMemberAssign(this, expression, result)
         }
         // `-` over a number literal is the negative constant, so an array of
         // literals with negatives in it is still a static table.
@@ -7731,12 +6574,7 @@ class BootstrapLowerer(
         }
         if (!negativeLiteral && (expression.kind == "unary-" ||
             expression.kind == "unary!" || expression.kind == "unary~")) {
-            val operand = if (expression.kind == "unary!") {
-                this.lowerExpression(expression.children[0])
-            } else this.lowerArithmeticOperand(expression.children[0])
-            var opcode = if (expression.kind == "unary-") "neg" else "not"
-            if (expression.kind == "unary~") opcode = "bit.not"
-            result = this.emit(opcode, operand, -1, "")
+            result = bootstrapLowerNegate(this, expression, result)
         }
         if (expression.kind == "unary+") {
             result = this.lowerExpression(expression.children[0])
@@ -7762,261 +6600,22 @@ class BootstrapLowerer(
             expression.kind == "<" || expression.kind == "<=" ||
             expression.kind == ">" || expression.kind == ">="
         )) {
-            var opcode = expression.kind
-            if (expression.kind == "+" &&
-                this.lowerExpressionType(expression.children[0]) == "string" &&
-                this.lowerExpressionType(expression.children[1]) == "string") {
-                opcode = "string.concat"
-            }
-            if ((expression.kind == "==" || expression.kind == "!=") &&
-                this.lowerExpressionType(expression.children[0]) == "string" &&
-                this.lowerExpressionType(expression.children[1]) == "string") {
-                opcode = if (expression.kind == "==") {
-                    "string.equal"
-                } else "string.not.equal"
-            }
-            val comparison = expression.kind == "==" ||
-                expression.kind == "!=" || expression.kind == "<" ||
-                expression.kind == "<=" || expression.kind == ">" ||
-                expression.kind == ">="
-            val arithmetic = opcode == expression.kind && !comparison
-            val comparisonType = if (opcode == expression.kind && comparison) {
-                bootstrapIrNativeComparisonType(
-                    expression.kind,
-                    this.lowerRuntimeType(this.lowerExpressionType(
-                        expression.children[0]
-                    )),
-                    this.lowerRuntimeType(this.lowerExpressionType(
-                        expression.children[1]
-                    ))
-                )
-            } else ""
-            var left = if (arithmetic) {
-                this.lowerArithmeticOperand(expression.children[0])
-            } else this.lowerExpression(expression.children[0])
-            var right = this.lowerExpression(expression.children[1])
-            if (comparisonType != "") {
-                left = this.emit("scalar.cast", left, -1, comparisonType)
-                right = this.emit("scalar.cast", right, -1, comparisonType)
-            }
-            result = this.emit(opcode, left, right, "")
+            result = bootstrapLowerArithmetic(this, expression, result)
         }
         if (expression.kind == "&&" || expression.kind == "||") {
             result = this.lowerLogicalExpression(expression)
         }
         if (expression.kind == "if") {
-            // Reserve the result name before lowering the condition. The
-            // condition may itself contain an if expression; deriving both
-            // names from the unchanged nextLabel created duplicate locals and
-            // made otherwise valid nested conditionals fail IR verification.
-            val temporaryId = this.allocateLabel()
-            val temporary = "if_result_$temporaryId"
-            this.emitControl(
-                bootstrapIrLocalZeroOpcode(this.lowerRuntimeType(
-                    this.lowerExpressionType(expression)
-                )),
-                -1, -1, -1, temporary
-            )
-            val condition = this.lowerExpression(expression.children[0])
-            val thenLabel = this.allocateLabel()
-            val elseLabel = this.allocateLabel()
-            val mergeLabel = this.allocateLabel()
-            this.emitControl("branch", condition, thenLabel, elseLabel, "")
-            this.emitControl("label", -1, thenLabel, -1, "")
-            val previousThenScope = this.enterLocalScope()
-            this.addNullableRefinements(expression.children[0], true)
-            val thenValue = this.lowerExpression(expression.children[1])
-            this.leaveLocalScope(previousThenScope)
-            this.emitControl("local.set", thenValue, -1, -1, temporary)
-            this.emitControl("jump", -1, mergeLabel, -1, "")
-            this.emitControl("label", -1, elseLabel, -1, "")
-            var elseValue = -1
-            if (expression.children[2].kind == "missing") {
-                elseValue = this.emit("const.i64", -1, -1, "0")
-            } else {
-                val previousElseScope = this.enterLocalScope()
-                this.addNullableRefinements(expression.children[0], false)
-                elseValue = this.lowerExpression(expression.children[2])
-                this.leaveLocalScope(previousElseScope)
-            }
-            this.emitControl("local.set", elseValue, -1, -1, temporary)
-            this.emitControl("jump", -1, mergeLabel, -1, "")
-            this.emitControl("label", -1, mergeLabel, -1, "")
-            result = this.emit("local.load", -1, -1, temporary)
+            result = bootstrapLowerIf(this, expression, result)
         }
         if (expression.kind == "while") {
-            val conditionLabel = this.allocateLabel()
-            val bodyLabel = this.allocateLabel()
-            val mergeLabel = this.allocateLabel()
-            val previousBreakLabel = this.breakLabel
-            val previousContinueLabel = this.continueLabel
-            val previousBreakScope = this.breakScope
-            val previousContinueScope = this.continueScope
-            this.breakLabel = mergeLabel
-            this.continueLabel = conditionLabel
-            this.breakScope = this.currentScope
-            this.continueScope = this.currentScope
-            this.emitControl("jump", -1, conditionLabel, -1, "")
-            this.emitControl("label", -1, conditionLabel, -1, "")
-            val condition = this.lowerExpression(expression.children[0])
-            this.emitControl("branch", condition, bodyLabel, mergeLabel, "")
-            this.emitControl("label", -1, bodyLabel, -1, "")
-            this.lowerExpression(expression.children[1])
-            this.emitControl("jump", -1, conditionLabel, -1, "")
-            this.breakLabel = previousBreakLabel
-            this.continueLabel = previousContinueLabel
-            this.breakScope = previousBreakScope
-            this.continueScope = previousContinueScope
-            this.emitControl("label", -1, mergeLabel, -1, "")
-            result = this.emit("const.void", -1, -1, "")
+            result = bootstrapLowerWhile(this, expression, result)
         }
         if (expression.kind == "do.while") {
-            val bodyLabel = this.allocateLabel()
-            val conditionLabel = this.allocateLabel()
-            val mergeLabel = this.allocateLabel()
-            val previousBreakLabel = this.breakLabel
-            val previousContinueLabel = this.continueLabel
-            val previousBreakScope = this.breakScope
-            val previousContinueScope = this.continueScope
-            this.breakLabel = mergeLabel
-            this.continueLabel = conditionLabel
-            this.breakScope = this.currentScope
-            this.continueScope = this.currentScope
-            this.emitControl("jump", -1, bodyLabel, -1, "")
-            this.emitControl("label", -1, bodyLabel, -1, "")
-            this.lowerExpression(expression.children[0])
-            this.emitControl("jump", -1, conditionLabel, -1, "")
-            this.emitControl("label", -1, conditionLabel, -1, "")
-            val condition = this.lowerExpression(expression.children[1])
-            this.emitControl("branch", condition, bodyLabel, mergeLabel, "")
-            this.breakLabel = previousBreakLabel
-            this.continueLabel = previousContinueLabel
-            this.breakScope = previousBreakScope
-            this.continueScope = previousContinueScope
-            this.emitControl("label", -1, mergeLabel, -1, "")
-            result = this.emit("const.void", -1, -1, "")
+            result = bootstrapLowerDoWhile(this, expression, result)
         }
         if (expression.kind == "for") {
-            val sourceType = bootstrapBorrowElementType(
-                this.lowerExpressionType(expression.children[0])
-            )
-            var elementType = bootstrapArrayElementType(sourceType)
-            if (sourceType == "string") elementType = "i64"
-            if (bootstrapIsGeneratorType(sourceType)) {
-                elementType = bootstrapGeneratorElementType(sourceType)
-            }
-            // `for (i in a until b)` / `a..b` count in place: the range is
-            // never materialised as an array. Both bounds are evaluated once.
-            val rangeKind = expression.children[0].kind
-            val range = rangeKind == "range.until" || rangeKind == "range.closed"
-            var source = -1
-            var length = -1
-            var indexStorage = ""
-            if (range) {
-                val begin = this.lowerExpression(expression.children[0].children[0])
-                length = this.lowerExpression(expression.children[0].children[1])
-                indexStorage = "for_index_${this.nextLabel}"
-                this.emitControl(
-                    "local.zero.i64", -1, -1, -1, indexStorage
-                )
-                this.emitControl("local.set", begin, -1, -1, indexStorage)
-            } else {
-                source = this.lowerExpression(expression.children[0])
-            }
-            if (bootstrapIsGeneratorType(sourceType)) {
-                this.emitResultMove(expression.children[0])
-            }
-            if (!range && !bootstrapIsGeneratorType(sourceType)) {
-                val lengthOpcode = if (sourceType == "string") {
-                    "string.length"
-                } else "array.length"
-                length = this.emit(lengthOpcode, source, -1, "")
-                indexStorage = "for_index_${this.nextLabel}"
-                this.emitControl(
-                    "local.zero.i64", -1, -1, -1, indexStorage
-                )
-                val zero = this.emit("const.i64", -1, -1, "0")
-                this.emitControl("local.set", zero, -1, -1, indexStorage)
-            }
-            val conditionLabel = this.allocateLabel()
-            val bodyLabel = this.allocateLabel()
-            val incrementLabel = this.allocateLabel()
-            val mergeLabel = this.allocateLabel()
-            val previousBreakLabel = this.breakLabel
-            val previousContinueLabel = this.continueLabel
-            val previousBreakScope = this.breakScope
-            val previousContinueScope = this.continueScope
-            val loopScope = this.currentScope
-            this.breakLabel = mergeLabel
-            this.continueLabel = incrementLabel
-            this.breakScope = loopScope
-            this.continueScope = loopScope
-            val previousScope = this.enterLocalScope()
-            val iteratorStorage =
-                "for_value_${this.nextValue}_${expression.text}"
-            val iteratorCaptured = this.capturedByLambda(
-                expression.children[1],
-                expression.text
-            )
-            this.locals.append(expression.text)
-            if (iteratorCaptured) {
-                this.localTypes.append("cell:$elementType")
-            } else this.localTypes.append(elementType)
-            this.localStorage.append(iteratorStorage)
-            this.localScopes.append(this.currentScope)
-            this.localBorrowSources.append("")
-            this.emitControl("jump", -1, conditionLabel, -1, "")
-            this.emitControl("label", -1, conditionLabel, -1, "")
-            var index = -1
-            var more = -1
-            if (bootstrapIsGeneratorType(sourceType)) {
-                more = this.emit("generator.next", source, -1, "")
-            } else {
-                index = this.emit("local.load", -1, -1, indexStorage)
-                val compare = if (rangeKind == "range.closed") "<=" else "<"
-                more = this.emit(compare, index, length, "")
-            }
-            this.emitControl("branch", more, bodyLabel, mergeLabel, "")
-            this.emitControl("label", -1, bodyLabel, -1, "")
-            val value = if (range) index
-            else if (bootstrapIsGeneratorType(sourceType))
-                this.emit("generator.value", source, -1, "")
-            else if (sourceType == "string")
-                this.emit("string.get", source, index, "")
-            // Typed element read (array.get.f64/i64/bool/f32), as for `values[i]`.
-            else this.emit(this.lowerIndexGetOpcode(sourceType), source, index, "")
-            var iteratorValue = value
-            if (iteratorCaptured) {
-                iteratorValue = this.emit("cell.create", value, -1, "")
-            }
-            this.emit("local.declare", iteratorValue, -1, iteratorStorage)
-            this.lowerExpression(expression.children[1])
-            this.emitControl("jump", -1, incrementLabel, -1, "")
-            this.breakLabel = previousBreakLabel
-            this.continueLabel = previousContinueLabel
-            this.breakScope = previousBreakScope
-            this.continueScope = previousContinueScope
-            this.leaveLocalScope(previousScope)
-            this.emitControl("label", -1, incrementLabel, -1, "")
-            if (!bootstrapIsGeneratorType(sourceType)) {
-                val current = this.emit("local.load", -1, -1, indexStorage)
-                if (rangeKind == "range.closed") {
-                    // `a..b` stops at b itself, so b == i64 max cannot overflow.
-                    val stepLabel = this.allocateLabel()
-                    val complete = this.emit("==", current, length, "")
-                    this.emitControl("branch", complete, mergeLabel, stepLabel, "")
-                    this.emitControl("label", -1, stepLabel, -1, "")
-                }
-                val one = this.emit("const.i64", -1, -1, "1")
-                val next = this.emit("+", current, one, "")
-                this.emitControl("local.set", next, -1, -1, indexStorage)
-            }
-            this.emitControl("jump", -1, conditionLabel, -1, "")
-            this.emitControl("label", -1, mergeLabel, -1, "")
-            if (bootstrapIsGeneratorType(sourceType)) {
-                this.emit("generator.drop", source, -1, "")
-            }
-            result = this.emit("const.void", -1, -1, "")
+            result = bootstrapLowerFor(this, expression, result)
         }
         if (expression.kind == "break") {
             this.emitDropsThroughScope(this.breakScope)
@@ -8029,72 +6628,7 @@ class BootstrapLowerer(
             result = this.emit("const.void", -1, -1, "")
         }
         if (expression.kind == "when") {
-            val temporaryId = this.allocateLabel()
-            val temporary = "when_result_$temporaryId"
-            this.emitControl(
-                bootstrapIrLocalZeroOpcode(this.lowerRuntimeType(
-                    this.lowerExpressionType(expression)
-                )),
-                -1, -1, -1, temporary
-            )
-            val subject = this.lowerExpression(expression.children[0])
-            val mergeLabel = this.allocateLabel()
-            var branch = 1
-            var hasElse = false
-            while (branch + 1 < expression.children.size) {
-                val match = expression.children[branch]
-                val body = expression.children[branch + 1]
-                if (match.kind == "missing") {
-                    hasElse = true
-                    val bodyValue = this.lowerExpression(body)
-                    this.emitControl(
-                        "local.set",
-                        bodyValue,
-                        -1,
-                        -1,
-                        temporary
-                    )
-                    this.emitControl("jump", -1, mergeLabel, -1, "")
-                } else {
-                    // `a, b, c -> body` repeats the body after each match
-                    // (see parseWhen): test them in turn, then lower it once.
-                    var bodyLabel = -1
-                    var nextLabel = -1
-                    while (true) {
-                        val matchValue = this.lowerExpression(expression.children[branch])
-                        val condition = this.emit("==", subject, matchValue, "")
-                        if (bodyLabel < 0) bodyLabel = this.allocateLabel()
-                        nextLabel = this.allocateLabel()
-                        this.emitControl(
-                            "branch",
-                            condition,
-                            bodyLabel,
-                            nextLabel,
-                            ""
-                        )
-                        if (!bootstrapWhenSharesBody(expression, branch)) break
-                        this.emitControl("label", -1, nextLabel, -1, "")
-                        branch = branch + 2
-                    }
-                    this.emitControl("label", -1, bodyLabel, -1, "")
-                    val bodyValue = this.lowerExpression(body)
-                    this.emitControl(
-                        "local.set",
-                        bodyValue,
-                        -1,
-                        -1,
-                        temporary
-                    )
-                    this.emitControl("jump", -1, mergeLabel, -1, "")
-                    this.emitControl("label", -1, nextLabel, -1, "")
-                }
-                branch = branch + 2
-            }
-            if (!hasElse) {
-                this.emitControl("unreachable", -1, -1, -1, "")
-            }
-            this.emitControl("label", -1, mergeLabel, -1, "")
-            result = this.emit("local.load", -1, -1, temporary)
+            result = bootstrapLowerWhen(this, expression, result)
         }
         // Do not recompute the type of every lowered node here. Type lookup is
         // intentionally simple during bootstrap and scans declaration tables;
@@ -8946,6 +7480,1932 @@ class BootstrapLowerer(
             this.validationFailures
         )
     }
+}
+
+@noinline
+fun bootstrapLowerStringTemplate(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    result = lowerer.emit("const.string", -1, -1, "")
+    var part = 0
+    while (part < expression.children.size) {
+        val child = expression.children[part]
+        val childType = lowerer.lowerRuntimeType(
+            bootstrapBorrowElementType(lowerer.lowerExpressionType(child))
+        )
+        // Floats are written by abla/float/text's f64Text (sema
+        // requires it to be imported); an f32 widens first through
+        // abla/float's f32ToF64, which that module imports.
+        val float = if (childType == "f32") BootstrapExpression(
+            "call", "f32ToF64", child.begin, child.end, [child]
+        ) else child
+        // A narrower integer widens to i64; a u64 is written
+        // unsigned by the runtime's __ablaRuntimeU64Text.
+        val narrow = childType == "i8" || childType == "u8" ||
+            childType == "i16" || childType == "u16" ||
+            childType == "i32" || childType == "u32"
+        val text = if (childType == "f64" || childType == "f32") {
+            lowerer.lowerExpression(BootstrapExpression(
+                "call", "f64Text", child.begin, child.end, [float]
+            ))
+        } else if (childType == "u64") {
+            lowerer.lowerExpression(BootstrapExpression(
+                "call", "__ablaRuntimeU64Text", child.begin,
+                child.end, [child]
+            ))
+        } else if (narrow) {
+            lowerer.emit("to.string", lowerer.lowerExpression(
+                BootstrapExpression(
+                    "call", "i64", child.begin, child.end, [child]
+                )
+            ), -1, "")
+        } else if (childType == "string") {
+            lowerer.lowerExpression(child)
+        } else lowerer.emit("to.string", lowerer.lowerExpression(child), -1, "")
+        result = lowerer.emit("string.concat", result, text, "")
+        part = part + 1
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerArray(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val elements: array<int> = []
+    var element = 0
+    while (element < expression.children.size) {
+        elements.append(lowerer.lowerExpression(expression.children[element]))
+        element = element + 1
+    }
+    result = lowerer.emitMany("array.create", elements, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerRange(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val begin = lowerer.lowerExpression(expression.children[0])
+    val end = lowerer.lowerExpression(expression.children[1])
+    val elements: array<int> = []
+    result = lowerer.emitMany("array.create", elements, "")
+    val temporary = "range_current_${lowerer.nextLabel}"
+    lowerer.emitControl("local.zero.i64", -1, -1, -1, temporary)
+    lowerer.emitControl("local.set", begin, -1, -1, temporary)
+    val conditionLabel = lowerer.allocateLabel()
+    val bodyLabel = lowerer.allocateLabel()
+    val incrementLabel = lowerer.allocateLabel()
+    val mergeLabel = lowerer.allocateLabel()
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.emitControl("label", -1, conditionLabel, -1, "")
+    val current = lowerer.emit("local.load", -1, -1, temporary)
+    var operation = "<"
+    if (expression.kind == "range.closed") operation = "<="
+    val more = lowerer.emit(operation, current, end, "")
+    lowerer.emitControl("branch", more, bodyLabel, mergeLabel, "")
+    lowerer.emitControl("label", -1, bodyLabel, -1, "")
+    val appendOperands: array<int> = [result, current]
+    lowerer.emitMany("array.append", appendOperands, "")
+    if (expression.kind == "range.closed") {
+        val complete = lowerer.emit("==", current, end, "")
+        lowerer.emitControl(
+            "branch",
+            complete,
+            mergeLabel,
+            incrementLabel,
+            ""
+        )
+    } else {
+        lowerer.emitControl("jump", -1, incrementLabel, -1, "")
+    }
+    lowerer.emitControl("label", -1, incrementLabel, -1, "")
+    val one = lowerer.emit("const.i64", -1, -1, "1")
+    val next = lowerer.emit("+", current, one, "")
+    lowerer.emitControl("local.set", next, -1, -1, temporary)
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerCompile(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (lowerer.validationOnly) {
+        result = lowerer.emit("const.void", -1, -1, "")
+    } else {
+        val evaluated = bootstrapEvaluate(
+            expression.children[0],
+            lowerer.declarations
+        )
+        lowerer.recordCompileInputs(evaluated)
+        if (evaluated.diagnostics != "") {
+            bootstrapStageDriverDiagnostic(evaluated.diagnostics)
+        }
+        lowerer.errors = lowerer.errors + evaluated.errors
+        result = lowerer.emitEvaluated(evaluated.value)
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerRegion(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val checkpoint = lowerer.emitMany(
+        "call",
+        [],
+        "__ablaRuntimePlatformRegionBegin"
+    )
+    result = lowerer.lowerExpression(expression.children[0])
+    lowerer.emitMany(
+        "call",
+        [checkpoint],
+        "__ablaRuntimePlatformRegionEnd"
+    )
+    result
+}
+
+@noinline
+fun bootstrapLowerIdentifier(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (lowerer.lowerNameIsDelegated(expression.text)) {
+        result = lowerer.emitDelegatedMethod(
+            expression.text,
+            "getValue",
+            [],
+            expression.begin,
+            expression.end
+        )
+    } else if (lowerer.isField(expression.text) &&
+        !lowerer.isParameter(expression.text) &&
+        !lowerer.isLocal(expression.text)) {
+        val receiver = lowerer.emit(
+            "parameter.load",
+            -1,
+            -1,
+            "this"
+        )
+        var object = receiver
+        if (lowerer.isCapturedParameter("this")) {
+            object = lowerer.emit("cell.get", receiver, -1, "")
+        }
+        result = lowerer.emitFieldGet(
+            object,
+            lowerer.currentOwner,
+            expression.text
+        )
+    } else if (lowerer.isParameter(expression.text) ||
+               lowerer.isLocal(expression.text) ||
+               lowerer.isGlobal(expression.text)) {
+        val opcode =
+            if (lowerer.isParameter(expression.text)) "parameter.load"
+            else if (lowerer.isLocal(expression.text)) "local.load"
+            else "global.load"
+        val storage =
+            if (opcode == "local.load") lowerer.storageFor(expression.text)
+            else expression.text
+        result = lowerer.emit(opcode, -1, -1, storage)
+        if ((opcode == "local.load" &&
+             lowerer.localIsCell(expression.text)) ||
+            (opcode == "parameter.load" &&
+             lowerer.isCapturedParameter(expression.text))) {
+            result = lowerer.emit("cell.get", result, -1, "")
+        } else result = result
+    } else if (lowerer.isFunction(expression.text)) {
+        result = lowerer.emit("function.ref", -1, -1, expression.text)
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit("invalid", -1, -1, expression.text)
+    }
+    if (lowerer.isImplicitResult(expression)) {
+        lowerer.emitResultMove(expression)
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerLambda(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val lambdaInstructions: array<BootstrapInstruction> = []
+    val lambdaParameters: array<string> = []
+    val lambdaParameterTypes: array<string> = []
+    val lambdaAbiParameterTypes: array<string> = []
+    val explicitParameters: array<string> = []
+    val explicitParameterTypes: array<string> = []
+    var parameter = 0
+    while (parameter + 1 < expression.children.size) {
+        val found = expression.children[parameter]
+        explicitParameters.append(found.text)
+        if (found.children.size > 0) {
+            explicitParameterTypes.append(found.children[0].text)
+        } else explicitParameterTypes.append("unknown")
+        parameter = parameter + 1
+    }
+    val body = expression.children[expression.children.size - 1]
+    val bound: array<string> = []
+    parameter = 0
+    while (parameter < explicitParameters.size) {
+        bound.append(explicitParameters[parameter])
+        parameter = parameter + 1
+    }
+    val free: array<string> = []
+    lowerer.collectLambdaFreeNames(body, bound, free)
+    val captureNames: array<string> = []
+    val capturedCells: array<string> = []
+    val ownedCaptures: array<string> = []
+    val captureValues: array<int> = []
+    var freeIndex = 0
+    while (freeIndex < free.size) {
+        var captureName = free[freeIndex]
+        if (lowerer.isField(captureName) && lowerer.currentOwner != "") {
+            captureName = "this"
+        }
+        if ((lowerer.isParameter(captureName) ||
+             lowerer.isLocal(captureName)) &&
+            !lowerer.nameIsBound(captureNames, captureName)) {
+            captureNames.append(captureName)
+            var captureType = lowerer.lowerLocalType(captureName)
+            if (lowerer.isParameter(captureName)) {
+                captureType = lowerer.lowerParameterType(captureName)
+            }
+            if (lowerer.lowerNameIsDelegated(captureName)) {
+                captureType = lowerer.lowerDelegatedMetadataType(
+                    captureName
+                )
+            }
+            val captureStorageType =
+                bootstrapDelegatedStorageOrSelf(captureType)
+            if (lowerer.lowerTypeIsAffine(captureStorageType) &&
+                (expression.kind == "lambda.move" ||
+                 expression.kind == "lambda.generator")) {
+                captureValues.append(lowerer.captureOwned(captureName))
+                ownedCaptures.append(captureName)
+                lambdaAbiParameterTypes.append(captureType)
+            } else {
+                if (lowerer.lowerTypeIsAffine(captureStorageType)) {
+                    lowerer.errors = lowerer.errors + 1
+                }
+                capturedCells.append(captureName)
+                captureValues.append(lowerer.captureCell(captureName))
+                // Ordinary captures are passed as cell objects even
+                // when the captured source value is scalar.
+                lambdaAbiParameterTypes.append("unknown")
+            }
+            lambdaParameterTypes.append(captureType)
+            lambdaParameters.append(captureName)
+        }
+        freeIndex = freeIndex + 1
+    }
+    parameter = 0
+    while (parameter < explicitParameters.size) {
+        lambdaParameters.append(explicitParameters[parameter])
+        lambdaParameterTypes.append(explicitParameterTypes[parameter])
+        lambdaAbiParameterTypes.append(
+            explicitParameterTypes[parameter]
+        )
+        parameter = parameter + 1
+    }
+    val lambdaLocals: array<string> = []
+    val lambdaLocalTypes: array<string> = []
+    val lambdaStorage: array<string> = []
+    val lambdaScopes: array<int> = []
+    val lambdaEvaluatedValues: array<BootstrapEvalValue> = []
+    val lambdaEvaluatedResults: array<int> = []
+    val lambdaImplicitResults: array<BootstrapExpression> = []
+    lowerer.collectImplicitResults(body, lambdaImplicitResults)
+    val lambdaLowerer = BootstrapLowerer(
+        lambdaInstructions,
+        lowerer.functions,
+        lambdaParameters,
+        lambdaParameterTypes,
+        ownedCaptures,
+        capturedCells,
+        lambdaLocals,
+        lambdaLocalTypes,
+        lambdaStorage,
+        lambdaScopes,
+        [],
+        [],
+        [],
+        [-1],
+        0,
+        lowerer.declarations,
+        lowerer.functionDeclarations,
+        lowerer.typeDeclarations,
+        lowerer.scalarTypeDeclarations,
+        lowerer.valueDeclarations,
+        lowerer.methodDeclarations,
+        lowerer.affineTypes,
+        lowerer.neverCallNames,
+        lowerer.mutableReceivers,
+        lowerer.managedAliasBegins,
+        lowerer.managedAliasEnds,
+        lowerer.managedAliasSources,
+        [],
+        [],
+        [],
+        lambdaImplicitResults,
+        lowerer.currentOwner,
+        lambdaEvaluatedValues,
+        lambdaEvaluatedResults,
+        lowerer.compileInputPaths,
+        lowerer.compileInputContents,
+        0,
+        0,
+        -1,
+        -1,
+        -1,
+        -1,
+        lowerer.validationOnly,
+        lowerer.errors,
+        bootstrapIrLocalNames()
+    )
+    val lambdaResult = lambdaLowerer.lowerExpression(body)
+    lambdaLowerer.emitOwnedParameterDrops()
+    lowerer.errors = lambdaLowerer.errors
+    // Transactional declaration sinks restart their local function
+    // index. Source spans keep lambda symbols deterministic and unique
+    // across independently committed declarations.
+    val lambdaName =
+        "lambda_${expression.begin}_${expression.end}_${lowerer.functions.size}"
+    val lambdaFunction = bootstrapFinalizeIrFunction(
+        lambdaName,
+        lambdaParameters,
+        lambdaInstructions,
+        lambdaResult,
+        bootstrapIrRuntimeTypes(
+            lowerer.declarations, lowerer.scalarTypeDeclarations, lambdaAbiParameterTypes
+        ),
+        "unknown",
+        lambdaLowerer.localStorage,
+        bootstrapIrRuntimeTypes(
+            lowerer.declarations, lowerer.scalarTypeDeclarations, lambdaLowerer.localTypes
+        ),
+        false,
+        false,
+        false,
+        "",
+        if (bootstrapIrSourceLabel == "") "lambda"
+            else "${bootstrapIrSourceLabel}.lambda",
+        bootstrapIrSourcePositionOf(
+            bootstrapIrSourceFile, expression.begin
+        )
+    )
+    lowerer.errors = lowerer.errors + lambdaFunction.verificationErrors
+    lowerer.functions.append(lambdaFunction)
+    if (expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator") {
+        val lambdaDropTypes: array<string> = []
+        var dropType = 0
+        while (dropType < lambdaParameterTypes.size) {
+            lambdaDropTypes.append(bootstrapDelegatedStorageOrSelf(
+                lambdaParameterTypes[dropType]
+            ))
+            dropType = dropType + 1
+        }
+        val closureDrop = bootstrapBuildClosureDropFunction(
+            lambdaName,
+            captureNames,
+            lambdaDropTypes,
+            lowerer.affineTypes
+        )
+        lowerer.errors =
+            lowerer.errors + closureDrop.verificationErrors
+        lowerer.functions.append(closureDrop)
+    }
+    result = lowerer.emitMany("closure.create", captureValues, lambdaName)
+    result
+}
+
+@noinline
+fun bootstrapLowerBlock(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val previousScope = lowerer.enterLocalScope()
+    // A local a closure captures lives in a cell from its declaration
+    // on. Converting it where the closure was built ran again on each
+    // pass of a loop and wrapped the cell in a second cell; inside one
+    // `if` arm it converted one path only.
+    var captured: array<string> = []
+    var capturesCollected = false
+    var statement = 0
+    while (statement < expression.children.size) {
+        val lowered = expression.children[statement]
+        result = lowerer.lowerExpression(lowered)
+        val after = bootstrapConditionAfterIf(lowered)
+        if (after != "") lowerer.addNullableRefinements(
+            lowered.children[0], after == "true"
+        )
+        if (lowered.kind == "local.val" || lowered.kind == "local.var") {
+            if (!capturesCollected) {
+                lowerer.collectCapturedNames(expression, captured)
+                capturesCollected = true
+            }
+            if (lowerer.nameIsBound(captured, lowered.text) &&
+                !lowerer.lowerNameIsDelegated(lowered.text) &&
+                !lowerer.lowerTypeIsAffine(bootstrapDelegatedStorageOrSelf(
+                    lowerer.lowerLocalType(lowered.text)
+                ))) lowerer.captureCell(lowered.text)
+        }
+        statement = statement + 1
+    }
+    if (result < 0) result = lowerer.emit("const.void", -1, -1, "")
+    lowerer.emitScopeDrops(lowerer.currentScope)
+    lowerer.leaveLocalScope(previousScope)
+    result
+}
+
+@noinline
+fun bootstrapLowerDefer(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (expression.children.size == 1) {
+        val closure = lowerer.lowerExpression(BootstrapExpression(
+            "lambda.move",
+            "",
+            expression.begin,
+            expression.end,
+            [expression.children[0]]
+        ))
+        val name = "defer_${lowerer.nextValue}"
+        val storage = "local_${lowerer.nextValue}_$name"
+        lowerer.locals.append(name)
+        lowerer.localTypes.append("once:function:()->void")
+        lowerer.localStorage.append(storage)
+        lowerer.localScopes.append(lowerer.currentScope)
+        lowerer.localBorrowSources.append("")
+        lowerer.emit("local.declare", closure, -1, storage)
+        lowerer.deferredScopes.append(lowerer.currentScope)
+        lowerer.deferredStorage.append(storage)
+    } else lowerer.errors = lowerer.errors + 1
+    result = lowerer.emit("const.void", -1, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerGenerator(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val closure = lowerer.lowerExpression(BootstrapExpression(
+        "lambda.generator",
+        "",
+        expression.begin,
+        expression.end,
+        [expression.children[0]]
+    ))
+    result = lowerer.emit("generator.create", closure, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerTask(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val closure = lowerer.lowerExpression(BootstrapExpression(
+        "lambda.move",
+        "",
+        expression.begin,
+        expression.end,
+        [expression.children[0]]
+    ))
+    result = lowerer.emit("${expression.kind}.create", closure, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerYield(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val value = lowerer.lowerExpression(expression.children[0])
+    val keepRunning = lowerer.emit("generator.yield", value, -1, "")
+    val continueLabel = lowerer.allocateLabel()
+    val cancelLabel = lowerer.allocateLabel()
+    lowerer.emitControl(
+        "branch", keepRunning, continueLabel, cancelLabel, ""
+    )
+    lowerer.emitControl("label", -1, cancelLabel, -1, "")
+    lowerer.emitDropsThroughScope(-1)
+    lowerer.emitOwnedParameterDrops()
+    val cancelled = lowerer.emit("const.void", -1, -1, "")
+    lowerer.emitControl("return", cancelled, -1, -1, "")
+    lowerer.emitControl("label", -1, continueLabel, -1, "")
+    result = lowerer.emit("const.void", -1, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerReturn(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (expression.children[0].kind == "missing") {
+        result = lowerer.emit("const.void", -1, -1, "")
+    } else {
+        result = lowerer.lowerExpression(expression.children[0])
+        lowerer.emitResultMove(expression.children[0])
+        result = result
+    }
+    lowerer.emitDropsThroughScope(-1)
+    lowerer.emitOwnedParameterDrops()
+    lowerer.emitControl("return", result, -1, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerLocal(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val hasInitializer = expression.children[0].kind != "missing"
+    val delegated = hasInitializer &&
+        expression.children[0].kind == "delegate.initializer" &&
+        expression.children[0].children.size > 1
+    val initializer = if (delegated) {
+        expression.children[0].children[0]
+    } else expression.children[0]
+    val managedAlias = !delegated && lowerer.isManagedAlias(expression)
+    var value = -1
+    var localType = "unknown"
+    if (hasInitializer) {
+        value = lowerer.lowerExpression(initializer)
+        localType = lowerer.lowerExpressionType(initializer)
+    }
+    if (delegated) {
+        val delegateType = localType
+        var exposedType = lowerer.lowerMethodResultType(
+            delegateType,
+            "getValue"
+        )
+        val declared = expression.children[0].children[1].text
+        if (declared != "inferred") {
+            exposedType = bootstrapNormalizeType(declared)
+        }
+        localType = bootstrapDelegatedType(
+            expression.kind == "local.var",
+            delegateType,
+            exposedType
+        )
+    }
+    if (managedAlias && !bootstrapIsBorrowType(localType)) {
+        localType = "borrow:$localType"
+    }
+    if (!delegated && expression.children.size > 1 &&
+        expression.children[1].text != "inferred") {
+        val declaredType = bootstrapNormalizeType(
+            expression.children[1].text
+        )
+        if (!managedAlias ||
+            (declaredType != bootstrapBorrowElementType(localType) &&
+             declaredType != localType)) localType = declaredType
+    }
+    val storage = "local_${lowerer.nextValue}_${expression.text}"
+    lowerer.locals.append(expression.text)
+    lowerer.localTypes.append(localType)
+    lowerer.localStorage.append(storage)
+    lowerer.localScopes.append(lowerer.currentScope)
+    lowerer.localBorrowSources.append("")
+    if (hasInitializer) {
+        result = lowerer.emit("local.declare", value, -1, storage)
+        if (!delegated && bootstrapIsBorrowType(localType)) {
+            val constructorAlias = managedAlias &&
+                expression.children[0].kind == "call" &&
+                lowerer.isClass(expression.children[0].text)
+            val source = if (constructorAlias) {
+                lowerer.lowerManagedAliasSource(
+                    expression.children[0],
+                    lowerer.managedAliasSource(expression)
+                )
+            } else if (managedAlias) {
+                lowerer.lowerBorrowArgumentSource(expression.children[0])
+            } else if (expression.children[0].kind == "identifier" &&
+                lowerer.lowerNameIsDelegated(
+                    expression.children[0].text
+                )) {
+                lowerer.lowerPlacePath(expression.children[0])
+            } else lowerer.lowerBorrowSource(expression.children[0])
+            if (source == "") {
+                lowerer.errors = lowerer.errors + 1
+                bootstrapSemanticUnit()
+            } else {
+                lowerer.localBorrowSources[lowerer.localBorrowSources.size - 1] =
+                    source
+                lowerer.emitControl(
+                    "borrow.bind",
+                    -1,
+                    -1,
+                    -1,
+                    "$storage|$source"
+                )
+                bootstrapSemanticUnit()
+            }
+        }
+        result = result
+    } else {
+        lowerer.emitControl("local.allocate", -1, -1, -1, storage)
+        result = lowerer.emit("const.void", -1, -1, "")
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerAssign(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val value = lowerer.lowerExpression(expression.children[0])
+    if (lowerer.lowerNameIsDelegated(expression.text)) {
+        lowerer.emitDelegatedMethod(
+            expression.text,
+            "setValue",
+            [value],
+            expression.begin,
+            expression.end
+        )
+        result = value
+    } else if (lowerer.isLocal(expression.text)) {
+        lowerer.emitAffineDrop(
+            lowerer.storageFor(expression.text),
+            lowerer.lowerLocalType(expression.text)
+        )
+        if (lowerer.localIsCell(expression.text)) {
+            val cell = lowerer.emit(
+                "local.load",
+                -1,
+                -1,
+                lowerer.storageFor(expression.text)
+            )
+            result = lowerer.emitMany("cell.set", [cell, value], "")
+        } else result = lowerer.emit(
+                "local.assign",
+                value,
+                -1,
+                lowerer.storageFor(expression.text)
+            )
+    } else if (lowerer.isCapturedParameter(expression.text)) {
+        val cell = lowerer.emit(
+            "parameter.load",
+            -1,
+            -1,
+            expression.text
+        )
+        result = lowerer.emitMany("cell.set", [cell, value], "")
+    } else if (lowerer.isField(expression.text)) {
+        val receiver = lowerer.emit(
+            "parameter.load",
+            -1,
+            -1,
+            "this"
+        )
+        var object = receiver
+        if (lowerer.isCapturedParameter("this")) {
+            object = lowerer.emit("cell.get", receiver, -1, "")
+        }
+        val fieldType = lowerer.lowerFieldType(
+            lowerer.currentOwner,
+            expression.text
+        )
+        if (lowerer.lowerTypeIsAffine(fieldType)) {
+            val previous = lowerer.emitFieldGet(
+                object,
+                lowerer.currentOwner,
+                expression.text
+            )
+            lowerer.emitAffineValueDrop(previous, fieldType)
+        }
+        result = lowerer.emitFieldSet(
+            object,
+            value,
+            lowerer.currentOwner,
+            expression.text
+        )
+    } else result = lowerer.emit("global.assign", value, -1, expression.text)
+    result
+}
+
+@noinline
+fun bootstrapLowerDelegateProject(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val name = expression.children[0].text
+    val place = lowerer.lowerPlacePath(expression)
+    if (place != "") {
+        lowerer.emitControl("place.load", -1, -1, -1, place)
+    }
+    result = lowerer.lowerDelegateSlot(name)
+    result
+}
+
+@noinline
+fun bootstrapLowerDelegateAssign(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val name = expression.children[0].text
+    val value = lowerer.lowerExpression(expression.children[1])
+    val storageType = lowerer.lowerStorageType(name)
+    if (lowerer.isLocal(name)) {
+        if (lowerer.localIsCell(name)) {
+            val cell = lowerer.emit(
+                "local.load", -1, -1, lowerer.storageFor(name)
+            )
+            if (lowerer.lowerTypeIsAffine(storageType)) {
+                val previous = lowerer.emit("cell.get", cell, -1, "")
+                lowerer.emitAffineValueDrop(previous, storageType)
+            }
+            lowerer.emitMany("cell.set", [cell, value], "")
+        } else {
+            lowerer.emitAffineDrop(lowerer.storageFor(name), storageType)
+            lowerer.emit("local.assign", value, -1, lowerer.storageFor(name))
+        }
+    } else if (lowerer.isCapturedParameter(name)) {
+        val cell = lowerer.emit("parameter.load", -1, -1, name)
+        if (lowerer.lowerTypeIsAffine(storageType)) {
+            val previous = lowerer.emit("cell.get", cell, -1, "")
+            lowerer.emitAffineValueDrop(previous, storageType)
+        }
+        lowerer.emitMany("cell.set", [cell, value], "")
+    } else if (lowerer.isGlobal(name)) {
+        if (lowerer.lowerTypeIsAffine(storageType)) {
+            val previous = lowerer.emit("global.load", -1, -1, name)
+            lowerer.emitAffineValueDrop(previous, storageType)
+        }
+        lowerer.emit("global.assign", value, -1, name)
+    } else lowerer.errors = lowerer.errors + 1
+    val place = lowerer.lowerPlacePath(expression.children[0])
+    if (place != "") {
+        lowerer.emitControl("place.set", -1, -1, -1, place)
+    }
+    result = value
+    result
+}
+
+@noinline
+fun bootstrapLowerCallMove(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (expression.children.size == 1 &&
+        expression.children[0].kind == "identifier" &&
+        (lowerer.isLocal(expression.children[0].text) ||
+         lowerer.isParameter(expression.children[0].text))) {
+        val moved = expression.children[0]
+        result = lowerer.lowerExpression(moved)
+        lowerer.emitControl(
+            "local.move",
+            -1,
+            -1,
+            -1,
+            lowerer.storageFor(moved.text)
+        )
+        bootstrapSemanticUnit()
+    } else if (expression.children.size == 1 &&
+        (expression.children[0].kind == "member" ||
+         expression.children[0].kind == "index")) {
+        val moved = expression.children[0]
+        val root = bootstrapPlaceRootName(moved)
+        val place = lowerer.lowerPlacePath(moved)
+        lowerer.emitControl("place.load", -1, -1, -1, place)
+        if (moved.kind == "member") {
+            val receiver = lowerer.lowerPlaceProjection(
+                moved.children[0]
+            )
+            val ownerType = lowerer.lowerExpressionType(
+                moved.children[0]
+            )
+            result = lowerer.emitFieldGet(
+                receiver,
+                ownerType,
+                moved.text
+            )
+            val empty = lowerer.emit("const.null", -1, -1, "")
+            lowerer.emitFieldSet(
+                receiver,
+                empty,
+                ownerType,
+                moved.text
+            )
+        } else {
+            val receiver = lowerer.lowerPlaceProjection(
+                moved.children[0]
+            )
+            val index = lowerer.lowerExpression(moved.children[1])
+            val receiverType = bootstrapBorrowElementType(
+                lowerer.lowerExpressionType(moved.children[0])
+            )
+            val opcode = lowerer.lowerIndexGetOpcode(receiverType)
+            result = lowerer.emit(opcode, receiver, index, "")
+            val empty = lowerer.emit("const.null", -1, -1, "")
+            lowerer.emitMany("index.set", [receiver, index, empty], "")
+        }
+        if ((lowerer.isLocal(root) || lowerer.isParameter(root)) &&
+            lowerer.lowerTypeIsAffine(
+                lowerer.lowerExpressionType(moved)
+            )) {
+            lowerer.emitControl(
+                "place.move",
+                -1,
+                -1,
+                -1,
+                place
+            )
+        } else {
+            lowerer.errors = lowerer.errors + 1
+            bootstrapSemanticUnit()
+        }
+        bootstrapSemanticUnit()
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit("invalid", -1, -1, "move")
+        bootstrapSemanticUnit()
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallShared(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (expression.children.size == 1) {
+        val value = lowerer.lowerExpression(expression.children[0])
+        result = lowerer.emit(
+            "shared.create",
+            value,
+            -1,
+            lowerer.lowerExpressionType(expression.children[0])
+        )
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit("invalid", -1, -1, "Shared")
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallMutex(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (expression.children.size == 1) {
+        val value = lowerer.lowerExpression(expression.children[0])
+        result = lowerer.emit(
+            "shared.create",
+            value,
+            -1,
+            lowerer.lowerExpressionType(expression.children[0])
+        )
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit("invalid", -1, -1, "Mutex")
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallFilledArray(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (expression.children.size == 2) {
+        val count = lowerer.lowerExpression(expression.children[0])
+        val value = lowerer.lowerExpression(expression.children[1])
+        result = lowerer.emitMany("array.filled", [count, value], "")
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit("invalid", -1, -1, "filledArray")
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallCell(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    if (expression.children.size == 1) {
+        val value = lowerer.lowerExpression(expression.children[0])
+        result = lowerer.emit("cell.create", value, -1, "")
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit("invalid", -1, -1, "Cell")
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallXtensaInterruptHandler(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val validIntrinsic = lowerer.isExternal(expression.text) &&
+        lowerer.externalLibrary(expression.text) == "intrinsic"
+    val validHandler = expression.children.size == 1 &&
+        expression.children[0].kind == "identifier" &&
+        lowerer.isNativeInterruptHandler(expression.children[0].text)
+    if (validIntrinsic && validHandler) {
+        result = lowerer.emit(
+            "native.xtensa.interrupt.handler.address",
+            -1,
+            -1,
+            expression.children[0].text
+        )
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit(
+            "invalid", -1, -1,
+            "nativeXtensaInterruptHandlerAddress"
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallNativeStaticBytes(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val validIntrinsic = lowerer.isExternal(expression.text) &&
+        lowerer.externalLibrary(expression.text) == "intrinsic"
+    val contents = if (expression.children.size == 1) {
+        bootstrapStaticString(expression.children[0])
+    } else BootstrapStaticString("", false)
+    if (validIntrinsic && contents.valid) {
+        val opcode = if (
+            expression.text == "nativeStaticMutableBytes"
+        ) "native.static.mutable.bytes" else "native.static.bytes"
+        result = lowerer.emit(opcode, -1, -1, contents.text)
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit(
+            "invalid", -1, -1, expression.text
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallNativeStaticU32s(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val validIntrinsic = lowerer.isExternal(expression.text) &&
+        lowerer.externalLibrary(expression.text) == "intrinsic"
+    val validValues = expression.children.size == 1 &&
+        expression.children[0].kind == "array" &&
+        expression.children[0].children.size > 0
+    if (validIntrinsic && validValues) {
+        val values: array<int> = []
+        var value = 0
+        while (value < expression.children[0].children.size) {
+            values.append(lowerer.lowerExpression(
+                expression.children[0].children[value]
+            ))
+            value = value + 1
+        }
+        val opcode = if (
+            expression.text == "nativeStaticMutableU32s"
+        ) "native.static.mutable.u32s" else "native.static.u32s"
+        result = lowerer.emitMany(opcode, values, "")
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit(
+            "invalid", -1, -1, expression.text
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallNativeInternalSectionU32s(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val validIntrinsic = lowerer.isExternal(expression.text) &&
+        lowerer.externalLibrary(expression.text) == "intrinsic"
+    val validValues = expression.children.size == 3 &&
+        expression.children[0].kind == "array" &&
+        expression.children[0].children.size > 0
+    val linkName = if (expression.children.size == 3) {
+        bootstrapStaticString(expression.children[1])
+    } else BootstrapStaticString("", false)
+    val section = if (expression.children.size == 3) {
+        bootstrapStaticString(expression.children[2])
+    } else BootstrapStaticString("", false)
+    if (validIntrinsic && validValues && linkName.valid &&
+        linkName.text != "" && section.valid && section.text != "") {
+        val values: array<int> = []
+        var value = 0
+        while (value < expression.children[0].children.size) {
+            values.append(lowerer.lowerExpression(
+                expression.children[0].children[value]
+            ))
+            value = value + 1
+        }
+        result = lowerer.emitManyTexts(
+            "native.internal.section.u32s", values, "",
+            [linkName.text, section.text]
+        )
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit(
+            "invalid", -1, -1, expression.text
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCallNativeFunctionAddress(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val validIntrinsic = lowerer.isExternal(expression.text) &&
+        lowerer.externalLibrary(expression.text) == "intrinsic"
+    val validFunction = expression.children.size == 1 &&
+        expression.children[0].kind == "identifier" &&
+        lowerer.isNativeAddressableFunction(expression.children[0].text)
+    if (validIntrinsic && validFunction) {
+        result = lowerer.emit(
+            "native.function.address", -1, -1,
+            expression.children[0].text
+        )
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit(
+            "invalid", -1, -1, "nativeFunctionAddress"
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerInlineAssembly(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val assemblyTemplate = if (expression.children.size > 0) {
+        bootstrapStaticString(expression.children[0])
+    } else BootstrapStaticString("", false)
+    val assemblyConstraints = if (expression.children.size > 1) {
+        bootstrapStaticString(expression.children[1])
+    } else BootstrapStaticString("", false)
+    val valid = expression.children.size >= 2 &&
+        assemblyTemplate.valid && assemblyConstraints.valid
+    if (valid) {
+        val operands: array<int> = []
+        var operand = 2
+        while (operand < expression.children.size) {
+            operands.append(lowerer.lowerExpression(
+                expression.children[operand]
+            ))
+            operand = operand + 1
+        }
+        val resultType = lowerer.lowerRuntimeType(
+            lowerer.lowerFunctionResultType(expression.text)
+        )
+        result = lowerer.emitManyTexts(
+            "inline.assembly",
+            operands,
+            resultType,
+            [
+                assemblyConstraints.text,
+                assemblyTemplate.text
+            ]
+        )
+    } else {
+        lowerer.errors = lowerer.errors + 1
+        result = lowerer.emit(
+            "invalid", -1, -1, "inline-assembly.literal"
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerCall(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val arguments: array<int> = []
+    var argument = 0
+    while (argument < expression.children.size) {
+        arguments.append(lowerer.lowerExpression(
+            expression.children[argument]
+        ))
+        argument = argument + 1
+    }
+    var callableType = "unknown"
+    if (lowerer.isParameter(expression.text)) {
+        callableType = lowerer.lowerParameterType(expression.text)
+    }
+    if (lowerer.isLocal(expression.text)) {
+        callableType = lowerer.lowerLocalType(expression.text)
+    }
+    if (lowerer.isGlobal(expression.text)) {
+        callableType = lowerer.lowerGlobalFunctionType(expression.text)
+    }
+    argument = 0
+    while (argument < expression.children.size) {
+        var parameterKind = lowerer.lowerFunctionParameterKind(
+            expression.text,
+            argument
+        )
+        if (bootstrapIsFunctionType(callableType)) {
+            parameterKind = bootstrapFunctionParameterKind(
+                callableType,
+                argument
+            )
+        }
+        if (parameterKind == "var") {
+            lowerer.emitBorrowMutation(expression.children[argument])
+        }
+        argument = argument + 1
+    }
+    var opcode = "call"
+    if (lowerer.isClass(expression.text)) opcode = "object.create"
+    if (lowerer.isExternal(expression.text)) {
+        opcode = "extern.${lowerer.externalLibrary(expression.text)}"
+    }
+    if (lowerer.isParameter(expression.text) ||
+        lowerer.isLocal(expression.text) ||
+        lowerer.isGlobal(expression.text)) {
+        val operands: array<int> = []
+        operands.append(lowerer.lowerExpression(BootstrapExpression(
+            "identifier",
+            expression.text,
+            expression.begin,
+            expression.begin,
+            []
+        )))
+        var indirectArgument = 0
+        while (indirectArgument < arguments.size) {
+            operands.append(arguments[indirectArgument])
+            indirectArgument = indirectArgument + 1
+        }
+        val indirectOpcode =
+            if (bootstrapIsOnceFunctionType(callableType)) {
+                "call.indirect.once"
+            } else "call.indirect"
+        result = lowerer.emitMany(indirectOpcode, operands, "")
+        if (bootstrapIsOnceFunctionType(callableType)) {
+            lowerer.emitControl(
+                "local.move",
+                -1,
+                -1,
+                -1,
+                lowerer.storageFor(expression.text)
+            )
+        }
+        result = result
+    } else if (lowerer.isScalarType(expression.text) &&
+        arguments.size == 1) {
+        result = lowerer.emit(
+            "scalar.cast",
+            arguments[0],
+            -1,
+            lowerer.lowerRuntimeType(expression.text)
+        )
+    } else result = lowerer.emitMany(
+        opcode,
+        arguments,
+        // An extern is linked (or an intrinsic recognized) by its
+        // source name, also when its module is imported under an
+        // alias and its declaration carries the module prefix.
+        if (opcode == "call" || opcode == "object.create") {
+            expression.text
+        } else bootstrapCanonicalDeclarationSourceName(expression.text)
+    )
+    result
+}
+
+@noinline
+fun bootstrapLowerMember(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val receiverType = bootstrapBorrowElementType(
+        lowerer.lowerExpressionType(expression.children[0])
+    )
+    val place = lowerer.lowerPlacePath(expression)
+    if (place != "") {
+        lowerer.emitControl("place.load", -1, -1, -1, place)
+    }
+    val receiver = if (place != "") {
+        lowerer.lowerPlaceProjection(expression.children[0])
+    } else lowerer.lowerExpression(expression.children[0])
+    if (expression.text == "size" &&
+        (receiverType == "string" ||
+         bootstrapIsArrayType(receiverType) ||
+         bootstrapIsMapType(receiverType))) {
+        val opcode = if (receiverType == "string") {
+            "string.length"
+        } else if (bootstrapIsMapType(receiverType)) "map.size"
+        else "array.length"
+        result = lowerer.emit(opcode, receiver, -1, "")
+    } else result = lowerer.emitFieldGet(
+        receiver, receiverType, expression.text
+    )
+    result
+}
+
+@noinline
+fun bootstrapLowerIndex(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val place = lowerer.lowerPlacePath(expression)
+    if (place != "") {
+        lowerer.emitControl("place.load", -1, -1, -1, place)
+    }
+    val receiver = if (place != "") {
+        lowerer.lowerPlaceProjection(expression.children[0])
+    } else lowerer.lowerExpression(expression.children[0])
+    val index = lowerer.lowerExpression(expression.children[1])
+    val receiverType = bootstrapBorrowElementType(
+        lowerer.lowerExpressionType(expression.children[0])
+    )
+    val opcode = lowerer.lowerIndexGetOpcode(receiverType)
+    result = lowerer.emit(opcode, receiver, index, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerIndexAssign(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val ownerPlace = lowerer.lowerPlacePath(expression.children[0])
+    var place = ""
+    if (ownerPlace != "") {
+        var indexText = "*"
+        if (expression.children[1].kind == "integer") {
+            indexText = expression.children[1].text
+        }
+        place = "$ownerPlace[$indexText]"
+    }
+    val receiver = if (place != "") {
+        lowerer.lowerPlaceProjection(expression.children[0])
+    } else lowerer.lowerExpression(expression.children[0])
+    val index = lowerer.lowerExpression(expression.children[1])
+    val value = lowerer.lowerExpression(expression.children[2])
+    val elementType = bootstrapArrayElementType(
+        lowerer.lowerExpressionType(expression.children[0])
+    )
+    if (lowerer.lowerTypeIsAffine(elementType)) {
+        val previous = lowerer.emit("array.get", receiver, index, "")
+        lowerer.emitAffineValueDrop(previous, elementType)
+    }
+    result = lowerer.emitMany(
+        "index.set",
+        [receiver, index, value],
+        ""
+    )
+    if (place != "") {
+        lowerer.emitControl("place.set", -1, -1, -1, place)
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerMemberCall(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val owner = bootstrapBorrowElementType(
+        lowerer.lowerExpressionType(expression.children[0])
+    )
+    val arguments: array<int> = []
+    var argument = 0
+    while (argument < expression.children.size) {
+        arguments.append(lowerer.lowerExpression(
+            expression.children[argument]
+        ))
+        argument = argument + 1
+    }
+    if (((expression.text == "append" ||
+          expression.text == "truncate" ||
+          expression.text == "clear") &&
+         bootstrapIsArrayType(owner)) ||
+        bootstrapMutableReceiverContains(
+            lowerer.mutableReceivers,
+            owner,
+            expression.text
+        )) {
+        lowerer.emitBorrowMutation(expression.children[0])
+    }
+    argument = 1
+    while (argument < expression.children.size) {
+        if (lowerer.lowerMethodParameterKind(
+            owner,
+            expression.text,
+            argument - 1
+        ) == "var") {
+            lowerer.emitBorrowMutation(expression.children[argument])
+        }
+        argument = argument + 1
+    }
+    if (bootstrapIsMapType(owner) &&
+        (expression.text == "set" || expression.text == "clear")) {
+        lowerer.emitMany("map.${expression.text}", arguments, "")
+        result = lowerer.emit("const.void", -1, -1, "")
+    } else if (bootstrapIsMapType(owner)) {
+        result = lowerer.emitMany("map.${expression.text}", arguments, "")
+    } else if (bootstrapIsCellType(owner) &&
+        expression.text == "get") {
+        result = lowerer.emit("cell.get", arguments[0], -1, "")
+    } else if (bootstrapIsCellType(owner) &&
+               expression.text == "set" &&
+               arguments.size == 2) {
+        lowerer.emitMany("cell.set", [arguments[0], arguments[1]], "")
+        result = lowerer.emit("const.void", -1, -1, "")
+    } else if (bootstrapIsMutexType(owner) &&
+        expression.text == "clone") {
+        result = lowerer.emit("shared.clone", arguments[0], -1, "")
+    } else if (bootstrapIsMutexType(owner) &&
+               expression.text == "with" &&
+               arguments.size == 2) {
+        val payload = lowerer.emit(
+            "shared.lock",
+            arguments[0],
+            -1,
+            bootstrapMutexElementType(owner)
+        )
+        result = lowerer.emitMany(
+            "call.indirect",
+            [arguments[1], payload],
+            ""
+        )
+        lowerer.emitControl(
+            "shared.unlock",
+            arguments[0],
+            -1,
+            -1,
+            ""
+        )
+    } else if (bootstrapIsSharedType(owner) &&
+        expression.text == "clone") {
+        result = lowerer.emit("shared.clone", arguments[0], -1, "")
+    } else if (bootstrapIsSharedType(owner) &&
+               expression.text == "get") {
+        result = lowerer.emit("shared.get", arguments[0], -1, "")
+    } else if (bootstrapIsSharedType(owner) &&
+               expression.text == "downgrade") {
+        result = lowerer.emit("weak.create", arguments[0], -1, "")
+    } else if (bootstrapIsWeakType(owner) &&
+               expression.text == "clone") {
+        result = lowerer.emit("weak.clone", arguments[0], -1, "")
+    } else if (bootstrapIsWeakType(owner) &&
+               expression.text == "upgrade") {
+        result = lowerer.emit("weak.upgrade", arguments[0], -1, "")
+    } else if (bootstrapIsWeakType(owner) &&
+               expression.text == "isAlive") {
+        result = lowerer.emit("weak.alive", arguments[0], -1, "")
+    } else if (expression.text == "append" &&
+               bootstrapIsArrayType(owner)) {
+        result = lowerer.emitMany("array.append", arguments, "")
+    } else if (expression.text == "truncate" &&
+               bootstrapIsArrayType(owner)) {
+        result = lowerer.emitMany("array.truncate", arguments, "")
+    } else if (expression.text == "clear" &&
+               bootstrapIsArrayType(owner)) {
+        result = lowerer.emitMany(
+            "array.truncate",
+            [arguments[0], lowerer.emit("const.i64", -1, -1, "0")],
+            ""
+        )
+    } else if (expression.text == "slice" && owner == "string") {
+        result = lowerer.emitMany("string.slice", arguments, "")
+    } else {
+        var methodOwner = owner
+        if (methodOwner == "unknown") {
+            methodOwner = lowerer.methodOwner(expression.text)
+        }
+        val extensionOwner = lowerer.lowerExtensionOwner(
+            methodOwner,
+            expression.text
+        )
+        if (extensionOwner != "") {
+            result = lowerer.emitMany(
+                "call",
+                arguments,
+                "extension_${extensionOwner}_${expression.text}"
+            )
+        } else if (methodOwner == "") lowerer.errors = lowerer.errors + 1
+        else result = lowerer.emitMany(
+            "call",
+            arguments,
+            "${methodOwner}_${expression.text}"
+        )
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerMemberAssign(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val ownerPlace = lowerer.lowerPlacePath(expression.children[0])
+    val place = if (ownerPlace == "") ""
+        else "$ownerPlace.${expression.text}"
+    val receiver = if (place != "") {
+        lowerer.lowerPlaceProjection(expression.children[0])
+    } else lowerer.lowerExpression(expression.children[0])
+    val value = lowerer.lowerExpression(expression.children[1])
+    val ownerType = lowerer.lowerExpressionType(expression.children[0])
+    val fieldType = lowerer.lowerFieldType(
+        ownerType,
+        expression.text
+    )
+    if (lowerer.lowerTypeIsAffine(fieldType)) {
+        val previous = lowerer.emitFieldGet(
+            receiver,
+            ownerType,
+            expression.text
+        )
+        lowerer.emitAffineValueDrop(previous, fieldType)
+    }
+    result = lowerer.emitFieldSet(
+        receiver,
+        value,
+        ownerType,
+        expression.text
+    )
+    if (place != "") {
+        lowerer.emitControl("place.set", -1, -1, -1, place)
+    }
+    result
+}
+
+@noinline
+fun bootstrapLowerNegate(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val operand = if (expression.kind == "unary!") {
+        lowerer.lowerExpression(expression.children[0])
+    } else lowerer.lowerArithmeticOperand(expression.children[0])
+    var opcode = if (expression.kind == "unary-") "neg" else "not"
+    if (expression.kind == "unary~") opcode = "bit.not"
+    result = lowerer.emit(opcode, operand, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerArithmetic(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    var opcode = expression.kind
+    if (expression.kind == "+" &&
+        lowerer.lowerExpressionType(expression.children[0]) == "string" &&
+        lowerer.lowerExpressionType(expression.children[1]) == "string") {
+        opcode = "string.concat"
+    }
+    if ((expression.kind == "==" || expression.kind == "!=") &&
+        lowerer.lowerExpressionType(expression.children[0]) == "string" &&
+        lowerer.lowerExpressionType(expression.children[1]) == "string") {
+        opcode = if (expression.kind == "==") {
+            "string.equal"
+        } else "string.not.equal"
+    }
+    val comparison = expression.kind == "==" ||
+        expression.kind == "!=" || expression.kind == "<" ||
+        expression.kind == "<=" || expression.kind == ">" ||
+        expression.kind == ">="
+    val arithmetic = opcode == expression.kind && !comparison
+    val comparisonType = if (opcode == expression.kind && comparison) {
+        bootstrapIrNativeComparisonType(
+            expression.kind,
+            lowerer.lowerRuntimeType(lowerer.lowerExpressionType(
+                expression.children[0]
+            )),
+            lowerer.lowerRuntimeType(lowerer.lowerExpressionType(
+                expression.children[1]
+            ))
+        )
+    } else ""
+    var left = if (arithmetic) {
+        lowerer.lowerArithmeticOperand(expression.children[0])
+    } else lowerer.lowerExpression(expression.children[0])
+    var right = lowerer.lowerExpression(expression.children[1])
+    if (comparisonType != "") {
+        left = lowerer.emit("scalar.cast", left, -1, comparisonType)
+        right = lowerer.emit("scalar.cast", right, -1, comparisonType)
+    }
+    result = lowerer.emit(opcode, left, right, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerIf(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    // Reserve the result name before lowering the condition. The
+    // condition may itself contain an if expression; deriving both
+    // names from the unchanged nextLabel created duplicate locals and
+    // made otherwise valid nested conditionals fail IR verification.
+    val temporaryId = lowerer.allocateLabel()
+    val temporary = "if_result_$temporaryId"
+    lowerer.emitControl(
+        bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
+            lowerer.lowerExpressionType(expression)
+        )),
+        -1, -1, -1, temporary
+    )
+    val condition = lowerer.lowerExpression(expression.children[0])
+    val thenLabel = lowerer.allocateLabel()
+    val elseLabel = lowerer.allocateLabel()
+    val mergeLabel = lowerer.allocateLabel()
+    lowerer.emitControl("branch", condition, thenLabel, elseLabel, "")
+    lowerer.emitControl("label", -1, thenLabel, -1, "")
+    val previousThenScope = lowerer.enterLocalScope()
+    lowerer.addNullableRefinements(expression.children[0], true)
+    val thenValue = lowerer.lowerExpression(expression.children[1])
+    lowerer.leaveLocalScope(previousThenScope)
+    lowerer.emitControl("local.set", thenValue, -1, -1, temporary)
+    lowerer.emitControl("jump", -1, mergeLabel, -1, "")
+    lowerer.emitControl("label", -1, elseLabel, -1, "")
+    var elseValue = -1
+    if (expression.children[2].kind == "missing") {
+        elseValue = lowerer.emit("const.i64", -1, -1, "0")
+    } else {
+        val previousElseScope = lowerer.enterLocalScope()
+        lowerer.addNullableRefinements(expression.children[0], false)
+        elseValue = lowerer.lowerExpression(expression.children[2])
+        lowerer.leaveLocalScope(previousElseScope)
+    }
+    lowerer.emitControl("local.set", elseValue, -1, -1, temporary)
+    lowerer.emitControl("jump", -1, mergeLabel, -1, "")
+    lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    result = lowerer.emit("local.load", -1, -1, temporary)
+    result
+}
+
+@noinline
+fun bootstrapLowerWhile(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val conditionLabel = lowerer.allocateLabel()
+    val bodyLabel = lowerer.allocateLabel()
+    val mergeLabel = lowerer.allocateLabel()
+    val previousBreakLabel = lowerer.breakLabel
+    val previousContinueLabel = lowerer.continueLabel
+    val previousBreakScope = lowerer.breakScope
+    val previousContinueScope = lowerer.continueScope
+    lowerer.breakLabel = mergeLabel
+    lowerer.continueLabel = conditionLabel
+    lowerer.breakScope = lowerer.currentScope
+    lowerer.continueScope = lowerer.currentScope
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.emitControl("label", -1, conditionLabel, -1, "")
+    val condition = lowerer.lowerExpression(expression.children[0])
+    lowerer.emitControl("branch", condition, bodyLabel, mergeLabel, "")
+    lowerer.emitControl("label", -1, bodyLabel, -1, "")
+    lowerer.lowerExpression(expression.children[1])
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.breakLabel = previousBreakLabel
+    lowerer.continueLabel = previousContinueLabel
+    lowerer.breakScope = previousBreakScope
+    lowerer.continueScope = previousContinueScope
+    lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    result = lowerer.emit("const.void", -1, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerDoWhile(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val bodyLabel = lowerer.allocateLabel()
+    val conditionLabel = lowerer.allocateLabel()
+    val mergeLabel = lowerer.allocateLabel()
+    val previousBreakLabel = lowerer.breakLabel
+    val previousContinueLabel = lowerer.continueLabel
+    val previousBreakScope = lowerer.breakScope
+    val previousContinueScope = lowerer.continueScope
+    lowerer.breakLabel = mergeLabel
+    lowerer.continueLabel = conditionLabel
+    lowerer.breakScope = lowerer.currentScope
+    lowerer.continueScope = lowerer.currentScope
+    lowerer.emitControl("jump", -1, bodyLabel, -1, "")
+    lowerer.emitControl("label", -1, bodyLabel, -1, "")
+    lowerer.lowerExpression(expression.children[0])
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.emitControl("label", -1, conditionLabel, -1, "")
+    val condition = lowerer.lowerExpression(expression.children[1])
+    lowerer.emitControl("branch", condition, bodyLabel, mergeLabel, "")
+    lowerer.breakLabel = previousBreakLabel
+    lowerer.continueLabel = previousContinueLabel
+    lowerer.breakScope = previousBreakScope
+    lowerer.continueScope = previousContinueScope
+    lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    result = lowerer.emit("const.void", -1, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerFor(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val sourceType = bootstrapBorrowElementType(
+        lowerer.lowerExpressionType(expression.children[0])
+    )
+    var elementType = bootstrapArrayElementType(sourceType)
+    if (sourceType == "string") elementType = "i64"
+    if (bootstrapIsGeneratorType(sourceType)) {
+        elementType = bootstrapGeneratorElementType(sourceType)
+    }
+    // `for (i in a until b)` / `a..b` count in place: the range is
+    // never materialised as an array. Both bounds are evaluated once.
+    val rangeKind = expression.children[0].kind
+    val range = rangeKind == "range.until" || rangeKind == "range.closed"
+    var source = -1
+    var length = -1
+    var indexStorage = ""
+    if (range) {
+        val begin = lowerer.lowerExpression(expression.children[0].children[0])
+        length = lowerer.lowerExpression(expression.children[0].children[1])
+        indexStorage = "for_index_${lowerer.nextLabel}"
+        lowerer.emitControl(
+            "local.zero.i64", -1, -1, -1, indexStorage
+        )
+        lowerer.emitControl("local.set", begin, -1, -1, indexStorage)
+    } else {
+        source = lowerer.lowerExpression(expression.children[0])
+    }
+    if (bootstrapIsGeneratorType(sourceType)) {
+        lowerer.emitResultMove(expression.children[0])
+    }
+    if (!range && !bootstrapIsGeneratorType(sourceType)) {
+        val lengthOpcode = if (sourceType == "string") {
+            "string.length"
+        } else "array.length"
+        length = lowerer.emit(lengthOpcode, source, -1, "")
+        indexStorage = "for_index_${lowerer.nextLabel}"
+        lowerer.emitControl(
+            "local.zero.i64", -1, -1, -1, indexStorage
+        )
+        val zero = lowerer.emit("const.i64", -1, -1, "0")
+        lowerer.emitControl("local.set", zero, -1, -1, indexStorage)
+    }
+    val conditionLabel = lowerer.allocateLabel()
+    val bodyLabel = lowerer.allocateLabel()
+    val incrementLabel = lowerer.allocateLabel()
+    val mergeLabel = lowerer.allocateLabel()
+    val previousBreakLabel = lowerer.breakLabel
+    val previousContinueLabel = lowerer.continueLabel
+    val previousBreakScope = lowerer.breakScope
+    val previousContinueScope = lowerer.continueScope
+    val loopScope = lowerer.currentScope
+    lowerer.breakLabel = mergeLabel
+    lowerer.continueLabel = incrementLabel
+    lowerer.breakScope = loopScope
+    lowerer.continueScope = loopScope
+    val previousScope = lowerer.enterLocalScope()
+    val iteratorStorage =
+        "for_value_${lowerer.nextValue}_${expression.text}"
+    val iteratorCaptured = lowerer.capturedByLambda(
+        expression.children[1],
+        expression.text
+    )
+    lowerer.locals.append(expression.text)
+    if (iteratorCaptured) {
+        lowerer.localTypes.append("cell:$elementType")
+    } else lowerer.localTypes.append(elementType)
+    lowerer.localStorage.append(iteratorStorage)
+    lowerer.localScopes.append(lowerer.currentScope)
+    lowerer.localBorrowSources.append("")
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.emitControl("label", -1, conditionLabel, -1, "")
+    var index = -1
+    var more = -1
+    if (bootstrapIsGeneratorType(sourceType)) {
+        more = lowerer.emit("generator.next", source, -1, "")
+    } else {
+        index = lowerer.emit("local.load", -1, -1, indexStorage)
+        val compare = if (rangeKind == "range.closed") "<=" else "<"
+        more = lowerer.emit(compare, index, length, "")
+    }
+    lowerer.emitControl("branch", more, bodyLabel, mergeLabel, "")
+    lowerer.emitControl("label", -1, bodyLabel, -1, "")
+    val value = if (range) index
+    else if (bootstrapIsGeneratorType(sourceType))
+        lowerer.emit("generator.value", source, -1, "")
+    else if (sourceType == "string")
+        lowerer.emit("string.get", source, index, "")
+    // Typed element read (array.get.f64/i64/bool/f32), as for `values[i]`.
+    else lowerer.emit(lowerer.lowerIndexGetOpcode(sourceType), source, index, "")
+    var iteratorValue = value
+    if (iteratorCaptured) {
+        iteratorValue = lowerer.emit("cell.create", value, -1, "")
+    }
+    lowerer.emit("local.declare", iteratorValue, -1, iteratorStorage)
+    lowerer.lowerExpression(expression.children[1])
+    lowerer.emitControl("jump", -1, incrementLabel, -1, "")
+    lowerer.breakLabel = previousBreakLabel
+    lowerer.continueLabel = previousContinueLabel
+    lowerer.breakScope = previousBreakScope
+    lowerer.continueScope = previousContinueScope
+    lowerer.leaveLocalScope(previousScope)
+    lowerer.emitControl("label", -1, incrementLabel, -1, "")
+    if (!bootstrapIsGeneratorType(sourceType)) {
+        val current = lowerer.emit("local.load", -1, -1, indexStorage)
+        if (rangeKind == "range.closed") {
+            // `a..b` stops at b itself, so b == i64 max cannot overflow.
+            val stepLabel = lowerer.allocateLabel()
+            val complete = lowerer.emit("==", current, length, "")
+            lowerer.emitControl("branch", complete, mergeLabel, stepLabel, "")
+            lowerer.emitControl("label", -1, stepLabel, -1, "")
+        }
+        val one = lowerer.emit("const.i64", -1, -1, "1")
+        val next = lowerer.emit("+", current, one, "")
+        lowerer.emitControl("local.set", next, -1, -1, indexStorage)
+    }
+    lowerer.emitControl("jump", -1, conditionLabel, -1, "")
+    lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    if (bootstrapIsGeneratorType(sourceType)) {
+        lowerer.emit("generator.drop", source, -1, "")
+    }
+    result = lowerer.emit("const.void", -1, -1, "")
+    result
+}
+
+@noinline
+fun bootstrapLowerWhen(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val temporaryId = lowerer.allocateLabel()
+    val temporary = "when_result_$temporaryId"
+    lowerer.emitControl(
+        bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
+            lowerer.lowerExpressionType(expression)
+        )),
+        -1, -1, -1, temporary
+    )
+    val subject = lowerer.lowerExpression(expression.children[0])
+    val mergeLabel = lowerer.allocateLabel()
+    var branch = 1
+    var hasElse = false
+    while (branch + 1 < expression.children.size) {
+        val match = expression.children[branch]
+        val body = expression.children[branch + 1]
+        if (match.kind == "missing") {
+            hasElse = true
+            val bodyValue = lowerer.lowerExpression(body)
+            lowerer.emitControl(
+                "local.set",
+                bodyValue,
+                -1,
+                -1,
+                temporary
+            )
+            lowerer.emitControl("jump", -1, mergeLabel, -1, "")
+        } else {
+            // `a, b, c -> body` repeats the body after each match
+            // (see parseWhen): test them in turn, then lower it once.
+            var bodyLabel = -1
+            var nextLabel = -1
+            while (true) {
+                val matchValue = lowerer.lowerExpression(expression.children[branch])
+                val condition = lowerer.emit("==", subject, matchValue, "")
+                if (bodyLabel < 0) bodyLabel = lowerer.allocateLabel()
+                nextLabel = lowerer.allocateLabel()
+                lowerer.emitControl(
+                    "branch",
+                    condition,
+                    bodyLabel,
+                    nextLabel,
+                    ""
+                )
+                if (!bootstrapWhenSharesBody(expression, branch)) break
+                lowerer.emitControl("label", -1, nextLabel, -1, "")
+                branch = branch + 2
+            }
+            lowerer.emitControl("label", -1, bodyLabel, -1, "")
+            val bodyValue = lowerer.lowerExpression(body)
+            lowerer.emitControl(
+                "local.set",
+                bodyValue,
+                -1,
+                -1,
+                temporary
+            )
+            lowerer.emitControl("jump", -1, mergeLabel, -1, "")
+            lowerer.emitControl("label", -1, nextLabel, -1, "")
+        }
+        branch = branch + 2
+    }
+    if (!hasElse) {
+        lowerer.emitControl("unreachable", -1, -1, -1, "")
+    }
+    lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    result = lowerer.emit("local.load", -1, -1, temporary)
+    result
 }
 
 fun bootstrapExpressionHasContractCall(
