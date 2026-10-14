@@ -376,10 +376,29 @@ val BOOTSTRAP_WASM_LTO_PARTITIONS = 4
 
 fun bootstrapLlvmOutOfProcess(): bool {
     val configured = linuxEnvironment("ABLA_LLVM_OUT_OF_PROCESS")
-    // LLVM 21's in-process WebAssembly passes change later native optimization
-    // results in the same process. Keep the isolated tools as the release default;
-    // explicit 0 opts into the experimental in-process path.
-    !configured.found || configured.value != "0"
+    configured.found && configured.value == "1"
+}
+
+noescape extern:"c" fun LLVMParseCommandLineOptions(
+    argc: i32, argv: i64*, overview: cstring
+): void
+
+// LLVM 23's WebAssemblyTargetLowering constructor calls
+// setMinimumJumpTableEntries(2), which mutates a process-wide cl::opt rather
+// than target-local state (llvm/lib/CodeGen/TargetLoweringBase.cpp). Restore
+// LLVM's default of 4 after Wasm, including failed builds, so later native
+// optimization and ORC compilation cannot inherit Wasm's switch costs.
+// Abla does not expose this LLVM option; compilation here is sequential.
+trusted fun bootstrapRestoreLlvmJumpTableDefault(): void {
+    val program = "ablac"
+    val option = "--min-jump-table-entries=4"
+    val arguments = nativeByteBuffer(24)
+    arguments.storeI64(0, nativeCStringAddress(program))
+    arguments.storeI64(8, nativeCStringAddress(option))
+    arguments.storePointer(16, nativeNullPointer())
+    LLVMParseCommandLineOptions(2, arguments.address, "")
+    arguments.close()
+    return
 }
 
 // Optimizes the module the backend kept (bootstrapLlvmHoldModule) with a fast build's
@@ -437,6 +456,7 @@ trusted fun bootstrapEmitHeldWasmObject(llvmTriple: string, objectPath: string):
     target.close()
     message.close()
     bootstrapDisposeHeldModule()
+    bootstrapRestoreLlvmJumpTableDefault()
     status
 }
 
@@ -1596,9 +1616,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         (cacheProfile == "cross-fast" || cacheProfile == "raw-cross-fast") &&
         !bootstrapKeepLlvmText()
     val bitcodePath = if (bitcodeHandoff) "$outputPath.input.bc" else ""
-    // Experimental in-process Wasm codegen avoids the bitcode/opt/llc handoff.
-    // It requires ABLA_LLVM_OUT_OF_PROCESS=0 until the LLVM 21 cross-target
-    // state interaction is resolved; release builds use the isolated tools.
+    // In-process Wasm codegen avoids the bitcode/opt/llc handoff.
+    // ABLA_LLVM_OUT_OF_PROCESS=1 retains the isolated-tool fallback.
     val inProcessCodegen = bitcodeHandoff && !bootstrapLlvmOutOfProcess()
     val fastCross = cacheProfile == "cross-fast" || cacheProfile == "raw-cross-fast"
     val firstHash = bootstrapNativeCacheHash(

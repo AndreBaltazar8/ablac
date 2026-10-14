@@ -88,6 +88,9 @@ separate `opt` and `llc`. `ABLA_KEEP_LLVM_TEXT=1` keeps the text, as
 `<module>.ll` beside the module, and runs `opt` and `llc` on it;
 `ABLA_LLVM_OUT_OF_PROCESS=1` runs them on the module as bitcode instead. Release
 builds always write that text (their LTO step reads it), and so do native builds.
+After in-process Wasm code generation, the compiler restores LLVM 23's global
+minimum jump-table size to its default of 4 (Wasm sets it to 2). This keeps later
+native optimization independent of earlier Wasm builds in the same process.
 Handed over as bitcode, the module also loses the names of its local values in `opt`
 and `llc` (nothing after them reads those names; functions and globals keep theirs),
 and neither tool verifies it again, since the compiler verified it as it emitted it.

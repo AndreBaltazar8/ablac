@@ -26,4 +26,7 @@ cmp -s "$output_directory/after-development.wasm" "$output_directory/alone.wasm"
 cmp -s "$output_directory/after-development.o" "$output_directory/alone.o" ||
     fail "a release native object built after a development module differs from one built alone"
 
+cmp -s "$output_directory/after-development-again.o" "$output_directory/alone.o" ||
+    fail "a release native object differs after a second development module"
+
 echo "build same process: release outputs after a development module are the same as ones built alone"

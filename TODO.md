@@ -80,12 +80,6 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
-- [ ] **In-process Wasm optimization changes later native objects with LLVM 21.**
-  `tools/test-build-same-process.sh` fails on Linux when
-  `ABLA_LLVM_OUT_OF_PROCESS=0`: identical native input IR gives different objects
-  after a development Wasm build. A standalone LLVM C API reproducer also differs
-  after running the Wasm passes. The isolated `opt`/`llc` path is the release default
-  until the LLVM state interaction is resolved; the in-process path is opt-in.
 - [ ] **Temporaries never share a stack slot.** Every IR value that is not a scalar gets
   its own 24-byte slot, and the backend emits no `llvm.lifetime` markers, so LLVM keeps
   them all apart: a frame grows with its function's size, not with what is live at once.
