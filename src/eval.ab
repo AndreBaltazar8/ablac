@@ -5075,6 +5075,14 @@ class BootstrapEvaluator(
             bootstrapEvalStepLimitReached(this)
             return bootstrapEvalInvalid()
         }
+        // Each level of a nested evaluation holds frames on the compiler's own
+        // stack: past the depth that stack can take, stop with a diagnostic
+        // instead of crashing (deep compile-time recursion).
+        if (bootstrapEvalDepth >= bootstrapEvalDepthLimit()) {
+            bootstrapEvalDepthLimitReached(this)
+            return bootstrapEvalInvalid()
+        }
+        bootstrapEvalDepth = bootstrapEvalDepth + 1
         // The cases are @noinline functions of their own, so a nested
         // evaluation holds a small frame per level, not every case's locals.
         val form = bootstrapEvalCase(expression)
@@ -5106,6 +5114,8 @@ class BootstrapEvaluator(
             51 -> bootstrapEvaluateFor(this, expression)
             else -> bootstrapEvaluateUncommon(this, expression, form)
         }
+        bootstrapEvalDepth = bootstrapEvalDepth - 1
+        if (bootstrapEvalDepth == 0) bootstrapEvalDepthReported = false
         if (this.errors > errorsBefore &&
             this.diagnostics.size == diagnosticsBefore) {
             bootstrapEvalExpressionFailed(this, expression)
@@ -5287,6 +5297,46 @@ fun bootstrapEvalDefaultArgument(
     evaluator.steps = defaults.steps
     evaluator.diagnostics = defaults.diagnostics
     value
+}
+
+// How deeply `evaluate` is nested now, and how deep the compiler's stack lets it
+// go (0 until first computed). Measured: a level costs about 4 KB of native
+// stack; the limit assumes 6 KB and keeps 4 MB in reserve.
+var bootstrapEvalDepth: int = 0
+var bootstrapEvalDepthLimitValue: int = 0
+// The limit is reported once per outermost evaluation, not by every level that
+// then unwinds into it again.
+var bootstrapEvalDepthReported: bool = false
+
+fun bootstrapEvalDepthLimit(): int {
+    if (bootstrapEvalDepthLimitValue == 0) {
+        var stackBytes = 8 * 1024 * 1024
+        val limits = linuxStackLimits()
+        if (limits.size == 2) {
+            stackBytes = if (limits[0] < 0) 512 * 1024 * 1024 else limits[0]
+        }
+        var limit = (stackBytes - 4 * 1024 * 1024) / (6 * 1024)
+        if (limit < 256) limit = 256
+        // ABLA_EVAL_DEPTH_LIMIT lowers it (never raises it), for tests.
+        val configured = linuxEnvironment("ABLA_EVAL_DEPTH_LIMIT")
+        if (configured.found && configured.value.size <= 9) {
+            val parsed = bootstrapDecimalIndex(configured.value)
+            if (parsed > 0 && parsed < limit) limit = parsed
+        }
+        bootstrapEvalDepthLimitValue = limit
+    }
+    bootstrapEvalDepthLimitValue
+}
+
+@noinline
+fun bootstrapEvalDepthLimitReached(var evaluator: BootstrapEvaluator): void {
+    evaluator.errors = evaluator.errors + 1
+    if (bootstrapEvalDepthReported) return
+    bootstrapEvalDepthReported = true
+    evaluator.recordEvaluatorDiagnostic(
+        "E_EVAL_STACK_DEPTH",
+        "compile-time evaluation nested deeper than ${bootstrapEvalDepthLimit()} levels (unbounded recursion, or recursion deeper than the compiler's stack allows)"
+    )
 }
 
 // The evaluator's diagnostics are built apart from `evaluate`, whose frame

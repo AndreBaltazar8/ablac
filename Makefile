@@ -133,6 +133,7 @@ test: ablac
 	tools/test-ownership-help.sh $(COMPILER)
 	tools/test-fs-tree.sh $(COMPILER)
 	tools/test-compile-time-floats.sh $(COMPILER)
+	tools/test-compile-time-depth.sh $(COMPILER)
 	tools/test-compile-time-arguments.sh $(COMPILER)
 	tools/test-import-precedence-diagnostics.sh $(COMPILER)
 	tools/test-region-escape-operators.sh $(COMPILER)
