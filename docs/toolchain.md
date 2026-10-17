@@ -291,3 +291,21 @@ coexist. After emission it may reuse an optimized executable only from an exact
 content-addressed match over the module, runtime inputs, host, toolchain, and
 release profile. `ABLA_RELEASE_SELFHOST_CACHE=0` forces a cold backend. The
 release gate still verifies byte-identical IR from the rebuilt compiler.
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `ABLA_SYSROOT`, `ABLA_STDLIB` | where the toolchain's standard library and runtime are found (above) |
+| `ABLA_LLVM`, `ABLA_LLD` | other prefixes of the LLVM and LLD the compiler links |
+| `ABLA_DEBUG=1\|0` | debug information on or off, overriding the build profile ([debugging.md](debugging.md)) |
+| `ABLA_MAX_MEMORY_MB`, `ABLA_MAX_SECONDS`, `ABLA_MAX_CPU_SECONDS`, `ABLA_KILL_GRACE_SECONDS` | the launcher's resource guard for the compiler and anything compile-time code starts ([performance.md](performance.md)) |
+| `ABLA_MAX_STACK_KB` | the compiler's stack size in a packaged toolchain |
+| `ABLA_NATIVE_JOBS` | parallel native object jobs |
+| `ABLA_EVAL_STEP_LIMIT` | lowers the compile-time step limit ([compile-time.md](compile-time.md#limits)) |
+| `ABLA_PACKAGE_CACHE` | the package cache directory ([packages.md](packages.md)) |
+| `ABLA_KEEP_LLVM_TEXT`, `ABLA_LLVM_OUT_OF_PROCESS`, `ABLA_LLVM_VERIFY`, `ABLA_FAST_INLINE_THRESHOLD`, `ABLA_WASM_OPT_CORES`, `ABLA_NO_SIDECAR` | code-generation controls (above) |
+| `ABLA_MACOS_SDK`, `ABLA_MACOS_LLVM_LIB`, `ABLA_MACOS_OPENSSL_LIB`, `ABLA_MACOS_CLANG` | cross-linking for macOS: the SDK, target libraries, and the `clang` used to link (default `clang`) |
+| `ABLA_COMPILER_COLLECT_GROWTH_MB` | without a launcher memory budget, the compiler collects garbage each time its heap grows by this much (default 256; 0 never collects) |
+| `ABLA_COMPILER_MEMORY_TRACE`, `ABLA_COMPILER_REACHABILITY_TRACE` | when non-empty, print the compiler's live memory per phase, or its reachability decisions, to standard error |
+| `ABLA_EVAL_INDEX_CHECK`, `ABLA_OVERLOAD_CHECK`, `ABLA_BORROW_INDEX_CHECK`, `ABLA_RECEIVER_INDEX_CHECK`, `ABLA_LIFT_CODEC_CHECK` | compiler self-checks for its own tests: `=1` cross-checks a fast path against the slow one and reports any disagreement |
