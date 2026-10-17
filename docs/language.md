@@ -43,7 +43,7 @@ The compiler accepts `;` as an explicit separator, but never requires it.
 
 The compatible declaration forms are:
 
-```abla
+```abla fragment
 val immutable = 1
 var mutable: int = 2
 
@@ -70,7 +70,7 @@ exactly once; `var` may be reassigned.
 
 A typed local `var` may defer its first assignment:
 
-```abla
+```abla fragment
 var answer: int
 if (ready) answer = 42 else answer = fallback()
 use(answer)
@@ -106,7 +106,7 @@ of a function's or lambda's body block may not redeclare one of its parameters
 A local or top-level `val`/`var` may store a policy object while exposing the
 value returned by that object's accessors:
 
-```abla
+```abla fragment
 class ClampedInt(var current: int, val minimum: int, val maximum: int) {
     fun getValue(): int = current
     fun setValue(next: int): void {
@@ -183,7 +183,7 @@ Annotations accept an optional expression argument. `@export("symbol")` and
 top-level function; the same signature and target validation used by the
 compiler export API still applies:
 
-```abla
+```abla fragment
 @export("micro_handle")
 fun handle(pointer: int, length: int): int = dispatch(pointer, length)
 ```
@@ -191,7 +191,7 @@ fun handle(pointer: int, length: int): int = dispatch(pointer, length)
 An array publishes ABI aliases for the same implementation without repeating
 the annotation:
 
-```abla
+```abla fragment
 @export(["current_name", "compatibility_name"])
 fun handle(pointer: int, length: int): int = dispatch(pointer, length)
 ```
@@ -220,7 +220,7 @@ with the most exact type matches. Two equally good candidates are rejected as
 `call.overload-no-match`; two declarations with the same parameter types remain
 `symbol.duplicate`.
 
-```abla
+```abla fragment
 fun N.mul(other: N): N = …
 fun N.mul(k: f64): N = …
 operator fun N.plus(other: N): N = …
@@ -281,7 +281,7 @@ implementations and does not implicitly transfer ownership.
 A stable nullable local or parameter is refined to `T` only on a control-flow
 path that proves it non-null:
 
-```abla
+```abla fragment
 val connection = weakConnection.upgrade()
 if (connection != null) {
     inspect(connection.get())
@@ -308,7 +308,7 @@ scope exit, reassignment, early return, `break`, `continue`, and owned-parameter
 exit. Moves clear the source storage, so cleanup at a later merge is a checked
 no-op rather than a second invocation:
 
-```abla
+```abla fragment
 resource class Socket(val descriptor: int) {
     fun drop(): void {
         platformClose(descriptor)
@@ -351,7 +351,7 @@ the caller's binding. Borrowed parameters cannot be returned or stored. A
 `var` parameter is an exclusive mutable borrow for the duration of one call,
 and an `own` parameter explicitly consumes an affine argument:
 
-```abla
+```abla fragment
 fun inspect(socket: Socket): int = socket.descriptor
 fun reset(var socket: Socket): int {
     socket.descriptor = -1
@@ -397,7 +397,7 @@ A direct immutable local alias of an array, a class with a mutable field, or a
 class that reaches such a field through nested `val` class fields is converted
 to a source-linked managed view:
 
-```abla
+```abla fragment
 val counter = Counter(20)
 val view = counter
 val observed = view.value
@@ -443,7 +443,7 @@ and `own` parameter modes, so indirect calls apply the same mutation, transfer,
 and overlap rules. The modes are also available in explicitly written callable
 types:
 
-```abla
+```abla fragment
 fun invoke(callback: (own: Socket) -> int, own socket: Socket): int =
     callback(move(socket))
 
@@ -494,7 +494,7 @@ so `Cell` cannot manufacture an escaping mutable alias. It is a local
 single-thread abstraction and will remain non-transferable when concurrency
 traits land; cross-thread mutation uses `Mutex<T>`.
 
-```abla
+```abla fragment
 class Counter(val value: Cell<int>)
 
 val counter = Counter(Cell(0))
@@ -507,7 +507,7 @@ copying a handle implicitly is rejected, while `clone()` deliberately creates
 a second handle. This keeps reference-count changes visible in source and
 prevents ordinary assignment from silently becoming an atomic operation:
 
-```abla
+```abla fragment
 val original = Shared(Socket(openDescriptor()))
 val second = original.clone()
 inspect(original.get())
@@ -523,7 +523,7 @@ other owning call, so an existing local is written `Shared(move(value))`.
 passed to an ordinary borrowed parameter, or bound to an inferred immutable
 local when the receiver is a stable local/parameter-rooted place:
 
-```abla
+```abla fragment
 val owner = Shared(Socket(openDescriptor()))
 val view = owner.get()
 inspect(view)
@@ -562,7 +562,7 @@ analysis. A function-value result can retain the same relation using a
 zero-based parameter index, including through local/global aliases,
 higher-order parameters, and returned function values:
 
-```abla
+```abla fragment
 val callback: (Shared<Ticket>) -> borrow(0) Ticket = view
 val ticket = callback(owner)
 ```
@@ -622,7 +622,7 @@ the rules above.
 the body's affine values have been destroyed. Only an allocation-independent
 scalar may cross the boundary:
 
-```abla
+```abla fragment
 val status = region {
     val document = parseDocument(source)
     consume(document)
@@ -660,7 +660,7 @@ Reusable lambdas cannot implicitly capture affine values. `move { ... }`
 creates a consuming closure and transfers its affine free variables at closure
 creation:
 
-```abla
+```abla fragment
 var socket = Socket(openDescriptor())
 val closeLater = move { platformClose(socket.descriptor) }
 socket = Socket(otherDescriptor) // starts a new lifetime
@@ -678,7 +678,7 @@ properties contains an affine value. Resource fields and array elements are
 borrowed when inspected and require an explicit consuming projection when
 extracted:
 
-```abla
+```abla fragment
 var box = TicketBox(Ticket(40))
 val ticket = move(box.ticket) // leaves only `box.ticket` uninitialized
 box = TicketBox(Ticket(2))    // replacing the owner starts a new lifetime
@@ -731,7 +731,7 @@ between two integer expressions, `^` is XOR.
 
 `if` and `when` are expressions when all paths yield compatible values:
 
-```abla
+```abla fragment
 val sign = if (n < 0) -1 else if (n > 0) 1 else 0
 
 val label = when (n) {
@@ -785,7 +785,7 @@ Abla does not expose a general unsafe-block programming model. A raw native
 declaration uses `trusted extern`, and only a function whose complete
 implementation is declared `trusted` may call it:
 
-```abla
+```abla fragment
 trusted extern:"intrinsic" fun platformRead(address: i64*): int
 
 trusted fun checkedRead(buffer: NativeBuffer, offset: int): int {
@@ -804,7 +804,7 @@ and package-interface work.
 
 `#expression` evaluates an expression during compilation:
 
-```abla
+```abla fragment
 val table = #makeTable()
 
 fun main {
@@ -817,7 +817,7 @@ A top-level `#expression` is also a compile action. Its result is deliberately
 discarded, so registration, generation, and validation calls do not require a
 dummy `val` declaration:
 
-```abla
+```abla fragment
 #registerRoutes()
 ```
 
@@ -860,7 +860,7 @@ authorization beside the entry module and a source-visible request:
 compileCapabilities = ["filesystem.read"]
 ```
 
-```abla
+```abla fragment
 import "abla/compiler"
 import "abla/io"
 #compilerGrant("filesystem.read")
@@ -905,7 +905,7 @@ value holding anything else (a closure, a handle) is evaluated afresh at each ev
 A module the native cache skips runs no handlers, so a provider that collects from its
 uses wants `--no-cache` builds.
 
-```abla
+```abla fragment
 class Seen(val names: array<string>)
 compile val seen: Seen = Seen([])
 
@@ -955,7 +955,7 @@ remain later refinements.
 order before affine locals are dropped, on block fallthrough and on `return`,
 `break`, or `continue`:
 
-```abla
+```abla fragment
 fun useConnection(): void {
     val connection = openConnection()
     defer { connection.close() }
@@ -970,7 +970,7 @@ guaranteed; panic recovery remains abortive and does not unwind defers.
 
 A generator is a lazy, synchronous, single-pass sequence:
 
-```abla
+```abla fragment
 val values = generator {
     yield 20
     yield 22
@@ -990,7 +990,7 @@ non-borrowed, non-affine types.
 `task` creates a stackful cooperative coroutine on the current OS thread;
 `await` consumes it and produces its result:
 
-```abla
+```abla fragment
 val parse = task { parseDocument(source) }
 val document = await parse
 ```
@@ -1003,7 +1003,7 @@ currently restricted to non-borrowed, non-affine values.
 dropping an unawaited thread also joins it, so a lexical scope cannot leave a
 worker detached:
 
-```abla
+```abla fragment
 val workerState = state.clone()
 val worker = thread { workerState.with(processBatch) }
 val result = await worker
@@ -1021,7 +1021,7 @@ These suspension and OS-thread runtimes currently require a hosted target.
 Imports are top-level declarations. A direct implementation import may retain
 compatibility visibility or bind the target to a module-local alias:
 
-```abla
+```abla fragment
 import "path/to/file.ab"
 import "shared/models.ab" as models
 
@@ -1033,7 +1033,7 @@ An import argument may also be a typed compile-time source-provider call. The
 provider returns `ImportSource` rather than performing network I/O during
 parsing:
 
-```abla
+```abla fragment
 import github("AndreBaltazar8/abla-mvc") as mvc
 ```
 
@@ -1061,7 +1061,7 @@ A contract import exposes callable signatures, annotations, defaults, ownership
 modes, and reachable nominal data shapes without adding their implementations
 to the runtime program:
 
-```abla
+```abla fragment
 import contract "../backend/counter.ab" as counter
 
 val request = $rpc(counter.incrementRemotely(41))

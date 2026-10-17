@@ -5,13 +5,21 @@ compile-time evaluation, and `$json` literals. It has no HTTP or host-runtime
 dependency.
 
 ```abla
+import "abla/io"
 import "abla/json"
 
-val parsed = jsonParse("{\"name\":\"Abla\",\"versions\":[1,2.5e1]}")
-if (parsed.succeeded) {
-    val name = parsed.value.get("name").asString()
-    val encoded = jsonStringify(parsed.value)
+fun main {
+    val parsed = jsonParse("{\"name\":\"Abla\",\"versions\":[1,2.5e1]}")
+    if (parsed.succeeded) {
+        println(parsed.value.get("name").asString())
+        println("${parsed.value.get("versions").size()} versions")
+        println(jsonStringify(parsed.value))
+    }
 }
+// output:
+// Abla
+// 2 versions
+// {"name":"Abla","versions":[1,2.5e1]}
 ```
 
 ## Values and numbers
@@ -58,11 +66,18 @@ ambiguous.
 ## Strict parsing
 
 ```abla
-val result = jsonParse(source)
-if (!result.succeeded) {
-    val code = result.error.code
-    val byte = result.error.byteOffset
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val result = jsonParse("{\"a\": 1,}")
+    if (!result.succeeded) {
+        val error = result.error
+        println("${error.code} at byte ${error.byteOffset}, line ${error.line} column ${error.column}")
+    }
 }
+// output:
+// unexpected_token at byte 8, line 1 column 9
 ```
 
 `jsonParse` accepts the standard JSON grammar and valid UTF-8. It rejects
@@ -112,12 +127,21 @@ Known-schema protocol code does not need to allocate a `Json` tree. An
 can retain a validated raw value slice:
 
 ```abla
-val reader = jsonObjectReader(source)
-reader.nextExpected("method")
-val method = reader.readString()
-reader.nextExpected("headers")
-val headers = reader.readStringPairsRaw()
-val valid = reader.finish()
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val source = "{\"method\":\"GET\",\"headers\":[[\"accept\",\"text/plain\"]]}"
+    val reader = jsonObjectReader(source)
+    reader.nextExpected("method")
+    val method = reader.readString()
+    reader.nextExpected("headers")
+    val headers = reader.readStringPairsRaw()
+    val valid = reader.finish()
+    println("$method $headers $valid")
+}
+// output:
+// GET [["accept","text/plain"]] true
 ```
 
 `nextExpected` is the order-sensitive fast path for canonical producers.
@@ -143,22 +167,29 @@ For output, the single-pass `JsonEncoder` writes one validated stream without
 building fragments or a dynamic tree:
 
 ```abla
-val encoder = jsonEncoder()
-encoder.beginObject()
-encoder.key("ok")
-encoder.boolean(true)
-encoder.key("items")
-encoder.beginArray()
-encoder.string("one")
-encoder.integer(2)
-encoder.endArray()
-encoder.endObject()
-val encoded = encoder.finish()
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val encoder = jsonEncoder()
+    encoder.beginObject()
+    encoder.encodedKey(#jsonEncodeString("ok"))
+    encoder.boolean(true)
+    encoder.key("items")
+    encoder.beginArray()
+    encoder.string("one")
+    encoder.integer(2)
+    encoder.endArray()
+    encoder.endObject()
+    println(encoder.finish())
+}
+// output:
+// {"ok":true,"items":["one",2]}
 ```
 
-For a static protocol key, `encodedKey(#jsonEncodeString("ok"))` moves quoting
-and UTF-8 validation to compile time. Dynamic or untrusted keys continue to use
-`key`.
+For a static protocol key, `encodedKey(#jsonEncodeString("ok"))` (used for
+`"ok"` above) moves quoting and UTF-8 validation to compile time. Dynamic or
+untrusted keys continue to use `key`.
 
 `key`, `string`, `integer`, `boolean`, `nullValue`, `beginObject`,
 `beginArray`, `endObject`, and `endArray` enforce container state while writing.
@@ -179,15 +210,31 @@ invalid bytes are never emitted as JSON.
 expressions:
 
 ```abla
-val literal = $json {
-    "answer": 42,
-    "ratio": 1.5e-2,
-    "large": 9223372036854775808,
-    "name": user.name,
-    "next": count + 1,
-    "item-$index": lookup(index),
-    "tags": ["fixed", tag()]
+import "abla/io"
+import "abla/json"
+
+class User(val name: string)
+
+fun lookup(index: int): int = index * 10
+fun tag(): string = "dynamic"
+
+fun main {
+    val user = User("ada")
+    val count = 2
+    val index = 3
+    val literal = $json {
+        "answer": 42,
+        "ratio": 1.5e-2,
+        "large": 9223372036854775808,
+        "name": user.name,
+        "next": count + 1,
+        "item-$index": lookup(index),
+        "tags": ["fixed", tag()]
+    }
+    println(jsonStringify(literal))
 }
+// output:
+// {"answer":42,"ratio":1.5e-2,"large":9223372036854775808,"name":"ada","next":3,"item-3":30,"tags":["fixed","dynamic"]}
 ```
 
 A value that starts with `{` or `[` is a JSON object or array; anything else
@@ -211,10 +258,18 @@ fixtures and headers because validation and serialization both happen during
 compilation:
 
 ```abla
-val body = #$jsons {
-    "event": "ready",
-    "attempt": 1
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val body = #$jsons {
+        "event": "ready",
+        "attempt": 1
+    }
+    println(body)
 }
+// output:
+// {"event":"ready","attempt":1}
 ```
 
 `$json`, `#$json`, `$jsons`, `#$jsons`, `#jsonParse`, and `#jsonStringify` use
@@ -228,14 +283,21 @@ read runtime locals.
 JSON policy is separate from the base HTTP transport:
 
 ```abla
+import "abla/io"
+import "abla/json"
 import "abla/http/json"
 
-val request = httpPostJson("/rpc", jsonObject(
-    ["method"],
-    [jsonString("ping")]
-))
-val response = httpJsonValue(jsonBoolean(true), 200)
-val body = request.parseJson()
+fun main {
+    val request = httpPostJson("/rpc", jsonObject(
+        ["method"],
+        [jsonString("ping")]
+    ))
+    val response = httpJsonValue(jsonBoolean(true), 200)
+    val body = request.parseJson()
+    println("${body.succeeded} ${body.value.get("method").asString()} ${response.status}")
+}
+// output:
+// true ping 200
 ```
 
 `HttpRequest.parseJson` accepts `application/json` and media types whose subtype

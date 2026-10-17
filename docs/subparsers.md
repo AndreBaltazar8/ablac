@@ -35,7 +35,7 @@ static string in the runtime program.
 Parser providers are ordinary modules. Registration is an explicit top-level
 compile expression in the module prelude:
 
-```abla
+```abla fragment
 #compilerRegisterSubparser("json", parseJson)
 ```
 
@@ -132,7 +132,7 @@ Architecture packages can use the same mechanism to own assembly syntax. A
 provider such as `$xtensa` parses register operations or instruction blocks and
 returns calls to generic typed compiler boundaries:
 
-```abla
+```abla fragment
 trusted noescape extern:"inline-assembly" fun assemblyReadU32(
     template: string,
     constraints: string

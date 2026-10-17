@@ -32,7 +32,7 @@ portable service code to opt into the operating system resolver.
 
 An empty TCP read is no longer ambiguous when using the structured API:
 
-```abla
+```abla fragment
 val incoming = connection.readWithTimeoutResult(65536, 5000)
 if (incoming.hasData()) process(incoming.bytes)
 else if (incoming.reachedEof()) connection.close()
@@ -49,23 +49,29 @@ subsequent cleanup a verified no-op.
 
 ## TCP and UDP
 
-```abla
+```abla build
 import "abla/net"
 
-val listener = tcpListenAddress(ipv4Loopback(8080))
-val connection = listener.accept()
-val request = connection.readWithTimeoutResult(65536, 5000)
-connection.writeResult("response")
-connection.close()
-listener.close()
+fun main {
+    val listener = tcpListenAddress(ipv4Loopback(8080))
+    val connection = listener.accept()
+    val request = connection.readWithTimeoutResult(65536, 5000)
+    if (request.hasData()) connection.writeResult("response")
+    connection.close()
+    listener.close()
+}
 ```
 
 UDP preserves datagram boundaries and reports the source address:
 
-```abla
-val socket = udpBindPort(8081)
-val datagram = socket.receiveFromWithTimeout(65507, 5000)
-if (datagram.received) socket.sendTo(datagram.bytes, datagram.source)
+```abla build
+import "abla/net"
+
+fun main {
+    val socket = udpBindPort(8081)
+    val datagram = socket.receiveFromWithTimeout(65507, 5000)
+    if (datagram.received) socket.sendTo(datagram.bytes, datagram.source)
+}
 ```
 
 `SocketPoller` owns one epoll descriptor. `watchDescriptor`,
@@ -85,7 +91,7 @@ affine TCP connection adapter. It implements:
 - bounded frame/message/input sizes; and
 - path-aware `WebSocketRouter` handlers.
 
-```abla
+```abla build
 import "abla/websocket"
 
 fun echo(request: HttpRequest, var socket: WebSocketConnection): void {
@@ -96,9 +102,11 @@ fun echo(request: HttpRequest, var socket: WebSocketConnection): void {
     return
 }
 
-val router = webSocketRouter()
-router.route("/rooms/:room", echo)
-serveWebSockets(router, 8080)
+fun main {
+    val router = webSocketRouter()
+    router.route("/rooms/:room", echo)
+    serveWebSockets(router, 8080)
+}
 ```
 
 See [websocket-echo-server.ab](../examples/websocket-echo-server.ab) for a
@@ -128,7 +136,7 @@ assigns every connection a stable, never-reused integer id and surfaces
 heartbeat and deadline sweep, flush), so a fixed-step simulation interleaves
 it with ticks and sends, broadcasts, or closes whenever it likes:
 
-```abla
+```abla fragment
 import "abla/websocket/server"
 
 val server = webSocketServer(
@@ -188,7 +196,7 @@ the peer is retried once on a fresh connection. Register `pollDescriptor()`
 with `WebSocketServer.watchExternal` so a blocking server `step` wakes when a
 reply arrives:
 
-```abla
+```abla fragment
 val http = httpAsyncClient()
 server.watchExternal(http.pollDescriptor())
 val grant = http.postJson(economyUrl, body, [HttpHeader("X-API-KEY", key)])
@@ -206,7 +214,7 @@ only the signature primitive uses OpenSSL libcrypto. `abla/jwt/remote` fetches
 a JWKS over HTTPS, caches it for a day, and refetches at most once per
 cooldown when a token names an unknown key:
 
-```abla
+```abla fragment
 import "abla/jwt/remote"
 
 val jwks = jwksCache("https://auth.example.com/.well-known/jwks.json")
@@ -253,7 +261,7 @@ parallel service model today. Native `thread` remains appropriate for bounded
 jobs, but a permanently allocating server must not use threads as workers until
 the managed collector can coordinate all thread root stacks.
 
-```abla
+```abla fragment
 val server = httpEventServerHandler(
     handleRequest,
     ipv4Loopback(8080),

@@ -117,7 +117,7 @@ keeps its Abla name; `.exported(name)` names only the destination module's
 bounded foreign symbol. `compiler.reference(handle)` preserves a handle from
 annotation or typed-expression reflection without resolving it again by name:
 
-```abla
+```abla fragment
 val client = compiler.newModule("client")
 val functions = compiler.functionsAnnotated("client")
 val action = compiler.reference(functions[0]).annotated("browser-copy")
@@ -183,13 +183,37 @@ handles, whether delegate replacement is allowed, and the source offsets of
 the `by` initializer:
 
 ```abla
-val binding = compiler.findBinding("volume")
-if (compiler.bindingIsDelegated(binding)) {
+import "abla/io"
+import "abla/compiler"
+
+class Clamped(var current: int, val minimum: int, val maximum: int) {
+    fun getValue(): int = current
+    fun setValue(next: int): void {
+        current = if (next < minimum) minimum else if (next > maximum) maximum else next
+        return
+    }
+}
+
+var volume: int by Clamped(40, 0, 100)
+
+compile fun describeVolume(): string {
+    val binding = compiler.findBinding("volume")
+    if (!compiler.bindingIsDelegated(binding)) return "volume is not delegated"
     val valueType = compiler.bindingExposedType(binding)
     val policyType = compiler.bindingDelegateType(binding)
-    val getter = compiler.bindingGetter(binding)
+    val getter = compiler.functionName(compiler.bindingGetter(binding))
+    val setter = compiler.functionName(compiler.bindingSetter(binding))
+    "volume: $valueType by $policyType ($getter/$setter)"
 }
+
+fun main {
+    println(#describeVolume())
+}
+// output:
+// volume: i64 by Clamped (getValue/setValue)
 ```
+
+Types are reported by their canonical spelling, so `int` reads as `i64`.
 
 The low-level ABI uses `compilerBindings`, `compilerFindBinding`, and the
 `compilerBinding...` accessors declared by `abla/compiler`. Getter and setter

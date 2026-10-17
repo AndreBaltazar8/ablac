@@ -69,15 +69,16 @@ otherwise is the symbol name. Other targets ignore the annotation:
 ```abla
 @wasmImport("wasi_snapshot_preview1")
 trusted noescape extern:"c" fun fd_write(fd: i32, iovs: i32, count: i32, written: i32): i32
-``` A build with debug information keeps
-the function names and publishes `<module>.map` and `<module>.debug.wasm`
-beside the module.
+```
+
+The embedding runtime must validate the imported symbol names and signatures
+before instantiation. A Wasm build with debug information keeps the function
+names and publishes `<module>.map` and `<module>.debug.wasm` beside the module.
 
 Development (`--fast`) builds carry debug information: DWARF line tables,
 readable function symbols and, natively, frame pointers and a printed stack on
 a crash. Release builds don't; `-g`/`--debug`, `--no-debug` and
-`ABLA_DEBUG=1|0` override either. See [debugging.md](debugging.md). The embedding runtime must validate
-the imported symbol names and signatures before instantiation.
+`ABLA_DEBUG=1|0` override either. See [debugging.md](debugging.md).
 
 A development (`--fast`) WebAssembly build optimizes its module and writes its object
 in the compiler's own process, with the passes and options `opt` and `llc -O0` would

@@ -187,7 +187,7 @@ build/ablac serve program.ab
 Projects can import locked packages through typed compile-time source
 providers:
 
-```abla
+```abla fragment
 import github("AndreBaltazar8/abla-mvc")
 ```
 

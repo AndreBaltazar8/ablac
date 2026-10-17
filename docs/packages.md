@@ -3,7 +3,7 @@
 Abla package imports are typed compile-time source expressions. The concise
 GitHub form is:
 
-```abla
+```abla fragment
 import github("AndreBaltazar8/abla-mvc")
 ```
 
@@ -14,7 +14,7 @@ use Git.
 
 The surrounding import may bind any provider result to a local namespace:
 
-```abla
+```abla fragment
 import github("AndreBaltazar8/abla-mvc") as mvc
 ```
 
@@ -47,7 +47,7 @@ resolver)`. The resolver is a compile-time function returning
 `resolvedImport(revision, entry, files)`, and each file is made with
 `importFile(path, contents)`:
 
-```abla
+```abla fragment
 compile fun resolveGeneratedMvc(): ResolvedImport = resolvedImport(
     "schema-v3",
     "src/generated-mvc.ab",
@@ -84,7 +84,7 @@ of the same `ImportSource` type. Selector kinds are `rev`, `tag`, `branch`, and
 `head`. `github("owner/repository")` is a convenience provider using `HEAD`.
 For example:
 
-```abla
+```abla fragment
 compile fun companyMvc(): ImportSource = gitImportSource(
     "abla-mvc",
     "ssh://git@git.example.invalid/platform/abla-mvc.git",

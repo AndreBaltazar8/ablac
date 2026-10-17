@@ -221,7 +221,7 @@ newest version not newer than the requested version; no header selects latest.
 ISO dates are the initial canonical keys because lexical and chronological
 ordering agree.
 
-```abla
+```abla fragment
 val api = httpRouter("Stripe-Version")
 api.version("2024-01-01").get("/customers/:id", customerV1)
 api.version("2025-01-01").get("/customers/:id", customerV2)

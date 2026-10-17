@@ -12,13 +12,40 @@ form below.
 The source form is an expression-oriented lexical region:
 
 ```abla
-val status = region {
-    val source = loadRequestSource()
-    val parsed = parse(source)
-    consumeBeforeRegionEnds(parsed)
-    0
+import "abla/io"
+
+class Document(val words: array<string>)
+
+fun parseDocument(source: string): Document {
+    val words: array<string> = []
+    var start = 0
+    var index = 0
+    while (index <= source.size) {
+        if (index == source.size || source[index] == 32) {
+            if (index > start) words.append(source.slice(start, index))
+            start = index + 1
+        }
+        index += 1
+    }
+    Document(words)
 }
+
+fun countWords(document: Document): int = document.words.size
+
+fun main {
+    val count = region {
+        val document = parseDocument("scoped allocation regions reclaim memory")
+        countWords(document)
+    }
+    println("$count words")
+}
+// output:
+// 5 words
 ```
+
+Everything `parseDocument` allocates (the `Document`, its array, the word
+strings) belongs to the region and is reclaimed when it ends; only the integer
+leaves it.
 
 Entering the expression creates an affine allocation domain. Heap allocations
 performed transitively by calls in the body belong to that domain. Normal

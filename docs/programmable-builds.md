@@ -9,7 +9,7 @@ compose those primitives.
 The low-level executable node is `compilerBuildProgram`; public extensions may
 use the grouped `compiler.buildProgram(...)` method:
 
-```abla
+```abla fragment
 import "abla/compiler"
 val app = #compilerBuildProgram(
     "app-core",
@@ -28,7 +28,7 @@ For a program assembled from declarations in the current compilation, the
 higher-level independent-module surface owns entry generation and the child
 node:
 
-```abla
+```abla fragment
 compile fun buildHelper(): void {
     val helper = compiler.newModule("helper")
     helper.use(compiler.function("sharedLogic"))
@@ -46,7 +46,7 @@ The same builder can emit a function-only module. A lifted reference carries
 its destination annotation and foreign name, while the Wasm package owns the
 target descriptor and `emitWasm` convenience:
 
-```abla
+```abla fragment
 import "abla/compiler"
 import "abla/wasm/build"
 
@@ -75,7 +75,7 @@ that entry.
 
 Resolved declarations can also become roots of a named target artifact:
 
-```abla
+```abla fragment
 compile fun configureClient(): void {
     val action = compiler.findFunction("clientAnswer")
     compiler.contributeArtifactRoot(
