@@ -41,4 +41,9 @@ grep -q 'give it a result type' "$output_directory/cycle.err"
 grep -q 'function.result-cycle:pong@38' "$output_directory/mutual.err"
 grep -q 'function.result-cycle:walk@' "$output_directory/mutual.err"
 [[ $(grep -c '^error' "$output_directory/mutual.err") -eq 2 ]]
-echo "inferred results: callers use the body's type; cycles are named where they close"
+"$compiler" build "$cases/reflect.ab" -o "$output_directory/reflect" --no-cache
+reflected=$("$output_directory/reflect")
+[[ $reflected == $'listUsers -> string\ncountUsers -> i64\nhasUsers -> bool' ]] || {
+    echo "inferred results: reflection said:"; echo "$reflected"; exit 1
+}
+echo "inferred results: callers and reflection use the body's type; cycles are named where they close"

@@ -43,8 +43,9 @@ fun main {
 
 `routeTable` runs inside the compiler, and the program receives its result
 as a constant array. Types are reported in their canonical spelling (`int`
-is `i64`). `compiler.annotationArgumentText(function, annotation)` gives an
-annotation argument's literal text (see
+is `i64`), and a result type the source leaves out is reported as inferred
+from the body. `compiler.annotationArgumentText(function, annotation)` gives
+an annotation argument's literal text (see
 [function reflection](#function-reflection)).
 
 ## Transforms: changing the program
