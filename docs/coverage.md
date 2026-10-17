@@ -85,7 +85,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Feature | Implemented in | Documented in | Quality | Tested by |
 |---|---|---|---|---|
 | `defer` | `parser.ab`, `sema.ab`, `ir.ab` | [concurrency.md#defer](concurrency.md#defer) | good | test-concurrency |
-| Generators | `parser.ab`, `sema.ab`, runtime | [concurrency.md#generators](concurrency.md#generators) (eager: known issue) | good | test-concurrency, test-generators-tasks |
+| Generators | `parser.ab`, `sema.ab`, runtime | [concurrency.md#generators](concurrency.md#generators) | good | test-concurrency, test-generators-tasks |
 | Tasks, `await` | `sema.ab`, runtime | [concurrency.md#tasks](concurrency.md#tasks) | good | test-concurrency, test-generators-tasks |
 | Threads | `sema.ab`, runtime | [concurrency.md#threads](concurrency.md#threads) | good | test-concurrency |
 

@@ -1,0 +1,645 @@
+// Lowering a generator's state machine (generator.ab).
+//
+// The step function's states are labels: entering it jumps to the state
+// saved in its state slot (or, given true, to the closing code), a
+// `generator.goto` leaves the blocks it is in and jumps, and a `yield` saves
+// the state to resume and returns true. A slot is a captured cell, typed
+// where its first assignment gives it a type; an affine slot is emptied
+// when its value moves out, and dropped by `generator.drop`.
+//
+// Within one step a slot lives in a typed local of the step function: read
+// from its cell on entry and written back on leaving, so the body runs on
+// native values, as an ordinary function's locals do. A slot a closure in the
+// body captures stays in its cell, shared.
+
+import "ir.ab"
+import "generator.ab"
+
+// The step function being lowered: its state labels (the closing code
+// last) and the scope its states are entered from.
+var bootstrapGeneratorLabels: array<int> = []
+var bootstrapGeneratorStatesScope: int = -1
+// The slots it keeps in locals for the step and writes: their names and
+// local storage, written back as the step ends.
+var bootstrapGeneratorCachedNames: array<string> = []
+var bootstrapGeneratorCachedStorage: array<string> = []
+// The types slots took (generator.ab names are unique per program), and the
+// slots made empty whose initial value waits for that type: a scalar slot
+// starts as its type's zero, so a step can unbox it unconditionally.
+var bootstrapGeneratorLearnedNames: array<string> = []
+var bootstrapGeneratorLearnedTypes: array<string> = []
+var bootstrapGeneratorPendingNames: array<string> = []
+var bootstrapGeneratorPendingInstructions: array<int> = []
+
+/** A generator slot's name: the machine marks it with `#` (generator.ab). */
+fun bootstrapIsGeneratorSlotName(name: string): bool {
+    var index = 0
+    while (index < name.size) {
+        if (name[index] == 35) return true
+        index = index + 1
+    }
+    false
+}
+
+/** The storage of a slot kept in a local for one step: written back to its
+ *  cell when the step ends, never dropped with the function's scopes. */
+fun bootstrapIsGeneratorSlotStorage(storage: string): bool =
+    storage.size > 11 && storage.slice(0, 11) == "slot_value_"
+
+/** A type the backend keeps in a native register (a scalar). */
+fun bootstrapGeneratorScalarSlotType(type: string): bool =
+    type == "i64" || type == "u64" || type == "i32" || type == "u32" ||
+    type == "i16" || type == "u16" || type == "i8" || type == "u8" ||
+    type == "char" || type == "bool" || type == "f64" || type == "f32"
+
+/** A slot name bound to a local the step keeps it in. */
+fun bootstrapLowerIsCachedSlot(var lowerer: BootstrapLowerer, name: string): bool =
+    lowerer.isLocal(name) && bootstrapIsGeneratorSlotStorage(lowerer.storageFor(name))
+
+/** A slot's type where it is bound: a cached local or a captured cell. */
+fun bootstrapLowerSlotType(var lowerer: BootstrapLowerer, name: string): string =
+    if (lowerer.isLocal(name)) lowerer.lowerLocalType(name)
+    else lowerer.lowerParameterType(name)
+
+/** A name bound to a generator slot here: a captured cell parameter or a
+ *  local cell holding an affine value. Only a generator keeps an affine
+ *  value in a cell, emptying it as the value moves out. */
+fun bootstrapLowerIsAffineCell(var lowerer: BootstrapLowerer, name: string): bool {
+    if (lowerer.isCapturedParameter(name)) {
+        return lowerer.lowerTypeIsAffine(bootstrapLowerSlotStorageType(lowerer, name))
+    }
+    lowerer.isLocal(name) && lowerer.localIsCell(name) &&
+        lowerer.lowerTypeIsAffine(bootstrapLowerSlotStorageType(lowerer, name))
+}
+
+/** What a slot's cell holds: a delegated local's delegate, else its value. */
+fun bootstrapLowerSlotStorageType(var lowerer: BootstrapLowerer, name: string): string =
+    bootstrapDelegatedStorageOrSelf(
+        if (lowerer.isCapturedParameter(name)) lowerer.lowerParameterMetadataType(name)
+        else lowerer.lowerLocalMetadataType(name)
+    )
+
+/** The cell a slot name is bound to. */
+fun bootstrapLowerSlotCell(var lowerer: BootstrapLowerer, name: string): int =
+    if (lowerer.isCapturedParameter(name)) lowerer.emit("parameter.load", -1, -1, name)
+    else lowerer.emit("local.load", -1, -1, lowerer.storageFor(name))
+
+/** Empties the slot `name` is bound to: its value moved out. */
+fun bootstrapLowerEmptySlot(var lowerer: BootstrapLowerer, name: string): void {
+    val cell = bootstrapLowerSlotCell(lowerer, name)
+    val empty = lowerer.emit("const.null", -1, -1, "")
+    lowerer.emitMany("cell.set", [cell, empty], "")
+    return
+}
+
+/** Moves the value out of an affine slot: reads it and empties the slot. */
+fun bootstrapLowerTakeSlot(var lowerer: BootstrapLowerer, name: string): int {
+    val cell = bootstrapLowerSlotCell(lowerer, name)
+    val value = lowerer.emit("cell.get", cell, -1, "")
+    val empty = lowerer.emit("const.null", -1, -1, "")
+    lowerer.emitMany("cell.set", [cell, empty], "")
+    value
+}
+
+/** A captured slot's type, learned from its first assignment: the
+ *  declared type, else the assigned value's. */
+fun bootstrapLowerLearnSlotType(
+    var lowerer: BootstrapLowerer,
+    name: string,
+    type: string
+): void {
+    if (type == "unknown") return
+    if (bootstrapLowerIsCachedSlot(lowerer, name)) {
+        val local = lowerer.visibleLocal(name, true)
+        if (local >= 0 && bootstrapNormalizeType(lowerer.localTypes[local]) == "unknown") {
+            lowerer.localTypes[local] = type
+            bootstrapGeneratorLearnedNames.append(name)
+            bootstrapGeneratorLearnedTypes.append(type)
+        }
+        return
+    }
+    if (!lowerer.isCapturedParameter(name)) return
+    var index = 0
+    while (index < lowerer.parameters.size) {
+        if (lowerer.parameters[index] == name && index < lowerer.parameterTypes.size &&
+            bootstrapNormalizeType(lowerer.parameterTypes[index]) == "unknown") {
+            lowerer.parameterTypes[index] = type
+            bootstrapGeneratorLearnedNames.append(name)
+            bootstrapGeneratorLearnedTypes.append(type)
+        }
+        index = index + 1
+    }
+    return
+}
+
+/** The type an assignment gives a slot: its declared type (a second child),
+ *  else the value's. */
+fun bootstrapLowerAssignedSlotType(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): string =
+    if (expression.children.size > 1 && expression.children[1].kind == "type") {
+        bootstrapNormalizeType(expression.children[1].text)
+    } else lowerer.lowerExpressionType(expression.children[0])
+
+/** Stores `value` (of `type`) into the slot `name`. */
+fun bootstrapLowerStoreSlot(
+    var lowerer: BootstrapLowerer,
+    name: string,
+    value: int,
+    type: string
+): void {
+    bootstrapLowerLearnSlotType(lowerer, name, type)
+    if (bootstrapLowerIsCachedSlot(lowerer, name)) {
+        lowerer.emit("local.assign", value, -1, lowerer.storageFor(name))
+        return
+    }
+    val cell = bootstrapLowerSlotCell(lowerer, name)
+    lowerer.emitMany("cell.set", [cell, value], "")
+    return
+}
+
+/** A slot of the generator's expansion: a cell holding its initializer, or
+ *  nothing yet. */
+@noinline
+fun bootstrapLowerGeneratorSlot(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val hasInitializer = expression.children.size > 0 &&
+        expression.children[0].kind != "missing"
+    var value = -1
+    var type = "unknown"
+    if (hasInitializer) {
+        type = lowerer.lowerExpressionType(expression.children[0])
+        value = lowerer.lowerExpression(expression.children[0])
+    } else {
+        bootstrapGeneratorPendingNames.append(expression.text)
+        bootstrapGeneratorPendingInstructions.append(lowerer.instructions.size)
+        value = lowerer.emit("const.null", -1, -1, "")
+    }
+    val cell = lowerer.emit("cell.create", value, -1, "")
+    val storage = "local_${lowerer.nextValue}_${expression.text}"
+    lowerer.locals.append(expression.text)
+    lowerer.localTypes.append("cell:$type")
+    lowerer.localStorage.append(storage)
+    lowerer.localScopes.append(lowerer.currentScope)
+    lowerer.localBorrowSources.append("")
+    lowerer.emit("local.declare", cell, -1, storage)
+}
+
+/** The generator: its step function as a closure over the slots. */
+@noinline
+fun bootstrapLowerGeneratorMachine(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    // The empty slots of this expansion: those lowered just before it (a
+    // nested generator, lowered with the step function, takes its own).
+    val pendingNames = bootstrapGeneratorPendingNames
+    val pendingInstructions = bootstrapGeneratorPendingInstructions
+    bootstrapGeneratorPendingNames = []
+    bootstrapGeneratorPendingInstructions = []
+    val learned = bootstrapGeneratorLearnedNames.size
+    val closure = lowerer.lowerExpression(expression.children[0])
+    var index = 0
+    while (index < pendingNames.size) {
+        var type = "unknown"
+        var entry = learned
+        while (entry < bootstrapGeneratorLearnedNames.size) {
+            if (type == "unknown" && bootstrapGeneratorLearnedNames[entry] == pendingNames[index]) {
+                type = bootstrapNormalizeType(bootstrapGeneratorLearnedTypes[entry])
+            }
+            entry = entry + 1
+        }
+        val at = pendingInstructions[index]
+        if (bootstrapGeneratorScalarSlotType(type) && at >= 0 && at < lowerer.instructions.size) {
+            val empty = lowerer.instructions[at]
+            // Unboxing reads a scalar's bits as an integer's (a float's too).
+            val opcode = if (type == "bool") "const.bool" else "const.i64"
+            val text = if (type == "bool") "false" else "0"
+            lowerer.instructions[at] = BootstrapInstruction(
+                opcode, empty.result, -1, -1, text, -1, -1, [], [], empty.position
+            )
+        }
+        index = index + 1
+    }
+    bootstrapGeneratorLearnedNames.truncate(learned)
+    bootstrapGeneratorLearnedTypes.truncate(learned)
+    lowerer.emit("generator.create", closure, -1, "")
+}
+
+/** Whether a state may write the slot `name`: assigns it, iterates with it,
+ *  passes it to a call (which may move it or change it through a `var`
+ *  parameter), or drops what it holds. Only reads leave it unwritten. */
+fun bootstrapGeneratorWrites(expression: BootstrapExpression, name: string): bool {
+    val kind = expression.kind
+    if ((kind == "assign" || kind == "generator.declare" ||
+         kind == "generator.suspend") && expression.text == name) return true
+    if (kind == "generator.suspend" && expression.children.size > 1 &&
+        expression.children[1].text == name) return true
+    if ((kind == "generator.drop" || kind == "generator.forinit" ||
+         kind == "generator.forstep" || kind == "generator.fornext") &&
+        bootstrapGeneratorNames(expression, name)) return true
+    // A call may move it or change it through a `var` parameter.
+    if ((kind == "call" || kind == "member.call" || kind == "await" ||
+         kind == "member.assign" || kind == "index.assign" ||
+         kind == "delegate.assign" || kind == "delegate.project" || kind == "for") &&
+        bootstrapGeneratorNames(expression, name)) return true
+    var child = 0
+    while (child < expression.children.size) {
+        if (bootstrapGeneratorWrites(expression.children[child], name)) return true
+        child = child + 1
+    }
+    false
+}
+
+/** Whether an identifier `name` is under `expression`. */
+fun bootstrapGeneratorNames(expression: BootstrapExpression, name: string): bool {
+    if (expression.kind == "identifier" && expression.text == name) return true
+    var child = 0
+    while (child < expression.children.size) {
+        if (bootstrapGeneratorNames(expression.children[child], name)) return true
+        child = child + 1
+    }
+    false
+}
+
+/** Every name a closure in `expression` captures (a lambda, `task`,
+ *  `thread`, `generator`, or a `defer`'s body). */
+fun bootstrapLowerClosureCaptures(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    var captured: array<string>
+): void {
+    if (expression.kind == "defer" && expression.children.size == 1) {
+        lowerer.collectLambdaFreeNames(expression.children[0], [], captured)
+        return
+    }
+    if (expression.kind == "lambda" || expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator" ||
+        bootstrapExpressionIsClosureBlock(expression)) {
+        lowerer.collectCapturedNames(expression, captured)
+        return
+    }
+    var child = 0
+    while (child < expression.children.size) {
+        bootstrapLowerClosureCaptures(lowerer, expression.children[child], captured)
+        child = child + 1
+    }
+    return
+}
+
+@noinline
+fun bootstrapLowerGeneratorStates(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val previousLabels = bootstrapGeneratorLabels
+    val previousScope = bootstrapGeneratorStatesScope
+    val previousCachedNames = bootstrapGeneratorCachedNames
+    val previousCachedStorage = bootstrapGeneratorCachedStorage
+    val blocks = bootstrapGeneratorStateBlocks(expression)
+    val labels: array<int> = []
+    var index = 0
+    while (index < blocks.size) {
+        labels.append(lowerer.allocateLabel())
+        index = index + 1
+    }
+    bootstrapGeneratorLabels = labels
+    bootstrapGeneratorStatesScope = lowerer.currentScope
+    // The slots this step keeps in locals: every captured slot no closure of
+    // the body shares. Their loads are emitted after the states, once the
+    // states gave each its type; the function starts by jumping to them.
+    val shared: array<string> = []
+    bootstrapLowerClosureCaptures(lowerer, expression, shared)
+    val cachedNames: array<string> = []
+    val cachedStorage: array<string> = []
+    val writtenNames: array<string> = []
+    index = 0
+    while (index < lowerer.capturedParameters.size) {
+        val name = lowerer.capturedParameters[index]
+        if (bootstrapIsGeneratorSlotName(name) && !lowerer.nameIsBound(shared, name)) {
+            if (bootstrapGeneratorWrites(expression, name)) {
+                writtenNames.append(name)
+            }
+            val storage = "slot_value_${lowerer.nextValue}_$index"
+            lowerer.nextValue = lowerer.nextValue + 1
+            val type = lowerer.lowerParameterType(name)
+            lowerer.locals.append(name)
+            lowerer.localTypes.append(type)
+            lowerer.localStorage.append(storage)
+            lowerer.localScopes.append(lowerer.currentScope)
+            lowerer.localBorrowSources.append("")
+            cachedNames.append(name)
+            cachedStorage.append(storage)
+        }
+        index = index + 1
+    }
+    // Only the slots the states write go back to their cells.
+    val writtenStorage: array<string> = []
+    index = 0
+    while (index < cachedNames.size) {
+        if (lowerer.nameIsBound(writtenNames, cachedNames[index])) {
+            writtenStorage.append(cachedStorage[index])
+        }
+        index = index + 1
+    }
+    bootstrapGeneratorCachedNames = writtenNames
+    bootstrapGeneratorCachedStorage = writtenStorage
+    val closeLabel = labels[labels.size - 1]
+    val entryLabel = lowerer.allocateLabel()
+    val dispatchLabel = lowerer.allocateLabel()
+    lowerer.emitControl("jump", -1, entryLabel, -1, "")
+    index = 0
+    while (index < blocks.size) {
+        lowerer.emitControl("label", -1, labels[index], -1, "")
+        lowerer.lowerExpression(blocks[index])
+        lowerer.emitControl("jump", -1, closeLabel, -1, "")
+        index = index + 1
+    }
+    lowerer.emitControl("label", -1, entryLabel, -1, "")
+    index = 0
+    while (index < cachedNames.size) {
+        val cell = lowerer.emit("parameter.load", -1, -1, cachedNames[index])
+        var value = lowerer.emit("cell.get", cell, -1, "")
+        // A scalar slot is unboxed once here, so its local is a native one.
+        val type = bootstrapNormalizeType(lowerer.lowerLocalMetadataType(cachedNames[index]))
+        if (bootstrapGeneratorScalarSlotType(type)) {
+            value = lowerer.emit("scalar.cast", value, -1, type)
+        }
+        lowerer.emit("local.declare", value, -1, cachedStorage[index])
+        index = index + 1
+    }
+    val closing = lowerer.lowerExpression(expression.children[1])
+    lowerer.emitControl("branch", closing, closeLabel, dispatchLabel, "")
+    lowerer.emitControl("label", -1, dispatchLabel, -1, "")
+    val state = lowerer.lowerExpression(expression.children[0])
+    val resumes = bootstrapGeneratorResumeStates(expression.text)
+    index = 0
+    while (index < resumes.size) {
+        val resume = resumes[index]
+        if (resume >= 0 && resume < labels.size) {
+            val target = lowerer.emit("const.i64", -1, -1, "$resume")
+            val matches = lowerer.emit("==", state, target, "")
+            val next = lowerer.allocateLabel()
+            lowerer.emitControl("branch", matches, labels[resume], next, "")
+            lowerer.emitControl("label", -1, next, -1, "")
+        }
+        index = index + 1
+    }
+    lowerer.emitControl("jump", -1, closeLabel, -1, "")
+    bootstrapGeneratorLabels = previousLabels
+    bootstrapGeneratorStatesScope = previousScope
+    bootstrapGeneratorCachedNames = previousCachedNames
+    bootstrapGeneratorCachedStorage = previousCachedStorage
+    lowerer.emit("const.void", -1, -1, "")
+}
+
+/** Leaves the step function with `more`: the slots it kept in locals go
+ *  back to their cells first. */
+fun bootstrapLowerGeneratorLeave(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    more: bool
+): int {
+    var index = 0
+    while (index < bootstrapGeneratorCachedNames.size) {
+        // A peek: the local may have moved out on this path (it is then
+        // empty, and the slot becomes empty too).
+        val value = lowerer.emit("resource.peek", -1, -1, bootstrapGeneratorCachedStorage[index])
+        val cell = lowerer.emit("parameter.load", -1, -1, bootstrapGeneratorCachedNames[index])
+        lowerer.emitMany("cell.set", [cell, value], "")
+        index = index + 1
+    }
+    val text = if (more) "true" else "false"
+    bootstrapLowerReturn(lowerer, BootstrapExpression(
+        "return", "", expression.begin, expression.end,
+        [BootstrapExpression(text, text, expression.begin, expression.end, [])]
+    ), -1)
+}
+
+@noinline
+fun bootstrapLowerGeneratorGoto(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val target = bootstrapGeneratorTarget(
+        expression.text, bootstrapGeneratorLabels.size
+    )
+    if (target < 0 || target >= bootstrapGeneratorLabels.size) {
+        lowerer.errors = lowerer.errors + 1
+    } else {
+        lowerer.emitDropsThroughScope(bootstrapGeneratorStatesScope)
+        lowerer.emitControl("jump", -1, bootstrapGeneratorLabels[target], -1, "")
+    }
+    lowerer.emit("const.void", -1, -1, "")
+}
+
+@noinline
+fun bootstrapLowerGeneratorSuspend(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val value = lowerer.lowerExpression(expression.children[0])
+    lowerer.emit("generator.yield", value, -1, "")
+    bootstrapLowerAssign(lowerer, BootstrapExpression(
+        "assign", expression.children[1].text, expression.begin, expression.end,
+        [BootstrapExpression("integer", expression.text, expression.begin, expression.end, [])]
+    ), -1)
+    bootstrapLowerGeneratorLeave(lowerer, expression, true)
+}
+
+/** Drops what an affine slot holds and empties it. */
+@noinline
+fun bootstrapLowerGeneratorDrop(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val name = expression.children[0].text
+    val type = bootstrapLowerSlotStorageType(lowerer, name)
+    if (bootstrapLowerIsCachedSlot(lowerer, name)) {
+        lowerer.emitAffineDrop(lowerer.storageFor(name), type)
+    } else if (lowerer.lowerTypeIsAffine(type)) {
+        val value = bootstrapLowerTakeSlot(lowerer, name)
+        lowerer.emitAffineValueDrop(value, type)
+    }
+    lowerer.emit("const.void", -1, -1, "")
+}
+
+/** A delegated local kept in a slot: its delegate, typed as the local. */
+@noinline
+fun bootstrapLowerGeneratorDeclare(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val initializer = expression.children[0]
+    val delegateType = lowerer.lowerExpressionType(initializer)
+    val value = lowerer.lowerExpression(initializer)
+    var exposedType = lowerer.lowerMethodResultType(delegateType, "getValue")
+    if (initializer.children.size > 1 && initializer.children[1].text != "inferred") {
+        exposedType = bootstrapNormalizeType(initializer.children[1].text)
+    }
+    bootstrapLowerStoreSlot(
+        lowerer, expression.text, value,
+        bootstrapDelegatedType(initializer.text == "var", delegateType, exposedType)
+    )
+    lowerer.emit("const.void", -1, -1, "")
+}
+
+/** What a loop's source slot holds, borrowed or not. */
+fun bootstrapLowerForSourceType(var lowerer: BootstrapLowerer, expression: BootstrapExpression): string =
+    bootstrapBorrowElementType(bootstrapLowerSlotType(lowerer, expression.children[0].text))
+
+@noinline
+fun bootstrapLowerGeneratorForInit(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val source = expression.children[0]
+    val sourceType = bootstrapBorrowElementType(lowerer.lowerExpressionType(source))
+    val value = lowerer.lowerExpression(source)
+    if (bootstrapIsGeneratorType(sourceType)) lowerer.emitResultMove(source)
+    bootstrapLowerStoreSlot(lowerer, expression.children[1].text, value, sourceType)
+    if (!bootstrapIsGeneratorType(sourceType)) {
+        val length = lowerer.emit(
+            if (sourceType == "string") "string.length" else "array.length",
+            value, -1, ""
+        )
+        bootstrapLowerStoreSlot(lowerer, expression.children[3].text, length, "i64")
+        val zero = lowerer.emit("const.i64", -1, -1, "0")
+        bootstrapLowerStoreSlot(lowerer, expression.children[2].text, zero, "i64")
+    }
+    lowerer.emit("const.void", -1, -1, "")
+}
+
+@noinline
+fun bootstrapLowerGeneratorForNext(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val sourceType = bootstrapLowerForSourceType(lowerer, expression)
+    if (bootstrapIsGeneratorType(sourceType)) {
+        val source = lowerer.lowerExpression(expression.children[0])
+        return lowerer.emit("generator.next", source, -1, "")
+    }
+    val index = lowerer.lowerExpression(expression.children[1])
+    val limit = lowerer.lowerExpression(expression.children[2])
+    lowerer.emit("<", index, limit, "")
+}
+
+@noinline
+fun bootstrapLowerGeneratorForValue(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val sourceType = bootstrapLowerForSourceType(lowerer, expression)
+    val source = lowerer.lowerExpression(expression.children[0])
+    if (bootstrapIsGeneratorType(sourceType)) {
+        return lowerer.emit("generator.value", source, -1, "")
+    }
+    val index = lowerer.lowerExpression(expression.children[1])
+    if (sourceType == "string") return lowerer.emit("string.get", source, index, "")
+    lowerer.emit(lowerer.lowerIndexGetOpcode(sourceType), source, index, "")
+}
+
+@noinline
+fun bootstrapLowerGeneratorForStep(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val sourceType = bootstrapLowerForSourceType(lowerer, expression)
+    if (!bootstrapIsGeneratorType(sourceType)) {
+        val index = lowerer.lowerExpression(expression.children[1])
+        val one = lowerer.emit("const.i64", -1, -1, "1")
+        val next = lowerer.emit("+", index, one, "")
+        bootstrapLowerStoreSlot(lowerer, expression.children[1].text, next, "i64")
+    }
+    lowerer.emit("const.void", -1, -1, "")
+}
+
+/** The element type a loop's `generator.forvalue` reads. */
+fun bootstrapLowerForValueType(var lowerer: BootstrapLowerer, expression: BootstrapExpression): string {
+    val sourceType = bootstrapLowerForSourceType(lowerer, expression)
+    if (bootstrapIsGeneratorType(sourceType)) return bootstrapGeneratorElementType(sourceType)
+    if (sourceType == "string") return "i64"
+    bootstrapArrayElementType(sourceType)
+}
+
+/** A `generator { body }` expression: its state machine, lowered. */
+@noinline
+fun bootstrapLowerGeneratorExpression(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val free: array<string> = []
+    lowerer.collectLambdaFreeNames(expression.children[0], [], free)
+    val owned: array<string> = []
+    var index = 0
+    while (index < free.size) {
+        val name = free[index]
+        // The receiver is captured as it is, never moved in.
+        if (name != "this" && (lowerer.isLocal(name) || lowerer.isParameter(name)) &&
+            !lowerer.lowerNameIsDelegated(name)) {
+            val type = if (lowerer.isLocal(name)) lowerer.lowerLocalType(name)
+                else lowerer.lowerParameterType(name)
+            if (lowerer.lowerTypeIsAffine(bootstrapDelegatedStorageOrSelf(type))) {
+                owned.append(name)
+            }
+        }
+        index = index + 1
+    }
+    val expansion = bootstrapGeneratorExpand(expression, owned)
+    if (expansion.error != "") {
+        lowerer.errors = lowerer.errors + 1
+        return lowerer.emit("invalid", -1, -1, expansion.error)
+    }
+    lowerer.lowerExpression(expansion.expression)
+}
+
+/** The lowering of a generator's machine node, or -2 when `expression` is
+ *  not one. */
+fun bootstrapLowerGeneratorNode(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val kind = expression.kind
+    if (kind == "generator.slot") return bootstrapLowerGeneratorSlot(lowerer, expression)
+    if (kind == "generator.machine") return bootstrapLowerGeneratorMachine(lowerer, expression)
+    if (kind == "generator.states") return bootstrapLowerGeneratorStates(lowerer, expression)
+    if (kind == "generator.goto") return bootstrapLowerGeneratorGoto(lowerer, expression)
+    if (kind == "generator.branch") {
+        val condition = lowerer.lowerExpression(expression.children[0])
+        val thenLabel = lowerer.allocateLabel()
+        val elseLabel = lowerer.allocateLabel()
+        lowerer.emitControl("branch", condition, thenLabel, elseLabel, "")
+        lowerer.emitControl("label", -1, thenLabel, -1, "")
+        bootstrapLowerGeneratorGoto(lowerer, expression.children[1])
+        lowerer.emitControl("label", -1, elseLabel, -1, "")
+        bootstrapLowerGeneratorGoto(lowerer, expression.children[2])
+        return lowerer.emit("const.void", -1, -1, "")
+    }
+    if (kind == "generator.suspend") return bootstrapLowerGeneratorSuspend(lowerer, expression)
+    if (kind == "generator.return") {
+        return bootstrapLowerGeneratorLeave(lowerer, expression, expression.text == "true")
+    }
+    if (kind == "generator.drop") return bootstrapLowerGeneratorDrop(lowerer, expression)
+    if (kind == "generator.declare") return bootstrapLowerGeneratorDeclare(lowerer, expression)
+    if (kind == "generator.retype") {
+        bootstrapLowerLearnSlotType(
+            lowerer, expression.text, bootstrapNormalizeType(expression.children[1].text)
+        )
+        return lowerer.emit("const.void", -1, -1, "")
+    }
+    if (kind == "generator.assume") {
+        lowerer.addNullableRefinements(
+            expression.children[0], expression.children[1].kind == "true"
+        )
+        return lowerer.emit("const.void", -1, -1, "")
+    }
+    if (kind == "generator.forinit") return bootstrapLowerGeneratorForInit(lowerer, expression)
+    if (kind == "generator.fornext") return bootstrapLowerGeneratorForNext(lowerer, expression)
+    if (kind == "generator.forvalue") return bootstrapLowerGeneratorForValue(lowerer, expression)
+    if (kind == "generator.forstep") return bootstrapLowerGeneratorForStep(lowerer, expression)
+    -2
+}

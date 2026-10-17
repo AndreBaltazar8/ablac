@@ -1,0 +1,336 @@
+// Evaluating a generator at compile time: the state machine generator.ab
+// builds, run by the interpreter as lowering compiles it.
+//
+// A generator value holds its step function (a closure over the slots),
+// the value it last yielded, and its status: 0 suspended, 1 finished,
+// 2 running. Iterating it runs the step function once per element, so a
+// generator is as lazy under `#` as at run time.
+
+import "eval.ab"
+import "generator.ab"
+
+fun bootstrapEvalGeneratorValue(closure: BootstrapEvalValue): BootstrapEvalValue =
+    BootstrapEvalValue(
+        "generator", 0, false, "",
+        [closure, bootstrapEvalInvalid(), bootstrapEvalInteger(0)], "", []
+    )
+
+fun bootstrapEvalIsGenerator(value: BootstrapEvalValue): bool =
+    value.kind == "generator" && value.elements.size == 3
+
+/** Runs a generator's step function once: to its next `yield` (true) or
+ *  its end (false); `closing` runs its closing code instead. */
+fun bootstrapEvalGeneratorStep(
+    var evaluator: BootstrapEvaluator,
+    var producer: BootstrapEvalValue,
+    closing: bool
+): bool {
+    val closure = producer.elements[0]
+    if (closure.kind != "closure") {
+        evaluator.errors = evaluator.errors + 1
+        return false
+    }
+    val lambda = evaluator.syntax[closure.integer]
+    val callNames: array<string> = []
+    val callValues: array<BootstrapEvalValue> = []
+    val callMutable: array<bool> = []
+    var capture = 0
+    while (capture < closure.fieldNames.size) {
+        callNames.append(closure.fieldNames[capture])
+        callValues.append(closure.elements[capture])
+        callMutable.append(true)
+        capture = capture + 1
+    }
+    callNames.append(lambda.children[0].text)
+    callValues.append(bootstrapEvalBoolean(closing))
+    callMutable.append(false)
+    // What `generator.suspend` yields into.
+    callNames.append("#generator")
+    callValues.append(producer)
+    callMutable.append(false)
+    val invocation = BootstrapEvaluator(
+        evaluator.declarations,
+        evaluator.affineTypes,
+        evaluator.context,
+        callNames,
+        callValues,
+        callMutable,
+        evaluator.cursors,
+        evaluator.syntax,
+        evaluator.typedCalls,
+        evaluator.reflectedTypes,
+        evaluator.generatedDeclarations,
+        evaluator.extensionRequests,
+        evaluator.compileInputPaths,
+        evaluator.compileInputContents,
+        evaluator.globalKeys,
+        evaluator.globalValues,
+        evaluator.allowedCompileEffects,
+        evaluator.errors,
+        evaluator.steps,
+        evaluator.diagnostics
+    )
+    producer.elements[2] = bootstrapEvalInteger(2)
+    var result = invocation.evaluate(lambda.children[lambda.children.size - 1])
+    if (result.kind == "return" && result.elements.size == 1) result = result.elements[0]
+    evaluator.errors = invocation.errors
+    evaluator.steps = invocation.steps
+    evaluator.diagnostics = invocation.diagnostics
+    val more = result.kind == "boolean" && result.boolean
+    if (more) producer.elements[2] = bootstrapEvalInteger(0)
+    else {
+        producer.elements[2] = bootstrapEvalInteger(1)
+        producer.elements[0] = evaluator.uninitializedValue()
+        producer.elements[1] = evaluator.uninitializedValue()
+    }
+    more
+}
+
+/** The next element of a generator: true when it yielded one. */
+fun bootstrapEvalGeneratorNext(
+    var evaluator: BootstrapEvaluator,
+    var producer: BootstrapEvalValue
+): bool {
+    if (!bootstrapEvalIsGenerator(producer)) {
+        evaluator.errors = evaluator.errors + 1
+        return false
+    }
+    val status = producer.elements[2].integer
+    if (status == 1) return false
+    if (status == 2) {
+        // A generator iterated from inside its own body.
+        evaluator.errors = evaluator.errors + 1
+        return false
+    }
+    bootstrapEvalGeneratorStep(evaluator, producer, false)
+}
+
+/** Dropping a generator closes it: a suspended one runs its pending defers
+ *  and drops what it holds. */
+fun bootstrapEvalGeneratorDrop(
+    var evaluator: BootstrapEvaluator,
+    var producer: BootstrapEvalValue
+): void {
+    if (bootstrapEvalIsGenerator(producer) && producer.elements[2].integer == 0) {
+        bootstrapEvalGeneratorStep(evaluator, producer, true)
+    }
+    return
+}
+
+/** The cell a slot name is bound to. */
+fun bootstrapEvalSlotCell(var evaluator: BootstrapEvaluator, name: string): BootstrapEvalValue {
+    val found = evaluator.find(name)
+    if (found < 0 || evaluator.values[found].kind != "cell") {
+        evaluator.errors = evaluator.errors + 1
+        return bootstrapEvalCell(bootstrapEvalInvalid())
+    }
+    evaluator.values[found]
+}
+
+fun bootstrapEvalSlotRead(var evaluator: BootstrapEvaluator, name: string): BootstrapEvalValue =
+    bootstrapEvalSlotCell(evaluator, name).elements[0]
+
+fun bootstrapEvalSlotWrite(
+    var evaluator: BootstrapEvaluator,
+    name: string,
+    value: BootstrapEvalValue
+): void {
+    val cell = bootstrapEvalSlotCell(evaluator, name)
+    cell.elements[0] = value
+    return
+}
+
+/** A `for` source moved into the loop: an identifier's binding is left
+ *  empty, as lowering moves a generator iterated in place. */
+fun bootstrapEvalMoveForSource(
+    var evaluator: BootstrapEvaluator,
+    source: BootstrapExpression,
+    value: BootstrapEvalValue
+): void {
+    if (!bootstrapEvalIsGenerator(value) || source.kind != "identifier") return
+    val found = evaluator.find(source.text)
+    if (found < 0) return
+    if (evaluator.values[found].kind == "cell") {
+        val cell = evaluator.values[found]
+        cell.elements[0] = evaluator.uninitializedValue()
+    } else evaluator.values[found] = evaluator.uninitializedValue()
+    return
+}
+
+@noinline
+fun bootstrapEvaluateGeneratorStates(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    val blocks = bootstrapGeneratorStateBlocks(expression)
+    val closingIndex = evaluator.find(expression.children[1].text)
+    val closing = closingIndex >= 0 && evaluator.values[closingIndex].boolean
+    var state = if (closing) blocks.size - 1
+        else bootstrapEvalSlotRead(evaluator, expression.children[0].text).integer
+    while (true) {
+        if (state < 0 || state >= blocks.size) {
+            evaluator.errors = evaluator.errors + 1
+            return bootstrapEvalInvalid()
+        }
+        val result = evaluator.evaluate(blocks[state])
+        if (result.kind != "goto") return result
+        state = bootstrapGeneratorTarget(result.text, blocks.size)
+        if (evaluator.steps > evaluator.context.stepLimit) return bootstrapEvalInvalid()
+    }
+    bootstrapEvalInvalid()
+}
+
+@noinline
+fun bootstrapEvaluateGeneratorSuspend(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    val value = evaluator.evaluate(expression.children[0])
+    val found = evaluator.find("#generator")
+    if (found < 0 || !bootstrapEvalIsGenerator(evaluator.values[found])) {
+        evaluator.errors = evaluator.errors + 1
+        return bootstrapEvalInvalid()
+    }
+    val producer = evaluator.values[found]
+    producer.elements[1] = value
+    bootstrapEvalSlotWrite(
+        evaluator, expression.children[1].text,
+        bootstrapEvalInteger(bootstrapDecimalIndex(expression.text))
+    )
+    bootstrapEvalReturn(bootstrapEvalBoolean(true))
+}
+
+@noinline
+fun bootstrapEvaluateGeneratorDrop(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    val cell = bootstrapEvalSlotCell(evaluator, expression.children[0].text)
+    val held = cell.elements[0]
+    cell.elements[0] = evaluator.uninitializedValue()
+    if (held.kind != "uninitialized" && held.kind != "invalid") evaluator.dropValue(held)
+    bootstrapEvalVoid()
+}
+
+@noinline
+fun bootstrapEvaluateGeneratorFor(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    val kind = expression.kind
+    if (kind == "generator.forinit") {
+        val source = evaluator.evaluate(expression.children[0])
+        bootstrapEvalMoveForSource(evaluator, expression.children[0], source)
+        bootstrapEvalSlotWrite(evaluator, expression.children[1].text, source)
+        var count = source.elements.size
+        if (source.kind == "string") count = source.text.size
+        bootstrapEvalSlotWrite(evaluator, expression.children[2].text, bootstrapEvalInteger(0))
+        bootstrapEvalSlotWrite(evaluator, expression.children[3].text, bootstrapEvalInteger(count))
+        return bootstrapEvalVoid()
+    }
+    // generator.fornext/forvalue/forstep: (source, index, limit) slots.
+    var source = bootstrapEvalSlotRead(evaluator, expression.children[0].text)
+    val index = bootstrapEvalSlotRead(evaluator, expression.children[1].text).integer
+    if (kind == "generator.fornext") {
+        if (bootstrapEvalIsGenerator(source)) {
+            return bootstrapEvalBoolean(bootstrapEvalGeneratorNext(evaluator, source))
+        }
+        val limit = bootstrapEvalSlotRead(evaluator, expression.children[2].text).integer
+        return bootstrapEvalBoolean(index < limit)
+    }
+    if (kind == "generator.forvalue") {
+        if (bootstrapEvalIsGenerator(source)) return source.elements[1]
+        if (source.kind == "string") return bootstrapEvalInteger(source.text[index])
+        if (index >= 0 && index < source.elements.size) return source.elements[index]
+        evaluator.errors = evaluator.errors + 1
+        return bootstrapEvalInvalid()
+    }
+    if (!bootstrapEvalIsGenerator(source)) {
+        bootstrapEvalSlotWrite(
+            evaluator, expression.children[1].text, bootstrapEvalInteger(index + 1)
+        )
+    }
+    bootstrapEvalVoid()
+}
+
+/** A `generator { body }` expression: its machine's slots and step
+ *  function, made into a generator value. */
+@noinline
+fun bootstrapEvaluateGeneratorExpression(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    val free: array<string> = []
+    evaluator.collectLambdaFreeNames(expression.children[0], [], free)
+    val owned: array<string> = []
+    var index = 0
+    while (index < free.size) {
+        val found = evaluator.find(free[index])
+        if (found >= 0 && free[index] != "this") {
+            var value = evaluator.values[found]
+            if (value.kind == "cell" && value.elements.size == 1) value = value.elements[0]
+            if (value.kind != "uninitialized" && evaluator.valueIsAffine(value)) {
+                owned.append(free[index])
+            }
+        }
+        index = index + 1
+    }
+    val expansion = bootstrapGeneratorExpand(expression, owned)
+    if (expansion.error != "") {
+        evaluator.errors = evaluator.errors + 1
+        return bootstrapEvalInvalid()
+    }
+    // The slots live as long as the step function: they are cells, which
+    // closing a block leaves alone.
+    evaluator.evaluate(expansion.expression)
+}
+
+@noinline
+fun bootstrapEvaluateGeneratorNode(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    val kind = expression.kind
+    if (kind == "generator") return bootstrapEvaluateGeneratorExpression(evaluator, expression)
+    if (kind == "generator.slot") {
+        var value = evaluator.uninitializedValue()
+        if (expression.children.size > 0 && expression.children[0].kind != "missing") {
+            value = evaluator.evaluate(expression.children[0])
+        }
+        evaluator.names.append(expression.text)
+        evaluator.values.append(bootstrapEvalCell(value))
+        evaluator.mutable.append(true)
+        return bootstrapEvalVoid()
+    }
+    if (kind == "generator.machine") {
+        return bootstrapEvalGeneratorValue(evaluator.evaluate(expression.children[0]))
+    }
+    if (kind == "generator.states") return bootstrapEvaluateGeneratorStates(evaluator, expression)
+    if (kind == "generator.goto") {
+        return BootstrapEvalValue("goto", 0, false, expression.text, [], "", [])
+    }
+    if (kind == "generator.branch") {
+        val condition = evaluator.evaluate(expression.children[0])
+        return evaluator.evaluate(expression.children[if (condition.boolean) 1 else 2])
+    }
+    if (kind == "generator.suspend") return bootstrapEvaluateGeneratorSuspend(evaluator, expression)
+    if (kind == "generator.return") {
+        return bootstrapEvalReturn(bootstrapEvalBoolean(expression.text == "true"))
+    }
+    if (kind == "generator.drop") return bootstrapEvaluateGeneratorDrop(evaluator, expression)
+    if (kind == "generator.declare") {
+        // A delegated local: its slot holds the delegate.
+        bootstrapEvalSlotWrite(
+            evaluator, expression.text, evaluator.evaluate(expression.children[0])
+        )
+        return bootstrapEvalVoid()
+    }
+    if (kind == "generator.assume" || kind == "generator.retype") return bootstrapEvalVoid()
+    if (kind == "generator.forinit" || kind == "generator.fornext" ||
+        kind == "generator.forvalue" || kind == "generator.forstep") {
+        return bootstrapEvaluateGeneratorFor(evaluator, expression)
+    }
+    // A `yield` outside a generator's machine: the checker reports it.
+    evaluator.errors = evaluator.errors + 1
+    bootstrapEvalInvalid()
+}

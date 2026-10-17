@@ -525,70 +525,77 @@ trusted fun __ablaRuntimeReleaseClosure(closure: int): void =
 trusted fun __ablaRuntimeDropClosure(closure: int): void =
     abla_llvm_drop_closure(ablaRuntimePointerFromAddress(closure))
 
+// A generator's control block (five value slots): its step function, the
+// value it last yielded, the step's argument and result, then its status
+// (0 suspended, 1 finished, 2 running) in a word the collector skips.
+// The step function runs to the next `yield` (true) or the end (false);
+// given true it closes the generator instead, running pending defers and
+// dropping what the generator holds.
 trusted fun __ablaRuntimeGeneratorCreate(
     closure: any,
     dispatch: int,
     release: int,
     drop: int
 ): any {
-    val control = __ablaRuntimeAllocateLayout(64, 2)
-    val values = __ablaRuntimeArrayCreate(0, 0)
+    val control = __ablaRuntimeAllocateLayout(104, 2)
     __ablaRuntimeCopyValue(closure, control)
-    __ablaRuntimeCopyValue(values, control + 24)
-    ablaRuntimeStoreI64(control + 48, 0)
-    ablaRuntimeStoreI64(control + 56, 0)
+    __ablaRuntimeCopyValue(__ablaRuntimeNull(), control + 24)
+    __ablaRuntimeCopyValue(__ablaRuntimeNull(), control + 48)
+    __ablaRuntimeCopyValue(__ablaRuntimeNull(), control + 72)
+    ablaRuntimeStoreI64(control + 96, 0)
     ablaRuntimeMakeValue(11, 0, control, 0)
 }
 
-trusted fun __ablaRuntimeGeneratorExecute(control: int): void {
-    if (ablaRuntimeLoadI64(control + 56) == 0) {
-        // A generator's body may iterate another generator: the inner one runs to its
-        // end with its own buffer, then the outer one's yields go back to the outer's.
-        val outer = __ablaRuntimeCurrentGenerator
-        __ablaRuntimeCurrentGenerator = control
-        val ignored = __ablaRuntimeAllocateLayout(24, 2)
-        __ablaRuntimeDispatchClosure(control, ignored)
+trusted fun __ablaRuntimeGeneratorStep(control: int, closing: bool): bool {
+    // A generator's body may iterate another generator: each step runs with
+    // its own generator current, so a `yield` reaches the right one.
+    val outer = __ablaRuntimeCurrentGenerator
+    __ablaRuntimeCurrentGenerator = control
+    ablaRuntimeStoreI64(control + 96, 2)
+    __ablaRuntimeCopyValue(__ablaRuntimeBool(closing), control + 48)
+    abla_llvm_call_indirect(
+        ablaRuntimePointerFromAddress(control + 72),
+        ablaRuntimePointerFromAddress(control),
+        ablaRuntimePointerFromAddress(control + 48),
+        1
+    )
+    __ablaRuntimeCurrentGenerator = outer
+    val more = __ablaRuntimeAsBool(__ablaRuntimeValueAt(control + 72))
+    if (more) ablaRuntimeStoreI64(control + 96, 0)
+    else {
+        ablaRuntimeStoreI64(control + 96, 1)
         __ablaRuntimeReleaseClosure(control)
         __ablaRuntimeCopyValue(__ablaRuntimeNull(), control)
-        __ablaRuntimeFree(ignored)
-        __ablaRuntimeCurrentGenerator = outer
-        ablaRuntimeStoreI64(control + 56, 1)
+        __ablaRuntimeCopyValue(__ablaRuntimeNull(), control + 24)
     }
+    more
 }
 
 trusted fun __ablaRuntimeGeneratorNext(handle: any): any {
     val control = __ablaRuntimeSharedControl(handle, 11)
-    __ablaRuntimeGeneratorExecute(control)
-    val index = ablaRuntimeLoadI64(control + 48)
-    val values = __ablaRuntimeValueAt(control + 24)
-    val available = index < __ablaRuntimeArrayLengthI64(values)
-    if (available) ablaRuntimeStoreI64(control + 48, index + 1)
-    __ablaRuntimeBool(available)
+    val status = ablaRuntimeLoadI64(control + 96)
+    // Iterating a generator from inside its own body.
+    if (status == 2) ablaRuntimeTrap()
+    __ablaRuntimeBool(status == 0 && __ablaRuntimeGeneratorStep(control, false))
 }
 
 trusted fun __ablaRuntimeGeneratorValue(handle: any): any {
     val control = __ablaRuntimeSharedControl(handle, 11)
-    val index = ablaRuntimeLoadI64(control + 48) - 1
-    __ablaRuntimeArrayGet(
-        __ablaRuntimeValueAt(control + 24),
-        __ablaRuntimeI64(index)
-    )
+    __ablaRuntimeValueAt(control + 24)
 }
 
 trusted fun __ablaRuntimeGeneratorYield(value: any): any {
     val control = __ablaRuntimeCurrentGenerator
     if (control == 0) ablaRuntimeTrap()
-    __ablaRuntimeArrayAppend(
-        __ablaRuntimeValueAt(control + 24), value
-    )
+    __ablaRuntimeCopyValue(value, control + 24)
     __ablaRuntimeBool(true)
 }
 
 trusted fun __ablaRuntimeGeneratorDrop(handle: any): any {
     val control = __ablaRuntimeSharedControl(handle, 11)
-    if (ablaRuntimeLoadI64(control + 56) == 0) {
-        __ablaRuntimeDropClosure(control)
-    }
+    val status = ablaRuntimeLoadI64(control + 96)
+    if (status == 2) ablaRuntimeTrap()
+    if (status == 0) __ablaRuntimeGeneratorStep(control, true)
     __ablaRuntimeFree(control)
     __ablaRuntimeVoid()
 }

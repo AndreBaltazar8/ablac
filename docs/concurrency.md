@@ -114,14 +114,60 @@ fun main {
 - A generator is single-pass: iterate over it once.
 - Generators can be nested: a generator body may iterate another generator.
 
-> Known issue (being fixed by ct-gen): generators currently run eagerly. On the first iteration the
-> whole body runs and its values are buffered, so side effects in the body
-> happen before the consumer sees the first value, and a `defer` in the
-> body runs at that point instead of when the generator is exhausted,
-> broken out of, or dropped. A body that never finishes, such as
-> `while (true) { yield n; n += 1 }`, is rejected (`generator.result`).
-> Until generators are lazy, keep generator bodies free of side effects and
-> make them finite.
+A generator is lazy. Creating one runs nothing; each time its `for` loop asks
+for the next value, the body runs from where it stopped up to the next
+`yield`, keeping its locals as they were. So the producer and the consumer
+take turns, and a generator may go on forever, since its consumer decides
+when to stop:
+
+```abla
+import "abla/io"
+
+fun naturals(): Generator<int> = generator {
+    defer { println("closed") }
+    var n = 0
+    while (true) {
+        println("producing $n")
+        yield n
+        n += 1
+    }
+}
+
+fun main {
+    for (n in naturals()) {
+        println("got $n")
+        if (n == 1) break
+    }
+    println("done")
+}
+// output:
+// producing 0
+// got 0
+// producing 1
+// got 1
+// closed
+// done
+```
+
+- Leaving the loop early, by `break` or by `return` from inside it, closes
+  the generator: its pending `defer`s run and what it owns is dropped, last
+  first. Finishing the body does the same. A generator that is dropped
+  without being iterated, or before it is finished, is closed when it is
+  dropped.
+- What a generator owns: affine values it captures, which move into it when
+  it is created, and the affine locals of its body that are alive at a
+  `yield`.
+- `yield` is a statement of the generator's body: of a block, a branch of a
+  statement `if` or `when`, or a loop body. It has no value, so it can't be
+  part of an expression (`generator.yield-position`). It can't be inside a
+  `region` either: while the generator waits at a `yield`, its consumer runs,
+  and what the consumer allocates would land in the region and be freed with
+  it.
+- A generator is compiled into a resumable state machine (`src/generator.ab`),
+  the same at run time, under `ablac run`, on WebAssembly and at compile
+  time. A body's locals that live across a `yield` are kept in the
+  generator, between steps, and a loop without a `yield` in it keeps its
+  locals on the stack.
 
 ## Tasks
 
@@ -237,9 +283,9 @@ To share mutable state between threads, put it in a `Mutex`
 
 ## At compile time
 
-`defer`, tasks and `await` work at compile time, under `#`, exactly as at
-run time. Generators are not yet supported there (`E_EVAL_EXPRESSION` at the
-`generator`), and a generator, task or thread can't be the result of a `#`
+`defer`, generators, tasks and `await` work at compile time, under `#`,
+exactly as at run time: a generator is as lazy there, running the same state
+machine. A generator, task or thread can't be the result of a `#`
 expression ([compile-time.md](compile-time.md#expression)).
 
 ## Diagnostics
@@ -249,7 +295,8 @@ expression ([compile-time.md](compile-time.md#expression)).
 | `defer.result` | the `defer` body produces a value |
 | `defer.control` | `return`, `break` or `continue` inside a `defer` body |
 | `generator.empty` | a generator body with no `yield` |
-| `generator.result` | a generator body whose last expression has a value (or never finishes) |
+| `generator.result` | a generator body whose last expression has a value |
+| `generator.yield-position` | a `yield` inside an expression or a `region` |
 | `generator.body`, `task.body`, `thread.body` | `generator`, `task` or `thread` without a `{ ... }` body |
 | `yield.outside-generator` | `yield` outside a `generator { }` |
 | `yield.type` | yields of different types in one generator |

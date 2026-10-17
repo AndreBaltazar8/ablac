@@ -1,0 +1,925 @@
+import "sema.ab"
+
+// Lazy generators: `generator { body }` as a resumable state machine.
+//
+// The body is cut at each `yield` into numbered states, the way a
+// generator is compiled where the target has no stack switching. Both
+// phases run the same machine: the interpreter evaluates it at compile
+// time and lowering compiles it, so a generator behaves alike under `#`
+// and at run time.
+//
+// The expansion of a generator is a block in the enclosing function:
+//
+//     generator.slot "#gs.<id>" = 0      the state to resume
+//     generator.slot "x#<id>.<n>"        one per local the machine keeps
+//     generator.slot "c#<id>.<n>" = move(c)   an affine capture, moved in
+//     generator.machine { #gclose.<id> -> generator.states [...] }
+//
+// `generator.states` lists the resume states in its text ("0,3,5"); its
+// children are the state slot and the closing parameter (identifiers), the
+// states (blocks), and last the closing code.
+//
+// A slot is a cell the step function captures. The step function takes one
+// argument: false runs to the next `yield` (true: a value was yielded) or to
+// the end (false); true closes a suspended generator, running its pending
+// defers and dropping what it holds, last first, and returns false.
+//
+// Inside the states:
+//     generator.suspend k (value, state slot)   yield value, resume at k
+//     generator.goto k | close      jump to state k, or to the closing code
+//     generator.branch (c, goto, goto)   jump one way or the other
+//     generator.return false        leave the step function (closing ends so)
+//     generator.drop (slot)         drop what a slot holds and empty it
+//     generator.declare slot (delegate.initializer, slot)  a delegated local
+//     generator.retype slot (slot, type)   a local declared with no value
+//     generator.assume (c, b)       what the original code knew of `c` here
+//     generator.forinit/fornext/forvalue/forstep  iterating a `for` source
+//
+// Statements without a `yield` stay as they are (renamed), so a loop with
+// no `yield` in it keeps its own locals. A local of a block that is cut is
+// kept in a slot from its declaration to the block's end; the statements of
+// a block after its last `yield` stay one ordinary block.
+
+class BootstrapGeneratorState(val statements: array<BootstrapExpression>)
+
+class BootstrapGeneratorScope(
+    val parent: int,
+    val slots: array<string>,
+    val deferFlags: array<string>,
+    val deferBodies: array<BootstrapExpression>,
+    val children: array<int>
+)
+
+class BootstrapGeneratorLoop(
+    val breakState: int,
+    val continueState: int,
+    val scope: int
+)
+
+class BootstrapGeneratorExpansion(
+    val expression: BootstrapExpression,
+    val error: string,
+    val errorBegin: int,
+    val errorEnd: int
+)
+
+fun bootstrapGeneratorIsLambda(kind: string): bool =
+    kind == "lambda" || kind == "lambda.move" || kind == "lambda.generator" ||
+    kind == "generator" || kind == "task" || kind == "thread" ||
+    kind == "defer" || kind == "compile" || kind == "declaration.block"
+
+/** Whether `expression` yields for the generator it is in: a `yield` not
+ *  inside a nested function, generator, task, thread, or defer. */
+fun bootstrapGeneratorHasYield(expression: BootstrapExpression): bool {
+    if (expression.kind == "yield") return true
+    if (bootstrapGeneratorIsLambda(expression.kind)) return false
+    var child = 0
+    while (child < expression.children.size) {
+        if (bootstrapGeneratorHasYield(expression.children[child])) return true
+        child = child + 1
+    }
+    false
+}
+
+/** Every `yield` of a generator body is a statement: of a block, a branch
+ *  of a statement `if` or `when`, or a loop body. The first one that is
+ *  not, or a `yield` in a `region`, as (begin, end); (-1, -1) when none. */
+fun bootstrapGeneratorMisplacedYield(
+    expression: BootstrapExpression,
+    statement: bool
+): array<int> {
+    if (bootstrapGeneratorIsLambda(expression.kind)) return [-1, -1]
+    if (expression.kind == "yield") {
+        if (!statement) return [expression.begin, expression.end]
+        return bootstrapGeneratorMisplacedYield(expression.children[0], false)
+    }
+    if (!bootstrapGeneratorHasYield(expression)) return [-1, -1]
+    if (expression.kind == "region") return [expression.begin, expression.end]
+    var child = 0
+    while (child < expression.children.size) {
+        val kind = expression.kind
+        val nested = statement && (kind == "block" ||
+            (kind == "if" && child > 0) ||
+            (kind == "when" && child > 0 && child % 2 == 0) ||
+            (kind == "while" && child == 1) ||
+            (kind == "do.while" && child == 0) ||
+            (kind == "for" && child == 1))
+        val found = bootstrapGeneratorMisplacedYield(
+            expression.children[child], nested
+        )
+        if (found[0] >= 0) return found
+        child = child + 1
+    }
+    [-1, -1]
+}
+
+class BootstrapGeneratorMachine(
+    val id: string,
+    val begin: int,
+    val end: int,
+    val states: array<BootstrapGeneratorState>,
+    var current: int,
+    val resumes: array<int>,
+    val slotNames: array<string>,
+    val slotInitializers: array<BootstrapExpression>,
+    val scopes: array<BootstrapGeneratorScope>,
+    var scope: int,
+    val loops: array<BootstrapGeneratorLoop>,
+    val envNames: array<string>,
+    val envTargets: array<string>,
+    val assumptions: array<BootstrapExpression>,
+    var error: string,
+    var errorBegin: int,
+    var errorEnd: int,
+    var counter: int
+) {
+    fun node(
+        kind: string,
+        text: string,
+        at: BootstrapExpression,
+        children: array<BootstrapExpression>
+    ): BootstrapExpression = BootstrapExpression(
+        kind, text, at.begin, at.end, children
+    )
+
+    fun identifier(name: string, at: BootstrapExpression): BootstrapExpression =
+        this.node("identifier", name, at, [])
+
+    fun missing(at: BootstrapExpression): BootstrapExpression =
+        this.node("missing", "", at, [])
+
+    fun fail(code: string, at: BootstrapExpression): void {
+        if (this.error == "") {
+            this.error = code
+            this.errorBegin = at.begin
+            this.errorEnd = at.end
+        }
+        return
+    }
+
+    fun stateSlot(): string = "#gs.${this.id}"
+
+    fun closeParameter(): string = "#gclose.${this.id}"
+
+    // States --------------------------------------------------------------
+
+    fun newState(): int {
+        this.states.append(BootstrapGeneratorState([]))
+        this.states.size - 1
+    }
+
+    fun emit(statement: BootstrapExpression): void {
+        // Code after a jump is unreachable but still compiled, as it is in
+        // the body: it gets a state nothing jumps to.
+        if (this.current < 0) this.current = this.newState()
+        this.states[this.current].statements.append(statement)
+        return
+    }
+
+    fun gotoNode(target: string, at: BootstrapExpression): BootstrapExpression =
+        this.node("generator.goto", target, at, [])
+
+    fun jump(target: int, at: BootstrapExpression): void {
+        if (this.current >= 0) this.emit(this.gotoNode("$target", at))
+        this.current = -1
+        return
+    }
+
+    fun mark(state: int, at: BootstrapExpression): void {
+        if (this.current >= 0) this.jump(state, at)
+        this.current = state
+        var index = 0
+        while (index + 1 < this.assumptions.size) {
+            this.emit(this.node(
+                "generator.assume", "", at,
+                [this.assumptions[index], this.assumptions[index + 1]]
+            ))
+            index = index + 2
+        }
+        return
+    }
+
+    fun assume(condition: BootstrapExpression, truth: bool): void {
+        this.assumptions.append(condition)
+        this.assumptions.append(this.node(
+            if (truth) "true" else "false",
+            if (truth) "true" else "false",
+            condition, []
+        ))
+        return
+    }
+
+    fun forget(mark: int): void {
+        if (this.assumptions.size > mark) this.assumptions.truncate(mark)
+        return
+    }
+
+    // Names ---------------------------------------------------------------
+
+    fun bind(name: string, target: string): void {
+        this.envNames.append(name)
+        this.envTargets.append(target)
+        return
+    }
+
+    fun unbind(mark: int): void {
+        if (this.envNames.size > mark) {
+            this.envNames.truncate(mark)
+            this.envTargets.truncate(mark)
+        }
+        return
+    }
+
+    fun lookup(name: string): string {
+        var index = this.envNames.size
+        while (index > 0) {
+            index = index - 1
+            if (this.envNames[index] == name) return this.envTargets[index]
+        }
+        name
+    }
+
+    fun newSlot(name: string, initializer: BootstrapExpression): string {
+        val slot = "$name#${this.id}.${this.counter}"
+        this.counter = this.counter + 1
+        this.slotNames.append(slot)
+        this.slotInitializers.append(initializer)
+        slot
+    }
+
+    // A slot whose value the scope drops at its end, after its defers.
+    fun scopedSlot(name: string, at: BootstrapExpression): string {
+        val slot = this.newSlot(name, this.missing(at))
+        this.scopes[this.scope].slots.append(slot)
+        slot
+    }
+
+    fun enterScope(): int {
+        val previous = this.scope
+        this.scopes.append(BootstrapGeneratorScope(previous, [], [], [], []))
+        this.scope = this.scopes.size - 1
+        if (previous >= 0) this.scopes[previous].children.append(this.scope)
+        previous
+    }
+
+    fun leaveScope(previous: int): void {
+        this.scope = previous
+        return
+    }
+
+    // What leaving `scope` runs: its registered defers, last first, then
+    // what its slots hold, last declared first.
+    fun scopeCleanup(scope: int, at: BootstrapExpression): array<BootstrapExpression> {
+        val statements: array<BootstrapExpression> = []
+        val found = this.scopes[scope]
+        var index = found.deferFlags.size
+        while (index > 0) {
+            index = index - 1
+            val flag = found.deferFlags[index]
+            statements.append(this.node("if", "", at, [
+                this.identifier(flag, at),
+                this.node("block", "", at, [
+                    this.node("assign", flag, at, [this.node("false", "false", at, [])]),
+                    found.deferBodies[index]
+                ]),
+                this.missing(at)
+            ]))
+        }
+        index = found.slots.size
+        while (index > 0) {
+            index = index - 1
+            statements.append(this.node(
+                "generator.drop", "", at,
+                [this.identifier(found.slots[index], at)]
+            ))
+        }
+        statements
+    }
+
+    // The cleanup of every scope from the current one out to `outer`
+    // (exclusive), innermost first.
+    fun exitCleanup(outer: int, at: BootstrapExpression): array<BootstrapExpression> {
+        val statements: array<BootstrapExpression> = []
+        var scope = this.scope
+        while (scope >= 0 && scope != outer) {
+            val cleanup = this.scopeCleanup(scope, at)
+            var index = 0
+            while (index < cleanup.size) {
+                statements.append(cleanup[index])
+                index = index + 1
+            }
+            scope = this.scopes[scope].parent
+        }
+        statements
+    }
+
+    // Closing: inner scopes before outer ones, later before earlier. Every
+    // step checks what is live, so one order serves every suspension point.
+    fun appendCloseCleanup(scope: int, var statements: array<BootstrapExpression>, at: BootstrapExpression): void {
+        val found = this.scopes[scope]
+        var child = found.children.size
+        while (child > 0) {
+            child = child - 1
+            this.appendCloseCleanup(found.children[child], statements, at)
+        }
+        val cleanup = this.scopeCleanup(scope, at)
+        var index = 0
+        while (index < cleanup.size) {
+            statements.append(cleanup[index])
+            index = index + 1
+        }
+        return
+    }
+
+    // A jump out of the cut scopes down to the loop's: inline when the jump
+    // is a statement of the machine, through a state of its own when it is
+    // inside a statement kept whole (that statement's own locals are left
+    // first, by the jump).
+    fun exitJump(loop: BootstrapGeneratorLoop, target: int, at: BootstrapExpression, inline: bool): BootstrapExpression {
+        val cleanup = this.exitCleanup(loop.scope, at)
+        if (cleanup.size == 0) return this.gotoNode("$target", at)
+        if (inline) {
+            cleanup.append(this.gotoNode("$target", at))
+            return this.node("block", "", at, cleanup)
+        }
+        val trampoline = this.newState()
+        var index = 0
+        while (index < cleanup.size) {
+            this.states[trampoline].statements.append(cleanup[index])
+            index = index + 1
+        }
+        this.states[trampoline].statements.append(this.gotoNode("$target", at))
+        this.gotoNode("$trampoline", at)
+    }
+
+    // Statements kept whole ------------------------------------------------
+
+    fun rewriteChildren(expression: BootstrapExpression, loopDepth: int, nested: bool): array<BootstrapExpression> {
+        val children: array<BootstrapExpression> = []
+        var child = 0
+        while (child < expression.children.size) {
+            children.append(this.rewrite(expression.children[child], loopDepth, nested))
+            child = child + 1
+        }
+        children
+    }
+
+    /** `expression` with the machine's names, and, outside nested
+     *  functions, its `return` and its `break`/`continue` of a cut loop as
+     *  jumps of the machine. */
+    fun rewrite(expression: BootstrapExpression, loopDepth: int, nested: bool): BootstrapExpression {
+        val kind = expression.kind
+        if (kind == "compile" || kind == "declaration.block" || kind == "type") return expression
+        if (kind == "identifier") {
+            return this.node(kind, this.lookup(expression.text), expression, [])
+        }
+        if (kind == "assign" || kind == "call") {
+            return this.node(
+                kind, this.lookup(expression.text), expression,
+                this.rewriteChildren(expression, loopDepth, nested)
+            )
+        }
+        if (!nested && kind == "return") return this.gotoNode("close", expression)
+        if (!nested && loopDepth == 0 && (kind == "break" || kind == "continue")) {
+            if (this.loops.size == 0) {
+                this.fail("generator.loop-control:${expression.kind}", expression)
+                return expression
+            }
+            val loop = this.loops[this.loops.size - 1]
+            return this.exitJump(
+                loop,
+                if (kind == "break") loop.breakState else loop.continueState,
+                expression, false
+            )
+        }
+        val mark = this.envNames.size
+        var result = expression
+        if (kind == "block") {
+            val children: array<BootstrapExpression> = []
+            var child = 0
+            while (child < expression.children.size) {
+                val statement = expression.children[child]
+                children.append(this.rewrite(statement, loopDepth, nested))
+                if (statement.kind == "local.val" || statement.kind == "local.var") {
+                    this.bind(statement.text, statement.text)
+                }
+                child = child + 1
+            }
+            result = this.node(kind, expression.text, expression, children)
+        } else if (kind == "for") {
+            val source = this.rewrite(expression.children[0], loopDepth, nested)
+            this.bind(expression.text, expression.text)
+            val body = this.rewrite(expression.children[1], loopDepth + 1, nested)
+            result = this.node(kind, expression.text, expression, [source, body])
+        } else if (kind == "while" || kind == "do.while") {
+            val children: array<BootstrapExpression> = []
+            var child = 0
+            while (child < expression.children.size) {
+                children.append(this.rewrite(expression.children[child], loopDepth + 1, nested))
+                child = child + 1
+            }
+            result = this.node(kind, expression.text, expression, children)
+        } else if (kind == "lambda" || kind == "lambda.move" || kind == "lambda.generator") {
+            val children: array<BootstrapExpression> = []
+            var child = 0
+            while (child + 1 < expression.children.size) {
+                children.append(expression.children[child])
+                this.bind(expression.children[child].text, expression.children[child].text)
+                child = child + 1
+            }
+            children.append(this.rewrite(
+                expression.children[expression.children.size - 1], 0, true
+            ))
+            result = this.node(kind, expression.text, expression, children)
+        } else if (bootstrapGeneratorIsLambda(kind)) {
+            result = this.node(
+                kind, expression.text, expression,
+                this.rewriteChildren(expression, 0, true)
+            )
+        } else {
+            result = this.node(
+                kind, expression.text, expression,
+                this.rewriteChildren(expression, loopDepth, nested)
+            )
+        }
+        this.unbind(mark)
+        result
+    }
+
+    // The cut statements ------------------------------------------------------
+
+    fun process(statement: BootstrapExpression): void {
+        val kind = statement.kind
+        if (kind == "local.val" || kind == "local.var") {
+            this.hoistLocal(statement)
+        } else if (kind == "defer") {
+            this.registerDefer(statement)
+        } else if (!bootstrapGeneratorHasYield(statement)) {
+            this.emit(this.rewrite(statement, 0, false))
+        } else if (kind == "yield") {
+            val resume = this.newState()
+            this.resumes.append(resume)
+            this.emit(this.node(
+                "generator.suspend", "$resume", statement,
+                [this.rewrite(statement.children[0], 0, false),
+                 this.identifier(this.stateSlot(), statement)]
+            ))
+            this.current = -1
+            this.mark(resume, statement)
+        } else if (kind == "block") {
+            this.processBlock(statement)
+        } else if (kind == "if") {
+            this.processIf(statement)
+        } else if (kind == "when") {
+            this.processWhen(statement)
+        } else if (kind == "while") {
+            this.processWhile(statement)
+        } else if (kind == "do.while") {
+            this.processDoWhile(statement)
+        } else if (kind == "for") {
+            this.processFor(statement)
+        } else this.fail("generator.yield-position:yield", statement)
+        return
+    }
+
+    fun hoistLocal(statement: BootstrapExpression): void {
+        val initializer = statement.children[0]
+        if (bootstrapGeneratorHasYield(initializer)) {
+            this.fail("generator.yield-position:yield", initializer)
+            return
+        }
+        if (initializer.kind == "delegate.initializer") {
+            // A delegated local keeps its delegate in the slot; reading and
+            // assigning the name call getValue/setValue on it.
+            val slot = this.scopedSlot(statement.text, statement)
+            this.emit(this.node(
+                "generator.declare", slot, statement,
+                [this.rewrite(initializer, 0, false), this.identifier(slot, statement)]
+            ))
+            this.bind(statement.text, slot)
+            return
+        }
+        val typed = statement.children.size > 1 && statement.children[1].text != "inferred"
+        val slot = this.scopedSlot(statement.text, statement)
+        if (initializer.kind == "missing") {
+            // `var x: T` with no value: assigned before it is read, so the
+            // slot only learns its type here.
+            this.bind(statement.text, slot)
+            if (typed) {
+                this.emit(this.node(
+                    "generator.retype", slot, statement,
+                    [this.identifier(slot, statement), statement.children[1]]
+                ))
+            }
+            return
+        }
+        val value = this.rewrite(initializer, 0, false)
+        this.bind(statement.text, slot)
+        val children: array<BootstrapExpression> = [value]
+        if (typed) children.append(statement.children[1])
+        this.emit(this.node("assign", slot, statement, children))
+        return
+    }
+
+    fun registerDefer(statement: BootstrapExpression): void {
+        val flag = this.newSlot("defer", this.node("false", "false", statement, []))
+        this.scopes[this.scope].deferFlags.append(flag)
+        this.scopes[this.scope].deferBodies.append(
+            this.rewrite(statement.children[0], 0, true)
+        )
+        this.emit(this.node("assign", flag, statement, [this.node("true", "true", statement, [])]))
+        return
+    }
+
+    fun processBlock(block: BootstrapExpression): void {
+        val previous = this.enterScope()
+        val names = this.envNames.size
+        val known = this.assumptions.size
+        var last = -1
+        var index = 0
+        while (index < block.children.size) {
+            if (bootstrapGeneratorHasYield(block.children[index])) last = index
+            index = index + 1
+        }
+        index = 0
+        while (index < block.children.size) {
+            val statement = block.children[index]
+            if (index > last && this.scopes[this.scope].deferFlags.size == 0) {
+                // The rest of the block has no `yield`: it stays a block,
+                // with its own locals and defers.
+                val rest: array<BootstrapExpression> = []
+                while (index < block.children.size) {
+                    rest.append(block.children[index])
+                    index = index + 1
+                }
+                this.emit(this.rewrite(
+                    BootstrapExpression("block", "", rest[0].begin, block.end, rest),
+                    0, false
+                ))
+            } else {
+                this.process(statement)
+                val after = bootstrapConditionAfterIf(statement)
+                if (after != "" && this.error == "") {
+                    val condition = this.rewrite(statement.children[0], 0, false)
+                    this.assume(condition, after == "true")
+                    this.emit(this.node(
+                        "generator.assume", "", statement,
+                        [condition, this.assumptions[this.assumptions.size - 1]]
+                    ))
+                }
+                index = index + 1
+            }
+        }
+        val cleanup = this.scopeCleanup(this.scope, block)
+        index = 0
+        while (index < cleanup.size) {
+            this.emit(cleanup[index])
+            index = index + 1
+        }
+        this.forget(known)
+        this.unbind(names)
+        this.leaveScope(previous)
+        return
+    }
+
+    // A branch or loop body that is not a block is a scope of its own too.
+    fun processBody(body: BootstrapExpression): void {
+        if (body.kind == "block") this.processBlock(body)
+        else this.processBlock(BootstrapExpression("block", "", body.begin, body.end, [body]))
+        return
+    }
+
+    fun processIf(statement: BootstrapExpression): void {
+        val condition = this.rewrite(statement.children[0], 0, false)
+        val thenState = this.newState()
+        val elseState = this.newState()
+        val endState = this.newState()
+        val otherwise = statement.children[2].kind != "missing"
+        this.emit(this.node("generator.branch", "", statement, [
+            condition,
+            this.gotoNode("$thenState", statement),
+            this.gotoNode(if (otherwise) "$elseState" else "$endState", statement)
+        ]))
+        this.current = -1
+        val known = this.assumptions.size
+        this.assume(condition, true)
+        this.mark(thenState, statement)
+        this.processBody(statement.children[1])
+        this.forget(known)
+        this.jump(endState, statement)
+        if (otherwise) {
+            this.assume(condition, false)
+            this.mark(elseState, statement)
+            this.processBody(statement.children[2])
+            this.forget(known)
+            this.jump(endState, statement)
+        }
+        this.mark(endState, statement)
+        return
+    }
+
+    fun processWhen(statement: BootstrapExpression): void {
+        val children: array<BootstrapExpression> = [
+            this.rewrite(statement.children[0], 0, false)
+        ]
+        val bodies: array<BootstrapExpression> = []
+        val targets: array<int> = []
+        var branch = 1
+        while (branch + 1 < statement.children.size) {
+            val body = statement.children[branch + 1]
+            var target = -1
+            var known = 0
+            while (known < bodies.size) {
+                if (bodies[known].begin == body.begin && bodies[known].end == body.end &&
+                    bodies[known].kind == body.kind) target = targets[known]
+                known = known + 1
+            }
+            if (target < 0) {
+                target = this.newState()
+                bodies.append(body)
+                targets.append(target)
+            }
+            val match = statement.children[branch]
+            children.append(
+                if (match.kind == "missing") match else this.rewrite(match, 0, false)
+            )
+            children.append(this.gotoNode("$target", body))
+            branch = branch + 2
+        }
+        val endState = this.newState()
+        this.emit(this.node("when", "", statement, children))
+        this.jump(endState, statement)
+        var index = 0
+        while (index < bodies.size) {
+            this.mark(targets[index], bodies[index])
+            this.processBody(bodies[index])
+            this.jump(endState, statement)
+            index = index + 1
+        }
+        this.mark(endState, statement)
+        return
+    }
+
+    fun processWhile(statement: BootstrapExpression): void {
+        val conditionState = this.newState()
+        val bodyState = this.newState()
+        val endState = this.newState()
+        this.mark(conditionState, statement)
+        val condition = this.rewrite(statement.children[0], 0, false)
+        this.emit(this.node("generator.branch", "", statement, [
+            condition,
+            this.gotoNode("$bodyState", statement),
+            this.gotoNode("$endState", statement)
+        ]))
+        this.current = -1
+        this.mark(bodyState, statement)
+        this.loops.append(BootstrapGeneratorLoop(endState, conditionState, this.scope))
+        this.processBody(statement.children[1])
+        this.loops.truncate(this.loops.size - 1)
+        this.jump(conditionState, statement)
+        this.mark(endState, statement)
+        return
+    }
+
+    fun processDoWhile(statement: BootstrapExpression): void {
+        val bodyState = this.newState()
+        val conditionState = this.newState()
+        val endState = this.newState()
+        this.mark(bodyState, statement)
+        this.loops.append(BootstrapGeneratorLoop(endState, conditionState, this.scope))
+        this.processBody(statement.children[0])
+        this.loops.truncate(this.loops.size - 1)
+        this.jump(conditionState, statement)
+        this.mark(conditionState, statement)
+        this.emit(this.node("generator.branch", "", statement, [
+            this.rewrite(statement.children[1], 0, false),
+            this.gotoNode("$bodyState", statement),
+            this.gotoNode("$endState", statement)
+        ]))
+        this.current = -1
+        this.mark(endState, statement)
+        return
+    }
+
+    fun processFor(statement: BootstrapExpression): void {
+        val previous = this.enterScope()
+        val names = this.envNames.size
+        val source = statement.children[0]
+        val conditionState = this.newState()
+        val bodyState = this.newState()
+        val stepState = this.newState()
+        val endState = this.newState()
+        val range = source.kind == "range.until" || source.kind == "range.closed"
+        var index = ""
+        var limit = ""
+        var iterated = ""
+        if (range) {
+            // `for (i in a until b)` counts in place: both bounds once.
+            index = this.scopedSlot("index", statement)
+            limit = this.scopedSlot("limit", statement)
+            this.emit(this.node("assign", index, statement, [this.rewrite(source.children[0], 0, false)]))
+            this.emit(this.node("assign", limit, statement, [this.rewrite(source.children[1], 0, false)]))
+        } else {
+            iterated = this.scopedSlot("source", statement)
+            index = this.scopedSlot("index", statement)
+            limit = this.scopedSlot("limit", statement)
+            this.emit(this.node("generator.forinit", "", statement, [
+                this.rewrite(source, 0, false),
+                this.identifier(iterated, statement),
+                this.identifier(index, statement),
+                this.identifier(limit, statement)
+            ]))
+        }
+        val slots: array<BootstrapExpression> = [
+            this.identifier(iterated, statement),
+            this.identifier(index, statement),
+            this.identifier(limit, statement)
+        ]
+        this.mark(conditionState, statement)
+        val more = if (range) this.node(
+            if (source.kind == "range.closed") "<=" else "<",
+            if (source.kind == "range.closed") "<=" else "<",
+            statement,
+            [this.identifier(index, statement), this.identifier(limit, statement)]
+        ) else this.node("generator.fornext", "", statement, slots)
+        this.emit(this.node("generator.branch", "", statement, [
+            more,
+            this.gotoNode("$bodyState", statement),
+            this.gotoNode("$endState", statement)
+        ]))
+        this.current = -1
+        this.mark(bodyState, statement)
+        // The element is not dropped: an array's is borrowed.
+        val element = this.newSlot(statement.text, this.missing(statement))
+        this.bind(statement.text, element)
+        this.emit(this.node("assign", element, statement, [
+            if (range) this.identifier(index, statement)
+            else this.node("generator.forvalue", "", statement, slots)
+        ]))
+        this.loops.append(BootstrapGeneratorLoop(endState, stepState, this.scope))
+        this.processBody(statement.children[1])
+        this.loops.truncate(this.loops.size - 1)
+        this.jump(stepState, statement)
+        this.mark(stepState, statement)
+        if (range) {
+            if (source.kind == "range.closed") {
+                // `a..b` stops at b itself, so b == i64 max cannot overflow.
+                val more2 = this.newState()
+                this.emit(this.node("generator.branch", "", statement, [
+                    this.node("==", "==", statement, [
+                        this.identifier(index, statement), this.identifier(limit, statement)
+                    ]),
+                    this.gotoNode("$endState", statement),
+                    this.gotoNode("$more2", statement)
+                ]))
+                this.current = -1
+                this.mark(more2, statement)
+            }
+            this.emit(this.node("assign", index, statement, [
+                this.node("+", "+", statement, [
+                    this.identifier(index, statement),
+                    this.node("integer", "1", statement, [])
+                ])
+            ]))
+        } else this.emit(this.node("generator.forstep", "", statement, slots))
+        this.jump(conditionState, statement)
+        this.mark(endState, statement)
+        val cleanup = this.scopeCleanup(this.scope, statement)
+        var item = 0
+        while (item < cleanup.size) {
+            this.emit(cleanup[item])
+            item = item + 1
+        }
+        this.unbind(names)
+        this.leaveScope(previous)
+        return
+    }
+
+    // The whole machine ------------------------------------------------------
+
+    fun expand(origin: BootstrapExpression, owned: array<string>): BootstrapExpression {
+        val body = origin.children[0]
+        val misplaced = bootstrapGeneratorMisplacedYield(body, true)
+        if (misplaced[0] >= 0) {
+            this.fail("generator.yield-position:yield", BootstrapExpression(
+                "yield", "", misplaced[0], misplaced[1], []
+            ))
+        }
+        val stateSlot = this.stateSlot()
+        // The captures the body owns: moved into slots, dropped on closing.
+        val rootScope = this.enterScope()
+        var capture = 0
+        while (capture < owned.size) {
+            val name = owned[capture]
+            val slot = this.newSlot(name, this.node(
+                "call", "move", origin, [this.identifier(name, origin)]
+            ))
+            this.scopes[this.scope].slots.append(slot)
+            this.bind(name, slot)
+            capture = capture + 1
+        }
+        val entry = this.newState()
+        this.mark(entry, body)
+        this.processBody(body)
+        this.current = -1
+        // Falling off the end of the body is closing it.
+        val states: array<BootstrapExpression> = [
+            this.identifier(stateSlot, body),
+            this.identifier(this.closeParameter(), body)
+        ]
+        var index = 0
+        while (index < this.states.size) {
+            val count = this.states[index].statements.size
+            if (count == 0 ||
+                this.states[index].statements[count - 1].kind != "generator.goto") {
+                this.states[index].statements.append(this.gotoNode("close", body))
+            }
+            states.append(BootstrapExpression(
+                "block", "", body.begin, body.end, this.states[index].statements
+            ))
+            index = index + 1
+        }
+        val closing: array<BootstrapExpression> = []
+        this.appendCloseCleanup(0, closing, body)
+        closing.append(this.node("generator.return", "false", body, []))
+        states.append(BootstrapExpression("block", "", body.begin, body.end, closing))
+        var resumes = "0"
+        index = 0
+        while (index < this.resumes.size) {
+            resumes = "$resumes,${this.resumes[index]}"
+            index = index + 1
+        }
+        val step = this.node("lambda", "", origin, [
+            this.node("lambda.parameter", this.closeParameter(), origin, [
+                this.node("type", "bool", origin, [])
+            ]),
+            this.node("block", "", body, [
+                this.node("generator.states", resumes, body, states)
+            ])
+        ])
+        val statements: array<BootstrapExpression> = [
+            this.node("generator.slot", stateSlot, origin, [
+                this.node("integer", "0", origin, [])
+            ])
+        ]
+        index = 0
+        while (index < this.slotNames.size) {
+            statements.append(this.node(
+                "generator.slot", this.slotNames[index], origin,
+                [this.slotInitializers[index]]
+            ))
+            index = index + 1
+        }
+        statements.append(this.node("generator.machine", stateSlot, origin, [step]))
+        this.leaveScope(rootScope)
+        this.node("block", "", origin, statements)
+    }
+}
+
+/** The state machine of `generator` (a `generator { body }` expression).
+ *  `owned` names the captures the body owns (affine values it moves in).
+ *  A body the machine cannot express reports `error` at its span. */
+fun bootstrapGeneratorExpand(
+    origin: BootstrapExpression,
+    owned: array<string>
+): BootstrapGeneratorExpansion {
+    val machine = BootstrapGeneratorMachine(
+        "${origin.begin}", origin.begin, origin.end,
+        [], -1, [], [], [], [], -1, [], [], [], [], "", -1, -1, 0
+    )
+    val expression = machine.expand(origin, owned)
+    BootstrapGeneratorExpansion(
+        expression, machine.error, machine.errorBegin, machine.errorEnd
+    )
+}
+
+/** The state of a `generator.goto`/`generator.suspend` target text: a
+ *  number, or `close` (the closing code, after every state). */
+fun bootstrapGeneratorTarget(text: string, stateCount: int): int =
+    if (text == "close") stateCount - 1 else bootstrapDecimalIndex(text)
+
+/** The state blocks of a `generator.states` node, the closing code last. */
+fun bootstrapGeneratorStateBlocks(states: BootstrapExpression): array<BootstrapExpression> {
+    val blocks: array<BootstrapExpression> = []
+    var index = 2
+    while (index < states.children.size) {
+        blocks.append(states.children[index])
+        index = index + 1
+    }
+    blocks
+}
+
+/** The resume states listed in a `generator.states` text: "0,3,5". */
+fun bootstrapGeneratorResumeStates(text: string): array<int> {
+    val states: array<int> = []
+    var begin = 0
+    var index = 0
+    while (index <= text.size) {
+        if (index == text.size || text[index] == 44) {
+            if (index > begin) states.append(bootstrapDecimalIndex(text.slice(begin, index)))
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    states
+}

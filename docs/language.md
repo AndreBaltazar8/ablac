@@ -1403,7 +1403,9 @@ These have their own page, [concurrency.md](concurrency.md). In brief:
   ends; several `defer`s run last-registered first
   ([details](concurrency.md#defer)).
 - `generator { ... yield value ... }` produces a `Generator<T>` for a `for`
-  loop ([details](concurrency.md#generators)).
+  loop. It is lazy: the body runs as far as the next `yield` each time the
+  loop asks, and leaving the loop early closes it, running its `defer`s
+  ([details](concurrency.md#generators)).
 - `task { ... }` is a cooperative coroutine (`Task<T>`); `await` runs it
   and returns its result ([details](concurrency.md#tasks)).
 - `thread { ... }` starts an OS thread (`Thread<T>`); `await` joins it. A
