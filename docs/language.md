@@ -513,6 +513,24 @@ fun main {
 > still see the nullable type (`string.interpolation:nullable:string` in
 > `else -> "got $s"`). Use `if (s == null) ... else ...` for now.
 
+In a `when` on a nullable name, the arms after its `null ->` arm see the name
+not null; an arm sharing the `null` arm's body (`"b", null -> ...`) does not:
+
+```abla
+import "abla/io"
+
+fun label(name: string?): string = when (name) {
+    null -> "nobody"
+    else -> "${name.size} letters"
+}
+
+fun main {
+    println("${label(null)}, ${label("Ada")}")
+}
+// output:
+// nobody, 3 letters
+```
+
 ### Nominal types
 
 `type Name = underlying` declares a distinct name for a primitive type. It
