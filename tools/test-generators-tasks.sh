@@ -19,6 +19,15 @@ check() {
     [[ $status -eq 0 && $output == "$2" ]] || { echo "$1: status $status, output '$output'"; exit 1; }
 }
 
+# The same program through `ablac run` (the in-process JIT).
+check_run() {
+    set +e
+    output=$("$compiler" run "$project_root/tests/cases/modules/$1.ab" 2>&1)
+    status=$?
+    set -e
+    [[ $status -eq 0 && $output == "$2" ]] || { echo "$1 (run): status $status, output '$output'"; exit 1; }
+}
+
 reject() {
     set +e
     diagnostics=$("$compiler" build "$project_root/tests/cases/modules/$1.ab" \
@@ -30,6 +39,8 @@ reject() {
 
 check generator-nested 114
 check task-array-move 6
+check generator-task-capture $'1\n4\nfinished 4'
+check_run generator-task-capture $'1\n4\nfinished 4'
 reject task-array-borrow "ownership.await-borrow:each"
 reject task-array-borrow-move "move.local"
 echo "generators and tasks: nesting, yield precedence, borrowed task elements"
