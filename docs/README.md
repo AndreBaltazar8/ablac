@@ -47,7 +47,8 @@ in seven short sections of runnable programs.
 [reliability-roadmap.md](reliability-roadmap.md),
 [compile-effect-path-performance.md](compile-effect-path-performance.md) and
 [original-audit.md](original-audit.md) record the state and the plans of the
-compiler itself.
+compiler itself. [coverage.md](coverage.md) tracks which features are
+documented and tested.
 
 ## Examples
 
