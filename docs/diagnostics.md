@@ -51,6 +51,7 @@ only its parse errors.
 | `E_PARSE_PARAMETER_SEPARATOR`, `E_PARSE_ARGUMENT_SEPARATOR`, `E_PARSE_ARRAY_SEPARATOR` | a missing `,` |
 | `E_PARSE_UNCLOSED_DELIMITER` | an unclosed `(`, `[` or `{` |
 | `E_PARSE_STRING_PART` | a malformed string or template |
+| `E_PARSE_EXTENSION_RECEIVER` | an extension's receiver type isn't followed by `.name` (e.g. an unclosed `array<int`) |
 | `E_PARSE_SAFE_CALL`, `E_PARSE_ELVIS` | Kotlin's `?.` or `?:`: Abla has neither; check `x != null` (which narrows a `val`) or write `if (x != null) x else fallback` |
 | `E_PARSE_INVALID_ESCAPE` | an unknown backslash escape in a string, a `\x` without 2 hex digits, or a `\u` that isn't a Unicode code point ([language.md](language.md#lexical-structure)) |
 | `E_PARSE_ASSIGNMENT_TARGET` | the left side of `=` can't be assigned |

@@ -596,9 +596,10 @@ fun main {
 
 ### Extension functions
 
-`fun Type.name(...)` adds a function that is called like a method. Inside
-it, `this` is the receiver. Fields of the receiver are currently read through
-`this`:
+`fun Type.name(...)` adds a function that is called like a method. The
+receiver may be any type: a class, a scalar, `array<int>`, `Map<string, int>`
+or a nullable `string?`. Inside it, `this` is the receiver. Fields of the
+receiver are currently read through `this`:
 
 ```abla
 import "abla/io"
@@ -607,12 +608,18 @@ class Point(val x: int, val y: int)
 
 fun Point.length2(): int = this.x * this.x + this.y * this.y
 fun int.isEven(): bool = this % 2 == 0
+fun array<int>.total(): int {
+    var sum = 0
+    for (value in this) sum = sum + value
+    sum
+}
 
 fun main {
-    println("${Point(3, 4).length2()} ${10.isEven()}")
+    val values = [1, 2, 3]
+    println("${Point(3, 4).length2()} ${10.isEven()} ${values.total()}")
 }
 // output:
-// 25 true
+// 25 true 6
 ```
 
 > Known issue (being fixed by ablac-frontend): inside an extension function,

@@ -489,10 +489,13 @@ class BootstrapParser(
                 []
             ))
             this.skipSeparators()
-            if (!this.consume(",") && !this.at(")")) this.fail(
-                "PARAMETER_SEPARATOR",
-                "expected `,` or `)` after parameter"
-            )
+            if (!this.consume(",") && !this.at(")")) {
+                this.fail(
+                    "PARAMETER_SEPARATOR",
+                    "expected `,` or `)` after parameter"
+                )
+                if (!this.at("end") && !this.at(")")) this.position = this.position + 1
+            }
             this.skipSeparators()
         }
         this.expect(")")
@@ -1216,7 +1219,8 @@ class BootstrapParser(
         } else if (this.consume("[")) {
             val elements: array<BootstrapExpression> = []
             this.skipSeparators()
-            while (!this.at("]") && !this.at("end")) {
+            var open = true
+            while (open && !this.at("]") && !this.at("end")) {
                 elements.append(this.parseExpression())
                 this.skipSeparators()
                 if (!this.consume(",") && !this.at("]")) {
@@ -1224,6 +1228,10 @@ class BootstrapParser(
                         "ARRAY_SEPARATOR",
                         "expected `,` or `]` after array element"
                     )
+                    // Another construct's closer ends the list; anything
+                    // else is skipped, so the loop always moves on.
+                    if (this.at(")") || this.at("}")) open = false
+                    else if (!this.at("end")) this.position = this.position + 1
                 }
                 this.skipSeparators()
             }
@@ -1257,7 +1265,8 @@ class BootstrapParser(
                 val arguments: array<BootstrapExpression> = []
                 this.position = this.position + 1
                 this.skipSeparators()
-                while (!this.at(")") && !this.at("end")) {
+                var open = true
+                while (open && !this.at(")") && !this.at("end")) {
                     if (this.at("identifier") &&
                         this.tokens[this.position + 1].kind == "=") {
                         val name = this.tokens[this.position]
@@ -1278,6 +1287,8 @@ class BootstrapParser(
                             "ARGUMENT_SEPARATOR",
                             "expected `,` or `)` after argument"
                         )
+                        if (this.at("]") || this.at("}")) open = false
+                        else if (!this.at("end")) this.position = this.position + 1
                     }
                     this.skipSeparators()
                 }
@@ -1792,8 +1803,54 @@ class BootstrapParser(
         this.expect("identifier")
         var declarationName = bootstrapTokenText(this.source, nameToken)
         var extensionOwner = ""
+        // `fun array<int>.total()`, `fun string?.orEmpty()`: the receiver is
+        // any type, read up to the `.` before the method name.
+        var receiverType = declarationName
+        if (kind == "fun" && (this.at("<") || this.at("?"))) {
+            var angles = 0
+            var more = true
+            while (more && !this.at("end")) {
+                if (angles == 0 && this.at(".")) {
+                    more = false
+                } else if (angles == 0 && !this.at("<") && !this.at("?")) {
+                    more = false
+                } else if (angles > 0 && (this.at("newline") ||
+                           this.at("{") || this.at("=") || this.at(")"))) {
+                    more = false
+                } else {
+                    if (this.at("<")) angles = angles + 1
+                    if (this.at(">")) angles = angles - 1
+                    if (this.at(">>")) angles = angles - 2
+                    if (this.at(">>>")) angles = angles - 3
+                    receiverType = "$receiverType${bootstrapTokenText(this.source, this.tokens[this.position])}"
+                    this.position = this.position + 1
+                }
+            }
+            if (!this.at(".")) {
+                this.fail(
+                    "EXTENSION_RECEIVER",
+                    "expected `.` and the method name after the extension's receiver type `$receiverType`"
+                )
+                // Skip the rest of the declaration (its line, or its braced
+                // body), so one mistake is one error.
+                var braces = 0
+                var skipping = true
+                while (skipping && !this.at("end")) {
+                    if (braces == 0 && this.at("newline")) {
+                        skipping = false
+                    } else {
+                        if (this.at("{")) braces = braces + 1
+                        if (this.at("}")) {
+                            braces = braces - 1
+                            if (braces == 0) skipping = false
+                        }
+                        this.position = this.position + 1
+                    }
+                }
+            }
+        }
         if (kind == "fun" && this.consume(".")) {
-            extensionOwner = declarationName
+            extensionOwner = receiverType
             nameToken = this.tokens[this.position]
             this.expect("identifier")
             declarationName = bootstrapTokenText(this.source, nameToken)

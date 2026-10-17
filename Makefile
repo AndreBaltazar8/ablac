@@ -170,6 +170,7 @@ test: ablac
 	tools/test-lowered-ir-cache.sh $(COMPILER)
 	tools/test-determinism.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
+	tools/test-extension-receivers.sh $(COMPILER)
 
 check: test self-rebuild
 
