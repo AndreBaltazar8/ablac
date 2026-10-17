@@ -166,6 +166,9 @@ fun main {
 - `await` applies to a `Task` or a `Thread` (`await.type`).
 - A task's result can't be a borrowed view or an affine value
   (`task.affine-result`).
+- A panic inside a task ends the whole program at once, exactly as on the
+  main thread: the message goes to standard error and the exit status is
+  101. `await` doesn't catch it.
 
 ## Threads
 
@@ -209,6 +212,14 @@ A thread shares nothing by accident:
 - It can't assign to a captured variable (`thread.capture-mutation`) or to
   a mutable top-level `var` (`thread.mutable-global`).
 - Its result can't be a borrowed view or an affine value.
+
+A panic inside a thread also ends the whole process at once, with the
+message on standard error and exit status 101; other threads don't keep
+running, and `await` doesn't catch it.
+
+> Known issue (being fixed by ct-rt): today a panic on any thread or task
+> (an index out of bounds, for example) exits with status 133 and prints no
+> reason under `ablac run`.
 
 ```abla error
 fun main {

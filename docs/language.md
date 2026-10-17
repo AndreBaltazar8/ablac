@@ -368,6 +368,11 @@ fun main {
 
 - An array literal's elements must share one type (`array.element-type`).
   An empty literal needs a declared type.
+
+> Known issue (being fixed by ablac-frontend): the constructor forms
+> `array<int>()` and `Map<string, int>()` are going to mean the same as
+> `val x: array<int> = []` and `val m: Map<string, int> = Map()`. Today they
+> are parse errors; declare the type on the binding instead.
 - `append(value)` adds at the end, `truncate(n)` keeps the first `n`
   elements (`n` beyond the size keeps all), `clear()` removes all, and
   `filledArray(count, value)` creates a filled array. A negative count for
@@ -463,6 +468,12 @@ fun main {
   check: copy them into a `val`, as `sum` does.
 - Using a nullable value as non-null is an error that names the type, such
   as `member:nullable:Node.value` or `arithmetic.type@..:nullable:i64:i64`.
+- In a `when` whose subject is a nullable `val` or parameter, the arms after
+  a `null ->` arm see the non-null type.
+
+> Known issue (being fixed by ct-infer): today the arms after `null ->`
+> still see the nullable type (`string.interpolation:nullable:string` in
+> `else -> "got $s"`). Use `if (s == null) ... else ...` for now.
 
 ### Nominal types
 
@@ -508,6 +519,12 @@ fun main {
 closure does with its captures
 ([ownership.md](ownership.md#closures-and-ownership)). Generic arguments are
 written `Type<A, B>`.
+
+Only the built-in types take type arguments (`array`, `Map`, `Task`,
+`Shared`, the `Fn` family and the others listed above). A program can't
+declare its own generic functions or classes: `fun <T> first(...)` and
+`class Box<T>(...)` are parse errors. Like implementing interfaces, this is
+an open language-design item.
 
 ### `void` and `never`
 

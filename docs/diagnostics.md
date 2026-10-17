@@ -37,6 +37,12 @@ usually follow from an earlier one.
 When several errors are reported, fix the first one and build again: later
 errors often follow from it.
 
+> Known issue (being fixed by coordinator): a parse error should stop the
+> build after the parser, so that only parse errors print. Today the later
+> phases still run, so a parse error can be followed by `unknown`-type
+> semantic errors and `E_IR_*`/`E_LLVM_*` errors (some printed before it).
+> Fix the first `E_PARSE_*` error and ignore the rest.
+
 ## Parser: `E_PARSE_*`
 
 A parse error stops the build after the parser, so a file with one reports
@@ -74,7 +80,7 @@ only its parse errors.
 | `method.unknown:<T>.<m>` | `T` has no method `m` (a help line names the standard module to import when one declares it, e.g. `abla/text` for `string.trim`) |
 | `function.argument:<f>@<offset>:<expected>:<actual>`, `method.argument`, `constructor.argument` | an argument of the wrong type |
 | `function.result:<f>:<declared>:<actual>`, `method.result` | the body's value doesn't match the declared result type ([language.md](language.md#void-and-never)) |
-| `return.type` | a `return` value doesn't match the result type |
+| `return.type` | a `return` value doesn't match the result type. Known issue (being fixed by coordinator): it will name the function and both types (`return.type:<f>:<expected>:<found>`), with a help line when the value is a closure that changes its captures (declare the result `FnMut() -> T`) |
 | `member:<Type>.<name>` | no such property or method; `member:nullable:...` means the receiver may be `null` |
 | `local.initializer:<name>` | an initializer doesn't match the declared type |
 | `assignment.type:<name>@<offset>` | an assigned value doesn't match the variable's type |

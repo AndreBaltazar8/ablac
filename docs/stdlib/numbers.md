@@ -55,8 +55,13 @@ on every target and at compile time.
 |---|---|
 | `f64FromInt(n)`, `f64ToInt(x)` | `int` and `f64` (`f64ToInt` truncates toward zero, saturates out-of-range values to the `int` limits, and gives 0 for NaN) |
 | `f64ToF32(x)`, `f32ToF64(x)` | between float widths |
-| `f32FromI32`, `f32FromU32`, `f32ToI32`, `f32ToU32` | between `f32` and 32-bit integers |
+| `f32FromI32`, `f32FromU32`, `f32ToI32`, `f32ToU32` | between `f32` and 32-bit integers; `f32ToI32`/`f32ToU32` truncate toward zero, saturate and give 0 for NaN, like `f64ToInt` |
 | `f64ToBits(x)`, `f64FromBits(n)`, `f32ToBits(x)`, `f32FromBits(n)` | to and from IEEE bit patterns |
+
+> Known issue (being fixed by ablac-backend): today `f32ToI32` and
+> `f32ToU32` give arbitrary values at run time for NaN and out-of-range
+> input (saturated values under `#`). Check `isNaN` and the range before
+> converting.
 
 ## `abla/bits` and `abla/integer`
 
