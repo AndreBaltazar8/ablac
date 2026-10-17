@@ -153,9 +153,6 @@ test: ablac
 	tools/test-field-shadowing.sh $(COMPILER)
 	tools/test-compile-eval-jit.sh $(COMPILER)
 	tools/test-compile-native.sh $(COMPILER)
-	tools/test-compile-time-scalars.sh $(COMPILER)
-	tools/test-integer-narrowing.sh $(COMPILER)
-	tools/test-resource-drop-link.sh $(COMPILER)
 	tools/test-optimize-o1.sh $(COMPILER)
 	tools/test-map.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
@@ -182,6 +179,9 @@ test: ablac
 	tools/test-when-null.sh $(COMPILER)
 	tools/test-init-order.sh $(COMPILER)
 	tools/test-extension-receivers.sh $(COMPILER)
+	tools/test-compile-time-scalars.sh $(COMPILER)
+	tools/test-integer-narrowing.sh $(COMPILER)
+	tools/test-resource-drop-link.sh $(COMPILER)
 
 check: test self-rebuild
 
