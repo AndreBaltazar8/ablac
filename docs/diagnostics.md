@@ -39,6 +39,9 @@ errors often follow from it.
 
 ## Parser: `E_PARSE_*`
 
+A parse error stops the build after the parser, so a file with one reports
+only its parse errors.
+
 | Code | Message |
 |---|---|
 | `E_PARSE_EXPECTED_TOKEN` | expected token `X`, found `Y` |
