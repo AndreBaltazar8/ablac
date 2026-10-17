@@ -438,18 +438,25 @@ error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past 50000000 steps (an en
 `ABLA_EVAL_STEP_LIMIT=<n>` lowers the limit for a build (it never raises
 it), which is useful in tests.
 
-Recursion at compile time is bounded by the compiler's own stack: about 3,000
-to 4,000 nested calls with the default stack. Deeper recursion stops with
-`E_EVAL_STACK_DEPTH`, reported once, and `ABLA_EVAL_DEPTH_LIMIT=<n>` lowers
-the limit. When compile-time code runs on the coming JIT tier it recurses as
-deep as at run time, and the `auto` mode moves an evaluation that hits the
-depth limit onto the JIT.
+Recursion at compile time is bounded by the compiler's own stack. The
+evaluator allows one nesting level per 4 KB of stack after a 1 MB reserve,
+and a call takes a few levels (about three for a simple recursive function).
+The `ablac` launcher gives the compiler the largest stack the system allows:
+on macOS that is 64 MB, or 16,124 levels, about 5,000 nested calls of a small
+function. A plain 8 MB stack allows about 1,790 levels. Deeper recursion
+stops with one error that names the limit, instead of crashing the compiler:
 
-> Known issue (being fixed by coordinator): today deeper compile-time
-> recursion crashes the compiler (exit status 139) instead of reporting
-> `E_EVAL_STACK_DEPTH`. Memory introspection (`memoryLiveBytes`,
-`memoryCollect`, ...) has no meaning inside the compiler, and is not
-available at compile time.
+```text
+error[E_EVAL_STACK_DEPTH]: compile-time evaluation nested deeper than 16124 levels (unbounded recursion, or recursion deeper than the compiler's stack allows)
+```
+
+`ABLA_EVAL_DEPTH_LIMIT=<n>` lowers the limit (it never raises it), and
+`ABLA_MAX_STACK_KB` sets the launcher's stack. When compile-time code runs
+on the coming JIT tier it recurses as deep as at run time, and the `auto`
+mode moves an evaluation that hits the depth limit onto the JIT.
+
+Memory introspection (`memoryLiveBytes`, `memoryCollect`, ...) has no
+meaning inside the compiler, and is not available at compile time.
 
 ## Declaration blocks
 

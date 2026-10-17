@@ -63,8 +63,10 @@ fun main {
 
 - A `defer` is registered when execution reaches it. The last one above is
   never reached on the `return items.size` path, so it doesn't run there.
-- The body must be a block that produces `void` (`defer.result`), and it
-  can't `return`, `break` or `continue` out of itself (`defer.control`).
+- The body must be a block that produces `void` (`defer.result`); a final
+  assignment such as `defer { depth -= 1 }` counts as a statement, as at the
+  end of a `void` function. It can't `return`, `break` or `continue` out of
+  itself (`defer.control`).
 - A `defer` inside a loop body runs at the end of every iteration, including
   one cut short by `continue` or `break`.
 - A panic ends the program without running pending `defer`s.

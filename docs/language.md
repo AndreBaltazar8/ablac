@@ -165,6 +165,11 @@ lines")
 // concat
 ```
 
+`$name` takes the longest identifier after the `$` and nothing more, so
+`"$a.b"` inserts `a` followed by the text `.b`; use `${a.b}` for a member.
+A `$` that isn't followed by a letter, `_` or `{` is ordinary text (`"$5"`,
+`"cost: $"`), and `\$` always is.
+
 A template may insert strings, integers of any width, `bool`, and
 `f64`/`f32` (with `import "abla/float/text"`; without it the error says so).
 Other types, `char` included, are `string.interpolation:<type>`.
@@ -735,11 +740,6 @@ fun main {
   compile-time declaration block, not a lambda
   ([compile-time.md](compile-time.md#declaration-blocks)).
 
-> Known issue (being fixed by ct-parity): today a call through a parameter
-> or local that has the same name as a top-level function calls the
-> top-level function instead (`function.arity:<name>`). Give such callbacks
-> distinct names for now.
-
 > Known issue (being fixed by ablac-frontend): today a call drops a callee
 > that isn't a plain name. `adder(2)(3)` silently calls `adder(3)`,
 > `handlers[0]()` has an unknown type, and `button.onClick(event)` on a
@@ -794,9 +794,6 @@ fun main {
   `noescape fun`). Properties belong in the constructor
   (`E_PARSE_CLASS_MEMBER`).
 
-> Known issue (being fixed by ct-parity): today a method can't call another
-> method of its class by name (`area()` reports `call.target:area`; write
-> `this.area()`).
 - Objects are references: assigning one shares it. Changing an object through
   a parameter needs a `var` parameter, and the compiler checks aliases
   ([ownership.md](ownership.md#changing-objects-through-references)).
@@ -805,6 +802,10 @@ fun main {
 - `resource class` declares a type whose objects have one owner and an
   optional `drop()`
   ([ownership.md](ownership.md#resources-values-with-one-owner)).
+
+> Known issue (being fixed by ct-parity): today a method can't call another
+> method of its class by name (`area()` reports `call.target:area`; write
+> `this.area()`).
 
 ### Interfaces
 
@@ -1127,7 +1128,7 @@ and blocks. From the tightest binding to the loosest:
 | Level | Operators | Notes |
 |---|---|---|
 | postfix | `f(x)`, `a.b`, `a[i]`, trailing lambda | |
-| prefix | `-` `+` `!` `~` `#` `^` `await` | `#` and `^` apply to the whole postfix chain after them |
+| prefix | `-` `+` `!` `~` `#` `^` `await` | `#` applies to the whole postfix chain after it; `^name.member` reaches into the delegate |
 | multiplicative | `*` `/` `%` | |
 | additive | `+` `-` | |
 | shift | `<<` `>>` `>>>` | |
