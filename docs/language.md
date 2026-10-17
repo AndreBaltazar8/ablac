@@ -500,325 +500,35 @@ the original nullable type returns after the branch. These restrictions avoid
 invalidating a proof through assignment or an alias; later data-flow work may
 accept a mutable place when it can prove no intervening write.
 
-`resource class` declares an affine nominal type:
+### Ownership and resources
 
-```abla
-resource class Socket(var descriptor: int)
-```
+Ownership has its own page, [ownership.md](ownership.md). In brief:
 
-A resource may reserve a zero-argument `drop(): void` method. The compiler
-invokes it exactly once for a directly owned, still-live resource on ordinary
-scope exit, reassignment, early return, `break`, `continue`, and owned-parameter
-exit. Moves clear the source storage, so cleanup at a later merge is a checked
-no-op rather than a second invocation:
-
-```abla fragment
-resource class Socket(val descriptor: int) {
-    fun drop(): void {
-        platformClose(descriptor)
-        return
-    }
-}
-```
-
-`drop` is compiler-reserved on resource classes: duplicate declarations or a
-non-`void`/parameterized signature are rejected. The compiler generates one
-verified drop helper per reachable affine type. Direct resources, structural
-wrappers, nested fields, arrays, and nullable resources therefore clean up
-recursively at compile time and in LLVM. Replacing an affine
-field or array element drops the previous value first.
-
-Consuming a field or element clears only that slot and leaves the owner
-partially initialized. Unmoved sibling fields and statically distinct array
-indexes remain usable; rereading the moved place or using the complete owner is
-rejected across CFG joins. Assigning a compatible owned value back into a
-mutable moved field or array element reinitializes that place; whole-owner use
-becomes valid only when every incoming CFG path has restored every moved
-subplace. The remaining live fields are destroyed at the owner's ordinary
-lifetime end, so projection remainders are neither leaked nor double-dropped.
-A dynamic index is tracked conservatively as an unknown array place. Moving a
-field out of a class that defines its own `drop` is rejected
-because doing so could violate the user destructor's invariants.
-Each moving lambda also has a verified companion drop function describing its
-capture layout. An uninvoked, replaced, returned-from, nested, or
-container-held `FnOnce` recursively destroys its still-owned captures and
-releases its environment; invocation transfers those captures into the lambda
-body and releases the environment afterward. Compile-time evaluation, LLVM,
-and native LLVM execution use the same rule.
-
-`move(local)` transfers an affine local and invalidates the source binding on
-every control-flow path. A subsequent read or second move is rejected by the
-IR verifier; assigning a mutable binding again starts a new lifetime. Returning
-a local is an implicit move because the source lifetime ends on that edge.
-Ordinary parameters borrow resources by default, so inspection does not consume
-the caller's binding. Borrowed parameters cannot be returned or stored. A
-`var` parameter is an exclusive mutable borrow for the duration of one call,
-and an `own` parameter explicitly consumes an affine argument:
-
-```abla fragment
-fun inspect(socket: Socket): int = socket.descriptor
-fun reset(var socket: Socket): int {
-    socket.descriptor = -1
-    socket.descriptor
-}
-fun close(own socket: Socket): int = platformClose(socket.descriptor)
-fun forward(own socket: Socket): Socket = move(socket)
-
-var socket = Socket(openDescriptor())
-inspect(socket)          // borrowed; socket remains available
-reset(socket)            // exclusively borrowed; available after the call
-close(move(socket))      // ownership transferred; socket is invalid
-close(Socket(otherFd))   // a fresh value transfers directly
-```
-
-The same call-scoped rule applies when the borrowed place is rooted in a
-module-level `val` or `var`: the binding remains module-owned, the callee may
-mutate through the exclusive borrow, and it cannot retain or return that borrow.
-
-`own` is valid only on an affine function, extension, or method parameter;
-using it on a scalar or another freely copyable type is a compile error. Class
-primary-constructor properties remain spelled `val` or `var`. An affine value
-stored in either property is already transferred by construction, so a bare
-`own` constructor parameter is rejected rather than silently consuming and
-discarding a value that is not a field.
-
-`var` applies to affine owners and managed references: resource classes,
-ordinary classes/interfaces, and arrays. Its argument must be a uniquely
-addressable place or a value proven fresh through a constructor-returning
-function/method; arbitrary returned references are not assumed unique. It
-cannot be `move(...)` or an ordinary parameter. The callee may mutate
-fields/elements and call mutating methods, but cannot rebind the parameter or
-let the view escape. Ordinary managed parameters are read-only, including
-nested field/index mutation and `append`. Defaults and raw `extern`
-declarations are not valid for `var` parameters.
-
-Mutating receivers are inferred with receiver-type-specific transitive
-summaries, including mutation through managed fields. One call rejects an
-exclusive view overlapping any other managed/affine argument or receiver and
-still permits disjoint projections.
-
-A direct immutable local alias of an array, a class with a mutable field, or a
-class that reaches such a field through nested `val` class fields is converted
-to a source-linked managed view:
-
-```abla fragment
-val counter = Counter(20)
-val view = counter
-val observed = view.value
-increment(counter) // legal: `view` was last used above
-```
-
-The alias cannot mutate, escape, be stored, become a mutable local, or overlap
-a mutation while a later use is reachable. The typed CFG uses exact field and
-constant-index provenance, so mutations of disjoint sibling places remain
-legal. Runtime functions, compile functions, and methods use the same rule and
-are pre-verified before staged execution. Arrays reached only through `val`
-fields and references stored into new aggregates remain the next
-immutable-sharing rung; those need lifetime propagation across aggregate
-boundaries rather than merely deeper type classification.
-
-A function or method also cannot disguise a mutable managed parameter or
-receiver as an ordinary result. Direct projections and branch/block tails
-derived from a parameter require an explicit source-linked result such as
-`borrow(owner) Counter` or `borrow(this) Counter`. Mutating fluent APIs should
-return `void` unless retaining the returned view is an intentional part of
-their contract.
-
-Ordinary mutable managed results must otherwise be provably fresh. The proof
-covers literals/constructors, local `val` builder identities, complete `if` and
-`when` joins, staged/region wrappers, and calls whose implementation has the
-same proof. Returning a global, a stored global projection, or an opaque
-non-factory result without `borrow(source)` is rejected. Affine `own` results
-continue to use move semantics rather than this shared-reference rule.
-
-Existing local and owned-parameter bindings require `move` at a consuming call;
-fresh constructor and function results transfer directly. Function, method, and
-constructor-property transfers use the same rule. The callee owns an `own`
-parameter and may forward it with `move` or return it at the end of its
-lifetime. A single call cannot give overlapping affine places to an `own` or
-`var` parameter and another live argument: for example,
-`consumeAfterInspect(ticket, move(ticket))` and `copy(ticket, ticket)` are
-rejected because aliases would coexist inside the callee. Segment-aware
-checking still allows disjoint calls such as `copy(pair.left, pair.right)` and
-`inspectAndConsume(pair.left, move(pair.right))`. A method receiver is live for
-the complete call; a mutating receiver is exclusive and a shared receiver
-cannot overlap an owned argument. Inferred callable types preserve both `var`
-and `own` parameter modes, so indirect calls apply the same mutation, transfer,
-and overlap rules. The modes are also available in explicitly written callable
-types:
-
-```abla fragment
-fun invoke(callback: (own: Socket) -> int, own socket: Socket): int =
-    callback(move(socket))
-
-fun modify(callback: (var: Socket) -> int, var socket: Socket): int =
-    callback(socket)
-```
-
-`(Socket) -> int`, `(var: Socket) -> int`, and `(own: Socket) -> int` are
-different types, so a mutating or consuming function cannot be assigned to a
-shared callable slot.
-
-Callable families describe how a closure itself may be invoked. `Fn(A) -> R`
-is reusable and read-only, `FnMut(A) -> R` may mutate captured state, and
-`FnOnce(A) -> R` consumes its environment. A parameter accepting `FnMut` must
-be declared `var`; a parameter accepting `FnOnce` must be declared `own`:
-
-```abla
-fun twice(var callback: FnMut() -> int): int =
-    callback() + callback()
-
-fun finish(own callback: FnOnce() -> int): int = callback()
-```
-
-A lambda passed directly to a statically known function, method, or constructor
-parameter may omit its parameter annotations; the expected callable type
-supplies them before the body is checked. An unconstrained omitted type remains
-an error. A read-only `Fn` can satisfy a repeatable `FnMut` callback slot
-because it supports the same calls without mutating its captures; the reverse
-conversion is not allowed.
-
-The compiler infers `FnMut` when an ordinary lambda assigns through a captured
-place and implements the capture as one shared mutable cell, so compiled and
-staged execution observe the same updates. `move { ... }` infers `FnOnce`.
-`FnMut` and `FnOnce` values are affine and cannot be copied accidentally.
-
-`FnNoEscape(A) -> R` is an orthogonal effect-bearing callable type. It proves
-that the callback does not retain any Abla-managed argument, so it may be
-invoked with region-owned values. An ordinary Abla function satisfies this type
-when its inferred transitive receiver and parameter effects prove that it does
-not retain its arguments. The explicit `noescape` spelling remains useful as a
-checked public contract and is required at foreign or opaque boundaries whose
-bodies the compiler cannot inspect.
-
-`Cell<T>` is explicit interior mutability for copy scalars. It can be retained
-in a `val` field and changed only through `set`; `get` returns the scalar by
-value. Managed references and affine resources are rejected as cell payloads,
-so `Cell` cannot manufacture an escaping mutable alias. It is a local
-single-thread abstraction and will remain non-transferable when concurrency
-traits land; cross-thread mutation uses `Mutex<T>`.
-
-```abla fragment
-class Counter(val value: Cell<int>)
-
-val counter = Counter(Cell(0))
-counter.value.set(counter.value.get() + 1)
-```
-
-`Shared<T>` is explicit, thread-safe shared ownership for an affine value and
-`Weak<T>` is its non-owning counterpart. The handles are themselves affine:
-copying a handle implicitly is rejected, while `clone()` deliberately creates
-a second handle. This keeps reference-count changes visible in source and
-prevents ordinary assignment from silently becoming an atomic operation:
-
-```abla fragment
-val original = Shared(Socket(openDescriptor()))
-val second = original.clone()
-inspect(original.get())
-
-val observer = original.downgrade()
-val possibleOwner = observer.upgrade() // Shared<Socket>?
-val live = observer.isAlive()
-```
-
-`Shared(value)` consumes an existing affine binding in the same way as any
-other owning call, so an existing local is written `Shared(move(value))`.
-`get()` returns a compiler-tracked, non-escaping `borrow:T`: it may be inspected,
-passed to an ordinary borrowed parameter, or bound to an inferred immutable
-local when the receiver is a stable local/parameter-rooted place:
-
-```abla fragment
-val owner = Shared(Socket(openDescriptor()))
-val view = owner.get()
-inspect(view)
-val descriptor = view.descriptor // last use of `view`
-val transferred = move(owner)    // legal after the last use
-```
-
-Typed-IR CFG liveness ties `view` to the exact source place. Moving, replacing,
-or mutating an overlapping source is rejected on every path that can reach a
-later view use; field- and constant-index-disjoint sibling places remain legal.
-This analysis is non-lexical. Every runtime function, compile function, and
-method whose syntax can bind a borrow is verified in side-effect-suppressed IR
-before any staged `#` evaluation. Borrow locals are immutable and inferred from
-a direct stable `get()`, another stable borrow local, or a field/index
-projection rooted in one. Copies and projections retain the original owner
-place rather than the intermediate view, so they may outlive that view and end
-independently. `if` and exhaustive `when` expressions may join borrow branches
-when every branch resolves to that same original owner place, including through
-block results; a conditional choice between different owner roots is rejected.
-Functions, compile functions, and methods may return a view only through an
-explicit source-linked contract:
-
-```abla
-fun view(owner: Shared<Ticket>): borrow(owner) Ticket = owner.get()
-
-resource class Holder(val handle: Shared<Ticket>) {
-    fun view(): borrow(this) Ticket = this.handle.get()
-}
-```
-
-Every explicit and implicit return must be proven to originate at that named
-ordinary parameter or `this`; field projections conservatively retain the
-whole declared source lifetime. At a direct call, the source is substituted
-with the caller's exact owner place and participates in the same CFG last-use
-analysis. A function-value result can retain the same relation using a
-zero-based parameter index, including through local/global aliases,
-higher-order parameters, and returned function values:
-
-```abla fragment
-val callback: (Shared<Ticket>) -> borrow(0) Ticket = view
-val ticket = callback(owner)
-```
-
-`Borrow<T>` is the explicit immutable-view spelling for parameters and locals;
-it never manufactures provenance, so an initializer still has to be derived
-from a checked owner. `own`/`var`/defaulted sources, cross-owner returns, and
-extern lifetime promises are rejected. A returned view passed beside an
-overlapping `own` or `var` argument is rejected before argument evaluation can
-invalidate it.
-Borrows without such a contract cannot be captured, returned, stored in objects/arrays/globals,
-reshared, consumed, mutably borrowed, or mutated through. Heap-valued
-projections remain borrowed so an intermediate projection cannot launder the
-lifetime.
-
-`Mutex<T>` is the checked shared-mutation abstraction. It owns an affine
-payload, may be explicitly cloned, and holds a per-control atomic lock for the
-entire callback passed to `with`:
-
-```abla
-resource class Counter(var value: int)
-
-fun increment(var counter: Counter): int {
-    counter.value = counter.value + 1
-    counter.value
-}
-
-val state = Mutex(Counter(40))
-val next = state.with(increment)
-```
-
-The current sound baseline requires a named callback with exactly one matching
-`var` parameter and an allocation-independent scalar result. Consequently the
-exclusive payload borrow cannot escape the locked call. Native LLVM and C
-paths use atomic acquire/release locking; compile-time evaluation enforces the
-same ownership and escape contract.
-
-`downgrade()` creates a `Weak<T>` without extending the payload lifetime.
-`upgrade()` atomically returns a new strong handle when the payload is still
-alive and `null` otherwise; `isAlive()` is only an observation and does not pin
-the value. The implementation uses atomic strong and weak counts and an
-implicit weak reference while any strong owner remains. The last strong owner
-runs the payload's verified drop helper exactly once, while the control block
-remains valid until the last weak handle is destroyed.
-
-The first sound implementations of `Shared`, `Weak`, and `Mutex` restrict `T`
-to affine types. Ordinary classes
-and primitive arrays still use freely aliased reference semantics, so accepting
-them here would imply safety guarantees that the language cannot yet enforce.
-General immutable sharing, profile-selected non-atomic local sharing, and
-refinement of provably unmodified mutable places are later rungs; none weaken
-the rules above.
+- Plain values (`int`, `bool`, `f64`, `string`, ...) are copied. Ordinary
+  class objects, arrays and closures are *managed references*: they are
+  shared freely and collected automatically, but a function changes an
+  object it receives only through a `var` parameter, and an alias may not
+  observe a change made after it was taken
+  ([details](ownership.md#changing-objects-through-references)).
+- `resource class` declares an *affine* type, whose values have one owner.
+  Ownership moves with `move(x)`, and `drop()` runs exactly once when the last
+  owner goes away
+  ([details](ownership.md#resources-values-with-one-owner)). A class that
+  stores an affine value is affine too.
+- Parameters borrow by default. `var p: T` borrows exclusively for one call;
+  `own p: T` takes ownership
+  ([details](ownership.md#parameters-borrow-var-and-own)).
+- Iterating over an array of resources borrows each element, and iterating
+  over `move(array)` takes each one out
+  ([details](ownership.md#collections-of-resources)).
+- `Shared<T>.get()` views and `borrow(source)` results are tied to their
+  owner by a control-flow check (`E_BORROW_CONFLICT`)
+  ([details](ownership.md#borrowed-views-and-borrow-results)).
+- `Cell<T>`, `Shared<T>`, `Weak<T>` and `Mutex<T>` make sharing explicit
+  ([details](ownership.md#sharing-cell-shared-weak-mutex)).
+- Closures are `Fn`, `FnMut` or `FnOnce` depending on what they do to their
+  captures; `move { ... }` moves resources into a closure
+  ([details](ownership.md#closures-and-ownership)).
 
 ### Scoped allocation regions
 
@@ -859,52 +569,6 @@ freestanding programs are manual by default. `memorySetLimit` and
 `memorySetCollectionGrowth` select pressure collection on every target (see
 [the standard library](standard-library.md)). Affine native buffers are pinned until deterministic destruction or
 region reset.
-
-Reusable lambdas cannot implicitly capture affine values. `move { ... }`
-creates a consuming closure and transfers its affine free variables at closure
-creation:
-
-```abla fragment
-var socket = Socket(openDescriptor())
-val closeLater = move { platformClose(socket.descriptor) }
-socket = Socket(otherDescriptor) // starts a new lifetime
-closeLater()                     // consumes the closure
-```
-
-The inferred closure type has `FnOnce` semantics: it is itself affine, cannot
-be copied, and its invocation invalidates the binding. A second call, use of an
-outer resource after capture, ordinary `{ ... }` resource capture, and moving a
-borrowed parameter into a closure are rejected.
-
-Affinity propagates through stored fields and arrays. A class need not be
-spelled `resource class` to be affine when one of its `val`/`var` constructor
-properties contains an affine value. Resource fields and array elements are
-borrowed when inspected and require an explicit consuming projection when
-extracted:
-
-```abla fragment
-var box = TicketBox(Ticket(40))
-val ticket = move(box.ticket) // leaves only `box.ticket` uninitialized
-box = TicketBox(Ticket(2))    // replacing the owner starts a new lifetime
-
-var tickets = [Ticket(40)]
-val first = move(tickets[0])  // leaves only the constant index uninitialized
-tickets = [Ticket(2)]         // replacing the array restores the whole owner
-```
-
-Place liveness follows nested field and array-index segments. Independent
-fields and statically distinct indexes remain available, including below a
-nested array projection. A computed index aliases every index at that segment,
-but it does not poison unrelated fields. Assigning through a computed index
-cannot prove that a previously moved dynamic slot was restored; replacing a
-known enclosing place or the complete owner can. Implicit owned extraction from
-a borrowed container is rejected. Read-only borrow copies and field/index
-projections may be stored as immutable locals and retain transitive provenance
-to the original owner place. `Fn`/`FnMut`/`FnOnce`, `Borrow<T>`, and indexed
-borrow-return function types are available. Checked call-scoped mutable managed
-references are available; lifetime-polymorphic/cross-owner joins, persistent
-immutable-alias provenance, and mutable borrows that outlive one call remain
-in progress.
 
 Function types use `(A, B) -> R`; an extension receiver uses `T.(A) -> R`.
 Generic arguments use `Type<A, B>`.

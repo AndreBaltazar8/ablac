@@ -8,6 +8,7 @@ compiler. The documents below are grouped by what you are trying to do.
 | Document | What it covers |
 |---|---|
 | [language.md](language.md) | The language reference: syntax, declarations, types, ownership, control flow, modules |
+| [ownership.md](ownership.md) | Who may change a value and who cleans it up: `var`/`own` parameters, `move`, resources, borrows, `Shared`/`Mutex`, closures |
 | [regions.md](regions.md) | `region { ... }`: scoped allocation and its escape rules |
 | [standard-library.md](standard-library.md) | The `abla/...` modules and their layering |
 | [json.md](json.md) | `abla/json`, `$json` and `$jsons` |
