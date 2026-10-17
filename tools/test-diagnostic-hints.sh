@@ -33,4 +33,7 @@ check invalid-elvis-template 1 "E_PARSE_ELVIS" "Abla has no \`?:\`"
 "$compiler" build "$cases/defer-assignment-tail.ab" -o "$output_directory/defer-assignment-tail" --no-cache >/dev/null
 actual=$("$output_directory/defer-assignment-tail")
 [[ $actual == "1 x 2 3" ]] || { echo "defer-assignment-tail: '$actual'"; exit 1; }
-echo "diagnostic hints: method.unknown (+ import), ?. and ?:, defer ending in an assignment"
+"$compiler" build "$cases/trailing-lambda-member-call.ab" -o "$output_directory/trailing-lambda-member-call" --no-cache >/dev/null
+actual=$("$output_directory/trailing-lambda-member-call")
+[[ $actual == "30 11 101 0" ]] || { echo "trailing-lambda-member-call: '$actual'"; exit 1; }
+echo "diagnostic hints: method.unknown (+ import), ?. and ?:, defer ending in an assignment, trailing lambda after a member call"
