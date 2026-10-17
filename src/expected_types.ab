@@ -7,12 +7,15 @@
 // checks each element against `T`, and lowering and compile-time evaluation
 // see the same typed literal.
 //
+// A store into a receiver whose type the syntax declares (a typed parameter,
+// local, field or top-level value) expects its element or value type too:
+// `xs.append(v)`, `xs[i] = v`, `m.set(k, v)`, `x = v`, `o.f = v`.
+//
 // The pass is syntax to syntax before semantic analysis; a literal with no
 // such context keeps its type from its elements.
 import "parser.ab"
 import "overload.ab"
 import "staged_parser.ab"
-import "receiver_names.ab"
 
 /** The array type `type` names once a trailing `?` is dropped, else "". */
 fun bootstrapExpectedArrayType(type: string): string {
@@ -119,40 +122,194 @@ fun bootstrapExpectedArgumentType(
     "${types[index]}"
 }
 
+/** Declared type texts by name; a name declared without a type, or twice
+ *  with different types, has "". */
+class BootstrapExpectedNames(
+    val names: array<string>,
+    val types: array<string>
+) {
+    fun find(name: string): int {
+        var index = 0
+        while (index < this.names.size) {
+            if (this.names[index] == name) return index
+            index = index + 1
+        }
+        -1
+    }
+
+    fun add(name: string, type: string): void {
+        val index = this.find(name)
+        if (index < 0) {
+            this.names.append(name)
+            this.types.append(type)
+        } else if (this.types[index] != type) this.types[index] = ""
+        return
+    }
+
+    fun typeOf(name: string): string {
+        val index = this.find(name)
+        if (index < 0) return ""
+        "${this.types[index]}"
+    }
+}
+
+/** Each class's fields with their declared types. */
+class BootstrapExpectedClasses(
+    val names: array<string>,
+    val fields: array<BootstrapExpectedNames>
+) {
+    fun find(name: string): int {
+        var index = 0
+        while (index < this.names.size) {
+            if (this.names[index] == name) return index
+            index = index + 1
+        }
+        -1
+    }
+}
+
+/** What a body's names are declared as: its own parameters and locals, the
+ *  receiver's fields (`owner`, in a method or extension function), the
+ *  top-level values. */
+class BootstrapExpectedScope(
+    val locals: BootstrapExpectedNames,
+    val owner: string,
+    val classes: BootstrapExpectedClasses,
+    val globals: BootstrapExpectedNames
+)
+
+/** The type a local declaration names: its annotation, or the type of
+ *  `array<T>()` or `Map<K, V>()` it is initialized with; else "". */
+fun bootstrapExpectedLocalType(expression: BootstrapExpression): string {
+    if (expression.children.size > 1 && expression.children[1].kind == "type" &&
+        expression.children[1].text != "inferred") return "${expression.children[1].text}"
+    if (expression.children.size > 0) {
+        val initializer = expression.children[0]
+        if (initializer.kind == "array" && initializer.text != "") return "${initializer.text}"
+        if (initializer.kind == "call" && initializer.text == "Map" &&
+            initializer.children.size == 1 && initializer.children[0].kind == "type") {
+            return "${initializer.children[0].text}"
+        }
+    }
+    ""
+}
+
+/** Every name `expression` binds, with the type it declares. */
+fun bootstrapExpectedLocals(expression: BootstrapExpression, var names: BootstrapExpectedNames): void {
+    if (expression.kind == "local.val" || expression.kind == "local.var") {
+        names.add(expression.text, bootstrapExpectedLocalType(expression))
+    }
+    if (expression.kind == "for") names.add(expression.text, "")
+    if (expression.kind == "lambda" || expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator") {
+        var parameter = 0
+        while (parameter + 1 < expression.children.size) {
+            names.add(expression.children[parameter].text, "")
+            parameter = parameter + 1
+        }
+    }
+    for (child in expression.children) bootstrapExpectedLocals(child, names)
+    return
+}
+
+/** The declared type of `expression` where the syntax names it, else "". */
+fun bootstrapExpectedTypeOf(expression: BootstrapExpression, scope: BootstrapExpectedScope): string {
+    if (expression.kind == "identifier") {
+        if (scope.locals.find(expression.text) >= 0) return scope.locals.typeOf(expression.text)
+        if (expression.text == "this") return "${scope.owner}"
+        val owner = scope.classes.find(scope.owner)
+        if (owner >= 0 && scope.classes.fields[owner].find(expression.text) >= 0) {
+            return scope.classes.fields[owner].typeOf(expression.text)
+        }
+        return scope.globals.typeOf(expression.text)
+    }
+    if (expression.kind == "member" && expression.children.size == 1) {
+        val owner = scope.classes.find(bootstrapExpectedTypeOf(expression.children[0], scope))
+        if (owner >= 0) return scope.classes.fields[owner].typeOf(expression.text)
+        return ""
+    }
+    if (expression.kind == "index" && expression.children.size == 2) {
+        val array = bootstrapExpectedArrayType(bootstrapExpectedTypeOf(expression.children[0], scope))
+        if (array != "") return array.slice(6, array.size - 1)
+    }
+    ""
+}
+
+/** `V` of `Map<K, V>` (or `Map<K, V>?`), else "". */
+fun bootstrapExpectedMapValueType(type: string): string {
+    var text = type
+    if (text.size > 0 && text[text.size - 1] == 63) text = text.slice(0, text.size - 1)
+    if (text.size < 6 || text.slice(0, 4) != "Map<" || text[text.size - 1] != 62) return ""
+    var depth = 0
+    var index = 4
+    while (index < text.size - 1) {
+        val code = text[index]
+        if (code == 60 || code == 40) depth = depth + 1
+        if (code == 62 || code == 41) depth = depth - 1
+        if (code == 44 && depth == 0) return text.slice(index + 1, text.size - 1)
+        index = index + 1
+    }
+    ""
+}
+
+/** `children[at]` as a value of `type`; whether it changed. */
+fun bootstrapExpectChild(var children: array<BootstrapExpression>, at: int, type: string): bool {
+    if (type == "" || at >= children.size) return false
+    val typed = bootstrapExpectType(children[at], type)
+    if (typed == children[at]) return false
+    children[at] = typed
+    true
+}
+
 /** `expression` with the expected types written into the literals inside it;
  *  `result` is the enclosing function's result type ("" outside one). */
 fun bootstrapExpectTypesIn(
     expression: BootstrapExpression,
     callees: BootstrapExpectedCallees,
-    bound: array<string>,
+    scope: BootstrapExpectedScope,
     result: string
 ): BootstrapExpression {
     // A lambda's `return` leaves the lambda, whose result isn't declared here.
     val inner = if (expression.kind == "lambda" || expression.kind == "lambda.move" ||
         expression.kind == "lambda.generator") "" else result
-    val children: array<BootstrapExpression> = []
+    var children: array<BootstrapExpression> = []
     var changed = false
     for (child in expression.children) {
-        val rewritten = bootstrapExpectTypesIn(child, callees, bound, inner)
+        val rewritten = bootstrapExpectTypesIn(child, callees, scope, inner)
         if (rewritten != child) changed = true
         children.append(rewritten)
     }
-    if ((expression.kind == "local.val" || expression.kind == "local.var") &&
+    val kind = expression.kind
+    if ((kind == "local.val" || kind == "local.var") &&
         children.size > 1 && children[1].kind == "type" && children[1].text != "inferred") {
-        val typed = bootstrapExpectType(children[0], children[1].text)
-        if (typed != children[0]) {
-            children[0] = typed
-            changed = true
-        }
+        if (bootstrapExpectChild(children, 0, children[1].text)) changed = true
     }
-    if (expression.kind == "return" && result != "" && children.size == 1) {
-        val typed = bootstrapExpectType(children[0], result)
-        if (typed != children[0]) {
-            children[0] = typed
-            changed = true
-        }
+    if (kind == "return" && result != "" && children.size == 1) {
+        if (bootstrapExpectChild(children, 0, result)) changed = true
     }
-    if (expression.kind == "call" && !bootstrapReceiverNameIn(bound, expression.text)) {
+    // Stores into a receiver whose type is declared: `xs.append(v)`,
+    // `xs[i] = v`, `m.set(k, v)`, `x = v`, `o.f = v`.
+    if (kind == "member.call" && children.size == 2 && expression.text == "append") {
+        val array = bootstrapExpectedArrayType(bootstrapExpectedTypeOf(children[0], scope))
+        if (array != "" && bootstrapExpectChild(children, 1, array.slice(6, array.size - 1))) changed = true
+    }
+    if (kind == "member.call" && children.size == 3 && expression.text == "set") {
+        val value = bootstrapExpectedMapValueType(bootstrapExpectedTypeOf(children[0], scope))
+        if (bootstrapExpectChild(children, 2, value)) changed = true
+    }
+    if (kind == "index.assign" && children.size == 3) {
+        val array = bootstrapExpectedArrayType(bootstrapExpectedTypeOf(children[0], scope))
+        if (array != "" && bootstrapExpectChild(children, 2, array.slice(6, array.size - 1))) changed = true
+    }
+    if (kind == "assign" && children.size == 1) {
+        val target = BootstrapExpression("identifier", expression.text, expression.begin, expression.begin, [])
+        if (bootstrapExpectChild(children, 0, bootstrapExpectedTypeOf(target, scope))) changed = true
+    }
+    if (kind == "member.assign" && children.size == 2) {
+        val target = BootstrapExpression("member", expression.text, expression.begin, expression.begin, [children[0]])
+        if (bootstrapExpectChild(children, 1, bootstrapExpectedTypeOf(target, scope))) changed = true
+    }
+    if (kind == "call" && scope.locals.find(expression.text) < 0) {
         val callee = callees.find(expression.text)
         if (callee >= 0) {
             var position = 0
@@ -160,18 +317,16 @@ fun bootstrapExpectTypesIn(
                 val argument = children[position]
                 val type = bootstrapExpectedArgumentType(callees, callee, argument, position)
                 if (type != "") {
-                    var typed = argument
                     if (argument.kind == "named.argument" && argument.children.size == 1) {
                         val value = bootstrapExpectType(argument.children[0], type)
-                        if (value != argument.children[0]) typed = BootstrapExpression(
-                            argument.kind, argument.text, argument.begin, argument.end, [value]
-                        )
+                        if (value != argument.children[0]) {
+                            children[position] = BootstrapExpression(
+                                argument.kind, argument.text, argument.begin, argument.end, [value]
+                            )
+                            changed = true
+                        }
                     } else if (argument.kind != "named.argument") {
-                        typed = bootstrapExpectType(argument, type)
-                    }
-                    if (typed != argument) {
-                        children[position] = typed
-                        changed = true
+                        if (bootstrapExpectChild(children, position, type)) changed = true
                     }
                 }
                 position = position + 1
@@ -182,17 +337,29 @@ fun bootstrapExpectTypesIn(
     BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
 }
 
-/** A function's or top-level value's body with the expected types written in. */
+/** A function's or top-level value's body with the expected types written in;
+ *  `owner` is the receiver's type in a method or extension function. */
 fun bootstrapExpectTypesBody(
     declaration: BootstrapDeclaration,
-    callees: BootstrapExpectedCallees
+    callees: BootstrapExpectedCallees,
+    owner: string,
+    classes: BootstrapExpectedClasses,
+    globals: BootstrapExpectedNames
 ): BootstrapDeclaration {
-    var bound: array<string> = []
-    for (parameter in declaration.parameters) bound.append(parameter)
-    bootstrapReceiverBoundNames(declaration.expression, bound)
+    var locals = BootstrapExpectedNames([], [])
+    var parameter = 0
+    while (parameter < declaration.parameters.size) {
+        locals.add(
+            declaration.parameters[parameter],
+            if (parameter < declaration.parameterTypes.size) "${declaration.parameterTypes[parameter]}" else ""
+        )
+        parameter = parameter + 1
+    }
+    bootstrapExpectedLocals(declaration.expression, locals)
+    val scope = BootstrapExpectedScope(locals, owner, classes, globals)
     val function = declaration.kind == "fun" || declaration.kind == "compile.fun"
     val result = if (function) declaration.resultType else ""
-    var body = bootstrapExpectTypesIn(declaration.expression, callees, bound, result)
+    var body = bootstrapExpectTypesIn(declaration.expression, callees, scope, result)
     val value = declaration.kind == "val" || declaration.kind == "var" ||
         declaration.kind == "compile.val" || declaration.kind == "compile.var"
     if (declaration.resultType != "" && (function || value)) {
@@ -204,15 +371,39 @@ fun bootstrapExpectTypesBody(
 
 fun bootstrapResolveExpectedTypes(parsed: BootstrapParseResult): BootstrapParseResult {
     val callees = bootstrapExpectedCallees(parsed.declarations)
+    var classes = BootstrapExpectedClasses([], [])
+    var globals = BootstrapExpectedNames([], [])
+    for (declaration in parsed.declarations) {
+        if (declaration.kind == "class" && classes.find(declaration.name) < 0) {
+            var fields = BootstrapExpectedNames([], [])
+            var parameter = 0
+            while (parameter < declaration.parameters.size &&
+                parameter < declaration.parameterTypes.size) {
+                if (parameter < declaration.parameterKinds.size &&
+                    (declaration.parameterKinds[parameter] == "val" ||
+                     declaration.parameterKinds[parameter] == "var")) {
+                    fields.add(declaration.parameters[parameter], "${declaration.parameterTypes[parameter]}")
+                }
+                parameter = parameter + 1
+            }
+            classes.names.append(declaration.name)
+            classes.fields.append(fields)
+        }
+        if (declaration.kind == "val" || declaration.kind == "var") {
+            globals.add(declaration.name, "${declaration.resultType}")
+        }
+    }
     val declarations: array<BootstrapDeclaration> = []
     var changed = false
     for (declaration in parsed.declarations) {
-        var rewritten = bootstrapExpectTypesBody(declaration, callees)
+        var rewritten = bootstrapExpectTypesBody(
+            declaration, callees, declaration.extensionOwner, classes, globals
+        )
         if (declaration.methods.size > 0) {
             val methods: array<BootstrapDeclaration> = []
             var methodsChanged = false
             for (method in declaration.methods) {
-                val typed = bootstrapExpectTypesBody(method, callees)
+                val typed = bootstrapExpectTypesBody(method, callees, declaration.name, classes, globals)
                 if (typed != method) methodsChanged = true
                 methods.append(typed)
             }

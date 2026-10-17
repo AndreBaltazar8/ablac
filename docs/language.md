@@ -386,7 +386,10 @@ fun main {
 
 - An array literal takes the type expected of it: a typed local or
   top-level value, a function's result or `return`, an argument of a
-  top-level function or constructor. That type's element type flows into
+  top-level function or constructor, or a store into a receiver of declared
+  type (`xs.append(v)`, `xs[i] = v`, `m.set(k, v)`, `x = v`, `o.field = v`,
+  where `xs`, `m`, `x` or the field has a declared type or is initialized
+  with `array<T>()` or `Map<K, V>()`). That type's element type flows into
   nested literals and lambdas, and `null` fits a `T?` element
   (`val rows: array<array<int?>> = [[1, null], []]`). Without such a type,
   the elements must share one, `[]` and `null` taking the others'
