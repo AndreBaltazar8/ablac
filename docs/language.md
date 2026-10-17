@@ -803,7 +803,7 @@ fun main {
   optional `drop()`
   ([ownership.md](ownership.md#resources-values-with-one-owner)).
 
-> Known issue (being fixed by ct-parity): today a method can't call another
+> Known issue (being fixed by ablac-frontend): today a method can't call another
 > method of its class by name (`area()` reports `call.target:area`; write
 > `this.area()`).
 
