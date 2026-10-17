@@ -1,0 +1,660 @@
+// Inferred `borrow(source)` results.
+//
+// A function, method or extension whose declared result is an ordinary class
+// or array that ownership tracks (one with mutable state), and whose every
+// return path is a reference into one parameter or into `this`, gets the
+// contract an explicit `borrow(source) T` would declare. Return paths: the
+// parameter or a place under it, `this` or one of its fields, a `for`
+// variable over a parameter's elements, a new object storing the source, the
+// result of a call that borrows from it, or a new value. Callers then treat
+// the result as a view of their argument (sema and the typed CFG check it like
+// any other view), so changing the argument while the result is still used
+// is a borrow conflict, as it is when the object is built inline.
+//
+// The declarations are rewritten before analysis, so sema, lowering and the
+// typed CFG see the contract exactly as if it were written. An explicit
+// contract is left as written. A result whose paths come from several
+// sources, or from a local this pass does not follow, keeps its declared type:
+// sema then decides, as it always did.
+import "sema.ab"
+import "abla/sys/linux/process"
+import "abla/sys/linux/io"
+
+class BootstrapBorrowInference(
+    val classes: Map<string, int>,
+    val globals: Map<string, int>,
+    // Each top-level function's (by name) and method's or extension's (by
+    // `Owner.name`) contract source so far: "" for none.
+    val contracts: Map<string, string>,
+    val declarations: array<BootstrapDeclaration>
+)
+
+fun bootstrapBorrowContract(inference: BootstrapBorrowInference, key: string): string {
+    val contract = inference.contracts.get(key)
+    if (contract == null) "?" else contract
+}
+
+// One function's body as the pass reads it.
+class BootstrapBorrowScope(
+    val parameters: array<string>,
+    val parameterKinds: array<string>,
+    val parameterTypes: array<string>,
+    val parameterDefaults: array<BootstrapExpression>,
+    val owner: string,
+    val declared: Map<string, int>,
+    val forSources: Map<string, string>,
+    val valInitializers: Map<string, BootstrapExpression>
+)
+
+fun bootstrapBorrowInferenceKey(owner: string, name: string): string =
+    if (owner == "") name else "$owner.$name"
+
+fun bootstrapBorrowClassDeclaration(
+    inference: BootstrapBorrowInference,
+    type: string
+): BootstrapDeclaration? {
+    val index = inference.classes.get(type)
+    if (index == null) null else inference.declarations[index]
+}
+
+// Whether ownership tracks references of `type` (sema's
+// typeNeedsManagedAliasTracking, without nullable results).
+fun bootstrapBorrowTypeTracked(
+    inference: BootstrapBorrowInference,
+    type: string,
+    depth: int
+): bool {
+    if (depth == 0 && bootstrapIsArrayType(type)) return true
+    if (depth >= 32) return false
+    val declaration = bootstrapBorrowClassDeclaration(inference, type)
+    if (declaration == null) return false
+    var field = 0
+    while (field < declaration.parameterTypes.size) {
+        if (field < declaration.parameterKinds.size &&
+            declaration.parameterKinds[field] == "var") return true
+        val fieldType = bootstrapNormalizeType(declaration.parameterTypes[field])
+        if (!bootstrapIsArrayType(fieldType) &&
+            bootstrapBorrowTypeTracked(inference, fieldType, depth + 1)) {
+            return true
+        }
+        field = field + 1
+    }
+    false
+}
+
+// Whether `type` is an ordinary (non-affine) class or array of them: no
+// resource, wrapper or generic other than arrays anywhere inside.
+fun bootstrapBorrowTypeOrdinary(
+    inference: BootstrapBorrowInference,
+    type: string,
+    depth: int
+): bool {
+    if (depth >= 32) return false
+    if (bootstrapIsArrayType(type)) {
+        val element = bootstrapArrayElementType(type)
+        return bootstrapScalarTypeUnderlyingValid(element) ||
+            element == "string" ||
+            bootstrapBorrowTypeOrdinary(inference, element, depth + 1)
+    }
+    val declaration = bootstrapBorrowClassDeclaration(inference, type)
+    if (declaration == null || declaration.isResource) return false
+    var field = 0
+    while (field < declaration.parameterTypes.size) {
+        var fieldType = bootstrapNormalizeType(declaration.parameterTypes[field])
+        if (bootstrapIsNullableType(fieldType)) {
+            fieldType = bootstrapNullableElementType(fieldType)
+        }
+        if (!bootstrapScalarTypeUnderlyingValid(fieldType) &&
+            fieldType != "string" && fieldType != type &&
+            !bootstrapBorrowTypeOrdinary(inference, fieldType, depth + 1)) {
+            return false
+        }
+        field = field + 1
+    }
+    true
+}
+
+fun bootstrapBorrowClassHasVarField(declaration: BootstrapDeclaration): bool {
+    var found = false
+    for (kind in declaration.parameterKinds) if (kind == "var") found = true
+    found
+}
+
+// Every name the body declares (locals, loop variables, lambda parameters),
+// with how often, and the parameter each `for` variable iterates over.
+fun bootstrapBorrowCollectDeclared(
+    var scope: BootstrapBorrowScope,
+    expression: BootstrapExpression
+): void {
+    if (expression.kind == "local.val" || expression.kind == "local.var" ||
+        expression.kind == "for" || expression.kind == "lambda.parameter") {
+        val count = scope.declared.get(expression.text)
+        scope.declared.set(
+            expression.text, if (count == null) 1 else count + 1
+        )
+    }
+    if (expression.kind == "local.val" && expression.children.size > 0 &&
+        expression.children[0].kind != "missing") {
+        scope.valInitializers.set(expression.text, expression.children[0])
+    }
+    if (expression.kind == "for" && expression.children.size > 1) {
+        val root = bootstrapPlaceRootName(expression.children[0])
+        var source = ""
+        var parameter = 0
+        while (parameter < scope.parameters.size) {
+            if (scope.parameters[parameter] == root &&
+                scope.parameterKinds[parameter] == "parameter") source = root
+            parameter = parameter + 1
+        }
+        scope.forSources.set(expression.text, source)
+    }
+    for (child in expression.children) {
+        bootstrapBorrowCollectDeclared(scope, child)
+    }
+}
+
+fun bootstrapBorrowParameterIndex(scope: BootstrapBorrowScope, name: string): int {
+    var found = -1
+    var parameter = 0
+    while (parameter < scope.parameters.size) {
+        if (scope.parameters[parameter] == name) found = parameter
+        parameter = parameter + 1
+    }
+    found
+}
+
+// The source a place's root names: "p:<parameter>" or "p:this", "" for a
+// global (static), "?" otherwise.
+fun bootstrapBorrowPlaceSource(
+    inference: BootstrapBorrowInference,
+    scope: BootstrapBorrowScope,
+    expression: BootstrapExpression,
+    allowLoop: bool
+): string {
+    val root = bootstrapPlaceRootName(expression)
+    if (root == "") return "?"
+    if (scope.declared.get(root) != null) {
+        if (!allowLoop || scope.declared.get(root) != 1) return "?"
+        val loop = scope.forSources.get(root)
+        if (loop != null) return if (loop == "") "?" else "p:$loop"
+        // A `val` holding a view of the source (`val b = B(p); b`).
+        val initializer = scope.valInitializers.get(root)
+        if (initializer == null || expression.kind != "identifier") return "?"
+        val source = bootstrapBorrowValueSource(inference, scope, initializer)
+        return if (source.size > 0 && source[0] == 98) source else "?"
+    }
+    if (root == "this") return if (scope.owner == "") "?" else "p:this"
+    val parameter = bootstrapBorrowParameterIndex(scope, root)
+    if (parameter >= 0) {
+        val kind = scope.parameterKinds[parameter]
+        if ((kind != "parameter" && kind != "var") ||
+            (parameter < scope.parameterDefaults.size &&
+             scope.parameterDefaults[parameter].kind != "missing")) return "?"
+        return "p:$root"
+    }
+    if (scope.owner != "") {
+        val owner = bootstrapBorrowClassDeclaration(inference, scope.owner)
+        if (owner != null) {
+            for (field in owner.parameters) if (field == root) return "p:this"
+        }
+    }
+    // A global outlives every call.
+    if (inference.globals.get(root) != null) "" else "?"
+}
+
+// Joins the sources of two values of one expression (`if`/`when` arms).
+fun bootstrapBorrowJoin(left: string, right: string): string {
+    if (left == "?" || right == "?") return "?"
+    if (left == "") return if (right.size > 0 && right[0] == 98) "?" else right
+    if (right == "") return if (left[0] == 98) "?" else left
+    if (left == right) return left
+    if (left.slice(2, left.size) == right.slice(2, right.size)) return "?"
+    "*"
+}
+
+// The source of an argument a constructor stores or a contract borrows from:
+// a parameter or `this` (or a place under one), "" for a new value.
+fun bootstrapBorrowArgumentSource(
+    inference: BootstrapBorrowInference,
+    scope: BootstrapBorrowScope,
+    expression: BootstrapExpression
+): string {
+    if (expression.kind == "identifier" || expression.kind == "member" ||
+        expression.kind == "index") {
+        val root = bootstrapPlaceRootName(expression)
+        if (root != "this" && bootstrapBorrowParameterIndex(scope, root) < 0) {
+            return "?"
+        }
+        return bootstrapBorrowPlaceSource(inference, scope, expression, false)
+    }
+    val value = bootstrapBorrowValueSource(inference, scope, expression)
+    if (value == "") "" else "?"
+}
+
+// The source of a value: "p:<s>" a place under source s, "b:<s>" a value
+// typed as a view of s (a constructor storing it, a contract call), "" new
+// or static, "?" unknown, "*" several sources.
+fun bootstrapBorrowValueSource(
+    inference: BootstrapBorrowInference,
+    scope: BootstrapBorrowScope,
+    expression: BootstrapExpression
+): string {
+    val kind = expression.kind
+    if (kind == "block") {
+        if (expression.children.size == 0) return "?"
+        return bootstrapBorrowValueSource(
+            inference, scope, expression.children[expression.children.size - 1]
+        )
+    }
+    if (kind == "if") {
+        if (expression.children.size < 3 ||
+            expression.children[2].kind == "missing") return "?"
+        return bootstrapBorrowJoin(
+            bootstrapBorrowValueSource(inference, scope, expression.children[1]),
+            bootstrapBorrowValueSource(inference, scope, expression.children[2])
+        )
+    }
+    if (kind == "when") {
+        var joined = ""
+        var first = true
+        var branch = 2
+        while (branch < expression.children.size) {
+            val source = bootstrapBorrowValueSource(
+                inference, scope, expression.children[branch]
+            )
+            joined = if (first) source else bootstrapBorrowJoin(joined, source)
+            first = false
+            branch = branch + 2
+        }
+        return joined
+    }
+    if ((kind == "compile" || kind == "region") && expression.children.size > 0) {
+        return bootstrapBorrowValueSource(inference, scope, expression.children[0])
+    }
+    if (kind == "identifier" || kind == "member" || kind == "index") {
+        return bootstrapBorrowPlaceSource(inference, scope, expression, true)
+    }
+    // A `return` as the last statement: its value is checked on its own.
+    if (kind == "return") return ""
+    if (kind == "integer" || kind == "string" || kind == "true" ||
+        kind == "false" || kind == "float" || kind == "string.template") {
+        return ""
+    }
+    if (kind == "array") {
+        for (element in expression.children) {
+            if (bootstrapBorrowValueSource(inference, scope, element) != "") {
+                return "?"
+            }
+        }
+        return ""
+    }
+    if (kind == "call") {
+        if (scope.declared.get(expression.text) != null) return "?"
+        val constructed = bootstrapBorrowClassDeclaration(inference, expression.text)
+        if (constructed != null) {
+            if (constructed.isResource) return "?"
+            if (bootstrapBorrowClassHasVarField(constructed)) return ""
+            // Only stored references of tracked, non-array fields make the
+            // object a view, and a class with a `var` field is not tracked as
+            // a container (as sema's constructorStoredBorrowSource).
+            var stored = ""
+            var argument = 0
+            while (argument < expression.children.size &&
+                argument < constructed.parameterTypes.size) {
+                val fieldType = bootstrapNormalizeType(
+                    constructed.parameterTypes[argument]
+                )
+                if (!bootstrapIsArrayType(fieldType) &&
+                    bootstrapBorrowTypeTracked(inference, fieldType, 0)) {
+                    val source = bootstrapBorrowArgumentSource(
+                        inference, scope, expression.children[argument]
+                    )
+                    if (source == "?") return "?"
+                    if (source != "") {
+                        val named = "b:${source.slice(2, source.size)}"
+                        if (stored == "") stored = named
+                        else if (stored != named) return "*"
+                    }
+                }
+                argument = argument + 1
+            }
+            return stored
+        }
+        val contract = bootstrapBorrowContract(inference, expression.text)
+        if (contract == "?") return "?"
+        if (contract == "") return ""
+        val index = bootstrapBorrowDeclaredParameter(
+            inference, "", expression.text, contract
+        )
+        if (index < 0 || index >= expression.children.size) return "?"
+        val source = bootstrapBorrowArgumentSource(
+            inference, scope, expression.children[index]
+        )
+        return if (source == "" || source == "?") source
+            else "b:${source.slice(2, source.size)}"
+    }
+    if (kind == "member.call" && expression.children.size > 0) {
+        val receiver = expression.children[0]
+        val receiverSource = bootstrapBorrowArgumentSource(inference, scope, receiver)
+        if (receiverSource == "?") return "?"
+        val owner = bootstrapBorrowPlaceType(inference, scope, receiver)
+        if (owner == "") return "?"
+        val contract = bootstrapBorrowContract(
+            inference, bootstrapBorrowInferenceKey(owner, expression.text)
+        )
+        if (contract == "?") return "?"
+        if (contract == "") return ""
+        var source = receiverSource
+        if (contract != "this") {
+            val index = bootstrapBorrowDeclaredParameter(
+                inference, owner, expression.text, contract
+            )
+            if (index < 0 || index + 1 >= expression.children.size) return "?"
+            source = bootstrapBorrowArgumentSource(
+                inference, scope, expression.children[index + 1]
+            )
+        }
+        return if (source == "" || source == "?") source
+            else "b:${source.slice(2, source.size)}"
+    }
+    "?"
+}
+
+// The declared class of a place under a parameter or `this`, "" if unknown.
+fun bootstrapBorrowPlaceType(
+    inference: BootstrapBorrowInference,
+    scope: BootstrapBorrowScope,
+    expression: BootstrapExpression
+): string {
+    if (expression.kind == "identifier") {
+        if (scope.declared.get(expression.text) != null) return ""
+        if (expression.text == "this") return scope.owner
+        val parameter = bootstrapBorrowParameterIndex(scope, expression.text)
+        if (parameter >= 0) {
+            return bootstrapNormalizeType(scope.parameterTypes[parameter])
+        }
+        return bootstrapBorrowFieldType(inference, scope.owner, expression.text)
+    }
+    if (expression.kind == "member" && expression.children.size > 0) {
+        return bootstrapBorrowFieldType(
+            inference,
+            bootstrapBorrowPlaceType(inference, scope, expression.children[0]),
+            expression.text
+        )
+    }
+    ""
+}
+
+fun bootstrapBorrowFieldType(
+    inference: BootstrapBorrowInference,
+    owner: string,
+    field: string
+): string {
+    val declaration = bootstrapBorrowClassDeclaration(inference, owner)
+    if (declaration == null) return ""
+    var index = 0
+    while (index < declaration.parameters.size) {
+        if (declaration.parameters[index] == field &&
+            index < declaration.parameterTypes.size) {
+            return bootstrapNormalizeType(declaration.parameterTypes[index])
+        }
+        index = index + 1
+    }
+    ""
+}
+
+// The index of the parameter named `contract` in the declaration `key` names.
+fun bootstrapBorrowDeclaredParameter(
+    inference: BootstrapBorrowInference,
+    owner: string,
+    name: string,
+    contract: string
+): int {
+    for (declaration in inference.declarations) {
+        var candidate = declaration
+        var found = false
+        if (owner == "" && declaration.extensionOwner == "" &&
+            declaration.name == name && (declaration.kind == "fun" ||
+            declaration.kind == "compile.fun")) found = true
+        if (owner != "" && declaration.extensionOwner == owner &&
+            declaration.name == name) found = true
+        if (owner != "" && declaration.kind == "class" &&
+            declaration.name == owner) {
+            for (method in declaration.methods) if (method.name == name) {
+                candidate = method
+                found = true
+            }
+        }
+        if (found) {
+            var index = 0
+            while (index < candidate.parameters.size) {
+                if (candidate.parameters[index] == contract) return index
+                index = index + 1
+            }
+            return -1
+        }
+    }
+    -1
+}
+
+// Every `return`'s value in `expression`, outside lambdas.
+fun bootstrapBorrowCollectReturns(
+    expression: BootstrapExpression,
+    var returns: array<BootstrapExpression>
+): void {
+    if (expression.kind == "lambda" || expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator") return
+    if (expression.kind == "return" && expression.children.size > 0) {
+        returns.append(expression.children[0])
+    }
+    for (child in expression.children) bootstrapBorrowCollectReturns(child, returns)
+}
+
+// The source `declaration`'s result borrows from ("" none), given the
+// contracts known so far.
+fun bootstrapBorrowInferDeclaration(
+    inference: BootstrapBorrowInference,
+    declaration: BootstrapDeclaration,
+    owner: string
+): string {
+    val resultType = bootstrapNormalizeType(declaration.resultType)
+    if (declaration.resultType == "inferred" ||
+        bootstrapStartsBorrowResultContract(declaration.resultType) ||
+        declaration.expression.kind == "missing" ||
+        !bootstrapBorrowTypeTracked(inference, resultType, 0) ||
+        !bootstrapBorrowTypeOrdinary(inference, resultType, 0)) return ""
+    var scope = BootstrapBorrowScope(
+        declaration.parameters,
+        declaration.parameterKinds,
+        declaration.parameterTypes,
+        declaration.parameterDefaults,
+        owner,
+        Map(),
+        Map(),
+        Map()
+    )
+    bootstrapBorrowCollectDeclared(scope, declaration.expression)
+    val returns: array<BootstrapExpression> = []
+    bootstrapBorrowCollectReturns(declaration.expression, returns)
+    returns.append(declaration.expression)
+    var contract = ""
+    for (value in returns) {
+        val source = bootstrapBorrowValueSource(inference, scope, value)
+        if (source == "?" || source == "*") return ""
+        if (source != "") {
+            val name = source.slice(2, source.size)
+            if (contract == "") contract = name
+            else if (contract != name) return ""
+        }
+    }
+    contract
+}
+
+fun bootstrapBorrowWithContract(
+    declaration: BootstrapDeclaration,
+    contract: string
+): BootstrapDeclaration = BootstrapDeclaration(
+    declaration.kind,
+    declaration.name,
+    declaration.begin,
+    declaration.end,
+    declaration.expression,
+    declaration.parameters,
+    declaration.parameterTypes,
+    "borrow($contract)${declaration.resultType}",
+    declaration.methods,
+    declaration.parameterDefaults,
+    declaration.externalLibrary,
+    declaration.parameterKinds,
+    declaration.extensionOwner,
+    declaration.isTrusted,
+    declaration.isResource,
+    declaration.isNoEscape,
+    declaration.generatedNamespace,
+    declaration.generatedOriginBegin,
+    declaration.generatedOriginEnd,
+    declaration.annotations,
+    declaration.annotationArguments,
+    declaration.annotationBegins,
+    declaration.annotationEnds,
+    declaration.sourceIdentity
+)
+
+fun bootstrapBorrowIsFunction(declaration: BootstrapDeclaration): bool =
+    declaration.kind == "fun" || declaration.kind == "compile.fun"
+
+fun bootstrapInferBorrowContracts(parsed: BootstrapParseResult): BootstrapParseResult {
+    val inference = BootstrapBorrowInference(Map(), Map(), Map(), parsed.declarations)
+    var index = 0
+    while (index < parsed.declarations.size) {
+        val declaration = parsed.declarations[index]
+        if (declaration.kind == "class") inference.classes.set(declaration.name, index)
+        if (declaration.kind == "val" || declaration.kind == "var") {
+            inference.globals.set(declaration.name, index)
+        }
+        index = index + 1
+    }
+    // The contracts as written ("" none), then inferred ones until nothing
+    // changes: a contract can come from a call to a function inferred before.
+    for (declaration in parsed.declarations) {
+        if (bootstrapBorrowIsFunction(declaration)) {
+            inference.contracts.set(
+                bootstrapBorrowInferenceKey(declaration.extensionOwner, declaration.name),
+                bootstrapBorrowResultSource(declaration.resultType)
+            )
+        }
+        if (declaration.kind == "class") {
+            for (method in declaration.methods) {
+                if (bootstrapBorrowIsFunction(method)) inference.contracts.set(
+                    bootstrapBorrowInferenceKey(declaration.name, method.name),
+                    bootstrapBorrowResultSource(method.resultType)
+                )
+            }
+        }
+    }
+    val inferredKeys: array<string> = []
+    var inferred = 0
+    var changed = true
+    var round = 0
+    while (changed && round < 8) {
+        changed = false
+        for (declaration in parsed.declarations) {
+            if (bootstrapBorrowIsFunction(declaration) &&
+                declaration.generatedNamespace == "") {
+                val key = bootstrapBorrowInferenceKey(
+                    declaration.extensionOwner, declaration.name
+                )
+                if (bootstrapBorrowContract(inference, key) == "") {
+                    val contract = bootstrapBorrowInferDeclaration(
+                        inference, declaration, declaration.extensionOwner
+                    )
+                    if (contract != "") {
+                        inference.contracts.set(key, contract)
+                        inferred = inferred + 1
+                        inferredKeys.append(key)
+                        changed = true
+                    }
+                }
+            }
+            if (declaration.kind == "class" && declaration.generatedNamespace == "") {
+                for (method in declaration.methods) {
+                    val key = bootstrapBorrowInferenceKey(declaration.name, method.name)
+                    if (bootstrapBorrowIsFunction(method) &&
+                        bootstrapBorrowContract(inference, key) == "") {
+                        val contract = bootstrapBorrowInferDeclaration(
+                            inference, method, declaration.name
+                        )
+                        if (contract != "") {
+                            inference.contracts.set(key, contract)
+                            inferred = inferred + 1
+                        inferredKeys.append(key)
+                            changed = true
+                        }
+                    }
+                }
+            }
+        }
+        round = round + 1
+    }
+    if (inferred == 0) return parsed
+    val trace = linuxEnvironment("ABLA_BORROW_INFERENCE_TRACE")
+    if (trace.found && trace.value != "") {
+        for (key in inferredKeys) {
+            linuxWriteStandardError(
+                "abla-borrow-inference $key borrow(${bootstrapBorrowContract(inference, key)})\n"
+            )
+        }
+    }
+
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) {
+        var rewritten = declaration
+        if (bootstrapBorrowIsFunction(declaration) &&
+            !bootstrapStartsBorrowResultContract(declaration.resultType)) {
+            val contract = bootstrapBorrowContract(inference, bootstrapBorrowInferenceKey(
+                declaration.extensionOwner, declaration.name
+            ))
+            if (contract != "" && contract != "?") {
+                rewritten = bootstrapBorrowWithContract(declaration, contract)
+            }
+        }
+        if (declaration.kind == "class") {
+            val methods: array<BootstrapDeclaration> = []
+            var any = false
+            for (method in declaration.methods) {
+                val contract = bootstrapBorrowContract(
+                    inference, bootstrapBorrowInferenceKey(declaration.name, method.name)
+                )
+                if (bootstrapBorrowIsFunction(method) &&
+                    !bootstrapStartsBorrowResultContract(method.resultType) &&
+                    contract != "" && contract != "?") {
+                    methods.append(bootstrapBorrowWithContract(method, contract))
+                    any = true
+                } else methods.append(method)
+            }
+            if (any) rewritten = BootstrapDeclaration(
+                declaration.kind, declaration.name, declaration.begin,
+                declaration.end, declaration.expression, declaration.parameters,
+                declaration.parameterTypes, declaration.resultType, methods,
+                declaration.parameterDefaults, declaration.externalLibrary,
+                declaration.parameterKinds, declaration.extensionOwner,
+                declaration.isTrusted, declaration.isResource,
+                declaration.isNoEscape, declaration.generatedNamespace,
+                declaration.generatedOriginBegin, declaration.generatedOriginEnd,
+                declaration.annotations, declaration.annotationArguments,
+                declaration.annotationBegins, declaration.annotationEnds,
+                declaration.sourceIdentity
+            )
+        }
+        declarations.append(rewritten)
+    }
+    BootstrapParseResult(
+        declarations,
+        parsed.actions,
+        parsed.errors,
+        parsed.extensionErrors,
+        parsed.compileInputPaths,
+        parsed.compileInputContents,
+        parsed.diagnostics
+    )
+}

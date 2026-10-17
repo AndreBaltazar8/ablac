@@ -128,7 +128,9 @@ fi
 
 for program in \
     managed-return-global \
-    managed-return-stored-global; do
+    managed-return-stored-global \
+    managed-return-parameter \
+    managed-return-this; do
     "$compiler" build "$project_root/tests/cases/bootstrap/$program.ab" \
         -o "$output_directory/$program"
     set +e
@@ -141,18 +143,18 @@ for program in \
     fi
 done
 
-"$compiler" build \
-    "$project_root/tests/cases/modules/managed-borrow-results.ab" \
-    -o "$output_directory/managed-borrow-results"
-set +e
-"$project_root/tools/run-limited.sh" \
-    "$output_directory/managed-borrow-results"
-borrow_results_status=$?
-set -e
-if [[ $borrow_results_status -ne 42 ]]; then
-    echo "ownership: managed borrow results expected 42, got $borrow_results_status" >&2
-    exit 1
-fi
+for program in managed-borrow-results inferred-borrow-results; do
+    "$compiler" build "$project_root/tests/cases/modules/$program.ab" \
+        -o "$output_directory/$program"
+    set +e
+    "$project_root/tools/run-limited.sh" "$output_directory/$program"
+    program_status=$?
+    set -e
+    if [[ $program_status -ne 42 ]]; then
+        echo "ownership: $program expected 42, got $program_status" >&2
+        exit 1
+    fi
+done
 
 # Rejected by the typed-CFG checks after lowering: each failure names the
 # mistake, the place and (through source records) where it happens.
@@ -191,7 +193,10 @@ for fixture in \
     invalid-compile-transitive-managed-alias-active-mutation \
     invalid-compile-managed-alias-active-mutation \
     invalid-managed-borrow-result-conflict \
-    invalid-managed-borrow-method-conflict; do
+    invalid-managed-borrow-method-conflict \
+    invalid-inferred-borrow-wrap \
+    invalid-inferred-borrow-parameter \
+    invalid-inferred-borrow-receiver; do
     check_rejected "$fixture" 'error[E_BORROW_CONFLICT]:'
 done
 
@@ -213,8 +218,6 @@ for fixture in \
     invalid-managed-readonly-array-mutation \
     invalid-managed-readonly-array-append \
     invalid-cell-managed-payload \
-    invalid-managed-return-parameter \
-    invalid-managed-return-this \
     invalid-managed-alias-mutable-local \
     invalid-managed-alias-mutation \
     invalid-managed-alias-escape \
@@ -340,6 +343,22 @@ for fixture in \
     [[ ! -e $output ]] || exit 1
 done
 
+
+# In a module whose source an import alias rewrites, the records name the
+# file's own offsets: 284 is `source[0]`, 250 the `move(source)`.
+alias_fixture="$project_root/tests/cases/modules/invalid-move-after-alias.ab"
+set +e
+"$compiler" build "$alias_fixture" -o "$output_directory/alias-move" \
+    >"$output_directory/alias-move.out" 2>"$output_directory/alias-move.err"
+set -e
+if ! grep -Fq "source[ownership]:$alias_fixture:284:285" \
+        "$output_directory/alias-move.err" ||
+    ! grep -Fq "source[ownership]:$alias_fixture:250:251" \
+        "$output_directory/alias-move.err"; then
+    echo "affine move: positions in an aliased module are not the file's" >&2
+    sed -n '1,40p' "$output_directory/alias-move.err" >&2
+    exit 1
+fi
 
 check_rejected invalid-owned-use-after-move 'ownership.use-after-move:ticket:'
 check_rejected invalid-capture-use-after-move 'ownership.use-after-move:ticket:'

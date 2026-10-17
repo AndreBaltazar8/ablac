@@ -499,6 +499,14 @@ Reading `view.value` after `increment(counter)` would be
 it, is still used afterwards`, with a note pointing where `view` borrows
 `counter`.
 
+The contract may be left out. When every return path of a class or array
+result comes from one parameter or from `this` (or is a new object that
+stores it, or a call that borrows from it), the compiler infers
+`borrow(name)`: `fun same(counter: Counter): Counter = counter` and
+`fun get(): Counter = counter` in a method behave as above. A result whose
+paths come from several sources keeps its declared type, and a written
+contract is always kept as written.
+
 ## Sharing: `Cell`, `Shared`, `Weak`, `Mutex`
 
 When one owner isn't enough, these wrappers make sharing explicit:

@@ -2033,7 +2033,7 @@ fun bootstrapCopyRegionCallSummary(
         bootstrapStringSetCopy(source.unsafeMembers),
         bootstrapStringSetCopy(source.retainingReceivers),
         bootstrapStringSetCopy(source.retainingParameters),
-        source.heapFields
+        bootstrapStringSetCopy(source.heapFields)
     )
 }
 
@@ -2287,7 +2287,7 @@ fun bootstrapSemanticHelp(code: string): string {
         "ownership.borrow-store" ->
             "a borrowed value (reached through a parameter or an alias) cannot be stored where it would outlive the borrow: store a new value built from it, or pass and store its owner"
         "ownership.managed-return-borrow-contract" ->
-            "a returned reference must be a new value or rooted in a global: to return a view of a parameter or of `this`, declare the result `borrow(name) T` (the caller then cannot change `name` while it uses the result), or build and return a new value"
+            "a returned reference must be a new value, rooted in a global, or come from one parameter or `this` (the result is then a view of it, and the caller cannot change that argument while it uses the result); this one's source could not be followed (several sources, or a local): return a place under one parameter, declare the result `borrow(name) T`, or build and return a new value"
         "ownership.borrow-return-source" ->
             "every value a `borrow(name) T` result returns must come from `name` (or be new): return a place under `name`, or change the contract"
         "ownership.stored-reference-multiple" ->
@@ -2301,7 +2301,7 @@ fun bootstrapSemanticHelp(code: string): string {
         "ownership.move-required" ->
             "this value has a single owner: give it away with move(name), after which the name can no longer be used"
         "ownership.borrow-escape" ->
-            "a borrowed parameter cannot leave the function: return or store a new value built from it, or take the parameter as `own`"
+            "a borrowed parameter cannot leave the function unless the result says it is a view of it: declare the result `borrow(name) T`, return or store a new value built from it, or take the parameter as `own`"
         "ownership.borrow-exclusive" ->
             "an `own` parameter takes ownership: pass move(name) of a value you own, not a borrowed one"
         "ownership.fnmut-parameter-mode" ->
@@ -6799,11 +6799,10 @@ class BootstrapAnalyzer(
     }
 
     /** A returned borrow that is a new object storing only the function's own
-     *  fresh locals (`val box = Box(); Pair(box, 1)`) or its parameters
-     *  (`fun still(root: N): B = B(root)`). The locals end at the return, and a
-     *  stored parameter is shared with the caller as a class with a `var` field
-     *  (or one assigned after construction) already shares it, so the borrow is
-     *  not an escape. */
+     *  fresh locals (`val box = Box(); Pair(box, 1)`): they end at the return,
+     *  so the borrow is not an escape. One storing a parameter is a view of
+     *  it, which needs a `borrow(parameter)` result (borrow_inference.ab infers
+     *  it for `B(root)` and `val b = B(root); b`). */
     fun returnedBorrowIsOwned(expression: BootstrapExpression): bool {
         var call = expression
         var allowLocals = true
@@ -6829,7 +6828,7 @@ class BootstrapAnalyzer(
         }
         call.kind == "call" && this.findKind(call.text) == "class" &&
             this.constructorStoresOnlyFreshLocals(
-                expression, call, 0, allowLocals, true
+                expression, call, 0, allowLocals, false
             )
     }
 
@@ -6955,6 +6954,33 @@ class BootstrapAnalyzer(
             fresh = this.expressionProducesFreshManagedReference(
                 expression.children[0], depth, allowVisibleLocals
             )
+        }
+        // A view of a new value is that value (borrowResultOfFreshSource).
+        if (!fresh && (expression.kind == "call" ||
+            expression.kind == "member.call") && depth < 32) {
+            val result = if (expression.kind == "call") {
+                this.borrowResultOfFreshSource(
+                    bootstrapFunctionResultType(this.findType(expression.text)),
+                    "", expression, 0
+                )
+            } else {
+                val receiver = bootstrapBorrowElementType(
+                    this.ownershipExpressionType(expression.children[0])
+                )
+                this.borrowResultOfFreshSource(
+                    this.methodResultType(receiver, expression.text),
+                    receiver, expression, 1
+                )
+            }
+            val declared = if (expression.kind == "call") {
+                bootstrapFunctionResultType(this.findType(expression.text))
+            } else this.methodResultType(
+                bootstrapBorrowElementType(
+                    this.ownershipExpressionType(expression.children[0])
+                ),
+                expression.text
+            )
+            fresh = bootstrapIsBorrowType(declared) && !bootstrapIsBorrowType(result)
         }
         if (!fresh && expression.kind == "call" && depth < 32) {
             val declaration = this.functionDeclarations.find(
@@ -8047,9 +8073,14 @@ class BootstrapAnalyzer(
             while (parameter < declaration.parameters.size) {
                 if (declaration.parameters[parameter] == contract) {
                     valid = true
+                    // A view of an ordinary class may come from a `var`
+                    // parameter: the call has ended when the view exists.
                     if (parameter < declaration.parameterKinds.size &&
                         (declaration.parameterKinds[parameter] == "own" ||
-                         declaration.parameterKinds[parameter] == "var")) {
+                         (declaration.parameterKinds[parameter] == "var" &&
+                          this.typeIsAffine(bootstrapBorrowResultElementType(
+                              declaration.resultType
+                          ))))) {
                         this.fail(
                             "ownership.borrow-return-source-mode:$context:$contract"
                         )
@@ -8082,7 +8113,23 @@ class BootstrapAnalyzer(
                     this.fail("ownership.borrow-escape:$context")
                 }
             } else {
-                val source = this.borrowExpressionSource(expression)
+                var source = this.borrowExpressionSource(expression)
+                // `val b = B(p); b`: the block's locals are out of scope by
+                // now, so read the `val`'s initializer.
+                if (source == "" && expression.kind == "block" &&
+                    expression.children.size > 0) {
+                    val tail = expression.children[expression.children.size - 1]
+                    for (statement in expression.children) {
+                        if (tail.kind == "identifier" &&
+                            statement.kind == "local.val" &&
+                            statement.text == tail.text &&
+                            statement.children.size > 0) {
+                            source = this.borrowExpressionSource(
+                                statement.children[0]
+                            )
+                        }
+                    }
+                }
                 if (!bootstrapBorrowSourceMatchesContract(
                     source,
                     this.currentBorrowResultSource
@@ -8112,6 +8159,31 @@ class BootstrapAnalyzer(
                 "ownership.managed-return-borrow-contract:$context:$source"
             )
         }
+    }
+
+    // A call's `borrow(source)` result whose source argument (`this`: the
+    // receiver, at 0) is a new value is that value: nothing else names it.
+    // Views of affine values stay views (the temporary owner is dropped).
+    fun borrowResultOfFreshSource(
+        result: string,
+        owner: string,
+        call: BootstrapExpression,
+        firstArgument: int
+    ): string {
+        if (!bootstrapIsBorrowType(result) ||
+            this.typeIsAffine(bootstrapBorrowElementType(result))) return result
+        val contract = this.borrowCallResultSource(owner, call.text)
+        if (contract == "") return result
+        var index = 0
+        if (contract != "this") {
+            val parameter = this.borrowCallResultParameter(owner, call.text, contract)
+            if (parameter < 0) return result
+            index = parameter + firstArgument
+        }
+        if (index < call.children.size &&
+            this.expressionProducesFreshManagedReference(
+                call.children[index], 0, false
+            )) bootstrapBorrowElementType(result) else result
     }
 
     // A `borrow(source) T` result of an ordinary (non-affine) type returns the
@@ -8181,7 +8253,8 @@ class BootstrapAnalyzer(
                 return true
             }
         }
-        this.expressionProducesFreshManagedReference(expression, 0, true)
+        this.expressionProducesFreshManagedReference(expression, 0, true) ||
+            this.managedReferenceIsStatic(expression)
     }
 
     // A place rooted in a global (`store.rows[i]`), or in a local read from
@@ -10407,6 +10480,9 @@ fun bootstrapInferCall(
         }
     } else {
         result = bootstrapFunctionResultType(functionType)
+        if (symbolKind == "fun" || symbolKind == "compile.fun") {
+            result = analyzer.borrowResultOfFreshSource(result, "", expression, 0)
+        }
         if (bootstrapIsBorrowType(result) &&
             symbolKind != "fun" &&
             symbolKind != "compile.fun") {
@@ -10899,8 +10975,11 @@ fun bootstrapInferMemberCall(
             methodTypes,
             "method.${receiver}.${expression.text}"
         )
-        result = analyzer.methodResultType(
-            receiver, expression.text, expression.begin
+        result = analyzer.borrowResultOfFreshSource(
+            analyzer.methodResultType(receiver, expression.text, expression.begin),
+            receiver,
+            expression,
+            1
         )
         analyzer.recordTypedCall(
             expression,

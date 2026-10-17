@@ -48,17 +48,24 @@ status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
 
-for invalid in invalid-constructor-stores-var-parameter \
-    invalid-constructor-stores-shadowed-parameter; do
-    set +e
-    "$compiler" build "$cases/$invalid.ab" \
-        -o "$output_directory/$invalid" --no-cache --fast \
-        > "$output_directory/$invalid.out" 2>&1
-    stores_status=$?
-    set -e
-    [[ $stores_status -ne 0 ]] || exit 1
-    grep -q 'ownership.borrow-escape' "$output_directory/$invalid.out"
-done
+set +e
+"$compiler" build "$cases/invalid-constructor-stores-shadowed-parameter.ab" \
+    -o "$output_directory/stores-shadowed" --no-cache --fast \
+    > "$output_directory/stores-shadowed.out" 2>&1
+stores_status=$?
+set -e
+[[ $stores_status -ne 0 ]] || exit 1
+grep -q 'ownership.borrow-escape' "$output_directory/stores-shadowed.out"
+
+set +e
+"$compiler" build "$cases/invalid-constructor-stores-parameter-alias.ab" \
+    -o "$output_directory/stores-alias" --no-cache --fast \
+    > "$output_directory/stores-alias.out" 2>&1
+alias_status=$?
+set -e
+[[ $alias_status -ne 0 ]] || exit 1
+grep -q 'E_BORROW_CONFLICT\]: in `main`, `node` is changed while `first`' \
+    "$output_directory/stores-alias.out"
 
 set +e
 "$compiler" build "$cases/invalid-borrow-conflict.ab" \
@@ -94,4 +101,4 @@ for invalid in invalid-shared-loop-append invalid-shared-loop-nested \
         "$output_directory/$invalid.out"
 done
 
-printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return; returned objects may store parameters; borrow conflicts are named; shared loop elements stay read-only'
+printf '%s\n' 'shadowing locals leave the receiver alone; global-rooted references return; returned objects storing parameters are views of them; borrow conflicts are named; shared loop elements stay read-only'

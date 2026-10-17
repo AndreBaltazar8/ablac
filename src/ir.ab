@@ -5955,6 +5955,43 @@ class BootstrapLowerer(
         source
     }
 
+    // Whether `expression` calls a `borrow(source)` function or method with
+    // a new value as the source: sema types its result as that value, not
+    // as a view (borrowResultOfFreshSource).
+    fun lowerBorrowsFromNewValue(expression: BootstrapExpression): bool {
+        var argument: BootstrapExpression? = null
+        if (expression.kind == "call") {
+            val contract = this.lowerBorrowCallResultSource("", expression.text)
+            val parameter = this.lowerBorrowCallResultParameter(
+                "", expression.text, contract
+            )
+            if (contract != "" && parameter >= 0 &&
+                parameter < expression.children.size) {
+                argument = expression.children[parameter]
+            }
+        }
+        if (expression.kind == "member.call" && expression.children.size > 0) {
+            val owner = bootstrapBorrowElementType(
+                this.lowerExpressionType(expression.children[0])
+            )
+            val contract = this.lowerBorrowCallResultSource(owner, expression.text)
+            if (contract == "this") argument = expression.children[0]
+            if (contract != "" && contract != "this") {
+                val parameter = this.lowerBorrowCallResultParameter(
+                    owner, expression.text, contract
+                )
+                if (parameter >= 0 && parameter + 1 < expression.children.size) {
+                    argument = expression.children[parameter + 1]
+                }
+            }
+        }
+        val chosen = argument
+        chosen != null && chosen.kind != "identifier" &&
+            chosen.kind != "member" && chosen.kind != "index" &&
+            chosen.kind != "delegate.project" &&
+            this.lowerBorrowArgumentSource(chosen) == ""
+    }
+
     fun lowerBorrowSource(expression: BootstrapExpression): string {
         var source = ""
         if (expression.kind == "identifier" &&
@@ -6061,6 +6098,17 @@ class BootstrapLowerer(
         if ((expression.kind == "member" || expression.kind == "index") &&
             expression.children.size > 0) {
             source = this.lowerBorrowSource(expression.children[0])
+        }
+        // A new object storing a place is a view of it (sema's stored
+        // reference source).
+        if (expression.kind == "call" && this.isClass(expression.text)) {
+            var argument = 0
+            while (source == "" && argument < expression.children.size) {
+                source = this.lowerBorrowArgumentSource(
+                    expression.children[argument]
+                )
+                argument = argument + 1
+            }
         }
         if (expression.kind == "block" && expression.children.size > 0) {
             source = this.lowerBorrowSource(
@@ -8460,7 +8508,13 @@ fun bootstrapLowerLocal(
                 )) {
                 lowerer.lowerPlacePath(expression.children[0])
             } else lowerer.lowerBorrowSource(expression.children[0])
-            if (source == "") {
+            if (source == "" && !managedAlias &&
+                lowerer.lowerBorrowsFromNewValue(expression.children[0])) {
+                // A view of a new value is that value.
+                lowerer.localTypes[lowerer.localTypes.size - 1] =
+                    bootstrapBorrowElementType(localType)
+                bootstrapSemanticUnit()
+            } else if (source == "") {
                 lowerer.errors = lowerer.errors + 1
                 bootstrapSemanticUnit()
             } else {
@@ -10013,8 +10067,10 @@ fun bootstrapLowerParsed(
 }
 
 fun bootstrapLower(source: string): BootstrapIrProgram {
-    val parsed = bootstrapResolveOverloads(bootstrapResolveExpectedTypes(
-        bootstrapResolveReceiverNames(bootstrapParseStaged(source))
+    val parsed = bootstrapInferBorrowContracts(bootstrapResolveOverloads(
+        bootstrapResolveExpectedTypes(
+            bootstrapResolveReceiverNames(bootstrapParseStaged(source))
+        )
     ))
     bootstrapLowerParsed(parsed, bootstrapAnalyzeParsed(parsed))
 }
