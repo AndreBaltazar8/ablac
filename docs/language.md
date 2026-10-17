@@ -702,9 +702,14 @@ fun main {
   from the body (joined with what its `return`s give), and callers use it as
   they would a declared one (below).
 - Parameters may have defaults, which may refer to earlier parameters.
-  Arguments may be passed by name after the positional ones (see the
-  known issue below about methods). Each argument
-  is evaluated once, in source order. Unknown, duplicate, out-of-order or
+  Arguments may be passed by name after the positional ones, to functions,
+  constructors, methods and extension functions. Each argument (and a method
+  call's receiver, first) is evaluated once, in source order. A method's
+  default reads the receiver's fields (an extension's through `this`), never
+  a caller's variable of the same name. A named method call is resolved before types are known: every class
+  method and extension of that name with those parameter names must take the
+  same parameters (and fill an omitted one the same way), otherwise it is
+  `E_NAMED_ARGUMENT_TARGET` and the arguments go by position. Unknown, duplicate, out-of-order or
   missing required names are errors (`E_NAMED_ARGUMENT_UNKNOWN`,
   `_DUPLICATE`, `_ORDER`, `_REQUIRED`).
 - Parameters borrow their arguments; `var` and `own` change that
@@ -714,10 +719,6 @@ fun main {
 
 > Known issue (being fixed by ct-rt): today a stack overflow ends the
 > program with exit status 139 and no message.
-
-> Known issue (being fixed by ablac-backend): named arguments currently work
-> only for top-level functions and constructors; a method call with them is
-> `E_NAMED_ARGUMENT_TARGET`.
 
 An inferred result works the same for functions, methods, extensions and
 compile funs, at runtime and under `#`:
