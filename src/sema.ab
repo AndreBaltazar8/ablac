@@ -4998,7 +4998,10 @@ class BootstrapAnalyzer(
     // fresh local passed to a constructor is moved when this body never
     // reads it again.
     var currentBody: BootstrapExpression =
-        BootstrapExpression("missing", "", 0, 0, [])
+        BootstrapExpression("missing", "", 0, 0, []),
+    // Inside a `#` expression reached from run-time code: the locals before
+    // this index are the run-time code's, which don't exist when it runs.
+    var compileLocalBarrier: int = -1
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -5289,12 +5292,13 @@ class BootstrapAnalyzer(
             }
             refinementIndex = refinementIndex + 1
         }
+        // In a method, a field shadows a top-level binding of its name.
+        if (result == "unknown" && this.currentOwner != "") {
+            result = this.fieldType(this.currentOwner, name)
+        }
         if (result == "unknown") {
             val index = this.symbolIndex(name)
             if (index >= 0) result = this.symbols[index].type
-        }
-        if (result == "unknown" && this.currentOwner != "") {
-            result = this.fieldType(this.currentOwner, name)
         }
         if (result == "unknown" && name == "github") {
             result = "function:(string)->ImportSource"
@@ -5367,6 +5371,11 @@ class BootstrapAnalyzer(
                 result = this.locals[localIndex].type
             }
             localIndex = localIndex + 1
+        }
+        // A field is stored as itself, whatever a top-level delegate of its
+        // name stores.
+        if (result == "unknown" && this.currentOwner != "") {
+            result = this.fieldType(this.currentOwner, name)
         }
         if (result == "unknown") {
             val index = this.symbolIndex(name)
@@ -5488,6 +5497,24 @@ class BootstrapAnalyzer(
         while (index < this.locals.size) {
             if (this.locals[index].name == name &&
                 this.locals[index].scope == this.currentScope) found = true
+            index = index + 1
+        }
+        found
+    }
+
+    /** Whether `name` here is a visible local or (in a method) a field: then it
+     *  isn't the top-level binding of that name, in any module. */
+    fun shadowsGlobal(name: string): bool =
+        this.hasVisibleLocal(name) || (this.currentOwner != "" &&
+            this.fieldType(this.currentOwner, name) != "unknown")
+
+    /** The visible local named `name` (the innermost), -1 none. */
+    fun visibleLocalIndex(name: string): int {
+        var found = -1
+        var index = 0
+        while (index < this.locals.size) {
+            if (this.locals[index].name == name &&
+                this.scopeIsVisible(this.locals[index].scope)) found = index
             index = index + 1
         }
         found
@@ -6884,7 +6911,7 @@ class BootstrapAnalyzer(
             // `move(global)` is already rejected; this closes the implicit form
             // (`val local = global`, `return global`, owned arguments, fields).
             if (expression.kind == "identifier" &&
-                !this.hasVisibleLocal(expression.text)) {
+                !this.shadowsGlobal(expression.text)) {
                 val globalKind = this.findKind(expression.text)
                 if (globalKind == "val" || globalKind == "var") {
                     this.fail(
@@ -7489,28 +7516,41 @@ class BootstrapAnalyzer(
             }
             capture = capture + 1
         }
-        if (this.threadUsesMutableGlobal(body)) {
+        var declared: array<string> = []
+        bootstrapCollectDeclaredNames(body, declared)
+        if (this.threadUsesMutableGlobal(body, declared)) {
             this.fail("thread.mutable-global")
         }
     }
 
-    fun threadUsesMutableGlobal(expression: BootstrapExpression): bool {
+    // A global `var` the thread body names: not a local or field of the code
+    // starting the thread, nor a name the body declares itself.
+    fun threadNamesMutableGlobal(name: string, declared: array<string>): bool {
+        if (name == "" || this.shadowsGlobal(name)) return false
+        for (local in declared) if (local == name) return false
+        this.findKind(name) == "var"
+    }
+
+    fun threadUsesMutableGlobal(
+        expression: BootstrapExpression,
+        declared: array<string>
+    ): bool {
         var found = false
         if ((expression.kind == "identifier" ||
              expression.kind == "assign") &&
-            this.findKind(expression.text) == "var") found = true
+            this.threadNamesMutableGlobal(expression.text, declared)) found = true
         if ((expression.kind == "member.assign" ||
              expression.kind == "index.assign") &&
             expression.children.size > 0) {
             val root = bootstrapPlaceRootName(expression.children[0])
-            if (root != "" && this.findKind(root) == "var") found = true
+            if (this.threadNamesMutableGlobal(root, declared)) found = true
         }
         if (expression.kind != "lambda" &&
             expression.kind != "lambda.move") {
             var child = 0
             while (!found && child < expression.children.size) {
                 found = this.threadUsesMutableGlobal(
-                    expression.children[child]
+                    expression.children[child], declared
                 )
                 child = child + 1
             }
@@ -7871,7 +7911,8 @@ class BootstrapAnalyzer(
         if (root == "") false
         else if (this.hasVisibleLocal(root)) {
             this.visibleBorrowSource(root) == "managed.static"
-        } else this.findKind(root) == "val" || this.findKind(root) == "var"
+        } else if (this.shadowsGlobal(root)) false
+        else this.findKind(root) == "val" || this.findKind(root) == "var"
     }
 
     // A block's value read, through its own `val` locals, from a global.
@@ -9242,9 +9283,12 @@ fun bootstrapInferCompile(
     // becomes a program value (ct_lift.ab).
     val lifted = bootstrapLiftDiscardedAction == 0
     bootstrapLiftDiscardedAction = 0
+    val previousBarrier = analyzer.compileLocalBarrier
+    if (analyzer.compileDepth == 0) analyzer.compileLocalBarrier = analyzer.locals.size
     analyzer.compileDepth = analyzer.compileDepth + 1
     result = analyzer.infer(expression.children[0])
     analyzer.compileDepth = analyzer.compileDepth - 1
+    analyzer.compileLocalBarrier = previousBarrier
     val problem = if (lifted) bootstrapLiftTypeProblem(analyzer, result) else ""
     if (problem != "") analyzer.fail("compile.result: $problem")
     result
@@ -9296,6 +9340,26 @@ fun bootstrapInferArray(
     result
 }
 
+/** The names `expression` declares anywhere inside it: locals, loop
+ *  variables, lambda parameters. */
+fun bootstrapCollectDeclaredNames(
+    expression: BootstrapExpression,
+    var names: array<string>
+): void {
+    if (expression.kind == "local.val" || expression.kind == "local.var" ||
+        expression.kind == "for") names.append(expression.text)
+    if ((expression.kind == "lambda" || expression.kind == "lambda.move") &&
+        expression.children.size > 0) {
+        var parameter = 0
+        while (parameter + 1 < expression.children.size) {
+            names.append(expression.children[parameter].text)
+            parameter = parameter + 1
+        }
+    }
+    for (child in expression.children) bootstrapCollectDeclaredNames(child, names)
+    return
+}
+
 @noinline
 fun bootstrapInferRange(
     var analyzer: BootstrapAnalyzer,
@@ -9323,8 +9387,15 @@ fun bootstrapInferIdentifier(
     val kind = analyzer.findKind(expression.text)
     // A local of the same name (in any module) is the local, not the global.
     if ((kind == "compile.val" || kind == "compile.var") &&
-        analyzer.compileDepth == 0 && !analyzer.hasVisibleLocal(expression.text)) {
+        analyzer.compileDepth == 0 && !analyzer.shadowsGlobal(expression.text)) {
         analyzer.fail("compile.value-runtime:${expression.text}")
+    }
+    // `#(n * 2)` in run-time code: `n` is computed when the program runs, after
+    // the compile-time expression was evaluated.
+    if (analyzer.compileDepth > 0 && analyzer.compileLocalBarrier >= 0 &&
+        analyzer.visibleLocalIndex(expression.text) >= 0 &&
+        analyzer.visibleLocalIndex(expression.text) < analyzer.compileLocalBarrier) {
+        analyzer.fail("compile.runtime-local:${expression.text}@${expression.begin}")
     }
     if (result == "unknown") analyzer.fail(
         "identifier:${expression.text}@${expression.begin}"
@@ -9660,6 +9731,12 @@ fun bootstrapInferCall(
         }
     }
     val symbolKind = analyzer.findKind(expression.text)
+    // A `compile fun` runs while the program is compiled, so run-time code
+    // reaches it only through `#`.
+    if (symbolKind == "compile.fun" && analyzer.compileDepth == 0 &&
+        !analyzer.shadowsGlobal(expression.text)) {
+        analyzer.fail("compile.call-runtime:${expression.text}@${expression.begin}")
+    }
     val primitiveType = if (bootstrapScalarTypeUnderlyingValid(
         bootstrapNormalizeType(expression.text)
     )) bootstrapNormalizeType(expression.text) else ""
@@ -10877,7 +10954,7 @@ fun bootstrapInferAssign(
         !analyzer.fieldIsMutable(analyzer.currentOwner, expression.text)) {
         analyzer.fail("field.immutable:${expression.text}")
     }
-    if (!analyzer.hasVisibleLocal(expression.text) &&
+    if (!analyzer.shadowsGlobal(expression.text) &&
         analyzer.findKind(expression.text) == "val") {
         analyzer.fail("global.immutable:${expression.text}")
     }
