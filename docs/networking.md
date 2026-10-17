@@ -79,6 +79,87 @@ fun main {
 closed, and error readiness without giving the poller ownership of watched
 sockets.
 
+## HTTP routing
+
+`abla/http` separates routing from transport: a router maps a method and a
+path pattern to a handler, and `dispatch` runs it for one request. The
+same router serves `serveHttp(router, port)`, the event server below, or a
+test that builds requests by hand:
+
+```abla
+import "abla/io"
+import "abla/http"
+
+fun showUser(request: HttpRequest): HttpResponse =
+    httpText("user ${request.routeParameter("id")}, verbose=${request.queryParameter("verbose")}")
+
+fun createUser(request: HttpRequest): HttpResponse =
+    httpJson("{\"created\":\"${request.body}\"}", 201)
+
+fun main {
+    val router = httpRouter()
+    router.get("/users/:id", showUser)
+    router.post("/users", createUser)
+    val first = router.dispatch(httpParseRequest("GET /users/42?verbose=1 HTTP/1.1\r\nHost: example\r\n\r\n"))
+    println("${first.status} ${first.body}")
+    val second = router.dispatch(httpPost("/users", "ada"))
+    println("${second.status} ${second.header("Content-Type")} ${second.body}")
+    val missing = router.dispatch(httpGet("/nowhere"))
+    println("${missing.status} ${httpStatusReason(missing.status)}")
+}
+// output:
+// 200 user 42, verbose=1
+// 201 application/json {"created":"ada"}
+// 404 Not Found
+```
+
+| Function | Purpose |
+|---|---|
+| `httpRouter(versionHeader = "Abla-Version")` | a router; `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, `route(method, pattern, handler)` add routes; `:name` segments are parameters |
+| `router.version("2025-01-01").get(...)` | a versioned route, chosen by the version header ([standard-library.md](standard-library.md#http-versioning)) |
+| `router.dispatch(request)` | the response for one request (404 when no route matches) |
+| `request.header(name)`, `routeParameter(name)`, `queryParameter(name)`, `parameter(name)` | request accessors (`""` when absent; header names are case-insensitive) |
+| `httpText(body, status = 200)`, `httpJson(body, status = 200)` | responses with a content type |
+| `httpGet(path)`, `httpPost(path, body)`, `httpRequest(method, path, body, headers)` | build a request |
+| `httpParseRequest(text)`, `httpParseResponse(text)`, `response.render()` | parse and render the wire format |
+| `serveHttp(router, port)`, `serveHttpOnce`, `serveHttpOnListener` | serve over TCP |
+| `httpIpv4Client(...)`, `httpsClient(host, port, maxBytes, timeout)` (from `abla/http/tls`), `client.send(request)` | send requests |
+
+### Portable sockets: `abla/net/hosted`
+
+`abla/net` speaks to the Linux kernel directly. `abla/net/hosted` offers the
+same kind of resources on Linux and macOS, with host-name resolution:
+
+```abla
+import "abla/io"
+import "abla/net/hosted"
+
+fun main {
+    val listener = hostedTcpListen("127.0.0.1", 0)       // port 0: any free port
+    val client = hostedTcpConnect("127.0.0.1", listener.localPort())
+    val server = listener.accept()
+    client.writeResult("ping")
+    println("server got ${server.readResult(1024).bytes}")
+    server.writeResult("pong")
+    println("client got ${client.readResult(1024).bytes}")
+}
+// output:
+// server got ping
+// client got pong
+```
+
+| Function | Result |
+|---|---|
+| `hostedTcpConnect(host, port, timeoutMilliseconds = 5000)` | a `HostedTcpConnection`; `host` may be a name |
+| `hostedTcpListen(host = "::", port = 0, backlog = 128, dualStack = true)` | a `HostedTcpListener`, with `accept()` and `localPort()` |
+| `connection.readResult(maximum)`, `readNetwork(...)` | a read result: `bytes` plus `hasData()`, `reachedEof()`, `wouldBlock()`, `failed()` |
+| `connection.writeResult(text)`, `writeNetwork(...)` | a write result |
+| `setNonblocking(enabled)`, `close()` | on connections and listeners |
+| `hostedUdpBind(host = "::", port = 0, dualStack = true)` | a `HostedUdpSocket` |
+| `hostedSocketPoller()` | readiness for many sockets: epoll on Linux, kqueue on macOS |
+
+All of these are resources: they close when their owner goes away.
+
 ## WebSockets
 
 `abla/websocket` contains a transport-independent RFC 6455 frame codec and an
@@ -119,6 +200,28 @@ complete echo service. Server peers must send masked frames.
 `result`, and structured error envelopes. The RPC router is deliberately
 separate from transport, allowing generated `@rpc` adapters to share dispatch
 logic across HTTP, WebSockets, NATS, or local calls.
+
+```abla
+import "abla/io"
+import "abla/json"
+import "abla/websocket/rpc"
+
+fun add(params: Json): Json = jsonInteger(params.getInt("a") + params.getInt("b"))
+
+fun main {
+    val rpc = webSocketRpcRouter()
+    rpc.route("add", add)
+    println(jsonStringify(rpc.dispatch($json {"id": 1, "method": "add", "params": {"a": 2, "b": 40}})))
+    println(jsonStringify(rpc.dispatch($json {"id": 2, "method": "nope"})))
+}
+// output:
+// {"id":1,"result":42}
+// {"id":2,"error":{"code":"method_not_found","message":"RPC method was not found"}}
+```
+
+`rpc.serveNext(connection, ...)` reads one JSON message from a WebSocket
+connection, dispatches it and sends the reply. `connection.sendJson(value)`
+and `connection.readJson(limits, timeout)` come from `abla/websocket/json`.
 
 For multiplexed services, `abla/websocket/event` owns all accepted connections
 in one bounded epoll loop. It validates masking, UTF-8, fragmentation, ping,
@@ -222,6 +325,14 @@ val result = jwks.verify(token, JwtOptions(issuer = "Example"))
 if (result.valid) admit(result.subject) else refuse(result.error)
 ```
 
+| Function | Result |
+|---|---|
+| `jwtKeySet(jwksJson)` | a `JwtKeySet` from a JWKS document; `size()`, `hasKey(kid)` |
+| `keySet.verify(token, JwtOptions(...))` | a `JwtVerification(valid, error, subject, kid, header, claims)` |
+| `JwtOptions(issuer = "", audience = "", clockToleranceSeconds = 0, requireSubject = true, nowSeconds = -1)` | the claims to enforce; a negative `nowSeconds` reads the clock |
+| `jwtDecodeUnverified(token)` | the claims as `Json`, **without** checking the signature: for logging only |
+| `jwksCache(url, ...)`, `cache.verify(token, options)` | from `abla/jwt/remote`: a cached, refreshed remote key set |
+
 ## DNS and TLS
 
 `abla/dns` encodes bounded A/AAAA queries and parses compressed response names
@@ -229,12 +340,26 @@ without recursive allocation or unbounded pointer traversal. The raw resolver
 uses a configured IPv4 nameserver from `/etc/resolv.conf`; `tcpConnectHost`
 tries numeric literals first and then bounded AAAA/A results.
 
+| Function | Result |
+|---|---|
+| `dnsResolve(host, timeoutMilliseconds = 2000, server = "")` | a `DnsResolution(addresses, succeeded, timedOut, errorCode)`; each `DnsAddress` has `family`, `address` and `ttlSeconds` |
+| `tcpConnectHost(host, port, timeoutMilliseconds = 5000)` | a `TcpConnection` to the first address that answers |
+| `dnsQuery(host, recordType, identifier)`, `dnsParseResponse(...)` | the wire codec, for custom resolvers |
+
 `abla/tls/hosted` dynamically loads OpenSSL 1.1 or 3 only when imported. Client
 connections enable peer verification, system trust, SNI, and hostname checks.
 An explicit CA-file connector and certificate/private-key listener support
 local and private PKI deployments. `abla/http/tls` and `abla/websocket/tls`
 provide HTTPS and WSS client transports. Hosted secure random is supplied by
 `abla/random/hosted` on Linux and macOS.
+
+| Function | Result |
+|---|---|
+| `tlsConnect(host, port = 443, timeoutMilliseconds = 5000)` | a verified `TlsConnection`, with `read`, `write` and `close` |
+| `tlsConnectWithCa(host, caPath, port, timeout)` | the same, trusting the given CA file |
+| `tlsUpgrade(var connection, host, caPath = "")` | start TLS on an existing TCP connection |
+| `tlsListen(certificatePath, privateKeyPath, host = "::", port = 443, ...)` | a `TlsListener`, with `accept()` |
+| `tlsAvailable()`, `tlsLastError()` | whether OpenSSL could be loaded, and the last error |
 
 ## Persistent HTTP and streaming
 
@@ -274,6 +399,28 @@ server.run()
 `abla/http/stream` supplies chunk encoders and decoders, gzip responses, and
 Server-Sent Events framing. The base HTTP client transparently recognizes
 complete chunked responses, including HTTPS replies.
+
+```abla
+import "abla/http/stream"
+import "abla/io"
+
+fun main {
+    print(serverSentEvent("first line\nsecond line", "update", "7").encode())
+    println("chunk: ${httpChunkEncode("hello").size} bytes")
+}
+// output:
+// event: update
+// id: 7
+// data: first line
+// data: second line
+//
+// chunk: 10 bytes
+```
+
+`sseResponseHead()` starts an event stream response, and `sseChunk(event)`
+frames one event as a chunk. `httpGzipResponse(request, response, minimum)`
+compresses a response when the client accepts gzip, and
+`httpChunkedResponse` streams a body in chunks.
 
 ## HTTP upgrade behavior
 

@@ -99,7 +99,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | `abla/crypto`, `abla/date` | [stdlib/security-and-dates.md](stdlib/security-and-dates.md) | good | crypto, date |
 | `abla/test`, `ablac test` | [stdlib/testing.md](stdlib/testing.md) | good | test-ablac-test |
 | `abla/json`, `abla/http/json` | [json.md](json.md) | good | json-subparser, json-expressions, runtime-json, test-json-limits |
-| `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/jwt` | [networking.md](networking.md) | reference (some modules mentioned only) | linux-net, http-*, websocket-*, tls, jwt |
+| `abla/net`, `abla/net/hosted`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/jwt` | [networking.md](networking.md) | good (HTTP routing, hosted sockets, RPC, SSE run; servers build-only) | linux-net, hosted-network, http-*, websocket-*, tls, jwt |
 | `abla/memory` | [standard-library.md](standard-library.md) | reference | runtime-memory-* |
 | `abla/html` | [subparsers.md](subparsers.md) | mentioned | html-subparser |
 | `abla/compression/gzip`, `abla/process/supervisor`, `abla/net/contracts` | [standard-library.md](standard-library.md) | mentioned | http-advanced, host-process-configured |
@@ -110,9 +110,8 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 
 - `ABLA_COMPILE_EVAL` and compile-time native calls: to be documented when
   they land.
-- Networking modules that are named but not explained: `abla/net/hosted`,
-  `abla/dns`, `abla/http/stream`, `abla/websocket/json`, `/rpc`, `/event`,
-  `/tls`, `abla/tls/hosted`, and `abla/jwt` key sets.
+- Networking: `abla/websocket/event`, `abla/websocket/tls` and
+  `abla/http/async` have prose and fragments but no runnable example.
 - `abla/html`, `abla/compression/gzip`, `abla/llvm/*`.
 - The compiler API: a per-function reference for type handles, class
   fields, generic substitution, the raw parser cursor functions and the
