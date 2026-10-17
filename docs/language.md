@@ -284,6 +284,14 @@ fun main {
   is negative or at least the width gives zero.
 - Mixing types (`f64 + int`, `string + int`) is `arithmetic.type`. Mixing
   bit-operation types is `bitwise.type`.
+- Division or remainder by zero panics with "division by zero" (exit
+  status 101). Under `#` it is a compile-time error, and a divisor that is
+  the constant zero is rejected when the program is type-checked. The
+  smallest value divided by `-1` wraps to itself, and its remainder is 0.
+
+> Known issue (being fixed by ct-rt): today division and remainder by zero
+> quietly give 0 at run time (`7 % 0` gives 7 under `#`), and
+> `-9223372036854775808 / -1` gives 0 at run time.
 
 > Known issue (being fixed by ablac-backend): an `int` argument passed to a parameter of a narrower type
 > (`u8`, `i32`, ...) is narrowed implicitly, without a conversion call. Write
@@ -324,7 +332,9 @@ compile time too, with identical results.
 
 A `string` is immutable UTF-8. `size` is its length in bytes; `text[i]` is
 the byte at `i` as an `int`; `slice(begin, end)` copies a byte range; `+`
-concatenates two strings. `for (b in text)` iterates over the bytes.
+concatenates two strings. `==` compares contents, and `<`, `<=`, `>`, `>=`
+compare byte by byte, lexicographically. `for (b in text)` iterates over the
+bytes.
 `abla/text` adds the usual helpers (`split`, `trim`, `startsWith`,
 `indexOf`, `replace`, ...) and code-point access; see
 [standard-library.md](standard-library.md).
@@ -357,8 +367,14 @@ fun main {
 - `append(value)` adds at the end, `truncate(n)` keeps the first `n`
   elements, `clear()` removes all, and `filledArray(count, value)` creates a
   filled array.
-- Reading or writing outside the array stops the program with a trap and a
-  stack trace.
+- Reading or writing outside the array panics with the index and the size
+  ("index 5 out of bounds for array of size 3", exit status 101). The same
+  holds for a string index or slice.
+
+> Known issue (being fixed by ct-rt): out-of-bounds accesses currently stop
+> the program with "fatal signal" and a stack trace but no reason, and
+> ordered comparison of strings type-checks but crashes the native program.
+
 - Changing an array you received as a parameter needs a `var` parameter
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)). An array of
   resources owns its elements.
@@ -549,14 +565,17 @@ fun main {
   from the body. Until the known issue below is fixed, write the result
   type whenever callers use the result.
 - Parameters may have defaults, which may refer to earlier parameters.
-  Arguments to top-level functions and constructors may be passed by name
-  after the positional ones (methods take positional arguments only,
-  `E_NAMED_ARGUMENT_TARGET`). Each argument
+  Arguments may be passed by name after the positional ones (see the
+  known issue below about methods). Each argument
   is evaluated once, in source order. Unknown, duplicate, out-of-order or
   missing required names are errors (`E_NAMED_ARGUMENT_UNKNOWN`,
   `_DUPLICATE`, `_ORDER`, `_REQUIRED`).
 - Parameters borrow their arguments; `var` and `own` change that
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)).
+
+> Known issue (being fixed by coordinator): named arguments currently work
+> only for top-level functions and constructors; a method call with them is
+> `E_NAMED_ARGUMENT_TARGET`.
 
 > Known issue (being fixed by ct-infer): a result inferred from
 > `fun inc(a: int) = a + 1` is currently unknown to its callers, so `inc(41) + 1` fails with
@@ -1034,7 +1053,13 @@ names, literals, fields and indexes, never a call
 (`E_PARSE_COMPOUND_ASSIGNMENT_TARGET`). Only names, fields, indexes and
 `^name` can be assigned (`E_PARSE_ASSIGNMENT_TARGET`).
 
-`==` compares numbers, booleans, strings (by content) and `null`.
+`==` and `!=` compare numbers, booleans and strings by value, and class
+objects and arrays by identity: two separately created objects with equal
+fields are not `==`. Any value can be compared with `null`.
+
+> Known issue (being fixed by ct-parity): under `#`, `==` currently compares
+> objects and arrays by their contents, so `[1, 2] == [1, 2]` is `true` at
+> compile time and `false` at run time.
 
 ## Control flow
 

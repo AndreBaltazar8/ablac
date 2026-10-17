@@ -166,12 +166,20 @@ in an earlier check. Some ownership mistakes are currently reported this
 way:
 
 - A use after `move`, a double move, a move on only one branch, a partly
-  moved owner, a second call of an `FnOnce`, and a `var` read before it is
-  assigned show up as `E_IR_FUNCTION_VERIFICATION: function X violated a
-  typed IR invariant`, with no variable name.
+  moved owner, a second call of an `FnOnce`, a task awaited twice, and a
+  `var` read before it is assigned show up as `E_IR_FUNCTION_VERIFICATION:
+  function X violated a typed IR invariant`, with no variable name (being
+  fixed by ct-own).
 - Calling a `compile fun` from run-time code shows up as
   `E_LLVM_INSTRUCTION_UNSUPPORTED: function main cannot lower ... call target
-  <name>`.
+  <name>` (being fixed by ct-parity).
+- An unknown `$name` subparser (usually a missing import) shows up only as
+  `E_LLVM_INSTRUCTION_UNSUPPORTED ... target subparser.placeholder` (being
+  fixed by coordinator).
+- `E_NAMED_ARGUMENT_*` errors are surrounded by internal errors, and their
+  `source[named-argument]` record lacks the file name (being fixed by
+  coordinator). An ambiguous overload is followed by a stray `call.target`
+  (being fixed by coordinator).
 
 If you hit one that doesn't follow from an earlier error, it is a compiler
 bug worth reporting with the smallest program that shows it.
