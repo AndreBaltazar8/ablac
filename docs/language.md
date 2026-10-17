@@ -369,19 +369,19 @@ fun main {
 - An array literal's elements must share one type (`array.element-type`).
   An empty literal needs a declared type.
 - `append(value)` adds at the end, `truncate(n)` keeps the first `n`
-  elements, `clear()` removes all, and `filledArray(count, value)` creates a
-  filled array.
+  elements (`0 <= n <= size`), `clear()` removes all, and
+  `filledArray(count, value)` creates a filled array.
 - Reading or writing outside the array panics with the index and the size
   ("index 5 out of bounds for array of size 3", exit status 101). The same
   holds for a string index or slice.
-
-> Known issue (being fixed by ct-rt): out-of-bounds accesses currently stop
-> the program with "fatal signal" and a stack trace but no reason, and
-> ordered comparison of strings type-checks but crashes the native program.
-
 - Changing an array you received as a parameter needs a `var` parameter
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)). An array of
   resources owns its elements.
+
+> Known issue (being fixed by ct-rt): out-of-bounds accesses (including
+> `truncate` outside `0..size` and a negative `filledArray` count) currently
+> stop the program with "fatal signal" and a stack trace but no reason, and
+> ordered comparison of strings type-checks but crashes the native program.
 
 ### Maps
 
