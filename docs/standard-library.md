@@ -1,56 +1,93 @@
-# Standard library architecture
+# Standard library
 
-Abla's standard library is source-modular. Importing one feature must not pull
-unrelated policy or compiler machinery into the program:
+The standard library is a set of ordinary Abla modules, imported by path:
+`import "abla/text"`. Importing a module pulls in only that module and what it
+needs, so a program that never touches JSON, TLS or the compiler doesn't
+carry them.
+
+## By task
+
+| Page | Modules |
+|---|---|
+| [Text, bytes and number formatting](stdlib/text.md) | `abla/text`, `abla/bytes`, `abla/float/text` |
+| [Console, files, processes and time](stdlib/system.md) | `abla/io`, `abla/fs`, `abla/process/*` |
+| [Numbers, bits and randomness](stdlib/numbers.md) | `abla/core`, `abla/math`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` |
+| [Hashing, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/date` |
+| [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
+| [JSON](json.md) | `abla/json`, `abla/http/json`, `$json` |
+| [Networking](networking.md) | `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/jwt` |
+| [Compiler API](compiler-api.md), [subparsers](subparsers.md), [programmable builds](programmable-builds.md) | `abla/compiler`, `abla/compiler/parser`, `abla/build`, `abla/wasm/build`, `abla/android/build` |
+
+Built into the language rather than imported: `string`, arrays, `Map`,
+`Cell`, `Shared`, `Weak`, `Mutex`, tasks, threads, generators and
+`region { ... }` ([language.md](language.md)).
+
+## All modules
 
 | Import | Responsibility |
 |---|---|
-| `abla/core` | phase-safe scalar helpers |
-| `abla/math` | phase-safe numeric algorithms |
-| `abla/bits` | named compatibility functions for native 64-bit bit operations |
-| `abla/bytes` | phase-safe owned byte buffers, byte encoding, borrowed slices, stable hashing |
-| `abla/crypto` | portable SHA-256, protocol SHA-1, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison, and legacy MD5 |
-| `abla/text` | phase-safe UTF-8 validation, scalar indexing, and slicing |
-| `abla/io` | portable console, EOF-aware line input, and callback-backed buffered text writers |
-| `abla/io/buffered` | opt-in buffered file writer adapter |
-| `abla/process/supervisor` | hosted child-process launch, isolated logs, polling, process-tree termination, monotonic timing, and processor discovery |
+| `abla/core` | `int.abs()`, `int.sign()` |
+| `abla/math` | numeric algorithms: integer `min`/`max`/`clamp`, `f64` functions and constants |
+| `abla/float` | `f64`/`f32` conversions and bit patterns |
+| `abla/float/text` | shortest round-trip `f64` text and parsing; needed to interpolate floats |
+| `abla/integer` | exact integer intrinsics (`u32.countLeadingZeros()`) |
+| `abla/bits` | named functions for 64-bit bit operations |
+| `abla/bytes` | byte buffers, byte encoding, borrowed slices, stable hashing |
+| `abla/text` | string helpers (split, trim, replace, ...) and UTF-8 validation, code points and slicing |
+| `abla/crypto` | SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
+| `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
+| `abla/test` | checks for test programs run by `ablac test` |
+| `abla/io` | console output, end-of-input-aware line input, buffered text writers |
+| `abla/io/buffered` | buffered file writer |
 | `abla/fs` | `Path`, metadata, atomic text writes, directory entries, watches |
-| `abla/process` | `Command`, `ChildProcess`, arguments, sleep, and monotonic timing |
-| `abla/process/arguments`, `/command`, `/time` | size-selectable portable process capabilities, including an affine allocation-free clock |
-| `abla/random` | bounded cryptographic entropy using raw Linux `getrandom` |
-| `abla/random/hosted` | bounded `/dev/urandom` entropy for Linux and macOS hosted programs |
-| `region { ... }` | compiler-checked lexical allocation generation (language construct) |
-| `abla/runtime/memory` | internal emitted checkpoint/live-byte/budget/collection intrinsics used by the portable facade, compiler, and tests |
+| `abla/process` | arguments, environment, commands, exit, time: everything below |
+| `abla/process/arguments`, `/environment`, `/command`, `/exit`, `/time` | the same, one capability per import, including an affine allocation-free clock |
+| `abla/process/supervisor` | hosted child-process launch, isolated logs, polling, process-tree termination, monotonic timing, and processor discovery |
+| `abla/random` | bounded cryptographic entropy (`getrandom`) |
+| `abla/random/hosted` | the same function under its hosted name, `hostedSecureRandomBytes` |
+| `abla/random/result` | `SecureRandomResult` |
+| `abla/memory` | heap limit, collection mode, `memoryCollect()`, live-byte statistics |
+| `abla/json` | [bounded JSON parsing, deterministic serialization, and `$json` literals](json.md) |
+| `abla/html` | HTML data model and the `$html` subparser |
 | `abla/net` | affine dual-stack TCP/UDP sockets, structured I/O results, deadlines, and epoll readiness on raw Linux |
+| `abla/net/contracts` | transport-neutral network outcome types |
 | `abla/net/hosted` | DNS-capable dual-stack TCP/UDP plus epoll on Linux and kqueue on macOS |
 | `abla/dns` | bounded DNS A/AAAA codec, compression-pointer parser, UDP resolver, and hostname connect helper |
 | `abla/http` | HTTP/1 client/server, chunk-aware client parsing, pluggable transport, and version-aware routing |
 | `abla/http/stream` | keep-alive/chunked policy, gzip negotiation, and Server-Sent Events framing |
 | `abla/http/event` | bounded epoll HTTP/1.1 manager with pipelining, partial writes, and backpressure |
+| `abla/http/async` | nonblocking HTTP(S) client driven by a poll loop |
 | `abla/http/tls` | certificate-verified HTTPS client transport |
+| `abla/http/json` | adapters between JSON values and HTTP requests/responses |
 | `abla/compression/gzip` | RFC gzip framing, CRC-32, and fixed-Huffman DEFLATE compression |
 | `abla/tls/hosted` | dynamically loaded OpenSSL client/listener transport with hostname and certificate verification |
 | `abla/websocket` | bounded RFC 6455 handshake, framing, connection lifecycle, and routed server helpers |
-| `abla/websocket/json`, `/rpc` | optional bounded JSON messages and transport-neutral RPC method routing |
+| `abla/websocket/client` | client masking keys |
+| `abla/websocket/json`, `/rpc` | bounded JSON messages and transport-neutral RPC method routing |
 | `abla/websocket/event` | bounded epoll WebSocket manager with fragmentation, ping/pong, and output backpressure |
+| `abla/websocket/server` | connection-oriented WebSocket server with admission, broadcast and draining |
 | `abla/websocket/tls` | certificate-verified WSS client transport |
-| `abla/json` | [bounded JSON parsing, deterministic serialization, and `$json` literals](json.md) |
-| `abla/float` | runtime `f64` bit-pattern access and explicit signed `int` to `f64` numerical conversion |
-| `abla/http/json` | opt-in adapters between JSON values and HTTP requests/responses |
-| `abla/html` | HTML data model and `$html` subparser |
-| `abla/compiler/*` | compile-time parser/reflection APIs only |
+| `abla/jwt`, `abla/jwt/remote` | JWS RS256/ES256 verification against a key set, and a cached remote JWKS |
+| `abla/compiler`, `abla/compiler/parser` | compile-time reflection, transforms, generated code and subparser APIs (compile time only) |
 | `abla/build` | framework-neutral compile-time program and export requests |
-| `abla/android/build` | Android-owned arm64 target, `libabla_app.so` request, and generated JNI/Kotlin/CMake/Gradle integration |
-| `abla/wasm/build` | WebAssembly-owned wasm32 target and no-entry module request |
-| `abla/mvc/wasm/build` | MVC composition that generates a thin browser loader around the WASM module |
-| `abla/unsafe/memory` | internal trusted native boundary plus checked pointer cells/buffers; retained at this legacy import path while typed resource modules stabilize |
-| `abla/unsafe/mmio` | trusted volatile 8/16/32/64-bit memory-mapped I/O primitives for platform frameworks and device drivers |
-| `abla/sys/linux` | opt-in raw x86-64 Linux syscall and native descriptor APIs |
-| `abla/sys/linux/fs` | raw-kernel `Path`, metadata, atomic writes, entries, and watches |
-| `abla/sys/linux/io` | raw-kernel buffered input lines, polling, and full output writes |
-| `abla/sys/linux/process` | arguments, environment/PATH, sleep, fork/exec, capture, and child lifecycle |
-| `abla/sys/linux/net` | affine TCP/UDP sockets, poll/epoll readiness, plus signalfd graceful SIGTERM draining |
+| `abla/android/build` | Android arm64 target, `libabla_app.so` request, and generated JNI/Kotlin/CMake/Gradle integration |
+| `abla/wasm/build` | WebAssembly wasm32 target and no-entry module request |
+| `abla/mvc/wasm/build` | an MVC composition that generates a thin browser loader around the Wasm module |
 | `abla/llvm/aot`, `abla/llvm/orc` | in-process object emission and persistent JIT sessions |
+| `abla/unsafe/memory` | the trusted native boundary plus checked pointer cells and buffers |
+| `abla/unsafe/memory/raw` | raw stack, static and section memory, and raw loads and stores (trusted) |
+| `abla/unsafe/native` | typed call-through-address functions and atomics (trusted) |
+| `abla/unsafe/mmio` | trusted volatile 8/16/32/64-bit memory-mapped I/O primitives for platform frameworks and device drivers |
+| `abla/unsafe/xtensa` | Xtensa interrupt-entry addresses and dispatcher tables |
+| `abla/sys/linux` | opt-in raw x86-64 Linux syscall and native descriptor APIs |
+| `abla/sys/linux/fs`, `/io`, `/process`, `/net`, `/random` | the raw-kernel implementations behind the portable modules |
+| `abla/platform/host` | the hosted runtime's `ablaHost*` functions; portable code uses the modules above instead |
+| `abla/runtime/*` | the runtime itself, linked automatically; internal |
+
+There are no visibility modifiers, so a module's internal helpers are also
+importable. The functions named on the task pages are the supported API.
+
+## Architecture notes
 
 `ByteBuffer` currently uses immutable chunks and `ByteSlice` is a checked view.
 That representation is portable and works in both `#` evaluation and native
@@ -70,8 +107,8 @@ atomic files, directory enumeration/watch identities, arguments, sleep, and
 command/child lifecycle. `abla/process/time` exposes millisecond/nanosecond
 monotonic values, checked nanosecond sleep, and an affine `MonotonicClock` that
 reuses its three kernel buffers in hot loops. Linux lowers these operations to
-`clock_gettime` and `nanosleep` syscalls without libc. The narrow compatibility
-ABI remains isolated in
+`clock_gettime` and `nanosleep` syscalls without libc.
+
 `BufferedTextWriter` batches text behind an ordinary `(string) -> bool` sink.
 Its stdout/stderr constructors stay in `abla/io`; the file adapter is a
 separate `abla/io/buffered` import and flushes through append-only atomic kernel
@@ -140,8 +177,8 @@ surface: `newfstatat`, `getcwd`, `openat`, `read`, `write`, `fsync`, `mkdir`,
 `rename`, `unlink`/`rmdir`, and `getdents64` are issued from Abla, with owned
 native buffers for kernel out-parameters. The Linux self-hosted compiler uses
 it for module loading, cache files, atomic outputs, and watched graphs. The
-the compiler preserves the same intrinsic contract while final LLVM
-output lowers it directly; portable applications select `abla/fs` explicitly.
+compiler preserves the same intrinsic contract while final LLVM output lowers
+it directly; portable applications select `abla/fs` explicitly.
 
 `abla/sys/linux/io` adds a stateful input reader that preserves bytes following
 a line terminator, distinguishes EOF from an empty line, accepts CRLF, and can
@@ -167,8 +204,9 @@ Allocation regions are intentionally narrower than a garbage collector.
 `region { ... }` rejects heap-backed results, stores into older locals/objects,
 retaining foreign calls, and direct or transitive mutation of outer receivers
 and heap parameters. Affine resources are destroyed before the generation is
-reset. The raw numeric checkpoint API remains internal because it cannot encode
-those lifetime facts. The REPL uses the checked form after unloading each JIT
+reset. The raw numeric checkpoint functions (`memoryCheckpoint`,
+`memoryReset` in `abla/memory`) cannot encode those lifetime facts, so they
+are for runtime and compiler internals, not for application code. The REPL uses the checked form after unloading each JIT
 generation; HTTP handlers can adopt it once their response promotion and
 long-lived-state policy is explicit.
 

@@ -14,7 +14,8 @@ in seven short sections of runnable programs.
 | [ownership.md](ownership.md) | Who may change a value and who cleans it up: `var`/`own` parameters, `move`, resources, borrows, `Shared`/`Mutex`, closures |
 | [concurrency.md](concurrency.md) | `defer`, generators, tasks and threads |
 | [regions.md](regions.md) | `region { ... }`: scoped allocation and its escape rules |
-| [standard-library.md](standard-library.md) | The `abla/...` modules and their layering |
+| [standard-library.md](standard-library.md) | Every `abla/...` module, by task, with links to their API pages |
+| [stdlib/text.md](stdlib/text.md), [stdlib/system.md](stdlib/system.md), [stdlib/numbers.md](stdlib/numbers.md), [stdlib/security-and-dates.md](stdlib/security-and-dates.md), [stdlib/testing.md](stdlib/testing.md) | Library API pages: text, files and processes, math, hashing and dates, testing |
 | [json.md](json.md) | `abla/json`, `$json` and `$jsons` |
 | [networking.md](networking.md) | Sockets, HTTP, WebSocket, TLS and JWT |
 | [diagnostics.md](diagnostics.md) | How to read compiler errors, and what each code means |

@@ -3,9 +3,10 @@
 #
 #   tools/test-doc-examples.sh [COMPILER] [DOC.md ...]
 #
-# With no documents it checks README.md and docs/*.md. Every fenced block whose
-# info string starts with `abla` is an example; the words after `abla` select
-# what is checked (docs/README.md#examples documents the convention):
+# With no documents it checks README.md, docs/*.md and docs/*/*.md. Every
+# fenced block whose info string starts with `abla` is an example; the words
+# after `abla` select what is checked (docs/README.md#examples documents the
+# convention):
 #
 #   ```abla            a complete program: it must compile; when it declares
 #                      `fun main` it is run, and its standard output must equal
@@ -32,7 +33,10 @@ compiler=${1:-$project_root/build/ablac}
 shift || true
 if [[ $compiler != /* ]]; then compiler=$PWD/$compiler; fi
 if (($# == 0)); then
-    set -- "$project_root/README.md" "$project_root"/docs/*.md
+    set -- "$project_root/README.md"
+    for doc in "$project_root"/docs/*.md "$project_root"/docs/*/*.md; do
+        [[ -f $doc ]] && set -- "$@" "$doc"
+    done
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/abla-doc-examples.XXXXXX")
