@@ -1349,8 +1349,10 @@ fun main {
 ```
 
 - Imports are top-level declarations. A module is loaded once however many
-  modules import it, and import cycles are detected. A path that names no
-  file is `E_IMPORT_NOT_FOUND`.
+  modules import it. Two modules may import each other: a cycle of imports
+  is allowed, and each module sees the other's declarations. (A cycle of
+  *packages* is `E_PACKAGE_CYCLE`, see [packages.md](packages.md).) A path
+  that names no file is `E_IMPORT_NOT_FOUND`.
 - Without an alias, every top-level declaration of the imported module is
   visible by its short name. Two unaliased imports that expose the same name
   make that name ambiguous: `E_IMPORT_UNQUALIFIED_AMBIGUOUS`. Source order
