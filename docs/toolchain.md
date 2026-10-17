@@ -307,7 +307,7 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_MAX_MEMORY_MB`, `ABLA_MAX_SECONDS`, `ABLA_MAX_CPU_SECONDS`, `ABLA_KILL_GRACE_SECONDS` | the launcher's resource guard for the compiler and anything compile-time code starts ([performance.md](performance.md)) |
 | `ABLA_MAX_STACK_KB` | the compiler's stack size in a packaged toolchain |
 | `ABLA_NATIVE_JOBS` | parallel native object jobs |
-| `ABLA_EVAL_STEP_LIMIT` | lowers the compile-time step limit ([compile-time.md](compile-time.md#limits)) |
+| `ABLA_EVAL_STEP_LIMIT`, `ABLA_EVAL_DEPTH_LIMIT` | lower the compile-time step and recursion-depth limits ([compile-time.md](compile-time.md#limits)) |
 | `ABLA_JIT_CACHE=0`, `ABLA_JIT_CACHE_TRACE=1` | turn `ablac run`'s object cache off, or report its decisions on standard error (above) |
 | `ABLA_PACKAGE_CACHE` | the package cache directory ([packages.md](packages.md)) |
 | `ABLA_KEEP_LLVM_TEXT`, `ABLA_LLVM_OUT_OF_PROCESS`, `ABLA_LLVM_VERIFY`, `ABLA_FAST_INLINE_THRESHOLD`, `ABLA_WASM_OPT_CORES`, `ABLA_NO_SIDECAR` | code-generation controls (above) |

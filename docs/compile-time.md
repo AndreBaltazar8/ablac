@@ -436,7 +436,18 @@ error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past 50000000 steps (an en
 ```
 
 `ABLA_EVAL_STEP_LIMIT=<n>` lowers the limit for a build (it never raises
-it), which is useful in tests. Memory introspection (`memoryLiveBytes`,
+it), which is useful in tests.
+
+Recursion at compile time is bounded by the compiler's own stack: about 3,000
+to 4,000 nested calls with the default stack. Deeper recursion stops with
+`E_EVAL_STACK_DEPTH`, reported once, and `ABLA_EVAL_DEPTH_LIMIT=<n>` lowers
+the limit. When compile-time code runs on the coming JIT tier it recurses as
+deep as at run time, and the `auto` mode moves an evaluation that hits the
+depth limit onto the JIT.
+
+> Known issue (being fixed by coordinator): today deeper compile-time
+> recursion crashes the compiler (exit status 139) instead of reporting
+> `E_EVAL_STACK_DEPTH`. Memory introspection (`memoryLiveBytes`,
 `memoryCollect`, ...) has no meaning inside the compiler, and is not
 available at compile time.
 

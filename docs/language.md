@@ -369,8 +369,9 @@ fun main {
 - An array literal's elements must share one type (`array.element-type`).
   An empty literal needs a declared type.
 - `append(value)` adds at the end, `truncate(n)` keeps the first `n`
-  elements (`0 <= n <= size`), `clear()` removes all, and
-  `filledArray(count, value)` creates a filled array.
+  elements (`n` beyond the size keeps all), `clear()` removes all, and
+  `filledArray(count, value)` creates a filled array. A negative count for
+  either panics.
 - Reading or writing outside the array panics with the index and the size
   ("index 5 out of bounds for array of size 3", exit status 101). The same
   holds for a string index or slice.
@@ -378,10 +379,11 @@ fun main {
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)). An array of
   resources owns its elements.
 
-> Known issue (being fixed by ct-rt): out-of-bounds accesses (including
-> `truncate` outside `0..size` and a negative `filledArray` count) currently
-> stop the program with "fatal signal" and a stack trace but no reason, and
-> ordered comparison of strings type-checks but crashes the native program.
+> Known issue (being fixed by ct-rt): out-of-bounds accesses, `truncate`
+> with a negative count or one beyond the size, and a negative `filledArray`
+> count currently stop the program with "fatal signal" and a stack trace but
+> no reason, and ordered comparison of strings type-checks but crashes the
+> native program.
 
 ### Maps
 
@@ -584,6 +586,11 @@ fun main {
   `_DUPLICATE`, `_ORDER`, `_REQUIRED`).
 - Parameters borrow their arguments; `var` and `own` change that
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)).
+- Recursion is limited by the thread's stack. Running out of stack panics
+  with "stack overflow".
+
+> Known issue (being fixed by ct-rt): today a stack overflow ends the
+> program with exit status 139 and no message.
 
 > Known issue (being fixed by ablac-backend): named arguments currently work
 > only for top-level functions and constructors; a method call with them is
