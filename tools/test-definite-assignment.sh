@@ -40,7 +40,7 @@ check_rejected() {
     fi
 }
 
-check_rejected invalid-definite-assignment ir.verification
+check_rejected invalid-definite-assignment assignment.unassigned:answer:
 check_rejected invalid-uninitialized-val local.uninitialized-val
 check_rejected invalid-uninitialized-type local.uninitialized-type
 

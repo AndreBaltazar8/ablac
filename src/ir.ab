@@ -1644,7 +1644,196 @@ fun bootstrapIrBlockDominates(
     cursor == dominator
 }
 
-fun bootstrapIrHasUninitializedPath(
+// A read the verifier rejects because of a move or a missing assignment, for
+// its diagnostic: `code` (ownership.use-after-move, ...), the place read and
+// the place moved as the program names them, and the source positions of the
+// read and of the move (or of the unassigned declaration), -1 when unknown.
+class BootstrapIrOwnershipFinding(
+    val code: string,
+    val place: string,
+    val moved: string,
+    val use: int,
+    val cause: int
+)
+
+// A place as the program writes it: storage names without their `local_N_`
+// prefix, and `[...]` for an index that is not a constant.
+fun bootstrapIrFindingPlace(place: string): string {
+    val source = bootstrapIrSourcePlace(place)
+    var result = ""
+    var index = 0
+    while (index < source.size) {
+        if (index + 2 < source.size && source[index] == 91 &&
+            source[index + 1] == 42 && source[index + 2] == 93) {
+            result = "$result[...]"
+            index = index + 3
+        } else {
+            result = "$result${source.slice(index, index + 1)}"
+            index = index + 1
+        }
+    }
+    result
+}
+
+// Whether some path reaches instruction `use` (in `useBlock`) on which
+// `moved` was not moved since it last got a value: the move that made the
+// read fail happened on some paths only. `moved` is a local (`isLocal`, with
+// its declaration instruction and whether that assigns it) or a place under one.
+fun bootstrapIrPathAvoidsMove(
+    moved: string,
+    isLocal: bool,
+    declaration: int,
+    initialized: bool,
+    useBlock: int,
+    use: int,
+    instructions: array<BootstrapInstruction>,
+    blocks: array<BootstrapIrBlock>
+): bool {
+    val root = bootstrapIrPlaceRoot(moved)
+    val visited: array<bool> = []
+    val stack: array<int> = []
+    while (visited.size < blocks.size) {
+        visited.append(false)
+        stack.append(0)
+    }
+    visited[useBlock] = true
+    stack[0] = useBlock
+    var stackSize = 1
+    var found = false
+    while (stackSize > 0 && !found) {
+        stackSize = stackSize - 1
+        val block = stack[stackSize]
+        var index = if (block == useBlock) use - 1 else blocks[block].end - 1
+        var stopped = false
+        while (index >= blocks[block].begin && !stopped) {
+            val instruction = instructions[index]
+            if (isLocal) {
+                if (instruction.text == moved &&
+                    instruction.opcode == "local.move") stopped = true
+                else if (instruction.text == moved &&
+                    bootstrapIrWritesLocal(instruction.opcode)) {
+                    found = true
+                    stopped = true
+                } else if (index == declaration) {
+                    found = initialized
+                    stopped = true
+                }
+            } else {
+                if (instruction.opcode == "place.move" &&
+                    instruction.text == moved) stopped = true
+                else if ((instruction.opcode == "place.set" &&
+                    bootstrapIrPlaceRestored(moved, instruction.text)) ||
+                    ((instruction.opcode == "local.declare" ||
+                      instruction.opcode == "local.assign" ||
+                      instruction.opcode == "local.set") &&
+                     instruction.text == root)) {
+                    found = true
+                    stopped = true
+                }
+            }
+            index = index - 1
+        }
+        if (!stopped) {
+            // The entry: a parameter, or a place nothing moved on this path.
+            if (blocks[block].predecessors.size == 0) found = true
+            var predecessor = 0
+            while (predecessor < blocks[block].predecessors.size) {
+                val source = blocks[block].predecessors[predecessor]
+                if (!visited[source]) {
+                    visited[source] = true
+                    stack[stackSize] = source
+                    stackSize = stackSize + 1
+                }
+                predecessor = predecessor + 1
+            }
+        }
+    }
+    found
+}
+
+// Adds `finding` unless it repeats one: reading a moved name twice, or
+// `move(x)` (a read, then the move), is one mistake, so one error.
+fun bootstrapIrAddFinding(
+    var findings: array<BootstrapIrOwnershipFinding>,
+    finding: BootstrapIrOwnershipFinding
+): bool {
+    for (earlier in findings) {
+        if (earlier.code == finding.code && earlier.place == finding.place &&
+            earlier.moved == finding.moved && earlier.cause == finding.cause) {
+            return false
+        }
+    }
+    findings.append(finding)
+    true
+}
+
+// The finding for a read of `local` at `use` that `cause` (a move, or its
+// unassigned declaration) leaves without a value.
+fun bootstrapIrLocalFinding(
+    local: BootstrapIrLocal,
+    useBlock: int,
+    use: int,
+    cause: int,
+    instructions: array<BootstrapInstruction>,
+    blocks: array<BootstrapIrBlock>
+): BootstrapIrOwnershipFinding {
+    val name = bootstrapIrFindingPlace(local.name)
+    var code = "ownership.use-after-move"
+    if (instructions[cause].opcode != "local.move") {
+        code = "assignment.unassigned"
+    } else if (cause > 0 &&
+        instructions[cause - 1].opcode == "call.indirect.once") {
+        code = "ownership.once-called-again"
+    } else if (bootstrapIrPathAvoidsMove(
+        local.name, true, local.declaration, local.initialized,
+        useBlock, use, instructions, blocks
+    )) code = "ownership.use-after-conditional-move"
+    BootstrapIrOwnershipFinding(
+        code, name, name, instructions[use].position,
+        instructions[cause].position
+    )
+}
+
+// The finding for a read of `requested` at `use` while `moved` (overlapping
+// it) is moved out on some path to it.
+fun bootstrapIrPlaceFinding(
+    moved: string,
+    requested: string,
+    useBlock: int,
+    use: int,
+    instructions: array<BootstrapInstruction>,
+    blocks: array<BootstrapIrBlock>
+): BootstrapIrOwnershipFinding {
+    // The move: the last one of `moved` before the read, else any.
+    var cause = -1
+    var index = 0
+    while (index < instructions.size) {
+        if (instructions[index].opcode == "place.move" &&
+            instructions[index].text == moved &&
+            (cause < 0 || index < use)) cause = index
+        index = index + 1
+    }
+    val conditional = bootstrapIrPathAvoidsMove(
+        moved, false, -1, true, useBlock, use, instructions, blocks
+    )
+    val whole = moved.size > requested.size &&
+        moved.slice(0, requested.size) == requested &&
+        (moved[requested.size] == 46 || moved[requested.size] == 91)
+    BootstrapIrOwnershipFinding(
+        if (whole) "ownership.partial-move"
+        else if (conditional) "ownership.use-after-conditional-move"
+        else "ownership.use-after-move",
+        bootstrapIrFindingPlace(requested),
+        bootstrapIrFindingPlace(moved),
+        instructions[use].position,
+        if (cause >= 0) instructions[cause].position else -1
+    )
+}
+
+// The instruction that leaves `local` without a value on some path to the
+// load at `loadInstruction`: a move of it, or its declaration when that
+// declares it unassigned; -1 when every path assigns it.
+fun bootstrapIrUninitializedCause(
     local: BootstrapIrLocal,
     loadBlock: int,
     loadInstruction: int,
@@ -1653,14 +1842,14 @@ fun bootstrapIrHasUninitializedPath(
     var visited: array<int>,
     generation: int,
     var stack: array<int>
-): bool {
+): int {
     // A block is visited in this search when it holds this search's generation.
     var block = 0
     visited[loadBlock] = generation
     stack[0] = loadBlock
     var stackSize = 1
-    var uninitialized = false
-    while (stackSize > 0 && !uninitialized) {
+    var cause = -1
+    while (stackSize > 0 && cause < 0) {
         stackSize = stackSize - 1
         block = stack[stackSize]
         var instructionIndex = blocks[block].end - 1
@@ -1670,7 +1859,7 @@ fun bootstrapIrHasUninitializedPath(
             val instruction = instructions[instructionIndex]
             if (instruction.text == local.name &&
                 instruction.opcode == "local.move") {
-                uninitialized = true
+                cause = instructionIndex
                 stopped = true
             }
             if (instruction.text == local.name &&
@@ -1678,7 +1867,7 @@ fun bootstrapIrHasUninitializedPath(
                 stopped = true
             }
             if (instructionIndex == local.declaration) {
-                uninitialized = !local.initialized
+                if (!local.initialized) cause = instructionIndex
                 stopped = true
             }
             instructionIndex = instructionIndex - 1
@@ -1696,7 +1885,7 @@ fun bootstrapIrHasUninitializedPath(
             }
         }
     }
-    uninitialized
+    cause
 }
 
 fun bootstrapIrPlaceRoot(place: string): string {
@@ -2056,8 +2245,9 @@ fun bootstrapVerifyIrBorrows(
     locals: array<BootstrapIrLocal>
 ): int = bootstrapIrBorrowConflicts(instructions, blocks, locals).size
 
-/** One entry per borrow error: "storage\tsource" when `source` is changed
- *  while the local `storage` that borrows it is still used afterwards, ""
+/** One entry per borrow error: "storage\tsource\tchange\tbind" when
+ *  `source` is changed (by instruction `change`) while the local `storage`
+ *  that borrows it (bound by instruction `bind`) is still used afterwards, ""
  *  for a malformed binding. */
 fun bootstrapIrBorrowConflicts(
     instructions: array<BootstrapInstruction>,
@@ -2154,7 +2344,9 @@ fun bootstrapIrBorrowConflicts(
                     instruction,
                     binding.source
                 ) && live) {
-                    conflicts.append("${binding.storage}\t${binding.source}")
+                    conflicts.append(
+                        "${binding.storage}\t${binding.source}\t$instructionIndex\t${binding.instruction}"
+                    )
                 }
                 if (instruction.opcode == "borrow.bind" &&
                     bootstrapIrBorrowStorage(instruction.text) ==
@@ -2267,6 +2459,18 @@ fun bootstrapVerifyIrPlaces(
     instructions: array<BootstrapInstruction>,
     blocks: array<BootstrapIrBlock>
 ): int {
+    val findings: array<BootstrapIrOwnershipFinding> = []
+    bootstrapCheckIrPlaces(instructions, blocks, findings)
+}
+
+// bootstrapVerifyIrPlaces, adding its errors to `findings`: a place read
+// while it, or a part of it, is moved out on some path (once per place read
+// and move).
+fun bootstrapCheckIrPlaces(
+    instructions: array<BootstrapInstruction>,
+    blocks: array<BootstrapIrBlock>,
+    var findings: array<BootstrapIrOwnershipFinding>
+): int {
     val inputs: array<BootstrapIrPlaceState> = []
     val outputs: array<BootstrapIrPlaceState> = []
     var block = 0
@@ -2348,6 +2552,12 @@ fun bootstrapVerifyIrPlaces(
                     if (bootstrapIrPlacesConflict(
                         state.values[place],
                         requested
+                    ) && bootstrapIrAddFinding(
+                        findings,
+                        bootstrapIrPlaceFinding(
+                            state.values[place], requested, block,
+                            instructionIndex, instructions, blocks
+                        )
                     )) errors = errors + 1
                     place = place + 1
                 }
@@ -2365,6 +2575,22 @@ fun bootstrapVerifyIrLocals(
     blocks: array<BootstrapIrBlock>,
     locals: array<BootstrapIrLocal>,
     immediateDominators: array<int>
+): int {
+    val findings: array<BootstrapIrOwnershipFinding> = []
+    bootstrapCheckIrLocals(
+        instructions, blocks, locals, immediateDominators, findings
+    )
+}
+
+// bootstrapVerifyIrLocals, adding a finding per program error to `findings`:
+// a read of a moved or unassigned local, once per local and move (the other
+// errors are compiler faults, not the program's).
+fun bootstrapCheckIrLocals(
+    instructions: array<BootstrapInstruction>,
+    blocks: array<BootstrapIrBlock>,
+    locals: array<BootstrapIrLocal>,
+    immediateDominators: array<int>,
+    var findings: array<BootstrapIrOwnershipFinding>
 ): int {
     var errors = 0
     // Each local named like an earlier one is an error per earlier one; the table also
@@ -2442,7 +2668,7 @@ fun bootstrapVerifyIrLocals(
                          instruction.opcode == "local.move") &&
                         (!local.initialized || moved.find(local.name, 0) == 1)) {
                         generation = generation + 1
-                        if (bootstrapIrHasUninitializedPath(
+                        val cause = bootstrapIrUninitializedCause(
                             local,
                             block,
                             instructionIndex,
@@ -2451,6 +2677,13 @@ fun bootstrapVerifyIrLocals(
                             visited,
                             generation,
                             stack
+                        )
+                        if (cause >= 0 && bootstrapIrAddFinding(
+                            findings,
+                            bootstrapIrLocalFinding(
+                                local, block, instructionIndex, cause,
+                                instructions, blocks
+                            )
                         )) errors = errors + 1
                     }
                     bootstrapSemanticUnit()
@@ -9595,6 +9828,138 @@ fun bootstrapIrSourcePlace(place: string): string {
     result
 }
 
+// A `source[ownership]` record of a lowered position (none for generated code).
+fun bootstrapIrPositionRecord(position: int): string {
+    val file = bootstrapIrSourcePositionFile(position)
+    if (file < 0 || file >= bootstrapIrSourceFiles.size) return ""
+    val offset = bootstrapIrSourcePositionOffset(position)
+    "source[ownership]:${bootstrapIrSourceFiles[file]}:$offset:${offset + 1}\n"
+}
+
+// The diagnostic of a finding: what is wrong, where (the read), where the
+// value went (the move or the unassigned declaration), and the usual fix.
+fun bootstrapIrFindingDiagnostic(
+    finding: BootstrapIrOwnershipFinding,
+    where: string
+): string {
+    val place = finding.place
+    val moved = finding.moved
+    var message = "in `$where`, `$place` is used after it was moved"
+    var note = "`$moved` was moved here"
+    var kind = "E_OWNERSHIP"
+    if (finding.code == "ownership.use-after-move" && place != moved) {
+        message = "in `$where`, `$place` is used after `$moved` was moved"
+    }
+    if (finding.code == "ownership.use-after-conditional-move") {
+        message = if (place == moved)
+            "in `$where`, `$place` is used, but it is moved on some paths to here"
+            else "in `$where`, `$place` is used, but `$moved` is moved on some paths to here"
+        note = "`$moved` is moved here"
+    }
+    if (finding.code == "ownership.partial-move") {
+        message = "in `$where`, `$place` is used whole, but `$moved` was moved out of it and is not put back on every path"
+        note = "`$moved` was moved out here"
+    }
+    if (finding.code == "ownership.once-called-again") {
+        message = "in `$where`, `$place` can run only once, and it may already have run"
+        note = "`$place` ran here"
+    }
+    if (finding.code == "assignment.unassigned") {
+        kind = "E_DEFINITE_ASSIGNMENT"
+        message = "in `$where`, `$place` is read before it is assigned on every path"
+        note = "`$place` is declared here without a value"
+    }
+    var diagnostic =
+        "error[$kind]: ${finding.code}:$place: $message\n${bootstrapIrPositionRecord(finding.use)}"
+    val cause = bootstrapIrPositionRecord(finding.cause)
+    if (cause != "") diagnostic = "${diagnostic}note: $note\n$cause"
+    val help = bootstrapSemanticHelp(finding.code)
+    if (help != "") diagnostic = "${diagnostic}help: $help\n"
+    diagnostic
+}
+
+// A function's name as the program writes it: `Owner.method` for an extension.
+fun bootstrapIrReadableFunctionName(name: string): string {
+    var where = name
+    if (where.size > 10 && where.slice(0, 10) == "extension_") {
+        where = where.slice(10, where.size)
+        var cut = 0
+        while (cut < where.size && where[cut] != 95) cut = cut + 1
+        if (cut < where.size) {
+            where = "${where.slice(0, cut)}.${where.slice(cut + 1, where.size)}"
+        }
+    }
+    where
+}
+
+// The diagnostics a failed function's verification can name, one per error
+// they explain: borrow conflicts, reads of moved or unassigned locals, and
+// reads of moved places.
+fun bootstrapIrNamedVerificationErrors(
+    function: BootstrapIrFunction
+): array<string> {
+    val named: array<string> = []
+    val where = bootstrapIrReadableFunctionName(function.name)
+    for (conflict in bootstrapIrBorrowConflicts(
+        function.instructions, function.blocks, function.locals
+    )) if (conflict != "") {
+        val fields: array<string> = []
+        var begin = 0
+        var index = 0
+        while (index <= conflict.size) {
+            if (index == conflict.size || conflict[index] == 9) {
+                fields.append(conflict.slice(begin, index))
+                begin = index + 1
+            }
+            index = index + 1
+        }
+        val borrower = bootstrapIrFindingPlace(fields[0])
+        val source = bootstrapIrFindingPlace(fields[1])
+        var diagnostic =
+            "error[E_BORROW_CONFLICT]: in `$where`, `$source` is changed while `$borrower`, which borrows it, is still used afterwards\n"
+        if (fields.size == 4) {
+            val change = bootstrapIrDecimal(fields[2])
+            val bind = bootstrapIrDecimal(fields[3])
+            if (change >= 0 && change < function.instructions.size) {
+                diagnostic = "$diagnostic${bootstrapIrPositionRecord(
+                    function.instructions[change].position
+                )}"
+            }
+            if (bind >= 0 && bind < function.instructions.size) {
+                val record = bootstrapIrPositionRecord(
+                    function.instructions[bind].position
+                )
+                if (record != "") {
+                    diagnostic = "${diagnostic}note: `$borrower` borrows `$source` here\n$record"
+                }
+            }
+        }
+        named.append(diagnostic)
+    }
+    val findings: array<BootstrapIrOwnershipFinding> = []
+    bootstrapCheckIrLocals(
+        function.instructions, function.blocks, function.locals,
+        bootstrapBuildImmediateDominators(function.blocks), findings
+    )
+    bootstrapCheckIrPlaces(function.instructions, function.blocks, findings)
+    for (finding in findings) {
+        named.append(bootstrapIrFindingDiagnostic(finding, where))
+    }
+    named
+}
+
+fun bootstrapIrDecimal(text: string): int {
+    if (text.size == 0) return -1
+    var value = 0
+    var index = 0
+    while (index < text.size) {
+        if (text[index] < 48 || text[index] > 57) return -1
+        value = value * 10 + text[index] - 48
+        index = index + 1
+    }
+    value
+}
+
 fun bootstrapIrVerificationDiagnostics(
     program: BootstrapIrProgram,
     parsed: BootstrapParseResult,
@@ -9613,40 +9978,22 @@ fun bootstrapIrVerificationDiagnostics(
                 parsed,
                 function.name
             )
-        // Name the borrow conflicts among the function's errors: a place
-        // changed while a local that borrows it is used again later.
-        val conflicts: array<string> = []
+        // Name what the function's errors are about where the verifier can:
+        // the rest are compiler faults, reported as invariant violations.
+        val explained: array<string> = []
         if (function.verificationErrors > 0) {
-            for (conflict in bootstrapIrBorrowConflicts(
-                function.instructions, function.blocks, function.locals
-            )) if (conflict != "") conflicts.append(conflict)
+            for (diagnostic in bootstrapIrNamedVerificationErrors(function)) {
+                explained.append(diagnostic)
+            }
         }
         var functionError = 0
         while (functionError < function.verificationErrors &&
             classified < totalIrErrors) {
-            if (functionError < conflicts.size &&
-                !(delegatedReplacement && functionError == 0)) {
-                val conflict = conflicts[functionError]
-                var tab = 0
-                while (conflict[tab] != 9) tab = tab + 1
-                val source = bootstrapIrSourcePlace(
-                    conflict.slice(tab + 1, conflict.size)
-                )
-                val borrower = bootstrapIrSourcePlace(conflict.slice(0, tab))
-                var where = function.name
-                if (where.size > 10 && where.slice(0, 10) == "extension_") {
-                    where = where.slice(10, where.size)
-                    var cut = 0
-                    while (cut < where.size && where[cut] != 95) cut = cut + 1
-                    if (cut < where.size) {
-                        where = "${where.slice(0, cut)}.${where.slice(cut + 1, where.size)}"
-                    }
-                }
-                diagnostics =
-                    "${diagnostics}error[E_BORROW_CONFLICT]: in `$where`, `$source` is changed while `$borrower`, which borrows it, is still used afterwards\n"
-            } else if (delegatedReplacement && functionError == 0) {
+            if (delegatedReplacement && functionError == 0) {
                 diagnostics =
                     "${diagnostics}error[E_DELEGATE_BORROW_CONFLICT]: delegate replacement in `${function.name}` conflicts with a live projected view\n"
+            } else if (functionError < explained.size) {
+                diagnostics = "$diagnostics${explained[functionError]}"
             } else diagnostics =
                     "${diagnostics}error[E_IR_FUNCTION_VERIFICATION]: function `${function.name}` violated a typed IR invariant (failure ${functionError + 1} of ${function.verificationErrors})\n"
             diagnostics =

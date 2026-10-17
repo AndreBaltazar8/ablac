@@ -154,10 +154,36 @@ if [[ $borrow_results_status -ne 42 ]]; then
     exit 1
 fi
 
+# Rejected by the typed-CFG checks after lowering: each failure names the
+# mistake, the place and (through source records) where it happens.
+check_rejected() {
+    local fixture=$1
+    local expected=$2
+    local output="$output_directory/$fixture"
+    rm -f "$output"
+    set +e
+    "$compiler" build "$project_root/tests/cases/bootstrap/$fixture.ab" \
+        -o "$output" >"$output.out" 2>"$output.err"
+    local result=$?
+    set -e
+    if [[ $result -ne 1 ]] || ! grep -Fq -- "$expected" "$output.err"; then
+        echo "affine move: $fixture was not rejected with $expected" >&2
+        sed -n '1,80p' "$output.err" >&2
+        exit 1
+    fi
+    if grep -Fq 'violated a typed IR invariant' "$output.err"; then
+        echo "affine move: $fixture has an unnamed verifier failure" >&2
+        sed -n '1,80p' "$output.err" >&2
+        exit 1
+    fi
+    [[ ! -e $output ]] || exit 1
+}
+
+check_rejected invalid-use-after-move 'ownership.use-after-move:source:'
+check_rejected invalid-conditional-move \
+    'ownership.use-after-conditional-move:source:'
+check_rejected invalid-double-move 'ownership.use-after-move:source:'
 for fixture in \
-    invalid-use-after-move \
-    invalid-conditional-move \
-    invalid-double-move \
     invalid-managed-alias-active-mutation \
     invalid-stored-reference-active-mutation \
     invalid-compile-stored-reference-active-mutation \
@@ -166,19 +192,7 @@ for fixture in \
     invalid-compile-managed-alias-active-mutation \
     invalid-managed-borrow-result-conflict \
     invalid-managed-borrow-method-conflict; do
-    output="$output_directory/$fixture"
-    rm -f "$output"
-    set +e
-    "$compiler" build "$project_root/tests/cases/bootstrap/$fixture.ab" \
-        -o "$output" >"$output.out" 2>"$output.err"
-    result=$?
-    set -e
-    if [[ $result -ne 1 ]] || ! grep -Fq 'ir.verification:' "$output.err"; then
-        echo "affine move: $fixture was not rejected by CFG ownership" >&2
-        sed -n '1,80p' "$output.err" >&2
-        exit 1
-    fi
-    [[ ! -e $output ]] || exit 1
+    check_rejected "$fixture" 'error[E_BORROW_CONFLICT]:'
 done
 
 for fixture in \
@@ -327,43 +341,17 @@ for fixture in \
 done
 
 
-output="$output_directory/invalid-owned-use-after-move"
-rm -f "$output"
-set +e
-"$compiler" build \
-    "$project_root/tests/cases/bootstrap/invalid-owned-use-after-move.ab" \
-    -o "$output" >"$output.out" 2>"$output.err"
-result=$?
-set -e
-if [[ $result -ne 1 ]] || ! grep -Fq 'ir.verification:' "$output.err"; then
-    echo "affine move: moved owned parameter remained readable" >&2
-    sed -n '1,80p' "$output.err" >&2
-    exit 1
-fi
-[[ ! -e $output ]] || exit 1
-
-for fixture in \
-    invalid-capture-use-after-move \
-    invalid-once-closure-second-call \
-    invalid-field-owner-after-move \
-    invalid-index-owner-after-move \
-    invalid-partial-owner-use \
-    invalid-partial-reinitialize-branch \
-    invalid-dynamic-place-reinitialize; do
-    output="$output_directory/$fixture"
-    rm -f "$output"
-    set +e
-    "$compiler" build "$project_root/tests/cases/bootstrap/$fixture.ab" \
-        -o "$output" >"$output.out" 2>"$output.err"
-    result=$?
-    set -e
-    if [[ $result -ne 1 ]] || ! grep -Fq 'ir.verification:' "$output.err"; then
-        echo "affine move: $fixture escaped FnOnce CFG checks" >&2
-        sed -n '1,80p' "$output.err" >&2
-        exit 1
-    fi
-    [[ ! -e $output ]] || exit 1
-done
+check_rejected invalid-owned-use-after-move 'ownership.use-after-move:ticket:'
+check_rejected invalid-capture-use-after-move 'ownership.use-after-move:ticket:'
+check_rejected invalid-once-closure-second-call \
+    'ownership.once-called-again:callback:'
+check_rejected invalid-field-owner-after-move \
+    'ownership.use-after-move:box.ticket.value:'
+check_rejected invalid-index-owner-after-move \
+    'ownership.use-after-move:tickets[0].value:'
+check_rejected invalid-partial-owner-use 'ownership.partial-move:box:'
+check_rejected invalid-partial-reinitialize-branch 'ownership.partial-move:box:'
+check_rejected invalid-dynamic-place-reinitialize 'ownership.partial-move:shelf:'
 
 output="$output_directory/invalid-move-expression"
 rm -f "$output"
