@@ -1,0 +1,179 @@
+// Receiver members by plain name. Inside a class's methods and an extension
+// function's body, a call `name(...)` to a method of the receiver's type (its
+// own or an extension of that type) means `this.name(...)`, and in an
+// extension function a plain read or assignment of one of the receiver's fields
+// means `this.field` (a method reaches its own fields already). A name the body
+// binds itself (a parameter, local, loop variable or lambda parameter, anywhere
+// in the body) keeps its own meaning; otherwise a receiver member wins over a
+// top-level declaration of the same name.
+//
+// The rewrite is syntax to syntax before semantic analysis, so analysis,
+// lowering and compile-time evaluation all see the same `this.` form, and
+// overloaded methods are then resolved as any `this.name(...)` call is.
+import "parser.ab"
+import "overload.ab"
+import "staged_parser.ab"
+
+class BootstrapReceiverMembers(
+    val methods: array<string>,
+    val fields: array<string>
+)
+
+fun bootstrapReceiverNameIn(names: array<string>, name: string): bool {
+    for (each in names) if (each == name) return true
+    false
+}
+
+/** Every receiver type's methods and fields: a class's (or interface's) own,
+ *  and the extension functions declared on it; one entry per type. */
+class BootstrapReceiverIndex(
+    val owners: array<string>,
+    val members: array<BootstrapReceiverMembers>
+) {
+    fun of(owner: string): BootstrapReceiverMembers {
+        val normalized = bootstrapNormalizeType(owner)
+        var index = 0
+        while (index < this.owners.size) {
+            if (this.owners[index] == normalized) return this.members[index]
+            index = index + 1
+        }
+        this.owners.append(normalized)
+        this.members.append(BootstrapReceiverMembers([], []))
+        this.members[this.members.size - 1]
+    }
+}
+
+fun bootstrapReceiverIndex(declarations: array<BootstrapDeclaration>): BootstrapReceiverIndex {
+    var index = BootstrapReceiverIndex([], [])
+    for (declaration in declarations) {
+        if (declaration.kind == "class" || declaration.kind == "interface") {
+            val members = index.of(declaration.name)
+            for (method in declaration.methods) {
+                if (method.kind == "fun" || method.kind == "compile.fun") {
+                    members.methods.append(method.name)
+                }
+            }
+            var parameter = 0
+            while (parameter < declaration.parameters.size) {
+                if (parameter < declaration.parameterKinds.size &&
+                    (declaration.parameterKinds[parameter] == "val" ||
+                     declaration.parameterKinds[parameter] == "var")) {
+                    members.fields.append(declaration.parameters[parameter])
+                }
+                parameter = parameter + 1
+            }
+        }
+        if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+            declaration.extensionOwner != "") {
+            index.of(declaration.extensionOwner).methods.append(declaration.name)
+        }
+    }
+    index
+}
+
+/** The names `expression` binds anywhere inside it. */
+fun bootstrapReceiverBoundNames(expression: BootstrapExpression, var names: array<string>): void {
+    if (expression.kind == "local.val" || expression.kind == "local.var" ||
+        expression.kind == "for") names.append(expression.text)
+    if ((expression.kind == "lambda" || expression.kind == "lambda.move") &&
+        expression.children.size > 0) {
+        var parameter = 0
+        while (parameter + 1 < expression.children.size) {
+            names.append(expression.children[parameter].text)
+            parameter = parameter + 1
+        }
+    }
+    for (child in expression.children) bootstrapReceiverBoundNames(child, names)
+    return
+}
+
+fun bootstrapReceiverThis(at: BootstrapExpression): BootstrapExpression =
+    BootstrapExpression("identifier", "this", at.begin, at.begin, [])
+
+fun bootstrapReceiverRewrite(
+    expression: BootstrapExpression,
+    members: BootstrapReceiverMembers,
+    bound: array<string>,
+    extension: bool
+): BootstrapExpression {
+    val children: array<BootstrapExpression> = []
+    var changed = false
+    for (child in expression.children) {
+        val rewritten = bootstrapReceiverRewrite(child, members, bound, extension)
+        if (rewritten != child) changed = true
+        children.append(rewritten)
+    }
+    val name = expression.text
+    if (name != "" && !bootstrapReceiverNameIn(bound, name)) {
+        var named = false
+        for (child in children) if (child.kind == "named.argument") named = true
+        if (expression.kind == "call" && !named &&
+            bootstrapReceiverNameIn(members.methods, name)) {
+            val arguments: array<BootstrapExpression> = [bootstrapReceiverThis(expression)]
+            for (child in children) arguments.append(child)
+            return BootstrapExpression("member.call", name, expression.begin, expression.end, arguments)
+        }
+        if (extension && bootstrapReceiverNameIn(members.fields, name)) {
+            if (expression.kind == "identifier") {
+                return BootstrapExpression(
+                    "member", name, expression.begin, expression.end,
+                    [bootstrapReceiverThis(expression)]
+                )
+            }
+            if (expression.kind == "assign" && children.size == 1) {
+                return BootstrapExpression(
+                    "member.assign", name, expression.begin, expression.end,
+                    [bootstrapReceiverThis(expression), children[0]]
+                )
+            }
+        }
+    }
+    if (!changed) return expression
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
+fun bootstrapReceiverRewriteBody(
+    declaration: BootstrapDeclaration,
+    members: BootstrapReceiverMembers,
+    extension: bool
+): BootstrapDeclaration {
+    var bound: array<string> = []
+    for (parameter in declaration.parameters) bound.append(parameter)
+    bootstrapReceiverBoundNames(declaration.expression, bound)
+    bootstrapDeclarationWithExpression(
+        declaration,
+        bootstrapReceiverRewrite(declaration.expression, members, bound, extension)
+    )
+}
+
+fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseResult {
+    var index = bootstrapReceiverIndex(parsed.declarations)
+    val declarations: array<BootstrapDeclaration> = []
+    var changed = false
+    for (declaration in parsed.declarations) {
+        var rewritten = declaration
+        if (declaration.kind == "class" && declaration.methods.size > 0) {
+            val members = index.of(declaration.name)
+            val methods: array<BootstrapDeclaration> = []
+            for (method in declaration.methods) {
+                methods.append(bootstrapReceiverRewriteBody(method, members, false))
+            }
+            rewritten = bootstrapDeclarationWithMethods(declaration, methods)
+            changed = true
+        }
+        if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+            declaration.extensionOwner != "") {
+            val members = index.of(declaration.extensionOwner)
+            if (members.methods.size > 0 || members.fields.size > 0) {
+                rewritten = bootstrapReceiverRewriteBody(declaration, members, true)
+                changed = true
+            }
+        }
+        declarations.append(rewritten)
+    }
+    if (!changed) return parsed
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+}
