@@ -1,0 +1,111 @@
+// Diagnostics as a person reads them. A diagnostic's place is a record line,
+// `source[kind]:path:begin:end`, in byte offsets of the file (tools read it);
+// the compiler's output adds the line and column it names after it:
+//
+//     error[E_EVAL_EXPRESSION]: compile-time evaluation failed while ...
+//     source[eval]:tools/table.ab:812:830
+//       --> tools/table.ab:31:9
+//
+// Columns count characters (UTF-8 sequences), from 1. A record whose file
+// can't be read (a generated module) stays as it is.
+import "abla/sys/linux/fs"
+
+class BootstrapDiagnosticSources(
+    val paths: array<string>,
+    val contents: array<string>,
+    val readable: array<bool>
+)
+
+fun bootstrapDiagnosticDecimal(text: string, begin: int, end: int): int {
+    if (begin >= end || end - begin > 18) return -1
+    var value = 0
+    var index = begin
+    while (index < end) {
+        val digit = text[index] - 48
+        if (digit < 0 || digit > 9) return -1
+        value = value * 10 + digit
+        index = index + 1
+    }
+    value
+}
+
+fun bootstrapDiagnosticSource(
+    var sources: BootstrapDiagnosticSources,
+    path: string
+): int {
+    var index = 0
+    while (index < sources.paths.size) {
+        if (sources.paths[index] == path) return index
+        index = index + 1
+    }
+    val file = Path(path)
+    val readable = file.exists()
+    sources.paths.append(path)
+    sources.contents.append(if (readable) file.readText() else "")
+    sources.readable.append(readable)
+    sources.paths.size - 1
+}
+
+// `path:line:column` of `offset` in `contents`.
+fun bootstrapDiagnosticLineColumn(
+    path: string,
+    contents: string,
+    offset: int
+): string {
+    var line = 1
+    var lineBegin = 0
+    var index = 0
+    while (index < offset) {
+        if (contents[index] == 10) {
+            line = line + 1
+            lineBegin = index + 1
+        }
+        index = index + 1
+    }
+    var column = 1
+    index = lineBegin
+    while (index < offset) {
+        // Continuation bytes (10xxxxxx) belong to the character before.
+        if ((contents[index] & 192) != 128) column = column + 1
+        index = index + 1
+    }
+    "$path:$line:$column"
+}
+
+fun bootstrapDiagnosticPositions(diagnostics: string): string {
+    var sources = BootstrapDiagnosticSources([], [], [])
+    var output = ""
+    var lineBegin = 0
+    while (lineBegin < diagnostics.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < diagnostics.size && diagnostics[lineEnd] != 10) {
+            lineEnd = lineEnd + 1
+        }
+        val line = diagnostics.slice(lineBegin, lineEnd)
+        output = "$output$line"
+        if (lineEnd < diagnostics.size) output = "$output\n"
+        if (line.size > 7 && line.slice(0, 7) == "source[") {
+            // The path runs from after `]:` to the second colon from the end.
+            var close = 7
+            while (close < line.size && line[close] != 93) close = close + 1
+            var last = line.size - 1
+            while (last > close && line[last] != 58) last = last - 1
+            var middle = last - 1
+            while (middle > close && line[middle] != 58) middle = middle - 1
+            val begin = bootstrapDiagnosticDecimal(line, middle + 1, last)
+            if (close + 2 < middle && begin >= 0) {
+                val path = line.slice(close + 2, middle)
+                val source = bootstrapDiagnosticSource(sources, path)
+                if (sources.readable[source] &&
+                    begin <= sources.contents[source].size) {
+                    if (lineEnd >= diagnostics.size) output = "$output\n"
+                    output = "$output  --> ${bootstrapDiagnosticLineColumn(
+                        path, sources.contents[source], begin
+                    )}\n"
+                }
+            }
+        }
+        lineBegin = lineEnd + 1
+    }
+    output
+}

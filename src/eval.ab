@@ -4600,7 +4600,9 @@ class BootstrapEvaluator(
                 val invocation = bootstrapEvalInvocation(
                     this, callNames, callValues, callMutable
                 )
-                result = invocation.evaluate(declaration.expression)
+                result = bootstrapEvaluateFrom(
+                    invocation, declaration.sourceIdentity, declaration.expression
+                )
                 if (result.kind == "return" && result.elements.size == 1) {
                     result = result.elements[0]
                 }
@@ -4806,7 +4808,9 @@ class BootstrapEvaluator(
                     this.steps,
                     this.diagnostics
                 )
-                result = invocation.evaluate(declaration.expression)
+                result = bootstrapEvaluateFrom(
+                    invocation, declaration.sourceIdentity, declaration.expression
+                )
                 if (result.kind == "return" && result.elements.size == 1) {
                     result = result.elements[0]
                 }
@@ -4897,7 +4901,12 @@ class BootstrapEvaluator(
                             this.steps,
                             this.diagnostics
                         )
-                        result = invocation.evaluate(method.expression)
+                        result = bootstrapEvaluateFrom(
+                            invocation,
+                            if (method.sourceIdentity != "") method.sourceIdentity
+                            else declaration.sourceIdentity,
+                            method.expression
+                        )
                         if (result.kind == "return" &&
                             result.elements.size == 1) {
                             result = result.elements[0]
@@ -5106,7 +5115,9 @@ fun bootstrapEvalGlobalCallable(
         val declaration = evaluator.declarations[global]
         if (bootstrapDeclarationIsValue(declaration.kind) &&
             declaration.name == name) {
-            callable = evaluator.evaluate(declaration.expression)
+            callable = bootstrapEvaluateFrom(
+                evaluator, declaration.sourceIdentity, declaration.expression
+            )
         }
         globalNode = evaluator.nextNamed(globalNode)
     }
@@ -5220,10 +5231,68 @@ fun bootstrapEvalExpressionFailed(
     var evaluator: BootstrapEvaluator,
     expression: BootstrapExpression
 ): void {
-    evaluator.recordEvaluatorDiagnostic(
-        "E_EVAL_EXPRESSION",
-        "compile-time evaluation failed while evaluating `${expression.kind}` `${expression.text}` at ${expression.begin}:${expression.end}"
-    )
+    var source = ""
+    var slot = evaluator.names.size
+    while (source == "" && slot > 0) {
+        slot = slot - 1
+        if (evaluator.names[slot] == "#source" &&
+            evaluator.values[slot].kind == "string") source = evaluator.values[slot].text
+    }
+    if (source == "") {
+        evaluator.recordEvaluatorDiagnostic(
+            "E_EVAL_EXPRESSION",
+            "compile-time evaluation failed while evaluating `${expression.kind}` `${expression.text}` at ${expression.begin}:${expression.end}"
+        )
+    } else {
+        evaluator.recordEvaluatorDiagnostic(
+            "E_EVAL_EXPRESSION",
+            "compile-time evaluation failed while evaluating `${expression.kind}` `${expression.text}`"
+        )
+        evaluator.diagnostics =
+            "${evaluator.diagnostics}source[eval]:$source:${expression.begin}:${expression.end}\n"
+    }
+}
+
+// Evaluates a declaration's body as code of the source it came from: a local
+// the code can't name (`#source`) holds the path an evaluation failure names.
+@noinline
+fun bootstrapEvaluateFrom(
+    var evaluator: BootstrapEvaluator,
+    source: string,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    if (source == "") return evaluator.evaluate(expression)
+    val slot = evaluator.names.size
+    evaluator.names.append("#source")
+    evaluator.values.append(bootstrapEvalString(source))
+    evaluator.mutable.append(false)
+    val result = evaluator.evaluate(expression)
+    evaluator.names[slot] = ""
+    evaluator.values[slot] = evaluator.uninitializedValue()
+    result
+}
+
+// A failed `#` expression of the program: its diagnostics, counted as one error
+// per `error[` line (bootstrapDiagnosedLoweringErrors).
+fun bootstrapStageEvaluationFailure(diagnostics: string): void {
+    var text = diagnostics
+    if (text == "") {
+        text = "error[E_EVAL_EXPRESSION]: compile-time evaluation failed\n"
+    }
+    var lines = 0
+    var index = 0
+    while (index + 6 <= text.size) {
+        if ((index == 0 || text[index - 1] == 10) &&
+            text.slice(index, index + 6) == "error[") lines = lines + 1
+        index = index + 1
+    }
+    if (lines == 0) {
+        text = "error[E_EVAL_EXPRESSION]: compile-time evaluation failed\n$text"
+        lines = 1
+    }
+    bootstrapStageDriverDiagnostic(text)
+    bootstrapNoteDiagnosedLoweringErrors(lines)
+    return
 }
 
 // The kinds `evaluate` dispatches through here are the ones that rarely nest
@@ -5615,7 +5684,9 @@ fun bootstrapEvaluateIdentifier(
                 } else if (declaration.kind == "compile.val" ||
                     declaration.kind == "compile.var") {
                     result = evaluator.compileGlobal(declaration)
-                } else result = evaluator.evaluate(declaration.expression)
+                } else result = bootstrapEvaluateFrom(
+                    evaluator, declaration.sourceIdentity, declaration.expression
+                )
             }
             if ((declaration.kind == "fun" ||
                  declaration.kind == "compile.fun") &&
@@ -10282,11 +10353,18 @@ fun bootstrapEvaluateWithEffectsIn(
     context: BootstrapEvalContext,
     expression: BootstrapExpression,
     declarations: array<BootstrapDeclaration>,
-    allowedCompileEffects: int
+    allowedCompileEffects: int,
+    source: string = ""
 ): BootstrapEvalResult {
     val names: array<string> = []
     val values: array<BootstrapEvalValue> = []
     val mutable: array<bool> = []
+    // The source the expression is in, which an evaluation failure names.
+    if (source != "") {
+        names.append("#source")
+        values.append(bootstrapEvalString(source))
+        mutable.append(false)
+    }
     val cursors: array<BootstrapSubparserCursor> = []
     val syntax: array<BootstrapExpression> = []
     val generatedDeclarations: array<BootstrapDeclaration> = []
@@ -10332,9 +10410,10 @@ fun bootstrapEvaluateWithEffectsIn(
 
 fun bootstrapEvaluate(
     expression: BootstrapExpression,
-    declarations: array<BootstrapDeclaration>
-): BootstrapEvalResult = bootstrapEvaluateWithEffects(
-    expression, declarations, 1023
+    declarations: array<BootstrapDeclaration>,
+    source: string = ""
+): BootstrapEvalResult = bootstrapEvaluateWithEffectsIn(
+    bootstrapEvalContext(declarations), expression, declarations, 1023, source
 )
 
 class BootstrapSubparserInvocation(
