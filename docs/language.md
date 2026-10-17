@@ -741,11 +741,6 @@ fun main {
   compile-time declaration block, not a lambda
   ([compile-time.md](compile-time.md#declaration-blocks)).
 
-> Known issue (being fixed by ct-infer): today a lambda passed to `append`
-> or a `Map` method needs explicit parameter types
-> (`{ x: int -> x + 1 }`); without them the parameter is
-> `identifier:x`.
-
 ## Classes
 
 A class declares its properties in its primary constructor: `val` for
@@ -785,10 +780,12 @@ fun main {
   member of the receiver, then a top-level declaration. A plain read
   (`scale`) takes the first level that has the name. A call (`scale(v)`)
   takes the first level with an *applicable* candidate: a method, or a
-  property of function type, whose parameters accept the arguments. A
-  property that isn't a function never captures a call, and a method that
-  can't take these arguments lets the search continue. With no applicable
-  candidate anywhere, the error names the innermost one.
+  property of function type, that takes that many arguments (a method's
+  defaults may be left out, and named arguments must name its parameters;
+  argument types are then checked against the candidate found). A property
+  that isn't a function never captures a call, and a method that can't take
+  that many arguments lets the search continue. With no applicable candidate
+  anywhere, the error names the innermost one.
 - A class body contains only methods (`fun`, `operator fun`, `trusted fun`,
   `noescape fun`). Properties belong in the constructor
   (`E_PARSE_CLASS_MEMBER`).
