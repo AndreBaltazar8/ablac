@@ -413,13 +413,6 @@ fun main {
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)). An array of
   resources owns its elements.
 
-> Known issue (being fixed by ablac-frontend): the constructor forms
-> `array<int>()` and `Map<string, int>()` are going to mean the same as
-> `val x: array<int> = []` and `val m: Map<string, int> = Map()`. Today they
-> are parse errors; declare the type on the binding instead. Also today,
-> only a top-level empty literal takes the declared type: nested empty
-> literals and `null` elements are `array.element-type`.
-
 > Known issue (being fixed by ablac-frontend): an array literal passed to a
 > receiver whose type is only inferred (`val rows = makeRows()` then
 > `rows.append([1, null])`) still types itself from its own elements.
@@ -748,12 +741,6 @@ fun main {
   compile-time declaration block, not a lambda
   ([compile-time.md](compile-time.md#declaration-blocks)).
 
-> Known issue (being fixed by ablac-frontend): today a call drops a callee
-> that isn't a plain name. `adder(2)(3)` silently calls `adder(3)`,
-> `handlers[0]()` has an unknown type, and `button.onClick(event)` on a
-> property is `method.arity`. Put the function in a local first:
-> `val f = adder(2)` then `f(3)`.
-
 > Known issue (being fixed by ct-infer): today a lambda passed to `append`
 > or a `Map` method needs explicit parameter types
 > (`{ x: int -> x + 1 }`); without them the parameter is
@@ -819,7 +806,7 @@ fun main {
   optional `drop()`
   ([ownership.md](ownership.md#resources-values-with-one-owner)).
 
-```abla fragment
+```abla
 import "abla/io"
 
 fun scale(x: int): int = x * 10
@@ -836,15 +823,6 @@ fun main {
 // output:
 // 54
 ```
-
-> Known issue (being fixed by ablac-frontend): today a property or method
-> named like a top-level function captures every call of that name, even
-> one it can't take (`scale(v)` above reports `call.target:scale`, so the
-> example is not run yet). Until then, give such members distinct names.
-
-> Known issue (being fixed by ablac-frontend): today a method can't call another
-> method of its class by name (`area()` reports `call.target:area`; write
-> `this.area()`).
 
 ### Interfaces
 
