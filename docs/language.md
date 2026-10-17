@@ -1053,13 +1053,17 @@ names, literals, fields and indexes, never a call
 (`E_PARSE_COMPOUND_ASSIGNMENT_TARGET`). Only names, fields, indexes and
 `^name` can be assigned (`E_PARSE_ASSIGNMENT_TARGET`).
 
-`==` and `!=` compare numbers, booleans and strings by value, and class
-objects and arrays by identity: two separately created objects with equal
-fields are not `==`. Any value can be compared with `null`.
+`==` and `!=` compare integers, floats, booleans and strings by value
+(strings by their text; `NaN != NaN`). On class objects, arrays, maps and
+closures they compare identity: whether both sides are the same object. Two
+separately created objects with equal fields are not `==`. A nullable
+reference compares to `null` by whether it holds a value. To compare
+contents, write a function, such as a field-by-field `equals`. The same rules
+hold at compile time.
 
-> Known issue (being fixed by ct-parity): under `#`, `==` currently compares
-> objects and arrays by their contents, so `[1, 2] == [1, 2]` is `true` at
-> compile time and `false` at run time.
+> Known issue (being fixed by ct-parity): under `#`, `==` on two objects of
+> the same class or two arrays is currently always `true` (even
+> `P(1) == P(2)`), so `#` and run time disagree.
 
 ## Control flow
 
