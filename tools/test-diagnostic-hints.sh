@@ -28,6 +28,7 @@ check invalid-method-unknown 1 "method.unknown:string.fooBar"
 check invalid-method-missing-import 1 "method.unknown:string.trim" 'help: `trim` is declared in abla/text; add `import "abla/text"`'
 check invalid-method-unknown-template 1 "method.unknown:C.fooBar"
 check invalid-safe-call 1 "E_PARSE_SAFE_CALL" "Abla has no \`?.\`"
+check invalid-unknown-in-arithmetic 1 "identifier:x"
 check invalid-elvis-template 1 "E_PARSE_ELVIS" "Abla has no \`?:\`"
 
 "$compiler" build "$cases/defer-assignment-tail.ab" -o "$output_directory/defer-assignment-tail" --no-cache >/dev/null
