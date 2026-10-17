@@ -194,25 +194,29 @@ or turned into a `var` (`ownership.borrow-mutation`,
 
 ### Returning references
 
-A function may return an object it created, or the result of a function
-that does. That includes constructor calls, literals, a local `val` built up
-in the function, and `if`/`when` whose every branch is such a value:
+A function may return a reference that is new, or one rooted in a global:
+
+- a new object: a constructor call, a literal, a local `val` built up in
+  the function, or the result of a function that returns a new object;
+- a reference rooted in a top-level binding, such as a global itself, a
+  field of one, a `for` variable over one, or a `val` read from one. A
+  global outlives every call, so returning it creates no unchecked alias;
+- an `if`/`when` whose every branch is one of these.
 
 ```abla fragment
-fun fresh(start: int): Counter = Counter(start)     // fine
+val shared = Counter(0)
+
+fun fresh(start: int): Counter = Counter(start)     // fine: new
+fun current(): Counter = shared                     // fine: rooted in a global
 fun same(counter: Counter): Counter = counter       // rejected
 ```
 
-Returning a parameter or `this` as an ordinary result is rejected
+Returning a parameter or `this` as a plain result is rejected
 (`ownership.managed-return-borrow-contract`): the caller would get a second,
-unchecked name for its own object. Return a new object built from it
-instead, or return nothing and let the caller keep using its own reference.
-A method that changes its receiver should return `void`, not `this`.
-
-> Known issues (being fixed by ct-own): returning a top-level `val` (`fun current(): Counter =
-> shared`) is currently accepted, although it creates the same kind of
-> alias. The help text for `ownership.managed-return-borrow-contract` says a
-> parameter may be returned, but returning one is exactly what it rejects.
+unchecked name for its own object. To return a view of it, declare the
+result `borrow(name) T`
+([below](#borrowed-views-and-borrow-results)); otherwise build and return a
+new value, or return nothing and let the caller keep its own reference.
 
 ## Resources: values with one owner
 
@@ -300,11 +304,30 @@ The rules:
   a `val`/`var` property already transfers it
   (`ownership.owned-constructor-parameter`).
 
-> Known issue (being fixed by ct-own): a mistake that the control-flow check finds (a use after
-> `move`, a double `move`, a move on only one branch, reading a partly moved
-> owner, a second call of a `FnOnce`) is currently reported as
-> `E_IR_FUNCTION_VERIFICATION: function main violated a typed IR invariant`,
-> without the variable's name or position.
+Mistakes the control-flow check finds are reported with the place, a note
+pointing at the move, and a fix:
+
+```abla error
+resource class Ticket(val seat: int)
+
+fun consume(own ticket: Ticket): int = ticket.seat
+
+fun main: int {
+    val source = Ticket(1)
+    consume(move(source))
+    source.seat
+}
+// error: ownership.use-after-move:source
+// error: `source` is used after it was moved
+```
+
+| Code | Meaning |
+|---|---|
+| `ownership.use-after-move:<place>` | a value is used after it was moved; the note shows the move |
+| `ownership.use-after-conditional-move:<place>` | a value is moved on some paths (a branch, or an earlier turn of a loop) and used after |
+| `ownership.partial-move:<owner>` | an owner is used whole after one of its parts was moved out and not put back on every path |
+| `ownership.once-called-again:<callback>` | a `move { ... }` closure may already have run |
+| `assignment.unassigned:<name>` | a variable declared without a value is read before every path assigns it |
 
 ## Collections of resources
 
@@ -429,9 +452,44 @@ Rules for views:
 - In a function type, the source is a zero-based parameter index:
   `(Shared<Ticket>) -> borrow(0) Ticket`.
 
-`borrow(...)` contracts currently apply to `Shared<T>` views. Ordinary class
-results follow the [returning references](#returning-references) rules
-instead.
+`borrow(name) T` works on ordinary class and array results too. Every return
+path must be a place rooted at `name` (a parameter, or `this` including a
+field read by name in a method), a `for` variable over such a place, or a
+new value (`ownership.borrow-return-source` otherwise). At the call, the
+result is a view of the caller's argument or receiver:
+
+```abla
+import "abla/io"
+
+class Counter(var value: int)
+
+class Holder(val counter: Counter) {
+    fun view(): borrow(this) Counter = counter
+}
+
+fun same(counter: Counter): borrow(counter) Counter = counter
+
+fun increment(var counter: Counter): void {
+    counter.value += 1
+    return
+}
+
+fun main {
+    val counter = Counter(10)
+    val view = same(counter)
+    val before = view.value
+    increment(counter)   // fine: `view` is not used again
+    val holder = Holder(Counter(20))
+    println("$before ${counter.value} ${holder.view().value}")
+}
+// output:
+// 10 11 20
+```
+
+Reading `view.value` after `increment(counter)` would be
+`E_BORROW_CONFLICT: in main, counter is changed while view, which borrows
+it, is still used afterwards`, with a note pointing where `view` borrows
+`counter`.
 
 ## Sharing: `Cell`, `Shared`, `Weak`, `Mutex`
 
@@ -630,7 +688,9 @@ to `consume`, and the value is `ticket`.
 | `ownership.borrow-capture` | A closure captures a borrowed value | capture the owner or a copy |
 | `ownership.borrow-mutable-local` | A borrow or alias is bound to a `var` | use `val` |
 | `ownership.borrow-source` | `if`/`when` chooses between views of different owners | view one owner |
-| `ownership.managed-return-borrow-contract` | A parameter or `this` is returned as an ordinary result | return a new object |
+| `ownership.managed-return-borrow-contract` | A parameter or `this` is returned as a plain result | declare the result `borrow(name) T`, or return a new object |
+| `ownership.borrow-return-source` | A `borrow(name) T` result returns something not rooted at `name` | return a place of `name`, or a new value |
+| `ownership.use-after-move`, `ownership.use-after-conditional-move`, `ownership.partial-move`, `ownership.once-called-again`, `assignment.unassigned` | See [resources](#resources-values-with-one-owner) | use the value before moving it, or assign it again |
 | `ownership.capture-move-required` | A plain closure captures a resource | `move { ... }` |
 | `ownership.fnmut-parameter-mode`, `ownership.fnonce-parameter-mode` | An `FnMut` passed to a non-`var` parameter, an `FnOnce` to a non-`own` one | fix the parameter mode |
 | `ownership.await-borrow` | `await` on a borrowed task, such as a loop element | iterate over `move(array)` |

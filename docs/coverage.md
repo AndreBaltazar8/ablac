@@ -56,7 +56,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 |---|---|---|---|---|
 | Parameter modes (borrow, `var`, `own`) | `sema.ab` | [ownership.md#parameters-borrow-var-and-own](ownership.md#parameters-borrow-var-and-own) | good | test-borrow-duplicates, test-ownership-help |
 | Aliases, `E_BORROW_CONFLICT` | `sema.ab`, `ir.ab` | [ownership.md#changing-objects-through-references](ownership.md#changing-objects-through-references) | good | test-borrow-lifetimes |
-| Returning managed references | `sema.ab` | [ownership.md#returning-references](ownership.md#returning-references) (known issues) | reference | test-affine-move† (stale fixtures) |
+| Returning managed references, `borrow(name)` results | `sema.ab` | [ownership.md#returning-references](ownership.md#returning-references) | good | managed-return-global, managed-return-stored-global, test-borrow-lifetimes |
 | `resource class`, `drop`, `move`, field and element moves | `parser.ab`, `sema.ab`, `ir.ab` drop helpers | [ownership.md#resources-values-with-one-owner](ownership.md#resources-values-with-one-owner) | good | test-affine-move†, resource-drop (native), test-ownership-shadows-and-globals |
 | Arrays of resources, `for (x in move(a))`, await on a borrowed task | `sema.ab` | [ownership.md#collections-of-resources](ownership.md#collections-of-resources) | good | test-generators-tasks |
 | `Shared` views, `Borrow<T>`, `borrow(...)` results | `sema.ab` | [ownership.md#borrowed-views-and-borrow-results](ownership.md#borrowed-views-and-borrow-results) | good | test-borrow-lifetimes |

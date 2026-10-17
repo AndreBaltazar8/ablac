@@ -165,11 +165,6 @@ consequences of it: fix the first error. On their own, they point at a gap
 in an earlier check. Some ownership mistakes are currently reported this
 way:
 
-- A use after `move`, a double move, a move on only one branch, a partly
-  moved owner, a second call of an `FnOnce`, a task awaited twice, and a
-  `var` read before it is assigned show up as `E_IR_FUNCTION_VERIFICATION:
-  function X violated a typed IR invariant`, with no variable name (being
-  fixed by ct-own).
 - Calling a `compile fun` from run-time code shows up as
   `E_LLVM_INSTRUCTION_UNSUPPORTED: function main cannot lower ... call target
   <name>` (being fixed by ct-parity).
