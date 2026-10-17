@@ -61,7 +61,7 @@ done
 
 inferred_output="$output_directory/inferred-noescape-callback"
 "$compiler" build \
-    "$project_root/tests/cases/bootstrap/invalid-region-noescape-callback-type.ab" \
+    "$project_root/tests/cases/bootstrap/inferred-noescape-callback.ab" \
     -o "$inferred_output"
 set +e
 "$project_root/tools/run-limited.sh" "$inferred_output"

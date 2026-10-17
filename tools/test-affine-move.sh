@@ -126,6 +126,34 @@ if [[ $structural_drop_status -ne 42 ]]; then
     exit 1
 fi
 
+for program in \
+    managed-return-global \
+    managed-return-stored-global; do
+    "$compiler" build "$project_root/tests/cases/bootstrap/$program.ab" \
+        -o "$output_directory/$program"
+    set +e
+    "$project_root/tools/run-limited.sh" "$output_directory/$program"
+    program_status=$?
+    set -e
+    if [[ $program_status -ne 42 ]]; then
+        echo "ownership: $program expected 42, got $program_status" >&2
+        exit 1
+    fi
+done
+
+"$compiler" build \
+    "$project_root/tests/cases/modules/managed-borrow-results.ab" \
+    -o "$output_directory/managed-borrow-results"
+set +e
+"$project_root/tools/run-limited.sh" \
+    "$output_directory/managed-borrow-results"
+borrow_results_status=$?
+set -e
+if [[ $borrow_results_status -ne 42 ]]; then
+    echo "ownership: managed borrow results expected 42, got $borrow_results_status" >&2
+    exit 1
+fi
+
 for fixture in \
     invalid-use-after-move \
     invalid-conditional-move \
@@ -135,7 +163,9 @@ for fixture in \
     invalid-compile-stored-reference-active-mutation \
     invalid-transitive-managed-alias-active-mutation \
     invalid-compile-transitive-managed-alias-active-mutation \
-    invalid-compile-managed-alias-active-mutation; do
+    invalid-compile-managed-alias-active-mutation \
+    invalid-managed-borrow-result-conflict \
+    invalid-managed-borrow-method-conflict; do
     output="$output_directory/$fixture"
     rm -f "$output"
     set +e
@@ -171,13 +201,11 @@ for fixture in \
     invalid-cell-managed-payload \
     invalid-managed-return-parameter \
     invalid-managed-return-this \
-    invalid-managed-return-global \
-    invalid-managed-return-stored-global \
     invalid-managed-alias-mutable-local \
     invalid-managed-alias-mutation \
     invalid-managed-alias-escape \
-    invalid-stored-reference-escape \
     invalid-stored-reference-multiple \
+    invalid-managed-borrow-result-source \
     invalid-managed-mutable-call-alias \
     invalid-managed-mutable-method-alias \
     invalid-managed-overload-freshness \

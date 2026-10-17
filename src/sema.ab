@@ -2156,7 +2156,9 @@ fun bootstrapSemanticHelp(code: string): string {
         "ownership.borrow-store" ->
             "a borrowed value (reached through a parameter or an alias) cannot be stored where it would outlive the borrow: store a new value built from it, or pass and store its owner"
         "ownership.managed-return-borrow-contract" ->
-            "a function may return a reference only to a value it creates or to one of its parameters: build and return a new value"
+            "a returned reference must be a new value or rooted in a global: to return a view of a parameter or of `this`, declare the result `borrow(name) T` (the caller then cannot change `name` while it uses the result), or build and return a new value"
+        "ownership.borrow-return-source" ->
+            "every value a `borrow(name) T` result returns must come from `name` (or be new): return a place under `name`, or change the contract"
         "ownership.stored-reference-multiple" ->
             "the new object would keep references that come from more than one argument, which ownership cannot track: create the values inline in the call, or pass copies"
         "ownership.stored-reference-provenance" ->
@@ -7666,6 +7668,14 @@ class BootstrapAnalyzer(
                     "ownership.borrow-return-source:$context:${this.currentBorrowResultSource}"
                 )
             }
+        } else if (this.currentBorrowResultSource != "" &&
+                   actual != "never" && !this.typeIsAffine(actual)) {
+            if (!this.managedReferenceMatchesContract(
+                expression,
+                this.currentBorrowResultSource
+            )) this.fail(
+                "ownership.borrow-return-source:$context:${this.currentBorrowResultSource}"
+            )
         } else if (this.currentBorrowResultSource == "" &&
                    !this.typeIsAffine(actual) &&
                    this.typeNeedsManagedAliasTracking(actual) &&
@@ -7680,6 +7690,76 @@ class BootstrapAnalyzer(
                 "ownership.managed-return-borrow-contract:$context:$source"
             )
         }
+    }
+
+    // A `borrow(source) T` result of an ordinary (non-affine) type returns the
+    // T itself; validateBorrowReturn checks that it comes from the source.
+    fun borrowResultAccepts(declared: string, actual: string): bool =
+        this.currentBorrowResultSource != "" &&
+            bootstrapIsBorrowType(declared) && !bootstrapIsBorrowType(actual) &&
+            !this.typeIsAffine(actual) &&
+            this.typesCompatible(bootstrapBorrowElementType(declared), actual)
+
+    // Whether every value `expression` can produce is fresh or a place rooted
+    // at `contract`: a parameter, or `this` (also through an implicit field).
+    fun managedReferenceMatchesContract(
+        expression: BootstrapExpression,
+        contract: string
+    ): bool {
+        if (expression.kind == "block" && expression.children.size > 0) {
+            return this.managedReferenceMatchesContract(
+                expression.children[expression.children.size - 1], contract
+            )
+        }
+        if (expression.kind == "if") {
+            return expression.children.size > 2 &&
+                expression.children[2].kind != "missing" &&
+                this.managedReferenceMatchesContract(
+                    expression.children[1], contract
+                ) && this.managedReferenceMatchesContract(
+                    expression.children[2], contract
+                )
+        }
+        if (expression.kind == "when") {
+            var matches = true
+            var branch = 2
+            while (matches && branch < expression.children.size) {
+                matches = this.managedReferenceMatchesContract(
+                    expression.children[branch], contract
+                )
+                branch = branch + 2
+            }
+            return matches
+        }
+        if ((expression.kind == "compile" || expression.kind == "region") &&
+            expression.children.size > 0) {
+            return this.managedReferenceMatchesContract(
+                expression.children[0], contract
+            )
+        }
+        if (expression.kind == "identifier" || expression.kind == "member" ||
+            expression.kind == "index") {
+            val root = bootstrapPlaceRootName(expression)
+            if (root != "" && this.hasVisibleLocal(root)) {
+                val kind = this.visibleLocalKind(root)
+                if (kind == "parameter" || kind == "mutable.parameter") {
+                    return root == contract
+                }
+                // A `for` variable over the source's elements, or a fresh local.
+                val source = this.visibleBorrowSource(root)
+                if (source.size > 7 && source.slice(0, 7) == "shared:") {
+                    return bootstrapBorrowSourceMatchesContract(
+                        source.slice(7, source.size), contract
+                    )
+                }
+                return source == "managed.fresh"
+            }
+            if (root != "" && contract == "this" && this.currentOwner != "" &&
+                this.fieldType(this.currentOwner, root) != "unknown") {
+                return true
+            }
+        }
+        this.expressionProducesFreshManagedReference(expression, 0, true)
     }
 
     // A place rooted in a global (`store.rows[i]`), or in a local read from
@@ -8777,6 +8857,9 @@ class BootstrapAnalyzer(
                     !this.typesCompatible(
                         bootstrapNormalizeType(declaration.resultType),
                         actual
+                    ) && !this.borrowResultAccepts(
+                        bootstrapNormalizeType(declaration.resultType),
+                        actual
                     )) {
                     this.fail(
                         "function.result:${declaration.name}:${bootstrapNormalizeType(declaration.resultType)}:$actual"
@@ -8948,6 +9031,9 @@ class BootstrapAnalyzer(
                 )
                 if (method.resultType != "inferred" &&
                     !this.typesCompatible(
+                        bootstrapNormalizeType(method.resultType),
+                        actual
+                    ) && !this.borrowResultAccepts(
                         bootstrapNormalizeType(method.resultType),
                         actual
                     )) {
@@ -10421,7 +10507,8 @@ fun bootstrapInferReturn(
     }
     if (analyzer.currentResultType != "" &&
         analyzer.currentResultType != "inferred" &&
-        !analyzer.typesCompatible(analyzer.currentResultType, returned)) {
+        !analyzer.typesCompatible(analyzer.currentResultType, returned) &&
+        !analyzer.borrowResultAccepts(analyzer.currentResultType, returned)) {
         analyzer.fail("return.type")
     }
     if (analyzer.currentResultType != "" &&
