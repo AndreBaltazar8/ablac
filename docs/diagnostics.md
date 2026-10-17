@@ -171,6 +171,3 @@ earlier check, with its own code. So if you see one of these, it is a
 compiler bug, whether or not another error came before it. Please report it
 with the smallest program that shows it.
 
-> Known issue (being fixed by ct-parity): calling a `compile fun` from
-> run-time code is still reported as `E_LLVM_INSTRUCTION_UNSUPPORTED:
-> function main cannot lower ... call target <name>`.

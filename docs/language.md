@@ -1067,10 +1067,6 @@ reference compares to `null` by whether it holds a value. To compare
 contents, write a function, such as a field-by-field `equals`. The same rules
 hold at compile time.
 
-> Known issue (being fixed by ct-parity): under `#`, `==` on two objects of
-> the same class or two arrays is currently always `true` (even
-> `P(1) == P(2)`), so `#` and run time disagree.
-
 ## Control flow
 
 `if` and `when` are expressions when every branch produces a compatible
