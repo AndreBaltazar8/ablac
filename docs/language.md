@@ -385,7 +385,9 @@ fun main {
 ```
 
 - An array literal's elements must share one type (`array.element-type`).
-  An empty literal needs a declared type.
+  An empty literal needs a declared type, or names it: `array<int>()` is
+  `[]` as an `array<int>`, usable wherever an expression goes
+  (`val names = array<string>()`, `total(array<int>())`).
 - A declared type flows into the literal: in
   `val grid: array<array<int>> = [[1], []]` the inner `[]` is an
   `array<int>`, and `val names: array<string?> = ["a", null]` accepts the
@@ -423,7 +425,8 @@ fun main {
 ### Maps
 
 `Map<K, V>` is a built-in hash map with `string` or `int` keys. Its type
-must be declared where it is created:
+must be declared where it is created, or named by the constructor:
+`Map<string, int>()` is `Map()` as a `Map<string, int>`:
 
 ```abla
 import "abla/io"
@@ -445,8 +448,8 @@ fun main {
 
 `get` returns `V?`; `remove` returns whether the key was present; `keys()`
 and `values()` return arrays in insertion order; `clear()` empties the map.
-A map without a declared type is `map.untyped`, and other key types are
-`map.key-type`.
+A map without a declared type is `map.untyped`, other key types are
+`map.key-type`, and a constructor type that isn't `Map<K, V>` is `map.type`.
 
 ### Nullable types
 
