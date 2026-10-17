@@ -116,13 +116,12 @@ fun main: int {
     val n = 4
     #(n * 2)
 }
-// error: E_EVAL_EXPRESSION
+// error: compile.runtime-local:n
 ```
 
-> Known issue (being fixed by ct-parity): reading a local under `#` is reported only when the
-> evaluation reaches it, as `E_EVAL_EXPRESSION: compile-time evaluation
-> failed while evaluating identifier n`. It is not a type error naming the
-> local.
+A `#` expression runs while the program is compiled, before any of the
+run-time code around it: reading one of that code's locals is
+`compile.runtime-local:<name>`.
 
 ## `compile fun`
 
@@ -154,10 +153,15 @@ in both phases. A function that reaches a platform facility with no
 compile-time implementation (see [below](#what-works-at-compile-time-today))
 fails when it is evaluated at compile time.
 
-> Known issue (being fixed by ct-parity): calling a `compile fun` from run-time code is not rejected by
-> the type checker. It fails later, in code generation, with
-> `E_LLVM_INSTRUCTION_UNSUPPORTED: function main cannot lower ... call target
-> <name>`.
+Calling a `compile fun` from run-time code is `compile.call-runtime:<name>`;
+reach it through `#`:
+
+```abla error
+compile fun twice(x: int): int = x * 2
+
+fun main: int = twice(21)
+// error: compile.call-runtime:twice
+```
 
 ## Top-level actions
 
@@ -250,17 +254,16 @@ fun main {
 - A module that the native object cache skips runs no handlers. A provider
   that collects from its uses should be built with `--no-cache`.
 
-> Known issue (being fixed by ct-parity): a `compile val` currently clashes with *any* identifier of the
-> same name, even a local in another module. `compile val registry` breaks
-> every build, because the runtime has a local named `registry`. Prefer
-> distinctive names until this is fixed.
 
 ## Ordinary globals at compile time
 
 A top-level `val` or `var` without `compile` belongs to the run-time
-program. Compile-time code can read it, but today every *reference* to it
-during compile-time evaluation evaluates its initializer again. Changes made
-through it are lost, even within one evaluation:
+program. Compile-time code reads and changes it as it would a `compile var`:
+it holds one value for the whole compilation, made by its initializer the
+first time compile-time code reads it, and what one evaluation changes
+through it (or assigns to a `var`) is what the next one sees. The program
+itself still starts from the initializer; nothing compile-time code does
+leaks into it.
 
 ```abla
 import "abla/io"
@@ -268,10 +271,12 @@ import "abla/io"
 class Box(var n: int)
 
 val box = Box(1)
+var count = 0
 
 fun bump(): int {
     box.n += 1
-    box.n
+    count += 1
+    box.n * 10 + count
 }
 
 fun main {
@@ -279,19 +284,16 @@ fun main {
     println("${bump()} ${bump()}")
 }
 // output:
-// 1 1
-// 2 3
+// 21 32
+// 21 32
 ```
 
-At compile time, `box.n += 1` changes one fresh `Box(1)` and the next line
-reads another. Assigning to a run-time `var` (`counter += 1` on a top-level
-`var counter`)
-during compile-time evaluation currently fails with `E_EVAL_EXPRESSION`.
-
-These two rules are being changed so that a run-time global has one value for
-the whole compilation, exactly like a `compile var`. This page will be
-updated when that lands. Until then, keep compile-time state in
-`compile val`/`compile var`.
+An initializer reads the other globals' initial values, as the program
+initializes every global before code changes any: `val doubled = count * 2`
+read after `count` changed still starts from `count`'s initializer. Between
+evaluations the values are kept as data (integers, booleans, strings, null,
+arrays and objects, without cycles); a global holding anything else is made
+afresh by the next evaluation.
 
 ## Capabilities: files, environment, processes, network
 

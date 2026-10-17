@@ -8,6 +8,7 @@ codes with what they mean and where the rule is explained.
 ```text
 error[E_SEMANTIC]: function.argument:add@60:i64:string
 source[semantic]:main.ab:60:61
+  --> main.ab:4:17
 help: ...
 ```
 
@@ -19,7 +20,10 @@ help: ...
   callee `add`, the byte offset `60` of the argument, the expected type
   `i64` and the actual type `string`.
 - `source[phase]:file:begin:end` locates it as a range of **byte offsets**
-  in the file. The phase is `parser`, `semantic`, `eval` and so on.
+  in the file, for tools. The phase is `parser`, `semantic`, `eval` and so
+  on. The `-->` line after it gives the same place as `file:line:column`
+  (columns count characters, from 1); it is left out when the file can't be
+  read, as for a generated module.
 - `help:` lines, when present, suggest a fix.
 - `context[...]` lines add the module or declaration involved.
 - The last line counts the errors per phase:
@@ -121,7 +125,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 
 | Code | Meaning |
 |---|---|
-| `E_EVAL_EXPRESSION` | a compile-time evaluation failed; the message names the expression and its byte range |
+| `E_EVAL_EXPRESSION` | a compile-time evaluation failed; the message names the expression, and a `source[eval]` record with its `-->` line gives its file, line and column |
 | `E_EVAL_STEP_LIMIT` | an evaluation ran past the step limit |
 | `compile.effect-denied`, `compile.capability-not-authorized`, `compile.capability-unknown` | [capabilities](compile-time.md#capabilities-files-environment-processes-network) |
 | `compile.value-runtime:<name>` | run-time code reads a `compile val`/`compile var` |

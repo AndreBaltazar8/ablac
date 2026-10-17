@@ -844,21 +844,23 @@ fun main {
 // new policy: 10
 ```
 
-Write `(^volume).maximum` with the parentheses. Prefix `^` applies to the
-whole member chain after it, so `^volume.maximum` means `^(volume.maximum)`,
-and `volume.maximum` is not a delegated binding:
+`^` binds to the name after it: `^volume.maximum` reads the delegate's field,
+the same as `(^volume).maximum`, and a call or an index after it applies to
+the delegate too (a binding has no members of its own).
 
-```abla error
+```abla
+import "abla/io"
+
 class Clamped(var current: int, val minimum: int, val maximum: int) {
     fun getValue(): int = current
 }
 
-fun main: int {
+fun main {
     val volume by Clamped(40, 0, 100)
-    ^volume.maximum
+    println("${^volume.maximum} ${(^volume).maximum} $volume")
 }
-// error: E_NOT_DELEGATED
-// error: delegate projection requires an addressable delegated binding
+// output:
+// 100 100 40
 ```
 
 The rules for `^`:
@@ -959,17 +961,12 @@ fun main {
 |---|---|
 | `E_DELEGATE_GETTER_MISSING` | The delegate has no zero-argument `getValue()`, or it doesn't return the declared type |
 | `E_DELEGATE_SETTER_MISSING` | A delegated `var` whose delegate has no `setValue(T): void` |
-| `E_NOT_DELEGATED` | `^` applied to something that isn't a delegated binding (including `^a.b`; write `(^a).b`) |
+| `E_NOT_DELEGATED` | `^` applied to something that isn't a delegated binding |
 | `E_DELEGATE_REPLACE_VAL` | `^name = ...` on a delegated `val` |
 | `E_DELEGATE_TYPE_MISMATCH` | `^name = ...` with a delegate of a different class |
 | `E_DELEGATE_MOVE_PROJECTION` | `move(^name)` |
 | `E_DELEGATE_AFFINE_VALUE` | `getValue()` returns an owned affine value |
 | `E_DELEGATE_BORROW_CONFLICT` | The delegate is replaced while a borrow of it from `^name` is still used |
-
-> Known issue (being fixed by ct-parity): in a method, a field whose name is also the name of a
-> top-level delegated binding currently resolves to the top-level binding at
-> run time. Until that's fixed, don't give a top-level delegated binding the
-> same name as a field of any class.
 
 ## Overloads and operator functions
 
@@ -1050,8 +1047,8 @@ Two traps follow from the table:
   `x & 1 == 0` means `x & (1 == 0)`, which is `bitwise.type` (its help says
   to parenthesize). Write
   `(x & 1) == 0`.
-- `^name` projects a delegated binding, and it covers the member chain after
-  it: write `(^volume).maximum`
+- `^name` projects a delegated binding, and member access after it applies
+  to the delegate: `^volume.maximum` is `(^volume).maximum`
   ([delegated bindings](#delegated-bindings)). Between two integers, `^` is
   XOR.
 
