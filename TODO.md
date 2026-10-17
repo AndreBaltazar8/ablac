@@ -27,12 +27,6 @@ called out below.
   load it with an acquire load (or flatten under the node's lock), so no reader loads the
   children after another thread cleared them.
 
-- [ ] **`abla/platform/host`'s `extern:"host"` functions have no native
-  implementation.** They lived in the C host runtime removed in `93ce196`; only the
-  compile-time evaluator implements a few. A native program that calls one fails at
-  the link with an undefined `ablaHost*` symbol. Either implement them on the public
-  modules or reject such calls in a native build with a diagnostic naming the public
-  replacement (`abla/fs`, `abla/io`, `abla/process/*`).
 - [ ] **`tools/test-wasm-mvc-extension.sh` checks a stale symbol.** It greps
   `llvm-readobj --symbols` for `abla_mvc_revision`, but a linked module's symbol table
   lists name-section names (`app.revision`); the export itself is present. Check the

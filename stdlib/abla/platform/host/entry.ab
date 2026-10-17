@@ -1,6 +1,25 @@
-// Narrow bootstrap host capability ABI. Portable library entry points should
-// not call this module directly; filesystem and compiler adapters select it
-// only when the hosted profile is required.
+// Narrow host capability API: files, standard streams, process arguments,
+// processes, time, entropy and sockets as flat functions over strings and
+// integer handles. Portable library code should use abla/fs, abla/io,
+// abla/process/* and abla/net instead; this module serves tools that want
+// the flat form, in either phase.
+//
+// Each function is implemented here on the Linux system layer (the same
+// syscalls the public modules use), so a compiled program links it like any
+// other code. At compile time the evaluator does not run these bodies: it
+// performs the call with the compiler's own copy of the function, after
+// checking the compile capability the name implies (filesystem.read,
+// filesystem.write, environment, process.io, network, clock, random) and
+// journaling deterministic inputs. TLS lives in abla/platform/host/tls, so
+// only programs that use it link the TLS library.
+
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/sys/linux/net"
+import "abla/sys/linux/random"
+import "abla/dns"
 
 noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
 
@@ -9,203 +28,299 @@ noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool
 // backend queries this ABI capability instead of naming an architecture.
 noescape extern:"intrinsic" fun ablaHostValueArgumentsIndirect(): bool
 
-noescape extern:"host" fun ablaHostReadFile(path: string): string
+// ---- files ----
 
-noescape extern:"host" fun ablaHostWriteFile(path: string, contents: string)
+fun ablaHostReadFile(path: string): string = Path(path).readText()
 
-noescape extern:"host" fun ablaHostWriteFileAtomic(
-    path: string,
-    contents: string
-): bool
+fun ablaHostWriteFile(path: string, contents: string) {
+    val written = Path(path).writeText(contents)
+}
 
-noescape extern:"host" fun ablaHostCreateParentDirectories(path: string)
+fun ablaHostWriteFileAtomic(path: string, contents: string): bool =
+    Path(path).writeTextAtomic(contents)
 
-noescape extern:"host" fun ablaHostCreateDirectories(path: string): bool
+fun ablaHostCreateParentDirectories(path: string) {
+    val created = Path(path).createParentDirectories()
+}
 
-noescape extern:"host" fun ablaHostFileKind(path: string): int
+fun ablaHostCreateDirectories(path: string): bool =
+    Path(path).createDirectories()
 
-noescape extern:"host" fun ablaHostFileSize(path: string): int
+// 0: absent, otherwise the kind linuxFileInfo reports (1: a regular file).
+fun ablaHostFileKind(path: string): int = Path(path).info().kind
 
-noescape extern:"host" fun ablaHostListDirectory(path: string): array<string>
+fun ablaHostFileSize(path: string): int = Path(path).info().size
 
-noescape extern:"host" fun ablaHostMoveFile(
-    source: string,
-    destination: string
-): bool
+// The entry names, sorted bytewise so every host lists them in one order;
+// [] when the directory does not exist.
+fun ablaHostListDirectory(path: string): array<string> {
+    val names: array<string> = []
+    for (entry in Path(path).entries()) {
+        val name = entry.name()
+        var position = names.size
+        names.append(name)
+        while (position > 0 && ablaHostNameBefore(name, names[position - 1])) {
+            names[position] = names[position - 1]
+            position = position - 1
+        }
+        names[position] = name
+    }
+    names
+}
 
-noescape extern:"host" fun ablaHostRemoveFile(path: string): bool
+fun ablaHostNameBefore(left: string, right: string): bool {
+    var index = 0
+    while (index < left.size && index < right.size) {
+        if (left[index] != right[index]) return left[index] < right[index]
+        index = index + 1
+    }
+    left.size < right.size
+}
 
-noescape extern:"host" fun ablaHostCurrentDirectory(): string
+fun ablaHostMoveFile(source: string, destination: string): bool =
+    Path(source).moveTo(Path(destination))
 
-noescape extern:"host" fun ablaHostReadStdinLine(): string
+fun ablaHostRemoveFile(path: string): bool = Path(path).remove()
 
-noescape extern:"host" fun ablaHostStdinLineAvailable(): bool
+fun ablaHostCurrentDirectory(): string = currentDirectory().text
 
-noescape extern:"host" fun ablaHostWriteStdout(text: string): void
+// The file's modification time in nanoseconds (0 when absent).
+fun ablaHostFileRevision(path: string): int = Path(path).info().revision
 
-noescape extern:"host" fun ablaHostWriteStderr(text: string): void
+// ---- standard streams ----
 
-noescape extern:"host" fun ablaHostFileRevision(path: string): int
+var ablaHostStandardInput: LinuxInput = linuxStandardInput()
 
-noescape extern:"host" fun ablaHostArgumentCount(): int
+// The next line of standard input without its terminator ("" at the end).
+fun ablaHostReadStdinLine(): string = ablaHostStandardInput.readLine().text
 
-noescape extern:"host" fun ablaHostArgument(index: int): string
+fun ablaHostStdinLineAvailable(): bool = ablaHostStandardInput.ready(0)
 
-noescape extern:"host" fun ablaHostSleep(milliseconds: int)
+fun ablaHostWriteStdout(text: string): void = linuxPrintStandardOutput(text)
 
-noescape extern:"host" fun ablaHostRunProcess(arguments: array<string>): int
+fun ablaHostWriteStderr(text: string): void = linuxPrintStandardError(text)
 
-noescape extern:"host" fun ablaHostCaptureProcess(
-    arguments: array<string>
-): string
+// ---- process ----
 
-noescape extern:"host" fun ablaHostStartProcess(arguments: array<string>): int
+fun ablaHostArgumentCount(): int = linuxArgumentCount()
 
-noescape extern:"host" fun ablaHostStartProcessConfigured(
+fun ablaHostArgument(index: int): string = linuxArgument(index)
+
+fun ablaHostSleep(milliseconds: int) {
+    linuxSleep(milliseconds)
+}
+
+fun ablaHostMonotonicMilliseconds(): int = linuxMonotonicMilliseconds()
+
+fun ablaHostProcessorCount(): int {
+    val online = Path("/sys/devices/system/cpu/online").readText()
+    var count = 0
+    var begin = 0
+    while (begin < online.size) {
+        var first = 0
+        var digits = 0
+        while (begin < online.size && online[begin] >= 48 && online[begin] <= 57) {
+            first = first * 10 + online[begin] - 48
+            digits = digits + 1
+            begin = begin + 1
+        }
+        var last = first
+        if (begin < online.size && online[begin] == 45) {
+            begin = begin + 1
+            last = 0
+            while (begin < online.size && online[begin] >= 48 &&
+                   online[begin] <= 57) {
+                last = last * 10 + online[begin] - 48
+                begin = begin + 1
+            }
+        }
+        if (digits > 0 && last >= first) count = count + last - first + 1
+        begin = begin + 1
+    }
+    if (count > 0) count else 1
+}
+
+fun ablaHostCommand(arguments: array<string>): LinuxCommand {
+    val command = linuxCommand(if (arguments.size > 0) arguments[0] else "")
+    var index = 1
+    while (index < arguments.size) {
+        command.argument(arguments[index])
+        index = index + 1
+    }
+    command
+}
+
+// The exit status (-1 when there is nothing to run).
+fun ablaHostRunProcess(arguments: array<string>): int =
+    if (arguments.size == 0) -1 else ablaHostCommand(arguments).run()
+
+// The process's standard output.
+fun ablaHostCaptureProcess(arguments: array<string>): string =
+    if (arguments.size == 0) "" else ablaHostCommand(arguments).captureText()
+
+// The started process's identifier (negative on failure).
+fun ablaHostStartProcess(arguments: array<string>): int =
+    if (arguments.size == 0) -1 else ablaHostCommand(arguments).start().process
+
+fun ablaHostStartProcessConfigured(
     directory: string,
     arguments: array<string>,
     environmentNames: array<string>,
     environmentValues: array<string>,
     outputPath: string
-): int
+): int = linuxStartConfiguredProcess(
+    directory, arguments, environmentNames, environmentValues, outputPath
+).process
 
 // Returns -1 while the process is still running, otherwise its exit status.
-noescape extern:"host" fun ablaHostPollProcess(process: int): int
+fun ablaHostPollProcess(process: int): int = LinuxChildProcess(process).poll()
 
-noescape extern:"host" fun ablaHostStopProcessTree(
-    process: int,
-    graceMilliseconds: int
-): int
+fun ablaHostStopProcessTree(process: int, graceMilliseconds: int): int =
+    LinuxChildProcess(process).stopTree(graceMilliseconds)
 
-noescape extern:"host" fun ablaHostMonotonicMilliseconds(): int
+fun ablaHostStopProcess(process: int): int = LinuxChildProcess(process).stop()
 
-noescape extern:"host" fun ablaHostProcessorCount(): int
+fun ablaHostStopProcessGracefully(process: int, graceMilliseconds: int): int =
+    LinuxChildProcess(process).stop(graceMilliseconds)
 
-noescape extern:"host" fun ablaHostSecureRandom(count: int): string
+// `count` bytes from the system's entropy source ("" on failure).
+fun ablaHostSecureRandom(count: int): string = secureRandomBytes(count).bytes
 
-noescape extern:"host" fun ablaHostTlsAvailable(): bool
+// ---- sockets ----
+//
+// Sockets are descriptors. The status of the last read, write or receive is
+// ablaHostNetStatus() (0: data or written, 1: end of stream, 2: would block,
+// 3: failed) with its error number in ablaHostNetError(); a receive also sets
+// ablaHostNetSourceAddress()/ablaHostNetSourcePort().
 
-noescape extern:"host" fun ablaHostTlsOpen(
-    host: string,
-    port: int,
-    timeoutMilliseconds: int
-): int
+var ablaHostNetLastStatus: int = 0
+var ablaHostNetLastError: int = 0
+var ablaHostNetLastSourceAddress: string = ""
+var ablaHostNetLastSourcePort: int = -1
 
-noescape extern:"host" fun ablaHostTlsOpenWithCa(
-    host: string,
-    port: int,
-    timeoutMilliseconds: int,
-    caPath: string
-): int
+fun ablaHostNetRecord(status: string, errorCode: int): void {
+    ablaHostNetLastError = errorCode
+    ablaHostNetLastStatus = if (status == "data" || status == "written") 0
+        else if (status == "eof") 1
+        else if (errorCode == 11) 2
+        else 3
+    return
+}
 
-noescape extern:"host" fun ablaHostTlsRead(
-    handle: int,
-    maximum: int
-): string
+fun ablaHostNetIpv6(host: string): bool = linuxIpv6Words(host).size == 8
 
-noescape extern:"host" fun ablaHostTlsWrite(
-    handle: int,
-    contents: string
-): int
+// A connected descriptor (negative on failure). Names resolve through DNS.
+fun ablaHostNetConnect(host: string, port: int, timeoutMilliseconds: int): int {
+    var connection = if (ablaHostNetIpv6(host))
+        tcpConnectIpv6(ipv6SocketAddress(host, port), timeoutMilliseconds)
+    else tcpConnectHost(host, port, timeoutMilliseconds)
+    val descriptor = connection.descriptor
+    connection.descriptor = -1
+    descriptor
+}
 
-noescape extern:"host" fun ablaHostTlsClose(handle: int): bool
+fun ablaHostNetListen(host: string, port: int, backlog: int, dualStack: bool): int {
+    var listener = if (ablaHostNetIpv6(host))
+        tcpListenIpv6(ipv6SocketAddress(host, port), backlog, dualStack)
+    else tcpListenAddress(ipv4SocketAddress(host, port), backlog)
+    val descriptor = listener.descriptor
+    listener.descriptor = -1
+    descriptor
+}
 
-noescape extern:"host" fun ablaHostTlsError(): string
+fun ablaHostNetAccept(listener: int): int = linuxTcpAcceptDescriptor(listener)
 
-noescape extern:"host" fun ablaHostTlsListen(
-    host: string,
-    port: int,
-    backlog: int,
-    dualStack: bool,
-    certificatePath: string,
-    privateKeyPath: string
-): int
+fun ablaHostNetSetNonblocking(descriptor: int, enabled: bool): bool =
+    linuxSocketSetNonblocking(descriptor, enabled)
 
-noescape extern:"host" fun ablaHostTlsListenerPort(handle: int): int
+fun ablaHostNetLocalPort(descriptor: int): int {
+    var listener = TcpListener(descriptor)
+    val port = listener.localPort()
+    listener.descriptor = -1
+    port
+}
 
-noescape extern:"host" fun ablaHostTlsAccept(handle: int): int
+fun ablaHostNetRead(descriptor: int, maximum: int): string {
+    var connection = TcpConnection(descriptor)
+    val result = connection.readResult(maximum)
+    connection.descriptor = -1
+    ablaHostNetRecord(result.status, result.errorCode)
+    result.bytes
+}
 
-noescape extern:"host" fun ablaHostTlsListenerClose(handle: int): bool
+// The bytes written (negative on failure).
+fun ablaHostNetWrite(descriptor: int, contents: string): int {
+    var connection = TcpConnection(descriptor)
+    val result = connection.writeResult(contents)
+    connection.descriptor = -1
+    ablaHostNetRecord(result.status, result.errorCode)
+    if (result.status == "written") result.written else -result.errorCode
+}
 
-noescape extern:"host" fun ablaHostNetConnect(
-    host: string,
-    port: int,
-    timeoutMilliseconds: int
-): int
+fun ablaHostNetStatus(): int = ablaHostNetLastStatus
 
-noescape extern:"host" fun ablaHostNetListen(
-    host: string,
-    port: int,
-    backlog: int,
-    dualStack: bool
-): int
+fun ablaHostNetError(): int = ablaHostNetLastError
 
-noescape extern:"host" fun ablaHostNetAccept(listener: int): int
+fun ablaHostNetClose(descriptor: int): bool = linuxTcpCloseDescriptor(descriptor)
 
-noescape extern:"host" fun ablaHostNetSetNonblocking(
-    descriptor: int,
-    enabled: bool
-): bool
+fun ablaHostNetUdpBind(host: string, port: int, dualStack: bool): int {
+    var socket = if (ablaHostNetIpv6(host))
+        udpBindIpv6(ipv6SocketAddress(host, port), true, dualStack)
+    else udpBind(ipv4SocketAddress(host, port))
+    val descriptor = socket.descriptor
+    socket.descriptor = -1
+    descriptor
+}
 
-noescape extern:"host" fun ablaHostNetLocalPort(descriptor: int): int
+fun ablaHostNetUdpSend(descriptor: int, host: string, port: int, contents: string): int {
+    var socket = UdpSocket(descriptor)
+    val result = if (ablaHostNetIpv6(host))
+        socket.sendToIpv6(contents, ipv6SocketAddress(host, port))
+    else socket.sendTo(contents, ipv4SocketAddress(host, port))
+    socket.descriptor = -1
+    ablaHostNetRecord(result.status, result.errorCode)
+    if (result.status == "written") result.written else -result.errorCode
+}
 
-noescape extern:"host" fun ablaHostNetRead(
-    descriptor: int,
-    maximum: int
-): string
+fun ablaHostNetUdpReceive(descriptor: int, maximum: int): string {
+    var socket = UdpSocket(descriptor)
+    val datagram = socket.receiveFrom(maximum)
+    socket.descriptor = -1
+    ablaHostNetLastSourceAddress = datagram.source.address
+    ablaHostNetLastSourcePort = datagram.source.port
+    ablaHostNetRecord(if (datagram.received) "data" else "error", datagram.errorCode)
+    datagram.bytes
+}
 
-noescape extern:"host" fun ablaHostNetWrite(
-    descriptor: int,
-    contents: string
-): int
+fun ablaHostNetSourceAddress(): string = ablaHostNetLastSourceAddress
 
-noescape extern:"host" fun ablaHostNetStatus(): int
+fun ablaHostNetSourcePort(): int = ablaHostNetLastSourcePort
 
-noescape extern:"host" fun ablaHostNetError(): int
+fun ablaHostNetPollerCreate(): int {
+    var poller = socketPoller()
+    val descriptor = poller.descriptor
+    poller.descriptor = -1
+    descriptor
+}
 
-noescape extern:"host" fun ablaHostNetClose(descriptor: int): bool
-
-noescape extern:"host" fun ablaHostNetUdpBind(
-    host: string,
-    port: int,
-    dualStack: bool
-): int
-
-noescape extern:"host" fun ablaHostNetUdpSend(
-    descriptor: int,
-    host: string,
-    port: int,
-    contents: string
-): int
-
-noescape extern:"host" fun ablaHostNetUdpReceive(
-    descriptor: int,
-    maximum: int
-): string
-
-noescape extern:"host" fun ablaHostNetSourceAddress(): string
-
-noescape extern:"host" fun ablaHostNetSourcePort(): int
-
-noescape extern:"host" fun ablaHostNetPollerCreate(): int
-
-noescape extern:"host" fun ablaHostNetPollerControl(
+// operation: 1 add, 2 remove, 3 modify (epoll's control operations).
+fun ablaHostNetPollerControl(
     poller: int,
     descriptor: int,
     readable: bool,
     writable: bool,
     operation: int
-): bool
+): bool {
+    var watched = SocketPoller(poller)
+    val changed = linuxPollerControl(watched, operation, descriptor, readable, writable)
+    watched.descriptor = -1
+    changed
+}
 
-noescape extern:"host" fun ablaHostNetPollerWait(
-    poller: int,
-    maximumEvents: int,
-    timeoutMilliseconds: int
-): string
-
-noescape extern:"host" fun ablaHostStopProcess(process: int): int
-
-noescape extern:"host" fun ablaHostStopProcessGracefully(
-    process: int,
-    graceMilliseconds: int
-): int
+// The ready events in SocketPoller.waitCompact's encoding.
+fun ablaHostNetPollerWait(poller: int, maximumEvents: int, timeoutMilliseconds: int): string {
+    var watched = SocketPoller(poller)
+    val events = watched.waitCompact(maximumEvents, timeoutMilliseconds)
+    watched.descriptor = -1
+    events
+}

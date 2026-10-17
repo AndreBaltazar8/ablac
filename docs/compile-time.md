@@ -432,6 +432,85 @@ fun main {
 The manifest's unknown capability names are ignored. A grant with an
 unknown name is `compile.capability-unknown`.
 
+### Native code at compile time
+
+With `trusted.native`, compile-time code runs native code as a compiled program
+does. A call to an `extern:"c"` declaration calls the C function, with the
+argument and result conversions of a compiled call. Its symbol is looked up in
+the compiler process (the C library) and in the libraries of the root
+manifest's `nativeLibraries`, which the compiler loads for the build: it
+searches `LIBRARY_PATH`, the system library directories and the dynamic
+loader's own paths. `trusted` code's raw memory operations, the allocator behind
+`abla/unsafe/memory`, and the system calls under `abla/fs`, `abla/process` and
+`abla/net` act on real memory and the real system. `nativeFunctionAddress(f)`
+gives C code an entry that calls back into `f`, so a C sort with an Abla
+comparison works as at run time.
+
+```toml file=abla.toml
+compileCapabilities = ["trusted.native"]
+```
+
+```abla
+import "abla/io"
+import "abla/compiler"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+
+#compilerGrant("trusted.native")
+
+noescape extern:"c" fun strlen(text: cstring): int
+noescape extern:"c" fun qsort(base: i64*, count: int, size: int, compare: i64*): void
+
+trusted fun compareWords(left: int, right: int): i32 =
+    i32(ablaUnsafeLoadI64(nativePointerFromAddress(left)) -
+        ablaUnsafeLoadI64(nativePointerFromAddress(right)))
+
+trusted fun sortedDigits(): int {
+    val buffer = nativeByteBuffer(32)
+    val values = [4, 2, 3, 1]
+    var index = 0
+    while (index < 4) {
+        buffer.storeI64(index * 8, values[index])
+        index = index + 1
+    }
+    qsort(buffer.address, 4, 8, nativePointerFromAddress(
+        nativeFunctionAddress(compareWords)
+    ))
+    var digits = 0
+    index = 0
+    while (index < 4) {
+        digits = digits * 10 + buffer.loadI64(index * 8)
+        index = index + 1
+    }
+    buffer.close()
+    digits
+}
+
+val nameLength = #strlen("compile time")
+val sorted = #sortedDigits()
+
+fun main {
+    print("$nameLength $sorted\n")
+}
+// output:
+// 12 1234
+```
+
+The rest of `abla/platform/host` works in both phases too: a compiled program
+links its functions, and compile-time code performs each under the capability
+it implies — `ablaHostFileKind`, `FileSize`, `FileRevision` and
+`CurrentDirectory` are `filesystem.read` (journaled like a read); writes, moves
+and removals `filesystem.write`; `Argument`/`ArgumentCount` `environment`;
+standard streams and processes `process.io`; `Net*` (and the `Tls*` functions
+of `abla/platform/host/tls`) `network`; `Sleep` and `MonotonicMilliseconds`
+`clock`; `SecureRandom` `random`.
+
+Without the grant, a native call is rejected before it runs
+(`compile.effect-denied:trusted.native`, or `E_COMPILE_NATIVE_DENIED` from a
+parser handler, which runs before that check). A symbol found nowhere is
+`E_COMPILE_NATIVE_SYMBOL`, which names the manifest libraries that were not
+found.
+
 ### Capabilities and the build cache
 
 A build whose compile-time code read nothing from outside can reuse its
@@ -524,17 +603,17 @@ compiler team tracks the remaining gaps case by case.
 | Delegated bindings, resources and `drop`, ownership checks | works |
 | Granted capabilities through the providers above | works |
 | Closures as `#` results | works |
-| `print`/`println`, `abla/fs`, `abla/process`, sockets: anything that ends in a system call | not yet: `compile.effect-denied:trusted.native` (being added by ct-native) |
-| `extern:"c"` functions, trusted raw memory | not yet: being added behind the `trusted.native` capability |
-| Fixed-width and nominal conversions (`u16(x)`, `Pin(x)`), integer extension methods | partly: being fixed |
+| `print`/`println`, `abla/fs`, `abla/process`, sockets: anything that ends in a system call | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
+| `extern:"c"` functions, trusted raw memory, `nativeFunctionAddress` callbacks | works with `trusted.native` |
+| `abla/platform/host` | works: each function under the capability it implies |
+| Fixed-width integer conversions (`u16(x)`); nominal conversions (`Pin(x)`), integer extension methods | fixed-width works; the rest partly: being fixed |
 | Run-time globals | see [above](#ordinary-globals-at-compile-time) |
 | Process arguments (`processArgumentCount()`) | works: compile-time code sees none, so the count is 0; no capability needed |
 
-So, for now, compile-time code cannot print. When ct-native lands the
-system-call mapping, `println` under `#` will write to the compiler's own
-standard output. Until then, to inspect what compile-time code computes,
-return the value with `#` and print it at run time, or stage a file with
-`compilerWriteFile`.
+Without `trusted.native`, compile-time code cannot print yet; `println` under
+`#` without a grant, writing to the compiler's standard output, is coming. To
+inspect what it computes, return the value with `#` and print it at run time,
+or stage a file with `compilerWriteFile`.
 
 ## How a compilation runs
 

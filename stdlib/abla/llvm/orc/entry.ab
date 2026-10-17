@@ -27,6 +27,11 @@ noescape extern:"c" fun LLVMCreateMemoryBufferWithContentsOfFile(
     outputBuffer: i64*,
     outputMessage: i64*
 ): i32
+noescape extern:"c" fun LLVMCreateMemoryBufferWithMemoryRangeCopy(
+    data: cstring,
+    length: int,
+    name: cstring
+): i64*
 noescape extern:"c" fun LLVMDisposeMemoryBuffer(buffer: i64*): void
 noescape extern:"c" fun LLVMDisposeMessage(message: i64*): void
 noescape extern:"c" fun LLVMCreatePassBuilderOptions(): i64*
@@ -108,9 +113,22 @@ noescape extern:"c" fun LLVMGetBufferSize(buffer: i64*): int
 noescape extern:"c" fun LLVMGetHostCPUName(): i64*
 noescape extern:"c" fun LLVMGetHostCPUFeatures(): i64*
 noescape extern:"c" fun LLVMLoadLibraryPermanently(path: cstring): i32
+noescape extern:"c" fun LLVMSearchForAddressOfSymbol(name: cstring): i64*
+noescape extern:"c" fun LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
+    outputGenerator: i64*,
+    path: cstring,
+    globalPrefix: i8,
+    filter: i64*,
+    filterContext: i64*
+): i64*
 
 fun llvmLoadLibraryPermanently(path: string): int =
     LLVMLoadLibraryPermanently(path)
+
+// The address of `name` in the process or in a library loaded permanently
+// (0 when absent): what the JIT's process generator resolves it to.
+trusted fun llvmSearchForAddressOfSymbol(name: string): int =
+    nativePointerAddress(LLVMSearchForAddressOfSymbol(name))
 
 fun llvmConsumeError(error: i64*, status: int): int {
     var result = 0
@@ -268,11 +286,6 @@ fun LlvmOrcSession.addFile(path: string, passes: string = ""): LlvmOrcGeneration
     val nullPointer = nativeNullPointer()
     val buffer = nativePointerCell(nullPointer)
     val message = nativePointerCell(nullPointer)
-    val module = nativePointerCell(nullPointer)
-    val context = LLVMContextCreate()
-    var contextTransferred = false
-    var threadModuleOwned = false
-    var threadContextDisposed = false
     var status: int = 128
     if (!this.closed && this.status == 0) {
         status = LLVMCreateMemoryBufferWithContentsOfFile(
@@ -281,10 +294,48 @@ fun LlvmOrcSession.addFile(path: string, passes: string = ""): LlvmOrcGeneration
             message.address
         )
     }
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    val generation = this.addBuffer(buffer.load(), status, passes)
+    buffer.close()
+    message.close()
+    generation
+}
+
+// Adds the textual IR module `ir` (`name` in LLVM's messages), after running
+// the IR pipeline `passes` on it.
+fun LlvmOrcSession.addText(
+    name: string,
+    ir: string,
+    passes: string = ""
+): LlvmOrcGeneration {
+    var status: int = 128
+    var buffer = nativeNullPointer()
+    if (!this.closed && this.status == 0) {
+        buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(ir, ir.size, name)
+        status = if (pointerIsNull(buffer)) 120 else 0
+    }
+    this.addBuffer(buffer, status, passes)
+}
+
+// Parses the memory buffer `source` (consumed; `initialStatus` says how
+// creating it went) and adds its module through a new generation tracker.
+fun LlvmOrcSession.addBuffer(
+    source: i64*,
+    initialStatus: int,
+    passes: string
+): LlvmOrcGeneration {
+    val nullPointer = nativeNullPointer()
+    val message = nativePointerCell(nullPointer)
+    val module = nativePointerCell(nullPointer)
+    val context = LLVMContextCreate()
+    var contextTransferred = false
+    var threadModuleOwned = false
+    var threadContextDisposed = false
+    var status = initialStatus
     if (status == 0) {
         status = LLVMParseIRInContext(
             context,
-            buffer.load(),
+            source,
             module.address,
             message.address
         )
@@ -343,7 +394,6 @@ fun LlvmOrcSession.addFile(path: string, passes: string = ""): LlvmOrcGeneration
         LLVMOrcReleaseResourceTracker(tracker)
         tracker = nullPointer
     }
-    buffer.close()
     message.close()
     module.close()
     LlvmOrcGeneration(tracker, status, status != 0)

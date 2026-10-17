@@ -1,0 +1,1443 @@
+// Native code at compile time: extern:"c" calls and the trusted raw-memory
+// and system intrinsics, for the compile-time evaluator.
+//
+// The compiler is itself a process on the Abla runtime, so a raw intrinsic is
+// evaluated by performing it: a load reads the address, an allocation comes
+// from the same allocator a program's would, a syscall enters the kernel the
+// same way. An extern:"c" call resolves its symbol in the compiler process or
+// in a library of the root manifest's `nativeLibraries` (loaded permanently,
+// once per process) and goes through a thunk compiled for its signature by an
+// in-process ORC JIT: the thunk loads the arguments from 64-bit words, makes
+// the call with the declared C types, as a compiled program's call would, and
+// stores the widened result.
+//
+// Everything here is arbitrary native code at compile time: it requires the
+// `trusted.native` compile capability (process arguments and the environment
+// require `environment`), checked when evaluated as well as by the semantic
+// effect analysis, since parser handlers run before that analysis.
+
+import "eval.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/native"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/sys/linux/fs"
+import "abla/llvm/orc"
+import "abla/float"
+import "abla/platform/host"
+import "abla/platform/host/tls"
+
+noescape extern:"c" fun dlopen(path: i64*, mode: i32): i64*
+noescape extern:"c" fun dlsym(handle: i64*, name: cstring): i64*
+
+// The entry module of the compilation being staged (set when its module graph
+// starts loading): its root manifest names the native libraries.
+var ctNativeEntryPath: string = ""
+
+// The libraries loaded for `ctNativeLibrariesEntry`, and the ones that were
+// named but not found (reported when a symbol is then missing).
+var ctNativeLibrariesEntry: string = ""
+var ctNativeLibrariesReady: bool = false
+var ctNativeLoadedLibraries: array<string> = []
+var ctNativeLoadedLibraryPaths: array<string> = []
+var ctNativeMissingLibraries: array<string> = []
+var ctNativeSearchedDirectories: string = ""
+
+// The thunk JIT (created on the first extern:"c" call) and its thunks, one per
+// signature key.
+var ctNativeSessions: array<LlvmOrcSession> = []
+var ctNativeThunkKeys: array<string> = []
+var ctNativeThunkAddresses: array<int> = []
+
+// Resolved symbols, by name.
+var ctNativeSymbolNames: array<string> = []
+var ctNativeSymbolAddresses: array<int> = []
+
+// Strings whose storage an evaluated `ablaUnsafeCStringAddress` or
+// `ablaUnsafeStringAddress` handed out. A program keeps such a string alive
+// while it uses the address; the evaluator's values may be dropped earlier, so
+// the most recent ones are held here.
+val CT_NATIVE_PINNED_LIMIT = 4096
+var ctNativePinned: array<string> = []
+var ctNativePinnedNext: int = 0
+
+// The compile capabilities granted to the `#` expressions of the program being
+// lowered: its source requests intersected with the manifest's authorization,
+// and none once semantic analysis failed (a denied effect is one such
+// failure, and lowering still evaluates for diagnostics).
+var ctNativeLoweringGrants: int = 0
+
+fun ctNativeSetLoweringGrants(parsed: BootstrapParseResult, semanticErrors: int): void {
+    ctNativeLoweringGrants = if (semanticErrors > 0) 0 else
+        bootstrapBuildCompileEffectGrants(
+            bootstrapBuildCompileEffectRequests(parsed),
+            bootstrapBuildCompileEffectAuthorizations(parsed)
+        )
+    return
+}
+
+fun ctNativeSetEntry(path: string): void {
+    ctNativeEntryPath = path
+    return
+}
+
+fun ctNativeIntrinsicPrefix(name: string): bool =
+    name.startsWith("ablaUnsafe") || name.startsWith("ablaLinux") ||
+    name.startsWith("ablaRuntimePointer") || name.startsWith("__ablaRuntime") ||
+    name == "nativeStackAllocate" || name == "nativeFunctionAddress"
+
+// The raw intrinsics evaluated here (the extern:"intrinsic" declarations of
+// abla/unsafe/memory, abla/unsafe/native and abla/sys/linux, and the runtime's
+// allocation entry points they reach).
+fun ctNativeIntrinsic(name: string): bool =
+    name == "ablaUnsafeLoadU8" || name == "ablaUnsafeLoadU16" ||
+    name == "ablaUnsafeLoadU32" || name == "ablaUnsafeLoadI64" ||
+    name == "ablaUnsafeLoadPointer" ||
+    name == "ablaUnsafeStoreU8" || name == "ablaUnsafeStoreU16" ||
+    name == "ablaUnsafeStoreU32" || name == "ablaUnsafeStoreI64" ||
+    name == "ablaUnsafeStorePointer" ||
+    name == "ablaUnsafeNullPointer" || name == "ablaUnsafePointerIsNull" ||
+    name == "ablaUnsafePointerOffset" || name == "ablaUnsafePointerAddress" ||
+    name == "ablaRuntimePointerFromAddress" ||
+    name == "ablaRuntimePointerAddress" ||
+    name == "ablaUnsafeSetMemory" || name == "ablaUnsafeCopyMemory" ||
+    name == "ablaUnsafeCStringAddress" || name == "ablaUnsafeStringAddress" ||
+    name == "ablaUnsafeAdoptString" || name == "ablaUnsafeBorrowCString" ||
+    name == "__ablaRuntimeAllocateLayout" || name == "__ablaRuntimeAllocate" ||
+    name == "__ablaRuntimeFree" ||
+    name == "__ablaRuntimePlatformMemorySetLayout" ||
+    name == "ablaUnsafeAtomicFetchAddI64" ||
+    name == "ablaUnsafeAtomicCompareExchangeU32" ||
+    name == "ablaUnsafeAtomicCompareExchangeRelaxedU32" ||
+    name == "ablaUnsafeAtomicFence" ||
+    name == "nativeStackAllocate" || name == "nativeFunctionAddress" ||
+    name == "ablaUnsafeCallVoid0" || name == "ablaUnsafeCallI32" ||
+    name == "ablaUnsafeCallVoidPointer3" ||
+    name == "ablaLinuxSyscall" ||
+    name == "ablaLinuxArgumentCount" || name == "ablaLinuxArgument" ||
+    name == "ablaLinuxEnvironmentPointer"
+
+// The compile capability an intrinsic needs (the effect bit the semantic
+// analysis gives its declaration).
+fun ctNativeIntrinsicEffect(name: string): int =
+    if (name == "ablaLinuxArgumentCount" || name == "ablaLinuxArgument" ||
+        name == "ablaLinuxEnvironmentPointer") 16 else 512
+
+fun ctNativeDenied(
+    var evaluator: BootstrapEvaluator,
+    what: string,
+    effect: int
+): BootstrapEvalValue {
+    val capability = bootstrapCompileEffectName(effect)
+    evaluator.errors = evaluator.errors + 1
+    evaluator.recordEvaluatorDiagnostic(
+        "E_COMPILE_NATIVE_DENIED",
+        "compile-time $what needs the `$capability` compile capability: request it with `#compilerGrant(\"$capability\")` and authorize it in the entry's abla.toml `compileCapabilities`"
+    )
+    bootstrapEvalInvalid()
+}
+
+// The 64-bit word an evaluated scalar passes as (an integer or address, a
+// bool as 0/1, a float's IEEE bits).
+fun ctNativeWord(value: BootstrapEvalValue): int =
+    if (value.kind == "boolean") { if (value.boolean) 1 else 0 }
+    else value.integer
+
+fun ctNativeArgument(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    index: int
+): int =
+    if (index < expression.children.size)
+        ctNativeWord(evaluator.evaluate(expression.children[index]))
+    else 0
+
+trusted fun ctNativePin(value: string): void {
+    if (ctNativePinned.size < CT_NATIVE_PINNED_LIMIT) {
+        ctNativePinned.append(value)
+    } else {
+        ctNativePinned[ctNativePinnedNext] = value
+        ctNativePinnedNext = ctNativePinnedNext + 1
+        if (ctNativePinnedNext == CT_NATIVE_PINNED_LIMIT) {
+            ctNativePinnedNext = 0
+        }
+    }
+}
+
+// A copy of the NUL-terminated bytes at `address`, owned by the compiler.
+trusted fun ctNativeCopyCString(address: int): string {
+    var length = 0
+    while (ablaUnsafeLoadU8(nativePointerFromAddress(address + length)) != 0) {
+        length = length + 1
+    }
+    val copy = nativeByteBuffer(length + 1)
+    var index = 0
+    while (index < length) {
+        copy.store(index, ablaUnsafeLoadU8(
+            nativePointerFromAddress(address + index)
+        ))
+        index = index + 1
+    }
+    copy.store(length, 0)
+    copy.adoptString(length)
+}
+
+// A NUL-terminated copy of `text` in a platform allocation (released with
+// ctNativeFree).
+trusted fun ctNativeCString(text: string): int {
+    val address = __ablaRuntimeAllocateLayout(text.size + 1, 10)
+    var index = 0
+    while (index < text.size) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + index), text[index])
+        index = index + 1
+    }
+    ablaUnsafeStoreU8(nativePointerFromAddress(address + text.size), 0)
+    address
+}
+
+trusted fun ctNativeFree(address: int): void = __ablaRuntimeFree(address)
+
+@noinline
+trusted fun ctNativeEvaluateIntrinsic(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    name: string
+): BootstrapEvalValue {
+    val effect = ctNativeIntrinsicEffect(name)
+    if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, effect)) {
+        return ctNativeDenied(evaluator, "intrinsic `$name`", effect)
+    }
+    if (name == "nativeFunctionAddress") {
+        return ctNativeEvaluateFunctionAddress(evaluator, expression)
+    }
+    var result = bootstrapEvalVoid()
+    if (name == "ablaUnsafeLoadU8") {
+        result = bootstrapEvalInteger(ablaUnsafeLoadU8(nativePointerFromAddress(
+            ctNativeArgument(evaluator, expression, 0)
+        )))
+    } else if (name == "ablaUnsafeLoadU16") {
+        result = bootstrapEvalInteger(ablaUnsafeLoadU16(nativePointerFromAddress(
+            ctNativeArgument(evaluator, expression, 0)
+        )))
+    } else if (name == "ablaUnsafeLoadU32") {
+        result = bootstrapEvalInteger(ablaUnsafeLoadU32(nativePointerFromAddress(
+            ctNativeArgument(evaluator, expression, 0)
+        )))
+    } else if (name == "ablaUnsafeLoadI64") {
+        result = bootstrapEvalInteger(ablaUnsafeLoadI64(nativePointerFromAddress(
+            ctNativeArgument(evaluator, expression, 0)
+        )))
+    } else if (name == "ablaUnsafeLoadPointer") {
+        result = bootstrapEvalInteger(nativePointerAddress(
+            ablaUnsafeLoadPointer(nativePointerFromAddress(
+                ctNativeArgument(evaluator, expression, 0)
+            ))
+        ))
+    } else if (name == "ablaUnsafeStoreU8" || name == "ablaUnsafeStoreU16" ||
+               name == "ablaUnsafeStoreU32" || name == "ablaUnsafeStoreI64" ||
+               name == "ablaUnsafeStorePointer") {
+        val address = nativePointerFromAddress(
+            ctNativeArgument(evaluator, expression, 0)
+        )
+        val value = ctNativeArgument(evaluator, expression, 1)
+        if (name == "ablaUnsafeStoreU8") ablaUnsafeStoreU8(address, value)
+        if (name == "ablaUnsafeStoreU16") ablaUnsafeStoreU16(address, value)
+        if (name == "ablaUnsafeStoreU32") ablaUnsafeStoreU32(address, value)
+        if (name == "ablaUnsafeStoreI64") ablaUnsafeStoreI64(address, value)
+        if (name == "ablaUnsafeStorePointer") {
+            ablaUnsafeStorePointer(address, nativePointerFromAddress(value))
+        }
+    } else if (name == "ablaUnsafeNullPointer") {
+        result = bootstrapEvalInteger(0)
+    } else if (name == "ablaUnsafePointerIsNull") {
+        result = bootstrapEvalBoolean(
+            ctNativeArgument(evaluator, expression, 0) == 0
+        )
+    } else if (name == "ablaUnsafePointerOffset") {
+        val base = ctNativeArgument(evaluator, expression, 0)
+        result = bootstrapEvalInteger(
+            base + ctNativeArgument(evaluator, expression, 1)
+        )
+    } else if (name == "ablaUnsafePointerAddress" ||
+               name == "ablaRuntimePointerFromAddress" ||
+               name == "ablaRuntimePointerAddress") {
+        result = bootstrapEvalInteger(ctNativeArgument(evaluator, expression, 0))
+    } else if (name == "ablaUnsafeSetMemory") {
+        val address = ctNativeArgument(evaluator, expression, 0)
+        val value = ctNativeArgument(evaluator, expression, 1)
+        val size = ctNativeArgument(evaluator, expression, 2)
+        ablaUnsafeSetMemory(nativePointerFromAddress(address), value, size)
+    } else if (name == "ablaUnsafeCopyMemory") {
+        val destination = ctNativeArgument(evaluator, expression, 0)
+        val source = ctNativeArgument(evaluator, expression, 1)
+        val size = ctNativeArgument(evaluator, expression, 2)
+        ablaUnsafeCopyMemory(destination, source, size)
+    } else if (name == "ablaUnsafeCStringAddress" ||
+               name == "ablaUnsafeStringAddress") {
+        val value = evaluator.evaluate(expression.children[0])
+        if (value.kind == "string") {
+            ctNativePin(value.text)
+            result = bootstrapEvalInteger(
+                if (name == "ablaUnsafeCStringAddress")
+                    ablaUnsafeCStringAddress(value.text)
+                else ablaUnsafeStringAddress(value.text)
+            )
+        } else {
+            result = bootstrapEvalInvalid()
+        }
+    } else if (name == "ablaUnsafeAdoptString") {
+        // The allocation came from this process's allocator (the evaluated
+        // __ablaRuntimeAllocateLayout), so the string adopts it as a
+        // program's would.
+        val address = ctNativeArgument(evaluator, expression, 0)
+        val length = ctNativeArgument(evaluator, expression, 1)
+        result = bootstrapEvalString(
+            ablaUnsafeAdoptString(nativePointerFromAddress(address), length)
+        )
+    } else if (name == "ablaUnsafeBorrowCString") {
+        // The caller guarantees the bytes only for a while; the evaluator's
+        // string may outlive that, so it gets a copy.
+        result = bootstrapEvalString(ctNativeCopyCString(
+            ctNativeArgument(evaluator, expression, 0)
+        ))
+    } else if (name == "__ablaRuntimeAllocateLayout") {
+        val size = ctNativeArgument(evaluator, expression, 0)
+        val layout = ctNativeArgument(evaluator, expression, 1)
+        result = bootstrapEvalInteger(__ablaRuntimeAllocateLayout(size, layout))
+    } else if (name == "__ablaRuntimeAllocate") {
+        result = bootstrapEvalInteger(__ablaRuntimeAllocate(
+            ctNativeArgument(evaluator, expression, 0)
+        ))
+    } else if (name == "__ablaRuntimeFree") {
+        __ablaRuntimeFree(ctNativeArgument(evaluator, expression, 0))
+    } else if (name == "__ablaRuntimePlatformMemorySetLayout") {
+        val address = ctNativeArgument(evaluator, expression, 0)
+        val layout = ctNativeArgument(evaluator, expression, 1)
+        __ablaRuntimePlatformMemorySetLayout(address, layout)
+    } else if (name == "ablaUnsafeAtomicFetchAddI64") {
+        val address = ctNativeArgument(evaluator, expression, 0)
+        val delta = ctNativeArgument(evaluator, expression, 1)
+        result = bootstrapEvalInteger(ablaUnsafeAtomicFetchAddI64(
+            nativePointerFromAddress(address), delta
+        ))
+    } else if (name == "ablaUnsafeAtomicCompareExchangeU32" ||
+               name == "ablaUnsafeAtomicCompareExchangeRelaxedU32") {
+        val address = ctNativeArgument(evaluator, expression, 0)
+        val expected = u32(ctNativeArgument(evaluator, expression, 1))
+        val replacement = u32(ctNativeArgument(evaluator, expression, 2))
+        val observed = if (name == "ablaUnsafeAtomicCompareExchangeU32")
+            ablaUnsafeAtomicCompareExchangeU32(address, expected, replacement)
+        else ablaUnsafeAtomicCompareExchangeRelaxedU32(
+            address, expected, replacement
+        )
+        result = bootstrapEvalInteger(i64(observed))
+    } else if (name == "ablaUnsafeAtomicFence") {
+        ablaUnsafeAtomicFence()
+    } else if (name == "nativeStackAllocate") {
+        // A frame's stack storage at run time; the evaluator's frames are not
+        // native ones, so it lives in a platform allocation instead.
+        result = bootstrapEvalInteger(__ablaRuntimeAllocateLayout(
+            ctNativeArgument(evaluator, expression, 0), 10
+        ))
+    } else if (name == "ablaUnsafeCallVoid0") {
+        ablaUnsafeCallVoid0(ctNativeArgument(evaluator, expression, 0))
+    } else if (name == "ablaUnsafeCallI32") {
+        result = bootstrapEvalInteger(ablaUnsafeCallI32(
+            ctNativeArgument(evaluator, expression, 0)
+        ))
+    } else if (name == "ablaUnsafeCallVoidPointer3") {
+        val address = ctNativeArgument(evaluator, expression, 0)
+        val first = ctNativeArgument(evaluator, expression, 1)
+        val second = ctNativeArgument(evaluator, expression, 2)
+        val third = ctNativeArgument(evaluator, expression, 3)
+        ablaUnsafeCallVoidPointer3(
+            address,
+            nativePointerFromAddress(first),
+            nativePointerFromAddress(second),
+            nativePointerFromAddress(third)
+        )
+    } else if (name == "ablaLinuxSyscall") {
+        val number = ctNativeArgument(evaluator, expression, 0)
+        val argument0 = ctNativeArgument(evaluator, expression, 1)
+        val argument1 = ctNativeArgument(evaluator, expression, 2)
+        val argument2 = ctNativeArgument(evaluator, expression, 3)
+        val argument3 = ctNativeArgument(evaluator, expression, 4)
+        val argument4 = ctNativeArgument(evaluator, expression, 5)
+        val argument5 = ctNativeArgument(evaluator, expression, 6)
+        result = bootstrapEvalInteger(ablaLinuxSyscall(
+            number, argument0, argument1, argument2,
+            argument3, argument4, argument5
+        ))
+    } else if (name == "ablaLinuxArgumentCount") {
+        result = bootstrapEvalInteger(ablaLinuxArgumentCount())
+    } else if (name == "ablaLinuxArgument") {
+        result = bootstrapEvalString(ablaLinuxArgument(
+            ctNativeArgument(evaluator, expression, 0)
+        ))
+    } else if (name == "ablaLinuxEnvironmentPointer") {
+        result = bootstrapEvalInteger(
+            nativePointerAddress(ablaLinuxEnvironmentPointer())
+        )
+    }
+    result
+}
+
+// Fixed-width integer conversions (`i32(x)`, `u8(x)`, …) of an integer:
+// the compiler's own conversion, so a value wraps as it does in a program.
+fun ctNativeScalarConversion(name: string): bool =
+    name == "i8" || name == "i16" || name == "i32" || name == "i64" ||
+    name == "u8" || name == "u16" || name == "u32" || name == "u64"
+
+@noinline
+fun ctNativeEvaluateScalarConversion(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    name: string
+): BootstrapEvalValue {
+    if (expression.children.size != 1) return bootstrapEvalInvalid()
+    val value = evaluator.evaluate(expression.children[0])
+    if (value.kind != "integer") return bootstrapEvalInvalid()
+    val x = value.integer
+    bootstrapEvalInteger(
+        if (name == "i8") i64(i8(x))
+        else if (name == "i16") i64(i16(x))
+        else if (name == "i32") i64(i32(x))
+        else if (name == "u8") i64(u8(x))
+        else if (name == "u16") i64(u16(x))
+        else if (name == "u32") i64(u32(x))
+        else x
+    )
+}
+
+// ---- extern:"c" ----
+
+// A C ABI type of an extern:"c" parameter or result, as the LLVM backend
+// lowers it (bootstrapLlvmNativeType): "" when unsupported.
+fun ctNativeLlvmType(type: string): string =
+    if (type == "i8" || type == "u8" || type == "char") "i8"
+    else if (type == "i16" || type == "u16") "i16"
+    else if (type == "i32" || type == "u32") "i32"
+    else if (type == "i64" || type == "u64") "i64"
+    else if (type == "f32") "float"
+    else if (type == "f64") "double"
+    else if (type == "bool") "i1"
+    else if (type == "cstring" || ctNativeIsPointerType(type)) "ptr"
+    else if (type == "void") "void"
+    else ""
+
+fun ctNativeIsPointerType(type: string): bool =
+    type.size > 1 && type[type.size - 1] == 42 &&
+    !bootstrapTextContains(type, ":") && !bootstrapTextContains(type, "(") &&
+    !bootstrapTextContains(type, "<")
+
+fun ctNativeUnsigned(type: string): bool =
+    type == "char" || type == "u8" || type == "u16" || type == "u32" ||
+    type == "u64"
+
+fun ctNativeRuntimeType(
+    declarations: array<BootstrapDeclaration>,
+    type: string
+): string {
+    val normalized = bootstrapNormalizeType(type)
+    val underlying = bootstrapScalarTypeUnderlying(declarations, normalized)
+    if (underlying == "") normalized else underlying
+}
+
+// The thunk for one signature: `void thunk(ptr fn, ptr words, ptr result)`
+// loads each argument from its word, calls `fn` with the declared C types and
+// stores the result widened to a word (sign- or zero-extended by its type).
+fun ctNativeThunkSource(
+    symbol: string,
+    parameterTypes: array<string>,
+    resultType: string
+): string {
+    var body = ""
+    val arguments: array<string> = []
+    var index = 0
+    while (index < parameterTypes.size) {
+        val type = parameterTypes[index]
+        val llvm = ctNativeLlvmType(type)
+        body = "$body  %w$index.p = getelementptr i64, ptr %words, i64 $index\n  %w$index = load i64, ptr %w$index.p\n"
+        if (llvm == "i64") {
+            arguments.append("i64 %w$index")
+        } else if (llvm == "i8" || llvm == "i16" || llvm == "i32" ||
+                   llvm == "i1") {
+            body = "$body  %a$index = trunc i64 %w$index to $llvm\n"
+            arguments.append("$llvm %a$index")
+        } else if (llvm == "double") {
+            body = "$body  %a$index = bitcast i64 %w$index to double\n"
+            arguments.append("double %a$index")
+        } else if (llvm == "float") {
+            body = "$body  %b$index = trunc i64 %w$index to i32\n  %a$index = bitcast i32 %b$index to float\n"
+            arguments.append("float %a$index")
+        } else {
+            body = "$body  %a$index = inttoptr i64 %w$index to ptr\n"
+            arguments.append("ptr %a$index")
+        }
+        index = index + 1
+    }
+    var list = ""
+    index = 0
+    while (index < arguments.size) {
+        list = if (index == 0) arguments[index] else "$list, ${arguments[index]}"
+        index = index + 1
+    }
+    val result = ctNativeLlvmType(resultType)
+    if (result == "void") {
+        body = "$body  call void %fn($list)\n  store i64 0, ptr %result\n"
+    } else {
+        body = "$body  %r = call $result %fn($list)\n"
+        if (result == "i64") {
+            body = "$body  store i64 %r, ptr %result\n"
+        } else if (result == "i8" || result == "i16" || result == "i32" ||
+                   result == "i1") {
+            val extend = if (result == "i1" || ctNativeUnsigned(resultType))
+                "zext" else "sext"
+            body = "$body  %rw = $extend $result %r to i64\n  store i64 %rw, ptr %result\n"
+        } else if (result == "double") {
+            body = "$body  %rw = bitcast double %r to i64\n  store i64 %rw, ptr %result\n"
+        } else if (result == "float") {
+            body = "$body  %rb = bitcast float %r to i32\n  %rw = zext i32 %rb to i64\n  store i64 %rw, ptr %result\n"
+        } else {
+            body = "$body  %rw = ptrtoint ptr %r to i64\n  store i64 %rw, ptr %result\n"
+        }
+    }
+    "define void @$symbol(ptr %fn, ptr %words, ptr %result) {\nentry:\n$body  ret void\n}\n"
+}
+
+// The thunk's address for a signature (compiled on first use), or a negative
+// JIT status.
+fun ctNativeThunk(parameterTypes: array<string>, resultType: string): int {
+    var key = "$resultType("
+    var index = 0
+    while (index < parameterTypes.size) {
+        key = "$key${parameterTypes[index]},"
+        index = index + 1
+    }
+    index = 0
+    while (index < ctNativeThunkKeys.size) {
+        if (ctNativeThunkKeys[index] == key) return ctNativeThunkAddresses[index]
+        index = index + 1
+    }
+    if (ctNativeSessions.size == 0) {
+        ctNativeSessions.append(llvmOrcCreateSession())
+    }
+    val session = ctNativeSessions[0]
+    if (session.status != 0) return -session.status
+    val symbol = "abla_ct_native_thunk_${ctNativeThunkKeys.size}"
+    val generation = session.addText(
+        symbol, ctNativeThunkSource(symbol, parameterTypes, resultType)
+    )
+    if (generation.status != 0) return -generation.status
+    val lookup = session.lookup(symbol)
+    if (lookup.status != 0) return -lookup.status
+    ctNativeThunkKeys.append(key)
+    ctNativeThunkAddresses.append(lookup.address)
+    lookup.address
+}
+
+// ---- native libraries ----
+
+fun ctNativeRootManifest(entry: string): string {
+    var directory = Path(entry).parent()
+    var result = directory.child("abla.toml")
+    var searching = !result.exists()
+    var depth = 0
+    while (searching && depth < 128) {
+        val parent = directory.parent()
+        if (parent.text == directory.text) searching = false
+        directory = parent
+        val candidate = directory.child("abla.toml")
+        if (candidate.exists()) {
+            result = candidate
+            searching = false
+        }
+        depth = depth + 1
+    }
+    result.text
+}
+
+// The strings of the manifest's `nativeLibraries = [...]` array.
+fun ctNativeManifestNames(source: string): array<string> {
+    val names: array<string> = []
+    val key = "nativeLibraries"
+    var cursor = -1
+    var lineBegin = 0
+    while (cursor < 0 && lineBegin < source.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < source.size && source[lineEnd] != 10) lineEnd = lineEnd + 1
+        var begin = lineBegin
+        while (begin < lineEnd && (source[begin] == 32 || source[begin] == 9)) {
+            begin = begin + 1
+        }
+        if (begin + key.size <= lineEnd && source.slice(begin, begin + key.size) == key) {
+            var index = begin + key.size
+            while (index < lineEnd && (source[index] == 32 || source[index] == 9)) {
+                index = index + 1
+            }
+            if (index < lineEnd && source[index] == 61) {
+                index = index + 1
+                while (index < lineEnd && (source[index] == 32 || source[index] == 9)) {
+                    index = index + 1
+                }
+                if (index < lineEnd && source[index] == 91) cursor = index + 1
+            }
+        }
+        lineBegin = lineEnd + 1
+    }
+    var complete = cursor < 0
+    while (!complete && cursor < source.size) {
+        val byte = source[cursor]
+        if (byte == 93) {
+            complete = true
+        } else if (byte == 34) {
+            var end = cursor + 1
+            while (end < source.size && source[end] != 34 && source[end] != 10) {
+                end = end + 1
+            }
+            if (end < source.size && source[end] == 34) {
+                names.append(source.slice(cursor + 1, end))
+                cursor = end + 1
+            } else complete = true
+        } else if (byte == 35) {
+            while (cursor < source.size && source[cursor] != 10) cursor = cursor + 1
+        } else {
+            cursor = cursor + 1
+        }
+    }
+    names
+}
+
+fun ctNativeLibraryNameValid(name: string): bool {
+    var valid = name.size > 0 && name.size <= 128
+    var index = 0
+    while (valid && index < name.size) {
+        val byte = name[index]
+        valid = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) ||
+            byte == 43 || byte == 45 || byte == 46 || byte == 95
+        index = index + 1
+    }
+    valid
+}
+
+// The C runtime's own libraries: already in the compiler process.
+fun ctNativeProcessLibrary(name: string): bool =
+    name == "c" || name == "m" || name == "dl" || name == "pthread" ||
+    name == "rt" || name == "util" || name == "System"
+
+// Where `-l<name>` may find a library: LIBRARY_PATH (which the C compiler
+// driver also passes to the linker), then the usual system directories.
+fun ctNativeLibraryDirectories(): array<string> {
+    val directories: array<string> = []
+    val configured = linuxEnvironment("LIBRARY_PATH")
+    if (configured.found) {
+        var begin = 0
+        var index = 0
+        while (index <= configured.value.size) {
+            if (index == configured.value.size || configured.value[index] == 58) {
+                if (index > begin) {
+                    directories.append(configured.value.slice(begin, index))
+                }
+                begin = index + 1
+            }
+            index = index + 1
+        }
+    }
+    if (ablaHostIsMacOS()) {
+        directories.append("/opt/homebrew/lib")
+        directories.append("/usr/local/lib")
+        directories.append("/usr/lib")
+    } else {
+        directories.append("/usr/local/lib")
+        directories.append("/usr/lib/x86_64-linux-gnu")
+        directories.append("/lib/x86_64-linux-gnu")
+        directories.append("/usr/lib/aarch64-linux-gnu")
+        directories.append("/lib/aarch64-linux-gnu")
+        directories.append("/usr/lib64")
+        directories.append("/lib64")
+        directories.append("/usr/lib")
+        directories.append("/lib")
+    }
+    directories
+}
+
+// Loads a library file; a GNU ld script (a Linux `lib<name>.so` may be one)
+// loads the shared objects it names instead.
+fun ctNativeLoadFile(path: string): bool {
+    if (llvmLoadLibraryPermanently(path) == 0) return true
+    var loaded = false
+    val info = Path(path).info()
+    if (info.size > 0 && info.size < 4096) {
+        val script = Path(path).readText()
+        if (bootstrapTextContains(script, "GROUP") ||
+            bootstrapTextContains(script, "INPUT")) {
+            var index = 0
+            while (index < script.size) {
+                if (script[index] == 47) {
+                    var end = index
+                    while (end < script.size && script[end] != 32 &&
+                           script[end] != 41 && script[end] != 10 &&
+                           script[end] != 9) end = end + 1
+                    val candidate = script.slice(index, end)
+                    if (bootstrapTextContains(candidate, ".so") &&
+                        llvmLoadLibraryPermanently(candidate) == 0) loaded = true
+                    index = end
+                } else {
+                    index = index + 1
+                }
+            }
+        }
+    }
+    loaded
+}
+
+// The path a library was loaded from ("" when not found).
+fun ctNativeLoadLibrary(name: string, directories: array<string>): string {
+    val file = if (ablaHostIsMacOS()) "lib$name.dylib" else "lib$name.so"
+    var loaded = ""
+    var index = 0
+    while (loaded == "" && index < directories.size) {
+        val candidate = "${directories[index]}/$file"
+        if (Path(candidate).exists() && ctNativeLoadFile(candidate)) {
+            loaded = candidate
+        }
+        index = index + 1
+    }
+    // The dynamic loader's own search (its configured paths, and on Darwin the
+    // shared cache that holds the system libraries).
+    if (loaded == "" && llvmLoadLibraryPermanently(file) == 0) loaded = file
+    loaded
+}
+
+// Loads the root manifest's nativeLibraries for the current entry (once per
+// entry; a library stays loaded for the life of the process).
+fun ctNativePrepareLibraries(): void {
+    if (ctNativeLibrariesReady && ctNativeLibrariesEntry == ctNativeEntryPath) {
+        return
+    }
+    ctNativeLibrariesReady = true
+    ctNativeLibrariesEntry = ctNativeEntryPath
+    ctNativeLoadedLibraries = []
+    ctNativeLoadedLibraryPaths = []
+    ctNativeMissingLibraries = []
+    if (ctNativeEntryPath == "") return
+    val manifest = ctNativeRootManifest(ctNativeEntryPath)
+    if (!Path(manifest).exists()) return
+    val names = ctNativeManifestNames(Path(manifest).readText())
+    val directories = ctNativeLibraryDirectories()
+    var searched = ""
+    var index = 0
+    while (index < directories.size) {
+        searched = if (index == 0) directories[index]
+            else "$searched, ${directories[index]}"
+        index = index + 1
+    }
+    ctNativeSearchedDirectories = searched
+    index = 0
+    while (index < names.size && index < 32) {
+        val name = names[index]
+        if (ctNativeLibraryNameValid(name) && !ctNativeProcessLibrary(name)) {
+            val loaded = ctNativeLoadLibrary(name, directories)
+            if (loaded != "") {
+                ctNativeLoadedLibraries.append(name)
+                ctNativeLoadedLibraryPaths.append(loaded)
+            } else {
+                ctNativeMissingLibraries.append(name)
+            }
+        }
+        index = index + 1
+    }
+}
+
+// The JIT tier's libraries for a slice program: the root manifest's
+// nativeLibraries, loaded, when the program holds the trusted.native grant
+// (none otherwise, so nothing outside the process resolves without it).
+fun bootstrapCtNativeLibraries(parsed: BootstrapParseResult): array<string> {
+    val grants = bootstrapBuildCompileEffectGrants(
+        bootstrapBuildCompileEffectRequests(parsed),
+        bootstrapBuildCompileEffectAuthorizations(parsed)
+    )
+    if (!bootstrapCompileEffectHas(grants, 512)) return []
+    ctNativePrepareLibraries()
+    val paths: array<string> = []
+    for (path in ctNativeLoadedLibraryPaths) paths.append(path)
+    paths
+}
+
+// A symbol in the process's global scope: the executable, its libraries and
+// those loaded globally since (RTLD_LAZY is 1 on Darwin and Linux).
+trusted fun ctNativeProcessSymbol(name: string): int =
+    nativePointerAddress(dlsym(dlopen(nativeNullPointer(), 1), name))
+
+// The address of a C symbol (0 when absent): the compiler process, then the
+// libraries loaded for the root manifest.
+fun ctNativeSymbol(name: string): int {
+    var index = 0
+    while (index < ctNativeSymbolNames.size) {
+        if (ctNativeSymbolNames[index] == name) return ctNativeSymbolAddresses[index]
+        index = index + 1
+    }
+    ctNativePrepareLibraries()
+    var address = ctNativeProcessSymbol(name)
+    if (address == 0) address = llvmSearchForAddressOfSymbol(name)
+    if (address != 0) {
+        ctNativeSymbolNames.append(name)
+        ctNativeSymbolAddresses.append(address)
+    }
+    address
+}
+
+// Why `name` did not resolve (the message of E_COMPILE_NATIVE_SYMBOL).
+fun ctNativeMissingSymbolMessage(name: string): string {
+    var detail = ""
+    var index = 0
+    while (index < ctNativeMissingLibraries.size) {
+        detail = if (index == 0) ctNativeMissingLibraries[index]
+            else "$detail, ${ctNativeMissingLibraries[index]}"
+        index = index + 1
+    }
+    if (detail != "") {
+        detail = "; nativeLibraries not found: $detail (searched $ctNativeSearchedDirectories and the dynamic loader's paths)"
+    }
+    "compile-time call to extern:\"c\" `$name`: the symbol is in neither the compiler process nor a library of the root manifest's nativeLibraries$detail"
+}
+
+fun ctNativeMissingSymbol(var evaluator: BootstrapEvaluator, name: string): BootstrapEvalValue {
+    evaluator.errors = evaluator.errors + 1
+    evaluator.recordEvaluatorDiagnostic(
+        "E_COMPILE_NATIVE_SYMBOL", ctNativeMissingSymbolMessage(name)
+    )
+    bootstrapEvalInvalid()
+}
+
+// For the JIT tier, before a slice is added: an error line per extern:"c"
+// declaration of `declarations` whose symbol does not resolve ("" when all do),
+// instead of ORC's materialization failure.
+fun bootstrapCtNativeCheckSymbols(declarations: array<BootstrapDeclaration>): string {
+    var diagnostics = ""
+    for (declaration in declarations) {
+        if (declaration.kind == "extern" && declaration.externalLibrary == "c") {
+            val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
+            if (ctNativeSymbol(name) == 0) {
+                diagnostics = "${diagnostics}error[E_COMPILE_NATIVE_SYMBOL]: ${ctNativeMissingSymbolMessage(name)}\n"
+            }
+        }
+    }
+    diagnostics
+}
+
+// Evaluates a call to an extern:"c" declaration by calling the C function.
+@noinline
+trusted fun ctNativeEvaluateExternCall(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    declaration: BootstrapDeclaration
+): BootstrapEvalValue {
+    val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
+    if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 512)) {
+        return ctNativeDenied(evaluator, "call to extern:\"c\" `$name`", 512)
+    }
+    val parameterTypes: array<string> = []
+    var supported = true
+    var index = 0
+    while (index < declaration.parameterTypes.size) {
+        val type = ctNativeRuntimeType(
+            evaluator.declarations, declaration.parameterTypes[index]
+        )
+        if (ctNativeLlvmType(type) == "" || type == "void") supported = false
+        parameterTypes.append(type)
+        index = index + 1
+    }
+    val resultType = ctNativeRuntimeType(evaluator.declarations, declaration.resultType)
+    if (ctNativeLlvmType(resultType) == "" || resultType == "cstring") {
+        supported = false
+    }
+    if (!supported || expression.children.size != parameterTypes.size) {
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(
+            "E_COMPILE_NATIVE_SIGNATURE",
+            "compile-time call to extern:\"c\" `$name` has a signature the C call bridge does not support (scalars, bool, f32/f64, pointers and cstring parameters; no cstring result)"
+        )
+        return bootstrapEvalInvalid()
+    }
+    val function = ctNativeSymbol(name)
+    if (function == 0) return ctNativeMissingSymbol(evaluator, name)
+    val thunk = ctNativeThunk(parameterTypes, resultType)
+    if (thunk <= 0) {
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(
+            "E_COMPILE_NATIVE_JIT",
+            "compile-time call to extern:\"c\" `$name`: compiling its call thunk failed (ORC status ${-thunk})"
+        )
+        return bootstrapEvalInvalid()
+    }
+    val words = nativeByteBuffer(if (parameterTypes.size == 0) 8 else parameterTypes.size * 8)
+    val temporaries: array<int> = []
+    var valid = true
+    index = 0
+    while (index < parameterTypes.size) {
+        val value = evaluator.evaluate(expression.children[index])
+        var word = 0
+        if (parameterTypes[index] == "cstring") {
+            if (value.kind == "string") {
+                word = ctNativeCString(value.text)
+                temporaries.append(word)
+            } else valid = false
+        } else if (value.kind == "integer" || value.kind == "boolean" ||
+                   value.kind == "f64" || value.kind == "f32") {
+            word = ctNativeWord(value)
+        } else if (value.kind == "null") {
+            word = 0
+        } else valid = false
+        words.storeI64(index * 8, word)
+        index = index + 1
+    }
+    var result = bootstrapEvalInvalid()
+    if (valid) {
+        val output = nativeI64Cell(0)
+        ctNativeCallbackParents.append(
+            bootstrapEvalInvocation(evaluator, [], [], [])
+        )
+        ablaUnsafeCallVoidPointer3(
+            thunk,
+            nativePointerFromAddress(function),
+            words.address,
+            output.address
+        )
+        val parent = ctNativeCallbackParents[ctNativeCallbackParents.size - 1]
+        ctNativeCallbackParents.truncate(ctNativeCallbackParents.size - 1)
+        evaluator.errors = parent.errors
+        evaluator.steps = parent.steps
+        evaluator.diagnostics = parent.diagnostics
+        val word = output.load()
+        output.close()
+        result = if (resultType == "void") bootstrapEvalVoid()
+            else if (resultType == "bool") bootstrapEvalBoolean(word != 0)
+            else if (resultType == "f64") BootstrapEvalValue("f64", word, false, "", [], "", [])
+            else if (resultType == "f32") bootstrapEvalF32(ablaBitI32ToF32(word))
+            else bootstrapEvalInteger(word)
+    } else {
+        evaluator.errors = evaluator.errors + 1
+    }
+    // A noescape declaration's temporary C strings live for the call, as a
+    // compiled program's do; otherwise the callee may keep them.
+    if (declaration.isNoEscape) {
+        index = 0
+        while (index < temporaries.size) {
+            ctNativeFree(temporaries[index])
+            index = index + 1
+        }
+    }
+    words.close()
+    result
+}
+
+// ---- callbacks: nativeFunctionAddress at compile time ----
+//
+// A compiled program's nativeFunctionAddress(f) is a C-ABI entry for f. At
+// compile time f is evaluated, so its entry is a thunk compiled for f's
+// signature that stores the arguments as words and calls
+// ctNativeCallbackDispatch(slot, words), which evaluates f's body with the
+// evaluator of the C call in progress (C code calls back during that call).
+
+var ctNativeCallbackKeys: array<string> = []
+var ctNativeCallbackAddresses: array<int> = []
+var ctNativeCallbackDeclarations: array<BootstrapDeclaration> = []
+// The evaluators of the extern:"c" calls in progress, innermost last.
+var ctNativeCallbackParents: array<BootstrapEvaluator> = []
+
+fun ctNativeCallbackValue(word: int, type: string): BootstrapEvalValue =
+    if (type == "bool") bootstrapEvalBoolean(word != 0)
+    else if (type == "f64") BootstrapEvalValue("f64", word, false, "", [], "", [])
+    else if (type == "f32") bootstrapEvalF32(ablaBitI32ToF32(word))
+    else bootstrapEvalInteger(word)
+
+trusted fun ctNativeCallbackDispatch(slot: int, words: int): int {
+    if (ctNativeCallbackParents.size == 0 || slot < 0 ||
+        slot >= ctNativeCallbackDeclarations.size) return 0
+    val top = ctNativeCallbackParents.size - 1
+    var parent = ctNativeCallbackParents[top]
+    val declaration = ctNativeCallbackDeclarations[slot]
+    val names: array<string> = []
+    val values: array<BootstrapEvalValue> = []
+    val mutable: array<bool> = []
+    var index = 0
+    while (index < declaration.parameters.size) {
+        names.append(declaration.parameters[index])
+        values.append(ctNativeCallbackValue(
+            ablaUnsafeLoadI64(nativePointerFromAddress(words + index * 8)),
+            ctNativeRuntimeType(parent.declarations, declaration.parameterTypes[index])
+        ))
+        mutable.append(false)
+        index = index + 1
+    }
+    val invocation = bootstrapEvalInvocation(parent, names, values, mutable)
+    var result = invocation.evaluate(declaration.expression)
+    if (result.kind == "return" && result.elements.size == 1) {
+        result = result.elements[0]
+    }
+    parent.errors = invocation.errors
+    parent.steps = invocation.steps
+    parent.diagnostics = invocation.diagnostics
+    ctNativeCallbackParents[top] = parent
+    ctNativeWord(result)
+}
+
+trusted fun ctNativeCallbackDispatchAddress(): int =
+    nativeFunctionAddress(ctNativeCallbackDispatch)
+
+// The callback thunk: `R entry(P…)` stores each argument widened to a word
+// and returns ctNativeCallbackDispatch(slot, words) narrowed to R.
+fun ctNativeCallbackSource(
+    symbol: string,
+    slot: int,
+    parameterTypes: array<string>,
+    resultType: string
+): string {
+    val count = if (parameterTypes.size == 0) 1 else parameterTypes.size
+    var parameters = ""
+    var body = "  %words = alloca [$count x i64], align 8\n"
+    var index = 0
+    while (index < parameterTypes.size) {
+        val type = parameterTypes[index]
+        val llvm = ctNativeLlvmType(type)
+        parameters = if (index == 0) "$llvm %p$index"
+            else "$parameters, $llvm %p$index"
+        body = "$body  %s$index = getelementptr i64, ptr %words, i64 $index\n"
+        if (llvm == "i64") {
+            body = "$body  store i64 %p$index, ptr %s$index\n"
+        } else if (llvm == "i8" || llvm == "i16" || llvm == "i32" ||
+                   llvm == "i1") {
+            val extend = if (llvm == "i1" || ctNativeUnsigned(type)) "zext"
+                else "sext"
+            body = "$body  %w$index = $extend $llvm %p$index to i64\n  store i64 %w$index, ptr %s$index\n"
+        } else if (llvm == "double") {
+            body = "$body  %w$index = bitcast double %p$index to i64\n  store i64 %w$index, ptr %s$index\n"
+        } else if (llvm == "float") {
+            body = "$body  %b$index = bitcast float %p$index to i32\n  %w$index = zext i32 %b$index to i64\n  store i64 %w$index, ptr %s$index\n"
+        } else {
+            body = "$body  %w$index = ptrtoint ptr %p$index to i64\n  store i64 %w$index, ptr %s$index\n"
+        }
+        index = index + 1
+    }
+    val dispatch = ctNativeCallbackDispatchAddress()
+    body = "$body  %address = ptrtoint ptr %words to i64\n  %dispatch = inttoptr i64 $dispatch to ptr\n  %r = call i64 %dispatch(i64 $slot, i64 %address)\n"
+    val result = ctNativeLlvmType(resultType)
+    if (result == "void") {
+        body = "$body  ret void\n"
+    } else if (result == "i64") {
+        body = "$body  ret i64 %r\n"
+    } else if (result == "i1") {
+        body = "$body  %n = icmp ne i64 %r, 0\n  ret i1 %n\n"
+    } else if (result == "i8" || result == "i16" || result == "i32") {
+        body = "$body  %n = trunc i64 %r to $result\n  ret $result %n\n"
+    } else if (result == "double") {
+        body = "$body  %n = bitcast i64 %r to double\n  ret double %n\n"
+    } else if (result == "float") {
+        body = "$body  %t = trunc i64 %r to i32\n  %n = bitcast i32 %t to float\n  ret float %n\n"
+    } else {
+        body = "$body  %n = inttoptr i64 %r to ptr\n  ret ptr %n\n"
+    }
+    "define $result @$symbol($parameters) {\nentry:\n$body}\n"
+}
+
+@noinline
+trusted fun ctNativeEvaluateFunctionAddress(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 512)) {
+        return ctNativeDenied(evaluator, "intrinsic `nativeFunctionAddress`", 512)
+    }
+    var name = ""
+    if (expression.children.size == 1) {
+        val reference = evaluator.evaluate(expression.children[0])
+        if (reference.kind == "function") name = reference.text
+    }
+    var found = -1
+    var index = 0
+    while (found < 0 && index < evaluator.declarations.size) {
+        val candidate = evaluator.declarations[index]
+        if (candidate.name == name && candidate.kind == "fun" &&
+            candidate.extensionOwner == "") found = index
+        index = index + 1
+    }
+    val parameterTypes: array<string> = []
+    var resultType = ""
+    var supported = found >= 0
+    if (supported) {
+        val declaration = evaluator.declarations[found]
+        index = 0
+        while (index < declaration.parameterTypes.size) {
+            val type = ctNativeRuntimeType(
+                evaluator.declarations, declaration.parameterTypes[index]
+            )
+            // The scalar ABI nativeFunctionAddress takes in a compiled program.
+            if (!bootstrapExportScalarTypeValid(type)) supported = false
+            parameterTypes.append(type)
+            index = index + 1
+        }
+        resultType = ctNativeRuntimeType(evaluator.declarations, declaration.resultType)
+        if (resultType != "void" && !bootstrapExportScalarTypeValid(resultType)) {
+            supported = false
+        }
+    }
+    if (!supported) {
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(
+            "E_COMPILE_NATIVE_SIGNATURE",
+            "compile-time nativeFunctionAddress needs a named top-level function with fixed-width integer, bool or f32/f64 parameters and result (got `$name`)"
+        )
+        return bootstrapEvalInvalid()
+    }
+    var key = "$name:$resultType("
+    index = 0
+    while (index < parameterTypes.size) {
+        key = "$key${parameterTypes[index]},"
+        index = index + 1
+    }
+    index = 0
+    while (index < ctNativeCallbackKeys.size) {
+        if (ctNativeCallbackKeys[index] == key) {
+            return bootstrapEvalInteger(ctNativeCallbackAddresses[index])
+        }
+        index = index + 1
+    }
+    if (ctNativeSessions.size == 0) {
+        ctNativeSessions.append(llvmOrcCreateSession())
+    }
+    val session = ctNativeSessions[0]
+    val slot = ctNativeCallbackKeys.size
+    val symbol = "abla_ct_native_callback_$slot"
+    var status = session.status
+    var address = 0
+    if (status == 0) {
+        val generation = session.addText(
+            symbol, ctNativeCallbackSource(symbol, slot, parameterTypes, resultType)
+        )
+        status = generation.status
+    }
+    if (status == 0) {
+        val lookup = session.lookup(symbol)
+        status = lookup.status
+        address = lookup.address
+    }
+    if (status != 0) {
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(
+            "E_COMPILE_NATIVE_JIT",
+            "compile-time nativeFunctionAddress(`$name`): compiling its entry thunk failed (ORC status $status)"
+        )
+        return bootstrapEvalInvalid()
+    }
+    ctNativeCallbackKeys.append(key)
+    ctNativeCallbackAddresses.append(address)
+    ctNativeCallbackDeclarations.append(evaluator.declarations[found])
+    bootstrapEvalInteger(address)
+}
+
+// ---- host providers: abla/platform/host at compile time ----
+//
+// The host API's functions are ordinary code in a program. At compile time
+// the evaluator performs them with the compiler's own copy (the same source),
+// under the capability each name implies; the semantic effect analysis gives
+// them that capability instead of walking their bodies (which would demand
+// trusted.native for the system calls inside).
+
+// The providers the evaluator performs here (ablaHostReadFile and
+// ablaHostListDirectory are the evaluator's own, in bootstrapEvaluateCallHost).
+fun ctNativeHostProvider(name: string): bool =
+    name != "ablaHostReadFile" && name != "ablaHostListDirectory" &&
+    bootstrapCompileHostProviderEffect(name) != 0
+
+fun ctNativeValueText(values: array<BootstrapEvalValue>, index: int): string =
+    if (index < values.size && values[index].kind == "string") values[index].text
+    else ""
+
+fun ctNativeValueTexts(values: array<BootstrapEvalValue>, index: int): array<string> {
+    val texts: array<string> = []
+    if (index < values.size && values[index].kind == "array") {
+        for (element in values[index].elements) {
+            if (element.kind == "string") texts.append(element.text)
+        }
+    }
+    texts
+}
+
+fun ctNativeValueWord(values: array<BootstrapEvalValue>, index: int): int =
+    if (index < values.size) ctNativeWord(values[index]) else 0
+
+fun ctNativeValueFlag(values: array<BootstrapEvalValue>, index: int): bool =
+    ctNativeValueWord(values, index) != 0
+
+// The journal identities of the deterministic host observations besides file
+// contents: what bootstrapCompileInputContents re-observes before a cached
+// artifact is reused.
+val CT_NATIVE_INPUT_PREFIXES = [
+    "abla-input:file-kind:", "abla-input:file-size:",
+    "abla-input:file-revision:", "abla-input:current-directory:"
+]
+
+fun ctNativeHostInputPrefix(identity: string): string {
+    for (prefix in CT_NATIVE_INPUT_PREFIXES) {
+        if (identity.startsWith(prefix)) return prefix
+    }
+    ""
+}
+
+fun ctNativeHostInputContents(identity: string): string {
+    val prefix = ctNativeHostInputPrefix(identity)
+    val path = identity.slice(prefix.size, identity.size)
+    if (prefix == "abla-input:file-kind:") "${ablaHostFileKind(path)}"
+    else if (prefix == "abla-input:file-size:") "${ablaHostFileSize(path)}"
+    else if (prefix == "abla-input:file-revision:") "${ablaHostFileRevision(path)}"
+    else ablaHostCurrentDirectory()
+}
+
+@noinline
+fun ctNativeEvaluateHost(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    name: string
+): BootstrapEvalValue {
+    val effect = bootstrapCompileHostProviderEffect(name)
+    if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, effect)) {
+        return ctNativeDenied(evaluator, "call to `$name`", effect)
+    }
+    val values: array<BootstrapEvalValue> = []
+    for (child in expression.children) values.append(evaluator.evaluate(child))
+    ctNativeHostCall(evaluator, name, values)
+}
+
+// Performs host provider `name` on evaluated arguments (for the interpreter
+// and the JIT tier's bridge), after checking its capability.
+fun ctNativeHostCall(
+    var evaluator: BootstrapEvaluator,
+    name: string,
+    values: array<BootstrapEvalValue>
+): BootstrapEvalValue {
+    val effect = bootstrapCompileHostProviderEffect(name)
+    if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, effect)) {
+        return ctNativeDenied(evaluator, "call to `$name`", effect)
+    }
+    val operation = name.slice(8, name.size)
+    var result = bootstrapEvalVoid()
+    if (operation == "FileKind" || operation == "FileSize" ||
+        operation == "FileRevision") {
+        val path = ctNativeValueText(values, 0)
+        val observed = if (operation == "FileKind") ablaHostFileKind(path)
+            else if (operation == "FileSize") ablaHostFileSize(path)
+            else ablaHostFileRevision(path)
+        val kind = if (operation == "FileKind") "file-kind"
+            else if (operation == "FileSize") "file-size" else "file-revision"
+        evaluator.recordCompileInput("abla-input:$kind:$path", "$observed")
+        result = bootstrapEvalInteger(observed)
+    } else if (operation == "CurrentDirectory") {
+        val directory = ablaHostCurrentDirectory()
+        evaluator.recordCompileInput("abla-input:current-directory:", directory)
+        result = bootstrapEvalString(directory)
+    } else if (operation == "WriteFile") {
+        val path = ctNativeValueText(values, 0)
+        ablaHostWriteFile(path, ctNativeValueText(values, 1))
+    } else if (operation == "WriteFileAtomic") {
+        val path = ctNativeValueText(values, 0)
+        result = bootstrapEvalBoolean(
+            ablaHostWriteFileAtomic(path, ctNativeValueText(values, 1))
+        )
+    } else if (operation == "CreateParentDirectories") {
+        ablaHostCreateParentDirectories(ctNativeValueText(values, 0))
+    } else if (operation == "CreateDirectories") {
+        result = bootstrapEvalBoolean(
+            ablaHostCreateDirectories(ctNativeValueText(values, 0))
+        )
+    } else if (operation == "MoveFile") {
+        val source = ctNativeValueText(values, 0)
+        result = bootstrapEvalBoolean(
+            ablaHostMoveFile(source, ctNativeValueText(values, 1))
+        )
+    } else if (operation == "RemoveFile") {
+        result = bootstrapEvalBoolean(
+            ablaHostRemoveFile(ctNativeValueText(values, 0))
+        )
+    } else if (operation == "ArgumentCount") {
+        result = bootstrapEvalInteger(ablaHostArgumentCount())
+    } else if (operation == "Argument") {
+        result = bootstrapEvalString(
+            ablaHostArgument(ctNativeValueWord(values, 0))
+        )
+    } else if (operation == "ReadStdinLine") {
+        result = bootstrapEvalString(ablaHostReadStdinLine())
+    } else if (operation == "StdinLineAvailable") {
+        result = bootstrapEvalBoolean(ablaHostStdinLineAvailable())
+    } else if (operation == "WriteStdout") {
+        ablaHostWriteStdout(ctNativeValueText(values, 0))
+    } else if (operation == "WriteStderr") {
+        ablaHostWriteStderr(ctNativeValueText(values, 0))
+    } else if (operation == "ProcessorCount") {
+        result = bootstrapEvalInteger(ablaHostProcessorCount())
+    } else if (operation == "RunProcess") {
+        result = bootstrapEvalInteger(
+            ablaHostRunProcess(ctNativeValueTexts(values, 0))
+        )
+    } else if (operation == "CaptureProcess") {
+        result = bootstrapEvalString(
+            ablaHostCaptureProcess(ctNativeValueTexts(values, 0))
+        )
+    } else if (operation == "StartProcess") {
+        result = bootstrapEvalInteger(
+            ablaHostStartProcess(ctNativeValueTexts(values, 0))
+        )
+    } else if (operation == "StartProcessConfigured") {
+        val directory = ctNativeValueText(values, 0)
+        val arguments = ctNativeValueTexts(values, 1)
+        val names = ctNativeValueTexts(values, 2)
+        val environmentValues = ctNativeValueTexts(values, 3)
+        val output = ctNativeValueText(values, 4)
+        result = bootstrapEvalInteger(ablaHostStartProcessConfigured(
+            directory, arguments, names, environmentValues, output
+        ))
+    } else if (operation == "PollProcess") {
+        result = bootstrapEvalInteger(
+            ablaHostPollProcess(ctNativeValueWord(values, 0))
+        )
+    } else if (operation == "StopProcessTree" ||
+               operation == "StopProcessGracefully") {
+        val process = ctNativeValueWord(values, 0)
+        val grace = ctNativeValueWord(values, 1)
+        result = bootstrapEvalInteger(
+            if (operation == "StopProcessTree") ablaHostStopProcessTree(process, grace)
+            else ablaHostStopProcessGracefully(process, grace)
+        )
+    } else if (operation == "StopProcess") {
+        result = bootstrapEvalInteger(
+            ablaHostStopProcess(ctNativeValueWord(values, 0))
+        )
+    } else if (operation == "Sleep") {
+        ablaHostSleep(ctNativeValueWord(values, 0))
+    } else if (operation == "MonotonicMilliseconds") {
+        result = bootstrapEvalInteger(ablaHostMonotonicMilliseconds())
+    } else if (operation == "SecureRandom") {
+        result = bootstrapEvalString(
+            ablaHostSecureRandom(ctNativeValueWord(values, 0))
+        )
+    } else {
+        result = ctNativeHostNetwork(evaluator, operation, values)
+    }
+    result
+}
+
+@noinline
+fun ctNativeHostNetwork(
+    var evaluator: BootstrapEvaluator,
+    operation: string,
+    values: array<BootstrapEvalValue>
+): BootstrapEvalValue {
+    var result = bootstrapEvalInvalid()
+    if (operation == "NetConnect" || operation == "TlsOpen") {
+        val host = ctNativeValueText(values, 0)
+        val port = ctNativeValueWord(values, 1)
+        val timeout = ctNativeValueWord(values, 2)
+        result = bootstrapEvalInteger(
+            if (operation == "NetConnect") ablaHostNetConnect(host, port, timeout)
+            else ablaHostTlsOpen(host, port, timeout)
+        )
+    } else if (operation == "TlsOpenWithCa") {
+        val host = ctNativeValueText(values, 0)
+        val port = ctNativeValueWord(values, 1)
+        val timeout = ctNativeValueWord(values, 2)
+        val ca = ctNativeValueText(values, 3)
+        result = bootstrapEvalInteger(ablaHostTlsOpenWithCa(host, port, timeout, ca))
+    } else if (operation == "NetListen") {
+        val host = ctNativeValueText(values, 0)
+        val port = ctNativeValueWord(values, 1)
+        val backlog = ctNativeValueWord(values, 2)
+        val dualStack = ctNativeValueFlag(values, 3)
+        result = bootstrapEvalInteger(ablaHostNetListen(host, port, backlog, dualStack))
+    } else if (operation == "TlsListen") {
+        val host = ctNativeValueText(values, 0)
+        val port = ctNativeValueWord(values, 1)
+        val backlog = ctNativeValueWord(values, 2)
+        val dualStack = ctNativeValueFlag(values, 3)
+        val certificate = ctNativeValueText(values, 4)
+        val key = ctNativeValueText(values, 5)
+        result = bootstrapEvalInteger(ablaHostTlsListen(
+            host, port, backlog, dualStack, certificate, key
+        ))
+    } else if (operation == "NetAccept" || operation == "NetLocalPort" ||
+               operation == "NetClose" || operation == "TlsClose" ||
+               operation == "TlsListenerPort" || operation == "TlsAccept" ||
+               operation == "TlsListenerClose") {
+        val handle = ctNativeValueWord(values, 0)
+        result = if (operation == "NetAccept") bootstrapEvalInteger(ablaHostNetAccept(handle))
+            else if (operation == "NetLocalPort") bootstrapEvalInteger(ablaHostNetLocalPort(handle))
+            else if (operation == "NetClose") bootstrapEvalBoolean(ablaHostNetClose(handle))
+            else if (operation == "TlsClose") bootstrapEvalBoolean(ablaHostTlsClose(handle))
+            else if (operation == "TlsListenerPort") bootstrapEvalInteger(ablaHostTlsListenerPort(handle))
+            else if (operation == "TlsAccept") bootstrapEvalInteger(ablaHostTlsAccept(handle))
+            else bootstrapEvalBoolean(ablaHostTlsListenerClose(handle))
+    } else if (operation == "NetSetNonblocking") {
+        val descriptor = ctNativeValueWord(values, 0)
+        result = bootstrapEvalBoolean(ablaHostNetSetNonblocking(
+            descriptor, ctNativeValueFlag(values, 1)
+        ))
+    } else if (operation == "NetRead" || operation == "TlsRead" ||
+               operation == "NetUdpReceive") {
+        val handle = ctNativeValueWord(values, 0)
+        val maximum = ctNativeValueWord(values, 1)
+        result = bootstrapEvalString(
+            if (operation == "NetRead") ablaHostNetRead(handle, maximum)
+            else if (operation == "TlsRead") ablaHostTlsRead(handle, maximum)
+            else ablaHostNetUdpReceive(handle, maximum)
+        )
+    } else if (operation == "NetWrite" || operation == "TlsWrite") {
+        val handle = ctNativeValueWord(values, 0)
+        val contents = ctNativeValueText(values, 1)
+        result = bootstrapEvalInteger(
+            if (operation == "NetWrite") ablaHostNetWrite(handle, contents)
+            else ablaHostTlsWrite(handle, contents)
+        )
+    } else if (operation == "NetStatus") {
+        result = bootstrapEvalInteger(ablaHostNetStatus())
+    } else if (operation == "NetError") {
+        result = bootstrapEvalInteger(ablaHostNetError())
+    } else if (operation == "TlsAvailable") {
+        result = bootstrapEvalBoolean(ablaHostTlsAvailable())
+    } else if (operation == "TlsError") {
+        result = bootstrapEvalString(ablaHostTlsError())
+    } else if (operation == "NetUdpBind") {
+        val host = ctNativeValueText(values, 0)
+        val port = ctNativeValueWord(values, 1)
+        result = bootstrapEvalInteger(ablaHostNetUdpBind(
+            host, port, ctNativeValueFlag(values, 2)
+        ))
+    } else if (operation == "NetUdpSend") {
+        val descriptor = ctNativeValueWord(values, 0)
+        val host = ctNativeValueText(values, 1)
+        val port = ctNativeValueWord(values, 2)
+        val contents = ctNativeValueText(values, 3)
+        result = bootstrapEvalInteger(ablaHostNetUdpSend(descriptor, host, port, contents))
+    } else if (operation == "NetSourceAddress") {
+        result = bootstrapEvalString(ablaHostNetSourceAddress())
+    } else if (operation == "NetSourcePort") {
+        result = bootstrapEvalInteger(ablaHostNetSourcePort())
+    } else if (operation == "NetPollerCreate") {
+        result = bootstrapEvalInteger(ablaHostNetPollerCreate())
+    } else if (operation == "NetPollerControl") {
+        val poller = ctNativeValueWord(values, 0)
+        val descriptor = ctNativeValueWord(values, 1)
+        val readable = ctNativeValueFlag(values, 2)
+        val writable = ctNativeValueFlag(values, 3)
+        val operationCode = ctNativeValueWord(values, 4)
+        result = bootstrapEvalBoolean(ablaHostNetPollerControl(
+            poller, descriptor, readable, writable, operationCode
+        ))
+    } else if (operation == "NetPollerWait") {
+        val poller = ctNativeValueWord(values, 0)
+        val maximum = ctNativeValueWord(values, 1)
+        val timeout = ctNativeValueWord(values, 2)
+        result = bootstrapEvalString(ablaHostNetPollerWait(poller, maximum, timeout))
+    }
+    if (result.kind == "invalid") evaluator.errors = evaluator.errors + 1
+    result
+}
