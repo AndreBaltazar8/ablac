@@ -39,7 +39,16 @@ class BootstrapLiftState(
     val values: array<BootstrapEvalValue>,
     val results: array<int>,
     val layouts: array<BootstrapLiftLambdaLayout>,
-    var problems: int
+    var problems: int,
+    // Types the captures of closures that came from native code.
+    val retyper: BootstrapLiftRetyper
+)
+
+fun bootstrapLiftState(
+    syntax: array<BootstrapExpression>,
+    declarations: array<BootstrapDeclaration>
+): BootstrapLiftState = BootstrapLiftState(
+    syntax, [], [], [], 0, bootstrapLiftRetyper(declarations, syntax)
 )
 
 fun bootstrapLiftProbing(lowerer: BootstrapLowerer): bool =
@@ -95,8 +104,8 @@ fun bootstrapLiftEmitResult(
         }
         return lowerer.emit("invalid", -1, -1, "compile")
     }
-    // ABLA_LIFT_CODEC_CHECK=1 sends every result through the codec the
-    // compile-time JIT uses (and back), so the suite checks both agree.
+    // ABLA_LIFT_CODEC_CHECK=1 sends every result through the codec kept
+    // compile globals are stored in (and back), so the suite checks it.
     val check = linuxEnvironment("ABLA_LIFT_CODEC_CHECK")
     if (check.found && check.value == "1") {
         val encoded = bootstrapLiftEncode(
@@ -110,7 +119,7 @@ fun bootstrapLiftEmitResult(
             val again = bootstrapLiftEncode(
                 decoded.value, syntax, lowerer.declarations
             )
-            var state = BootstrapLiftState(syntax, [], [], [], 0)
+            var state = bootstrapLiftState(syntax, lowerer.declarations)
             if (decoded.problem != "" || again.bytes != encoded.bytes) {
                 return bootstrapLiftFail(
                     lowerer, state,
@@ -120,7 +129,11 @@ fun bootstrapLiftEmitResult(
             return bootstrapLiftEmit(lowerer, state, decoded.value, type)
         }
     }
-    var state = BootstrapLiftState(evaluated.syntax, [], [], [], 0)
+    val memo = evaluated.liftMemo
+    var state = if (memo != null) BootstrapLiftState(
+        evaluated.syntax, [], [], [], 0,
+        BootstrapLiftRetyper(lowerer.declarations, evaluated.syntax, memo, "")
+    ) else bootstrapLiftState(evaluated.syntax, lowerer.declarations)
     bootstrapLiftEmit(lowerer, state, evaluated.value, type)
 }
 
@@ -185,8 +198,11 @@ fun bootstrapLiftEmit(
     if (kind == "f64") return bootstrapLiftEmitF64(lowerer, value.integer)
     if (kind == "f32") {
         // A boxed f32 is its bits: the cast reinterprets them, NaN payload
-        // included.
-        val bits = lowerer.emit("const.i64", -1, -1, "${value.integer}")
+        // included (written sign-extended, as both tiers read them).
+        val bits = lowerer.emit(
+            "const.i64", -1, -1,
+            "${bootstrapLiftCanonicalInteger(value.integer, "i32")}"
+        )
         return lowerer.emit("scalar.cast", bits, -1, "f32")
     }
     if (kind == "null") return lowerer.emit("const.null", -1, -1, "")
@@ -542,11 +558,20 @@ fun bootstrapLiftEmitClosure(
         )
     }
     val layout = state.layouts[layoutIndex]
+    // A closure from native code lists its captures in lowering's order,
+    // still untyped.
+    val positional = value.text == "positional"
+    if (positional && value.elements.size != layout.captureNames.size) {
+        return bootstrapLiftFail(
+            lowerer, state,
+            "a native closure of type `${bootstrapLiftTypeText(type)}` (lambda at ${lambda.begin}:${lambda.end}) has ${value.elements.size} captures where its lambda has ${layout.captureNames.size}"
+        )
+    }
     val captureValues: array<int> = []
     var capture = 0
     while (capture < layout.captureNames.size) {
         val name = layout.captureNames[capture]
-        var found = -1
+        var found = if (positional) capture else -1
         var index = 0
         while (found < 0 && index < value.fieldNames.size) {
             if (value.fieldNames[index] == name) found = index
@@ -568,7 +593,16 @@ fun bootstrapLiftEmitClosure(
             if (layout.ownedCaptures[index] == name) owned = true
             index = index + 1
         }
-        val captured = value.elements[found]
+        var captured = value.elements[found]
+        if (positional) {
+            captured = bootstrapLiftRetype(
+                state.retyper, captured,
+                if (owned) captureType else "cell:$captureType"
+            )
+            if (state.retyper.problem != "") {
+                return bootstrapLiftFail(lowerer, state, state.retyper.problem)
+            }
+        }
         if (owned) {
             captureValues.append(bootstrapLiftEmit(
                 lowerer, state, captured, captureType
@@ -578,9 +612,11 @@ fun bootstrapLiftEmitClosure(
                 lowerer, state, captured, "cell:$captureType"
             ))
         } else {
-            // An ordinary capture reaches the lambda in a cell.
-            val inner = bootstrapLiftEmit(lowerer, state, captured, captureType)
-            captureValues.append(lowerer.emit("cell.create", inner, -1, ""))
+            // An ordinary capture reaches the lambda in a cell (the receiver
+            // is held without one): built as every lifted cell is.
+            captureValues.append(bootstrapLiftEmit(
+                lowerer, state, bootstrapEvalCell(captured), "cell:$captureType"
+            ))
         }
         capture = capture + 1
     }
@@ -760,9 +796,9 @@ fun bootstrapLiftTypeProblemIn(
 
 // The codec -----------------------------------------------------------------
 //
-// A compile-time value as bytes, for values computed outside the evaluator
-// (native code run by the compile-time JIT) and for checking that both tiers
-// lift the same graph. One node per value, prefix tag then payload:
+// A compile-time value as bytes: how kept compile globals last from one
+// evaluation to the next (shared and cyclic values and closures included).
+// One node per value, prefix tag then payload:
 //
 //   i<decimal>;  integer          d<bits>;  f64 bits      f<bits>;  f32 bits
 //   b0 / b1      boolean          s<n>:<n bytes> string   n null    v void
@@ -1149,12 +1185,24 @@ fun bootstrapLiftDecodeClosure(var decoder: BootstrapLiftDecoder): BootstrapEval
 
 // The native encoder ------------------------------------------------------
 //
-// Native compile-time code (the JIT tier) hands its result over as codec
-// bytes. For the static result type the compiler writes the encoder as Abla
-// source, added to the code it compiles: one function per type reached, an
-// identity table keyed by heap address so shared and cyclic values are
-// written once, and the same node order the evaluator's encoding uses, so
-// both tiers produce the same bytes for the same value.
+// Native compile-time code (the JIT tier) hands its result over by walking
+// the runtime's own value representation: one fixed trusted function, the
+// same for every type, writes the boxed values it reaches as raw nodes into
+// a reply buffer ([length:i64][bytes]). The compiler reads them back with the
+// static type: a boxed f64 is its bits, a Map is the array the runtime keeps
+// it in, objects and fields are named by the runtime's stable name ids, and a
+// closure by its function's runtime id. Raw nodes:
+//
+//   v  n  b0  b1       void, null, booleans
+//   i<word>;           a boxed integer word (integers, f64 bits, f32 bits)
+//   s<n>:<n bytes>     string
+//   a<count>;<nodes>   array (also a Map's representation)
+//   o<type id>;<count>;(<field id>;<node>)...   object
+//   c<node>            cell
+//   h<node>            Shared (its value)
+//   F<function id>;<count>;<capture nodes>      function value
+//   r<id>;             the id-th a/o/c/h/F-with-captures, numbered as opened
+//   x<tag>;            a value native results cannot carry (a task, ...)
 
 class BootstrapCtEncoder(
     val name: string,
@@ -1163,22 +1211,18 @@ class BootstrapCtEncoder(
     val reason: string
 )
 
-class BootstrapLiftEncoderWriter(
-    val declarations: array<BootstrapDeclaration>,
-    val suffix: string,
-    val types: array<string>,
-    val bodies: array<string>,
-    var problem: string
+/** The runtime ids and names of the functions a native result may hold
+ *  (from the lowered program the JIT runs), and each one's source identity. */
+class BootstrapCtFunctionTable(
+    val ids: array<int>,
+    val names: array<string>,
+    val sources: array<string>
 )
 
-fun bootstrapLiftDeclared(declarations: array<BootstrapDeclaration>, name: string): bool {
-    for (declaration in declarations) {
-        if (declaration.name == name) return true
-    }
-    false
-}
+fun bootstrapCtNoFunctions(): BootstrapCtFunctionTable =
+    BootstrapCtFunctionTable([], [], [])
 
-/** The class declaration named `type`, or -1. */
+/** The class, interface or nominal type declaration named `type`, or -1. */
 fun bootstrapLiftClassIndex(declarations: array<BootstrapDeclaration>, type: string): int {
     var index = 0
     while (index < declarations.size) {
@@ -1191,200 +1235,641 @@ fun bootstrapLiftClassIndex(declarations: array<BootstrapDeclaration>, type: str
     -1
 }
 
-/** The encoder function of normalized `type` (written on first use). */
-fun bootstrapLiftEncoderFunction(var writer: BootstrapLiftEncoderWriter, type: string): string {
-    var index = 0
-    while (index < writer.types.size) {
-        if (writer.types[index] == type) return "__abla_lift_${writer.suffix}_$index"
-        index = index + 1
-    }
-    val name = "__abla_lift_${writer.suffix}_${writer.types.size}"
-    writer.types.append(type)
-    writer.bodies.append("")
-    val slot = writer.types.size - 1
-    writer.bodies[slot] = bootstrapLiftEncoderBody(writer, type, name)
-    name
-}
-
-fun bootstrapLiftEncoderIdentity(writer: BootstrapLiftEncoderWriter): string =
-    "    val address = ablaRuntimeValueWord0(value)\n" +
-    "    val seen = out.opened.get(address)\n" +
-    "    if (seen != null) {\n" +
-    "        out.parts.append(\"r\${seen};\")\n" +
-    "        return\n" +
-    "    }\n" +
-    "    out.opened.set(address, out.opened.size)\n"
-
-fun bootstrapLiftEncoderBody(
-    var writer: BootstrapLiftEncoderWriter,
-    type: string,
-    name: string
-): string {
-    val header = "trusted fun $name(var out: __AblaLiftOut_${writer.suffix}, value: ${bootstrapLiftTypeText(type)}): void {\n"
-    var body = ""
-    if (type == "i64") body = "    out.parts.append(\"i\$value;\")\n"
-    else if (bootstrapIsIntegerScalarType(type)) {
-        body = "    out.parts.append(\"i\${i64(value)};\")\n"
-    } else if (type == "bool") {
-        body = "    out.parts.append(if (value) \"b1\" else \"b0\")\n"
-    } else if (type == "string") {
-        body = "    out.parts.append(\"s\${value.size}:\")\n    out.parts.append(value)\n"
-    } else if (type == "f64") {
-        body = "    out.parts.append(\"d\${ablaBitF64ToI64(value)};\")\n"
-    } else if (type == "f32") {
-        body = "    out.parts.append(\"f\${ablaBitF32ToI32(value)};\")\n"
-    } else if (type == "void") {
-        body = "    out.parts.append(\"v\")\n"
-    } else if (type == "null") {
-        body = "    out.parts.append(\"n\")\n"
-    } else if (bootstrapIsNullableType(type)) {
-        val inner = bootstrapLiftEncoderFunction(writer, bootstrapNullableElementType(type))
-        body = "    if (value == null) out.parts.append(\"n\") else $inner(out, value)\n"
-    } else if (bootstrapIsArrayType(type)) {
-        val element = bootstrapLiftEncoderFunction(writer, bootstrapArrayElementType(type))
-        body = "${bootstrapLiftEncoderIdentity(writer)}" +
-            "    out.parts.append(\"a\${value.size};\")\n" +
-            "    for (element in value) $element(out, element)\n"
-    } else if (bootstrapIsMapType(type)) {
-        val key = bootstrapLiftEncoderFunction(writer, bootstrapMapKeyType(type))
-        val stored = bootstrapLiftEncoderFunction(writer, bootstrapMapValueType(type))
-        body = "${bootstrapLiftEncoderIdentity(writer)}" +
-            "    val keys = value.keys()\n" +
-            "    val stored = value.values()\n" +
-            "    out.parts.append(\"m\${keys.size};\")\n" +
-            "    var index = 0\n" +
-            "    while (index < keys.size) {\n" +
-            "        $key(out, keys[index])\n" +
-            "        $stored(out, stored[index])\n" +
-            "        index = index + 1\n" +
-            "    }\n"
-    } else if (bootstrapIsCellType(type)) {
-        val inner = bootstrapLiftEncoderFunction(writer, bootstrapCellElementType(type))
-        body = "${bootstrapLiftEncoderIdentity(writer)}" +
-            "    out.parts.append(\"c\")\n" +
-            "    $inner(out, value.get())\n"
-    } else if (bootstrapIsFunctionType(type)) {
-        writer.problem = "a function value's lambda and captures are not visible to native code yet"
-    } else {
-        body = bootstrapLiftEncoderClassBody(writer, type)
-    }
-    "$header$body}\n"
-}
-
-fun bootstrapLiftEncoderClassBody(var writer: BootstrapLiftEncoderWriter, type: string): string {
-    val index = bootstrapLiftClassIndex(writer.declarations, type)
-    if (index < 0) {
-        writer.problem = "values of type `${bootstrapLiftTypeText(type)}` have no native encoding"
-        return ""
-    }
-    val declaration = writer.declarations[index]
-    if (declaration.kind == "type") {
-        val underlying = bootstrapLiftEncoderFunction(
-            writer, bootstrapNormalizeType(declaration.resultType)
-        )
-        return "    $underlying(out, value)\n"
-    }
-    if (declaration.kind != "class" || declaration.isResource) {
-        writer.problem = "values of type `${bootstrapLiftTypeText(type)}` need their class at run time to be encoded"
-        return ""
-    }
-    val names: array<string> = []
-    val calls: array<string> = []
-    var field = 0
-    while (field < declaration.parameters.size) {
-        val kind = if (field < declaration.parameterKinds.size)
-            declaration.parameterKinds[field] else ""
-        if ((kind == "val" || kind == "var") && field < declaration.parameterTypes.size) {
-            val fieldName = declaration.parameters[field]
-            names.append(fieldName)
-            calls.append(
-                "    out.parts.append(\"${bootstrapLiftToken(fieldName)}\")\n" +
-                "    ${bootstrapLiftEncoderFunction(writer, bootstrapNormalizeType(declaration.parameterTypes[field]))}(out, value.$fieldName)\n"
-            )
+/** The lambda at [begin, end) of a declaration of `source` (any source when
+ *  none has it). */
+fun bootstrapLiftLambdaAt(
+    declarations: array<BootstrapDeclaration>,
+    source: string,
+    begin: int,
+    end: int
+): BootstrapExpression? {
+    val declared = bootstrapLiftFindDeclaredLambda(declarations, source, begin, end)
+    if (declared != null) return declared
+    for (declaration in declarations) {
+        val found = bootstrapLiftFindLambda(declaration.expression, begin, end)
+        if (found != null) return found
+        for (method in declaration.methods) {
+            val inMethod = bootstrapLiftFindLambda(method.expression, begin, end)
+            if (inMethod != null) return inMethod
         }
-        field = field + 1
     }
-    "${bootstrapLiftEncoderIdentity(writer)}" +
-        "    out.parts.append(\"o${bootstrapLiftToken(type)}${names.size};\")\n" +
-        textJoin(calls)
+    null
 }
 
-/** The encoder for a compile-time result of static `type`: Abla source
- *  defining `fun <name>(value: T): string`, its names ending in `suffix`. */
+/** The encoder for a native compile-time result: Abla source defining
+ *  `trusted fun <name>(value: any): int`, which returns the reply address. */
 fun bootstrapCtLiftEncoder(
     type: string,
     declarations: array<BootstrapDeclaration>,
     suffix: string
 ): BootstrapCtEncoder {
-    var writer = BootstrapLiftEncoderWriter(declarations, suffix, [], [], "")
     val normalized = bootstrapNormalizeType(type)
-    val root = bootstrapLiftEncoderFunction(writer, normalized)
-    if (writer.problem != "") return BootstrapCtEncoder("", "", false, writer.problem)
-    val name = "__abla_lift_encode_$suffix"
-    val parts: array<string> = []
-    // The intrinsics the encoder calls, unless the program declares them.
-    val intrinsics = [
-        "ablaRuntimeValueWord0", "ablaBitF64ToI64", "ablaBitF32ToI32"
-    ]
-    val signatures = [
-        "trusted noescape extern:\"intrinsic\" fun ablaRuntimeValueWord0(value: any): int\n",
-        "noescape extern:\"intrinsic\" fun ablaBitF64ToI64(value: f64): int\n",
-        "noescape extern:\"intrinsic\" fun ablaBitF32ToI32(value: f32): int\n"
-    ]
-    var intrinsic = 0
-    while (intrinsic < intrinsics.size) {
-        if (!bootstrapLiftDeclared(declarations, intrinsics[intrinsic])) {
-            parts.append(signatures[intrinsic])
-        }
-        intrinsic = intrinsic + 1
-    }
-    parts.append(
-        "class __AblaLiftOut_$suffix(val parts: array<string>, val opened: Map<int, int>)\n" +
-        "fun __abla_lift_join_$suffix(parts: array<string>): string {\n" +
-        "    var level = parts\n" +
-        "    while (level.size > 1) {\n" +
-        "        val next: array<string> = []\n" +
+    val reason = bootstrapLiftTypeReason(normalized)
+    if (reason != "") return BootstrapCtEncoder("", "", false, reason)
+    val s = suffix
+    val name = "__abla_lift_reply_$s"
+    val source =
+        "class __AblaLiftRaw_$s(var address: int, var size: int, var capacity: int, val opened: Map<int, int>)\n" +
+        "trusted fun __abla_lift_byte_$s(var out: __AblaLiftRaw_$s, byte: int): void {\n" +
+        "    if (out.size == out.capacity) {\n" +
+        "        val capacity = if (out.capacity == 0) 256 else out.capacity * 2\n" +
+        "        val grown = __ablaRuntimeAllocate(capacity + 8)\n" +
         "        var index = 0\n" +
-        "        while (index + 1 < level.size) {\n" +
-        "            next.append(\"\${level[index]}\${level[index + 1]}\")\n" +
-        "            index = index + 2\n" +
+        "        while (index < out.size) {\n" +
+        "            ablaRuntimeStoreU8(grown + 8 + index, ablaRuntimeLoadU8(out.address + 8 + index))\n" +
+        "            index = index + 1\n" +
         "        }\n" +
-        "        if (index < level.size) next.append(level[index])\n" +
-        "        level = next\n" +
+        "        if (out.address != 0) __ablaRuntimeFree(out.address)\n" +
+        "        out.address = grown\n" +
+        "        out.capacity = capacity\n" +
         "    }\n" +
-        "    if (level.size == 1) level[0] else \"\"\n" +
+        "    ablaRuntimeStoreU8(out.address + 8 + out.size, byte)\n" +
+        "    out.size = out.size + 1\n" +
+        "    return\n" +
         "}\n" +
-        "trusted fun $name(value: ${bootstrapLiftTypeText(normalized)}): string {\n" +
-        "    var out = __AblaLiftOut_$suffix([], Map())\n" +
-        "    $root(out, value)\n" +
-        "    __abla_lift_join_$suffix(out.parts)\n" +
+        // Digits of a non-positive number, most significant first.
+        "trusted fun __abla_lift_digits_$s(var out: __AblaLiftRaw_$s, number: int): void {\n" +
+        "    val quotient = number / 10\n" +
+        "    if (quotient != 0) __abla_lift_digits_$s(out, quotient)\n" +
+        "    __abla_lift_byte_$s(out, 48 - (number - quotient * 10))\n" +
+        "}\n" +
+        "trusted fun __abla_lift_number_$s(var out: __AblaLiftRaw_$s, tag: int, number: int): void {\n" +
+        "    if (tag != 0) __abla_lift_byte_$s(out, tag)\n" +
+        "    if (number < 0) {\n" +
+        "        __abla_lift_byte_$s(out, 45)\n" +
+        "        __abla_lift_digits_$s(out, number)\n" +
+        "    } else __abla_lift_digits_$s(out, 0 - number)\n" +
+        "    __abla_lift_byte_$s(out, 59)\n" +
+        "}\n" +
+        // Whether the heap value at `address` was written before (then a reference).
+        "trusted fun __abla_lift_seen_$s(var out: __AblaLiftRaw_$s, address: int): bool {\n" +
+        "    val seen = out.opened.get(address)\n" +
+        "    if (seen != null) {\n" +
+        "        __abla_lift_number_$s(out, 114, seen)\n" +
+        "        return true\n" +
+        "    }\n" +
+        "    out.opened.set(address, out.opened.size)\n" +
+        "    false\n" +
+        "}\n" +
+        "trusted fun __abla_lift_value_$s(var out: __AblaLiftRaw_$s, value: any): void {\n" +
+        "    val tag = __ablaRuntimeTag(value)\n" +
+        "    if (tag == 0) __abla_lift_byte_$s(out, 118)\n" +
+        "    else if (tag == 1) __abla_lift_byte_$s(out, 110)\n" +
+        "    else if (tag == 2) __abla_lift_number_$s(out, 105, __ablaRuntimeWord0(value))\n" +
+        "    else if (tag == 3) {\n" +
+        "        __abla_lift_byte_$s(out, 98)\n" +
+        "        __abla_lift_byte_$s(out, if (__ablaRuntimeWord0(value) != 0) 49 else 48)\n" +
+        "    } else if (tag == 4) {\n" +
+        // A string may be a rope: its data flattens it.
+        "        val length = __ablaRuntimeStringLengthValue(value)\n" +
+        "        val data = if (length == 0) 0 else __ablaRuntimeStringData(value)\n" +
+        "        __abla_lift_byte_$s(out, 115)\n" +
+        "        if (length == 0) __abla_lift_byte_$s(out, 48) else __abla_lift_digits_$s(out, 0 - length)\n" +
+        "        __abla_lift_byte_$s(out, 58)\n" +
+        "        var index = 0\n" +
+        "        while (index < length) {\n" +
+        "            __abla_lift_byte_$s(out, ablaRuntimeLoadU8(data + index))\n" +
+        "            index = index + 1\n" +
+        "        }\n" +
+        "    } else if (tag == 7) {\n" +
+        "        if (!__abla_lift_seen_$s(out, __ablaRuntimeWord0(value))) {\n" +
+        "            val count = __ablaRuntimeAsI64(__ablaRuntimeArrayLength(value))\n" +
+        "            __abla_lift_number_$s(out, 97, count)\n" +
+        "            var index = 0\n" +
+        "            while (index < count) {\n" +
+        "                __abla_lift_value_$s(out, __ablaRuntimeArrayGet(value, __ablaRuntimeI64(index)))\n" +
+        "                index = index + 1\n" +
+        "            }\n" +
+        "        }\n" +
+        "    } else if (tag == 8) {\n" +
+        "        val object = __ablaRuntimeObjectAddress(value)\n" +
+        "        if (!__abla_lift_seen_$s(out, object)) {\n" +
+        // Fields set by position only (indexed stores) are not counted as used.
+        "            val used = ablaRuntimeLoadI64(object + 8)\n" +
+        "            val capacity = ablaRuntimeLoadI64(object + 16)\n" +
+        "            val count = if (used < capacity) capacity else used\n" +
+        "            val fields = ablaRuntimeLoadI64(object + 24)\n" +
+        "            __abla_lift_number_$s(out, 111, ablaRuntimeLoadI32(object))\n" +
+        "            __abla_lift_number_$s(out, 0, count)\n" +
+        "            var index = 0\n" +
+        "            while (index < count) {\n" +
+        "                __abla_lift_number_$s(out, 0, ablaRuntimeLoadI32(fields + index * 32))\n" +
+        "                __abla_lift_value_$s(out, __ablaRuntimeValueAt(fields + index * 32 + 8))\n" +
+        "                index = index + 1\n" +
+        "            }\n" +
+        "        }\n" +
+        "    } else if (tag == 6) {\n" +
+        "        if (!__abla_lift_seen_$s(out, __ablaRuntimeWord0(value))) {\n" +
+        "            __abla_lift_byte_$s(out, 99)\n" +
+        "            __abla_lift_value_$s(out, __ablaRuntimeCellGet(value))\n" +
+        "        }\n" +
+        "    } else if (tag == 9) {\n" +
+        "        if (!__abla_lift_seen_$s(out, __ablaRuntimeWord0(value))) {\n" +
+        "            __abla_lift_byte_$s(out, 104)\n" +
+        "            __abla_lift_value_$s(out, __ablaRuntimeSharedGet(value))\n" +
+        "        }\n" +
+        "    } else if (tag == 5) {\n" +
+        "        val count = __ablaRuntimeFunctionCaptureCount(value)\n" +
+        "        if (count == 0 || !__abla_lift_seen_$s(out, __ablaRuntimeFunctionCapturePointer(value))) {\n" +
+        "            __abla_lift_number_$s(out, 70, __ablaRuntimeAsFunction(value))\n" +
+        "            __abla_lift_number_$s(out, 0, count)\n" +
+        "            var index = 0\n" +
+        "            while (index < count) {\n" +
+        "                __abla_lift_value_$s(out, __ablaRuntimeFunctionCapture(value, index))\n" +
+        "                index = index + 1\n" +
+        "            }\n" +
+        "        }\n" +
+        "    } else __abla_lift_number_$s(out, 120, tag)\n" +
+        "}\n" +
+        "trusted fun $name(value: any): int {\n" +
+        "    var out = __AblaLiftRaw_$s(0, 0, 0, Map())\n" +
+        "    __abla_lift_value_$s(out, value)\n" +
+        "    if (out.address == 0) __abla_lift_byte_$s(out, 118)\n" +
+        "    ablaRuntimeStoreI64(out.address, out.size)\n" +
+        "    out.address\n" +
         "}\n"
+    BootstrapCtEncoder(name, source, true, "")
+}
+
+// Raw nodes become BootstrapEvalValues in two steps: bytes to an untyped
+// graph (kinds "raw.*" where the representation is ambiguous), then that
+// graph to typed values with the static type (bootstrapLiftRetype). Closure
+// captures stay untyped until the lift knows their types.
+
+class BootstrapLiftRawReader(
+    val bytes: string,
+    var at: int,
+    val functions: BootstrapCtFunctionTable,
+    val opened: array<BootstrapEvalValue>,
+    var problem: string
+) {
+    fun fail(message: string): BootstrapEvalValue {
+        if (this.problem == "") this.problem = "malformed native result at ${this.at}: $message"
+        this.at = this.bytes.size
+        bootstrapEvalInvalid()
+    }
+
+    fun number(): int {
+        var negative = false
+        var value = 0
+        var digits = 0
+        if (this.at < this.bytes.size && this.bytes[this.at] == 45) {
+            negative = true
+            this.at = this.at + 1
+        }
+        while (this.at < this.bytes.size && this.bytes[this.at] >= 48 &&
+               this.bytes[this.at] <= 57) {
+            // Accumulated negative, so the most negative word reads back.
+            value = value * 10 - (this.bytes[this.at] - 48)
+            digits = digits + 1
+            this.at = this.at + 1
+        }
+        if (digits == 0 || this.at >= this.bytes.size || this.bytes[this.at] != 59) {
+            this.fail("expected a number")
+            return 0
+        }
+        this.at = this.at + 1
+        if (negative) value else 0 - value
+    }
+
+    fun open(value: BootstrapEvalValue): BootstrapEvalValue {
+        this.opened.append(value)
+        value
+    }
+}
+
+fun bootstrapLiftRawValue(var reader: BootstrapLiftRawReader): BootstrapEvalValue {
+    if (reader.problem != "" || reader.at >= reader.bytes.size) {
+        return reader.fail("expected a value")
+    }
+    val tag = reader.bytes[reader.at]
+    reader.at = reader.at + 1
+    if (tag == 118) return bootstrapEvalVoid()
+    if (tag == 110) return bootstrapEvalNull()
+    if (tag == 105) {
+        return BootstrapEvalValue("raw.integer", reader.number(), false, "", [], "", [])
+    }
+    if (tag == 98) {
+        val bit = if (reader.at < reader.bytes.size) reader.bytes[reader.at] else 0
+        reader.at = reader.at + 1
+        return bootstrapEvalBoolean(bit == 49)
+    }
+    if (tag == 115) {
+        var size = 0
+        while (reader.at < reader.bytes.size && reader.bytes[reader.at] != 58) {
+            size = size * 10 + reader.bytes[reader.at] - 48
+            reader.at = reader.at + 1
+        }
+        if (reader.at + 1 + size > reader.bytes.size) return reader.fail("truncated string")
+        val text = reader.bytes.slice(reader.at + 1, reader.at + 1 + size)
+        reader.at = reader.at + 1 + size
+        return bootstrapEvalString(text)
+    }
+    if (tag == 114) {
+        val id = reader.number()
+        return if (id >= 0 && id < reader.opened.size) reader.opened[id]
+            else reader.fail("unknown reference $id")
+    }
+    if (tag == 97) {
+        val array = reader.open(BootstrapEvalValue(
+            "raw.array", reader.opened.size, false, "", [], "", []
+        ))
+        var count = reader.number()
+        while (reader.problem == "" && count > 0) {
+            array.elements.append(bootstrapLiftRawValue(reader))
+            count = count - 1
+        }
+        return array
+    }
+    if (tag == 111) {
+        val type = reader.number()
+        val object = reader.open(BootstrapEvalValue(
+            "raw.object", reader.opened.size, false, "$type", [], "", []
+        ))
+        var count = reader.number()
+        while (reader.problem == "" && count > 0) {
+            object.fieldNames.append("${reader.number()}")
+            object.elements.append(bootstrapLiftRawValue(reader))
+            count = count - 1
+        }
+        return object
+    }
+    if (tag == 99 || tag == 104) {
+        val holder = reader.open(BootstrapEvalValue(
+            if (tag == 99) "raw.cell" else "raw.shared",
+            reader.opened.size, false, "", [], "", []
+        ))
+        holder.elements.append(bootstrapLiftRawValue(reader))
+        return holder
+    }
+    if (tag == 70) {
+        val id = reader.number()
+        val count = reader.number()
+        var name = ""
+        var source = ""
+        var index = 0
+        while (index < reader.functions.ids.size) {
+            if (reader.functions.ids[index] == id) {
+                name = reader.functions.names[index]
+                if (index < reader.functions.sources.size) {
+                    source = reader.functions.sources[index]
+                }
+            }
+            index = index + 1
+        }
+        if (name == "") return reader.fail("unknown function id $id")
+        val function = BootstrapEvalValue(
+            "raw.function", reader.opened.size, false, name, [], source, []
+        )
+        if (count > 0) reader.open(function)
+        var remaining = count
+        while (reader.problem == "" && remaining > 0) {
+            function.elements.append(bootstrapLiftRawValue(reader))
+            remaining = remaining - 1
+        }
+        return function
+    }
+    if (tag == 120) {
+        val runtimeTag = reader.number()
+        val what = when (runtimeTag) {
+            10 -> "a weak reference"
+            11 -> "a generator"
+            12 -> "a task"
+            13 -> "a thread"
+            else -> "a value with runtime tag $runtimeTag"
+        }
+        if (reader.problem == "") {
+            reader.problem = "$what cannot become a program value"
+        }
+        return bootstrapEvalInvalid()
+    }
+    reader.fail("unknown node $tag")
+}
+
+/** The runtime's stable id of a class or field name (the backend's
+ *  bootstrapLlvmStableNameId: importing the backend here would pull it into
+ *  every tool that imports semantic analysis). */
+fun bootstrapLiftStableNameId(name: string): int {
+    var hash = bootstrapIrHashText(181, name, 281, 1000000007)
+    if (hash < 0) hash = 0 - hash
+    hash
+}
+
+/** Raw (untyped) values converted with their static types, each raw
+ *  aggregate once (sharing and cycles survive). */
+class BootstrapLiftRetyper(
+    val declarations: array<BootstrapDeclaration>,
+    val syntax: array<BootstrapExpression>,
+    val memo: BootstrapLiftMemo,
+    var problem: string
+)
+
+/** The raw aggregates typed so far and what each became. */
+class BootstrapLiftMemo(
+    val raw: array<BootstrapEvalValue>,
+    val typed: array<BootstrapEvalValue>
+)
+
+fun bootstrapLiftRetyper(
+    declarations: array<BootstrapDeclaration>,
+    syntax: array<BootstrapExpression>
+): BootstrapLiftRetyper =
+    BootstrapLiftRetyper(declarations, syntax, BootstrapLiftMemo([], []), "")
+
+fun bootstrapLiftRetypeKnown(retyper: BootstrapLiftRetyper, raw: BootstrapEvalValue): int {
+    var index = 0
+    while (index < retyper.memo.raw.size) {
+        if (retyper.memo.raw[index] == raw) return index
+        index = index + 1
+    }
+    -1
+}
+
+fun bootstrapLiftRetypeRemember(
+    var retyper: BootstrapLiftRetyper,
+    raw: BootstrapEvalValue,
+    typed: BootstrapEvalValue
+): BootstrapEvalValue {
+    retyper.memo.raw.append(raw)
+    retyper.memo.typed.append(typed)
+    typed
+}
+
+fun bootstrapLiftRetypeFail(var retyper: BootstrapLiftRetyper, message: string): BootstrapEvalValue {
+    if (retyper.problem == "") retyper.problem = message
+    bootstrapEvalInvalid()
+}
+
+/** An integer word as the evaluator holds a value of integer `type`. */
+fun bootstrapLiftCanonicalInteger(word: int, type: string): int {
+    if (type == "i8") return ((word & 255) ^ 128) - 128
+    if (type == "u8") return word & 255
+    if (type == "i16") return ((word & 65535) ^ 32768) - 32768
+    if (type == "u16") return word & 65535
+    if (type == "i32") return ((word & 4294967295) ^ 2147483648) - 2147483648
+    if (type == "u32") return word & 4294967295
+    word
+}
+
+fun bootstrapLiftRetypeType(declarations: array<BootstrapDeclaration>, type: string): string {
+    var result = bootstrapBorrowElementType(bootstrapNormalizeType(type))
+    var depth = 0
+    while (depth < 16) {
+        val index = bootstrapLiftClassIndex(declarations, result)
+        if (index < 0 || declarations[index].kind != "type") return result
+        result = bootstrapNormalizeType(declarations[index].resultType)
+        depth = depth + 1
+    }
+    result
+}
+
+/** `raw` (from native code or still untyped) as a value of static `type`. */
+fun bootstrapLiftRetype(
+    var retyper: BootstrapLiftRetyper,
+    raw: BootstrapEvalValue,
+    staticType: string
+): BootstrapEvalValue {
+    val type = bootstrapLiftRetypeType(retyper.declarations, staticType)
+    val kind = raw.kind
+    if (kind.size < 4 || kind.slice(0, 4) != "raw.") {
+        // Already typed (null, booleans, strings, void, invalid).
+        return raw
+    }
+    if (bootstrapIsNullableType(type)) {
+        return bootstrapLiftRetype(retyper, raw, bootstrapNullableElementType(type))
+    }
+    if (kind == "raw.integer") {
+        if (type == "f64") {
+            return BootstrapEvalValue("f64", raw.integer, false, "", [], "", [])
+        }
+        if (type == "f32") {
+            return BootstrapEvalValue(
+                "f32", bootstrapLiftCanonicalInteger(raw.integer, "i32"),
+                false, "", [], "", []
+            )
+        }
+        return bootstrapEvalInteger(bootstrapLiftCanonicalInteger(raw.integer, type))
+    }
+    val known = bootstrapLiftRetypeKnown(retyper, raw)
+    if (known >= 0) return retyper.memo.typed[known]
+    if (kind == "raw.cell") {
+        val element = if (bootstrapIsCellType(type)) bootstrapCellElementType(type) else type
+        val cell = bootstrapLiftRetypeRemember(retyper, raw, BootstrapEvalValue(
+            "cell", 0, false, "", [], "", []
+        ))
+        cell.elements.append(bootstrapLiftRetype(retyper, raw.elements[0], element))
+        return cell
+    }
+    if (bootstrapIsCellType(type)) {
+        // A Cell handed over as a value is its contents: a fresh cell.
+        return bootstrapEvalCell(
+            bootstrapLiftRetype(retyper, raw, bootstrapCellElementType(type))
+        )
+    }
+    if (kind == "raw.shared") {
+        val element = if (bootstrapIsSharedType(type)) bootstrapSharedElementType(type)
+            else if (bootstrapIsMutexType(type)) bootstrapMutexElementType(type)
+            else "unknown"
+        val control = BootstrapEvalValue("shared.control", 0, false, "", [], "", [])
+        val shared = bootstrapLiftRetypeRemember(retyper, raw, BootstrapEvalValue(
+            "shared", 0, false, "", [control], "", []
+        ))
+        control.elements.append(bootstrapLiftRetype(retyper, raw.elements[0], element))
+        control.elements.append(bootstrapEvalInteger(1))
+        control.elements.append(bootstrapEvalInteger(1))
+        return shared
+    }
+    if (kind == "raw.array" && bootstrapIsMapType(type)) {
+        // [keys, values, slots, live count]; a removed entry's key is null.
+        if (raw.elements.size != 4) {
+            return bootstrapLiftRetypeFail(retyper, "a Map arrived in an unknown layout")
+        }
+        val keys = bootstrapEvalArray([])
+        val stored = bootstrapEvalArray([])
+        val map = bootstrapLiftRetypeRemember(retyper, raw, BootstrapEvalValue(
+            "map", 0, false, "", [keys, stored], "", []
+        ))
+        val rawKeys = raw.elements[0].elements
+        val rawValues = raw.elements[1].elements
+        var entry = 0
+        while (entry < rawKeys.size && entry < rawValues.size) {
+            if (rawKeys[entry].kind != "null") {
+                keys.elements.append(bootstrapLiftRetype(
+                    retyper, rawKeys[entry], bootstrapMapKeyType(type)
+                ))
+                stored.elements.append(bootstrapLiftRetype(
+                    retyper, rawValues[entry], bootstrapMapValueType(type)
+                ))
+            }
+            entry = entry + 1
+        }
+        return map
+    }
+    if (kind == "raw.array") {
+        val element = bootstrapLiftElementType(type)
+        val array = bootstrapLiftRetypeRemember(retyper, raw, bootstrapEvalArray([]))
+        for (item in raw.elements) {
+            array.elements.append(bootstrapLiftRetype(retyper, item, element))
+        }
+        return array
+    }
+    if (kind == "raw.object") return bootstrapLiftRetypeObject(retyper, raw, type)
+    if (kind == "raw.function") return bootstrapLiftRetypeFunction(retyper, raw)
+    bootstrapLiftRetypeFail(retyper, "a native value of kind `$kind` has no program form")
+}
+
+fun bootstrapLiftRetypeObject(
+    var retyper: BootstrapLiftRetyper,
+    raw: BootstrapEvalValue,
+    type: string
+): BootstrapEvalValue {
+    // The class: the static one, else the one whose stable id the object carries.
+    var index = bootstrapLiftClassIndex(retyper.declarations, type)
+    if (index < 0 || retyper.declarations[index].kind != "class") {
+        index = -1
+        var candidate = 0
+        while (index < 0 && candidate < retyper.declarations.size) {
+            val declaration = retyper.declarations[candidate]
+            if (declaration.kind == "class" && declaration.extensionOwner == "" &&
+                "${bootstrapLiftStableNameId(declaration.name)}" == raw.text) {
+                index = candidate
+            }
+            candidate = candidate + 1
+        }
+    }
+    if (index < 0) {
+        return bootstrapLiftRetypeFail(retyper, "a native object of class id ${raw.text} has no class")
+    }
+    val declaration = retyper.declarations[index]
+    val object = bootstrapLiftRetypeRemember(
+        retyper, raw, bootstrapEvalObject(declaration.name, [], [])
     )
-    for (body in writer.bodies) parts.append(body)
-    BootstrapCtEncoder(name, textJoin(parts), true, "")
+    var field = 0
+    var position = 0
+    while (field < declaration.parameters.size) {
+        val kind = if (field < declaration.parameterKinds.size)
+            declaration.parameterKinds[field] else ""
+        if ((kind == "val" || kind == "var") && field < declaration.parameterTypes.size) {
+            val name = declaration.parameters[field]
+            val id = "${bootstrapLiftStableNameId(name)}"
+            var slot = -1
+            var search = 0
+            while (slot < 0 && search < raw.fieldNames.size) {
+                if (raw.fieldNames[search] == id) slot = search
+                search = search + 1
+            }
+            if (slot < 0 && position < raw.elements.size) slot = position
+            if (slot < 0) {
+                return bootstrapLiftRetypeFail(
+                    retyper, "a native `${declaration.name}` lacks its field `$name`"
+                )
+            }
+            object.fieldNames.append(name)
+            object.elements.append(bootstrapLiftRetype(
+                retyper, raw.elements[slot],
+                bootstrapNormalizeType(declaration.parameterTypes[field])
+            ))
+            position = position + 1
+        }
+        field = field + 1
+    }
+    object
+}
+
+/** The `[prefix]lambda_<begin>_<end>_<n>` span of a lambda function's name. */
+fun bootstrapLiftLambdaSpan(name: string): array<int> {
+    var at = 0
+    var found = -1
+    while (at + 7 <= name.size) {
+        if (name.slice(at, at + 7) == "lambda_") found = at + 7
+        at = at + 1
+    }
+    if (found < 0) return []
+    val numbers: array<int> = []
+    var value = 0
+    var digits = 0
+    var index = found
+    while (index <= name.size) {
+        if (index < name.size && name[index] >= 48 && name[index] <= 57) {
+            value = value * 10 + name[index] - 48
+            digits = digits + 1
+        } else {
+            if (digits > 0) numbers.append(value)
+            value = 0
+            digits = 0
+        }
+        index = index + 1
+    }
+    if (numbers.size >= 2) [numbers[0], numbers[1]] else []
+}
+
+fun bootstrapLiftRetypeFunction(
+    var retyper: BootstrapLiftRetyper,
+    raw: BootstrapEvalValue
+): BootstrapEvalValue {
+    val span = bootstrapLiftLambdaSpan(raw.text)
+    if (span.size == 0) {
+        // A named function: the program refers to its declaration.
+        var name = raw.text
+        for (declaration in retyper.declarations) {
+            if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+                declaration.extensionOwner != "" &&
+                raw.text == "extension_${declaration.extensionOwner}_${declaration.name}") {
+                name = declaration.name
+            }
+        }
+        return bootstrapLiftRetypeRemember(retyper, raw, bootstrapEvalFunction(name))
+    }
+    val lambda = bootstrapLiftLambdaAt(
+        retyper.declarations, raw.owner, span[0], span[1]
+    )
+    var family = "fn"
+    if (lambda != null) {
+        retyper.syntax.append(lambda)
+        if (lambda.kind == "lambda.move") family = "once"
+    } else {
+        return bootstrapLiftRetypeFail(retyper, "no lambda for native function `${raw.text}`")
+    }
+    // Captures stay raw, in lowering's order, until the lift knows their types.
+    val closure = bootstrapLiftRetypeRemember(retyper, raw, BootstrapEvalValue(
+        "closure", retyper.syntax.size - 1, family == "once", "positional",
+        [], family, []
+    ))
+    for (capture in raw.elements) closure.elements.append(capture)
+    closure
 }
 
 class BootstrapCtDecoded(
     val value: BootstrapEvalValue,
     val syntax: array<BootstrapExpression>,
     val ok: bool,
-    val diagnostic: string
+    val diagnostic: string,
+    // Pass as BootstrapEvalResult.liftMemo (with `syntax` as its syntax).
+    val memo: BootstrapLiftMemo
 )
 
-/** A native result's bytes as the value the lift builds; `type` is the
- *  static result type (diagnostics only). */
+/** A native result's reply bytes as the value the lift builds, read with the
+ *  static result `type`; closures resolve through `functions`. */
 fun bootstrapCtLiftDecode(
     bytes: string,
     type: string,
-    declarations: array<BootstrapDeclaration>
+    declarations: array<BootstrapDeclaration>,
+    functions: BootstrapCtFunctionTable
 ): BootstrapCtDecoded {
     val syntax: array<BootstrapExpression> = []
-    val decoded = bootstrapLiftDecode(bytes, declarations, syntax)
-    if (decoded.problem != "") {
+    var reader = BootstrapLiftRawReader(bytes, 0, functions, [], "")
+    val raw = bootstrapLiftRawValue(reader)
+    if (reader.problem == "" && reader.at != bytes.size) reader.fail("trailing bytes")
+    var retyper = bootstrapLiftRetyper(declarations, syntax)
+    val value = if (reader.problem == "") bootstrapLiftRetype(retyper, raw, type)
+        else bootstrapEvalInvalid()
+    val problem = if (reader.problem != "") reader.problem else retyper.problem
+    if (problem != "") {
         return BootstrapCtDecoded(
             bootstrapEvalInvalid(), syntax, false,
-            "error[E_CT_LIFT_DECODE]: the native result of type `${bootstrapLiftTypeText(bootstrapNormalizeType(type))}` could not be decoded: ${decoded.problem}\n"
+            "error[E_CT_LIFT_DECODE]: the native result of type `${bootstrapLiftTypeText(bootstrapNormalizeType(type))}` could not be decoded: $problem\n",
+            retyper.memo
         )
     }
-    BootstrapCtDecoded(decoded.value, syntax, true, "")
+    BootstrapCtDecoded(value, syntax, true, "", retyper.memo)
 }

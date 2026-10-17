@@ -1159,27 +1159,36 @@ fun bootstrapCompileGlobalSlot(key: string): int {
     found
 }
 
-/** What an earlier evaluation kept under `key` (invalid when none). */
-fun bootstrapCompileGlobalLoad(key: string): BootstrapEvalValue {
+/** What an earlier evaluation kept under `key` (invalid when none); a kept
+ *  closure's lambda joins `syntax`. */
+fun bootstrapCompileGlobalLoad(
+    key: string,
+    declarations: array<BootstrapDeclaration>,
+    syntax: array<BootstrapExpression>
+): BootstrapEvalValue {
     val slot = bootstrapCompileGlobalSlot(key)
     if (slot < 0) return bootstrapEvalInvalid()
-    val reader = BootstrapCompileGlobalReader(
-        Path("${bootstrapCompileGlobalRoot()}/$slot.value").readText(), 0, true
-    )
-    val value = reader.value()
-    if (!reader.ok) return bootstrapEvalInvalid()
-    value
+    val text = Path("${bootstrapCompileGlobalRoot()}/$slot.value").readText()
+    if (text == "") return bootstrapEvalInvalid()
+    val decoded = bootstrapLiftDecode(text, declarations, syntax)
+    if (decoded.problem != "") return bootstrapEvalInvalid()
+    decoded.value
 }
 
-/** Keep the globals an evaluation read (and possibly changed) for the next ones. */
+/** Keep the globals an evaluation read (and possibly changed) for the next
+ *  ones, in the lift codec (shared and cyclic values, closures). */
 fun bootstrapCompileGlobalsKeep(
     keys: array<string>,
-    values: array<BootstrapEvalValue>
+    values: array<BootstrapEvalValue>,
+    syntax: array<BootstrapExpression>,
+    declarations: array<BootstrapDeclaration>
 ): void {
     val root = bootstrapCompileGlobalRoot()
     var index = 0
     while (index < keys.size) {
-        val encoded = bootstrapCompileGlobalEncode(values[index])
+        val encoded = bootstrapLiftEncode(
+            values[index], syntax, declarations
+        ).bytes
         var slot = bootstrapCompileGlobalSlot(keys[index])
         if (encoded == "") {
             if (slot >= 0) Path("$root/$slot.value").writeText("")
@@ -1489,7 +1498,10 @@ class BootstrapEvalResult(
     val generatedDeclarations: array<BootstrapDeclaration>,
     // The syntax closure values index (`value.integer`): lifting a closure
     // into the program lowers its lambda from here (ct_lift.ab).
-    val syntax: array<BootstrapExpression> = []
+    val syntax: array<BootstrapExpression> = [],
+    // A native result's typing so far: its closures' captures are typed when
+    // lifted, against the same values (bootstrapCtLiftDecode).
+    val liftMemo: BootstrapLiftMemo? = null
 )
 
 fun bootstrapEvalInvalid(): BootstrapEvalValue =
@@ -3157,7 +3169,7 @@ class BootstrapEvaluator(
             if (this.globalKeys[index] == key) return this.globalValues[index]
             index = index + 1
         }
-        var value = bootstrapCompileGlobalLoad(key)
+        var value = bootstrapCompileGlobalLoad(key, this.declarations, this.syntax)
         if (value.kind == "invalid") value = this.evaluate(declaration.expression)
         this.globalKeys.append(key)
         this.globalValues.append(value)
@@ -3291,7 +3303,9 @@ class BootstrapEvaluator(
                         index = index + 1
                     }
                     if (result.kind == "invalid") {
-                        result = bootstrapCompileGlobalLoad(key)
+                        result = bootstrapCompileGlobalLoad(
+                            key, this.declarations, this.syntax
+                        )
                         if (result.kind == "invalid") {
                             result = this.evaluate(candidate.expression)
                         }
@@ -5477,7 +5491,9 @@ fun bootstrapRuntimeGlobal(
         else bootstrapRuntimeGlobalKey(declaration)
     val slot = bootstrapEvalGlobalSlot(evaluator, key)
     if (slot >= 0) return evaluator.globalValues[slot]
-    var value = bootstrapCompileGlobalLoad(key)
+    var value = bootstrapCompileGlobalLoad(
+        key, evaluator.declarations, evaluator.syntax
+    )
     if (value.kind == "invalid" && !initializing) {
         value = bootstrapRuntimeGlobalInitial(evaluator, declaration)
     } else if (value.kind == "invalid") {
@@ -10889,7 +10905,9 @@ fun bootstrapEvaluateWithEffectsIn(
         source
     )
     val result = evaluator.evaluate(expression)
-    bootstrapCompileGlobalsKeep(globalKeys, globalValues)
+    bootstrapCompileGlobalsKeep(
+        globalKeys, globalValues, evaluator.syntax, evaluator.declarations
+    )
     BootstrapEvalResult(
         result,
         evaluator.errors,
@@ -10999,7 +11017,9 @@ fun bootstrapInvokeSubparserHandlerIn(
         result.integer < syntax.size) {
         expression = syntax[result.integer]
     }
-    bootstrapCompileGlobalsKeep(globalKeys, globalValues)
+    bootstrapCompileGlobalsKeep(
+        globalKeys, globalValues, evaluator.syntax, evaluator.declarations
+    )
     BootstrapSubparserInvocation(
         expression,
         evaluator.errors + cursor.errors,
@@ -11081,7 +11101,9 @@ fun bootstrapInvokeExtensionFinalizerIn(
             )
         ]
     ))
-    bootstrapCompileGlobalsKeep(globalKeys, globalValues)
+    bootstrapCompileGlobalsKeep(
+        globalKeys, globalValues, evaluator.syntax, evaluator.declarations
+    )
     BootstrapEvalResult(
         result,
         evaluator.errors,
@@ -11146,7 +11168,9 @@ fun bootstrapInvokeCompilerTransformIn(
         []
     ))
     bootstrapCompilerTransformActive = false
-    bootstrapCompileGlobalsKeep(globalKeys, globalValues)
+    bootstrapCompileGlobalsKeep(
+        globalKeys, globalValues, evaluator.syntax, evaluator.declarations
+    )
     BootstrapEvalResult(
         result,
         evaluator.errors,

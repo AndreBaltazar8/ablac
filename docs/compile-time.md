@@ -270,9 +270,11 @@ fun main {
 
 - Run-time code can't read a compile-time global (`compile.value-runtime`).
   Copy what you need into the program with `#`.
-- Between evaluations the value is kept as data: integers, booleans,
-  strings, `null`, arrays and objects. A global that holds anything else (a
-  closure, a handle) is evaluated afresh for each evaluation.
+- Between evaluations the value is kept whole: data, objects (shared
+  references and cycles stay as they are) and closures with what they
+  captured. A global that holds something that exists only while one
+  evaluation runs (a generator, a task) is evaluated afresh for each
+  evaluation.
 - A module that the native object cache skips runs no handlers. A provider
   that collects from its uses should be built with `--no-cache`.
 

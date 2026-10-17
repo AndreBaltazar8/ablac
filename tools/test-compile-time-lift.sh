@@ -12,7 +12,7 @@ mkdir -p "$output_directory"
 # Lifted directly, then through the codec the compile-time JIT hands its
 # results over in (encoded, decoded, encoded again: the same bytes).
 for check in 0 1; do
-    for name in closures values; do
+    for name in closures values kept more; do
         ABLA_LIFT_CODEC_CHECK=$check "$compiler" build "$cases/$name.ab" \
             -o "$output_directory/$name" --no-cache
         set +e
@@ -26,6 +26,24 @@ echo "compile-time lift: $name (codec check $check) exited $status" >&2
             exit 1
         fi
     done
+done
+
+# Under the compile-time JIT (where the compiler has it) the same results are
+# computed natively and handed over through the native encoder: the program
+# must come out byte-identical to the interpreted one.
+for name in closures values more; do
+    "$compiler" --emit-llvm "$cases/$name.ab" > "$output_directory/$name.interp.ll"
+    set +e
+    ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" --emit-llvm \
+        "$cases/$name.ab" > "$output_directory/$name.jit.ll" \
+        2> "$output_directory/$name.jit.err"
+    set -e
+    if grep -q 'native at' "$output_directory/$name.jit.err"; then
+        if ! cmp -s "$output_directory/$name.interp.ll" "$output_directory/$name.jit.ll"; then
+            echo "compile-time lift: $name differs between the interpreter and the JIT" >&2
+            exit 1
+        fi
+    fi
 done
 
 expect_failure() { # <case> <text the diagnostics must contain>
