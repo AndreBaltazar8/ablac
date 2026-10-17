@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# A lambda where a void function is expected may end in an assignment.
+# A lambda where a void function is expected may end in an assignment, and so may a
+# function, method or extension declared `: void`.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -15,4 +16,13 @@ set +e
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
-echo "lambda void assignment: callbacks may end in an assignment"
+
+"$compiler" build \
+    "$project_root/tests/cases/modules/function-void-assignment.ab" \
+    -o "$output_directory/function" --no-cache
+set +e
+output=$("$output_directory/function")
+status=$?
+set -e
+[[ $status -eq 42 && $output == "27 11" ]] || { echo "function: status $status, output '$output'"; exit 1; }
+echo "void assignment: callbacks and void functions may end in an assignment"

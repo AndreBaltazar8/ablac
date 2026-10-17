@@ -506,9 +506,14 @@ written `Type<A, B>`.
 ### `void` and `never`
 
 An empty block, and a `while` loop, have type `void`. A function whose
-result type is `void` must not end in an expression that has a value:
+result type is `void` returns nothing. Its body may still end in an
+assignment: an assignment's value is the assigned value, but in a `void`
+function (or method, extension or lambda) a trailing assignment just ends the
+body:
 
-```abla error
+```abla
+import "abla/io"
+
 var count = 0
 
 fun bump(): void {
@@ -517,12 +522,15 @@ fun bump(): void {
 
 fun main {
     bump()
+    bump()
+    println("$count")
 }
-// error: function.result:bump:void:i64
+// output:
+// 2
 ```
 
-An assignment is an expression whose value is the assigned value, so end such
-a body with `return` (or declare no result type and ignore the value).
+Any other trailing expression with a value (`fun f(): void { 1 + 2 }`) is
+`function.result:f:void:i64`; end such a body with `return`.
 
 `never` is the type of an expression that can't complete, such as a call to
 `exit` or `panic`, or a `while (true)` loop with no `break`. It fits
