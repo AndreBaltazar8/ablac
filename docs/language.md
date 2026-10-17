@@ -823,9 +823,10 @@ fun main {
   `handlers[0]()`, `(pick())(x)`. `button.onClick(event)` calls a method
   named `onClick` if there is one, and otherwise a property of function
   type with that name.
-- Parameter types also come from a built-in method's element type:
-  `callbacks.append({ x -> x + 1 })` on an `array<(int) -> int>`, and the
-  same for `Map` values.
+- Parameter types also come from where the lambda is stored: a built-in
+  method's element type (`callbacks.append({ x -> x + 1 })` on an
+  `array<(int) -> int>`, `Map.set`), an index assignment, an array literal
+  of a declared type, a field or a variable of function type.
 - A call by name looks for an *applicable* candidate level by level: a
   local or parameter, then a member of the receiver, then a top-level
   function ([classes](#classes) has the details). So a callback parameter
