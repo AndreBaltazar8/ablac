@@ -3,6 +3,7 @@ import "abla/unsafe/memory/raw"
 import "ct_bridge.ab"
 import "compile_actions.ab"
 import "ct_native.ab"
+import "eval_scalar.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
@@ -1509,6 +1510,102 @@ fun bootstrapEvalInvalid(): BootstrapEvalValue =
 
 fun bootstrapEvalInteger(value: int): BootstrapEvalValue =
     BootstrapEvalValue("integer", value, false, "", [], "", [])
+
+/** An integer of scalar type `width` (eval_scalar.ab), wrapped to it, of the
+ *  nominal scalar type `nominal` when that is not "". */
+fun bootstrapEvalScalar(value: int, width: string, nominal: string): BootstrapEvalValue =
+    BootstrapEvalValue("integer", bootstrapEvalWrap(value, width), false, nominal, [], width, [])
+
+/** The first of `values` that leaves its expression (a `return`, `break` or
+ *  `continue` reached while evaluating an argument or initializer), or -1. */
+fun bootstrapEvalFirstEscape(values: array<BootstrapEvalValue>): int {
+    var index = 0
+    while (index < values.size) {
+        val kind = values[index].kind
+        if (kind == "return" || kind == "break" || kind == "continue") return index
+        index = index + 1
+    }
+    -1
+}
+
+/** What a `type` declaration named `name` stands for, normalized; "" when
+ *  `name` is no scalar type declaration. */
+fun bootstrapEvalScalarUnderlying(var evaluator: BootstrapEvaluator, name: string): string {
+    if (!bootstrapCouldNameScalarType(name)) return ""
+    var node = evaluator.firstNamed(name)
+    while (node >= 0) {
+        val declaration = evaluator.declarations[evaluator.namedDeclaration(node)]
+        if (declaration.kind == "type" && declaration.name == name) {
+            return bootstrapNormalizeType(declaration.resultType)
+        }
+        node = evaluator.nextNamed(node)
+    }
+    ""
+}
+
+/** `value` as it reaches a place declared `type` (a parameter, a result, a
+ *  field, a typed local): an integer takes the type's width and nominal name. */
+fun bootstrapEvalCoerce(
+    var evaluator: BootstrapEvaluator,
+    value: BootstrapEvalValue,
+    type: string
+): BootstrapEvalValue {
+    if (value.kind != "integer") return value
+    val normalized = bootstrapNormalizeType(type)
+    var width = bootstrapEvalIntegerWidth(normalized)
+    var nominal = ""
+    if (width == "-") {
+        width = bootstrapEvalIntegerWidth(bootstrapEvalScalarUnderlying(evaluator, normalized))
+        if (width == "-") return value
+        nominal = normalized
+    }
+    if (width == value.owner && nominal == value.text) value
+    else bootstrapEvalScalar(value.integer, width, nominal)
+}
+
+/** `T(x)` for a builtin integer type or a nominal scalar type T: `x` converted
+ *  to T; invalid when `name` names neither. */
+fun bootstrapEvalScalarConversion(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    name: string
+): BootstrapEvalValue {
+    if (expression.children.size != 1) return bootstrapEvalInvalid()
+    var width = bootstrapEvalIntegerWidth(bootstrapNormalizeType(name))
+    var nominal = ""
+    if (width == "-") {
+        val underlying = bootstrapEvalScalarUnderlying(evaluator, name)
+        if (underlying == "") return bootstrapEvalInvalid()
+        width = bootstrapEvalIntegerWidth(underlying)
+        nominal = name
+    }
+    val value = evaluator.evaluate(expression.children[0])
+    // A nominal f64, f32 or bool keeps the representation it wraps.
+    if (width == "-" || value.kind != "integer") value
+    else bootstrapEvalScalar(value.integer, width, nominal)
+}
+
+/** The receiver type an integer's method resolves on: its nominal type, then
+ *  its builtin width, then i64, the first that declares `name`. */
+fun bootstrapEvalIntegerReceiverType(
+    var evaluator: BootstrapEvaluator,
+    receiver: BootstrapEvalValue,
+    name: string
+): string {
+    val candidates: array<string> = []
+    if (receiver.text != "") candidates.append(receiver.text)
+    if (receiver.owner != "") candidates.append(receiver.owner)
+    for (candidate in candidates) {
+        var node = evaluator.firstNamed(name)
+        while (node >= 0) {
+            val declaration = evaluator.declarations[evaluator.namedDeclaration(node)]
+            if (declaration.extensionOwner != "" &&
+                bootstrapNormalizeType(declaration.extensionOwner) == candidate) return candidate
+            node = evaluator.nextNamed(node)
+        }
+    }
+    "i64"
+}
 
 fun bootstrapEvalBoolean(value: bool): BootstrapEvalValue =
     BootstrapEvalValue("boolean", 0, value, "", [], "", [])
@@ -3321,7 +3418,9 @@ class BootstrapEvaluator(
 
     fun printable(value: BootstrapEvalValue): string {
         var result = value.text
-        if (value.kind == "integer") result = "${value.integer}"
+        if (value.kind == "integer") {
+            result = bootstrapEvalIntegerText(value.integer, value.owner)
+        }
         if (value.kind == "f64") result = f64Text(bootstrapEvalAsF64(value))
         if (value.kind == "f32") {
             result = f64Text(f32ToF64(bootstrapEvalAsF32(value)))
@@ -4620,6 +4719,9 @@ class BootstrapEvaluator(
                 return result
             }
         }
+        if (target < 0 && result.kind == "invalid") {
+            result = bootstrapEvalScalarConversion(this, expression, targetName)
+        }
         // ABLA_COMPILE_EVAL=bridge performs routed externs through the
         // native-code bridge (src/ct_bridge.ab) instead of directly.
         val routed = if (callable.kind != "closure" &&
@@ -4654,8 +4756,12 @@ class BootstrapEvaluator(
                     // A default sees the parameters bound before it: the name
                     // joins once its value is there (bootstrapEvalDefaultArgument).
                     if (argument < expression.children.size) {
-                        callValues.append(this.evaluate(
-                            expression.children[argument]
+                        callValues.append(bootstrapEvalCoerce(
+                            this,
+                            this.evaluate(expression.children[argument]),
+                            if (argument < declaration.parameterTypes.size)
+                                declaration.parameterTypes[argument]
+                            else "inferred"
                         ))
                         argument = argument
                     } else if (argument < declaration.parameterDefaults.size &&
@@ -4679,12 +4785,16 @@ class BootstrapEvaluator(
                 val invocation = bootstrapEvalInvocation(
                     this, callNames, callValues, callMutable
                 )
-                result = bootstrapEvaluateFrom(
-                    invocation, declaration.sourceIdentity, declaration.expression
-                )
+                // An argument that left its expression leaves the call too.
+                val escaped = bootstrapEvalFirstEscape(callValues)
+                result = if (escaped >= 0) bootstrapEvalInvalid()
+                    else bootstrapEvaluateFrom(
+                        invocation, declaration.sourceIdentity, declaration.expression
+                    )
                 if (result.kind == "return" && result.elements.size == 1) {
                     result = result.elements[0]
                 }
+                result = bootstrapEvalCoerce(this, result, declaration.resultType)
                 invocation.dropOwnedParameters(
                     declaration.parameterKinds,
                     result,
@@ -4693,6 +4803,7 @@ class BootstrapEvaluator(
                 this.errors = invocation.errors
                 this.steps = invocation.steps
                 this.diagnostics = invocation.diagnostics
+                if (escaped >= 0) result = callValues[escaped]
             }
             if (declaration.name == targetName &&
                 declaration.kind == "extern" &&
@@ -4713,8 +4824,12 @@ class BootstrapEvaluator(
         var result = bootstrapEvalInvalid()
         var receiverType = receiver.owner
         if (receiver.kind == "string") receiverType = "string"
-        if (receiver.kind == "integer") receiverType = "i64"
+        if (receiver.kind == "integer") {
+            receiverType = bootstrapEvalIntegerReceiverType(this, receiver, expression.text)
+        }
         if (receiver.kind == "boolean") receiverType = "bool"
+        if (receiver.kind == "f64") receiverType = "f64"
+        if (receiver.kind == "f32") receiverType = "f32"
         if (receiver.owner == "Compiler") {
             var target = ""
             if (expression.text == "functions") {
@@ -4820,16 +4935,22 @@ class BootstrapEvaluator(
             val declaration = this.declarations[declarationIndex]
             if ((declaration.kind == "fun" ||
                  declaration.kind == "compile.fun") &&
-                declaration.extensionOwner == receiverType &&
+                bootstrapNormalizeType(declaration.extensionOwner) == receiverType &&
                 declaration.name == expression.text) {
                 val extensionNames: array<string> = ["this"]
-                val extensionValues: array<BootstrapEvalValue> = [receiver]
+                val extensionValues: array<BootstrapEvalValue> = [
+                    bootstrapEvalCoerce(this, receiver, declaration.extensionOwner)
+                ]
                 val extensionMutable: array<bool> = [false]
                 var parameter = 0
                 while (parameter < declaration.parameters.size) {
                     if (parameter + 1 < expression.children.size) {
-                        extensionValues.append(this.evaluate(
-                            expression.children[parameter + 1]
+                        extensionValues.append(bootstrapEvalCoerce(
+                            this,
+                            this.evaluate(expression.children[parameter + 1]),
+                            if (parameter < declaration.parameterTypes.size)
+                                declaration.parameterTypes[parameter]
+                            else "inferred"
                         ))
                     } else if (parameter <
                             declaration.parameterDefaults.size &&
@@ -4895,12 +5016,15 @@ class BootstrapEvaluator(
                     this.diagnostics,
                     this.sourceIdentity
                 )
-                result = bootstrapEvaluateFrom(
-                    invocation, declaration.sourceIdentity, declaration.expression
-                )
+                val escaped = bootstrapEvalFirstEscape(extensionValues)
+                result = if (escaped >= 0) bootstrapEvalInvalid()
+                    else bootstrapEvaluateFrom(
+                        invocation, declaration.sourceIdentity, declaration.expression
+                    )
                 if (result.kind == "return" && result.elements.size == 1) {
                     result = result.elements[0]
                 }
+                result = bootstrapEvalCoerce(this, result, declaration.resultType)
                 invocation.dropOwnedParameters(
                     declaration.parameterKinds,
                     result,
@@ -4909,6 +5033,7 @@ class BootstrapEvaluator(
                 this.errors = invocation.errors
                 this.steps = invocation.steps
                 this.diagnostics = invocation.diagnostics
+                if (escaped >= 0) result = extensionValues[escaped]
             }
             if (declaration.kind == "class" &&
                 declaration.name == receiver.owner) {
@@ -4990,12 +5115,14 @@ class BootstrapEvaluator(
                             this.diagnostics,
                             this.sourceIdentity
                         )
-                        result = bootstrapEvaluateFrom(
-                            invocation,
-                            if (method.sourceIdentity != "") method.sourceIdentity
-                            else declaration.sourceIdentity,
-                            method.expression
-                        )
+                        val escaped = bootstrapEvalFirstEscape(methodValues)
+                        result = if (escaped >= 0) bootstrapEvalInvalid()
+                            else bootstrapEvaluateFrom(
+                                invocation,
+                                if (method.sourceIdentity != "") method.sourceIdentity
+                                else declaration.sourceIdentity,
+                                method.expression
+                            )
                         if (result.kind == "return" &&
                             result.elements.size == 1) {
                             result = result.elements[0]
@@ -5008,6 +5135,7 @@ class BootstrapEvaluator(
                         this.errors = invocation.errors
                         this.steps = invocation.steps
                         this.diagnostics = invocation.diagnostics
+                        if (escaped >= 0) result = methodValues[escaped]
                     }
                     methodIndex = methodIndex + 1
                 }
@@ -5278,6 +5406,11 @@ fun bootstrapEvaluateConstruction(
             evaluator.errors = evaluator.errors + 1
             value = value
         }
+        if (parameter < declaration.parameterTypes.size) {
+            value = bootstrapEvalCoerce(
+                evaluator, value, declaration.parameterTypes[parameter]
+            )
+        }
         if (parameter < declaration.parameterKinds.size &&
             (declaration.parameterKinds[parameter] == "val" ||
              declaration.parameterKinds[parameter] == "var")) {
@@ -5291,6 +5424,8 @@ fun bootstrapEvaluateConstruction(
         fieldNames,
         fields
     )
+    val escaped = bootstrapEvalFirstEscape(fields)
+    if (escaped >= 0) result = fields[escaped]
     result
 }
 
@@ -5861,8 +5996,8 @@ fun bootstrapEvaluateComplement(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    val value = evaluator.evaluate(expression.children[0]).integer
-    result = bootstrapEvalInteger(bitNot(value))
+    val value = evaluator.evaluate(expression.children[0])
+    result = bootstrapEvalScalar(bitNot(value.integer), value.owner, value.text)
     result
 }
 
@@ -6280,10 +6415,16 @@ fun bootstrapEvaluateLocal(
     if (expression.children[0].kind != "missing") {
         value = evaluator.evaluate(expression.children[0])
     }
+    if (expression.children.size > 1 &&
+        expression.children[1].text != "inferred") {
+        value = bootstrapEvalCoerce(evaluator, value, expression.children[1].text)
+    }
     evaluator.names.append(expression.text)
     evaluator.values.append(value)
     evaluator.mutable.append(expression.kind == "local.var")
     result = BootstrapEvalValue("void", 0, false, "", [], "", [])
+    // An initializer that left its expression leaves the block too.
+    if (bootstrapEvalFirstEscape([value]) == 0) result = value
     result
 }
 
@@ -6825,7 +6966,7 @@ fun bootstrapEvaluateNegate(
         if (expression.kind == "unary-") {
             bootstrapEvalF32(-bootstrapEvalAsF32(value))
         } else value
-    } else bootstrapEvalInteger(integer)
+    } else bootstrapEvalScalar(integer, value.owner, value.text)
     result
 }
 
@@ -6855,14 +6996,14 @@ fun bootstrapEvaluateArithmetic(
     } else {
         // Float payloads are IEEE bits, not integers. In particular a
         // floating zero must never reach an integer division first.
-        val left = leftValue.integer
-        val right = rightValue.integer
-        var value = left + right
-        if (expression.kind == "-") value = left - right
-        if (expression.kind == "*") value = left * right
-        if (expression.kind == "/") value = left / right
-        if (expression.kind == "%") value = left - (left / right) * right
-        bootstrapEvalInteger(value)
+        val width = bootstrapEvalOperationWidth(leftValue.owner, rightValue.owner)
+        bootstrapEvalScalar(
+            bootstrapEvalIntegerArithmetic(
+                expression.kind, leftValue.integer, rightValue.integer, width
+            ),
+            width,
+            bootstrapEvalOperationWidth(leftValue.text, rightValue.text)
+        )
     }
     result
 }
@@ -6873,17 +7014,20 @@ fun bootstrapEvaluateBitwise(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    val left = evaluator.evaluate(expression.children[0]).integer
-    val right = evaluator.evaluate(expression.children[1]).integer
-    var value = bitAnd(left, right)
-    if (expression.kind == "|") value = bitOr(left, right)
-    if (expression.kind == "^") value = bitXor(left, right)
-    if (expression.kind == "<<") value = bitShiftLeft(left, right)
-    if (expression.kind == ">>") value = bitShiftRight(left, right)
-    if (expression.kind == ">>>") {
-        value = bitShiftRightUnsigned(left, right)
-    }
-    result = bootstrapEvalInteger(value)
+    val left = evaluator.evaluate(expression.children[0])
+    val right = evaluator.evaluate(expression.children[1])
+    // A shift has its left operand's type.
+    val shift = expression.kind == "<<" || expression.kind == ">>" ||
+        expression.kind == ">>>"
+    val width = if (shift) left.owner
+        else bootstrapEvalOperationWidth(left.owner, right.owner)
+    result = bootstrapEvalScalar(
+        bootstrapEvalIntegerBitwise(
+            expression.kind, left.integer, right.integer, width
+        ),
+        width,
+        if (shift) left.text else bootstrapEvalOperationWidth(left.text, right.text)
+    )
     result
 }
 
@@ -6915,6 +7059,10 @@ fun bootstrapEvaluateComparison(
     if (expression.kind == "<=") value = left <= right
     if (expression.kind == ">") value = left > right
     if (expression.kind == ">=") value = left >= right
+    if (leftValue.kind == "integer" &&
+        bootstrapEvalOperationWidth(leftValue.owner, rightValue.owner) == "u64") {
+        value = bootstrapEvalUnsignedCompare(expression.kind, left, right)
+    }
     if (bootstrapEvalFloat(leftValue) && bootstrapEvalFloat(rightValue)) {
         value = bootstrapEvalF64Compare(
             expression.kind,
