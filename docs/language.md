@@ -137,9 +137,13 @@ between digits (`1_000_000`). **Floating literals** need a fractional part or
 an exponent (`1.5`, `2e3`, `1.25e-2`) and have type `f64`. There are no
 character literals: `"abc"[1]` is the byte value `98`.
 
-**Strings** are written `"..."` and may span lines. Escapes: `\n`, `\r`,
-`\t`, `\b`, `\"`, `\'`, `\\`, `\$`, `\xNN` (any byte) and `\uXXXX` (ASCII code
-points). `$name` and `${expression}` insert values:
+**Strings** are written `"..."` and may span lines. They hold bytes, and
+the source text is UTF-8. Escapes: `\n`, `\r`, `\t`, `\b`, `\0` (the zero
+byte), `\"`, `\'`, `\\`, `\$`, `\xHH` (any one byte), and `\uXXXX` or `\u{H}`
+to `\u{HHHHHH}` (a Unicode code point, stored as its UTF-8 bytes; surrogates
+`D800`-`DFFF` and values above `10FFFF` aren't code points). Any other
+backslash sequence is an error (`E_PARSE_INVALID_ESCAPE`): write `\\` for a
+backslash. `$name` and `${expression}` insert values:
 
 ```abla
 import "abla/io"
@@ -148,14 +152,14 @@ fun main {
     val name = "Abla"
     val count = 3
     println("$name has ${count + 1} letters")
-    println("price: \$5, tab:\t|, hex: \x41, unicode: B")
+    println("price: \$5, tab:\t|, hex: \x41, unicode: \u00e9 \u{1F600}")
     println("two
 lines")
     println("con" + "cat")
 }
 // output:
 // Abla has 4 letters
-// price: $5, tab:	|, hex: A, unicode: B
+// price: $5, tab:	|, hex: A, unicode: é 😀
 // two
 // lines
 // concat

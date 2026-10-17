@@ -106,82 +106,170 @@ fun bootstrapAsciiCodepoint(codepoint: int): string {
     result
 }
 
+// The byte a one-letter escape stands for: `\n` `\r` `\t` `\b` `\0`, and
+// `\"` `\'` `\\` `\$` for themselves.
+fun bootstrapSimpleEscapeByte(escaped: int): int {
+    var result = -1
+    if (escaped == 110) result = 10
+    else if (escaped == 114) result = 13
+    else if (escaped == 116) result = 9
+    else if (escaped == 98) result = 8
+    else if (escaped == 48) result = 0
+    else if (escaped == 34 || escaped == 39 || escaped == 92 ||
+             escaped == 36) result = escaped
+    result
+}
+
+// The value of the hex digits starting at `begin`, up to the first non-digit.
+fun bootstrapHexDigitsValue(raw: string, begin: int): int {
+    var value = 0
+    var cursor = begin
+    while (cursor < raw.size && bootstrapHexValue(raw[cursor]) >= 0) {
+        value = value * 16 + bootstrapHexValue(raw[cursor])
+        cursor = cursor + 1
+    }
+    value
+}
+
+// Where the escape whose backslash is at `index` ends, or -1 when it is not
+// a valid escape. Besides the one-letter escapes: `\xHH` (one byte),
+// `\uXXXX` and `\u{H…}` (1-6 digits), which name a Unicode scalar value.
+fun bootstrapEscapeEnd(raw: string, index: int): int {
+    var finish = -1
+    if (index + 1 < raw.size) {
+        val escaped = raw[index + 1]
+        if (bootstrapSimpleEscapeByte(escaped) >= 0) finish = index + 2
+        else if (escaped == 120) {
+            if (index + 3 < raw.size &&
+                bootstrapHexValue(raw[index + 2]) >= 0 &&
+                bootstrapHexValue(raw[index + 3]) >= 0) finish = index + 4
+        } else if (escaped == 117) {
+            var digitsBegin = index + 2
+            if (index + 2 < raw.size && raw[index + 2] == 123) {
+                digitsBegin = index + 3
+                var cursor = digitsBegin
+                while (cursor < raw.size && cursor - digitsBegin <= 6 &&
+                       bootstrapHexValue(raw[cursor]) >= 0) {
+                    cursor = cursor + 1
+                }
+                if (cursor > digitsBegin && cursor - digitsBegin <= 6 &&
+                    cursor < raw.size && raw[cursor] == 125) {
+                    finish = cursor + 1
+                }
+            } else if (index + 5 < raw.size &&
+                       bootstrapHexValue(raw[index + 2]) >= 0 &&
+                       bootstrapHexValue(raw[index + 3]) >= 0 &&
+                       bootstrapHexValue(raw[index + 4]) >= 0 &&
+                       bootstrapHexValue(raw[index + 5]) >= 0) {
+                finish = index + 6
+            }
+            if (finish >= 0) {
+                val codepoint = bootstrapHexDigitsValue(raw, digitsBegin)
+                if (codepoint > 1114111 ||
+                    (codepoint >= 55296 && codepoint <= 57343)) finish = -1
+            }
+        }
+    }
+    finish
+}
+
+// The first malformed escape in a string literal's text: its offset, or -1.
+fun bootstrapInvalidEscapeOffset(raw: string): int {
+    var result = -1
+    var index = 0
+    while (result < 0 && index < raw.size) {
+        if (raw[index] == 92) {
+            val finish = bootstrapEscapeEnd(raw, index)
+            if (finish < 0) result = index else index = finish
+        } else {
+            index = index + 1
+        }
+    }
+    result
+}
+
+fun bootstrapInvalidEscapeMessage(raw: string, offset: int): string {
+    val escaped = if (offset + 1 < raw.size) raw[offset + 1] else 0
+    if (escaped == 117) {
+        "invalid Unicode escape: `\\uXXXX` takes 4 hex digits and `\\u{H...}` 1 to 6, naming a Unicode scalar value (at most 10FFFF, not a surrogate D800-DFFF)"
+    } else if (escaped == 120) {
+        "invalid byte escape: `\\x` takes exactly 2 hex digits"
+    } else {
+        "unknown escape `${raw.slice(offset, offset + 2)}` in a string; the escapes are \\n \\r \\t \\b \\0 \\\" \\' \\\\ \\\$ \\xHH \\uXXXX \\u{H...} (write `\\\\` for a backslash)"
+    }
+}
+
 fun bootstrapDecodeString(raw: string): string {
-    // A decoded literal can never exceed its source byte length. Decode into
-    // one owned buffer instead of repeatedly concatenating immutable strings;
-    // generated inline assembly contains thousands of `\n` escapes, for
-    // which the old loop retained quadratic transient copies.
+    // A decoded literal can never exceed its source byte length (a `\u`
+    // escape is at least as long as its UTF-8). Decode into one owned buffer
+    // instead of repeatedly concatenating immutable strings; generated inline
+    // assembly contains thousands of `\n` escapes, for which the old loop
+    // retained quadratic transient copies. A malformed escape (reported by
+    // the parser through bootstrapInvalidEscapeOffset) is kept as written.
     val output = nativeByteBuffer(raw.size + 1)
     var valid = !pointerIsNull(output.address)
     var index = 0
     var destination = 0
     while (valid && index < raw.size) {
-        if (raw[index] == 92 && index + 1 < raw.size) {
-            val escaped = raw[index + 1]
-            var decoded = -1
-            var consumed = 2
-            if (escaped == 110) decoded = 10
-            else if (escaped == 114) decoded = 13
-            else if (escaped == 116) decoded = 9
-            else if (escaped == 98) decoded = 8
-            else if (escaped == 48) {
-                valid = output.store(destination, 92)
-                destination = destination + 1
-                if (valid) valid = output.store(destination, 48)
-                destination = destination + 1
-            }
-            else if (escaped == 34) decoded = 34
-            else if (escaped == 39) decoded = 39
-            else if (escaped == 92) decoded = 92
-            else if (escaped == 36) decoded = 36
-            else if (escaped == 120 && index + 3 < raw.size) {
-                val high = bootstrapHexValue(raw[index + 2])
-                val low = bootstrapHexValue(raw[index + 3])
-                if (high >= 0 && low >= 0) {
-                    decoded = high * 16 + low
-                    consumed = 4
-                }
-            }
-            else if (escaped == 117 && index + 5 < raw.size) {
-                var codepoint = 0
-                var digit = 0
-                var unicodeValid = true
-                while (digit < 4) {
-                    val value = bootstrapHexValue(raw[index + 2 + digit])
-                    if (value < 0) unicodeValid = false
-                    if (value >= 0) codepoint = codepoint * 16 + value
-                    digit = digit + 1
-                }
-                val unicode = bootstrapAsciiCodepoint(codepoint)
-                if (unicodeValid && unicode != "") {
-                    decoded = unicode[0]
-                } else {
-                    var rawByte = 0
-                    while (valid && rawByte < 6) {
-                        valid = output.store(
-                            destination, raw[index + rawByte]
-                        )
-                        destination = destination + 1
-                        rawByte = rawByte + 1
-                    }
-                }
-                consumed = 6
-            }
-            if (decoded >= 0) {
-                valid = output.store(destination, decoded)
-                destination = destination + 1
-            } else if (escaped != 48 &&
-                       !(escaped == 117 && consumed == 6)) {
-                valid = output.store(destination, 92)
-                destination = destination + 1
-                if (valid) valid = output.store(destination, escaped)
-                destination = destination + 1
-            }
-            index = index + consumed
-        } else {
+        val finish = if (raw[index] == 92) bootstrapEscapeEnd(raw, index)
+            else -1
+        if (finish < 0) {
             valid = output.store(destination, raw[index])
             destination = destination + 1
             index = index + 1
+        } else {
+            val escaped = raw[index + 1]
+            if (escaped == 120) {
+                valid = output.store(
+                    destination,
+                    bootstrapHexValue(raw[index + 2]) * 16 +
+                        bootstrapHexValue(raw[index + 3])
+                )
+                destination = destination + 1
+            } else if (escaped == 117) {
+                val codepoint = bootstrapHexDigitsValue(
+                    raw, if (raw[index + 2] == 123) index + 3 else index + 2
+                )
+                if (codepoint < 128) {
+                    valid = output.store(destination, codepoint)
+                    destination = destination + 1
+                } else if (codepoint < 2048) {
+                    valid = output.store(destination, 192 + codepoint / 64)
+                    if (valid) valid = output.store(
+                        destination + 1, 128 + codepoint % 64
+                    )
+                    destination = destination + 2
+                } else if (codepoint < 65536) {
+                    valid = output.store(destination, 224 + codepoint / 4096)
+                    if (valid) valid = output.store(
+                        destination + 1, 128 + codepoint / 64 % 64
+                    )
+                    if (valid) valid = output.store(
+                        destination + 2, 128 + codepoint % 64
+                    )
+                    destination = destination + 3
+                } else {
+                    valid = output.store(
+                        destination, 240 + codepoint / 262144
+                    )
+                    if (valid) valid = output.store(
+                        destination + 1, 128 + codepoint / 4096 % 64
+                    )
+                    if (valid) valid = output.store(
+                        destination + 2, 128 + codepoint / 64 % 64
+                    )
+                    if (valid) valid = output.store(
+                        destination + 3, 128 + codepoint % 64
+                    )
+                    destination = destination + 4
+                }
+            } else {
+                valid = output.store(
+                    destination, bootstrapSimpleEscapeByte(escaped)
+                )
+                destination = destination + 1
+            }
+            index = finish
         }
     }
     var result = ""
@@ -240,6 +328,17 @@ class BootstrapParser(
             "${this.diagnostics}error[E_PARSE_$code]: $message\n"
         this.diagnostics =
             "${this.diagnostics}source[parser]:${this.sourceIdentity}:$begin:$end\n"
+    }
+
+    // Reports the first malformed escape in a string literal's text.
+    fun checkEscapes(token: BootstrapToken, raw: string) {
+        val offset = bootstrapInvalidEscapeOffset(raw)
+        if (offset >= 0) this.failAt(
+            "INVALID_ESCAPE",
+            bootstrapInvalidEscapeMessage(raw, offset),
+            token.begin + offset,
+            token.begin + if (offset + 2 < raw.size) offset + 2 else raw.size
+        )
     }
 
     fun fail(code: string, message: string) {
@@ -1043,9 +1142,9 @@ class BootstrapParser(
             while (!this.at("string-end") && !this.at("end")) {
                 if (this.at("string-text")) {
                     val textToken = this.tokens[this.position]
-                    val part = bootstrapDecodeString(
-                        bootstrapTokenText(this.source, textToken)
-                    )
+                    val rawText = bootstrapTokenText(this.source, textToken)
+                    this.checkEscapes(textToken, rawText)
+                    val part = bootstrapDecodeString(rawText)
                     text = "$text$part"
                     parts.append(BootstrapExpression(
                         "string",
@@ -1763,10 +1862,10 @@ class BootstrapParser(
         this.expect("string-start")
         var library = ""
         if (this.at("string-text")) {
-            library = bootstrapDecodeString(bootstrapTokenText(
-                this.source,
-                this.tokens[this.position]
-            ))
+            val libraryToken = this.tokens[this.position]
+            val rawLibrary = bootstrapTokenText(this.source, libraryToken)
+            this.checkEscapes(libraryToken, rawLibrary)
+            library = bootstrapDecodeString(rawLibrary)
             this.position = this.position + 1
         }
         this.expect("string-end")

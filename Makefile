@@ -136,6 +136,7 @@ test: ablac
 	tools/test-compile-time-depth.sh $(COMPILER)
 	tools/test-compile-time-arguments.sh $(COMPILER)
 	tools/test-import-precedence-diagnostics.sh $(COMPILER)
+	tools/test-string-escapes.sh $(COMPILER)
 	tools/test-region-escape-operators.sh $(COMPILER)
 	tools/test-diagnostic-noise.sh $(COMPILER)
 	tools/test-compile-time-lift.sh $(COMPILER)
