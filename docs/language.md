@@ -96,16 +96,15 @@ for a later version.
 
 **Comments.** `// to end of line` and `/* block */`. Block comments nest.
 
-**Keywords.** These are reserved everywhere: `abstract`, `await`, `break`,
-`class`, `compile`, `constructor`, `continue`, `defer`, `do`, `else`,
+**Keywords.** These are reserved everywhere: `await`, `break`,
+`class`, `compile`, `continue`, `defer`, `do`, `else`,
 `extern`, `false`, `for`, `fun`, `generator`, `if`, `import`, `in`,
 `interface`, `noescape`, `null`, `resource`, `return`, `task`, `thread`,
 `true`, `trusted`, `until`, `val`, `var`, `when`, `while`, `yield`. These
 are keywords only in one position and ordinary identifiers elsewhere:
 `by` (after a binding's name), `own` (before a parameter name), `region`
 (before `{`), `operator` (before `fun`), `type` (at the start of a
-declaration), `move` (before `{`). `abstract` is accepted and ignored, and
-`constructor` is reserved for future use.
+declaration), `move` (before `{`).
 
 **Statements.** A newline ends a statement where a statement can end. `;`
 separates statements explicitly and is never required. A line that starts
@@ -286,7 +285,7 @@ fun main {
 - Mixing types (`f64 + int`, `string + int`) is `arithmetic.type`. Mixing
   bit-operation types is `bitwise.type`.
 
-> Known issue: an `int` argument passed to a parameter of a narrower type
+> Known issue (being fixed by ablac-backend): an `int` argument passed to a parameter of a narrower type
 > (`u8`, `i32`, ...) is narrowed implicitly, without a conversion call. Write
 > the conversion anyway; the implicit form may become an error.
 
@@ -474,7 +473,7 @@ fun main {
 - Inside an extension of a nominal type, `this` is the underlying value.
 - `type` is a keyword only at the start of a declaration.
 
-> Known issue: a nominal value can't yet initialize a typed local
+> Known issue (being fixed by ablac-backend): a nominal value can't yet initialize a typed local
 > (`val raw: int = id`) or be inserted into a string template directly.
 > Pass it through a function, as `idNumber` does.
 
@@ -546,9 +545,9 @@ fun main {
   `return value` leaves early.
 - A function with no parameters may omit `()`: `fun greet { ... }`,
   `fun main: int = 0`.
-- **Write the result type** (`: int`) for any function whose result is
-  used. A function without one has its result inferred, but callers can't
-  use it yet. See the known issue below.
+- The result type may be omitted: `fun inc(a: int) = a + 1` infers `int`
+  from the body. Until the known issue below is fixed, write the result
+  type whenever callers use the result.
 - Parameters may have defaults, which may refer to earlier parameters.
   Arguments may be passed by name after the positional ones. Each argument
   is evaluated once, in source order. Unknown, duplicate, out-of-order or
@@ -557,15 +556,15 @@ fun main {
 - Parameters borrow their arguments; `var` and `own` change that
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)).
 
-> Known issue: a result inferred from `fun inc(a: int) = a + 1` is currently
-> unknown to its callers, so `inc(41) + 1` fails with
+> Known issue (being fixed by ct-infer): a result inferred from
+> `fun inc(a: int) = a + 1` is currently unknown to its callers, so `inc(41) + 1` fails with
 > `arithmetic.type@..:inferred:i64` and `fun main: int = inc(41)` with
 > `function.result:main:i64:inferred`.
 
 ### Extension functions
 
 `fun Type.name(...)` adds a function that is called like a method. Inside
-it, `this` is the receiver. Fields of the receiver must be read through
+it, `this` is the receiver. Fields of the receiver are currently read through
 `this`:
 
 ```abla
@@ -582,6 +581,10 @@ fun main {
 // output:
 // 25 true
 ```
+
+> Known issue (being fixed by ablac-frontend): inside an extension function,
+> the receiver's fields aren't yet in scope by name as they are in a method;
+> `x` instead of `this.x` reports `identifier:x`.
 
 ### Lambdas and closures
 
@@ -681,7 +684,8 @@ fun main {
 signatures. Today an interface is only a nominal type: there is no syntax
 for a class to implement one, and a class value is not accepted where an
 interface is expected (`function.argument:...:Shape:Square`). Interfaces are
-used as opaque handle types in compiler and library APIs.
+used as opaque handle types in compiler and library APIs. Implementing
+interfaces is an open language-design item, raised with the language owner.
 
 ## Delegated bindings
 
@@ -933,7 +937,7 @@ fun main {
 | `E_DELEGATE_AFFINE_VALUE` | `getValue()` returns an owned affine value |
 | `E_DELEGATE_BORROW_CONFLICT` | The delegate is replaced while a borrow of it from `^name` is still used |
 
-> Known issue: in a method, a field whose name is also the name of a
+> Known issue (being fixed by ct-parity): in a method, a field whose name is also the name of a
 > top-level delegated binding currently resolves to the top-level binding at
 > run time. Until that's fixed, don't give a top-level delegated binding the
 > same name as a field of any class.

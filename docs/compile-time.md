@@ -119,7 +119,7 @@ fun main: int {
 // error: E_EVAL_EXPRESSION
 ```
 
-> Known issue: reading a local under `#` is reported only when the
+> Known issue (being fixed by ct-parity): reading a local under `#` is reported only when the
 > evaluation reaches it, as `E_EVAL_EXPRESSION: compile-time evaluation
 > failed while evaluating identifier n`. It is not a type error naming the
 > local.
@@ -154,7 +154,7 @@ in both phases. A function that reaches a platform facility with no
 compile-time implementation (see [below](#what-works-at-compile-time-today))
 fails when it is evaluated at compile time.
 
-> Known issue: calling a `compile fun` from run-time code is not rejected by
+> Known issue (being fixed by ct-parity): calling a `compile fun` from run-time code is not rejected by
 > the type checker. It fails later, in code generation, with
 > `E_LLVM_INSTRUCTION_UNSUPPORTED: function main cannot lower ... call target
 > <name>`.
@@ -209,7 +209,7 @@ compiler needs them before it can evaluate anything:
 These work only as literal top-level actions. Called from inside a
 `compile fun`, `compilerGrant`, `compilerRegisterSubparser` and
 `compilerGenerateModule` currently do nothing, and they don't report an
-error either.
+error either (being fixed by ct-bridge).
 
 An action that runs code (anything other than a grant) disables the
 whole-program native object cache for that build. Every build then runs it
@@ -250,7 +250,7 @@ fun main {
 - A module that the native object cache skips runs no handlers. A provider
   that collects from its uses should be built with `--no-cache`.
 
-> Known issue: a `compile val` currently clashes with *any* identifier of the
+> Known issue (being fixed by ct-parity): a `compile val` currently clashes with *any* identifier of the
 > same name, even a local in another module. `compile val registry` breaks
 > every build, because the runtime has a local named `registry`. Prefer
 > distinctive names until this is fixed.
@@ -312,6 +312,25 @@ compileCapabilities = ["filesystem.read"]
 hello from a file
 ```
 
+The intended way to read a file at compile time is the same `abla/fs` API
+as at run time, under the `filesystem.read` grant:
+
+```abla fragment
+import "abla/io"
+import "abla/fs"
+import "abla/compiler"
+
+#compilerGrant("filesystem.read")
+
+val greeting = #path("greeting.txt").readText()
+```
+
+That form doesn't work yet: `abla/fs` ends in system calls, which compile-time
+evaluation can't make yet (being added by ct-native; the build currently
+stops with `compile.effect-denied:trusted.native`). Until then, use the
+host runtime's file function. It is internal and will go away once the
+`abla/fs` form works:
+
 ```abla
 import "abla/io"
 import "abla/compiler"
@@ -340,7 +359,7 @@ The check happens before evaluation starts, so a denied path never runs.
 
 | Capability | What it allows | Providers | Native object cache |
 |---|---|---|---|
-| `filesystem.read` | read files, list directories | `ablaHostReadFile(path)`, `ablaHostListDirectory(path)` (sorted) | kept: each read is journaled and revalidated |
+| `filesystem.read` | read files, list directories | `abla/fs` (coming); today the internal `ablaHostReadFile(path)`, `ablaHostListDirectory(path)` (sorted) | kept: each read is journaled and revalidated |
 | `filesystem.write` | stage output files, published only if the build succeeds | `compilerWriteFile(path, contents)` | disabled |
 | `environment` | read named environment variables | `compilerEnvironment(name)` (`""` when unset) | kept: each value is journaled and revalidated |
 | `process.io` | run a child process | `compilerRunProcess(arguments)` | disabled |
@@ -462,12 +481,14 @@ compiler team tracks the remaining gaps case by case.
 | Delegated bindings, resources and `drop`, ownership checks | works |
 | Granted capabilities through the providers above | works |
 | Closures as `#` results | works |
-| `print`/`println`, `abla/fs`, `abla/process`, sockets: anything that ends in a system call | not yet: `compile.effect-denied:trusted.native` |
+| `print`/`println`, `abla/fs`, `abla/process`, sockets: anything that ends in a system call | not yet: `compile.effect-denied:trusted.native` (being added by ct-native) |
 | `extern:"c"` functions, trusted raw memory | not yet: being added behind the `trusted.native` capability |
 | Fixed-width and nominal conversions (`u16(x)`, `Pin(x)`), integer extension methods | partly: being fixed |
 | Run-time globals | see [above](#ordinary-globals-at-compile-time) |
 
-So, for now, compile-time code cannot print. To inspect what it computes,
+So, for now, compile-time code cannot print. When ct-native lands the
+system-call mapping, `println` under `#` will write to the compiler's own
+standard output. Until then, to inspect what compile-time code computes,
 return the value with `#` and print it at run time, or stage a file with
 `compilerWriteFile`.
 

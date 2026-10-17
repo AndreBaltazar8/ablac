@@ -36,7 +36,7 @@ fun main {
 
 The rest of this page gives the complete rules.
 
-> Known issue: a string built with `+` inside a region can currently be
+> Known issue (reported, fixer to be named): a string built with `+` inside a region can currently be
 > assigned to an outer variable without an error, and is corrupted when the
 > memory is reused. Don't assign strings computed inside a region to outer
 > variables.

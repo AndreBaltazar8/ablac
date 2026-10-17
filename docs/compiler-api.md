@@ -43,7 +43,7 @@ fun main {
 `routeTable` runs inside the compiler, and the program receives its result
 as a constant array. Types are reported in their canonical spelling (`int`
 is `i64`). Annotation names are reflected, but their arguments (the
-`"/users"` above) are not yet.
+`"/users"` above) are not yet (being added by ct-bridge).
 
 ## Transforms: changing the program
 

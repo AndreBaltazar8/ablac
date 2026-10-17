@@ -209,7 +209,7 @@ unchecked name for its own object. Return a new object built from it
 instead, or return nothing and let the caller keep using its own reference.
 A method that changes its receiver should return `void`, not `this`.
 
-> Known issues: returning a top-level `val` (`fun current(): Counter =
+> Known issues (being fixed by ct-own): returning a top-level `val` (`fun current(): Counter =
 > shared`) is currently accepted, although it creates the same kind of
 > alias. The help text for `ownership.managed-return-borrow-contract` says a
 > parameter may be returned, but returning one is exactly what it rejects.
@@ -300,7 +300,7 @@ The rules:
   a `val`/`var` property already transfers it
   (`ownership.owned-constructor-parameter`).
 
-> Known issue: a mistake that the control-flow check finds (a use after
+> Known issue (being fixed by ct-own): a mistake that the control-flow check finds (a use after
 > `move`, a double `move`, a move on only one branch, reading a partly moved
 > owner, a second call of a `FnOnce`) is currently reported as
 > `E_IR_FUNCTION_VERIFICATION: function main violated a typed IR invariant`,

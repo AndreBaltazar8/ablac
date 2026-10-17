@@ -35,7 +35,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Lambdas, trailing lambdas, closures | `parser.ab` `parseLambda`, `sema.ab` | [language.md#lambdas-and-closures](language.md#lambdas-and-closures) | good | test-closure-captures, test-lambda-void-assignment |
 | Classes, methods, properties | `parser.ab`, `sema.ab` | [language.md#classes](language.md#classes) | good | classes (native) |
 | Interfaces | `parser.ab`, `sema.ab` (nominal only) | [language.md#interfaces](language.md#interfaces) | reference | overload-probe-filter |
-| `abstract`, `constructor` keywords | `parser.ab` (ignored), `lexer.ab` (reserved) | [language.md#lexical-structure](language.md#lexical-structure) | mentioned | — |
+| `abstract`, `constructor` keywords | being removed (they did nothing) | not documented | — | — |
 | Delegated bindings `by`, `^name` | `parser.ab`, `sema.ab` | [language.md#delegated-bindings](language.md#delegated-bindings) | good | test-delegated-bindings |
 | Overloads, `operator fun` | `overload.ab`, `parser.ab` | [language.md#overloads-and-operator-functions](language.md#overloads-and-operator-functions) | good | test-overloads, test-overload-probe-filter |
 | Operator precedence, compound assignment | `parser.ab` | [language.md#expressions-and-operators](language.md#expressions-and-operators) | good | test-compound-assignment |

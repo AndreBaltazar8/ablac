@@ -112,7 +112,7 @@ fun main {
 - A generator is single-pass: iterate over it once.
 - Generators can be nested: a generator body may iterate another generator.
 
-> Known issue: generators currently run eagerly. On the first iteration the
+> Known issue (being fixed by ct-gen): generators currently run eagerly. On the first iteration the
 > whole body runs and its values are buffered, so side effects in the body
 > happen before the consumer sees the first value, and a `defer` in the
 > body runs at that point instead of when the generator is exhausted,
