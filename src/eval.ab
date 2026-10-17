@@ -14,7 +14,8 @@ import "generator_eval.ab"
 // Parser handlers, finalizers, and ordinary staged expressions use separate
 // evaluator objects. Keep their transaction in a private per-process staging
 // directory; only scalar counters are global, so scoped-region safety remains
-// independent from compile-driver bookkeeping.
+// independent from compile-driver bookkeeping. The directory is this process's
+// scratch: its files are written plainly (no fsync, no rename).
 var bootstrapCompileOutputCount: int = 0
 var bootstrapCompileOutputBytes: int = 0
 // Compile-time globals kept between evaluations (bootstrapCompileGlobalsKeep): how many
@@ -672,9 +673,7 @@ fun bootstrapStageAnnotatedExports(parsed: BootstrapParseResult): int {
                     )
                     exportNameIndex = exportNameIndex + 1
                 }
-                if (!valid) {
-                    bootstrapExportRequestCount = exportRequestBegin
-                }
+                if (!valid) bootstrapTruncateExportRequests(exportRequestBegin)
                 if (!valid) {
                     errors = errors + 1
                     bootstrapStageDriverDiagnostic(
@@ -714,34 +713,40 @@ fun bootstrapExportRequestsEqual(
     equal
 }
 
+// A staged request is one file: its fields as tokens (bootstrapCompileGlobalToken).
+fun bootstrapExportRequestRecord(request: BootstrapExportRequest): string {
+    var record = "${bootstrapCompileGlobalToken(request.source)}${bootstrapCompileGlobalToken(request.name)}${bootstrapCompileGlobalToken(request.resultType)}${if (request.checked) "1:1" else "1:0"}${if (request.internal) "1:1" else "1:0"}${if (request.required) "1:1" else "1:0"}${bootstrapCompileGlobalToken("${request.parameterTypes.size}")}"
+    var parameter = 0
+    while (parameter < request.parameterTypes.size) {
+        record = "$record${bootstrapCompileGlobalToken(request.parameterNames[parameter])}${bootstrapCompileGlobalToken(request.parameterTypes[parameter])}"
+        parameter = parameter + 1
+    }
+    record
+}
+
 fun bootstrapExportRequestAt(
     root: string,
     index: int
 ): BootstrapExportRequest {
+    val reader = BootstrapCompileGlobalReader(Path("$root/$index").readText(), 0, true)
+    val source = reader.token()
+    val name = reader.token()
+    val resultType = reader.token()
+    val checked = reader.token() == "1"
+    val internal = reader.token() == "1"
+    val required = reader.token() == "1"
+    val parameterCount = bootstrapDecimalIndex(reader.token())
     val parameterNames: array<string> = []
     val parameterTypes: array<string> = []
-    val parameterCount = bootstrapDecimalIndex(
-        Path("$root/$index.parameters").readText()
-    )
     var parameter = 0
     while (parameter < parameterCount) {
-        parameterNames.append(Path(
-            "$root/$index.parameter-$parameter-name"
-        ).readText())
-        parameterTypes.append(Path(
-            "$root/$index.parameter-$parameter-type"
-        ).readText())
+        parameterNames.append(reader.token())
+        parameterTypes.append(reader.token())
         parameter = parameter + 1
     }
     BootstrapExportRequest(
-        Path("$root/$index.source").readText(),
-        Path("$root/$index.name").readText(),
-        Path("$root/$index.result").readText(),
-        parameterNames,
-        parameterTypes,
-        Path("$root/$index.checked").readText() == "1",
-        Path("$root/$index.internal").readText() == "1",
-        Path("$root/$index.required").readText() == "1"
+        source, name, resultType, parameterNames, parameterTypes,
+        checked, internal, required
     )
 }
 
@@ -750,9 +755,16 @@ fun bootstrapStageExportRequest(request: BootstrapExportRequest): bool {
         bootstrapLinkerSymbolNameValid(request.name)
     } else bootstrapExportNameValid(request.name)
     val root = bootstrapExportRequestRoot()
+    // `names` lists the staged names, one per line in staging order (names have
+    // no line breaks), so a duplicate is found in one read: reading every earlier
+    // request's files took seconds for a slice program with hundreds of entries.
+    val names = if (bootstrapExportRequestCount > 0) Path("$root/names").readText() else ""
     var index = 0
-    while (valid && index < bootstrapExportRequestCount) {
-        if (Path("$root/$index.name").readText() == request.name) {
+    var start = 0
+    while (valid && index < bootstrapExportRequestCount && start < names.size) {
+        var end = start
+        while (end < names.size && names[end] != 10) end = end + 1
+        if (names.slice(start, end) == request.name) {
             // Framework aggregators may independently discover the same
             // monolithic link edge. Repeating an identical request is
             // idempotent; a different source, ABI, or linkage for the same
@@ -762,58 +774,37 @@ fun bootstrapStageExportRequest(request: BootstrapExportRequest): bool {
             )) return true
             valid = false
         }
+        start = end + 1
         index = index + 1
     }
     if (valid) valid = Path(root).createDirectories()
     val requestIndex = bootstrapExportRequestCount
-    if (valid) valid = Path("$root/$requestIndex.source").writeTextAtomic(
-        request.source
+    if (valid) valid = Path("$root/$requestIndex").writeText(
+        bootstrapExportRequestRecord(request)
     )
-    if (valid) valid = Path("$root/$requestIndex.name").writeTextAtomic(
-        request.name
-    )
-    if (valid) valid = Path("$root/$requestIndex.result").writeTextAtomic(
-        request.resultType
-    )
-    if (valid) valid = Path("$root/$requestIndex.checked").writeTextAtomic(
-        if (request.checked) "1" else "0"
-    )
-    if (valid) valid = Path("$root/$requestIndex.internal").writeTextAtomic(
-        if (request.internal) "1" else "0"
-    )
-    if (valid) valid = Path("$root/$requestIndex.required").writeTextAtomic(
-        if (request.required) "1" else "0"
-    )
-    if (valid) valid = Path("$root/$requestIndex.parameters").writeTextAtomic(
-        "${request.parameterTypes.size}"
-    )
-    var parameter = 0
-    while (valid && parameter < request.parameterTypes.size) {
-        valid = Path(
-            "$root/$requestIndex.parameter-$parameter-name"
-        ).writeTextAtomic(request.parameterNames[parameter])
-        if (valid) valid = Path(
-            "$root/$requestIndex.parameter-$parameter-type"
-        ).writeTextAtomic(request.parameterTypes[parameter])
-        parameter = parameter + 1
-    }
+    // The record is complete before its name is listed.
+    if (valid) valid = Path("$root/names").appendText("${request.name}\n")
     if (valid) bootstrapExportRequestCount = requestIndex + 1
-    if (!valid) {
-        Path("$root/$requestIndex.source").remove()
-        Path("$root/$requestIndex.name").remove()
-        Path("$root/$requestIndex.result").remove()
-        Path("$root/$requestIndex.checked").remove()
-        Path("$root/$requestIndex.internal").remove()
-        Path("$root/$requestIndex.required").remove()
-        Path("$root/$requestIndex.parameters").remove()
-        parameter = 0
-        while (parameter < request.parameterTypes.size) {
-            Path("$root/$requestIndex.parameter-$parameter-name").remove()
-            Path("$root/$requestIndex.parameter-$parameter-type").remove()
-            parameter = parameter + 1
-        }
-    }
+    if (!valid) Path("$root/$requestIndex").remove()
     valid
+}
+
+// Forgets the requests staged after the first `count` (their files are rewritten
+// by later requests; the name list keeps its first `count` lines).
+fun bootstrapTruncateExportRequests(count: int): void {
+    if (count < bootstrapExportRequestCount) {
+        val path = Path("${bootstrapExportRequestRoot()}/names")
+        val names = path.readText()
+        var end = 0
+        var kept = 0
+        while (kept < count && end < names.size) {
+            if (names[end] == 10) kept = kept + 1
+            end = end + 1
+        }
+        val rewritten = path.writeText(names.slice(0, end))
+        bootstrapExportRequestCount = count
+    }
+    return
 }
 
 fun bootstrapTakeExportRequests(): array<BootstrapExportRequest> {
@@ -821,43 +812,12 @@ fun bootstrapTakeExportRequests(): array<BootstrapExportRequest> {
     val root = bootstrapExportRequestRoot()
     var index = 0
     while (index < bootstrapExportRequestCount) {
-        val parameterNames: array<string> = []
-        val parameterTypes: array<string> = []
-        val parameterCount = bootstrapDecimalIndex(
-            Path("$root/$index.parameters").readText()
-        )
-        var parameter = 0
-        while (parameter < parameterCount) {
-            parameterNames.append(Path(
-                "$root/$index.parameter-$parameter-name"
-            ).readText())
-            parameterTypes.append(Path(
-                "$root/$index.parameter-$parameter-type"
-            ).readText())
-            Path("$root/$index.parameter-$parameter-name").remove()
-            Path("$root/$index.parameter-$parameter-type").remove()
-            parameter = parameter + 1
-        }
-        requests.append(BootstrapExportRequest(
-            Path("$root/$index.source").readText(),
-            Path("$root/$index.name").readText(),
-            Path("$root/$index.result").readText(),
-            parameterNames,
-            parameterTypes,
-            Path("$root/$index.checked").readText() == "1",
-            Path("$root/$index.internal").readText() == "1",
-            Path("$root/$index.required").readText() == "1"
-        ))
-        Path("$root/$index.source").remove()
-        Path("$root/$index.name").remove()
-        Path("$root/$index.result").remove()
-        Path("$root/$index.checked").remove()
-        Path("$root/$index.internal").remove()
-        Path("$root/$index.required").remove()
-        Path("$root/$index.parameters").remove()
+        requests.append(bootstrapExportRequestAt(root, index))
+        Path("$root/$index").remove()
         index = index + 1
     }
     bootstrapExportRequestCount = 0
+    Path("$root/names").remove()
     Path(root).remove()
     requests
 }
@@ -871,9 +831,8 @@ fun bootstrapRequiredInternalFunctionSources(): array<string> {
     val root = bootstrapExportRequestRoot()
     var index = 0
     while (index < bootstrapExportRequestCount) {
-        if (Path("$root/$index.required").readText() == "1") {
-            sources.append(Path("$root/$index.source").readText())
-        }
+        val request = bootstrapExportRequestAt(root, index)
+        if (request.required) sources.append(request.source)
         index = index + 1
     }
     sources
@@ -916,7 +875,7 @@ fun bootstrapStageDriverDiagnostic(diagnostic: string): void {
         val root = bootstrapDriverDiagnosticRoot()
         if (Path(root).createDirectories() && Path(
             "$root/$bootstrapDriverDiagnosticCount"
-        ).writeTextAtomic(diagnostic)) {
+        ).writeText(diagnostic)) {
             bootstrapDriverDiagnosticCount =
                 bootstrapDriverDiagnosticCount + 1
         }
@@ -1218,16 +1177,16 @@ fun bootstrapCompileGlobalsKeep(
         val encoded = bootstrapCompileGlobalEncode(values[index])
         var slot = bootstrapCompileGlobalSlot(keys[index])
         if (encoded == "") {
-            if (slot >= 0) Path("$root/$slot.value").writeTextAtomic("")
+            if (slot >= 0) Path("$root/$slot.value").writeText("")
         } else {
             var written = true
             if (slot < 0) {
                 slot = bootstrapCompileGlobalCount
                 written = Path(root).createDirectories() &&
-                    Path("$root/$slot.key").writeTextAtomic(keys[index])
+                    Path("$root/$slot.key").writeText(keys[index])
                 if (written) bootstrapCompileGlobalCount = slot + 1
             }
-            if (written) Path("$root/$slot.value").writeTextAtomic(encoded)
+            if (written) Path("$root/$slot.value").writeText(encoded)
         }
         index = index + 1
     }
