@@ -144,6 +144,56 @@ candidate. A failure publishes no artifact. The service object itself is a
 `compile val`; referring to it from runtime code is a phase diagnostic and it
 creates no runtime global.
 
+## Class and type reflection
+
+Classes and types have handles too. `compilerFindClass(name)` returns a
+class handle, and type handles come from `compilerFindType(spelling)`,
+`compilerFunctionParameterTypeHandle`, `compilerFunctionResultTypeHandle` and
+`compilerClassFieldTypeHandle`:
+
+```abla
+import "abla/io"
+import "abla/compiler"
+
+class Order(val id: int, var items: array<string>, val note: string?)
+
+fun total(order: Order, discounts: array<int>): int = 0
+
+compile fun describeOrder(): array<string> {
+    val rows: array<string> = []
+    val order = compilerFindClass("Order")
+    for (i in 0 until compilerClassFieldCount(order)) {
+        val mutability = if (compilerClassFieldIsMutable(order, i)) "var" else "val"
+        rows.append("$mutability ${compilerClassFieldName(order, i)}: ${compilerClassFieldType(order, i)}")
+    }
+    val type = compilerFunctionParameterTypeHandle(compiler.findFunction("total"), 1)
+    rows.append("${compilerTypeName(type)}: kind ${compilerTypeKind(type)}, element ${compilerTypeName(compilerTypeElement(type))}")
+    rows.append("string? is nullable: ${compilerTypeIsNullable(compilerFindType("string?"))}")
+    rows
+}
+
+fun main {
+    for (row in #describeOrder()) println(row)
+}
+// output:
+// val id: i64
+// var items: array:string
+// val note: nullable:string
+// array:i64: kind array, element i64
+// string? is nullable: true
+```
+
+| Function | Result |
+|---|---|
+| `compilerFindClass(name)` | a class handle, or `-1` |
+| `compilerClassFieldCount`, `compilerClassFieldName`, `compilerClassFieldType`, `compilerClassFieldIsMutable`, `compilerClassFieldTypeHandle` | the constructor properties, in order |
+| `compilerFindType(spelling)` | a type handle |
+| `compilerTypeName`, `compilerTypeKind` | the canonical spelling (`array:i64`, `nullable:string`) and its kind: `primitive`, `nominal` (classes and named types), `nullable`, `array`, `shared`, `weak`, `mutex`, `borrow`, `function`, `function.mutable`, `function.once` or `pointer` |
+| `compilerTypeIsNullable`, `compilerTypeIsAffine` | flags |
+| `compilerTypeArgumentCount`, `compilerTypeArgument`, `compilerTypeElement`, `compilerTypeResult` | the parts of generic, array and function types |
+| `compilerTypeDeclaration(type)` | the class handle of a class type, or `-1` |
+| `compilerFunctionGenericSubstitutionCount/Name/TypeHandle` | reserved: zero until generic declarations exist |
+
 ## Independent modules and declaration blocks
 
 `compiler.function(name)` turns a resolved function declaration into a
