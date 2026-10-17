@@ -1047,7 +1047,8 @@ and blocks. From the tightest binding to the loosest:
 Two traps follow from the table:
 
 - Bitwise operators bind more loosely than comparisons, so
-  `x & 1 == 0` means `x & (1 == 0)`, which is `bitwise.type`. Write
+  `x & 1 == 0` means `x & (1 == 0)`, which is `bitwise.type` (its help says
+  to parenthesize). Write
   `(x & 1) == 0`.
 - `^name` projects a delegated binding, and it covers the member chain after
   it: write `(^volume).maximum`
@@ -1319,7 +1320,8 @@ fun main {
 ```
 
 - Imports are top-level declarations. A module is loaded once however many
-  modules import it, and import cycles are detected.
+  modules import it, and import cycles are detected. A path that names no
+  file is `E_IMPORT_NOT_FOUND`.
 - Without an alias, every top-level declaration of the imported module is
   visible by its short name. Two unaliased imports that expose the same name
   make that name ambiguous: `E_IMPORT_UNQUALIFIED_AMBIGUOUS`. Source order

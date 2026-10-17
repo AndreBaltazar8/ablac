@@ -34,12 +34,22 @@ fun main {
 // error: region.escape:assignment.saved
 ```
 
-The rest of this page gives the complete rules.
+Strings built inside the region count too, including the result of `+` and
+of a `when` branch:
 
-> Known issue (being fixed by coordinator): a string built with `+` inside a region can currently be
-> assigned to an outer variable without an error, and is corrupted when the
-> memory is reused. Don't assign strings computed inside a region to outer
-> variables.
+```abla error
+fun main {
+    var saved = ""
+    val n = region {
+        val name = "a"
+        saved = name + "b"
+        0
+    }
+}
+// error: region.escape:assignment.saved
+```
+
+The rest of this page gives the complete rules.
 
 ## Why a checked form
 

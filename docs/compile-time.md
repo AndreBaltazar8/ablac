@@ -485,6 +485,7 @@ compiler team tracks the remaining gaps case by case.
 | `extern:"c"` functions, trusted raw memory | not yet: being added behind the `trusted.native` capability |
 | Fixed-width and nominal conversions (`u16(x)`, `Pin(x)`), integer extension methods | partly: being fixed |
 | Run-time globals | see [above](#ordinary-globals-at-compile-time) |
+| Process arguments (`processArgumentCount()`) | works: compile-time code sees none, so the count is 0; no capability needed |
 
 So, for now, compile-time code cannot print. When ct-native lands the
 system-call mapping, `println` under `#` will write to the compiler's own

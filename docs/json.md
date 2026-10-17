@@ -251,11 +251,17 @@ Keys must be strings; a key of another type is a compile error at that key.
 A key repeated within one literal object is a compile error, and so is a
 trailing comma in an object or array.
 
-> Known issue (being fixed by coordinator): today a repeated key is accepted
-> (and serialized twice), a trailing comma is reported as "expected `:` after
-> a $json object key", and a value of an unsupported type is reported as
-> `call.overload-no-match:ablaJsonValue(...)` instead of an error listing
-> the accepted types.
+A value of another type is rejected with a help line listing the accepted
+types.
+
+```abla error
+import "abla/json"
+
+fun main {
+    val document = $json {"name": "a", "name": "b"}
+}
+// error: duplicate key "name" in a $json object
+```
 An Abla expression that starts with `{` or `[` (a lambda or an array literal)
 goes in parentheses. So does a top-level value followed by an operator that
 should apply to the result: `($jsons count()) == expected`.

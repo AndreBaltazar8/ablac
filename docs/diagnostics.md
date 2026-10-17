@@ -127,6 +127,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `compile.value-runtime:<name>` | run-time code reads a `compile val`/`compile var` |
 | `compile.result: ...` | a `#` result that can't become a program value |
 | `declaration.block.compile-only` | a declaration block in run-time code |
+| `subparser.unknown:<name>` | `$name` is not registered by any imported module; the help names the usual import (`abla/json` for `$json`) |
 | `E_EXT_SUBPARSER_REGISTRATION`, `E_EXT_SUBPARSER_COLLISION` | a bad or duplicate `$name` registration ([subparsers.md](subparsers.md)) |
 | `E_SUBPARSER_INVOCATION`, `E_SUBPARSER_FAILURE` | a subparser handler failed or reported an error |
 | `E_EXT_GENERATED_MODULE_REQUEST`, `E_EXT_GENERATED_SEMANTIC`, `E_EXT_GENERATED_PROVENANCE`, `E_EXT_NAMESPACE_*` | a generated module was rejected |
@@ -142,6 +143,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | Code | Meaning |
 |---|---|
 | `E_NO_MAIN` | the entry module has no `fun main` |
+| `E_IMPORT_NOT_FOUND` | an imported file doesn't exist; the message names the path it looked for |
 | `E_IMPORT_UNQUALIFIED_AMBIGUOUS` | two unaliased imports expose the same name ([modules](language.md#modules-and-imports)) |
 | `E_IMPORT_ALIAS_*` | alias errors: duplicate alias, module imported twice, unknown member, alias used as a value |
 | `E_IMPORT_PROVIDER_*` | a source provider expression or its result is invalid ([packages.md](packages.md)) |
@@ -162,19 +164,11 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 `E_IR_*`, `E_LLVM_*`, `E_COMPILER_UNCLASSIFIED` and `E_INTERNAL` come from
 the later compiler stages. After a source error they are usually just
 consequences of it: fix the first error. On their own, they point at a gap
-in an earlier check. Some ownership mistakes are currently reported this
-way:
+in an earlier check. One mistake is currently reported this way:
 
 - Calling a `compile fun` from run-time code shows up as
   `E_LLVM_INSTRUCTION_UNSUPPORTED: function main cannot lower ... call target
   <name>` (being fixed by ct-parity).
-- An unknown `$name` subparser (usually a missing import) shows up only as
-  `E_LLVM_INSTRUCTION_UNSUPPORTED ... target subparser.placeholder` (being
-  fixed by coordinator).
-- `E_NAMED_ARGUMENT_*` errors are surrounded by internal errors, and their
-  `source[named-argument]` record lacks the file name (being fixed by
-  coordinator). An ambiguous overload is followed by a stray `call.target`
-  (being fixed by coordinator).
 
 If you hit one that doesn't follow from an earlier error, it is a compiler
 bug worth reporting with the smallest program that shows it.
