@@ -86,7 +86,8 @@ fun main {
 | `path(text)`, `Path(text)`, `currentDirectory()` | a `Path` |
 | `p.child(name)`, `p.parent()`, `p.name()`, `p.extension()`, `p.text` | path arithmetic |
 | `p.exists()`, `p.info()`, `p.revision()`, `p.isSymbolicLink()` | metadata. `FileInfo` has `size`, `kind`, `revision`, `exists()`, `isFile()`, `isDirectory()`, `modifiedMilliseconds()` |
-| `p.readText()` | the whole file as a string |
+| `p.readText()` | the whole file as a string ("" when it can't be read) |
+| `p.readTextResult()` | a `FileReadResult`: `text`, `succeeded`, `errorCode` |
 | `p.writeText(text)`, `p.appendText(text)` | write or append; `bool` success |
 | `p.writeTextAtomic(text)` | write a temporary file and rename it over `p`, so readers never see a partial file |
 | `p.createDirectories()`, `p.createParentDirectories()` | `mkdir -p` |
@@ -98,9 +99,13 @@ fun main {
 Write operations return `false` on failure instead of stopping the program.
 `readText()` returns `""` for a file that doesn't exist or can't be read, the
 same as for an empty file, so check `exists()` (or `info().isFile()`) first
-when the difference matters. A missing file's `info().size` is `-1`. A
-fallible `readTextResult()`, which reports whether the read succeeded, is
-being added by ct-native.
+when the difference matters, or use `readTextResult()`. A missing file's
+`info().size` is `-1`.
+
+`p.readTextResult()` returns a `FileReadResult`: `text`, `succeeded`, and the
+system's `errorCode` when the read failed (2 for a file that doesn't exist, 13
+for permission denied, 21 for a directory). Under `#`, a failed read is
+journaled like a successful one, so creating the file later rebuilds.
 
 ## Processes: `abla/process`
 

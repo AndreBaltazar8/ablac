@@ -114,4 +114,34 @@ grep -q 'compile.effect-denied:filesystem.write:record->ablaHostWriteFileAtomic'
     exit 1
 }
 
-echo "compile-time native: C calls, callbacks, raw memory, system calls, a manifest library and the host API; denied calls not performed"
+# abla/fs under a filesystem.read grant; println to the compiler's output.
+(cd "$cases/fs-read" && "$compiler" build main.ab -o "$output_directory/fs-read" --no-cache) \
+    > "$output_directory/fs-read.compile.out"
+grep -q 'compile time read 19 bytes' "$output_directory/fs-read.compile.out"
+expect_42 "$cases/fs-read" "$output_directory/fs-read"
+set +e
+(cd "$cases/fs-read-denied" && "$compiler" build main.ab -o "$output_directory/fs-read-denied" --no-cache) \
+    > "$output_directory/fs-read-denied.log" 2> "$output_directory/fs-read-denied.err"
+fs_denied=$?
+set -e
+[[ $fs_denied -ne 0 ]] || exit 1
+grep -q 'compile.effect-denied:filesystem.read' "$output_directory/fs-read-denied.err"
+(cd "$cases/print-only" && "$compiler" build main.ab -o "$output_directory/print-only" --no-cache) \
+    > "$output_directory/print-only.compile.out"
+grep -q 'printed at compile time: 42' "$output_directory/print-only.compile.out"
+expect_42 "$cases/print-only" "$output_directory/print-only"
+
+# A failed read is journaled: the cached build is not reused once the file exists.
+rm -rf "$cases/fs-cache/build" "$cases/fs-cache/late.txt"
+(cd "$cases/fs-cache" && "$compiler" build main.ab -o "$output_directory/fs-cache" >/dev/null)
+[[ $("$output_directory/fs-cache") == false ]] || exit 1
+printf 'now here\n' > "$cases/fs-cache/late.txt"
+(cd "$cases/fs-cache" && "$compiler" build main.ab -o "$output_directory/fs-cache" >/dev/null)
+result=$("$output_directory/fs-cache")
+rm -rf "$cases/fs-cache/build" "$cases/fs-cache/late.txt"
+[[ $result == true ]] || {
+    echo 'a cached build ignored a file that appeared after a failed compile-time read' >&2
+    exit 1
+}
+
+echo "compile-time native: C calls, callbacks, raw memory, system calls, a manifest library, the host API, abla/fs reads and println; denied calls not performed"

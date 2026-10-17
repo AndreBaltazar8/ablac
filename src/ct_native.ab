@@ -26,6 +26,8 @@ import "abla/llvm/orc"
 import "abla/float"
 import "abla/platform/host"
 import "abla/platform/host/tls"
+import "abla/io"
+import "abla/process/time"
 
 noescape extern:"c" fun dlopen(path: i64*, mode: i32): i64*
 noescape extern:"c" fun dlsym(handle: i64*, name: cstring): i64*
@@ -84,6 +86,7 @@ fun ctNativeSetEntry(path: string): void {
 fun ctNativeIntrinsicPrefix(name: string): bool =
     name.startsWith("ablaUnsafe") || name.startsWith("ablaLinux") ||
     name.startsWith("ablaRuntimePointer") || name.startsWith("__ablaRuntime") ||
+    name == "ablaRuntimeTrap" ||
     name == "nativeStackAllocate" || name == "nativeFunctionAddress"
 
 // The raw intrinsics evaluated here (the extern:"intrinsic" declarations of
@@ -113,7 +116,7 @@ fun ctNativeIntrinsic(name: string): bool =
     name == "nativeStackAllocate" || name == "nativeFunctionAddress" ||
     name == "ablaUnsafeCallVoid0" || name == "ablaUnsafeCallI32" ||
     name == "ablaUnsafeCallVoidPointer3" ||
-    name == "ablaLinuxSyscall" ||
+    name == "ablaLinuxSyscall" || name == "ablaRuntimeTrap" ||
     name == "ablaLinuxArgumentCount" || name == "ablaLinuxArgument" ||
     name == "ablaLinuxEnvironmentPointer"
 
@@ -121,7 +124,13 @@ fun ctNativeIntrinsic(name: string): bool =
 // analysis gives its declaration).
 fun ctNativeIntrinsicEffect(name: string): int =
     if (name == "ablaLinuxArgumentCount" || name == "ablaLinuxArgument" ||
-        name == "ablaLinuxEnvironmentPointer") 16 else 512
+        name == "ablaRuntimeTrap") 0
+    else if (name == "ablaLinuxEnvironmentPointer") 16
+    else 512
+
+// Whether an evaluation holds capability `effect` (0: needs none).
+fun ctNativeAllowed(evaluator: BootstrapEvaluator, effect: int): bool =
+    effect <= 0 || bootstrapCompileEffectHas(evaluator.allowedCompileEffects, effect)
 
 fun ctNativeDenied(
     var evaluator: BootstrapEvaluator,
@@ -204,11 +213,20 @@ trusted fun ctNativeEvaluateIntrinsic(
     name: string
 ): BootstrapEvalValue {
     val effect = ctNativeIntrinsicEffect(name)
-    if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, effect)) {
+    if (!ctNativeAllowed(evaluator, effect)) {
         return ctNativeDenied(evaluator, "intrinsic `$name`", effect)
     }
     if (name == "nativeFunctionAddress") {
         return ctNativeEvaluateFunctionAddress(evaluator, expression)
+    }
+    if (name == "ablaRuntimeTrap") {
+        // A run-time trap (an impossible state the runtime refuses to go on
+        // from) ends a compile-time evaluation with a diagnostic instead.
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(
+            "E_EVAL_TRAP", "compile-time evaluation reached a run-time trap"
+        )
+        return bootstrapEvalInvalid()
     }
     var result = bootstrapEvalVoid()
     if (name == "ablaUnsafeLoadU8") {
@@ -368,12 +386,12 @@ trusted fun ctNativeEvaluateIntrinsic(
             number, argument0, argument1, argument2,
             argument3, argument4, argument5
         ))
-    } else if (name == "ablaLinuxArgumentCount") {
-        result = bootstrapEvalInteger(ablaLinuxArgumentCount())
-    } else if (name == "ablaLinuxArgument") {
-        result = bootstrapEvalString(ablaLinuxArgument(
-            ctNativeArgument(evaluator, expression, 0)
-        ))
+    } else if (name == "ablaLinuxArgumentCount" || name == "ablaLinuxArgument") {
+        // A compile-time evaluation is a program run with no arguments (not
+        // the compiler's): no count, no program path.
+        val unused = ctNativeArgument(evaluator, expression, 0)
+        result = if (name == "ablaLinuxArgumentCount") bootstrapEvalInteger(0)
+            else bootstrapEvalString("")
     } else if (name == "ablaLinuxEnvironmentPointer") {
         result = bootstrapEvalInteger(
             nativePointerAddress(ablaLinuxEnvironmentPointer())
@@ -1145,11 +1163,34 @@ trusted fun ctNativeEvaluateFunctionAddress(
 // them that capability instead of walking their bodies (which would demand
 // trusted.native for the system calls inside).
 
-// The providers the evaluator performs here (ablaHostReadFile and
+// The function providers performed here, by name (ablaHostReadFile and
 // ablaHostListDirectory are the evaluator's own, in bootstrapEvaluateCallHost).
-fun ctNativeHostProvider(name: string): bool =
-    name != "ablaHostReadFile" && name != "ablaHostListDirectory" &&
-    bootstrapCompileHostProviderEffect(name) != 0
+fun ctNativeProviderName(name: string): bool =
+    if (name.startsWith("ablaHost"))
+        name != "ablaHostReadFile" && name != "ablaHostListDirectory" &&
+        bootstrapCompileHostOperationEffect(name) >= 0
+    else bootstrapCompileProviderEffect("io", "", name) >= 0 ||
+        bootstrapCompileProviderEffect("time", "", name) >= 0 ||
+        name == "currentDirectory"
+
+// The capability of the provider a call to `name` (receiver type `owner`, ""
+// for a plain function) reaches, or -1 when it reaches anything else: every
+// function of that name the program declares must be the provider.
+fun ctNativeProviderTarget(var evaluator: BootstrapEvaluator, owner: string, name: string): int {
+    var effect = -1
+    var other = false
+    var node = evaluator.firstNamed(name)
+    while (node >= 0) {
+        val declaration = evaluator.declarations[evaluator.namedDeclaration(node)]
+        if (declaration.extensionOwner == owner &&
+            (declaration.kind == "fun" || declaration.kind == "extern")) {
+            val found = bootstrapCompileDeclarationProviderEffect(declaration)
+            if (found >= 0) effect = found else other = true
+        }
+        node = evaluator.nextNamed(node)
+    }
+    if (other) -1 else effect
+}
 
 fun ctNativeValueText(values: array<BootstrapEvalValue>, index: int): string =
     if (index < values.size && values[index].kind == "string") values[index].text
@@ -1176,7 +1217,9 @@ fun ctNativeValueFlag(values: array<BootstrapEvalValue>, index: int): bool =
 // artifact is reused.
 val CT_NATIVE_INPUT_PREFIXES = [
     "abla-input:file-kind:", "abla-input:file-size:",
-    "abla-input:file-revision:", "abla-input:current-directory:"
+    "abla-input:file-revision:", "abla-input:current-directory:",
+    "abla-input:file-result:", "abla-input:symbolic-link:",
+    "abla-input:entries:"
 ]
 
 fun ctNativeHostInputPrefix(identity: string): string {
@@ -1192,6 +1235,9 @@ fun ctNativeHostInputContents(identity: string): string {
     if (prefix == "abla-input:file-kind:") "${ablaHostFileKind(path)}"
     else if (prefix == "abla-input:file-size:") "${ablaHostFileSize(path)}"
     else if (prefix == "abla-input:file-revision:") "${ablaHostFileRevision(path)}"
+    else if (prefix == "abla-input:file-result:") ctNativeReadResultText(Path(path).readTextResult())
+    else if (prefix == "abla-input:symbolic-link:") "${Path(path).isSymbolicLink()}"
+    else if (prefix == "abla-input:entries:") ctNativeEntryNames(path)
     else ablaHostCurrentDirectory()
 }
 
@@ -1201,8 +1247,8 @@ fun ctNativeEvaluateHost(
     expression: BootstrapExpression,
     name: string
 ): BootstrapEvalValue {
-    val effect = bootstrapCompileHostProviderEffect(name)
-    if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, effect)) {
+    val effect = bootstrapCompileHostOperationEffect(name)
+    if (!ctNativeAllowed(evaluator, effect)) {
         return ctNativeDenied(evaluator, "call to `$name`", effect)
     }
     val values: array<BootstrapEvalValue> = []
@@ -1217,8 +1263,8 @@ fun ctNativeHostCall(
     name: string,
     values: array<BootstrapEvalValue>
 ): BootstrapEvalValue {
-    val effect = bootstrapCompileHostProviderEffect(name)
-    if (!bootstrapCompileEffectHas(evaluator.allowedCompileEffects, effect)) {
+    val effect = bootstrapCompileHostOperationEffect(name)
+    if (!ctNativeAllowed(evaluator, effect)) {
         return ctNativeDenied(evaluator, "call to `$name`", effect)
     }
     val operation = name.slice(8, name.size)
@@ -1261,11 +1307,9 @@ fun ctNativeHostCall(
             ablaHostRemoveFile(ctNativeValueText(values, 0))
         )
     } else if (operation == "ArgumentCount") {
-        result = bootstrapEvalInteger(ablaHostArgumentCount())
+        result = bootstrapEvalInteger(0)
     } else if (operation == "Argument") {
-        result = bootstrapEvalString(
-            ablaHostArgument(ctNativeValueWord(values, 0))
-        )
+        result = bootstrapEvalString("")
     } else if (operation == "ReadStdinLine") {
         result = bootstrapEvalString(ablaHostReadStdinLine())
     } else if (operation == "StdinLineAvailable") {
@@ -1441,3 +1485,148 @@ fun ctNativeHostNetwork(
     if (result.kind == "invalid") evaluator.errors = evaluator.errors + 1
     result
 }
+
+// ---- standard-library providers: abla/fs, abla/io, abla/process/time ----
+
+fun ctNativePathValue(text: string): BootstrapEvalValue =
+    bootstrapEvalObject("Path", ["text"], [bootstrapEvalString(text)])
+
+fun ctNativePathText(value: BootstrapEvalValue): string {
+    var text = ""
+    var field = 0
+    while (field < value.fieldNames.size) {
+        if (value.fieldNames[field] == "text" && value.elements[field].kind == "string") {
+            text = value.elements[field].text
+        }
+        field = field + 1
+    }
+    text
+}
+
+fun ctNativeEntryNames(path: string): string {
+    var names = ""
+    for (entry in Path(path).entries()) names = "$names${entry.name()}\n"
+    names
+}
+
+fun ctNativeReadResultText(result: FileReadResult): string =
+    "${result.succeeded}:${result.errorCode}:${result.text}"
+
+// Performs a function provider (`effect` is its capability) on the call's
+// arguments.
+@noinline
+fun ctNativeEvaluateProvider(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    name: string,
+    effect: int
+): BootstrapEvalValue {
+    if (!ctNativeAllowed(evaluator, effect)) {
+        return ctNativeDenied(evaluator, "call to `$name`", effect)
+    }
+    if (name.startsWith("ablaHost")) return ctNativeEvaluateHost(evaluator, expression, name)
+    val values: array<BootstrapEvalValue> = []
+    for (child in expression.children) values.append(evaluator.evaluate(child))
+    var result = bootstrapEvalVoid()
+    // Output goes to the compiler's own standard output and error.
+    if (name == "print") print(ctNativeValueText(values, 0))
+    else if (name == "println") println(ctNativeValueText(values, 0))
+    else if (name == "eprint") eprint(ctNativeValueText(values, 0))
+    else if (name == "eprintln") eprintln(ctNativeValueText(values, 0))
+    else if (name == "readLine") result = bootstrapEvalString(readLine())
+    else if (name == "currentDirectory") {
+        val directory = currentDirectory().text
+        evaluator.recordCompileInput("abla-input:current-directory:", directory)
+        result = ctNativePathValue(directory)
+    } else if (name == "sleep") sleep(ctNativeValueWord(values, 0))
+    else if (name == "sleepNanoseconds") {
+        result = bootstrapEvalBoolean(sleepNanoseconds(ctNativeValueWord(values, 0)))
+    } else if (name == "monotonicNanoseconds") result = bootstrapEvalInteger(monotonicNanoseconds())
+    else if (name == "monotonicMilliseconds") result = bootstrapEvalInteger(monotonicMilliseconds())
+    else if (name == "realtimeNanoseconds") result = bootstrapEvalInteger(realtimeNanoseconds())
+    else if (name == "realtimeMilliseconds") result = bootstrapEvalInteger(realtimeMilliseconds())
+    else {
+        evaluator.errors = evaluator.errors + 1
+        result = bootstrapEvalInvalid()
+    }
+    result
+}
+
+// Performs `Path.<method>` on an evaluated receiver; `arguments` holds the
+// call's children and the method's arguments start at `first`. Every
+// observation is journaled under an identity bootstrapCompileInputContents
+// re-observes, so a cached build is reused only while the answer is the same.
+@noinline
+fun ctNativeEvaluatePathMethod(
+    var evaluator: BootstrapEvaluator,
+    receiver: BootstrapEvalValue,
+    method: string,
+    arguments: array<BootstrapExpression>,
+    first: int,
+    effect: int
+): BootstrapEvalValue {
+    if (!ctNativeAllowed(evaluator, effect)) {
+        return ctNativeDenied(evaluator, "call to `Path.$method`", effect)
+    }
+    var index = first
+    while (index < arguments.size) {
+        val unused = evaluator.evaluate(arguments[index])
+        index = index + 1
+    }
+    val path = ctNativePathText(receiver)
+    var result = bootstrapEvalInvalid()
+    if (method == "readText") {
+        val contents = Path(path).readText()
+        evaluator.recordCompileInput(path, contents)
+        result = bootstrapEvalString(contents)
+    } else if (method == "readTextResult") {
+        val read = Path(path).readTextResult()
+        evaluator.recordCompileInput("abla-input:file-result:$path", ctNativeReadResultText(read))
+        result = bootstrapEvalObject(
+            "FileReadResult", ["text", "succeeded", "errorCode"],
+            [bootstrapEvalString(read.text), bootstrapEvalBoolean(read.succeeded),
+             bootstrapEvalInteger(read.errorCode)]
+        )
+    } else if (method == "exists" || method == "info" || method == "revision") {
+        val info = Path(path).info()
+        evaluator.recordCompileInput("abla-input:file-kind:$path", "${info.kind}")
+        if (method == "exists") {
+            result = bootstrapEvalBoolean(info.exists())
+        } else {
+            evaluator.recordCompileInput("abla-input:file-revision:$path", "${info.revision}")
+            if (method == "revision") {
+                result = bootstrapEvalInteger(info.revision)
+            } else {
+                evaluator.recordCompileInput("abla-input:file-size:$path", "${info.size}")
+                result = bootstrapEvalObject(
+                    "FileInfo", ["path", "kind", "size", "revision"],
+                    [ctNativePathValue(path), bootstrapEvalInteger(info.kind),
+                     bootstrapEvalInteger(info.size), bootstrapEvalInteger(info.revision)]
+                )
+            }
+        }
+    } else if (method == "isSymbolicLink") {
+        val link = Path(path).isSymbolicLink()
+        evaluator.recordCompileInput("abla-input:symbolic-link:$path", "$link")
+        result = bootstrapEvalBoolean(link)
+    } else if (method == "entries") {
+        val elements: array<BootstrapEvalValue> = []
+        var names = ""
+        for (entry in Path(path).entries()) {
+            elements.append(ctNativePathValue(entry.text))
+            names = "$names${entry.name()}\n"
+        }
+        evaluator.recordCompileInput("abla-input:entries:$path", names)
+        result = bootstrapEvalArray(elements)
+    } else {
+        evaluator.errors = evaluator.errors + 1
+    }
+    result
+}
+
+// `p.method(...)` on a Path when that method is a provider (-1 otherwise).
+fun ctNativePathProvider(var evaluator: BootstrapEvaluator, receiver: BootstrapEvalValue, method: string): int =
+    if (receiver.kind == "object" && receiver.owner == "Path" &&
+        bootstrapCompileProviderEffect("fs", "Path", method) >= 0)
+        ctNativeProviderTarget(evaluator, "Path", method)
+    else -1

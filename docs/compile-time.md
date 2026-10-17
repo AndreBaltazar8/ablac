@@ -336,10 +336,10 @@ compileCapabilities = ["filesystem.read"]
 hello from a file
 ```
 
-The intended way to read a file at compile time is the same `abla/fs` API
-as at run time, under the `filesystem.read` grant:
+A file is read at compile time with the same `abla/fs` API as at run time,
+under the `filesystem.read` grant:
 
-```abla fragment
+```abla
 import "abla/io"
 import "abla/fs"
 import "abla/compiler"
@@ -347,22 +347,6 @@ import "abla/compiler"
 #compilerGrant("filesystem.read")
 
 val greeting = #path("greeting.txt").readText()
-```
-
-That form doesn't work yet: `abla/fs` ends in system calls, which compile-time
-evaluation can't make yet (being added by ct-native; the build currently
-stops with `compile.effect-denied:trusted.native`). Until then, use the
-host runtime's file function. It is internal and will go away once the
-`abla/fs` form works:
-
-```abla
-import "abla/io"
-import "abla/compiler"
-import "abla/platform/host"
-
-#compilerGrant("filesystem.read")
-
-val greeting = #ablaHostReadFile("greeting.txt")
 
 fun main {
     print(greeting)
@@ -371,7 +355,7 @@ fun main {
 // hello from a file
 ```
 
-Without the grant, the build stops with `compile.effect-denied:filesystem.read:ablaHostReadFile`.
+Without the grant, the build stops with `compile.effect-denied:filesystem.read`.
 Without the manifest entry, it stops with `compile.capability-not-authorized:filesystem.read`.
 In a package, a dependency's `compileCapabilities` must be a subset of the
 root project's (`E_PACKAGE_CAPABILITY_DENIED`).
@@ -383,18 +367,25 @@ The check happens before evaluation starts, so a denied path never runs.
 
 | Capability | What it allows | Providers | Native object cache |
 |---|---|---|---|
-| `filesystem.read` | read files, list directories | `abla/fs` (coming); today the internal `ablaHostReadFile(path)`, `ablaHostListDirectory(path)` (sorted) | kept: each read is journaled and revalidated |
+| `filesystem.read` | read files, list directories, file metadata | `abla/fs`: `p.readText()`, `p.readTextResult()`, `p.exists()`, `p.info()`, `p.revision()`, `p.isSymbolicLink()`, `p.entries()`, `currentDirectory()` (the internal `ablaHostReadFile`/`ablaHostListDirectory` too) | kept: each read is journaled and revalidated, a failed one too |
 | `filesystem.write` | stage output files, published only if the build succeeds | `compilerWriteFile(path, contents)` | disabled |
 | `environment` | read named environment variables | `compilerEnvironment(name)` (`""` when unset) | kept: each value is journaled and revalidated |
 | `process.io` | run a child process | `compilerRunProcess(arguments)` | disabled |
 | `network` | one TCP request/response | `compilerTcpExchange(ipv4, port, request, maxBytes, timeoutMs)` | disabled |
-| `clock` | read the wall clock | `compilerClockMilliseconds()` | disabled |
+| `clock` | read the clocks, sleep | `compilerClockMilliseconds()`; `abla/process/time`'s `sleep`, `monotonicMilliseconds()`, `realtimeMilliseconds()` and their nanosecond forms | disabled |
 | `random` | random integers | `compilerRandomInteger(maxExclusive)` | disabled |
 | `trusted.native` | run trusted and `extern` code (raw memory, C functions, system calls) | see [below](#what-works-at-compile-time-today) | disabled |
 
-The `compiler*` providers come from `import "abla/compiler"`. The
-`ablaHost*` file functions come from `import "abla/platform/host"`. File
-paths are relative to the directory the compiler runs in.
+The `compiler*` providers come from `import "abla/compiler"`. File paths are
+relative to the directory the compiler runs in.
+
+`print`, `println`, `eprint` and `eprintln` need no capability: under `#` they
+write to the compiler's own standard output and error. What a compilation
+prints is not an input of the build, so it changes neither the program nor
+whether a cached build is reused (a cached build just doesn't print again,
+like a warning). Reading standard input (`readLine`) needs `process.io`. A
+compile-time evaluation is a program the compiler runs with no arguments:
+`processArgumentCount()` is 0 under `#`.
 
 Bounds:
 
@@ -500,8 +491,9 @@ The rest of `abla/platform/host` works in both phases too: a compiled program
 links its functions, and compile-time code performs each under the capability
 it implies — `ablaHostFileKind`, `FileSize`, `FileRevision` and
 `CurrentDirectory` are `filesystem.read` (journaled like a read); writes, moves
-and removals `filesystem.write`; `Argument`/`ArgumentCount` `environment`;
-standard streams and processes `process.io`; `Net*` (and the `Tls*` functions
+and removals `filesystem.write`; standard output and error none (and
+`Argument`/`ArgumentCount` none: there are no arguments under `#`); standard
+input and processes `process.io`; `Net*` (and the `Tls*` functions
 of `abla/platform/host/tls`) `network`; `Sleep` and `MonotonicMilliseconds`
 `clock`; `SecureRandom` `random`.
 
@@ -603,17 +595,17 @@ compiler team tracks the remaining gaps case by case.
 | Delegated bindings, resources and `drop`, ownership checks | works |
 | Granted capabilities through the providers above | works |
 | Closures as `#` results | works |
-| `print`/`println`, `abla/fs`, `abla/process`, sockets: anything that ends in a system call | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
+| `print`/`println` | works, no grant: to the compiler's standard output |
+| `abla/fs` reads, `abla/process/time` | works with `filesystem.read` / `clock` |
+| Other system calls (`abla/fs` writes, processes, sockets) | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
 | `extern:"c"` functions, trusted raw memory, `nativeFunctionAddress` callbacks | works with `trusted.native` |
 | `abla/platform/host` | works: each function under the capability it implies |
 | Fixed-width integer conversions (`u16(x)`); nominal conversions (`Pin(x)`), integer extension methods | fixed-width works; the rest partly: being fixed |
 | Run-time globals | see [above](#ordinary-globals-at-compile-time) |
 | Process arguments (`processArgumentCount()`) | works: compile-time code sees none, so the count is 0; no capability needed |
 
-Without `trusted.native`, compile-time code cannot print yet; `println` under
-`#` without a grant, writing to the compiler's standard output, is coming. To
-inspect what it computes, return the value with `#` and print it at run time,
-or stage a file with `compilerWriteFile`.
+Compile-time code prints with `println` like any program; its output is
+the compiler's.
 
 ## How a compilation runs
 

@@ -1,12 +1,47 @@
-// The compile capabilities of abla/platform/host's providers, for the
-// semantic effect analysis (sema.ab) and the evaluator (ct_native.ab).
+// Compile-time providers: standard-library entry points whose compile
+// capability is fixed by what they do, not inferred from their bodies (which
+// reach system calls and raw memory, i.e. trusted.native). The semantic effect
+// analysis (sema.ab) gives such a declaration its capability and does not walk
+// its body; the evaluator (ct_native.ab) performs the call with the compiler's
+// own copy of the same function, journaling what it observes, and the JIT tier
+// bridges the same declarations to the evaluator.
+//
+// A provider is matched by its module (a file of the standard library), its
+// receiver type for an extension method, and its name, so a program's own
+// function of the same name is never one.
 
 import "parser.ab"
 import "abla/text"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
 
-// The compile capability of a host provider (0 when `name` is not one).
-fun bootstrapCompileHostProviderEffect(name: string): int {
-    if (!name.startsWith("ablaHost")) return 0
+// The capability of the provider `name` of `module` ("host", "fs", "io",
+// "time") with receiver `owner` ("" for a plain function): an effect bit, 0
+// for none (output, the compiler's empty process arguments), -1 when it is
+// not a provider.
+fun bootstrapCompileProviderEffect(module: string, owner: string, name: string): int {
+    if (module == "host" && owner == "") return bootstrapCompileHostOperationEffect(name)
+    if (module == "fs" && owner == "Path") {
+        if (name == "readText" || name == "readTextResult" || name == "exists" ||
+            name == "info" || name == "revision" || name == "isSymbolicLink" ||
+            name == "entries") return 4
+    }
+    if (module == "fs" && owner == "" && name == "currentDirectory") return 4
+    if (module == "io" && owner == "") {
+        if (name == "print" || name == "println" || name == "eprint" ||
+            name == "eprintln") return 0
+        if (name == "readLine") return 32
+    }
+    if (module == "time" && owner == "") {
+        if (name == "sleep" || name == "sleepNanoseconds" ||
+            name == "monotonicNanoseconds" || name == "monotonicMilliseconds" ||
+            name == "realtimeNanoseconds" || name == "realtimeMilliseconds") return 128
+    }
+    -1
+}
+
+fun bootstrapCompileHostOperationEffect(name: string): int {
+    if (!name.startsWith("ablaHost")) return -1
     val operation = name.slice(8, name.size)
     if (operation == "ReadFile" || operation == "FileKind" ||
         operation == "FileSize" || operation == "ListDirectory" ||
@@ -15,9 +50,11 @@ fun bootstrapCompileHostProviderEffect(name: string): int {
         operation == "CreateParentDirectories" ||
         operation == "CreateDirectories" || operation == "MoveFile" ||
         operation == "RemoveFile") return 8
-    if (operation == "ArgumentCount" || operation == "Argument") return 16
+    // A compile-time evaluation is a program the compiler runs with no
+    // arguments, and what it writes is output, not an input of the build.
+    if (operation == "ArgumentCount" || operation == "Argument" ||
+        operation == "WriteStdout" || operation == "WriteStderr") return 0
     if (operation == "ReadStdinLine" || operation == "StdinLineAvailable" ||
-        operation == "WriteStdout" || operation == "WriteStderr" ||
         operation == "ProcessorCount" || operation == "RunProcess" ||
         operation == "CaptureProcess" || operation == "StartProcess" ||
         operation == "StartProcessConfigured" || operation == "PollProcess" ||
@@ -26,22 +63,58 @@ fun bootstrapCompileHostProviderEffect(name: string): int {
     if (operation.startsWith("Net") || operation.startsWith("Tls")) return 64
     if (operation == "Sleep" || operation == "MonotonicMilliseconds") return 128
     if (operation == "SecureRandom") return 256
-    0
+    -1
 }
 
-// Whether a declaration is one of the host API's providers (a function of the
-// standard library's abla/platform/host or abla/platform/host/tls).
-fun bootstrapCompileHostProvider(declaration: BootstrapDeclaration): bool {
-    if (declaration.kind != "fun" || declaration.extensionOwner != "") {
-        return false
+// The provider module a declaration belongs to ("" for none): its source must
+// be the named file of the standard library in use.
+var bootstrapCompileProviderRoot: string = ""
+
+fun bootstrapCompileProviderStandardLibrary(): string {
+    if (bootstrapCompileProviderRoot == "") {
+        val configured = linuxEnvironment("ABLA_STDLIB")
+        val sysroot = linuxEnvironment("ABLA_SYSROOT")
+        var root = Path(if (sysroot.found && sysroot.value != "") sysroot.value else ".").child("stdlib").text
+        if (configured.found && configured.value != "") root = configured.value
+        bootstrapCompileProviderRoot = root
     }
+    bootstrapCompileProviderRoot
+}
+
+fun bootstrapCompileProviderModule(declaration: BootstrapDeclaration): string {
+    var source = declaration.sourceIdentity
+    if (source == "") source = bootstrapCanonicalDeclarationModuleIdentity(declaration.name)
+    val root = bootstrapCompileProviderStandardLibrary()
+    var relative = ""
+    if (source.startsWith("$root/")) relative = source.slice(root.size + 1, source.size)
+    if (relative == "abla/platform/host/entry.ab" ||
+        relative == "abla/platform/host/tls/entry.ab") "host"
+    else if (relative == "abla/sys/linux/fs/entry.ab") "fs"
+    else if (relative == "abla/io/entry.ab") "io"
+    else if (relative == "abla/process/time/entry.ab") "time"
+    else ""
+}
+
+// A declaration's provider capability (-1 when it is not a provider).
+fun bootstrapCompileDeclarationProviderEffect(declaration: BootstrapDeclaration): int {
+    if (declaration.kind != "fun") return -1
     val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
-    if (bootstrapCompileHostProviderEffect(name) == 0) return false
-    var module = declaration.sourceIdentity
-    if (module == "") {
-        module = bootstrapCanonicalDeclarationModuleIdentity(declaration.name)
-    }
-    module.endsWith("abla/platform/host/entry.ab") ||
-        module.endsWith("abla/platform/host/tls/entry.ab") ||
-        module == "abla/platform/host" || module == "abla/platform/host/tls"
+    // Cheap test first: most declarations are no provider's name.
+    if (bootstrapCompileProviderEffect("host", "", name) < 0 &&
+        bootstrapCompileProviderEffect("fs", declaration.extensionOwner, name) < 0 &&
+        bootstrapCompileProviderEffect("io", declaration.extensionOwner, name) < 0 &&
+        bootstrapCompileProviderEffect("time", declaration.extensionOwner, name) < 0) return -1
+    val module = bootstrapCompileProviderModule(declaration)
+    if (module == "") -1
+    else bootstrapCompileProviderEffect(module, declaration.extensionOwner, name)
+}
+
+fun bootstrapCompileHostProvider(declaration: BootstrapDeclaration): bool =
+    bootstrapCompileDeclarationProviderEffect(declaration) >= 0
+
+// The name the evaluator dispatches a provider by: `name`, or `Owner.name`
+// for an extension method (whose receiver is then the call's first child).
+fun bootstrapCompileProviderKey(declaration: BootstrapDeclaration): string {
+    val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
+    if (declaration.extensionOwner == "") name else "${declaration.extensionOwner}.$name"
 }
