@@ -1,8 +1,10 @@
 // Receiver members by plain name. Inside a class's methods and an extension
-// function's body, a call `name(...)` to a method of the receiver's type (its
-// own or an extension of that type) or to one of its fields (a function value,
-// called as `this.name(...)` calls it when no method has that name) means
-// `this.name(...)`, and in an
+// function's body, a call `name(...)` that a method of the receiver's type (its
+// own or an extension of that type) or one of its function-typed fields takes
+// (the arity fits) means `this.name(...)`; a member that doesn't take the
+// arguments, and a field of any other type, leave the call to the top-level
+// declarations (a method still captures it when no top-level declaration has
+// the name, so the error is about the method). In an
 // extension function a plain read or assignment of one of the receiver's fields
 // means `this.field` (a method reaches its own fields already). A name the body
 // binds itself (a parameter, local, loop variable or lambda parameter, anywhere
@@ -18,7 +20,10 @@ import "staged_parser.ab"
 
 class BootstrapReceiverMembers(
     val methods: array<string>,
-    val fields: array<string>
+    val methodMinimums: array<int>,
+    val methodParameters: array<array<string>>,
+    val fields: array<string>,
+    val fieldTypes: array<string>
 )
 
 fun bootstrapReceiverNameIn(names: array<string>, name: string): bool {
@@ -40,9 +45,30 @@ class BootstrapReceiverIndex(
             index = index + 1
         }
         this.owners.append(normalized)
-        this.members.append(BootstrapReceiverMembers([], []))
+        this.members.append(BootstrapReceiverMembers([], [], [], [], []))
         this.members[this.members.size - 1]
     }
+}
+
+/** How many of `declaration`'s parameters a call must pass: those before the
+ *  last one without a default. */
+fun bootstrapReceiverMinimumArguments(declaration: BootstrapDeclaration): int {
+    var minimum = 0
+    var index = 0
+    while (index < declaration.parameters.size) {
+        val defaulted = index < declaration.parameterDefaults.size &&
+            declaration.parameterDefaults[index].kind != "missing"
+        if (!defaulted) minimum = index + 1
+        index = index + 1
+    }
+    minimum
+}
+
+fun bootstrapReceiverAddMethod(var members: BootstrapReceiverMembers, method: BootstrapDeclaration): void {
+    members.methods.append(method.name)
+    members.methodMinimums.append(bootstrapReceiverMinimumArguments(method))
+    members.methodParameters.append(method.parameters)
+    return
 }
 
 fun bootstrapReceiverIndex(declarations: array<BootstrapDeclaration>): BootstrapReceiverIndex {
@@ -52,7 +78,7 @@ fun bootstrapReceiverIndex(declarations: array<BootstrapDeclaration>): Bootstrap
             val members = index.of(declaration.name)
             for (method in declaration.methods) {
                 if (method.kind == "fun" || method.kind == "compile.fun") {
-                    members.methods.append(method.name)
+                    bootstrapReceiverAddMethod(members, method)
                 }
             }
             var parameter = 0
@@ -61,16 +87,84 @@ fun bootstrapReceiverIndex(declarations: array<BootstrapDeclaration>): Bootstrap
                     (declaration.parameterKinds[parameter] == "val" ||
                      declaration.parameterKinds[parameter] == "var")) {
                     members.fields.append(declaration.parameters[parameter])
+                    members.fieldTypes.append(
+                        if (parameter < declaration.parameterTypes.size)
+                            declaration.parameterTypes[parameter] else ""
+                    )
                 }
                 parameter = parameter + 1
             }
         }
         if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
             declaration.extensionOwner != "") {
-            index.of(declaration.extensionOwner).methods.append(declaration.name)
+            val members = index.of(declaration.extensionOwner)
+            bootstrapReceiverAddMethod(members, declaration)
         }
     }
     index
+}
+
+/** The top-level names a plain call can reach: functions, constructors,
+ *  values (a function value is called too). */
+fun bootstrapReceiverGlobalNames(declarations: array<BootstrapDeclaration>): array<string> {
+    val names: array<string> = []
+    for (declaration in declarations) {
+        if (declaration.extensionOwner == "" &&
+            (declaration.kind == "fun" || declaration.kind == "compile.fun" ||
+             declaration.kind == "extern" || declaration.kind == "class" ||
+             declaration.kind == "val" || declaration.kind == "var")) {
+            names.append(declaration.name)
+        }
+    }
+    names
+}
+
+/** Whether a plain call of `name` reaches something outside the receiver: a
+ *  top-level declaration, a built-in constructor or a scalar conversion. */
+fun bootstrapReceiverGlobalCallable(globals: array<string>, name: string): bool =
+    bootstrapReceiverNameIn(globals, name) ||
+    name == "move" || name == "Shared" || name == "Mutex" || name == "Cell" ||
+    name == "Map" || name == "filledArray" ||
+    bootstrapScalarTypeUnderlyingValid(bootstrapNormalizeType(name))
+
+/** Whether a receiver method or function-typed field named like `call` takes
+ *  its arguments: a method whose arity fits (defaults may be left out, a named
+ *  argument must name a parameter), or a field of a function type with that
+ *  many parameters and no named arguments. A field of any other type never
+ *  takes a call. */
+fun bootstrapReceiverTakes(
+    members: BootstrapReceiverMembers,
+    call: BootstrapExpression,
+    arguments: array<BootstrapExpression>
+): bool {
+    var named = false
+    for (argument in arguments) if (argument.kind == "named.argument") named = true
+    var method = 0
+    while (method < members.methods.size) {
+        if (members.methods[method] == call.text &&
+            arguments.size >= members.methodMinimums[method] &&
+            arguments.size <= members.methodParameters[method].size) {
+            var fits = true
+            for (argument in arguments) {
+                if (argument.kind == "named.argument" &&
+                    !bootstrapReceiverNameIn(members.methodParameters[method], argument.text)) {
+                    fits = false
+                }
+            }
+            if (fits) return true
+        }
+        method = method + 1
+    }
+    var field = 0
+    while (field < members.fields.size) {
+        if (members.fields[field] == call.text && !named) {
+            val type = bootstrapNormalizeType(members.fieldTypes[field])
+            if (bootstrapIsFunctionType(type) &&
+                bootstrapFunctionParameterCount(type) == arguments.size) return true
+        }
+        field = field + 1
+    }
+    false
 }
 
 /** The names `expression` binds anywhere inside it. */
@@ -96,22 +190,25 @@ fun bootstrapReceiverRewrite(
     expression: BootstrapExpression,
     members: BootstrapReceiverMembers,
     bound: array<string>,
-    extension: bool
+    extension: bool,
+    globals: array<string>
 ): BootstrapExpression {
     val children: array<BootstrapExpression> = []
     var changed = false
     for (child in expression.children) {
-        val rewritten = bootstrapReceiverRewrite(child, members, bound, extension)
+        val rewritten = bootstrapReceiverRewrite(child, members, bound, extension, globals)
         if (rewritten != child) changed = true
         children.append(rewritten)
     }
     val name = expression.text
     if (name != "" && !bootstrapReceiverNameIn(bound, name)) {
-        var named = false
-        for (child in children) if (child.kind == "named.argument") named = true
-        if (expression.kind == "call" && !named &&
-            (bootstrapReceiverNameIn(members.methods, name) ||
-             bootstrapReceiverNameIn(members.fields, name))) {
+        // A receiver member captures the call when it takes these arguments;
+        // otherwise the call goes on to the top-level declarations, unless
+        // none has the name, so the error names the receiver's method.
+        if (expression.kind == "call" &&
+            (bootstrapReceiverTakes(members, expression, children) ||
+             (bootstrapReceiverNameIn(members.methods, name) &&
+              !bootstrapReceiverGlobalCallable(globals, name)))) {
             val arguments: array<BootstrapExpression> = [bootstrapReceiverThis(expression)]
             for (child in children) arguments.append(child)
             return BootstrapExpression("member.call", name, expression.begin, expression.end, arguments)
@@ -138,19 +235,21 @@ fun bootstrapReceiverRewrite(
 fun bootstrapReceiverRewriteBody(
     declaration: BootstrapDeclaration,
     members: BootstrapReceiverMembers,
-    extension: bool
+    extension: bool,
+    globals: array<string>
 ): BootstrapDeclaration {
     var bound: array<string> = []
     for (parameter in declaration.parameters) bound.append(parameter)
     bootstrapReceiverBoundNames(declaration.expression, bound)
     bootstrapDeclarationWithExpression(
         declaration,
-        bootstrapReceiverRewrite(declaration.expression, members, bound, extension)
+        bootstrapReceiverRewrite(declaration.expression, members, bound, extension, globals)
     )
 }
 
 fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseResult {
     var index = bootstrapReceiverIndex(parsed.declarations)
+    val globals = bootstrapReceiverGlobalNames(parsed.declarations)
     val declarations: array<BootstrapDeclaration> = []
     var changed = false
     for (declaration in parsed.declarations) {
@@ -159,7 +258,7 @@ fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseR
             val members = index.of(declaration.name)
             val methods: array<BootstrapDeclaration> = []
             for (method in declaration.methods) {
-                methods.append(bootstrapReceiverRewriteBody(method, members, false))
+                methods.append(bootstrapReceiverRewriteBody(method, members, false, globals))
             }
             rewritten = bootstrapDeclarationWithMethods(declaration, methods)
             changed = true
@@ -168,7 +267,7 @@ fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseR
             declaration.extensionOwner != "") {
             val members = index.of(declaration.extensionOwner)
             if (members.methods.size > 0 || members.fields.size > 0) {
-                rewritten = bootstrapReceiverRewriteBody(declaration, members, true)
+                rewritten = bootstrapReceiverRewriteBody(declaration, members, true, globals)
                 changed = true
             }
         }

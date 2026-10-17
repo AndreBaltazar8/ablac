@@ -3193,13 +3193,13 @@ fun bootstrapExpressionDelegatedCompileEffects(
         bootstrapAffineNamesContain(delegatedNames, expression.text)) {
         mask = bootstrapCompileEffectLookup(summary, "setValue", true)
     }
-    // A call of a name in scope there (a parameter, an earlier local of the
-    // block, a loop variable, a lambda parameter) calls that value, not the
-    // top-level function of that name.
+    // A call that a function-typed name in scope there takes (a parameter,
+    // an earlier local of the block, a lambda parameter, with that many
+    // parameters) calls that value, not the top-level function of that name.
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
         expression.text != "Cell" && expression.text != "Map" &&
-        !bootstrapAffineNamesContain(bound, expression.text)) {
+        !bootstrapAffineNamesContain(bound, "${expression.text}#${expression.children.size}")) {
         mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,
             expression.text,
@@ -3263,20 +3263,82 @@ fun bootstrapExpressionDelegatedCompileEffects(
     mask
 }
 
-/** `bound` and the names of the first `count` of `binders`. */
+/** `name#arity` for a binding of function type by its syntax, else `name#-`
+ *  (the name, but nothing a call can be sure to reach). */
+fun bootstrapEffectBindingKey(name: string, type: string): string {
+    val normalized = bootstrapNormalizeType(type)
+    if (bootstrapIsFunctionType(normalized)) {
+        return "$name#${bootstrapFunctionParameterCount(normalized)}"
+    }
+    "$name#-"
+}
+
+/** What the first `count` of `binders` bind: a lambda parameter or local by
+ *  its declared type (a local initialized with a lambda by that lambda's
+ *  parameters), a loop variable as no function. */
+fun bootstrapEffectBinderKey(binder: BootstrapExpression): string {
+    if (binder.kind == "lambda.parameter" && binder.children.size > 0) {
+        return bootstrapEffectBindingKey(binder.text, binder.children[0].text)
+    }
+    if ((binder.kind == "local.val" || binder.kind == "local.var") &&
+        binder.children.size > 1 && binder.children[1].text != "inferred") {
+        return bootstrapEffectBindingKey(binder.text, binder.children[1].text)
+    }
+    if ((binder.kind == "local.val" || binder.kind == "local.var") &&
+        binder.children.size > 0 &&
+        (binder.children[0].kind == "lambda" || binder.children[0].kind == "lambda.move")) {
+        return "${binder.text}#${binder.children[0].children.size - 1}"
+    }
+    "${binder.text}#-"
+}
+
+/** `bound` with the first `count` of `binders` bound: each replaces what its
+ *  name meant before. */
 fun bootstrapEffectBind(
     bound: array<string>,
     binders: array<BootstrapExpression>,
     count: int
 ): array<string> {
-    val names: array<string> = []
-    for (name in bound) names.append(name)
+    val keys: array<string> = []
     var index = 0
     while (index < count && index < binders.size) {
-        names.append(binders[index].text)
+        keys.append(bootstrapEffectBinderKey(binders[index]))
         index = index + 1
     }
+    bootstrapEffectBindKeys(bound, keys)
+}
+
+fun bootstrapEffectBindKeys(bound: array<string>, keys: array<string>): array<string> {
+    val names: array<string> = []
+    for (key in bound) {
+        var replaced = false
+        for (added in keys) {
+            if (bootstrapEffectKeyName(added) == bootstrapEffectKeyName(key)) replaced = true
+        }
+        if (!replaced) names.append(key)
+    }
+    for (key in keys) names.append(key)
     names
+}
+
+fun bootstrapEffectKeyName(key: string): string {
+    var index = key.size - 1
+    while (index > 0 && key[index] != 35) index = index - 1
+    key.slice(0, index)
+}
+
+/** What `declaration`'s parameters bind, as bootstrapEffectBind keys. */
+fun bootstrapEffectParameterKeys(declaration: BootstrapDeclaration): array<string> {
+    val keys: array<string> = []
+    var index = 0
+    while (index < declaration.parameters.size) {
+        keys.append(bootstrapEffectBindingKey(
+            declaration.parameters[index],
+            if (index < declaration.parameterTypes.size) declaration.parameterTypes[index] else ""
+        ))
+        index = index + 1
+    }
+    keys
 }
 
 fun bootstrapBuildCompileEffectSummary(
@@ -3407,7 +3469,7 @@ fun bootstrapBuildCompileEffectSummary(
             entryOwners.append(declaration.extensionOwner)
             entryExpressions.append(declaration.expression)
             entryWalked.append(declaration.kind != "extern")
-            entryParameters.append(declaration.parameters)
+            entryParameters.append(bootstrapEffectParameterKeys(declaration))
         }
         var methodIndex = 0
         while (methodIndex < declaration.methods.size) {
@@ -3439,7 +3501,7 @@ fun bootstrapBuildCompileEffectSummary(
             entryOwners.append(declaration.name)
             entryExpressions.append(method.expression)
             entryWalked.append(method.kind != "extern")
-            entryParameters.append(method.parameters)
+            entryParameters.append(bootstrapEffectParameterKeys(method))
             methodIndex = methodIndex + 1
         }
         declarationIndex = declarationIndex + 1
@@ -5352,10 +5414,18 @@ class BootstrapAnalyzer(
         if (result == "unknown" && this.currentOwner != "") {
             result = this.fieldType(this.currentOwner, name)
         }
-        if (result == "unknown") {
-            val index = this.symbolIndex(name)
-            if (index >= 0) result = this.symbols[index].type
+        if (result == "unknown") result = this.findTopLevelType(name)
+        else if (bootstrapIsDelegatedType(result)) {
+            result = bootstrapDelegatedExposedType(result)
         }
+        result
+    }
+
+    /** The type of the top-level binding `name`, past any local or field. */
+    fun findTopLevelType(name: string): string {
+        var result = "unknown"
+        val index = this.symbolIndex(name)
+        if (index >= 0) result = this.symbols[index].type
         if (result == "unknown" && name == "github") {
             result = "function:(string)->ImportSource"
         }
@@ -5560,6 +5630,19 @@ class BootstrapAnalyzer(
 
     /** Whether `name` here is a visible local or (in a method) a field: then it
      *  isn't the top-level binding of that name, in any module. */
+    /** Whether a call `name(...)` calls a visible local or parameter: one of
+     *  function type that takes `arguments` arguments (or of a type not known
+     *  yet). A local of another type or arity leaves the call to the top-level
+     *  declarations; a receiver member that
+     *  takes the call was made `this.name(...)` already (receiver_names.ab). */
+    fun callsLocal(name: string, arguments: int): bool {
+        if (!this.hasVisibleLocal(name)) return false
+        val type = bootstrapBorrowElementType(this.findType(name))
+        type == "unknown" || (bootstrapIsFunctionType(type) &&
+            (bootstrapFunctionParameterCount(type) < 0 ||
+             bootstrapFunctionParameterCount(type) == arguments))
+    }
+
     fun shadowsGlobal(name: string): bool =
         this.hasVisibleLocal(name) || (this.currentOwner != "" &&
             this.fieldType(this.currentOwner, name) != "unknown")
@@ -9808,9 +9891,9 @@ fun bootstrapInferCall(
     initial: string
 ): string {
     var result = initial
-    // A local, parameter or field of function type is called as itself: no
+    // A local or parameter of function type is called as itself: no
     // top-level declaration of the same name describes it.
-    val localCallable = analyzer.shadowsGlobal(expression.text)
+    val localCallable = analyzer.callsLocal(expression.text, expression.children.size)
     if (!localCallable && analyzer.regionDepth > 0 &&
         bootstrapRegionCallIsUnsafe(
             analyzer.regionCalls,
@@ -9839,7 +9922,10 @@ fun bootstrapInferCall(
         analyzer.trustedDepth == 0) {
         analyzer.fail("native.trust:${expression.text}")
     }
-    val functionType = analyzer.findType(expression.text)
+    // A call no local takes goes to the top-level declaration of its name,
+    // past a local or field of the same name that isn't a function.
+    val functionType = if (localCallable) analyzer.findType(expression.text)
+        else analyzer.findTopLevelType(expression.text)
     val externalLibrary = if (localCallable) "" else analyzer.functionExternalLibrary(
         expression.text
     )
@@ -9884,7 +9970,7 @@ fun bootstrapInferCall(
     // A `compile fun` runs while the program is compiled, so run-time code
     // reaches it only through `#`.
     if (symbolKind == "compile.fun" && analyzer.compileDepth == 0 &&
-        !analyzer.shadowsGlobal(expression.text)) {
+        !localCallable) {
         analyzer.fail("compile.call-runtime:${expression.text}@${expression.begin}")
     }
     val primitiveType = if (!localCallable && bootstrapScalarTypeUnderlyingValid(
