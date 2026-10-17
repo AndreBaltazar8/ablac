@@ -1252,8 +1252,76 @@ fun bootstrapLlvmScalarOperand(
     result
 }
 
+// Integer `/` and `%`. A zero divisor panics ("division by zero"): one
+// compare and a branch to a cold block, which LLVM drops for a constant
+// divisor. The one overflowing signed quotient, MIN / -1, wraps to MIN (its
+// remainder is 0) like the other fixed-width operators; the hardware
+// instruction would trap there (x86, wasm) or LLVM call it undefined, so a
+// divisor of -1 divides by 1 and negates instead, without a branch.
+fun bootstrapLlvmEmitIntegerDivision(
+    backend: BootstrapLlvmBackend,
+    llvmFunction: i64*,
+    scalar: string,
+    opcode: string,
+    left: i64*,
+    right: i64*
+): i64* {
+    val type = backend.type(scalar)
+    val zero = LLVMBuildICmp(
+        backend.builder, llvmIntEqual(), right, LLVMConstInt(type, 0, 0),
+        "scalar.divisor.zero"
+    )
+    val failed = LLVMAppendBasicBlockInContext(
+        backend.context, llvmFunction, "scalar.division.by.zero"
+    )
+    val divide = LLVMAppendBasicBlockInContext(
+        backend.context, llvmFunction, "scalar.divide.checked"
+    )
+    LLVMBuildCondBr(backend.builder, zero, failed, divide)
+    LLVMPositionBuilderAtEnd(backend.builder, failed)
+    val message = "division by zero"
+    bootstrapLlvmCallNamed(
+        backend, "abla_platform_panic",
+        [bootstrapLlvmGlobalStringPointer(
+            backend, message, "abla.division.error"
+        ), LLVMConstInt(backend.i64Type, message.size, 0)],
+        "", false, [false, false]
+    )
+    LLVMBuildUnreachable(backend.builder)
+    LLVMPositionBuilderAtEnd(backend.builder, divide)
+    var result = nativeNullPointer()
+    if (bootstrapLlvmIsUnsignedNativeInteger(scalar)) {
+        result = if (opcode == "/") LLVMBuildUDiv(
+            backend.builder, left, right, "scalar.divide"
+        ) else LLVMBuildURem(
+            backend.builder, left, right, "scalar.remainder"
+        )
+    } else {
+        val negativeOne = LLVMBuildICmp(
+            backend.builder, llvmIntEqual(), right,
+            LLVMConstInt(type, -1, 1), "scalar.divisor.negative.one"
+        )
+        val divisor = LLVMBuildSelect(
+            backend.builder, negativeOne, LLVMConstInt(type, 1, 0), right,
+            "scalar.divisor.safe"
+        )
+        result = if (opcode == "/") LLVMBuildSelect(
+            backend.builder, negativeOne,
+            LLVMBuildNeg(backend.builder, left, "scalar.divide.negate"),
+            LLVMBuildSDiv(
+                backend.builder, left, divisor, "scalar.divide.signed"
+            ),
+            "scalar.divide"
+        ) else LLVMBuildSRem(
+            backend.builder, left, divisor, "scalar.remainder"
+        )
+    }
+    result
+}
+
 fun bootstrapLlvmEmitScalarOperation(
     backend: BootstrapLlvmBackend,
+    llvmFunction: i64*,
     var storage: BootstrapLlvmFunctionStorage,
     instruction: BootstrapInstruction
 ): bool {
@@ -1315,22 +1383,13 @@ fun bootstrapLlvmEmitScalarOperation(
                 if (instruction.opcode == "*") native = LLVMBuildMul(
                     backend.builder, left, right, "scalar.multiply"
                 )
-                if (instruction.opcode == "/") native =
-                    if (bootstrapLlvmIsUnsignedNativeInteger(scalar)) {
-                        LLVMBuildUDiv(
-                            backend.builder, left, right, "scalar.divide"
-                        )
-                    } else LLVMBuildSDiv(
-                        backend.builder, left, right, "scalar.divide"
+                if (instruction.opcode == "/" ||
+                    instruction.opcode == "%") {
+                    native = bootstrapLlvmEmitIntegerDivision(
+                        backend, llvmFunction, scalar, instruction.opcode,
+                        left, right
                     )
-                if (instruction.opcode == "%") native =
-                    if (bootstrapLlvmIsUnsignedNativeInteger(scalar)) {
-                        LLVMBuildURem(
-                            backend.builder, left, right, "scalar.remainder"
-                        )
-                    } else LLVMBuildSRem(
-                        backend.builder, left, right, "scalar.remainder"
-                    )
+                }
             }
         }
         if (instruction.opcode == "neg") {
@@ -6467,7 +6526,8 @@ fun bootstrapLlvmEmitFunction(
     )
     LLVMPositionBuilderAtEnd(backend.builder, entry)
     bootstrapLlvmDebugLocate(debug, backend, functionId, -1)
-    if (function.name == "__ablaDebugPrintStack" &&
+    if ((function.name == "__ablaDebugPrintStack" ||
+         function.name == "__ablaRuntimePrintStack") &&
         bootstrapLlvmDebugHostedRuntime(backend)) {
         bootstrapLlvmCall(
             backend,
@@ -7131,7 +7191,7 @@ fun bootstrapLlvmEmitFunction(
         }
         var scalarOperation = false
         if (reachable) scalarOperation = bootstrapLlvmEmitScalarOperation(
-            backend, storage, instruction
+            backend, llvmFunction, storage, instruction
         )
         if (scalarOperation) matched = true
         val runtime = bootstrapLlvmRuntimeOperation(instruction.opcode)

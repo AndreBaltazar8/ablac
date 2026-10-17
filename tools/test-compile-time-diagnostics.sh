@@ -36,7 +36,7 @@ build_fails() {
 log=$output/index.log
 build_fails compile-time-index.ab "$log"
 [[ $(grep -c '^error\[' "$log") -eq 1 ]] || fail "index: not one error" "$log"
-grep -q '^error\[E_EVAL_EXPRESSION\]: compile-time evaluation failed' "$log" ||
+grep -qx 'error\[E_EVAL_OUT_OF_BOUNDS\]: index 7 out of bounds for array of size 3' "$log" ||
     fail "index: no evaluation error" "$log"
 grep -q '^source\[eval\]:compile-time-index.ab:48:61$' "$log" || fail "index: no record" "$log"
 grep -q '^  --> compile-time-index.ab:1:49$' "$log" || fail "index: no line:column" "$log"

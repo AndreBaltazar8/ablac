@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Array truncate/clear: in place, capacity kept, out-of-range counts trap, and
-# the receiver must be an owned, mutable array.
+# Array truncate/clear: in place, capacity kept, a count at or past the size
+# changes nothing, a negative count panics, and the receiver must be an owned,
+# mutable array.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -14,7 +15,7 @@ mkdir -p "$output_directory"
 set +e
 "$output_directory/main"
 status=$?
-"$output_directory/trap" 2> /dev/null
+"$output_directory/trap" 2> "$output_directory/trap.err"
 trap_status=$?
 "$compiler" build "$cases/invalid-borrowed.ab" -o "$output_directory/invalid" \
     --no-cache > "$output_directory/borrowed.err" 2>&1
@@ -24,9 +25,10 @@ borrowed_status=$?
 size_status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
-[[ $trap_status -ne 0 ]] || exit 1
+[[ $trap_status -eq 101 ]] || exit 1
+grep -qx 'panic: truncate to a negative size (-1)' "$output_directory/trap.err"
 [[ $borrowed_status -ne 0 && $size_status -ne 0 ]] || exit 1
 grep -q 'ownership.borrow-mutation:clear' "$output_directory/borrowed.err"
 grep -q 'truncate.size' "$output_directory/size.err"
 grep -q 'clear.arity' "$output_directory/size.err"
-echo "array truncate/clear: in place, trapping past the end, owned receivers only"
+echo "array truncate/clear: in place, a no-op past the end, panicking below zero, owned receivers only"

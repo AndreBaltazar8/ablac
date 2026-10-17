@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # filledArray(count, value): one allocation of count copies; numbers, bools and
-# strings only; negative counts trap; it also runs at compile time.
+# strings only; a negative count panics; it also runs at compile time.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -14,16 +14,17 @@ mkdir -p "$output_directory"
 set +e
 "$output_directory/main"
 status=$?
-"$output_directory/trap" 2> /dev/null
+"$output_directory/trap" 2> "$output_directory/trap.err"
 trap_status=$?
 "$compiler" build "$cases/invalid.ab" -o "$output_directory/invalid" \
     --no-cache > "$output_directory/invalid.err" 2>&1
 invalid_status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
-[[ $trap_status -ne 0 ]] || exit 1
+[[ $trap_status -eq 101 ]] || exit 1
+grep -qx 'panic: filledArray with a negative size (-1)' "$output_directory/trap.err"
 [[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'filledArray.element:Node' "$output_directory/invalid.err"
 grep -q 'filledArray.count' "$output_directory/invalid.err"
 grep -q 'filledArray.arity' "$output_directory/invalid.err"
-echo "filledArray: one allocation, value elements only, negative counts trap"
+echo "filledArray: one allocation, value elements only, a negative count panics"

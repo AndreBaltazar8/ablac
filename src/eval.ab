@@ -4,6 +4,7 @@ import "ct_bridge.ab"
 import "compile_actions.ab"
 import "ct_native.ab"
 import "eval_scalar.ab"
+import "eval_checks.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
@@ -5553,6 +5554,29 @@ fun bootstrapEvalStepLimitReached(var evaluator: BootstrapEvaluator): void {
     }
 }
 
+// Where compiled code would panic (eval_checks.ab): a compile-time error with
+// the panic's text, at `expression`.
+@noinline
+fun bootstrapEvalRuntimePanic(
+    var evaluator: BootstrapEvaluator,
+    code: string,
+    message: string,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    evaluator.errors = evaluator.errors + 1
+    val source = evaluator.sourceIdentity
+    if (source == "") {
+        evaluator.recordEvaluatorDiagnostic(
+            code, "$message at ${expression.begin}:${expression.end}"
+        )
+    } else {
+        evaluator.recordEvaluatorDiagnostic(code, message)
+        evaluator.diagnostics =
+            "${evaluator.diagnostics}source[eval]:$source:${expression.begin}:${expression.end}\n"
+    }
+    bootstrapEvalInvalid()
+}
+
 @noinline
 fun bootstrapEvalExpressionFailed(
     var evaluator: BootstrapEvaluator,
@@ -6241,6 +6265,11 @@ fun bootstrapEvaluateFilledArray(
             index = index + 1
         }
         result = bootstrapEvalArray(elements)
+    } else if (count.kind == "integer") {
+        result = bootstrapEvalRuntimePanic(
+            evaluator, "E_EVAL_OUT_OF_BOUNDS",
+            bootstrapEvalFilledPanicText(count.integer), expression
+        )
     } else {
         evaluator.errors = evaluator.errors + 1
         result = bootstrapEvalInvalid()
@@ -6708,6 +6737,17 @@ fun bootstrapEvaluateIndex(
     } else if (receiver.kind == "array" && index >= 0 &&
         index < receiver.elements.size) {
         result = receiver.elements[index]
+    } else if (receiver.kind == "string" || receiver.kind == "array") {
+        result = bootstrapEvalRuntimePanic(
+            evaluator, "E_EVAL_OUT_OF_BOUNDS",
+            bootstrapEvalIndexPanicText(
+                index,
+                if (receiver.kind == "string") receiver.text.size
+                else receiver.elements.size,
+                receiver.kind
+            ),
+            expression
+        )
     } else {
         evaluator.errors = evaluator.errors + 1
         result = result
@@ -6736,6 +6776,13 @@ fun bootstrapEvaluateIndexAssign(
             evaluator.dropValue(receiver.elements[index])
         }
         receiver.elements[index] = value
+        result = value
+    } else if (receiver.kind == "array") {
+        bootstrapEvalRuntimePanic(
+            evaluator, "E_EVAL_OUT_OF_BOUNDS",
+            bootstrapEvalIndexPanicText(index, receiver.elements.size, "array"),
+            expression
+        )
         result = value
     } else {
         evaluator.errors = evaluator.errors + 1
@@ -6776,11 +6823,14 @@ fun bootstrapEvaluateMemberCall(
         receiver.kind == "array") {
         val count = if (expression.text == "clear") 0
             else evaluator.evaluate(expression.children[1]).integer
-        if (count < 0 || count > receiver.elements.size) {
-            evaluator.errors = evaluator.errors + 1
-            result = bootstrapEvalInvalid()
+        if (count < 0) {
+            result = bootstrapEvalRuntimePanic(
+                evaluator, "E_EVAL_OUT_OF_BOUNDS",
+                bootstrapEvalTruncatePanicText(count), expression
+            )
         } else {
-            receiver.elements.truncate(count)
+            // At or past the size, nothing changes.
+            if (count < receiver.elements.size) receiver.elements.truncate(count)
             result = BootstrapEvalValue(
                 "void", 0, false, "", [], "", []
             )
@@ -6790,7 +6840,13 @@ fun bootstrapEvaluateMemberCall(
         expression.children.size == 3) {
         val begin = evaluator.evaluate(expression.children[1]).integer
         val end = evaluator.evaluate(expression.children[2]).integer
-        result = bootstrapEvalString(receiver.text.slice(begin, end))
+        result = if (begin < 0 || end < begin || end > receiver.text.size) {
+            bootstrapEvalRuntimePanic(
+                evaluator, "E_EVAL_OUT_OF_BOUNDS",
+                bootstrapEvalSlicePanicText(begin, end, receiver.text.size),
+                expression
+            )
+        } else bootstrapEvalString(receiver.text.slice(begin, end))
     } else if (receiver.kind == "object" &&
                bootstrapEvalFieldCallable(evaluator, receiver, expression.text).kind != "invalid") {
         // `holder.callback(4)` with no method `callback`: the field's value.
@@ -6998,7 +7054,11 @@ fun bootstrapEvaluateArithmetic(
         // Float payloads are IEEE bits, not integers. In particular a
         // floating zero must never reach an integer division first.
         val width = bootstrapEvalOperationWidth(leftValue.owner, rightValue.owner)
-        bootstrapEvalScalar(
+        if ((expression.kind == "/" || expression.kind == "%") &&
+            rightValue.integer == 0) bootstrapEvalRuntimePanic(
+            evaluator, "E_EVAL_DIVISION_BY_ZERO", "division by zero",
+            expression
+        ) else bootstrapEvalScalar(
             bootstrapEvalIntegerArithmetic(
                 expression.kind, leftValue.integer, rightValue.integer, width
             ),
@@ -7063,6 +7123,12 @@ fun bootstrapEvaluateComparison(
     if (leftValue.kind == "integer" &&
         bootstrapEvalOperationWidth(leftValue.owner, rightValue.owner) == "u64") {
         value = bootstrapEvalUnsignedCompare(expression.kind, left, right)
+    }
+    if (leftValue.kind == "string" && rightValue.kind == "string") {
+        value = bootstrapEvalOrdered(
+            expression.kind,
+            bootstrapEvalStringOrder(leftValue.text, rightValue.text)
+        )
     }
     if (bootstrapEvalFloat(leftValue) && bootstrapEvalFloat(rightValue)) {
         value = bootstrapEvalF64Compare(

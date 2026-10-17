@@ -6066,6 +6066,19 @@ class BootstrapAnalyzer(
         found
     }
 
+    /** Whether a local (a parameter, a block's `val`) named `name` is in
+     *  scope. */
+    fun localVisible(name: string): bool {
+        var found = false
+        var localIndex = 0
+        while (!found && localIndex < this.locals.size) {
+            found = this.locals[localIndex].name == name &&
+                this.scopeIsVisible(this.locals[localIndex].scope)
+            localIndex = localIndex + 1
+        }
+        found
+    }
+
     fun findKind(name: string): string {
         var result = "unknown"
         val index = this.symbolIndex(name)
@@ -8478,6 +8491,13 @@ class BootstrapAnalyzer(
                 this.failScalarExpression(
                     "arithmetic.type", expression, left, right
                 )
+            } else if ((expression.kind == "/" || expression.kind == "%") &&
+                       bootstrapIsIntegerScalarType(left)) {
+                // A divisor that is always zero would always panic.
+                val divisor = bootstrapStaticInteger(this, rightExpression, 0)
+                if (divisor.known && divisor.value == 0) {
+                    this.fail("division.zero@${rightExpression.begin}")
+                }
             }
             result = left
         } else {
@@ -11784,6 +11804,77 @@ fun bootstrapInferWhen(
     result
 }
 
+class BootstrapStaticInteger(val known: bool, val value: int)
+
+// An integer expression's value when it is a constant: a literal, a constant
+// negated, converted to an integer type or combined by `+`, `-`, `*`, or a
+// top-level `val` (not shadowed by a local) initialized with one.
+fun bootstrapStaticInteger(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    depth: int
+): BootstrapStaticInteger {
+    var result = BootstrapStaticInteger(false, 0)
+    if (depth > 16) return result
+    if (expression.kind == "integer") {
+        // The parser leaves a literal's text in decimal.
+        var value = 0
+        for (digit in expression.text) value = value * 10 + digit - 48
+        result = BootstrapStaticInteger(true, value)
+    } else if (expression.kind == "unary-" && expression.children.size == 1) {
+        val operand = bootstrapStaticInteger(
+            analyzer, expression.children[0], depth + 1
+        )
+        if (operand.known) result = BootstrapStaticInteger(true, -operand.value)
+    } else if ((expression.kind == "+" || expression.kind == "-" ||
+                expression.kind == "*") && expression.children.size == 2) {
+        val left = bootstrapStaticInteger(
+            analyzer, expression.children[0], depth + 1
+        )
+        val right = bootstrapStaticInteger(
+            analyzer, expression.children[1], depth + 1
+        )
+        if (left.known && right.known) {
+            result = BootstrapStaticInteger(
+                true,
+                if (expression.kind == "+") left.value + right.value
+                else if (expression.kind == "-") left.value - right.value
+                else left.value * right.value
+            )
+        }
+    } else if (expression.kind == "call" && expression.children.size == 1 &&
+               bootstrapIsIntegerScalarType(expression.text)) {
+        // Zero stays zero at every width.
+        val operand = bootstrapStaticInteger(
+            analyzer, expression.children[0], depth + 1
+        )
+        if (operand.known && operand.value == 0) result = operand
+    } else if (expression.kind == "identifier" &&
+               !analyzer.localVisible(expression.text) &&
+               analyzer.findKind(expression.text) == "val") {
+        var node = analyzer.declarationNames.first(expression.text)
+        while (node >= 0) {
+            val declaration = analyzer.declarations[
+                analyzer.declarationNames.nodeDeclarations[node]
+            ]
+            if (declaration.kind == "val" && declaration.extensionOwner == "" &&
+                declaration.name == expression.text) {
+                result = bootstrapStaticInteger(
+                    analyzer, declaration.expression, depth + 1
+                )
+                node = -1
+            } else node = analyzer.declarationNames.nodeNexts[node]
+        }
+    }
+    result
+}
+
+// A type `<` can order: a number or a string (`any` in low-level code, and
+// an operand whose type is already in error).
+fun bootstrapOrderedComparisonType(type: string): bool =
+    bootstrapIsNumericScalarType(type) || type == "string" ||
+    type == "any" || type == "unknown"
+
 @noinline
 fun bootstrapInferComparison(
     var analyzer: BootstrapAnalyzer,
@@ -11796,6 +11887,12 @@ fun bootstrapInferComparison(
     val right = bootstrapBorrowElementType(analyzer.infer(expression.children[1]))
     if (!analyzer.typesCompatible(left, right) &&
         !analyzer.typesCompatible(right, left)) {
+        analyzer.fail("comparison.type")
+    } else if (expression.kind != "==" && expression.kind != "!=" &&
+               (!bootstrapOrderedComparisonType(analyzer.scalarValueType(left)) ||
+                !bootstrapOrderedComparisonType(analyzer.scalarValueType(right)))) {
+        // `<`, `<=`, `>`, `>=` order numbers and strings (by their bytes);
+        // nothing else has an order.
         analyzer.fail("comparison.type")
     }
     result = "bool"

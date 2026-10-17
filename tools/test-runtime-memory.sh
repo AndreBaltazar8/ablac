@@ -90,7 +90,7 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     > "$directory/limited.out" 2> "$directory/limited.err"
 limited_status=$?
 set -e
-[[ $limited_status -eq 134 ]] || exit 1
+[[ $limited_status -eq 101 ]] || exit 1
 rg -q 'memory limit exceeded' "$directory/limited.err"
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-collect.ab" \

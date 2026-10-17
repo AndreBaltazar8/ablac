@@ -618,6 +618,280 @@ fun bootstrapLlvmDebugInstallFaultHandlers(
     return
 }
 
+// --- stack overflow ---------------------------------------------------------
+// A hosted executable (macOS or Linux, with libc) turns a stack overflow into
+// a panic: "panic: stack overflow" on standard error (and the stack in a debug
+// build), exit status 101. Main records its frame address and installs a
+// SIGSEGV/SIGBUS handler that runs on an alternate signal stack (a static
+// buffer), since the overflowed stack has no room left for it. The handler
+// calls a fault an overflow when its address lies at the far end of the stack:
+// below the thread's stack base (macOS), or of RLIMIT_STACK below main's frame
+// (Linux). Any other fault keeps its course (the debug fault report, else the
+// default action). Nothing runs on the normal path. The toolchain sets
+// bootstrapLlvmStackGuard for hosted, non-Wasm targets.
+
+var bootstrapLlvmStackGuard: bool = false
+
+// Calls C function `name` with the given signature, declaring it if the module
+// doesn't have it yet. The call carries its own type, so a declaration the
+// program made with other integer widths (`extern:"c" fun raise(signal: int)`)
+// doesn't clash.
+fun bootstrapLlvmStackGuardCall(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    result: i64*,
+    parameters: array<i64*>,
+    arguments: array<i64*>
+): i64* {
+    var function = LLVMGetNamedFunction(backend.module, name)
+    if (pointerIsNull(function)) {
+        function = bootstrapLlvmDeclare(
+            backend, name, result, parameters, false, []
+        )
+    }
+    bootstrapLlvmCallTyped(
+        backend, bootstrapLlvmFunctionType(backend, result, parameters),
+        function, arguments, ""
+    )
+}
+
+fun bootstrapLlvmStackGuardRuntime(backend: BootstrapLlvmBackend): bool =
+    bootstrapLlvmStackGuard &&
+    !bootstrapTextContains(backend.targetTriple, "wasm") &&
+    (backend.macOS || bootstrapTextContains(backend.targetTriple, "linux"))
+
+fun bootstrapLlvmSignalStackBytes(): int = 65536
+
+// The address `offset` bytes into a byte buffer of `bytes` bytes.
+fun bootstrapLlvmByteAt(
+    backend: BootstrapLlvmBackend,
+    buffer: i64*,
+    bytes: int,
+    offset: int
+): i64* = bootstrapLlvmArrayElement(
+    backend, LLVMArrayType2(backend.i8Type, bytes), buffer, offset, ""
+)
+
+fun bootstrapLlvmStackGuardGlobal(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    type: i64*
+): i64* {
+    var global = LLVMGetNamedGlobal(backend.module, name)
+    if (pointerIsNull(global)) {
+        global = LLVMAddGlobal(backend.module, type, name)
+        LLVMSetInitializer(global, LLVMConstNull(type))
+        LLVMSetLinkage(global, llvmInternalLinkage())
+        LLVMSetAlignment(global, 16)
+    }
+    global
+}
+
+// In the C `main`, before any Abla code runs: record the stack top, give the
+// thread an alternate signal stack and route SIGSEGV and SIGBUS to
+// abla_runtime_stack_fault (defined after every other body).
+fun bootstrapLlvmInstallStackGuard(backend: BootstrapLlvmBackend): void {
+    if (!bootstrapLlvmStackGuardRuntime(backend)) return
+    val mac = backend.macOS
+    val top = bootstrapLlvmStackGuardGlobal(
+        backend, "abla_runtime_stack_top", backend.i64Type
+    )
+    val frame = bootstrapLlvmStackGuardCall(
+        backend, "llvm.frameaddress.p0", backend.pointerType,
+        [backend.i32Type], [LLVMConstInt(backend.i32Type, 0, 0)]
+    )
+    LLVMBuildStore(
+        backend.builder,
+        LLVMBuildPtrToInt(backend.builder, frame, backend.i64Type, ""),
+        top
+    )
+    // stack_t: macOS {sp, size, flags}, Linux {sp, flags, size}.
+    val signalStack = bootstrapLlvmStackGuardGlobal(
+        backend, "abla_runtime_signal_stack",
+        LLVMArrayType2(backend.i8Type, bootstrapLlvmSignalStackBytes())
+    )
+    val stackType = LLVMArrayType2(backend.i8Type, 32)
+    val stack = LLVMBuildAlloca(backend.builder, stackType, "signal.stack")
+    LLVMBuildStore(
+        backend.builder, LLVMConstNull(stackType), stack
+    )
+    LLVMBuildStore(backend.builder, signalStack, stack)
+    LLVMBuildStore(
+        backend.builder,
+        LLVMConstInt(backend.i64Type, bootstrapLlvmSignalStackBytes(), 0),
+        bootstrapLlvmByteAt(backend, stack, 32, if (mac) 8 else 16)
+    )
+    bootstrapLlvmStackGuardCall(
+        backend, "sigaltstack", backend.i32Type,
+        [backend.pointerType, backend.pointerType],
+        [stack, LLVMConstNull(backend.pointerType)]
+    )
+    // struct sigaction: the handler first; sa_flags at 12 (macOS) or 136
+    // (Linux, after a 128-byte mask). SA_SIGINFO | SA_ONSTACK.
+    val actionType = LLVMArrayType2(backend.i8Type, 160)
+    val action = LLVMBuildAlloca(backend.builder, actionType, "signal.action")
+    LLVMBuildStore(backend.builder, LLVMConstNull(actionType), action)
+    val handler = bootstrapLlvmDeclare(
+        backend, "abla_runtime_stack_fault", backend.voidType,
+        [backend.i32Type, backend.pointerType, backend.pointerType],
+        false, []
+    )
+    LLVMSetLinkage(handler, llvmInternalLinkage())
+    LLVMBuildStore(backend.builder, handler, action)
+    LLVMBuildStore(
+        backend.builder,
+        LLVMConstInt(backend.i32Type, if (mac) 65 else 134217732, 0),
+        bootstrapLlvmByteAt(backend, action, 160, if (mac) 12 else 136)
+    )
+    for (signal in [11, if (mac) 10 else 7]) {
+        bootstrapLlvmStackGuardCall(
+            backend, "sigaction", backend.i32Type,
+            [backend.i32Type, backend.pointerType, backend.pointerType],
+            [LLVMConstInt(backend.i32Type, signal, 0), action,
+             LLVMConstNull(backend.pointerType)]
+        )
+    }
+    return
+}
+
+// abla_runtime_stack_fault(signal, siginfo, context), when main installed it.
+fun bootstrapLlvmEmitStackGuardHandler(backend: BootstrapLlvmBackend): void {
+    val handler = LLVMGetNamedFunction(
+        backend.module, "abla_runtime_stack_fault"
+    )
+    if (pointerIsNull(handler) || LLVMIsDeclaration(handler) == 0) return
+    val mac = backend.macOS
+    val i64 = backend.i64Type
+    LLVMPositionBuilderAtEnd(
+        backend.builder,
+        LLVMAppendBasicBlockInContext(backend.context, handler, "entry")
+    )
+    // si_addr: offset 24 on macOS, 16 on Linux.
+    val info = LLVMGetParam(handler, 1)
+    val address = LLVMBuildPtrToInt(
+        backend.builder,
+        LLVMBuildLoad2(
+            backend.builder, backend.pointerType,
+            bootstrapLlvmByteAt(backend, info, 32, if (mac) 24 else 16),
+            "fault.address"
+        ),
+        i64, ""
+    )
+    var low = nativeNullPointer()
+    var window = 0
+    if (mac) {
+        val currentThread = bootstrapLlvmStackGuardCall(
+            backend, "pthread_self", backend.pointerType, [], []
+        )
+        val base = bootstrapLlvmStackGuardCall(
+            backend, "pthread_get_stackaddr_np", backend.pointerType,
+            [backend.pointerType], [currentThread]
+        )
+        val size = bootstrapLlvmStackGuardCall(
+            backend, "pthread_get_stacksize_np", i64,
+            [backend.pointerType], [currentThread]
+        )
+        low = LLVMBuildSub(
+            backend.builder,
+            LLVMBuildPtrToInt(backend.builder, base, i64, ""), size, ""
+        )
+        window = 1048576
+    } else {
+        // RLIMIT_STACK (3) below main's frame; an unlimited stack (all
+        // ones) counts as 64 GiB.
+        val limitType = LLVMArrayType2(backend.i8Type, 16)
+        val limit = LLVMBuildAlloca(backend.builder, limitType, "stack.limit")
+        bootstrapLlvmStackGuardCall(
+            backend, "getrlimit", backend.i32Type,
+            [backend.i32Type, backend.pointerType],
+            [LLVMConstInt(backend.i32Type, 3, 0), limit]
+        )
+        val current = LLVMBuildLoad2(backend.builder, i64, limit, "")
+        val size = LLVMBuildSelect(
+            backend.builder,
+            LLVMBuildICmp(
+                backend.builder, llvmIntEqual(), current,
+                LLVMConstInt(i64, -1, 1), ""
+            ),
+            LLVMConstInt(i64, 68719476736, 0), current, ""
+        )
+        low = LLVMBuildSub(
+            backend.builder,
+            LLVMBuildLoad2(
+                backend.builder, i64,
+                LLVMGetNamedGlobal(backend.module, "abla_runtime_stack_top"),
+                ""
+            ),
+            size, ""
+        )
+        // main's frame sits below the environment and arguments.
+        window = 2097152
+    }
+    // low - window <= address < low + window (unsigned: address - (low -
+    // window) < 2 * window).
+    val overflow = LLVMBuildICmp(
+        backend.builder, llvmIntUnsignedLessThan(),
+        LLVMBuildSub(
+            backend.builder, address,
+            LLVMBuildSub(backend.builder, low, LLVMConstInt(i64, window, 0), ""),
+            ""
+        ),
+        LLVMConstInt(i64, 2 * window, 0), "stack.overflow"
+    )
+    val overflowed = LLVMAppendBasicBlockInContext(
+        backend.context, handler, "overflow"
+    )
+    val other = LLVMAppendBasicBlockInContext(
+        backend.context, handler, "other"
+    )
+    LLVMBuildCondBr(backend.builder, overflow, overflowed, other)
+    LLVMPositionBuilderAtEnd(backend.builder, overflowed)
+    val message = "panic: stack overflow\n"
+    bootstrapLlvmStackGuardCall(
+        backend, "write", i64, [i64, backend.pointerType, i64],
+        [LLVMConstInt(i64, 2, 0),
+         bootstrapLlvmGlobalStringPointer(backend, message, "abla.stack.overflow"),
+         LLVMConstInt(i64, message.size, 0)]
+    )
+    if (bootstrapLlvmDebugHostedRuntime(backend)) {
+        bootstrapLlvmStackGuardCall(
+            backend, "abla_runtime_print_stack", backend.voidType, [], []
+        )
+    }
+    bootstrapLlvmStackGuardCall(
+        backend, "_exit", backend.voidType, [backend.i64Type],
+        [LLVMConstInt(backend.i64Type, 101, 0)]
+    )
+    LLVMBuildUnreachable(backend.builder)
+    LLVMPositionBuilderAtEnd(backend.builder, other)
+    val signal = LLVMBuildZExt(
+        backend.builder, LLVMGetParam(handler, 0), i64, ""
+    )
+    if (bootstrapLlvmDebugHostedRuntime(backend)) {
+        // The debug report, which restores the default action.
+        val fault = bootstrapLlvmDeclare(
+            backend, "abla_runtime_fault", backend.voidType, [i64], false, []
+        )
+        LLVMSetLinkage(fault, llvmInternalLinkage())
+        bootstrapLlvmCall(backend, fault, [signal], "", false, [])
+    } else {
+        bootstrapLlvmStackGuardCall(
+            backend, "signal", backend.pointerType,
+            [i64, backend.pointerType],
+            [signal, LLVMConstNull(backend.pointerType)]
+        )
+    }
+    // Back to the default action: the signal raised again (delivered once
+    // the handler returns) or the faulting instruction run again ends the
+    // process as before.
+    bootstrapLlvmStackGuardCall(
+        backend, "raise", backend.i32Type, [backend.i32Type],
+        [LLVMGetParam(handler, 0)]
+    )
+    LLVMBuildRetVoid(backend.builder)
+    return
+}
+
 fun bootstrapLlvmDebugWrite(
     backend: BootstrapLlvmBackend,
     text: string,

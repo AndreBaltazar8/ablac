@@ -629,6 +629,8 @@ step fails, none of its changes are kept.
 |---|---|
 | `E_EVAL_EXPRESSION` | compile-time evaluation failed; the message names the expression kind and its byte range |
 | `E_EVAL_STEP_LIMIT` | an evaluation ran past the step limit |
+| `E_EVAL_DIVISION_BY_ZERO` | an integer division or remainder by zero, which panics at run time |
+| `E_EVAL_OUT_OF_BOUNDS` | an index or slice outside a string or an array, or a negative `truncate` or `filledArray` count; the message is the run-time panic's |
 | `compile.effect-denied:<capability>:<call path>` | the code needs a capability that this module didn't grant |
 | `compile.capability-not-authorized:<capability>` | the module grants a capability that `abla.toml` doesn't authorize |
 | `compile.capability-unknown:<name>` | the grant names no known capability |

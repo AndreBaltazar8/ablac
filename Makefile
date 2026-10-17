@@ -182,6 +182,7 @@ test: ablac
 	tools/test-compile-time-scalars.sh $(COMPILER)
 	tools/test-integer-narrowing.sh $(COMPILER)
 	tools/test-resource-drop-link.sh $(COMPILER)
+	tools/test-runtime-checks.sh $(COMPILER)
 
 check: test self-rebuild
 

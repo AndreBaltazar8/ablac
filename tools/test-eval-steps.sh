@@ -79,7 +79,7 @@ set +e
 status=$?
 set -e
 if [[ $status -ne 1 ]] ||
-    ! grep -Fq "error[E_EVAL_EXPRESSION]: compile-time evaluation failed while evaluating \`index\`" \
+    ! grep -Fq "error[E_EVAL_OUT_OF_BOUNDS]: index 3 out of bounds for array of size 0" \
         "$output_directory/element.out"; then
     echo "eval-steps: element.ab exited $status without reporting the failed index" >&2
     sed -n '1,20p' "$output_directory/element.out" >&2

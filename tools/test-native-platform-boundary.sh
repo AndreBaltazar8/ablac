@@ -62,8 +62,8 @@ ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=30 \
     2> "$output_directory/pure-panic-errors.txt"
 panic_status=$?
 set -e
-[[ $panic_status -eq 134 ]] || exit 1
-rg -q '^abla panic: array index out of bounds$' \
+[[ $panic_status -eq 101 ]] || exit 1
+rg -q '^panic: index 1 out of bounds for array of size 1$' \
     "$output_directory/pure-panic-errors.txt"
 
 "$compiler" build \

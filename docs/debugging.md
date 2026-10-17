@@ -36,10 +36,12 @@ What a debug build contains:
   source position and no line rows.
 - **Frame pointers** on native targets (`"frame-pointer"="all"`), so unwinders
   and crash reporters walk the whole Abla stack.
-- **A stack on a crash** (hosted executables): a trap (an index out of range, a
-  failed check), a bad memory access or an abort prints `fatal signal` and the
-  stack before the process ends with the signal as before; `panic(message)`
-  prints the message and the stack, then exits with status 101. The frames are
+- **A stack on a crash** (hosted executables): `panic(message)` and the
+  runtime's own panics (an index out of bounds, a division by zero, a stack
+  overflow, the memory limit) print `panic: <message>` and the stack, then
+  exit with status 101; a trap (a failed internal check), a bad memory access
+  or an abort prints `fatal signal` and the stack before the process ends
+  with the signal as before. The frames are
   named by the symbol table; on macOS the image's load address follows, for
   `atos`. Return addresses are printed one byte back, inside their calls, so
   `atos`/`addr2line` report the call's line.
@@ -53,11 +55,11 @@ the object next to the executable, or run `dsymutil <output>` to gather a
 
 ```sh
 ablac build app.ab -o build/app --fast
-lldb build/app -o run -k bt          # stops at a trap; bt shows app.ab:line:col frames
+lldb build/app -o 'breakpoint set -n _exit' -o run -k bt   # stops at a panic
 ```
 
 ```text
-* frame #0: app`self.__ablaRuntimeArrayIndex at entry.ab:1456:9
+* frame #2: app`self.__ablaRuntimePanicIndex at entry.ab:742:5
   frame #4: app`app.inner at app.ab:5:5
   frame #5: app`app.middle at app.ab:10:5
   frame #6: app`app.main at app.ab:14:18

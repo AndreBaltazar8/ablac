@@ -67,7 +67,9 @@ fun main: int {
   (`processArgumentCount()`, `processArgument(i)`).
 - `exit(code)` from `abla/process/exit` ends the program immediately.
   `panic(message)` prints the message and a stack trace and exits with
-  status 101.
+  status 101. The runtime panics the same way, with the reason, on a division
+  by zero, an index out of bounds or, in a native executable, a stack
+  overflow (`panic: stack overflow`).
 
 ```abla
 import "abla/io"
@@ -321,19 +323,34 @@ fun main {
 // 16 -4 15 1 7 6 -1
 ```
 
+- Division or remainder by zero panics with `division by zero` (exit status
+  101, like [`panic`](#programs)); under `#` it is the compile-time error
+  `E_EVAL_DIVISION_BY_ZERO`. A divisor that is always zero (a `0` literal, or
+  a constant expression or top-level `val` that comes to 0) is the error
+  `division.zero`. The one quotient too large for its type, the smallest
+  signed value divided by `-1`, wraps to itself, and its remainder is 0.
+  Unsigned types divide unsigned. The same holds at every width and at
+  compile time.
+
+```abla
+import "abla/io"
+
+fun main {
+    val smallest = -9223372036854775807 - 1
+    println("${smallest / -1} ${smallest % -1} ${i8(-128) / i8(-1)}")
+    val none = smallest - smallest
+    println("${7 / none}")      // panic: division by zero
+}
+// output:
+// -9223372036854775808 0 -128
+// exit: 101
+```
+
 - `>>` is arithmetic for signed types and logical for unsigned ones; `>>>`
   is always logical. A shift count may have any integer type. A count that
   is negative or at least the width gives zero.
 - Mixing types (`f64 + int`, `string + int`) is `arithmetic.type`. Mixing
   bit-operation types is `bitwise.type`.
-- Division or remainder by zero panics with "division by zero" (exit
-  status 101). Under `#` it is a compile-time error, and a divisor that is
-  the constant zero is rejected when the program is type-checked. The
-  smallest value divided by `-1` wraps to itself, and its remainder is 0.
-
-> Known issue (being fixed by ct-rt): today division and remainder by zero
-> quietly give 0 at run time (`7 % 0` gives 7 under `#`), and
-> `-9223372036854775808 / -1` gives 0 at run time.
 
 - An `int` argument for a parameter of a narrower type (`u8`, `i32`, ...) of
   a function, method or constructor is `integer.narrowing`: write `u8(value)`
@@ -375,9 +392,22 @@ compile time too, with identical results.
 
 A `string` is immutable UTF-8. `size` is its length in bytes; `text[i]` is
 the byte at `i` as an `int`; `slice(begin, end)` copies a byte range; `+`
-concatenates two strings. `==` compares contents, and `<`, `<=`, `>`, `>=`
-compare byte by byte, lexicographically. `for (b in text)` iterates over the
-bytes.
+concatenates two strings. `for (b in text)` iterates over the bytes. An
+index or a range outside the string panics, like an array index
+(`slice 3..10 out of bounds for string of size 5`). `<`, `<=`, `>` and `>=`
+compare strings byte by byte (lexicographically, so a prefix comes first and
+`"Z" < "a"`), the same at run time and at compile time:
+
+```abla
+import "abla/io"
+
+fun main {
+    println("${"apple" < "banana"} ${"app" < "apple"} ${"Zebra" < "apple"} ${"b" >= "b"}")
+}
+// output:
+// true true true true
+```
+
 `abla/text` adds the usual helpers (`split`, `trim`, `startsWith`,
 `indexOf`, `replace`, ...) and code-point access; see
 [standard-library.md](standard-library.md).
@@ -424,11 +454,13 @@ fun main {
   `array<int>`, and `val names: array<string?> = ["a", null]` accepts the
   `null`. The same holds for a declared result or parameter type.
 - `append(value)` adds at the end, `truncate(n)` keeps the first `n`
-  elements (`n` beyond the size keeps all), `clear()` removes all, and
-  `filledArray(count, value)` creates a filled array. A negative count for
-  either panics.
-- Reading or writing outside the array panics with the index and the size
-  ("index 5 out of bounds for array of size 3", exit status 101). The same
+  elements (all of them when `n` is at least the size), `clear()` removes
+  all, and `filledArray(count, value)` creates a filled array.
+- Reading or writing outside the array panics (exit status 101) with the
+  reason, such as `index 5 out of bounds for array of size 3`; so do a
+  negative count to `truncate` (`truncate to a negative size (-1)`) and to
+  `filledArray` (`filledArray with a negative size (-2)`). Under `#`
+  the same text is a compile-time error (`E_EVAL_OUT_OF_BOUNDS`). The same
   holds for a string index or slice.
 - Changing an array you received as a parameter needs a `var` parameter
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)). An array of
@@ -1242,7 +1274,8 @@ closures they compare identity: whether both sides are the same object. Two
 separately created objects with equal fields are not `==`. A nullable
 reference compares to `null` by whether it holds a value. To compare
 contents, write a function, such as a field-by-field `equals`. The same rules
-hold at compile time.
+hold at compile time. `<`, `<=`, `>` and `>=` order numbers and strings, and nothing else
+(`comparison.type`).
 
 ## Control flow
 

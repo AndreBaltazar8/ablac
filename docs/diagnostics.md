@@ -83,7 +83,8 @@ only its parse errors.
 | `local.duplicate`, `local.shadows-parameter`, `local.uninitialized-type`, `local.uninitialized-val` | see [values and variables](language.md#values-and-variables) |
 | `symbol.duplicate:<name>:<files>` | two declarations with the same name and parameter types |
 | `call.overload-ambiguous`, `call.overload-no-match` | see [overloads](language.md#overloads-and-operator-functions) |
-| `arithmetic.type@<offset>:<left>:<right>`, `bitwise.type`, `comparison.type`, `logical.type`, `unary.boolean` | operand types that don't fit the operator ([integers](language.md#integers)) |
+| `arithmetic.type@<offset>:<left>:<right>`, `bitwise.type`, `comparison.type`, `logical.type`, `unary.boolean` | operand types that don't fit the operator ([integers](language.md#integers)); `<`, `<=`, `>`, `>=` take numbers and strings only |
+| `division.zero@<offset>` | an integer divisor that is always zero ([integers](language.md#integers)) |
 | `string.interpolation:<type>` | a value a template can't insert ([strings](language.md#lexical-structure)) |
 | `array.element-type`, `index.type`, `index.receiver` | array literal and indexing errors |
 | `append.*`, `truncate.size`, `clear.arity`, `filledArray.*`, `slice.*` | array and string method errors ([arrays](language.md#arrays)) |
@@ -135,6 +136,8 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 |---|---|
 | `E_EVAL_EXPRESSION` | a compile-time evaluation failed; the message names the expression, and a `source[eval]` record with its `-->` line gives its file, line and column |
 | `E_EVAL_STEP_LIMIT` | an evaluation ran past the step limit |
+| `E_EVAL_DIVISION_BY_ZERO` | an integer division or remainder by zero under `#` ([integers](language.md#integers)) |
+| `E_EVAL_OUT_OF_BOUNDS` | an index or slice out of bounds, or a negative `truncate` or `filledArray` count, under `#`, with the run-time panic's message |
 | `E_EVAL_STACK_DEPTH` | compile-time recursion nested deeper than the compiler's stack allows ([limits](compile-time.md#limits)) |
 | `compile.effect-denied`, `compile.capability-not-authorized`, `compile.capability-unknown` | [capabilities](compile-time.md#capabilities-files-environment-processes-network) |
 | `compile.value-runtime:<name>` | run-time code reads a `compile val`/`compile var` |
