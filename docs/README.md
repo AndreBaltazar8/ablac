@@ -19,7 +19,7 @@ compiler. The documents below are grouped by what you are trying to do.
 
 | Document | What it covers |
 |---|---|
-| [language.md#compile-time-execution](language.md#compile-time-execution) | `#expression`, `compile fun`, `compile val`/`compile var`, capabilities |
+| [compile-time.md](compile-time.md) | `#expression`, `compile fun`, top-level actions, `compile val`/`compile var`, capabilities, limits, declaration blocks |
 | [compiler-api.md](compiler-api.md) | The `abla/compiler` module: reflection, transforms, generated code, exports |
 | [subparsers.md](subparsers.md) | `$name` subparsers: parsing your own syntax at compile time |
 | [programmable-builds.md](programmable-builds.md) | Building other programs, Wasm modules and libraries from compile-time code |

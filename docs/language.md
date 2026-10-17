@@ -670,42 +670,26 @@ and package-interface work.
 
 ## Compile-time execution
 
-`#expression` evaluates an expression during compilation:
+Compile-time execution has its own page, [compile-time.md](compile-time.md).
+In brief:
 
-```abla fragment
-val table = #makeTable()
-
-fun main {
-    #println("building main")
-    use(table)
-}
-```
-
-A top-level `#expression` is also a compile action. Its result is deliberately
-discarded, so registration, generation, and validation calls do not require a
-dummy `val` declaration:
-
-```abla fragment
-#registerRoutes()
-```
-
-A `compile` declaration is available only during compilation. A normal,
-phase-safe declaration is available in both phases. Runtime-only native
-capabilities cause a compile-time error when invoked without a compile-time
-provider.
-
-Compile-time evaluation is staged:
-
-1. parse and construct the module graph;
-2. resolve declarations and types;
-3. execute pending compile expressions to a fixed point;
-4. validate the transformed typed program;
-5. generate target code.
-
-Generated declarations are typed before later compile-time code can observe
-them. Mutations are transactional: on diagnostic failure, the program remains
-unchanged. Stable reflection handles expose declarations, types, annotations,
-and syntax builders. They never expose C++ or backend pointers.
+- `#expression` evaluates an expression during compilation and stores the
+  result in the program as a constant. `#` binds to the operand right after
+  it, call and member chain included: `#f() + 1` is `(#f()) + 1`
+  ([details](compile-time.md#expression)).
+- `compile fun` declares a function that exists only during compilation;
+  ordinary functions work in both phases
+  ([details](compile-time.md#compile-fun)).
+- A top-level `#expression` is an action, run for its effect after semantic
+  analysis ([details](compile-time.md#top-level-actions)).
+- `compile val` / `compile var` hold one value for the whole compilation,
+  shared by every compile-time evaluation
+  ([details](compile-time.md#compile-val-and-compile-var)).
+- Files, environment, processes, network, clock and randomness need a
+  capability, authorized in `abla.toml` and requested with
+  `#compilerGrant` ([details](compile-time.md#capabilities-files-environment-processes-network)).
+- Reflection, transforms and generated code are the `abla/compiler` module
+  ([compiler-api.md](compiler-api.md)).
 
 Typed deferred-expression reflection also exposes deterministic state access
 paths. Paths are rooted at semantic parameters, receivers, locals, or globals
@@ -714,90 +698,8 @@ wildcard projections. Function summaries propagate those paths through calls
 by substituting resolved arguments; recursion or an unavailable body widens to
 an explicit unknown result. Extensions may compare read and write paths for
 prefix-aware invalidation and may lift a recorded expression into a generated
-function only by listing explicit, ownership-safe captures. This facility is
-framework-neutral and does not make ordinary values observable at runtime.
-
-Compile-time libraries are ordinary Abla modules. The compiler supplies a
-versioned `compiler` module containing reflection, diagnostics, source,
-filesystem, environment, and process capabilities. Ambient filesystem and
-network access are denied by default. Capability use requires both a package
-authorization beside the entry module and a source-visible request:
-
-```toml
-# abla.toml
-compileCapabilities = ["filesystem.read"]
-```
-
-```abla fragment
-import "abla/compiler"
-import "abla/io"
-#compilerGrant("filesystem.read")
-fun schemaSize(): int {
-    val schema = #ablaHostReadFile("api.json")
-    schema.size
-}
-```
-
-The compiler infers transitive effect bitsets for allocation, compiler access,
-filesystem read/write, environment, process I/O, network, clock, randomness,
-and trusted native calls. A denied staged path fails before evaluation. Until
-an ambient provider has a deterministic input contract, its grant disables
-native object-cache reuse/publication. `filesystem.read` and
-`compilerEnvironment(name)` are deterministic providers: staged reads journal
-their observed provider identity, size, and dual content fingerprint and
-revalidate them on every hit without storing environment values in the cache
-sidecar. The sibling manifest is also part of cache identity. Parser handlers
-and extension finalizers receive the complete granted-effect mask, merge their
-input journals into the same artifact contract, and long-lived frontend
-snapshots revalidate them before reuse. Their request/manifest intersection is
-checked before parser evaluation, since that phase precedes complete semantic
-analysis. Manifest authorization is injected as
-an internal AST marker that ordinary source cannot construct.
-
-`ablaHostListDirectory(path)` (also `filesystem.read`) lists a directory's entry names,
-sorted bytewise so every host sees the same order; the listing is journaled like a read.
-`compilerWriteFile(path, contents)` (`filesystem.write`) stages an output published with
-the compilation; writing the same path again replaces its staged contents, so a handler
-can rewrite one generated file as it learns more. A compilation stages at most 4096
-distinct paths and 256 MiB.
-
-Compile-time globals (`compile val` / `compile var`) hold one value for a whole
-compilation. The first reference evaluates the initializer; what any evaluation then
-changes through it — an object's fields, an array's elements, a `compile var`'s
-assignment — is what every later evaluation sees: parser handlers, finalizers,
-transforms and compile expressions alike, across every module of the compilation. A
-provider can therefore collect what its uses contribute (a table of generated entries,
-say) and write the result once it has it all. Between evaluations the values are kept
-as data, so a kept global holds integers, booleans, strings, null, arrays and objects; a
-value holding anything else (a closure, a handle) is evaluated afresh at each evaluation.
-A module the native cache skips runs no handlers, so a provider that collects from its
-uses wants `--no-cache` builds.
-
-```abla fragment
-class Seen(val names: array<string>)
-compile val seen: Seen = Seen([])
-
-compile fun parseTag(cursor: ParserCursor): SyntaxExpression {
-    seen.names.append(parserRawTakeName(cursor))
-    val unused = compilerWriteFile("build/tags.txt", "${seen.names.size}")
-    syntaxInteger(seen.names.size)
-}
-```
-
-The compiler module also provides bounded clock, random-integer, and process
-execution operations. These require explicit `clock`, `random`, or
-`process.io` grants and always disable native-object cache hits and publication.
-The same watchdog process group bounds the compiler and any staged child.
-
-The version 0.1 bootstrap exposes deterministic read-only function handles,
-complete signatures, selected-call ownership/default/phase/trust metadata,
-canonical method ownership, class-field metadata,
-lexical/direct/member expression inspection, compiler-owned resolved-call
-builders, trust/phase/native metadata, structural syntax inspection, and
-bounded generated virtual modules; see `docs/compiler-api.md`. Generated
-source is parsed and the complete candidate is revalidated rather than exposing
-live host AST objects. Direct finalizers instead publish compiler-owned syntax
-trees with opaque generated-declaration references.
+function only by listing explicit, ownership-safe captures (see
+[compiler-api.md](compiler-api.md)).
 
 ## Compile-time subparsers
 

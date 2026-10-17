@@ -240,6 +240,7 @@ The [documentation index](docs/README.md) lists every document.
 
 - [Language contract](docs/language.md)
 - [Ownership, borrowing and resources](docs/ownership.md)
+- [Compile-time execution](docs/compile-time.md)
 - [Toolchain interface](docs/toolchain.md)
 - [Debugging: lldb, crash stacks, browser developer tools](docs/debugging.md)
 - [Compiler extension API](docs/compiler-api.md)
