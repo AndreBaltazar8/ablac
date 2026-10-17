@@ -236,7 +236,8 @@ under `build/`.
 
 ## Documentation
 
-The [documentation index](docs/README.md) lists every document.
+The [documentation index](docs/README.md) lists every document. New to
+Abla? Start with [the tour](docs/guide.md).
 
 - [Language reference](docs/language.md)
 - [Ownership, borrowing and resources](docs/ownership.md)
