@@ -654,16 +654,15 @@ fun main {
 
 `fun Type.name(...)` adds a function that is called like a method. The
 receiver may be any type: a class, a scalar, `array<int>`, `Map<string, int>`
-or a nullable `string?`. Inside it, `this` is the receiver, and, as in a
-method, the receiver's fields and methods are meant to be in scope by name
-(until the known issue below is fixed, write `this.`):
+or a nullable `string?`. Inside it, `this` is the receiver, and the
+receiver's fields and methods are in scope by name, as in a method:
 
 ```abla
 import "abla/io"
 
 class Point(val x: int, val y: int)
 
-fun Point.length2(): int = this.x * this.x + this.y * this.y
+fun Point.length2(): int = x * x + y * y
 fun int.isEven(): bool = this % 2 == 0
 fun array<int>.total(): int {
     var sum = 0
@@ -678,10 +677,6 @@ fun main {
 // output:
 // 25 true 6
 ```
-
-> Known issue (being fixed by ablac-frontend): inside an extension function,
-> the receiver's fields and methods aren't yet in scope by name as they will
-> be in a method; `x` instead of `this.x` reports `identifier:x`.
 
 ### Lambdas and closures
 
@@ -802,6 +797,11 @@ fun main {
   ([ownership.md](ownership.md#changing-objects-through-references)).
 - A method that changes `this` is detected automatically, and the receiver
   is then treated like a `var` argument.
+- A name means the innermost thing it names: a parameter or local (lambda
+  parameters and loop variables included), then a property or method of the
+  receiver (in a method or an extension function), then a top-level
+  declaration. A method calls the receiver's other methods by plain name,
+  and a parameter named like a top-level function calls the parameter.
 - `resource class` declares a type whose objects have one owner and an
   optional `drop()`
   ([ownership.md](ownership.md#resources-values-with-one-owner)).

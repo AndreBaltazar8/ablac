@@ -8358,6 +8358,9 @@ class BootstrapAnalyzer(
             }
             result = bootstrapInferCall(this, expression, result)
         }
+        if (expression.kind == "call.value") {
+            result = bootstrapInferCallValue(this, expression, result)
+        }
         if (expression.kind == "member") {
             result = bootstrapInferMember(this, expression, result)
         }
@@ -9717,6 +9720,65 @@ fun bootstrapInferCallFilledArray(
     result
 }
 
+/** `receiver.name(arguments)` as a call of the value of `receiver.name`. */
+fun bootstrapMemberCallAsValueCall(expression: BootstrapExpression): BootstrapExpression {
+    val children: array<BootstrapExpression> = [BootstrapExpression(
+        "member", expression.text, expression.begin, expression.end,
+        [expression.children[0]]
+    )]
+    var argument = 1
+    while (argument < expression.children.size) {
+        children.append(expression.children[argument])
+        argument = argument + 1
+    }
+    BootstrapExpression("call.value", "", expression.begin, expression.end, children)
+}
+
+/** A call of a value: `f(1)(2)`, `handlers[0]()`, `(holder.callback)(5)`; the
+ *  callee is any expression of function type, called with its parameters. */
+@noinline
+fun bootstrapInferCallValue(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    val calleeType = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
+    val parameterCount = bootstrapFunctionParameterCount(calleeType)
+    if (!bootstrapIsFunctionType(calleeType)) {
+        if (calleeType != "unknown") analyzer.fail("call.value-target:$calleeType")
+    } else if (parameterCount < 0 || expression.children.size - 1 != parameterCount) {
+        analyzer.fail("function.arity:value")
+    }
+    var argument = 1
+    while (argument < expression.children.size) {
+        val expected = if (bootstrapIsFunctionType(calleeType))
+            bootstrapFunctionParameterType(calleeType, argument - 1) else "unknown"
+        analyzer.contextualizeLambdaParameters(expression.children[argument], expected)
+        val actual = analyzer.infer(expression.children[argument])
+        if (!bootstrapTypesCompatible(expected, actual)) {
+            analyzer.fail("function.argument:value@${expression.children[argument].begin}:$expected:$actual")
+        }
+        if (bootstrapIsFunctionType(calleeType)) {
+            val kind = bootstrapFunctionParameterKind(calleeType, argument - 1)
+            if (kind == "var") {
+                analyzer.validateMutableBorrowArgument(
+                    expression.children[argument], expected, "function.value"
+                )
+            }
+            if (kind == "own") {
+                analyzer.validateOwnershipTransfer(
+                    expected, expression.children[argument], "argument.function.value"
+                )
+            }
+        }
+        argument = argument + 1
+    }
+    result = if (bootstrapIsFunctionType(calleeType))
+        bootstrapFunctionResultType(calleeType) else "unknown"
+    result
+}
+
 @noinline
 fun bootstrapInferCall(
     var analyzer: BootstrapAnalyzer,
@@ -10380,6 +10442,15 @@ fun bootstrapInferMemberCall(
             }
         }
         result = "string"
+    } else if (analyzer.methodParameterCount(receiver, expression.text) < 0 &&
+        bootstrapIsFunctionType(bootstrapBorrowElementType(
+            analyzer.fieldType(receiver, expression.text)
+        ))) {
+        // A function-typed property called like a method (`holder.callback(4)`)
+        // when no method has that name: the property's value is called.
+        result = bootstrapInferCallValue(
+            analyzer, bootstrapMemberCallAsValueCall(expression), result
+        )
     } else {
         val receiverKind = analyzer.methodReceiverKind(
             receiver,

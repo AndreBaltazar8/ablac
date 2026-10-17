@@ -5131,7 +5131,23 @@ class BootstrapLowerer(
                 result = result
             }
         }
-        if (expression.kind == "member.call") {
+        if (expression.kind == "call.value" && expression.children.size > 0) {
+            result = bootstrapFunctionResultType(bootstrapBorrowElementType(
+                this.lowerExpressionType(expression.children[0])
+            ))
+        }
+        if (expression.kind == "member.call" && expression.children.size > 0 &&
+            this.lowerMemberCallsField(
+                bootstrapBorrowElementType(this.lowerExpressionType(expression.children[0])),
+                expression.text
+            )) {
+            result = bootstrapFunctionResultType(bootstrapBorrowElementType(
+                this.lowerFieldType(
+                    bootstrapBorrowElementType(this.lowerExpressionType(expression.children[0])),
+                    expression.text
+                )
+            ))
+        } else if (expression.kind == "member.call") {
             val owner = bootstrapBorrowElementType(
                 this.lowerExpressionType(expression.children[0])
             )
@@ -5332,6 +5348,14 @@ class BootstrapLowerer(
         }
         result
     }
+
+    /** Whether `owner.name(...)` calls a function-typed field: no method of
+     *  that name, and a field of function type. */
+    fun lowerMemberCallsField(owner: string, name: string): bool =
+        this.methodDeclarations.find(owner, name) < 0 &&
+            bootstrapIsFunctionType(bootstrapBorrowElementType(
+                this.lowerFieldType(owner, name)
+            ))
 
     fun lowerMethodParameterKind(
         owner: string,
@@ -6724,6 +6748,9 @@ class BootstrapLowerer(
         }
         if (expression.kind == "member.call") {
             result = bootstrapLowerMemberCall(this, expression, result)
+        }
+        if (expression.kind == "call.value") {
+            result = bootstrapLowerCallValue(this, expression, result)
         }
         if (expression.kind == "member.assign") {
             result = bootstrapLowerMemberAssign(this, expression, result)
@@ -8959,6 +8986,41 @@ fun bootstrapLowerCall(
     result
 }
 
+/** A call of a value (`f(1)(2)`, `handlers[0]()`): the callee is evaluated
+ *  and called indirectly with the arguments. */
+@noinline
+fun bootstrapLowerCallValue(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    initial: int
+): int {
+    var result = initial
+    val calleeType = bootstrapBorrowElementType(
+        lowerer.lowerExpressionType(expression.children[0])
+    )
+    val operands: array<int> = [lowerer.lowerExpression(expression.children[0])]
+    var argument = 1
+    while (argument < expression.children.size) {
+        operands.append(lowerer.lowerExpression(expression.children[argument]))
+        argument = argument + 1
+    }
+    argument = 1
+    while (argument < expression.children.size) {
+        if (bootstrapIsFunctionType(calleeType) &&
+            bootstrapFunctionParameterKind(calleeType, argument - 1) == "var") {
+            lowerer.emitBorrowMutation(expression.children[argument])
+        }
+        argument = argument + 1
+    }
+    result = lowerer.emitMany(
+        if (bootstrapIsOnceFunctionType(calleeType)) "call.indirect.once"
+        else "call.indirect",
+        operands,
+        ""
+    )
+    result
+}
+
 @noinline
 fun bootstrapLowerMember(
     var lowerer: BootstrapLowerer,
@@ -9063,6 +9125,12 @@ fun bootstrapLowerMemberCall(
     val owner = bootstrapBorrowElementType(
         lowerer.lowerExpressionType(expression.children[0])
     )
+    // `holder.callback(4)` with no method `callback`: the field's value is called.
+    if (lowerer.lowerMemberCallsField(owner, expression.text)) {
+        return bootstrapLowerCallValue(
+            lowerer, bootstrapMemberCallAsValueCall(expression), initial
+        )
+    }
     val arguments: array<int> = []
     var argument = 0
     while (argument < expression.children.size) {

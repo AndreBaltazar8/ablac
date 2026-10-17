@@ -5544,6 +5544,7 @@ fun bootstrapEvaluateUncommon(
     40 -> bootstrapEvaluateComplement(evaluator, expression)
     42 -> bootstrapEvaluateBitwise(evaluator, expression)
     50 -> bootstrapEvaluateDoWhile(evaluator, expression)
+    52 -> bootstrapEvaluateCallValue(evaluator, expression)
     else -> bootstrapEvalInvalid()
 }
 
@@ -5621,6 +5622,7 @@ fun bootstrapEvalCase(expression: BootstrapExpression): int {
     if (expression.kind == "while") return 49
     if (expression.kind == "do.while") return 50
     if (expression.kind == "for") return 51
+    if (expression.kind == "call.value") return 52
     0
 }
 
@@ -6571,12 +6573,92 @@ fun bootstrapEvaluateMemberCall(
         val begin = evaluator.evaluate(expression.children[1]).integer
         val end = evaluator.evaluate(expression.children[2]).integer
         result = bootstrapEvalString(receiver.text.slice(begin, end))
+    } else if (receiver.kind == "object" &&
+               bootstrapEvalFieldCallable(evaluator, receiver, expression.text).kind != "invalid") {
+        // `holder.callback(4)` with no method `callback`: the field's value.
+        result = bootstrapEvalCallValueWith(
+            evaluator, expression,
+            bootstrapEvalFieldCallable(evaluator, receiver, expression.text)
+        )
     } else if (receiver.kind == "object" ||
                receiver.kind == "string" ||
                receiver.kind == "integer" ||
                receiver.kind == "boolean") {
         result = evaluator.evaluateMethod(receiver, expression)
     } else result = result
+    result
+}
+
+/** The value of `receiver`'s field `name` when `receiver.name(...)` calls it:
+ *  the receiver's type has no method `name`, and the field holds a function.
+ *  Invalid otherwise. */
+fun bootstrapEvalFieldCallable(
+    evaluator: BootstrapEvaluator,
+    receiver: BootstrapEvalValue,
+    name: string
+): BootstrapEvalValue {
+    var field = -1
+    var index = 0
+    while (index < receiver.fieldNames.size && index < receiver.elements.size) {
+        if (receiver.fieldNames[index] == name) field = index
+        index = index + 1
+    }
+    if (field < 0) return bootstrapEvalInvalid()
+    val value = receiver.elements[field]
+    if (value.kind != "closure" && value.kind != "function") return bootstrapEvalInvalid()
+    for (declaration in evaluator.declarations) {
+        if (declaration.kind == "class" && declaration.name == receiver.owner) {
+            for (method in declaration.methods) {
+                if (method.name == name) return bootstrapEvalInvalid()
+            }
+        }
+        if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+            declaration.name == name && declaration.extensionOwner != "" &&
+            bootstrapNormalizeType(declaration.extensionOwner) ==
+                bootstrapNormalizeType(receiver.owner)) return bootstrapEvalInvalid()
+    }
+    value
+}
+
+/** A call of a value (`f(1)(2)`, `handlers[0]()`): the callee, then the
+ *  arguments, as a call of a closure or of a named function. */
+@noinline
+fun bootstrapEvaluateCallValue(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    val callee = bootstrapEvalUnwrapBorrow(evaluator.evaluate(expression.children[0]))
+    bootstrapEvalCallValueWith(evaluator, expression, callee)
+}
+
+/** Calls `callee` with the arguments of `expression` (its children after the
+ *  first: the callee or the receiver). */
+@noinline
+fun bootstrapEvalCallValueWith(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    callee: BootstrapEvalValue
+): BootstrapEvalValue {
+    val arguments: array<BootstrapExpression> = []
+    var argument = 1
+    while (argument < expression.children.size) {
+        arguments.append(expression.children[argument])
+        argument = argument + 1
+    }
+    var result = bootstrapEvalInvalid()
+    if (callee.kind == "closure") {
+        result = bootstrapEvaluateClosureCall(
+            evaluator,
+            BootstrapExpression("call", "", expression.begin, expression.end, arguments),
+            callee,
+            -1
+        )
+    } else if (callee.kind == "function") {
+        result = evaluator.evaluate(BootstrapExpression(
+            "call", callee.text, expression.begin, expression.end, arguments
+        ))
+    }
+    if (result.kind == "invalid") evaluator.errors = evaluator.errors + 1
     result
 }
 
