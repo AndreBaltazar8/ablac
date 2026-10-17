@@ -1,11 +1,53 @@
 # Scoped allocation regions
 
-Abla's allocation-generation runtime can reclaim many objects in constant
-logical time, but a numeric checkpoint is not a safe public lifetime model.
-`memoryReset(checkpoint)` can invalidate an array, object, string, or closure
+`region { ... }` runs a block whose allocations are all freed at once when
+the block ends: no garbage collection, no per-object work. It suits work that
+builds a lot of temporary data and keeps only a small answer, such as parsing
+one request, compiling one expression or analysing one file. The compiler
+checks that nothing allocated in the region is still reachable when the
+memory is reused.
+
+A region's result must be a scalar (`int`, `bool`, `f64`, ...), because
+anything allocated inside it is about to be freed:
+
+```abla error
+fun main {
+    val text = region {
+        "a" + "b"
+    }
+}
+// error: region.result:string
+```
+
+Nor can the block store a region-allocated value anywhere that outlives it:
+
+```abla error
+class Item(val name: string)
+
+fun main {
+    var saved = Item("outer")
+    val n = region {
+        saved = Item("inner")
+        0
+    }
+}
+// error: region.escape:assignment.saved
+```
+
+The rest of this page gives the complete rules.
+
+> Known issue: a string built with `+` inside a region can currently be
+> assigned to an outer variable without an error, and is corrupted when the
+> memory is reused. Don't assign strings computed inside a region to outer
+> variables.
+
+## Why a checked form
+
+The runtime can reclaim a whole allocation generation in constant time, but
+a raw numeric checkpoint is not a safe lifetime model:
+`memoryReset(checkpoint)` can invalidate an array, object, string or closure
 while an ordinary binding still refers to it. The raw primitive therefore
-remains an internal bootstrap mechanism; source code uses the checked lexical
-form below.
+remains an internal mechanism, and source code uses the checked lexical form.
 
 ## Surface
 

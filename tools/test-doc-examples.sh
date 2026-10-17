@@ -24,7 +24,11 @@
 #                      the same works for any language (```toml file=abla.toml),
 #                      and an abla.toml applies only to the next program
 #
-# Environment: DOC_EXAMPLES_FILTER (a substring of "doc:line" to run a subset),
+# Every relative Markdown link must name an existing file, and an anchor in it
+# a heading of that file.
+#
+# Environment: DOC_EXAMPLES_FILTER (a substring of "doc:line" to run a subset,
+# which also skips the link check), DOC_EXAMPLES_LINKS_ONLY=1 (check links only),
 # DOC_EXAMPLES_KEEP=1 (keep the work directory), ABLA_MAX_SECONDS (per program).
 set -euo pipefail
 
@@ -52,6 +56,7 @@ export ABLA_MAX_CPU_SECONDS=${ABLA_MAX_CPU_SECONDS:-$ABLA_MAX_SECONDS}
 passed=0
 failed=0
 skipped=0
+links=0
 failures=()
 
 fail() { # $1 = location, $2 = reason, $3 = log file (optional)
@@ -133,8 +138,60 @@ check_program() { # $1 = mode, $2 = source, $3 = location, $4 = directory
     passed=$((passed + 1))
 }
 
+# The anchors GitHub gives the headings of a Markdown file, one per line.
+heading_anchors() {
+    awk '
+        /^```/ { fenced = !fenced; next }
+        fenced || !/^#+ / { next }
+        {
+            text = tolower($0); sub(/^#+ +/, "", text)
+            gsub(/[^a-z0-9 _-]/, "", text); gsub(/ /, "-", text)
+            anchor = (seen[text]++ ? text "-" (seen[text] - 1) : text)
+            print anchor
+        }
+    ' "$1"
+}
+
+# Each relative link of a Markdown file outside code, as "line target".
+markdown_links() {
+    awk '
+        /^```/ { fenced = !fenced; next }
+        fenced { next }
+        {
+            line = $0
+            gsub(/`[^`]*`/, "", line)
+            while (match(line, /\]\([^) ]+\)/)) {
+                target = substr(line, RSTART + 2, RLENGTH - 3)
+                line = substr(line, RSTART + RLENGTH)
+                if (target !~ /^[a-z]+:/) print NR " " target
+            }
+        }
+    ' "$1"
+}
+
+check_links() { # $1 = document, $2 = its name for messages
+    local doc=$1 name=$2 line target file anchor resolved
+    while read -r line target; do
+        file=${target%%#*}
+        anchor=
+        [[ $target == *"#"* ]] && anchor=${target#*#}
+        if [[ -z $file ]]; then resolved=$doc
+        else resolved=$(dirname "$doc")/$file; fi
+        if [[ ! -e $resolved ]]; then
+            fail "$name:$line" "broken link: $target"
+        elif [[ -n $anchor && $resolved == *.md ]] &&
+            ! heading_anchors "$resolved" | grep -qxF -- "$anchor"; then
+            fail "$name:$line" "broken link anchor: $target"
+        else
+            links=$((links + 1))
+        fi
+    done < <(markdown_links "$doc")
+}
+
 for doc in "$@"; do
     name=${doc#"$project_root"/}
+    if [[ -z ${DOC_EXAMPLES_FILTER:-} ]]; then check_links "$doc" "$name"; fi
+    [[ ${DOC_EXAMPLES_LINKS_ONLY:-0} == 1 ]] && continue
     doc_dir=$work/$(printf '%s' "$name" | tr '/.' '__')
     mkdir -p "$doc_dir/files" "$doc_dir/blocks"
     # One file per fenced block: blocks/<n>, and a line "<n> <line> <info>" in index.
@@ -178,7 +235,8 @@ for doc in "$@"; do
     done <"$doc_dir/blocks/index"
 done
 
-printf 'doc examples: %d passed, %d failed, %d fragments\n' "$passed" "$failed" "$skipped"
+printf 'doc examples: %d passed, %d failed, %d fragments; %d links checked\n' \
+    "$passed" "$failed" "$skipped" "$links"
 if ((failed > 0)); then
     printf '  %s\n' "${failures[@]}"
     exit 1

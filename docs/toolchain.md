@@ -18,6 +18,7 @@ ablac build app.ab -o build/app --fast --no-cache
 ablac build app.ab -o build/app -g        # debug information in a release build
 ablac run app.ab -- arguments  # compiled in process (--o1 IR pipeline) and called there
 ablac run --built app.ab   # built (--o1, cached) and exec'd
+ablac test tests/*.ab      # build and run test programs (abla/test)
 ablac repl
 ablac serve app.ab
 ```
@@ -31,6 +32,10 @@ its own, and none of the compiler's memory stays behind, which suits a
 long-running program. The executable is kept as `build/.abla-run/<source path>`.
 Either way the program keeps the standard streams, the working directory and
 the environment.
+
+`ablac test` builds each test program into `build/abla-test/`, runs it,
+prints `PASS <file>` or `FAIL <file> (exit <status>)` and a summary, and
+exits with 1 when any failed; see [stdlib/testing.md](stdlib/testing.md).
 
 Built-in hosted targets are `x86_64-linux`, `x86_64-macos`, and
 `arm64-macos`. Cross-linking Mach-O on Linux requires `ABLA_MACOS_SDK`; optional

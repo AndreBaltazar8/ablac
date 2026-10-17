@@ -84,6 +84,9 @@ fun main: int {
 A ` ```toml file=abla.toml ` block applies to the next program only, which is
 how a document shows a compile-time capability grant.
 
+The same tool checks that every relative link names an existing file and,
+when it has a `#anchor`, a heading in that file.
+
 Run the checks for one document while editing it:
 
 ```sh
