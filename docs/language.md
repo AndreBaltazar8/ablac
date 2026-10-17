@@ -170,9 +170,10 @@ lines")
 A `$` that isn't followed by a letter, `_` or `{` is ordinary text (`"$5"`,
 `"cost: $"`), and `\$` always is.
 
-A template may insert strings, integers of any width, `bool`, and
-`f64`/`f32` (with `import "abla/float/text"`; without it the error says so).
-Other types, `char` included, are `string.interpolation:<type>`.
+A template may insert strings, integers of any width (in decimal, a `u64`
+unsigned), a `char` (as its character), a nominal scalar (as the value it
+wraps), `bool`, and `f64`/`f32` (with `import "abla/float/text"`; without it
+the error says so). Other types are `string.interpolation:<type>`.
 A nullable value must be checked for `null` first
 (`string.interpolation:nullable:...`). A template made only of literal text
 and top-level `val`s holding such strings is folded into one constant at
@@ -334,9 +335,10 @@ fun main {
 > quietly give 0 at run time (`7 % 0` gives 7 under `#`), and
 > `-9223372036854775808 / -1` gives 0 at run time.
 
-> Known issue (being fixed by ablac-backend): an `int` argument passed to a parameter of a narrower type
-> (`u8`, `i32`, ...) is narrowed implicitly, without a conversion call. Write
-> the conversion anyway; the implicit form may become an error.
+- An `int` argument for a parameter of a narrower type (`u8`, `i32`, ...) of
+  a function, method or constructor is `integer.narrowing`: write `u8(value)`
+  to keep the low bits. An integer literal that fits, or an `if` of such
+  literals, needs no conversion (`take(200)`).
 
 ### Floating point
 
@@ -561,25 +563,23 @@ fun idNumber(id: UserId): int = id
 
 fun main {
     val id = UserId(41)
-    println("user ${idNumber(id.next())}")
-    println("${id + 1}")
+    val raw: int = id
+    println("user ${idNumber(id.next())} $id")
+    println("${raw + 1}")
 }
 // output:
-// user 42
+// user 42 41
 // 42
 ```
 
 - `UserId(41)` converts an `int` to a `UserId`. An `int` is not accepted
   where a `UserId` is required (`function.argument:...:UserId:i64`).
 - The other direction is implicit: a `UserId` is accepted where an `int` is,
-  as an argument, a result or an operand. Arithmetic produces the underlying
-  type, so wrapping the result is explicit.
+  as an argument, a typed local, a result, an operand or in a string
+  template. Arithmetic produces the underlying type, so wrapping the result is
+  explicit.
 - Inside an extension of a nominal type, `this` is the underlying value.
 - `type` is a keyword only at the start of a declaration.
-
-> Known issue (being fixed by ablac-backend): a nominal value can't yet initialize a typed local
-> (`val raw: int = id`) or be inserted into a string template directly.
-> Pass it through a function, as `idNumber` does.
 
 ### Function types
 

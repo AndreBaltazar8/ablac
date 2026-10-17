@@ -154,6 +154,7 @@ test: ablac
 	tools/test-compile-eval-jit.sh $(COMPILER)
 	tools/test-compile-native.sh $(COMPILER)
 	tools/test-compile-time-scalars.sh $(COMPILER)
+	tools/test-integer-narrowing.sh $(COMPILER)
 	tools/test-resource-drop-link.sh $(COMPILER)
 	tools/test-optimize-o1.sh $(COMPILER)
 	tools/test-map.sh $(COMPILER)

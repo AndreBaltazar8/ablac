@@ -1901,6 +1901,58 @@ fun bootstrapTypesCompatible(expected: string, actual: string): bool {
     compatible
 }
 
+/** An int (i64) argument for a narrower integer parameter, which would keep
+ *  only its low bits: it must be converted explicitly (`u8(value)`). An
+ *  integer literal that fits the parameter's type needs no conversion. */
+fun bootstrapImplicitIntegerNarrowing(
+    expected: string,
+    actual: string,
+    argument: BootstrapExpression
+): bool {
+    if (actual != "i64") return false
+    var minimum = 0
+    var maximum = 0
+    if (expected == "i8") {
+        minimum = -128
+        maximum = 127
+    } else if (expected == "u8" || expected == "char") maximum = 255
+    else if (expected == "i16") {
+        minimum = -32768
+        maximum = 32767
+    } else if (expected == "u16") maximum = 65535
+    else if (expected == "i32") {
+        minimum = -2147483648
+        maximum = 2147483647
+    } else if (expected == "u32") maximum = 4294967295
+    else return false
+    !bootstrapIntegerLiteralFits(argument, minimum, maximum)
+}
+
+/** Whether `expression` is an integer literal in [minimum, maximum], or an
+ *  `if` whose results all are. */
+fun bootstrapIntegerLiteralFits(
+    expression: BootstrapExpression,
+    minimum: int,
+    maximum: int
+): bool {
+    if (expression.kind == "block" && expression.children.size == 1) {
+        return bootstrapIntegerLiteralFits(expression.children[0], minimum, maximum)
+    }
+    if (expression.kind == "if" && expression.children.size == 3) {
+        return bootstrapIntegerLiteralFits(expression.children[1], minimum, maximum) &&
+            bootstrapIntegerLiteralFits(expression.children[2], minimum, maximum)
+    }
+    var literal = expression
+    val negative = literal.kind == "unary-" && literal.children.size == 1
+    if (negative) literal = literal.children[0]
+    if (literal.kind != "integer" || literal.text.size == 0 ||
+        literal.text[0] == 45 || literal.text.size > 10) return false
+    var value = 0
+    for (byte in literal.text) value = value * 10 + byte - 48
+    if (negative) value = 0 - value
+    value >= minimum && value <= maximum
+}
+
 fun bootstrapTypesCompatibleWithInferredNoEscape(
     expected: string,
     actual: string,
@@ -2228,6 +2280,8 @@ fun bootstrapSemanticHelp(code: string): string {
             "no imported module registers this `\$name` subparser: import the module that does (for example `import \"abla/json\"` for `\$json` and `\$jsons`)"
         "generator.yield-position" ->
             "a `yield` is a statement of the generator's body: of a block, a branch of a statement `if` or `when`, or a loop body; it has no value, so it cannot be part of an expression. Nor can it be inside a `region`: while the generator is suspended its consumer runs, and what the consumer allocates would land in the region and be freed with it"
+        "integer.narrowing" ->
+            "an int does not narrow implicitly where a narrower integer is expected: convert it explicitly, e.g. u8(value), which keeps the low bits; an integer literal that fits needs no conversion"
         "ownership.borrow-mutation" ->
             "it is borrowed here (reached through a parameter or another alias), so it cannot be changed: declare the parameter `var` to change the caller's value, or change a copy"
         "ownership.borrow-store" ->
@@ -9467,9 +9521,12 @@ fun bootstrapInferStringTemplate(
     while (part < expression.children.size) {
         // A borrowed part (a field read through an alias) is copied
         // into the text there and then, so it is its element type.
-        val partType = bootstrapBorrowElementType(
+        val inferredPart = bootstrapBorrowElementType(
             analyzer.infer(expression.children[part])
         )
+        // A nominal scalar is written as the value it wraps.
+        val partUnderlying = analyzer.scalarTypeUnderlying(inferredPart)
+        val partType = if (partUnderlying != "") partUnderlying else inferredPart
         // A float is written by abla/float/text's f64Text, the
         // shortest text that reads back as it (as JavaScript does).
         val float = partType == "f64" || partType == "f32"
@@ -9478,9 +9535,9 @@ fun bootstrapInferStringTemplate(
                 "string.interpolation:$partType: import \"abla/float/text\" to interpolate a float"
             )
         }
-        // A fixed-width integer is written as its decimal value.
-        val integer = bootstrapIsIntegerScalarType(partType) &&
-            bootstrapNormalizeType(partType) != "char"
+        // A fixed-width integer is written as its decimal value, a char as
+        // its character.
+        val integer = bootstrapIsIntegerScalarType(partType)
         // An unknown part follows an error already reported (an unknown
         // method or name): one mistake, one error.
         if (!float && !integer && partType != "string" &&
@@ -10178,7 +10235,12 @@ fun bootstrapInferCall(
                     argument
                 )
             }
-            if (!bootstrapTypesCompatibleWithInferredNoEscape(
+            if (bootstrapImplicitIntegerNarrowing(
+                expected, analyzer.scalarValueType(actual),
+                expression.children[argument]
+            )) {
+                analyzer.fail("integer.narrowing:${expression.text}@${expression.children[argument].begin}:$expected:$actual")
+            } else if (!bootstrapTypesCompatibleWithInferredNoEscape(
                 expected,
                 actual,
                 expression.children[argument],
@@ -10243,7 +10305,12 @@ fun bootstrapInferCall(
             val expected = bootstrapNormalizeType(
                 declaration.parameterTypes[parameter]
             )
-            if (!bootstrapTypesCompatible(expected, actual)) {
+            if (bootstrapImplicitIntegerNarrowing(
+                expected, analyzer.scalarValueType(actual),
+                expression.children[parameter]
+            )) {
+                analyzer.fail("integer.narrowing:${expression.text}@${expression.children[parameter].begin}:$expected:$actual")
+            } else if (!bootstrapTypesCompatible(expected, actual)) {
                 analyzer.fail("constructor.argument:${expression.text}")
             }
             if (parameter < declaration.parameterKinds.size &&
@@ -10272,9 +10339,10 @@ fun bootstrapInferCall(
         if (expression.children.size != 1) {
             analyzer.fail("type.constructor-arity:${expression.text}")
         }
+        // A nominal scalar converts as the value it wraps.
         if (expression.children.size == 1 &&
             !bootstrapScalarConversionCompatible(
-                underlying, resolvedArgumentTypes[0]
+                underlying, analyzer.scalarValueType(resolvedArgumentTypes[0])
             )) {
             analyzer.fail("type.constructor-argument:${expression.text}")
         }
@@ -10725,7 +10793,12 @@ fun bootstrapInferMemberCall(
                 expected
             )
             val actual = analyzer.infer(expression.children[argument])
-            if (!bootstrapTypesCompatibleWithInferredNoEscape(
+            if (bootstrapImplicitIntegerNarrowing(
+                expected, analyzer.scalarValueType(actual),
+                expression.children[argument]
+            )) {
+                analyzer.fail("integer.narrowing:${receiver}.${expression.text}@${expression.children[argument].begin}:$expected:$actual")
+            } else if (!bootstrapTypesCompatibleWithInferredNoEscape(
                 expected,
                 actual,
                 expression.children[argument],
@@ -11254,7 +11327,7 @@ fun bootstrapInferLocal(
         } else {
             type = declaredType
             if (hasInitializer &&
-                !bootstrapTypesCompatible(type, initializerType)) {
+                !analyzer.typesCompatible(type, initializerType)) {
                 analyzer.fail("local.initializer:${expression.text}")
             }
             bootstrapSemanticUnit()
@@ -11325,7 +11398,7 @@ fun bootstrapInferAssign(
         analyzer.fail("ownership.borrow-store:assignment.${expression.text}")
     }
     if (target == "unknown" ||
-        !bootstrapTypesCompatible(target, value)) {
+        !analyzer.typesCompatible(target, value)) {
         analyzer.fail(
             "assignment.type:${expression.text}@${expression.begin}"
         )
