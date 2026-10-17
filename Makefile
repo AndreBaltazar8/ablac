@@ -186,6 +186,9 @@ test: ablac
 	tools/test-float-integer-saturation.sh $(COMPILER)
 	tools/test-named-method-arguments.sh $(COMPILER)
 	tools/test-map-resources.sh $(COMPILER)
+	tools/test-definite-assignment.sh $(COMPILER)
+	tools/test-shared-ownership.sh $(COMPILER)
+	tools/test-mutex.sh $(COMPILER)
 
 check: test self-rebuild
 
