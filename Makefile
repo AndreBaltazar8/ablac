@@ -113,6 +113,7 @@ test: ablac
 	tools/test-string-retention.sh $(COMPILER)
 	tools/test-process-exit.sh $(COMPILER)
 	tools/test-main-void.sh $(COMPILER)
+	tools/test-generators-tasks.sh $(COMPILER)
 	tools/test-run-built.sh $(COMPILER)
 	tools/test-jit-host-selection.sh $(COMPILER)
 	tools/test-jit-http.sh $(COMPILER)
