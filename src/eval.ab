@@ -5272,6 +5272,91 @@ fun bootstrapEvaluateFrom(
     result
 }
 
+// A program global (`val` / `var`) read by compile-time code: like a `compile val`,
+// one value for the whole compilation, so what compile-time code changes through
+// it or assigns to it is what every later evaluation reads, as within one run of
+// the program. The program itself starts from its own initializer; nothing leaks
+// into it. The program initializes its globals before anything changes them, so
+// an initializer here reads the others' initial values (`initial:` keys), not
+// what the evaluation has changed since: a global first read after another was
+// assigned still starts where the program's does.
+fun bootstrapRuntimeGlobalKey(declaration: BootstrapDeclaration): string =
+    "runtime:${bootstrapCompileGlobalKey(declaration)}"
+
+fun bootstrapEvalGlobalSlot(evaluator: BootstrapEvaluator, key: string): int {
+    var index = 0
+    while (index < evaluator.globalKeys.size) {
+        if (evaluator.globalKeys[index] == key) return index
+        index = index + 1
+    }
+    -1
+}
+
+@noinline
+fun bootstrapRuntimeGlobal(
+    var evaluator: BootstrapEvaluator,
+    declaration: BootstrapDeclaration
+): BootstrapEvalValue {
+    var initializing = false
+    var binding = evaluator.names.size
+    while (!initializing && binding > 0) {
+        binding = binding - 1
+        if (evaluator.names[binding] == "#initial") initializing = true
+    }
+    val key = if (initializing) "initial:${bootstrapCompileGlobalKey(declaration)}"
+        else bootstrapRuntimeGlobalKey(declaration)
+    val slot = bootstrapEvalGlobalSlot(evaluator, key)
+    if (slot >= 0) return evaluator.globalValues[slot]
+    var value = bootstrapCompileGlobalLoad(key)
+    if (value.kind == "invalid" && !initializing) {
+        value = bootstrapRuntimeGlobalInitial(evaluator, declaration)
+    } else if (value.kind == "invalid") {
+        // In a scope of its own: the initializer sees globals, not the locals
+        // of the code that first read it.
+        var initializer = bootstrapEvalInvocation(
+            evaluator, ["#initial"], [bootstrapEvalVoid()], [false]
+        )
+        value = bootstrapEvaluateFrom(
+            initializer, declaration.sourceIdentity, declaration.expression
+        )
+        evaluator.errors = initializer.errors
+        evaluator.steps = initializer.steps
+        evaluator.diagnostics = initializer.diagnostics
+    }
+    evaluator.globalKeys.append(key)
+    evaluator.globalValues.append(value)
+    value
+}
+
+// A global's initial value: its initializer, reading the initial values of
+// the globals it names. The live value starts as this same value (an object
+// stays one object, whichever way it is reached).
+fun bootstrapRuntimeGlobalInitial(
+    var evaluator: BootstrapEvaluator,
+    declaration: BootstrapDeclaration
+): BootstrapEvalValue {
+    var initializer = bootstrapEvalInvocation(
+        evaluator, ["#initial"], [bootstrapEvalVoid()], [false]
+    )
+    val value = bootstrapRuntimeGlobal(initializer, declaration)
+    evaluator.errors = initializer.errors
+    evaluator.steps = initializer.steps
+    evaluator.diagnostics = initializer.diagnostics
+    value
+}
+
+/** The program `var` global named `name`, -1 none. */
+fun bootstrapRuntimeVar(evaluator: BootstrapEvaluator, name: string): int {
+    var result = -1
+    var index = 0
+    while (index < evaluator.declarations.size) {
+        if (evaluator.declarations[index].kind == "var" &&
+            evaluator.declarations[index].name == name) result = index
+        index = index + 1
+    }
+    result
+}
+
 // A failed `#` expression of the program: its diagnostics, counted as one error
 // per `error[` line (bootstrapDiagnosedLoweringErrors).
 fun bootstrapStageEvaluationFailure(diagnostics: string): void {
@@ -5776,9 +5861,7 @@ fun bootstrapEvaluateIdentifier(
                 } else if (declaration.kind == "compile.val" ||
                     declaration.kind == "compile.var") {
                     result = evaluator.compileGlobal(declaration)
-                } else result = bootstrapEvaluateFrom(
-                    evaluator, declaration.sourceIdentity, declaration.expression
-                )
+                } else result = bootstrapRuntimeGlobal(evaluator, declaration)
             }
             if ((declaration.kind == "fun" ||
                  declaration.kind == "compile.fun") &&
@@ -6074,6 +6157,27 @@ fun bootstrapEvaluateAssign(
         // A `compile var` takes the new value for the rest of the compilation.
         val declaration = evaluator.declarations[evaluator.compileVar(expression.text)]
         val key = bootstrapCompileGlobalKey(declaration)
+        val value = evaluator.evaluate(expression.children[0])
+        var slot = -1
+        var index = 0
+        while (index < evaluator.globalKeys.size) {
+            if (evaluator.globalKeys[index] == key) slot = index
+            index = index + 1
+        }
+        if (slot >= 0) evaluator.globalValues[slot] = value
+        else {
+            evaluator.globalKeys.append(key)
+            evaluator.globalValues.append(value)
+        }
+        result = value
+    } else if (expression.kind == "assign" && evaluator.find(expression.text) < 0 &&
+        evaluator.delegatedSlot(expression.text).kind != "delegate" &&
+        bootstrapRuntimeVar(evaluator, expression.text) >= 0) {
+        // A program `var` assigned by compile-time code: its value for the rest
+        // of the compilation (bootstrapRuntimeGlobal).
+        val declaration =
+            evaluator.declarations[bootstrapRuntimeVar(evaluator, expression.text)]
+        val key = bootstrapRuntimeGlobalKey(declaration)
         val value = evaluator.evaluate(expression.children[0])
         var slot = -1
         var index = 0
