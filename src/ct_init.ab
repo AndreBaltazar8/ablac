@@ -1,0 +1,473 @@
+// Global initialization order: top-level values initialize in dependency
+// order. A value whose initializer reads another value, directly or through
+// the functions and methods it calls (in any module), initializes after it;
+// among values ready at the same time the earliest declared goes first. A
+// cycle is `global.initialization-cycle:a->b->a`, so no initializer (at run
+// time or under `#`) can read a value that isn't initialized yet.
+//
+// The analysis records what each body reads as it resolves names: the body
+// being analyzed (a value's initializer, a function's, a method's) is the
+// owner of an edge to each top-level value, function, method or class it
+// names. Lambdas count for the body they are written in: they may run during
+// the initialization.
+
+class BootstrapInitEdges(
+    val from: array<int>,
+    val to: array<int>,
+    // The body being analyzed (its method handle), -1 for none.
+    var owner: int,
+    // By symbol: the method handle it names, -1 none, -2 not looked up yet.
+    val symbolHandles: array<int>
+)
+
+fun bootstrapNoInitEdges(): BootstrapInitEdges =
+    BootstrapInitEdges([], [], -1, [])
+
+/** The current body reads (or calls) the declaration with handle `target`. */
+fun bootstrapInitRecord(var analyzer: BootstrapAnalyzer, target: int): void {
+    val owner = analyzer.initEdges.owner
+    if (owner < 0 || target < 0) return
+    val count = analyzer.initEdges.from.size
+    if (count > 0 && analyzer.initEdges.from[count - 1] == owner &&
+        analyzer.initEdges.to[count - 1] == target) return
+    analyzer.initEdges.from.append(owner)
+    analyzer.initEdges.to.append(target)
+    return
+}
+
+/** The current body names global symbol `index`. */
+fun bootstrapInitRecordSymbol(var analyzer: BootstrapAnalyzer, index: int): void {
+    if (analyzer.initEdges.owner < 0) return
+    while (analyzer.initEdges.symbolHandles.size <= index) {
+        analyzer.initEdges.symbolHandles.append(-2)
+    }
+    var handle = analyzer.initEdges.symbolHandles[index]
+    if (handle == -2) {
+        handle = bootstrapInitSymbolHandle(analyzer, index)
+        analyzer.initEdges.symbolHandles[index] = handle
+    }
+    bootstrapInitRecord(analyzer, handle)
+    return
+}
+
+fun bootstrapInitSymbolHandle(var analyzer: BootstrapAnalyzer, index: int): int {
+    val symbol = analyzer.symbols[index]
+    if (bootstrapDeclarationIsValue(symbol.kind) || symbol.kind == "class") {
+        val entry = analyzer.topLevelNames.find(symbol.name)
+        if (entry < 0 || analyzer.topLevelNames.counts[entry] != 1) return -1
+        return analyzer.topLevelNames.firsts[entry]
+    }
+    if (symbol.kind != "fun" && symbol.kind != "compile.fun") return -1
+    var dot = symbol.name.size - 1
+    while (dot >= 0 && symbol.name[dot] != 46) dot = dot - 1
+    if (dot < 0) return analyzer.functionDeclarations.find(symbol.name)
+    val entry = analyzer.methodDeclarations.find(
+        symbol.name.slice(0, dot),
+        symbol.name.slice(dot + 1, symbol.name.size)
+    )
+    if (entry < 0) -1 else analyzer.methodDeclarations.handles[entry]
+}
+
+/** The top-level names a class's parameter defaults read (they run when it
+ *  is constructed), as edges from the class. */
+fun bootstrapInitCollectNames(
+    analyzer: BootstrapAnalyzer,
+    owner: int,
+    expression: BootstrapExpression,
+    var from: array<int>,
+    var to: array<int>
+): void {
+    if (expression.kind == "identifier" || expression.kind == "call") {
+        val entry = analyzer.topLevelNames.find(expression.text)
+        if (entry >= 0 && analyzer.topLevelNames.counts[entry] == 1) {
+            from.append(owner)
+            to.append(analyzer.topLevelNames.firsts[entry])
+        }
+    }
+    for (child in expression.children) {
+        bootstrapInitCollectNames(analyzer, owner, child, from, to)
+    }
+    return
+}
+
+/** The values' initialization: the order the `val`/`var` declarations
+ *  initialize in (their indices; [] after a cycle) and each cycle, once. */
+class BootstrapInitialization(
+    val order: array<int>,
+    val cyclePaths: array<string>,
+    val cycleSources: array<string>,
+    val cycleBegins: array<int>
+)
+
+/** Reports the values' initialization cycles; returns their order. */
+fun bootstrapCheckInitialization(var analyzer: BootstrapAnalyzer): array<int> {
+    val checked = bootstrapInitialization(analyzer)
+    var cycle = 0
+    val source = analyzer.currentSourceIdentity
+    while (cycle < checked.cyclePaths.size) {
+        analyzer.currentSourceIdentity = checked.cycleSources[cycle]
+        analyzer.fail(
+            "global.initialization-cycle:${checked.cyclePaths[cycle]}@${checked.cycleBegins[cycle]}"
+        )
+        cycle = cycle + 1
+    }
+    analyzer.currentSourceIdentity = source
+    val order: array<int> = []
+    for (value in checked.order) order.append(value)
+    order
+}
+
+fun bootstrapInitialization(analyzer: BootstrapAnalyzer): BootstrapInitialization {
+    val declarations = analyzer.declarations
+    var nodes = declarations.size
+    for (handle in analyzer.methodDeclarations.handles) {
+        if (handle + 1 > nodes) nodes = handle + 1
+    }
+    val from: array<int> = []
+    val to: array<int> = []
+    var edge = 0
+    while (edge < analyzer.initEdges.from.size) {
+        from.append(analyzer.initEdges.from[edge])
+        to.append(analyzer.initEdges.to[edge])
+        edge = edge + 1
+    }
+    var index = 0
+    while (index < declarations.size) {
+        if (declarations[index].kind == "class") {
+            for (value in declarations[index].parameterDefaults) {
+                bootstrapInitCollectNames(analyzer, index, value, from, to)
+            }
+        }
+        index = index + 1
+    }
+    // Adjacency (compressed rows).
+    val starts: array<int> = []
+    index = 0
+    while (index <= nodes) {
+        starts.append(0)
+        index = index + 1
+    }
+    edge = 0
+    while (edge < from.size) {
+        if (from[edge] < nodes && to[edge] < nodes) {
+            starts[from[edge] + 1] = starts[from[edge] + 1] + 1
+        }
+        edge = edge + 1
+    }
+    index = 0
+    while (index < nodes) {
+        starts[index + 1] = starts[index + 1] + starts[index]
+        index = index + 1
+    }
+    val fill: array<int> = []
+    val targets: array<int> = []
+    index = 0
+    while (index < nodes) {
+        fill.append(starts[index])
+        index = index + 1
+    }
+    while (targets.size < starts[nodes]) targets.append(0)
+    edge = 0
+    while (edge < from.size) {
+        if (from[edge] < nodes && to[edge] < nodes) {
+            targets[fill[from[edge]]] = to[edge]
+            fill[from[edge]] = fill[from[edge]] + 1
+        }
+        edge = edge + 1
+    }
+    val isValue: array<bool> = []
+    index = 0
+    while (index < nodes) {
+        isValue.append(index < declarations.size &&
+            bootstrapDeclarationIsValue(declarations[index].kind))
+        index = index + 1
+    }
+    // Each value's dependencies: the values it reaches through bodies that
+    // aren't values (a value reached is its own initializer's concern).
+    val dependencyStarts: array<int> = []
+    val dependencies: array<int> = []
+    val stamp: array<int> = []
+    index = 0
+    while (index < nodes) {
+        stamp.append(-1)
+        index = index + 1
+    }
+    val stack: array<int> = []
+    index = 0
+    while (index < declarations.size) {
+        dependencyStarts.append(dependencies.size)
+        if (isValue[index]) {
+            stack.append(index)
+            stamp[index] = index
+            var reachedSelf = false
+            while (stack.size > 0) {
+                val node = stack[stack.size - 1]
+                stack.truncate(stack.size - 1)
+                var next = starts[node]
+                while (next < starts[node + 1]) {
+                    val target = targets[next]
+                    if (target == index) {
+                        if (!reachedSelf) dependencies.append(index)
+                        reachedSelf = true
+                    } else if (stamp[target] != index) {
+                        stamp[target] = index
+                        if (isValue[target]) dependencies.append(target)
+                        else stack.append(target)
+                    }
+                    next = next + 1
+                }
+            }
+        }
+        index = index + 1
+    }
+    dependencyStarts.append(dependencies.size)
+    val cyclePaths: array<string> = []
+    val cycleSources: array<string> = []
+    val cycleBegins: array<int> = []
+    bootstrapInitializationCycles(
+        declarations, isValue, dependencyStarts, dependencies,
+        cyclePaths, cycleSources, cycleBegins
+    )
+    val order: array<int> = []
+    if (cyclePaths.size > 0) {
+        return BootstrapInitialization(order, cyclePaths, cycleSources, cycleBegins)
+    }
+    // Kahn's order, the earliest declared ready value first.
+    val waiting: array<int> = []
+    val dependents: array<int> = []
+    val dependentStarts: array<int> = []
+    index = 0
+    while (index <= declarations.size) {
+        dependentStarts.append(0)
+        if (index < declarations.size) waiting.append(0)
+        index = index + 1
+    }
+    index = 0
+    while (index < declarations.size) {
+        var dependency = dependencyStarts[index]
+        while (dependency < dependencyStarts[index + 1]) {
+            val needed = dependencies[dependency]
+            waiting[index] = waiting[index] + 1
+            dependentStarts[needed + 1] = dependentStarts[needed + 1] + 1
+            dependency = dependency + 1
+        }
+        index = index + 1
+    }
+    index = 0
+    while (index < declarations.size) {
+        dependentStarts[index + 1] = dependentStarts[index + 1] + dependentStarts[index]
+        index = index + 1
+    }
+    val dependentFill: array<int> = []
+    index = 0
+    while (index < declarations.size) {
+        dependentFill.append(dependentStarts[index])
+        index = index + 1
+    }
+    while (dependents.size < dependentStarts[declarations.size]) dependents.append(0)
+    index = 0
+    while (index < declarations.size) {
+        var dependency = dependencyStarts[index]
+        while (dependency < dependencyStarts[index + 1]) {
+            val needed = dependencies[dependency]
+            dependents[dependentFill[needed]] = index
+            dependentFill[needed] = dependentFill[needed] + 1
+            dependency = dependency + 1
+        }
+        index = index + 1
+    }
+    // `ready` is kept sorted, so its front is the earliest declared.
+    val ready: array<int> = []
+    index = 0
+    while (index < declarations.size) {
+        if (isValue[index] && waiting[index] == 0) ready.append(index)
+        index = index + 1
+    }
+    var front = 0
+    while (front < ready.size) {
+        val value = ready[front]
+        front = front + 1
+        if (declarations[value].kind == "val" || declarations[value].kind == "var") {
+            order.append(value)
+        }
+        var dependent = dependentStarts[value]
+        while (dependent < dependentStarts[value + 1]) {
+            val waiter = dependents[dependent]
+            waiting[waiter] = waiting[waiter] - 1
+            if (waiting[waiter] == 0) {
+                // Insert in order among the values not taken yet.
+                ready.append(waiter)
+                var slot = ready.size - 1
+                while (slot > front && ready[slot - 1] > waiter) {
+                    ready[slot] = ready[slot - 1]
+                    slot = slot - 1
+                }
+                ready[slot] = waiter
+            }
+            dependent = dependent + 1
+        }
+    }
+    BootstrapInitialization(order, cyclePaths, cycleSources, cycleBegins)
+}
+
+/** Each cycle among the values once, as the shortest path from its earliest
+ *  declared value back to itself, with where that value is declared. */
+fun bootstrapInitializationCycles(
+    declarations: array<BootstrapDeclaration>,
+    isValue: array<bool>,
+    dependencyStarts: array<int>,
+    dependencies: array<int>,
+    var paths: array<string>,
+    var sources: array<string>,
+    var begins: array<int>
+): void {
+    val component = bootstrapInitComponents(declarations.size, dependencyStarts, dependencies)
+    val reported: array<bool> = []
+    val parent: array<int> = []
+    val sizes: array<int> = []
+    var index = 0
+    while (index < declarations.size) {
+        reported.append(false)
+        parent.append(-1)
+        sizes.append(0)
+        index = index + 1
+    }
+    index = 0
+    while (index < declarations.size) {
+        sizes[component[index]] = sizes[component[index]] + 1
+        index = index + 1
+    }
+    index = 0
+    while (index < declarations.size) {
+        if (isValue[index] && !reported[component[index]]) {
+            // In a cycle when it reaches itself within its component.
+            var self = false
+            val size = sizes[component[index]]
+            var dependency = dependencyStarts[index]
+            while (dependency < dependencyStarts[index + 1]) {
+                if (dependencies[dependency] == index) self = true
+                dependency = dependency + 1
+            }
+            if (size > 1 || self) {
+                reported[component[index]] = true
+                var path = "${declarations[index].name}"
+                if (!self) {
+                    // Breadth first from `index` back to it, inside the component.
+                    val queue: array<int> = [index]
+                    val touched: array<int> = [index]
+                    parent[index] = index
+                    var head = 0
+                    var closing = -1
+                    while (head < queue.size && closing < 0) {
+                        val node = queue[head]
+                        head = head + 1
+                        var next = dependencyStarts[node]
+                        while (next < dependencyStarts[node + 1] && closing < 0) {
+                            val target = dependencies[next]
+                            if (target == index) closing = node
+                            else if (component[target] == component[index] &&
+                                     parent[target] < 0) {
+                                parent[target] = node
+                                touched.append(target)
+                                queue.append(target)
+                            }
+                            next = next + 1
+                        }
+                    }
+                    val reversed: array<string> = []
+                    var node = closing
+                    while (node != index && node >= 0) {
+                        reversed.append("${declarations[node].name}")
+                        node = parent[node]
+                    }
+                    var step = reversed.size - 1
+                    while (step >= 0) {
+                        path = "$path->${reversed[step]}"
+                        step = step - 1
+                    }
+                    for (reset in touched) parent[reset] = -1
+                }
+                path = "$path->${declarations[index].name}"
+                paths.append(path)
+                sources.append("${declarations[index].sourceIdentity}")
+                begins.append(declarations[index].begin)
+            }
+        }
+        index = index + 1
+    }
+    return
+}
+
+/** Strongly connected components (Tarjan, iterative): each node's component,
+ *  numbered by its first node. */
+fun bootstrapInitComponents(
+    count: int,
+    starts: array<int>,
+    targets: array<int>
+): array<int> {
+    val order: array<int> = []
+    val low: array<int> = []
+    val component: array<int> = []
+    val onStack: array<bool> = []
+    var index = 0
+    while (index < count) {
+        order.append(-1)
+        low.append(0)
+        component.append(-1)
+        onStack.append(false)
+        index = index + 1
+    }
+    val stack: array<int> = []
+    val callNodes: array<int> = []
+    val callNext: array<int> = []
+    var counter = 0
+    var root = 0
+    while (root < count) {
+        if (order[root] < 0) {
+            callNodes.append(root)
+            callNext.append(starts[root])
+            order[root] = counter
+            low[root] = counter
+            counter = counter + 1
+            stack.append(root)
+            onStack[root] = true
+            while (callNodes.size > 0) {
+                val top = callNodes.size - 1
+                val node = callNodes[top]
+                if (callNext[top] < starts[node + 1]) {
+                    val target = targets[callNext[top]]
+                    callNext[top] = callNext[top] + 1
+                    if (order[target] < 0) {
+                        order[target] = counter
+                        low[target] = counter
+                        counter = counter + 1
+                        stack.append(target)
+                        onStack[target] = true
+                        callNodes.append(target)
+                        callNext.append(starts[target])
+                    } else if (onStack[target] && order[target] < low[node]) {
+                        low[node] = order[target]
+                    }
+                } else {
+                    if (low[node] == order[node]) {
+                        var member = -1
+                        while (member != node) {
+                            member = stack[stack.size - 1]
+                            stack.truncate(stack.size - 1)
+                            onStack[member] = false
+                            component[member] = node
+                        }
+                    }
+                    callNodes.truncate(top)
+                    callNext.truncate(top)
+                    if (top > 0) {
+                        val caller = callNodes[top - 1]
+                        if (low[node] < low[caller]) low[caller] = low[node]
+                    }
+                }
+            }
+        }
+        root = root + 1
+    }
+    component
+}

@@ -127,8 +127,6 @@ test: ablac
 	tools/test-interpolate-fixed-width.sh $(COMPILER)
 	tools/test-contextual-keywords.sh $(COMPILER)
 	tools/test-lambda-void-assignment.sh $(COMPILER)
-	tools/test-inferred-results.sh $(COMPILER)
-	tools/test-when-null.sh $(COMPILER)
 	tools/test-process-environment.sh $(COMPILER)
 	tools/test-compiler-stack.sh $(COMPILER)
 	tools/test-ablac-test.sh $(COMPILER)
@@ -175,6 +173,9 @@ test: ablac
 	tools/test-subparser-generated-adapter.sh $(COMPILER)
 	tools/test-ct-bridge.sh $(COMPILER)
 	tools/test-self-hosted.sh $(COMPILER)
+	tools/test-inferred-results.sh $(COMPILER)
+	tools/test-when-null.sh $(COMPILER)
+	tools/test-init-order.sh $(COMPILER)
 	tools/test-extension-receivers.sh $(COMPILER)
 
 check: test self-rebuild

@@ -2,6 +2,7 @@ import "subparser.ab"
 import "ct_lift.ab"
 import "generator.ab"
 import "ct_infer.ab"
+import "ct_init.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/sys/linux/fs"
@@ -2266,6 +2267,8 @@ fun bootstrapSemanticHelp(code: string): string {
             "a lambda that moves what it captured (`move { ... }`) runs at most once: call it once, or capture a copy so it can run again"
         "assignment.unassigned" ->
             "a variable declared without a value must be assigned on every path before it is read: give it an initial value, or assign it in every branch"
+        "global.initialization-cycle" ->
+            "each of these top-level values needs the next one initialized first (its initializer reads it, directly or through the functions it calls): compute one of them later, for example in a function called from `main`"
         "function.result-cycle" ->
             "the function calls itself (directly or through other functions without a result type) before its result type is known: give it a result type, as in `fun f(n: int): int`"
         else -> ""
@@ -5151,7 +5154,9 @@ class BootstrapAnalyzer(
     // this index are the run-time code's, which don't exist when it runs.
     var compileLocalBarrier: int = -1,
     // Result types inferred from bodies (ct_infer.ab).
-    val inferredResults: BootstrapInferredResults = bootstrapNoInferredResults()
+    val inferredResults: BootstrapInferredResults = bootstrapNoInferredResults(),
+    // What each body reads, for the globals' initialization order (ct_init.ab).
+    val initEdges: BootstrapInitEdges = bootstrapNoInitEdges()
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -5462,6 +5467,7 @@ class BootstrapAnalyzer(
         val index = this.symbolIndex(name)
         if (index >= 0) {
             result = this.symbols[index].type
+            if (this.initEdges.owner >= 0) bootstrapInitRecordSymbol(this, index)
             if (bootstrapFunctionTypeIsInferred(result)) {
                 result = bootstrapResolvedSymbolType(this, index)
             }
@@ -6097,6 +6103,9 @@ class BootstrapAnalyzer(
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
             val declaration = this.methodDeclarations.declarations[entry]
+            if (this.initEdges.owner >= 0) {
+                bootstrapInitRecord(this, this.methodDeclarations.handles[entry])
+            }
             if (declaration.resultType != "inferred") {
                 result = bootstrapNormalizeType(declaration.resultType)
             } else result = bootstrapResolvedResultType(
@@ -8725,6 +8734,8 @@ class BootstrapAnalyzer(
             this.currentGeneratedOriginBegin =
                 declaration.generatedOriginBegin
             this.currentGeneratedOriginEnd = declaration.generatedOriginEnd
+            this.initEdges.owner =
+                if (bootstrapDeclarationIsValue(declaration.kind)) index else -1
             var symbolName = declaration.name
             if (declaration.extensionOwner != "") {
                 symbolName = "${declaration.extensionOwner}.${declaration.name}"
@@ -8935,6 +8946,7 @@ class BootstrapAnalyzer(
             this.fail("subparser.registration")
             registryError = registryError + 1
         }
+        this.initEdges.owner = -1
         this.locals = []
         this.refinementNames = []
         this.refinementTypes = []
@@ -8968,6 +8980,7 @@ class BootstrapAnalyzer(
         while (index < parsed.declarations.size) {
             val declaration = parsed.declarations[index]
             this.currentSourceIdentity = declaration.sourceIdentity
+            this.initEdges.owner = index
             var nakedAnnotation = -1
             var inlineAnnotation = -1
             var noinlineAnnotation = -1
@@ -9235,6 +9248,7 @@ class BootstrapAnalyzer(
             while (methodIndex < owner.methods.size) {
                 val method = owner.methods[methodIndex]
                 this.currentSourceIdentity = method.sourceIdentity
+                this.initEdges.owner = this.selectedMethodHandle(owner.name, method.name)
                 var methodAnnotation = 0
                 while (methodAnnotation < method.annotations.size) {
                     if (method.annotations[methodAnnotation] == "naked") {
@@ -9386,6 +9400,10 @@ class BootstrapAnalyzer(
             }
             index = index + 1
         }
+        this.initEdges.owner = -1
+        // The overload probe types only some bodies: the build's analysis checks.
+        val initializationOrder = if (this.overloads.keys.size == 0)
+            bootstrapCheckInitialization(this) else []
         BootstrapSemanticResult(
             this.symbols,
             this.errors,
@@ -9401,7 +9419,8 @@ class BootstrapAnalyzer(
             BootstrapInferredResultTypes(
                 this.inferredResults.sources,
                 this.inferredResults.begins,
-                this.inferredResults.results
+                this.inferredResults.results,
+                initializationOrder
             )
         )
     }
@@ -11860,7 +11879,8 @@ fun bootstrapAnalyzer(
         "",
         BootstrapExpression("missing", "", 0, 0, []),
         -1,
-        bootstrapNoInferredResults()
+        bootstrapNoInferredResults(),
+        bootstrapNoInitEdges()
     )
 }
 

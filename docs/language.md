@@ -214,12 +214,14 @@ fun main {
   top level); assigning a `val` property is `field.immutable`.
 - Top-level `val`/`var` are initialized before `main` runs, in dependency
   order: a global whose initializer reads another global, directly or
-  through the functions it calls, in this module or another, is
-  initialized after it. Independent globals keep declaration order. A
+  through the functions and methods it calls, in this module or another, is
+  initialized after it. Among globals ready at the same time the earliest
+  declared goes first, so independent globals keep declaration order. A
   cycle (`val a = b + 1` with `val b = a + 1`, also through functions or
-  across modules) is a compile error,
-  `global.initialization-cycle:a->b->a`, at run time and under `#` alike.
-  So no initializer can see a global that isn't initialized yet.
+  across modules) is a compile error, `global.initialization-cycle:a->b->a`,
+  at run time and under `#` alike, so no initializer can see a global that
+  isn't initialized yet. Code in a lambda counts for the initializer it is
+  written in, since it may run there.
 - A local lives from its declaration to the end of its block. A local in a
   nested block may shadow an outer local, a parameter or a field; the outer
   one is visible again after the block, including to closures that captured
@@ -228,12 +230,29 @@ fun main {
   function's or lambda's body can't redeclare one of its parameters
   (`local.shadows-parameter`).
 
-> Known issue (being fixed by ct-infer): today a direct reference moves a
-> global after the others instead of right after its dependency, a
-> dependency through a function isn't followed (the read sees `0`, `""` or
-> an empty object), cycles compile and read zero values, and a cycle read
-> under `#` crashes the compiler. Keep initializers free of calls that read
-> other globals.
+```abla
+import "abla/io"
+
+val greeting = "$salutation, $name"   // initialized after both
+val salutation = "Hello"
+val name = pick()
+fun pick(): string = names[1]          // `name` needs `names` first
+val names = ["Ada", "Grace"]
+
+fun main {
+    println(greeting)
+}
+// output:
+// Hello, Grace
+```
+
+```abla error
+val a = b + 1
+val b = twice(a)
+fun twice(n: int): int = n * 2
+fun main: int = a
+// error: global.initialization-cycle:a->b->a
+```
 
 ```abla
 import "abla/io"
@@ -509,12 +528,8 @@ fun main {
 - There is no safe-call `?.` and no `?:` operator: check `x != null`, which
   narrows a `val`.
 
-> Known issue (being fixed by ct-infer): today the arms after `null ->`
-> still see the nullable type (`string.interpolation:nullable:string` in
-> `else -> "got $s"`). Use `if (s == null) ... else ...` for now.
-
-In a `when` on a nullable name, the arms after its `null ->` arm see the name
-not null; an arm sharing the `null` arm's body (`"b", null -> ...`) does not:
+For example (an arm sharing the `null` arm's body, as in `"b", null -> ...`,
+is not narrowed):
 
 ```abla
 import "abla/io"
