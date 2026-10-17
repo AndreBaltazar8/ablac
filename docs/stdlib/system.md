@@ -98,7 +98,9 @@ fun main {
 Write operations return `false` on failure instead of stopping the program.
 `readText()` returns `""` for a file that doesn't exist or can't be read, the
 same as for an empty file, so check `exists()` (or `info().isFile()`) first
-when the difference matters. A missing file's `info().size` is `-1`.
+when the difference matters. A missing file's `info().size` is `-1`. A
+fallible `readTextResult()`, which reports whether the read succeeded, is
+being added by ct-native.
 
 ## Processes: `abla/process`
 
