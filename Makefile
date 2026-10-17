@@ -127,6 +127,7 @@ test: ablac
 	tools/test-interpolate-fixed-width.sh $(COMPILER)
 	tools/test-contextual-keywords.sh $(COMPILER)
 	tools/test-lambda-void-assignment.sh $(COMPILER)
+	tools/test-inferred-results.sh $(COMPILER)
 	tools/test-process-environment.sh $(COMPILER)
 	tools/test-compiler-stack.sh $(COMPILER)
 	tools/test-ablac-test.sh $(COMPILER)

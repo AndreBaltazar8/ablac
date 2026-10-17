@@ -631,8 +631,8 @@ fun main {
 - A function with no parameters may omit `()`: `fun greet { ... }`,
   `fun main: int = 0`.
 - The result type may be omitted: `fun inc(a: int) = a + 1` infers `int`
-  from the body. Until the known issue below is fixed, write the result
-  type whenever callers use the result.
+  from the body (joined with what its `return`s give), and callers use it as
+  they would a declared one (below).
 - Parameters may have defaults, which may refer to earlier parameters.
   Arguments may be passed by name after the positional ones (see the
   known issue below about methods). Each argument
@@ -651,10 +651,38 @@ fun main {
 > only for top-level functions and constructors; a method call with them is
 > `E_NAMED_ARGUMENT_TARGET`.
 
-> Known issue (being fixed by ct-infer): a result inferred from
-> `fun inc(a: int) = a + 1` is currently unknown to its callers, so `inc(41) + 1` fails with
-> `arithmetic.type@..:inferred:i64` and `fun main: int = inc(41)` with
-> `function.result:main:i64:inferred`.
+An inferred result works the same for functions, methods, extensions and
+compile funs, at runtime and under `#`:
+
+```abla
+import "abla/io"
+
+fun sign(n: int) = if (n < 0) -1 else 1
+class Counter(var count: int) {
+    fun next() = count + 1
+}
+fun Counter.label() = "counter ${this.next()}"
+
+fun main: int {
+    val s = sign(-5)
+    println("$s ${Counter(1).label()} ${#sign(3)}")
+    s + 43
+}
+// output:
+// -1 counter 2 1
+// exit: 42
+```
+
+An inferred function can't call itself, directly or through other inferred
+functions, because its type would depend on itself; declaring the result type
+of one function in the cycle is enough:
+
+```abla error
+fun factorial(n: int) = if (n <= 1) 1 else n * factorial(n - 1)
+fun main: int = factorial(5)
+// error: function.result-cycle:factorial
+// error: give it a result type
+```
 
 ### Extension functions
 

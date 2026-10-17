@@ -1,6 +1,7 @@
 import "subparser.ab"
 import "ct_lift.ab"
 import "generator.ab"
+import "ct_infer.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/sys/linux/fs"
@@ -2237,6 +2238,8 @@ fun bootstrapSemanticHelp(code: string): string {
             "a lambda that moves what it captured (`move { ... }`) runs at most once: call it once, or capture a copy so it can run again"
         "assignment.unassigned" ->
             "a variable declared without a value must be assigned on every path before it is read: give it an initial value, or assign it in every branch"
+        "function.result-cycle" ->
+            "the function calls itself (directly or through other functions without a result type) before its result type is known: give it a result type, as in `fun f(n: int): int`"
         else -> ""
     }
 }
@@ -2708,7 +2711,9 @@ class BootstrapSemanticResult(
     val resolvedNames: array<BootstrapResolvedName>,
     val managedAliasBegins: array<int>,
     val managedAliasEnds: array<int>,
-    val managedAliasSources: array<string>
+    val managedAliasSources: array<string>,
+    // Result types inferred from bodies, which lowering types calls with.
+    val inferredResults: BootstrapInferredResultTypes = bootstrapNoInferredResultTypes()
 )
 
 // Compile-time effects are deliberately represented as a compact bitset. The
@@ -5116,7 +5121,9 @@ class BootstrapAnalyzer(
         BootstrapExpression("missing", "", 0, 0, []),
     // Inside a `#` expression reached from run-time code: the locals before
     // this index are the run-time code's, which don't exist when it runs.
-    var compileLocalBarrier: int = -1
+    var compileLocalBarrier: int = -1,
+    // Result types inferred from bodies (ct_infer.ab).
+    val inferredResults: BootstrapInferredResults = bootstrapNoInferredResults()
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -5425,7 +5432,12 @@ class BootstrapAnalyzer(
     fun findTopLevelType(name: string): string {
         var result = "unknown"
         val index = this.symbolIndex(name)
-        if (index >= 0) result = this.symbols[index].type
+        if (index >= 0) {
+            result = this.symbols[index].type
+            if (bootstrapFunctionTypeIsInferred(result)) {
+                result = bootstrapResolvedSymbolType(this, index)
+            }
+        }
         if (result == "unknown" && name == "github") {
             result = "function:(string)->ImportSource"
         }
@@ -5440,6 +5452,9 @@ class BootstrapAnalyzer(
         }
         if (result == "unknown" && name == "importSource") {
             result = "function:(string,string,string,function:()->ResolvedImport)->ImportSource"
+        }
+        if (result == "unknown" && !this.inferredResults.settled) {
+            result = bootstrapLaterGlobalType(this, name)
         }
         if (bootstrapIsDelegatedType(result)) {
             result = bootstrapDelegatedExposedType(result)
@@ -6049,14 +6064,20 @@ class BootstrapAnalyzer(
         found
     }
 
-    fun methodResultType(owner: string, method: string): string {
+    fun methodResultType(owner: string, method: string, at: int = -1): string {
         var result = "unknown"
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
             val declaration = this.methodDeclarations.declarations[entry]
             if (declaration.resultType != "inferred") {
                 result = bootstrapNormalizeType(declaration.resultType)
-            }
+            } else result = bootstrapResolvedResultType(
+                this,
+                declaration,
+                this.methodDeclarations.handles[entry],
+                if (declaration.extensionOwner == "") owner else "",
+                at
+            )
         }
         result
     }
@@ -6216,11 +6237,14 @@ class BootstrapAnalyzer(
         ))
         val index = this.overloadDeclarationIndex(owner, name)
         val declaration = this.overloadDeclaration(owner, index)
-        if (declaration.resultType != "inferred") {
-            return bootstrapNormalizeType(declaration.resultType)
-        }
-        // An inferred result: analyze the call as it will be written.
-        this.infer(BootstrapExpression(kind, name, expression.begin, expression.end, children))
+        // An inferred result is its body's (ct_infer.ab).
+        bootstrapResolvedResultType(
+            this,
+            declaration,
+            if (owner == "") index else this.methodDeclarations.handles[index],
+            if (owner != "" && declaration.extensionOwner == "") owner else "",
+            expression.begin
+        )
     }
 
     /** The type of an overloaded free call, else "" (nothing inferred). */
@@ -6890,7 +6914,7 @@ class BootstrapAnalyzer(
             val found = this.methodDeclarations.declarations[entry]
             if (bootstrapTypesCompatible(
                     expected,
-                    bootstrapNormalizeType(found.resultType)
+                    this.methodResultType(owner, expression.text)
                 )) {
                 fresh = this.expressionProducesFreshManagedReference(
                     found.expression,
@@ -8900,6 +8924,8 @@ class BootstrapAnalyzer(
         this.regionDepth = 0
         this.regionScope = -1
         this.compileDepth = 0
+        // Every global is published: a result inferred from here on is final.
+        this.inferredResults.settled = true
         var actionIndex = 0
         while (actionIndex < parsed.actions.size) {
             this.currentSourceIdentity = ""
@@ -9343,7 +9369,12 @@ class BootstrapAnalyzer(
             this.resolvedNames,
             this.managedAliasBegins,
             this.managedAliasEnds,
-            this.managedAliasSources
+            this.managedAliasSources,
+            BootstrapInferredResultTypes(
+                this.inferredResults.sources,
+                this.inferredResults.begins,
+                this.inferredResults.results
+            )
         )
     }
 }
@@ -10691,7 +10722,9 @@ fun bootstrapInferMemberCall(
             methodTypes,
             "method.${receiver}.${expression.text}"
         )
-        result = analyzer.methodResultType(receiver, expression.text)
+        result = analyzer.methodResultType(
+            receiver, expression.text, expression.begin
+        )
         analyzer.recordTypedCall(
             expression,
             result,
@@ -11785,7 +11818,14 @@ fun bootstrapAnalyzer(
         "unknown",
         typedRequestBegins.size > 0,
         bootstrapTopLevelNameIndex(parsed.declarations),
-        overloads
+        overloads,
+        [],
+        "",
+        0,
+        "",
+        BootstrapExpression("missing", "", 0, 0, []),
+        -1,
+        bootstrapNoInferredResults()
     )
 }
 

@@ -1,0 +1,367 @@
+// Inferred result types: a function, method, extension or compile fun declared
+// without a result type (`fun inc(a: int) = a + 1`) has the type of its body.
+//
+// A call reads that type before (or while) the analysis reaches the body, so
+// the first reader infers the body then, quietly: everything the inference
+// records (errors, diagnostics, typed calls, resolved names, aliases, overload
+// resolutions) is rolled back, and the body is analyzed for real, reporting
+// once, in its turn. The type is kept by method handle
+// (bootstrapMethodDeclarationIndex) for the analysis and by declaration
+// (source and offset) for lowering, which types calls with the same results.
+//
+// A body that reaches its own inference (it calls itself, directly or through
+// other functions without a result type) has no type to read: the call that
+// closes the cycle is reported, and its callers see the type the rest of the
+// body gives.
+
+class BootstrapInferredResults(
+    // By method handle: "" not inferred yet, "?" being inferred, else the type.
+    val types: array<string>,
+    // Once every global is published (the initializers ran): a body inferred
+    // before that may name a global published later, so it is inferred again.
+    var settled: bool,
+    // Uses that closed a cycle, reported once outside any quiet inference.
+    val cycleNames: array<string>,
+    val cycleSources: array<string>,
+    val cycleBegins: array<int>,
+    var cyclesReported: int,
+    var quietDepth: int,
+    // Whether the last quiet inference failed (its errors are rolled back).
+    var quietFailed: bool,
+    // What lowering reads: each inferred declaration's source, offset, type.
+    val sources: array<string>,
+    val begins: array<int>,
+    val results: array<string>
+)
+
+/** The inferred result types lowering reads (BootstrapSemanticResult). */
+class BootstrapInferredResultTypes(
+    val sources: array<string>,
+    val begins: array<int>,
+    val types: array<string>
+) {
+    /** The inferred result of the declaration at `source`:`begin`, or "". */
+    fun find(source: string, begin: int): string {
+        var result = ""
+        var index = 0
+        while (result == "" && index < this.begins.size) {
+            if (this.begins[index] == begin && this.sources[index] == source) {
+                result = this.types[index]
+            }
+            index = index + 1
+        }
+        result
+    }
+}
+
+fun bootstrapNoInferredResultTypes(): BootstrapInferredResultTypes =
+    BootstrapInferredResultTypes([], [], [])
+
+fun bootstrapNoInferredResults(): BootstrapInferredResults =
+    BootstrapInferredResults([], false, [], [], [], 0, 0, false, [], [], [])
+
+/** A function type `function:(…)->inferred` with its result filled in. */
+fun bootstrapInferredFunctionType(type: string, result: string): string =
+    if (bootstrapFunctionTypeIsInferred(type)) {
+        "${type.slice(0, type.size - 8)}$result"
+    } else type
+
+fun bootstrapFunctionTypeIsInferred(type: string): bool {
+    val suffix = "->inferred"
+    if (type.size <= suffix.size || type[type.size - 2] != 101) return false
+    var index = 0
+    while (index < suffix.size &&
+           type[type.size - suffix.size + index] == suffix[index]) {
+        index = index + 1
+    }
+    index == suffix.size
+}
+
+/** The result type of `declaration` (method handle `handle`; `owner` is the
+ *  class of a class method, else ""), inferring its body on first use. */
+fun bootstrapResolvedResultType(
+    var analyzer: BootstrapAnalyzer,
+    declaration: BootstrapDeclaration,
+    handle: int,
+    owner: string,
+    at: int
+): string {
+    if (declaration.resultType != "inferred") {
+        return bootstrapNormalizeType(declaration.resultType)
+    }
+    while (analyzer.inferredResults.types.size <= handle) {
+        analyzer.inferredResults.types.append("")
+    }
+    val known = analyzer.inferredResults.types[handle]
+    if (known == "?") {
+        analyzer.inferredResults.cycleNames.append(declaration.name)
+        analyzer.inferredResults.cycleSources.append(analyzer.currentSourceIdentity)
+        analyzer.inferredResults.cycleBegins.append(
+            if (at >= 0) at
+            else if (analyzer.inferSource == analyzer.currentSourceIdentity)
+                analyzer.inferBegin
+            else 0
+        )
+        return "unknown"
+    }
+    if (known != "") return known
+    analyzer.inferredResults.types[handle] = "?"
+    val inferred = bootstrapInferBodyQuietly(analyzer, declaration, owner)
+    // Inferred before every global was published, with errors: maybe only
+    // for a global named before its declaration, so it is inferred again.
+    if (!analyzer.inferredResults.settled && analyzer.inferredResults.quietFailed) {
+        analyzer.inferredResults.types[handle] = ""
+    } else {
+        analyzer.inferredResults.types[handle] = inferred
+        analyzer.inferredResults.sources.append(declaration.sourceIdentity)
+        analyzer.inferredResults.begins.append(declaration.begin)
+        analyzer.inferredResults.results.append(inferred)
+    }
+    bootstrapReportResultCycles(analyzer)
+    inferred
+}
+
+/** The cycles found by the quiet inferences, once none is running. */
+fun bootstrapReportResultCycles(var analyzer: BootstrapAnalyzer): void {
+    if (analyzer.inferredResults.quietDepth > 0) return
+    val source = analyzer.currentSourceIdentity
+    val inferSource = analyzer.inferSource
+    val inferBegin = analyzer.inferBegin
+    while (analyzer.inferredResults.cyclesReported <
+           analyzer.inferredResults.cycleNames.size) {
+        val cycle = analyzer.inferredResults.cyclesReported
+        analyzer.inferredResults.cyclesReported = cycle + 1
+        analyzer.currentSourceIdentity = analyzer.inferredResults.cycleSources[cycle]
+        analyzer.fail(
+            "function.result-cycle:${analyzer.inferredResults.cycleNames[cycle]}@${analyzer.inferredResults.cycleBegins[cycle]}"
+        )
+    }
+    analyzer.currentSourceIdentity = source
+    analyzer.inferSource = inferSource
+    analyzer.inferBegin = inferBegin
+    return
+}
+
+/** The type of `declaration`'s body (or a global's initializer), analyzed
+ *  as its turn will analyze it, leaving the analyzer as it was. */
+@noinline
+fun bootstrapInferBodyQuietly(
+    var analyzer: BootstrapAnalyzer,
+    declaration: BootstrapDeclaration,
+    owner: string
+): string {
+    if (declaration.expression.kind == "missing") return "void"
+    val errors = analyzer.errors
+    val extensionErrors = analyzer.extensionErrors
+    val diagnostics = analyzer.diagnostics
+    val overloadFailures = analyzer.overloadFailures
+    val typedCalls = analyzer.typedCalls.size
+    val resolvedNames = analyzer.resolvedNames.size
+    val managedAliases = analyzer.managedAliasBegins.size
+    val overloadResolutions = analyzer.overloadResolutions.size
+    val locals = analyzer.locals.size
+    val refinementNames = analyzer.refinementNames.size
+    val refinementTypes = analyzer.refinementTypes.size
+    val refinementScopes = analyzer.refinementScopes.size
+    val regionOwnedNames = analyzer.regionOwnedNames.size
+    val regionOwnedScopes = analyzer.regionOwnedScopes.size
+    val scopeParents = analyzer.scopeParents.size
+    val currentScope = analyzer.currentScope
+    val currentOwner = analyzer.currentOwner
+    val currentResultType = analyzer.currentResultType
+    val currentBorrowResultSource = analyzer.currentBorrowResultSource
+    val returnedType = analyzer.returnedType
+    val currentGeneratedNamespace = analyzer.currentGeneratedNamespace
+    val currentGeneratedOriginBegin = analyzer.currentGeneratedOriginBegin
+    val currentGeneratedOriginEnd = analyzer.currentGeneratedOriginEnd
+    val currentSourceIdentity = analyzer.currentSourceIdentity
+    val loopDepth = analyzer.loopDepth
+    val trustedDepth = analyzer.trustedDepth
+    val regionDepth = analyzer.regionDepth
+    val regionScope = analyzer.regionScope
+    val compileDepth = analyzer.compileDepth
+    val generatorDepth = analyzer.generatorDepth
+    val yieldedType = analyzer.yieldedType
+    val inferBegin = analyzer.inferBegin
+    val inferSource = analyzer.inferSource
+    val currentBody = analyzer.currentBody
+    val compileLocalBarrier = analyzer.compileLocalBarrier
+    val liftDiscardedAction = bootstrapLiftDiscardedAction
+    analyzer.inferredResults.quietDepth = analyzer.inferredResults.quietDepth + 1
+
+    // The body's scope is a new root: the locals, refinements and region
+    // ownership of the body being analyzed stay out of sight, and are
+    // dropped again afterwards.
+    analyzer.scopeParents.append(-1)
+    val bodyScope = analyzer.scopeParents.size - 1
+    val receiver = if (owner != "") owner
+        else bootstrapNormalizeType(declaration.extensionOwner)
+    if (receiver != "") {
+        analyzer.locals.append(BootstrapSymbol(
+            "this",
+            if (analyzer.methodReceiverKind(receiver, declaration.name) == "var")
+                "mutable.parameter" else "parameter",
+            receiver,
+            bodyScope,
+            "",
+            ""
+        ))
+    }
+    var parameter = 0
+    while (parameter < declaration.parameters.size) {
+        var kind = "parameter"
+        if (parameter < declaration.parameterKinds.size) {
+            if (declaration.parameterKinds[parameter] == "own") {
+                kind = "owned.parameter"
+            }
+            if (declaration.parameterKinds[parameter] == "var") {
+                kind = "mutable.parameter"
+            }
+        }
+        analyzer.locals.append(BootstrapSymbol(
+            declaration.parameters[parameter],
+            kind,
+            if (parameter < declaration.parameterTypes.size)
+                bootstrapNormalizeType(declaration.parameterTypes[parameter])
+            else "unknown",
+            bodyScope,
+            "",
+            "abla:${declaration.sourceIdentity}:${declaration.begin}:parameter:$parameter:${declaration.parameters[parameter]}"
+        ))
+        parameter = parameter + 1
+    }
+    analyzer.currentScope = bodyScope
+    analyzer.currentOwner = owner
+    analyzer.currentBody = declaration.expression
+    analyzer.currentResultType = "inferred"
+    analyzer.currentBorrowResultSource = ""
+    analyzer.returnedType = "unknown"
+    analyzer.currentSourceIdentity = declaration.sourceIdentity
+    analyzer.currentGeneratedNamespace = declaration.generatedNamespace
+    analyzer.currentGeneratedOriginBegin = declaration.generatedOriginBegin
+    analyzer.currentGeneratedOriginEnd = declaration.generatedOriginEnd
+    analyzer.loopDepth = 0
+    analyzer.trustedDepth = if (declaration.isTrusted) 1 else 0
+    analyzer.regionDepth = 0
+    analyzer.regionScope = -1
+    analyzer.compileDepth = if (declaration.kind == "compile.fun" ||
+                                declaration.kind == "compile.val" ||
+                                declaration.kind == "compile.var") 1 else 0
+    analyzer.generatorDepth = 0
+    analyzer.yieldedType = "unknown"
+    analyzer.compileLocalBarrier = -1
+    bootstrapLiftDiscardedAction = 0
+
+    var result = analyzer.infer(declaration.expression)
+    if (result == "never") {
+        // Only `return`s leave it; without one it never returns, which a
+        // caller sees as no value (lowering knows only declared `never`).
+        result = if (analyzer.returnedType == "unknown") "void"
+            else analyzer.returnedType
+    } else if (analyzer.returnedType != "unknown") {
+        result = bootstrapJoinTypes(result, analyzer.returnedType)
+    }
+    result = bootstrapNormalizeType(result)
+
+    analyzer.inferredResults.quietDepth = analyzer.inferredResults.quietDepth - 1
+    analyzer.inferredResults.quietFailed = analyzer.errors > errors
+    bootstrapLiftDiscardedAction = liftDiscardedAction
+    analyzer.errors = errors
+    analyzer.extensionErrors = extensionErrors
+    analyzer.diagnostics = diagnostics
+    analyzer.overloadFailures = overloadFailures
+    analyzer.typedCalls.truncate(typedCalls)
+    analyzer.resolvedNames.truncate(resolvedNames)
+    analyzer.managedAliasBegins.truncate(managedAliases)
+    analyzer.managedAliasEnds.truncate(managedAliases)
+    analyzer.managedAliasSources.truncate(managedAliases)
+    analyzer.overloadResolutions.truncate(overloadResolutions)
+    analyzer.locals.truncate(locals)
+    analyzer.refinementNames.truncate(refinementNames)
+    analyzer.refinementTypes.truncate(refinementTypes)
+    analyzer.refinementScopes.truncate(refinementScopes)
+    analyzer.regionOwnedNames.truncate(regionOwnedNames)
+    analyzer.regionOwnedScopes.truncate(regionOwnedScopes)
+    analyzer.scopeParents.truncate(scopeParents)
+    analyzer.currentScope = currentScope
+    analyzer.currentOwner = currentOwner
+    analyzer.currentResultType = currentResultType
+    analyzer.currentBorrowResultSource = currentBorrowResultSource
+    analyzer.returnedType = returnedType
+    analyzer.currentGeneratedNamespace = currentGeneratedNamespace
+    analyzer.currentGeneratedOriginBegin = currentGeneratedOriginBegin
+    analyzer.currentGeneratedOriginEnd = currentGeneratedOriginEnd
+    analyzer.currentSourceIdentity = currentSourceIdentity
+    analyzer.loopDepth = loopDepth
+    analyzer.trustedDepth = trustedDepth
+    analyzer.regionDepth = regionDepth
+    analyzer.regionScope = regionScope
+    analyzer.compileDepth = compileDepth
+    analyzer.generatorDepth = generatorDepth
+    analyzer.yieldedType = yieldedType
+    analyzer.inferBegin = inferBegin
+    analyzer.inferSource = inferSource
+    analyzer.currentBody = currentBody
+    analyzer.compileLocalBarrier = compileLocalBarrier
+    result
+}
+
+/** The type of global symbol `index`, a function whose result is inferred
+ *  (`function:(…)->inferred`) now with its result: once known for good, the
+ *  symbol keeps it. */
+fun bootstrapResolvedSymbolType(var analyzer: BootstrapAnalyzer, index: int): string {
+    val symbol = analyzer.symbols[index]
+    if (symbol.kind != "fun" && symbol.kind != "compile.fun") return symbol.type
+    var dot = symbol.name.size - 1
+    while (dot >= 0 && symbol.name[dot] != 46) dot = dot - 1
+    var handle = -1
+    if (dot < 0) {
+        handle = analyzer.functionDeclarations.find(symbol.name)
+    } else {
+        val entry = analyzer.methodDeclarations.find(
+            symbol.name.slice(0, dot),
+            symbol.name.slice(dot + 1, symbol.name.size)
+        )
+        if (entry >= 0) handle = analyzer.methodDeclarations.handles[entry]
+    }
+    if (handle < 0 || handle >= analyzer.declarations.size) return symbol.type
+    val declaration = analyzer.declarations[handle]
+    val result = bootstrapResolvedResultType(analyzer, declaration, handle, "", -1)
+    val type = bootstrapInferredFunctionType(symbol.type, result)
+    if (handle < analyzer.inferredResults.types.size) {
+        val known = analyzer.inferredResults.types[handle]
+        if (known != "" && known != "?") {
+            analyzer.symbols[index] = BootstrapSymbol(
+                symbol.name, symbol.kind, type, symbol.scope,
+                symbol.borrowSource, symbol.identity
+            )
+        }
+    }
+    type
+}
+
+/** While the globals' initializers are inferred (before every global is
+ *  published), the type of the global `name` declared later, inferred
+ *  quietly from its initializer; else "unknown". Initialization follows what
+ *  each initializer reads, so a global may read one declared after it, also
+ *  through a function whose result is inferred. */
+fun bootstrapLaterGlobalType(var analyzer: BootstrapAnalyzer, name: string): string {
+    val entry = analyzer.topLevelNames.find(name)
+    if (entry < 0 || analyzer.topLevelNames.counts[entry] != 1) return "unknown"
+    val index = analyzer.topLevelNames.firsts[entry]
+    val declaration = analyzer.declarations[index]
+    if (!bootstrapDeclarationIsValue(declaration.kind) ||
+        declaration.resultType != "inferred" ||
+        declaration.expression.kind == "delegate.initializer") return "unknown"
+    while (analyzer.inferredResults.types.size <= index) {
+        analyzer.inferredResults.types.append("")
+    }
+    val known = analyzer.inferredResults.types[index]
+    if (known == "?") return "unknown"
+    if (known != "") return known
+    analyzer.inferredResults.types[index] = "?"
+    val type = bootstrapInferBodyQuietly(analyzer, declaration, "")
+    analyzer.inferredResults.types[index] =
+        if (analyzer.inferredResults.quietFailed) "" else type
+    type
+}
