@@ -175,16 +175,35 @@ control bytes while retaining valid non-ASCII UTF-8. A manually forged invalid
 kind, number, string, or object shape produces the contained fallback `"null"`;
 invalid bytes are never emitted as JSON.
 
-`$json` constructs the same model directly and accepts standard integer,
-fraction, and exponent forms:
+`$json` constructs the same model directly. Its keys and values are Abla
+expressions:
 
 ```abla
 val literal = $json {
     "answer": 42,
     "ratio": 1.5e-2,
-    "large": 9223372036854775808
+    "large": 9223372036854775808,
+    "name": user.name,
+    "next": count + 1,
+    "item-$index": lookup(index),
+    "tags": ["fixed", tag()]
 }
 ```
+
+A value that starts with `{` or `[` is a JSON object or array; anything else
+is an Abla expression. A number literal on its own keeps its source text, so
+standard integer, fraction, and exponent forms, and integers beyond `int`, are
+never rounded. String, Boolean, and `null` literals map directly. Any other
+expression is converted by its type: `Json`, `string`, `int`, `bool`, `f64`,
+`JsonNumber`, and arrays of `Json`, `string`, `int`, `f64`, or `bool`. An `f64`
+is written as its shortest round-trip text (`f64Text`), the same bytes at
+compile time and at run time; NaN and the infinities become `null`. A value of
+any other type is a compile error at that value.
+
+Keys must be strings; a key of another type is a compile error at that key.
+An Abla expression that starts with `{` or `[` (a lambda or an array literal)
+goes in parentheses. So does a top-level value followed by an operator that
+should apply to the result: `($jsons count()) == expected`.
 
 `$jsons` uses the same grammar and immediately returns the deterministic
 serialized string. Its staged form is the concise choice for static protocol
@@ -200,7 +219,9 @@ val body = #$jsons {
 
 `$json`, `#$json`, `$jsons`, `#$jsons`, `#jsonParse`, and `#jsonStringify` use
 the same phase-safe implementation as runtime code. For the same tree,
-compile-time and native serialization produce identical bytes.
+compile-time and native serialization produce identical bytes. Under `#`, the
+value expressions run at compile time too, so they may call functions but not
+read runtime locals.
 
 ## HTTP adapter
 

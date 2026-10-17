@@ -24,7 +24,8 @@ compile-only host values into runtime IR.
 
 The `$json` provider uses the same [JSON model](json.md) as `jsonParse`. It
 accepts integer, fractional, and exponent number forms without converting them
-through floating point, including across formatted multi-line literals. The
+through floating point, including across formatted multi-line literals. Other
+keys and values are handed back to the base parser as Abla expressions. The
 companion `$jsons` provider delegates to that grammar and wraps the resulting
 tree in deterministic `jsonStringify`; `#$jsons` therefore leaves a validated
 static string in the runtime program.
@@ -57,7 +58,8 @@ The Abla API receives one opaque cursor positioned immediately after the parser
 name. A handler may:
 
 - inspect and consume named base-language tokens or exact raw source text;
-- read the current token text;
+- read the current token text, or an upcoming token's text without
+  consuming it (`parserTextAhead`);
 - skip raw whitespace, read raw names, and consume text up to delimiters;
 - construct owned syntax with integer, string, Boolean, null, identifier,
   binary, array, member/index, call, conditional, local, return, and block

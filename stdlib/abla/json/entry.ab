@@ -348,6 +348,46 @@ fun ablaJsonArray(values: array<Json>): Json = jsonArray(values)
 fun ablaJsonObject(keys: array<string>, values: array<Json>): Json =
     jsonObject(keys, values)
 
+// A `$json` value written as an Abla expression becomes JSON through these:
+// the call picks the overload for the expression's type, so a value of any
+// other type is a compile error at the value.
+fun ablaJsonValue(value: Json): Json = value
+fun ablaJsonValue(value: string): Json = jsonString(value)
+fun ablaJsonValue(value: int): Json = jsonInteger(value)
+fun ablaJsonValue(value: bool): Json = jsonBoolean(value)
+fun ablaJsonValue(value: JsonNumber): Json = jsonNumber(value)
+// An f64 interpolates as f64Text, the shortest text that reads back as the
+// value, with the same bytes at compile time and at run time; JSON has no NaN
+// or infinities: null.
+fun ablaJsonValue(value: f64): Json =
+    if (value != value || value - value != 0.0) jsonNull()
+    else jsonNumberText("$value")
+fun ablaJsonValue(values: array<Json>): Json = jsonArray(values)
+fun ablaJsonValue(values: array<string>): Json {
+    val converted: array<Json> = []
+    for (value in values) converted.append(jsonString(value))
+    jsonArray(converted)
+}
+fun ablaJsonValue(values: array<int>): Json {
+    val converted: array<Json> = []
+    for (value in values) converted.append(jsonInteger(value))
+    jsonArray(converted)
+}
+fun ablaJsonValue(values: array<f64>): Json {
+    val converted: array<Json> = []
+    for (value in values) converted.append(ablaJsonValue(value))
+    jsonArray(converted)
+}
+fun ablaJsonValue(values: array<bool>): Json {
+    val converted: array<Json> = []
+    for (value in values) converted.append(jsonBoolean(value))
+    jsonArray(converted)
+}
+
+// A `$json` key written as an expression other than a string literal: only a
+// string is accepted.
+fun ablaJsonKey(key: string): string = key
+
 fun Json.isNull(): bool = this.kind == 0
 fun Json.isString(): bool = this.kind == 1
 fun Json.isNumber(): bool = this.kind == 2
@@ -1826,28 +1866,46 @@ compile fun ablaJsonSyntaxCall(
     syntaxCall(name, arguments)
 }
 
+// A value is a JSON object or array when it starts with `{` or `[`; anything
+// else is an Abla expression. A number literal on its own keeps its source text
+// (so 9223372036854775808 and 1.5e-2 stay exact), string, Boolean and null
+// literals map directly, and any other expression is converted by its type
+// through ablaJsonValue.
 compile fun ablaJsonParseValue(cursor: ParserCursor): SyntaxExpression {
     if (parserAt(cursor, "{")) ablaJsonParseObject(cursor)
     else if (parserAt(cursor, "[")) ablaJsonParseArray(cursor)
-    else if (parserAt(cursor, "string")) {
-        ablaJsonSyntaxCall(
-            "ablaJsonString",
-            parserParseAblaExpression(cursor)
-        )
-    } else if (parserAt(cursor, "integer") || parserAt(cursor, "float") ||
-        parserAt(cursor, "-")) {
-        val number = parserRawTakeUntil(cursor, " \t\r\n,]}")
-        ablaJsonSyntaxCall("ablaJsonNumberText", syntaxString(number))
-    } else if (parserAt(cursor, "true") || parserAt(cursor, "false")) {
-        ablaJsonSyntaxCall(
-            "ablaJsonBoolean",
-            parserParseAblaExpression(cursor)
-        )
-    } else {
-        parserExpect(cursor, "null")
-        val arguments: array<SyntaxExpression> = []
-        syntaxCall("ablaJsonNull", arguments)
+    else {
+        val negative = parserAt(cursor, "-")
+        val lexeme = parserTextAhead(cursor, if (negative) 1 else 0)
+        val value = parserParseAblaExpression(cursor)
+        val kind = syntaxKind(value)
+        val literal = if (negative) {
+            kind == "unary-" && syntaxChildCount(value) == 1 &&
+                ablaJsonNumberLiteral(syntaxKind(syntaxChild(value, 0)))
+        } else ablaJsonNumberLiteral(kind)
+        val number = if (negative) "-$lexeme" else lexeme
+        if (literal && jsonNumberKind(number) >= 0) {
+            ablaJsonSyntaxCall("ablaJsonNumberText", syntaxString(number))
+        } else if (kind == "null") {
+            val arguments: array<SyntaxExpression> = []
+            syntaxCall("ablaJsonNull", arguments)
+        } else if (kind == "string") {
+            ablaJsonSyntaxCall("ablaJsonString", value)
+        } else if (kind == "true" || kind == "false") {
+            ablaJsonSyntaxCall("ablaJsonBoolean", value)
+        } else ablaJsonSyntaxCall("ablaJsonValue", value)
     }
+}
+
+compile fun ablaJsonNumberLiteral(kind: string): bool =
+    kind == "integer" || kind == "float"
+
+compile fun ablaJsonExpect(
+    cursor: ParserCursor,
+    token: string,
+    message: string
+) {
+    if (!parserConsume(cursor, token)) parserFail(cursor, message)
 }
 
 compile fun ablaJsonParseArray(cursor: ParserCursor): SyntaxExpression {
@@ -1859,7 +1917,7 @@ compile fun ablaJsonParseArray(cursor: ParserCursor): SyntaxExpression {
         more = parserConsume(cursor, ",")
         if (more) parserRawSkipWhitespace(cursor)
     }
-    parserExpect(cursor, "]")
+    ablaJsonExpect(cursor, "]", "expected `,` or `]` after a \$json array element")
     ablaJsonSyntaxCall("ablaJsonArray", syntaxArray(values))
 }
 
@@ -1869,13 +1927,16 @@ compile fun ablaJsonParseObject(cursor: ParserCursor): SyntaxExpression {
     val values: array<SyntaxExpression> = []
     var more = !parserAt(cursor, "}")
     while (more) {
-        keys.append(parserParseAblaExpression(cursor))
-        parserExpect(cursor, ":")
+        // A key that is not a string literal must still be a string.
+        val key = parserParseAblaExpression(cursor)
+        if (syntaxKind(key) == "string") keys.append(key)
+        else keys.append(ablaJsonSyntaxCall("ablaJsonKey", key))
+        ablaJsonExpect(cursor, ":", "expected `:` after a \$json object key")
         values.append(ablaJsonParseValue(cursor))
         more = parserConsume(cursor, ",")
         if (more) parserRawSkipWhitespace(cursor)
     }
-    parserExpect(cursor, "}")
+    ablaJsonExpect(cursor, "}", "expected `,` or `}` after a \$json object member")
     val arguments: array<SyntaxExpression> = []
     arguments.append(syntaxArray(keys))
     arguments.append(syntaxArray(values))

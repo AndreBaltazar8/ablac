@@ -108,6 +108,7 @@ test: ablac
 	tools/test-arrays-dense.sh $(COMPILER)
 	tools/test-json-limits.sh $(COMPILER)
 	tools/test-deep-json.sh $(COMPILER)
+	tools/test-json-expressions.sh $(COMPILER)
 	tools/test-string-plus.sh $(COMPILER)
 	tools/test-string-retention.sh $(COMPILER)
 	tools/test-process-exit.sh $(COMPILER)
