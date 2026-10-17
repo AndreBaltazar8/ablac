@@ -5533,15 +5533,100 @@ fun bootstrapEvaluateCallCell(
     result
 }
 
+// A generator runs as the runtime's does: its body is a move closure, run whole
+// the first time the generator is iterated, and `yield` appends to the values
+// the iteration then walks. Its defers run as the body finishes. The values
+// live in a local the body can't name (`#yield`), so a generator iterated
+// inside another collects into its own.
 @noinline
 fun bootstrapEvaluateGenerator(
     var evaluator: BootstrapEvaluator,
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    evaluator.errors = evaluator.errors + 1
-    result = bootstrapEvalInvalid()
+    if (expression.kind == "generator" && expression.children.size == 1) {
+        val closure = evaluator.evaluate(BootstrapExpression(
+            "lambda.move",
+            "",
+            expression.begin,
+            expression.end,
+            [expression.children[0]]
+        ))
+        result = BootstrapEvalValue(
+            "generator", 0, false, "", [closure], "", []
+        )
+    }
+    if (expression.kind == "yield" && expression.children.size == 1) {
+        val value = evaluator.evaluate(expression.children[0])
+        var slot = evaluator.names.size
+        var found = -1
+        while (slot > 0 && found < 0) {
+            slot = slot - 1
+            if (evaluator.names[slot] == "#yield") found = slot
+        }
+        if (found >= 0 && value.kind != "invalid") {
+            evaluator.values[found].elements.append(value)
+            result = bootstrapEvalVoid()
+        }
+    }
+    if (result.kind == "invalid") evaluator.errors = evaluator.errors + 1
     result
+}
+
+// Runs a generator's body once, the first time it is iterated, and keeps what
+// it yielded beside its spent closure (`elements[1]`).
+@noinline
+fun bootstrapRunGenerator(
+    var evaluator: BootstrapEvaluator,
+    var source: BootstrapEvalValue
+): void {
+    if (source.elements.size != 1 || source.elements[0].kind != "closure") {
+        if (source.elements.size != 2) evaluator.errors = evaluator.errors + 1
+        return
+    }
+    val yielded: array<BootstrapEvalValue> = []
+    val lambda = evaluator.syntax[source.elements[0].integer]
+    val callNames: array<string> = ["#yield"]
+    val callValues: array<BootstrapEvalValue> = [bootstrapEvalArray(yielded)]
+    val callMutable: array<bool> = [false]
+    var capture = 0
+    while (capture < source.elements[0].fieldNames.size) {
+        callNames.append(source.elements[0].fieldNames[capture])
+        callValues.append(source.elements[0].elements[capture])
+        callMutable.append(source.elements[0].owner == "mut")
+        capture = capture + 1
+    }
+    val invocation = BootstrapEvaluator(
+        evaluator.declarations,
+        evaluator.affineTypes,
+        evaluator.context,
+        callNames,
+        callValues,
+        callMutable,
+        evaluator.cursors,
+        evaluator.syntax,
+        evaluator.typedCalls,
+        evaluator.reflectedTypes,
+        evaluator.generatedDeclarations,
+        evaluator.extensionRequests,
+        evaluator.compileInputPaths,
+        evaluator.compileInputContents,
+        evaluator.globalKeys,
+        evaluator.globalValues,
+        evaluator.allowedCompileEffects,
+        evaluator.errors,
+        evaluator.steps,
+        evaluator.diagnostics
+    )
+    val ignored = invocation.evaluate(
+        lambda.children[lambda.children.size - 1]
+    )
+    evaluator.errors = invocation.errors
+    evaluator.steps = invocation.steps
+    evaluator.diagnostics = invocation.diagnostics
+    source.elements[0] = evaluator.uninitializedValue()
+    source.elements.append(invocation.values[0])
+    return
 }
 
 @noinline
@@ -6690,7 +6775,7 @@ fun bootstrapEvaluateFor(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    val source = evaluator.evaluate(expression.children[0])
+    var source = evaluator.evaluate(expression.children[0])
     val iteratorIndex = evaluator.names.size
     evaluator.names.append(expression.text)
     evaluator.values.append(bootstrapEvalInvalid())
@@ -6698,13 +6783,20 @@ fun bootstrapEvaluateFor(
     var element = 0
     var looping = true
     result = bootstrapEvalVoid()
+    if (source.kind == "generator") bootstrapRunGenerator(evaluator, source)
     var count = source.elements.size
     if (source.kind == "string") count = source.text.size
+    if (source.kind == "generator") {
+        count = 0
+        if (source.elements.size == 2) count = source.elements[1].elements.size
+    }
     while (element < count && looping && evaluator.steps <= evaluator.context.stepLimit) {
         if (source.kind == "string") {
             evaluator.values[iteratorIndex] = bootstrapEvalInteger(
                 source.text[element]
             )
+        } else if (source.kind == "generator") {
+            evaluator.values[iteratorIndex] = source.elements[1].elements[element]
         } else {
             evaluator.values[iteratorIndex] = source.elements[element]
         }
