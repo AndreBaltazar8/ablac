@@ -44,24 +44,24 @@ val entries = #table()
 
 fun main {
     for (entry in entries) println("${entry.name} = ${entry.code}")
-    println("${#fib(30) + 1}")
+    println("${#fib(20) + 1}")
 }
 // output:
 // item1 = 5
 // item2 = 55
 // item3 = 610
-// 832041
+// 6766
 ```
 
-`fib(30)` runs once, inside the compiler. The program only contains the
+`fib(20)` runs once, inside the compiler. The program only contains the
 number. `table()` is an ordinary function: the program could call it at run
 time too, and here it runs at compile time because of the `#`.
 
 Things to know about `#`:
 
 - **It binds tightly.** `#` applies to the operand right after it, including
-  that operand's calls, member accesses and indexes. `#fib(30) + 1` means
-  `(#fib(30)) + 1`, and `#config.items[0]` evaluates the whole chain. Use
+  that operand's calls, member accesses and indexes. `#fib(20) + 1` means
+  `(#fib(20)) + 1`, and `#config.items[0]` evaluates the whole chain. Use
   parentheses for anything larger: `#(a() + b())`.
 - **It runs once per build**, not once per execution. A `#` inside a function
   body or a loop is still one constant.
