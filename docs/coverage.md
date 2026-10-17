@@ -76,8 +76,8 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Step limit, `ABLA_EVAL_STEP_LIMIT` | `eval.ab` | [compile-time.md#limits](compile-time.md#limits) | good | test-eval-steps |
 | Declaration blocks | `parser.ab`, `sema.ab`, `eval.ab` | [compile-time.md#declaration-blocks](compile-time.md#declaration-blocks) | reference | test-independent-modules |
 | `ABLA_COMPILE_EVAL` (interpreter / JIT) | in progress | — | missing | — |
-| Compiler reflection, transforms, generated modules, exports | `eval.ab`, `stdlib/abla/compiler` | [compiler-api.md](compiler-api.md) | reference | compiler tests (69 files) |
-| Subparsers `$name` | `subparser.ab`, `stdlib/abla/compiler/parser` | [subparsers.md](subparsers.md) | reference | subparser tests (34 files) |
+| Compiler reflection, transforms, generated modules, exports | `eval.ab`, `stdlib/abla/compiler` | [compiler-api.md](compiler-api.md) | good (reflection, transforms, types run; generated modules reference) | compiler tests (69 files) |
+| Subparsers `$name` | `subparser.ab`, `stdlib/abla/compiler/parser` | [subparsers.md](subparsers.md) | good (tutorial runs) | subparser tests (34 files) |
 | Programmable builds | `toolchain.ab`, `stdlib/abla/build` | [programmable-builds.md](programmable-builds.md) | reference | test-programmable-build†, test-target-descriptors† |
 
 ## Concurrency
@@ -113,6 +113,9 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 - Networking: `abla/websocket/event`, `abla/websocket/tls` and
   `abla/http/async` have prose and fragments but no runnable example.
 - `abla/html`, `abla/compression/gzip`, `abla/llvm/*`.
-- The compiler API: a per-function reference for type handles, class
-  fields, generic substitution, the raw parser cursor functions and the
-  generated-declaration builders.
+- The compiler API: the raw-line helpers of the parser cursor
+  (`parserRawLineRecordsValid`, `parserRawInsert*`, `parserRawGuardNestedEntries`,
+  `parserRawWrapTopLevelRecord`), the generated-declaration builders, and
+  annotation arguments, which can't be reflected yet.
+- Programmable builds: the examples are fragments, because they build other
+  programs for fixed targets.
