@@ -728,10 +728,10 @@ fun main {
 - Parameter types also come from a built-in method's element type:
   `callbacks.append({ x -> x + 1 })` on an `array<(int) -> int>`, and the
   same for `Map` values.
-- A call resolves to a local or parameter holding a function first, then a
-  member of the receiver, then a top-level function, so a callback
-  parameter named like a global function calls the callback.
-
+- A call by name looks for an *applicable* candidate level by level: a
+  local or parameter, then a member of the receiver, then a top-level
+  function ([classes](#classes) has the details). So a callback parameter
+  named like a global function calls the callback.
 - `return` inside a lambda returns from the lambda.
 - Lambdas that change a capture are `FnMut`, and `move { ... }` lambdas are
   `FnOnce`. Both are affine
@@ -786,14 +786,17 @@ fun main {
 
 - Construction is a call: `Point(3, 4)`, with defaults and named arguments
   like any function (`constructor.arity`, `constructor.argument`).
-- A name in a method resolves to, in order: a local or parameter, a member
-  of the receiver, then a top-level declaration. So a property or method
-  named like a global function wins inside the class, and a parameter wins
-  over both.
+- A name in a method resolves level by level: a local or parameter, then a
+  member of the receiver, then a top-level declaration. A plain read
+  (`scale`) takes the first level that has the name. A call (`scale(v)`)
+  takes the first level with an *applicable* candidate: a method, or a
+  property of function type, whose parameters accept the arguments. A
+  property that isn't a function never captures a call, and a method that
+  can't take these arguments lets the search continue. With no applicable
+  candidate anywhere, the error names the innermost one.
 - A class body contains only methods (`fun`, `operator fun`, `trusted fun`,
   `noescape fun`). Properties belong in the constructor
   (`E_PARSE_CLASS_MEMBER`).
-
 - Objects are references: assigning one shares it. Changing an object through
   a parameter needs a `var` parameter, and the compiler checks aliases
   ([ownership.md](ownership.md#changing-objects-through-references)).
@@ -802,6 +805,29 @@ fun main {
 - `resource class` declares a type whose objects have one owner and an
   optional `drop()`
   ([ownership.md](ownership.md#resources-values-with-one-owner)).
+
+```abla fragment
+import "abla/io"
+
+fun scale(x: int): int = x * 10
+fun bump(x: int): int = x + 1
+
+class Camera(val scale: int) {
+    fun bump(): int = 7
+    fun calc(v: int): int = scale(v) + scale + bump(v) + bump()
+}
+
+fun main {
+    println("${Camera(2).calc(4)}")   // 40 + 2 + 5 + 7
+}
+// output:
+// 54
+```
+
+> Known issue (being fixed by ablac-frontend): today a property or method
+> named like a top-level function captures every call of that name, even
+> one it can't take (`scale(v)` above reports `call.target:scale`, so the
+> example is not run yet). Until then, give such members distinct names.
 
 > Known issue (being fixed by ablac-frontend): today a method can't call another
 > method of its class by name (`area()` reports `call.target:area`; write
