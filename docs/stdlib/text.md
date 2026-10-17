@@ -82,9 +82,9 @@ fun main {
 | `s.isValidUtf8()` | rejects overlong encodings, surrogates, truncation and values above U+10FFFF |
 | `utf8Info(s)` | `Utf8Info(valid, codePoints, errorOffset)` |
 | `s.codePointCount()` | number of code points |
-| `s.codePointAt(i)`, `s.codePointSlice(begin, end)` | by code-point position |
-| `utf8ByteOffset(s, i)`, `utf8DecodeAt(s, offset)` | convert between code-point and byte positions |
-| `utf8Encode(scalar)` | the UTF-8 encoding of one code point |
+| `s.codePointAt(i)`, `s.codePointSlice(begin, end)` | by code-point position; a position past the end (or invalid UTF-8 before it) gives `-1` and `""` instead of panicking |
+| `utf8ByteOffset(s, i)`, `utf8DecodeAt(s, offset)` | convert between code-point and byte positions; `utf8ByteOffset` is `-1` past the end (`i == codePointCount()` gives `size`) |
+| `utf8Encode(scalar)` | the UTF-8 encoding of one code point; `""` for a negative value, a surrogate or one above U+10FFFF |
 
 There are no locale-dependent operations and no large Unicode tables.
 
