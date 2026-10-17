@@ -139,6 +139,7 @@ test: ablac
 	tools/test-string-escapes.sh $(COMPILER)
 	tools/test-parse-errors-stop.sh $(COMPILER)
 	tools/test-return-type-diagnostic.sh $(COMPILER)
+	tools/test-diagnostic-hints.sh $(COMPILER)
 	tools/test-region-escape-operators.sh $(COMPILER)
 	tools/test-diagnostic-noise.sh $(COMPILER)
 	tools/test-compile-time-lift.sh $(COMPILER)
