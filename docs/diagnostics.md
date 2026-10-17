@@ -51,6 +51,7 @@ only its parse errors.
 | `E_PARSE_PARAMETER_SEPARATOR`, `E_PARSE_ARGUMENT_SEPARATOR`, `E_PARSE_ARRAY_SEPARATOR` | a missing `,` |
 | `E_PARSE_UNCLOSED_DELIMITER` | an unclosed `(`, `[` or `{` |
 | `E_PARSE_STRING_PART` | a malformed string or template |
+| `E_PARSE_SAFE_CALL`, `E_PARSE_ELVIS` | Kotlin's `?.` or `?:`: Abla has neither; check `x != null` (which narrows a `val`) or write `if (x != null) x else fallback` |
 | `E_PARSE_INVALID_ESCAPE` | an unknown backslash escape in a string, a `\x` without 2 hex digits, or a `\u` that isn't a Unicode code point ([language.md](language.md#lexical-structure)) |
 | `E_PARSE_ASSIGNMENT_TARGET` | the left side of `=` can't be assigned |
 | `E_PARSE_COMPOUND_ASSIGNMENT_TARGET` | the left side of `+=` etc. contains a call ([language.md](language.md#expressions-and-operators)) |
@@ -69,6 +70,7 @@ only its parse errors.
 | `identifier:<name>@<offset>` | no variable, parameter or declaration of that name is visible |
 | `call.target:<name>` | no function of that name |
 | `function.arity:<f>`, `method.arity:<T>.<m>`, `constructor.arity` | wrong number of arguments |
+| `method.unknown:<T>.<m>` | `T` has no method `m` (a help line names the standard module to import when one declares it, e.g. `abla/text` for `string.trim`) |
 | `function.argument:<f>@<offset>:<expected>:<actual>`, `method.argument`, `constructor.argument` | an argument of the wrong type |
 | `function.result:<f>:<declared>:<actual>`, `method.result` | the body's value doesn't match the declared result type ([language.md](language.md#void-and-never)) |
 | `return.type` | a `return` value doesn't match the result type |

@@ -2,6 +2,8 @@ import "subparser.ab"
 import "ct_lift.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
+import "abla/sys/linux/fs"
+import "package.ab"
 
 fun bootstrapSemanticUnit(): void {}
 
@@ -9243,9 +9245,12 @@ fun bootstrapInferStringTemplate(
         // A fixed-width integer is written as its decimal value.
         val integer = bootstrapIsIntegerScalarType(partType) &&
             bootstrapNormalizeType(partType) != "char"
+        // An unknown part follows an error already reported (an unknown
+        // method or name): one mistake, one error.
         if (!float && !integer && partType != "string" &&
             partType != "bool" && partType != "null" &&
-            partType != "any") {
+            partType != "any" &&
+            !(partType == "unknown" && analyzer.errors > 0)) {
             analyzer.fail("string.interpolation:$partType")
         }
         part = part + 1
@@ -10340,8 +10345,19 @@ fun bootstrapInferMemberCall(
             expression.text
         )
         val suppliedCount = expression.children.size - 1
-        if (parameterCount < 0 || suppliedCount > parameterCount ||
-            suppliedCount < requiredCount) {
+        if (parameterCount < 0) {
+            analyzer.fail(
+                "method.unknown:${receiver}.${expression.text}@${expression.begin}"
+            )
+            val module = bootstrapStandardMethodModule(
+                receiver, expression.text
+            )
+            if (module != "") {
+                analyzer.diagnostics =
+                    "${analyzer.diagnostics}help: `${expression.text}` is declared in $module; add `import \"$module\"`\n"
+            }
+        } else if (suppliedCount > parameterCount ||
+                   suppliedCount < requiredCount) {
             analyzer.fail("method.arity:${receiver}.${expression.text}")
         }
         var argument = 1
@@ -10657,6 +10673,40 @@ fun bootstrapInferAwait(
     } else {
         analyzer.fail("await.type:$operation")
         result = "unknown"
+    }
+    result
+}
+
+// The standard-library module that declares the extension method
+// `<receiver>.<method>` on a built-in type, for a hint when it isn't imported
+// ("" when none does). Only read on that error path.
+fun bootstrapStandardMethodModule(receiver: string, method: string): string {
+    val surface = if (receiver == "i64") "int" else receiver
+    var result = ""
+    if (surface == "string" || surface == "int" || surface == "f64" ||
+        surface == "bool") {
+        val needle = "fun $surface.$method"
+        val modules = ["abla/text", "abla/core"]
+        var index = 0
+        while (result == "" && index < modules.size) {
+            val path = Path(bootstrapStandardLibraryRoot()).child(
+                modules[index]
+            ).child("entry.ab")
+            if (path.info().exists()) {
+                val source = path.readText()
+                var at = 0
+                while (result == "" && at + needle.size < source.size) {
+                    val next = source[at + needle.size]
+                    if (source.slice(at, at + needle.size) == needle &&
+                        (at == 0 || source[at - 1] == 10) &&
+                        (next == 40 || next == 58 || next == 32)) {
+                        result = modules[index]
+                    }
+                    at = at + 1
+                }
+            }
+            index = index + 1
+        }
     }
     result
 }
