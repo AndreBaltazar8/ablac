@@ -162,13 +162,11 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 ## Internal errors
 
 `E_IR_*`, `E_LLVM_*`, `E_COMPILER_UNCLASSIFIED` and `E_INTERNAL` come from
-the later compiler stages. After a source error they are usually just
-consequences of it: fix the first error. On their own, they point at a gap
-in an earlier check. One mistake is currently reported this way:
+the later compiler stages. Every source mistake should be reported by an
+earlier check, with its own code. So if you see one of these, it is a
+compiler bug, whether or not another error came before it. Please report it
+with the smallest program that shows it.
 
-- Calling a `compile fun` from run-time code shows up as
-  `E_LLVM_INSTRUCTION_UNSUPPORTED: function main cannot lower ... call target
-  <name>` (being fixed by ct-parity).
-
-If you hit one that doesn't follow from an earlier error, it is a compiler
-bug worth reporting with the smallest program that shows it.
+> Known issue (being fixed by ct-parity): calling a `compile fun` from
+> run-time code is still reported as `E_LLVM_INSTRUCTION_UNSUPPORTED:
+> function main cannot lower ... call target <name>`.
