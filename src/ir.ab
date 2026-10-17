@@ -1,4 +1,5 @@
 import "eval.ab"
+import "ct_lift.ab"
 import "staged_parser.ab"
 import "overload.ab"
 import "abla/runtime/memory"
@@ -4222,7 +4223,10 @@ class BootstrapLowerer(
     val localNames: BootstrapIrLocalNames,
     // Compile functions whose validation-only lowering failed: never emitted,
     // but their errors are named like any function's (bootstrapIrVerificationDiagnostics).
-    val validationFailures: array<BootstrapIrFunction> = []
+    val validationFailures: array<BootstrapIrFunction> = [],
+    // What lifting a compile-time closure asks lowering to observe (ct_lift.ab);
+    // the lowerers a lowerer makes share it.
+    val liftProbe: BootstrapLiftProbe
 ) {
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     fun visibleLocal(name: string, typed: bool): int {
@@ -6195,111 +6199,6 @@ class BootstrapLowerer(
         opcode
     }
 
-    fun emitEvaluated(value: BootstrapEvalValue): int {
-        var result = -1
-        var seen = -1
-        var seenIndex = 0
-        while (seenIndex < this.evaluatedValues.size) {
-            if (this.evaluatedValues[seenIndex] == value) seen = seenIndex
-            seenIndex = seenIndex + 1
-        }
-        if (seen >= 0) result = this.evaluatedResults[seen]
-        if (value.kind == "integer") {
-            result = this.emit("const.i64", -1, -1, "${value.integer}")
-        }
-        if (value.kind == "boolean") {
-            var booleanText = "false"
-            if (value.boolean) booleanText = "true"
-            else booleanText = booleanText
-            result = this.emit("const.bool", -1, -1, booleanText)
-        }
-        if (value.kind == "string") {
-            result = this.emit("const.string", -1, -1, value.text)
-        }
-        if (value.kind == "f64") {
-            result = this.emit(
-                "const.f64", -1, -1, bootstrapF64LiteralText(value.integer)
-            )
-        }
-        if (value.kind == "null") {
-            result = this.emit("const.null", -1, -1, "")
-        }
-        // An array of numbers, booleans or strings is one array.create of
-        // constants, which the backend builds from a static table.
-        var scalars = value.kind == "array" && seen < 0 &&
-            value.elements.size >= 2
-        var scalar = 0
-        while (scalars && scalar < value.elements.size) {
-            val kind = value.elements[scalar].kind
-            scalars = kind == "integer" || kind == "f64" ||
-                kind == "boolean" || kind == "string"
-            scalar = scalar + 1
-        }
-        if (scalars) {
-            val constants: array<int> = []
-            scalar = 0
-            while (scalar < value.elements.size) {
-                constants.append(this.emitEvaluated(value.elements[scalar]))
-                scalar = scalar + 1
-            }
-            result = this.emitMany("array.create", constants, "")
-            this.evaluatedValues.append(value)
-            this.evaluatedResults.append(result)
-        }
-        if (value.kind == "array" && seen < 0 && !scalars) {
-            val empty: array<int> = []
-            result = this.emitMany("array.create", empty, "")
-            this.evaluatedValues.append(value)
-            this.evaluatedResults.append(result)
-            var element = 0
-            while (element < value.elements.size) {
-                val elementValue = this.emitEvaluatedOperand(value.elements[element])
-                val appendOperands: array<int> = [result, elementValue]
-                this.emitMany("array.append", appendOperands, "")
-                element = element + 1
-            }
-        }
-        if (value.kind == "map" && seen < 0) {
-            val none: array<int> = []
-            result = this.emitMany("map.create", none, "")
-            this.evaluatedValues.append(value)
-            this.evaluatedResults.append(result)
-            var entry = 0
-            while (entry < value.elements[0].elements.size) {
-                val key = this.emitEvaluatedOperand(value.elements[0].elements[entry])
-                val stored = this.emitEvaluatedOperand(value.elements[1].elements[entry])
-                this.emitMany("map.set", [result, key, stored], "")
-                entry = entry + 1
-            }
-        }
-        if (value.kind == "object" && seen < 0) {
-            result = this.emit("object.allocate", -1, -1, value.owner)
-            this.evaluatedValues.append(value)
-            this.evaluatedResults.append(result)
-            var field = 0
-            while (field < value.fieldNames.size &&
-                   field < value.elements.size) {
-                val fieldValue = this.emitEvaluatedOperand(value.elements[field])
-                val fieldOperands: array<int> = [result, fieldValue]
-                this.emitMany(
-                    "field.set",
-                    fieldOperands,
-                    value.fieldNames[field]
-                )
-                field = field + 1
-            }
-        }
-        if (result < 0) this.errors = this.errors + 1
-        result
-    }
-
-    // An element, key or field the evaluator could not finish still lowers
-    // to an instruction, so the backend never reads operand -1.
-    fun emitEvaluatedOperand(value: BootstrapEvalValue): int {
-        val result = this.emitEvaluated(value)
-        if (result < 0) this.emit("invalid", -1, -1, "compile") else result
-    }
-
     fun appendLogicalOperands(
         expression: BootstrapExpression,
         operation: string,
@@ -6763,7 +6662,9 @@ class BootstrapLowerer(
             -1,
             validationOnly,
             this.errors,
-            bootstrapIrLocalNames()
+            bootstrapIrLocalNames(),
+            [],
+            this.liftProbe
         )
         var defaultIndex = 0
         while (defaultIndex < declaration.parameterDefaults.size) {
@@ -6944,7 +6845,9 @@ class BootstrapLowerer(
             -1,
             validationOnly,
             this.errors,
-            bootstrapIrLocalNames()
+            bootstrapIrLocalNames(),
+            [],
+            this.liftProbe
         )
         var defaultIndex = 0
         while (defaultIndex < method.parameterDefaults.size) {
@@ -7604,7 +7507,11 @@ fun bootstrapLowerCompile(
     initial: int
 ): int {
     var result = initial
-    if (lowerer.validationOnly) {
+    if (lowerer.validationOnly && bootstrapLiftProbing(lowerer)) {
+        // A lambda inside the expression may be the one a lifted closure
+        // needs the capture types of.
+        result = lowerer.lowerExpression(expression.children[0])
+    } else if (lowerer.validationOnly) {
         result = lowerer.emit("const.void", -1, -1, "")
     } else {
         val evaluated = bootstrapEvaluate(
@@ -7614,9 +7521,14 @@ fun bootstrapLowerCompile(
         lowerer.recordCompileInputs(evaluated)
         if (evaluated.diagnostics != "") {
             bootstrapStageDriverDiagnostic(evaluated.diagnostics)
+            bootstrapNoteDiagnosedLoweringErrors(evaluated.errors)
         }
         lowerer.errors = lowerer.errors + evaluated.errors
-        result = lowerer.emitEvaluated(evaluated.value)
+        result = bootstrapLiftEmitResult(
+            lowerer,
+            evaluated,
+            lowerer.lowerExpressionType(expression.children[0])
+        )
     }
     result
 }
@@ -7711,7 +7623,6 @@ fun bootstrapLowerLambda(
     initial: int
 ): int {
     var result = initial
-    val lambdaInstructions: array<BootstrapInstruction> = []
     val lambdaParameters: array<string> = []
     val lambdaParameterTypes: array<string> = []
     val lambdaAbiParameterTypes: array<string> = []
@@ -7790,6 +7701,38 @@ fun bootstrapLowerLambda(
         )
         parameter = parameter + 1
     }
+    bootstrapLiftProbeLambda(
+        lowerer, expression, lambdaParameters, lambdaParameterTypes,
+        lambdaAbiParameterTypes, captureNames, ownedCaptures, capturedCells
+    )
+    result = bootstrapLowerLambdaFunction(
+        lowerer, expression, "", lambdaParameters, lambdaParameterTypes,
+        lambdaAbiParameterTypes, captureNames, ownedCaptures, capturedCells,
+        captureValues, lowerer.currentOwner
+    )
+    result
+}
+
+/** The function of a lambda whose captures are known, and the closure over
+ *  `captureValues` (a cell for each ordinary capture, the value for an owned
+ *  one). `symbolPrefix` keeps a lambda lifted from a compile-time value apart
+ *  from the one its source declaration lowers. */
+fun bootstrapLowerLambdaFunction(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression,
+    symbolPrefix: string,
+    lambdaParameters: array<string>,
+    lambdaParameterTypes: array<string>,
+    lambdaAbiParameterTypes: array<string>,
+    captureNames: array<string>,
+    ownedCaptures: array<string>,
+    capturedCells: array<string>,
+    captureValues: array<int>,
+    owner: string
+): int {
+    var result = -1
+    val lambdaInstructions: array<BootstrapInstruction> = []
+    val body = expression.children[expression.children.size - 1]
     val lambdaLocals: array<string> = []
     val lambdaLocalTypes: array<string> = []
     val lambdaStorage: array<string> = []
@@ -7830,7 +7773,7 @@ fun bootstrapLowerLambda(
         [],
         [],
         lambdaImplicitResults,
-        lowerer.currentOwner,
+        owner,
         lambdaEvaluatedValues,
         lambdaEvaluatedResults,
         lowerer.compileInputPaths,
@@ -7843,7 +7786,9 @@ fun bootstrapLowerLambda(
         -1,
         lowerer.validationOnly,
         lowerer.errors,
-        bootstrapIrLocalNames()
+        bootstrapIrLocalNames(),
+        [],
+        lowerer.liftProbe
     )
     val lambdaResult = lambdaLowerer.lowerExpression(body)
     lambdaLowerer.emitOwnedParameterDrops()
@@ -7852,7 +7797,7 @@ fun bootstrapLowerLambda(
     // index. Source spans keep lambda symbols deterministic and unique
     // across independently committed declarations.
     val lambdaName =
-        "lambda_${expression.begin}_${expression.end}_${lowerer.functions.size}"
+        "${symbolPrefix}lambda_${expression.begin}_${expression.end}_${lowerer.functions.size}"
     val lambdaFunction = bootstrapFinalizeIrFunction(
         lambdaName,
         lambdaParameters,
@@ -9547,7 +9492,8 @@ fun bootstrapLowerParsedCached(
         false,
         analyzed.errors,
         bootstrapIrLocalNames(),
-        validationFailures
+        validationFailures,
+        BootstrapLiftProbe([], [])
     ).lower(parsed, contextFirst, contextSecond, cache, pruneUnused)
 }
 

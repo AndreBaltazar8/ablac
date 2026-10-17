@@ -13,13 +13,18 @@ mkdir -p "$output_directory"
 set +e
 "$output_directory/program"
 status=$?
-"$compiler" --emit-llvm \
-    "$project_root/tests/cases/modules/invalid-compile-time-f32.ab" \
-    > "$output_directory/invalid.ll" 2> "$output_directory/invalid.err"
-invalid=$?
 set -e
-[[ $status -eq 42 && $invalid -ne 0 ]] || exit 1
-grep -q 'compile.result:f32' "$output_directory/invalid.err"
+[[ $status -eq 42 ]] || exit 1
+
+# An f32 result lifts as the same f32 bits.
+"$compiler" build \
+    "$project_root/tests/cases/modules/compile-time-f32-result.ab" \
+    -o "$output_directory/single" --no-cache
+set +e
+"$output_directory/single"
+status=$?
+set -e
+[[ $status -eq 42 ]] || exit 1
 
 # A 20000-entry table evaluates whole (it stopped at 100000 steps).
 "$compiler" build "$project_root/tests/cases/modules/compile-time-tables.ab" \

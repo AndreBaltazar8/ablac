@@ -20,6 +20,10 @@ var bootstrapCompileOutputBytes: int = 0
 // the per-process journal holds.
 var bootstrapCompileGlobalCount: int = 0
 var bootstrapBuildTransactionActive: bool = false
+// Lowering errors already explained by a staged driver diagnostic (a failed
+// compile-time evaluation or lift): the driver neither emits nor reports
+// them again as IR failures.
+var bootstrapDiagnosedLoweringErrors: int = 0
 var bootstrapBuildTransactionCount: int = 0
 
 class BootstrapCompileProgramRequest(
@@ -873,6 +877,17 @@ fun bootstrapRequiredInternalFunctionSources(): array<string> {
 fun bootstrapDriverDiagnosticRoot(): string =
     "build/.abla-driver-diagnostics-${linuxProcessId()}"
 
+fun bootstrapNoteDiagnosedLoweringErrors(count: int): void {
+    bootstrapDiagnosedLoweringErrors = bootstrapDiagnosedLoweringErrors + count
+    bootstrapSemanticUnit()
+}
+
+fun bootstrapTakeDiagnosedLoweringErrors(): int {
+    val count = bootstrapDiagnosedLoweringErrors
+    bootstrapDiagnosedLoweringErrors = 0
+    count
+}
+
 fun bootstrapStageDriverDiagnostic(diagnostic: string): void {
     if (diagnostic.size <= 8192 && bootstrapDriverDiagnosticCount < 64) {
         val root = bootstrapDriverDiagnosticRoot()
@@ -1461,7 +1476,10 @@ class BootstrapEvalResult(
     val diagnostics: string,
     val compileInputPaths: array<string>,
     val compileInputContents: array<string>,
-    val generatedDeclarations: array<BootstrapDeclaration>
+    val generatedDeclarations: array<BootstrapDeclaration>,
+    // The syntax closure values index (`value.integer`): lifting a closure
+    // into the program lowers its lambda from here (ct_lift.ab).
+    val syntax: array<BootstrapExpression> = []
 )
 
 fun bootstrapEvalInvalid(): BootstrapEvalValue =
@@ -2048,6 +2066,19 @@ class BootstrapEvaluator(
     var steps: int,
     var diagnostics: string
 ) {
+    /** Whether `name` is a field of the method receiver `this`. */
+    fun receiverHasField(name: string): bool {
+        val index = this.find("this")
+        if (index < 0) return false
+        var receiver = this.values[index]
+        if (receiver.kind == "cell") receiver = receiver.elements[0]
+        if (receiver.kind != "object") return false
+        for (field in receiver.fieldNames) {
+            if (field == name) return true
+        }
+        false
+    }
+
     fun recordEvaluatorDiagnostic(code: string, message: string): void {
         this.diagnostics =
             "${this.diagnostics}error[$code]: $message\n"
@@ -5481,12 +5512,20 @@ fun bootstrapEvaluateLambda(
     val captureValues: array<BootstrapEvalValue> = []
     var capture = 0
     while (capture < free.size) {
-        val found = evaluator.find(free[capture])
+        var name = free[capture]
+        var found = evaluator.find(name)
+        // A field read inside a method's lambda captures the receiver, as
+        // lowering does.
+        if (found < 0 && evaluator.receiverHasField(name)) {
+            name = "this"
+            found = evaluator.find(name)
+        }
         if (found >= 0 &&
-            !evaluator.nameIsBound(captureNames, free[capture])) {
+            !evaluator.nameIsBound(captureNames, name)) {
             var value = evaluator.values[found]
-            captureNames.append(free[capture])
-            if (!(expression.kind == "lambda.move" &&
+            captureNames.append(name)
+            // The receiver binding never changes: it is captured as is.
+            if (name != "this" && !(expression.kind == "lambda.move" &&
                   evaluator.valueIsAffine(value))) {
                 if (value.kind != "cell") {
                     value = bootstrapEvalCell(value)
@@ -5532,9 +5571,13 @@ fun bootstrapEvaluateIdentifier(
     }
     else {
         val receiverIndex = evaluator.find("this")
-        if (receiverIndex >= 0 &&
-            evaluator.values[receiverIndex].kind == "object") {
-            val receiver = evaluator.values[receiverIndex]
+        // A closure made in a method holds its receiver in a cell.
+        val receiverValue = if (receiverIndex < 0) bootstrapEvalInvalid()
+            else if (evaluator.values[receiverIndex].kind == "cell")
+                evaluator.values[receiverIndex].elements[0]
+            else evaluator.values[receiverIndex]
+        if (receiverValue.kind == "object") {
+            val receiver = receiverValue
             var field = 0
             while (field < receiver.fieldNames.size) {
                 if (receiver.fieldNames[field] == expression.text) {
@@ -10254,7 +10297,8 @@ fun bootstrapEvaluateWithEffectsIn(
         evaluator.diagnostics,
         compileInputPaths,
         compileInputContents,
-        generatedDeclarations
+        generatedDeclarations,
+        syntax
     )
 }
 
