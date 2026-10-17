@@ -55,6 +55,27 @@ column=$(( $(printf '%s' "$before" | tail -n1 | LC_ALL=en_US.UTF-8 wc -m) + 1 ))
 grep -q "^  --> unicode-column.ab:$line:$column\$" "$log" ||
     fail "unicode: expected unicode-column.ab:$line:$column" "$log"
 
+log=$output/memory.log
+build_fails compile-time-memory.ab "$log"
+grep -q '^error\[E_EVAL_MEMORY_UNAVAILABLE\]: `runtimeMemoryCollect` has no program heap' "$log" ||
+    fail "memory: not denied" "$log"
+
+log=$output/compile-fun.log
+build_fails compile-fun-at-run-time.ab "$log"
+grep -q '^error\[E_SEMANTIC\]: compile.call-runtime:twice' "$log" ||
+    fail "compile fun at run time: not reported" "$log"
+! grep -qE 'E_IR_|E_LLVM_' "$log" || fail "compile fun at run time: code-generation noise" "$log"
+
+log=$output/run-time-local.log
+build_fails run-time-local-in-compile.ab "$log"
+grep -q '^error\[E_SEMANTIC\]: compile.runtime-local:n' "$log" ||
+    fail "run-time local in #: not reported" "$log"
+! grep -qE 'E_IR_|E_LLVM_|E_EVAL_' "$log" || fail "run-time local in #: noise" "$log"
+
+log=$output/parse-error.log
+build_fails parse-error-before-main.ab "$log"
+! grep -q 'E_NO_MAIN' "$log" || fail "parse error: a skipped main reported missing" "$log"
+
 log=$output/no-main.log
 build_fails no-main.ab "$log"
 [[ $(grep -c '^error\[' "$log") -eq 1 ]] || fail "no-main: not one error" "$log"
