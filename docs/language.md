@@ -103,54 +103,258 @@ of a function's or lambda's body block may not redeclare one of its parameters
 
 ### Delegated bindings
 
-A local or top-level `val`/`var` may store a policy object while exposing the
-value returned by that object's accessors:
+A delegated binding looks like an ordinary `val` or `var`, but every read and
+every write of it goes through an object you choose: the *delegate*. Use one
+when a value needs a policy attached to it (clamping, validation, logging,
+counting, a value kept somewhere else) without making every use site call
+that policy by hand.
 
-```abla fragment
-class ClampedInt(var current: int, val minimum: int, val maximum: int) {
+```abla
+import "abla/io"
+
+class Clamped(var current: int, val minimum: int, val maximum: int) {
     fun getValue(): int = current
     fun setValue(next: int): void {
-        if (next < minimum) current = minimum
-        else if (next > maximum) current = maximum
-        else current = next
+        current = if (next < minimum) minimum else if (next > maximum) maximum else next
         return
     }
 }
 
-var volume: int by ClampedInt(40, 0, 100)
-volume = 140                         // setValue(140), result is 140
-val stored = volume                  // one getValue(), observes 100
-^volume = ClampedInt(20, 0, 50)      // replaces the stored delegate
+fun main {
+    var volume: int by Clamped(40, 0, 100)
+    println("start: $volume")
+    volume = 140                // calls setValue(140); the delegate keeps 100
+    println("after 140: $volume")
+    volume -= 150               // getValue, then setValue(-50); it keeps 0
+    println("after -= 150: $volume")
+}
+// output:
+// start: 40
+// after 140: 100
+// after -= 150: 0
 ```
 
-`val/var name [: Exposed] by delegate` evaluates `delegate` exactly once. If
-`Exposed` is omitted, it is inferred from the unambiguous zero-argument
-`getValue` result. A delegated `var` additionally requires
-`setValue(Exposed): void`; a delegated `val` does not. Every ordinary read
-calls `getValue` once, and every ordinary assignment evaluates its right-hand
-side once and calls `setValue` once. The assignment result remains the
-converted attempted value and does not perform an extra getter call.
+`var volume: int by Clamped(40, 0, 100)` evaluates `Clamped(40, 0, 100)` once
+and stores that object. From then on, `volume` in an expression means
+`getValue()` on the stored object and `volume = x` means `setValue(x)`.
 
-Prefix `^` projects the stored delegate rather than the exposed value.
-Ordinary arguments therefore remain value-oriented, while `inspect(^volume)`
-uses the delegate's static type and the normal parameter, borrow, and ownership
-rules. Only a delegated `var` permits `^volume = replacement`, and the
-replacement must have the same static delegate type. Its expression is
-evaluated before an affine old delegate is dropped. `move(^volume)` is rejected
-because it would leave the exposed binding without initialized storage.
+#### The delegate contract
 
-A closure captures the live delegate slot, not a getter snapshot. Captured
-`var` replacement remains visible through the existing shared capture cell.
-Top-level delegates follow normal deterministic initializer order. Delegate
-getters and setters retain their ordinary transitive effects in staged and
-runtime code; a denied compiler capability is not hidden by delegated syntax.
-An owned affine getter result is rejected, while the delegate itself may be
-affine and is dropped once under the usual scope/reassignment rules.
+- The delegate is an instance of a class with a zero-argument `getValue()`
+  method. Its result type is the *exposed* type: what `volume` reads as.
+- A delegated `var` also needs `setValue(next: T): void`, where `T` is the
+  exposed type. A delegated `val` needs no setter and cannot be assigned
+  (`assignment.immutable`).
+- The type annotation is optional: `var volume by Clamped(40, 0, 100)` takes
+  its type from `getValue()`. When it is written, `getValue()` must return
+  exactly that type.
+- `by` works on local and top-level `val`/`var`, and on `compile val` /
+  `compile var`. It does not work on parameters or class properties.
 
-Compile-time binding reflection reports delegation, exposed and delegate
-types, mutability, selected getter/setter handles, replacement permission, and
-the `by` span. Reflection exposes metadata only; the live delegate is available
-solely through source-level `^binding`.
+#### When the accessors run
+
+- Every read calls `getValue()` once. That includes reads inside string
+  templates and the read half of a compound assignment.
+- Every assignment evaluates its right-hand side once and calls `setValue()`
+  once. `volume -= 150` is one `getValue()` and one `setValue()`.
+- The value of an assignment expression is the value that was *assigned*, not
+  what the delegate kept. `val attempted = (volume = 140)` sets `attempted` to
+  `140` even though `volume` reads back `100`. No extra `getValue()` call is
+  made to find out.
+
+```abla
+import "abla/io"
+
+class Counted(var current: int, var reads: int, var writes: int) {
+    fun getValue(): int {
+        reads += 1
+        current
+    }
+    fun setValue(next: int): void {
+        writes += 1
+        current = next
+        return
+    }
+}
+
+fun main {
+    var score by Counted(0, 0, 0)
+    score = 10                 // 1 write
+    score += 5                 // 1 read, 1 write
+    val copy = score           // 1 read
+    println("score $score")    // 1 read
+    val attempted = (score = 7)
+    println("assigned $attempted; reads ${(^score).reads}, writes ${(^score).writes}")
+}
+// output:
+// score 15
+// assigned 7; reads 3, writes 3
+```
+
+#### Reaching the delegate: `^name`
+
+Prefix `^` names the stored delegate object instead of the exposed value. Its
+static type is the delegate's class, so you can read its fields, call its
+methods, and pass it to functions under the usual parameter and ownership
+rules. On a delegated `var`, `^name = replacement` swaps in a new delegate:
+
+```abla
+import "abla/io"
+
+class Clamped(var current: int, val minimum: int, val maximum: int) {
+    fun getValue(): int = current
+    fun setValue(next: int): void {
+        current = if (next < minimum) minimum else if (next > maximum) maximum else next
+        return
+    }
+}
+
+fun widen(var policy: Clamped): void {
+    policy.current = policy.maximum   // a `var` parameter may mutate the delegate
+    return
+}
+
+fun main {
+    var volume: int by Clamped(40, 0, 100)
+    println("limit ${(^volume).maximum}")
+    widen(^volume)
+    println("widened to $volume")
+    ^volume = Clamped(5, 0, 10)      // replace the delegate itself
+    volume += 100
+    println("new policy: $volume")
+}
+// output:
+// limit 100
+// widened to 100
+// new policy: 10
+```
+
+Write `(^volume).maximum` with the parentheses. Prefix `^` applies to the
+whole member chain after it, so `^volume.maximum` means `^(volume.maximum)`,
+and `volume.maximum` is not a delegated binding:
+
+```abla error
+class Clamped(var current: int, val minimum: int, val maximum: int) {
+    fun getValue(): int = current
+}
+
+fun main: int {
+    val volume by Clamped(40, 0, 100)
+    ^volume.maximum
+}
+// error: E_NOT_DELEGATED
+// error: delegate projection requires an addressable delegated binding
+```
+
+The rules for `^`:
+
+- Only a delegated `var` can have its delegate replaced; on a `val` that is
+  `E_DELEGATE_REPLACE_VAL`.
+- The replacement must have the same class as the current delegate
+  (`E_DELEGATE_TYPE_MISMATCH`).
+- The replacement expression is evaluated first. Then the old delegate is
+  dropped, if it is a resource.
+- `move(^name)` is rejected (`E_DELEGATE_MOVE_PROJECTION`): it would leave the
+  binding with no delegate to call.
+- `val alias = ^name` borrows the delegate. Replacing it while `alias` is
+  still used later is `E_DELEGATE_BORROW_CONFLICT`.
+- `^` on an ordinary binding is `E_NOT_DELEGATED` ("`n` has ordinary
+  storage"). Between two integer expressions, `^` is XOR.
+
+#### Closures, ownership and lifetime
+
+A closure captures the binding itself, not a snapshot of its value. Each call
+of the closure goes through the delegate that is current at that moment,
+including one installed by `^name = ...` after the closure was created.
+
+```abla
+import "abla/io"
+
+class Box(var current: int) {
+    fun getValue(): int = current
+    fun setValue(next: int): void {
+        current = next
+        return
+    }
+}
+
+fun main {
+    var value by Box(1)
+    val read = { value }
+    value = 7
+    println("after assignment: ${read()}")
+    ^value = Box(11)
+    println("after replacement: ${read()}")
+}
+// output:
+// after assignment: 7
+// after replacement: 11
+```
+
+The delegate may be a `resource class`. It is dropped exactly once: when the
+binding goes out of scope, or when `^name = replacement` replaces it. A
+getter may not hand out an owned affine value (`E_DELEGATE_AFFINE_VALUE`), but
+it may return a view tied to the delegate, as in
+`fun getValue(): borrow(this) Ticket`.
+
+A top-level delegated binding is initialized in the normal top-level
+initializer order, and its delegate expression runs once.
+
+#### At compile time
+
+Delegated bindings behave the same under `#`, inside `compile fun`, and as
+`compile val` / `compile var`. The getter's and setter's effects count as the
+binding's effects, so a getter that reads the environment needs the
+`environment` capability like any other caller (`compile.effect-denied`). The
+compiler's binding reflection (`compiler.findBinding`,
+`compiler.bindingIsDelegated`, `compiler.bindingDelegateType`, ...; see
+[compiler-api.md](compiler-api.md#binding-reflection)) reports a binding's
+delegation, exposed and delegate types, mutability, accessor handles,
+whether replacement is allowed, and the `by` span. Reflection describes the
+declaration only. The live delegate object is reachable only through
+`^name` in source.
+
+```abla
+import "abla/io"
+
+class Box(var current: int) {
+    fun getValue(): int = current
+    fun setValue(next: int): void {
+        current = next
+        return
+    }
+}
+
+compile fun staged(): int {
+    var value by Box(5)
+    value += 1
+    value * 7
+}
+
+fun main {
+    println("${#staged()}")
+}
+// output:
+// 42
+```
+
+#### Diagnostics
+
+| Code | Cause |
+|---|---|
+| `E_DELEGATE_GETTER_MISSING` | The delegate has no zero-argument `getValue()`, or it doesn't return the declared type |
+| `E_DELEGATE_SETTER_MISSING` | A delegated `var` whose delegate has no `setValue(T): void` |
+| `E_NOT_DELEGATED` | `^` applied to something that isn't a delegated binding (including `^a.b`; write `(^a).b`) |
+| `E_DELEGATE_REPLACE_VAL` | `^name = ...` on a delegated `val` |
+| `E_DELEGATE_TYPE_MISMATCH` | `^name = ...` with a delegate of a different class |
+| `E_DELEGATE_MOVE_PROJECTION` | `move(^name)` |
+| `E_DELEGATE_AFFINE_VALUE` | `getValue()` returns an owned affine value |
+| `E_DELEGATE_BORROW_CONFLICT` | The delegate is replaced while a borrow of it from `^name` is still used |
+
+> Known issue: in a method, a field whose name is also the name of a
+> top-level delegated binding currently resolves to the top-level binding at
+> run time. Until that's fixed, don't give a top-level delegated binding the
+> same name as a field of any class.
 
 Function declarations may omit `()` only when they have no parameters. This
 retains prototype compatibility. Trailing lambdas are supported. Lambdas are
