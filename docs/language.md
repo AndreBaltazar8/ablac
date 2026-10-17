@@ -384,8 +384,15 @@ fun main {
 // 0 0
 ```
 
-- An array literal's elements must share one type (`array.element-type`).
-  An empty literal needs a declared type, or names it: `array<int>()` is
+- An array literal takes the type expected of it: a typed local or
+  top-level value, a function's result or `return`, an argument of a
+  top-level function or constructor. That type's element type flows into
+  nested literals and lambdas, and `null` fits a `T?` element
+  (`val rows: array<array<int?>> = [[1, null], []]`). Without such a type,
+  the elements must share one, `[]` and `null` taking the others'
+  (`[[1], []]` is an `array<array<int>>`, `["x", null]` an
+  `array<string?>`); otherwise it is `array.element-type`.
+- An empty literal needs an expected type, or names it: `array<int>()` is
   `[]` as an `array<int>`, usable wherever an expression goes
   (`val names = array<string>()`, `total(array<int>())`).
 - A declared type flows into the literal: in

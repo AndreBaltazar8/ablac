@@ -1,0 +1,229 @@
+// Expected types flow into array literals. Where a literal stands for a value
+// of a declared type (a typed local or top-level value, a function's result or
+// a `return` in it, an argument of a top-level function or a constructor), an
+// array literal takes that type as `array<T>()` names its own, and each
+// element literal in it takes `T` the same way: `[[1], []]` as an
+// `array<array<int>>`, `["x", null]` as an `array<string?>`. Analysis then
+// checks each element against `T`, and lowering and compile-time evaluation
+// see the same typed literal.
+//
+// The pass is syntax to syntax before semantic analysis; a literal with no
+// such context keeps its type from its elements.
+import "parser.ab"
+import "overload.ab"
+import "staged_parser.ab"
+import "receiver_names.ab"
+
+/** The array type `type` names once a trailing `?` is dropped, else "". */
+fun bootstrapExpectedArrayType(type: string): string {
+    var text = type
+    if (text.size > 0 && text[text.size - 1] == 63) text = text.slice(0, text.size - 1)
+    if (text.size < 7 || text.slice(0, 6) != "array<" || text[text.size - 1] != 62) return ""
+    text
+}
+
+/** `expression` as a value of type `type`. */
+fun bootstrapExpectType(expression: BootstrapExpression, type: string): BootstrapExpression {
+    if (expression.kind == "array" && expression.text == "") {
+        val array = bootstrapExpectedArrayType(type)
+        if (array == "") return expression
+        val element = array.slice(6, array.size - 1)
+        val children: array<BootstrapExpression> = []
+        for (child in expression.children) children.append(bootstrapExpectType(child, element))
+        return BootstrapExpression("array", array, expression.begin, expression.end, children)
+    }
+    if (expression.kind == "block" && expression.children.size > 0) {
+        val last = expression.children.size - 1
+        val result = bootstrapExpectType(expression.children[last], type)
+        if (result == expression.children[last]) return expression
+        val children: array<BootstrapExpression> = []
+        var index = 0
+        while (index < last) {
+            children.append(expression.children[index])
+            index = index + 1
+        }
+        children.append(result)
+        return BootstrapExpression("block", expression.text, expression.begin, expression.end, children)
+    }
+    if (expression.kind == "if" && expression.children.size == 3) {
+        val taken = bootstrapExpectType(expression.children[1], type)
+        val otherwise = bootstrapExpectType(expression.children[2], type)
+        if (taken == expression.children[1] && otherwise == expression.children[2]) return expression
+        return BootstrapExpression(
+            "if", expression.text, expression.begin, expression.end,
+            [expression.children[0], taken, otherwise]
+        )
+    }
+    expression
+}
+
+/** The parameter types of the top-level functions and constructors a plain
+ *  call can name: one entry per name declared once. */
+class BootstrapExpectedCallees(
+    val names: array<string>,
+    val parameters: array<array<string>>,
+    val types: array<array<string>>
+) {
+    fun find(name: string): int {
+        var index = 0
+        while (index < this.names.size) {
+            if (this.names[index] == name) return index
+            index = index + 1
+        }
+        -1
+    }
+}
+
+fun bootstrapExpectedCallees(declarations: array<BootstrapDeclaration>): BootstrapExpectedCallees {
+    var callees = BootstrapExpectedCallees([], [], [])
+    val repeated: array<string> = []
+    for (declaration in declarations) {
+        val callable = ((declaration.kind == "fun" || declaration.kind == "compile.fun" ||
+            declaration.kind == "extern") && declaration.extensionOwner == "") ||
+            declaration.kind == "class"
+        if (callable) {
+            if (callees.find(declaration.name) >= 0) repeated.append(declaration.name)
+            else {
+                callees.names.append(declaration.name)
+                callees.parameters.append(declaration.parameters)
+                callees.types.append(declaration.parameterTypes)
+            }
+        }
+    }
+    for (name in repeated) {
+        val index = callees.find(name)
+        if (index >= 0) callees.names[index] = ""
+    }
+    callees
+}
+
+/** The type the callee gives its argument `argument` (at `position`), or "". */
+fun bootstrapExpectedArgumentType(
+    callees: BootstrapExpectedCallees,
+    callee: int,
+    argument: BootstrapExpression,
+    position: int
+): string {
+    val parameters = callees.parameters[callee]
+    val types = callees.types[callee]
+    var index = position
+    if (argument.kind == "named.argument") {
+        index = -1
+        var parameter = 0
+        while (parameter < parameters.size) {
+            if (parameters[parameter] == argument.text) index = parameter
+            parameter = parameter + 1
+        }
+    }
+    if (index < 0 || index >= types.size) return ""
+    "${types[index]}"
+}
+
+/** `expression` with the expected types written into the literals inside it;
+ *  `result` is the enclosing function's result type ("" outside one). */
+fun bootstrapExpectTypesIn(
+    expression: BootstrapExpression,
+    callees: BootstrapExpectedCallees,
+    bound: array<string>,
+    result: string
+): BootstrapExpression {
+    // A lambda's `return` leaves the lambda, whose result isn't declared here.
+    val inner = if (expression.kind == "lambda" || expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator") "" else result
+    val children: array<BootstrapExpression> = []
+    var changed = false
+    for (child in expression.children) {
+        val rewritten = bootstrapExpectTypesIn(child, callees, bound, inner)
+        if (rewritten != child) changed = true
+        children.append(rewritten)
+    }
+    if ((expression.kind == "local.val" || expression.kind == "local.var") &&
+        children.size > 1 && children[1].kind == "type" && children[1].text != "inferred") {
+        val typed = bootstrapExpectType(children[0], children[1].text)
+        if (typed != children[0]) {
+            children[0] = typed
+            changed = true
+        }
+    }
+    if (expression.kind == "return" && result != "" && children.size == 1) {
+        val typed = bootstrapExpectType(children[0], result)
+        if (typed != children[0]) {
+            children[0] = typed
+            changed = true
+        }
+    }
+    if (expression.kind == "call" && !bootstrapReceiverNameIn(bound, expression.text)) {
+        val callee = callees.find(expression.text)
+        if (callee >= 0) {
+            var position = 0
+            while (position < children.size) {
+                val argument = children[position]
+                val type = bootstrapExpectedArgumentType(callees, callee, argument, position)
+                if (type != "") {
+                    var typed = argument
+                    if (argument.kind == "named.argument" && argument.children.size == 1) {
+                        val value = bootstrapExpectType(argument.children[0], type)
+                        if (value != argument.children[0]) typed = BootstrapExpression(
+                            argument.kind, argument.text, argument.begin, argument.end, [value]
+                        )
+                    } else if (argument.kind != "named.argument") {
+                        typed = bootstrapExpectType(argument, type)
+                    }
+                    if (typed != argument) {
+                        children[position] = typed
+                        changed = true
+                    }
+                }
+                position = position + 1
+            }
+        }
+    }
+    if (!changed) return expression
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
+/** A function's or top-level value's body with the expected types written in. */
+fun bootstrapExpectTypesBody(
+    declaration: BootstrapDeclaration,
+    callees: BootstrapExpectedCallees
+): BootstrapDeclaration {
+    var bound: array<string> = []
+    for (parameter in declaration.parameters) bound.append(parameter)
+    bootstrapReceiverBoundNames(declaration.expression, bound)
+    val function = declaration.kind == "fun" || declaration.kind == "compile.fun"
+    val result = if (function) declaration.resultType else ""
+    var body = bootstrapExpectTypesIn(declaration.expression, callees, bound, result)
+    val value = declaration.kind == "val" || declaration.kind == "var" ||
+        declaration.kind == "compile.val" || declaration.kind == "compile.var"
+    if (declaration.resultType != "" && (function || value)) {
+        body = bootstrapExpectType(body, declaration.resultType)
+    }
+    if (body == declaration.expression) return declaration
+    bootstrapDeclarationWithExpression(declaration, body)
+}
+
+fun bootstrapResolveExpectedTypes(parsed: BootstrapParseResult): BootstrapParseResult {
+    val callees = bootstrapExpectedCallees(parsed.declarations)
+    val declarations: array<BootstrapDeclaration> = []
+    var changed = false
+    for (declaration in parsed.declarations) {
+        var rewritten = bootstrapExpectTypesBody(declaration, callees)
+        if (declaration.methods.size > 0) {
+            val methods: array<BootstrapDeclaration> = []
+            var methodsChanged = false
+            for (method in declaration.methods) {
+                val typed = bootstrapExpectTypesBody(method, callees)
+                if (typed != method) methodsChanged = true
+                methods.append(typed)
+            }
+            if (methodsChanged) rewritten = bootstrapDeclarationWithMethods(rewritten, methods)
+        }
+        if (rewritten != declaration) changed = true
+        declarations.append(rewritten)
+    }
+    if (!changed) return parsed
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+}
