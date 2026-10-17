@@ -710,14 +710,17 @@ fun main {
   `calls`. Captures outlive the call that created them, and `this` is
   captured the same way.
 - A function name is a function value (`apply(5, double)`).
+- Any expression of function type can be called: `adder(2)(3)`,
+  `handlers[0]()`, `(pick())(x)`. `button.onClick(event)` calls a method
+  named `onClick` if there is one, and otherwise a property of function
+  type with that name.
+- Parameter types also come from a built-in method's element type:
+  `callbacks.append({ x -> x + 1 })` on an `array<(int) -> int>`, and the
+  same for `Map` values.
 - A call resolves to a local or parameter holding a function first, then a
   member of the receiver, then a top-level function, so a callback
   parameter named like a global function calls the callback.
 
-> Known issue (being fixed by ct-parity): today a call through a parameter
-> or local that has the same name as a top-level function calls the
-> top-level function instead (`function.arity:<name>`). Give such callbacks
-> distinct names for now.
 - `return` inside a lambda returns from the lambda.
 - Lambdas that change a capture are `FnMut`, and `move { ... }` lambdas are
   `FnOnce`. Both are affine
@@ -725,6 +728,22 @@ fun main {
 - Braces whose first member is a declaration (`{ fun f() ... }`) are a
   compile-time declaration block, not a lambda
   ([compile-time.md](compile-time.md#declaration-blocks)).
+
+> Known issue (being fixed by ct-parity): today a call through a parameter
+> or local that has the same name as a top-level function calls the
+> top-level function instead (`function.arity:<name>`). Give such callbacks
+> distinct names for now.
+
+> Known issue (being fixed by ablac-frontend): today a call drops a callee
+> that isn't a plain name. `adder(2)(3)` silently calls `adder(3)`,
+> `handlers[0]()` has an unknown type, and `button.onClick(event)` on a
+> property is `method.arity`. Put the function in a local first:
+> `val f = adder(2)` then `f(3)`.
+
+> Known issue (being fixed by ct-infer): today a lambda passed to `append`
+> or a `Map` method needs explicit parameter types
+> (`{ x: int -> x + 1 }`); without them the parameter is
+> `identifier:x`.
 
 ## Classes
 
