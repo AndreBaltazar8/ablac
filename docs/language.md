@@ -403,6 +403,12 @@ fun main {
 > only a top-level empty literal takes the declared type: nested empty
 > literals and `null` elements are `array.element-type`.
 
+> Known issue (being fixed by ablac-frontend): an array literal passed to a
+> receiver whose type is only inferred (`val rows = makeRows()` then
+> `rows.append([1, null])`) still types itself from its own elements.
+> Annotate the local (`val rows: array<array<int?>> = makeRows()`) until
+> then.
+
 > Known issue (being fixed by ct-rt): out-of-bounds accesses, `truncate`
 > with a negative count or one beyond the size, and a negative `filledArray`
 > count currently stop the program with "fatal signal" and a stack trace but
