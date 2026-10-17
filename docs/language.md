@@ -581,7 +581,7 @@ fun main {
 - Parameters borrow their arguments; `var` and `own` change that
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)).
 
-> Known issue (being fixed by coordinator): named arguments currently work
+> Known issue (being fixed by ablac-backend): named arguments currently work
 > only for top-level functions and constructors; a method call with them is
 > `E_NAMED_ARGUMENT_TARGET`.
 
