@@ -1,9 +1,33 @@
-# Abla language contract
+# The Abla language
 
-Status: bootstrap specification, version 0.1.
+This is the reference for the Abla language: what each construct means, its
+rules, and the diagnostics you get when a rule is broken. Every example on
+this page is a complete program that the documentation tests compile and
+run, with its output.
 
-This document distinguishes deliberate language behavior from limitations of
-the original prototype. Changes require a language test and an update here.
+Larger topics have their own pages:
+
+- [ownership.md](ownership.md): who may change a value and who cleans it
+  up (`var`/`own` parameters, `move`, resources, borrows, `Shared`, `Mutex`)
+- [compile-time.md](compile-time.md): running code during compilation (`#`,
+  `compile fun`, `compile val`, capabilities)
+- [concurrency.md](concurrency.md): `defer`, generators, tasks and threads
+- [regions.md](regions.md): scoped allocation with `region { ... }`
+- [compiler-api.md](compiler-api.md) and [subparsers.md](subparsers.md):
+  extending the compiler
+
+Contents: [design rules](#design-rules) ·
+[programs](#programs) · [lexical structure](#lexical-structure) ·
+[values and variables](#values-and-variables) · [types](#types) ·
+[functions](#functions) · [classes](#classes) ·
+[delegated bindings](#delegated-bindings) ·
+[overloads and operators](#overloads-and-operator-functions) ·
+[expressions](#expressions-and-operators) ·
+[control flow](#control-flow) · [ownership](#ownership-and-resources) ·
+[regions](#scoped-allocation-regions) · [memory](#memory-management) ·
+[compile time](#compile-time-execution) · [modules](#modules-and-imports) ·
+[annotations](#annotations) ·
+[trusted and native code](#trusted-native-implementations)
 
 ## Design rules
 
@@ -16,92 +40,650 @@ the original prototype. Changes require a language test and an update here.
 7. Compiler reflection uses stable handles rather than mutable implementation
    objects.
 
-## Lexical structure
+## Programs
 
-Source is UTF-8. The bootstrap accepts ASCII letters and `_` in identifiers;
-Unicode identifier classes are reserved for a later version. Spaces, tabs, and
-comments separate tokens. Newlines are significant only where they can
-terminate a statement or where the grammar forbids a line break.
-
-Line comments begin with `//`. Block comments use `/* ... */` and may nest.
-
-Integer literals are decimal or hexadecimal (`0x2a`) and may contain `_`
-between digits. Floating literals are decimal, default to `f64`, and require a
-fractional digit or a valid decimal exponent (`1.5`, `2e3`, `1.25e-2`); `_` may
-separate their digits. Floating literals and arithmetic are currently runtime
-only, operands must have the same width, and `abla/float` provides the explicit
-signed `int` to `f64` numerical conversion `f64FromInt`. Explicit `f32`
-conversion remains forthcoming. Strings use `"..."` and support the escapes
-`\t`, `\b`, `\r`, `\n`, `\'`, `\"`, `\\`, `\$`, byte-preserving `\xNN`, and
-ASCII `\uXXXX`. `$name` and `${expression}` are string interpolation. A
-template made only of literal text and module `val`s that hold such strings is
-one compile-time constant, so composing text from named pieces costs nothing.
-
-The compiler accepts `;` as an explicit separator, but never requires it.
-
-## Declarations
-
-The compatible declaration forms are:
-
-```abla fragment
-val immutable = 1
-var mutable: int = 2
-
-fun inferred(a: int) = a + 1
-fun block(a: int): int {
-    a + 1
-}
-
-extern:"c" fun puts(text: cstring): int
-compile fun generate() { ... }
-
-class Point(val x: int, val y: int) {
-    fun sum() = x + y
-}
-
-interface Printable {
-    fun print()
-}
-```
-
-The last expression in a block is its value. A function with no declared
-return type is inferred. An empty block has type `void`. `val` may be assigned
-exactly once; `var` may be reassigned.
-
-A typed local `var` may defer its first assignment:
-
-```abla fragment
-var answer: int
-if (ready) answer = 42 else answer = fallback()
-use(answer)
-```
-
-The verified control-flow graph requires every path to assign the binding
-before a read. An untyped deferred declaration and a deferred `val` are
-rejected; `val` continues to receive its value at its declaration until
-single-assignment path merging is implemented.
-
-A local is in scope from its declaration to the end of its block. A local of a
-nested block may shadow a parameter, an outer local, or a field; the outer
-binding is visible again once that block ends, including to a lambda that
-captures it:
+A program is a module with a `fun main`. `main` takes no parameters. If it
+returns an `int`, that is the process exit status; without a result type
+(or with `: void`) the program exits with 0. Printing comes from the
+standard library's `abla/io`:
 
 ```abla
-fun scaled(width: f64, flag: bool): f64 {
-    var result = width
-    if (flag) {
-        val flag = 0.5      // shadows the parameter inside this block
-        result = width * flag
-    }
-    if (flag) result else 0.0   // the parameter again
+import "abla/io"
+
+fun main: int {
+    println("Hello, world!")
+    3
 }
+// output:
+// Hello, world!
+// exit: 3
 ```
 
-Two locals of one block may not share a name (`local.duplicate`), and a local
-of a function's or lambda's body block may not redeclare one of its parameters
-(`local.shadows-parameter`): the parameters are declared in that scope.
+- `ablac build hello.ab -o hello` builds an executable; `ablac run hello.ab`
+  compiles and runs it in one step ([toolchain.md](toolchain.md)).
+- A module without `main` can't be built on its own (`E_NO_MAIN`); it is
+  imported by others.
+- Command-line arguments come from `abla/process`
+  (`processArgumentCount()`, `processArgument(i)`).
+- `exit(code)` from `abla/process/exit` ends the program immediately.
+  `panic(message)` prints the message and a stack trace and exits with
+  status 101.
 
-### Delegated bindings
+```abla
+import "abla/io"
+import "abla/process/exit"
+
+fun check(n: int): int {
+    if (n < 0) panic("negative input: $n")
+    n
+}
+
+fun main: int {
+    println("${check(2)}")
+    if (check(1) == 1) exit(7)
+    0
+}
+// output:
+// 2
+// exit: 7
+```
+
+## Lexical structure
+
+**Source and identifiers.** Source is UTF-8. Identifiers are ASCII letters,
+digits and `_`, not starting with a digit. Unicode identifiers are reserved
+for a later version.
+
+**Comments.** `// to end of line` and `/* block */`. Block comments nest.
+
+**Keywords.** These are reserved everywhere: `abstract`, `await`, `break`,
+`class`, `compile`, `constructor`, `continue`, `defer`, `do`, `else`,
+`extern`, `false`, `for`, `fun`, `generator`, `if`, `import`, `in`,
+`interface`, `noescape`, `null`, `resource`, `return`, `task`, `thread`,
+`true`, `trusted`, `until`, `val`, `var`, `when`, `while`, `yield`. These
+are keywords only in one position and ordinary identifiers elsewhere:
+`by` (after a binding's name), `own` (before a parameter name), `region`
+(before `{`), `operator` (before `fun`), `type` (at the start of a
+declaration), `move` (before `{`). `abstract` is accepted and ignored, and
+`constructor` is reserved for future use.
+
+**Statements.** A newline ends a statement where a statement can end. `;`
+separates statements explicitly and is never required. A line that starts
+with a binary `+` or `-` followed by a space, or with `.`, continues the
+expression on the line above:
+
+```abla
+import "abla/io"
+
+fun main {
+    val total = 1 +
+        2
+    val adjusted = 10
+        - 4
+    val prefix = "abcdef"
+        .slice(0, 3)
+    val x = 1; val y = 2
+    println("$total $adjusted $prefix ${x + y}")
+}
+// output:
+// 3 6 abc 3
+```
+
+A sign glued to a number at the start of a line (`-1`) begins a new
+statement, so `if (found) return i` followed by `-1` on the next line returns
+`-1` from the function rather than computing `i - 1`.
+
+**Integer literals** are decimal or hexadecimal (`0x2a`), with optional `_`
+between digits (`1_000_000`). **Floating literals** need a fractional part or
+an exponent (`1.5`, `2e3`, `1.25e-2`) and have type `f64`. There are no
+character literals: `"abc"[1]` is the byte value `98`.
+
+**Strings** are written `"..."` and may span lines. Escapes: `\n`, `\r`,
+`\t`, `\b`, `\"`, `\'`, `\\`, `\$`, `\xNN` (any byte) and `\uXXXX` (ASCII code
+points). `$name` and `${expression}` insert values:
+
+```abla
+import "abla/io"
+
+fun main {
+    val name = "Abla"
+    val count = 3
+    println("$name has ${count + 1} letters")
+    println("price: \$5, tab:\t|, hex: \x41, unicode: B")
+    println("two
+lines")
+    println("con" + "cat")
+}
+// output:
+// Abla has 4 letters
+// price: $5, tab:	|, hex: A, unicode: B
+// two
+// lines
+// concat
+```
+
+A template may insert strings, integers of any width, `bool`, and
+`f64`/`f32` (with `import "abla/float/text"`; without it the error says so).
+Other types, `char` included, are `string.interpolation:<type>`.
+A nullable value must be checked for `null` first
+(`string.interpolation:nullable:...`). A template made only of literal text
+and top-level `val`s holding such strings is folded into one constant at
+compile time.
+
+## Values and variables
+
+`val` declares a binding that is assigned once; `var` one that can be
+reassigned. The type comes from the initializer unless you write it:
+
+```abla
+import "abla/io"
+
+val greeting = "hello"
+var visits = 0
+
+fun visit(): void {
+    visits += 1
+    return
+}
+
+fun main {
+    val limit: int = 3
+    var answer: int
+    if (limit > 2) answer = 42 else answer = 0
+    visit()
+    visit()
+    println("$greeting $visits $answer")
+}
+// output:
+// hello 2 42
+```
+
+- A typed local `var` may be declared without a value (`var answer: int`).
+  Every path must then assign it before it is read. An untyped declaration
+  without a value (`local.uninitialized-type`) and a `val` without a value
+  (`local.uninitialized-val`) are rejected.
+- Assigning a `val` is `assignment.immutable` (`global.immutable` at the
+  top level); assigning a `val` property is `field.immutable`.
+- Top-level `val`/`var` are initialized in declaration order before `main`
+  runs.
+- A local lives from its declaration to the end of its block. A local in a
+  nested block may shadow an outer local, a parameter or a field; the outer
+  one is visible again after the block, including to closures that captured
+  it.
+- Two locals of one block can't share a name (`local.duplicate`), and a
+  function's or lambda's body can't redeclare one of its parameters
+  (`local.shadows-parameter`).
+
+```abla
+import "abla/io"
+
+fun scaled(width: int, flag: bool): int {
+    var result = width
+    if (flag) {
+        val flag = 2          // shadows the parameter inside this block
+        result = width * flag
+    }
+    if (flag) result else 0   // the parameter again
+}
+
+fun main {
+    println("${scaled(21, true)}")
+}
+// output:
+// 42
+```
+
+## Types
+
+| Type | Values |
+|---|---|
+| `bool` | `true`, `false` |
+| `i8`, `i16`, `i32`, `i64` | signed integers; `int` is `i64` |
+| `u8`, `u16`, `u32`, `u64` | unsigned integers |
+| `f32`, `f64` | IEEE floating point; literals are `f64` |
+| `char` | a byte-sized character code |
+| `string` | immutable UTF-8 text, indexed by byte |
+| `array<T>` | a growable sequence |
+| `Map<K, V>` | a hash map with `string` or `int` keys |
+| `T?` | `T` or `null` |
+| `(A, B) -> R` | a function; see [functions](#functions) |
+| `void` | no value: the type of an empty block |
+| `never` | no value ever: the type of a call that doesn't return |
+| `any` | any value (used by low-level code) |
+| `T*` | a native pointer, only in [trusted code](#trusted-native-implementations) |
+
+Classes, interfaces and nominal `type`s add named types, and the standard
+library adds `Task<T>`, `Thread<T>`, `Generator<T>`, `Cell<T>`, `Shared<T>`,
+`Weak<T>`, `Mutex<T>` and `Borrow<T>`.
+
+### Integers
+
+Arithmetic and bitwise operators require both operands to have the same
+integer type. Fixed-width `+`, `-` and `*` wrap around at their width;
+division rounds toward zero and `%` takes the sign of the dividend. To mix
+widths, convert explicitly with the type's name: `u32(value)`, `i16(value)`.
+Narrowing keeps the low bits; widening sign-extends a signed source and
+zero-extends an unsigned one. No conversion allocates.
+
+```abla
+import "abla/io"
+
+fun main {
+    val small = u8(250) + u8(10)
+    println("$small ${i8(200)} ${u32(-1)}")
+    println("${-7 / 2} ${-7 % 3} ${9223372036854775807 + 1}")
+    println("${1 << 4} ${-8 >> 1} ${-8 >>> 60} ${5 & 3} ${5 | 3} ${5 ^ 3} ${~0}")
+}
+// output:
+// 4 -56 4294967295
+// -3 -1 -9223372036854775808
+// 16 -4 15 1 7 6 -1
+```
+
+- `>>` is arithmetic for signed types and logical for unsigned ones; `>>>`
+  is always logical. A shift count may have any integer type. A count that
+  is negative or at least the width gives zero.
+- Mixing types (`f64 + int`, `string + int`) is `arithmetic.type`. Mixing
+  bit-operation types is `bitwise.type`.
+
+> Known issue: an `int` argument passed to a parameter of a narrower type
+> (`u8`, `i32`, ...) is narrowed implicitly, without a conversion call. Write
+> the conversion anyway; the implicit form may become an error.
+
+### Floating point
+
+`f64` is the default. `abla/float` converts between integers and floats
+(`f64FromInt`, `f64ToInt`, `f64ToF32`, `f32ToF64`, ...) and to and from bit
+patterns. `abla/math` has `sqrt`, `pow`, `sin`, `floor`, `mathPi` and the
+rest. `abla/float/text` prints shortest round-trip text and is needed to
+put a float in a template:
+
+```abla
+import "abla/io"
+import "abla/float"
+import "abla/float/text"
+import "abla/math"
+
+fun main {
+    val r = 2.5
+    val area = mathPi * r * r
+    println(f64Text(area))
+    println("${f64ToInt(floor(area))} ${f64FromInt(3) / 2.0}")
+    val small: f32 = f64ToF32(0.1)
+    println(f64Text(f32ToF64(small)))
+}
+// output:
+// 19.634954084936208
+// 19 1.5
+// 0.10000000149011612
+```
+
+Both operands of float arithmetic must have the same width. Floats work at
+compile time too, with identical results.
+
+### Strings
+
+A `string` is immutable UTF-8. `size` is its length in bytes; `text[i]` is
+the byte at `i` as an `int`; `slice(begin, end)` copies a byte range; `+`
+concatenates two strings. `for (b in text)` iterates over the bytes.
+`abla/text` adds the usual helpers (`split`, `trim`, `startsWith`,
+`indexOf`, `replace`, ...) and code-point access; see
+[standard-library.md](standard-library.md).
+
+### Arrays
+
+```abla
+import "abla/io"
+
+fun main {
+    val words = ["a", "b"]
+    words.append("c")
+    val grid = filledArray(3, 0)
+    grid[1] = 5
+    println("${words.size} ${grid[1]} ${grid.size}")
+    words.truncate(1)
+    println("${words.size} ${words[0]}")
+    words.clear()
+    val empty: array<int> = []
+    println("${words.size} ${empty.size}")
+}
+// output:
+// 3 5 3
+// 1 a
+// 0 0
+```
+
+- An array literal's elements must share one type (`array.element-type`).
+  An empty literal needs a declared type.
+- `append(value)` adds at the end, `truncate(n)` keeps the first `n`
+  elements, `clear()` removes all, and `filledArray(count, value)` creates a
+  filled array.
+- Reading or writing outside the array stops the program with a trap and a
+  stack trace.
+- Changing an array you received as a parameter needs a `var` parameter
+  ([ownership.md](ownership.md#parameters-borrow-var-and-own)). An array of
+  resources owns its elements.
+
+### Maps
+
+`Map<K, V>` is a built-in hash map with `string` or `int` keys. Its type
+must be declared where it is created:
+
+```abla
+import "abla/io"
+
+fun main {
+    val ages: Map<string, int> = Map()
+    ages.set("ada", 36)
+    ages.set("alan", 41)
+    val age = ages.get("ada")              // int?
+    if (age != null) println("ada is $age")
+    println("${ages.has("alan")} ${ages.remove("alan")} ${ages.size}")
+    for (name in ages.keys()) println("key $name")
+}
+// output:
+// ada is 36
+// true true 1
+// key ada
+```
+
+`get` returns `V?`; `remove` returns whether the key was present; `keys()`
+and `values()` return arrays in insertion order; `clear()` empties the map.
+A map without a declared type is `map.untyped`, and other key types are
+`map.key-type`.
+
+### Nullable types
+
+`T?` holds a `T` or `null`. A nullable value can't be used as a `T` until
+the compiler can see it isn't `null`. Checking a `val` or a parameter
+narrows it on the path where the check holds, and after an `if` whose
+branch leaves the block (`return`, `break`, `continue`):
+
+```abla
+import "abla/io"
+
+class Node(val value: int, val next: Node?)
+
+fun describe(node: Node?): string {
+    if (node == null) return "missing"
+    "found ${node.value}"            // `node` is a Node here
+}
+
+fun sum(start: Node?): int {
+    var total = 0
+    var current = start
+    while (current != null) {
+        val node = current           // a `val` copy can be narrowed
+        if (node != null) {
+            total += node.value
+            current = node.next
+        }
+    }
+    total
+}
+
+fun main {
+    val list = Node(1, Node(2, Node(3, null)))
+    println(describe(list.next))
+    println(describe(null))
+    println("${sum(list)}")
+}
+// output:
+// found 2
+// missing
+// 6
+```
+
+- `x != null` and `null != x` narrow the true branch; `==` narrows the false
+  branch. `!`, and the guaranteed paths of `&&` and `||`, carry the facts
+  through.
+- Only `val` locals and parameters are narrowed. A `var` and a field read
+  through an object are not, because an assignment could invalidate the
+  check: copy them into a `val`, as `sum` does.
+- Using a nullable value as non-null is an error that names the type, such
+  as `member:nullable:Node.value` or `arithmetic.type@..:nullable:i64:i64`.
+
+### Nominal types
+
+`type Name = underlying` declares a distinct name for a primitive type. It
+costs nothing at run time, but the compiler keeps the two apart:
+
+```abla
+import "abla/io"
+
+type UserId = int
+
+fun UserId.next(): UserId = UserId(this + 1)
+fun idNumber(id: UserId): int = id
+
+fun main {
+    val id = UserId(41)
+    println("user ${idNumber(id.next())}")
+    println("${id + 1}")
+}
+// output:
+// user 42
+// 42
+```
+
+- `UserId(41)` converts an `int` to a `UserId`. An `int` is not accepted
+  where a `UserId` is required (`function.argument:...:UserId:i64`).
+- The other direction is implicit: a `UserId` is accepted where an `int` is,
+  as an argument, a result or an operand. Arithmetic produces the underlying
+  type, so wrapping the result is explicit.
+- Inside an extension of a nominal type, `this` is the underlying value.
+- `type` is a keyword only at the start of a declaration.
+
+> Known issue: a nominal value can't yet initialize a typed local
+> (`val raw: int = id`) or be inserted into a string template directly.
+> Pass it through a function, as `idNumber` does.
+
+### Function types
+
+`(A, B) -> R` is a function taking `A` and `B` and returning `R`;
+`T.(A) -> R` is one with a receiver. Parameter modes are part of the type:
+`(var: Counter) -> int` and `(own: Ticket) -> int` differ from
+`(Counter) -> int`. `Fn`, `FnMut`, `FnOnce` and `FnNoEscape` describe what a
+closure does with its captures
+([ownership.md](ownership.md#closures-and-ownership)). Generic arguments are
+written `Type<A, B>`.
+
+### `void` and `never`
+
+An empty block, and a `while` loop, have type `void`. A function whose
+result type is `void` must not end in an expression that has a value:
+
+```abla error
+var count = 0
+
+fun bump(): void {
+    count = count + 1
+}
+
+fun main {
+    bump()
+}
+// error: function.result:bump:void:i64
+```
+
+An assignment is an expression whose value is the assigned value, so end such
+a body with `return` (or declare no result type and ignore the value).
+
+`never` is the type of an expression that can't complete, such as a call to
+`exit` or `panic`, or a `while (true)` loop with no `break`. It fits
+wherever a value is expected, so a diverging branch doesn't change the type
+of an `if` or `when`. A function declared `never` must not be able to return
+or fall through (`function.result:<name>:never:...`).
+
+## Functions
+
+```abla
+import "abla/io"
+
+fun area(width: int = 80, height: int = width / 2): int = width * height
+
+fun describe(name: string, count: int): string {
+    val plural = if (count == 1) "" else "s"
+    "$count $name$plural"
+}
+
+fun greet {
+    println("hello")
+}
+
+fun main {
+    greet()
+    println(describe("file", 2))
+    println("${area()} ${area(height = 30)} ${area(height = 30, width = 100)}")
+}
+// output:
+// hello
+// 2 files
+// 3200 2400 3000
+```
+
+- The body is a block, whose last expression is the result, or `= expression`.
+  `return value` leaves early.
+- A function with no parameters may omit `()`: `fun greet { ... }`,
+  `fun main: int = 0`.
+- **Write the result type** (`: int`) for any function whose result is
+  used. A function without one has its result inferred, but callers can't
+  use it yet. See the known issue below.
+- Parameters may have defaults, which may refer to earlier parameters.
+  Arguments may be passed by name after the positional ones. Each argument
+  is evaluated once, in source order. Unknown, duplicate, out-of-order or
+  missing required names are errors (`E_NAMED_ARGUMENT_UNKNOWN`,
+  `_DUPLICATE`, `_ORDER`, `_REQUIRED`).
+- Parameters borrow their arguments; `var` and `own` change that
+  ([ownership.md](ownership.md#parameters-borrow-var-and-own)).
+
+> Known issue: a result inferred from `fun inc(a: int) = a + 1` is currently
+> unknown to its callers, so `inc(41) + 1` fails with
+> `arithmetic.type@..:inferred:i64` and `fun main: int = inc(41)` with
+> `function.result:main:i64:inferred`.
+
+### Extension functions
+
+`fun Type.name(...)` adds a function that is called like a method. Inside
+it, `this` is the receiver. Fields of the receiver must be read through
+`this`:
+
+```abla
+import "abla/io"
+
+class Point(val x: int, val y: int)
+
+fun Point.length2(): int = this.x * this.x + this.y * this.y
+fun int.isEven(): bool = this % 2 == 0
+
+fun main {
+    println("${Point(3, 4).length2()} ${10.isEven()}")
+}
+// output:
+// 25 true
+```
+
+### Lambdas and closures
+
+A lambda is written in braces. Parameters, if any, come before `->`; their
+types may be omitted where the expected function type supplies them. A call
+whose last argument is a lambda may put it after the parentheses (a
+*trailing lambda*), and omit empty parentheses:
+
+```abla
+import "abla/io"
+
+fun apply(value: int, transform: (int) -> int): int = transform(value)
+fun double(n: int): int = n * 2
+fun compose(f: (int) -> int, g: (int) -> int): (int) -> int = { x: int -> g(f(x)) }
+
+fun main {
+    println("${apply(5, double)}")
+    println("${apply(5) { n -> n + 1 }}")
+    val add = { a: int, b: int -> a + b }
+    val incremented = compose(double, { n -> n + 1 })
+    val constant = { -> 42 }
+    println("${add(2, 3)} ${incremented(10)} ${constant()}")
+    var calls = 0
+    val count = { calls += 1 }
+    count()
+    count()
+    println("$calls")
+}
+// output:
+// 10
+// 6
+// 5 21 42
+// 2
+```
+
+- A lambda captures variables, not copies: `count` above changes the outer
+  `calls`. Captures outlive the call that created them, and `this` is
+  captured the same way.
+- A function name is a function value (`apply(5, double)`).
+- `return` inside a lambda returns from the lambda.
+- Lambdas that change a capture are `FnMut`, and `move { ... }` lambdas are
+  `FnOnce`. Both are affine
+  ([ownership.md](ownership.md#closures-and-ownership)).
+- Braces whose first member is a declaration (`{ fun f() ... }`) are a
+  compile-time declaration block, not a lambda
+  ([compile-time.md](compile-time.md#declaration-blocks)).
+
+## Classes
+
+A class declares its properties in its primary constructor: `val` for
+read-only, `var` for mutable. Its body holds methods. Inside a method,
+properties are in scope by name, and `this` is the receiver:
+
+```abla
+import "abla/io"
+
+class Point(val x: int, val y: int = 0) {
+    fun plus(other: Point): Point = Point(x + other.x, y + other.y)
+    fun describe(): string = "($x, $y)"
+}
+
+class Account(val owner: string, var balance: int) {
+    fun deposit(amount: int): void {
+        balance += amount
+        return
+    }
+}
+
+fun main {
+    println(Point(3, 4).plus(Point(x = 1)).describe())
+    val account = Account("ada", 10)
+    account.deposit(5)
+    println("${account.owner}: ${account.balance}")
+}
+// output:
+// (4, 4)
+// ada: 15
+```
+
+- Construction is a call: `Point(3, 4)`, with defaults and named arguments
+  like any function (`constructor.arity`, `constructor.argument`).
+- A class body contains only methods (`fun`, `operator fun`, `trusted fun`,
+  `noescape fun`). Properties belong in the constructor
+  (`E_PARSE_CLASS_MEMBER`).
+- Objects are references: assigning one shares it. Changing an object through
+  a parameter needs a `var` parameter, and the compiler checks aliases
+  ([ownership.md](ownership.md#changing-objects-through-references)).
+- A method that changes `this` is detected automatically, and the receiver
+  is then treated like a `var` argument.
+- `resource class` declares a type whose objects have one owner and an
+  optional `drop()`
+  ([ownership.md](ownership.md#resources-values-with-one-owner)).
+
+### Interfaces
+
+`interface Name { fun member(...) }` declares a named type with method
+signatures. Today an interface is only a nominal type: there is no syntax
+for a class to implement one, and a class value is not accepted where an
+interface is expected (`function.argument:...:Shape:Square`). Interfaces are
+used as opaque handle types in compiler and library APIs.
+
+## Delegated bindings
 
 A delegated binding looks like an ordinary `val` or `var`, but every read and
 every write of it goes through an object you choose: the *delegate*. Use one
@@ -138,7 +720,7 @@ fun main {
 and stores that object. From then on, `volume` in an expression means
 `getValue()` on the stored object and `volume = x` means `setValue(x)`.
 
-#### The delegate contract
+### The delegate contract
 
 - The delegate is an instance of a class with a zero-argument `getValue()`
   method. Its result type is the *exposed* type: what `volume` reads as.
@@ -151,7 +733,7 @@ and stores that object. From then on, `volume` in an expression means
 - `by` works on local and top-level `val`/`var`, and on `compile val` /
   `compile var`. It does not work on parameters or class properties.
 
-#### When the accessors run
+### When the accessors run
 
 - Every read calls `getValue()` once. That includes reads inside string
   templates and the read half of a compound assignment.
@@ -191,7 +773,7 @@ fun main {
 // assigned 7; reads 3, writes 3
 ```
 
-#### Reaching the delegate: `^name`
+### Reaching the delegate: `^name`
 
 Prefix `^` names the stored delegate object instead of the exposed value. Its
 static type is the delegate's class, so you can read its fields, call its
@@ -261,7 +843,7 @@ The rules for `^`:
 - `^` on an ordinary binding is `E_NOT_DELEGATED` ("`n` has ordinary
   storage"). Between two integer expressions, `^` is XOR.
 
-#### Closures, ownership and lifetime
+### Closures, ownership and lifetime
 
 A closure captures the binding itself, not a snapshot of its value. Each call
 of the closure goes through the delegate that is current at that moment,
@@ -300,7 +882,7 @@ it may return a view tied to the delegate, as in
 A top-level delegated binding is initialized in the normal top-level
 initializer order, and its delegate expression runs once.
 
-#### At compile time
+### At compile time
 
 Delegated bindings behave the same under `#`, inside `compile fun`, and as
 `compile val` / `compile var`. The getter's and setter's effects count as the
@@ -338,7 +920,7 @@ fun main {
 // 42
 ```
 
-#### Diagnostics
+### Diagnostics
 
 | Code | Cause |
 |---|---|
@@ -356,151 +938,190 @@ fun main {
 > run time. Until that's fixed, don't give a top-level delegated binding the
 > same name as a field of any class.
 
-Function declarations may omit `()` only when they have no parameters. This
-retains prototype compatibility. Trailing lambdas are supported. Lambdas are
-lexical closures: captured bindings outlive their declaring call, nested
-closures forward environments transitively, and a captured `var` is one shared
-mutable binding rather than a copied snapshot. Capturing `this` follows the
-same rules.
-
-Function and primary-constructor parameters may have defaults. Calls may bind
-top-level function and constructor parameters by name; positional arguments
-must come first, every argument expression is evaluated once in source order,
-and omitted defaults may refer to earlier parameters:
-
-```abla
-class Window(val width: int = 80, val height: int = width / 2)
-
-fun area(width: int = 80, height: int = width / 2): int =
-    width * height
-
-val window = Window(height = 30)
-val pixels = area(height = 30, width = 100)
-```
-
-Unknown, duplicate, ambiguous, or missing required names are compile-time
-errors. The compiler lowers named calls to the ordinary positional ABI, so
-foreign consumers and generated code do not need a second calling convention.
-
-Annotations accept an optional expression argument. `@export("symbol")` and
-`@exportChecked("symbol")` attach the stable foreign symbol directly to a
-top-level function; the same signature and target validation used by the
-compiler export API still applies:
-
-```abla fragment
-@export("micro_handle")
-fun handle(pointer: int, length: int): int = dispatch(pointer, length)
-```
-
-An array publishes ABI aliases for the same implementation without repeating
-the annotation:
-
-```abla fragment
-@export(["current_name", "compatibility_name"])
-fun handle(pointer: int, length: int): int = dispatch(pointer, length)
-```
-
-Native naked-assembly exports coalesce those names to one LLVM definition.
-Other exports retain ordinary adapters for each public name.
-
-The direct scalar ABI preserves `bool`, `char`, `f32`, `f64`, and every
-currently lowered signed or unsigned 8/16/32/64-bit integer type. WebAssembly
-represents narrow integers in its `i32` lane while the adapter preserves their
-declared bit width; `i64` and `u64` use its `i64` lane, and floating values use
-their matching native lane. Managed classes and arrays are not exported as
-opaque runtime values.
-Unchecked exports whose complete signature is scalar call the typed direct ABI
-without constructing universal runtime values. Checked exports retain their
-panic-containing status ABI. A program may publish up to 128 explicitly named
-exports; larger surfaces should be split at package or artifact boundaries.
-
-### Overloads and operator functions
+## Overloads and operator functions
 
 Functions, extension functions and methods may share a name when their
-parameter types differ. Each call is resolved statically to one declaration:
-the candidate whose parameters accept the argument types, preferring the one
-with the most exact type matches. Two equally good candidates are rejected as
-`call.overload-ambiguous`, and a call no candidate accepts as
-`call.overload-no-match`; two declarations with the same parameter types remain
-`symbol.duplicate`.
-
-```abla fragment
-fun N.mul(other: N): N = …
-fun N.mul(k: f64): N = …
-operator fun N.plus(other: N): N = …
-operator fun N.unaryMinus(): N = …
-operator fun f64.times(n: N): N = …
-
-val sum = a + b * 0.5 - -c        // a.plus(b.times(0.5)).minus(c.unaryMinus())
-val scaled = 0.5 * a              // the receiver may be a scalar
-```
-
-`operator fun` on a receiver gives an arithmetic operator meaning for that
-type: `plus` (`+`), `minus` (`-`), `times` (`*`), `div` (`/`), `rem` (`%`)
-and `unaryMinus` (prefix `-`). An operator applies when its receiver is the
-left operand's type and a candidate accepts the right operand; otherwise the
-expression is ordinary scalar arithmetic, whose code is unchanged. Overloaded
-declarations are published under distinct internal names before semantic
-analysis, so overloading adds no dispatch at runtime. Named arguments and
-function references do not select among overloads.
-
-## Types
-
-The core types are `void`, `bool`, signed integer types (`i8`, `i16`, `i32`,
-`i64`, with `int` aliasing `i64`), unsigned counterparts, floating types
-(`f32`, `f64`), `char`, `string`, `array<T>`, and `any`.
-
-A nominal scalar gives a primitive value a distinct source type without adding
-runtime storage:
+parameter types differ. `operator fun` gives an arithmetic operator a
+meaning for a type:
 
 ```abla
-type Pin = int
+import "abla/io"
+import "abla/float/text"
 
-fun Pin.next(): Pin = Pin(this + 1)
-fun pinNumber(pin: Pin): int = pin
-```
+class Vec(val x: f64, val y: f64)
 
-`Pin(4)` is the explicit conversion from the underlying integer. The reverse
-direction is implicit: inside an extension, `this` is the integer itself, and a
-`Pin` can be consumed wherever its underlying integer is accepted. A plain
-integer is not accepted where `Pin` is required. Arithmetic uses the primitive
-value and produces the underlying primitive type, so constructing a new `Pin`
-remains explicit. Extensions still resolve against the nominal `Pin` type.
-After semantic resolution the typed IR erases the nominal spelling to its
-primitive representation; there is no allocation, object header, or dynamic
-dispatch. `type` is contextual at declaration position and remains available
-as an ordinary identifier elsewhere.
+operator fun Vec.plus(other: Vec): Vec = Vec(this.x + other.x, this.y + other.y)
+operator fun Vec.minus(other: Vec): Vec = Vec(this.x - other.x, this.y - other.y)
+operator fun Vec.times(k: f64): Vec = Vec(this.x * k, this.y * k)
+operator fun f64.times(v: Vec): Vec = Vec(this * v.x, this * v.y)
+operator fun Vec.unaryMinus(): Vec = Vec(-this.x, -this.y)
 
-Primitive integer conversions are also explicit calls: `u32(value)`,
-`i16(value)`, and the other integer spellings convert without allocating.
-Narrowing keeps the low bits; widening sign-extends a signed source and
-zero-extends an unsigned source. This makes register-width intent visible and
-lets fixed-width values remain native through locals, calls, globals, branches,
-and exports.
+fun describe(v: Vec): string = "(${f64Text(v.x)}, ${f64Text(v.y)})"
+fun describe(n: int): string = "#$n"
+fun describe(text: string): string = "\"$text\""
 
-`T?` is nullable. Nullability is part of every type and is not represented by a
-sentinel integer. `T*` is a native pointer type confined to trusted platform
-implementations and does not implicitly transfer ownership.
-
-A stable nullable local or parameter is refined to `T` only on a control-flow
-path that proves it non-null:
-
-```abla fragment
-val connection = weakConnection.upgrade()
-if (connection != null) {
-    inspect(connection.get())
+fun main {
+    val a = Vec(1.0, 2.0)
+    val b = Vec(0.5, 0.5)
+    println(describe(a + b * 2.0 - -a))   // a.plus(b.times(2.0)).minus(a.unaryMinus())
+    println(describe(0.5 * a))            // the receiver may be a scalar
+    println("${describe(7)} ${describe("seven")}")
+    var total = Vec(0.0, 0.0)
+    total += a                            // compound assignment uses `plus` too
+    println(describe(total))
 }
+// output:
+// (3, 5)
+// (0.5, 1)
+// #7 "seven"
+// (1, 2)
 ```
 
-Both `value != null` and `null != value` refine the true branch; `==` refines
-the false branch, and `!`, guaranteed `&&` true paths, and guaranteed `||`
-false paths preserve the corresponding polarity. The fact is branch-local.
-Mutable locals are not refined, fields are not refined through a receiver, and
-the original nullable type returns after the branch. These restrictions avoid
-invalidating a proof through assignment or an alias; later data-flow work may
-accept a mutable place when it can prove no intervening write.
+- Each call resolves at compile time to the one candidate whose parameters
+  accept the arguments, preferring the most exact type matches. Two equally
+  good candidates are `call.overload-ambiguous`, and no candidate is
+  `call.overload-no-match`. Two declarations with the same parameter types
+  are `symbol.duplicate`.
+- The operator names are `plus` (`+`), `minus` (`-`), `times` (`*`), `div`
+  (`/`), `rem` (`%`) and `unaryMinus` (prefix `-`). An operator applies when
+  its receiver is the left operand's type and it accepts the right operand.
+  Otherwise the expression is ordinary arithmetic, unchanged.
+- Overloads are resolved before code generation, so they cost nothing at run
+  time. Named arguments and function references don't choose between
+  overloads.
 
-### Ownership and resources
+## Expressions and operators
+
+Everything that can produce a value is an expression, including `if`, `when`
+and blocks. From the tightest binding to the loosest:
+
+| Level | Operators | Notes |
+|---|---|---|
+| postfix | `f(x)`, `a.b`, `a[i]`, trailing lambda | |
+| prefix | `-` `+` `!` `~` `#` `^` `await` | `#` and `^` apply to the whole postfix chain after them |
+| multiplicative | `*` `/` `%` | |
+| additive | `+` `-` | |
+| shift | `<<` `>>` `>>>` | |
+| range | `..` `until` | not chainable |
+| comparison | `<` `<=` `>` `>=` | |
+| equality | `==` `!=` | |
+| bitwise | `&`, then `^`, then `\|` | looser than `==`, as in C |
+| logical | `&&`, then `\|\|` | short-circuit |
+| assignment | `=` `+=` `-=` `*=` `/=` `%=` | right-associative |
+
+`yield` takes the whole expression after it.
+
+Two traps follow from the table:
+
+- Bitwise operators bind more loosely than comparisons, so
+  `x & 1 == 0` means `x & (1 == 0)`, which is `bitwise.type`. Write
+  `(x & 1) == 0`.
+- `^name` projects a delegated binding, and it covers the member chain after
+  it: write `(^volume).maximum`
+  ([delegated bindings](#delegated-bindings)). Between two integers, `^` is
+  XOR.
+
+An assignment is an expression whose value is the assigned value. Compound
+assignment `place op= value` means `place = place op value`, so operator
+functions apply to it. The place is evaluated twice, so it may contain only
+names, literals, fields and indexes, never a call
+(`E_PARSE_COMPOUND_ASSIGNMENT_TARGET`). Only names, fields, indexes and
+`^name` can be assigned (`E_PARSE_ASSIGNMENT_TARGET`).
+
+`==` compares numbers, booleans, strings (by content) and `null`.
+
+## Control flow
+
+`if` and `when` are expressions when every branch produces a compatible
+value. `when` compares its subject with each arm in order and takes the
+first match; an arm may list several values:
+
+```abla
+import "abla/io"
+
+fun describe(n: int): string = when (n) {
+    0 -> "zero"
+    1, 2 -> "small"
+    else -> "other"
+}
+
+fun sign(n: int): int = if (n < 0) -1 else if (n > 0) 1 else 0
+
+fun main {
+    for (i in 0..3) print("${describe(i)} ")
+    println("")
+    val answer = when (sign(-5)) {
+        -1 -> "negative"
+        else -> "not negative"
+    }
+    val flag = true
+    val word = when (flag) {
+        true -> "yes"
+        false -> "no"
+    }
+    println("$answer $word")
+}
+// output:
+// zero small small other 
+// negative yes
+```
+
+- Every `when` must be exhaustive. A `bool` subject may list `true` and
+  `false`; any other subject needs a final `else` (`when.non-exhaustive`).
+  `else` must be the last arm and appear once (`when.else-last`,
+  `when.else-duplicate`). A repeated literal is `when.duplicate`.
+- The subject is evaluated once. Arms may match integers, booleans, strings
+  and `null`.
+- An `if` without `else` is a statement.
+
+Loops are statements. `for (x in source)` iterates over an array, the bytes
+of a string, a generator, or a range: `a..b` includes `b`, and `a until b`
+stops before it. A range is an ordinary `array<int>`. The loop variable is a
+`val` (`assignment.immutable` if assigned).
+
+```abla
+import "abla/io"
+
+fun firstNegative(values: array<int>): int {
+    for (v in values) {
+        if (v < 0) return v
+    }
+    0
+}
+
+fun main {
+    for (i in 0 until 3) print("$i ")
+    for (b in "ab") print("$b ")
+    println("")
+    var i = 0
+    while (true) {
+        i += 1
+        if (i % 2 == 0) continue
+        if (i > 7) break
+        print("$i ")
+    }
+    println("")
+    var n = 10
+    do {
+        n -= 3
+    } while (n > 0)
+    println("$n ${firstNegative([3, -2, -5])}")
+}
+// output:
+// 0 1 2 97 98 
+// 1 3 5 7 
+// -2 -2
+```
+
+- `break` leaves the innermost loop; `continue` starts its next iteration.
+  Outside a loop they are `break.outside-loop` and `continue.outside-loop`.
+- `return` leaves the innermost function or lambda; a bare `return` returns
+  `void` (`return.type`, `return.outside-function`).
+- Conditions must be `bool` (`if.condition`, `while.condition`,
+  `do-while.condition`).
+- All of these behave the same at compile time.
+
+## Ownership and resources
 
 Ownership has its own page, [ownership.md](ownership.md). In brief:
 
@@ -530,143 +1151,35 @@ Ownership has its own page, [ownership.md](ownership.md). In brief:
   captures; `move { ... }` moves resources into a closure
   ([details](ownership.md#closures-and-ownership)).
 
-### Scoped allocation regions
+## Scoped allocation regions
 
-`region { ... }` creates a lexical allocation generation and reclaims it after
-the body's affine values have been destroyed. Only an allocation-independent
-scalar may cross the boundary:
+`region { ... }` runs a block whose allocations are all reclaimed when it
+ends. Only a scalar result (`int`, `bool`, `f64`, ...) may leave it; the
+compiler rejects anything that would let a region-owned value outlive the
+block. See [regions.md](regions.md) for the rules and an example.
 
-```abla fragment
-val status = region {
-    val document = parseDocument(source)
-    consume(document)
-    0
-}
-```
+## Memory management
 
-Heap values cannot be returned, assigned into older locals or objects, captured
-by an escaping closure, or passed through a call that may retain them. Receiver
-and heap-parameter mutation effects propagate through wrappers, and unknown
-foreign declarations retain by default. `noescape extern` is the FFI promise
-that Abla-managed arguments do not survive the call; `trusted` separately
-controls whether unsafe operations are authorized. Nested regions reset in
-LIFO order. Arbitrary indirect calls remain conservatively retaining until
-their type is `FnNoEscape`; ordinary function values remain retaining.
-Non-local exits are rejected until cleanup-bearing edges are part of the
-exception/control-flow model.
+Ordinary objects, arrays, strings and closures are reclaimed by a precise
+garbage collector, cycles included. Resources are destroyed
+deterministically instead ([ownership.md](ownership.md)), and regions
+reclaim whole blocks of allocations at once.
 
-All tracked heaps have a hard cumulative allocation budget. The default is one
-GiB and portable `abla/memory` code may change it explicitly. Exceeding it is a
-controlled runtime panic before the platform allocation occurs. Ordinary
-freely aliased objects can be reclaimed, including cycles, at an explicit
-`memoryCollect()` safe point. The compiler emits liveness-compressed shadow
-roots through direct and higher-order calls and traces precise allocation
-layouts. Hosted native programs collect under allocation pressure by default:
-every allocating function is a function-entry safe point. A program opts out
-with `memorySetManualCollection()` (a call that `main` can reach compiles it
-without those safe points, and it collects only at `memoryCollect()`); wasm and
-freestanding programs are manual by default. `memorySetLimit` and
-`memorySetCollectionGrowth` select pressure collection on every target (see
-[the standard library](standard-library.md)). Affine native buffers are pinned until deterministic destruction or
-region reset.
+- Hosted native programs collect automatically, under allocation pressure:
+  every allocating function is a possible collection point. Wasm and
+  freestanding programs collect only when they call `memoryCollect()`.
+- `memorySetManualCollection()` switches a hosted program to manual
+  collection. A call to it that `main` can reach compiles the program
+  without the automatic collection points.
+- `memorySetLimit` and `memorySetCollectionGrowth` turn on pressure
+  collection on any target.
+- Every program has a hard limit on the total memory it allocates, one GiB
+  by default, adjustable with `abla/memory`. Exceeding it is a controlled
+  panic, raised before the allocation happens.
+- Native buffers owned by resources stay in place until they are dropped or
+  their region ends.
 
-Function types use `(A, B) -> R`; an extension receiver uses `T.(A) -> R`.
-Generic arguments use `Type<A, B>`.
-
-## Expressions and control flow
-
-Calls, member access, and indexing bind most tightly, followed by unary
-operators, multiplication/division, addition/subtraction, shifts, comparison,
-equality, bitwise AND/XOR/OR, logical conjunction/disjunction, and assignment.
-Assignment is right-associative and produces the assigned value for prototype
-compatibility. Compound assignment `place op= value` (`+=`, `-=`, `*=`, `/=`,
-`%=`) means `place = place op value`, so an operator function applies to it as
-well. Its place is evaluated twice and therefore may contain only names,
-literals, fields and indexes, never a call.
-
-Integer arithmetic and bitwise operators preserve their common declared width.
-Fixed-width addition, subtraction, and multiplication wrap at that width;
-division and ordered comparisons use the type's signedness. `&`, `|`, `^`, and
-`~` operate on every bit in that width. `<<` shifts left, `>>` is arithmetic for
-signed types and logical for unsigned types, and `>>>` is always logical. A
-negative signed shift count or a count greater than or equal to the type width
-produces zero. Arithmetic and `&`, `|`, and `^` operands must have the same
-integer type. A shift count may use any integer type and is converted to the
-shifted value's width before the range check, so `i32(value) >> 24` does not
-need a redundant `i32(24)`. Use an explicit primitive conversion for other
-mixed-width operations. Prefix `^binding` remains the delegate projection;
-between two integer expressions, `^` is XOR.
-
-`if` and `when` are expressions when all paths yield compatible values:
-
-```abla fragment
-val sign = if (n < 0) -1 else if (n > 0) 1 else 0
-
-val label = when (n) {
-    0 -> "zero"
-    1, 2 -> "small"
-    else -> "other"
-}
-```
-
-Every `when` must be exhaustive. A Boolean subject may cover `true` and
-`false` explicitly; every other subject currently requires one final `else`
-arm. An `else` arm may appear only once and must be last. Repeated literal
-integer, Boolean, string, or `null` matches are rejected. The subject is
-evaluated once, and the first matching arm supplies the expression value at
-compile time and runtime.
-
-`never` is the uninhabited result type for expressions that cannot complete.
-It joins with the type of a completing branch, so a diverging arm does not
-force the whole expression to have type `never`:
-
-```abla
-fun waitForever(): never {
-    while (true) {}
-}
-
-fun value(flag: bool): int = when (flag) {
-    true -> 42
-    false -> waitForever()
-}
-```
-
-The compiler currently proves a loop divergent when its condition is the
-literal `true` and no `break` can target that loop. It lowers proven
-divergence to a verified unreachable terminator in native LLVM and generated
-C control flow. A declared `never` function is rejected if any path can
-produce a value or fall through.
-
-`while` and `do ... while` are statements. `return expression` immediately
-exits the innermost function, method, or lambda; a bare `return` returns
-`void`. Return values are checked against declared result types, and explicit
-returns execute identically at compile time and runtime. `break` exits the
-innermost loop and `continue` starts its next condition check; both are valid
-in `while`, `do ... while`, and `for` during compile-time or runtime execution.
-`for (value in source)` iterates arrays, byte-indexed strings, inclusive
-ascending integer ranges (`first..last`), and exclusive ascending ranges
-(`first until end`). Range expressions are ordinary `array<int>` values.
-
-## Trusted native implementations
-
-Abla does not expose a general unsafe-block programming model. A raw native
-declaration uses `trusted extern`, and only a function whose complete
-implementation is declared `trusted` may call it:
-
-```abla fragment
-trusted extern:"intrinsic" fun platformRead(address: i64*): int
-
-trusted fun checkedRead(buffer: NativeBuffer, offset: int): int {
-    if (offset < 0 || offset + 8 > buffer.capacity) 0
-    else platformRead(buffer.pointerAt(offset))
-}
-```
-
-Calling `platformRead` from an ordinary function is a compile error. Calling
-the checked wrapper is ordinary safe code. The intended stable policy also
-requires a package-manifest grant before non-platform packages may define a
-trusted implementation; that manifest enforcement remains part of the effect
-and package-interface work.
+See [standard-library.md](standard-library.md) for `abla/memory`.
 
 ## Compile-time execution
 
@@ -736,48 +1249,67 @@ These have their own page, [concurrency.md](concurrency.md). In brief:
 
 ## Modules and imports
 
-Imports are top-level declarations. A direct implementation import may retain
-compatibility visibility or bind the target to a module-local alias:
+Each source file is a module. `import "path"` makes another module's
+top-level declarations available. A path is relative to the importing file,
+except `abla/...`, which names a standard-library module. `as name` binds the
+module to an alias instead, so its declarations are reached as
+`name.declaration`:
 
-```abla fragment
-import "path/to/file.ab"
-import "shared/models.ab" as models
+```abla file=shapes/geometry.ab
+class Rect(val width: int, val height: int)
 
-fun load(value: models.Account): models.Account =
-    models.normalize(value)
+fun area(rect: Rect): int = rect.width * rect.height
+
+val unit = Rect(1, 1)
 ```
 
-An import argument may also be a typed compile-time source-provider call. The
-provider returns `ImportSource` rather than performing network I/O during
-parsing:
+```abla
+import "abla/io"
+import "shapes/geometry.ab" as geo
+
+fun main {
+    val r = geo.Rect(3, 4)
+    println("${geo.area(r)} ${geo.area(geo.unit)}")
+}
+// output:
+// 12 1
+```
+
+- Imports are top-level declarations. A module is loaded once however many
+  modules import it, and import cycles are detected.
+- Without an alias, every top-level declaration of the imported module is
+  visible by its short name. Two unaliased imports that expose the same name
+  make that name ambiguous: `E_IMPORT_UNQUALIFIED_AMBIGUOUS`. Source order
+  never picks a winner, so add an alias.
+- An alias belongs to the importing module only, and it is a compile-time
+  namespace, not a value (`E_IMPORT_ALIAS_USED_AS_VALUE`). Importing a
+  module doesn't expose the aliases *it* uses. Other alias errors:
+  `E_IMPORT_ALIAS_DUPLICATE` (one alias bound twice),
+  `E_IMPORT_ALIAS_TARGET_DUPLICATE` (one module imported twice),
+  `E_IMPORT_ALIAS_MEMBER_UNKNOWN`.
+- There are no visibility modifiers: every top-level declaration of a module
+  is visible to its importers.
+- A declaration's identity (for native symbols and reflection) comes from
+  the module that defines it, not from an importer's alias, so renaming an
+  alias renames nothing in the output.
+- Compile-time and run-time code import the same modules. Each declaration
+  is kept or dropped for its phase.
+
+An import argument may also be a compile-time *source provider* call that
+returns an `ImportSource`, such as `github("owner/repository")`. Providers,
+`abla.lock` and vendoring are described in [packages.md](packages.md):
 
 ```abla fragment
 import github("AndreBaltazar8/abla-mvc") as mvc
 ```
 
-User-defined compile functions can return `ImportSource` through
-`gitImportSource(...)` or through `importSource(...)` with a deferred resolver
-that supplies a `ResolvedImport` of source files. Resolution, immutable locks,
-offline behavior, and vendoring are documented in `docs/packages.md`.
+### Contract imports
 
-Imports are canonicalized, cached by content and configuration, cycle checked,
-and processed deterministically. Compile-time and runtime code can import the
-same module; phase filtering happens per declaration. An aliased module is a
-compile-time namespace, not a runtime value. Its functions, globals,
-constructors, interfaces, and nominal types are available only through the
-alias. Aliases are direct and module-local; importing a facade does not expose
-the aliases used inside that facade.
-
-Canonical declaration and type identities derive from the normalized defining
-module, not the consumer's alias spelling. Consequently, alias renames affect
-only the importing frontend and do not rename native symbols or reflected
-canonical identities. Two unaliased direct imports exposing the same short
-name are diagnosed as `E_IMPORT_UNQUALIFIED_AMBIGUOUS`; source order never
-selects a winner.
-
-A contract import exposes callable signatures, annotations, defaults, ownership
-modes, and reachable nominal data shapes without adding their implementations
-to the runtime program:
+`import contract "path" as name` exposes another module's function
+signatures, annotations, defaults, ownership modes and data shapes, without
+adding its implementations to this program. It is for code that calls across
+a boundary (a client calling a server): a compile-time extension must
+replace every contract call with real client code, as an RPC subparser does:
 
 ```abla fragment
 import contract "../backend/counter.ab" as counter
@@ -785,30 +1317,116 @@ import contract "../backend/counter.ab" as counter
 val request = $rpc(counter.incrementRemotely(41))
 ```
 
-Contract calls are ordinary typed direct calls while a deferred compiler
-extension inspects them. The extension must replace the call with executable
-client-side syntax. A contract call left in the final program fails with
-`E_CONTRACT_CALL_NOT_CONSUMED` before IR construction. Contract extraction does
-not stage backend initializers or compile actions and follows only imports
-needed by declaration shapes, so implementation-only dependencies and ambient
-capabilities remain outside the consumer. Interface fingerprints exclude
-function bodies; changing a signature, annotation, default, or reachable data
-shape changes the contract identity, while a body-only edit does not.
+A contract call left in the program fails with
+`E_CONTRACT_CALL_NOT_CONSUMED`. Contract extraction doesn't run the other
+module's initializers or compile-time actions, and it follows only the
+imports its declaration shapes need, so the backend's private dependencies
+and capabilities stay out of the client. A contract's fingerprint excludes
+function bodies: changing a signature, annotation, default or data shape
+changes it, and a body-only edit does not.
 
-Portable console programs import `abla/io`; the selected target profile
-provides the implementation behind the same source API:
+### Console programs
+
+Portable console programs import `abla/io`; each target supplies the
+implementation behind the same API. `print` and `println` write standard
+output, and `eprint` and `eprintln` write standard error.
+`readInputLine()` returns `InputLine(text, available)`, so end of input is
+distinct from an empty line. The shorter `readLine()` returns `""` at the
+end of input.
+
+## Annotations
+
+An annotation is `@name` or `@name(argument)` before a declaration. A
+declaration may carry several, each at most once.
+
+| Annotation | On | Effect |
+|---|---|---|
+| `@export("symbol")` | top-level function | publishes it under a stable foreign symbol; an array of names publishes aliases |
+| `@exportChecked("symbol")` | top-level function | the same, with the panic-containing checked ABI |
+| `@inline` | function, method | asks the backend to inline it |
+| `@noinline` | function, method | keeps it out of line (`noinline.function`, `noinline.inline` if combined with `@inline`) |
+| `@naked` | trusted function | emits the body as raw assembly without a prologue ([llvm-backend.md](llvm-backend.md)) |
+| `@section("name")` | function | places it in a linker section ([llvm-backend.md](llvm-backend.md)) |
+| `@wasmImport("module")` | `extern:"c"` declaration | imports it from that Wasm module; `["module", "field"]` also renames it ([toolchain.md](toolchain.md)) |
+
+Other annotation names are kept as metadata for compile-time code to read
+(`compiler.annotation`, `functionsAnnotated`; see
+[compiler-api.md](compiler-api.md)).
 
 ```abla
 import "abla/io"
-fun main: int {
-    println("Hello, world!")
-    0
+
+@inline
+fun square(n: int): int = n * n
+
+@noinline
+fun cube(n: int): int = n * n * n
+
+@export("example_add")
+fun add(left: int, right: int): int = left + right
+
+fun main {
+    println("${square(3)} ${cube(2)} ${add(1, 1)}")
+}
+// output:
+// 9 8 2
+```
+
+Exports:
+
+- Exported signatures use scalar types. `bool`, `char`, `f32`, `f64` and
+  every 8- to 64-bit integer type keep their exact width. In WebAssembly,
+  narrow integers travel in the `i32` lane. Classes and arrays are not
+  exported. A `string` parameter becomes a `(pointer, length)` pair that the
+  adapter copies, and a `string` result becomes a handle with data, length
+  and release functions. See [native declarations](#native-declarations).
+- A program may publish up to 128 named exports.
+- A scalar-only unchecked export calls the function directly. A checked
+  export returns a status and contains panics.
+- Naked-assembly exports with several names share one definition. Other
+  exports get one adapter per name.
+
+## Trusted native implementations
+
+Abla has no general unsafe block. Raw native operations (pointers, raw
+memory, foreign functions that take pointers) are declared `trusted`, and
+only a `trusted` function may call them:
+
+```abla fragment
+trusted extern:"intrinsic" fun platformRead(address: i64*): int
+
+trusted fun checkedRead(buffer: NativeBuffer, offset: int): int {
+    if (offset < 0 || offset + 8 > buffer.capacity) 0
+    else platformRead(buffer.pointerAt(offset))
 }
 ```
 
-`readInputLine()` returns `InputLine(text, available)` so EOF remains distinct
-from a valid empty line. The shorter `readLine()` intentionally maps EOF to an
-empty string.
+Calling `platformRead` from an ordinary function is an error
+(`native.trust:platformRead`). Calling the checked wrapper is ordinary safe
+code: the `trusted` function is where the safety argument lives. The intended
+policy also requires a package-manifest grant before a non-platform package
+may define a trusted implementation. That manifest check is not enforced yet.
+
+`extern:"kind"` declares a function implemented outside Abla:
+
+| Kind | Implemented by |
+|---|---|
+| `extern:"c"` | a C-ABI symbol, linked from libc or a declared native library |
+| `extern:"intrinsic"` | the compiler, for raw memory and runtime operations |
+| `extern:"host"` | the hosted platform runtime (`abla/platform/host`) |
+| `extern:"compiler"`, `extern:"parser"` | the compiler, at compile time only (`abla/compiler`) |
+| `extern:"inline-assembly"` | a template of target assembly ([llvm-backend.md](llvm-backend.md)) |
+
+`noescape` on a declaration promises that it doesn't keep any Abla value it
+receives, which lets region-owned values be passed to it
+([regions.md](regions.md)). `trusted` and `noescape` are independent.
+
+```abla
+extern:"c" fun labs(value: int): int
+
+fun main: int = labs(-5)
+// exit: 5
+```
 
 ## Native declarations
 

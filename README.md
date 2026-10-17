@@ -238,7 +238,7 @@ under `build/`.
 
 The [documentation index](docs/README.md) lists every document.
 
-- [Language contract](docs/language.md)
+- [Language reference](docs/language.md)
 - [Ownership, borrowing and resources](docs/ownership.md)
 - [Compile-time execution](docs/compile-time.md)
 - [Cleanup, generators, tasks and threads](docs/concurrency.md)
