@@ -242,6 +242,7 @@ The [documentation index](docs/README.md) lists every document.
 - [Ownership, borrowing and resources](docs/ownership.md)
 - [Compile-time execution](docs/compile-time.md)
 - [Cleanup, generators, tasks and threads](docs/concurrency.md)
+- [Diagnostics: reading compiler errors](docs/diagnostics.md)
 - [Toolchain interface](docs/toolchain.md)
 - [Debugging: lldb, crash stacks, browser developer tools](docs/debugging.md)
 - [Compiler extension API](docs/compiler-api.md)

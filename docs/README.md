@@ -14,6 +14,7 @@ compiler. The documents below are grouped by what you are trying to do.
 | [standard-library.md](standard-library.md) | The `abla/...` modules and their layering |
 | [json.md](json.md) | `abla/json`, `$json` and `$jsons` |
 | [networking.md](networking.md) | Sockets, HTTP, WebSocket, TLS and JWT |
+| [diagnostics.md](diagnostics.md) | How to read compiler errors, and what each code means |
 | [debugging.md](debugging.md) | Debug builds, stack traces, panics |
 
 ## Compile time
