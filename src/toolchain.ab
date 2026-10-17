@@ -39,14 +39,17 @@ class BootstrapTargetDescriptor(
 // silently relying on declarations that only the linker path injects.
 fun bootstrapParseHostModuleWithRuntime(
     sourcePath: string
-): BootstrapParseResult {
+): BootstrapParseResult = bootstrapLoadHostModuleGraph(sourcePath).parse()
+
+// The module graph of `sourcePath` with the host runtime, loaded (not yet parsed).
+fun bootstrapLoadHostModuleGraph(sourcePath: string): BootstrapModuleGraph {
     val state = bootstrapModuleState()
     val graph = BootstrapModuleGraph([], 0, state, [], [], "", [])
     val standardLibrary = Path(bootstrapStandardLibraryRoot())
     graph.load(standardLibrary.child("abla/runtime/self/entry.ab").text)
     graph.load(standardLibrary.child("abla/runtime/platform/host.ab").text)
     graph.load(sourcePath)
-    graph.parse()
+    graph
 }
 
 fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
@@ -1185,8 +1188,12 @@ fun bootstrapEmitPartitionedObject(
     BootstrapPartitionEmission(status, reused, refreshed)
 }
 
+// With `registrations`, a top-level `compilerRegisterSubparser` action does not make
+// the graph uncacheable (`ablac run`'s object cache: such an action only shapes how
+// the compilation parses, which the cached object already reflects).
 fun bootstrapGraphCompileCapabilitiesCacheable(
-    graph: BootstrapModuleGraph
+    graph: BootstrapModuleGraph,
+    registrations: bool = false
 ): bool {
     var cacheable = true
     var module = 0
@@ -1210,7 +1217,10 @@ fun bootstrapGraphCompileCapabilitiesCacheable(
             // Executable top-level actions may stage build graph state. They
             // must run on every root invocation instead of disappearing
             // behind a whole-program native-object cache hit.
-            if (!grant && !authorization) cacheable = false
+            val registration = registrations && staged.kind == "compile" &&
+                staged.children.size == 1 && staged.children[0].kind == "call" &&
+                staged.children[0].text == "compilerRegisterSubparser"
+            if (!grant && !authorization && !registration) cacheable = false
             if (bootstrapExpressionContainsCall(
                 staged,
                 "compilerBuildProgram"
@@ -2512,15 +2522,29 @@ fun bootstrapNativeBuild(
 class BootstrapRunIr(
     val status: int,
     val llvmPath: string,
-    val linkHost: bool
+    val linkHost: bool,
+    // With `hold`: the module, kept in memory (bootstrapLlvmHeldModule) instead of
+    // written to `llvmPath`, and what a cache record of the run needs.
+    val sourcePaths: array<string>,
+    val cacheable: bool,
+    val compileInputPaths: array<string>,
+    val compileInputContents: array<string>
 )
 
-fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
+fun bootstrapPrepareRun(sourcePath: string, hold: bool = false): BootstrapRunIr {
     bootstrapBeginCompileOutputs()
     val llvmPath = "build/.abla-run.ll"
-    val compilation = bootstrapCompileLlvmParsed(
-        bootstrapParseHostModuleWithRuntime(sourcePath)
-    )
+    val graph = bootstrapLoadHostModuleGraph(sourcePath)
+    val parsed = graph.parse()
+    val sourcePaths: array<string> = []
+    for (snapshot in graph.orderedSnapshots) sourcePaths.append(snapshot.path)
+    sourcePaths.append(bootstrapRootManifestPath(sourcePath).text)
+    val enclosingHold = bootstrapLlvmHoldModule
+    bootstrapLlvmHoldModule = hold
+    val compilation = bootstrapCompileLlvmParsed(parsed)
+    bootstrapLlvmHoldModule = enclosingHold
+    val cacheable = bootstrapGraphCompileCapabilitiesCacheable(graph, true) &&
+        bootstrapCompileOutputCount == 0
     val requestedPrograms = bootstrapTakeCompileProgramRequests()
     val definedTargets = bootstrapTakeDefinedTargets()
     val artifactRoots = bootstrapTakeArtifactRootRequests()
@@ -2534,11 +2558,12 @@ fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
     }
     if (compilation.errors == 0 && requestedPrograms.size == 0 &&
         definedTargets.size == 0 && artifactRoots.size == 0 &&
-        Path(llvmPath).writeTextAtomic(compilation.output)) {
+        (hold || Path(llvmPath).writeTextAtomic(compilation.output))) {
         status = 0
     }
     if (status == 0 && !bootstrapCommitCompileOutputs()) status = 144
     if (status != 0) bootstrapDiscardCompileOutputs()
+    if (status != 0 && hold) bootstrapDisposeHeldModule()
     if (compilation.errors != 0) {
         linuxPrintStandardError(
             bootstrapDiagnosticPositions(compilation.diagnostics)
@@ -2547,7 +2572,10 @@ fun bootstrapPrepareRun(sourcePath: string): BootstrapRunIr {
             "LLVM compilation failed: ${compilation.parserErrors} parser, ${compilation.extensionErrors} extension, ${compilation.semanticErrors} semantic, ${compilation.irErrors} IR, ${compilation.errors} total error(s)\n"
         )
     }
-    BootstrapRunIr(status, llvmPath, compilation.linkHost)
+    BootstrapRunIr(
+        status, llvmPath, compilation.linkHost, sourcePaths, cacheable,
+        compilation.compileInputPaths, compilation.compileInputContents
+    )
 }
 
 fun bootstrapRun(sourcePath: string): int {

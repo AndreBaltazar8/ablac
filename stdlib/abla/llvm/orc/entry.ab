@@ -2,7 +2,9 @@
 // ownership transfer follows LLVM's documented C API exactly.
 
 import "abla/unsafe/memory"
+import "abla/unsafe/native"
 import "abla/sys/linux/process"
+import "abla/sys/linux/fs"
 
 noescape extern:"c" fun LLVMInitializeX86TargetInfo(): void
 noescape extern:"c" fun LLVMInitializeX86Target(): void
@@ -19,6 +21,7 @@ noescape extern:"c" fun LLVMGetVersion(major: i64*, minor: i64*, patch: i64*): v
 
 noescape extern:"c" fun LLVMContextCreate(): i64*
 noescape extern:"c" fun LLVMContextDispose(context: i64*): void
+noescape extern:"c" fun LLVMDisposeModule(module: i64*): void
 noescape extern:"c" fun LLVMCreateMemoryBufferWithContentsOfFile(
     path: cstring,
     outputBuffer: i64*,
@@ -89,6 +92,21 @@ noescape extern:"c" fun LLVMOrcLLJITLookup(
     name: cstring
 ): i64*
 noescape extern:"c" fun LLVMConsumeError(error: i64*): void
+noescape extern:"c" fun LLVMOrcLLJITAddObjectFileWithRT(
+    jit: i64*,
+    tracker: i64*,
+    buffer: i64*
+): i64*
+noescape extern:"c" fun LLVMOrcLLJITGetObjTransformLayer(jit: i64*): i64*
+noescape extern:"c" fun LLVMOrcObjectTransformLayerSetTransform(
+    layer: i64*,
+    transform: int,
+    context: i64*
+): void
+noescape extern:"c" fun LLVMGetBufferStart(buffer: i64*): i64*
+noescape extern:"c" fun LLVMGetBufferSize(buffer: i64*): int
+noescape extern:"c" fun LLVMGetHostCPUName(): i64*
+noescape extern:"c" fun LLVMGetHostCPUFeatures(): i64*
 noescape extern:"c" fun LLVMLoadLibraryPermanently(path: cstring): i32
 
 fun llvmLoadLibraryPermanently(path: string): int =
@@ -130,6 +148,27 @@ trusted fun llvmLibraryVersion(): string {
 trusted fun llvmVersionPart(parts: NativeByteBuffer, offset: int): int =
     parts.load(offset) + parts.load(offset + 1) * 256 +
         parts.load(offset + 2) * 65536 + parts.load(offset + 3) * 16777216
+
+// Copies an LLVM-owned message (a C string) into an Abla string and disposes it.
+trusted fun llvmTakeMessage(message: i64*): string {
+    var result = ""
+    if (!pointerIsNull(message)) {
+        var length = 0
+        while (ablaUnsafeLoadU8(ablaUnsafePointerOffset(message, length)) != 0) {
+            length = length + 1
+        }
+        val copy = nativeByteBuffer(length + 1)
+        ablaUnsafeCopyMemory(nativePointerAddress(copy.address), nativePointerAddress(message), length)
+        copy.store(length, 0)
+        result = copy.adoptString(length)
+        LLVMDisposeMessage(message)
+    }
+    result
+}
+
+// The host CPU's name and its features, as LLJIT targets them.
+fun llvmHostCpuName(): string = llvmTakeMessage(LLVMGetHostCPUName())
+fun llvmHostCpuFeatures(): string = llvmTakeMessage(LLVMGetHostCPUFeatures())
 
 trusted fun llvmDefaultTargetTriple(): string {
     val triple = LLVMGetDefaultTargetTriple()
@@ -198,6 +237,11 @@ fun llvmOrcCreateSession(): LlvmOrcSession {
     }
     if (status == 0) {
         LLVMOrcJITDylibAddGenerator(dylib, processGenerator.load())
+        LLVMOrcObjectTransformLayerSetTransform(
+            LLVMOrcLLJITGetObjTransformLayer(jit.load()),
+            nativeFunctionAddress(llvmOrcCaptureObject),
+            nullPointer
+        )
     }
     if (status != 0 && !pointerIsNull(jit.load())) {
         llvmConsumeError(LLVMOrcDisposeLLJIT(jit.load()), 126)
@@ -304,6 +348,150 @@ fun LlvmOrcSession.addFile(path: string, passes: string = ""): LlvmOrcGeneration
     module.close()
     LlvmOrcGeneration(tracker, status, status != 0)
 }
+
+// Adds an in-memory module (as the backend keeps it: bootstrapLlvmHoldModule)
+// after running the IR pipeline `passes` on it (none when empty). The session
+// takes ownership of `context` and `module` whatever the outcome.
+fun LlvmOrcSession.addModule(
+    context: i64*,
+    module: i64*,
+    passes: string = ""
+): LlvmOrcGeneration {
+    val nullPointer = nativeNullPointer()
+    var status: int = 128
+    if (!this.closed && this.status == 0 && !pointerIsNull(module)) status = 0
+    if (status == 0 && passes != "") {
+        val options = LLVMCreatePassBuilderOptions()
+        status = llvmConsumeError(
+            LLVMRunPasses(module, passes, nullPointer, options), 129
+        )
+        LLVMDisposePassBuilderOptions(options)
+    }
+    var tracker = nullPointer
+    if (status == 0) {
+        val threadContext =
+            LLVMOrcCreateNewThreadSafeContextFromLLVMContext(context)
+        val threadModule = LLVMOrcCreateNewThreadSafeModule(
+            module,
+            threadContext
+        )
+        tracker = LLVMOrcJITDylibCreateResourceTracker(this.dylib)
+        if (pointerIsNull(tracker)) {
+            status = 124
+            LLVMOrcDisposeThreadSafeModule(threadModule)
+        } else {
+            // The WithRT API consumes the thread-safe module even on failure.
+            status = llvmConsumeError(
+                LLVMOrcLLJITAddLLVMIRModuleWithRT(
+                    this.jit,
+                    tracker,
+                    threadModule
+                ),
+                124
+            )
+        }
+        LLVMOrcDisposeThreadSafeContext(threadContext)
+    } else {
+        if (!pointerIsNull(module)) LLVMDisposeModule(module)
+        if (!pointerIsNull(context)) LLVMContextDispose(context)
+    }
+    if (status != 0 && !pointerIsNull(tracker)) {
+        llvmConsumeError(LLVMOrcResourceTrackerRemove(tracker), 127)
+        LLVMOrcReleaseResourceTracker(tracker)
+        tracker = nullPointer
+    }
+    LlvmOrcGeneration(tracker, status, status != 0)
+}
+
+// Adds an object file's contents (`buffer`, which the call consumes) as a
+// generation of its own.
+fun LlvmOrcSession.addObjectBuffer(buffer: i64*): LlvmOrcGeneration {
+    var status = if (this.closed || this.status != 0) 128 else 0
+    var tracker = nativeNullPointer()
+    if (status == 0) {
+        tracker = LLVMOrcJITDylibCreateResourceTracker(this.dylib)
+        if (pointerIsNull(tracker)) status = 124
+    }
+    if (status == 0) {
+        // Consumes the buffer even on failure.
+        status = llvmConsumeError(
+            LLVMOrcLLJITAddObjectFileWithRT(this.jit, tracker, buffer), 124
+        )
+    } else LLVMDisposeMemoryBuffer(buffer)
+    if (status != 0 && !pointerIsNull(tracker)) {
+        llvmConsumeError(LLVMOrcResourceTrackerRemove(tracker), 127)
+        LLVMOrcReleaseResourceTracker(tracker)
+        tracker = nativeNullPointer()
+    }
+    LlvmOrcGeneration(tracker, status, status != 0)
+}
+
+// Adds the object file at `path` (one `lookupCapturing` wrote, say) without
+// compiling anything: status 120 when it cannot be read.
+fun LlvmOrcSession.addObjectFile(path: string): LlvmOrcGeneration {
+    val nullPointer = nativeNullPointer()
+    val buffer = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    var status = if (this.closed || this.status != 0) 128 else 0
+    if (status == 0 && LLVMCreateMemoryBufferWithContentsOfFile(
+        path, buffer.address, message.address
+    ) != 0) status = 120
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    val loaded = buffer.load()
+    buffer.close()
+    message.close()
+    if (status == 0) this.addObjectBuffer(loaded)
+    else LlvmOrcGeneration(nullPointer, status, true)
+}
+
+// Objects the JIT generated while a capture was armed (`lookupCapturing`), as
+// their bytes. Every session's object layer passes what it links through
+// llvmOrcCaptureObject, so a capture sees exactly the code LLJIT generated.
+var llvmOrcCapturing: bool = false
+var llvmOrcCaptured: array<string> = []
+
+// The transform's C signature, `LLVMErrorRef (void *, LLVMMemoryBufferRef *)`, as
+// addresses (nativeFunctionAddress takes scalar signatures): no error, ever.
+trusted fun llvmOrcCaptureObject(context: i64, objectInOut: i64): i64 {
+    if (llvmOrcCapturing) {
+        val buffer = NativePointerCell(nativePointerFromAddress(objectInOut), false, false).load()
+        val size = LLVMGetBufferSize(buffer)
+        val copy = nativeByteBuffer(size + 1)
+        ablaUnsafeCopyMemory(
+            nativePointerAddress(copy.address),
+            nativePointerAddress(LLVMGetBufferStart(buffer)),
+            size
+        )
+        llvmOrcCaptured.append(copy.adoptString(size))
+    }
+    0
+}
+
+// Looks `name` up like `lookup`, keeping the machine code that generating it
+// took: when exactly one module was compiled for it, its object is published at
+// `objectPath` (written beside it, then renamed) for a later `addObjectFile`, and
+// `captured` is true. Nothing is published when nothing (or more than one module)
+// was compiled, or the object cannot be written.
+fun LlvmOrcSession.lookupCapturing(name: string, objectPath: string): LlvmOrcCapture {
+    llvmOrcCaptured.truncate(0)
+    llvmOrcCapturing = true
+    val found = this.lookup(name)
+    llvmOrcCapturing = false
+    var captured = false
+    if (found.status == 0 && llvmOrcCaptured.size == 1) {
+        val staged = Path("$objectPath.tmp.${linuxProcessId()}")
+        captured = staged.writeText(llvmOrcCaptured[0]) && staged.moveTo(Path(objectPath))
+        if (!captured) staged.remove()
+    }
+    llvmOrcCaptured.truncate(0)
+    LlvmOrcCapture(found.status, found.address, captured)
+}
+
+class LlvmOrcCapture(
+    val status: int,
+    val address: int,
+    val captured: bool
+)
 
 fun LlvmOrcSession.lookup(name: string): LlvmOrcLookup {
     val address = nativeI64Cell(0)

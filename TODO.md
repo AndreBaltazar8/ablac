@@ -13,10 +13,11 @@ called out below.
   path again; `run --built` builds through the cache and execs the result. Measured on
   2026-10-13 against build + exec cold/warm: a map exporter 5.98 s (13.94 s without the
   pipeline; built 15.45/6.39 s), a map builder 10.90 s (86.76 s; 10.58/9.52 s), a model
-  generator 57.75 s (over 9 min; 62.4/62.0 s). Next: a per-module object cache keyed like the
-  build cache (cached objects added with `LLVMOrcLLJITAddObjectFile`), so a rerun skips
-  compiling, and indirection stubs (ORC lazy reexports or an indirect stubs manager) so a
-  function can be redefined while the program runs.
+  generator 57.75 s (over 9 min; 62.4/62.0 s). Done since: an object cache (`jit_cache.ab`:
+  the object LLJIT generated, captured through its object transform layer, reused while every
+  source file and compile-time input is unchanged), so a rerun skips compiling. Next:
+  indirection stubs (ORC lazy reexports or an indirect stubs manager) so a function can be
+  redefined while the program runs.
 
 - [ ] **Flattening a rope clears its children without a fence.** `__ablaRuntimeStringDataSlow`
   (`stdlib/abla/runtime/self/entry.ab`) stores the flat copy at +40, then zeroes the four child

@@ -118,6 +118,7 @@ test: ablac
 	tools/test-resource-scope-drops.sh $(COMPILER)
 	tools/test-run-built.sh $(COMPILER)
 	tools/test-jit-host-selection.sh $(COMPILER)
+	tools/test-jit-object-cache.sh $(COMPILER)
 	tools/test-jit-http.sh $(COMPILER)
 	tools/test-module-shadowing.sh $(COMPILER)
 	tools/test-string-helpers.sh $(COMPILER)

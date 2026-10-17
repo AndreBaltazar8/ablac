@@ -2,6 +2,7 @@ import "backend/llvm/backend.ab"
 import "module.ab"
 import "analysis_service.ab"
 import "toolchain.ab"
+import "jit_cache.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/llvm/orc"
@@ -88,17 +89,68 @@ fun bootstrapOrcEmit(sourcePath: string): int {
 
 // `ablac run` (the default, and --jit): compiles the program in process, runs
 // the IR pipeline `passes` on it (the --o1 one unless --fast), and calls it
-// there through LLVM ORC.
+// there through LLVM ORC. The object goes through the JIT object cache
+// (jit_cache.ab): an unchanged program reruns without compiling.
 fun bootstrapRunInProcess(
     sourcePath: string,
     arguments: array<string> = [],
     passes: string = ""
 ): int {
-    val prepared = bootstrapPrepareRun(sourcePath)
-    var status = prepared.status
-    if (status == 0) {
-        status = llvmOrcRunFile(prepared.llvmPath, sourcePath, arguments, passes)
+    val key = jitRunKey(sourcePath, passes)
+    val session = llvmOrcCreateSession()
+    var status = session.status
+    var generation = LlvmOrcGeneration(nativeNullPointer(), 128, true)
+    var entry = 0
+    val cached = if (status == 0) jitRunCachedObject(key) else ""
+    if (cached != "") {
+        generation = session.addObjectFile(cached)
+        if (generation.status == 0) {
+            val lookup = session.lookup("main")
+            if (lookup.status == 0) entry = lookup.address
+            else {
+                // An object the JIT cannot link is compiled afresh.
+                val removed = generation.remove()
+                generation = LlvmOrcGeneration(nativeNullPointer(), 128, true)
+            }
+        }
     }
+    if (status == 0 && entry == 0) {
+        val prepared = bootstrapPrepareRun(sourcePath, true)
+        status = prepared.status
+        if (status == 0) {
+            // The session owns the held module from here on.
+            generation = session.addModule(bootstrapLlvmHeldContext, bootstrapLlvmHeldModule, passes)
+            bootstrapLlvmHeldContext = nativeNullPointer()
+            bootstrapLlvmHeldModule = nativeNullPointer()
+            status = generation.status
+        }
+        if (status == 0 && key.valid && !prepared.cacheable) {
+            jitCacheTrace("uncacheable (a top-level compile action, a nondeterministic grant or a staged output)")
+        }
+        if (status == 0 && key.valid && prepared.cacheable &&
+            Path(JIT_CACHE_DIRECTORY).createDirectories()) {
+            val objectPath = jitRunObjectPath(key, prepared.sourcePaths)
+            val lookup = session.lookupCapturing("main", objectPath)
+            status = lookup.status
+            entry = lookup.address
+            if (!lookup.captured) jitCacheTrace("uncaptured (not exactly one module compiled)")
+            if (lookup.captured) {
+                val published = jitRunPublish(key, jitRunRecord(
+                    objectPath, prepared.sourcePaths,
+                    prepared.compileInputPaths, prepared.compileInputContents
+                ), objectPath)
+            }
+        } else if (status == 0) {
+            val lookup = session.lookup("main")
+            status = lookup.status
+            entry = lookup.address
+        }
+    }
+    if (status == 0) status = llvmOrcCallMain(entry, sourcePath, arguments)
+    val removeStatus = generation.remove()
+    if (status == 0 && removeStatus != 0) status = removeStatus
+    val closeStatus = session.close()
+    if (status == 0 && closeStatus != 0) status = closeStatus
     status
 }
 

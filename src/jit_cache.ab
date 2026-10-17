@@ -1,0 +1,148 @@
+// The JIT's object cache for `ablac run`: an unchanged program skips the frontend
+// and LLVM altogether and adds the object an earlier run generated.
+//
+// A run's key is the compiler (its image, the LLVM library, the host CPU and its
+// features, the standard library's root), the IR pipeline and the entry (its path
+// and the working directory). A
+// key's record lists every source file the program's module graph read, with its
+// size and two hashes, the compile-time inputs it journaled (revalidated as a
+// build's are) and the object generated from them. A hit needs every file and
+// input unchanged: then the import graph, which those files determine, is too.
+// The record is written only for a program whose compilation is cacheable as a
+// build's is (no executable top-level compile action, no grant other than
+// `filesystem.read` / `environment`) and staged no compile outputs.
+
+import "toolchain.ab"
+import "ct_tier.ab"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
+import "abla/sys/linux/io"
+import "abla/llvm/orc"
+
+val JIT_CACHE_DIRECTORY = "build/.abla-cache"
+val JIT_RUN_RECORD_HEADER = "abla-run-object-v1"
+
+var jitCompilerIdentity: string = ""
+
+// The compiler's identity, read once per process.
+trusted fun jitCacheCompilerIdentity(): string {
+    if (jitCompilerIdentity == "") {
+        val image = Path("/proc/self/exe").readText()
+        if (image.size > 0) {
+            jitCompilerIdentity = "compiler:${ctContentKey(image)}\nllvm:${llvmLibraryVersion()}\ntriple:${llvmDefaultTargetTriple()}\ncpu:${llvmHostCpuName()}\nfeatures:${llvmHostCpuFeatures()}"
+        }
+    }
+    jitCompilerIdentity
+}
+
+class JitRunKey(val valid: bool, val stem: string)
+
+// ABLA_JIT_CACHE_TRACE=1 reports each run's cache decision on standard error.
+fun jitCacheTrace(message: string): void {
+    val trace = linuxEnvironment("ABLA_JIT_CACHE_TRACE")
+    if (trace.found && trace.value == "1") linuxPrintStandardError("[jit-cache] $message\n")
+    return
+}
+
+// Where `sourcePath`'s run under `passes` keeps its record (`stem.record`); not
+// valid when the compiler has no identity (its image cannot be read) or
+// ABLA_JIT_CACHE=0.
+fun jitRunKey(sourcePath: string, passes: string): JitRunKey {
+    val disabled = linuxEnvironment("ABLA_JIT_CACHE")
+    val compilerIdentity = jitCacheCompilerIdentity()
+    val valid = compilerIdentity != "" && !(disabled.found && disabled.value == "0")
+    val identity = "$compilerIdentity\nstdlib:${bootstrapStandardLibraryRoot()}\npasses:$passes\ndirectory:${currentDirectory().text}\nentry:$sourcePath"
+    JitRunKey(valid, "$JIT_CACHE_DIRECTORY/run-${ctContentHash(identity)}")
+}
+
+// What a record lists for one file: path, then its content key ("-" when absent).
+fun jitFileLine(path: string): string {
+    val info = Path(path).info()
+    val key = if (info.isFile()) ctContentKey(Path(path).readText()) else "-"
+    "${path.size}\n$path$key\n"
+}
+
+// The object a valid record names, or "" (no record, a changed file or input, or
+// a record this version does not read).
+fun jitRunCachedObject(key: JitRunKey): string {
+    var object = ""
+    if (key.valid) {
+        val record = Path("${key.stem}.record").readText()
+        val lines = JitRecordReader(record, 0, true)
+        lines.ok = lines.line() == JIT_RUN_RECORD_HEADER
+        val candidate = lines.line()
+        val count = bootstrapDecimalIndex(lines.line())
+        if (count < 0) lines.ok = false
+        var index = 0
+        while (lines.ok && index < count) {
+            val size = bootstrapDecimalIndex(lines.line())
+            if (size < 0 || lines.at + size > record.size) lines.ok = false
+            if (lines.ok) {
+                val path = record.slice(lines.at, lines.at + size)
+                lines.at = lines.at + size
+                val expected = lines.line()
+                lines.ok = jitFileLine(path) == "${path.size}\n$path$expected\n"
+            }
+            index = index + 1
+        }
+        if (lines.ok) {
+            lines.ok = bootstrapValidateCompileInputs(record.slice(lines.at, record.size))
+        }
+        if (lines.ok && candidate != "" && Path(candidate).info().isFile()) object = candidate
+    }
+    jitCacheTrace(if (!key.valid) "off" else if (object == "") "miss ${key.stem}" else "hit ${key.stem}")
+    object
+}
+
+class JitRecordReader(val text: string, var at: int, var ok: bool) {
+    fun line(): string {
+        var result = ""
+        if (this.ok) {
+            var end = this.at
+            while (end < this.text.size && this.text[end] != 10) end = end + 1
+            if (end >= this.text.size) this.ok = false
+            else {
+                result = this.text.slice(this.at, end)
+                this.at = end + 1
+            }
+        }
+        result
+    }
+}
+
+// The record of a run whose module graph read `paths` and whose compile-time code
+// read `inputPaths`/`inputContents`, for its object `objectPath`.
+fun jitRunRecord(
+    objectPath: string,
+    paths: array<string>,
+    inputPaths: array<string>,
+    inputContents: array<string>
+): string {
+    var files = ""
+    for (path in paths) files = "$files${jitFileLine(path)}"
+    "$JIT_RUN_RECORD_HEADER\n$objectPath\n${paths.size}\n$files${bootstrapSerializeCompileInputs(inputPaths, inputContents)}"
+}
+
+// The object path a new record will name: the key's stem and the record's own
+// fingerprint, so an object is never rewritten under a name a record already uses.
+fun jitRunObjectPath(key: JitRunKey, paths: array<string>): string {
+    var files = ""
+    for (path in paths) files = "$files${jitFileLine(path)}"
+    "${key.stem}-${ctContentHash(files)}.o"
+}
+
+// Publishes `record` for `key` (written beside it, then renamed), removing the
+// object of the record it replaces.
+fun jitRunPublish(key: JitRunKey, record: string, objectPath: string): bool {
+    val path = Path("${key.stem}.record")
+    val previous = path.readText()
+    val published = path.writeTextAtomic(record)
+    jitCacheTrace(if (published) "stored $objectPath" else "not stored")
+    if (published && previous != "") {
+        val reader = JitRecordReader(previous, 0, true)
+        reader.ok = reader.line() == JIT_RUN_RECORD_HEADER
+        val old = reader.line()
+        if (reader.ok && old != "" && old != objectPath) Path(old).remove()
+    }
+    published
+}

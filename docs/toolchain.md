@@ -25,7 +25,12 @@ ablac serve app.ab
 
 `ablac run` compiles the program in process, runs the `--o1` IR pipeline on it
 (`--fast`: the fast one; `--jit` names this default) and calls it through LLVM
-ORC; its `argv[0]` is the source path. `--built` builds it through the build
+ORC; its `argv[0]` is the source path. The object LLJIT generated is kept in
+`build/.abla-cache/run-*` with the size and hashes of every source file the
+program read: a rerun with all of them (and the compiler) unchanged adds that
+object and starts without compiling. A program with an executable top-level
+compile action (other than a subparser registration), a nondeterministic
+compile grant or a staged compile output is not kept. `--built` builds it through the build
 cache instead and execs it in its place (`--release` does that with the release
 profile): an unchanged program starts without compiling, it gets a process of
 its own, and none of the compiler's memory stays behind, which suits a
@@ -303,6 +308,7 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_MAX_STACK_KB` | the compiler's stack size in a packaged toolchain |
 | `ABLA_NATIVE_JOBS` | parallel native object jobs |
 | `ABLA_EVAL_STEP_LIMIT` | lowers the compile-time step limit ([compile-time.md](compile-time.md#limits)) |
+| `ABLA_JIT_CACHE=0`, `ABLA_JIT_CACHE_TRACE=1` | turn `ablac run`'s object cache off, or report its decisions on standard error (above) |
 | `ABLA_PACKAGE_CACHE` | the package cache directory ([packages.md](packages.md)) |
 | `ABLA_KEEP_LLVM_TEXT`, `ABLA_LLVM_OUT_OF_PROCESS`, `ABLA_LLVM_VERIFY`, `ABLA_FAST_INLINE_THRESHOLD`, `ABLA_WASM_OPT_CORES`, `ABLA_NO_SIDECAR` | code-generation controls (above) |
 | `ABLA_MACOS_SDK`, `ABLA_MACOS_LLVM_LIB`, `ABLA_MACOS_OPENSSL_LIB`, `ABLA_MACOS_CLANG` | cross-linking for macOS: the SDK, target libraries, and the `clang` used to link (default `clang`) |
