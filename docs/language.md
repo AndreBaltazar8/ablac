@@ -549,7 +549,9 @@ fun main {
   from the body. Until the known issue below is fixed, write the result
   type whenever callers use the result.
 - Parameters may have defaults, which may refer to earlier parameters.
-  Arguments may be passed by name after the positional ones. Each argument
+  Arguments to top-level functions and constructors may be passed by name
+  after the positional ones (methods take positional arguments only,
+  `E_NAMED_ARGUMENT_TARGET`). Each argument
   is evaluated once, in source order. Unknown, duplicate, out-of-order or
   missing required names are errors (`E_NAMED_ARGUMENT_UNKNOWN`,
   `_DUPLICATE`, `_ORDER`, `_REQUIRED`).
