@@ -1,0 +1,875 @@
+// Compile-time evaluation as native code: the generations (ABLA_COMPILE_EVAL=jit|auto).
+//
+// The interpreter (eval.ab) runs `#expr` and top-level compile actions by walking
+// the syntax tree. This tier runs them as machine code instead: after semantic
+// analysis, every site of a compile pass becomes an exported entry function of one
+// *slice program* (the program's own declarations, compile-phase ones lowered as
+// ordinary code, plus the entries), lowered and emitted through the same IR and
+// LLVM path as runtime code, and added to the process's LLVM ORC session as one
+// generation; ct_eval.ab calls the entries where the interpreter would have run.
+//
+// A site the tier cannot take yet (a result type without an encoder, a compiler
+// API or host provider call, a cross-target build) runs in the interpreter;
+// ABLA_COMPILE_EVAL_TRACE=1 says why.
+
+import "ct_eval.ab"
+import "backend/llvm/backend.ab"
+import "abla/llvm/orc"
+
+// One ORC session for the process; one generation per compile pass that has sites.
+var bootstrapCtSessionLive: bool = false
+var bootstrapCtSessionState: LlvmOrcSession = LlvmOrcSession(
+    nativeNullPointer(), nativeNullPointer(), 128, true
+)
+var bootstrapCtGenerationLive: bool = false
+var bootstrapCtGenerationState: LlvmOrcGeneration = LlvmOrcGeneration(
+    nativeNullPointer(), 128, true
+)
+var bootstrapCtGenerationNumber: int = 0
+var bootstrapCtNextSite: int = 0
+
+// --- sites -------------------------------------------------------------------
+
+fun bootstrapCtIsAction(expression: BootstrapExpression): bool {
+    val transform = expression.kind == "member.call" &&
+        expression.text == "transform" &&
+        expression.children.size > 0 &&
+        expression.children[0].kind == "identifier" &&
+        expression.children[0].text == "compiler"
+    val authorization = expression.kind == "compile.capability.authorization"
+    val grant = expression.kind == "call" && expression.text == "compilerGrant"
+    !transform && !authorization && !grant
+}
+
+fun bootstrapCtCollectNodes(
+    expression: BootstrapExpression,
+    sourceIdentity: string
+): void {
+    if (expression.kind == "compile" && expression.children.size == 1) {
+        // Compile code nested in it runs as part of it: one site.
+        bootstrapCtSites.append(BootstrapCtSite(
+            expression.children[0], expression, sourceIdentity, false,
+            "unknown", -1, BOOTSTRAP_CT_UNPREPARED, 0
+        ))
+    } else {
+        for (child in expression.children) {
+            bootstrapCtCollectNodes(child, sourceIdentity)
+        }
+    }
+}
+
+fun bootstrapCtCollectDeclaration(
+    declaration: BootstrapDeclaration,
+    sourceIdentity: string
+): void {
+    // A compile declaration's `compile` nodes run inside the interpreter when the
+    // declaration runs, never at lowering: not sites.
+    if (declaration.kind == "compile.fun" || declaration.kind == "compile.val" ||
+        declaration.kind == "compile.var" || declaration.kind == "extern") return
+    bootstrapCtCollectNodes(declaration.expression, sourceIdentity)
+    for (parameterDefault in declaration.parameterDefaults) {
+        bootstrapCtCollectNodes(parameterDefault, sourceIdentity)
+    }
+    for (method in declaration.methods) {
+        bootstrapCtCollectDeclaration(method, sourceIdentity)
+    }
+}
+
+fun bootstrapCtCollectSites(parsed: BootstrapParseResult): void {
+    bootstrapCtSites = []
+    for (action in parsed.actions) {
+        var expression = action
+        if (expression.kind == "compile" && expression.children.size == 1) {
+            expression = expression.children[0]
+        }
+        if (bootstrapCtIsAction(expression)) {
+            bootstrapCtSites.append(BootstrapCtSite(
+                expression, action, "", true, "void", -1, BOOTSTRAP_CT_UNPREPARED, 0
+            ))
+        }
+    }
+    for (declaration in parsed.declarations) {
+        bootstrapCtCollectDeclaration(declaration, declaration.sourceIdentity)
+    }
+}
+
+// Semantic analysis of the program, with each site's static type recorded (typed
+// requests for its `compile` node) when the tier is on; then the pass's slice.
+fun bootstrapCtAnalyze(
+    parsed: BootstrapParseResult,
+    targetTriple: string
+): BootstrapSemanticResult {
+    if (bootstrapCtMode() == "interp") return bootstrapAnalyzeParsed(parsed)
+    bootstrapCtFinishPass()
+    bootstrapCtCollectSites(parsed)
+    if (bootstrapCtSites.size == 0) return bootstrapAnalyzeParsed(parsed)
+    val begins: array<int> = []
+    val ends: array<int> = []
+    val kinds: array<string> = []
+    val sources: array<string> = []
+    for (site in bootstrapCtSites) {
+        if (!site.action) {
+            begins.append(site.node.begin)
+            ends.append(site.node.end)
+            kinds.append("compile")
+            sources.append(site.sourceIdentity)
+        }
+    }
+    val analyzed = bootstrapAnalyzeRequestedSourceSpans(
+        parsed, begins, ends, kinds, sources
+    )
+    for (site in bootstrapCtSites) {
+        if (!site.action) {
+            for (typed in analyzed.typedCalls) {
+                if (typed.kind == "compile" && typed.begin == site.node.begin &&
+                    typed.end == site.node.end &&
+                    typed.sourceIdentity == site.sourceIdentity) {
+                    site.type = typed.type
+                }
+            }
+        }
+    }
+    if (analyzed.errors == 0) bootstrapCtPrepare(parsed, targetTriple)
+    analyzed
+}
+
+// --- reachability: what a site's code can reach, by name ---------------------
+
+class BootstrapCtReach(
+    val declarations: array<BootstrapDeclaration>,
+    val table: BootstrapIrNameTable,
+    val itemDeclarations: array<int>,
+    val itemMethods: array<int>,
+    val itemNext: array<int>,
+    val visited: array<bool>,
+    // Every declaration some ready site reaches: the slice is these and the runtime.
+    val kept: array<bool>
+) {
+    fun add(name: string, declaration: int, method: int): void {
+        this.itemDeclarations.append(declaration)
+        this.itemMethods.append(method)
+        this.itemNext.append(this.table.find(name, -1))
+        this.visited.append(false)
+        this.table.put(name, this.itemDeclarations.size - 1)
+    }
+
+    // The names in a declaration's signature types (a class named only in a parameter
+    // or result type is still part of its program).
+    fun pendTypes(
+        declaration: BootstrapDeclaration,
+        var pending: array<BootstrapExpression>,
+        var pendingLibrary: array<bool>,
+        library: bool
+    ): void {
+        val types: array<string> = [declaration.resultType]
+        for (type in declaration.parameterTypes) types.append(type)
+        for (type in types) {
+            var begin = 0
+            var index = 0
+            while (index <= type.size) {
+                val byte = if (index < type.size) type[index] else 32
+                val word = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+                    (byte >= 48 && byte <= 57) || byte == 95
+                if (!word) {
+                    if (index > begin) {
+                        pending.append(BootstrapExpression(
+                            "type", type.slice(begin, index), 0, 0, []
+                        ))
+                        pendingLibrary.append(library)
+                    }
+                    begin = index + 1
+                }
+                index = index + 1
+            }
+        }
+        return
+    }
+
+    fun reset(): void {
+        var item = 0
+        while (item < this.visited.size) {
+            this.visited[item] = false
+            item = item + 1
+        }
+    }
+
+    // The first construct `expression` reaches that the tier cannot run yet, or "".
+    fun unsupported(
+        expression: BootstrapExpression,
+        var globals: array<int>
+    ): string = this.walk(expression, globals, false, false)
+
+    // What the runtime's own declarations reach is part of every slice.
+    fun keepFrom(expression: BootstrapExpression): void {
+        val unused: array<int> = []
+        val ignored = this.walk(expression, unused, true, true)
+        return
+    }
+
+    // Walks what `expression` reaches. Code of the standard library never names a
+    // program's values, so a library body's identifiers resolve only to library values
+    // (a runtime local named like a program global is not that global).
+    fun walk(
+        expression: BootstrapExpression,
+        var globals: array<int>,
+        keepOnly: bool,
+        fromLibrary: bool
+    ): string {
+        val pending: array<BootstrapExpression> = [expression]
+        val pendingLibrary: array<bool> = [fromLibrary]
+        var reason = ""
+        while (reason == "" && pending.size > 0) {
+            val node = pending[pending.size - 1]
+            val library = pendingLibrary[pendingLibrary.size - 1]
+            pending.truncate(pending.size - 1)
+            pendingLibrary.truncate(pendingLibrary.size - 1)
+            for (child in node.children) {
+                pending.append(child)
+                pendingLibrary.append(library)
+            }
+            val literal = node.kind == "string" || node.kind == "integer" ||
+                node.kind == "float" || node.kind == "char"
+            if (!literal && node.text != "") {
+                var item = this.table.find(node.text, -1)
+                while (reason == "" && item >= 0) {
+                    val owner = this.declarations[this.itemDeclarations[item]]
+                    // A value is named by an identifier or an assignment; a call or a
+                    // member of that name is something else.
+                    val valueItem = this.itemMethods[item] < 0 &&
+                        bootstrapDeclarationIsValue(owner.kind)
+                    val ownerLibrary = bootstrapCtLibraryDeclaration(owner)
+                    val names = !valueItem ||
+                        ((node.kind == "identifier" || node.kind == "assign") &&
+                         (!library || ownerLibrary))
+                    if (names && !this.visited[item]) {
+                        this.visited[item] = true
+                        this.kept[this.itemDeclarations[item]] = true
+                        this.pendTypes(owner, pending, pendingLibrary, ownerLibrary)
+                        val declaration = if (this.itemMethods[item] < 0) owner
+                            else owner.methods[this.itemMethods[item]]
+                        var follow = true
+                        if (keepOnly) {
+                            follow = declaration.kind != "extern"
+                        } else if (declaration.kind == "extern" &&
+                            (declaration.externalLibrary == "compiler" ||
+                             declaration.externalLibrary == "host")) {
+                            reason = "reaches extern:\"${declaration.externalLibrary}\" fun ${declaration.name} (compiler API bridge pending)"
+                        } else if (declaration.kind == "compile.val" ||
+                                   declaration.kind == "compile.var") {
+                            val type = bootstrapNormalizeType(declaration.resultType)
+                            if (bootstrapCtEncoderSuffix(type) == "" ||
+                                type == "void" || type == "null") {
+                                reason = "reaches compile global ${declaration.name} of type ${declaration.resultType}, which has no encoder yet (value codec pending)"
+                            } else globals.append(this.itemDeclarations[item])
+                        } else if (valueItem && bootstrapCtHasCompileNode(declaration.expression)) {
+                            // Its initializer runs compile-time code of its own when it is
+                            // read at compile time: left to the interpreter.
+                            reason = "reaches global ${declaration.name}, whose initializer is compile-time code"
+                        }
+                        if (reason == "" && follow) {
+                            pending.append(declaration.expression)
+                            pendingLibrary.append(ownerLibrary)
+                            for (parameterDefault in declaration.parameterDefaults) {
+                                pending.append(parameterDefault)
+                                pendingLibrary.append(ownerLibrary)
+                            }
+                            if (this.itemMethods[item] < 0) {
+                                for (method in declaration.methods) {
+                                    pending.append(method.expression)
+                                    pendingLibrary.append(ownerLibrary)
+                                    for (parameterDefault in method.parameterDefaults) {
+                                        pending.append(parameterDefault)
+                                        pendingLibrary.append(ownerLibrary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    item = this.itemNext[item]
+                }
+            }
+        }
+        reason
+    }
+}
+
+fun bootstrapCtHasCompileNode(expression: BootstrapExpression): bool {
+    if (expression.kind == "compile") return true
+    for (child in expression.children) {
+        if (bootstrapCtHasCompileNode(child)) return true
+    }
+    false
+}
+
+var bootstrapCtLibraryRoot: string = "-"
+
+// A declaration of the standard library: under ABLA_STDLIB when that is set, else
+// under a toolchain's or a checkout's `stdlib/abla/`.
+fun bootstrapCtLibraryDeclaration(declaration: BootstrapDeclaration): bool {
+    if (bootstrapCtLibraryRoot == "-") {
+        val configured = linuxEnvironment("ABLA_STDLIB")
+        bootstrapCtLibraryRoot = if (configured.found) configured.value else ""
+    }
+    if (bootstrapCtLibraryRoot != "") {
+        declaration.sourceIdentity.size >= bootstrapCtLibraryRoot.size &&
+            declaration.sourceIdentity.slice(0, bootstrapCtLibraryRoot.size) == bootstrapCtLibraryRoot
+    } else bootstrapTextContains(declaration.sourceIdentity, "/stdlib/abla/")
+}
+
+// The value runtime's own modules: every slice carries them whole.
+fun bootstrapCtRuntimeDeclaration(declaration: BootstrapDeclaration): bool =
+    bootstrapTextContains(declaration.sourceIdentity, "/abla/runtime/")
+
+fun bootstrapCtReach(declarations: array<BootstrapDeclaration>): BootstrapCtReach {
+    var count = declarations.size
+    for (declaration in declarations) count = count + declaration.methods.size
+    val kept: array<bool> = []
+    for (declaration in declarations) kept.append(false)
+    val reach = BootstrapCtReach(
+        declarations, bootstrapIrNameTable(count), [], [], [], [], kept
+    )
+    var index = 0
+    while (index < declarations.size) {
+        reach.add(declarations[index].name, index, -1)
+        var method = 0
+        while (method < declarations[index].methods.size) {
+            reach.add(declarations[index].methods[method].name, index, method)
+            method = method + 1
+        }
+        index = index + 1
+    }
+    reach
+}
+
+// --- the slice -----------------------------------------------------------------
+
+// The stub codec until the value codec lands: the scalar kinds of the journal text.
+fun bootstrapCtEncoderSuffix(type: string): string =
+    if (type == "i64" || type == "int") "i64"
+    else if (type == "bool") "bool"
+    else if (type == "string") "string"
+    else if (type == "void") "void"
+    else if (type == "null") "null"
+    else ""
+
+fun bootstrapCtSupportSource(generation: int): string {
+    val g = "$generation"
+    "trusted fun __abla_ct_reply_$g(bytes: string): int {\n" +
+    "    val address = __ablaRuntimeAllocate(bytes.size + 8)\n" +
+    "    ablaRuntimeStoreI64(address, bytes.size)\n" +
+    "    var index = 0\n" +
+    "    while (index < bytes.size) {\n" +
+    "        ablaRuntimeStoreU8(address + 8 + index, bytes[index])\n" +
+    "        index = index + 1\n" +
+    "    }\n" +
+    "    address\n" +
+    "}\n" +
+    "@export(\"abla_ct_free_$g\")\n" +
+    "trusted fun __abla_ct_free_$g(address: int): int {\n" +
+    "    __ablaRuntimeFree(address)\n" +
+    "    0\n" +
+    "}\n" +
+    "fun __abla_ct_token_$g(text: string): string = \"\${text.size}:\$text\"\n" +
+    "fun __abla_ct_encode_i64_$g(value: int): string =\n" +
+    "    \"7:integer\${__abla_ct_token_$g(\"\$value\")}1:00:0:1:01:0\"\n" +
+    "fun __abla_ct_encode_bool_$g(value: bool): string =\n" +
+    "    if (value) \"7:boolean1:01:10:0:1:01:0\" else \"7:boolean1:01:00:0:1:01:0\"\n" +
+    "fun __abla_ct_encode_string_$g(value: string): string =\n" +
+    "    \"6:string1:01:0\${__abla_ct_token_$g(value)}0:1:01:0\"\n"
+}
+
+fun bootstrapCtEntrySource(site: BootstrapCtSite, generation: int): string {
+    val id = "${site.id}"
+    val suffix = if (site.action) "void" else bootstrapCtEncoderSuffix(site.type)
+    val header = "@export(\"abla_ct_eval_$id\")\ncompile fun __abla_ct_eval_$id(): int"
+    if (suffix == "void" || suffix == "null") {
+        "$header {\n    __abla_ct_site_$id()\n    __abla_ct_reply_$generation(\"4:$suffix" +
+            "1:01:00:0:1:01:0\")\n}\n"
+    } else {
+        "$header =\n    __abla_ct_reply_$generation(__abla_ct_encode_${suffix}_$generation(__abla_ct_site_$id()))\n"
+    }
+}
+
+// Template positions move far past any source offset (still below 2^32, which
+// positions pack the file index above), so position-keyed analysis facts of the
+// spliced site expression never meet a template node's.
+val BOOTSTRAP_CT_TEMPLATE_OFFSET = 2147483648
+
+fun bootstrapCtSplice(
+    node: BootstrapExpression,
+    placeholder: string,
+    replacement: BootstrapExpression
+): BootstrapExpression {
+    if (node.kind == "call" && node.text == placeholder &&
+        node.children.size == 0) return replacement
+    val children: array<BootstrapExpression> = []
+    for (child in node.children) {
+        children.append(bootstrapCtSplice(child, placeholder, replacement))
+    }
+    BootstrapExpression(
+        node.kind, node.text,
+        node.begin + BOOTSTRAP_CT_TEMPLATE_OFFSET,
+        node.end + BOOTSTRAP_CT_TEMPLATE_OFFSET,
+        children
+    )
+}
+
+fun bootstrapCtDeclarationWith(
+    declaration: BootstrapDeclaration,
+    kind: string,
+    expression: BootstrapExpression,
+    shift: int,
+    sourceIdentity: string
+): BootstrapDeclaration = BootstrapDeclaration(
+    kind,
+    declaration.name,
+    declaration.begin + shift,
+    declaration.end + shift,
+    expression,
+    declaration.parameters,
+    declaration.parameterTypes,
+    declaration.resultType,
+    declaration.methods,
+    declaration.parameterDefaults,
+    declaration.externalLibrary,
+    declaration.parameterKinds,
+    declaration.extensionOwner,
+    declaration.isTrusted,
+    declaration.isResource,
+    declaration.isNoEscape,
+    declaration.generatedNamespace,
+    declaration.generatedOriginBegin,
+    declaration.generatedOriginEnd,
+    declaration.annotations,
+    declaration.annotationArguments,
+    declaration.annotationBegins,
+    declaration.annotationEnds,
+    sourceIdentity
+)
+
+fun bootstrapCtGlobalSource(global: BootstrapCtGlobal, index: int, generation: int): string {
+    val suffix = bootstrapCtEncoderSuffix(global.type)
+    "@export(\"abla_ct_global_${generation}_$index\")\ncompile fun __abla_ct_global_${generation}_$index(): int =\n    __abla_ct_reply_$generation(__abla_ct_encode_${suffix}_$generation(__abla_ct_value_$index()))\n"
+}
+
+// A kept scalar as a literal initializer ("missing" when there is none).
+fun bootstrapCtLiftScalar(value: BootstrapEvalValue, begin: int, end: int): BootstrapExpression =
+    if (value.kind == "integer") BootstrapExpression("integer", "${value.integer}", begin, end, [])
+    else if (value.kind == "boolean")
+        BootstrapExpression(if (value.boolean) "true" else "false", "", begin, end, [])
+    else if (value.kind == "string") BootstrapExpression("string", value.text, begin, end, [])
+    else BootstrapExpression("missing", "", begin, end, [])
+
+fun bootstrapCtFailReady(reason: string): void {
+    for (site in bootstrapCtSites) {
+        if (site.reason == "") site.reason = reason
+    }
+}
+
+fun bootstrapCtFirstLine(text: string): string {
+    var end = 0
+    while (end < text.size && text[end] != 10) end = end + 1
+    text.slice(0, end)
+}
+
+fun bootstrapCtSession(): bool {
+    if (!bootstrapCtSessionLive) {
+        bootstrapCtSessionState = llvmOrcCreateSession()
+        bootstrapCtSessionLive = bootstrapCtSessionState.status == 0
+    }
+    bootstrapCtSessionLive
+}
+
+fun bootstrapCtTripleFamily(triple: string): string {
+    var end = 0
+    while (end < triple.size && triple[end] != 45) end = end + 1
+    var architecture = triple.slice(0, end)
+    if (architecture == "aarch64") architecture = "arm64"
+    val system = if (bootstrapTextContains(triple, "apple")) "apple"
+        else if (bootstrapTextContains(triple, "linux")) "linux"
+        else triple
+    "$architecture:$system"
+}
+
+// Compile-time code runs on the host: only a host build's program can be its slice.
+fun bootstrapCtTripleIsHost(triple: string): bool =
+    bootstrapCtTripleFamily(triple) == bootstrapCtTripleFamily(llvmDefaultTargetTriple())
+
+fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void {
+    for (site in bootstrapCtSites) {
+        if (site.reason == BOOTSTRAP_CT_UNPREPARED) site.reason = ""
+    }
+    if (!bootstrapCtTripleIsHost(targetTriple)) {
+        bootstrapCtFailReady("cross-target build (compile-time code runs on the host)")
+    }
+    val reach = bootstrapCtReach(parsed.declarations)
+    for (declaration in parsed.declarations) {
+        if (bootstrapCtRuntimeDeclaration(declaration)) {
+            reach.keepFrom(declaration.expression)
+            for (method in declaration.methods) reach.keepFrom(method.expression)
+        }
+    }
+    var ready = 0
+    for (site in bootstrapCtSites) {
+        if (site.reason == "" && !site.action &&
+            bootstrapCtEncoderSuffix(site.type) == "") {
+            site.reason = "result type ${site.type} has no encoder yet (value codec pending)"
+        }
+        if (site.reason == "") {
+            reach.reset()
+            val reached: array<int> = []
+            site.reason = reach.unsupported(site.expression, reached)
+            if (site.reason == "") {
+                for (global in reached) {
+                    var known = false
+                    for (existing in bootstrapCtGlobals) {
+                        if (existing.declaration == global) known = true
+                    }
+                    if (!known) bootstrapCtGlobals.append(BootstrapCtGlobal(
+                        global,
+                        bootstrapCompileGlobalKey(parsed.declarations[global]),
+                        bootstrapNormalizeType(parsed.declarations[global].resultType),
+                        "", 0
+                    ))
+                }
+            }
+        }
+        if (site.reason == "") {
+            site.id = bootstrapCtNextSite
+            bootstrapCtNextSite = bootstrapCtNextSite + 1
+            ready = ready + 1
+        }
+    }
+    if (ready > 0 && !bootstrapCtSession()) {
+        bootstrapCtFailReady("the ORC session could not be created")
+        ready = 0
+    }
+    if (ready == 0) return
+    bootstrapCtGenerationNumber = bootstrapCtGenerationNumber + 1
+    val generation = bootstrapCtGenerationNumber
+    var source = bootstrapCtSupportSource(generation)
+    for (site in bootstrapCtSites) {
+        if (site.reason == "") source = "$source${bootstrapCtEntrySource(site, generation)}"
+    }
+    var globalIndex = 0
+    while (globalIndex < bootstrapCtGlobals.size) {
+        source = "$source${bootstrapCtGlobalSource(
+            bootstrapCtGlobals[globalIndex], globalIndex, generation
+        )}"
+        globalIndex = globalIndex + 1
+    }
+    val template = bootstrapParse(source)
+    if (template.errors > 0) {
+        bootstrapCtFailReady("slice template: ${bootstrapCtFirstLine(template.diagnostics)}")
+        return
+    }
+    // The program's declarations as they are (analysis sees the phases it knows),
+    // then the support declarations and one entry per site.
+    val sliceDeclarations: array<BootstrapDeclaration> = []
+    var declarationIndex = 0
+    while (declarationIndex < parsed.declarations.size) {
+        val declaration = parsed.declarations[declarationIndex]
+        if (reach.kept[declarationIndex] || bootstrapCtRuntimeDeclaration(declaration)) {
+            sliceDeclarations.append(declaration)
+        }
+        declarationIndex = declarationIndex + 1
+    }
+    val exports: array<BootstrapExportRequest> = []
+    for (declaration in template.declarations) {
+        var sourceIdentity = ""
+        var expression = bootstrapCtSplice(declaration.expression, "", declaration.expression)
+        for (site in bootstrapCtSites) {
+            if (site.reason == "" && declaration.name == "__abla_ct_eval_${site.id}") {
+                sourceIdentity = site.sourceIdentity
+                expression = bootstrapCtSplice(
+                    declaration.expression, "__abla_ct_site_${site.id}", site.expression
+                )
+            }
+        }
+        globalIndex = 0
+        while (globalIndex < bootstrapCtGlobals.size) {
+            if (declaration.name == "__abla_ct_global_${generation}_$globalIndex") {
+                val global = parsed.declarations[bootstrapCtGlobals[globalIndex].declaration]
+                sourceIdentity = global.sourceIdentity
+                expression = bootstrapCtSplice(
+                    declaration.expression, "__abla_ct_value_$globalIndex",
+                    BootstrapExpression("identifier", global.name, global.begin, global.end, [])
+                )
+            }
+            globalIndex = globalIndex + 1
+        }
+        sliceDeclarations.append(bootstrapCtDeclarationWith(
+            declaration, declaration.kind, expression,
+            BOOTSTRAP_CT_TEMPLATE_OFFSET, sourceIdentity
+        ))
+        if (declaration.annotations.size > 0 && declaration.annotations[0] == "export") {
+            val parameterNames: array<string> = []
+            val parameterTypes: array<string> = []
+            for (parameter in declaration.parameters) {
+                parameterNames.append(parameter)
+                parameterTypes.append("i64")
+            }
+            exports.append(BootstrapExportRequest(
+                declaration.name,
+                declaration.annotationArguments[0].text,
+                "i64", parameterNames, parameterTypes, false, false, false
+            ))
+        }
+    }
+    val slice = BootstrapParseResult(
+        sliceDeclarations, parsed.actions, 0, 0,
+        parsed.compileInputPaths, parsed.compileInputContents, ""
+    )
+    val analyzed = bootstrapAnalyzeParsed(slice)
+    if (analyzed.errors > 0) {
+        bootstrapCtNote("slice analysis failed:\n${analyzed.diagnostics}")
+        bootstrapCtFailReady("slice analysis: ${bootstrapCtFirstLine(analyzed.diagnostics)}")
+        return
+    }
+    // Lowered as one runtime program: compile declarations become ordinary ones.
+    val loweredDeclarations: array<BootstrapDeclaration> = []
+    for (declaration in sliceDeclarations) {
+        var kind = if (declaration.kind == "compile.fun") "fun" else declaration.kind
+        var initializer = declaration.expression
+        if (kind == "compile.val" || kind == "compile.var") {
+            // One value for the compilation: what an earlier evaluation kept, if any.
+            kind = "var"
+            val kept = bootstrapCompileGlobalLoad(bootstrapCompileGlobalKey(declaration))
+            val lifted = bootstrapCtLiftScalar(kept, declaration.begin, declaration.end)
+            if (lifted.kind != "missing") initializer = lifted
+        }
+        loweredDeclarations.append(
+            if (kind == declaration.kind) declaration
+            else bootstrapCtDeclarationWith(
+                declaration, kind, initializer, 0, declaration.sourceIdentity
+            )
+        )
+    }
+    val lowered = BootstrapParseResult(
+        loweredDeclarations, [], 0, 0,
+        parsed.compileInputPaths, parsed.compileInputContents, ""
+    )
+    // The outer program's staged exports and diagnostics are set aside while the
+    // slice uses the same staging, then put back.
+    val outerExports = bootstrapTakeExportRequests()
+    val outerDiagnostics = bootstrapTakeDriverDiagnostics()
+    for (request in exports) bootstrapStageExportRequest(request)
+    bootstrapCtLoweringSlice = true
+    val program = bootstrapLowerParsedCached(
+        lowered, analyzed, bootstrapIrTransientState(), true
+    )
+    bootstrapCtLoweringSlice = false
+    var context = nativeNullPointer()
+    var module = nativeNullPointer()
+    var failure = ""
+    if (program.errors > 0) {
+        failure = "slice lowering: ${program.errors} error(s)"
+        val discarded = bootstrapTakeExportRequests()
+    } else {
+        val holdModule = bootstrapLlvmHoldModule
+        val bitcodePath = bootstrapLlvmBitcodePath
+        val debugInfo = bootstrapLlvmDebugInfo
+        bootstrapLlvmHoldModule = true
+        bootstrapLlvmBitcodePath = ""
+        bootstrapLlvmDebugInfo = false
+        val emitted = bootstrapEmitLlvmProgram(program, llvmDefaultTargetTriple(), false)
+        if (emitted.errors > 0) {
+            failure = "slice emission: ${emitted.errors} error(s)"
+        } else {
+            context = bootstrapLlvmHeldContext
+            module = bootstrapLlvmHeldModule
+        }
+        bootstrapLlvmHeldContext = nativeNullPointer()
+        bootstrapLlvmHeldModule = nativeNullPointer()
+        bootstrapLlvmHoldModule = holdModule
+        bootstrapLlvmBitcodePath = bitcodePath
+        bootstrapLlvmDebugInfo = debugInfo
+    }
+    val sliceDiagnostics = bootstrapTakeDriverDiagnostics()
+    if (sliceDiagnostics != "") bootstrapCtNote("slice diagnostics:\n$sliceDiagnostics")
+    for (request in outerExports) bootstrapStageExportRequest(request)
+    if (outerDiagnostics != "") bootstrapStageDriverDiagnostic(outerDiagnostics)
+    if (failure != "") {
+        bootstrapCtFailReady(failure)
+        return
+    }
+    bootstrapCtInstallGuard(context, module, generation)
+    // ABLA_COMPILE_EVAL_DUMP=<directory> keeps each generation's module as text.
+    val dump = linuxEnvironment("ABLA_COMPILE_EVAL_DUMP")
+    if (dump.found && dump.value != "") {
+        Path(dump.value).createDirectories()
+        val dumped = LlvmOwnedModule(context, module, 0, false)
+        val written = dumped.writeText("${dump.value}/generation-$generation.ll")
+        dumped.closed = true
+    }
+    val added = bootstrapCtSessionState.addModule(context, module, llvmPassesFast())
+    if (added.status != 0) {
+        bootstrapCtFailReady("ORC rejected the slice (status ${added.status})")
+        return
+    }
+    bootstrapCtGenerationState = added
+    bootstrapCtGenerationLive = true
+    for (global in bootstrapCtGlobals) {
+        global.exchanged = bootstrapCompileGlobalEncode(bootstrapCompileGlobalLoad(global.key))
+    }
+    bootstrapCtFreeAddress = bootstrapCtLookup("abla_ct_free_$generation")
+    bootstrapCtGuardAddress = bootstrapCtLookup("abla_ct_guard_$generation")
+    bootstrapCtGenerationSpent = ""
+    if (bootstrapCtFreeAddress == 0 || bootstrapCtGuardAddress == 0) {
+        bootstrapCtFailReady("the slice's support entries are missing")
+    }
+    for (site in bootstrapCtSites) {
+        if (site.reason == "") {
+            site.entry = bootstrapCtLookup("abla_ct_eval_${site.id}")
+            if (site.entry == 0) site.reason = "the site's entry is missing"
+        }
+    }
+    var getter = 0
+    while (getter < bootstrapCtGlobals.size) {
+        bootstrapCtGlobals[getter].getter =
+            bootstrapCtLookup("abla_ct_global_${generation}_$getter")
+        getter = getter + 1
+    }
+}
+
+fun bootstrapCtLookup(symbol: string): int {
+    val found = bootstrapCtSessionState.lookup(symbol)
+    if (found.status == 0) found.address else 0
+}
+
+// --- the guard: a fatal stop in compile-time code returns to the compiler ------------
+
+// A runtime panic writes its message and then calls `abort`; so does an exhausted
+// memory limit. In the slice every `abort` becomes a jump back to the entry's guard
+// (`_setjmp`/`_longjmp`, no signal mask), so the compiler reports the failure and
+// goes on. The generation is spent afterwards: frames the jump skipped never popped
+// their collector roots, so no later entry may run on it.
+fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool {
+    val builder = LLVMCreateBuilderInContext(context)
+    val voidType = LLVMVoidTypeInContext(context)
+    val i1 = LLVMInt1TypeInContext(context)
+    val i32Type = LLVMInt32TypeInContext(context)
+    val i64Type = LLVMInt64TypeInContext(context)
+    val pointer = LLVMPointerTypeInContext(context, 0)
+    // 512 bytes hold any supported host's jmp_buf.
+    val bufferType = LLVMArrayType2(i64Type, 64)
+    val jump = LLVMAddGlobal(module, bufferType, "abla.ct.jump")
+    LLVMSetInitializer(jump, LLVMConstNull(bufferType))
+    LLVMSetLinkage(jump, llvmInternalLinkage())
+    LLVMSetAlignment(jump, 16)
+    val armed = LLVMAddGlobal(module, i1, "abla.ct.armed")
+    LLVMSetInitializer(armed, LLVMConstInt(i1, 0, 0))
+    LLVMSetLinkage(armed, llvmInternalLinkage())
+    val returnsTwice = LLVMCreateEnumAttribute(
+        context, LLVMGetEnumAttributeKindForName("returns_twice", 13), 0
+    )
+    val noReturn = LLVMCreateEnumAttribute(
+        context, LLVMGetEnumAttributeKindForName("noreturn", 8), 0
+    )
+    val oneParameter = llvmPointerVector(1)
+    oneParameter.set(0, pointer)
+    val setjmpType = LLVMFunctionType(i32Type, oneParameter.pointer(), 1, 0)
+    var setjmp = LLVMGetNamedFunction(module, "_setjmp")
+    if (pointerIsNull(setjmp)) setjmp = LLVMAddFunction(module, "_setjmp", setjmpType)
+    LLVMAddAttributeAtIndex(setjmp, -1, returnsTwice)
+    val twoParameters = llvmPointerVector(2)
+    twoParameters.set(0, pointer)
+    twoParameters.set(1, i32Type)
+    val longjmpType = LLVMFunctionType(voidType, twoParameters.pointer(), 2, 0)
+    var longjmp = LLVMGetNamedFunction(module, "_longjmp")
+    if (pointerIsNull(longjmp)) longjmp = LLVMAddFunction(module, "_longjmp", longjmpType)
+    LLVMAddAttributeAtIndex(longjmp, -1, noReturn)
+    // A failed runtime check traps (llvm.trap): it stops the same way.
+    val trap = LLVMGetNamedFunction(module, "llvm.trap")
+    if (!pointerIsNull(trap)) {
+        val trapType = LLVMGlobalGetValueType(trap)
+        val catcher = LLVMAddFunction(module, "abla.ct.trap", trapType)
+        LLVMSetLinkage(catcher, llvmInternalLinkage())
+        LLVMReplaceAllUsesWith(trap, catcher)
+        val entry = LLVMAppendBasicBlockInContext(context, catcher, "entry")
+        val back = LLVMAppendBasicBlockInContext(context, catcher, "back")
+        val stop = LLVMAppendBasicBlockInContext(context, catcher, "stop")
+        LLVMPositionBuilderAtEnd(builder, entry)
+        val isArmed = LLVMBuildLoad2(builder, i1, armed, "armed")
+        LLVMBuildCondBr(builder, isArmed, back, stop)
+        LLVMPositionBuilderAtEnd(builder, back)
+        val jumpArguments = llvmPointerVector(2)
+        jumpArguments.set(0, jump)
+        jumpArguments.set(1, LLVMConstInt(i32Type, 2, 0))
+        LLVMBuildCall2(builder, longjmpType, longjmp, jumpArguments.pointer(), 2, "")
+        jumpArguments.drop()
+        LLVMBuildUnreachable(builder)
+        LLVMPositionBuilderAtEnd(builder, stop)
+        LLVMBuildCall2(builder, trapType, trap, nativeNullPointer(), 0, "")
+        LLVMBuildUnreachable(builder)
+    }
+    val abort = LLVMGetNamedFunction(module, "abort")
+    if (!pointerIsNull(abort)) {
+        val abortType = LLVMGlobalGetValueType(abort)
+        val catcher = LLVMAddFunction(module, "abla.ct.abort", abortType)
+        LLVMSetLinkage(catcher, llvmInternalLinkage())
+        LLVMReplaceAllUsesWith(abort, catcher)
+        val entry = LLVMAppendBasicBlockInContext(context, catcher, "entry")
+        val back = LLVMAppendBasicBlockInContext(context, catcher, "back")
+        val stop = LLVMAppendBasicBlockInContext(context, catcher, "stop")
+        LLVMPositionBuilderAtEnd(builder, entry)
+        val isArmed = LLVMBuildLoad2(builder, i1, armed, "armed")
+        LLVMBuildCondBr(builder, isArmed, back, stop)
+        LLVMPositionBuilderAtEnd(builder, back)
+        val jumpArguments = llvmPointerVector(2)
+        jumpArguments.set(0, jump)
+        jumpArguments.set(1, LLVMConstInt(i32Type, 1, 0))
+        LLVMBuildCall2(builder, longjmpType, longjmp, jumpArguments.pointer(), 2, "")
+        jumpArguments.drop()
+        LLVMBuildUnreachable(builder)
+        LLVMPositionBuilderAtEnd(builder, stop)
+        LLVMBuildCall2(builder, abortType, abort, nativeNullPointer(), 0, "")
+        LLVMBuildUnreachable(builder)
+    }
+    // i64 abla_ct_guard_<g>(ptr entry): the entry's reply, or 0 after a stop.
+    val guardType = LLVMFunctionType(i64Type, oneParameter.pointer(), 1, 0)
+    val guard = LLVMAddFunction(module, "abla_ct_guard_$generation", guardType)
+    val entry = LLVMAppendBasicBlockInContext(context, guard, "entry")
+    val run = LLVMAppendBasicBlockInContext(context, guard, "run")
+    val caught = LLVMAppendBasicBlockInContext(context, guard, "caught")
+    LLVMPositionBuilderAtEnd(builder, entry)
+    val setjmpArguments = llvmPointerVector(1)
+    setjmpArguments.set(0, jump)
+    val marked = LLVMBuildCall2(
+        builder, setjmpType, setjmp, setjmpArguments.pointer(), 1, "marked"
+    )
+    setjmpArguments.drop()
+    LLVMAddCallSiteAttribute(marked, -1, returnsTwice)
+    val first = LLVMBuildICmp(
+        builder, llvmIntEqual(), marked, LLVMConstInt(i32Type, 0, 0), "first"
+    )
+    LLVMBuildCondBr(builder, first, run, caught)
+    LLVMPositionBuilderAtEnd(builder, run)
+    LLVMBuildStore(builder, LLVMConstInt(i1, 1, 0), armed)
+    val entryType = LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0)
+    val reply = LLVMBuildCall2(
+        builder, entryType, LLVMGetParam(guard, 0), nativeNullPointer(), 0, "reply"
+    )
+    LLVMBuildStore(builder, LLVMConstInt(i1, 0, 0), armed)
+    LLVMBuildRet(builder, reply)
+    LLVMPositionBuilderAtEnd(builder, caught)
+    LLVMBuildStore(builder, LLVMConstInt(i1, 0, 0), armed)
+    LLVMBuildRet(builder, LLVMConstInt(i64Type, 0, 0))
+    oneParameter.drop()
+    twoParameters.drop()
+    LLVMDisposeBuilder(builder)
+    true
+}
+
+// A compile pass is over: its generation's code and memory go.
+fun bootstrapCtFinishPass(): void {
+    if (bootstrapCtGenerationLive) {
+        val removed = bootstrapCtGenerationState.remove()
+        bootstrapCtGenerationLive = false
+    }
+    bootstrapCtFreeAddress = 0
+    bootstrapCtGuardAddress = 0
+    bootstrapCtSites = []
+    bootstrapCtGlobals = []
+    return
+}

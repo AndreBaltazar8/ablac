@@ -151,6 +151,7 @@ test: ablac
 	tools/test-nullable-refinement.sh $(COMPILER)
 	tools/test-callable-families.sh $(COMPILER)
 	tools/test-field-shadowing.sh $(COMPILER)
+	tools/test-compile-eval-jit.sh $(COMPILER)
 	tools/test-optimize-o1.sh $(COMPILER)
 	tools/test-map.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)

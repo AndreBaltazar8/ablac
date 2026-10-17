@@ -1,0 +1,270 @@
+// Compile-time evaluation as native code: the calls (ABLA_COMPILE_EVAL=jit|auto).
+//
+// ct_jit.ab prepares, per compile pass, one generation of native code with an entry
+// per compile-time site; this file runs those entries where the interpreter would
+// run the site, in the same order, and needs nothing of LLVM to do it: entries,
+// the guard and the support functions are addresses resolved when the generation
+// was added. A site with no entry runs in the interpreter.
+//
+// JIT code has a runtime of its own, so no heap pointer crosses: an entry encodes
+// its result as bytes (the compile-global journal text, read back with
+// BootstrapCompileGlobalReader), copies them to `[length:i64][bytes]` in its own
+// memory and returns the address; the compiler copies them and frees them there.
+
+import "eval.ab"
+import "abla/unsafe/memory"
+import "abla/bytes"
+
+trusted noescape extern:"intrinsic" fun ablaUnsafeCallExact_I64_I64(
+    address: int,
+    argument: int
+): int
+
+// A place the interpreter would evaluate: `expression` (the operand of a
+// `compile` node, or a top-level action), the node itself (actions: the action),
+// and, once prepared, the entry's number or why the site stays interpreted.
+class BootstrapCtSite(
+    val expression: BootstrapExpression,
+    val node: BootstrapExpression,
+    val sourceIdentity: string,
+    val action: bool,
+    var type: string,
+    var id: int,
+    var reason: string,
+    // The entry's address in the live generation (0: none).
+    var entry: int
+)
+
+val BOOTSTRAP_CT_UNPREPARED = "the program has semantic errors"
+
+// A compile global the live generation holds (`compile val` / `compile var`): its
+// declaration, keep-store key, type, the journal text last exchanged with the
+// keep-store (which an interpreted evaluation may have changed since), and the
+// address of the generation's getter for it.
+class BootstrapCtGlobal(
+    val declaration: int,
+    val key: string,
+    val type: string,
+    var exchanged: string,
+    var getter: int
+)
+
+class BootstrapCtOutcome(
+    val taken: bool,
+    val reason: string,
+    val result: BootstrapEvalResult
+)
+
+var bootstrapCtModeValue: string = ""
+var bootstrapCtTraceValue: int = -1
+// The live generation's support entries (0: none) and why it takes no more calls
+// ("" while it does).
+var bootstrapCtFreeAddress: int = 0
+var bootstrapCtGuardAddress: int = 0
+var bootstrapCtGenerationSpent: string = ""
+var bootstrapCtCurrentLive: bool = false
+var bootstrapCtCurrent: BootstrapEvaluator = BootstrapEvaluator(
+    [], [], bootstrapEvalNoContext(),
+    [], [], [], [], [], [], [], [], [], [], [], [], [], 0, 0, 0, "", ""
+)
+var bootstrapCtSites: array<BootstrapCtSite> = []
+var bootstrapCtGlobals: array<BootstrapCtGlobal> = []
+// Set while the slice itself is lowered: a `compile` node met there is compile
+// code being compiled, so its operand is lowered, never evaluated.
+var bootstrapCtLoweringSlice: bool = false
+
+// "interp" (the default), "jit" or "auto". Until the tier policy lands, auto is jit.
+fun bootstrapCtMode(): string {
+    if (bootstrapCtModeValue == "") {
+        val configured = linuxEnvironment("ABLA_COMPILE_EVAL")
+        bootstrapCtModeValue = if (configured.found &&
+            (configured.value == "jit" || configured.value == "auto")) {
+            configured.value
+        } else "interp"
+    }
+    bootstrapCtModeValue
+}
+
+fun bootstrapCtTrace(): bool {
+    if (bootstrapCtTraceValue < 0) {
+        val configured = linuxEnvironment("ABLA_COMPILE_EVAL_TRACE")
+        bootstrapCtTraceValue =
+            if (configured.found && configured.value == "1") 1 else 0
+    }
+    bootstrapCtTraceValue == 1
+}
+
+fun bootstrapCtNote(message: string): void {
+    if (bootstrapCtTrace()) linuxPrintStandardError("note[ct-jit]: $message\n")
+}
+
+fun bootstrapCtSiteLabel(site: BootstrapCtSite): string =
+    "${if (site.sourceIdentity == "") "<root>" else site.sourceIdentity}:${site.node.begin}"
+
+trusted fun bootstrapCtReadReply(address: int): string {
+    val pointer = nativePointerFromAddress(address)
+    val size = ablaUnsafeLoadI64(pointer)
+    val bytes = byteBuffer()
+    var index = 0
+    while (index < size) {
+        bytes.appendByteValue(ablaUnsafeLoadU8(ablaUnsafePointerOffset(pointer, 8 + index)))
+        index = index + 1
+    }
+    bytes.toText()
+}
+
+fun bootstrapCtNotTaken(reason: string): BootstrapCtOutcome = BootstrapCtOutcome(
+    false, reason, BootstrapEvalResult(bootstrapEvalInvalid(), 0, "", [], [], [])
+)
+
+// Runs `expression`'s entry when it has one; not taken leaves it to the interpreter.
+trusted fun bootstrapCtTryEvaluate(
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>,
+    allowedCompileEffects: int
+): BootstrapCtOutcome {
+    var found = -1
+    var index = 0
+    while (found < 0 && index < bootstrapCtSites.size) {
+        if (bootstrapCtSites[index].expression == expression) found = index
+        index = index + 1
+    }
+    if (found < 0) return bootstrapCtNotTaken("not a prepared site")
+    val site = bootstrapCtSites[found]
+    if (site.reason != "") return bootstrapCtNotTaken(site.reason)
+    if (site.entry == 0) return bootstrapCtNotTaken("the site has no entry")
+    if (bootstrapCtGenerationSpent != "") return bootstrapCtNotTaken(bootstrapCtGenerationSpent)
+    // The generation's compile globals are the keep-store's: an interpreted evaluation
+    // that changed one since leaves this generation's copy stale.
+    for (global in bootstrapCtGlobals) {
+        if (bootstrapCompileGlobalEncode(bootstrapCompileGlobalLoad(global.key)) !=
+            global.exchanged) {
+            bootstrapCtGenerationSpent =
+                "compile global ${global.key} changed in an interpreted evaluation"
+            return bootstrapCtNotTaken(bootstrapCtGenerationSpent)
+        }
+    }
+    // The evaluation's context, as the interpreter builds it: compiler callbacks
+    // made during the call act on it, and the result reports from it.
+    var evaluator = bootstrapCtEvaluator(declarations, allowedCompileEffects)
+    val enclosing = bootstrapCtCurrent
+    val enclosingLive = bootstrapCtCurrentLive
+    bootstrapCtCurrent = evaluator
+    bootstrapCtCurrentLive = true
+    val reply = ablaUnsafeCallExact_I64_I64(bootstrapCtGuardAddress, site.entry)
+    bootstrapCtCurrent = enclosing
+    bootstrapCtCurrentLive = enclosingLive
+    var value = bootstrapEvalInvalid()
+    if (reply == 0) {
+        bootstrapCtGenerationSpent =
+            "an earlier compile-time evaluation of this pass stopped"
+        evaluator.recordEvaluatorDiagnostic(
+            "E_CT_STOPPED",
+            "compile-time evaluation at ${bootstrapCtSiteLabel(site)} stopped: a runtime check failed or the code aborted"
+        )
+        evaluator.errors = evaluator.errors + 1
+    } else {
+        val text = bootstrapCtReadReply(reply)
+        ablaUnsafeCallExact_I64_I64(bootstrapCtFreeAddress, reply)
+        val reader = BootstrapCompileGlobalReader(text, 0, true)
+        value = reader.value()
+        // The entry has run: a reply that cannot be read is an error, not a retry.
+        if (!reader.ok || reader.at != text.size) {
+            value = bootstrapEvalInvalid()
+            evaluator.recordEvaluatorDiagnostic(
+                "E_CT_JIT_RESULT",
+                "compile-time result at ${bootstrapCtSiteLabel(site)} could not be decoded"
+            )
+            evaluator.errors = evaluator.errors + 1
+        } else bootstrapCtNote("native at ${bootstrapCtSiteLabel(site)}")
+    }
+    if (reply != 0) bootstrapCtExchangeGlobals(evaluator, site)
+    bootstrapCompileGlobalsKeep(evaluator.globalKeys, evaluator.globalValues)
+    BootstrapCtOutcome(true, "", BootstrapEvalResult(
+        value,
+        evaluator.errors,
+        evaluator.diagnostics,
+        evaluator.compileInputPaths,
+        evaluator.compileInputContents,
+        evaluator.generatedDeclarations
+    ))
+}
+
+// After a call: the generation's compile globals as they now are, kept like the
+// interpreter keeps the globals an evaluation used.
+trusted fun bootstrapCtExchangeGlobals(var evaluator: BootstrapEvaluator, site: BootstrapCtSite): void {
+    var index = 0
+    while (index < bootstrapCtGlobals.size) {
+        val global = bootstrapCtGlobals[index]
+        var reply = 0
+        if (global.getter != 0) {
+            reply = ablaUnsafeCallExact_I64_I64(bootstrapCtGuardAddress, global.getter)
+        }
+        if (reply == 0) {
+            bootstrapCtGenerationSpent = "compile global ${global.key} could not be read back"
+            evaluator.recordEvaluatorDiagnostic(
+                "E_CT_JIT_RESULT",
+                "compile global ${global.key} could not be read back after ${bootstrapCtSiteLabel(site)}"
+            )
+            evaluator.errors = evaluator.errors + 1
+        } else {
+            val text = bootstrapCtReadReply(reply)
+            ablaUnsafeCallExact_I64_I64(bootstrapCtFreeAddress, reply)
+            val reader = BootstrapCompileGlobalReader(text, 0, true)
+            val value = reader.value()
+            if (reader.ok) {
+                evaluator.globalKeys.append(global.key)
+                evaluator.globalValues.append(value)
+                global.exchanged = bootstrapCompileGlobalEncode(value)
+            }
+        }
+        index = index + 1
+    }
+    return
+}
+
+// A fresh evaluation context, exactly as bootstrapEvaluateWithEffectsIn makes one.
+fun bootstrapCtEvaluator(
+    declarations: array<BootstrapDeclaration>,
+    allowedCompileEffects: int
+): BootstrapEvaluator {
+    val context = bootstrapEvalContext(declarations)
+    BootstrapEvaluator(
+        declarations, context.affineTypes, context,
+        [], [], [], [], [], [], [], [], [], [], [], [], [],
+        allowedCompileEffects, 0, 0, "", ""
+    )
+}
+
+// The evaluation a native call is running (compiler callbacks act on it).
+fun bootstrapCtCurrentEvaluator(): BootstrapEvaluator = bootstrapCtCurrent
+
+// The interpreter entry points' JIT-first forms (the hooks at the evaluation sites).
+fun bootstrapCtEvaluateWithEffects(
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>,
+    allowedCompileEffects: int
+): BootstrapEvalResult {
+    if (bootstrapCtMode() != "interp") {
+        val outcome = bootstrapCtTryEvaluate(
+            expression, declarations, allowedCompileEffects
+        )
+        if (outcome.taken) return outcome.result
+        bootstrapCtNote("interpreted at ${expression.begin}: ${outcome.reason}")
+    }
+    bootstrapEvaluateWithEffects(expression, declarations, allowedCompileEffects)
+}
+
+// `source`: the file being lowered, which an interpreted evaluation's failures name.
+fun bootstrapCtEvaluate(
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>,
+    source: string = ""
+): BootstrapEvalResult {
+    if (bootstrapCtMode() != "interp") {
+        val outcome = bootstrapCtTryEvaluate(expression, declarations, 1023)
+        if (outcome.taken) return outcome.result
+        bootstrapCtNote("interpreted at ${expression.begin}: ${outcome.reason}")
+    }
+    bootstrapEvaluate(expression, declarations, source)
+}
