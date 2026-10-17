@@ -401,6 +401,18 @@ compiler treats every element as possibly moved until the array is replaced
 or the slot reassigned. Replacing an element (`tickets[1] = Ticket(9)`)
 drops the old one first.
 
+A `Map` whose values are resources follows the same rules: `get` and
+`values()` borrow (moving out of them is `ownership.move-borrow`), `set`
+drops the value it replaces, `remove` drops the removed value,
+`take(key)` moves it out as a `V?`, and the map drops its remaining values
+when it goes out of scope.
+
+> Known issue (being fixed by ct-own): today a map of resources breaks
+> single ownership. `get` and `values()` hand out owning copies, so one
+> value can be moved out and dropped several times, and replaced, removed
+> or remaining values are never dropped. Don't store resources in a `Map`
+> yet; keep them in an array and map keys to indexes.
+
 ## Borrowed views and `borrow(...)` results
 
 `Shared<T>.get()` returns a *view* of the shared value: a reference the

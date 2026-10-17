@@ -207,8 +207,14 @@ fun main {
   (`local.uninitialized-val`) are rejected.
 - Assigning a `val` is `assignment.immutable` (`global.immutable` at the
   top level); assigning a `val` property is `field.immutable`.
-- Top-level `val`/`var` are initialized in declaration order before `main`
-  runs.
+- Top-level `val`/`var` are initialized before `main` runs, in dependency
+  order: a global whose initializer reads another global, directly or
+  through the functions it calls, in this module or another, is
+  initialized after it. Independent globals keep declaration order. A
+  cycle (`val a = b + 1` with `val b = a + 1`, also through functions or
+  across modules) is a compile error,
+  `global.initialization-cycle:a->b->a`, at run time and under `#` alike.
+  So no initializer can see a global that isn't initialized yet.
 - A local lives from its declaration to the end of its block. A local in a
   nested block may shadow an outer local, a parameter or a field; the outer
   one is visible again after the block, including to closures that captured
@@ -216,6 +222,13 @@ fun main {
 - Two locals of one block can't share a name (`local.duplicate`), and a
   function's or lambda's body can't redeclare one of its parameters
   (`local.shadows-parameter`).
+
+> Known issue (being fixed by ct-infer): today a direct reference moves a
+> global after the others instead of right after its dependency, a
+> dependency through a function isn't followed (the read sees `0`, `""` or
+> an empty object), cycles compile and read zero values, and a cycle read
+> under `#` crashes the compiler. Keep initializers free of calls that read
+> other globals.
 
 ```abla
 import "abla/io"
@@ -368,11 +381,10 @@ fun main {
 
 - An array literal's elements must share one type (`array.element-type`).
   An empty literal needs a declared type.
-
-> Known issue (being fixed by ablac-frontend): the constructor forms
-> `array<int>()` and `Map<string, int>()` are going to mean the same as
-> `val x: array<int> = []` and `val m: Map<string, int> = Map()`. Today they
-> are parse errors; declare the type on the binding instead.
+- A declared type flows into the literal: in
+  `val grid: array<array<int>> = [[1], []]` the inner `[]` is an
+  `array<int>`, and `val names: array<string?> = ["a", null]` accepts the
+  `null`. The same holds for a declared result or parameter type.
 - `append(value)` adds at the end, `truncate(n)` keeps the first `n`
   elements (`n` beyond the size keeps all), `clear()` removes all, and
   `filledArray(count, value)` creates a filled array. A negative count for
@@ -383,6 +395,13 @@ fun main {
 - Changing an array you received as a parameter needs a `var` parameter
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)). An array of
   resources owns its elements.
+
+> Known issue (being fixed by ablac-frontend): the constructor forms
+> `array<int>()` and `Map<string, int>()` are going to mean the same as
+> `val x: array<int> = []` and `val m: Map<string, int> = Map()`. Today they
+> are parse errors; declare the type on the binding instead. Also today,
+> only a top-level empty literal takes the declared type: nested empty
+> literals and `null` elements are `array.element-type`.
 
 > Known issue (being fixed by ct-rt): out-of-bounds accesses, `truncate`
 > with a negative count or one beyond the size, and a negative `filledArray`
@@ -470,6 +489,8 @@ fun main {
   as `member:nullable:Node.value` or `arithmetic.type@..:nullable:i64:i64`.
 - In a `when` whose subject is a nullable `val` or parameter, the arms after
   a `null ->` arm see the non-null type.
+- There is no safe-call `?.` and no `?:` operator: check `x != null`, which
+  narrows a `val`.
 
 > Known issue (being fixed by ct-infer): today the arms after `null ->`
 > still see the nullable type (`string.interpolation:nullable:string` in
