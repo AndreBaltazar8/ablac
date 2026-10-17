@@ -183,6 +183,7 @@ test: ablac
 	tools/test-integer-narrowing.sh $(COMPILER)
 	tools/test-resource-drop-link.sh $(COMPILER)
 	tools/test-runtime-checks.sh $(COMPILER)
+	tools/test-float-integer-saturation.sh $(COMPILER)
 
 check: test self-rebuild
 

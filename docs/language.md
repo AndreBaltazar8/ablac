@@ -385,8 +385,11 @@ fun main {
 // 0.10000000149011612
 ```
 
-Both operands of float arithmetic must have the same width. Floats work at
-compile time too, with identical results.
+Both operands of float arithmetic must have the same width. A float to
+integer conversion (`f64ToInt`, `f32ToI32`, `f32ToU32`) truncates toward zero
+and saturates: a value beyond the integer type gives its smallest or largest
+value, and NaN gives 0, on every target. Floats work at compile time too, with
+identical results.
 
 ### Strings
 
