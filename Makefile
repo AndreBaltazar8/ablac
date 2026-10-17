@@ -137,6 +137,8 @@ test: ablac
 	tools/test-region-escape-operators.sh $(COMPILER)
 	tools/test-diagnostic-noise.sh $(COMPILER)
 	tools/test-compile-time-lift.sh $(COMPILER)
+	tools/test-compile-time-diagnostics.sh $(COMPILER)
+	PARITY_SET=probes tools/test-compile-time-parity.sh $(COMPILER)
 	tools/test-optimize-o1.sh $(COMPILER)
 	tools/test-map.sh $(COMPILER)
 	tools/test-xtensa-interrupt-handler.sh $(COMPILER)
