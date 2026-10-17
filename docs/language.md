@@ -598,8 +598,9 @@ fun main {
 
 `fun Type.name(...)` adds a function that is called like a method. The
 receiver may be any type: a class, a scalar, `array<int>`, `Map<string, int>`
-or a nullable `string?`. Inside it, `this` is the receiver. Fields of the
-receiver are currently read through `this`:
+or a nullable `string?`. Inside it, `this` is the receiver, and, as in a
+method, the receiver's fields and methods are meant to be in scope by name
+(until the known issue below is fixed, write `this.`):
 
 ```abla
 import "abla/io"
@@ -623,8 +624,8 @@ fun main {
 ```
 
 > Known issue (being fixed by ablac-frontend): inside an extension function,
-> the receiver's fields aren't yet in scope by name as they are in a method;
-> `x` instead of `this.x` reports `identifier:x`.
+> the receiver's fields and methods aren't yet in scope by name as they will
+> be in a method; `x` instead of `this.x` reports `identifier:x`.
 
 ### Lambdas and closures
 
@@ -664,6 +665,14 @@ fun main {
   `calls`. Captures outlive the call that created them, and `this` is
   captured the same way.
 - A function name is a function value (`apply(5, double)`).
+- A call resolves to a local or parameter holding a function first, then a
+  member of the receiver, then a top-level function, so a callback
+  parameter named like a global function calls the callback.
+
+> Known issue (being fixed by ct-parity): today a call through a parameter
+> or local that has the same name as a top-level function calls the
+> top-level function instead (`function.arity:<name>`). Give such callbacks
+> distinct names for now.
 - `return` inside a lambda returns from the lambda.
 - Lambdas that change a capture are `FnMut`, and `move { ... }` lambdas are
   `FnOnce`. Both are affine
@@ -676,7 +685,8 @@ fun main {
 
 A class declares its properties in its primary constructor: `val` for
 read-only, `var` for mutable. Its body holds methods. Inside a method,
-properties are in scope by name, and `this` is the receiver:
+the receiver's properties and methods are in scope by name, and `this` is
+the receiver itself:
 
 ```abla
 import "abla/io"
@@ -706,9 +716,17 @@ fun main {
 
 - Construction is a call: `Point(3, 4)`, with defaults and named arguments
   like any function (`constructor.arity`, `constructor.argument`).
+- A name in a method resolves to, in order: a local or parameter, a member
+  of the receiver, then a top-level declaration. So a property or method
+  named like a global function wins inside the class, and a parameter wins
+  over both.
 - A class body contains only methods (`fun`, `operator fun`, `trusted fun`,
   `noescape fun`). Properties belong in the constructor
   (`E_PARSE_CLASS_MEMBER`).
+
+> Known issue (being fixed by ct-parity): today a method can't call another
+> method of its class by name (`area()` reports `call.target:area`; write
+> `this.area()`).
 - Objects are references: assigning one shares it. Changing an object through
   a parameter needs a `var` parameter, and the compiler checks aliases
   ([ownership.md](ownership.md#changing-objects-through-references)).
