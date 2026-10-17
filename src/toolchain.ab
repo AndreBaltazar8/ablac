@@ -1232,17 +1232,10 @@ fun bootstrapGraphCompileCapabilitiesCacheable(
             }
             action = action + 1
         }
-        val declarations =
-            graph.orderedSnapshots[module].discovery.declarations
-        var declaration = 0
-        while (declaration < declarations.size) {
-            if (bootstrapDeclarationContainsCall(
-                declarations[declaration],
-                "compilerBuildProgram"
-            )) cacheable = false
-            declaration = declaration + 1
-        }
         module = module + 1
+    }
+    if (cacheable && bootstrapGraphCompileCodeReaches(graph, "compilerBuildProgram")) {
+        cacheable = false
     }
     cacheable
 }
@@ -1316,6 +1309,76 @@ fun bootstrapExpressionContainsCall(
         child = child + 1
     }
     found
+}
+
+// Whether code that runs during compilation can call `name`: what the graph's
+// top-level actions and its `#` expressions (in any declaration) reach, through
+// every declaration they name, by name alone (a method or an overload of that name
+// counts; so does a string literal, which may name a finalizer). A declaration that
+// merely exists (a library's wrapper no compile code calls) does not count.
+fun bootstrapGraphCompileCodeReaches(
+    graph: BootstrapModuleGraph,
+    name: string
+): bool {
+    val declarations: array<BootstrapDeclaration> = []
+    for (snapshot in graph.orderedSnapshots) {
+        for (declaration in snapshot.discovery.declarations) {
+            declarations.append(declaration)
+            for (method in declaration.methods) declarations.append(method)
+        }
+    }
+    val table = bootstrapIrNameTable(declarations.size)
+    val next: array<int> = []
+    var index = 0
+    while (index < declarations.size) {
+        next.append(table.find(declarations[index].name, -1))
+        table.put(declarations[index].name, index)
+        index = index + 1
+    }
+    val visited = filledArray(declarations.size, false)
+    val pending: array<BootstrapExpression> = []
+    for (snapshot in graph.orderedSnapshots) {
+        for (action in snapshot.discovery.actions) pending.append(action)
+    }
+    // Every `#` expression is a root; so is everything a root names.
+    for (declaration in declarations) bootstrapCollectCompileNodes(declaration, pending)
+    var found = false
+    while (!found && pending.size > 0) {
+        val node = pending[pending.size - 1]
+        pending.truncate(pending.size - 1)
+        if (node.text == name) found = true
+        for (child in node.children) pending.append(child)
+        if (node.text != "" && node.kind != "integer") {
+            var item = table.find(node.text, -1)
+            while (item >= 0) {
+                if (!visited[item]) {
+                    visited[item] = true
+                    pending.append(declarations[item].expression)
+                    for (fallback in declarations[item].parameterDefaults) pending.append(fallback)
+                }
+                item = next[item]
+            }
+        }
+    }
+    found
+}
+
+fun bootstrapCollectCompileNodes(
+    declaration: BootstrapDeclaration,
+    var into: array<BootstrapExpression>
+): void {
+    bootstrapCollectCompileExpressions(declaration.expression, into)
+    for (fallback in declaration.parameterDefaults) bootstrapCollectCompileExpressions(fallback, into)
+    return
+}
+
+fun bootstrapCollectCompileExpressions(
+    expression: BootstrapExpression,
+    var into: array<BootstrapExpression>
+): void {
+    if (expression.kind == "compile") into.append(expression)
+    else for (child in expression.children) bootstrapCollectCompileExpressions(child, into)
+    return
 }
 
 fun bootstrapDeclarationContainsCall(
