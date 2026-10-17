@@ -104,7 +104,7 @@ build_and_run() { # dir tag entry mode
 
 run_case() { # kind name source mode
     local kind=$1 name=$2 source=$3 mode=$4
-    local dir=$output/cases/$mode/$name status detail
+    local dir=$output/cases/$mode/$name status detail granted=""
     mkdir -p "$dir"
     if [[ $kind == probe ]]; then
         if [[ $(basename "$source") == main.ab ]]; then
@@ -142,6 +142,20 @@ run_case() { # kind name source mode
         detail="runtime $(cat "$dir/runtime.status"): $(first_error "$dir/runtime.err")"
     else
         build_and_run "$dir" staged staged.ab "$mode"
+        # Native code at compile time is the program's own trusted code running
+        # in the compiler: it needs the trusted.native grant, which a module
+        # case asks for when that was all it was denied.
+        if [[ $kind == module && $(cat "$dir/staged.status") == build* ]] &&
+            grep -q 'compile.effect-denied:trusted.native' "$dir/staged.err" &&
+            ! grep -v 'compile.effect-denied:trusted.native' "$dir/staged.err" |
+                grep -q '^error\[E_SEMANTIC\]: compile.effect-denied'; then
+            granted=" (granted trusted.native)"
+            printf 'compileCapabilities = ["trusted.native"]\n' >"$dir/abla.toml"
+            { printf 'import "abla/compiler"\n#compilerGrant("trusted.native")\n'
+              cat "$dir/staged.ab"; } >"$dir/staged.granted.ab"
+            mv "$dir/staged.granted.ab" "$dir/staged.ab"
+            build_and_run "$dir" staged staged.ab "$mode"
+        fi
         case $(cat "$dir/staged.status") in
             "build 124" | "build 137" | "build 152")
                 status=timeout
@@ -155,7 +169,7 @@ run_case() { # kind name source mode
             *)
                 if cmp -s "$dir/runtime.out" "$dir/staged.out"; then
                     status=pass
-                    detail=""
+                    detail="${granted:-}"
                 else
                     status=mismatch
                     detail="runtime $(tr '\n' ' ' <"$dir/runtime.out" | cut -c1-90)| staged $(tr '\n' ' ' <"$dir/staged.out" | cut -c1-90)"
@@ -166,6 +180,7 @@ run_case() { # kind name source mode
     # Keep only what a failure needs; the copies of the module tree go.
     if [[ $kind == module ]]; then
         find "$dir" -mindepth 1 -maxdepth 1 ! -name 'runtime*' ! -name 'staged*' \
+            ! -name 'abla.toml' \
             -exec rm -rf {} +
     fi
     printf '%s\t%s\t%s\t%s\n' "$name" "$mode" "$status" "$detail" >"$dir/result.tsv"
