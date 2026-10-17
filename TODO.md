@@ -41,10 +41,6 @@ called out below.
   with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
   `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
   not `parameterDefaults` (a method's defaults likewise).
-- [ ] **Compile-time effects are charged to calls by name.** `expressionCompileEffects`
-  attributes `name(...)` to the top-level function of that name, so a local closure named
-  like an effectful function is charged its effects and can be denied wrongly (never allowed
-  wrongly). Resolve the callee as the call itself is resolved (locals and fields first).
 - [ ] **`tools/test-affine-move.sh` is stale.** It is in neither the Makefile nor
   `abla-tests.json`, and fails on master before its fixtures: one of its native builds
   stops at the link (`_abla_array_get` undefined). Its CFG-ownership fixtures still expect

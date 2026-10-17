@@ -2,7 +2,8 @@
 # What a failed build says: a compile-time evaluation failure names its file,
 # line and column and is the whole diagnosis (no code-generation noise after
 # it); positions count characters; a missing entry file and a program with
-# no main each say so once, with the error count matching the error lines.
+# no main each say so once, with the error count matching the error lines;
+# compile-time effects follow scope.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -88,5 +89,17 @@ grep -q '^error\[E_SOURCE_NOT_FOUND\]: no such file: missing.ab$' "$log" ||
 ! grep -q 'E_NO_MAIN' "$log" || fail "missing: reported as no main" "$log"
 if (cd "$cases" && "$compiler" run missing.ab) >"$log" 2>&1; then fail "run missing ran" "$log"; fi
 grep -q 'E_SOURCE_NOT_FOUND' "$log" || fail "run missing: not reported" "$log"
+
+# Effects follow scope: a parameter or local named like an effectful function
+# isn't charged its effects, a call of the function itself is.
+log=$output/scoped-effects.log
+build_fails scoped-call-effects.ab "$log"
+[[ $(grep -c '^error\[E_SEMANTIC\]: compile.effect-denied:' "$log") -eq 2 ]] ||
+    fail "scoped effects: not two denials" "$log"
+grep -q 'effect-denied:trusted.native:printsInBody->loud->println->' "$log" ||
+    fail "scoped effects: a call beside a lambda parameter not charged" "$log"
+grep -q 'effect-denied:trusted.native:printsBeforeLocal->later->println->' "$log" ||
+    fail "scoped effects: a call before a local not charged" "$log"
+! grep -q 'allowed\|quiet' "$log" || fail "scoped effects: a parameter charged" "$log"
 
 echo "compile-time diagnostics: located, counted, no code-generation noise"

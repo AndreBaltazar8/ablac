@@ -3181,7 +3181,8 @@ fun bootstrapExpressionDelegatedCompileEffects(
     typeMap: BootstrapEffectTypeMap = BootstrapEffectTypeMap([], [], [], []),
     scopeNames: array<string> = [],
     scopeTypes: array<string> = [],
-    owner: string = ""
+    owner: string = "",
+    bound: array<string> = []
 ): int {
     var mask = 0
     if (expression.kind == "identifier" &&
@@ -3192,9 +3193,13 @@ fun bootstrapExpressionDelegatedCompileEffects(
         bootstrapAffineNamesContain(delegatedNames, expression.text)) {
         mask = bootstrapCompileEffectLookup(summary, "setValue", true)
     }
+    // A call of a name in scope there (a parameter, an earlier local of the
+    // block, a loop variable, a lambda parameter) calls that value, not the
+    // top-level function of that name.
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
-        expression.text != "Cell" && expression.text != "Map") {
+        expression.text != "Cell" && expression.text != "Map" &&
+        !bootstrapAffineNamesContain(bound, expression.text)) {
         mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,
             expression.text,
@@ -3221,23 +3226,57 @@ fun bootstrapExpressionDelegatedCompileEffects(
     if (expression.kind == "delegate.project") end = 0
     if (expression.kind == "delegate.assign") begin = 1
     if (expression.kind == "delegate.initializer") end = 1
+    // What the children see: a lambda's parameters and a loop's variable in
+    // its body, and each local from the statement after it on.
+    var inner: array<string> = []
+    var extended = false
+    var parameters = 0
+    if (expression.kind == "lambda" || expression.kind == "lambda.move") {
+        parameters = expression.children.size - 1
+        inner = bootstrapEffectBind(bound, expression.children, parameters)
+        extended = true
+    }
     var child = begin
     while (child < end) {
-        mask = bootstrapCompileEffectMerge(
-            mask,
-            bootstrapExpressionDelegatedCompileEffects(
-                expression.children[child],
-                summary,
-                delegatedNames,
-                typeMap,
-                scopeNames,
-                scopeTypes,
-                owner
+        if (child == 1 && expression.kind == "for") {
+            inner = bootstrapEffectBind(bound, [expression], 1)
+            extended = true
+        }
+        if (child >= parameters) {
+            val childMask = if (extended) bootstrapExpressionDelegatedCompileEffects(
+                expression.children[child], summary, delegatedNames, typeMap,
+                scopeNames, scopeTypes, owner, inner
+            ) else bootstrapExpressionDelegatedCompileEffects(
+                expression.children[child], summary, delegatedNames, typeMap,
+                scopeNames, scopeTypes, owner, bound
             )
-        )
+            mask = bootstrapCompileEffectMerge(mask, childMask)
+        }
+        val statement = expression.children[child]
+        if (statement.kind == "local.val" || statement.kind == "local.var") {
+            inner = if (extended) bootstrapEffectBind(inner, [statement], 1)
+                else bootstrapEffectBind(bound, [statement], 1)
+            extended = true
+        }
         child = child + 1
     }
     mask
+}
+
+/** `bound` and the names of the first `count` of `binders`. */
+fun bootstrapEffectBind(
+    bound: array<string>,
+    binders: array<BootstrapExpression>,
+    count: int
+): array<string> {
+    val names: array<string> = []
+    for (name in bound) names.append(name)
+    var index = 0
+    while (index < count && index < binders.size) {
+        names.append(binders[index].text)
+        index = index + 1
+    }
+    names
 }
 
 fun bootstrapBuildCompileEffectSummary(
@@ -3341,6 +3380,7 @@ fun bootstrapBuildCompileEffectSummary(
     val entryOwners: array<string> = []
     val entryExpressions: array<BootstrapExpression> = []
     val entryWalked: array<bool> = []
+    val entryParameters: array<array<string>> = []
     declarationIndex = 0
     while (declarationIndex < declarations.size) {
         val declaration = declarations[declarationIndex]
@@ -3367,6 +3407,7 @@ fun bootstrapBuildCompileEffectSummary(
             entryOwners.append(declaration.extensionOwner)
             entryExpressions.append(declaration.expression)
             entryWalked.append(declaration.kind != "extern")
+            entryParameters.append(declaration.parameters)
         }
         var methodIndex = 0
         while (methodIndex < declaration.methods.size) {
@@ -3398,6 +3439,7 @@ fun bootstrapBuildCompileEffectSummary(
             entryOwners.append(declaration.name)
             entryExpressions.append(method.expression)
             entryWalked.append(method.kind != "extern")
+            entryParameters.append(method.parameters)
             methodIndex = methodIndex + 1
         }
         declarationIndex = declarationIndex + 1
@@ -3446,7 +3488,8 @@ fun bootstrapBuildCompileEffectSummary(
                 typeMap,
                 entryScopeNames[entry],
                 entryScopeTypes[entry],
-                entryOwners[entry]
+                entryOwners[entry],
+                entryParameters[entry]
             )
             val merged = bootstrapCompileEffectMerge(masks[entry], inferred)
             grew = merged != masks[entry]
