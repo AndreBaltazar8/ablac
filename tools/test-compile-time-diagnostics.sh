@@ -6,6 +6,7 @@
 set -euo pipefail
 
 compiler=${1:-build/ablac}
+[[ $compiler == /* ]] || compiler=$PWD/$compiler
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cases=$project_root/tests/cases/diagnostics
 output=$project_root/build/compile-time-diagnostics
