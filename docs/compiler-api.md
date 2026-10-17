@@ -1,12 +1,61 @@
 # Compiler API
 
-Status: bootstrap API, version 0.2. The module is imported with
-`import "abla/compiler"` and is available only to compile-time code.
+`import "abla/compiler"` gives compile-time code a view of the program being
+compiled, and controlled ways to change it. It is available only at compile
+time: in `compile fun`s, `#` expressions and top-level actions
+([compile-time.md](compile-time.md)). This page describes API version 0.2.
 
-The public surface is the compile-time-only `compiler: Compiler` service:
+Everything goes through one object, `compiler`. Declarations are named by
+*handles*: opaque integers that are stable for one compilation.
+
+## Reflection: reading the program
 
 ```abla
+import "abla/io"
 import "abla/compiler"
+
+@route("/users")
+fun listUsers(page: int): string = "users page $page"
+
+@route("/orders")
+fun listOrders(page: int): string = "orders page $page"
+
+fun helper(): int = 0
+
+compile fun routeTable(): array<string> {
+    val rows: array<string> = []
+    for (function in compiler.functionsAnnotated("route")) {
+        val name = compiler.functionName(function)
+        val first = compiler.parameterType(function, 0)
+        rows.append("$name($first) -> ${compiler.resultType(function)}")
+    }
+    rows
+}
+
+fun main {
+    for (row in #routeTable()) println(row)
+}
+// output:
+// listUsers(i64) -> string
+// listOrders(i64) -> string
+```
+
+`routeTable` runs inside the compiler, and the program receives its result
+as a constant array. Types are reported in their canonical spelling (`int`
+is `i64`). Annotation names are reflected, but their arguments (the
+`"/users"` above) are not yet.
+
+## Transforms: changing the program
+
+A transform is a zero-argument `compile fun` registered with a top-level
+`#compiler.transform(handler)`. It runs before final semantic analysis and
+may replace function bodies and add annotations. The changed program is then
+checked completely, as if it had been written that way:
+
+```abla
+import "abla/io"
+import "abla/compiler"
+
 @client
 fun answer(value: int): int = value + 1
 
@@ -19,12 +68,34 @@ compile fun configure(): void {
 }
 
 #compiler.transform(configure)
+
+fun main {
+    println("${answer(40)}")
+}
+// output:
+// 42
 ```
 
-Its methods group reflection, validated transforms, files, targets, child
-programs, artifact roots, and foreign exports behind one coherent object. The
-standalone `compiler...` externs remain the versioned bootstrap ABI used by the
-standard library; new extension code should prefer the service object.
+## The `compiler` service at a glance
+
+| Methods | Purpose |
+|---|---|
+| `functions()`, `findFunction(name)`, `functionsAnnotated(annotation)` | find function handles (`-1` when not found) |
+| `functionName`, `functionIdentity`, `functionModuleIdentity`, `functionOwner`, `parameterCount`, `parameterName`, `parameterType`, `resultType`, `annotationCount`, `annotation`, `isCompileOnly`, `isTrusted`, `isExternal` | read a function's signature and metadata |
+| `bindings()`, `findBinding(name)`, `bindingName`, `bindingIsMutable`, `bindingIsDelegated`, `bindingExposedType`, `bindingDelegateType`, `bindingGetter`, `bindingSetter`, `bindingCanReplaceDelegate`, `bindingByBegin`, `bindingByEnd` | read top-level bindings ([below](#binding-reflection)) |
+| `transform(handler)` | register a transform (only as a literal top-level action) |
+| `replaceFunctionBody(function, source)`, `addFunctionAnnotation(function, name)` | change the program, from a transform |
+| `function(name)`, `reference(handle)` | a `FunctionReference`, for building other programs |
+| `newModule(name)` | an `IndependentModule`: a separate program built from chosen functions ([below](#independent-modules-and-declaration-blocks)) |
+| `buildProgram(...)`, `defineTarget(...)`, `contributeArtifactRoot(...)` | [programmable builds](programmable-builds.md) |
+| `exportFunction`, `exportCheckedFunction`, `internalFunction`, `requiredInternalFunction` | [foreign exports](#programmable-build-nodes) |
+| `writeFile(path, contents)` | stage an output file (needs `filesystem.write`) |
+
+The lower-level `compiler*` functions (`compilerFindFunction`, ...) are the
+versioned ABI underneath; the standard library uses them, and new code should
+prefer the `compiler` methods. Typed inspection of expressions, used by
+subparser finalizers, is in `abla/compiler/parser` ([below](#typed-dependency-and-mutation-reflection)
+and [subparsers.md](subparsers.md)).
 
 ## Function reflection
 
