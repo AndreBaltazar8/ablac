@@ -10,10 +10,20 @@ in Abla and contain no privileged provider logic in stage 0.
 An embedded expression begins with `$` and a registered parser name:
 
 ```abla
-val document = $json {"testKey": "value"}
-val view = $html <div>{count + 20}</div>
-val frozen = #$json {"answer": 42}
-val encoded = #$jsons {"answer": 42}
+import "abla/io"
+import "abla/json"
+import "abla/html"
+
+fun main {
+    val count = 1
+    val document = $json {"testKey": "value"}
+    val view = $html <div>{count + 20}</div>
+    val frozen = #$json {"answer": 42}
+    val encoded = #$jsons {"answer": 42}
+    println("${document.get("testKey").asString()} ${frozen.getInt("answer")} $encoded ${view.tag}")
+}
+// output:
+// value 42 {"answer":42} div
 ```
 
 The named subparser always runs during compilation because it extends the
@@ -29,6 +39,111 @@ keys and values are handed back to the base parser as Abla expressions. The
 companion `$jsons` provider delegates to that grammar and wraps the resulting
 tree in deterministic `jsonStringify`; `#$jsons` therefore leaves a validated
 static string in the runtime program.
+
+## Writing a subparser
+
+A subparser is a `compile fun` that takes a `ParserCursor` and returns a
+`SyntaxExpression`, the expression that replaces `$name ...` in the
+program. Register it with a top-level `#compilerRegisterSubparser("name",
+handler)`. From then on, the module (and every module that imports it) can
+write `$name`:
+
+```abla
+import "abla/io"
+import "abla/text"
+import "abla/compiler/parser"
+
+// $twice(expression): hand the inside back to the Abla parser, double it.
+compile fun parseTwice(cursor: ParserCursor): SyntaxExpression {
+    parserExpect(cursor, "(")
+    val inner = parserParseAblaExpression(cursor)
+    parserExpect(cursor, ")")
+    syntaxBinary("*", inner, syntaxInteger(2))
+}
+
+// $shout[any text]: read raw source text, upper-case it at compile time.
+compile fun parseShout(cursor: ParserCursor): SyntaxExpression {
+    parserRawExpect(cursor, "[")
+    val text = parserRawTakeUntil(cursor, "]")
+    parserRawExpect(cursor, "]")
+    syntaxString(text.uppercase() + "!")
+}
+
+// $squares 4: build the array literal [1, 4, 9, 16].
+compile fun parseSquares(cursor: ParserCursor): SyntaxExpression {
+    parserRawSkipWhitespace(cursor)
+    val digits = parserRawTakeUntil(cursor, " \n)],;")
+    var count = 0
+    for (d in digits) {
+        if (d < 48 || d > 57) parserFail(cursor, "expected a number after \$squares")
+        count = count * 10 + d - 48
+    }
+    val items: array<SyntaxExpression> = []
+    for (i in 1..count) items.append(syntaxInteger(i * i))
+    syntaxArray(items)
+}
+
+#compilerRegisterSubparser("twice", parseTwice)
+#compilerRegisterSubparser("shout", parseShout)
+#compilerRegisterSubparser("squares", parseSquares)
+
+fun main {
+    val n = 20
+    println("${$twice(n + 1)}")
+    println($shout[hello, world])
+    val table = $squares 4
+    println("${table.size} ${table[3]}")
+}
+// output:
+// 42
+// HELLO, WORLD!
+// 4 16
+```
+
+The cursor starts right after the name. A handler reads the source in one
+of two ways:
+
+- **Tokens**, as the Abla lexer sees them: `parserAt`, `parserConsume`,
+  `parserExpect`, `parserCurrentText`, and `parserTextAhead(cursor, n)` to
+  look ahead without consuming. `parserParseAblaExpression` parses one whole
+  Abla expression, which may itself contain other `$name` subparsers.
+- **Raw bytes**, for text that isn't Abla: `parserRawAt`, `parserRawConsume`,
+  `parserRawExpect`, `parserRawTakeUntil(cursor, delimiterBytes)`,
+  `parserRawTakeUntilText(cursor, delimiter)`, `parserRawTakeName`,
+  `parserRawTakeSymbol`, `parserRawSkipWhitespace`, `parserRawEnd`, and
+  `parserRawPosition` for spans.
+
+It builds its result with the `syntax*` builders: `syntaxInteger`,
+`syntaxString`, `syntaxBoolean`, `syntaxNull`, `syntaxIdentifier`,
+`syntaxBinary`, `syntaxArray`, `syntaxCall`, `syntaxMember`, `syntaxIndex`,
+`syntaxIf`, `syntaxBlock`, `syntaxLocal`, `syntaxVariable`, `syntaxAssign`,
+`syntaxReturn`, `syntaxLambda` and `syntaxInferredLambda`. A syntax handle
+is consumed when it is put into another node.
+
+`parserFail(cursor, message)` reports an error at the cursor. The build
+stops with that message:
+
+```abla error
+import "abla/compiler/parser"
+
+compile fun parseOne(cursor: ParserCursor): SyntaxExpression {
+    parserRawSkipWhitespace(cursor)
+    if (parserRawTakeName(cursor) != "one") parserFail(cursor, "expected the word one")
+    syntaxInteger(1)
+}
+
+#compilerRegisterSubparser("one", parseOne)
+
+fun main: int = $one two
+// error: E_SUBPARSER_FAILURE
+// error: expected the word one
+```
+
+The returned expression is ordinary, phase-neutral Abla. `$twice(n + 1)`
+runs at run time, and `#$twice(20)` would run at compile time. The handler
+itself always runs at compile time, with compile-time rules: it may use
+`compile val` state, and it needs [capabilities](compile-time.md#capabilities-files-environment-processes-network)
+to read files or the environment.
 
 ## Registration staging
 
