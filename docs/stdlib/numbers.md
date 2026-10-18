@@ -58,10 +58,23 @@ on every target and at compile time.
 | `f32FromI32`, `f32FromU32`, `f32ToI32`, `f32ToU32` | between `f32` and 32-bit integers; `f32ToI32`/`f32ToU32` truncate toward zero, saturate and give 0 for NaN, like `f64ToInt` |
 | `f64ToBits(x)`, `f64FromBits(n)`, `f32ToBits(x)`, `f32FromBits(n)` | to and from IEEE bit patterns |
 
-> Known issue (being fixed by ablac-backend): today `f32ToI32` and
-> `f32ToU32` give arbitrary values at run time for NaN and out-of-range
-> input (saturated values under `#`). Check `isNaN` and the range before
-> converting.
+```abla
+import "abla/io"
+import "abla/float"
+
+fun main {
+    val nan = f64ToF32(0.0 / 0.0)
+    val big = f64ToF32(1.0e20)
+    val small = f64ToF32(-1.0e20)
+    println("${f32ToI32(nan)} ${f32ToI32(big)} ${f32ToI32(small)} ${f32ToI32(f64ToF32(-7.9))}")
+    println("${f32ToU32(nan)} ${f32ToU32(big)} ${f32ToU32(small)}")
+}
+// output:
+// 0 2147483647 -2147483648 -7
+// 0 4294967295 0
+```
+
+The same values come out at run time and under `#`.
 
 ## `abla/bits` and `abla/integer`
 

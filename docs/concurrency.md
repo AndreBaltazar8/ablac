@@ -265,9 +265,24 @@ A panic inside a thread also ends the whole process at once, with the
 message on standard error and exit status 101; other threads don't keep
 running, and `await` doesn't catch it.
 
-> Known issue (being fixed by ct-rt): today a panic on any thread or task
-> (an index out of bounds, for example) exits with status 133 and prints no
-> reason under `ablac run`.
+```abla
+import "abla/io"
+
+fun main: int {
+    println("starting")
+    val worker = thread {
+        val values = [1, 2, 3]
+        values[7]            // panics on the worker thread
+    }
+    await worker
+}
+// output:
+// starting
+// exit: 101
+```
+
+The worker's reason, `panic: index 7 out of bounds for array of size 3`,
+goes to standard error, the same for a task and under `ablac run`.
 
 ```abla error
 fun main {

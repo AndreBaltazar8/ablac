@@ -452,10 +452,6 @@ fun main {
 - An empty literal needs an expected type, or names it: `array<int>()` is
   `[]` as an `array<int>`, usable wherever an expression goes
   (`val names = array<string>()`, `total(array<int>())`).
-- A declared type flows into the literal: in
-  `val grid: array<array<int>> = [[1], []]` the inner `[]` is an
-  `array<int>`, and `val names: array<string?> = ["a", null]` accepts the
-  `null`. The same holds for a declared result or parameter type.
 - `append(value)` adds at the end, `truncate(n)` keeps the first `n`
   elements (all of them when `n` is at least the size), `clear()` removes
   all, and `filledArray(count, value)` creates a filled array.
@@ -475,11 +471,22 @@ fun main {
 > Annotate the local (`val rows: array<array<int?>> = makeRows()`) until
 > then.
 
-> Known issue (being fixed by ct-rt): out-of-bounds accesses, `truncate`
-> with a negative count or one beyond the size, and a negative `filledArray`
-> count currently stop the program with "fatal signal" and a stack trace but
-> no reason, and ordered comparison of strings type-checks but crashes the
-> native program.
+```abla
+import "abla/io"
+
+fun main {
+    val xs = [1, 2, 3]
+    xs.truncate(10)          // keeps all three
+    println("${xs.size}")
+    println("${xs[5]}")      // panics: index 5 out of bounds for array of size 3
+}
+// output:
+// 3
+// exit: 101
+```
+
+The reason goes to standard error: `panic: index 5 out of bounds for array
+of size 3`.
 
 ### Maps
 
@@ -715,10 +722,25 @@ fun main {
 - Parameters borrow their arguments; `var` and `own` change that
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)).
 - Recursion is limited by the thread's stack. Running out of stack panics
-  with "stack overflow".
+  with `panic: stack overflow` on standard error and exit status 101:
 
-> Known issue (being fixed by ct-rt): today a stack overflow ends the
-> program with exit status 139 and no message.
+```abla
+import "abla/io"
+
+fun depth(n: int): int {
+    val local = [n, n + 1]
+    if (n == 0) return local[0]
+    local[1] + depth(n - 1) + local[0]
+}
+
+fun main: int {
+    println("deep")
+    depth(100000000) % 256   // panics: stack overflow
+}
+// output:
+// deep
+// exit: 101
+```
 
 An inferred result works the same for functions, methods, extensions and
 compile funs, at runtime and under `#`:
