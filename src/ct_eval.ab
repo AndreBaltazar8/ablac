@@ -50,13 +50,15 @@ val BOOTSTRAP_CT_UNPREPARED = "the program has semantic errors"
 // A compile global the live generation holds (`compile val` / `compile var`): its
 // declaration, keep-store key, type, the journal text last exchanged with the
 // keep-store (which an interpreted evaluation may have changed since), and the
-// address of the generation's getter for it.
+// addresses of the generation's getter for it and, for an int or bool `compile var`,
+// its setter (0: none), through which a value the evaluator changed goes back in.
 class BootstrapCtGlobal(
     val declaration: int,
     val key: string,
     val type: string,
     var exchanged: string,
-    var getter: int
+    var getter: int,
+    var setter: int = 0
 )
 
 // A guarded native call's result, or how it stopped: 1 an abort, 2 a failed runtime
@@ -218,13 +220,17 @@ trusted fun bootstrapCtTryEvaluate(
     if (bootstrapCtGenerationSpent != "") return bootstrapCtNotTaken(bootstrapCtGenerationSpent)
     // The generation's compile globals are the keep-store's: an interpreted evaluation
     // that changed one since leaves this generation's copy stale.
+    // A changed int or bool `compile var` goes back in through its setter; any other
+    // change leaves the generation stale.
     for (global in bootstrapCtGlobals) {
-        if (global.getter != 0 &&
-            bootstrapCompileGlobalEncode(bootstrapCompileGlobalLoad(global.key, declarations, [])) !=
-            global.exchanged) {
-            bootstrapCtGenerationSpent =
-                "compile global ${global.key} changed in an interpreted evaluation"
-            return bootstrapCtNotTaken(bootstrapCtGenerationSpent)
+        if (global.getter != 0) {
+            val kept = bootstrapCompileGlobalLoad(global.key, declarations, [])
+            if (bootstrapCompileGlobalEncode(kept) != global.exchanged &&
+                !bootstrapCtPushGlobal(global, kept)) {
+                bootstrapCtGenerationSpent =
+                    "compile global ${global.key} changed in an interpreted evaluation"
+                return bootstrapCtNotTaken(bootstrapCtGenerationSpent)
+            }
         }
     }
     // The evaluation's context, as the interpreter builds it: compiler callbacks
@@ -312,6 +318,19 @@ trusted fun bootstrapCtExchangeGlobals(var evaluator: BootstrapEvaluator, site: 
         index = index + 1
     }
     return
+}
+
+// Stores `value` into the generation's copy of `global` through its setter; false
+// when it has none or the value is not the setter's kind.
+trusted fun bootstrapCtPushGlobal(var global: BootstrapCtGlobal, value: BootstrapEvalValue): bool {
+    if (global.setter == 0) return false
+    val word = if (value.kind == "integer" && (global.type == "int" || global.type == "i64")) value.integer
+        else if (value.kind == "boolean" && global.type == "bool") (if (value.boolean) 1 else 0)
+        else return false
+    val stored = ablaUnsafeCallExact_I64_I64(global.setter, word)
+    global.exchanged = bootstrapCompileGlobalEncode(value)
+    bootstrapCtNote("compile global ${global.key} changed in an interpreted evaluation: passed in")
+    true
 }
 
 // A fresh evaluation context, exactly as bootstrapEvaluateWithEffectsIn makes one.
