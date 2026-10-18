@@ -108,9 +108,8 @@ build_and_run() { # dir tag entry mode
 }
 
 # Cases whose run here depends on the host, so matching outputs are both sides
-# agreeing on a failure, not parity.
-host_dependent='module/hosted-network	the ::1 TCP listener and UDP poller fail natively on macOS
-module/http-client	its client expects a server on 127.0.0.1:39092 (tools/test-http-client.sh starts one)'
+# agreeing on a failure, not parity ("<case>\t<reason>" lines; none today).
+host_dependent=''
 
 host_dependent_reason() { # name
     awk -F'\t' -v n="$1" '$1 == n { print $2 }' <<<"$host_dependent"
