@@ -70,9 +70,44 @@ ABLA_EVAL_DEPTH_LIMIT=5 "$compiler" build "$output_directory/guarded.ab" \
 guarded_status=$?
 set -e
 if [[ $guarded_status -eq 0 || $guarded_status -ge 100 ]] ||
-    [[ $(grep -c '^error\[E_EVAL_STACK_DEPTH\]' "$output_directory/guarded.log") -ne 1 ]]; then
+    [[ $(grep -c '^error\[E_EVAL_STACK_DEPTH\]' "$output_directory/guarded.log") -ne 1 ]] ||
+    [[ $(grep -c '^error\[' "$output_directory/guarded.log") -ne 1 ]]; then
     printf 'deep json: the guarded #$jsons gave status %s\n' "$guarded_status" >&2
     cat "$output_directory/guarded.log" >&2
     exit 1
 fi
-echo "deep json: $depth levels compile on an 8 MB stack; the depth guard in #\$jsons is one error"
+# 1000 levels on a plain 8 MB stack: the build succeeds, or stops with exactly
+# one error, the evaluator's depth guard (no cascade from the levels it
+# unwinds, no parse of the literal it gave up on), and never crashes.
+deep=1000
+nested=1
+for ((level = 0; level < deep; level++)); do nested="[$nested]"; done
+cat > "$output_directory/deepest.ab" <<EOF
+import "abla/json"
+import "abla/io"
+
+fun main: int {
+    val encoded = #\$jsons $nested
+    println("\${encoded.size}")
+    0
+}
+EOF
+set +e
+(
+    ulimit -s 8192
+    ulimit -H -s 8192
+    ABLA_MAX_STACK_KB=8192 "$compiler" build "$output_directory/deepest.ab" \
+        -o "$output_directory/deepest" --no-cache
+) > "$output_directory/deepest.log" 2>&1
+deepest_status=$?
+set -e
+deepest_errors=$(grep -c '^error\[' "$output_directory/deepest.log" || true)
+if [[ $deepest_status -ge 100 ]] || { [[ $deepest_status -ne 0 ]] &&
+    { [[ $deepest_errors -ne 1 ]] ||
+      ! grep -q '^error\[E_EVAL_STACK_DEPTH\]' "$output_directory/deepest.log"; }; }; then
+    printf 'deep json: %s levels gave status %s with %s errors\n' \
+        "$deep" "$deepest_status" "$deepest_errors" >&2
+    sed -n '1,20p' "$output_directory/deepest.log" >&2
+    exit 1
+fi
+echo "deep json: $depth levels compile on an 8 MB stack; the depth guard in #\$jsons is one error, and $deep levels never crash"

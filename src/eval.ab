@@ -5318,8 +5318,11 @@ class BootstrapEvaluator(
             else -> bootstrapEvaluateUncommon(this, expression, form)
         }
         bootstrapEvalDepth = bootstrapEvalDepth - 1
+        // While a stack-depth stop unwinds, the levels it passes through
+        // failed because of it: it is the one diagnostic, not one per level.
+        val unwinding = bootstrapEvalDepthReported
         if (bootstrapEvalDepth == 0) bootstrapEvalDepthReported = false
-        if (this.errors > errorsBefore &&
+        if (!unwinding && this.errors > errorsBefore &&
             this.diagnostics.size == diagnosticsBefore) {
             bootstrapEvalExpressionFailed(this, expression)
         }
@@ -5584,11 +5587,30 @@ fun bootstrapEvalDepthLimit(): int {
     bootstrapEvalDepthLimitValue
 }
 
+// How many stack-depth stops have been reported, ever: a caller compares it
+// before and after an evaluation to tell whether one happened inside.
+var bootstrapEvalDepthStops: int = 0
+
+/** The number of `error[` lines in `diagnostics`. */
+fun bootstrapEvalErrorLines(diagnostics: string): int {
+    var count = 0
+    var index = 0
+    var lineStart = true
+    while (index < diagnostics.size) {
+        if (lineStart && index + 6 <= diagnostics.size &&
+            diagnostics.slice(index, index + 6) == "error[") count = count + 1
+        lineStart = diagnostics[index] == 10
+        index = index + 1
+    }
+    count
+}
+
 @noinline
 fun bootstrapEvalDepthLimitReached(var evaluator: BootstrapEvaluator): void {
     evaluator.errors = evaluator.errors + 1
     if (bootstrapEvalDepthReported) return
     bootstrapEvalDepthReported = true
+    bootstrapEvalDepthStops = bootstrapEvalDepthStops + 1
     evaluator.recordEvaluatorDiagnostic(
         "E_EVAL_STACK_DEPTH",
         "compile-time evaluation nested ${bootstrapEvalDepth} levels deep and used up the compiler's stack (unbounded recursion, or recursion deeper than the compiler's stack allows)"
@@ -9930,7 +9952,11 @@ fun bootstrapEvaluateCallParser(
             evaluator.cursors[cursor.integer].sourceIdentity
         )
     }
-    if (targetName == "parserFail") {
+    // A failure a subparser reports while a stack-depth stop unwinds through
+    // it follows from that stop, which is the one diagnostic.
+    if (targetName == "parserFail" && bootstrapEvalDepthReported) {
+        result = bootstrapEvalVoid()
+    } else if (targetName == "parserFail") {
         val cursor = evaluator.evaluate(expression.children[0])
         val message = evaluator.evaluate(expression.children[1])
         evaluator.recordEvaluatorDiagnostic(
@@ -11241,6 +11267,7 @@ fun bootstrapInvokeSubparserHandlerIn(
     cursor: BootstrapSubparserCursor,
     allowedCompileEffects: int
 ): BootstrapSubparserInvocation {
+    val stopsBefore = bootstrapEvalDepthStops
     val names: array<string> = ["cursor"]
     val values: array<BootstrapEvalValue> = [BootstrapEvalValue(
         "cursor",
@@ -11309,9 +11336,14 @@ fun bootstrapInvokeSubparserHandlerIn(
     bootstrapCompileGlobalsKeep(
         globalKeys, globalValues, evaluator.syntax, evaluator.declarations
     )
+    // After a stack-depth stop, what failed on the way out (each level's
+    // cursor or value) is that one stop: count the errors it reported.
+    val errors = if (bootstrapEvalDepthStops > stopsBefore)
+        bootstrapEvalErrorLines(evaluator.diagnostics)
+        else evaluator.errors + cursor.errors
     BootstrapSubparserInvocation(
         expression,
-        evaluator.errors + cursor.errors,
+        errors,
         evaluator.diagnostics,
         extensionRequests,
         compileInputPaths,
