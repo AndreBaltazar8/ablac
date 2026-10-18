@@ -45,6 +45,9 @@ if grep -q 'interpreted at' "$output_directory/scalars-jit.trace"; then
     cat "$output_directory/scalars-jit.trace" >&2
     exit 1
 fi
+# The trace reports each generation's size and cost by phase.
+grep -q '^note\[ct-jit\]: generation [0-9]*: [0-9]* declarations, [0-9]* functions; analysis [0-9]* ms, lowering [0-9]* ms, emission [0-9]* ms, code [0-9]* ms$' \
+    "$output_directory/scalars-jit.trace"
 # The interpreter tier never prepares a slice.
 if grep -q 'ct-jit' "$output_directory/scalars-interp.trace"; then
     echo "compile-eval-jit: the interpreter tier used the native tier" >&2
