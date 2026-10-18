@@ -440,10 +440,11 @@ fun main {
 
 - An array literal takes the type expected of it: a typed local or
   top-level value, a function's result or `return`, an argument of a
-  top-level function or constructor, or a store into a receiver of declared
+  top-level function or constructor, or a store into a receiver of known
   type (`xs.append(v)`, `xs[i] = v`, `m.set(k, v)`, `x = v`, `o.field = v`,
-  where `xs`, `m`, `x` or the field has a declared type or is initialized
-  with `array<T>()` or `Map<K, V>()`). That type's element type flows into
+  a method's argument), declared or inferred: `val rows = makeRows()` then
+  `rows.append([null])` makes `[null]` the element type `makeRows` gives
+  `rows`. That type's element type flows into
   nested literals and lambdas, and `null` fits a `T?` element
   (`val rows: array<array<int?>> = [[1, null], []]`). Without such a type,
   the elements must share one, `[]` and `null` taking the others'
@@ -465,11 +466,23 @@ fun main {
   ([ownership.md](ownership.md#parameters-borrow-var-and-own)). An array of
   resources owns its elements.
 
-> Known issue (being fixed by ablac-frontend): an array literal passed to a
-> receiver whose type is only inferred (`val rows = makeRows()` then
-> `rows.append([1, null])`) still types itself from its own elements.
-> Annotate the local (`val rows: array<array<int?>> = makeRows()`) until
-> then.
+```abla
+import "abla/io"
+
+fun makeRows() {
+    val rows: array<array<string?>> = []
+    rows
+}
+
+fun main {
+    val rows = makeRows()         // inferred: array<array<string?>>
+    rows.append([null])           // an array<string?>
+    rows.append([null, "b"])
+    println("${rows.size} ${rows[0][0] == null} ${rows[1].size}")
+}
+// output:
+// 2 true 2
+```
 
 ```abla
 import "abla/io"

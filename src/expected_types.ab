@@ -11,8 +11,12 @@
 // local, field or top-level value) expects its element or value type too:
 // `xs.append(v)`, `xs[i] = v`, `m.set(k, v)`, `x = v`, `o.f = v`.
 //
-// The pass is syntax to syntax before semantic analysis; a literal with no
-// such context keeps its type from its elements.
+// The pass is syntax to syntax before semantic analysis. A store whose
+// receiver's type only analysis knows (an inferred local:
+// `val rows = makeRows()` then `rows.append([null])`) has analysis record the
+// literal's type (BootstrapContextualLiterals), and lowering writes it in the
+// same way first (bootstrapApplyContextualLiterals). A literal with no such
+// context keeps its type from its elements.
 import "parser.ab"
 import "overload.ab"
 import "staged_parser.ab"
@@ -457,6 +461,96 @@ fun bootstrapResolveExpectedTypes(parsed: BootstrapParseResult): BootstrapParseR
                 val typed = bootstrapExpectTypesBody(method, callees, declaration.name, classes, globals)
                 if (typed != method) methodsChanged = true
                 methods.append(typed)
+            }
+            if (methodsChanged) rewritten = bootstrapDeclarationWithMethods(rewritten, methods)
+        }
+        if (rewritten != declaration) changed = true
+        declarations.append(rewritten)
+    }
+    if (!changed) return parsed
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+}
+
+/** Array literals typed from a context only analysis knows (a store into a
+ *  receiver whose type is inferred): each one's source, span and source
+ *  array type. */
+class BootstrapContextualLiterals(
+    val sources: array<string>,
+    val begins: array<int>,
+    val ends: array<int>,
+    val types: array<string>
+) {
+    /** The type recorded for the literal at `source`:`begin`..`end`, or "". */
+    fun find(source: string, begin: int, end: int): string {
+        var index = 0
+        while (index < this.begins.size) {
+            if (this.begins[index] == begin && this.ends[index] == end &&
+                this.sources[index] == source) return "${this.types[index]}"
+            index = index + 1
+        }
+        ""
+    }
+
+    fun add(source: string, begin: int, end: int, type: string): void {
+        if (this.find(source, begin, end) != "") return
+        this.sources.append(source)
+        this.begins.append(begin)
+        this.ends.append(end)
+        this.types.append(type)
+        return
+    }
+}
+
+fun bootstrapNoContextualLiterals(): BootstrapContextualLiterals =
+    BootstrapContextualLiterals([], [], [], [])
+
+/** `expression` (in `source`) with the recorded literal types written in. */
+fun bootstrapContextualLiteralsIn(
+    expression: BootstrapExpression,
+    source: string,
+    literals: BootstrapContextualLiterals
+): BootstrapExpression {
+    var children: array<BootstrapExpression> = []
+    var changed = false
+    for (child in expression.children) {
+        val rewritten = bootstrapContextualLiteralsIn(child, source, literals)
+        if (rewritten != child) changed = true
+        children.append(rewritten)
+    }
+    var text = expression.text
+    if (expression.kind == "array" && text == "") {
+        text = literals.find(source, expression.begin, expression.end)
+        if (text != "") changed = true
+    }
+    if (!changed) return expression
+    BootstrapExpression(expression.kind, text, expression.begin, expression.end, children)
+}
+
+/** `parsed` with the literal types analysis recorded (`literals`) written
+ *  in, as bootstrapResolveExpectedTypes writes the ones the syntax shows. */
+fun bootstrapApplyContextualLiterals(
+    parsed: BootstrapParseResult,
+    literals: BootstrapContextualLiterals
+): BootstrapParseResult {
+    if (literals.begins.size == 0) return parsed
+    val declarations: array<BootstrapDeclaration> = []
+    var changed = false
+    for (declaration in parsed.declarations) {
+        var rewritten = declaration
+        val body = bootstrapContextualLiteralsIn(declaration.expression, declaration.sourceIdentity, literals)
+        if (body != declaration.expression) rewritten = bootstrapDeclarationWithExpression(declaration, body)
+        if (declaration.methods.size > 0) {
+            val methods: array<BootstrapDeclaration> = []
+            var methodsChanged = false
+            for (method in declaration.methods) {
+                val methodBody = bootstrapContextualLiteralsIn(method.expression, method.sourceIdentity, literals)
+                if (methodBody != method.expression) {
+                    methodsChanged = true
+                    methods.append(bootstrapDeclarationWithExpression(method, methodBody))
+                } else methods.append(method)
             }
             if (methodsChanged) rewritten = bootstrapDeclarationWithMethods(rewritten, methods)
         }

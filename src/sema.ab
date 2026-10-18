@@ -1367,6 +1367,16 @@ fun bootstrapDelegatedStorageOrSelf(type: string): string =
     if (bootstrapIsDelegatedType(type)) bootstrapDelegatedStorageType(type)
     else type
 
+/** Whether the normalized `type` names `word` (`unknown`, `inferred`). */
+fun bootstrapTypeMentions(type: string, word: string): bool {
+    var index = 0
+    while (index + word.size <= type.size) {
+        if (type.slice(index, index + word.size) == word) return true
+        index = index + 1
+    }
+    false
+}
+
 fun bootstrapIsNullableType(type: string): bool =
     type.size >= 9 && type.slice(0, 9) == "nullable:"
 
@@ -2847,7 +2857,9 @@ class BootstrapSemanticResult(
     val managedAliasEnds: array<int>,
     val managedAliasSources: array<string>,
     // Result types inferred from bodies, which lowering types calls with.
-    val inferredResults: BootstrapInferredResultTypes = bootstrapNoInferredResultTypes()
+    val inferredResults: BootstrapInferredResultTypes = bootstrapNoInferredResultTypes(),
+    // Array literals typed from an inferred receiver, which lowering types.
+    val contextualLiterals: BootstrapContextualLiterals = bootstrapNoContextualLiterals()
 )
 
 // Compile-time effects are deliberately represented as a compact bitset. The
@@ -5299,7 +5311,9 @@ class BootstrapAnalyzer(
     val initEdges: BootstrapInitEdges = bootstrapNoInitEdges(),
     // The assignments (by begin) of the body being analyzed whose value is
     // used: bootstrapCollectUsedAssignments.
-    var usedAssignments: array<int> = []
+    var usedAssignments: array<int> = [],
+    // Array literals typed from a store's inferred receiver (expected_types.ab).
+    val contextualLiterals: BootstrapContextualLiterals = bootstrapNoContextualLiterals()
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -8488,6 +8502,7 @@ class BootstrapAnalyzer(
             if (method == "set") {
                 // A lambda takes its parameter types from the value type.
                 this.contextualizeLambdaParameters(expression.children[2], value)
+                this.contextualizeArrayLiteral(expression.children[2], value)
                 val stored = this.infer(expression.children[2])
                 if (bootstrapIsBorrowType(stored)) {
                     this.fail("ownership.borrow-store:map.set")
@@ -8515,6 +8530,39 @@ class BootstrapAnalyzer(
             }
         }
         return result
+    }
+
+    /** An untyped array literal stored where `expected` is known only here
+     *  (an inferred receiver's `append`, `set`, `[i] =`, `=`, a field or a
+     *  method argument) takes `expected` as its type, as one whose context
+     *  the syntax declares does (expected_types.ab): analysis checks its
+     *  elements against it and lowering builds it as that type. */
+    fun contextualizeArrayLiteral(value: BootstrapExpression, expected: string): void {
+        val array = if (bootstrapIsNullableType(expected))
+            bootstrapNullableElementType(expected) else expected
+        if (!bootstrapIsArrayType(array) || bootstrapTypeMentions(array, "unknown") ||
+            bootstrapTypeMentions(array, "inferred")) return
+        val text = bootstrapLiftTypeText(array)
+        if (bootstrapNormalizeType(text) != array) return
+        this.recordContextualLiteral(value, text)
+        return
+    }
+
+    /** Records `type` (source text) for the untyped literal `value` is, or
+     *  that the block or `if` it is ends in. */
+    fun recordContextualLiteral(value: BootstrapExpression, type: string): void {
+        if (value.kind == "array" && value.text == "") {
+            val array = bootstrapExpectedArrayType(type)
+            if (array != "") {
+                this.contextualLiterals.add(this.currentSourceIdentity, value.begin, value.end, array)
+            }
+        } else if (value.kind == "block" && value.children.size > 0) {
+            this.recordContextualLiteral(value.children[value.children.size - 1], type)
+        } else if (value.kind == "if" && value.children.size == 3) {
+            this.recordContextualLiteral(value.children[1], type)
+            this.recordContextualLiteral(value.children[2], type)
+        }
+        return
     }
 
     fun contextualizeLambdaParameters(
@@ -9728,7 +9776,8 @@ class BootstrapAnalyzer(
                 this.inferredResults.begins,
                 this.inferredResults.results,
                 initializationOrder
-            )
+            ),
+            this.contextualLiterals
         )
     }
 }
@@ -9861,13 +9910,26 @@ fun bootstrapInferArray(
     // A literal of a named or expected type (`array<T>()`, or one that
     // expected_types.ab typed from its context) checks its elements against
     // it; any other takes the type its elements share, `[]` and `null` taking
-    // the others' (`[[1], []]`, `["x", null]`).
-    val typed = expression.text != ""
-    val type = if (typed) bootstrapNormalizeType(expression.text) else ""
+    // the others' (`[[1], []]`, `["x", null]`). One a store typed from its
+    // inferred receiver (contextualizeArrayLiteral) types its elements so.
+    var declared = expression.text
+    val contextual = declared == "" && analyzer.contextualLiterals.begins.size > 0
+    if (contextual) {
+        declared = analyzer.contextualLiterals.find(
+            analyzer.currentSourceIdentity, expression.begin, expression.end
+        )
+    }
+    val typed = declared != ""
+    val type = if (typed) bootstrapNormalizeType(declared) else ""
     var elementType = if (typed) bootstrapArrayElementType(type) else "unknown"
     var element = 0
     while (element < expression.children.size) {
         if (typed) analyzer.contextualizeLambdaParameters(expression.children[element], elementType)
+        if (contextual && typed) {
+            analyzer.recordContextualLiteral(
+                expression.children[element], declared.slice(6, declared.size - 1)
+            )
+        }
         val found = analyzer.infer(expression.children[element])
         if (bootstrapIsBorrowType(found)) {
             analyzer.fail("ownership.borrow-store:array")
@@ -10729,10 +10791,13 @@ fun bootstrapInferIndexAssign(
     val receiver = bootstrapBorrowElementType(rawReceiver)
     val index = analyzer.infer(expression.children[1])
     // A lambda takes its parameter types from the element type.
-    if (bootstrapIsArrayType(receiver)) analyzer.contextualizeLambdaParameters(
-        expression.children[2],
-        bootstrapArrayElementType(receiver)
-    )
+    if (bootstrapIsArrayType(receiver)) {
+        analyzer.contextualizeLambdaParameters(
+            expression.children[2],
+            bootstrapArrayElementType(receiver)
+        )
+        analyzer.contextualizeArrayLiteral(expression.children[2], bootstrapArrayElementType(receiver))
+    }
     val value = analyzer.infer(expression.children[2])
     if (bootstrapIsBorrowType(value)) {
         analyzer.fail("ownership.borrow-store:index.assign")
@@ -10815,6 +10880,7 @@ fun bootstrapInferMemberCall(
                 analyzer.fail("cell.set.arity")
             } else {
                 analyzer.contextualizeLambdaParameters(expression.children[1], element)
+                analyzer.contextualizeArrayLiteral(expression.children[1], element)
                 val value = analyzer.infer(expression.children[1])
                 if (!bootstrapTypesCompatible(element, value)) {
                     analyzer.fail("cell.set.value:$element:$value")
@@ -10906,6 +10972,7 @@ fun bootstrapInferMemberCall(
                 expression.children[1],
                 bootstrapArrayElementType(receiver)
             )
+            analyzer.contextualizeArrayLiteral(expression.children[1], bootstrapArrayElementType(receiver))
             val value = analyzer.infer(expression.children[1])
             if (bootstrapIsBorrowType(value)) {
                 analyzer.fail("ownership.borrow-store:append")
@@ -11032,6 +11099,7 @@ fun bootstrapInferMemberCall(
                 expression.children[argument],
                 expected
             )
+            analyzer.contextualizeArrayLiteral(expression.children[argument], expected)
             val actual = analyzer.infer(expression.children[argument])
             if (bootstrapImplicitIntegerNarrowing(
                 expected, analyzer.scalarValueType(actual),
@@ -11136,6 +11204,7 @@ fun bootstrapInferMemberAssign(
     val receiver = bootstrapBorrowElementType(rawReceiver)
     val expected = analyzer.fieldType(receiver, expression.text)
     analyzer.contextualizeLambdaParameters(expression.children[1], expected)
+    analyzer.contextualizeArrayLiteral(expression.children[1], expected)
     val actual = analyzer.infer(expression.children[1])
     if (bootstrapIsBorrowType(actual)) {
         analyzer.fail("ownership.borrow-store:field.${expression.text}")
@@ -11637,6 +11706,7 @@ fun bootstrapInferAssign(
     analyzer.contextualizeLambdaParameters(
         expression.children[0], bootstrapBorrowElementType(target)
     )
+    analyzer.contextualizeArrayLiteral(expression.children[0], target)
     val value = analyzer.infer(expression.children[0])
     if (target != "unknown") {
         analyzer.recordResolvedName(expression, target)

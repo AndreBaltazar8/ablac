@@ -196,6 +196,7 @@ test: ablac
 	tools/test-native-platform-boundary.sh $(COMPILER)
 	tools/test-lambda-context.sh $(COMPILER)
 	tools/test-reproducible-build.sh $(COMPILER)
+	tools/test-inferred-receivers.sh $(COMPILER)
 
 check: test self-rebuild
 
