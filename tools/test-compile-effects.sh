@@ -108,6 +108,8 @@ set -e
 grep -q 'LLVM compilation failed:' \
     "$output_directory/subparser-denied.err"
 
+# The cache-hit checks build with --fast: an LTO build copies its cached .ll back
+# over the output on a hit, which would hide the marker each check writes.
 # Historical compiler identities may each have a record for this fixture.
 # Remove only those recoverable input sidecars so the corruption assertion
 # below targets the record published by this exact compiler invocation.
@@ -122,11 +124,11 @@ fi
 
 "$compiler" build \
     "$project_root/tests/cases/capabilities/entry.ab" \
-    -o "$output_directory/granted"
+    -o "$output_directory/granted" --fast
 printf '%s\n' 'compile-input-cache-hit' > "$output_directory/granted.ll"
 "$compiler" build \
     "$project_root/tests/cases/capabilities/entry.ab" \
-    -o "$output_directory/granted"
+    -o "$output_directory/granted" --fast
 grep -q '^compile-input-cache-hit$' "$output_directory/granted.ll"
 set +e
 ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
@@ -147,7 +149,7 @@ done < <(find "$project_root/build/.abla-cache" -type f \
 printf '%s\n' 'corrupt-input-record' > "$input_cache"
 "$compiler" build \
     "$project_root/tests/cases/capabilities/entry.ab" \
-    -o "$output_directory/granted"
+    -o "$output_directory/granted" --fast
 if grep -q '^compile-input-cache-hit$' "$output_directory/granted.ll"; then
     echo 'corrupt compile-input record was reused' >&2
     exit 1
@@ -157,7 +159,7 @@ printf '%s\n' 'compile-input-cache-hit' > "$output_directory/granted.ll"
 printf '%s\n' second > "$input"
 "$compiler" build \
     "$project_root/tests/cases/capabilities/entry.ab" \
-    -o "$output_directory/granted"
+    -o "$output_directory/granted" --fast
 if grep -q '^compile-input-cache-hit$' "$output_directory/granted.ll"; then
     echo 'compile input content change reused a stale object' >&2
     exit 1
@@ -174,18 +176,18 @@ set -e
 printf '%s\n' first > "$input"
 "$compiler" build \
     "$project_root/tests/cases/capabilities/subparser-input.ab" \
-    -o "$output_directory/subparser-input"
+    -o "$output_directory/subparser-input" --fast
 printf '%s\n' 'subparser-input-cache-hit' > \
     "$output_directory/subparser-input.ll"
 "$compiler" build \
     "$project_root/tests/cases/capabilities/subparser-input.ab" \
-    -o "$output_directory/subparser-input"
+    -o "$output_directory/subparser-input" --fast
 grep -q '^subparser-input-cache-hit$' \
     "$output_directory/subparser-input.ll"
 printf '%s\n' second > "$input"
 "$compiler" build \
     "$project_root/tests/cases/capabilities/subparser-input.ab" \
-    -o "$output_directory/subparser-input"
+    -o "$output_directory/subparser-input" --fast
 if grep -q '^subparser-input-cache-hit$' \
     "$output_directory/subparser-input.ll"; then
     echo 'subparser input change reused a stale object' >&2
@@ -202,17 +204,17 @@ set -e
 # journaled, cacheable while unchanged, and invalidates on value changes.
 ABLA_COMPILE_TEST_INPUT=first "$compiler" build \
     "$project_root/tests/cases/capabilities/environment.ab" \
-    -o "$output_directory/environment"
+    -o "$output_directory/environment" --fast
 printf '%s\n' 'environment-input-cache-hit' > \
     "$output_directory/environment.ll"
 ABLA_COMPILE_TEST_INPUT=first "$compiler" build \
     "$project_root/tests/cases/capabilities/environment.ab" \
-    -o "$output_directory/environment"
+    -o "$output_directory/environment" --fast
 grep -q '^environment-input-cache-hit$' \
     "$output_directory/environment.ll"
 ABLA_COMPILE_TEST_INPUT=second "$compiler" build \
     "$project_root/tests/cases/capabilities/environment.ab" \
-    -o "$output_directory/environment"
+    -o "$output_directory/environment" --fast
 if grep -q '^environment-input-cache-hit$' \
     "$output_directory/environment.ll"; then
     echo 'environment input change reused a stale object' >&2
@@ -317,7 +319,7 @@ printf '%s\n' 'compileCapabilities = []' > "$manifest"
 set +e
 "$compiler" build \
     "$project_root/tests/cases/capabilities/entry.ab" \
-    -o "$output_directory/granted" \
+    -o "$output_directory/granted" --fast \
     > "$output_directory/manifest-denied.out" \
     2> "$output_directory/manifest-denied.err"
 manifest_status=$?

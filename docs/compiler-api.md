@@ -27,7 +27,8 @@ compile fun routeTable(): array<string> {
     for (function in compiler.functionsAnnotated("route")) {
         val name = compiler.functionName(function)
         val first = compiler.parameterType(function, 0)
-        rows.append("$name($first) -> ${compiler.resultType(function)}")
+        val path = compiler.annotationArgumentText(function, 0)
+        rows.append("$path $name($first) -> ${compiler.resultType(function)}")
     }
     rows
 }
@@ -36,14 +37,15 @@ fun main {
     for (row in #routeTable()) println(row)
 }
 // output:
-// listUsers(i64) -> string
-// listOrders(i64) -> string
+// /users listUsers(i64) -> string
+// /orders listOrders(i64) -> string
 ```
 
 `routeTable` runs inside the compiler, and the program receives its result
 as a constant array. Types are reported in their canonical spelling (`int`
-is `i64`). Annotation names are reflected, but their arguments (the
-`"/users"` above) are not yet (being added by ct-bridge).
+is `i64`). `compiler.annotationArgumentText(function, annotation)` gives an
+annotation argument's literal text (see
+[function reflection](#function-reflection)).
 
 ## Transforms: changing the program
 
@@ -132,7 +134,12 @@ consumer's alias spelling.
 The VM reads owned IR metadata for handles and never exposes AST, semantic, C++,
 or backend pointers. Marker annotations are retained with source spans, included
 in interface/IR fingerprints, and exposed through `compiler.annotationCount`
-and `compiler.annotation`.
+and `compiler.annotation`. An annotation's argument (`@route("/users")` has
+one, a bare `@marker` none) is reflected by
+`compiler.annotationArgumentCount(function, annotation)`, its syntax kind and
+literal text by `compiler.annotationArgumentKind` and
+`compiler.annotationArgumentText`, and the whole argument as a syntax handle by
+`compiler.annotationArgument` (from `abla/compiler/parser`).
 
 `#compiler.transform(handler)` opens the bounded mutation stage before final
 semantic analysis. `compiler.replaceFunctionBody(handle, source)` currently

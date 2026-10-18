@@ -1,0 +1,88 @@
+import "toolchain.ab"
+
+// Driver-level parts of the compiler bridge (src/ct_bridge.ab) that need the
+// module loader: the helper module's path and the native test harness.
+
+// The module whose helpers the shims call. The slice carries its
+// declarations (and those of its imports) alongside the shims.
+fun bootstrapCtBridgeModulePath(): string =
+    Path(bootstrapStandardLibraryRoot()).child("abla/compiler/bridge/entry.ab").text
+
+// Native harness (tests): `ablac run` with ABLA_CT_BRIDGE_RUN_FRAME=<effect
+// mask> runs the program's `main` inside a bridge frame whose evaluator sees
+// the program's own declarations, so a program made of generated shims calls
+// the compiler API natively exactly as JIT'd compile-time code does. After
+// the run, the frame's failures, diagnostics and input journal are written
+// to standard error. ABLA_CT_BRIDGE_SHIMS_OUT=<path> writes the shims of the
+// program's declarations to that path instead.
+
+fun ctBridgeRunFrameBegin(sourcePath: string): int {
+    val shimsOut = linuxEnvironment("ABLA_CT_BRIDGE_SHIMS_OUT")
+    val configured = linuxEnvironment("ABLA_CT_BRIDGE_RUN_FRAME")
+    var serial = 0
+    if ((shimsOut.found && shimsOut.value != "") ||
+        (configured.found && configured.value != "")) {
+        val parsed = bootstrapParseHostModuleWithRuntime(sourcePath)
+        if (shimsOut.found && shimsOut.value != "") {
+            var source = ""
+            var index = 0
+            while (index < parsed.declarations.size) {
+                source = "$source${ctBridgeReplacementSource(parsed.declarations[index])}"
+                index = index + 1
+            }
+            Path(shimsOut.value).writeText(source)
+        }
+        if (configured.found && configured.value != "") {
+            serial = ctBridgeEnter(
+                ctBridgeRunEvaluator(
+                    parsed.declarations,
+                    bootstrapDecimalIndex(configured.value)
+                ),
+                0,
+                0
+            )
+        }
+    }
+    serial
+}
+
+fun ctBridgeRunEvaluator(
+    declarations: array<BootstrapDeclaration>,
+    allowedCompileEffects: int
+): BootstrapEvaluator = BootstrapEvaluator(
+    declarations,
+    bootstrapBuildAffineTypeNames(declarations),
+    bootstrapEvalContext(declarations),
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    allowedCompileEffects,
+    0,
+    0,
+    ""
+)
+
+fun ctBridgeRunFrameEnd(serial: int): void {
+    val top = ctBridgeTopIndex()
+    if (serial != 0 && top >= 0 && ctBridgeFrames[top].serial == serial) {
+        var report = "ct-bridge: errors=${ctBridgeFrames[top].evaluator.errors} invocations=$ctBridgeInvocationCount\n${ctBridgeFrames[top].evaluator.diagnostics}"
+        var index = 0
+        while (index < ctBridgeFrames[top].evaluator.compileInputPaths.size) {
+            report = "${report}ct-bridge: input ${ctBridgeFrames[top].evaluator.compileInputPaths[index]} ${ctBridgeFrames[top].evaluator.compileInputContents[index].size}\n"
+            index = index + 1
+        }
+        linuxPrintStandardError(report)
+        ctBridgeLeave(serial)
+    }
+    return
+}

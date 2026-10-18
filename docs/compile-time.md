@@ -210,13 +210,35 @@ compiler needs them before it can evaluate anything:
 | `#compilerGenerateModule("namespace", "source")` | adds a generated module to the program |
 | `#compiler.transform(handler)` | runs a [transform](compiler-api.md) over the program |
 
-These work only as literal top-level actions. Called from inside a
-`compile fun`, `compilerGrant`, `compilerRegisterSubparser` and
-`compilerGenerateModule` currently do nothing, and they don't report an
-error either (being fixed by ct-bridge).
+Grants and subparser registrations take effect only as literal top-level
+actions: a grant stays visible in source, and subparsers are registered
+before any compile-time code runs. Called from compile-time code, they fail
+with `E_COMPILE_GRANT_PHASE` and `E_EXT_SUBPARSER_REGISTRATION`.
+`compilerGenerateModule` (and `compiler.generateModule`) also works from
+compile-time code that a `compiler.transform` handler runs, because
+transforms run before the program is analyzed:
 
-An action that runs code (anything other than a grant) disables the
-whole-program native object cache for that build. Every build then runs it
+```abla
+import "abla/compiler"
+
+compile fun configure(): void {
+    compiler.generateModule("answer", "fun generatedAnswer(): int = 42\n")
+    return
+}
+
+#compiler.transform(configure)
+
+fun main: int = generatedAnswer()
+// exit: 42
+```
+
+Anywhere later (a top-level action, a `#` expression), the program has
+already been analyzed, and the call fails with
+`E_EXT_GENERATED_MODULE_PHASE`.
+
+An action that runs code (anything other than the literal actions above,
+except a transform) disables the whole-program native object cache for that
+build. Every build then runs it
 again.
 
 ## `compile val` and `compile var`
@@ -540,4 +562,7 @@ step fails, none of its changes are kept.
 | `compile.value-runtime:<name>` | run-time code reads a `compile val`/`compile var` |
 | `compile.result: <type> cannot become a program value: <reason>` | a `#` result that exists only inside the compiler (a generator, task, thread, borrow, `Weak`, raw pointer, or object with `drop()`) |
 | `declaration.block.compile-only` | a declaration block in run-time code |
+| `E_COMPILE_GRANT_PHASE` | compile-time code called `compilerGrant`; grants are literal top-level actions |
+| `E_EXT_SUBPARSER_REGISTRATION` | an invalid or duplicate subparser registration, or one made from compile-time code |
+| `E_EXT_GENERATED_MODULE_PHASE` | `compilerGenerateModule` ran after the program was analyzed (outside a transform) |
 | `E_PACKAGE_CAPABILITY_DENIED` | a dependency asks for a capability the root project doesn't authorize |

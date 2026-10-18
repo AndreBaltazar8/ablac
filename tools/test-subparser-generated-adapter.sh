@@ -253,10 +253,11 @@ grep -q 'error\[E_PARSE_PARAMETER_SEPARATOR\]:' \
 grep -Fq \
     'source[parser]:'"$project_root"'/tests/cases/bootstrap/invalid-parser-diagnostics.ab:' \
     "$output_directory/invalid-parser.err"
-grep -q 'error\[E_IR_FUNCTION_VERIFICATION\]:' \
-    "$output_directory/invalid-parser.err"
-grep -q 'error\[E_IR_EMISSION\]:' \
-    "$output_directory/invalid-parser.err"
+# A parse error stops the build after the parser: no IR errors follow it.
+if grep -q 'error\[E_IR_' "$output_directory/invalid-parser.err"; then
+    echo 'IR errors after a parse error' >&2
+    exit 1
+fi
 assert_compiler_diagnostic_accounting \
     "$output_directory/invalid-parser.err"
 
@@ -310,7 +311,8 @@ PATH="$missing_toolchain_path" "$compiler" build \
 invalid_native_toolchain_status=$?
 set -e
 [[ $invalid_native_toolchain_status -ne 0 ]] || exit 1
-grep -q 'error\[E_NATIVE_TOOLCHAIN\]: native toolchain failed with status' \
+# On macOS the SDK lookup (xcrun) is the first toolchain step to fail.
+grep -Eq 'error\[E_NATIVE_TOOLCHAIN\]: native toolchain failed with status|error\[E_MACOS_SDK\]' \
     "$output_directory/invalid-native-toolchain.err"
 
 "$project_root/tools/test-generated-cross-module-diagnostics.sh" "$compiler"

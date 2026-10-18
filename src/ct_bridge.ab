@@ -1,0 +1,850 @@
+import "abla/unsafe/memory"
+
+// The compiler API for native compile-time code.
+//
+// Compile-time code that runs as native code (the JIT tier) reaches the
+// compiler through the C entry points exported below. A call is staged
+// argument by argument (`abla_ct_bridge_arg_*`), performed by
+// `abla_ct_bridge_invoke(name)` and read back through
+// `abla_ct_bridge_result_*`. Every entry point takes scalars or borrowed bytes
+// and returns a scalar, so no value representation crosses the boundary.
+//
+// The invocation reuses the interpreter's implementation: the staged
+// arguments become `bridge.value` children of a synthetic call, and
+// `bootstrapEvaluateIntrinsicCall` runs on the evaluator of the active frame.
+// Effect grants, input journaling, transactional staging and diagnostics are
+// therefore those of the interpreter by construction.
+//
+// Compiler-owned values without a scalar form (syntax handles, parser cursors,
+// generated module builders, access paths, declaration blocks) cross as
+// opaque box handles. A box belongs to one frame; a handle from another frame
+// is rejected rather than aliased.
+//
+// All per-call state lives in the frame, which the caller creates and drops
+// around one native entry.
+
+class CtBridgeFrame(
+    var evaluator: BootstrapEvaluator,
+    val serial: int,
+    val begin: int,
+    val end: int,
+    val boxes: array<BootstrapEvalValue>,
+    // The box of each syntax handle already boxed (-1: none), so walking a
+    // tree does not grow the box table per visit.
+    val syntaxBoxes: array<int>,
+    // Arguments being staged: element 0 holds the call's arguments, each
+    // later element the elements of an array argument still open. Native
+    // code in a frame is suspended while a call is dispatched (code the
+    // compiler runs meanwhile gets a frame of its own), so one list suffices.
+    val staging: array<array<BootstrapEvalValue>>,
+    // The last result (at most one element), held until the next invocation.
+    val results: array<BootstrapEvalValue>,
+    // A native entry's arguments and its returned value (at most one).
+    val entryArguments: array<BootstrapEvalValue>,
+    val entryResults: array<BootstrapEvalValue>
+)
+
+val CT_BRIDGE_BOX_BITS = 24
+val CT_BRIDGE_BOX_LIMIT = 16777216
+
+// Bridge frames, innermost last.
+var ctBridgeFrames: array<CtBridgeFrame> = []
+var ctBridgeFrameSerial: int = 0
+var ctBridgeInvocationCount: int = 0
+// Native code addresses of compile-time functions, for function arguments.
+// Owned by the JIT session (ctBridgeRegisterFunction / ctBridgeForgetFunctions).
+var ctBridgeFunctionAddresses: array<int> = []
+var ctBridgeFunctionNames: array<string> = []
+
+// Makes `evaluator` the target of bridge calls until the matching leave.
+// Frames nest: native code may re-enter the compiler, which may run more
+// native code. `begin`/`end` locate the evaluated expression for diagnostics.
+fun ctBridgeEnter(evaluator: BootstrapEvaluator, begin: int, end: int): int {
+    ctBridgeFrameSerial = ctBridgeFrameSerial + 1
+    val call: array<BootstrapEvalValue> = []
+    val staging: array<array<BootstrapEvalValue>> = [call]
+    ctBridgeFrames.append(CtBridgeFrame(
+        evaluator,
+        ctBridgeFrameSerial,
+        begin,
+        end,
+        [],
+        [],
+        staging,
+        [],
+        [],
+        []
+    ))
+    ctBridgeFrameSerial
+}
+
+fun ctBridgeLeave(serial: int): bool {
+    val valid = ctBridgeFrames.size > 0 &&
+        ctBridgeFrames[ctBridgeFrames.size - 1].serial == serial
+    if (valid) ctBridgeFrames.truncate(ctBridgeFrames.size - 1)
+    valid
+}
+
+fun ctBridgeActive(): bool = ctBridgeFrames.size > 0
+
+fun ctBridgeTopIndex(): int = ctBridgeFrames.size - 1
+
+// Boxes a compiler-owned value in the active frame. Entry trampolines use it
+// to pass a cursor or syntax handle into native code.
+fun ctBridgeBox(value: BootstrapEvalValue): int {
+    val top = ctBridgeTopIndex()
+    var handle = -1
+    if (top >= 0) {
+        val serial = ctBridgeFrames[top].serial << CT_BRIDGE_BOX_BITS
+        val syntax = value.kind == "syntax" && value.integer >= 0 &&
+            value.integer < CT_BRIDGE_BOX_LIMIT
+        if (syntax && value.integer < ctBridgeFrames[top].syntaxBoxes.size &&
+            ctBridgeFrames[top].syntaxBoxes[value.integer] >= 0) {
+            handle = serial | ctBridgeFrames[top].syntaxBoxes[value.integer]
+        } else if (ctBridgeFrames[top].boxes.size < CT_BRIDGE_BOX_LIMIT) {
+            val index = ctBridgeFrames[top].boxes.size
+            if (syntax) {
+                while (ctBridgeFrames[top].syntaxBoxes.size <= value.integer) {
+                    ctBridgeFrames[top].syntaxBoxes.append(-1)
+                }
+                ctBridgeFrames[top].syntaxBoxes[value.integer] = index
+            }
+            ctBridgeFrames[top].boxes.append(value)
+            handle = serial | index
+        }
+    }
+    handle
+}
+
+fun ctBridgeBoxValid(handle: int): bool {
+    val top = ctBridgeTopIndex()
+    top >= 0 && handle >= 0 &&
+        (handle >> CT_BRIDGE_BOX_BITS) == ctBridgeFrames[top].serial &&
+        (handle & (CT_BRIDGE_BOX_LIMIT - 1)) < ctBridgeFrames[top].boxes.size
+}
+
+fun ctBridgeUnbox(handle: int): BootstrapEvalValue =
+    if (ctBridgeBoxValid(handle)) {
+        ctBridgeFrames[ctBridgeTopIndex()].boxes[
+            handle & (CT_BRIDGE_BOX_LIMIT - 1)
+        ]
+    } else bootstrapEvalInvalid()
+
+// The JIT tier registers the address of every compile-time function it
+// materializes, so a function value passed as an argument (a finalizer, a
+// handler) reaches the interpreter's API as that declaration's name.
+fun ctBridgeRegisterFunction(address: int, name: string): void {
+    var found = false
+    var index = 0
+    while (index < ctBridgeFunctionAddresses.size) {
+        if (ctBridgeFunctionAddresses[index] == address) {
+            ctBridgeFunctionNames[index] = name
+            found = true
+        }
+        index = index + 1
+    }
+    if (!found) {
+        ctBridgeFunctionAddresses.append(address)
+        ctBridgeFunctionNames.append(name)
+    }
+}
+
+fun ctBridgeFunctionName(address: int): string {
+    var name = ""
+    var index = 0
+    while (index < ctBridgeFunctionAddresses.size) {
+        if (ctBridgeFunctionAddresses[index] == address) {
+            name = ctBridgeFunctionNames[index]
+        }
+        index = index + 1
+    }
+    name
+}
+
+fun ctBridgeForgetFunctions(): void {
+    ctBridgeFunctionAddresses.truncate(0)
+    ctBridgeFunctionNames.truncate(0)
+}
+
+// Whether a value crosses as a box rather than as a scalar, string or array.
+fun ctBridgeBoxedKind(kind: string): bool =
+    kind != "integer" && kind != "boolean" && kind != "string" &&
+        kind != "array" && kind != "void" && kind != "null" &&
+        kind != "invalid" && kind != "function"
+
+// Appends a staged argument to the innermost open list; -1 without an
+// active frame.
+fun ctBridgeStage(value: BootstrapEvalValue): int {
+    val top = ctBridgeTopIndex()
+    var count = -1
+    if (top >= 0) {
+        val level = ctBridgeFrames[top].staging.size - 1
+        ctBridgeFrames[top].staging[level].append(value)
+        count = ctBridgeFrames[top].staging[level].size
+    }
+    count
+}
+
+// Drops whatever is staged, closing any open array argument.
+fun ctBridgeClearStaging(): void {
+    val top = ctBridgeTopIndex()
+    if (top >= 0) {
+        ctBridgeFrames[top].staging.truncate(1)
+        ctBridgeFrames[top].staging[0].truncate(0)
+    }
+    return
+}
+
+fun ctBridgeArgumentCount(): int {
+    val top = ctBridgeTopIndex()
+    if (top >= 0) ctBridgeFrames[top].staging[0].size else 0
+}
+
+fun ctBridgeArgumentAt(index: int): BootstrapEvalValue =
+    if (index >= 0 && index < ctBridgeArgumentCount()) {
+        ctBridgeFrames[ctBridgeTopIndex()].staging[0][index]
+    } else bootstrapEvalInvalid()
+
+// Reads one argument of the synthetic call being dispatched (the
+// `bridge.value` case of the evaluator).
+fun ctBridgeArgument(expression: BootstrapExpression): BootstrapEvalValue =
+    ctBridgeArgumentAt(bootstrapDecimalIndex(expression.text))
+
+fun ctBridgeResult(): BootstrapEvalValue {
+    val top = ctBridgeTopIndex()
+    if (top >= 0 && ctBridgeFrames[top].results.size > 0) {
+        ctBridgeFrames[top].results[0]
+    } else bootstrapEvalInvalid()
+}
+
+// Performs intrinsic `name` on the staged arguments in the active frame.
+// 0: success. 1: the intrinsic failed (the evaluator holds the diagnostic,
+// and the evaluation fails as it would under the interpreter). 2: no active
+// frame.
+fun ctBridgeDispatch(name: string): int {
+    val top = ctBridgeTopIndex()
+    var status = 2
+    if (top >= 0) {
+        ctBridgeFrames[top].results.truncate(0)
+        val begin = ctBridgeFrames[top].begin
+        val end = ctBridgeFrames[top].end
+        var evaluator = ctBridgeFrames[top].evaluator
+        val errorsBefore = evaluator.errors
+        val diagnosticsBefore = evaluator.diagnostics.size
+        val children: array<BootstrapExpression> = []
+        val count = ctBridgeArgumentCount()
+        // An invalid argument (a function value the session never
+        // registered) reaches the intrinsic, which reports it as the
+        // interpreter would.
+        val valid = name != "" && ctBridgeFrames[top].staging.size == 1
+        var index = 0
+        while (index < count) {
+            children.append(BootstrapExpression(
+                "bridge.value", "$index", begin, end, []
+            ))
+            index = index + 1
+        }
+        val call = BootstrapExpression("call", name, begin, end, children)
+        val result = if (!valid) bootstrapEvalInvalid()
+            else if (name == CT_BRIDGE_DECLARATION_BLOCK) {
+                ctBridgeDeclarationBlock(evaluator, begin, end)
+            } else bootstrapEvaluateIntrinsicCall(
+                evaluator, call, name, bootstrapEvalInvalid()
+            )
+        // As the interpreter's call site: an invalid result is a failure,
+        // and a failure without a diagnostic of its own names the call.
+        if (result.kind == "invalid") evaluator.errors = evaluator.errors + 1
+        if (evaluator.errors > errorsBefore &&
+            evaluator.diagnostics.size == diagnosticsBefore) {
+            bootstrapEvalExpressionFailed(evaluator, call)
+        }
+        status = if (evaluator.errors > errorsBefore) 1 else 0
+        ctBridgeFrames[top].evaluator = evaluator
+        ctBridgeClearStaging()
+        ctBridgeFrames[top].results.append(bootstrapEvalUnwrapBorrow(result))
+    }
+    ctBridgeInvocationCount = ctBridgeInvocationCount + 1
+    status
+}
+
+// A `declare { ... }` quote in native code: the slice replaces the
+// expression with a bridge call carrying its text and source identity, and
+// the interpreter's own case builds the value.
+val CT_BRIDGE_DECLARATION_BLOCK = "__ablaCtDeclarationBlock"
+
+fun ctBridgeDeclarationBlock(
+    var evaluator: BootstrapEvaluator,
+    begin: int,
+    end: int
+): BootstrapEvalValue {
+    val text = ctBridgeArgumentAt(0)
+    val sourceIdentity = ctBridgeArgumentAt(1)
+    if (ctBridgeArgumentCount() == 2 && text.kind == "string" &&
+        sourceIdentity.kind == "string") {
+        bootstrapEvaluateDeclarationBlock(evaluator, BootstrapExpression(
+            "declaration.block",
+            text.text,
+            begin,
+            end,
+            [BootstrapExpression(
+                "declaration.block.source", sourceIdentity.text, begin, end, []
+            )]
+        ))
+    } else bootstrapEvalInvalid()
+}
+
+// The native form of a `declaration.block` expression, for the slice:
+// `DeclarationBlock(ablaCtBridgeDeclarationBlock(text, sourceIdentity))`.
+fun ctBridgeDeclarationBlockExpression(
+    expression: BootstrapExpression
+): BootstrapExpression {
+    var sourceIdentity = ""
+    if (expression.children.size == 1 &&
+        expression.children[0].kind == "declaration.block.source") {
+        sourceIdentity = expression.children[0].text
+    }
+    BootstrapExpression(
+        "call",
+        "DeclarationBlock",
+        expression.begin,
+        expression.end,
+        [BootstrapExpression(
+            "call",
+            "ablaCtBridgeDeclarationBlock",
+            expression.begin,
+            expression.end,
+            [
+                BootstrapExpression(
+                    "string", expression.text, expression.begin,
+                    expression.end, []
+                ),
+                BootstrapExpression(
+                    "string", sourceIdentity, expression.begin,
+                    expression.end, []
+                )
+            ]
+        )]
+    )
+}
+
+fun ctBridgeResultElement(index: int): BootstrapEvalValue {
+    val result = ctBridgeResult()
+    if (result.kind == "array" && index >= 0 &&
+        index < result.elements.size) {
+        bootstrapEvalUnwrapBorrow(result.elements[index])
+    } else bootstrapEvalInvalid()
+}
+
+fun ctBridgeScalar(value: BootstrapEvalValue): int =
+    if (value.kind == "integer") value.integer
+    else if (value.kind == "boolean") { if (value.boolean) 1 else 0 }
+    else if (ctBridgeBoxedKind(value.kind)) ctBridgeBox(value)
+    else 0
+
+fun ctBridgeSize(value: BootstrapEvalValue): int =
+    if (value.kind == "string") value.text.size
+    else if (value.kind == "array") value.elements.size
+    else 0
+
+trusted fun ctBridgeTextAddress(value: BootstrapEvalValue): int =
+    if (value.kind == "string" && value.text.size > 0) {
+        ablaUnsafeStringAddress(value.text)
+    } else 0
+
+// An exported function's string parameter is a view of the caller's bytes
+// (memory of the native code), so whatever the compiler keeps is copied.
+trusted fun ctBridgeOwnedText(value: string): string {
+    var result = ""
+    if (value.size > 0) {
+        val copy = ablaUnsafePointerAddress(ablaUnsafeAllocate(value.size + 1))
+        ablaUnsafeCopyMemory(copy, ablaUnsafeStringAddress(value), value.size)
+        ablaUnsafeStoreU8(nativePointerFromAddress(copy + value.size), 0)
+        result = adoptNativeString(copy, value.size)
+    }
+    result
+}
+
+// C entry points. The staging calls return the staged argument count (-1
+// without an active frame).
+
+@export("abla_ct_bridge_arg_integer")
+fun ctBridgeArgInteger(value: i64): i64 = ctBridgeStage(bootstrapEvalInteger(value))
+
+@export("abla_ct_bridge_arg_boolean")
+fun ctBridgeArgBoolean(value: i64): i64 =
+    ctBridgeStage(bootstrapEvalBoolean(value != 0))
+
+@export("abla_ct_bridge_arg_string")
+fun ctBridgeArgString(value: string): i64 =
+    ctBridgeStage(bootstrapEvalString(ctBridgeOwnedText(value)))
+
+@export("abla_ct_bridge_arg_handle")
+fun ctBridgeArgHandle(handle: i64): i64 = ctBridgeStage(ctBridgeUnbox(handle))
+
+// A function value by its native code address (see ctBridgeRegisterFunction).
+@export("abla_ct_bridge_arg_function")
+fun ctBridgeArgFunction(address: i64): i64 {
+    val name = ctBridgeFunctionName(address)
+    ctBridgeStage(
+        if (name != "") bootstrapEvalFunction(name) else bootstrapEvalInvalid()
+    )
+}
+
+// A function value by its declaration name, for generated trampolines that
+// know it statically.
+@export("abla_ct_bridge_arg_function_name")
+fun ctBridgeArgFunctionName(name: string): i64 =
+    ctBridgeStage(bootstrapEvalFunction(ctBridgeOwnedText(name)))
+
+// Opens an array argument: later arguments are its elements until the end.
+@export("abla_ct_bridge_arg_array_begin")
+fun ctBridgeArgArrayBegin(): i64 {
+    val top = ctBridgeTopIndex()
+    var depth = -1
+    if (top >= 0) {
+        val elements: array<BootstrapEvalValue> = []
+        ctBridgeStage(bootstrapEvalArray(elements))
+        ctBridgeFrames[top].staging.append(elements)
+        depth = ctBridgeFrames[top].staging.size
+    }
+    depth
+}
+
+@export("abla_ct_bridge_arg_array_end")
+fun ctBridgeArgArrayEnd(): i64 {
+    val top = ctBridgeTopIndex()
+    var count = -1
+    if (top >= 0 && ctBridgeFrames[top].staging.size > 1) {
+        val level = ctBridgeFrames[top].staging.size - 1
+        count = ctBridgeFrames[top].staging[level].size
+        ctBridgeFrames[top].staging.truncate(level)
+    }
+    count
+}
+
+// Performs the intrinsic named `name` (the extern's declared name) on the
+// staged arguments.
+@export("abla_ct_bridge_invoke")
+fun ctBridgeInvoke(name: string): i64 =
+    ctBridgeDispatch(ctBridgeOwnedText(name))
+
+// The result: an integer, a boolean (0/1) or a box handle by kind.
+@export("abla_ct_bridge_result_scalar")
+fun ctBridgeResultScalar(): i64 = ctBridgeScalar(ctBridgeResult())
+
+// A string's byte count or an array's element count.
+@export("abla_ct_bridge_result_size")
+fun ctBridgeResultSize(): i64 = ctBridgeSize(ctBridgeResult())
+
+// A string result's bytes, valid until the next invocation.
+@export("abla_ct_bridge_result_address")
+fun ctBridgeResultAddress(): i64 = ctBridgeTextAddress(ctBridgeResult())
+
+@export("abla_ct_bridge_result_element_scalar")
+fun ctBridgeResultElementScalar(index: i64): i64 =
+    ctBridgeScalar(ctBridgeResultElement(index))
+
+@export("abla_ct_bridge_result_element_size")
+fun ctBridgeResultElementSize(index: i64): i64 =
+    ctBridgeSize(ctBridgeResultElement(index))
+
+@export("abla_ct_bridge_result_element_address")
+fun ctBridgeResultElementAddress(index: i64): i64 =
+    ctBridgeTextAddress(ctBridgeResultElement(index))
+
+// Native entries (subparser handlers, extension finalizers, transforms) are
+// zero-argument functions the compiler calls inside a frame that holds their
+// arguments; the entry reads them and returns its value through the bridge.
+
+fun ctBridgeEnterEntry(
+    evaluator: BootstrapEvaluator,
+    begin: int,
+    end: int,
+    arguments: array<BootstrapEvalValue>
+): int {
+    val serial = ctBridgeEnter(evaluator, begin, end)
+    val top = ctBridgeTopIndex()
+    var index = 0
+    while (index < arguments.size) {
+        ctBridgeFrames[top].entryArguments.append(arguments[index])
+        index = index + 1
+    }
+    serial
+}
+
+fun ctBridgeEntryArgument(index: int): BootstrapEvalValue {
+    val top = ctBridgeTopIndex()
+    if (top >= 0 && index >= 0 &&
+        index < ctBridgeFrames[top].entryArguments.size) {
+        ctBridgeFrames[top].entryArguments[index]
+    } else bootstrapEvalInvalid()
+}
+
+// What the running entry returned; invalid when it returned nothing.
+fun ctBridgeEntryResult(): BootstrapEvalValue {
+    val top = ctBridgeTopIndex()
+    if (top >= 0 && ctBridgeFrames[top].entryResults.size > 0) {
+        ctBridgeFrames[top].entryResults[0]
+    } else bootstrapEvalInvalid()
+}
+
+fun ctBridgeReturn(value: BootstrapEvalValue): int {
+    val top = ctBridgeTopIndex()
+    var status = -1
+    if (top >= 0) {
+        ctBridgeFrames[top].entryResults.truncate(0)
+        ctBridgeFrames[top].entryResults.append(value)
+        status = 0
+    }
+    status
+}
+
+@export("abla_ct_bridge_entry_scalar")
+fun ctBridgeEntryScalar(index: i64): i64 =
+    ctBridgeScalar(ctBridgeEntryArgument(index))
+
+@export("abla_ct_bridge_entry_size")
+fun ctBridgeEntrySize(index: i64): i64 = ctBridgeSize(ctBridgeEntryArgument(index))
+
+@export("abla_ct_bridge_entry_address")
+fun ctBridgeEntryAddress(index: i64): i64 =
+    ctBridgeTextAddress(ctBridgeEntryArgument(index))
+
+@export("abla_ct_bridge_return_void")
+fun ctBridgeReturnVoid(): i64 = ctBridgeReturn(bootstrapEvalVoid())
+
+@export("abla_ct_bridge_return_integer")
+fun ctBridgeReturnInteger(value: i64): i64 =
+    ctBridgeReturn(bootstrapEvalInteger(value))
+
+@export("abla_ct_bridge_return_boolean")
+fun ctBridgeReturnBoolean(value: i64): i64 =
+    ctBridgeReturn(bootstrapEvalBoolean(value != 0))
+
+@export("abla_ct_bridge_return_string")
+fun ctBridgeReturnString(value: string): i64 =
+    ctBridgeReturn(bootstrapEvalString(ctBridgeOwnedText(value)))
+
+@export("abla_ct_bridge_return_handle")
+fun ctBridgeReturnHandle(handle: i64): i64 = ctBridgeReturn(ctBridgeUnbox(handle))
+
+// The source of entry `entry` (an exported symbol name) calling `handler`.
+// Kinds: "subparser" (ParserCursor) -> SyntaxExpression, "finalizer"
+// (string, SyntaxExpression) -> string, "generated-finalizer" (string,
+// SyntaxExpression) -> GeneratedModuleBuilder, "transform" () -> void.
+fun ctBridgeEntrySource(entry: string, handler: string, kind: string): string {
+    val call = if (kind == "subparser") {
+        "    ablaCtBridgeReturnHandle($handler(ParserCursor(ablaCtBridgeEntryHandle(0))).ctHandle)\n"
+    } else if (kind == "finalizer") {
+        "    ablaCtBridgeReturnString($handler(ablaCtBridgeEntryString(0), SyntaxExpression(ablaCtBridgeEntryHandle(1))))\n"
+    } else if (kind == "generated-finalizer") {
+        "    ablaCtBridgeReturnHandle($handler(ablaCtBridgeEntryString(0), SyntaxExpression(ablaCtBridgeEntryHandle(1))).ctHandle)\n"
+    } else if (kind == "transform") {
+        "    $handler()\n    ablaCtBridgeReturnVoid()\n"
+    } else ""
+    if (call == "") ""
+    else "@export(\"$entry\")\ntrusted fun __$entry(): int {\n$call    0\n}\n"
+}
+
+// Stub generation: the native replacements of compiler API declarations.
+
+// The compile-only classes whose values are compiler-owned handles. Native
+// code holds them as a class wrapping the box handle.
+fun ctBridgeOpaqueType(type: string): bool =
+    type == "ParserCursor" || type == "SyntaxExpression" ||
+        type == "GeneratedModuleBuilder" || type == "TypedAccessPath" ||
+        type == "DeclarationBlock"
+
+// Whether native compile-time code reaches this declaration's
+// implementation through the bridge: every compiler, parser and host extern.
+// Host externs are included so a native call is subject to the same effect
+// grants and input journal as the interpreter's.
+// Host providers are matched by name too, so they stay routed when they are
+// ordinary functions with native bodies (never compiled into the slice: the
+// bodies would run without the grant check and the journal).
+fun ctBridgeRoutesExtern(declaration: BootstrapDeclaration): bool =
+    (declaration.kind == "extern" &&
+        (declaration.externalLibrary == "compiler" ||
+         declaration.externalLibrary == "parser" ||
+         declaration.externalLibrary == "host")) ||
+    ((declaration.kind == "fun" || declaration.kind == "extern") &&
+        declaration.externalLibrary != "intrinsic" &&
+        declaration.extensionOwner == "" &&
+        declaration.name.startsWith("ablaHost"))
+
+fun ctBridgeTypeText(type: string): string {
+    var text = ""
+    var index = 0
+    while (index < type.size) {
+        if (type[index] != 32) text = "$text${type.slice(index, index + 1)}"
+        index = index + 1
+    }
+    // An extern declared without a result type returns nothing.
+    if (text == "i64") "int" else if (text == "inferred") "void" else text
+}
+
+fun ctBridgeArrayElement(type: string): string =
+    if (type.size > 7 && type.slice(0, 6) == "array<" &&
+        type[type.size - 1] == 62) {
+        ctBridgeTypeText(type.slice(6, type.size - 1))
+    } else ""
+
+fun ctBridgeFunctionType(type: string): bool =
+    type.size > 0 && type[0] == 40 && bootstrapTextContains(type, "->")
+
+// One statement staging `name` of `type`; "" when the type has no bridge form.
+fun ctBridgeArgumentSource(name: string, rawType: string): string {
+    val type = ctBridgeTypeText(rawType)
+    val element = ctBridgeArrayElement(type)
+    if (type == "int") "    ablaCtBridgeArgInteger($name)\n"
+    else if (type == "bool") "    ablaCtBridgeArgBoolean($name)\n"
+    else if (type == "string") "    ablaCtBridgeArgString($name)\n"
+    else if (ctBridgeOpaqueType(type)) {
+        "    ablaCtBridgeArgHandle($name.ctHandle)\n"
+    } else if (element == "int") "    ablaCtBridgeArgIntegers($name)\n"
+    else if (element == "bool") "    ablaCtBridgeArgBooleans($name)\n"
+    else if (element == "string") "    ablaCtBridgeArgStrings($name)\n"
+    else if (ctBridgeOpaqueType(element)) {
+        "    ablaCtBridgeArgArrayBegin()\n    var ${name}Index = 0\n    while (${name}Index < $name.size) {\n        ablaCtBridgeArgHandle($name[${name}Index].ctHandle)\n        ${name}Index = ${name}Index + 1\n    }\n    ablaCtBridgeArgArrayEnd()\n"
+    } else if (ctBridgeFunctionType(type)) {
+        "    ablaCtBridgeArgFunction($name)\n"
+    } else ""
+}
+
+// The stub's result expression; "" when the type has no bridge form.
+fun ctBridgeResultSource(rawType: string): string {
+    val type = ctBridgeTypeText(rawType)
+    val element = ctBridgeArrayElement(type)
+    if (type == "" || type == "void") "    return\n"
+    else if (type == "int") "    ablaCtBridgeResultInteger()\n"
+    else if (type == "bool") "    ablaCtBridgeResultBoolean()\n"
+    else if (type == "string") "    ablaCtBridgeResultString()\n"
+    else if (ctBridgeOpaqueType(type)) {
+        "    $type(ablaCtBridgeResultHandle())\n"
+    } else if (element == "int") "    ablaCtBridgeResultIntegers()\n"
+    else if (element == "bool") "    ablaCtBridgeResultBooleans()\n"
+    else if (element == "string") "    ablaCtBridgeResultStrings()\n"
+    else if (ctBridgeOpaqueType(element)) {
+        "    val results: array<$element> = []\n    var resultIndex = 0\n    while (resultIndex < ablaCtBridgeResultCount()) {\n        results.append($element(ablaCtBridgeResultElementHandle(resultIndex)))\n        resultIndex = resultIndex + 1\n    }\n    results\n"
+    } else ""
+}
+
+// The native replacement of `declaration`, as source for the slice that
+// replaces it; "" when the declaration is kept as it is. Covers the routed
+// externs, the opaque handle classes and `ablaAtCompileTime`.
+fun ctBridgeReplacementSource(declaration: BootstrapDeclaration): string {
+    var source = ""
+    if (declaration.kind == "class" && ctBridgeOpaqueType(declaration.name) &&
+        declaration.parameters.size == 0) {
+        source = "class ${declaration.name}(val ctHandle: int)\n"
+    }
+    if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+        declaration.name == "ablaAtCompileTime" &&
+        declaration.parameters.size == 0 &&
+        declaration.extensionOwner == "") {
+        source = "fun ablaAtCompileTime(): bool = true\n"
+    }
+    if (ctBridgeRoutesExtern(declaration)) {
+        var parameters = ""
+        var body = ""
+        var valid = true
+        var index = 0
+        while (index < declaration.parameters.size) {
+            val type = if (index < declaration.parameterTypes.size)
+                declaration.parameterTypes[index] else ""
+            val staged = ctBridgeArgumentSource(
+                declaration.parameters[index], type
+            )
+            if (staged == "") valid = false
+            parameters = "$parameters${if (index > 0) ", " else ""}${declaration.parameters[index]}: ${ctBridgeTypeText(type)}"
+            body = "$body$staged"
+            index = index + 1
+        }
+        val result = ctBridgeResultSource(declaration.resultType)
+        if (result == "") valid = false
+        val resultType = ctBridgeTypeText(declaration.resultType)
+        if (valid) {
+            source = "trusted fun ${declaration.name}($parameters): ${if (resultType == "") "void" else resultType} {\n${body}    ablaCtBridgeInvoke(\"${declaration.name}\")\n$result}\n"
+        }
+    }
+    source
+}
+
+// The JIT tier's entry: the replacement declarations for every declaration
+// of `declarations` that native code reaches through the bridge, in order.
+// Each replacement keeps the replaced declaration's name and source identity.
+fun bootstrapCtBridgeShims(
+    declarations: array<BootstrapDeclaration>
+): array<BootstrapDeclaration> {
+    val shims: array<BootstrapDeclaration> = []
+    var index = 0
+    while (index < declarations.size) {
+        val source = ctBridgeReplacementSource(declarations[index])
+        if (source != "") {
+            val parsed = bootstrapParseWithIdentity(
+                source, declarations[index].sourceIdentity
+            )
+            if (parsed.errors == 0 && parsed.declarations.size == 1) {
+                shims.append(parsed.declarations[0])
+            }
+        }
+        index = index + 1
+    }
+    shims
+}
+
+// Loopback (ABLA_COMPILE_EVAL=bridge): the interpreter performs every routed
+// extern call through the C entry points above, staging and reading values
+// exactly as a generated stub does. It exercises the whole bridge against
+// every compile-time program the interpreter runs.
+
+var ctBridgeLoopbackMode: int = -1
+
+fun ctBridgeLoopbackEnabled(): bool {
+    if (ctBridgeLoopbackMode < 0) {
+        val configured = linuxEnvironment("ABLA_COMPILE_EVAL")
+        ctBridgeLoopbackMode =
+            if (configured.found && configured.value == "bridge") 1 else 0
+    }
+    ctBridgeLoopbackMode == 1
+}
+
+// Stages one evaluated argument by its declared type, as a stub would.
+fun ctBridgeLoopbackStage(value: BootstrapEvalValue, rawType: string): bool {
+    val type = ctBridgeTypeText(rawType)
+    val element = ctBridgeArrayElement(type)
+    var valid = true
+    if (type == "int" && value.kind == "integer") {
+        ctBridgeArgInteger(value.integer)
+    } else if (type == "bool" && value.kind == "boolean") {
+        ctBridgeArgBoolean(if (value.boolean) 1 else 0)
+    } else if (type == "string" && value.kind == "string") {
+        ctBridgeArgString(value.text)
+    } else if (ctBridgeOpaqueType(type) && ctBridgeBoxedKind(value.kind)) {
+        ctBridgeArgHandle(ctBridgeBox(value))
+    } else if (element != "" && value.kind == "array") {
+        ctBridgeArgArrayBegin()
+        var index = 0
+        while (valid && index < value.elements.size) {
+            valid = ctBridgeLoopbackStage(
+                bootstrapEvalUnwrapBorrow(value.elements[index]), element
+            )
+            index = index + 1
+        }
+        ctBridgeArgArrayEnd()
+    } else if (ctBridgeFunctionType(type) && value.kind == "function") {
+        ctBridgeArgFunctionName(value.text)
+    } else {
+        // A value native code could not pass (a closure for a function
+        // parameter): staged as it is, so the intrinsic reports it.
+        ctBridgeStage(value)
+    }
+    valid
+}
+
+trusted fun ctBridgeLoopbackText(address: int, size: int): string {
+    var result = ""
+    if (address > 0 && size > 0) {
+        val copy = ablaUnsafePointerAddress(ablaUnsafeAllocate(size + 1))
+        ablaUnsafeCopyMemory(copy, address, size)
+        ablaUnsafeStoreU8(nativePointerFromAddress(copy + size), 0)
+        result = adoptNativeString(copy, size)
+    }
+    result
+}
+
+fun ctBridgeLoopbackElement(index: int, type: string): BootstrapEvalValue =
+    if (type == "int") bootstrapEvalInteger(ctBridgeResultElementScalar(index))
+    else if (type == "bool") {
+        bootstrapEvalBoolean(ctBridgeResultElementScalar(index) != 0)
+    } else if (type == "string") bootstrapEvalString(ctBridgeLoopbackText(
+        ctBridgeResultElementAddress(index),
+        ctBridgeResultElementSize(index)
+    )) else if (ctBridgeOpaqueType(type)) {
+        ctBridgeUnbox(ctBridgeResultElementScalar(index))
+    } else bootstrapEvalInvalid()
+
+// Reads the result by the declared type, as a stub would.
+fun ctBridgeLoopbackRead(rawType: string): BootstrapEvalValue {
+    val type = ctBridgeTypeText(rawType)
+    val element = ctBridgeArrayElement(type)
+    var result = bootstrapEvalInvalid()
+    if (ctBridgeResult().kind == "invalid") result = bootstrapEvalInvalid()
+    else if (type == "" || type == "void") result = bootstrapEvalVoid()
+    else if (type == "int") {
+        result = bootstrapEvalInteger(ctBridgeResultScalar())
+    } else if (type == "bool") {
+        result = bootstrapEvalBoolean(ctBridgeResultScalar() != 0)
+    } else if (type == "string") {
+        result = bootstrapEvalString(ctBridgeLoopbackText(
+            ctBridgeResultAddress(), ctBridgeResultSize()
+        ))
+    } else if (ctBridgeOpaqueType(type)) {
+        result = ctBridgeUnbox(ctBridgeResultScalar())
+    } else if (element != "") {
+        val elements: array<BootstrapEvalValue> = []
+        val count = ctBridgeResultSize()
+        var index = 0
+        while (index < count) {
+            elements.append(ctBridgeLoopbackElement(index, element))
+            index = index + 1
+        }
+        result = bootstrapEvalArray(elements)
+    }
+    result
+}
+
+// The routed extern `name` resolves to, or -1.
+fun ctBridgeLoopbackTarget(
+    var evaluator: BootstrapEvaluator,
+    name: string
+): int {
+    var found = -1
+    var node = evaluator.firstNamed(name)
+    while (found < 0 && node >= 0) {
+        val index = evaluator.namedDeclaration(node)
+        if (evaluator.declarations[index].name == name &&
+            ctBridgeRoutesExtern(evaluator.declarations[index])) found = index
+        node = evaluator.nextNamed(node)
+    }
+    found
+}
+
+fun ctBridgeLoopbackCall(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    target: int
+): BootstrapEvalValue {
+    val declaration = evaluator.declarations[target]
+    // Native code computes every argument before the stub runs, so nested
+    // calls in an argument finish before this call stages anything.
+    val values: array<BootstrapEvalValue> = []
+    var index = 0
+    while (index < expression.children.size) {
+        values.append(bootstrapEvalUnwrapBorrow(
+            evaluator.evaluate(expression.children[index])
+        ))
+        index = index + 1
+    }
+    val serial = ctBridgeEnter(evaluator, expression.begin, expression.end)
+    var valid = values.size == declaration.parameters.size
+    index = 0
+    while (valid && index < values.size) {
+        valid = ctBridgeLoopbackStage(
+            values[index],
+            if (index < declaration.parameterTypes.size)
+                declaration.parameterTypes[index] else ""
+        )
+        index = index + 1
+    }
+    var result = bootstrapEvalInvalid()
+    if (valid) {
+        ctBridgeInvoke(declaration.name)
+        result = ctBridgeLoopbackRead(declaration.resultType)
+        // The dispatch counted the failed call; the interpreter's call site
+        // counts an invalid result again.
+        if (result.kind == "invalid") evaluator.errors = evaluator.errors - 1
+    } else ctBridgeClearStaging()
+    ctBridgeLeave(serial)
+    result
+}

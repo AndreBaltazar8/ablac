@@ -1,5 +1,7 @@
 import "sema.ab"
 import "abla/unsafe/memory/raw"
+import "ct_bridge.ab"
+import "compile_actions.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
@@ -4602,7 +4604,15 @@ class BootstrapEvaluator(
                 return result
             }
         }
-        result = bootstrapEvaluateIntrinsicCall(
+        // ABLA_COMPILE_EVAL=bridge performs routed externs through the
+        // native-code bridge (src/ct_bridge.ab) instead of directly.
+        val routed = if (callable.kind != "closure" &&
+            ctBridgeLoopbackEnabled()) {
+            ctBridgeLoopbackTarget(this, targetName)
+        } else -1
+        if (routed >= 0) {
+            result = ctBridgeLoopbackCall(this, expression, routed)
+        } else result = bootstrapEvaluateIntrinsicCall(
             this, expression, targetName, result
         )
         var declarationIndexNode = this.firstNamed(targetName)
@@ -5552,6 +5562,8 @@ fun bootstrapEvaluateUncommon(
     42 -> bootstrapEvaluateBitwise(evaluator, expression)
     50 -> bootstrapEvaluateDoWhile(evaluator, expression)
     52 -> bootstrapEvaluateCallValue(evaluator, expression)
+    // An argument native code passed to an intrinsic (src/ct_bridge.ab).
+    53 -> ctBridgeArgument(expression)
     else -> bootstrapEvalInvalid()
 }
 
@@ -5630,6 +5642,7 @@ fun bootstrapEvalCase(expression: BootstrapExpression): int {
     if (expression.kind == "do.while") return 50
     if (expression.kind == "for") return 51
     if (expression.kind == "call.value") return 52
+    if (expression.kind == "bridge.value") return 53
     0
 }
 
@@ -8182,6 +8195,10 @@ fun bootstrapEvaluateCallCompiler(
         targetName == "compilerFunctionResultType" ||
         targetName == "compilerFunctionAnnotationCount" ||
         targetName == "compilerFunctionAnnotation" ||
+        targetName == "compilerFunctionAnnotationArgumentCount" ||
+        targetName == "compilerFunctionAnnotationArgumentKind" ||
+        targetName == "compilerFunctionAnnotationArgumentText" ||
+        targetName == "compilerFunctionAnnotationArgument" ||
         targetName == "compilerFunctionIsCompileOnly" ||
         targetName == "compilerFunctionIsTrusted" ||
         targetName == "compilerFunctionIsExternal") {
@@ -8281,6 +8298,47 @@ fun bootstrapEvaluateCallCompiler(
                         declaration.annotations[annotation]
                     )
                 } else evaluator.errors = evaluator.errors + 1
+            }
+            // An annotation's argument: `@route("/users")` has one, a bare
+            // `@marker` none. Literals report their kind and text; any
+            // argument is also available as a syntax handle.
+            if (targetName == "compilerFunctionAnnotationArgumentCount" ||
+                targetName == "compilerFunctionAnnotationArgumentKind" ||
+                targetName == "compilerFunctionAnnotationArgumentText" ||
+                targetName == "compilerFunctionAnnotationArgument") {
+                val annotation = evaluator.evaluate(
+                    expression.children[1]
+                ).integer
+                val argument = if (expression.children.size > 2) {
+                    evaluator.evaluate(expression.children[2]).integer
+                } else 0
+                val present = annotation >= 0 &&
+                    annotation < declaration.annotations.size &&
+                    annotation < declaration.annotationArguments.size &&
+                    declaration.annotationArguments[annotation].kind !=
+                        "missing"
+                if (annotation < 0 ||
+                    annotation >= declaration.annotations.size) {
+                    evaluator.errors = evaluator.errors + 1
+                } else if (targetName ==
+                    "compilerFunctionAnnotationArgumentCount") {
+                    result = bootstrapEvalInteger(if (present) 1 else 0)
+                } else if (!present || argument != 0) {
+                    evaluator.errors = evaluator.errors + 1
+                } else {
+                    val value = declaration.annotationArguments[annotation]
+                    if (targetName ==
+                        "compilerFunctionAnnotationArgumentKind") {
+                        result = bootstrapEvalString(value.kind)
+                    }
+                    if (targetName ==
+                        "compilerFunctionAnnotationArgumentText") {
+                        result = bootstrapEvalString(value.text)
+                    }
+                    if (targetName == "compilerFunctionAnnotationArgument") {
+                        result = evaluator.syntaxValue(value)
+                    }
+                }
             }
             if (targetName == "compilerFunctionIsCompileOnly") {
                 result = bootstrapEvalBoolean(
@@ -8382,21 +8440,51 @@ fun bootstrapEvaluateCallCompiler(
             }
         } else evaluator.errors = evaluator.errors + 1
     }
+    // Literal top-level `#compilerRegisterSubparser`, `#compilerGrant` and
+    // `#compilerGenerateModule` actions are collected from source before any
+    // compile-time code runs and are never evaluated. Reaching one here means
+    // compile-time code called it.
     if (targetName == "compilerRegisterSubparser") {
         var argument = 0
         while (argument < expression.children.size) {
             evaluator.evaluate(expression.children[argument])
             argument = argument + 1
         }
+        evaluator.recordEvaluatorDiagnostic(
+            "E_EXT_SUBPARSER_REGISTRATION",
+            "compilerRegisterSubparser registers a subparser only as a literal top-level action (`#compilerRegisterSubparser(\"name\", handler)`): subparsers are registered before any compile-time code runs"
+        )
+        evaluator.errors = evaluator.errors + 1
         result = bootstrapEvalVoid()
     }
     if (targetName == "compilerGrant") {
         evaluator.evaluate(expression.children[0])
+        evaluator.recordEvaluatorDiagnostic(
+            "E_COMPILE_GRANT_PHASE",
+            "compilerGrant grants a capability only as a literal top-level action (`#compilerGrant(\"capability\")`), so that every grant is visible in source"
+        )
+        evaluator.errors = evaluator.errors + 1
         result = bootstrapEvalVoid()
     }
     if (targetName == "compilerGenerateModule") {
-        evaluator.evaluate(expression.children[0])
-        evaluator.evaluate(expression.children[1])
+        val namespace = evaluator.evaluate(expression.children[0])
+        val source = evaluator.evaluate(expression.children[1])
+        if (!bootstrapCompilerTransformActive) {
+            evaluator.recordEvaluatorDiagnostic(
+                "E_EXT_GENERATED_MODULE_PHASE",
+                "compilerGenerateModule adds a module only as a literal top-level action or from a compiler.transform handler, which run before the program is analyzed; this call ran after"
+            )
+            evaluator.errors = evaluator.errors + 1
+        } else if (namespace.kind != "string" || source.kind != "string" ||
+            !bootstrapStageGeneratedModule(BootstrapGeneratedModuleRequest(
+                namespace.text, source.text
+            ))) {
+            evaluator.recordEvaluatorDiagnostic(
+                "E_EXT_GENERATED_MODULE_REQUEST",
+                "compilerGenerateModule requires a unique non-empty namespace and at most 65536 bytes of source"
+            )
+            evaluator.errors = evaluator.errors + 1
+        }
         result = bootstrapEvalVoid()
     }
     if (targetName == "compilerReplaceFunctionBody") {
