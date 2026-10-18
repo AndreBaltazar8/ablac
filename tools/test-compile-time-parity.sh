@@ -26,7 +26,9 @@
 # Results: build/compile-time-parity/results.tsv (case, mode, status, detail),
 # one directory per case and mode with both programs, their output and the logs.
 # Status: pass | mismatch | compile-failed | runtime-skipped (the program itself
-# doesn't build or run here) | timeout.
+# doesn't build here or doesn't finish) | timeout | interp-threads (a timeout
+# under the interpreter in a program that starts a thread: its body runs only
+# when awaited, docs/compile-time.md#threads-at-compile-time).
 set -uo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -136,8 +138,11 @@ run_case() { # kind name source mode
         rm -f "$dir/$base.ab"
     fi
     build_and_run "$dir" runtime runtime.ab "$mode"
+    # A program that doesn't build, or doesn't finish (a server waiting for
+    # clients), has no run-time result to compare.
     if [[ $(cat "$dir/runtime.status") != "exit 0" && $kind == probe ]] ||
-        [[ $(cat "$dir/runtime.status") == build* ]]; then
+        [[ $(cat "$dir/runtime.status") == build* ]] ||
+        [[ $(cat "$dir/runtime.status") == "exit 124" ]]; then
         status=runtime-skipped
         detail="runtime $(cat "$dir/runtime.status"): $(first_error "$dir/runtime.err")"
     else
@@ -160,6 +165,12 @@ run_case() { # kind name source mode
             "build 124" | "build 137" | "build 152")
                 status=timeout
                 detail="compile-time evaluation exceeded ${seconds}s"
+                # The interpreter runs a thread's body when it is awaited, so a
+                # program that waits on its own thread first can't finish there.
+                if [[ $mode == interp ]] && grep -q 'thread {' "$source"; then
+                    status=interp-threads
+                    detail="waits on a thread the interpreter runs only at await"
+                fi
                 ;;
             build*)
                 status=compile-failed
@@ -201,7 +212,7 @@ find "$output/cases" -name result.tsv -exec cat {} + | sort >"$output/results.ts
 echo
 for mode in $modes; do
     printf '%s:' "$mode"
-    for status in pass mismatch compile-failed timeout runtime-skipped; do
+    for status in pass mismatch compile-failed timeout interp-threads runtime-skipped; do
         printf ' %s %d' "$status" \
             "$(awk -F'\t' -v m="$mode" -v s="$status" '$2 == m && $3 == s' \
                 "$output/results.tsv" | wc -l | tr -d ' ')"

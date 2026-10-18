@@ -554,6 +554,17 @@ mode moves an evaluation that hits the depth limit onto the JIT.
 Memory introspection (`memoryLiveBytes`, `memoryCollect`, ...) has no
 meaning inside the compiler, and is not available at compile time.
 
+### Threads at compile time
+
+The compile-time interpreter runs one thing at a time. A `thread { }` body
+doesn't start when the thread is created; it runs when the thread is
+awaited. Code that waits for its own thread before awaiting it never
+finishes under `#`: a server that accepts a connection from a client thread
+it started, or a loop that waits for a flag the thread sets. The evaluation
+runs until the compiler's time limit stops it. Await the thread before
+anything waits on it, or keep such code at run time. Threads that run
+alongside each other under `#` come with the JIT tier.
+
 ## Declaration blocks
 
 In compile-time code, braces whose first member is a declaration (`fun`,
@@ -591,6 +602,7 @@ compiler team tracks the remaining gaps case by case.
 |---|---|
 | Functions, recursion, classes and methods, arrays, `Map`, strings, string templates | works |
 | Closures used within one evaluation; tasks and `await` | works |
+| `thread { }` | runs when it is awaited, not alongside the code that started it ([threads at compile time](#threads-at-compile-time)) |
 | Generators | being fixed |
 | `f32`/`f64` arithmetic, `abla/math`, `abla/float/text` | works |
 | `abla/json`, `$json`, `$jsons` | works |
