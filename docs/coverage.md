@@ -26,9 +26,9 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Strings | `sema.ab` `string.*` | [language.md#strings](language.md#strings), [stdlib/text.md](stdlib/text.md) | good | test-string-helpers, test-string-retention |
 | Arrays (`append`, `truncate`, `clear`, `filledArray`) | `sema.ab`, `ir.ab` | [language.md#arrays](language.md#arrays) | good | test-array-filled, test-array-truncate, test-arrays-dense, test-collection-modes |
 | `Map<K, V>` | `sema.ab` `map.*`, `ir.ab` | [language.md#maps](language.md#maps) | good | test-map |
-| Nullable types and narrowing | `sema.ab` refinement | [language.md#nullable-types](language.md#nullable-types) | good | test-narrowing-and-branches, test-nullable-refinement† |
+| Nullable types and narrowing | `sema.ab` refinement | [language.md#nullable-types](language.md#nullable-types) | good | test-narrowing-and-branches, test-nullable-refinement |
 | Nominal `type X = int` | `parser.ab`, `sema.ab` | [language.md#nominal-types](language.md#nominal-types) | good | test-nominal-scalars |
-| `void`, `never` | `sema.ab` divergence, `ir.ab` unreachable | [language.md#void-and-never](language.md#void-and-never) | good | test-exhaustive-when† |
+| `void`, `never` | `sema.ab` divergence, `ir.ab` unreachable | [language.md#void-and-never](language.md#void-and-never) | good | test-exhaustive-when |
 | Functions, defaults, named arguments | `parser.ab`, `module.ab` normalizer | [language.md#functions](language.md#functions) | good | test-named-default-arguments, test-argument-diagnostics |
 | Inferred result types | `sema.ab` | [language.md#functions](language.md#functions) (known issue) | good | — |
 | Extension functions | `parser.ab` `parseDeclaration` | [language.md#extension-functions](language.md#extension-functions) | good | test-line-continuation, test-nominal-scalars |
@@ -39,13 +39,13 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Delegated bindings `by`, `^name` | `parser.ab`, `sema.ab` | [language.md#delegated-bindings](language.md#delegated-bindings) | good | test-delegated-bindings |
 | Overloads, `operator fun` | `overload.ab`, `parser.ab` | [language.md#overloads-and-operator-functions](language.md#overloads-and-operator-functions) | good | test-overloads, test-overload-probe-filter |
 | Operator precedence, compound assignment | `parser.ab` | [language.md#expressions-and-operators](language.md#expressions-and-operators) | good | test-compound-assignment |
-| `if`/`when`, exhaustiveness | `parser.ab`, `sema.ab` | [language.md#control-flow](language.md#control-flow) | good | test-exhaustive-when†, exhaustive-when (native) |
-| Loops, ranges, `break`/`continue`/`return` | `parser.ab`, `sema.ab` | [language.md#control-flow](language.md#control-flow) | good | test-for-range†, test-loop-control†, test-return-control |
-| Imports, aliases | `module.ab` | [language.md#modules-and-imports](language.md#modules-and-imports) | good | test-import-alias, test-import-aliases†, test-module-shadowing |
+| `if`/`when`, exhaustiveness | `parser.ab`, `sema.ab` | [language.md#control-flow](language.md#control-flow) | good | test-exhaustive-when, exhaustive-when (native) |
+| Loops, ranges, `break`/`continue`/`return` | `parser.ab`, `sema.ab` | [language.md#control-flow](language.md#control-flow) | good | test-for-range, test-loop-control, test-return-control |
+| Imports, aliases | `module.ab` | [language.md#modules-and-imports](language.md#modules-and-imports) | good | test-import-alias, test-import-aliases, test-module-shadowing |
 | Contract imports | `module.ab`, `sema.ab` | [language.md#contract-imports](language.md#contract-imports) | reference | test-contract-imports |
 | Source providers, packages | `package.ab` | [packages.md](packages.md) | reference | test-package-providers |
 | Annotations `@export`, `@exportChecked`, `@inline`, `@noinline`, `@naked`, `@section`, `@wasmImport` | `sema.ab`, `ir.ab`, backend | [language.md#annotations](language.md#annotations), [llvm-backend.md](llvm-backend.md), [toolchain.md](toolchain.md) | good | test-wasm-export-extern, test-wasm-import-module, test-internal-function, test-xtensa-interrupt-handler |
-| `trusted`, `extern` kinds, `noescape` | `parser.ab`, `sema.ab` | [language.md#trusted-native-implementations](language.md#trusted-native-implementations) | reference | test-unsafe-boundary†, test-native-libraries |
+| `trusted`, `extern` kinds, `noescape` | `parser.ab`, `sema.ab` | [language.md#trusted-native-implementations](language.md#trusted-native-implementations) | reference | test-unsafe-boundary, test-native-libraries |
 | Native ABI, exports | backend | [language.md#native-declarations](language.md#native-declarations), [compiler-api.md](compiler-api.md) | reference | test-value-abi, test-native-cstring-lifetime |
 | Inline assembly | `sema.ab`, `ir.ab` | [llvm-backend.md](llvm-backend.md), [subparsers.md](subparsers.md) | reference | test-internal-function, test-xtensa-interrupt-handler |
 | Memory management, collection modes | runtime, `stdlib/abla/memory` | [language.md#memory-management](language.md#memory-management), [standard-library.md](standard-library.md) | reference | test-runtime-memory, test-memory-checkpoint, test-memory-drop-root |
@@ -57,12 +57,12 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | Parameter modes (borrow, `var`, `own`) | `sema.ab` | [ownership.md#parameters-borrow-var-and-own](ownership.md#parameters-borrow-var-and-own) | good | test-borrow-duplicates, test-ownership-help |
 | Aliases, `E_BORROW_CONFLICT` | `sema.ab`, `ir.ab` | [ownership.md#changing-objects-through-references](ownership.md#changing-objects-through-references) | good | test-borrow-lifetimes |
 | Returning managed references, `borrow(name)` results | `sema.ab` | [ownership.md#returning-references](ownership.md#returning-references) | good | managed-return-global, managed-return-stored-global, test-borrow-lifetimes |
-| `resource class`, `drop`, `move`, field and element moves | `parser.ab`, `sema.ab`, `ir.ab` drop helpers | [ownership.md#resources-values-with-one-owner](ownership.md#resources-values-with-one-owner) | good | test-affine-move†, resource-drop (native), test-ownership-shadows-and-globals |
+| `resource class`, `drop`, `move`, field and element moves | `parser.ab`, `sema.ab`, `ir.ab` drop helpers | [ownership.md#resources-values-with-one-owner](ownership.md#resources-values-with-one-owner) | good | test-affine-move, resource-drop (native), test-ownership-shadows-and-globals |
 | Arrays of resources, `for (x in move(a))`, await on a borrowed task | `sema.ab` | [ownership.md#collections-of-resources](ownership.md#collections-of-resources) | good | test-generators-tasks |
 | `Shared` views, `Borrow<T>`, `borrow(...)` results | `sema.ab` | [ownership.md#borrowed-views-and-borrow-results](ownership.md#borrowed-views-and-borrow-results) | good | test-borrow-lifetimes |
-| `Cell`, `Shared`, `Weak`, `Mutex` | `sema.ab`, runtime | [ownership.md#sharing-cell-shared-weak-mutex](ownership.md#sharing-cell-shared-weak-mutex) | good | test-shared-ownership†, test-mutex†, interior-cell (native) |
-| `Fn`/`FnMut`/`FnOnce`/`FnNoEscape`, `move { }` | `sema.ab` | [ownership.md#closures-and-ownership](ownership.md#closures-and-ownership) | good | test-callable-families†, test-scoped-region† |
-| Regions | `parser.ab`, `sema.ab` | [regions.md](regions.md) | good | test-scoped-region†, scoped-region (native) |
+| `Cell`, `Shared`, `Weak`, `Mutex` | `sema.ab`, runtime | [ownership.md#sharing-cell-shared-weak-mutex](ownership.md#sharing-cell-shared-weak-mutex) | good | test-shared-ownership, test-mutex, interior-cell (native) |
+| `Fn`/`FnMut`/`FnOnce`/`FnNoEscape`, `move { }` | `sema.ab` | [ownership.md#closures-and-ownership](ownership.md#closures-and-ownership) | good | test-callable-families, test-scoped-region |
+| Regions | `parser.ab`, `sema.ab` | [regions.md](regions.md) | good | test-scoped-region, scoped-region (native) |
 
 ## Compile time
 
@@ -72,13 +72,13 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | `compile fun` | `parser.ab`, `sema.ab` | [compile-time.md#compile-fun](compile-time.md#compile-fun) | good | many compiler tests |
 | Top-level actions, literal-only actions | `parser.ab`, `staged_parser.ab`, `backend.ab` | [compile-time.md#top-level-actions](compile-time.md#top-level-actions) | good | test-compiler-service-slices† |
 | `compile val`, `compile var` | `eval.ab` | [compile-time.md#compile-val-and-compile-var](compile-time.md#compile-val-and-compile-var) | good | compile-globals |
-| Capabilities, `abla.toml`, `compilerGrant` | `sema.ab`, `module.ab`, `eval.ab` | [compile-time.md#capabilities-files-environment-processes-network](compile-time.md#capabilities-files-environment-processes-network) | good | test-compile-effects†, test-compile-effect-path |
+| Capabilities, `abla.toml`, `compilerGrant` | `sema.ab`, `module.ab`, `eval.ab` | [compile-time.md#capabilities-files-environment-processes-network](compile-time.md#capabilities-files-environment-processes-network) | good | test-compile-effects, test-compile-effect-path |
 | Step limit, `ABLA_EVAL_STEP_LIMIT` | `eval.ab` | [compile-time.md#limits](compile-time.md#limits) | good | test-eval-steps |
 | Declaration blocks | `parser.ab`, `sema.ab`, `eval.ab` | [compile-time.md#declaration-blocks](compile-time.md#declaration-blocks) | reference | test-independent-modules |
 | `ABLA_COMPILE_EVAL` (interpreter / JIT) | in progress | — | missing | — |
 | Compiler reflection, transforms, generated modules, exports | `eval.ab`, `stdlib/abla/compiler` | [compiler-api.md](compiler-api.md) | good (reflection, transforms, types run; generated modules reference) | compiler tests (69 files) |
 | Subparsers `$name` | `subparser.ab`, `stdlib/abla/compiler/parser` | [subparsers.md](subparsers.md) | good (tutorial runs) | subparser tests (34 files) |
-| Programmable builds | `toolchain.ab`, `stdlib/abla/build` | [programmable-builds.md](programmable-builds.md) | reference | test-programmable-build†, test-target-descriptors† |
+| Programmable builds | `toolchain.ab`, `stdlib/abla/build` | [programmable-builds.md](programmable-builds.md) | reference | test-programmable-build†, test-target-descriptors |
 
 ## Concurrency
 
