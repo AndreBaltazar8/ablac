@@ -2,7 +2,8 @@
 # A module value first demanded while lowering (through an extension method call)
 # initializes after the values its initializer reads, not before them; so does one
 # whose initializer reads through a call lowering inserts (a float template part's
-# f64Text reads abla/float/text's tables), at run time and under `#` in both tiers.
+# f64Text reads abla/float/text's tables), also inside a function the initializer
+# calls, at run time and under `#` in both tiers.
 set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=${1:-$project_root/build/ablac}
@@ -20,14 +21,16 @@ expect_42() { # name program
     set -e
     [[ $status -eq 42 ]] || { echo "global init order: $1 exited $status, expected 42" >&2; exit 1; }
 }
-template_case="$project_root/tests/cases/modules/global-init-template-floats.ab"
-"$compiler" build "$template_case" -o "$output_root/template" --no-cache
-expect_42 "template floats at run time" "$output_root/template"
-sed -E 's/^fun main: int =/fun checked(): int =/' "$template_case" > "$output_root/staged.ab"
-printf '\nfun main: int = #checked()\n' >> "$output_root/staged.ab"
-for mode in interp jit; do
-    ABLA_COMPILE_EVAL=$mode "$compiler" build "$output_root/staged.ab" \
-        -o "$output_root/staged-$mode" --no-cache
-    expect_42 "template floats under # ($mode)" "$output_root/staged-$mode"
+for template in floats call; do
+    template_case="$project_root/tests/cases/modules/global-init-template-$template.ab"
+    "$compiler" build "$template_case" -o "$output_root/template-$template" --no-cache
+    expect_42 "template $template at run time" "$output_root/template-$template"
+    sed -E 's/^fun main: int =/fun checked(): int =/' "$template_case" > "$output_root/staged-$template.ab"
+    printf '\nfun main: int = #checked()\n' >> "$output_root/staged-$template.ab"
+    for mode in interp jit; do
+        ABLA_COMPILE_EVAL=$mode "$compiler" build "$output_root/staged-$template.ab" \
+            -o "$output_root/staged-$template-$mode" --no-cache
+        expect_42 "template $template under # ($mode)" "$output_root/staged-$template-$mode"
+    done
 done
 echo "global init order: initializers see the values they read, also through the text writers templates call"
