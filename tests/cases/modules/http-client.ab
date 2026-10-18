@@ -1,4 +1,5 @@
 import "abla/http"
+import "abla/net"
 
 fun fakeTlsExchange(
     request: string,
@@ -13,9 +14,47 @@ fun fakeTlsExchange(
     ) else HttpTransportResult("", false)
 }
 
+// The program's own loopback listener (an ephemeral port), opened by main.
+var loopbackListener = -1
+
+// One exchange over real loopback sockets, in one thread: the client connects
+// to the program's own listener and sends, the server side answers and
+// closes, then the client reads to the end.
+fun loopbackExchange(
+    request: string,
+    maximum: int,
+    timeout: int
+): HttpTransportResult {
+    var listener = TcpListener(loopbackListener)
+    val client = tcpConnect(ipv4Loopback(listener.localPort()), timeout)
+    val server = if (client.descriptor >= 0) listener.accept() else TcpConnection(-1)
+    listener.descriptor = -1
+    if (client.descriptor < 0 || server.descriptor < 0) {
+        return HttpTransportResult("", false)
+    }
+    val sent = client.write(request) == request.size
+    val received = server.readWithTimeoutResult(65536, timeout)
+    val valid = received.hasData() &&
+        received.bytes.slice(0, 21) == "GET /hello HTTP/1.1\r\n"
+    val body = if (valid) "hello" else "bad"
+    server.write("HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\n\r\n$body")
+    server.close()
+    var response = ""
+    var reading = sent
+    while (reading && response.size < maximum) {
+        val chunk = client.readWithTimeout(maximum - response.size, timeout)
+        if (chunk.size > 0) response = "$response$chunk" else reading = false
+    }
+    client.close()
+    HttpTransportResult(response, sent)
+}
+
 fun main: int {
-    val network = httpIpv4Client("localhost:39092", "127.0.0.1", 39092)
+    var listener = tcpListenAddress(ipv4Loopback(0))
+    loopbackListener = listener.descriptor
+    val network = httpClient("localhost", loopbackExchange, 4096, 1000)
     val remote = network.send(httpGet("/hello"))
+    listener.close()
 
     val tls = httpClient("example.test", fakeTlsExchange, 4096, 1000)
     val synthetic = tls.send(httpGet("/fake"))

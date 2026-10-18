@@ -36,7 +36,7 @@ for _ in $(seq 1 100); do
 done
 [[ -e $ready ]] || exit 1
 
-"$compiler" build "$project_root/tests/cases/modules/http-client.ab" \
+"$compiler" build "$project_root/tests/cases/http-client-ipv4.ab" \
     -o "$program" --fast --no-cache
 set +e
 "$project_root/tools/run-limited.sh" "$program"
@@ -44,6 +44,15 @@ status=$?
 set -e
 wait "$server_pid"
 trap - EXIT
+[[ $status -eq 42 ]] || exit 1
+
+# The same exchanges against the program's own loopback listener.
+"$compiler" build "$project_root/tests/cases/modules/http-client.ab" \
+    -o "$output_directory/loopback" --fast --no-cache
+set +e
+"$project_root/tools/run-limited.sh" "$output_directory/loopback"
+status=$?
+set -e
 [[ $status -eq 42 ]] || exit 1
 
 printf '%s\n' 'HTTP client: bounded raw IPv4 exchange + pluggable TLS transport passed'
