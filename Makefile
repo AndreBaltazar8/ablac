@@ -192,6 +192,7 @@ test: ablac
 	tools/test-affine-move.sh $(COMPILER)
 	tools/test-field-places.sh $(COMPILER)
 	tools/test-compile-time-cell-capture.sh $(COMPILER)
+	tools/test-hosted-network.sh $(COMPILER)
 
 check: test self-rebuild
 

@@ -211,44 +211,40 @@ static int darwin_sockaddr(const void *linux_address, size_t linux_length,
   return -1;
 }
 
+// Writes `address` in Linux's layout. Like Linux, an address longer than the
+// caller's buffer is truncated to it, and the length reports the full size
+// (a 16-byte buffer still gets an IPv6 socket's family and port).
 static int linux_sockaddr(const struct sockaddr *address,
                           socklen_t address_length, void *linux_address,
                           uint32_t *linux_length) {
   if (linux_address == NULL || linux_length == NULL)
     return 0;
-  unsigned char *output = (unsigned char *)linux_address;
+  unsigned char converted[28];
+  uint32_t size = 0;
+  memset(converted, 0, sizeof(converted));
   if (address->sa_family == AF_INET &&
       address_length >= sizeof(struct sockaddr_in)) {
-    if (*linux_length < 16) {
-      errno = EINVAL;
-      return -1;
-    }
     const struct sockaddr_in *input = (const struct sockaddr_in *)address;
-    memset(output, 0, 16);
-    output[0] = 2;
-    memcpy(output + 2, &input->sin_port, 2);
-    memcpy(output + 4, &input->sin_addr, 4);
-    *linux_length = 16;
-    return 0;
-  }
-  if (address->sa_family == AF_INET6 &&
-      address_length >= sizeof(struct sockaddr_in6)) {
-    if (*linux_length < 28) {
-      errno = EINVAL;
-      return -1;
-    }
+    converted[0] = 2;
+    memcpy(converted + 2, &input->sin_port, 2);
+    memcpy(converted + 4, &input->sin_addr, 4);
+    size = 16;
+  } else if (address->sa_family == AF_INET6 &&
+             address_length >= sizeof(struct sockaddr_in6)) {
     const struct sockaddr_in6 *input = (const struct sockaddr_in6 *)address;
-    memset(output, 0, 28);
-    output[0] = 10;
-    memcpy(output + 2, &input->sin6_port, 2);
-    memcpy(output + 4, &input->sin6_flowinfo, 4);
-    memcpy(output + 8, &input->sin6_addr, 16);
-    memcpy(output + 24, &input->sin6_scope_id, 4);
-    *linux_length = 28;
-    return 0;
+    converted[0] = 10;
+    memcpy(converted + 2, &input->sin6_port, 2);
+    memcpy(converted + 4, &input->sin6_flowinfo, 4);
+    memcpy(converted + 8, &input->sin6_addr, 16);
+    memcpy(converted + 24, &input->sin6_scope_id, 4);
+    size = 28;
+  } else {
+    errno = EAFNOSUPPORT;
+    return -1;
   }
-  errno = EAFNOSUPPORT;
-  return -1;
+  memcpy(linux_address, converted, *linux_length < size ? *linux_length : size);
+  *linux_length = size;
+  return 0;
 }
 
 static long darwin_getdents(int descriptor, unsigned char *output,
