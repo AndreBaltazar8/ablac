@@ -70,7 +70,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 |---|---|---|---|---|
 | `#expression`, lifting results | `parser.ab`, `ir.ab` `bootstrapLowerCompile`, `ct_lift.ab` | [compile-time.md#expression](compile-time.md#expression) | good | test-compile-time-branch, test-compile-time-floats |
 | `compile fun` | `parser.ab`, `sema.ab` | [compile-time.md#compile-fun](compile-time.md#compile-fun) | good | many compiler tests |
-| Top-level actions, literal-only actions | `parser.ab`, `staged_parser.ab`, `backend.ab` | [compile-time.md#top-level-actions](compile-time.md#top-level-actions) | good | test-compiler-service-slices† |
+| Top-level actions, literal-only actions | `parser.ab`, `staged_parser.ab`, `backend.ab` | [compile-time.md#top-level-actions](compile-time.md#top-level-actions) | good | test-compiler-service-slices |
 | `compile val`, `compile var` | `eval.ab` | [compile-time.md#compile-val-and-compile-var](compile-time.md#compile-val-and-compile-var) | good | compile-globals |
 | Capabilities, `abla.toml`, `compilerGrant` | `sema.ab`, `module.ab`, `eval.ab` | [compile-time.md#capabilities-files-environment-processes-network](compile-time.md#capabilities-files-environment-processes-network) | good | test-compile-effects, test-compile-effect-path |
 | Step limit, `ABLA_EVAL_STEP_LIMIT` | `eval.ab` | [compile-time.md#limits](compile-time.md#limits) | good | test-eval-steps |
@@ -78,7 +78,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | `ABLA_COMPILE_EVAL` (interpreter / JIT) | in progress | — | missing | — |
 | Compiler reflection, transforms, generated modules, exports | `eval.ab`, `stdlib/abla/compiler` | [compiler-api.md](compiler-api.md) | good (reflection, transforms, types run; generated modules reference) | compiler tests (69 files) |
 | Subparsers `$name` | `subparser.ab`, `stdlib/abla/compiler/parser` | [subparsers.md](subparsers.md) | good (tutorial runs) | subparser tests (34 files) |
-| Programmable builds | `toolchain.ab`, `stdlib/abla/build` | [programmable-builds.md](programmable-builds.md) | reference | test-programmable-build†, test-target-descriptors |
+| Programmable builds | `toolchain.ab`, `stdlib/abla/build` | [programmable-builds.md](programmable-builds.md) | reference | test-programmable-build, test-target-descriptors |
 
 ## Concurrency
 

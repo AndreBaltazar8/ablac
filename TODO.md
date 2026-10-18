@@ -27,14 +27,24 @@ called out below.
   load it with an acquire load (or flatten under the node's lock), so no reader loads the
   children after another thread cleared them.
 
-- [ ] **`tools/test-wasm-mvc-extension.sh` checks a stale symbol.** It greps
-  `llvm-readobj --symbols` for `abla_mvc_revision`, but a linked module's symbol table
-  lists name-section names (`app.revision`); the export itself is present. Check the
-  export section instead. (Before `087b3b6` the build failed earlier.)
 - [ ] **An operator in a parameter default is not rewritten.** `fun f(b: N = N(1) + N(2))`
   with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
   `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
   not `parameterDefaults` (a method's defaults likewise).
+- [ ] **Checked exports don't build.** `exportCheckedFunction` (language.md, "Checked export
+  adapters") fails every build with `E_IR_EMISSION`: the adapter calls `abla_checked_invoke`,
+  which `backend/llvm/runtime.ab` declares but nothing has defined since the runtime moved to
+  Abla (`93ce196`). On a target without the capability the IR failure also hides
+  `E_EXPORT_TARGET_CAPABILITY`. `tools/test-wasm-mvc-extension.sh` covers both and stays out of
+  the suite until they work.
+- [ ] **No SIGTERM drain on macOS.** `tcpEnableGracefulShutdown` blocks SIGTERM and reads it
+  from a signalfd; `runtime/abla_darwin_compat.c` returns `ENOSYS` for `rt_sigprocmask` and
+  `signalfd4`, so a Mach-O server stops mid-request on SIGTERM (kqueue `EVFILT_SIGNAL` could
+  back it). `tools/test-graceful-reload.sh` skips on Darwin until then.
+- [ ] **Linking a hosted Linux artifact on macOS fails obscurely.** A `x86_64-linux`
+  executable or shared library built on a Mac reaches the host's Mach-O `ld64.lld` with ELF
+  flags (`unknown argument '--gc-sections'`); there is no Linux sysroot to link against
+  either. Reject it up front with a target diagnostic.
 
 ## Packages
 

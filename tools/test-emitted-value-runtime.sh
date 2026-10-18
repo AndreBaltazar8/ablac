@@ -32,19 +32,20 @@ done
     "$project_root/tests/cases/modules/vm.ab" \
     > "$output_directory/runtime.ll"
 
-legacy='abla_(as_cstring|divide|equal|not_equal|to_string|string_data|array_|object_|cell_|closure|string_(static|concat|length|get|slice))'
-if rg -q "^define .*@${legacy}" "$output_directory/runtime.ll"; then
-    echo "generated LLVM duplicated the portable value runtime" >&2
-    rg "^define .*@${legacy}" "$output_directory/runtime.ll" >&2
-    exit 1
-fi
-rg -q '^declare .*@abla_string_concat' "$output_directory/runtime.ll"
-rg -q '^declare .*@abla_to_string' "$output_directory/runtime.ll"
-rg -q '^declare .*@abla_equal' "$output_directory/runtime.ll"
+# The value runtime is Abla compiled into each module: every function of it
+# is defined there once, internal, and never left for another object to
+# supply (the packaging is test-native-platform-boundary.sh's).
+ir=$output_directory/runtime.ll
+for function in abla_string_concat abla_to_string abla_equal abla_string_data; do
+    definitions=$(rg -c "^define .*@${function}\\(" "$ir" || true)
+    internal=$(rg -c "^define internal .*@${function}\\(" "$ir" || true)
+    declarations=$(rg -c "^declare .*@${function}\\(" "$ir" || true)
+    if [[ $definitions != 1 || $internal != 1 || -n $declarations ]]; then
+        echo "generated LLVM: $function is not one internal definition" >&2
+        exit 1
+    fi
+done
 [[ -s $output_directory/value-runtime.o ]] || exit 1
 [[ ! -e $output_directory/value-runtime.value-runtime.o ]] || exit 1
-[[ ! -e $output_directory/value-runtime.host.o ]] || exit 1
-nm --defined-only "$output_directory/value-runtime.o" |
-    rg ' [Tt] abla_string_data$' >/dev/null
 
-echo "portable value runtime: strings, ropes, formatting, equality, and one linked implementation"
+echo "portable value runtime: strings, ropes, formatting, equality, and one internal implementation per module"

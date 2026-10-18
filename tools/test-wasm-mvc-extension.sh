@@ -35,7 +35,11 @@ set -e
 
 llvm-readobj --file-headers "$module" | grep -q 'Format: WASM'
 llvm-readobj --file-headers "$module" | grep -q 'Arch: wasm32'
-llvm-readobj --symbols "$module" | grep -q 'Name: abla_mvc_revision'
+# The export section, not the symbol table: a linked module's symbols are its
+# name section's `<module>.<function>` names.
+node -e 'const { readFileSync } = require("node:fs");
+const exports = WebAssembly.Module.exports(new WebAssembly.Module(readFileSync(process.argv[1])));
+process.exit(exports.some((entry) => entry.name === "abla_mvc_revision") ? 0 : 1);' "$module"
 [[ ! -e $module.value-runtime.o ]] || exit 1
 [[ ! -e $module.wasm-platform.o ]] || exit 1
 grep -q '"schema":"abla.abi.v1"' "$abi_manifest"
@@ -64,12 +68,15 @@ unsafe_module="$output_directory/unsafe-memory.wasm"
     -o "$output_directory/unsafe-memory-driver" --fast --no-cache
 # Primitive scalar operations belong to LLVM lowering, not to an Abla runtime
 # wrapper. The portable text algorithms below remain ordinary Abla functions.
+# The runtime's boxed-value operations are Abla functions of every module (the
+# library's boxed JSON code adds through one), so nothing may call the scalar
+# comparison and bit wrappers.
 grep -q 'scalar.add' "$unsafe_module.ll"
 grep -q 'scalar.bit.and' "$unsafe_module.ll"
 grep -q 'scalar.shift.left' "$unsafe_module.ll"
-if grep -Eq '^define .*@(abla_add|abla_less|ablaBitAnd|ablaBitShiftLeft)\(' \
+if grep -Eq 'call .*@(abla_less|ablaBitAnd|ablaBitShiftLeft)\(' \
     "$unsafe_module.ll"; then
-    echo "WASM proof unexpectedly defines primitive runtime wrappers" >&2
+    echo "WASM proof unexpectedly calls primitive runtime wrappers" >&2
     exit 1
 fi
 grep -Eq '^define .*@ablaTextIsValidUtf8\(' "$unsafe_module.ll"

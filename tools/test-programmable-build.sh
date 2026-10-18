@@ -3,6 +3,13 @@ set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# Its build graphs target x86_64-linux: the programs they build run here and
+# their artifacts are checked as ELF. Elsewhere there is nothing to run them on.
+if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
+    echo "programmable build: skipped on $(uname -s) $(uname -m) (builds and runs x86_64-linux programs)"
+    exit 0
+fi
 output_directory="$project_root/build/programmable-build"
 mkdir -p "$output_directory"
 
@@ -81,36 +88,22 @@ clang "$project_root/tests/cases/program-build/export-scalar-caller.c" \
     -o "$output_directory/export-scalar-caller"
 "$output_directory/export-scalar-caller"
 
-llvm-readelf -h "$output_directory/program.o" | grep -q 'REL (Relocatable file)'
-llvm-ar t "$output_directory/libprogram.a" | grep -q '.o$'
-llvm-readelf -h "$output_directory/libabla_app.so" | \
-    grep -q 'DYN (Shared object file)'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_answer$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_next$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_resource_next$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_add$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_i8_identity$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_u64_identity$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_bytes_score$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_bytes_length$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_echo_bytes$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_invoke$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_app_checked_divide$'
-llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_owned_bytes_release$'
-if llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_global_'; then
+grep -q 'REL (Relocatable file)' <<<"$(llvm-readelf -h "$output_directory/program.o")"
+grep -q '.o$' <<<"$(llvm-ar t "$output_directory/libprogram.a")"
+grep -q 'DYN (Shared object file)' <<<"$(llvm-readelf -h "$output_directory/libabla_app.so")"
+grep -q ' abla_app_answer$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_next$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_resource_next$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_add$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_i8_identity$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_u64_identity$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_bytes_score$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_bytes_length$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_echo_bytes$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_invoke$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_app_checked_divide$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+grep -q ' abla_owned_bytes_release$' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"
+if grep -q ' abla_global_' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"; then
     echo "internal Abla global escaped the shared-library ABI" >&2
     exit 1
 fi
@@ -140,8 +133,7 @@ grep -q '"panic":"contained","statusAbi":"i32"' \
     "$output_directory/libabla_app.so.abi.json"
 grep -q '"panicContainment":"sjlj"' \
     "$output_directory/libabla_app.so.abi.json"
-if llvm-nm -D --defined-only "$output_directory/libabla_app.so" | \
-    grep -q ' abla_fn_'; then
+if grep -q ' abla_fn_' <<<"$(llvm-nm -D --defined-only "$output_directory/libabla_app.so")"; then
     echo "internal Abla function symbol escaped the shared-library ABI" >&2
     exit 1
 fi

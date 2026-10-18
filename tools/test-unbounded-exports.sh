@@ -17,14 +17,17 @@ root_file=$output_directory/many-exports-root.ab
             "$index" "$index" "$index"
     done
 } >"$source_file"
-cat >"$root_file" <<'EOF'
+# A hosted library links against the host's C library: build it for the host.
+host_target=x86_64-linux
+if [[ $(uname -s) == Darwin ]]; then host_target=$(uname -m)-macos; fi
+cat >"$root_file" <<EOF
 import "abla/compiler"
 
 val scheduled = #compilerBuildProgram(
     "many-exports",
     "build/unbounded-exports/many-exports.ab",
     "build/unbounded-exports/libmany_exports.so",
-    "x86_64-linux",
+    "$host_target",
     "shared-library",
     true,
     false
@@ -36,8 +39,12 @@ EOF
 "$compiler" build "$root_file" \
     -o "$output_directory/many-exports-root" --fast --no-cache
 "$output_directory/many-exports-root"
-count=$(llvm-nm -D --defined-only \
-    "$output_directory/libmany_exports.so" | grep -c ' abla_many_')
+# The dynamic symbol table on ELF; a Mach-O library's exports are its
+# external definitions (with a leading underscore).
+symbols=(-D --defined-only)
+if [[ $host_target == *-macos ]]; then symbols=(--extern-only --defined-only); fi
+count=$(llvm-nm "${symbols[@]}" \
+    "$output_directory/libmany_exports.so" | grep -c ' _\{0,1\}abla_many_')
 [[ $count -eq 129 ]] || exit 1
 
 echo 'unbounded staged exports: 129 unique ABI definitions passed'

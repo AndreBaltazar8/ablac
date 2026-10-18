@@ -232,6 +232,10 @@ test: ablac
 	tools/test-orc-http.sh $(COMPILER)
 	tools/test-http-server.sh $(COMPILER)
 	tools/test-graceful-reload.sh $(COMPILER)
+	tools/test-direct-syscall.sh $(COMPILER)
+	tools/test-emitted-value-runtime.sh $(COMPILER)
+	tools/test-unbounded-exports.sh $(COMPILER)
+	tools/test-programmable-build.sh $(COMPILER)
 
 check: test self-rebuild
 
