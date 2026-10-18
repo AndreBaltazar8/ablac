@@ -36,10 +36,10 @@ for mode in interp jit; do
 done
 
 # A delegated compile global is kept as its delegate on both tiers: the native sites
-# (five) see each other's changes, and the interpreted one's change, which no setter
+# (six, one of them the seed global's initializer) see each other's changes, and the interpreted one's change, which no setter
 # can pass in, leaves the last site interpreted.
 native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/delegates-jit.trace" || true)
-[[ $native -eq 5 ]] || { echo "compile-eval-jit: $native native sites in delegates.ab, expected 5" >&2; cat "$output_directory/delegates-jit.trace" >&2; exit 1; }
+[[ $native -eq 6 ]] || { echo "compile-eval-jit: $native native sites in delegates.ab, expected 6" >&2; cat "$output_directory/delegates-jit.trace" >&2; exit 1; }
 grep -q 'interpreted at .*: compile global .*counted changed in an interpreted evaluation' \
     "$output_directory/delegates-jit.trace"
 
