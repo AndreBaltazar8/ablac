@@ -13,23 +13,29 @@ server=0
 
 cleanup() {
     if [[ $server -gt 0 ]]; then
-        pkill -TERM -s "$server" 2>/dev/null || true
+        kill -TERM -- "-$server" 2>/dev/null || true
         wait "$server" 2>/dev/null || true
     fi
     rm -rf -- "$test_directory"
 }
 trap cleanup EXIT
 
+# setsid(1) is util-linux only: start the command in a new session portably.
+# It execs in place, so a background job's $! leads the session's process
+# group and `kill -- -$!` stops it and what it started.
+new_session=(perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!\n"; exec @ARGV or die "exec: $!\n"')
+
 "$compiler" build "$project_root/tests/cases/modules/http-server.ab" \
     -o "$test_directory/server"
-[[ ! -e $test_directory/server.host.o ]] || exit 1
+# The host object is the syscall layer on macOS only.
+[[ $(uname -s) == Darwin || ! -e $test_directory/server.host.o ]] || exit 1
 symbols=$(nm "$test_directory/server" | awk '{print $3}')
 if rg -q '^(ablaHost|abla_host_)' <<< "$symbols"; then
     printf '%s\n' 'raw HTTP server linked hosted capability symbols' >&2
     exit 1
 fi
 
-setsid env ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=15 \
+"${new_session[@]}" env ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=15 \
     "$project_root/tools/run-limited.sh" "$test_directory/server" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
 server=$!

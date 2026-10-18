@@ -1,39 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-    printf 'usage: %s <self-hosted-compiler> <abla-orc-runner>\n' "$0" >&2
+if [[ $# -ne 1 ]]; then
+    printf 'usage: %s <self-hosted-compiler>\n' "$0" >&2
     exit 2
 fi
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=$1
-runner=$2
 test_directory=$(mktemp -d "$project_root/build/orc-http.XXXXXX")
 server=0
 
 cleanup() {
     if [[ $server -gt 0 ]]; then
-        pkill -TERM -s "$server" 2>/dev/null || true
+        kill -TERM -- "-$server" 2>/dev/null || true
         wait "$server" 2>/dev/null || true
     fi
     rm -rf -- "$test_directory"
 }
 trap cleanup EXIT
 
-"$compiler" --emit-llvm \
-    "$project_root/tests/cases/modules/http-server.ab" \
-    > "$test_directory/server.ll"
+# setsid(1) is util-linux only: start the command in a new session portably.
+# It execs in place, so a background job's $! leads the session's process
+# group and `kill -- -$!` stops it and what it started.
+new_session=(perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!\n"; exec @ARGV or die "exec: $!\n"')
 
-setsid env ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=20 \
-    "$project_root/tools/run-limited.sh" "$runner" \
-    "$test_directory/server.ll" \
+"${new_session[@]}" env ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=20 \
+    "$project_root/tools/run-limited.sh" "$compiler" run \
+    "$project_root/tests/cases/modules/http-server.ab" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
 server=$!
 
 port=""
-for attempt in {1..100}; do
-    port=$(sed -n '1p' "$test_directory/stderr.txt" 2>/dev/null || true)
+for attempt in {1..400}; do
+    port=$(grep -m1 -E '^[0-9]+$' "$test_directory/stderr.txt" 2>/dev/null || true)
     if [[ $port =~ ^[0-9]+$ ]]; then
         break
     fi

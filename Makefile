@@ -228,6 +228,10 @@ test: ablac
 	tools/test-android-extension.sh $(COMPILER)
 	tools/test-android-rpc-example.sh $(COMPILER)
 	tools/test-hot-reload.sh $(COMPILER)
+	tools/test-orc-session.sh $(COMPILER)
+	tools/test-orc-http.sh $(COMPILER)
+	tools/test-http-server.sh $(COMPILER)
+	tools/test-graceful-reload.sh $(COMPILER)
 
 check: test self-rebuild
 
