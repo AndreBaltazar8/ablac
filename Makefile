@@ -190,6 +190,7 @@ test: ablac
 	tools/test-shared-ownership.sh $(COMPILER)
 	tools/test-mutex.sh $(COMPILER)
 	tools/test-affine-move.sh $(COMPILER)
+	tools/test-field-places.sh $(COMPILER)
 
 check: test self-rebuild
 

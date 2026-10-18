@@ -298,6 +298,13 @@ The rules:
   do arrays and nullable values that hold resources.
 - You can't move a field out of a class that defines its own `drop`
   (`ownership.place-drop`): its `drop` would then see a missing field.
+- In a method or extension function, a field named on its own (`ticket`) is
+  the place `this.ticket`: the same rules apply to both spellings. Copying a
+  resource field out needs `move` (`ownership.place-move-required`), the
+  receiver's fields can't be moved out of it (`ownership.place-owner`), and a
+  view of a field, or of an element of an array a field holds (`val` field or
+  `var`), conflicts with a later change to it (`E_BORROW_CONFLICT`), as a
+  view of a local does.
 - One call can't both give a value away and borrow it: `inspect(t, move(t))`
   is `ownership.borrow-own-alias`.
 - A constructor property can't be spelled `own`: storing an affine value in
