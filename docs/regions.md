@@ -49,6 +49,28 @@ fun main {
 // error: region.escape:assignment.saved
 ```
 
+A function the region calls is held to the same rules: one that stores what
+it is given, or builds, in a module value cannot be called inside a region,
+however deep the call:
+
+```abla error
+var names: array<string> = []
+
+fun remember(name: string): int {
+    names.append(name)
+    names.size
+}
+
+fun rememberFile(index: int): int = remember("file$index")
+
+fun main {
+    val n = region {
+        rememberFile(1)
+    }
+}
+// error: region.call-retention:rememberFile
+```
+
 The rest of this page gives the complete rules.
 
 ## Why a checked form

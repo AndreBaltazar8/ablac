@@ -224,6 +224,7 @@ test: ablac
 	tools/test-typed-subparser-inspection.sh $(COMPILER)
 	tools/test-unsafe-boundary.sh $(COMPILER)
 	tools/test-wasm-gc.sh $(COMPILER)
+	tools/test-repl.sh $(COMPILER)
 
 check: test self-rebuild
 

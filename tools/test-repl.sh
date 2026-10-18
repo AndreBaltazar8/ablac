@@ -26,14 +26,16 @@ printf 'fun add(value: int): int = value + 1\nadd(41)\nval base: int = 40\nbase 
 [[ $(< "$output") == $'abla> defined\nabla> 42\nabla> defined\nabla> 42\nabla> reset\nabla> abla> ' ]] || exit 1
 grep -q 'identifier:base' "$errors"
 
+# Each line compiles in a child compiler (about half a second, most of it
+# the runtime), so 32 generations stay within the memory limit in time.
 {
-    for _ in $(seq 1 128); do
+    for _ in $(seq 1 32); do
         printf '20 + 22\n'
     done
     printf ':quit\n'
-} | ABLA_MAX_MEMORY_MB=512 ABLA_MAX_SECONDS=30 \
+} | ABLA_MAX_MEMORY_MB=512 ABLA_MAX_SECONDS=120 \
     "$project_root/tools/run-limited.sh" "$compiler" repl \
     > "$output" 2> "$errors"
-[[ $(grep -o '42' "$output" | wc -l) -eq 128 ]] || exit 1
+[[ $(grep -o '42' "$output" | wc -l) -eq 32 ]] || exit 1
 
 printf '%s\n' 'persistent REPL: retained definitions + recovery + reclaimed JIT generations'

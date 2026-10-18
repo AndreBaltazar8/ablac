@@ -40,6 +40,8 @@ fixtures=(
     invalid-region-return
     invalid-region-transitive-call
     invalid-region-transitive-receiver
+    invalid-region-transitive-global
+    invalid-region-global-method
 )
 
 for fixture in "${fixtures[@]}"; do
@@ -58,6 +60,20 @@ for fixture in "${fixtures[@]}"; do
     fi
     [[ ! -e $output ]] || exit 1
 done
+
+# Scalar module values, scalar arrays and shadowing names stay allowed.
+scalars_output="$output_directory/region-module-scalars"
+"$compiler" build \
+    "$project_root/tests/cases/bootstrap/region-module-scalars.ab" \
+    -o "$scalars_output"
+set +e
+"$project_root/tools/run-limited.sh" "$scalars_output"
+scalars_status=$?
+set -e
+if [[ $scalars_status -ne 42 ]]; then
+    echo "scoped region: module scalars expected 42, got $scalars_status" >&2
+    exit 1
+fi
 
 inferred_output="$output_directory/inferred-noescape-callback"
 "$compiler" build \

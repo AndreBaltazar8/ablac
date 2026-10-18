@@ -4591,6 +4591,154 @@ fun bootstrapRegionExpressionCallsFunctionParameter(
     unsafe
 }
 
+// The module values (`var`/`val` declarations) by name, with their normalized
+// types: "unknown" for one whose type is left to inference and whose
+// initializer is not a scalar literal.
+fun bootstrapRegionModuleValues(
+    declarations: array<BootstrapDeclaration>
+): Map<string, string> {
+    val values: Map<string, string> = Map()
+    for (declaration in declarations) {
+        if (declaration.kind == "var" || declaration.kind == "val") {
+            var type = bootstrapNormalizeType(declaration.resultType)
+            if (declaration.resultType == "" ||
+                declaration.resultType == "inferred" || type == "unknown") {
+                type = if (bootstrapRegionScalarLiteral(declaration.expression)) {
+                    "i64"
+                } else "unknown"
+            }
+            values.set(declaration.name, type)
+        }
+    }
+    values
+}
+
+// A literal number or boolean, or one negated: what an untyped module value's
+// initializer must be for the value to hold no heap memory (the summary runs
+// before inference).
+fun bootstrapRegionScalarLiteral(expression: BootstrapExpression): bool {
+    var scalar = expression.kind == "integer" || expression.kind == "float" ||
+        expression.kind == "true" || expression.kind == "false"
+    if ((expression.kind == "unary-" || expression.kind == "unary!") &&
+        expression.children.size == 1) {
+        scalar = bootstrapRegionScalarLiteral(expression.children[0])
+    }
+    scalar
+}
+
+// Whether a module value of `type` keeps what its `append`, `set` or
+// `x[i] = v` stores: an array or map of heap elements, or a type the summary
+// can't see into.
+fun bootstrapRegionModuleValueKeepsElements(type: string): bool {
+    var keeps = true
+    if (bootstrapIsArrayType(type)) {
+        keeps = !bootstrapRegionResultIsIndependent(
+            bootstrapArrayElementType(type)
+        )
+    } else if (bootstrapIsMapType(type)) {
+        keeps = !bootstrapRegionResultIsIndependent(bootstrapMapKeyType(type)) ||
+            !bootstrapRegionResultIsIndependent(bootstrapMapValueType(type))
+    }
+    keeps
+}
+
+// The module value `root` names, or "" when it is no module value or a
+// parameter, field or local of that name shadows it here.
+fun bootstrapRegionModuleValueType(
+    root: string,
+    values: Map<string, string>,
+    shadowed: array<string>
+): string {
+    var type = ""
+    val found = values.get(root)
+    if (found != null && !bootstrapAffineNamesContain(shadowed, root)) {
+        type = found
+    }
+    type
+}
+
+// Whether a body stores into a module value what may be region memory: a heap
+// value assigned to it or to one of its heap fields, an element appended, set
+// or indexed into a heap-element array or map, or a call to one of its type's
+// methods that keeps an argument. A function that does is unsafe in a region:
+// the region frees what the module value still refers to.
+fun bootstrapRegionExpressionStoresModuleValue(
+    expression: BootstrapExpression,
+    values: Map<string, string>,
+    shadowed: array<string>,
+    summary: BootstrapRegionCallSummary
+): bool {
+    var stores = false
+    if (expression.kind == "assign") {
+        val type = bootstrapRegionModuleValueType(
+            expression.text, values, shadowed
+        )
+        if (type != "" && !bootstrapRegionResultIsIndependent(type)) {
+            stores = true
+        }
+    }
+    if ((expression.kind == "member.assign" ||
+         expression.kind == "index.assign" ||
+         expression.kind == "member.call") &&
+        expression.children.size > 0) {
+        val type = bootstrapRegionModuleValueType(
+            bootstrapPlaceRootName(expression.children[0]), values, shadowed
+        )
+        if (type != "") {
+            if (expression.kind == "member.assign" &&
+                (type == "unknown" ||
+                 bootstrapRegionFieldIsHeap(summary, type, expression.text))) {
+                stores = true
+            }
+            if (expression.kind == "index.assign" &&
+                bootstrapRegionModuleValueKeepsElements(type)) {
+                stores = true
+            }
+            if (expression.kind == "member.call" &&
+                (((expression.text == "append" || expression.text == "set") &&
+                  bootstrapRegionModuleValueKeepsElements(type)) ||
+                 bootstrapRegionReceiverCallIsRetaining(
+                     summary, type, expression.text
+                 ))) {
+                stores = true
+            }
+        }
+    }
+    // A lambda's parameters, a loop's variable in its body and a block's
+    // local from its declaration on shadow a module value of their name.
+    var scope = bootstrapNamesWith(shadowed, [])
+    var child = 0
+    val lambda = expression.kind == "lambda" ||
+        expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator"
+    if (lambda) {
+        val parameters: array<string> = []
+        while (child + 1 < expression.children.size) {
+            parameters.append(expression.children[child].text)
+            child = child + 1
+        }
+        scope = bootstrapNamesWith(shadowed, parameters)
+    }
+    while (!stores && child < expression.children.size) {
+        val found = expression.children[child]
+        val body = expression.kind == "for" && child == 1
+        stores = bootstrapRegionExpressionStoresModuleValue(
+            found,
+            values,
+            if (body) {
+                bootstrapNamesWith(scope, [expression.text])
+            } else scope,
+            summary
+        )
+        if (expression.kind == "block" &&
+            (found.kind == "local.val" || found.kind == "local.var")) {
+            scope = bootstrapNamesWith(scope, [found.text])
+        }
+        child = child + 1
+    }
+    stores
+}
+
 fun bootstrapBuildRegionCallSummary(
     declarations: array<BootstrapDeclaration>
 ): BootstrapRegionCallSummary {
@@ -4629,12 +4777,25 @@ fun bootstrapBuildRegionCallSummary(
         }
         declarationIndex = declarationIndex + 1
     }
+    val moduleValues = bootstrapRegionModuleValues(declarations)
     var changed = true
     while (changed) {
         changed = false
         declarationIndex = 0
         while (declarationIndex < declarations.size) {
             val declaration = declarations[declarationIndex]
+            if ((declaration.kind == "fun" ||
+                 declaration.kind == "compile.fun") &&
+                !bootstrapRegionCallIsUnsafe(summary, declaration.name) &&
+                bootstrapRegionExpressionStoresModuleValue(
+                    declaration.expression,
+                    moduleValues,
+                    declaration.parameters,
+                    summary
+                )) {
+                bootstrapRegionAddUnsafe(summary, declaration.name)
+                changed = true
+            }
             if (bootstrapRegionExpressionRetainsParameters(
                 declaration.expression,
                 declaration.name,
@@ -4676,10 +4837,18 @@ fun bootstrapBuildRegionCallSummary(
                     changed = true
                 }
                 if (!bootstrapRegionCallIsUnsafe(summary, name) &&
-                    bootstrapRegionExpressionCallsUnsafe(
+                    (bootstrapRegionExpressionCallsUnsafe(
                         method.expression,
                         summary
-                    )) {
+                    ) || bootstrapRegionExpressionStoresModuleValue(
+                        method.expression,
+                        moduleValues,
+                        // The type's fields shadow module values too.
+                        bootstrapNamesWith(
+                            declaration.parameters, method.parameters
+                        ),
+                        summary
+                    ))) {
                     bootstrapRegionAddUnsafe(summary, name)
                     changed = true
                 }
