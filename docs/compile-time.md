@@ -636,6 +636,44 @@ Generated declarations are type-checked before any later compile-time code
 can see them. Program changes made at compile time are transactional: if a
 step fails, none of its changes are kept.
 
+## Native evaluation
+
+`ABLA_COMPILE_EVAL=jit` (or `auto`) runs compile-time code as machine code
+instead of in the evaluator; the default is still `interp` while the native
+tier is completed. After type checking, each compile pass builds one *slice*
+of the program: the declarations its `#expression`s and actions reach, the
+runtime, and an exported entry per site, with compile declarations compiled
+as ordinary code. The slice goes through the same code generator as the
+program and is loaded into the compiler with LLVM's in-process JIT; each
+entry then runs exactly where the evaluator would have run its site, in the
+same order. The native code has a runtime of its own: values, closures
+included, come back through the same codec the evaluator's results use, so a
+site gives the same program constant on either tier.
+
+A site the native tier cannot take yet runs in the evaluator: code that calls
+the compiler API or a host provider (`extern:"compiler"`, `extern:"host"`), a
+compile global still holding a kept array or object, a global whose
+initializer is itself compile-time code, a result only the compiler can hold
+(a generator, task, thread, borrow, `Weak` or raw pointer), a cross-target
+build (compile-time code always runs on the host), the REPL, and a
+compilation that compile-time code starts (it runs inside the outer pass).
+
+- A runtime panic in native compile-time code is the evaluator's error for the
+  same failure, with the same text (`E_EVAL_OUT_OF_BOUNDS`,
+  `E_EVAL_DIVISION_BY_ZERO`, else `E_CT_PANIC`); an abort, a failed check or
+  recursion past the end of the compiler's stack is `E_CT_STOPPED`. The
+  compiler survives each, and the rest of the pass runs in the evaluator.
+- Native code has no step limit. One evaluation may run for
+  `ABLA_COMPILE_EVAL_TIME_LIMIT` seconds (default 600, `0` for no limit), then
+  stops with `E_CT_TIME_LIMIT`.
+- `compile val`/`compile var` hold one value for the compilation on both
+  tiers: after each native call their values are kept as the evaluator keeps
+  them. Once an evaluated site changes a global the slice holds, the rest of
+  the pass runs in the evaluator.
+- `ABLA_COMPILE_EVAL_TRACE=1` prints, per site, whether it ran natively or why
+  it did not; `ABLA_COMPILE_EVAL_DUMP=<directory>` keeps each slice's LLVM
+  module.
+
 ## Diagnostics
 
 | Code | Meaning |
@@ -644,6 +682,9 @@ step fails, none of its changes are kept.
 | `E_EVAL_STEP_LIMIT` | an evaluation ran past the step limit |
 | `E_EVAL_DIVISION_BY_ZERO` | an integer division or remainder by zero, which panics at run time |
 | `E_EVAL_OUT_OF_BOUNDS` | an index or slice outside a string or an array, or a negative `truncate` or `filledArray` count; the message is the run-time panic's |
+| `E_CT_STOPPED` | native compile-time code aborted, failed a check or ran past the end of the stack ([native evaluation](#native-evaluation)) |
+| `E_CT_TIME_LIMIT` | a native evaluation ran past `ABLA_COMPILE_EVAL_TIME_LIMIT` |
+| `E_CT_PANIC` | native compile-time code panicked with a reason the evaluator has no code of its own for |
 | `compile.effect-denied:<capability>:<call path>` | the code needs a capability that this module didn't grant |
 | `compile.capability-not-authorized:<capability>` | the module grants a capability that `abla.toml` doesn't authorize |
 | `compile.capability-unknown:<name>` | the grant names no known capability |

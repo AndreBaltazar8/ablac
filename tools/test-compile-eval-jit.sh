@@ -117,4 +117,26 @@ stop_case deep jit
 grep -q 'error\[E_CT_STOPPED\]: compile-time evaluation at .*deep.ab:[0-9]* stopped: a bad memory access' \
     "$output_directory/deep-jit.trace"
 
+# Two compilations in one process: a program whose compile-time code builds another.
+# The inner compilation runs inside the outer pass, so it is interpreted and the outer
+# pass keeps its generation; each starts with fresh compile globals.
+(
+    cd "$project_root"
+    ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
+        "$cases/twice/outer.ab" -o "$output_directory/outer-jit" --no-cache \
+        2> "$output_directory/twice-jit.trace"
+)
+set +e
+"$output_directory/outer-jit"
+outer=$?
+"$output_directory/inner"
+inner=$?
+set -e
+if [[ $outer -ne 42 || $inner -ne 42 ]]; then
+    echo "compile-eval-jit: twice: outer $outer, inner $inner, expected 42 and 42" >&2
+    cat "$output_directory/twice-jit.trace" >&2
+    exit 1
+fi
+grep -q '^note\[ct-jit\]: native at .*outer.ab' "$output_directory/twice-jit.trace"
+
 echo "compile-eval-jit: native compile-time sites agree with the interpreter"
