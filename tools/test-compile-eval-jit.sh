@@ -32,7 +32,16 @@ for mode in interp jit; do
     run_case "$mode" globals-stale 42
     run_case "$mode" globals-exchange 42
     run_case "$mode" codec 42
+    run_case "$mode" delegates 42
 done
+
+# A delegated compile global is kept as its delegate on both tiers: the native sites
+# (five) see each other's changes, and the interpreted one's change, which no setter
+# can pass in, leaves the last site interpreted.
+native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/delegates-jit.trace" || true)
+[[ $native -eq 5 ]] || { echo "compile-eval-jit: $native native sites in delegates.ab, expected 5" >&2; cat "$output_directory/delegates-jit.trace" >&2; exit 1; }
+grep -q 'interpreted at .*: compile global .*counted changed in an interpreted evaluation' \
+    "$output_directory/delegates-jit.trace"
 
 # Native code collects as a hosted program does: globals are roots, and allocation
 # pressure collects by default (the interpreter has no heap to measure).
