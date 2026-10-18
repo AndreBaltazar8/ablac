@@ -75,7 +75,7 @@ fi
 # compile-time code is interpreted, with the reason.
 native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/fallback-jit.trace" || true)
 [[ $native -eq 5 ]] || { echo "compile-eval-jit: $native native sites in fallback.ab, expected 5" >&2; cat "$output_directory/fallback-jit.trace" >&2; exit 1; }
-grep -q 'interpreted at .*: reaches global base, whose initializer is compile-time code' \
+grep -q 'interpreted at .*: reaches extern:"compiler" fun compilerApplyTransform, which takes a function' \
     "$output_directory/fallback-jit.trace"
 
 grep -q 'native at' "$output_directory/codec-jit.trace"
@@ -172,15 +172,15 @@ if [[ $outer -ne 42 || $inner -ne 42 ]]; then
 fi
 grep -q '^note\[ct-jit\]: native at .*outer.ab' "$output_directory/twice-jit.trace"
 
-# The site reading `base` (whose initializer is compile-time code) is interpreted; the
-# other four (`base`'s own, the global function call, the moved scalar, the f32
-# template) stay native.
+# The site naming compilerApplyTransform is interpreted; the other five (`base`'s own,
+# one reading `base`, whose initializer is compile-time code, the global function call,
+# the moved scalar, the f32 template) stay native.
 native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/reach-jit.trace" || true)
 interpreted=$(grep -c 'interpreted at' "$output_directory/reach-jit.trace" || true)
-if [[ $native -ne 4 || $interpreted -ne 1 ]] ||
-    ! grep -q 'interpreted at .*: reaches global base, whose initializer is compile-time code' \
+if [[ $native -ne 5 || $interpreted -ne 1 ]] ||
+    ! grep -q 'interpreted at .*: reaches extern:"compiler" fun compilerApplyTransform' \
         "$output_directory/reach-jit.trace"; then
-    echo "compile-eval-jit: reach.ab: $native native, $interpreted interpreted, expected 4 and 1" >&2
+    echo "compile-eval-jit: reach.ab: $native native, $interpreted interpreted, expected 5 and 1" >&2
     cat "$output_directory/reach-jit.trace" >&2
     exit 1
 fi
