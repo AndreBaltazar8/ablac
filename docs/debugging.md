@@ -115,6 +115,27 @@ the map, decode its mappings (one generated line; the column is the module
 byte offset that stack frames print as `:0x…`), and look up each frame's
 offset — the greatest mapped offset at or below it.
 
+## Collector stress: `ABLA_GC_STRESS=1`
+
+A value that some function fails to keep rooted is only freed when a
+collection happens to run while it is unrooted, which under normal pressure
+can take millions of allocations. Run a hosted native program with
+`ABLA_GC_STRESS=1` to make every safe point collect: the program reads the
+variable once at startup, and then each allocating function collects on entry.
+A missing root then frees its value at once, and the next use of it fails
+close to the cause.
+
+```sh
+ABLA_GC_STRESS=1 build/app
+```
+
+Expect the program to run much slower (each collection walks the whole heap),
+so use small inputs. The variable changes nothing else: results and output
+are the same as without it. A program in manual collection mode
+(`memorySetManualCollection()`) has no safe points, so it is unaffected.
+WebAssembly modules don't read it. Without the variable it costs nothing:
+the safe point's check is the same compare either way.
+
 ## Cost
 
 Debug information leaves release builds untouched. In a development build of

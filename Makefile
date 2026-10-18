@@ -197,6 +197,7 @@ test: ablac
 	tools/test-lambda-context.sh $(COMPILER)
 	tools/test-reproducible-build.sh $(COMPILER)
 	tools/test-inferred-receivers.sh $(COMPILER)
+	tools/test-gc-stress.sh $(COMPILER)
 
 check: test self-rebuild
 

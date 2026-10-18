@@ -231,7 +231,9 @@ Collection has two modes:
   at 32 MiB; each later one once the heap has grown by
   `max(64 MiB, half of what the last collection kept)`, capped below the limit.
   `memorySetCollectionGrowth(bytes)` lowers the least growth for programs that
-  care about their footprint.
+  care about their footprint. Run with `ABLA_GC_STRESS=1` to
+  collect at every safe point instead
+  ([debugging.md](debugging.md#collector-stress-abla_gc_stress1)).
 - **Manual collection** (the default for wasm and freestanding targets, and
   for modules entered through their exports). Only an explicit
   `memoryCollect()` frees cyclic garbage. The compiler roots only the

@@ -10,6 +10,7 @@ trusted noescape extern:"c" fun write(
     length: int
 ): int
 trusted noescape extern:"c" fun _exit(status: int): void
+trusted noescape extern:"c" fun getenv(name: i64*): i64*
 trusted noescape extern:"c" fun pthread_mutex_init(
     mutex: i64*,
     attributes: i64*
@@ -151,6 +152,10 @@ var __ablaRuntimeHostCollectionEnabled: bool = true
 var __ablaRuntimeHostCollectionThreshold: int = 33554432
 // Least growth of the tracked heap past what a collection kept before the next.
 var __ablaRuntimeHostCollectionGrowth: int = 67108864
+// ABLA_GC_STRESS=1 (read once, at startup): every safe point collects, which
+// makes a missing root fail at once. Set here, it zeroes the threshold; the
+// safe point's check is the same compare either way.
+var __ablaRuntimeHostGcStress: bool = __ablaRuntimeHostGcStressConfigured()
 var __ablaRuntimeHostCollectionCount: int = 0
 var __ablaRuntimeHostCollectionMinimum: int = 0
 var __ablaRuntimeHostCollectionMaximum: int = 0
@@ -991,11 +996,38 @@ trusted fun __ablaRuntimeRootsPop(frame: int): int {
     0
 }
 
+// Whether the environment says ABLA_GC_STRESS=1; then collection starts at once.
+@noinline
+trusted fun __ablaRuntimeHostGcStressConfigured(): bool {
+    val name = "ABLA_GC_STRESS"
+    val buffer = ablaRuntimePointerAddress(malloc(name.size + 1))
+    if (buffer == 0) return false
+    var index = 0
+    while (index < name.size) {
+        ablaRuntimeStoreU8(buffer + index, name[index])
+        index = index + 1
+    }
+    ablaRuntimeStoreU8(buffer + name.size, 0)
+    val value = ablaRuntimePointerAddress(getenv(ablaRuntimePointerFromAddress(buffer)))
+    free(ablaRuntimePointerFromAddress(buffer))
+    val stress = value != 0 && ablaRuntimeLoadU8(value) == 49 &&
+        ablaRuntimeLoadU8(value + 1) == 0
+    if (stress) __ablaRuntimeHostCollectionThreshold = 0
+    stress
+}
+
+// A safe point: every allocating function checks this on entry, and LTO inlines
+// it there, so only the check is inline; the collection is out of line.
 trusted fun __ablaRuntimeMemoryPressure(): int {
     if (!__ablaRuntimeHostCollectionEnabled ||
         __ablaRuntimeHostRegionLoad() != 0 ||
         __ablaRuntimeHostLiveBytes <
             __ablaRuntimeHostCollectionThreshold) return 0
+    __ablaRuntimeHostPressureCollect()
+}
+
+@noinline
+trusted fun __ablaRuntimeHostPressureCollect(): int {
     __ablaRuntimePlatformMemoryCollect()
     val reserve = 67108864
     val least = __ablaRuntimeHostCollectionGrowth
@@ -1009,7 +1041,7 @@ trusted fun __ablaRuntimeMemoryPressure(): int {
         } else reserve
     if (next < least / 2) next = least / 2
     if (next > latest) next = latest
-    __ablaRuntimeHostCollectionThreshold = next
+    __ablaRuntimeHostCollectionThreshold = if (__ablaRuntimeHostGcStress) 0 else next
     0
 }
 
