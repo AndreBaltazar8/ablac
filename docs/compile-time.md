@@ -711,7 +711,11 @@ evaluator's, and compiler-owned values (syntax, cursors, builders) cross as
 handles.
 
 A site the native tier cannot take yet runs in the evaluator: code that passes
-a function to a compiler API call, a compile global still holding a kept value
+a function to a compiler API call, code that calls a capability provider written
+in Abla (the `abla/fs` reads and writes, `abla/process/time`,
+`abla/platform/host`), which only the evaluator performs as described
+[above](#capabilities-files-environment-processes-network), staged and
+journaled, a compile global still holding a kept value
 native code can't take in (an object, a map, a nested array, or any value of a
 `compile val`), a global whose
 initializer is itself compile-time code, a result only the compiler can hold
