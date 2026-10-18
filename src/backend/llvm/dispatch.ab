@@ -534,3 +534,197 @@ fun bootstrapLlvmEmitIndirectDispatcher(
     LLVMBuildRetVoid(backend.builder)
     if (false) LLVMDisposeMessage(nativeNullPointer())
 }
+
+// A generator's step runs on every iteration. Through abla_llvm_call_indirect
+// it would count the closure's captures, switch over every closure function
+// and check each argument's presence; the closure a `generator.create` takes
+// is known where it is made, so it gets its own entry with the dispatcher's
+// signature that copies the captures and the one argument as the dispatcher
+// does and calls the step's direct function. The runtime keeps the entry in
+// the generator and calls it through abla_llvm_call_dispatch.
+
+fun bootstrapLlvmGeneratorStepSymbol(symbol: string): string =
+    "${symbol}_generator_step"
+
+/** The step function of the `generator.create` at `at`: the function of the
+ *  `closure.create` it takes, when that takes the closure's captures and one
+ *  argument; else -1. */
+fun bootstrapLlvmGeneratorStepFunction(
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    at: int,
+    functionIndex: BootstrapLlvmNameIndex
+): int {
+    val create = function.instructions[at]
+    var index = at - 1
+    while (index >= 0) {
+        val candidate = function.instructions[index]
+        if (candidate.result == create.left) {
+            if (candidate.opcode != "closure.create") return -1
+            val found = functionIndex.find(candidate.text)
+            if (found < 0) return -1
+            val step = program.functions[found]
+            if (bootstrapLlvmDirectNeedsArgumentCount(step) ||
+                bootstrapLlvmDirectParameterCount(step) != candidate.operands.size + 1) return -1
+            return found
+        }
+        index = index - 1
+    }
+    -1
+}
+
+/** Declares abla_llvm_call_dispatch when the program runs generators, and
+ *  each emitted generator's step entry. */
+fun bootstrapLlvmDeclareGeneratorSteps(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    functionIndex: BootstrapLlvmNameIndex,
+    identities: BootstrapLlvmFunctionIdentities,
+    emitted: array<bool>
+): void {
+    if (!bootstrapLlvmRuntimeBridgeUsed(program, "abla_generator_create") &&
+        !bootstrapLlvmRuntimeBridgeUsed(program, "abla_generator_next") &&
+        !bootstrapLlvmRuntimeBridgeUsed(program, "abla_generator_drop")) return
+    val parameters = [backend.pointerType, backend.pointerType, backend.pointerType, backend.i64Type]
+    val dispatch = bootstrapLlvmDeclare(
+        backend, "abla_llvm_call_dispatch", backend.voidType,
+        [backend.pointerType, backend.pointerType, backend.pointerType,
+         backend.pointerType, backend.i64Type],
+        false, [false, false, false, false, false]
+    )
+    LLVMSetLinkage(dispatch, llvmInternalLinkage())
+    var index = 0
+    while (index < program.functions.size) {
+        if (index < emitted.size && emitted[index]) {
+            val function = program.functions[index]
+            var at = 0
+            while (at < function.instructions.size) {
+                if (function.instructions[at].opcode == "generator.create") {
+                    val step = bootstrapLlvmGeneratorStepFunction(program, function, at, functionIndex)
+                    if (step >= 0 && step < emitted.size && emitted[step]) {
+                        val entry = bootstrapLlvmDeclare(
+                            backend, bootstrapLlvmGeneratorStepSymbol(identities.symbols[step]),
+                            backend.voidType, parameters, true, [false, false, false, false]
+                        )
+                        LLVMSetLinkage(entry, llvmInternalLinkage())
+                    }
+                }
+                at = at + 1
+            }
+        }
+        index = index + 1
+    }
+    return
+}
+
+/** The step entry `generator.create` at `at` passes the runtime: the step's
+ *  own (bootstrapLlvmDeclareGeneratorSteps), else the closure dispatcher. */
+fun bootstrapLlvmGeneratorDispatch(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    at: int,
+    functionIndex: BootstrapLlvmNameIndex,
+    identities: BootstrapLlvmFunctionIdentities
+): i64* {
+    val step = bootstrapLlvmGeneratorStepFunction(program, function, at, functionIndex)
+    if (step >= 0) {
+        val entry = LLVMGetNamedFunction(
+            backend.module, bootstrapLlvmGeneratorStepSymbol(identities.symbols[step])
+        )
+        if (!pointerIsNull(entry)) return entry
+    }
+    LLVMGetNamedFunction(backend.module, "abla_llvm_call_indirect")
+}
+
+/** The bodies of abla_llvm_call_dispatch and of the step entries declared. */
+fun bootstrapLlvmEmitGeneratorSteps(
+    backend: BootstrapLlvmBackend,
+    program: BootstrapIrProgram,
+    identities: BootstrapLlvmFunctionIdentities,
+    emitted: array<bool>
+): void {
+    val dispatch = LLVMGetNamedFunction(backend.module, "abla_llvm_call_dispatch")
+    if (pointerIsNull(dispatch)) return
+    // abla_llvm_call_dispatch(entry, output, closure, arguments, count)
+    // calls `entry`, which has the dispatcher's signature.
+    LLVMPositionBuilderAtEnd(
+        backend.builder, LLVMAppendBasicBlockInContext(backend.context, dispatch, "entry")
+    )
+    val forwarded = llvmPointerVector(4)
+    var parameter = 0
+    while (parameter < 4) {
+        forwarded.set(parameter, LLVMGetParam(dispatch, i32(parameter + 1)))
+        parameter = parameter + 1
+    }
+    val call = LLVMBuildCall2(
+        backend.builder,
+        LLVMGlobalGetValueType(LLVMGetNamedFunction(backend.module, "abla_llvm_call_indirect")),
+        LLVMGetParam(dispatch, 0), forwarded.pointer(), 4, ""
+    )
+    forwarded.drop()
+    bootstrapLlvmAddSret(backend, call, true)
+    LLVMBuildRetVoid(backend.builder)
+    var index = 0
+    while (index < program.functions.size) {
+        val entry = LLVMGetNamedFunction(
+            backend.module, bootstrapLlvmGeneratorStepSymbol(identities.symbols[index])
+        )
+        if (!pointerIsNull(entry) && index < emitted.size && emitted[index]) {
+            bootstrapLlvmEmitGeneratorStep(backend, program.functions[index], identities.symbols[index], entry)
+        }
+        index = index + 1
+    }
+    if (false) LLVMDisposeMessage(nativeNullPointer())
+}
+
+fun bootstrapLlvmEmitGeneratorStep(
+    backend: BootstrapLlvmBackend,
+    function: BootstrapIrFunction,
+    symbol: string,
+    entry: i64*
+): void {
+    LLVMPositionBuilderAtEnd(
+        backend.builder, LLVMAppendBasicBlockInContext(backend.context, entry, "entry")
+    )
+    val output = LLVMGetParam(entry, 0)
+    val closure = LLVMGetParam(entry, 1)
+    val supplied = LLVMGetParam(entry, 2)
+    val count = bootstrapLlvmDirectParameterCount(function)
+    val captures = bootstrapLlvmCallNamed(
+        backend, "abla_function_capture_pointer", [closure], "captures", false, [true]
+    )
+    // The step's values, copied as the dispatcher copies them: the captures,
+    // then its argument.
+    val merged = LLVMBuildArrayAlloca(
+        backend.builder, backend.valueType, LLVMConstInt(backend.i64Type, count, 0), "step.arguments"
+    )
+    LLVMSetAlignment(merged, 8)
+    val arguments: array<i64*> = []
+    if (bootstrapLlvmDirectResultUsesOutput(function)) arguments.append(output)
+    var parameter = 0
+    while (parameter < count) {
+        val source = if (parameter < count - 1)
+            bootstrapLlvmValueElement(backend, captures, parameter, "step.capture")
+        else bootstrapLlvmValueElement(backend, supplied, 0, "step.argument")
+        val slot = bootstrapLlvmValueElement(backend, merged, parameter, "step.value")
+        LLVMBuildStore(
+            backend.builder, LLVMBuildLoad2(backend.builder, backend.valueType, source, "step.load"), slot
+        )
+        val scalar = bootstrapLlvmDirectParameterScalarType(function, parameter)
+        arguments.append(
+            if (scalar == "") slot else bootstrapLlvmUnboxScalar(backend, slot, scalar, "step.scalar")
+        )
+        parameter = parameter + 1
+    }
+    bootstrapLlvmEmitDirectCall(
+        backend, function,
+        LLVMGetNamedFunction(backend.module, bootstrapLlvmDirectFunctionSymbol(symbol)),
+        arguments, output
+    )
+    if (bootstrapLlvmDirectResultIsVoid(function)) {
+        bootstrapLlvmRuntimeCall(backend, "abla_void", output, [])
+    }
+    LLVMBuildRetVoid(backend.builder)
+    return
+}
