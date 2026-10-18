@@ -721,7 +721,7 @@ to `consume`, and the value is `ticket`.
 | `ownership.owned-constructor-parameter` | `own` on a constructor property | write `val`/`var` |
 | `ownership.mutable-borrow-default`, `ownership.mutable-borrow-extern` | A `var` parameter with a default, or on an `extern` | remove it |
 | `ownership.place-drop` | Moving a field out of a class with its own `drop` | move the whole object |
-| `ownership.assignment-value` | Using an assignment's value when it is a resource (a function's result, a kept `if` branch): the place owns it now | write the value to a local first, or return the variable after assigning |
+| `ownership.assignment-value` | Using an assignment's value when it is a resource (a function's result, a kept `if` branch, the last expression of a lambda whose function type expects a result): the place owns it now. A lambda with no known expected type isn't checked | write the value to a local first, or return the variable after assigning |
 | `ownership.place-move-required` | Taking a resource field or element without `move` | `move(box.field)` |
 | `move.local-or-place` | `move(...)` of something that isn't a local or a field/element path | move a local |
 | `resource.drop-duplicate`, `resource.drop-signature` | A bad `drop` declaration | one `fun drop(): void` |

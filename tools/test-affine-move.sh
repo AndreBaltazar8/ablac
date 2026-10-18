@@ -403,7 +403,7 @@ if [[ $status -ne 10 || $(cat "$output_directory/assignments.out") != $'drop 4\n
     cat "$output_directory/assignments.out" >&2
     exit 1
 fi
-for fixture in invalid-tail invalid-branch; do
+for fixture in invalid-tail invalid-branch invalid-lambda; do
     output="$output_directory/assignment-$fixture"
     rm -f "$output"
     set +e
