@@ -265,9 +265,16 @@ class BootstrapCtReach(
                         if (keepOnly) {
                             follow = declaration.kind != "extern"
                         } else if (declaration.kind == "extern" &&
-                            (declaration.externalLibrary == "compiler" ||
-                             declaration.externalLibrary == "host")) {
-                            reason = "reaches extern:\"${declaration.externalLibrary}\" fun ${declaration.name} (compiler API bridge pending)"
+                            ctBridgeRoutesExtern(declaration)) {
+                            // Called through the compiler bridge: the slice gets a shim
+                            // that runs the interpreter's implementation.
+                            val shim = ctBridgeReplacementSource(declaration)
+                            if (shim == "") {
+                                reason = "reaches extern:\"${declaration.externalLibrary}\" fun ${declaration.name}, whose types don't cross the compiler bridge"
+                            } else if (bootstrapTextContains(shim, "ablaCtBridgeArgFunction(")) {
+                                reason = "reaches extern:\"${declaration.externalLibrary}\" fun ${declaration.name}, which takes a function (not passed through the compiler bridge yet)"
+                            }
+                            follow = false
                         } else if (declaration.kind == "compile.val" ||
                                    declaration.kind == "compile.var") {
                             val type = bootstrapNormalizeType(declaration.resultType)
@@ -346,6 +353,51 @@ fun bootstrapCtLibraryDeclaration(declaration: BootstrapDeclaration): bool {
 }
 
 // The value runtime's own modules: every slice carries them whole.
+// Whether the slice replaces `declaration` with its bridge shim: the compiler API
+// externs, the opaque compiler classes and ablaAtCompileTime. (`ablaHost*` functions
+// with bodies of their own stay as they are.)
+fun bootstrapCtBridged(declaration: BootstrapDeclaration): bool =
+    declaration.kind == "extern" || declaration.kind == "class" ||
+        declaration.name == "ablaAtCompileTime"
+
+// The trusted helpers bridge shims call (abla/compiler/bridge), with what they reach
+// kept in the slice; none when they can't be read, or when the program imports the
+// module and so has them already (kept here).
+fun bootstrapCtBridgeImported(parsed: BootstrapParseResult): bool {
+    for (declaration in parsed.declarations) {
+        if (bootstrapTextContains(declaration.sourceIdentity, "/abla/compiler/bridge/")) {
+            return true
+        }
+    }
+    false
+}
+
+fun bootstrapCtBridgeHelpers(
+    parsed: BootstrapParseResult,
+    var reach: BootstrapCtReach
+): array<BootstrapDeclaration> {
+    var index = 0
+    while (index < parsed.declarations.size) {
+        if (bootstrapTextContains(parsed.declarations[index].sourceIdentity, "/abla/compiler/bridge/")) {
+            reach.kept[index] = true
+            reach.keepFrom(parsed.declarations[index].expression)
+        }
+        index = index + 1
+    }
+    if (bootstrapCtBridgeImported(parsed)) return []
+    val path = "${bootstrapCompileProviderStandardLibrary()}/abla/compiler/bridge/entry.ab"
+    val text = Path(path).readText()
+    if (text == "") return []
+    val helpers = bootstrapParseWithIdentity(text, path)
+    if (helpers.errors > 0) return []
+    val result: array<BootstrapDeclaration> = []
+    for (declaration in helpers.declarations) {
+        reach.keepFrom(declaration.expression)
+        result.append(declaration)
+    }
+    result
+}
+
 fun bootstrapCtRuntimeDeclaration(declaration: BootstrapDeclaration): bool =
     bootstrapTextContains(declaration.sourceIdentity, "/abla/runtime/")
 
@@ -662,8 +714,24 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     if (ready == 0) return
     bootstrapCtGenerationNumber = bootstrapCtGenerationNumber + 1
     val generation = bootstrapCtGenerationNumber
+    // A kept compiler API extern (and an opaque compiler class, ablaAtCompileTime)
+    // is its bridge shim, whose helpers come from abla/compiler/bridge.
+    var bridged = false
+    var bridgeIndex = 0
+    while (bridgeIndex < parsed.declarations.size) {
+        val declaration = parsed.declarations[bridgeIndex]
+        if (reach.kept[bridgeIndex] && declaration.kind == "extern" &&
+            ctBridgeRoutesExtern(declaration)) bridged = true
+        bridgeIndex = bridgeIndex + 1
+    }
+    val helpers = if (bridged) bootstrapCtBridgeHelpers(parsed, reach) else []
+    if (bridged && helpers.size == 0 && !bootstrapCtBridgeImported(parsed)) {
+        bootstrapCtFailReady("the compiler bridge's helpers (abla/compiler/bridge) could not be read")
+        return
+    }
     // The support declares the intrinsics it needs unless the slice keeps them.
     val kept: array<BootstrapDeclaration> = []
+    for (helper in helpers) kept.append(helper)
     var keptIndex = 0
     while (keptIndex < parsed.declarations.size) {
         if (reach.kept[keptIndex] || bootstrapCtRuntimeDeclaration(parsed.declarations[keptIndex])) {
@@ -694,10 +762,13 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     while (declarationIndex < parsed.declarations.size) {
         val declaration = parsed.declarations[declarationIndex]
         if (reach.kept[declarationIndex] || bootstrapCtRuntimeDeclaration(declaration)) {
-            sliceDeclarations.append(declaration)
+            val shims = if (bootstrapCtBridged(declaration))
+                bootstrapCtBridgeShims([declaration]) else []
+            sliceDeclarations.append(if (shims.size == 1) shims[0] else declaration)
         }
         declarationIndex = declarationIndex + 1
     }
+    for (helper in helpers) sliceDeclarations.append(helper)
     val exports: array<BootstrapExportRequest> = []
     for (declaration in template.declarations) {
         var sourceIdentity = ""

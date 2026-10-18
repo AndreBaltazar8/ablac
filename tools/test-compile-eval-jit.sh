@@ -54,11 +54,12 @@ if grep -q 'ct-jit' "$output_directory/scalars-interp.trace"; then
     echo "compile-eval-jit: the interpreter tier used the native tier" >&2
     exit 1
 fi
-# Arrays and objects come back natively; a compiler API call is interpreted, with
-# the reason.
+# Arrays and objects come back natively and a compiler API call runs through the
+# bridge (five native sites); a site reading a global whose initializer is
+# compile-time code is interpreted, with the reason.
 native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/fallback-jit.trace" || true)
-[[ $native -eq 3 ]] || { echo "compile-eval-jit: $native native sites in fallback.ab, expected 3" >&2; cat "$output_directory/fallback-jit.trace" >&2; exit 1; }
-grep -q 'interpreted at .*: reaches extern:"compiler" fun compilerFindFunction' \
+[[ $native -eq 5 ]] || { echo "compile-eval-jit: $native native sites in fallback.ab, expected 5" >&2; cat "$output_directory/fallback-jit.trace" >&2; exit 1; }
+grep -q 'interpreted at .*: reaches global base, whose initializer is compile-time code' \
     "$output_directory/fallback-jit.trace"
 
 grep -q 'native at' "$output_directory/codec-jit.trace"
@@ -69,17 +70,18 @@ if grep -q 'interpreted at' "$output_directory/codec-jit.trace"; then
 fi
 
 # Compile globals: the interpreted site changes the counter, which goes back into the
-# generation through its setter, so every other site (four) stays native.
+# generation through its setter, so every other site (five, one a compiler API call
+# through the bridge) stays native.
 native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/globals-jit.trace" || true)
-[[ $native -eq 4 ]] || { echo "compile-eval-jit: $native native sites in globals.ab, expected 4" >&2; cat "$output_directory/globals-jit.trace" >&2; exit 1; }
+[[ $native -eq 5 ]] || { echo "compile-eval-jit: $native native sites in globals.ab, expected 5" >&2; cat "$output_directory/globals-jit.trace" >&2; exit 1; }
 grep -q 'compile global .*counter changed in an interpreted evaluation: passed in' \
     "$output_directory/globals-jit.trace"
 # A changed global without a setter leaves the rest of the pass interpreted.
 grep -q 'interpreted at .*: compile global .*grid changed in an interpreted evaluation' \
     "$output_directory/globals-stale-jit.trace"
-# Strings, f64 and arrays of them go back in: both native sites stay native.
+# Strings, f64 and arrays of them go back in: the three native sites stay native.
 native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/globals-exchange-jit.trace" || true)
-[[ $native -eq 2 ]] || { echo "compile-eval-jit: $native native sites in globals-exchange.ab, expected 2" >&2; cat "$output_directory/globals-exchange-jit.trace" >&2; exit 1; }
+[[ $native -eq 3 ]] || { echo "compile-eval-jit: $native native sites in globals-exchange.ab, expected 3" >&2; cat "$output_directory/globals-exchange-jit.trace" >&2; exit 1; }
 for global in trail scale counts names; do
     grep -q "compile global .*$global changed in an interpreted evaluation: passed in" \
         "$output_directory/globals-exchange-jit.trace"

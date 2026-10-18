@@ -689,10 +689,17 @@ same order. The native code has a runtime of its own: values, closures
 included, come back through the same codec the evaluator's results use, so a
 site gives the same program constant on either tier.
 
-A site the native tier cannot take yet runs in the evaluator: code that calls
-the compiler API or a host provider (`extern:"compiler"`, `extern:"host"`), a
-compile global still holding a kept value native code can't take in (an
-object, a map, a nested array, or any value of a `compile val`), a global whose
+Native code calls the compiler API, parser externs and host providers
+(`extern:"compiler"`, `extern:"parser"`, `extern:"host"`) through the compiler
+bridge: each call runs the evaluator's implementation on the site's evaluation,
+so grants, the input journal, staged writes and diagnostics are the
+evaluator's, and compiler-owned values (syntax, cursors, builders) cross as
+handles.
+
+A site the native tier cannot take yet runs in the evaluator: code that passes
+a function to a compiler API call, a compile global still holding a kept value
+native code can't take in (an object, a map, a nested array, or any value of a
+`compile val`), a global whose
 initializer is itself compile-time code, a result only the compiler can hold
 (a generator, task, thread, borrow, `Weak` or raw pointer), a cross-target
 build (compile-time code always runs on the host), the REPL, and a
