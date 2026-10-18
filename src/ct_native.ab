@@ -1392,13 +1392,23 @@ fun ctNativeHostCall(
     if (operation == "FileKind" || operation == "FileSize" ||
         operation == "FileRevision") {
         val path = ctNativeValueText(values, 0)
-        val observed = if (operation == "FileKind") ablaHostFileKind(path)
-            else if (operation == "FileSize") ablaHostFileSize(path)
-            else ablaHostFileRevision(path)
-        val kind = if (operation == "FileKind") "file-kind"
-            else if (operation == "FileSize") "file-size" else "file-revision"
-        evaluator.recordCompileInput("abla-input:$kind:$path", "$observed")
-        result = bootstrapEvalInteger(observed)
+        val staged = ctNativeStagedSlot(path) >= 0 || ctNativeStagedUnder(path)
+        if (staged) {
+            // The compile-time file view (ctNativeViewInfo).
+            val info = ctNativeViewInfo(evaluator, path)
+            result = bootstrapEvalInteger(ctNativeInfoField(
+                info,
+                if (operation == "FileKind") "kind" else if (operation == "FileSize") "size" else "revision"
+            ))
+        } else {
+            val observed = if (operation == "FileKind") ablaHostFileKind(path)
+                else if (operation == "FileSize") ablaHostFileSize(path)
+                else ablaHostFileRevision(path)
+            val kind = if (operation == "FileKind") "file-kind"
+                else if (operation == "FileSize") "file-size" else "file-revision"
+            evaluator.recordCompileInput("abla-input:$kind:$path", "$observed")
+            result = bootstrapEvalInteger(observed)
+        }
     } else if (operation == "CurrentDirectory") {
         val directory = ablaHostCurrentDirectory()
         evaluator.recordCompileInput("abla-input:current-directory:", directory)
@@ -1406,22 +1416,22 @@ fun ctNativeHostCall(
     } else if (operation == "WriteFile" || operation == "WriteFileAtomic") {
         // Staged like compilerWriteFile: published when the build succeeds.
         val path = ctNativeValueText(values, 0)
-        val staged = bootstrapStageCompileOutput(path, ctNativeValueText(values, 1))
+        val staged = ctNativeViewWrite(evaluator, path, ctNativeValueText(values, 1))
         if (operation == "WriteFileAtomic") result = bootstrapEvalBoolean(staged)
     } else if (operation == "CreateParentDirectories" ||
                operation == "CreateDirectories") {
-        // Staged files' directories are made when they are published.
-        val valid = bootstrapCompileOutputPathValid(ctNativeValueText(values, 0))
-        if (operation == "CreateDirectories") result = bootstrapEvalBoolean(valid)
+        val path = ctNativeValueText(values, 0)
+        val directory = if (operation == "CreateDirectories") path else Path(path).parent().text
+        val made = directory == "" || directory == "." ||
+            ctNativeViewCreateDirectories(evaluator, directory)
+        if (operation == "CreateDirectories") result = bootstrapEvalBoolean(made)
     } else if (operation == "MoveFile") {
-        val source = ctNativeValueText(values, 0)
-        result = bootstrapEvalBoolean(
-            ablaHostMoveFile(source, ctNativeValueText(values, 1))
-        )
+        // Moves and removals act on the compile-time file view too.
+        result = bootstrapEvalBoolean(ctNativeViewMove(
+            evaluator, ctNativeValueText(values, 0), ctNativeValueText(values, 1)
+        ))
     } else if (operation == "RemoveFile") {
-        result = bootstrapEvalBoolean(
-            ablaHostRemoveFile(ctNativeValueText(values, 0))
-        )
+        result = bootstrapEvalBoolean(ctNativeViewRemove(evaluator, ctNativeValueText(values, 0)))
     } else if (operation == "ArgumentCount") {
         result = bootstrapEvalInteger(0)
     } else if (operation == "Argument") {
@@ -1677,10 +1687,183 @@ fun ctNativeStagedSlot(path: string): int =
 fun ctNativeStagedText(slot: int): string =
     Path("${bootstrapCompileOutputRoot()}/$slot.data").readText()
 
+// ---- the compile-time file view ----
+//
+// Under `#`, files are written to the compilation's staging area and
+// published only when the build succeeds (bootstrapStageCompileOutput). What
+// compile-time code sees is the disk with that staging laid over it: a staged
+// file or directory is there, a staged removal is gone, and a directory holds
+// what it holds on disk plus what was staged in it. Disk observations are
+// journaled as build inputs; the staging is the build's own output.
+
+/** Whether a live staged path (a file or directory) lies under `path`. */
+fun ctNativeStagedUnder(path: string): bool {
+    if (bootstrapCompileOutputCount == 0 || !bootstrapCompileOutputPathValid(path)) return false
+    val prefix = "$path/"
+    var slot = 0
+    while (slot < bootstrapCompileOutputCount) {
+        val staged = bootstrapCompileOutputPath(slot)
+        if (staged.startsWith(prefix) && bootstrapCompileOutputKind(slot) != "removed") return true
+        slot = slot + 1
+    }
+    false
+}
+
+/** What `path` is in the view, as FileInfo's kind: 0 nothing, 1 a file, 2 a
+ *  directory (the disk's other kinds as it says). */
+fun ctNativeViewKind(var evaluator: BootstrapEvaluator, path: string): int {
+    val slot = ctNativeStagedSlot(path)
+    if (slot >= 0) {
+        val kind = bootstrapCompileOutputKind(slot)
+        return if (kind == "file") 1 else if (kind == "directory") 2 else 0
+    }
+    val observed = Path(path).info().kind
+    evaluator.recordCompileInput("abla-input:file-kind:$path", "$observed")
+    if (observed == 0 && ctNativeStagedUnder(path)) 2 else observed
+}
+
+/** `path`'s FileInfo in the view. */
+fun ctNativeViewInfo(var evaluator: BootstrapEvaluator, path: string): BootstrapEvalValue {
+    val slot = ctNativeStagedSlot(path)
+    var kind = 0
+    var size = 0
+    var revision = 0
+    if (slot >= 0) {
+        val staged = bootstrapCompileOutputKind(slot)
+        if (staged != "removed") {
+            kind = if (staged == "file") 1 else 2
+            if (staged == "file") size = ctNativeStagedText(slot).size
+            revision = bootstrapCompileOutputRevision(slot)
+        }
+    } else {
+        val info = Path(path).info()
+        evaluator.recordCompileInput("abla-input:file-kind:$path", "${info.kind}")
+        evaluator.recordCompileInput("abla-input:file-revision:$path", "${info.revision}")
+        evaluator.recordCompileInput("abla-input:file-size:$path", "${info.size}")
+        kind = info.kind
+        size = info.size
+        revision = info.revision
+        if (kind == 0 && ctNativeStagedUnder(path)) kind = 2
+    }
+    bootstrapEvalObject(
+        "FileInfo", ["path", "kind", "size", "revision"],
+        [ctNativePathValue(path), bootstrapEvalInteger(kind),
+         bootstrapEvalInteger(size), bootstrapEvalInteger(revision)]
+    )
+}
+
+fun ctNativeInfoField(info: BootstrapEvalValue, name: string): int {
+    var index = 0
+    while (index < info.fieldNames.size) {
+        if (info.fieldNames[index] == name) return info.elements[index].integer
+        index = index + 1
+    }
+    0
+}
+
+/** A file's contents in the view, or why there are none (FileReadResult's
+ *  error numbers: 2 nothing there, 21 a directory). `plain` reads as
+ *  readText does, journaled under the path itself. */
+fun ctNativeViewRead(var evaluator: BootstrapEvaluator, path: string, plain: bool = false): FileReadResult {
+    val slot = ctNativeStagedSlot(path)
+    if (slot >= 0) {
+        val kind = bootstrapCompileOutputKind(slot)
+        return if (kind == "file") FileReadResult(ctNativeStagedText(slot), true, 0)
+            else FileReadResult("", false, if (kind == "directory") 21 else 2)
+    }
+    if (ctNativeStagedUnder(path) && Path(path).info().kind == 0) {
+        return FileReadResult("", false, 21)
+    }
+    if (plain) {
+        val contents = Path(path).readText()
+        evaluator.recordCompileInput(path, contents)
+        return FileReadResult(contents, true, 0)
+    }
+    val read = Path(path).readTextResult()
+    evaluator.recordCompileInput("abla-input:file-result:$path", ctNativeReadResultText(read))
+    read
+}
+
+/** The names in directory `path` in the view: the disk's (less staged
+ *  removals), then what was staged in it. */
+fun ctNativeViewEntries(var evaluator: BootstrapEvaluator, path: string): array<string> {
+    val names: array<string> = []
+    val slot = ctNativeStagedSlot(path)
+    if (slot >= 0 && bootstrapCompileOutputKind(slot) != "directory") return names
+    var listed = ""
+    for (entry in Path(path).entries()) {
+        val name = entry.name()
+        listed = "$listed$name\n"
+        val child = ctNativeStagedSlot(entry.text)
+        if (child < 0 || bootstrapCompileOutputKind(child) != "removed") names.append(name)
+    }
+    evaluator.recordCompileInput("abla-input:entries:$path", listed)
+    if (bootstrapCompileOutputCount > 0 && bootstrapCompileOutputPathValid(path)) {
+        val prefix = "$path/"
+        var staged = 0
+        while (staged < bootstrapCompileOutputCount) {
+            val stagedPath = bootstrapCompileOutputPath(staged)
+            if (stagedPath.startsWith(prefix) && bootstrapCompileOutputKind(staged) != "removed") {
+                var end = prefix.size
+                while (end < stagedPath.size && stagedPath[end] != 47) end = end + 1
+                val name = stagedPath.slice(prefix.size, end)
+                var known = false
+                for (present in names) if (present == name) known = true
+                if (!known) names.append(name)
+            }
+            staged = staged + 1
+        }
+    }
+    names
+}
+
+/** Stages `contents` at `path` as a file write does at run time: making its
+ *  parent directories first. */
+fun ctNativeViewWrite(var evaluator: BootstrapEvaluator, path: string, contents: string): bool {
+    val parent = Path(path).parent().text
+    (parent == "" || parent == "." || ctNativeViewCreateDirectories(evaluator, parent)) &&
+        bootstrapStageCompileOutput(path, contents)
+}
+
+/** Makes directory `path` in the view: true when it is one now. */
+fun ctNativeViewCreateDirectories(var evaluator: BootstrapEvaluator, path: string): bool {
+    if (!bootstrapCompileOutputPathValid(path)) return false
+    val kind = ctNativeViewKind(evaluator, path)
+    if (kind == 2) return true
+    if (kind != 0) return false
+    bootstrapStageCompileEntry(path, "directory")
+}
+
+/** Removes a file, or an empty directory, from the view. */
+fun ctNativeViewRemove(var evaluator: BootstrapEvaluator, path: string): bool {
+    if (!bootstrapCompileOutputPathValid(path)) return false
+    val kind = ctNativeViewKind(evaluator, path)
+    if (kind == 0) return false
+    if (kind == 2 && ctNativeViewEntries(evaluator, path).size > 0) return false
+    bootstrapStageCompileEntry(path, "removed")
+}
+
+/** Moves a file or a directory (and what it holds) in the view. */
+fun ctNativeViewMove(var evaluator: BootstrapEvaluator, source: string, destination: string): bool {
+    if (!bootstrapCompileOutputPathValid(source) ||
+        !bootstrapCompileOutputPathValid(destination)) return false
+    val kind = ctNativeViewKind(evaluator, source)
+    if (kind == 1) {
+        val read = ctNativeViewRead(evaluator, source, true)
+        return read.succeeded && ctNativeViewWrite(evaluator, destination, read.text) &&
+            bootstrapStageCompileEntry(source, "removed")
+    }
+    if (kind != 2 || !ctNativeViewCreateDirectories(evaluator, destination)) return false
+    for (name in ctNativeViewEntries(evaluator, source)) {
+        if (!ctNativeViewMove(evaluator, "$source/$name", "$destination/$name")) return false
+    }
+    bootstrapStageCompileEntry(source, "removed")
+}
+
 // Performs `Path.<method>` on an evaluated receiver; `arguments` holds the
-// call's children and the method's arguments start at `first`. Every
-// observation is journaled under an identity bootstrapCompileInputContents
-// re-observes, so a cached build is reused only while the answer is the same.
+// call's children and the method's arguments start at `first`. It answers
+// from the compile-time file view (above), journaling what it observes on
+// disk, so a cached build is reused only while the answer is the same.
 @noinline
 fun ctNativeEvaluatePathMethod(
     var evaluator: BootstrapEvaluator,
@@ -1700,78 +1883,57 @@ fun ctNativeEvaluatePathMethod(
         index = index + 1
     }
     val path = ctNativePathText(receiver)
-    // A path this compilation staged reads back as staged (not journaled: it
-    // is the build's own output, not an input).
-    val staged = if (method == "readText" || method == "readTextResult" ||
-        method == "exists" || method == "info" || method == "appendText")
-        ctNativeStagedSlot(path) else -1
     var result = bootstrapEvalInvalid()
     if (method == "writeText" || method == "writeTextAtomic" || method == "appendText") {
         // Staged like compilerWriteFile: published when the build succeeds,
         // discarded when it fails.
         var contents = ctNativeValueText(values, 0)
         if (method == "appendText") {
-            contents = "${if (staged >= 0) ctNativeStagedText(staged) else Path(path).readText()}$contents"
+            val read = ctNativeViewRead(evaluator, path)
+            contents = "${if (read.succeeded) read.text else ""}$contents"
         }
-        result = bootstrapEvalBoolean(bootstrapStageCompileOutput(path, contents))
-    } else if (method == "createDirectories" || method == "createParentDirectories") {
-        // A staged file's directories are made when it is published.
-        result = bootstrapEvalBoolean(bootstrapCompileOutputPathValid(path))
-    } else if (staged >= 0) {
-        val text = ctNativeStagedText(staged)
-        result = if (method == "readText") bootstrapEvalString(text)
-            else if (method == "readTextResult") bootstrapEvalObject(
-                "FileReadResult", ["text", "succeeded", "errorCode"],
-                [bootstrapEvalString(text), bootstrapEvalBoolean(true), bootstrapEvalInteger(0)]
-            )
-            else if (method == "exists") bootstrapEvalBoolean(true)
-            else bootstrapEvalObject(
-                "FileInfo", ["path", "kind", "size", "revision"],
-                [ctNativePathValue(path), bootstrapEvalInteger(1),
-                 bootstrapEvalInteger(text.size), bootstrapEvalInteger(0)]
-            )
+        result = bootstrapEvalBoolean(ctNativeViewWrite(evaluator, path, contents))
+    } else if (method == "createDirectories") {
+        result = bootstrapEvalBoolean(ctNativeViewCreateDirectories(evaluator, path))
+    } else if (method == "createParentDirectories") {
+        val parent = Path(path).parent().text
+        result = bootstrapEvalBoolean(
+            parent == "" || parent == "." || ctNativeViewCreateDirectories(evaluator, parent)
+        )
+    } else if (method == "remove") {
+        result = bootstrapEvalBoolean(ctNativeViewRemove(evaluator, path))
+    } else if (method == "moveTo") {
+        result = bootstrapEvalBoolean(
+            ctNativeViewMove(evaluator, path, ctNativePathText(if (values.size > 0) values[0] else bootstrapEvalInvalid()))
+        )
     } else if (method == "readText") {
-        val contents = Path(path).readText()
-        evaluator.recordCompileInput(path, contents)
-        result = bootstrapEvalString(contents)
+        val read = ctNativeViewRead(evaluator, path, true)
+        result = bootstrapEvalString(if (read.succeeded) read.text else "")
     } else if (method == "readTextResult") {
-        val read = Path(path).readTextResult()
-        evaluator.recordCompileInput("abla-input:file-result:$path", ctNativeReadResultText(read))
+        val read = ctNativeViewRead(evaluator, path)
         result = bootstrapEvalObject(
             "FileReadResult", ["text", "succeeded", "errorCode"],
             [bootstrapEvalString(read.text), bootstrapEvalBoolean(read.succeeded),
              bootstrapEvalInteger(read.errorCode)]
         )
-    } else if (method == "exists" || method == "info" || method == "revision") {
-        val info = Path(path).info()
-        evaluator.recordCompileInput("abla-input:file-kind:$path", "${info.kind}")
-        if (method == "exists") {
-            result = bootstrapEvalBoolean(info.exists())
-        } else {
-            evaluator.recordCompileInput("abla-input:file-revision:$path", "${info.revision}")
-            if (method == "revision") {
-                result = bootstrapEvalInteger(info.revision)
-            } else {
-                evaluator.recordCompileInput("abla-input:file-size:$path", "${info.size}")
-                result = bootstrapEvalObject(
-                    "FileInfo", ["path", "kind", "size", "revision"],
-                    [ctNativePathValue(path), bootstrapEvalInteger(info.kind),
-                     bootstrapEvalInteger(info.size), bootstrapEvalInteger(info.revision)]
-                )
-            }
-        }
+    } else if (method == "exists") {
+        result = bootstrapEvalBoolean(ctNativeViewKind(evaluator, path) != 0)
+    } else if (method == "info") {
+        result = ctNativeViewInfo(evaluator, path)
+    } else if (method == "revision") {
+        result = bootstrapEvalInteger(ctNativeInfoField(ctNativeViewInfo(evaluator, path), "revision"))
     } else if (method == "isSymbolicLink") {
-        val link = Path(path).isSymbolicLink()
-        evaluator.recordCompileInput("abla-input:symbolic-link:$path", "$link")
+        var link = false
+        if (ctNativeStagedSlot(path) < 0 && !ctNativeStagedUnder(path)) {
+            link = Path(path).isSymbolicLink()
+            evaluator.recordCompileInput("abla-input:symbolic-link:$path", "$link")
+        }
         result = bootstrapEvalBoolean(link)
     } else if (method == "entries") {
         val elements: array<BootstrapEvalValue> = []
-        var names = ""
-        for (entry in Path(path).entries()) {
-            elements.append(ctNativePathValue(entry.text))
-            names = "$names${entry.name()}\n"
+        for (name in ctNativeViewEntries(evaluator, path)) {
+            elements.append(ctNativePathValue(Path(path).child(name).text))
         }
-        evaluator.recordCompileInput("abla-input:entries:$path", names)
         result = bootstrapEvalArray(elements)
     } else {
         evaluator.errors = evaluator.errors + 1

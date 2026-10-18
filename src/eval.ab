@@ -1120,6 +1120,8 @@ fun bootstrapClearCompileOutputs(): void {
     while (index < bootstrapCompileOutputCount) {
         Path("$root/$index.path").remove()
         Path("$root/$index.data").remove()
+        Path("$root/$index.kind").remove()
+        Path("$root/$index.revision").remove()
         index = index + 1
     }
     Path(root).remove()
@@ -1230,22 +1232,20 @@ fun bootstrapTextBefore(a: string, b: string): bool {
 }
 
 /** The names in directory `path` ("." and ".." left out), sorted bytewise. */
-fun bootstrapSortedEntryNames(path: string): array<string> {
-    val names: array<string> = []
-    for (entry in Path(path).entries()) {
-        val name = entry.name()
-        if (name != "." && name != "..") {
-            names.append(name)
-            var at = names.size - 1
-            while (at > 0 && bootstrapTextBefore(names[at], names[at - 1])) {
-                val swap = names[at - 1]
-                names[at - 1] = names[at]
-                names[at] = swap
-                at = at - 1
-            }
+/** `names` sorted bytewise. */
+fun bootstrapSortedNames(names: array<string>): array<string> {
+    val sorted: array<string> = []
+    for (name in names) {
+        sorted.append(name)
+        var at = sorted.size - 1
+        while (at > 0 && bootstrapTextBefore(sorted[at], sorted[at - 1])) {
+            val swap = sorted[at - 1]
+            sorted[at - 1] = sorted[at]
+            sorted[at] = swap
+            at = at - 1
         }
     }
-    names
+    sorted
 }
 
 /** A data value's journal text: "" when it holds anything but data. */
@@ -1399,20 +1399,71 @@ fun bootstrapCompileOutputSlot(path: string): int {
     found
 }
 
+// A slot stages a file (its data is the contents), a directory (made when
+// published) or a removal (the path is deleted when published and is absent
+// until then): its `.kind` file says which, none for a file. Its `.revision`
+// counts its changes, which is the path's revision under `#`.
+
+/** The kind slot `slot` stages: "file", "directory" or "removed". */
+fun bootstrapCompileOutputKind(slot: int): string {
+    val kindFile = Path("${bootstrapCompileOutputRoot()}/$slot.kind")
+    if (kindFile.exists()) kindFile.readText() else "file"
+}
+
+/** How many times slot `slot` changed (1 once staged). */
+fun bootstrapCompileOutputRevision(slot: int): int {
+    val revisionFile = Path("${bootstrapCompileOutputRoot()}/$slot.revision")
+    val revision = if (revisionFile.exists()) bootstrapDecimalIndex(revisionFile.readText()) else 1
+    if (revision > 0) revision else 1
+}
+
+/** The path slot `slot` stages. */
+fun bootstrapCompileOutputPath(slot: int): string =
+    Path("${bootstrapCompileOutputRoot()}/$slot.path").readText()
+
+/** Slot `slot` now stages `kind` with `contents`, one revision later. */
+fun bootstrapRestageCompileOutput(slot: int, kind: string, contents: string): bool {
+    val root = bootstrapCompileOutputRoot()
+    val dataFile = Path("$root/$slot.data")
+    val previous = dataFile.readText().size
+    val nextBytes = bootstrapCompileOutputBytes - previous + contents.size
+    if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
+    if (!dataFile.writeTextAtomic(contents)) return false
+    bootstrapCompileOutputBytes = nextBytes
+    val kindFile = Path("$root/$slot.kind")
+    val kept = if (kind == "file") kindFile.remove() || !kindFile.exists()
+        else kindFile.writeTextAtomic(kind)
+    kept && Path("$root/$slot.revision").writeTextAtomic(
+        "${bootstrapCompileOutputRevision(slot) + 1}"
+    )
+}
+
+/** Stages `kind` ("directory" or "removed") at `path`: true when staged. */
+fun bootstrapStageCompileEntry(path: string, kind: string): bool {
+    if (!bootstrapCompileOutputPathValid(path)) return false
+    val slot = bootstrapCompileOutputSlot(path)
+    if (slot >= 0) return bootstrapRestageCompileOutput(slot, kind, "")
+    if (bootstrapCompileOutputCount >= BOOTSTRAP_COMPILE_OUTPUT_LIMIT) return false
+    val root = bootstrapCompileOutputRoot()
+    val index = bootstrapCompileOutputCount
+    var valid = Path(root).createDirectories() &&
+        Path("$root/$index.path").writeTextAtomic(path) &&
+        Path("$root/$index.data").writeTextAtomic("") &&
+        Path("$root/$index.kind").writeTextAtomic(kind)
+    if (!valid) {
+        Path("$root/$index.path").remove()
+        Path("$root/$index.data").remove()
+        Path("$root/$index.kind").remove()
+    } else bootstrapCompileOutputCount = index + 1
+    valid
+}
+
 fun bootstrapStageCompileOutput(path: string, contents: string): bool {
     var valid = bootstrapCompileOutputPathValid(path) &&
         contents.size <= 16777216
     // A path written again in the same compilation: the last contents win, in its slot.
     val slot = if (valid) bootstrapCompileOutputSlot(path) else -1
-    if (slot >= 0) {
-        val dataFile = Path("${bootstrapCompileOutputRoot()}/$slot.data")
-        val previous = dataFile.readText().size
-        val nextBytes = bootstrapCompileOutputBytes - previous + contents.size
-        if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) return false
-        if (!dataFile.writeTextAtomic(contents)) return false
-        bootstrapCompileOutputBytes = nextBytes
-        return true
-    }
+    if (slot >= 0) return bootstrapRestageCompileOutput(slot, "file", contents)
     val nextBytes = bootstrapCompileOutputBytes + contents.size
     if (nextBytes > BOOTSTRAP_COMPILE_OUTPUT_BYTES) valid = false
     if (bootstrapCompileOutputCount >= BOOTSTRAP_COMPILE_OUTPUT_LIMIT) valid = false
@@ -1475,14 +1526,18 @@ fun bootstrapCommitCompileOutputs(): bool {
         val pathFile = Path("$root/$index.path")
         val dataFile = Path("$root/$index.data")
         committed = pathFile.exists() && dataFile.exists()
-        if (committed && bootstrapBuildTransactionActive) {
-            committed = bootstrapRecordBuildTransactionPath(
-                pathFile.readText()
-            )
+        val kind = bootstrapCompileOutputKind(index)
+        val target = Path(pathFile.readText())
+        // Recording a path in the transaction moves what was there aside.
+        if (committed && bootstrapBuildTransactionActive && kind != "directory") {
+            committed = bootstrapRecordBuildTransactionPath(target.text)
         }
-        if (committed) committed = Path(pathFile.readText()).writeTextAtomic(
-            dataFile.readText()
-        )
+        if (committed && kind == "file") committed = target.writeTextAtomic(dataFile.readText())
+        if (committed && kind == "directory") committed = target.createDirectories()
+        if (committed && kind == "removed" && target.exists()) {
+            target.remove()
+            committed = !target.exists()
+        }
         index = index + 1
     }
     bootstrapDiscardCompileOutputs()
@@ -9648,9 +9703,9 @@ fun bootstrapEvaluateCallHost(
     if (targetName == "ablaHostReadFile") {
         if (bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 4)) {
             val path = evaluator.evaluate(expression.children[0])
-            val contents = Path(path.text).readText()
-            evaluator.recordCompileInput(path.text, contents)
-            result = bootstrapEvalString(contents)
+            // The compile-time file view (ct_native.ab): staged files too.
+            val read = ctNativeViewRead(evaluator, path.text, true)
+            result = bootstrapEvalString(if (read.succeeded) read.text else "")
         } else {
             // Parser staging precedes full semantic analysis. Reject the
             // invocation here so an unauthorized handler cannot touch the
@@ -9664,7 +9719,7 @@ fun bootstrapEvaluateCallHost(
         // on every host; [] when it doesn't exist.
         if (bootstrapCompileEffectHas(evaluator.allowedCompileEffects, 4)) {
             val path = evaluator.evaluate(expression.children[0])
-            val names = bootstrapSortedEntryNames(path.text)
+            val names = bootstrapSortedNames(ctNativeViewEntries(evaluator, path.text))
             var listing = ""
             val elements: array<BootstrapEvalValue> = []
             var index = 0

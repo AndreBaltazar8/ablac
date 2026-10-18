@@ -370,7 +370,7 @@ The check happens before evaluation starts, so a denied path never runs.
 | Capability | What it allows | Providers | Native object cache |
 |---|---|---|---|
 | `filesystem.read` | read files, list directories, file metadata | `abla/fs`: `p.readText()`, `p.readTextResult()`, `p.exists()`, `p.info()`, `p.revision()`, `p.isSymbolicLink()`, `p.entries()`, `currentDirectory()` (the internal `ablaHostReadFile`/`ablaHostListDirectory` too) | kept: each read is journaled and revalidated, a failed one too |
-| `filesystem.write` | stage output files, published only if the build succeeds | `compilerWriteFile(path, contents)`; `abla/fs`: `p.writeText()`, `p.writeTextAtomic()`, `p.appendText()`, `p.createDirectories()`, `p.createParentDirectories()` | disabled |
+| `filesystem.write` | stage output files, directories, moves and removals, published only if the build succeeds | `compilerWriteFile(path, contents)`; `abla/fs`: `p.writeText()`, `p.writeTextAtomic()`, `p.appendText()`, `p.createDirectories()`, `p.createParentDirectories()`, `p.moveTo(destination)`, `p.remove()` | disabled |
 | `environment` | read named environment variables | `compilerEnvironment(name)` (`""` when unset) | kept: each value is journaled and revalidated |
 | `process.io` | run a child process | `compilerRunProcess(arguments)` | disabled |
 | `network` | one TCP request/response | `compilerTcpExchange(ipv4, port, request, maxBytes, timeoutMs)` | disabled |
@@ -381,14 +381,28 @@ The check happens before evaluation starts, so a denied path never runs.
 The `compiler*` providers come from `import "abla/compiler"`. File paths are
 relative to the directory the compiler runs in.
 
-Under `#`, the `abla/fs` writes are staged exactly like `compilerWriteFile`:
-nothing touches the disk until the build succeeds, then every staged file is
-published (its directories made as needed); a failed build publishes nothing.
-The same bounds apply, and paths must be project-relative. A path staged
-earlier in the compilation reads back with its staged contents
-(`readText`, `readTextResult`, `exists`, `info`), and `appendText` appends to
-them. Moving, copying and removing files can't be staged, so they stay
-native code (`trusted.native`).
+Under `#`, the `abla/fs` writes, moves and removals are staged exactly like
+`compilerWriteFile`: nothing touches the disk until the build succeeds, then
+the staging is published in the order it happened (each file written with its
+directories made as needed, each directory made, each moved or removed path
+deleted); a failed build publishes nothing. The same bounds apply, and paths
+must be project-relative.
+
+Until then, compile-time code sees the disk with the staging laid over it,
+which is what the program sees after the same operations at run time:
+
+- a staged file reads back with its staged contents (`readText`,
+  `readTextResult`, `exists`, `info`), and `appendText` appends to them;
+- each staged change is a new `revision()`, so `watchFile` sees a staged
+  rewrite;
+- a write makes its parent directories, as at run time, and `entries()` lists
+  what was staged in a directory along with what is on disk;
+- `remove()` and `moveTo()` act on staged and disk paths alike: a removed path
+  is gone, and a directory with something in it is not removed.
+
+Another process (one started under `process.io`) sees only the disk, so a
+file the build has staged isn't there for it yet. `removeTree()` asks what a
+path is without following links, which is native code (`trusted.native`).
 
 `print`, `println`, `eprint` and `eprintln` need no capability: under `#` they
 write to the compiler's own standard output and error. What a compilation
@@ -627,7 +641,7 @@ compiler team tracks the remaining gaps case by case.
 | Functions, recursion, classes and methods, arrays, `Map`, strings, string templates | works |
 | Closures used within one evaluation; tasks and `await` | works |
 | `thread { }` | runs when it is awaited, not alongside the code that started it ([threads at compile time](#threads-at-compile-time)) |
-| Generators | being fixed |
+| Generators | works |
 | `f32`/`f64` arithmetic, `abla/math`, `abla/float/text` | works |
 | `abla/json`, `$json`, `$jsons` | works |
 | Delegated bindings, resources and `drop`, ownership checks | works |
@@ -635,9 +649,9 @@ compiler team tracks the remaining gaps case by case.
 | Closures as `#` results | works |
 | `print`/`println` | works, no grant: to the compiler's standard output |
 | `abla/fs` reads, `abla/process/time` | works with `filesystem.read` / `clock` |
-| `abla/fs` writes | works with `filesystem.write`, staged until the build succeeds |
+| `abla/fs` writes, moves and removals | works with `filesystem.write`, staged until the build succeeds |
 | Standard-library code built on its own raw memory (byte buffers) | works, no grant |
-| Other system calls (file moves and removals, processes, sockets) | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
+| Other system calls (processes, sockets) | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
 | `extern:"c"` functions, trusted raw memory, `nativeFunctionAddress` callbacks | works with `trusted.native` |
 | `abla/platform/host` | works: each function under the capability it implies |
 | Fixed-width integer conversions (`u16(x)`); nominal conversions (`Pin(x)`), integer extension methods | fixed-width works; the rest partly: being fixed |

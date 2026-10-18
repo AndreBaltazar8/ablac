@@ -199,6 +199,7 @@ test: ablac
 	tools/test-inferred-receivers.sh $(COMPILER)
 	tools/test-gc-stress.sh $(COMPILER)
 	tools/test-generator-step.sh $(COMPILER)
+	tools/test-compile-time-files.sh $(COMPILER)
 
 check: test self-rebuild
 
