@@ -92,4 +92,26 @@ if (lines[13].result?.valid !== false) {
 }
 ' <<<"$responses"
 
-printf '%s\n' 'analysis service: protocol, overlays, UTF-8 spans, semantic calls/diagnostics, created documents, stale versions passed'
+# The analysis sees the code the build compiles: receiver members called by
+# plain name, literals typed from their declaration and lambdas typed from the
+# array they are appended to analyze without diagnostics, as they build.
+rewrites=$(
+    printf '%s\n' \
+        '{"schema":1,"id":1,"method":"initialize","params":{"workspaceRoots":[],"clientName":"analysis-test","clientVersion":"1"}}' \
+        '{"schema":1,"id":2,"method":"document/open","params":{"uri":"file:///tmp/abla-analysis-rewrites.ab","version":1,"text":"class Shape(val w: int, var h: int) {\n    fun area(): int = w * h\n    fun describe(): string = \"area ${area()}\"\n}\n\nfun main: int {\n    val rows: array<array<int?>> = [[1, null], []]\n    val handlers: array<(int) -> int> = []\n    handlers.append({ x -> x + 1 })\n    Shape(3, 4).describe().size + rows.size + handlers[0](1)\n}\n"}}' \
+        '{"schema":1,"id":3,"method":"analyze","params":{}}' \
+        '{"schema":1,"id":4,"method":"shutdown","params":{}}' |
+        "$compiler" analyze --stdio
+)
+node -e '
+const lines = require("node:fs").readFileSync(0, "utf8").trim().split("\n").map(JSON.parse);
+const document = lines[2].result.documents[0];
+if (document.diagnostics.length !== 0) {
+  throw new Error("analysis differs from the build: " + JSON.stringify(document.diagnostics));
+}
+if (!document.symbols.some((symbol) => symbol.name === "Shape")) {
+  throw new Error("the rewritten document lost its symbols");
+}
+' <<<"$rewrites"
+
+printf '%s\n' 'analysis service: protocol, overlays, UTF-8 spans, semantic calls/diagnostics, created documents, stale versions, build rewrites passed'
