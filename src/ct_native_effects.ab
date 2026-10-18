@@ -26,6 +26,11 @@ fun bootstrapCompileProviderEffect(module: string, owner: string, name: string):
             name == "info" || name == "revision" || name == "isSymbolicLink" ||
             name == "entries") return 4
     }
+    // Writes are staged (compilerWriteFile's contract: published on success).
+    if (module == "fs" && owner == "Path") {
+        if (name == "writeText" || name == "writeTextAtomic" || name == "appendText" ||
+            name == "createDirectories" || name == "createParentDirectories") return 8
+    }
     if (module == "fs" && owner == "" && name == "currentDirectory") return 4
     if (module == "io" && owner == "") {
         if (name == "print" || name == "println" || name == "eprint" ||
@@ -48,8 +53,9 @@ fun bootstrapCompileHostOperationEffect(name: string): int {
         operation == "CurrentDirectory" || operation == "FileRevision") return 4
     if (operation == "WriteFile" || operation == "WriteFileAtomic" ||
         operation == "CreateParentDirectories" ||
-        operation == "CreateDirectories" || operation == "MoveFile" ||
-        operation == "RemoveFile") return 8
+        operation == "CreateDirectories") return 8
+    // A move or a removal can't be staged: native code.
+    if (operation == "MoveFile" || operation == "RemoveFile") return 512
     // A compile-time evaluation is a program the compiler runs with no
     // arguments, and what it writes is output, not an input of the build.
     if (operation == "ArgumentCount" || operation == "Argument" ||
@@ -117,4 +123,58 @@ fun bootstrapCompileHostProvider(declaration: BootstrapDeclaration): bool =
 fun bootstrapCompileProviderKey(declaration: BootstrapDeclaration): string {
     val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
     if (declaration.extensionOwner == "") name else "${declaration.extensionOwner}.$name"
+}
+
+// ---- contained raw memory ----
+//
+// The standard library implements pure computations (byte buffers, JWT
+// parsing) with trusted raw memory. That memory is its own, like the
+// runtime's, so it does not make the computation native code: a raw-memory
+// operation carries the internal effect BOOTSTRAP_COMPILE_RAW_MEMORY instead
+// of trusted.native, and where it lands decides what it means. The
+// standard library drops it (contained), its unsafe boundary (abla/unsafe,
+// abla/runtime) passes it on to whoever calls in, and a program's own code
+// turns it into trusted.native. External C functions, function-pointer calls
+// and system calls stay trusted.native everywhere.
+
+val BOOTSTRAP_COMPILE_RAW_MEMORY = 1024
+
+// Raw-memory intrinsics: loads, stores, pointer arithmetic, string storage,
+// allocation and atomics.
+fun bootstrapCompileRawMemoryIntrinsic(name: string): bool =
+    (name.startsWith("ablaUnsafeLoad") || name.startsWith("ablaUnsafeStore") ||
+     name.startsWith("ablaUnsafeVolatile") || name.startsWith("ablaUnsafeAtomic")) ||
+    name == "ablaUnsafeNullPointer" || name == "ablaUnsafePointerIsNull" ||
+    name == "ablaUnsafePointerOffset" || name == "ablaUnsafePointerAddress" ||
+    name == "ablaUnsafeSetMemory" || name == "ablaUnsafeCopyMemory" ||
+    name == "ablaUnsafeCStringAddress" || name == "ablaUnsafeStringAddress" ||
+    name == "ablaUnsafeAdoptString" || name == "ablaUnsafeBorrowCString" ||
+    name == "ablaRuntimePointerFromAddress" || name == "ablaRuntimePointerAddress" ||
+    name == "nativeStackAllocate"
+
+// Where a source sits for that rule: 0 the program's own code, 1 the
+// standard library, 2 its unsafe boundary (abla/unsafe), 3 the runtime.
+fun bootstrapCompileSourceClass(source: string): int {
+    val root = bootstrapCompileProviderStandardLibrary()
+    if (!source.startsWith("$root/")) return 0
+    val relative = source.slice(root.size + 1, source.size)
+    if (relative.startsWith("abla/unsafe/")) 2
+    else if (relative.startsWith("abla/runtime/")) 3
+    else 1
+}
+
+fun bootstrapCompileDeclarationSourceClass(declaration: BootstrapDeclaration): int {
+    var source = declaration.sourceIdentity
+    if (source == "") source = bootstrapCanonicalDeclarationModuleIdentity(declaration.name)
+    bootstrapCompileSourceClass(source)
+}
+
+// What an effect mask means in code of `sourceClass`.
+fun bootstrapCompileContainEffects(mask: int, sourceClass: int): int {
+    if (sourceClass >= 2 ||
+        !bootstrapCompileEffectHas(mask, BOOTSTRAP_COMPILE_RAW_MEMORY)) return mask
+    val without = mask - BOOTSTRAP_COMPILE_RAW_MEMORY
+    if (sourceClass == 1) without
+    else if (bootstrapCompileEffectHas(without, 512)) without
+    else without + 512
 }

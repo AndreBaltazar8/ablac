@@ -370,7 +370,7 @@ The check happens before evaluation starts, so a denied path never runs.
 | Capability | What it allows | Providers | Native object cache |
 |---|---|---|---|
 | `filesystem.read` | read files, list directories, file metadata | `abla/fs`: `p.readText()`, `p.readTextResult()`, `p.exists()`, `p.info()`, `p.revision()`, `p.isSymbolicLink()`, `p.entries()`, `currentDirectory()` (the internal `ablaHostReadFile`/`ablaHostListDirectory` too) | kept: each read is journaled and revalidated, a failed one too |
-| `filesystem.write` | stage output files, published only if the build succeeds | `compilerWriteFile(path, contents)` | disabled |
+| `filesystem.write` | stage output files, published only if the build succeeds | `compilerWriteFile(path, contents)`; `abla/fs`: `p.writeText()`, `p.writeTextAtomic()`, `p.appendText()`, `p.createDirectories()`, `p.createParentDirectories()` | disabled |
 | `environment` | read named environment variables | `compilerEnvironment(name)` (`""` when unset) | kept: each value is journaled and revalidated |
 | `process.io` | run a child process | `compilerRunProcess(arguments)` | disabled |
 | `network` | one TCP request/response | `compilerTcpExchange(ipv4, port, request, maxBytes, timeoutMs)` | disabled |
@@ -380,6 +380,15 @@ The check happens before evaluation starts, so a denied path never runs.
 
 The `compiler*` providers come from `import "abla/compiler"`. File paths are
 relative to the directory the compiler runs in.
+
+Under `#`, the `abla/fs` writes are staged exactly like `compilerWriteFile`:
+nothing touches the disk until the build succeeds, then every staged file is
+published (its directories made as needed); a failed build publishes nothing.
+The same bounds apply, and paths must be project-relative. A path staged
+earlier in the compilation reads back with its staged contents
+(`readText`, `readTextResult`, `exists`, `info`), and `appendText` appends to
+them. Moving, copying and removing files can't be staged, so they stay
+native code (`trusted.native`).
 
 `print`, `println`, `eprint` and `eprintln` need no capability: under `#` they
 write to the compiler's own standard output and error. What a compilation
@@ -435,7 +444,10 @@ manifest's `nativeLibraries`, which the compiler loads for the build: it
 searches `LIBRARY_PATH`, the system library directories and the dynamic
 loader's own paths. `trusted` code's raw memory operations, the allocator behind
 `abla/unsafe/memory`, and the system calls under `abla/fs`, `abla/process` and
-`abla/net` act on real memory and the real system. `nativeFunctionAddress(f)`
+`abla/net` act on real memory and the real system. The standard library's own
+use of raw memory (byte buffers it allocates and owns) is contained: it needs
+no capability, the same as the runtime's memory. A program's own `trusted`
+raw-memory code, including calls into `abla/unsafe`, needs `trusted.native`. `nativeFunctionAddress(f)`
 gives C code an entry that calls back into `f`, so a C sort with an Abla
 comparison works as at run time.
 
@@ -612,7 +624,9 @@ compiler team tracks the remaining gaps case by case.
 | Closures as `#` results | works |
 | `print`/`println` | works, no grant: to the compiler's standard output |
 | `abla/fs` reads, `abla/process/time` | works with `filesystem.read` / `clock` |
-| Other system calls (`abla/fs` writes, processes, sockets) | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
+| `abla/fs` writes | works with `filesystem.write`, staged until the build succeeds |
+| Standard-library code built on its own raw memory (byte buffers) | works, no grant |
+| Other system calls (file moves and removals, processes, sockets) | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
 | `extern:"c"` functions, trusted raw memory, `nativeFunctionAddress` callbacks | works with `trusted.native` |
 | `abla/platform/host` | works: each function under the capability it implies |
 | Fixed-width integer conversions (`u16(x)`); nominal conversions (`Pin(x)`), integer extension methods | fixed-width works; the rest partly: being fixed |

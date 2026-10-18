@@ -144,4 +144,35 @@ rm -rf "$cases/fs-cache/build" "$cases/fs-cache/late.txt"
     exit 1
 }
 
-echo "compile-time native: C calls, callbacks, raw memory, system calls, a manifest library, the host API, abla/fs reads and println; denied calls not performed"
+# abla/fs writes are staged: published on success, discarded on failure.
+rm -rf "$cases/fs-write/build-fs-write" "$cases/fs-write-failed/build-fs-write-failed"
+run_case "$cases/fs-write" "$output_directory/fs-write" build > /dev/null
+[[ $(cat "$cases/fs-write/build-fs-write/generated.txt") == $'first\nsecond' ]] || {
+    echo 'a staged compile-time write was not published' >&2
+    exit 1
+}
+expect_42 "$cases/fs-write" "$output_directory/fs-write"
+rm -rf "$cases/fs-write/build-fs-write"
+set +e
+run_case "$cases/fs-write-failed" "$output_directory/fs-write-failed" build \
+    > "$output_directory/fs-write-failed.log" 2>&1
+write_failed=$?
+set -e
+[[ $write_failed -ne 0 ]] || exit 1
+[[ ! -e $cases/fs-write-failed/build-fs-write-failed/never.txt ]] || {
+    echo 'a failed compilation published its staged write' >&2
+    exit 1
+}
+
+# The standard library's own raw memory is contained; a program's is not.
+run_case "$cases/contained" "$output_directory/contained" build > /dev/null
+expect_42 "$cases/contained" "$output_directory/contained"
+set +e
+run_case "$cases/uncontained" "$output_directory/uncontained" build \
+    > "$output_directory/uncontained.log" 2>&1
+uncontained=$?
+set -e
+[[ $uncontained -ne 0 ]] || exit 1
+grep -q 'compile.effect-denied:trusted.native:poke->nativeByteBuffer' "$output_directory/uncontained.log"
+
+echo "compile-time native: C calls, callbacks, raw memory, system calls, a manifest library, the host API, abla/fs reads, staged writes, println and contained standard-library memory; denied calls not performed"

@@ -128,6 +128,25 @@ fun ctNativeIntrinsicEffect(name: string): int =
     else if (name == "ablaLinuxEnvironmentPointer") 16
     else 512
 
+// The source class (bootstrapCompileSourceClass) of the innermost frame being
+// evaluated that is not the unsafe boundary or the runtime: raw memory the
+// standard library's own code (1) reaches is contained; the program's (0)
+// is trusted.native.
+var ctNativeRawContext: int = 0
+
+// Entering a declaration's body from `source`: returns the context to
+// restore when it is left.
+fun ctNativeEnterSource(source: string): int {
+    val previous = ctNativeRawContext
+    val sourceClass = bootstrapCompileSourceClass(source)
+    if (sourceClass <= 1) ctNativeRawContext = sourceClass
+    previous
+}
+
+// Raw-memory operations: contained within the standard library.
+fun ctNativeRawOperation(name: string): bool =
+    bootstrapCompileRawMemoryIntrinsic(name) || name.startsWith("__ablaRuntime")
+
 // Whether an evaluation holds capability `effect` (0: needs none).
 fun ctNativeAllowed(evaluator: BootstrapEvaluator, effect: int): bool =
     effect <= 0 || bootstrapCompileEffectHas(evaluator.allowedCompileEffects, effect)
@@ -213,7 +232,8 @@ trusted fun ctNativeEvaluateIntrinsic(
     name: string
 ): BootstrapEvalValue {
     val effect = ctNativeIntrinsicEffect(name)
-    if (!ctNativeAllowed(evaluator, effect)) {
+    val contained = ctNativeRawContext == 1 && ctNativeRawOperation(name)
+    if (!contained && !ctNativeAllowed(evaluator, effect)) {
         return ctNativeDenied(evaluator, "intrinsic `$name`", effect)
     }
     if (name == "nativeFunctionAddress") {
@@ -1283,20 +1303,16 @@ fun ctNativeHostCall(
         val directory = ablaHostCurrentDirectory()
         evaluator.recordCompileInput("abla-input:current-directory:", directory)
         result = bootstrapEvalString(directory)
-    } else if (operation == "WriteFile") {
+    } else if (operation == "WriteFile" || operation == "WriteFileAtomic") {
+        // Staged like compilerWriteFile: published when the build succeeds.
         val path = ctNativeValueText(values, 0)
-        ablaHostWriteFile(path, ctNativeValueText(values, 1))
-    } else if (operation == "WriteFileAtomic") {
-        val path = ctNativeValueText(values, 0)
-        result = bootstrapEvalBoolean(
-            ablaHostWriteFileAtomic(path, ctNativeValueText(values, 1))
-        )
-    } else if (operation == "CreateParentDirectories") {
-        ablaHostCreateParentDirectories(ctNativeValueText(values, 0))
-    } else if (operation == "CreateDirectories") {
-        result = bootstrapEvalBoolean(
-            ablaHostCreateDirectories(ctNativeValueText(values, 0))
-        )
+        val staged = bootstrapStageCompileOutput(path, ctNativeValueText(values, 1))
+        if (operation == "WriteFileAtomic") result = bootstrapEvalBoolean(staged)
+    } else if (operation == "CreateParentDirectories" ||
+               operation == "CreateDirectories") {
+        // Staged files' directories are made when they are published.
+        val valid = bootstrapCompileOutputPathValid(ctNativeValueText(values, 0))
+        if (operation == "CreateDirectories") result = bootstrapEvalBoolean(valid)
     } else if (operation == "MoveFile") {
         val source = ctNativeValueText(values, 0)
         result = bootstrapEvalBoolean(
@@ -1552,6 +1568,15 @@ fun ctNativeEvaluateProvider(
     result
 }
 
+// The slot of `path` among the outputs this compilation staged (-1: none).
+fun ctNativeStagedSlot(path: string): int =
+    if (bootstrapCompileOutputCount > 0 && bootstrapCompileOutputPathValid(path))
+        bootstrapCompileOutputSlot(path)
+    else -1
+
+fun ctNativeStagedText(slot: int): string =
+    Path("${bootstrapCompileOutputRoot()}/$slot.data").readText()
+
 // Performs `Path.<method>` on an evaluated receiver; `arguments` holds the
 // call's children and the method's arguments start at `first`. Every
 // observation is journaled under an identity bootstrapCompileInputContents
@@ -1568,14 +1593,44 @@ fun ctNativeEvaluatePathMethod(
     if (!ctNativeAllowed(evaluator, effect)) {
         return ctNativeDenied(evaluator, "call to `Path.$method`", effect)
     }
+    val values: array<BootstrapEvalValue> = []
     var index = first
     while (index < arguments.size) {
-        val unused = evaluator.evaluate(arguments[index])
+        values.append(evaluator.evaluate(arguments[index]))
         index = index + 1
     }
     val path = ctNativePathText(receiver)
+    // A path this compilation staged reads back as staged (not journaled: it
+    // is the build's own output, not an input).
+    val staged = if (method == "readText" || method == "readTextResult" ||
+        method == "exists" || method == "info" || method == "appendText")
+        ctNativeStagedSlot(path) else -1
     var result = bootstrapEvalInvalid()
-    if (method == "readText") {
+    if (method == "writeText" || method == "writeTextAtomic" || method == "appendText") {
+        // Staged like compilerWriteFile: published when the build succeeds,
+        // discarded when it fails.
+        var contents = ctNativeValueText(values, 0)
+        if (method == "appendText") {
+            contents = "${if (staged >= 0) ctNativeStagedText(staged) else Path(path).readText()}$contents"
+        }
+        result = bootstrapEvalBoolean(bootstrapStageCompileOutput(path, contents))
+    } else if (method == "createDirectories" || method == "createParentDirectories") {
+        // A staged file's directories are made when it is published.
+        result = bootstrapEvalBoolean(bootstrapCompileOutputPathValid(path))
+    } else if (staged >= 0) {
+        val text = ctNativeStagedText(staged)
+        result = if (method == "readText") bootstrapEvalString(text)
+            else if (method == "readTextResult") bootstrapEvalObject(
+                "FileReadResult", ["text", "succeeded", "errorCode"],
+                [bootstrapEvalString(text), bootstrapEvalBoolean(true), bootstrapEvalInteger(0)]
+            )
+            else if (method == "exists") bootstrapEvalBoolean(true)
+            else bootstrapEvalObject(
+                "FileInfo", ["path", "kind", "size", "revision"],
+                [ctNativePathValue(path), bootstrapEvalInteger(1),
+                 bootstrapEvalInteger(text.size), bootstrapEvalInteger(0)]
+            )
+    } else if (method == "readText") {
         val contents = Path(path).readText()
         evaluator.recordCompileInput(path, contents)
         result = bootstrapEvalString(contents)
