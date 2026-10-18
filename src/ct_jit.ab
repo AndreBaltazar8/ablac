@@ -8,7 +8,7 @@
 // LLVM path as runtime code, and added to the process's LLVM ORC session as one
 // generation; ct_eval.ab calls the entries where the interpreter would have run.
 //
-// A site the tier cannot take yet (a result type without an encoder, a compiler
+// A site the tier cannot take yet (a result the value codec cannot carry, a compiler
 // API or host provider call, a cross-target build) runs in the interpreter;
 // ABLA_COMPILE_EVAL_TRACE=1 says why.
 
@@ -257,9 +257,17 @@ class BootstrapCtReach(
                         } else if (declaration.kind == "compile.val" ||
                                    declaration.kind == "compile.var") {
                             val type = bootstrapNormalizeType(declaration.resultType)
-                            if (bootstrapCtEncoderSuffix(type) == "" ||
-                                type == "void" || type == "null") {
-                                reason = "reaches compile global ${declaration.name} of type ${declaration.resultType}, which has no encoder yet (value codec pending)"
+                            val typeReason = bootstrapLiftTypeReason(type)
+                            // Native code starts from the value an earlier evaluation
+                            // kept; only a scalar can be its initializer yet.
+                            val kept = bootstrapCompileGlobalLoad(
+                                bootstrapCompileGlobalKey(declaration), this.declarations, []
+                            )
+                            if (typeReason != "" || type == "void" || type == "null") {
+                                reason = "reaches compile global ${declaration.name} of type ${declaration.resultType}, which native code cannot hand back"
+                            } else if (kept.kind != "invalid" &&
+                                bootstrapCtLiftScalar(kept, 0, 0).kind == "missing") {
+                                reason = "reaches compile global ${declaration.name}, which holds a kept ${kept.kind} native code cannot take in yet"
                             } else globals.append(this.itemDeclarations[item])
                         } else if (valueItem && bootstrapCtHasCompileNode(declaration.expression)) {
                             // Its initializer runs compile-time code of its own when it is
@@ -343,17 +351,12 @@ fun bootstrapCtReach(declarations: array<BootstrapDeclaration>): BootstrapCtReac
 
 // --- the slice -----------------------------------------------------------------
 
-// The stub codec until the value codec lands: the scalar kinds of the journal text.
-fun bootstrapCtEncoderSuffix(type: string): string =
-    if (type == "i64" || type == "int") "i64"
-    else if (type == "bool") "bool"
-    else if (type == "string") "string"
-    else if (type == "void") "void"
-    else if (type == "null") "null"
-    else ""
-
-fun bootstrapCtSupportSource(generation: int): string {
+// The generation's support: the empty reply of an entry that only runs its site,
+// the free entry, and the value codec's encoder (ct_lift.ab), which every value
+// entry and global getter calls: it walks the runtime's value, whatever its type.
+fun bootstrapCtSupportSource(generation: int, declarations: array<BootstrapDeclaration>): string {
     val g = "$generation"
+    bootstrapCtLiftEncoder("i64", declarations, g).source +
     "trusted fun __abla_ct_reply_$g(bytes: string): int {\n" +
     "    val address = __ablaRuntimeAllocate(bytes.size + 8)\n" +
     "    ablaRuntimeStoreI64(address, bytes.size)\n" +
@@ -368,25 +371,16 @@ fun bootstrapCtSupportSource(generation: int): string {
     "trusted fun __abla_ct_free_$g(address: int): int {\n" +
     "    __ablaRuntimeFree(address)\n" +
     "    0\n" +
-    "}\n" +
-    "fun __abla_ct_token_$g(text: string): string = \"\${text.size}:\$text\"\n" +
-    "fun __abla_ct_encode_i64_$g(value: int): string =\n" +
-    "    \"7:integer\${__abla_ct_token_$g(\"\$value\")}1:00:0:1:01:0\"\n" +
-    "fun __abla_ct_encode_bool_$g(value: bool): string =\n" +
-    "    if (value) \"7:boolean1:01:10:0:1:01:0\" else \"7:boolean1:01:00:0:1:01:0\"\n" +
-    "fun __abla_ct_encode_string_$g(value: string): string =\n" +
-    "    \"6:string1:01:0\${__abla_ct_token_$g(value)}0:1:01:0\"\n"
+    "}\n"
 }
 
 fun bootstrapCtEntrySource(site: BootstrapCtSite, generation: int): string {
     val id = "${site.id}"
-    val suffix = if (site.action) "void" else bootstrapCtEncoderSuffix(site.type)
     val header = "@export(\"abla_ct_eval_$id\")\ncompile fun __abla_ct_eval_$id(): int"
-    if (suffix == "void" || suffix == "null") {
-        "$header {\n    __abla_ct_site_$id()\n    __abla_ct_reply_$generation(\"4:$suffix" +
-            "1:01:00:0:1:01:0\")\n}\n"
+    if (!site.encodes) {
+        "$header {\n    __abla_ct_site_$id()\n    __abla_ct_reply_$generation(\"\")\n}\n"
     } else {
-        "$header =\n    __abla_ct_reply_$generation(__abla_ct_encode_${suffix}_$generation(__abla_ct_site_$id()))\n"
+        "$header =\n    __abla_lift_reply_$generation(__abla_ct_site_$id())\n"
     }
 }
 
@@ -447,10 +441,9 @@ fun bootstrapCtDeclarationWith(
     sourceIdentity
 )
 
-fun bootstrapCtGlobalSource(global: BootstrapCtGlobal, index: int, generation: int): string {
-    val suffix = bootstrapCtEncoderSuffix(global.type)
-    "@export(\"abla_ct_global_${generation}_$index\")\ncompile fun __abla_ct_global_${generation}_$index(): int =\n    __abla_ct_reply_$generation(__abla_ct_encode_${suffix}_$generation(__abla_ct_value_$index()))\n"
-}
+fun bootstrapCtGlobalSource(index: int, generation: int): string =
+    "@export(\"abla_ct_global_${generation}_$index\")\ncompile fun __abla_ct_global_${generation}_$index(): int =\n    __abla_lift_reply_$generation(__abla_ct_value_$index())\n"
+
 
 // A kept scalar as a literal initializer ("missing" when there is none).
 fun bootstrapCtLiftScalar(value: BootstrapEvalValue, begin: int, end: int): BootstrapExpression =
@@ -511,9 +504,10 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     }
     var ready = 0
     for (site in bootstrapCtSites) {
-        if (site.reason == "" && !site.action &&
-            bootstrapCtEncoderSuffix(site.type) == "") {
-            site.reason = "result type ${site.type} has no encoder yet (value codec pending)"
+        site.encodes = !site.action && site.type != "void" && site.type != "null"
+        if (site.reason == "" && site.encodes) {
+            val typeReason = bootstrapLiftTypeReason(bootstrapNormalizeType(site.type))
+            if (typeReason != "") site.reason = "result type ${site.type}: $typeReason"
         }
         if (site.reason == "") {
             reach.reset()
@@ -547,15 +541,13 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     if (ready == 0) return
     bootstrapCtGenerationNumber = bootstrapCtGenerationNumber + 1
     val generation = bootstrapCtGenerationNumber
-    var source = bootstrapCtSupportSource(generation)
+    var source = bootstrapCtSupportSource(generation, parsed.declarations)
     for (site in bootstrapCtSites) {
         if (site.reason == "") source = "$source${bootstrapCtEntrySource(site, generation)}"
     }
     var globalIndex = 0
     while (globalIndex < bootstrapCtGlobals.size) {
-        source = "$source${bootstrapCtGlobalSource(
-            bootstrapCtGlobals[globalIndex], globalIndex, generation
-        )}"
+        source = "$source${bootstrapCtGlobalSource(globalIndex, generation)}"
         globalIndex = globalIndex + 1
     }
     val template = bootstrapParse(source)
@@ -711,6 +703,14 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     }
     bootstrapCtGenerationState = added
     bootstrapCtGenerationLive = true
+    // A native result's closure names its function by runtime id.
+    val functionIds: array<int> = []
+    val functionNames: array<string> = []
+    for (function in program.functions) {
+        functionIds.append(bootstrapLlvmFunctionRuntimeId(function))
+        functionNames.append(function.name)
+    }
+    bootstrapCtFunctions = BootstrapCtFunctionTable(functionIds, functionNames, [])
     for (global in bootstrapCtGlobals) {
         global.exchanged = bootstrapCompileGlobalEncode(
             bootstrapCompileGlobalLoad(global.key, parsed.declarations, [])
@@ -957,6 +957,7 @@ fun bootstrapCtFinishPass(): void {
     }
     bootstrapCtFreeAddress = 0
     bootstrapCtGuardAddress = 0
+    bootstrapCtFunctions = bootstrapCtNoFunctions()
     bootstrapCtPanicTextAddress = 0
     bootstrapCtPanicSizeAddress = 0
     bootstrapCtSites = []

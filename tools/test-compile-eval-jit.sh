@@ -29,6 +29,7 @@ for mode in interp jit; do
     run_case "$mode" scalars 42
     run_case "$mode" fallback 33
     run_case "$mode" globals 42
+    run_case "$mode" codec 42
 done
 
 # Every scalar site (six expressions and one action) ran natively.
@@ -48,12 +49,19 @@ if grep -q 'ct-jit' "$output_directory/scalars-interp.trace"; then
     echo "compile-eval-jit: the interpreter tier used the native tier" >&2
     exit 1
 fi
-# Results without an encoder are interpreted, with the reason.
-grep -q 'interpreted at .*: result type array:i64 has no encoder yet' \
+# Arrays and objects come back natively; a compiler API call is interpreted, with
+# the reason.
+native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/fallback-jit.trace" || true)
+[[ $native -eq 3 ]] || { echo "compile-eval-jit: $native native sites in fallback.ab, expected 3" >&2; cat "$output_directory/fallback-jit.trace" >&2; exit 1; }
+grep -q 'interpreted at .*: reaches extern:"compiler" fun compilerFindFunction' \
     "$output_directory/fallback-jit.trace"
-grep -q 'interpreted at .*: result type Pair has no encoder yet' \
-    "$output_directory/fallback-jit.trace"
-grep -q 'native at' "$output_directory/fallback-jit.trace"
+
+grep -q 'native at' "$output_directory/codec-jit.trace"
+if grep -q 'interpreted at' "$output_directory/codec-jit.trace"; then
+    echo "compile-eval-jit: the codec site fell back to the interpreter" >&2
+    cat "$output_directory/codec-jit.trace" >&2
+    exit 1
+fi
 
 # Compile globals: three native sites, then an interpreted one changes the counter, so
 # the generation's copy is stale and the last site is interpreted too.

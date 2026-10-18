@@ -7,11 +7,13 @@
 // was added. A site with no entry runs in the interpreter.
 //
 // JIT code has a runtime of its own, so no heap pointer crosses: an entry encodes
-// its result as bytes (the compile-global journal text, read back with
-// BootstrapCompileGlobalReader), copies them to `[length:i64][bytes]` in its own
-// memory and returns the address; the compiler copies them and frees them there.
+// its result with the value codec's encoder (ct_lift.ab) as `[length:i64][bytes]`
+// in its own memory and returns the address; the compiler copies the bytes, frees
+// them there and decodes them with the static type (bootstrapCtLiftDecode), as the
+// interpreter's lift would have built the value.
 
 import "eval.ab"
+import "ct_lift.ab"
 import "abla/unsafe/memory"
 import "abla/bytes"
 
@@ -32,7 +34,10 @@ class BootstrapCtSite(
     var id: int,
     var reason: string,
     // The entry's address in the live generation (0: none).
-    var entry: int
+    var entry: int,
+    // Whether its entry encodes a value (false: an action, or a void or null
+    // result, which the entry only runs).
+    var encodes: bool = false
 )
 
 val BOOTSTRAP_CT_UNPREPARED = "the program has semantic errors"
@@ -71,6 +76,9 @@ var bootstrapCtCurrent: BootstrapEvaluator = BootstrapEvaluator(
     [], [], [], [], [], [], [], [], [], [], [], [], [], 0, 0, 0, "", ""
 )
 var bootstrapCtSites: array<BootstrapCtSite> = []
+// The live generation's functions by runtime id: a native result's closures name
+// their function by it.
+var bootstrapCtFunctions: BootstrapCtFunctionTable = bootstrapCtNoFunctions()
 var bootstrapCtGlobals: array<BootstrapCtGlobal> = []
 // Set while the slice itself is lowered: a `compile` node met there is compile
 // code being compiled, so its operand is lowered, never evaluated.
@@ -157,7 +165,8 @@ trusted fun bootstrapCtTryEvaluate(
     // The generation's compile globals are the keep-store's: an interpreted evaluation
     // that changed one since leaves this generation's copy stale.
     for (global in bootstrapCtGlobals) {
-        if (bootstrapCompileGlobalEncode(bootstrapCompileGlobalLoad(global.key, declarations, [])) !=
+        if (global.getter != 0 &&
+            bootstrapCompileGlobalEncode(bootstrapCompileGlobalLoad(global.key, declarations, [])) !=
             global.exchanged) {
             bootstrapCtGenerationSpent =
                 "compile global ${global.key} changed in an interpreted evaluation"
@@ -175,6 +184,8 @@ trusted fun bootstrapCtTryEvaluate(
     bootstrapCtCurrent = enclosing
     bootstrapCtCurrentLive = enclosingLive
     var value = bootstrapEvalInvalid()
+    var syntax: array<BootstrapExpression> = []
+    var memo: BootstrapLiftMemo? = null
     if (reply == 0) {
         bootstrapCtGenerationSpent =
             "an earlier compile-time evaluation of this pass stopped"
@@ -186,17 +197,22 @@ trusted fun bootstrapCtTryEvaluate(
     } else {
         val text = bootstrapCtReadReply(reply)
         ablaUnsafeCallExact_I64_I64(bootstrapCtFreeAddress, reply)
-        val reader = BootstrapCompileGlobalReader(text, 0, true)
-        value = reader.value()
-        // The entry has run: a reply that cannot be read is an error, not a retry.
-        if (!reader.ok || reader.at != text.size) {
-            value = bootstrapEvalInvalid()
-            evaluator.recordEvaluatorDiagnostic(
-                "E_CT_JIT_RESULT",
-                "compile-time result at ${bootstrapCtSiteLabel(site)} could not be decoded"
-            )
-            evaluator.errors = evaluator.errors + 1
-        } else bootstrapCtNote("native at ${bootstrapCtSiteLabel(site)}")
+        if (!site.encodes) {
+            value = if (site.type == "null") bootstrapEvalNull() else bootstrapEvalVoid()
+            bootstrapCtNote("native at ${bootstrapCtSiteLabel(site)}")
+        } else {
+            val decoded = bootstrapCtLiftDecode(text, site.type, declarations, bootstrapCtFunctions)
+            // The entry has run: a reply that cannot be read is an error, not a retry.
+            if (!decoded.ok) {
+                evaluator.diagnostics = "${evaluator.diagnostics}${decoded.diagnostic}"
+                evaluator.errors = evaluator.errors + 1
+            } else {
+                value = decoded.value
+                syntax = decoded.syntax
+                memo = decoded.memo
+                bootstrapCtNote("native at ${bootstrapCtSiteLabel(site)}")
+            }
+        }
     }
     if (reply != 0) bootstrapCtExchangeGlobals(evaluator, site)
     bootstrapCompileGlobalsKeep(
@@ -209,7 +225,9 @@ trusted fun bootstrapCtTryEvaluate(
         evaluator.diagnostics,
         evaluator.compileInputPaths,
         evaluator.compileInputContents,
-        evaluator.generatedDeclarations
+        evaluator.generatedDeclarations,
+        syntax,
+        memo
     ))
 }
 
@@ -219,10 +237,9 @@ trusted fun bootstrapCtExchangeGlobals(var evaluator: BootstrapEvaluator, site: 
     var index = 0
     while (index < bootstrapCtGlobals.size) {
         val global = bootstrapCtGlobals[index]
-        var reply = 0
-        if (global.getter != 0) {
-            reply = ablaUnsafeCallExact_I64_I64(bootstrapCtGuardAddress, global.getter)
-        }
+        // (A global no entry of the generation reaches has no getter.)
+        val reply = if (global.getter == 0) -1
+            else ablaUnsafeCallExact_I64_I64(bootstrapCtGuardAddress, global.getter)
         if (reply == 0) {
             bootstrapCtGenerationSpent = "compile global ${global.key} could not be read back"
             evaluator.recordEvaluatorDiagnostic(
@@ -230,15 +247,16 @@ trusted fun bootstrapCtExchangeGlobals(var evaluator: BootstrapEvaluator, site: 
                 "compile global ${global.key} could not be read back after ${bootstrapCtSiteLabel(site)}"
             )
             evaluator.errors = evaluator.errors + 1
-        } else {
+        } else if (reply > 0) {
             val text = bootstrapCtReadReply(reply)
             ablaUnsafeCallExact_I64_I64(bootstrapCtFreeAddress, reply)
-            val reader = BootstrapCompileGlobalReader(text, 0, true)
-            val value = reader.value()
-            if (reader.ok) {
+            val decoded = bootstrapCtLiftDecode(
+                text, global.type, evaluator.declarations, bootstrapCtFunctions
+            )
+            if (decoded.ok) {
                 evaluator.globalKeys.append(global.key)
-                evaluator.globalValues.append(value)
-                global.exchanged = bootstrapCompileGlobalEncode(value)
+                evaluator.globalValues.append(decoded.value)
+                global.exchanged = bootstrapCompileGlobalEncode(decoded.value)
             }
         }
         index = index + 1
