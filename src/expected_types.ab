@@ -64,26 +64,112 @@ fun bootstrapExpectType(expression: BootstrapExpression, type: string): Bootstra
     expression
 }
 
+// ---- name lookups ----
+//
+// The tables below are looked up once per call, identifier and member a body
+// holds, so a scan of every name would make the pass quadratic in the
+// program's size. Past a few names, each table keeps an open-addressing index
+// over its names array (a slot holds an entry's position, -1 none); an entry
+// is never removed, and a name's first entry is found first, as by a scan. A
+// table with a blanked entry ("", a name declared twice) is still found by its
+// slots for every other name; "" itself is looked up by a scan.
+// ABLA_EXPECTED_INDEX_CHECK=1 checks every lookup against a scan.
+
+val BOOTSTRAP_EXPECTED_INDEXED = 8
+
+var bootstrapExpectedIndexCheckValue: int = -1
+
+fun bootstrapExpectedIndexCheck(): bool {
+    if (bootstrapExpectedIndexCheckValue < 0) {
+        val configured = linuxEnvironment("ABLA_EXPECTED_INDEX_CHECK")
+        bootstrapExpectedIndexCheckValue = if (configured.found && configured.value == "1") 1 else 0
+    }
+    bootstrapExpectedIndexCheckValue == 1
+}
+
+fun bootstrapExpectedScan(names: array<string>, name: string): int {
+    var index = 0
+    while (index < names.size) {
+        if (names[index] == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+/** The first entry of `name` in `names`, by `slots` once it has them. */
+fun bootstrapExpectedFind(slots: array<int>, names: array<string>, name: string): int {
+    var found = -1
+    if (slots.size == 0 || name == "") found = bootstrapExpectedScan(names, name)
+    else {
+        var slot = bootstrapFunctionDeclarationHash(name)
+        slot = slot - slot / slots.size * slots.size
+        while (found < 0 && slots[slot] >= 0) {
+            if (names[slots[slot]] == name) found = slots[slot]
+            else {
+                slot = slot + 1
+                if (slot == slots.size) slot = 0
+            }
+        }
+    }
+    if (bootstrapExpectedIndexCheck() && found != bootstrapExpectedScan(names, name)) {
+        linuxPrintStandardError(
+            "error[E_INTERNAL]: expected.index-check: `$name` found at $found, a scan says ${bootstrapExpectedScan(names, name)}\n"
+        )
+    }
+    found
+}
+
+fun bootstrapExpectedPlace(var slots: array<int>, names: array<string>, entry: int): void {
+    var slot = bootstrapFunctionDeclarationHash(names[entry])
+    slot = slot - slot / slots.size * slots.size
+    while (slots[slot] >= 0) {
+        slot = slot + 1
+        if (slot == slots.size) slot = 0
+    }
+    slots[slot] = entry
+    return
+}
+
+/** Indexes `names[entry]`, just appended: past BOOTSTRAP_EXPECTED_INDEXED
+ *  names the table gets slots, rebuilt at four times its size whenever it is
+ *  half full. */
+fun bootstrapExpectedIndex(var slots: array<int>, names: array<string>, entry: int): void {
+    if (names.size <= BOOTSTRAP_EXPECTED_INDEXED) return
+    if (slots.size < 2 * names.size) {
+        slots.clear()
+        while (slots.size < 4 * names.size) slots.append(-1)
+        var placed = 0
+        while (placed < names.size) {
+            bootstrapExpectedPlace(slots, names, placed)
+            placed = placed + 1
+        }
+    } else bootstrapExpectedPlace(slots, names, entry)
+    return
+}
+
 /** The parameter types of the top-level functions and constructors a plain
  *  call can name: one entry per name declared once. */
 class BootstrapExpectedCallees(
     val names: array<string>,
     val parameters: array<array<string>>,
     val types: array<array<string>>,
-    val results: array<string>
+    val results: array<string>,
+    val slots: array<int>
 ) {
-    fun find(name: string): int {
-        var index = 0
-        while (index < this.names.size) {
-            if (this.names[index] == name) return index
-            index = index + 1
-        }
-        -1
+    fun find(name: string): int = bootstrapExpectedFind(this.slots, this.names, name)
+
+    fun add(name: string, parameters: array<string>, types: array<string>, result: string): void {
+        this.names.append(name)
+        this.parameters.append(parameters)
+        this.types.append(types)
+        this.results.append(result)
+        bootstrapExpectedIndex(this.slots, this.names, this.names.size - 1)
+        return
     }
 }
 
 fun bootstrapExpectedCallees(declarations: array<BootstrapDeclaration>): BootstrapExpectedCallees {
-    var callees = BootstrapExpectedCallees([], [], [], [])
+    var callees = BootstrapExpectedCallees([], [], [], [], [])
     val repeated: array<string> = []
     for (declaration in declarations) {
         val callable = ((declaration.kind == "fun" || declaration.kind == "compile.fun" ||
@@ -91,14 +177,10 @@ fun bootstrapExpectedCallees(declarations: array<BootstrapDeclaration>): Bootstr
             declaration.kind == "class"
         if (callable) {
             if (callees.find(declaration.name) >= 0) repeated.append(declaration.name)
-            else {
-                callees.names.append(declaration.name)
-                callees.parameters.append(declaration.parameters)
-                callees.types.append(declaration.parameterTypes)
-                callees.results.append(
-                    if (declaration.kind == "class") declaration.name else declaration.resultType
-                )
-            }
+            else callees.add(
+                declaration.name, declaration.parameters, declaration.parameterTypes,
+                if (declaration.kind == "class") declaration.name else declaration.resultType
+            )
         }
     }
     for (name in repeated) {
@@ -134,22 +216,17 @@ fun bootstrapExpectedArgumentType(
  *  with different types, has "". */
 class BootstrapExpectedNames(
     val names: array<string>,
-    val types: array<string>
+    val types: array<string>,
+    val slots: array<int>
 ) {
-    fun find(name: string): int {
-        var index = 0
-        while (index < this.names.size) {
-            if (this.names[index] == name) return index
-            index = index + 1
-        }
-        -1
-    }
+    fun find(name: string): int = bootstrapExpectedFind(this.slots, this.names, name)
 
     fun add(name: string, type: string): void {
         val index = this.find(name)
         if (index < 0) {
             this.names.append(name)
             this.types.append(type)
+            bootstrapExpectedIndex(this.slots, this.names, this.names.size - 1)
         } else if (this.types[index] != type) this.types[index] = ""
         return
     }
@@ -164,15 +241,16 @@ class BootstrapExpectedNames(
 /** Each class's fields with their declared types. */
 class BootstrapExpectedClasses(
     val names: array<string>,
-    val fields: array<BootstrapExpectedNames>
+    val fields: array<BootstrapExpectedNames>,
+    val slots: array<int>
 ) {
-    fun find(name: string): int {
-        var index = 0
-        while (index < this.names.size) {
-            if (this.names[index] == name) return index
-            index = index + 1
-        }
-        -1
+    fun find(name: string): int = bootstrapExpectedFind(this.slots, this.names, name)
+
+    fun add(name: string, fields: BootstrapExpectedNames): void {
+        this.names.append(name)
+        this.fields.append(fields)
+        bootstrapExpectedIndex(this.slots, this.names, this.names.size - 1)
+        return
     }
 }
 
@@ -374,7 +452,7 @@ fun bootstrapExpectedBodyScope(
     classes: BootstrapExpectedClasses,
     globals: BootstrapExpectedNames
 ): BootstrapExpectedScope {
-    var locals = BootstrapExpectedNames([], [])
+    var locals = BootstrapExpectedNames([], [], [])
     var parameter = 0
     while (parameter < declaration.parameters.size) {
         locals.add(
@@ -394,11 +472,11 @@ class BootstrapExpectedWorld(
 )
 
 fun bootstrapExpectedWorld(declarations: array<BootstrapDeclaration>): BootstrapExpectedWorld {
-    var classes = BootstrapExpectedClasses([], [])
-    var globals = BootstrapExpectedNames([], [])
+    var classes = BootstrapExpectedClasses([], [], [])
+    var globals = BootstrapExpectedNames([], [], [])
     for (declaration in declarations) {
         if (declaration.kind == "class" && classes.find(declaration.name) < 0) {
-            var fields = BootstrapExpectedNames([], [])
+            var fields = BootstrapExpectedNames([], [], [])
             var parameter = 0
             while (parameter < declaration.parameters.size &&
                 parameter < declaration.parameterTypes.size) {
@@ -409,8 +487,7 @@ fun bootstrapExpectedWorld(declarations: array<BootstrapDeclaration>): Bootstrap
                 }
                 parameter = parameter + 1
             }
-            classes.names.append(declaration.name)
-            classes.fields.append(fields)
+            classes.add(declaration.name, fields)
         }
         if (declaration.kind == "val" || declaration.kind == "var") {
             globals.add(declaration.name, "${declaration.resultType}")
