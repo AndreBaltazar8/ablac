@@ -429,6 +429,193 @@ static long darwin_epoll_wait(int descriptor, unsigned char *output,
   return measured;
 }
 
+// Linux and Darwin number most signals alike but not all (SIGUSR1, SIGCHLD,
+// SIGBUS, ...): Darwin's number by Linux's, 0 where Darwin has none.
+static const int darwin_signals[32] = {
+    0,  1,  2,  3,  4,  5,  6,  10, 8,  9,  30, 11, 31, 13, 14, 15,
+    0,  20, 19, 17, 18, 21, 22, 16, 24, 25, 26, 27, 28, 23, 0,  12};
+
+static int linux_signal(int darwin) {
+  for (int number = 1; number < 32; ++number)
+    if (darwin_signals[number] == darwin)
+      return number;
+  return 0;
+}
+
+static sigset_t darwin_sigset(uint64_t linux_set) {
+  sigset_t set;
+  sigemptyset(&set);
+  for (int number = 1; number < 32; ++number)
+    if ((linux_set & (UINT64_C(1) << (number - 1))) != 0 &&
+        darwin_signals[number] != 0)
+      sigaddset(&set, darwin_signals[number]);
+  return set;
+}
+
+static uint64_t linux_sigset(const sigset_t *set) {
+  uint64_t linux_set = 0;
+  for (int number = 1; number < 32; ++number)
+    if (darwin_signals[number] != 0 && sigismember(set, darwin_signals[number]))
+      linux_set |= UINT64_C(1) << (number - 1);
+  return linux_set;
+}
+
+// rt_sigprocmask: Linux's how is 0/1/2 for block/unblock/set, its set 8 bytes.
+static long darwin_sigprocmask(int64_t how, const void *linux_set,
+                               void *linux_old, int64_t size) {
+  static const int hows[3] = {SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK};
+  if (size != 8 || (linux_set != NULL && (how < 0 || how > 2))) {
+    errno = EINVAL;
+    return -1;
+  }
+  sigset_t set;
+  if (linux_set != NULL) {
+    uint64_t bits;
+    memcpy(&bits, linux_set, sizeof(bits));
+    set = darwin_sigset(bits);
+  }
+  sigset_t old;
+  const int failed = pthread_sigmask(linux_set != NULL ? hows[how] : SIG_BLOCK,
+                                     linux_set != NULL ? &set : NULL, &old);
+  if (failed != 0) {
+    errno = failed;
+    return -1;
+  }
+  if (linux_old != NULL) {
+    const uint64_t bits = linux_sigset(&old);
+    memcpy(linux_old, &bits, sizeof(bits));
+  }
+  return 0;
+}
+
+// A signalfd is a kqueue watching its signals with EVFILT_SIGNAL, which sees a
+// signal sent to the process even while it is blocked; poll and the epoll
+// adapter see the kqueue readable once one arrives. A read takes them as
+// Linux's 128-byte signalfd_siginfo records and, as reading a signalfd does,
+// accepts the pending signal. These descriptors (with whether they are
+// nonblocking, which a read must honour itself) are the ones read and close
+// look for.
+#define DARWIN_SIGNAL_DESCRIPTORS 16
+static int darwin_signal_descriptors[DARWIN_SIGNAL_DESCRIPTORS];
+static int darwin_signal_nonblocking[DARWIN_SIGNAL_DESCRIPTORS];
+static int darwin_signal_descriptor_count;
+
+static int darwin_signal_slot(int descriptor) {
+  if (__atomic_load_n(&darwin_signal_descriptor_count, __ATOMIC_ACQUIRE) == 0 ||
+      descriptor < 0)
+    return -1;
+  for (int slot = 0; slot < DARWIN_SIGNAL_DESCRIPTORS; ++slot)
+    if (__atomic_load_n(&darwin_signal_descriptors[slot], __ATOMIC_ACQUIRE) ==
+        descriptor + 1)
+      return slot;
+  return -1;
+}
+
+static long darwin_close(int descriptor) {
+  const int slot = darwin_signal_slot(descriptor);
+  if (slot >= 0) {
+    __atomic_store_n(&darwin_signal_descriptors[slot], 0, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&darwin_signal_descriptor_count, 1, __ATOMIC_ACQ_REL);
+  }
+  return close(descriptor);
+}
+
+static long darwin_signalfd(int64_t descriptor, const void *linux_mask,
+                            int64_t size, int64_t flags) {
+  if (linux_mask == NULL || size != 8 ||
+      (flags & ~(INT64_C(2048) | INT64_C(524288))) != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  int slot = -1;
+  int watcher = (int)descriptor;
+  if (descriptor != -1) {
+    slot = darwin_signal_slot(watcher);
+    if (slot < 0) {
+      errno = EINVAL;
+      return -1;
+    }
+  }
+  uint64_t bits;
+  memcpy(&bits, linux_mask, sizeof(bits));
+  if (slot < 0) {
+    for (int free_slot = 0; free_slot < DARWIN_SIGNAL_DESCRIPTORS; ++free_slot)
+      if (darwin_signal_descriptors[free_slot] == 0) {
+        slot = free_slot;
+        break;
+      }
+    if (slot < 0) {
+      errno = EMFILE;
+      return -1;
+    }
+    watcher = kqueue();
+    if (watcher < 0)
+      return -1;
+    configure_descriptor(watcher, flags);
+    darwin_signal_nonblocking[slot] = (flags & 2048) != 0;
+    __atomic_store_n(&darwin_signal_descriptors[slot], watcher + 1,
+                     __ATOMIC_RELEASE);
+    __atomic_add_fetch(&darwin_signal_descriptor_count, 1, __ATOMIC_ACQ_REL);
+  }
+  // Watch exactly the mask's signals: a changed mask drops the others.
+  for (int number = 1; number < 32; ++number) {
+    if (darwin_signals[number] == 0)
+      continue;
+    const int watched = (bits & (UINT64_C(1) << (number - 1))) != 0;
+    struct kevent change;
+    EV_SET(&change, darwin_signals[number], EVFILT_SIGNAL,
+           watched ? EV_ADD | EV_ENABLE : EV_DELETE, 0, 0, NULL);
+    if (kevent(watcher, &change, 1, NULL, 0, NULL) == -1 && watched) {
+      if (descriptor == -1) {
+        const int failure = errno;
+        (void)darwin_close(watcher);
+        errno = failure;
+      }
+      return -1;
+    }
+  }
+  return watcher;
+}
+
+static long darwin_signalfd_read(int slot, int descriptor,
+                                 unsigned char *output, size_t length) {
+  enum { record = 128, most = 16 };
+  size_t wanted = length / record;
+  if (output == NULL || wanted == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (wanted > most)
+    wanted = most;
+  struct kevent events[most];
+  const struct timespec now = {0, 0};
+  int measured;
+  do {
+    measured = kevent(descriptor, NULL, 0, events, (int)wanted,
+                      darwin_signal_nonblocking[slot] ? &now : NULL);
+  } while (measured < 0 && errno == EINTR);
+  if (measured == 0) {
+    errno = EAGAIN;
+    return -1;
+  }
+  if (measured < 0)
+    return -1;
+  for (int index = 0; index < measured; ++index) {
+    const int signal = (int)events[index].ident;
+    memset(output + (size_t)index * record, 0, record);
+    store_u32(output, (size_t)index * record, (uint32_t)linux_signal(signal));
+    sigset_t pending;
+    if (sigpending(&pending) == 0 && sigismember(&pending, signal)) {
+      sigset_t only;
+      sigemptyset(&only);
+      sigaddset(&only, signal);
+      int taken;
+      (void)sigwait(&only, &taken);
+    }
+  }
+  return (long)measured * record;
+}
+
 // Darwin has no procfs. The one path the toolchain reads, `/proc/self/exe`
 // (its own image, for the build cache identity and to re-run itself), names
 // the running executable. Linux resolves that link to the image the process
@@ -482,24 +669,34 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
                                   int64_t argument5) {
   long result = -1;
   switch (number) {
-  case 0:
-    result =
-        read((int)argument0, (void *)(uintptr_t)argument1, (size_t)argument2);
+  case 0: {
+    const int slot = darwin_signal_slot((int)argument0);
+    result = slot >= 0 ? darwin_signalfd_read(
+                             slot, (int)argument0,
+                             (unsigned char *)(uintptr_t)argument1,
+                             (size_t)argument2)
+                       : read((int)argument0, (void *)(uintptr_t)argument1,
+                              (size_t)argument2);
     break;
+  }
   case 1:
     result = write((int)argument0, (const void *)(uintptr_t)argument1,
                    (size_t)argument2);
     break;
   case 3:
-    result = close((int)argument0);
+    result = darwin_close((int)argument0);
     break;
   case 7:
     result = poll((struct pollfd *)(uintptr_t)argument0, (nfds_t)argument1,
                   (int)argument2);
     break;
   case 14:
+    result = darwin_sigprocmask(argument0, (const void *)(uintptr_t)argument1,
+                                (void *)(uintptr_t)argument2, argument3);
+    break;
   case 289:
-    errno = ENOSYS;
+    result = darwin_signalfd(argument0, (const void *)(uintptr_t)argument1,
+                             argument2, argument3);
     break;
   case 16:
     result =

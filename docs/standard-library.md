@@ -192,7 +192,9 @@ structured I/O outcomes, and single/multi-descriptor readiness with `socket`,
 shutdown blocks `SIGTERM`, consumes
 it through `signalfd`, and polls the listener and shutdown descriptor together;
 an active HTTP request therefore finishes before the next accept observes the
-drain request. The current `abla/net` facade selects this backend, so AOT and
+drain request. On macOS the Darwin adapter backs `rt_sigprocmask` with
+`pthread_sigmask` and a `signalfd` with a kqueue watching `EVFILT_SIGNAL`, so a
+Mach-O server drains the same way. The current `abla/net` facade selects this backend, so AOT and
 JIT HTTP servers link and run without the project C capability adapter.
 Hosted services that need the same transport concepts on macOS can explicitly
 select `abla/net/hosted`; its narrow runtime adapter uses `getaddrinfo`, epoll,

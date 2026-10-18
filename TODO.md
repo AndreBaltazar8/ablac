@@ -37,10 +37,6 @@ called out below.
   Abla (`93ce196`). On a target without the capability the IR failure also hides
   `E_EXPORT_TARGET_CAPABILITY`. `tools/test-wasm-mvc-extension.sh` covers both and stays out of
   the suite until they work.
-- [ ] **No SIGTERM drain on macOS.** `tcpEnableGracefulShutdown` blocks SIGTERM and reads it
-  from a signalfd; `runtime/abla_darwin_compat.c` returns `ENOSYS` for `rt_sigprocmask` and
-  `signalfd4`, so a Mach-O server stops mid-request on SIGTERM (kqueue `EVFILT_SIGNAL` could
-  back it). `tools/test-graceful-reload.sh` skips on Darwin until then.
 - [ ] **Linking a hosted Linux artifact on macOS fails obscurely.** A `x86_64-linux`
   executable or shared library built on a Mac reaches the host's Mach-O `ld64.lld` with ELF
   flags (`unknown argument '--gc-sections'`); there is no Linux sysroot to link against

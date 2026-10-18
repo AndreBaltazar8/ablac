@@ -9,12 +9,6 @@ fi
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=$1
 
-# The drain receives SIGTERM through a signalfd; the Darwin syscall layer has
-# none, so there the old generation stops mid-request.
-if [[ $(uname -s) == Darwin ]]; then
-    echo "graceful reload: skipped on Darwin (no signalfd for the SIGTERM drain)"
-    exit 0
-fi
 test_directory=$(mktemp -d "$project_root/build/graceful-reload.XXXXXX")
 supervisor=0
 request=0
