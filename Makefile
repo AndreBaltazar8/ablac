@@ -189,6 +189,7 @@ test: ablac
 	tools/test-definite-assignment.sh $(COMPILER)
 	tools/test-shared-ownership.sh $(COMPILER)
 	tools/test-mutex.sh $(COMPILER)
+	tools/test-affine-move.sh $(COMPILER)
 
 check: test self-rebuild
 
