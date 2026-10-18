@@ -785,7 +785,9 @@ fun main {
   argument types are then checked against the candidate found). A property
   that isn't a function never captures a call, and a method that can't take
   that many arguments lets the search continue. With no applicable candidate
-  anywhere, the error names the innermost one.
+  anywhere, the error names the innermost one. A scalar conversion's name
+  (`u32(x)`, `int(x)`, `f64(x)`, ...) always means the conversion: a member
+  named `u32` never captures it and is called as `this.u32(...)`.
 - A class body contains only methods (`fun`, `operator fun`, `trusted fun`,
   `noescape fun`). Properties belong in the constructor
   (`E_PARSE_CLASS_MEMBER`).
