@@ -517,6 +517,17 @@ parser handler, which runs before that check). A symbol found nowhere is
 `E_COMPILE_NATIVE_SYMBOL`, which names the manifest libraries that were not
 found.
 
+Native code under `#` runs in the compiler's process, not the program's:
+`ablaHostIsMacOS()` reports the host the compiler runs on, and a symbol only the
+program defines (its own `@export` functions) isn't there, so `dlsym` finds
+nothing. A load, store or call through such a null address (or any address in
+the null page) fails the evaluation with `E_EVAL_NATIVE_ADDRESS`; the compiler
+doesn't crash. Call C functions through `extern:"c"` declarations: the
+evaluator calls a function pointer itself only through `ablaUnsafeCallVoid0`,
+`ablaUnsafeCallI32` and `ablaUnsafeCallVoidPointer3`, and the other typed
+`ablaUnsafeCall*` functions of `abla/unsafe/native` work only at run time.
+`nativeStaticAllocate` storage is zeroed and lasts for the compilation.
+
 ### Capabilities and the build cache
 
 A build whose compile-time code read nothing from outside can reuse its
