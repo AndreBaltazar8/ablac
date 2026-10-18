@@ -119,7 +119,8 @@ build_and_run() { # dir tag entry mode
 by_design='module/proc-self-exe	*	host-dependent	reads its own executable (/proc/self/exe): under `#` that is the compiler
 module/unsafe-boundary	*	host-dependent	calls its own @export functions through dlsym: they exist only in the running program, not in the compiler
 module/http-advanced	*	staged-writes	a child process (gzip) reads a file the case wrote: under `#` writes stay staged until the build succeeds
-module/websocket-server-protocol	interp	interp-timing	forks clients with 100 ms ping / 400 ms idle deadlines the interpreter cannot meet (passes under jit)'
+module/websocket-server-protocol	interp	interp-timing	forks clients with 100 ms ping / 400 ms idle deadlines the interpreter cannot meet (passes under jit)
+module/http-async	interp	interp-timing	the interpreted child builds the 200 KB /big body byte by byte and misses the client timeout (passes under jit)'
 
 by_design_status() { # name mode
     awk -F'\t' -v n="$1" -v m="$2" '$1 == n && ($2 == "*" || $2 == m) { print $3 }' <<<"$by_design"
