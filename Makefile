@@ -195,6 +195,7 @@ test: ablac
 	tools/test-hosted-network.sh $(COMPILER)
 	tools/test-native-platform-boundary.sh $(COMPILER)
 	tools/test-lambda-context.sh $(COMPILER)
+	tools/test-reproducible-build.sh $(COMPILER)
 
 check: test self-rebuild
 
