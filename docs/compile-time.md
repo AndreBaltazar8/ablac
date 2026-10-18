@@ -710,6 +710,9 @@ compilation that compile-time code starts (it runs inside the outer pass).
   `E_EVAL_DIVISION_BY_ZERO`, else `E_CT_PANIC`); an abort, a failed check or
   recursion past the end of the compiler's stack is `E_CT_STOPPED`. The
   compiler survives each, and the rest of the pass runs in the evaluator.
+- Native code manages memory as a hosted program's `main` does: globals are
+  collector roots, and allocation pressure collects unless the code calls
+  `memorySetManualCollection()`.
 - Native code has no step limit. One evaluation may run for
   `ABLA_COMPILE_EVAL_TIME_LIMIT` seconds (default 600, `0` for no limit), then
   stops with `E_CT_TIME_LIMIT`.

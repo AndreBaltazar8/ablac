@@ -34,6 +34,12 @@ for mode in interp jit; do
     run_case "$mode" codec 42
 done
 
+# Native code collects as a hosted program does: globals are roots, and allocation
+# pressure collects by default (the interpreter has no heap to measure).
+run_case jit memory 42
+native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/memory-jit.trace" || true)
+[[ $native -eq 2 ]] || { echo "compile-eval-jit: $native native sites in memory.ab, expected 2" >&2; cat "$output_directory/memory-jit.trace" >&2; exit 1; }
+
 # Every scalar site (six expressions and one action) ran natively.
 native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/scalars-jit.trace" || true)
 if [[ $native -ne 7 ]]; then
