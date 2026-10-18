@@ -227,6 +227,7 @@ test: ablac
 	tools/test-repl.sh $(COMPILER)
 	tools/test-android-extension.sh $(COMPILER)
 	tools/test-android-rpc-example.sh $(COMPILER)
+	tools/test-hot-reload.sh $(COMPILER)
 
 check: test self-rebuild
 
