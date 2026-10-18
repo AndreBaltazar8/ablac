@@ -598,24 +598,28 @@ error[E_EVAL_STACK_DEPTH]: compile-time evaluation nested 16408 levels deep and 
 ```
 
 `ABLA_EVAL_DEPTH_LIMIT=<n>` lowers the limit (it never raises it), and
-`ABLA_MAX_STACK_KB` sets the launcher's stack. When compile-time code runs
-on the coming JIT tier it recurses as deep as at run time, and the `auto`
-mode moves an evaluation that hits the depth limit onto the JIT.
+`ABLA_MAX_STACK_KB` sets the launcher's stack. These bounds are the
+evaluator's. In the [native tier](#native-evaluation) compile-time code runs
+as machine code on the compiler's stack, with frames like a program's, so it
+recurses about as deep as at run time (100,000 levels of a small function
+fit); running past the end of the stack stops it with `E_CT_STOPPED`, and
+there is no step limit, only a [time limit](#native-evaluation).
 
-Memory introspection (`memoryLiveBytes`, `memoryCollect`, ...) has no
-meaning inside the compiler, and is not available at compile time: each
-function used is one `E_EVAL_MEMORY_UNAVAILABLE` error.
+The runtime memory API (`memoryLiveBytes`, `memoryCollect`, `memoryReset`,
+...) needs a heap of the program's own. The evaluator has none, so there each
+function used is one `E_EVAL_MEMORY_UNAVAILABLE` error. Native compile-time
+code has a runtime of its own, and the API measures and manages that heap.
 
 ### Threads at compile time
 
-The compile-time interpreter runs one thing at a time. A `thread { }` body
-doesn't start when the thread is created; it runs when the thread is
-awaited. Code that waits for its own thread before awaiting it never
-finishes under `#`: a server that accepts a connection from a client thread
-it started, or a loop that waits for a flag the thread sets. The evaluation
-runs until the compiler's time limit stops it. Await the thread before
-anything waits on it, or keep such code at run time. Threads that run
-alongside each other under `#` come with the JIT tier.
+The evaluator runs one thing at a time. A `thread { }` body doesn't start
+when the thread is created; it runs when the thread is awaited. Code that
+waits for its own thread before awaiting it never finishes there: a server
+that accepts a connection from a client thread it started, or a loop that
+waits for a flag the thread sets. The evaluation runs until the step limit or
+the compiler's watchdog stops it. Await the thread before anything waits on
+it, or run such code in the [native tier](#native-evaluation), where threads
+run alongside the code that started them, as at run time.
 
 ## Declaration blocks
 
@@ -647,14 +651,29 @@ blocks per module.
 
 ## What works at compile time today
 
-Compile-time evaluation is being brought to full parity with run time. The
-compiler team tracks the remaining gaps case by case.
+A computation under `#` prints what it prints at run time. The compiler's
+parity check (`tools/test-compile-time-parity.sh`) runs every probe and every
+module test program both ways, in both tiers, and compares their output and
+exit status. Where the two differ by design, the difference has a name and a
+reason:
+
+- the evaluator runs a thread's body when it is awaited
+  ([threads](#threads-at-compile-time)), and has no program heap for the
+  runtime memory API ([limits](#limits));
+- code past the evaluator's step limit, or with real-time deadlines it can't
+  meet, finishes in the native tier;
+- a program that reads its own executable, or calls its own exported
+  functions, finds the compiler under `#`;
+- another process can't see a file the build has staged
+  ([capabilities](#capabilities-files-environment-processes-network));
+- a program that panics at run time stops the build with the same panic
+  under `#`, because a compile-time panic is a compile error.
 
 | Area | Under `#` today |
 |---|---|
 | Functions, recursion, classes and methods, arrays, `Map`, strings, string templates | works |
 | Closures used within one evaluation; tasks and `await` | works |
-| `thread { }` | runs when it is awaited, not alongside the code that started it ([threads at compile time](#threads-at-compile-time)) |
+| `thread { }` | evaluator: runs when it is awaited ([threads at compile time](#threads-at-compile-time)); native tier: alongside the code that started it |
 | Generators | works |
 | `f32`/`f64` arithmetic, `abla/math`, `abla/float/text` | works |
 | `abla/json`, `$json`, `$jsons` | works |
@@ -668,7 +687,8 @@ compiler team tracks the remaining gaps case by case.
 | Other system calls (processes, sockets) | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
 | `extern:"c"` functions, trusted raw memory, `nativeFunctionAddress` callbacks | works with `trusted.native` |
 | `abla/platform/host` | works: each function under the capability it implies |
-| Fixed-width integer conversions (`u16(x)`); nominal conversions (`Pin(x)`), integer extension methods | fixed-width works; the rest partly: being fixed |
+| Fixed-width integer conversions (`u16(x)`), nominal conversions (`Pin(x)`), integer extension methods | works |
+| The runtime memory API (`memoryLiveBytes`, `memoryCollect`, ...) | evaluator: `E_EVAL_MEMORY_UNAVAILABLE`; native tier: its own runtime's heap ([limits](#limits)) |
 | Run-time globals | see [above](#ordinary-globals-at-compile-time) |
 | Process arguments (`processArgumentCount()`) | works: compile-time code sees none, so the count is 0; no capability needed |
 
@@ -691,10 +711,10 @@ step fails, none of its changes are kept.
 
 ## Native evaluation
 
-`ABLA_COMPILE_EVAL=jit` (or `auto`) runs compile-time code as machine code
-instead of in the evaluator; the default is still `interp` while the native
-tier is completed. After type checking, each compile pass builds one *slice*
-of the program: the declarations its `#expression`s and actions reach, the
+`ABLA_COMPILE_EVAL=jit` runs compile-time code as machine code instead of in
+the evaluator; the default is still `interp` while the native tier is
+completed, and `auto` is the same as `jit` today. After type checking, each
+compile pass builds one *slice* of the program: the declarations its `#expression`s and actions reach, the
 runtime, and an exported entry per site, with compile declarations compiled
 as ordinary code. The slice goes through the same code generator as the
 program and is loaded into the compiler with LLVM's in-process JIT; each
@@ -750,6 +770,8 @@ compilation that compile-time code starts (it runs inside the outer pass).
 |---|---|
 | `E_EVAL_EXPRESSION` | compile-time evaluation failed; the message names the expression kind and its byte range |
 | `E_EVAL_STEP_LIMIT` | an evaluation ran past the step limit |
+| `E_EVAL_STACK_DEPTH` | an evaluation nested deeper than the compiler's stack allows ([limits](#limits)) |
+| `E_EVAL_MEMORY_UNAVAILABLE` | the runtime memory API called in the evaluator, which has no program heap |
 | `E_EVAL_DIVISION_BY_ZERO` | an integer division or remainder by zero, which panics at run time |
 | `E_EVAL_OUT_OF_BOUNDS` | an index or slice outside a string or an array, or a negative `truncate` or `filledArray` count; the message is the run-time panic's |
 | `E_CT_STOPPED` | native compile-time code aborted, failed a check or ran past the end of the stack ([native evaluation](#native-evaluation)) |
@@ -759,6 +781,7 @@ compilation that compile-time code starts (it runs inside the outer pass).
 | `compile.capability-not-authorized:<capability>` | the module grants a capability that `abla.toml` doesn't authorize |
 | `compile.capability-unknown:<name>` | the grant names no known capability |
 | `compile.value-runtime:<name>` | run-time code reads a `compile val`/`compile var` |
+| `compile.call-runtime:<name>` | run-time code calls a `compile fun` or the compiler API ([`compile fun`](#compile-fun)) |
 | `compile.result: <type> cannot become a program value: <reason>` | a `#` result that exists only inside the compiler (a generator, task, thread, borrow, `Weak`, raw pointer, or object with `drop()`) |
 | `declaration.block.compile-only` | a declaration block in run-time code |
 | `E_COMPILE_GRANT_PHASE` | compile-time code called `compilerGrant`; grants are literal top-level actions |

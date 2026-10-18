@@ -308,7 +308,7 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_MAX_STACK_KB` | the compiler's stack size in a packaged toolchain |
 | `ABLA_NATIVE_JOBS` | parallel native object jobs |
 | `ABLA_EVAL_STEP_LIMIT`, `ABLA_EVAL_DEPTH_LIMIT` | lower the compile-time step and recursion-depth limits ([compile-time.md](compile-time.md#limits)) |
-| `ABLA_COMPILE_EVAL=interp\|jit\|auto`, `ABLA_COMPILE_EVAL_TRACE=1`, `ABLA_COMPILE_EVAL_DUMP=<dir>`, `ABLA_COMPILE_EVAL_TIME_LIMIT=<s>` | run compile-time code in the evaluator (default) or as native code, report each site's tier, keep the native slices, and bound one native evaluation ([compile-time.md](compile-time.md#native-evaluation)) |
+| `ABLA_COMPILE_EVAL=interp\|jit\|auto`, `ABLA_COMPILE_EVAL_TRACE=1`, `ABLA_COMPILE_EVAL_DUMP=<dir>`, `ABLA_COMPILE_EVAL_TIME_LIMIT=<s>` | run compile-time code in the evaluator (default) or as native code (`auto` is `jit` today), report each site's tier and why a site stays in the evaluator, keep the native slices, and bound one native evaluation (default 600 s, `0` none) ([compile-time.md](compile-time.md#native-evaluation)) |
 | `ABLA_JIT_CACHE=0`, `ABLA_JIT_CACHE_TRACE=1` | turn `ablac run`'s object cache off, or report its decisions on standard error (above) |
 | `ABLA_PACKAGE_CACHE` | the package cache directory ([packages.md](packages.md)) |
 | `ABLA_KEEP_LLVM_TEXT`, `ABLA_LLVM_OUT_OF_PROCESS`, `ABLA_LLVM_VERIFY`, `ABLA_FAST_INLINE_THRESHOLD`, `ABLA_WASM_OPT_CORES`, `ABLA_NO_SIDECAR` | code-generation controls (above) |
