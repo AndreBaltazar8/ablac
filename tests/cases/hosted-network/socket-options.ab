@@ -1,0 +1,67 @@
+// Socket options by their Linux numbers (setsockopt 54 / getsockopt 55) take
+// effect on every host: on macOS the Linux syscall layer maps each level's
+// numbers to Darwin's, so a send buffer, keepalive tuning, a receive timeout or
+// a TTL set here reads back.
+import "abla/sys/linux"
+import "abla/sys/linux/net"
+import "abla/unsafe/memory"
+
+fun setOption(descriptor: int, level: int, option: int, value: int): bool {
+    val buffer = nativeByteBuffer(8)
+    linuxNetStoreU32(buffer, 0, value)
+    val status = linuxSyscall5(54, descriptor, level, option, nativePointerAddress(buffer.address), 4)
+    buffer.close()
+    status == 0
+}
+
+// The option's int value, or -1 when it can't be read.
+fun getOption(descriptor: int, level: int, option: int): int {
+    val buffer = nativeByteBuffer(8)
+    val length = nativeByteBuffer(8)
+    linuxNetStoreU32(length, 0, 4)
+    val status = linuxSyscall5(
+        55, descriptor, level, option,
+        nativePointerAddress(buffer.address), nativePointerAddress(length.address)
+    )
+    val value = if (status == 0) buffer.loadI64(0) & 4294967295 else -1
+    buffer.close()
+    length.close()
+    value
+}
+
+fun receiveTimeout(descriptor: int): bool {
+    val timeout = nativeByteBuffer(16)
+    timeout.storeI64(0, 2)
+    timeout.storeI64(8, 250000)
+    val set = linuxSyscall5(54, descriptor, 1, 20, nativePointerAddress(timeout.address), 16) == 0
+    timeout.storeI64(0, -1)
+    timeout.storeI64(8, -1)
+    val length = nativeByteBuffer(8)
+    linuxNetStoreU32(length, 0, 16)
+    val read = linuxSyscall5(
+        55, descriptor, 1, 20,
+        nativePointerAddress(timeout.address), nativePointerAddress(length.address)
+    ) == 0
+    val matches = timeout.loadI64(0) == 2 && timeout.loadI64(8) == 250000
+    timeout.close()
+    length.close()
+    set && read && matches
+}
+
+fun main: int {
+    val descriptor = linuxSyscall3(41, 2, 1, 0)
+    if (descriptor < 0) return 1
+    var failed = 0
+    if (!setOption(descriptor, 1, 7, 4096) || getOption(descriptor, 1, 7) < 4096) failed = failed + 1
+    if (!setOption(descriptor, 1, 8, 8192) || getOption(descriptor, 1, 8) < 8192) failed = failed + 2
+    if (!setOption(descriptor, 1, 9, 1) || getOption(descriptor, 1, 9) == 0) failed = failed + 4
+    if (getOption(descriptor, 1, 3) != 1) failed = failed + 8
+    if (!setOption(descriptor, 6, 1, 1) || getOption(descriptor, 6, 1) == 0) failed = failed + 16
+    if (!setOption(descriptor, 6, 4, 30) || getOption(descriptor, 6, 4) != 30 ||
+        !setOption(descriptor, 6, 5, 5) || getOption(descriptor, 6, 5) != 5 ||
+        !setOption(descriptor, 6, 6, 3) || getOption(descriptor, 6, 6) != 3) failed = failed + 32
+    if (!setOption(descriptor, 0, 2, 33) || getOption(descriptor, 0, 2) != 33) failed = failed + 64
+    if (!receiveTimeout(descriptor)) failed = failed + 128
+    linuxSyscall1(3, descriptor)
+    if (failed == 0) 42 else 100 + failed % 100
+}

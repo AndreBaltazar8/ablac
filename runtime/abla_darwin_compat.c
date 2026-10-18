@@ -13,6 +13,8 @@
 #include <math.h>
 #include <mach-o/dyld.h>
 #include <malloc/malloc.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -303,15 +305,60 @@ static int darwin_socket_level(int level) {
   return level == 1 ? SOL_SOCKET : level;
 }
 
+// Linux socket option numbers (asm-generic, x86-64 and AArch64 alike) as Darwin's.
+// Option values keep their layout: ints, struct linger, struct ip_mreq, and the
+// 64-bit struct timeval (a Linux tv_usec long reads as Darwin's int + padding).
+// An option with no Darwin counterpart passes through and fails there.
 static int darwin_socket_option(int level, int option) {
-  if (level == SOL_SOCKET && option == 2)
-    return SO_REUSEADDR;
-  if (level == SOL_SOCKET && option == 4)
-    return SO_ERROR;
-  if (level == SOL_SOCKET && option == 15)
-    return SO_REUSEPORT;
-  if (level == IPPROTO_IPV6 && option == 26)
-    return IPV6_V6ONLY;
+  if (level == SOL_SOCKET) {
+    switch (option) {
+    case 1: return SO_DEBUG;
+    case 2: return SO_REUSEADDR;
+    case 3: return SO_TYPE;
+    case 4: return SO_ERROR;
+    case 5: return SO_DONTROUTE;
+    case 6: return SO_BROADCAST;
+    case 7: return SO_SNDBUF;
+    case 8: return SO_RCVBUF;
+    case 9: return SO_KEEPALIVE;
+    case 10: return SO_OOBINLINE;
+    case 13: return SO_LINGER;
+    case 15: return SO_REUSEPORT;
+    case 18: return SO_RCVLOWAT;
+    case 19: return SO_SNDLOWAT;
+    case 20: return SO_RCVTIMEO;
+    case 21: return SO_SNDTIMEO;
+    case 30: return SO_ACCEPTCONN;
+    }
+  } else if (level == IPPROTO_TCP) {
+    switch (option) {
+    case 1: return TCP_NODELAY;
+    case 2: return TCP_MAXSEG;
+    case 4: return TCP_KEEPALIVE; // Linux TCP_KEEPIDLE
+    case 5: return TCP_KEEPINTVL;
+    case 6: return TCP_KEEPCNT;
+    }
+  } else if (level == IPPROTO_IP) {
+    switch (option) {
+    case 1: return IP_TOS;
+    case 2: return IP_TTL;
+    case 32: return IP_MULTICAST_IF;
+    case 33: return IP_MULTICAST_TTL;
+    case 34: return IP_MULTICAST_LOOP;
+    case 35: return IP_ADD_MEMBERSHIP;
+    case 36: return IP_DROP_MEMBERSHIP;
+    }
+  } else if (level == IPPROTO_IPV6) {
+    switch (option) {
+    case 16: return IPV6_UNICAST_HOPS;
+    case 17: return IPV6_MULTICAST_IF;
+    case 18: return IPV6_MULTICAST_HOPS;
+    case 19: return IPV6_MULTICAST_LOOP;
+    case 20: return IPV6_JOIN_GROUP;
+    case 21: return IPV6_LEAVE_GROUP;
+    case 26: return IPV6_V6ONLY;
+    }
+  }
   return option;
 }
 
@@ -581,6 +628,11 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
         int *error = (int *)(uintptr_t)argument3;
         *error = linux_errno(*error);
       }
+      // Darwin's tv_usec is an int and padding; Linux reads a long.
+      if (result == 0 && level == SOL_SOCKET &&
+          (option == SO_RCVTIMEO || option == SO_SNDTIMEO) && argument3 != 0 &&
+          argument4 != 0 && *(socklen_t *)(uintptr_t)argument4 >= 16)
+        memset((char *)(uintptr_t)argument3 + 12, 0, 4);
     }
     break;
   }
