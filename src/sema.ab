@@ -2266,6 +2266,43 @@ fun bootstrapIsComparisonKind(kind: string): bool =
 fun bootstrapIsRegionValueOperator(kind: string): bool =
     kind == "+" || kind == "-" || kind == "*" || kind == "/" || kind == "%"
 
+/** The assignments in `expression` whose value is used (`used`: whether its
+ *  own value is): every position but a block's statement before its last, a
+ *  loop's body and a lambda's body (whose result the syntax doesn't tell),
+ *  which pass their position on to a block's last expression and an `if`'s
+ *  or `when`'s branches. */
+fun bootstrapCollectUsedAssignments(
+    expression: BootstrapExpression,
+    used: bool,
+    var begins: array<int>
+): void {
+    val kind = expression.kind
+    if (bootstrapIsAssignment(expression) && used) begins.append(expression.begin)
+    var index = 0
+    while (index < expression.children.size) {
+        val child = expression.children[index]
+        val last = index == expression.children.size - 1
+        val childUsed = if (kind == "block") used && last
+            else if (kind == "if") index == 0 || used
+            else if (kind == "when") used
+            else if (kind == "while" || kind == "for") index == 0
+            else if (kind == "lambda" || kind == "lambda.move" ||
+                kind == "lambda.generator") !last
+            else true
+        bootstrapCollectUsedAssignments(child, childUsed, begins)
+        index = index + 1
+    }
+    return
+}
+
+/** Whether a function's body ends in a value its callers receive: a declared
+ *  result other than `void`, or an inferred one from an expression body
+ *  (`fun f() = x`). A block body without a declared result is taken as
+ *  statements (`fun reset() { n = 0 }`). */
+fun bootstrapResultIsUsed(declaration: BootstrapDeclaration): bool =
+    if (declaration.resultType == "inferred") declaration.expression.kind != "block"
+    else bootstrapNormalizeType(declaration.resultType) != "void"
+
 fun bootstrapIsAssignment(expression: BootstrapExpression): bool =
     expression.kind == "assign" || expression.kind == "member.assign" ||
     expression.kind == "index.assign"
@@ -2282,6 +2319,8 @@ fun bootstrapSemanticHelp(code: string): string {
             "a `yield` is a statement of the generator's body: of a block, a branch of a statement `if` or `when`, or a loop body; it has no value, so it cannot be part of an expression. Nor can it be inside a `region`: while the generator is suspended its consumer runs, and what the consumer allocates would land in the region and be freed with it"
         "integer.narrowing" ->
             "an int does not narrow implicitly where a narrower integer is expected: convert it explicitly, e.g. u8(value), which keeps the low bits; an integer literal that fits needs no conversion"
+        "ownership.assignment-value" ->
+            "an assignment's value is the value it stored, which the assigned place now owns: using it too would drop it twice; write the value to a local first, or return the variable after assigning"
         "ownership.borrow-mutation" ->
             "it is borrowed here (reached through a parameter or another alias), so it cannot be changed: declare the parameter `var` to change the caller's value, or change a copy"
         "ownership.borrow-store" ->
@@ -5229,7 +5268,10 @@ class BootstrapAnalyzer(
     // Result types inferred from bodies (ct_infer.ab).
     val inferredResults: BootstrapInferredResults = bootstrapNoInferredResults(),
     // What each body reads, for the globals' initialization order (ct_init.ab).
-    val initEdges: BootstrapInitEdges = bootstrapNoInitEdges()
+    val initEdges: BootstrapInitEdges = bootstrapNoInitEdges(),
+    // The assignments (by begin) of the body being analyzed whose value is
+    // used: bootstrapCollectUsedAssignments.
+    var usedAssignments: array<int> = []
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -8797,6 +8839,16 @@ class BootstrapAnalyzer(
         ) {
             result = bootstrapInferComparison(this, expression, result)
         }
+        // Using an assignment's value would hand out what the place now owns.
+        if (bootstrapIsAssignment(expression) && this.typeIsAffine(result)) {
+            for (begin in this.usedAssignments) {
+                if (begin == expression.begin) {
+                    this.inferBegin = expression.begin
+                    this.inferSource = this.currentSourceIdentity
+                    this.fail("ownership.assignment-value")
+                }
+            }
+        }
         this.recordTypedExpression(expression, result)
         result
     }
@@ -9371,6 +9423,12 @@ class BootstrapAnalyzer(
                     parameter = parameter + 1
                 }
                 bootstrapEndVoidBodyAfterAssignment(declaration.resultType, declaration.expression)
+                this.usedAssignments = []
+                bootstrapCollectUsedAssignments(
+                    declaration.expression,
+                    bootstrapResultIsUsed(declaration),
+                    this.usedAssignments
+                )
                 val actual = this.infer(declaration.expression)
                 bootstrapRecordBodyResult(this, declaration, index, actual)
                 this.validateBorrowReturn(
@@ -9534,6 +9592,12 @@ class BootstrapAnalyzer(
                     parameter = parameter + 1
                 }
                 bootstrapEndVoidBodyAfterAssignment(method.resultType, method.expression)
+                this.usedAssignments = []
+                bootstrapCollectUsedAssignments(
+                    method.expression,
+                    bootstrapResultIsUsed(method),
+                    this.usedAssignments
+                )
                 val actual = this.infer(method.expression)
                 bootstrapRecordBodyResult(
                     this, method, this.selectedMethodHandle(owner.name, method.name), actual

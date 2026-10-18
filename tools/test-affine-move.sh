@@ -386,4 +386,38 @@ if [[ $result -ne 1 ]] || ! grep -Fq 'move.local' "$output.err"; then
 fi
 [[ ! -e $output ]] || exit 1
 
+# An assignment's value is what the place now owns: using it (a result, an
+# `if` branch whose value is kept) would drop it twice, so it is rejected; a
+# statement assignment, a void function ending in one and a non-affine
+# assignment's value are fine, and each resource drops once, at run time and
+# under `#`.
+assignments=$project_root/tests/cases/assignment-value
+"$compiler" build "$assignments/assignments.ab" -o "$output_directory/assignments" \
+    --no-cache > "$output_directory/assignments.build" 2>&1
+set +e
+"$output_directory/assignments" > "$output_directory/assignments.out"
+status=$?
+set -e
+if [[ $status -ne 10 || $(cat "$output_directory/assignments.out") != $'drop 4\ndrop 1\ndrop 2\ndrop 3\n10 10' ]]; then
+    echo "affine move: assignments dropped wrongly ($status):" >&2
+    cat "$output_directory/assignments.out" >&2
+    exit 1
+fi
+for fixture in invalid-tail invalid-branch; do
+    output="$output_directory/assignment-$fixture"
+    rm -f "$output"
+    set +e
+    "$compiler" build "$assignments/$fixture.ab" -o "$output" --no-cache \
+        >"$output.out" 2>"$output.err"
+    result=$?
+    set -e
+    if [[ $result -ne 1 ]] || ! grep -Fq 'ownership.assignment-value' "$output.err" ||
+        ! grep -Fq 'help: ' "$output.err"; then
+        echo "affine move: $fixture was not rejected with ownership.assignment-value" >&2
+        sed -n '1,20p' "$output.err" >&2
+        exit 1
+    fi
+    [[ ! -e $output ]] || exit 1
+done
+
 echo "affine resources: own/var borrows + mode-bearing callables + FnOnce + partial places + recursive drops + CFG + compile-time/LLVM passed"
