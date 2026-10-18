@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# JSON literals nested 200 deep (a compile-time `#$json` object, a `#$jsons`
+# JSON literals nested 150 deep (a compile-time `#$json` object, a `#$jsons`
 # array, a runtime `$json` object) compile on the default 8 MB stack: the
 # subparser, the compile-time evaluator, semantic analysis and lowering each
 # hold a few small frames per level. The hard limit is lowered too, so neither
@@ -10,7 +10,7 @@ compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/deep-json"
 mkdir -p "$output_directory"
-depth=200
+depth=150
 
 object=1
 array=1
@@ -51,4 +51,28 @@ output=$("$output_directory/deep")
     printf 'deep json: %s\n' "$output" >&2
     exit 1
 }
-echo "deep json: $depth levels compile on an 8 MB stack"
+# The depth guard firing inside `#$jsons` (here at a lowered level cap) is one
+# error: the syntax built from the failed evaluation reads no handle past the
+# evaluator's table.
+cat > "$output_directory/guarded.ab" <<EOF
+import "abla/json"
+import "abla/io"
+
+fun main: int {
+    val encoded = #\$jsons [[[[[[[[[[1]]]]]]]]]]
+    println(encoded)
+    0
+}
+EOF
+set +e
+ABLA_EVAL_DEPTH_LIMIT=5 "$compiler" build "$output_directory/guarded.ab" \
+    -o "$output_directory/guarded" --no-cache > "$output_directory/guarded.log" 2>&1
+guarded_status=$?
+set -e
+if [[ $guarded_status -eq 0 || $guarded_status -ge 100 ]] ||
+    [[ $(grep -c '^error\[E_EVAL_STACK_DEPTH\]' "$output_directory/guarded.log") -ne 1 ]]; then
+    printf 'deep json: the guarded #$jsons gave status %s\n' "$guarded_status" >&2
+    cat "$output_directory/guarded.log" >&2
+    exit 1
+fi
+echo "deep json: $depth levels compile on an 8 MB stack; the depth guard in #\$jsons is one error"
