@@ -439,15 +439,16 @@ error[E_EVAL_STEP_LIMIT]: compile-time evaluation ran past 50000000 steps (an en
 it), which is useful in tests.
 
 Recursion at compile time is bounded by the compiler's own stack. The
-evaluator allows one nesting level per 4 KB of stack after a 1 MB reserve,
-and a call takes a few levels (about three for a simple recursive function).
-The `ablac` launcher gives the compiler the largest stack the system allows:
-on macOS that is 64 MB, or 16,124 levels, about 5,000 nested calls of a small
-function. A plain 8 MB stack allows about 1,790 levels. Deeper recursion
-stops with one error that names the limit, instead of crashing the compiler:
+evaluator measures how much of that stack nested evaluation has used and stops
+1.5 MB short of the limit; a call takes a few nesting levels (about three for
+a simple recursive function). The `ablac` launcher gives the compiler the
+largest stack the system allows: on macOS that is 64 MB, about 16,000 levels
+or 5,000 nested calls of a small function. A plain 8 MB stack allows about
+1,700 levels. Deeper recursion stops with one error instead of crashing the
+compiler:
 
 ```text
-error[E_EVAL_STACK_DEPTH]: compile-time evaluation nested deeper than 16124 levels (unbounded recursion, or recursion deeper than the compiler's stack allows)
+error[E_EVAL_STACK_DEPTH]: compile-time evaluation nested 16408 levels deep and used up the compiler's stack (unbounded recursion, or recursion deeper than the compiler's stack allows)
 ```
 
 `ABLA_EVAL_DEPTH_LIMIT=<n>` lowers the limit (it never raises it), and

@@ -1,4 +1,5 @@
 import "sema.ab"
+import "abla/unsafe/memory/raw"
 import "abla/sys/linux/io"
 import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
@@ -5045,7 +5046,12 @@ class BootstrapEvaluator(
         // Each level of a nested evaluation holds frames on the compiler's own
         // stack: past the depth that stack can take, stop with a diagnostic
         // instead of crashing (deep compile-time recursion).
-        if (bootstrapEvalDepth >= bootstrapEvalDepthLimit()) {
+        if (bootstrapEvalDepth == 0) {
+            bootstrapEvalStackBase = bootstrapEvalStackMark()
+        } else if ((bootstrapEvalDepth % 8 == 0 &&
+                    bootstrapEvalStackBase - bootstrapEvalStackMark() >
+                        bootstrapEvalStackBudget()) ||
+                   bootstrapEvalDepth >= bootstrapEvalDepthLimit()) {
             bootstrapEvalDepthLimitReached(this)
             return bootstrapEvalInvalid()
         }
@@ -5266,33 +5272,49 @@ fun bootstrapEvalDefaultArgument(
     value
 }
 
-// How deeply `evaluate` is nested now, and how deep the compiler's stack lets it
-// go (0 until first computed). Measured: a level costs about 4 KB of native
-// stack; the limit assumes 6 KB and keeps 4 MB in reserve.
+// How deeply `evaluate` is nested now, and the optional level cap (0 until
+// first computed).
 var bootstrapEvalDepth: int = 0
 var bootstrapEvalDepthLimitValue: int = 0
 // The limit is reported once per outermost evaluation, not by every level that
 // then unwinds into it again.
 var bootstrapEvalDepthReported: bool = false
 
-fun bootstrapEvalDepthLimit(): int {
-    if (bootstrapEvalDepthLimitValue == 0) {
+// The stack the outermost evaluation started at, and how far below it nested
+// evaluation may go: the stack limit less 1 MB for the compiler's own frames
+// above it and 512 KB for the deepest levels (checked every 8 of them) and the
+// diagnostic. Measuring bytes, not levels, keeps the guard right when a
+// level's frames grow or shrink.
+var bootstrapEvalStackBase: int = 0
+var bootstrapEvalStackBudgetValue: int = 0
+
+// An address in this call's own frame, just below the caller's.
+@noinline
+trusted fun bootstrapEvalStackMark(): int = nativeStackAllocate(16)
+
+fun bootstrapEvalStackBudget(): int {
+    if (bootstrapEvalStackBudgetValue == 0) {
         var stackBytes = 8 * 1024 * 1024
         val limits = linuxStackLimits()
         if (limits.size == 2) {
             stackBytes = if (limits[0] < 0) 512 * 1024 * 1024 else limits[0]
         }
-        // Measured on an 8 MB stack: a nested evaluation level holds about
-        // 3.5 KB and the compiler about 1 MB below the first one (the
-        // unguarded compiler crashed at 2100-2400 levels). 4 KB a level
-        // after a 1 MB reserve stops about 20% short of that.
-        var limit = (stackBytes - 1024 * 1024) / (4 * 1024)
-        if (limit < 256) limit = 256
-        // ABLA_EVAL_DEPTH_LIMIT lowers it (never raises it), for tests.
+        var budget = stackBytes - 1024 * 1024 - 512 * 1024
+        if (budget < 1024 * 1024) budget = 1024 * 1024
+        bootstrapEvalStackBudgetValue = budget
+    }
+    bootstrapEvalStackBudgetValue
+}
+
+// ABLA_EVAL_DEPTH_LIMIT caps the nesting in levels (for tests); without it
+// only the stack budget applies.
+fun bootstrapEvalDepthLimit(): int {
+    if (bootstrapEvalDepthLimitValue == 0) {
+        var limit = 1000000000
         val configured = linuxEnvironment("ABLA_EVAL_DEPTH_LIMIT")
         if (configured.found && configured.value.size <= 9) {
             val parsed = bootstrapDecimalIndex(configured.value)
-            if (parsed > 0 && parsed < limit) limit = parsed
+            if (parsed > 0) limit = parsed
         }
         bootstrapEvalDepthLimitValue = limit
     }
@@ -5306,7 +5328,7 @@ fun bootstrapEvalDepthLimitReached(var evaluator: BootstrapEvaluator): void {
     bootstrapEvalDepthReported = true
     evaluator.recordEvaluatorDiagnostic(
         "E_EVAL_STACK_DEPTH",
-        "compile-time evaluation nested deeper than ${bootstrapEvalDepthLimit()} levels (unbounded recursion, or recursion deeper than the compiler's stack allows)"
+        "compile-time evaluation nested ${bootstrapEvalDepth} levels deep and used up the compiler's stack (unbounded recursion, or recursion deeper than the compiler's stack allows)"
     )
 }
 
