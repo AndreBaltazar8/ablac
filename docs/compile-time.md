@@ -163,6 +163,20 @@ fun main: int = twice(21)
 // error: compile.call-runtime:twice
 ```
 
+The compiler's own API (`compilerEnvironment`, `compilerWriteFile`, the
+reflection and syntax functions of `abla/compiler`) exists only while the
+program compiles in the same way, so an ordinary function that calls it is
+run-time code calling it. Make that function a `compile fun`:
+
+```abla error
+import "abla/compiler"
+
+fun homeLength(): int = compilerEnvironment("HOME").size
+
+fun main: int = #homeLength()
+// error: compile.call-runtime:compilerEnvironment
+```
+
 ## Top-level actions
 
 A `#expression` on its own at the top level of a module is an *action*. It
