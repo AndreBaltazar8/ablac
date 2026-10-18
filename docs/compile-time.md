@@ -666,7 +666,8 @@ site gives the same program constant on either tier.
 
 A site the native tier cannot take yet runs in the evaluator: code that calls
 the compiler API or a host provider (`extern:"compiler"`, `extern:"host"`), a
-compile global still holding a kept array or object, a global whose
+compile global still holding a kept value native code can't take in (an
+object, a map, a nested array, or any value of a `compile val`), a global whose
 initializer is itself compile-time code, a result only the compiler can hold
 (a generator, task, thread, borrow, `Weak` or raw pointer), a cross-target
 build (compile-time code always runs on the host), the REPL, and a
@@ -682,10 +683,10 @@ compilation that compile-time code starts (it runs inside the outer pass).
   stops with `E_CT_TIME_LIMIT`.
 - `compile val`/`compile var` hold one value for the compilation on both
   tiers: after each native call their values are kept as the evaluator keeps
-  them. When an evaluated site changes an `int` or `bool` `compile var` the
-  slice holds, the new value goes back into the native code. A change to a
-  global of any other type makes the rest of the pass fall back to the
-  evaluator.
+  them. When an evaluated site changes a `compile var` the slice holds whose
+  type is `int`, `bool`, `f64` or `string`, or an array of those, the new
+  value goes back into the native code. A change to a global of any other
+  type makes the rest of the pass fall back to the evaluator.
 - `ABLA_COMPILE_EVAL_TRACE=1` prints, per site, whether it ran natively or why
   it did not; `ABLA_COMPILE_EVAL_DUMP=<directory>` keeps each slice's LLVM
   module.

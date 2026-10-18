@@ -30,6 +30,7 @@ for mode in interp jit; do
     run_case "$mode" fallback 33
     run_case "$mode" globals 42
     run_case "$mode" globals-stale 42
+    run_case "$mode" globals-exchange 42
     run_case "$mode" codec 42
 done
 
@@ -74,8 +75,15 @@ native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/globals-jit.tra
 grep -q 'compile global .*counter changed in an interpreted evaluation: passed in' \
     "$output_directory/globals-jit.trace"
 # A changed global without a setter leaves the rest of the pass interpreted.
-grep -q 'interpreted at .*: compile global .*trail changed in an interpreted evaluation' \
+grep -q 'interpreted at .*: compile global .*grid changed in an interpreted evaluation' \
     "$output_directory/globals-stale-jit.trace"
+# Strings, f64 and arrays of them go back in: both native sites stay native.
+native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/globals-exchange-jit.trace" || true)
+[[ $native -eq 2 ]] || { echo "compile-eval-jit: $native native sites in globals-exchange.ab, expected 2" >&2; cat "$output_directory/globals-exchange-jit.trace" >&2; exit 1; }
+for global in trail scale counts names; do
+    grep -q "compile global .*$global changed in an interpreted evaluation: passed in" \
+        "$output_directory/globals-exchange-jit.trace"
+done
 
 # A native compile-time code that stops is a diagnostic; the compiler survives it (an
 # error status, not a signal or a panic's 101). Each case: name, mode, environment.

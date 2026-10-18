@@ -320,16 +320,94 @@ trusted fun bootstrapCtExchangeGlobals(var evaluator: BootstrapEvaluator, site: 
     return
 }
 
-// Stores `value` into the generation's copy of `global` through its setter; false
-// when it has none or the value is not the setter's kind.
+// What a setter can store: an int, bool, f64 or string, or an array of those; ""
+// for another type.
+fun bootstrapCtSetterKind(type: string): string {
+    if (type == "int" || type == "i64" || type == "bool" || type == "f64" || type == "string") {
+        return if (type == "int") "i64" else type
+    }
+    if (type.size > 6 && type.slice(0, 6) == "array:") {
+        val element = bootstrapCtSetterKind(type.slice(6, type.size))
+        if (element != "" && !bootstrapTextContains(element, "array")) return "array:$element"
+    }
+    ""
+}
+
+// Stores `value` into the generation's copy of `global` through its setter, written
+// as the setter reads it (bootstrapCtSetterSource): an int, bool or f64 as one word,
+// a string as [size][bytes], an array as [count] and its elements so. False when
+// the global has no setter or the value doesn't fit its kind.
 trusted fun bootstrapCtPushGlobal(var global: BootstrapCtGlobal, value: BootstrapEvalValue): bool {
     if (global.setter == 0) return false
-    val word = if (value.kind == "integer" && (global.type == "int" || global.type == "i64")) value.integer
-        else if (value.kind == "boolean" && global.type == "bool") (if (value.boolean) 1 else 0)
-        else return false
-    val stored = ablaUnsafeCallExact_I64_I64(global.setter, word)
+    val kind = bootstrapCtSetterKind(global.type)
+    val words: array<int> = []
+    val texts: array<string> = []
+    var fits = true
+    if (kind.size > 6 && kind.slice(0, 6) == "array:") {
+        if (value.kind != "array") return false
+        val element = kind.slice(6, kind.size)
+        for (item in value.elements) {
+            if (!bootstrapCtPushPart(element, item, words, texts)) fits = false
+        }
+    } else fits = bootstrapCtPushPart(kind, value, words, texts)
+    if (!fits) return false
+    val array = kind.size > 6 && kind.slice(0, 6) == "array:"
+    val text = kind == "string" || kind == "array:string"
+    // [count] for an array, then each part: a word, or [size][bytes].
+    var size = if (array) 8 else 0
+    var part = 0
+    while (part < words.size) {
+        size = size + 8
+        if (text) size = size + texts[-1 - words[part]].size
+        part = part + 1
+    }
+    // (Zeroed in words: rounded up to one.)
+    val buffer = bootstrapCtZeroed((size + 15) / 8 * 8)
+    var at = buffer
+    if (array) {
+        ablaRuntimeStoreI64(at, words.size)
+        at = at + 8
+    }
+    part = 0
+    while (part < words.size) {
+        if (!text) {
+            ablaRuntimeStoreI64(at, words[part])
+            at = at + 8
+        } else {
+            val bytes = texts[-1 - words[part]]
+            ablaRuntimeStoreI64(at, bytes.size)
+            var byte = 0
+            while (byte < bytes.size) {
+                ablaRuntimeStoreU8(at + 8 + byte, bytes[byte])
+                byte = byte + 1
+            }
+            at = at + 8 + bytes.size
+        }
+        part = part + 1
+    }
+    val stored = ablaUnsafeCallExact_I64_I64_I64(global.setter, buffer, size)
+    __ablaRuntimeFree(buffer)
     global.exchanged = bootstrapCompileGlobalEncode(value)
     bootstrapCtNote("compile global ${global.key} changed in an interpreted evaluation: passed in")
+    true
+}
+
+// One part of a pushed value: a word for an int, bool or f64, or (for a string) a
+// negative index into `texts`.
+fun bootstrapCtPushPart(
+    kind: string,
+    value: BootstrapEvalValue,
+    var words: array<int>,
+    var texts: array<string>
+): bool {
+    if ((kind == "i64" && value.kind == "integer") || (kind == "f64" && value.kind == "f64")) {
+        words.append(value.integer)
+    } else if (kind == "bool" && value.kind == "boolean") {
+        words.append(if (value.boolean) 1 else 0)
+    } else if (kind == "string" && value.kind == "string") {
+        texts.append(value.text)
+        words.append(-texts.size)
+    } else return false
     true
 }
 

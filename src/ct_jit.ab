@@ -271,14 +271,16 @@ class BootstrapCtReach(
                             val type = bootstrapNormalizeType(declaration.resultType)
                             val typeReason = bootstrapLiftTypeReason(type)
                             // Native code starts from the value an earlier evaluation
-                            // kept; only a scalar can be its initializer yet.
+                            // kept: a scalar as its initializer, any other value a
+                            // settable global can hold through its setter.
                             val kept = bootstrapCompileGlobalLoad(
                                 bootstrapCompileGlobalKey(declaration), this.declarations, []
                             )
                             if (typeReason != "" || type == "void" || type == "null") {
                                 reason = "reaches compile global ${declaration.name} of type ${declaration.resultType}, which native code cannot hand back"
                             } else if (kept.kind != "invalid" &&
-                                bootstrapCtLiftScalar(kept, 0, 0).kind == "missing") {
+                                bootstrapCtLiftScalar(kept, 0, 0).kind == "missing" &&
+                                !bootstrapCtSettable(declaration, this.declarations)) {
                                 reason = "reaches compile global ${declaration.name}, which holds a kept ${kept.kind} native code cannot take in yet"
                             } else globals.append(this.itemDeclarations[item])
                         } else if (valueItem && bootstrapCtHasCompileNode(declaration.expression)) {
@@ -369,6 +371,7 @@ fun bootstrapCtReach(declarations: array<BootstrapDeclaration>): BootstrapCtReac
 fun bootstrapCtSupportSource(generation: int, declarations: array<BootstrapDeclaration>): string {
     val g = "$generation"
     bootstrapCtLiftEncoder("i64", declarations, g).source +
+    bootstrapCtSetterSupport(g, declarations) +
     "trusted fun __abla_ct_reply_$g(bytes: string): int {\n" +
     "    val address = __ablaRuntimeAllocate(bytes.size + 8)\n" +
     "    ablaRuntimeStoreI64(address, bytes.size)\n" +
@@ -384,6 +387,38 @@ fun bootstrapCtSupportSource(generation: int, declarations: array<BootstrapDecla
     "    __ablaRuntimeFree(address)\n" +
     "    0\n" +
     "}\n"
+}
+
+// What setters use: a string made from bytes the compiler wrote, and the
+// intrinsics that need, unless `declarations` (what the slice keeps) has them.
+fun bootstrapCtSetterSupport(g: string, declarations: array<BootstrapDeclaration>): string {
+    var intrinsics = ""
+    if (!bootstrapCtDeclares(declarations, "ablaUnsafeAdoptString")) {
+        intrinsics = "${intrinsics}trusted noescape extern:\"intrinsic\" fun ablaUnsafeAdoptString(address: i64*, length: int): string\n"
+    }
+    if (!bootstrapCtDeclares(declarations, "ablaBitI64ToF64")) {
+        intrinsics = "${intrinsics}noescape extern:\"intrinsic\" fun ablaBitI64ToF64(value: int): f64\n"
+    }
+    "$intrinsics" +
+    // (The setters are ordinary compile code: their raw reads go through here.)
+    "trusted fun __abla_ct_word_$g(address: int): int = ablaRuntimeLoadI64(address)\n" +
+    "trusted fun __abla_ct_text_$g(address: int, size: int): string {\n" +
+    "    val data = __ablaRuntimeAllocateLayout(size + 1, 1)\n" +
+    "    var index = 0\n" +
+    "    while (index < size) {\n" +
+    "        ablaRuntimeStoreU8(data + index, ablaRuntimeLoadU8(address + index))\n" +
+    "        index = index + 1\n" +
+    "    }\n" +
+    "    ablaRuntimeStoreU8(data + size, 0)\n" +
+    "    ablaUnsafeAdoptString(ablaRuntimePointerFromAddress(data), size)\n" +
+    "}\n"
+}
+
+fun bootstrapCtDeclares(declarations: array<BootstrapDeclaration>, name: string): bool {
+    for (declaration in declarations) {
+        if (declaration.name == name) return true
+    }
+    false
 }
 
 fun bootstrapCtEntrySource(site: BootstrapCtSite, generation: int): string {
@@ -456,8 +491,33 @@ fun bootstrapCtDeclarationWith(
 fun bootstrapCtGlobalSource(index: int, generation: int): string =
     "@export(\"abla_ct_global_${generation}_$index\")\ncompile fun __abla_ct_global_${generation}_$index(): int =\n    __abla_lift_reply_$generation(__abla_ct_value_$index())\n"
 
-// An int or bool `compile var` whose name no other declaration has gets a setter: a
-// value the evaluator gives it later goes back into the generation's copy.
+// A `compile var` of a settable type whose name no other declaration has: a value
+// the evaluator gives it goes back into the generation's copy through its setter.
+fun bootstrapCtSettable(
+    declaration: BootstrapDeclaration,
+    declarations: array<BootstrapDeclaration>
+): bool {
+    if (declaration.kind != "compile.var") return false
+    if (bootstrapCtSetterKind(bootstrapNormalizeType(declaration.resultType)) == "") return false
+    var named = 0
+    for (other in declarations) {
+        if (other.name == declaration.name) named = named + 1
+    }
+    named == 1
+}
+
+// One value read from the setter's buffer at `at` (advanced past it), as source.
+fun bootstrapCtSetterRead(kind: string, generation: int): string {
+    val word = "__abla_ct_word_$generation(at)"
+    if (kind == "string") "__abla_ct_text_$generation(at + 8, $word)"
+    else if (kind == "f64") "ablaBitI64ToF64($word)"
+    else if (kind == "bool") "$word != 0"
+    else word
+}
+
+// The setter of a settable global: `(address, size)` addresses the value as the
+// compiler wrote it (bootstrapCtPushGlobal): an int, bool or f64 as one word, a
+// string as [size][bytes], an array as [count] and then each element so.
 fun bootstrapCtSetterSource(
     global: BootstrapCtGlobal,
     declarations: array<BootstrapDeclaration>,
@@ -465,15 +525,20 @@ fun bootstrapCtSetterSource(
     generation: int
 ): string {
     val declaration = declarations[global.declaration]
-    if (declaration.kind != "compile.var") return ""
-    if (global.type != "int" && global.type != "i64" && global.type != "bool") return ""
-    var named = 0
-    for (other in declarations) {
-        if (other.name == declaration.name) named = named + 1
-    }
-    if (named != 1) return ""
-    val stored = if (global.type == "bool") "value != 0" else "value"
-    "@export(\"abla_ct_set_${generation}_$index\")\ncompile fun __abla_ct_set_${generation}_$index(value: int): int {\n    ${declaration.name} = $stored\n    0\n}\n"
+    if (!bootstrapCtSettable(declaration, declarations)) return ""
+    val kind = bootstrapCtSetterKind(global.type)
+    val header = "@export(\"abla_ct_set_${generation}_$index\")\ncompile fun __abla_ct_set_${generation}_$index(address: int, size: int): int {\n    var at = address\n"
+    val body = if (kind.size > 6 && kind.slice(0, 6) == "array:") {
+        val element = kind.slice(6, kind.size)
+        val advance = if (element == "string") "at = at + 8 + __abla_ct_word_$generation(at)"
+            else "at = at + 8"
+        "    val count = __abla_ct_word_$generation(at)\n    at = at + 8\n" +
+        "    val values: array<$element> = []\n    var index = 0\n" +
+        "    while (index < count) {\n        values.append(${bootstrapCtSetterRead(element, generation)})\n" +
+        "        $advance\n        index = index + 1\n    }\n" +
+        "    ${declaration.name} = values\n"
+    } else "    ${declaration.name} = ${bootstrapCtSetterRead(kind, generation)}\n"
+    "$header$body    0\n}\n"
 }
 
 
@@ -536,6 +601,13 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
             for (method in declaration.methods) reach.keepFrom(method.expression)
         }
     }
+    // A float in a string template is written by abla/float/text's f64Text, which
+    // no site names: kept when the program has it, so such templates type-check.
+    for (declaration in parsed.declarations) {
+        if (declaration.name == "f64Text" && declaration.kind == "fun") {
+            reach.keepFrom(BootstrapExpression("call", "f64Text", 0, 0, []))
+        }
+    }
     var ready = 0
     for (site in bootstrapCtSites) {
         site.encodes = !site.action && site.type != "void" && site.type != "null"
@@ -575,7 +647,16 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     if (ready == 0) return
     bootstrapCtGenerationNumber = bootstrapCtGenerationNumber + 1
     val generation = bootstrapCtGenerationNumber
-    var source = bootstrapCtSupportSource(generation, parsed.declarations)
+    // The support declares the intrinsics it needs unless the slice keeps them.
+    val kept: array<BootstrapDeclaration> = []
+    var keptIndex = 0
+    while (keptIndex < parsed.declarations.size) {
+        if (reach.kept[keptIndex] || bootstrapCtRuntimeDeclaration(parsed.declarations[keptIndex])) {
+            kept.append(parsed.declarations[keptIndex])
+        }
+        keptIndex = keptIndex + 1
+    }
+    var source = bootstrapCtSupportSource(generation, kept)
     for (site in bootstrapCtSites) {
         if (site.reason == "") source = "$source${bootstrapCtEntrySource(site, generation)}"
     }
@@ -786,6 +867,15 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
         ) != "") {
             bootstrapCtGlobals[getter].setter =
                 bootstrapCtLookup("abla_ct_set_${generation}_$getter")
+            // A kept value no literal can carry (an f64, an array) goes in now,
+            // before any site reads it.
+            val kept = bootstrapCompileGlobalLoad(
+                bootstrapCtGlobals[getter].key, parsed.declarations, []
+            )
+            if (kept.kind != "invalid" && bootstrapCtLiftScalar(kept, 0, 0).kind == "missing" &&
+                !bootstrapCtPushGlobal(bootstrapCtGlobals[getter], kept)) {
+                bootstrapCtFailReady("compile global ${bootstrapCtGlobals[getter].key} could not be passed in")
+            }
         }
         getter = getter + 1
     }
