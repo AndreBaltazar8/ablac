@@ -97,5 +97,28 @@ grep -q 'emits only object or static-library artifacts' \
     "$directory/raw-executable.err"
 [[ ! -e "$directory/raw-executable" ]] || exit 1
 
+# A Mac has no Linux sysroot: a hosted Linux executable or shared library is
+# refused before linking, while its object still builds.
+if [[ $(uname -s) == Darwin ]]; then
+    for emit in executable shared-library; do
+        set +e
+        "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
+            --fast --no-cache --target x86_64-linux --emit "$emit" \
+            -o "$directory/linux-$emit" \
+            >"$directory/linux-$emit.out" 2>"$directory/linux-$emit.err"
+        linux_status=$?
+        set -e
+        [[ $linux_status -eq 160 ]] || exit 1
+        grep -q "error\[E_TARGET_HOST_LINK\]: .* for target 'x86_64-linux' links against a Linux C library" \
+            "$directory/linux-$emit.err"
+        ! grep -q "E_NATIVE_TOOLCHAIN" "$directory/linux-$emit.err" || exit 1
+        [[ ! -e "$directory/linux-$emit" ]] || exit 1
+    done
+    "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
+        --fast --no-cache --target x86_64-linux --emit object \
+        -o "$directory/linux.o"
+    llvm-readelf -h "$directory/linux.o" | grep -q 'X86-64'
+fi
+
 printf '%s\n' \
-    'target descriptors: hosted, freestanding, extension-defined and raw LLVM objects, and deterministic unsupported-target diagnostics passed'
+    'target descriptors: hosted, freestanding, extension-defined and raw LLVM objects, and deterministic unsupported-target and host-link diagnostics passed'

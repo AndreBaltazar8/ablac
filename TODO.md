@@ -37,10 +37,6 @@ called out below.
   Abla (`93ce196`). On a target without the capability the IR failure also hides
   `E_EXPORT_TARGET_CAPABILITY`. `tools/test-wasm-mvc-extension.sh` covers both and stays out of
   the suite until they work.
-- [ ] **Linking a hosted Linux artifact on macOS fails obscurely.** A `x86_64-linux`
-  executable or shared library built on a Mac reaches the host's Mach-O `ld64.lld` with ELF
-  flags (`unknown argument '--gc-sections'`); there is no Linux sysroot to link against
-  either. Reject it up front with a target diagnostic.
 
 ## Packages
 
@@ -202,41 +198,6 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `lowerGlobalFunctionType` each look it up afresh), and dispatch the opcode table on the
   opcode's first byte. Worth perhaps 0.3-0.6% of a dev build; not measurable on a loaded
   machine.
-- [ ] **LLVM 23 (adopted 2026-10-11 on macOS and Linux).** Evaluated with LLVM 23.1.3 (macOS arm64 release) against 21,
-  with `a223373` built against each. Instructions retired by the compiler and every LLVM tool and
-  wasm-opt, on a game's builds (one round; walls were inflated by external load):
-
-  | Build | LLVM 21 | LLVM 23 | Peak (tree RSS) |
-  |---|---|---|---|
-  | release Wasm client | 1,260 G | 1,000 G (−21%) | 1.77 → 1.64 GB |
-  | development Wasm client | 269 G | 228 G (−15%) | 2.06 → 2.11 GB (compiler) |
-  | release native server | 345 G | 248 G (−28%) | 0.99 → 0.96 GB |
-  | release simulation module | 93 G | 77 G (−18%) | 0.52 → 0.53 GB |
-
-  Per tool on the release client: opt −29%, clang's O2 pre-link −32%, wasm-ld −40%, wasm-opt
-  −4%. Sizes: client −1.67% after wasm-opt, simulation module +0.31%, server −0.48%,
-  development client +0.05%. Runtime unchanged: the simulation's hashes match, natively and in
-  Wasm, and its instructions per run are within 0.2% (native and under node). The initializer
-  chunks and 4 LTO partitions still pay under 23 (wasm-ld −26% instructions; 4 partitions −32%
-  wall, lower peak). Under 23 the compiler is a fixed point (`.ll` and binary).
-
-  The switch: macOS uses Homebrew `llvm@23`/`lld@23` (23.1.2; `ABLA_LLVM`/`ABLA_LLD` override
-  the tool scripts' prefixes). The microcontroller pipeline is `default<O2>` with every
-  function `minsize` (23 has no `default<Oz>`). opt and llc no longer get `--threads=1` (ThinLTO's
-  option, a no-op there; a statically linked opt doesn't have it). The C API calls and the opcode
-  and type-kind numbers the compiler reads are unchanged in 23 (only `Br` was split). Verified:
-  a fixed point under 23 (also reached from the v0.2.15 bootstrap through the handoff), the
-  suite the same as under 21 (71/71), and a game's simulation hashes natively and in Wasm.
-
-  Linux followed the same day: the development shell pins a nixpkgs with `llvmPackages_23`
-  (23.1.3), and the portable package bundles apt.llvm.org's LLVM 23. The Nix-built compiler binds
-  glibc 2.38's `fmod`/`fmodf`, so the Linux package needs glibc 2.38 or later (Ubuntu 24.04, Debian
-  13); 2.35 ran the LLVM 21 one. LLVM 23's wasm-ld also exports the mutable `__stack_pointer` under
-  `--export-dynamic`, so wasm-opt gets `--enable-mutable-globals` (older Binaryen rejects the
-  module otherwise; Homebrew's output is unchanged). Verified (linux/amd64): the v0.2.15 bootstrap
-  hands over to libLLVM.so.23.1, the result is a fixed point, the self-rebuild test's IR matches,
-  and the package runs native, Wasm and `run` builds on a clean Ubuntu 24.04 with no LLVM.
-  v0.2.16, built on 23, is the bootstrap since, so the LLVM 21 handoff is gone.
 
 ## Not checked
 

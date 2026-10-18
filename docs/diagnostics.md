@@ -171,6 +171,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | Code | Meaning |
 |---|---|
 | `E_BUILD_TARGET_*`, `E_BUILD_ARTIFACT_UNSUPPORTED` | an unknown target, artifact or target definition ([programmable-builds.md](programmable-builds.md)) |
+| `E_TARGET_HOST_LINK` | a hosted Linux executable or shared library built on macOS, which has no Linux sysroot to link against |
 | `E_BUILD_GRAPH_*`, `E_BUILD_PROGRAM_REQUEST`, `E_BUILD_OUTPUT`, `E_BUILD_IO` | a programmable build graph that is invalid or couldn't be published |
 | `E_ARTIFACT_*` | artifact roots and slices ([programmable-builds.md](programmable-builds.md)) |
 | `E_NATIVE_TOOLCHAIN` | the linker or another native tool failed |
