@@ -402,16 +402,12 @@ or the slot reassigned. Replacing an element (`tickets[1] = Ticket(9)`)
 drops the old one first.
 
 A `Map` whose values are resources follows the same rules: `get` and
-`values()` borrow (moving out of them is `ownership.move-borrow`), `set`
-drops the value it replaces, `remove` drops the removed value,
-`take(key)` moves it out as a `V?`, and the map drops its remaining values
-when it goes out of scope.
-
-> Known issue (being fixed by ct-own): today a map of resources breaks
-> single ownership. `get` and `values()` hand out owning copies, so one
-> value can be moved out and dropped several times, and replaced, removed
-> or remaining values are never dropped. Don't store resources in a `Map`
-> yet; keep them in an array and map keys to indexes.
+`values()` borrow (moving a `get` result out is `ownership.borrow-move`, an
+element of `values()` `move.local`), and a borrowed value can't be held
+across a change to the map (`E_BORROW_CONFLICT`). `set` drops the value it
+replaces, `remove` drops the removed value, `clear` drops them all,
+`take(key)` moves one out as a `V?`, and the map drops its remaining values
+when it goes out of scope. The same holds at compile time.
 
 ## Borrowed views and `borrow(...)` results
 

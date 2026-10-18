@@ -185,6 +185,7 @@ test: ablac
 	tools/test-runtime-checks.sh $(COMPILER)
 	tools/test-float-integer-saturation.sh $(COMPILER)
 	tools/test-named-method-arguments.sh $(COMPILER)
+	tools/test-map-resources.sh $(COMPILER)
 
 check: test self-rebuild
 

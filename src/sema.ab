@@ -2244,7 +2244,7 @@ fun bootstrapEndVoidBodyAfterAssignment(resultType: string, var body: BootstrapE
 // function (`fun Map<string, int>.bump(...)`), called like any other.
 fun bootstrapIsMapBuiltinMethod(name: string): bool =
     name == "get" || name == "has" || name == "set" || name == "remove" ||
-    name == "keys" || name == "values" || name == "clear"
+    name == "keys" || name == "values" || name == "clear" || name == "take"
 
 /** Whether a function was published as a member `name__<types>` of an overload set. */
 fun bootstrapHasOverloadMember(declarations: array<BootstrapDeclaration>, name: string): bool {
@@ -2541,6 +2541,14 @@ fun bootstrapSummaryTypeIsAffineAt(
     if (!affine && depth < 32 && bootstrapIsArrayType(normalized)) {
         affine = bootstrapSummaryTypeIsAffineAt(
             bootstrapArrayElementType(normalized),
+            names,
+            depth + 1
+        )
+    }
+    // A map owns its values: affine values make it affine.
+    if (!affine && depth < 32 && bootstrapIsMapType(normalized)) {
+        affine = bootstrapSummaryTypeIsAffineAt(
+            bootstrapMapValueType(normalized),
             names,
             depth + 1
         )
@@ -7937,6 +7945,15 @@ class BootstrapAnalyzer(
                     stored != "managed.multiple") source = stored
             }
         }
+        // An affine value a map lends (`get`, `values`) is borrowed from it.
+        if (expression.kind == "member.call" &&
+            (expression.text == "get" || expression.text == "values") &&
+            expression.children.size > 0 &&
+            bootstrapIsMapType(bootstrapBorrowElementType(
+                this.infer(expression.children[0])
+            ))) {
+            source = this.borrowArgumentSource(expression.children[0])
+        }
         if (expression.kind == "member.call" &&
             expression.children.size > 0 && expression.text != "get") {
             val receiverType = bootstrapBorrowElementType(
@@ -8300,7 +8317,8 @@ class BootstrapAnalyzer(
         } else if (key != "string" && key != "i64") {
             this.fail("map.key-type:$key")
         }
-        if (method == "set" || method == "remove" || method == "clear") {
+        if (method == "set" || method == "remove" || method == "clear" ||
+            method == "take") {
             if (bootstrapIsBorrowType(rawReceiver)) {
                 this.fail("ownership.borrow-mutation:map.$method")
             }
@@ -8308,12 +8326,10 @@ class BootstrapAnalyzer(
         }
         val arity = if (method == "set") 3
             else if (method == "get" || method == "has" ||
-                method == "remove") 2
+                method == "remove" || method == "take") 2
             else 1
         var result = "unknown"
-        if (method != "get" && method != "has" && method != "set" &&
-            method != "remove" && method != "keys" && method != "values" &&
-            method != "clear") {
+        if (!bootstrapIsMapBuiltinMethod(method)) {
             this.fail("map.member:$method")
         } else if (expression.children.size != arity) {
             this.fail("map.$method.arity")
@@ -8338,13 +8354,18 @@ class BootstrapAnalyzer(
                     value, expression.children[2], "argument.map.set"
                 )
             }
+            val nullable = if (bootstrapIsNullableType(value)) value
+                else "nullable:$value"
+            // Like an array's elements, a map's affine values stay the
+            // map's: `get` and `values` lend them, `take` moves one out.
+            val lent = if (this.typeIsAffine(value)) "borrow:" else ""
             result = when (method) {
-                "get" -> if (bootstrapIsNullableType(value)) value
-                    else "nullable:$value"
+                "get" -> "$lent$nullable"
+                "take" -> nullable
                 "has" -> "bool"
                 "remove" -> "bool"
                 "keys" -> "array:$key"
-                "values" -> "array:$value"
+                "values" -> "${lent}array:$value"
                 else -> "void"
             }
         }
@@ -11681,9 +11702,8 @@ fun bootstrapInferFor(
 ): string {
     var result = initial
     // `val b = a; for (n in b)`: a borrowed array iterates as one.
-    val sourceType = bootstrapBorrowElementType(
-        analyzer.infer(expression.children[0])
-    )
+    val rawSourceType = analyzer.infer(expression.children[0])
+    val sourceType = bootstrapBorrowElementType(rawSourceType)
     var elementType = "unknown"
     if (bootstrapIsArrayType(sourceType)) {
         elementType = bootstrapArrayElementType(sourceType)
@@ -11710,7 +11730,8 @@ fun bootstrapInferFor(
                    analyzer.typeIsAffine(elementType) &&
                    (expression.children[0].kind == "identifier" ||
                     expression.children[0].kind == "member" ||
-                    expression.children[0].kind == "index")) {
+                    expression.children[0].kind == "index" ||
+                    bootstrapIsBorrowType(rawSourceType))) {
             "element:${bootstrapPlaceRootName(expression.children[0])}"
         } else ""
     val previousScope = analyzer.enterScope()

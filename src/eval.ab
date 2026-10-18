@@ -3167,6 +3167,10 @@ class BootstrapEvaluator(
         if (value.kind == "delegate" && value.elements.size == 1) {
             affine = this.valueIsAffine(value.elements[0])
         }
+        // A map is as affine as its values.
+        if (value.kind == "map" && value.elements.size > 1) {
+            affine = this.valueIsAffine(value.elements[1])
+        }
         affine
     }
 
@@ -3213,14 +3217,18 @@ class BootstrapEvaluator(
             this.dropValue(value.elements[0])
             value.elements[0] = this.uninitializedValue()
         }
+        if (value.kind == "map" && value.elements.size > 1) {
+            this.dropValue(value.elements[1])
+        }
+        // First to last, as the generated drop function does at run time.
         if (value.kind == "array" && this.valueIsAffine(value)) {
-            var element = value.elements.size
-            while (element > 0) {
-                element = element - 1
+            var element = 0
+            while (element < value.elements.size) {
                 if (value.elements[element].kind != "uninitialized") {
                     this.dropValue(value.elements[element])
                     value.elements[element] = this.uninitializedValue()
                 }
+                element = element + 1
             }
         }
         if (value.kind == "object" &&
@@ -5174,19 +5182,32 @@ class BootstrapEvaluator(
             index = index + 1
         }
         var result = bootstrapEvalVoid()
+        // Affine values stay the map's: `get`/`values` lend them, `take` moves
+        // one out, and one replaced, removed or cleared is dropped.
         if (method == "get") {
-            result = if (entry >= 0) values.elements[entry] else bootstrapEvalNull()
+            result = if (entry < 0) bootstrapEvalNull()
+                else if (this.valueIsAffine(values.elements[entry])) {
+                    bootstrapEvalBorrow(values.elements[entry])
+                } else values.elements[entry]
         } else if (method == "has") {
             result = bootstrapEvalBoolean(entry >= 0)
         } else if (method == "set" && expression.children.size == 3) {
             val value = this.evaluate(expression.children[2])
-            if (entry >= 0) values.elements[entry] = value
-            else {
+            if (entry >= 0) {
+                val previous = values.elements[entry]
+                values.elements[entry] = value
+                if (this.valueIsAffine(previous)) this.dropValue(previous)
+            } else {
                 keys.elements.append(key)
                 values.elements.append(value)
             }
-        } else if (method == "remove") {
+        } else if (method == "remove" || method == "take") {
+            result = if (method == "take") bootstrapEvalNull()
+                else bootstrapEvalBoolean(entry >= 0)
             if (entry >= 0) {
+                val removed = values.elements[entry]
+                if (method == "take") result = removed
+                else if (this.valueIsAffine(removed)) this.dropValue(removed)
                 var shift = entry
                 while (shift + 1 < keys.elements.size) {
                     keys.elements[shift] = keys.elements[shift + 1]
@@ -5196,7 +5217,6 @@ class BootstrapEvaluator(
                 keys.elements.truncate(keys.elements.size - 1)
                 values.elements.truncate(values.elements.size - 1)
             }
-            result = bootstrapEvalBoolean(entry >= 0)
         } else if (method == "keys" || method == "values") {
             val source = if (method == "keys") keys else values
             val copy: array<BootstrapEvalValue> = []
@@ -5206,7 +5226,11 @@ class BootstrapEvaluator(
                 element = element + 1
             }
             result = bootstrapEvalArray(copy)
+            if (method == "values" && this.valueIsAffine(result)) {
+                result = bootstrapEvalBorrow(result)
+            }
         } else if (method == "clear") {
+            if (this.valueIsAffine(values)) this.dropValue(values)
             keys.elements.truncate(0)
             values.elements.truncate(0)
         } else {
@@ -7333,7 +7357,8 @@ fun bootstrapEvaluateFor(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    var source = evaluator.evaluate(expression.children[0])
+    // A borrowed array (a map's affine `values()`) iterates as the array.
+    var source = bootstrapEvalUnwrapBorrow(evaluator.evaluate(expression.children[0]))
     val generated = bootstrapEvalIsGenerator(source)
     // A generator is iterated in place: the loop owns it, asks it for each
     // element as it needs one, and closes it however the loop ends.
