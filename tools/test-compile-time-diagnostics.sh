@@ -96,9 +96,9 @@ log=$output/scoped-effects.log
 build_fails scoped-call-effects.ab "$log"
 [[ $(grep -c '^error\[E_SEMANTIC\]: compile.effect-denied:' "$log") -eq 2 ]] ||
     fail "scoped effects: not two denials" "$log"
-grep -q 'effect-denied:trusted.native:printsInBody->loud->println->' "$log" ||
+grep -q 'effect-denied:trusted.native:printsInBody->loud->poke->' "$log" ||
     fail "scoped effects: a call beside a lambda parameter not charged" "$log"
-grep -q 'effect-denied:trusted.native:printsBeforeLocal->later->println->' "$log" ||
+grep -q 'effect-denied:trusted.native:printsBeforeLocal->later->poke->' "$log" ||
     fail "scoped effects: a call before a local not charged" "$log"
 ! grep -q 'allowed\|quiet' "$log" || fail "scoped effects: a parameter charged" "$log"
 
