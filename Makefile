@@ -193,6 +193,7 @@ test: ablac
 	tools/test-field-places.sh $(COMPILER)
 	tools/test-compile-time-cell-capture.sh $(COMPILER)
 	tools/test-hosted-network.sh $(COMPILER)
+	tools/test-native-platform-boundary.sh $(COMPILER)
 
 check: test self-rebuild
 
