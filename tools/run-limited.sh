@@ -39,7 +39,7 @@ memory_bytes=$((memory_mb * 1024 * 1024))
 # default and trying to raise the hard limit installed by this runner.
 export ABLA_MAX_MEMORY_MB=$memory_mb
 
-if [[ $(uname -s) == Darwin ]]; then
+if [[ $OSTYPE == darwin* ]]; then
     ulimit -S -c 0
     ulimit -S -t "$cpu_seconds"
     set +e

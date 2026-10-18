@@ -24,7 +24,7 @@ fi
 # space for those builds while retaining the launcher's hard process bounds.
 default_stack_kb=131072
 default_memory_mb=4096
-if [[ $(uname -s) == Darwin ]]; then
+if [[ $OSTYPE == darwin* ]]; then
     hard_stack_kb=$(ulimit -H -s)
     if [[ $hard_stack_kb =~ ^[1-9][0-9]*$ &&
           $hard_stack_kb -lt $default_stack_kb ]]; then
@@ -61,7 +61,7 @@ ulimit -S -s "$stack_kb"
 # libraries which are deliberately absent from the global loader path. Enter
 # the pinned shell for every command when that is the case, including cheap
 # commands such as --version and the long-lived analysis service.
-if [[ $(uname -s) == Linux && -z ${IN_NIX_SHELL:-} ]]; then
+if [[ $OSTYPE == linux* && -z ${IN_NIX_SHELL:-} ]]; then
     runtime_dependencies=$(ldd "$compiler" 2>/dev/null || true)
     if [[ $runtime_dependencies == *'not found'* ]]; then
         run_in_toolchain_shell "$@"
@@ -79,8 +79,8 @@ fi
 # Mac it runs with the tools of the Homebrew LLVM it links (llvm@N and lld@N),
 # first on PATH whatever else the caller's PATH holds. ABLA_LLVM and ABLA_LLD
 # name other prefixes of that LLVM.
-if [[ $(uname -s) == Darwin ]]; then
-    linked_llvm=$(otool -L "$compiler" 2>/dev/null | sed -n \
+if [[ $OSTYPE == darwin* ]]; then
+    linked_llvm=$(PATH=/usr/bin:/bin:$PATH; otool -L "$compiler" 2>/dev/null | sed -n \
         's/^[[:space:]]*\([^ ]*libLLVM[^ ]*\) (.*current version \([0-9][0-9]*\)\..*/\1 \2/p' |
         sed -n 1p)
     if [[ $linked_llvm == */opt/llvm*' '* ]]; then
