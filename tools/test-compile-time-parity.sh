@@ -121,6 +121,7 @@ build_and_run() { # dir tag entry mode
 by_design='module/proc-self-exe	*	host-dependent	reads its own executable (/proc/self/exe): under `#` that is the compiler
 module/unsafe-boundary	*	host-dependent	calls its own @export functions through dlsym: they exist only in the running program, not in the compiler
 module/http-advanced	*	staged-writes	a child process (gzip) reads a file the case wrote: under `#` writes stay staged until the build succeeds
+module/network-advanced	jit	staged-writes	its http-advanced part: a child process (gzip) reads a file the case wrote, which stays staged under `#` (interp: interp-threads)
 module/websocket-server-protocol	interp	interp-timing	forks clients with 100 ms ping / 400 ms idle deadlines the interpreter cannot meet (passes under jit)
 module/http-async	interp	interp-timing	the interpreted child builds the 200 KB /big body byte by byte and misses the client timeout (passes under jit)'
 
