@@ -154,4 +154,27 @@ if [[ $outer -ne 42 || $inner -ne 42 ]]; then
 fi
 grep -q '^note\[ct-jit\]: native at .*outer.ab' "$output_directory/twice-jit.trace"
 
-echo "compile-eval-jit: native compile-time sites agree with the interpreter"
+# A granted program (abla/json registers subparsers) stays native.
+mkdir -p "$output_directory/granted"
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
+        "$cases/granted/main.ab" -o "$output_directory/granted/$mode" --no-cache \
+        2> "$output_directory/granted/$mode.trace"
+    set +e
+    "$output_directory/granted/$mode"
+    granted=$?
+    set -e
+    if [[ $granted -ne 42 ]]; then
+        echo "compile-eval-jit: granted under $mode exited $granted, expected 42" >&2
+        cat "$output_directory/granted/$mode.trace" >&2
+        exit 1
+    fi
+done
+if ! grep -q '^note\[ct-jit\]: native at' "$output_directory/granted/jit.trace" ||
+    grep -q 'interpreted at' "$output_directory/granted/jit.trace"; then
+    echo "compile-eval-jit: the granted program fell back to the interpreter" >&2
+    cat "$output_directory/granted/jit.trace" >&2
+    exit 1
+fi
+
+echo "compile-eval-jit: native compile-time sites agree with the interpreter, granted programs included"
