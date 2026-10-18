@@ -877,11 +877,15 @@ fun main {
   member of the receiver, then a top-level declaration. A plain read
   (`scale`) takes the first level that has the name. A call (`scale(v)`)
   takes the first level with an *applicable* candidate: a method, or a
-  property of function type, that takes that many arguments (a method's
-  defaults may be left out, and named arguments must name its parameters;
-  argument types are then checked against the candidate found). A property
-  that isn't a function never captures a call, and a method that can't take
-  that many arguments lets the search continue. With no applicable candidate
+  property of function type, that takes the arguments: that many of them (a
+  method's defaults may be left out, and named arguments must name its
+  parameters), each of a type the parameter accepts where the code shows it
+  (a literal, a declared local, parameter or field, a constructor call, a
+  function's declared result; other arguments are checked against the
+  candidate found). A property that isn't a function never captures a call,
+  and a method that can't take the arguments lets the search continue:
+  `label(7)` beside a method `label(text: string)` calls a top-level
+  `label(n: int)`. With no applicable candidate
   anywhere, the error names the innermost one. A scalar conversion's name
   (`u32(x)`, `int(x)`, `f64(x)`, ...) always means the conversion: a member
   named `u32` never captures it and is called as `this.u32(...)`.

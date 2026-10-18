@@ -4,7 +4,10 @@
 // (the arity fits) means `this.name(...)`; a member that doesn't take the
 // arguments, and a field of any other type, leave the call to the top-level
 // declarations (a method still captures it when no top-level declaration has
-// the name, so the error is about the method). A scalar conversion's name
+// the name, so the error is about the method). An argument whose type the
+// syntax shows (a literal, a declared local, parameter or field, a
+// constructor, a function's declared result) must fit the member's parameter
+// type; one whose type only analysis knows is taken to fit. A scalar conversion's name
 // (`u32(x)`, `int(x)`) is never captured: `this.u32(...)` calls such a member.
 // A plain read or assignment of one of the receiver's fields means
 // `this.field`, so ownership sees the same place either way: a resource field
@@ -20,11 +23,13 @@
 import "parser.ab"
 import "overload.ab"
 import "staged_parser.ab"
+import "expected_types.ab"
 
 class BootstrapReceiverMembers(
     val methods: array<string>,
     val methodMinimums: array<int>,
     val methodParameters: array<array<string>>,
+    val methodParameterTypes: array<array<string>>,
     val fields: array<string>,
     val fieldTypes: array<string>
 )
@@ -48,7 +53,7 @@ class BootstrapReceiverIndex(
             index = index + 1
         }
         this.owners.append(normalized)
-        this.members.append(BootstrapReceiverMembers([], [], [], [], []))
+        this.members.append(BootstrapReceiverMembers([], [], [], [], [], []))
         this.members[this.members.size - 1]
     }
 }
@@ -71,6 +76,7 @@ fun bootstrapReceiverAddMethod(var members: BootstrapReceiverMembers, method: Bo
     members.methods.append(method.name)
     members.methodMinimums.append(bootstrapReceiverMinimumArguments(method))
     members.methodParameters.append(method.parameters)
+    members.methodParameterTypes.append(method.parameterTypes)
     return
 }
 
@@ -133,16 +139,57 @@ fun bootstrapReceiverGlobalCallable(globals: array<string>, name: string): bool 
     name == "move" || name == "Shared" || name == "Mutex" || name == "Cell" ||
     name == "Map" || name == "filledArray" || bootstrapReceiverIsConversion(name)
 
+/** A type the syntax names that analysis is sure to read the same way: a
+ *  scalar, `string`, `null`, a declared class, or an array, map or nullable
+ *  of those. Anything else (an alias, a borrow, a function type) is left to
+ *  analysis. */
+fun bootstrapReceiverPlainType(type: string, classes: BootstrapExpectedClasses): bool {
+    if (bootstrapScalarTypeUnderlyingValid(type) || type == "string" || type == "null") return true
+    if (bootstrapIsNullableType(type)) {
+        return bootstrapReceiverPlainType(bootstrapNullableElementType(type), classes)
+    }
+    if (bootstrapIsArrayType(type)) {
+        return bootstrapReceiverPlainType(bootstrapArrayElementType(type), classes)
+    }
+    if (bootstrapIsMapType(type)) {
+        return bootstrapReceiverPlainType(bootstrapMapKeyType(type), classes) &&
+            bootstrapReceiverPlainType(bootstrapMapValueType(type), classes)
+    }
+    classes.find(type) >= 0
+}
+
+/** Whether an argument may be passed to a parameter of type `parameter`: only
+ *  when both types are plain (bootstrapReceiverPlainType) and incompatible is
+ *  the answer no. A number literal fits any numeric parameter. */
+fun bootstrapReceiverArgumentFits(
+    context: BootstrapReceiverContext,
+    parameter: string,
+    argument: BootstrapExpression
+): bool {
+    val expected = bootstrapNormalizeType(parameter)
+    val shown = bootstrapExpectedValueType(argument, context.scope, context.callees)
+    if (expected == "" || shown == "") return true
+    val actual = bootstrapNormalizeType(shown)
+    val classes = context.scope.classes
+    if (!bootstrapReceiverPlainType(expected, classes) ||
+        !bootstrapReceiverPlainType(actual, classes)) return true
+    val literal = argument.kind == "integer" || argument.kind == "float"
+    if (literal && (bootstrapIsNumericScalarType(expected) ||
+        bootstrapIsNumericScalarType(bootstrapNullableElementType(expected)))) return true
+    bootstrapTypesCompatible(expected, actual)
+}
+
 /** Whether a receiver method or function-typed field named like `call` takes
  *  its arguments: a method whose arity fits (defaults may be left out, a named
  *  argument must name a parameter), or a field of a function type with that
  *  many parameters and no named arguments. A field of any other type never
  *  takes a call. */
 fun bootstrapReceiverTakes(
-    members: BootstrapReceiverMembers,
+    context: BootstrapReceiverContext,
     call: BootstrapExpression,
     arguments: array<BootstrapExpression>
 ): bool {
+    val members = context.members
     var named = false
     for (argument in arguments) if (argument.kind == "named.argument") named = true
     var method = 0
@@ -151,11 +198,18 @@ fun bootstrapReceiverTakes(
             arguments.size >= members.methodMinimums[method] &&
             arguments.size <= members.methodParameters[method].size) {
             var fits = true
+            var position = 0
             for (argument in arguments) {
                 if (argument.kind == "named.argument" &&
                     !bootstrapReceiverNameIn(members.methodParameters[method], argument.text)) {
                     fits = false
                 }
+                val types = members.methodParameterTypes[method]
+                if (argument.kind != "named.argument" && position < types.size &&
+                    !bootstrapReceiverArgumentFits(context, types[position], argument)) {
+                    fits = false
+                }
+                position = position + 1
             }
             if (fits) return true
         }
@@ -166,7 +220,17 @@ fun bootstrapReceiverTakes(
         if (members.fields[field] == call.text && !named) {
             val type = bootstrapNormalizeType(members.fieldTypes[field])
             if (bootstrapIsFunctionType(type) &&
-                bootstrapFunctionParameterCount(type) == arguments.size) return true
+                bootstrapFunctionParameterCount(type) == arguments.size) {
+                var fits = true
+                var position = 0
+                while (position < arguments.size) {
+                    if (!bootstrapReceiverArgumentFits(
+                        context, bootstrapFunctionParameterType(type, position), arguments[position]
+                    )) fits = false
+                    position = position + 1
+                }
+                if (fits) return true
+            }
         }
         field = field + 1
     }
@@ -192,16 +256,28 @@ fun bootstrapReceiverBoundNames(expression: BootstrapExpression, var names: arra
 fun bootstrapReceiverThis(at: BootstrapExpression): BootstrapExpression =
     BootstrapExpression("identifier", "this", at.begin, at.begin, [])
 
+/** What the rewrite of one body knows: the receiver's members, the names the
+ *  body binds, the top-level names, and the declared types the syntax shows
+ *  (expected_types.ab) to tell whether a member takes a call's arguments. */
+class BootstrapReceiverContext(
+    val members: BootstrapReceiverMembers,
+    val bound: array<string>,
+    val globals: array<string>,
+    val scope: BootstrapExpectedScope,
+    val callees: BootstrapExpectedCallees
+)
+
 fun bootstrapReceiverRewrite(
     expression: BootstrapExpression,
-    members: BootstrapReceiverMembers,
-    bound: array<string>,
-    globals: array<string>
+    context: BootstrapReceiverContext
 ): BootstrapExpression {
+    val members = context.members
+    val bound = context.bound
+    val globals = context.globals
     val children: array<BootstrapExpression> = []
     var changed = false
     for (child in expression.children) {
-        val rewritten = bootstrapReceiverRewrite(child, members, bound, globals)
+        val rewritten = bootstrapReceiverRewrite(child, context)
         if (rewritten != child) changed = true
         children.append(rewritten)
     }
@@ -213,7 +289,7 @@ fun bootstrapReceiverRewrite(
         // scalar conversion's name (`u32(x)`) always means the conversion: a
         // member of that name is called as `this.u32(...)`.
         if (expression.kind == "call" && !bootstrapReceiverIsConversion(name) &&
-            (bootstrapReceiverTakes(members, expression, children) ||
+            (bootstrapReceiverTakes(context, expression, children) ||
              (bootstrapReceiverNameIn(members.methods, name) &&
               !bootstrapReceiverGlobalCallable(globals, name)))) {
             val arguments: array<BootstrapExpression> = [bootstrapReceiverThis(expression)]
@@ -242,20 +318,29 @@ fun bootstrapReceiverRewrite(
 fun bootstrapReceiverRewriteBody(
     declaration: BootstrapDeclaration,
     members: BootstrapReceiverMembers,
-    globals: array<string>
+    globals: array<string>,
+    owner: string,
+    world: BootstrapExpectedWorld,
+    callees: BootstrapExpectedCallees
 ): BootstrapDeclaration {
     var bound: array<string> = []
     for (parameter in declaration.parameters) bound.append(parameter)
     bootstrapReceiverBoundNames(declaration.expression, bound)
+    val scope = bootstrapExpectedBodyScope(declaration, owner, world.classes, world.globals)
     bootstrapDeclarationWithExpression(
         declaration,
-        bootstrapReceiverRewrite(declaration.expression, members, bound, globals)
+        bootstrapReceiverRewrite(
+            declaration.expression,
+            BootstrapReceiverContext(members, bound, globals, scope, callees)
+        )
     )
 }
 
 fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseResult {
     var index = bootstrapReceiverIndex(parsed.declarations)
     val globals = bootstrapReceiverGlobalNames(parsed.declarations)
+    val world = bootstrapExpectedWorld(parsed.declarations)
+    val callees = bootstrapExpectedCallees(parsed.declarations)
     val declarations: array<BootstrapDeclaration> = []
     var changed = false
     for (declaration in parsed.declarations) {
@@ -264,7 +349,7 @@ fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseR
             val members = index.of(declaration.name)
             val methods: array<BootstrapDeclaration> = []
             for (method in declaration.methods) {
-                methods.append(bootstrapReceiverRewriteBody(method, members, globals))
+                methods.append(bootstrapReceiverRewriteBody(method, members, globals, declaration.name, world, callees))
             }
             rewritten = bootstrapDeclarationWithMethods(declaration, methods)
             changed = true
@@ -273,7 +358,9 @@ fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseR
             declaration.extensionOwner != "") {
             val members = index.of(declaration.extensionOwner)
             if (members.methods.size > 0 || members.fields.size > 0) {
-                rewritten = bootstrapReceiverRewriteBody(declaration, members, globals)
+                rewritten = bootstrapReceiverRewriteBody(
+                    declaration, members, globals, declaration.extensionOwner, world, callees
+                )
                 changed = true
             }
         }

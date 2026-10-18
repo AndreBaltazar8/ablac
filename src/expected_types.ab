@@ -65,7 +65,8 @@ fun bootstrapExpectType(expression: BootstrapExpression, type: string): Bootstra
 class BootstrapExpectedCallees(
     val names: array<string>,
     val parameters: array<array<string>>,
-    val types: array<array<string>>
+    val types: array<array<string>>,
+    val results: array<string>
 ) {
     fun find(name: string): int {
         var index = 0
@@ -78,7 +79,7 @@ class BootstrapExpectedCallees(
 }
 
 fun bootstrapExpectedCallees(declarations: array<BootstrapDeclaration>): BootstrapExpectedCallees {
-    var callees = BootstrapExpectedCallees([], [], [])
+    var callees = BootstrapExpectedCallees([], [], [], [])
     val repeated: array<string> = []
     for (declaration in declarations) {
         val callable = ((declaration.kind == "fun" || declaration.kind == "compile.fun" ||
@@ -90,6 +91,9 @@ fun bootstrapExpectedCallees(declarations: array<BootstrapDeclaration>): Bootstr
                 callees.names.append(declaration.name)
                 callees.parameters.append(declaration.parameters)
                 callees.types.append(declaration.parameterTypes)
+                callees.results.append(
+                    if (declaration.kind == "class") declaration.name else declaration.resultType
+                )
             }
         }
     }
@@ -346,17 +350,7 @@ fun bootstrapExpectTypesBody(
     classes: BootstrapExpectedClasses,
     globals: BootstrapExpectedNames
 ): BootstrapDeclaration {
-    var locals = BootstrapExpectedNames([], [])
-    var parameter = 0
-    while (parameter < declaration.parameters.size) {
-        locals.add(
-            declaration.parameters[parameter],
-            if (parameter < declaration.parameterTypes.size) "${declaration.parameterTypes[parameter]}" else ""
-        )
-        parameter = parameter + 1
-    }
-    bootstrapExpectedLocals(declaration.expression, locals)
-    val scope = BootstrapExpectedScope(locals, owner, classes, globals)
+    val scope = bootstrapExpectedBodyScope(declaration, owner, classes, globals)
     val function = declaration.kind == "fun" || declaration.kind == "compile.fun"
     val result = if (function) declaration.resultType else ""
     var body = bootstrapExpectTypesIn(declaration.expression, callees, scope, result)
@@ -369,11 +363,36 @@ fun bootstrapExpectTypesBody(
     bootstrapDeclarationWithExpression(declaration, body)
 }
 
-fun bootstrapResolveExpectedTypes(parsed: BootstrapParseResult): BootstrapParseResult {
-    val callees = bootstrapExpectedCallees(parsed.declarations)
+/** What a body's names are declared as (see BootstrapExpectedScope). */
+fun bootstrapExpectedBodyScope(
+    declaration: BootstrapDeclaration,
+    owner: string,
+    classes: BootstrapExpectedClasses,
+    globals: BootstrapExpectedNames
+): BootstrapExpectedScope {
+    var locals = BootstrapExpectedNames([], [])
+    var parameter = 0
+    while (parameter < declaration.parameters.size) {
+        locals.add(
+            declaration.parameters[parameter],
+            if (parameter < declaration.parameterTypes.size) "${declaration.parameterTypes[parameter]}" else ""
+        )
+        parameter = parameter + 1
+    }
+    bootstrapExpectedLocals(declaration.expression, locals)
+    BootstrapExpectedScope(locals, owner, classes, globals)
+}
+
+/** The classes' declared fields and the top-level values' declared types. */
+class BootstrapExpectedWorld(
+    val classes: BootstrapExpectedClasses,
+    val globals: BootstrapExpectedNames
+)
+
+fun bootstrapExpectedWorld(declarations: array<BootstrapDeclaration>): BootstrapExpectedWorld {
     var classes = BootstrapExpectedClasses([], [])
     var globals = BootstrapExpectedNames([], [])
-    for (declaration in parsed.declarations) {
+    for (declaration in declarations) {
         if (declaration.kind == "class" && classes.find(declaration.name) < 0) {
             var fields = BootstrapExpectedNames([], [])
             var parameter = 0
@@ -393,6 +412,38 @@ fun bootstrapResolveExpectedTypes(parsed: BootstrapParseResult): BootstrapParseR
             globals.add(declaration.name, "${declaration.resultType}")
         }
     }
+    BootstrapExpectedWorld(classes, globals)
+}
+
+/** The type the syntax shows for `expression`, or "": a literal's, a declared
+ *  name's or field's (bootstrapExpectedTypeOf), a constructor's class, a
+ *  top-level function's declared result. */
+fun bootstrapExpectedValueType(
+    expression: BootstrapExpression,
+    scope: BootstrapExpectedScope,
+    callees: BootstrapExpectedCallees
+): string {
+    val kind = expression.kind
+    if (kind == "integer") return "int"
+    if (kind == "float") return "f64"
+    if (kind == "string" || kind == "string.template") return "string"
+    if (kind == "true" || kind == "false") return "bool"
+    if (kind == "null") return "null"
+    if (kind == "array" && expression.text != "") return "${expression.text}"
+    if (kind == "call") {
+        if (scope.locals.find(expression.text) >= 0) return ""
+        val callee = callees.find(expression.text)
+        if (callee >= 0) return "${callees.results[callee]}"
+        return ""
+    }
+    bootstrapExpectedTypeOf(expression, scope)
+}
+
+fun bootstrapResolveExpectedTypes(parsed: BootstrapParseResult): BootstrapParseResult {
+    val callees = bootstrapExpectedCallees(parsed.declarations)
+    val world = bootstrapExpectedWorld(parsed.declarations)
+    val classes = world.classes
+    val globals = world.globals
     val declarations: array<BootstrapDeclaration> = []
     var changed = false
     for (declaration in parsed.declarations) {

@@ -34,4 +34,11 @@ fi
 grep -q 'method.arity:Counter.reset' "$output_directory/method-arity.log" ||
     { echo "field shadowing: method-arity not reported against the method" >&2
       cat "$output_directory/method-arity.log" >&2; exit 1; }
+if "$compiler" build "$project_root/tests/cases/field-shadowing/method-argument.ab" \
+    -o "$output_directory/method-argument" --no-cache >"$output_directory/method-argument.log" 2>&1; then
+    echo "field shadowing: method-argument built" >&2; exit 1
+fi
+grep -q 'method.argument:Counter.reset' "$output_directory/method-argument.log" ||
+    { echo "field shadowing: method-argument not reported against the method" >&2
+      cat "$output_directory/method-argument.log" >&2; exit 1; }
 echo "field shadowing: fields shadow same-named globals across modules; calls take the first applicable level"
