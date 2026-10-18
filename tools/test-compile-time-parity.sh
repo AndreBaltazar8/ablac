@@ -28,7 +28,8 @@
 # Status: pass | mismatch | compile-failed | runtime-skipped (the program itself
 # doesn't build here or doesn't finish) | timeout | interp-threads (a timeout
 # under the interpreter in a program that starts a thread: its body runs only
-# when awaited, docs/compile-time.md#threads-at-compile-time).
+# when awaited, docs/compile-time.md#threads-at-compile-time) | interp-memory
+# (the program measures or resets its heap, which the interpreter doesn't have).
 set -uo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -176,6 +177,12 @@ run_case() { # kind name source mode
                 status=compile-failed
                 detail=$(first_error "$dir/staged.err")
                 [[ -n $detail ]] || detail=$(tail -n1 "$dir/staged.err" | cut -c1-200)
+                # The runtime memory API has no heap to measure in the
+                # interpreter (docs/compile-time.md).
+                if [[ $mode == interp ]] &&
+                    grep -q '^error\[E_EVAL_MEMORY_UNAVAILABLE\]' "$dir/staged.err"; then
+                    status=interp-memory
+                fi
                 ;;
             *)
                 if cmp -s "$dir/runtime.out" "$dir/staged.out"; then
@@ -212,7 +219,7 @@ find "$output/cases" -name result.tsv -exec cat {} + | sort >"$output/results.ts
 echo
 for mode in $modes; do
     printf '%s:' "$mode"
-    for status in pass mismatch compile-failed timeout interp-threads runtime-skipped; do
+    for status in pass mismatch compile-failed timeout interp-threads interp-memory runtime-skipped; do
         printf ' %s %d' "$status" \
             "$(awk -F'\t' -v m="$mode" -v s="$status" '$2 == m && $3 == s' \
                 "$output/results.tsv" | wc -l | tr -d ' ')"

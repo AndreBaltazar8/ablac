@@ -552,7 +552,8 @@ on the coming JIT tier it recurses as deep as at run time, and the `auto`
 mode moves an evaluation that hits the depth limit onto the JIT.
 
 Memory introspection (`memoryLiveBytes`, `memoryCollect`, ...) has no
-meaning inside the compiler, and is not available at compile time.
+meaning inside the compiler, and is not available at compile time: each
+function used is one `E_EVAL_MEMORY_UNAVAILABLE` error.
 
 ### Threads at compile time
 
