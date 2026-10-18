@@ -100,8 +100,9 @@ build_and_run() { # dir tag entry mode
     )
     status=$?
     if [[ $status -ne 0 ]]; then
-        echo "build $status" >"$tag.status"
-        mv "$tag.status" "$dir/" 2>/dev/null
+        # Straight into the case's directory: cases build in parallel, and a
+        # status written beside the harness could be taken by another case.
+        echo "build $status" >"$dir/$tag.status"
         return
     fi
     (
