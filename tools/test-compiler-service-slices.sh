@@ -40,6 +40,18 @@ grep -q 'function.result:answer:i64:string' \
 grep -q 'compile.value-runtime:compiler' \
     "$output_directory/invalid-runtime.err"
 
+# A module's export names (its ABI), one per line.
+wasm_exports() {
+    node -e 'const { readFileSync } = require("node:fs");
+for (const entry of WebAssembly.Module.exports(new WebAssembly.Module(readFileSync(process.argv[1])))) console.log(entry.name);' "$1"
+}
+
+# Whether the module has a function named `$2` (an extended regex) at all: its
+# name section names functions `<module>.<function>`.
+wasm_has_function() {
+    llvm-readobj --symbols "$1" | grep -Eq "Name: ([^ ]*\.)?($2)\$"
+}
+
 build_slice() {
     "$compiler" build \
         "$project_root/tests/cases/program-build/artifact-slice-root.ab" \
@@ -60,10 +72,10 @@ second_identity=$(sha256sum "$module" | cut -d' ' -f1)
 
 "$output_directory/server"
 llvm-readobj --file-headers "$module" | grep -q 'Format: WASM'
-llvm-readobj --symbols "$module" | grep -q 'Name: abla_client_answer'
-llvm-readobj --symbols "$module" | grep -q 'Name: abla_client_double'
-if llvm-readobj --symbols "$module" | \
-    grep -Eq 'Name: (unselectedClient|serverAnswer)'; then
+wasm_exports "$module" | grep -qx 'abla_client_answer'
+wasm_exports "$module" | grep -qx 'abla_client_double'
+if wasm_exports "$module" | grep -Eqx '(unselectedClient|serverAnswer)' ||
+    wasm_has_function "$module" 'unselectedClient|serverAnswer'; then
     echo "unselected function escaped the artifact slice ABI" >&2
     exit 1
 fi
@@ -89,10 +101,12 @@ build_stateful_slice
 stateful_second_identity=$(sha256sum "$stateful_module" | cut -d' ' -f1)
 [[ $stateful_first_identity == "$stateful_second_identity" ]] || exit 1
 
-llvm-readobj --symbols "$stateful_module" | grep -q 'Name: client_increment'
-llvm-readobj --symbols "$stateful_module" | grep -q 'Name: client_double'
-if llvm-readobj --symbols "$stateful_module" | \
-    grep -Eq 'Name: (unselectedStatefulClient|invalidStatefulClient|serverAction|serverSessions|serverAction)'; then
+wasm_exports "$stateful_module" | grep -qx 'client_increment'
+wasm_exports "$stateful_module" | grep -qx 'client_double'
+if wasm_exports "$stateful_module" |
+        grep -Eqx '(unselectedStatefulClient|invalidStatefulClient|serverAction|serverSessions)' ||
+    wasm_has_function "$stateful_module" \
+        'unselectedStatefulClient|invalidStatefulClient|serverAction|serverSessions'; then
     echo "unselected/unrelated declaration escaped the stateful artifact slice ABI" >&2
     exit 1
 fi
