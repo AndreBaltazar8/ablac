@@ -30,9 +30,9 @@ driver_status=$?
 set -e
 [[ $driver_status -eq 37 ]] || exit 1
 
-llvm-readelf -h "$library" | grep -q 'AArch64'
-llvm-readelf -h "$library" | grep -q 'DYN (Shared object file)'
-llvm-nm -D --defined-only "$library" | grep -q ' abla_app_answer$'
+grep -q 'AArch64' <<<"$(llvm-readelf -h "$library")"
+grep -q 'DYN (Shared object file)' <<<"$(llvm-readelf -h "$library")"
+grep -q ' abla_app_answer$' <<<"$(llvm-nm -D --defined-only "$library")"
 grep -q '"schema":"abla.abi.v1"' "$abi_manifest"
 grep -q '"name":"android-arm64"' "$abi_manifest"
 grep -q '"symbol":"abla_app_answer"' "$abi_manifest"

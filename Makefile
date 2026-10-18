@@ -225,6 +225,8 @@ test: ablac
 	tools/test-unsafe-boundary.sh $(COMPILER)
 	tools/test-wasm-gc.sh $(COMPILER)
 	tools/test-repl.sh $(COMPILER)
+	tools/test-android-extension.sh $(COMPILER)
+	tools/test-android-rpc-example.sh $(COMPILER)
 
 check: test self-rebuild
 

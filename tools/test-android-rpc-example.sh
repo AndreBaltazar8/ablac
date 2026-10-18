@@ -20,8 +20,8 @@ invalid_output="$output_directory/invalid-click"
     -o "$server" --fast --no-cache
 
 [[ -x $server && -s $library && -s $action_manifest ]] || exit 1
-llvm-readelf -h "$library" | grep -q 'AArch64'
-if llvm-nm --defined-only "$library" | grep -q 'incrementCounter'; then
+grep -q 'AArch64' <<<"$(llvm-readelf -h "$library")"
+if grep -q 'incrementCounter' <<<"$(llvm-nm --defined-only "$library")"; then
     echo "server action leaked into the Android native slice" >&2
     exit 1
 fi
@@ -61,12 +61,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The server takes a moment to listen: retry for up to five seconds.
 first_response=""
-for _ in 1 2 3 4 5; do
+for _ in $(seq 1 50); do
     if first_response=$(curl --fail --silent --request POST \
         "http://127.0.0.1:18080/rpc/$action?current=40"); then
         break
     fi
+    sleep 0.1
 done
 [[ $first_response == 41 ]] || exit 1
 second_response=$(curl --fail --silent --request POST \
