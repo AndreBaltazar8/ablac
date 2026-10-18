@@ -29,7 +29,9 @@
 # doesn't build here or doesn't finish) | timeout | interp-threads (a timeout
 # under the interpreter in a program that starts a thread: its body runs only
 # when awaited, docs/compile-time.md#threads-at-compile-time) | interp-memory
-# (the program measures or resets its heap, which the interpreter doesn't have).
+# (the program measures or resets its heap, which the interpreter doesn't have) |
+# host-dependent (listed below: the outputs match, but on a failure the host
+# causes).
 set -uo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -103,6 +105,15 @@ build_and_run() { # dir tag entry mode
         echo "exit $?" >"$tag.status"
         cat "$tag.compiler.out" "$tag.program.out" "$tag.status" >"$tag.out"
     )
+}
+
+# Cases whose run here depends on the host, so matching outputs are both sides
+# agreeing on a failure, not parity.
+host_dependent='module/hosted-network	the ::1 TCP listener and UDP poller fail natively on macOS
+module/http-client	its client expects a server on 127.0.0.1:39092 (tools/test-http-client.sh starts one)'
+
+host_dependent_reason() { # name
+    awk -F'\t' -v n="$1" '$1 == n { print $2 }' <<<"$host_dependent"
 }
 
 run_case() { # kind name source mode
@@ -185,7 +196,11 @@ run_case() { # kind name source mode
                 fi
                 ;;
             *)
-                if cmp -s "$dir/runtime.out" "$dir/staged.out"; then
+                if cmp -s "$dir/runtime.out" "$dir/staged.out" &&
+                    [[ -n $(host_dependent_reason "$name") ]]; then
+                    status=host-dependent
+                    detail=$(host_dependent_reason "$name")
+                elif cmp -s "$dir/runtime.out" "$dir/staged.out"; then
                     status=pass
                     detail="${granted:-}"
                 else
@@ -204,8 +219,8 @@ run_case() { # kind name source mode
     printf '%s\t%s\t%s\t%s\n' "$name" "$mode" "$status" "$detail" >"$dir/result.tsv"
     printf '%-14s %-8s %s %s\n' "$status" "$mode" "$name" "${detail:0:120}"
 }
-export -f run_case build_and_run first_error limited
-export output compiler seconds project_root
+export -f run_case build_and_run first_error limited host_dependent_reason
+export output compiler seconds project_root host_dependent
 
 for mode in $modes; do
     list_cases | while read -r kind name source; do
@@ -219,7 +234,7 @@ find "$output/cases" -name result.tsv -exec cat {} + | sort >"$output/results.ts
 echo
 for mode in $modes; do
     printf '%s:' "$mode"
-    for status in pass mismatch compile-failed timeout interp-threads interp-memory runtime-skipped; do
+    for status in pass mismatch compile-failed timeout interp-threads interp-memory host-dependent runtime-skipped; do
         printf ' %s %d' "$status" \
             "$(awk -F'\t' -v m="$mode" -v s="$status" '$2 == m && $3 == s' \
                 "$output/results.tsv" | wc -l | tr -d ' ')"
