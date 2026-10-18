@@ -718,6 +718,10 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     }
     bootstrapCtFreeAddress = bootstrapCtLookup("abla_ct_free_$generation")
     bootstrapCtGuardAddress = bootstrapCtLookup("abla_ct_guard_$generation")
+    if (bootstrapCtPanicCaught) {
+        bootstrapCtPanicTextAddress = bootstrapCtLookup("abla_ct_panic_text_$generation")
+        bootstrapCtPanicSizeAddress = bootstrapCtLookup("abla_ct_panic_size_$generation")
+    }
     bootstrapCtGenerationSpent = ""
     if (bootstrapCtFreeAddress == 0 || bootstrapCtGuardAddress == 0) {
         bootstrapCtFailReady("the slice's support entries are missing")
@@ -743,10 +747,10 @@ fun bootstrapCtLookup(symbol: string): int {
 
 // --- the guard: a fatal stop in compile-time code returns to the compiler ------------
 
-// A runtime panic writes its message and then calls `abort`; so does an exhausted
-// memory limit. In the slice every `abort` becomes a jump back to the entry's guard
-// (`_setjmp`/`_longjmp`, no signal mask), so the compiler reports the failure and
-// goes on. The generation is spent afterwards: frames the jump skipped never popped
+// A failed check traps, `abort` aborts, and a runtime panic prints its message and
+// exits (bootstrapCtCatchPanic). In the slice each of them becomes a jump back to
+// the entry's guard (`_setjmp`/`_longjmp`, no signal mask), so the compiler reports
+// the failure and goes on. The generation is spent afterwards: frames the jump skipped never popped
 // their collector roots, so no later entry may run on it.
 fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool {
     val builder = LLVMCreateBuilderInContext(context)
@@ -830,6 +834,8 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
         LLVMBuildCall2(builder, abortType, abort, nativeNullPointer(), 0, "")
         LLVMBuildUnreachable(builder)
     }
+    bootstrapCtPanicCaught =
+        bootstrapCtCatchPanic(context, module, builder, generation, jump, armed, longjmpType, longjmp)
     // i64 abla_ct_guard_<g>(ptr entry): the entry's reply, or 0 after a stop.
     val guardType = LLVMFunctionType(i64Type, oneParameter.pointer(), 1, 0)
     val guard = LLVMAddFunction(module, "abla_ct_guard_$generation", guardType)
@@ -865,6 +871,84 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     true
 }
 
+// A runtime panic (an index out of bounds, a division by zero, ...) prints
+// "panic: <message>" and exits with status 101. In the slice it stops the same way
+// as `abort`, and its message is kept for the diagnostic: the panic's body, the one
+// call in abla_platform_panic, takes the message's address and size, which the
+// catcher copies (up to 1 KiB) into abla_ct_panic_text_<g> / abla_ct_panic_size_<g>.
+fun bootstrapCtCatchPanic(
+    context: i64*,
+    module: i64*,
+    builder: i64*,
+    generation: int,
+    jump: i64*,
+    armed: i64*,
+    longjmpType: i64*,
+    longjmp: i64*
+): bool {
+    val platformPanic = LLVMGetNamedFunction(module, "abla_platform_panic")
+    if (pointerIsNull(platformPanic)) return false
+    val i1 = LLVMInt1TypeInContext(context)
+    val i32Type = LLVMInt32TypeInContext(context)
+    val i64Type = LLVMInt64TypeInContext(context)
+    val pointer = LLVMPointerTypeInContext(context, 0)
+    var body = nativeNullPointer()
+    var instruction = LLVMGetFirstInstruction(LLVMGetEntryBasicBlock(platformPanic))
+    while (!pointerIsNull(instruction) && pointerIsNull(body)) {
+        if (!pointerIsNull(LLVMIsACallInst(instruction))) {
+            val callee = LLVMGetCalledValue(instruction)
+            if (LLVMCountParams(callee) == 2 &&
+                bootstrapCtIsI64(LLVMTypeOf(LLVMGetParam(callee, 0))) &&
+                bootstrapCtIsI64(LLVMTypeOf(LLVMGetParam(callee, 1)))) body = callee
+        }
+        instruction = LLVMGetNextInstruction(instruction)
+    }
+    if (pointerIsNull(body)) return false
+    val textType = LLVMArrayType2(LLVMInt8TypeInContext(context), 1024)
+    val text = LLVMAddGlobal(module, textType, "abla_ct_panic_text_$generation")
+    LLVMSetInitializer(text, LLVMConstNull(textType))
+    val size = LLVMAddGlobal(module, i64Type, "abla_ct_panic_size_$generation")
+    LLVMSetInitializer(size, LLVMConstInt(i64Type, 0, 0))
+    val bodyType = LLVMGlobalGetValueType(body)
+    val catcher = LLVMAddFunction(module, "abla.ct.panic", bodyType)
+    LLVMSetLinkage(catcher, llvmInternalLinkage())
+    LLVMReplaceAllUsesWith(body, catcher)
+    val entry = LLVMAppendBasicBlockInContext(context, catcher, "entry")
+    val back = LLVMAppendBasicBlockInContext(context, catcher, "back")
+    val stop = LLVMAppendBasicBlockInContext(context, catcher, "stop")
+    LLVMPositionBuilderAtEnd(builder, entry)
+    val isArmed = LLVMBuildLoad2(builder, i1, armed, "armed")
+    LLVMBuildCondBr(builder, isArmed, back, stop)
+    LLVMPositionBuilderAtEnd(builder, back)
+    val limit = LLVMConstInt(i64Type, 1024, 0)
+    val length = LLVMGetParam(catcher, 1)
+    val over = LLVMBuildICmp(builder, llvmIntUnsignedGreaterThan(), length, limit, "over")
+    val kept = LLVMBuildSelect(builder, over, limit, length, "kept")
+    val source = LLVMBuildIntToPtr(builder, LLVMGetParam(catcher, 0), pointer, "message")
+    LLVMBuildMemCpy(builder, text, 1, source, 1, kept)
+    LLVMBuildStore(builder, kept, size)
+    val jumpArguments = llvmPointerVector(2)
+    jumpArguments.set(0, jump)
+    jumpArguments.set(1, LLVMConstInt(i32Type, 3, 0))
+    LLVMBuildCall2(builder, longjmpType, longjmp, jumpArguments.pointer(), 2, "")
+    jumpArguments.drop()
+    LLVMBuildUnreachable(builder)
+    LLVMPositionBuilderAtEnd(builder, stop)
+    val arguments = llvmPointerVector(2)
+    arguments.set(0, LLVMGetParam(catcher, 0))
+    arguments.set(1, length)
+    val result = LLVMBuildCall2(builder, bodyType, body, arguments.pointer(), 2, "result")
+    arguments.drop()
+    LLVMBuildRet(builder, result)
+    true
+}
+
+// Whether this generation's slice has the panic catcher (its message buffers).
+var bootstrapCtPanicCaught: bool = false
+
+fun bootstrapCtIsI64(type: i64*): bool =
+    LLVMGetTypeKind(type) == 8 && LLVMGetIntTypeWidth(type) == 64
+
 // A compile pass is over: its generation's code and memory go.
 fun bootstrapCtFinishPass(): void {
     if (bootstrapCtGenerationLive) {
@@ -873,6 +957,8 @@ fun bootstrapCtFinishPass(): void {
     }
     bootstrapCtFreeAddress = 0
     bootstrapCtGuardAddress = 0
+    bootstrapCtPanicTextAddress = 0
+    bootstrapCtPanicSizeAddress = 0
     bootstrapCtSites = []
     bootstrapCtGlobals = []
     return

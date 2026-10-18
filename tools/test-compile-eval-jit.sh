@@ -69,14 +69,28 @@ ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build "$cases/stop.a
     -o "$output_directory/stop-jit" --no-cache 2> "$output_directory/stop-jit.trace"
 status=$?
 set -e
-if [[ $status -eq 0 || $status -ge 128 ]]; then
+if [[ $status -eq 0 || $status -ge 101 ]]; then
     echo "compile-eval-jit: stop.ab compiled with status $status" >&2
     cat "$output_directory/stop-jit.trace" >&2
     exit 1
 fi
-grep -q 'error\[E_CT_STOPPED\]: compile-time evaluation at .*stop.ab:[0-9]* stopped' \
+grep -q 'error\[E_CT_STOPPED\]: compile-time evaluation at .*stop.ab:[0-9]* stopped: panic: index 5 out of bounds for array of size 2' \
     "$output_directory/stop-jit.trace"
 grep -q 'interpreted at .*: an earlier compile-time evaluation of this pass stopped' \
     "$output_directory/stop-jit.trace"
+
+# A division by zero is a runtime panic: it stops the same way, with its message.
+set +e
+ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build "$cases/stop-divide.ab" \
+    -o "$output_directory/stop-divide-jit" --no-cache 2> "$output_directory/stop-divide-jit.trace"
+status=$?
+set -e
+if [[ $status -eq 0 || $status -ge 101 ]]; then
+    echo "compile-eval-jit: stop-divide.ab compiled with status $status" >&2
+    cat "$output_directory/stop-divide-jit.trace" >&2
+    exit 1
+fi
+grep -q 'error\[E_CT_STOPPED\]: compile-time evaluation at .*stop-divide.ab:[0-9]* stopped: panic: division by zero' \
+    "$output_directory/stop-divide-jit.trace"
 
 echo "compile-eval-jit: native compile-time sites agree with the interpreter"
