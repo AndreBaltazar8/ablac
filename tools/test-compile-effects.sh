@@ -51,6 +51,18 @@ grep -q 'compile.effect-denied:environment:readBuildEnvironment->compilerEnviron
 set +e
 ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
+    "$project_root/tests/cases/bootstrap/invalid-compile-effect-extension.ab" \
+    > "$output_directory/extension-denied.ll" \
+    2> "$output_directory/extension-denied.err"
+extension_denied_status=$?
+set -e
+[[ $extension_denied_status -ne 0 ]] || exit 1
+grep -q 'compile.effect-denied:filesystem.read:measureInputs->Path.inputSize->Path.info' \
+    "$output_directory/extension-denied.err"
+
+set +e
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+    "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/invalid-compile-effect-clock.ab" \
     > "$output_directory/clock-denied.ll" \
     2> "$output_directory/clock-denied.err"
