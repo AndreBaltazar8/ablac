@@ -32,6 +32,7 @@ for mode in interp jit; do
     run_case "$mode" globals-stale 42
     run_case "$mode" globals-exchange 42
     run_case "$mode" codec 42
+    run_case "$mode" reach 42
     run_case "$mode" delegates 42
 done
 
@@ -170,6 +171,19 @@ if [[ $outer -ne 42 || $inner -ne 42 ]]; then
     exit 1
 fi
 grep -q '^note\[ct-jit\]: native at .*outer.ab' "$output_directory/twice-jit.trace"
+
+# The site reading `base` (whose initializer is compile-time code) is interpreted; the
+# other four (`base`'s own, the global function call, the moved scalar, the f32
+# template) stay native.
+native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/reach-jit.trace" || true)
+interpreted=$(grep -c 'interpreted at' "$output_directory/reach-jit.trace" || true)
+if [[ $native -ne 4 || $interpreted -ne 1 ]] ||
+    ! grep -q 'interpreted at .*: reaches global base, whose initializer is compile-time code' \
+        "$output_directory/reach-jit.trace"; then
+    echo "compile-eval-jit: reach.ab: $native native, $interpreted interpreted, expected 4 and 1" >&2
+    cat "$output_directory/reach-jit.trace" >&2
+    exit 1
+fi
 
 # A granted program (abla/json registers subparsers) stays native.
 mkdir -p "$output_directory/granted"

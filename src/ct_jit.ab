@@ -245,15 +245,25 @@ class BootstrapCtReach(
                 node.kind == "float" || node.kind == "char"
             if (!literal && node.text != "") {
                 var item = this.table.find(node.text, -1)
+                // A call names a value (a global holding a function) when no function
+                // or other declaration has that name.
+                var callsValue = node.kind == "call"
+                var other = item
+                while (callsValue && other >= 0) {
+                    if (this.itemMethods[other] < 0 && !bootstrapDeclarationIsValue(
+                        this.declarations[this.itemDeclarations[other]].kind
+                    )) callsValue = false
+                    other = this.itemNext[other]
+                }
                 while (reason == "" && item >= 0) {
                     val owner = this.declarations[this.itemDeclarations[item]]
-                    // A value is named by an identifier or an assignment; a call or a
-                    // member of that name is something else.
+                    // A value is named by an identifier or an assignment (or a call
+                    // nothing else answers); a member of that name is something else.
                     val valueItem = this.itemMethods[item] < 0 &&
                         bootstrapDeclarationIsValue(owner.kind)
                     val ownerLibrary = bootstrapCtLibraryDeclaration(owner)
                     val names = !valueItem ||
-                        ((node.kind == "identifier" || node.kind == "assign") &&
+                        ((node.kind == "identifier" || node.kind == "assign" || callsValue) &&
                          (!library || ownerLibrary))
                     if (names && !this.visited[item]) {
                         this.visited[item] = true
@@ -678,11 +688,13 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
             for (method in declaration.methods) reach.keepFrom(method.expression)
         }
     }
-    // A float in a string template is written by abla/float/text's f64Text, which
-    // no site names: kept when the program has it, so such templates type-check.
+    // A float in a string template is written by abla/float/text's f64Text (an f32
+    // widened by abla/float's f32ToF64 first), which no site names: kept when the
+    // program has them, so such templates type-check and lower.
     for (declaration in parsed.declarations) {
-        if (declaration.name == "f64Text" && declaration.kind == "fun") {
-            reach.keepFrom(BootstrapExpression("call", "f64Text", 0, 0, []))
+        if ((declaration.name == "f64Text" || declaration.name == "f32ToF64") &&
+            declaration.kind == "fun") {
+            reach.keepFrom(BootstrapExpression("call", declaration.name, 0, 0, []))
         }
     }
     // The slice's analysis sees the program's top-level grants (they decide what its
@@ -702,8 +714,20 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
         }
         if (site.reason == "") {
             reach.reset()
+            // A site the tier can't take adds nothing to the slice: what its walk
+            // kept before the reason was found (code naming what the slice won't
+            // carry) would fail the slice's analysis for every other site.
+            val keptBefore: array<bool> = []
+            for (kept in reach.kept) keptBefore.append(kept)
             val reached: array<int> = []
             site.reason = reach.unsupported(site.expression, reached)
+            if (site.reason != "") {
+                var restored = 0
+                while (restored < keptBefore.size) {
+                    reach.kept[restored] = keptBefore[restored]
+                    restored = restored + 1
+                }
+            }
             if (site.reason == "") {
                 for (global in reached) {
                     var known = false
