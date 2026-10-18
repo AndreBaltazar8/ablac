@@ -70,35 +70,51 @@ native=$(grep -c '^note\[ct-jit\]: native at' "$output_directory/globals-jit.tra
 grep -q 'interpreted at .*: compile global .*counter changed in an interpreted evaluation' \
     "$output_directory/globals-jit.trace"
 
-# A runtime stop in native compile-time code is a diagnostic; the compiler survives
-# it (an error status, not a signal) and interprets the sites after it.
-set +e
-ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build "$cases/stop.ab" \
-    -o "$output_directory/stop-jit" --no-cache 2> "$output_directory/stop-jit.trace"
-status=$?
-set -e
-if [[ $status -eq 0 || $status -ge 101 ]]; then
-    echo "compile-eval-jit: stop.ab compiled with status $status" >&2
-    cat "$output_directory/stop-jit.trace" >&2
-    exit 1
-fi
-grep -q 'error\[E_CT_STOPPED\]: compile-time evaluation at .*stop.ab:[0-9]* stopped: panic: index 5 out of bounds for array of size 2' \
+# A native compile-time code that stops is a diagnostic; the compiler survives it (an
+# error status, not a signal or a panic's 101). Each case: name, mode, environment.
+stop_case() { # name mode [VAR=value...]
+    local name=$1 mode=$2 status
+    shift 2
+    set +e
+    env "$@" ABLA_COMPILE_EVAL=$mode ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build \
+        "$cases/$name.ab" -o "$output_directory/$name-$mode" --no-cache \
+        2> "$output_directory/$name-$mode.trace"
+    status=$?
+    set -e
+    if [[ $status -eq 0 || $status -ge 101 ]]; then
+        echo "compile-eval-jit: $name.ab under $mode compiled with status $status" >&2
+        cat "$output_directory/$name-$mode.trace" >&2
+        exit 1
+    fi
+}
+
+# A runtime panic is the interpreter's error, same code and text, at the site; the
+# sites after it are interpreted.
+for name in stop stop-divide; do
+    stop_case "$name" jit
+    stop_case "$name" interp
+    jit_error=$(grep -m1 '^error\[' "$output_directory/$name-jit.trace")
+    interp_error=$(grep -m1 '^error\[' "$output_directory/$name-interp.trace")
+    if [[ $jit_error != "$interp_error" ]]; then
+        echo "compile-eval-jit: $name.ab: native \"$jit_error\", interpreter \"$interp_error\"" >&2
+        exit 1
+    fi
+done
+grep -q '^error\[E_EVAL_OUT_OF_BOUNDS\]: index 5 out of bounds for array of size 2$' \
     "$output_directory/stop-jit.trace"
 grep -q 'interpreted at .*: an earlier compile-time evaluation of this pass stopped' \
     "$output_directory/stop-jit.trace"
-
-# A division by zero is a runtime panic: it stops the same way, with its message.
-set +e
-ABLA_COMPILE_EVAL=jit ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build "$cases/stop-divide.ab" \
-    -o "$output_directory/stop-divide-jit" --no-cache 2> "$output_directory/stop-divide-jit.trace"
-status=$?
-set -e
-if [[ $status -eq 0 || $status -ge 101 ]]; then
-    echo "compile-eval-jit: stop-divide.ab compiled with status $status" >&2
-    cat "$output_directory/stop-divide-jit.trace" >&2
-    exit 1
-fi
-grep -q 'error\[E_CT_STOPPED\]: compile-time evaluation at .*stop-divide.ab:[0-9]* stopped: panic: division by zero' \
+grep -q '^error\[E_EVAL_DIVISION_BY_ZERO\]: division by zero$' \
     "$output_directory/stop-divide-jit.trace"
+
+# An endless native evaluation stops at the time limit.
+stop_case endless jit ABLA_COMPILE_EVAL_TIME_LIMIT=1
+grep -q 'error\[E_CT_TIME_LIMIT\]: compile-time evaluation at .*endless.ab:[0-9]* ran past the time limit (1 s' \
+    "$output_directory/endless-jit.trace"
+
+# Recursion past the end of the stack in native code is a diagnostic too.
+stop_case deep jit
+grep -q 'error\[E_CT_STOPPED\]: compile-time evaluation at .*deep.ab:[0-9]* stopped: a bad memory access' \
+    "$output_directory/deep-jit.trace"
 
 echo "compile-eval-jit: native compile-time sites agree with the interpreter"

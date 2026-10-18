@@ -21,6 +21,11 @@ trusted noescape extern:"intrinsic" fun ablaUnsafeCallExact_I64_I64(
     address: int,
     argument: int
 ): int
+trusted noescape extern:"intrinsic" fun ablaUnsafeCallExact_I64_I64_I64(
+    address: int,
+    first: int,
+    second: int
+): int
 
 // A place the interpreter would evaluate: `expression` (the operand of a
 // `compile` node, or a top-level action), the node itself (actions: the action),
@@ -54,6 +59,11 @@ class BootstrapCtGlobal(
     var getter: int
 )
 
+// A guarded native call's result, or how it stopped: 1 an abort, 2 a failed runtime
+// check (trap), 3 the time limit, 4 a bad access (the stack ran past its end), 5 a
+// runtime panic (its message is in the generation's panic buffer).
+class BootstrapCtCallResult(val value: int, val how: int)
+
 class BootstrapCtOutcome(
     val taken: bool,
     val reason: string,
@@ -63,9 +73,12 @@ class BootstrapCtOutcome(
 var bootstrapCtModeValue: string = ""
 var bootstrapCtTraceValue: int = -1
 // The live generation's support entries (0: none) and why it takes no more calls
-// ("" while it does).
+// ("" while it does): its guard, free, and its SIGALRM (the time limit) and
+// SIGSEGV/SIGBUS (a stack run past its end) handlers.
 var bootstrapCtFreeAddress: int = 0
 var bootstrapCtGuardAddress: int = 0
+var bootstrapCtAlarmAddress: int = 0
+var bootstrapCtFaultAddress: int = 0
 // Where a caught runtime panic leaves its message (0: the slice has no panic catcher).
 var bootstrapCtPanicTextAddress: int = 0
 var bootstrapCtPanicSizeAddress: int = 0
@@ -112,13 +125,10 @@ fun bootstrapCtNote(message: string): void {
 fun bootstrapCtSiteLabel(site: BootstrapCtSite): string =
     "${if (site.sourceIdentity == "") "<root>" else site.sourceIdentity}:${site.node.begin}"
 
-// Why a native entry stopped: a runtime panic's message, else a failed check or an abort.
-trusted fun bootstrapCtStopReason(): string {
-    if (bootstrapCtPanicSizeAddress == 0 || bootstrapCtPanicTextAddress == 0) {
-        return "a runtime check failed or the code aborted"
-    }
+// A caught runtime panic's message ("" when the slice has no panic catcher).
+trusted fun bootstrapCtPanicMessage(): string {
+    if (bootstrapCtPanicSizeAddress == 0 || bootstrapCtPanicTextAddress == 0) return ""
     val size = ablaUnsafeLoadI64(nativePointerFromAddress(bootstrapCtPanicSizeAddress))
-    if (size <= 0) return "a runtime check failed or the code aborted"
     val text = nativePointerFromAddress(bootstrapCtPanicTextAddress)
     val bytes = byteBuffer()
     var index = 0
@@ -126,7 +136,45 @@ trusted fun bootstrapCtStopReason(): string {
         bytes.appendByteValue(ablaUnsafeLoadU8(ablaUnsafePointerOffset(text, index)))
         index = index + 1
     }
-    "panic: ${bytes.toText()}"
+    bytes.toText()
+}
+
+// A native call that stopped, reported as the interpreter reports the same failure:
+// a panic with its code and text (bootstrapEvalRuntimePanic), placed at the site.
+fun bootstrapCtReportStop(var evaluator: BootstrapEvaluator, site: BootstrapCtSite, how: int): void {
+    val label = bootstrapCtSiteLabel(site)
+    if (how == 5 && bootstrapCtPanicMessage() != "") {
+        val text = bootstrapCtPanicMessage()
+        val code = if (text == "division by zero") "E_EVAL_DIVISION_BY_ZERO"
+            else if (bootstrapTextContains(text, "out of bounds") ||
+                     bootstrapTextContains(text, "negative size")) "E_EVAL_OUT_OF_BOUNDS"
+            else "E_CT_PANIC"
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(code, text)
+        if (site.sourceIdentity != "") {
+            evaluator.diagnostics =
+                "${evaluator.diagnostics}source[eval]:${site.sourceIdentity}:${site.node.begin}:${site.node.end}\n"
+        }
+    } else if (how == 3) {
+        evaluator.recordEvaluatorDiagnostic(
+            "E_CT_TIME_LIMIT",
+            "compile-time evaluation at $label ran past the time limit (${bootstrapCtTimeLimitSeconds()} s; ABLA_COMPILE_EVAL_TIME_LIMIT)"
+        )
+        evaluator.errors = evaluator.errors + 1
+    } else if (how == 4) {
+        evaluator.recordEvaluatorDiagnostic(
+            "E_CT_STOPPED",
+            "compile-time evaluation at $label stopped: a bad memory access (recursion deeper than the compiler's stack?)"
+        )
+        evaluator.errors = evaluator.errors + 1
+    } else {
+        evaluator.recordEvaluatorDiagnostic(
+            "E_CT_STOPPED",
+            "compile-time evaluation at $label stopped: a runtime check failed or the code aborted"
+        )
+        evaluator.errors = evaluator.errors + 1
+    }
+    return
 }
 
 trusted fun bootstrapCtReadReply(address: int): string {
@@ -180,20 +228,15 @@ trusted fun bootstrapCtTryEvaluate(
     val enclosingLive = bootstrapCtCurrentLive
     bootstrapCtCurrent = evaluator
     bootstrapCtCurrentLive = true
-    val reply = ablaUnsafeCallExact_I64_I64(bootstrapCtGuardAddress, site.entry)
+    val called = bootstrapCtCall(site.entry)
     bootstrapCtCurrent = enclosing
     bootstrapCtCurrentLive = enclosingLive
+    val reply = called.value
     var value = bootstrapEvalInvalid()
     var syntax: array<BootstrapExpression> = []
     var memo: BootstrapLiftMemo? = null
-    if (reply == 0) {
-        bootstrapCtGenerationSpent =
-            "an earlier compile-time evaluation of this pass stopped"
-        evaluator.recordEvaluatorDiagnostic(
-            "E_CT_STOPPED",
-            "compile-time evaluation at ${bootstrapCtSiteLabel(site)} stopped: ${bootstrapCtStopReason()}"
-        )
-        evaluator.errors = evaluator.errors + 1
+    if (called.how != 0) {
+        bootstrapCtReportStop(evaluator, site, called.how)
     } else {
         val text = bootstrapCtReadReply(reply)
         ablaUnsafeCallExact_I64_I64(bootstrapCtFreeAddress, reply)
@@ -214,7 +257,7 @@ trusted fun bootstrapCtTryEvaluate(
             }
         }
     }
-    if (reply != 0) bootstrapCtExchangeGlobals(evaluator, site)
+    if (called.how == 0) bootstrapCtExchangeGlobals(evaluator, site)
     bootstrapCompileGlobalsKeep(
         evaluator.globalKeys, evaluator.globalValues,
         evaluator.syntax, evaluator.declarations
@@ -238,9 +281,10 @@ trusted fun bootstrapCtExchangeGlobals(var evaluator: BootstrapEvaluator, site: 
     while (index < bootstrapCtGlobals.size) {
         val global = bootstrapCtGlobals[index]
         // (A global no entry of the generation reaches has no getter.)
-        val reply = if (global.getter == 0) -1
-            else ablaUnsafeCallExact_I64_I64(bootstrapCtGuardAddress, global.getter)
-        if (reply == 0) {
+        val called = if (global.getter == 0) BootstrapCtCallResult(-1, 0)
+            else bootstrapCtCall(global.getter)
+        val reply = called.value
+        if (called.how != 0 || reply == 0) {
             bootstrapCtGenerationSpent = "compile global ${global.key} could not be read back"
             evaluator.recordEvaluatorDiagnostic(
                 "E_CT_JIT_RESULT",
@@ -333,4 +377,147 @@ fun bootstrapCtEvaluate(
         bootstrapCtNote("interpreted at ${expression.begin}: ${outcome.reason}")
     }
     bootstrapEvaluate(expression, declarations, source)
+}
+
+// Calls `entry` of the live generation under its guard, the time limit and the stack
+// fault handler. A stop spends the generation: frames the jump back skipped never
+// popped their collector roots, so nothing more may run on it.
+trusted fun bootstrapCtCall(entry: int): BootstrapCtCallResult {
+    // The guard writes how the call stopped here (0: it returned).
+    val stopped = nativeI64Cell(0)
+    val limit = bootstrapCtTimeLimitSeconds()
+    val timer = limit > 0 && bootstrapCtAlarmAddress != 0 &&
+        bootstrapCtArmAlarm(bootstrapCtAlarmAddress, limit)
+    val faults = bootstrapCtFaultAddress != 0 && bootstrapCtArmFaults(bootstrapCtFaultAddress)
+    val value = ablaUnsafeCallExact_I64_I64_I64(
+        bootstrapCtGuardAddress, entry, nativePointerAddress(stopped.address)
+    )
+    if (timer) bootstrapCtDisarmAlarm()
+    if (faults) bootstrapCtDisarmFaults()
+    val how = stopped.load()
+    val closed = stopped.close()
+    if (how != 0) {
+        bootstrapCtGenerationSpent = "an earlier compile-time evaluation of this pass stopped"
+    }
+    BootstrapCtCallResult(if (how != 0) 0 else value, how)
+}
+
+// --- the time limit -------------------------------------------------------------
+
+noescape extern:"c" fun sigaction(signal: i32, action: i64*, previous: i64*): i32
+noescape extern:"c" fun setitimer(which: i32, value: i64*, previous: i64*): i32
+noescape extern:"c" fun sigaltstack(stack: i64*, previous: i64*): i32
+
+// ABLA_COMPILE_EVAL_TIME_LIMIT: seconds one native evaluation may run (default 600;
+// 0: no limit). The interpreter's bound is its step limit; native code has no steps.
+var bootstrapCtTimeLimitValue: int = -1
+// Set with the session (ct_jit.ab): the signal structs' layouts differ by host.
+var bootstrapCtHostIsDarwin: bool = false
+
+fun bootstrapCtTimeLimitSeconds(): int {
+    if (bootstrapCtTimeLimitValue < 0) {
+        val configured = linuxEnvironment("ABLA_COMPILE_EVAL_TIME_LIMIT")
+        bootstrapCtTimeLimitValue = 600
+        if (configured.found && configured.value.size > 0 && configured.value.size <= 9) {
+            var parsed = 0
+            var valid = true
+            for (byte in configured.value) {
+                if (byte < 48 || byte > 57) valid = false
+                else parsed = parsed * 10 + byte - 48
+            }
+            if (valid) bootstrapCtTimeLimitValue = parsed
+        }
+    }
+    bootstrapCtTimeLimitValue
+}
+
+// A zeroed buffer of `size` bytes (a multiple of 8) the caller frees.
+trusted fun bootstrapCtZeroed(size: int): int {
+    val address = __ablaRuntimeAllocateLayout(size, 10)
+    var offset = 0
+    while (offset < size) {
+        ablaRuntimeStoreI64(address + offset, 0)
+        offset = offset + 8
+    }
+    address
+}
+
+// SIGALRM runs `handler` (SA_NODEFER, so the jump back leaves the signal unblocked)
+// after `seconds`. struct sigaction: Darwin {handler, mask u32, flags i32}; Linux
+// {handler, mask[128], flags i32, restorer}.
+trusted fun bootstrapCtArmAlarm(handler: int, seconds: int): bool {
+    val action = bootstrapCtZeroed(160)
+    ablaRuntimeStoreI64(action, handler)
+    if (bootstrapCtHostIsDarwin) ablaRuntimeStoreI64(action + 8, 16 * 4294967296)
+    else ablaRuntimeStoreI64(action + 136, 1073741824)
+    val installed = sigaction(14, ablaRuntimePointerFromAddress(action), nativeNullPointer()) == 0
+    __ablaRuntimeFree(action)
+    var armed = false
+    if (installed) {
+        val timer = bootstrapCtZeroed(32)
+        ablaRuntimeStoreI64(timer + 16, seconds)
+        armed = setitimer(0, ablaRuntimePointerFromAddress(timer), nativeNullPointer()) == 0
+        __ablaRuntimeFree(timer)
+    }
+    armed
+}
+
+trusted fun bootstrapCtDisarmAlarm(): void {
+    val timer = bootstrapCtZeroed(32)
+    val stopped = setitimer(0, ablaRuntimePointerFromAddress(timer), nativeNullPointer())
+    __ablaRuntimeFree(timer)
+    // Back to the default action, so no handler of a removed generation stays.
+    val action = bootstrapCtZeroed(160)
+    val restored = sigaction(14, ablaRuntimePointerFromAddress(action), nativeNullPointer())
+    __ablaRuntimeFree(action)
+    return
+}
+
+// --- a stack run past its end -------------------------------------------------------
+
+// The alternate signal stack the fault handler runs on (a fault from a stack run past
+// its end cannot run on that stack), set up once for the process, and the fault
+// signals' actions before a call, put back after it.
+var bootstrapCtSignalStack: int = 0
+var bootstrapCtSavedSegv: int = 0
+var bootstrapCtSavedBus: int = 0
+
+fun bootstrapCtBusSignal(): int = if (bootstrapCtHostIsDarwin) 10 else 7
+
+// SIGSEGV and SIGBUS run `handler` on the alternate stack until bootstrapCtDisarmFaults.
+// stack_t: Darwin {sp, size, flags i32}; Linux {sp, flags i32, size}. SA_ONSTACK:
+// Darwin 0x1, Linux 0x08000000; SA_NODEFER as for the alarm.
+trusted fun bootstrapCtArmFaults(handler: int): bool {
+    val darwin = bootstrapCtHostIsDarwin
+    if (bootstrapCtSignalStack == 0) {
+        val size = 262144
+        val memory = __ablaRuntimeAllocateLayout(size, 10)
+        val stack = bootstrapCtZeroed(32)
+        ablaRuntimeStoreI64(stack, memory)
+        if (darwin) ablaRuntimeStoreI64(stack + 8, size) else ablaRuntimeStoreI64(stack + 16, size)
+        if (sigaltstack(ablaRuntimePointerFromAddress(stack), nativeNullPointer()) == 0) {
+            bootstrapCtSignalStack = memory
+        }
+        __ablaRuntimeFree(stack)
+        if (bootstrapCtSignalStack == 0) return false
+    }
+    if (bootstrapCtSavedSegv == 0) bootstrapCtSavedSegv = bootstrapCtZeroed(160)
+    if (bootstrapCtSavedBus == 0) bootstrapCtSavedBus = bootstrapCtZeroed(160)
+    val action = bootstrapCtZeroed(160)
+    ablaRuntimeStoreI64(action, handler)
+    if (darwin) ablaRuntimeStoreI64(action + 8, 17 * 4294967296)
+    else ablaRuntimeStoreI64(action + 136, 1073741824 + 134217728)
+    val segv = sigaction(11, ablaRuntimePointerFromAddress(action),
+        ablaRuntimePointerFromAddress(bootstrapCtSavedSegv)) == 0
+    val bus = sigaction(i32(bootstrapCtBusSignal()), ablaRuntimePointerFromAddress(action),
+        ablaRuntimePointerFromAddress(bootstrapCtSavedBus)) == 0
+    __ablaRuntimeFree(action)
+    segv && bus
+}
+
+trusted fun bootstrapCtDisarmFaults(): void {
+    val segv = sigaction(11, ablaRuntimePointerFromAddress(bootstrapCtSavedSegv), nativeNullPointer())
+    val bus = sigaction(i32(bootstrapCtBusSignal()), ablaRuntimePointerFromAddress(bootstrapCtSavedBus),
+        nativeNullPointer())
+    return
 }

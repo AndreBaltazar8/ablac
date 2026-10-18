@@ -468,6 +468,7 @@ fun bootstrapCtFirstLine(text: string): string {
 fun bootstrapCtSession(): bool {
     if (!bootstrapCtSessionLive) {
         bootstrapCtSessionState = llvmOrcCreateSession()
+        bootstrapCtHostIsDarwin = bootstrapTextContains(llvmDefaultTargetTriple(), "apple")
         bootstrapCtSessionLive = bootstrapCtSessionState.status == 0
     }
     bootstrapCtSessionLive
@@ -718,6 +719,8 @@ fun bootstrapCtPrepare(parsed: BootstrapParseResult, targetTriple: string): void
     }
     bootstrapCtFreeAddress = bootstrapCtLookup("abla_ct_free_$generation")
     bootstrapCtGuardAddress = bootstrapCtLookup("abla_ct_guard_$generation")
+    bootstrapCtAlarmAddress = bootstrapCtLookup("abla_ct_alarm_$generation")
+    bootstrapCtFaultAddress = bootstrapCtLookup("abla_ct_fault_$generation")
     if (bootstrapCtPanicCaught) {
         bootstrapCtPanicTextAddress = bootstrapCtLookup("abla_ct_panic_text_$generation")
         bootstrapCtPanicSizeAddress = bootstrapCtLookup("abla_ct_panic_size_$generation")
@@ -748,10 +751,12 @@ fun bootstrapCtLookup(symbol: string): int {
 // --- the guard: a fatal stop in compile-time code returns to the compiler ------------
 
 // A failed check traps, `abort` aborts, and a runtime panic prints its message and
-// exits (bootstrapCtCatchPanic). In the slice each of them becomes a jump back to
-// the entry's guard (`_setjmp`/`_longjmp`, no signal mask), so the compiler reports
-// the failure and goes on. The generation is spent afterwards: frames the jump skipped never popped
-// their collector roots, so no later entry may run on it.
+// exits (bootstrapCtCatchPanic); a call past the time limit gets SIGALRM, and one
+// that runs its stack past the end SIGSEGV or SIGBUS. In the slice each of them
+// becomes a jump back to the entry's guard (`_setjmp`/`_longjmp`, no signal mask),
+// so the compiler reports the failure and goes on. The generation is spent
+// afterwards: frames the jump skipped never popped their collector roots, so no
+// later entry may run on it.
 fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool {
     val builder = LLVMCreateBuilderInContext(context)
     val voidType = LLVMVoidTypeInContext(context)
@@ -836,8 +841,53 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     }
     bootstrapCtPanicCaught =
         bootstrapCtCatchPanic(context, module, builder, generation, jump, armed, longjmpType, longjmp)
-    // i64 abla_ct_guard_<g>(ptr entry): the entry's reply, or 0 after a stop.
-    val guardType = LLVMFunctionType(i64Type, oneParameter.pointer(), 1, 0)
+    // void abla_ct_alarm_<g>(i32 signal), the time limit, and void
+    // abla_ct_fault_<g>(i32 signal), a bad access (a stack run past its end, on the
+    // alternate signal stack): while a call runs each jumps back; otherwise the
+    // alarm does nothing and the fault is fatal.
+    val signalParameter = llvmPointerVector(1)
+    signalParameter.set(0, i32Type)
+    val handlerType = LLVMFunctionType(voidType, signalParameter.pointer(), 1, 0)
+    signalParameter.drop()
+    var handler = 0
+    while (handler < 2) {
+        val fault = handler == 1
+        val function = LLVMAddFunction(
+            module, if (fault) "abla_ct_fault_$generation" else "abla_ct_alarm_$generation",
+            handlerType
+        )
+        val handlerEntry = LLVMAppendBasicBlockInContext(context, function, "entry")
+        val handlerBack = LLVMAppendBasicBlockInContext(context, function, "back")
+        val handlerIdle = LLVMAppendBasicBlockInContext(context, function, "idle")
+        LLVMPositionBuilderAtEnd(builder, handlerEntry)
+        val handlerArmed = LLVMBuildLoad2(builder, i1, armed, "armed")
+        LLVMBuildCondBr(builder, handlerArmed, handlerBack, handlerIdle)
+        LLVMPositionBuilderAtEnd(builder, handlerBack)
+        val handlerJump = llvmPointerVector(2)
+        handlerJump.set(0, jump)
+        handlerJump.set(1, LLVMConstInt(i32Type, if (fault) 4 else 3, 0))
+        LLVMBuildCall2(builder, longjmpType, longjmp, handlerJump.pointer(), 2, "")
+        handlerJump.drop()
+        LLVMBuildUnreachable(builder)
+        LLVMPositionBuilderAtEnd(builder, handlerIdle)
+        if (fault) {
+            var fatal = LLVMGetNamedFunction(module, "abort")
+            if (pointerIsNull(fatal)) {
+                fatal = LLVMAddFunction(module, "abort", LLVMFunctionType(voidType, nativeNullPointer(), 0, 0))
+            }
+            LLVMBuildCall2(builder, LLVMGlobalGetValueType(fatal), fatal, nativeNullPointer(), 0, "")
+            LLVMBuildUnreachable(builder)
+        } else LLVMBuildRetVoid(builder)
+        handler = handler + 1
+    }
+    // i64 abla_ct_guard_<g>(ptr entry, ptr stopped): the entry's reply with
+    // *stopped = 0, or 0 with *stopped = how the call stopped (the jump's value: 1
+    // an abort, 2 a trap, 3 the time limit, 4 a bad access, 5 a runtime panic).
+    val guardParameters = llvmPointerVector(2)
+    guardParameters.set(0, pointer)
+    guardParameters.set(1, pointer)
+    val guardType = LLVMFunctionType(i64Type, guardParameters.pointer(), 2, 0)
+    guardParameters.drop()
     val guard = LLVMAddFunction(module, "abla_ct_guard_$generation", guardType)
     val entry = LLVMAppendBasicBlockInContext(context, guard, "entry")
     val run = LLVMAppendBasicBlockInContext(context, guard, "run")
@@ -855,6 +905,7 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     )
     LLVMBuildCondBr(builder, first, run, caught)
     LLVMPositionBuilderAtEnd(builder, run)
+    LLVMBuildStore(builder, LLVMConstInt(i64Type, 0, 0), LLVMGetParam(guard, 1))
     LLVMBuildStore(builder, LLVMConstInt(i1, 1, 0), armed)
     val entryType = LLVMFunctionType(i64Type, nativeNullPointer(), 0, 0)
     val reply = LLVMBuildCall2(
@@ -864,6 +915,7 @@ fun bootstrapCtInstallGuard(context: i64*, module: i64*, generation: int): bool 
     LLVMBuildRet(builder, reply)
     LLVMPositionBuilderAtEnd(builder, caught)
     LLVMBuildStore(builder, LLVMConstInt(i1, 0, 0), armed)
+    LLVMBuildStore(builder, LLVMBuildZExt(builder, marked, i64Type, "how"), LLVMGetParam(guard, 1))
     LLVMBuildRet(builder, LLVMConstInt(i64Type, 0, 0))
     oneParameter.drop()
     twoParameters.drop()
@@ -929,7 +981,7 @@ fun bootstrapCtCatchPanic(
     LLVMBuildStore(builder, kept, size)
     val jumpArguments = llvmPointerVector(2)
     jumpArguments.set(0, jump)
-    jumpArguments.set(1, LLVMConstInt(i32Type, 3, 0))
+    jumpArguments.set(1, LLVMConstInt(i32Type, 5, 0))
     LLVMBuildCall2(builder, longjmpType, longjmp, jumpArguments.pointer(), 2, "")
     jumpArguments.drop()
     LLVMBuildUnreachable(builder)
@@ -957,6 +1009,8 @@ fun bootstrapCtFinishPass(): void {
     }
     bootstrapCtFreeAddress = 0
     bootstrapCtGuardAddress = 0
+    bootstrapCtAlarmAddress = 0
+    bootstrapCtFaultAddress = 0
     bootstrapCtFunctions = bootstrapCtNoFunctions()
     bootstrapCtPanicTextAddress = 0
     bootstrapCtPanicSizeAddress = 0
