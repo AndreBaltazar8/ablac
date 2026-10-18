@@ -194,4 +194,23 @@ set -e
 [[ $uncontained -ne 0 ]] || exit 1
 grep -q 'compile.effect-denied:trusted.native:poke->nativeByteBuffer' "$output_directory/uncontained.log"
 
-echo "compile-time native: C calls, callbacks, raw memory, system calls, a manifest library, the host API, abla/fs reads, staged writes, println and contained standard-library memory; denied calls not performed"
+# A program's static storage exists under `#`.
+run_case "$cases/static-storage" "$output_directory/static-storage" build > /dev/null
+expect_42 "$cases/static-storage" "$output_directory/static-storage"
+
+# A null address (a store through it, a call to a symbol dlsym didn't find) is an
+# evaluation error, never a crashed compiler.
+set +e
+run_case "$cases/null-address" "$output_directory/null-address" build \
+    > "$output_directory/null-address.log" 2>&1
+null_address=$?
+set -e
+if [[ $null_address -eq 0 || $null_address -ge 128 ]]; then
+    echo "null-address: the compiler exited $null_address" >&2
+    cat "$output_directory/null-address.log" >&2
+    exit 1
+fi
+grep -q 'E_EVAL_NATIVE_ADDRESS.*ablaUnsafeStoreI64. at address 0' "$output_directory/null-address.log"
+grep -q 'E_EVAL_NATIVE_ADDRESS.*ablaUnsafeCallVoid0. at address 0' "$output_directory/null-address.log"
+
+echo "compile-time native: C calls, callbacks, raw memory, static storage, system calls, a manifest library, the host API, abla/fs reads, staged writes, println and contained standard-library memory; denied calls not performed, null addresses are errors"

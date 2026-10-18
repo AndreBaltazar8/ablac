@@ -87,7 +87,8 @@ fun ctNativeIntrinsicPrefix(name: string): bool =
     name.startsWith("ablaUnsafe") || name.startsWith("ablaLinux") ||
     name.startsWith("ablaRuntimePointer") || name.startsWith("__ablaRuntime") ||
     name == "ablaRuntimeTrap" ||
-    name == "nativeStackAllocate" || name == "nativeFunctionAddress"
+    name == "nativeStackAllocate" || name == "nativeStaticAllocate" ||
+    name == "nativeFunctionAddress"
 
 // The raw intrinsics evaluated here (the extern:"intrinsic" declarations of
 // abla/unsafe/memory, abla/unsafe/native and abla/sys/linux, and the runtime's
@@ -113,7 +114,8 @@ fun ctNativeIntrinsic(name: string): bool =
     name == "ablaUnsafeAtomicCompareExchangeU32" ||
     name == "ablaUnsafeAtomicCompareExchangeRelaxedU32" ||
     name == "ablaUnsafeAtomicFence" ||
-    name == "nativeStackAllocate" || name == "nativeFunctionAddress" ||
+    name == "nativeStackAllocate" || name == "nativeStaticAllocate" ||
+    name == "nativeFunctionAddress" ||
     name == "ablaUnsafeCallVoid0" || name == "ablaUnsafeCallI32" ||
     name == "ablaUnsafeCallVoidPointer3" ||
     name == "ablaLinuxSyscall" || name == "ablaRuntimeTrap" ||
@@ -179,6 +181,48 @@ fun ctNativeArgument(
     if (index < expression.children.size)
         ctNativeWord(evaluator.evaluate(expression.children[index]))
     else 0
+
+// An address `name` reads, writes or calls through, or -1 (after an error) when it
+// is not one: a value that isn't an integer (a missing result), or one in the
+// null page, which would crash the compiler instead of failing the evaluation.
+fun ctNativeCheckedAddress(
+    var evaluator: BootstrapEvaluator,
+    value: BootstrapEvalValue,
+    name: string
+): int {
+    val address = if (value.kind == "integer") value.integer else 0
+    if (value.kind != "integer" || address < 4096) {
+        evaluator.errors = evaluator.errors + 1
+        evaluator.recordEvaluatorDiagnostic(
+            "E_EVAL_NATIVE_ADDRESS",
+            if (value.kind != "integer")
+                "`$name` was given no address (a ${value.kind} value) in compile-time evaluation"
+            else if (address < 0)
+                "`$name` at address $address (not a process address) in compile-time evaluation"
+            else "`$name` at address $address (a null pointer) in compile-time evaluation"
+        )
+        return -1
+    }
+    address
+}
+
+fun ctNativeAddressArgument(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    index: int,
+    name: string
+): int = ctNativeCheckedAddress(evaluator,
+    if (index < expression.children.size)
+        evaluator.evaluate(expression.children[index]) else bootstrapEvalInvalid(),
+    name)
+
+fun ctNativeValueArgument(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression,
+    index: int
+): BootstrapEvalValue =
+    if (index < expression.children.size)
+        evaluator.evaluate(expression.children[index]) else bootstrapEvalInvalid()
 
 trusted fun ctNativePin(value: string): void {
     if (ctNativePinned.size < CT_NATIVE_PINNED_LIMIT) {
@@ -250,33 +294,33 @@ trusted fun ctNativeEvaluateIntrinsic(
     }
     var result = bootstrapEvalVoid()
     if (name == "ablaUnsafeLoadU8") {
-        result = bootstrapEvalInteger(ablaUnsafeLoadU8(nativePointerFromAddress(
-            ctNativeArgument(evaluator, expression, 0)
-        )))
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
+        result = bootstrapEvalInteger(ablaUnsafeLoadU8(nativePointerFromAddress(address)))
     } else if (name == "ablaUnsafeLoadU16") {
-        result = bootstrapEvalInteger(ablaUnsafeLoadU16(nativePointerFromAddress(
-            ctNativeArgument(evaluator, expression, 0)
-        )))
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
+        result = bootstrapEvalInteger(ablaUnsafeLoadU16(nativePointerFromAddress(address)))
     } else if (name == "ablaUnsafeLoadU32") {
-        result = bootstrapEvalInteger(ablaUnsafeLoadU32(nativePointerFromAddress(
-            ctNativeArgument(evaluator, expression, 0)
-        )))
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
+        result = bootstrapEvalInteger(ablaUnsafeLoadU32(nativePointerFromAddress(address)))
     } else if (name == "ablaUnsafeLoadI64") {
-        result = bootstrapEvalInteger(ablaUnsafeLoadI64(nativePointerFromAddress(
-            ctNativeArgument(evaluator, expression, 0)
-        )))
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
+        result = bootstrapEvalInteger(ablaUnsafeLoadI64(nativePointerFromAddress(address)))
     } else if (name == "ablaUnsafeLoadPointer") {
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
         result = bootstrapEvalInteger(nativePointerAddress(
-            ablaUnsafeLoadPointer(nativePointerFromAddress(
-                ctNativeArgument(evaluator, expression, 0)
-            ))
+            ablaUnsafeLoadPointer(nativePointerFromAddress(address))
         ))
     } else if (name == "ablaUnsafeStoreU8" || name == "ablaUnsafeStoreU16" ||
                name == "ablaUnsafeStoreU32" || name == "ablaUnsafeStoreI64" ||
                name == "ablaUnsafeStorePointer") {
-        val address = nativePointerFromAddress(
-            ctNativeArgument(evaluator, expression, 0)
-        )
+        val target = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (target < 0) return bootstrapEvalInvalid()
+        val address = nativePointerFromAddress(target)
         val value = ctNativeArgument(evaluator, expression, 1)
         if (name == "ablaUnsafeStoreU8") ablaUnsafeStoreU8(address, value)
         if (name == "ablaUnsafeStoreU16") ablaUnsafeStoreU16(address, value)
@@ -301,15 +345,27 @@ trusted fun ctNativeEvaluateIntrinsic(
                name == "ablaRuntimePointerAddress") {
         result = bootstrapEvalInteger(ctNativeArgument(evaluator, expression, 0))
     } else if (name == "ablaUnsafeSetMemory") {
-        val address = ctNativeArgument(evaluator, expression, 0)
+        // An empty fill may name no memory at all.
+        val target = ctNativeValueArgument(evaluator, expression, 0)
         val value = ctNativeArgument(evaluator, expression, 1)
         val size = ctNativeArgument(evaluator, expression, 2)
-        ablaUnsafeSetMemory(nativePointerFromAddress(address), value, size)
+        if (size > 0) {
+            val address = ctNativeCheckedAddress(evaluator, target, name)
+            if (address < 0) return bootstrapEvalInvalid()
+            ablaUnsafeSetMemory(nativePointerFromAddress(address), value, size)
+        }
     } else if (name == "ablaUnsafeCopyMemory") {
-        val destination = ctNativeArgument(evaluator, expression, 0)
-        val source = ctNativeArgument(evaluator, expression, 1)
+        // An empty copy may name no memory at all.
+        val into = ctNativeValueArgument(evaluator, expression, 0)
+        val origin = ctNativeValueArgument(evaluator, expression, 1)
         val size = ctNativeArgument(evaluator, expression, 2)
-        ablaUnsafeCopyMemory(destination, source, size)
+        if (size > 0) {
+            val destination = ctNativeCheckedAddress(evaluator, into, name)
+            if (destination < 0) return bootstrapEvalInvalid()
+            val source = ctNativeCheckedAddress(evaluator, origin, name)
+            if (source < 0) return bootstrapEvalInvalid()
+            ablaUnsafeCopyMemory(destination, source, size)
+        }
     } else if (name == "ablaUnsafeCStringAddress" ||
                name == "ablaUnsafeStringAddress") {
         val value = evaluator.evaluate(expression.children[0])
@@ -335,9 +391,9 @@ trusted fun ctNativeEvaluateIntrinsic(
     } else if (name == "ablaUnsafeBorrowCString") {
         // The caller guarantees the bytes only for a while; the evaluator's
         // string may outlive that, so it gets a copy.
-        result = bootstrapEvalString(ctNativeCopyCString(
-            ctNativeArgument(evaluator, expression, 0)
-        ))
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
+        result = bootstrapEvalString(ctNativeCopyCString(address))
     } else if (name == "__ablaRuntimeAllocateLayout") {
         val size = ctNativeArgument(evaluator, expression, 0)
         val layout = ctNativeArgument(evaluator, expression, 1)
@@ -353,14 +409,16 @@ trusted fun ctNativeEvaluateIntrinsic(
         val layout = ctNativeArgument(evaluator, expression, 1)
         __ablaRuntimePlatformMemorySetLayout(address, layout)
     } else if (name == "ablaUnsafeAtomicFetchAddI64") {
-        val address = ctNativeArgument(evaluator, expression, 0)
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
         val delta = ctNativeArgument(evaluator, expression, 1)
         result = bootstrapEvalInteger(ablaUnsafeAtomicFetchAddI64(
             nativePointerFromAddress(address), delta
         ))
     } else if (name == "ablaUnsafeAtomicCompareExchangeU32" ||
                name == "ablaUnsafeAtomicCompareExchangeRelaxedU32") {
-        val address = ctNativeArgument(evaluator, expression, 0)
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
         val expected = u32(ctNativeArgument(evaluator, expression, 1))
         val replacement = u32(ctNativeArgument(evaluator, expression, 2))
         val observed = if (name == "ablaUnsafeAtomicCompareExchangeU32")
@@ -377,14 +435,25 @@ trusted fun ctNativeEvaluateIntrinsic(
         result = bootstrapEvalInteger(__ablaRuntimeAllocateLayout(
             ctNativeArgument(evaluator, expression, 0), 10
         ))
+    } else if (name == "nativeStaticAllocate") {
+        // A program's zeroed static storage; under `#` it lasts for the
+        // compilation (an evaluation that runs again gets storage of its own).
+        val capacity = ctNativeArgument(evaluator, expression, 0)
+        val rounded = (if (capacity > 0) capacity else 1) + 7
+        val storage = __ablaRuntimeAllocateLayout(rounded / 8 * 8, 10)
+        ablaUnsafeSetMemory(nativePointerFromAddress(storage), 0, rounded / 8 * 8)
+        result = bootstrapEvalInteger(storage)
     } else if (name == "ablaUnsafeCallVoid0") {
-        ablaUnsafeCallVoid0(ctNativeArgument(evaluator, expression, 0))
+        val function = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (function < 0) return bootstrapEvalInvalid()
+        ablaUnsafeCallVoid0(function)
     } else if (name == "ablaUnsafeCallI32") {
-        result = bootstrapEvalInteger(ablaUnsafeCallI32(
-            ctNativeArgument(evaluator, expression, 0)
-        ))
+        val function = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (function < 0) return bootstrapEvalInvalid()
+        result = bootstrapEvalInteger(ablaUnsafeCallI32(function))
     } else if (name == "ablaUnsafeCallVoidPointer3") {
-        val address = ctNativeArgument(evaluator, expression, 0)
+        val address = ctNativeAddressArgument(evaluator, expression, 0, name)
+        if (address < 0) return bootstrapEvalInvalid()
         val first = ctNativeArgument(evaluator, expression, 1)
         val second = ctNativeArgument(evaluator, expression, 2)
         val third = ctNativeArgument(evaluator, expression, 3)
