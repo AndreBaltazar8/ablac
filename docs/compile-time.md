@@ -737,7 +737,8 @@ in Abla (the `abla/fs` reads and writes, `abla/process/time`,
 [above](#capabilities-files-environment-processes-network), staged and
 journaled, a compile global still holding a kept value
 native code can't take in (an object, a map, a nested array, or any value of a
-`compile val`), a result only the compiler can hold
+`compile val`), a global whose initializer is compile-time code other than one
+call (`val x = #f(...)`, which runs natively), a result only the compiler can hold
 (a generator, task, thread, borrow, `Weak` or raw pointer), a cross-target
 build (compile-time code always runs on the host), the REPL, and a
 compilation that compile-time code starts (it runs inside the outer pass).
