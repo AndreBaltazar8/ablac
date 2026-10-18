@@ -210,7 +210,9 @@ fun bootstrapLiftEmit(
     if (kind == "array") return bootstrapLiftEmitArray(lowerer, state, value, type)
     if (kind == "map") return bootstrapLiftEmitMap(lowerer, state, value, type)
     if (kind == "object") return bootstrapLiftEmitObject(lowerer, state, value)
-    if (kind == "cell") return bootstrapLiftEmitCell(lowerer, state, value, type)
+    if (kind == "cell" || kind == "slot") {
+        return bootstrapLiftEmitCell(lowerer, state, value, type)
+    }
     if (kind == "shared") return bootstrapLiftEmitShared(lowerer, state, value, type)
     if (kind == "function") {
         return lowerer.emit("function.ref", -1, -1, value.text)
@@ -597,7 +599,7 @@ fun bootstrapLiftEmitClosure(
         if (positional) {
             captured = bootstrapLiftRetype(
                 state.retyper, captured,
-                if (owned) captureType else "cell:$captureType"
+                if (owned) captureType else "capture:$captureType"
             )
             if (state.retyper.problem != "") {
                 return bootstrapLiftFail(lowerer, state, state.retyper.problem)
@@ -607,7 +609,7 @@ fun bootstrapLiftEmitClosure(
             captureValues.append(bootstrapLiftEmit(
                 lowerer, state, captured, captureType
             ))
-        } else if (captured.kind == "cell") {
+        } else if (captured.kind == "slot") {
             captureValues.append(bootstrapLiftEmit(
                 lowerer, state, captured, "cell:$captureType"
             ))
@@ -920,9 +922,9 @@ fun bootstrapLiftEncodeValue(
                 field = field + 1
             }
         }
-    } else if (kind == "cell") {
+    } else if (kind == "cell" || kind == "slot") {
         if (bootstrapLiftEncodeOpen(encoder, value)) {
-            encoder.parts.append("c")
+            encoder.parts.append(if (kind == "cell") "c" else "k")
             if (value.elements.size == 1) {
                 bootstrapLiftEncodeValue(encoder, value.elements[0])
             } else encoder.parts.append("n")
@@ -1060,8 +1062,10 @@ fun bootstrapLiftDecodeValue(var decoder: BootstrapLiftDecoder): BootstrapEvalVa
     if (tag == 97) return bootstrapLiftDecodeArray(decoder)
     if (tag == 109) return bootstrapLiftDecodeMap(decoder)
     if (tag == 111) return bootstrapLiftDecodeObject(decoder)
-    if (tag == 99) {
-        val cell = decoder.open(BootstrapEvalValue("cell", 0, false, "", [], "", []))
+    if (tag == 99 || tag == 107) {
+        val cell = decoder.open(BootstrapEvalValue(
+            if (tag == 99) "cell" else "slot", 0, false, "", [], "", []
+        ))
         cell.elements.append(bootstrapLiftDecodeValue(decoder))
         return cell
     }
@@ -1652,14 +1656,19 @@ fun bootstrapLiftRetype(
     }
     val known = bootstrapLiftRetypeKnown(retyper, raw)
     if (known >= 0) return retyper.memo.typed[known]
+    // A native closure's capture box ("capture:T") becomes the evaluator's
+    // capture slot, never a Cell value.
+    val slot = bootstrapIsCaptureCellType(type)
     if (kind == "raw.cell") {
-        val element = if (bootstrapIsCellType(type)) bootstrapCellElementType(type) else type
+        val element = if (slot) type.slice(8, type.size)
+            else if (bootstrapIsCellType(type)) bootstrapCellElementType(type) else type
         val cell = bootstrapLiftRetypeRemember(retyper, raw, BootstrapEvalValue(
-            "cell", 0, false, "", [], "", []
+            if (slot) "slot" else "cell", 0, false, "", [], "", []
         ))
         cell.elements.append(bootstrapLiftRetype(retyper, raw.elements[0], element))
         return cell
     }
+    if (slot) return bootstrapEvalSlot(bootstrapLiftRetype(retyper, raw, type.slice(8, type.size)))
     if (bootstrapIsCellType(type)) {
         // A Cell handed over as a value is its contents: a fresh cell.
         return bootstrapEvalCell(

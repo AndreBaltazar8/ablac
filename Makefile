@@ -191,6 +191,7 @@ test: ablac
 	tools/test-mutex.sh $(COMPILER)
 	tools/test-affine-move.sh $(COMPILER)
 	tools/test-field-places.sh $(COMPILER)
+	tools/test-compile-time-cell-capture.sh $(COMPILER)
 
 check: test self-rebuild
 
