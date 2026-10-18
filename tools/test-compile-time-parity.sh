@@ -30,8 +30,13 @@
 # under the interpreter in a program that starts a thread: its body runs only
 # when awaited, docs/compile-time.md#threads-at-compile-time) | interp-memory
 # (the program measures or resets its heap, which the interpreter doesn't have) |
-# host-dependent (listed below: the outputs match, but on a failure the host
-# causes).
+# interp-steps (the interpreter ran past its step limit; the same `#` code
+# under ABLA_COMPILE_EVAL=jit finishes and matches) | host-dependent and
+# staged-writes and interp-timing (listed below with the reason, differing by
+# design: what the case reports is the process it runs in, which under `#` is
+# the compiler; another process reads a file the case wrote, which under `#`
+# stays staged until the build succeeds; or the case keeps real-time deadlines
+# the interpreter can't meet).
 set -uo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -107,12 +112,37 @@ build_and_run() { # dir tag entry mode
     )
 }
 
-# Cases whose run here depends on the host, so matching outputs are both sides
-# agreeing on a failure, not parity ("<case>\t<reason>" lines; none today).
-host_dependent=''
+# Cases whose two sides differ (or agree) by design, in the modes given ("*"
+# for all), with the status they get and why, whether or not the `#` side
+# builds ("<case>\t<modes>\t<status>\t<reason>"; docs/compile-time.md).
+by_design='module/proc-self-exe	*	host-dependent	reads its own executable (/proc/self/exe): under `#` that is the compiler
+module/unsafe-boundary	*	host-dependent	calls its own @export functions through dlsym: they exist only in the running program, not in the compiler
+module/http-advanced	*	staged-writes	a child process (gzip) reads a file the case wrote: under `#` writes stay staged until the build succeeds
+module/websocket-server-protocol	interp	interp-timing	forks clients with 100 ms ping / 400 ms idle deadlines the interpreter cannot meet (passes under jit)'
 
-host_dependent_reason() { # name
-    awk -F'\t' -v n="$1" '$1 == n { print $2 }' <<<"$host_dependent"
+by_design_status() { # name mode
+    awk -F'\t' -v n="$1" -v m="$2" '$1 == n && ($2 == "*" || $2 == m) { print $3 }' <<<"$by_design"
+}
+
+by_design_reason() { # name mode
+    awk -F'\t' -v n="$1" -v m="$2" '$1 == n && ($2 == "*" || $2 == m) { print $4 }' <<<"$by_design"
+}
+
+# Whether `source` or a file it imports by a relative path starts a thread.
+starts_thread() { # source
+    local pending=("$1") seen="" file
+    while ((${#pending[@]} > 0)); do
+        file=${pending[0]}
+        pending=("${pending[@]:1}")
+        [[ -f $file && " $seen " != *" $file "* ]] || continue
+        seen="$seen $file"
+        grep -q 'thread {' "$file" && return 0
+        local imported
+        while IFS= read -r imported; do
+            pending+=("$(cd "$(dirname "$file")" && pwd)/$imported")
+        done < <(sed -n 's/^import "\(\.\{0,2\}\/\{0,1\}[^"]*\.ab\)".*/\1/p' "$file")
+    done
+    return 1
 }
 
 run_case() { # kind name source mode
@@ -158,19 +188,39 @@ run_case() { # kind name source mode
         detail="runtime $(cat "$dir/runtime.status"): $(first_error "$dir/runtime.err")"
     else
         build_and_run "$dir" staged staged.ab "$mode"
-        # Native code at compile time is the program's own trusted code running
-        # in the compiler: it needs the trusted.native grant, which a module
-        # case asks for when that was all it was denied.
-        if [[ $kind == module && $(cat "$dir/staged.status") == build* ]] &&
-            grep -q 'compile.effect-denied:trusted.native' "$dir/staged.err" &&
-            ! grep -v 'compile.effect-denied:trusted.native' "$dir/staged.err" |
-                grep -q '^error\[E_SEMANTIC\]: compile.effect-denied'; then
-            granted=" (granted trusted.native)"
-            printf 'compileCapabilities = ["trusted.native"]\n' >"$dir/abla.toml"
-            { printf 'import "abla/compiler"\n#compilerGrant("trusted.native")\n'
-              cat "$dir/staged.ab"; } >"$dir/staged.granted.ab"
-            mv "$dir/staged.granted.ab" "$dir/staged.ab"
-            build_and_run "$dir" staged staged.ab "$mode"
+        # Compile-time code reaches files, the clock, the environment or native
+        # code only with a grant (docs/compile-time.md#capabilities-files-
+        # environment-processes-network). A module case denied nothing but
+        # capabilities asks for those, and again for any the grant uncovers.
+        if [[ $kind == module ]]; then
+            local capabilities="" round=0
+            while [[ $(cat "$dir/staged.status") == build* && $round -lt 8 ]] &&
+                grep -q '^error\[E_SEMANTIC\]: compile.effect-denied:' "$dir/staged.err" &&
+                ! grep '^error' "$dir/staged.err" |
+                    grep -vq '^error\[E_SEMANTIC\]: compile.effect-denied:'; do
+                local denied
+                denied=$(sed -n 's/^error\[E_SEMANTIC\]: compile.effect-denied:\([a-z.]*\).*/\1/p' \
+                    "$dir/staged.err" | sort -u)
+                local added=false capability
+                for capability in $denied; do
+                    [[ " $capabilities " == *" $capability "* ]] && continue
+                    capabilities="${capabilities:+$capabilities }$capability"
+                    added=true
+                done
+                $added || break
+                local list="" actions=""
+                for capability in $capabilities; do
+                    list="${list:+$list, }\"$capability\""
+                    actions="$actions#compilerGrant(\"$capability\")\n"
+                done
+                printf 'compileCapabilities = [%s]\n' "$list" >"$dir/abla.toml"
+                [[ -f "$dir/staged.ungranted.ab" ]] || cp "$dir/staged.ab" "$dir/staged.ungranted.ab"
+                { printf 'import "abla/compiler"\n%b' "$actions"
+                  cat "$dir/staged.ungranted.ab"; } >"$dir/staged.ab"
+                granted=" (granted ${capabilities// /, })"
+                build_and_run "$dir" staged staged.ab "$mode"
+                round=$((round + 1))
+            done
         fi
         case $(cat "$dir/staged.status") in
             "build 124" | "build 137" | "build 152")
@@ -178,7 +228,7 @@ run_case() { # kind name source mode
                 detail="compile-time evaluation exceeded ${seconds}s"
                 # The interpreter runs a thread's body when it is awaited, so a
                 # program that waits on its own thread first can't finish there.
-                if [[ $mode == interp ]] && grep -q 'thread {' "$source"; then
+                if [[ $mode == interp ]] && starts_thread "$source"; then
                     status=interp-threads
                     detail="waits on a thread the interpreter runs only at await"
                 fi
@@ -187,18 +237,31 @@ run_case() { # kind name source mode
                 status=compile-failed
                 detail=$(first_error "$dir/staged.err")
                 [[ -n $detail ]] || detail=$(tail -n1 "$dir/staged.err" | cut -c1-200)
+                if [[ -n $(by_design_status "$name" "$mode") ]]; then
+                    status=$(by_design_status "$name" "$mode")
+                    detail="$(by_design_reason "$name" "$mode") ($detail)"
+                fi
                 # The runtime memory API has no heap to measure in the
                 # interpreter (docs/compile-time.md).
                 if [[ $mode == interp ]] &&
                     grep -q '^error\[E_EVAL_MEMORY_UNAVAILABLE\]' "$dir/staged.err"; then
                     status=interp-memory
                 fi
+                # Past the interpreter's step limit: the same code natively.
+                if [[ $mode == interp ]] &&
+                    grep -q '^error\[E_EVAL_STEP_LIMIT\]' "$dir/staged.err"; then
+                    build_and_run "$dir" staged-jit staged.ab jit
+                    if [[ $(cat "$dir/staged-jit.status") != build* ]] &&
+                        cmp -s "$dir/runtime.out" "$dir/staged-jit.out"; then
+                        status=interp-steps
+                        detail="past the interpreter's step limit; passes with ABLA_COMPILE_EVAL=jit"
+                    fi
+                fi
                 ;;
             *)
-                if cmp -s "$dir/runtime.out" "$dir/staged.out" &&
-                    [[ -n $(host_dependent_reason "$name") ]]; then
-                    status=host-dependent
-                    detail=$(host_dependent_reason "$name")
+                if [[ -n $(by_design_status "$name" "$mode") ]]; then
+                    status=$(by_design_status "$name" "$mode")
+                    detail="$(by_design_reason "$name" "$mode")${granted:-}"
                 elif cmp -s "$dir/runtime.out" "$dir/staged.out"; then
                     status=pass
                     detail="${granted:-}"
@@ -218,8 +281,8 @@ run_case() { # kind name source mode
     printf '%s\t%s\t%s\t%s\n' "$name" "$mode" "$status" "$detail" >"$dir/result.tsv"
     printf '%-14s %-8s %s %s\n' "$status" "$mode" "$name" "${detail:0:120}"
 }
-export -f run_case build_and_run first_error limited host_dependent_reason
-export output compiler seconds project_root host_dependent
+export -f run_case build_and_run first_error limited by_design_status by_design_reason starts_thread
+export output compiler seconds project_root by_design
 
 for mode in $modes; do
     list_cases | while read -r kind name source; do
@@ -233,7 +296,7 @@ find "$output/cases" -name result.tsv -exec cat {} + | sort >"$output/results.ts
 echo
 for mode in $modes; do
     printf '%s:' "$mode"
-    for status in pass mismatch compile-failed timeout interp-threads interp-memory host-dependent runtime-skipped; do
+    for status in pass mismatch compile-failed timeout interp-threads interp-memory interp-steps interp-timing host-dependent staged-writes runtime-skipped; do
         printf ' %s %d' "$status" \
             "$(awk -F'\t' -v m="$mode" -v s="$status" '$2 == m && $3 == s' \
                 "$output/results.tsv" | wc -l | tr -d ' ')"
