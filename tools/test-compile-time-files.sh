@@ -3,8 +3,8 @@
 # published only when the build succeeds; compile-time code sees the disk with
 # the staging laid over it, so the same operations agree at run time and under
 # `#`, and a failed build leaves the disk as it was. Both tiers: the native
-# tier (jit) leaves a site that reaches a capability provider to the evaluator,
-# which stages and journals it.
+# tier (jit) calls the providers through the compiler bridge, so the evaluator
+# stages and journals each call.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -21,7 +21,7 @@ for mode in interp jit; do
     export ABLA_COMPILE_EVAL=$mode
     rm -rf build/compile-time-files
 
-    "$compiler" build view.ab -o view --no-cache
+    ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build view.ab -o view --no-cache 2> view.trace
     output=$(./view)
     runtime=$(sed -n 1p <<<"$output")
     staged=$(sed -n 2p <<<"$output")
@@ -37,7 +37,7 @@ for mode in interp jit; do
     printf 'old' > build/compile-time-files/publish/old.txt
     printf 'gone' > build/compile-time-files/publish/gone.txt
     printf 'kept' > build/compile-time-files/failed/old.txt
-    "$compiler" build publish.ab -o publish --no-cache
+    ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build publish.ab -o publish --no-cache 2> publish.trace
     ./publish && status=0 || status=$?
     [[ $status -eq 4 ]] || { echo "compile-time files ($mode): publish staged $status of 4"; exit 1; }
     [[ $(cat build/compile-time-files/publish/written.txt) == written ]]
@@ -61,14 +61,21 @@ for mode in interp jit; do
         }
     done
     if [[ $mode == jit ]]; then
-        grep -q 'interpreted at .*: reaches provider Path\.' late-fail.err || {
-            echo "compile-time files: the provider site ran natively"; cat late-fail.err; exit 1
-        }
+        # Every provider these cases reach crosses the bridge: each site is native.
+        for traced in view.trace publish.trace late-fail.err; do
+            if ! grep -q 'native at' $traced || grep -q 'interpreted at' $traced; then
+                echo "compile-time files: a provider site didn't run natively ($traced)"
+                cat $traced; exit 1
+            fi
+        done
     fi
 
     # A file read under `#` is journaled: a cached build sees it change.
     printf 'first' > build/compile-time-files/input.txt
-    "$compiler" build read-input.ab -o read-input
+    ABLA_COMPILE_EVAL_TRACE=1 "$compiler" build read-input.ab -o read-input 2> read-input.trace
+    if [[ $mode == jit ]] && ! grep -q 'native at' read-input.trace; then
+        echo "compile-time files: the journaled read didn't run natively"; cat read-input.trace; exit 1
+    fi
     [[ $(./read-input) == first ]]
     printf 'second' > build/compile-time-files/input.txt
     "$compiler" build read-input.ab -o read-input

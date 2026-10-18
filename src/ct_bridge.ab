@@ -329,7 +329,8 @@ fun ctBridgeDeclarationBlockExpression(
 
 fun ctBridgeResultElement(index: int): BootstrapEvalValue {
     val result = ctBridgeResult()
-    if (result.kind == "array" && index >= 0 &&
+    // An array's elements, or an object's fields in declaration order.
+    if ((result.kind == "array" || result.kind == "object") && index >= 0 &&
         index < result.elements.size) {
         bootstrapEvalUnwrapBorrow(result.elements[index])
     } else bootstrapEvalInvalid()
@@ -341,14 +342,22 @@ fun ctBridgeScalar(value: BootstrapEvalValue): int =
     else if (ctBridgeBoxedKind(value.kind)) ctBridgeBox(value)
     else 0
 
+// A Path (abla/fs) crosses as its text.
+fun ctBridgePath(value: BootstrapEvalValue): bool =
+    value.kind == "object" && value.owner == "Path" && value.elements.size == 1 &&
+        value.elements[0].kind == "string"
+
 fun ctBridgeSize(value: BootstrapEvalValue): int =
     if (value.kind == "string") value.text.size
     else if (value.kind == "array") value.elements.size
+    else if (ctBridgePath(value)) value.elements[0].text.size
     else 0
 
 trusted fun ctBridgeTextAddress(value: BootstrapEvalValue): int =
     if (value.kind == "string" && value.text.size > 0) {
         ablaUnsafeStringAddress(value.text)
+    } else if (ctBridgePath(value) && value.elements[0].text.size > 0) {
+        ablaUnsafeStringAddress(value.elements[0].text)
     } else 0
 
 // An exported function's string parameter is a view of the caller's bytes
@@ -377,6 +386,11 @@ fun ctBridgeArgBoolean(value: i64): i64 =
 @export("abla_ct_bridge_arg_string")
 fun ctBridgeArgString(value: string): i64 =
     ctBridgeStage(bootstrapEvalString(ctBridgeOwnedText(value)))
+
+@export("abla_ct_bridge_arg_path")
+fun ctBridgeArgPath(value: string): i64 = ctBridgeStage(bootstrapEvalObject(
+    "Path", ["text"], [bootstrapEvalString(ctBridgeOwnedText(value))]
+))
 
 @export("abla_ct_bridge_arg_handle")
 fun ctBridgeArgHandle(handle: i64): i64 = ctBridgeStage(ctBridgeUnbox(handle))
@@ -599,6 +613,7 @@ fun ctBridgeArgumentSource(name: string, rawType: string): string {
     if (type == "int") "    ablaCtBridgeArgInteger($name)\n"
     else if (type == "bool") "    ablaCtBridgeArgBoolean($name)\n"
     else if (type == "string") "    ablaCtBridgeArgString($name)\n"
+    else if (type == "Path") "    ablaCtBridgeArgPath($name.text)\n"
     else if (ctBridgeOpaqueType(type)) {
         "    ablaCtBridgeArgHandle($name.ctHandle)\n"
     } else if (element == "int") "    ablaCtBridgeArgIntegers($name)\n"
@@ -619,7 +634,16 @@ fun ctBridgeResultSource(rawType: string): string {
     else if (type == "int") "    ablaCtBridgeResultInteger()\n"
     else if (type == "bool") "    ablaCtBridgeResultBoolean()\n"
     else if (type == "string") "    ablaCtBridgeResultString()\n"
-    else if (ctBridgeOpaqueType(type)) {
+    else if (type == "Path") "    Path(ablaCtBridgeResultString())\n"
+    // The providers' result classes (abla/fs), field by field.
+    else if (type == "FileReadResult") {
+        "    FileReadResult(ablaCtBridgeResultElementString(0), ablaCtBridgeResultElementScalar(1) != 0, ablaCtBridgeResultElementScalar(2))\n"
+    } else if (type == "FileInfo") {
+        "    FileInfo(Path(ablaCtBridgeResultElementString(0)), ablaCtBridgeResultElementScalar(1), ablaCtBridgeResultElementScalar(2), ablaCtBridgeResultElementScalar(3))\n"
+    }
+    else if (element == "Path") {
+        "    val paths: array<Path> = []\n    for (text in ablaCtBridgeResultStrings()) paths.append(Path(text))\n    paths\n"
+    } else if (ctBridgeOpaqueType(type)) {
         "    $type(ablaCtBridgeResultHandle())\n"
     } else if (element == "int") "    ablaCtBridgeResultIntegers()\n"
     else if (element == "bool") "    ablaCtBridgeResultBooleans()\n"
@@ -665,6 +689,34 @@ fun ctBridgeReplacementSource(declaration: BootstrapDeclaration): string {
         val resultType = ctBridgeTypeText(declaration.resultType)
         if (valid) {
             source = "trusted fun ${declaration.name}($parameters): ${if (resultType == "") "void" else resultType} {\n${body}    ablaCtBridgeInvoke(\"${declaration.name}\")\n$result}\n"
+        }
+    } else if (declaration.kind == "fun" &&
+        (declaration.extensionOwner == "" || declaration.extensionOwner == "Path") &&
+        bootstrapCompileDeclarationProviderEffect(declaration) > 0) {
+        // A capability provider (abla/fs, abla/process/time, abla/io): the
+        // evaluator performs it by its key, so it is staged, journaled and
+        // checked as an interpreted call is. A Path method passes its
+        // receiver first.
+        var parameters = ""
+        var body = if (declaration.extensionOwner == "Path")
+            "    ablaCtBridgeArgPath(this.text)\n" else ""
+        var valid = true
+        var index = 0
+        while (index < declaration.parameters.size) {
+            val type = if (index < declaration.parameterTypes.size)
+                declaration.parameterTypes[index] else ""
+            val staged = ctBridgeArgumentSource(declaration.parameters[index], type)
+            if (staged == "") valid = false
+            parameters = "$parameters${if (index > 0) ", " else ""}${declaration.parameters[index]}: ${ctBridgeTypeText(type)}"
+            body = "$body$staged"
+            index = index + 1
+        }
+        val result = ctBridgeResultSource(declaration.resultType)
+        if (result == "") valid = false
+        val resultType = ctBridgeTypeText(declaration.resultType)
+        val owner = if (declaration.extensionOwner == "") "" else "${declaration.extensionOwner}."
+        if (valid) {
+            source = "trusted fun $owner${declaration.name}($parameters): ${if (resultType == "") "void" else resultType} {\n${body}    ablaCtBridgeInvoke(\"${bootstrapCompileProviderKey(declaration)}\")\n$result}\n"
         }
     }
     source
