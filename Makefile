@@ -201,6 +201,7 @@ test: ablac
 	tools/test-generator-step.sh $(COMPILER)
 	tools/test-compile-time-files.sh $(COMPILER)
 	tools/test-compiler-service-slices.sh $(COMPILER)
+	tools/test-module-incremental-state.sh $(COMPILER)
 
 check: test self-rebuild
 

@@ -14,7 +14,9 @@ status=$?
 set -e
 
 test "$status" -eq 42
-test ! -e "$output.host.o"
+# The host object is the syscall layer on macOS only (see
+# test-native-platform-boundary.sh).
+[[ $(uname -s) == Darwin || ! -e $output.host.o ]]
 if nm "$output" | awk '{print $3}' | \
     rg '^(ablaHost|abla_host_|abla_platform_)' >/dev/null; then
     echo "module incremental state unexpectedly linked project C symbols" >&2
