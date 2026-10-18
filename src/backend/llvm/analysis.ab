@@ -520,9 +520,10 @@ fun bootstrapLlvmInstructionMayCollect(
         instruction.text == "runtimeMemoryCollect") result = true
     if (instruction.opcode == "call.indirect" ||
         instruction.opcode == "call.indirect.once") result = true
+    // A yield stores the value in the generator and the step returns: it
+    // neither allocates nor runs other code (generator_ir.ab).
     if (instruction.opcode == "generator.create" ||
         instruction.opcode == "generator.next" ||
-        instruction.opcode == "generator.yield" ||
         instruction.opcode == "generator.drop" ||
         instruction.opcode == "task.create" ||
         instruction.opcode == "task.drop" ||
@@ -583,6 +584,45 @@ fun bootstrapLlvmInstructionMayAllocate(
     result
 }
 
+/** The values `function` defines only as a constant int, bool or null. An
+ *  `==` or `!=` with one compares tags, never two strings, so it never
+ *  flattens a rope (a generator's state dispatch compares so). */
+fun bootstrapLlvmConstantScalarValues(function: BootstrapIrFunction): array<bool> {
+    val count = bootstrapLlvmValueCount(function)
+    val constant: array<bool> = []
+    val defined: array<bool> = []
+    while (constant.size < count) {
+        constant.append(false)
+        defined.append(false)
+    }
+    for (instruction in function.instructions) {
+        val result = instruction.result
+        if (result >= 0 && result < count) {
+            val scalar = instruction.opcode == "const.i64" ||
+                instruction.opcode == "const.bool" ||
+                instruction.opcode == "const.null"
+            constant[result] = scalar && (!defined[result] || constant[result])
+            defined[result] = true
+        }
+    }
+    constant
+}
+
+/** bootstrapLlvmInstructionMayAllocate, knowing `constant`
+ *  (bootstrapLlvmConstantScalarValues). */
+fun bootstrapLlvmInstructionMayAllocateWith(
+    instruction: BootstrapInstruction,
+    constant: array<bool>
+): bool {
+    if (instruction.opcode == "==" || instruction.opcode == "!=") {
+        if ((instruction.left >= 0 && instruction.left < constant.size && constant[instruction.left]) ||
+            (instruction.right >= 0 && instruction.right < constant.size && constant[instruction.right])) {
+            return false
+        }
+    }
+    bootstrapLlvmInstructionMayAllocate(instruction)
+}
+
 fun bootstrapLlvmCollectingFunctions(
     program: BootstrapIrProgram,
     functionIndex: BootstrapLlvmNameIndex,
@@ -596,12 +636,13 @@ fun bootstrapLlvmCollectingFunctions(
             "runtimeMemoryCollect" ||
             program.functions[function].name ==
                 "__ablaRuntimePlatformMemoryCollect"
+        val constant = if (automaticPressure)
+            bootstrapLlvmConstantScalarValues(program.functions[function]) else []
         var instruction = 0
         while (instruction < program.functions[function].instructions.size) {
             val candidate = program.functions[function].instructions[instruction]
             if (candidate.opcode == "generator.create" ||
                 candidate.opcode == "generator.next" ||
-                candidate.opcode == "generator.yield" ||
                 candidate.opcode == "generator.drop" ||
                 candidate.opcode == "task.create" ||
                 candidate.opcode == "task.drop" ||
@@ -609,7 +650,7 @@ fun bootstrapLlvmCollectingFunctions(
                 candidate.opcode == "thread.drop" ||
                 candidate.opcode == "await") direct = true
             if (automaticPressure &&
-                bootstrapLlvmInstructionMayAllocate(candidate)) direct = true
+                bootstrapLlvmInstructionMayAllocateWith(candidate, constant)) direct = true
             instruction = instruction + 1
         }
         result.append(direct)
