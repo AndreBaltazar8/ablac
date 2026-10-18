@@ -36,7 +36,9 @@
 # design: what the case reports is the process it runs in, which under `#` is
 # the compiler; another process reads a file the case wrote, which under `#`
 # stays staged until the build succeeds; or the case keeps real-time deadlines
-# the interpreter can't meet).
+# the interpreter can't meet) | same-panic (the program panics at run time and
+# its `#` evaluation stops with the same panic: E_CT_PANIC, or the evaluator's
+# own code for it, with the same message).
 set -uo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -249,6 +251,17 @@ run_case() { # kind name source mode
                     grep -q '^error\[E_EVAL_MEMORY_UNAVAILABLE\]' "$dir/staged.err"; then
                     status=interp-memory
                 fi
+                # A panic at run time is the same panic under `#`.
+                if [[ $(cat "$dir/runtime.status") == "exit 101" ]]; then
+                    local panic staged_panic
+                    panic=$(sed -n 's/^panic: //p' "$dir/runtime.program.err" | head -1)
+                    staged_panic=$(sed -E -n 's/^error\[(E_CT_PANIC|E_EVAL_OUT_OF_BOUNDS|E_EVAL_DIVISION_BY_ZERO)\]: //p' \
+                        "$dir/staged.err" | head -1)
+                    if [[ -n $panic && $panic == "$staged_panic" ]]; then
+                        status=same-panic
+                        detail="panics at run time and under \`#\`: $panic"
+                    fi
+                fi
                 # Past the interpreter's step limit: the same code natively.
                 if [[ $mode == interp ]] &&
                     grep -q '^error\[E_EVAL_STEP_LIMIT\]' "$dir/staged.err"; then
@@ -298,7 +311,7 @@ find "$output/cases" -name result.tsv -exec cat {} + | sort >"$output/results.ts
 echo
 for mode in $modes; do
     printf '%s:' "$mode"
-    for status in pass mismatch compile-failed timeout interp-threads interp-memory interp-steps interp-timing host-dependent staged-writes runtime-skipped; do
+    for status in pass mismatch compile-failed timeout interp-threads interp-memory interp-steps interp-timing host-dependent staged-writes same-panic runtime-skipped; do
         printf ' %s %d' "$status" \
             "$(awk -F'\t' -v m="$mode" -v s="$status" '$2 == m && $3 == s' \
                 "$output/results.tsv" | wc -l | tr -d ' ')"
