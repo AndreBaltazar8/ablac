@@ -164,6 +164,25 @@ set -e
     exit 1
 }
 
+# Without the filesystem.write capability the write is denied and nothing is
+# staged or published.
+rm -rf "$cases/fs-write-denied/build-fs-write-denied"
+set +e
+run_case "$cases/fs-write-denied" "$output_directory/fs-write-denied" build \
+    > "$output_directory/fs-write-denied.log" 2>&1
+write_denied=$?
+set -e
+[[ $write_denied -ne 0 ]] || exit 1
+grep -q 'filesystem.write' "$output_directory/fs-write-denied.log" || {
+    echo 'an ungranted compile-time write was not denied' >&2
+    cat "$output_directory/fs-write-denied.log" >&2
+    exit 1
+}
+[[ ! -e $cases/fs-write-denied/build-fs-write-denied ]] || {
+    echo 'an ungranted compile-time write touched the tree' >&2
+    exit 1
+}
+
 # The standard library's own raw memory is contained; a program's is not.
 run_case "$cases/contained" "$output_directory/contained" build > /dev/null
 expect_42 "$cases/contained" "$output_directory/contained"
