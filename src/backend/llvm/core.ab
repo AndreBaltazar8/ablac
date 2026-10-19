@@ -26,7 +26,11 @@ class BootstrapLlvmBackend(
     val pointerType: i64*,
     val payloadType: i64*,
     val valueType: i64*,
-    val rootFrameType: i64*
+    val rootFrameType: i64*,
+    // The TBAA access tags (bootstrapLlvmTagAccess), made with the context.
+    val aliasKind: i32,
+    val aliasSlot: i64*,
+    val aliasRaw: i64*
 )
 
 fun bootstrapLlvmBackend(targetTriple: string): BootstrapLlvmBackend {
@@ -76,7 +80,9 @@ fun bootstrapLlvmBackend(targetTriple: string): BootstrapLlvmBackend {
         false,
         context, module, builder, voidType, i1Type, i8Type, i32Type,
         i64Type, f32Type, f64Type, pointerType, payloadType, valueType,
-        rootFrameType
+        rootFrameType, LLVMGetMDKindIDInContext(context, "tbaa", i32(4)),
+        bootstrapLlvmAliasTag(context, i64Type, "abla field slot"),
+        bootstrapLlvmAliasTag(context, i64Type, "abla raw memory")
     )
 }
 
@@ -156,6 +162,48 @@ fun bootstrapLlvmFunctionType(
     types.drop()
     resultType
 }
+
+noescape extern:"c" fun LLVMMDStringInContext2(context: i64*, text: cstring, length: int): i64*
+noescape extern:"c" fun LLVMMDNodeInContext2(context: i64*, nodes: i64*, count: int): i64*
+noescape extern:"c" fun LLVMMetadataAsValue(context: i64*, metadata: i64*): i64*
+noescape extern:"c" fun LLVMGetMDKindIDInContext(context: i64*, name: cstring, length: i32): i32
+noescape extern:"c" fun LLVMSetMetadata(value: i64*, kind: i32, node: i64*): void
+
+// Two kinds of memory that never overlap, as TBAA access tags under one root:
+// a declared field's slot, which only the runtime's typed field accessors
+// touch through ablaRuntimeLoadSlot*/StoreSlot*, and the raw memory programs
+// reach through abla/unsafe (a column's bytes). Raw addresses come from raw,
+// C, stack and static allocations and string bytes; nothing outside the
+// runtime can take an object's address. Every other access (the collector,
+// by-name field access, extension fields, value cells) has neither tag and
+// may alias both. Each backend makes its tags with its own context: metadata
+// never outlives the context it belongs to, and compile-time evaluation makes
+// and disposes contexts all the time.
+
+fun bootstrapLlvmMetadataNode(context: i64*, nodes: array<i64*>): i64* {
+    val vector = llvmPointerVector(nodes.size)
+    for (index in 0 until nodes.size) vector.set(index, nodes[index])
+    val node = LLVMMDNodeInContext2(context, vector.pointer(), nodes.size)
+    vector.drop()
+    node
+}
+
+// The access tag for type `name` under the shared root, as a value.
+fun bootstrapLlvmAliasTag(context: i64*, i64Type: i64*, name: string): i64* {
+    val rootName = "abla memory"
+    val root = bootstrapLlvmMetadataNode(
+        context, [LLVMMDStringInContext2(context, rootName, rootName.size)]
+    )
+    val zero = LLVMValueAsMetadata(LLVMConstInt(i64Type, 0, 0))
+    val type = bootstrapLlvmMetadataNode(
+        context, [LLVMMDStringInContext2(context, name, name.size), root, zero]
+    )
+    LLVMMetadataAsValue(context, bootstrapLlvmMetadataNode(context, [type, type, zero]))
+}
+
+/** Tag `access` (a load or store) as touching a field slot, or else raw memory. */
+fun bootstrapLlvmTagAccess(backend: BootstrapLlvmBackend, access: i64*, slot: bool): void =
+    LLVMSetMetadata(access, backend.aliasKind, if (slot) backend.aliasSlot else backend.aliasRaw)
 
 fun bootstrapLlvmAttributeKind(name: string): i32 =
     LLVMGetEnumAttributeKindForName(name, name.size)

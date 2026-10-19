@@ -1,0 +1,65 @@
+// Declared field slots and abla/unsafe memory carry separate alias tags, so
+// LLVM may keep a field it read across raw stores and a raw value across field
+// stores. Every interleaving here must still read what was last written:
+// raw stores between field reads, field stores between raw reads, a column
+// whose address and size are fields, and an object replaced in a field
+// mid-loop. Run as is and with ABLA_GC_STRESS=1,
+// it prints the same lines and exits 42.
+import "abla/io"
+import "abla/unsafe/memory"
+import "abla/float/text"
+
+class Column(var data: i64*, var size: int)
+
+trusted fun column(size: int): Column = Column(ablaUnsafeAllocate(size * 8), size)
+
+trusted fun Column.get(index: int): int =
+    ablaUnsafeLoadI64(ablaUnsafePointerOffset(this.data, index * 8))
+
+trusted fun Column.set(index: int, value: int): void {
+    ablaUnsafeStoreI64(ablaUnsafePointerOffset(this.data, index * 8), value)
+    return
+}
+
+class Tally(var count: int, var scale: f64, var open: bool, var cells: Column, var name: string)
+
+// Field stores between raw reads and raw stores between field reads.
+fun Tally.run(rounds: int): int {
+    var total = 0
+    for (round in 0 until rounds) {
+        for (index in 0 until this.cells.size) {
+            this.cells.set(index, this.cells.get(index) + this.count)
+            this.count = this.count + 1
+            if (index % 3 == 0) this.open = !this.open
+            total = total + this.cells.get(index) + (if (this.open) 1 else 0)
+        }
+        this.scale = this.scale * 2.0
+    }
+    total
+}
+
+// The column in a field is replaced while the loop runs: reads through
+// this.cells must follow it.
+fun Tally.swapMidway(): int {
+    var total = 0
+    for (index in 0 until 8) {
+        if (index == 4) {
+            val next = column(8)
+            for (at in 0 until 8) next.set(at, 100 + at)
+            this.cells = next
+        }
+        total = total + this.cells.get(index)
+        this.cells.set(index, 0)
+    }
+    total + this.cells.get(5)
+}
+
+fun main: int {
+    val tally = Tally(1, 0.5, false, column(8), "first")
+    for (index in 0 until 8) tally.cells.set(index, index * 10)
+    println("run ${tally.run(3)} count ${tally.count} scale ${tally.scale} open ${tally.open}")
+    println("swap ${tally.swapMidway()} size ${tally.cells.size}")
+    tally.name = "second"
+    println("named ${tally.name} ${tally.cells.get(7)}")
+    42
+}

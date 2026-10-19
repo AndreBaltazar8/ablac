@@ -28,6 +28,16 @@ called out below.
   and leave the declared ones in place: the by-name scan reads the inline slots, then the
   overflow; the collector marks both.
 
+- **Tried, not pursued: telling LLVM a class-typed field holds an object.** A read of a
+  field whose type is a class that is neither optional nor affine was followed by
+  `llvm.assume(address != 0)`, so what reads the object next could drop its null check
+  (branch ct/noalias-params, 657395e). Every producer fills such fields (constructors,
+  the compile-time lift, assignment), and only affine fields can be moved out. On a
+  game's simulation it made no measurable difference, alone or on top of the
+  field-slot alias tags (native 42/42 us a tick with mobs, WebAssembly within 1%). An
+  `assume` would turn any producer missed later (extension fields with defaults,
+  generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
+
 ## Packages
 
 Package-side work (not changed from ablac):
