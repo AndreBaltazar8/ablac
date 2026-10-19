@@ -17,8 +17,11 @@ test "$status" -eq 42
 # The host object is the syscall layer on macOS only (see
 # test-native-platform-boundary.sh).
 [[ $(uname -s) == Darwin || ! -e $output.host.o ]]
-if nm "$output" | awk '{print $3}' | \
-    rg '^(ablaHost|abla_host_|abla_platform_)' >/dev/null; then
+# These two platform entries are emitted in Abla's LLVM module, as checked
+# by test-native-platform-boundary.sh; they are not linked C adapters.
+if nm "$output" | awk '{sub(/^_/, "", $3); print $3}' | \
+    rg '^(ablaHost|abla_host_|abla_platform_)' | \
+    rg -v '^(abla_platform_free|abla_platform_panic)$' >/dev/null; then
     echo "module incremental state unexpectedly linked project C symbols" >&2
     exit 1
 fi

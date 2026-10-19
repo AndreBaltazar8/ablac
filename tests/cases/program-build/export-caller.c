@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdlib.h>
 
 extern int64_t abla_app_answer(void);
 extern int64_t abla_app_next(void);
@@ -19,6 +20,8 @@ extern uint64_t abla_app_u64_identity(uint64_t value);
 extern int64_t abla_app_bytes_score(const uint8_t *data, uint64_t length);
 extern int64_t abla_app_bytes_length(const uint8_t *data, uint64_t length);
 extern void *abla_app_echo_bytes(const uint8_t *data, uint64_t length);
+extern void *abla_app_duplicate_bytes(const uint8_t *data, uint64_t length);
+extern int64_t abla_app_collect(void);
 extern const uint8_t *abla_owned_bytes_data(void *handle);
 extern uint64_t abla_owned_bytes_length(void *handle);
 extern void abla_owned_bytes_release(void *handle);
@@ -72,7 +75,40 @@ int main(void) {
     int valid = echo != NULL &&
         abla_owned_bytes_length(echo) == 3 &&
         memcmp(abla_owned_bytes_data(echo), bytes, 3) == 0;
+    void *empty = abla_app_echo_bytes(NULL, 0);
+    valid = valid && empty != NULL && abla_owned_bytes_length(empty) == 0;
+    abla_owned_bytes_release(empty);
+    /* Copies remain independent of both the input and later Abla allocations. */
+    const size_t large_size = 1024 * 1024;
+    uint8_t *large = malloc(large_size);
+    if (large == NULL) return 1;
+    memset(large, 0xa5, large_size);
+    void *large_echo = abla_app_echo_bytes(large, large_size);
+    memset(large, 0x5a, large_size);
+    for (int i = 0; i < 20; ++i) {
+        void *temporary = abla_app_echo_bytes(large, large_size);
+        valid = valid && temporary != NULL &&
+            abla_owned_bytes_length(temporary) == large_size &&
+            memcmp(abla_owned_bytes_data(temporary), large, large_size) == 0;
+        abla_owned_bytes_release(temporary);
+    }
+    (void)abla_app_collect();
+    void *rope = abla_app_duplicate_bytes(bytes, 3);
+    (void)abla_app_collect();
+    valid = valid && rope != NULL && abla_owned_bytes_length(rope) == 6 &&
+        memcmp(abla_owned_bytes_data(rope), bytes, 3) == 0 &&
+        memcmp(abla_owned_bytes_data(rope) + 3, bytes, 3) == 0;
+    abla_owned_bytes_release(rope);
+    memset(large, 0xa5, large_size);
+    valid = valid && large_echo != NULL &&
+        abla_owned_bytes_length(large_echo) == large_size &&
+        memcmp(abla_owned_bytes_data(large_echo), large, large_size) == 0 &&
+        abla_owned_bytes_length(echo) == 3 &&
+        memcmp(abla_owned_bytes_data(echo), bytes, 3) == 0;
+    free(large);
+    abla_owned_bytes_release(large_echo);
     abla_owned_bytes_release(echo);
+    abla_owned_bytes_release(NULL);
     return valid && abla_app_next() == 41 && abla_app_next() == 42 &&
         abla_app_resource_next() == 51 &&
         abla_app_resource_next() == 52 &&

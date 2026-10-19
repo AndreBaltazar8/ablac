@@ -37,7 +37,7 @@ int main(void) {
            "the panic's message is copied");
 
     expect(abla_checked_quotient(4, &result, message, sizeof message, &length) == 0 &&
-               result == 21, "a call after a panic returns normally");
+               result == 21 && length == 0, "a call after a panic clears the error length");
 
     memset(message, 0, sizeof message);
     expect(abla_checked_element(7, &result, message, 5, &length) == 1,

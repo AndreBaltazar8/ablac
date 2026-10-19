@@ -222,7 +222,7 @@ test: ablac
 	tools/test-linux-io.sh $(COMPILER)
 	tools/test-linux-process.sh $(COMPILER)
 	tools/test-linux-sleep.sh $(COMPILER)
-	tools/test-macos-host.sh $(COMPILER)
+	@if test "$$(uname -s)" = Darwin; then tools/test-macos-host.sh $(COMPILER); else echo "macOS host: skipped on $$(uname -s)"; fi
 	tools/test-portable-buffered-io.sh $(COMPILER)
 	tools/test-portable-io.sh $(COMPILER)
 	tools/test-stable-native-symbols.sh $(COMPILER)

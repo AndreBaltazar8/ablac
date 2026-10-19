@@ -391,7 +391,8 @@ Both operands of float arithmetic must have the same width. A float to
 integer conversion (`f64ToInt`, `f32ToI32`, `f32ToU32`) truncates toward zero
 and saturates: a value beyond the integer type gives its smallest or largest
 value, and NaN gives 0, on every target. Floats work at compile time too, with
-identical results.
+identical results. The sign and payload bits of a NaN produced by arithmetic
+are unspecified and may differ between compile time and run time.
 
 ### Strings
 
@@ -1853,7 +1854,8 @@ Checked export adapters are opt-in through `exportCheckedFunction`. Their C ABI
 returns an `int32_t` status and moves the normal result to an out-pointer. A
 panic becomes status `1`; its bytes are copied into a caller-owned buffer and
 the full length is reported even when that buffer truncates the message.
-Status `2` reports invalid boundary output pointers. This contains control flow
+A successful call sets the reported error length to zero when its pointer is
+non-null. Status `2` reports invalid boundary output pointers. This contains control flow
 and restores the runtime's recovery/root frames, but cleanup is abortive and
 external side effects are not transactional. Direct exports remain explicitly
 uncontained. Targets that do not advertise the required runtime capability

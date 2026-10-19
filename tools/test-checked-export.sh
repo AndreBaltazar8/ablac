@@ -21,3 +21,14 @@ ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=30 \
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
+
+# The same foreign ABI must work on ELF and both Mach-O architectures.
+abi_library=$output_directory/libabla_app.so
+if [[ $(uname -s) == Darwin ]]; then abi_library=$output_directory/libabla_app.dylib; fi
+"$compiler" build "$project_root/tests/cases/program-build/exported-library.ab" \
+    --emit shared-library -o "$abi_library" --no-cache
+clang "$project_root/tests/cases/program-build/export-caller.c" \
+    -L"$output_directory" -labla_app -Wl,-rpath,"$output_directory" \
+    -o "$output_directory/foreign-caller"
+"$output_directory/foreign-caller"
+echo "foreign export: owned bytes survive GC, concatenation, callbacks, and checked results"

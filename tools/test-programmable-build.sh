@@ -53,11 +53,18 @@ set -e
 [[ $generated_child_status -eq 43 ]] || exit 1
 [[ $artifacts_root_status -eq 38 ]] || exit 1
 
-if grep -q '@abla.exports.initialized' \
-    "$output_directory/libabla_scalar.so.ll"; then
-    echo "constant scalar globals retained the lazy export guard" >&2
-    exit 1
-fi
+# Runtime support can own initialization state even when the user scalar
+# exports need none. Check the exported paths, not the whole runtime module.
+grep -q '^@abla_scalar_next = alias .*@exported-scalar-only.scalarNext' \
+    "$output_directory/libabla_scalar.so.ll"
+grep -q '^@abla_scalar_add_u32 = alias .*@exported-scalar-only.scalarAddU32' \
+    "$output_directory/libabla_scalar.so.ll"
+awk '
+    /^define .*@exported-scalar-only\.(scalarNext|scalarAddU32)\(/ { inside = 1; count++ }
+    inside && /@abla_export_ensure_initialized/ { guarded = 1 }
+    inside && /^}/ { inside = 0 }
+    END { exit (count == 2 && !guarded) ? 0 : 1 }
+' "$output_directory/libabla_scalar.so.ll"
 if grep -q 'export.arguments' \
     "$output_directory/libabla_scalar.so.ll"; then
     echo "scalar-only export retained boxed argument storage" >&2
