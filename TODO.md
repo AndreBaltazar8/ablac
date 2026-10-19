@@ -23,12 +23,6 @@ called out below.
   with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
   `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
   not `parameterDefaults` (a method's defaults likewise).
-- [ ] **Checked exports don't build.** `exportCheckedFunction` (language.md, "Checked export
-  adapters") fails every build with `E_IR_EMISSION`: the adapter calls `abla_checked_invoke`,
-  which `backend/llvm/runtime.ab` declares but nothing has defined since the runtime moved to
-  Abla (`93ce196`). On a target without the capability the IR failure also hides
-  `E_EXPORT_TARGET_CAPABILITY`. `tools/test-wasm-mvc-extension.sh` covers both and stays out of
-  the suite until they work.
 
 ## Packages
 

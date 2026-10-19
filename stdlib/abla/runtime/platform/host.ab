@@ -10,6 +10,7 @@ trusted noescape extern:"c" fun write(
     length: int
 ): int
 trusted noescape extern:"c" fun _exit(status: int): void
+trusted noescape extern:"c" fun _longjmp(buffer: i64*, value: int): void
 trusted noescape extern:"c" fun getenv(name: i64*): i64*
 trusted noescape extern:"c" fun pthread_mutex_init(
     mutex: i64*,
@@ -191,11 +192,12 @@ val __ablaRuntimeHostRegionCachedPages: int = 32
 // Stack roots form a strict LIFO within one native thread. Sharing the head
 // between workers lets their push/pop sequences interleave and makes a valid
 // pop look corrupt. Resolve this address at each use so LLVM's local-exec TLS
-// model selects the calling thread's independent head cell.
+// model selects the calling thread's independent head cell. The thread's
+// region follows it, then its innermost recovery frame (a checked export's).
 @inline
 trusted fun __ablaRuntimeHostRootFrameAddress(): int =
     nativeThreadLocalBytes(
-        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
     )
 
 @inline
@@ -218,6 +220,48 @@ trusted fun __ablaRuntimeHostRegionLoad(): int =
 @inline
 trusted fun __ablaRuntimeHostRegionStore(regionAddress: int): void {
     ablaRuntimeStoreI64(__ablaRuntimeHostRegionAddress(), regionAddress)
+}
+
+@inline
+trusted fun __ablaRuntimeHostRecoveryAddress(): int =
+    __ablaRuntimeHostRootFrameAddress() + 16
+
+// A checked export's call runs under a recovery frame: a panic inside it copies
+// its message to the caller's buffer and resumes the export at its setjmp
+// instead of ending the program. The frame, on the export's stack:
+//   0 the enclosing frame   8 the root frame head   16 the region
+//   24 the message buffer   32 its capacity         40 where the length goes
+//   48 the jmp_buf (the backend's abla_checked_invoke sizes it).
+trusted fun __ablaRuntimeRecoveryEnter(
+    frame: int,
+    errorData: int,
+    errorCapacity: int,
+    errorLength: int
+): int {
+    ablaRuntimeStoreI64(frame, ablaRuntimeLoadI64(__ablaRuntimeHostRecoveryAddress()))
+    ablaRuntimeStoreI64(frame + 8, __ablaRuntimeHostRootFrameLoad())
+    ablaRuntimeStoreI64(frame + 16, __ablaRuntimeHostRegionLoad())
+    ablaRuntimeStoreI64(frame + 24, errorData)
+    ablaRuntimeStoreI64(frame + 32, errorCapacity)
+    ablaRuntimeStoreI64(frame + 40, errorLength)
+    ablaRuntimeStoreI64(__ablaRuntimeHostRecoveryAddress(), frame)
+    0
+}
+
+// The call returned: its frame is no longer the innermost.
+trusted fun __ablaRuntimeRecoveryLeave(frame: int): int {
+    ablaRuntimeStoreI64(__ablaRuntimeHostRecoveryAddress(), ablaRuntimeLoadI64(frame))
+    0
+}
+
+// The call panicked: the root frames and the region it entered are abandoned
+// with its stack (their memory is not reclaimed), so the thread's state is the
+// frame's again.
+trusted fun __ablaRuntimeRecoveryRestore(frame: int): int {
+    __ablaRuntimeHostRootFrameStore(ablaRuntimeLoadI64(frame + 8))
+    __ablaRuntimeHostRegionStore(ablaRuntimeLoadI64(frame + 16))
+    ablaRuntimeStoreI64(__ablaRuntimeHostRecoveryAddress(), ablaRuntimeLoadI64(frame))
+    0
 }
 
 // The latest allocation still registered (its header), or 0.
@@ -441,6 +485,8 @@ trusted fun __ablaRuntimePlatformAllocateLayout(
         4611686018427387903
     } else __ablaRuntimeHostLimit
     if (size > limit - __ablaRuntimeHostLiveBytes) {
+        // Unlocked first: a checked export recovers from this panic.
+        __ablaRuntimeHostHeapUnlock(mutex)
         __ablaRuntimePlatformPanic(
             __ablaRuntimeStringData("memory limit exceeded"), 21
         )
@@ -1119,12 +1165,38 @@ trusted fun __ablaRuntimePlatformPromoteAllocation(address: int): int {
 // that body); does nothing elsewhere.
 trusted fun __ablaRuntimePrintStack(): void {}
 
+// Inside a checked export, a panic's message goes to its caller's buffer (as
+// much as fits; the length is the whole message's) and the export resumes at
+// its recovery frame; elsewhere this returns and the panic ends the program.
+trusted fun __ablaRuntimeHostRecover(data: int, length: int): int {
+    val frame = ablaRuntimeLoadI64(__ablaRuntimeHostRecoveryAddress())
+    if (frame != 0) {
+        val buffer = ablaRuntimeLoadI64(frame + 24)
+        val capacity = ablaRuntimeLoadI64(frame + 32)
+        val lengthAddress = ablaRuntimeLoadI64(frame + 40)
+        var index = 0
+        while (buffer != 0 && index < length && index < capacity) {
+            ablaRuntimeStoreU8(buffer + index, ablaRuntimeLoadU8(data + index))
+            index = index + 1
+        }
+        if (lengthAddress != 0) ablaRuntimeStoreI64(lengthAddress, length)
+        _longjmp(ablaRuntimePointerFromAddress(frame + 48), 1)
+    }
+    0
+}
+
+// `panic` from abla/process/exit (through __ablaPanicContain's compiler-given
+// body): the same recovery as a runtime panic.
+trusted fun __ablaRuntimePanicContain(data: int, length: int): int =
+    __ablaRuntimeHostRecover(data, length)
+
 // A panic raised by the runtime or by compiled code (division by zero, an
 // index out of bounds, the memory limit) ends the program the way `panic`
 // from abla/process/exit does: "panic: <message>" on standard error, the stack
 // in a debug build, then exit status 101.
 @noinline
 trusted fun __ablaRuntimePlatformPanic(data: int, length: int): int {
+    __ablaRuntimeHostRecover(data, length)
     write(2, ablaRuntimePointerFromAddress(
         __ablaRuntimeStringData("panic: ")
     ), 7)

@@ -1,5 +1,9 @@
 import "dispatch.ab"
 
+// Whether the program being emitted has a checked export: then `panic` hands
+// its message to the export's caller (__ablaPanicContain's body, functions.ab).
+var bootstrapLlvmCheckedExports: bool = false
+
 fun bootstrapLlvmDeclareProgramBoundaries(
     backend: BootstrapLlvmBackend,
     program: BootstrapIrProgram,
@@ -1166,6 +1170,89 @@ fun bootstrapLlvmReleaseExportCallbacks(
     if (false) LLVMDisposeMessage(nativeNullPointer())
 }
 
+// abla_checked_invoke(function, arguments, count, result, message, capacity,
+// length): calls a boxed wrapper under a recovery frame (the runtime's
+// __ablaRuntimeRecoveryEnter). 0 when it returned; 1 when it panicked, whose
+// message the runtime copied to `message` before it longjmp'd back here. The
+// frame and its jmp_buf live in this function's own stack frame, which the
+// runtime enters only through _setjmp's second return.
+fun bootstrapLlvmDefineCheckedInvoke(backend: BootstrapLlvmBackend): void {
+    val invoke = LLVMGetNamedFunction(backend.module, "abla_checked_invoke")
+    if (!pointerIsNull(invoke) && LLVMIsDeclaration(invoke) != 0) {
+        val pointer = backend.pointerType
+        LLVMSetLinkage(invoke, llvmInternalLinkage())
+        bootstrapLlvmAddFunctionAttribute(backend, invoke, "noinline")
+        val setjmp = bootstrapLlvmDeclare(
+            backend, "_setjmp", backend.i32Type, [pointer], false, [false]
+        )
+        bootstrapLlvmAddFunctionAttribute(backend, setjmp, "returns_twice")
+        val entry = LLVMAppendBasicBlockInContext(
+            backend.context, invoke, "entry"
+        )
+        val call = LLVMAppendBasicBlockInContext(
+            backend.context, invoke, "call"
+        )
+        val panicked = LLVMAppendBasicBlockInContext(
+            backend.context, invoke, "panicked"
+        )
+        LLVMPositionBuilderAtEnd(backend.builder, entry)
+        // 48 bytes of frame (see the runtime), then a jmp_buf: 512 bytes
+        // covers every hosted libc's (glibc x86-64 200, Darwin arm64 192).
+        val frame = LLVMBuildAlloca(
+            backend.builder,
+            LLVMArrayType2(backend.i8Type, 560),
+            "recovery.frame"
+        )
+        LLVMSetAlignment(frame, 16)
+        val jumpOffset = llvmPointerVector(1)
+        jumpOffset.set(0, LLVMConstInt(backend.i64Type, 48, 0))
+        val jumpBuffer = LLVMBuildGEP2(
+            backend.builder, backend.i8Type, frame,
+            jumpOffset.pointer(), 1, "recovery.jmp_buf"
+        )
+        jumpOffset.drop()
+        val resumed = bootstrapLlvmCall(
+            backend, setjmp, [jumpBuffer], "recovery.resumed", false, [false]
+        )
+        LLVMBuildCondBr(
+            backend.builder,
+            LLVMBuildICmp(
+                backend.builder, llvmIntEqual(), resumed,
+                LLVMConstInt(backend.i32Type, 0, 0), "recovery.first"
+            ),
+            call, panicked
+        )
+        LLVMPositionBuilderAtEnd(backend.builder, call)
+        bootstrapLlvmCallNamed(
+            backend, "abla_runtime_recovery_enter",
+            [frame, LLVMGetParam(invoke, i32(4)),
+             LLVMGetParam(invoke, i32(5)), LLVMGetParam(invoke, i32(6))],
+            "", false, [false, false, false, false]
+        )
+        val wrapperType = bootstrapLlvmFunctionType(
+            backend, backend.voidType, [pointer, pointer, backend.i64Type]
+        )
+        val wrapped = bootstrapLlvmCallTyped(
+            backend, wrapperType, LLVMGetParam(invoke, i32(0)),
+            [LLVMGetParam(invoke, i32(3)), LLVMGetParam(invoke, i32(1)),
+             LLVMGetParam(invoke, i32(2))],
+            ""
+        )
+        bootstrapLlvmAddSret(backend, wrapped, true)
+        bootstrapLlvmCallNamed(
+            backend, "abla_runtime_recovery_leave", [frame],
+            "", false, [false]
+        )
+        LLVMBuildRet(backend.builder, LLVMConstInt(backend.i32Type, 0, 0))
+        LLVMPositionBuilderAtEnd(backend.builder, panicked)
+        bootstrapLlvmCallNamed(
+            backend, "abla_runtime_recovery_restore", [frame],
+            "", false, [false]
+        )
+        LLVMBuildRet(backend.builder, LLVMConstInt(backend.i32Type, 1, 0))
+    }
+}
+
 fun bootstrapLlvmReturnExportValue(
     backend: BootstrapLlvmBackend,
     result: i64*,
@@ -1474,6 +1561,9 @@ fun bootstrapLlvmEmitExports(
                     retained.append(alias)
                 }
             } else {
+            // Before the adapter takes the builder: the invoke has a body of
+            // its own.
+            if (request.checked) bootstrapLlvmDefineCheckedInvoke(backend)
             val parameters = bootstrapLlvmExportParameterTypes(
                 backend, request, request.checked
             )

@@ -236,6 +236,8 @@ test: ablac
 	tools/test-emitted-value-runtime.sh $(COMPILER)
 	tools/test-unbounded-exports.sh $(COMPILER)
 	tools/test-programmable-build.sh $(COMPILER)
+	tools/test-checked-export.sh $(COMPILER)
+	tools/test-wasm-mvc-extension.sh $(COMPILER)
 
 check: test self-rebuild
 
