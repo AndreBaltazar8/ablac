@@ -6,6 +6,9 @@
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
+# The allowed cases build from inside the output directory: keep a relative
+# compiler path pointing where it did.
+[[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cases="$project_root/tests/cases/runtime-internal"
 output_directory="$project_root/build/runtime-internal"
