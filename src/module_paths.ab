@@ -1,0 +1,109 @@
+// Where the compiler's sources and modules are: the toolchain's and the
+// standard library's roots, and the lexical normalization that gives each
+// module its identity. Kept apart so semantic analysis can use them without
+// the module graph (sema.ab is compiled alone by some tools and tests).
+import "abla/sys/linux/fs"
+import "abla/sys/linux/process"
+
+// Compiler-owned sources must not depend on the directory from which ablac was
+// invoked. The public launcher supplies ABLA_SYSROOT automatically; the
+// narrower ABLA_STDLIB override is retained for custom toolchains and bootstrap
+// compatibility. A relative fallback keeps direct development binaries usable
+// from the repository root.
+fun bootstrapToolchainRoot(): string {
+    val configured = linuxEnvironment("ABLA_SYSROOT")
+    var result = "."
+    if (configured.found && configured.value != "") result = configured.value
+    result
+}
+
+fun bootstrapStandardLibraryRoot(): string {
+    val configured = linuxEnvironment("ABLA_STDLIB")
+    var result = Path(bootstrapToolchainRoot()).child("stdlib").text
+    if (configured.found && configured.value != "") result = configured.value
+    result
+}
+
+// Module identity is lexical and deterministic: it does not consult the host
+// filesystem or resolve symlinks. This keeps absent generated inputs, caches,
+// and watched builds reproducible while collapsing path aliases.
+fun bootstrapNormalizeModulePath(value: string): string {
+    val absolute = value.size > 0 && value[0] == 47
+    var output = if (absolute) "/" else ""
+    var index = 0
+    while (index < value.size) {
+        while (index < value.size && value[index] == 47) index = index + 1
+        val begin = index
+        while (index < value.size && value[index] != 47) index = index + 1
+        if (begin < index) {
+            val segment = value.slice(begin, index)
+            if (segment == "..") {
+                var lastBegin = output.size
+                while (lastBegin > 0 && output[lastBegin - 1] != 47) {
+                    lastBegin = lastBegin - 1
+                }
+                val last = output.slice(lastBegin, output.size)
+                if (last != "" && last != "..") {
+                    var end = lastBegin
+                    if (end > 1 && output[end - 1] == 47) end = end - 1
+                    if (absolute && end == 0) end = 1
+                    output = output.slice(0, end)
+                } else if (!absolute) {
+                    if (output != "") output = "$output/"
+                    output = "${output}.."
+                }
+            } else if (segment != ".") {
+                if (output != "" && output != "/") output = "$output/"
+                output = "$output$segment"
+            }
+        }
+    }
+    if (output == "") output = "."
+    output
+}
+
+// A relative path that climbs above its base ("../…") can name the same file in
+// several lexically different ways (`../../ecs/x.ab` and `../../../engine/ecs/x.ab`
+// from `src/engine/examples/app` are one file). Resolve such a path against the
+// working directory, normalise it, and express it relative to that directory
+// again, so equal files always get equal identities (still relative, still
+// independent of symlinks).
+var bootstrapWorkingDirectory = ""
+
+fun bootstrapCanonicalEscapingPath(path: string): string {
+    if (path.size < 2 || path.slice(0, 2) != "..") return path
+    if (bootstrapWorkingDirectory == "") bootstrapWorkingDirectory = currentDirectory().text
+    val base = bootstrapWorkingDirectory
+    if (base.size == 0 || base[0] != 47) return path
+    val absolute = bootstrapNormalizeModulePath("$base/$path")
+    // Relative path from `base` to `absolute`, segment by segment.
+    val baseParts = bootstrapPathSegments(base)
+    val targetParts = bootstrapPathSegments(absolute)
+    var common = 0
+    while (common < baseParts.size && common < targetParts.size &&
+           baseParts[common] == targetParts[common]) common = common + 1
+    var output = ""
+    var up = common
+    while (up < baseParts.size) {
+        output = if (output == "") ".." else "$output/.."
+        up = up + 1
+    }
+    var down = common
+    while (down < targetParts.size) {
+        output = if (output == "") targetParts[down] else "$output/${targetParts[down]}"
+        down = down + 1
+    }
+    if (output == "") "." else output
+}
+
+fun bootstrapPathSegments(path: string): array<string> {
+    val parts: array<string> = []
+    var index = 0
+    while (index < path.size) {
+        while (index < path.size && path[index] == 47) index = index + 1
+        val begin = index
+        while (index < path.size && path[index] != 47) index = index + 1
+        if (begin < index) parts.append(path.slice(begin, index))
+    }
+    parts
+}

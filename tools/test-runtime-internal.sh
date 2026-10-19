@@ -70,4 +70,20 @@ allowed() { # $1 = label, $2 = standard library root, $3 = program
 allowed copy "$output_directory/allowed/stdlib" "$fixture"
 allowed link "$output_directory/allowed-link/stdlib" "$output_directory/allowed-link/allowed.ab"
 allowed relative allowed/stdlib allowed/allowed.ab
+# A root written with `//`, `.` or `..` names the same modules.
+allowed doubled "$output_directory/allowed//stdlib" "$fixture"
+allowed dotted "$output_directory/allowed/./stdlib/" "$fixture"
+allowed parent "$output_directory/allowed-link/../allowed/stdlib" "$fixture"
+
+# A generated module named abla/runtime/… is the program's code.
+refused_route() { # $1 = label, $2 = program
+    if (cd "$output_directory" && ABLA_STDLIB="$output_directory/allowed/stdlib" \
+        "$compiler" build "$2" -o "$output_directory/route-$1" --no-cache \
+        > "$output_directory/route-$1.err" 2>&1); then
+        echo "runtime internal: route $1 compiled"; exit 1
+    fi
+    grep -qF 'native.runtime-internal:' "$output_directory/route-$1.err" ||
+        { echo "runtime internal: route $1 not refused"; cat "$output_directory/route-$1.err"; exit 1; }
+}
+refused_route generated "$cases/generated-module.ab"
 echo "runtime internal: address intrinsics and slot accessors refused outside abla/runtime; function ids public"
