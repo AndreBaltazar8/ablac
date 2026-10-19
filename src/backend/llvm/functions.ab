@@ -488,6 +488,117 @@ fun bootstrapLlvmConstantTable(
     global
 }
 
+// Lifetime markers for value slots: a value read and written only inside one IR
+// block, defined by its first access, never a collection root, and not read after
+// the instructions (the function's result) gets llvm.lifetime.start before its
+// first access and llvm.lifetime.end after its last, so LLVM can give such slots
+// one stack slot. By instruction, the first value whose slot starts (ends)
+// there; by value, the next one at the same instruction.
+class BootstrapLlvmValueLifetimes(
+    val startHead: array<int>,
+    val endHead: array<int>,
+    val nextStart: array<int>,
+    val nextEnd: array<int>
+)
+
+fun bootstrapLlvmValueLifetimes(
+    function: BootstrapIrFunction,
+    storage: BootstrapLlvmFunctionStorage,
+    rootValues: array<bool>
+): BootstrapLlvmValueLifetimes {
+    val count = storage.values.size
+    val first: array<int> = []
+    val last: array<int> = []
+    val blockOf: array<int> = []
+    val eligible: array<bool> = []
+    val nextStart: array<int> = []
+    val nextEnd: array<int> = []
+    while (first.size < count) {
+        first.append(-1)
+        last.append(-1)
+        blockOf.append(-1)
+        eligible.append(true)
+        nextStart.append(-1)
+        nextEnd.append(-1)
+    }
+    val startHead: array<int> = []
+    val endHead: array<int> = []
+    // A function that hands a value slot's address to the runtime keeps its
+    // slots apart: the address may outlive the instruction.
+    var addressed = false
+    for (instruction in function.instructions) {
+        startHead.append(-1)
+        endHead.append(-1)
+        if (instruction.text == "ablaRuntimeValueAddress") addressed = true
+    }
+    if (addressed || count == 0) {
+        return BootstrapLlvmValueLifetimes(startHead, endHead, nextStart, nextEnd)
+    }
+    var block = 0
+    var index = 0
+    while (index < function.instructions.size) {
+        val instruction = function.instructions[index]
+        if (instruction.opcode == "label") block = block + 1
+        var operand = -2
+        while (operand < instruction.operands.size + 1) {
+            // The reads (left, right, operands), then the write (result).
+            val value = if (operand == -2) instruction.left
+                else if (operand == -1) instruction.right
+                else if (operand < instruction.operands.size)
+                    instruction.operands[operand]
+                else instruction.result
+            if (value >= 0 && value < count) {
+                if (first[value] < 0) {
+                    first[value] = index
+                    blockOf[value] = block
+                    if (operand < instruction.operands.size) {
+                        eligible[value] = false
+                    }
+                } else if (blockOf[value] != block) eligible[value] = false
+                last[value] = index
+            }
+            operand = operand + 1
+        }
+        index = index + 1
+    }
+    var value = count
+    while (value > 0) {
+        value = value - 1
+        if (eligible[value] && first[value] >= 0 &&
+            value != function.result &&
+            !pointerIsNull(storage.values[value]) &&
+            !(value < rootValues.size && rootValues[value])) {
+            val ending = function.instructions[last[value]].opcode
+            if (ending != "return" && ending != "jump" &&
+                ending != "branch" && ending != "unreachable") {
+                nextStart[value] = startHead[first[value]]
+                startHead[first[value]] = value
+                nextEnd[value] = endHead[last[value]]
+                endHead[last[value]] = value
+            }
+        }
+    }
+    BootstrapLlvmValueLifetimes(startHead, endHead, nextStart, nextEnd)
+}
+
+fun bootstrapLlvmMarkLifetimes(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    head: int,
+    next: array<int>,
+    intrinsic: string
+): void {
+    var value = head
+    while (value >= 0) {
+        bootstrapLlvmStackGuardCall(
+            backend, intrinsic, backend.voidType, [backend.pointerType],
+            [storage.values[value]]
+        )
+        value = next[value]
+    }
+    return
+}
+
 fun bootstrapLlvmCreateFunctionStorage(
     backend: BootstrapLlvmBackend,
     function: BootstrapIrFunction,
@@ -6623,6 +6734,7 @@ fun bootstrapLlvmEmitFunction(
         backend, function, llvmFunction, storage
     )
     bootstrapLlvmPushRoots(backend, storage)
+    val lifetimes = bootstrapLlvmValueLifetimes(function, storage, rootValues)
     if (backend.pressureSafePoints && collecting && directlyAllocates &&
         !runtimeImplementation &&
         function.name != "__bootstrap_globals") {
@@ -6661,6 +6773,10 @@ fun bootstrapLlvmEmitFunction(
         var supported = true
         val reachable = !terminated || instruction.opcode == "label"
         if (!reachable) matched = true
+        if (reachable) bootstrapLlvmMarkLifetimes(
+            backend, storage, lifetimes.startHead[instructionIndex],
+            lifetimes.nextStart, "llvm.lifetime.start.p0"
+        )
         if (reachable && instruction.opcode == "label") {
             matched = true
             if (!terminated) LLVMBuildBr(
@@ -7789,6 +7905,10 @@ fun bootstrapLlvmEmitFunction(
             )
             errors = errors + 1
         }
+        if (reachable && !terminated) bootstrapLlvmMarkLifetimes(
+            backend, storage, lifetimes.endHead[instructionIndex],
+            lifetimes.nextEnd, "llvm.lifetime.end.p0"
+        )
         instructionIndex = instructionIndex + 1
     }
     if (!terminated) {

@@ -76,6 +76,7 @@ test: ablac
 	tools/test-value-abi.sh $(COMPILER)
 	tools/test-unsafe-mmio.sh $(COMPILER)
 	tools/test-unsafe-stack-memory.sh $(COMPILER)
+	tools/test-value-lifetimes.sh $(COMPILER)
 	bash tools/test-scalar-default-unboxing.sh $(COMPILER)
 	tools/test-unsafe-static-memory.sh $(COMPILER)
 	tools/test-native-cstring-lifetime.sh $(COMPILER)

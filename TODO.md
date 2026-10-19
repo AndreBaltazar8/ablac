@@ -37,16 +37,14 @@ Package-side work (not changed from ablac):
 
 ## Compile time and memory
 
-- [ ] **Temporaries never share a stack slot.** Every IR value that is not a scalar gets
-  its own 24-byte slot, and the backend emits no `llvm.lifetime` markers, so LLVM keeps
-  them all apart: a frame grows with its function's size, not with what is live at once.
-  `BootstrapEvaluator.evaluate`, a `when` of 25 calls, still holds about 180 slots
-  (2.3 KB), of which a few are live at a time. Moving the evaluator's, the analyzer's and
-  the lowerer's cases into `@noinline` functions took a nested JSON literal from about
-  420 KB of stack per level to 28 KB. Markers for the values defined and last used inside
-  one IR block (the GC root plan already finds each value's definition and last use)
-  would shrink every frame, programs' too. First, audit the emitter for value reads that
-  do not come from an instruction's `left`, `right` or `operands`.
+- [ ] **Temporaries spanning IR blocks never share a stack slot.** Every IR value that is
+  not a scalar gets its own 24-byte slot. A value used only inside one IR block, defined by
+  its first access and never a collection root gets `llvm.lifetime` markers, so LLVM can
+  overlap those (a release server 1.5% smaller, the compiler 2.4%). The rest still keep
+  their own slots: values that cross blocks (a `when`'s arms, a loop's body) and roots,
+  whose slot addresses the root frame holds for the whole call. Liveness over the block
+  graph (the borrow analysis computes one) would let markers cover the first; roots need
+  their frame entry cleared where they die.
 
 Measured on a 10K-function Wasm application (86 MB of LLVM IR). Its dev build's compiler,
 collecting each time its heap grows by 256 MiB, peaks at about 1 GB and takes about 28 CPU
