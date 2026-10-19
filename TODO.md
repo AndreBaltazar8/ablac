@@ -72,7 +72,13 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   | no `opt` O1 (C) | 169 s | −1.8% | same within noise |
 
   C is a possible free size win; it would need a native release build's and a client's
-  frame-time check before it changes anything.
+  frame-time check before it changes anything. Measured again on 2026-10-19 (after value
+  lifetimes and fewer safe points), C no longer pays for Wasm: the release client grows
+  0.44% (6,167,821 → 6,194,818 B; build 107 → 102 s) and the simulation module is the
+  same (−128 B, ticks equal under node). A native release server shrinks 0.55% and links
+  9% faster (74 → 67 s) with the same simulation ticks, but the O1 there is where the
+  universal ABI wrappers are specialized before they become internal (`ea5d004`: hot
+  indirect calls keep their scalars), which a simulation doesn't exercise; it stays.
   With the LTO link in 4 partitions and wasm-opt sorting functions first (2026-10-10), the
   pre-link is the cheapest lever left in that stage. Without it, the link stage (pre-link,
   wasm-ld, wasm-opt) of the same client takes 756 G instructions instead of 925 G
