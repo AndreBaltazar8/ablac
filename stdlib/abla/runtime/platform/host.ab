@@ -141,7 +141,10 @@ trusted fun __ablaRuntimePlatformThreadJoin(handle: int): bool {
 // slot is always the latest allocation still held. Checkpoints are registry positions, so
 // a region or compiler phase can release its complete allocation suffix in one bounded
 // walk without involving the LLVM backend. A collection reads the registry in order
-// instead of chasing links through the whole heap.
+// instead of chasing links through the whole heap. An entry is the header's address, plus
+// 1 for an allocation too large for the collection's page directory (header and payload
+// past `CollectionSmallBytes`): the directory is built from the registry alone, without
+// reading a header.
 var __ablaRuntimeHostRegistry: int = 0
 var __ablaRuntimeHostRegistrySlots: int = 0
 var __ablaRuntimeHostRegistryCapacity: int = 0
@@ -270,7 +273,7 @@ trusted fun __ablaRuntimeHostRegistryLast(): int =
     if (__ablaRuntimeHostRegistrySlots == 0) 0
     else ablaRuntimeLoadI64(
         __ablaRuntimeHostRegistry + (__ablaRuntimeHostRegistrySlots - 1) * 8
-    )
+    ) & -16
 
 // Out of line: it runs once per doubling, and inlined it made every allocation's path
 // too large to inline where it used to be.
@@ -287,13 +290,14 @@ trusted fun __ablaRuntimeHostRegistryGrow(): void {
     return
 }
 
-trusted fun __ablaRuntimeHostRegister(header: int): void {
+trusted fun __ablaRuntimeHostRegister(header: int, large: bool): void {
     if (__ablaRuntimeHostRegistrySlots == __ablaRuntimeHostRegistryCapacity) {
         __ablaRuntimeHostRegistryGrow()
     }
     ablaRuntimeStoreI64(header, __ablaRuntimeHostRegistrySlots)
     ablaRuntimeStoreI64(
-        __ablaRuntimeHostRegistry + __ablaRuntimeHostRegistrySlots * 8, header
+        __ablaRuntimeHostRegistry + __ablaRuntimeHostRegistrySlots * 8,
+        if (large) header + 1 else header
     )
     __ablaRuntimeHostRegistrySlots = __ablaRuntimeHostRegistrySlots + 1
     return
@@ -458,7 +462,9 @@ trusted fun __ablaRuntimeHostTrackedAllocate(size: int, layout: int): int {
     ablaRuntimeStoreI64(header + 8, 0)
     ablaRuntimeStoreI64(header + 16, size)
     ablaRuntimeStoreI64(header + 24, layout)
-    __ablaRuntimeHostRegister(header)
+    __ablaRuntimeHostRegister(
+        header, size > __ablaRuntimeHostCollectionSmallBytes - 32
+    )
     __ablaRuntimeHostAllocationCount =
         __ablaRuntimeHostAllocationCount + 1
     val payload = header + 32
@@ -636,6 +642,7 @@ trusted fun __ablaRuntimeHostCollectionPagesGrow(table: int, capacity: int): int
         if (key != 0) {
             val target = __ablaRuntimeHostCollectionPageSlot(grown, capacity * 2 - 1, key - 1)
             ablaRuntimeStoreI64(grown + target * 16, key)
+            ablaRuntimeStoreI64(grown + target * 16 + 8, ablaRuntimeLoadI64(table + slot * 16 + 8))
         }
         slot = slot + 1
     }
@@ -644,72 +651,77 @@ trusted fun __ablaRuntimeHostCollectionPagesGrow(table: int, capacity: int): int
 }
 
 // Every registered allocation into the page directory (or, when larger, the address-ordered
-// list of large allocations).
+// list of large allocations), in one pass over the registry: its entries say which are
+// large, so no header is read. A page's bitmap is placed when the page is first met (the
+// table holds its offset until the pass ends, as the bitmaps may move while they grow).
 trusted fun __ablaRuntimeHostCollectionPagesBuild(): void {
-    val largest = __ablaRuntimeHostCollectionSmallBytes - 32
     var capacity = 4096
     var table = ablaRuntimePointerAddress(calloc(capacity * 2, 8))
     if (table == 0) ablaRuntimeTrap()
     var pages = 0
-    var large = 0
+    var bitmapCapacity = 256
+    var bitmaps = ablaRuntimePointerAddress(malloc(bitmapCapacity * 512))
+    if (bitmaps == 0) ablaRuntimeTrap()
+    var largeCapacity = 64
+    var list = ablaRuntimePointerAddress(malloc(largeCapacity * 8))
+    if (list == 0) ablaRuntimeTrap()
+    var listed = 0
     // Allocations next to each other in the registry mostly share a page: the
     // page entered last needs no probe.
     var lastPage = -1
+    var lastBitmap = 0
     var slot = 0
     while (slot < __ablaRuntimeHostRegistrySlots) {
-        val header = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
-        if (header != 0) {
-            if (ablaRuntimeLoadI64(header + 16) > largest) {
-                large = large + 1
-            } else if (header >> 16 != lastPage) {
-                val page = header >> 16
-                lastPage = page
-                val at = __ablaRuntimeHostCollectionPageSlot(table, capacity - 1, page)
+        val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
+        if ((entry & 1) != 0) {
+            if (listed == largeCapacity) {
+                largeCapacity = largeCapacity * 2
+                list = ablaRuntimePointerAddress(realloc(
+                    ablaRuntimePointerFromAddress(list), largeCapacity * 8
+                ))
+                if (list == 0) ablaRuntimeTrap()
+            }
+            ablaRuntimeStoreI64(list + listed * 8, entry - 1)
+            listed = listed + 1
+        } else if (entry != 0) {
+            if (entry >> 16 != lastPage) {
+                lastPage = entry >> 16
+                val at = __ablaRuntimeHostCollectionPageSlot(table, capacity - 1, lastPage)
                 if (ablaRuntimeLoadI64(table + at * 16) == 0) {
-                    ablaRuntimeStoreI64(table + at * 16, page + 1)
+                    if (pages == bitmapCapacity) {
+                        bitmapCapacity = bitmapCapacity * 2
+                        bitmaps = ablaRuntimePointerAddress(realloc(
+                            ablaRuntimePointerFromAddress(bitmaps), bitmapCapacity * 512
+                        ))
+                        if (bitmaps == 0) ablaRuntimeTrap()
+                    }
+                    lastBitmap = pages * 512
+                    var word = 0
+                    while (word < 64) {
+                        ablaRuntimeStoreI64(bitmaps + lastBitmap + word * 8, 0)
+                        word = word + 1
+                    }
+                    ablaRuntimeStoreI64(table + at * 16, lastPage + 1)
+                    ablaRuntimeStoreI64(table + at * 16 + 8, lastBitmap)
                     pages = pages + 1
                     if (pages * 2 > capacity) {
                         table = __ablaRuntimeHostCollectionPagesGrow(table, capacity)
                         capacity = capacity * 2
                     }
-                }
+                } else lastBitmap = ablaRuntimeLoadI64(table + at * 16 + 8)
             }
+            val bit = (entry & 65535) >> 4
+            val word = bitmaps + lastBitmap + (bit >> 6) * 8
+            ablaRuntimeStoreI64(word, ablaRuntimeLoadI64(word) | (1 << (bit & 63)))
         }
         slot = slot + 1
     }
-    val bitmaps = ablaRuntimePointerAddress(calloc((if (pages > 0) pages else 1) * 512, 1))
-    if (bitmaps == 0) ablaRuntimeTrap()
-    var next = 0
     slot = 0
     while (slot < capacity) {
         if (ablaRuntimeLoadI64(table + slot * 16) != 0) {
-            ablaRuntimeStoreI64(table + slot * 16 + 8, bitmaps + next * 512)
-            next = next + 1
-        }
-        slot = slot + 1
-    }
-    val list = ablaRuntimePointerAddress(malloc((if (large > 0) large else 1) * 8))
-    if (list == 0) ablaRuntimeTrap()
-    var listed = 0
-    lastPage = -1
-    var lastBitmap = 0
-    slot = 0
-    while (slot < __ablaRuntimeHostRegistrySlots) {
-        val header = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
-        if (header != 0) {
-            if (ablaRuntimeLoadI64(header + 16) > largest) {
-                ablaRuntimeStoreI64(list + listed * 8, header)
-                listed = listed + 1
-            } else {
-                if (header >> 16 != lastPage) {
-                    lastPage = header >> 16
-                    val at = __ablaRuntimeHostCollectionPageSlot(table, capacity - 1, lastPage)
-                    lastBitmap = ablaRuntimeLoadI64(table + at * 16 + 8)
-                }
-                val bit = (header & 65535) >> 4
-                val word = lastBitmap + (bit >> 6) * 8
-                ablaRuntimeStoreI64(word, ablaRuntimeLoadI64(word) | (1 << (bit & 63)))
-            }
+            ablaRuntimeStoreI64(
+                table + slot * 16 + 8, bitmaps + ablaRuntimeLoadI64(table + slot * 16 + 8)
+            )
         }
         slot = slot + 1
     }
@@ -962,8 +974,9 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
     var kept = 0
     var slot = 0
     while (slot < __ablaRuntimeHostRegistrySlots) {
-        val header = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
-        if (header != 0) {
+        val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
+        if (entry != 0) {
+            val header = entry & -16
             val state = ablaRuntimeLoadI64(header + 24)
             if (state >= 0 && state < 16 && state != 10 && state != 12) {
                 __ablaRuntimeHostLiveBytes =
@@ -973,7 +986,7 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
             } else {
                 if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
                 ablaRuntimeStoreI64(header, kept)
-                ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + kept * 8, header)
+                ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + kept * 8, entry)
                 kept = kept + 1
             }
         }

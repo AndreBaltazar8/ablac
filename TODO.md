@@ -141,7 +141,11 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   step does not help: every garbage object is freed once whatever the step (256 → 512 MiB:
   instructions unchanged, peak +90 MB). Candidates: the directory kept across collections
   (above), and freeing a sweep's garbage in batches (Darwin's `malloc_zone_batch_free`)
-  instead of one `free` each.
+  instead of one `free` each (a Darwin-only symbol: the host runtime serves Linux too).
+  Since then the page directory is built from the registry alone, in one pass: an entry
+  says whether its allocation is large, so the build reads no header (about 2% less wall
+  time for a compiler emitting a large program; the sweep, `free` and madvise are what
+  is left).
 - [ ] **Name lookups in lowering.** Sampled over a game client's dev build at `d39b14d`,
   `BootstrapFunctionDeclarationIndex.find` and the name hash under it are about 450 ms
   together, about 1% of the compiler's samples (an index lookup each time, but many of
