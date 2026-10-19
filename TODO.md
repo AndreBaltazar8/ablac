@@ -56,6 +56,22 @@ called out below.
   that race for the clock). Clocks per partition of TVars (or per thread, compared as
   vectors) would let disjoint transactions scale.
 
+- [ ] **Closures that do not escape, on the stack (paused).** Making a closure costs
+  more than a small transaction (~110 ns for `call { count + 1 }`): a heap Cell for every
+  captured variable, even a `val` or a parameter, and a heap block for the captures of
+  each `closure.create`. Approved design: escape summaries of parameters as a greatest
+  fixed point over the whole program's IR in the backend (`FnNoEscape` does not give
+  them: it is about the closure's arguments). A parameter stays non-escaping when it is
+  only called, passed to a direct call's non-escaping parameter, or kept in a local whose
+  loads are such uses. A `closure.create` result obeys the same rules, plus flowing only
+  into its own slot or one local it alone stores at once (its block is reused per
+  execution). Then (1) put its captures in its stack `arguments` array, listed in the
+  root frame, behind a marker that `__ablaRuntimeClosureRelease` skips, and (2) give a
+  variable captured only by such closures a stack cell. Any call that is not a direct,
+  statically known one (indirect calls; later, interface witnesses and delegates)
+  escapes its closure arguments. The caches stay sound: the analysis runs after the
+  lowered-IR cache, and the native partitions are keyed by their LLVM text.
+
 - **Tried, not pursued: telling LLVM a class-typed field holds an object.** A read of a
   field whose type is a class that is neither optional nor affine was followed by
   `llvm.assume(address != 0)`, so what reads the object next could drop its null check
