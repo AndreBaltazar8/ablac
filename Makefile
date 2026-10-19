@@ -240,6 +240,7 @@ test: ablac
 	tools/test-programmable-build.sh $(COMPILER)
 	tools/test-checked-export.sh $(COMPILER)
 	tools/test-wasm-mvc-extension.sh $(COMPILER)
+	tools/test-initializer-evaluation.sh $(COMPILER)
 
 check: test self-rebuild
 

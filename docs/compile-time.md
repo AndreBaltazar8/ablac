@@ -702,7 +702,12 @@ the compiler's.
 2. Type-check the whole program, including generated declarations.
 3. Run top-level actions, in order, then the transforms they registered.
 4. Lower the program: each `#expression` is evaluated where it is lowered,
-   and its value is stored as a constant.
+   and its value is stored as a constant. A top-level `val` or `var` whose
+   initializer contains a `#expression` is always lowered, whether or not
+   anything reads it and whether or not the program has `main`, so its
+   compile-time effects (an export, an internal link name, a staged file,
+   output, an error) are the same in every build. Code that runs only for its
+   effect still reads best as a [top-level action](#top-level-actions).
 5. Check the result and generate code.
 
 Generated declarations are type-checked before any later compile-time code
