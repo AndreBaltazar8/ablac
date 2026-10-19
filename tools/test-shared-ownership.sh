@@ -36,6 +36,19 @@ if [[ $native_status -ne 42 ]]; then
     exit 1
 fi
 
+# Operators on a field read through Shared.get() give new values, not views.
+"$compiler" build \
+    "$project_root/tests/cases/modules/shared-view-operators.ab" \
+    -o "$output_directory/view-operators"
+set +e
+"$project_root/tools/run-limited.sh" "$output_directory/view-operators"
+view_status=$?
+set -e
+if [[ $view_status -ne 42 ]]; then
+    echo "shared ownership: view operators expected 42, got $view_status" >&2
+    exit 1
+fi
+
 fixtures=(
     invalid-shared-handle-copy
     invalid-shared-borrow-store
