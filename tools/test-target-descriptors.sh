@@ -117,7 +117,8 @@ if [[ $(uname -s) == Darwin ]]; then
     "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
         --fast --no-cache --target x86_64-linux --emit object \
         -o "$directory/linux.o"
-    llvm-readelf -h "$directory/linux.o" | grep -q 'X86-64'
+    linux_header=$(llvm-readelf -h "$directory/linux.o")
+    grep -q 'X86-64' <<<"$linux_header"
 fi
 
 printf '%s\n' \
