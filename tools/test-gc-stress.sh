@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ABLA_GC_STRESS=1 collects at every safe point, so a value a function fails to root
 # is freed at once instead of under rare pressure. Programs that keep values across
-# allocations (generators, tasks, retained strings, loop-carried roots) give their
+# allocations (generators, tasks, retained strings, loop-carried roots, callbacks that
+# allocate: comparators, generator and task bodies, drops) give their
 # usual results under it.
 set -euo pipefail
 
@@ -45,8 +46,10 @@ done
 sed 's/round < 2000/round < 40/' "$modules/runtime-memory-loop-roots.ab" \
     > "$output_directory/loop-roots.ab"
 build "$output_directory/loop-roots.ab" loop-roots
+build "$project_root/tests/cases/gc-stress/callbacks.ab" callbacks
 
 stress=ABLA_GC_STRESS=1
+expect callbacks 42 "" $stress
 expect generator-nested 0 114 $stress
 expect generator-lazy 0 $'produce 0\ngot 0\nproduce 1\ngot 1\nproduce 2\ngot 2\ntotal 5050\nstart\nv 1\nclosed\n--\nstart\nv 1\nafter 1\nv 2\nafter 2\nclosed\n--\ndropping\na\nbb\nb!\nb!\nc\nu0\nu1\nu2\nc1\nc2\nzero\none\none!\nmany\no 10\nclose a\nclose r\nfirst 1\nlevel 0\nlevel 2\nlevel 4\nlevel 5\nend' $stress
 expect generator-affine 0 $'got 7\ngot 8\ndrop 8\ndrop 7\n--\ngot 7\ngot 8\ngot 3\ndrop 8\ndrop 7\n--\ngot 1\ndefer sees 9\ndrop 9\ngot 2\n--\ngot 0\ngot 5\ndrop 5\n--\nend\ndrop 7' $stress

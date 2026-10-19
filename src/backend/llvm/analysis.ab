@@ -575,24 +575,32 @@ fun bootstrapLlvmInstructionMayAllocate(
         instruction.opcode == "task.create" ||
         instruction.opcode == "thread.create" ||
         instruction.opcode == "field.set" ||
-        instruction.opcode == "field.set.indexed" ||
         instruction.opcode == "object.allocate" ||
         instruction.opcode == "object.create" ||
         instruction.opcode == "shared.create" ||
         instruction.opcode == "string.concat" ||
         instruction.opcode == "string.slice" ||
         instruction.opcode == "to.string") result = true
-    // Host/native boundaries may materialize returned heap values. String
-    // inspection (==, string.get, index.get) may flatten a rope, but that copy
-    // is the rope's own (+40), reachable from it, and allocating never
-    // collects: it is no reason for a safe point, so a byte-comparing helper
-    // keeps no root frame.
+    // Host/native boundaries may materialize returned heap values. Allocating
+    // never collects, so what allocates nothing a collection could reclaim is
+    // no reason for a safe point: string inspection (==, string.get,
+    // index.get) may flatten a rope, but that copy is the rope's own (+40,
+    // reachable from it); a raw allocation (ablaUnsafeAllocate) is never
+    // collected; storing into a typed field slot (field.set.indexed) copies
+    // into the object, where only a field added by name (field.set) grows it.
     if (instruction.opcode == "extern.c" ||
         instruction.opcode == "extern.host") result = true
-    if (instruction.opcode == "call" &&
-        instruction.text == "ablaUnsafeAllocate") result = true
     result
 }
+
+// The C entry points into generated code that runtime implementations call
+// (__ablaRuntimeDispatchClosure, GeneratorStep, ReleaseClosure, DropClosure).
+fun bootstrapLlvmEntersGeneratedCode(symbol: string): bool =
+    symbol == "abla_llvm_call_indirect" || symbol == "abla_llvm_call_dispatch" ||
+    symbol == "abla_llvm_release_closure" || symbol == "abla_llvm_drop_closure"
+
+fun bootstrapLlvmRuntimeImplementation(name: string): bool =
+    name.size >= 13 && name.slice(0, 13) == "__ablaRuntime"
 
 fun bootstrapLlvmCollectingFunctions(
     program: BootstrapIrProgram,
@@ -603,6 +611,11 @@ fun bootstrapLlvmCollectingFunctions(
     val result: array<bool> = []
     var function = 0
     while (function < program.functions.size) {
+        // A runtime implementation gets no safe point (bootstrapLlvmEmitFunction): what
+        // it allocates never collects there, so it collects only through what it calls.
+        val runtimeImplementation = bootstrapLlvmRuntimeImplementation(
+            program.functions[function].name
+        )
         var direct = program.functions[function].name ==
             "runtimeMemoryCollect" ||
             program.functions[function].name ==
@@ -618,8 +631,12 @@ fun bootstrapLlvmCollectingFunctions(
                 candidate.opcode == "thread.create" ||
                 candidate.opcode == "thread.drop" ||
                 candidate.opcode == "await") direct = true
-            if (automaticPressure &&
+            if (automaticPressure && !runtimeImplementation &&
                 bootstrapLlvmInstructionMayAllocate(candidate)) direct = true
+            // The dispatchers enter generated code: the closure, generator step or drop
+            // they run may reach any safe point, also from a runtime implementation.
+            if (automaticPressure && candidate.opcode == "extern.c" &&
+                bootstrapLlvmEntersGeneratedCode(candidate.text)) direct = true
             instruction = instruction + 1
         }
         result.append(direct)

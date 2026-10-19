@@ -1,0 +1,79 @@
+// Callbacks that allocate while their caller holds heap values: a comparator
+// and a mapping function called through a function value, a generator's body
+// stepped by the runtime, a task's body run at await, a closure and its
+// captured resource dropped by the runtime, and a resource's drop. Under
+// ABLA_GC_STRESS=1 every safe point collects, so a caller that left a value
+// unrooted across one of these calls reads freed memory.
+
+var dropped: array<string> = []
+
+resource class Noisy(val label: string) {
+    fun drop(): void {
+        dropped.append("dropped ${label} after ${dropped.size}")
+        return
+    }
+}
+
+fun padded(text: string): string =
+    text + "-0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz"
+
+fun sortWith(values: array<string>, less: (string, string) -> bool): array<string> {
+    val sorted: array<string> = []
+    for (value in values) {
+        var at = sorted.size
+        sorted.append(value)
+        while (at > 0 && less(sorted[at], sorted[at - 1])) {
+            val swap = sorted[at - 1]
+            sorted[at - 1] = sorted[at]
+            sorted[at] = swap
+            at = at - 1
+        }
+    }
+    sorted
+}
+
+fun mapWith(values: array<string>, change: (string) -> string): array<string> {
+    val mapped: array<string> = []
+    for (value in values) mapped.append(change(value))
+    mapped
+}
+
+fun words(count: int): Generator<string> = generator {
+    var index = 0
+    while (index < count) {
+        yield padded("word-${count - index}")
+        index = index + 1
+    }
+}
+
+fun total(values: array<string>): int {
+    var size = 0
+    for (value in values) size = size + value.size
+    size
+}
+
+fun main: int {
+    val held = padded("held") + padded("across")
+    val names: array<string> = []
+    for (word in words(12)) names.append(word)
+    // The comparator allocates (two paddings) on every comparison.
+    val sorted = sortWith(names) { a, b -> padded(a).size + a.size < padded(b).size + b.size || a < b }
+    val mapped = mapWith(sorted) { name -> padded(name) + "!" }
+    val computed = task { total(mapped) + padded("task").size }
+    val sum = await computed
+    var closures = 0
+    for (round in 0 until 6) {
+        val token = Noisy(padded("closure-$round"))
+        val read = move { token.label.size }
+        closures = closures + read()
+    }
+    for (round in 0 until 6) {
+        val noisy = Noisy(padded("plain-$round"))
+        closures = closures + noisy.label.size
+    }
+    val ordered = sorted[0] < sorted[sorted.size - 1]
+    if (held == padded("held") + padded("across") && names.size == 12 &&
+        sorted.size == 12 && ordered && mapped[3] == padded(sorted[3]) + "!" &&
+        sum == total(mapped) + padded("task").size && closures > 0 &&
+        dropped.size == 12 && dropped[11] == "dropped ${padded("plain-5")} after 11") 42 else 1
+}
