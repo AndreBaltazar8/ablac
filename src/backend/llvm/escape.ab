@@ -1,7 +1,8 @@
 import "analysis.ab"
 
-// Closures that do not escape the frame that makes them. Their captures can then
-// live in the frame (bootstrapLlvmStackClosureSites) instead of a heap block.
+// Closures and cells that do not escape the frame that makes them. A closure's
+// captures can then live in the frame, and a cell's value (a captured variable's,
+// or a Cell's) too, instead of a heap block (bootstrapLlvmStackClosureSites).
 //
 // The analysis runs on the whole program's IR in the backend, after the lowered-IR
 // cache, so no cached lowering depends on it; native partitions are keyed by the
@@ -10,8 +11,8 @@ import "analysis.ab"
 // and one is marked escaping when any use of its value may outlive the call, until
 // nothing changes.
 //
-// A tracked value (a closure.create result, or a parameter's) stays in its frame
-// when each use is one of:
+// A tracked value (a closure.create's or a cell.create's result, or a parameter's)
+// stays in its frame when each use is one of:
 // - the callee of call.indirect / call.indirect.once (not an argument of one: the
 //   callee is unknown);
 // - argument j of a direct `call g` whose parameter j does not escape (or a runtime
@@ -19,21 +20,30 @@ import "analysis.ab"
 // - a store into a local (local.declare / local.set / local.assign), whose loads
 //   (local.load, resource.peek) are tracked in turn;
 // - resource.drop / closure.drop (a closure's release does not free captures that
-//   are in a frame).
+//   are in a frame);
+// - reading or writing through it as a cell (cell.get, cell.set);
+// - for a cell, a capture by a closure kept in the frame whose function keeps that
+//   capture parameter.
 // Any other use escapes: a return, a store into a field, an array, a global or a
-// cell, a capture by another closure, a generator, task or thread, an extern or any
-// other runtime call, and every opcode not listed. Calls whose callee is not known
-// statically (indirect calls today; interface witnesses and delegates later) count
-// as escaping for their closure arguments: keep it that way.
+// cell, a capture by any other closure, a generator, task or thread, an extern or
+// any other runtime call, and every opcode not listed. Calls whose callee is not
+// known statically (indirect calls today; interface witnesses and delegates later)
+// count as escaping for their closure arguments: keep it that way.
 //
-// A closure.create also obeys the loop rule: its block belongs to the instruction
-// and is reused on each execution, so its value may reach a local only through a
-// store right after it, into a local nothing else stores. Then whatever reads the
-// closure pairs with the latest execution's captures; any other copy escapes.
+// Loop rules. A closure's block belongs to its instruction and is reused on each
+// execution, so its value may reach a local only through a store right after it,
+// into a local nothing else stores; then whatever reads the closure pairs with the
+// latest execution's captures, and any other copy escapes. A cell must be made in
+// no loop at all (a closure from an earlier iteration could see its slot reused);
+// its variable's local may hold the variable's value before it.
 //
 // Unwinding (an abandoned transaction, a panic a checked export contains) leaves
-// these frames with their root frames; no runtime structure holds a frame closure,
-// since reaching one (a TVar, a Shared, a generator, task or thread) escapes.
+// these frames with their root frames; no runtime structure holds a frame closure
+// or cell, since reaching one (a TVar, a Shared, a generator, task or thread)
+// escapes.
+//
+// ABLA_ESCAPE_TRACE=<text> reports why each closure or cell of a function whose name
+// contains <text> escapes (backend.ab).
 
 // The sites of the program being emitted (bootstrapLlvmEmitProgram sets them), and of
 // the function being emitted: per instruction, whether a closure.create's captures
@@ -41,6 +51,8 @@ import "analysis.ab"
 var bootstrapLlvmStackClosureSitesAll: array<array<bool>> = []
 var bootstrapLlvmStackClosureFlags: array<bool> = []
 val bootstrapLlvmNoStackClosures: array<bool> = []
+var bootstrapLlvmEscapeDebug: bool = false
+var bootstrapLlvmEscapeDebugLines: array<string> = []
 
 // Whether instruction `at` of the function being emitted makes a frame closure.
 fun bootstrapLlvmStackClosureAt(at: int): bool =
@@ -64,7 +76,8 @@ fun bootstrapLlvmEscapes(
     create: int,
     functionIndex: BootstrapLlvmNameIndex,
     emitted: array<bool>,
-    parameterEscapes: array<array<bool>>
+    parameterEscapes: array<array<bool>>,
+    frame: array<bool>
 ): bool {
     val instructions = function.instructions
     var changed = true
@@ -72,8 +85,12 @@ fun bootstrapLlvmEscapes(
         changed = false
         for (at in 0 until instructions.size) {
             val instruction = instructions[at]
+            // A cell, made in no loop, is not in its variable's local before it:
+            // a load there reads the value the cell is made from.
+            val beforeCell = create >= 0 && at < create &&
+                instructions[create].opcode == "cell.create"
             if ((instruction.opcode == "local.load" ||
-                 instruction.opcode == "resource.peek") &&
+                 instruction.opcode == "resource.peek") && !beforeCell &&
                 instruction.result >= 0 && instruction.result < tracked.size &&
                 !tracked[instruction.result] &&
                 bootstrapLlvmEscapeHasLocal(locals, instruction.text)) {
@@ -99,11 +116,17 @@ fun bootstrapLlvmEscapes(
     for (at in 0 until instructions.size) {
         val instruction = instructions[at]
         // Stores into a tracked local: under the loop rule only the create's own
-        // value, right after it.
+        // value, right after it. A cell, made in no loop, also lets its variable's
+        // local be stored before it (the variable's value, before it had a cell).
         if (create >= 0 && bootstrapLlvmEscapeStores(instruction.opcode) &&
             bootstrapLlvmEscapeHasLocal(locals, instruction.text)) {
             val createResult = function.instructions[create].result
-            if (instruction.left != createResult || at != create + 1) return true
+            val before = at < create &&
+                function.instructions[create].opcode == "cell.create"
+            if (!before && (instruction.left != createResult || at != create + 1)) {
+                if (bootstrapLlvmEscapeDebug) bootstrapLlvmEscapeDebugLines.append("${function.name} create@$create: store@$at ${instruction.opcode} '${instruction.text}'")
+                return true
+            }
         }
         // An instruction's inputs: its operands, or else its left and right.
         val count = if (instruction.operands.size > 0) instruction.operands.size else 2
@@ -112,9 +135,12 @@ fun bootstrapLlvmEscapes(
                 else if (position == 0) instruction.left else instruction.right
             if (input >= 0 && input < tracked.size && tracked[input] &&
                 !bootstrapLlvmEscapeUseStays(
-                    program, instruction, position, functionIndex, emitted,
-                    parameterEscapes
-                )) return true
+                    program, instruction, at, position, functionIndex, emitted,
+                    parameterEscapes, frame
+                )) {
+                if (bootstrapLlvmEscapeDebug) bootstrapLlvmEscapeDebugLines.append("${function.name} create@$create: use@$at ${instruction.opcode} #$position '${instruction.text}'")
+                return true
+            }
         }
     }
     false
@@ -131,15 +157,30 @@ fun bootstrapLlvmEscapeHasLocal(locals: array<string>, name: string): bool {
 fun bootstrapLlvmEscapeUseStays(
     program: BootstrapIrProgram,
     instruction: BootstrapInstruction,
+    at: int,
     position: int,
     functionIndex: BootstrapLlvmNameIndex,
     emitted: array<bool>,
-    parameterEscapes: array<array<bool>>
+    parameterEscapes: array<array<bool>>,
+    frame: array<bool>
 ): bool {
     val opcode = instruction.opcode
     if (bootstrapLlvmEscapeStores(opcode) && position == 0) return true
     if (opcode == "resource.drop" || opcode == "closure.drop") return position == 0
     if (opcode == "call.indirect" || opcode == "call.indirect.once") return position == 0
+    // Reading or writing through a cell keeps the cell (writing a value into one
+    // stores that value: position 1 escapes).
+    if (opcode == "cell.get" || opcode == "cell.set") return position == 0
+    // A capture of a closure kept in this frame, whose function keeps that
+    // capture parameter in its own frame (`frame`: the frame closures, given when
+    // following a cell).
+    if (opcode == "closure.create") {
+        if (at >= frame.size || !frame[at]) return false
+        val lambda = functionIndex.find(instruction.text)
+        if (lambda < 0 || lambda >= emitted.size || !emitted[lambda]) return false
+        if (position >= program.functions[lambda].parameters.size) return false
+        return !parameterEscapes[lambda][position]
+    }
     if (opcode == "call" && instruction.operands.size > 0) {
         if (bootstrapLlvmEscapeInvokesOnly(instruction.text, position)) return true
         val callee = functionIndex.find(instruction.text)
@@ -199,14 +240,63 @@ fun bootstrapLlvmStackClosureSites(
                 var locals: array<string> = []
                 onStack = !bootstrapLlvmEscapes(
                     program, function, tracked, locals, at, functionIndex, emitted,
-                    parameterEscapes
+                    parameterEscapes, bootstrapLlvmNoStackClosures
                 )
             }
             stack.append(onStack)
         }
+        // Cells (a captured variable's, or a Cell): made once in the frame (in no
+        // loop: a closure from an earlier iteration could see the slot reused), and
+        // reaching only frame closures that keep them, reads and writes through
+        // them, and locals.
+        if (index < emitted.size && emitted[index]) {
+            val inLoop = bootstrapLlvmEscapeInLoop(function)
+            for (at in 0 until function.instructions.size) {
+                val instruction = function.instructions[at]
+                if (instruction.opcode == "cell.create" && instruction.result >= 0 &&
+                    !inLoop[at]) {
+                    var tracked = bootstrapLlvmEscapeValues(function)
+                    tracked[instruction.result] = true
+                    var locals: array<string> = []
+                    stack[at] = !bootstrapLlvmEscapes(
+                        program, function, tracked, locals, at, functionIndex, emitted,
+                        parameterEscapes, stack
+                    )
+                }
+            }
+        }
         sites.append(stack)
     }
     sites
+}
+
+// Per instruction, whether it lies within a loop: between a label and a later jump
+// or branch back to it (the lowering's loops are structured).
+fun bootstrapLlvmEscapeInLoop(function: BootstrapIrFunction): array<bool> {
+    val instructions = function.instructions
+    val labels: array<int> = []
+    val positions: array<int> = []
+    for (at in 0 until instructions.size) {
+        if (instructions[at].opcode == "label") {
+            labels.append(instructions[at].target)
+            positions.append(at)
+        }
+    }
+    val inLoop: array<bool> = []
+    for (at in 0 until instructions.size) inLoop.append(false)
+    for (at in 0 until instructions.size) {
+        val instruction = instructions[at]
+        if (instruction.opcode == "jump" || instruction.opcode == "branch") {
+            for (index in 0 until labels.size) {
+                if ((labels[index] == instruction.target ||
+                     (instruction.opcode == "branch" && labels[index] == instruction.alternate)) &&
+                    positions[index] <= at) {
+                    for (inside in positions[index] until at + 1) inLoop[inside] = true
+                }
+            }
+        }
+    }
+    inLoop
 }
 
 fun bootstrapLlvmParameterEscapes(
@@ -235,7 +325,7 @@ fun bootstrapLlvmParameterEscapes(
     var locals = [name]
     bootstrapLlvmEscapes(
         program, function, tracked, locals, -1, functionIndex, emitted,
-        parameterEscapes
+        parameterEscapes, bootstrapLlvmNoStackClosures
     )
 }
 
