@@ -19,6 +19,9 @@ trusted noescape extern:"intrinsic" fun ablaRuntimeStoreI64(
     value: int
 ): void
 trusted noescape extern:"intrinsic" fun ablaRuntimeLoadU8(address: int): int
+// A sequentially consistent fence (orders a rope's flat copy with its children
+// across threads).
+trusted noescape extern:"intrinsic" fun ablaRuntimeFence(): void
 trusted noescape extern:"intrinsic" fun ablaRuntimeStoreU8(
     address: int,
     value: int
@@ -917,7 +920,7 @@ trusted fun __ablaRuntimeCopyString(
         // A rope node that has its flat copy (+40) is read through the copy:
         // flattening drops the node's children. Load +40 before them.
         if (data == 0 && storage != 0) {
-            val flat = ablaRuntimeLoadI64(storage + 40)
+            val flat = __ablaRuntimeRopeFlat(storage)
             if (flat != 0) {
                 data = flat
                 storage = ablaRuntimeLoadI64(storage)
@@ -951,45 +954,73 @@ trusted fun __ablaRuntimeCopyString(
                 stack = replacement
                 capacity = nextCapacity
             }
-            // LIFO: push right first so left is flattened first.
-            ablaRuntimeStoreI64(
-                stack + count * 16,
-                ablaRuntimeLoadI64(storage + 24)
-            )
-            ablaRuntimeStoreI64(
-                stack + count * 16 + 8,
-                ablaRuntimeLoadI64(storage + 32)
-            )
-            count = count + 1
-            ablaRuntimeStoreI64(
-                stack + count * 16,
-                ablaRuntimeLoadI64(storage + 8)
-            )
-            ablaRuntimeStoreI64(
-                stack + count * 16 + 8,
-                ablaRuntimeLoadI64(storage + 16)
-            )
-            count = count + 1
+            val leftData = ablaRuntimeLoadI64(storage + 8)
+            val leftStorage = ablaRuntimeLoadI64(storage + 16)
+            val rightData = ablaRuntimeLoadI64(storage + 24)
+            val rightStorage = ablaRuntimeLoadI64(storage + 32)
+            val flat = __ablaRuntimeRopeChildrenCleared(storage)
+            if (flat != 0) {
+                ablaRuntimeStoreI64(stack + count * 16, flat)
+                ablaRuntimeStoreI64(
+                    stack + count * 16 + 8, ablaRuntimeLoadI64(storage)
+                )
+                count = count + 1
+            } else {
+                // LIFO: push right first so left is flattened first.
+                ablaRuntimeStoreI64(stack + count * 16, rightData)
+                ablaRuntimeStoreI64(stack + count * 16 + 8, rightStorage)
+                count = count + 1
+                ablaRuntimeStoreI64(stack + count * 16, leftData)
+                ablaRuntimeStoreI64(stack + count * 16 + 8, leftStorage)
+                count = count + 1
+            }
         }
     }
     __ablaRuntimeFree(stack)
     written
 }
 
+// A rope node's flat copy (+40), or 0. Once threads run, another thread may
+// have just published it: the fence orders the copy's bytes after it.
+@inline
+trusted fun __ablaRuntimeRopeFlat(rope: int): int {
+    val flat = ablaRuntimeLoadI64(rope + 40)
+    if (flat != 0 && __ablaRuntimePlatformThreadsEnabled()) ablaRuntimeFence()
+    flat
+}
+
+// Called after a reader loaded a rope node's four child words, which it found
+// no flat copy for: the node's flat copy if another thread published it
+// meanwhile (and so may have cleared some of the children just read), else 0.
+// Flattening stores +40 before it clears the children and the reader loads
+// +40 again after them, each across a fence, so a reader that saw a cleared
+// child sees the copy here.
+@inline
+trusted fun __ablaRuntimeRopeChildrenCleared(rope: int): int =
+    if (__ablaRuntimePlatformThreadsEnabled()) {
+        ablaRuntimeFence()
+        __ablaRuntimeRopeFlat(rope)
+    } else 0
+
 trusted fun __ablaRuntimeStringDataSlow(value: any, rope: int): int {
-    val cached = ablaRuntimeLoadI64(rope + 40)
+    val cached = __ablaRuntimeRopeFlat(rope)
     if (cached != 0) cached
     else {
         val length = ablaRuntimeLoadI64(rope)
         val allocated = __ablaRuntimeAllocateLayout(length + 1, 1)
         __ablaRuntimeCopyString(value, allocated, 0)
         ablaRuntimeStoreU8(allocated + length, 0)
-        ablaRuntimeStoreI64(rope + 40, allocated)
         // The copy stands for the whole tree now: drop the children so the
         // collector frees the pieces, and the node keeps only the copy. Every
-        // reader (CopyString, WriteVectors) loads +40 before the children.
-        // Single-threaded only (TODO.md): a concurrent reader could load the
-        // children after this clears them.
+        // reader (CopyString, WriteVectors) loads +40 before the children,
+        // and once threads run loads it again after them: publish the copy's
+        // bytes, then +40, then clear, each across a fence. Two threads may
+        // flatten one node at once; each copy is whole, and the later store
+        // wins.
+        val threads = __ablaRuntimePlatformThreadsEnabled()
+        if (threads) ablaRuntimeFence()
+        ablaRuntimeStoreI64(rope + 40, allocated)
+        if (threads) ablaRuntimeFence()
         ablaRuntimeStoreI64(rope + 8, 0)
         ablaRuntimeStoreI64(rope + 16, 0)
         ablaRuntimeStoreI64(rope + 24, 0)
@@ -1041,7 +1072,7 @@ trusted fun __ablaRuntimeStringWriteVectors(
             // A flattened node's copy (+40) is loaded before its children,
             // which flattening drops.
             if (data == 0 && storage != 0) {
-                data = ablaRuntimeLoadI64(storage + 40)
+                data = __ablaRuntimeRopeFlat(storage)
             }
             if (data != 0) {
                 ablaRuntimeStoreI64(
@@ -1054,25 +1085,31 @@ trusted fun __ablaRuntimeStringWriteVectors(
                 count = count + 1
                 skipped = 0
             } else if (storage != 0 && pendingCount + 2 <= maximum) {
-                // LIFO: push right first so the left segment is emitted first.
-                ablaRuntimeStoreI64(
-                    pending + pendingCount * 16,
-                    ablaRuntimeLoadI64(storage + 24)
-                )
-                ablaRuntimeStoreI64(
-                    pending + pendingCount * 16 + 8,
-                    ablaRuntimeLoadI64(storage + 32)
-                )
-                pendingCount = pendingCount + 1
-                ablaRuntimeStoreI64(
-                    pending + pendingCount * 16,
-                    ablaRuntimeLoadI64(storage + 8)
-                )
-                ablaRuntimeStoreI64(
-                    pending + pendingCount * 16 + 8,
-                    ablaRuntimeLoadI64(storage + 16)
-                )
-                pendingCount = pendingCount + 1
+                val leftData = ablaRuntimeLoadI64(storage + 8)
+                val leftStorage = ablaRuntimeLoadI64(storage + 16)
+                val rightData = ablaRuntimeLoadI64(storage + 24)
+                val rightStorage = ablaRuntimeLoadI64(storage + 32)
+                val flat = __ablaRuntimeRopeChildrenCleared(storage)
+                if (flat != 0) {
+                    // Flattened meanwhile: emit the copy, past what was skipped.
+                    ablaRuntimeStoreI64(pending + pendingCount * 16, flat)
+                    ablaRuntimeStoreI64(
+                        pending + pendingCount * 16 + 8, currentLength
+                    )
+                    pendingCount = pendingCount + 1
+                } else {
+                    // LIFO: push right first so the left segment is emitted first.
+                    ablaRuntimeStoreI64(pending + pendingCount * 16, rightData)
+                    ablaRuntimeStoreI64(
+                        pending + pendingCount * 16 + 8, rightStorage
+                    )
+                    pendingCount = pendingCount + 1
+                    ablaRuntimeStoreI64(pending + pendingCount * 16, leftData)
+                    ablaRuntimeStoreI64(
+                        pending + pendingCount * 16 + 8, leftStorage
+                    )
+                    pendingCount = pendingCount + 1
+                }
             } else return -7
         }
     }

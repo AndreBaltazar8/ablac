@@ -19,14 +19,6 @@ called out below.
   indirection stubs (ORC lazy reexports or an indirect stubs manager) so a function can be
   redefined while the program runs.
 
-- [ ] **Flattening a rope clears its children without a fence.** `__ablaRuntimeStringDataSlow`
-  (`stdlib/abla/runtime/self/entry.ab`) stores the flat copy at +40, then zeroes the four child
-  words so the collector frees the pieces. The readers (`__ablaRuntimeCopyString`,
-  `__ablaRuntimeStringWriteVectors`) load +40 before the children. That is enough while one
-  thread touches a string; before threads share strings, publish +40 with a release store and
-  load it with an acquire load (or flatten under the node's lock), so no reader loads the
-  children after another thread cleared them.
-
 - [ ] **An operator in a parameter default is not rewritten.** `fun f(b: N = N(1) + N(2))`
   with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
   `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
@@ -52,22 +44,6 @@ Package-side work (not changed from ablac):
   The audit also found general-dynamic TLS references (`__tls_get_addr`), which
   ESP-IDF may not supply. Recheck the current TLS lowering with the actual target
   toolchains and complete the ESP-IDF links before closing this item.
-
-- [ ] **abla-testrunner: `ablaHostIsMacOS` is ambiguous.** The package and the
-  stdlib both define it, so `tests/parser_test.ab` and `tests/integration_test.ab`
-  fail with `E_IMPORT_UNQUALIFIED_AMBIGUOUS` and `symbol.duplicate`. The two
-  declarations are identical. Fix in `src/testrunner.ab`: replace
-  `noescape extern:"intrinsic" fun ablaHostIsMacOS(): bool` with
-  `import "abla/platform/host"`.
-- [ ] **abla-testrunner: `tests/fixture.ab` fails to link** (`_ablaHostArgument`,
-  `_ablaHostSleep`, `_ablaHostWriteStdout` undefined). Cause: the `abla/platform/host`
-  item above; the package moved `src/` to the public APIs in `54f3fac` but not
-  `tests/`, and `parser_test.ab`/`integration_test.ab` fail the same way once the
-  ambiguity is fixed. Fix: in the three test files import the public modules instead
-  of `abla/platform/host` and use `processArgument(i)` (`abla/process/arguments`),
-  `sleep(ms)` and `monotonicMilliseconds()` (`abla/process/time`), `print(text)`
-  (`abla/io`), `currentDirectory().text` and `path(p).readText()` (`abla/fs`).
-  Checked on a scratch copy: with this and the item above, `make check` passes.
 
 ## Compile time and memory
 

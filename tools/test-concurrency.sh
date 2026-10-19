@@ -30,6 +30,18 @@ if [[ $status -ne 42 ]]; then
     exit 1
 fi
 
+"$compiler" build \
+    "$project_root/tests/cases/concurrency/thread-rope-flatten.ab" \
+    --no-cache -o "$output_directory/thread-rope-flatten"
+set +e
+"$project_root/tools/run-limited.sh" "$output_directory/thread-rope-flatten"
+status=$?
+set -e
+if [[ $status -ne 42 ]]; then
+    echo "concurrency: readers must not see a rope's children cleared by a concurrent flatten (expected 42, got $status)" >&2
+    exit 1
+fi
+
 rm -f "$output_directory/invalid"
 set +e
 "$compiler" build \
@@ -80,4 +92,4 @@ for index in "${!defer_fixtures[@]}"; do
     [[ ! -e $output_directory/$fixture ]] || exit 1
 done
 
-echo 'concurrency: defer/generator/task/thread LLVM/diagnostic checks passed'
+echo 'concurrency: defer/generator/task/thread LLVM/diagnostic checks and concurrent rope flattening passed'
