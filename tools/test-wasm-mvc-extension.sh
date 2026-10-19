@@ -33,8 +33,8 @@ driver_status=$?
 set -e
 [[ $driver_status -eq 36 ]] || exit 1
 
-llvm-readobj --file-headers "$module" | grep -q 'Format: WASM'
-llvm-readobj --file-headers "$module" | grep -q 'Arch: wasm32'
+grep -q 'Format: WASM' <<<"$(llvm-readobj --file-headers "$module")"
+grep -q 'Arch: wasm32' <<<"$(llvm-readobj --file-headers "$module")"
 # The export section, not the symbol table: a linked module's symbols are its
 # name section's `<module>.<function>` names.
 node -e 'const { readFileSync } = require("node:fs");
@@ -49,7 +49,7 @@ grep -q '"ownership":"value"' "$abi_manifest"
 grep -q '"panic":"not-contained"' "$abi_manifest"
 node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' \
     "$abi_manifest"
-if llvm-readobj --sections "$module" | grep -q 'Type: IMPORT'; then
+if grep -q 'Type: IMPORT' <<<"$(llvm-readobj --sections "$module")"; then
     echo "WASM proof unexpectedly requires runtime imports" >&2
     exit 1
 fi
@@ -80,7 +80,7 @@ if grep -Eq 'call .*@(abla_less|ablaBitAnd|ablaBitShiftLeft)\(' \
     exit 1
 fi
 grep -Eq '^define .*@ablaTextIsValidUtf8\(' "$unsafe_module.ll"
-if llvm-readobj --sections "$unsafe_module" | grep -q 'Type: IMPORT'; then
+if grep -q 'Type: IMPORT' <<<"$(llvm-readobj --sections "$unsafe_module")"; then
     echo "WASM unsafe-memory proof unexpectedly requires runtime imports" >&2
     exit 1
 fi

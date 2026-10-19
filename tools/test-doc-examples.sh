@@ -180,7 +180,7 @@ check_links() { # $1 = document, $2 = its name for messages
         if [[ ! -e $resolved ]]; then
             fail "$name:$line" "broken link: $target"
         elif [[ -n $anchor && $resolved == *.md ]] &&
-            ! heading_anchors "$resolved" | grep -qxF -- "$anchor"; then
+            ! grep -qxF -- "$anchor" <<<"$(heading_anchors "$resolved")"; then
             fail "$name:$line" "broken link anchor: $target"
         else
             links=$((links + 1))

@@ -204,8 +204,8 @@ run_case() { # kind name source mode
             local capabilities="" round=0
             while [[ $(cat "$dir/staged.status") == build* && $round -lt 8 ]] &&
                 grep -q '^error\[E_SEMANTIC\]: compile.effect-denied:' "$dir/staged.err" &&
-                ! grep '^error' "$dir/staged.err" |
-                    grep -vq '^error\[E_SEMANTIC\]: compile.effect-denied:'; do
+                ! grep -vq '^error\[E_SEMANTIC\]: compile.effect-denied:' \
+                    <<<"$(grep '^error' "$dir/staged.err")"; do
                 local denied
                 denied=$(sed -n 's/^error\[E_SEMANTIC\]: compile.effect-denied:\([a-z.]*\).*/\1/p' \
                     "$dir/staged.err" | sort -u)
@@ -330,10 +330,10 @@ if [[ -f $expect ]]; then
         [[ " $modes " == *" $mode "* ]] || continue
         [[ -z $filter || $name =~ $filter ]] || continue
         # Only the cases this run selected.
-        awk -F'\t' -v m="$mode" -v n="$name" '$1 == n && $2 == m' \
-            "$output/results.tsv" | grep -q . || continue
-        if ! awk -F'\t' -v m="$mode" -v n="$name" '$1 == n && $2 == m && $3 == "pass"' \
-            "$output/results.tsv" | grep -q .; then
+        [[ -n $(awk -F'\t' -v m="$mode" -v n="$name" '$1 == n && $2 == m' \
+            "$output/results.tsv") ]] || continue
+        if [[ -z $(awk -F'\t' -v m="$mode" -v n="$name" '$1 == n && $2 == m && $3 == "pass"' \
+            "$output/results.tsv") ]]; then
             echo "REGRESSED: $mode $name"
             failed=1
         fi

@@ -53,8 +53,7 @@ test "$native_status" -eq 42
 # On Linux the libm dependency is a shared library of its own; macOS keeps
 # libm inside libSystem.
 if [[ $(uname -s) == Linux ]]; then
-    llvm-readelf -d "$output_root/floating-native" |
-        rg -q 'Shared library: \[libm'
+    rg -q 'Shared library: \[libm' <<<"$(llvm-readelf -d "$output_root/floating-native")"
 fi
 
 if "$compiler" build \

@@ -47,7 +47,7 @@ counter_steps=$(step_bodies "$output_directory/counter.ll" |
 [[ $(echo "$counter_steps" | sort | tr -d '\n') == 01 ]] || {
     echo "generator step: counter's steps root as $counter_steps (want one without, one with)"; exit 1
 }
-step_bodies "$output_directory/words.ll" | grep -q 'abla_runtime_roots_push' || {
+grep -q 'abla_runtime_roots_push' <<<"$(step_bodies "$output_directory/words.ll")" || {
     echo "generator step: an allocating step does not root"; exit 1
 }
 echo "generator step: steps are called directly; only an allocating one roots"

@@ -45,7 +45,7 @@ check_packaging() { # output
     fi
     [[ -z $unresolved ]] ||
         fail "$output.o leaves Abla runtime symbols unresolved: $unresolved"
-    if nm -u "$output.o" | awk '{print $NF}' | grep -qx '__longjmp_chk'; then
+    if grep -qx '__longjmp_chk' <<<"$(nm -u "$output.o" | awk '{print $NF}')"; then
         fail "$output.o needs a glibc-only fortified symbol"
     fi
 }

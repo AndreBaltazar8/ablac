@@ -71,10 +71,10 @@ second_identity=$(sha256sum "$module" | cut -d' ' -f1)
 [[ $first_identity == "$second_identity" ]] || exit 1
 
 "$output_directory/server"
-llvm-readobj --file-headers "$module" | grep -q 'Format: WASM'
-wasm_exports "$module" | grep -qx 'abla_client_answer'
-wasm_exports "$module" | grep -qx 'abla_client_double'
-if wasm_exports "$module" | grep -Eqx '(unselectedClient|serverAnswer)' ||
+grep -q 'Format: WASM' <<<"$(llvm-readobj --file-headers "$module")"
+grep -qx 'abla_client_answer' <<<"$(wasm_exports "$module")"
+grep -qx 'abla_client_double' <<<"$(wasm_exports "$module")"
+if grep -Eqx '(unselectedClient|serverAnswer)' <<<"$(wasm_exports "$module")" ||
     wasm_has_function "$module" 'unselectedClient|serverAnswer'; then
     echo "unselected function escaped the artifact slice ABI" >&2
     exit 1
@@ -101,10 +101,10 @@ build_stateful_slice
 stateful_second_identity=$(sha256sum "$stateful_module" | cut -d' ' -f1)
 [[ $stateful_first_identity == "$stateful_second_identity" ]] || exit 1
 
-wasm_exports "$stateful_module" | grep -qx 'client_increment'
-wasm_exports "$stateful_module" | grep -qx 'client_double'
-if wasm_exports "$stateful_module" |
-        grep -Eqx '(unselectedStatefulClient|invalidStatefulClient|serverAction|serverSessions)' ||
+grep -qx 'client_increment' <<<"$(wasm_exports "$stateful_module")"
+grep -qx 'client_double' <<<"$(wasm_exports "$stateful_module")"
+if grep -Eqx '(unselectedStatefulClient|invalidStatefulClient|serverAction|serverSessions)' \
+        <<<"$(wasm_exports "$stateful_module")" ||
     wasm_has_function "$stateful_module" \
         'unselectedStatefulClient|invalidStatefulClient|serverAction|serverSessions'; then
     echo "unselected/unrelated declaration escaped the stateful artifact slice ABI" >&2
