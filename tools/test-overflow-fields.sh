@@ -7,6 +7,9 @@
 # collection stress.
 set -euo pipefail
 compiler=${1:-build/ablac}
+# The lift case builds from inside its case directory: keep a relative compiler
+# path pointing where it did.
+[[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/overflow-fields"
 mkdir -p "$output_directory"
