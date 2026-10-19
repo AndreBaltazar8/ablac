@@ -94,6 +94,13 @@ only its parse errors.
 | `when.non-exhaustive`, `when.duplicate`, `when.else-last`, `when.else-duplicate`, `when.empty` | see [control flow](language.md#control-flow) |
 | `break.outside-loop`, `continue.outside-loop`, `return.outside-function` | control transfer outside its construct |
 | `E_NAMED_ARGUMENT_UNKNOWN`, `_DUPLICATE`, `_ORDER`, `_REQUIRED`, `_TARGET`, `_ARITY` | named-argument errors ([functions](language.md#functions)) |
+| `field.extension-owner:<T>` | an extension field on a type with no object to hold it: a scalar, string, array, nominal type or interface ([extension fields](language.md#extension-fields)) |
+| `field.extension-shadows:<T>.<f>` | an extension field named like a field or method of its class |
+| `field.extension-untyped:<T>.<f>`, `field.extension-default:<T>.<f>`, `field.extension-delegate:<T>.<f>` | an extension field without a type, without a default, or with a delegate |
+| `field.extension-type:<T>.<f>:<expected>:<actual>` | an extension field's default of another type |
+| `field.extension-resource:<T>.<f>` | an affine extension field (a resource, `Shared`, `Weak`, `Mutex`) on a class that isn't affine |
+| `field.extension-reassigned:<T>.<f>` | a second assignment of an extension `val` (at run time; `E_EVAL_EXTENSION_REASSIGNED` under `#`) |
+| `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a generic's `<T>`, a `where` clause, `const` type parameters, an interface's `type Item`, `sealed` |
 | `native.trust:<f>` | calling a trusted function from untrusted code ([trusted code](language.md#trusted-native-implementations)) |
 | `native.runtime-internal:<f>` | calling one of the runtime's address intrinsics or field-slot accessors outside `abla/runtime`, trusted or not ([trusted code](language.md#trusted-native-implementations)) |
 | `noinline.*`, `naked.*`, `section.*`, `wasmImport.*`, `inline-assembly.*` | misused [annotations](language.md#annotations) |

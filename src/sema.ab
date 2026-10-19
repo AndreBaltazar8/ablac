@@ -5660,7 +5660,13 @@ class BootstrapAnalyzer(
     // used: bootstrapCollectUsedAssignments.
     var usedAssignments: array<int> = [],
     // Array literals typed from a store's inferred receiver (expected_types.ab).
-    val contextualLiterals: BootstrapContextualLiterals = bootstrapNoContextualLiterals()
+    val contextualLiterals: BootstrapContextualLiterals = bootstrapNoContextualLiterals(),
+    // The member expressions a mutation goes through (`n.items` in
+    // `n.items.append(x)`): an extension field the object doesn't have takes
+    // its default there, stored, so the mutation stays (bootstrapLowerer).
+    val mutationPlaceSources: array<string> = [],
+    val mutationPlaceBegins: array<int> = [],
+    val mutationPlaceEnds: array<int> = []
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -6556,7 +6562,64 @@ class BootstrapAnalyzer(
                 }
             }
         }
+        if (result == "unknown") {
+            val extension = this.extensionFieldSymbol(owner, field)
+            if (extension >= 0) result = this.symbols[extension].type
+        }
         result
+    }
+
+    /** The symbol of the extension field `owner.field` (`var Owner.field: T`),
+     *  -1 when there is none. A declared field of the class comes first. */
+    fun extensionFieldSymbol(owner: string, field: string): int {
+        val index = this.symbolIndex("$owner.$field")
+        if (index >= 0 && bootstrapIsExtensionFieldKind(this.symbols[index].kind)) index
+        else -1
+    }
+
+    /** An extension field's declaration: a typed default, no delegate, a class
+     *  as its owner and no member of that class with its name. */
+    fun validateExtensionField(declaration: BootstrapDeclaration): void {
+        val name = "${declaration.extensionOwner}.${declaration.name}"
+        if (declaration.resultType == "inferred") {
+            this.fail("field.extension-untyped:$name")
+        }
+        if (declaration.expression.kind == "missing") {
+            this.fail("field.extension-default:$name")
+        }
+        if (declaration.expression.kind == "delegate.initializer") {
+            this.fail("field.extension-delegate:$name")
+        }
+        val ownerIndex = this.typeDeclarations.find(declaration.extensionOwner)
+        val owner = if (ownerIndex >= 0) this.declarations[ownerIndex]
+            else declaration
+        if (ownerIndex < 0 || owner.kind != "class" ||
+            owner.name != declaration.extensionOwner) {
+            this.fail("field.extension-owner:${declaration.extensionOwner}")
+        } else {
+            var shadows = false
+            var parameter = 0
+            while (parameter < owner.parameters.size) {
+                if (owner.parameters[parameter] == declaration.name &&
+                    parameter < owner.parameterKinds.size &&
+                    (owner.parameterKinds[parameter] == "val" ||
+                     owner.parameterKinds[parameter] == "var")) shadows = true
+                parameter = parameter + 1
+            }
+            for (method in owner.methods) {
+                if (method.name == declaration.name) shadows = true
+            }
+            if (shadows) this.fail("field.extension-shadows:$name")
+            // A field never changes what its class is to modules that don't
+            // see it: an affine one (a resource, Shared, Weak, Mutex…) only on
+            // a class that is affine already.
+            if (declaration.resultType != "inferred" &&
+                this.typeIsAffine(bootstrapNormalizeType(declaration.resultType)) &&
+                !this.typeIsAffine(declaration.extensionOwner)) {
+                this.fail("field.extension-resource:$name")
+            }
+        }
+        return
     }
 
     fun fieldDeclarationIdentity(owner: string, field: string): string {
@@ -6574,6 +6637,10 @@ class BootstrapAnalyzer(
                 }
                 fieldIndex = fieldIndex + 1
             }
+        }
+        if (identity == "") {
+            val extension = this.extensionFieldSymbol(owner, field)
+            if (extension >= 0) identity = this.symbols[extension].identity
         }
         identity
     }
@@ -6594,6 +6661,9 @@ class BootstrapAnalyzer(
                 }
             }
         }
+        // An extension `val` is assigned once per object (a second assignment
+        // traps when the program runs), so both kinds take assignments.
+        if (!result && this.extensionFieldSymbol(owner, field) >= 0) result = true
         result
     }
 
@@ -7631,6 +7701,22 @@ class BootstrapAnalyzer(
         receiver: BootstrapExpression,
         context: string
     ): void {
+        var place = receiver
+        while ((place.kind == "member" || place.kind == "index" ||
+                place.kind == "delegate.project") && place.children.size > 0) {
+            if (place.kind == "member") {
+                this.mutationPlaceSources.append(this.currentSourceIdentity)
+                this.mutationPlaceBegins.append(place.begin)
+                this.mutationPlaceEnds.append(place.end)
+            }
+            place = place.children[0]
+        }
+        // A field of `this` named alone (in a method or extension function).
+        if (place.kind == "identifier") {
+            this.mutationPlaceSources.append(this.currentSourceIdentity)
+            this.mutationPlaceBegins.append(place.begin)
+            this.mutationPlaceEnds.append(place.end)
+        }
         val root = bootstrapPlaceRootName(receiver)
         if (root != "" && this.hasVisibleLocal(root) &&
             ((this.visibleLocalKind(root) == "parameter" &&
@@ -9376,6 +9462,12 @@ class BootstrapAnalyzer(
                 type = declaration.name
                 publish = true
             }
+            if (bootstrapIsExtensionFieldKind(declaration.kind)) {
+                if (declaration.resultType != "inferred") {
+                    type = bootstrapNormalizeType(declaration.resultType)
+                }
+                publish = true
+            }
             // An overload (same name, other parameter types) is published by
             // overload.ab under its own name before the build's analysis; a
             // module analyzed on its own keeps the first one.
@@ -9396,9 +9488,14 @@ class BootstrapAnalyzer(
                     }
                     previous = previous + 1
                 }
-                if (!overload) this.fail(
-                    "symbol.duplicate:$symbolName:$previousSource:${declaration.sourceIdentity}"
-                )
+                // A duplicate extension field is reported once, not again for
+                // its default function.
+                if (!overload && !(declaration.extensionOwner != "" &&
+                    declaration.name.startsWith(bootstrapExtensionFieldDefaultName("")))) {
+                    this.fail(
+                        "symbol.duplicate:$symbolName:$previousSource:${declaration.sourceIdentity}"
+                    )
+                }
             }
             if (publish && !overload) {
                 this.appendSymbol(BootstrapSymbol(
@@ -9434,6 +9531,7 @@ class BootstrapAnalyzer(
                 declaration.kind == "class" ||
                 declaration.kind == "interface" ||
                 declaration.kind == "type" ||
+                bootstrapIsExtensionFieldKind(declaration.kind) ||
                 (bootstrapDeclarationIsValue(declaration.kind) &&
                  declaration.resultType != "inferred")
             if (!predeclared && this.hasSymbol(symbolName)) {
@@ -9515,6 +9613,9 @@ class BootstrapAnalyzer(
                 if (!bootstrapScalarTypeUnderlyingValid(underlying)) {
                     this.fail("type.underlying:${declaration.name}:$underlying")
                 }
+            }
+            if (bootstrapIsExtensionFieldKind(declaration.kind)) {
+                this.validateExtensionField(declaration)
             }
             if (!predeclared) {
                 this.appendSymbol(BootstrapSymbol(
@@ -9912,8 +10013,13 @@ class BootstrapAnalyzer(
                         bootstrapNormalizeType(declaration.resultType),
                         actual
                     )) {
+                    val defaultPrefix = bootstrapExtensionFieldDefaultName("")
                     this.fail(
-                        "function.result:${declaration.name}:${bootstrapNormalizeType(declaration.resultType)}:$actual"
+                        if (declaration.extensionOwner != "" &&
+                            declaration.name.startsWith(defaultPrefix)) {
+                            // An extension field's default (its default function).
+                            "field.extension-type:${declaration.extensionOwner}.${declaration.name.slice(defaultPrefix.size, declaration.name.size)}:${bootstrapNormalizeType(declaration.resultType)}:$actual"
+                        } else "function.result:${declaration.name}:${bootstrapNormalizeType(declaration.resultType)}:$actual"
                     )
                 }
                 if (declaration.resultType != "inferred" &&
@@ -10142,7 +10248,10 @@ class BootstrapAnalyzer(
                 this.initEdges.implicitDeclarations,
                 this.initEdges.implicitNames,
                 initialization.dependencyStarts,
-                initialization.dependencies
+                initialization.dependencies,
+                this.mutationPlaceSources,
+                this.mutationPlaceBegins,
+                this.mutationPlaceEnds
             ),
             this.contextualLiterals
         )
@@ -11107,6 +11216,15 @@ fun bootstrapInferMember(
         result = analyzer.fieldType(receiver, expression.text)
         if (result == "unknown") {
             analyzer.fail("member:${receiver}.${expression.text}")
+        }
+        // An extension field the object doesn't have reads its default: the
+        // read calls the default function.
+        if (analyzer.initEdges.owner >= 0 &&
+            analyzer.extensionFieldSymbol(receiver, expression.text) >= 0) {
+            val defaultFunction = analyzer.symbolIndex(
+                "$receiver.${bootstrapExtensionFieldDefaultName(expression.text)}"
+            )
+            if (defaultFunction >= 0) bootstrapInitRecordSymbol(analyzer, defaultFunction)
         }
         if (bootstrapIsBorrowType(rawReceiver) &&
             !bootstrapRegionResultIsIndependent(result)) {

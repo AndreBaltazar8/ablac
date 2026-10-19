@@ -266,6 +266,27 @@ fun bootstrapCompilerTransformTarget(
     "error[E_COMPILER_TRANSFORM_MODULE]: $operation can't change `${declaration.name}` yet: it is declared in ${declaration.sourceIdentity}, and a transform changes only its own module's functions\n"
 }
 
+// Extension fields a transform removed (`Owner.name`), taken by the staged
+// parse when it copies the module back (bootstrapRemoveExtensionFields).
+var bootstrapExtensionFieldRemovals: array<string> = []
+
+/** The extension fields of the class `owner`, as declaration indices. */
+fun bootstrapEvalExtensionFields(
+    declarations: array<BootstrapDeclaration>,
+    owner: string
+): array<int> {
+    val fields: array<int> = []
+    var index = 0
+    while (index < declarations.size) {
+        if (bootstrapIsExtensionFieldKind(declarations[index].kind) &&
+            bootstrapNormalizeType(declarations[index].extensionOwner) == owner) {
+            fields.append(index)
+        }
+        index = index + 1
+    }
+    fields
+}
+
 fun bootstrapStageFunctionBodyReplacement(
     replacement: BootstrapFunctionBodyReplacement
 ): bool {
@@ -2264,7 +2285,11 @@ class BootstrapEvalContext(
     // Each class's field names, by declaration index: built at its first
     // construction and shared by its instances (constructionKnown says which).
     val constructionFields: array<array<string>> = [],
-    val constructionKnown: array<bool> = []
+    val constructionKnown: array<bool> = [],
+    // Whether the program declares extension fields, once looked (one entry): an
+    // instance then gets its own copy of the names, since gaining an
+    // extension field appends to them (bootstrapEvaluatePlace).
+    val extensionFields: array<bool> = []
 )
 
 // ABLA_EVAL_STEP_LIMIT lowers the step limit (never raises it), so a test can
@@ -5413,6 +5438,116 @@ class BootstrapEvaluator(
         result
     }
 
+    /** The object's field `name`: a declared one, or an extension field (its
+     *  value if the object holds it, else its default, not stored). Invalid
+     *  for neither. */
+    fun objectField(
+        receiver: BootstrapEvalValue,
+        name: string
+    ): BootstrapEvalValue {
+        var result = bootstrapEvalInvalid()
+        var found = false
+        var field = 0
+        while (field < receiver.fieldNames.size) {
+            if (receiver.fieldNames[field] == name) {
+                result = receiver.elements[field]
+                found = true
+            }
+            field = field + 1
+        }
+        if (!found) {
+            val declaration = this.extensionFieldDefaultDeclaration(receiver.owner, name)
+            if (declaration >= 0) result = this.extensionFieldDefault(receiver, declaration)
+        }
+        result
+    }
+
+    /** The default function of the extension field `owner.field`
+     *  (bootstrapExtensionFieldDefaultName), -1 when there is none. */
+    fun extensionFieldDefaultDeclaration(owner: string, field: string): int {
+        val index = this.namedExtension(
+            bootstrapExtensionFieldDefaultName(field), owner, "fun"
+        )
+        index
+    }
+
+    /** Whether `owner.field` is an extension `val`, assigned once per object. */
+    fun extensionFieldIsValue(owner: string, field: string): bool =
+        this.namedExtension(field, owner, "extension.val") >= 0
+
+    /** The first declaration of kind `kind` named `name` extending `owner`
+     *  (through the name index when it covers the declarations), or -1. */
+    fun namedExtension(name: string, owner: string, kind: string): int {
+        var result = -1
+        val indexed = this.context.size == this.declarations.size
+        var node = if (indexed) this.firstNamed(name) else -1
+        var scanned = 0
+        var more = true
+        while (result < 0 && more) {
+            var index = -1
+            if (indexed) {
+                if (node >= 0) {
+                    index = this.namedDeclaration(node)
+                    node = this.nextNamed(node)
+                }
+            } else if (scanned < this.declarations.size) {
+                index = scanned
+                scanned = scanned + 1
+            }
+            if (index < 0) {
+                more = false
+            } else {
+                val declaration = this.declarations[index]
+                if (declaration.kind == kind && declaration.name == name &&
+                    declaration.extensionOwner != "" &&
+                    bootstrapNormalizeType(declaration.extensionOwner) == owner) result = index
+            }
+        }
+        result
+    }
+
+    /** Runs an extension field's default function with `receiver` as `this`. */
+    fun extensionFieldDefault(
+        receiver: BootstrapEvalValue,
+        index: int
+    ): BootstrapEvalValue {
+        val declaration = this.declarations[index]
+        val invocation = BootstrapEvaluator(
+            this.declarations,
+            this.affineTypes,
+            this.context,
+            ["this"],
+            [bootstrapEvalCoerce(this, receiver, declaration.extensionOwner)],
+            [false],
+            this.cursors,
+            this.syntax,
+            this.typedCalls,
+            this.reflectedTypes,
+            this.generatedDeclarations,
+            this.extensionRequests,
+            this.compileInputPaths,
+            this.compileInputContents,
+            this.globalKeys,
+            this.globalValues,
+            this.allowedCompileEffects,
+            this.errors,
+            this.steps,
+            this.diagnostics,
+            this.sourceIdentity
+        )
+        var result = bootstrapEvaluateFrom(
+            invocation, declaration.sourceIdentity, declaration.expression
+        )
+        if (result.kind == "return" && result.elements.size == 1) {
+            result = result.elements[0]
+        }
+        result = bootstrapEvalCoerce(this, result, declaration.resultType)
+        this.errors = invocation.errors
+        this.steps = invocation.steps
+        this.diagnostics = invocation.diagnostics
+        result
+    }
+
     fun evaluate(expression: BootstrapExpression): BootstrapEvalValue {
         val errorsBefore = this.errors
         val diagnosticsBefore = this.diagnostics.size
@@ -5645,9 +5780,22 @@ fun bootstrapEvaluateConstruction(
         context.constructionFields[declarationIndex] = fieldNames
         context.constructionKnown[declarationIndex] = true
     }
+    // Where the program declares extension fields, an instance gets its own
+    // names: gaining one appends to them (bootstrapEvaluatePlace).
+    if (context.extensionFields.size == 0) {
+        var found = false
+        for (candidate in evaluator.declarations) {
+            if (bootstrapIsExtensionFieldKind(candidate.kind)) found = true
+        }
+        context.extensionFields.append(found)
+    }
+    val instanceNames: array<string> = []
+    if (context.extensionFields[0]) {
+        for (name in fieldNames) instanceNames.append(name)
+    }
     result = bootstrapEvalObject(
         declaration.name,
-        fieldNames,
+        if (context.extensionFields[0]) instanceNames else fieldNames,
         fields
     )
     val escaped = bootstrapEvalFirstEscape(fields)
@@ -6939,15 +7087,39 @@ fun bootstrapEvaluateMember(
             result = result
         }
     } else if (receiver.kind == "object") {
-        var field = 0
-        while (field < receiver.fieldNames.size) {
-            if (receiver.fieldNames[field] == expression.text) {
-                result = receiver.elements[field]
-            }
-            field = field + 1
-        }
-        result = result
+        result = evaluator.objectField(receiver, expression.text)
     } else result = result
+    if (rawReceiver.kind == "borrow" &&
+        bootstrapEvalValueNeedsBorrow(result)) {
+        result = bootstrapEvalBorrow(result)
+    }
+    result
+}
+
+/** The value a mutation goes through (the receiver of `append`, `clear`, a
+ *  map's `set`, an element or a field assignment): along a member chain, an
+ *  extension field the object doesn't have takes its default, stored, so
+ *  the mutation stays (as compiled code does at sema's mutation places). */
+fun bootstrapEvaluatePlace(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    if (expression.kind != "member" || expression.children.size != 1 ||
+        expression.text == "size") return evaluator.evaluate(expression)
+    val rawReceiver = bootstrapEvaluatePlace(evaluator, expression.children[0])
+    val receiver = bootstrapEvalUnwrapBorrow(rawReceiver)
+    var result = bootstrapEvalInvalid()
+    if (receiver.kind == "object") {
+        var held = false
+        for (field in receiver.fieldNames) {
+            if (field == expression.text) held = true
+        }
+        result = evaluator.objectField(receiver, expression.text)
+        if (!held && result.kind != "invalid") {
+            receiver.fieldNames.append(expression.text)
+            receiver.elements.append(result)
+        }
+    }
     if (rawReceiver.kind == "borrow" &&
         bootstrapEvalValueNeedsBorrow(result)) {
         result = bootstrapEvalBorrow(result)
@@ -6962,13 +7134,20 @@ fun bootstrapEvaluateMemberAssign(
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
     val receiver = bootstrapEvalUnwrapBorrow(
-        evaluator.evaluate(expression.children[0])
+        bootstrapEvaluatePlace(evaluator, expression.children[0])
     )
     val value = evaluator.evaluate(expression.children[1])
     var assigned = false
     var field = 0
     while (field < receiver.fieldNames.size) {
         if (receiver.fieldNames[field] == expression.text) {
+            if (evaluator.extensionFieldIsValue(receiver.owner, expression.text)) {
+                return bootstrapEvalRuntimePanic(
+                    evaluator, "E_EVAL_EXTENSION_REASSIGNED",
+                    "field.extension-reassigned:${receiver.owner}.${expression.text}",
+                    expression
+                )
+            }
             if (receiver.elements[field].kind != "uninitialized") {
                 evaluator.dropValue(receiver.elements[field])
             }
@@ -6976,6 +7155,13 @@ fun bootstrapEvaluateMemberAssign(
             assigned = true
         }
         field = field + 1
+    }
+    // An extension field the object doesn't hold yet.
+    if (!assigned && receiver.kind == "object" &&
+        evaluator.extensionFieldDefaultDeclaration(receiver.owner, expression.text) >= 0) {
+        receiver.fieldNames.append(expression.text)
+        receiver.elements.append(value)
+        assigned = true
     }
     if (!assigned) evaluator.errors = evaluator.errors + 1
     result = value
@@ -7026,7 +7212,7 @@ fun bootstrapEvaluateIndexAssign(
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
     val receiver = bootstrapEvalUnwrapBorrow(
-        evaluator.evaluate(expression.children[0])
+        bootstrapEvaluatePlace(evaluator, expression.children[0])
     )
     val index = evaluator.evaluate(expression.children[1]).integer
     val value = evaluator.evaluate(expression.children[2])
@@ -7057,8 +7243,14 @@ fun bootstrapEvaluateMemberCall(
     expression: BootstrapExpression
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
+    // A mutating built-in (an array's append, truncate and clear; a map's set,
+    // remove, clear and take) goes through its receiver as a place.
+    val mutates = expression.text == "append" || expression.text == "truncate" ||
+        expression.text == "clear" || expression.text == "set" ||
+        expression.text == "remove" || expression.text == "take"
     val receiver = bootstrapEvalUnwrapBorrow(
-        evaluator.evaluate(expression.children[0])
+        if (mutates) bootstrapEvaluatePlace(evaluator, expression.children[0])
+        else evaluator.evaluate(expression.children[0])
     )
     val pathProvider = ctNativePathProvider(evaluator, receiver, expression.text)
     if (pathProvider >= 0) {
@@ -9004,6 +9196,100 @@ fun bootstrapEvaluateCallCompiler(
                 } else evaluator.errors = evaluator.errors + 1
             }
         } else evaluator.errors = evaluator.errors + 1
+    }
+    // A class's extension fields (`var Point.label: T = default`), in
+    // declaration order: how many, and each one's name, type and mutability.
+    if (targetName == "compilerExtensionFieldCount" ||
+        targetName == "compilerExtensionFieldName" ||
+        targetName == "compilerExtensionFieldType" ||
+        targetName == "compilerExtensionFieldIsMutable") {
+        val handle = evaluator.evaluate(expression.children[0]).integer
+        val fields = if (handle >= 0 && handle < evaluator.declarations.size &&
+            evaluator.declarations[handle].kind == "class")
+            bootstrapEvalExtensionFields(evaluator.declarations, evaluator.declarations[handle].name)
+            else []
+        if (handle < 0 || handle >= evaluator.declarations.size ||
+            evaluator.declarations[handle].kind != "class") {
+            evaluator.errors = evaluator.errors + 1
+        } else if (targetName == "compilerExtensionFieldCount") {
+            result = bootstrapEvalInteger(fields.size)
+        } else {
+            val wanted = evaluator.evaluate(expression.children[1]).integer
+            if (wanted < 0 || wanted >= fields.size) {
+                evaluator.errors = evaluator.errors + 1
+            } else {
+                val field = evaluator.declarations[fields[wanted]]
+                if (targetName == "compilerExtensionFieldName") {
+                    result = bootstrapEvalString(field.name)
+                }
+                if (targetName == "compilerExtensionFieldType") {
+                    result = bootstrapEvalString(bootstrapNormalizeType(field.resultType))
+                }
+                if (targetName == "compilerExtensionFieldIsMutable") {
+                    result = bootstrapEvalBoolean(field.kind == "extension.var")
+                }
+            }
+        }
+    }
+    // Declares an extension field from a transform: a generated module
+    // `var Owner.name: type = default` (`val` when not mutable), checked with
+    // the complete candidate program as a written one is.
+    if (targetName == "compilerAddExtensionField") {
+        val handle = evaluator.evaluate(expression.children[0]).integer
+        val name = evaluator.evaluate(expression.children[1])
+        val type = evaluator.evaluate(expression.children[2])
+        val initial = evaluator.evaluate(expression.children[3])
+        val mutable = evaluator.evaluate(expression.children[4])
+        val valid = handle >= 0 && handle < evaluator.declarations.size &&
+            evaluator.declarations[handle].kind == "class" &&
+            name.kind == "string" && type.kind == "string" &&
+            initial.kind == "string" && mutable.kind == "boolean" &&
+            bootstrapStageGeneratedModule(BootstrapGeneratedModuleRequest(
+                "extension-field:${evaluator.declarations[handle].name}.${name.text}",
+                "${if (mutable.boolean) "var" else "val"} ${evaluator.declarations[handle].name}.${name.text}: ${type.text} = ${initial.text}\n"
+            ))
+        if (!valid) {
+            evaluator.recordEvaluatorDiagnostic(
+                "E_COMPILER_TRANSFORM_EXTENSION_FIELD",
+                "compiler.addExtensionField requires a class handle, a field name, a type and a default's source, inside compiler.transform"
+            )
+            evaluator.errors = evaluator.errors + 1
+        }
+        result = bootstrapEvalBoolean(valid)
+    }
+    // Removes one of the transform's own module's extension fields (with its
+    // default function) before analysis.
+    if (targetName == "compilerRemoveExtensionField") {
+        val handle = evaluator.evaluate(expression.children[0]).integer
+        val name = evaluator.evaluate(expression.children[1])
+        var field = -1
+        if (handle >= 0 && handle < evaluator.declarations.size &&
+            evaluator.declarations[handle].kind == "class" && name.kind == "string") {
+            for (candidate in bootstrapEvalExtensionFields(
+                evaluator.declarations, evaluator.declarations[handle].name
+            )) {
+                if (evaluator.declarations[candidate].name == name.text) field = candidate
+            }
+        }
+        val refused = if (field >= 0) bootstrapCompilerTransformTarget(
+            evaluator.declarations, field, "compiler.removeExtensionField", true
+        ) else ""
+        val valid = field >= 0 && refused == "" && bootstrapCompilerTransformActive
+        if (valid) {
+            bootstrapExtensionFieldRemovals.append(
+                "${evaluator.declarations[handle].name}.${name.text}"
+            )
+        } else if (refused != "") {
+            evaluator.diagnostics = "${evaluator.diagnostics}$refused"
+            evaluator.errors = evaluator.errors + 1
+        } else {
+            evaluator.recordEvaluatorDiagnostic(
+                "E_COMPILER_TRANSFORM_EXTENSION_FIELD",
+                "compiler.removeExtensionField requires a class handle and the name of one of its extension fields, inside compiler.transform"
+            )
+            evaluator.errors = evaluator.errors + 1
+        }
+        result = bootstrapEvalBoolean(valid)
     }
     // Literal top-level `#compilerRegisterSubparser`, `#compilerGrant` and
     // `#compilerGenerateModule` actions are collected from source before any

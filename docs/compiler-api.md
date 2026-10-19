@@ -100,6 +100,7 @@ fails, never reporting a change it then drops.
 | `bindings()`, `findBinding(name)`, `bindingName`, `bindingIsMutable`, `bindingIsDelegated`, `bindingExposedType`, `bindingDelegateType`, `bindingGetter`, `bindingSetter`, `bindingCanReplaceDelegate`, `bindingByBegin`, `bindingByEnd` | read top-level bindings ([below](#binding-reflection)) |
 | `transform(handler)` | register a transform (only as a literal top-level action) |
 | `replaceFunctionBody(function, source)`, `addFunctionAnnotation(function, name)` | change the program, from a transform |
+| `extensionFields(type)`, `fieldsOf(type, includeExtensions)`, `addExtensionField(type, name, fieldType, initial, mutable)`, `removeExtensionField(type, name)` | a class's [extension fields](#extension-fields) |
 | `function(name)`, `reference(handle)` | a `FunctionReference`, for building other programs |
 | `newModule(name)` | an `IndependentModule`: a separate program built from chosen functions ([below](#independent-modules-and-declaration-blocks)) |
 | `buildProgram(...)`, `defineTarget(...)`, `contributeArtifactRoot(...)` | [programmable builds](programmable-builds.md) |
@@ -313,6 +314,46 @@ parameter ownership, inserted conversion descriptions, and phase/trust flags.
 Only deferred request expressions retain these compact post-resolution records;
 raw parser handlers cannot query typed state. The stable generic-substitution
 surface returns zero until generic declarations land.
+
+## Extension fields
+
+A class's extension fields ([language.md](language.md#extension-fields)) are
+listed by handle (`compiler.findClass(name)`): `compiler.extensionFields(type)`
+returns their names in declaration order, and `compiler.fieldsOf(type)` returns
+the declared fields and then the extension fields (`includeExtensions = false`
+for the declared ones only). From a transform, `compiler.addExtensionField`
+declares one as if the program did, with the default given as source.
+`compiler.removeExtensionField` removes one that the transform's own module
+declares; another module's is refused (`E_COMPILER_TRANSFORM_MODULE`, or
+`E_COMPILER_TRANSFORM_STDLIB`):
+
+```abla
+import "abla/io"
+import "abla/compiler"
+
+class Enemy(val level: int)
+
+var Enemy.unused: int = 0
+
+compile fun fields(): void {
+    val enemy = compiler.findClass("Enemy")
+    compiler.addExtensionField(enemy, "maxHp", "int", "this.level * 10")
+    compiler.removeExtensionField(enemy, "unused")
+    return
+}
+
+#compiler.transform(fields)
+
+fun main {
+    println("${Enemy(3).maxHp}")
+}
+// output:
+// 30
+```
+
+`compilerExtensionFieldCount`, `compilerExtensionFieldName`,
+`compilerExtensionFieldType` and `compilerExtensionFieldIsMutable` are the
+versioned ABI underneath.
 
 ## Binding reflection
 

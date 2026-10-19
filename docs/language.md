@@ -816,6 +816,67 @@ fun main {
 // 25 true 6
 ```
 
+### Extension fields
+
+`var Type.name: T = default` adds a field to a class from outside it, as an
+extension function adds a method. It is read and written like a declared
+field, `p.label` and `p.label = "x"`, and inside the class's methods and
+extension functions by name alone:
+
+```abla
+import "abla/io"
+
+class Point(val x: int)
+
+var Point.label: string = "none"
+var Point.hits: int = this.x * 10
+val Point.created: int = 0
+
+fun Point.describe(): string = "$label:$hits"
+
+fun main {
+    val p = Point(3)
+    println(p.describe())
+    p.label = "named"
+    p.hits = p.hits + 1
+    p.created = 7
+    println("${p.describe()} ${p.created}")
+}
+// output:
+// none:30
+// named:31 7
+```
+
+- **Type and default:** the type is written, and the default is required
+  (`= null` for an optional type). An object that never had the field set
+  reads the default, which may use `this` (the object) and its fields.
+  Nothing happens at construction: a default runs at each read of an unset
+  field and is not kept, so defaults should be pure.
+- **Through a mutation:** a field used as the place a mutation goes through
+  keeps its default from then on, so the mutation stays. Examples are
+  `n.items.append(x)`, `n.items[0] = x`, `n.box.value = 3` and a map's
+  `set`. A plain read never stores anything.
+- **`val`:** an extension `val` takes one assignment per object. A second
+  one stops the program (`field.extension-reassigned:Point.created`), and
+  under `#` it is `E_EVAL_EXTENSION_REASSIGNED`.
+- **Owner:** the owner is a class, from any module or package. Scalars,
+  strings, arrays, nominal types and interfaces have no object to hold one
+  (`field.extension-owner`).
+- **Names:** a member of the class with the same name is an error
+  (`field.extension-shadows`). So are two extension fields of one class with
+  the same name, in any modules (`symbol.duplicate`, as for extension
+  functions).
+- **Ownership:** an extension field never changes what its class is to code
+  that doesn't see it. A field of an affine type (a resource, `Shared`,
+  `Weak`, `Mutex`) is allowed only on a class that is affine already
+  (`field.extension-resource`). Such fields are dropped with the object,
+  after its declared fields, from the last set to the first.
+- **Access cost:** an extension field is reached by name, a little more
+  slowly than a declared field, which stays at its fixed slot.
+
+`#` code reads and writes extension fields the same way, and the compiler
+API lists, adds and removes them ([compiler-api.md](compiler-api.md#extension-fields)).
+
 ### Lambdas and closures
 
 A lambda is written in braces. Parameters, if any, come before `->`; their

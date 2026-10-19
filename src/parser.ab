@@ -434,7 +434,9 @@ class BootstrapParser(
         while (!finished && !this.at("end")) {
             if (angles == 0 && parentheses == 0 &&
                 (this.at("=") || this.atWord("by") || this.at("{") ||
-                 this.at("newline") || this.at(";"))) {
+                 this.at("newline") || this.at(";") ||
+                 // `fun f(): T where …`: a reserved generic constraint.
+                 (type != "" && this.atWord("where")))) {
                 finished = true
             } else if (angles == 0 && parentheses == 0 &&
                 (this.at(",") || (stopOnRightParen && this.at(")")))) {
@@ -1864,11 +1866,37 @@ class BootstrapParser(
             )
         }
 
+    /** Reserved syntax (a generic's `<T>`, `where`, `const` type parameters, an
+     *  interface's `type Item`, `sealed`): reported as not supported yet, and
+     *  skipped, so it never parses as something else. */
+    fun failReserved(form: string) {
+        this.fail("NOT_YET_SUPPORTED", "$form is reserved syntax, not supported yet")
+    }
+
+    /** Skips a `<…>` group (type parameters), nested ones included. */
+    fun skipAngleGroup() {
+        var depth = 0
+        var more = true
+        while (more && !this.at("end")) {
+            if (this.at("<")) depth = depth + 1
+            if (this.at(">")) depth = depth - 1
+            if (this.at(">>")) depth = depth - 2
+            if (this.at(">>>")) depth = depth - 3
+            this.position = this.position + 1
+            if (depth <= 0) more = false
+        }
+    }
+
     fun parseDeclaration(): BootstrapDeclaration {
         val begin = this.tokens[this.position].begin
         var kind = this.tokens[this.position].kind
         if (this.atWord("type")) kind = "type"
         this.position = this.position + 1
+        // `fun <T> first(…)`: a generic function.
+        if (kind == "fun" && this.at("<")) {
+            this.failReserved("a generic function (`fun <T>`)")
+            this.skipAngleGroup()
+        }
         var nameToken = this.tokens[this.position]
         this.expect("identifier")
         var declarationName = bootstrapTokenText(this.source, nameToken)
@@ -1925,6 +1953,14 @@ class BootstrapParser(
             this.expect("identifier")
             declarationName = bootstrapTokenText(this.source, nameToken)
         }
+        // `var Point.label: string = ""`: an extension field of the class.
+        if ((kind == "val" || kind == "var") && this.consume(".")) {
+            kind = "extension.$kind"
+            extensionOwner = declarationName
+            nameToken = this.tokens[this.position]
+            this.expect("identifier")
+            declarationName = bootstrapTokenText(this.source, nameToken)
+        }
         var expression = BootstrapExpression("missing", "", begin, begin, [])
         var parameters: array<string> = []
         var parameterTypes: array<string> = []
@@ -1944,6 +1980,12 @@ class BootstrapParser(
             if (this.consume(":")) {
                 resultType = this.parseType(false)
             }
+            // `where T : Shape`: a generic's constraints.
+            if (this.atWord("where")) {
+                this.failReserved("a `where` clause")
+                while (!this.at("end") && !this.at("=") && !this.at("{") &&
+                       !this.at("newline")) this.position = this.position + 1
+            }
             if (this.consume("=")) {
                 this.skipSeparators()
                 expression = this.parseExpression()
@@ -1951,6 +1993,11 @@ class BootstrapParser(
             }
             else if (this.at("{")) expression = this.parseBlock()
         } else if (kind == "class" || kind == "interface") {
+            // `class Box<T>`: a generic class or interface.
+            if (this.at("<")) {
+                this.failReserved("a generic ${kind} (`$kind ${declarationName}<T>`)")
+                this.skipAngleGroup()
+            }
             if (this.at("(")) {
                 val parsedParameters = this.parseParameters()
                 parameters = parsedParameters.names
@@ -1969,6 +2016,10 @@ class BootstrapParser(
                         methods.append(this.parseTrustedDeclaration())
                     } else if (this.at("noescape")) {
                         methods.append(this.parseNoEscapeDeclaration())
+                    } else if (kind == "interface" && this.atWord("type")) {
+                        // `type Item`: an interface's associated type.
+                        this.failReserved("an associated type (`type Item`)")
+                        this.skipToDeclarationEnd()
                     } else {
                         this.fail(
                             "CLASS_MEMBER",
@@ -2404,6 +2455,13 @@ class BootstrapParser(
                 declarations.append(this.parseExternal())
             } else if (this.at("compile")) {
                 declarations.append(this.parseCompileDeclaration())
+            } else if (this.atWord("sealed") &&
+                (this.tokens[this.position + 1].kind == "interface" ||
+                 this.tokens[this.position + 1].kind == "class")) {
+                // `sealed interface Shape`: reported, then read as the plain form.
+                this.failReserved("`sealed`")
+                this.position = this.position + 1
+                declarations.append(this.parseDeclaration())
             } else if (
                 this.at("fun") || this.at("class") || this.atWord("type") ||
                 this.at("interface") || this.at("val") || this.at("var")
@@ -2425,6 +2483,7 @@ class BootstrapParser(
             }
             this.skipSeparators()
         }
+        bootstrapAppendExtensionFieldDefaults(declarations)
         BootstrapParseResult(
             declarations,
             actions,
@@ -2435,6 +2494,55 @@ class BootstrapParser(
             this.diagnostics
         )
     }
+}
+
+fun bootstrapIsExtensionFieldKind(kind: string): bool =
+    kind == "extension.val" || kind == "extension.var"
+
+/** The extension function that computes an extension field's default:
+ *  `Owner.__abla_default_<field>()`, whose body is the default expression (so
+ *  it reads `this` and the receiver's fields as an extension function does). */
+fun bootstrapExtensionFieldDefaultName(field: string): string = "__abla_default_$field"
+
+/** Appends each extension field's default function after the declarations. */
+fun bootstrapAppendExtensionFieldDefaults(var declarations: array<BootstrapDeclaration>): void {
+    val count = declarations.size
+    var index = 0
+    while (index < count) {
+        val field = declarations[index]
+        if (bootstrapIsExtensionFieldKind(field.kind) &&
+            field.expression.kind != "missing" &&
+            field.expression.kind != "delegate.initializer") {
+            declarations.append(BootstrapDeclaration(
+                "fun",
+                bootstrapExtensionFieldDefaultName(field.name),
+                field.begin,
+                field.end,
+                field.expression,
+                [],
+                [],
+                field.resultType,
+                [],
+                [],
+                "",
+                [],
+                field.extensionOwner,
+                false,
+                false,
+                false,
+                field.generatedNamespace,
+                field.generatedOriginBegin,
+                field.generatedOriginEnd,
+                [],
+                [],
+                [],
+                [],
+                field.sourceIdentity
+            ))
+        }
+        index = index + 1
+    }
+    return
 }
 
 fun bootstrapParse(source: string): BootstrapParseResult {
