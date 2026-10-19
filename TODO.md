@@ -19,10 +19,6 @@ called out below.
   indirection stubs (ORC lazy reexports or an indirect stubs manager) so a function can be
   redefined while the program runs.
 
-- [ ] **An operator in a parameter default is not rewritten.** `fun f(b: N = N(1) + N(2))`
-  with `operator fun N.plus` fails with `arithmetic.type`: the probe resolves the default's
-  `+`, but `bootstrapOverloadRewriteDeclaration` (`overload.ab`) rewrites only the body,
-  not `parameterDefaults` (a method's defaults likewise).
 
 ## Packages
 

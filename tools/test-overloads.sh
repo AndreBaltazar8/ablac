@@ -15,6 +15,16 @@ status=$?
 set -e
 test "$status" -eq 42
 
+# Operators in parameter defaults.
+"$compiler" build \
+    "$project_root/tests/cases/modules/operator-defaults.ab" \
+    -o "$output_root/operator-defaults" --no-cache
+set +e
+"$output_root/operator-defaults"
+status=$?
+set -e
+test "$status" -eq 42
+
 set +e
 "$compiler" build \
     "$project_root/tests/cases/modules/overload-ambiguous.ab" \
@@ -23,4 +33,4 @@ status=$?
 set -e
 test "$status" -ne 0
 grep -q 'call.overload-ambiguous:pick(P,Q)' "$output_root/ambiguous.log"
-echo "overloads: free/extension/method overloads, operators, ambiguity diagnostic passed"
+echo "overloads: free/extension/method overloads, operators (in parameter defaults too), ambiguity diagnostic passed"
