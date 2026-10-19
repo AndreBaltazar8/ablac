@@ -3459,23 +3459,38 @@ fun bootstrapMarkSourceDeclaration(
     return
 }
 
-// The module values an initializer reads directly (identifiers naming a val / var).
+// The module values an initializer reads directly (identifiers naming a val /
+// var, not a local of the same name: the analysis's shadowed identifiers).
 fun bootstrapCollectValueReads(
     expression: BootstrapExpression,
     valueDeclarations: BootstrapFunctionDeclarationIndex,
-    var reads: array<int>
+    var reads: array<int>,
+    source: string,
+    shadowed: BootstrapStringSet
 ): void {
-    if (expression.kind == "identifier") {
+    if (expression.kind == "identifier" &&
+        !bootstrapNamesLocal(shadowed, source, expression)) {
         val value = valueDeclarations.find(expression.text)
         if (value >= 0) reads.append(value)
     }
     var child = 0
     while (child < expression.children.size) {
-        bootstrapCollectValueReads(expression.children[child], valueDeclarations, reads)
+        bootstrapCollectValueReads(
+            expression.children[child], valueDeclarations, reads, source, shadowed
+        )
         child = child + 1
     }
     return
 }
+
+// Whether the analysis found the identifier, call or assignment naming a
+// local of the same name as a top-level declaration (its shadowed identifiers).
+fun bootstrapNamesLocal(
+    shadowed: BootstrapStringSet,
+    source: string,
+    expression: BootstrapExpression
+): bool = shadowed.keys.size > 0 &&
+    shadowed.contains(bootstrapIdentifierKey(source, expression))
 
 fun bootstrapCollectSourceReachability(
     expression: BootstrapExpression,
@@ -3485,9 +3500,16 @@ fun bootstrapCollectSourceReachability(
     valueDeclarations: BootstrapFunctionDeclarationIndex,
     methodDeclarations: BootstrapMethodDeclarationIndex,
     var reachable: array<bool>,
-    var pending: array<int>
+    var pending: array<int>,
+    // Where the expression is, and what in it names a local rather than the
+    // declaration of the same name (the analysis's shadowed identifiers).
+    source: string,
+    shadowed: BootstrapStringSet
 ): void {
-    if (expression.kind == "call") {
+    val local = (expression.kind == "call" || expression.kind == "identifier" ||
+        expression.kind == "assign") &&
+        bootstrapNamesLocal(shadowed, source, expression)
+    if (expression.kind == "call" && !local) {
         val calledFunction = functionDeclarations.find(expression.text)
         bootstrapMarkSourceDeclaration(reachable, pending, calledFunction)
         // A call of a global that holds a function (`val maker = makeLeaf`,
@@ -3522,7 +3544,7 @@ fun bootstrapCollectSourceReachability(
             )
         }
     }
-    if (expression.kind == "identifier") {
+    if (expression.kind == "identifier" && !local) {
         bootstrapMarkSourceDeclaration(
             reachable,
             pending,
@@ -3551,7 +3573,7 @@ fun bootstrapCollectSourceReachability(
             argument = argument + 1
         }
     }
-    if (expression.kind == "assign") {
+    if (expression.kind == "assign" && !local) {
         bootstrapMarkSourceDeclaration(
             reachable,
             pending,
@@ -3568,7 +3590,9 @@ fun bootstrapCollectSourceReachability(
             valueDeclarations,
             methodDeclarations,
             reachable,
-            pending
+            pending,
+            source,
+            shadowed
         )
         child = child + 1
     }
@@ -3581,10 +3605,16 @@ fun bootstrapSourceInitializerWritesGlobal(
     functionDeclarations: BootstrapFunctionDeclarationIndex,
     typeDeclarations: BootstrapFunctionDeclarationIndex,
     valueDeclarations: BootstrapFunctionDeclarationIndex,
-    var functionStates: array<int>
+    var functionStates: array<int>,
+    source: string,
+    shadowed: BootstrapStringSet
 ): bool {
-    if (expression.kind == "assign" &&
+    val local = (expression.kind == "assign" || expression.kind == "call") &&
+        bootstrapNamesLocal(shadowed, source, expression)
+    if (expression.kind == "assign" && !local &&
         valueDeclarations.find(expression.text) >= 0) return true
+    // A local function value called may do anything.
+    if (expression.kind == "call" && local) return true
     if (expression.kind == "call") {
         // Exact internal sections are linker-visible declarations even when
         // ordinary Abla control flow never reads their addresses. Root their
@@ -3615,7 +3645,9 @@ fun bootstrapSourceInitializerWritesGlobal(
                 functionDeclarations,
                 typeDeclarations,
                 valueDeclarations,
-                functionStates
+                functionStates,
+                declaration.sourceIdentity,
+                shadowed
             )
             functionStates[function] = if (writes) 1 else 0
             if (writes) {
@@ -3646,7 +3678,9 @@ fun bootstrapSourceInitializerWritesGlobal(
                 functionDeclarations,
                 typeDeclarations,
                 valueDeclarations,
-                functionStates
+                functionStates,
+                source,
+                shadowed
             )) return true
         child = child + 1
     }
@@ -3681,7 +3715,9 @@ fun bootstrapSourceReachableDeclarations(
     // Calls lowering inserts into a declaration's bodies (a float template's
     // f64Text), by declaration index: the analysis's implicit calls.
     implicitDeclarations: array<int> = [],
-    implicitNames: array<string> = []
+    implicitNames: array<string> = [],
+    // What names a local rather than a declaration (the analysis's).
+    shadowed: BootstrapStringSet = bootstrapStringSet()
 ): array<bool> {
     val reachable: array<bool> = []
     val pending: array<int> = []
@@ -3709,7 +3745,9 @@ fun bootstrapSourceReachableDeclarations(
                 functionDeclarations,
                 typeDeclarations,
                 valueDeclarations,
-                initializerWriteStates
+                initializerWriteStates,
+                candidate.sourceIdentity,
+                shadowed
             ))
         if (candidate.name == "main") mainRoots = mainRoots + 1
         if (bootstrapDeclarationHasAnnotation(candidate, "naked")) {
@@ -3762,7 +3800,9 @@ fun bootstrapSourceReachableDeclarations(
             valueDeclarations,
             methodDeclarations,
             reachable,
-            pending
+            pending,
+            "",
+            shadowed
         )
         action = action + 1
     }
@@ -3809,7 +3849,9 @@ fun bootstrapSourceReachableDeclarations(
                 valueDeclarations,
                 methodDeclarations,
                 fromValues,
-                valuePending
+                valuePending,
+                reached.sourceIdentity,
+                shadowed
             )
             var reachedMethod = 0
             while (reachedMethod < reached.methods.size) {
@@ -3821,7 +3863,9 @@ fun bootstrapSourceReachableDeclarations(
                     valueDeclarations,
                     methodDeclarations,
                     fromValues,
-                    valuePending
+                    valuePending,
+                    reached.methods[reachedMethod].sourceIdentity,
+                    shadowed
                 )
                 reachedMethod = reachedMethod + 1
             }
@@ -3838,7 +3882,9 @@ fun bootstrapSourceReachableDeclarations(
             valueDeclarations,
             methodDeclarations,
             reachable,
-            pending
+            pending,
+            candidate.sourceIdentity,
+            shadowed
         )
         var method = 0
         while (method < candidate.methods.size) {
@@ -3850,7 +3896,9 @@ fun bootstrapSourceReachableDeclarations(
                 valueDeclarations,
                 methodDeclarations,
                 reachable,
-                pending
+                pending,
+                candidate.methods[method].sourceIdentity,
+                shadowed
             )
             method = method + 1
         }
@@ -4735,7 +4783,10 @@ class BootstrapLowerer(
     // the lowerers a lowerer makes share it.
     val liftProbe: BootstrapLiftProbe,
     // Result types the analysis inferred from bodies (ct_infer.ab).
-    val inferredResults: BootstrapInferredResultTypes = bootstrapNoInferredResultTypes()
+    val inferredResults: BootstrapInferredResultTypes = bootstrapNoInferredResultTypes(),
+    // What names a local rather than the declaration of the same name (the
+    // analysis's shadowed identifiers), for the reachability scans.
+    val shadowedIdentifiers: BootstrapStringSet = bootstrapStringSet()
 ) {
     /** The newest visible local named `name` (with a type, when `typed`), or -1. */
     fun visibleLocal(name: string, typed: bool): int {
@@ -7949,7 +8000,8 @@ class BootstrapLowerer(
                 this.valueDeclarations,
                 this.methodDeclarations,
                 this.inferredResults.implicitDeclarations,
-                this.inferredResults.implicitNames
+                this.inferredResults.implicitNames,
+                this.shadowedIdentifiers
             )
             var reachableIndex = 0
             while (reachableIndex < found.size) {
@@ -8003,7 +8055,9 @@ class BootstrapLowerer(
                 bootstrapCollectValueReads(
                     parsed.declarations[index].expression,
                     this.valueDeclarations,
-                    reads
+                    reads,
+                    parsed.declarations[index].sourceIdentity,
+                    this.shadowedIdentifiers
                 )
                 // And what it reads through what it calls (a function's body or
                 // defaults, an extension's, a method's), which the walk above
@@ -8040,7 +8094,9 @@ class BootstrapLowerer(
                 this.valueDeclarations,
                 this.methodDeclarations,
                 sourceReachable,
-                pendingDeclarations
+                pendingDeclarations,
+                declaration.sourceIdentity,
+                this.shadowedIdentifiers
             )
             var sourceMethod = 0
             while (sourceMethod < declaration.methods.size) {
@@ -8052,7 +8108,9 @@ class BootstrapLowerer(
                     this.valueDeclarations,
                     this.methodDeclarations,
                     sourceReachable,
-                    pendingDeclarations
+                    pendingDeclarations,
+                    declaration.methods[sourceMethod].sourceIdentity,
+                    this.shadowedIdentifiers
                 )
                 sourceMethod = sourceMethod + 1
             }
@@ -10469,7 +10527,8 @@ fun bootstrapLowerParsedCached(
         bootstrapIrLocalNames(),
         validationFailures,
         BootstrapLiftProbe([], []),
-        analyzed.inferredResults
+        analyzed.inferredResults,
+        bootstrapStringSetOf(analyzed.shadowedIdentifiers)
     ).lower(parsed, contextFirst, contextSecond, cache, pruneUnused)
 }
 

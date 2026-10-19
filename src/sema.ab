@@ -2377,12 +2377,28 @@ fun bootstrapRuntimeModuleSource(sourceIdentity: string): bool {
     sourceIdentity.startsWith(bootstrapRuntimeModulePrefix)
 }
 
+// An identifier, call or assignment by where it is: `source:begin:name`.
+fun bootstrapIdentifierKey(source: string, expression: BootstrapExpression): string =
+    "$source:${expression.begin}:${expression.text}"
+
+// The identifier a place (`rows`, `h.items[0]`) starts with, else a missing node.
+fun bootstrapPlaceRoot(expression: BootstrapExpression): BootstrapExpression {
+    if (expression.kind == "identifier") return expression
+    if ((expression.kind == "delegate.project" || expression.kind == "member" ||
+         expression.kind == "index") && expression.children.size > 0) {
+        return bootstrapPlaceRoot(expression.children[0])
+    }
+    BootstrapExpression("missing", "", expression.begin, expression.end, [])
+}
+
 // What an ownership diagnostic means and the usual fix, as a `help:` line
 // after it ("" for a code without one).
 fun bootstrapSemanticHelp(code: string): string {
     var colon = 0
     while (colon < code.size && code[colon] != 58) colon = colon + 1
     when (code.slice(0, colon)) {
+        "library.program-global" ->
+            "the standard library reads only its own globals, never a program's: this name is the library's local or a missing declaration"
         "native.runtime-internal" ->
             "this intrinsic exposes the runtime's own memory layout, so only the runtime (abla/runtime) calls it, even from trusted code: use the typed operation it backs (a field, an index, a function value's `ablaRuntimeFunctionId`), or `abla/unsafe` for raw memory you allocate"
         "subparser.unknown" ->
@@ -2920,7 +2936,11 @@ class BootstrapSemanticResult(
     // Result types inferred from bodies, which lowering types calls with.
     val inferredResults: BootstrapInferredResultTypes = bootstrapNoInferredResultTypes(),
     // Array literals typed from an inferred receiver, which lowering types.
-    val contextualLiterals: BootstrapContextualLiterals = bootstrapNoContextualLiterals()
+    val contextualLiterals: BootstrapContextualLiterals = bootstrapNoContextualLiterals(),
+    // The identifiers and calls that named a local while a top-level
+    // declaration has the name (BootstrapAnalyzer.shadowedIdentifiers), which
+    // lowering's name scans skip (bootstrapIdentifierKey keys).
+    val shadowedIdentifiers: array<string> = []
 )
 
 // Compile-time effects are deliberately represented as a compact bitset. The
@@ -5666,7 +5686,14 @@ class BootstrapAnalyzer(
     // its default there, stored, so the mutation stays (bootstrapLowerer).
     val mutationPlaceSources: array<string> = [],
     val mutationPlaceBegins: array<int> = [],
-    val mutationPlaceEnds: array<int> = []
+    val mutationPlaceEnds: array<int> = [],
+    // By identifier, call or assignment (bootstrapIdentifierKey): those that
+    // named a local or field while a top-level declaration has the same name,
+    // recorded while the local's scope was live. A check that runs after the
+    // scope is left (a body's result) and lowering's name scans read this
+    // rather than looking the name up again, where the local is gone and a
+    // global of the same name (of any module) would answer.
+    val shadowedIdentifiers: BootstrapStringSet = bootstrapStringSet()
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -6202,6 +6229,51 @@ class BootstrapAnalyzer(
         type == "unknown" || (bootstrapIsFunctionType(type) &&
             (bootstrapFunctionParameterCount(type) < 0 ||
              bootstrapFunctionParameterCount(type) == arguments))
+    }
+
+    /** Records that the identifier, call or assignment names a local or
+     *  field, when a top-level declaration has its name (shadowedIdentifiers). */
+    fun recordShadowed(expression: BootstrapExpression): void {
+        if (this.symbolIndex(expression.text) >= 0) {
+            this.shadowedIdentifiers.add(
+                bootstrapIdentifierKey(this.currentSourceIdentity, expression)
+            )
+        }
+        return
+    }
+
+    /** The kind of the global the identifier, call or assignment names: ""
+     *  when it named a local or field where it was analyzed
+     *  (shadowedIdentifiers) or names one in scope now. */
+    fun globalKindNamed(expression: BootstrapExpression): string {
+        if (expression.kind == "missing" || expression.text == "") return ""
+        if (this.shadowedIdentifiers.contains(
+            bootstrapIdentifierKey(this.currentSourceIdentity, expression)
+        )) return ""
+        if (this.shadowsGlobal(expression.text)) return ""
+        this.findKind(expression.text)
+    }
+
+    /** Fails when standard-library code names a global `val` or `var` of a
+     *  program's module: the library never reads the program's globals, so
+     *  such a name is a leak (a local the library meant, or a missing one). */
+    fun validateGlobalVisible(expression: BootstrapExpression): void {
+        if (!bootstrapStandardLibraryModuleSource(this.currentSourceIdentity) ||
+            this.shadowsGlobal(expression.text)) return
+        val entry = this.topLevelNames.find(expression.text)
+        if (entry < 0 || this.topLevelNames.counts[entry] != 1) return
+        val declaration = this.declarations[this.topLevelNames.firsts[entry]]
+        if (bootstrapDeclarationIsValue(declaration.kind) &&
+            !bootstrapStandardLibraryModuleSource(declaration.sourceIdentity)) {
+            this.fail("library.program-global:${expression.text}@${expression.begin}")
+        }
+        return
+    }
+
+    /** Whether the identifier names a global `val` or `var` (globalKindNamed). */
+    fun namesGlobal(expression: BootstrapExpression): bool {
+        val globalKind = this.globalKindNamed(expression)
+        globalKind == "val" || globalKind == "var"
     }
 
     fun shadowsGlobal(name: string): bool =
@@ -7751,14 +7823,10 @@ class BootstrapAnalyzer(
             // be live (and dropped again at exit) after the receiver drops it.
             // `move(global)` is already rejected; this closes the implicit form
             // (`val local = global`, `return global`, owned arguments, fields).
-            if (expression.kind == "identifier" &&
-                !this.shadowsGlobal(expression.text)) {
-                val globalKind = this.findKind(expression.text)
-                if (globalKind == "val" || globalKind == "var") {
-                    this.fail(
-                        "ownership.global-move:$context:${expression.text}"
-                    )
-                }
+            if (expression.kind == "identifier" && this.namesGlobal(expression)) {
+                this.fail(
+                    "ownership.global-move:$context:${expression.text}"
+                )
             }
             if (expression.kind == "member" ||
                 expression.kind == "index") {
@@ -8357,42 +8425,27 @@ class BootstrapAnalyzer(
             }
             capture = capture + 1
         }
-        var declared: array<string> = []
-        bootstrapCollectDeclaredNames(body, declared)
-        if (this.threadUsesMutableGlobal(body, declared)) {
-            this.fail("thread.mutable-global")
-        }
     }
 
-    // A global `var` the thread body names: not a local or field of the code
-    // starting the thread, nor a name the body declares itself.
-    fun threadNamesMutableGlobal(name: string, declared: array<string>): bool {
-        if (name == "" || this.shadowsGlobal(name)) return false
-        for (local in declared) if (local == name) return false
-        this.findKind(name) == "var"
-    }
-
-    fun threadUsesMutableGlobal(
-        expression: BootstrapExpression,
-        declared: array<string>
-    ): bool {
+    // Whether the analyzed thread body names a global `var`: not a local or
+    // field of the code starting the thread, nor a local of the body itself
+    // (globalKindNamed reads what each name was where it was analyzed).
+    fun threadUsesMutableGlobal(expression: BootstrapExpression): bool {
         var found = false
         if ((expression.kind == "identifier" ||
              expression.kind == "assign") &&
-            this.threadNamesMutableGlobal(expression.text, declared)) found = true
+            this.globalKindNamed(expression) == "var") found = true
         if ((expression.kind == "member.assign" ||
              expression.kind == "index.assign") &&
-            expression.children.size > 0) {
-            val root = bootstrapPlaceRootName(expression.children[0])
-            if (this.threadNamesMutableGlobal(root, declared)) found = true
+            expression.children.size > 0 &&
+            this.globalKindNamed(bootstrapPlaceRoot(expression.children[0])) == "var") {
+            found = true
         }
         if (expression.kind != "lambda" &&
             expression.kind != "lambda.move") {
             var child = 0
             while (!found && child < expression.children.size) {
-                found = this.threadUsesMutableGlobal(
-                    expression.children[child], declared
-                )
+                found = this.threadUsesMutableGlobal(expression.children[child])
                 child = child + 1
             }
         }
@@ -8808,8 +8861,7 @@ class BootstrapAnalyzer(
         if (root == "") false
         else if (this.hasVisibleLocal(root)) {
             this.visibleBorrowSource(root) == "managed.static"
-        } else if (this.shadowsGlobal(root)) false
-        else this.findKind(root) == "val" || this.findKind(root) == "var"
+        } else this.namesGlobal(bootstrapPlaceRoot(expression))
     }
 
     // A block's value read, through its own `val` locals, from a global.
@@ -10253,7 +10305,8 @@ class BootstrapAnalyzer(
                 this.mutationPlaceBegins,
                 this.mutationPlaceEnds
             ),
-            this.contextualLiterals
+            this.contextualLiterals,
+            this.shadowedIdentifiers.keys
         )
     }
 }
@@ -10431,26 +10484,6 @@ fun bootstrapInferArray(
     result
 }
 
-/** The names `expression` declares anywhere inside it: locals, loop
- *  variables, lambda parameters. */
-fun bootstrapCollectDeclaredNames(
-    expression: BootstrapExpression,
-    var names: array<string>
-): void {
-    if (expression.kind == "local.val" || expression.kind == "local.var" ||
-        expression.kind == "for") names.append(expression.text)
-    if ((expression.kind == "lambda" || expression.kind == "lambda.move") &&
-        expression.children.size > 0) {
-        var parameter = 0
-        while (parameter + 1 < expression.children.size) {
-            names.append(expression.children[parameter].text)
-            parameter = parameter + 1
-        }
-    }
-    for (child in expression.children) bootstrapCollectDeclaredNames(child, names)
-    return
-}
-
 @noinline
 fun bootstrapInferRange(
     var analyzer: BootstrapAnalyzer,
@@ -10497,6 +10530,12 @@ fun bootstrapInferIdentifier(
         !bootstrapRuntimeInternalCaller(analyzer.currentSourceIdentity)) {
         analyzer.fail("native.runtime-internal:${expression.text}")
     }
+    // A local named like a global (of this module or another): remembered as
+    // the local, for checks that run once its scope is gone (namesGlobal).
+    if (result != "unknown" && analyzer.shadowsGlobal(expression.text)) {
+        analyzer.recordShadowed(expression)
+    }
+    if (result != "unknown") analyzer.validateGlobalVisible(expression)
     if (result != "unknown" &&
         analyzer.nameIsDelegated(expression.text)) {
         analyzer.validateDelegatedRead(expression, expression.text)
@@ -10832,6 +10871,8 @@ fun bootstrapInferCall(
     // A local or parameter of function type is called as itself: no
     // top-level declaration of the same name describes it.
     val localCallable = analyzer.callsLocal(expression.text, expression.children.size)
+    if (localCallable) analyzer.recordShadowed(expression)
+    else analyzer.validateGlobalVisible(expression)
     if (!localCallable && analyzer.regionDepth > 0 &&
         bootstrapRegionCallIsUnsafe(
             analyzer.regionCalls,
@@ -11879,6 +11920,10 @@ fun bootstrapInferTask(
         if (bootstrapIsBorrowType(found) || analyzer.typeIsAffine(found)) {
             analyzer.fail("${expression.kind}.affine-result:$found")
         }
+        if (expression.kind == "thread" &&
+            analyzer.threadUsesMutableGlobal(expression.children[0])) {
+            analyzer.fail("thread.mutable-global")
+        }
         result = "${expression.kind}:$found"
     }
     result
@@ -12277,6 +12322,8 @@ fun bootstrapInferAssign(
         analyzer.findKind(expression.text) == "val") {
         analyzer.fail("global.immutable:${expression.text}")
     }
+    if (analyzer.shadowsGlobal(expression.text)) analyzer.recordShadowed(expression)
+    analyzer.validateGlobalVisible(expression)
     val assignmentTarget = BootstrapExpression(
         "identifier",
         expression.text,
@@ -12868,6 +12915,13 @@ fun bootstrapAnalyzer(
         bootstrapNoInitEdges()
     )
 }
+
+fun bootstrapStringSetOf(keys: array<string>): BootstrapStringSet {
+    val set = bootstrapStringSet()
+    for (key in keys) set.add(key)
+    set
+}
+
 
 fun bootstrapAnalyze(source: string): BootstrapSemanticResult =
     bootstrapAnalyzeParsed(bootstrapParse(source))

@@ -79,6 +79,7 @@ only its parse errors.
 | `local.initializer:<name>` | an initializer doesn't match the declared type |
 | `assignment.type:<name>@<offset>` | an assigned value doesn't match the variable's type |
 | `assignment.immutable`, `global.immutable`, `field.immutable`, `member.immutable` | assigning a `val` |
+| `library.program-global:<name>@<offset>` | standard-library code names a program's global `val` or `var` ([modules](language.md#modules-and-imports)) |
 | `global.initialization-cycle:<a>-><b>->...<a>` | top-level initializers that depend on each other, directly or through functions ([language.md](language.md#values-and-variables)) |
 | `local.duplicate`, `local.shadows-parameter`, `local.uninitialized-type`, `local.uninitialized-val` | see [values and variables](language.md#values-and-variables) |
 | `symbol.duplicate:<name>:<files>` | two declarations with the same name and parameter types |

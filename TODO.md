@@ -82,6 +82,17 @@ called out below.
   `assume` would turn any producer missed later (extension fields with defaults,
   generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
 
+- [ ] **Interfaces (paused, roadmap).** Nominal and retroactive conformance (`extend C : I`),
+  default methods, witness-table dispatch, `as?` downcasts, resource interfaces.
+- [ ] **Generics (paused, roadmap).** Monomorphized `fun <T>` / `class Box<T>` with interface
+  bounds, inferred type arguments, invariant; the syntax is reserved (`E_PARSE_NOT_YET_SUPPORTED`).
+- [ ] **Module-scoped globals.** A module seeing only its own and its imports' globals would
+  need a language-wide migration: measured on 2026-10-19, 102 errors in the compiler's own
+  sources and 2061 in a game client written against today's flat namespace. Today the standard
+  library never reads a program's globals (`library.program-global`).
+- [ ] **Software transactional memory surface (paused, roadmap).** `var x: T by TVar(v)`,
+  `atomic { }` with `retry` / `orElse`, over the runtime's TVar and transaction entry points.
+
 ## Packages
 
 Package-side work (not changed from ablac):

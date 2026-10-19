@@ -228,7 +228,9 @@ fun main {
 - A local lives from its declaration to the end of its block. A local in a
   nested block may shadow an outer local, a parameter or a field; the outer
   one is visible again after the block, including to closures that captured
-  it.
+  it. A parameter or local always shadows a global of its name, of this
+  module or any other: the standard library's `cell` parameter stays itself
+  in a program with a global `val cell`.
 - Two locals of one block can't share a name (`local.duplicate`), and a
   function's or lambda's body can't redeclare one of its parameters
   (`local.shadows-parameter`).
@@ -1645,7 +1647,8 @@ fun main {
   `E_IMPORT_ALIAS_TARGET_DUPLICATE` (one module imported twice),
   `E_IMPORT_ALIAS_MEMBER_UNKNOWN`.
 - There are no visibility modifiers: every top-level declaration of a module
-  is visible to its importers.
+  is visible to its importers. The standard library never reads a program's
+  global `val`s and `var`s (`library.program-global`).
 - A declaration's identity (for native symbols and reflection) comes from
   the module that defines it, not from an importer's alias, so renaming an
   alias renames nothing in the output.
