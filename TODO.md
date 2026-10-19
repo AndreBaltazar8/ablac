@@ -20,6 +20,14 @@ called out below.
   redefined while the program runs.
 
 
+- [ ] **A class instance can't gain fields by name.** Typed field accesses address a
+  class's declared fields in the instance's inline slots (`object + 32 + index * 32`), so
+  `__ablaRuntimeFieldSet` panics rather than grow such an object (growth moved every slot).
+  Nothing in the language adds an undeclared field today. If something ever must
+  (reflection, expando objects), give the object an overflow array for the added fields
+  and leave the declared ones in place: the by-name scan reads the inline slots, then the
+  overflow; the collector marks both.
+
 ## Packages
 
 Package-side work (not changed from ablac):
