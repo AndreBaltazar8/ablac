@@ -1,0 +1,98 @@
+// A direct function's value parameters are `noalias` (the backend's
+// bootstrapLlvmDirectValuesNoAlias): what a function reads from one may be kept
+// across its stores through other pointers. These calls must still see every
+// change made through those other pointers: raw stores into a column the
+// argument owns, field writes to the object an argument names, an owned
+// argument moved out, the same value passed twice, closures and generator
+// steps (whose arguments the dispatchers copy), and a closure's captures handed
+// to its drop function. Run as is and with ABLA_GC_STRESS=1, it prints the
+// same lines and exits 42.
+import "abla/io"
+import "abla/unsafe/memory"
+
+var dropped: array<string> = []
+
+class Column(val data: i64*, var size: int)
+
+trusted fun column(size: int): Column = Column(ablaUnsafeAllocate(size * 8), size)
+
+trusted fun Column.get(index: int): int =
+    ablaUnsafeLoadI64(ablaUnsafePointerOffset(this.data, index * 8))
+
+trusted fun Column.set(index: int, value: int): void {
+    ablaUnsafeStoreI64(ablaUnsafePointerOffset(this.data, index * 8), value)
+    return
+}
+
+class Grid(val cells: Column, var filled: int, var label: string)
+
+// Raw stores between reads of `this` and of its fields, as a hot loop does.
+fun Grid.fill(base: int, step: int): int {
+    var index = 0
+    var total = 0
+    while (index < this.cells.size) {
+        this.cells.set(index, base + index * step)
+        this.filled = this.filled + 1
+        total = total + this.cells.get(index) + this.filled
+        index = index + 1
+    }
+    total
+}
+
+// The object one argument names changes through another argument.
+fun relabel(grid: Grid, var other: Grid, text: string): string {
+    other.label = text
+    "${grid.label}/${other.label}"
+}
+
+fun sum(left: Grid, right: Grid): int = left.filled * 100 + right.filled
+
+resource class Noisy(val label: string) {
+    fun drop(): void {
+        dropped.append("drop ${label}")
+        return
+    }
+}
+
+fun consume(own noisy: Noisy, after: string): string {
+    val label = noisy.label
+    val moved = move(noisy)
+    "$label $after ${moved.label}"
+}
+
+fun apply(transform: (Grid) -> int, grid: Grid): int = transform(grid)
+
+fun counted(grid: Grid): array<int> {
+    val result: array<int> = []
+    val values: Generator<int> = generator {
+        var index = 0
+        while (index < grid.cells.size) {
+            yield grid.cells.get(index) * 2
+            index = index + 1
+        }
+    }
+    for (value in values) result.append(value)
+    result
+}
+
+fun main: int {
+    val grid = Grid(column(6), 0, "start")
+    val other = Grid(column(3), 0, "other")
+    println("fill ${grid.fill(10, 3)} filled ${grid.filled}")
+    println("again ${grid.fill(1, 1)} filled ${grid.filled}")
+    println("relabel ${relabel(grid, other, "next")} ${relabel(other, grid, "back")}")
+    println("sum ${sum(grid, grid)} ${sum(other, grid)}")
+    println(consume(Noisy("first"), "then"))
+    other.cells.set(1, 5)
+    val read = apply({ g -> g.cells.get(1) * 10 + g.filled }, other)
+    other.cells.set(1, 6)
+    println("closure $read then ${apply({ g -> g.cells.get(1) }, other)}")
+    var line = "generator"
+    for (value in counted(grid)) line = "$line $value"
+    println(line)
+    val keep = Noisy("captured")
+    val reader = move { keep.label.size }
+    println("captured ${reader()}")
+    for (entry in dropped) println(entry)
+    42
+}

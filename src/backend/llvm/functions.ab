@@ -135,6 +135,31 @@ fun bootstrapLlvmDirectParameterCount(
     count
 }
 
+// A direct function's value parameters are pointers to 24-byte values which
+// nothing else reaches while it runs, so they are `noalias`: LLVM may keep
+// what it read from one across the function's stores through other pointers
+// (an object's fields, a column's raw bytes). Every caller passes a slot of
+// its own that no other code writes during the call:
+//   - `call` and `resource.drop` pass the caller's IR value slots. A value is
+//     written once, by the instruction that defines it; only the collector
+//     reads it meanwhile, through the caller's root frame. A call naming one
+//     value for two parameters passes a copy for the second
+//     (bootstrapLlvmDirectCallArguments).
+//   - a generated wrapper forwards elements of the array it is given: the
+//     closure dispatcher's and a generator step's copies of the captures and
+//     arguments, an export's boxed arguments (abla_checked_invoke included),
+//     or its own placeholder for a missing argument.
+//   - main, the globals initializer and interrupt entries pass no values;
+//     native adapters and scalar exports pass scalars only.
+// Two shapes are left out: a closure's drop function, which the drop
+// dispatcher hands the closure's own capture array, and the runtime's
+// implementations, which its bridges hand their callers' pointers (often into
+// an object or array the implementation itself writes).
+fun bootstrapLlvmDirectValuesNoAlias(function: BootstrapIrFunction): bool =
+    !function.naked &&
+        !bootstrapLlvmRuntimeImplementation(function.name) &&
+        !function.name.startsWith(bootstrapClosureDropFunctionName(""))
+
 fun bootstrapLlvmDeclareDirectFunction(
     backend: BootstrapLlvmBackend,
     name: string,
@@ -174,6 +199,18 @@ fun bootstrapLlvmDeclareDirectFunction(
     // inside this module. Internal linkage lets LLVM remove imported runtime
     // and library implementations which are not reachable from the artifact.
     LLVMSetLinkage(declared, llvmInternalLinkage())
+    if (bootstrapLlvmDirectValuesNoAlias(function)) {
+        val first = parameters.size - parameterCount
+        parameter = 0
+        while (parameter < parameterCount) {
+            if (bootstrapLlvmDirectParameterScalarType(function, parameter) == "") {
+                bootstrapLlvmAddParameterAttribute(
+                    backend, declared, first + parameter, "noalias"
+                )
+            }
+            parameter = parameter + 1
+        }
+    }
     // Whole-program MCU builds are dominated by flash size. These standard
     // LLVM attributes select the strict minimum-size cost model for ordinary
     // calls; explicit @inline remains alwaysinline and @noinline remains an
@@ -686,6 +723,18 @@ fun bootstrapLlvmCreateFunctionStorage(
             )
             storage = LLVMBuildAlloca(
                 backend.builder, storageType, "indirect.arguments"
+            )
+            LLVMSetAlignment(storage, 8)
+        }
+        // A direct call naming one value twice passes the repeats as copies:
+        // its value parameters are `noalias` (bootstrapLlvmDirectValuesNoAlias).
+        if (instruction.opcode == "call" &&
+            bootstrapLlvmRepeatsOperand(instruction.operands)) {
+            storageType = LLVMArrayType2(
+                backend.valueType, instruction.operands.size
+            )
+            storage = LLVMBuildAlloca(
+                backend.builder, storageType, "argument.copies"
             )
             LLVMSetAlignment(storage, 8)
         }
@@ -1205,12 +1254,22 @@ fun bootstrapLlvmPrepareArguments(
     result
 }
 
+fun bootstrapLlvmRepeatsOperand(operands: array<int>): bool {
+    for (at in 1 until operands.size) {
+        for (before in 0 until at) {
+            if (operands[before] == operands[at]) return true
+        }
+    }
+    false
+}
+
 fun bootstrapLlvmDirectCallArguments(
     backend: BootstrapLlvmBackend,
     storage: BootstrapLlvmFunctionStorage,
     function: BootstrapIrFunction,
     operands: array<int>,
-    output: i64*
+    output: i64*,
+    copies: i64* = nativeNullPointer()
 ): array<i64*> {
     val arguments: array<i64*> = []
     if (bootstrapLlvmDirectResultUsesOutput(function)) {
@@ -1229,7 +1288,21 @@ fun bootstrapLlvmDirectCallArguments(
         )
         if (parameter < operands.size) {
             if (scalar == "") {
-                arguments.append(storage.values[operands[parameter]])
+                var slot = storage.values[operands[parameter]]
+                var repeated = false
+                if (!pointerIsNull(copies)) {
+                    for (before in 0 until parameter) {
+                        if (operands[before] == operands[parameter]) repeated = true
+                    }
+                }
+                if (repeated) {
+                    val copy = bootstrapLlvmValueElement(
+                        backend, copies, parameter, "argument.copy"
+                    )
+                    bootstrapLlvmCopyValue(backend, slot, copy, "argument.copy")
+                    slot = copy
+                }
+                arguments.append(slot)
             } else {
                 var native = bootstrapLlvmNativeValue(
                     backend, storage, operands[parameter]
@@ -7447,7 +7520,8 @@ fun bootstrapLlvmEmitFunction(
                     else nativeNullPointer()
                 val arguments = bootstrapLlvmDirectCallArguments(
                     backend, storage, program.functions[called],
-                    instruction.operands, callOutput
+                    instruction.operands, callOutput,
+                    storage.scratch[instructionIndex]
                 )
                 val directResult = bootstrapLlvmEmitDirectCall(
                     backend,

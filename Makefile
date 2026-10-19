@@ -78,6 +78,7 @@ test: ablac
 	tools/test-unsafe-stack-memory.sh $(COMPILER)
 	tools/test-value-lifetimes.sh $(COMPILER)
 	tools/test-fixed-fields.sh $(COMPILER)
+	tools/test-value-arguments.sh $(COMPILER)
 	bash tools/test-scalar-default-unboxing.sh $(COMPILER)
 	tools/test-unsafe-static-memory.sh $(COMPILER)
 	tools/test-native-cstring-lifetime.sh $(COMPILER)
