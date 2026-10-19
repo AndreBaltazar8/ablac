@@ -1,4 +1,5 @@
 import "runtime.ab"
+import "escape.ab"
 import "debug.ab"
 
 fun bootstrapLlvmDirectFunctionSymbol(name: string): string =
@@ -707,8 +708,12 @@ fun bootstrapLlvmCreateFunctionStorage(
              instruction.opcode == "array.create") &&
             instruction.operands.size > 0 &&
             !(index < tables.table.size && tables.table[index])) {
+            // A frame closure's captures follow one header value, whose last word
+            // marks them as the frame's (__ablaRuntimeClosureRelease).
             storageType = LLVMArrayType2(
-                backend.valueType, instruction.operands.size
+                backend.valueType, instruction.operands.size +
+                    if (instruction.opcode == "closure.create" &&
+                        bootstrapLlvmStackClosureAt(index)) 1 else 0
             )
             storage = LLVMBuildAlloca(
                 backend.builder, storageType, "arguments"
@@ -801,7 +806,32 @@ fun bootstrapLlvmCreateFunctionStorage(
         }
         index = index + 1
     }
-    var rootCount = 0
+    // Frame closures: the marker, and, when this function may collect, their
+    // captures as roots (defined before the first scan).
+    var closureRoots = 0
+    index = 0
+    while (index < scratch.size) {
+        if (bootstrapLlvmStackClosureAt(index) && !pointerIsNull(scratch[index])) {
+            bootstrapLlvmStoreFrameClosureMarker(backend, scratchTypes[index], scratch[index])
+            val captures = function.instructions[index].operands.size
+            if (collecting) {
+                var capture = 1
+                while (capture <= captures) {
+                    val stored = LLVMBuildStore(
+                        backend.builder, zero, bootstrapLlvmArrayElement(
+                            backend, scratchTypes[index], scratch[index], capture,
+                            "frame.capture"
+                        )
+                    )
+                    LLVMSetAlignment(stored, 8)
+                    capture = capture + 1
+                }
+                closureRoots = closureRoots + captures
+            }
+        }
+        index = index + 1
+    }
+    var rootCount = closureRoots
     if (collecting) {
         index = 0
         while (index < parameters.size) {
@@ -1045,6 +1075,31 @@ fun bootstrapLlvmPushRoots(
             }
             index = index + 1
         }
+        index = 0
+        while (index < storage.scratch.size) {
+            if (bootstrapLlvmStackClosureAt(index) &&
+                !pointerIsNull(storage.scratch[index])) {
+                val captures = bootstrapLlvmArrayLength(storage.scratchTypes[index]) - 1
+                var capture = 1
+                while (capture <= captures) {
+                    val destination = bootstrapLlvmArrayElement(
+                        backend, storage.gcRootsType, storage.gcRoots,
+                        root, "gc.root"
+                    )
+                    LLVMBuildStore(
+                        backend.builder,
+                        bootstrapLlvmArrayElement(
+                            backend, storage.scratchTypes[index], storage.scratch[index],
+                            capture, "frame.capture"
+                        ),
+                        destination
+                    )
+                    root = root + 1
+                    capture = capture + 1
+                }
+            }
+            index = index + 1
+        }
         val first = bootstrapLlvmArrayElement(
             backend, storage.gcRootsType, storage.gcRoots, 0, "gc.roots.pointer"
         )
@@ -1252,6 +1307,84 @@ fun bootstrapLlvmPrepareArguments(
         )
     }
     result
+}
+
+fun bootstrapLlvmArrayLength(arrayType: i64*): int = LLVMGetArrayLength2(arrayType)
+
+// The marker in a frame closure's header value: its last word, the 8 bytes before
+// the captures, is -1 (a heap block has its layout there, never negative).
+fun bootstrapLlvmStoreFrameClosureMarker(
+    backend: BootstrapLlvmBackend,
+    arrayType: i64*,
+    storage: i64*
+): void {
+    val header = bootstrapLlvmArrayElement(backend, arrayType, storage, 0, "frame.header")
+    val payload = LLVMBuildStructGEP2(
+        backend.builder, backend.valueType, header, 2, "frame.header.payload"
+    )
+    val marker = LLVMBuildStructGEP2(
+        backend.builder, backend.payloadType, payload, 1, "frame.header.marker"
+    )
+    val stored = LLVMBuildStore(
+        backend.builder, LLVMConstInt(backend.i64Type, -1, 1), marker
+    )
+    LLVMSetAlignment(stored, 8)
+}
+
+// A closure whose captures live in this frame (bootstrapLlvmStackClosureSites): they
+// are copied after the header value, and the closure (tag 5, its function, the
+// count, the captures) is built in place, without the runtime.
+fun bootstrapLlvmEmitFrameClosure(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    instructionIndex: int,
+    operands: array<int>,
+    functionId: int,
+    destination: i64*
+): void {
+    val arrayType = storage.scratchTypes[instructionIndex]
+    val array = storage.scratch[instructionIndex]
+    var operand = 0
+    while (operand < operands.size) {
+        bootstrapLlvmCopyValue(
+            backend, storage.values[operands[operand]],
+            bootstrapLlvmArrayElement(
+                backend, arrayType, array, operand + 1, "frame.capture"
+            ),
+            "frame.capture.value"
+        )
+        operand = operand + 1
+    }
+    val captures = bootstrapLlvmArrayElement(
+        backend, arrayType, array, 1, "frame.captures"
+    )
+    val tag = LLVMBuildStructGEP2(
+        backend.builder, backend.valueType, destination, 0, "closure.tag"
+    )
+    val auxiliary = LLVMBuildStructGEP2(
+        backend.builder, backend.valueType, destination, 1, "closure.function"
+    )
+    val payload = LLVMBuildStructGEP2(
+        backend.builder, backend.valueType, destination, 2, "closure.payload"
+    )
+    LLVMBuildStore(backend.builder, LLVMConstInt(backend.i32Type, 5, 0), tag)
+    LLVMBuildStore(
+        backend.builder, LLVMConstInt(backend.i32Type, functionId, 0), auxiliary
+    )
+    LLVMBuildStore(
+        backend.builder, LLVMConstInt(backend.i64Type, operands.size, 0),
+        LLVMBuildStructGEP2(
+            backend.builder, backend.payloadType, payload, 0, "closure.count"
+        )
+    )
+    LLVMBuildStore(
+        backend.builder,
+        LLVMBuildPtrToInt(backend.builder, captures, backend.i64Type, "closure.captures"),
+        LLVMBuildStructGEP2(
+            backend.builder, backend.payloadType, payload, 1, "closure.word1"
+        )
+    )
+    return
 }
 
 fun bootstrapLlvmRepeatsOperand(operands: array<int>): bool {
@@ -6956,6 +7089,10 @@ fun bootstrapLlvmEmitFunction(
     var tables = bootstrapLlvmConstantTables(
         function, bootstrapLlvmValueCount(function)
     )
+    bootstrapLlvmStackClosureFlags =
+        if (functionId < bootstrapLlvmStackClosureSitesAll.size)
+            bootstrapLlvmStackClosureSitesAll[functionId]
+        else bootstrapLlvmNoStackClosures
     var storage = bootstrapLlvmCreateFunctionStorage(
         backend, function, llvmFunction, collecting, rootValues,
         scalarPlan, tables
@@ -7551,7 +7688,15 @@ fun bootstrapLlvmEmitFunction(
                     "", true, [false, false]
                 )
             }
-            if (found >= 0 && instruction.operands.size > 0) {
+            if (found >= 0 && instruction.operands.size > 0 &&
+                bootstrapLlvmStackClosureAt(instructionIndex)) {
+                bootstrapLlvmEmitFrameClosure(
+                    backend, storage, instructionIndex, instruction.operands,
+                    identities.runtimeIds[found], storage.values[instruction.result]
+                )
+            }
+            if (found >= 0 && instruction.operands.size > 0 &&
+                !bootstrapLlvmStackClosureAt(instructionIndex)) {
                 val captures = bootstrapLlvmPrepareArguments(
                     backend, storage, instructionIndex,
                     instruction.operands, 0

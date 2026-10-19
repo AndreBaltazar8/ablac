@@ -1,0 +1,255 @@
+import "analysis.ab"
+
+// Closures that do not escape the frame that makes them. Their captures can then
+// live in the frame (bootstrapLlvmStackClosureSites) instead of a heap block.
+//
+// The analysis runs on the whole program's IR in the backend, after the lowered-IR
+// cache, so no cached lowering depends on it; native partitions are keyed by the
+// LLVM text it shapes. It is a greatest fixed point over parameter summaries: every
+// parameter of an emitted function that can hold a closure starts as non-escaping,
+// and one is marked escaping when any use of its value may outlive the call, until
+// nothing changes.
+//
+// A tracked value (a closure.create result, or a parameter's) stays in its frame
+// when each use is one of:
+// - the callee of call.indirect / call.indirect.once (not an argument of one: the
+//   callee is unknown);
+// - argument j of a direct `call g` whose parameter j does not escape (or a runtime
+//   function that only invokes it: __ablaRuntimeStmAtomic);
+// - a store into a local (local.declare / local.set / local.assign), whose loads
+//   (local.load, resource.peek) are tracked in turn;
+// - resource.drop / closure.drop (a closure's release does not free captures that
+//   are in a frame).
+// Any other use escapes: a return, a store into a field, an array, a global or a
+// cell, a capture by another closure, a generator, task or thread, an extern or any
+// other runtime call, and every opcode not listed. Calls whose callee is not known
+// statically (indirect calls today; interface witnesses and delegates later) count
+// as escaping for their closure arguments: keep it that way.
+//
+// A closure.create also obeys the loop rule: its block belongs to the instruction
+// and is reused on each execution, so its value may reach a local only through a
+// store right after it, into a local nothing else stores. Then whatever reads the
+// closure pairs with the latest execution's captures; any other copy escapes.
+//
+// Unwinding (an abandoned transaction, a panic a checked export contains) leaves
+// these frames with their root frames; no runtime structure holds a frame closure,
+// since reaching one (a TVar, a Shared, a generator, task or thread) escapes.
+
+// The sites of the program being emitted (bootstrapLlvmEmitProgram sets them), and of
+// the function being emitted: per instruction, whether a closure.create's captures
+// live in the frame.
+var bootstrapLlvmStackClosureSitesAll: array<array<bool>> = []
+var bootstrapLlvmStackClosureFlags: array<bool> = []
+val bootstrapLlvmNoStackClosures: array<bool> = []
+
+// Whether instruction `at` of the function being emitted makes a frame closure.
+fun bootstrapLlvmStackClosureAt(at: int): bool =
+    at < bootstrapLlvmStackClosureFlags.size && bootstrapLlvmStackClosureFlags[at]
+
+// Whether `name` is a runtime function that only invokes argument `position`.
+fun bootstrapLlvmEscapeInvokesOnly(name: string, position: int): bool =
+    name == "__ablaRuntimeStmAtomic" && position == 0
+
+fun bootstrapLlvmEscapeStores(opcode: string): bool =
+    opcode == "local.declare" || opcode == "local.set" || opcode == "local.assign"
+
+// Whether the values `tracked` starts with (and `locals`) reach a use that may
+// outlive the frame. `create` is the closure.create's instruction for the loop rule,
+// or -1 for a parameter.
+fun bootstrapLlvmEscapes(
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    var tracked: array<bool>,
+    var locals: array<string>,
+    create: int,
+    functionIndex: BootstrapLlvmNameIndex,
+    emitted: array<bool>,
+    parameterEscapes: array<array<bool>>
+): bool {
+    val instructions = function.instructions
+    var changed = true
+    while (changed) {
+        changed = false
+        for (at in 0 until instructions.size) {
+            val instruction = instructions[at]
+            if ((instruction.opcode == "local.load" ||
+                 instruction.opcode == "resource.peek") &&
+                instruction.result >= 0 && instruction.result < tracked.size &&
+                !tracked[instruction.result] &&
+                bootstrapLlvmEscapeHasLocal(locals, instruction.text)) {
+                tracked[instruction.result] = true
+                changed = true
+            }
+            if (bootstrapLlvmEscapeStores(instruction.opcode) &&
+                instruction.left >= 0 && instruction.left < tracked.size &&
+                tracked[instruction.left]) {
+                if (!bootstrapLlvmEscapeHasLocal(locals, instruction.text)) {
+                    locals.append("${instruction.text}")
+                    changed = true
+                }
+                if (instruction.opcode == "local.assign" &&
+                    instruction.result >= 0 && instruction.result < tracked.size &&
+                    !tracked[instruction.result]) {
+                    tracked[instruction.result] = true
+                    changed = true
+                }
+            }
+        }
+    }
+    for (at in 0 until instructions.size) {
+        val instruction = instructions[at]
+        // Stores into a tracked local: under the loop rule only the create's own
+        // value, right after it.
+        if (create >= 0 && bootstrapLlvmEscapeStores(instruction.opcode) &&
+            bootstrapLlvmEscapeHasLocal(locals, instruction.text)) {
+            val createResult = function.instructions[create].result
+            if (instruction.left != createResult || at != create + 1) return true
+        }
+        // An instruction's inputs: its operands, or else its left and right.
+        val count = if (instruction.operands.size > 0) instruction.operands.size else 2
+        for (position in 0 until count) {
+            val input = if (instruction.operands.size > 0) instruction.operands[position]
+                else if (position == 0) instruction.left else instruction.right
+            if (input >= 0 && input < tracked.size && tracked[input] &&
+                !bootstrapLlvmEscapeUseStays(
+                    program, instruction, position, functionIndex, emitted,
+                    parameterEscapes
+                )) return true
+        }
+    }
+    false
+}
+
+fun bootstrapLlvmEscapeHasLocal(locals: array<string>, name: string): bool {
+    for (local in locals) {
+        if (local == name) return true
+    }
+    false
+}
+
+// Whether input `position` of `instruction` keeps a tracked value in the frame.
+fun bootstrapLlvmEscapeUseStays(
+    program: BootstrapIrProgram,
+    instruction: BootstrapInstruction,
+    position: int,
+    functionIndex: BootstrapLlvmNameIndex,
+    emitted: array<bool>,
+    parameterEscapes: array<array<bool>>
+): bool {
+    val opcode = instruction.opcode
+    if (bootstrapLlvmEscapeStores(opcode) && position == 0) return true
+    if (opcode == "resource.drop" || opcode == "closure.drop") return position == 0
+    if (opcode == "call.indirect" || opcode == "call.indirect.once") return position == 0
+    if (opcode == "call" && instruction.operands.size > 0) {
+        if (bootstrapLlvmEscapeInvokesOnly(instruction.text, position)) return true
+        val callee = functionIndex.find(instruction.text)
+        if (callee < 0 || callee >= emitted.size || !emitted[callee]) return false
+        if (position >= program.functions[callee].parameters.size) return false
+        return !parameterEscapes[callee][position]
+    }
+    false
+}
+
+// For each function, the closure.create instructions whose captures can live in its
+// frame (those with captures that do not escape).
+fun bootstrapLlvmStackClosureSites(
+    program: BootstrapIrProgram,
+    functionIndex: BootstrapLlvmNameIndex,
+    emitted: array<bool>
+): array<array<bool>> {
+    var parameterEscapes: array<array<bool>> = []
+    for (index in 0 until program.functions.size) {
+        val escapes: array<bool> = []
+        for (parameter in 0 until program.functions[index].parameters.size) {
+            escapes.append(false)
+        }
+        parameterEscapes.append(escapes)
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        for (index in 0 until program.functions.size) {
+            if (index < emitted.size && emitted[index]) {
+                val function = program.functions[index]
+                for (parameter in 0 until function.parameters.size) {
+                    if (!parameterEscapes[index][parameter] &&
+                        bootstrapLlvmParameterEscapes(
+                            program, function, parameter, functionIndex, emitted,
+                            parameterEscapes
+                        )) {
+                        parameterEscapes[index][parameter] = true
+                        changed = true
+                    }
+                }
+            }
+        }
+    }
+    val sites: array<array<bool>> = []
+    for (index in 0 until program.functions.size) {
+        val function = program.functions[index]
+        val stack: array<bool> = []
+        for (at in 0 until function.instructions.size) {
+            val instruction = function.instructions[at]
+            var onStack = false
+            if (index < emitted.size && emitted[index] &&
+                instruction.opcode == "closure.create" &&
+                instruction.operands.size > 0 && instruction.result >= 0) {
+                var tracked = bootstrapLlvmEscapeValues(function)
+                tracked[instruction.result] = true
+                var locals: array<string> = []
+                onStack = !bootstrapLlvmEscapes(
+                    program, function, tracked, locals, at, functionIndex, emitted,
+                    parameterEscapes
+                )
+            }
+            stack.append(onStack)
+        }
+        sites.append(stack)
+    }
+    sites
+}
+
+fun bootstrapLlvmParameterEscapes(
+    program: BootstrapIrProgram,
+    function: BootstrapIrFunction,
+    parameter: int,
+    functionIndex: BootstrapLlvmNameIndex,
+    emitted: array<bool>,
+    parameterEscapes: array<array<bool>>
+): bool {
+    // Only a parameter that can hold a closure is followed; no closure reaches any
+    // other, so calling it escaping costs nothing.
+    if (!bootstrapLlvmEscapeMayHoldClosure(
+        if (parameter < function.parameterTypes.size) function.parameterTypes[parameter]
+        else "unknown"
+    )) return true
+    val name = function.parameters[parameter]
+    var tracked = bootstrapLlvmEscapeValues(function)
+    for (instruction in function.instructions) {
+        if (instruction.opcode == "parameter.load" && instruction.text == name &&
+            instruction.result >= 0 && instruction.result < tracked.size) {
+            tracked[instruction.result] = true
+        }
+    }
+    // The parameter is a local too: resource.peek and local.move name it.
+    var locals = [name]
+    bootstrapLlvmEscapes(
+        program, function, tracked, locals, -1, functionIndex, emitted,
+        parameterEscapes
+    )
+}
+
+fun bootstrapLlvmEscapeMayHoldClosure(type: string): bool =
+    type == "any" || type == "unknown" || type == "" ||
+    bootstrapTextContains(type, "function:")
+
+fun bootstrapLlvmEscapeValues(function: BootstrapIrFunction): array<bool> {
+    var count = 0
+    for (instruction in function.instructions) {
+        if (instruction.result + 1 > count) count = instruction.result + 1
+    }
+    val values: array<bool> = []
+    for (index in 0 until count) values.append(false)
+    values
+}
+

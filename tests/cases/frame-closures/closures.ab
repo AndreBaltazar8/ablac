@@ -1,0 +1,103 @@
+import "abla/memory"
+
+// Closures that stay in the frame that makes them, and ones that escape it: each
+// gives what the closure computes, also when collections run inside it.
+
+class Box(var callback: (int) -> int)
+
+val kept: array<(int) -> int> = []
+
+fun apply(callback: (int) -> int, value: int): int = callback(value)
+fun forward(callback: (int) -> int, value: int): int = apply(callback, value) + 1
+fun collecting(callback: (int) -> int, value: int): int {
+    memoryCollect()
+    val label = "v$value-${value * 3}"
+    memoryCollect()
+    callback(value) + label.size * 0
+}
+fun twice(var callback: FnMut() -> int): int = callback() + callback()
+fun finish(own callback: FnOnce() -> int): int = callback()
+fun keep(callback: (int) -> int): int {
+    kept.append(callback)
+    0
+}
+fun give(callback: (int) -> int): (int) -> int = callback
+
+resource class Ticket(val seat: int)
+
+// A generator's body keeps a closure in a local across a yield: its step returns at
+// each yield, so whatever it holds across one cannot be in that step's frame.
+fun scaled(factor: int): Generator<int> = generator {
+    val label = "factor-$factor"
+    val scale = { x: int -> x * factor + label.size }
+    yield scale(1)
+    memoryCollect()
+    yield scale(2)
+    var steps = 0
+    val step = { steps += 1; steps }
+    yield step()
+    memoryCollect()
+    yield step() + scale(3)
+}
+
+// A transaction's body: the runtime only invokes it.
+trusted fun atomically(body: () -> int): int =
+    __ablaRuntimeAsI64(__ablaRuntimeStmAtomic(body))
+
+trusted fun tvar(value: int): any = __ablaRuntimeTVarCreate(__ablaRuntimeI64(value))
+
+trusted fun bump(tvar: any, by: int): int {
+    val next = __ablaRuntimeAsI64(__ablaRuntimeStmRead(tvar)) + by
+    __ablaRuntimeStmWrite(tvar, __ablaRuntimeI64(next))
+    next
+}
+
+fun frameClosures(): int {
+    var failures = 0
+    val offset = 10
+    var total = 0
+    var index = 0
+    // A closure per iteration, through two levels of parameters, each seeing its
+    // own iteration's captures.
+    while (index < 50) {
+        val text = "item-$index"
+        total = total + forward({ x -> x + offset + index + text.size }, 5)
+        index = index + 1
+    }
+    if (total != 50 * (5 + 10 + 1) + 49 * 50 / 2 + 10 * 6 + 40 * 7) failures = failures + 1
+    // Collections while the closure's string capture lives only in the frame.
+    val prefix = "prefix-${offset * 7}"
+    if (collecting({ x -> x + prefix.size }, 4) != 4 + 9) failures = failures + 1
+    // A closure kept in a local and called twice.
+    val scale = { x: int -> x * offset }
+    if (apply(scale, 2) + apply(scale, 3) != 50) failures = failures + 1
+    // A closure that changes a captured variable.
+    var calls = 0
+    val counted = { calls += 1; calls }
+    if (twice(counted) != 3 || calls != 2) failures = failures + 1
+    // A move closure, consumed.
+    val ticket = Ticket(9)
+    val useTicket = move { ticket.seat * 2 }
+    if (finish(move(useTicket)) != 18) failures = failures + 1
+    // A transaction's body, collecting inside it.
+    val counter = tvar(1)
+    val step = "step-$offset"
+    val bumped = atomically {
+        memoryCollect()
+        bump(counter, step.size)
+    }
+    if (bumped != 8) failures = failures + 1
+    // Closures kept across a generator's yields.
+    var generated = 0
+    for (value in scaled(offset)) generated = generated * 100 + value
+    if (generated != 19290141) failures = failures + 1
+    // Closures that escape: kept in an array, returned, held by an object.
+    keep({ x -> x + offset + 1 })
+    val given = give({ x -> x - offset })
+    val box = Box({ x -> x + total })
+    memoryCollect()
+    if (kept[kept.size - 1](1) != 12 || given(15) != 5 || box.callback(1) != total + 1) {
+        failures = failures + 1
+    }
+    failures
+}
