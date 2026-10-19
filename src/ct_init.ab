@@ -24,7 +24,15 @@ class BootstrapInitEdges(
     // f64Text), by declaration index: published, so the lowering keeps what they
     // reach and initializes the values they read first.
     val implicitDeclarations: array<int> = [],
-    val implicitNames: array<string> = []
+    val implicitNames: array<string> = [],
+    // The `thread { }` body being analyzed (an index into threadSources), -1
+    // none: what it reads and calls is recorded for it too, by thread
+    // (bootstrapCheckThreadGlobals).
+    var threadBody: int = -1,
+    val threadFrom: array<int> = [],
+    val threadTo: array<int> = [],
+    val threadSources: array<string> = [],
+    val threadBegins: array<int> = []
 )
 
 fun bootstrapNoInitEdges(): BootstrapInitEdges =
@@ -32,6 +40,15 @@ fun bootstrapNoInitEdges(): BootstrapInitEdges =
 
 /** The current body reads (or calls) the declaration with handle `target`. */
 fun bootstrapInitRecord(var analyzer: BootstrapAnalyzer, target: int): void {
+    val body = analyzer.initEdges.threadBody
+    if (body >= 0 && target >= 0) {
+        val threadCount = analyzer.initEdges.threadFrom.size
+        if (threadCount == 0 || analyzer.initEdges.threadFrom[threadCount - 1] != body ||
+            analyzer.initEdges.threadTo[threadCount - 1] != target) {
+            analyzer.initEdges.threadFrom.append(body)
+            analyzer.initEdges.threadTo.append(target)
+        }
+    }
     val owner = analyzer.initEdges.owner
     if (owner < 0 || target < 0) return
     val count = analyzer.initEdges.from.size
@@ -63,7 +80,7 @@ fun bootstrapInitRecordImplicitCall(var analyzer: BootstrapAnalyzer, name: strin
 
 /** The current body names global symbol `index`. */
 fun bootstrapInitRecordSymbol(var analyzer: BootstrapAnalyzer, index: int): void {
-    if (analyzer.initEdges.owner < 0) return
+    if (analyzer.initEdges.owner < 0 && analyzer.initEdges.threadBody < 0) return
     while (analyzer.initEdges.symbolHandles.size <= index) {
         analyzer.initEdges.symbolHandles.append(-2)
     }
@@ -151,23 +168,22 @@ fun bootstrapCheckInitialization(var analyzer: BootstrapAnalyzer): BootstrapInit
     checked
 }
 
-fun bootstrapInitialization(analyzer: BootstrapAnalyzer): BootstrapInitialization {
+/** Every read and call the analysis recorded, from the reading body to what
+ *  it reads (by handle), and the names parameter defaults read: they run when
+ *  a call leaves their arguments out, a class's in its construction, a
+ *  function's or method's in its body, so they are reads of that body. */
+fun bootstrapInitEdgeList(
+    analyzer: BootstrapAnalyzer,
+    var from: array<int>,
+    var to: array<int>
+): void {
     val declarations = analyzer.declarations
-    var nodes = declarations.size
-    for (handle in analyzer.methodDeclarations.handles) {
-        if (handle + 1 > nodes) nodes = handle + 1
-    }
-    val from: array<int> = []
-    val to: array<int> = []
     var edge = 0
     while (edge < analyzer.initEdges.from.size) {
         from.append(analyzer.initEdges.from[edge])
         to.append(analyzer.initEdges.to[edge])
         edge = edge + 1
     }
-    // Parameter defaults run when a call leaves their arguments out: a
-    // class's in its construction, a function's or method's in its body. So
-    // the names they read are reads of the class, the function or the method.
     var index = 0
     while (index < declarations.size) {
         val declaration = declarations[index]
@@ -194,14 +210,26 @@ fun bootstrapInitialization(analyzer: BootstrapAnalyzer): BootstrapInitializatio
         }
         index = index + 1
     }
+    return
+}
+
+fun bootstrapInitialization(analyzer: BootstrapAnalyzer): BootstrapInitialization {
+    val declarations = analyzer.declarations
+    var nodes = declarations.size
+    for (handle in analyzer.methodDeclarations.handles) {
+        if (handle + 1 > nodes) nodes = handle + 1
+    }
+    val from: array<int> = []
+    val to: array<int> = []
+    bootstrapInitEdgeList(analyzer, from, to)
     // Adjacency (compressed rows).
     val starts: array<int> = []
-    index = 0
+    var index = 0
     while (index <= nodes) {
         starts.append(0)
         index = index + 1
     }
-    edge = 0
+    var edge = 0
     while (edge < from.size) {
         if (from[edge] < nodes && to[edge] < nodes) {
             starts[from[edge] + 1] = starts[from[edge] + 1] + 1
@@ -526,4 +554,157 @@ fun bootstrapInitComponents(
         root = root + 1
     }
     component
+}
+
+/** Each global a `thread { }` body can reach, directly or through the
+ *  functions, methods and constructors it calls, is one another thread may be
+ *  using: it must be a value no thread can change. That is a `val` of a
+ *  thread-safe type (bootstrapThreadSafeType) or a compile-time value.
+ *  Otherwise it is thread.shared-global:<name>, at the thread. (A `var` the
+ *  body names itself is thread.mutable-global already.) The runtime
+ *  (abla/runtime) guards its own globals, so neither they nor what its
+ *  functions reach are checked. A library `val` marked `@threadShared`
+ *  was reviewed as never changed after it is built. Programs that start no thread build nothing
+ *  here. */
+fun bootstrapCheckThreadGlobals(var analyzer: BootstrapAnalyzer): void {
+    val threads = analyzer.initEdges.threadSources.size
+    if (threads == 0) return
+    val declarations = analyzer.declarations
+    var nodes = declarations.size
+    for (handle in analyzer.methodDeclarations.handles) {
+        if (handle + 1 > nodes) nodes = handle + 1
+    }
+    val from: array<int> = []
+    val to: array<int> = []
+    bootstrapInitEdgeList(analyzer, from, to)
+    val starts: array<int> = []
+    while (starts.size <= nodes) starts.append(0)
+    var edge = 0
+    while (edge < from.size) {
+        if (from[edge] >= 0 && from[edge] < nodes && to[edge] >= 0 && to[edge] < nodes) {
+            starts[from[edge] + 1] = starts[from[edge] + 1] + 1
+        }
+        edge = edge + 1
+    }
+    var index = 0
+    while (index < nodes) {
+        starts[index + 1] = starts[index + 1] + starts[index]
+        index = index + 1
+    }
+    val fill: array<int> = []
+    index = 0
+    while (index < nodes) {
+        fill.append(starts[index])
+        index = index + 1
+    }
+    val targets: array<int> = []
+    while (targets.size < starts[nodes]) targets.append(0)
+    edge = 0
+    while (edge < from.size) {
+        if (from[edge] >= 0 && from[edge] < nodes && to[edge] >= 0 && to[edge] < nodes) {
+            targets[fill[from[edge]]] = to[edge]
+            fill[from[edge]] = fill[from[edge]] + 1
+        }
+        edge = edge + 1
+    }
+    val stamp: array<int> = []
+    while (stamp.size < nodes) stamp.append(-1)
+    val messages: array<string> = []
+    val messageSources: array<string> = []
+    var body = 0
+    while (body < threads) {
+        val stack: array<int> = []
+        val direct: array<bool> = []
+        edge = 0
+        while (edge < analyzer.initEdges.threadFrom.size) {
+            val target = analyzer.initEdges.threadTo[edge]
+            if (analyzer.initEdges.threadFrom[edge] == body && target >= 0 &&
+                target < nodes && stamp[target] != body) {
+                stamp[target] = body
+                stack.append(target)
+                direct.append(true)
+            }
+            edge = edge + 1
+        }
+        val reported: array<int> = []
+        while (stack.size > 0) {
+            val node = stack[stack.size - 1]
+            val named = direct[direct.size - 1]
+            stack.truncate(stack.size - 1)
+            direct.truncate(direct.size - 1)
+            var follow = true
+            val runtime = node < declarations.size &&
+                bootstrapRuntimeModuleSource(declarations[node].sourceIdentity)
+            if (runtime) follow = false
+            if (!runtime && node < declarations.size &&
+                bootstrapDeclarationIsValue(declarations[node].kind)) {
+                val global = declarations[node]
+                val symbol = analyzer.symbolIndex(global.name)
+                val type = if (symbol >= 0) analyzer.symbols[symbol].type else "unknown"
+                // `@threadShared`: a library global reviewed as never changed
+                // after it is built (bootstrapValidateThreadShared).
+                val safe = global.kind == "compile.val" || global.kind == "compile.var" ||
+                    (global.kind == "val" &&
+                     global.expression.kind != "delegate.initializer" &&
+                     (bootstrapThreadSafeType(analyzer, type, 0) ||
+                      bootstrapDeclarationHasAnnotation(global, "threadShared")))
+                // A `var` the body names is thread.mutable-global already.
+                if (!safe && !(named && global.kind == "var")) reported.append(node)
+                // A function value's initializer is what calling it runs.
+                follow = bootstrapIsFunctionType(bootstrapNormalizeType(type))
+            }
+            if (follow) {
+                var next = starts[node]
+                while (next < starts[node + 1]) {
+                    val target = targets[next]
+                    if (stamp[target] != body) {
+                        stamp[target] = body
+                        stack.append(target)
+                        direct.append(false)
+                    }
+                    next = next + 1
+                }
+            }
+        }
+        for (global in reported) {
+            messages.append(
+                "thread.shared-global:${declarations[global].name}@${analyzer.initEdges.threadBegins[body]}"
+            )
+            messageSources.append("${analyzer.initEdges.threadSources[body]}")
+        }
+        body = body + 1
+    }
+    val source = analyzer.currentSourceIdentity
+    var message = 0
+    while (message < messages.size) {
+        analyzer.currentSourceIdentity = messageSources[message]
+        analyzer.fail(messages[message])
+        message = message + 1
+    }
+    analyzer.currentSourceIdentity = source
+    return
+}
+
+/** A type whose values no thread can change, so threads may share one:
+ *  scalars, strings, functions, a Shared, Mutex or Weak handle, and an
+ *  optional one of those. A class instance is not (wrap it in a Shared or
+ *  Mutex), nor an array, a map or a cell. */
+fun bootstrapThreadSafeType(analyzer: BootstrapAnalyzer, type: string, depth: int): bool {
+    val normalized = bootstrapNormalizeType(type)
+    if (depth > 16 || normalized == "unknown") return false
+    if (bootstrapScalarTypeUnderlyingValid(normalized) || normalized == "string" ||
+        normalized == "bool" || normalized == "void" ||
+        bootstrapIsFunctionType(normalized) ||
+        bootstrapIsSharedType(normalized) || bootstrapIsMutexType(normalized) ||
+        bootstrapIsWeakType(normalized)) return true
+    if (bootstrapIsNullableType(normalized)) {
+        return bootstrapThreadSafeType(
+            analyzer, bootstrapNullableElementType(normalized), depth + 1
+        )
+    }
+    val declarationIndex = analyzer.typeDeclarations.find(normalized)
+    if (declarationIndex < 0) return false
+    val declaration = analyzer.declarations[declarationIndex]
+    declaration.kind == "type" &&
+        bootstrapScalarTypeUnderlyingValid(bootstrapNormalizeType(declaration.resultType))
 }

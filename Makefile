@@ -156,6 +156,7 @@ test: ablac
 	tools/test-callable-families.sh $(COMPILER)
 	tools/test-field-shadowing.sh $(COMPILER)
 	tools/test-global-names.sh $(COMPILER)
+	tools/test-thread-globals.sh $(COMPILER)
 	tools/test-compile-eval-jit.sh $(COMPILER)
 	tools/test-compile-native.sh $(COMPILER)
 	tools/test-optimize-o1.sh $(COMPILER)

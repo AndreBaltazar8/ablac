@@ -7,7 +7,53 @@ import "abla/dns"
 import "abla/sys/linux/net"
 import "abla/unsafe/memory"
 
-var hostedTlsError: string = ""
+// The calling thread's last error, as a code in thread-local storage (like
+// errno: each thread has its own, so threads starting connections at once
+// don't share it); tlsLastError reads it as text.
+@inline
+trusted fun hostedTlsErrorSlot(): i64* =
+    nativePointerFromAddress(
+        nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00")
+    )
+
+trusted fun hostedTlsSetError(code: int): void {
+    ablaUnsafeStoreI64(hostedTlsErrorSlot(), code)
+    return
+}
+
+val hostedTlsListenerFailed = 11
+val hostedTlsServerHandshakeFailed = 12
+
+// A failed stage of a client connection, as its error code.
+fun hostedTlsStageCode(stage: string): int = when (stage) {
+    "tcp_connect" -> 2
+    "context_create" -> 3
+    "trust_store" -> 4
+    "session_create" -> 5
+    "server_name" -> 6
+    "host_verification_setup" -> 7
+    "socket_attach" -> 8
+    "handshake" -> 9
+    "certificate_verification" -> 10
+    else -> 1
+}
+
+fun hostedTlsErrorText(code: int): string = when (code) {
+    0 -> ""
+    1 -> "TLS failed at configuration"
+    2 -> "TLS failed at tcp_connect"
+    3 -> "TLS failed at context_create"
+    4 -> "TLS failed at trust_store"
+    5 -> "TLS failed at session_create"
+    6 -> "TLS failed at server_name"
+    7 -> "TLS failed at host_verification_setup"
+    8 -> "TLS failed at socket_attach"
+    9 -> "TLS failed at handshake"
+    10 -> "TLS failed at certificate_verification"
+    11 -> "TLS certificate, private key, or listener failed"
+    12 -> "TLS server handshake failed"
+    else -> "TLS failed"
+}
 
 // Connection control: context pointer, SSL pointer, descriptor, owns-context.
 // Listener control: context pointer, descriptor.
@@ -60,7 +106,8 @@ resource class TlsListener(var handle: int) {
 
 trusted fun tlsAvailable(): bool = OpenSSL_version_num() > 0
 
-fun tlsLastError(): string = hostedTlsError
+trusted fun tlsLastError(): string =
+    hostedTlsErrorText(ablaUnsafeLoadI64(hostedTlsErrorSlot()))
 
 // The raw connector deliberately bounds its nonblocking connection phase to
 // ten seconds. HTTPS callers may use a larger overall exchange timeout; keep
@@ -93,7 +140,7 @@ trusted fun tlsOpen(
         ) else tcpConnectHost(host, port, connectTimeout)
         ready = connection.descriptor >= 0
     }
-    if (!ready) { hostedTlsError = "TLS failed at $stage"; return -1 }
+    if (!ready) { hostedTlsSetError(hostedTlsStageCode(stage)); return -1 }
     tlsUpgradeHandle(connection, host, caPath)
 }
 
@@ -150,11 +197,11 @@ trusted fun tlsUpgradeHandle(var connection: TcpConnection, host: string, caPath
             context, session, connection.descriptor, true
         )
         connection.descriptor = -1
-        hostedTlsError = ""
+        hostedTlsSetError(0)
     } else {
         if (!pointerIsNull(session)) SSL_free(session)
         if (!pointerIsNull(context)) SSL_CTX_free(context)
-        hostedTlsError = "TLS failed at $stage"
+        hostedTlsSetError(hostedTlsStageCode(stage))
         connection.close()
     }
     handle
@@ -213,10 +260,10 @@ trusted fun tlsListenHandle(
     if (ready) {
         handle = tlsAllocateListener(context, listener.descriptor)
         listener.descriptor = -1
-        hostedTlsError = ""
+        hostedTlsSetError(0)
     } else {
         if (!pointerIsNull(context)) SSL_CTX_free(context)
-        hostedTlsError = "TLS certificate, private key, or listener failed"
+        hostedTlsSetError(hostedTlsListenerFailed)
     }
     handle
 }
@@ -260,7 +307,7 @@ trusted fun TlsListener.accept(): TlsConnection {
         else {
             if (!pointerIsNull(session)) SSL_free(session)
             if (descriptor >= 0) linuxTcpCloseDescriptor(descriptor)
-            hostedTlsError = "TLS server handshake failed"
+            hostedTlsSetError(hostedTlsServerHandshakeFailed)
         }
     }
     TlsConnection(handle)

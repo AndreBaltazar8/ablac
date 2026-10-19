@@ -257,8 +257,20 @@ A thread shares nothing by accident:
 - A thread body may capture only `Shared<T>`, `Mutex<T>` and `Weak<T>`
   handles, which move into the thread. Clone the handle first if the parent
   needs it too (`thread.capture-type`).
-- It can't assign to a captured variable (`thread.capture-mutation`) or to
+- It can't assign to a captured variable (`thread.capture-mutation`) or name
   a mutable top-level `var` (`thread.mutable-global`).
+- Every global it reaches, in its body or through the functions, methods and
+  function values it calls, must be one no other thread can change: a `val`
+  of a scalar, a string, a function, or a `Shared`, `Mutex` or `Weak`
+  handle (or an optional one of those), or a compile-time value. A class
+  instance, an array, a map or a `var` is `thread.shared-global:<name>`:
+  wrap it in a `Mutex` (or `Shared`). The runtime's own globals are its
+  business. A standard-library `val` marked `@threadShared` (abla/json's
+  shared empty values, float text's tables) was reviewed as never changed
+  once built, so threads share it; the annotation is accepted only in the
+  standard library (`threadShared.library`) and only on a `val`
+  (`threadShared.val`). A `task` runs on its starter's thread and is not
+  checked.
 - Its result can't be a borrowed view or an affine value.
 
 A panic inside a thread also ends the whole process at once, with the
@@ -323,4 +335,6 @@ expression ([compile-time.md](compile-time.md#expression)).
 | `await.operation` | `await` without an operand |
 | `thread.capture-type` | a thread body captures something other than a `Shared`/`Mutex`/`Weak` handle |
 | `thread.capture-mutation` | a thread body assigns to a captured variable |
-| `thread.mutable-global` | a thread body assigns to a mutable top-level `var` |
+| `thread.mutable-global` | a thread body names a mutable top-level `var` |
+| `thread.shared-global:<name>@<offset>` | a thread reaches a global another thread may change or alias |
+| `threadShared.library:<name>`, `threadShared.val:<name>` | `@threadShared` outside the standard library, or not on a `val` |

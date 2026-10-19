@@ -1,7 +1,15 @@
 import "abla/websocket/event"
 
-var websocketEventDone = false
-var websocketEventPort = 0
+// What the client thread and the server loop share: the listener's port and
+// whether the client is done.
+resource class WebSocketEventLink(val port: int, var done: bool)
+
+fun webSocketEventPort(var link: WebSocketEventLink): int = link.port
+fun webSocketEventDone(var link: WebSocketEventLink): bool = link.done
+fun webSocketEventFinish(var link: WebSocketEventLink): bool {
+    link.done = true
+    true
+}
 
 fun eventEcho(
     path: string,
@@ -11,12 +19,12 @@ fun eventEcho(
     "$path:$kind:$payload", "text", true
 )
 
-fun websocketEventClient(): int {
+fun websocketEventClient(link: Mutex<WebSocketEventLink>): int {
     val connection = tcpConnectIpv4(
-        "127.0.0.1", websocketEventPort, 1000
+        "127.0.0.1", link.with(webSocketEventPort), 1000
     )
     if (connection.descriptor < 0) {
-        websocketEventDone = true
+        link.with(webSocketEventFinish)
         return 1
     }
     val request = "GET /rooms/7 HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
@@ -30,7 +38,7 @@ fun websocketEventClient(): int {
         else reading = false
     }
     connection.close()
-    websocketEventDone = true
+    link.with(webSocketEventFinish)
     val headerEnd = httpHeaderEnd(response)
     var valid = headerEnd > 0 &&
         response.slice(0, 12) == "HTTP/1.1 101"
@@ -48,9 +56,10 @@ fun main: int {
     val router = webSocketEventRouter()
     router.route("/rooms/:room", eventEcho)
     val server = webSocketEventServer(router, ipv4Loopback(0))
-    websocketEventPort = server.listener.localPort()
-    val client = thread { websocketEventClient() }
-    while (!websocketEventDone) server.step(100)
+    val link = Mutex(WebSocketEventLink(server.listener.localPort(), false))
+    val forClient = link.clone()
+    val client = thread { websocketEventClient(forClient) }
+    while (!link.with(webSocketEventDone)) server.step(100)
     val status = await client
     server.stop()
     val drained = server.drain()

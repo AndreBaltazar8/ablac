@@ -3,14 +3,29 @@ import "abla/sys/linux"
 import "abla/sys/linux/process"
 import "abla/unsafe/memory"
 
-var eventClientDone = false
-var eventPort = 0
-var eventBackpressureClientDone = false
-var eventBackpressurePort = 0
-var eventBackpressureSend = false
-var eventBackpressureRead = false
-var eventBodyDone = false
-var eventBodyPort = 0
+// What a client thread and the server loop share: the listener's port,
+// whether the client is done, and (backpressure) when the client may send and
+// read.
+resource class EventLink(val port: int, var done: bool, var send: bool, var read: bool)
+
+fun eventLinkPort(var link: EventLink): int = link.port
+fun eventLinkDone(var link: EventLink): bool = link.done
+fun eventLinkSend(var link: EventLink): bool = link.send
+fun eventLinkRead(var link: EventLink): bool = link.read
+fun eventLinkFinish(var link: EventLink): bool {
+    link.done = true
+    true
+}
+fun eventLinkAllowSend(var link: EventLink): bool {
+    link.send = true
+    true
+}
+fun eventLinkAllowRead(var link: EventLink): bool {
+    link.read = true
+    true
+}
+
+fun eventLink(port: int): Mutex<EventLink> = Mutex(EventLink(port, false, false, false))
 
 fun eventOne(request: HttpRequest): HttpResponse = httpText("first")
 fun eventTwo(request: HttpRequest): HttpResponse = httpText("second")
@@ -29,12 +44,12 @@ fun eventLarge(request: HttpRequest): HttpResponse {
     httpText(largePayload)
 }
 
-fun eventBodyClient(): int {
+fun eventBodyClient(link: Mutex<EventLink>): int {
     val bodyConnection = tcpConnectIpv4(
-        "127.0.0.1", eventBodyPort, 1000
+        "127.0.0.1", link.with(eventLinkPort), 1000
     )
     if (bodyConnection.descriptor < 0) {
-        eventBodyDone = true
+        link.with(eventLinkFinish)
         return 1
     }
     var splitPayload = "0123456789abcdef"
@@ -63,7 +78,7 @@ fun eventBodyClient(): int {
         else reading = false
     }
     bodyConnection.close()
-    eventBodyDone = true
+    link.with(eventLinkFinish)
     if (textContains(response, splitPayload)) 0 else 2
 }
 
@@ -71,9 +86,10 @@ fun eventBodyAcrossReads(): bool {
     val router = httpRouter()
     router.post("/body", eventBodyHandler)
     val server = httpEventServer(router, ipv4Loopback(0))
-    eventBodyPort = server.listener.localPort()
-    val client = thread { eventBodyClient() }
-    while (!eventBodyDone) server.step(100)
+    val link = eventLink(server.listener.localPort())
+    val forClient = link.clone()
+    val client = thread { eventBodyClient(forClient) }
+    while (!link.with(eventLinkDone)) server.step(100)
     val status = await client
     server.stop()
     server.drain()
@@ -90,10 +106,10 @@ fun textContains(input: string, wanted: string): bool {
     found
 }
 
-fun eventClient(): int {
-    val connection = tcpConnectIpv4("127.0.0.1", eventPort, 1000)
+fun eventClient(link: Mutex<EventLink>): int {
+    val connection = tcpConnectIpv4("127.0.0.1", link.with(eventLinkPort), 1000)
     if (connection.descriptor < 0) {
-        eventClientDone = true
+        link.with(eventLinkFinish)
         return 1
     }
     val requests = "GET /one HTTP/1.1\r\nHost: local\r\nConnection: keep-alive\r\n\r\nGET /two HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
@@ -106,7 +122,7 @@ fun eventClient(): int {
         else reading = false
     }
     connection.close()
-    eventClientDone = true
+    link.with(eventLinkFinish)
     if (textContains(response, "first") &&
         textContains(response, "second") &&
         textContains(response, "Connection: keep-alive") &&
@@ -135,18 +151,18 @@ fun eventTestSendBuffer(descriptor: int, bytes: int): bool {
     status == 0
 }
 
-fun eventBackpressureClient(): int {
+fun eventBackpressureClient(link: Mutex<EventLink>): int {
     val connection = tcpConnectIpv4(
-        "127.0.0.1", eventBackpressurePort, 1000
+        "127.0.0.1", link.with(eventLinkPort), 1000
     )
     if (connection.descriptor < 0) {
-        eventBackpressureClientDone = true
+        link.with(eventLinkFinish)
         return 1
     }
-    while (!eventBackpressureSend) linuxSleep(1)
+    while (!link.with(eventLinkSend)) linuxSleep(1)
     val request = "GET /large HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
     val sent = connection.write(request)
-    while (!eventBackpressureRead) linuxSleep(1)
+    while (!link.with(eventLinkRead)) linuxSleep(1)
     var response = ""
     var reading = sent == request.size
     while (reading) {
@@ -155,7 +171,7 @@ fun eventBackpressureClient(): int {
         else reading = false
     }
     connection.close()
-    eventBackpressureClientDone = true
+    link.with(eventLinkFinish)
     if (response.size >= 262144 &&
         textContains(response, "Connection: close")) 0 else 2
 }
@@ -164,16 +180,17 @@ fun eventBackpressure(): bool {
     val router = httpRouter()
     router.get("/large", eventLarge)
     val server = httpEventServer(router, ipv4Loopback(0))
-    eventBackpressurePort = server.listener.localPort()
-    val client = thread { eventBackpressureClient() }
+    val link = eventLink(server.listener.localPort())
+    val forClient = link.clone()
+    val client = thread { eventBackpressureClient(forClient) }
     while (server.activeConnections() == 0) server.step(100)
     val sendBufferSet = eventTestSendBuffer(server.descriptors[0], 4096)
-    eventBackpressureSend = true
+    link.with(eventLinkAllowSend)
     server.step(1000)
     val writeInterestEnabled = server.writeWatching[0] &&
         server.outputOffsets[0] > 0 && server.outputs[0] != ""
-    eventBackpressureRead = true
-    while (!eventBackpressureClientDone) server.step(100)
+    link.with(eventLinkAllowRead)
+    while (!link.with(eventLinkDone)) server.step(100)
     val status = await client
     server.stop()
     server.drain()
@@ -188,9 +205,10 @@ fun main: int {
     router.get("/two", eventTwo)
     router.post("/body", eventBodyHandler)
     val server = httpEventServer(router, ipv4Loopback(0))
-    eventPort = server.listener.localPort()
-    val client = thread { eventClient() }
-    while (!eventClientDone) server.step(100)
+    val link = eventLink(server.listener.localPort())
+    val forClient = link.clone()
+    val client = thread { eventClient(forClient) }
+    while (!link.with(eventLinkDone)) server.step(100)
     val status = await client
     server.stop()
     val drained = server.drain()

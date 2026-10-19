@@ -2399,6 +2399,10 @@ fun bootstrapSemanticHelp(code: string): string {
     when (code.slice(0, colon)) {
         "library.program-global" ->
             "the standard library reads only its own globals, never a program's: this name is the library's local or a missing declaration"
+        "threadShared.library" ->
+            "`@threadShared` is the standard library's reviewed promise that a global never changes once built; a program shares one between threads through Shared<T> or Mutex<T>"
+        "thread.shared-global" ->
+            "a thread reaches this global (in its body or through what it calls) while other threads may use it: wrap it in Shared<T> or Mutex<T>, or give the thread its own copy"
         "native.runtime-internal" ->
             "this intrinsic exposes the runtime's own memory layout, so only the runtime (abla/runtime) calls it, even from trusted code: use the typed operation it backs (a field, an index, a function value's `ablaRuntimeFunctionId`), or `abla/unsafe` for raw memory you allocate"
         "subparser.unknown" ->
@@ -6006,7 +6010,9 @@ class BootstrapAnalyzer(
         val index = this.symbolIndex(name)
         if (index >= 0) {
             result = this.symbols[index].type
-            if (this.initEdges.owner >= 0) bootstrapInitRecordSymbol(this, index)
+            if (this.initEdges.owner >= 0 || this.initEdges.threadBody >= 0) {
+                bootstrapInitRecordSymbol(this, index)
+            }
             if (bootstrapFunctionTypeIsInferred(result)) {
                 result = bootstrapResolvedSymbolType(this, index)
             }
@@ -6764,7 +6770,7 @@ class BootstrapAnalyzer(
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
             val declaration = this.methodDeclarations.declarations[entry]
-            if (this.initEdges.owner >= 0) {
+            if (this.initEdges.owner >= 0 || this.initEdges.threadBody >= 0) {
                 bootstrapInitRecord(this, this.methodDeclarations.handles[entry])
             }
             if (declaration.resultType != "inferred") {
@@ -9847,6 +9853,15 @@ class BootstrapAnalyzer(
                 if (declaration.annotations[annotation] == "noinline") {
                     noinlineAnnotation = annotation
                 }
+                // A library's reviewed promise that a global never changes
+                // once built, which threads may then share (ct_init.ab).
+                if (declaration.annotations[annotation] == "threadShared") {
+                    if (declaration.kind != "val") {
+                        this.fail("threadShared.val:${declaration.name}")
+                    } else if (!bootstrapStandardLibraryModuleSource(
+                        declaration.sourceIdentity
+                    )) this.fail("threadShared.library:${declaration.name}")
+                }
                 if (declaration.annotations[annotation] == "section") {
                     if (declaration.kind != "fun" ||
                         declaration.extensionOwner != "") {
@@ -10279,6 +10294,7 @@ class BootstrapAnalyzer(
         // The overload probe types only some bodies: the build's analysis checks.
         val initialization = if (this.overloads.keys.size == 0)
             bootstrapCheckInitialization(this) else BootstrapInitialization([], [], [], [])
+        if (this.overloads.keys.size == 0) bootstrapCheckThreadGlobals(this)
         if (this.overloads.keys.size == 0) bootstrapPublishInferredResults(this)
         BootstrapSemanticResult(
             this.symbols,
@@ -11909,6 +11925,14 @@ fun bootstrapInferTask(
         if (expression.kind == "thread") {
             analyzer.validateThreadCaptures(expression.children[0])
         }
+        // What a thread's body reads and calls is recorded for it as well
+        // (bootstrapCheckThreadGlobals); a task runs on its starter's thread.
+        val previousThread = analyzer.initEdges.threadBody
+        if (expression.kind == "thread") {
+            analyzer.initEdges.threadBody = analyzer.initEdges.threadSources.size
+            analyzer.initEdges.threadSources.append(analyzer.currentSourceIdentity)
+            analyzer.initEdges.threadBegins.append(expression.begin)
+        }
         val callable = analyzer.infer(BootstrapExpression(
             "lambda.move",
             "",
@@ -11916,6 +11940,7 @@ fun bootstrapInferTask(
             expression.end,
             [expression.children[0]]
         ))
+        analyzer.initEdges.threadBody = previousThread
         val found = bootstrapFunctionResultType(callable)
         if (bootstrapIsBorrowType(found) || analyzer.typeIsAffine(found)) {
             analyzer.fail("${expression.kind}.affine-result:$found")
