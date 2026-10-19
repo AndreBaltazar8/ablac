@@ -152,19 +152,19 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   says whether its allocation is large, so the build reads no header (about 2% less wall
   time for a compiler emitting a large program; the sweep, `free` and madvise are what
   is left).
-- [ ] **Name lookups in lowering.** Sampled over a game client's dev build at `d39b14d`,
-  `BootstrapFunctionDeclarationIndex.find` and the name hash under it are about 450 ms
-  together, about 1% of the compiler's samples (an index lookup each time, but many of
-  them); over a game server's `--emit-llvm`, `bootstrapFunctionDeclarationHash`,
-  `bootstrapIrLookupHash` and the two `find`s are about 4% of samples. The hashes read the
-  name a byte at a time. The callers of `find` are not in the sample: lowering's recursion
-  is deeper than its stacks. Next: count the lookups per call site, then remember a
-  callee's declaration where the same name is looked up again (`lowerFunctionResultType`,
-  `lowerFunctionType`, `lowerGlobalFunctionType` each look it up afresh). (The runtime
-  operation per opcode is a table, and the borrow liveness resolves successor blocks once.)
-  A sample of a compiler built without `-g` names functions `abla_fn_<a>_<b>`; the
-  compiler's own `--emit-llvm` maps each to its source name through the function's
-  `"abla.source"` attribute.
+- [ ] **Name lookups in lowering.** Over a game server's `--emit-llvm` the method index's
+  `find` was 200 of 3,552 samples, the declaration index's 148 and the name hashes 98 and
+  76. Done: the method index hashes owner and name in place instead of a key string made
+  per lookup, and the slot hash is FNV-1a (an xor and a multiply a byte; a word at a time
+  would need the string's bytes flat, a rope's are not): about 4% of that `--emit-llvm`.
+  (The runtime operation per opcode is a table, and the borrow liveness resolves successor
+  blocks once.) Left: the declaration index's `find`, whose callers the sample does not
+  show: lowering's recursion is deeper than its stacks. Next: count the lookups per call
+  site, then remember a callee's declaration where the same name is looked up again
+  (`lowerFunctionResultType`, `lowerFunctionType`, `lowerGlobalFunctionType` each look it
+  up afresh). A sample of a compiler built without `-g` names functions
+  `abla_fn_<a>_<b>`; the compiler's own `--emit-llvm` maps each to its source name
+  through the function's `"abla.source"` attribute.
 
 ## Not checked
 
