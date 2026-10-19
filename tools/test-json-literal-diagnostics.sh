@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# `$json` literals: a repeated literal key and a trailing comma are errors at the
-# literal, and a value it can't convert says what it accepts.
+# `$json` literals: a repeated literal key and a comma with nothing before it are
+# errors at the literal (a trailing comma is allowed, tools/test-json-expressions.sh),
+# and a value it can't convert says what it accepts.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -22,7 +23,7 @@ expect() { # file text…
 }
 
 expect json-duplicate-key 'duplicate key "a"'
-expect json-trailing-comma "trailing comma in a \$json object"
-expect json-trailing-comma-array "trailing comma in a \$json array"
+expect json-stray-comma "expected a \$json object member before \`,\`"
+expect json-stray-comma-array "expected a \$json array element before \`,\`"
 expect json-unconvertible "can't convert a value of type P"
-echo "json literal diagnostics: duplicate keys, trailing commas, unconvertible values"
+echo "json literal diagnostics: duplicate keys, stray commas, unconvertible values"

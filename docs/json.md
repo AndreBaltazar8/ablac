@@ -81,7 +81,7 @@ fun main {
 ```
 
 `jsonParse` accepts the standard JSON grammar and valid UTF-8. It rejects
-comments, trailing commas, leading plus signs, leading zeroes, incomplete
+comments, trailing commas (which `$json` literals allow), leading plus signs, leading zeroes, incomplete
 fractions or exponents, unescaped control bytes, lone UTF-16 surrogates,
 duplicate object keys, and non-whitespace trailing input. Escaped surrogate
 pairs are decoded to UTF-8. Error offsets count source bytes; line and column
@@ -229,7 +229,7 @@ fun main {
         "name": user.name,
         "next": count + 1,
         "item-$index": lookup(index),
-        "tags": ["fixed", tag()]
+        "tags": ["fixed", tag()],
     }
     println(jsonStringify(literal))
 }
@@ -248,8 +248,11 @@ compile time and at run time; NaN and the infinities become `null`. A value of
 any other type is a compile error at that value.
 
 Keys must be strings; a key of another type is a compile error at that key.
-A key repeated within one literal object is a compile error, and so is a
-trailing comma in an object or array.
+A key repeated within one literal object is a compile error. Unlike JSON, an
+object or array may end in a comma, as `"tags"` and the object above do, so a
+literal written one member per line can add, remove, or reorder lines freely; a
+comma with nothing before it (`[1,, 2]`, `{,}`) is a compile error. `$jsons`
+reads the same grammar.
 
 A value of another type is rejected with a help line listing the accepted
 types.
