@@ -95,6 +95,7 @@ only its parse errors.
 | `break.outside-loop`, `continue.outside-loop`, `return.outside-function` | control transfer outside its construct |
 | `E_NAMED_ARGUMENT_UNKNOWN`, `_DUPLICATE`, `_ORDER`, `_REQUIRED`, `_TARGET`, `_ARITY` | named-argument errors ([functions](language.md#functions)) |
 | `native.trust:<f>` | calling a trusted function from untrusted code ([trusted code](language.md#trusted-native-implementations)) |
+| `native.runtime-internal:<f>` | calling one of the runtime's address intrinsics or field-slot accessors outside `abla/runtime`, trusted or not ([trusted code](language.md#trusted-native-implementations)) |
 | `noinline.*`, `naked.*`, `section.*`, `wasmImport.*`, `inline-assembly.*` | misused [annotations](language.md#annotations) |
 | `E_EXPORT_ANNOTATION`, `E_EXPORT_SIGNATURE_UNSUPPORTED`, `E_EXPORT_TARGET_CAPABILITY` | an export with a bad name or a signature the foreign ABI can't express |
 

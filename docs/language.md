@@ -1703,6 +1703,33 @@ code: the `trusted` function is where the safety argument lives. The intended
 policy also requires a package-manifest grant before a non-platform package
 may define a trusted implementation. That manifest check is not enforced yet.
 
+Object addresses are runtime-internal. The intrinsics that yield the address of
+a value, an object, a field, a cell or an array (`ablaRuntimeValueAddress`,
+`ablaRuntimeValueWord0`, `__ablaRuntimeWord0`, `__ablaRuntimeWord1`,
+`__ablaRuntimeObjectAddress`, `__ablaRuntimeFieldAddress`,
+`__ablaRuntimeFieldAddressScan`, `__ablaRuntimeFieldAddressIndexed`,
+`__ablaRuntimeCellAddress`, `__ablaRuntimeArrayAddress`), and the field-slot
+accessors (`ablaRuntimeLoadSlotI32`, `ablaRuntimeLoadSlotI64`,
+`ablaRuntimeStoreSlotI32`, `ablaRuntimeStoreSlotI64`), are called only by
+modules under `abla/runtime` and by the code the compiler generates for
+compile-time evaluation. A call from anywhere else, trusted or not, is an error
+(`native.runtime-internal:ablaRuntimeValueWord0`). The compiler and the backend
+rely on no other code holding those addresses: an object can move or change
+layout, and LLVM is told that raw memory never aliases a field slot.
+
+Raw memory you allocate (`abla/unsafe/memory/raw`, `abla/unsafe/native`, C
+allocations) stays yours to address. A function value's id, the one thing the
+bridge and similar tools needed from a value's words, is
+`ablaRuntimeFunctionId(f)`: the function a value calls, 0 for a value that
+isn't a function.
+
+```abla error
+trusted fun word(value: any): int = ablaRuntimeValueWord0(value)
+
+fun main: int = word(1)
+// error: native.runtime-internal:ablaRuntimeValueWord0
+```
+
 `extern:"kind"` declares a function implemented outside Abla:
 
 | Kind | Implemented by |

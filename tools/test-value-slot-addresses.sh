@@ -4,8 +4,12 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=${1:-$project_root/build/ablac}
 output_directory="$project_root/build/value-slot-addresses"
-fixture="$project_root/tests/cases/value-slot-addresses.ab"
 mkdir -p -- "$output_directory"
+# Only the runtime calls ablaRuntimeValueAddress: the fixture is built as one
+# of its modules.
+fixture=$("$project_root/tools/runtime-fixture.sh" \
+    "$project_root/tests/cases/value-slot-addresses.ab" "$output_directory")
+export ABLA_STDLIB="$output_directory/stdlib"
 
 "$compiler" build "$fixture" -o "$output_directory/value-slot-addresses" \
     --fast --no-cache

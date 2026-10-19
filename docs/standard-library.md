@@ -82,7 +82,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/sys/linux` | opt-in raw x86-64 Linux syscall and native descriptor APIs |
 | `abla/sys/linux/fs`, `/io`, `/process`, `/net`, `/random` | the raw-kernel implementations behind the portable modules |
 | `abla/platform/host` | the hosted runtime's `ablaHost*` functions; portable code uses the modules above instead |
-| `abla/runtime/*` | the runtime itself, linked automatically; internal |
+| `abla/runtime/*` | the runtime itself, linked automatically; internal (its address intrinsics are callable only from it: `native.runtime-internal`) |
 
 There are no visibility modifiers, so a module's internal helpers are also
 importable. The functions named on the task pages are the supported API.

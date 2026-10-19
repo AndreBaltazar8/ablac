@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# The runtime's address intrinsics and field-slot accessors are callable only
+# from abla/runtime (and the compile-time support the compiler generates):
+# a program's call, trusted or not, or its use of one as a function value is
+# native.runtime-internal. A function value's id stays public.
+set -euo pipefail
+
+compiler=${1:-build/ablac.bin}
+project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cases="$project_root/tests/cases/runtime-internal"
+output_directory="$project_root/build/runtime-internal"
+mkdir -p "$output_directory"
+
+if "$compiler" build "$cases/refused.ab" -o "$output_directory/refused" \
+    --no-cache > "$output_directory/refused.err" 2>&1; then
+    echo "runtime internal: refused.ab compiled"; exit 1
+fi
+for name in ablaRuntimeValueAddress ablaRuntimeValueWord0 __ablaRuntimeWord0 \
+    __ablaRuntimeWord1 __ablaRuntimeObjectAddress __ablaRuntimeFieldAddressScan \
+    __ablaRuntimeFieldAddress __ablaRuntimeFieldAddressIndexed \
+    __ablaRuntimeCellAddress __ablaRuntimeArrayAddress ablaRuntimeLoadSlotI32 \
+    ablaRuntimeLoadSlotI64 ablaRuntimeStoreSlotI32 ablaRuntimeStoreSlotI64; do
+    grep -qF "error[E_SEMANTIC]: native.runtime-internal:$name" \
+        "$output_directory/refused.err" ||
+        { echo "runtime internal: $name not refused"; cat "$output_directory/refused.err"; exit 1; }
+done
+# The trusted call, the untrusted one and the function value.
+[[ $(grep -c 'native.runtime-internal:ablaRuntimeValueWord0' \
+    "$output_directory/refused.err") == 2 ]] ||
+    { echo "runtime internal: an ablaRuntimeValueWord0 call not refused"; exit 1; }
+[[ $(grep -c 'native.runtime-internal:__ablaRuntimeObjectAddress' \
+    "$output_directory/refused.err") == 2 ]] ||
+    { echo "runtime internal: the function value not refused"; exit 1; }
+grep -qF 'help: this intrinsic exposes the runtime' "$output_directory/refused.err" ||
+    { echo "runtime internal: no help line"; exit 1; }
+
+# A program can't declare one either: the runtime's name is taken (checked once
+# the runtime declares the slot accessors).
+if grep -q 'fun ablaRuntimeLoadSlotI32' \
+    "${ABLA_STDLIB:-$project_root/stdlib}/abla/runtime/self/entry.ab"; then
+    if "$compiler" build "$cases/declared-slot.ab" -o "$output_directory/declared-slot" \
+        --no-cache > "$output_directory/declared-slot.err" 2>&1; then
+        echo "runtime internal: declared-slot.ab compiled"; exit 1
+    fi
+    grep -qF 'symbol.duplicate:ablaRuntimeLoadSlotI32' "$output_directory/declared-slot.err" ||
+        { echo "runtime internal: declared-slot.ab not a duplicate"; cat "$output_directory/declared-slot.err"; exit 1; }
+fi
+
+"$compiler" build "$cases/function-id.ab" -o "$output_directory/function-id" --no-cache
+set +e
+"$output_directory/function-id"
+status=$?
+set -e
+[[ $status == 42 ]] || { echo "runtime internal: function-id exited with $status"; exit 1; }
+
+# The runtime's own modules may call them.
+fixture=$("$project_root/tools/runtime-fixture.sh" "$cases/allowed.ab" "$output_directory/allowed")
+ABLA_STDLIB="$output_directory/allowed/stdlib" "$compiler" build "$fixture" \
+    -o "$output_directory/allowed-program" --no-cache
+set +e
+"$output_directory/allowed-program"
+status=$?
+set -e
+[[ $status == 42 ]] || { echo "runtime internal: allowed exited with $status"; exit 1; }
+echo "runtime internal: address intrinsics and slot accessors refused outside abla/runtime; function ids public"

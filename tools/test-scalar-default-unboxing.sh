@@ -3,9 +3,13 @@ set -euo pipefail
 # This test reads the module's LLVM text, which a development build keeps only when asked.
 export ABLA_KEEP_LLVM_TEXT=1
 compiler=${1:-build/ablac}
-fixture=tests/cases/modules/scalar-default-unboxing.ab
 output=build/tests/scalar-default-unboxing
 mkdir -p build/tests
+# It calls ablaRuntimeValueWord0, which only the runtime may: built as one of
+# the runtime's modules.
+fixture=$(tools/runtime-fixture.sh tests/cases/modules/scalar-default-unboxing.ab \
+    build/tests/scalar-default-unboxing-stdlib)
+export ABLA_STDLIB=$PWD/build/tests/scalar-default-unboxing-stdlib/stdlib
 "$compiler" run "$fixture"
 for triple in x86_64-unknown-linux-gnu i386-unknown-linux-gnu; do
     "$compiler" build "$fixture" -o "$output-$triple.o" \

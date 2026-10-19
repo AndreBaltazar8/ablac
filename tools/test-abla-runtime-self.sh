@@ -9,8 +9,17 @@ mkdir -p -- "$output_directory"
 fixtures=(runtime-self-intrinsics runtime-path-parent)
 for fixture in "${fixtures[@]}"; do
     output="$output_directory/$fixture"
-    "$compiler" build "$project_root/tests/cases/$fixture.ab" \
-        -o "$output" --fast --no-cache
+    if [[ $fixture == runtime-self-intrinsics ]]; then
+        # It calls ablaRuntimeValueAddress, which only the runtime may: built
+        # as one of the runtime's modules.
+        source=$("$project_root/tools/runtime-fixture.sh" \
+            "$project_root/tests/cases/$fixture.ab" "$output_directory")
+        ABLA_STDLIB="$output_directory/stdlib" "$compiler" build "$source" \
+            -o "$output" --fast --no-cache
+    else
+        "$compiler" build "$project_root/tests/cases/$fixture.ab" \
+            -o "$output" --fast --no-cache
+    fi
     set +e
     "$project_root/tools/run-limited.sh" "$output"
     status=$?

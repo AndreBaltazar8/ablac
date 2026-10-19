@@ -2318,12 +2318,43 @@ fun bootstrapIsAssignment(expression: BootstrapExpression): bool =
     expression.kind == "assign" || expression.kind == "member.assign" ||
     expression.kind == "index.assign"
 
+// The runtime's address-yielding intrinsics and field-slot accessors. What
+// they return (an object's, a field's or a value's own memory) or the alias
+// tag their access carries is sound only under the runtime's layout
+// invariants, so only the runtime and the code the compiler generates for it
+// call them, whether the caller is trusted or not.
+fun bootstrapRuntimeInternalFunction(name: string): bool =
+    name == "ablaRuntimeValueAddress" ||
+    name == "ablaRuntimeValueWord0" ||
+    name == "__ablaRuntimeWord0" ||
+    name == "__ablaRuntimeWord1" ||
+    name == "__ablaRuntimeObjectAddress" ||
+    name == "__ablaRuntimeFieldAddressScan" ||
+    name == "__ablaRuntimeFieldAddress" ||
+    name == "__ablaRuntimeFieldAddressIndexed" ||
+    name == "__ablaRuntimeCellAddress" ||
+    name == "__ablaRuntimeArrayAddress" ||
+    name == "ablaRuntimeLoadSlotI32" ||
+    name == "ablaRuntimeLoadSlotI64" ||
+    name == "ablaRuntimeStoreSlotI32" ||
+    name == "ablaRuntimeStoreSlotI64"
+
+// Code that may call them: a module under abla/runtime in the standard library,
+// or the support the compile-time slice generates (its declarations carry no
+// source; the program's own declarations in the slice keep theirs, and the
+// program's analysis has already checked them).
+fun bootstrapRuntimeInternalCaller(sourceIdentity: string): bool =
+    bootstrapCompileSourceClass(sourceIdentity) == 3 ||
+    (sourceIdentity == "" && bootstrapCtAnalyzingSlice)
+
 // What an ownership diagnostic means and the usual fix, as a `help:` line
 // after it ("" for a code without one).
 fun bootstrapSemanticHelp(code: string): string {
     var colon = 0
     while (colon < code.size && code[colon] != 58) colon = colon + 1
     when (code.slice(0, colon)) {
+        "native.runtime-internal" ->
+            "this intrinsic exposes the runtime's own memory layout, so only the runtime (abla/runtime) calls it, even from trusted code: use the typed operation it backs (a field, an index, a function value's `ablaRuntimeFunctionId`), or `abla/unsafe` for raw memory you allocate"
         "subparser.unknown" ->
             "no imported module registers this `\$name` subparser: import the module that does (for example `import \"abla/json\"` for `\$json` and `\$jsons`)"
         "generator.yield-position" ->
@@ -10321,6 +10352,12 @@ fun bootstrapInferIdentifier(
     if (result == "unknown") analyzer.fail(
         "identifier:${expression.text}@${expression.begin}"
     )
+    // A runtime-internal function taken as a value is called later, anywhere.
+    if (bootstrapRuntimeInternalFunction(expression.text) &&
+        analyzer.visibleLocalIndex(expression.text) < 0 &&
+        !bootstrapRuntimeInternalCaller(analyzer.currentSourceIdentity)) {
+        analyzer.fail("native.runtime-internal:${expression.text}")
+    }
     if (result != "unknown" &&
         analyzer.nameIsDelegated(expression.text)) {
         analyzer.validateDelegatedRead(expression, expression.text)
@@ -10683,6 +10720,10 @@ fun bootstrapInferCall(
     if (!localCallable && analyzer.functionRequiresTrust(expression.text) &&
         analyzer.trustedDepth == 0) {
         analyzer.fail("native.trust:${expression.text}")
+    }
+    if (!localCallable && bootstrapRuntimeInternalFunction(expression.text) &&
+        !bootstrapRuntimeInternalCaller(analyzer.currentSourceIdentity)) {
+        analyzer.fail("native.runtime-internal:${expression.text}")
     }
     // A call no local takes goes to the top-level declaration of its name,
     // past a local or field of the same name that isn't a function.
