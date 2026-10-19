@@ -26,6 +26,14 @@ init eighth
 42 21 42 21 42'
 [[ $output == "$expected" ]] || { echo "init order: output:"; echo "$output"; exit 1; }
 
+# A global holding a function, called by name in another global's initializer
+# (inferred and typed): the call reads that global, so it initializes first.
+"$compiler" build "$cases/call-value.ab" -o "$output_directory/call-value" --no-cache
+output=$("$output_directory/call-value") ||
+    { echo "init order: call-value exited with $?"; exit 1; }
+[[ $output == $'leaf 7\nleaf 7' ]] ||
+    { echo "init order: call-value output:"; echo "$output"; exit 1; }
+
 rejected() { # $1 = case, then the texts its diagnostics must contain
     local name=$1; shift
     if "$compiler" build "$cases/$name.ab" -o "$output_directory/invalid" \
@@ -42,6 +50,7 @@ rejected invalid-through-functions 'global.initialization-cycle:total->total' \
     'global.initialization-cycle:selfish->selfish'
 rejected invalid-modules 'global.initialization-cycle:qy->px->qy' 'cycle-q.ab:'
 rejected invalid-compile-time 'global.initialization-cycle:a2->b2->a2'
+rejected invalid-call-value-cycle 'global.initialization-cycle:maker->node->maker'
 if grep -q 'E_EVAL' "$output_directory/invalid-compile-time.err"; then
     echo "init order: the cycle was evaluated under #"; exit 1
 fi
