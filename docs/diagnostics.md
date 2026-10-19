@@ -152,6 +152,8 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_EXT_FUNCTION_HANDLE_*`, `E_EXT_EXPRESSION_HANDLE_INVALID` | a reflection handle that is unknown, out of range or of the wrong kind ([compiler-api.md](compiler-api.md)) |
 | `E_EXT_TYPED_QUERY_BEFORE_RESOLUTION`, `E_REACTIVE_*` | typed reflection asked too early, or an invalid lifted function |
 | `E_COMPILER_TRANSFORM_*` | a `compiler.transform` handler or its body/annotation changes were rejected |
+| `E_COMPILER_TRANSFORM_RUNTIME` | a transform asked to change a runtime function (`abla/runtime`), which it never may ([transforms](compiler-api.md#transforms-changing-the-program)) |
+| `E_COMPILER_TRANSFORM_STDLIB`, `E_COMPILER_TRANSFORM_MODULE` | a transform asked to replace the body of a function in another module, of the standard library or of the program; only its own module's bodies change for now |
 | `E_INDEPENDENT_MODULE_*` | a misused independent module ([programmable-builds.md](programmable-builds.md)) |
 | `E_CONTRACT_CALL_NOT_CONSUMED` | a [contract](language.md#contract-imports) call left in the program |
 

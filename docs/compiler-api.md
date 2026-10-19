@@ -79,6 +79,18 @@ fun main {
 // 42
 ```
 
+A transform replaces the bodies of its own module's functions, and may annotate
+any module's. A change it can't make is refused when it is asked for:
+`replaceFunctionBody` or `addFunctionAnnotation` returns false and the build
+fails, never reporting a change it then drops.
+
+- The runtime's functions (`abla/runtime`) are never changed:
+  `E_COMPILER_TRANSFORM_RUNTIME`. Its guarantees, such as which code may hold an
+  object's address, rest on its code as written.
+- Another module's function body is not replaced yet:
+  `E_COMPILER_TRANSFORM_STDLIB` for the standard library's,
+  `E_COMPILER_TRANSFORM_MODULE` for another of the program's modules.
+
 ## The `compiler` service at a glance
 
 | Methods | Purpose |

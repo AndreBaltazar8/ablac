@@ -183,6 +183,7 @@ test: ablac
 	tools/test-when-null.sh $(COMPILER)
 	tools/test-init-order.sh $(COMPILER)
 	tools/test-runtime-internal.sh $(COMPILER)
+	tools/test-transform-targets.sh $(COMPILER)
 	tools/test-extension-receivers.sh $(COMPILER)
 	tools/test-compile-time-scalars.sh $(COMPILER)
 	tools/test-integer-narrowing.sh $(COMPILER)

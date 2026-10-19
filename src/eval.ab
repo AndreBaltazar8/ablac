@@ -236,6 +236,36 @@ fun bootstrapTakeArtifactRootRequests(): array<BootstrapArtifactRootRequest> {
 fun bootstrapFunctionBodyReplacementRoot(): string =
     "build/.abla-function-body-replacements-${linuxProcessId()}"
 
+// The declarations a running transform may change (its own module's, by
+// handle); empty outside the staged parse, which then checks nothing here.
+var bootstrapCompilerTransformEditable: array<bool> = []
+
+/** Why a transform may not change the function at `handle` ("" when it may):
+ *  the runtime's functions never (its guarantees rest on them). With
+ *  `ownModule` (a body replacement), another module's, of the standard library
+ *  or the program, not yet either: only the transform's own module is copied
+ *  back, so the change would be dropped. (An added annotation reaches any
+ *  module: the complete graph applies it, bootstrapApplyPendingFunctionAnnotations.) */
+fun bootstrapCompilerTransformTarget(
+    declarations: array<BootstrapDeclaration>,
+    handle: int,
+    operation: string,
+    ownModule: bool
+): string {
+    if (handle < 0 || handle >= declarations.size) return ""
+    val declaration = declarations[handle]
+    if (bootstrapRuntimeModuleSource(declaration.sourceIdentity)) {
+        return "error[E_COMPILER_TRANSFORM_RUNTIME]: $operation can't change `${declaration.name}`: it is the runtime's (abla/runtime), whose guarantees rest on its code as written\n"
+    }
+    if (!ownModule || bootstrapCompilerTransformEditable.size == 0 ||
+        (handle < bootstrapCompilerTransformEditable.size &&
+         bootstrapCompilerTransformEditable[handle])) return ""
+    if (bootstrapStandardLibraryModuleSource(declaration.sourceIdentity)) {
+        return "error[E_COMPILER_TRANSFORM_STDLIB]: $operation can't change `${declaration.name}` yet: it is the standard library's (${declaration.sourceIdentity}), and a transform changes only its own module's functions\n"
+    }
+    "error[E_COMPILER_TRANSFORM_MODULE]: $operation can't change `${declaration.name}` yet: it is declared in ${declaration.sourceIdentity}, and a transform changes only its own module's functions\n"
+}
+
 fun bootstrapStageFunctionBodyReplacement(
     replacement: BootstrapFunctionBodyReplacement
 ): bool {
@@ -9030,6 +9060,13 @@ fun bootstrapEvaluateCallCompiler(
             evaluator.functionHandleValid(reflected.integer) &&
             reflected.integer < evaluator.declarations.size &&
             evaluator.declarations[reflected.integer].kind == "fun"
+        val refused = if (valid) bootstrapCompilerTransformTarget(
+            evaluator.declarations, reflected.integer, "compiler.replaceFunctionBody", true
+        ) else ""
+        if (refused != "") {
+            valid = false
+            evaluator.diagnostics = "${evaluator.diagnostics}$refused"
+        }
         if (valid) valid = bootstrapStageFunctionBodyReplacement(
             BootstrapFunctionBodyReplacement(
                 reflected.integer,
@@ -9038,6 +9075,9 @@ fun bootstrapEvaluateCallCompiler(
         )
         if (valid) {
             result = bootstrapEvalBoolean(true)
+        } else if (refused != "") {
+            evaluator.errors = evaluator.errors + 1
+            result = bootstrapEvalBoolean(false)
         } else {
             evaluator.recordEvaluatorDiagnostic(
                 "E_COMPILER_TRANSFORM_REQUEST",
@@ -9055,6 +9095,13 @@ fun bootstrapEvaluateCallCompiler(
             evaluator.functionHandleValid(reflected.integer) &&
             reflected.integer < evaluator.declarations.size &&
             evaluator.declarations[reflected.integer].kind == "fun"
+        val refused = if (valid) bootstrapCompilerTransformTarget(
+            evaluator.declarations, reflected.integer, "compiler.addFunctionAnnotation", false
+        ) else ""
+        if (refused != "") {
+            valid = false
+            evaluator.diagnostics = "${evaluator.diagnostics}$refused"
+        }
         if (valid) valid = bootstrapStageFunctionAnnotationAddition(
             BootstrapFunctionAnnotationAddition(
                 reflected.integer,
@@ -9063,6 +9110,9 @@ fun bootstrapEvaluateCallCompiler(
         )
         if (valid) {
             result = bootstrapEvalBoolean(true)
+        } else if (refused != "") {
+            evaluator.errors = evaluator.errors + 1
+            result = bootstrapEvalBoolean(false)
         } else {
             evaluator.recordEvaluatorDiagnostic(
                 "E_COMPILER_TRANSFORM_ANNOTATION",
