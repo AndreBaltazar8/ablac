@@ -39,11 +39,30 @@ memory_bytes=$((memory_mb * 1024 * 1024))
 # default and trying to raise the hard limit installed by this runner.
 export ABLA_MAX_MEMORY_MB=$memory_mb
 
+# Runs the bounded command as a background job that keeps standard input (a
+# job's is /dev/null otherwise) and forwards TERM, INT and HUP to it: stopping
+# this script stops what it runs, which the limiter passes to the command's
+# process group.
+bounded() {
+    "$@" <&0 &
+    local job=$!
+    trap 'kill -TERM "$job" 2>/dev/null' TERM
+    trap 'kill -INT "$job" 2>/dev/null' INT
+    trap 'kill -HUP "$job" 2>/dev/null' HUP
+    status=0
+    wait "$job" || status=$?
+    # A forwarded signal interrupts the wait; the job's own status follows.
+    while kill -0 "$job" 2>/dev/null; do
+        wait "$job" && status=0 || status=$?
+    done
+    trap - TERM INT HUP
+}
+
 if [[ $OSTYPE == darwin* ]]; then
     ulimit -S -c 0
     ulimit -S -t "$cpu_seconds"
     set +e
-    /usr/bin/perl -e \
+    bounded /usr/bin/perl -e \
         'my $seconds = shift;
          my $pid = fork();
          exit 127 unless defined $pid;
@@ -51,6 +70,16 @@ if [[ $OSTYPE == darwin* ]]; then
              setpgrp(0, 0);
              exec @ARGV;
              exit 127;
+         }
+         # Stopping the runner stops what it runs: its process group (a
+         # server it started, say) would otherwise outlive it.
+         for my $signal (["TERM", 15], ["INT", 2], ["HUP", 1]) {
+             my ($name, $number) = @$signal;
+             $SIG{$name} = sub {
+                 kill $name, -$pid;
+                 waitpid($pid, 0);
+                 exit 128 + $number;
+             };
          }
          $SIG{ALRM} = sub {
              kill "TERM", -$pid;
@@ -66,11 +95,10 @@ if [[ $OSTYPE == darwin* ]]; then
          exit 128 + ($status & 127) if $status & 127;
          exit $status >> 8;' \
         "$wall_seconds" "$@"
-    status=$?
     set -e
 else
     set +e
-    timeout \
+    bounded timeout \
         --signal=TERM \
         --kill-after="${kill_grace_seconds}s" \
         "${wall_seconds}s" \
@@ -80,7 +108,6 @@ else
             --core=0:0 \
             -- \
             "$@"
-    status=$?
     set -e
 fi
 

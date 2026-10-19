@@ -96,8 +96,11 @@ build_and_run() { # dir tag entry mode
     local dir=$1 tag=$2 entry=$3 mode=$4 status
     (
         cd "$dir" || exit 1
-        ABLA_COMPILE_EVAL=$mode ABLA_MAX_SECONDS=$seconds \
-            "$compiler" build "$entry" -o "$tag.program" --no-cache \
+        # Through the runner, whatever $compiler is: a bare compiler binary
+        # bounds nothing itself (only the repository launcher does), with the
+        # launcher's memory default.
+        ABLA_COMPILE_EVAL=$mode ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096} \
+            limited "$compiler" build "$entry" -o "$tag.program" --no-cache \
             >"$tag.compiler.out" 2>"$tag.err"
     )
     status=$?
