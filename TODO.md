@@ -113,14 +113,6 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   dropped: the analyzer reads other bodies syntactically (fresh values, borrow sources,
   region retention, no-escape inference), and in one pass those would see `a + b` where
   the rewritten program has `a.plus__N(b)`, with no cheap way to notice.
-- [ ] **String helpers carry a root frame.** With automatic pressure, any function with an
-  instruction that may allocate collects and roots its values, and so do its callers.
-  String inspection counts (`string.get`, `index.get`, `==`/`!=`: a rope may be
-  flattened), so a byte-comparing helper like `hasPrefix(text, prefix)` gets a 4-slot
-  frame and a pressure check; called on every type normalization it cost the compiler 7 G
-  instructions. Excluding `==`/`!=` of two native scalars changes almost nothing (306 of
-  4,053 client functions collect either way; 1,745 → 1,737 in a server): what decides is
-  the possible rope flattening, a collection-placement policy.
 - [ ] **A collection still visits every allocation.** It builds the page bitmaps from the
   whole registry and sweeps it all, garbage and live alike, freeing garbage one block at a
   time. Of that build's active time the marker is about 8%, free() 4% and the page release

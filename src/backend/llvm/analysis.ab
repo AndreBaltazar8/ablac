@@ -582,57 +582,16 @@ fun bootstrapLlvmInstructionMayAllocate(
         instruction.opcode == "string.concat" ||
         instruction.opcode == "string.slice" ||
         instruction.opcode == "to.string") result = true
-    // String inspection may lazily flatten ropes. Host/native boundaries may
-    // materialize returned heap values.
-    if (instruction.opcode == "==" || instruction.opcode == "!=" ||
-        instruction.opcode == "string.equal" ||
-        instruction.opcode == "string.not.equal" ||
-        instruction.opcode == "index.get" ||
-        instruction.opcode == "string.get" ||
-        instruction.opcode == "extern.c" ||
+    // Host/native boundaries may materialize returned heap values. String
+    // inspection (==, string.get, index.get) may flatten a rope, but that copy
+    // is the rope's own (+40), reachable from it, and allocating never
+    // collects: it is no reason for a safe point, so a byte-comparing helper
+    // keeps no root frame.
+    if (instruction.opcode == "extern.c" ||
         instruction.opcode == "extern.host") result = true
     if (instruction.opcode == "call" &&
         instruction.text == "ablaUnsafeAllocate") result = true
     result
-}
-
-/** The values `function` defines only as a constant int, bool or null. An
- *  `==` or `!=` with one compares tags, never two strings, so it never
- *  flattens a rope (a generator's state dispatch compares so). */
-fun bootstrapLlvmConstantScalarValues(function: BootstrapIrFunction): array<bool> {
-    val count = bootstrapLlvmValueCount(function)
-    val constant: array<bool> = []
-    val defined: array<bool> = []
-    while (constant.size < count) {
-        constant.append(false)
-        defined.append(false)
-    }
-    for (instruction in function.instructions) {
-        val result = instruction.result
-        if (result >= 0 && result < count) {
-            val scalar = instruction.opcode == "const.i64" ||
-                instruction.opcode == "const.bool" ||
-                instruction.opcode == "const.null"
-            constant[result] = scalar && (!defined[result] || constant[result])
-            defined[result] = true
-        }
-    }
-    constant
-}
-
-/** bootstrapLlvmInstructionMayAllocate, knowing `constant`
- *  (bootstrapLlvmConstantScalarValues). */
-fun bootstrapLlvmInstructionMayAllocateWith(
-    instruction: BootstrapInstruction,
-    constant: array<bool>
-): bool {
-    if (instruction.opcode == "==" || instruction.opcode == "!=") {
-        if ((instruction.left >= 0 && instruction.left < constant.size && constant[instruction.left]) ||
-            (instruction.right >= 0 && instruction.right < constant.size && constant[instruction.right])) {
-            return false
-        }
-    }
-    bootstrapLlvmInstructionMayAllocate(instruction)
 }
 
 fun bootstrapLlvmCollectingFunctions(
@@ -648,8 +607,6 @@ fun bootstrapLlvmCollectingFunctions(
             "runtimeMemoryCollect" ||
             program.functions[function].name ==
                 "__ablaRuntimePlatformMemoryCollect"
-        val constant = if (automaticPressure)
-            bootstrapLlvmConstantScalarValues(program.functions[function]) else []
         var instruction = 0
         while (instruction < program.functions[function].instructions.size) {
             val candidate = program.functions[function].instructions[instruction]
@@ -662,7 +619,7 @@ fun bootstrapLlvmCollectingFunctions(
                 candidate.opcode == "thread.drop" ||
                 candidate.opcode == "await") direct = true
             if (automaticPressure &&
-                bootstrapLlvmInstructionMayAllocateWith(candidate, constant)) direct = true
+                bootstrapLlvmInstructionMayAllocate(candidate)) direct = true
             instruction = instruction + 1
         }
         result.append(direct)

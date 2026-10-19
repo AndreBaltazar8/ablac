@@ -229,7 +229,9 @@ Collection has two modes:
 
 - **Pressure collection** (the default for hosted native programs with
   `main`). Every allocating function is a safe point: on entry it collects
-  once the tracked heap has grown past a threshold. The first collection runs
+  once the tracked heap has grown past a threshold. (Comparing or indexing a
+  string may flatten a rope, which allocates the rope's own copy; that alone
+  makes no safe point.) The first collection runs
   at 32 MiB; each later one once the heap has grown by
   `max(64 MiB, half of what the last collection kept)`, capped below the limit.
   `memorySetCollectionGrowth(bytes)` lowers the least growth for programs that
