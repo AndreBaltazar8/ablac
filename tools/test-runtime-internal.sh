@@ -53,13 +53,21 @@ status=$?
 set -e
 [[ $status == 42 ]] || { echo "runtime internal: function-id exited with $status"; exit 1; }
 
-# The runtime's own modules may call them.
+# The runtime's own modules may call them, however the standard library's root
+# is spelled: as copied, through a symlink, relative to the working directory.
 fixture=$("$project_root/tools/runtime-fixture.sh" "$cases/allowed.ab" "$output_directory/allowed")
-ABLA_STDLIB="$output_directory/allowed/stdlib" "$compiler" build "$fixture" \
-    -o "$output_directory/allowed-program" --no-cache
-set +e
-"$output_directory/allowed-program"
-status=$?
-set -e
-[[ $status == 42 ]] || { echo "runtime internal: allowed exited with $status"; exit 1; }
+ln -sfn "$output_directory/allowed" "$output_directory/allowed-link"
+allowed() { # $1 = label, $2 = standard library root, $3 = program
+    (cd "$output_directory" && ABLA_STDLIB="$2" "$compiler" build "$3" \
+        -o "$output_directory/allowed-program-$1" --no-cache) ||
+        { echo "runtime internal: allowed ($1) refused"; exit 1; }
+    set +e
+    "$output_directory/allowed-program-$1"
+    local status=$?
+    set -e
+    [[ $status == 42 ]] || { echo "runtime internal: allowed ($1) exited with $status"; exit 1; }
+}
+allowed copy "$output_directory/allowed/stdlib" "$fixture"
+allowed link "$output_directory/allowed-link/stdlib" "$output_directory/allowed-link/allowed.ab"
+allowed relative allowed/stdlib allowed/allowed.ab
 echo "runtime internal: address intrinsics and slot accessors refused outside abla/runtime; function ids public"
