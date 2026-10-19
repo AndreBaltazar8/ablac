@@ -979,9 +979,14 @@ trusted fun __ablaRuntimeStmLogWrite(descriptor: int, tvar: any, value: any): vo
     __ablaRuntimePlatformRootsSet(descriptor + 200, ablaRuntimeLoadI64(descriptor + 104), 2 * count + 2)
 }
 
-// Whether every read is still current: the same version, and not held by another
-// commit (this one's own commit holds what it writes).
-trusted fun __ablaRuntimeStmValidate(descriptor: int): bool {
+// Whether every read is still current: the same version, and not held. Only
+// `committing`, when this transaction holds what it writes, is a held TVar it wrote
+// its own; while its body runs (moving the snapshot up) it holds nothing, and a TVar
+// it read and wrote can be held by another commit about to change it. Taking that
+// lock for its own let the snapshot move past the other commit's version, and the
+// commit then skip its check (the clock had not moved since) and overwrite the
+// other's write.
+trusted fun __ablaRuntimeStmValidate(descriptor: int, committing: bool): bool {
     val log = ablaRuntimeLoadI64(descriptor + 64)
     val count = ablaRuntimeLoadI64(descriptor + 48)
     var index = 0
@@ -989,7 +994,8 @@ trusted fun __ablaRuntimeStmValidate(descriptor: int): bool {
         val tvar = ablaRuntimeLoadI64(log + index * 32 + 8)
         val word = ablaRuntimeAtomicLoadI64(tvar)
         if ((word >> 1) != ablaRuntimeLoadI64(log + index * 32 + 24)) return false
-        if ((word & 1) != 0 && __ablaRuntimeStmWritten(descriptor, tvar) < 0) return false
+        if ((word & 1) != 0 &&
+            (!committing || __ablaRuntimeStmWritten(descriptor, tvar) < 0)) return false
         index = index + 1
     }
     true
@@ -1023,7 +1029,7 @@ trusted fun __ablaRuntimeStmReadLogged(descriptor: int, tvarValue: any, tvar: in
                 }
                 // Newer than the snapshot: move the snapshot up, then read again.
                 val now = ablaRuntimeAtomicLoadI64(__ablaRuntimeStmShared)
-                if (!__ablaRuntimeStmValidate(descriptor)) {
+                if (!__ablaRuntimeStmValidate(descriptor, false)) {
                     __ablaRuntimeStmAbandon(descriptor, false)
                 }
                 ablaRuntimeStoreI64(descriptor + 16, now)
@@ -1177,10 +1183,17 @@ trusted fun __ablaRuntimeStmCommit(descriptor: int): bool {
     val observed = ablaRuntimeAtomicCompareExchangeI64(shared, seen, seen + 1)
     val version = if (observed == seen) seen + 1 else observed
     if ((observed != seen || seen != ablaRuntimeLoadI64(descriptor + 16)) &&
-        !__ablaRuntimeStmValidate(descriptor)) {
+        !__ablaRuntimeStmValidate(descriptor, true)) {
         __ablaRuntimeStmRelease(descriptor, writes)
         return false
     }
+    // Every TVar's lock bit before any of its new bytes, as a seqlock's writer
+    // must: a reader that sees a new byte then sees the TVar held (or released at
+    // the new version) when it reads the word again. Without it the stores after
+    // the compare-and-swaps could become visible first on arm64, and a transaction
+    // could read one TVar's new value under its old version and another's old
+    // value, then pass its validation before the bits showed.
+    ablaRuntimeFenceRelease()
     var index = 0
     while (index < writes) {
         val entry = log + index * 56
