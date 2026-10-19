@@ -66,3 +66,14 @@ v0.2.18 stable host binaries. LLVM 23 has been used since v0.2.16.
 The v0.2.14 tag preserves the bridge source and its reproducible source chain
 from v0.2.13 in `tools/bootstrap-word0-bridge.sh`. Release tags preserve that
 history; the temporary bridge branch is no longer needed.
+
+## Object layout change (extension-field overflow)
+
+A class instance's header changed: `+24` is now its overflow of fields set by
+name (0 when there is none), where it used to point at its own inline slots.
+Compile-time code compiled by the JIT and the compiler running it share
+objects, so a compiler whose own runtime predates this change can't run
+compile-time JIT code against the new standard library (it reads `+24` as
+the slots). `make ablac` from the pinned host is such a stage-1 compiler: use
+the compiler it builds (stage 2) for tests, parity and releases, which
+`make self-rebuild` already does.
