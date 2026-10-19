@@ -34,6 +34,15 @@ output=$("$output_directory/call-value") ||
 [[ $output == $'leaf 7\nleaf 7' ]] ||
     { echo "init order: call-value output:"; echo "$output"; exit 1; }
 
+# Globals a parameter default reads initialize before a global whose
+# initializer leaves that argument out (function, extension and method), and so
+# do the globals an extension function's body reads.
+"$compiler" build "$cases/default-reads.ab" -o "$output_directory/default-reads" --no-cache
+output=$("$output_directory/default-reads") ||
+    { echo "init order: default-reads exited with $?"; exit 1; }
+[[ $output == '7 8 14 10' ]] ||
+    { echo "init order: default-reads output:"; echo "$output"; exit 1; }
+
 rejected() { # $1 = case, then the texts its diagnostics must contain
     local name=$1; shift
     if "$compiler" build "$cases/$name.ab" -o "$output_directory/invalid" \
