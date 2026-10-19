@@ -159,15 +159,16 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
 - [ ] **Name lookups in lowering.** Sampled over a game client's dev build at `d39b14d`,
   `BootstrapFunctionDeclarationIndex.find` and the name hash under it are about 450 ms
   together, about 1% of the compiler's samples (an index lookup each time, but many of
-  them), and `bootstrapIrRuntimeOperationDeclaration` about 100 ms: it compares an
-  instruction's opcode with some 80 strings, one after another and all of them, for every
-  lowered instruction (`bootstrapCollectLoweredInstructionTargets`). The callers of `find`
-  are not in the sample: lowering's recursion is deeper than its stacks. Next: count the
-  lookups per call site, then remember a callee's declaration where the same name is
-  looked up again (`lowerFunctionResultType`, `lowerFunctionType`,
-  `lowerGlobalFunctionType` each look it up afresh), and dispatch the opcode table on the
-  opcode's first byte. Worth perhaps 0.3-0.6% of a dev build; not measurable on a loaded
-  machine.
+  them); over a game server's `--emit-llvm`, `bootstrapFunctionDeclarationHash`,
+  `bootstrapIrLookupHash` and the two `find`s are about 4% of samples. The hashes read the
+  name a byte at a time. The callers of `find` are not in the sample: lowering's recursion
+  is deeper than its stacks. Next: count the lookups per call site, then remember a
+  callee's declaration where the same name is looked up again (`lowerFunctionResultType`,
+  `lowerFunctionType`, `lowerGlobalFunctionType` each look it up afresh). (The runtime
+  operation per opcode is a table, and the borrow liveness resolves successor blocks once.)
+  A sample of a compiler built without `-g` names functions `abla_fn_<a>_<b>`; the
+  compiler's own `--emit-llvm` maps each to its source name through the function's
+  `"abla.source"` attribute.
 
 ## Not checked
 
