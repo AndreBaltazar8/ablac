@@ -40,6 +40,22 @@ called out below.
   `__ablaRuntimeFieldDefault` (null until then), drops of resource-typed extension fields
   with their holder, and the compiler-API operations.
 
+- [ ] **Transactional memory: the surface.** The runtime runs transactions
+  (`__ablaRuntimeStmAtomic` over a closure, `StmRead`/`StmWrite`/`StmRetry`, TVars of tag
+  14; tools/test-stm.sh). Still to come: `TVar<T>` as a delegate, `atomic { }`, `retry`,
+  `orElse` (a checkpoint of the write buffer and a nested attempt), the checks
+  (`stm.outside-atomic`, `stm.effect:<effect>`, `stm.resource`, `stm.outside-mutation`),
+  and a body lowered to a closure that is not allocated (making it costs more than a
+  small transaction).
+
+- [ ] **Transactional memory: partitioned clocks.** Every writing commit takes a version
+  from one global clock, so small transactions on many threads queue on its cache line:
+  four threads each reading and writing 4 TVars a block take 88 ns a block (wall over all
+  blocks) on disjoint TVars and 151 on shared ones, against 52 under one Mutex
+  (tests/cases/stm/bench.ab, with TL2's GV4 already sharing a version between commits
+  that race for the clock). Clocks per partition of TVars (or per thread, compared as
+  vectors) would let disjoint transactions scale.
+
 - **Tried, not pursued: telling LLVM a class-typed field holds an object.** A read of a
   field whose type is a class that is neither optional nor affine was followed by
   `llvm.assume(address != 0)`, so what reads the object next could drop its null check

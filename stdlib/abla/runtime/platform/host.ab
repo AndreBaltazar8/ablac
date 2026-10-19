@@ -29,6 +29,22 @@ trusted noescape extern:"c" fun pthread_join(
     handle: int,
     result: i64*
 ): int
+trusted noescape extern:"c" fun pthread_cond_init(
+    condition: i64*,
+    attributes: i64*
+): int
+trusted noescape extern:"c" fun pthread_cond_wait(
+    condition: i64*,
+    mutex: i64*
+): int
+trusted noescape extern:"c" fun pthread_cond_broadcast(condition: i64*): int
+// Generated with the module when transactions are reached (the backend's
+// bootstrapLlvmDefineStmInvoke): one attempt of a transaction's body.
+trusted noescape extern:"c" fun abla_stm_invoke(
+    closure: i64*,
+    output: i64*,
+    slot: i64*
+): int
 
 // Bytes reserved for one pthread_mutex_t: 40 on Linux, 64 on Darwin. Every
 // runtime mutex slot (the heap lock, Shared/Mutex control blocks) is sized from
@@ -135,6 +151,112 @@ trusted fun __ablaRuntimePlatformThreadJoin(handle: int): bool {
     }
     joined
 }
+// What the runtime's transactions (self/entry.ab) need from the platform.
+
+// Bytes reserved for one pthread_cond_t: 48 on Linux and Darwin.
+@inline
+trusted fun __ablaRuntimePlatformConditionBytes(): int = 64
+
+trusted fun __ablaRuntimePlatformConditionInitialize(address: int): void {
+    if (pthread_cond_init(
+        ablaRuntimePointerFromAddress(address),
+        ablaRuntimePointerFromAddress(0)
+    ) != 0) ablaRuntimeTrap()
+}
+
+trusted fun __ablaRuntimePlatformConditionWait(condition: int, mutex: int): void {
+    if (pthread_cond_wait(
+        ablaRuntimePointerFromAddress(condition),
+        ablaRuntimePointerFromAddress(mutex)
+    ) != 0) ablaRuntimeTrap()
+}
+
+trusted fun __ablaRuntimePlatformConditionBroadcast(condition: int): void {
+    if (pthread_cond_broadcast(ablaRuntimePointerFromAddress(condition)) != 0) {
+        ablaRuntimeTrap()
+    }
+}
+
+// Zeroed memory the collector neither tracks nor frees.
+trusted fun __ablaRuntimePlatformRawAllocate(size: int): int {
+    val address = ablaRuntimePointerAddress(calloc(1, size))
+    if (address == 0) ablaRuntimeTrap()
+    address
+}
+
+trusted fun __ablaRuntimePlatformRawFree(address: int): void {
+    if (address != 0) free(ablaRuntimePointerFromAddress(address))
+}
+
+// No other thread runs: none can start except from this one.
+@inline
+trusted fun __ablaRuntimePlatformOnlyThread(): bool =
+    __ablaRuntimeHostActiveThreads == 0
+
+// The calling thread's transaction descriptor (0 before its first transaction).
+@inline
+trusted fun __ablaRuntimeHostStmCell(): int =
+    nativeThreadLocalBytes("\x00\x00\x00\x00\x00\x00\x00\x00")
+
+@inline
+trusted fun __ablaRuntimePlatformStmDescriptor(): int =
+    ablaRuntimeLoadI64(__ablaRuntimeHostStmCell())
+
+trusted fun __ablaRuntimePlatformStmSetDescriptor(descriptor: int): void {
+    ablaRuntimeStoreI64(__ablaRuntimeHostStmCell(), descriptor)
+}
+
+// A lock over rare runtime-wide changes (the heap's own; held without allocating).
+@inline
+trusted fun __ablaRuntimePlatformGlobalLock(): int = __ablaRuntimeHostHeapLock()
+
+@inline
+trusted fun __ablaRuntimePlatformGlobalUnlock(lock: int): void =
+    __ablaRuntimeHostHeapUnlock(lock)
+
+// A root frame's array holds 8-byte value addresses; this points a pushed frame at
+// another array and count.
+@inline
+trusted fun __ablaRuntimePlatformRootBytes(): int = 8
+
+@inline
+trusted fun __ablaRuntimePlatformRootStore(roots: int, index: int, value: int): void {
+    ablaRuntimeStoreI64(roots + index * 8, value)
+}
+
+@inline
+trusted fun __ablaRuntimePlatformRootsSet(frame: int, roots: int, count: int): void {
+    ablaRuntimeStoreI64(frame + 8, roots)
+    ablaRuntimeStoreI64(frame + 16, count)
+}
+
+// One attempt of a transaction's body, the closure at `closure`, its result to
+// `output`. True when the attempt was abandoned (__ablaRuntimePlatformAbandon).
+trusted fun __ablaRuntimePlatformAttempt(closure: int, output: int, slot: int): bool =
+    abla_stm_invoke(
+        ablaRuntimePointerFromAddress(closure),
+        ablaRuntimePointerFromAddress(output),
+        ablaRuntimePointerFromAddress(slot)
+    ) != 0
+
+// Leaves the attempt whose jmp_buf `slot` holds, from any depth of its body.
+trusted fun __ablaRuntimePlatformAbandon(slot: int): never {
+    _longjmp(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(slot)), 1)
+    while (true) ablaRuntimeTrap()
+}
+
+// The thread's root frames and region, saved before an attempt and restored when it
+// is abandoned: what its body pushed is left with its stack.
+trusted fun __ablaRuntimePlatformUnwindSave(at: int): void {
+    ablaRuntimeStoreI64(at, __ablaRuntimeHostRootFrameLoad())
+    ablaRuntimeStoreI64(at + 8, __ablaRuntimeHostRegionLoad())
+}
+
+trusted fun __ablaRuntimePlatformUnwindRestore(at: int): void {
+    __ablaRuntimeHostRootFrameStore(ablaRuntimeLoadI64(at))
+    __ablaRuntimeHostRegionStore(ablaRuntimeLoadI64(at + 8))
+}
+
 // Host allocations are registered in allocation order: an array of their headers, each
 // header holding its slot (its first word). A freed allocation leaves an empty slot, which
 // the next collection compacts away; trailing empty slots are dropped at once, so the last
@@ -259,8 +381,9 @@ trusted fun __ablaRuntimeRecoveryLeave(frame: int): int {
 
 // The call panicked: the root frames and the region it entered are abandoned
 // with its stack (their memory is not reclaimed), so the thread's state is the
-// frame's again.
+// frame's again, and a transaction it was in is rolled back.
 trusted fun __ablaRuntimeRecoveryRestore(frame: int): int {
+    __ablaRuntimeStmRecover()
     __ablaRuntimeHostRootFrameStore(ablaRuntimeLoadI64(frame + 8))
     __ablaRuntimeHostRegionStore(ablaRuntimeLoadI64(frame + 16))
     ablaRuntimeStoreI64(__ablaRuntimeHostRecoveryAddress(), ablaRuntimeLoadI64(frame))
@@ -872,7 +995,7 @@ trusted fun __ablaRuntimeHostMarkValue(value: int): void {
     if (tag == 5) {
         __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(value + 16))
     }
-    if (tag >= 6 && tag <= 13) {
+    if (tag >= 6 && tag <= 14) {
         __ablaRuntimeHostMarkPointer(ablaRuntimeLoadI64(value + 8))
     }
 }

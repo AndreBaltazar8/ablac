@@ -1,0 +1,167 @@
+import "abla/io"
+import "abla/process/time"
+import "./stm.ab"
+
+// The cost of a TVar access, against the same work on plain ints and under a
+// Mutex: one thread (direct transactions, logged ones, Mutex.with), then four
+// threads on disjoint and on shared TVars against one Mutex over them all.
+
+resource class Counters(var values: array<int>)
+
+val tvars: array<any> = makeTVars()
+
+fun makeTVars(): array<any> {
+    val made: array<any> = []
+    var index = 0
+    while (index < 16) {
+        made.append(tvar(0))
+        index = index + 1
+    }
+    made
+}
+
+// A block over `count` TVars from `first`, made once: what is timed is the
+// transaction, not making its closure.
+fun block(first: int, count: int, write: bool): () -> int = {
+    var sum = 0
+    var index = first
+    while (index < first + count) {
+        val value = readInt(tvars[index])
+        if (write) writeInt(tvars[index], value + 1)
+        sum = sum + value
+        index = index + 1
+    }
+    sum
+}
+
+fun plain(var values: array<int>, count: int, write: bool): int {
+    var sum = 0
+    var index = 0
+    while (index < count) {
+        val value = values[index]
+        if (write) values[index] = value + 1
+        sum = sum + value
+        index = index + 1
+    }
+    sum
+}
+
+fun read1(var counters: Counters): int = plain(counters.values, 1, false)
+fun read4(var counters: Counters): int = plain(counters.values, 4, false)
+fun read16(var counters: Counters): int = plain(counters.values, 16, false)
+fun write1(var counters: Counters): int = plain(counters.values, 1, true)
+fun write4(var counters: Counters): int = plain(counters.values, 4, true)
+fun write16(var counters: Counters): int = plain(counters.values, 16, true)
+
+fun locked(mutex: Mutex<Counters>, count: int, write: bool): int =
+    if (count == 1) { if (write) mutex.with(write1) else mutex.with(read1) }
+    else if (count == 4) { if (write) mutex.with(write4) else mutex.with(read4) }
+    else { if (write) mutex.with(write16) else mutex.with(read16) }
+
+fun zeros(): array<int> {
+    val made: array<int> = []
+    var index = 0
+    while (index < 16) {
+        made.append(0)
+        index = index + 1
+    }
+    made
+}
+
+// Nanoseconds per access (a read, or a read and a write) over `rounds` blocks.
+fun timed(kind: string, mutex: Mutex<Counters>, var values: array<int>, count: int, write: bool, rounds: int): int {
+    val body = block(0, count, write)
+    var sink = 0
+    val started = monotonicNanoseconds()
+    var round = 0
+    while (round < rounds) {
+        sink = sink + if (kind == "plain") plain(values, count, write)
+            else if (kind == "mutex") locked(mutex, count, write)
+            else atomic(body)
+        round = round + 1
+    }
+    val elapsed = monotonicNanoseconds() - started
+    if (sink == -1) println("")
+    elapsed * 10 / (rounds * count)
+}
+
+fun tenths(value: int): string = "${value / 10}.${value % 10}"
+
+fun single(): void {
+    val mutex = Mutex(Counters(zeros()))
+    var values = zeros()
+    println("one thread, ns per access (read / read+write):")
+    println("  TVars  plain           Mutex.with      direct          logged")
+    for (count in [1, 4, 16]) {
+        val rounds = 3200000 / count
+        var line = "  ${count}"
+        for (kind in ["plain", "mutex", "direct", "logged"]) {
+            alwaysLogged(kind == "logged")
+            timed(kind, mutex, values, count, false, rounds / 4)
+            val reading = timed(kind, mutex, values, count, false, rounds)
+            val writing = timed(kind, mutex, values, count, true, rounds)
+            line = line + "      ${tenths(reading)} / ${tenths(writing)}"
+        }
+        alwaysLogged(false)
+        println(line)
+    }
+}
+
+fun stmWorker(first: int, rounds: int): int {
+    val body = block(first, 4, true)
+    var round = 0
+    var sum = 0
+    while (round < rounds) {
+        sum = sum + atomic(body)
+        round = round + 1
+    }
+    sum
+}
+
+fun mutexWorker(mutex: Mutex<Counters>, rounds: int): int {
+    var round = 0
+    var sum = 0
+    while (round < rounds) {
+        sum = sum + mutex.with(write4)
+        round = round + 1
+    }
+    sum
+}
+
+fun main: int {
+    single()
+    val before = atomic { readInt(tvars[0]) + readInt(tvars[4]) }
+    val rounds = 400000
+    var started = monotonicNanoseconds()
+    val a = thread { stmWorker(0, 400000) }
+    val b = thread { stmWorker(4, 400000) }
+    val c = thread { stmWorker(8, 400000) }
+    val d = thread { stmWorker(12, 400000) }
+    await a + await b + await c + await d
+    val disjoint = (monotonicNanoseconds() - started) / (4 * rounds)
+    val abandonedBefore = abandoned()
+    started = monotonicNanoseconds()
+    val e = thread { stmWorker(0, 400000) }
+    val f = thread { stmWorker(0, 400000) }
+    val g = thread { stmWorker(0, 400000) }
+    val h = thread { stmWorker(0, 400000) }
+    await e + await f + await g + await h
+    val shared = (monotonicNanoseconds() - started) / (4 * rounds)
+    val conflicts = abandoned() - abandonedBefore
+    val mutex = Mutex(Counters(zeros()))
+    val m1 = mutex.clone()
+    val m2 = mutex.clone()
+    val m3 = mutex.clone()
+    val m4 = mutex.clone()
+    started = monotonicNanoseconds()
+    val i = thread { mutexWorker(m1, 400000) }
+    val j = thread { mutexWorker(m2, 400000) }
+    val k = thread { mutexWorker(m3, 400000) }
+    val l = thread { mutexWorker(m4, 400000) }
+    await i + await j + await k + await l
+    val locked = (monotonicNanoseconds() - started) / (4 * rounds)
+    println("four threads, 4 TVars read and written a block, ns per block (wall / blocks):")
+    println("  disjoint TVars $disjoint, shared TVars $shared (${conflicts * 100 / (4 * rounds)}% abandoned), one Mutex $locked")
+    val after = atomic { readInt(tvars[0]) + readInt(tvars[4]) }
+    if (after - before == 400000 * 6) 42 else 1
+}

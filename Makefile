@@ -244,6 +244,7 @@ test: ablac
 	tools/test-unbounded-exports.sh $(COMPILER)
 	tools/test-programmable-build.sh $(COMPILER)
 	tools/test-checked-export.sh $(COMPILER)
+	tools/test-stm.sh $(COMPILER)
 	tools/test-wasm-mvc-extension.sh $(COMPILER)
 	tools/test-initializer-evaluation.sh $(COMPILER)
 

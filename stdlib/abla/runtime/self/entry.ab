@@ -41,6 +41,25 @@ trusted fun ablaRuntimeStoreSlotI64(address: int, value: int): void =
 // A sequentially consistent fence (orders a rope's flat copy with its children
 // across threads).
 trusted noescape extern:"intrinsic" fun ablaRuntimeFence(): void
+// The transactional memory's atomics on 64-bit words: an acquire load, a release
+// store, and a sequentially consistent compare-and-swap (returning the word seen)
+// and fetch-add (returning the word before); acquire and release fences.
+trusted noescape extern:"intrinsic" fun ablaRuntimeAtomicLoadI64(address: int): int
+trusted noescape extern:"intrinsic" fun ablaRuntimeAtomicStoreI64(
+    address: int,
+    value: int
+): void
+trusted noescape extern:"intrinsic" fun ablaRuntimeAtomicCompareExchangeI64(
+    address: int,
+    expected: int,
+    replacement: int
+): int
+trusted noescape extern:"intrinsic" fun ablaRuntimeAtomicFetchAddI64(
+    address: int,
+    delta: int
+): int
+trusted noescape extern:"intrinsic" fun ablaRuntimeFenceAcquire(): void
+trusted noescape extern:"intrinsic" fun ablaRuntimeFenceRelease(): void
 trusted noescape extern:"intrinsic" fun ablaRuntimeStoreU8(
     address: int,
     value: int
@@ -672,6 +691,7 @@ trusted fun __ablaRuntimeThreadEntry(control: int): int {
     __ablaRuntimeDispatchClosure(control, control + 24)
     __ablaRuntimeReleaseClosure(control)
     __ablaRuntimeCopyValue(__ablaRuntimeNull(), control)
+    __ablaRuntimeStmThreadExit()
     0
 }
 
@@ -729,6 +749,614 @@ trusted fun __ablaRuntimeAwait(operation: any): any {
     } else ablaRuntimeTrap()
     result
 }
+
+// Software transactional memory: the runtime half of `atomic`, `retry` and TVars
+// (TL2 with snapshot extension). The language lowers an atomic block to
+// __ablaRuntimeStmAtomic over the block as a closure, a TVar's reads and writes
+// inside it to __ablaRuntimeStmRead / __ablaRuntimeStmWrite, and `retry` to
+// __ablaRuntimeStmRetry.
+//
+// A TVar is a 40-byte block the collector reads as layout 7 (its value at +16):
+//   +0  its word: the version of its value << 1, plus 1 while a committing
+//       transaction holds it
+//   +8  unused
+//   +16 the value
+// A value of tag 14 holds it.
+//
+// When no other thread runs (always on WebAssembly), a transaction runs directly:
+// reads and writes reach the TVars at once, and the first write to each TVar keeps
+// its old value in the thread's undo log, so a panic that a checked export catches
+// rolls the transaction back. Nothing can conflict, and no thread can start inside
+// it.
+//
+// Otherwise it is logged. It reads a snapshot (the global clock when it began): a
+// read takes the TVar's word, its value, then the word again, and keeps the read
+// (TVar, version) when both words agree, the TVar is not held and its version is
+// no newer than the snapshot. A newer version first tries to move the snapshot to
+// the current clock, which holds when every earlier read is still current. Writes
+// go to a write buffer. The commit holds each written TVar (never waiting long:
+// a TVar held elsewhere fails it), takes the next clock value, checks the reads
+// again unless no other transaction committed since the snapshot, then writes the
+// values back and releases each TVar at the new version (the clock is advanced as
+// TL2's GV4 does, see __ablaRuntimeStmCommit). A failed read abandons
+// the attempt from wherever its body is (the platform's longjmp), so a body never
+// sees an inconsistent state; what the attempt pushed (root frames, a region,
+// pending defers and drops) is left with its stack, which is why `atomic` may
+// mutate only TVars and what it creates.
+//
+// A failed attempt backs off for a random time that doubles with each failure in a
+// row. After 32 in a row the transaction runs alone: it takes the serial lock, and
+// every other commit waits for it and fails, so its next attempt succeeds once the
+// commits already past that check are done.
+//
+// `retry` abandons the attempt, then waits (under one global mutex and condition)
+// until a TVar it read changes; a commit that wrote wakes the waiters when there
+// are any.
+//
+// Each thread's descriptor (raw memory, in the shared list, freed when its thread
+// ends):
+//   0 atomic blocks entered (0 outside)   8 mode (1 direct, 2 logged)
+//  16 the snapshot   24 the thread's number (from 1)   32 failures in a row
+//  40 random state   48 reads   56 read capacity   64 read log   72 read roots
+//  80 writes   88 write capacity   96 write log   104 write roots   112 written filter
+// 120 the attempt's jmp_buf   128 root frames and region before it (2 words)
+// 144 the next descriptor   152 the generator current before it   160 retrying
+// 168 runs alone   176 read root frame   200 write root frame
+// 224 the body's result (24 bytes)   248 attempts abandoned   256 logged commits
+// 264 the block it was carved from
+// A read entry is 32 bytes: the TVar's value, the version read. A write entry is
+// 56: the TVar's value, the value (logged: to write; direct: the old one), and the
+// TVar's word when the commit took it. The two root frames list each entry's values
+// for the collector while the transaction runs.
+//
+// The shared state (raw memory): 0 the clock, alone in its cache line (every
+// writing commit adds to it)   128 thread numbers given   136 waiting threads
+// 144 the number of the thread running alone (0: none)   152 the first descriptor
+// 160 attempts abandoned and 168 logged commits by threads that ended
+// 192 the serial lock, the wait lock, then the wait condition.
+
+var __ablaRuntimeStmShared: int = 0
+// Every transaction logged, also on one thread (tests: logged transactions under
+// collection stress).
+var __ablaRuntimeStmAlwaysLogged: bool = false
+
+@noinline
+trusted fun __ablaRuntimeStmSharedCreate(): int {
+    val lock = __ablaRuntimePlatformGlobalLock()
+    var shared = __ablaRuntimeStmShared
+    if (shared == 0) {
+        val mutexBytes = __ablaRuntimePlatformMutexBytes()
+        shared = __ablaRuntimePlatformRawAllocate(
+            192 + 2 * mutexBytes + __ablaRuntimePlatformConditionBytes()
+        )
+        __ablaRuntimePlatformMutexInitialize(shared + 192)
+        __ablaRuntimePlatformMutexInitialize(shared + 192 + mutexBytes)
+        __ablaRuntimePlatformConditionInitialize(shared + 192 + 2 * mutexBytes)
+        ablaRuntimeFenceRelease()
+        __ablaRuntimeStmShared = shared
+    }
+    __ablaRuntimePlatformGlobalUnlock(lock)
+    shared
+}
+
+@inline
+trusted fun __ablaRuntimeStmState(): int {
+    val shared = __ablaRuntimeStmShared
+    if (shared != 0) shared else __ablaRuntimeStmSharedCreate()
+}
+
+@noinline
+trusted fun __ablaRuntimeStmDescriptorCreate(): int {
+    val shared = __ablaRuntimeStmState()
+    // In cache lines of its own: every transaction writes it, and another
+    // thread's descriptor sharing a line made four threads each four times slower.
+    val block = __ablaRuntimePlatformRawAllocate(512)
+    val descriptor = (block + 127) & -128
+    ablaRuntimeStoreI64(descriptor + 264, block)
+    val number = ablaRuntimeAtomicFetchAddI64(shared + 128, 1) + 1
+    ablaRuntimeStoreI64(descriptor + 24, number)
+    ablaRuntimeStoreI64(descriptor + 40, number * 2654435761 + 1)
+    val lock = __ablaRuntimePlatformGlobalLock()
+    ablaRuntimeStoreI64(descriptor + 144, ablaRuntimeLoadI64(shared + 152))
+    ablaRuntimeStoreI64(shared + 152, descriptor)
+    __ablaRuntimePlatformGlobalUnlock(lock)
+    __ablaRuntimePlatformStmSetDescriptor(descriptor)
+    descriptor
+}
+
+@inline
+trusted fun __ablaRuntimeStmDescriptor(): int {
+    val descriptor = __ablaRuntimePlatformStmDescriptor()
+    if (descriptor != 0) descriptor else __ablaRuntimeStmDescriptorCreate()
+}
+
+// The thread is ending: its descriptor leaves the shared list.
+trusted fun __ablaRuntimeStmThreadExit(): void {
+    val descriptor = __ablaRuntimePlatformStmDescriptor()
+    if (descriptor == 0) return
+    val shared = __ablaRuntimeStmShared
+    val lock = __ablaRuntimePlatformGlobalLock()
+    var link = shared + 152
+    while (ablaRuntimeLoadI64(link) != 0 && ablaRuntimeLoadI64(link) != descriptor) {
+        link = ablaRuntimeLoadI64(link) + 144
+    }
+    if (ablaRuntimeLoadI64(link) == descriptor) {
+        ablaRuntimeStoreI64(link, ablaRuntimeLoadI64(descriptor + 144))
+    }
+    ablaRuntimeStoreI64(shared + 160, ablaRuntimeLoadI64(shared + 160) + ablaRuntimeLoadI64(descriptor + 248))
+    ablaRuntimeStoreI64(shared + 168, ablaRuntimeLoadI64(shared + 168) + ablaRuntimeLoadI64(descriptor + 256))
+    __ablaRuntimePlatformGlobalUnlock(lock)
+    __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 64))
+    __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 72))
+    __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 96))
+    __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 104))
+    __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 264))
+    __ablaRuntimePlatformStmSetDescriptor(0)
+}
+
+trusted fun __ablaRuntimeTVarCreate(value: any): any {
+    val tvar = __ablaRuntimeAllocateLayout(40, 7)
+    ablaRuntimeStoreI64(tvar, 0)
+    ablaRuntimeStoreI64(tvar + 8, 0)
+    __ablaRuntimeCopyValue(value, tvar + 16)
+    ablaRuntimeMakeValue(14, 0, tvar, 0)
+}
+
+// A TVar's bit in a descriptor's written filter.
+@inline
+trusted fun __ablaRuntimeStmBit(tvar: int): int = 1 << ((tvar >> 4) & 63)
+
+// The write entry for `tvar`, or -1.
+trusted fun __ablaRuntimeStmWritten(descriptor: int, tvar: int): int {
+    if ((ablaRuntimeLoadI64(descriptor + 112) & __ablaRuntimeStmBit(tvar)) == 0) return -1
+    val log = ablaRuntimeLoadI64(descriptor + 96)
+    var index = ablaRuntimeLoadI64(descriptor + 80) - 1
+    while (index >= 0) {
+        if (ablaRuntimeLoadI64(log + index * 56 + 8) == tvar) return index
+        index = index - 1
+    }
+    -1
+}
+
+// Grows a log (`at`: the descriptor's count field; capacity, log and roots follow)
+// of `bytes`-byte entries holding `values` values each, and points its root frame
+// at the new roots.
+@noinline
+trusted fun __ablaRuntimeStmGrow(at: int, bytes: int, values: int, frame: int): void {
+    val count = ablaRuntimeLoadI64(at)
+    val capacity = ablaRuntimeLoadI64(at + 8)
+    val grown = if (capacity == 0) 16 else capacity * 2
+    val log = __ablaRuntimePlatformRawAllocate(grown * bytes)
+    val roots = __ablaRuntimePlatformRawAllocate(grown * values * __ablaRuntimePlatformRootBytes())
+    val old = ablaRuntimeLoadI64(at + 16)
+    var offset = 0
+    while (offset < count * bytes) {
+        ablaRuntimeStoreI64(log + offset, ablaRuntimeLoadI64(old + offset))
+        offset = offset + 8
+    }
+    var index = 0
+    while (index < grown) {
+        var value = 0
+        while (value < values) {
+            __ablaRuntimePlatformRootStore(roots, index * values + value, log + index * bytes + value * 24)
+            value = value + 1
+        }
+        index = index + 1
+    }
+    __ablaRuntimePlatformRawFree(old)
+    __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(at + 24))
+    ablaRuntimeStoreI64(at + 8, grown)
+    ablaRuntimeStoreI64(at + 16, log)
+    ablaRuntimeStoreI64(at + 24, roots)
+    __ablaRuntimePlatformRootsSet(frame, roots, count * values)
+}
+
+trusted fun __ablaRuntimeStmLogRead(descriptor: int, tvar: any, version: int): void {
+    val count = ablaRuntimeLoadI64(descriptor + 48)
+    if (count == ablaRuntimeLoadI64(descriptor + 56)) {
+        __ablaRuntimeStmGrow(descriptor + 48, 32, 1, descriptor + 176)
+    }
+    val entry = ablaRuntimeLoadI64(descriptor + 64) + count * 32
+    __ablaRuntimeCopyValue(tvar, entry)
+    ablaRuntimeStoreI64(entry + 24, version)
+    ablaRuntimeStoreI64(descriptor + 48, count + 1)
+    __ablaRuntimePlatformRootsSet(descriptor + 176, ablaRuntimeLoadI64(descriptor + 72), count + 1)
+}
+
+trusted fun __ablaRuntimeStmLogWrite(descriptor: int, tvar: any, value: any): void {
+    val count = ablaRuntimeLoadI64(descriptor + 80)
+    if (count == ablaRuntimeLoadI64(descriptor + 88)) {
+        __ablaRuntimeStmGrow(descriptor + 80, 56, 2, descriptor + 200)
+    }
+    val entry = ablaRuntimeLoadI64(descriptor + 96) + count * 56
+    __ablaRuntimeCopyValue(tvar, entry)
+    __ablaRuntimeCopyValue(value, entry + 24)
+    ablaRuntimeStoreI64(descriptor + 80, count + 1)
+    ablaRuntimeStoreI64(
+        descriptor + 112,
+        ablaRuntimeLoadI64(descriptor + 112) | __ablaRuntimeStmBit(__ablaRuntimeWord0(tvar))
+    )
+    __ablaRuntimePlatformRootsSet(descriptor + 200, ablaRuntimeLoadI64(descriptor + 104), 2 * count + 2)
+}
+
+// Whether every read is still current: the same version, and not held by another
+// commit (this one's own commit holds what it writes).
+trusted fun __ablaRuntimeStmValidate(descriptor: int): bool {
+    val log = ablaRuntimeLoadI64(descriptor + 64)
+    val count = ablaRuntimeLoadI64(descriptor + 48)
+    var index = 0
+    while (index < count) {
+        val tvar = ablaRuntimeLoadI64(log + index * 32 + 8)
+        val word = ablaRuntimeAtomicLoadI64(tvar)
+        if ((word >> 1) != ablaRuntimeLoadI64(log + index * 32 + 24)) return false
+        if ((word & 1) != 0 && __ablaRuntimeStmWritten(descriptor, tvar) < 0) return false
+        index = index + 1
+    }
+    true
+}
+
+// Leaves the attempt at once (from any depth of its body), to retry it or, with
+// `retrying`, to wait for a change first.
+@noinline
+trusted fun __ablaRuntimeStmAbandon(descriptor: int, retrying: bool): never {
+    ablaRuntimeStoreI64(descriptor + 160, if (retrying) 1 else 0)
+    __ablaRuntimePlatformAbandon(descriptor + 120)
+}
+
+@noinline
+trusted fun __ablaRuntimeStmReadLogged(descriptor: int, tvarValue: any, tvar: int): any {
+    val written = __ablaRuntimeStmWritten(descriptor, tvar)
+    if (written >= 0) {
+        return __ablaRuntimeValueAt(ablaRuntimeLoadI64(descriptor + 96) + written * 56 + 24)
+    }
+    var tries = 0
+    while (tries < 256) {
+        val word = ablaRuntimeAtomicLoadI64(tvar)
+        if ((word & 1) == 0) {
+            val value = __ablaRuntimeValueAt(tvar + 16)
+            ablaRuntimeFenceAcquire()
+            if (ablaRuntimeLoadI64(tvar) == word) {
+                val version = word >> 1
+                if (version <= ablaRuntimeLoadI64(descriptor + 16)) {
+                    __ablaRuntimeStmLogRead(descriptor, tvarValue, version)
+                    return value
+                }
+                // Newer than the snapshot: move the snapshot up, then read again.
+                val now = ablaRuntimeAtomicLoadI64(__ablaRuntimeStmShared)
+                if (!__ablaRuntimeStmValidate(descriptor)) {
+                    __ablaRuntimeStmAbandon(descriptor, false)
+                }
+                ablaRuntimeStoreI64(descriptor + 16, now)
+            }
+        }
+        tries = tries + 1
+    }
+    __ablaRuntimeStmAbandon(descriptor, false)
+}
+
+// A TVar's value, inside a transaction. Inline, as is a write's check: a block's
+// accesses share one lookup of the thread's descriptor (a call on some hosts).
+@inline
+trusted fun __ablaRuntimeStmRead(tvarValue: any): any {
+    val tvar = __ablaRuntimeSharedControl(tvarValue, 14)
+    val descriptor = __ablaRuntimePlatformStmDescriptor()
+    if (descriptor == 0 || ablaRuntimeLoadI64(descriptor + 8) != 2 ||
+        ablaRuntimeLoadI64(descriptor) == 0) {
+        __ablaRuntimeValueAt(tvar + 16)
+    } else __ablaRuntimeStmReadLogged(descriptor, tvarValue, tvar)
+}
+
+// Sets a TVar's value, inside a transaction.
+@inline
+trusted fun __ablaRuntimeStmWrite(tvarValue: any, value: any): any {
+    val tvar = __ablaRuntimeSharedControl(tvarValue, 14)
+    val descriptor = __ablaRuntimePlatformStmDescriptor()
+    if (descriptor == 0 || ablaRuntimeLoadI64(descriptor) == 0) {
+        __ablaRuntimeCopyValue(value, tvar + 16)
+    } else __ablaRuntimeStmWriteLogged(descriptor, tvarValue, tvar, value)
+    __ablaRuntimeVoid()
+}
+
+// A write inside a transaction: to the write buffer (logged), or in place with the
+// old value kept once (direct).
+@noinline
+trusted fun __ablaRuntimeStmWriteLogged(descriptor: int, tvarValue: any, tvar: int, value: any): void {
+    val logged = ablaRuntimeLoadI64(descriptor + 8) == 2
+    val written = __ablaRuntimeStmWritten(descriptor, tvar)
+    if (written >= 0) {
+        if (logged) {
+            __ablaRuntimeCopyValue(
+                value, ablaRuntimeLoadI64(descriptor + 96) + written * 56 + 24
+            )
+        } else __ablaRuntimeCopyValue(value, tvar + 16)
+    } else if (logged) {
+        __ablaRuntimeStmLogWrite(descriptor, tvarValue, value)
+    } else {
+        __ablaRuntimeStmLogWrite(descriptor, tvarValue, __ablaRuntimeValueAt(tvar + 16))
+        __ablaRuntimeCopyValue(value, tvar + 16)
+    }
+}
+
+// Inside a transaction: waits until a TVar it read changes, then runs it again.
+trusted fun __ablaRuntimeStmRetry(): never {
+    val descriptor = __ablaRuntimePlatformStmDescriptor()
+    if (descriptor == 0 || ablaRuntimeLoadI64(descriptor) == 0) {
+        __ablaRuntimePanic("retry outside a transaction")
+    }
+    if (ablaRuntimeLoadI64(descriptor + 8) != 2 || __ablaRuntimePlatformOnlyThread() ||
+        ablaRuntimeLoadI64(descriptor + 48) == 0) {
+        __ablaRuntimePanic("retry can never wake: no other thread can change what the transaction read")
+    }
+    __ablaRuntimeStmAbandon(descriptor, true)
+}
+
+// Whether the calling thread is inside a transaction.
+trusted fun __ablaRuntimeStmActive(): bool {
+    val descriptor = __ablaRuntimePlatformStmDescriptor()
+    descriptor != 0 && ablaRuntimeLoadI64(descriptor) != 0
+}
+
+// Starts the outermost transaction of an attempt.
+trusted fun __ablaRuntimeStmBegin(descriptor: int): void {
+    ablaRuntimeStoreI64(descriptor, 1)
+    ablaRuntimeStoreI64(descriptor + 160, 0)
+    val logged = __ablaRuntimeStmAlwaysLogged || !__ablaRuntimePlatformOnlyThread()
+    ablaRuntimeStoreI64(descriptor + 8, if (logged) 2 else 1)
+    ablaRuntimeStoreI64(descriptor + 48, 0)
+    ablaRuntimeStoreI64(descriptor + 80, 0)
+    ablaRuntimeStoreI64(descriptor + 112, 0)
+    if (logged) {
+        ablaRuntimeStoreI64(descriptor + 16, ablaRuntimeAtomicLoadI64(__ablaRuntimeStmState()))
+    }
+    __ablaRuntimeRootsPush(descriptor + 176, ablaRuntimeLoadI64(descriptor + 72), 0)
+    __ablaRuntimeRootsPush(descriptor + 200, ablaRuntimeLoadI64(descriptor + 104), 0)
+    __ablaRuntimePlatformUnwindSave(descriptor + 128)
+    ablaRuntimeStoreI64(descriptor + 152, __ablaRuntimeCurrentGenerator)
+}
+
+// Ends the outermost transaction (committed, rolled back or abandoned).
+trusted fun __ablaRuntimeStmEnd(descriptor: int): void {
+    __ablaRuntimeRootsPop(descriptor + 200)
+    __ablaRuntimeRootsPop(descriptor + 176)
+    ablaRuntimeStoreI64(descriptor + 48, 0)
+    ablaRuntimeStoreI64(descriptor + 80, 0)
+    ablaRuntimeStoreI64(descriptor + 112, 0)
+    ablaRuntimeStoreI64(descriptor, 0)
+}
+
+// Releases the TVars a failed commit held, the first `count` of its writes.
+trusted fun __ablaRuntimeStmRelease(descriptor: int, count: int): void {
+    val log = ablaRuntimeLoadI64(descriptor + 96)
+    var index = 0
+    while (index < count) {
+        val entry = log + index * 56
+        ablaRuntimeAtomicStoreI64(ablaRuntimeLoadI64(entry + 8), ablaRuntimeLoadI64(entry + 48))
+        index = index + 1
+    }
+}
+
+// Commits a logged transaction; false when it conflicted (nothing was written).
+trusted fun __ablaRuntimeStmCommit(descriptor: int): bool {
+    val writes = ablaRuntimeLoadI64(descriptor + 80)
+    if (writes == 0) return true
+    val shared = __ablaRuntimeStmShared
+    val alone = ablaRuntimeAtomicLoadI64(shared + 144)
+    if (alone != 0 && alone != ablaRuntimeLoadI64(descriptor + 24)) {
+        // Another transaction runs alone: wait for it, then run again.
+        __ablaRuntimePlatformMutexLock(shared + 192)
+        __ablaRuntimePlatformMutexUnlock(shared + 192)
+        return false
+    }
+    val log = ablaRuntimeLoadI64(descriptor + 96)
+    var held = 0
+    while (held < writes) {
+        val entry = log + held * 56
+        val tvar = ablaRuntimeLoadI64(entry + 8)
+        var tries = 0
+        var taken = false
+        while (!taken && tries < 64) {
+            val word = ablaRuntimeAtomicLoadI64(tvar)
+            if ((word & 1) == 0 &&
+                ablaRuntimeAtomicCompareExchangeI64(tvar, word, word | 1) == word) {
+                ablaRuntimeStoreI64(entry + 48, word)
+                taken = true
+            } else tries = tries + 1
+        }
+        if (!taken) {
+            __ablaRuntimeStmRelease(descriptor, held)
+            return false
+        }
+        held = held + 1
+    }
+    // The new version: the clock moved up by one, or, when another commit moved it
+    // first, the version that commit took (TL2's GV4: both hold their TVars, so they
+    // may share it, and a contended clock sees one write instead of a queue of them).
+    // The reads need checking again unless this commit moved the clock up from the
+    // snapshot itself.
+    val seen = ablaRuntimeAtomicLoadI64(shared)
+    val observed = ablaRuntimeAtomicCompareExchangeI64(shared, seen, seen + 1)
+    val version = if (observed == seen) seen + 1 else observed
+    if ((observed != seen || seen != ablaRuntimeLoadI64(descriptor + 16)) &&
+        !__ablaRuntimeStmValidate(descriptor)) {
+        __ablaRuntimeStmRelease(descriptor, writes)
+        return false
+    }
+    var index = 0
+    while (index < writes) {
+        val entry = log + index * 56
+        __ablaRuntimeCopyValue(__ablaRuntimeValueAt(entry + 24), ablaRuntimeLoadI64(entry + 8) + 16)
+        index = index + 1
+    }
+    index = 0
+    while (index < writes) {
+        ablaRuntimeAtomicStoreI64(ablaRuntimeLoadI64(log + index * 56 + 8), version << 1)
+        index = index + 1
+    }
+    ablaRuntimeStoreI64(descriptor + 256, ablaRuntimeLoadI64(descriptor + 256) + 1)
+    // Ordered after the releases: a thread that counted itself waiting before this
+    // load is woken; one counted after it sees the new versions.
+    ablaRuntimeFence()
+    if (ablaRuntimeAtomicLoadI64(shared + 136) != 0) {
+        val waitLock = shared + 192 + __ablaRuntimePlatformMutexBytes()
+        __ablaRuntimePlatformMutexLock(waitLock)
+        __ablaRuntimePlatformConditionBroadcast(waitLock + __ablaRuntimePlatformMutexBytes())
+        __ablaRuntimePlatformMutexUnlock(waitLock)
+    }
+    true
+}
+
+// Whether a TVar a retrying transaction read has changed since.
+trusted fun __ablaRuntimeStmChanged(descriptor: int): bool {
+    val log = ablaRuntimeLoadI64(descriptor + 64)
+    val count = ablaRuntimeLoadI64(descriptor + 48)
+    var index = 0
+    while (index < count) {
+        val word = ablaRuntimeAtomicLoadI64(ablaRuntimeLoadI64(log + index * 32 + 8))
+        if (word != ablaRuntimeLoadI64(log + index * 32 + 24) << 1) return true
+        index = index + 1
+    }
+    false
+}
+
+trusted fun __ablaRuntimeStmAwaitChange(descriptor: int): void {
+    val shared = __ablaRuntimeStmShared
+    val waitLock = shared + 192 + __ablaRuntimePlatformMutexBytes()
+    ablaRuntimeAtomicFetchAddI64(shared + 136, 1)
+    __ablaRuntimePlatformMutexLock(waitLock)
+    while (!__ablaRuntimeStmChanged(descriptor)) {
+        __ablaRuntimePlatformConditionWait(waitLock + __ablaRuntimePlatformMutexBytes(), waitLock)
+    }
+    __ablaRuntimePlatformMutexUnlock(waitLock)
+    ablaRuntimeAtomicFetchAddI64(shared + 136, -1)
+    return
+}
+
+// No longer running alone. (Plain stores across a fence: a checked export's
+// recovery reaches this in every program that has one.)
+trusted fun __ablaRuntimeStmJoin(descriptor: int): void {
+    if (ablaRuntimeLoadI64(descriptor + 168) != 0) {
+        ablaRuntimeFence()
+        ablaRuntimeStoreI64(__ablaRuntimeStmShared + 144, 0)
+        __ablaRuntimePlatformMutexUnlock(__ablaRuntimeStmShared + 192)
+        ablaRuntimeStoreI64(descriptor + 168, 0)
+    }
+}
+
+// A failed attempt: wait a random time that doubles with each failure in a row, or
+// after 32 run alone.
+trusted fun __ablaRuntimeStmBackOff(descriptor: int): void {
+    val failures = ablaRuntimeLoadI64(descriptor + 32) + 1
+    ablaRuntimeStoreI64(descriptor + 32, failures)
+    val shared = __ablaRuntimeStmShared
+    ablaRuntimeStoreI64(descriptor + 248, ablaRuntimeLoadI64(descriptor + 248) + 1)
+    if (failures >= 32 && ablaRuntimeLoadI64(descriptor + 168) == 0) {
+        __ablaRuntimePlatformMutexLock(shared + 192)
+        ablaRuntimeAtomicStoreI64(shared + 144, ablaRuntimeLoadI64(descriptor + 24))
+        ablaRuntimeStoreI64(descriptor + 168, 1)
+        return
+    }
+    var random = ablaRuntimeLoadI64(descriptor + 40)
+    random = random ^ (random << 13)
+    random = random ^ (random >> 7)
+    random = random ^ (random << 17)
+    ablaRuntimeStoreI64(descriptor + 40, random)
+    val window = 1 << (if (failures > 10) 10 else failures)
+    var spins = (random & (window - 1)) * 16
+    while (spins > 0) {
+        ablaRuntimeAtomicLoadI64(shared)
+        spins = spins - 1
+    }
+}
+
+// Runs `closure` (no arguments) as a transaction and returns its result. Inside
+// another transaction it joins that one.
+trusted fun __ablaRuntimeStmAtomic(closure: any): any {
+    val descriptor = __ablaRuntimeStmDescriptor()
+    val closureAddress = ablaRuntimeValueAddress(closure)
+    val output = descriptor + 224
+    val depth = ablaRuntimeLoadI64(descriptor)
+    if (depth != 0) {
+        ablaRuntimeStoreI64(descriptor, depth + 1)
+        __ablaRuntimeDispatchClosure(closureAddress, output)
+        ablaRuntimeStoreI64(descriptor, depth)
+        return __ablaRuntimeValueAt(output)
+    }
+    while (true) {
+        __ablaRuntimeStmBegin(descriptor)
+        if (ablaRuntimeLoadI64(descriptor + 8) == 1) {
+            __ablaRuntimeDispatchClosure(closureAddress, output)
+            __ablaRuntimeStmEnd(descriptor)
+            return __ablaRuntimeValueAt(output)
+        }
+        val abandoned = __ablaRuntimePlatformAttempt(closureAddress, output, descriptor + 120)
+        if (abandoned) {
+            __ablaRuntimePlatformUnwindRestore(descriptor + 128)
+            __ablaRuntimeCurrentGenerator = ablaRuntimeLoadI64(descriptor + 152)
+        }
+        if (!abandoned && __ablaRuntimeStmCommit(descriptor)) {
+            __ablaRuntimeStmEnd(descriptor)
+            __ablaRuntimeStmJoin(descriptor)
+            ablaRuntimeStoreI64(descriptor + 32, 0)
+            return __ablaRuntimeValueAt(output)
+        }
+        if (abandoned && ablaRuntimeLoadI64(descriptor + 160) != 0) {
+            __ablaRuntimeStmJoin(descriptor)
+            __ablaRuntimeStmAwaitChange(descriptor)
+            __ablaRuntimeStmEnd(descriptor)
+        } else {
+            __ablaRuntimeStmEnd(descriptor)
+            __ablaRuntimeStmBackOff(descriptor)
+        }
+    }
+    __ablaRuntimeNull()
+}
+
+// A panic a checked export caught inside a transaction: a direct one's writes are
+// undone, newest first; a logged one's were never made. The root frames went with
+// the export's.
+trusted fun __ablaRuntimeStmRecover(): void {
+    val descriptor = __ablaRuntimePlatformStmDescriptor()
+    if (descriptor == 0 || ablaRuntimeLoadI64(descriptor) == 0) return
+    if (ablaRuntimeLoadI64(descriptor + 8) == 1) {
+        val log = ablaRuntimeLoadI64(descriptor + 96)
+        var index = ablaRuntimeLoadI64(descriptor + 80) - 1
+        while (index >= 0) {
+            val entry = log + index * 56
+            __ablaRuntimeCopyValue(__ablaRuntimeValueAt(entry + 24), ablaRuntimeLoadI64(entry + 8) + 16)
+            index = index - 1
+        }
+    }
+    __ablaRuntimeStmJoin(descriptor)
+    ablaRuntimeStoreI64(descriptor + 48, 0)
+    ablaRuntimeStoreI64(descriptor + 80, 0)
+    ablaRuntimeStoreI64(descriptor + 112, 0)
+    ablaRuntimeStoreI64(descriptor, 0)
+}
+
+// Tests: run every transaction logged, also on one thread.
+trusted fun __ablaRuntimeStmSetAlwaysLogged(logged: bool): void {
+    __ablaRuntimeStmAlwaysLogged = logged
+}
+
+// Abandoned attempts and logged commits so far (0 before any transaction): the
+// running threads' counts and those of the threads that ended.
+trusted fun __ablaRuntimeStmCount(offset: int): int {
+    val shared = __ablaRuntimeStmShared
+    if (shared == 0) return 0
+    val lock = __ablaRuntimePlatformGlobalLock()
+    var total = ablaRuntimeLoadI64(shared + (if (offset == 248) 160 else 168))
+    var descriptor = ablaRuntimeLoadI64(shared + 152)
+    while (descriptor != 0) {
+        total = total + ablaRuntimeLoadI64(descriptor + offset)
+        descriptor = ablaRuntimeLoadI64(descriptor + 144)
+    }
+    __ablaRuntimePlatformGlobalUnlock(lock)
+    total
+}
+
+trusted fun __ablaRuntimeStmAbandoned(): int = __ablaRuntimeStmCount(248)
+
+trusted fun __ablaRuntimeStmCommits(): int = __ablaRuntimeStmCount(256)
 
 trusted fun __ablaRuntimeNegate(value: any): any =
     __ablaRuntimeI64(0 - __ablaRuntimeAsI64(value))
