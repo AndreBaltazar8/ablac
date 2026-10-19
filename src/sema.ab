@@ -4661,12 +4661,16 @@ fun bootstrapRegionModuleValueType(
 // value assigned to it or to one of its heap fields, an element appended, set
 // or indexed into a heap-element array or map, or a call to one of its type's
 // methods that keeps an argument. A function that does is unsafe in a region:
-// the region frees what the module value still refers to.
+// the region frees what the module value still refers to. `shadowed` is a
+// stack of the names bound around the expression (it comes back as it went
+// in); `methodCalls` counts the other method calls on module values, whose
+// answer can change as the summary learns which methods keep an argument.
 fun bootstrapRegionExpressionStoresModuleValue(
     expression: BootstrapExpression,
     values: Map<string, string>,
-    shadowed: array<string>,
-    summary: BootstrapRegionCallSummary
+    var shadowed: array<string>,
+    summary: BootstrapRegionCallSummary,
+    var methodCalls: array<int>
 ): bool {
     var stores = false
     if (expression.kind == "assign") {
@@ -4694,49 +4698,67 @@ fun bootstrapRegionExpressionStoresModuleValue(
                 bootstrapRegionModuleValueKeepsElements(type)) {
                 stores = true
             }
-            if (expression.kind == "member.call" &&
-                (((expression.text == "append" || expression.text == "set") &&
-                  bootstrapRegionModuleValueKeepsElements(type)) ||
-                 bootstrapRegionReceiverCallIsRetaining(
-                     summary, type, expression.text
-                 ))) {
-                stores = true
+            if (expression.kind == "member.call") {
+                if ((expression.text == "append" || expression.text == "set") &&
+                    bootstrapRegionModuleValueKeepsElements(type)) stores = true
+                methodCalls[0] = methodCalls[0] + 1
+                if (bootstrapRegionReceiverCallIsRetaining(
+                    summary, type, expression.text
+                )) stores = true
             }
         }
     }
     // A lambda's parameters, a loop's variable in its body and a block's
     // local from its declaration on shadow a module value of their name.
-    var scope = bootstrapNamesWith(shadowed, [])
+    val mark = shadowed.size
     var child = 0
     val lambda = expression.kind == "lambda" ||
         expression.kind == "lambda.move" ||
         expression.kind == "lambda.generator"
     if (lambda) {
-        val parameters: array<string> = []
         while (child + 1 < expression.children.size) {
-            parameters.append(expression.children[child].text)
+            shadowed.append(expression.children[child].text)
             child = child + 1
         }
-        scope = bootstrapNamesWith(shadowed, parameters)
     }
     while (!stores && child < expression.children.size) {
         val found = expression.children[child]
         val body = expression.kind == "for" && child == 1
+        val bodyMark = shadowed.size
+        if (body) shadowed.append(expression.text)
         stores = bootstrapRegionExpressionStoresModuleValue(
-            found,
-            values,
-            if (body) {
-                bootstrapNamesWith(scope, [expression.text])
-            } else scope,
-            summary
+            found, values, shadowed, summary, methodCalls
         )
+        if (body) shadowed.truncate(bodyMark)
         if (expression.kind == "block" &&
             (found.kind == "local.val" || found.kind == "local.var")) {
-            scope = bootstrapNamesWith(scope, [found.text])
+            shadowed.append(found.text)
         }
         child = child + 1
     }
+    shadowed.truncate(mark)
     stores
+}
+
+// Marks a body that stores into a module value unsafe, and keeps for the
+// fixed point the name of one whose answer may change (see above).
+fun bootstrapRegionCheckModuleStores(
+    name: string,
+    expression: BootstrapExpression,
+    values: Map<string, string>,
+    var shadowed: array<string>,
+    var summary: BootstrapRegionCallSummary,
+    var recheck: BootstrapStringSet
+): void {
+    if (!bootstrapRegionCallIsUnsafe(summary, name)) {
+        val methodCalls = [0]
+        if (bootstrapRegionExpressionStoresModuleValue(
+            expression, values, shadowed, summary, methodCalls
+        )) {
+            bootstrapRegionAddUnsafe(summary, name)
+        } else if (methodCalls[0] > 0) recheck.add(name)
+    }
+    return
 }
 
 fun bootstrapBuildRegionCallSummary(
@@ -4777,7 +4799,32 @@ fun bootstrapBuildRegionCallSummary(
         }
         declarationIndex = declarationIndex + 1
     }
+    // Each body is walked for module-value stores once; one that calls a
+    // method on a module value is walked again on each pass, as that method may
+    // turn out to keep its argument.
     val moduleValues = bootstrapRegionModuleValues(declarations)
+    val moduleRecheck = bootstrapStringSet()
+    declarationIndex = 0
+    while (declarationIndex < declarations.size) {
+        val declaration = declarations[declarationIndex]
+        if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
+            bootstrapRegionCheckModuleStores(
+                declaration.name, declaration.expression, moduleValues,
+                bootstrapNamesWith(declaration.parameters, []),
+                summary, moduleRecheck
+            )
+        }
+        for (method in declaration.methods) {
+            bootstrapRegionCheckModuleStores(
+                "${declaration.name}.${method.name}", method.expression,
+                moduleValues,
+                // The type's fields shadow module values too.
+                bootstrapNamesWith(declaration.parameters, method.parameters),
+                summary, moduleRecheck
+            )
+        }
+        declarationIndex = declarationIndex + 1
+    }
     var changed = true
     while (changed) {
         changed = false
@@ -4787,11 +4834,13 @@ fun bootstrapBuildRegionCallSummary(
             if ((declaration.kind == "fun" ||
                  declaration.kind == "compile.fun") &&
                 !bootstrapRegionCallIsUnsafe(summary, declaration.name) &&
+                moduleRecheck.contains(declaration.name) &&
                 bootstrapRegionExpressionStoresModuleValue(
                     declaration.expression,
                     moduleValues,
-                    declaration.parameters,
-                    summary
+                    bootstrapNamesWith(declaration.parameters, []),
+                    summary,
+                    [0]
                 )) {
                 bootstrapRegionAddUnsafe(summary, declaration.name)
                 changed = true
@@ -4840,15 +4889,16 @@ fun bootstrapBuildRegionCallSummary(
                     (bootstrapRegionExpressionCallsUnsafe(
                         method.expression,
                         summary
-                    ) || bootstrapRegionExpressionStoresModuleValue(
+                    ) || (moduleRecheck.contains(name) &&
+                    bootstrapRegionExpressionStoresModuleValue(
                         method.expression,
                         moduleValues,
-                        // The type's fields shadow module values too.
                         bootstrapNamesWith(
                             declaration.parameters, method.parameters
                         ),
-                        summary
-                    ))) {
+                        summary,
+                        [0]
+                    )))) {
                     bootstrapRegionAddUnsafe(summary, name)
                     changed = true
                 }
