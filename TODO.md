@@ -166,11 +166,15 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   per lookup, and the slot hash is FNV-1a (an xor and a multiply a byte; a word at a time
   would need the string's bytes flat, a rope's are not): about 4% of that `--emit-llvm`.
   (The runtime operation per opcode is a table, and the borrow liveness resolves successor
-  blocks once.) Left: the declaration index's `find`, whose callers the sample does not
-  show: lowering's recursion is deeper than its stacks. Next: count the lookups per call
-  site, then remember a callee's declaration where the same name is looked up again
-  (`lowerFunctionResultType`, `lowerFunctionType`, `lowerGlobalFunctionType` each look it
-  up afresh). A sample of a compiler built without `-g` names functions
+  blocks once.) The declaration index's `find`, counted per call site with a temporary
+  counting build (2026-10-19): 1,001,428 lookups per server `--emit-llvm`, 49% repeating
+  the site's previous name. The largest are runtime-operation marking (164k, 12% repeats),
+  the current owner's declaration while lowering a method (66k, 100%), class and scalar
+  checks (66k, 54%), field types (58k, 62%), globals (52k, 69%) and function result types
+  (42k + 34k, 73%). Remembering the repeats would save about 1.5–2% of that emit (0.1 s),
+  within the timing noise, so nothing changed; the one clean candidate, if lowering ever
+  needs it, is caching the current owner's declaration while a method lowers. A sample of
+  a compiler built without `-g` names functions
   `abla_fn_<a>_<b>`; the compiler's own `--emit-llvm` maps each to its source name
   through the function's `"abla.source"` attribute.
 
