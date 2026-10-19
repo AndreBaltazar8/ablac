@@ -728,3 +728,59 @@ fun bootstrapLlvmEmitGeneratorStep(
     LLVMBuildRetVoid(backend.builder)
     return
 }
+
+/** abla_stm_invoke(closure, output, slot): runs one attempt of a transaction's body
+ *  (the closure, through abla_llvm_call_indirect) under a jmp_buf in this function's
+ *  frame, whose address it stores at `slot` first. 0 when the body returned; 1 when
+ *  the runtime abandoned the attempt (a conflict or a retry) by longjmp'ing to it.
+ *  Defined when the runtime's transactions are reached (they declare it). */
+fun bootstrapLlvmDefineStmInvoke(backend: BootstrapLlvmBackend): void {
+    val invoke = LLVMGetNamedFunction(backend.module, "abla_stm_invoke")
+    if (pointerIsNull(invoke) || LLVMIsDeclaration(invoke) == 0) return
+    val indirect = LLVMGetNamedFunction(backend.module, "abla_llvm_call_indirect")
+    if (pointerIsNull(indirect)) return
+    LLVMSetLinkage(invoke, llvmInternalLinkage())
+    bootstrapLlvmAddFunctionAttribute(backend, invoke, "noinline")
+    val setjmp = bootstrapLlvmDeclare(
+        backend, "_setjmp", backend.i32Type, [backend.pointerType], false, [false]
+    )
+    bootstrapLlvmAddFunctionAttribute(backend, setjmp, "returns_twice")
+    val entry = LLVMAppendBasicBlockInContext(backend.context, invoke, "entry")
+    val call = LLVMAppendBasicBlockInContext(backend.context, invoke, "call")
+    val abandoned = LLVMAppendBasicBlockInContext(backend.context, invoke, "abandoned")
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    // 512 bytes cover every hosted libc's jmp_buf (glibc x86-64 200, Darwin arm64 192).
+    val buffer = LLVMBuildAlloca(
+        backend.builder, LLVMArrayType2(backend.i8Type, 512), "stm.jmp_buf"
+    )
+    LLVMSetAlignment(buffer, 16)
+    val resumed = bootstrapLlvmCall(
+        backend, setjmp, [buffer], "stm.resumed", false, [false]
+    )
+    LLVMBuildCondBr(
+        backend.builder,
+        LLVMBuildICmp(
+            backend.builder, llvmIntEqual(), resumed,
+            LLVMConstInt(backend.i32Type, 0, 0), "stm.first"
+        ),
+        call, abandoned
+    )
+    val result = LLVMGetReturnType(LLVMGlobalGetValueType(invoke))
+    LLVMPositionBuilderAtEnd(backend.builder, call)
+    LLVMBuildStore(backend.builder, buffer, LLVMGetParam(invoke, 2))
+    val arguments = llvmPointerVector(4)
+    arguments.set(0, LLVMGetParam(invoke, 1))
+    arguments.set(1, LLVMGetParam(invoke, 0))
+    arguments.set(2, LLVMConstNull(backend.pointerType))
+    arguments.set(3, LLVMConstInt(backend.i64Type, 0, 0))
+    val attempt = LLVMBuildCall2(
+        backend.builder, LLVMGlobalGetValueType(indirect), indirect,
+        arguments.pointer(), 4, ""
+    )
+    arguments.drop()
+    bootstrapLlvmAddSret(backend, attempt, true)
+    LLVMBuildRet(backend.builder, LLVMConstInt(result, 0, 0))
+    LLVMPositionBuilderAtEnd(backend.builder, abandoned)
+    LLVMBuildRet(backend.builder, LLVMConstInt(result, 1, 0))
+    return
+}
