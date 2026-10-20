@@ -7,6 +7,7 @@ import "abla/memory"
 import "abla/net"
 import "abla/sys/linux/process"
 import "abla/text"
+import "abla/unsafe/memory"
 
 class HttpEventServerOptions(
     val maximumConnections: int,
@@ -312,6 +313,14 @@ fun httpEventResponse(
     if (response.body.size >= gzipMinimumBytes) {
         encoded = httpGzipResponse(request, response, gzipMinimumBytes)
     }
+    if (ablaAtCompileTime()) httpEventResponsePortable(request, encoded, keepAlive)
+    else httpEventResponseNative(request, encoded, keepAlive)
+}
+
+@noinline
+fun httpEventResponsePortable(
+    request: HttpRequest, encoded: HttpResponse, keepAlive: bool
+): string {
     var output = "HTTP/1.1 ${encoded.status} ${httpStatusReason(encoded.status)}\r\n"
     var hasLength = false
     var index = 0
@@ -332,6 +341,63 @@ fun httpEventResponse(
     output = "$output\r\n"
     if (request.method != "HEAD") output = "$output${encoded.body}"
     output
+}
+
+// Bounds-check every copy even though the capacity is computed first.
+trusted fun httpEventResponseCopy(
+    address: int, capacity: int, offset: int, value: string
+): int {
+    if (offset < 0 || offset > capacity || value.size > capacity - offset) return -1
+    ablaUnsafeCopyMemory(address + offset, ablaUnsafeStringAddress(value), value.size)
+    offset + value.size
+}
+
+// Serialize into one exact-size allocation instead of constructing a chain
+// of temporary strings and flattening its ropes at the socket boundary.
+trusted fun httpEventResponseNative(
+    request: HttpRequest, encoded: HttpResponse, keepAlive: bool
+): string {
+    val statusText = "${encoded.status}"
+    val reason = httpStatusReason(encoded.status)
+    val connection = if (keepAlive) "Connection: keep-alive\r\n" else "Connection: close\r\n"
+    val body = if (request.method == "HEAD") "" else encoded.body
+    var total = 9 + statusText.size + 1 + reason.size + 2 + connection.size + 2 + body.size
+    var hasLength = false
+    for (header in encoded.headers) {
+        if (!httpAsciiEqualInsensitive(header.name, "Connection")) {
+            total = total + header.name.size + 2 + header.value.size + 2
+            if (httpAsciiEqualInsensitive(header.name, "Content-Length")) hasLength = true
+        }
+    }
+    val addLength = !hasLength && encoded.status != 101
+    val lengthText = if (addLength) "${encoded.body.size}" else ""
+    if (addLength) total = total + 16 + lengthText.size + 2
+    val output = adoptNativeString(
+        ablaUnsafePointerAddress(ablaUnsafeAllocate(total + 1)), total
+    )
+    val address = ablaUnsafeStringAddress(output)
+    var offset = httpEventResponseCopy(address, total, 0, "HTTP/1.1 ")
+    offset = httpEventResponseCopy(address, total, offset, statusText)
+    offset = httpEventResponseCopy(address, total, offset, " ")
+    offset = httpEventResponseCopy(address, total, offset, reason)
+    offset = httpEventResponseCopy(address, total, offset, "\r\n")
+    for (header in encoded.headers) {
+        if (!httpAsciiEqualInsensitive(header.name, "Connection")) {
+            offset = httpEventResponseCopy(address, total, offset, header.name)
+            offset = httpEventResponseCopy(address, total, offset, ": ")
+            offset = httpEventResponseCopy(address, total, offset, header.value)
+            offset = httpEventResponseCopy(address, total, offset, "\r\n")
+        }
+    }
+    offset = httpEventResponseCopy(address, total, offset, connection)
+    if (addLength) {
+        offset = httpEventResponseCopy(address, total, offset, "Content-Length: ")
+        offset = httpEventResponseCopy(address, total, offset, lengthText)
+        offset = httpEventResponseCopy(address, total, offset, "\r\n")
+    }
+    offset = httpEventResponseCopy(address, total, offset, "\r\n")
+    offset = httpEventResponseCopy(address, total, offset, body)
+    if (offset == total) output else httpEventResponsePortable(request, encoded, keepAlive)
 }
 
 // Process one framed request in the caller's region. Keeping this separate
