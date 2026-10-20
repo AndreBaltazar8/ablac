@@ -704,28 +704,20 @@ trusted fun jsonParseEscapedNative(var state: JsonParserState, begin: int): stri
     ""
 }
 
-fun jsonParseEscapedString(
-    var state: JsonParserState,
-    quoteOffset: int,
-    contentBegin: int
-): string {
-    if (ablaAtCompileTime()) return jsonParseEscapedPortable(state, quoteOffset, contentBegin)
-    else {
-        if (state.errorCode.size == 0) {
-            val originalOffset = state.offset
-            val decoded = jsonParseEscapedNative(state, contentBegin)
-            if (state.offset != originalOffset) return decoded
-        }
-        jsonParseEscapedPortable(state, quoteOffset, contentBegin)
-    }
-}
-
 fun jsonParseStringFallback(
     var state: JsonParserState,
     quoteOffset: int,
     contentBegin: int
 ): string {
     state.offset = contentBegin
+    // Try the bounded decoder before rescanning the plain prefix. Invalid
+    // input leaves the cursor unchanged and uses the original diagnostics.
+    if (ablaAtCompileTime()) {} else {
+        if (state.errorCode.size == 0) {
+            val decoded = jsonParseEscapedNative(state, contentBegin)
+            if (state.offset != contentBegin) return decoded
+        }
+    }
     var scanning = state.errorCode.size == 0
     var closed = false
     while (scanning && state.offset < state.source.size) {
@@ -758,7 +750,7 @@ fun jsonParseStringFallback(
         val result = state.source.slice(contentBegin, state.offset)
         state.offset = state.offset + 1
         result
-    } else jsonParseEscapedString(
+    } else jsonParseEscapedPortable(
         state, quoteOffset, contentBegin
     )
 }
@@ -1033,13 +1025,12 @@ fun jsonParse(
 }
 
 fun jsonReaderConsume(var state: JsonParserState, expected: int): bool {
-    jsonSkipWhitespace(state)
+    val offset = ablaJsonWhitespaceEnd(state.source, state.offset)
     val matches = state.errorCode.size == 0 &&
-        state.offset < state.source.size &&
-        state.source[state.offset] == expected
-    if (matches) state.offset = state.offset + 1
-    else state.fail(
-        "unexpected_token", "unexpected token while reading JSON", state.offset
+        offset < state.source.size && state.source[offset] == expected
+    state.offset = offset + (if (matches) 1 else 0)
+    if (!matches) state.fail(
+        "unexpected_token", "unexpected token while reading JSON", offset
     )
     matches
 }
@@ -1269,6 +1260,7 @@ fun JsonObjectReader.nextExpected(name: string): bool {
 // Fastest canonical-schema lookup: compare an unescaped key directly in the
 // source buffer. Producers using this contract emit ordinary UTF-8 field
 // names; escaped spellings of the same key are deliberately rejected.
+@inline
 fun JsonObjectReader.nextExpectedRaw(name: string): bool {
     if (this.expectingValue) this.state.fail(
         "unexpected_token", "previous JSON object value was not consumed",
@@ -1280,34 +1272,63 @@ fun JsonObjectReader.nextExpectedRaw(name: string): bool {
             this.state.source, originalOffset, name, !this.first
         )
     } else -1
-    var matches = compactEnd >= 0
-    if (matches) {
+    if (compactEnd >= 0) {
         this.state.offset = compactEnd
         this.expectingValue = true
         this.first = false
+        return true
+    }
+    jsonObjectReaderExpectedRawFallback(this, name, originalOffset)
+}
+
+// Keep diagnostics outside the common constant-schema comparison, allowing
+// LLVM to specialize short literal field names without duplicating fallback code.
+@noinline
+fun jsonObjectReaderExpectedRawFallback(
+    var reader: JsonObjectReader, name: string, originalOffset: int
+): bool {
+    var compactEnd = -1
+    // Retry the raw matcher after legal separator whitespace, without
+    // allocating a key substring. Keep the original cursor for diagnostics.
+    if (compactEnd < 0 && reader.state.errorCode.size == 0) {
+        var cursor = ablaJsonWhitespaceEnd(reader.state.source, originalOffset)
+        var separator = true
+        if (!reader.first) {
+            separator = cursor < reader.state.source.size && reader.state.source[cursor] == 44
+            if (separator) cursor = ablaJsonWhitespaceEnd(reader.state.source, cursor + 1)
+        }
+        if (separator) compactEnd = ablaJsonMatchCompactObjectField(
+            reader.state.source, cursor, name, false
+        )
+    }
+    var matches = compactEnd >= 0
+    if (matches) {
+        reader.state.offset = compactEnd
+        reader.expectingValue = true
+        reader.first = false
     } else {
-        this.state.offset = originalOffset
-        if (!this.first) jsonReaderConsume(this.state, 44)
-        jsonSkipWhitespace(this.state)
+        reader.state.offset = originalOffset
+        if (!reader.first) jsonReaderConsume(reader.state, 44)
+        jsonSkipWhitespace(reader.state)
         // The fallback preserves whitespace handling and precise diagnostics.
-        matches = this.state.errorCode.size == 0 &&
-            this.state.offset < this.state.source.size &&
-            this.state.source[this.state.offset] == 34
-        if (matches) this.state.offset = this.state.offset + 1
-        val begin = this.state.offset
+        matches = reader.state.errorCode.size == 0 &&
+            reader.state.offset < reader.state.source.size &&
+            reader.state.source[reader.state.offset] == 34
+        if (matches) reader.state.offset = reader.state.offset + 1
+        val begin = reader.state.offset
         val end = begin + name.size
-        matches = matches && end < this.state.source.size &&
-            this.state.source.slice(begin, end) == name &&
-            this.state.source[end] == 34
-        if (matches) this.state.offset = end + 1
-        else if (this.state.errorCode.size == 0) this.state.fail(
+        matches = matches && end < reader.state.source.size &&
+            reader.state.source.slice(begin, end) == name &&
+            reader.state.source[end] == 34
+        if (matches) reader.state.offset = end + 1
+        else if (reader.state.errorCode.size == 0) reader.state.fail(
             "unexpected_token", "unexpected JSON object field",
-            this.state.offset
+            reader.state.offset
         )
         if (matches) {
-            jsonReaderConsume(this.state, 58)
-            this.expectingValue = true
-            this.first = false
+            jsonReaderConsume(reader.state, 58)
+            reader.expectingValue = true
+            reader.first = false
         }
     }
     matches
@@ -1330,8 +1351,7 @@ fun JsonObjectReader.readInteger(): int {
         "unexpected_token", "JSON object reader has no current value",
         this.state.offset
     )
-    jsonSkipWhitespace(this.state)
-    val begin = this.state.offset
+    val begin = ablaJsonWhitespaceEnd(this.state.source, this.state.offset)
     val fastEnd = if (this.state.errorCode.size == 0) {
         ablaJsonAvailableIntegerEnd(this.state.source, begin)
     } else -1
@@ -1339,6 +1359,7 @@ fun JsonObjectReader.readInteger(): int {
         this.state.offset = fastEnd
         value = ablaJsonIntegerValueAt(this.state.source, begin, fastEnd)
     } else {
+        this.state.offset = begin
         if (this.state.errorCode.size == 0) jsonScanNumber(this.state)
         val text = this.state.source.slice(begin, this.state.offset)
         val grammar = jsonNumberGrammar(text)
@@ -1547,8 +1568,7 @@ fun JsonArrayReader.readInteger(): int {
         "unexpected_token", "JSON array reader has no current value",
         this.state.offset
     )
-    jsonSkipWhitespace(this.state)
-    val begin = this.state.offset
+    val begin = ablaJsonWhitespaceEnd(this.state.source, this.state.offset)
     val fastEnd = if (this.state.errorCode.size == 0) {
         ablaJsonAvailableIntegerEnd(this.state.source, begin)
     } else -1
@@ -1556,6 +1576,7 @@ fun JsonArrayReader.readInteger(): int {
         this.state.offset = fastEnd
         value = ablaJsonIntegerValueAt(this.state.source, begin, fastEnd)
     } else {
+        this.state.offset = begin
         if (this.state.errorCode.size == 0) jsonScanNumber(this.state)
         val text = this.state.source.slice(begin, this.state.offset)
         val grammar = jsonNumberGrammar(text)
@@ -1744,8 +1765,26 @@ trusted fun jsonAppendEscapedNative(var output: ByteBuffer, value: string): void
     return
 }
 
+// Short plain strings need one reservation instead of three token appends.
+// Large strings retain the chunk path, avoiding an extra contents copy.
+trusted fun jsonAppendPlainNative(var output: ByteBuffer, value: string): void {
+    val length = value.size + 2
+    val destination = output.stageReserve(length)
+    ablaUnsafeStoreU8(nativePointerFromAddress(destination), 34)
+    ablaUnsafeCopyMemory(destination + 1, ablaUnsafeStringAddress(value), value.size)
+    ablaUnsafeStoreU8(nativePointerFromAddress(destination + length - 1), 34)
+    output.staged = output.staged + length
+    output.byteCount = output.byteCount + length
+    return
+}
+
 fun jsonAppendString(var output: ByteBuffer, value: string): bool {
     if (jsonStringIsPlain(value)) {
+        if (ablaAtCompileTime()) return jsonAppendStringPortable(output, value)
+        else if (value.size < BYTE_BUFFER_LARGE) {
+            jsonAppendPlainNative(output, value)
+            return true
+        }
         output.appendText("\"")
         output.appendText(value)
         output.appendText("\"")
