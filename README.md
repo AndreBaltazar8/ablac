@@ -166,7 +166,7 @@ make clean         # remove generated files
 ```
 
 On an empty build directory, `make` downloads the checksum-pinned native
-compiler for the host from `v0.2.19`, then immediately recompiles the current
+compiler for the host from `v0.2.20`, then immediately recompiles the current
 `src/` graph.
 No C++ compiler implementation or generated-C bootstrap is involved.
 
