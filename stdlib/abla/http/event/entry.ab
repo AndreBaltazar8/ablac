@@ -203,8 +203,9 @@ fun httpEventRequestLength(
 ): int {
     val headerEnd = httpHeaderEnd(input)
     var result = 0
-    if (headerEnd < 0 && input.size > maximumHeader) result = -1
-    if (headerEnd >= 0) {
+    if ((headerEnd < 0 && input.size > maximumHeader) ||
+        headerEnd > maximumHeader) result = -1
+    if (headerEnd >= 0 && headerEnd <= maximumHeader) {
         val request = httpParseRequest(input.slice(0, headerEnd))
         val transfer = request.header("Transfer-Encoding")
         if (httpHeaderTokenContains(transfer, "chunked")) {
@@ -257,8 +258,9 @@ fun httpEventFrame(
     val headerEnd = httpHeaderEnd(input)
     var length = 0
     var framedRequest: HttpRequest? = null
-    if (headerEnd < 0 && input.size > maximumHeader) length = -1
-    if (headerEnd >= 0) {
+    if ((headerEnd < 0 && input.size > maximumHeader) ||
+        headerEnd > maximumHeader) length = -1
+    if (headerEnd >= 0 && headerEnd <= maximumHeader) {
         // Parse the request head once and retain it for dispatch. The previous
         // event path parsed every complete request once to discover framing,
         // discarded that graph, then parsed the same bytes again.
@@ -396,7 +398,7 @@ fun HttpEventServer.processNoEscapeInputInRegion(
                 this.outputOffsets[slot] = written.written
                 if (!this.writeWatching[slot] &&
                     this.poller.modifyDescriptor(
-                        this.descriptors[slot], true, true
+                        this.descriptors[slot], false, true
                     )) this.writeWatching[slot] = true
             }
         }
@@ -411,7 +413,7 @@ fun HttpEventServer.processNoEscapeInputInRegion(
 
 fun HttpEventServer.processNoEscapeSlot(slot: int): void {
     var processing = slot >= 0 && slot < this.descriptors.size &&
-        this.descriptors[slot] >= 0 && this.outputs[slot] == ""
+        this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
     while (processing) {
         var consumed = 0
         var clearInput = false
@@ -429,7 +431,7 @@ fun HttpEventServer.processNoEscapeSlot(slot: int): void {
         }
         if (clearInput) this.inputs[slot] = ""
         processing = consumed > 0 &&
-            this.descriptors[slot] >= 0 && this.outputs[slot] == ""
+            this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
     }
     return
 }
@@ -440,7 +442,7 @@ fun HttpEventServer.processSlot(slot: int): void {
         return
     }
     var processing = slot >= 0 && slot < this.descriptors.size &&
-        this.descriptors[slot] >= 0 && this.outputs[slot] == ""
+        this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
     while (processing) {
         val frame = httpEventFrame(
             this.inputs[slot],
@@ -518,46 +520,70 @@ fun HttpEventServer.acceptReady(): void {
 }
 
 fun HttpEventServer.readReady(slot: int): void {
-    var reading = slot >= 0 && this.descriptors[slot] >= 0
+    var reading = slot >= 0 && this.descriptors[slot] >= 0 &&
+        this.outputs[slot].size == 0
     while (reading) {
         if (this.useNoEscapeHandler) {
             var clearInput = false
             reading = region {
-                val connection = TcpConnection(this.descriptors[slot])
-                val incoming = connection.readCompact(32768)
-                connection.descriptor = -1
+                var pending = this.inputs[slot]
+                var accumulating = true
                 var continueReading = false
-                if (incoming.size > 0) {
-                    this.lastActivityMilliseconds[slot] =
-                        linuxMonotonicMilliseconds()
-                    val input = "${this.inputs[slot]}$incoming"
-                    if (input.size >
-                        this.options.maximumHeaderBytes +
-                        this.options.maximumBodyBytes) {
-                        this.closeSlot(slot)
-                    } else {
-                        var consumed = 0
-                        var offset = 0
-                        var processing = true
-                        while (processing) {
-                            consumed = this.processNoEscapeInputInRegion(
-                                slot, input.slice(offset, input.size)
-                            )
-                            if (consumed > 0) offset = offset + consumed
-                            processing = consumed > 0 &&
-                                offset < input.size &&
-                                this.descriptors[slot] >= 0 &&
-                                this.outputs[slot] == ""
-                        }
-                        if (this.descriptors[slot] >= 0 && offset < input.size) {
-                            this.inputs[slot] = memoryPromoteString(
+                var reads = 0
+                // Keep adjacent pieces of an incomplete request in this
+                // region. Promote only when yielding back to the event loop,
+                // rather than copying every full receive into the GC heap.
+                // Bound the region even for a continuously sending client.
+                while (accumulating) {
+                    val connection = TcpConnection(this.descriptors[slot])
+                    var receiveMaximum = this.options.maximumHeaderBytes +
+                        this.options.maximumBodyBytes - pending.size + 1
+                    if (receiveMaximum > 131072) receiveMaximum = 131072
+                    val incoming = connection.readCompact(receiveMaximum)
+                    connection.descriptor = -1
+                    reads = reads + 1
+                    continueReading = false
+                    accumulating = false
+                    if (incoming.size > 0) {
+                        this.lastActivityMilliseconds[slot] =
+                            linuxMonotonicMilliseconds()
+                        val input = "$pending$incoming"
+                        if (input.size >
+                            this.options.maximumHeaderBytes +
+                            this.options.maximumBodyBytes &&
+                            httpEventRequestLength(input,
+                                this.options.maximumHeaderBytes,
+                                this.options.maximumBodyBytes) <= 0) {
+                            this.closeSlot(slot)
+                        } else {
+                            var consumed = 0
+                            var offset = 0
+                            var processing = true
+                            while (processing) {
+                                consumed = this.processNoEscapeInputInRegion(
+                                    slot, input.slice(offset, input.size)
+                                )
+                                if (consumed > 0) offset = offset + consumed
+                                processing = consumed > 0 &&
+                                    offset < input.size &&
+                                    this.descriptors[slot] >= 0 &&
+                                    this.outputs[slot].size == 0
+                            }
+                            pending = if (this.descriptors[slot] >= 0 && offset < input.size) {
                                 input.slice(offset, input.size)
-                            )
-                        } else clearInput = true
+                            } else ""
+                            accumulating = offset == 0 && consumed == 0 &&
+                                reads < 4 &&
+                                this.descriptors[slot] >= 0 &&
+                                this.outputs[slot].size == 0
+                        }
+                        continueReading = incoming.size == receiveMaximum &&
+                            this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
                     }
-                    continueReading = incoming.size == 32768 &&
-                        this.descriptors[slot] >= 0
                 }
+                if (this.descriptors[slot] >= 0 && pending.size > 0) {
+                    this.inputs[slot] = memoryPromoteString(pending)
+                } else clearInput = true
                 continueReading
             }
             if (clearInput) this.inputs[slot] = ""
@@ -575,11 +601,14 @@ fun HttpEventServer.readReady(slot: int): void {
                 )
                 if (this.inputs[slot].size >
                     this.options.maximumHeaderBytes +
-                    this.options.maximumBodyBytes) {
+                    this.options.maximumBodyBytes &&
+                    httpEventRequestLength(this.inputs[slot],
+                        this.options.maximumHeaderBytes,
+                        this.options.maximumBodyBytes) <= 0) {
                     this.closeSlot(slot)
                 } else this.processSlot(slot)
                 reading = incoming.size == 32768 &&
-                    this.descriptors[slot] >= 0
+                    this.descriptors[slot] >= 0 && this.outputs[slot].size == 0
             } else reading = false
         }
     }
@@ -616,7 +645,7 @@ fun HttpEventServer.writeReady(slot: int): void {
             }
         } else if (!this.writeWatching[slot]) {
             if (this.poller.modifyDescriptor(
-                this.descriptors[slot], true, true
+                this.descriptors[slot], false, true
             )) this.writeWatching[slot] = true
         }
     }
@@ -693,7 +722,7 @@ fun HttpEventServer.beginDrain(): void {
         var slot = 0
         while (slot < this.descriptors.size) {
             if (this.descriptors[slot] >= 0) {
-                if (this.outputs[slot] != "") this.closing[slot] = true
+                if (this.outputs[slot].size > 0) this.closing[slot] = true
                 else {
                     val length = httpEventRequestLength(
                         this.inputs[slot],

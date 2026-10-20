@@ -6,6 +6,7 @@ import "abla/bytes"
 import "abla/compiler/parser"
 import "abla/float/text"
 import "abla/text"
+import "abla/unsafe/memory"
 
 class JsonNumber(
     val text: string,
@@ -166,7 +167,9 @@ class JsonEncoder(
     var valid: bool
 )
 
-fun jsonDefaultLimits(): JsonLimits = JsonLimits(
+// These limits contain only immutable scalar fields and can be shared.
+@threadShared
+val jsonStandardLimits = JsonLimits(
     1048576,
     64,
     100000,
@@ -174,6 +177,8 @@ fun jsonDefaultLimits(): JsonLimits = JsonLimits(
     10000,
     true
 )
+
+fun jsonDefaultLimits(): JsonLimits = jsonStandardLimits
 
 // Each call's limits are its own: a caller parsing a large trusted document
 // (a map, an admin export) raises bytes, nodes and members as far as it
@@ -476,9 +481,10 @@ fun jsonHexValue(byte: int): int {
 fun jsonHexQuad(source: string, offset: int): int {
     var value = 0
     var valid = offset >= 0 && offset + 4 <= source.size
+    val packed = if (valid) ablaTextReadU32LittleEndian(source, offset) else 0
     var index = 0
     while (valid && index < 4) {
-        val digit = jsonHexValue(source[offset + index])
+        val digit = jsonHexValue((packed >> (index * 8)) & 255)
         if (digit < 0) valid = false
         if (digit >= 0) value = value * 16 + digit
         index = index + 1
@@ -486,7 +492,7 @@ fun jsonHexQuad(source: string, offset: int): int {
     if (valid) value else -1
 }
 
-fun jsonParseEscapedString(
+fun jsonParseEscapedPortable(
     var state: JsonParserState,
     quoteOffset: int,
     contentBegin: int
@@ -604,6 +610,116 @@ fun jsonParseEscapedString(
     output.toText()
 }
 
+
+// Decode a valid escaped string into one bounded allocation. On any unusual
+// or invalid input leave the parser untouched and use the precise portable
+// diagnostic path. Decoding never produces more bytes than the source span.
+trusted fun jsonParseEscapedNative(var state: JsonParserState, begin: int): string {
+    val source = state.source
+    val maximum = state.limits.maximumStringBytes
+    if (begin < 0 || begin > source.size || maximum <= 0) return ""
+    val sourceAddress = ablaUnsafeStringAddress(source)
+    var scanLimit = source.size
+    if (maximum < (source.size - begin) / 6) scanLimit = begin + maximum * 6 + 1
+    var end = begin
+    var closed = false
+    while (!closed && end < scanLimit) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceAddress + end))
+        if (byte == 34) closed = true
+        else end = end + (if (byte == 92) 2 else 1)
+    }
+    if (!closed) return ""
+    val capacity = if (end - begin < maximum) end - begin else maximum
+    val buffer = nativeByteBuffer(capacity + 1)
+    val destination = nativePointerAddress(buffer.address)
+    var offset = begin
+    var written = 0
+    var valid = true
+    while (valid && offset < end) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(sourceAddress + offset))
+        offset = offset + 1
+        if (byte == 92) {
+            if (offset >= end) valid = false
+            else {
+                val escaped = ablaUnsafeLoadU8(nativePointerFromAddress(sourceAddress + offset))
+                offset = offset + 1
+                if (escaped == 117) {
+                    var scalar = if (offset + 4 <= end) jsonHexQuad(source, offset) else -1
+                    offset = offset + 4
+                    if (scalar >= 55296 && scalar <= 56319) {
+                        if (offset + 6 <= end &&
+                            ablaUnsafeLoadU8(nativePointerFromAddress(sourceAddress + offset)) == 92 &&
+                            ablaUnsafeLoadU8(nativePointerFromAddress(sourceAddress + offset + 1)) == 117) {
+                            val low = jsonHexQuad(source, offset + 2)
+                            if (low >= 56320 && low <= 57343) {
+                                scalar = 65536 + (scalar - 55296) * 1024 + low - 56320
+                                offset = offset + 6
+                            } else valid = false
+                        } else valid = false
+                    } else if (scalar < 0 || (scalar >= 56320 && scalar <= 57343)) valid = false
+                    if (valid) {
+                        val length = if (scalar < 128) 1 else if (scalar < 2048) 2
+                            else if (scalar < 65536) 3 else 4
+                        if (written + length > capacity) valid = false
+                        if (valid) {
+                            val lead = if (length == 1) scalar
+                                else if (length == 2) 192 | (scalar >> 6)
+                                else if (length == 3) 224 | (scalar >> 12)
+                                else 240 | (scalar >> 18)
+                            ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), lead)
+                            var index = 1
+                            while (index < length) {
+                                ablaUnsafeStoreU8(nativePointerFromAddress(destination + written + index),
+                                    128 | ((scalar >> ((length - index - 1) * 6)) & 63))
+                                index = index + 1
+                            }
+                            written = written + length
+                        }
+                    }
+                } else {
+                    val decoded = if (escaped == 34 || escaped == 92 || escaped == 47) escaped
+                        else if (escaped == 98) 8 else if (escaped == 102) 12
+                        else if (escaped == 110) 10 else if (escaped == 114) 13
+                        else if (escaped == 116) 9 else -1
+                    if (decoded < 0 || written >= capacity) valid = false
+                    else {
+                        ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), decoded)
+                        written = written + 1
+                    }
+                }
+            }
+        } else if (byte < 32 || written >= capacity) valid = false
+        else {
+            ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), byte)
+            written = written + 1
+        }
+    }
+    if (valid) {
+        val text = buffer.adoptString(written)
+        if (text.isValidUtf8()) {
+            state.offset = end + 1
+            return text
+        }
+    } else buffer.close()
+    ""
+}
+
+fun jsonParseEscapedString(
+    var state: JsonParserState,
+    quoteOffset: int,
+    contentBegin: int
+): string {
+    if (ablaAtCompileTime()) return jsonParseEscapedPortable(state, quoteOffset, contentBegin)
+    else {
+        if (state.errorCode.size == 0) {
+            val originalOffset = state.offset
+            val decoded = jsonParseEscapedNative(state, contentBegin)
+            if (state.offset != originalOffset) return decoded
+        }
+        jsonParseEscapedPortable(state, quoteOffset, contentBegin)
+    }
+}
+
 fun jsonParseStringFallback(
     var state: JsonParserState,
     quoteOffset: int,
@@ -648,6 +764,12 @@ fun jsonParseStringFallback(
 }
 
 fun jsonParseString(var state: JsonParserState): string {
+    // Streaming object readers leave the cursor immediately after the colon.
+    // Compact strings avoid the whitespace scan, while ordinary JSON permits
+    // whitespace before the opening quote.
+    if (state.offset < state.source.size && state.source[state.offset] != 34) {
+        jsonSkipWhitespace(state)
+    }
     val quoteOffset = state.offset
     if (state.offset < state.source.size && state.source[state.offset] == 34) {
         state.offset = state.offset + 1
@@ -1525,7 +1647,7 @@ noescape extern:"intrinsic" fun ablaJsonStringIsPlain(
 fun jsonStringIsPlain(value: string): bool =
     ablaJsonStringIsPlain(value)
 
-fun jsonAppendString(var output: ByteBuffer, value: string): bool {
+fun jsonAppendStringPortable(var output: ByteBuffer, value: string): bool {
     var offset = 0
     var valid = jsonStringIsPlain(value)
     if (valid) {
@@ -1568,6 +1690,73 @@ fun jsonAppendString(var output: ByteBuffer, value: string): bool {
         if (valid) output.appendText("\"")
     }
     valid
+}
+
+
+// Valid UTF-8 only: size once, then write the escaped bytes into one reserved
+// span. The portable writer remains the evaluator and invalid-input fallback.
+trusted fun jsonAppendEscapedNative(var output: ByteBuffer, value: string): void {
+    val size = value.size
+    val source = ablaUnsafeStringAddress(value)
+    var length = 2
+    var index = 0
+    while (index < size) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(source + index))
+        length = length + (if (byte == 34 || byte == 92 || byte == 8 ||
+            byte == 12 || byte == 10 || byte == 13 || byte == 9) 2
+            else if (byte < 32) 6 else 1)
+        index = index + 1
+    }
+    val destination = output.stageReserve(length)
+    ablaUnsafeStoreU8(nativePointerFromAddress(destination), 34)
+    var written = 1
+    index = 0
+    while (index < size) {
+        val byte = ablaUnsafeLoadU8(nativePointerFromAddress(source + index))
+        if (byte == 34 || byte == 92 || byte < 32) {
+            ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), 92)
+            written = written + 1
+            val escape = if (byte == 8) 98 else if (byte == 12) 102
+                else if (byte == 10) 110 else if (byte == 13) 114
+                else if (byte == 9) 116 else byte
+            if (byte >= 32 || escape != byte) {
+                ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), escape)
+                written = written + 1
+            } else {
+                ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), 117)
+                ablaUnsafeStoreU8(nativePointerFromAddress(destination + written + 1), 48)
+                ablaUnsafeStoreU8(nativePointerFromAddress(destination + written + 2), 48)
+                ablaUnsafeStoreU8(nativePointerFromAddress(destination + written + 3), 48 + (byte >> 4))
+                val low = byte & 15
+                ablaUnsafeStoreU8(nativePointerFromAddress(destination + written + 4),
+                    if (low < 10) 48 + low else 87 + low)
+                written = written + 5
+            }
+        } else {
+            ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), byte)
+            written = written + 1
+        }
+        index = index + 1
+    }
+    ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), 34)
+    output.staged = output.staged + length
+    output.byteCount = output.byteCount + length
+    return
+}
+
+fun jsonAppendString(var output: ByteBuffer, value: string): bool {
+    if (jsonStringIsPlain(value)) {
+        output.appendText("\"")
+        output.appendText(value)
+        output.appendText("\"")
+        return true
+    }
+    if (ablaAtCompileTime()) return jsonAppendStringPortable(output, value)
+    else {
+        if (!value.isValidUtf8()) return jsonAppendStringPortable(output, value)
+        jsonAppendEscapedNative(output, value)
+        true
+    }
 }
 
 fun jsonWriteString(var writer: JsonWriter, value: string): void {

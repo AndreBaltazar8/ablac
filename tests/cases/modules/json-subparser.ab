@@ -121,6 +121,16 @@ fun nestedStreamingJsonWorks(): bool {
     val spacedSecond = spacedArray.readInteger()
     val emptyArray = jsonArrayReader("[]")
     emptyArray.next()
+    val spacedStrings = jsonObjectReader("{ \"name\" : \n\t\"Andre\", \"roles\" : [ \"admin\", \"writer\" ] }")
+    spacedStrings.nextExpectedRaw("name")
+    val spacedName = spacedStrings.readString()
+    spacedStrings.nextExpectedRaw("roles")
+    val spacedRoles = spacedStrings.readArray()
+    spacedRoles.next()
+    val spacedRole = spacedRoles.readString()
+    spacedRoles.next()
+    val secondRole = spacedRoles.readString()
+    val spacedRolesDone = spacedRoles.finishNested()
     reader.finish() && total == 31 && itemCount == 2 && active &&
         name == "Andre" && primaryRole == "admin" && !trailing.finish() &&
         whitespace.finish() && spacedValue == 9 && compact.finish() &&
@@ -128,7 +138,74 @@ fun nestedStreamingJsonWorks(): bool {
         minimum == -9223372036854775808 && maximum == 9223372036854775807 &&
         malformedInteger.state.errorCode == "invalid_number" &&
         spacedArray.finish() && spacedFirst == 1 && spacedSecond == 2 &&
-        emptyArray.finish()
+        emptyArray.finish() && spacedStrings.finish() &&
+        spacedName == "Andre" && spacedRole == "admin" &&
+        secondRole == "writer" && spacedRolesDone
+}
+
+fun scalarBufferText(): string = jsonParse(
+    "\"\\u0000\\u007f\\u0080\\u07ff\\u0800\\ud7ff\\ue000\\uffff\\ud800\\udc00\\udbff\\udfff\""
+).value.asString()
+
+fun escapedBoundaryText(): string {
+    val output = byteBuffer()
+    for (round in 0 until 40) {
+        for (control in 0 until 32) output.appendText(byteEncode(control))
+        output.appendText("plain\"\\é🌍")
+    }
+    output.toText()
+}
+
+fun escapedDiagnosticFingerprint(): string {
+    val output = byteBuffer()
+    for (source in [
+        "\"\\ntext\"", "\"\\u0000\"", "\"\\uD800\\uDC00\"",
+        "\"\\uDBFF\\uDFFF\"", "\"\\uD800\"", "\"\\uDC00\"",
+        "\"\\uD800\\u0041\"", "\"\\u12g4\"", "\"\\u12\"",
+        "\"\\x\"", "\"\\", "\"\\nunterminated", "\"\\n\n\"",
+        "\"\\n${byteEncode(255)}\"", "\"\\n${byteEncode(192)}${byteEncode(128)}\"",
+        "\"\\nabcdefg\"", "\"\\nabcdefgh\"", "\"a\\\"b\\\\c\\/d\""
+    ]) {
+        for (maximum in [1, 8, 4096]) {
+            val result = jsonParse(source, JsonLimits(4096, 64, 10000, maximum, 100, true))
+            output.appendText("${result.succeeded}:${jsonQuote(result.value.asString())}:")
+            output.appendText("${result.error.code}:${result.error.message}:")
+            output.appendText("${result.error.byteOffset}:${result.error.line}:${result.error.column};")
+        }
+    }
+    output.toText()
+}
+
+fun escapedSpansWork(): bool {
+    val scalarText = scalarBufferText()
+    val frozenScalarText = #scalarBufferText()
+    var expectedScalars = ""
+    for (scalar in [0, 127, 128, 2047, 2048, 55295, 57344, 65535, 65536, 1114111]) {
+        expectedScalars = "$expectedScalars${utf8Encode(scalar)}"
+    }
+    val text = "prefix\" ordinary ASCII é 日本語 \n suffix\\end"
+    val encoded = jsonQuote(text)
+    val parsed = jsonParse(encoded)
+    val limit = JsonLimits(4096, 64, 10000, 8, 100, true)
+    val tooLong = jsonParse("\"\\naaaaaaaa\"", limit)
+    val exact = jsonParse("\"\\naaaaaaa\"", limit)
+    val invalid = jsonParse("\"\\ntext\\uD800rest\"")
+    val invalidUtf8 = "quote\"${byteEncode(255)}"
+    val boundaryText = escapedBoundaryText()
+    val boundaryQuoted = jsonQuote(boundaryText)
+    val boundaryReference = #jsonQuote(escapedBoundaryText())
+    val boundaryParsed = jsonParse(boundaryQuoted)
+    scalarText == expectedScalars && scalarText == frozenScalarText &&
+        escapedDiagnosticFingerprint() == #escapedDiagnosticFingerprint() &&
+        boundaryQuoted == boundaryReference && boundaryParsed.succeeded &&
+        boundaryParsed.value.asString() == boundaryText &&
+        encoded == "\"prefix\\\" ordinary ASCII é 日本語 \\n suffix\\\\end\"" &&
+        parsed.succeeded && parsed.value.asString() == text &&
+        !tooLong.succeeded && tooLong.error.code == "string_limit" &&
+        tooLong.error.byteOffset == 0 && exact.succeeded &&
+        exact.value.asString() == "\naaaaaaa" &&
+        !invalid.succeeded && invalid.error.code == "invalid_unicode" &&
+        jsonQuote(invalidUtf8) == "null"
 }
 
 fun main: int {
@@ -142,6 +219,7 @@ fun main: int {
     else if (jsonQuote("a\"b\n") != "\"a\\\"b\\n\"") 2
     else if (!streamingJsonWorks()) 3
     else if (!nestedStreamingJsonWorks()) 4
+    else if (!escapedSpansWork()) 5
     else if (frozen.getString("name") == runtime.at(1).at(1).getString("name")) {
         frozen.getInt("number") + runtime.getInt("number") + 2
     } else 0

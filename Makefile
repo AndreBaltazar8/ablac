@@ -229,6 +229,7 @@ test: ablac
 	tools/test-structured-type-reflection.sh $(COMPILER)
 	tools/test-target-descriptors.sh $(COMPILER)
 	tools/test-text-unicode.sh $(COMPILER)
+	tools/test-json-native-paths.sh $(COMPILER)
 	tools/test-transactional-native-output.sh $(COMPILER)
 	tools/test-typed-subparser-inspection.sh $(COMPILER)
 	tools/test-unsafe-boundary.sh $(COMPILER)

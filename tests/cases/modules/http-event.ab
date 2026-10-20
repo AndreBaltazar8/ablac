@@ -54,7 +54,7 @@ fun eventBodyClient(link: Mutex<EventLink>): int {
     }
     var splitPayload = "0123456789abcdef"
     var splitIteration = 0
-    while (splitIteration < 10) {
+    while (splitIteration < 12) {
         splitPayload = "$splitPayload$splitPayload"
         splitIteration = splitIteration + 1
     }
@@ -82,10 +82,11 @@ fun eventBodyClient(link: Mutex<EventLink>): int {
     if (textContains(response, splitPayload)) 0 else 2
 }
 
-fun eventBodyAcrossReads(): bool {
+fun eventBodyAcrossReads(noEscape: bool = false): bool {
     val router = httpRouter()
     router.post("/body", eventBodyHandler)
-    val server = httpEventServer(router, ipv4Loopback(0))
+    val server = if (noEscape) httpEventServerNoEscapeHandler(eventBodyHandler, ipv4Loopback(0))
+        else httpEventServer(router, ipv4Loopback(0))
     val link = eventLink(server.listener.localPort())
     val forClient = link.clone()
     val client = thread { eventBodyClient(forClient) }
@@ -176,10 +177,11 @@ fun eventBackpressureClient(link: Mutex<EventLink>): int {
         textContains(response, "Connection: close")) 0 else 2
 }
 
-fun eventBackpressure(): bool {
+fun eventBackpressure(noEscape: bool = false): bool {
     val router = httpRouter()
     router.get("/large", eventLarge)
-    val server = httpEventServer(router, ipv4Loopback(0))
+    val server = if (noEscape) httpEventServerNoEscapeHandler(eventLarge, ipv4Loopback(0))
+        else httpEventServer(router, ipv4Loopback(0))
     val link = eventLink(server.listener.localPort())
     val forClient = link.clone()
     val client = thread { eventBackpressureClient(forClient) }
@@ -194,11 +196,16 @@ fun eventBackpressure(): bool {
     val status = await client
     server.stop()
     server.drain()
-    sendBufferSet && writeInterestEnabled && status == 0 &&
+    val succeeded = sendBufferSet && writeInterestEnabled && status == 0 &&
         server.activeConnections() == 0
+    if (!succeeded) linuxWriteStandardError("backpressure noEscape=$noEscape send=$sendBufferSet interest=$writeInterestEnabled status=$status active=${server.activeConnections()}\n")
+    succeeded
 }
 
 fun main: int {
+    val oversizedHead = "GET / HTTP/1.1\r\nHost: local\r\n\r\n"
+    if (httpEventFrame(oversizedHead, 8, 100).length != -1 ||
+        httpEventRequestLength(oversizedHead, 8, 100) != -1) return 8
     val reusable = reusableEventListeners()
     val router = httpRouter()
     router.get("/one", eventOne)
@@ -212,7 +219,12 @@ fun main: int {
     val status = await client
     server.stop()
     val drained = server.drain()
-    if (reusable && status == 0 && drained == 0 && server.stopped &&
-        server.activeConnections() == 0 && eventBackpressure() &&
-        eventBodyAcrossReads()) 42 else 1
+    if (!reusable) 1
+    else if (status != 0) 2
+    else if (drained != 0 || !server.stopped || server.activeConnections() != 0) 3
+    else if (!eventBackpressure()) 4
+    else if (!eventBodyAcrossReads()) 5
+    else if (!eventBackpressure(true)) 6
+    else if (!eventBodyAcrossReads(true)) 7
+    else 42
 }
