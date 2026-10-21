@@ -102,6 +102,7 @@ fails, never reporting a change it then drops.
 | `replaceFunctionBody(function, source)`, `addFunctionAnnotation(function, name)` | change the program, from a transform |
 | `extensionFields(type)`, `fieldsOf(type, includeExtensions)`, `addExtensionField(type, name, fieldType, initial, mutable)`, `removeExtensionField(type, name)` | a class's [extension fields](#extension-fields) |
 | `conformances(type)`, `conformsTo(type, interface)`, `implementers(interface)`, `witness(type, interface)`, `declareInterface(name, members, parents)`, `addConformance(type, interface, members)` | [interfaces](#interfaces) and the classes conforming to them |
+| `fieldIsDelegated(type, name)`, `fieldDelegateType(type, name)` | whether a class's property is [delegated](language.md#delegated-class-properties), and its delegate's type |
 | `function(name)`, `reference(handle)` | a `FunctionReference`, for building other programs |
 | `newModule(name)` | an `IndependentModule`: a separate program built from chosen functions ([below](#independent-modules-and-declaration-blocks)) |
 | `buildProgram(...)`, `defineTarget(...)`, `contributeArtifactRoot(...)` | [programmable builds](programmable-builds.md) |
@@ -209,6 +210,7 @@ fun main {
 |---|---|
 | `compilerFindClass(name)` | a class handle, or `-1` |
 | `compilerClassFieldCount`, `compilerClassFieldName`, `compilerClassFieldType`, `compilerClassFieldIsMutable`, `compilerClassFieldTypeHandle` | the constructor properties, in order |
+| `compilerClassFieldIsDelegated`, `compilerClassFieldDelegateType` | whether a constructor property is [delegated](language.md#delegated-class-properties), and its delegate's type (`compilerClassFieldType` is the type it reads as) |
 | `compilerFindType(spelling)` | a type handle |
 | `compilerTypeName`, `compilerTypeKind` | the canonical spelling (`array:i64`, `nullable:string`) and its kind: `primitive`, `nominal` (classes and named types), `nullable`, `array`, `shared`, `weak`, `mutex`, `borrow`, `function`, `function.mutable`, `function.once` or `pointer` |
 | `compilerTypeIsNullable`, `compilerTypeIsAffine` | flags |

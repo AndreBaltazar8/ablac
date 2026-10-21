@@ -1458,7 +1458,8 @@ fun main {
   and naming it is `E_NAMED_ARGUMENT_DELEGATED`. Its `by` expression runs at
   each construction, in parameter order, like a default, so it may read the
   parameters before it: `class Account(val start: int, var balance: int by
-  Counted(start))`.
+  Counted(start))`. It may not read itself, a later parameter, an earlier
+  delegated property or `this` (`E_DELEGATE_INITIALIZER_SCOPE`).
 - **Access.** `obj.name` calls `getValue()`, `obj.name = v` calls
   `setValue(v)` and is worth `v`, and `obj.name += v` is one of each, as for
   a delegated local. Inside the class's methods (and through `this` in its
@@ -1476,6 +1477,12 @@ fun main {
   rules: a `resource class` delegate makes its class affine (declare the class
   `resource class`), and it is dropped with the object or when replaced.
 - **Under `#`.** Everything above behaves the same in compile-time code.
+- **Reflection.** `compiler.fieldsOf(type)` lists a delegated property with
+  the class's other properties; `compiler.fieldIsDelegated(type, name)` tells
+  it apart and `compiler.fieldDelegateType(type, name)` is its delegate's type
+  ([compiler-api.md](compiler-api.md#class-and-type-reflection)).
+- An [extension field](#extension-fields) can't be delegated
+  (`field.extension-delegate`).
 
 ### At compile time
 
@@ -1528,6 +1535,7 @@ fun main {
 | `E_DELEGATE_AFFINE_VALUE` | `getValue()` returns an owned affine value |
 | `E_DELEGATE_BORROW_CONFLICT` | The delegate is replaced while a borrow of it from `^name` is still used |
 | `E_NAMED_ARGUMENT_DELEGATED` | A constructor argument names a delegated property |
+| `E_DELEGATE_INITIALIZER_SCOPE` | A delegated property's `by` reads itself, a later parameter, an earlier delegated property or `this` |
 | `E_PARSE_DELEGATED_PARAMETER` | `by` on a function's parameter |
 
 ## Overloads and operator functions

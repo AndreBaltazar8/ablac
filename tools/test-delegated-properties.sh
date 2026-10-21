@@ -34,6 +34,10 @@ fixtures=(
     invalid-delegated-property-projection
     invalid-delegated-property-argument
     invalid-delegated-property-parameter
+    invalid-delegated-property-later
+    invalid-delegated-property-self
+    invalid-delegated-property-this
+    invalid-delegated-extension-field
 )
 diagnostics=(
     E_DELEGATE_GETTER_MISSING
@@ -44,7 +48,14 @@ diagnostics=(
     E_NOT_DELEGATED
     E_NAMED_ARGUMENT_DELEGATED
     E_PARSE_DELEGATED_PARAMETER
+    E_DELEGATE_INITIALIZER_SCOPE
+    E_DELEGATE_INITIALIZER_SCOPE
+    E_DELEGATE_INITIALIZER_SCOPE
+    field.extension-delegate:Point.label
 )
+# The plain code a misplaced `by` leaves may report more; the others report
+# their diagnostic alone.
+alone=(1 1 1 1 1 1 1 1 0 0 0 1)
 
 index=0
 while [[ $index -lt ${#fixtures[@]} ]]; do
@@ -60,7 +71,8 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     set -e
     # One diagnosis each: the plain code it becomes reports nothing more.
     errors=$(grep -c '^error\[' "$output.err" || true)
-    if [[ $result -ne 1 ]] || ! grep -Fq "$expected" "$output.err" || [[ $errors -ne 1 ]]; then
+    if [[ $result -ne 1 ]] || ! grep -Fq "$expected" "$output.err" ||
+        [[ ${alone[$index]} -eq 1 && $errors -ne 1 ]]; then
         printf 'delegated properties: %s did not report %s alone\n' \
             "$fixture" "$expected" >&2
         sed -n '1,80p' "$output.err" >&2

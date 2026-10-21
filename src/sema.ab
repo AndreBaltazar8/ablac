@@ -1374,6 +1374,34 @@ fun bootstrapIsDelegatedProperty(declaration: BootstrapDeclaration, index: int):
     declaration.kind == "class" && index < declaration.parameterDefaults.size &&
         declaration.parameterDefaults[index].kind == "delegate.initializer"
 
+// After the rewrite (delegated_properties.ab), a delegated property's default
+// is "delegate.field": its `by` expression and its type (what it reads as),
+// kept for reflection. Its field is then an ordinary one.
+fun bootstrapIsRewrittenDelegatedProperty(declaration: BootstrapDeclaration, index: int): bool =
+    declaration.kind == "class" && index < declaration.parameterDefaults.size &&
+        declaration.parameterDefaults[index].kind == "delegate.field"
+
+fun bootstrapIsAnyDelegatedProperty(declaration: BootstrapDeclaration, index: int): bool =
+    bootstrapIsDelegatedProperty(declaration, index) ||
+        bootstrapIsRewrittenDelegatedProperty(declaration, index)
+
+/** A delegated property's type (what it reads as), before or after the
+ *  rewrite; "inferred" before it when it isn't written. */
+fun bootstrapDelegatedPropertyType(declaration: BootstrapDeclaration, index: int): string {
+    val initializer = declaration.parameterDefaults[index]
+    if (initializer.children.size < 2) return "unknown"
+    val type = initializer.children[1].text
+    if (type == "inferred") type else bootstrapNormalizeType(type)
+}
+
+fun bootstrapHasAnyDelegatedProperty(declaration: BootstrapDeclaration): bool {
+    if (declaration.kind != "class") return false
+    for (fallback in declaration.parameterDefaults) {
+        if (fallback.kind == "delegate.initializer" || fallback.kind == "delegate.field") return true
+    }
+    false
+}
+
 fun bootstrapHasDelegatedProperty(declaration: BootstrapDeclaration): bool {
     if (declaration.kind != "class") return false
     for (fallback in declaration.parameterDefaults) {
@@ -6647,6 +6675,10 @@ class BootstrapAnalyzer(
             code.slice(0, 23) == "delegate.type-mismatch:") {
             this.diagnostics =
                 "${this.diagnostics}error[E_DELEGATE_TYPE_MISMATCH]: ${code.slice(23, code.size)}\n"
+        } else if (code.size >= 27 &&
+            code.slice(0, 27) == "delegate.initializer-scope:") {
+            this.diagnostics =
+                "${this.diagnostics}error[E_DELEGATE_INITIALIZER_SCOPE]: ${code.slice(27, code.size)}\n"
         } else if (code == "delegate.move-projection") {
             this.diagnostics =
                 "${this.diagnostics}error[E_DELEGATE_MOVE_PROJECTION]: a delegate projection cannot be consumed with `move`\n"
@@ -7514,6 +7546,11 @@ class BootstrapAnalyzer(
         // Its diagnostics point at the `by`.
         this.inferBegin = declaration.parameterDefaults[index].begin
         this.inferSource = declaration.sourceIdentity
+        if (declaration.parameterDefaults[index].children.size > 0) {
+            this.checkDelegatedInitializerScope(
+                declaration, index, declaration.parameterDefaults[index].children[0], key
+            )
+        }
         val type = this.delegatedInitializerType(declaration.parameterDefaults[index], key)
         this.keepDelegatedFailures(before)
         this.currentScope = savedScope
@@ -7521,6 +7558,42 @@ class BootstrapAnalyzer(
         this.currentSourceIdentity = savedSource
         this.delegatedFieldTypes[entry] = type
         type
+    }
+
+    /** A delegated property's `by` runs at construction, after the parameters
+     *  before it: it may not read itself, a later parameter, an earlier
+     *  delegated property (its field holds the delegate) or `this`. */
+    fun checkDelegatedInitializerScope(
+        declaration: BootstrapDeclaration,
+        index: int,
+        expression: BootstrapExpression,
+        key: string
+    ): void {
+        if (expression.kind == "identifier") {
+            var reason = if (expression.text == "this") "`this`, which isn't made yet" else ""
+            var parameter = 0
+            while (reason == "" && parameter < declaration.parameters.size) {
+                if (declaration.parameters[parameter] == expression.text) {
+                    if (parameter == index) reason = "`${expression.text}` itself"
+                    else if (parameter > index) {
+                        reason = "`${expression.text}`, a later parameter"
+                    } else if (bootstrapIsDelegatedProperty(declaration, parameter)) {
+                        reason = "`${expression.text}`, a delegated property"
+                    }
+                }
+                parameter = parameter + 1
+            }
+            if (reason != "") {
+                this.inferBegin = expression.begin
+                this.fail(
+                    "delegate.initializer-scope:the `by` of `$key` reads $reason: it may read only the parameters before it"
+                )
+            }
+        }
+        for (child in expression.children) {
+            this.checkDelegatedInitializerScope(declaration, index, child, key)
+        }
+        return
     }
 
     /** Keeps the delegate diagnostics reported since `before` for the
@@ -7594,7 +7667,7 @@ class BootstrapAnalyzer(
             this.fail("field.extension-default:$name")
         }
         if (declaration.expression.kind == "delegate.initializer") {
-            this.fail("field.extension-delegate:$name")
+            this.fail("field.extension-delegate:$name@${declaration.expression.begin}")
         }
         val ownerIndex = this.typeDeclarations.find(declaration.extensionOwner)
         val owner = if (ownerIndex >= 0) this.declarations[ownerIndex]
