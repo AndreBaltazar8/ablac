@@ -712,49 +712,16 @@ fun jsonParseStringFallback(
     contentBegin: int
 ): string {
     state.offset = contentBegin
-    // Try the bounded decoder before rescanning the plain prefix. Invalid
-    // input leaves the cursor unchanged and uses the original diagnostics.
+    // The bounded decoder takes every valid string. Anything it refuses
+    // (invalid input, a string over the limit) leaves the cursor unchanged
+    // and goes to the portable decoder for its precise diagnostics.
     if (ablaAtCompileTime()) {} else {
         if (state.errorCode.size == 0) {
             val decoded = jsonParseEscapedNative(state, contentBegin)
             if (state.offset != contentBegin) return decoded
         }
     }
-    var scanning = state.errorCode.size == 0
-    var closed = false
-    while (scanning && state.offset < state.source.size) {
-        val byte = state.source[state.offset]
-        if (byte == 34) {
-            closed = true
-            scanning = false
-        } else if (byte == 92 || byte < 32) scanning = false
-        else if (byte < 128) state.offset = state.offset + 1
-        else {
-            val length = utf8SequenceLength(byte)
-            if (!utf8SequenceValid(state.source, state.offset, length)) {
-                state.fail(
-                    "invalid_unicode", "invalid UTF-8 in JSON string",
-                    state.offset
-                )
-                scanning = false
-            } else state.offset = state.offset + length
-        }
-        if (state.errorCode.size == 0 &&
-            state.offset - contentBegin > state.limits.maximumStringBytes) {
-            state.fail(
-                "string_limit", "JSON string exceeds configured limit",
-                quoteOffset
-            )
-            scanning = false
-        }
-    }
-    if (closed && state.errorCode.size == 0) {
-        val result = state.source.slice(contentBegin, state.offset)
-        state.offset = state.offset + 1
-        result
-    } else jsonParseEscapedPortable(
-        state, quoteOffset, contentBegin
-    )
+    jsonParseEscapedPortable(state, quoteOffset, contentBegin)
 }
 
 fun jsonParseString(var state: JsonParserState): string {
@@ -1721,7 +1688,7 @@ fun jsonAppendStringPortable(var output: ByteBuffer, value: string): bool {
 
 
 // Valid UTF-8 only: size once, then write the escaped bytes into one reserved
-// span. The portable writer remains the evaluator and invalid-input fallback.
+// span. The portable writer is the evaluator's; it is not in a runtime build.
 @noinline
 trusted fun jsonAppendEscapedNative(var output: ByteBuffer, value: string): void {
     val size = value.size
@@ -1799,7 +1766,9 @@ fun jsonAppendString(var output: ByteBuffer, value: string): bool {
     }
     if (ablaAtCompileTime()) return jsonAppendStringPortable(output, value)
     else {
-        if (!value.isValidUtf8()) return jsonAppendStringPortable(output, value)
+        // Every caller marks its writer invalid on false; nothing reads the
+        // partial output, so invalid UTF-8 needs no portable rewrite.
+        if (!value.isValidUtf8()) return false
         jsonAppendEscapedNative(output, value)
         true
     }
