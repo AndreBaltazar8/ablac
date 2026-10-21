@@ -28,18 +28,20 @@ fun main {
     println("${sqrt(2.0)} ${pow(2.0, 10.0)} ${floor(-1.5)} ${ceil(-1.5)}")
     println("${sin(mathPi / 2.0)} ${atan2(1.0, 1.0) == mathQuarterPi} ${hypot(3.0, 4.0)}")
     println("${exp(1.0) == mathE} ${log(mathE)} ${lerp(0.0, 10.0, 0.25)} ${roundEven(2.5)}")
+    println("${1.0 / fmin(0.0, -0.0)} ${fmax(-1.0, 0.0 / 0.0)}")
 }
 // output:
 // 3 7 10
 // 1.4142135623730951 1024 -2 -1
 // 1 true 5
 // true 1 2.5 2
+// -Infinity NaN
 ```
 
 | Function | Notes |
 |---|---|
 | `min(a, b)`, `max(a, b)`, `clamp(value, minimum, maximum)` | `int` |
-| `fmin`, `fmax`, `fclamp`, `fabs` | the `f64` versions |
+| `fmin`, `fmax`, `fclamp`, `fabs` | the `f64` versions; `fmin` and `fmax` are IEEE 754 minimum and maximum: NaN if either argument is NaN, and `-0.0` below `0.0` |
 | `sqrt`, `pow(x, y)`, `exp`, `log` | `log` is the natural logarithm |
 | `sin`, `cos`, `tan`, `atan`, `atan2(y, x)` | radians |
 | `floor`, `ceil`, `trunc`, `roundEven` | `roundEven` rounds halves to even; there is no other rounding mode |
