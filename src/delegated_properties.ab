@@ -1,0 +1,248 @@
+// Delegated class properties: `class Account(var balance: int by TVar(0))`.
+//
+// The property's field holds the delegate. Its `by` expression is the field's
+// value at construction, filled in at each constructor call like a default
+// (module.ab's named-argument normalizer; the property takes no argument).
+// Before the build's semantic analysis, a probe analysis types the program
+// (sema.ab reads a delegated property as its getter's type) and records each
+// access of one, which is then rewritten into plain code:
+//
+//   account.balance            account.balance.getValue()
+//   account.balance = v        { val t = v; account.balance.setValue(t); t }
+//   account.^balance           account.balance            (the delegate)
+//   account.^balance = d       account.balance = d
+//   balance, ^balance, ...     the same through `this`, in the class's methods
+//
+// The class's parameter then has the delegate's type and a plain default, so
+// every later stage (analysis, ownership, lowering, the interpreter, `#`) sees
+// an ordinary field and ordinary calls. A program without delegated
+// properties is returned unchanged, without the probe.
+
+import "overload.ab"
+
+fun bootstrapResolveDelegatedProperties(parsed: BootstrapParseResult): BootstrapParseResult {
+    var active = false
+    for (declaration in parsed.declarations) {
+        if (bootstrapHasDelegatedProperty(declaration)) active = true
+    }
+    if (!active) return parsed
+
+    var probe = bootstrapAnalyzer(parsed, [], [], [], [], bootstrapNoOverloads(), false, false)
+    probe.analyze(parsed)
+    // Every property's type, used or not (its getter and setter are checked there).
+    val storageTypes: array<string> = []
+    for (declaration in parsed.declarations) {
+        if (bootstrapHasDelegatedProperty(declaration)) {
+            var parameter = 0
+            while (parameter < declaration.parameters.size) {
+                if (bootstrapIsDelegatedProperty(declaration, parameter)) {
+                    storageTypes.append(bootstrapDelegatedStorageType(
+                        probe.delegatedFieldType(declaration, parameter)
+                    ))
+                }
+                parameter = parameter + 1
+            }
+        }
+    }
+    val resolutions: array<BootstrapOverloadResolution> = []
+    for (rewrite in probe.delegatedRewrites) {
+        resolutions.append(BootstrapOverloadResolution(
+            rewrite.sourceIdentity, rewrite.begin, rewrite.end, rewrite.kind, rewrite.text,
+            rewrite.action, rewrite.type
+        ))
+    }
+    val index = bootstrapOverloadIndex(resolutions)
+    val declarations: array<BootstrapDeclaration> = []
+    var storage = 0
+    for (declaration in parsed.declarations) {
+        var rewritten = bootstrapDelegatedRewriteDeclaration(declaration, resolutions, index)
+        if (bootstrapHasDelegatedProperty(declaration)) {
+            val types: array<string> = []
+            val defaults: array<BootstrapExpression> = []
+            var parameter = 0
+            while (parameter < declaration.parameters.size) {
+                if (bootstrapIsDelegatedProperty(declaration, parameter)) {
+                    types.append(storageTypes[storage])
+                    storage = storage + 1
+                    val initializer = declaration.parameterDefaults[parameter]
+                    defaults.append(if (initializer.children.size > 0) initializer.children[0] else initializer)
+                } else {
+                    types.append(declaration.parameterTypes[parameter])
+                    defaults.append(
+                        if (parameter < rewritten.parameterDefaults.size) rewritten.parameterDefaults[parameter]
+                        else BootstrapExpression("missing", "", declaration.begin, declaration.begin, [])
+                    )
+                }
+                parameter = parameter + 1
+            }
+            rewritten = bootstrapDeclarationWithParameterTypes(
+                bootstrapDeclarationWithParameterDefaults(rewritten, defaults), types
+            )
+        }
+        declarations.append(rewritten)
+    }
+    val actions: array<BootstrapExpression> = []
+    for (action in parsed.actions) {
+        actions.append(bootstrapDelegatedRewrite(action, "", resolutions, index))
+    }
+    // One error per `error[` line (its source and help lines follow it).
+    var errors = 0
+    var line = 0
+    val failures = probe.delegatedFailures
+    while (line < failures.size) {
+        if (line + 6 <= failures.size && failures.slice(line, line + 6) == "error[") errors = errors + 1
+        while (line < failures.size && failures[line] != 10) line = line + 1
+        line = line + 1
+    }
+    BootstrapParseResult(
+        declarations, actions, parsed.errors + errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents,
+        "${parsed.diagnostics}${probe.delegatedFailures}"
+    )
+}
+
+fun bootstrapDeclarationWithParameterTypes(
+    declaration: BootstrapDeclaration,
+    parameterTypes: array<string>
+): BootstrapDeclaration = BootstrapDeclaration(
+    declaration.kind,
+    declaration.name,
+    declaration.begin,
+    declaration.end,
+    declaration.expression,
+    declaration.parameters,
+    parameterTypes,
+    declaration.resultType,
+    declaration.methods,
+    declaration.parameterDefaults,
+    declaration.externalLibrary,
+    declaration.parameterKinds,
+    declaration.extensionOwner,
+    declaration.isTrusted,
+    declaration.isResource,
+    declaration.isNoEscape,
+    declaration.generatedNamespace,
+    declaration.generatedOriginBegin,
+    declaration.generatedOriginEnd,
+    declaration.annotations,
+    declaration.annotationArguments,
+    declaration.annotationBegins,
+    declaration.annotationEnds,
+    declaration.sourceIdentity
+)
+
+fun bootstrapDelegatedRewriteDeclaration(
+    declaration: BootstrapDeclaration,
+    resolutions: array<BootstrapOverloadResolution>,
+    index: BootstrapOverloadIndex
+): BootstrapDeclaration {
+    var rewritten = bootstrapDeclarationWithExpression(
+        declaration,
+        bootstrapDelegatedRewrite(declaration.expression, declaration.sourceIdentity, resolutions, index)
+    )
+    if (declaration.parameterDefaults.size > 0) {
+        val defaults: array<BootstrapExpression> = []
+        for (fallback in declaration.parameterDefaults) {
+            defaults.append(bootstrapDelegatedRewrite(
+                fallback, declaration.sourceIdentity, resolutions, index
+            ))
+        }
+        rewritten = bootstrapDeclarationWithParameterDefaults(rewritten, defaults)
+    }
+    if (declaration.methods.size > 0) {
+        val methods: array<BootstrapDeclaration> = []
+        for (method in declaration.methods) {
+            methods.append(bootstrapDelegatedRewriteDeclaration(method, resolutions, index))
+        }
+        rewritten = bootstrapDeclarationWithMethods(rewritten, methods)
+    }
+    rewritten
+}
+
+fun bootstrapDelegatedNode(
+    kind: string,
+    text: string,
+    at: BootstrapExpression,
+    children: array<BootstrapExpression>
+): BootstrapExpression = BootstrapExpression(kind, text, at.begin, at.end, children)
+
+/** `expression` with every recorded delegated property access in plain code. */
+fun bootstrapDelegatedRewrite(
+    expression: BootstrapExpression,
+    source: string,
+    resolutions: array<BootstrapOverloadResolution>,
+    index: BootstrapOverloadIndex
+): BootstrapExpression {
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) {
+        children.append(bootstrapDelegatedRewrite(child, source, resolutions, index))
+    }
+    val found = index.find(bootstrapOverloadNodeKey(
+        source, expression.begin, expression.end, expression.kind, expression.text
+    ))
+    if (found < 0) {
+        return BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+    }
+    val action = resolutions[found].kind
+    val self = bootstrapDelegatedNode("identifier", "this", expression, [])
+    if (action == "read" && children.size == 1) {
+        return bootstrapDelegatedNode("member.call", "getValue", expression, [
+            bootstrapDelegatedNode("member", expression.text, expression, [children[0]])
+        ])
+    }
+    if (action == "self.read") {
+        return bootstrapDelegatedNode("member.call", "getValue", expression, [
+            bootstrapDelegatedNode("member", expression.text, expression, [self])
+        ])
+    }
+    // An assignment or replacement that was reported is its value alone.
+    if ((action == "drop.assign" || action == "drop.replace") && children.size > 0) {
+        return children[children.size - 1]
+    }
+    if (action == "project" && children.size == 1) return children[0]
+    if (action == "self.project" && children.size == 1) {
+        return bootstrapDelegatedNode("member", children[0].text, expression, [self])
+    }
+    if (action == "replace" && children.size == 2 && children[0].children.size == 1) {
+        return bootstrapDelegatedNode("member.assign", children[0].text, expression, [
+            children[0].children[0], children[1]
+        ])
+    }
+    if (action == "self.replace" && children.size == 2) {
+        return bootstrapDelegatedNode("member.assign", children[0].text, expression, [
+            self, children[1]
+        ])
+    }
+    if ((action == "assign" && children.size == 2) ||
+        (action == "self.assign" && children.size == 1)) {
+        // The value is evaluated once and is the assignment's value (what was
+        // assigned, not what the delegate kept); a receiver that isn't a place
+        // is evaluated once, first.
+        val statements: array<BootstrapExpression> = []
+        var receiver = if (action == "assign") children[0] else self
+        val stem = "__abla_delegated_${expression.begin}_${expression.end}"
+        if (!bootstrapRereadablePlace(receiver)) {
+            statements.append(bootstrapDelegatedLocal("${stem}_receiver", receiver, "inferred"))
+            receiver = bootstrapDelegatedNode("identifier", "${stem}_receiver", receiver, [])
+        }
+        val value = children[children.size - 1]
+        val type = resolutions[found].name
+        statements.append(bootstrapDelegatedLocal(
+            "${stem}_value", value, if (type == "") "inferred" else type
+        ))
+        val assigned = bootstrapDelegatedNode("identifier", "${stem}_value", value, [])
+        statements.append(bootstrapDelegatedNode("member.call", "setValue", expression, [
+            bootstrapDelegatedNode("member", expression.text, expression, [receiver]),
+            assigned
+        ]))
+        statements.append(assigned)
+        return bootstrapDelegatedNode("block", "", expression, statements)
+    }
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
+fun bootstrapDelegatedLocal(name: string, value: BootstrapExpression, type: string): BootstrapExpression =
+    BootstrapExpression("local.val", name, value.begin, value.end, [
+        value,
+        BootstrapExpression("type", type, value.begin, value.begin, [])
+    ])

@@ -58,6 +58,7 @@ only its parse errors.
 | `E_PARSE_COMPOUND_ASSIGNMENT_TARGET` | the left side of `+=` etc. contains a call ([language.md](language.md#expressions-and-operators)) |
 | `E_PARSE_TRAILING_LAMBDA_TARGET` | a trailing lambda after something that can't be called |
 | `E_PARSE_CLASS_MEMBER` | a class body contains something other than a method |
+| `E_PARSE_DELEGATED_PARAMETER` | `by` on a function's parameter, or on a constructor parameter that isn't `val`/`var`: only a class property is delegated ([delegated properties](language.md#delegated-class-properties)) |
 | `E_PARSE_RESOURCE_DECLARATION` | `resource` before something other than `class` |
 | `E_PARSE_ANNOTATION`, `E_PARSE_ANNOTATED_DECLARATION` | a duplicate annotation, or one not followed by a declaration |
 | `E_PARSE_DEFER_BODY`, `E_PARSE_REGION_BODY`, `E_PARSE_SUSPENDING_BODY` | `defer`, `region`, `generator`, `task` or `thread` without a block |
@@ -95,6 +96,7 @@ only its parse errors.
 | `when.non-exhaustive`, `when.duplicate`, `when.else-last`, `when.else-duplicate`, `when.empty` | see [control flow](language.md#control-flow) |
 | `break.outside-loop`, `continue.outside-loop`, `return.outside-function` | control transfer outside its construct |
 | `E_NAMED_ARGUMENT_UNKNOWN`, `_DUPLICATE`, `_ORDER`, `_REQUIRED`, `_TARGET`, `_ARITY` | named-argument errors ([functions](language.md#functions)) |
+| `E_NAMED_ARGUMENT_DELEGATED` | a constructor argument names a delegated property, whose delegate comes from its `by` ([delegated properties](language.md#delegated-class-properties)) |
 | `field.extension-owner:<T>` | an extension field on a type with no object to hold it: a scalar, string, array, nominal type or interface ([extension fields](language.md#extension-fields)) |
 | `field.extension-shadows:<T>.<f>` | an extension field named like a field or method of its class |
 | `field.extension-untyped:<T>.<f>`, `field.extension-default:<T>.<f>`, `field.extension-delegate:<T>.<f>` | an extension field without a type, without a default, or with a delegate |

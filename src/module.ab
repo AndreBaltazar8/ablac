@@ -763,12 +763,28 @@ class BootstrapNamedArgumentNormalizer(
             val selectedTarget = this.target(expression.text)
             if (selectedTarget >= 0 &&
                 this.declarations[selectedTarget].kind == "class" &&
-                expression.children.size <
-                    this.declarations[selectedTarget].parameters.size) {
+                (expression.children.size <
+                    this.declarations[selectedTarget].parameters.size ||
+                 bootstrapHasDelegatedProperty(this.declarations[selectedTarget]))) {
                 required = true
             }
         }
         required
+    }
+
+    // The parameter the `position`th positional argument fills: a delegated
+    // property takes no argument, so positions skip it.
+    fun positionalParameter(declaration: BootstrapDeclaration, position: int): int {
+        var remaining = position
+        var index = 0
+        while (index < declaration.parameters.size) {
+            if (!bootstrapIsDelegatedProperty(declaration, index)) {
+                if (remaining == 0) return index
+                remaining = remaining - 1
+            }
+            index = index + 1
+        }
+        declaration.parameters.size
     }
 
     fun replaceParameterReferences(
@@ -848,8 +864,9 @@ class BootstrapNamedArgumentNormalizer(
         }
         if (!normalizeCall && selectedTarget >= 0 &&
             this.declarations[selectedTarget].kind == "class" &&
-            result.children.size <
-                this.declarations[selectedTarget].parameters.size) {
+            (result.children.size <
+                this.declarations[selectedTarget].parameters.size ||
+             bootstrapHasDelegatedProperty(this.declarations[selectedTarget]))) {
             normalizeCall = true
         }
         if (normalizeCall) {
@@ -901,7 +918,7 @@ class BootstrapNamedArgumentNormalizer(
                 var argument = argumentBegin
                 while (argument < result.children.size) {
                     val supplied = result.children[argument]
-                    var selected = positional
+                    var selected = this.positionalParameter(declaration, positional)
                     var value = supplied
                     if (supplied.kind == "named.argument") {
                         namedSeen = true
@@ -914,6 +931,14 @@ class BootstrapNamedArgumentNormalizer(
                             "`${supplied.text}` is not a parameter of `${result.text}`",
                             supplied
                         )
+                        if (selected >= 0 && bootstrapIsDelegatedProperty(declaration, selected)) {
+                            this.fail(
+                                "DELEGATED",
+                                "`${supplied.text}` is a delegated property of `${result.text}`: its delegate comes from `by`, not from an argument",
+                                supplied
+                            )
+                            selected = -1
+                        }
                     } else {
                         if (namedSeen) this.fail(
                             "ORDER",
@@ -973,6 +998,11 @@ class BootstrapNamedArgumentNormalizer(
                         if (parameter < declaration.parameterDefaults.size) {
                             defaultValue = declaration.parameterDefaults[parameter]
                         }
+                        // A delegated property's field holds the delegate.
+                        if (defaultValue.kind == "delegate.initializer" &&
+                            defaultValue.children.size > 0) {
+                            defaultValue = defaultValue.children[0]
+                        }
                         if (defaultValue.kind == "missing") this.fail(
                             "REQUIRED",
                             "required parameter `${declaration.parameters[parameter]}` is missing from `${result.text}`",
@@ -1014,13 +1044,20 @@ class BootstrapNamedArgumentNormalizer(
                             )
                             val normalizedDefault = this.normalize(substituted)
                             temporaryNames[parameter] = temporary
-                            values[parameter] = BootstrapExpression(
-                                "identifier", temporary,
-                                defaultValue.begin, defaultValue.end, []
-                            )
-                            statements.append(this.local(
-                                temporary, normalizedDefault
-                            ))
+                            if (bootstrapIsDelegatedProperty(declaration, parameter)) {
+                                // The delegate goes straight into its field: it
+                                // may be a resource, which a temporary would
+                                // have to move.
+                                values[parameter] = normalizedDefault
+                            } else {
+                                values[parameter] = BootstrapExpression(
+                                    "identifier", temporary,
+                                    defaultValue.begin, defaultValue.end, []
+                                )
+                                statements.append(this.local(
+                                    temporary, normalizedDefault
+                                ))
+                            }
                         }
                     }
                     parameter = parameter + 1

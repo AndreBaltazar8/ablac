@@ -1258,8 +1258,10 @@ and stores that object. From then on, `volume` in an expression means
 - The type annotation is optional: `var volume by Clamped(40, 0, 100)` takes
   its type from `getValue()`. When it is written, `getValue()` must return
   exactly that type.
-- `by` works on local and top-level `val`/`var`, and on `compile val` /
-  `compile var`. It does not work on parameters or class properties.
+- `by` works on local and top-level `val`/`var`, on `compile val` /
+  `compile var`, and on class properties
+  ([below](#delegated-class-properties)). It does not work on a function's
+  parameters (`E_PARSE_DELEGATED_PARAMETER`).
 
 ### When the accessors run
 
@@ -1412,6 +1414,69 @@ it may return a view tied to the delegate, as in
 A top-level delegated binding is initialized in the normal top-level
 initializer order, and its delegate expression runs once.
 
+### Delegated class properties
+
+A constructor's `val` or `var` property may be delegated too:
+`var volume: int by Clamped(40, 0, 100)`. The object's field holds the
+delegate, and `mixer.volume` reads and writes through it, under the same
+contract as a delegated local.
+
+```abla
+import "abla/io"
+
+class Clamped(var current: int, val minimum: int, val maximum: int) {
+    fun getValue(): int = current
+    fun setValue(next: int): void {
+        current = if (next < minimum) minimum else if (next > maximum) maximum else next
+        return
+    }
+}
+
+class Mixer(val name: string, var volume: int by Clamped(40, 0, 100), val gain: int) {
+    fun louder(): void {
+        volume += 30               // in a method, the bare name works the same way
+        return
+    }
+    fun limit(): int = ^volume.maximum
+}
+
+fun main {
+    val mixer = Mixer("main", 3)   // `volume` takes no argument
+    mixer.volume = 140             // setValue(140): the delegate keeps 100
+    println("${mixer.name}: ${mixer.volume}, limit ${mixer.limit()}")
+    mixer.^volume = Clamped(5, 0, 10)
+    mixer.louder()
+    println("new policy: ${mixer.volume}, limit ${mixer.^volume.maximum}")
+}
+// output:
+// main: 100, limit 100
+// new policy: 10, limit 10
+```
+
+- **Construction.** A delegated property takes no constructor argument:
+  positional arguments skip it (`Mixer("main", 3)` sets `name` and `gain`),
+  and naming it is `E_NAMED_ARGUMENT_DELEGATED`. Its `by` expression runs at
+  each construction, in parameter order, like a default, so it may read the
+  parameters before it: `class Account(val start: int, var balance: int by
+  Counted(start))`.
+- **Access.** `obj.name` calls `getValue()`, `obj.name = v` calls
+  `setValue(v)` and is worth `v`, and `obj.name += v` is one of each, as for
+  a delegated local. Inside the class's methods (and through `this` in its
+  extension functions) the bare name means the same.
+- **The delegate.** `obj.^name` is the delegate object, and
+  `obj.^name = replacement` replaces it on a `var` property, with the
+  replacement's class checked and the old delegate dropped if it is a
+  resource. Inside the class's methods `^name` is the same as `this.^name`.
+  The rules and diagnostics of [`^name`](#reaching-the-delegate-name) apply,
+  and `^` after `.` on a property that isn't delegated is `E_NOT_DELEGATED`.
+- **Types.** The type annotation is optional, as on a local:
+  `var hits by Counted(0)` takes the getter's type. The delegate's getter and
+  setter are checked with the class, whether or not the property is used.
+- **Ownership.** The field's type is the delegate's class, under the usual
+  rules: a `resource class` delegate makes its class affine (declare the class
+  `resource class`), and it is dropped with the object or when replaced.
+- **Under `#`.** Everything above behaves the same in compile-time code.
+
 ### At compile time
 
 Delegated bindings behave the same under `#`, inside `compile fun`, and as
@@ -1462,6 +1527,8 @@ fun main {
 | `E_DELEGATE_MOVE_PROJECTION` | `move(^name)` |
 | `E_DELEGATE_AFFINE_VALUE` | `getValue()` returns an owned affine value |
 | `E_DELEGATE_BORROW_CONFLICT` | The delegate is replaced while a borrow of it from `^name` is still used |
+| `E_NAMED_ARGUMENT_DELEGATED` | A constructor argument names a delegated property |
+| `E_PARSE_DELEGATED_PARAMETER` | `by` on a function's parameter |
 
 ## Overloads and operator functions
 
