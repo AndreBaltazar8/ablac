@@ -1859,6 +1859,30 @@ fun bootstrapGlobalFunctionType(
     result
 }
 
+/** Whether a class's method implements an interface member: the same
+ *  parameter types and modes, and the same result unless the method's is
+ *  left to inference. */
+fun bootstrapConformanceSignatureMatches(
+    member: BootstrapDeclaration,
+    method: BootstrapDeclaration
+): bool {
+    if (member.parameterTypes.size != method.parameterTypes.size) return false
+    var index = 0
+    while (index < member.parameterTypes.size) {
+        if (bootstrapNormalizeType(member.parameterTypes[index]) !=
+            bootstrapNormalizeType(method.parameterTypes[index])) return false
+        val memberKind = if (index < member.parameterKinds.size)
+            member.parameterKinds[index] else "parameter"
+        val methodKind = if (index < method.parameterKinds.size)
+            method.parameterKinds[index] else "parameter"
+        if (memberKind != methodKind) return false
+        index = index + 1
+    }
+    method.resultType == "inferred" ||
+        bootstrapNormalizeType(member.resultType) ==
+            bootstrapNormalizeType(method.resultType)
+}
+
 fun bootstrapTypesCompatible(expected: string, actual: string): bool {
     var compatible = expected == actual || expected == "unknown" ||
         actual == "unknown" || actual == "never" || expected == "any"
@@ -2399,6 +2423,16 @@ fun bootstrapSemanticHelp(code: string): string {
     when (code.slice(0, colon)) {
         "library.program-global" ->
             "the standard library reads only its own globals, never a program's: this name is the library's local or a missing declaration"
+        "interface.missing-member" ->
+            "the class declares the interface but has no method of this name; add it (or give the interface member a default body)"
+        "interface.member-signature" ->
+            "the class's method of this name must take the interface member's parameter types and modes and return its result type"
+        "interface.unknown" ->
+            "a class conforms only to interfaces; this name isn't one"
+        "interface.resource-into-plain" ->
+            "a plain interface's values copy freely, so a resource class can't conform to one"
+        "interface.inheritance" ->
+            "an interface extending another (`interface Solid : Shape`) is not supported yet"
         "threadShared.library" ->
             "`@threadShared` is the standard library's reviewed promise that a global never changes once built; a program shares one between threads through Shared<T> or Mutex<T>"
         "thread.shared-global" ->
@@ -5791,7 +5825,128 @@ class BootstrapAnalyzer(
                 compatible = bootstrapTypesCompatible(expected, underlying)
             }
         }
+        if (!compatible) compatible = this.upcastsToInterface(expected, actual)
         compatible
+    }
+
+    /** bootstrapTypesCompatible, plus the class-to-interface upcast. */
+    fun typesOrUpcast(expected: string, actual: string): bool =
+        bootstrapTypesCompatible(expected, actual) ||
+            this.upcastsToInterface(expected, actual)
+
+    /** The interface declaration named `name`, or -1. */
+    fun interfaceDeclaration(name: string): int {
+        val found = this.typeDeclarations.find(name)
+        if (found >= 0 && this.declarations[found].kind == "interface" &&
+            this.declarations[found].name == name) found
+        else -1
+    }
+
+    /** Whether the class `type` declares that it conforms to `interfaceName`. */
+    fun conformsTo(type: string, interfaceName: string): bool {
+        if (this.interfaceDeclaration(interfaceName) < 0) return false
+        val found = this.typeDeclarations.find(type)
+        if (found < 0) return false
+        val declaration = this.declarations[found]
+        if (declaration.kind != "class" || declaration.name != type) return false
+        for (conformance in declaration.conformances) {
+            if (bootstrapNormalizeType(conformance) == interfaceName) return true
+        }
+        false
+    }
+
+    /** A class value where an interface it conforms to is expected (and `C?`
+     *  where `I?` is): the implicit upcast. */
+    fun upcastsToInterface(expected: string, actual: string): bool {
+        var target = expected
+        var source = actual
+        if (bootstrapIsNullableType(target)) {
+            target = bootstrapNullableElementType(target)
+            if (bootstrapIsNullableType(source)) {
+                source = bootstrapNullableElementType(source)
+            }
+        }
+        this.conformsTo(source, target)
+    }
+
+    /** A class's `: I, J`: each names an interface, once, which the class
+     *  implements (its members by name and signature, or the interface's
+     *  default bodies). An interface's own parents are not supported yet. */
+    fun validateConformances(declaration: BootstrapDeclaration): void {
+        if (declaration.kind == "interface") {
+            if (declaration.conformances.size > 0) {
+                this.failAtOffset("interface.inheritance:${declaration.name}", declaration.begin)
+            }
+            return
+        }
+        if (declaration.kind != "class") return
+        val seen: array<string> = []
+        for (written in declaration.conformances) {
+            val interfaceName = bootstrapNormalizeType(written)
+            val found = this.interfaceDeclaration(interfaceName)
+            var duplicate = false
+            for (previous in seen) {
+                if (previous == interfaceName) duplicate = true
+            }
+            seen.append(interfaceName)
+            if (found < 0) {
+                this.failAtOffset("interface.unknown:${declaration.name}:$interfaceName", declaration.begin)
+            } else if (duplicate) {
+                this.failAtOffset("interface.duplicate:${declaration.name}:$interfaceName", declaration.begin)
+            } else {
+                // A plain interface's values copy freely: no resource behind one.
+                if (declaration.isResource) {
+                    this.failAtOffset("interface.resource-into-plain:$interfaceName:${declaration.name}", declaration.begin)
+                }
+                for (member in this.declarations[found].methods) {
+                    this.validateConformanceMember(
+                        declaration, interfaceName, member
+                    )
+                }
+            }
+        }
+        return
+    }
+
+    /** fail, with the diagnostic placed at `begin` of the current source. */
+    fun failAtOffset(code: string, begin: int) {
+        val previousBegin = this.inferBegin
+        val previousSource = this.inferSource
+        this.inferBegin = begin
+        this.inferSource = this.currentSourceIdentity
+        this.fail(code)
+        this.inferBegin = previousBegin
+        this.inferSource = previousSource
+    }
+
+    /** One interface member, against the class's methods of that name. */
+    fun validateConformanceMember(
+        declaration: BootstrapDeclaration,
+        interfaceName: string,
+        member: BootstrapDeclaration
+    ): void {
+        val wanted = bootstrapDeclarationFunctionType(member)
+        var named = false
+        var matches = false
+        var methodBegin = declaration.begin
+        for (method in declaration.methods) {
+            if (method.name == member.name) {
+                named = true
+                methodBegin = method.begin
+                if (bootstrapConformanceSignatureMatches(member, method)) {
+                    matches = true
+                }
+            }
+        }
+        if (named && !matches) {
+            this.failAtOffset(
+                "interface.member-signature:$interfaceName.${member.name}:${declaration.name}:$wanted",
+                methodBegin
+            )
+        } else if (!named && member.expression.kind == "missing") {
+            this.failAtOffset("interface.missing-member:$interfaceName.${member.name}:${declaration.name}", declaration.begin)
+        }
+        return
     }
 
     fun scalarTypeUnderlying(name: string): string {
@@ -6900,7 +7055,7 @@ class BootstrapAnalyzer(
                     // An operator applies only to operands known to fit it.
                     if (expected == actual) exact = exact + 1
                     else if ((operatorOnly && (actual == "unknown" || actual == "any")) ||
-                             !bootstrapTypesCompatible(expected, actual)) fits = false
+                             !this.typesOrUpcast(expected, actual)) fits = false
                     argument = argument + 1
                 }
                 if (fits && exact > bestExact) {
@@ -9635,7 +9790,7 @@ class BootstrapAnalyzer(
                     val declaredType = bootstrapNormalizeType(
                         declaration.resultType
                     )
-                    if (!bootstrapTypesCompatible(
+                    if (!this.typesOrUpcast(
                         declaredType,
                         inferredType
                     )) this.fail("global.type:${declaration.name}")
@@ -9674,6 +9829,9 @@ class BootstrapAnalyzer(
             }
             if (bootstrapIsExtensionFieldKind(declaration.kind)) {
                 this.validateExtensionField(declaration)
+            }
+            if (declaration.kind == "class" || declaration.kind == "interface") {
+                this.validateConformances(declaration)
             }
             if (!predeclared) {
                 this.appendSymbol(BootstrapSymbol(
@@ -10486,7 +10644,7 @@ fun bootstrapInferArray(
             analyzer.fail("ownership.borrow-store:array")
         }
         if (typed) {
-            if (!bootstrapTypesCompatible(elementType, found)) analyzer.fail("array.element-type")
+            if (!analyzer.typesOrUpcast(elementType, found)) analyzer.fail("array.element-type")
         } else if (elementType == "unknown") {
             elementType = found
         } else if (elementType != found) {
@@ -10854,7 +11012,7 @@ fun bootstrapInferCallValue(
             bootstrapFunctionParameterType(calleeType, argument - 1) else "unknown"
         analyzer.contextualizeLambdaParameters(expression.children[argument], expected)
         val actual = analyzer.infer(expression.children[argument])
-        if (!bootstrapTypesCompatible(expected, actual)) {
+        if (!analyzer.typesOrUpcast(expected, actual)) {
             analyzer.fail("function.argument:value@${expression.children[argument].begin}:$expected:$actual")
         }
         if (bootstrapIsFunctionType(calleeType)) {
@@ -11095,7 +11253,8 @@ fun bootstrapInferCall(
                 expression.children[argument],
                 analyzer.regionCalls,
                 analyzer.declarations
-            )) analyzer.fail("function.argument:${expression.text}@${expression.children[argument].begin}:$expected:$actual")
+            ) &&
+                !analyzer.upcastsToInterface(expected, actual)) analyzer.fail("function.argument:${expression.text}@${expression.children[argument].begin}:$expected:$actual")
             var parameterKind = "parameter"
             if (parameterCount >= 0) {
                 parameterKind = analyzer.functionParameterKind(
@@ -11159,7 +11318,7 @@ fun bootstrapInferCall(
                 expression.children[parameter]
             )) {
                 analyzer.fail("integer.narrowing:${expression.text}@${expression.children[parameter].begin}:$expected:$actual")
-            } else if (!bootstrapTypesCompatible(expected, actual)) {
+            } else if (!analyzer.typesOrUpcast(expected, actual)) {
                 analyzer.fail("constructor.argument:${expression.text}")
             }
             if (parameter < declaration.parameterKinds.size &&
@@ -11536,7 +11695,7 @@ fun bootstrapInferMemberCall(
             if (bootstrapIsBorrowType(value)) {
                 analyzer.fail("ownership.borrow-store:append")
             }
-            if (!bootstrapTypesCompatible(
+            if (!analyzer.typesOrUpcast(
                 bootstrapArrayElementType(receiver),
                 value
             )) {
@@ -11671,7 +11830,8 @@ fun bootstrapInferMemberCall(
                 expression.children[argument],
                 analyzer.regionCalls,
                 analyzer.declarations
-            )) {
+            ) &&
+                !analyzer.upcastsToInterface(expected, actual)) {
                 analyzer.fail("method.argument:${receiver}.${expression.text}@${expression.children[argument].begin}:$expected:$actual")
             }
             if (analyzer.methodParameterKind(
@@ -11769,7 +11929,7 @@ fun bootstrapInferMemberAssign(
         analyzer.fail("ownership.borrow-store:field.${expression.text}")
     }
     if (expected == "unknown" ||
-        !bootstrapTypesCompatible(expected, actual)) {
+        !analyzer.typesOrUpcast(expected, actual)) {
         analyzer.fail("member.assign:${receiver}.${expression.text}")
     }
     analyzer.validateOwnershipTransfer(

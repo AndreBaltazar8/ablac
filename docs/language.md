@@ -652,8 +652,7 @@ written `Type<A, B>`.
 Only the built-in types take type arguments (`array`, `Map`, `Task`,
 `Shared`, the `Fn` family and the others listed above). A program can't
 declare its own generic functions or classes: `fun <T> first(...)` and
-`class Box<T>(...)` are parse errors. Like implementing interfaces, this is
-an open language-design item.
+`class Box<T>(...)` are parse errors until generics land.
 
 ### `void` and `never`
 
@@ -1026,12 +1025,55 @@ fun main {
 
 ### Interfaces
 
-`interface Name { fun member(...) }` declares a named type with method
-signatures. Today an interface is only a nominal type: there is no syntax
-for a class to implement one, and a class value is not accepted where an
-interface is expected (`function.argument:...:Shape:Square`). Interfaces are
-used as opaque handle types in compiler and library APIs. Implementing
-interfaces is an open language-design item, raised with the language owner.
+`interface Name { fun member(...): T }` declares a named type with method
+signatures. A class names the interfaces it conforms to after its fields, and
+implements each member with a method of the same name, parameter types and
+modes, and result type. A value of the class then stands wherever one of those
+interfaces is expected: as an argument, a field, an array element, a variable
+of the interface's type or a nullable one (`Square?` where `Shape?` is wanted).
+
+```abla
+import "abla/io"
+
+interface Shape {
+    fun area(): f64
+}
+
+interface Named {
+    fun name(): string
+}
+
+class Square(val side: f64) : Shape, Named {
+    fun area(): f64 = this.side * this.side
+    fun name() = "square"
+}
+
+fun count(shapes: array<Shape>): int = shapes.size
+
+fun main {
+    val shapes: array<Shape> = [Square(1.0)]
+    shapes.append(Square(3.0))
+    val named: Named = Square(2.0)
+    println("${count(shapes)}")
+}
+// output:
+// 2
+```
+
+A conformance is checked at the class: a missing member is
+`interface.missing-member:Shape.area:Square`, a method of that name with
+another signature is `interface.member-signature`, and a name that isn't an
+interface is `interface.unknown`. A class only conforms to the interfaces it
+names; matching methods alone don't make it conform. A resource class can't
+conform to a plain interface (`interface.resource-into-plain`), because plain
+interface values copy freely.
+
+> **Being built.** Calling an interface's members through an interface value,
+> default member bodies, `as?` downcasts and the compiler-API operations
+> (`declareInterface`, `addConformance`, `conformances`, `implementers`,
+> `witness`) come next. After them: `extend Square : Printable` for classes you
+> don't own, interface inheritance, `resource interface`, and
+> `sealed interface` with exhaustive `when (x) { is A -> … }`.
 
 ## Delegated bindings
 

@@ -252,6 +252,7 @@ test: ablac
 	tools/test-wasm-mvc-extension.sh $(COMPILER)
 	tools/test-initializer-evaluation.sh $(COMPILER)
 	tools/test-math-v8.sh $(COMPILER)
+	tools/test-interfaces.sh $(COMPILER)
 
 check: test self-rebuild
 
