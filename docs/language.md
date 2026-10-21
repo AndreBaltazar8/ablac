@@ -585,8 +585,8 @@ fun main {
   as `member:nullable:Node.value` or `arithmetic.type@..:nullable:i64:i64`.
 - In a `when` whose subject is a nullable `val` or parameter, the arms after
   a `null ->` arm see the non-null type.
-- There is no safe-call `?.` and no `?:` operator: check `x != null`, which
-  narrows a `val`.
+- `a?.b` and `a ?? b` handle a nullable value in one expression; see
+  [null-safe operators](#null-safe-operators).
 
 For example (an arm sharing the `null` arm's body, as in `"b", null -> ...`,
 is not narrowed):
@@ -604,6 +604,76 @@ fun main {
 }
 // output:
 // nobody, 3 letters
+```
+
+### Null-safe operators
+
+`a?.b` reads `b` from `a` only when `a` isn't `null`, and is `null`
+otherwise. `a ?? b` is `a`'s value when it isn't `null`, and `b` otherwise:
+
+```abla
+import "abla/io"
+
+class Node(val value: int, val next: Node?, val name: string?)
+
+fun Node.plus(n: int): int = this.value + n
+
+fun second(list: Node?): int = list?.next?.value ?? 0
+
+fun firstValue(node: Node?): int {
+    val value = node?.value ?? return -1   // leave the function on null
+    value * 10
+}
+
+fun main {
+    val list = Node(1, Node(2, null, "two"), null)
+    val none: Node? = null
+    println("${second(list)} ${second(none)}")
+    println("${list.next?.name?.size ?? 0} ${list.name ?? "anonymous"}")
+    println("${none?.plus(5) ?? -1} ${firstValue(list)} ${firstValue(none)}")
+}
+// output:
+// 2 0
+// 3 anonymous
+// -1 10 -1
+```
+
+- After `?.`, the rest of the postfix chain (member reads, calls, indexing,
+  further `?.`) runs only when the receiver isn't `null`, and the whole chain
+  is `null` otherwise: `a?.b.c` is `a.b.c` or `null`, and a skipped call
+  evaluates none of its arguments. Parentheses end the chain: `(a?.b).c`
+  reads `c` from a nullable value, which is `member:nullable:...`.
+- The type of `a?.chain` is the chain's type made nullable; a chain ending in
+  a `void` call is a `void` statement (`node?.close()`).
+- `a ?? b` evaluates `b` only when `a` is `null`. Its type is `a`'s non-null
+  type when `b` has that type, and nullable when `b` is nullable or `null`.
+  `b` must have `a`'s type (`null-default.type:<T>:<U>`); an integer literal
+  is an `int`, so write `i32(0)` for an `i32` default.
+- `??` groups to the right (`a ?? b ?? c` is `a ?? (b ?? c)`). It binds more
+  loosely than arithmetic and ranges and more tightly than comparisons:
+  `a ?? 1 + 2` is `a ?? (1 + 2)`, and `a ?? 0 < n` is `(a ?? 0) < n`.
+- The right side of `??` may be `return`, `break` or `continue`, which leave
+  as an `if` branch does: `val x = y ?? return`.
+- Each side is evaluated at most once, left to right. The left side must be
+  able to be `null`: `?.` on a value that can't be is `safe-call.non-null:<T>`
+  (use `.`), and `??` after one is `null-default.non-null:<T>`.
+- A line may start with `?.` or `??`, continuing the expression above.
+- `a?.b` is not a place: `a?.b = x` is `E_PARSE_ASSIGNMENT_TARGET`. Check
+  `a != null` on a `val`, then assign through `.`.
+- Ownership: `a ?? b` hands `a`'s value on, so a resource on the left must be
+  given away, as `move(t) ?? Ticket(0)` (`ownership.move-required` otherwise).
+  `a?.b` reads through a parameter or a `val` in place; any other receiver (a
+  call's result, a `var`, a field) is read once into a hidden `val`, so a
+  fresh resource is dropped after the chain, and a resource in a `var` or a
+  field can't be the receiver.
+- Both behave the same at compile time.
+
+```abla error
+fun main {
+    val count = 3
+    val shown = count ?? 0
+}
+// error: null-default.non-null:i64
 ```
 
 ### Nominal types
@@ -1597,12 +1667,13 @@ and blocks. From the tightest binding to the loosest:
 
 | Level | Operators | Notes |
 |---|---|---|
-| postfix | `f(x)`, `a.b`, `a[i]`, trailing lambda | |
+| postfix | `f(x)`, `a.b`, `a?.b`, `a[i]`, trailing lambda | `a?.b` skips the rest of the chain when `a` is `null` ([null-safe operators](#null-safe-operators)) |
 | prefix | `-` `+` `!` `~` `#` `^` `await` | `#` applies to the whole postfix chain after it; `^name.member` reaches into the delegate |
 | multiplicative | `*` `/` `%` | |
 | additive | `+` `-` | |
 | shift | `<<` `>>` `>>>` | |
 | range | `..` `until` | not chainable |
+| null default | `??` | right-associative; the right side may be `return`, `break` or `continue` |
 | comparison | `<` `<=` `>` `>=` | |
 | equality | `==` `!=` | |
 | bitwise | `&`, then `^`, then `\|` | looser than `==`, as in C |

@@ -255,6 +255,7 @@ test: ablac
 	tools/test-interfaces.sh $(COMPILER)
 	tools/test-managed-alias-files.sh $(COMPILER)
 	tools/test-delegated-properties.sh $(COMPILER)
+	tools/test-null-operators.sh $(COMPILER)
 
 check: test self-rebuild
 

@@ -2521,6 +2521,12 @@ fun bootstrapSemanticHelp(code: string): string {
             "no imported module registers this `\$name` subparser: import the module that does (for example `import \"abla/json\"` for `\$json` and `\$jsons`)"
         "generator.yield-position" ->
             "a `yield` is a statement of the generator's body: of a block, a branch of a statement `if` or `when`, or a loop body; it has no value, so it cannot be part of an expression. Nor can it be inside a `region`: while the generator is suspended its consumer runs, and what the consumer allocates would land in the region and be freed with it"
+        "null-default.non-null" ->
+            "the left side of `??` is never null, so the default is never used: drop the `?? ...`"
+        "null-default.type" ->
+            "`a ?? b` is a's non-null value or b, so b must have that type (an integer literal is an `int`: write `i32(0)` for an `i32`), or be `null`, which makes the result nullable"
+        "safe-call.non-null" ->
+            "the receiver of `?.` is never null here: use `.` (after a `?.`, the rest of the chain already runs only when the receiver is not null)"
         "integer.narrowing" ->
             "an int does not narrow implicitly where a narrower integer is expected: convert it explicitly, e.g. u8(value), which keeps the low bits; an integer literal that fits needs no conversion"
         "ownership.assignment-value" ->
@@ -6714,6 +6720,11 @@ class BootstrapAnalyzer(
         }
         val help = bootstrapSemanticHelp(code)
         if (help != "") this.diagnostics = "${this.diagnostics}help: $help\n"
+        // The hidden local of `??` or `?.` (parser.ab, nullGuard).
+        if (bootstrapTextContains(code, "__abla_null_default_")) this.diagnostics =
+            "${this.diagnostics}help: `a ?? b` takes `a` to hand it on: a resource there must be given away, as `move(a) ?? b`\n"
+        if (bootstrapTextContains(code, "__abla_safe_call_")) this.diagnostics =
+            "${this.diagnostics}help: `a?.b` keeps `a` in a hidden `val` unless it is a parameter or a `val`, so a resource there would be moved into it: read it through a parameter or a `val`\n"
         bootstrapSemanticUnit()
     }
 
@@ -13611,6 +13622,16 @@ fun bootstrapInferIf(
         val elseType = analyzer.infer(expression.children[2])
         analyzer.leaveScope(previousElseScope)
         result = bootstrapJoinTypesWith(thenType, elseType, analyzer.declarations)
+        // `a ?? b` (parser.ab, nullGuard) whose sides have no common type.
+        if (expression.text == "??" && result == "void" &&
+            thenType != "void" && elseType != "void") {
+            analyzer.inferBegin = expression.children[0].begin
+            analyzer.inferSource = analyzer.currentSourceIdentity
+            analyzer.fail(
+                "null-default.type:${bootstrapNormalizeType(thenType)}:${bootstrapNormalizeType(elseType)}"
+            )
+            result = "unknown"
+        }
     }
     result
 }
@@ -13947,6 +13968,18 @@ fun bootstrapInferComparison(
     // A borrow compares as what it borrows (`borrowed != null`).
     val left = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
     val right = bootstrapBorrowElementType(analyzer.infer(expression.children[1]))
+    // The test of `a ?? b` or `a?.b` (parser.ab, nullGuard): `a` must be
+    // able to be null.
+    if (expression.text == "??" || expression.text == "?.") {
+        if (left != "unknown" && left != "null" && !bootstrapIsNullableType(left)) {
+            analyzer.inferBegin = expression.begin
+            analyzer.inferSource = analyzer.currentSourceIdentity
+            analyzer.fail(
+                "${if (expression.text == "??") "null-default" else "safe-call"}.non-null:${bootstrapNormalizeType(left)}"
+            )
+        }
+        return "bool"
+    }
     if (!analyzer.typesCompatible(left, right) &&
         !analyzer.typesCompatible(right, left)) {
         analyzer.fail("comparison.type")

@@ -52,9 +52,9 @@ only its parse errors.
 | `E_PARSE_UNCLOSED_DELIMITER` | an unclosed `(`, `[` or `{` |
 | `E_PARSE_STRING_PART` | a malformed string or template |
 | `E_PARSE_EXTENSION_RECEIVER` | an extension's receiver type isn't followed by `.name` (e.g. an unclosed `array<int`) |
-| `E_PARSE_SAFE_CALL`, `E_PARSE_ELVIS` | Kotlin's `?.` or `?:`: Abla has neither; check `x != null` (which narrows a `val`) or write `if (x != null) x else fallback` |
+| `E_PARSE_ELVIS` | Kotlin's `?:`: Abla writes it `??` ([null-safe operators](language.md#null-safe-operators)) |
 | `E_PARSE_INVALID_ESCAPE` | an unknown backslash escape in a string, a `\x` without 2 hex digits, or a `\u` that isn't a Unicode code point ([language.md](language.md#lexical-structure)) |
-| `E_PARSE_ASSIGNMENT_TARGET` | the left side of `=` can't be assigned |
+| `E_PARSE_ASSIGNMENT_TARGET` | the left side of `=` can't be assigned (a `?.` chain is not a place) |
 | `E_PARSE_COMPOUND_ASSIGNMENT_TARGET` | the left side of `+=` etc. contains a call ([language.md](language.md#expressions-and-operators)) |
 | `E_PARSE_TRAILING_LAMBDA_TARGET` | a trailing lambda after something that can't be called |
 | `E_PARSE_CLASS_MEMBER` | a class body contains something other than a method |
@@ -77,6 +77,9 @@ only its parse errors.
 | `function.result:<f>:<declared>:<actual>`, `method.result` | the body's value doesn't match the declared result type ([language.md](language.md#void-and-never)) |
 | `return.type@<offset>:<expected>:<found>` | a `return` value doesn't match the result type; a help line says when the value is a closure that changes its captures (declare the result `FnMut(...) -> T`) |
 | `member:<Type>.<name>` | no such property or method; `member:nullable:...` means the receiver may be `null` |
+| `safe-call.non-null:<T>` | `?.` on a value that is never `null`: use `.` ([null-safe operators](language.md#null-safe-operators)) |
+| `null-default.non-null:<T>` | `??` after a value that is never `null`, so the default is never used |
+| `null-default.type:<T>:<U>` | `a ?? b` where `b`'s type isn't `a`'s non-null type `T` (an integer literal is an `int`: write `i32(0)`) |
 | `local.initializer:<name>` | an initializer doesn't match the declared type |
 | `assignment.type:<name>@<offset>` | an assigned value doesn't match the variable's type |
 | `assignment.immutable`, `global.immutable`, `field.immutable`, `member.immutable` | assigning a `val` |

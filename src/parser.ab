@@ -323,9 +323,37 @@ class BootstrapParser(
     val expansionExpressions: array<BootstrapExpression>,
     var position: int,
     var errors: int,
-    var diagnostics: string
+    var diagnostics: string,
+    // The names in scope where the parser is, innermost last, and whether
+    // each is stable (a parameter, a `val` without `by`, a `for` variable),
+    // which `?.` and `??` test in place (nullGuard). Names below
+    // bindingFloor belong to an enclosing declaration and are not seen.
+    val bindingNames: array<string>,
+    val bindingStable: array<bool>,
+    var bindingFloor: int
 ) {
     fun at(kind: string): bool = this.tokens[this.position].kind == kind
+
+    fun declareBinding(name: string, stable: bool) {
+        this.bindingNames.append(name)
+        this.bindingStable.append(stable)
+    }
+
+    fun leaveBindings(size: int) {
+        this.bindingNames.truncate(size)
+        this.bindingStable.truncate(size)
+    }
+
+    /** Whether `name` is a binding in scope that can't change, so testing it
+     *  and then reading it again reads the same value. */
+    fun stableBinding(name: string): bool {
+        var index = this.bindingNames.size
+        while (index > this.bindingFloor) {
+            index = index - 1
+            if (this.bindingNames[index] == name) return this.bindingStable[index]
+        }
+        false
+    }
 
     fun atWord(word: string): bool = this.at("identifier") &&
         bootstrapTokenText(this.source, this.tokens[this.position]) == word
@@ -425,6 +453,29 @@ class BootstrapParser(
         val before = this.position
         while (this.at("newline")) this.position = this.position + 1
         val continued = this.at(".")
+        if (!continued) this.position = before
+        continued
+    }
+
+    // `?.` continues a chain as `.` does, from the next line too.
+    fun continueSafeCall(): bool {
+        val before = this.position
+        while (this.at("newline")) this.position = this.position + 1
+        val continued = this.at("?") &&
+            this.position + 1 < this.tokens.size &&
+            this.tokens[this.position + 1].kind == "."
+        if (!continued) this.position = before
+        continued
+    }
+
+    // `??` (or Kotlin's `?:`, reported and read as `??`), from the next line too.
+    fun continueNullDefault(): bool {
+        val before = this.position
+        while (this.at("newline")) this.position = this.position + 1
+        val continued = this.at("?") &&
+            this.position + 1 < this.tokens.size &&
+            (this.tokens[this.position + 1].kind == "?" ||
+             this.tokens[this.position + 1].kind == ":")
         if (!continued) this.position = before
         continued
     }
@@ -642,10 +693,12 @@ class BootstrapParser(
             }
         } else hasArrow = hasArrow
 
+        val bindings = this.bindingNames.size
         if (hasArrow) {
             var parameter = 0
             while (parameter < parameters.size) {
                 children.append(parameters[parameter])
+                this.declareBinding(parameters[parameter].text, true)
                 parameter = parameter + 1
             }
             this.skipSeparators()
@@ -688,6 +741,7 @@ class BootstrapParser(
         }
         val end = this.tokens[this.position]
         this.expect("}")
+        this.leaveBindings(bindings)
         children.append(BootstrapExpression(
             "block",
             "",
@@ -810,6 +864,10 @@ class BootstrapParser(
             this.skipSeparators()
             initializer = this.parseExpression()
         }
+        this.declareBinding(
+            bootstrapTokenText(this.source, name),
+            localKind == "val" && initializer.kind != "delegate.initializer"
+        )
         BootstrapExpression(
             "local.$localKind",
             bootstrapTokenText(this.source, name),
@@ -830,6 +888,7 @@ class BootstrapParser(
 
     fun parseBlock(): BootstrapExpression {
         val start = this.tokens[this.position]
+        val bindings = this.bindingNames.size
         this.expect("{")
         val statements: array<BootstrapExpression> = []
         this.skipSeparators()
@@ -871,6 +930,7 @@ class BootstrapParser(
         }
         val end = this.tokens[this.position]
         this.expect("}")
+        this.leaveBindings(bindings)
         BootstrapExpression("block", "", start.begin, end.end, statements)
     }
 
@@ -947,8 +1007,10 @@ class BootstrapParser(
             start.end,
             []
         )
+        // A closer or `,` ends a bare `return` too: `f(x ?? return, y)`.
         if (!this.at("newline") && !this.at(";") &&
-            !this.at("}") && !this.at("end")) {
+            !this.at("}") && !this.at("end") && !this.at(")") &&
+            !this.at("]") && !this.at(",")) {
             value = this.parseExpression()
         }
         BootstrapExpression(
@@ -1047,7 +1109,10 @@ class BootstrapParser(
         this.skipSeparators()
         this.expect(")")
         this.skipSeparators()
+        val bindings = this.bindingNames.size
+        this.declareBinding(bootstrapTokenText(this.source, name), true)
         val body = this.parseControlBody()
+        this.leaveBindings(bindings)
         BootstrapExpression(
             "for",
             bootstrapTokenText(this.source, name),
@@ -1457,34 +1522,8 @@ class BootstrapParser(
                     )
                 }
                 more = more
-            } else if (this.at("?") &&
-                       this.position + 1 < this.tokens.size &&
-                       (this.tokens[this.position + 1].kind == "." ||
-                        this.tokens[this.position + 1].kind == ":")) {
-                // Kotlin's `?.` and `?:`: say what Abla writes instead, and
-                // read on as if they were `.` and nothing, so one mistake
-                // is one error.
-                val mark = this.tokens[this.position]
-                val next = this.tokens[this.position + 1]
-                if (next.kind == ".") {
-                    this.failAt(
-                        "SAFE_CALL",
-                        "Abla has no `?.`: check `x != null` first (that narrows a `val`), then use `.`",
-                        mark.begin,
-                        next.end
-                    )
-                    this.position = this.position + 1
-                } else {
-                    this.failAt(
-                        "ELVIS",
-                        "Abla has no `?:`: write `if (x != null) x else fallback`",
-                        mark.begin,
-                        next.end
-                    )
-                    this.position = this.position + 2
-                    this.skipSeparators()
-                    val fallback = this.parseExpression()
-                }
+            } else if (this.continueSafeCall()) {
+                expression = this.parseSafeCall(expression)
                 more = more
             } else if (this.continueMemberChain()) {
                 this.position = this.position + 1
@@ -1802,8 +1841,101 @@ class BootstrapParser(
         expression
     }
 
+    // `a ?? b` binds tighter than comparisons and looser than ranges, and
+    // groups to the right: `a ?? b ?? c` is `a ?? (b ?? c)`. The right side
+    // may also be `return`, `break` or `continue`, as an `if` branch may.
+    fun parseNullDefault(): BootstrapExpression {
+        val left = this.parseRange()
+        if (!this.continueNullDefault()) return left
+        val mark = this.tokens[this.position]
+        val next = this.tokens[this.position + 1]
+        if (next.kind == ":") this.failAt(
+            "ELVIS",
+            "Abla writes Kotlin's `?:` as `??`: `x ?? fallback`",
+            mark.begin,
+            next.end
+        )
+        this.position = this.position + 2
+        this.skipSeparators()
+        val right =
+            if (this.at("return")) this.parseReturn()
+            else if (this.at("break") || this.at("continue")) this.parseLoopControl()
+            else this.parseNullDefault()
+        // Always through a local: `present` hands its value on (a resource
+        // is moved out of it, ir.ab bootstrapIsNullDefaultResult).
+        val name = "__abla_null_default_${mark.begin}"
+        this.nullGuard("??", left, name, mark, bootstrapNullSubjectUse(name, mark), right)
+    }
+
+    // `receiver?.name…`: the rest of the chain (members, calls, indexing,
+    // further `?.`) runs on the receiver only when it is not null, and the
+    // whole chain is null otherwise, so the arguments of a skipped call are
+    // never evaluated. Parentheses end the chain: `(a?.b).c`.
+    fun parseSafeCall(receiver: BootstrapExpression): BootstrapExpression {
+        val mark = this.tokens[this.position]
+        this.position = this.position + 2
+        val member = this.tokens[this.position]
+        this.expect("identifier")
+        val name = this.nullSubjectName(receiver, mark)
+        val rest = this.parsePostfixOn(BootstrapExpression(
+            "member",
+            bootstrapTokenText(this.source, member),
+            receiver.begin,
+            member.end,
+            [bootstrapNullSubjectUse(name, mark)]
+        ))
+        this.nullGuard(
+            "?.",
+            receiver,
+            name,
+            mark,
+            rest,
+            BootstrapExpression("null", "null", mark.begin, mark.begin + 1, [])
+        )
+    }
+
+    // What the test of `?.` reads: a stable binding itself, which the chain
+    // then only reads through, else a local holding the receiver (nullGuard).
+    // The locals are named for the operator's offset, which no source name
+    // repeats.
+    fun nullSubjectName(subject: BootstrapExpression, mark: BootstrapToken): string =
+        if (subject.kind == "identifier" && this.stableBinding(subject.text)) subject.text
+        else "__abla_safe_call_${mark.begin}"
+
+    // `if (x != null) present else absent` when `?.`'s subject is a stable
+    // binding `x` (a parameter, a `val`: narrowed as written), else
+    // `{ val t = subject; if (t != null) present else absent }`, so the
+    // subject is evaluated once and `t` is narrowed in `present`. The `if`,
+    // the comparison (and the block) carry the operator as their text, for
+    // its diagnostics. Each read of the subject has a span of its own (the
+    // operator's first byte for the test, its second for `present`), as
+    // reads in source do.
+    fun nullGuard(
+        operator: string,
+        subject: BootstrapExpression,
+        name: string,
+        mark: BootstrapToken,
+        present: BootstrapExpression,
+        absent: BootstrapExpression
+    ): BootstrapExpression {
+        val direct = name == subject.text && subject.kind == "identifier"
+        val test = BootstrapExpression("!=", operator, mark.begin, mark.begin + 2, [
+            if (direct) subject
+            else BootstrapExpression("identifier", name, mark.begin, mark.begin + 1, []),
+            BootstrapExpression("null", "null", mark.begin, mark.begin + 1, [])
+        ])
+        val end = if (absent.end > present.end) absent.end else present.end
+        val choice = BootstrapExpression("if", operator, subject.begin, end, [test, present, absent])
+        if (direct) return choice
+        val local = BootstrapExpression("local.val", name, subject.begin, subject.end, [
+            subject,
+            BootstrapExpression("type", "inferred", subject.begin, subject.begin, [])
+        ])
+        BootstrapExpression("block", operator, subject.begin, end, [local, choice])
+    }
+
     fun parseComparison(): BootstrapExpression {
-        var expression = this.parseRange()
+        var expression = this.parseNullDefault()
         var more =
             this.at("<") || this.at("<=") ||
             this.at(">") || this.at(">=")
@@ -1811,7 +1943,7 @@ class BootstrapParser(
             val operation = this.tokens[this.position]
             this.position = this.position + 1
             this.skipSeparators()
-            val right = this.parseRange()
+            val right = this.parseNullDefault()
             expression = BootstrapExpression(
                 operation.kind,
                 operation.kind,
@@ -1927,7 +2059,9 @@ class BootstrapParser(
             this.position = this.position + 1
             this.skipSeparators()
             val value = this.parseExpression()
-            if (!bootstrapRereadablePlace(expression)) this.failAt(
+            // (A `?.` chain is reported once, as not assignable.)
+            if (!bootstrapRereadablePlace(expression) &&
+                !bootstrapIsSafeChain(expression)) this.failAt(
                 "COMPOUND_ASSIGNMENT_TARGET",
                 "the left side of `$kind` is evaluated twice, so it may not call anything",
                 expression.begin,
@@ -1981,7 +2115,9 @@ class BootstrapParser(
         } else {
             this.failAt(
                 "ASSIGNMENT_TARGET",
-                "left side of assignment is not assignable",
+                if (bootstrapIsSafeChain(expression))
+                    "a `?.` chain is not assignable: check `x != null` (that narrows a `val`), then assign through `.`"
+                else "left side of assignment is not assignable",
                 expression.begin,
                 expression.end
             )
@@ -2017,6 +2153,11 @@ class BootstrapParser(
 
     fun parseDeclaration(): BootstrapDeclaration {
         val begin = this.tokens[this.position].begin
+        // A declaration (one in a declaration block too) sees none of the
+        // enclosing function's locals.
+        val enclosingFloor = this.bindingFloor
+        val enclosingBindings = this.bindingNames.size
+        this.bindingFloor = enclosingBindings
         var kind = this.tokens[this.position].kind
         if (this.atWord("type")) kind = "type"
         this.position = this.position + 1
@@ -2125,6 +2266,8 @@ class BootstrapParser(
                 while (!this.at("end") && !this.at("=") && !this.at("{") &&
                        !this.at("newline")) this.position = this.position + 1
             }
+            this.declareBinding("this", true)
+            for (parameter in parameters) this.declareBinding(parameter, true)
             if (this.consume("=")) {
                 this.skipSeparators()
                 expression = this.parseExpression()
@@ -2213,6 +2356,8 @@ class BootstrapParser(
             }
             this.skipToDeclarationEnd()
         }
+        this.leaveBindings(enclosingBindings)
+        this.bindingFloor = enclosingFloor
 
         BootstrapDeclaration(
             kind,
@@ -2759,7 +2904,7 @@ fun bootstrapAppendExtensionFieldDefaults(var declarations: array<BootstrapDecla
 
 fun bootstrapParse(source: string): BootstrapParseResult {
     BootstrapParser(
-        "<memory>", source, bootstrapLex(source), [], [], [], 0, 0, ""
+        "<memory>", source, bootstrapLex(source), [], [], [], 0, 0, "", [], [], 0
     ).parse()
 }
 
@@ -2776,7 +2921,10 @@ fun bootstrapParseWithIdentity(
         [],
         0,
         0,
-        ""
+        "",
+        [],
+        [],
+        0
     ).parse()
 }
 
@@ -2873,6 +3021,14 @@ fun bootstrapSourceVisibleType(type: string): string {
     }
     "$output${type.slice(cursor, type.size)}"
 }
+
+// The read of the subject `present` starts with (parser.ab, nullGuard).
+fun bootstrapNullSubjectUse(name: string, mark: BootstrapToken): BootstrapExpression =
+    BootstrapExpression("identifier", name, mark.begin + 1, mark.begin + 2, [])
+
+// A `?.` chain (parser.ab, nullGuard), which is not a place.
+fun bootstrapIsSafeChain(expression: BootstrapExpression): bool =
+    (expression.kind == "block" || expression.kind == "if") && expression.text == "?."
 
 /** A place made only of names, literals, fields and indexes: reading it twice
  *  has no effects. */
