@@ -12,9 +12,10 @@
 | `abla/process/exit` | `exit` and `panic` |
 | `abla/process/time` | clocks and `sleep` |
 | `abla/process/supervisor` | supervised child processes with logs and process-tree termination |
+| `abla/process/metrics` | CPU time, memory, open descriptors, start time and heap of the running process |
 
 These run on Linux and macOS. They talk to the kernel directly, without
-libc. At compile time they are not available yet
+libc (`abla/process/metrics` reads macOS's numbers from its system library). At compile time they are not available yet
 ([compile-time.md](../compile-time.md#what-works-at-compile-time-today)).
 
 ## Console: `abla/io`
@@ -158,3 +159,49 @@ fun main {
 | `utcNow()` | the current date as a `UtcDate` ([dates](security-and-dates.md#dates-abladate)) |
 | `sleep(milliseconds)`, `sleepNanoseconds(nanoseconds)` | pause the thread |
 | `monotonicClock()` | an affine `MonotonicClock` that reuses its buffers, for hot loops |
+
+## Resource use: `abla/process/metrics`
+
+What a health endpoint or a metrics exporter reports about the running
+process. `abla/process` does not include it; import it on its own.
+
+```abla
+import "abla/io"
+import "abla/process/metrics"
+import "abla/process/time"
+
+fun main {
+    val metrics = processMetrics()
+    println("resident memory read: ${metrics.residentBytes > 0}")
+    println("descriptors open: ${metrics.openDescriptors >= 3}")
+    println("limit read: ${metrics.maximumDescriptors != 0}")
+    println("heap in use: ${processHeapBytes() > 0}")
+    println("started in the past: ${metrics.startTimeMilliseconds <= realtimeMilliseconds()}")
+}
+// output:
+// resident memory read: true
+// descriptors open: true
+// limit read: true
+// heap in use: true
+// started in the past: true
+```
+
+`processMetrics()` reads everything into a `ProcessMetrics`; each value also
+has its own function, which costs one system call or `/proc` read. A value
+that cannot be read is `-1`.
+
+| Field | Function | Value |
+|---|---|---|
+| `cpuUserMicroseconds`, `cpuSystemMicroseconds` | `processCpuMicroseconds()` (`[user, system]`) | CPU time in user code and in the kernel (`getrusage`) |
+| `residentBytes`, `virtualBytes` | `processResidentBytes()`, `processVirtualBytes()` | resident set and virtual size (Linux `/proc/self/status`, macOS `proc_pidinfo`) |
+| `openDescriptors` | `processOpenDescriptors()` | open file descriptors, sockets included |
+| `maximumDescriptors` | `processMaximumDescriptors()` | the soft `RLIMIT_NOFILE`, what `ulimit -n` prints; `-1` when unlimited |
+| `startTimeMilliseconds` | `processStartTimeMilliseconds()` | when the process started, in Unix milliseconds |
+| `heapBytes` | `processHeapBytes()` | bytes the Abla allocator holds: its own running count (the same as `memoryLiveBytes()` in `abla/memory`), so garbage not yet collected is included |
+
+`cpuUserSeconds()`, `cpuSystemSeconds()`, `cpuSeconds()` (both together) and
+`startTimeSeconds()` give the same numbers as `f64` seconds (print them with
+`abla/float/text`). The Linux start time has the kernel's clock-tick
+resolution (usually 10 ms); macOS's has microseconds. macOS counts a larger
+virtual size than Linux for the same program, since it reserves the shared
+library region in every process.

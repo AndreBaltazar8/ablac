@@ -262,6 +262,7 @@ test: ablac
 	tools/test-strict-imports.sh $(COMPILER)
 	tools/test-generics.sh $(COMPILER)
 	tools/test-transform-reuse.sh $(COMPILER)
+	tools/test-process-metrics.sh $(COMPILER)
 
 check: test self-rebuild
 

@@ -1,0 +1,278 @@
+// The running process's resource use, for health endpoints and metrics
+// exporters: CPU time, memory, descriptors, start time and the tracked heap.
+// One processMetrics() call reads everything; the single reads below cost
+// one system call (or one /proc file) each.
+//
+// Linux reads raw system calls and /proc without libc. macOS reads the
+// system library (getrusage, getrlimit, proc_pidinfo) behind
+// ablaHostIsMacOS(), a constant the backend folds, so the Darwin calls never
+// reach a Linux link. A value that cannot be read is -1.
+
+import "abla/float"
+import "abla/memory"
+import "abla/platform/host"
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/unsafe/memory"
+
+trusted noescape extern:"c" fun getrusage(who: i32, usage: i64*): i32
+trusted noescape extern:"c" fun getrlimit(kind: i32, limits: i64*): i32
+trusted noescape extern:"c" fun proc_pidinfo(
+    process: i32,
+    flavor: i32,
+    argument: int,
+    buffer: i64*,
+    size: i32
+): i32
+
+// proc_pidinfo for this process (Darwin).
+trusted fun processMetricsPidInfo(flavor: int, buffer: i64*, size: int): int =
+    int(proc_pidinfo(i32(linuxProcessId()), i32(flavor), 0, buffer, i32(size)))
+
+class ProcessMetrics(
+    // CPU time spent in user code and in the kernel on its behalf.
+    val cpuUserMicroseconds: int,
+    val cpuSystemMicroseconds: int,
+    // Resident set size and virtual size.
+    val residentBytes: int,
+    val virtualBytes: int,
+    // Open file descriptors (sockets included) and the soft limit on them.
+    val openDescriptors: int,
+    val maximumDescriptors: int,
+    // When the process started, in milliseconds since 1970-01-01T00:00:00Z.
+    val startTimeMilliseconds: int,
+    // Bytes the Abla allocator has handed out and not yet freed, garbage the
+    // collector has not reclaimed included.
+    val heapBytes: int
+) {
+    fun cpuUserSeconds(): f64 = f64FromInt(this.cpuUserMicroseconds) / 1000000.0
+    fun cpuSystemSeconds(): f64 = f64FromInt(this.cpuSystemMicroseconds) / 1000000.0
+    fun cpuSeconds(): f64 = f64FromInt(
+        this.cpuUserMicroseconds + this.cpuSystemMicroseconds
+    ) / 1000000.0
+    fun startTimeSeconds(): f64 = f64FromInt(this.startTimeMilliseconds) / 1000.0
+}
+
+/** Every metric in one read. */
+fun processMetrics(): ProcessMetrics {
+    val cpu = processCpuMicroseconds()
+    val memory = processMemoryBytes()
+    ProcessMetrics(
+        cpu[0], cpu[1], memory[0], memory[1],
+        processOpenDescriptors(), processMaximumDescriptors(),
+        processStartTimeMilliseconds(), processHeapBytes()
+    )
+}
+
+fun processMetricsU32(buffer: NativeByteBuffer, offset: int): int =
+    buffer.load(offset) | buffer.load(offset + 1) << 8 |
+        buffer.load(offset + 2) << 16 | buffer.load(offset + 3) << 24
+
+/**
+ * [user, system] CPU time in microseconds (getrusage RUSAGE_SELF), or
+ * [-1, -1].
+ */
+trusted fun processCpuMicroseconds(): array<int> {
+    // struct rusage starts with two struct timevals: seconds as 64 bits, then
+    // microseconds (64 bits on Linux, 32 and padding on Darwin: the low 32
+    // bits are the value on both).
+    val usage = nativeByteBuffer(144)
+    val status = if (ablaHostIsMacOS()) int(getrusage(i32(0), usage.address))
+        else linuxSyscall2(98, 0, nativePointerAddress(usage.address))
+    val result = if (status == 0) [
+        usage.loadI64(0) * 1000000 + processMetricsU32(usage, 8),
+        usage.loadI64(16) * 1000000 + processMetricsU32(usage, 24)
+    ] else [-1, -1]
+    usage.close()
+    result
+}
+
+fun processCpuUserMicroseconds(): int = processCpuMicroseconds()[0]
+
+fun processCpuSystemMicroseconds(): int = processCpuMicroseconds()[1]
+
+// The number after `name` on its line of a /proc file: "VmRSS:   1234 kB"
+// in /proc/self/status, "btime 1700000000" in /proc/stat; -1 without one.
+fun processMetricsLineNumber(text: string, name: string): int {
+    var result = -1
+    var begin = 0
+    while (result < 0 && begin < text.size) {
+        var end = begin
+        while (end < text.size && text[end] != 10) end = end + 1
+        if (end - begin > name.size &&
+            (text[begin + name.size] == 58 || text[begin + name.size] == 32) &&
+            text.slice(begin, begin + name.size) == name) {
+            var index = begin + name.size + 1
+            while (index < end && (text[index] == 32 || text[index] == 9)) {
+                index = index + 1
+            }
+            var value = 0
+            var digits = 0
+            while (index < end && text[index] >= 48 && text[index] <= 57) {
+                value = value * 10 + text[index] - 48
+                digits = digits + 1
+                index = index + 1
+            }
+            if (digits > 0) result = value
+        }
+        begin = end + 1
+    }
+    result
+}
+
+fun processMetricsKilobytes(value: int): int =
+    if (value < 0) -1 else value * 1024
+
+/** [resident, virtual] size in bytes, or -1 for one that cannot be read. */
+trusted fun processMemoryBytes(): array<int> {
+    var resident = -1
+    var virtual = -1
+    if (ablaHostIsMacOS()) {
+        // proc_pidinfo PROC_PIDTASKINFO: struct proc_taskinfo (96 bytes)
+        // begins with pti_virtual_size and pti_resident_size.
+        val info = nativeByteBuffer(96)
+        if (processMetricsPidInfo(4, info.address, 96) == 96) {
+            virtual = info.loadI64(0)
+            resident = info.loadI64(8)
+        }
+        info.close()
+    } else {
+        val status = linuxReadFile("/proc/self/status")
+        resident = processMetricsKilobytes(processMetricsLineNumber(status, "VmRSS"))
+        virtual = processMetricsKilobytes(processMetricsLineNumber(status, "VmSize"))
+    }
+    [resident, virtual]
+}
+
+fun processResidentBytes(): int = processMemoryBytes()[0]
+
+fun processVirtualBytes(): int = processMemoryBytes()[1]
+
+/** The number of open file descriptors, or -1. */
+trusted fun processOpenDescriptors(): int {
+    var result = -1
+    if (ablaHostIsMacOS()) {
+        // proc_pidinfo PROC_PIDLISTFDS fills 8-byte proc_fdinfo records; with
+        // no buffer it answers an estimate with room to spare. Grow until a
+        // read leaves the buffer short of full.
+        var capacity = processMetricsPidInfo(1, nativeNullPointer(), 0) + 256
+        while (result < 0 && capacity > 256 && capacity < 67108864) {
+            val records = nativeByteBuffer(capacity)
+            val read = processMetricsPidInfo(1, records.address, capacity)
+            records.close()
+            if (read <= 0) capacity = 0
+            else if (read < capacity) result = read / 8
+            else capacity = capacity * 2
+        }
+    } else {
+        // /proc/self/fd lists one entry per descriptor, including the one
+        // reading the directory.
+        val entries = path("/proc/self/fd").entries()
+        if (entries.size > 0) result = entries.size - 1
+    }
+    result
+}
+
+/** The soft limit on open file descriptors (RLIMIT_NOFILE), or -1. */
+trusted fun processMaximumDescriptors(): int {
+    val limits = nativeByteBuffer(16)
+    limits.storeI64(0, 0)
+    limits.storeI64(8, 0)
+    // RLIMIT_NOFILE is 7 on Linux and 8 on Darwin; unlimited reads as all
+    // ones on Linux and as RLIM_INFINITY (2^63 - 1) on Darwin.
+    val status = if (ablaHostIsMacOS()) int(getrlimit(i32(8), limits.address))
+        else linuxSyscall2(97, 7, nativePointerAddress(limits.address))
+    var result = -1
+    if (status == 0) {
+        result = limits.loadI64(0)
+        if (result == 9223372036854775807) result = -1
+    }
+    limits.close()
+    result
+}
+
+// Field `index` (1-based, as in proc(5)) of /proc/self/stat; the second field,
+// the command name, is parenthesized and may hold spaces, so counting starts
+// after its closing parenthesis.
+fun processMetricsStatField(stat: string, index: int): int {
+    var cursor = stat.size - 1
+    while (cursor >= 0 && stat[cursor] != 41) cursor = cursor - 1
+    var result = -1
+    if (cursor >= 0) {
+        var field = 2
+        cursor = cursor + 1
+        while (result < 0 && cursor < stat.size) {
+            while (cursor < stat.size && stat[cursor] == 32) cursor = cursor + 1
+            field = field + 1
+            var value = 0
+            var digits = 0
+            while (cursor < stat.size && stat[cursor] != 32) {
+                if (stat[cursor] >= 48 && stat[cursor] <= 57) {
+                    value = value * 10 + stat[cursor] - 48
+                    digits = digits + 1
+                }
+                cursor = cursor + 1
+            }
+            if (field == index && digits > 0) result = value
+            if (field == index && digits == 0) cursor = stat.size
+        }
+    }
+    result
+}
+
+// The kernel's clock tick rate (AT_CLKTCK in the auxiliary vector), the unit
+// of /proc/self/stat's times.
+fun processMetricsClockTicks(): int {
+    val auxv = linuxReadFile("/proc/self/auxv")
+    var result = 100
+    var offset = 0
+    while (offset + 16 <= auxv.size) {
+        var key = 0
+        var value = 0
+        var byte = 7
+        while (byte >= 0) {
+            key = key * 256 + auxv[offset + byte]
+            value = value * 256 + auxv[offset + 8 + byte]
+            byte = byte - 1
+        }
+        if (key == 17 && value > 0) result = value
+        if (key == 0) offset = auxv.size
+        offset = offset + 16
+    }
+    result
+}
+
+/** When the process started, in milliseconds since the Unix epoch, or -1. */
+trusted fun processStartTimeMilliseconds(): int {
+    var result = -1
+    if (ablaHostIsMacOS()) {
+        // proc_pidinfo PROC_PIDTBSDINFO: struct proc_bsdinfo (136 bytes),
+        // pbi_start_tvsec at 120 and pbi_start_tvusec at 128.
+        val info = nativeByteBuffer(136)
+        val read = processMetricsPidInfo(3, info.address, 136)
+        if (read == 136) {
+            result = info.loadI64(120) * 1000 + info.loadI64(128) / 1000
+        }
+        info.close()
+    } else {
+        // starttime (field 22) counts clock ticks since boot; btime in
+        // /proc/stat is the boot time in seconds since the epoch.
+        val ticks = processMetricsStatField(
+            linuxReadFile("/proc/self/stat"), 22
+        )
+        val boot = processMetricsLineNumber(
+            linuxReadFile("/proc/stat"), "btime"
+        )
+        if (ticks >= 0 && boot >= 0) {
+            result = boot * 1000 + ticks * 1000 /
+                processMetricsClockTicks()
+        }
+    }
+    result
+}
+
+/**
+ * Bytes the Abla allocator holds for live and not yet collected values: the
+ * runtime's own running count, a single read.
+ */
+fun processHeapBytes(): int = memoryLiveBytes()

@@ -44,6 +44,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/process` | arguments, environment, commands, exit, time: everything below |
 | `abla/process/arguments`, `/environment`, `/command`, `/exit`, `/time` | the same, one capability per import, including an affine allocation-free clock |
 | `abla/process/supervisor` | hosted child-process launch, isolated logs, polling, process-tree termination, monotonic timing, and processor discovery |
+| `abla/process/metrics` | the process's CPU time, resident/virtual memory, open descriptors and their limit, start time and tracked heap bytes |
 | `abla/random` | bounded cryptographic entropy (`getrandom`) |
 | `abla/random/hosted` | the same function under its hosted name, `hostedSecureRandomBytes` |
 | `abla/random/result` | `SecureRandomResult` |

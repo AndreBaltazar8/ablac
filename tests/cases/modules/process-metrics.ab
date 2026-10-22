@@ -1,0 +1,71 @@
+// abla/process/metrics: CPU time grows with work, memory and the heap are
+// positive, the descriptor count follows opened files, the descriptor limit
+// is the shell's `ulimit -n` (the test passes it in ABLA_TEST_ULIMIT) and the
+// start time is a moment ago.
+import "abla/io"
+import "abla/process"
+import "abla/process/metrics"
+import "abla/sys/linux"
+
+fun metricsCheck(name: string, ok: bool): bool {
+    if (!ok) println("process metrics: $name failed")
+    ok
+}
+
+fun main: int {
+    val before = processMetrics()
+    var ok = true
+
+    // Busy work: at least 200 ms of CPU.
+    val began = monotonicMilliseconds()
+    var spin = 0
+    while (monotonicMilliseconds() - began < 300) spin = spin + 1
+    val cpu = processCpuMicroseconds()
+    ok = metricsCheck("cpu", spin > 0 && before.cpuUserMicroseconds >= 0 &&
+        cpu[0] + cpu[1] - before.cpuUserMicroseconds -
+            before.cpuSystemMicroseconds >= 150000) && ok
+    ok = metricsCheck("cpu seconds", before.cpuSeconds() >= 0.0) && ok
+
+    ok = metricsCheck("memory", before.residentBytes > 0 &&
+        before.virtualBytes >= before.residentBytes &&
+        processResidentBytes() > 0) && ok
+
+    val files: array<int> = []
+    var index = 0
+    while (index < 5) {
+        files.append(linuxOpen("/dev/null").descriptor)
+        index = index + 1
+    }
+    val opened = processOpenDescriptors()
+    for (descriptor in files) linuxSyscall1(3, descriptor)
+    val closed = processOpenDescriptors()
+    ok = metricsCheck("descriptors", before.openDescriptors >= 3 &&
+        opened == before.openDescriptors + 5 &&
+        closed == before.openDescriptors) && ok
+
+    val limit = processEnvironmentOr("ABLA_TEST_ULIMIT", "")
+    val expected = if (limit == "unlimited") "-1" else limit
+    ok = metricsCheck("descriptor limit",
+        "${processMaximumDescriptors()}" == expected &&
+        before.maximumDescriptors == processMaximumDescriptors()) && ok
+
+    val now = realtimeMilliseconds()
+    ok = metricsCheck("start time", before.startTimeMilliseconds <= now &&
+        before.startTimeMilliseconds > now - 60000 &&
+        before.startTimeSeconds() > 0.0) && ok
+
+    val heap = processHeapBytes()
+    val kept: array<string> = []
+    index = 0
+    while (index < 1000) {
+        kept.append("entry $index")
+        index = index + 1
+    }
+    ok = metricsCheck("heap", before.heapBytes > 0 &&
+        processHeapBytes() > heap && kept.size == 1000) && ok
+
+    if (ok) {
+        println("process metrics: ok")
+        42
+    } else 1
+}
