@@ -4,7 +4,8 @@ set -euo pipefail
 # from one build to the next, and from a sysroot reached through another path
 # up to that path itself (they name the sources by absolute path). Their lines
 # are the files' own, also in a module whose names are rewritten (shapes.ab is
-# imported under an alias) and in the runtime's platform module.
+# imported under an alias) and in the runtime's platform module, and a private
+# or rewritten name is named as its source wrote it.
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -65,10 +66,9 @@ fi
 
 # A function's line is its declaration's line in its file.
 ABLA_KEEP_LLVM_TEXT=1 build text "$long"
-# declared_line MODULE FUNCTION: its subprogram's line (a rewritten name keeps
-# its module prefix).
+# declared_line MODULE FUNCTION: its subprogram's line.
 declared_line() {
-    grep -o "DISubprogram(name: \"$1\.\(__abla_module_[0-9a-f]*__\)\{0,1\}$2\"[^)]*" \
+    grep -o "DISubprogram(name: \"$1\.$2\"[^)]*" \
         "$output_directory/text/module.wasm.ll" |
         grep -o ' line: [0-9]*' | head -1 | grep -o '[0-9]*'
 }
@@ -77,6 +77,7 @@ source_line() {
 }
 for check in \
     "shapes|perimeter|$project_root/tests/cases/wasm-debug-reproducible/shapes.ab" \
+    "shapes|sideTotal|$project_root/tests/cases/wasm-debug-reproducible/shapes.ab" \
     "main|total|$project_root/tests/cases/wasm-debug-reproducible/main.ab" \
     "wasm|__ablaRuntimeWasmBump|$sysroot/stdlib/abla/runtime/platform/wasm.ab"
 do
@@ -86,4 +87,11 @@ do
     [ -n "$declared" ] || fail "no subprogram for $module.$function"
     [ "$declared" = "$expected" ] ||
         fail "$module.$function is at line $declared, declared at $expected"
+done
+for file in "$output_directory/text/module.wasm.ll" \
+    "$output_directory/first/module.wasm" "$output_directory/first/module.wasm.debug.wasm"
+do
+    if strings "$file" | grep -q '__abla_module_'; then
+        fail "$(basename "$file") names a function by its module prefix"
+    fi
 done
