@@ -287,8 +287,11 @@ kept the event loop about 8% busy.
 
 #### TLS (`wss://` and `https://`)
 
-`abla/websocket/server/tls` serves the same server over TLS. Load one
-certificate chain and its private key (for example an ACME client's
+`abla/websocket/server/tls` serves the same server over TLS. It is a second
+import, beside `abla/websocket/server`, on purpose: the build links OpenSSL
+(`-lssl -lcrypto`) into a program exactly when its imports declare the OpenSSL
+functions, so keeping them out of `abla/websocket/server` means a plain server
+never depends on OpenSSL or loads it at startup. Load one certificate chain and its private key (for example an ACME client's
 `fullchain.pem` and `privkey.pem`) with `webSocketServerTls`, or from PEM text
 with `webSocketServerTlsPem`, and pass the result as
 `WebSocketServerOptions(tls = ...)`. Everything above works unchanged:
@@ -329,9 +332,16 @@ closes only that socket; no event is surfaced for it (the connection never
 reached the application), and `server.stats.tlsHandshakeFailures` counts it.
 Connections negotiate TLS 1.2 or later with one certificate (no SNI). A
 configuration that failed to load has a non-empty `error`, and a server given
-it closes its listener (`localPort()` is -1) rather than serve plaintext. Only
-programs that import `abla/websocket/server/tls` link OpenSSL; a plain server
-does not.
+it closes its listener (`localPort()` is -1) rather than serve plaintext.
+
+OpenSSL writes with `write(2)`, which raises `SIGPIPE` when the peer has reset
+the socket. A TLS server's `step` and `flush` block `SIGPIPE` in the thread
+running them (the signal mask is per thread), so such a write fails with
+`EPIPE` and only that connection closes, whichever thread drives the server.
+On macOS, sockets carry `SO_NOSIGPIPE` already. A program that
+builds with `--emit object` and links the object itself must put
+`-lssl -lcrypto` on its link line for this module, as for any TLS module
+below; `ablac build` adds them on its own.
 
 ### Nonblocking HTTP client
 
@@ -496,7 +506,10 @@ that way, from its one poller.
 connections enable peer verification, system trust, SNI, and hostname checks.
 An explicit CA-file connector and certificate/private-key listener support
 local and private PKI deployments. `abla/http/tls` and `abla/websocket/tls`
-provide HTTPS and WSS client transports. Hosted secure random is supplied by
+provide HTTPS and WSS client transports. `ablac build` links OpenSSL for these
+modules on its own; a program built with `--emit object` and linked by hand
+(for example with `gcc` for x86_64-linux) needs `-lssl -lcrypto` on the link
+line. Hosted secure random is supplied by
 `abla/random/hosted` on Linux and macOS.
 
 | Function | Result |
