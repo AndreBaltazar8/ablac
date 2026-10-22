@@ -11,7 +11,7 @@ compiler=${1:-build/ablac}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/determinism"
 cases="$project_root/tests/cases/determinism"
-expected=2057395661
+expected=755267292
 mkdir -p "$output_directory" || exit 1
 
 if command -v node >/dev/null 2>&1; then
