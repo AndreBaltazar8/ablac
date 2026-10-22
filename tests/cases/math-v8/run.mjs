@@ -23,6 +23,13 @@
 //   node run.mjs expect <dir> [samples]                        this Node's Math results, to files
 //   node run.mjs digest [samples...]                           this Node's digests, for expected.json
 //
+// expected.json comes from the official Node 22.14.0 image (V8 12.4.254.21) on
+// x86-64; `inputs` and `digests` are what
+//   docker run --rm --platform linux/amd64 -v "$PWD/tests/cases/math-v8:/t:ro" \
+//       node:22.14.0-bookworm-slim node /t/run.mjs digest 2000 250000 1000000 4000000
+// prints, and the same image writes the result files for --expected with
+// `node /t/run.mjs expect /e <samples>` (a directory mounted at /e).
+//
 // `samples` is the number of inputs per function (default 250,000, and 2,000
 // for the ct modes).
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -365,7 +372,7 @@ function check(label, name, count, inputs, actual) {
     let expected = null;
     if (reference.kind === "live") {
         expected = each(arity, inputs, FUNCTIONS[name].math);
-        referenceLabel = `Node ${process.versions.node} ${process.arch} Math`;
+        referenceLabel = `Node ${process.versions.node} ${process.arch} Math, V8 ${process.versions.v8}`;
     } else if (reference.kind === "files") {
         const bytes = readFileSync(join(reference.dir, `${name}-${count}.bin`));
         expected = new Float64Array(bytes.buffer, bytes.byteOffset, bytes.length / 8);
@@ -374,7 +381,7 @@ function check(label, name, count, inputs, actual) {
         recorded ??= JSON.parse(readFileSync(join(here, "expected.json"), "utf8"));
         const digests = recorded.digests[String(count)];
         if (!digests) throw new Error(`expected.json records no digests for ${count} samples`);
-        referenceLabel = `${recorded.reference} (recorded digests)`;
+        referenceLabel = `${recorded.reference}, V8 ${recorded.v8} (recorded digests)`;
         // The generator must give the inputs the digests were recorded for.
         if (digest(inputs) !== recorded.inputs[String(count)][name]) {
             throw new Error(`${name}: this Node generated other inputs than the recorded ones`);
@@ -553,7 +560,10 @@ ${sites.map((s) => `    printAll(out, ${s})`).join("\n")}
     }
     console.log(`math-v8 expect: Node ${process.versions.node} ${process.arch} results for ${count} cases per function in ${first}`);
 } else if (mode === "digest") {
-    const out = { reference: `Node ${process.versions.node} ${process.platform}-${process.arch} Math`, inputs: {}, digests: {} };
+    const out = {
+        reference: `Node ${process.versions.node} ${process.platform}-${process.arch} Math`,
+        v8: process.versions.v8, inputs: {}, digests: {},
+    };
     for (const text of argv.slice(1)) {
         const count = samples(text);
         out.inputs[String(count)] = {};

@@ -91,11 +91,15 @@ fun main {
   a NaN is infinity, and it doesn't overflow before its result does.
 - The functions without a JavaScript counterpart (`min`, `max`, `clamp`,
   `fclamp`, `lerp`, `roundEven`) are `abla/math`'s.
-- The reference is Node 22 on x86-64, which runs V8's C code as written. Node
-  builds for Arm64 fuse multiply-adds in that code, so they differ from it (and
-  from each other's platforms) by an ulp in about 0.07% of results; macOS's C
-  library also truncates `pow`'s subnormal results there. A NaN's payload is
-  not part of the contract, as JavaScript doesn't show it.
+- The reference is V8's code as written, as Node 22.14 (V8 12.4.254.21) runs
+  it on x86-64: no fused multiply-adds, and a correctly rounded `scalbn`. Node
+  and browsers on Arm64 or macOS can differ from it by 1 ulp in about 0.07–0.1%
+  of results (Node 22.14: 0.070% on Linux Arm64, 0.094% on macOS Arm64, over 16
+  million cases), where the C compiler fuses multiply-adds in that code or the
+  C library's `scalbn` truncates `pow`'s subnormal results. V8 built with
+  Chromium's configuration computes `sin` and `cos` with a port of glibc's
+  instead of fdlibm's, so browsers' `Math.sin` and `Math.cos` are not these.
+  A NaN's payload is not part of the contract, as JavaScript doesn't show it.
 - Like `abla/math`, the module uses only `+`, `-`, `*`, `/` and exact
   operations, so native, Wasm and compile-time results are the same bits.
   Angles beyond 2^19 · pi/2 reduce through scratch arrays in a
@@ -105,8 +109,10 @@ fun main {
 read from the compiler, must match, and every function's results over a
 seeded set of inputs (random bit patterns, each function's branch points and
 their neighbours, huge, subnormal and special arguments) must have the bits
-recorded from Node 22 on x86-64, natively at every optimization level, as
-release and development WebAssembly, and under `#` in both tiers.
+recorded from Node 22.14 on x86-64, natively at every optimization level, as
+release and development WebAssembly, and under `#` in both tiers. It runs the
+harness on Node 22.14 (`MATH_V8_NODE`, default
+`~/.nvm/versions/node/v22.14.0/bin/node`) and checks its V8 version.
 
 ## `abla/float`
 
