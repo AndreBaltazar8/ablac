@@ -97,7 +97,7 @@ fun bootstrapGenericDeclaration(
     declaration.conformances,
     declaration.isSealed,
     declaration.isPrivate,
-    []
+    declaration.typeParameters
 )
 
 /** `expression` with each type written in it rewritten by `rewrite` (type
@@ -151,23 +151,10 @@ fun bootstrapGenericRewriteExpression(
                     state.failed.add(name)
                 }
                 text = if (kind == "type") "unknown" else "array<unknown>"
-            } else if (template >= 0) {
-                // `Box<int>` where `Box<T : Shape>`: each argument satisfies its bound.
-                val arguments = bootstrapGenericInstanceArguments(name)
-                var parameter = 0
-                for (written in state.table.declarations[template].typeParameters) {
-                    for (bound in bootstrapGenericParameterBounds(written)) {
-                        if (parameter < arguments.size &&
-                            !bootstrapGenericSatisfies(state.conformers, state.table, arguments[parameter], bound)) {
-                            if (!state.failed.contains(name)) {
-                                state.diagnostics = "${state.diagnostics}error[E_SEMANTIC]: generic.bound:${bootstrapSourceVisibleType(state.table.names[template])}:${bootstrapGenericParameterName(written)}:${bootstrapSourceVisibleType(arguments[parameter])}:${bootstrapSourceVisibleType(bound)}\nsource[semantic]:$identity:${expression.begin}:${if (expression.end > expression.begin) expression.end else expression.begin + 1}\n"
-                                state.failed.add(name)
-                            }
-                            text = if (kind == "type") "unknown" else "array<unknown>"
-                        }
-                    }
-                    parameter = parameter + 1
-                }
+            } else if (template >= 0 &&
+                       !bootstrapGenericCheckBounds(state, template, name, identity, expression.begin, expression.end)) {
+                // `Box<int>` where `Box<T : Shape>`.
+                text = if (kind == "type") "unknown" else "array<unknown>"
             }
             request = request + 1
         }
@@ -296,6 +283,68 @@ fun bootstrapGenericQuery(query: BootstrapExpression, var state: BootstrapGeneri
         return if (bootstrapSummaryTypeIsAffine(type, bootstrapBuildAffineTypeNames(state.conformers))) 1 else 0
     }
     -1
+}
+
+/** Whether each type argument of the instance `name` of generic
+ *  `template` satisfies its parameter's bounds; the first that doesn't is
+ *  reported at `begin`..`end` (once per instance) and the instance fails. */
+fun bootstrapGenericCheckBounds(
+    var state: BootstrapGenericState,
+    template: int,
+    name: string,
+    identity: string,
+    begin: int,
+    end: int
+): bool {
+    val arguments = bootstrapGenericInstanceArguments(name)
+    var parameter = 0
+    for (written in state.table.declarations[template].typeParameters) {
+        for (bound in bootstrapGenericParameterBounds(written)) {
+            if (parameter < arguments.size &&
+                !bootstrapGenericSatisfies(state.conformers, state.table, arguments[parameter], bound)) {
+                if (!state.failed.contains(name)) {
+                    state.diagnostics = "${state.diagnostics}error[E_SEMANTIC]: generic.bound:${bootstrapSourceVisibleType(state.table.names[template])}:${bootstrapGenericParameterName(written)}:${bootstrapSourceVisibleType(arguments[parameter])}:${bootstrapSourceVisibleType(bound)}\nsource[semantic]:$identity:$begin:${if (end > begin) end else begin + 1}\n"
+                    state.failed.add(name)
+                }
+                return false
+            }
+        }
+        parameter = parameter + 1
+    }
+    true
+}
+
+/** The instances `compiler.instantiate` asked for from a transform: each
+ *  is a generated declaration annotated `@__abla_instantiate("Box<int>")`. */
+fun bootstrapGenericRequestInstantiations(declarations: array<BootstrapDeclaration>, var state: BootstrapGenericState): void {
+    for (declaration in declarations) {
+        var annotation = 0
+        while (annotation < declaration.annotations.size) {
+            if (declaration.annotations[annotation] == "__abla_instantiate" &&
+                annotation < declaration.annotationArguments.size &&
+                declaration.annotationArguments[annotation].kind == "string") {
+                val spelling = declaration.annotationArguments[annotation].text
+                val template = state.table.findFree(bootstrapGenericCalleeName(spelling))
+                if (template >= 0) {
+                    val node = BootstrapExpression(
+                        if (state.table.declarations[template].kind == "class") "type" else "identifier",
+                        spelling, declaration.begin, declaration.end, []
+                    )
+                    val none: array<string> = []
+                    val before = state.requests.size
+                    bootstrapGenericRewriteExpression(node, declaration.sourceIdentity, none, none, state)
+                    if (state.table.declarations[template].kind != "class" && state.requests.size > before) {
+                        bootstrapGenericCheckBounds(
+                            state, template, state.requests[state.requests.size - 1],
+                            declaration.sourceIdentity, declaration.begin, declaration.end
+                        )
+                    }
+                }
+            }
+            annotation = annotation + 1
+        }
+    }
+    return
 }
 
 fun bootstrapGenericRewriteTypes(
@@ -506,10 +555,16 @@ fun bootstrapGenericMakeRequested(var state: BootstrapGenericState): void {
         }
         val sources: array<string> = []
         for (argument in arguments) sources.append(bootstrapGenericSourceType(bootstrapGenericParse(argument)))
-        state.instances.append(bootstrapGenericRewriteDeclaration(
+        val substitutions: array<string> = []
+        var index = 0
+        while (index < parameters.size) {
+            substitutions.append("${parameters[index]}=${arguments[index]}")
+            index = index + 1
+        }
+        state.instances.append(bootstrapGenericWithSubstitutions(bootstrapGenericRewriteDeclaration(
             declaration, name, "${declaration.sourceIdentity}$BOOTSTRAP_GENERIC_SOURCE_MARK$name",
             parameters, sources, state
-        ))
+        ), substitutions))
         state.fresh.add(name)
     }
     state.requests.clear()
@@ -720,6 +775,25 @@ fun bootstrapGenericUnmarkDeclaration(declaration: BootstrapDeclaration): Bootst
     )
 }
 
+/** An instance (and its methods) carrying its type arguments, `T=i64`,
+ *  for reflection once its generic is gone (compilerTypeArgument,
+ *  compilerFunctionGenericSubstitution*). */
+fun bootstrapGenericWithSubstitutions(
+    declaration: BootstrapDeclaration,
+    substitutions: array<string>
+): BootstrapDeclaration {
+    val methods: array<BootstrapDeclaration> = []
+    for (method in declaration.methods) methods.append(bootstrapGenericWithSubstitutions(method, substitutions))
+    bootstrapGenericWithTypeParameters(
+        bootstrapGenericDeclaration(
+            declaration, declaration.name, declaration.expression, declaration.parameterTypes,
+            declaration.resultType, methods, declaration.parameterDefaults,
+            declaration.extensionOwner, declaration.sourceIdentity
+        ),
+        substitutions
+    )
+}
+
 fun bootstrapGenericWithTypeParameters(
     declaration: BootstrapDeclaration,
     typeParameters: array<string>
@@ -739,8 +813,8 @@ fun bootstrapGenericWithTypeParameters(
 fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseResult {
     var generic = false
     for (declaration in parsed.declarations) {
-        if (declaration.typeParameters.size > 0) generic = true
-        for (method in declaration.methods) if (method.typeParameters.size > 0) generic = true
+        if (bootstrapGenericIsTemplate(declaration)) generic = true
+        for (method in declaration.methods) if (bootstrapGenericIsTemplate(method)) generic = true
     }
     if (!generic) return parsed
 
@@ -748,7 +822,7 @@ fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseRe
     var free = bootstrapStringSet()
     var extensions = bootstrapStringSet()
     for (declaration in parsed.declarations) {
-        if (declaration.typeParameters.size > 0) {
+        if (bootstrapGenericIsTemplate(declaration)) {
             if (declaration.kind == "class" || declaration.extensionOwner == "") free.add(declaration.name)
             else extensions.add(declaration.name)
         }
@@ -767,7 +841,7 @@ fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseRe
     val owners: array<string> = []
     val templates: array<BootstrapDeclaration> = []
     for (declaration in source) {
-        if (declaration.kind == "class" && declaration.typeParameters.size > 0) {
+        if (declaration.kind == "class" && bootstrapGenericIsTemplate(declaration)) {
             ids.append(declaration.name)
             names.append(declaration.name)
             owners.append("")
@@ -777,7 +851,7 @@ fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseRe
     val classes = BootstrapGenericTable(ids, names, owners, templates, false, bootstrapStringSet())
     for (declaration in source) {
         if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
-            declaration.typeParameters.size > 0) {
+            bootstrapGenericIsTemplate(declaration)) {
             var owner = ""
             if (declaration.extensionOwner != "") {
                 val ignored: array<string> = []
@@ -813,7 +887,7 @@ fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseRe
             }
         }
         for (method in declaration.methods) {
-            if (method.typeParameters.size > 0) {
+            if (bootstrapGenericIsTemplate(method)) {
                 bootstrapGenericError(state, "generic.method-not-supported:${declaration.name}.${method.name}", method)
             }
         }
@@ -836,12 +910,13 @@ fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseRe
     val none: array<string> = []
     val declarations: array<BootstrapDeclaration> = []
     for (declaration in source) {
-        if (declaration.typeParameters.size == 0) {
+        if (!bootstrapGenericIsTemplate(declaration)) {
             declarations.append(bootstrapGenericRewriteDeclaration(
                 declaration, declaration.name, declaration.sourceIdentity, none, none, state
             ))
         }
     }
+    bootstrapGenericRequestInstantiations(source, state)
     val parameterClasses: array<BootstrapDeclaration> = []
     var template = 0
     while (template < templates.size) {

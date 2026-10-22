@@ -58,6 +58,15 @@ output=$(run "$output_directory/strict")
 [[ $output == $'<3> <s> 2\nstatus 42' ]] ||
     { echo "generics, strict imports: $output" >&2; exit 1; }
 
+# The compiler API: instances listed, type arguments read, and an instance
+# made because a transform asked for it (under each evaluator).
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode "$compiler" build "$cases/api/main.ab" -o "$output_directory/api" --no-cache
+    output=$(run "$output_directory/api")
+    [[ $output == $'1 2 true\n Box<string> Box<i64> | first<Square> first<i64> | Box<i64>: i64 | true: Square string bool | Box<i64> true\nstatus 42' ]] ||
+        { echo "generics, compiler API ($mode): $output" >&2; exit 1; }
+done
+
 # Each error case, against its lines in expected.txt.
 expected_file=$cases/errors/expected.txt
 for source in "$cases"/errors/*.ab; do
@@ -92,4 +101,4 @@ incremental $'first 1\n2'
 cp "$cases/incremental/library-edited.ab" "$work/library.ab"
 incremental $'second 1\n3'
 
-echo "generics: generic functions, extensions and classes compute what they should (built and under ablac run), private and strict-imports generics resolve, misuses are the errors they should be, and an edited generic rebuilds its instances"
+echo "generics: generic functions, extensions and classes compute what they should (built and under ablac run), private and strict-imports generics resolve, the compiler API reads and makes instances, misuses are the errors they should be, and an edited generic rebuilds its instances"

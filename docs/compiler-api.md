@@ -120,7 +120,8 @@ complete program before analysis:
 | `replaceFunctionBody(function, source)`, `addFunctionAnnotation(function, name)` | change the program, from a transform |
 | `extensionFields(type)`, `fieldsOf(type, includeExtensions)`, `addExtensionField(type, name, fieldType, initial, mutable)`, `removeExtensionField(type, name)` | a class's [extension fields](#extension-fields) |
 | `conformances(type)`, `conformsTo(type, interface)`, `implementers(interface)`, `witness(type, interface)`, `declareInterface(name, members, parents)`, `addConformance(type, interface, members)` | [interfaces](#interfaces) and the classes conforming to them |
-| `findType(name)`, `typeName(type)`, `classOf(type)`, `typeConformsTo(type, interface)`, `isResource(type)` | type handles, as a [generic](#generics)'s `#` code sees its type parameters |
+| `findType(name)`, `typeName(type)`, `classOf(type)`, `typeConformsTo(type, interface)`, `isResource(type)`, `typeArguments(type)` | type handles, as a [generic](#generics)'s `#` code sees its type parameters |
+| `instantiations(generic)`, `instantiate(generic, typeArguments)`, `functionTypeArguments(function)` | a [generic](#generics)'s instances |
 | `fieldIsDelegated(type, name)`, `fieldDelegateType(type, name)` | whether a class's property is [delegated](language.md#delegated-class-properties), and its delegate's type |
 | `function(name)`, `reference(handle)` | a `FunctionReference`, for building other programs |
 | `newModule(name)` | an `IndependentModule`: a separate program built from chosen functions ([below](#independent-modules-and-declaration-blocks)) |
@@ -235,7 +236,7 @@ fun main {
 | `compilerTypeIsNullable`, `compilerTypeIsAffine` | flags |
 | `compilerTypeArgumentCount`, `compilerTypeArgument`, `compilerTypeElement`, `compilerTypeResult` | the parts of generic, array and function types |
 | `compilerTypeDeclaration(type)` | the class handle of a class type, or `-1` |
-| `compilerFunctionGenericSubstitutionCount/Name/TypeHandle` | reserved: zero until generic declarations exist |
+| `compilerFunctionGenericSubstitutionCount/Name/TypeHandle` | an instance of a generic function (or a method of a generic class's instance): its type parameters' names and type arguments; zero for any other function |
 
 ## Independent modules and declaration blocks
 
@@ -474,6 +475,53 @@ An `if` whose condition is a `#` query of `typeConformsTo` or `isResource`
 on type parameters is decided per instance before the instance is checked,
 and keeps only the branch it takes
 ([language guide](language.md#compile-time-code-per-instance)).
+
+The instances themselves can be read and asked for:
+
+- `compiler.instantiations(generic)` lists the instances of the generic
+  class or function `generic` that the program has, as written
+  (`Box<i64>`), in the order they were made (those a transform asked for
+  first). `findType`, `findClass` and `findFunction` take that
+  spelling (`findFunction("first<Square>")`, `findFunction("Box<string>.get")`).
+- `compiler.typeArguments(type)` are the type arguments of a generic class's
+  instance as type handles (an array's or a nullable's element too), and
+  `compiler.functionTypeArguments(function)` those of a generic function's
+  instance, or of a method of a generic class's instance.
+- `compiler.instantiate(generic, typeArguments)` is the instance for those
+  type arguments, as written (`instantiate("Box", ["int"])` is `Box<i64>`).
+  From a transform, an instance the program doesn't use yet is made with
+  the others, as if the program used it, and its bounds are checked as a
+  use's would be. Elsewhere it must exist already:
+  `E_COMPILER_GENERIC_INSTANTIATE`.
+
+```abla
+import "abla/io"
+import "abla/compiler"
+
+class Box<T>(val value: T)
+
+compile fun ask(): void {
+    compiler.instantiate("Box", ["string"])
+    return
+}
+
+#compiler.transform(ask)
+
+compile fun boxes(): string {
+    var text = ""
+    for (name in compiler.instantiations("Box")) {
+        val arguments = compiler.typeArguments(compiler.findType(name))
+        text = "$text $name of ${compiler.typeName(arguments[0])};"
+    }
+    text
+}
+
+fun main {
+    println("${Box(1).value}${#boxes()}")
+}
+// output:
+// 1 Box<string> of string; Box<i64> of i64;
+```
 
 ## Binding reflection
 

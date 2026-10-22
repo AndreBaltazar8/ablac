@@ -5751,6 +5751,16 @@ class BootstrapEvaluator(
     }
 }
 
+/** A type, class or function name as `#` code writes it, a generic's
+ *  instance by its type arguments (`Box<int>`), as the program names it. */
+fun bootstrapEvalGenericSpelling(evaluator: BootstrapEvaluator, text: string): string {
+    var angle = false
+    for (byte in text) if (byte == 60) angle = true
+    if (!angle) return text
+    val spelled = bootstrapGenericSpelledName(text, bootstrapGenericTableOf(evaluator.declarations))
+    if (bootstrapIsGenericInstanceName(spelled)) spelled else text
+}
+
 // The compiler's builtins, by family: each family's cases (and their locals)
 // live in a frame of their own, entered only for a name of that family.
 @noinline
@@ -8471,7 +8481,9 @@ fun bootstrapEvaluateCallReflection(
     // works identically in the self-hosted compile-time evaluator.
     if (targetName == "compilerFindType") {
         val name = evaluator.evaluate(expression.children[0])
-        result = bootstrapEvalInteger(evaluator.reflectedTypeHandle(name.text))
+        result = bootstrapEvalInteger(evaluator.reflectedTypeHandle(
+            bootstrapEvalGenericSpelling(evaluator, name.text)
+        ))
     }
     if (targetName == "typedExpressionTypeHandle") {
         val syntaxHandle = evaluator.evaluate(expression.children[0]).integer
@@ -8556,7 +8568,8 @@ fun bootstrapEvaluateCallReflection(
                 ))
             }
             if (targetName == "compilerTypeArgumentCount") {
-                var count = 0
+                // A generic class's instance: its type arguments.
+                var count = bootstrapGenericInstanceArguments(type).size
                 if (kind == "nullable" || kind == "array" ||
                     kind == "shared" || kind == "weak" ||
                     kind == "mutex" || kind == "borrow" ||
@@ -8611,6 +8624,8 @@ fun bootstrapEvaluateCallReflection(
                 argument < bootstrapFunctionParameterCount(type)) {
                 argumentType = bootstrapFunctionParameterType(type, argument)
             }
+            val instanceArguments = bootstrapGenericInstanceArguments(type)
+            if (argument >= 0 && argument < instanceArguments.size) argumentType = instanceArguments[argument]
             val argumentHandle = evaluator.reflectedTypeHandle(argumentType)
             if (argumentHandle >= 0) {
                 result = bootstrapEvalInteger(argumentHandle)
@@ -9224,7 +9239,9 @@ fun bootstrapEvaluateCallCompiler(
 ): BootstrapEvalValue {
     var result = initial
     if (targetName == "compilerFindFunction") {
-        val name = evaluator.evaluate(expression.children[0])
+        val written = evaluator.evaluate(expression.children[0])
+        // `first<int>`: the generic's instance.
+        val name = bootstrapEvalString(bootstrapEvalGenericSpelling(evaluator, written.text))
         var handle = -1
         var declarationIndex = 0
         while (declarationIndex < evaluator.declarations.size) {
@@ -9512,17 +9529,86 @@ fun bootstrapEvaluateCallCompiler(
         targetName == "compilerFunctionGenericSubstitutionTypeHandle") {
         val handle = evaluator.evaluate(expression.children[0]).integer
         if (evaluator.functionHandleValid(handle)) {
+            // An instance of a generic (or a method of one) carries its type
+            // arguments; any other function has none.
+            val owner = evaluator.functionHandleOwner(handle)
+            val method = evaluator.functionHandleMethod(handle)
+            val declaration = if (owner >= 0 && method >= 0) evaluator.declarations[owner].methods[method]
+                else evaluator.declarations[handle]
+            val names = bootstrapGenericSubstitutions(declaration, true)
+            val types = bootstrapGenericSubstitutions(declaration, false)
             if (targetName ==
                 "compilerFunctionGenericSubstitutionCount") {
-                result = bootstrapEvalInteger(0)
+                result = bootstrapEvalInteger(names.size)
             } else {
-                evaluator.evaluate(expression.children[1])
-                evaluator.errors = evaluator.errors + 1
+                val substitution = evaluator.evaluate(expression.children[1]).integer
+                if (substitution < 0 || substitution >= names.size) {
+                    evaluator.errors = evaluator.errors + 1
+                } else if (targetName == "compilerFunctionGenericSubstitutionName") {
+                    result = bootstrapEvalString(names[substitution])
+                } else {
+                    result = bootstrapEvalInteger(evaluator.reflectedTypeHandle(types[substitution]))
+                }
             }
         } else evaluator.errors = evaluator.errors + 1
     }
+    // A generic's instances, by name (`Box`, `first`), as written
+    // (`Box<i64>`).
+    if (targetName == "compilerGenericInstanceCount" ||
+        targetName == "compilerGenericInstanceName") {
+        val generic = evaluator.evaluate(expression.children[0]).text
+        val names: array<string> = []
+        for (declaration in evaluator.declarations) {
+            if (bootstrapIsGenericInstanceName(declaration.name) &&
+                !bootstrapGenericMentionsParameter(declaration.name) &&
+                bootstrapSourceVisibleType(bootstrapGenericInstanceGeneric(declaration.name)) == generic) {
+                names.append(bootstrapGenericVisible(declaration.name))
+            }
+        }
+        if (targetName == "compilerGenericInstanceCount") {
+            result = bootstrapEvalInteger(names.size)
+        } else {
+            val wanted = evaluator.evaluate(expression.children[1]).integer
+            if (wanted < 0 || wanted >= names.size) {
+                evaluator.errors = evaluator.errors + 1
+            } else result = bootstrapEvalString(names[wanted])
+        }
+    }
+    // `instantiate`: from a transform, the instance is made with the
+    // program's others (a generated declaration asks the generics pass for
+    // it); elsewhere it must exist already. Either way, its name as written.
+    if (targetName == "compilerInstantiate") {
+        val spelling = evaluator.evaluate(expression.children[0]).text
+        val table = bootstrapGenericTableOf(evaluator.declarations)
+        val generic = bootstrapGenericCalleeName(spelling)
+        val template = table.findFree(generic)
+        val instance = bootstrapEvalGenericSpelling(evaluator, spelling)
+        var exists = false
+        for (declaration in evaluator.declarations) {
+            if (declaration.name == instance) exists = true
+        }
+        var valid = template >= 0 && bootstrapIsGenericInstanceName(instance) &&
+            bootstrapGenericInstanceArguments(instance).size ==
+                bootstrapGenericParameterNames(table.declarations[template]).size
+        if (valid && !exists) {
+            valid = bootstrapCompilerTransformActive && bootstrapStageGeneratedModule(BootstrapGeneratedModuleRequest(
+                "instantiate:$instance",
+                "@__abla_instantiate(\"$spelling\")\ncompile fun __abla_instantiate_${bootstrapGenericEscape(instance)}(): void {\n    return\n}\n"
+            ))
+        }
+        if (valid) {
+            result = bootstrapEvalString(bootstrapGenericVisible(instance))
+        } else {
+            evaluator.recordEvaluatorDiagnostic(
+                "E_COMPILER_GENERIC_INSTANTIATE",
+                "compiler.instantiate(\"${generic}\", …) requires a generic class or function and one type argument per type parameter; an instance not made yet is made from a transform (compiler.transform)"
+            )
+            evaluator.errors = evaluator.errors + 1
+            result = bootstrapEvalString("")
+        }
+    }
     if (targetName == "compilerFindClass") {
-        val name = evaluator.evaluate(expression.children[0]).text
+        val name = bootstrapEvalGenericSpelling(evaluator, evaluator.evaluate(expression.children[0]).text)
         var handle = -1
         var declaration = 0
         while (declaration < evaluator.declarations.size) {
