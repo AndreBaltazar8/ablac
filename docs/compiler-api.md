@@ -91,6 +91,11 @@ complete program before analysis:
   `E_COMPILER_EDIT_CONFLICT`, naming both; the same body twice is one change.
 - An edit whose target is not exactly one declaration is
   `E_COMPILER_EDIT_TARGET`.
+- Another module's [private](language.md#modules-and-imports) function is
+  found by its source name and edited like any other. A new body reads names
+  as the function's own module does, whoever wrote it: that module's private
+  names and what it imports (under strict imports, only that), not the
+  transforming module's.
 - The runtime's functions (`abla/runtime`) are never changed:
   `E_COMPILER_TRANSFORM_RUNTIME`. Its guarantees, such as which code may hold an
   object's address, rest on its code as written. The call returns false and

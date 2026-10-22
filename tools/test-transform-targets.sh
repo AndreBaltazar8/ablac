@@ -13,8 +13,8 @@ cases="$project_root/tests/cases/transform-targets"
 output_directory="$project_root/build/transform-targets"
 mkdir -p "$output_directory"
 
-runs() { # $1 = case, $2 = the exit status its program must have
-    "$compiler" build "$cases/$1.ab" -o "$output_directory/$1" --no-cache
+runs() { # $1 = case, $2 = the exit status its program must have, then build flags
+    "$compiler" build "$cases/$1.ab" -o "$output_directory/$1" --no-cache "${@:3}"
     set +e
     "$output_directory/$1"
     local status=$?
@@ -28,6 +28,10 @@ runs stdlib 42
 runs field 42
 runs agree 42
 runs sees 42
+runs private 42
+# Under strict imports too: a body reads names as its own module does.
+runs module 42 --strict-imports
+runs private 42 --strict-imports
 
 refused() { # $1 = case, $2 = the diagnostic it must report
     if "$compiler" build "$cases/$1.ab" -o "$output_directory/$1" --no-cache \
@@ -46,4 +50,4 @@ grep -qF '`transform.library`' "$output_directory/stdlib-ungranted.err" ||
 grep -q 'conflict-a.ab' "$output_directory/conflict.err" &&
     grep -q 'conflict-b.ab' "$output_directory/conflict.err" ||
     { echo "transform targets: the conflict doesn't name both transforms"; cat "$output_directory/conflict.err"; exit 1; }
-echo "transform targets: own, other modules' and the standard library's bodies, annotations and fields changed; conflicts and the runtime refused"
+echo "transform targets: own, other modules' (private ones too, strict imports too) and the standard library's bodies, annotations and fields changed; conflicts and the runtime refused"
