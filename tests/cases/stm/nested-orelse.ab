@@ -1,0 +1,117 @@
+import "abla/io"
+import "abla/memory"
+
+// orElse nested three levels deep, in the first and the second alternative at
+// every level, with a retry possible in each alternative (a bit of `flags`
+// each) and every alternative writing the same TVars: each savepoint's undo
+// must restore exactly what its alternative wrote, the reads staying. Checked
+// against a model over plain strings for all 64 combinations, on one thread
+// (direct, then logged, with a collection between kept writes and their undo)
+// and on four threads at once (logged, conflicting on a shared counter).
+
+trusted fun alwaysLogged(logged: bool): void = __ablaRuntimeStmSetAlwaysLogged(logged)
+
+// Bumped by every alternative: its end value counts the committed ones.
+var noise: int by TVar(0)
+
+class Trail(var text: string by TVar(""), var count: int by TVar(0))
+
+fun flagged(flags: int, bit: int): bool = ((flags >> bit) & 1) == 1
+
+// The new text is made here and this frame is gone when a deeper alternative
+// writes over it: the value it replaced is then held by the kept log alone.
+fun mark(trail: Trail, level: int, side: int): void {
+    trail.text = "${trail.text}$level${if (side == 0) "a" else "b"}"
+    return
+}
+
+fun alternative(trail: Trail, level: int, flags: int, side: int): bool {
+    mark(trail, level, side)
+    trail.count += 1
+    noise += 1
+    if (level < 3) choice(trail, level + 1, flags)
+    // The kept values (strings) must survive a collection before the undo,
+    // and the blocks of any it freed are taken again at once.
+    if (level == 3) {
+        memoryCollect()
+        val churn: array<string> = []
+        for (index in 0 until 200) churn.append("${index % 10}x${trail.count}y${level}z")
+    }
+    if (flagged(flags, (level - 1) * 2 + side)) retry
+    true
+}
+
+fun choice(trail: Trail, level: int, flags: int): bool = atomic {
+    atomic { alternative(trail, level, flags, 0) } orElse { alternative(trail, level, flags, 1) }
+}
+
+// The same choices over a plain string: null when the choice retried.
+fun modelAlternative(level: int, flags: int, side: int, text: string): string? {
+    var result = "$text$level${if (side == 0) "a" else "b"}"
+    if (level < 3) {
+        val inner = modelChoice(level + 1, flags, result)
+        if (inner == null) return null
+        result = inner
+    }
+    if (flagged(flags, (level - 1) * 2 + side)) return null
+    result
+}
+
+fun modelChoice(level: int, flags: int, text: string): string? {
+    val first = modelAlternative(level, flags, 0, text)
+    if (first != null) return first
+    modelAlternative(level, flags, 1, text)
+}
+
+fun markers(text: string): int {
+    var count = 0
+    for (index in 0 until text.size) if (text[index] == 97 || text[index] == 98) count += 1
+    count
+}
+
+// One combination: 0 when the TVars hold what the model says.
+fun combination(flags: int): int {
+    val trail = Trail()
+    val chosen = atomic {
+        atomic { choice(trail, 1, flags) } orElse {
+            trail.text = "${trail.text}!"
+            false
+        }
+    }
+    val model = modelChoice(1, flags, "")
+    val expected = if (model == null) "!" else model
+    val text = atomic { trail.text }
+    val count = atomic { trail.count }
+    if (text == expected && count == markers(expected) && chosen == (model != null)) 0 else 1
+}
+
+fun allCombinations(rounds: int): int {
+    var failed = 0
+    for (round in 0 until rounds) for (flags in 0 until 64) failed += combination(flags)
+    failed
+}
+
+fun committed(rounds: int): int {
+    var total = 0
+    for (flags in 0 until 64) {
+        val model = modelChoice(1, flags, "")
+        if (model != null) total += markers(model)
+    }
+    total * rounds
+}
+
+fun main: int {
+    var failed = allCombinations(1)
+    alwaysLogged(true)
+    failed += allCombinations(1)
+    alwaysLogged(false)
+    val before = atomic { noise }
+    val one = thread { allCombinations(5) }
+    val two = thread { allCombinations(5) }
+    val three = thread { allCombinations(5) }
+    val four = thread { allCombinations(5) }
+    failed += await one + await two + await three + await four
+    val bumps = atomic { noise } - before
+    println("nested orElse: $failed failed, $bumps committed alternatives (expected ${committed(20)})")
+    if (failed == 0 && bumps == committed(20) && before == committed(2)) 42 else 1
+}

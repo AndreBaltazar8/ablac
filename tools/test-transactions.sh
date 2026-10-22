@@ -33,7 +33,7 @@ for mode in interp jit; do
     expect_42 "$output_directory/single-$mode"
 done
 
-for program in surface-bank surface-channel; do
+for program in surface-bank surface-channel nested-orelse; do
     "$compiler" build "$project_root/tests/cases/stm/$program.ab" \
         -o "$output_directory/$program" --no-cache
     run=0
@@ -42,6 +42,8 @@ for program in surface-bank surface-channel; do
         run=$((run + 1))
     done
 done
+# The orElse alternatives' kept values survive collections at every point.
+ABLA_GC_STRESS=1 expect_42 "$output_directory/nested-orelse"
 
 # One thread in a WebAssembly module (direct transactions, orElse).
 if command -v node >/dev/null 2>&1; then wasm_runner=node; else wasm_runner=bun; fi
@@ -51,6 +53,17 @@ if command -v node >/dev/null 2>&1; then wasm_runner=node; else wasm_runner=bun;
 (cd "$project_root" && "$output_directory/wasm-driver")
 wasm_output=$("$wasm_runner" "$project_root/tests/cases/stm/run.mjs" "$output_directory/transactions.wasm")
 [[ $wasm_output == 0 ]] || { echo "transactions (WebAssembly): $wasm_output failed" >&2; exit 1; }
+# There, an orElse alternative that can retry is refused when it compiles.
+set +e
+(cd "$project_root" && "$compiler" build tests/cases/stm/surface-orelse-wasm-build.ab \
+    -o "$output_directory/orelse-driver" --no-cache > "$output_directory/orelse-driver.log" 2>&1)
+set -e
+if ! grep -Fq 'stm.orelse-retry-wasm' "$output_directory/orelse-driver.log" ||
+    (cd "$project_root" && "$output_directory/orelse-driver" 2>/dev/null); then
+    echo "transactions (WebAssembly): an orElse alternative that retries was not refused" >&2
+    cat "$output_directory/orelse-driver.log" >&2
+    exit 1
+fi
 
 fixtures=(
     outside-direct outside-helper outside-lambda outside-retry
@@ -90,4 +103,4 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     index=$((index + 1))
 done
 
-printf 'transactions: semantics (both evaluators, WebAssembly), bank and channel under contention (%s runs each), and every check passed\n' "$runs"
+printf 'transactions: semantics (both evaluators, WebAssembly), bank, channel and nested orElse under contention (%s runs each), and every check passed\n' "$runs"
