@@ -177,6 +177,15 @@ fun main: int = #homeLength()
 // error: compile.call-runtime:compilerEnvironment
 ```
 
+Compile-time reflection ignores `private`. `compiler.functions()` lists every
+declaration. `compiler.findClass(name)` and `findFunction(name)` find a
+[private](language.md#modules-and-imports) declaration by its source name,
+the calling module's when the evaluation knows it, else the only one of that
+name in the program. `compiler.isPrivate(handle)` tells which ones are
+private. Ordinary `#` code still resolves names as its module sees them, so
+a private name used directly from another module is an error there as
+anywhere.
+
 ## Top-level actions
 
 A `#expression` on its own at the top level of a module is an *action*. It
