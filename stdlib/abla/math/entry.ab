@@ -17,6 +17,10 @@ noescape extern:"intrinsic" fun ablaF64Ceil(value: f64): f64
 noescape extern:"intrinsic" fun ablaF64Trunc(value: f64): f64
 noescape extern:"intrinsic" fun ablaF64Abs(value: f64): f64
 noescape extern:"intrinsic" fun ablaF64RoundEven(value: f64): f64
+noescape extern:"intrinsic" fun ablaF64Minimum(left: f64, right: f64): f64
+noescape extern:"intrinsic" fun ablaF64Maximum(left: f64, right: f64): f64
+noescape extern:"intrinsic" fun ablaF64Fma(x: f64, y: f64, z: f64): f64
+noescape extern:"intrinsic" fun ablaF64FmaIsFused(): bool
 
 // pi
 val mathPi: f64 = f64FromBits(4614256656552045848)
@@ -44,24 +48,101 @@ fun isFinite(value: f64): bool = value - value == 0.0
 
 /** The smaller of two f64s as IEEE 754-2019 minimum: NaN if either is NaN,
  *  and -0.0 below 0.0. */
-fun fmin(left: f64, right: f64): f64 {
-    val smaller = if (left < right) left else right
-    // Equal values differ in bits only as ±0.0, whose OR is -0.0.
-    val tie = if (left == right) f64FromBits(f64ToBits(left) | f64ToBits(right)) else smaller
-    if (left != left || right != right) left + right else tie
-}
+fun fmin(left: f64, right: f64): f64 = ablaF64Minimum(left, right)
 /** The larger of two f64s as IEEE 754-2019 maximum: NaN if either is NaN,
  *  and 0.0 above -0.0. */
-fun fmax(left: f64, right: f64): f64 {
-    val larger = if (left > right) left else right
-    // Equal values differ in bits only as ±0.0, whose AND is 0.0.
-    val tie = if (left == right) f64FromBits(f64ToBits(left) & f64ToBits(right)) else larger
-    if (left != left || right != right) left + right else tie
+fun fmax(left: f64, right: f64): f64 = ablaF64Maximum(left, right)
+/** value held to [minimum, maximum] (maximum wins if they cross), with fmin's
+ *  and fmax's rules: NaN if any argument is NaN, and -0.0 below 0.0. */
+fun fclamp(value: f64, minimum: f64, maximum: f64): f64 =
+    ablaF64Minimum(ablaF64Maximum(value, minimum), maximum)
+/** x * y + z rounded once (IEEE 754 fusedMultiplyAdd): the hardware's
+ *  instruction where the target has one, an exact software routine elsewhere,
+ *  so every target gives the same bits. */
+fun fma(x: f64, y: f64, z: f64): f64 =
+    if (ablaF64FmaIsFused()) ablaF64Fma(x, y, z) else __mathFmaSoftware(x, y, z)
+
+// x y + z rounded once (IEEE 754 fusedMultiplyAdd), in integers: abla/math's
+// fma where the target has no fused multiply-add instruction, and at compile
+// time. The exact sum is formed in 128 bits with a sticky bit, then rounded
+// once to the nearest double (to even on a tie).
+fun __mathFmaSoftware(x: f64, y: f64, z: f64): f64 {
+    val xb = f64ToBits(x)
+    val yb = f64ToBits(y)
+    val zb = f64ToBits(z)
+    val xe = (xb >>> 52) & 0x7ff
+    val ye = (yb >>> 52) & 0x7ff
+    val ze = (zb >>> 52) & 0x7ff
+    // an infinite, NaN or zero x or y: x y is exact
+    if (xe == 0x7ff || ye == 0x7ff || (xb << 1) == 0 || (yb << 1) == 0) return x * y + z
+    // x y finite and nonzero: an infinite or NaN z is the result
+    if (ze == 0x7ff) return z + z
+    // a zero z: x y rounded once, keeping its sign if it underflows to zero
+    if ((zb << 1) == 0) return x * y
+    // |x| = mx 2^ex and so on, with integer significands
+    val mx = (xb & 0xfffffffffffff) | (if (xe != 0) 1 << 52 else 0)
+    val my = (yb & 0xfffffffffffff) | (if (ye != 0) 1 << 52 else 0)
+    val mz = (zb & 0xfffffffffffff) | (if (ze != 0) 1 << 52 else 0)
+    val ex = (if (xe != 0) xe else 1) - 1075
+    val ey = (if (ye != 0) ye else 1) - 1075
+    val ez = (if (ze != 0) ze else 1) - 1075
+    // P = mx my 2^ep and Z = mz 2^ezz, each with its top bit moved to bit 125
+    val ph0 = __mathMulHigh(mx, my)
+    val pl0 = mx * my
+    val pshift = (if (ph0 != 0) __mathClz(ph0) else 64 + __mathClz(pl0)) - 2
+    val ph = __mathShl128High(ph0, pl0, pshift)
+    val pl = __mathShl128Low(pl0, pshift)
+    val ep = ex + ey - pshift
+    val zshift = 62 + __mathClz(mz)
+    val zh = __mathShl128High(0, mz, zshift)
+    val zl = __mathShl128Low(mz, zshift)
+    val ezz = ez - zshift
+    val ps = (xb ^ yb) >>> 63
+    val zs = zb >>> 63
+    // the larger magnitude first
+    val pFirst = if (ep != ezz) ep > ezz else if (ph != zh) __mathULess(zh, ph) else !__mathULess(pl, zl)
+    val bh = if (pFirst) ph else zh
+    val bl = if (pFirst) pl else zl
+    val be = if (pFirst) ep else ezz
+    val bs = if (pFirst) ps else zs
+    val sh = if (pFirst) zh else ph
+    val sl = if (pFirst) zl else pl
+    val d = be - (if (pFirst) ezz else ep)
+    // the smaller one aligned, the bits shifted out kept as a sticky bit
+    var th = __mathShr128High(sh, d)
+    var tl = __mathShr128Low(sh, sl, d)
+    val lost = if (d >= 128) true
+        else __mathShl128High(th, tl, d) != sh || __mathShl128Low(tl, d) != sl
+    if (lost) tl = tl | 1
+    var rh = 0
+    var rl = 0
+    if (bs == (if (pFirst) zs else ps)) {
+        rl = bl + tl
+        rh = bh + th + (if (__mathULess(rl, bl)) 1 else 0)
+    } else {
+        rl = bl - tl
+        rh = bh - th - (if (__mathULess(bl, tl)) 1 else 0)
+        // an exact cancellation is +0 when rounding to nearest
+        if ((rh | rl) == 0) return 0.0
+    }
+    // the sum's top 63 bits, the rest as a sticky bit: r 2^e, 2^62 <= r < 2^63
+    val lr = if (rh != 0) __mathClz(rh) else 64 + __mathClz(rl)
+    val nh = __mathShl128High(rh, rl, lr)
+    val nl = __mathShl128Low(rl, lr)
+    val r = (nh >>> 1) | (if ((nh & 1) != 0 || nl != 0) 1 else 0)
+    val e = be + 65 - lr
+    // round to 53 bits, or to the subnormal grid 2^-1074
+    val k = if (e >= -1084) 10 else -(e + 1074)
+    if (k >= 64) return if (bs == 1) -0.0 else 0.0
+    var m = r >>> k
+    val rem = r & ((1 << k) - 1)
+    val half = 1 << (k - 1)
+    if (rem > half || (rem == half && (m & 1) != 0)) m += 1
+    if (k > 10) return f64FromBits(m | (bs << 63))
+    if (e + 1085 + (m >>> 53) >= 2047) return if (bs == 1) -1.0 / 0.0 else 1.0 / 0.0
+    f64FromBits((((e + 1084) << 52) + m) | (bs << 63))
 }
-fun fclamp(value: f64, minimum: f64, maximum: f64): f64 {
-    val lower = if (value < minimum) minimum else value
-    if (lower > maximum) maximum else lower
-}
+
 fun lerp(from: f64, to: f64, t: f64): f64 = from + (to - from) * t
 
 // --- two-argument arctangent -------------------------------------------------

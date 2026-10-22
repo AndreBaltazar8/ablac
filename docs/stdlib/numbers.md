@@ -41,7 +41,8 @@ fun main {
 | Function | Notes |
 |---|---|
 | `min(a, b)`, `max(a, b)`, `clamp(value, minimum, maximum)` | `int` |
-| `fmin`, `fmax`, `fclamp`, `fabs` | the `f64` versions; `fmin` and `fmax` are IEEE 754 minimum and maximum: NaN if either argument is NaN, and `-0.0` below `0.0` |
+| `fmin`, `fmax`, `fclamp`, `fabs` | the `f64` versions; `fmin` and `fmax` are IEEE 754 minimum and maximum (NaN if either argument is NaN, and `-0.0` below `0.0`), and `fclamp(x, lo, hi)` is `fmin(fmax(x, lo), hi)`; single instructions on AArch64 and Wasm |
+| `fma(x, y, z)` | `x * y + z` rounded once: the hardware's fused multiply-add on AArch64 and x86-64, an exact software one on Wasm and at compile time, with the same bits everywhere |
 | `sqrt`, `pow(x, y)`, `exp`, `log` | `log` is the natural logarithm; all four are correctly rounded (the double nearest the exact result); `pow` follows C's special cases, so `pow(x, 0.0)` and `pow(1.0, y)` are 1 even for a quiet NaN and `pow(-1.0, ±inf)` is 1 |
 | `sin`, `cos`, `tan`, `atan`, `atan2(y, x)` | radians; all five are correctly rounded, for every finite argument however large |
 | `floor`, `ceil`, `trunc`, `roundEven` | `roundEven` rounds halves to even; there is no other rounding mode |
@@ -76,8 +77,8 @@ fun main {
 }
 // output:
 // 1 NaN 1 NaN
-// 1 NaN Infinity -Infinity
-// NaN Infinity 1.4142135623730952e+300
+// NaN NaN -Infinity -Infinity
+// Infinity Infinity 1.4142135623730952e+300
 // -0.8178819121159085 -0.5583496378112418 17.12434728726902
 ```
 
@@ -88,9 +89,10 @@ fun main {
   `Math.max`. `sqrt`, `floor`, `ceil`, `trunc`, `fabs`, `isNaN` and `isFinite`
   are exact in both modules, and the constants are the same values.
 - Where JavaScript and `abla/math` disagree, this module answers as JavaScript
-  does: `pow(1, NaN)` and `pow(±1, ±inf)` are NaN; `fmin` and `fmax` return NaN
-  when either argument is NaN and order -0 below +0; `hypot` of an infinity and
-  a NaN is infinity, and it doesn't overflow before its result does.
+  does: `pow(1, NaN)` and `pow(±1, ±inf)` are NaN, and the other functions
+  round as V8's ports do rather than correctly. Both agree that `fmin` and
+  `fmax` return NaN when either argument is NaN and order -0 below +0, and
+  that `hypot` of an infinity and a NaN is infinity.
 - The functions without a JavaScript counterpart (`min`, `max`, `clamp`,
   `fclamp`, `lerp`, `roundEven`) are `abla/math`'s.
 - The reference is V8's code as written, as Node 22.14 (V8 12.4.254.21) runs

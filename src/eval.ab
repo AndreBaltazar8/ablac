@@ -2196,6 +2196,44 @@ fun bootstrapEvalFloatCall(
     result
 }
 
+// abla/math's two- and three-argument float intrinsics at compile time. The
+// evaluator has no fused multiply-add instruction: abla/math then computes fma
+// in software, as on Wasm, and minimum and maximum here follow
+// llvm.minimum/llvm.maximum (a NaN wins, -0 orders below +0).
+fun bootstrapEvalFloatCallOthers(
+    name: string,
+    count: int,
+    first: BootstrapEvalValue,
+    second: BootstrapEvalValue,
+    third: BootstrapEvalValue
+): BootstrapEvalValue {
+    var result = BootstrapEvalValue("invalid", 0, false, "", BOOTSTRAP_EVAL_NO_ELEMENTS, "", BOOTSTRAP_EVAL_NO_FIELDS)
+    if (name == "ablaF64FmaIsFused" && count == 0) result = bootstrapEvalBoolean(false)
+    if ((name == "ablaF64Minimum" || name == "ablaF64Maximum") && count == 2 &&
+        first.kind == "f64" && second.kind == "f64") {
+        val left = bootstrapEvalAsF64(first)
+        val right = bootstrapEvalAsF64(second)
+        val minimum = name == "ablaF64Minimum"
+        var value = if (minimum == (left < right)) left else right
+        if (left == right) {
+            // equal values differ in bits only as ±0
+            val bits = if (minimum) f64ToBits(left) | f64ToBits(right)
+                else f64ToBits(left) & f64ToBits(right)
+            value = f64FromBits(bits)
+        }
+        if (left != left || right != right) value = left + right
+        result = bootstrapEvalF64(value)
+    }
+    if (name == "ablaF64Fma" && count == 3 && first.kind == "f64" &&
+        second.kind == "f64" && third.kind == "f64") {
+        result = bootstrapEvalF64(__mathFmaSoftware(
+            bootstrapEvalAsF64(first), bootstrapEvalAsF64(second),
+            bootstrapEvalAsF64(third)
+        ))
+    }
+    result
+}
+
 fun bootstrapEvalReturn(value: BootstrapEvalValue): BootstrapEvalValue =
     BootstrapEvalValue("return", 0, false, "", [value], "", [])
 
@@ -8875,7 +8913,24 @@ fun bootstrapEvaluateCallText(
         result = evaluator.evaluate(expression.children[0])
     }
     val floatIntrinsic = bootstrapEvalFloatIntrinsic(targetName)
-    if (floatIntrinsic && expression.children.size == 1) {
+    val floatArguments = expression.children.size
+    if (floatIntrinsic && floatArguments != 1) {
+        val none = bootstrapEvalInteger(0)
+        result = bootstrapEvalFloatCallOthers(
+            targetName, floatArguments,
+            if (floatArguments > 0) evaluator.evaluate(expression.children[0]) else none,
+            if (floatArguments > 1) evaluator.evaluate(expression.children[1]) else none,
+            if (floatArguments > 2) evaluator.evaluate(expression.children[2]) else none
+        )
+        if (result.kind == "invalid") {
+            evaluator.errors = evaluator.errors + 1
+            evaluator.recordEvaluatorDiagnostic(
+                "E_EVAL_INTRINSIC_ARGUMENT",
+                "$targetName expected numbers"
+            )
+        }
+    }
+    if (floatIntrinsic && floatArguments == 1) {
         result = bootstrapEvalFloatCall(
             targetName, evaluator.evaluate(expression.children[0])
         )
