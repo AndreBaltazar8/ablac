@@ -198,6 +198,7 @@ that cannot be read is `-1`.
 | `maximumDescriptors` | `processMaximumDescriptors()` | the soft `RLIMIT_NOFILE`, what `ulimit -n` prints; `-1` when unlimited |
 | `startTimeMilliseconds` | `processStartTimeMilliseconds()` | when the process started, in Unix milliseconds |
 | `heapBytes` | `processHeapBytes()` | bytes the Abla allocator holds: its own running count (the same as `memoryLiveBytes()` in `abla/memory`), so garbage not yet collected is included |
+| `dataBytes` | `processDataBytes()` | the data segment (Linux `VmData`: the heap and private anonymous mappings, what Prometheus reports as `process_heap_bytes`); `-1` on macOS |
 
 `cpuUserSeconds()`, `cpuSystemSeconds()`, `cpuSeconds()` (both together) and
 `startTimeSeconds()` give the same numbers as `f64` seconds (print them with
