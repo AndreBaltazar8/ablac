@@ -113,11 +113,13 @@ only its parse errors.
 | `interface.member-conflict:<I>.<m>:<parent>` | an interface declaring a parent's member again with another signature |
 | `interface.default-ambiguous:<m>:<C>` | two interfaces the class conforms to, neither extending the other, give `m` a default, and the class has no method of its own |
 | `interface.plain-into-resource:<I>:<C>` | a class that isn't a resource conforming to a resource interface |
+| `interface.sealed-foreign:<I>:<name>` | a class (or `extend`, or interface) in another module than the sealed interface `I` joining it |
+| `when.is-type:<subject>:<type>` | a `when` arm `is T` where `T` isn't a class conforming to the subject's interface, or an interface extending it |
 | `interface.drop-member:<I>` | an interface declaring `drop`, which is each resource class's own |
-| `interface.cast-resource:<I>` | `as?` on a resource interface's value, which would leave two owners (not supported yet) |
+| `interface.cast-resource:<I>` | `as?` on a resource interface's value, which would leave two owners (not supported yet; a `when` arm `is A` sees it as its class without moving it) |
 | `interface.no-witness:<I>:<class>` | at run time: a call through an interface on an instance of a class with no witness for it (the dispatch fallback; no program reaches it today) |
 | `E_COMPILER_TRANSFORM_INTERFACE` | `compiler.declareInterface` or `compiler.addConformance` outside a transform, or without its handle and names ([compiler API](compiler-api.md#interfaces)) |
-| `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a generic's `<T>`, a `where` clause, `const` type parameters, an interface's `type Item`, `sealed` |
+| `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a generic's `<T>`, a `where` clause, `const` type parameters, an interface's `type Item`, a `sealed class` |
 | `native.trust:<f>` | calling a trusted function from untrusted code ([trusted code](language.md#trusted-native-implementations)) |
 | `native.runtime-internal:<f>` | calling one of the runtime's address intrinsics or field-slot accessors outside `abla/runtime`, trusted or not ([trusted code](language.md#trusted-native-implementations)) |
 | `noinline.*`, `naked.*`, `section.*`, `wasmImport.*`, `inline-assembly.*` | misused [annotations](language.md#annotations) |

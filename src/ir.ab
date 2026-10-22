@@ -5114,6 +5114,48 @@ class BootstrapLowerer(
         }
     }
 
+    /** In an `is` arm: the subject (a local or parameter) has the type tested. */
+    fun addTypeRefinement(expression: BootstrapExpression, type: string): void {
+        if (expression.kind != "identifier") return
+        val name = expression.text
+        if (this.isLocal(name) || this.isParameter(name)) {
+            val current = if (this.isLocal(name)) this.lowerLocalType(name)
+                else this.lowerParameterType(name)
+            this.refinementNames.append(
+                if (this.isLocal(name)) this.storageFor(name) else name
+            )
+            this.refinementTypes.append(
+                if (bootstrapIsBorrowType(current)) "borrow:$type" else type
+            )
+            this.refinementScopes.append(this.currentScope)
+        }
+        return
+    }
+
+    /** Branches to `matched` when `value` is an instance of `type` (a class,
+     *  or any class conforming to the interface); returns the label reached
+     *  otherwise, not yet placed. */
+    fun lowerIsTest(value: int, type: string, matched: int): int {
+        val classes: array<string> = []
+        if (bootstrapInterfaceIndexIn(this.declarations, type) >= 0) {
+            for (implementer in bootstrapInterfaceImplementers(this.declarations, type)) {
+                classes.append(this.declarations[implementer].name)
+            }
+        } else classes.append(type)
+        var index = 0
+        while (index < classes.size) {
+            val matches = this.emit("object.is", value, -1, classes[index])
+            val next = this.allocateLabel()
+            this.emitControl("branch", matches, matched, next, "")
+            if (index + 1 < classes.size) this.emitControl("label", -1, next, -1, "")
+            else return next
+            index = index + 1
+        }
+        val none = this.allocateLabel()
+        this.emitControl("jump", -1, none, -1, "")
+        none
+    }
+
     fun addNullableRefinements(
         expression: BootstrapExpression,
         conditionIsTrue: bool
@@ -5723,11 +5765,21 @@ class BootstrapLowerer(
                         bootstrapWhenNotNullCondition(expression), true
                     )
                 }
+                val tested = expression.children[branch - 1].kind == "is" &&
+                    !bootstrapWhenArmShared(expression, branch - 1)
+                val previousScope = if (tested) this.enterLocalScope() else 0
+                if (tested) {
+                    this.addTypeRefinement(
+                        expression.children[0],
+                        bootstrapNormalizeType(expression.children[branch - 1].text)
+                    )
+                }
                 branchType = bootstrapJoinTypesWith(
                     branchType,
                     this.lowerExpressionType(expression.children[branch]),
                     this.declarations
                 )
+                if (tested) this.leaveLocalScope(previousScope)
                 branch = branch + 2
             }
             if (notNullScope >= 0) this.leaveLocalScope(notNullScope)
@@ -10492,24 +10544,44 @@ fun bootstrapLowerWhen(
             // (see parseWhen): test them in turn, then lower it once.
             var bodyLabel = -1
             var nextLabel = -1
+            val firstMatch = branch
             while (true) {
-                val matchValue = lowerer.lowerExpression(expression.children[branch])
-                val condition = lowerer.emit("==", subject, matchValue, "")
                 if (bodyLabel < 0) bodyLabel = lowerer.allocateLabel()
-                nextLabel = lowerer.allocateLabel()
-                lowerer.emitControl(
-                    "branch",
-                    condition,
-                    bodyLabel,
-                    nextLabel,
-                    ""
-                )
+                if (expression.children[branch].kind == "is") {
+                    // `is T`: an instance of T, or of a class conforming to it.
+                    nextLabel = lowerer.lowerIsTest(
+                        subject, bootstrapNormalizeType(expression.children[branch].text),
+                        bodyLabel
+                    )
+                } else {
+                    val matchValue = lowerer.lowerExpression(expression.children[branch])
+                    val condition = lowerer.emit("==", subject, matchValue, "")
+                    nextLabel = lowerer.allocateLabel()
+                    lowerer.emitControl(
+                        "branch",
+                        condition,
+                        bodyLabel,
+                        nextLabel,
+                        ""
+                    )
+                }
                 if (!bootstrapWhenSharesBody(expression, branch)) break
                 lowerer.emitControl("label", -1, nextLabel, -1, "")
                 branch = branch + 2
             }
             lowerer.emitControl("label", -1, bodyLabel, -1, "")
+            // A lone `is` arm sees the subject as the type it tested.
+            val tested = expression.children[firstMatch].kind == "is" &&
+                !bootstrapWhenArmShared(expression, firstMatch)
+            val previousScope = if (tested) lowerer.enterLocalScope() else 0
+            if (tested) {
+                lowerer.addTypeRefinement(
+                    expression.children[0],
+                    bootstrapNormalizeType(expression.children[firstMatch].text)
+                )
+            }
             val bodyValue = lowerer.lowerExpression(body)
+            if (tested) lowerer.leaveLocalScope(previousScope)
             lowerer.emitControl(
                 "local.set",
                 bodyValue,
@@ -11044,11 +11116,3 @@ fun bootstrapOrderInitializers(
     return
 }
 
-/** Whether the `when` arm after `branch` is another match of the same `a, b -> body` arm. */
-fun bootstrapWhenSharesBody(expression: BootstrapExpression, branch: int): bool {
-    if (branch + 3 >= expression.children.size) return false
-    if (expression.children[branch + 2].kind == "missing") return false
-    val body = expression.children[branch + 1]
-    val next = expression.children[branch + 3]
-    next.begin == body.begin && next.end == body.end && next.kind == body.kind
-}

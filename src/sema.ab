@@ -2449,6 +2449,10 @@ fun bootstrapSemanticHelp(code: string): string {
             "every class conforming to a resource interface is a resource class"
         "interface.cast-resource" ->
             "`as?` would leave two owners of one resource: a resource interface's value isn't cast back yet"
+        "interface.sealed-foreign" ->
+            "a sealed interface's classes (and the interfaces extending it) are declared in its own module"
+        "when.is-type" ->
+            "`is` tests for a class conforming to the subject's interface, or an interface extending it"
         "interface.drop-member" ->
             "`drop` is each resource class's own; an interface value's drop runs its class's"
         "threadShared.library" ->
@@ -2608,6 +2612,13 @@ fun bootstrapTypeConformsIn(
     }
     false
 }
+
+/** Whether the class `owner` is `type` or conforms to it. */
+fun bootstrapTypeConformsOrIs(
+    declarations: array<BootstrapDeclaration>,
+    owner: string,
+    type: string
+): bool = owner == type || bootstrapTypeConformsIn(declarations, owner, type)
 
 /** Every member of the interface `name`: its own, then those it inherits
  *  that it doesn't declare again. */
@@ -6335,6 +6346,10 @@ class BootstrapAnalyzer(
                 if (!owner.isResource && this.declarations[found].isResource) {
                     this.failAtOffset("interface.plain-into-resource:$interfaceName:${declaration.name}", declaration.begin)
                 }
+                val sealed = this.foreignSealed(interfaceName, declaration.sourceIdentity)
+                if (sealed != "") {
+                    this.failAtOffset("interface.sealed-foreign:$sealed:${declaration.name}", declaration.begin)
+                }
                 for (member in bootstrapInterfaceAllMembers(this.declarations, interfaceName)) {
                     this.validateConformanceMember(
                         declaration, ownerIndex, found, member
@@ -6444,6 +6459,21 @@ class BootstrapAnalyzer(
         return
     }
 
+    /** The sealed interface among `interfaceName` and its ancestors declared
+     *  in another module than `sourceIdentity`, or "". */
+    fun foreignSealed(interfaceName: string, sourceIdentity: string): string {
+        val names = [interfaceName]
+        for (ancestor in bootstrapInterfaceAncestors(this.declarations, interfaceName)) {
+            names.append(ancestor)
+        }
+        for (name in names) {
+            val found = this.interfaceDeclaration(name)
+            if (found >= 0 && this.declarations[found].isSealed &&
+                this.declarations[found].sourceIdentity != sourceIdentity) return name
+        }
+        ""
+    }
+
     /** An interface: its parents are interfaces, once, with no cycle and of
      *  its own kind (resource or plain); a member it declares again has its
      *  parent's signature; each member without a body names its result; and
@@ -6464,6 +6494,11 @@ class BootstrapAnalyzer(
                 this.failAtOffset("interface.duplicate:${declaration.name}:$parentName", declaration.begin)
             } else if (this.declarations[found].isResource != declaration.isResource) {
                 this.failAtOffset("interface.inheritance-resource:${declaration.name}:$parentName", declaration.begin)
+            } else {
+                val sealed = this.foreignSealed(parentName, declaration.sourceIdentity)
+                if (sealed != "") {
+                    this.failAtOffset("interface.sealed-foreign:$sealed:${declaration.name}", declaration.begin)
+                }
             }
         }
         if (bootstrapInterfaceInCycle(this.declarations, declaration.name)) {
@@ -6860,6 +6895,20 @@ class BootstrapAnalyzer(
                 this.refinementScopes.append(this.currentScope)
             }
         }
+    }
+
+    /** In an `is` arm: the subject (a local or parameter that isn't `var`)
+     *  has the type tested. */
+    fun addTypeRefinement(expression: BootstrapExpression, type: string): void {
+        if (expression.kind != "identifier") return
+        val name = expression.text
+        if (this.hasVisibleLocal(name) && this.visibleLocalKind(name) != "var") {
+            val borrowed = bootstrapIsBorrowType(this.findType(name))
+            this.refinementNames.append(this.visibleRefinementBinding(name))
+            this.refinementTypes.append(if (borrowed) "borrow:$type" else type)
+            this.refinementScopes.append(this.currentScope)
+        }
+        return
     }
 
     fun visibleRefinementBinding(name: string): string {
@@ -13347,6 +13396,10 @@ fun bootstrapInferWhen(
     var hasTrue = false
     var hasFalse = false
     val literalKeys: array<string> = []
+    // `is` arms: the classes and interfaces they test, and whether `null` is matched.
+    val isTargets: array<string> = []
+    var hasNull = false
+    val subjectElement = bootstrapWhenSubjectElement(subject)
     if (expression.children.size == 1) analyzer.fail("when.empty")
     val notNullFrom = bootstrapWhenNotNullFrom(expression)
     var notNullScope = -1
@@ -13364,7 +13417,18 @@ fun bootstrapInferWhen(
             }
             hasElse = true
             bootstrapSemanticUnit()
+        } else if (match.kind == "is") {
+            val target = bootstrapNormalizeType(match.text)
+            if (target == subjectElement ||
+                !bootstrapTypeConformsIn(analyzer.declarations, target, subjectElement)) {
+                analyzer.fail("when.is-type@${match.begin}:$subjectElement:$target")
+            }
+            if (bootstrapAffineNamesContain(isTargets, target)) {
+                analyzer.fail("when.duplicate:is $target")
+            } else isTargets.append(target)
+            bootstrapSemanticUnit()
         } else {
+            if (match.kind == "null") hasNull = true
             val matchType = analyzer.infer(match)
             if (!bootstrapTypesCompatible(subject, matchType)) {
                 analyzer.fail("when.match")
@@ -13379,18 +13443,79 @@ fun bootstrapInferWhen(
             }
             bootstrapSemanticUnit()
         }
+        // In an `is` arm the subject (a local or parameter) is the type tested.
+        val tested = match.kind == "is" && !bootstrapWhenArmShared(expression, branch)
+        val previousScope = if (tested) analyzer.enterScope() else 0
+        if (tested) {
+            analyzer.addTypeRefinement(
+                expression.children[0], bootstrapNormalizeType(match.text)
+            )
+        }
         val found = analyzer.infer(expression.children[branch + 1])
+        if (tested) analyzer.leaveScope(previousScope)
         branchType = bootstrapJoinTypesWith(
             branchType, found, analyzer.declarations
         )
         branch = branch + 2
     }
     if (notNullScope >= 0) analyzer.leaveScope(notNullScope)
-    if (!hasElse && !(subject == "bool" && hasTrue && hasFalse)) {
+    // A sealed interface's classes are all known: `is` arms covering each
+    // (and `null`, for a nullable subject) need no `else`.
+    val sealedCovered = isTargets.size > 0 &&
+        (!bootstrapIsNullableType(bootstrapBorrowElementType(subject)) || hasNull) &&
+        bootstrapWhenCoversSealed(analyzer.declarations, subjectElement, isTargets)
+    if (!hasElse && !(subject == "bool" && hasTrue && hasFalse) && !sealedCovered) {
         analyzer.fail("when.non-exhaustive:$subject")
     }
     result = branchType
     result
+}
+
+/** Whether the `when` arm after `branch` is another match of the same `a, b -> body` arm. */
+fun bootstrapWhenSharesBody(expression: BootstrapExpression, branch: int): bool {
+    if (branch + 3 >= expression.children.size) return false
+    if (expression.children[branch + 2].kind == "missing") return false
+    val body = expression.children[branch + 1]
+    val next = expression.children[branch + 3]
+    next.begin == body.begin && next.end == body.end && next.kind == body.kind
+}
+
+/** Whether the `when` arm at `branch` shares its body with a neighbour
+ *  (`a, b -> body`). */
+fun bootstrapWhenArmShared(expression: BootstrapExpression, branch: int): bool =
+    bootstrapWhenSharesBody(expression, branch) ||
+        (branch >= 3 && bootstrapWhenSharesBody(expression, branch - 2))
+
+/** A `when` subject's type without a borrow or `?`: what `is` arms test. */
+fun bootstrapWhenSubjectElement(subject: string): string {
+    val element = bootstrapBorrowElementType(subject)
+    if (bootstrapIsNullableType(element)) bootstrapNullableElementType(element)
+    else element
+}
+
+/** Whether `subject` is a sealed interface and every class conforming to it
+ *  is, or conforms to, one of `targets`. */
+fun bootstrapWhenCoversSealed(
+    declarations: array<BootstrapDeclaration>,
+    subject: string,
+    targets: array<string>
+): bool {
+    val found = bootstrapInterfaceIndexIn(declarations, subject)
+    if (found < 0 || !declarations[found].isSealed) return false
+    for (candidate in declarations) {
+        if (candidate.kind == "class" &&
+            bootstrapTypeConformsIn(declarations, candidate.name, subject)) {
+            var covered = false
+            for (target in targets) {
+                if (target == candidate.name ||
+                    bootstrapTypeConformsIn(declarations, candidate.name, target)) {
+                    covered = true
+                }
+            }
+            if (!covered) return false
+        }
+    }
+    true
 }
 
 class BootstrapStaticInteger(val known: bool, val value: int)

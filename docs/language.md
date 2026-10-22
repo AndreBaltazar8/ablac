@@ -1104,7 +1104,7 @@ fun main {
   class they are an instance of. A resource interface extends only resource
   interfaces, and a plain one only plain ones. `drop` is each class's own, never an
   interface member. `as?` on a resource interface's value isn't supported
-  yet (`interface.cast-resource`). Parameter modes (`var`, `own`, a borrow)
+  (`interface.cast-resource`): a `when` arm `is A` tests it instead. Parameter modes (`var`, `own`, a borrow)
   apply to interface parameters as to class ones.
 
 ```abla
@@ -1171,8 +1171,45 @@ interface value made at compile time lifts into the program as its instance,
 and the [compiler API](compiler-api.md#interfaces) reads and declares
 interfaces and conformances.
 
-> **Still to come.** `sealed interface` with an exhaustive
-> `when (x) { is A -> … }`, and generic interfaces (`interface Source<T>`).
+#### Sealed interfaces and `is`
+
+A `sealed interface` is a sum type. Every class conforming to it, and every
+interface extending it, is declared in its own module
+(`interface.sealed-foreign` otherwise), so its classes are all known. A
+`when` over an interface value tests the class with `is`, and in an arm with
+one `is`, a subject that is a local or parameter (not a `var`) has the type
+tested. A `when` over a sealed interface with an `is` arm for each of its
+classes (an interface arm covers the classes conforming to it, and a
+nullable subject also needs `null ->`) needs no `else`. Over any other
+interface, more classes may come from other modules, so it needs one.
+
+```abla
+import "abla/io"
+
+sealed interface Expr
+
+class Num(val value: int) : Expr
+class Add(val left: Expr, val right: Expr) : Expr
+class Neg(val operand: Expr) : Expr
+
+fun evaluate(expr: Expr): int = when (expr) {
+    is Num -> expr.value
+    is Add -> evaluate(expr.left) + evaluate(expr.right)
+    is Neg -> -evaluate(expr.operand)
+}
+
+fun main {
+    println("${evaluate(Add(Num(2), Neg(Num(5))))}")
+}
+// output:
+// -3
+```
+
+`is` arms on a resource interface's value see it as its class without
+moving it. An `is` naming a type that isn't a class conforming to the
+subject's interface (or an interface extending it) is `when.is-type`.
+
+> **Still to come.** Generic interfaces (`interface Source<T>`).
 
 ## Delegated bindings
 
@@ -1563,11 +1600,14 @@ fun main {
 ```
 
 - Every `when` must be exhaustive. A `bool` subject may list `true` and
-  `false`; any other subject needs a final `else` (`when.non-exhaustive`).
+  `false`, and a [sealed interface](#interfaces) subject an `is` arm for
+  each of its classes; any other subject needs a final `else`
+  (`when.non-exhaustive`).
   `else` must be the last arm and appear once (`when.else-last`,
   `when.else-duplicate`). A repeated literal is `when.duplicate`.
 - The subject is evaluated once. Arms may match integers, booleans, strings
-  and `null`.
+  and `null`, and an interface subject `is A`: an instance of the class `A`,
+  or of a class conforming to the interface `A`.
 - An `if` without `else` is a statement.
 
 Loops are statements. `for (x in source)` iterates over an array, the bytes
