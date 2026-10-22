@@ -363,7 +363,7 @@ as the syntax does. A class is a handle (`compiler.findClass(name)`), and an
 interface is its name:
 
 - `compiler.conformances(type)` lists the interfaces the class conforms to: the
-  ones it declares, then the ones `extend` adds.
+  ones it declares, then the ones `extend` adds, then the ones those extend.
 - `compiler.conformsTo(type, interface)` checks one interface.
 - `compiler.implementers(interface)` lists the classes conforming to an
   interface, in declaration order.
@@ -373,8 +373,9 @@ interface is its name:
 
 From a transform:
 
-- `compiler.declareInterface(name, members)` declares an interface. Each
-  member is given as source (`fun area(): f64`, or with a default body).
+- `compiler.declareInterface(name, members, parents)` declares an interface
+  (extending `parents`, if any). Each member is given as source
+  (`fun area(): f64`, or with a default body).
 - `compiler.addConformance(type, interface, members)` is the programmatic
   `extend`. It makes the class conform, and adds each member's source as an
   extension function of the class. A member's source is written like a

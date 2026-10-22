@@ -2437,8 +2437,20 @@ fun bootstrapSemanticHelp(code: string): string {
             "an interface member without a body declares its result type (`fun area(): f64`); write `: void` for none"
         "interface.extend-unknown" ->
             "`extend` adds interfaces to a class; this name isn't a class"
-        "interface.inheritance" ->
-            "an interface extending another (`interface Solid : Shape`) is not supported yet"
+        "interface.inheritance-cycle" ->
+            "an interface can't extend itself, directly or through its parents"
+        "interface.inheritance-resource" ->
+            "a resource interface extends only resource interfaces, and a plain one only plain ones"
+        "interface.member-conflict" ->
+            "a member declared again in an interface keeps its parent's parameter types, modes and result"
+        "interface.default-ambiguous" ->
+            "two interfaces the class conforms to give this member a default and neither extends the other: give the class its own method"
+        "interface.plain-into-resource" ->
+            "every class conforming to a resource interface is a resource class"
+        "interface.cast-resource" ->
+            "`as?` would leave two owners of one resource: a resource interface's value isn't cast back yet"
+        "interface.drop-member" ->
+            "`drop` is each resource class's own; an interface value's drop runs its class's"
         "threadShared.library" ->
             "`@threadShared` is the standard library's reviewed promise that a global never changes once built; a program shares one between threads through Shared<T> or Mutex<T>"
         "thread.shared-global" ->
@@ -2501,8 +2513,53 @@ fun bootstrapSemanticHelp(code: string): string {
     }
 }
 
+/** The interface declaration named `name`, or -1. */
+fun bootstrapInterfaceIndexIn(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): int {
+    var index = 0
+    while (index < declarations.size) {
+        if (declarations[index].kind == "interface" &&
+            declarations[index].name == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+/** The interfaces `name` extends, directly or through others, each once,
+ *  nearest first (`name` itself left out, and a cycle followed once). */
+fun bootstrapInterfaceAncestors(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): array<string> {
+    val result: array<string> = []
+    var next = 0
+    var current = name
+    var more = true
+    while (more) {
+        val found = bootstrapInterfaceIndexIn(declarations, current)
+        if (found >= 0) {
+            for (parent in declarations[found].conformances) {
+                val parentName = bootstrapNormalizeType(parent)
+                var seen = parentName == name
+                for (previous in result) {
+                    if (previous == parentName) seen = true
+                }
+                if (!seen) result.append(parentName)
+            }
+        }
+        more = next < result.size
+        if (more) {
+            current = result[next]
+            next = next + 1
+        }
+    }
+    result
+}
+
 /** The interfaces the class `name` conforms to: those it declares, then those
- *  `extend name : I` adds, each once, in declaration order. */
+ *  `extend name : I` adds, then the interfaces those extend, each once. */
 fun bootstrapClassInterfaces(
     declarations: array<BootstrapDeclaration>,
     name: string
@@ -2512,16 +2569,171 @@ fun bootstrapClassInterfaces(
         if ((declaration.kind == "class" || declaration.kind == "extend") &&
             declaration.name == name) {
             for (conformance in declaration.conformances) {
-                val interfaceName = bootstrapNormalizeType(conformance)
+                bootstrapAppendInterfaceOnce(result, bootstrapNormalizeType(conformance))
+            }
+        }
+    }
+    val direct = result.size
+    var index = 0
+    while (index < direct) {
+        for (ancestor in bootstrapInterfaceAncestors(declarations, result[index])) {
+            bootstrapAppendInterfaceOnce(result, ancestor)
+        }
+        index = index + 1
+    }
+    result
+}
+
+fun bootstrapAppendInterfaceOnce(var names: array<string>, name: string): void {
+    for (previous in names) {
+        if (previous == name) return
+    }
+    names.append(name)
+    return
+}
+
+/** Whether `type` (a class or an interface) is, or conforms to, the
+ *  interface `interfaceName`. */
+fun bootstrapTypeConformsIn(
+    declarations: array<BootstrapDeclaration>,
+    type: string,
+    interfaceName: string
+): bool {
+    if (type == interfaceName) return bootstrapInterfaceIndexIn(declarations, type) >= 0
+    val interfaces = if (bootstrapInterfaceIndexIn(declarations, type) >= 0)
+        bootstrapInterfaceAncestors(declarations, type)
+        else bootstrapClassInterfaces(declarations, type)
+    for (candidate in interfaces) {
+        if (candidate == interfaceName) return true
+    }
+    false
+}
+
+/** Every member of the interface `name`: its own, then those it inherits
+ *  that it doesn't declare again. */
+fun bootstrapInterfaceAllMembers(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): array<BootstrapDeclaration> {
+    val result: array<BootstrapDeclaration> = []
+    val names = [name]
+    for (ancestor in bootstrapInterfaceAncestors(declarations, name)) {
+        names.append(ancestor)
+    }
+    for (owner in names) {
+        val found = bootstrapInterfaceIndexIn(declarations, owner)
+        if (found >= 0) {
+            for (member in bootstrapInterfaceMembers(declarations[found])) {
                 var seen = false
                 for (previous in result) {
-                    if (previous == interfaceName) seen = true
+                    if (previous.name == member.name) seen = true
                 }
-                if (!seen) result.append(interfaceName)
+                if (!seen) result.append(member)
             }
         }
     }
     result
+}
+
+/** The interface declaring the member `member` that `name` has (itself, or
+ *  the nearest ancestor that declares it), or "". */
+fun bootstrapInterfaceDeclaringOwner(
+    declarations: array<BootstrapDeclaration>,
+    name: string,
+    member: string
+): string {
+    val names = [name]
+    for (ancestor in bootstrapInterfaceAncestors(declarations, name)) {
+        names.append(ancestor)
+    }
+    for (owner in names) {
+        val found = bootstrapInterfaceIndexIn(declarations, owner)
+        if (found >= 0) {
+            for (candidate in bootstrapInterfaceMembers(declarations[found])) {
+                if (candidate.name == member) return owner
+            }
+        }
+    }
+    ""
+}
+
+/** The interface whose default body answers `member` for the class `owner`:
+ *  among the interfaces it conforms to that give `member` a body, the one no
+ *  other of them extends. "" when none does, "?" when two unrelated ones do. */
+fun bootstrapDefaultInterface(
+    declarations: array<BootstrapDeclaration>,
+    owner: string,
+    member: string
+): string {
+    val candidates: array<string> = []
+    for (interfaceName in bootstrapClassInterfaces(declarations, owner)) {
+        val found = bootstrapInterfaceIndexIn(declarations, interfaceName)
+        if (found >= 0) {
+            for (candidate in bootstrapInterfaceMembers(declarations[found])) {
+                if (candidate.name == member &&
+                    bootstrapInterfaceMemberHasDefault(declarations[found], candidate)) {
+                    candidates.append(interfaceName)
+                }
+            }
+        }
+    }
+    val specific: array<string> = []
+    for (candidate in candidates) {
+        var extended = false
+        for (other in candidates) {
+            if (other != candidate) {
+                for (ancestor in bootstrapInterfaceAncestors(declarations, other)) {
+                    if (ancestor == candidate) extended = true
+                }
+            }
+        }
+        if (!extended) specific.append(candidate)
+    }
+    if (specific.size == 1) specific[0]
+    else if (specific.size == 0) ""
+    else "?"
+}
+
+/** The first of the class's interfaces that declares `member`, or "". */
+fun bootstrapFirstInterfaceWithMember(
+    declarations: array<BootstrapDeclaration>,
+    owner: string,
+    member: string
+): string {
+    for (interfaceName in bootstrapClassInterfaces(declarations, owner)) {
+        val found = bootstrapInterfaceIndexIn(declarations, interfaceName)
+        if (found >= 0) {
+            for (candidate in bootstrapInterfaceMembers(declarations[found])) {
+                if (candidate.name == member) return interfaceName
+            }
+        }
+    }
+    ""
+}
+
+/** Whether the interface `name` extends itself, through any parents. */
+fun bootstrapInterfaceInCycle(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): bool {
+    val found = bootstrapInterfaceIndexIn(declarations, name)
+    if (found < 0) return false
+    val reached: array<string> = []
+    for (parent in declarations[found].conformances) {
+        bootstrapAppendInterfaceOnce(reached, bootstrapNormalizeType(parent))
+    }
+    var index = 0
+    while (index < reached.size) {
+        if (reached[index] == name) return true
+        val next = bootstrapInterfaceIndexIn(declarations, reached[index])
+        if (next >= 0) {
+            for (parent in declarations[next].conformances) {
+                bootstrapAppendInterfaceOnce(reached, bootstrapNormalizeType(parent))
+            }
+        }
+        index = index + 1
+    }
+    false
 }
 
 /** An interface's members as written: once lowering made each member a
@@ -2588,8 +2800,8 @@ fun bootstrapWitnessKind(
             bootstrapNormalizeType(candidate.extensionOwner) == owner.name &&
             bootstrapConformanceSignatureMatches(member, candidate)) return "extension"
     }
-    if (bootstrapInterfaceMemberHasDefault(interfaceDeclaration, member)) "default"
-    else ""
+    val provider = bootstrapDefaultInterface(declarations, owner.name, member.name)
+    if (provider != "" && provider != "?") "default" else ""
 }
 
 /** bootstrapJoinTypes, where two classes (or a class and an interface it
@@ -2617,26 +2829,46 @@ fun bootstrapJoinTypesWith(
     if (leftDeclaration < 0 || rightDeclaration < 0) return joined
     val leftInterfaces = bootstrapDeclaredInterfaces(declarations, declarations[leftDeclaration])
     val rightInterfaces = bootstrapDeclaredInterfaces(declarations, declarations[rightDeclaration])
-    var shared = ""
-    var count = 0
+    val shared: array<string> = []
     for (candidate in leftInterfaces) {
         for (other in rightInterfaces) {
-            if (candidate == other) {
-                shared = candidate
-                count = count + 1
-            }
+            if (candidate == other) shared.append(candidate)
         }
     }
-    if (count == 1) shared else joined
+    // The most specific: one no other shared interface extends.
+    var result = ""
+    var count = 0
+    for (candidate in shared) {
+        var extended = false
+        for (other in shared) {
+            if (other != candidate) {
+                for (ancestor in bootstrapInterfaceAncestors(declarations, other)) {
+                    if (ancestor == candidate) extended = true
+                }
+            }
+        }
+        if (!extended) {
+            result = candidate
+            count = count + 1
+        }
+    }
+    if (count == 1) result else joined
 }
 
 /** A class's interfaces, or an interface itself. */
 fun bootstrapDeclaredInterfaces(
     declarations: array<BootstrapDeclaration>,
     declaration: BootstrapDeclaration
-): array<string> =
-    if (declaration.kind == "interface") [declaration.name]
-    else bootstrapClassInterfaces(declarations, declaration.name)
+): array<string> {
+    if (declaration.kind != "interface") {
+        return bootstrapClassInterfaces(declarations, declaration.name)
+    }
+    val result = [declaration.name]
+    for (ancestor in bootstrapInterfaceAncestors(declarations, declaration.name)) {
+        result.append(ancestor)
+    }
+    result
+}
 
 // Compute the narrowest type that can represent either branch of an
 // expression. In particular, `null` joined with `T` is `T?`; treating that
@@ -3022,7 +3254,9 @@ fun bootstrapBuildAffineTypeNames(
     var declaration = 0
     while (declaration < declarations.size) {
         val found = declarations[declaration]
-        if (found.kind == "class" && found.isResource &&
+        // A resource interface's values are resources too.
+        if ((found.kind == "class" || found.kind == "interface") &&
+            found.isResource &&
             !bootstrapAffineNamesContain(names, found.name)) {
             names.append(found.name)
         }
@@ -5626,6 +5860,41 @@ fun bootstrapMethodDeclarationIndex(
         }
         declaration = declaration + 1
     }
+    // An interface's inherited members, under the interface: a call on a
+    // `Solid` finds `Shape`'s `area` (with `Shape`'s handle).
+    declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.kind == "interface" && candidate.conformances.size > 0) {
+            val owner = bootstrapNormalizeType(candidate.name)
+            for (member in bootstrapInterfaceAllMembers(declarations, candidate.name)) {
+                val key = bootstrapMethodDeclarationKey(owner, member.name)
+                var present = false
+                for (existing in keys) {
+                    if (existing == key) present = true
+                }
+                if (!present) {
+                    val declaringKey = bootstrapMethodDeclarationKey(
+                        bootstrapInterfaceDeclaringOwner(
+                            declarations, candidate.name, member.name
+                        ),
+                        member.name
+                    )
+                    var handle = -1
+                    var entry = 0
+                    while (entry < keys.size) {
+                        if (keys[entry] == declaringKey) handle = handles[entry]
+                        entry = entry + 1
+                    }
+                    keys.append(key)
+                    owners.append(owner)
+                    methods.append(member)
+                    handles.append(handle)
+                }
+            }
+        }
+        declaration = declaration + 1
+    }
     var capacity = 8
     while (capacity < keys.size * 2 + 1) capacity = capacity * 2
     val slots: array<int> = []
@@ -5992,11 +6261,9 @@ class BootstrapAnalyzer(
         val found = this.typeDeclarations.find(type)
         if (found < 0) return false
         val declaration = this.declarations[found]
-        if (declaration.kind != "class" || declaration.name != type) return false
-        for (conformance in bootstrapClassInterfaces(this.declarations, type)) {
-            if (conformance == interfaceName) return true
-        }
-        false
+        if ((declaration.kind != "class" && declaration.kind != "interface") ||
+            declaration.name != type) return false
+        bootstrapTypeConformsIn(this.declarations, type, interfaceName)
     }
 
     /** A class value where an interface it conforms to is expected (and `C?`
@@ -6020,19 +6287,7 @@ class BootstrapAnalyzer(
      *  yet. */
     fun validateConformances(declaration: BootstrapDeclaration): void {
         if (declaration.kind == "interface") {
-            if (declaration.conformances.size > 0) {
-                this.failAtOffset("interface.inheritance:${declaration.name}", declaration.begin)
-            }
-            // A member without a body names its result: no body to infer it from.
-            for (member in declaration.methods) {
-                if (member.expression.kind == "missing" &&
-                    member.resultType == "inferred") {
-                    this.failAtOffset(
-                        "interface.member-untyped:${declaration.name}.${member.name}",
-                        member.begin
-                    )
-                }
-            }
+            this.validateInterface(declaration)
             return
         }
         if (declaration.kind != "class" && declaration.kind != "extend") return
@@ -6072,11 +6327,15 @@ class BootstrapAnalyzer(
             } else if (duplicate) {
                 this.failAtOffset("interface.duplicate:${declaration.name}:$interfaceName", declaration.begin)
             } else {
-                // A plain interface's values copy freely: no resource behind one.
-                if (owner.isResource) {
+                // A plain interface's values copy freely: no resource behind
+                // one. A resource interface's are resources: only resources.
+                if (owner.isResource && !this.declarations[found].isResource) {
                     this.failAtOffset("interface.resource-into-plain:$interfaceName:${declaration.name}", declaration.begin)
                 }
-                for (member in bootstrapInterfaceMembers(this.declarations[found])) {
+                if (!owner.isResource && this.declarations[found].isResource) {
+                    this.failAtOffset("interface.plain-into-resource:$interfaceName:${declaration.name}", declaration.begin)
+                }
+                for (member in bootstrapInterfaceAllMembers(this.declarations, interfaceName)) {
                     this.validateConformanceMember(
                         declaration, ownerIndex, found, member
                     )
@@ -6096,6 +6355,10 @@ class BootstrapAnalyzer(
         val target = bootstrapNormalizeType(expression.text)
         if (operand != "unknown" && !this.conformsTo(target, source)) {
             this.fail("interface.cast@${expression.begin}:$operand:$target")
+        } else if (this.interfaceDeclaration(source) >= 0 &&
+            this.declarations[this.interfaceDeclaration(source)].isResource) {
+            // It would leave two owners of one resource.
+            this.fail("interface.cast-resource@${expression.begin}:$source")
         }
         "nullable:$target"
     }
@@ -6163,9 +6426,75 @@ class BootstrapAnalyzer(
                 "interface.member-signature:$interfaceName.${member.name}:${owner.name}:$wanted",
                 methodBegin
             )
-        } else if (!named &&
-            !bootstrapInterfaceMemberHasDefault(interfaceDeclaration, member)) {
-            this.failAtOffset("interface.missing-member:$interfaceName.${member.name}:${owner.name}", declaration.begin)
+        } else if (!named) {
+            val provider = bootstrapDefaultInterface(
+                this.declarations, owner.name, member.name
+            )
+            if (provider == "?") {
+                // Once, from the first of the class's interfaces with the member.
+                if (bootstrapInterfaceDeclaringOwner(
+                    this.declarations, interfaceName, member.name
+                ) == bootstrapFirstInterfaceWithMember(
+                    this.declarations, owner.name, member.name
+                )) this.failAtOffset("interface.default-ambiguous:${member.name}:${owner.name}", declaration.begin)
+            } else if (provider == "") {
+                this.failAtOffset("interface.missing-member:$interfaceName.${member.name}:${owner.name}", declaration.begin)
+            }
+        }
+        return
+    }
+
+    /** An interface: its parents are interfaces, once, with no cycle and of
+     *  its own kind (resource or plain); a member it declares again has its
+     *  parent's signature; each member without a body names its result; and
+     *  `drop` is a class's own. */
+    fun validateInterface(declaration: BootstrapDeclaration): void {
+        val seen: array<string> = []
+        for (written in declaration.conformances) {
+            val parentName = bootstrapNormalizeType(written)
+            val found = this.interfaceDeclaration(parentName)
+            var duplicate = false
+            for (previous in seen) {
+                if (previous == parentName) duplicate = true
+            }
+            seen.append(parentName)
+            if (found < 0) {
+                this.failAtOffset("interface.unknown:${declaration.name}:$parentName", declaration.begin)
+            } else if (duplicate) {
+                this.failAtOffset("interface.duplicate:${declaration.name}:$parentName", declaration.begin)
+            } else if (this.declarations[found].isResource != declaration.isResource) {
+                this.failAtOffset("interface.inheritance-resource:${declaration.name}:$parentName", declaration.begin)
+            }
+        }
+        if (bootstrapInterfaceInCycle(this.declarations, declaration.name)) {
+            this.failAtOffset("interface.inheritance-cycle:${declaration.name}", declaration.begin)
+        }
+        for (member in bootstrapInterfaceMembers(declaration)) {
+            // A member without a body names its result: no body to infer it from.
+            if (member.expression.kind == "missing" &&
+                member.resultType == "inferred") {
+                this.failAtOffset(
+                    "interface.member-untyped:${declaration.name}.${member.name}",
+                    member.begin
+                )
+            }
+            if (member.name == "drop") {
+                this.failAtOffset("interface.drop-member:${declaration.name}", member.begin)
+            }
+            for (ancestor in bootstrapInterfaceAncestors(this.declarations, declaration.name)) {
+                val ancestorIndex = this.interfaceDeclaration(ancestor)
+                if (ancestorIndex >= 0) {
+                    for (inherited in bootstrapInterfaceMembers(this.declarations[ancestorIndex])) {
+                        if (inherited.name == member.name &&
+                            !bootstrapConformanceSignatureMatches(inherited, member)) {
+                            this.failAtOffset(
+                                "interface.member-conflict:${declaration.name}.${member.name}:$ancestor",
+                                member.begin
+                            )
+                        }
+                    }
+                }
+            }
         }
         return
     }

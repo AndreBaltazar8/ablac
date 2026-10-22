@@ -1086,10 +1086,26 @@ fun main {
   otherwise (a nullable interface value too). A class that doesn't conform to
   the interface can never be the result, so naming one is an error
   (`interface.cast`).
-- **Ownership.** A resource class can't conform to a plain interface
-  (`interface.resource-into-plain`), because plain interface values copy
-  freely. Parameter modes (`var`, `own`, a borrow) apply to interface
-  parameters as to class ones.
+- **Inheritance.** `interface Solid : Shape, Named { … }` extends other
+  interfaces. A `Solid` stands wherever a `Shape` is expected, a class that
+  conforms to `Solid` conforms to `Shape` too and answers its members, and a
+  call on a `Solid` reaches the members it inherits. An interface may declare
+  a parent's member again, with the same signature
+  (`interface.member-conflict` otherwise), to give it a default of its own.
+  When a class has no method for a member, the default of the most specific
+  of its interfaces answers. Two unrelated defaults are
+  `interface.default-ambiguous`: the class then writes its own. An interface
+  can't extend itself (`interface.inheritance-cycle`).
+- **Ownership.** A plain interface's values copy freely, so a resource class
+  can't conform to one (`interface.resource-into-plain`). A
+  `resource interface` is the opposite: every class conforming to it is a
+  resource class (`interface.plain-into-resource`), and its values are
+  resources, with one owner, moved with `move(x)` and dropped through the
+  class they are an instance of. A resource interface extends only resource
+  interfaces, and a plain one only plain ones. `drop` is each class's own, never an
+  interface member. `as?` on a resource interface's value isn't supported
+  yet (`interface.cast-resource`). Parameter modes (`var`, `own`, a borrow)
+  apply to interface parameters as to class ones.
 
 ```abla
 import "abla/io"
@@ -1125,15 +1141,38 @@ That can't happen in a program today: an interface value only ever comes from a
 class that conforms. The fallback is where a conformance added at run time
 would be found.
 
+```abla
+import "abla/io"
+
+resource interface Handle {
+    fun id(): int
+}
+
+resource class File(val number: int) : Handle {
+    fun id(): int = this.number
+    fun drop(): void {
+        println("close ${this.number}")
+    }
+}
+
+fun finish(own handle: Handle): int = handle.id()
+
+fun main {
+    val handle: Handle = File(3)
+    println("finished ${finish(move(handle))}")
+}
+// output:
+// close 3
+// finished 3
+```
+
 Compile-time code (`#`) calls through interfaces with the same results, an
 interface value made at compile time lifts into the program as its instance,
 and the [compiler API](compiler-api.md#interfaces) reads and declares
 interfaces and conformances.
 
-> **Still to come.** Interfaces extending other interfaces
-> (`interface Solid : Shape`, `interface.inheritance` today), `resource
-> interface`, `sealed interface` with an exhaustive `when (x) { is A -> … }`,
-> and generic interfaces (`interface Source<T>`).
+> **Still to come.** `sealed interface` with an exhaustive
+> `when (x) { is A -> … }`, and generic interfaces (`interface Source<T>`).
 
 ## Delegated bindings
 

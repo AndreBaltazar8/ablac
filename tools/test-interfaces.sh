@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Interfaces: a class's `: Shape, Named` conformance and `extend`, the implicit
+# Interfaces: a class's `: Shape, Named` conformance and `extend`, inheritance,
+# resource interfaces (dropped through their class), the implicit
 # upcast, calls through an interface value (the class's method, an extension
 # function or the interface's default body), `as?`, other modules, `#` in both
 # tiers (the same results at compile time, and lifted values), the compiler
@@ -44,8 +45,10 @@ for mode in interp jit; do
     runs dispatch "$dispatched"$'\n'"$dispatched" "$mode"
     runs extend " (1, 2)! #abla! true"$'\n'" (1, 2)! #abla! true" "$mode"
     runs lift "shape of 12 21 true" "$mode"
+    runs inheritance "45 24 cube of 8 shape of 9 cube of 8 cube true"$'\n'"45 24 cube of 8 shape of 9 cube of 8 cube true" "$mode"
     runs api $'shape of 4\npoint\nsquare 3\n Shape Labeled | Square Point | area:method describe:default | area:extension describe:extension | false' "$mode" 0
 done
+runs resource $'peek 3\nfinishing 80\nclose socket 80\nfinishing 3\nclose file 3\nsum 83\nkept 22\nmany 16\nclose file 7\nclose socket 9\nclose socket 22'
 rejected missing-member 'interface.missing-member:Shape.area:Square' 'missing-member.ab:5:1'
 rejected member-signature 'interface.member-signature:Shape.scaled:Square:function:(f64)->f64' \
     'member-signature.ab:6:5'
@@ -54,9 +57,17 @@ rejected member-untyped 'interface.member-untyped:Closer.close' 'member-untyped.
 rejected unknown 'interface.unknown:Square:Point' 'interface.unknown:Square:Drawable'
 rejected duplicate 'interface.duplicate:Square:Shape'
 rejected resource-into-plain 'interface.resource-into-plain:Closer:Ticket'
-rejected inheritance 'interface.inheritance:Solid'
+rejected inheritance-cycle 'interface.inheritance-cycle:A' 'interface.inheritance-cycle:B'
+rejected inheritance-resource 'interface.inheritance-resource:Labeled:Handle'
+rejected member-conflict 'interface.member-conflict:Solid.area:Shape' 'member-conflict.ab:6:5'
+rejected default-ambiguous 'interface.default-ambiguous:hello:Both'
+[[ $(grep -c 'interface.default-ambiguous' "$output_directory/default-ambiguous.err") == 1 ]] ||
+    { echo "interfaces: default-ambiguous reported more than once"; exit 1; }
+rejected plain-into-resource 'interface.plain-into-resource:Handle:Plain'
+rejected drop-member 'interface.drop-member:Handle'
+rejected cast-resource 'interface.cast-resource@'
 rejected not-conforming 'function.argument:measure@'
 rejected cast-impossible 'interface.cast@' ':Shape:Label' 'cast-impossible.ab:19:17'
 rejected extend-unknown 'interface.extend-unknown:Missing'
 rejected extend-missing 'interface.missing-member:Shape.area:Square' 'extend-missing.ab:7:1'
-echo "interfaces: conformance, extend, dispatch, defaults, as?, modules, # (both tiers), lift, compiler API, diagnostics"
+echo "interfaces: conformance, extend, inheritance, resource interfaces, dispatch, defaults, as?, modules, # (both tiers), lift, compiler API, diagnostics"

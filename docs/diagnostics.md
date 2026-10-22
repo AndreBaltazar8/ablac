@@ -108,7 +108,13 @@ only its parse errors.
 | `interface.extend-unknown:<name>` | `extend` names something that isn't a class |
 | `interface.resource-into-plain:<I>:<C>` | a resource class conforming to a plain interface, whose values copy freely |
 | `interface.cast:<from>:<to>` | `x as? C` where `C` doesn't conform to `x`'s interface, so the cast could never succeed |
-| `interface.inheritance:<I>` | an interface with parents (`interface Solid : Shape`), not supported yet |
+| `interface.inheritance-cycle:<I>` | an interface extending itself, directly or through its parents |
+| `interface.inheritance-resource:<I>:<parent>` | a resource interface extending a plain one, or a plain one a resource one |
+| `interface.member-conflict:<I>.<m>:<parent>` | an interface declaring a parent's member again with another signature |
+| `interface.default-ambiguous:<m>:<C>` | two interfaces the class conforms to, neither extending the other, give `m` a default, and the class has no method of its own |
+| `interface.plain-into-resource:<I>:<C>` | a class that isn't a resource conforming to a resource interface |
+| `interface.drop-member:<I>` | an interface declaring `drop`, which is each resource class's own |
+| `interface.cast-resource:<I>` | `as?` on a resource interface's value, which would leave two owners (not supported yet) |
 | `interface.no-witness:<I>:<class>` | at run time: a call through an interface on an instance of a class with no witness for it (the dispatch fallback; no program reaches it today) |
 | `E_COMPILER_TRANSFORM_INTERFACE` | `compiler.declareInterface` or `compiler.addConformance` outside a transform, or without its handle and names ([compiler API](compiler-api.md#interfaces)) |
 | `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a generic's `<T>`, a `where` clause, `const` type parameters, an interface's `type Item`, `sealed` |

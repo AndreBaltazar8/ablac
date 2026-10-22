@@ -2997,6 +2997,15 @@ fun bootstrapCollectDropType(
         bootstrapSemanticUnit()
     } else {
         types.append(normalized)
+        // A resource interface's drop runs its class's: each conforming class's.
+        val interfaceIndex = bootstrapInterfaceIndexIn(declarations, normalized)
+        if (interfaceIndex >= 0) {
+            for (implementer in bootstrapInterfaceImplementers(declarations, normalized)) {
+                bootstrapCollectDropType(
+                    declarations[implementer].name, declarations, affineTypes, types
+                )
+            }
+        }
         if (bootstrapIsNullableType(normalized)) {
             bootstrapCollectDropType(
                 bootstrapNullableElementType(normalized),
@@ -3300,6 +3309,25 @@ fun bootstrapBuildDropFunction(
         val next = builder.emit("+", current, one, "")
         builder.emitControl("local.set", next, -1, -1, indexStorage)
         builder.emitControl("jump", -1, conditionLabel, -1, "")
+    } else if (bootstrapInterfaceIndexIn(declarations, normalized) >= 0) {
+        // A resource interface value: the drop of the class it is an
+        // instance of (the dispatch's fallback for any other).
+        val dropped = builder.label()
+        for (implementer in bootstrapInterfaceImplementers(declarations, normalized)) {
+            val name = declarations[implementer].name
+            val matches = builder.emit("object.is", value, -1, name)
+            val armLabel = builder.label()
+            val nextLabel = builder.label()
+            builder.emitControl("branch", matches, armLabel, nextLabel, "")
+            builder.emitControl("label", -1, armLabel, -1, "")
+            builder.emitMany("call", [value], bootstrapDropFunctionName(name))
+            builder.emitControl("jump", -1, dropped, -1, "")
+            builder.emitControl("label", -1, nextLabel, -1, "")
+        }
+        val interfaceName = builder.emit("const.string", -1, -1, normalized)
+        builder.emit("interface.no-witness", value, interfaceName, "")
+        builder.emitControl("unreachable", -1, -1, -1, "")
+        builder.emitControl("label", -1, dropped, -1, "")
     } else {
         val declarationIndex = bootstrapDropDeclarationIndex(
             declarations,
@@ -5365,6 +5393,16 @@ class BootstrapLowerer(
             )
         }
         result
+    }
+
+    /** `owner`, or for an interface's inherited member the interface that
+     *  declares it, whose dispatcher the call goes to. */
+    fun lowerInterfaceDeclaringOwner(owner: string, name: string): string {
+        val found = this.typeDeclarations.find(owner)
+        if (found < 0 || this.declarations[found].kind != "interface" ||
+            this.declarations[found].conformances.size == 0) return owner
+        val declaring = bootstrapInterfaceDeclaringOwner(this.declarations, owner, name)
+        if (declaring == "") owner else declaring
     }
 
     fun lowerExtensionOwner(owner: string, name: string): string {
@@ -9960,7 +9998,7 @@ fun bootstrapLowerMemberCall(
         else result = lowerer.emitMany(
             "call",
             arguments,
-            "${methodOwner}_${expression.text}"
+            "${lowerer.lowerInterfaceDeclaringOwner(methodOwner, expression.text)}_${expression.text}"
         )
     }
     result
