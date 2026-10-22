@@ -63,8 +63,19 @@ run_program 42 || exit 1
 # A byte-distinct compiler must not reuse an object made by another compiler,
 # even for identical program source. The variant behaves the same; only its
 # image (an inert ELF section, or a Mach-O signature identifier) differs.
+# (Beside the launcher, or beside the launcher a link to one points at.)
 compiler_payload=$compiler
-if [[ -x $compiler.bin ]]; then compiler_payload=$compiler.bin; fi
+resolved=$compiler
+while [[ -L $resolved ]]; do
+    target=$(readlink "$resolved")
+    [[ $target == /* ]] || target=$(dirname "$resolved")/$target
+    resolved=$target
+done
+if [[ -x $compiler.bin ]]; then
+    compiler_payload=$compiler.bin
+elif [[ -x $resolved.bin ]]; then
+    compiler_payload=$resolved.bin
+fi
 # `make_variant <path> <identity>`: a copy of the compiler whose image differs.
 make_variant() {
     cp -- "$compiler_payload" "$1" || return 1
@@ -113,23 +124,24 @@ run_program 42 || exit 1
 
 # The program imports nothing, but every hosted program compiles the standard
 # library's runtime modules: editing one in another sysroot must miss, and so
-# must the unedited copy (another sysroot's modules are other files).
-sysroot="$output_directory/sysroot"
-rm -rf -- "$sysroot" || exit 1
-mkdir -p -- "$sysroot" || exit 1
+# must the unedited copy (another sysroot's modules are other files). (The
+# binary itself: a launcher may set ABLA_SYSROOT whatever the caller's is.)
+# A new directory each run: a rerun's copy is another sysroot too.
+rm -rf -- "$output_directory"/sysroot.* || exit 1
+sysroot=$(mktemp -d "$output_directory/sysroot.XXXXXX") || exit 1
 cp -R -- "$project_root/stdlib" "$project_root/runtime" "$sysroot/" || exit 1
 printf '%s\n' 'native-object-cache-hit' > "$output.ll"
-ABLA_SYSROOT=$sysroot "$compiler" build "$source_file" -o "$output" --fast ||
+ABLA_SYSROOT=$sysroot "$compiler_payload" build "$source_file" -o "$output" --fast ||
     exit 1
 expect_miss 'sysroots' || exit 1
 printf '%s\n' 'native-object-cache-hit' > "$output.ll"
-ABLA_SYSROOT=$sysroot "$compiler" build "$source_file" -o "$output" --fast ||
+ABLA_SYSROOT=$sysroot "$compiler_payload" build "$source_file" -o "$output" --fast ||
     exit 1
 expect_hit || exit 1
 printf '\n// An edit that changes no behavior.\n' \
     >> "$sysroot/stdlib/abla/runtime/self/entry.ab" || exit 1
 printf '%s\n' 'native-object-cache-hit' > "$output.ll"
-ABLA_SYSROOT=$sysroot "$compiler" build "$source_file" -o "$output" --fast ||
+ABLA_SYSROOT=$sysroot "$compiler_payload" build "$source_file" -o "$output" --fast ||
     exit 1
 expect_miss 'standard library edits' || exit 1
 run_program 42 || exit 1

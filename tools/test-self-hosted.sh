@@ -6,6 +6,19 @@ compiler=${1:-$project_root/build/ablac}
 if [[ $compiler != /* ]]; then
     compiler="$project_root/$compiler"
 fi
+# Some tests take the compiler binary itself (<compiler>.bin, beside the
+# launcher). A link to a launcher elsewhere has its binary beside that launcher.
+if [[ ! -x $compiler.bin ]]; then
+    resolved=$compiler
+    while [[ -L $resolved ]]; do
+        target=$(readlink "$resolved")
+        [[ $target == /* ]] || target=$(dirname "$resolved")/$target
+        resolved=$target
+    done
+    if [[ -x $resolved.bin ]]; then
+        compiler=$resolved
+    fi
+fi
 
 if [[ $(uname -s) == Darwin ]]; then
     if [[ -x /opt/homebrew/bin/brew ]]; then
