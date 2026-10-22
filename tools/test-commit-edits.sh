@@ -26,7 +26,7 @@ for mode in interp jit; do
         echo "commit edits: fixpoint compiled under $mode"; exit 1
     fi
     grep -q '^error\[E_COMPILE_EDIT_FIXPOINT\]: compile.edit-fixpoint: .*8 rounds' "$output_directory/fixpoint-$mode.err" &&
-        grep -q 'annotate `.*fixpoint.ab:tagged` (round 8: ' "$output_directory/fixpoint-$mode.err" ||
+        grep -q 'annotate `.*fixpoint.ab:tagged` (round 8: [^)]*commit-edits/fixpoint.ab:[0-9]*:[0-9]*)' "$output_directory/fixpoint-$mode.err" ||
         { echo "commit edits: fixpoint under $mode"; cat "$output_directory/fixpoint-$mode.err"; exit 1; }
 done
 echo "commit edits: # sites' edits committed in rounds, settled or stopped at 8 (interp, jit)"
