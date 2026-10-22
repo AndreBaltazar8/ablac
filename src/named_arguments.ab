@@ -1,0 +1,790 @@
+// Named arguments become positional before analysis
+// (bootstrapNormalizeNamedArguments), and compile-time code's edits are
+// committed to the raw program (bootstrapCommitEdits), which a new body's named
+// arguments are normalized with.
+import "staged_parser.ab"
+import "abla/sys/linux/process"
+
+class BootstrapNamedTargetIndex(
+    val names: array<string>,
+    var values: array<int>,
+    val slots: array<int>
+) {
+    fun find(name: string): int {
+        var result = -1
+        if (this.slots.size > 0) {
+            var slot = bootstrapNamedTargetHash(name)
+            slot = slot - slot / this.slots.size * this.slots.size
+            var probes = 0
+            while (result == -1 && probes < this.slots.size &&
+                   this.slots[slot] >= 0) {
+                val entry = this.slots[slot]
+                if (this.names[entry] == name) {
+                    result = this.values[entry]
+                } else {
+                    slot = slot + 1
+                    if (slot == this.slots.size) slot = 0
+                }
+                probes = probes + 1
+            }
+        }
+        result
+    }
+}
+
+fun bootstrapNamedTargetHash(name: string): int {
+    var hash = 0
+    var index = 0
+    while (index < name.size) {
+        hash = hash * 131 + name[index]
+        hash = hash - hash / 2147483647 * 2147483647
+        index = index + 1
+    }
+    hash
+}
+
+fun bootstrapNamedTargetIndex(
+    declarations: array<BootstrapDeclaration>
+): BootstrapNamedTargetIndex {
+    val names: array<string> = []
+    val values: array<int> = []
+    var declaration = 0
+    while (declaration < declarations.size) {
+        val candidate = declarations[declaration]
+        if (candidate.extensionOwner == "" &&
+            (candidate.kind == "fun" ||
+             candidate.kind == "compile.fun" ||
+             candidate.kind == "class")) {
+            names.append(candidate.name)
+            values.append(declaration)
+        }
+        declaration = declaration + 1
+    }
+    var capacity = 8
+    while (capacity < names.size * 2 + 1) capacity = capacity * 2
+    val slots: array<int> = []
+    var slot = 0
+    while (slot < capacity) {
+        slots.append(-1)
+        slot = slot + 1
+    }
+    var entry = 0
+    while (entry < names.size) {
+        slot = bootstrapNamedTargetHash(names[entry])
+        slot = slot - slot / capacity * capacity
+        var placed = false
+        while (!placed) {
+            val existing = slots[slot]
+            if (existing < 0) {
+                slots[slot] = entry
+                placed = true
+            } else if (names[existing] == names[entry]) {
+                // Preserve the normalizer's existing ambiguity result without
+                // retaining or rescanning a list of duplicate declarations.
+                values[existing] = -2
+                placed = true
+            } else {
+                slot = slot + 1
+                if (slot == capacity) slot = 0
+            }
+        }
+        entry = entry + 1
+    }
+    BootstrapNamedTargetIndex(names, values, slots)
+}
+
+class BootstrapNamedArgumentNormalizer(
+    val declarations: array<BootstrapDeclaration>,
+    val targets: BootstrapNamedTargetIndex,
+    var errors: int,
+    var diagnostics: string,
+    // The module of the declaration being normalized, for source records.
+    var sourceIdentity: string = ""
+) {
+    fun fail(code: string, message: string, expression: BootstrapExpression) {
+        this.errors = this.errors + 1
+        this.diagnostics =
+            "${this.diagnostics}error[E_NAMED_ARGUMENT_$code]: $message\n"
+        this.diagnostics =
+            "${this.diagnostics}source[named-argument]:${this.sourceIdentity}:${expression.begin}:${expression.end}\n"
+    }
+
+    fun target(name: string): int = this.targets.find(name)
+
+    // The class methods and extension functions named `name` that have a
+    // parameter for every named argument in `children` (a member call's).
+    fun methodTargets(
+        name: string,
+        children: array<BootstrapExpression>
+    ): BootstrapNamedMethodTargets {
+        val owners: array<int> = []
+        val methods: array<int> = []
+        var index = 0
+        while (index < this.declarations.size) {
+            val declaration = this.declarations[index]
+            if (declaration.kind == "class") {
+                var method = 0
+                while (method < declaration.methods.size) {
+                    if (declaration.methods[method].name == name &&
+                        this.acceptsNamed(declaration.methods[method], children)) {
+                        owners.append(index)
+                        methods.append(method)
+                    }
+                    method = method + 1
+                }
+            } else if (declaration.name == name &&
+                declaration.extensionOwner != "" &&
+                (declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+                this.acceptsNamed(declaration, children)) {
+                owners.append(index)
+                methods.append(-1)
+            }
+            index = index + 1
+        }
+        BootstrapNamedMethodTargets(owners, methods)
+    }
+
+    fun acceptsNamed(
+        declaration: BootstrapDeclaration,
+        children: array<BootstrapExpression>
+    ): bool {
+        var argument = 1
+        while (argument < children.size) {
+            if (children[argument].kind == "named.argument" &&
+                this.parameter(declaration, children[argument].text) < 0) return false
+            argument = argument + 1
+        }
+        true
+    }
+
+    fun methodDeclaration(
+        targets: BootstrapNamedMethodTargets,
+        target: int
+    ): BootstrapDeclaration {
+        val owner = this.declarations[targets.owners[target]]
+        if (targets.methods[target] >= 0) owner.methods[targets.methods[target]]
+        else owner
+    }
+
+    // Whether every target takes the same parameters in the same order, so
+    // the arguments line up whichever the receiver's type selects.
+    fun sameParameters(targets: BootstrapNamedMethodTargets): bool {
+        val first = this.methodDeclaration(targets, 0)
+        var target = 1
+        while (target < targets.owners.size) {
+            val other = this.methodDeclaration(targets, target)
+            if (other.parameters.size != first.parameters.size) return false
+            var parameter = 0
+            while (parameter < first.parameters.size) {
+                if (other.parameters[parameter] != first.parameters[parameter]) return false
+                parameter = parameter + 1
+            }
+            target = target + 1
+        }
+        true
+    }
+
+    // The class a target's defaults read the members of: a method's own
+    // class, or an extension's receiver class (-1 when it is not a class).
+    // The class whose members a target's default may name without `this`: a
+    // class method's; an extension reaches them only through `this`.
+    fun methodClass(targets: BootstrapNamedMethodTargets, target: int): int =
+        if (targets.methods[target] >= 0) targets.owners[target] else -1
+
+    // `expression` (a method's default) read in the receiver's context:
+    // `this` is `receiver`, and a field or method of `owner` written without a
+    // receiver is reached through it, never through a caller's variable.
+    fun qualifyReceiver(
+        expression: BootstrapExpression,
+        receiver: BootstrapExpression,
+        owner: int
+    ): BootstrapExpression {
+        if (expression.kind == "identifier" && expression.text == "this") return receiver
+        val children: array<BootstrapExpression> = []
+        for (child in expression.children) {
+            children.append(this.qualifyReceiver(child, receiver, owner))
+        }
+        if (owner >= 0) {
+            val declaration = this.declarations[owner]
+            if (expression.kind == "identifier" &&
+                this.ownerField(declaration, expression.text)) {
+                return BootstrapExpression(
+                    "member", expression.text, expression.begin, expression.end,
+                    [receiver]
+                )
+            }
+            if (expression.kind == "call") {
+                for (method in declaration.methods) {
+                    if (method.name == expression.text) {
+                        val arguments: array<BootstrapExpression> = [receiver]
+                        for (child in children) arguments.append(child)
+                        return BootstrapExpression(
+                            "member.call", expression.text, expression.begin,
+                            expression.end, arguments
+                        )
+                    }
+                }
+            }
+        }
+        BootstrapExpression(
+            expression.kind, expression.text, expression.begin, expression.end,
+            children
+        )
+    }
+
+    fun ownerField(declaration: BootstrapDeclaration, name: string): bool {
+        var index = 0
+        while (index < declaration.parameters.size) {
+            if (declaration.parameters[index] == name &&
+                index < declaration.parameterKinds.size &&
+                (declaration.parameterKinds[index] == "val" ||
+                 declaration.parameterKinds[index] == "var")) return true
+            index = index + 1
+        }
+        false
+    }
+
+    fun parameter(declaration: BootstrapDeclaration, name: string): int {
+        var result = -1
+        var index = 0
+        while (index < declaration.parameters.size) {
+            if (declaration.parameters[index] == name) result = index
+            index = index + 1
+        }
+        result
+    }
+
+    fun requiresNormalization(expression: BootstrapExpression): bool {
+        var required = false
+        var child = 0
+        while (!required && child < expression.children.size) {
+            required = this.requiresNormalization(
+                expression.children[child]
+            )
+            child = child + 1
+        }
+        var hasNamed = false
+        child = 0
+        while ((expression.kind == "call" ||
+                expression.kind == "member.call") &&
+               child < expression.children.size) {
+            if (expression.children[child].kind == "named.argument") {
+                hasNamed = true
+            }
+            child = child + 1
+        }
+        if (hasNamed) required = true
+        if (!required && expression.kind == "call") {
+            val selectedTarget = this.target(expression.text)
+            if (selectedTarget >= 0 &&
+                this.declarations[selectedTarget].kind == "class" &&
+                (expression.children.size <
+                    this.declarations[selectedTarget].parameters.size ||
+                 bootstrapHasAnyDelegatedProperty(this.declarations[selectedTarget]))) {
+                required = true
+            }
+        }
+        required
+    }
+
+    // The parameter the `position`th positional argument fills: a delegated
+    // property takes no argument, so positions skip it.
+    fun positionalParameter(declaration: BootstrapDeclaration, position: int): int {
+        var remaining = position
+        var index = 0
+        while (index < declaration.parameters.size) {
+            if (!bootstrapIsAnyDelegatedProperty(declaration, index)) {
+                if (remaining == 0) return index
+                remaining = remaining - 1
+            }
+            index = index + 1
+        }
+        declaration.parameters.size
+    }
+
+    fun replaceParameterReferences(
+        expression: BootstrapExpression,
+        names: array<string>,
+        replacements: array<string>
+    ): BootstrapExpression {
+        var replacement = ""
+        var index = 0
+        while (expression.kind == "identifier" && index < names.size) {
+            if (names[index] == expression.text &&
+                index < replacements.size) replacement = replacements[index]
+            index = index + 1
+        }
+        val children: array<BootstrapExpression> = []
+        index = 0
+        while (index < expression.children.size) {
+            children.append(this.replaceParameterReferences(
+                expression.children[index], names, replacements
+            ))
+            index = index + 1
+        }
+        BootstrapExpression(
+            expression.kind,
+            if (replacement == "") expression.text else replacement,
+            expression.begin,
+            expression.end,
+            children
+        )
+    }
+
+    fun local(name: string, value: BootstrapExpression): BootstrapExpression =
+        BootstrapExpression(
+            "local.val", name, value.begin, value.end,
+            [
+                value,
+                BootstrapExpression(
+                    "type", "inferred", value.begin, value.begin, []
+                )
+            ]
+        )
+
+    fun normalize(expression: BootstrapExpression): BootstrapExpression {
+        val normalizedChildren: array<BootstrapExpression> = []
+        var child = 0
+        while (child < expression.children.size) {
+            normalizedChildren.append(this.normalize(
+                expression.children[child]
+            ))
+            child = child + 1
+        }
+        var result = BootstrapExpression(
+            expression.kind,
+            expression.text,
+            expression.begin,
+            expression.end,
+            normalizedChildren
+        )
+        var hasNamed = false
+        child = 0
+        while ((result.kind == "call" || result.kind == "member.call") &&
+            child < result.children.size) {
+            if (result.children[child].kind == "named.argument") {
+                hasNamed = true
+            }
+            child = child + 1
+        }
+        var normalizeCall = hasNamed
+        var selectedTarget = -1
+        if (result.kind == "call") selectedTarget = this.target(result.text)
+        var memberTargets = BootstrapNamedMethodTargets([], [])
+        if (result.kind == "member.call" && hasNamed) {
+            memberTargets = this.methodTargets(result.text, result.children)
+            selectedTarget = if (memberTargets.owners.size == 0) -1
+                else if (this.sameParameters(memberTargets)) 0
+                else -2
+        }
+        if (!normalizeCall && selectedTarget >= 0 &&
+            this.declarations[selectedTarget].kind == "class" &&
+            (result.children.size <
+                this.declarations[selectedTarget].parameters.size ||
+             bootstrapHasAnyDelegatedProperty(this.declarations[selectedTarget]))) {
+            normalizeCall = true
+        }
+        if (normalizeCall) {
+            val target = selectedTarget
+            val method = result.kind == "member.call"
+            if (target < 0) {
+                this.fail(
+                    "TARGET",
+                    if (target == -2 && method)
+                        "named call `${result.text}` matches methods whose parameters differ: pass its arguments by position"
+                    else if (target == -2)
+                        "named call `${result.text}` is ambiguous"
+                    else if (method)
+                        "named call `${result.text}` has no method or extension with those parameters"
+                    else "named call `${result.text}` has no declared function or constructor target",
+                    result
+                )
+            }
+            if (target >= 0) {
+                val declaration = if (method) this.methodDeclaration(memberTargets, 0)
+                    else this.declarations[target]
+                val values: array<BootstrapExpression> = []
+                val temporaryNames: array<string> = []
+                var parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    values.append(BootstrapExpression(
+                        "missing", "", result.begin, result.begin, []
+                    ))
+                    temporaryNames.append("")
+                    parameter = parameter + 1
+                }
+                val statements: array<BootstrapExpression> = []
+                // A method call's receiver is evaluated once, first; a place
+                // (`name`, `name.field`) is read again where it is needed.
+                var receiver = result
+                if (method) {
+                    receiver = result.children[0]
+                    if (!bootstrapNamedArgumentPlace(receiver)) {
+                        val temporary = "__abla_named_${result.begin}_receiver"
+                        statements.append(this.local(temporary, receiver))
+                        receiver = BootstrapExpression(
+                            "identifier", temporary, receiver.begin, receiver.end, []
+                        )
+                    }
+                }
+                var positional = 0
+                var namedSeen = false
+                val argumentBegin = if (result.kind == "member.call") 1 else 0
+                var argument = argumentBegin
+                while (argument < result.children.size) {
+                    val supplied = result.children[argument]
+                    var selected = this.positionalParameter(declaration, positional)
+                    var value = supplied
+                    if (supplied.kind == "named.argument") {
+                        namedSeen = true
+                        selected = this.parameter(declaration, supplied.text)
+                        if (supplied.children.size == 1) {
+                            value = supplied.children[0]
+                        }
+                        if (selected < 0) this.fail(
+                            "UNKNOWN",
+                            "`${supplied.text}` is not a parameter of `${result.text}`",
+                            supplied
+                        )
+                        if (selected >= 0 && bootstrapIsAnyDelegatedProperty(declaration, selected)) {
+                            this.fail(
+                                "DELEGATED",
+                                "`${supplied.text}` is a delegated property of `${result.text}`: its delegate comes from `by`, not from an argument",
+                                supplied
+                            )
+                            selected = -1
+                        }
+                    } else {
+                        if (namedSeen) this.fail(
+                            "ORDER",
+                            "positional arguments must precede named arguments",
+                            supplied
+                        )
+                        positional = positional + 1
+                    }
+                    if (selected >= declaration.parameters.size) {
+                        this.fail(
+                            "ARITY",
+                            "too many arguments for `${result.text}`",
+                            supplied
+                        )
+                    }
+                    if (selected >= 0 &&
+                        selected < declaration.parameters.size) {
+                        if (temporaryNames[selected] != "") this.fail(
+                            "DUPLICATE",
+                            "parameter `${declaration.parameters[selected]}` is supplied more than once",
+                            supplied
+                        )
+                        // A `var` parameter borrows the caller's place
+                        // itself; through a `val` temporary it borrowed a
+                        // borrow and failed ownership.borrow-exclusive.
+                        val borrowsPlace = selected <
+                            declaration.parameterKinds.size &&
+                            declaration.parameterKinds[selected] == "var" &&
+                            bootstrapNamedArgumentPlace(value)
+                        if (temporaryNames[selected] == "" && borrowsPlace) {
+                            // A default naming this parameter reads the
+                            // variable; a member place has no such name.
+                            temporaryNames[selected] =
+                                if (value.kind == "identifier") value.text
+                                else "__abla_named_${result.begin}_place_$argument"
+                            values[selected] = value
+                        }
+                        if (temporaryNames[selected] == "") {
+                            val temporary =
+                                "__abla_named_${result.begin}_${argument}"
+                            temporaryNames[selected] = temporary
+                            values[selected] = BootstrapExpression(
+                                "identifier", temporary,
+                                value.begin, value.end, []
+                            )
+                            statements.append(this.local(temporary, value))
+                        }
+                    }
+                    argument = argument + 1
+                }
+                parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    if (temporaryNames[parameter] == "") {
+                        var defaultValue = BootstrapExpression(
+                            "missing", "", result.begin, result.begin, []
+                        )
+                        if (parameter < declaration.parameterDefaults.size) {
+                            defaultValue = declaration.parameterDefaults[parameter]
+                        }
+                        // A delegated property's field holds the delegate.
+                        if ((defaultValue.kind == "delegate.initializer" ||
+                             defaultValue.kind == "delegate.field") &&
+                            defaultValue.children.size > 0) {
+                            defaultValue = defaultValue.children[0]
+                        }
+                        if (defaultValue.kind == "missing") this.fail(
+                            "REQUIRED",
+                            "required parameter `${declaration.parameters[parameter]}` is missing from `${result.text}`",
+                            result
+                        )
+                        if (defaultValue.kind != "missing" && method) {
+                            // Every method the receiver may select must
+                            // fill the omitted parameter the same way.
+                            var other = 1
+                            while (other < memberTargets.owners.size) {
+                                val alternative = this.methodDeclaration(memberTargets, other)
+                                if (parameter >= alternative.parameterDefaults.size ||
+                                    !bootstrapSameExpression(
+                                        alternative.parameterDefaults[parameter],
+                                        defaultValue
+                                    )) {
+                                    this.fail(
+                                        "TARGET",
+                                        "named call `${result.text}` matches methods whose default for `${declaration.parameters[parameter]}` differs: pass it",
+                                        result
+                                    )
+                                    other = memberTargets.owners.size
+                                }
+                                other = other + 1
+                            }
+                        }
+                        if (defaultValue.kind != "missing") {
+                            val temporary =
+                                "__abla_named_${result.begin}_default_$parameter"
+                            var substituted = this.replaceParameterReferences(
+                                defaultValue,
+                                declaration.parameters,
+                                temporaryNames
+                            )
+                            // A method's default reads the receiver's
+                            // members, not the caller's names.
+                            if (method) substituted = this.qualifyReceiver(
+                                substituted, receiver, this.methodClass(memberTargets, 0)
+                            )
+                            val normalizedDefault = this.normalize(substituted)
+                            temporaryNames[parameter] = temporary
+                            if (bootstrapIsAnyDelegatedProperty(declaration, parameter)) {
+                                // The delegate goes straight into its field: it
+                                // may be a resource, which a temporary would
+                                // have to move.
+                                values[parameter] = normalizedDefault
+                            } else {
+                                values[parameter] = BootstrapExpression(
+                                    "identifier", temporary,
+                                    defaultValue.begin, defaultValue.end, []
+                                )
+                                statements.append(this.local(
+                                    temporary, normalizedDefault
+                                ))
+                            }
+                        }
+                    }
+                    parameter = parameter + 1
+                }
+                val normalizedValues: array<BootstrapExpression> = []
+                if (method) normalizedValues.append(receiver)
+                parameter = 0
+                while (parameter < values.size) {
+                    normalizedValues.append(values[parameter])
+                    parameter = parameter + 1
+                }
+                statements.append(BootstrapExpression(
+                    result.kind,
+                    result.text,
+                    result.begin,
+                    result.end,
+                    normalizedValues
+                ))
+                result = BootstrapExpression(
+                    "block", "", result.begin, result.end, statements
+                )
+            }
+        }
+        result
+    }
+}
+
+// The declarations a named member call may name: `methods[i]` indexes the
+// methods of class `owners[i]`, or is -1 for the extension function `owners[i]`.
+class BootstrapNamedMethodTargets(val owners: array<int>, val methods: array<int>)
+
+// Whether two parsed expressions are the same syntax (positions aside).
+fun bootstrapSameExpression(left: BootstrapExpression, right: BootstrapExpression): bool {
+    if (left.kind != right.kind || left.text != right.text ||
+        left.children.size != right.children.size) return false
+    var child = 0
+    while (child < left.children.size) {
+        if (!bootstrapSameExpression(left.children[child], right.children[child])) return false
+        child = child + 1
+    }
+    true
+}
+
+// `name` or `name.field…`: reading it again at the call has no effects.
+fun bootstrapNamedArgumentPlace(expression: BootstrapExpression): bool =
+    expression.kind == "identifier" ||
+    (expression.kind == "member" && expression.children.size == 1 &&
+     bootstrapNamedArgumentPlace(expression.children[0]))
+
+fun bootstrapNormalizeNamedDeclaration(
+    var normalizer: BootstrapNamedArgumentNormalizer,
+    declaration: BootstrapDeclaration
+): BootstrapDeclaration {
+    val defaults: array<BootstrapExpression> = []
+    var defaultIndex = 0
+    while (defaultIndex < declaration.parameterDefaults.size) {
+        defaults.append(normalizer.normalize(
+            declaration.parameterDefaults[defaultIndex]
+        ))
+        defaultIndex = defaultIndex + 1
+    }
+    val methods: array<BootstrapDeclaration> = []
+    var method = 0
+    while (method < declaration.methods.size) {
+        methods.append(bootstrapNormalizeNamedDeclaration(
+            normalizer, declaration.methods[method]
+        ))
+        method = method + 1
+    }
+    BootstrapDeclaration(
+        declaration.kind,
+        declaration.name,
+        declaration.begin,
+        declaration.end,
+        normalizer.normalize(declaration.expression),
+        declaration.parameters,
+        declaration.parameterTypes,
+        declaration.resultType,
+        methods,
+        defaults,
+        declaration.externalLibrary,
+        declaration.parameterKinds,
+        declaration.extensionOwner,
+        declaration.isTrusted,
+        declaration.isResource,
+        declaration.isNoEscape,
+        declaration.generatedNamespace,
+        declaration.generatedOriginBegin,
+        declaration.generatedOriginEnd,
+        declaration.annotations,
+        declaration.annotationArguments,
+        declaration.annotationBegins,
+        declaration.annotationEnds,
+        declaration.sourceIdentity,
+        declaration.conformances,
+        declaration.isSealed,
+        declaration.isPrivate,
+        declaration.typeParameters
+    )
+}
+
+fun bootstrapDeclarationRequiresNamedNormalization(
+    normalizer: BootstrapNamedArgumentNormalizer,
+    declaration: BootstrapDeclaration
+): bool {
+    var required = normalizer.requiresNormalization(
+        declaration.expression
+    )
+    var defaultIndex = 0
+    while (!required &&
+           defaultIndex < declaration.parameterDefaults.size) {
+        required = normalizer.requiresNormalization(
+            declaration.parameterDefaults[defaultIndex]
+        )
+        defaultIndex = defaultIndex + 1
+    }
+    var method = 0
+    while (!required && method < declaration.methods.size) {
+        required = bootstrapDeclarationRequiresNamedNormalization(
+            normalizer, declaration.methods[method]
+        )
+        method = method + 1
+    }
+    required
+}
+
+fun bootstrapCommitEditOrder(edit: BootstrapDeclarationEdit): string =
+    "${bootstrapEditTargetText(edit)}\u{1F}${edit.kind}\u{1F}${edit.origin}\u{1F}${edit.payload}"
+
+/** Commits `edits` (made by compile-time code in a round of lowering, or by
+ *  transforms) to the raw program `parsed`: the declarations as parsed,
+ *  before any of the rewrites bootstrapPreSemanticPipeline makes, which the
+ *  caller runs again over the whole result before it analyzes it again.
+ *  Errors (a target that isn't one declaration, two bodies for one function)
+ *  join the result's. */
+fun bootstrapCommitEdits(
+    parsed: BootstrapParseResult,
+    edits: array<BootstrapDeclarationEdit>
+): BootstrapParseResult {
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) declarations.append(declaration)
+    // In a fixed order (target, kind, origin), whatever order the sites ran in.
+    val ordered: array<BootstrapDeclarationEdit> = []
+    for (edit in edits) {
+        val key = bootstrapCommitEditOrder(edit)
+        var at = ordered.size
+        while (at > 0 && bootstrapTextBefore(key, bootstrapCommitEditOrder(ordered[at - 1]))) {
+            at = at - 1
+        }
+        ordered.append(edit)
+        var move = ordered.size - 1
+        while (move > at) {
+            ordered[move] = ordered[move - 1]
+            move = move - 1
+        }
+        ordered[at] = edit
+    }
+    val outcome = bootstrapApplyDeclarationEdits(declarations, ordered)
+    // A new body may name arguments: normalized as the parse's were.
+    bootstrapNormalizeNamedArguments(BootstrapParseResult(
+        declarations,
+        parsed.actions,
+        parsed.errors + outcome.errors,
+        parsed.extensionErrors + outcome.errors,
+        parsed.compileInputPaths,
+        parsed.compileInputContents,
+        "${parsed.diagnostics}${outcome.diagnostics}",
+        parsed.declarationEdits
+    ))
+}
+
+fun bootstrapNormalizeNamedArguments(
+    parsed: BootstrapParseResult
+): BootstrapParseResult {
+    var normalizer = BootstrapNamedArgumentNormalizer(
+        parsed.declarations,
+        bootstrapNamedTargetIndex(parsed.declarations),
+        0,
+        ""
+    )
+    val declarations: array<BootstrapDeclaration> = []
+    var declaration = 0
+    while (declaration < parsed.declarations.size) {
+        val candidate = parsed.declarations[declaration]
+        if (bootstrapDeclarationRequiresNamedNormalization(
+            normalizer, candidate
+        )) {
+            normalizer.sourceIdentity = candidate.sourceIdentity
+            declarations.append(bootstrapNormalizeNamedDeclaration(
+                normalizer, candidate
+            ))
+        } else declarations.append(candidate)
+        declaration = declaration + 1
+    }
+    val actions: array<BootstrapExpression> = []
+    var action = 0
+    while (action < parsed.actions.size) {
+        val candidate = parsed.actions[action]
+        if (normalizer.requiresNormalization(candidate)) {
+            actions.append(normalizer.normalize(candidate))
+        } else actions.append(candidate)
+        action = action + 1
+    }
+    bootstrapNoteNamedArgumentErrors(normalizer.errors)
+    BootstrapParseResult(
+        declarations,
+        actions,
+        parsed.errors + normalizer.errors,
+        parsed.extensionErrors,
+        parsed.compileInputPaths,
+        parsed.compileInputContents,
+        "${parsed.diagnostics}${normalizer.diagnostics}"
+    )
+}

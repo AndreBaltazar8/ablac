@@ -265,6 +265,7 @@ test: ablac
 	tools/test-process-metrics.sh $(COMPILER)
 	tools/test-dns-async.sh $(COMPILER)
 	tools/test-websocket-tls-server.sh $(COMPILER)
+	tools/test-commit-edits.sh $(COMPILER)
 
 check: test self-rebuild
 

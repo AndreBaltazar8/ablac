@@ -117,7 +117,7 @@ complete program before analysis:
 | `functionName`, `functionIdentity`, `functionModuleIdentity`, `functionOwner`, `parameterCount`, `parameterName`, `parameterType`, `resultType`, `annotationCount`, `annotation`, `isCompileOnly`, `isTrusted`, `isExternal` | read a function's signature and metadata |
 | `bindings()`, `findBinding(name)`, `bindingName`, `bindingIsMutable`, `bindingIsDelegated`, `bindingExposedType`, `bindingDelegateType`, `bindingGetter`, `bindingSetter`, `bindingCanReplaceDelegate`, `bindingByBegin`, `bindingByEnd` | read top-level bindings ([below](#binding-reflection)) |
 | `transform(handler)` | register a transform (only as a literal top-level action) |
-| `replaceFunctionBody(function, source)`, `addFunctionAnnotation(function, name)` | change the program, from a transform |
+| `replaceFunctionBody(function, source)`, `addFunctionAnnotation(function, name)` | change the program, from a transform or a `#expression` ([committing changes](compile-time.md#committing-program-changes)) |
 | `extensionFields(type)`, `fieldsOf(type, includeExtensions)`, `addExtensionField(type, name, fieldType, initial, mutable)`, `removeExtensionField(type, name)` | a class's [extension fields](#extension-fields) |
 | `conformances(type)`, `conformsTo(type, interface)`, `implementers(interface)`, `witness(type, interface)`, `declareInterface(name, members, parents)`, `addConformance(type, interface, members)` | [interfaces](#interfaces) and the classes conforming to them |
 | `findType(name)`, `typeName(type)`, `classOf(type)`, `typeConformsTo(type, interface)`, `isResource(type)`, `typeArguments(type)` | type handles, as a [generic](#generics)'s `#` code sees its type parameters |

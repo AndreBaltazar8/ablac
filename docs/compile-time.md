@@ -740,6 +740,54 @@ Generated declarations are type-checked before any later compile-time code
 can see them. Program changes made at compile time are transactional: if a
 step fails, none of its changes are kept.
 
+### Committing program changes
+
+A `#expression` may change the program too, with the compiler API's
+`compiler.replaceFunctionBody` and `compiler.addFunctionAnnotation`, as a
+[transform](compiler-api.md#transforms-changing-the-program) does. Each change is
+an *edit* of a declaration as parsed. When a lowering of the program (a *round*)
+has made edits, they are committed, the program is checked again and lowered
+again, and its `#expression`s run again from the compile globals they started
+from:
+
+```abla
+import "abla/io"
+import "abla/compiler"
+
+fun answer(): int = 1
+
+compile fun specialize(): int {
+    compiler.replaceFunctionBody(compiler.findFunction("answer"), "41")
+    1
+}
+
+val marker = #specialize()
+
+fun main {
+    println("${answer() + marker}")
+}
+// output:
+// 42
+```
+
+- A round whose edits are all ones already committed changes nothing, and is
+  the last: the site above asks for the same body again in the second round.
+- Edits are committed in a fixed order (by target, then kind and origin),
+  whatever order the sites ran in. Two different bodies for one function are
+  `E_COMPILER_EDIT_CONFLICT`; a target that is not exactly one declaration is
+  `E_COMPILER_EDIT_TARGET`.
+- Each commit rewrites the whole program again (receiver names, overloads,
+  delegated properties, ...), so an added overload can change which function
+  an untouched call resolves to.
+- After 8 rounds that each changed the program, the build stops with
+  `compile.edit-fixpoint`, listing the last round's edits and the site that
+  asked for each.
+- Output a discarded round printed stays printed: a site's `println` appears
+  once per round.
+- A standard-library target needs the `transform.library` capability, as it
+  does from a transform; the runtime's functions are never changed.
+- A program that makes no edits is lowered once, as before.
+
 ## Native evaluation
 
 `ABLA_COMPILE_EVAL=jit` runs compile-time code as machine code instead of in

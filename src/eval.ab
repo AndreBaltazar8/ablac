@@ -125,6 +125,53 @@ var bootstrapTransformEdits: array<BootstrapDeclarationEdit> = []
 // The running transform's action, "<sourceIdentity>:<begin>:<end>": the
 // origin of the edits it makes.
 var bootstrapCompilerTransformOrigin: string = ""
+// While a round of lowering evaluates `#` sites (bootstrapCompileLlvmParsedCached):
+// its number, the raw declarations its program was rewritten from (an edit
+// names a declaration as parsed), and the edits its compile-time code made,
+// which the driver commits before the next round.
+var bootstrapCompileEditRound: int = -1
+var bootstrapCompileRoundRaw: array<BootstrapDeclaration> = []
+var bootstrapCompileRoundEdits: array<BootstrapDeclarationEdit> = []
+
+fun bootstrapTakeCompileRoundEdits(): array<BootstrapDeclarationEdit> {
+    val edits = bootstrapCompileRoundEdits
+    bootstrapCompileRoundEdits = []
+    edits
+}
+
+/** Records compile-time code's change to the declaration at `handle` (of the
+ *  round's rewritten program) as an edit of its raw declaration; false outside
+ *  a round, or inside a region (the REPL), where it couldn't outlive the line. */
+fun bootstrapStageCompileRoundEdit(
+    declarations: array<BootstrapDeclaration>,
+    handle: int,
+    kind: string,
+    payload: string,
+    origin: string
+): bool {
+    if (bootstrapCompileEditRound < 0 || __ablaRuntimePlatformRegionActive() ||
+        handle < 0 || handle >= declarations.size) return false
+    var target = declarations[handle]
+    // The rewrites rename overloads and add `this.`: the raw declaration is the
+    // one parsed at the same place.
+    for (raw in bootstrapCompileRoundRaw) {
+        if (raw.sourceIdentity == target.sourceIdentity && raw.begin == target.begin &&
+            raw.kind == target.kind) target = raw
+    }
+    if (bootstrapRuntimeModuleSource(target.sourceIdentity)) return false
+    bootstrapCompileRoundEdits.append(BootstrapDeclarationEdit(
+        kind,
+        target.sourceIdentity,
+        target.extensionOwner,
+        target.name,
+        bootstrapEditSignature(target),
+        payload,
+        [],
+        origin,
+        "round ${bootstrapCompileEditRound + 1}: $origin"
+    ))
+    true
+}
 
 fun bootstrapArtifactRootRequestRoot(): string =
     "build/.abla-artifact-root-requests-${linuxProcessId()}"
@@ -1307,6 +1354,37 @@ fun bootstrapCompileGlobalsKeep(
         index = index + 1
     }
     bootstrapSemanticUnit()
+}
+
+/** The compile globals' kept values as they are now ("key", "value" pairs),
+ *  for a round of lowering that runs again to start from them. */
+fun bootstrapSnapshotCompileGlobals(): array<string> {
+    val root = bootstrapCompileGlobalRoot()
+    val pairs: array<string> = []
+    var index = 0
+    while (index < bootstrapCompileGlobalCount) {
+        pairs.append(Path("$root/$index.key").readText())
+        pairs.append(Path("$root/$index.value").readText())
+        index = index + 1
+    }
+    pairs
+}
+
+/** Puts back what bootstrapSnapshotCompileGlobals took. */
+fun bootstrapRestoreCompileGlobals(pairs: array<string>): void {
+    bootstrapForgetCompileGlobals()
+    val root = bootstrapCompileGlobalRoot()
+    var index = 0
+    while (index + 1 < pairs.size) {
+        val slot = bootstrapCompileGlobalCount
+        if (Path(root).createDirectories() &&
+            Path("$root/$slot.key").writeText(pairs[index]) &&
+            Path("$root/$slot.value").writeText(pairs[index + 1])) {
+            bootstrapCompileGlobalCount = slot + 1
+        }
+        index = index + 2
+    }
+    return
 }
 
 fun bootstrapCompileGlobalToken(text: string): string = "${text.size}:$text"
@@ -9936,7 +10014,7 @@ fun bootstrapEvaluateCallCompiler(
                 "",
                 [],
                 bootstrapCompilerTransformOrigin,
-                ""
+                "transform"
             ))
         } else if (refused != "") {
             evaluator.diagnostics = "${evaluator.diagnostics}$refused"
@@ -10023,7 +10101,15 @@ fun bootstrapEvaluateCallCompiler(
             )
             valid = library
         }
-        if (valid) valid = bootstrapStageFunctionBodyReplacement(
+        // From a `#` site while the program is lowered: an edit the next round
+        // of lowering commits.
+        if (valid && !bootstrapCompilerTransformActive && bootstrapCompileEditRound >= 0) {
+            valid = body.text.size > 0 && body.text.size <= 65536 &&
+                bootstrapStageCompileRoundEdit(
+                    evaluator.declarations, reflected.integer, "replaceBody", body.text,
+                    "${evaluator.sourceIdentity}:${expression.begin}:${expression.end}"
+                )
+        } else if (valid) valid = bootstrapStageFunctionBodyReplacement(
             BootstrapFunctionBodyReplacement(
                 reflected.integer,
                 body.text
@@ -10060,7 +10146,13 @@ fun bootstrapEvaluateCallCompiler(
             valid = false
             evaluator.diagnostics = "${evaluator.diagnostics}$refused"
         }
-        if (valid) valid = bootstrapStageFunctionAnnotationAddition(
+        if (valid && !bootstrapCompilerTransformActive && bootstrapCompileEditRound >= 0) {
+            valid = bootstrapTargetTokenValid(annotation.text) &&
+                bootstrapStageCompileRoundEdit(
+                    evaluator.declarations, reflected.integer, "annotate", annotation.text,
+                    "${evaluator.sourceIdentity}:${expression.begin}:${expression.end}"
+                )
+        } else if (valid) valid = bootstrapStageFunctionAnnotationAddition(
             BootstrapFunctionAnnotationAddition(
                 reflected.integer,
                 annotation.text

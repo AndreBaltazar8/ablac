@@ -1,6 +1,7 @@
 import "exports.ab"
 import "../../diagnostic_positions.ab"
 import "../../receiver_names.ab"
+import "../../named_arguments.ab"
 import "../../expected_types.ab"
 import "../../ct_jit.ab"
 
@@ -393,12 +394,60 @@ fun bootstrapEmitLlvmProgram(
     )
 }
 
+/** The rewrites between the parse and the analysis, in order: receiver
+ *  members by plain name become `this.` accesses, array literals take the type
+ *  expected of them (expected_types.ab), overloads get distinct names and their
+ *  calls name them (overload.ab), delegated properties' accesses become calls of
+ *  their delegates (delegated_properties.ab), and results that return a view of
+ *  a parameter get its borrow contract. Run over the whole raw program each
+ *  round (bootstrapCommitEdits): they are not idempotent. */
+fun bootstrapPreSemanticPipeline(written: BootstrapParseResult): BootstrapParseResult =
+    bootstrapInferBorrowContracts(bootstrapResolveDelegatedProperties(
+        bootstrapResolveOverloads(bootstrapResolveExpectedTypes(
+            bootstrapInstantiateGenerics(bootstrapResolveReceiverNames(written))
+        ))
+    ))
+
+// Rounds of lowering that commit compile-time code's edits, at most.
+val BOOTSTRAP_COMPILE_EDIT_ROUNDS = 8
+
+/** The edits of `edits` that aren't already in `committed` (a site that asks
+ *  for what it got changes nothing). */
+fun bootstrapNewCompileEdits(
+    edits: array<BootstrapDeclarationEdit>,
+    committed: array<BootstrapDeclarationEdit>
+): array<BootstrapDeclarationEdit> {
+    val fresh: array<BootstrapDeclarationEdit> = []
+    for (edit in edits) {
+        var known = false
+        for (other in committed) {
+            if (other.kind == edit.kind && other.targetIdentity == edit.targetIdentity &&
+                other.owner == edit.owner && other.name == edit.name &&
+                other.signature == edit.signature && other.payload == edit.payload) known = true
+        }
+        for (other in fresh) {
+            if (other.kind == edit.kind && other.targetIdentity == edit.targetIdentity &&
+                other.owner == edit.owner && other.name == edit.name &&
+                other.signature == edit.signature && other.payload == edit.payload) known = true
+        }
+        if (!known) fresh.append(edit)
+    }
+    fresh
+}
+
 fun bootstrapCompileLlvmParsedCached(
     written: BootstrapParseResult,
     var cache: BootstrapIrCacheState,
     targetTriple: string,
     pruneUnused: bool = false,
-    requireMain: bool = true
+    requireMain: bool = true,
+    // The round of lowering (0: the first), and the edits compile-time code
+    // made in the rounds before, committed to `written` already.
+    round: int = 0,
+    committed: array<BootstrapDeclarationEdit> = [],
+    // The compile globals before the first round's `#` sites ran: each round
+    // starts from them, as a single lowering would.
+    globalsBefore: array<string> = []
 ): BootstrapLlvmCompilation {
     // A parse error stops the build after the parser: analysis and code
     // generation would only run over the holes it left, and their errors
@@ -435,11 +484,7 @@ fun bootstrapCompileLlvmParsedCached(
     // properties' accesses become plain calls of their delegates
     // (delegated_properties.ab); results that return a view of a parameter
     // get its borrow contract.
-    val parsed = bootstrapInferBorrowContracts(bootstrapResolveDelegatedProperties(
-        bootstrapResolveOverloads(bootstrapResolveExpectedTypes(
-            bootstrapInstantiateGenerics(bootstrapResolveReceiverNames(written))
-        ))
-    ))
+    val parsed = bootstrapPreSemanticPipeline(written)
     bootstrapLlvmTraceMemory("frontend.annotations.begin")
     val annotationErrors = bootstrapStageAnnotatedExports(parsed)
     bootstrapLlvmTraceMemory("frontend.annotations.end")
@@ -498,10 +543,47 @@ fun bootstrapCompileLlvmParsedCached(
     bootstrapLlvmTraceMemory("frontend.lowering.begin")
     val staleDiagnosed = bootstrapTakeDiagnosedLoweringErrors()
     bootstrapStagedEvaluationBlocked = analyzed.errors > 0 || actionErrors > 0
+    // `#` sites may change the program (compiler.replaceFunctionBody, ...):
+    // their edits are committed and the program lowered again (a round), until
+    // a round changes nothing.
+    bootstrapCompileEditRound = round
+    bootstrapCompileRoundRaw = written.declarations
+    val globals = if (round == 0) bootstrapSnapshotCompileGlobals() else globalsBefore
+    if (round > 0) bootstrapRestoreCompileGlobals(globals)
+    val earlierRoundEdits = bootstrapTakeCompileRoundEdits()
     val program = bootstrapLowerParsedCached(
         parsed, analyzed, cache, pruneUnused
     )
+    bootstrapCompileEditRound = -1
+    bootstrapCompileRoundRaw = []
     bootstrapStagedEvaluationBlocked = false
+    val roundEdits = bootstrapNewCompileEdits(bootstrapTakeCompileRoundEdits(), committed)
+    if (roundEdits.size > 0 && analyzed.errors == 0 && actionErrors == 0 &&
+        program.errors == 0) {
+        // This round's code is discarded: what it staged goes with it.
+        val discardedExports = bootstrapTakeExportRequests()
+        val discardedDiagnosed = bootstrapTakeDiagnosedLoweringErrors()
+        val discardedDiagnostics = bootstrapTakeDriverDiagnostics()
+        bootstrapCtFinishPass()
+        if (round + 1 >= BOOTSTRAP_COMPILE_EDIT_ROUNDS) {
+            var asked = ""
+            for (edit in roundEdits) {
+                asked = "$asked\n  ${edit.kind} `${bootstrapEditTargetText(edit)}` (${edit.originChain})"
+            }
+            return BootstrapLlvmCompilation(
+                "", 1, 0, 0, 1, 0,
+                "error[E_COMPILE_EDIT_FIXPOINT]: compile.edit-fixpoint: compile-time code changed the program in each of $BOOTSTRAP_COMPILE_EDIT_ROUNDS rounds of lowering; the last round asked for:$asked\n",
+                false, false, [], [], ""
+            )
+        }
+        val sofar: array<BootstrapDeclarationEdit> = []
+        for (edit in committed) sofar.append(edit)
+        for (edit in roundEdits) sofar.append(edit)
+        return bootstrapCompileLlvmParsedCached(
+            bootstrapCommitEdits(written, roundEdits), cache, targetTriple,
+            pruneUnused, requireMain, round + 1, sofar, globals
+        )
+    }
     // Lowering errors whose diagnostics are already staged (a compile-time
     // evaluation or lift that failed, one per diagnostic): they are the
     // diagnosis, as semantic errors are, so nothing is emitted for them and

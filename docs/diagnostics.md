@@ -210,6 +210,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_COMPILER_TRANSFORM_RUNTIME` | a transform asked to change a runtime function (`abla/runtime`), which it never may ([transforms](compiler-api.md#transforms-changing-the-program)) |
 | `E_COMPILER_EDIT_CONFLICT` | two transforms gave one function different bodies; the message names both ([transforms](compiler-api.md#transforms-changing-the-program)) |
 | `E_COMPILER_EDIT_TARGET` | a transform's change to another module names no declaration, or more than one |
+| `E_COMPILE_EDIT_FIXPOINT` (`compile.edit-fixpoint`) | compile-time code changed the program in each of 8 rounds of lowering; the message lists the last round's edits ([committing changes](compile-time.md#committing-program-changes)) |
 | `E_INDEPENDENT_MODULE_*` | a misused independent module ([programmable-builds.md](programmable-builds.md)) |
 | `E_CONTRACT_CALL_NOT_CONSUMED` | a [contract](language.md#contract-imports) call left in the program |
 
