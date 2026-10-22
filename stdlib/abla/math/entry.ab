@@ -65,47 +65,100 @@ fun fclamp(value: f64, minimum: f64, maximum: f64): f64 {
 fun lerp(from: f64, to: f64, t: f64): f64 = from + (to - from) * t
 
 // --- two-argument arctangent -------------------------------------------------
-// A port of FreeBSD msun's e_atan2.c (fdlibm) over atan. (sin, cos, tan and
-// atan are below, with the other correctly rounded functions.)
+// atan2 is correctly rounded: a port of CORE-MATH's atan2 (its helpers are below
+// with the other correctly rounded functions).
 
-@inline
-fun __mathHigh(value: f64): int = f64ToBits(value) >> 32
-
-/** The angle of the vector (x, y) from the +x axis, in (-pi, pi]. */
+/** The angle of the vector (x, y) from the +x axis, in [-pi, pi], correctly
+ *  rounded. */
 fun atan2(y: f64, x: f64): f64 {
-    if (isNaN(x) || isNaN(y)) return x + y
-    if (x == 1.0) return atan(y)
-    val hx = __mathHigh(x)
-    val hy = __mathHigh(y)
-    // Bit 0: y is negative; bit 1: x is negative (sign bits, so -0.0 counts).
-    var m = ((hy >> 31) & 1) | ((hx >> 30) & 2)
-    if (y == 0.0) {
-        return if (m <= 1) y else if (m == 2) mathPi else -mathPi
+    // A port of CORE-MATH's atan2.c (copyright 2024-2025 Paul Zimmermann and
+    // Alexei Sibidanov, MIT licence: see the end of this file).
+    val iy = f64ToBits(y)
+    val ix = f64ToBits(x)
+    val aiy = iy & 0x7fffffffffffffff
+    val aix = ix & 0x7fffffffffffffff
+    if (aiy == 0 || aiy >= 0x7ff0000000000000 || aix == 0 || aix >= 0x7ff0000000000000) {
+        return __mathAtan2Special(y, x)
     }
-    if (x == 0.0) return if (hy < 0) -mathHalfPi else mathHalfPi
-    val xInfinite = !isFinite(x)
-    val yInfinite = !isFinite(y)
-    if (xInfinite) {
-        if (yInfinite) {
-            return if (m == 0) mathQuarterPi else if (m == 1) -mathQuarterPi
-                else if (m == 2) 3.0 * mathQuarterPi else -3.0 * mathQuarterPi
-        }
-        return if (m == 0) 0.0 else if (m == 1) -0.0
-            else if (m == 2) mathPi else -mathPi
+    val gt = if (aix < aiy) 1 else 0
+    val sx = ix >>> 63
+    val sy = iy >>> 63
+    // exponents 53 or more apart: the accurate path
+    val dxy = if (gt == 1) aiy - aix - 1 else aix - aiy
+    if (dxy >= 53 << 52) return __mathAtan2Accurate(y, x)
+    // atan2 = offset ± (atan(j / 64) + atan(z)), z = (b - j a / 64) / (a + j b / 64)
+    // for the larger and smaller magnitudes a and b
+    var a = if (gt == 1) fabs(y) else fabs(x)
+    var b = if (gt == 1) fabs(x) else fabs(y)
+    val sg = if ((gt ^ sx ^ sy) == 1) -1.0 else 1.0
+    val kw = (sx << 2) | (sy << 1) | gt
+    val jt = (f64ToBits(b / a + f64FromBits(4611703610613432320)) >>> 45) & 127
+    // the offset: a multiple of pi/2
+    val quarters = if (kw == 1 || kw == 5) 1.0 else if (kw == 3 || kw == 7) -1.0
+        else if (kw == 4) 2.0 else if (kw == 6) -2.0 else 0.0
+    var fh = f64FromBits(__mathAtan2High(jt)) * sg + quarters * f64FromBits(4609753056924675352)
+    var fl = f64FromBits(__mathAtan2Low(jt)) * sg + quarters * f64FromBits(4364452196894661639)
+    // scaled for Dekker's products (CORE-MATH scales only the extremes)
+    if (a < f64FromBits(2805742567851819008)) {
+        a = a * f64FromBits(7309342195222315008)
+        b = b * f64FromBits(7309342195222315008)
+    } else if (a > f64FromBits(6408622269748215808)) {
+        a = a * f64FromBits(1905022642377719808)
+        b = b * f64FromBits(1905022642377719808)
     }
-    if (yInfinite) return if (hy < 0) -mathHalfPi else mathHalfPi
-    val k = (((hy & 2147483647) >> 20) - ((hx & 2147483647) >> 20))
-    var z: f64 = 0.0
-    if (k > 60) {
-        z = mathHalfPi + 0.5 * __mathPiLo
-        m = m & 1
-    } else if (hx < 0 && k < -60) {
-        z = 0.0
-    } else z = atan(fabs(y / x))
-    if (m == 0) z
-    else if (m == 1) -z
-    else if (m == 2) mathPi - (z - __mathPiLo)
-    else (z - __mathPiLo) - mathPi
+    val t0 = f64FromInt(jt) * 0.015625
+    // zn = b - t0 a exactly rounded (CORE-MATH's fma: b - t0 a is exact)
+    val p0 = t0 * a
+    val zn = (b - p0) - __mathMulLow(t0, a, p0)
+    // zd = a + t0 b, rounded once but for 2^-105
+    val p1 = t0 * b
+    val s1 = a + p1
+    val b1 = s1 - a
+    val zd = s1 + (((a - (s1 - b1)) + (p1 - b1)) + __mathMulLow(t0, b, p1))
+    var z = zn / zd
+    var z2 = z * z
+    z = z * sg
+    val dz = (z * z2) * (f64FromBits(-4623695617433709358) + z2 * (f64FromBits(4596373779673833930) +
+        z2 * f64FromBits(-4629057557932522335)))
+    // CORE-MATH's bound from 1.1e10 random pairs, plus 2.5%
+    var eps = fabs(z) * f64FromBits(4377587898245971968) + f64FromBits(4201858452336672768)
+    val rh = fh + z
+    val rl = (fl + dz) + (z - (rh - fh))
+    var lb = rh + (rl - eps)
+    var ub = rh + (rl + eps)
+    if (lb != ub) {
+        // z = zn / zd to about 2^-100
+        var dh = b * t0
+        var dl = __mathMulLow(b, t0, dh)
+        val ds = a + dh
+        dl = dl + (dh - (ds - a))
+        dh = ds
+        val rdh = 1.0 / dh
+        var nh = a * t0
+        var nl = __mathMulLow(a, t0, nh)
+        val dt = b - nh
+        val b2 = dt + nh
+        val w = if (b2 == b) -nl else (b - b2) - nl
+        nh = dt + w
+        nl = w - (nh - dt)
+        val zh0 = nh * rdh
+        z2 = zh0 * zh0
+        // nh - dh zh0 exactly rounded (CORE-MATH's fma: nh - pz is exact)
+        val pz = dh * zh0
+        var zl = rdh * (((nh - pz) - __mathMulLow(dh, zh0, pz)) + (nl - (nh * rdh) * dl))
+        zl = zl + zh0 * z2 * ((f64FromBits(-4623695617433709227) + z2 * f64FromBits(4596373779694318942)) +
+            (z2 * z2) * (f64FromBits(-4629057045730584840) + z2 * f64FromBits(4592668304607484866)))
+        val zh = zh0 * sg
+        zl = zl * sg
+        eps = f64FromBits(4383128337338335232) * (fabs(zh) * z2 + f64FromBits(4377498837804122112))
+        val sh = fh + zh
+        fl = (fl + zl) + (zh - (sh - fh))
+        fh = sh
+        lb = fh + (fl - eps)
+        ub = fh + (fl + eps)
+        if (lb != ub) return __mathAtan2Accurate(y, x)
+    }
+    ub
 }
 
 // --- power --------------------------------------------------------------------
@@ -6636,6 +6689,1348 @@ fun __mathPowExact(x: f64, y: f64, zh: int, zl: int, zp: int, exact: bool): f64 
     }
     if ((k >> 54) != 0) return nan
     __mathPow2(f64FromInt(k * sg), bigE * (n << bigF))
+}
+
+// --- atan2 (CORE-MATH atan2.c and tint.h) ---------------------------------------
+
+// atan2 for a zero, infinite or NaN argument.
+@noinline
+fun __mathAtan2Special(y: f64, x: f64): f64 {
+    val iy = f64ToBits(y)
+    val ix = f64ToBits(x)
+    val aiy = iy << 1
+    val aix = ix << 1
+    val top = 0x7ff << 53
+    val pi = f64FromBits(4614256656552045848)
+    val halfPi = f64FromBits(4609753056924675352)
+    if (!__mathULess(aiy, top) || !__mathULess(aix, top)) {
+        if (__mathULess(top, aiy) || __mathULess(top, aix)) return y + x
+        if (aiy == top && aix == top) {
+            // ±pi/4, or ±3pi/4 for x = -inf
+            val h = if (ix < 0) f64FromBits(4612488097114038738) else f64FromBits(4605249457297304856)
+            val l = if (ix < 0) f64FromBits(4363988038922010624) else f64FromBits(4359484439294640128)
+            return if (iy < 0) -h - l else h + l
+        }
+        if (aix == top) {
+            if (ix < 0) return if (iy < 0) -pi - f64FromBits(4368955796522032135) else pi + f64FromBits(4368955796522032135)
+            return if (iy < 0) -0.0 else 0.0
+        }
+        return if (iy < 0) -halfPi - f64FromBits(4364452196894661639) else halfPi + f64FromBits(4364452196894661639)
+    }
+    // a zero
+    if (aiy == 0 && aix == 0) {
+        if (ix == 0) return y
+        return if (iy == 0) pi else -pi
+    }
+    if (aiy == 0) {
+        if (x > 0.0) return y / x
+        return if (iy >= 0) pi else -pi
+    }
+    if (y > 0.0) halfPi else -halfPi
+}
+
+// a b == c exactly, for finite nonzero a, b and c.
+fun __mathTimesIsExact(a: f64, b: f64, c: f64): bool {
+    if ((f64ToBits(a) ^ f64ToBits(b) ^ f64ToBits(c)) < 0) return false
+    val ab = f64ToBits(a) & 0x7fffffffffffffff
+    val bb = f64ToBits(b) & 0x7fffffffffffffff
+    val cb = f64ToBits(c) & 0x7fffffffffffffff
+    // odd significands and their exponents
+    var ma = (ab & 0xfffffffffffff) | (if ((ab >>> 52) != 0) 1 << 52 else 0)
+    var mb = (bb & 0xfffffffffffff) | (if ((bb >>> 52) != 0) 1 << 52 else 0)
+    var mc = (cb & 0xfffffffffffff) | (if ((cb >>> 52) != 0) 1 << 52 else 0)
+    val ta = __mathCtz(ma)
+    val tb = __mathCtz(mb)
+    val tc = __mathCtz(mc)
+    ma = ma >>> ta
+    mb = mb >>> tb
+    mc = mc >>> tc
+    val ea = (if ((ab >>> 52) != 0) (ab >>> 52) - 1075 else -1074) + ta
+    val eb = (if ((bb >>> 52) != 0) (bb >>> 52) - 1075 else -1074) + tb
+    val ec = (if ((cb >>> 52) != 0) (cb >>> 52) - 1075 else -1074) + tc
+    ea + eb == ec && __mathMulHigh(ma, mb) == 0 && ma * mb == mc
+}
+
+// The double v as a 192-bit float (tint_fromd): its high word, then its p.
+fun __mathTintHigh(v: f64): int {
+    val av = f64ToBits(v) & 0x7fffffffffffffff
+    if ((av >>> 52) != 0) return (1 << 63) | (av << 11)
+    av << __mathClz(av)
+}
+fun __mathTintP(v: f64): int {
+    val vb = f64ToBits(v)
+    val av = vb & 0x7fffffffffffffff
+    val ex = if ((av >>> 52) != 0) (av >>> 52) - 0x3fe else -0x3f2 - __mathClz(av)
+    (ex << 1) | (vb >>> 63)
+}
+
+// The 192-bit float (h, m, l, p) rounded to the nearest double (tint_tod),
+// or truncated when exact (it holds a double already).
+fun __mathAtan2ToDouble(h: int, m: int, l: int, p: int, exact: bool): f64 {
+    var ex = p >> 1
+    val s = if ((p & 1) == 1) -1.0 else 1.0
+    if (ex >= 1025) return s * f64FromBits(9214364837600034816) * 2.0
+    if (ex <= -1074) {
+        if (ex < -1074) return s * f64FromBits(1) * 0.5
+        val mid = h == (1 << 63) && m == 0 && l == 0
+        return s * f64FromBits(1) * (if (mid) 0.5 else 0.75)
+    }
+    var hh = h
+    var mm = m
+    var ll = l
+    if (ex <= -1022) {
+        // subnormal: shift right by sh, the dropped bits kept sticky
+        val sh = -1021 - ex
+        ll = (mm << (64 - sh)) | (ll >>> sh) | (if (ll != 0) 1 else 0)
+        mm = (hh << (64 - sh)) | (mm >>> sh)
+        hh = hh >>> sh
+        ex += sh
+    }
+    val low = hh & 0x7ff
+    val frac = if (exact) 0.0 else if (low < 0x400) 0.25 else if (low > 0x400) 0.75
+        else if (mm == 0 && ll == 0) 0.5 else 0.75
+    // frac s + s h rounds once, as CORE-MATH's fma
+    val r = (frac * s + s * f64FromInt(hh >>> 11)) * f64FromBits(4372995238176751616)
+    r * f64FromBits((ex - 1 + 1023) << 52)
+}
+
+// atan2 in 192 bits (CORE-MATH's atan2_accurate): z = y / x (or x / y) by
+// div_tint, atan(z) by z P(z) / Q(z), then the quadrant. The 192-bit operations
+// are written out inline (generated from CORE-MATH's tint.h).
+@noinline
+fun __mathAtan2Accurate(y: f64, x: f64): f64 {
+    val t = y / x
+    if (t == 0.0) return if (x > 0.0) t else if (y > 0.0) mathPi else -mathPi
+    // a tiny exact t = y / x: atan(t) rounds to t
+    if (x > 0.0 && fabs(t) <= f64FromBits(4489265212858409599) && __mathTimesIsExact(t, x, y)) return t
+    val inv = fabs(y) > fabs(x)
+    // not CORE-MATH's: a quotient q = num / den with 2^-400 < |q| < 2^-51 gives
+    // atan2 = k + atan(±q) with k = 0, ±pi/2 or ±pi, and atan(q) = q - q^3 / 3 + ...;
+    // q to about 2^-104 decides the rounding but for the closest cases
+    val num = if (inv) x else y
+    val den = if (inv) y else x
+    val q = num / den
+    if (fabs(q) < f64FromBits(4377498837804122112) && fabs(q) > f64FromBits(2805742567851819008)) {
+        var n = num
+        var d = den
+        if (fabs(d) < f64FromBits(2805742567851819008)) {
+            n = n * f64FromBits(7309342195222315008)
+            d = d * f64FromBits(7309342195222315008)
+        } else if (fabs(d) > f64FromBits(6408622269748215808)) {
+            n = n * f64FromBits(1905022642377719808)
+            d = d * f64FromBits(1905022642377719808)
+        }
+        // n - q d is exact, and so is its computation
+        val pd = q * d
+        val ql = ((n - pd) - __mathMulLow(q, d, pd)) / d
+        val corr = ql - q * q * q * 0.3333333333333333
+        // the error is below 2^-103 |q|, and k's below 2^-104
+        val eps = f64FromBits(4156822456062967808) * (if (!inv && x > 0.0) fabs(q) else 1.0)
+        var kh = 0.0
+        var v = corr
+        if (inv || x < 0.0) {
+            // k = ±pi/2 - atan(x / y), or ±pi + atan(y / x)
+            val half = if (inv) 0.5 else 1.0
+            val sq = if (inv) -1.0 else 1.0
+            kh = (if (y < 0.0) -mathPi else mathPi) * half
+            val kl = (if (y < 0.0) -__mathPiLo else __mathPiLo) * half
+            v = (kl + sq * q) + sq * corr
+        } else kh = q
+        val lb = kh + (v - eps)
+        val ub = kh + (v + eps)
+        if (lb == ub) return ub
+    }
+    // B / A: y / x or x / y, then P / Q
+    var bh = 0
+    var bm = 0
+    var bl = 0
+    var bp = 0
+    var ah = 0
+    var am = 0
+    var al = 0
+    var ap = 0
+    var pass = 0
+    var sz = 0
+    while (pass < 2) {
+        if (pass == 0) {
+            bh = __mathTintHigh(num)
+            bm = 0
+            bl = 0
+            bp = __mathTintP(num)
+            ah = __mathTintHigh(den)
+            am = 0
+            al = 0
+            ap = __mathTintP(den)
+        }
+        // div_tint: Y ~ 1 / A by a Newton step from a double, then R = Y B refined
+        var a0 = __mathAtan2ToDouble(ah, am, al, ap, true)
+        val subnormal = fabs(a0) < f64FromBits(4503599627370496)
+        if (subnormal) a0 = a0 * f64FromBits(4845873199050653696)
+        val inva = 1.0 / a0
+        var gh = __mathTintHigh(inva)
+        var gm = 0
+        var gl = 0
+        var gp = __mathTintP(inva) + (if (subnormal) 106 else 0)
+        var qh = 0
+        var qm = 0
+        var ql = 0
+        var qp = 0
+        // q = a g
+        if (true) {
+            var rh2001 = __mathMulHigh(ah, gh)
+            var rm2001 = ah * gh
+            var rl2001 = ah * gm
+            val h12001 = __mathMulHigh(ah, gm)
+            rm2001 += h12001
+            if (__mathULess(rm2001, h12001)) rh2001 += 1
+            val l22001 = am * gh
+            val h22001 = __mathMulHigh(am, gh)
+            rl2001 += l22001
+            var cm2001 = if (__mathULess(rl2001, l22001)) 1 else 0
+            rm2001 += h22001
+            if (__mathULess(rm2001, h22001)) rh2001 += 1
+            // the high words of ah bl, am bm and al bh
+            val t12001 = __mathMulHigh(ah, gl)
+            val t22001 = __mathMulHigh(am, gm)
+            val t32001 = __mathMulHigh(al, gh)
+            var sl2001 = t12001 + t22001
+            var sh2001 = if (__mathULess(sl2001, t12001)) 1 else 0
+            val sl22001 = sl2001 + t32001
+            if (__mathULess(sl22001, sl2001)) sh2001 += 1
+            cm2001 += sh2001
+            rl2001 += sl22001
+            if (__mathULess(rl2001, sl22001)) cm2001 += 1
+            rm2001 += cm2001
+            if (__mathULess(rm2001, cm2001)) rh2001 += 1
+            var ex2001 = (ap >> 1) + (gp >> 1)
+            if ((rh2001 >>> 63) == 0) {
+                rh2001 = (rh2001 << 1) | (rm2001 >>> 63)
+                rm2001 = (rm2001 << 1) | (rl2001 >>> 63)
+                rl2001 = rl2001 << 1
+                ex2001 -= 1
+            }
+            qh = rh2001
+            qm = rm2001
+            ql = rl2001
+            qp = (ex2001 << 1) | ((ap ^ gp) & 1)
+        }
+        qp = qp ^ 1
+        // q = constant + q
+        if (true) {
+            var order2002 = 0
+            if (-9223372036854775808 == 0) order2002 = if (qh == 0) 0 else -1
+            else if (qh == 0) order2002 = 1
+            else if ((2 >> 1) != (qp >> 1)) order2002 = if ((2 >> 1) > (qp >> 1)) 1 else -1
+            else if (-9223372036854775808 != qh) order2002 = if (__mathULess(qh, -9223372036854775808)) 1 else -1
+            else if (0 != qm) order2002 = if (__mathULess(qm, 0)) 1 else -1
+            else if (0 != ql) order2002 = if (__mathULess(ql, 0)) 1 else -1
+            if (order2002 == 0) {
+                if (((2 ^ qp) & 1) != 0) {
+                    qh = 0
+                    qm = 0
+                    ql = 0
+                    qp = -1076 << 1
+                } else {
+                    qh = -9223372036854775808
+                    qm = 0
+                    ql = 0
+                    qp = 2 + 2
+                }
+            } else {
+                // |x| > |y|
+                val xh2002 = if (order2002 > 0) -9223372036854775808 else qh
+                val xm2002 = if (order2002 > 0) 0 else qm
+                val xl2002 = if (order2002 > 0) 0 else ql
+                val xp2002 = if (order2002 > 0) 2 else qp
+                val yh2002 = if (order2002 > 0) qh else -9223372036854775808
+                val ym2002 = if (order2002 > 0) qm else 0
+                val yl2002 = if (order2002 > 0) ql else 0
+                val yp2002 = if (order2002 > 0) qp else 2
+                val sh2002 = (xp2002 >> 1) - (yp2002 >> 1)
+                // t = y >> sh
+                val th2002 = __mathShr256(yh2002, ym2002, yl2002, 0, sh2002, 3)
+                val tm2002 = __mathShr256(yh2002, ym2002, yl2002, 0, sh2002, 2)
+                val tl2002 = __mathShr256(yh2002, ym2002, yl2002, 0, sh2002, 1)
+                var ch2002 = 0
+                var cm2002 = 0
+                var cl2002 = 0
+                var ex2002 = xp2002 >> 1
+                if (((xp2002 ^ yp2002) & 1) != 0) {
+                    // a subtraction
+                    cl2002 = xl2002 - tl2002
+                    var bw2002 = if (__mathULess(xl2002, tl2002)) 1 else 0
+                    cm2002 = xm2002 - tm2002 - bw2002
+                    bw2002 = if (__mathULess(xm2002, tm2002) || (xm2002 == tm2002 && bw2002 == 1)) 1 else 0
+                    ch2002 = xh2002 - th2002 - bw2002
+                    val z2002 = __mathClz256(ch2002, cm2002, cl2002, 0)
+                    if (z2002 <= 1 || sh2002 == 0) {
+                        val nh2002 = __mathShl256(0, ch2002, cm2002, cl2002, z2002, 2)
+                        val nm2002 = __mathShl256(0, ch2002, cm2002, cl2002, z2002, 1)
+                        cl2002 = __mathShl256(0, ch2002, cm2002, cl2002, z2002, 0)
+                        ch2002 = nh2002
+                        cm2002 = nm2002
+                        ex2002 -= z2002
+                    } else {
+                        // redo it shifted left by z, keeping the bits of y the shift dropped
+                        val ph2002 = __mathShl256(0, xh2002, xm2002, xl2002, z2002, 2)
+                        val pm2002 = __mathShl256(0, xh2002, xm2002, xl2002, z2002, 1)
+                        val pl2002 = __mathShl256(0, xh2002, xm2002, xl2002, z2002, 0)
+                        val qh2002 = __mathShl256(0, yh2002, ym2002, yl2002, z2002 - sh2002, 2)
+                        val qm2002 = __mathShl256(0, yh2002, ym2002, yl2002, z2002 - sh2002, 1)
+                        val ql2002 = __mathShl256(0, yh2002, ym2002, yl2002, z2002 - sh2002, 0)
+                        cl2002 = pl2002 - ql2002
+                        bw2002 = if (__mathULess(pl2002, ql2002)) 1 else 0
+                        cm2002 = pm2002 - qm2002 - bw2002
+                        bw2002 = if (__mathULess(pm2002, qm2002) || (pm2002 == qm2002 && bw2002 == 1)) 1 else 0
+                        ch2002 = ph2002 - qh2002 - bw2002
+                        val z12002 = __mathClz256(ch2002, cm2002, cl2002, 0)
+                        val nh2002 = __mathShl256(0, ch2002, cm2002, cl2002, z12002, 2)
+                        val nm2002 = __mathShl256(0, ch2002, cm2002, cl2002, z12002, 1)
+                        cl2002 = __mathShl256(0, ch2002, cm2002, cl2002, z12002, 0)
+                        ch2002 = nh2002
+                        cm2002 = nm2002
+                        ex2002 -= z2002 + z12002
+                    }
+                } else {
+                    // an addition, a carry shifted back in
+                    cl2002 = xl2002 + tl2002
+                    var cy2002 = if (__mathULess(cl2002, xl2002)) 1 else 0
+                    cm2002 = xm2002 + tm2002 + cy2002
+                    cy2002 = if (__mathULess(cm2002, xm2002) || (cm2002 == xm2002 && cy2002 == 1)) 1 else 0
+                    ch2002 = xh2002 + th2002 + cy2002
+                    cy2002 = if (__mathULess(ch2002, xh2002) || (ch2002 == xh2002 && cy2002 == 1)) 1 else 0
+                    if (cy2002 == 1) {
+                        cl2002 = (cm2002 << 63) | (cl2002 >>> 1)
+                        cm2002 = (ch2002 << 63) | (cm2002 >>> 1)
+                        ch2002 = (1 << 63) | (ch2002 >>> 1)
+                        ex2002 += 1
+                    }
+                }
+                qh = ch2002
+                qm = cm2002
+                ql = cl2002
+                qp = (ex2002 << 1) | (xp2002 & 1)
+            }
+        }
+        // q = g q
+        if (true) {
+            var rh2003 = __mathMulHigh(gh, qh)
+            var rm2003 = gh * qh
+            var rl2003 = gh * qm
+            val h12003 = __mathMulHigh(gh, qm)
+            rm2003 += h12003
+            if (__mathULess(rm2003, h12003)) rh2003 += 1
+            val l22003 = gm * qh
+            val h22003 = __mathMulHigh(gm, qh)
+            rl2003 += l22003
+            var cm2003 = if (__mathULess(rl2003, l22003)) 1 else 0
+            rm2003 += h22003
+            if (__mathULess(rm2003, h22003)) rh2003 += 1
+            // the high words of ah bl, am bm and al bh
+            val t12003 = __mathMulHigh(gh, ql)
+            val t22003 = __mathMulHigh(gm, qm)
+            val t32003 = __mathMulHigh(gl, qh)
+            var sl2003 = t12003 + t22003
+            var sh2003 = if (__mathULess(sl2003, t12003)) 1 else 0
+            val sl22003 = sl2003 + t32003
+            if (__mathULess(sl22003, sl2003)) sh2003 += 1
+            cm2003 += sh2003
+            rl2003 += sl22003
+            if (__mathULess(rl2003, sl22003)) cm2003 += 1
+            rm2003 += cm2003
+            if (__mathULess(rm2003, cm2003)) rh2003 += 1
+            var ex2003 = (gp >> 1) + (qp >> 1)
+            if ((rh2003 >>> 63) == 0) {
+                rh2003 = (rh2003 << 1) | (rm2003 >>> 63)
+                rm2003 = (rm2003 << 1) | (rl2003 >>> 63)
+                rl2003 = rl2003 << 1
+                ex2003 -= 1
+            }
+            qh = rh2003
+            qm = rm2003
+            ql = rl2003
+            qp = (ex2003 << 1) | ((gp ^ qp) & 1)
+        }
+        // g = g + q
+        if (true) {
+            var order2004 = 0
+            if (gh == 0) order2004 = if (qh == 0) 0 else -1
+            else if (qh == 0) order2004 = 1
+            else if ((gp >> 1) != (qp >> 1)) order2004 = if ((gp >> 1) > (qp >> 1)) 1 else -1
+            else if (gh != qh) order2004 = if (__mathULess(qh, gh)) 1 else -1
+            else if (gm != qm) order2004 = if (__mathULess(qm, gm)) 1 else -1
+            else if (gl != ql) order2004 = if (__mathULess(ql, gl)) 1 else -1
+            if (order2004 == 0) {
+                if (((gp ^ qp) & 1) != 0) {
+                    gh = 0
+                    gm = 0
+                    gl = 0
+                    gp = -1076 << 1
+                } else {
+                    gh = gh
+                    gm = gm
+                    gl = gl
+                    gp = gp + 2
+                }
+            } else {
+                // |x| > |y|
+                val xh2004 = if (order2004 > 0) gh else qh
+                val xm2004 = if (order2004 > 0) gm else qm
+                val xl2004 = if (order2004 > 0) gl else ql
+                val xp2004 = if (order2004 > 0) gp else qp
+                val yh2004 = if (order2004 > 0) qh else gh
+                val ym2004 = if (order2004 > 0) qm else gm
+                val yl2004 = if (order2004 > 0) ql else gl
+                val yp2004 = if (order2004 > 0) qp else gp
+                val sh2004 = (xp2004 >> 1) - (yp2004 >> 1)
+                // t = y >> sh
+                val th2004 = __mathShr256(yh2004, ym2004, yl2004, 0, sh2004, 3)
+                val tm2004 = __mathShr256(yh2004, ym2004, yl2004, 0, sh2004, 2)
+                val tl2004 = __mathShr256(yh2004, ym2004, yl2004, 0, sh2004, 1)
+                var ch2004 = 0
+                var cm2004 = 0
+                var cl2004 = 0
+                var ex2004 = xp2004 >> 1
+                if (((xp2004 ^ yp2004) & 1) != 0) {
+                    // a subtraction
+                    cl2004 = xl2004 - tl2004
+                    var bw2004 = if (__mathULess(xl2004, tl2004)) 1 else 0
+                    cm2004 = xm2004 - tm2004 - bw2004
+                    bw2004 = if (__mathULess(xm2004, tm2004) || (xm2004 == tm2004 && bw2004 == 1)) 1 else 0
+                    ch2004 = xh2004 - th2004 - bw2004
+                    val z2004 = __mathClz256(ch2004, cm2004, cl2004, 0)
+                    if (z2004 <= 1 || sh2004 == 0) {
+                        val nh2004 = __mathShl256(0, ch2004, cm2004, cl2004, z2004, 2)
+                        val nm2004 = __mathShl256(0, ch2004, cm2004, cl2004, z2004, 1)
+                        cl2004 = __mathShl256(0, ch2004, cm2004, cl2004, z2004, 0)
+                        ch2004 = nh2004
+                        cm2004 = nm2004
+                        ex2004 -= z2004
+                    } else {
+                        // redo it shifted left by z, keeping the bits of y the shift dropped
+                        val ph2004 = __mathShl256(0, xh2004, xm2004, xl2004, z2004, 2)
+                        val pm2004 = __mathShl256(0, xh2004, xm2004, xl2004, z2004, 1)
+                        val pl2004 = __mathShl256(0, xh2004, xm2004, xl2004, z2004, 0)
+                        val qh2004 = __mathShl256(0, yh2004, ym2004, yl2004, z2004 - sh2004, 2)
+                        val qm2004 = __mathShl256(0, yh2004, ym2004, yl2004, z2004 - sh2004, 1)
+                        val ql2004 = __mathShl256(0, yh2004, ym2004, yl2004, z2004 - sh2004, 0)
+                        cl2004 = pl2004 - ql2004
+                        bw2004 = if (__mathULess(pl2004, ql2004)) 1 else 0
+                        cm2004 = pm2004 - qm2004 - bw2004
+                        bw2004 = if (__mathULess(pm2004, qm2004) || (pm2004 == qm2004 && bw2004 == 1)) 1 else 0
+                        ch2004 = ph2004 - qh2004 - bw2004
+                        val z12004 = __mathClz256(ch2004, cm2004, cl2004, 0)
+                        val nh2004 = __mathShl256(0, ch2004, cm2004, cl2004, z12004, 2)
+                        val nm2004 = __mathShl256(0, ch2004, cm2004, cl2004, z12004, 1)
+                        cl2004 = __mathShl256(0, ch2004, cm2004, cl2004, z12004, 0)
+                        ch2004 = nh2004
+                        cm2004 = nm2004
+                        ex2004 -= z2004 + z12004
+                    }
+                } else {
+                    // an addition, a carry shifted back in
+                    cl2004 = xl2004 + tl2004
+                    var cy2004 = if (__mathULess(cl2004, xl2004)) 1 else 0
+                    cm2004 = xm2004 + tm2004 + cy2004
+                    cy2004 = if (__mathULess(cm2004, xm2004) || (cm2004 == xm2004 && cy2004 == 1)) 1 else 0
+                    ch2004 = xh2004 + th2004 + cy2004
+                    cy2004 = if (__mathULess(ch2004, xh2004) || (ch2004 == xh2004 && cy2004 == 1)) 1 else 0
+                    if (cy2004 == 1) {
+                        cl2004 = (cm2004 << 63) | (cl2004 >>> 1)
+                        cm2004 = (ch2004 << 63) | (cm2004 >>> 1)
+                        ch2004 = (1 << 63) | (ch2004 >>> 1)
+                        ex2004 += 1
+                    }
+                }
+                gh = ch2004
+                gm = cm2004
+                gl = cl2004
+                gp = (ex2004 << 1) | (xp2004 & 1)
+            }
+        }
+        var rh = 0
+        var rm = 0
+        var rl = 0
+        var rp = 0
+        // r = g b
+        if (true) {
+            var rh2005 = __mathMulHigh(gh, bh)
+            var rm2005 = gh * bh
+            var rl2005 = gh * bm
+            val h12005 = __mathMulHigh(gh, bm)
+            rm2005 += h12005
+            if (__mathULess(rm2005, h12005)) rh2005 += 1
+            val l22005 = gm * bh
+            val h22005 = __mathMulHigh(gm, bh)
+            rl2005 += l22005
+            var cm2005 = if (__mathULess(rl2005, l22005)) 1 else 0
+            rm2005 += h22005
+            if (__mathULess(rm2005, h22005)) rh2005 += 1
+            // the high words of ah bl, am bm and al bh
+            val t12005 = __mathMulHigh(gh, bl)
+            val t22005 = __mathMulHigh(gm, bm)
+            val t32005 = __mathMulHigh(gl, bh)
+            var sl2005 = t12005 + t22005
+            var sh2005 = if (__mathULess(sl2005, t12005)) 1 else 0
+            val sl22005 = sl2005 + t32005
+            if (__mathULess(sl22005, sl2005)) sh2005 += 1
+            cm2005 += sh2005
+            rl2005 += sl22005
+            if (__mathULess(rl2005, sl22005)) cm2005 += 1
+            rm2005 += cm2005
+            if (__mathULess(rm2005, cm2005)) rh2005 += 1
+            var ex2005 = (gp >> 1) + (bp >> 1)
+            if ((rh2005 >>> 63) == 0) {
+                rh2005 = (rh2005 << 1) | (rm2005 >>> 63)
+                rm2005 = (rm2005 << 1) | (rl2005 >>> 63)
+                rl2005 = rl2005 << 1
+                ex2005 -= 1
+            }
+            rh = rh2005
+            rm = rm2005
+            rl = rl2005
+            rp = (ex2005 << 1) | ((gp ^ bp) & 1)
+        }
+        var wh = 0
+        var wm = 0
+        var wl = 0
+        var wp = 0
+        // w = a r
+        if (true) {
+            var rh2006 = __mathMulHigh(ah, rh)
+            var rm2006 = ah * rh
+            var rl2006 = ah * rm
+            val h12006 = __mathMulHigh(ah, rm)
+            rm2006 += h12006
+            if (__mathULess(rm2006, h12006)) rh2006 += 1
+            val l22006 = am * rh
+            val h22006 = __mathMulHigh(am, rh)
+            rl2006 += l22006
+            var cm2006 = if (__mathULess(rl2006, l22006)) 1 else 0
+            rm2006 += h22006
+            if (__mathULess(rm2006, h22006)) rh2006 += 1
+            // the high words of ah bl, am bm and al bh
+            val t12006 = __mathMulHigh(ah, rl)
+            val t22006 = __mathMulHigh(am, rm)
+            val t32006 = __mathMulHigh(al, rh)
+            var sl2006 = t12006 + t22006
+            var sh2006 = if (__mathULess(sl2006, t12006)) 1 else 0
+            val sl22006 = sl2006 + t32006
+            if (__mathULess(sl22006, sl2006)) sh2006 += 1
+            cm2006 += sh2006
+            rl2006 += sl22006
+            if (__mathULess(rl2006, sl22006)) cm2006 += 1
+            rm2006 += cm2006
+            if (__mathULess(rm2006, cm2006)) rh2006 += 1
+            var ex2006 = (ap >> 1) + (rp >> 1)
+            if ((rh2006 >>> 63) == 0) {
+                rh2006 = (rh2006 << 1) | (rm2006 >>> 63)
+                rm2006 = (rm2006 << 1) | (rl2006 >>> 63)
+                rl2006 = rl2006 << 1
+                ex2006 -= 1
+            }
+            wh = rh2006
+            wm = rm2006
+            wl = rl2006
+            wp = (ex2006 << 1) | ((ap ^ rp) & 1)
+        }
+        wp = wp ^ 1
+        // w = b + w
+        if (true) {
+            var order2007 = 0
+            if (bh == 0) order2007 = if (wh == 0) 0 else -1
+            else if (wh == 0) order2007 = 1
+            else if ((bp >> 1) != (wp >> 1)) order2007 = if ((bp >> 1) > (wp >> 1)) 1 else -1
+            else if (bh != wh) order2007 = if (__mathULess(wh, bh)) 1 else -1
+            else if (bm != wm) order2007 = if (__mathULess(wm, bm)) 1 else -1
+            else if (bl != wl) order2007 = if (__mathULess(wl, bl)) 1 else -1
+            if (order2007 == 0) {
+                if (((bp ^ wp) & 1) != 0) {
+                    wh = 0
+                    wm = 0
+                    wl = 0
+                    wp = -1076 << 1
+                } else {
+                    wh = bh
+                    wm = bm
+                    wl = bl
+                    wp = bp + 2
+                }
+            } else {
+                // |x| > |y|
+                val xh2007 = if (order2007 > 0) bh else wh
+                val xm2007 = if (order2007 > 0) bm else wm
+                val xl2007 = if (order2007 > 0) bl else wl
+                val xp2007 = if (order2007 > 0) bp else wp
+                val yh2007 = if (order2007 > 0) wh else bh
+                val ym2007 = if (order2007 > 0) wm else bm
+                val yl2007 = if (order2007 > 0) wl else bl
+                val yp2007 = if (order2007 > 0) wp else bp
+                val sh2007 = (xp2007 >> 1) - (yp2007 >> 1)
+                // t = y >> sh
+                val th2007 = __mathShr256(yh2007, ym2007, yl2007, 0, sh2007, 3)
+                val tm2007 = __mathShr256(yh2007, ym2007, yl2007, 0, sh2007, 2)
+                val tl2007 = __mathShr256(yh2007, ym2007, yl2007, 0, sh2007, 1)
+                var ch2007 = 0
+                var cm2007 = 0
+                var cl2007 = 0
+                var ex2007 = xp2007 >> 1
+                if (((xp2007 ^ yp2007) & 1) != 0) {
+                    // a subtraction
+                    cl2007 = xl2007 - tl2007
+                    var bw2007 = if (__mathULess(xl2007, tl2007)) 1 else 0
+                    cm2007 = xm2007 - tm2007 - bw2007
+                    bw2007 = if (__mathULess(xm2007, tm2007) || (xm2007 == tm2007 && bw2007 == 1)) 1 else 0
+                    ch2007 = xh2007 - th2007 - bw2007
+                    val z2007 = __mathClz256(ch2007, cm2007, cl2007, 0)
+                    if (z2007 <= 1 || sh2007 == 0) {
+                        val nh2007 = __mathShl256(0, ch2007, cm2007, cl2007, z2007, 2)
+                        val nm2007 = __mathShl256(0, ch2007, cm2007, cl2007, z2007, 1)
+                        cl2007 = __mathShl256(0, ch2007, cm2007, cl2007, z2007, 0)
+                        ch2007 = nh2007
+                        cm2007 = nm2007
+                        ex2007 -= z2007
+                    } else {
+                        // redo it shifted left by z, keeping the bits of y the shift dropped
+                        val ph2007 = __mathShl256(0, xh2007, xm2007, xl2007, z2007, 2)
+                        val pm2007 = __mathShl256(0, xh2007, xm2007, xl2007, z2007, 1)
+                        val pl2007 = __mathShl256(0, xh2007, xm2007, xl2007, z2007, 0)
+                        val qh2007 = __mathShl256(0, yh2007, ym2007, yl2007, z2007 - sh2007, 2)
+                        val qm2007 = __mathShl256(0, yh2007, ym2007, yl2007, z2007 - sh2007, 1)
+                        val ql2007 = __mathShl256(0, yh2007, ym2007, yl2007, z2007 - sh2007, 0)
+                        cl2007 = pl2007 - ql2007
+                        bw2007 = if (__mathULess(pl2007, ql2007)) 1 else 0
+                        cm2007 = pm2007 - qm2007 - bw2007
+                        bw2007 = if (__mathULess(pm2007, qm2007) || (pm2007 == qm2007 && bw2007 == 1)) 1 else 0
+                        ch2007 = ph2007 - qh2007 - bw2007
+                        val z12007 = __mathClz256(ch2007, cm2007, cl2007, 0)
+                        val nh2007 = __mathShl256(0, ch2007, cm2007, cl2007, z12007, 2)
+                        val nm2007 = __mathShl256(0, ch2007, cm2007, cl2007, z12007, 1)
+                        cl2007 = __mathShl256(0, ch2007, cm2007, cl2007, z12007, 0)
+                        ch2007 = nh2007
+                        cm2007 = nm2007
+                        ex2007 -= z2007 + z12007
+                    }
+                } else {
+                    // an addition, a carry shifted back in
+                    cl2007 = xl2007 + tl2007
+                    var cy2007 = if (__mathULess(cl2007, xl2007)) 1 else 0
+                    cm2007 = xm2007 + tm2007 + cy2007
+                    cy2007 = if (__mathULess(cm2007, xm2007) || (cm2007 == xm2007 && cy2007 == 1)) 1 else 0
+                    ch2007 = xh2007 + th2007 + cy2007
+                    cy2007 = if (__mathULess(ch2007, xh2007) || (ch2007 == xh2007 && cy2007 == 1)) 1 else 0
+                    if (cy2007 == 1) {
+                        cl2007 = (cm2007 << 63) | (cl2007 >>> 1)
+                        cm2007 = (ch2007 << 63) | (cm2007 >>> 1)
+                        ch2007 = (1 << 63) | (ch2007 >>> 1)
+                        ex2007 += 1
+                    }
+                }
+                wh = ch2007
+                wm = cm2007
+                wl = cl2007
+                wp = (ex2007 << 1) | (xp2007 & 1)
+            }
+        }
+        // w = g w
+        if (true) {
+            var rh2008 = __mathMulHigh(gh, wh)
+            var rm2008 = gh * wh
+            var rl2008 = gh * wm
+            val h12008 = __mathMulHigh(gh, wm)
+            rm2008 += h12008
+            if (__mathULess(rm2008, h12008)) rh2008 += 1
+            val l22008 = gm * wh
+            val h22008 = __mathMulHigh(gm, wh)
+            rl2008 += l22008
+            var cm2008 = if (__mathULess(rl2008, l22008)) 1 else 0
+            rm2008 += h22008
+            if (__mathULess(rm2008, h22008)) rh2008 += 1
+            // the high words of ah bl, am bm and al bh
+            val t12008 = __mathMulHigh(gh, wl)
+            val t22008 = __mathMulHigh(gm, wm)
+            val t32008 = __mathMulHigh(gl, wh)
+            var sl2008 = t12008 + t22008
+            var sh2008 = if (__mathULess(sl2008, t12008)) 1 else 0
+            val sl22008 = sl2008 + t32008
+            if (__mathULess(sl22008, sl2008)) sh2008 += 1
+            cm2008 += sh2008
+            rl2008 += sl22008
+            if (__mathULess(rl2008, sl22008)) cm2008 += 1
+            rm2008 += cm2008
+            if (__mathULess(rm2008, cm2008)) rh2008 += 1
+            var ex2008 = (gp >> 1) + (wp >> 1)
+            if ((rh2008 >>> 63) == 0) {
+                rh2008 = (rh2008 << 1) | (rm2008 >>> 63)
+                rm2008 = (rm2008 << 1) | (rl2008 >>> 63)
+                rl2008 = rl2008 << 1
+                ex2008 -= 1
+            }
+            wh = rh2008
+            wm = rm2008
+            wl = rl2008
+            wp = (ex2008 << 1) | ((gp ^ wp) & 1)
+        }
+        // r = r + w
+        if (true) {
+            var order2009 = 0
+            if (rh == 0) order2009 = if (wh == 0) 0 else -1
+            else if (wh == 0) order2009 = 1
+            else if ((rp >> 1) != (wp >> 1)) order2009 = if ((rp >> 1) > (wp >> 1)) 1 else -1
+            else if (rh != wh) order2009 = if (__mathULess(wh, rh)) 1 else -1
+            else if (rm != wm) order2009 = if (__mathULess(wm, rm)) 1 else -1
+            else if (rl != wl) order2009 = if (__mathULess(wl, rl)) 1 else -1
+            if (order2009 == 0) {
+                if (((rp ^ wp) & 1) != 0) {
+                    rh = 0
+                    rm = 0
+                    rl = 0
+                    rp = -1076 << 1
+                } else {
+                    rh = rh
+                    rm = rm
+                    rl = rl
+                    rp = rp + 2
+                }
+            } else {
+                // |x| > |y|
+                val xh2009 = if (order2009 > 0) rh else wh
+                val xm2009 = if (order2009 > 0) rm else wm
+                val xl2009 = if (order2009 > 0) rl else wl
+                val xp2009 = if (order2009 > 0) rp else wp
+                val yh2009 = if (order2009 > 0) wh else rh
+                val ym2009 = if (order2009 > 0) wm else rm
+                val yl2009 = if (order2009 > 0) wl else rl
+                val yp2009 = if (order2009 > 0) wp else rp
+                val sh2009 = (xp2009 >> 1) - (yp2009 >> 1)
+                // t = y >> sh
+                val th2009 = __mathShr256(yh2009, ym2009, yl2009, 0, sh2009, 3)
+                val tm2009 = __mathShr256(yh2009, ym2009, yl2009, 0, sh2009, 2)
+                val tl2009 = __mathShr256(yh2009, ym2009, yl2009, 0, sh2009, 1)
+                var ch2009 = 0
+                var cm2009 = 0
+                var cl2009 = 0
+                var ex2009 = xp2009 >> 1
+                if (((xp2009 ^ yp2009) & 1) != 0) {
+                    // a subtraction
+                    cl2009 = xl2009 - tl2009
+                    var bw2009 = if (__mathULess(xl2009, tl2009)) 1 else 0
+                    cm2009 = xm2009 - tm2009 - bw2009
+                    bw2009 = if (__mathULess(xm2009, tm2009) || (xm2009 == tm2009 && bw2009 == 1)) 1 else 0
+                    ch2009 = xh2009 - th2009 - bw2009
+                    val z2009 = __mathClz256(ch2009, cm2009, cl2009, 0)
+                    if (z2009 <= 1 || sh2009 == 0) {
+                        val nh2009 = __mathShl256(0, ch2009, cm2009, cl2009, z2009, 2)
+                        val nm2009 = __mathShl256(0, ch2009, cm2009, cl2009, z2009, 1)
+                        cl2009 = __mathShl256(0, ch2009, cm2009, cl2009, z2009, 0)
+                        ch2009 = nh2009
+                        cm2009 = nm2009
+                        ex2009 -= z2009
+                    } else {
+                        // redo it shifted left by z, keeping the bits of y the shift dropped
+                        val ph2009 = __mathShl256(0, xh2009, xm2009, xl2009, z2009, 2)
+                        val pm2009 = __mathShl256(0, xh2009, xm2009, xl2009, z2009, 1)
+                        val pl2009 = __mathShl256(0, xh2009, xm2009, xl2009, z2009, 0)
+                        val qh2009 = __mathShl256(0, yh2009, ym2009, yl2009, z2009 - sh2009, 2)
+                        val qm2009 = __mathShl256(0, yh2009, ym2009, yl2009, z2009 - sh2009, 1)
+                        val ql2009 = __mathShl256(0, yh2009, ym2009, yl2009, z2009 - sh2009, 0)
+                        cl2009 = pl2009 - ql2009
+                        bw2009 = if (__mathULess(pl2009, ql2009)) 1 else 0
+                        cm2009 = pm2009 - qm2009 - bw2009
+                        bw2009 = if (__mathULess(pm2009, qm2009) || (pm2009 == qm2009 && bw2009 == 1)) 1 else 0
+                        ch2009 = ph2009 - qh2009 - bw2009
+                        val z12009 = __mathClz256(ch2009, cm2009, cl2009, 0)
+                        val nh2009 = __mathShl256(0, ch2009, cm2009, cl2009, z12009, 2)
+                        val nm2009 = __mathShl256(0, ch2009, cm2009, cl2009, z12009, 1)
+                        cl2009 = __mathShl256(0, ch2009, cm2009, cl2009, z12009, 0)
+                        ch2009 = nh2009
+                        cm2009 = nm2009
+                        ex2009 -= z2009 + z12009
+                    }
+                } else {
+                    // an addition, a carry shifted back in
+                    cl2009 = xl2009 + tl2009
+                    var cy2009 = if (__mathULess(cl2009, xl2009)) 1 else 0
+                    cm2009 = xm2009 + tm2009 + cy2009
+                    cy2009 = if (__mathULess(cm2009, xm2009) || (cm2009 == xm2009 && cy2009 == 1)) 1 else 0
+                    ch2009 = xh2009 + th2009 + cy2009
+                    cy2009 = if (__mathULess(ch2009, xh2009) || (ch2009 == xh2009 && cy2009 == 1)) 1 else 0
+                    if (cy2009 == 1) {
+                        cl2009 = (cm2009 << 63) | (cl2009 >>> 1)
+                        cm2009 = (ch2009 << 63) | (cm2009 >>> 1)
+                        ch2009 = (1 << 63) | (ch2009 >>> 1)
+                        ex2009 += 1
+                    }
+                }
+                rh = ch2009
+                rm = cm2009
+                rl = cl2009
+                rp = (ex2009 << 1) | (xp2009 & 1)
+            }
+        }
+        if (pass == 1) {
+            bh = rh
+            bm = rm
+            bl = rl
+            bp = rp
+            pass = 2
+        } else {
+            if (!inv && x > 0.0 && (rp >> 1) <= -96) {
+                // |y / x| < 2^-96: atan rounds like y / x nudged toward zero
+                rl = rl - 2
+                rm = rm - (if (__mathULess(rl, 2)) 1 else 0)
+                rh = rh - (if (__mathULess(rm, 1)) 1 else 0)
+                return __mathAtan2ToDouble(rh, rm, rl, rp, false)
+            }
+            // atan(|z|) = |z| P(|z|) / Q(|z|): B = P, A = Q by Horner
+            sz = rp & 1
+            rp = rp & -2
+            var ph = __mathAtan2P(116)
+            var pm = __mathAtan2P(117)
+            var pl = __mathAtan2P(118)
+            var pp = __mathAtan2P(119)
+            var uh = __mathAtan2Q(116)
+            var um = __mathAtan2Q(117)
+            var ul = __mathAtan2Q(118)
+            var up = __mathAtan2Q(119)
+            var i = 28
+            while (i >= 0) {
+                // p = p r
+                if (true) {
+                    var rh2010 = __mathMulHigh(ph, rh)
+                    var rm2010 = ph * rh
+                    var rl2010 = ph * rm
+                    val h12010 = __mathMulHigh(ph, rm)
+                    rm2010 += h12010
+                    if (__mathULess(rm2010, h12010)) rh2010 += 1
+                    val l22010 = pm * rh
+                    val h22010 = __mathMulHigh(pm, rh)
+                    rl2010 += l22010
+                    var cm2010 = if (__mathULess(rl2010, l22010)) 1 else 0
+                    rm2010 += h22010
+                    if (__mathULess(rm2010, h22010)) rh2010 += 1
+                    // the high words of ah bl, am bm and al bh
+                    val t12010 = __mathMulHigh(ph, rl)
+                    val t22010 = __mathMulHigh(pm, rm)
+                    val t32010 = __mathMulHigh(pl, rh)
+                    var sl2010 = t12010 + t22010
+                    var sh2010 = if (__mathULess(sl2010, t12010)) 1 else 0
+                    val sl22010 = sl2010 + t32010
+                    if (__mathULess(sl22010, sl2010)) sh2010 += 1
+                    cm2010 += sh2010
+                    rl2010 += sl22010
+                    if (__mathULess(rl2010, sl22010)) cm2010 += 1
+                    rm2010 += cm2010
+                    if (__mathULess(rm2010, cm2010)) rh2010 += 1
+                    var ex2010 = (pp >> 1) + (rp >> 1)
+                    if ((rh2010 >>> 63) == 0) {
+                        rh2010 = (rh2010 << 1) | (rm2010 >>> 63)
+                        rm2010 = (rm2010 << 1) | (rl2010 >>> 63)
+                        rl2010 = rl2010 << 1
+                        ex2010 -= 1
+                    }
+                    ph = rh2010
+                    pm = rm2010
+                    pl = rl2010
+                    pp = (ex2010 << 1) | ((pp ^ rp) & 1)
+                }
+                // u = u r
+                if (true) {
+                    var rh2011 = __mathMulHigh(uh, rh)
+                    var rm2011 = uh * rh
+                    var rl2011 = uh * rm
+                    val h12011 = __mathMulHigh(uh, rm)
+                    rm2011 += h12011
+                    if (__mathULess(rm2011, h12011)) rh2011 += 1
+                    val l22011 = um * rh
+                    val h22011 = __mathMulHigh(um, rh)
+                    rl2011 += l22011
+                    var cm2011 = if (__mathULess(rl2011, l22011)) 1 else 0
+                    rm2011 += h22011
+                    if (__mathULess(rm2011, h22011)) rh2011 += 1
+                    // the high words of ah bl, am bm and al bh
+                    val t12011 = __mathMulHigh(uh, rl)
+                    val t22011 = __mathMulHigh(um, rm)
+                    val t32011 = __mathMulHigh(ul, rh)
+                    var sl2011 = t12011 + t22011
+                    var sh2011 = if (__mathULess(sl2011, t12011)) 1 else 0
+                    val sl22011 = sl2011 + t32011
+                    if (__mathULess(sl22011, sl2011)) sh2011 += 1
+                    cm2011 += sh2011
+                    rl2011 += sl22011
+                    if (__mathULess(rl2011, sl22011)) cm2011 += 1
+                    rm2011 += cm2011
+                    if (__mathULess(rm2011, cm2011)) rh2011 += 1
+                    var ex2011 = (up >> 1) + (rp >> 1)
+                    if ((rh2011 >>> 63) == 0) {
+                        rh2011 = (rh2011 << 1) | (rm2011 >>> 63)
+                        rm2011 = (rm2011 << 1) | (rl2011 >>> 63)
+                        rl2011 = rl2011 << 1
+                        ex2011 -= 1
+                    }
+                    uh = rh2011
+                    um = rm2011
+                    ul = rl2011
+                    up = (ex2011 << 1) | ((up ^ rp) & 1)
+                }
+                // p = p + constant
+                if (true) {
+                    var order2012 = 0
+                    if (ph == 0) order2012 = if (__mathAtan2P(4 * (i) + 0) == 0) 0 else -1
+                    else if (__mathAtan2P(4 * (i) + 0) == 0) order2012 = 1
+                    else if ((pp >> 1) != (__mathAtan2P(4 * (i) + 3) >> 1)) order2012 = if ((pp >> 1) > (__mathAtan2P(4 * (i) + 3) >> 1)) 1 else -1
+                    else if (ph != __mathAtan2P(4 * (i) + 0)) order2012 = if (__mathULess(__mathAtan2P(4 * (i) + 0), ph)) 1 else -1
+                    else if (pm != __mathAtan2P(4 * (i) + 1)) order2012 = if (__mathULess(__mathAtan2P(4 * (i) + 1), pm)) 1 else -1
+                    else if (pl != __mathAtan2P(4 * (i) + 2)) order2012 = if (__mathULess(__mathAtan2P(4 * (i) + 2), pl)) 1 else -1
+                    if (order2012 == 0) {
+                        if (((pp ^ __mathAtan2P(4 * (i) + 3)) & 1) != 0) {
+                            ph = 0
+                            pm = 0
+                            pl = 0
+                            pp = -1076 << 1
+                        } else {
+                            ph = ph
+                            pm = pm
+                            pl = pl
+                            pp = pp + 2
+                        }
+                    } else {
+                        // |x| > |y|
+                        val xh2012 = if (order2012 > 0) ph else __mathAtan2P(4 * (i) + 0)
+                        val xm2012 = if (order2012 > 0) pm else __mathAtan2P(4 * (i) + 1)
+                        val xl2012 = if (order2012 > 0) pl else __mathAtan2P(4 * (i) + 2)
+                        val xp2012 = if (order2012 > 0) pp else __mathAtan2P(4 * (i) + 3)
+                        val yh2012 = if (order2012 > 0) __mathAtan2P(4 * (i) + 0) else ph
+                        val ym2012 = if (order2012 > 0) __mathAtan2P(4 * (i) + 1) else pm
+                        val yl2012 = if (order2012 > 0) __mathAtan2P(4 * (i) + 2) else pl
+                        val yp2012 = if (order2012 > 0) __mathAtan2P(4 * (i) + 3) else pp
+                        val sh2012 = (xp2012 >> 1) - (yp2012 >> 1)
+                        // t = y >> sh
+                        val th2012 = __mathShr256(yh2012, ym2012, yl2012, 0, sh2012, 3)
+                        val tm2012 = __mathShr256(yh2012, ym2012, yl2012, 0, sh2012, 2)
+                        val tl2012 = __mathShr256(yh2012, ym2012, yl2012, 0, sh2012, 1)
+                        var ch2012 = 0
+                        var cm2012 = 0
+                        var cl2012 = 0
+                        var ex2012 = xp2012 >> 1
+                        if (((xp2012 ^ yp2012) & 1) != 0) {
+                            // a subtraction
+                            cl2012 = xl2012 - tl2012
+                            var bw2012 = if (__mathULess(xl2012, tl2012)) 1 else 0
+                            cm2012 = xm2012 - tm2012 - bw2012
+                            bw2012 = if (__mathULess(xm2012, tm2012) || (xm2012 == tm2012 && bw2012 == 1)) 1 else 0
+                            ch2012 = xh2012 - th2012 - bw2012
+                            val z2012 = __mathClz256(ch2012, cm2012, cl2012, 0)
+                            if (z2012 <= 1 || sh2012 == 0) {
+                                val nh2012 = __mathShl256(0, ch2012, cm2012, cl2012, z2012, 2)
+                                val nm2012 = __mathShl256(0, ch2012, cm2012, cl2012, z2012, 1)
+                                cl2012 = __mathShl256(0, ch2012, cm2012, cl2012, z2012, 0)
+                                ch2012 = nh2012
+                                cm2012 = nm2012
+                                ex2012 -= z2012
+                            } else {
+                                // redo it shifted left by z, keeping the bits of y the shift dropped
+                                val ph2012 = __mathShl256(0, xh2012, xm2012, xl2012, z2012, 2)
+                                val pm2012 = __mathShl256(0, xh2012, xm2012, xl2012, z2012, 1)
+                                val pl2012 = __mathShl256(0, xh2012, xm2012, xl2012, z2012, 0)
+                                val qh2012 = __mathShl256(0, yh2012, ym2012, yl2012, z2012 - sh2012, 2)
+                                val qm2012 = __mathShl256(0, yh2012, ym2012, yl2012, z2012 - sh2012, 1)
+                                val ql2012 = __mathShl256(0, yh2012, ym2012, yl2012, z2012 - sh2012, 0)
+                                cl2012 = pl2012 - ql2012
+                                bw2012 = if (__mathULess(pl2012, ql2012)) 1 else 0
+                                cm2012 = pm2012 - qm2012 - bw2012
+                                bw2012 = if (__mathULess(pm2012, qm2012) || (pm2012 == qm2012 && bw2012 == 1)) 1 else 0
+                                ch2012 = ph2012 - qh2012 - bw2012
+                                val z12012 = __mathClz256(ch2012, cm2012, cl2012, 0)
+                                val nh2012 = __mathShl256(0, ch2012, cm2012, cl2012, z12012, 2)
+                                val nm2012 = __mathShl256(0, ch2012, cm2012, cl2012, z12012, 1)
+                                cl2012 = __mathShl256(0, ch2012, cm2012, cl2012, z12012, 0)
+                                ch2012 = nh2012
+                                cm2012 = nm2012
+                                ex2012 -= z2012 + z12012
+                            }
+                        } else {
+                            // an addition, a carry shifted back in
+                            cl2012 = xl2012 + tl2012
+                            var cy2012 = if (__mathULess(cl2012, xl2012)) 1 else 0
+                            cm2012 = xm2012 + tm2012 + cy2012
+                            cy2012 = if (__mathULess(cm2012, xm2012) || (cm2012 == xm2012 && cy2012 == 1)) 1 else 0
+                            ch2012 = xh2012 + th2012 + cy2012
+                            cy2012 = if (__mathULess(ch2012, xh2012) || (ch2012 == xh2012 && cy2012 == 1)) 1 else 0
+                            if (cy2012 == 1) {
+                                cl2012 = (cm2012 << 63) | (cl2012 >>> 1)
+                                cm2012 = (ch2012 << 63) | (cm2012 >>> 1)
+                                ch2012 = (1 << 63) | (ch2012 >>> 1)
+                                ex2012 += 1
+                            }
+                        }
+                        ph = ch2012
+                        pm = cm2012
+                        pl = cl2012
+                        pp = (ex2012 << 1) | (xp2012 & 1)
+                    }
+                }
+                // u = u + constant
+                if (true) {
+                    var order2013 = 0
+                    if (uh == 0) order2013 = if (__mathAtan2Q(4 * (i) + 0) == 0) 0 else -1
+                    else if (__mathAtan2Q(4 * (i) + 0) == 0) order2013 = 1
+                    else if ((up >> 1) != (__mathAtan2Q(4 * (i) + 3) >> 1)) order2013 = if ((up >> 1) > (__mathAtan2Q(4 * (i) + 3) >> 1)) 1 else -1
+                    else if (uh != __mathAtan2Q(4 * (i) + 0)) order2013 = if (__mathULess(__mathAtan2Q(4 * (i) + 0), uh)) 1 else -1
+                    else if (um != __mathAtan2Q(4 * (i) + 1)) order2013 = if (__mathULess(__mathAtan2Q(4 * (i) + 1), um)) 1 else -1
+                    else if (ul != __mathAtan2Q(4 * (i) + 2)) order2013 = if (__mathULess(__mathAtan2Q(4 * (i) + 2), ul)) 1 else -1
+                    if (order2013 == 0) {
+                        if (((up ^ __mathAtan2Q(4 * (i) + 3)) & 1) != 0) {
+                            uh = 0
+                            um = 0
+                            ul = 0
+                            up = -1076 << 1
+                        } else {
+                            uh = uh
+                            um = um
+                            ul = ul
+                            up = up + 2
+                        }
+                    } else {
+                        // |x| > |y|
+                        val xh2013 = if (order2013 > 0) uh else __mathAtan2Q(4 * (i) + 0)
+                        val xm2013 = if (order2013 > 0) um else __mathAtan2Q(4 * (i) + 1)
+                        val xl2013 = if (order2013 > 0) ul else __mathAtan2Q(4 * (i) + 2)
+                        val xp2013 = if (order2013 > 0) up else __mathAtan2Q(4 * (i) + 3)
+                        val yh2013 = if (order2013 > 0) __mathAtan2Q(4 * (i) + 0) else uh
+                        val ym2013 = if (order2013 > 0) __mathAtan2Q(4 * (i) + 1) else um
+                        val yl2013 = if (order2013 > 0) __mathAtan2Q(4 * (i) + 2) else ul
+                        val yp2013 = if (order2013 > 0) __mathAtan2Q(4 * (i) + 3) else up
+                        val sh2013 = (xp2013 >> 1) - (yp2013 >> 1)
+                        // t = y >> sh
+                        val th2013 = __mathShr256(yh2013, ym2013, yl2013, 0, sh2013, 3)
+                        val tm2013 = __mathShr256(yh2013, ym2013, yl2013, 0, sh2013, 2)
+                        val tl2013 = __mathShr256(yh2013, ym2013, yl2013, 0, sh2013, 1)
+                        var ch2013 = 0
+                        var cm2013 = 0
+                        var cl2013 = 0
+                        var ex2013 = xp2013 >> 1
+                        if (((xp2013 ^ yp2013) & 1) != 0) {
+                            // a subtraction
+                            cl2013 = xl2013 - tl2013
+                            var bw2013 = if (__mathULess(xl2013, tl2013)) 1 else 0
+                            cm2013 = xm2013 - tm2013 - bw2013
+                            bw2013 = if (__mathULess(xm2013, tm2013) || (xm2013 == tm2013 && bw2013 == 1)) 1 else 0
+                            ch2013 = xh2013 - th2013 - bw2013
+                            val z2013 = __mathClz256(ch2013, cm2013, cl2013, 0)
+                            if (z2013 <= 1 || sh2013 == 0) {
+                                val nh2013 = __mathShl256(0, ch2013, cm2013, cl2013, z2013, 2)
+                                val nm2013 = __mathShl256(0, ch2013, cm2013, cl2013, z2013, 1)
+                                cl2013 = __mathShl256(0, ch2013, cm2013, cl2013, z2013, 0)
+                                ch2013 = nh2013
+                                cm2013 = nm2013
+                                ex2013 -= z2013
+                            } else {
+                                // redo it shifted left by z, keeping the bits of y the shift dropped
+                                val ph2013 = __mathShl256(0, xh2013, xm2013, xl2013, z2013, 2)
+                                val pm2013 = __mathShl256(0, xh2013, xm2013, xl2013, z2013, 1)
+                                val pl2013 = __mathShl256(0, xh2013, xm2013, xl2013, z2013, 0)
+                                val qh2013 = __mathShl256(0, yh2013, ym2013, yl2013, z2013 - sh2013, 2)
+                                val qm2013 = __mathShl256(0, yh2013, ym2013, yl2013, z2013 - sh2013, 1)
+                                val ql2013 = __mathShl256(0, yh2013, ym2013, yl2013, z2013 - sh2013, 0)
+                                cl2013 = pl2013 - ql2013
+                                bw2013 = if (__mathULess(pl2013, ql2013)) 1 else 0
+                                cm2013 = pm2013 - qm2013 - bw2013
+                                bw2013 = if (__mathULess(pm2013, qm2013) || (pm2013 == qm2013 && bw2013 == 1)) 1 else 0
+                                ch2013 = ph2013 - qh2013 - bw2013
+                                val z12013 = __mathClz256(ch2013, cm2013, cl2013, 0)
+                                val nh2013 = __mathShl256(0, ch2013, cm2013, cl2013, z12013, 2)
+                                val nm2013 = __mathShl256(0, ch2013, cm2013, cl2013, z12013, 1)
+                                cl2013 = __mathShl256(0, ch2013, cm2013, cl2013, z12013, 0)
+                                ch2013 = nh2013
+                                cm2013 = nm2013
+                                ex2013 -= z2013 + z12013
+                            }
+                        } else {
+                            // an addition, a carry shifted back in
+                            cl2013 = xl2013 + tl2013
+                            var cy2013 = if (__mathULess(cl2013, xl2013)) 1 else 0
+                            cm2013 = xm2013 + tm2013 + cy2013
+                            cy2013 = if (__mathULess(cm2013, xm2013) || (cm2013 == xm2013 && cy2013 == 1)) 1 else 0
+                            ch2013 = xh2013 + th2013 + cy2013
+                            cy2013 = if (__mathULess(ch2013, xh2013) || (ch2013 == xh2013 && cy2013 == 1)) 1 else 0
+                            if (cy2013 == 1) {
+                                cl2013 = (cm2013 << 63) | (cl2013 >>> 1)
+                                cm2013 = (ch2013 << 63) | (cm2013 >>> 1)
+                                ch2013 = (1 << 63) | (ch2013 >>> 1)
+                                ex2013 += 1
+                            }
+                        }
+                        uh = ch2013
+                        um = cm2013
+                        ul = cl2013
+                        up = (ex2013 << 1) | (xp2013 & 1)
+                    }
+                }
+                i -= 1
+            }
+            // p = p r
+            if (true) {
+                var rh2014 = __mathMulHigh(ph, rh)
+                var rm2014 = ph * rh
+                var rl2014 = ph * rm
+                val h12014 = __mathMulHigh(ph, rm)
+                rm2014 += h12014
+                if (__mathULess(rm2014, h12014)) rh2014 += 1
+                val l22014 = pm * rh
+                val h22014 = __mathMulHigh(pm, rh)
+                rl2014 += l22014
+                var cm2014 = if (__mathULess(rl2014, l22014)) 1 else 0
+                rm2014 += h22014
+                if (__mathULess(rm2014, h22014)) rh2014 += 1
+                // the high words of ah bl, am bm and al bh
+                val t12014 = __mathMulHigh(ph, rl)
+                val t22014 = __mathMulHigh(pm, rm)
+                val t32014 = __mathMulHigh(pl, rh)
+                var sl2014 = t12014 + t22014
+                var sh2014 = if (__mathULess(sl2014, t12014)) 1 else 0
+                val sl22014 = sl2014 + t32014
+                if (__mathULess(sl22014, sl2014)) sh2014 += 1
+                cm2014 += sh2014
+                rl2014 += sl22014
+                if (__mathULess(rl2014, sl22014)) cm2014 += 1
+                rm2014 += cm2014
+                if (__mathULess(rm2014, cm2014)) rh2014 += 1
+                var ex2014 = (pp >> 1) + (rp >> 1)
+                if ((rh2014 >>> 63) == 0) {
+                    rh2014 = (rh2014 << 1) | (rm2014 >>> 63)
+                    rm2014 = (rm2014 << 1) | (rl2014 >>> 63)
+                    rl2014 = rl2014 << 1
+                    ex2014 -= 1
+                }
+                ph = rh2014
+                pm = rm2014
+                pl = rl2014
+                pp = (ex2014 << 1) | ((pp ^ rp) & 1)
+            }
+            bh = ph
+            bm = pm
+            bl = pl
+            bp = pp
+            ah = uh
+            am = um
+            al = ul
+            ap = up
+            pass = 1
+        }
+    }
+    // B = atan(|z|): atan(z), then the quadrant
+    var zh = bh
+    var zm = bm
+    var zl = bl
+    var zp = (bp & -2) | sz
+    if (inv) {
+        // pi/2 - atan(x / y), or -(pi/2 + atan(x / y))
+        val neg = zp & 1
+        zp = zp | 1
+    // z = constant + z
+    if (true) {
+        var order2015 = 0
+        if (-3958705157555305932 == 0) order2015 = if (zh == 0) 0 else -1
+        else if (zh == 0) order2015 = 1
+        else if ((2 >> 1) != (zp >> 1)) order2015 = if ((2 >> 1) > (zp >> 1)) 1 else -1
+        else if (-3958705157555305932 != zh) order2015 = if (__mathULess(zh, -3958705157555305932)) 1 else -1
+        else if (-4267615245585081135 != zm) order2015 = if (__mathULess(zm, -4267615245585081135)) 1 else -1
+        else if (2955010104097229940 != zl) order2015 = if (__mathULess(zl, 2955010104097229940)) 1 else -1
+        if (order2015 == 0) {
+            if (((2 ^ zp) & 1) != 0) {
+                zh = 0
+                zm = 0
+                zl = 0
+                zp = -1076 << 1
+            } else {
+                zh = -3958705157555305932
+                zm = -4267615245585081135
+                zl = 2955010104097229940
+                zp = 2 + 2
+            }
+        } else {
+            // |x| > |y|
+            val xh2015 = if (order2015 > 0) -3958705157555305932 else zh
+            val xm2015 = if (order2015 > 0) -4267615245585081135 else zm
+            val xl2015 = if (order2015 > 0) 2955010104097229940 else zl
+            val xp2015 = if (order2015 > 0) 2 else zp
+            val yh2015 = if (order2015 > 0) zh else -3958705157555305932
+            val ym2015 = if (order2015 > 0) zm else -4267615245585081135
+            val yl2015 = if (order2015 > 0) zl else 2955010104097229940
+            val yp2015 = if (order2015 > 0) zp else 2
+            val sh2015 = (xp2015 >> 1) - (yp2015 >> 1)
+            // t = y >> sh
+            val th2015 = __mathShr256(yh2015, ym2015, yl2015, 0, sh2015, 3)
+            val tm2015 = __mathShr256(yh2015, ym2015, yl2015, 0, sh2015, 2)
+            val tl2015 = __mathShr256(yh2015, ym2015, yl2015, 0, sh2015, 1)
+            var ch2015 = 0
+            var cm2015 = 0
+            var cl2015 = 0
+            var ex2015 = xp2015 >> 1
+            if (((xp2015 ^ yp2015) & 1) != 0) {
+                // a subtraction
+                cl2015 = xl2015 - tl2015
+                var bw2015 = if (__mathULess(xl2015, tl2015)) 1 else 0
+                cm2015 = xm2015 - tm2015 - bw2015
+                bw2015 = if (__mathULess(xm2015, tm2015) || (xm2015 == tm2015 && bw2015 == 1)) 1 else 0
+                ch2015 = xh2015 - th2015 - bw2015
+                val z2015 = __mathClz256(ch2015, cm2015, cl2015, 0)
+                if (z2015 <= 1 || sh2015 == 0) {
+                    val nh2015 = __mathShl256(0, ch2015, cm2015, cl2015, z2015, 2)
+                    val nm2015 = __mathShl256(0, ch2015, cm2015, cl2015, z2015, 1)
+                    cl2015 = __mathShl256(0, ch2015, cm2015, cl2015, z2015, 0)
+                    ch2015 = nh2015
+                    cm2015 = nm2015
+                    ex2015 -= z2015
+                } else {
+                    // redo it shifted left by z, keeping the bits of y the shift dropped
+                    val ph2015 = __mathShl256(0, xh2015, xm2015, xl2015, z2015, 2)
+                    val pm2015 = __mathShl256(0, xh2015, xm2015, xl2015, z2015, 1)
+                    val pl2015 = __mathShl256(0, xh2015, xm2015, xl2015, z2015, 0)
+                    val qh2015 = __mathShl256(0, yh2015, ym2015, yl2015, z2015 - sh2015, 2)
+                    val qm2015 = __mathShl256(0, yh2015, ym2015, yl2015, z2015 - sh2015, 1)
+                    val ql2015 = __mathShl256(0, yh2015, ym2015, yl2015, z2015 - sh2015, 0)
+                    cl2015 = pl2015 - ql2015
+                    bw2015 = if (__mathULess(pl2015, ql2015)) 1 else 0
+                    cm2015 = pm2015 - qm2015 - bw2015
+                    bw2015 = if (__mathULess(pm2015, qm2015) || (pm2015 == qm2015 && bw2015 == 1)) 1 else 0
+                    ch2015 = ph2015 - qh2015 - bw2015
+                    val z12015 = __mathClz256(ch2015, cm2015, cl2015, 0)
+                    val nh2015 = __mathShl256(0, ch2015, cm2015, cl2015, z12015, 2)
+                    val nm2015 = __mathShl256(0, ch2015, cm2015, cl2015, z12015, 1)
+                    cl2015 = __mathShl256(0, ch2015, cm2015, cl2015, z12015, 0)
+                    ch2015 = nh2015
+                    cm2015 = nm2015
+                    ex2015 -= z2015 + z12015
+                }
+            } else {
+                // an addition, a carry shifted back in
+                cl2015 = xl2015 + tl2015
+                var cy2015 = if (__mathULess(cl2015, xl2015)) 1 else 0
+                cm2015 = xm2015 + tm2015 + cy2015
+                cy2015 = if (__mathULess(cm2015, xm2015) || (cm2015 == xm2015 && cy2015 == 1)) 1 else 0
+                ch2015 = xh2015 + th2015 + cy2015
+                cy2015 = if (__mathULess(ch2015, xh2015) || (ch2015 == xh2015 && cy2015 == 1)) 1 else 0
+                if (cy2015 == 1) {
+                    cl2015 = (cm2015 << 63) | (cl2015 >>> 1)
+                    cm2015 = (ch2015 << 63) | (cm2015 >>> 1)
+                    ch2015 = (1 << 63) | (ch2015 >>> 1)
+                    ex2015 += 1
+                }
+            }
+            zh = ch2015
+            zm = cm2015
+            zl = cl2015
+            zp = (ex2015 << 1) | (xp2015 & 1)
+        }
+    }
+        zp = zp | neg
+    }
+    if (x < 0.0) {
+        // atan(z) - pi or atan(z) + pi
+        val pos = 1 - (zp & 1)
+        zp = zp | 1
+    // z = constant + z
+    if (true) {
+        var order2016 = 0
+        if (-3958705157555305932 == 0) order2016 = if (zh == 0) 0 else -1
+        else if (zh == 0) order2016 = 1
+        else if ((4 >> 1) != (zp >> 1)) order2016 = if ((4 >> 1) > (zp >> 1)) 1 else -1
+        else if (-3958705157555305932 != zh) order2016 = if (__mathULess(zh, -3958705157555305932)) 1 else -1
+        else if (-4267615245585081135 != zm) order2016 = if (__mathULess(zm, -4267615245585081135)) 1 else -1
+        else if (2955010104097229940 != zl) order2016 = if (__mathULess(zl, 2955010104097229940)) 1 else -1
+        if (order2016 == 0) {
+            if (((4 ^ zp) & 1) != 0) {
+                zh = 0
+                zm = 0
+                zl = 0
+                zp = -1076 << 1
+            } else {
+                zh = -3958705157555305932
+                zm = -4267615245585081135
+                zl = 2955010104097229940
+                zp = 4 + 2
+            }
+        } else {
+            // |x| > |y|
+            val xh2016 = if (order2016 > 0) -3958705157555305932 else zh
+            val xm2016 = if (order2016 > 0) -4267615245585081135 else zm
+            val xl2016 = if (order2016 > 0) 2955010104097229940 else zl
+            val xp2016 = if (order2016 > 0) 4 else zp
+            val yh2016 = if (order2016 > 0) zh else -3958705157555305932
+            val ym2016 = if (order2016 > 0) zm else -4267615245585081135
+            val yl2016 = if (order2016 > 0) zl else 2955010104097229940
+            val yp2016 = if (order2016 > 0) zp else 4
+            val sh2016 = (xp2016 >> 1) - (yp2016 >> 1)
+            // t = y >> sh
+            val th2016 = __mathShr256(yh2016, ym2016, yl2016, 0, sh2016, 3)
+            val tm2016 = __mathShr256(yh2016, ym2016, yl2016, 0, sh2016, 2)
+            val tl2016 = __mathShr256(yh2016, ym2016, yl2016, 0, sh2016, 1)
+            var ch2016 = 0
+            var cm2016 = 0
+            var cl2016 = 0
+            var ex2016 = xp2016 >> 1
+            if (((xp2016 ^ yp2016) & 1) != 0) {
+                // a subtraction
+                cl2016 = xl2016 - tl2016
+                var bw2016 = if (__mathULess(xl2016, tl2016)) 1 else 0
+                cm2016 = xm2016 - tm2016 - bw2016
+                bw2016 = if (__mathULess(xm2016, tm2016) || (xm2016 == tm2016 && bw2016 == 1)) 1 else 0
+                ch2016 = xh2016 - th2016 - bw2016
+                val z2016 = __mathClz256(ch2016, cm2016, cl2016, 0)
+                if (z2016 <= 1 || sh2016 == 0) {
+                    val nh2016 = __mathShl256(0, ch2016, cm2016, cl2016, z2016, 2)
+                    val nm2016 = __mathShl256(0, ch2016, cm2016, cl2016, z2016, 1)
+                    cl2016 = __mathShl256(0, ch2016, cm2016, cl2016, z2016, 0)
+                    ch2016 = nh2016
+                    cm2016 = nm2016
+                    ex2016 -= z2016
+                } else {
+                    // redo it shifted left by z, keeping the bits of y the shift dropped
+                    val ph2016 = __mathShl256(0, xh2016, xm2016, xl2016, z2016, 2)
+                    val pm2016 = __mathShl256(0, xh2016, xm2016, xl2016, z2016, 1)
+                    val pl2016 = __mathShl256(0, xh2016, xm2016, xl2016, z2016, 0)
+                    val qh2016 = __mathShl256(0, yh2016, ym2016, yl2016, z2016 - sh2016, 2)
+                    val qm2016 = __mathShl256(0, yh2016, ym2016, yl2016, z2016 - sh2016, 1)
+                    val ql2016 = __mathShl256(0, yh2016, ym2016, yl2016, z2016 - sh2016, 0)
+                    cl2016 = pl2016 - ql2016
+                    bw2016 = if (__mathULess(pl2016, ql2016)) 1 else 0
+                    cm2016 = pm2016 - qm2016 - bw2016
+                    bw2016 = if (__mathULess(pm2016, qm2016) || (pm2016 == qm2016 && bw2016 == 1)) 1 else 0
+                    ch2016 = ph2016 - qh2016 - bw2016
+                    val z12016 = __mathClz256(ch2016, cm2016, cl2016, 0)
+                    val nh2016 = __mathShl256(0, ch2016, cm2016, cl2016, z12016, 2)
+                    val nm2016 = __mathShl256(0, ch2016, cm2016, cl2016, z12016, 1)
+                    cl2016 = __mathShl256(0, ch2016, cm2016, cl2016, z12016, 0)
+                    ch2016 = nh2016
+                    cm2016 = nm2016
+                    ex2016 -= z2016 + z12016
+                }
+            } else {
+                // an addition, a carry shifted back in
+                cl2016 = xl2016 + tl2016
+                var cy2016 = if (__mathULess(cl2016, xl2016)) 1 else 0
+                cm2016 = xm2016 + tm2016 + cy2016
+                cy2016 = if (__mathULess(cm2016, xm2016) || (cm2016 == xm2016 && cy2016 == 1)) 1 else 0
+                ch2016 = xh2016 + th2016 + cy2016
+                cy2016 = if (__mathULess(ch2016, xh2016) || (ch2016 == xh2016 && cy2016 == 1)) 1 else 0
+                if (cy2016 == 1) {
+                    cl2016 = (cm2016 << 63) | (cl2016 >>> 1)
+                    cm2016 = (ch2016 << 63) | (cm2016 >>> 1)
+                    ch2016 = (1 << 63) | (ch2016 >>> 1)
+                    ex2016 += 1
+                }
+            }
+            zh = ch2016
+            zm = cm2016
+            zl = cl2016
+            zp = (ex2016 << 1) | (xp2016 & 1)
+        }
+    }
+        zp = zp | pos
+    }
+    __mathAtan2ToDouble(zh, zm, zl, zp, false)
 }
 
 // --- 128-bit floats for the accurate paths (CORE-MATH dint.h) ------------------
@@ -18952,6 +20347,401 @@ fun __mathPowExpPoly3(index: int): int =
         else -> 0
     }
 
+// atan2's accurate path: z P(z) / Q(z) approximates atan(z) on [0, 1]; P's
+// coefficients in 192 bits, [h, m, l, ex << 1 | sign] each, degree 0 first
+fun __mathAtan2P(index: int): int =
+    when (index) {
+        0 -> -9047661783760687414
+        1 -> 8200600246882380357
+        2 -> 116138287687233472
+        3 -> -20
+        4 -> -5490041103630123517
+        5 -> -1271972759828359024
+        6 -> -984305818454050790
+        7 -> -16
+        8 -> -5727284938059234406
+        9 -> 1289006005103155450
+        10 -> 2852380876916512652
+        11 -> -12
+        12 -> -194874710563287677
+        13 -> -5596806935977374269
+        14 -> -7926179627124692737
+        15 -> -10
+        16 -> -7614433269855046778
+        17 -> -2254027781192701863
+        18 -> -4698917119424399456
+        19 -> -6
+        20 -> -7590071888890575472
+        21 -> -991434566614593963
+        22 -> 3194424690646359934
+        23 -> -4
+        24 -> -8949424634667324655
+        25 -> -5940356286654064589
+        26 -> 5689296302324188106
+        27 -> -2
+        28 -> -3766003993889947386
+        29 -> -4870977575256611101
+        30 -> 6236130466016758032
+        31 -> -2
+        32 -> -8288602686455648190
+        33 -> -3633659732460054328
+        34 -> 305071184039108685
+        35 -> 0
+        36 -> -5774680326435423809
+        37 -> 1287857176357394900
+        38 -> 4806197511085239148
+        39 -> 0
+        40 -> -4109258594988186343
+        41 -> 3431466729623061367
+        42 -> 2036866578146407942
+        43 -> 0
+        44 -> -3681799275134262507
+        45 -> -7940330006355860242
+        46 -> -5573495764826100926
+        47 -> 0
+        48 -> -4571091715238718674
+        49 -> 2160405770566983143
+        50 -> -1943643496817012880
+        51 -> 0
+        52 -> -6532844410854053785
+        53 -> -2860437076627566077
+        54 -> -1024636375918756157
+        55 -> 0
+        56 -> -9098073375951242184
+        57 -> 2158138086863014201
+        58 -> -3797611512669246423
+        59 -> 0
+        60 -> -5049359718872323879
+        61 -> -4026897715662962137
+        62 -> -7544772402000706766
+        63 -> -2
+        64 -> -945916826427693318
+        65 -> -4423146546470106011
+        66 -> -8955084561960079163
+        67 -> -4
+        68 -> -8057726069474521384
+        69 -> 8016070748029258399
+        70 -> -8172611112086738510
+        71 -> -4
+        72 -> -7282421643512770041
+        73 -> -5994236719435270319
+        74 -> 4516902228783293748
+        75 -> -6
+        76 -> -7648350802458254749
+        77 -> -8847749848096004320
+        78 -> -276017288462100264
+        79 -> -8
+        80 -> -9116210506281164979
+        81 -> 8126606298315791771
+        82 -> 888591699479175512
+        83 -> -10
+        84 -> -4184191351120387944
+        85 -> 8691479705417587559
+        86 -> -5033408478952895295
+        87 -> -14
+        88 -> -8931701507918275484
+        89 -> -5378911997952265454
+        90 -> 7379350820037250312
+        91 -> -16
+        92 -> -7563994621432909410
+        93 -> -4464566818772414691
+        94 -> 3935758891027550858
+        95 -> -20
+        96 -> -8046805413580720219
+        97 -> -4139586110972015884
+        98 -> -1246431094121766520
+        99 -> -24
+        100 -> -2460291207135053035
+        101 -> 8446327004380899981
+        102 -> 4548743430878033339
+        103 -> -30
+        104 -> -9155930075620070427
+        105 -> 1794314879857844041
+        106 -> -3332608068282208867
+        107 -> -34
+        108 -> -3884674319515613876
+        109 -> -4983010647630347652
+        110 -> 2290067738305523478
+        111 -> -42
+        112 -> -6865172790238271487
+        113 -> -1811550232661623036
+        114 -> 2257152066513296687
+        115 -> -50
+        116 -> -7204562544904220324
+        117 -> 933167680363498179
+        118 -> -6206945001519113571
+        119 -> -117
+        else -> 0
+    }
+
+// Q's coefficients, likewise
+fun __mathAtan2Q(index: int): int =
+    when (index) {
+        0 -> -9047661783760687414
+        1 -> 8200600246882380357
+        2 -> 116138287687233472
+        3 -> -20
+        4 -> -5490041103630123517
+        5 -> -1271972759828359024
+        6 -> -984305818454050609
+        7 -> -16
+        8 -> -5531470723685299736
+        9 -> -845991165633822245
+        10 -> -7521493116885040062
+        11 -> -12
+        12 -> -9050878080259764895
+        13 -> -1287674227675981980
+        14 -> -3599289016565065390
+        15 -> -8
+        16 -> -7090982946348748050
+        17 -> -1206815421603360215
+        18 -> 8371002998511070712
+        19 -> -6
+        20 -> -6847572752884591458
+        21 -> -710458669177513181
+        22 -> -8843023883344343347
+        23 -> -4
+        24 -> -8081209154025258354
+        25 -> 1918378388024475131
+        26 -> -5794266295509094024
+        27 -> -2
+        28 -> -2053244817595306475
+        29 -> 6938436796845953515
+        30 -> -6941555405090133200
+        31 -> -2
+        32 -> -6817098691902512845
+        33 -> -1863571894246546430
+        34 -> -3809329514709113761
+        35 -> 0
+        36 -> -3544120924799259601
+        37 -> -2899563910143288674
+        38 -> -6761228840766954063
+        39 -> 0
+        40 -> -1088070091644796047
+        41 -> 4452399834828167491
+        42 -> -8461496384984168308
+        43 -> 0
+        44 -> -9223372036854775808
+        45 -> 0
+        46 -> 0
+        47 -> 2
+        48 -> -510480186185838333
+        49 -> -5595752499672344961
+        50 -> -9110884844448463702
+        51 -> 0
+        52 -> -2466196958015888844
+        53 -> 5162038472162878180
+        54 -> -6439372132448057590
+        55 -> 0
+        56 -> -5391407188177073950
+        57 -> 2618028011843880522
+        58 -> 4429508535243257936
+        59 -> 0
+        60 -> -8670536228254874719
+        61 -> 5663124164106017547
+        62 -> -621766931974513752
+        63 -> 0
+        64 -> -5042254287724284971
+        65 -> -1973263148059255061
+        66 -> 7495630858627439833
+        67 -> -2
+        68 -> -1656530107885280191
+        69 -> -7756044716220237784
+        70 -> 5881344070559517856
+        71 -> -4
+        72 -> -8870959004797929829
+        73 -> 1128982165364792633
+        74 -> -6233086687502127981
+        75 -> -4
+        76 -> -8543992132167472205
+        77 -> -2256372996694492171
+        78 -> 440455522929278964
+        79 -> -6
+        80 -> -9216040381416801134
+        81 -> -513224020315828921
+        82 -> -9112596191005183812
+        83 -> -8
+        84 -> -3054275586963863589
+        85 -> -6283928846067958865
+        86 -> -572861936379764855
+        87 -> -12
+        88 -> -7082637837539511759
+        89 -> -3495883524395234983
+        90 -> 3681389962099712078
+        91 -> -14
+        92 -> -3786312490180333976
+        93 -> -7527850175323713532
+        94 -> -5016626332631023145
+        95 -> -18
+        96 -> -2221872343399747010
+        97 -> -7509449349153328788
+        98 -> 8115898489627416274
+        99 -> -22
+        100 -> -3434075183960370419
+        101 -> 6774745450882243166
+        102 -> 2588746643993960560
+        103 -> -26
+        104 -> -7269059790638187803
+        105 -> 1848314164696006382
+        106 -> 408082351429801867
+        107 -> -30
+        108 -> -5856244056115729349
+        109 -> 3524732392664659829
+        110 -> -8458938848228345615
+        111 -> -36
+        112 -> -8882877885312073603
+        113 -> 1433640043208996529
+        114 -> 5545098382007242558
+        115 -> -42
+        116 -> -3700629565223824515
+        117 -> 2538937726721489951
+        118 -> -823067227545778790
+        119 -> -52
+        else -> 0
+    }
+
+// atan(i / 64) rounded to 53 bits, for 0 <= i <= 64
+fun __mathAtan2High(index: int): int =
+    when (index) {
+        0 -> 0
+        1 -> 4580160088135398144
+        2 -> 4584661490348946944
+        3 -> 4586911279187286592
+        4 -> 4589156319577832960
+        5 -> 4590282508712301984
+        6 -> 4591400132611862784
+        7 -> 4592514515973638080
+        8 -> 4593625142376804192
+        9 -> 4594201562964047648
+        10 -> 4594752366443913840
+        11 -> 4595300551196852848
+        12 -> 4595845883958811392
+        13 -> 4596388139109221920
+        14 -> 4596927099139416224
+        15 -> 4597462555070322480
+        16 -> 4597994306818310368
+        17 -> 4598348691526935392
+        18 -> 4598610581640704376
+        19 -> 4598870347659865928
+        20 -> 4599127908639304648
+        21 -> 4599383188605939464
+        22 -> 4599636116588580168
+        23 -> 4599886626624753632
+        24 -> 4600134657745673968
+        25 -> 4600380153940653048
+        26 -> 4600623064102345512
+        27 -> 4600863341954296600
+        28 -> 4601100945962312704
+        29 -> 4601335839231204464
+        30 -> 4601567989388462576
+        31 -> 4601797368456418128
+        32 -> 4602023952714414928
+        33 -> 4602247722552482360
+        34 -> 4602468662317945880
+        35 -> 4602682789664498700
+        36 -> 4602790413510324432
+        37 -> 4602896609907000284
+        38 -> 4603001378128515752
+        39 -> 4603104719013837844
+        40 -> 4603206634882137780
+        41 -> 4603307129448472172
+        42 -> 4603406207740317232
+        43 -> 4603503876015311820
+        44 -> 4603600141680523196
+        45 -> 4603695013213509400
+        46 -> 4603788500085413620
+        47 -> 4603880612686289748
+        48 -> 4603971362252824288
+        49 -> 4604060760798587908
+        50 -> 4604148821046920736
+        51 -> 4604235556366528444
+        52 -> 4604320980709841688
+        53 -> 4604405108554169228
+        54 -> 4604487954845655176
+        55 -> 4604569534946033048
+        56 -> 4604649864582153780
+        57 -> 4604728959798251024
+        58 -> 4604806836910895456
+        59 -> 4604883512466579604
+        60 -> 4604959003201866316
+        61 -> 4605033326006026948
+        62 -> 4605106497886089720
+        63 -> 4605178535934214236
+        64 -> 4605249457297304856
+        else -> 0
+    }
+
+// the rounding error of __mathAtan2High(i)
+fun __mathAtan2Low(index: int): int =
+    when (index) {
+        0 -> 0
+        1 -> -4852256822840701441
+        2 -> 4369147117027423966
+        3 -> -4853184832219519684
+        4 -> -4853128710472227714
+        5 -> -4862577640135704329
+        6 -> 4372177359728516627
+        7 -> 4362843936494193457
+        8 -> 4371742560061106128
+        9 -> 4371749348085372098
+        10 -> -4855658059606598915
+        11 -> -4852484951811028870
+        12 -> 4364327216974104605
+        13 -> 4370870810041045202
+        14 -> 4364026479443821003
+        15 -> 4371242929391617432
+        16 -> -4858000184293914104
+        17 -> 4369272055164671757
+        18 -> 4351335565439474681
+        19 -> -4854300982614573168
+        20 -> 4372548585933543634
+        21 -> 4366955100861272849
+        22 -> 4367846446145140720
+        23 -> 4366630621613897792
+        24 -> 4359992596412795764
+        25 -> -4862566277414490701
+        26 -> -4853593563632407029
+        27 -> 4357767867718765175
+        28 -> -4851984570235873536
+        29 -> -4851322588967291400
+        30 -> -4864800405070853068
+        31 -> 4360304137526806314
+        32 -> -4863067085147190001
+        33 -> -4850971255307232903
+        34 -> -4870016744125093341
+        35 -> -4860735532708538989
+        36 -> -4864631651799184922
+        37 -> -4850600720297994754
+        38 -> 4368161944274989341
+        39 -> -4858874986158383489
+        40 -> -4874820182729922929
+        41 -> -4850873923055878693
+        42 -> 4367322183711477726
+        43 -> -4852372788762915811
+        44 -> -4857274072094181505
+        45 -> 4371715334492246063
+        46 -> 4359149686475867376
+        47 -> 4371888193129681095
+        48 -> 4369133973742179467
+        49 -> 4360789824789248364
+        50 -> -4853632602210921341
+        51 -> -4854109944605526742
+        52 -> 4350480050219771850
+        53 -> 4372665967406158196
+        54 -> -4854074121316919433
+        55 -> 4364761974030703993
+        56 -> -4865924661261967626
+        57 -> -4855088846770193445
+        58 -> -4851785995204431312
+        59 -> -4857888941545069909
+        60 -> 4366523682211434938
+        61 -> 4368891203249015692
+        62 -> -4862379504114894309
+        63 -> 4371913111144200724
+        64 -> 4359948597267291143
+        else -> 0
+    }
+
 // CORE-MATH's licence, for the ports above:
 //
 // exp.c, hypot.c: Copyright (c) 2022-2026 Alexei Sibidanov <sibid@uvic.ca>.
@@ -18961,6 +20751,8 @@ fun __mathPowExpPoly3(index: int): int =
 // tan.c: Copyright (c) 2022-2025 Paul Zimmermann and Tom Hubrecht
 // pow.c, pow.h: Copyright (c) 2022-2025 CERN and Inria. Its dint.h and qint.h:
 // Copyright (c) 2022, 2023 CERN and Inria
+// atan2.c: Copyright (c) 2024-2025 Paul Zimmermann and Alexei Sibidanov. Its
+// tint.h: Copyright (c) 2023-2024 Paul Zimmermann and Alexei Sibidanov
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
