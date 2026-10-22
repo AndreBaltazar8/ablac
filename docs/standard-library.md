@@ -131,6 +131,17 @@ using that address as memory remains trusted. The trusted boundary also
 provides fixed-signature call-through-address operations for native extension
 entry points. Each operation encodes its exact pointer and integer lanes; there
 is no unchecked variadic call surface.
+
+A NUL-terminated native string becomes an Abla string with `nativeCString`,
+which copies it: the string stays valid after the native memory is released or
+reused. `borrowNativeCString` reads it in place, without a copy, and is valid
+only while that memory is. A string made from a borrowed one can share the same
+bytes, because string operations don't copy what they can share: a template
+such as `"${s}"`, `+` with an empty side, a concatenation longer than 64 bytes
+(it keeps references to its parts), and a stored value. Use a borrowed string,
+and anything made from it, only while the memory is live; text that outlives
+the memory comes from `nativeCString`.
+
 Native counter integrations can use the monotonic atomic `i64` fetch-add
 operation instead of introducing a foreign runtime helper or data race.
 Trusted embedded drivers can also request function-scoped native storage with

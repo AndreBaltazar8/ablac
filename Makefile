@@ -276,6 +276,7 @@ test-serial: ablac
 	tools/test-builtin-names.sh $(COMPILER)
 	tools/test-sidecar.sh $(COMPILER)
 	tools/test-tool-object-cache.sh $(COMPILER)
+	tools/test-native-cstring.sh $(COMPILER)
 
 check: test self-rebuild
 
