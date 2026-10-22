@@ -949,20 +949,38 @@ fun __mathSinCos(x: f64, quarter: int): f64 {
         // |x| < 2^-27: cos(x) = 1 - x^2/2 + ... rounds to 1
         return 1.0
     }
+    val ax = fabs(x)
+    // x = j pi / 2^14 + r with r in radians, or for |x| >= 2^31
+    // x / (2 pi) mod 1 = j / 2^15 + r with r in turns; the polynomials below are
+    // in r or in 2 pi r: sin(r) - r ~ r (s1 + s3 r^2), cos(r) - 1 ~ r^2 (c2 + c4 r^2)
+    var r = 0.0
+    var j = 0
+    var s1 = 1.0
+    var s3 = f64FromBits(-4628199217063499536)
+    var c2 = -0.5
+    var c4 = f64FromBits(4586165620537294128)
+    var eps = f64FromBits(4322857507950166016)
     if (e >= 0x3ff + 31) {
         if (e == 0x7ff) return x - x
-        return __mathSinCosLarge(x, quarter)
+        r = __mathSinCosReduce(x, 0)
+        j = f64ToInt(__mathSinCosReduce(x, 1))
+        s1 = f64FromBits(4618760256179416344)
+        s3 = f64FromBits(-4592356892387629359)
+        c2 = f64FromBits(-4597122725834766882)
+        c4 = f64FromBits(4634270120108634243)
+        eps = f64FromBits(4323473234461720576)
+    } else {
+        // |x| < 2^31: x = k pi / 2^14 + r, with 2^14 (pih + pil) = -pi
+        val k = roundEven(f64FromBits(4662456175840315523) * ax)
+        val pih = f64FromBits(-4672165775085916904)
+        val kp = k * pih
+        // ax + k pih is exact (CORE-MATH's fma)
+        val rh = (ax + kp) + __mathMulLow(k, pih, kp)
+        r = rh + k * f64FromBits(-4917466635115930617)
+        j = f64ToInt(k)
     }
-    // |x| < 2^31: x = k pi / 2^14 + r, with 2^14 (pih + pil) = -pi
-    val ax = fabs(x)
-    val k = roundEven(f64FromBits(4662456175840315523) * ax)
-    val pih = f64FromBits(-4672165775085916904)
-    val kp = k * pih
-    // ax + k pih is exact (CORE-MATH's fma)
-    val rh = (ax + kp) + __mathMulLow(k, pih, kp)
-    val r = rh + k * f64FromBits(-4917466635115930617)
     val r2 = r * r
-    val j = f64ToInt(k) + (quarter << 13)
+    j = j + (quarter << 13)
     // an odd multiple of pi negates
     val sbit = (if (quarter == 0 && xb < 0) 1 else 0) ^ ((j >> 14) & 1)
     val i1 = (j >> 7) & 0x7f
@@ -981,23 +999,22 @@ fun __mathSinCos(x: f64, quarter: int): f64 {
     val sh0 = s1h + s2h
     val sl0 = (s1l + s2l) + (s2h - (sh0 - s1h))
     val ch0 = u1ch * u2ch - u1sh * u2sh
-    // sin(r) - r and cos(r) - 1 to 2^-76.494 and 2^-92.723 for |r| <= 2^-13.339
-    val sr = r * (1.0 - f64FromBits(4595172819791276272) * r2)
-    val cr = r2 * (-0.5 + f64FromBits(4586165620537294128) * r2)
+    // radians: to 2^-76.494 and 2^-92.723 for |r| <= 2^-13.339 (CORE-MATH)
+    val sr = r * (s1 + s3 * r2)
+    val cr = r2 * (c2 + c4 * r2)
     val sign = if (sbit == 1) -1.0 else 1.0
     val fh = sign * sh0
     val fl = sign * ((sl0 + sh0 * cr) + ch0 * sr)
-    val eps = f64FromBits(4322857507950166016)
     val lb = fh + (fl - eps)
     if (lb == fh + (fl + eps)) return lb
     if (quarter == 0 && ax < f64FromBits(4535124824762089472)) return __mathSinSmall(x)
     __mathSinCosAccurate(x, quarter)
 }
 
-// The fast path for |x| >= 2^31.
+// For |x| >= 2^31: x / (2 pi) mod 1 = j / 2^15 + r + s with 0 <= r < 2^-15,
+// 0 <= s < 2^-67.988 (CORE-MATH's reduce_large): r for part 0, j for part 1.
 @noinline
-fun __mathSinCosLarge(x: f64, quarter: int): f64 {
-    // x / (2 pi) mod 1 = j / 2^15 + r + s with 0 <= r < 2^-15, 0 <= s < 2^-67.988
+fun __mathSinCosReduce(x: f64, part: int): f64 {
     val xb = f64ToBits(x)
     val e = (xb >>> 52) & 0x7ff
     val m = (1 << 52) | (xb & 0xfffffffffffff)
@@ -1015,36 +1032,9 @@ fun __mathSinCosLarge(x: f64, quarter: int): f64 {
     val low = ul + 580964351930793984
     if (__mathULess(low, ul)) uh += 1
     ul = low
-    val r = f64FromInt(((ul >>> 60) | (uh << 4)) & 0x1fffffffffffff) *
+    if (part == 1) return f64FromInt(uh >>> 49)
+    f64FromInt(((ul >>> 60) | (uh << 4)) & 0x1fffffffffffff) *
         f64FromBits(4300937644138823680) - f64FromBits(4535124824762089472)
-    val j = ((uh >>> 49) + (quarter << 13)) & 0x7fff
-    val sbit = (if (quarter == 0 && xb < 0) 1 else 0) ^ (j >> 14)
-    val i1 = (j >> 7) & 0x7f
-    val i2 = j & 0x7f
-    val r2 = r * r
-    val u1sh = f64FromBits(__mathSinU1SinHigh(i1))
-    val u1ch = f64FromBits(__mathSinU1CosHigh(i1))
-    val u2sh = f64FromBits(__mathSinU2SinHigh(i2))
-    val u2ch = f64FromBits(__mathSinU2CosHigh(i2))
-    val s1h = u1sh * u2ch
-    val s1l = (u1sh * f64FromBits(__mathSinU2CosLow(i2)) +
-        f64FromBits(__mathSinU1SinLow(i1)) * u2ch) + __mathMulLow(u1sh, u2ch, s1h)
-    val s2h = u2sh * u1ch
-    val s2l = (u2sh * f64FromBits(__mathSinU1CosLow(i1)) +
-        f64FromBits(__mathSinU2SinLow(i2)) * u1ch) + __mathMulLow(u2sh, u1ch, s2h)
-    val sh0 = s1h + s2h
-    val sl0 = (s1l + s2l) + (s2h - (sh0 - s1h))
-    val ch0 = u1ch * u2ch - u1sh * u2sh
-    // r in turns: sin(2 pi r) - 2 pi r and cos(2 pi r) - 1
-    val sr = r * (f64FromBits(4618760256179416344) - f64FromBits(4631015144467146449) * r2)
-    val cr = r2 * (f64FromBits(-4597122725834766882) + f64FromBits(4634270120108634243) * r2)
-    val sign = if (sbit == 1) -1.0 else 1.0
-    val fh = sign * sh0
-    val fl = sign * ((sl0 + sh0 * cr) + ch0 * sr)
-    val eps = f64FromBits(4323473234461720576)
-    val lb = fh + (fl - eps)
-    if (lb == fh + (fl + eps)) return lb
-    __mathSinCosAccurate(x, quarter)
 }
 
 // sin(x) for 2^-26 <= |x| < 2^-16 to 2^-112.7 relative, rounded.
