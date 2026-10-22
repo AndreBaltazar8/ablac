@@ -99,7 +99,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | `abla/crypto`, `abla/date` | [stdlib/security-and-dates.md](stdlib/security-and-dates.md) | good | crypto, date |
 | `abla/test`, `ablac test` | [stdlib/testing.md](stdlib/testing.md) | good | test-ablac-test |
 | `abla/json`, `abla/http/json` | [json.md](json.md) | good | json-subparser, json-expressions, runtime-json, test-json-limits |
-| `abla/net`, `abla/net/hosted`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/jwt` | [networking.md](networking.md) | good (HTTP routing, hosted sockets, RPC, SSE run; servers build-only) | linux-net, hosted-network, http-*, websocket-*, tls, jwt |
+| `abla/net`, `abla/net/hosted`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/dns/async`, `abla/jwt` | [networking.md](networking.md) | good (HTTP routing, hosted sockets, RPC, SSE run; servers build-only) | linux-net, hosted-network, http-*, websocket-*, tls, jwt, dns-async |
 | `abla/memory` | [standard-library.md](standard-library.md) | reference | runtime-memory-* |
 | `abla/html` | [subparsers.md](subparsers.md) | mentioned | html-subparser |
 | `abla/compression/gzip`, `abla/process/supervisor`, `abla/net/contracts` | [standard-library.md](standard-library.md) | mentioned | http-advanced, host-process-configured |

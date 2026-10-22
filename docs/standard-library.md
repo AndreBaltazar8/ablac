@@ -15,7 +15,7 @@ carry them.
 | [Hashing, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/date` |
 | [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
 | [JSON](json.md) | `abla/json`, `abla/http/json`, `$json` |
-| [Networking](networking.md) | `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/jwt` |
+| [Networking](networking.md) | `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/dns/async`, `abla/jwt` |
 | [Compiler API](compiler-api.md), [subparsers](subparsers.md), [programmable builds](programmable-builds.md) | `abla/compiler`, `abla/compiler/parser`, `abla/build`, `abla/wasm/build`, `abla/android/build` |
 
 Built into the language rather than imported: `string`, arrays, `Map`,
@@ -55,6 +55,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/net/contracts` | transport-neutral network outcome types |
 | `abla/net/hosted` | DNS-capable dual-stack TCP/UDP plus epoll on Linux and kqueue on macOS |
 | `abla/dns` | bounded DNS A/AAAA codec, compression-pointer parser, UDP resolver, and hostname connect helper |
+| `abla/dns/async` | `DnsAsyncResolver`: many nonblocking A/AAAA queries driven by `step` or an outside poller |
 | `abla/http` | HTTP/1 client/server, chunk-aware client parsing, pluggable transport, and version-aware routing |
 | `abla/http/stream` | keep-alive/chunked policy, gzip negotiation, and Server-Sent Events framing |
 | `abla/http/event` | bounded epoll HTTP/1.1 manager with pipelining, partial writes, and backpressure |

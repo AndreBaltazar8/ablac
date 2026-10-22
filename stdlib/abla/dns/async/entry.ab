@@ -1,0 +1,376 @@
+// Nonblocking DNS resolution (abla/dns/async; abla/dns has the codec and the
+// blocking resolver, and programs that import only it stay as they were).
+//
+// A DnsAsyncResolver keeps many queries in flight, each on its own
+// nonblocking UDP socket, and progresses them only when asked, so an event
+// loop resolves names without stalling a tick:
+//
+//     val dns = dnsAsyncResolver()
+//     val id = dns.start("api.example.com", 1)      // 1 = A, 28 = AAAA
+//     ...each loop iteration:
+//     dns.step(0)                                   // or: watch dns.descriptors()
+//     val result = dns.take(id)                     //   in your own poller and
+//     if (result != null) ...                       //   call receive() + sweep()
+//
+// A finished query keeps its socket until its result is taken, so a loop that
+// watches descriptors() in its own poller stops watching one (done(id) says
+// when) before take() closes it.
+//
+// Name servers, query identifiers, the deadline and the resend interval
+// follow the blocking dnsResolveType: the first IPv4 `nameserver` of
+// /etc/resolv.conf (or options.nameserver), a random 16-bit identifier, and
+// replies with another identifier, a server error or a malformed body are
+// ignored until a valid one or the deadline arrives. A literal address
+// completes at once, without a socket.
+
+import "abla/dns"
+import "abla/net"
+import "abla/random"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+
+class DnsAsyncOptions(
+    val timeoutMilliseconds: int = 3000,
+    // The query is sent again this long after the last send.
+    val resendMilliseconds: int = 1000,
+    // Empty reads /etc/resolv.conf once, at the first query.
+    val nameserver: string = "",
+    val nameserverPort: int = 53
+)
+
+// error is "" on success, otherwise "dns timeout", "dns socket failed",
+// "dns send failed" or "dns invalid host".
+class DnsAsyncResult(
+    val id: int,
+    val host: string,
+    val recordType: int,
+    val resolution: DnsResolution,
+    val error: string
+) {
+    fun succeeded(): bool = this.error == ""
+}
+
+resource class DnsAsyncResolver(
+    val options: DnsAsyncOptions,
+    var nameserver: string,
+    // One slot per query until its result is taken; a slot whose id is 0 is
+    // free.
+    val queryIds: array<int>,
+    val queryHosts: array<string>,
+    val queryTypes: array<int>,
+    val queryDescriptors: array<int>,
+    val queryIdentifiers: array<int>,
+    val queryDeadlines: array<int>,
+    val querySentAt: array<int>,
+    val queryFinished: array<bool>,
+    var results: array<DnsAsyncResult>,
+    var nextId: int,
+    var inFlight: int
+) {
+    fun drop(): void {
+        this.close()
+        return
+    }
+}
+
+fun dnsAsyncResolver(options: DnsAsyncOptions = DnsAsyncOptions()): DnsAsyncResolver =
+    DnsAsyncResolver(
+        options, options.nameserver, [], [], [], [], [], [], [], [], [], 1, 0
+    )
+
+// Closes every query's socket and drops the results not yet taken.
+fun DnsAsyncResolver.close(): void {
+    var slot = 0
+    while (slot < this.queryIds.size) {
+        this.release(slot)
+        slot = slot + 1
+    }
+    this.results = []
+    return
+}
+
+fun DnsAsyncResolver.release(slot: int): void {
+    if (this.queryIds[slot] != 0) {
+        val descriptor = this.queryDescriptors[slot]
+        if (descriptor >= 0) linuxTcpCloseDescriptor(descriptor)
+        this.queryDescriptors[slot] = -1
+        this.queryIds[slot] = 0
+        this.queryHosts[slot] = ""
+        if (!this.queryFinished[slot]) this.inFlight = this.inFlight - 1
+    }
+    return
+}
+
+fun DnsAsyncResolver.finish(
+    slot: int,
+    resolution: DnsResolution,
+    error: string
+): void {
+    this.results.append(DnsAsyncResult(
+        this.queryIds[slot], this.queryHosts[slot], this.queryTypes[slot],
+        resolution, error
+    ))
+    this.queryFinished[slot] = true
+    this.inFlight = this.inFlight - 1
+    return
+}
+
+fun DnsAsyncResolver.send(slot: int): bool {
+    if (this.nameserver == "") this.nameserver = dnsConfiguredServer()
+    var socket = UdpSocket(this.queryDescriptors[slot])
+    val sent = socket.sendTo(
+        dnsQuery(
+            this.queryHosts[slot], this.queryTypes[slot],
+            this.queryIdentifiers[slot]
+        ),
+        ipv4SocketAddress(this.nameserver, this.options.nameserverPort)
+    )
+    socket.descriptor = -1
+    sent.succeeded()
+}
+
+/**
+ * Starts resolving `host` for `recordType` (1 = A, 28 = AAAA) and returns the
+ * query's id. The result is ready at once for a literal address (the address
+ * itself when its family matches the type, no addresses otherwise) and for a
+ * name that cannot be queried or sent.
+ */
+fun DnsAsyncResolver.start(host: string, recordType: int = 1): int {
+    val id = this.nextId
+    this.nextId = this.nextId + 1
+    var slot = 0
+    while (slot < this.queryIds.size && this.queryIds[slot] != 0) slot = slot + 1
+    if (slot == this.queryIds.size) {
+        this.queryIds.append(0)
+        this.queryHosts.append("")
+        this.queryTypes.append(0)
+        this.queryDescriptors.append(-1)
+        this.queryIdentifiers.append(0)
+        this.queryDeadlines.append(0)
+        this.querySentAt.append(0)
+        this.queryFinished.append(false)
+    }
+    val now = linuxMonotonicMilliseconds()
+    this.queryIds[slot] = id
+    this.queryHosts[slot] = host
+    this.queryTypes[slot] = recordType
+    this.queryDescriptors[slot] = -1
+    this.queryIdentifiers[slot] = 0
+    this.queryDeadlines[slot] = now + this.options.timeoutMilliseconds
+    this.querySentAt[slot] = now
+    this.queryFinished[slot] = false
+    this.inFlight = this.inFlight + 1
+    val ipv4 = ipv4SocketAddress(host, 1).isValid()
+    val ipv6 = !ipv4 && ipv6SocketAddress(host, 1).isValid()
+    if (ipv4 || ipv6) {
+        val addresses: array<DnsAddress> = []
+        if (ipv4 && recordType == 1) addresses.append(DnsAddress(4, host, 0))
+        if (ipv6 && recordType == 28) addresses.append(DnsAddress(6, host, 0))
+        this.finish(slot, DnsResolution(addresses, true, false, 0), "")
+        return id
+    }
+    if (dnsQuery(host, recordType, 0) == "") {
+        this.finish(slot, DnsResolution([], false, false, 22), "dns invalid host")
+        return id
+    }
+    var socket = udpBindPort(0)
+    socket.setNonblocking()
+    val descriptor = socket.descriptor
+    socket.descriptor = -1
+    if (descriptor < 0) {
+        this.finish(
+            slot, DnsResolution([], false, false, -descriptor), "dns socket failed"
+        )
+        return id
+    }
+    val entropy = secureRandomBytes(2)
+    this.queryIdentifiers[slot] = if (entropy.succeeded)
+        entropy.bytes[0] * 256 + entropy.bytes[1] else 4242
+    this.queryDescriptors[slot] = descriptor
+    if (!this.send(slot)) {
+        this.finish(slot, DnsResolution([], false, false, 5), "dns send failed")
+    }
+    id
+}
+
+fun DnsAsyncResolver.slotOf(id: int): int {
+    var found = -1
+    var slot = 0
+    while (id != 0 && found < 0 && slot < this.queryIds.size) {
+        if (this.queryIds[slot] == id) found = slot
+        slot = slot + 1
+    }
+    found
+}
+
+/**
+ * The socket of query `id` until its result is taken (-1 for a query that
+ * needed none, or once taken).
+ */
+fun DnsAsyncResolver.descriptorOf(id: int): int {
+    val slot = this.slotOf(id)
+    if (slot >= 0) this.queryDescriptors[slot] else -1
+}
+
+/** Whether query `id` has a result waiting for take(). */
+fun DnsAsyncResolver.done(id: int): bool {
+    val slot = this.slotOf(id)
+    slot >= 0 && this.queryFinished[slot]
+}
+
+fun DnsAsyncResolver.waiting(slot: int): bool =
+    this.queryIds[slot] != 0 && !this.queryFinished[slot] &&
+        this.queryDescriptors[slot] >= 0
+
+/** Every in-flight query's socket, to watch for reading in another poller. */
+fun DnsAsyncResolver.descriptors(): array<int> {
+    val descriptors: array<int> = []
+    var slot = 0
+    while (slot < this.queryIds.size) {
+        if (this.waiting(slot)) descriptors.append(this.queryDescriptors[slot])
+        slot = slot + 1
+    }
+    descriptors
+}
+
+/** The number of queries still in flight. */
+fun DnsAsyncResolver.pending(): int = this.inFlight
+
+/**
+ * Reads one datagram from `descriptor` (a socket from descriptors() that
+ * polled readable). True when it completed its query.
+ */
+fun DnsAsyncResolver.receive(descriptor: int): bool {
+    var slot = -1
+    var index = 0
+    while (slot < 0 && index < this.queryIds.size) {
+        if (this.waiting(index) && this.queryDescriptors[index] == descriptor) {
+            slot = index
+        }
+        index = index + 1
+    }
+    if (slot < 0) return false
+    var socket = UdpSocket(descriptor)
+    val datagram = socket.receiveFrom(4096)
+    socket.descriptor = -1
+    if (!datagram.received) return false
+    val resolution = dnsParseResponse(datagram.bytes, this.queryIdentifiers[slot])
+    if (!resolution.succeeded) return false
+    this.finish(slot, resolution, "")
+    true
+}
+
+/**
+ * Ends the queries past their deadline with "dns timeout" and sends again
+ * those whose last send is resendMilliseconds old.
+ */
+fun DnsAsyncResolver.sweep(now: int = linuxMonotonicMilliseconds()): void {
+    var slot = 0
+    while (slot < this.queryIds.size) {
+        if (this.waiting(slot)) {
+            if (now >= this.queryDeadlines[slot]) {
+                this.finish(slot, DnsResolution([], false, true, 0), "dns timeout")
+            } else if (now - this.querySentAt[slot] >= this.options.resendMilliseconds) {
+                this.querySentAt[slot] = now
+                this.send(slot)
+            }
+        }
+        slot = slot + 1
+    }
+    return
+}
+
+/**
+ * Progresses every query for up to `timeoutMilliseconds` (0 never blocks):
+ * waits for a reply on any in-flight socket, reads the ready ones, then
+ * sweeps. Returns the number of datagrams read. Returns at once when nothing
+ * is in flight.
+ */
+fun DnsAsyncResolver.step(timeoutMilliseconds: int = 0): int {
+    val descriptors = this.descriptors()
+    var handled = 0
+    if (descriptors.size > 0) {
+        // Wake for the next deadline or resend even without a reply.
+        var timeout = if (timeoutMilliseconds < 0) 0 else timeoutMilliseconds
+        val now = linuxMonotonicMilliseconds()
+        var slot = 0
+        while (slot < this.queryIds.size) {
+            if (this.waiting(slot)) {
+                var due = this.querySentAt[slot] + this.options.resendMilliseconds
+                if (this.queryDeadlines[slot] < due) due = this.queryDeadlines[slot]
+                if (due - now < timeout) timeout = if (due > now) due - now else 0
+            }
+            slot = slot + 1
+        }
+        // struct pollfd: descriptor (32 bits), events, revents (16 bits each).
+        val records = nativeByteBuffer(descriptors.size * 8)
+        var index = 0
+        while (index < descriptors.size) {
+            linuxNetStoreU32(records, index * 8, descriptors[index])
+            linuxNetStoreU32(records, index * 8 + 4, 1)
+            index = index + 1
+        }
+        var polled = linuxSyscall3(
+            7, nativePointerAddress(records.address), descriptors.size, timeout
+        )
+        while (polled == -4) polled = linuxSyscall3(
+            7, nativePointerAddress(records.address), descriptors.size, timeout
+        )
+        index = 0
+        while (polled > 0 && index < descriptors.size) {
+            if (linuxNetReadNativeU16(records, index * 8 + 6) != 0) {
+                this.receive(descriptors[index])
+                handled = handled + 1
+            }
+            index = index + 1
+        }
+        records.close()
+    }
+    this.sweep(linuxMonotonicMilliseconds())
+    handled
+}
+
+/**
+ * Removes and returns query `id`'s result, closing its socket, or null while
+ * it is in flight.
+ */
+fun DnsAsyncResolver.take(id: int): DnsAsyncResult? {
+    var found: DnsAsyncResult? = null
+    val kept: array<DnsAsyncResult> = []
+    var index = 0
+    while (index < this.results.size) {
+        val result = this.results[index]
+        if (found == null && result.id == id) found = result
+        else kept.append(result)
+        index = index + 1
+    }
+    if (found != null) {
+        this.results = kept
+        val slot = this.slotOf(id)
+        if (slot >= 0) this.release(slot)
+    }
+    found
+}
+
+/** Removes and returns every finished result, in completion order. */
+fun DnsAsyncResolver.takeResults(): array<DnsAsyncResult> {
+    val taken: array<DnsAsyncResult> = []
+    var index = 0
+    while (index < this.results.size) {
+        taken.append(this.results[index])
+        val slot = this.slotOf(this.results[index].id)
+        if (slot >= 0) this.release(slot)
+        index = index + 1
+    }
+    this.results = []
+    taken
+}
+
+/** Abandons query `id`: closes its socket and drops its result. */
+fun DnsAsyncResolver.cancel(id: int): void {
+    if (this.take(id) == null) {
+        val slot = this.slotOf(id)
+        if (slot >= 0) this.release(slot)
+    }
+    return
+}

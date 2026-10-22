@@ -289,7 +289,7 @@ kept the event loop about 8% busy.
 
 `abla/http/async` issues HTTP/1.1 and HTTPS requests from an event loop.
 `request(method, url, headers, body, timeoutMilliseconds)` returns an id;
-DNS (cached A records over nonblocking UDP), TCP connect, the OpenSSL
+DNS (cached A records through `DnsAsyncResolver`, below), TCP connect, the OpenSSL
 handshake with peer/SNI/hostname verification, writes, and reads advance only
 inside `step`, and finished requests come back from `takeCompletions` as
 `HttpAsyncCompletion(id, status, headers, body, error, elapsedMilliseconds)`.
@@ -297,7 +297,9 @@ Connections are kept alive and pooled per scheme, host, and port up to
 `maximumConnectionsPerHost`; a request whose pooled connection was closed by
 the peer is retried once on a fresh connection. Register `pollDescriptor()`
 with `WebSocketServer.watchExternal` so a blocking server `step` wakes when a
-reply arrives:
+reply arrives. `HttpAsyncOptions` sets `dnsTimeoutMilliseconds`,
+`dnsCacheSeconds`, and the name server (`nameserver`, `nameserverPort`; empty
+reads `/etc/resolv.conf`):
 
 ```abla fragment
 val http = httpAsyncClient()
@@ -345,6 +347,70 @@ tries numeric literals first and then bounded AAAA/A results.
 | `dnsResolve(host, timeoutMilliseconds = 2000, server = "")` | a `DnsResolution(addresses, succeeded, timedOut, errorCode)`; each `DnsAddress` has `family`, `address` and `ttlSeconds` |
 | `tcpConnectHost(host, port, timeoutMilliseconds = 5000)` | a `TcpConnection` to the first address that answers |
 | `dnsQuery(host, recordType, identifier)`, `dnsParseResponse(...)` | the wire codec, for custom resolvers |
+
+Neither resolver reads `/etc/hosts` or applies `resolv.conf`'s `search` and
+`ndots`: a name is queried exactly as written, so a short cluster name needs
+its fully qualified form (`redis.default.svc.cluster.local`).
+
+### Nonblocking resolution: `abla/dns/async`
+
+`DnsAsyncResolver` keeps many queries in flight, each on its own nonblocking
+UDP socket, and moves them only when asked, so an event loop resolves names
+without stalling a tick. `start(host, recordType)` returns an id (`1` for A,
+`28` for AAAA); `step(timeoutMilliseconds)` waits up to that long for replies
+(never past the next resend or deadline) and returns at once when nothing is
+in flight; `take(id)` returns the `DnsAsyncResult` once there is one. A
+literal address, and a name that cannot be queried, finish inside `start`:
+
+```abla
+import "abla/io"
+import "abla/dns/async"
+
+fun main {
+    // Nothing answers on port 9: the query times out.
+    val dns = dnsAsyncResolver(DnsAsyncOptions(
+        timeoutMilliseconds = 200, nameserver = "127.0.0.1", nameserverPort = 9
+    ))
+    val literal = dns.start("192.0.2.7", 1)
+    val name = dns.start("unanswered.example", 28)
+    println("pending ${dns.pending()}")
+    while (dns.pending() > 0) dns.step(50)
+    for (result in dns.takeResults()) {
+        if (result.succeeded()) {
+            println("${result.host}: ${result.resolution.addresses[0].address}")
+        } else println("${result.host}: ${result.error}")
+    }
+}
+// output:
+// pending 1
+// 192.0.2.7: 192.0.2.7
+// unanswered.example: dns timeout
+```
+
+It follows `dnsResolveType`: the first IPv4 `nameserver` of
+`/etc/resolv.conf` unless `nameserver` is given, a random query identifier,
+and replies with another identifier, a server error (NXDOMAIN included) or a
+malformed body are ignored until a valid reply or the deadline. The query is
+sent again every `resendMilliseconds`.
+
+| Call | Result |
+|---|---|
+| `dnsAsyncResolver(DnsAsyncOptions(timeoutMilliseconds = 3000, resendMilliseconds = 1000, nameserver = "", nameserverPort = 53))` | a `DnsAsyncResolver` |
+| `dns.start(host, recordType = 1)` | the query's id. A literal address answers itself when its family matches (no addresses otherwise) |
+| `dns.step(timeoutMilliseconds = 0)` | polls the in-flight sockets, reads replies, resends, and expires; the number of datagrams read |
+| `dns.take(id)` | `DnsAsyncResult?`: `null` while in flight; otherwise `id`, `host`, `recordType`, `resolution` (a `DnsResolution`) and `error`, and `succeeded()` |
+| `dns.takeResults()` | every finished result, in completion order |
+| `dns.done(id)`, `dns.pending()` | whether a result is waiting; how many queries are in flight |
+| `dns.cancel(id)`, `dns.close()` | abandon one query, or all of them (dropping the resolver closes too) |
+| `dns.descriptors()`, `dns.descriptorOf(id)` | the in-flight sockets, to watch for reading in another poller |
+| `dns.receive(descriptor)`, `dns.sweep(now)` | for that poller: read one reply from a readable socket (true when it finished its query); resend and expire |
+
+`error` is `""`, `"dns timeout"` (with `resolution.timedOut`), `"dns invalid
+host"`, `"dns socket failed"` or `"dns send failed"`. A finished query keeps
+its socket until `take` (or `takeResults`, `cancel`) closes it, so a loop
+that watches `descriptors()` in its own poller stops watching one when
+`done(id)` says so, before taking it. `HttpAsyncClient` drives its resolver
+that way, from its one poller.
 
 `abla/tls/hosted` dynamically loads OpenSSL 1.1 or 3 only when imported. Client
 connections enable peer verification, system trust, SNI, and hostname checks.

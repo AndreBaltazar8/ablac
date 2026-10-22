@@ -263,6 +263,7 @@ test: ablac
 	tools/test-generics.sh $(COMPILER)
 	tools/test-transform-reuse.sh $(COMPILER)
 	tools/test-process-metrics.sh $(COMPILER)
+	tools/test-dns-async.sh $(COMPILER)
 
 check: test self-rebuild
 

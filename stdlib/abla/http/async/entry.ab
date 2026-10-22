@@ -10,14 +10,16 @@
 //     http.step(0)
 //     val done = http.takeCompletions()   // HttpAsyncCompletion(id, status, ...)
 //
-// DNS (A records, cached), TCP connect, the TLS handshake (OpenSSL with peer,
-// SNI, and hostname verification), request writes, and response reads are all
-// nonblocking state machines over one poller. Connections are kept alive and
-// pooled per scheme/host/port; a request that finds a pooled connection
-// already closed by the peer is retried once on a fresh connection.
+// DNS (A records through abla/dns's DnsAsyncResolver, cached), TCP connect,
+// the TLS handshake (OpenSSL with peer, SNI, and hostname verification),
+// request writes, and response reads are all nonblocking state machines over
+// one poller. Connections are kept alive and pooled per scheme/host/port; a
+// request that finds a pooled connection already closed by the peer is retried
+// once on a fresh connection.
 
 import "openssl-nonblocking.ab"
 import "abla/dns"
+import "abla/dns/async"
 import "abla/http"
 import "abla/net"
 import "abla/random"
@@ -31,7 +33,8 @@ class HttpAsyncOptions(
     val dnsCacheSeconds: int = 60,
     // Empty uses the system trust store.
     val caPath: string = "",
-    val nameserver: string = ""
+    val nameserver: string = "",
+    val nameserverPort: int = 53
 )
 
 class HttpAsyncCompletion(
@@ -85,7 +88,7 @@ resource class HttpAsyncClient(
     val poller: SocketPoller,
     val options: HttpAsyncOptions,
     var sslContext: int,
-    var nameserver: string,
+    val resolver: DnsAsyncResolver,
     val reader: HttpAsyncRead,
     // requests
     val requestIds: array<int>,
@@ -115,10 +118,8 @@ resource class HttpAsyncClient(
     val connectionHeaderEnds: array<int>,
     val connectionUsed: array<int>,
     val connectionIdleSince: array<int>,
-    val connectionDnsDescriptors: array<int>,
-    val connectionDnsIdentifiers: array<int>,
-    val connectionDnsDeadlines: array<int>,
-    val connectionDnsResent: array<int>,
+    // The resolver's query id while resolving, otherwise 0.
+    val connectionDnsQueries: array<int>,
     val connectionWriteInterest: array<bool>,
     val freeConnections: array<int>,
     var freeConnectionCount: int,
@@ -144,9 +145,6 @@ resource class HttpAsyncClient(
                 if (this.connectionDescriptors[slot] >= 0) {
                     linuxTcpCloseDescriptor(this.connectionDescriptors[slot])
                 }
-                if (this.connectionDnsDescriptors[slot] >= 0) {
-                    linuxTcpCloseDescriptor(this.connectionDnsDescriptors[slot])
-                }
                 this.connectionStates[slot] = 0
             }
             slot = slot + 1
@@ -155,6 +153,7 @@ resource class HttpAsyncClient(
             SSL_CTX_free(nativePointerFromAddress(this.sslContext))
             this.sslContext = 0
         }
+        this.resolver.close()
         this.poller.close()
         return
     }
@@ -162,10 +161,14 @@ resource class HttpAsyncClient(
 
 fun httpAsyncClient(options: HttpAsyncOptions = HttpAsyncOptions()): HttpAsyncClient =
     HttpAsyncClient(
-        socketPoller(), options, 0, options.nameserver, HttpAsyncRead("", 0),
+        socketPoller(), options, 0,
+        dnsAsyncResolver(DnsAsyncOptions(
+            options.dnsTimeoutMilliseconds, 1000, options.nameserver,
+            options.nameserverPort
+        )),
+        HttpAsyncRead("", 0),
         [], [], [], [], [], [], [], [], [], [], [], 0,
-        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [],
-        [], [], [], 0,
+        [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], 0,
         [], [], [], [], [], 1, 0, 0
     )
 
@@ -420,12 +423,11 @@ fun HttpAsyncClient.closeConnection(slot: int): void {
             linuxTcpCloseDescriptor(descriptor)
             this.connectionDescriptors[slot] = -1
         }
-        val dns = this.connectionDnsDescriptors[slot]
-        if (dns >= 0) {
-            this.poller.unwatchDescriptor(dns)
-            this.unroute(dns)
-            linuxTcpCloseDescriptor(dns)
-            this.connectionDnsDescriptors[slot] = -1
+        val query = this.connectionDnsQueries[slot]
+        if (query != 0) {
+            this.unwatchQuery(query)
+            this.resolver.cancel(query)
+            this.connectionDnsQueries[slot] = 0
         }
         this.connectionStates[slot] = httpAsyncConnectionFree
         this.connectionRequests[slot] = -1
@@ -484,10 +486,7 @@ fun HttpAsyncClient.allocateConnection(request: int): int {
         this.connectionHeaderEnds.append(-1)
         this.connectionUsed.append(0)
         this.connectionIdleSince.append(0)
-        this.connectionDnsDescriptors.append(-1)
-        this.connectionDnsIdentifiers.append(0)
-        this.connectionDnsDeadlines.append(0)
-        this.connectionDnsResent.append(0)
+        this.connectionDnsQueries.append(0)
         this.connectionWriteInterest.append(false)
     }
     this.connectionDescriptors[slot] = -1
@@ -502,7 +501,7 @@ fun HttpAsyncClient.allocateConnection(request: int): int {
     this.connectionInputs[slot] = ""
     this.connectionHeaderEnds[slot] = -1
     this.connectionUsed[slot] = 0
-    this.connectionDnsDescriptors[slot] = -1
+    this.connectionDnsQueries[slot] = 0
     this.connectionWriteInterest[slot] = false
     slot
 }
@@ -548,47 +547,50 @@ fun HttpAsyncClient.remember(host: string, address: string, ttlSeconds: int): vo
     return
 }
 
-fun HttpAsyncClient.sendDnsQuery(slot: int): bool {
-    if (this.nameserver == "") this.nameserver = dnsConfiguredServer()
-    var socket = UdpSocket(this.connectionDnsDescriptors[slot])
-    val sent = socket.sendTo(
-        dnsQuery(this.connectionHosts[slot], 1, this.connectionDnsIdentifiers[slot]),
-        ipv4SocketAddress(this.nameserver, 53)
-    )
-    socket.descriptor = -1
-    sent.succeeded()
+// Stops watching a query's socket (before the resolver closes it).
+fun HttpAsyncClient.unwatchQuery(query: int): void {
+    val descriptor = this.resolver.descriptorOf(query)
+    if (descriptor >= 0) {
+        this.poller.unwatchDescriptor(descriptor)
+        this.unroute(descriptor)
+    }
+    return
 }
 
 fun HttpAsyncClient.startResolve(slot: int): void {
-    var socket = udpBindPort(0)
-    socket.setNonblocking()
-    val descriptor = socket.descriptor
-    socket.descriptor = -1
-    if (descriptor < 0) {
-        this.fail(slot, "dns socket failed")
-        return
-    }
-    val entropy = secureRandomBytes(2)
-    this.connectionDnsIdentifiers[slot] = if (entropy.succeeded)
-        entropy.bytes[0] * 256 + entropy.bytes[1] else 4242
-    this.connectionDnsDescriptors[slot] = descriptor
-    this.connectionDnsDeadlines[slot] = linuxMonotonicMilliseconds() +
-        this.options.dnsTimeoutMilliseconds
-    this.connectionDnsResent[slot] = linuxMonotonicMilliseconds()
+    val query = this.resolver.start(this.connectionHosts[slot], 1)
+    this.connectionDnsQueries[slot] = query
     this.connectionStates[slot] = httpAsyncConnectionResolving
-    this.route(descriptor, slot * 2 + 1)
-    this.poller.watchDescriptor(descriptor)
-    if (!this.sendDnsQuery(slot)) this.fail(slot, "dns send failed")
+    val descriptor = this.resolver.descriptorOf(query)
+    if (descriptor >= 0) {
+        this.route(descriptor, slot * 2 + 1)
+        this.poller.watchDescriptor(descriptor)
+    }
+    // A socket or send failure is ready at once.
+    if (this.resolver.done(query)) this.resolved(slot)
     return
 }
 
 fun HttpAsyncClient.dnsReady(slot: int): void {
-    var socket = UdpSocket(this.connectionDnsDescriptors[slot])
-    val datagram = socket.receiveFrom(4096)
-    socket.descriptor = -1
-    if (!datagram.received) return
-    val resolution = dnsParseResponse(datagram.bytes, this.connectionDnsIdentifiers[slot])
-    if (!resolution.succeeded) return
+    val query = this.connectionDnsQueries[slot]
+    if (this.resolver.receive(this.resolver.descriptorOf(query))) {
+        this.resolved(slot)
+    }
+    return
+}
+
+// The slot's query has finished: connect to its first IPv4 address, or fail.
+fun HttpAsyncClient.resolved(slot: int): void {
+    val query = this.connectionDnsQueries[slot]
+    this.unwatchQuery(query)
+    val result = this.resolver.take(query)
+    this.connectionDnsQueries[slot] = 0
+    if (result == null) return
+    if (!result.succeeded()) {
+        this.fail(slot, result.error)
+        return
+    }
+    val resolution = result.resolution
     var address = ""
     var ttl = 0
     var index = 0
@@ -599,11 +601,6 @@ fun HttpAsyncClient.dnsReady(slot: int): void {
         }
         index = index + 1
     }
-    val dns = this.connectionDnsDescriptors[slot]
-    this.poller.unwatchDescriptor(dns)
-    this.unroute(dns)
-    linuxTcpCloseDescriptor(dns)
-    this.connectionDnsDescriptors[slot] = -1
     if (address == "") this.fail(slot, "dns: no IPv4 address for ${this.connectionHosts[slot]}")
     else {
         this.remember(this.connectionHosts[slot], address, ttl)
@@ -908,14 +905,14 @@ fun HttpAsyncClient.sweep(now: int): void {
         }
         request = request + 1
     }
+    // Resends and timeouts; a query that timed out is done.
+    this.resolver.sweep(now)
     var slot = 0
     while (slot < this.connectionStates.size) {
         val state = this.connectionStates[slot]
         if (state == httpAsyncConnectionResolving) {
-            if (now >= this.connectionDnsDeadlines[slot]) this.fail(slot, "dns timeout")
-            else if (now - this.connectionDnsResent[slot] >= 1000) {
-                this.connectionDnsResent[slot] = now
-                this.sendDnsQuery(slot)
+            if (this.resolver.done(this.connectionDnsQueries[slot])) {
+                this.resolved(slot)
             }
         } else if (state == httpAsyncConnectionIdle &&
             now - this.connectionIdleSince[slot] >= this.options.idleTimeoutMilliseconds) {
