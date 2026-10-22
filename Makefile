@@ -277,6 +277,7 @@ test-serial: ablac
 	tools/test-sidecar.sh $(COMPILER)
 	tools/test-tool-object-cache.sh $(COMPILER)
 	tools/test-native-cstring.sh $(COMPILER)
+	tools/test-frontend-scaling.sh $(COMPILER)
 
 check: test self-rebuild
 

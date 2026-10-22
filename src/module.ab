@@ -581,7 +581,10 @@ class BootstrapModuleState(
     var reusedParsed: int,
     var refreshedParsed: int,
     var build: int,
-    val acquiredIn: Map<string, int>
+    val acquiredIn: Map<string, int>,
+    // Each snapshot's place in `snapshots`, by module path: a graph acquires a
+    // module once per import edge that reaches it.
+    val snapshotIndex: Map<string, int> = Map()
 ) {
     fun beginBuild(): void {
         this.beginCounting()
@@ -601,13 +604,8 @@ class BootstrapModuleState(
     }
 
     fun indexOf(modulePath: string): int {
-        var result = -1
-        var index = 0
-        while (index < this.snapshots.size && result < 0) {
-            if (this.snapshots[index].path == modulePath) result = index
-            index = index + 1
-        }
-        result
+        val found = this.snapshotIndex.get(modulePath)
+        if (found != null) found else -1
     }
 
     fun acquire(modulePath: string): BootstrapModuleSnapshot {
@@ -663,6 +661,7 @@ class BootstrapModuleState(
                 this.snapshots[existing] = result
                 0
             } else {
+                this.snapshotIndex.set(modulePath, this.snapshots.size)
                 this.snapshots.append(result)
                 0
             }
@@ -1111,34 +1110,64 @@ class BootstrapModuleAlias(
     val written: string = ""
 )
 
-fun bootstrapModuleAliasTargetPrefix(
-    aliases: array<BootstrapModuleAlias>,
-    target: string
-): string {
-    var prefix = ""
-    var index = 0
-    while (index < aliases.size && prefix == "") {
-        if (aliases[index].target == target && aliases[index].alias != "") {
-            prefix = bootstrapModuleCanonicalPrefix(target)
-        }
-        index = index + 1
+// What a graph's import edges say about each module, looked up instead of
+// scanning every edge per module: the modules imported under an alias
+// somewhere (their names carry the module prefix) or only for their contract,
+// each importer's edges in order (`firstEdge`, then `nextEdge`), and the place
+// of each module in the snapshots.
+class BootstrapAliasSummary(
+    val aliasedTargets: Map<string, int>,
+    val contractTargets: Map<string, int>,
+    val importers: Map<string, int>,
+    val firstEdge: array<int>,
+    val lastEdge: array<int>,
+    val nextEdge: array<int>,
+    val snapshotIndex: Map<string, int>
+) {
+    fun targetPrefix(target: string): string =
+        if (this.aliasedTargets.get(target) != null)
+            bootstrapModuleCanonicalPrefix(target) else ""
+
+    fun isContractTarget(target: string): bool =
+        this.contractTargets.get(target) != null
+
+    /** The first of `importer`'s edges, or -1; nextEdge gives the next. */
+    fun firstEdgeOf(importer: string): int {
+        val slot = this.importers.get(importer)
+        if (slot != null) this.firstEdge[slot] else -1
     }
-    prefix
 }
 
-fun bootstrapModuleIsContractTarget(
+fun bootstrapAliasSummary(
     aliases: array<BootstrapModuleAlias>,
-    target: string
-): bool {
-    var contractOnly = false
+    snapshots: array<BootstrapModuleSnapshot>
+): BootstrapAliasSummary {
+    val summary = BootstrapAliasSummary(Map(), Map(), Map(), [], [], [], Map())
     var index = 0
     while (index < aliases.size) {
-        if (aliases[index].target == target && aliases[index].contractOnly) {
-            contractOnly = true
+        val alias = aliases[index]
+        if (alias.alias != "") summary.aliasedTargets.set(alias.target, 1)
+        if (alias.contractOnly) summary.contractTargets.set(alias.target, 1)
+        var slot = summary.firstEdge.size
+        val known = summary.importers.get(alias.importer)
+        if (known != null) {
+            slot = known
+            summary.nextEdge[summary.lastEdge[slot]] = index
+        } else {
+            summary.importers.set(alias.importer, slot)
+            summary.firstEdge.append(index)
+            summary.lastEdge.append(index)
         }
+        summary.lastEdge[slot] = index
+        summary.nextEdge.append(-1)
         index = index + 1
     }
-    contractOnly
+    index = 0
+    while (index < snapshots.size) {
+        summary.snapshotIndex.set(snapshots[index].path, index)
+        index = index + 1
+    }
+    summary
 }
 
 fun bootstrapContractDeclaration(
@@ -1481,7 +1510,8 @@ fun bootstrapAppendShadowNames(
 
 fun bootstrapModuleShadows(
     aliases: array<BootstrapModuleAlias>,
-    snapshots: array<BootstrapModuleSnapshot>
+    snapshots: array<BootstrapModuleSnapshot>,
+    summary: BootstrapAliasSummary
 ): array<BootstrapModuleShadow> {
     val shadowModules: array<int> = []
     val shadowNames: array<string> = []
@@ -1491,9 +1521,7 @@ fun bootstrapModuleShadows(
     var module = 0
     while (module < snapshots.size) {
         // An aliased module's names all carry its prefix already.
-        if (bootstrapModuleAliasTargetPrefix(
-            aliases, snapshots[module].path
-        ) == "") {
+        if (summary.targetPrefix(snapshots[module].path) == "") {
             bootstrapCollectShadowEntries(
                 snapshots[module], module, shadowModules, shadowNames,
                 entryModules, entryDeclarations, entryNames
@@ -1535,20 +1563,10 @@ fun bootstrapModuleShadows(
         val edgeTargets: array<int> = []
         var edge = 0
         while (edge < aliases.size) {
-            var importer = -1
-            var target = -1
-            var candidate = 0
-            while (candidate < snapshots.size) {
-                if (snapshots[candidate].path == aliases[edge].importer) {
-                    importer = candidate
-                }
-                if (snapshots[candidate].path == aliases[edge].target) {
-                    target = candidate
-                }
-                candidate = candidate + 1
-            }
-            edgeImporters.append(importer)
-            edgeTargets.append(target)
+            val importer = summary.snapshotIndex.get(aliases[edge].importer)
+            val target = summary.snapshotIndex.get(aliases[edge].target)
+            edgeImporters.append(if (importer != null) importer else -1)
+            edgeTargets.append(if (target != null) target else -1)
             edge = edge + 1
         }
         var group = 0
@@ -1616,13 +1634,12 @@ fun bootstrapRewriteModuleSource(
     snapshot: BootstrapModuleSnapshot,
     aliases: array<BootstrapModuleAlias>,
     snapshots: array<BootstrapModuleSnapshot>,
-    shadows: array<BootstrapModuleShadow>
+    shadows: array<BootstrapModuleShadow>,
+    summary: BootstrapAliasSummary
 ): string {
     val names: array<string> = []
     val replacements: array<string> = []
-    val ownPrefix = bootstrapModuleAliasTargetPrefix(
-        aliases, snapshot.path
-    )
+    val ownPrefix = summary.targetPrefix(snapshot.path)
     if (ownPrefix != "") {
         bootstrapAppendPrefixedNames(
             snapshot.discovery, ownPrefix, names, replacements
@@ -1654,22 +1671,20 @@ fun bootstrapRewriteModuleSource(
     // except inside a declaration that binds the name itself (a field,
     // parameter or local), where it is shadowed as it would be unaliased.
     val importedFrom = names.size
-    var edgeIndex = 0
-    while (edgeIndex < aliases.size) {
+    // (This module's own edges, in order.)
+    var edgeIndex = summary.firstEdgeOf(snapshot.path)
+    while (edgeIndex >= 0) {
         val edge = aliases[edgeIndex]
         val targetPrefix = if (edge.importer == snapshot.path &&
             edge.alias == "") {
-            bootstrapModuleAliasTargetPrefix(aliases, edge.target)
+            summary.targetPrefix(edge.target)
         } else ""
-        var target = 0
-        while (targetPrefix != "" && target < snapshots.size) {
-            if (snapshots[target].path == edge.target) {
-                bootstrapAppendPrefixedNames(
-                    snapshots[target].discovery, targetPrefix,
-                    names, replacements, false
-                )
-            }
-            target = target + 1
+        val target = summary.snapshotIndex.get(edge.target)
+        if (targetPrefix != "" && target != null) {
+            bootstrapAppendPrefixedNames(
+                snapshots[target].discovery, targetPrefix,
+                names, replacements, false
+            )
         }
         // A plainly imported module's shadowing declarations, unless this
         // module declares the name itself.
@@ -1684,21 +1699,21 @@ fun bootstrapRewriteModuleSource(
                 snapshot.discovery, true, names, replacements
             )
         }
-        edgeIndex = edgeIndex + 1
+        edgeIndex = summary.nextEdge[edgeIndex]
     }
     val declarationBounds = if (shadowedFrom < names.size) {
         bootstrapDeclarationBoundNames(snapshot.source, snapshot.discovery)
     } else []
     val localAliases: array<string> = []
     val aliasPrefixes: array<string> = []
-    var aliasIndex = 0
-    while (aliasIndex < aliases.size) {
+    var aliasIndex = summary.firstEdgeOf(snapshot.path)
+    while (aliasIndex >= 0) {
         val edge = aliases[aliasIndex]
         if (edge.importer == snapshot.path && edge.alias != "") {
             localAliases.append(edge.alias)
             aliasPrefixes.append(bootstrapModuleCanonicalPrefix(edge.target))
         }
-        aliasIndex = aliasIndex + 1
+        aliasIndex = summary.nextEdge[aliasIndex]
     }
     val rewrittenBegins: array<int> = []
     val rewrittenEnds: array<int> = []
@@ -1860,12 +1875,13 @@ fun bootstrapPrepareModuleSnapshot(
     snapshot: BootstrapModuleSnapshot,
     aliases: array<BootstrapModuleAlias>,
     snapshots: array<BootstrapModuleSnapshot>,
-    shadows: array<BootstrapModuleShadow>
+    shadows: array<BootstrapModuleShadow>,
+    summary: BootstrapAliasSummary
 ): BootstrapModuleSnapshot {
     val source = bootstrapRewriteModuleSource(
-        snapshot, aliases, snapshots, shadows
+        snapshot, aliases, snapshots, shadows, summary
     )
-    val contractOnly = bootstrapModuleIsContractTarget(aliases, snapshot.path)
+    val contractOnly = summary.isContractTarget(snapshot.path)
     // The common unaliased module needs no rewritten-source snapshot. Reuse
     // its already compact discovery record instead of parsing and retaining a
     // second interface AST for the duration of the build.
@@ -2003,6 +2019,7 @@ fun bootstrapValidateStrictImports(
         if (found) anyStrict = true
     }
     if (!anyStrict && !report) return BootstrapImportAliasValidation(0, "")
+    val strictSummary = bootstrapAliasSummary(aliases, snapshots)
     // Every module's names, as plain references could reach them: not an
     // extension member, private, nor of a module whose names carry its
     // prefix (imported under an alias somewhere).
@@ -2014,9 +2031,7 @@ fun bootstrapValidateStrictImports(
     val classMembers: array<array<string>> = []
     var module = 0
     while (module < snapshots.size) {
-        val prefixed = bootstrapModuleAliasTargetPrefix(
-            aliases, snapshots[module].path
-        ) != ""
+        val prefixed = strictSummary.targetPrefix(snapshots[module].path) != ""
         for (declaration in snapshots[module].discovery.declarations) {
             if (!prefixed && declaration.extensionOwner == "" &&
                 !declaration.isPrivate && declaration.name != "" &&
@@ -2333,6 +2348,24 @@ fun bootstrapValidateImportAliases(
     BootstrapImportAliasValidation(errors, diagnostics)
 }
 
+// What a module graph looks its edges and modules up by, instead of scanning
+// every edge or module recorded so far. By importing module (its slot, in
+// importers): its edges in the graph's `aliases`, first to last (aliasNext links
+// each to the module's next one), and the plain names its unqualified imports
+// so far expose ("<slot>\n<name>"); and the place of each loaded module.
+class BootstrapModuleGraphIndex(
+    val importers: Map<string, int>,
+    val firstAlias: array<int>,
+    val lastAlias: array<int>,
+    val aliasNext: array<int>,
+    val unqualifiedNames: Map<string, int>,
+    val modules: Map<string, int>,
+    var indexedModules: int
+)
+
+fun bootstrapModuleGraphIndex(): BootstrapModuleGraphIndex =
+    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0)
+
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
     var errors: int,
@@ -2340,27 +2373,36 @@ class BootstrapModuleGraph(
     val orderedSnapshots: array<BootstrapModuleSnapshot>,
     val authorizedCompileCapabilities: array<string>,
     var diagnostics: string,
-    val aliases: array<BootstrapModuleAlias>
+    val aliases: array<BootstrapModuleAlias>,
+    val index: BootstrapModuleGraphIndex
 ) {
+    fun importerSlot(importerPath: string): int {
+        val known = this.index.importers.get(importerPath)
+        if (known != null) return known
+        val slot = this.index.firstAlias.size
+        this.index.importers.set(importerPath, slot)
+        this.index.firstAlias.append(-1)
+        this.index.lastAlias.append(-1)
+        slot
+    }
+
     fun recordImportEdge(
         importer: BootstrapModuleSnapshot,
         edge: BootstrapImportEdge,
         target: string
     ): void {
+        val slot = this.importerSlot(importer.path)
         var duplicateAlias = false
         var duplicateTarget = false
-        var index = 0
-        while (index < this.aliases.size) {
-            val found = this.aliases[index]
-            if (found.importer == importer.path && edge.alias != "" &&
-                found.alias == edge.alias) duplicateAlias = true
-            if (found.importer == importer.path && found.target == target) {
-                duplicateTarget = true
-            }
-            index = index + 1
+        var ownEdge = this.index.firstAlias[slot]
+        while (ownEdge >= 0) {
+            val found = this.aliases[ownEdge]
+            if (edge.alias != "" && found.alias == edge.alias) duplicateAlias = true
+            if (found.target == target) duplicateTarget = true
+            ownEdge = this.index.aliasNext[ownEdge]
         }
         var declarationCollision = false
-        index = 0
+        var index = 0
         while (index < importer.discovery.declarations.size) {
             if (edge.alias != "" &&
                 importer.discovery.declarations[index].name == edge.alias) {
@@ -2370,17 +2412,30 @@ class BootstrapModuleGraph(
         }
         var unqualifiedAmbiguities = 0
         var ambiguityDiagnostics = ""
+        // Import discovery already parsed every module into the shared
+        // snapshot. Reuse it here instead of reparsing the target and all
+        // preceding imports for every edge.
+        var targetDeclarations: array<BootstrapDeclaration> = []
         if (edge.alias == "") {
-            // Import discovery already parsed every module into the shared
-            // snapshot. Reuse it here instead of reparsing the target and all
-            // preceding imports for every edge.
-            val targetDeclarations =
-                this.state.acquire(target).discovery.declarations
-            index = 0
-            while (index < this.aliases.size) {
-                val found = this.aliases[index]
-                if (found.importer == importer.path && found.alias == "" &&
-                    found.target != target) {
+            targetDeclarations = this.state.acquire(target).discovery.declarations
+        }
+        // Only an import that shares a plain name with one of the module's
+        // earlier unqualified imports can be ambiguous: the others skip the
+        // comparison with each of those imports.
+        var sharesName = false
+        for (declaration in targetDeclarations) {
+            if (declaration.name != "" && declaration.extensionOwner == "" &&
+                !declaration.isPrivate &&
+                this.index.unqualifiedNames.get("$slot\n${declaration.name}") != null) {
+                sharesName = true
+            }
+        }
+        if (edge.alias == "" && sharesName) {
+            ownEdge = this.index.firstAlias[slot]
+            while (ownEdge >= 0) {
+                val found = this.aliases[ownEdge]
+                ownEdge = this.index.aliasNext[ownEdge]
+                if (found.alias == "" && found.target != target) {
                     val foundDeclarations = this.state.acquire(
                         found.target
                     ).discovery.declarations
@@ -2412,7 +2467,6 @@ class BootstrapModuleGraph(
                         }
                     }
                 }
-                index = index + 1
             }
         }
         if (duplicateAlias) {
@@ -2437,6 +2491,20 @@ class BootstrapModuleGraph(
         }
         if (!duplicateAlias && !declarationCollision && !duplicateTarget &&
             unqualifiedAmbiguities == 0) {
+            val added = this.aliases.size
+            this.index.aliasNext.append(-1)
+            if (this.index.lastAlias[slot] >= 0) {
+                this.index.aliasNext[this.index.lastAlias[slot]] = added
+            } else this.index.firstAlias[slot] = added
+            this.index.lastAlias[slot] = added
+            if (edge.alias == "") {
+                for (declaration in targetDeclarations) {
+                    if (declaration.name != "" && declaration.extensionOwner == "" &&
+                        !declaration.isPrivate) {
+                        this.index.unqualifiedNames.set("$slot\n${declaration.name}", 1)
+                    }
+                }
+            }
             this.aliases.append(BootstrapModuleAlias(
                 importer.path,
                 target,
@@ -2452,13 +2520,15 @@ class BootstrapModuleGraph(
     }
     fun contains(modulePath: string): bool {
         val identity = bootstrapNormalizeModulePath(modulePath)
-        var found = false
-        var index = 0
-        while (index < this.modules.size) {
-            if (this.modules[index].path == identity) found = true
-            index = index + 1
+        // (Indexes the modules appended since the last lookup.)
+        while (this.index.indexedModules < this.modules.size) {
+            this.index.modules.set(
+                this.modules[this.index.indexedModules].path,
+                this.index.indexedModules
+            )
+            this.index.indexedModules = this.index.indexedModules + 1
         }
-        found
+        this.index.modules.get(identity) != null
     }
 
     fun loadContract(modulePath: string): string {
@@ -2601,8 +2671,11 @@ class BootstrapModuleGraph(
         val declarationEdits: array<BootstrapDeclarationEdit> = []
         val importedRegistrations: array<BootstrapSubparserRegistration> = []
         val preparedSnapshots: array<BootstrapModuleSnapshot> = []
-        val shadows = bootstrapModuleShadows(
+        val aliasSummary = bootstrapAliasSummary(
             this.aliases, this.orderedSnapshots
+        )
+        val shadows = bootstrapModuleShadows(
+            this.aliases, this.orderedSnapshots, aliasSummary
         )
         var preparedIndex = 0
         while (preparedIndex < this.orderedSnapshots.size) {
@@ -2610,7 +2683,8 @@ class BootstrapModuleGraph(
                 this.orderedSnapshots[preparedIndex],
                 this.aliases,
                 this.orderedSnapshots,
-                shadows
+                shadows,
+                aliasSummary
             ))
             preparedIndex = preparedIndex + 1
         }
@@ -2768,9 +2842,8 @@ class BootstrapModuleGraph(
                 registrationIndex = registrationIndex + 1
             }
 
-            val parsed = if (bootstrapModuleIsContractTarget(
-                this.aliases, snapshot.path
-            )) snapshot.discovery
+            val parsed = if (aliasSummary.isContractTarget(snapshot.path))
+                snapshot.discovery
             else this.state.acquireParsed(
                 snapshot,
                 dependencyFingerprint,
@@ -2919,7 +2992,7 @@ fun bootstrapBundleWithState(
     state.beginCounting()
     val modules: array<BootstrapModule> = []
     val ordered: array<BootstrapModuleSnapshot> = []
-    BootstrapModuleGraph(modules, 0, state, ordered, [], "", []).load(
+    BootstrapModuleGraph(modules, 0, state, ordered, [], "", [], bootstrapModuleGraphIndex()).load(
         modulePath
     )
 }
@@ -2934,7 +3007,7 @@ fun bootstrapParseModuleWithState(
     var state: BootstrapModuleState
 ): BootstrapParseResult {
     state.beginCounting()
-    val graph = BootstrapModuleGraph([], 0, state, [], [], "", [])
+    val graph = BootstrapModuleGraph([], 0, state, [], [], "", [], bootstrapModuleGraphIndex())
     graph.load(modulePath)
     graph.parse()
 }
