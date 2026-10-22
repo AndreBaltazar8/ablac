@@ -42,7 +42,7 @@ fun main {
 |---|---|
 | `min(a, b)`, `max(a, b)`, `clamp(value, minimum, maximum)` | `int` |
 | `fmin`, `fmax`, `fclamp`, `fabs` | the `f64` versions; `fmin` and `fmax` are IEEE 754 minimum and maximum (NaN if either argument is NaN, and `-0.0` below `0.0`), and `fclamp(x, lo, hi)` is `fmin(fmax(x, lo), hi)`; single instructions on AArch64 and Wasm |
-| `fma(x, y, z)` | `x * y + z` rounded once: the hardware's fused multiply-add on AArch64 and x86-64, an exact software one on Wasm and at compile time, with the same bits everywhere |
+| `fma(x, y, z)` | `x * y + z` rounded once: the hardware's fused multiply-add on AArch64, an exact software one elsewhere (baseline x86-64, Wasm, compile time), with the same bits everywhere |
 | `sqrt`, `pow(x, y)`, `exp`, `log` | `log` is the natural logarithm; all four are correctly rounded (the double nearest the exact result); `pow` follows C's special cases, so `pow(x, 0.0)` and `pow(1.0, y)` are 1 even for a quiet NaN and `pow(-1.0, ±inf)` is 1 |
 | `sin`, `cos`, `tan`, `atan`, `atan2(y, x)` | radians; all five are correctly rounded, for every finite argument however large |
 | `floor`, `ceil`, `trunc`, `roundEven` | `roundEven` rounds halves to even; there is no other rounding mode |
