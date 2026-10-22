@@ -12,9 +12,10 @@ mkdir -p "$output_directory"
 "$compiler" build \
     "$project_root/tests/cases/modules/strings-runtime.ab" \
     -o "$output_directory/string-runtime"
+# (--sidecar: the packaged object is checked below.)
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/emitted-value-runtime.ab" \
-    -o "$output_directory/value-runtime"
+    -o "$output_directory/value-runtime" --sidecar
 
 for executable in nested-string string-runtime value-runtime; do
     set +e

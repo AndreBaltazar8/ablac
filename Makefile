@@ -274,6 +274,7 @@ test-serial: ablac
 	tools/test-commit-edits.sh $(COMPILER)
 	tools/test-conformance-ir-cache.sh $(COMPILER)
 	tools/test-builtin-names.sh $(COMPILER)
+	tools/test-sidecar.sh $(COMPILER)
 
 check: test self-rebuild
 

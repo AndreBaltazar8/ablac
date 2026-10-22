@@ -3,7 +3,8 @@
 # the host platform runtime (stdlib/abla/runtime/platform/host.ab) is compiled
 # into it from source, each platform symbol defined there once, and the build
 # packages one self-contained object (plus, on macOS, the Linux syscall layer
-# as `<output>.host.o`). No separately linked value or platform runtime.
+# as `<output>.host.o`). No separately linked value or platform runtime. (The
+# release builds below ask for that object, the sidecar: --sidecar.)
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -52,7 +53,7 @@ check_packaging() { # output
 
 pure_output="$output_directory/pure-collections"
 "$compiler" build "$project_root/tests/cases/modules/collections.ab" \
-    -o "$pure_output"
+    -o "$pure_output" --sidecar
 "$compiler" --emit-llvm "$project_root/tests/cases/modules/collections.ab" \
     > "$output_directory/pure-collections.ll"
 
@@ -102,7 +103,8 @@ grep -qx 'panic: index 1 out of bounds for array of size 1' \
 
 for fixture in linux-filesystem filesystem process-capture; do
     output="$output_directory/$fixture"
-    "$compiler" build "$project_root/tests/cases/modules/$fixture.ab" -o "$output"
+    "$compiler" build "$project_root/tests/cases/modules/$fixture.ab" -o "$output" \
+        --sidecar
     check_packaging "$output"
     memory=64
     [[ $fixture == linux-filesystem ]] && memory=128
@@ -111,7 +113,7 @@ done
 
 host_output="$output_directory/host-runtime"
 "$compiler" build "$project_root/tests/cases/modules/host-runtime.ab" \
-    -o "$host_output"
+    -o "$host_output" --sidecar
 check_packaging "$host_output"
 
 echo "native platform boundary: each program is one module with its platform runtime, defined once"

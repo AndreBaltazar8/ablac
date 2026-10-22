@@ -60,8 +60,9 @@ ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=60 \
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
+# (--sidecar: the packaged object is what the checks below read.)
 "$compiler" build "$project_root/tests/cases/modules/runtime-memory.ab" \
-    -o "$program"
+    -o "$program" --sidecar
 [[ -s $program.o ]] || exit 1
 [[ ! -e $program.value-runtime.o ]] || exit 1
 # Mach-O programs link the Darwin syscall adapter as their host object; no

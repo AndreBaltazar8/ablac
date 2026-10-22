@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The same program built twice gives the same bytes: the executable and its
-# object, in a --fast, a default and a release (--no-sidecar) build. The builds
+# object, in a --fast, a default (release) and a release --sidecar build. The builds
 # are a second apart, so nothing may depend on the time (on macOS the debug
 # map's object times feed the image's UUID and code signature).
 set -euo pipefail
@@ -11,7 +11,7 @@ output_directory="$project_root/build/reproducible-build"
 mkdir -p "$output_directory"
 source="$project_root/tests/cases/modules/collections.ab"
 
-for mode in --fast default --no-sidecar; do
+for mode in --fast default --sidecar; do
     flags=()
     [[ $mode == default ]] || flags=("$mode")
     for run in 1 2; do

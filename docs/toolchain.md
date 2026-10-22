@@ -158,11 +158,13 @@ The default hosted release profile runs the deterministic
 generator, while whole-program optimization prioritizes constrained flash.
 Hosted `--fast` skips whole-module optimization and selects LLVM's low-latency
 code generator for edit/build cycles. A hosted release executable is linked from
-its own whole-program (LTO) object; its ordinary object is still built beside it, as
-`<output>.o`, the relocatable sidecar. `build --no-sidecar` (or `ABLA_NO_SIDECAR=1`)
-skips that object and its whole second optimization (most of a large program's release
-build after the front end); the executable is the same. A program that links LLVM
-links its ordinary object and builds it either way. External cross targets run a bounded
+its own whole-program (LTO) object. Its ordinary object, the relocatable sidecar
+`<output>.o`, takes a whole second optimization and code generation (most of a large
+program's release build after the front end) and nothing in the build reads it, so it
+is built only on request: `build --sidecar` (or `ABLA_SIDECAR=1`) builds it beside the
+executable, which is the same either way. `--no-sidecar` (or `ABLA_NO_SIDECAR=1`)
+declines it whatever the environment asks; a build without it removes a stale one. A
+program that links LLVM links its ordinary object and builds it either way. External cross targets run a bounded
 `default<O1>,globaldce` pass in fast mode, because target lowering must not
 validate unreachable host-only runtime assembly. It still runs the complete
 frontend, compile-time evaluator, verifier, object emitter, and linker; it is
@@ -319,7 +321,7 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_COMPILE_EVAL=interp\|jit\|auto`, `ABLA_COMPILE_EVAL_TRACE=1`, `ABLA_COMPILE_EVAL_DUMP=<dir>`, `ABLA_COMPILE_EVAL_TIME_LIMIT=<s>` | run compile-time code in the evaluator (default) or as native code (`auto` is `jit` today), report each site's tier and why a site stays in the evaluator, keep the native slices, and bound one native evaluation (default 600 s, `0` none) ([compile-time.md](compile-time.md#native-evaluation)) |
 | `ABLA_JIT_CACHE=0`, `ABLA_JIT_CACHE_TRACE=1` | turn `ablac run`'s object cache off, or report its decisions on standard error (above) |
 | `ABLA_PACKAGE_CACHE` | the package cache directory ([packages.md](packages.md)) |
-| `ABLA_KEEP_LLVM_TEXT`, `ABLA_LLVM_OUT_OF_PROCESS`, `ABLA_LLVM_VERIFY`, `ABLA_FAST_INLINE_THRESHOLD`, `ABLA_WASM_OPT_CORES`, `ABLA_NO_SIDECAR` | code-generation controls (above) |
+| `ABLA_KEEP_LLVM_TEXT`, `ABLA_LLVM_OUT_OF_PROCESS`, `ABLA_LLVM_VERIFY`, `ABLA_FAST_INLINE_THRESHOLD`, `ABLA_WASM_OPT_CORES`, `ABLA_SIDECAR`, `ABLA_NO_SIDECAR` | code-generation controls (above) |
 | `ABLA_MACOS_SDK`, `ABLA_MACOS_LLVM_LIB`, `ABLA_MACOS_OPENSSL_LIB`, `ABLA_MACOS_CLANG` | cross-linking for macOS: the SDK, target libraries, and the `clang` used to link (default `clang`) |
 | `ABLA_COMPILER_COLLECT_GROWTH_MB` | without a launcher memory budget, the compiler collects garbage each time its heap grows by this much (default 256; 0 never collects) |
 | `ABLA_COMPILER_MEMORY_TRACE`, `ABLA_COMPILER_REACHABILITY_TRACE` | when non-empty, print the compiler's live memory per phase, or its reachability decisions, to standard error |
