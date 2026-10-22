@@ -13,19 +13,34 @@
 #            as is, against its main renamed and evaluated under `#`
 #            (fun main: int = #parityMainBody()). Exit codes and output must match.
 #
+# A case's run-time side is built and run once, whatever the modes (once per
+# mode when the program's own sources hold compile-time code, which runs while
+# it builds), and each mode's `#` side is compared with it in the same
+# directory.
+#
 # Environment:
-#   PARITY_MODES    ABLA_COMPILE_EVAL modes to run (default "interp")
+#   PARITY_MODES    ABLA_COMPILE_EVAL modes to run (default "interp"; "interp
+#                   jit" runs both in one pass)
 #   PARITY_SET      probes | modules | all (default all)
 #   PARITY_FILTER   extended regex on case names (default: every case)
-#   PARITY_JOBS     cases built at once (default 4)
+#   PARITY_JOBS     cases built at once (default: the number of CPUs)
 #   PARITY_SECONDS  wall limit per compile and per run (default 120)
+#   PARITY_KNOWN_TIMEOUT_SECONDS
+#                   the limit instead for a side expected (PARITY_EXPECT) never
+#                   to finish: a `#` side expected to end in timeout or
+#                   interp-threads, and a run-time side whose case is expected
+#                   to end in runtime-skipped in every mode run (default 20)
 #   PARITY_EXPECT   a file of "<mode> <case> [<status>]" lines that must end with
 #                   that status, `pass` when there is none (default
 #                   tests/cases/parity/expected-pass.txt); the script fails when
 #                   one of them doesn't, and lists cases that newly pass.
+#   PARITY_OUTPUT   the results directory (default build/compile-time-parity);
+#                   emptied first, so runs at the same time each need their own
 #
-# Results: build/compile-time-parity/results.tsv (case, mode, status, detail),
-# one directory per case and mode with both programs, their output and the logs.
+# Results: <output>/results.tsv (case, mode, status, detail, then the seconds
+# the mode's `#` side took and the seconds the run-time side it was compared
+# with took), one directory per case and mode with both programs, their output and
+# the logs.
 # Status: pass | mismatch | compile-failed | runtime-skipped (the program itself
 # doesn't build here or doesn't finish) | timeout | interp-threads (a timeout
 # under the interpreter in a program that starts a thread: its body runs only
@@ -48,14 +63,22 @@ compiler=${1:-$project_root/build/ablac}
 modes=${PARITY_MODES:-interp}
 set_name=${PARITY_SET:-all}
 filter=${PARITY_FILTER:-}
-jobs=${PARITY_JOBS:-4}
+jobs=${PARITY_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 seconds=${PARITY_SECONDS:-120}
+known_timeout_seconds=${PARITY_KNOWN_TIMEOUT_SECONDS:-20}
 expect=${PARITY_EXPECT:-$project_root/tests/cases/parity/expected-pass.txt}
-output=$project_root/build/compile-time-parity
+output=${PARITY_OUTPUT:-$project_root/build/compile-time-parity}
+[[ $output == /* ]] || output=$PWD/$output
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 
 rm -rf "$output"
-mkdir -p "$output/cases"
+mkdir -p "$output/cases" "$output/work"
+
+# The expectations, one "<mode> <case> <status>" line each.
+expected=""
+if [[ -f $expect ]]; then
+    expected=$(awk '$1 != "" && $1 !~ /^#/ { print $1, $2, ($3 == "" ? "pass" : $3) }' "$expect")
+fi
 
 # Lists "<kind> <name> <source>" for every selected case.
 list_cases() {
@@ -86,9 +109,13 @@ first_error() {
         sed -E 's/ at [0-9]+:[0-9]+//g; s/[[:space:]]+$//' | cut -c1-200
 }
 
-limited() { # run with the wall/CPU bound; 124 = timed out
-    ABLA_MAX_SECONDS=$seconds ABLA_MAX_CPU_SECONDS=$seconds \
+limited() { # run with the wall/CPU bound of the side; 124 = timed out
+    ABLA_MAX_SECONDS=$side_seconds ABLA_MAX_CPU_SECONDS=$side_seconds \
         "$project_root/tools/run-limited.sh" "$@"
+}
+
+expected_status() { # mode name
+    awk -v m="$1" -v n="$2" '$1 == m && $2 == n { print $3; exit }' <<<"$expected"
 }
 
 # Builds and runs one program in its case directory; writes <tag>.out (stdout of
@@ -137,15 +164,16 @@ by_design_reason() { # name mode
     awk -F'\t' -v n="$1" -v m="$2" '$1 == n && ($2 == "*" || $2 == m) { print $4 }' <<<"$by_design"
 }
 
-# Whether `source` or a file it imports by a relative path starts a thread.
-starts_thread() { # source
-    local pending=("$1") seen="" file
+# Whether `source` or a file it imports by a relative path has a line matching
+# the extended regex `pattern`.
+sources_match() { # pattern source
+    local pattern=$1 pending=("$2") seen="" file
     while ((${#pending[@]} > 0)); do
         file=${pending[0]}
         pending=("${pending[@]:1}")
         [[ -f $file && " $seen " != *" $file "* ]] || continue
         seen="$seen $file"
-        grep -q 'thread {' "$file" && return 0
+        grep -qE "$pattern" "$file" && return 0
         local imported
         while IFS= read -r imported; do
             pending+=("$(cd "$(dirname "$file")" && pwd)/$imported")
@@ -154,9 +182,25 @@ starts_thread() { # source
     return 1
 }
 
-run_case() { # kind name source mode
-    local kind=$1 name=$2 source=$3 mode=$4
-    local dir=$output/cases/$mode/$name status detail granted=""
+# Whether `source` or a file it imports by a relative path starts a thread.
+starts_thread() { # source
+    sources_match 'thread \{' "$1"
+}
+
+# Whether the program's own sources hold compile-time code (`#`, a subparser
+# block), which runs while the run-time side builds too, under the mode's
+# evaluator: such a case builds its run-time side once per mode.
+has_compile_time_code() { # source
+    sources_match '#[A-Za-z_({]|[$][a-z][A-Za-z0-9]* *[{]' "$1"
+}
+
+# Runs one case: its run-time side (once, unless it has compile-time code),
+# then each mode's `#` side against it, all in one work directory (so every
+# side sees the same paths), whose files are then published to
+# <output>/cases/<mode>/<name>.
+run_case() { # kind name source
+    local kind=$1 name=$2 source=$3
+    local dir=$output/work/$name mode want side_seconds=$seconds started
     mkdir -p "$dir"
     if [[ $kind == probe ]]; then
         if [[ $(basename "$source") == main.ab ]]; then
@@ -187,7 +231,43 @@ run_case() { # kind name source mode
         printf '\nfun main: int = #parityMainBody()\n' >>"$dir/staged.ab"
         rm -f "$dir/$base.ab"
     fi
-    build_and_run "$dir" runtime runtime.ab "$mode"
+    cp "$dir/staged.ab" "$dir/.staged.pristine"
+    # A run-time side expected to be skipped in every mode (a server waiting
+    # for clients) only needs to show it doesn't finish.
+    for mode in $modes; do
+        want=$(expected_status "$mode" "$name")
+        if [[ $want != runtime-skipped ]]; then
+            side_seconds=$seconds
+            break
+        fi
+        side_seconds=$known_timeout_seconds
+    done
+    local per_mode=false built=false runtime_seconds=0
+    has_compile_time_code "$source" && per_mode=true
+    for mode in $modes; do
+        if ! $built || $per_mode; then
+            # (Removed, not overwritten: the last mode's directory links them.)
+            find "$dir" -mindepth 1 -maxdepth 1 -name 'runtime.*' ! -name runtime.ab -exec rm -rf {} +
+            started=$SECONDS
+            build_and_run "$dir" runtime runtime.ab "$mode"
+            runtime_seconds=$((SECONDS - started))
+            built=true
+        fi
+        started=$SECONDS
+        run_mode "$kind" "$name" "$source" "$mode"
+        publish_mode "$kind" "$name" "$mode" $((SECONDS - started)) "$runtime_seconds"
+    done
+    rm -rf "$dir"
+}
+
+# Compares one mode's `#` side with the run-time side; sets status and detail.
+run_mode() { # kind name source mode
+    local kind=$1 name=$2 source=$3 mode=$4
+    local dir=$output/work/$name granted="" side_seconds=$seconds
+    # A `#` side expected never to finish only needs to show that it doesn't.
+    case $(expected_status "$mode" "$name") in
+        timeout | interp-threads) side_seconds=$known_timeout_seconds ;;
+    esac
     # A program that doesn't build, or doesn't finish (a server waiting for
     # clients), has no run-time result to compare.
     if [[ $(cat "$dir/runtime.status") != "exit 0" && $kind == probe ]] ||
@@ -234,7 +314,7 @@ run_case() { # kind name source mode
         case $(cat "$dir/staged.status") in
             "build 124" | "build 137" | "build 152")
                 status=timeout
-                detail="compile-time evaluation exceeded ${seconds}s"
+                detail="compile-time evaluation exceeded ${side_seconds}s"
                 # The interpreter runs a thread's body when it is awaited, so a
                 # program that waits on its own thread first can't finish there.
                 if [[ $mode == interp ]] && starts_thread "$source"; then
@@ -292,24 +372,46 @@ run_case() { # kind name source mode
                 ;;
         esac
     fi
-    # Keep only what a failure needs; the copies of the module tree go.
-    if [[ $kind == module ]]; then
-        find "$dir" -mindepth 1 -maxdepth 1 ! -name 'runtime*' ! -name 'staged*' \
-            ! -name 'abla.toml' \
-            -exec rm -rf {} +
-    fi
-    printf '%s\t%s\t%s\t%s\n' "$name" "$mode" "$status" "$detail" >"$dir/result.tsv"
+}
+
+# Moves the mode's results out of the work directory and readies it for the
+# next mode: the `#` side's files go, its source comes back unedited.
+publish_mode() { # kind name mode seconds runtime-seconds
+    local kind=$1 name=$2 mode=$3
+    local dir=$output/work/$name target=$output/cases/$3/$2 entry
+    mkdir -p "$target"
+    for entry in "$dir"/* "$dir"/.[!.]*; do
+        [[ -e $entry && $(basename "$entry") != .staged.pristine ]] || continue
+        # Keep only what a failure needs; the copies of the module tree stay.
+        if [[ $kind == module ]]; then
+            case $(basename "$entry") in
+                runtime* | staged* | abla.toml) ;;
+                *) continue ;;
+            esac
+        fi
+        # (A link: the run-time side's files are shared by every mode.)
+        if [[ -f $entry ]]; then
+            ln "$entry" "$target/" || cp -p "$entry" "$target/"
+        else
+            cp -R "$entry" "$target/"
+        fi
+    done
+    rm -f "$dir"/staged.* "$dir"/staged-jit.*
+    [[ $kind == module ]] && rm -f "$dir/abla.toml"
+    cp "$dir/.staged.pristine" "$dir/staged.ab"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$mode" "$status" "$detail" "$4" "$5" >"$target/result.tsv"
     printf '%-14s %-8s %s %s\n' "$status" "$mode" "$name" "${detail:0:120}"
 }
-export -f run_case build_and_run first_error limited by_design_status by_design_reason starts_thread
-export output compiler seconds project_root by_design
+export -f run_case run_mode publish_mode build_and_run first_error limited \
+    expected_status by_design_status by_design_reason sources_match starts_thread \
+    has_compile_time_code
+export output compiler seconds known_timeout_seconds modes expected project_root by_design
 
-for mode in $modes; do
-    list_cases | while read -r kind name source; do
-        [[ -z $filter || $name =~ $filter ]] || continue
-        printf '%s\0%s\0%s\0%s\0' "$kind" "$name" "$source" "$mode"
-    done
-done | xargs -0 -n4 -P "$jobs" bash -c 'run_case "$@"' run_case
+list_cases | while read -r kind name source; do
+    [[ -z $filter || $name =~ $filter ]] || continue
+    printf '%s\0%s\0%s\0' "$kind" "$name" "$source"
+done | xargs -0 -n3 -P "$jobs" bash -c 'run_case "$@"' run_case
+rm -rf "$output/work"
 
 find "$output/cases" -name result.tsv -exec cat {} + | sort >"$output/results.tsv"
 
