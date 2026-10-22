@@ -657,6 +657,23 @@ fun bootstrapPublishCacheFile(source: string, destination: string): int {
     status
 }
 
+// An external tool as a cache key sees it: the file a command name runs (found on
+// PATH as an exec finds it), its size and modification time. A tool replaced in
+// place, or another one ahead of it on PATH, is another identity.
+fun bootstrapToolIdentity(command: string): string {
+    val path = linuxExecutablePath(command)
+    val info = Path(path).info()
+    "$path:${info.size}:${info.revision}"
+}
+
+// Where the cache keeps an object made from `identity` (everything the object is a
+// function of): `<stem>-<size>-<hash>-<hash>.o`.
+fun bootstrapToolObjectCachePath(stem: string, identity: string): string {
+    val first = bootstrapNativeCacheHash(identity, 239, 317, 1000000007)
+    val second = bootstrapNativeCacheHash(identity, 241, 331, 1000000009)
+    "$stem-${identity.size}-$first-$second.o"
+}
+
 class BootstrapPartitionEmission(
     val status: int,
     val reused: int,
@@ -2087,26 +2104,65 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         failureKind = "reported"
     }
     if (status == 0 && macTarget) {
-        val compileAdapter = linuxCommand(macClang)
-        compileAdapter.argument("--target=${target.llvmTriple}")
-        compileAdapter.argument("-O2")
-        compileAdapter.argument("-isysroot")
-        compileAdapter.argument(macSdkRoot)
-        compileAdapter.argument("-c")
-        compileAdapter.argument(
+        val adapterSource =
             Path(bootstrapRuntimeRoot()).child("abla_darwin_compat.c").text
-        )
-        compileAdapter.argument("-o")
-        compileAdapter.argument(hostPath)
-        status = compileAdapter.run()
+        // Every Mach-O build links the same adapter: with the cache on, its object
+        // is compiled once per adapter source, clang, SDK and target and reused.
+        // (The source is part of the key, so a local adapter change is never hidden.)
+        var adapterCache = ""
+        if (cacheEnabled) {
+            val sdkInfo = Path(macSdkRoot).info()
+            adapterCache = bootstrapToolObjectCachePath(
+                "$cacheDirectory/darwin-adapter-v1",
+                "${target.llvmTriple}\n-O2\n${bootstrapToolIdentity(macClang)}\n$macSdkRoot:${sdkInfo.revision}\n${Path(adapterSource).readText()}"
+            )
+        }
+        var adapterReused = false
+        if (adapterCache != "") {
+            val adapterCacheInfo = Path(adapterCache).info()
+            adapterReused = adapterCacheInfo.isFile() && adapterCacheInfo.size > 0 &&
+                bootstrapCopyNativeObject(adapterCache, hostPath) == 0
+        }
+        if (!adapterReused) {
+            val compileAdapter = linuxCommand(macClang)
+            compileAdapter.argument("--target=${target.llvmTriple}")
+            compileAdapter.argument("-O2")
+            compileAdapter.argument("-isysroot")
+            compileAdapter.argument(macSdkRoot)
+            compileAdapter.argument("-c")
+            compileAdapter.argument(adapterSource)
+            compileAdapter.argument("-o")
+            compileAdapter.argument(hostPath)
+            status = compileAdapter.run()
+            if (status == 0 && adapterCache != "" &&
+                Path(cacheDirectory).createDirectories()) {
+                bootstrapPublishCacheFile(hostPath, adapterCache)
+            }
+        }
     }
-    if (status == 0 && ltoEligible && !linkLlvm) {
+    // The LTO object is a function of the cached module and the tools that prepare
+    // and compile it: a cache hit takes the one its entry's first build made
+    // instead of preparing and compiling the module again.
+    var ltoCache = ""
+    if (ltoEligible && !linkLlvm && cacheEnabled && compileInputsCacheable) {
+        ltoCache = bootstrapToolObjectCachePath(
+            "$cacheStem.lto-v1",
+            "${target.llvmTriple}\n${bootstrapToolIdentity("opt")}\n${bootstrapToolIdentity(if (macTarget) macClang else "clang")}\n$macSdkRoot"
+        )
+    }
+    var ltoReused = false
+    if (status == 0 && cached && ltoCache != "") {
+        val ltoCacheInfo = Path(ltoCache).info()
+        ltoReused = ltoCacheInfo.isFile() && ltoCacheInfo.size > 0 &&
+            bootstrapCopyNativeObject(ltoCache, ltoObjectPath) == 0
+    }
+    if (status == 0 && ltoEligible && !linkLlvm && !ltoReused) {
         status = bootstrapPrepareLtoLlvm(llvmPath, ltoPreparedPath)
         // Preparing read and rewrote the module's text (well over 100 MB for a large
         // program): garbage now, while the LTO compile and link run beside this process.
         bootstrapCollectAndRelease()
     }
-    if (status == 0 && ltoEligible && !linkLlvm) {
+    if (status == 0 && ltoEligible && !linkLlvm && !ltoReused) {
         val compileLtoProgram = if (macTarget) linuxCommand(macClang)
             else linuxCommand("env")
         if (!macTarget) {
@@ -2131,6 +2187,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         compileLtoProgram.argument("-o")
         compileLtoProgram.argument(ltoObjectPath)
         status = compileLtoProgram.run()
+        if (status == 0 && ltoCache != "" && Path(cacheDirectory).createDirectories()) {
+            bootstrapPublishCacheFile(ltoObjectPath, ltoCache)
+        }
     }
     if (status == 0 && target.hosted && artifact == "executable") {
         val link = bootstrapLinkCommand(if (macTarget) macClang else "clang")

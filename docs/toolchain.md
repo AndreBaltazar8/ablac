@@ -184,8 +184,13 @@ module finalizers merge their transaction-local read journals into the same
 artifact identity. Persistent frontend snapshots revalidate those inputs
 before reusing staged syntax. A hit skips
 frontend and LLVM work, restores the recorded
-libLLVM/host-adapter link decisions, recompiles the Darwin adapter for Mach-O,
-and relinks. Local adapter changes are never hidden. The
+libLLVM/host-adapter link decisions and relinks; a release executable or Wasm
+module also takes the LTO object its entry's first build made, kept under a key
+of the `opt` and `clang` it was made with (the file each name runs, its size
+and time), so a hit neither prepares nor compiles the module again. Every
+Mach-O build links the Darwin adapter's object, which the cache keeps by the
+adapter's source, `clang`, SDK and target; a local adapter change is never
+hidden. The
 cache ABI tag in `src/toolchain.ab` must be bumped whenever
 object semantics change without a corresponding source-graph change.
 `--no-cache` bypasses both lookup and publication while still emitting the
