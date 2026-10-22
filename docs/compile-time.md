@@ -681,6 +681,7 @@ reason:
 | Granted capabilities through the providers above | works |
 | Closures as `#` results | works |
 | `print`/`println` | works, no grant: to the compiler's standard output |
+| `panic(message)`, `exit(code)` (`abla/process`) | no grant: stop the evaluation with `E_CT_PANIC` (the message) or `E_CT_STOPPED`, never the compiler, on either tier and with `trusted.native` too |
 | `abla/fs` reads, `abla/process/time` | works with `filesystem.read` / `clock` |
 | `abla/fs` writes, moves and removals | works with `filesystem.write`, staged until the build succeeds |
 | Standard-library code built on its own raw memory (byte buffers) | works, no grant |
@@ -694,6 +695,21 @@ reason:
 
 Compile-time code prints with `println` like any program; its output is
 the compiler's.
+
+A `panic` (or `exit`) in compile-time code fails the build with its message;
+the compiler goes on to report it:
+
+```abla error
+import "abla/process"
+
+compile fun rows(): int = panic("the table is empty")
+
+val count = #rows()
+
+fun main: int = count
+// error: E_CT_PANIC
+// error: the table is empty
+```
 
 ## How a compilation runs
 
@@ -750,8 +766,10 @@ compilation that compile-time code starts (it runs inside the outer pass).
 - A runtime panic in native compile-time code is the evaluator's error for the
   same failure, with the same text (`E_EVAL_OUT_OF_BOUNDS`,
   `E_EVAL_DIVISION_BY_ZERO`, else `E_CT_PANIC`); an abort, a failed check or
-  recursion past the end of the compiler's stack is `E_CT_STOPPED`. The
-  compiler survives each, and the rest of the pass runs in the evaluator.
+  recursion past the end of the compiler's stack is `E_CT_STOPPED`. `panic` is
+  a runtime panic with its message, and `exit(code)` is `E_CT_STOPPED`
+  ("compile-time code called exit(3)"), as in the evaluator. The compiler
+  survives each, and the rest of the pass runs in the evaluator.
 - Native code manages memory as a hosted program's `main` does: globals are
   collector roots, and allocation pressure collects unless the code calls
   `memorySetManualCollection()`.
@@ -778,9 +796,9 @@ compilation that compile-time code starts (it runs inside the outer pass).
 | `E_EVAL_MEMORY_UNAVAILABLE` | the runtime memory API called in the evaluator, which has no program heap |
 | `E_EVAL_DIVISION_BY_ZERO` | an integer division or remainder by zero, which panics at run time |
 | `E_EVAL_OUT_OF_BOUNDS` | an index or slice outside a string or an array, or a negative `truncate` or `filledArray` count; the message is the run-time panic's |
-| `E_CT_STOPPED` | native compile-time code aborted, failed a check or ran past the end of the stack ([native evaluation](#native-evaluation)) |
+| `E_CT_STOPPED` | compile-time code called `exit`, or native compile-time code aborted, failed a check or ran past the end of the stack ([native evaluation](#native-evaluation)) |
 | `E_CT_TIME_LIMIT` | a native evaluation ran past `ABLA_COMPILE_EVAL_TIME_LIMIT` |
-| `E_CT_PANIC` | native compile-time code panicked with a reason the evaluator has no code of its own for |
+| `E_CT_PANIC` | compile-time code called `panic`, or native compile-time code panicked with a reason the evaluator has no code of its own for |
 | `compile.effect-denied:<capability>:<call path>` | the code needs a capability that this module didn't grant |
 | `compile.capability-not-authorized:<capability>` | the module grants a capability that `abla.toml` doesn't authorize |
 | `compile.capability-unknown:<name>` | the grant names no known capability |

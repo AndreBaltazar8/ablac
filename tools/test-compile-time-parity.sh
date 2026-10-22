@@ -19,7 +19,8 @@
 #   PARITY_FILTER   extended regex on case names (default: every case)
 #   PARITY_JOBS     cases built at once (default 4)
 #   PARITY_SECONDS  wall limit per compile and per run (default 120)
-#   PARITY_EXPECT   a file of "<mode> <case>" lines that must pass (default
+#   PARITY_EXPECT   a file of "<mode> <case> [<status>]" lines that must end with
+#                   that status, `pass` when there is none (default
 #                   tests/cases/parity/expected-pass.txt); the script fails when
 #                   one of them doesn't, and lists cases that newly pass.
 #
@@ -325,22 +326,23 @@ done
 
 failed=0
 if [[ -f $expect ]]; then
-    while read -r mode name; do
+    while read -r mode name want; do
         [[ -z $mode || $mode == \#* ]] && continue
+        want=${want:-pass}
         [[ " $modes " == *" $mode "* ]] || continue
         [[ -z $filter || $name =~ $filter ]] || continue
         # Only the cases this run selected.
         [[ -n $(awk -F'\t' -v m="$mode" -v n="$name" '$1 == n && $2 == m' \
             "$output/results.tsv") ]] || continue
-        if [[ -z $(awk -F'\t' -v m="$mode" -v n="$name" '$1 == n && $2 == m && $3 == "pass"' \
+        if [[ -z $(awk -F'\t' -v m="$mode" -v n="$name" -v w="$want" '$1 == n && $2 == m && $3 == w' \
             "$output/results.tsv") ]]; then
-            echo "REGRESSED: $mode $name"
+            echo "REGRESSED: $mode $name (expected $want)"
             failed=1
         fi
     done <"$expect"
     awk -F'\t' '$3 == "pass" { print $2 " " $1 }' "$output/results.tsv" |
         while read -r line; do
-            grep -qxF "$line" "$expect" || echo "newly passing: $line"
+            grep -qE "^$line( pass)?$" "$expect" || echo "newly passing: $line"
         done
 fi
 echo "results: $output/results.tsv"

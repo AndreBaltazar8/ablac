@@ -123,7 +123,7 @@ stop_case() { # name mode [VAR=value...]
 
 # A runtime panic is the interpreter's error, same code and text, at the site; the
 # sites after it are interpreted.
-for name in stop stop-divide; do
+for name in stop stop-divide stop-panic stop-exit; do
     stop_case "$name" jit
     stop_case "$name" interp
     jit_error=$(grep -m1 '^error\[' "$output_directory/$name-jit.trace")
@@ -139,6 +139,21 @@ grep -q 'interpreted at .*: an earlier compile-time evaluation of this pass stop
     "$output_directory/stop-jit.trace"
 grep -q '^error\[E_EVAL_DIVISION_BY_ZERO\]: division by zero$' \
     "$output_directory/stop-divide-jit.trace"
+# `panic` and `exit` stop the evaluation, with no capability granted.
+grep -q '^error\[E_CT_PANIC\]: the table is empty$' "$output_directory/stop-panic-jit.trace"
+grep -q 'native at .*stop-panic.ab' "$output_directory/stop-panic-jit.trace"
+grep -q '^error\[E_CT_STOPPED\]: compile-time code called exit(3)$' \
+    "$output_directory/stop-exit-jit.trace"
+grep -q 'native at .*stop-exit.ab' "$output_directory/stop-exit-jit.trace"
+# So do they with trusted.native granted, where compile-time code makes real
+# system calls: each is one error, in either tier.
+mkdir -p "$output_directory/stop-native"
+for mode in jit interp; do
+    stop_case stop-native/main "$mode"
+    grep -q '^error\[E_CT_PANIC\]: from compile time$' "$output_directory/stop-native/main-$mode.trace"
+    grep -q '^error\[E_CT_STOPPED\]: compile-time code called exit(3)$' \
+        "$output_directory/stop-native/main-$mode.trace"
+done
 
 # An endless native evaluation stops at the time limit.
 stop_case endless jit ABLA_COMPILE_EVAL_TIME_LIMIT=1

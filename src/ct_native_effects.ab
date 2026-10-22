@@ -16,7 +16,7 @@ import "abla/sys/linux/fs"
 import "abla/sys/linux/process"
 
 // The capability of the provider `name` of `module` ("host", "fs", "io",
-// "time") with receiver `owner` ("" for a plain function): an effect bit, 0
+// "time", "exit") with receiver `owner` ("" for a plain function): an effect bit, 0
 // for none (output, the compiler's empty process arguments), -1 when it is
 // not a provider.
 fun bootstrapCompileProviderEffect(module: string, owner: string, name: string): int {
@@ -39,6 +39,10 @@ fun bootstrapCompileProviderEffect(module: string, owner: string, name: string):
             name == "eprintln") return 0
         if (name == "readLine") return 32
     }
+    // Stopping (abla/process/exit) needs no capability: compile-time code that
+    // panics or exits stops its evaluation with a diagnostic (ct_native.ab,
+    // ctNativeEvaluateProvider; the native tier catches the same stop).
+    if (module == "exit" && owner == "" && (name == "panic" || name == "exit")) return 0
     if (module == "time" && owner == "") {
         if (name == "sleep" || name == "sleepNanoseconds" ||
             name == "monotonicNanoseconds" || name == "monotonicMilliseconds" ||
@@ -73,6 +77,29 @@ fun bootstrapCompileHostOperationEffect(name: string): int {
     -1
 }
 
+// The code a panic with `text` stops compile-time code with, on either tier:
+// the evaluator's own code for a run-time check's message, else E_CT_PANIC.
+fun bootstrapCompilePanicCode(text: string): string =
+    if (text == "division by zero") "E_EVAL_DIVISION_BY_ZERO"
+    else if (text.contains("out of bounds") ||
+             text.contains("negative size")) "E_EVAL_OUT_OF_BOUNDS"
+    else if (text.startsWith("field.extension-reassigned:")) "E_EVAL_EXTENSION_REASSIGNED"
+    else "E_CT_PANIC"
+
+// What `exit(code)` in compile-time code reports (E_CT_STOPPED). The native
+// tier's slice turns `exit` into a panic whose message is this one after
+// BOOTSTRAP_COMPILE_EXIT_MARK, which its report reads back.
+fun bootstrapCompileExitMessage(code: string): string =
+    "compile-time code called exit($code)"
+
+val BOOTSTRAP_COMPILE_EXIT_MARK = "abla.ct.exit:"
+
+// Whether `declaration` is `exit` of abla/process/exit.
+fun bootstrapCompileExitProvider(declaration: BootstrapDeclaration): bool =
+    declaration.kind == "fun" && declaration.extensionOwner == "" &&
+    bootstrapCanonicalDeclarationSourceName(declaration.name) == "exit" &&
+    bootstrapCompileProviderModule(declaration) == "exit"
+
 // The provider module a declaration belongs to ("" for none): its source must
 // be the named file of the standard library in use.
 var bootstrapCompileProviderRoot: string = ""
@@ -99,6 +126,7 @@ fun bootstrapCompileProviderModule(declaration: BootstrapDeclaration): string {
     else if (relative == "abla/sys/linux/fs/entry.ab") "fs"
     else if (relative == "abla/io/entry.ab") "io"
     else if (relative == "abla/process/time/entry.ab") "time"
+    else if (relative == "abla/process/exit/entry.ab") "exit"
     else ""
 }
 
@@ -110,7 +138,8 @@ fun bootstrapCompileDeclarationProviderEffect(declaration: BootstrapDeclaration)
     if (bootstrapCompileProviderEffect("host", "", name) < 0 &&
         bootstrapCompileProviderEffect("fs", declaration.extensionOwner, name) < 0 &&
         bootstrapCompileProviderEffect("io", declaration.extensionOwner, name) < 0 &&
-        bootstrapCompileProviderEffect("time", declaration.extensionOwner, name) < 0) return -1
+        bootstrapCompileProviderEffect("time", declaration.extensionOwner, name) < 0 &&
+        bootstrapCompileProviderEffect("exit", declaration.extensionOwner, name) < 0) return -1
     val module = bootstrapCompileProviderModule(declaration)
     if (module == "") -1
     else bootstrapCompileProviderEffect(module, declaration.extensionOwner, name)
