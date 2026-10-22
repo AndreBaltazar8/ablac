@@ -37,39 +37,60 @@ run_42() {
     [[ $status -eq 42 ]] || { echo "math-v8: $program exited $status" >&2; return 1; }
 }
 
-"$compiler" build "$cases/interface.ab" -o "$output_directory/interface" --no-cache
-run_42 "$output_directory/interface"
+# The checks are independent and run side by side; each writes only its own files.
+check_semantics() {
+    "$compiler" build "$cases/interface.ab" -o "$output_directory/interface" --no-cache
+    run_42 "$output_directory/interface"
+    "$compiler" build "$cases/semantics.ab" -o "$output_directory/semantics" --no-cache
+    run_42 "$output_directory/semantics"
+    ABLA_COMPILE_EVAL=jit "$compiler" build "$cases/semantics.ab" \
+        -o "$output_directory/semantics-jit" --no-cache
+    run_42 "$output_directory/semantics-jit"
+}
 
-"$compiler" build "$cases/semantics.ab" -o "$output_directory/semantics" --no-cache
-run_42 "$output_directory/semantics"
-ABLA_COMPILE_EVAL=jit "$compiler" build "$cases/semantics.ab" \
-    -o "$output_directory/semantics-jit" --no-cache
-run_42 "$output_directory/semantics-jit"
-
-for profile in fast o1 o2; do
-    flags=()
+check_native() { # profile
+    local profile=$1 flags=()
     [[ $profile == o2 ]] || flags=("--$profile")
     "$compiler" build "$cases/native.ab" -o "$output_directory/native-$profile" \
         ${flags[@]+"${flags[@]}"} --no-cache
     "$node" "$cases/run.mjs" native "$output_directory/native-$profile" \
-        "$output_directory/io" "$samples"
-done
+        "$output_directory/io-$profile" "$samples"
+}
 
-rm -f "$output_directory"/math-v8*.wasm
-(cd "$project_root" && "$compiler" build "$cases/build.ab" \
-    -o "$output_directory/build-driver" --no-cache)
-(cd "$project_root" && "$output_directory/build-driver")
-for module in math-v8 math-v8-fast; do
-    "$node" "$cases/run.mjs" wasm "$output_directory/$module.wasm" "$samples"
-done
+check_wasm() {
+    rm -f "$output_directory"/math-v8*.wasm
+    (cd "$project_root" && "$compiler" build "$cases/build.ab" \
+        -o "$output_directory/build-driver" --no-cache)
+    (cd "$project_root" && "$output_directory/build-driver")
+    local module
+    for module in math-v8 math-v8-fast; do
+        "$node" "$cases/run.mjs" wasm "$output_directory/$module.wasm" "$samples"
+    done
+}
 
-"$node" "$cases/run.mjs" ct-write "$output_directory/ct/program.ab" 2000
-for tier in interp jit; do
+check_compile_time() { # tier
+    local tier=$1
     ABLA_COMPILE_EVAL=$tier "$compiler" build "$output_directory/ct/program.ab" \
         -o "$output_directory/ct/program-$tier" --no-cache
     "$output_directory/ct/program-$tier" >"$output_directory/ct/results-$tier.txt"
     "$node" "$cases/run.mjs" ct-check "$output_directory/ct/results-$tier.txt" 2000
+}
+
+"$node" "$cases/run.mjs" ct-write "$output_directory/ct/program.ab" 2000
+pids=()
+(check_semantics) & pids+=("$!")
+for profile in fast o1 o2; do
+    (check_native "$profile") & pids+=("$!")
 done
-rm -rf "$output_directory/io"
+(check_wasm) & pids+=("$!")
+for tier in interp jit; do
+    (check_compile_time "$tier") & pids+=("$!")
+done
+failed=0
+for pid in "${pids[@]}"; do
+    wait "$pid" || failed=1
+done
+rm -rf "$output_directory"/io-*
+[[ $failed -eq 0 ]] || exit 1
 
 echo "math-v8: interface alike; native fast/o1/o2, wasm release/fast and # (evaluator and native tier) bit-identical to Node 22.14 (V8 $expected_v8) x86-64 Math"

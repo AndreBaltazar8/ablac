@@ -53,11 +53,13 @@ while IFS= read -r source; do
 done < <(grep -rlE 'import "abla/compiler|compilerGrant|compileCapabilities' \
     tests/cases --include='*.ab' | sort)
 (( ${#cases[@]} >= 40 ))
-failures=0
-for source in "${cases[@]}"; do
-    compare_case "$source" || failures=$((failures + 1))
-done
-[[ $failures -eq 0 ]]
+# The cases are independent: CT_BRIDGE_JOBS of them at a time (default: the
+# number of CPUs); xargs exits nonzero when any of them mismatches.
+export compiler project_root output_directory
+export -f compare_case
+printf '%s\0' "${cases[@]}" |
+    xargs -0 -n1 -P "${CT_BRIDGE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}" \
+        bash -c 'compare_case "$1"' compare_case
 
 # Native: shims for the whole compiler API, then a program calling them.
 ABLA_CT_BRIDGE_SHIMS_OUT="$output_directory/shims.ab" \
