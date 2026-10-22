@@ -11,6 +11,23 @@ export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096}
 export ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-300}
 export ABLA_MAX_CPU_SECONDS=${ABLA_MAX_CPU_SECONDS:-$ABLA_MAX_SECONDS}
 
+# A delegated class keeps what it declares besides: its interfaces (an
+# upcast, a sealed interface's exhaustive `when is`), and a generic class's
+# delegated property in each instance.
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode "$compiler" build \
+        "$project_root/tests/cases/modules/delegated-properties-conformance.ab" \
+        -o "$output_directory/conformance-$mode" --no-cache
+    set +e
+    "$project_root/tools/run-limited.sh" "$output_directory/conformance-$mode"
+    status=$?
+    set -e
+    if [[ $status -ne 42 ]]; then
+        printf 'delegated properties, conformance (%s): expected 42, got %s\n' "$mode" "$status" >&2
+        exit 1
+    fi
+done
+
 for mode in interp jit; do
     ABLA_COMPILE_EVAL=$mode "$compiler" build \
         "$project_root/tests/cases/modules/delegated-properties.ab" \
