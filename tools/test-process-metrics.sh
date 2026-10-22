@@ -17,4 +17,16 @@ status=$?
 set -e
 [[ $status -eq 42 && $output == "process metrics: ok" ]] ||
     { echo "process metrics: exited with $status"; echo "$output"; exit 1; }
-echo "process metrics: cpu, memory, descriptors, limit, start time, heap"
+
+# The macOS reads sit behind ablaHostIsMacOS(), which the backend folds: a
+# Linux object (optimized or not) references no Darwin-only symbol.
+for mode in "" --fast; do
+    "$compiler" build "$project_root/tests/cases/modules/process-metrics.ab" \
+        --target x86_64-linux --emit object $mode \
+        -o "$output_directory/linux$mode.o" --no-cache 2>/dev/null
+    if nm -u "$output_directory/linux$mode.o" | grep -q proc_pidinfo; then
+        echo "process metrics: the x86_64-linux object$mode references proc_pidinfo"
+        exit 1
+    fi
+done
+echo "process metrics: cpu, memory, descriptors, limit, start time, heap, /proc parsers, Linux object"
