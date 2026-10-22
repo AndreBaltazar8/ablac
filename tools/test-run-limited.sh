@@ -46,12 +46,23 @@ timeout_output=$(
 status=$?
 set -e
 [[ $status -eq 124 ]] || exit 1
-[[ $timeout_output == *'stopped after 1 wall-clock second(s)'* ]] || exit 1
+[[ $timeout_output == *'time limit (1 s, ABLA_MAX_SECONDS) reached: killed after 1 wall-clock second(s)'* ]] || exit 1
 if pgrep -f "$marker-child" >/dev/null; then
     printf '[test-run-limited] descendant process leaked after timeout\n' >&2
     pgrep -af "$marker-child" >&2
     exit 1
 fi
+
+# The CPU limit stops a busy command (SIGXCPU) and says which limit it was.
+set +e
+cpu_output=$(
+    ABLA_MAX_MEMORY_MB=64 ABLA_MAX_SECONDS=60 ABLA_MAX_CPU_SECONDS=1 \
+        "$runner" perl -e '1 while 1' 2>&1
+)
+status=$?
+set -e
+[[ $status -eq 152 ]] || exit 1
+[[ $cpu_output == *'CPU time limit (1 s, ABLA_MAX_CPU_SECONDS) reached'* ]] || exit 1
 
 set +e
 invalid_output=$(ABLA_MAX_MEMORY_MB=unlimited "$runner" true 2>&1)

@@ -58,6 +58,7 @@ bounded() {
     trap - TERM INT HUP
 }
 
+started=$SECONDS
 if [[ $OSTYPE == darwin* ]]; then
     ulimit -S -c 0
     ulimit -S -t "$cpu_seconds"
@@ -111,14 +112,18 @@ else
     set -e
 fi
 
+# Killed at the wall-clock limit: 124 (the limiter's TERM), 142 (an alarm) or,
+# on Linux, 137 when the command outlived TERM and the grace period. Whatever
+# the signal, a command stopped at the limit exits 124 and says so.
+if [[ $status == 124 || $status == 142 ||
+      ($status == 137 && $((SECONDS - started)) -ge $wall_seconds) ]]; then
+    status=124
+fi
+
 case $status in
-    142)
-        printf '[abla-limit] stopped after %s wall-clock second(s)\n' \
-            "$wall_seconds" >&2
-        ;;
     124)
-        printf '[abla-limit] stopped after %s wall-clock second(s)\n' \
-            "$wall_seconds" >&2
+        printf '[abla-limit] time limit (%s s, ABLA_MAX_SECONDS) reached: killed after %s wall-clock second(s)\n' \
+            "$wall_seconds" "$wall_seconds" >&2
         ;;
     137)
         printf '[abla-limit] process was killed; address-space limit is %s MiB\n' \
@@ -133,8 +138,8 @@ case $status in
             "$memory_mb" >&2
         ;;
     152)
-        printf '[abla-limit] stopped after %s CPU second(s)\n' \
-            "$cpu_seconds" >&2
+        printf '[abla-limit] CPU time limit (%s s, ABLA_MAX_CPU_SECONDS) reached: killed after %s CPU second(s)\n' \
+            "$cpu_seconds" "$cpu_seconds" >&2
         ;;
 esac
 
