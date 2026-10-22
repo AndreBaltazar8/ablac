@@ -2431,6 +2431,12 @@ fun bootstrapSemanticHelp(code: string): string {
             "a class conforms only to interfaces; this name isn't one"
         "interface.resource-into-plain" ->
             "a plain interface's values copy freely, so a resource class can't conform to one"
+        "interface.cast" ->
+            "`as?` takes an interface value to a class that conforms to that interface"
+        "interface.member-untyped" ->
+            "an interface member without a body declares its result type (`fun area(): f64`); write `: void` for none"
+        "interface.extend-unknown" ->
+            "`extend` adds interfaces to a class; this name isn't a class"
         "interface.inheritance" ->
             "an interface extending another (`interface Solid : Shape`) is not supported yet"
         "threadShared.library" ->
@@ -2494,6 +2500,143 @@ fun bootstrapSemanticHelp(code: string): string {
         else -> ""
     }
 }
+
+/** The interfaces the class `name` conforms to: those it declares, then those
+ *  `extend name : I` adds, each once, in declaration order. */
+fun bootstrapClassInterfaces(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): array<string> {
+    val result: array<string> = []
+    for (declaration in declarations) {
+        if ((declaration.kind == "class" || declaration.kind == "extend") &&
+            declaration.name == name) {
+            for (conformance in declaration.conformances) {
+                val interfaceName = bootstrapNormalizeType(conformance)
+                var seen = false
+                for (previous in result) {
+                    if (previous == interfaceName) seen = true
+                }
+                if (!seen) result.append(interfaceName)
+            }
+        }
+    }
+    result
+}
+
+/** An interface's members as written: once lowering made each member a
+ *  dispatcher (interfaces.ab), its default body's copy is left out. */
+fun bootstrapInterfaceMembers(
+    interfaceDeclaration: BootstrapDeclaration
+): array<BootstrapDeclaration> {
+    val result: array<BootstrapDeclaration> = []
+    for (member in interfaceDeclaration.methods) {
+        if (!bootstrapInterfaceDefaultCopy(interfaceDeclaration, member)) {
+            result.append(member)
+        }
+    }
+    result
+}
+
+/** Whether `member` is the copy of a default body lowering keeps beside the
+ *  member's dispatcher (`name__default`). */
+fun bootstrapInterfaceDefaultCopy(
+    interfaceDeclaration: BootstrapDeclaration,
+    member: BootstrapDeclaration
+): bool {
+    if (member.name.size <= 9 ||
+        member.name.slice(member.name.size - 9, member.name.size) != "__default") {
+        return false
+    }
+    val name = member.name.slice(0, member.name.size - 9)
+    for (other in interfaceDeclaration.methods) {
+        if (other.name == name &&
+            other.expression.kind == "interface.dispatch") return true
+    }
+    false
+}
+
+/** Whether the interface gives `member` a default body (before or after
+ *  lowering made the member a dispatcher). */
+fun bootstrapInterfaceMemberHasDefault(
+    interfaceDeclaration: BootstrapDeclaration,
+    member: BootstrapDeclaration
+): bool {
+    if (member.expression.kind != "missing" &&
+        member.expression.kind != "interface.dispatch") return true
+    for (other in interfaceDeclaration.methods) {
+        if (other.name == "${member.name}__default") return true
+    }
+    false
+}
+
+/** What answers `member` of `interfaceDeclaration` for the class `owner`:
+ *  "method" (the class's own), "extension" (an extension function
+ *  `fun Owner.member`), "default" (the interface's body) or "" (nothing). */
+fun bootstrapWitnessKind(
+    declarations: array<BootstrapDeclaration>,
+    owner: BootstrapDeclaration,
+    interfaceDeclaration: BootstrapDeclaration,
+    member: BootstrapDeclaration
+): string {
+    for (method in owner.methods) {
+        if (method.name == member.name &&
+            bootstrapConformanceSignatureMatches(member, method)) return "method"
+    }
+    for (candidate in declarations) {
+        if (candidate.kind == "fun" && candidate.name == member.name &&
+            bootstrapNormalizeType(candidate.extensionOwner) == owner.name &&
+            bootstrapConformanceSignatureMatches(member, candidate)) return "extension"
+    }
+    if (bootstrapInterfaceMemberHasDefault(interfaceDeclaration, member)) "default"
+    else ""
+}
+
+/** bootstrapJoinTypes, where two classes (or a class and an interface it
+ *  conforms to) also join to the one interface both are: `if (round)
+ *  Circle(2) else Square(3)` is a `Shape` when that is the only interface
+ *  they share. */
+fun bootstrapJoinTypesWith(
+    left: string,
+    right: string,
+    declarations: array<BootstrapDeclaration>
+): string {
+    val joined = bootstrapJoinTypes(left, right)
+    if (joined != "void" || left == right) return joined
+    var leftDeclaration = -1
+    var rightDeclaration = -1
+    var index = 0
+    while (index < declarations.size) {
+        val candidate = declarations[index]
+        if (candidate.kind == "class" || candidate.kind == "interface") {
+            if (candidate.name == left) leftDeclaration = index
+            if (candidate.name == right) rightDeclaration = index
+        }
+        index = index + 1
+    }
+    if (leftDeclaration < 0 || rightDeclaration < 0) return joined
+    val leftInterfaces = bootstrapDeclaredInterfaces(declarations, declarations[leftDeclaration])
+    val rightInterfaces = bootstrapDeclaredInterfaces(declarations, declarations[rightDeclaration])
+    var shared = ""
+    var count = 0
+    for (candidate in leftInterfaces) {
+        for (other in rightInterfaces) {
+            if (candidate == other) {
+                shared = candidate
+                count = count + 1
+            }
+        }
+    }
+    if (count == 1) shared else joined
+}
+
+/** A class's interfaces, or an interface itself. */
+fun bootstrapDeclaredInterfaces(
+    declarations: array<BootstrapDeclaration>,
+    declaration: BootstrapDeclaration
+): array<string> =
+    if (declaration.kind == "interface") [declaration.name]
+    else bootstrapClassInterfaces(declarations, declaration.name)
 
 // Compute the narrowest type that can represent either branch of an
 // expression. In particular, `null` joined with `T` is `T?`; treating that
@@ -5842,15 +5985,16 @@ class BootstrapAnalyzer(
         else -1
     }
 
-    /** Whether the class `type` declares that it conforms to `interfaceName`. */
+    /** Whether the class `type` conforms to `interfaceName`: it declares so,
+     *  or an `extend type : interfaceName` does. */
     fun conformsTo(type: string, interfaceName: string): bool {
         if (this.interfaceDeclaration(interfaceName) < 0) return false
         val found = this.typeDeclarations.find(type)
         if (found < 0) return false
         val declaration = this.declarations[found]
         if (declaration.kind != "class" || declaration.name != type) return false
-        for (conformance in declaration.conformances) {
-            if (bootstrapNormalizeType(conformance) == interfaceName) return true
+        for (conformance in bootstrapClassInterfaces(this.declarations, type)) {
+            if (conformance == interfaceName) return true
         }
         false
     }
@@ -5869,18 +6013,52 @@ class BootstrapAnalyzer(
         this.conformsTo(source, target)
     }
 
-    /** A class's `: I, J`: each names an interface, once, which the class
-     *  implements (its members by name and signature, or the interface's
-     *  default bodies). An interface's own parents are not supported yet. */
+    /** A class's `: I, J` (or `extend C : I, J`): each names an interface,
+     *  once, which the class implements: each member by a method or an
+     *  extension function of the same name and signature, or by the
+     *  interface's default body. An interface's own parents are not supported
+     *  yet. */
     fun validateConformances(declaration: BootstrapDeclaration): void {
         if (declaration.kind == "interface") {
             if (declaration.conformances.size > 0) {
                 this.failAtOffset("interface.inheritance:${declaration.name}", declaration.begin)
             }
+            // A member without a body names its result: no body to infer it from.
+            for (member in declaration.methods) {
+                if (member.expression.kind == "missing" &&
+                    member.resultType == "inferred") {
+                    this.failAtOffset(
+                        "interface.member-untyped:${declaration.name}.${member.name}",
+                        member.begin
+                    )
+                }
+            }
             return
         }
-        if (declaration.kind != "class") return
+        if (declaration.kind != "class" && declaration.kind != "extend") return
+        val ownerIndex = this.typeDeclarations.find(declaration.name)
+        if (ownerIndex < 0 || this.declarations[ownerIndex].kind != "class" ||
+            this.declarations[ownerIndex].name != declaration.name) {
+            this.failAtOffset("interface.extend-unknown:${declaration.name}", declaration.begin)
+            return
+        }
+        val owner = this.declarations[ownerIndex]
+        // What earlier declarations already made the class conform to.
         val seen: array<string> = []
+        if (declaration.kind == "extend") {
+            for (conformance in owner.conformances) {
+                seen.append(bootstrapNormalizeType(conformance))
+            }
+            for (other in this.declarations) {
+                if (other.kind == "extend" && other.name == declaration.name &&
+                    (other.sourceIdentity != declaration.sourceIdentity ||
+                     other.begin < declaration.begin)) {
+                    for (conformance in other.conformances) {
+                        seen.append(bootstrapNormalizeType(conformance))
+                    }
+                }
+            }
+        }
         for (written in declaration.conformances) {
             val interfaceName = bootstrapNormalizeType(written)
             val found = this.interfaceDeclaration(interfaceName)
@@ -5895,17 +6073,31 @@ class BootstrapAnalyzer(
                 this.failAtOffset("interface.duplicate:${declaration.name}:$interfaceName", declaration.begin)
             } else {
                 // A plain interface's values copy freely: no resource behind one.
-                if (declaration.isResource) {
+                if (owner.isResource) {
                     this.failAtOffset("interface.resource-into-plain:$interfaceName:${declaration.name}", declaration.begin)
                 }
-                for (member in this.declarations[found].methods) {
+                for (member in bootstrapInterfaceMembers(this.declarations[found])) {
                     this.validateConformanceMember(
-                        declaration, interfaceName, member
+                        declaration, ownerIndex, found, member
                     )
                 }
             }
         }
         return
+    }
+
+    /** `value as? Square`: an interface value (or a nullable one) to a class
+     *  that conforms to that interface, as `Square?`. A cast that can never
+     *  succeed is an error. */
+    fun inferInterfaceCast(expression: BootstrapExpression): string {
+        val operand = bootstrapBorrowElementType(this.infer(expression.children[0]))
+        val source = if (bootstrapIsNullableType(operand))
+            bootstrapNullableElementType(operand) else operand
+        val target = bootstrapNormalizeType(expression.text)
+        if (operand != "unknown" && !this.conformsTo(target, source)) {
+            this.fail("interface.cast@${expression.begin}:$operand:$target")
+        }
+        "nullable:$target"
     }
 
     /** fail, with the diagnostic placed at `begin` of the current source. */
@@ -5919,17 +6111,22 @@ class BootstrapAnalyzer(
         this.inferSource = previousSource
     }
 
-    /** One interface member, against the class's methods of that name. */
+    /** One interface member, against the class's methods and extension
+     *  functions of that name. */
     fun validateConformanceMember(
         declaration: BootstrapDeclaration,
-        interfaceName: string,
+        ownerIndex: int,
+        interfaceIndex: int,
         member: BootstrapDeclaration
     ): void {
+        val owner = this.declarations[ownerIndex]
+        val interfaceDeclaration = this.declarations[interfaceIndex]
+        val interfaceName = interfaceDeclaration.name
         val wanted = bootstrapDeclarationFunctionType(member)
         var named = false
         var matches = false
         var methodBegin = declaration.begin
-        for (method in declaration.methods) {
+        for (method in owner.methods) {
             if (method.name == member.name) {
                 named = true
                 methodBegin = method.begin
@@ -5938,13 +6135,37 @@ class BootstrapAnalyzer(
                 }
             }
         }
+        if (!named) {
+            for (candidate in this.declarations) {
+                if (candidate.kind == "fun" && candidate.name == member.name &&
+                    bootstrapNormalizeType(candidate.extensionOwner) == owner.name) {
+                    named = true
+                    if (candidate.sourceIdentity == this.currentSourceIdentity) {
+                        methodBegin = candidate.begin
+                    }
+                    if (bootstrapConformanceSignatureMatches(member, candidate)) {
+                        matches = true
+                    }
+                }
+            }
+        }
+        // A method whose result is inferred matches once its body's type does.
+        if (matches && member.resultType != "inferred") {
+            val expected = bootstrapNormalizeType(member.resultType)
+            val actual = this.methodResultType(owner.name, member.name)
+            if (actual != "unknown" && actual != expected &&
+                !bootstrapTypesCompatible(expected, actual)) {
+                matches = false
+            }
+        }
         if (named && !matches) {
             this.failAtOffset(
-                "interface.member-signature:$interfaceName.${member.name}:${declaration.name}:$wanted",
+                "interface.member-signature:$interfaceName.${member.name}:${owner.name}:$wanted",
                 methodBegin
             )
-        } else if (!named && member.expression.kind == "missing") {
-            this.failAtOffset("interface.missing-member:$interfaceName.${member.name}:${declaration.name}", declaration.begin)
+        } else if (!named &&
+            !bootstrapInterfaceMemberHasDefault(interfaceDeclaration, member)) {
+            this.failAtOffset("interface.missing-member:$interfaceName.${member.name}:${owner.name}", declaration.begin)
         }
         return
     }
@@ -9528,6 +9749,7 @@ class BootstrapAnalyzer(
         if (expression.kind == "await") {
             result = bootstrapInferAwait(this, expression, result)
         }
+        if (expression.kind == "as?") result = this.inferInterfaceCast(expression)
         if (expression.kind == "return") {
             result = bootstrapInferReturn(this, expression, result)
         }
@@ -9744,6 +9966,8 @@ class BootstrapAnalyzer(
                 declaration.kind == "class" ||
                 declaration.kind == "interface" ||
                 declaration.kind == "type" ||
+                // `extend C : I` names a class, and declares no symbol.
+                declaration.kind == "extend" ||
                 bootstrapIsExtensionFieldKind(declaration.kind) ||
                 (bootstrapDeclarationIsValue(declaration.kind) &&
                  declaration.resultType != "inferred")
@@ -9830,7 +10054,8 @@ class BootstrapAnalyzer(
             if (bootstrapIsExtensionFieldKind(declaration.kind)) {
                 this.validateExtensionField(declaration)
             }
-            if (declaration.kind == "class" || declaration.kind == "interface") {
+            if (declaration.kind == "class" || declaration.kind == "interface" ||
+                declaration.kind == "extend") {
                 this.validateConformances(declaration)
             }
             if (!predeclared) {
@@ -10648,7 +10873,9 @@ fun bootstrapInferArray(
         } else if (elementType == "unknown") {
             elementType = found
         } else if (elementType != found) {
-            val joined = bootstrapJoinTypes(elementType, found)
+            val joined = bootstrapJoinTypesWith(
+                elementType, found, analyzer.declarations
+            )
             if (joined == "void") analyzer.fail("array.element-type")
             else elementType = joined
         }
@@ -12657,7 +12884,7 @@ fun bootstrapInferIf(
         analyzer.addNullableRefinements(expression.children[0], false)
         val elseType = analyzer.infer(expression.children[2])
         analyzer.leaveScope(previousElseScope)
-        result = bootstrapJoinTypes(thenType, elseType)
+        result = bootstrapJoinTypesWith(thenType, elseType, analyzer.declarations)
     }
     result
 }
@@ -12824,7 +13051,9 @@ fun bootstrapInferWhen(
             bootstrapSemanticUnit()
         }
         val found = analyzer.infer(expression.children[branch + 1])
-        branchType = bootstrapJoinTypes(branchType, found)
+        branchType = bootstrapJoinTypesWith(
+            branchType, found, analyzer.declarations
+        )
         branch = branch + 2
     }
     if (notNullScope >= 0) analyzer.leaveScope(notNullScope)

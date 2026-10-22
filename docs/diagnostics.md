@@ -101,11 +101,16 @@ only its parse errors.
 | `field.extension-type:<T>.<f>:<expected>:<actual>` | an extension field's default of another type |
 | `field.extension-resource:<T>.<f>` | an affine extension field (a resource, `Shared`, `Weak`, `Mutex`) on a class that isn't affine |
 | `field.extension-reassigned:<T>.<f>` | a second assignment of an extension `val` (at run time; `E_EVAL_EXTENSION_REASSIGNED` under `#`) |
-| `interface.missing-member:<I>.<m>:<C>` | a class conforms to an interface but has no method `m` and the interface gives it no default body ([interfaces](language.md#interfaces)) |
-| `interface.member-signature:<I>.<m>:<C>:<type>` | the class's method `m` takes other parameter types or modes, or returns another type, than the interface member's `<type>` |
-| `interface.unknown:<C>:<name>`, `interface.duplicate:<C>:<I>` | a class's conformance list names something that isn't an interface, or one interface twice |
+| `interface.missing-member:<I>.<m>:<C>` | a class conforms to an interface, and no method, extension function or default body of the interface answers its member `m` ([interfaces](language.md#interfaces)) |
+| `interface.member-signature:<I>.<m>:<C>:<type>` | the class's method (or extension function) `m` takes other parameter types or modes, or returns another type, than the interface member's `<type>` |
+| `interface.member-untyped:<I>.<m>` | an interface member without a body and without a result type |
+| `interface.unknown:<C>:<name>`, `interface.duplicate:<C>:<I>` | a class's conformance list (or an `extend`) names something that isn't an interface, or an interface the class already conforms to |
+| `interface.extend-unknown:<name>` | `extend` names something that isn't a class |
 | `interface.resource-into-plain:<I>:<C>` | a resource class conforming to a plain interface, whose values copy freely |
+| `interface.cast:<from>:<to>` | `x as? C` where `C` doesn't conform to `x`'s interface, so the cast could never succeed |
 | `interface.inheritance:<I>` | an interface with parents (`interface Solid : Shape`), not supported yet |
+| `interface.no-witness:<I>:#<class>` | at run time: a call through an interface on an instance of a class with no witness for it (the dispatch fallback; no program reaches it today) |
+| `E_COMPILER_TRANSFORM_INTERFACE` | `compiler.declareInterface` or `compiler.addConformance` outside a transform, or without its handle and names ([compiler API](compiler-api.md#interfaces)) |
 | `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a generic's `<T>`, a `where` clause, `const` type parameters, an interface's `type Item`, `sealed` |
 | `native.trust:<f>` | calling a trusted function from untrusted code ([trusted code](language.md#trusted-native-implementations)) |
 | `native.runtime-internal:<f>` | calling one of the runtime's address intrinsics or field-slot accessors outside `abla/runtime`, trusted or not ([trusted code](language.md#trusted-native-implementations)) |

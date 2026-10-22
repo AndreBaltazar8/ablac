@@ -7,6 +7,7 @@ import "receiver_names.ab"
 import "expected_types.ab"
 import "abla/runtime/memory"
 import "generator_ir.ab"
+import "interfaces.ab"
 
 fun bootstrapIrTraceMemory(label: string): void {
     val configured = linuxEnvironment("ABLA_COMPILER_MEMORY_TRACE")
@@ -4531,6 +4532,16 @@ fun bootstrapCollectLoweredInstructionTargets(
             "__ablaRuntimeFieldHas", targets, reachable, pending
         )
     }
+    if (candidate.opcode == "object.is") {
+        bootstrapMarkIrRuntimeDeclaration(
+            "__ablaRuntimeObjectIs", targets, reachable, pending
+        )
+    }
+    if (candidate.opcode == "interface.no-witness") {
+        bootstrapMarkIrRuntimeDeclaration(
+            "__ablaRuntimeInterfaceNoWitness", targets, reachable, pending
+        )
+    }
     if (candidate.opcode == "field.get.indexed") {
         bootstrapMarkIrRuntimeDeclaration(
             "__ablaRuntimeFieldGetIndexed", targets, reachable, pending
@@ -5367,6 +5378,15 @@ class BootstrapLowerer(
 
     fun lowerExpressionType(expression: BootstrapExpression): string {
         var result = "unknown"
+        if (expression.kind == "interface.cast") return expression.text
+        if (expression.kind == "as?") {
+            return "nullable:${bootstrapNormalizeType(expression.text)}"
+        }
+        if (expression.kind == "interface.dispatch") {
+            return if (expression.children.size > 0)
+                this.lowerExpressionType(expression.children[0].children[0])
+            else "void"
+        }
         if (expression.kind == "integer") result = "i64"
         if (expression.kind == "float") result = "f64"
         if (expression.kind == "true" || expression.kind == "false") {
@@ -5497,7 +5517,9 @@ class BootstrapLowerer(
             var element = "unknown"
             for (child in expression.children) {
                 val found = this.lowerExpressionType(child)
-                val joined = bootstrapJoinTypes(element, found)
+                val joined = bootstrapJoinTypesWith(
+                    element, found, this.declarations
+                )
                 if (joined != "void") element = joined
             }
             result = if (expression.text != "") bootstrapNormalizeType(expression.text)
@@ -5663,9 +5685,10 @@ class BootstrapLowerer(
                         bootstrapWhenNotNullCondition(expression), true
                     )
                 }
-                branchType = bootstrapJoinTypes(
+                branchType = bootstrapJoinTypesWith(
                     branchType,
-                    this.lowerExpressionType(expression.children[branch])
+                    this.lowerExpressionType(expression.children[branch]),
+                    this.declarations
                 )
                 branch = branch + 2
             }
@@ -5683,7 +5706,9 @@ class BootstrapLowerer(
                 this.addNullableRefinements(expression.children[0], false)
                 val elseType = this.lowerExpressionType(expression.children[2])
                 this.leaveLocalScope(previousElseScope)
-                result = bootstrapJoinTypes(thenType, elseType)
+                result = bootstrapJoinTypesWith(
+                    thenType, elseType, this.declarations
+                )
             }
         }
         if (expression.kind == "lambda") {
@@ -7339,6 +7364,17 @@ class BootstrapLowerer(
         }
         if (expression.kind == "member.call") {
             result = bootstrapLowerMemberCall(this, expression, result)
+        }
+        // An interface member's dispatcher (interfaces.ab), and the instance
+        // it hands to the class it found (the same value, typed as the class).
+        if (expression.kind == "interface.dispatch") {
+            result = bootstrapLowerInterfaceDispatch(this, expression)
+        }
+        if (expression.kind == "interface.cast") {
+            result = this.lowerExpression(expression.children[0])
+        }
+        if (expression.kind == "as?") {
+            result = bootstrapLowerAsCast(this, expression)
         }
         if (expression.kind == "call.value") {
             result = bootstrapLowerCallValue(this, expression, result)
@@ -10086,6 +10122,75 @@ fun bootstrapLowerIf(
     result
 }
 
+/** `value as? Square`: the value when it is an instance of the class, else
+ *  null. */
+@noinline
+fun bootstrapLowerAsCast(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val temporary = "cast_result_${lowerer.allocateLabel()}"
+    lowerer.emitControl(
+        bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
+            lowerer.lowerExpressionType(expression)
+        )),
+        -1, -1, -1, temporary
+    )
+    val value = lowerer.lowerExpression(expression.children[0])
+    val yesLabel = lowerer.allocateLabel()
+    val noLabel = lowerer.allocateLabel()
+    val mergeLabel = lowerer.allocateLabel()
+    val matches = lowerer.emit(
+        "object.is", value, -1, bootstrapNormalizeType(expression.text)
+    )
+    lowerer.emitControl("branch", matches, yesLabel, noLabel, "")
+    lowerer.emitControl("label", -1, yesLabel, -1, "")
+    lowerer.emitControl("local.set", value, -1, -1, temporary)
+    lowerer.emitControl("jump", -1, mergeLabel, -1, "")
+    lowerer.emitControl("label", -1, noLabel, -1, "")
+    val absent = lowerer.emit("const.null", -1, -1, "")
+    lowerer.emitControl("local.set", absent, -1, -1, temporary)
+    lowerer.emitControl("jump", -1, mergeLabel, -1, "")
+    lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    lowerer.emit("local.load", -1, -1, temporary)
+}
+
+/** A dispatcher's body: the first arm whose class the receiver is an instance
+ *  of answers; an instance of any other class goes to the runtime's fallback. */
+@noinline
+fun bootstrapLowerInterfaceDispatch(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val temporary = "dispatch_result_${lowerer.allocateLabel()}"
+    lowerer.emitControl(
+        bootstrapIrLocalZeroOpcode(lowerer.lowerRuntimeType(
+            lowerer.lowerExpressionType(expression)
+        )),
+        -1, -1, -1, temporary
+    )
+    val receiver = lowerer.lowerExpression(BootstrapExpression(
+        "identifier", "this", expression.begin, expression.begin, []
+    ))
+    val mergeLabel = lowerer.allocateLabel()
+    for (arm in expression.children) {
+        val armLabel = lowerer.allocateLabel()
+        val nextLabel = lowerer.allocateLabel()
+        val matches = lowerer.emit("object.is", receiver, -1, arm.text)
+        lowerer.emitControl("branch", matches, armLabel, nextLabel, "")
+        lowerer.emitControl("label", -1, armLabel, -1, "")
+        val value = lowerer.lowerExpression(arm.children[0])
+        lowerer.emitControl("local.set", value, -1, -1, temporary)
+        lowerer.emitControl("jump", -1, mergeLabel, -1, "")
+        lowerer.emitControl("label", -1, nextLabel, -1, "")
+    }
+    val interfaceName = lowerer.emit("const.string", -1, -1, expression.text)
+    lowerer.emit("interface.no-witness", receiver, interfaceName, "")
+    lowerer.emitControl("unreachable", -1, -1, -1, "")
+    lowerer.emitControl("label", -1, mergeLabel, -1, "")
+    lowerer.emit("local.load", -1, -1, temporary)
+}
+
 @noinline
 fun bootstrapLowerWhile(
     var lowerer: BootstrapLowerer,
@@ -10445,7 +10550,9 @@ fun bootstrapLowerParsedCached(
     pruneUnused: bool = false
 ): BootstrapIrProgram {
     // The literals analysis typed from an inferred receiver lower as typed.
-    val parsed = bootstrapApplyContextualLiterals(analyzedParse, analyzed.contextualLiterals)
+    val parsed = bootstrapLowerInterfaceDispatchers(
+        bootstrapApplyContextualLiterals(analyzedParse, analyzed.contextualLiterals)
+    )
     ctNativeSetLoweringGrants(parsed, analyzed.errors)
     val instructions: array<BootstrapInstruction> = []
     val functions: array<BootstrapIrFunction> = []

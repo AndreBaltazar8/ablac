@@ -1,0 +1,189 @@
+import "sema.ab"
+import "overload.ab"
+
+// Interfaces after analysis: which classes implement one, each class's witness
+// for it (which function answers each member), and the dispatchers lowering
+// calls through an interface value go to.
+//
+// An interface value is the instance itself. A call `shape.area()` on one
+// lowers to the interface's `area`, a dispatcher: it compares the instance's
+// class with each implementer's (object.is) and calls that class's witness. An
+// instance of any other class goes to the runtime's one fallback
+// (interface.no-witness), so nothing here assumes the implementers are all
+// known; a conformance added at run time would be answered there.
+
+/** The classes that conform to `interfaceName` (declared at the class or by
+ *  an `extend`), in declaration order (indices into `declarations`). */
+fun bootstrapInterfaceImplementers(
+    declarations: array<BootstrapDeclaration>,
+    interfaceName: string
+): array<int> {
+    val result: array<int> = []
+    var index = 0
+    while (index < declarations.size) {
+        val candidate = declarations[index]
+        if (candidate.kind == "class") {
+            for (conformance in bootstrapClassInterfaces(declarations, candidate.name)) {
+                if (conformance == interfaceName) result.append(index)
+            }
+        }
+        index = index + 1
+    }
+    result
+}
+
+/** The interface declaration named `name`, or -1. */
+fun bootstrapInterfaceDeclarationIndex(
+    declarations: array<BootstrapDeclaration>,
+    name: string
+): int {
+    var index = 0
+    while (index < declarations.size) {
+        if (declarations[index].kind == "interface" &&
+            declarations[index].name == name) return index
+        index = index + 1
+    }
+    -1
+}
+
+/** An interface member's default body keeps its place under this name; the
+ *  member's own name is its dispatcher. */
+fun bootstrapInterfaceDefaultName(member: string): string = "${member}__default"
+
+/** Whether any interface has a member, so a program without interfaces is
+ *  lowered exactly as before. */
+fun bootstrapParsedHasInterfaceMembers(parsed: BootstrapParseResult): bool {
+    for (declaration in parsed.declarations) {
+        if (declaration.kind == "interface" && declaration.methods.size > 0) {
+            return true
+        }
+    }
+    false
+}
+
+/** `parsed` with each interface member lowered as a dispatcher of the same
+ *  name (and its default body, if it has one, under
+ *  bootstrapInterfaceDefaultName). */
+fun bootstrapLowerInterfaceDispatchers(
+    parsed: BootstrapParseResult
+): BootstrapParseResult {
+    if (!bootstrapParsedHasInterfaceMembers(parsed)) return parsed
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) {
+        if (declaration.kind == "interface" && declaration.methods.size > 0) {
+            declarations.append(bootstrapInterfaceWithDispatchers(
+                parsed.declarations, declaration
+            ))
+        } else declarations.append(declaration)
+    }
+    BootstrapParseResult(
+        declarations,
+        parsed.actions,
+        parsed.errors,
+        parsed.extensionErrors,
+        parsed.compileInputPaths,
+        parsed.compileInputContents,
+        parsed.diagnostics
+    )
+}
+
+fun bootstrapInterfaceWithDispatchers(
+    declarations: array<BootstrapDeclaration>,
+    interfaceDeclaration: BootstrapDeclaration
+): BootstrapDeclaration {
+    val implementers = bootstrapInterfaceImplementers(
+        declarations, interfaceDeclaration.name
+    )
+    val methods: array<BootstrapDeclaration> = []
+    for (member in interfaceDeclaration.methods) {
+        methods.append(bootstrapMethodWith(
+            member,
+            member.name,
+            bootstrapInterfaceDispatch(
+                declarations, interfaceDeclaration, member, implementers
+            )
+        ))
+        if (member.expression.kind != "missing") {
+            methods.append(bootstrapMethodWith(
+                member,
+                bootstrapInterfaceDefaultName(member.name),
+                member.expression
+            ))
+        }
+    }
+    bootstrapDeclarationWithMethods(interfaceDeclaration, methods)
+}
+
+/** A dispatcher's body: an `interface.dispatch` (text: the interface) whose
+ *  children are its arms, `interface.arm` (text: the class) around the call
+ *  that class answers with. */
+fun bootstrapInterfaceDispatch(
+    declarations: array<BootstrapDeclaration>,
+    interfaceDeclaration: BootstrapDeclaration,
+    member: BootstrapDeclaration,
+    implementers: array<int>
+): BootstrapExpression {
+    val begin = member.begin
+    val arms: array<BootstrapExpression> = []
+    for (implementer in implementers) {
+        val owner = declarations[implementer]
+        val kind = bootstrapWitnessKind(
+            declarations, owner, interfaceDeclaration, member
+        )
+        if (kind != "") {
+            // The default body runs with `this` still the interface value.
+            val receiverType = if (kind == "default") interfaceDeclaration.name
+                else owner.name
+            val name = if (kind == "default")
+                bootstrapInterfaceDefaultName(member.name) else member.name
+            val children: array<BootstrapExpression> = [BootstrapExpression(
+                "interface.cast", receiverType, begin, begin,
+                [BootstrapExpression("identifier", "this", begin, begin, [])]
+            )]
+            for (parameter in member.parameters) {
+                children.append(BootstrapExpression(
+                    "identifier", parameter, begin, begin, []
+                ))
+            }
+            arms.append(BootstrapExpression(
+                "interface.arm", owner.name, begin, begin,
+                [BootstrapExpression("member.call", name, begin, begin, children)]
+            ))
+        }
+    }
+    BootstrapExpression(
+        "interface.dispatch", interfaceDeclaration.name, begin, member.end, arms
+    )
+}
+
+fun bootstrapMethodWith(
+    method: BootstrapDeclaration,
+    name: string,
+    expression: BootstrapExpression
+): BootstrapDeclaration = BootstrapDeclaration(
+    method.kind,
+    name,
+    method.begin,
+    method.end,
+    expression,
+    method.parameters,
+    method.parameterTypes,
+    method.resultType,
+    method.methods,
+    method.parameterDefaults,
+    method.externalLibrary,
+    method.parameterKinds,
+    method.extensionOwner,
+    method.isTrusted,
+    method.isResource,
+    method.isNoEscape,
+    method.generatedNamespace,
+    method.generatedOriginBegin,
+    method.generatedOriginEnd,
+    method.annotations,
+    method.annotationArguments,
+    method.annotationBegins,
+    method.annotationEnds,
+    method.sourceIdentity,
+    method.conformances
+)

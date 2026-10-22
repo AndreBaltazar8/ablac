@@ -1025,55 +1025,115 @@ fun main {
 
 ### Interfaces
 
-`interface Name { fun member(...): T }` declares a named type with method
-signatures. A class names the interfaces it conforms to after its fields, and
-implements each member with a method of the same name, parameter types and
-modes, and result type. A value of the class then stands wherever one of those
-interfaces is expected: as an argument, a field, an array element, a variable
-of the interface's type or a nullable one (`Square?` where `Shape?` is wanted).
+An interface names a set of methods. A class conforms to it, and its values
+then stand wherever the interface is expected. A call through an interface
+value runs the method of the value's class.
 
 ```abla
 import "abla/io"
 
 interface Shape {
-    fun area(): f64
+    fun area(): int
+    fun describe(): string = "shape of ${this.area()}"
 }
 
-interface Named {
-    fun name(): string
+class Square(val side: int) : Shape {
+    fun area(): int = this.side * this.side
 }
 
-class Square(val side: f64) : Shape, Named {
-    fun area(): f64 = this.side * this.side
-    fun name() = "square"
+class Circle(val radius: int) : Shape {
+    fun area(): int = 3 * this.radius * this.radius
+    fun describe(): string = "circle"
 }
 
-fun count(shapes: array<Shape>): int = shapes.size
+fun total(shapes: array<Shape>): int {
+    var sum = 0
+    for (shape in shapes) sum = sum + shape.area()
+    sum
+}
 
 fun main {
-    val shapes: array<Shape> = [Square(1.0)]
-    shapes.append(Square(3.0))
-    val named: Named = Square(2.0)
-    println("${count(shapes)}")
+    val shapes: array<Shape> = [Square(2), Circle(1)]
+    println("${total(shapes)} ${shapes[0].describe()} ${shapes[1].describe()}")
 }
 // output:
-// 2
+// 7 shape of 4 circle
 ```
 
-A conformance is checked at the class: a missing member is
-`interface.missing-member:Shape.area:Square`, a method of that name with
-another signature is `interface.member-signature`, and a name that isn't an
-interface is `interface.unknown`. A class only conforms to the interfaces it
-names; matching methods alone don't make it conform. A resource class can't
-conform to a plain interface (`interface.resource-into-plain`), because plain
-interface values copy freely.
+- **Members.** An interface member is a method signature. A member without a
+  body names its result type (`interface.member-untyped`). A member with a
+  body is a *default*: it runs for a class that has no method of that name,
+  with `this` the instance. An interface has no fields. A field-like need is a
+  method, which an [extension field](#extension-fields) can back.
+- **Conformance.** A class names its interfaces after its fields
+  (`class Square(…) : Shape, Named`). `extend Square : Printable` at top level
+  does the same for a class declared elsewhere, in any module. A class
+  conforms only to the interfaces it names or that `extend` adds: matching
+  methods alone don't make it conform.
+- **Witnesses.** Each member is answered by the class's method of the same
+  name, parameter types and modes, and result type. Failing that, an
+  extension function `fun Square.member(…)` answers it, and then the
+  interface's default. A member nothing answers is
+  `interface.missing-member:Shape.area:Square`. A method of that name with
+  another signature is `interface.member-signature`. A name that isn't an
+  interface is `interface.unknown`.
+- **Upcasts** are implicit: a `Square` passes, stores and returns where a
+  `Shape` is expected, and a `Square?` where a `Shape?` is. The branches of an
+  `if` or `when`, and the elements of an array literal, that are classes
+  sharing exactly one interface have that interface's type.
+- **`as?`** takes an interface value back to a class:
+  `shape as? Square` is the `Square` when the value is one, and `null`
+  otherwise (a nullable interface value too). A class that doesn't conform to
+  the interface can never be the result, so naming one is an error
+  (`interface.cast`).
+- **Ownership.** A resource class can't conform to a plain interface
+  (`interface.resource-into-plain`), because plain interface values copy
+  freely. Parameter modes (`var`, `own`, a borrow) apply to interface
+  parameters as to class ones.
 
-> **Being built.** Calling an interface's members through an interface value,
-> default member bodies, `as?` downcasts and the compiler-API operations
-> (`declareInterface`, `addConformance`, `conformances`, `implementers`,
-> `witness`) come next. After them: `extend Square : Printable` for classes you
-> don't own, interface inheritance, `resource interface`, and
-> `sealed interface` with exhaustive `when (x) { is A -> … }`.
+```abla
+import "abla/io"
+
+interface Printable {
+    fun print(): string
+}
+
+class Point(val x: int, val y: int)
+
+fun Point.print(): string = "($x, $y)"
+
+extend Point : Printable
+
+fun show(item: Printable): string {
+    val point = item as? Point
+    if (point != null) "point ${point.print()}" else item.print()
+}
+
+fun main {
+    println(show(Point(1, 2)))
+}
+// output:
+// point (1, 2)
+```
+
+An interface value is the instance itself, so taking one costs nothing and
+an object's layout never depends on its interfaces. A call through one
+compares the instance's class with each class that conforms and calls that
+class's witness. An instance of any other class goes to the runtime's one
+fallback, which stops the program with `interface.no-witness:Shape:#<class>`.
+That can't happen in a program today: an interface value only ever comes from a
+class that conforms. The fallback is where a conformance added at run time
+would be found.
+
+Compile-time code (`#`) calls through interfaces with the same results, an
+interface value made at compile time lifts into the program as its instance,
+and the [compiler API](compiler-api.md#interfaces) reads and declares
+interfaces and conformances.
+
+> **Still to come.** Interfaces extending other interfaces
+> (`interface Solid : Shape`, `interface.inheritance` today), `resource
+> interface`, `sealed interface` with an exhaustive `when (x) { is A -> … }`,
+> and generic interfaces (`interface Source<T>`).
 
 ## Delegated bindings
 

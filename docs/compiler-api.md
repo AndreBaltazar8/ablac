@@ -101,6 +101,7 @@ fails, never reporting a change it then drops.
 | `transform(handler)` | register a transform (only as a literal top-level action) |
 | `replaceFunctionBody(function, source)`, `addFunctionAnnotation(function, name)` | change the program, from a transform |
 | `extensionFields(type)`, `fieldsOf(type, includeExtensions)`, `addExtensionField(type, name, fieldType, initial, mutable)`, `removeExtensionField(type, name)` | a class's [extension fields](#extension-fields) |
+| `conformances(type)`, `conformsTo(type, interface)`, `implementers(interface)`, `witness(type, interface)`, `declareInterface(name, members, parents)`, `addConformance(type, interface, members)` | [interfaces](#interfaces) and the classes conforming to them |
 | `function(name)`, `reference(handle)` | a `FunctionReference`, for building other programs |
 | `newModule(name)` | an `IndependentModule`: a separate program built from chosen functions ([below](#independent-modules-and-declaration-blocks)) |
 | `buildProgram(...)`, `defineTarget(...)`, `contributeArtifactRoot(...)` | [programmable builds](programmable-builds.md) |
@@ -354,6 +355,71 @@ fun main {
 `compilerExtensionFieldCount`, `compilerExtensionFieldName`,
 `compilerExtensionFieldType` and `compilerExtensionFieldIsMutable` are the
 versioned ABI underneath.
+
+## Interfaces
+
+[Interfaces](language.md#interfaces) and conformances can be read and declared
+as the syntax does. A class is a handle (`compiler.findClass(name)`), and an
+interface is its name:
+
+- `compiler.conformances(type)` lists the interfaces the class conforms to: the
+  ones it declares, then the ones `extend` adds.
+- `compiler.conformsTo(type, interface)` checks one interface.
+- `compiler.implementers(interface)` lists the classes conforming to an
+  interface, in declaration order.
+- `compiler.witness(type, interface)` says what answers each member for the
+  class, as `member:kind`. The kind is `method` (the class's own), `extension`
+  (an extension function), `default` (the interface's body) or `missing`.
+
+From a transform:
+
+- `compiler.declareInterface(name, members)` declares an interface. Each
+  member is given as source (`fun area(): f64`, or with a default body).
+- `compiler.addConformance(type, interface, members)` is the programmatic
+  `extend`. It makes the class conform, and adds each member's source as an
+  extension function of the class. A member's source is written like a
+  method, starting with `fun`, and `this` is the instance.
+
+Like any program change, these take effect when the transforms have run,
+before analysis. So a derive written in Abla reads `fieldsOf` and adds a
+conformance with members it generates:
+
+```abla
+import "abla/io"
+import "abla/compiler"
+
+interface Describe {
+    fun describe(): string
+}
+
+class Point(val x: int, val y: int)
+
+compile fun derive(): void {
+    val point = compiler.findClass("Point")
+    var parts = ""
+    for (field in compiler.fieldsOf(point)) {
+        parts = if (parts == "") "$field=\${this.$field}"
+            else "$parts, $field=\${this.$field}"
+    }
+    compiler.addConformance(point, "Describe", ["fun describe(): string = \"Point($parts)\""])
+    return
+}
+
+#compiler.transform(derive)
+
+fun main {
+    val described: Describe = Point(1, 2)
+    println(described.describe())
+}
+// output:
+// Point(x=1, y=2)
+```
+
+`compilerConformanceCount`, `compilerConformanceName`,
+`compilerImplementerCount`, `compilerImplementerName`, `compilerWitnessCount`,
+`compilerWitnessEntry`, `compilerDeclareInterface` and `compilerAddConformance`
+are the versioned ABI underneath. A request outside a transform, or without a
+class handle and an interface name, is `E_COMPILER_TRANSFORM_INTERFACE`.
 
 ## Binding reflection
 
