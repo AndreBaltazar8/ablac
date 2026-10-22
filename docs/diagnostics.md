@@ -150,9 +150,9 @@ in [ownership.md](ownership.md#reading-ownership-diagnostics).
 `stm.outside-atomic`, `stm.effect:<effect>`, `stm.resource`,
 `stm.outside-mutation`, `stm.control:return` and `stm.orElse-type` are
 explained in [language.md](language.md#what-a-transaction-may-do).
-`tvar.arity`, `tvar.member:<name>`, `tvar.getValue.arity`,
-`tvar.setValue.arity` and `tvar.setValue.value:<T>:<actual>` are a misused
-`TVar` (it has only `getValue()` and `setValue(value)`).
+A misused `TVar` is reported as a class's would be (it has a constructor of
+one argument, `getValue()` and `setValue(value)`): `constructor.arity:TVar`,
+`method.unknown`, `method.arity`, `method.argument`.
 
 ## Regions
 

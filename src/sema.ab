@@ -1540,13 +1540,54 @@ fun bootstrapMutexElementType(type: string): string {
 fun bootstrapIsCellType(type: string): bool =
     type.size >= 5 && type.slice(0, 5) == "cell:"
 
-// `TVar<T>` is `tvar:T`: a transactional variable (a delegate whose getValue
-// and setValue go through the running transaction).
+// ---- TVar<T>, built in until generics land ----
+// `TVar<T>` is `tvar:T`: a transactional variable, shaped as the library class
+// it will be:
+//
+//   class TVar<T>(value: T) {      // T neither a resource nor affine
+//       fun getValue(): T          // the transaction's read
+//       fun setValue(value: T): void   // the transaction's write
+//   }
+//
+// Its methods answer the ordinary method queries (methodResultType,
+// methodParameterCount, methodParameterType), so calls, delegation (`by
+// TVar(…)`) and their diagnostics are a class's; lowering maps them to the
+// runtime (ir.ab: __ablaRuntimeTVarCreate, __ablaRuntimeStmRead/Write).
 fun bootstrapIsTVarType(type: string): bool =
     type.size >= 5 && type.slice(0, 5) == "tvar:"
 
 fun bootstrapTVarElementType(type: string): string =
     if (bootstrapIsTVarType(type)) type.slice(5, type.size) else "unknown"
+
+fun bootstrapTVarMethodParameters(method: string): int =
+    if (method == "getValue") 0 else if (method == "setValue") 1 else -1
+
+fun bootstrapTVarMethodResult(owner: string, method: string): string =
+    if (method == "getValue") bootstrapTVarElementType(owner)
+    else if (method == "setValue") "void" else "unknown"
+
+fun bootstrapTVarMethodParameter(owner: string, method: string, parameter: int): string =
+    if (method == "setValue" && parameter == 0) bootstrapTVarElementType(owner) else "unknown"
+
+@noinline
+fun bootstrapInferCallTVar(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1) {
+        analyzer.fail("constructor.arity:TVar")
+        result = "unknown"
+    } else {
+        val element = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
+        // An aborted attempt would skip a resource's drop, or drop it twice.
+        if (analyzer.typeIsAffine(element)) analyzer.fail("stm.resource:TVar<$element>")
+        result = "tvar:$element"
+    }
+    result
+}
+// ---- end of TVar<T> ----
 
 // Map<K, V> is `map:K:V`; K is string or i64 (or unknown for an untyped
 // `Map()`), so the colon after it always ends the key.
@@ -7926,10 +7967,7 @@ class BootstrapAnalyzer(
     }
 
     fun methodResultType(owner: string, method: string, at: int = -1): string {
-        if (bootstrapIsTVarType(owner)) {
-            return if (method == "getValue") bootstrapTVarElementType(owner)
-                else if (method == "setValue") "void" else "unknown"
-        }
+        if (bootstrapIsTVarType(owner)) return bootstrapTVarMethodResult(owner, method)
         var result = "unknown"
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -7951,9 +7989,7 @@ class BootstrapAnalyzer(
     }
 
     fun methodParameterCount(owner: string, method: string): int {
-        if (bootstrapIsTVarType(owner)) {
-            return if (method == "getValue") 0 else if (method == "setValue") 1 else -1
-        }
+        if (bootstrapIsTVarType(owner)) return bootstrapTVarMethodParameters(method)
         var result = -1
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -7963,7 +7999,7 @@ class BootstrapAnalyzer(
     }
 
     fun methodRequiredParameterCount(owner: string, method: string): int {
-        if (bootstrapIsTVarType(owner)) return this.methodParameterCount(owner, method)
+        if (bootstrapIsTVarType(owner)) return bootstrapTVarMethodParameters(method)
         var result = -1
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -7987,10 +8023,7 @@ class BootstrapAnalyzer(
         method: string,
         parameter: int
     ): string {
-        if (bootstrapIsTVarType(owner)) {
-            return if (method == "setValue" && parameter == 0) bootstrapTVarElementType(owner)
-                else "unknown"
-        }
+        if (bootstrapIsTVarType(owner)) return bootstrapTVarMethodParameter(owner, method, parameter)
         var result = "unknown"
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -12001,25 +12034,6 @@ fun bootstrapInferCallMap(
 }
 
 @noinline
-fun bootstrapInferCallTVar(
-    var analyzer: BootstrapAnalyzer,
-    expression: BootstrapExpression,
-    initial: string
-): string {
-    var result = initial
-    if (expression.children.size != 1) {
-        analyzer.fail("tvar.arity")
-        result = "unknown"
-    } else {
-        val element = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
-        // An aborted attempt would skip a resource's drop, or drop it twice.
-        if (analyzer.typeIsAffine(element)) analyzer.fail("stm.resource:TVar<$element>")
-        result = "tvar:$element"
-    }
-    result
-}
-
-@noinline
 fun bootstrapInferCallCell(
     var analyzer: BootstrapAnalyzer,
     expression: BootstrapExpression,
@@ -12688,28 +12702,6 @@ fun bootstrapInferMemberCall(
         (bootstrapIsMapBuiltinMethod(expression.text) ||
          analyzer.methodParameterCount(receiver, expression.text) < 0)) {
         result = analyzer.inferMapCall(expression, rawReceiver, receiver)
-    } else if (bootstrapIsTVarType(receiver)) {
-        val element = bootstrapTVarElementType(receiver)
-        analyzer.stmNote("access", -1, expression.begin, "${expression.text}()")
-        if (expression.text == "getValue") {
-            if (expression.children.size != 1) analyzer.fail("tvar.getValue.arity")
-            result = element
-        } else if (expression.text == "setValue") {
-            if (expression.children.size != 2) {
-                analyzer.fail("tvar.setValue.arity")
-            } else {
-                analyzer.contextualizeLambdaParameters(expression.children[1], element)
-                analyzer.contextualizeArrayLiteral(expression.children[1], element)
-                val value = analyzer.infer(expression.children[1])
-                if (!bootstrapTypesCompatible(element, value)) {
-                    analyzer.fail("tvar.setValue.value:$element:$value")
-                }
-            }
-            result = "void"
-        } else {
-            analyzer.fail("tvar.member:${expression.text}")
-            result = "unknown"
-        }
     } else if (bootstrapIsCellType(receiver)) {
         val element = bootstrapCellElementType(receiver)
         if (expression.text == "get") {
@@ -12894,6 +12886,10 @@ fun bootstrapInferMemberCall(
             analyzer, bootstrapMemberCallAsValueCall(expression), result
         )
     } else {
+        // A TVar's getValue and setValue are its transaction's reads and writes.
+        if (bootstrapIsTVarType(receiver)) {
+            analyzer.stmNote("access", -1, expression.begin, "${expression.text}()")
+        }
         val receiverKind = analyzer.methodReceiverKind(
             receiver,
             expression.text

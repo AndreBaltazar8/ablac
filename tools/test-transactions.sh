@@ -43,6 +43,15 @@ for program in surface-bank surface-channel; do
     done
 done
 
+# One thread in a WebAssembly module (direct transactions, orElse).
+if command -v node >/dev/null 2>&1; then wasm_runner=node; else wasm_runner=bun; fi
+(cd "$project_root" && "$compiler" build tests/cases/stm/surface-build.ab \
+    -o "$output_directory/wasm-driver" --no-cache > "$output_directory/wasm-driver.log" 2>&1) ||
+    { cat "$output_directory/wasm-driver.log" >&2; exit 1; }
+(cd "$project_root" && "$output_directory/wasm-driver")
+wasm_output=$("$wasm_runner" "$project_root/tests/cases/stm/run.mjs" "$output_directory/transactions.wasm")
+[[ $wasm_output == 0 ]] || { echo "transactions (WebAssembly): $wasm_output failed" >&2; exit 1; }
+
 fixtures=(
     outside-direct outside-helper outside-lambda outside-retry
     effect-io effect-fs effect-thread effect-delegate effect-native
@@ -81,4 +90,4 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     index=$((index + 1))
 done
 
-printf 'transactions: semantics (both evaluators), bank and channel under contention (%s runs each), and every check passed\n' "$runs"
+printf 'transactions: semantics (both evaluators, WebAssembly), bank and channel under contention (%s runs each), and every check passed\n' "$runs"
