@@ -1726,9 +1726,7 @@ fun main {
 - **The body is checked once**, with each type parameter a type that has
   nothing but what every type has (`==`, being passed and stored). Calling
   a method or reading a field of a `T` is an error at the generic
-  (`member:T.size`). Bounds that let a body call an interface's methods
-  (`<T : Shape>`) come with interfaces; until then they are
-  `generic.bound-not-supported`.
+  (`member:T.size`), unless a bound gives it that member (below).
 - **Each instance is checked too**, with its own types. Ownership follows
   the type arguments: an instance holding a resource is a resource
   (`Box<Ticket>` is one, `Box<int>` is not), and an error that only an
@@ -1757,6 +1755,68 @@ fun main {
   `where` clauses are reserved syntax.
 - **At compile time** generics behave as at run time: `#first([1, 2])`
   evaluates the instance the call names.
+
+### Bounds
+
+`<T : Shape>` bounds a type parameter by an interface, and `<T : Shape &
+Named>` by several. The body may then call the bounds' members on a `T`
+(and pass a `T` where a `Shape` is expected), and every type argument must
+be the interface or a class conforming to it, declared or by `extend`.
+Each instance calls its class's own method, with no dispatch; an interface
+type argument (`totalArea<Shape>(…)`) dispatches as any interface value
+does.
+
+```abla
+import "abla/io"
+
+interface Shape {
+    fun area(): int
+}
+
+interface Named {
+    fun name(): string
+}
+
+class Square(val side: int) : Shape, Named {
+    fun area(): int = this.side * this.side
+    fun name(): string = "square"
+}
+
+class Rect(val width: int, val height: int) : Shape {
+    fun area(): int = this.width * this.height
+}
+
+fun <T : Shape> totalArea(items: array<T>): int {
+    var total = 0
+    for (item in items) total = total + item.area()
+    total
+}
+
+fun <T : Shape & Named> describe(item: T): string = "${item.name()} of ${item.area()}"
+
+class Gallery<T : Shape>(val items: array<T>) {
+    fun largest(): int {
+        var best = 0
+        for (item in this.items) if (item.area() > best) best = item.area()
+        best
+    }
+}
+
+fun main {
+    println("${totalArea([Square(2), Square(3)])} ${totalArea([Rect(2, 5)])}")
+    println(describe(Square(4)))
+    println("${Gallery([Rect(1, 2), Rect(3, 3)]).largest()}")
+}
+// output:
+// 13 10
+// square of 16
+// 9
+```
+
+A type argument that doesn't satisfy a bound is
+`generic.bound:<f>:<T>:<type>:<interface>` (`totalArea([1, 2])`, or
+`Gallery<string>` written as a type), and a bound that names no interface
+is `generic.bound-not-interface:<f>:<T>:<bound>`.
 
 ## Expressions and operators
 

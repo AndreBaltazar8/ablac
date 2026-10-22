@@ -132,7 +132,8 @@ only its parse errors.
 | `generic.arity:<f>:<expected>:<written>` | the wrong number of type arguments written out, or a generic class's type with the wrong number |
 | `generic.instantiation-depth:<f>` | `f`'s instances make ever larger instances (`f(Box(x))` in `f`) |
 | `generic.overload:<f>` | a generic function sharing its name (and receiver) with another function |
-| `generic.bound-not-supported:<f>:<T>:<bound>` | a bounded type parameter (`<T : Shape>`), not supported yet |
+| `generic.bound:<f>:<T>:<type>:<interface>` | a type argument that is not the bound interface and doesn't conform to it ([bounds](language.md#bounds)) |
+| `generic.bound-not-interface:<f>:<T>:<bound>` | a type parameter's bound that names no interface |
 | `generic.method-not-supported:<C>.<m>` | a method with type parameters of its own |
 | `generic.reference:<f>` | a generic function used as a value rather than called |
 | `context[generic-instance]: <instance>` | a record after a diagnostic placed in a generic's body: the instance (`twice<Ticket>`) in which it is an error |

@@ -49,7 +49,10 @@ class BootstrapGenericState(
     var failed: BootstrapStringSet,
     var runaway: BootstrapStringSet,
     // What the pass reports itself (bootstrapInstantiateGenerics counts it).
-    var diagnostics: string
+    var diagnostics: string,
+    // The program's declarations and the type parameters' own, for whether
+    // a type argument satisfies a bound (bootstrapGenericSatisfies).
+    val conformers: array<BootstrapDeclaration>
 )
 
 fun bootstrapGenericError(var state: BootstrapGenericState, code: string, declaration: BootstrapDeclaration): void {
@@ -133,6 +136,23 @@ fun bootstrapGenericRewriteExpression(
                     state.failed.add(name)
                 }
                 text = if (kind == "type") "unknown" else "array<unknown>"
+            } else if (template >= 0) {
+                // `Box<int>` where `Box<T : Shape>`: each argument satisfies its bound.
+                val arguments = bootstrapGenericInstanceArguments(name)
+                var parameter = 0
+                for (written in state.table.declarations[template].typeParameters) {
+                    for (bound in bootstrapGenericParameterBounds(written)) {
+                        if (parameter < arguments.size &&
+                            !bootstrapGenericSatisfies(state.conformers, state.table, arguments[parameter], bound)) {
+                            if (!state.failed.contains(name)) {
+                                state.diagnostics = "${state.diagnostics}error[E_SEMANTIC]: generic.bound:${bootstrapSourceVisibleType(state.table.names[template])}:${bootstrapGenericParameterName(written)}:${bootstrapSourceVisibleType(arguments[parameter])}:${bootstrapSourceVisibleType(bound)}\nsource[semantic]:$identity:${expression.begin}:${if (expression.end > expression.begin) expression.end else expression.begin + 1}\n"
+                                state.failed.add(name)
+                            }
+                            text = if (kind == "type") "unknown" else "array<unknown>"
+                        }
+                    }
+                    parameter = parameter + 1
+                }
             }
             request = request + 1
         }
@@ -285,6 +305,49 @@ fun bootstrapGenericCopyOwned(declaration: BootstrapDeclaration, affine: array<s
 
 /** Makes every instance requested (and those its types and written calls
  *  name in turn). */
+/** The function `name` (bootstrapGenericDefaultCaller): `fun
+ *  label__abla_default_Shape(receiver: Shape, …) = receiver.label(…)`. An
+ *  instance's call of a bound's default member goes through it, so the
+ *  interface's body runs with the instance as `this`. */
+fun bootstrapGenericMakeDefaultCaller(var state: BootstrapGenericState, name: string): void {
+    val mark = bootstrapGenericFind(name, BOOTSTRAP_GENERIC_DEFAULT_MARK, 0)
+    val memberName = name.slice(0, mark)
+    val interfaceName = bootstrapGenericUnescape(name.slice(mark + BOOTSTRAP_GENERIC_DEFAULT_MARK.size, name.size))
+    val found = bootstrapInterfaceIndexIn(state.conformers, interfaceName)
+    if (found < 0) return
+    val owner = state.conformers[found]
+    for (member in bootstrapInterfaceAllMembers(state.conformers, interfaceName)) {
+        if (member.name == memberName) {
+            // Each node its own span inside the member's, so what the
+            // analysis keeps per node stays apart.
+            var at = member.begin
+            val receiver = "__abla_default_receiver"
+            val parameters = [receiver]
+            val types = [interfaceName]
+            val kinds = ["parameter"]
+            val arguments = [BootstrapExpression("identifier", receiver, at, at + 1, [])]
+            var index = 0
+            while (index < member.parameters.size) {
+                at = at + 1
+                parameters.append(member.parameters[index])
+                types.append(member.parameterTypes[index])
+                kinds.append(if (index < member.parameterKinds.size) member.parameterKinds[index] else "parameter")
+                arguments.append(BootstrapExpression("identifier", member.parameters[index], at, at + 1, []))
+                index = index + 1
+            }
+            val call = BootstrapExpression("member.call", memberName, member.begin, member.end, arguments)
+            state.instances.append(BootstrapDeclaration(
+                "fun", name, member.begin, member.end, call, parameters, types, member.resultType,
+                [], [], "", kinds, "", false, false, false, "", 0, 0, [], [], [], [],
+                "${owner.sourceIdentity}$BOOTSTRAP_GENERIC_SOURCE_MARK$name"
+            ))
+            state.fresh.add(name)
+            return
+        }
+    }
+    return
+}
+
 fun bootstrapGenericMakeRequested(var state: BootstrapGenericState): void {
     var next = 0
     while (next < state.requests.size) {
@@ -292,6 +355,10 @@ fun bootstrapGenericMakeRequested(var state: BootstrapGenericState): void {
         next = next + 1
         if (state.instanceNames.contains(name)) continue
         state.instanceNames.add(name)
+        if (bootstrapGenericFind(name, BOOTSTRAP_GENERIC_DEFAULT_MARK, 0) >= 0) {
+            bootstrapGenericMakeDefaultCaller(state, name)
+            continue
+        }
         val template = state.table.findId(bootstrapGenericInstanceGeneric(name))
         if (template < 0) continue
         val declaration = state.table.declarations[template]
@@ -613,14 +680,21 @@ fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseRe
     var state = BootstrapGenericState(
         BootstrapGenericTable(ids, names, owners, templates, false, bootstrapStringSet()),
         [], bootstrapStringSet(), [], bootstrapStringSet(), bootstrapStringSet(),
-        bootstrapStringSet(), ""
+        bootstrapStringSet(), "", []
     )
+    for (declaration in source) state.conformers.append(declaration)
 
-    // What v1 refuses.
+    // A bound names an interface; what v1 refuses.
     for (declaration in source) {
         for (parameter in declaration.typeParameters) {
-            if (bootstrapGenericFind(parameter, ":", 0) >= 0) {
-                bootstrapGenericError(state, "generic.bound-not-supported:${declaration.name}:$parameter", declaration)
+            for (bound in bootstrapGenericParameterBounds(parameter)) {
+                if (bootstrapInterfaceIndexIn(source, bound) < 0) {
+                    bootstrapGenericError(
+                        state,
+                        "generic.bound-not-interface:${bootstrapSourceVisibleType(declaration.name)}:${bootstrapGenericParameterName(parameter)}:${bootstrapSourceVisibleType(bound)}",
+                        declaration
+                    )
+                }
             }
         }
         for (method in declaration.methods) {
@@ -658,15 +732,25 @@ fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseRe
     while (template < templates.size) {
         val declaration = templates[template]
         val arguments: array<string> = []
-        for (parameter in bootstrapGenericParameterNames(declaration)) {
-            val name = bootstrapGenericParameterClass(ids[template], parameter)
+        for (parameter in declaration.typeParameters) {
+            val name = bootstrapGenericParameterClass(ids[template], bootstrapGenericParameterName(parameter))
             arguments.append(name)
-            parameterClasses.append(BootstrapDeclaration(
-                "class", name, declaration.begin, declaration.begin,
+            // A bounded parameter is an interface inheriting its bounds: the
+            // body may call their members (a resource bound makes it one).
+            val bounds = bootstrapGenericParameterBounds(parameter)
+            var affine = false
+            for (bound in bounds) {
+                val found = bootstrapInterfaceIndexIn(source, bound)
+                if (found >= 0 && source[found].isResource) affine = true
+            }
+            val placeholder = BootstrapDeclaration(
+                if (bounds.size > 0) "interface" else "class", name, declaration.begin, declaration.begin,
                 BootstrapExpression("missing", "", declaration.begin, declaration.begin, []),
-                [], [], "inferred", [], [], "", [], "", false, false, false, "", 0, 0,
-                [], [], [], [], declaration.sourceIdentity, []
-            ))
+                [], [], "inferred", [], [], "", [], "", false, affine, false, "", 0, 0,
+                [], [], [], [], declaration.sourceIdentity, bounds
+            )
+            parameterClasses.append(placeholder)
+            state.conformers.append(placeholder)
         }
         state.requests.append(bootstrapGenericInstanceName(ids[template], arguments))
         template = template + 1

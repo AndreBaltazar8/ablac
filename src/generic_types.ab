@@ -19,6 +19,10 @@ val BOOTSTRAP_GENERIC_PARAMETER_MARK = "__abla_tparam_"
 // facts the analysis keeps per node are keyed by source identity and span, and
 // every instance's nodes share their generic's spans.
 val BOOTSTRAP_GENERIC_SOURCE_MARK = "\u{1f}"
+// Names the function an instance calls a bound's default member through
+// (`label__abla_default_Shape`), when the type argument's class doesn't
+// define the member itself (bootstrapGenericInferDefaultCall).
+val BOOTSTRAP_GENERIC_DEFAULT_MARK = "__abla_default_"
 // Tells apart calls of generics that share one span: a default or a delegate
 // (`by`) is filled in at each call of what declares it (module.ab) with its
 // own spans, so two calls of `Tracked<T>` in one file hold its delegate's
@@ -546,12 +550,51 @@ fun bootstrapGenericSubstituteWords(
 /** A generic's type parameters' names (`T` of `T:Shape`). */
 fun bootstrapGenericParameterNames(declaration: BootstrapDeclaration): array<string> {
     val names: array<string> = []
-    for (parameter in declaration.typeParameters) {
-        var end = 0
-        while (end < parameter.size && parameter[end] != 58) end = end + 1
-        names.append(parameter.slice(0, end))
-    }
+    for (parameter in declaration.typeParameters) names.append(bootstrapGenericParameterName(parameter))
     names
+}
+
+/** A type parameter's name, without its bounds (`T:Shape` is `T`). */
+fun bootstrapGenericParameterName(parameter: string): string {
+    var end = 0
+    while (end < parameter.size && parameter[end] != 58) end = end + 1
+    parameter.slice(0, end)
+}
+
+/** A type parameter's bounds as written: `T:Shape&Named` is Shape, Named. */
+fun bootstrapGenericParameterBounds(parameter: string): array<string> {
+    val bounds: array<string> = []
+    var index = 0
+    while (index < parameter.size && parameter[index] != 58) index = index + 1
+    var begin = index + 1
+    var end = begin
+    while (end <= parameter.size) {
+        if (end == parameter.size || parameter[end] == 38) {
+            if (end > begin) bounds.append(bootstrapNormalizeType(parameter.slice(begin, end)))
+            begin = end + 1
+        }
+        end = end + 1
+    }
+    bounds
+}
+
+/** Whether the type argument `type` satisfies the bound `bound` (an
+ *  interface): it is the interface or conforms to it. An instance conforms
+ *  as its generic class declares, before the instance itself is made. */
+fun bootstrapGenericSatisfies(
+    declarations: array<BootstrapDeclaration>,
+    table: BootstrapGenericTable,
+    type: string,
+    bound: string
+): bool {
+    if (bootstrapTypeConformsIn(declarations, type, bound)) return true
+    val template = table.findId(bootstrapGenericInstanceGeneric(type))
+    if (template < 0 || table.declarations[template].kind != "class") return false
+    for (conformance in table.declarations[template].conformances) {
+        val name = bootstrapNormalizeType(conformance)
+        if (name == bound || bootstrapTypeConformsIn(declarations, name, bound)) return true
+    }
+    false
 }
 
 /** The generics of a program, for the probe that types their uses
@@ -752,6 +795,10 @@ fun bootstrapGenericBind(
 ): BootstrapGenericInstanceCall {
     // What the generic says, before any argument is typed (which changes the analyzer).
     val parameters = bootstrapGenericParameterNames(analyzer.generics.declarations[template])
+    val bounds: array<array<string>> = []
+    for (parameter in analyzer.generics.declarations[template].typeParameters) {
+        bounds.append(bootstrapGenericParameterBounds(parameter))
+    }
     val declared: array<string> = []
     for (name in analyzer.generics.declarations[template].parameters) declared.append(name)
     val patterns: array<BootstrapGenericType> = []
@@ -867,6 +914,20 @@ fun bootstrapGenericBind(
         }
         index = index + 1
     }
+    // Each type argument satisfies its parameter's bounds.
+    index = 0
+    while (index < parameters.size) {
+        for (bound in bounds[index]) {
+            if (!bootstrapGenericSatisfies(analyzer.declarations, analyzer.generics, bindings[index], bound)) {
+                bootstrapGenericFailure(
+                    analyzer, expression,
+                    "generic.bound:$visible:${parameters[index]}:${bootstrapSourceVisibleType(bindings[index])}:${bootstrapSourceVisibleType(bound)}"
+                )
+                return BootstrapGenericInstanceCall("", parameters, bindings)
+            }
+        }
+        index = index + 1
+    }
     val name = bootstrapGenericInstanceName(id, bindings)
     analyzer.genericRequests.append(name)
     BootstrapGenericInstanceCall(name, parameters, bindings)
@@ -933,10 +994,10 @@ fun bootstrapGenericInferMemberCall(
     receiver: string
 ): string {
     val name = bootstrapGenericCalleeName(expression.text)
-    if (!analyzer.generics.hasExtension(name)) return ""
+    if (!analyzer.generics.hasExtension(name)) return bootstrapGenericInferDefaultCall(analyzer, expression, receiver)
     val actual = bootstrapBorrowElementType(receiver)
     val chosen = bootstrapGenericExtensionFor(analyzer.generics, name, actual)
-    if (chosen < 0) return ""
+    if (chosen < 0) return bootstrapGenericInferDefaultCall(analyzer, expression, receiver)
     val module = analyzer.generics.declarations[chosen].sourceIdentity
     if (analyzer.generics.declarations[chosen].isPrivate &&
         module != bootstrapGenericSourceFile(analyzer.currentSourceIdentity)) {
@@ -951,6 +1012,49 @@ fun bootstrapGenericInferMemberCall(
     ))
     bootstrapGenericResultType(analyzer, chosen, call)
 }
+
+/** In an instance's body, a call of a member the receiver's class gets
+ *  only from an interface's default body (`item.label()` where `T : Shape`
+ *  became a class without `label`): a class has no such member of its own,
+ *  so the call goes through the interface, to a function taking it
+ *  (bootstrapGenericDefaultCaller). Its result type, else "". */
+fun bootstrapGenericInferDefaultCall(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    receiver: string
+): string {
+    if (!bootstrapGenericSourceIsInstance(analyzer.currentSourceIdentity)) return ""
+    val owner = bootstrapBorrowElementType(receiver)
+    val found = analyzer.typeDeclarations.find(owner)
+    if (found < 0 || analyzer.declarations[found].kind != "class" ||
+        analyzer.declarations[found].name != owner) return ""
+    val provider = bootstrapDefaultInterface(analyzer.declarations, owner, expression.text)
+    if (provider == "" || provider == "?") return ""
+    val interfaceIndex = bootstrapInterfaceIndexIn(analyzer.declarations, provider)
+    if (interfaceIndex < 0) return ""
+    var resultType = ""
+    for (member in bootstrapInterfaceAllMembers(analyzer.declarations, provider)) {
+        if (member.name == expression.text && bootstrapWitnessKind(
+            analyzer.declarations, analyzer.declarations[found], analyzer.declarations[interfaceIndex], member
+        ) == "default") resultType = "${member.resultType}"
+    }
+    if (resultType == "") return ""
+    var child = 1
+    while (child < expression.children.size) {
+        analyzer.infer(expression.children[child])
+        child = child + 1
+    }
+    val caller = bootstrapGenericDefaultCaller(provider, expression.text)
+    analyzer.genericResolutions.append(BootstrapOverloadResolution(
+        analyzer.currentSourceIdentity, expression.begin, expression.end,
+        expression.kind, expression.text, "call", caller
+    ))
+    analyzer.genericRequests.append(caller)
+    if (resultType == "inferred") "unknown" else bootstrapNormalizeType(resultType)
+}
+
+fun bootstrapGenericDefaultCaller(interfaceName: string, member: string): string =
+    "$member$BOOTSTRAP_GENERIC_DEFAULT_MARK${bootstrapGenericEscape(interfaceName)}"
 
 /** The generic extension `name` whose receiver type matches `actual`, else -1. */
 fun bootstrapGenericExtensionFor(table: BootstrapGenericTable, name: string, actual: string): int {
