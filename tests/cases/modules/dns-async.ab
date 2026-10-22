@@ -2,40 +2,40 @@ import "abla/io"
 import "abla/bytes"
 import "abla/dns"
 import "abla/dns/async"
+import "abla/fs"
 import "abla/http/async"
 import "abla/http/event"
+import "abla/process"
 
-// abla/dns's nonblocking resolver against a mock name server: a forked child
-// answers on 127.0.0.1 (an ephemeral port, the resolver's nameserverPort).
-// It answers A/AAAA for a.test, drops the first query for resend.test, sends a
-// reply with the wrong identifier before the right one for noise.test,
-// answers NXDOMAIN for nx.test, no A record for v6only.test, 127.0.0.1 for
-// web.test, and nothing for any other name. A second child serves HTTP, so
-// HttpAsyncClient resolves web.test through the same resolver.
+// abla/dns's resolvers (blocking dnsResolveType and the nonblocking
+// DnsAsyncResolver) against a mock name server: a forked child answering on
+// 127.0.0.1 (an ephemeral port, the resolvers' nameserverPort), with written
+// resolv.conf and hosts files. A second child serves HTTP, so HttpAsyncClient
+// resolves through the same resolver.
+//
+// The mock answers A/AAAA for a.test; drops the first query for resend.test;
+// sends a reply with the wrong identifier before the right one for
+// noise.test, an NXDOMAIN for another question before the answer for
+// spoofnx.test, an NXDOMAIN from another port before the answer for
+// wrongsource.test; SERVFAIL for servfail.test; no A record for v6only.test;
+// 127.0.0.1 for web.test and web.ns.svc.cluster.local; 10.2.2.2 for
+// redis.ns.svc.cluster.local, 10.3.3.3 for api.svc.cluster.local; nothing
+// for a name starting with "silent"; NXDOMAIN for any other name.
 
-fun mockAnswer(
-    var output: ByteBuffer,
-    recordType: int,
-    data: array<int>
-): void {
-    dnsAppendU16(output, 49164) // name: a pointer to the question's name
+fun mockQuestion(var output: ByteBuffer, name: string, recordType: int): void {
+    output.appendText(dnsEncodeName(name))
     dnsAppendU16(output, recordType)
     dnsAppendU16(output, 1)
-    dnsAppendU16(output, 0)
-    dnsAppendU16(output, 30) // TTL 30 seconds
-    dnsAppendU16(output, data.size)
-    for (byte in data) output.appendByteValue(byte)
     return
 }
 
 fun mockReply(
-    request: string,
     identifier: int,
-    rcode: int,
+    name: string,
     recordType: int,
+    rcode: int,
     data: array<int>
 ): string {
-    val name = dnsDecodeName(request, 12)
     val output = byteBuffer()
     dnsAppendU16(output, identifier)
     dnsAppendU16(output, 33152 + rcode)
@@ -43,47 +43,65 @@ fun mockReply(
     dnsAppendU16(output, if (data.size > 0) 1 else 0)
     dnsAppendU16(output, 0)
     dnsAppendU16(output, 0)
-    output.appendText(request.slice(12, name.nextOffset + 4))
-    if (data.size > 0) mockAnswer(output, recordType, data)
+    mockQuestion(output, name, recordType)
+    if (data.size > 0) {
+        dnsAppendU16(output, 49164) // the question's name
+        dnsAppendU16(output, if (data.size == 16) 28 else 1)
+        dnsAppendU16(output, 1)
+        dnsAppendU16(output, 0)
+        dnsAppendU16(output, 30) // TTL 30 seconds
+        dnsAppendU16(output, data.size)
+        for (byte in data) output.appendByteValue(byte)
+    }
     output.toText()
 }
 
-fun mockServe(socket: UdpSocket): int {
+fun mockServe(socket: UdpSocket, other: UdpSocket): int {
     var resendSeen = 0
     var loops = 0
-    while (loops < 300) {
+    while (loops < 400) {
         val request = socket.receiveFromWithTimeout(4096, 100)
         if (request.received && request.bytes.size > 12) {
             val bytes = request.bytes
-            val identifier = dnsReadU16(bytes, 0)
-            val name = dnsDecodeName(bytes, 12)
-            val recordType = dnsReadU16(bytes, name.nextOffset)
-            val ipv6: array<int> = [253, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-            val loopback6: array<int> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+            val id = dnsReadU16(bytes, 0)
+            val question = dnsDecodeName(bytes, 12)
+            val name = question.name
+            val kind = dnsReadU16(bytes, question.nextOffset)
             val none: array<int> = []
             var reply = ""
-            if (name.name == "a.test") {
-                reply = if (recordType == 28) mockReply(bytes, identifier, 0, 28, ipv6)
-                    else mockReply(bytes, identifier, 0, 1, [10, 1, 2, 3])
-            } else if (name.name == "resend.test") {
+            if (name == "a.test") {
+                reply = if (kind == 28) mockReply(id, name, kind, 0,
+                    [253, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+                    else mockReply(id, name, kind, 0, [10, 1, 2, 3])
+            } else if (name == "resend.test") {
                 resendSeen = resendSeen + 1
-                if (resendSeen > 1) {
-                    reply = mockReply(bytes, identifier, 0, 1, [10, 9, 9, 9])
-                }
-            } else if (name.name == "noise.test") {
+                if (resendSeen > 1) reply = mockReply(id, name, kind, 0, [10, 9, 9, 9])
+            } else if (name == "noise.test") {
                 socket.sendTo(
-                    mockReply(bytes, (identifier + 1) % 65536, 0, 1, [10, 6, 6, 6]),
+                    mockReply((id + 1) % 65536, name, kind, 0, [10, 6, 6, 6]),
                     request.source
                 )
-                reply = mockReply(bytes, identifier, 0, 1, [10, 4, 4, 4])
-            } else if (name.name == "nx.test") {
-                reply = mockReply(bytes, identifier, 3, 1, none)
-            } else if (name.name == "v6only.test") {
-                reply = if (recordType == 28)
-                    mockReply(bytes, identifier, 0, 28, loopback6)
-                    else mockReply(bytes, identifier, 0, 1, none)
-            } else if (name.name == "web.test") {
-                reply = mockReply(bytes, identifier, 0, 1, [127, 0, 0, 1])
+                reply = mockReply(id, name, kind, 0, [10, 4, 4, 4])
+            } else if (name == "spoofnx.test") {
+                socket.sendTo(mockReply(id, "other.test", kind, 3, none), request.source)
+                reply = mockReply(id, name, kind, 0, [10, 5, 5, 5])
+            } else if (name == "wrongsource.test") {
+                other.sendTo(mockReply(id, name, kind, 3, none), request.source)
+                reply = mockReply(id, name, kind, 0, [10, 6, 6, 6])
+            } else if (name == "servfail.test") {
+                reply = mockReply(id, name, kind, 2, none)
+            } else if (name == "v6only.test") {
+                reply = if (kind == 28) mockReply(id, name, kind, 0,
+                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+                    else mockReply(id, name, kind, 0, none)
+            } else if (name == "web.test" || name == "web.ns.svc.cluster.local") {
+                reply = mockReply(id, name, kind, 0, [127, 0, 0, 1])
+            } else if (name == "redis.ns.svc.cluster.local") {
+                reply = mockReply(id, name, kind, 0, [10, 2, 2, 2])
+            } else if (name == "api.svc.cluster.local") {
+                reply = mockReply(id, name, kind, 0, [10, 3, 3, 3])
+            } else if (name.size < 6 || name.slice(0, 6) != "silent") {
+                reply = mockReply(id, name, kind, 3, none)
             }
             if (reply != "") socket.sendTo(reply, request.source)
         }
@@ -97,7 +115,7 @@ fun webHandler(request: HttpRequest): HttpResponse = httpText("world:${request.p
 fun webServe(port: int): int {
     val server = httpEventServerHandler(webHandler, ipv4Loopback(port))
     var loops = 0
-    while (loops < 3000) {
+    while (loops < 4000) {
         server.step(10)
         loops = loops + 1
     }
@@ -118,31 +136,108 @@ fun firstAddress(result: DnsAsyncResult?): string =
     if (result == null || result.resolution.addresses.size == 0) ""
     else result.resolution.addresses[0].address
 
-// Steps until every query is done (or two seconds pass).
+fun firstResolved(resolution: DnsResolution): string =
+    if (resolution.addresses.size == 0) "" else resolution.addresses[0].address
+
+// Steps until every query is done (or three seconds pass).
 fun settle(var dns: DnsAsyncResolver): void {
     val began = linuxMonotonicMilliseconds()
-    while (dns.pending() > 0 && linuxMonotonicMilliseconds() - began < 2000) {
+    while (dns.pending() > 0 && linuxMonotonicMilliseconds() - began < 3000) {
         dns.step(50)
     }
     return
 }
 
+// Starts one query, settles it and returns its result.
+fun resolveOne(var dns: DnsAsyncResolver, host: string, recordType: int): DnsAsyncResult? {
+    val id = dns.start(host, recordType)
+    settle(dns)
+    dns.take(id)
+}
+
+// The configuration parser, the candidate order and the hosts file, as pure
+// functions.
+fun checkConfiguration(): void {
+    val configuration = dnsParseConfiguration(
+        "# generated\nnameserver 10.0.0.2\nnameserver ::1\n" +
+        "nameserver\t10.0.0.3 ; second\ndomain old.example\n" +
+        "search ns.svc.cluster.local svc.cluster.local.\n" +
+        "options timeout:2 ndots:5 attempts:3\n"
+    )
+    expect("configuration", configuration.nameservers.size == 2 &&
+        configuration.nameservers[1] == "10.0.0.3" &&
+        configuration.search.size == 2 &&
+        configuration.search[1] == "svc.cluster.local" &&
+        configuration.ndots == 5)
+    val fallback = dnsParseConfiguration("domain corp.example\noptions ndots:99\n")
+    expect("configuration defaults", fallback.nameservers.size == 0 &&
+        fallback.search.size == 1 && fallback.search[0] == "corp.example" &&
+        fallback.ndots == 15 && dnsChooseServer("", fallback) == "127.0.0.53" &&
+        dnsChooseServer("10.1.1.1", configuration) == "10.1.1.1" &&
+        dnsChooseServer("", configuration) == "10.0.0.2" &&
+        dnsParseConfiguration("").ndots == 1)
+    val short = dnsCandidates("redis", configuration)
+    expect("candidates below ndots", short.size == 3 &&
+        short[0] == "redis.ns.svc.cluster.local" &&
+        short[1] == "redis.svc.cluster.local" && short[2] == "redis")
+    val one = DnsConfiguration([], ["corp.example"], 1)
+    val dotted = dnsCandidates("api.example.com", one)
+    expect("candidates at ndots", dotted.size == 2 &&
+        dotted[0] == "api.example.com" && dotted[1] == "api.example.com.corp.example")
+    val absolute = dnsCandidates("api.example.com.", configuration)
+    expect("absolute candidate", absolute.size == 1 && absolute[0] == "api.example.com")
+    expect("no candidates", dnsCandidates("a..b", configuration).size == 0)
+    val hosts = "127.0.0.1 localhost\n# 10.0.0.9 commented\n" +
+        "10.7.7.7\tPinned.Test pinned # alias\n::7 pinned.test\n10.7.7.8 pinned.test\n"
+    val listed = dnsHostsLookup(hosts, "pinned.test", 1)
+    expect("hosts A", listed.size == 2 && listed[0].address == "10.7.7.7" &&
+        listed[1].address == "10.7.7.8" && listed[0].family == 4)
+    val listed6 = dnsHostsLookup(hosts, "PINNED", 28)
+    expect("hosts AAAA alias", listed6.size == 0)
+    val listed6b = dnsHostsLookup(hosts, "pinned.test.", 28)
+    expect("hosts AAAA", listed6b.size == 1 && listed6b[0].address == "::7" &&
+        listed6b[0].family == 6)
+    expect("hosts miss", dnsHostsLookup(hosts, "commented", 1).size == 0 &&
+        dnsHostsLookup(hosts, "10.0.0.9", 1).size == 0)
+    return
+}
+
 fun main: int {
+    checkConfiguration()
     var mock = udpBind(ipv4Loopback(0))
+    var other = udpBind(ipv4Loopback(0))
     val dnsPort = mock.localPort()
     val mockChild = linuxSyscall0(57)
-    if (mockChild == 0) linuxSyscall1(60, mockServe(mock))
+    if (mockChild == 0) linuxSyscall1(60, mockServe(mock, other))
     mock.close()
+    other.close()
     var probe = tcpListenAddress(ipv4Loopback(0))
     val webPort = probe.localPort()
     probe.close()
     val webChild = linuxSyscall0(57)
     if (webChild == 0) linuxSyscall1(60, webServe(webPort))
+
+    val directory = processEnvironmentOr("ABLA_TEST_DIRECTORY", ".")
+    val plainConfiguration = "$directory/dns-plain.conf"
+    val searchConfiguration = "$directory/dns-search.conf"
+    val hostsFile = "$directory/dns-hosts"
+    val emptyHosts = "$directory/dns-hosts-empty"
+    path(plainConfiguration).writeText("nameserver 127.0.0.1\n")
+    path(searchConfiguration).writeText(
+        "nameserver 127.0.0.1\nsearch ns.svc.cluster.local svc.cluster.local\n" +
+        "options ndots:2\n"
+    )
+    path(hostsFile).writeText(
+        "127.0.0.1 localhost\n10.7.7.7 pinned.test pinned # pinned\n" +
+        "::7 pinned.test\n127.0.0.1 pinnedweb\n"
+    )
+    path(emptyHosts).writeText("")
     linuxSleepMillisecondsChecked(200)
 
     val dns = dnsAsyncResolver(DnsAsyncOptions(
         timeoutMilliseconds = 600, resendMilliseconds = 150,
-        nameserver = "127.0.0.1", nameserverPort = dnsPort
+        nameserver = "127.0.0.1", nameserverPort = dnsPort,
+        configurationPath = plainConfiguration, hostsPath = emptyHosts
     ))
 
     // Literal addresses and unqueryable names finish at once, with no socket.
@@ -155,30 +250,33 @@ fun main: int {
         dns.descriptorOf(literal4) == -1 && dns.descriptors().size == 0)
     expect("literal A", firstAddress(dns.take(literal4)) == "10.0.0.1")
     expect("literal AAAA", firstAddress(dns.take(literal6)) == "::1")
-    val other = dns.take(mismatched)
-    expect("mismatched literal", other != null && other.succeeded() &&
-        other.resolution.addresses.size == 0)
+    val mixed = dns.take(mismatched)
+    expect("mismatched literal", mixed != null && mixed.succeeded() &&
+        mixed.resolution.addresses.size == 0)
     val bad = dns.take(invalid)
     expect("invalid host", bad != null && bad.error == "dns invalid host")
     expect("taken once", dns.take(literal4) == null)
 
-    // Concurrent A and AAAA, the resend, a stray reply, NXDOMAIN, silence.
+    // Concurrent queries: answers, the resend, stray replies, server errors,
+    // silence.
     val began = linuxMonotonicMilliseconds()
     val a = dns.start("a.test", 1)
     val aaaa = dns.start("a.test", 28)
     val resend = dns.start("resend.test")
     val noise = dns.start("noise.test")
-    val nx = dns.start("nx.test")
+    val spoof = dns.start("spoofnx.test")
+    val source = dns.start("wrongsource.test")
+    val servfail = dns.start("servfail.test")
     val silent = dns.start("silent.test")
     val cancelled = dns.start("silent.test")
-    expect("in flight", dns.pending() == 7 && dns.descriptors().size == 7 &&
+    expect("in flight", dns.pending() == 9 && dns.descriptors().size == 9 &&
         dns.descriptorOf(a) >= 0 && !dns.done(a))
     dns.cancel(cancelled)
-    expect("cancel", dns.pending() == 6 && dns.descriptorOf(cancelled) == -1)
+    expect("cancel", dns.pending() == 8 && dns.descriptorOf(cancelled) == -1)
     settle(dns)
     val elapsed = linuxMonotonicMilliseconds() - began
     val results = dns.takeResults()
-    expect("all finished", results.size == 6 && dns.pending() == 0)
+    expect("all finished", results.size == 8 && dns.pending() == 0)
     for (result in results) {
         if (result.id == a) {
             expect("A", firstAddress(result) == "10.1.2.3" &&
@@ -191,8 +289,14 @@ fun main: int {
             expect("resend", firstAddress(result) == "10.9.9.9")
         } else if (result.id == noise) {
             expect("stray reply ignored", firstAddress(result) == "10.4.4.4")
-        } else if (result.id == nx) {
-            expect("NXDOMAIN ignored until the deadline",
+        } else if (result.id == spoof) {
+            expect("NXDOMAIN for another question ignored",
+                firstAddress(result) == "10.5.5.5")
+        } else if (result.id == source) {
+            expect("NXDOMAIN from another port ignored",
+                firstAddress(result) == "10.6.6.6")
+        } else if (result.id == servfail) {
+            expect("SERVFAIL ignored until the deadline",
                 result.error == "dns timeout" && result.resolution.timedOut)
         } else if (result.id == silent) {
             expect("timeout", result.error == "dns timeout" &&
@@ -202,6 +306,16 @@ fun main: int {
     expect("deadline kept", elapsed >= 550 && elapsed < 1500)
     expect("sockets released", dns.descriptors().size == 0 &&
         dns.descriptorOf(a) == -1)
+
+    // NXDOMAIN fails at once.
+    val nxBegan = linuxMonotonicMilliseconds()
+    val nx = resolveOne(dns, "nx.test", 1)
+    expect("NXDOMAIN fails fast", nx != null && nx.error == "dns name not found" &&
+        nx.resolution.nameNotFound && nx.resolution.errorCode == 2 &&
+        linuxMonotonicMilliseconds() - nxBegan < 400)
+    val nodata = resolveOne(dns, "v6only.test", 1)
+    expect("no records", nodata != null && nodata.succeeded() &&
+        nodata.resolution.addresses.size == 0)
 
     // An outside loop: poll the descriptors itself, then receive and sweep.
     val outside = dns.start("a.test", 1)
@@ -218,39 +332,106 @@ fun main: int {
     expect("outside loop", firstAddress(dns.take(outside)) == "10.1.2.3")
     dns.close()
 
+    // Search domains, ndots and the hosts file.
+    val searching = dnsAsyncResolver(DnsAsyncOptions(
+        timeoutMilliseconds = 600, resendMilliseconds = 150,
+        nameserverPort = dnsPort, configurationPath = searchConfiguration,
+        hostsPath = hostsFile
+    ))
+    expect("search: first domain",
+        firstAddress(resolveOne(searching, "redis", 1)) == "10.2.2.2")
+    expect("search: second domain",
+        firstAddress(resolveOne(searching, "api", 1)) == "10.3.3.3")
+    expect("search: absolute name",
+        firstAddress(resolveOne(searching, "redis.ns.svc.cluster.local.", 1)) == "10.2.2.2")
+    expect("search: below ndots, as written last",
+        firstAddress(resolveOne(searching, "a.test", 1)) == "10.1.2.3")
+    val searchNxBegan = linuxMonotonicMilliseconds()
+    val searchNx = resolveOne(searching, "nx.test", 1)
+    expect("search: NXDOMAIN for every candidate",
+        searchNx != null && searchNx.error == "dns name not found" &&
+        linuxMonotonicMilliseconds() - searchNxBegan < 400)
+    val searchNodata = resolveOne(searching, "v6only.test", 1)
+    expect("search: no records after NXDOMAIN", searchNodata != null &&
+        searchNodata.succeeded() && searchNodata.resolution.addresses.size == 0)
+    val searchSilent = resolveOne(searching, "silent", 1)
+    expect("search: a timeout ends the search", searchSilent != null &&
+        searchSilent.error == "dns timeout")
+    val pinned = searching.start("pinned", 1)
+    expect("hosts: at once", searching.done(pinned) &&
+        firstAddress(searching.take(pinned)) == "10.7.7.7")
+    expect("hosts: AAAA",
+        firstAddress(resolveOne(searching, "pinned.test", 28)) == "::7")
+    searching.close()
+
+    // The blocking resolver resolves the same way.
+    val blockingBegan = linuxMonotonicMilliseconds()
+    val blockingNx = dnsResolveType("nx.test", 1, 600, "", dnsPort,
+        searchConfiguration, hostsFile)
+    expect("blocking: NXDOMAIN", !blockingNx.succeeded && blockingNx.nameNotFound &&
+        blockingNx.errorCode == 2 && !blockingNx.timedOut &&
+        linuxMonotonicMilliseconds() - blockingBegan < 400)
+    expect("blocking: search", firstResolved(dnsResolveType("redis", 1, 600, "",
+        dnsPort, searchConfiguration, hostsFile)) == "10.2.2.2")
+    expect("blocking: second domain", firstResolved(dnsResolveType("api", 1, 600,
+        "", dnsPort, searchConfiguration, hostsFile)) == "10.3.3.3")
+    expect("blocking: hosts", firstResolved(dnsResolveType("pinned", 1, 600, "",
+        dnsPort, searchConfiguration, hostsFile)) == "10.7.7.7")
+    expect("blocking: literal", firstResolved(dnsResolveType("10.0.0.1", 1, 600,
+        "", dnsPort, searchConfiguration, hostsFile)) == "10.0.0.1")
+    val blockingNodata = dnsResolveType("v6only.test", 1, 600, "", dnsPort,
+        searchConfiguration, hostsFile)
+    expect("blocking: no records", blockingNodata.succeeded &&
+        blockingNodata.addresses.size == 0)
+    val both = dnsResolve("v6only.test", 600, "", dnsPort, searchConfiguration,
+        hostsFile)
+    expect("blocking: both families", both.succeeded && both.addresses.size == 1 &&
+        both.addresses[0].family == 6)
+    val bothNx = dnsResolve("nx.test", 600, "", dnsPort, searchConfiguration,
+        hostsFile)
+    expect("blocking: both not found", !bothNx.succeeded && bothNx.nameNotFound)
+    val blockingSilent = dnsResolveType("silent", 1, 300, "", dnsPort,
+        searchConfiguration, hostsFile)
+    expect("blocking: timeout", !blockingSilent.succeeded && blockingSilent.timedOut)
+
     // HttpAsyncClient resolves through the same resolver.
     val client = httpAsyncClient(HttpAsyncOptions(
-        dnsTimeoutMilliseconds = 500, nameserver = "127.0.0.1",
-        nameserverPort = dnsPort
+        dnsTimeoutMilliseconds = 500, nameserverPort = dnsPort,
+        dnsConfigurationPath = searchConfiguration, dnsHostsPath = hostsFile
     ))
     val web = client.get("http://web.test:$webPort/hello")
+    val short = client.get("http://web:$webPort/short")
+    val listed = client.get("http://pinnedweb:$webPort/listed")
     val missing = client.get("http://silent.test:$webPort/")
+    val unknown = client.get("http://nx.test:$webPort/")
     val v6only = client.get("http://v6only.test:$webPort/")
-    var webOk = false
-    var missingOk = false
-    var v6Ok = false
+    var outcomes = ""
     var received = 0
+    var unknownMilliseconds = -1
     loops = 0
-    while (received < 3 && loops < 300) {
+    while (received < 6 && loops < 300) {
         client.step(10)
         for (completion in client.takeCompletions()) {
             received = received + 1
-            if (completion.id == web) {
-                webOk = completion.status == 200 && completion.body == "world:/hello"
-                if (!webOk) println("web: ${completion.status} ${completion.error}")
-            } else if (completion.id == missing) {
-                missingOk = completion.error == "dns timeout"
-                if (!missingOk) println("missing: ${completion.error}")
-            } else if (completion.id == v6only) {
-                v6Ok = completion.error == "dns: no IPv4 address for v6only.test"
-                if (!v6Ok) println("v6only: ${completion.error}")
-            }
+            var outcome = if (completion.succeeded())
+                "${completion.status} ${completion.body}" else completion.error
+            if (completion.id == unknown) unknownMilliseconds = completion.elapsedMilliseconds
+            val label = if (completion.id == web) "web" else if (completion.id == short)
+                "short" else if (completion.id == listed) "listed"
+                else if (completion.id == missing) "missing"
+                else if (completion.id == unknown) "unknown" else "v6only"
+            outcomes = "$outcomes$label=$outcome;"
         }
         loops = loops + 1
     }
-    expect("http resolves", webOk)
-    expect("http dns timeout", missingOk)
-    expect("http no IPv4", v6Ok)
+    expect("http outcomes: $outcomes",
+        textContains(outcomes, "web=200 world:/hello;") &&
+        textContains(outcomes, "short=200 world:/short;") &&
+        textContains(outcomes, "listed=200 world:/listed;") &&
+        textContains(outcomes, "missing=dns timeout;") &&
+        textContains(outcomes, "unknown=dns name not found;") &&
+        textContains(outcomes, "v6only=dns: no IPv4 address for v6only.test;"))
+    expect("http NXDOMAIN fast", unknownMilliseconds >= 0 && unknownMilliseconds < 400)
     // The cached address: no query, the pooled connection.
     val again = client.get("http://web.test:$webPort/again")
     var cached = false
@@ -273,4 +454,14 @@ fun main: int {
         println("dns async: ok")
         42
     } else 1
+}
+
+fun textContains(text: string, part: string): bool {
+    var index = 0
+    var found = false
+    while (!found && index + part.size <= text.size) {
+        if (text.slice(index, index + part.size) == part) found = true
+        index = index + 1
+    }
+    found
 }

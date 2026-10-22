@@ -54,7 +54,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/net` | affine dual-stack TCP/UDP sockets, structured I/O results, deadlines, and epoll readiness on raw Linux |
 | `abla/net/contracts` | transport-neutral network outcome types |
 | `abla/net/hosted` | DNS-capable dual-stack TCP/UDP plus epoll on Linux and kqueue on macOS |
-| `abla/dns` | bounded DNS A/AAAA codec, compression-pointer parser, UDP resolver, and hostname connect helper |
+| `abla/dns` | bounded DNS A/AAAA codec, compression-pointer parser, a resolver with /etc/hosts, resolv.conf search domains and ndots, and a hostname connect helper |
 | `abla/dns/async` | `DnsAsyncResolver`: many nonblocking A/AAAA queries driven by `step` or an outside poller |
 | `abla/http` | HTTP/1 client/server, chunk-aware client parsing, pluggable transport, and version-aware routing |
 | `abla/http/stream` | keep-alive/chunked policy, gzip negotiation, and Server-Sent Events framing |

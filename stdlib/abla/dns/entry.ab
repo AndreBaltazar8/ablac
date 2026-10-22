@@ -1,5 +1,7 @@
-// Bounded DNS wire codec and resolver. The default transport reads the first
-// IPv4 nameserver from resolv.conf and exchanges one UDP query without libc.
+// Bounded DNS wire codec and resolver. Names resolve as a C library's
+// resolver does, without libc: a literal address is itself, /etc/hosts comes
+// first, then the first IPv4 nameserver of /etc/resolv.conf is asked for each
+// candidate name its `search` domains and `ndots` give, over UDP.
 
 import "abla/bytes"
 import "abla/fs"
@@ -16,7 +18,9 @@ class DnsResolution(
     val addresses: array<DnsAddress>,
     val succeeded: bool,
     val timedOut: bool,
-    val errorCode: int
+    val errorCode: int,
+    // The name server answered NXDOMAIN for every candidate name (errorCode 2).
+    val nameNotFound: bool = false
 )
 
 class DnsDecodedName(
@@ -189,73 +193,296 @@ fun dnsParseResponse(
     DnsResolution(addresses, valid, false, if (valid) 0 else 74)
 }
 
-fun dnsConfiguredServer(): string {
-    val contents = path("/etc/resolv.conf").readText()
-    var result = "127.0.0.53"
-    var begin = 0
+// What /etc/resolv.conf configures: IPv4 name servers in order, the search
+// domains (the last `search` or `domain` line), and `options ndots:N`
+// (default 1, at most 15).
+class DnsConfiguration(
+    val nameservers: array<string>,
+    val search: array<string>,
+    val ndots: int
+)
+
+// The whitespace-separated words of `line` before a `#` or `;` comment.
+fun dnsConfigurationWords(line: string): array<string> {
+    val words: array<string> = []
     var index = 0
-    var found = false
-    while (!found && index <= contents.size) {
-        if (index == contents.size || contents[index] == 10) {
-            var end = index
-            if (end > begin && contents[end - 1] == 13) end = end - 1
-            val line = contents.slice(begin, end)
-            val prefix = "nameserver "
-            if (line.size > prefix.size &&
-                line.slice(0, prefix.size) == prefix) {
-                val candidate = line.slice(prefix.size, line.size)
-                if (ipv4SocketAddress(candidate, 53).isValid()) {
-                    result = candidate
-                    found = true
-                }
-            }
-            begin = index + 1
+    var ended = false
+    while (!ended && index < line.size) {
+        while (index < line.size && (line[index] == 32 || line[index] == 9 ||
+            line[index] == 13)) index = index + 1
+        if (index < line.size && (line[index] == 35 || line[index] == 59)) {
+            ended = true
+        } else if (index < line.size) {
+            val begin = index
+            while (index < line.size && line[index] != 32 && line[index] != 9 &&
+                line[index] != 13) index = index + 1
+            words.append(line.slice(begin, index))
         }
+    }
+    words
+}
+
+fun dnsParseConfiguration(text: string): DnsConfiguration {
+    val nameservers: array<string> = []
+    var search: array<string> = []
+    var ndots = 1
+    var begin = 0
+    while (begin < text.size) {
+        var end = begin
+        while (end < text.size && text[end] != 10) end = end + 1
+        val words = dnsConfigurationWords(text.slice(begin, end))
+        if (words.size >= 2 && words[0] == "nameserver" &&
+            ipv4SocketAddress(words[1], 53).isValid()) {
+            nameservers.append(words[1])
+        } else if (words.size >= 1 && (words[0] == "search" ||
+            words[0] == "domain")) {
+            val domains: array<string> = []
+            var index = 1
+            while (index < words.size) {
+                var domain = words[index]
+                if (domain.size > 0 && domain[domain.size - 1] == 46) {
+                    domain = domain.slice(0, domain.size - 1)
+                }
+                if (domain != "") domains.append(domain)
+                index = index + 1
+                if (words[0] == "domain") index = words.size
+            }
+            search = domains
+        } else if (words.size >= 1 && words[0] == "options") {
+            var index = 1
+            while (index < words.size) {
+                val option = words[index]
+                if (option.size > 6 && option.slice(0, 6) == "ndots:") {
+                    var value = 0
+                    var digit = 6
+                    while (digit < option.size && option[digit] >= 48 &&
+                        option[digit] <= 57) {
+                        if (value < 100) value = value * 10 + option[digit] - 48
+                        digit = digit + 1
+                    }
+                    ndots = if (value > 15) 15 else value
+                }
+                index = index + 1
+            }
+        }
+        begin = end + 1
+    }
+    DnsConfiguration(nameservers, search, ndots)
+}
+
+fun dnsReadConfiguration(path: string = "/etc/resolv.conf"): DnsConfiguration =
+    dnsParseConfiguration(path(path).readText())
+
+// The name server to ask: `server` when given, else the configuration's first,
+// else systemd-resolved's stub.
+fun dnsChooseServer(server: string, configuration: DnsConfiguration): string =
+    if (server != "") server
+    else if (configuration.nameservers.size > 0) configuration.nameservers[0]
+    else "127.0.0.53"
+
+fun dnsConfiguredServer(): string = dnsChooseServer("", dnsReadConfiguration())
+
+// The names to ask for, in order, as a C library's resolver tries them: a
+// name ending in a dot only as written; a name with at least `ndots` dots as
+// written first, then with each search domain; any other name with each
+// search domain first, then as written. Names that cannot be encoded are left
+// out.
+fun dnsCandidates(host: string, configuration: DnsConfiguration): array<string> {
+    val candidates: array<string> = []
+    if (host.size > 1 && host[host.size - 1] == 46) {
+        val absolute = host.slice(0, host.size - 1)
+        if (dnsEncodeName(absolute) != "") candidates.append(absolute)
+        return candidates
+    }
+    var dots = 0
+    var index = 0
+    while (index < host.size) {
+        if (host[index] == 46) dots = dots + 1
         index = index + 1
+    }
+    val asWritten = dnsEncodeName(host) != ""
+    if (asWritten && dots >= configuration.ndots) candidates.append(host)
+    if (asWritten) {
+        for (domain in configuration.search) {
+            val candidate = "$host.$domain"
+            if (dnsEncodeName(candidate) != "") candidates.append(candidate)
+        }
+    }
+    if (asWritten && dots < configuration.ndots) candidates.append(host)
+    candidates
+}
+
+fun dnsAsciiLower(text: string): string {
+    var lower = true
+    for (byte in text) if (byte >= 65 && byte <= 90) lower = false
+    if (lower) return text
+    val output = byteBuffer()
+    for (byte in text) {
+        output.appendByteValue(if (byte >= 65 && byte <= 90) byte + 32 else byte)
+    }
+    output.toText()
+}
+
+// The addresses of `recordType` (1 = A, 28 = AAAA) that a hosts file gives
+// `host` (its canonical name or an alias, compared without case), in file
+// order.
+fun dnsHostsLookup(text: string, host: string, recordType: int): array<DnsAddress> {
+    val addresses: array<DnsAddress> = []
+    var name = dnsAsciiLower(host)
+    if (name.size > 1 && name[name.size - 1] == 46) name = name.slice(0, name.size - 1)
+    var begin = 0
+    while (name != "" && begin < text.size) {
+        var end = begin
+        while (end < text.size && text[end] != 10) end = end + 1
+        val words = dnsConfigurationWords(text.slice(begin, end))
+        var index = 1
+        var named = false
+        while (!named && index < words.size) {
+            if (dnsAsciiLower(words[index]) == name) named = true
+            index = index + 1
+        }
+        if (named && recordType == 1 && ipv4SocketAddress(words[0], 1).isValid()) {
+            addresses.append(DnsAddress(4, words[0], 0))
+        }
+        if (named && recordType == 28 && !ipv4SocketAddress(words[0], 1).isValid() &&
+            ipv6SocketAddress(words[0], 1).isValid()) {
+            addresses.append(DnsAddress(6, words[0], 0))
+        }
+        begin = end + 1
+    }
+    addresses
+}
+
+// A literal address's resolution for `recordType` (the address when its
+// family matches, no addresses otherwise), or null for a name.
+fun dnsLiteral(host: string, recordType: int): DnsResolution? {
+    val ipv4 = ipv4SocketAddress(host, 1).isValid()
+    val ipv6 = !ipv4 && ipv6SocketAddress(host, 1).isValid()
+    if (!ipv4 && !ipv6) return null
+    val addresses: array<DnsAddress> = []
+    if (ipv4 && recordType == 1) addresses.append(DnsAddress(4, host, 0))
+    if (ipv6 && recordType == 28) addresses.append(DnsAddress(6, host, 0))
+    DnsResolution(addresses, true, false, 0)
+}
+
+// The response code of a reply to the query `identifier` for `name` (the
+// header's identifier and question must match, the reply bit be set), or -1.
+fun dnsResponseCode(input: string, identifier: int, name: string): int {
+    var result = -1
+    if (input.size >= 12 && dnsReadU16(input, 0) == identifier &&
+        (dnsReadU16(input, 2) & 32768) != 0 && dnsReadU16(input, 4) == 1) {
+        val question = dnsDecodeName(input, 12)
+        if (question.valid && dnsAsciiLower(question.name) == dnsAsciiLower(name)) {
+            result = dnsReadU16(input, 2) & 15
+        }
     }
     result
 }
 
-fun dnsResolveType(
-    host: string,
+// The resolution after every candidate failed with NXDOMAIN or no records:
+// no records (succeeded, no addresses) when any candidate exists without
+// records of the type, otherwise not found.
+fun dnsExhausted(sawNoData: bool): DnsResolution =
+    if (sawNoData) DnsResolution([], true, false, 0)
+    else DnsResolution([], false, false, 2, true)
+
+// One UDP exchange for `name`: what the first datagram gave, and whether it
+// was an authentic NXDOMAIN (from the server asked, matching the query).
+class DnsExchange(val resolution: DnsResolution, val notFound: bool)
+
+fun dnsExchange(
+    name: string,
     recordType: int,
-    timeoutMilliseconds: int = 2000,
-    server: string = ""
-): DnsResolution {
+    timeoutMilliseconds: int,
+    nameserver: string,
+    port: int
+): DnsExchange {
     val entropy = secureRandomBytes(2)
     val identifier = if (entropy.succeeded)
         entropy.bytes[0] * 256 + entropy.bytes[1]
     else 1
-    val query = dnsQuery(host, recordType, identifier)
-    var result = DnsResolution([], false, false, 22)
+    val query = dnsQuery(name, recordType, identifier)
+    var result = DnsExchange(DnsResolution([], false, false, 22), false)
     if (query != "") {
         val socket = udpBindPort(0)
-        val nameserver = if (server == "") dnsConfiguredServer() else server
-        val sent = socket.sendTo(query, ipv4SocketAddress(nameserver, 53))
+        val sent = socket.sendTo(query, ipv4SocketAddress(nameserver, port))
         if (sent.succeeded()) {
             val response = socket.receiveFromWithTimeout(
                 4096, timeoutMilliseconds
             )
             if (response.received) {
-                result = dnsParseResponse(response.bytes, identifier)
+                val resolution = dnsParseResponse(response.bytes, identifier)
+                val notFound = !resolution.succeeded &&
+                    response.source.address == nameserver &&
+                    response.source.port == port &&
+                    dnsResponseCode(response.bytes, identifier, name) == 3
+                result = DnsExchange(resolution, notFound)
             } else {
-                result = DnsResolution(
+                result = DnsExchange(DnsResolution(
                     [], false, response.timedOut, response.errorCode
-                )
+                ), false)
             }
-        } else result = DnsResolution([], false, false, sent.errorCode)
+        } else result = DnsExchange(
+            DnsResolution([], false, false, sent.errorCode), false
+        )
         socket.close()
     }
     result
 }
 
+/**
+ * Resolves `host` for `recordType` (1 = A, 28 = AAAA), blocking for up to
+ * `timeoutMilliseconds` per name asked. A literal address is itself; the
+ * hosts file answers next; then each candidate name (dnsCandidates) is asked
+ * in turn, moving on after NXDOMAIN or no records of the type. Any other
+ * failure (a timeout, a server error, a malformed reply) ends the search.
+ */
+fun dnsResolveType(
+    host: string,
+    recordType: int,
+    timeoutMilliseconds: int = 2000,
+    server: string = "",
+    serverPort: int = 53,
+    configurationPath: string = "/etc/resolv.conf",
+    hostsPath: string = "/etc/hosts"
+): DnsResolution {
+    val literal = dnsLiteral(host, recordType)
+    if (literal != null) return literal
+    val listed = dnsHostsLookup(path(hostsPath).readText(), host, recordType)
+    if (listed.size > 0) return DnsResolution(listed, true, false, 0)
+    val configuration = dnsReadConfiguration(configurationPath)
+    val nameserver = dnsChooseServer(server, configuration)
+    val candidates = dnsCandidates(host, configuration)
+    if (candidates.size == 0) return DnsResolution([], false, false, 22)
+    var sawNoData = false
+    for (candidate in candidates) {
+        val exchange = dnsExchange(
+            candidate, recordType, timeoutMilliseconds, nameserver, serverPort
+        )
+        val resolution = exchange.resolution
+        if (resolution.succeeded && resolution.addresses.size > 0) return resolution
+        if (resolution.succeeded) sawNoData = true
+        else if (!exchange.notFound) return resolution
+    }
+    dnsExhausted(sawNoData)
+}
+
 fun dnsResolve(
     host: string,
     timeoutMilliseconds: int = 2000,
-    server: string = ""
+    server: string = "",
+    serverPort: int = 53,
+    configurationPath: string = "/etc/resolv.conf",
+    hostsPath: string = "/etc/hosts"
 ): DnsResolution {
-    val ipv6 = dnsResolveType(host, 28, timeoutMilliseconds, server)
-    val ipv4 = dnsResolveType(host, 1, timeoutMilliseconds, server)
+    val ipv6 = dnsResolveType(
+        host, 28, timeoutMilliseconds, server, serverPort, configurationPath,
+        hostsPath
+    )
+    val ipv4 = dnsResolveType(
+        host, 1, timeoutMilliseconds, server, serverPort, configurationPath,
+        hostsPath
+    )
     val combined: array<DnsAddress> = []
     var index = 0
     while (index < ipv6.addresses.size) {
@@ -272,7 +499,9 @@ fun dnsResolve(
         ipv6.succeeded || ipv4.succeeded,
         ipv6.timedOut && ipv4.timedOut,
         if (ipv6.succeeded || ipv4.succeeded) 0 else if (ipv4.errorCode != 0)
-            ipv4.errorCode else ipv6.errorCode
+            ipv4.errorCode else ipv6.errorCode,
+        !ipv6.succeeded && !ipv4.succeeded && ipv6.nameNotFound &&
+            ipv4.nameNotFound
     )
 }
 

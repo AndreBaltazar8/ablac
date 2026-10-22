@@ -298,8 +298,10 @@ Connections are kept alive and pooled per scheme, host, and port up to
 the peer is retried once on a fresh connection. Register `pollDescriptor()`
 with `WebSocketServer.watchExternal` so a blocking server `step` wakes when a
 reply arrives. `HttpAsyncOptions` sets `dnsTimeoutMilliseconds`,
-`dnsCacheSeconds`, and the name server (`nameserver`, `nameserverPort`; empty
-reads `/etc/resolv.conf`):
+`dnsCacheSeconds`, the name server (`nameserver`, `nameserverPort`; empty
+reads `/etc/resolv.conf`), and the resolver's `dnsConfigurationPath` and
+`dnsHostsPath`. A host that does not exist fails at once with `"dns name not
+found"`:
 
 ```abla fragment
 val http = httpAsyncClient()
@@ -338,19 +340,43 @@ if (result.valid) admit(result.subject) else refuse(result.error)
 ## DNS and TLS
 
 `abla/dns` encodes bounded A/AAAA queries and parses compressed response names
-without recursive allocation or unbounded pointer traversal. The raw resolver
-uses a configured IPv4 nameserver from `/etc/resolv.conf`; `tcpConnectHost`
-tries numeric literals first and then bounded AAAA/A results.
+without recursive allocation or unbounded pointer traversal. Its resolvers
+(the blocking one here, the nonblocking one below) look a name up the way a C
+library's resolver does, without libc:
+
+1. A literal address is itself.
+2. `/etc/hosts` comes next: every line naming the host (as its name or an
+   alias, compared without case) with an address of the type asked.
+3. Then the first IPv4 `nameserver` of `/etc/resolv.conf` is asked for each
+   candidate name in turn. A name ending in a dot is only itself; a name with
+   at least `ndots` dots (`options ndots:N`, default 1) is tried as written
+   first and then with each `search` domain; any other name with each search
+   domain first and as written last. So in Kubernetes (`ndots:5`, `search
+   <namespace>.svc.cluster.local svc.cluster.local cluster.local`) a short
+   service name such as `redis` resolves.
+4. An NXDOMAIN (from the server asked, for the name asked) or an answer
+   without records of the type moves to the next candidate at once. When
+   every candidate is NXDOMAIN the lookup fails with `nameNotFound` (error
+   code 2) without waiting; when one had no records of the type it succeeds
+   with no addresses. A timeout, another server error or a malformed reply
+   ends the lookup.
+
+`tcpConnectHost` connects to a literal address directly and otherwise tries
+the AAAA, then the A results.
 
 | Function | Result |
 |---|---|
-| `dnsResolve(host, timeoutMilliseconds = 2000, server = "")` | a `DnsResolution(addresses, succeeded, timedOut, errorCode)`; each `DnsAddress` has `family`, `address` and `ttlSeconds` |
+| `dnsResolveType(host, recordType, timeoutMilliseconds = 2000, server = "", serverPort = 53, configurationPath = "/etc/resolv.conf", hostsPath = "/etc/hosts")` | a `DnsResolution(addresses, succeeded, timedOut, errorCode, nameNotFound)` for type 1 (A) or 28 (AAAA); each `DnsAddress` has `family`, `address` and `ttlSeconds`. The timeout applies to each name asked; `server` replaces the configured name server |
+| `dnsResolve(host, timeoutMilliseconds = 2000, server = "", ...)` | AAAA and A together, the AAAA addresses first; the same trailing parameters |
 | `tcpConnectHost(host, port, timeoutMilliseconds = 5000)` | a `TcpConnection` to the first address that answers |
-| `dnsQuery(host, recordType, identifier)`, `dnsParseResponse(...)` | the wire codec, for custom resolvers |
+| `dnsParseConfiguration(text)`, `dnsReadConfiguration(path)` | a `DnsConfiguration(nameservers, search, ndots)` from resolv.conf text |
+| `dnsCandidates(host, configuration)`, `dnsHostsLookup(hostsText, host, recordType)` | the names a lookup asks for, in order; the addresses a hosts file gives |
+| `dnsQuery(host, recordType, identifier)`, `dnsParseResponse(...)`, `dnsResponseCode(reply, identifier, name)` | the wire codec, for custom resolvers |
 
-Neither resolver reads `/etc/hosts` or applies `resolv.conf`'s `search` and
-`ndots`: a name is queried exactly as written, so a short cluster name needs
-its fully qualified form (`redis.default.svc.cluster.local`).
+Before hosts files and search domains were supported, the resolvers asked for the name exactly as written, did
+not read `/etc/hosts`, and treated NXDOMAIN like any server error (the
+blocking resolver failed with error code 74, the nonblocking one and
+`HttpAsyncClient` waited for the timeout).
 
 ### Nonblocking resolution: `abla/dns/async`
 
@@ -360,7 +386,8 @@ without stalling a tick. `start(host, recordType)` returns an id (`1` for A,
 `28` for AAAA); `step(timeoutMilliseconds)` waits up to that long for replies
 (never past the next resend or deadline) and returns at once when nothing is
 in flight; `take(id)` returns the `DnsAsyncResult` once there is one. A
-literal address, and a name that cannot be queried, finish inside `start`:
+literal address, a name the hosts file lists, and a name that cannot be
+queried finish inside `start`:
 
 ```abla
 import "abla/io"
@@ -387,15 +414,19 @@ fun main {
 // unanswered.example: dns timeout
 ```
 
-It follows `dnsResolveType`: the first IPv4 `nameserver` of
-`/etc/resolv.conf` unless `nameserver` is given, a random query identifier,
-and replies with another identifier, a server error (NXDOMAIN included) or a
-malformed body are ignored until a valid reply or the deadline. The query is
-sent again every `resendMilliseconds`.
+It resolves as `dnsResolveType` does: hosts file, candidate names, the first
+IPv4 `nameserver` of `/etc/resolv.conf` unless `nameserver` is given. Each
+candidate is asked under a random identifier and sent again every
+`resendMilliseconds`; NXDOMAIN or no records moves to the next at once, and
+NXDOMAIN for the last fails with `"dns name not found"`. Replies with another
+identifier, another server error (SERVFAIL, REFUSED) or a malformed body are
+ignored until a valid reply or the candidate's deadline (`timeoutMilliseconds`),
+which ends the query with `"dns timeout"`. The configuration and the hosts
+file are read once, at the first query that needs them.
 
 | Call | Result |
 |---|---|
-| `dnsAsyncResolver(DnsAsyncOptions(timeoutMilliseconds = 3000, resendMilliseconds = 1000, nameserver = "", nameserverPort = 53))` | a `DnsAsyncResolver` |
+| `dnsAsyncResolver(DnsAsyncOptions(timeoutMilliseconds = 3000, resendMilliseconds = 1000, nameserver = "", nameserverPort = 53, configurationPath = "/etc/resolv.conf", hostsPath = "/etc/hosts"))` | a `DnsAsyncResolver` |
 | `dns.start(host, recordType = 1)` | the query's id. A literal address answers itself when its family matches (no addresses otherwise) |
 | `dns.step(timeoutMilliseconds = 0)` | polls the in-flight sockets, reads replies, resends, and expires; the number of datagrams read |
 | `dns.take(id)` | `DnsAsyncResult?`: `null` while in flight; otherwise `id`, `host`, `recordType`, `resolution` (a `DnsResolution`) and `error`, and `succeeded()` |
@@ -403,10 +434,11 @@ sent again every `resendMilliseconds`.
 | `dns.done(id)`, `dns.pending()` | whether a result is waiting; how many queries are in flight |
 | `dns.cancel(id)`, `dns.close()` | abandon one query, or all of them (dropping the resolver closes too) |
 | `dns.descriptors()`, `dns.descriptorOf(id)` | the in-flight sockets, to watch for reading in another poller |
-| `dns.receive(descriptor)`, `dns.sweep(now)` | for that poller: read one reply from a readable socket (true when it finished its query); resend and expire |
+| `dns.receive(descriptor)`, `dns.sweep(now)` | for that poller: read one reply from a readable socket (true when it finished its query, false when it moved on to the next candidate); resend and expire |
 
-`error` is `""`, `"dns timeout"` (with `resolution.timedOut`), `"dns invalid
-host"`, `"dns socket failed"` or `"dns send failed"`. A finished query keeps
+`error` is `""`, `"dns name not found"` (with `resolution.nameNotFound`),
+`"dns timeout"` (with `resolution.timedOut`), `"dns invalid host"`, `"dns
+socket failed"` or `"dns send failed"`. A finished query keeps
 its socket until `take` (or `takeResults`, `cancel`) closes it, so a loop
 that watches `descriptors()` in its own poller stops watching one when
 `done(id)` says so, before taking it. `HttpAsyncClient` drives its resolver
