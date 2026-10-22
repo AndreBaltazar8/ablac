@@ -253,6 +253,7 @@ test: ablac
 	tools/test-initializer-evaluation.sh $(COMPILER)
 	tools/test-math-v8.sh $(COMPILER)
 	tools/test-interfaces.sh $(COMPILER)
+	tools/test-managed-alias-files.sh $(COMPILER)
 
 check: test self-rebuild
 
