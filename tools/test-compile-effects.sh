@@ -305,19 +305,36 @@ if grep -q '^network-cache-must-not-hit$' \
     exit 1
 fi
 
-python3 -c 'import socket
+# The listener takes a port the system picks (tests run in parallel) and
+# writes it down; the case is built from a copy, beside the capabilities'
+# manifest, that connects to that port instead of 39091.
+network_ready="$output_directory/network-port"
+network_case="$output_directory/network"
+rm -rf -- "$network_ready" "$network_case"
+mkdir -p "$network_case"
+python3 -c 'import os, socket, sys
 s=socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", 39091))
+s.bind(("127.0.0.1", 0))
 s.listen(1)
+open(sys.argv[1] + ".next", "w").write(str(s.getsockname()[1]))
+os.rename(sys.argv[1] + ".next", sys.argv[1])
 c,_=s.accept()
 if c.recv(4) == b"PING": c.sendall(b"PONG")
 c.close()
-s.close()' &
+s.close()' "$network_ready" &
 network_server_pid=$!
-sleep 0.1
-"$compiler" build \
+for _ in $(seq 1 500); do
+    [[ -e $network_ready ]] && break
+    sleep 0.02
+done
+[[ -e $network_ready ]] || exit 1
+cp "$manifest" "$network_case/abla.toml"
+sed "s/39091/$(<"$network_ready")/" \
     "$project_root/tests/cases/capabilities/network-live.ab" \
+    > "$network_case/network-live.ab"
+"$compiler" build \
+    "$network_case/network-live.ab" \
     -o "$output_directory/network-live"
 wait "$network_server_pid"
 network_server_pid=''

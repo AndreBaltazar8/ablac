@@ -50,7 +50,8 @@ The three bounded invocations isolate generation, cross-target Android emission,
 and hosted server emission. This avoids sharing target/evaluator state while the
 compiler's nested mixed-target build queue is still experimental.
 
-Start the generated server:
+Start the generated server (it listens on port 18080, the one the Android
+client calls; `ABLA_RPC_PORT` picks another):
 
 ```sh
 build/examples/android-rpc/rpc-server

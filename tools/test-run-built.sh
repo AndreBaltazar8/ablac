@@ -9,7 +9,18 @@ set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-cd "$project_root"
+[[ $compiler != */* || $compiler == /* ]] || compiler=$PWD/$compiler
+# The checks count entries in the build cache (build/.abla-cache under the
+# working directory), so the test runs in a directory of its own, named like
+# the project, with copies of its two programs: no other build shares the cache.
+work="$project_root/build/run-built-test/${project_root##*/}"
+rm -rf -- "$work"
+mkdir -p "$work/tests/cases/modules"
+cp "$project_root/tests/cases/modules/run-built.ab" \
+    "$project_root/tests/cases/modules/main-unannotated.ab" \
+    "$work/tests/cases/modules/"
+export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
+cd "$work"
 source=tests/cases/modules/run-built.ab
 executable=build/.abla-run/tests_cases_modules_run-built.ab
 expected=$'argument a\nargument b c\nenvironment probe\ndirectory '"${project_root##*/}"$'\ninput line'

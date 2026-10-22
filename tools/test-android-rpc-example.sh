@@ -53,7 +53,12 @@ set -e
 [[ $invalid_status -ne 0 ]] || exit 1
 grep -q 'MissingAndroidRpcActionType' "$invalid_output.err"
 
-"$server" &
+# A port the system picks (tests run in parallel, and 18080 may be taken).
+port=$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])')
+ABLA_RPC_PORT=$port "$server" &
 server_pid=$!
 cleanup() {
     kill "$server_pid" 2>/dev/null || true
@@ -61,18 +66,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The server takes a moment to listen: retry for up to five seconds.
+# The server takes a moment to listen: retry for up to ten seconds.
 first_response=""
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
     if first_response=$(curl --fail --silent --request POST \
-        "http://127.0.0.1:18080/rpc/$action?current=40"); then
+        "http://127.0.0.1:$port/rpc/$action?current=40"); then
         break
     fi
     sleep 0.1
 done
 [[ $first_response == 41 ]] || exit 1
 second_response=$(curl --fail --silent --request POST \
-    "http://127.0.0.1:18080/rpc/$action?current=$first_response")
+    "http://127.0.0.1:$port/rpc/$action?current=$first_response")
 [[ $second_response == 42 ]] || exit 1
 
 echo "Android RPC example: typed click-call discovery generated a client and native server passed"

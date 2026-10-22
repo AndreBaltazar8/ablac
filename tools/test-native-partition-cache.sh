@@ -7,11 +7,17 @@ set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+[[ $compiler != */* || $compiler == /* ]] || compiler=$PWD/$compiler
 directory="$project_root/build/native-partition-cache-test"
 source_file="$directory/app.ab"
 program="$directory/program"
-cache_directory="$project_root/build/.abla-cache"
+# The build cache is build/.abla-cache under the working directory: the test
+# builds from its own directory, so it measures (and empties) a cache no other
+# build shares.
+cache_directory="$directory/build/.abla-cache"
 mkdir -p "$directory" "$cache_directory" || exit 1
+export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
+cd "$directory" || exit 1
 
 native_host=0
 target_flags=(--target x86_64-linux --emit object)
