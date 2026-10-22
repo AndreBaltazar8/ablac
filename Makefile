@@ -259,6 +259,7 @@ test: ablac
 	tools/test-resource-temporaries.sh $(COMPILER)
 	tools/test-transactions.sh $(COMPILER)
 	tools/test-private.sh $(COMPILER)
+	tools/test-strict-imports.sh $(COMPILER)
 
 check: test self-rebuild
 

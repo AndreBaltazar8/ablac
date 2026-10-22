@@ -190,6 +190,14 @@ object semantics change without a corresponding source-graph change.
 `.ll`/object sidecars. It is the reproducibility and profiling mode used by the
 pure self-rebuild gate; options after the source are order-independent.
 
+`build --strict-imports` makes every module whose package doesn't set
+`visibility` [strict](language.md#strict-imports) (it is part of the cache
+identity). `build --visibility-report <file>` builds as usual, without the
+cache, and writes to `<file>` one tab-separated line per name a module would
+lose under strict imports: module, line, column, name, declaring module and
+the import to add. `ablac run tools/fix-imports.ab -- <file>` adds those
+imports.
+
 Compile-time build definitions may register additional program nodes through
 the versioned compiler API. After the root succeeds, `build` drains the bounded
 graph in declaration order; a requested program may add further nodes. This

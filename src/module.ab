@@ -63,8 +63,20 @@ class BootstrapImportEdge(
     val alias: string,
     val contractOnly: bool,
     val begin: int,
-    val end: int
+    val end: int,
+    // `export import "…"`: in a strict module, its names are its importers' too.
+    val exported: bool = false
 )
+
+/** Whether the `import` at `offset` is written `export import`. */
+fun bootstrapImportExportedAt(source: string, offset: int): bool {
+    var cursor = offset
+    while (cursor > 0 && (source[cursor - 1] == 32 || source[cursor - 1] == 9)) {
+        cursor = cursor - 1
+    }
+    cursor >= 6 && source.slice(cursor - 6, cursor) == "export" &&
+        (cursor == 6 || !bootstrapIsAlphaNumeric(source[cursor - 7]))
+}
 
 class BootstrapImportScan(
     val edges: array<BootstrapImportEdge>,
@@ -195,7 +207,8 @@ fun bootstrapScanImports(source: string): BootstrapImportScan {
                     diagnostics =
                         "${diagnostics}error[E_IMPORT_ALIAS_INVALID]: import source and alias must be non-empty valid identifiers\nsource[import]:$importBegin:$end\n"
                 } else edges.append(BootstrapImportEdge(
-                    requested, provider, alias, contractOnly, importBegin, end
+                    requested, provider, alias, contractOnly, importBegin, end,
+                    bootstrapImportExportedAt(source, importBegin)
                 ))
             } else {
                 var depth = 0
@@ -236,7 +249,8 @@ fun bootstrapScanImports(source: string): BootstrapImportScan {
                     diagnostics =
                         "${diagnostics}error[E_IMPORT_ALIAS_INVALID]: import source and alias must be non-empty valid identifiers\nsource[import]:$importBegin:$end\n"
                 } else edges.append(BootstrapImportEdge(
-                    requested, provider, alias, contractOnly, importBegin, end
+                    requested, provider, alias, contractOnly, importBegin, end,
+                    bootstrapImportExportedAt(source, importBegin)
                 ))
             }
             offset = end
@@ -1817,7 +1831,10 @@ class BootstrapModuleAlias(
     val alias: string,
     val contractOnly: bool,
     val begin: int,
-    val end: int
+    val end: int,
+    val exported: bool = false,
+    // The import as written (`abla/fs` resolves to another module).
+    val written: string = ""
 )
 
 fun bootstrapModuleCanonicalPrefix(modulePath: string): string {
@@ -2625,6 +2642,351 @@ class BootstrapImportAliasValidation(
     val diagnostics: string
 )
 
+// Strict imports (`visibility = "imports"` in a package's abla.toml, or
+// `--strict-imports` for modules whose package doesn't say): a module sees its
+// own declarations, those of the modules it imports without an alias, the
+// `export import`s of a strict one, and everything a flat one (the standard
+// library, a package that doesn't opt in) reaches. A name it uses from any
+// other module is E_NAME_NOT_IMPORTED, with the import to add.
+// `--visibility-report <path>` writes every such use, in any module but the
+// standard library's, to <path> (module, line, column, name, declaring module,
+// import), whether the module is strict or not; tools/fix-imports.ab applies it.
+var bootstrapStrictImportsRequested: bool = false
+var bootstrapVisibilityReportPath: string = ""
+var bootstrapVisibilityReportStarted: bool = false
+
+/** The `visibility` of the package `modulePath` belongs to: its nearest
+ *  abla.toml's, or "" when that doesn't say (or there is none). */
+fun bootstrapModuleManifestVisibility(modulePath: string): string {
+    var directory = Path(modulePath).parent()
+    var depth = 0
+    while (depth < 128) {
+        val candidate = directory.child("abla.toml")
+        if (candidate.exists()) {
+            return bootstrapTomlStringField(candidate.text, "visibility")
+        }
+        val parent = directory.parent()
+        if (parent.text == directory.text) return ""
+        directory = parent
+        depth = depth + 1
+    }
+    ""
+}
+
+fun bootstrapModuleStrict(modulePath: string): bool {
+    if (bootstrapStandardLibraryModuleSource(modulePath) ||
+        modulePath.startsWith("<")) return false
+    val visibility = bootstrapModuleManifestVisibility(modulePath)
+    if (visibility == "imports") true
+    else if (visibility == "program") false
+    else bootstrapStrictImportsRequested
+}
+
+/** `target` as an import from `importer`: a standard-library module by its
+ *  name (`abla/io`), another file by its path relative to the importer's. */
+fun bootstrapImportSpelling(importer: string, target: string): string {
+    val root = "${bootstrapCanonicalEscapingPath(
+        bootstrapNormalizeModulePath(bootstrapStandardLibraryRoot())
+    )}/"
+    if (target.startsWith(root)) {
+        var name = target.slice(root.size, target.size)
+        if (name.endsWith("/entry.ab")) name = name.slice(0, name.size - 9)
+        return name
+    }
+    val from = bootstrapPathSegments(Path(importer).parent().text)
+    val to = bootstrapPathSegments(target)
+    var common = 0
+    while (common < from.size && common + 1 < to.size && from[common] == to[common]) {
+        common = common + 1
+    }
+    var spelled = ""
+    var up = common
+    while (up < from.size) {
+        spelled = "$spelled../"
+        up = up + 1
+    }
+    if (spelled == "") spelled = "./"
+    var down = common
+    while (down < to.size) {
+        spelled = if (down + 1 < to.size) "$spelled${to[down]}/" else "$spelled${to[down]}"
+        down = down + 1
+    }
+    spelled
+}
+
+fun bootstrapValidateStrictImports(
+    aliases: array<BootstrapModuleAlias>,
+    snapshots: array<BootstrapModuleSnapshot>
+): BootstrapImportAliasValidation {
+    val report = bootstrapVisibilityReportPath != ""
+    val strict: array<bool> = []
+    // What the report asks: every module of the program (not the standard
+    // library's) as if it were strict.
+    val asStrict: array<bool> = []
+    var anyStrict = false
+    for (snapshot in snapshots) {
+        val found = bootstrapModuleStrict(snapshot.path)
+        strict.append(found)
+        asStrict.append(found || (report &&
+            !bootstrapStandardLibraryModuleSource(snapshot.path) &&
+            !snapshot.path.startsWith("<")))
+        if (found) anyStrict = true
+    }
+    if (!anyStrict && !report) return BootstrapImportAliasValidation(0, "")
+    // Every module's names, as plain references could reach them: not an
+    // extension member, private, nor of a module whose names carry its
+    // prefix (imported under an alias somewhere).
+    val names = bootstrapStringSet()
+    val declaring: array<array<int>> = []
+    // Each class's members, which code in its body or its extension
+    // functions may use without `this.`.
+    val classes = bootstrapStringSet()
+    val classMembers: array<array<string>> = []
+    var module = 0
+    while (module < snapshots.size) {
+        val prefixed = bootstrapModuleAliasTargetPrefix(
+            aliases, snapshots[module].path
+        ) != ""
+        for (declaration in snapshots[module].discovery.declarations) {
+            if (!prefixed && declaration.extensionOwner == "" &&
+                !declaration.isPrivate && declaration.name != "" &&
+                declaration.kind != "extend") {
+                if (!names.contains(declaration.name)) {
+                    names.add(declaration.name)
+                    declaring.append([])
+                }
+                declaring[names.indexOf(declaration.name)].append(module)
+            }
+            if (declaration.kind == "class" || declaration.kind == "interface") {
+                if (!classes.contains(declaration.name)) {
+                    classes.add(declaration.name)
+                    classMembers.append([])
+                }
+                val owner = classes.indexOf(declaration.name)
+                for (parameter in declaration.parameters) {
+                    classMembers[owner].append(parameter)
+                }
+                for (method in declaration.methods) classMembers[owner].append(method.name)
+            }
+        }
+        module = module + 1
+    }
+    var errors = 0
+    var diagnostics = ""
+    var lines = ""
+    // The standard-library import to suggest for each declaring module, once
+    // found ("": the module itself, by its path).
+    val suggested = filledArray(snapshots.size, "")
+    val suggestedKnown = filledArray(snapshots.size, false)
+    module = 0
+    while (module < snapshots.size) {
+        val snapshot = snapshots[module]
+        if (asStrict[module]) {
+            val visible = bootstrapStrictVisibleModules(
+                module, aliases, snapshots, asStrict
+            )
+            val findings = bootstrapStrictImportFindings(
+                snapshot, names, declaring, classes, classMembers, visible
+            )
+            for (finding in findings) {
+                if (!suggestedKnown[finding.declaring]) {
+                    suggested[finding.declaring] = bootstrapStrictSuggestedImport(
+                        finding.declaring, aliases, snapshots, strict
+                    )
+                    suggestedKnown[finding.declaring] = true
+                }
+                val spelling = if (suggested[finding.declaring] != "")
+                    suggested[finding.declaring]
+                    else bootstrapImportSpelling(
+                        snapshot.path, snapshots[finding.declaring].path
+                    )
+                if (strict[module]) {
+                    errors = errors + 1
+                    diagnostics =
+                        "${diagnostics}error[E_NAME_NOT_IMPORTED]: `${finding.name}` is declared in ${snapshots[finding.declaring].path}, which this module doesn't import\nhelp: add: import \"$spelling\"\nsource[strict-import]:${snapshot.path}:${finding.begin}:${finding.end}\n"
+                }
+                lines = "$lines${snapshot.path}\t${finding.line}\t${finding.column}\t${finding.name}\t${snapshots[finding.declaring].path}\timport \"$spelling\"\n"
+            }
+        }
+        module = module + 1
+    }
+    // A build may check its module graph more than once: the first check
+    // starts the report, later ones add the lines it doesn't have yet.
+    if (report) {
+        val reportPath = Path(bootstrapVisibilityReportPath)
+        var written = if (bootstrapVisibilityReportStarted) reportPath.readText() else ""
+        for (line in lines.split("\n")) {
+            if (line != "" && !written.contains("$line\n")) written = "$written$line\n"
+        }
+        reportPath.writeTextAtomic(written)
+        bootstrapVisibilityReportStarted = true
+    }
+    BootstrapImportAliasValidation(errors, diagnostics)
+}
+
+/** The standard-library import to suggest for a name of `declaring`, as the
+ *  program writes it: the import some program module resolves to it (`abla/fs`
+ *  resolves to `abla/sys/linux/fs`), else the shortest one a program module
+ *  writes that reaches it, else its own name. "" for a program module. */
+fun bootstrapStrictSuggestedImport(
+    declaring: int,
+    aliases: array<BootstrapModuleAlias>,
+    snapshots: array<BootstrapModuleSnapshot>,
+    strict: array<bool>
+): string {
+    val target = snapshots[declaring].path
+    if (!bootstrapStandardLibraryModuleSource(target)) return ""
+    var best = ""
+    for (edge in aliases) {
+        if (edge.alias == "" && edge.written.startsWith("abla/") &&
+            !bootstrapStandardLibraryModuleSource(edge.importer)) {
+            if (edge.target == target) return edge.written
+            val candidate = bootstrapSnapshotIndex(snapshots, edge.target)
+            if (candidate >= 0 && (best == "" || edge.written.size < best.size) &&
+                bootstrapStrictVisibleModules(
+                    candidate, aliases, snapshots, strict
+                )[declaring]) best = edge.written
+        }
+    }
+    if (best != "") best else bootstrapImportSpelling("", target)
+}
+
+/** The modules whose names `module` sees under strict imports, by index. */
+fun bootstrapStrictVisibleModules(
+    module: int,
+    aliases: array<BootstrapModuleAlias>,
+    snapshots: array<BootstrapModuleSnapshot>,
+    strict: array<bool>
+): array<bool> {
+    val visible = filledArray(snapshots.size, false)
+    visible[module] = true
+    val pending: array<int> = []
+    // Its own unaliased imports, then what they pass on.
+    for (edge in aliases) {
+        if (edge.alias == "" && edge.importer == snapshots[module].path) {
+            val target = bootstrapSnapshotIndex(snapshots, edge.target)
+            if (target >= 0 && !visible[target]) {
+                visible[target] = true
+                pending.append(target)
+            }
+        }
+    }
+    var next = 0
+    while (next < pending.size) {
+        val from = pending[next]
+        for (edge in aliases) {
+            if (edge.alias == "" && edge.importer == snapshots[from].path &&
+                (!strict[from] || edge.exported)) {
+                val target = bootstrapSnapshotIndex(snapshots, edge.target)
+                if (target >= 0 && !visible[target]) {
+                    visible[target] = true
+                    pending.append(target)
+                }
+            }
+        }
+        next = next + 1
+    }
+    visible
+}
+
+fun bootstrapSnapshotIndex(snapshots: array<BootstrapModuleSnapshot>, path: string): int {
+    var index = 0
+    while (index < snapshots.size) {
+        if (snapshots[index].path == path) return index
+        index = index + 1
+    }
+    -1
+}
+
+class BootstrapStrictImportFinding(
+    val name: string,
+    val declaring: int,
+    val begin: int,
+    val end: int,
+    val line: int,
+    val column: int
+)
+
+/** The plain names `snapshot` uses from modules it doesn't see, each once.
+ *  A name its own declarations bind (a parameter, local or field of the
+ *  enclosing declaration, or a member of the class it is in or extends), a
+ *  named argument and a member after `.` are left alone. */
+fun bootstrapStrictImportFindings(
+    snapshot: BootstrapModuleSnapshot,
+    names: BootstrapStringSet,
+    declaring: array<array<int>>,
+    classes: BootstrapStringSet,
+    classMembers: array<array<string>>,
+    visible: array<bool>
+): array<BootstrapStrictImportFinding> {
+    val result: array<BootstrapStrictImportFinding> = []
+    val source = snapshot.source
+    val discovery = snapshot.discovery
+    val own = bootstrapStringSet()
+    for (declaration in discovery.declarations) {
+        if (declaration.extensionOwner == "") own.add(declaration.name)
+    }
+    val bounds = bootstrapDeclarationBoundNames(source, discovery)
+    val reported = bootstrapStringSet()
+    val tokens = bootstrapLex(source)
+    var inImport = false
+    var depth = 0
+    var line = 1
+    var lineStart = 0
+    var lineCursor = 0
+    var index = 0
+    while (index < tokens.size) {
+        val token = tokens[index]
+        if (token.kind == "import") inImport = true
+        if (token.kind == "newline" || token.kind == ";") inImport = false
+        if (token.kind == "(") depth = depth + 1
+        if (token.kind == ")" && depth > 0) depth = depth - 1
+        val previous = if (index > 0) tokens[index - 1].kind else ""
+        val next = if (index + 1 < tokens.size) tokens[index + 1].kind else ""
+        if (!inImport && (token.kind == "identifier" ||
+                token.kind == "interpolation-identifier") &&
+            previous != "." && previous != "fun" && previous != "@" &&
+            !(next == "=" && depth > 0)) {
+            val text = bootstrapTokenText(source, token)
+            val known = names.indexOf(text)
+            if (known >= 0 && !own.contains(text) && !reported.contains(text)) {
+                var seen = false
+                for (candidate in declaring[known]) {
+                    if (visible[candidate]) seen = true
+                }
+                val enclosing = bootstrapDeclarationAt(discovery, token.begin)
+                if (!seen && enclosing >= 0) {
+                    if (enclosing < bounds.size &&
+                        bootstrapAffineNamesContain(bounds[enclosing], text)) seen = true
+                    val declaration = discovery.declarations[enclosing]
+                    val owner = if (declaration.kind == "class" ||
+                        declaration.kind == "interface") declaration.name
+                        else bootstrapNormalizeType(declaration.extensionOwner)
+                    val ownerIndex = if (owner != "") classes.indexOf(owner) else -1
+                    if (ownerIndex >= 0 &&
+                        bootstrapAffineNamesContain(classMembers[ownerIndex], text)) seen = true
+                }
+                if (!seen) {
+                    reported.add(text)
+                    while (lineCursor < token.begin) {
+                        if (source[lineCursor] == 10) {
+                            line = line + 1
+                            lineStart = lineCursor + 1
+                        }
+                        lineCursor = lineCursor + 1
+                    }
+                    result.append(BootstrapStrictImportFinding(
+                        text, declaring[known][0], token.begin, token.end,
+                        line, token.begin - lineStart + 1
+                    ))
+                }
+            }
+        }
+        index = index + 1
+    }
+    result
+}
+
 fun bootstrapValidateImportAliases(
     aliases: array<BootstrapModuleAlias>,
     state: BootstrapModuleState
@@ -2811,7 +3173,9 @@ class BootstrapModuleGraph(
                 edge.alias,
                 edge.contractOnly,
                 edge.begin,
-                edge.end
+                edge.end,
+                edge.exported,
+                edge.source
             ))
         }
         bootstrapSemanticUnit()
@@ -2986,10 +3350,14 @@ class BootstrapModuleGraph(
             this.aliases, this.state
         )
         bootstrapFrontendTraceMemory("parse.aliases")
-        var parseErrors = this.errors + aliasValidation.errors
+        val strictValidation = bootstrapValidateStrictImports(
+            this.aliases, this.orderedSnapshots
+        )
+        var parseErrors = this.errors + aliasValidation.errors +
+            strictValidation.errors
         var extensionErrors = 0
         var parseDiagnostics =
-            "${this.diagnostics}${aliasValidation.diagnostics}"
+            "${this.diagnostics}${aliasValidation.diagnostics}${strictValidation.diagnostics}"
         var dependencyFingerprint = 29
         var authorizedEffects = 0
         var authorized = 0

@@ -116,6 +116,13 @@ The entry is a library module and does not need `main`. Relative imports stay
 inside the materialized package. Provider imports in dependency entries are
 discovered transitively; incompatible duplicate names and cycles are rejected.
 
+`visibility = "imports"` makes the package's modules
+[strict](language.md#strict-imports): each sees only its own declarations and
+what it imports. `visibility = "program"`, or no key, keeps every name visible
+program-wide (`--strict-imports` makes a package without the key strict). The
+key belongs to the nearest manifest at or above a module, so a strict package
+can depend on a flat one and the other way round.
+
 ## Hosted system libraries
 
 A hosted root program may explicitly request installed system/driver libraries:

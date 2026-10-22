@@ -207,6 +207,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_NO_MAIN` | the entry module has no `fun main` |
 | `E_IMPORT_NOT_FOUND` | an imported file doesn't exist; the message names the path it looked for |
 | `E_IMPORT_UNQUALIFIED_AMBIGUOUS` | two unaliased imports expose the same name ([modules](language.md#modules-and-imports)) |
+| `E_NAME_NOT_IMPORTED` | a [strict](language.md#strict-imports) module uses a name of a module it doesn't import; `help:` is the import to add |
 | `E_IMPORT_ALIAS_*` | alias errors: duplicate alias, module imported twice, unknown member, alias used as a value |
 | `E_IMPORT_PROVIDER_*` | a source provider expression or its result is invalid ([packages.md](packages.md)) |
 | `E_PACKAGE_*` | lockfile, fetch, cache, digest, cycle and capability errors of dependencies ([packages.md](packages.md)) |

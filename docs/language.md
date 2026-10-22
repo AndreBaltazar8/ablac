@@ -2145,12 +2145,13 @@ fun main {
   visible by its short name. Two unaliased imports that expose the same name
   make that name ambiguous: `E_IMPORT_UNQUALIFIED_AMBIGUOUS`. Source order
   never picks a winner, so add an alias.
-- Visibility is program-wide today. A declaration that isn't `private` is
-  visible by its short name in every module of the program, including modules
-  that don't import its module, directly or at all. Importing still decides
-  ambiguity and aliases, and a module's own declaration of a name, or a
-  local, shadows the others. A per-package opt-in where a module sees only
-  its own declarations and its direct imports is planned.
+- Visibility is program-wide by default. A declaration that isn't `private`
+  is visible by its short name in every module of the program, including
+  modules that don't import its module, directly or at all. Importing still
+  decides ambiguity and aliases, and a module's own declaration of a name, or
+  a local, shadows the others. A package can opt into
+  [strict imports](#strict-imports), where a module sees only what it
+  imports.
 - An alias belongs to the importing module only, and it is a compile-time
   namespace, not a value (`E_IMPORT_ALIAS_USED_AS_VALUE`). Importing a
   module doesn't expose the aliases *it* uses. Other alias errors:
@@ -2184,6 +2185,69 @@ returns an `ImportSource`, such as `github("owner/repository")`. Providers,
 ```abla fragment
 import github("AndreBaltazar8/abla-mvc") as mvc
 ```
+
+### Strict imports
+
+A package whose `abla.toml` says `visibility = "imports"` is strict: each of
+its modules sees its own declarations and those of the modules it imports
+without an alias, and nothing else. `export import "path"` imports a module
+and passes its declarations on, as if declared here, to the modules that
+import this one:
+
+```toml file=abla.toml
+visibility = "imports"
+```
+
+```abla file=shapes/facade.ab
+export import "geometry.ab"
+import "ids.ab"
+
+fun describe(rect: Rect): string = "${area(rect)} #${nextId()}"
+```
+
+```abla
+import "abla/io"
+import "shapes/facade.ab"
+
+fun main {
+    val r = Rect(2, 3)    // geometry.ab's, passed on by the facade
+    println("${area(r)} ${describe(r)}")
+}
+// output:
+// 6 6 #1
+```
+
+A name the module reaches any other way, here through the facade's own
+import, is `E_NAME_NOT_IMPORTED`, and its `help:` line is the import to add:
+
+```toml file=abla.toml
+visibility = "imports"
+```
+
+```abla error
+import "shapes/facade.ab"
+
+fun main: int = nextId()
+// error: E_NAME_NOT_IMPORTED
+// error: add: import "./shapes/ids.ab"
+```
+
+- A module that isn't strict passes on everything it reaches, as today. The
+  standard library is never strict, so `import "abla/fs"` still gives `Path`
+  although `abla/fs` reaches it through another module. A strict package may
+  import a flat one and the other way round.
+- Member names (after `.`, or a class's own members in its body), named
+  arguments and a declaration's own parameters and locals aren't looked up
+  this way. Aliases, `private` and `E_IMPORT_UNQUALIFIED_AMBIGUOUS` work as
+  in any module.
+- `visibility = "program"` keeps a package flat. A program without a
+  manifest, or whose manifest doesn't say, is strict when built with
+  `--strict-imports`.
+- To migrate, `ablac build app.ab -o app --visibility-report report.tsv`
+  builds as usual and writes every name each module would lose, with the
+  import to add; `ablac run tools/fix-imports.ab -- report.tsv` adds those
+  imports. A new import that makes a name ambiguous needs an alias, which the
+  next build reports.
 
 ### Contract imports
 
