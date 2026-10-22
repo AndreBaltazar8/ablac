@@ -79,17 +79,22 @@ fun main {
 // 42
 ```
 
-A transform replaces the bodies of its own module's functions, and may annotate
-any module's. A change it can't make is refused when it is asked for:
-`replaceFunctionBody` or `addFunctionAnnotation` returns false and the build
-fails, never reporting a change it then drops.
+A transform may change any module's declarations: its own module's, another
+of the program's modules', or the standard library's. A change to another
+module is an *edit*, kept with the transforming module's parse (so a rebuild
+that reuses that parse still makes it) and applied by the module graph to the
+complete program before analysis:
 
+- Edits apply in module order, and the modules parsed after a transform's see
+  its changes.
+- Two transforms that give one function different bodies fail the build with
+  `E_COMPILER_EDIT_CONFLICT`, naming both; the same body twice is one change.
+- An edit whose target is not exactly one declaration is
+  `E_COMPILER_EDIT_TARGET`.
 - The runtime's functions (`abla/runtime`) are never changed:
   `E_COMPILER_TRANSFORM_RUNTIME`. Its guarantees, such as which code may hold an
-  object's address, rest on its code as written.
-- Another module's function body is not replaced yet:
-  `E_COMPILER_TRANSFORM_STDLIB` for the standard library's,
-  `E_COMPILER_TRANSFORM_MODULE` for another of the program's modules.
+  object's address, rest on its code as written. The call returns false and
+  the build fails, never reporting a change it then drops.
 
 ## The `compiler` service at a glance
 
@@ -326,9 +331,8 @@ returns their names in declaration order, and `compiler.fieldsOf(type)` returns
 the declared fields and then the extension fields (`includeExtensions = false`
 for the declared ones only). From a transform, `compiler.addExtensionField`
 declares one as if the program did, with the default given as source.
-`compiler.removeExtensionField` removes one that the transform's own module
-declares; another module's is refused (`E_COMPILER_TRANSFORM_MODULE`, or
-`E_COMPILER_TRANSFORM_STDLIB`):
+`compiler.removeExtensionField` removes one, the transform's own module's or
+another module's (an edit, as for [transforms](#transforms-changing-the-program)):
 
 ```abla
 import "abla/io"

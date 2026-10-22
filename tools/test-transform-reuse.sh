@@ -40,13 +40,15 @@ wait_for() { # file pattern
 server=$!
 
 wait_for "$test_directory/stdout.txt" 'other=1'
+grep -q '^tagged=1 value=5 other=1$' "$test_directory/stdout.txt" ||
+    { echo "transform reuse: the first build lacks the changes" >&2; cat "$test_directory/stdout.txt" >&2; exit 1; }
 # Change only a module the transforming one doesn't import: its parse is reused.
 printf 'fun otherValue(): int = 2\n' > "$test_directory/other.ab"
 wait_for "$test_directory/stdout.txt" 'other=2'
 grep -q 'reloaded generation 2; .*parsed: [0-9]* refreshed, [1-9][0-9]* reused' "$test_directory/stderr.txt" ||
     { echo "transform reuse: the second build reused no parse" >&2; cat "$test_directory/stderr.txt" >&2; exit 1; }
-if ! grep -q '^tagged=1 other=2$' "$test_directory/stdout.txt"; then
-    echo "transform reuse: the annotation on another module was lost when the parse was reused" >&2
+if ! grep -q '^tagged=1 value=5 other=2$' "$test_directory/stdout.txt"; then
+    echo "transform reuse: a change to another module was lost when the parse was reused" >&2
     cat "$test_directory/stdout.txt" >&2
     exit 1
 fi

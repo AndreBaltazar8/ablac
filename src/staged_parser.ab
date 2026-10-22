@@ -258,7 +258,10 @@ fun bootstrapApplyFunctionAnnotationAddition(
                 declaration.sourceIdentity,
                 declaration.extensionOwner,
                 declaration.name,
+                bootstrapEditSignature(declaration),
                 addition.annotation,
+                [],
+                bootstrapCompilerTransformOrigin,
                 ""
             ))
             declarations[addition.handle] = bootstrapDeclarationWithAnnotation(
@@ -269,6 +272,18 @@ fun bootstrapApplyFunctionAnnotationAddition(
     valid
 }
 
+/** The source of the transform handler `handler` (a unique compile fun). */
+fun bootstrapCompilerTransformHandlerSource(
+    declarations: array<BootstrapDeclaration>,
+    handler: string
+): string {
+    for (declaration in declarations) {
+        if (declaration.name == handler && declaration.kind == "compile.fun" &&
+            declaration.extensionOwner == "") return declaration.sourceIdentity
+    }
+    ""
+}
+
 /** The edits the transform stage made so far, and a fresh list for the next. */
 fun bootstrapTakeTransformEdits(): array<BootstrapDeclarationEdit> {
     val edits = bootstrapTransformEdits
@@ -276,36 +291,104 @@ fun bootstrapTakeTransformEdits(): array<BootstrapDeclarationEdit> {
     edits
 }
 
-/** Applies `edits` to the complete graph's declarations; the number of edits
- *  whose target isn't exactly one declaration. A module's own changes are
- *  already in its declarations, so applying them again changes nothing. */
+class BootstrapEditOutcome(val errors: int, val diagnostics: string)
+
+/** Whether `declaration` is the target of `edit`. */
+fun bootstrapEditTargets(edit: BootstrapDeclarationEdit, declaration: BootstrapDeclaration): bool {
+    if (declaration.sourceIdentity != edit.targetIdentity) return false
+    if (edit.kind == "removeField") {
+        return bootstrapIsExtensionFieldKind(declaration.kind) &&
+            declaration.extensionOwner == edit.owner && declaration.name == edit.name
+    }
+    declaration.kind == "fun" && declaration.extensionOwner == edit.owner &&
+        declaration.name == edit.name &&
+        (edit.signature == "" || bootstrapEditSignature(declaration) == edit.signature)
+}
+
+/** Applies `edits` to the complete graph's declarations, raw (before any
+ *  rewrite), in their order. Each target must be exactly one declaration
+ *  (E_COMPILER_EDIT_TARGET), and two replacements of one body must agree
+ *  (E_COMPILER_EDIT_CONFLICT). A module's own changes are already in its
+ *  declarations; with `quiet` (a later module's view while the graph is still
+ *  being parsed) a target not there yet is no error. */
 fun bootstrapApplyDeclarationEdits(
     var declarations: array<BootstrapDeclaration>,
-    edits: array<BootstrapDeclarationEdit>
-): int {
+    edits: array<BootstrapDeclarationEdit>,
+    quiet: bool = false
+): BootstrapEditOutcome {
     var errors = 0
+    var diagnostics = ""
+    var first = 0
+    while (!quiet && first < edits.size) {
+        val edit = edits[first]
+        var other = first + 1
+        while (edit.kind == "replaceBody" && other < edits.size) {
+            val later = edits[other]
+            if (later.kind == "replaceBody" && later.targetIdentity == edit.targetIdentity &&
+                later.owner == edit.owner && later.name == edit.name &&
+                later.signature == edit.signature && later.payload != edit.payload) {
+                errors = errors + 1
+                diagnostics = "${diagnostics}error[E_COMPILER_EDIT_CONFLICT]: `${bootstrapEditTargetText(edit)}` is given two different bodies, by ${edit.origin} and ${later.origin}\n"
+            }
+            other = other + 1
+        }
+        first = first + 1
+    }
     for (edit in edits) {
+        val instance = bootstrapTextContains(edit.targetIdentity, "\u{1F}")
         var matches = 0
+        var at = -1
         var declaration = 0
-        while (declaration < declarations.size) {
-            val candidate = declarations[declaration]
-            if (candidate.sourceIdentity == edit.targetIdentity &&
-                candidate.extensionOwner == edit.owner &&
-                candidate.name == edit.name) {
+        while (!instance && declaration < declarations.size) {
+            if (bootstrapEditTargets(edit, declarations[declaration])) {
                 matches = matches + 1
-                var present = false
-                for (annotation in candidate.annotations) {
-                    if (annotation == edit.payload) present = true
-                }
-                if (!present) declarations[declaration] =
-                    bootstrapDeclarationWithAnnotation(candidate, edit.payload)
+                at = declaration
             }
             declaration = declaration + 1
         }
-        if (matches != 1) errors = errors + 1
+        if (matches != 1) {
+            if (!quiet) {
+                errors = errors + 1
+                diagnostics = "${diagnostics}error[E_COMPILER_EDIT_TARGET]: ${edit.kind} by ${edit.origin}: `${bootstrapEditTargetText(edit)}` is ${if (instance) "an instance of a generic, which no edit may target" else if (matches == 0) "no declaration" else "$matches declarations"}\n"
+            }
+        } else if (edit.kind == "annotate") {
+            val candidate = declarations[at]
+            var present = false
+            for (annotation in candidate.annotations) {
+                if (annotation == edit.payload) present = true
+            }
+            if (!present) declarations[at] =
+                bootstrapDeclarationWithAnnotation(candidate, edit.payload)
+        } else if (edit.kind == "replaceBody") {
+            // The own module's replacement is in its declarations already.
+            if (bootstrapEditOriginModule(edit) != edit.targetIdentity &&
+                !bootstrapApplyFunctionBodyReplacement(
+                    declarations, BootstrapFunctionBodyReplacement(at, edit.payload, edit.origin)
+                ) && !quiet) {
+                errors = errors + 1
+                diagnostics = "${diagnostics}error[E_COMPILER_TRANSFORM_BODY]: replacement body by ${edit.origin} did not parse as exactly one compatible top-level function body\n"
+            }
+        } else if (edit.kind == "removeField" && !quiet) {
+            // (Not in a view: removing would shift the slots of the modules
+            // still to be parsed.)
+            val owner = edit.owner
+            val defaultName = bootstrapExtensionFieldDefaultName(edit.name)
+            val kept: array<BootstrapDeclaration> = []
+            for (candidate in declarations) {
+                val dropped = (bootstrapIsExtensionFieldKind(candidate.kind) &&
+                    candidate.sourceIdentity == edit.targetIdentity &&
+                    candidate.extensionOwner == owner && candidate.name == edit.name) ||
+                    (candidate.kind == "fun" && candidate.sourceIdentity == edit.targetIdentity &&
+                     candidate.extensionOwner == owner && candidate.name == defaultName)
+                if (!dropped) kept.append(candidate)
+            }
+            declarations.truncate(0)
+            for (candidate in kept) declarations.append(candidate)
+        }
     }
-    errors
+    BootstrapEditOutcome(errors, diagnostics)
 }
+
 
 /** Drops the extension fields the transforms removed from this module, with
  *  their default functions. */
@@ -384,6 +467,8 @@ fun bootstrapApplyCompilerTransforms(
             if (matches != 1) valid = false
             if (valid) {
                 evalContext = bootstrapEvalContextFor(evalContext, declarations)
+                bootstrapCompilerTransformOrigin =
+                    "${bootstrapCompilerTransformHandlerSource(declarations, handler)}:${expression.begin}:${expression.end}"
                 val invoked = bootstrapInvokeCompilerTransformIn(
                     evalContext,
                     declarations,
@@ -411,6 +496,7 @@ fun bootstrapApplyCompilerTransforms(
     val replacements = bootstrapTakeFunctionBodyReplacements()
     var replacement = 0
     while (replacement < replacements.size) {
+        val handle = replacements[replacement].handle
         if (!bootstrapApplyFunctionBodyReplacement(
             declarations,
             replacements[replacement]
@@ -418,6 +504,21 @@ fun bootstrapApplyCompilerTransforms(
             errors = errors + 1
             diagnostics =
                 "${diagnostics}error[E_COMPILER_TRANSFORM_BODY]: replacement body did not parse as exactly one compatible top-level function body\n"
+        } else {
+            // Recorded for every target, the own module's too: the module graph
+            // applies another module's, and finds two that disagree.
+            val target = declarations[handle]
+            bootstrapTransformEdits.append(BootstrapDeclarationEdit(
+                "replaceBody",
+                target.sourceIdentity,
+                target.extensionOwner,
+                target.name,
+                bootstrapEditSignature(target),
+                replacements[replacement].body,
+                [],
+                replacements[replacement].origin,
+                ""
+            ))
         }
         replacement = replacement + 1
     }

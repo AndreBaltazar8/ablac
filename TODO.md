@@ -7,19 +7,6 @@ called out below.
 
 ## Compiler and stdlib
 
-- [ ] **A transform replaces bodies in its own module only.** `compiler.replaceFunctionBody`
-  on another module's function (the standard library's or the program's) is refused
-  (`E_COMPILER_TRANSFORM_STDLIB`, `E_COMPILER_TRANSFORM_MODULE`); before, it reported
-  success and the change was dropped. The staged parse runs a module's transforms over the
-  complete graph's declarations but copies back only that module's
-  (`bootstrapParseStagedRegistered`), and the module state caches each module's parse by
-  its own fingerprint. The proper fix: the staged parse returns the replacements aimed at
-  other modules; the module graph applies them to the complete declarations before
-  analysis (as `bootstrapApplyPendingFunctionAnnotations` does for annotations), parses a
-  later module's target after its own parse, and folds the replacements into the target
-  module's cache fingerprint. The runtime's functions stay refused
-  (`E_COMPILER_TRANSFORM_RUNTIME`).
-
 - [ ] **`ablac run` becomes a live JIT.** The direction for `run` is a live in-process JIT: a
   running program loads code and redefines its own functions while it runs. Done: the JIT
   module gets the `--o1` IR pipeline (`--fast`: the fast one), which made `run` the in-process

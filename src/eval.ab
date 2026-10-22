@@ -47,7 +47,9 @@ class BootstrapCompileProgramRequest(
 
 class BootstrapFunctionBodyReplacement(
     val handle: int,
-    val body: string
+    val body: string,
+    // The transform action that asked for it (bootstrapCompilerTransformOrigin).
+    val origin: string = ""
 )
 
 class BootstrapFunctionAnnotationAddition(
@@ -120,6 +122,9 @@ var bootstrapIndependentModules: array<BootstrapIndependentModuleState> = []
 // The edits the running transform stage made to other modules' declarations,
 // taken with its parse result (bootstrapTakeTransformEdits).
 var bootstrapTransformEdits: array<BootstrapDeclarationEdit> = []
+// The running transform's action, "<sourceIdentity>:<begin>:<end>": the
+// origin of the edits it makes.
+var bootstrapCompilerTransformOrigin: string = ""
 
 fun bootstrapArtifactRootRequestRoot(): string =
     "build/.abla-artifact-root-requests-${linuxProcessId()}"
@@ -241,12 +246,10 @@ fun bootstrapFunctionBodyReplacementRoot(): string =
 // handle); empty outside the staged parse, which then checks nothing here.
 var bootstrapCompilerTransformEditable: array<bool> = []
 
-/** Why a transform may not change the function at `handle` ("" when it may):
- *  the runtime's functions never (its guarantees rest on them). With
- *  `ownModule` (a body replacement), another module's, of the standard library
- *  or the program, not yet either: only the transform's own module is copied
- *  back, so the change would be dropped. (An added annotation reaches any
- *  module: the complete graph applies it, bootstrapApplyDeclarationEdits.) */
+/** Why a transform may not change the declaration at `handle` ("" when it
+ *  may): the runtime's functions never (its guarantees rest on them). Another
+ *  module's change is an edit the module graph applies
+ *  (bootstrapApplyDeclarationEdits). */
 fun bootstrapCompilerTransformTarget(
     declarations: array<BootstrapDeclaration>,
     handle: int,
@@ -258,14 +261,15 @@ fun bootstrapCompilerTransformTarget(
     if (bootstrapRuntimeModuleSource(declaration.sourceIdentity)) {
         return "error[E_COMPILER_TRANSFORM_RUNTIME]: $operation can't change `${declaration.name}`: it is the runtime's (abla/runtime), whose guarantees rest on its code as written\n"
     }
-    if (!ownModule || bootstrapCompilerTransformEditable.size == 0 ||
-        (handle < bootstrapCompilerTransformEditable.size &&
-         bootstrapCompilerTransformEditable[handle])) return ""
-    if (bootstrapStandardLibraryModuleSource(declaration.sourceIdentity)) {
-        return "error[E_COMPILER_TRANSFORM_STDLIB]: $operation can't change `${declaration.name}` yet: it is the standard library's (${declaration.sourceIdentity}), and a transform changes only its own module's functions\n"
-    }
-    "error[E_COMPILER_TRANSFORM_MODULE]: $operation can't change `${declaration.name}` yet: it is declared in ${declaration.sourceIdentity}, and a transform changes only its own module's functions\n"
+    ""
 }
+
+/** Whether the running transform's own module declares the declaration at
+ *  `handle` (its change is then made in place, not as an edit). */
+fun bootstrapCompilerTransformOwns(handle: int): bool =
+    bootstrapCompilerTransformEditable.size == 0 ||
+    (handle >= 0 && handle < bootstrapCompilerTransformEditable.size &&
+     bootstrapCompilerTransformEditable[handle])
 
 // Extension fields a transform removed (`Owner.name`), taken by the staged
 // parse when it copies the module back (bootstrapRemoveExtensionFields).
@@ -310,10 +314,14 @@ fun bootstrapStageFunctionBodyReplacement(
     if (valid) valid = Path("$root/$request.body").writeTextAtomic(
         replacement.body
     )
+    if (valid) valid = Path("$root/$request.origin").writeTextAtomic(
+        bootstrapCompilerTransformOrigin
+    )
     if (valid) bootstrapFunctionBodyReplacementCount = request + 1
     if (!valid) {
         Path("$root/$request.handle").remove()
         Path("$root/$request.body").remove()
+        Path("$root/$request.origin").remove()
     }
     valid
 }
@@ -326,10 +334,12 @@ fun bootstrapTakeFunctionBodyReplacements(
     while (index < bootstrapFunctionBodyReplacementCount) {
         replacements.append(BootstrapFunctionBodyReplacement(
             bootstrapDecimalIndex(Path("$root/$index.handle").readText()),
-            Path("$root/$index.body").readText()
+            Path("$root/$index.body").readText(),
+            Path("$root/$index.origin").readText()
         ))
         Path("$root/$index.handle").remove()
         Path("$root/$index.body").remove()
+        Path("$root/$index.origin").remove()
         index = index + 1
     }
     bootstrapFunctionBodyReplacementCount = 0
@@ -9793,10 +9803,22 @@ fun bootstrapEvaluateCallCompiler(
             evaluator.declarations, field, "compiler.removeExtensionField", true
         ) else ""
         val valid = field >= 0 && refused == "" && bootstrapCompilerTransformActive
-        if (valid) {
+        if (valid && bootstrapCompilerTransformOwns(field)) {
             bootstrapExtensionFieldRemovals.append(
                 "${evaluator.declarations[handle].name}.${name.text}"
             )
+        } else if (valid) {
+            bootstrapTransformEdits.append(BootstrapDeclarationEdit(
+                "removeField",
+                evaluator.declarations[field].sourceIdentity,
+                evaluator.declarations[handle].name,
+                name.text,
+                "",
+                "",
+                [],
+                bootstrapCompilerTransformOrigin,
+                ""
+            ))
         } else if (refused != "") {
             evaluator.diagnostics = "${evaluator.diagnostics}$refused"
             evaluator.errors = evaluator.errors + 1
