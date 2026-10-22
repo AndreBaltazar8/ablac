@@ -117,6 +117,21 @@ fun bootstrapGenericRewriteExpression(
     )
     var text = expression.text
     val kind = expression.kind
+    // In an instance, `#` code names a type parameter as its type argument's
+    // type handle; an `if` that a `#` type query decides keeps only the
+    // branch it takes (bootstrapGenericGuard).
+    if (kind == "compile" && parameters.size > 0) {
+        return BootstrapExpression(
+            kind, text, expression.begin, expression.end,
+            [bootstrapGenericTypeValues(children[0], parameters, bootstrapGenericInstanceTypes(sources, state))]
+        )
+    }
+    if (kind == "if" && parameters.size > 0 && children.size >= 2) {
+        val taken = bootstrapGenericGuard(children[0], state)
+        if (taken == 1) return children[1]
+        if (taken == 0) return if (children.size > 2) children[2]
+            else BootstrapExpression("block", "", expression.begin, expression.end, [])
+    }
     if (kind == "type" || (kind == "array" && text.size > 6 && text.slice(0, 6) == "array<")) {
         val before = state.requests.size
         text = bootstrapGenericRewriteType(
@@ -181,6 +196,106 @@ fun bootstrapGenericRewriteExpression(
         }
     }
     BootstrapExpression(kind, text, expression.begin, expression.end, children)
+}
+
+/** Each type argument (as written, `sources`) as the type its instance's
+ *  code names: generic classes by their instances. */
+fun bootstrapGenericInstanceTypes(sources: array<string>, var state: BootstrapGenericState): array<string> {
+    val types: array<string> = []
+    for (source in sources) types.append(
+        bootstrapNormalizeType(bootstrapGenericRewriteType(source, state.table, state.requests))
+    )
+    types
+}
+
+/** `expression` (`#` code) with each identifier naming a type parameter
+ *  replaced by its type argument's type handle: `compilerFindType("Square")`. */
+fun bootstrapGenericTypeValues(
+    expression: BootstrapExpression,
+    parameters: array<string>,
+    types: array<string>
+): BootstrapExpression {
+    if (expression.kind == "identifier") {
+        var index = 0
+        while (index < parameters.size) {
+            if (parameters[index] == expression.text) {
+                return BootstrapExpression("call", "compilerFindType", expression.begin, expression.end, [
+                    BootstrapExpression("string", types[index], expression.begin, expression.end, [])
+                ])
+            }
+            index = index + 1
+        }
+    }
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapGenericTypeValues(child, parameters, types))
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
+/** Whether an instance's `if` condition `test` is a `#` type query that
+ *  holds (1), doesn't (0), or something it can't decide before the instance
+ *  is analyzed (-1): `#compiler.typeConformsTo(T, "I")`,
+ *  `#compiler.isResource(T)`, and `!`, `&&`, `||` of those. */
+fun bootstrapGenericGuard(test: BootstrapExpression, var state: BootstrapGenericState): int {
+    if (test.kind == "compile" && test.children.size == 1) return bootstrapGenericQuery(test.children[0], state)
+    bootstrapGenericLogic(test, state, false)
+}
+
+fun bootstrapGenericLogic(test: BootstrapExpression, var state: BootstrapGenericState, inside: bool): int {
+    if (test.kind == "unary!" && test.children.size == 1) {
+        val value = if (inside) bootstrapGenericQuery(test.children[0], state)
+            else bootstrapGenericGuard(test.children[0], state)
+        return if (value < 0) -1 else 1 - value
+    }
+    if ((test.kind == "&&" || test.kind == "||") && test.children.size == 2) {
+        val left = if (inside) bootstrapGenericQuery(test.children[0], state)
+            else bootstrapGenericGuard(test.children[0], state)
+        val right = if (inside) bootstrapGenericQuery(test.children[1], state)
+            else bootstrapGenericGuard(test.children[1], state)
+        if (test.kind == "&&") {
+            if (left == 0 || right == 0) return 0
+            return if (left == 1 && right == 1) 1 else -1
+        }
+        if (left == 1 || right == 1) return 1
+        return if (left == 0 && right == 0) 0 else -1
+    }
+    -1
+}
+
+/** A `#` type query's value (see bootstrapGenericGuard), as the compiler
+ *  API answers it once the instance is built. */
+fun bootstrapGenericQuery(query: BootstrapExpression, var state: BootstrapGenericState): int {
+    if (query.kind == "true") return 1
+    if (query.kind == "false") return 0
+    if (query.kind != "member.call" || query.children.size < 2 ||
+        query.children[0].kind != "identifier" || query.children[0].text != "compiler") {
+        return bootstrapGenericLogic(query, state, true)
+    }
+    val handle = query.children[1]
+    if (handle.kind != "call" || handle.text != "compilerFindType" || handle.children.size != 1 ||
+        handle.children[0].kind != "string") return -1
+    val type = handle.children[0].text
+    val placeholder = bootstrapIsGenericParameterClass(type)
+    if (query.text == "typeConformsTo" && query.children.size == 3 && query.children[2].kind == "string") {
+        val interfaceName = bootstrapNormalizeType(query.children[2].text)
+        // A type parameter's own: what its bounds give it.
+        if (placeholder) return if (bootstrapTypeConformsIn(state.conformers, type, interfaceName)) 1 else 0
+        // An interface type is only itself; a class (or an instance of a
+        // generic class) conforms as it declares.
+        if (bootstrapInterfaceIndexIn(state.conformers, type) >= 0) return if (type == interfaceName) 1 else 0
+        return if (bootstrapGenericSatisfies(state.conformers, state.table, type, interfaceName)) 1 else 0
+    }
+    if (query.text == "isResource" && query.children.size == 2) {
+        if (placeholder) {
+            for (declaration in state.conformers) {
+                if (declaration.name == type) return if (declaration.isResource) 1 else 0
+            }
+            return 0
+        }
+        // An instance's is known once its fields are: decided when analyzed.
+        if (bootstrapGenericInstanceGeneric(type) != "") return -1
+        return if (bootstrapSummaryTypeIsAffine(type, bootstrapBuildAffineTypeNames(state.conformers))) 1 else 0
+    }
+    -1
 }
 
 fun bootstrapGenericRewriteTypes(

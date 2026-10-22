@@ -23,10 +23,13 @@ run() { # program...
     echo "status $status"
 }
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/generics" --no-cache
-output=$(run "$output_directory/generics")
-[[ $output == $'generics: 0 failed\nstatus 42' ]] ||
-    { echo "generics: $output" >&2; exit 1; }
+# Built under each compile-time evaluator: `#` code runs per instance.
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode "$compiler" build "$cases/main.ab" -o "$output_directory/generics" --no-cache
+    output=$(run "$output_directory/generics")
+    [[ $output == $'generics: 0 failed\nstatus 42' ]] ||
+        { echo "generics ($mode): $output" >&2; exit 1; }
+done
 output=$(run "$compiler" run "$cases/main.ab")
 [[ $output == $'generics: 0 failed\nstatus 42' ]] ||
     { echo "generics (ablac run): $output" >&2; exit 1; }

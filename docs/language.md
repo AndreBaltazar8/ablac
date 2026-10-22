@@ -1754,7 +1754,8 @@ fun main {
   passed as a value (`generic.reference:<f>`). Generic interfaces (`interface Source<T>`) and
   `where` clauses are reserved syntax.
 - **At compile time** generics behave as at run time: `#first([1, 2])`
-  evaluates the instance the call names.
+  evaluates the instance the call names. `#` code in a generic's body runs
+  per instance ([below](#compile-time-code-per-instance)).
 
 ### Bounds
 
@@ -1817,6 +1818,46 @@ A type argument that doesn't satisfy a bound is
 `generic.bound:<f>:<T>:<type>:<interface>` (`totalArea([1, 2])`, or
 `Gallery<string>` written as a type), and a bound that names no interface
 is `generic.bound-not-interface:<f>:<T>:<bound>`.
+
+### Compile-time code per instance
+
+`#` code in a generic's body is evaluated for each instance, and in it a
+type parameter is its type argument's type handle
+([compiler API](compiler-api.md#generics)). An `if` whose condition is a
+`#` type query on the type parameters (`compiler.typeConformsTo(T, "I")`,
+`compiler.isResource(T)`, and `!`, `&&`, `||` of them) is decided for each
+instance before the instance is checked, and keeps only the branch it
+takes: the other may use what only some type arguments have. That is how a
+generic specializes, with no specialization feature. The generic's own
+check decides it for `T` by its bounds.
+
+```abla
+import "abla/io"
+import "abla/compiler"
+
+interface Hashable {
+    fun hash(): int
+}
+
+class Key(val n: int) : Hashable {
+    fun hash(): int = this.n * 31
+}
+
+class Note(val text: string)
+
+fun <T> fingerprint(value: T): int =
+    if (#compiler.typeConformsTo(T, "Hashable")) value.hash() else -1
+
+fun <T> describe(value: T): string = "${#compiler.typeName(T)}: ${fingerprint(value)}"
+
+fun main {
+    println(describe(Key(2)))
+    println(describe(Note("n")))
+}
+// output:
+// Key: 62
+// Note: -1
+```
 
 ## Expressions and operators
 

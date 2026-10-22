@@ -120,6 +120,7 @@ complete program before analysis:
 | `replaceFunctionBody(function, source)`, `addFunctionAnnotation(function, name)` | change the program, from a transform |
 | `extensionFields(type)`, `fieldsOf(type, includeExtensions)`, `addExtensionField(type, name, fieldType, initial, mutable)`, `removeExtensionField(type, name)` | a class's [extension fields](#extension-fields) |
 | `conformances(type)`, `conformsTo(type, interface)`, `implementers(interface)`, `witness(type, interface)`, `declareInterface(name, members, parents)`, `addConformance(type, interface, members)` | [interfaces](#interfaces) and the classes conforming to them |
+| `findType(name)`, `typeName(type)`, `classOf(type)`, `typeConformsTo(type, interface)`, `isResource(type)` | type handles, as a [generic](#generics)'s `#` code sees its type parameters |
 | `fieldIsDelegated(type, name)`, `fieldDelegateType(type, name)` | whether a class's property is [delegated](language.md#delegated-class-properties), and its delegate's type |
 | `function(name)`, `reference(handle)` | a `FunctionReference`, for building other programs |
 | `newModule(name)` | an `IndependentModule`: a separate program built from chosen functions ([below](#independent-modules-and-declaration-blocks)) |
@@ -450,6 +451,29 @@ fun main {
 `compilerWitnessEntry`, `compilerDeclareInterface` and `compilerAddConformance`
 are the versioned ABI underneath. A request outside a transform, or without a
 class handle and an interface name, is `E_COMPILER_TRANSFORM_INTERFACE`.
+
+## Generics
+
+`#` code in a [generic](language.md#generics)'s body runs once per
+instance, and names a type parameter `T` as its type argument's type
+handle (the handle `compiler.findType` returns). Type handles have their
+own queries:
+
+- `compiler.findType(name)` is the handle of a type as spelled
+  (`int`, `array<string>`, `Square`), and `compiler.typeName(type)` its
+  spelling (`i64`, `Box<i64>` for an instance of a generic class).
+- `compiler.classOf(type)` is its class's handle (for `fieldsOf`,
+  `conformances`, `witness`), or `-1` when it is no class.
+- `compiler.typeConformsTo(type, interface)` says whether it is a class
+  conforming to the interface (as `conformsTo` answers for its class), or is
+  that interface.
+- `compiler.isResource(type)` says whether it is a resource; an instance of
+  a generic class is one when it holds one.
+
+An `if` whose condition is a `#` query of `typeConformsTo` or `isResource`
+on type parameters is decided per instance before the instance is checked,
+and keeps only the branch it takes
+([language guide](language.md#compile-time-code-per-instance)).
 
 ## Binding reflection
 
