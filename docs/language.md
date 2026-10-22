@@ -1989,8 +1989,10 @@ fun main {
   an undo log: there is nothing to conflict with, and a `retry` that no
   `orElse` takes panics (`retry can never wake`), as nothing could change
   what the block read. A panic contained by a checked export rolls the
-  transaction back. On WebAssembly a `retry` inside an `orElse` alternative
-  traps, as nothing can leave the alternative there.
+  transaction back. On WebAssembly nothing can leave an `orElse`
+  alternative part-way, so one that can reach a `retry` (itself, in a nested
+  transaction or through what it calls) is refused when it compiles
+  (`stm.orelse-retry-wasm`): decide between the alternatives with `if`.
 - `#` code runs transactions as plain code, with the same results.
 
 ```abla
@@ -2072,6 +2074,7 @@ change only what can be put back. The compiler checks:
 | `stm.outside-mutation:<what>` | Inside a transaction, a change to anything but a TVar or what the transaction made (its own locals and the objects they hold): assigning a captured local, a global or a field, changing an outside object (a field, an element, a mutating method, a `var` argument), replacing an outer delegate, or calling a function that changes a global |
 | `stm.control:return` | `return` inside a transaction's body, which is a closure: it would leave only the block |
 | `stm.orElse-type:<a>:<b>` | The alternatives of an `orElse` have unrelated types |
+| `stm.orelse-retry-wasm` | Built for WebAssembly, an `orElse` alternative that can reach a `retry` |
 
 ```abla error
 import "abla/io"

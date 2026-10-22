@@ -148,7 +148,8 @@ in [ownership.md](ownership.md#reading-ownership-diagnostics).
 ## Transactions
 
 `stm.outside-atomic`, `stm.effect:<effect>`, `stm.resource`,
-`stm.outside-mutation`, `stm.control:return` and `stm.orElse-type` are
+`stm.outside-mutation`, `stm.control:return`, `stm.orElse-type` and
+`stm.orelse-retry-wasm` are
 explained in [language.md](language.md#what-a-transaction-may-do).
 A misused `TVar` is reported as a class's would be (it has a constructor of
 one argument, `getValue()` and `setValue(value)`): `constructor.arity:TVar`,

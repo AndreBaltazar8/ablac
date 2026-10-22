@@ -2570,6 +2570,8 @@ fun bootstrapSemanticHelp(code: string): string {
             "`drop` is each resource class's own; an interface value's drop runs its class's"
         "threadShared.library" ->
             "`@threadShared` is the standard library's reviewed promise that a global never changes once built; a program shares one between threads through Shared<T> or Mutex<T>"
+        "stm.orelse-retry-wasm" ->
+            "WebAssembly has no way to leave an alternative part-way: decide between the alternatives with `if` on what the first one checks, or build for a native target"
         "thread.shared-global" ->
             "a thread reaches this global (in its body or through what it calls) while other threads may use it: wrap it in Shared<T> or Mutex<T>, or give the thread its own copy"
         "native.runtime-internal" ->
@@ -13760,6 +13762,10 @@ fun bootstrapStmEffectName(mask: int): string =
     else if (bootstrapCompileEffectHas(mask, 512)) "native"
     else ""
 
+// Whether the program being analyzed is built for WebAssembly (backend.ab sets
+// it around the analysis), where an `orElse` alternative can't retry.
+var bootstrapSemanticTargetsWasm = false
+
 /** `a orElse b` (in an `atomic`): the alternatives' shared type. */
 @noinline
 fun bootstrapInferOrElse(
@@ -13768,6 +13774,11 @@ fun bootstrapInferOrElse(
     initial: string
 ): string {
     if (expression.children.size != 2) return "unknown"
+    // On WebAssembly a retry the first alternative reaches can't leave it
+    // (bootstrapCheckStm): its span, for the check.
+    if (bootstrapSemanticTargetsWasm) {
+        analyzer.stmNote("orelse", expression.children[0].end, expression.children[0].begin, "")
+    }
     analyzer.stmBodyPending = expression.children[0].begin
     val first = bootstrapFunctionResultType(analyzer.infer(expression.children[0]))
     analyzer.stmBodyPending = expression.children[1].begin
@@ -14599,8 +14610,10 @@ fun bootstrapCheckStm(var analyzer: BootstrapAnalyzer): void {
     val transactional: array<bool> = []
     val threads: array<bool> = []
     val inputs: array<bool> = []
+    val retries: array<bool> = []
     val globals: array<string> = []
     while (transactional.size < nodes) {
+        retries.append(false)
         // Printing or reading the standard streams: I/O no attempt takes back.
         val index = transactional.size
         inputs.append(index < declarations.size && bootstrapStmStreamFunction(declarations[index]))
@@ -14618,6 +14631,7 @@ fun bootstrapCheckStm(var analyzer: BootstrapAnalyzer): void {
                 transactional[owner] = true
             }
             if (kind == "thread") threads[owner] = true
+            if (kind == "access" && analyzer.stmTexts[event] == "retry") retries[owner] = true
             if (kind == "global" && globals[owner] == "") globals[owner] = analyzer.stmTexts[event]
         }
         event = event + 1
@@ -14644,6 +14658,10 @@ fun bootstrapCheckStm(var analyzer: BootstrapAnalyzer): void {
                 }
                 if (inputs[target] && !inputs[owner]) {
                     inputs[owner] = true
+                    changed = true
+                }
+                if (retries[target] && !retries[owner]) {
+                    retries[owner] = true
                     changed = true
                 }
                 if (globals[target] != "" && globals[owner] == "") {
@@ -14686,6 +14704,36 @@ fun bootstrapCheckStm(var analyzer: BootstrapAnalyzer): void {
             reported.add(key)
             analyzer.currentSourceIdentity = analyzer.stmSources[event]
             analyzer.fail("$code@$at")
+        }
+        event = event + 1
+    }
+    // On WebAssembly nothing leaves an `orElse` alternative part-way: one
+    // that reaches a `retry` (itself, through a nested transaction or what it
+    // calls) can't be built there.
+    event = 0
+    while (event < events) {
+        if (analyzer.stmKinds[event] == "orelse") {
+            val begin = analyzer.stmBegins[event]
+            val end = analyzer.stmTargets[event]
+            val file = analyzer.stmSources[event]
+            var reaches = false
+            var inner = 0
+            while (!reaches && inner < events) {
+                val target = analyzer.stmTargets[inner]
+                val at = analyzer.stmBegins[inner]
+                if (analyzer.stmSources[inner] == file && at >= begin && at < end) {
+                    if (analyzer.stmKinds[inner] == "access" && analyzer.stmTexts[inner] == "retry") {
+                        reaches = true
+                    }
+                    if (analyzer.stmKinds[inner] == "call" && target >= 0 && target < nodes &&
+                        callable[target] && retries[target]) reaches = true
+                }
+                inner = inner + 1
+            }
+            if (reaches) {
+                analyzer.currentSourceIdentity = file
+                analyzer.fail("stm.orelse-retry-wasm:orElse@$begin")
+            }
         }
         event = event + 1
     }
