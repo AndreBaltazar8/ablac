@@ -106,6 +106,8 @@ only its parse errors.
 | `field.extension-type:<T>.<f>:<expected>:<actual>` | an extension field's default of another type |
 | `field.extension-resource:<T>.<f>` | an affine extension field (a resource, `Shared`, `Weak`, `Mutex`) on a class that isn't affine |
 | `field.extension-reassigned:<T>.<f>` | a second assignment of an extension `val` (at run time; `E_EVAL_EXTENSION_REASSIGNED` under `#`) |
+| `name.private:<name>:<module>`, `E_NAME_PRIVATE` | another module's `private` declaration used here (through an alias: `E_NAME_PRIVATE`) ([modules](language.md#modules-and-imports)) |
+| `private.export:<f>` | `@export` on a `private` function |
 | `interface.missing-member:<I>.<m>:<C>` | a class conforms to an interface, and no method, extension function or default body of the interface answers its member `m` ([interfaces](language.md#interfaces)) |
 | `interface.member-signature:<I>.<m>:<C>:<type>` | the class's method (or extension function) `m` takes other parameter types or modes, or returns another type, than the interface member's `<type>` |
 | `interface.member-untyped:<I>.<m>` | an interface member without a body and without a result type |

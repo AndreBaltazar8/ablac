@@ -258,6 +258,7 @@ test: ablac
 	tools/test-null-operators.sh $(COMPILER)
 	tools/test-resource-temporaries.sh $(COMPILER)
 	tools/test-transactions.sh $(COMPILER)
+	tools/test-private.sh $(COMPILER)
 
 check: test self-rebuild
 

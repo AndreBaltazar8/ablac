@@ -2562,6 +2562,10 @@ fun bootstrapSemanticHelp(code: string): string {
             "every class conforming to a resource interface is a resource class"
         "interface.cast-resource" ->
             "`as?` would leave two owners of one resource: a resource interface's value isn't cast back yet"
+        "private.export" ->
+            "`@export` publishes a function under a foreign symbol, so it can't be private"
+        "name.private" ->
+            "a `private` declaration is visible only in the module that declares it"
         "interface.sealed-foreign" ->
             "a sealed interface's classes (and the interfaces extending it) are declared in its own module"
         "when.is-type" ->
@@ -6357,7 +6361,9 @@ class BootstrapAnalyzer(
     val stmTargets: array<int> = [],
     val stmBegins: array<int> = [],
     val stmSources: array<string> = [],
-    val stmTexts: array<string> = []
+    val stmTexts: array<string> = [],
+    // Whether any declaration is a private extension member: -1 not known yet.
+    var privateExtensionsKnown: int = -1
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -7848,6 +7854,43 @@ class BootstrapAnalyzer(
             this.visibleLocalScope(root) >= this.stmScopeFloor) return
         this.fail("stm.outside-mutation:${if (what == "") root else what}@$at")
         return
+    }
+
+    /** The module that declares `name` privately, when the current module
+     *  can't see it (its declarations carry their module's prefix), or "". */
+    fun privateModuleOf(name: string): string {
+        for (declaration in this.declarations) {
+            if (declaration.isPrivate && declaration.extensionOwner == "" &&
+                declaration.name != name &&
+                bootstrapSourceVisibleType(declaration.name) == name &&
+                declaration.sourceIdentity != this.currentSourceIdentity) {
+                return declaration.sourceIdentity
+            }
+        }
+        ""
+    }
+
+    /** The module of another module's private extension function or field
+     *  `owner.name`, or "". */
+    fun privateExtensionModule(owner: string, name: string): string {
+        if (this.privateExtensionsKnown < 0) {
+            this.privateExtensionsKnown = 0
+            for (declaration in this.declarations) {
+                if (declaration.isPrivate && declaration.extensionOwner != "") {
+                    this.privateExtensionsKnown = 1
+                }
+            }
+        }
+        if (this.privateExtensionsKnown == 0) return ""
+        for (declaration in this.declarations) {
+            if (declaration.isPrivate && declaration.name == name &&
+                declaration.extensionOwner != "" &&
+                bootstrapNormalizeType(declaration.extensionOwner) == owner &&
+                declaration.sourceIdentity != this.currentSourceIdentity) {
+                return declaration.sourceIdentity
+            }
+        }
+        ""
     }
 
     /** The symbol of the extension field `owner.field` (`var Owner.field: T`),
@@ -10916,6 +10959,17 @@ class BootstrapAnalyzer(
                 declaration.kind == "extend") {
                 this.validateConformances(declaration)
             }
+            // Exporting publishes a function: never a private one.
+            if (declaration.isPrivate) {
+                for (annotation in declaration.annotations) {
+                    if (annotation == "export" || annotation == "exportChecked") {
+                        this.failAtOffset(
+                            "private.export:${bootstrapSourceVisibleType(declaration.name)}",
+                            declaration.begin
+                        )
+                    }
+                }
+            }
             if (!predeclared) {
                 this.appendSymbol(BootstrapSymbol(
                     symbolName,
@@ -11787,9 +11841,14 @@ fun bootstrapInferIdentifier(
     if (result == "unknown" && expression.text == "retry") {
         return bootstrapInferRetry(analyzer, expression)
     }
-    if (result == "unknown") analyzer.fail(
-        "identifier:${expression.text}@${expression.begin}"
-    )
+    if (result == "unknown") {
+        val privateModule = analyzer.privateModuleOf(expression.text)
+        analyzer.fail(
+            if (privateModule != "")
+                "name.private:${expression.text}:$privateModule@${expression.begin}"
+            else "identifier:${expression.text}@${expression.begin}"
+        )
+    }
     // A runtime-internal function taken as a value is called later, anywhere.
     if (bootstrapRuntimeInternalFunction(expression.text) &&
         analyzer.visibleLocalIndex(expression.text) < 0 &&
@@ -12267,7 +12326,12 @@ fun bootstrapInferCall(
         symbolKind != "class" && symbolKind != "type" &&
         primitiveType == "" &&
         !bootstrapHasOverloadMember(analyzer.declarations, expression.text)) {
-        analyzer.fail("call.target:${expression.text}")
+        val privateModule = analyzer.privateModuleOf(expression.text)
+        analyzer.fail(
+            if (privateModule != "")
+                "name.private:${expression.text}:$privateModule@${expression.begin}"
+            else "call.target:${expression.text}"
+        )
     }
     var argument = 0
     val resolvedArgumentTypes: array<string> = []
@@ -12534,6 +12598,11 @@ fun bootstrapInferMember(
     var result = initial
     val rawReceiver = analyzer.infer(expression.children[0])
     val receiver = bootstrapBorrowElementType(rawReceiver)
+    // Another module's private extension field.
+    val privateField = analyzer.privateExtensionModule(receiver, expression.text)
+    if (privateField != "") {
+        analyzer.fail("name.private:${receiver}.${expression.text}:$privateField@${expression.begin}")
+    }
     if (expression.text == "size" &&
         (receiver == "string" || bootstrapIsArrayType(receiver) ||
          bootstrapIsMapType(receiver))) {
@@ -12917,6 +12986,14 @@ fun bootstrapInferMemberCall(
             expression.text
         )
         val suppliedCount = expression.children.size - 1
+        // Another module's private extension function.
+        val privateExtension = if (parameterCount >= 0)
+            analyzer.privateExtensionModule(receiver, expression.text) else ""
+        if (privateExtension != "") {
+            analyzer.fail(
+                "name.private:${receiver}.${expression.text}:$privateExtension@${expression.begin}"
+            )
+        }
         if (parameterCount < 0) {
             analyzer.fail(
                 "method.unknown:${receiver}.${expression.text}@${expression.begin}"

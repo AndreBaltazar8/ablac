@@ -108,7 +108,8 @@ fun bootstrapDeclarationWithExpression(
     declaration.annotationEnds,
     declaration.sourceIdentity,
     declaration.conformances,
-    declaration.isSealed
+    declaration.isSealed,
+    declaration.isPrivate
 )
 
 fun bootstrapDeclarationWithName(
@@ -140,7 +141,8 @@ fun bootstrapDeclarationWithName(
     declaration.annotationEnds,
     declaration.sourceIdentity,
     declaration.conformances,
-    declaration.isSealed
+    declaration.isSealed,
+    declaration.isPrivate
 )
 
 fun bootstrapIndependentEntryIdentity(identity: string): bool {
@@ -197,7 +199,8 @@ fun bootstrapDeclarationWithAnnotation(
         ends,
         declaration.sourceIdentity,
         declaration.conformances,
-        declaration.isSealed
+        declaration.isSealed,
+        declaration.isPrivate
     )
 }
 
@@ -462,6 +465,111 @@ fun bootstrapModuleNeedsGeneratedProcessing(
     needed
 }
 
+// For each top-level declaration, the names it binds inside itself:
+// declared with `val`/`var`/`own`, typed (`name: T`, a field or a
+// parameter), a lambda's parameters (`{ a, b ->`) or a `for` variable.
+fun bootstrapDeclarationBoundNames(
+    source: string,
+    discovery: BootstrapParseResult
+): array<array<string>> {
+    val tokens = bootstrapLex(source)
+    val result: array<array<string>> = []
+    var declaration = 0
+    while (declaration < discovery.declarations.size) {
+        result.append([])
+        declaration = declaration + 1
+    }
+    var index = 0
+    var current = 0
+    while (index < tokens.size) {
+        while (current < discovery.declarations.size &&
+            discovery.declarations[current].end <= tokens[index].begin) {
+            current = current + 1
+        }
+        val inside = current < discovery.declarations.size &&
+            discovery.declarations[current].begin <= tokens[index].begin
+        if (inside && tokens[index].kind == "identifier") {
+            val previous = if (index > 0) tokens[index - 1].kind else ""
+            val next = if (index + 1 < tokens.size) tokens[index + 1].kind else ""
+            val previousOwn = index > 0 && previous == "identifier" &&
+                bootstrapTokenText(source, tokens[index - 1]) == "own"
+            if (previous == "val" || previous == "var" || previousOwn ||
+                next == ":" || next == "->" ||
+                (previous == "{" && next == ",") ||
+                (previous == "(" && next == "in")) {
+                result[current].append(bootstrapTokenText(source, tokens[index]))
+            }
+        }
+        index = index + 1
+    }
+    result
+}
+
+// The top-level declaration spanning `offset`, or -1.
+fun bootstrapDeclarationAt(discovery: BootstrapParseResult, offset: int): int {
+    var result = -1
+    var declaration = 0
+    while (declaration < discovery.declarations.size) {
+        if (discovery.declarations[declaration].begin <= offset &&
+            offset < discovery.declarations[declaration].end) {
+            result = declaration
+        }
+        declaration = declaration + 1
+    }
+    result
+}
+
+/** A generated module's source, as the module that requested it sees names:
+ *  that module's names that carry its prefix (in `declarations`: private
+ *  ones, and every one of a module imported under an alias) replace the plain
+ *  ones, except where a local of the generated code binds the name. */
+fun bootstrapGeneratedSourceWithPrivates(
+    source: string,
+    identity: string,
+    declarations: array<BootstrapDeclaration>
+): string {
+    val names: array<string> = []
+    val replacements: array<string> = []
+    for (declaration in declarations) {
+        if (declaration.extensionOwner == "") {
+            val visible = bootstrapSourceVisibleType(declaration.name)
+            if (visible != declaration.name && !bootstrapAffineNamesContain(names, visible)) {
+                names.append(visible)
+                replacements.append(declaration.name)
+            }
+        }
+    }
+    if (names.size == 0) return source
+    val discovery = bootstrapParseWithIdentity(source, identity)
+    val bounds = bootstrapDeclarationBoundNames(source, discovery)
+    val tokens = bootstrapLex(source)
+    var output = ""
+    var cursor = 0
+    var index = 0
+    while (index < tokens.size) {
+        val token = tokens[index]
+        if ((token.kind == "identifier" || token.kind == "interpolation-identifier") &&
+            (index == 0 || (tokens[index - 1].kind != "." && tokens[index - 1].kind != "fun"))) {
+            val text = bootstrapTokenText(source, token)
+            var replacement = -1
+            var candidate = 0
+            while (candidate < names.size && replacement < 0) {
+                if (names[candidate] == text) replacement = candidate
+                candidate = candidate + 1
+            }
+            val enclosing = if (replacement >= 0) bootstrapDeclarationAt(discovery, token.begin) else -1
+            if (enclosing >= 0 && enclosing < bounds.size &&
+                bootstrapAffineNamesContain(bounds[enclosing], text)) replacement = -1
+            if (replacement >= 0) {
+                output = "$output${source.slice(cursor, token.begin)}${replacements[replacement]}"
+                cursor = token.end
+            }
+        }
+        index = index + 1
+    }
+    "$output${source.slice(cursor, source.size)}"
+}
+
 fun bootstrapApplyGeneratedModules(
     parsed: BootstrapParseResult,
     handlerDeclarations: array<BootstrapDeclaration>,
@@ -607,7 +715,11 @@ fun bootstrapApplyGeneratedModules(
             if (valid) {
                 namespaces.append(namespace)
                 val generated = bootstrapParseWithIdentity(
-                    expression.children[1].text,
+                    bootstrapGeneratedSourceWithPrivates(
+                        expression.children[1].text,
+                        "<generated:$namespace>",
+                        declarations
+                    ),
                     "<generated:$namespace>"
                 )
                 bootstrapMergeCompileInputs(
@@ -870,7 +982,11 @@ fun bootstrapApplyGeneratedModules(
         } else {
             namespaces.append(namespace)
             val generated = bootstrapParseWithIdentity(
-                transformModules[transformModule].source,
+                bootstrapGeneratedSourceWithPrivates(
+                    transformModules[transformModule].source,
+                    "<generated:$namespace>",
+                    declarations
+                ),
                 "<generated:$namespace>"
             )
             bootstrapMergeCompileInputs(

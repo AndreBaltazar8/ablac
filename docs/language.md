@@ -2104,6 +2104,26 @@ fun area(rect: Rect): int = rect.width * rect.height
 val unit = Rect(1, 1)
 ```
 
+```abla file=shapes/ids.ab
+private var issued = 0
+
+fun nextId(): int {
+    issued = issued + 1
+    issued
+}
+```
+
+```abla
+import "abla/io"
+import "shapes/ids.ab"
+
+fun main {
+    println("${nextId()} ${nextId()}")   // `issued` isn't visible here
+}
+// output:
+// 1 2
+```
+
 ```abla
 import "abla/io"
 import "shapes/geometry.ab" as geo
@@ -2125,15 +2145,32 @@ fun main {
   visible by its short name. Two unaliased imports that expose the same name
   make that name ambiguous: `E_IMPORT_UNQUALIFIED_AMBIGUOUS`. Source order
   never picks a winner, so add an alias.
+- Visibility is program-wide today. A declaration that isn't `private` is
+  visible by its short name in every module of the program, including modules
+  that don't import its module, directly or at all. Importing still decides
+  ambiguity and aliases, and a module's own declaration of a name, or a
+  local, shadows the others. A per-package opt-in where a module sees only
+  its own declarations and its direct imports is planned.
 - An alias belongs to the importing module only, and it is a compile-time
   namespace, not a value (`E_IMPORT_ALIAS_USED_AS_VALUE`). Importing a
   module doesn't expose the aliases *it* uses. Other alias errors:
   `E_IMPORT_ALIAS_DUPLICATE` (one alias bound twice),
   `E_IMPORT_ALIAS_TARGET_DUPLICATE` (one module imported twice),
   `E_IMPORT_ALIAS_MEMBER_UNKNOWN`.
-- There are no visibility modifiers: every top-level declaration of a module
-  is visible to its importers. The standard library never reads a program's
-  global `val`s and `var`s (`library.program-global`).
+- `private` before a top-level declaration (`fun`, `val`, `var`, `class`,
+  `interface`, `type`, an extension function or field) makes it visible only
+  in its own module. Two modules may each have a private declaration of one
+  name, and another module's private name never clashes with or hides a
+  public one. Using one from another module is `name.private`, through an
+  alias `E_NAME_PRIVATE`, and `@export` on one is `private.export`.
+  (`internal`, for a package, is reserved.) The standard library never reads
+  a program's global `val`s and `var`s (`library.program-global`).
+- Names are lexical: code resolves names as the module it is written in
+  sees them. A module's `#` code sees its private declarations. So do the
+  modules generated for it (the members `compiler.addConformance` adds, a
+  `compilerGenerateModule` source): they see names as the module that
+  requested them does. A generic's body sees
+  names as the module that declares it does, wherever it is instantiated.
 - A declaration's identity (for native symbols and reflection) comes from
   the module that defines it, not from an importer's alias, so renaming an
   alias renames nothing in the output.

@@ -358,6 +358,16 @@ fun main {
 `compilerExtensionFieldType` and `compilerExtensionFieldIsMutable` are the
 versioned ABI underneath.
 
+## Private declarations
+
+`compiler.isPrivate(handle)` says whether a class or function handle names a
+`private` declaration ([modules](language.md#modules-and-imports)).
+`compiler.findClass(name)` and `findFunction(name)` take the name as the
+source writes it. For a private declaration (or one in a module imported
+under an alias), they find the calling module's own, or else the only one in
+the program. Reflection (`functions()`, `functionsAnnotated`) lists every
+declaration, private ones included.
+
 ## Interfaces
 
 [Interfaces](language.md#interfaces) and conformances can be read and declared
