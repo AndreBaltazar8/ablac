@@ -42,7 +42,7 @@ fun main {
 |---|---|
 | `min(a, b)`, `max(a, b)`, `clamp(value, minimum, maximum)` | `int` |
 | `fmin`, `fmax`, `fclamp`, `fabs` | the `f64` versions; `fmin` and `fmax` are IEEE 754 minimum and maximum: NaN if either argument is NaN, and `-0.0` below `0.0` |
-| `sqrt`, `pow(x, y)`, `exp`, `log` | `log` is the natural logarithm |
+| `sqrt`, `pow(x, y)`, `exp`, `log` | `log` is the natural logarithm; `sqrt`, `exp` and `log` are correctly rounded (the double nearest the exact result) |
 | `sin`, `cos`, `tan`, `atan`, `atan2(y, x)` | radians |
 | `floor`, `ceil`, `trunc`, `roundEven` | `roundEven` rounds halves to even; there is no other rounding mode |
 | `hypot(x, y)`, `lerp(from, to, t)` | `hypot` is correctly rounded (the double nearest the exact root), never overflows or underflows on the way, and gives infinity when either argument is infinite, even if the other is NaN |
