@@ -400,6 +400,7 @@ The check happens before evaluation starts, so a denied path never runs.
 | `clock` | read the clocks, sleep | `compilerClockMilliseconds()`; `abla/process/time`'s `sleep`, `monotonicMilliseconds()`, `realtimeMilliseconds()` and their nanosecond forms | disabled |
 | `random` | random integers | `compilerRandomInteger(maxExclusive)` | disabled |
 | `trusted.native` | run trusted and `extern` code (raw memory, C functions, system calls) | see [below](#what-works-at-compile-time-today) | disabled |
+| `transform.library` | a transform changes a standard-library function's body or removes a standard-library extension field (annotations need no grant; a program's own modules never do) | `compilerReplaceFunctionBody`, `compilerRemoveExtensionField` on a standard-library target (see [compiler-api.md](compiler-api.md)) | kept: the edits are part of each module's fingerprint |
 
 The `compiler*` providers come from `import "abla/compiler"`. File paths are
 relative to the directory the compiler runs in.

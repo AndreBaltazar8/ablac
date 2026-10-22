@@ -264,6 +264,34 @@ fun bootstrapCompilerTransformTarget(
     ""
 }
 
+/** Whether compile-time code may change the declaration at `handle` (""), or
+ *  why not: a standard library declaration not in the transform's own module
+ *  needs the `transform.library` capability. Under ABLA_COMPILE_EVAL_TRACE=1
+ *  each change of the standard library is noted. */
+fun bootstrapCompilerLibraryChange(
+    var evaluator: BootstrapEvaluator,
+    handle: int,
+    operation: string,
+    origin: string
+): bool {
+    if (handle < 0 || handle >= evaluator.declarations.size) return true
+    val declaration = evaluator.declarations[handle]
+    if (!bootstrapStandardLibraryModuleSource(declaration.sourceIdentity) ||
+        (bootstrapCompilerTransformActive && bootstrapCompilerTransformOwns(handle))) return true
+    if (!ctNativeAllowed(evaluator, BOOTSTRAP_COMPILE_TRANSFORM_LIBRARY)) {
+        val denied = ctNativeDenied(
+            evaluator, "$operation of the standard library's `${declaration.name}`",
+            BOOTSTRAP_COMPILE_TRANSFORM_LIBRARY
+        )
+        return false
+    }
+    val trace = linuxEnvironment("ABLA_COMPILE_EVAL_TRACE")
+    if (trace.found && trace.value == "1") linuxPrintStandardError(
+        "note[transform]: $origin changes the standard library's `${declaration.name}` (${declaration.sourceIdentity})\n"
+    )
+    true
+}
+
 /** Whether the running transform's own module declares the declaration at
  *  `handle` (its change is then made in place, not as an edit). */
 fun bootstrapCompilerTransformOwns(handle: int): bool =
@@ -9802,7 +9830,11 @@ fun bootstrapEvaluateCallCompiler(
         val refused = if (field >= 0) bootstrapCompilerTransformTarget(
             evaluator.declarations, field, "compiler.removeExtensionField", true
         ) else ""
-        val valid = field >= 0 && refused == "" && bootstrapCompilerTransformActive
+        val library = field < 0 || refused != "" || !bootstrapCompilerTransformActive ||
+            bootstrapCompilerLibraryChange(
+                evaluator, field, "compiler.removeExtensionField", bootstrapCompilerTransformOrigin
+            )
+        val valid = field >= 0 && refused == "" && bootstrapCompilerTransformActive && library
         if (valid && bootstrapCompilerTransformOwns(field)) {
             bootstrapExtensionFieldRemovals.append(
                 "${evaluator.declarations[handle].name}.${name.text}"
@@ -9822,6 +9854,8 @@ fun bootstrapEvaluateCallCompiler(
         } else if (refused != "") {
             evaluator.diagnostics = "${evaluator.diagnostics}$refused"
             evaluator.errors = evaluator.errors + 1
+        } else if (!library) {
+            bootstrapSemanticUnit()
         } else {
             evaluator.recordEvaluatorDiagnostic(
                 "E_COMPILER_TRANSFORM_EXTENSION_FIELD",
@@ -9893,6 +9927,15 @@ fun bootstrapEvaluateCallCompiler(
             valid = false
             evaluator.diagnostics = "${evaluator.diagnostics}$refused"
         }
+        val origin = if (bootstrapCompilerTransformActive) bootstrapCompilerTransformOrigin
+            else "${evaluator.sourceIdentity}:${expression.begin}:${expression.end}"
+        var library = true
+        if (valid) {
+            library = bootstrapCompilerLibraryChange(
+                evaluator, reflected.integer, "compiler.replaceFunctionBody", origin
+            )
+            valid = library
+        }
         if (valid) valid = bootstrapStageFunctionBodyReplacement(
             BootstrapFunctionBodyReplacement(
                 reflected.integer,
@@ -9903,6 +9946,8 @@ fun bootstrapEvaluateCallCompiler(
             result = bootstrapEvalBoolean(true)
         } else if (refused != "") {
             evaluator.errors = evaluator.errors + 1
+            result = bootstrapEvalBoolean(false)
+        } else if (!library) {
             result = bootstrapEvalBoolean(false)
         } else {
             evaluator.recordEvaluatorDiagnostic(

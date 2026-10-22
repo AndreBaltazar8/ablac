@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A compiler.transform changes the bodies, annotations and extension fields of
 # any module's declarations, its own, another of the program's or the standard
-# library's: a change to another module is an edit the module graph applies.
+# library's (with the `transform.library` capability): a change to another
+# module is an edit the module graph applies.
 # Two different bodies for one function conflict; the runtime's functions are
 # never changed (E_COMPILER_TRANSFORM_RUNTIME).
 set -euo pipefail
@@ -39,6 +40,9 @@ refused() { # $1 = case, $2 = the diagnostic it must report
 refused runtime E_COMPILER_TRANSFORM_RUNTIME
 refused annotation-runtime E_COMPILER_TRANSFORM_RUNTIME
 refused conflict E_COMPILER_EDIT_CONFLICT
+refused stdlib-ungranted E_COMPILE_NATIVE_DENIED
+grep -qF '`transform.library`' "$output_directory/stdlib-ungranted.err" ||
+    { echo "transform targets: stdlib-ungranted doesn't name transform.library"; exit 1; }
 grep -q 'conflict-a.ab' "$output_directory/conflict.err" &&
     grep -q 'conflict-b.ab' "$output_directory/conflict.err" ||
     { echo "transform targets: the conflict doesn't name both transforms"; cat "$output_directory/conflict.err"; exit 1; }

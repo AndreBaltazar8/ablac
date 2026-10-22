@@ -95,6 +95,14 @@ complete program before analysis:
   `E_COMPILER_TRANSFORM_RUNTIME`. Its guarantees, such as which code may hold an
   object's address, rest on its code as written. The call returns false and
   the build fails, never reporting a change it then drops.
+- A standard-library function's body, or a standard-library extension field's
+  removal, needs the [`transform.library`](compile-time.md#capabilities-files-environment-processes-network)
+  capability: the project lists it in `compileCapabilities` and the
+  transforming module has `#compilerGrant("transform.library")`. Without it
+  the call is refused with `E_COMPILE_NATIVE_DENIED` naming
+  `transform.library`. Annotations, and a program's own modules, need no
+  grant. With `ABLA_COMPILE_EVAL_TRACE=1` each granted change prints a
+  `note[transform]:` line naming the transform's site and the function.
 
 ## The `compiler` service at a glance
 

@@ -194,6 +194,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_EVAL_OUT_OF_BOUNDS` | an index or slice out of bounds, or a negative `truncate` or `filledArray` count, under `#`, with the run-time panic's message |
 | `E_EVAL_STACK_DEPTH` | compile-time recursion nested deeper than the compiler's stack allows ([limits](compile-time.md#limits)) |
 | `compile.effect-denied`, `compile.capability-not-authorized`, `compile.capability-unknown` | [capabilities](compile-time.md#capabilities-files-environment-processes-network) |
+| `E_COMPILE_NATIVE_DENIED` | compile-time code reached something its module was not granted (trusted code, or a transform changing the standard library without `transform.library`); the message names the capability ([capabilities](compile-time.md#capabilities-files-environment-processes-network)) |
 | `compile.value-runtime:<name>` | run-time code reads a `compile val`/`compile var` |
 | `compile.result: ...` | a `#` result that can't become a program value |
 | `declaration.block.compile-only` | a declaration block in run-time code |
