@@ -1120,7 +1120,7 @@ An interface value is the instance itself, so taking one costs nothing and
 an object's layout never depends on its interfaces. A call through one
 compares the instance's class with each class that conforms and calls that
 class's witness. An instance of any other class goes to the runtime's one
-fallback, which stops the program with `interface.no-witness:Shape:#<class>`.
+fallback, which stops the program with `interface.no-witness:Shape:<class>` (the class's symbol).
 That can't happen in a program today: an interface value only ever comes from a
 class that conforms. The fallback is where a conformance added at run time
 would be found.

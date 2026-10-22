@@ -109,7 +109,7 @@ only its parse errors.
 | `interface.resource-into-plain:<I>:<C>` | a resource class conforming to a plain interface, whose values copy freely |
 | `interface.cast:<from>:<to>` | `x as? C` where `C` doesn't conform to `x`'s interface, so the cast could never succeed |
 | `interface.inheritance:<I>` | an interface with parents (`interface Solid : Shape`), not supported yet |
-| `interface.no-witness:<I>:#<class>` | at run time: a call through an interface on an instance of a class with no witness for it (the dispatch fallback; no program reaches it today) |
+| `interface.no-witness:<I>:<class>` | at run time: a call through an interface on an instance of a class with no witness for it (the dispatch fallback; no program reaches it today) |
 | `E_COMPILER_TRANSFORM_INTERFACE` | `compiler.declareInterface` or `compiler.addConformance` outside a transform, or without its handle and names ([compiler API](compiler-api.md#interfaces)) |
 | `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a generic's `<T>`, a `where` clause, `const` type parameters, an interface's `type Item`, `sealed` |
 | `native.trust:<f>` | calling a trusted function from untrusted code ([trusted code](language.md#trusted-native-implementations)) |
