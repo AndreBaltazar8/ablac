@@ -1,0 +1,273 @@
+// TLS for `abla/websocket/server`. Loads one certificate chain and private key
+// into an OpenSSL server context and hands the server the nonblocking OpenSSL
+// calls it drives from `step`:
+//
+//     val tls = webSocketServerTls("fullchain.pem", "privkey.pem")
+//     if (tls.error != "") println(tls.error)
+//     val server = webSocketServer(ipv4Any(443), WebSocketServerOptions(tls = tls))
+//
+// Only programs that import this module link OpenSSL. Connections negotiate
+// TLS 1.2 or later; a peer that closes TCP without close_notify reads as a
+// close. Create the configuration once: its context lives as long as the
+// program, and each server holds a reference of its own.
+
+import "abla/websocket/server"
+import "../../../tls/hosted/openssl.ab"
+import "../../../http/async/openssl-nonblocking.ab"
+import "../../../jwt/libcrypto.ab"
+import "abla/unsafe/memory"
+
+trusted noescape extern:"c" fun SSL_has_pending(session: i64*): i32
+trusted noescape extern:"c" fun SSL_CTX_up_ref(context: i64*): i32
+trusted noescape extern:"c" fun SSL_CTX_ctrl(
+    context: i64*, command: int, argument: int, pointer: i64*
+): int
+trusted noescape extern:"c" fun SSL_CTX_set_options(
+    context: i64*, options: int
+): int
+trusted noescape extern:"c" fun SSL_CTX_use_certificate(
+    context: i64*, certificate: i64*
+): i32
+trusted noescape extern:"c" fun SSL_CTX_use_PrivateKey(
+    context: i64*, key: i64*
+): i32
+trusted noescape extern:"c" fun BIO_new_mem_buf(buffer: i64*, length: int): i64*
+trusted noescape extern:"c" fun BIO_free(bio: i64*): i32
+trusted noescape extern:"c" fun PEM_read_bio_X509_AUX(
+    bio: i64*, existing: i64*, callback: i64*, data: i64*
+): i64*
+trusted noescape extern:"c" fun PEM_read_bio_X509(
+    bio: i64*, existing: i64*, callback: i64*, data: i64*
+): i64*
+trusted noescape extern:"c" fun PEM_read_bio_PrivateKey(
+    bio: i64*, existing: i64*, callback: i64*, data: i64*
+): i64*
+trusted noescape extern:"c" fun X509_free(certificate: i64*): void
+
+// Reads a certificate chain (leaf first) and its private key from PEM files,
+// such as an ACME client's fullchain.pem and privkey.pem.
+fun webSocketServerTls(
+    certificatePath: string,
+    privateKeyPath: string,
+    handshakeTimeoutMilliseconds: int = 5000
+): WebSocketServerTls = webSocketServerTlsConfigured(
+    certificatePath, privateKeyPath, false, handshakeTimeoutMilliseconds
+)
+
+// Same, from PEM text already in memory.
+fun webSocketServerTlsPem(
+    certificatePem: string,
+    privateKeyPem: string,
+    handshakeTimeoutMilliseconds: int = 5000
+): WebSocketServerTls = webSocketServerTlsConfigured(
+    certificatePem, privateKeyPem, true, handshakeTimeoutMilliseconds
+)
+
+class WebSocketServerTlsLoad(var context: int, var error: string)
+
+trusted fun webSocketServerTlsConfigured(
+    certificate: string,
+    privateKey: string,
+    pem: bool,
+    handshakeTimeoutMilliseconds: int
+): WebSocketServerTls {
+    val load = webSocketServerTlsLoad(certificate, privateKey, pem)
+    WebSocketServerTls(
+        load.context, load.error, handshakeTimeoutMilliseconds,
+        webSocketServerTlsStart, webSocketServerTlsHandshake,
+        webSocketServerTlsRead, webSocketServerTlsWrite,
+        webSocketServerTlsPending, webSocketServerTlsFree,
+        webSocketServerTlsRetain, webSocketServerTlsRelease
+    )
+}
+
+trusted fun webSocketServerTlsLoad(
+    certificate: string,
+    privateKey: string,
+    pem: bool
+): WebSocketServerTlsLoad {
+    var error = ""
+    var context = nativeNullPointer()
+    if (OpenSSL_version_num() <= 0) error = "TLS is unavailable"
+    if (error == "") {
+        ERR_clear_error()
+        context = SSL_CTX_new(TLS_server_method())
+        if (pointerIsNull(context)) error = "TLS context creation failed"
+    }
+    if (error == "") {
+        // SSL_CTX_set_min_proto_version(TLS1_2_VERSION)
+        SSL_CTX_ctrl(context, 123, 771, nativeNullPointer())
+        // SSL_OP_IGNORE_UNEXPECTED_EOF: a peer that drops TCP without
+        // close_notify reads as a close rather than a protocol error.
+        SSL_CTX_set_options(context, 128)
+        val loaded = if (pem) webSocketServerTlsUsePemCertificate(
+            context, certificate
+        ) else SSL_CTX_use_certificate_chain_file(context, certificate) == 1
+        if (!loaded) error = "TLS certificate failed to load"
+    }
+    if (error == "") {
+        val loaded = if (pem) webSocketServerTlsUsePemKey(context, privateKey)
+            else SSL_CTX_use_PrivateKey_file(context, privateKey, 1) == 1
+        if (!loaded) error = "TLS private key failed to load"
+    }
+    if (error == "" && SSL_CTX_check_private_key(context) != 1) {
+        error = "TLS private key does not match the certificate"
+    }
+    if (error != "" && !pointerIsNull(context)) {
+        SSL_CTX_free(context)
+        context = nativeNullPointer()
+    }
+    ERR_clear_error()
+    WebSocketServerTlsLoad(
+        if (pointerIsNull(context)) 0 else nativePointerAddress(context), error
+    )
+}
+
+// The leaf certificate, then any intermediates in order.
+trusted fun webSocketServerTlsUsePemCertificate(
+    context: i64*,
+    text: string
+): bool {
+    val bio = BIO_new_mem_buf(
+        nativePointerFromAddress(nativeStringAddress(text)), text.size
+    )
+    if (pointerIsNull(bio)) return false
+    val leaf = PEM_read_bio_X509_AUX(
+        bio, nativeNullPointer(), nativeNullPointer(), nativeNullPointer()
+    )
+    var loaded = !pointerIsNull(leaf) && SSL_CTX_use_certificate(context, leaf) == 1
+    if (!pointerIsNull(leaf)) X509_free(leaf)
+    var reading = loaded
+    while (reading) {
+        val intermediate = PEM_read_bio_X509(
+            bio, nativeNullPointer(), nativeNullPointer(), nativeNullPointer()
+        )
+        if (pointerIsNull(intermediate)) reading = false
+        // SSL_CTX_add0_chain_cert takes ownership on success.
+        else if (SSL_CTX_ctrl(context, 89, 0, intermediate) != 1) {
+            X509_free(intermediate)
+            loaded = false
+            reading = false
+        }
+    }
+    BIO_free(bio)
+    loaded
+}
+
+trusted fun webSocketServerTlsUsePemKey(context: i64*, text: string): bool {
+    val bio = BIO_new_mem_buf(
+        nativePointerFromAddress(nativeStringAddress(text)), text.size
+    )
+    if (pointerIsNull(bio)) return false
+    val key = PEM_read_bio_PrivateKey(
+        bio, nativeNullPointer(), nativeNullPointer(), nativeNullPointer()
+    )
+    val loaded = !pointerIsNull(key) && SSL_CTX_use_PrivateKey(context, key) == 1
+    if (!pointerIsNull(key)) EVP_PKEY_free(key)
+    BIO_free(bio)
+    loaded
+}
+
+// OpenSSL writes with write(2), which raises SIGPIPE on a socket the peer
+// reset; blocked, the write fails with EPIPE instead (Darwin sockets already
+// carry SO_NOSIGPIPE).
+fun webSocketServerTlsBlockBrokenPipe(): void {
+    val signals = nativeByteBuffer(8)
+    signals.storeI64(0, 4096)
+    linuxSyscall4(14, 0, nativePointerAddress(signals.address), 0, 8)
+    signals.close()
+    return
+}
+
+fun webSocketServerTlsStatus(code: int, failure: int): int = when (code) {
+    2 -> webSocketServerTlsWantsRead
+    3 -> webSocketServerTlsWantsWrite
+    else -> failure
+}
+
+trusted fun webSocketServerTlsStart(context: int, descriptor: int): int {
+    webSocketServerTlsBlockBrokenPipe()
+    ERR_clear_error()
+    val session = SSL_new(nativePointerFromAddress(context))
+    if (pointerIsNull(session)) return 0
+    if (SSL_set_fd(session, descriptor) != 1) {
+        SSL_free(session)
+        return 0
+    }
+    // SSL_CTRL_MODE: SSL_MODE_ENABLE_PARTIAL_WRITE |
+    // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_RELEASE_BUFFERS (idle
+    // connections hold no record buffers).
+    SSL_ctrl(session, 33, 19, "")
+    nativePointerAddress(session)
+}
+
+trusted fun webSocketServerTlsHandshake(session: int): int {
+    ERR_clear_error()
+    val pointer = nativePointerFromAddress(session)
+    val result: int = SSL_accept(pointer)
+    if (result == 1) 1 else {
+        val code: int = SSL_get_error(pointer, i32(result))
+        webSocketServerTlsStatus(code, -5)
+    }
+}
+
+trusted fun webSocketServerTlsRead(
+    session: int,
+    var result: WebSocketServerRead
+): void {
+    ERR_clear_error()
+    val stack = nativeStackAllocate(16384)
+    val pointer = nativePointerFromAddress(session)
+    val measured: int = SSL_read(pointer, nativePointerFromAddress(stack), 16384)
+    if (measured > 0) {
+        val target = nativeByteBuffer(measured + 1)
+        ablaUnsafeCopyMemory(nativePointerAddress(target.address), stack, measured)
+        result.text = target.adoptString(measured)
+        result.status = measured
+    } else {
+        result.text = ""
+        val code: int = SSL_get_error(pointer, i32(measured))
+        // SSL_ERROR_ZERO_RETURN: the peer closed.
+        result.status = if (code == 6) 0 else webSocketServerTlsStatus(code, -5)
+    }
+    return
+}
+
+// Writes at most one record. A retry after a pending write passes the same
+// bytes at the same offset, at least as long, as OpenSSL requires.
+trusted fun webSocketServerTlsWrite(
+    session: int,
+    contents: string,
+    offset: int
+): int {
+    ERR_clear_error()
+    val pointer = nativePointerFromAddress(session)
+    var length = contents.size - offset
+    if (length > 16384) length = 16384
+    val written: int = SSL_write(
+        pointer, contents.slice(offset, offset + length), length
+    )
+    if (written > 0) written else {
+        val code: int = SSL_get_error(pointer, i32(written))
+        webSocketServerTlsStatus(code, -32)
+    }
+}
+
+trusted fun webSocketServerTlsPending(session: int): bool =
+    SSL_has_pending(nativePointerFromAddress(session)) == 1
+
+trusted fun webSocketServerTlsFree(session: int, notify: bool): void {
+    val pointer = nativePointerFromAddress(session)
+    if (notify) SSL_shutdown(pointer)
+    SSL_free(pointer)
+    ERR_clear_error()
+    return
+}
+
+trusted fun webSocketServerTlsRetain(context: int): bool =
+    SSL_CTX_up_ref(nativePointerFromAddress(context)) == 1
+
+trusted fun webSocketServerTlsRelease(context: int): void {
+    SSL_CTX_free(nativePointerFromAddress(context))
+    return
+}

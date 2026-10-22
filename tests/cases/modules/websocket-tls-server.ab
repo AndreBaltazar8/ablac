@@ -1,0 +1,305 @@
+import "abla/websocket/server"
+import "abla/websocket/server/tls"
+import "abla/websocket/tls"
+import "abla/tls/hosted"
+import "abla/fs"
+import "abla/io"
+
+// A TLS WebSocket server on the IPv6 loopback (the hosted TLS client resolves
+// `localhost` there), with the certificate tools/test-websocket-tls-server.sh
+// generates. Clients run in forked child processes.
+
+val tlsServerCertificate = "build/websocket-tls-server/certificate.pem"
+val tlsServerPrivateKey = "build/websocket-tls-server/private-key.pem"
+val tlsServerLargeSize = 1000000
+
+fun tlsServerLargePayload(): string {
+    val output = byteBuffer()
+    var index = 0
+    while (index < tlsServerLargeSize) {
+        output.appendByteValue((index * 7 + index / 251) & 255)
+        index = index + 1
+    }
+    output.toText()
+}
+
+fun tlsServerConnect(port: int, path: string): TlsWebSocketConnection =
+    webSocketTlsClientWithCa("localhost", path, tlsServerCertificate, port, 3000)
+
+// Sends a close frame and waits for the server's echo.
+fun tlsServerClose(var socket: TlsWebSocketConnection): bool {
+    val frame = webSocketEncodeFrame(
+        webSocketClosePayload(1000, "done"), 8, true, socket.maskingKey
+    )
+    val sent = socket.stream.write(frame) == frame.size
+    val echo = socket.readFrame(1024)
+    socket.stream.close()
+    socket.closed = true
+    sent && echo.available && echo.frame.opcode == 8
+}
+
+// Text, ping and binary round trips, then the closing handshake.
+fun tlsServerEchoClient(port: int): int {
+    var socket = tlsServerConnect(port, "/echo")
+    if (socket.closed) return 1
+    if (!socket.sendText("secure hello")) return 2
+    val text = socket.readFrame(1024)
+    if (!text.available || text.frame.opcode != 1 ||
+        text.frame.payload != "re:secure hello") return 3
+    val ping = webSocketEncodeFrame("beat", 9, true, socket.maskingKey)
+    if (socket.stream.write(ping) != ping.size) return 4
+    val pong = socket.readFrame(1024)
+    if (!pong.available || pong.frame.opcode != 10 ||
+        pong.frame.payload != "beat") return 5
+    if (!socket.sendBinary("\x00\x01\xfe\xff")) return 6
+    val binary = socket.readFrame(1024)
+    if (!binary.available || binary.frame.opcode != 2 ||
+        binary.frame.payload != "\x00\x01\xfe\xff") return 7
+    if (!tlsServerClose(socket)) return 8
+    0
+}
+
+fun tlsServerAdmittedClient(port: int): int {
+    var socket = tlsServerConnect(port, "/admit?tk=good")
+    if (socket.closed) return 1
+    if (!socket.sendText("admitted")) return 2
+    val reply = socket.readFrame(1024)
+    if (!reply.available || reply.frame.payload != "re:admitted") return 3
+    if (!tlsServerClose(socket)) return 4
+    0
+}
+
+fun tlsServerDeniedClient(port: int): int {
+    val socket = tlsServerConnect(port, "/admit?tk=bad")
+    if (socket.closed) 0 else 1
+}
+
+// A plain HTTP route over TLS on the same port.
+fun tlsServerHttpClient(port: int): int {
+    var connection = tlsConnectWithCa("localhost", tlsServerCertificate, port, 3000)
+    if (connection.handle < 0) return 1
+    val request = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    if (connection.write(request) != request.size) return 2
+    var response = ""
+    var reading = true
+    while (reading) {
+        val chunk = connection.read(65536)
+        if (chunk == "") reading = false
+        else response = "$response$chunk"
+    }
+    connection.close()
+    if (response.slice(0, 12) == "HTTP/1.1 200" &&
+        textFindSequence(response, "\r\n\r\nhealthy", 0, response.size) > 0) 0
+    else 3
+}
+
+// The server echoes three copies (3 MB), which back up while this client
+// waits, so they are written in parts as the client drains them.
+fun tlsServerLargeClient(port: int): int {
+    var socket = tlsServerConnect(port, "/large")
+    if (socket.closed) return 1
+    val payload = tlsServerLargePayload()
+    if (!socket.sendBinary(payload)) return 2
+    linuxSleep(300)
+    var copy = 0
+    while (copy < 3) {
+        val echo = socket.readFrame(2000000)
+        if (!echo.available || echo.frame.opcode != 2) return 3
+        if (echo.frame.payload != payload) return 4
+        copy = copy + 1
+    }
+    if (!tlsServerClose(socket)) return 5
+    0
+}
+
+// Sends a large message and closes with the echo unread, so the socket resets
+// under the server's writes: they must fail without a SIGPIPE.
+fun tlsServerResetClient(port: int): int {
+    var socket = tlsServerConnect(port, "/reset")
+    if (socket.closed) return 1
+    if (!socket.sendBinary(tlsServerLargePayload())) return 2
+    linuxSleep(100)
+    socket.stream.close()
+    0
+}
+
+// Opens TCP and never starts the handshake; the server must drop it at its
+// TLS handshake timeout while serving everyone else.
+fun tlsServerStalledClient(port: int): int {
+    var connection = tcpConnectIpv6(ipv6Loopback(port), 1000)
+    if (connection.descriptor < 0) return 1
+    val started = linuxMonotonicMilliseconds()
+    val incoming = connection.readWithTimeoutResult(65536, 6000)
+    val elapsed = linuxMonotonicMilliseconds() - started
+    connection.close()
+    if (incoming.reachedEof() && elapsed >= 1000 && elapsed < 5000) 0 else 2
+}
+
+// Plain HTTP at the TLS port fails the handshake; only this socket closes.
+fun tlsServerGarbageClient(port: int): int {
+    var connection = tcpConnectIpv6(ipv6Loopback(port), 1000)
+    if (connection.descriptor < 0) return 1
+    connection.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    var closed = false
+    var waiting = true
+    while (waiting) {
+        val incoming = connection.readWithTimeoutResult(65536, 3000)
+        if (incoming.reachedEof() || incoming.failed()) {
+            closed = true
+            waiting = false
+        } else if (!incoming.hasData()) waiting = false
+    }
+    connection.close()
+    if (closed) 0 else 2
+}
+
+// The PEM-text server admits upgrades itself (open events).
+fun tlsServerPemClient(port: int): int {
+    var socket = tlsServerConnect(port, "/auto")
+    if (socket.closed) return 1
+    if (!socket.sendText("pem")) return 2
+    val reply = socket.readFrame(1024)
+    if (!reply.available || reply.frame.payload != "re:pem") return 3
+    if (!tlsServerClose(socket)) return 4
+    0
+}
+
+fun tlsServerHas(values: array<int>, wanted: int): bool {
+    for (value in values) if (value == wanted) return true
+    false
+}
+
+fun tlsServerSpawn(role: string, port: int, pemPort: int): LinuxChildProcess {
+    val process = linuxSyscall0(57)
+    if (process == 0) {
+        if (role != "stalled") linuxSleep(200)
+        val status = when (role) {
+            "stalled" -> tlsServerStalledClient(port)
+            "garbage" -> tlsServerGarbageClient(port)
+            "echo" -> tlsServerEchoClient(port)
+            "admitted" -> tlsServerAdmittedClient(port)
+            "denied" -> tlsServerDeniedClient(port)
+            "http" -> tlsServerHttpClient(port)
+            "large" -> tlsServerLargeClient(port)
+            "reset" -> tlsServerResetClient(port)
+            else -> tlsServerPemClient(pemPort)
+        }
+        linuxSyscall1(60, status)
+    }
+    LinuxChildProcess(process)
+}
+
+fun main: int {
+    val missing = webSocketServerTls("build/websocket-tls-server/missing.pem", tlsServerPrivateKey)
+    val unserved = webSocketServerIpv6(
+        ipv6Loopback(0), WebSocketServerOptions(tls = missing), false
+    )
+    val tls = webSocketServerTls(tlsServerCertificate, tlsServerPrivateKey, 1500)
+    val pemTls = webSocketServerTlsPem(
+        path(tlsServerCertificate).readText(), path(tlsServerPrivateKey).readText()
+    )
+    if (missing.error == "" || unserved.localPort() != -1 || tls.error != "" ||
+        pemTls.error != "") {
+        println("config: missing='${missing.error}' unserved=${unserved.localPort()} tls='${tls.error}' pem='${pemTls.error}'")
+        return 1
+    }
+    val server = webSocketServerIpv6(
+        ipv6Loopback(0),
+        WebSocketServerOptions(manualAdmission = true, tls = tls),
+        false
+    )
+    val pemServer = webSocketServerIpv6(
+        ipv6Loopback(0), WebSocketServerOptions(tls = pemTls), false
+    )
+    val port = server.localPort()
+    val roles = [
+        "stalled", "garbage", "echo", "admitted", "denied", "http", "large",
+        "reset", "pem"
+    ]
+    val children: array<LinuxChildProcess> = []
+    val running: array<bool> = []
+    for (role in roles) {
+        children.append(tlsServerSpawn(role, port, pemServer.localPort()))
+        running.append(true)
+    }
+    val statuses: array<int> = []
+    var failures = 0
+    var admitted = 0
+    var messages = 0
+    var httpRequests = 0
+    var opens = 0
+    var servedWhileStalled = false
+    var partialWrites = false
+    var peerAddresses = 0
+    val resetIds: array<int> = []
+    var loops = 0
+    while (statuses.size < roles.size && loops < 3000) {
+        server.step(2)
+        pemServer.step(0)
+        for (event in server.takeEvents()) {
+            if (event.isRequest()) {
+                val slot = server.slotOf(event.id)
+                if (slot >= 0 && linuxSocketAddressIpv6(
+                    server.descriptors[slot], true
+                ).port > 0) peerAddresses = peerAddresses + 1
+                if (event.path() == "/reset") resetIds.append(event.id)
+                if (event.query("tk") == "bad") server.reject(event.id, 401, "no")
+                else if (server.accept(event.id)) admitted = admitted + 1
+                else failures = failures + 1
+            } else if (event.isMessage()) {
+                if (!tlsServerHas(resetIds, event.id)) messages = messages + 1
+                if (server.stats.timeouts == 0) servedWhileStalled = true
+                if (event.payload.size == tlsServerLargeSize) {
+                    if (event.payload != tlsServerLargePayload()) failures = failures + 1
+                    val frame = webSocketServerEncode(event.payload, true)
+                    server.sendEncoded(event.id, frame)
+                    server.sendEncoded(event.id, frame)
+                    server.sendEncoded(event.id, frame)
+                    server.flush()
+                    if (server.bufferedAmount(event.id) > 0) partialWrites = true
+                } else if (event.binary) server.send(event.id, event.payload, true)
+                else server.sendText(event.id, "re:${event.payload}")
+            } else if (event.isHttp()) {
+                httpRequests = httpRequests + 1
+                if (event.path() != "/health") failures = failures + 1
+                server.respond(event.id, httpText("healthy"))
+            }
+        }
+        for (event in pemServer.takeEvents()) {
+            if (event.isOpen()) opens = opens + 1
+            else if (event.isMessage()) pemServer.sendText(event.id, "re:${event.payload}")
+        }
+        var child = 0
+        while (child < children.size) {
+            if (running[child]) {
+                val waited = linuxWaitProcess(children[child].process, true)
+                if (waited.output != "pending") {
+                    running[child] = false
+                    statuses.append(waited.status)
+                    if (waited.status != 0) {
+                        println("${roles[child]}: status ${waited.status}")
+                    }
+                }
+            }
+            child = child + 1
+        }
+        loops = loops + 1
+    }
+    server.step(10)
+    server.drain()
+    pemServer.drain()
+    var clientFailures = 0
+    for (status in statuses) if (status != 0) clientFailures = clientFailures + 1
+    val stats = server.stats
+    if (statuses.size == roles.size && clientFailures == 0 && failures == 0 &&
+        admitted == 4 && messages == 4 && httpRequests == 1 && opens == 1 &&
+        servedWhileStalled && partialWrites && peerAddresses == 5 &&
+        stats.timeouts == 1 && stats.tlsHandshakeFailures == 2 &&
+        server.connectionCount() == 0 && server.stopped) {
+        println("websocket-tls-server: ok")
+        42
+    } else {
+        println("statuses=${statuses.size} clientFailures=$clientFailures failures=$failures admitted=$admitted messages=$messages http=$httpRequests opens=$opens servedWhileStalled=$servedWhileStalled partialWrites=$partialWrites peers=$peerAddresses timeouts=${stats.timeouts} tlsFailures=${stats.tlsHandshakeFailures} active=${server.connectionCount()}")
+        1
+    }
+}

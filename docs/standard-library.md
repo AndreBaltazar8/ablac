@@ -69,6 +69,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/websocket/json`, `/rpc` | bounded JSON messages and transport-neutral RPC method routing |
 | `abla/websocket/event` | bounded epoll WebSocket manager with fragmentation, ping/pong, and output backpressure |
 | `abla/websocket/server` | connection-oriented WebSocket server with admission, broadcast and draining |
+| `abla/websocket/server/tls` | TLS for `abla/websocket/server`: a certificate and key as `WebSocketServerOptions(tls = ...)`, nonblocking handshakes |
 | `abla/websocket/tls` | certificate-verified WSS client transport |
 | `abla/jwt`, `abla/jwt/remote` | JWS RS256/ES256 verification against a key set, and a cached remote JWKS |
 | `abla/compiler`, `abla/compiler/parser` | compile-time reflection, transforms, generated code and subparser APIs (compile time only) |

@@ -285,6 +285,54 @@ Silicon laptop over loopback, 1000 sockets receiving a 1 KiB snapshot per tick
 messages per second cost about 3.7 ms per tick for broadcast and flush and
 kept the event loop about 8% busy.
 
+#### TLS (`wss://` and `https://`)
+
+`abla/websocket/server/tls` serves the same server over TLS. Load one
+certificate chain and its private key (for example an ACME client's
+`fullchain.pem` and `privkey.pem`) with `webSocketServerTls`, or from PEM text
+with `webSocketServerTlsPem`, and pass the result as
+`WebSocketServerOptions(tls = ...)`. Everything above works unchanged:
+upgrades, manual admission, plain HTTP routes on the same port, frames, ping
+and close, backpressure and partial writes. `descriptors[server.slotOf(id)]`
+is still the peer's socket, so `linuxSocketAddress` reads its address.
+
+```abla build
+import "abla/io"
+import "abla/websocket/server"
+import "abla/websocket/server/tls"
+
+fun main: int {
+    val tls = webSocketServerTls("fullchain.pem", "privkey.pem")
+    if (tls.error != "") {
+        println(tls.error)
+        return 1
+    }
+    val server = webSocketServer(ipv4Any(8443), WebSocketServerOptions(tls = tls))
+    server.enableGracefulShutdown()
+    while (!server.shutdownRequested()) {
+        server.step(50)
+        for (event in server.takeEvents()) {
+            if (event.isMessage()) server.send(event.id, event.payload, event.binary)
+            else if (event.isHttp()) server.respond(event.id, httpText("ok"))
+        }
+    }
+    server.drain()
+    0
+}
+```
+
+The handshake is nonblocking and runs inside `step`, like everything else:
+a client that connects and never finishes it holds only its own socket, and is
+closed when `handshakeTimeoutMilliseconds` (the third argument, 5000 by
+default) runs out, counted from the accept. A failed or timed-out handshake
+closes only that socket; no event is surfaced for it (the connection never
+reached the application), and `server.stats.tlsHandshakeFailures` counts it.
+Connections negotiate TLS 1.2 or later with one certificate (no SNI). A
+configuration that failed to load has a non-empty `error`, and a server given
+it closes its listener (`localPort()` is -1) rather than serve plaintext. Only
+programs that import `abla/websocket/server/tls` link OpenSSL; a plain server
+does not.
+
 ### Nonblocking HTTP client
 
 `abla/http/async` issues HTTP/1.1 and HTTPS requests from an event loop.
@@ -457,6 +505,7 @@ provide HTTPS and WSS client transports. Hosted secure random is supplied by
 | `tlsConnectWithCa(host, caPath, port, timeout)` | the same, trusting the given CA file |
 | `tlsUpgrade(var connection, host, caPath = "")` | start TLS on an existing TCP connection |
 | `tlsListen(certificatePath, privateKeyPath, host = "::", port = 443, ...)` | a `TlsListener`, with `accept()` |
+| `webSocketServerTls(certificatePath, privateKeyPath, handshakeTimeoutMilliseconds = 5000)` | from `abla/websocket/server/tls`: a `WebSocketServerTls` for `WebSocketServerOptions(tls = ...)` ([TLS](#tls-wss-and-https)); `webSocketServerTlsPem` takes PEM text |
 | `tlsAvailable()`, `tlsLastError()` | whether OpenSSL could be loaded, and the last error |
 
 ## Persistent HTTP and streaming
