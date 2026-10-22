@@ -22,7 +22,7 @@ define install_launcher
 	fi
 endef
 
-.PHONY: all bootstrap ablac ablac-dev self-rebuild test check compile benchmark \
+.PHONY: all bootstrap ablac ablac-dev self-rebuild test test-serial check compile benchmark \
 	benchmark-network clean prepare-test-driver
 
 all: ablac
@@ -68,7 +68,13 @@ self-rebuild: ablac
 prepare-test-driver:
 	tools/prepare-abla-test-driver.sh
 
+# The suite below, several commands at a time (JOBS=N caps them; the default is
+# the number of CPUs), one log each (tools/run-tests.sh). `make test-serial`
+# runs it one command after another.
 test: ablac
+	tools/run-tests.sh $(COMPILER)
+
+test-serial: ablac
 	tools/test-version.sh $(COMPILER)
 	tools/test-analysis-service.sh $(COMPILER)
 	tools/test-deep-logical.sh $(COMPILER)
@@ -148,7 +154,7 @@ test: ablac
 	tools/test-diagnostic-noise.sh $(COMPILER)
 	tools/test-compile-time-lift.sh $(COMPILER)
 	tools/test-compile-time-diagnostics.sh $(COMPILER)
-	PARITY_SET=probes tools/test-compile-time-parity.sh $(COMPILER)
+	PARITY_SET=probes PARITY_OUTPUT=$(BUILD_DIR)/compile-time-parity-probes tools/test-compile-time-parity.sh $(COMPILER)
 	tools/test-scoped-region.sh $(COMPILER)
 	tools/test-exhaustive-when.sh $(COMPILER)
 	tools/test-loop-control.sh $(COMPILER)
