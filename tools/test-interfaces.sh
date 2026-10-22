@@ -40,6 +40,7 @@ rejected() { # $1 = case, then the texts its diagnostics must contain
 }
 
 runs conformance "3 true false"
+runs one-line "9 xt"
 runs modules/main "shape of 12 true shape of 12"
 export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096}
 dispatched="14 shape of 4 circle square 2 circle square 3 true true true"
