@@ -2364,6 +2364,10 @@ fun main {
   alias `E_NAME_PRIVATE`, and `@export` on one is `private.export`.
   (`internal`, for a package, is reserved.) The standard library never reads
   a program's global `val`s and `var`s (`library.program-global`).
+- A program's declaration named like a built-in (`Cell`, `Shared`, `Mutex`,
+  `Map`, `filledArray`, `move`) hides the built-in in its own module and in
+  the modules that import it, as a type too (`val c: Cell = Cell(1)`). Other
+  modules, and the standard library, keep the built-in.
 - Names are lexical: code resolves names as the module it is written in
   sees them. A module's `#` code sees its private declarations. So do the
   modules generated for it (the members `compiler.addConformance` adds, a

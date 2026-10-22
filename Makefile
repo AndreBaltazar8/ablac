@@ -267,6 +267,7 @@ test: ablac
 	tools/test-websocket-tls-server.sh $(COMPILER)
 	tools/test-commit-edits.sh $(COMPILER)
 	tools/test-conformance-ir-cache.sh $(COMPILER)
+	tools/test-builtin-names.sh $(COMPILER)
 
 check: test self-rebuild
 
