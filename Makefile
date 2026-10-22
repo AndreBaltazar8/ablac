@@ -261,6 +261,7 @@ test: ablac
 	tools/test-private.sh $(COMPILER)
 	tools/test-strict-imports.sh $(COMPILER)
 	tools/test-generics.sh $(COMPILER)
+	tools/test-transform-reuse.sh $(COMPILER)
 
 check: test self-rebuild
 
