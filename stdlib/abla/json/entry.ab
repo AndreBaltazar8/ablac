@@ -1130,6 +1130,93 @@ private fun jsonScanValue(var state: JsonParserState, depth: int): void {
     }
 }
 
+// The end of the JSON number (RFC 8259: -?(0|[1-9][0-9]*)(.[0-9]+)?
+// ([eE][+-]?[0-9]+)?) starting at `begin`, or -1. A number running on into
+// more number bytes ("1-2", "01", "1.5.") is -1 too, as jsonScanNumber
+// reports it.
+fun jsonNumberEnd(source: string, begin: int): int {
+    var offset = begin
+    val size = source.size
+    if (offset < size && source[offset] == 45) offset = offset + 1
+    if (offset >= size) return -1
+    val lead = source[offset]
+    if (lead == 48) offset = offset + 1
+    else if (lead >= 49 && lead <= 57) {
+        while (offset < size && source[offset] >= 48 && source[offset] <= 57) {
+            offset = offset + 1
+        }
+    } else return -1
+    if (offset < size && source[offset] == 46) {
+        offset = offset + 1
+        val fraction = offset
+        while (offset < size && source[offset] >= 48 && source[offset] <= 57) {
+            offset = offset + 1
+        }
+        if (offset == fraction) return -1
+    }
+    if (offset < size && (source[offset] == 101 || source[offset] == 69)) {
+        offset = offset + 1
+        if (offset < size && (source[offset] == 43 || source[offset] == 45)) {
+            offset = offset + 1
+        }
+        val digits = offset
+        while (offset < size && source[offset] >= 48 && source[offset] <= 57) {
+            offset = offset + 1
+        }
+        if (offset == digits) return -1
+    }
+    if (offset < size) {
+        val byte = source[offset]
+        if ((byte >= 48 && byte <= 57) || byte == 45 || byte == 43 ||
+            byte == 46 || byte == 101 || byte == 69) return -1
+    }
+    offset
+}
+
+// Any JSON number as the nearest f64, read in place (f64ParseRange: no
+// allocation up to 18 significant digits).
+fun jsonReadNumber(var state: JsonParserState): f64 {
+    val begin = ablaJsonWhitespaceEnd(state.source, state.offset)
+    val end = if (state.errorCode.size == 0) jsonNumberEnd(state.source, begin)
+        else -1
+    if (end > begin) {
+        state.offset = end
+        return f64ParseRange(state.source, begin, end)
+    }
+    if (state.errorCode.size == 0) state.fail(
+        "invalid_number", "expected JSON number", begin
+    )
+    0.0
+}
+
+// The kind of the value at the cursor (Json.kind's codes: 0 null, 1 string,
+// 2 number, 3 boolean, 4 array, 5 object), or -1 when there is none.
+fun jsonPeekKind(state: JsonParserState): int {
+    if (state.errorCode.size != 0) return -1
+    val offset = ablaJsonWhitespaceEnd(state.source, state.offset)
+    if (offset >= state.source.size) return -1
+    val byte = state.source[offset]
+    if (byte == 34) 1
+    else if ((byte >= 48 && byte <= 57) || byte == 45) 2
+    else if (byte == 123) 5
+    else if (byte == 91) 4
+    else if (byte == 116 || byte == 102) 3
+    else if (byte == 110) 0
+    else -1
+}
+
+// Consumes a `null` at the cursor; leaves the cursor where it was otherwise.
+fun jsonReadNull(var state: JsonParserState): bool {
+    if (state.errorCode.size != 0) return false
+    val offset = ablaJsonWhitespaceEnd(state.source, state.offset)
+    val source = state.source
+    val matches = offset + 4 <= source.size && source[offset] == 110 &&
+        source[offset + 1] == 117 && source[offset + 2] == 108 &&
+        source[offset + 3] == 108
+    if (matches) state.offset = offset + 4
+    matches
+}
+
 fun jsonObjectReader(
     source: string,
     limits: JsonLimits = jsonDefaultLimits()
@@ -1376,6 +1463,36 @@ fun JsonObjectReader.readBoolean(): bool {
     value
 }
 
+/** Any JSON number (fraction and exponent included) as the nearest f64. */
+fun JsonObjectReader.readNumber(): f64 {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    val value = jsonReadNumber(this.state)
+    this.expectingValue = false
+    value
+}
+
+/**
+ * The current value's kind without consuming it, as Json.kind numbers kinds
+ * (0 null, 1 string, 2 number, 3 boolean, 4 array, 5 object); -1 when there
+ * is no current value or the reader has failed.
+ */
+fun JsonObjectReader.peek(): int =
+    if (this.expectingValue) jsonPeekKind(this.state) else -1
+
+/** Consumes a `null` value and returns true; false leaves the value unread. */
+fun JsonObjectReader.readNull(): bool {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON object reader has no current value",
+        this.state.offset
+    )
+    val read = jsonReadNull(this.state)
+    if (read) this.expectingValue = false
+    read
+}
+
 fun JsonObjectReader.readObject(): JsonObjectReader {
     if (!this.expectingValue) this.state.fail(
         "unexpected_token", "JSON object reader has no current value",
@@ -1580,6 +1697,36 @@ fun JsonArrayReader.readBoolean(): bool {
     }
     this.expectingValue = false
     value
+}
+
+/** Any JSON number (fraction and exponent included) as the nearest f64. */
+fun JsonArrayReader.readNumber(): f64 {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON array reader has no current value",
+        this.state.offset
+    )
+    val value = jsonReadNumber(this.state)
+    this.expectingValue = false
+    value
+}
+
+/**
+ * The current value's kind without consuming it, as Json.kind numbers kinds
+ * (0 null, 1 string, 2 number, 3 boolean, 4 array, 5 object); -1 when there
+ * is no current value or the reader has failed.
+ */
+fun JsonArrayReader.peek(): int =
+    if (this.expectingValue) jsonPeekKind(this.state) else -1
+
+/** Consumes a `null` value and returns true; false leaves the value unread. */
+fun JsonArrayReader.readNull(): bool {
+    if (!this.expectingValue) this.state.fail(
+        "unexpected_token", "JSON array reader has no current value",
+        this.state.offset
+    )
+    val read = jsonReadNull(this.state)
+    if (read) this.expectingValue = false
+    read
 }
 
 fun JsonArrayReader.readObject(): JsonObjectReader {

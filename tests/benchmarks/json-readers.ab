@@ -1,0 +1,146 @@
+// Typed decoding of a large data file with the forward JSON readers: an array
+// of objects with many short numeric keys (a quarter fractions, every
+// twentieth null), read with next() + peek()/readNull()/readNumber(), with
+// nextExpectedRaw() + readNumber(), and with readInteger() on integer-only
+// data for comparison; jsonParse builds the tree for perspective.
+//
+//     ablac build tests/benchmarks/json-readers.ab -o json-readers   (optimized: not --fast)
+//     ./json-readers [objects] [keys]          (defaults 8000 objects, 180 keys)
+
+import "abla/io"
+import "abla/bytes"
+import "abla/float"
+import "abla/float/text"
+import "abla/json"
+import "abla/process"
+
+fun benchKey(index: int): string = "k$index"
+
+// A large trusted file: raise bytes, nodes and members (and reject no keys).
+val benchLimits = JsonLimits(1073741824, 64, 1073741824, 1048576, 65536, false)
+
+fun benchSource(objects: int, keys: int, integersOnly: bool): string {
+    val output = byteBuffer()
+    output.appendText("[")
+    var row = 0
+    while (row < objects) {
+        if (row > 0) output.appendText(",")
+        output.appendText("{")
+        var key = 0
+        while (key < keys) {
+            if (key > 0) output.appendText(",")
+            output.appendText("\"k$key\":")
+            val value = row * 31 + key * 7
+            if (integersOnly) output.appendText("$value")
+            else if (key % 20 == 19) output.appendText("null")
+            else if (key % 4 == 3) output.appendText("$value.${key % 100}")
+            else if (key % 9 == 8) output.appendText("-${value}e-2")
+            else output.appendText("$value")
+            key = key + 1
+        }
+        output.appendText("}")
+        row = row + 1
+    }
+    output.appendText("]")
+    output.toText()
+}
+
+fun benchNext(source: string): f64 {
+    val rows = jsonArrayReader(source, benchLimits)
+    var sum = 0.0
+    while (rows.next()) {
+        val row = rows.readObject()
+        while (!row.done) {
+            row.next()
+            if (row.done) break
+            if (!row.readNull()) sum = sum + row.readNumber()
+        }
+    }
+    if (!rows.finish()) println("next: ${rows.state.errorMessage}")
+    sum
+}
+
+fun benchExpected(source: string, names: array<string>): f64 {
+    val rows = jsonArrayReader(source, benchLimits)
+    var sum = 0.0
+    while (rows.next()) {
+        val row = rows.readObject()
+        for (name in names) {
+            row.nextExpectedRaw(name)
+            if (row.peek() == 0) row.readNull() else sum = sum + row.readNumber()
+        }
+        row.finishNested()
+    }
+    if (!rows.finish()) println("expected: ${rows.state.errorMessage}")
+    sum
+}
+
+fun benchNumbers(source: string, names: array<string>): f64 {
+    val rows = jsonArrayReader(source, benchLimits)
+    var sum = 0.0
+    while (rows.next()) {
+        val row = rows.readObject()
+        for (name in names) {
+            row.nextExpectedRaw(name)
+            sum = sum + row.readNumber()
+        }
+        row.finishNested()
+    }
+    if (!rows.finish()) println("numbers: ${rows.state.errorMessage}")
+    sum
+}
+
+fun benchIntegers(source: string, names: array<string>): int {
+    val rows = jsonArrayReader(source, benchLimits)
+    var sum = 0
+    while (rows.next()) {
+        val row = rows.readObject()
+        for (name in names) {
+            row.nextExpectedRaw(name)
+            sum = sum + row.readInteger()
+        }
+        row.finishNested()
+    }
+    if (!rows.finish()) println("integers: ${rows.state.errorMessage}")
+    sum
+}
+
+fun nanosecondsPerField(began: int, objects: int, keys: int): string =
+    f64Text(f64FromInt((monotonicNanoseconds() - began) * 10 / (objects * keys)) / 10.0)
+
+fun main {
+    val objects = if (processArgumentCount() > 0) textToInteger(processArgument(0)) else 8000
+    val keys = if (processArgumentCount() > 1) textToInteger(processArgument(1)) else 180
+    val names: array<string> = []
+    var index = 0
+    while (index < keys) {
+        names.append(benchKey(index))
+        index = index + 1
+    }
+    val mixed = benchSource(objects, keys, false)
+    val integers = benchSource(objects, keys, true)
+    println("$objects objects x $keys keys: ${mixed.size} bytes mixed, ${integers.size} integer-only")
+
+    var began = monotonicNanoseconds()
+    val viaNext = benchNext(mixed)
+    println("next + readNull/readNumber:          ${nanosecondsPerField(began, objects, keys)} ns/field")
+    began = monotonicNanoseconds()
+    val viaExpected = benchExpected(mixed, names)
+    println("nextExpectedRaw + peek/readNumber:   ${nanosecondsPerField(began, objects, keys)} ns/field")
+    began = monotonicNanoseconds()
+    val viaNumbers = benchNumbers(integers, names)
+    println("nextExpectedRaw + readNumber (ints):  ${nanosecondsPerField(began, objects, keys)} ns/field")
+    began = monotonicNanoseconds()
+    val viaIntegers = benchIntegers(integers, names)
+    println("nextExpectedRaw + readInteger (ints): ${nanosecondsPerField(began, objects, keys)} ns/field")
+    began = monotonicNanoseconds()
+    val tree = jsonParse(mixed, benchLimits)
+    println("jsonParse tree (for perspective):    ${nanosecondsPerField(began, objects, keys)} ns/field")
+    if (viaNext != viaExpected || viaNumbers != f64FromInt(viaIntegers) || viaIntegers <= 0 || !tree.succeeded) println("MISMATCH")
+}
+
+fun textToInteger(text: string): int {
+    var value = 0
+    for (byte in text) if (byte >= 48 && byte <= 57) value = value * 10 + byte - 48
+    value
+}

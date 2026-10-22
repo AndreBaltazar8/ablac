@@ -249,8 +249,90 @@ fun rawWhitespaceAndPlainStringsWork(): bool {
     true
 }
 
+// readNumber, peek and readNull on both readers: any JSON number as the
+// nearest f64, the next value's kind without consuming it, and null or not.
+fun numbersAndNullsWork(): bool {
+    val reader = jsonObjectReader(
+        "{\"id\":7,\"name\":\"cell\",\"x\":-12.5,\"y\":3e2,\"z\":-2.5E-3," +
+        "\"w\":0.1,\"gone\":null,\"tags\":[1, null ,\"t\",true,{},[],-0]," +
+        "\"big\":1.7976931348623157e308,\"tiny\":5e-324,\"many\":123456789012345678901234}"
+    )
+    var kinds = ""
+    var sum = 0.0
+    var nulls = 0
+    var negativeZero = false
+    while (!reader.done && reader.state.errorCode == "") {
+        val key = reader.next()
+        if (reader.done) break
+        val kind = reader.peek()
+        if (kind != reader.peek()) return false
+        kinds = "$kinds$kind"
+        if (key == "name") {
+            if (reader.readNull() || reader.readString() != "cell") return false
+        } else if (key == "gone") {
+            if (!reader.readNull()) return false
+            nulls = nulls + 1
+        } else if (key == "tags") {
+            val tags = reader.readArray()
+            var tagKinds = ""
+            while (tags.next()) {
+                val tagKind = tags.peek()
+                tagKinds = "$tagKinds$tagKind"
+                if (tags.readNull()) nulls = nulls + 1
+                else if (tagKind == 2) {
+                    val value = tags.readNumber()
+                    if (f64ToBits(value) == f64ToBits(-0.0)) negativeZero = true
+                    sum = sum + value
+                } else tags.skip()
+            }
+            if (tagKinds != "2013542" || tags.peek() != -1) return false
+        } else if (key == "big") {
+            if (reader.readNumber() != 1.7976931348623157e308) return false
+        } else if (key == "tiny") {
+            if (reader.readNumber() != 5e-324) return false
+        } else if (key == "many") {
+            if (reader.readNumber() != 1.2345678901234568e23) return false
+        } else sum = sum + reader.readNumber()
+    }
+    // 7 - 12.5 + 300 - 0.0025 + 0.1 + 1 - 0
+    if (!reader.finish() || kinds != "21222204222" || nulls != 2 ||
+        sum != 7.0 - 12.5 + 300.0 - 0.0025 + 0.1 + 1.0 || !negativeZero) return false
+    if (reader.peek() != -1) return false
+
+    // An integer through readNumber; readInteger still rejects a fraction.
+    val mixed = jsonArrayReader("[42, 1.5]")
+    if (!mixed.next() || mixed.readNumber() != 42.0) return false
+    if (!mixed.next() || mixed.readInteger() != 0 ||
+        mixed.state.errorCode != "invalid_number") return false
+
+    // Malformed numbers fail as readInteger's do, at the number.
+    for (bad in ["-", "01", "1.", ".5", "+1", "1e", "1e+", "1.5.2", "-x", "1-2", "\"1\"", "true", "nul"]) {
+        val array = jsonArrayReader("[$bad]")
+        if (!array.next()) return false
+        val value = array.readNumber()
+        if (value != 0.0 || array.state.errorCode != "invalid_number" ||
+            array.state.errorOffset != 1 || array.peek() != -1) return false
+    }
+    // readNull leaves anything else unread, even a string "null".
+    val notNull = jsonObjectReader("{\"a\":\"null\",\"b\": nul}")
+    if (notNull.next() != "a" || notNull.readNull() || notNull.peek() != 1 ||
+        notNull.readString() != "null") return false
+    if (notNull.next() != "b" || notNull.readNull() || notNull.peek() != 0) return false
+    notNull.skip()
+    if (notNull.state.errorCode == "") return false
+    // Reading with no current value fails as the other reads do.
+    val early = jsonArrayReader("[null]")
+    if (early.peek() != -1 || early.readNull() ||
+        early.state.errorCode != "unexpected_token") return false
+    val earlyNumber = jsonObjectReader("{\"a\":1}")
+    if (earlyNumber.readNumber() != 0.0 ||
+        earlyNumber.state.errorCode != "unexpected_token") return false
+    true
+}
+
 fun main: int {
     val rawReference = #rawWhitespaceAndPlainStringsWork()
+    val numbersReference = #numbersAndNullsWork()
     val frozen = #$json {"number": 20, "name": "abla"}
     val runtime = $json {"number": 20, "nested": [true, {"name": "abla"}]}
     val encoded = #$jsons {
@@ -263,6 +345,7 @@ fun main: int {
     else if (!nestedStreamingJsonWorks()) 4
     else if (!escapedSpansWork()) 5
     else if (!rawReference || !rawWhitespaceAndPlainStringsWork()) 6
+    else if (!numbersReference || !numbersAndNullsWork()) 7
     else if (frozen.getString("name") == runtime.at(1).at(1).getString("name")) {
         frozen.getInt("number") + runtime.getInt("number") + 2
     } else 0

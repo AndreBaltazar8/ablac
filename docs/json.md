@@ -156,12 +156,70 @@ checks as the tree parser.
 
 Schema readers can also traverse nested data without rescanning a retained raw
 slice. `readObject` and `readArray` return readers sharing the same forward
-parser state. Object readers additionally expose `readInteger` and
-`readBoolean`; array readers use `next` with `readString`, `readInteger`,
-`readBoolean`, `readObject`, `readArray`, or `skip`. Call `finishNested` before
+parser state. Object readers additionally expose `readInteger`,
+`readNumber`, `readBoolean` and `readNull`; array readers use `next` with
+`readString`, `readInteger`, `readNumber`, `readBoolean`, `readNull`,
+`readObject`, `readArray`, or `skip`, and both have `peek`. Call `finishNested` before
 continuing in the parent and `finish` on the root reader. The canonical
 `nextExpectedRaw` path fuses compact `,"name":` tokens while preserving the
 whitespace-aware diagnostic fallback.
+
+Typed decoding of numeric data needs three more reads, on both readers.
+`readNumber()` reads any JSON number (fraction and exponent included) as the
+nearest `f64`, in place, without allocating; a malformed number fails with
+`invalid_number` at the number, as `readInteger` does. `peek()` gives the
+current value's kind without consuming it, with `Json.kind`'s codes (0 null,
+1 string, 2 number, 3 boolean, 4 array, 5 object), or -1 when there is no
+current value or the reader has failed. `readNull()` consumes a `null` and
+returns true; for anything else it returns false and leaves the value to read:
+
+```abla
+import "abla/io"
+import "abla/json"
+import "abla/float/text"
+
+class Sample(val id: int, val x: f64, val y: f64, val label: string)
+
+fun main {
+    val rows = jsonArrayReader(
+        "[{\"id\":1,\"x\":-2.5e-1,\"y\":3,\"label\":null}," +
+        "{\"id\":2,\"x\":0.1,\"y\":1E2,\"label\":\"edge\"}]"
+    )
+    val samples: array<Sample> = []
+    while (rows.next()) {
+        val row = rows.readObject()
+        row.nextExpectedRaw("id")
+        val id = row.readInteger()
+        row.nextExpectedRaw("x")
+        val x = row.readNumber()
+        row.nextExpectedRaw("y")
+        val y = row.readNumber()
+        row.nextExpectedRaw("label")
+        val label = if (row.readNull()) "-" else row.readString()
+        row.finishNested()
+        samples.append(Sample(id, x, y, label))
+    }
+    println("valid ${rows.finish()}")
+    for (sample in samples) {
+        println("${sample.id} ${f64Text(sample.x)} ${f64Text(sample.y)} ${sample.label}")
+    }
+    val value = jsonObjectReader("{\"v\":[1]}")
+    value.next()
+    println("kind ${value.peek()}")
+}
+// output:
+// valid true
+// 1 -0.25 3 -
+// 2 0.1 100 edge
+// kind 4
+```
+
+On an optimized build, decoding objects of 180 short numeric keys this way
+(`tests/benchmarks/json-readers.ab`) costs about 70 ns per field with
+`nextExpectedRaw` and `readNumber` (about 50 ns with `readInteger` on integer
+data), against about 2 µs per field for `jsonParse`'s tree. `next()` costs
+more per field, since it decodes every key and checks it against the keys
+before it: prefer `nextExpectedRaw` when the producer's key order is known.
 
 For output, the single-pass `JsonEncoder` writes one validated stream without
 building fragments or a dynamic tree:
