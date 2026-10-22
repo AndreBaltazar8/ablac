@@ -218,8 +218,9 @@ On an optimized build, decoding objects of 180 short numeric keys this way
 (`tests/benchmarks/json-readers.ab`) costs about 70 ns per field with
 `nextExpectedRaw` and `readNumber` (about 50 ns with `readInteger` on integer
 data), against about 2 µs per field for `jsonParse`'s tree. `next()` costs
-more per field, since it decodes every key and checks it against the keys
-before it: prefer `nextExpectedRaw` when the producer's key order is known.
+about twice as much (150–200 ns), since it decodes every key; rejecting
+duplicate keys adds a hash-table lookup per key once an object has 16
+members. Prefer `nextExpectedRaw` when the producer's key order is known.
 
 For output, the single-pass `JsonEncoder` writes one validated stream without
 building fragments or a dynamic tree:

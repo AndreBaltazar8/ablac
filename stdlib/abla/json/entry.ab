@@ -77,7 +77,9 @@ class JsonObjectReader(
     val keys: array<string>,
     var first: bool,
     var done: bool,
-    var expectingValue: bool
+    var expectingValue: bool,
+    // The keys as a set, once an object rejecting duplicates grows long.
+    var keyIndex: JsonKeyTable? = null
 )
 
 // Forward-only array companion for schema-aware nested JSON. Object and array
@@ -824,6 +826,7 @@ private fun jsonParseValue(var state: JsonParserState, depth: int): Json {
         } else if (byte == 123) {
             state.offset = state.offset + 1
             val keys: array<string> = []
+            var keyIndex: JsonKeyTable? = null
             val values: array<Json> = []
             jsonSkipWhitespace(state)
             var closed = false
@@ -855,13 +858,13 @@ private fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                     )
                 }
                 var duplicate = false
-                var keyIndex = 0
-                while (keyIndex < keys.size) {
-                    if (keys[keyIndex] == key) duplicate = true
-                    keyIndex = keyIndex + 1
+                if (state.limits.rejectDuplicateKeys) {
+                    if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
+                        keyIndex = jsonKeyTable()
+                    }
+                    duplicate = jsonKeyRepeats(keys, keyIndex, key)
                 }
-                if (state.errorCode.size == 0 && duplicate &&
-                    state.limits.rejectDuplicateKeys) {
+                if (state.errorCode.size == 0 && duplicate) {
                     state.fail(
                         "duplicate_key", "duplicate JSON object key", state.offset
                     )
@@ -948,6 +951,86 @@ private fun jsonErrorLocation(source: string, offset: int): array<int> {
     }
     [line, column]
 }
+
+// The keys of an object rejecting duplicates, once it grows long: an open
+// addressing table of positions + 1 into `names`, probed linearly from each
+// name's FNV-1a hash and kept at most half full.
+class JsonKeyTable(
+    val names: array<string>,
+    val hashes: array<int>,
+    var slots: array<int>,
+    var mask: int
+)
+
+val jsonKeyIndexMembers = 16
+
+fun jsonKeyHash(key: string): int {
+    var hash = -3750763034362895579
+    for (byte in key) hash = (hash ^ byte) * 1099511628211
+    hash
+}
+
+fun jsonKeyTableSlots(size: int): array<int> {
+    val slots: array<int> = []
+    var index = 0
+    while (index < size) {
+        slots.append(0)
+        index = index + 1
+    }
+    slots
+}
+
+// Whether `key` is in the table; adds it when it is not.
+fun JsonKeyTable.repeatsOrAdd(key: string): bool {
+    val hash = jsonKeyHash(key)
+    var slot = hash & this.mask
+    var entry = this.slots[slot]
+    while (entry != 0) {
+        if (this.hashes[entry - 1] == hash && this.names[entry - 1] == key) return true
+        slot = (slot + 1) & this.mask
+        entry = this.slots[slot]
+    }
+    this.names.append(key)
+    this.hashes.append(hash)
+    this.slots[slot] = this.names.size
+    if (this.names.size * 2 > this.mask) {
+        this.mask = this.mask * 2 + 1
+        this.slots = jsonKeyTableSlots(this.mask + 1)
+        var position = 0
+        while (position < this.names.size) {
+            var free = this.hashes[position] & this.mask
+            while (this.slots[free] != 0) free = (free + 1) & this.mask
+            this.slots[free] = position + 1
+            position = position + 1
+        }
+    }
+    false
+}
+
+// Whether `key` repeats one of `keys`, the members before it. Only asked
+// while duplicates are rejected, so `keys` are distinct: a short object scans
+// them; a longer one (from jsonKeyIndexMembers) keeps `index`, a table that
+// starts with every key so far and takes each new one as it is checked.
+fun jsonKeyRepeats(
+    keys: array<string>,
+    var index: JsonKeyTable?,
+    key: string
+): bool {
+    if (index == null) {
+        var found = false
+        var position = 0
+        while (!found && position < keys.size) {
+            found = keys[position] == key
+            position = position + 1
+        }
+        return found
+    }
+    if (index.names.size == 0) for (earlier in keys) index.repeatsOrAdd(earlier)
+    index.repeatsOrAdd(key)
+}
+
+// An empty key table for an object that has reached jsonKeyIndexMembers.
+fun jsonKeyTable(): JsonKeyTable = JsonKeyTable([], [], jsonKeyTableSlots(64), 63)
 
 fun jsonParse(
     source: string,
@@ -1079,6 +1162,7 @@ private fun jsonScanValue(var state: JsonParserState, depth: int): void {
         } else if (byte == 123) {
             state.offset = state.offset + 1
             val keys: array<string> = []
+            var keyIndex: JsonKeyTable? = null
             jsonSkipWhitespace(state)
             var closed = false
             if (state.offset < state.source.size &&
@@ -1093,12 +1177,13 @@ private fun jsonScanValue(var state: JsonParserState, depth: int): void {
                 )
                 val key = jsonParseString(state)
                 var duplicate = false
-                var index = 0
-                while (index < keys.size) {
-                    if (keys[index] == key) duplicate = true
-                    index = index + 1
+                if (state.limits.rejectDuplicateKeys) {
+                    if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
+                        keyIndex = jsonKeyTable()
+                    }
+                    duplicate = jsonKeyRepeats(keys, keyIndex, key)
                 }
-                if (duplicate && state.limits.rejectDuplicateKeys) state.fail(
+                if (duplicate) state.fail(
                     "duplicate_key", "duplicate JSON object key", state.offset
                 )
                 if (state.errorCode.size == 0) keys.append(key)
@@ -1259,12 +1344,13 @@ fun JsonObjectReader.next(): string {
         }
         if (this.state.errorCode.size == 0) key = jsonParseString(this.state)
         var duplicate = false
-        var index = 0
-        while (index < this.keys.size) {
-            if (this.keys[index] == key) duplicate = true
-            index = index + 1
+        if (this.state.limits.rejectDuplicateKeys) {
+            if (this.keyIndex == null && this.keys.size >= jsonKeyIndexMembers) {
+                this.keyIndex = jsonKeyTable()
+            }
+            duplicate = jsonKeyRepeats(this.keys, this.keyIndex, key)
         }
-        if (duplicate && this.state.limits.rejectDuplicateKeys) this.state.fail(
+        if (duplicate) this.state.fail(
             "duplicate_key", "duplicate JSON object key", this.state.offset
         )
         if (this.keys.size >= this.state.limits.maximumObjectMembers) {
