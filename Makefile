@@ -266,6 +266,7 @@ test: ablac
 	tools/test-dns-async.sh $(COMPILER)
 	tools/test-websocket-tls-server.sh $(COMPILER)
 	tools/test-commit-edits.sh $(COMPILER)
+	tools/test-conformance-ir-cache.sh $(COMPILER)
 
 check: test self-rebuild
 

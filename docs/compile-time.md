@@ -743,7 +743,9 @@ step fails, none of its changes are kept.
 ### Committing program changes
 
 A `#expression` may change the program too, with the compiler API's
-`compiler.replaceFunctionBody` and `compiler.addFunctionAnnotation`, as a
+`compiler.replaceFunctionBody`, `compiler.addFunctionAnnotation` and
+`compiler.instantiate` (an instance of a [generic](language.md#generics) the
+program doesn't use yet), as a
 [transform](compiler-api.md#transforms-changing-the-program) does. Each change is
 an *edit* of a declaration as parsed. When a lowering of the program (a *round*)
 has made edits, they are committed, the program is checked again and lowered
@@ -776,9 +778,10 @@ fun main {
   whatever order the sites ran in. Two different bodies for one function are
   `E_COMPILER_EDIT_CONFLICT`; a target that is not exactly one declaration is
   `E_COMPILER_EDIT_TARGET`.
-- Each commit rewrites the whole program again (receiver names, overloads,
-  delegated properties, ...), so an added overload can change which function
-  an untouched call resolves to.
+- Each commit rewrites the whole program again (receiver names, generics'
+  instances, overloads, delegated properties, ...), so an added overload can
+  change which function an untouched call resolves to, and each instance's
+  `#` code and folded type queries see the program as committed.
 - After 8 rounds that each changed the program, the build stops with
   `compile.edit-fixpoint`, listing the last round's edits and the site that
   asked for each.

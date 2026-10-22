@@ -136,7 +136,7 @@ only its parse errors.
 | `generic.bound-not-interface:<f>:<T>:<bound>` | a type parameter's bound that names no interface |
 | `generic.method-not-supported:<C>.<m>` | a method with type parameters of its own |
 | `generic.reference:<f>` | a generic function used as a value rather than called |
-| `E_COMPILER_GENERIC_INSTANTIATE` | `compiler.instantiate` of something that is no generic class or function, with the wrong number of type arguments, or, outside a transform, of an instance the program doesn't have ([compiler API](compiler-api.md#generics)) |
+| `E_COMPILER_GENERIC_INSTANTIATE` | `compiler.instantiate` of something that is no generic class or function, or with the wrong number of type arguments ([compiler API](compiler-api.md#generics)) |
 | `context[generic-instance]: <instance>` | a record after a diagnostic placed in a generic's body: the instance (`twice<Ticket>`) in which it is an error |
 | `native.trust:<f>` | calling a trusted function from untrusted code ([trusted code](language.md#trusted-native-implementations)) |
 | `native.runtime-internal:<f>` | calling one of the runtime's address intrinsics or field-slot accessors outside `abla/runtime`, trusted or not ([trusted code](language.md#trusted-native-implementations)) |

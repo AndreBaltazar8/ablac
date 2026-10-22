@@ -132,6 +132,10 @@ var bootstrapCompilerTransformOrigin: string = ""
 var bootstrapCompileEditRound: int = -1
 var bootstrapCompileRoundRaw: array<BootstrapDeclaration> = []
 var bootstrapCompileRoundEdits: array<BootstrapDeclarationEdit> = []
+// The `#` site being evaluated while a program is lowered, "<file>:<begin>:<end>"
+// ("" between sites): the origin an edit names, wherever in the compiler API
+// the request is made.
+var bootstrapCompileRoundSite: string = ""
 
 fun bootstrapTakeCompileRoundEdits(): array<BootstrapDeclarationEdit> {
     val edits = bootstrapCompileRoundEdits
@@ -9657,10 +9661,17 @@ fun bootstrapEvaluateCallCompiler(
     // it); elsewhere it must exist already. Either way, its name as written.
     if (targetName == "compilerInstantiate") {
         val spelling = evaluator.evaluate(expression.children[0]).text
-        val table = bootstrapGenericTableOf(evaluator.declarations)
+        // While a round of lowering runs, the generics themselves are in its
+        // raw program (the analyzed one has only their instances).
+        val known: array<BootstrapDeclaration> = []
+        for (declaration in evaluator.declarations) known.append(declaration)
+        if (bootstrapCompileEditRound >= 0) {
+            for (declaration in bootstrapCompileRoundRaw) known.append(declaration)
+        }
+        val table = bootstrapGenericTableOf(known)
         val generic = bootstrapGenericCalleeName(spelling)
         val template = table.findFree(generic)
-        val instance = bootstrapEvalGenericSpelling(evaluator, spelling)
+        val instance = bootstrapGenericSpelledName(spelling, table)
         var exists = false
         for (declaration in evaluator.declarations) {
             if (declaration.name == instance) exists = true
@@ -9669,17 +9680,36 @@ fun bootstrapEvaluateCallCompiler(
             bootstrapGenericInstanceArguments(instance).size ==
                 bootstrapGenericParameterNames(table.declarations[template]).size
         if (valid && !exists) {
-            valid = bootstrapCompilerTransformActive && bootstrapStageGeneratedModule(BootstrapGeneratedModuleRequest(
-                "instantiate:$instance",
-                "@__abla_instantiate(\"$spelling\")\ncompile fun __abla_instantiate_${bootstrapGenericEscape(instance)}(): void {\n    return\n}\n"
-            ))
+            if (bootstrapCompilerTransformActive) {
+                valid = bootstrapStageGeneratedModule(BootstrapGeneratedModuleRequest(
+                    "instantiate:$instance",
+                    "@__abla_instantiate(\"$spelling\")\ncompile fun __abla_instantiate_${bootstrapGenericEscape(instance)}(): void {\n    return\n}\n"
+                ))
+            } else if (bootstrapCompileEditRound >= 0 && !__ablaRuntimePlatformRegionActive()) {
+                // From a `#` site: an edit the next round of lowering commits
+                // (bootstrapApplyDeclarationEdits), after which the instance
+                // is the program's like any other.
+                val origin = if (bootstrapCompileRoundSite != "") bootstrapCompileRoundSite
+                    else "${bootstrapGenericSourceFile(evaluator.sourceIdentity)}:${expression.begin}:${expression.end}"
+                bootstrapCompileRoundEdits.append(BootstrapDeclarationEdit(
+                    "instantiate",
+                    bootstrapGenericSourceFile(table.declarations[template].sourceIdentity),
+                    "",
+                    bootstrapGenericVisible(instance),
+                    "",
+                    spelling,
+                    [],
+                    origin,
+                    "round ${bootstrapCompileEditRound + 1}: $origin"
+                ))
+            } else valid = false
         }
         if (valid) {
             result = bootstrapEvalString(bootstrapGenericVisible(instance))
         } else {
             evaluator.recordEvaluatorDiagnostic(
                 "E_COMPILER_GENERIC_INSTANTIATE",
-                "compiler.instantiate(\"${generic}\", …) requires a generic class or function and one type argument per type parameter; an instance not made yet is made from a transform (compiler.transform)"
+                "compiler.instantiate(\"${generic}\", …) requires a generic class or function and one type argument per type parameter"
             )
             evaluator.errors = evaluator.errors + 1
             result = bootstrapEvalString("")

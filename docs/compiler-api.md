@@ -489,10 +489,15 @@ The instances themselves can be read and asked for:
   instance, or of a method of a generic class's instance.
 - `compiler.instantiate(generic, typeArguments)` is the instance for those
   type arguments, as written (`instantiate("Box", ["int"])` is `Box<i64>`).
-  From a transform, an instance the program doesn't use yet is made with
-  the others, as if the program used it, and its bounds are checked as a
-  use's would be. Elsewhere it must exist already:
-  `E_COMPILER_GENERIC_INSTANTIATE`.
+  An instance the program doesn't use yet is made as if the program used
+  it, its bounds checked as a use's would be: from a transform, with the
+  program's other instances; from other `#` code, for the next round of
+  lowering ([committing program changes](compile-time.md#committing-program-changes)),
+  so the round that asked doesn't see it yet and the next one does. A site
+  that asks for a new instance in every round stops after 8 with
+  `compile.edit-fixpoint`, which lists the instances the last round asked
+  for and the sites that asked. Something that is no generic, or the wrong
+  number of type arguments, is `E_COMPILER_GENERIC_INSTANTIATE`.
 
 ```abla
 import "abla/io"

@@ -67,6 +67,22 @@ for mode in interp jit; do
         { echo "generics, compiler API ($mode): $output" >&2; exit 1; }
 done
 
+# `compiler.instantiate` from a `#` site: the instance is made for the next
+# round of lowering; a site that never settles stops after 8 rounds.
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode "$compiler" build "$cases/rounds/made.ab" -o "$output_directory/made" --no-cache
+    output=$(run "$output_directory/made")
+    [[ $output == $'1 Box<string> true true 2\nstatus 42' ]] ||
+        { echo "generics, instantiate from # ($mode): $output" >&2; exit 1; }
+    set +e
+    log=$(ABLA_COMPILE_EVAL=$mode "$compiler" build "$cases/rounds/fixpoint.ab" -o "$output_directory/fixpoint" --no-cache 2>&1)
+    status=$?
+    set -e
+    [[ $status != 0 && $log == *"E_COMPILE_EDIT_FIXPOINT"* &&
+       $log == *"instantiate \`"*"fixpoint.ab:Box<Box<"*"(round 8: "*"fixpoint.ab:"* ]] ||
+        { echo "generics, instantiation fixpoint ($mode): $log" >&2; exit 1; }
+done
+
 # Each error case, against its lines in expected.txt.
 expected_file=$cases/errors/expected.txt
 for source in "$cases"/errors/*.ab; do
