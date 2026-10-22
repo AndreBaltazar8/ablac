@@ -1222,6 +1222,11 @@ fun bootstrapNormalizeTypeSlow(type: string): string {
         val element = bootstrapNormalizeType(type.slice(5, type.size - 1))
         result = "cell:$element"
     }
+    if (type.size >= 7 && type.slice(0, 5) == "TVar<" &&
+        type.slice(type.size - 1, type.size) == ">") {
+        val element = bootstrapNormalizeType(type.slice(5, type.size - 1))
+        result = "tvar:$element"
+    }
     if (type.size >= 8 && type.slice(0, 4) == "Map<" &&
         type.slice(type.size - 1, type.size) == ">") {
         val comma = bootstrapTypeArgumentComma(type, 4, type.size - 1)
@@ -1280,6 +1285,9 @@ fun ablaCompilerTypeNeedsNormalization(type: string): bool {
         needed = true
     }
     if (!needed && type.size >= 5 && type.slice(0, 5) == "Cell<") {
+        needed = true
+    }
+    if (!needed && type.size >= 5 && type.slice(0, 5) == "TVar<") {
         needed = true
     }
     if (!needed && type.size >= 4 && type.slice(0, 4) == "Map<") {
@@ -1531,6 +1539,14 @@ fun bootstrapMutexElementType(type: string): string {
 
 fun bootstrapIsCellType(type: string): bool =
     type.size >= 5 && type.slice(0, 5) == "cell:"
+
+// `TVar<T>` is `tvar:T`: a transactional variable (a delegate whose getValue
+// and setValue go through the running transaction).
+fun bootstrapIsTVarType(type: string): bool =
+    type.size >= 5 && type.slice(0, 5) == "tvar:"
+
+fun bootstrapTVarElementType(type: string): string =
+    if (bootstrapIsTVarType(type)) type.slice(5, type.size) else "unknown"
 
 // Map<K, V> is `map:K:V`; K is string or i64 (or unknown for an untyped
 // `Map()`), so the colon after it always ends the key.
@@ -3220,7 +3236,8 @@ fun bootstrapSummaryTypeIsManagedReferenceAt(
 ): bool {
     val normalized = bootstrapNormalizeType(type)
     var managed = bootstrapIsArrayType(normalized) ||
-        bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized)
+        bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized) ||
+        bootstrapIsTVarType(normalized)
     var declaration = 0
     while (!managed && declaration < declarations.size) {
         val candidate = declarations[declaration]
@@ -3253,6 +3270,7 @@ fun bootstrapSummaryTypeIsManagedReferenceIn(
     val normalized = bootstrapNormalizeType(type)
     var managed = bootstrapIsArrayType(normalized) ||
         bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized) ||
+        bootstrapIsTVarType(normalized) ||
         managedTypes.find(normalized) >= 0
     if (!managed && depth < 32 && bootstrapIsNullableType(normalized)) {
         managed = bootstrapSummaryTypeIsManagedReferenceIn(
@@ -3696,7 +3714,8 @@ fun bootstrapExpressionCompileEffects(
     var mask = 0
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
-        expression.text != "Cell" && expression.text != "Map") {
+        expression.text != "Cell" && expression.text != "Map" &&
+        expression.text != "TVar") {
         mask = bootstrapCompileEffectLookup(
             summary,
             expression.text,
@@ -3978,6 +3997,7 @@ fun bootstrapExpressionDelegatedCompileEffects(
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
         expression.text != "Cell" && expression.text != "Map" &&
+        expression.text != "TVar" &&
         !bootstrapAffineNamesContain(bound, "${expression.text}#${expression.children.size}")) {
         mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,
@@ -6272,7 +6292,9 @@ class BootstrapAnalyzer(
     var delegatedFailures: string = "",
     // The names a `by` expression may not read (checkDelegatedInitializerScope).
     val delegatedFailedInitializers: array<BootstrapExpression> = [],
-    val delegatedFailedReplacements: array<BootstrapExpression> = []
+    val delegatedFailedReplacements: array<BootstrapExpression> = [],
+    // The `atomic` bodies being analyzed, innermost last (0: none).
+    var atomicDepth: int = 0
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -7344,6 +7366,7 @@ class BootstrapAnalyzer(
                 val promoting = expression.text == "memoryPromoteString"
                 val constructing = expression.text == "Shared" ||
                     expression.text == "Cell" || expression.text == "Map" ||
+                    expression.text == "TVar" ||
                     this.findKind(expression.text) == "class"
                 if (moving) {
                     owned = this.regionExpressionIsOwned(
@@ -7840,6 +7863,10 @@ class BootstrapAnalyzer(
     }
 
     fun methodResultType(owner: string, method: string, at: int = -1): string {
+        if (bootstrapIsTVarType(owner)) {
+            return if (method == "getValue") bootstrapTVarElementType(owner)
+                else if (method == "setValue") "void" else "unknown"
+        }
         var result = "unknown"
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -7861,6 +7888,9 @@ class BootstrapAnalyzer(
     }
 
     fun methodParameterCount(owner: string, method: string): int {
+        if (bootstrapIsTVarType(owner)) {
+            return if (method == "getValue") 0 else if (method == "setValue") 1 else -1
+        }
         var result = -1
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -7870,6 +7900,7 @@ class BootstrapAnalyzer(
     }
 
     fun methodRequiredParameterCount(owner: string, method: string): int {
+        if (bootstrapIsTVarType(owner)) return this.methodParameterCount(owner, method)
         var result = -1
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -7893,6 +7924,10 @@ class BootstrapAnalyzer(
         method: string,
         parameter: int
     ): string {
+        if (bootstrapIsTVarType(owner)) {
+            return if (method == "setValue" && parameter == 0) bootstrapTVarElementType(owner)
+                else "unknown"
+        }
         var result = "unknown"
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -8252,7 +8287,8 @@ class BootstrapAnalyzer(
             bootstrapIsBorrowType(normalized)) return false
         if (bootstrapIsArrayType(normalized) ||
             bootstrapIsCellType(normalized) ||
-            bootstrapIsMapType(normalized)) return true
+            bootstrapIsMapType(normalized) ||
+            bootstrapIsTVarType(normalized)) return true
         val declaration = this.typeDeclarations.find(normalized)
         if (declaration >= 0) {
             val kind = this.declarations[declaration].kind
@@ -9480,7 +9516,8 @@ class BootstrapAnalyzer(
         val normalized = bootstrapNormalizeType(type)
         bootstrapIsSharedType(normalized) ||
             bootstrapIsMutexType(normalized) ||
-            bootstrapIsWeakType(normalized)
+            bootstrapIsWeakType(normalized) ||
+            bootstrapIsTVarType(normalized)
     }
 
     fun validateThreadCaptures(body: BootstrapExpression): void {
@@ -9512,9 +9549,15 @@ class BootstrapAnalyzer(
     // (globalKindNamed reads what each name was where it was analyzed).
     fun threadUsesMutableGlobal(expression: BootstrapExpression): bool {
         var found = false
+        // A global delegated to a TVar is read and written through its
+        // transactions; replacing its delegate changes the global.
         if ((expression.kind == "identifier" ||
              expression.kind == "assign") &&
-            this.globalKindNamed(expression) == "var") found = true
+            this.globalKindNamed(expression) == "var" &&
+            !bootstrapIsTVarType(this.delegateType(expression.text))) found = true
+        if (expression.kind == "delegate.assign" && expression.children.size > 0 &&
+            expression.children[0].kind == "identifier" &&
+            this.globalKindNamed(expression.children[0]) == "var") found = true
         if ((expression.kind == "member.assign" ||
              expression.kind == "index.assign") &&
             expression.children.size > 0 &&
@@ -10385,13 +10428,16 @@ class BootstrapAnalyzer(
         if (expression.kind == "call" && expression.text == "Cell") {
             result = bootstrapInferCallCell(this, expression, result)
         }
+        if (expression.kind == "call" && expression.text == "TVar") {
+            result = bootstrapInferCallTVar(this, expression, result)
+        }
         if (expression.kind == "call" && expression.text == "filledArray") {
             result = bootstrapInferCallFilledArray(this, expression, result)
         }
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
             expression.text != "Cell" && expression.text != "filledArray" &&
-            expression.text != "Map") {
+            expression.text != "Map" && expression.text != "TVar") {
             if (this.overloads.keys.size > 0) {
                 val overloaded = this.inferOverloadedCall(expression)
                 if (overloaded != "") return overloaded
@@ -10462,6 +10508,12 @@ class BootstrapAnalyzer(
         }
         if (expression.kind == "delegate.project") {
             result = bootstrapInferDelegateProject(this, expression, result)
+        }
+        if (expression.kind == "atomic") {
+            result = bootstrapInferAtomic(this, expression, result)
+        }
+        if (expression.kind == "stm.orElse") {
+            result = bootstrapInferOrElse(this, expression, result)
         }
         if (expression.kind == "delegate.assign") {
             result = bootstrapInferDelegateAssign(this, expression, result)
@@ -11621,6 +11673,11 @@ fun bootstrapInferIdentifier(
         analyzer.visibleLocalIndex(expression.text) < analyzer.compileLocalBarrier) {
         analyzer.fail("compile.runtime-local:${expression.text}@${expression.begin}")
     }
+    // `retry`, where nothing else has the name: a transaction's (never
+    // completes: the transaction runs again once what it read changes).
+    if (result == "unknown" && expression.text == "retry") {
+        return bootstrapInferRetry(analyzer, expression)
+    }
     if (result == "unknown") analyzer.fail(
         "identifier:${expression.text}@${expression.begin}"
     )
@@ -11852,6 +11909,25 @@ fun bootstrapInferCallMap(
         analyzer.fail("map.arity")
         result = "unknown"
     } else result = "map:unknown:unknown"
+    result
+}
+
+@noinline
+fun bootstrapInferCallTVar(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    var result = initial
+    if (expression.children.size != 1) {
+        analyzer.fail("tvar.arity")
+        result = "unknown"
+    } else {
+        val element = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
+        // An aborted attempt would skip a resource's drop, or drop it twice.
+        if (analyzer.typeIsAffine(element)) analyzer.fail("stm.resource:TVar<$element>")
+        result = "tvar:$element"
+    }
     result
 }
 
@@ -12520,6 +12596,27 @@ fun bootstrapInferMemberCall(
         (bootstrapIsMapBuiltinMethod(expression.text) ||
          analyzer.methodParameterCount(receiver, expression.text) < 0)) {
         result = analyzer.inferMapCall(expression, rawReceiver, receiver)
+    } else if (bootstrapIsTVarType(receiver)) {
+        val element = bootstrapTVarElementType(receiver)
+        if (expression.text == "getValue") {
+            if (expression.children.size != 1) analyzer.fail("tvar.getValue.arity")
+            result = element
+        } else if (expression.text == "setValue") {
+            if (expression.children.size != 2) {
+                analyzer.fail("tvar.setValue.arity")
+            } else {
+                analyzer.contextualizeLambdaParameters(expression.children[1], element)
+                analyzer.contextualizeArrayLiteral(expression.children[1], element)
+                val value = analyzer.infer(expression.children[1])
+                if (!bootstrapTypesCompatible(element, value)) {
+                    analyzer.fail("tvar.setValue.value:$element:$value")
+                }
+            }
+            result = "void"
+        } else {
+            analyzer.fail("tvar.member:${expression.text}")
+            result = "unknown"
+        }
     } else if (bootstrapIsCellType(receiver)) {
         val element = bootstrapCellElementType(receiver)
         if (expression.text == "get") {
@@ -13500,6 +13597,45 @@ fun bootstrapInferAssign(
     result = value
     result
 }
+
+/** `atomic { … }`: its body's type. The body is a closure of no parameters
+ *  (what the runtime runs, again after a conflict). */
+@noinline
+fun bootstrapInferAtomic(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    if (expression.children.size != 1) return "unknown"
+    analyzer.atomicDepth = analyzer.atomicDepth + 1
+    val body = analyzer.infer(expression.children[0])
+    analyzer.atomicDepth = analyzer.atomicDepth - 1
+    bootstrapFunctionResultType(body)
+}
+
+/** `a orElse b` (in an `atomic`): the alternatives' shared type. */
+@noinline
+fun bootstrapInferOrElse(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    initial: string
+): string {
+    if (expression.children.size != 2) return "unknown"
+    val first = bootstrapFunctionResultType(analyzer.infer(expression.children[0]))
+    val second = bootstrapFunctionResultType(analyzer.infer(expression.children[1]))
+    if (first == "never") return second
+    if (second == "never" || bootstrapTypesCompatible(first, second)) return first
+    if (bootstrapTypesCompatible(second, first)) return second
+    analyzer.fail("stm.orElse-type:$first:$second@${expression.begin}")
+    "unknown"
+}
+
+/** `retry`: leaves the transaction's attempt until a TVar it read changes. */
+@noinline
+fun bootstrapInferRetry(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression
+): string = "never"
 
 @noinline
 fun bootstrapInferDelegateProject(

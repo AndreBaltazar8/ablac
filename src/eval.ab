@@ -3526,6 +3526,13 @@ class BootstrapEvaluator(
         begin: int,
         end: int
     ): BootstrapEvalValue {
+        // A TVar delegate is read and written directly.
+        var unwrapped = bootstrapEvalUnwrapBorrow(delegate)
+        if (unwrapped.kind == "tvar" && unwrapped.elements.size == 1) {
+            if (name == "getValue") return unwrapped.elements[0]
+            bootstrapEvalStmWrite(unwrapped, argument)
+            return bootstrapEvalVoid()
+        }
         val children: array<BootstrapExpression> = []
         if (hasArgument) {
             val temporary = "__delegate_argument_${this.steps}_${this.names.size}"
@@ -5592,6 +5599,8 @@ class BootstrapEvaluator(
         val errorsBefore = this.errors
         val diagnosticsBefore = this.diagnostics.size
         this.steps = this.steps + 1
+        // A `retry` leaving an `orElse` alternative (bootstrapEvaluateOrElse).
+        if (bootstrapEvalStmRetrying) return bootstrapEvalInvalid()
         if (this.steps > this.context.stepLimit) {
             // Past the limit nothing is evaluated: a loop the limit cut short
             // leaves values no later code expects (a slice out of range).
@@ -6208,6 +6217,9 @@ fun bootstrapEvaluateUncommon(
     // An argument native code passed to an intrinsic (src/ct_bridge.ab).
     53 -> ctBridgeArgument(expression)
     54 -> bootstrapEvaluateInterfaceCast(evaluator, expression)
+    55 -> bootstrapEvaluateCallTVar(evaluator, expression)
+    56 -> bootstrapEvaluateAtomic(evaluator, expression)
+    57 -> bootstrapEvaluateOrElse(evaluator, expression)
     else -> bootstrapEvalInvalid()
 }
 
@@ -6253,10 +6265,11 @@ fun bootstrapEvalCase(expression: BootstrapExpression): int {
     if (expression.kind == "call" && expression.text == "Map") return 12
     if (expression.kind == "call" && expression.text == "Cell") return 13
     if (expression.kind == "call" && expression.text == "filledArray") return 14
+    if (expression.kind == "call" && expression.text == "TVar") return 55
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
         expression.text != "Cell" && expression.text != "filledArray" &&
-        expression.text != "Map") return 15
+        expression.text != "Map" && expression.text != "TVar") return 15
     if (expression.kind == "compile") return 16
     if (expression.kind == "region") return 17
     if ((expression.kind == "task" || expression.kind == "thread") &&
@@ -6309,6 +6322,8 @@ fun bootstrapEvalCase(expression: BootstrapExpression): int {
     if (expression.kind == "call.value") return 52
     if (expression.kind == "bridge.value") return 53
     if (expression.kind == "as?") return 54
+    if (expression.kind == "atomic" && expression.children.size == 1) return 56
+    if (expression.kind == "stm.orElse" && expression.children.size == 2) return 57
     0
 }
 
@@ -6417,6 +6432,138 @@ fun bootstrapEvaluateCallMap(
             bootstrapEvalArray([])], "", []
     )
     result
+}
+
+/** `TVar(value)` at compile time: a box like a Cell's ("tvar"). `#` code runs
+ *  transactions as plain code (bootstrapEvalStmWrite keeps what they undo). */
+@noinline
+fun bootstrapEvaluateCallTVar(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    if (expression.children.size != 1) {
+        evaluator.errors = evaluator.errors + 1
+        return bootstrapEvalInvalid()
+    }
+    BootstrapEvalValue(
+        "tvar", 0, false, "", [evaluator.evaluate(expression.children[0])], "", []
+    )
+}
+
+// The writes of the running compile-time transactions, oldest first: each
+// TVar written and the value it held before (bootstrapEvalStmWrite), for an
+// `orElse` (or a failed transaction) to put back.
+var bootstrapEvalStmDepth = 0
+val bootstrapEvalStmUndoTVars: array<BootstrapEvalValue> = []
+val bootstrapEvalStmUndoValues: array<BootstrapEvalValue> = []
+
+/** A TVar's write at compile time: in place, the old value kept while a
+ *  transaction runs. */
+fun bootstrapEvalStmWrite(var tvar: BootstrapEvalValue, value: BootstrapEvalValue): void {
+    if (bootstrapEvalStmDepth > 0) {
+        bootstrapEvalStmUndoTVars.append(tvar)
+        bootstrapEvalStmUndoValues.append(tvar.elements[0])
+    }
+    tvar.elements[0] = value
+    return
+}
+
+// The `orElse` first alternatives running, and whether a `retry` is leaving
+// one: until its `orElse` takes it, nothing is evaluated (evaluate).
+var bootstrapEvalStmOrElseDepth = 0
+var bootstrapEvalStmRetrying = false
+
+/** Calls the body (a closure of no parameters) of `atomic` or `orElse`. */
+fun bootstrapEvalStmBody(
+    var evaluator: BootstrapEvaluator,
+    body: BootstrapExpression,
+    at: BootstrapExpression
+): BootstrapEvalValue {
+    val closure = bootstrapEvalUnwrapBorrow(evaluator.evaluate(body))
+    if (closure.kind != "closure") {
+        evaluator.errors = evaluator.errors + 1
+        return bootstrapEvalInvalid()
+    }
+    val none: array<BootstrapExpression> = []
+    bootstrapEvaluateClosureCall(
+        evaluator, BootstrapExpression("call", "", at.begin, at.end, none), closure, -1
+    )
+}
+
+/** `atomic { … }` at compile time: plain code (no other thread runs), with
+ *  each TVar write kept until the outermost transaction ends. */
+@noinline
+fun bootstrapEvaluateAtomic(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    bootstrapEvalStmDepth = bootstrapEvalStmDepth + 1
+    val result = bootstrapEvalStmBody(evaluator, expression.children[0], expression)
+    bootstrapEvalStmDepth = bootstrapEvalStmDepth - 1
+    // The outermost one committed: nothing is left to put back.
+    if (bootstrapEvalStmDepth == 0) {
+        bootstrapEvalStmUndoTVars.truncate(0)
+        bootstrapEvalStmUndoValues.truncate(0)
+    }
+    result
+}
+
+/** `a orElse b` at compile time: `a`, or, when it retries, `b` after `a`'s
+ *  writes are put back. */
+@noinline
+fun bootstrapEvaluateOrElse(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    val mark = bootstrapEvalStmUndoTVars.size
+    val errors = evaluator.errors
+    val diagnostics = evaluator.diagnostics
+    bootstrapEvalStmOrElseDepth = bootstrapEvalStmOrElseDepth + 1
+    val first = bootstrapEvalStmBody(evaluator, expression.children[0], expression)
+    bootstrapEvalStmOrElseDepth = bootstrapEvalStmOrElseDepth - 1
+    if (!bootstrapEvalStmRetrying) return first
+    // What the retried alternative left (values nothing used) is not an error.
+    bootstrapEvalStmRetrying = false
+    evaluator.errors = errors
+    evaluator.diagnostics = diagnostics
+    bootstrapEvalStmUndo(mark)
+    bootstrapEvalStmBody(evaluator, expression.children[1], expression)
+}
+
+/** `retry` at compile time: the nearest `orElse` takes it; with none, nothing
+ *  could ever change what the transaction read (as at run time, one thread). */
+@noinline
+fun bootstrapEvaluateRetry(
+    var evaluator: BootstrapEvaluator,
+    expression: BootstrapExpression
+): BootstrapEvalValue {
+    if (bootstrapEvalStmDepth > 0 && bootstrapEvalStmOrElseDepth > 0) {
+        bootstrapEvalStmRetrying = true
+        return bootstrapEvalInvalid()
+    }
+    if (bootstrapEvalStmDepth == 0) {
+        return bootstrapEvalRuntimePanic(
+            evaluator, "E_CT_PANIC", "retry outside a transaction", expression
+        )
+    }
+    bootstrapEvalRuntimePanic(
+        evaluator, "E_CT_PANIC",
+        "retry can never wake: no other thread can change what the transaction read",
+        expression
+    )
+}
+
+/** Puts back the compile-time TVar writes after the first `mark`, newest first. */
+fun bootstrapEvalStmUndo(mark: int): void {
+    var index = bootstrapEvalStmUndoTVars.size - 1
+    while (index >= mark) {
+        var tvar = bootstrapEvalStmUndoTVars[index]
+        tvar.elements[0] = bootstrapEvalStmUndoValues[index]
+        index = index - 1
+    }
+    bootstrapEvalStmUndoTVars.truncate(mark)
+    bootstrapEvalStmUndoValues.truncate(mark)
+    return
 }
 
 @noinline
@@ -6613,6 +6760,10 @@ fun bootstrapEvaluateIdentifier(
                 result = bootstrapEvalFunction(declaration.name)
             }
             declarationIndexNode = evaluator.nextNamed(declarationIndexNode)
+        }
+        // `retry`, where nothing else has the name: a transaction's.
+        if (result.kind == "invalid" && expression.text == "retry") {
+            return bootstrapEvaluateRetry(evaluator, expression)
         }
         if (result.kind == "invalid") {
             evaluator.errors = evaluator.errors + 1
@@ -7340,7 +7491,7 @@ fun bootstrapEvaluateMemberCall(
             evaluator, receiver, expression.text, expression.children, 1, pathProvider
         )
     } else if (receiver.kind == "cell" || receiver.kind == "shared" ||
-        receiver.kind == "weak") {
+        receiver.kind == "weak" || receiver.kind == "tvar") {
         result = bootstrapEvaluateReferenceMethod(evaluator, expression, receiver)
     } else if (receiver.kind == "map" &&
                bootstrapIsMapBuiltinMethod(expression.text)) {
@@ -7479,7 +7630,14 @@ fun bootstrapEvaluateReferenceMethod(
     var receiver: BootstrapEvalValue
 ): BootstrapEvalValue {
     var result = bootstrapEvalInvalid()
-    if (receiver.kind == "cell" && expression.text == "get" &&
+    if (receiver.kind == "tvar" && expression.text == "getValue" &&
+        expression.children.size == 1) {
+        result = receiver.elements[0]
+    } else if (receiver.kind == "tvar" && expression.text == "setValue" &&
+        expression.children.size == 2) {
+        bootstrapEvalStmWrite(receiver, evaluator.evaluate(expression.children[1]))
+        result = bootstrapEvalVoid()
+    } else if (receiver.kind == "cell" && expression.text == "get" &&
         expression.children.size == 1) {
         result = receiver.elements[0]
     } else if (receiver.kind == "cell" &&

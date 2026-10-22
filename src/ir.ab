@@ -5483,6 +5483,10 @@ class BootstrapLowerer(
     }
 
     fun lowerMethodResultType(owner: string, name: string): string {
+        if (bootstrapIsTVarType(owner)) {
+            return if (name == "getValue") bootstrapTVarElementType(owner)
+                else if (name == "setValue") "void" else "unknown"
+        }
         var result = "unknown"
         val entry = this.methodDeclarations.find(owner, name)
         if (entry >= 0) {
@@ -5541,6 +5545,15 @@ class BootstrapLowerer(
         if (expression.kind == "region") {
             result = this.lowerExpressionType(expression.children[0])
         }
+        if (expression.kind == "atomic" && expression.children.size == 1) {
+            result = bootstrapFunctionResultType(this.lowerExpressionType(expression.children[0]))
+        }
+        if (expression.kind == "stm.orElse" && expression.children.size == 2) {
+            result = bootstrapFunctionResultType(this.lowerExpressionType(expression.children[0]))
+            if (result == "never") {
+                result = bootstrapFunctionResultType(this.lowerExpressionType(expression.children[1]))
+            }
+        }
         if (expression.kind == "generator") {
             result = "generator:${this.lowerGeneratorElementType(
                 expression.children[0]
@@ -5574,6 +5587,8 @@ class BootstrapLowerer(
                 result = this.lowerFieldType(this.currentOwner, expression.text)
             } else if (this.isFunction(expression.text)) {
                 result = this.lowerFunctionType(expression.text)
+            } else if (expression.text == "retry") {
+                result = "never"
             } else result = this.lowerFunctionResultType(expression.text)
             if (this.lowerNameIsDelegated(expression.text)) {
                 result = bootstrapDelegatedExposedType(
@@ -5621,6 +5636,12 @@ class BootstrapLowerer(
                 result = "cell:${this.lowerExpressionType(
                     expression.children[0]
                 )}"
+            }
+            else if (expression.text == "TVar" &&
+                     expression.children.size == 1) {
+                result = "tvar:${bootstrapBorrowElementType(this.lowerExpressionType(
+                    expression.children[0]
+                ))}"
             }
             else if (expression.text == "Map" &&
                      expression.children.size == 0) {
@@ -5738,6 +5759,12 @@ class BootstrapLowerer(
             }
             else if (bootstrapIsCellType(owner) &&
                     expression.text == "set") result = "void"
+            else if (bootstrapIsTVarType(owner) &&
+                    expression.text == "getValue") {
+                result = bootstrapTVarElementType(owner)
+            }
+            else if (bootstrapIsTVarType(owner) &&
+                    expression.text == "setValue") result = "void"
             else if (bootstrapIsMutexType(owner) &&
                     expression.text == "with" &&
                     expression.children.size > 1) {
@@ -6404,6 +6431,14 @@ class BootstrapLowerer(
             end,
             [BootstrapExpression("identifier", name, begin, end, [])]
         ))
+        // A TVar's accessors are the runtime's transactional read and write.
+        if (bootstrapIsTVarType(owner)) {
+            return if (method == "getValue") this.emitMany("call", operands, "__ablaRuntimeStmRead")
+            else {
+                this.emitMany("call", operands, "__ablaRuntimeStmWrite")
+                this.emit("const.void", -1, -1, "")
+            }
+        }
         val extensionOwner = this.lowerExtensionOwner(owner, method)
         if (extensionOwner != "") {
             this.emitMany(
@@ -7387,6 +7422,20 @@ class BootstrapLowerer(
         if (expression.kind == "region") {
             result = bootstrapLowerRegion(this, expression, result)
         }
+        // A transaction runs its body, a closure the runtime calls (again
+        // after a conflict); the escape analysis keeps that closure in the
+        // frame. `a orElse b` runs inside one.
+        if (expression.kind == "atomic" && expression.children.size == 1) {
+            result = this.emitMany(
+                "call", [this.lowerExpression(expression.children[0])],
+                "__ablaRuntimeStmAtomic"
+            )
+        }
+        if (expression.kind == "stm.orElse" && expression.children.size == 2) {
+            val first = this.lowerExpression(expression.children[0])
+            val second = this.lowerExpression(expression.children[1])
+            result = this.emitMany("call", [first, second], "__ablaRuntimeStmOrElse")
+        }
         if (expression.kind == "identifier") {
             result = bootstrapLowerIdentifier(this, expression, result)
         }
@@ -7462,6 +7511,14 @@ class BootstrapLowerer(
         if (expression.kind == "call" && expression.text == "Cell") {
             result = bootstrapLowerCallCell(this, expression, result)
         }
+        // A TVar: the runtime's transactional variable (tag 14).
+        if (expression.kind == "call" && expression.text == "TVar" &&
+            expression.children.size == 1) {
+            result = this.emitMany(
+                "call", [this.lowerExpression(expression.children[0])],
+                "__ablaRuntimeTVarCreate"
+            )
+        }
         if (expression.kind == "call" &&
             expression.text == "nativeXtensaInterruptHandlerAddress") {
             result = bootstrapLowerCallXtensaInterruptHandler(
@@ -7498,7 +7555,7 @@ class BootstrapLowerer(
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
             expression.text != "Cell" && expression.text != "filledArray" &&
-            expression.text != "Map" &&
+            expression.text != "Map" && expression.text != "TVar" &&
             expression.text != "nativeXtensaInterruptHandlerAddress" &&
             expression.text != "nativeStaticBytes" &&
             expression.text != "nativeStaticMutableBytes" &&
@@ -8746,6 +8803,11 @@ fun bootstrapLowerIdentifier(
         } else result = result
     } else if (lowerer.isFunction(expression.text)) {
         result = lowerer.emit("function.ref", -1, -1, expression.text)
+    } else if (expression.text == "retry") {
+        // A transaction's `retry` (nothing else has the name): it leaves the
+        // attempt, which runs again once a TVar it read changes.
+        val none: array<int> = []
+        result = lowerer.emitMany("call", none, "__ablaRuntimeStmRetry")
     } else {
         lowerer.errors = lowerer.errors + 1
         result = lowerer.emit("invalid", -1, -1, expression.text)
@@ -10063,6 +10125,14 @@ fun bootstrapLowerMemberCall(
     } else if (bootstrapIsMapType(owner) &&
                bootstrapIsMapBuiltinMethod(expression.text)) {
         result = lowerer.emitMany("map.${expression.text}", arguments, "")
+    } else if (bootstrapIsTVarType(owner) &&
+        expression.text == "getValue") {
+        result = lowerer.emitMany("call", [arguments[0]], "__ablaRuntimeStmRead")
+    } else if (bootstrapIsTVarType(owner) &&
+               expression.text == "setValue" &&
+               arguments.size == 2) {
+        lowerer.emitMany("call", [arguments[0], arguments[1]], "__ablaRuntimeStmWrite")
+        result = lowerer.emit("const.void", -1, -1, "")
     } else if (bootstrapIsCellType(owner) &&
         expression.text == "get") {
         result = lowerer.emit("cell.get", arguments[0], -1, "")

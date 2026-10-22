@@ -809,11 +809,16 @@ trusted fun __ablaRuntimeAwait(operation: any): any {
 // 144 the next descriptor   152 the generator current before it   160 retrying
 // 168 runs alone   176 read root frame   200 write root frame
 // 224 the body's result (24 bytes)   248 attempts abandoned   256 logged commits
-// 264 the block it was carved from
+// 264 the block it was carved from   272 `orElse` first alternatives running
+// 280 kept writes   288 kept capacity   296 kept log   304 kept roots
+// 312 kept root frame
 // A read entry is 32 bytes: the TVar's value, the version read. A write entry is
 // 56: the TVar's value, the value (logged: to write; direct: the old one), and the
 // TVar's word when the commit took it. The two root frames list each entry's values
-// for the collector while the transaction runs.
+// for the collector while the transaction runs. While an `orElse` alternative
+// runs, a write over an earlier write entry keeps a 32-byte entry: the value it
+// replaced (logged: the entry's; direct: the TVar's) and the entry's index, so
+// the alternative's writes can be undone when it retries (__ablaRuntimeStmOrElse).
 //
 // The shared state (raw memory): 0 the clock, alone in its cache line (every
 // writing commit adds to it)   128 thread numbers given   136 waiting threads
@@ -859,6 +864,11 @@ trusted fun __ablaRuntimeStmDescriptorCreate(): int {
     val block = __ablaRuntimePlatformRawAllocate(512)
     val descriptor = (block + 127) & -128
     ablaRuntimeStoreI64(descriptor + 264, block)
+    var field = 272
+    while (field < 312) {
+        ablaRuntimeStoreI64(descriptor + field, 0)
+        field = field + 8
+    }
     val number = ablaRuntimeAtomicFetchAddI64(shared + 128, 1) + 1
     ablaRuntimeStoreI64(descriptor + 24, number)
     ablaRuntimeStoreI64(descriptor + 40, number * 2654435761 + 1)
@@ -896,6 +906,8 @@ trusted fun __ablaRuntimeStmThreadExit(): void {
     __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 72))
     __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 96))
     __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 104))
+    __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 296))
+    __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 304))
     __ablaRuntimePlatformRawFree(ablaRuntimeLoadI64(descriptor + 264))
     __ablaRuntimePlatformStmSetDescriptor(0)
 }
@@ -1075,6 +1087,14 @@ trusted fun __ablaRuntimeStmWrite(tvarValue: any, value: any): any {
 trusted fun __ablaRuntimeStmWriteLogged(descriptor: int, tvarValue: any, tvar: int, value: any): void {
     val logged = ablaRuntimeLoadI64(descriptor + 8) == 2
     val written = __ablaRuntimeStmWritten(descriptor, tvar)
+    if (written >= 0 && ablaRuntimeLoadI64(descriptor + 272) != 0) {
+        __ablaRuntimeStmKeep(
+            descriptor,
+            if (logged) __ablaRuntimeValueAt(ablaRuntimeLoadI64(descriptor + 96) + written * 56 + 24)
+            else __ablaRuntimeValueAt(tvar + 16),
+            written
+        )
+    }
     if (written >= 0) {
         if (logged) {
             __ablaRuntimeCopyValue(
@@ -1090,11 +1110,13 @@ trusted fun __ablaRuntimeStmWriteLogged(descriptor: int, tvarValue: any, tvar: i
 }
 
 // Inside a transaction: waits until a TVar it read changes, then runs it again.
+// Inside an `orElse` alternative, the other alternative runs instead.
 trusted fun __ablaRuntimeStmRetry(): never {
     val descriptor = __ablaRuntimePlatformStmDescriptor()
     if (descriptor == 0 || ablaRuntimeLoadI64(descriptor) == 0) {
         __ablaRuntimePanic("retry outside a transaction")
     }
+    if (ablaRuntimeLoadI64(descriptor + 272) != 0) __ablaRuntimeStmAbandon(descriptor, true)
     if (ablaRuntimeLoadI64(descriptor + 8) != 2 || __ablaRuntimePlatformOnlyThread() ||
         ablaRuntimeLoadI64(descriptor + 48) == 0) {
         __ablaRuntimePanic("retry can never wake: no other thread can change what the transaction read")
@@ -1117,6 +1139,8 @@ trusted fun __ablaRuntimeStmBegin(descriptor: int): void {
     ablaRuntimeStoreI64(descriptor + 48, 0)
     ablaRuntimeStoreI64(descriptor + 80, 0)
     ablaRuntimeStoreI64(descriptor + 112, 0)
+    ablaRuntimeStoreI64(descriptor + 272, 0)
+    ablaRuntimeStoreI64(descriptor + 280, 0)
     if (logged) {
         ablaRuntimeStoreI64(descriptor + 16, ablaRuntimeAtomicLoadI64(__ablaRuntimeStmState()))
     }
@@ -1287,6 +1311,107 @@ trusted fun __ablaRuntimeStmBackOff(descriptor: int): void {
     }
 }
 
+// Keeps, while an `orElse` alternative runs, what a write over write entry
+// `index` replaces.
+trusted fun __ablaRuntimeStmKeep(descriptor: int, value: any, index: int): void {
+    val count = ablaRuntimeLoadI64(descriptor + 280)
+    if (count == ablaRuntimeLoadI64(descriptor + 288)) {
+        __ablaRuntimeStmGrow(descriptor + 280, 32, 1, descriptor + 312)
+    }
+    val entry = ablaRuntimeLoadI64(descriptor + 296) + count * 32
+    __ablaRuntimeCopyValue(value, entry)
+    ablaRuntimeStoreI64(entry + 24, index)
+    ablaRuntimeStoreI64(descriptor + 280, count + 1)
+    __ablaRuntimePlatformRootsSet(descriptor + 312, ablaRuntimeLoadI64(descriptor + 304), count + 1)
+}
+
+// Undoes the writes since an `orElse` alternative began (`writes` write entries
+// and `kept` kept ones then), newest first. Its reads stay: when the other
+// alternative retries too, the transaction waits for any of them to change.
+trusted fun __ablaRuntimeStmUndoTo(descriptor: int, writes: int, kept: int): void {
+    val logged = ablaRuntimeLoadI64(descriptor + 8) == 2
+    val log = ablaRuntimeLoadI64(descriptor + 96)
+    val keptLog = ablaRuntimeLoadI64(descriptor + 296)
+    var index = ablaRuntimeLoadI64(descriptor + 280) - 1
+    while (index >= kept) {
+        val entry = keptLog + index * 32
+        val written = ablaRuntimeLoadI64(entry + 24)
+        if (written < writes) {
+            if (logged) {
+                __ablaRuntimeCopyValue(__ablaRuntimeValueAt(entry), log + written * 56 + 24)
+            } else {
+                __ablaRuntimeCopyValue(
+                    __ablaRuntimeValueAt(entry), ablaRuntimeLoadI64(log + written * 56 + 8) + 16
+                )
+            }
+        }
+        index = index - 1
+    }
+    // A direct entry made since holds the TVar's value before it.
+    if (!logged) {
+        index = ablaRuntimeLoadI64(descriptor + 80) - 1
+        while (index >= writes) {
+            val entry = log + index * 56
+            __ablaRuntimeCopyValue(__ablaRuntimeValueAt(entry + 24), ablaRuntimeLoadI64(entry + 8) + 16)
+            index = index - 1
+        }
+    }
+    ablaRuntimeStoreI64(descriptor + 80, writes)
+    ablaRuntimeStoreI64(descriptor + 280, kept)
+    var filter = 0
+    index = 0
+    while (index < writes) {
+        filter = filter | __ablaRuntimeStmBit(ablaRuntimeLoadI64(log + index * 56 + 8))
+        index = index + 1
+    }
+    ablaRuntimeStoreI64(descriptor + 112, filter)
+    __ablaRuntimePlatformRootsSet(descriptor + 200, ablaRuntimeLoadI64(descriptor + 104), 2 * writes)
+    __ablaRuntimePlatformRootsSet(descriptor + 312, ablaRuntimeLoadI64(descriptor + 304), kept)
+}
+
+// `first orElse second`, inside a transaction (`atomic { first } orElse
+// { second }` runs inside one): `first`'s result, or, when it retries, `second`'s
+// after `first`'s writes are undone. A conflict abandons the whole attempt.
+trusted fun __ablaRuntimeStmOrElse(first: any, second: any): any {
+    val descriptor = __ablaRuntimeStmDescriptor()
+    if (ablaRuntimeLoadI64(descriptor) == 0) __ablaRuntimePanic("orElse outside a transaction")
+    val output = descriptor + 224
+    val depth = ablaRuntimeLoadI64(descriptor + 272)
+    val writes = ablaRuntimeLoadI64(descriptor + 80)
+    val kept = ablaRuntimeLoadI64(descriptor + 280)
+    if (depth == 0) {
+        __ablaRuntimeRootsPush(descriptor + 312, ablaRuntimeLoadI64(descriptor + 304), 0)
+    }
+    ablaRuntimeStoreI64(descriptor + 272, depth + 1)
+    val outer = ablaRuntimeLoadI64(descriptor + 120)
+    val unwind = __ablaRuntimePlatformRawAllocate(16)
+    __ablaRuntimePlatformUnwindSave(unwind)
+    val suspended = __ablaRuntimeCurrentGenerator
+    val abandoned = __ablaRuntimePlatformAttempt(ablaRuntimeValueAddress(first), output, descriptor + 120)
+    ablaRuntimeStoreI64(descriptor + 120, outer)
+    ablaRuntimeStoreI64(descriptor + 272, depth)
+    if (abandoned) {
+        __ablaRuntimePlatformUnwindRestore(unwind)
+        __ablaRuntimeCurrentGenerator = suspended
+    }
+    __ablaRuntimePlatformRawFree(unwind)
+    val retried = abandoned && ablaRuntimeLoadI64(descriptor + 160) != 0
+    if (retried) {
+        ablaRuntimeStoreI64(descriptor + 160, 0)
+        __ablaRuntimeStmUndoTo(descriptor, writes, kept)
+    }
+    // What the alternatives keep matters only to an enclosing one.
+    if (depth == 0) {
+        ablaRuntimeStoreI64(descriptor + 280, 0)
+        __ablaRuntimeRootsPop(descriptor + 312)
+    }
+    if (!abandoned) return __ablaRuntimeValueAt(output)
+    // A conflict: the whole attempt runs again.
+    if (!retried) __ablaRuntimeStmAbandon(descriptor, false)
+    __ablaRuntimeDispatchClosure(ablaRuntimeValueAddress(second), output)
+    __ablaRuntimeValueAt(output)
+}
+
 // Runs `closure` (no arguments) as a transaction and returns its result. Inside
 // another transaction it joins that one.
 trusted fun __ablaRuntimeStmAtomic(closure: any): any {
@@ -1349,6 +1474,8 @@ trusted fun __ablaRuntimeStmRecover(): void {
     ablaRuntimeStoreI64(descriptor + 48, 0)
     ablaRuntimeStoreI64(descriptor + 80, 0)
     ablaRuntimeStoreI64(descriptor + 112, 0)
+    ablaRuntimeStoreI64(descriptor + 272, 0)
+    ablaRuntimeStoreI64(descriptor + 280, 0)
     ablaRuntimeStoreI64(descriptor, 0)
 }
 
