@@ -6293,8 +6293,28 @@ class BootstrapAnalyzer(
     // The names a `by` expression may not read (checkDelegatedInitializerScope).
     val delegatedFailedInitializers: array<BootstrapExpression> = [],
     val delegatedFailedReplacements: array<BootstrapExpression> = [],
-    // The `atomic` bodies being analyzed, innermost last (0: none).
-    var atomicDepth: int = 0
+    // The `atomic` bodies being analyzed, innermost last (0: none). A lambda
+    // inside one starts again from 0: it may run anywhere.
+    var atomicDepth: int = 0,
+    // Transactions' checks (bootstrapCheckStm): whether the program has an
+    // `atomic` or a TVar at all; the lambdas (other than transaction bodies)
+    // being analyzed; the lambda that is the next transaction body; the first
+    // scope inside the innermost transaction body.
+    var stmEnabled: bool = false,
+    var stmLambdaDepth: int = 0,
+    var stmBodyPending: int = -1,
+    var stmScopeFloor: int = -1,
+    // What the checks need of each body: a TVar access or `retry`
+    // ("access"), a call or read of a declaration ("call", its handle), a
+    // thread or task started ("thread"), a global changed ("global"), with
+    // the body (stmOwner), whether it is inside a transaction, and where.
+    val stmKinds: array<string> = [],
+    val stmOwners: array<int> = [],
+    val stmInside: array<bool> = [],
+    val stmTargets: array<int> = [],
+    val stmBegins: array<int> = [],
+    val stmSources: array<string> = [],
+    val stmTexts: array<string> = []
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -7744,6 +7764,49 @@ class BootstrapAnalyzer(
         return
     }
 
+    /** The body a transaction check event belongs to: a lambda's (-2: it may
+     *  run anywhere), a declaration's or method's handle, or -3 (an action). */
+    fun stmOwner(): int =
+        if (this.stmLambdaDepth > 0) -2
+        else if (this.initEdges.owner >= 0) this.initEdges.owner
+        else -3
+
+    fun stmNote(kind: string, target: int, begin: int, text: string): void {
+        if (!this.stmEnabled) return
+        this.stmKinds.append(kind)
+        this.stmOwners.append(this.stmOwner())
+        this.stmInside.append(this.atomicDepth > 0)
+        this.stmTargets.append(target)
+        this.stmBegins.append(begin)
+        this.stmSources.append(this.currentSourceIdentity)
+        this.stmTexts.append(text)
+        return
+    }
+
+    /** Inside a transaction, a change through `place` (`name`, `name.f…`,
+     *  `name[i]…`) must reach a TVar or what the transaction made: a local
+     *  declared inside it. A captured outer local, a global or an outside
+     *  object is stm.outside-mutation, as an abandoned attempt would leave
+     *  it changed. */
+    fun stmCheckMutation(place: BootstrapExpression, at: int, what: string): void {
+        if (!this.stmEnabled) return
+        val root = bootstrapPlaceRootName(place)
+        val global = root != "" && !this.hasVisibleLocal(root) &&
+            (this.currentOwner == "" || this.fieldType(this.currentOwner, root) == "unknown") &&
+            (this.findKind(root) == "var" || this.findKind(root) == "val")
+        // (The runtime's own globals, a collection's bookkeeping, aren't the
+        // program's state.)
+        if (global && !bootstrapIsTVarType(this.delegateType(root)) &&
+            !bootstrapRuntimeModuleSource(this.currentSourceIdentity)) {
+            this.stmNote("global", -1, at, root)
+        }
+        if (this.atomicDepth == 0) return
+        if (root != "" && this.hasVisibleLocal(root) &&
+            this.visibleLocalScope(root) >= this.stmScopeFloor) return
+        this.fail("stm.outside-mutation:${if (what == "") root else what}@$at")
+        return
+    }
+
     /** The symbol of the extension field `owner.field` (`var Owner.field: T`),
      *  -1 when there is none. A declared field of the class comes first. */
     fun extensionFieldSymbol(owner: string, field: string): int {
@@ -8192,6 +8255,10 @@ class BootstrapAnalyzer(
         name: string
     ): void {
         val owner = this.delegateType(name)
+        // The getter runs here (the transactions' checks: bootstrapCheckStm).
+        if (!bootstrapIsTVarType(owner)) {
+            this.stmNote("call", this.selectedMethodHandle(owner, "getValue"), expression.begin, "")
+        }
         val receiverKind = this.methodReceiverKind(owner, "getValue")
         if (receiverKind == "var" && this.hasVisibleLocal(name)) {
             this.validateMutableBorrowArgument(
@@ -8824,6 +8891,8 @@ class BootstrapAnalyzer(
         expected: string,
         context: string
     ): void {
+        // Lent to be changed: inside a transaction, it must be its own.
+        this.stmCheckMutation(expression, expression.begin, "")
         val kinds: array<int> = []
         val values: array<string> = []
         bootstrapCollectOwnershipPlace(expression, kinds, values)
@@ -10100,6 +10169,10 @@ class BootstrapAnalyzer(
                 this.fail("ownership.borrow-mutation:map.$method")
             }
             this.validateBorrowMutation(expression.children[0], "map.$method")
+            this.stmCheckMutation(
+                expression.children[0], expression.begin,
+                "${bootstrapPlaceRootName(expression.children[0])}.$method()"
+            )
         }
         val arity = if (method == "set") 3
             else if (method == "get" || method == "has" ||
@@ -11428,6 +11501,7 @@ class BootstrapAnalyzer(
         val initialization = if (this.overloads.keys.size == 0)
             bootstrapCheckInitialization(this) else BootstrapInitialization([], [], [], [])
         if (this.overloads.keys.size == 0) bootstrapCheckThreadGlobals(this)
+        if (this.overloads.keys.size == 0 && this.stmEnabled) bootstrapCheckStm(this)
         if (this.overloads.keys.size == 0) bootstrapPublishInferredResults(this)
         BootstrapSemanticResult(
             this.symbols,
@@ -11696,6 +11770,9 @@ fun bootstrapInferIdentifier(
     if (result != "unknown" &&
         analyzer.nameIsDelegated(expression.text)) {
         analyzer.validateDelegatedRead(expression, expression.text)
+        if (bootstrapIsTVarType(analyzer.delegateType(expression.text))) {
+            analyzer.stmNote("access", -1, expression.begin, expression.text)
+        }
         // (A property without a getter, reported with it, stays a field read.)
         if (analyzer.namesDelegatedField(expression.text) && result != "unknown") {
             analyzer.recordDelegatedRewrite(expression, "self.read")
@@ -11715,6 +11792,15 @@ fun bootstrapInferLambda(
 ): string {
     var result = initial
     analyzer.validateLambdaCaptures(expression)
+    // A transaction body stays inside its transaction; any other lambda may
+    // run anywhere (bootstrapCheckStm).
+    val transactionBody = expression.begin == analyzer.stmBodyPending
+    analyzer.stmBodyPending = -1
+    val previousAtomicDepth = analyzer.atomicDepth
+    if (!transactionBody) {
+        analyzer.atomicDepth = 0
+        analyzer.stmLambdaDepth = analyzer.stmLambdaDepth + 1
+    }
     val previousScope = analyzer.enterScope()
     val previousResultType = analyzer.currentResultType
     val previousBorrowResultSource =
@@ -11782,6 +11868,8 @@ fun bootstrapInferLambda(
         analyzer.yieldedType = previousYieldedType
     }
     analyzer.leaveScope(previousScope)
+    analyzer.atomicDepth = previousAtomicDepth
+    if (!transactionBody) analyzer.stmLambdaDepth = analyzer.stmLambdaDepth - 1
     val functionType = "function:($parameters)->$bodyType"
     if (expression.kind == "lambda.move" ||
         expression.kind == "lambda.generator") {
@@ -12512,6 +12600,10 @@ fun bootstrapInferIndexAssign(
         expression.children[0],
         "index.assign"
     )
+    analyzer.stmCheckMutation(
+        expression.children[0], expression.begin,
+        "${bootstrapPlaceRootName(expression.children[0])}[]"
+    )
     val rawReceiver = analyzer.infer(expression.children[0])
     if (bootstrapIsBorrowType(rawReceiver)) {
         analyzer.fail("ownership.borrow-mutation:index.assign")
@@ -12598,6 +12690,7 @@ fun bootstrapInferMemberCall(
         result = analyzer.inferMapCall(expression, rawReceiver, receiver)
     } else if (bootstrapIsTVarType(receiver)) {
         val element = bootstrapTVarElementType(receiver)
+        analyzer.stmNote("access", -1, expression.begin, "${expression.text}()")
         if (expression.text == "getValue") {
             if (expression.children.size != 1) analyzer.fail("tvar.getValue.arity")
             result = element
@@ -12625,6 +12718,10 @@ fun bootstrapInferMemberCall(
             }
             result = element
         } else if (expression.text == "set") {
+            analyzer.stmCheckMutation(
+                expression.children[0], expression.begin,
+                "${bootstrapPlaceRootName(expression.children[0])}.set()"
+            )
             if (expression.children.size != 2) {
                 analyzer.fail("cell.set.arity")
             } else {
@@ -12713,6 +12810,10 @@ fun bootstrapInferMemberCall(
             expression.children[0],
             "append"
         )
+        analyzer.stmCheckMutation(
+            expression.children[0], expression.begin,
+            "${bootstrapPlaceRootName(expression.children[0])}.append()"
+        )
         if (expression.children.size != 2) {
             analyzer.fail("append.arity")
         } else {
@@ -12756,6 +12857,10 @@ fun bootstrapInferMemberCall(
         analyzer.validateBorrowMutation(
             expression.children[0],
             expression.text
+        )
+        analyzer.stmCheckMutation(
+            expression.children[0], expression.begin,
+            "${bootstrapPlaceRootName(expression.children[0])}.${expression.text}()"
         )
         val arity = if (expression.text == "clear") 1 else 2
         if (expression.children.size != arity) {
@@ -12947,6 +13052,10 @@ fun bootstrapInferMemberAssign(
         expression.children[0],
         "member.assign.${expression.text}"
     )
+    analyzer.stmCheckMutation(
+        expression.children[0], expression.begin,
+        "${bootstrapPlaceRootName(expression.children[0])}.${expression.text}"
+    )
     val rawReceiver = analyzer.infer(expression.children[0])
     if (bootstrapIsBorrowType(rawReceiver)) {
         analyzer.fail("ownership.borrow-mutation:member.assign")
@@ -13123,6 +13232,9 @@ fun bootstrapInferTask(
     initial: string
 ): string {
     var result = initial
+    // A transaction could start it again, and an abandoned one couldn't stop it.
+    if (analyzer.atomicDepth > 0) analyzer.fail("stm.effect:thread@${expression.begin}")
+    analyzer.stmNote("thread", -1, expression.begin, expression.kind)
     if (expression.children.size != 1 ||
         expression.children[0].kind == "missing") {
         analyzer.fail("${expression.kind}.body")
@@ -13246,6 +13358,8 @@ fun bootstrapInferReturn(
 ): string {
     var result = initial
     if (analyzer.regionDepth > 0) analyzer.fail("region.control:return")
+    // A transaction's body is a closure: `return` would leave only it.
+    if (analyzer.atomicDepth > 0) analyzer.fail("stm.control:return@${expression.begin}")
     var returned = "void"
     if (expression.children[0].kind != "missing") {
         returned = analyzer.infer(expression.children[0])
@@ -13457,6 +13571,10 @@ fun bootstrapInferLocal(
         }
     }
     val kind = if (expression.kind == "local.var") "var" else "val"
+    // An abandoned attempt skips the drops of what its body owned.
+    if (analyzer.atomicDepth > 0 && analyzer.typeIsAffine(type)) {
+        analyzer.fail("stm.resource:${expression.text}@${expression.begin}")
+    }
     analyzer.locals.append(BootstrapSymbol(
         expression.text,
         kind,
@@ -13496,6 +13614,12 @@ fun bootstrapInferAssign(
     }
     val property = delegated && analyzer.namesDelegatedField(expression.text)
     var propertyAction = "self.assign"
+    if (delegated && bootstrapIsTVarType(analyzer.delegateType(expression.text))) {
+        analyzer.stmNote("access", -1, expression.begin, expression.text)
+    } else analyzer.stmCheckMutation(
+        BootstrapExpression("identifier", expression.text, expression.begin, expression.end, []),
+        expression.begin, ""
+    )
     if (target == "unknown" ||
         !analyzer.typesCompatible(target, value)) {
         if (property) {
@@ -13507,6 +13631,9 @@ fun bootstrapInferAssign(
     }
     if (delegated) {
         val delegateType = analyzer.delegateType(expression.text)
+        if (!bootstrapIsTVarType(delegateType)) analyzer.stmNote(
+            "call", analyzer.selectedMethodHandle(delegateType, "setValue"), expression.begin, ""
+        )
         val setterInput = analyzer.methodParameterType(
             delegateType,
             "setValue",
@@ -13607,11 +13734,35 @@ fun bootstrapInferAtomic(
     initial: string
 ): string {
     if (expression.children.size != 1) return "unknown"
+    val outermost = analyzer.atomicDepth == 0
+    analyzer.stmNote("atomic", -1, expression.begin, "")
+    val previousFloor = analyzer.stmScopeFloor
+    analyzer.stmScopeFloor = analyzer.scopeParents.size
     analyzer.atomicDepth = analyzer.atomicDepth + 1
+    analyzer.stmBodyPending = expression.children[0].begin
     val body = analyzer.infer(expression.children[0])
     analyzer.atomicDepth = analyzer.atomicDepth - 1
+    analyzer.stmScopeFloor = previousFloor
+    // What the body may do, through what it calls too: nothing an abandoned
+    // attempt could not take back (the outermost transaction checks all).
+    if (outermost && analyzer.compileEffects.names.size > 0) {
+        val effect = bootstrapStmEffectName(
+            analyzer.expressionCompileEffects(expression.children[0])
+        )
+        if (effect != "") analyzer.fail("stm.effect:$effect@${expression.begin}")
+    }
     bootstrapFunctionResultType(body)
 }
+
+/** An effect a transaction may not have (`stm.effect:<effect>`), of an
+ *  effect mask: I/O, the file system, the network or a native call. "" when
+ *  none (reading the environment, the clock or random numbers is allowed). */
+fun bootstrapStmEffectName(mask: int): string =
+    if (bootstrapCompileEffectHas(mask, 32)) "io"
+    else if (bootstrapCompileEffectHas(mask, 4) || bootstrapCompileEffectHas(mask, 8)) "filesystem"
+    else if (bootstrapCompileEffectHas(mask, 64)) "network"
+    else if (bootstrapCompileEffectHas(mask, 512)) "native"
+    else ""
 
 /** `a orElse b` (in an `atomic`): the alternatives' shared type. */
 @noinline
@@ -13621,7 +13772,9 @@ fun bootstrapInferOrElse(
     initial: string
 ): string {
     if (expression.children.size != 2) return "unknown"
+    analyzer.stmBodyPending = expression.children[0].begin
     val first = bootstrapFunctionResultType(analyzer.infer(expression.children[0]))
+    analyzer.stmBodyPending = expression.children[1].begin
     val second = bootstrapFunctionResultType(analyzer.infer(expression.children[1]))
     if (first == "never") return second
     if (second == "never" || bootstrapTypesCompatible(first, second)) return first
@@ -13635,7 +13788,12 @@ fun bootstrapInferOrElse(
 fun bootstrapInferRetry(
     var analyzer: BootstrapAnalyzer,
     expression: BootstrapExpression
-): string = "never"
+): string {
+    // In a program with no transaction at all, no `retry` is in one.
+    if (!analyzer.stmEnabled) analyzer.fail("stm.outside-atomic:retry@${expression.begin}")
+    analyzer.stmNote("access", -1, expression.begin, "retry")
+    "never"
+}
 
 @noinline
 fun bootstrapInferDelegateProject(
@@ -13758,6 +13916,7 @@ fun bootstrapInferDelegateAssign(
             expression.children[0],
             "delegate.replace.$name"
         )
+        analyzer.stmCheckMutation(expression.children[0], expression.begin, "^$name")
         analyzer.validateRegionStore(
             expression.children[0],
             expression.children[1],
@@ -14359,8 +14518,33 @@ fun bootstrapAnalyzer(
         BootstrapExpression("missing", "", 0, 0, []),
         -1,
         bootstrapNoInferredResults(),
-        bootstrapNoInitEdges()
+        bootstrapNoInitEdges(),
+        stmEnabled = bootstrapProgramUsesStm(parsed.declarations)
     )
+}
+
+/** Whether a program has an `atomic` or makes a TVar: only then are the
+ *  transactions' checks recorded (bootstrapCheckStm). */
+fun bootstrapProgramUsesStm(declarations: array<BootstrapDeclaration>): bool {
+    for (declaration in declarations) {
+        if (bootstrapExpressionUsesStm(declaration.expression)) return true
+        for (fallback in declaration.parameterDefaults) {
+            if (bootstrapExpressionUsesStm(fallback)) return true
+        }
+        for (method in declaration.methods) {
+            if (bootstrapExpressionUsesStm(method.expression)) return true
+        }
+    }
+    false
+}
+
+fun bootstrapExpressionUsesStm(expression: BootstrapExpression): bool {
+    if (expression.kind == "atomic" ||
+        (expression.kind == "call" && expression.text == "TVar")) return true
+    for (child in expression.children) {
+        if (bootstrapExpressionUsesStm(child)) return true
+    }
+    false
 }
 
 fun bootstrapStringSetOf(keys: array<string>): BootstrapStringSet {
@@ -14372,3 +14556,154 @@ fun bootstrapStringSetOf(keys: array<string>): BootstrapStringSet {
 
 fun bootstrapAnalyze(source: string): BootstrapSemanticResult =
     bootstrapAnalyzeParsed(bootstrapParse(source))
+
+/** The transactions' checks that need the whole program (language design
+ *  §3b), from what each body recorded (BootstrapAnalyzer.stmNote):
+ *  - a function or method that reaches a TVar (or `retry`) outside an
+ *    `atomic`, itself or through what it calls, runs only inside a
+ *    transaction: reaching one from where no transaction can run (`main`, a
+ *    global's initializer, a lambda) is stm.outside-atomic;
+ *  - a transaction may not call what starts a thread (stm.effect:thread) or
+ *    changes a global (stm.outside-mutation). */
+fun bootstrapCheckStm(var analyzer: BootstrapAnalyzer): void {
+    val declarations = analyzer.declarations
+    var nodes = declarations.size
+    for (handle in analyzer.methodDeclarations.handles) {
+        if (handle + 1 > nodes) nodes = handle + 1
+    }
+    val names: array<string> = []
+    val callable: array<bool> = []
+    while (names.size < nodes) {
+        val index = names.size
+        var name = ""
+        if (index < declarations.size &&
+            (declarations[index].kind == "fun" || declarations[index].kind == "compile.fun")) {
+            name = "${declarations[index].name}"
+        }
+        names.append(name)
+        callable.append(name != "")
+    }
+    var method = 0
+    while (method < analyzer.methodDeclarations.handles.size) {
+        val handle = analyzer.methodDeclarations.handles[method]
+        if (handle >= 0 && handle < nodes) {
+            names[handle] = "${analyzer.methodDeclarations.owners[method]}.${analyzer.methodDeclarations.declarations[method].name}"
+            callable[handle] = true
+        }
+        method = method + 1
+    }
+    // Whether each body may run inside a transaction: a function's or a
+    // method's, never `main`'s.
+    val transacting: array<bool> = []
+    var node = 0
+    while (node < nodes) {
+        transacting.append(callable[node] && names[node] != "main")
+        node = node + 1
+    }
+    val transactional: array<bool> = []
+    val threads: array<bool> = []
+    val inputs: array<bool> = []
+    val globals: array<string> = []
+    while (transactional.size < nodes) {
+        // Printing or reading the standard streams: I/O no attempt takes back.
+        val index = transactional.size
+        inputs.append(index < declarations.size && bootstrapStmStreamFunction(declarations[index]))
+        transactional.append(false)
+        threads.append(false)
+        globals.append("")
+    }
+    val events = analyzer.stmKinds.size
+    var event = 0
+    while (event < events) {
+        val owner = analyzer.stmOwners[event]
+        if (owner >= 0 && owner < nodes) {
+            val kind = analyzer.stmKinds[event]
+            if (kind == "access" && !analyzer.stmInside[event] && transacting[owner]) {
+                transactional[owner] = true
+            }
+            if (kind == "thread") threads[owner] = true
+            if (kind == "global" && globals[owner] == "") globals[owner] = analyzer.stmTexts[event]
+        }
+        event = event + 1
+    }
+    // What the callees reach, the callers reach (a call outside a
+    // transaction, for running only inside one).
+    var changed = true
+    while (changed) {
+        changed = false
+        event = 0
+        while (event < events) {
+            val owner = analyzer.stmOwners[event]
+            val target = analyzer.stmTargets[event]
+            if (analyzer.stmKinds[event] == "call" && owner >= 0 && owner < nodes &&
+                target >= 0 && target < nodes && callable[target]) {
+                if (transactional[target] && !transactional[owner] &&
+                    !analyzer.stmInside[event] && transacting[owner]) {
+                    transactional[owner] = true
+                    changed = true
+                }
+                if (threads[target] && !threads[owner]) {
+                    threads[owner] = true
+                    changed = true
+                }
+                if (inputs[target] && !inputs[owner]) {
+                    inputs[owner] = true
+                    changed = true
+                }
+                if (globals[target] != "" && globals[owner] == "") {
+                    globals[owner] = globals[target]
+                    changed = true
+                }
+            }
+            event = event + 1
+        }
+    }
+    val source = analyzer.currentSourceIdentity
+    // Each mistake once, though a call is recorded at each lookup.
+    val reported = bootstrapStringSet()
+    event = 0
+    while (event < events) {
+        val owner = analyzer.stmOwners[event]
+        val target = analyzer.stmTargets[event]
+        val kind = analyzer.stmKinds[event]
+        val inside = analyzer.stmInside[event]
+        val anywhere = owner < 0 || owner >= nodes || !transacting[owner]
+        val at = analyzer.stmBegins[event]
+        var code = ""
+        if (kind == "access" && !inside && anywhere) {
+            code = "stm.outside-atomic:${analyzer.stmTexts[event]}"
+        }
+        if (kind == "call" && target >= 0 && target < nodes && callable[target]) {
+            if (!inside && anywhere && transactional[target]) {
+                code = "stm.outside-atomic:${names[target]}"
+            } else if (inside && inputs[target]) {
+                code = "stm.effect:io:${names[target]}"
+            } else if (inside && threads[target]) {
+                code = "stm.effect:thread:${names[target]}"
+            } else if (inside && globals[target] != "") {
+                code = "stm.outside-mutation:${names[target]}:${globals[target]}"
+            }
+        }
+        // (A call is recorded at each lookup of its callee: once per body.)
+        val key = "${analyzer.stmSources[event]}:$owner:$code"
+        if (code != "" && (kind == "access" || !reported.contains(key))) {
+            reported.add(key)
+            analyzer.currentSourceIdentity = analyzer.stmSources[event]
+            analyzer.fail("$code@$at")
+        }
+        event = event + 1
+    }
+    analyzer.currentSourceIdentity = source
+    return
+}
+
+/** abla/io's printing and reading, and the standard streams under them. */
+fun bootstrapStmStreamFunction(declaration: BootstrapDeclaration): bool {
+    if (declaration.kind != "fun" || declaration.extensionOwner != "") return false
+    val name = bootstrapCanonicalDeclarationSourceName(declaration.name)
+    if ((name == "print" || name == "println" || name == "eprint" ||
+         name == "eprintln" || name == "readLine") &&
+        bootstrapCompileProviderModule(declaration) == "io") return true
+    name.startsWith("linuxPrintStandard") || name.startsWith("linuxWriteStandard") ||
+        name.startsWith("linuxReadStandard")
+}
