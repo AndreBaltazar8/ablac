@@ -29,7 +29,8 @@
 #
 # Environment: DOC_EXAMPLES_FILTER (a substring of "doc:line" to run a subset,
 # which also skips the link check), DOC_EXAMPLES_LINKS_ONLY=1 (check links only),
-# DOC_EXAMPLES_KEEP=1 (keep the work directory), ABLA_MAX_SECONDS (per program).
+# DOC_EXAMPLES_KEEP=1 (keep the work directory), DOC_EXAMPLES_JOBS (examples
+# built at once, default the number of CPUs), ABLA_MAX_SECONDS (per program).
 set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -53,6 +54,7 @@ export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096}
 export ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-60}
 export ABLA_MAX_CPU_SECONDS=${ABLA_MAX_CPU_SECONDS:-$ABLA_MAX_SECONDS}
 
+jobs=${DOC_EXAMPLES_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 passed=0
 failed=0
 skipped=0
@@ -77,6 +79,13 @@ expected_output() {
     ' "$1"
 }
 
+# An example's verdict, in <directory>/result: "pass", or "fail", the reason
+# and the log to show, a line each.
+verdict_fail() { # $1 = directory, $2 = reason, $3 = log file (optional)
+    printf 'fail\n%s\n%s\n' "$2" "${3:-}" >"$1/result"
+}
+
+# Checks one example; runs in a job of its own, so it only writes its verdict.
 check_program() { # $1 = mode, $2 = source, $3 = location, $4 = directory
     local mode=$1 source=$2 location=$3 dir=$4
     local binary=$dir/program log=$dir/build.log status has_main=0
@@ -90,25 +99,25 @@ check_program() { # $1 = mode, $2 = source, $3 = location, $4 = directory
     set -e
     if [[ $mode == error ]]; then
         if ((status == 0)); then
-            fail "$location" "expected a compile error, but it compiled"
+            verdict_fail "$dir" "expected a compile error, but it compiled"
             return
         fi
         local wanted
         while IFS= read -r wanted; do
             if ! grep -qF -- "$wanted" "$log"; then
-                fail "$location" "diagnostics lack '$wanted'" "$log"
+                verdict_fail "$dir" "diagnostics lack '$wanted'" "$log"
                 return
             fi
         done < <(sed -n 's/^[[:space:]]*\/\/ error: *//p' "$source")
-        passed=$((passed + 1))
+        echo pass >"$dir/result"
         return
     fi
     if ((status != 0)); then
-        fail "$location" "does not compile" "$log"
+        verdict_fail "$dir" "does not compile" "$log"
         return
     fi
     if [[ $mode == build ]] || ((has_main == 0)); then
-        passed=$((passed + 1))
+        echo pass >"$dir/result"
         return
     fi
     set +e
@@ -122,20 +131,20 @@ check_program() { # $1 = mode, $2 = source, $3 = location, $4 = directory
         expected_output "$source" >"$dir/expected"
         if ! cmp -s "$dir/expected" "$dir/stdout"; then
             diff "$dir/expected" "$dir/stdout" >"$dir/diff" 2>&1 || true
-            fail "$location" "output differs (< expected, > actual)" "$dir/diff"
+            verdict_fail "$dir" "output differs (< expected, > actual)" "$dir/diff"
             return
         fi
         exit_expected=${exit_expected:-0}
     fi
     if [[ -n $exit_expected ]] && ((status != exit_expected)); then
-        fail "$location" "exit status $status, expected $exit_expected" "$dir/stderr"
+        verdict_fail "$dir" "exit status $status, expected $exit_expected" "$dir/stderr"
         return
     fi
     if ((status >= 124)); then
-        fail "$location" "crashed or timed out (status $status)" "$dir/stderr"
+        verdict_fail "$dir" "crashed or timed out (status $status)" "$dir/stderr"
         return
     fi
-    passed=$((passed + 1))
+    echo pass >"$dir/result"
 }
 
 # The anchors GitHub gives the headings of a Markdown file, one per line.
@@ -231,9 +240,28 @@ for doc in "$@"; do
         cp -R "$doc_dir/files/." "$dir/"
         rm -f "$doc_dir/files/abla.toml"
         cp "$doc_dir/blocks/$n" "$dir/main.ab"
-        check_program "${mode:-run}" "$dir/main.ab" "$location" "$dir"
+        printf '%s\0%s\0%s\0%s\0' "${mode:-run}" "$dir/main.ab" "$location" "$dir" >>"$work/examples"
     done <"$doc_dir/blocks/index"
 done
+
+# Every example is set up in its own directory above (a document's `file=`
+# blocks apply in order); they build and run in parallel, and their verdicts
+# are reported in document order.
+if [[ -s $work/examples ]]; then
+    export compiler project_root
+    export -f check_program verdict_fail expected_output
+    xargs -0 -n4 -P "$jobs" bash -c 'check_program "$@"' check_program <"$work/examples"
+    while IFS= read -r -d '' mode && IFS= read -r -d '' source &&
+        IFS= read -r -d '' location && IFS= read -r -d '' dir; do
+        if [[ $(sed -n 1p "$dir/result" 2>/dev/null) == pass ]]; then
+            passed=$((passed + 1))
+        elif [[ -f $dir/result ]]; then
+            fail "$location" "$(sed -n 2p "$dir/result")" "$(sed -n 3p "$dir/result")"
+        else
+            fail "$location" "the check stopped before its verdict"
+        fi
+    done <"$work/examples"
+fi
 
 printf 'doc examples: %d passed, %d failed, %d fragments; %d links checked\n' \
     "$passed" "$failed" "$skipped" "$links"
