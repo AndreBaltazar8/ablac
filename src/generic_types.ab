@@ -593,7 +593,8 @@ fun bootstrapGenericTableOf(declarations: array<BootstrapDeclaration>): Bootstra
         else if (bootstrapIsGenericInstanceName(declaration.name) && declaration.extensionOwner == "") {
             id = bootstrapGenericInstanceGeneric(declaration.name)
         }
-        if (id != "" && (declaration.kind == "class" || declaration.kind == "fun" || declaration.kind == "compile.fun")) {
+        if (id != "" && (bootstrapGenericIsTypeKind(declaration.kind) ||
+                         declaration.kind == "fun" || declaration.kind == "compile.fun")) {
             var seen = false
             for (existing in ids) if (existing == id) seen = true
             if (!seen) {
@@ -614,7 +615,7 @@ fun bootstrapGenericSpelledName(text: string, table: BootstrapGenericTable): str
     val ignored: array<string> = []
     val head = bootstrapGenericCalleeName(text)
     val template = table.findFree(head)
-    if (head.size < text.size && template >= 0 && table.declarations[template].kind != "class") {
+    if (head.size < text.size && template >= 0 && !bootstrapGenericIsTypeKind(table.declarations[template].kind)) {
         val arguments: array<string> = []
         for (argument in bootstrapGenericCalleeArguments(text)) {
             arguments.append(bootstrapNormalizeType(bootstrapGenericRewriteType(argument, table, ignored)))
@@ -624,7 +625,13 @@ fun bootstrapGenericSpelledName(text: string, table: BootstrapGenericTable): str
     bootstrapNormalizeType(bootstrapGenericRewriteType(text, table, ignored))
 }
 
-/** A type parameter's bounds as written: `T:Shape&Named` is Shape, Named. */
+/** Whether a declaration kind makes a type: a generic of one is applied in
+ *  types (`Box<int>`, `Source<int>`). */
+fun bootstrapGenericIsTypeKind(kind: string): bool = kind == "class" || kind == "interface"
+
+/** A type parameter's bounds as written: `T:Shape&Named` is Shape, Named,
+ *  and `T:Ordered<T>` an instance of a generic interface (named with
+ *  bootstrapGenericBound). */
 fun bootstrapGenericParameterBounds(parameter: string): array<string> {
     val bounds: array<string> = []
     var index = 0
@@ -633,7 +640,12 @@ fun bootstrapGenericParameterBounds(parameter: string): array<string> {
     var end = begin
     while (end <= parameter.size) {
         if (end == parameter.size || parameter[end] == 38) {
-            if (end > begin) bounds.append(bootstrapNormalizeType(parameter.slice(begin, end)))
+            if (end > begin) {
+                val bound = parameter.slice(begin, end)
+                var angle = false
+                for (byte in bound) if (byte == 60) angle = true
+                bounds.append(if (angle) bound else bootstrapNormalizeType(bound))
+            }
             begin = end + 1
         }
         end = end + 1
@@ -641,23 +653,132 @@ fun bootstrapGenericParameterBounds(parameter: string): array<string> {
     bounds
 }
 
+/** A bound as the analysis names it for the type arguments `arguments`
+ *  (type strings) of the type parameters `parameters`: `Ordered<T>` with
+ *  `T` a `Money` is `Ordered__abla_generic_Money`. Each instance named is
+ *  appended to `requests`. */
+fun bootstrapGenericBound(
+    bound: string,
+    parameters: array<string>,
+    arguments: array<string>,
+    table: BootstrapGenericTable,
+    var requests: array<string>
+): string {
+    var angle = false
+    for (byte in bound) if (byte == 60) angle = true
+    if (!angle) return bound
+    val sources: array<string> = []
+    for (argument in arguments) sources.append(bootstrapGenericSourceType(bootstrapGenericParse(argument)))
+    bootstrapNormalizeType(bootstrapGenericRewriteType(
+        bootstrapGenericSubstituteWords(bound, parameters, sources), table, requests
+    ))
+}
+
+/** The interfaces `type` declares it conforms to (as a class, an `extend`
+ *  or an interface's parents). An instance of a generic class or interface
+ *  conforms as its generic declares, for its type arguments, whether or not
+ *  the instance is made yet. */
+fun bootstrapGenericDirectConformances(
+    declarations: array<BootstrapDeclaration>,
+    table: BootstrapGenericTable,
+    type: string
+): array<string> {
+    val result: array<string> = []
+    for (declaration in declarations) {
+        if ((bootstrapGenericIsTypeKind(declaration.kind) || declaration.kind == "extend") &&
+            declaration.name == type) {
+            for (conformance in declaration.conformances) result.append(bootstrapNormalizeType(conformance))
+        }
+    }
+    val template = table.findId(bootstrapGenericInstanceGeneric(type))
+    if (template >= 0 && bootstrapGenericIsTypeKind(table.declarations[template].kind)) {
+        val parameters = bootstrapGenericParameterNames(table.declarations[template])
+        val arguments = bootstrapGenericInstanceArguments(type)
+        if (arguments.size == parameters.size) {
+            val ignored: array<string> = []
+            for (conformance in table.declarations[template].conformances) {
+                result.append(bootstrapGenericBound(conformance, parameters, arguments, table, ignored))
+            }
+        }
+    }
+    result
+}
+
 /** Whether the type argument `type` satisfies the bound `bound` (an
- *  interface): it is the interface or conforms to it. An instance conforms
- *  as its generic class declares, before the instance itself is made. */
+ *  interface, or an instance of a generic one): it is the interface or
+ *  conforms to it, directly or through the interfaces it conforms to. */
 fun bootstrapGenericSatisfies(
     declarations: array<BootstrapDeclaration>,
     table: BootstrapGenericTable,
     type: string,
     bound: string
 ): bool {
-    if (bootstrapTypeConformsIn(declarations, type, bound)) return true
-    val template = table.findId(bootstrapGenericInstanceGeneric(type))
-    if (template < 0 || table.declarations[template].kind != "class") return false
-    for (conformance in table.declarations[template].conformances) {
-        val name = bootstrapNormalizeType(conformance)
-        if (name == bound || bootstrapTypeConformsIn(declarations, name, bound)) return true
+    if (type == bound || bootstrapTypeConformsIn(declarations, type, bound)) return true
+    bootstrapGenericConformance(declarations, table, type, bound, false) != ""
+}
+
+/** The interface `type` conforms to (directly or through others) that is
+ *  `target` (an interface's name), or with `instanceOf` an instance of the
+ *  generic interface `target`; else "". */
+fun bootstrapGenericConformance(
+    declarations: array<BootstrapDeclaration>,
+    table: BootstrapGenericTable,
+    type: string,
+    target: string,
+    instanceOf: bool
+): string {
+    val pending = [type]
+    var seen = bootstrapStringSet()
+    seen.add(type)
+    var next = 0
+    while (next < pending.size) {
+        val current = pending[next]
+        next = next + 1
+        for (conformance in bootstrapGenericDirectConformances(declarations, table, current)) {
+            if (instanceOf && bootstrapGenericInstanceGeneric(conformance) == target) return conformance
+            if (!instanceOf && conformance == target) return conformance
+            if (!seen.contains(conformance)) {
+                seen.add(conformance)
+                pending.append(conformance)
+            }
+        }
     }
-    false
+    ""
+}
+
+/** Matches as bootstrapGenericUnify does, but a parameter of a generic
+ *  interface's instance (`source: Source<T>`) also takes a value of a type
+ *  conforming to one of its instances: `T` binds from that instance's type
+ *  arguments (`Numbers : Source<int>` binds `T` to `i64`). */
+fun bootstrapGenericUnifyConforming(
+    declarations: array<BootstrapDeclaration>,
+    table: BootstrapGenericTable,
+    pattern: BootstrapGenericType,
+    actual: BootstrapGenericType,
+    parameters: array<string>,
+    var bindings: array<string>
+): void {
+    var value = actual
+    while ((value.head == "borrow" || (value.head.size > 7 && value.head.slice(0, 7) == "borrow@")) &&
+           !value.instance && value.arguments.size == 1) value = value.arguments[0]
+    if (pattern.head == "nullable" && !pattern.instance && pattern.arguments.size == 1 &&
+        !(value.head == "nullable" && !value.instance)) {
+        bootstrapGenericUnifyConforming(declarations, table, pattern.arguments[0], value, parameters, bindings)
+        return
+    }
+    if (pattern.instance && !(value.instance && value.head == pattern.head)) {
+        val template = table.findId(pattern.head)
+        if (template >= 0 && table.declarations[template].kind == "interface") {
+            val conformance = bootstrapGenericConformance(
+                declarations, table, bootstrapGenericTypeString(value), pattern.head, true
+            )
+            if (conformance != "") {
+                bootstrapGenericUnify(pattern, bootstrapGenericParse(conformance), parameters, bindings)
+                return
+            }
+        }
+    }
+    bootstrapGenericUnify(pattern, value, parameters, bindings)
 }
 
 /** The generics of a program, for the probe that types their uses
@@ -706,9 +827,10 @@ class BootstrapGenericTable(
         -1
     }
 
+    /** Whether `name` is a generic class or interface (applied in types). */
     fun isClass(name: string): bool {
         val index = this.findFree(name)
-        index >= 0 && this.declarations[index].kind == "class"
+        index >= 0 && bootstrapGenericIsTypeKind(this.declarations[index].kind)
     }
 
     fun hasExtension(name: string): bool {
@@ -905,7 +1027,19 @@ fun bootstrapGenericBind(
     // The type expected of the call's result binds first.
     if (analyzer.genericExpectedBegin == expression.begin &&
         analyzer.genericExpectedEnd == expression.end && analyzer.genericExpected != "") {
-        bootstrapGenericUnify(result, bootstrapGenericParse(analyzer.genericExpected), parameters, bindings)
+        val expected = bootstrapGenericParse(analyzer.genericExpected)
+        bootstrapGenericUnify(result, expected, parameters, bindings)
+        // A class expected as an interface's instance (`Failed("x")` where a
+        // `Result<int>` is expected, `class Failed<T> : Result<T>`): its
+        // conformance to that interface binds.
+        if (result.instance && expected.instance && expected.head != result.head) {
+            for (conformance in analyzer.generics.declarations[template].conformances) {
+                val pattern = bootstrapGenericPattern(conformance, analyzer.generics)
+                if (pattern.instance && pattern.head == expected.head) {
+                    bootstrapGenericUnify(pattern, expected, parameters, bindings)
+                }
+            }
+        }
         analyzer.genericExpectedBegin = -1
     }
     // The arguments, positional then named; lambdas last, once the
@@ -933,7 +1067,10 @@ fun bootstrapGenericBind(
         } else {
             val type = analyzer.infer(value)
             if (parameter >= 0 && parameter < patterns.size) {
-                bootstrapGenericUnify(patterns[parameter], bootstrapGenericParse(type), parameters, bindings)
+                bootstrapGenericUnifyConforming(
+                    analyzer.declarations, analyzer.generics,
+                    patterns[parameter], bootstrapGenericParse(type), parameters, bindings
+                )
             }
         }
         child = child + 1
@@ -980,11 +1117,12 @@ fun bootstrapGenericBind(
     // Each type argument satisfies its parameter's bounds.
     index = 0
     while (index < parameters.size) {
-        for (bound in bounds[index]) {
+        for (written in bounds[index]) {
+            val bound = bootstrapGenericBound(written, parameters, bindings, analyzer.generics, requests)
             if (!bootstrapGenericSatisfies(analyzer.declarations, analyzer.generics, bindings[index], bound)) {
                 bootstrapGenericFailure(
                     analyzer, expression,
-                    "generic.bound:$visible:${parameters[index]}:${bootstrapSourceVisibleType(bindings[index])}:${bootstrapSourceVisibleType(bound)}"
+                    "generic.bound:$visible:${parameters[index]}:${bootstrapGenericVisible(bootstrapSourceVisibleType(bindings[index]))}:${bootstrapGenericVisible(bootstrapSourceVisibleType(bound))}"
                 )
                 return BootstrapGenericInstanceCall("", parameters, bindings)
             }
@@ -994,6 +1132,22 @@ fun bootstrapGenericBind(
     val name = bootstrapGenericInstanceName(id, bindings)
     analyzer.genericRequests.append(name)
     BootstrapGenericInstanceCall(name, parameters, bindings)
+}
+
+/** In the probe: the type expected of `expression` (bootstrapGenericBind
+ *  binds from it), else "". */
+fun bootstrapGenericExpectedOf(analyzer: BootstrapAnalyzer, expression: BootstrapExpression): string =
+    if (analyzer.generics.probing && analyzer.genericExpectedBegin == expression.begin &&
+        analyzer.genericExpectedEnd == expression.end) analyzer.genericExpected else ""
+
+/** In the probe: `type` is expected of `expression` (a function's body, an
+ *  `if`'s branch, a block's last expression), when it isn't "". */
+fun bootstrapGenericExpect(var analyzer: BootstrapAnalyzer, type: string, expression: BootstrapExpression): void {
+    if (!analyzer.generics.probing || type == "" || type == "inferred" || type == "void") return
+    analyzer.genericExpected = type
+    analyzer.genericExpectedBegin = expression.begin
+    analyzer.genericExpectedEnd = expression.end
+    return
 }
 
 class BootstrapGenericInstanceCall(

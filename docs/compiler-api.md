@@ -462,12 +462,16 @@ own queries:
 
 - `compiler.findType(name)` is the handle of a type as spelled
   (`int`, `array<string>`, `Square`), and `compiler.typeName(type)` its
-  spelling (`i64`, `Box<i64>` for an instance of a generic class).
+  spelling (`i64`, `Box<i64>` for an instance of a generic class,
+  `Source<i64>` for one of a generic interface).
 - `compiler.classOf(type)` is its class's handle (for `fieldsOf`,
   `conformances`, `witness`), or `-1` when it is no class.
 - `compiler.typeConformsTo(type, interface)` says whether it is a class
   conforming to the interface (as `conformsTo` answers for its class), or is
-  that interface.
+  that interface. An instance of a generic interface is written as in
+  source (`"Source<int>"`); `conformsTo` and `implementers` take it the same
+  way, and `conformances` spells instances as `typeName` does
+  (`Source<i64>`).
 - `compiler.isResource(type)` says whether it is a resource; an instance of
   a generic class is one when it holds one.
 

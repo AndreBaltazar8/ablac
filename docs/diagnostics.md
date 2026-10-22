@@ -127,12 +127,12 @@ only its parse errors.
 | `interface.cast-resource:<I>` | `as?` on a resource interface's value, which would leave two owners (not supported yet; a `when` arm `is A` sees it as its class without moving it) |
 | `interface.no-witness:<I>:<class>` | at run time: a call through an interface on an instance of a class with no witness for it (the dispatch fallback; no program reaches it today) |
 | `E_COMPILER_TRANSFORM_INTERFACE` | `compiler.declareInterface` or `compiler.addConformance` outside a transform, or without its handle and names ([compiler API](compiler-api.md#interfaces)) |
-| `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a generic interface's `<T>`, a `where` clause, `const` type parameters, an interface's `type Item`, a `sealed class` |
+| `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a `where` clause, `const` type parameters, an interface's `type Item`, a `sealed class` |
 | `generic.cannot-infer:<f>:<T>` | nothing at a call binds type parameter `T`: write the type arguments out (`f<int>(…)`) or give the result an expected type ([generics](language.md#generics)) |
 | `generic.arity:<f>:<expected>:<written>` | the wrong number of type arguments written out, or a generic class's type with the wrong number |
 | `generic.instantiation-depth:<f>` | `f`'s instances make ever larger instances (`f(Box(x))` in `f`) |
 | `generic.overload:<f>` | a generic function sharing its name (and receiver) with another function |
-| `generic.bound:<f>:<T>:<type>:<interface>` | a type argument that is not the bound interface and doesn't conform to it ([bounds](language.md#bounds)) |
+| `generic.bound:<f>:<T>:<type>:<interface>` | a type argument that is not the bound interface and doesn't conform to it ([bounds](language.md#bounds)); a bound that is a generic interface's instance reads as one (`Ordered<i64>`) |
 | `generic.bound-not-interface:<f>:<T>:<bound>` | a type parameter's bound that names no interface |
 | `generic.method-not-supported:<C>.<m>` | a method with type parameters of its own |
 | `generic.reference:<f>` | a generic function used as a value rather than called |

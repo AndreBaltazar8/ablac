@@ -1279,7 +1279,8 @@ fun main {
 moving it. An `is` naming a type that isn't a class conforming to the
 subject's interface (or an interface extending it) is `when.is-type`.
 
-> **Still to come.** Generic interfaces (`interface Source<T>`).
+An interface may take type parameters too (`interface Source<T>`); see
+[generic interfaces](#generic-interfaces).
 
 ## Delegated bindings
 
@@ -1712,7 +1713,9 @@ fun main {
 
 - **Type arguments are inferred** from a call's arguments (an extension's
   from its receiver too) and from the type expected of the call's result (a
-  typed local's initializer, a returned value), never across statements. A
+  typed local's initializer, a returned value, a function's body, and the
+  branches of an `if` or `when` and a block's last expression in those),
+  never across statements. A
   lambda argument's parameters take their types from what is inferred
   before it, and its result can bind a type parameter (`R` above). They may
   be written out: `first<int>(xs)`, `Box<int>(1)`. A type parameter nothing
@@ -1751,8 +1754,8 @@ fun main {
   share its name with another function (`generic.overload:<f>`), a class's
   methods take no type parameters of their own
   (`generic.method-not-supported`), and a generic function is called, not
-  passed as a value (`generic.reference:<f>`). Generic interfaces (`interface Source<T>`) and
-  `where` clauses are reserved syntax.
+  passed as a value (`generic.reference:<f>`). `where` clauses are
+  reserved syntax.
 - **At compile time** generics behave as at run time: `#first([1, 2])`
   evaluates the instance the call names. `#` code in a generic's body runs
   per instance ([below](#compile-time-code-per-instance)).
@@ -1818,6 +1821,87 @@ A type argument that doesn't satisfy a bound is
 `generic.bound:<f>:<T>:<type>:<interface>` (`totalArea([1, 2])`, or
 `Gallery<string>` written as a type), and a bound that names no interface
 is `generic.bound-not-interface:<f>:<T>:<bound>`.
+
+### Generic interfaces
+
+An interface takes type parameters as a class does: `interface Source<T>`
+declares one interface per type argument, and `Source<int>` is one of them.
+A class conforms to an instance (`class Numbers : Source<int>`, or `extend
+Pair : Source<int>`), a generic class may conform to the instance for its
+own type argument (`class Repeat<T> : Source<T>`), and an interface may
+extend an instance (`interface Sized<T> : Source<T>`). Default members are
+written once and run with each instance's types.
+
+A generic function's parameter of an instance (`source: Source<T>`) takes
+a value of any class conforming to one, and its type arguments come from
+that conformance: `count(Numbers(3))` is `count<int>`. A bound may be an
+instance, one naming the bounded parameter itself among them, so that
+`<T : Ordered<T>>` takes a type that compares with its own kind. A value
+of an instance's type dispatches as any interface value does. A `sealed
+interface Result<T>` is sealed per instance: a `when` over a `Result<int>`
+with an `is` arm for each of its classes' instances (`is Ok<int>`, `is
+Failed<int>`) needs no `else`. A generic class's type arguments also come
+from the interface instance expected of it: where a `Result<int>` is
+expected, `Failed("bad")` is a `Failed<int>` (`class Failed<T> : Result<T>`).
+
+```abla
+import "abla/io"
+
+interface Source<T> {
+    fun at(index: int): T?
+    fun all(): array<T> {
+        val items: array<T> = []
+        var index = 0
+        var more = true
+        while (more) {
+            val item = this.at(index)
+            if (item != null) items.append(item) else more = false
+            index = index + 1
+        }
+        items
+    }
+}
+
+class Numbers(val limit: int) : Source<int> {
+    fun at(index: int): int? = if (index < this.limit) index * index else null
+}
+
+class Words(val words: array<string>) : Source<string> {
+    fun at(index: int): string? = if (index < this.words.size) this.words[index] else null
+}
+
+fun <T> count(source: Source<T>): int = source.all().size
+
+fun <T> allOf(source: Source<T>): array<T> = source.all()
+
+interface Ordered<T> {
+    fun compare(other: T): int
+}
+
+class Money(val cents: int) : Ordered<Money> {
+    fun compare(other: Money): int = this.cents - other.cents
+}
+
+fun <T : Ordered<T>> largest(items: array<T>): T {
+    var best = items[0]
+    for (item in items) if (item.compare(best) > 0) best = item
+    best
+}
+
+fun main {
+    println("${allOf(Numbers(4))[3]} ${count(Numbers(3))} ${count(Words(["a", "b"]))}")
+    val words: Source<string> = Words(["q"])
+    println(words.at(0) ?? "-")
+    println("${largest([Money(5), Money(9), Money(2)]).cents}")
+}
+// output:
+// 9 3 2
+// q
+// 9
+```
+
+A type argument outside a bound that is an instance reads as one in
+`generic.bound` (`generic.bound:largest:T:i64:Ordered<i64>`).
 
 ### Compile-time code per instance
 
