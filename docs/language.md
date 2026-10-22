@@ -2368,7 +2368,9 @@ fun main {
   sees them. A module's `#` code sees its private declarations. So do the
   modules generated for it (the members `compiler.addConformance` adds, a
   `compilerGenerateModule` source): they see names as the module that
-  requested them does. A generic's body sees
+  requested them does. So does a subparser's expansion: a name its handler
+  builds (`syntaxIdentifier`, `syntaxCall`, `syntaxAssign`) means what it
+  means in the module that invokes the subparser. A generic's body sees
   names as the module that declares it does, wherever it is instantiated.
 - A declaration's identity (for native symbols and reflection) comes from
   the module that defines it, not from an importer's alias, so renaming an

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # `private` top-level declarations: visible only in their module, so two
-# modules' private names never clash; `#` code and a transform's generated
-# members see their module's private names; the compiler API finds them; and
-# using one from another module (directly, through an alias, or as an
-# extension member) is reported.
+# modules' private names never clash; `#` code, a transform's generated
+# members and a subparser's expansion see their module's private names; the
+# compiler API finds them; and using one from another module (directly,
+# through an alias, or as an extension member) is reported.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -23,6 +23,14 @@ for mode in interp jit; do
     [[ $status == 42 ]] || { echo "private: main ($mode) exited with $status"; exit 1; }
     [[ $output == "hello 6 101 9 42 true hello 6" ]] ||
         { echo "private: main ($mode) printed:"; echo "$output"; exit 1; }
+    ABLA_COMPILE_EVAL=$mode "$compiler" build "$cases/subparser.ab" \
+        -o "$output_directory/subparser-$mode" --no-cache
+    set +e
+    output=$("$output_directory/subparser-$mode")
+    status=$?
+    set -e
+    [[ $status == 42 && $output == "20 20" ]] ||
+        { echo "private: subparser ($mode) exited with $status, printed:"; echo "$output"; exit 1; }
 done
 
 rejected() { # $1 = case, then the texts its diagnostics must contain
@@ -42,4 +50,4 @@ rejected use-alias 'E_NAME_PRIVATE' '`helper` is private to'
 rejected use-extension 'name.private:Point.secret:'
 rejected use-field 'name.private:Point.tag:'
 rejected export 'private.export:twice'
-echo "private: module-only names, no clashes, # (both tiers), generated members, compiler API, diagnostics"
+echo "private: module-only names, no clashes, # (both tiers), generated members, subparser expansions, compiler API, diagnostics"

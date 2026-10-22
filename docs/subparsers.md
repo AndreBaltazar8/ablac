@@ -118,7 +118,10 @@ It builds its result with the `syntax*` builders: `syntaxInteger`,
 `syntaxBinary`, `syntaxArray`, `syntaxCall`, `syntaxMember`, `syntaxIndex`,
 `syntaxIf`, `syntaxBlock`, `syntaxLocal`, `syntaxVariable`, `syntaxAssign`,
 `syntaxReturn`, `syntaxLambda` and `syntaxInferredLambda`. A syntax handle
-is consumed when it is put into another node.
+is consumed when it is put into another node. A name given to
+`syntaxIdentifier`, `syntaxCall` or `syntaxAssign` means what it means in
+the module that invokes the subparser, its `private` declarations included,
+not in the module that declares the handler.
 
 `parserFail(cursor, message)` reports an error at the cursor. The build
 stops with that message:
