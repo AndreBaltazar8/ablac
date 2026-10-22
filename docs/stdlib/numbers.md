@@ -45,7 +45,7 @@ fun main {
 | `sqrt`, `pow(x, y)`, `exp`, `log` | `log` is the natural logarithm |
 | `sin`, `cos`, `tan`, `atan`, `atan2(y, x)` | radians |
 | `floor`, `ceil`, `trunc`, `roundEven` | `roundEven` rounds halves to even; there is no other rounding mode |
-| `hypot(x, y)`, `lerp(from, to, t)` | |
+| `hypot(x, y)`, `lerp(from, to, t)` | `hypot` is correctly rounded (the double nearest the exact root), never overflows or underflows on the way, and gives infinity when either argument is infinite, even if the other is NaN |
 | `isNaN`, `isFinite` | |
 | `mathPi`, `mathHalfPi`, `mathQuarterPi`, `mathTau`, `mathE`, `mathLn2` | constants |
 

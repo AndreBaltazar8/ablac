@@ -165,7 +165,6 @@ fun fclamp(value: f64, minimum: f64, maximum: f64): f64 {
     if (lower > maximum) maximum else lower
 }
 fun lerp(from: f64, to: f64, t: f64): f64 = from + (to - from) * t
-fun hypot(x: f64, y: f64): f64 = sqrt(x * x + y * y)
 
 // --- trigonometry -----------------------------------------------------------
 // Ports of the FreeBSD msun (fdlibm) kernels, using only +, -, *, / and the
@@ -775,3 +774,216 @@ fun pow(x: f64, y: f64): f64 {
     else z = __mathWords(j, __mathLow(z))
     s * z
 }
+
+// --- correctly rounded functions (CORE-MATH) ----------------------------------
+// Ports of CORE-MATH (https://core-math.gitlabpages.inria.fr), which returns the
+// double nearest the exact result. CORE-MATH's fused multiply-adds become
+// Dekker's exact products, so only +, -, *, /, sqrt and integer operations
+// remain and every target agrees bit for bit.
+
+// The rounding error of p = a * b: a * b - p exactly (Dekker's product, for
+// |a|, |b| < 2^995 and no underflow).
+@inline
+fun __mathMulLow(a: f64, b: f64, p: f64): f64 {
+    val ca = 134217729.0 * a
+    val ah = ca - (ca - a)
+    val al = a - ah
+    val cb = 134217729.0 * b
+    val bh = cb - (cb - b)
+    val bl = b - bh
+    (((ah * bh - p) + ah * bl) + al * bh) + al * bl
+}
+
+// The rounding error of p = a * a: a * a - p exactly (as __mathMulLow).
+@inline
+fun __mathSquareLow(a: f64, p: f64): f64 {
+    val ca = 134217729.0 * a
+    val ah = ca - (ca - a)
+    val al = a - ah
+    ((ah * ah - p) + 2.0 * ah * al) + al * al
+}
+
+// The high 64 bits of the unsigned 128-bit product a * b.
+fun __mathMulHigh(a: int, b: int): int {
+    val a0 = a & 0xffffffff
+    val a1 = a >>> 32
+    val b0 = b & 0xffffffff
+    val b1 = b >>> 32
+    val p01 = a0 * b1
+    val p10 = a1 * b0
+    val middle = ((a0 * b0) >>> 32) + (p01 & 0xffffffff) + (p10 & 0xffffffff)
+    a1 * b1 + (p01 >>> 32) + (p10 >>> 32) + (middle >>> 32)
+}
+
+/** sqrt(x^2 + y^2) correctly rounded, without overflow or underflow in
+ *  between; ±inf in either argument gives inf even when the other is NaN. */
+fun hypot(x: f64, y: f64): f64 {
+    // A port of CORE-MATH's hypot.c (copyright 2022-2026 Alexei Sibidanov,
+    // MIT licence: see the end of this file) for round-to-nearest.
+    val xb = f64ToBits(x)
+    val yb = f64ToBits(y)
+    val exponentMask = 0x7ff << 52
+    val ax = fabs(x)
+    val ay = fabs(y)
+    if ((xb & exponentMask) == exponentMask || (yb & exponentMask) == exponentMask) {
+        // A NaN or an infinity: an infinity wins over a quiet NaN.
+        val wx = xb << 1
+        val wy = yb << 1
+        val infinity = exponentMask << 1
+        val oneInfinite = (wx == infinity) != (wy == infinity)
+        val oneQuiet = ((wx >>> 52) == 0xfff) != ((wy >>> 52) == 0xfff)
+        if (oneInfinite && oneQuiet) return if (wx == infinity) ax * ax else ay * ay
+        return ax + ay
+    }
+    val u = if (ax > ay) ax else ay
+    val v = if (ax > ay) ay else ax
+    var ub = f64ToBits(u)
+    var vb = f64ToBits(v)
+    if ((vb >>> 52) == 0) {
+        // v is subnormal or zero
+        if (vb == 0) return u
+        if ((ub >>> 52) == 0) return __mathHypotSubnormal(ub, vb)
+        // v's encoding as if its exponent field could go below 1
+        val zeros = 63 - ((f64ToBits(f64FromInt(vb)) >>> 52) - 1023)
+        vb = ((vb << (zeros - 11)) & (-1 >>> 12)) - ((zeros - 12) << 52)
+    }
+    // v < 2^-27 u: u^2 + v^2 rounds to u^2, and its root to u (unsigned: a
+    // subnormal v's encoding above is below zero)
+    if (u64(ub - vb) > u64(27 << 52)) return u
+    // Scale u to [1, 2) and v by the same power of 2.
+    val offset = (0x3ff << 52) - (ub & exponentMask)
+    val xs = f64FromBits(ub + offset)
+    val ys = f64FromBits(vb + offset)
+    val x2 = xs * xs
+    val dx2 = __mathSquareLow(xs, x2)
+    val y2 = ys * ys
+    val dy2 = __mathSquareLow(ys, y2)
+    val r2 = x2 + y2
+    val ir2 = 0.5 / r2
+    val dr2 = ((x2 - r2) + y2) + (dx2 + dy2)
+    var th = sqrt(r2)
+    val rsqrt = th * ir2
+    // th^2 - r2 exactly: th is r2's correctly rounded root
+    val th2 = th * th
+    val dz = dr2 - ((th2 - r2) + __mathSquareLow(th, th2))
+    var tl = rsqrt * dz
+    val sum = th + tl
+    tl = tl - (sum - th)
+    th = sum
+    val thb = f64ToBits(th)
+    val aidr = f64ToBits(fabs(tl)) + (0x3fe << 52) - (thb & exponentMask)
+    val mid = (aidr - 0x3c90000000000000 + 16) >>> 5
+    val midm = (aidr - 0x3c80000000000000 + 16) >>> 5
+    var result = thb
+    if (mid == 0 || midm == 0 || u64(aidr) < u64(0x39b0000000000000) ||
+        u64(aidr) > u64(0x3c9fffffffffff80)) {
+        // Too close to a rounding boundary: decide it in integers.
+        result = f64ToBits(__mathHypotHard(xs, ys))
+    }
+    result = result - offset
+    if (result >= exponentMask) return __mathHuge * __mathHuge
+    f64FromBits(result)
+}
+
+// hypot of two subnormals from their encodings a >= b > 0: the root of
+// a^2 + b^2 found and rounded in integers.
+fun __mathHypotSubnormal(a: int, b: int): f64 {
+    val af = f64FromInt(a)
+    val bf = f64FromInt(b)
+    val a2 = a << 1
+    val b2 = b << 1
+    var tm = f64ToInt(sqrt(af * af + bf * bf)) << 1
+    // D = a2^2 + b2^2 - tm^2, exact in wrapping 64-bit arithmetic since it is small
+    var d = a2 * a2 + b2 * b2 - tm * tm
+    while (d > 2 * tm) {
+        d = d - (2 * tm + 1)
+        tm += 1
+    }
+    while (d < 0) {
+        d = d + (2 * tm - 1)
+        tm -= 1
+    }
+    // tm = floor(sqrt(a2^2 + b2^2)); a midpoint is impossible here
+    var rm = tm >> 1
+    if (d != 0) rm = rm + (tm & 1)
+    f64FromBits(rm)
+}
+
+// hypot of x in [1, 2) and y <= x close to a rounding boundary: Newton's
+// root refined and rounded by comparing exact squares in integers.
+fun __mathHypotHard(x: f64, y: f64): f64 {
+    val mantissa = -1 >>> 12
+    val xb = f64ToBits(x)
+    val yb = f64ToBits(y)
+    var bm = (xb & mantissa) | (1 << 52)
+    var lm = (yb & mantissa) | (1 << 52)
+    val be = xb >>> 52
+    val le = yb >>> 52
+    val rb = f64ToBits(sqrt(x * x + y * y))
+    val bs = 2
+    var rm = (rb & mantissa) | (1 << 52)
+    var re = (rb >>> 52) - 0x3ff
+    var i = 0
+    while (i < 3) {
+        if (rm == (1 << 52)) {
+            rm = -1 >>> 11
+            re -= 1
+        } else rm -= 1
+        i += 1
+    }
+    bm = bm << bs
+    // squares wrap modulo 2^64: only small differences of them are used
+    var m2 = bm * bm
+    val ls = bs - (be - le)
+    if (ls >= 0) {
+        lm = lm << ls
+        m2 = m2 + lm * lm
+    } else {
+        // lm^2 as 128 bits, shifted right by -2 ls with a sticky bit
+        val shift = -2 * ls
+        val high = __mathMulHigh(lm, lm)
+        val low = lm * lm
+        m2 = m2 + ((low >>> shift) | (high << (64 - shift)))
+        if ((low & ((1 << shift) - 1)) != 0) m2 = m2 | 1
+    }
+    val k = bs + re
+    var d = 0
+    while (true) {
+        rm = rm + 1 + (if (rm >= (1 << 53)) 1 else 0)
+        val tm = rm << k
+        d = m2 - tm * tm
+        if (d <= 0) break
+    }
+    if (d != 0) {
+        val small = if (rm <= (1 << 53)) 1 else 0
+        val tm = (rm << k) - (1 << (k - small))
+        d = m2 - tm * tm
+        if (d != 0) rm = rm + (d >> 63)
+        else rm = rm - (rm & (1 << (1 - small)))
+    }
+    if (rm >= (1 << 53)) {
+        rm = rm >> 1
+        re += 1
+    }
+    f64FromBits(((be - 1 + re) << 52) + rm)
+}
+
+// CORE-MATH's licence, for the ports above:
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
