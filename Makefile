@@ -260,6 +260,7 @@ test: ablac
 	tools/test-transactions.sh $(COMPILER)
 	tools/test-private.sh $(COMPILER)
 	tools/test-strict-imports.sh $(COMPILER)
+	tools/test-generics.sh $(COMPILER)
 
 check: test self-rebuild
 

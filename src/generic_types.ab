@@ -1,0 +1,972 @@
+// Types for generics (generics.ab): instance names, a type's shape, matching
+// a generic parameter's type against an argument's.
+//
+// A type the analysis sees is a string (`i64`, `array:i64`, `map:string:i64`,
+// `nullable:Box`, `function:(i64)->bool`). An instantiation is an ordinary
+// declaration whose name spells the generic and its type arguments:
+// `Box<int>` is `Box__abla_generic_i64` and `first<array<Box<int>>>` is
+// `first__abla_generic_array_cBox_u_uabla_ugeneric_ui64`: the arguments' type
+// strings, escaped into identifier bytes (`_` is `_u`, so `__` never appears
+// in them). The name is a function of the generic and its arguments alone, so
+// every module that uses `Box<int>` names the one copy, and a copy's name
+// says what it is (bootstrapGenericVisible prints `Box<i64>`). A type
+// parameter checked in its generic's body is a class with no members,
+// `T__abla_tparam_<generic>`: only what every type has applies to it.
+
+val BOOTSTRAP_GENERIC_MARK = "__abla_generic_"
+val BOOTSTRAP_GENERIC_PARAMETER_MARK = "__abla_tparam_"
+// Separates an instance's source identity (its generic's file) from its name:
+// facts the analysis keeps per node are keyed by source identity and span, and
+// every instance's nodes share their generic's spans.
+val BOOTSTRAP_GENERIC_SOURCE_MARK = "\u{1f}"
+// Tells apart calls of generics that share one span: a default or a delegate
+// (`by`) is filled in at each call of what declares it (module.ab) with its
+// own spans, so two calls of `Tracked<T>` in one file hold its delegate's
+// `Slot(start, 0)` twice, at one span, with different type arguments. While
+// the probe binds them, each after the first carries this mark and its count
+// on its text (bootstrapGenericMarkCopies).
+val BOOTSTRAP_GENERIC_COPY_MARK = "\u{1e}"
+
+/** A type's shape: a name, or a constructor (`array`, `map`, `function`, an
+ *  instance's generic) and its arguments. A function's arguments are its
+ *  parameters, then its result. */
+class BootstrapGenericType(
+    val head: string,
+    val arguments: array<BootstrapGenericType>,
+    // A generic's instance: `head` is the generic's name.
+    val instance: bool
+)
+
+class BootstrapGenericParsed(val type: BootstrapGenericType, val next: int)
+
+fun bootstrapGenericLeaf(name: string): BootstrapGenericType =
+    BootstrapGenericType(name, [], false)
+
+fun bootstrapGenericWordByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+    (byte >= 97 && byte <= 122) || byte == 95
+
+fun bootstrapGenericEscape(text: string): string {
+    var output = ""
+    var index = 0
+    while (index < text.size) {
+        val byte = text[index]
+        val part = if ((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122)) text.slice(index, index + 1)
+        else when (byte) {
+            95 -> "_u"
+            58 -> "_c"
+            40 -> "_l"
+            41 -> "_r"
+            44 -> "_s"
+            45 -> "_d"
+            62 -> "_g"
+            60 -> "_a"
+            63 -> "_q"
+            64 -> "_t"
+            46 -> "_p"
+            32 -> "_w"
+            else -> "_x${bootstrapGenericHexDigit(byte / 16)}${bootstrapGenericHexDigit(byte % 16)}"
+        }
+        output = "$output$part"
+        index = index + 1
+    }
+    output
+}
+
+fun bootstrapGenericHexDigit(value: int): string =
+    "0123456789abcdef".slice(value, value + 1)
+
+fun bootstrapGenericUnescape(text: string): string {
+    var output = ""
+    var index = 0
+    while (index < text.size) {
+        if (text[index] == 95 && index + 1 < text.size) {
+            val code = text[index + 1]
+            if (code == 120 && index + 3 < text.size) {
+                val high = bootstrapHexValue(text[index + 2])
+                val low = bootstrapHexValue(text[index + 3])
+                output = "$output${bootstrapAsciiCodepoint(high * 16 + low)}"
+                index = index + 4
+            } else {
+                val part = when (code) {
+                    117 -> "_"
+                    99 -> ":"
+                    108 -> "("
+                    114 -> ")"
+                    115 -> ","
+                    100 -> "-"
+                    103 -> ">"
+                    97 -> "<"
+                    113 -> "?"
+                    116 -> "@"
+                    112 -> "."
+                    119 -> " "
+                    else -> ""
+                }
+                output = "$output$part"
+                index = index + 2
+            }
+        } else {
+            output = "$output${text.slice(index, index + 1)}"
+            index = index + 1
+        }
+    }
+    output
+}
+
+/** The instance of `generic` for `arguments` (type strings). */
+fun bootstrapGenericInstanceName(generic: string, arguments: array<string>): string {
+    var joined = ""
+    var index = 0
+    while (index < arguments.size) {
+        joined = if (index == 0) arguments[index] else "$joined,${arguments[index]}"
+        index = index + 1
+    }
+    "$generic$BOOTSTRAP_GENERIC_MARK${bootstrapGenericEscape(joined)}"
+}
+
+fun bootstrapGenericFind(text: string, mark: string, from: int): int {
+    var index = from
+    while (index + mark.size <= text.size) {
+        if (text[index] == mark[0] && text.slice(index, index + mark.size) == mark) return index
+        index = index + 1
+    }
+    -1
+}
+
+fun bootstrapIsGenericInstanceName(name: string): bool =
+    bootstrapGenericFind(name, BOOTSTRAP_GENERIC_MARK, 0) >= 0
+
+/** The generic an instance's name names (`Box`), else "". */
+fun bootstrapGenericInstanceGeneric(name: string): string {
+    val mark = bootstrapGenericFind(name, BOOTSTRAP_GENERIC_MARK, 0)
+    if (mark < 0) "" else name.slice(0, mark)
+}
+
+/** Splits `text` at its commas outside brackets. */
+fun bootstrapGenericSplitTopLevel(text: string): array<string> {
+    val parts: array<string> = []
+    if (text.size == 0) return parts
+    var depth = 0
+    var begin = 0
+    var index = 0
+    while (index < text.size) {
+        val byte = text[index]
+        if (byte == 40 || byte == 60) depth = depth + 1
+        // `->` is no bracket.
+        if (byte == 41 || (byte == 62 && !(index > 0 && text[index - 1] == 45))) depth = depth - 1
+        if (byte == 44 && depth == 0) {
+            parts.append(text.slice(begin, index))
+            begin = index + 1
+        }
+        index = index + 1
+    }
+    parts.append(text.slice(begin, text.size))
+    parts
+}
+
+/** An instance's type arguments (type strings). */
+fun bootstrapGenericInstanceArguments(name: string): array<string> {
+    val mark = bootstrapGenericFind(name, BOOTSTRAP_GENERIC_MARK, 0)
+    if (mark < 0) return []
+    bootstrapGenericSplitTopLevel(bootstrapGenericUnescape(
+        name.slice(mark + BOOTSTRAP_GENERIC_MARK.size, name.size)
+    ))
+}
+
+/** The class standing for type parameter `parameter` of `generic` in its body. */
+fun bootstrapGenericParameterClass(generic: string, parameter: string): string =
+    "$parameter$BOOTSTRAP_GENERIC_PARAMETER_MARK${bootstrapGenericEscape(generic)}"
+
+fun bootstrapIsGenericParameterClass(name: string): bool =
+    bootstrapGenericFind(name, BOOTSTRAP_GENERIC_PARAMETER_MARK, 0) >= 0
+
+/** Whether a type string names a type parameter's class anywhere. */
+fun bootstrapGenericMentionsParameter(type: string): bool =
+    bootstrapGenericFind(type, BOOTSTRAP_GENERIC_PARAMETER_MARK, 0) >= 0 ||
+    // In an instance's arguments, escaped.
+    bootstrapGenericFind(type, "_u_uabla_utparam_u", 0) >= 0
+
+// One-argument constructors of the analysis' type strings.
+fun bootstrapGenericUnaryHead(head: string): bool =
+    head == "array" || head == "nullable" || head == "shared" || head == "weak" ||
+    head == "mutex" || head == "cell" || head == "generator" || head == "task" ||
+    head == "thread" || head == "borrow" || head == "once" || head == "mut" ||
+    head == "noescape" || head == "var" || head == "own" ||
+    (head.size > 7 && head.slice(0, 7) == "borrow@")
+
+/** `text` from `at` as a type string's shape, up to where it ends. */
+fun bootstrapGenericParseAt(text: string, at: int): BootstrapGenericParsed {
+    var end = at
+    while (end < text.size && text[end] != 58 && text[end] != 44 &&
+           text[end] != 41 && text[end] != 40) end = end + 1
+    val head = text.slice(at, end)
+    if (end < text.size && text[end] == 58) {
+        if (head == "function" && end + 1 < text.size && text[end + 1] == 40) {
+            val arguments: array<BootstrapGenericType> = []
+            var next = end + 2
+            if (next < text.size && text[next] == 41) next = next + 1
+            else {
+                var more = true
+                while (more) {
+                    val parameter = bootstrapGenericParseAt(text, next)
+                    arguments.append(parameter.type)
+                    next = parameter.next
+                    if (next < text.size && text[next] == 44) next = next + 1
+                    else {
+                        if (next < text.size && text[next] == 41) next = next + 1
+                        more = false
+                    }
+                }
+            }
+            if (next + 1 < text.size && text[next] == 45 && text[next + 1] == 62) {
+                val result = bootstrapGenericParseAt(text, next + 2)
+                arguments.append(result.type)
+                return BootstrapGenericParsed(BootstrapGenericType("function", arguments, false), result.next)
+            }
+            return BootstrapGenericParsed(bootstrapGenericLeaf(text.slice(at, next)), next)
+        }
+        if (bootstrapGenericUnaryHead(head)) {
+            val inner = bootstrapGenericParseAt(text, end + 1)
+            return BootstrapGenericParsed(BootstrapGenericType(head, [inner.type], false), inner.next)
+        }
+        if (head == "map") {
+            val key = bootstrapGenericParseAt(text, end + 1)
+            if (key.next < text.size && text[key.next] == 58) {
+                val value = bootstrapGenericParseAt(text, key.next + 1)
+                return BootstrapGenericParsed(BootstrapGenericType("map", [key.type, value.type], false), value.next)
+            }
+            return BootstrapGenericParsed(BootstrapGenericType("map", [key.type], false), key.next)
+        }
+    }
+    val mark = bootstrapGenericFind(head, BOOTSTRAP_GENERIC_MARK, 0)
+    if (mark > 0) {
+        val arguments: array<BootstrapGenericType> = []
+        for (argument in bootstrapGenericInstanceArguments(head)) {
+            arguments.append(bootstrapGenericParse(argument))
+        }
+        return BootstrapGenericParsed(BootstrapGenericType(head.slice(0, mark), arguments, true), end)
+    }
+    BootstrapGenericParsed(bootstrapGenericLeaf(head), end)
+}
+
+/** A type string's shape; one it doesn't read whole is a name of its own. */
+fun bootstrapGenericParse(text: string): BootstrapGenericType {
+    val parsed = bootstrapGenericParseAt(text, 0)
+    if (parsed.next == text.size) parsed.type else bootstrapGenericLeaf(text)
+}
+
+/** The type string of a shape. */
+fun bootstrapGenericTypeString(type: BootstrapGenericType): string {
+    if (type.instance) {
+        val arguments: array<string> = []
+        for (argument in type.arguments) arguments.append(bootstrapGenericTypeString(argument))
+        return bootstrapGenericInstanceName(type.head, arguments)
+    }
+    if (type.arguments.size == 0) return type.head
+    if (type.head == "function") {
+        var parameters = ""
+        var index = 0
+        while (index + 1 < type.arguments.size) {
+            val parameter = bootstrapGenericTypeString(type.arguments[index])
+            parameters = if (index == 0) parameter else "$parameters,$parameter"
+            index = index + 1
+        }
+        return "function:($parameters)->${bootstrapGenericTypeString(type.arguments[type.arguments.size - 1])}"
+    }
+    var text = type.head
+    for (argument in type.arguments) text = "$text:${bootstrapGenericTypeString(argument)}"
+    text
+}
+
+/** A shape as source writes it (what a generic's body is rewritten with). */
+fun bootstrapGenericSourceType(type: BootstrapGenericType): string {
+    if (type.instance || type.arguments.size == 0) return bootstrapGenericTypeString(type)
+    val head = type.head
+    if (head == "function") return bootstrapGenericSourceFunction(type)
+    if ((head == "once" || head == "mut" || head == "noescape") &&
+        type.arguments[0].head == "function" && !type.arguments[0].instance) {
+        val prefix = if (head == "once") "FnOnce" else if (head == "mut") "FnMut" else "FnNoEscape"
+        return "$prefix${bootstrapGenericSourceFunction(type.arguments[0])}"
+    }
+    if (head == "map" && type.arguments.size == 2) {
+        return "Map<${bootstrapGenericSourceType(type.arguments[0])},${bootstrapGenericSourceType(type.arguments[1])}>"
+    }
+    val inner = bootstrapGenericSourceType(type.arguments[0])
+    when (head) {
+        "array" -> "array<$inner>"
+        "nullable" -> "$inner?"
+        "shared" -> "Shared<$inner>"
+        "weak" -> "Weak<$inner>"
+        "mutex" -> "Mutex<$inner>"
+        "cell" -> "Cell<$inner>"
+        "generator" -> "Generator<$inner>"
+        "task" -> "Task<$inner>"
+        "thread" -> "Thread<$inner>"
+        "borrow" -> "Borrow<$inner>"
+        "var" -> "var:$inner"
+        "own" -> "own:$inner"
+        else -> bootstrapGenericTypeString(type)
+    }
+}
+
+fun bootstrapGenericSourceFunction(type: BootstrapGenericType): string {
+    var parameters = ""
+    var index = 0
+    while (index + 1 < type.arguments.size) {
+        val parameter = bootstrapGenericSourceType(type.arguments[index])
+        parameters = if (index == 0) parameter else "$parameters,$parameter"
+        index = index + 1
+    }
+    "($parameters)->${bootstrapGenericSourceType(type.arguments[type.arguments.size - 1])}"
+}
+
+/** A type string as a person reads it in a diagnostic: instances as
+ *  `Box<i64>`, a type parameter's class as its name. */
+fun bootstrapGenericVisibleType(type: BootstrapGenericType): string {
+    if (type.instance) {
+        var arguments = ""
+        var index = 0
+        while (index < type.arguments.size) {
+            val argument = bootstrapGenericVisibleType(type.arguments[index])
+            arguments = if (index == 0) argument else "$arguments, $argument"
+            index = index + 1
+        }
+        return "${bootstrapSourceVisibleType(type.head)}<$arguments>"
+    }
+    if (type.arguments.size == 0) {
+        val mark = bootstrapGenericFind(type.head, BOOTSTRAP_GENERIC_PARAMETER_MARK, 0)
+        return if (mark > 0) type.head.slice(0, mark) else bootstrapSourceVisibleType(type.head)
+    }
+    if (type.head == "function") {
+        var parameters = ""
+        var index = 0
+        while (index + 1 < type.arguments.size) {
+            val parameter = bootstrapGenericVisibleType(type.arguments[index])
+            parameters = if (index == 0) parameter else "$parameters, $parameter"
+            index = index + 1
+        }
+        return "($parameters) -> ${bootstrapGenericVisibleType(type.arguments[type.arguments.size - 1])}"
+    }
+    if (type.head == "map" && type.arguments.size == 2) {
+        return "Map<${bootstrapGenericVisibleType(type.arguments[0])}, ${bootstrapGenericVisibleType(type.arguments[1])}>"
+    }
+    val inner = bootstrapGenericVisibleType(type.arguments[0])
+    when (type.head) {
+        "array" -> "array<$inner>"
+        "nullable" -> "$inner?"
+        "shared" -> "Shared<$inner>"
+        "weak" -> "Weak<$inner>"
+        "mutex" -> "Mutex<$inner>"
+        "cell" -> "Cell<$inner>"
+        "generator" -> "Generator<$inner>"
+        "task" -> "Task<$inner>"
+        "thread" -> "Thread<$inner>"
+        else -> "${type.head}:$inner"
+    }
+}
+
+/** `text` (a diagnostic, a type string) with every instance or type
+ *  parameter name in it spelled as a person reads it. */
+fun bootstrapGenericVisible(text: string): string {
+    if (bootstrapGenericFind(text, "__abla_", 0) < 0) return text
+    var output = ""
+    var cursor = 0
+    var index = 0
+    while (index < text.size) {
+        if (bootstrapGenericWordByte(text[index]) &&
+            (index == 0 || !bootstrapGenericWordByte(text[index - 1]))) {
+            var end = index
+            while (end < text.size && bootstrapGenericWordByte(text[end])) end = end + 1
+            val word = text.slice(index, end)
+            if (bootstrapIsGenericInstanceName(word) || bootstrapIsGenericParameterClass(word)) {
+                output = "$output${text.slice(cursor, index)}${bootstrapGenericVisibleType(bootstrapGenericParse(word))}"
+                cursor = end
+            }
+            index = end
+        } else index = index + 1
+    }
+    "$output${text.slice(cursor, text.size)}"
+}
+
+/** A source identity with an instance's mark: its generic's file. */
+fun bootstrapGenericSourceFile(identity: string): string {
+    val mark = bootstrapGenericFind(identity, BOOTSTRAP_GENERIC_SOURCE_MARK, 0)
+    if (mark < 0) identity else identity.slice(0, mark)
+}
+
+fun bootstrapGenericSourceIsInstance(identity: string): bool =
+    bootstrapGenericFind(identity, BOOTSTRAP_GENERIC_SOURCE_MARK, 0) >= 0
+
+/** The instance a source identity names, else "". */
+fun bootstrapGenericSourceInstance(identity: string): string {
+    val mark = bootstrapGenericFind(identity, BOOTSTRAP_GENERIC_SOURCE_MARK, 0)
+    if (mark < 0) "" else identity.slice(mark + BOOTSTRAP_GENERIC_SOURCE_MARK.size, identity.size)
+}
+
+/** Diagnostics as a person reads them: a `source[…]` record in an instance
+ *  names its generic's file and says which instance (a
+ *  `context[generic-instance]` record after it), and instance names read
+ *  `Box<i64>`. */
+fun bootstrapGenericDiagnostics(diagnostics: string): string {
+    if (bootstrapGenericFind(diagnostics, "__abla_", 0) < 0 &&
+        bootstrapGenericFind(diagnostics, BOOTSTRAP_GENERIC_SOURCE_MARK, 0) < 0) return diagnostics
+    var output = ""
+    var lineBegin = 0
+    while (lineBegin < diagnostics.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < diagnostics.size && diagnostics[lineEnd] != 10) lineEnd = lineEnd + 1
+        var line = diagnostics.slice(lineBegin, lineEnd)
+        val mark = bootstrapGenericFind(line, BOOTSTRAP_GENERIC_SOURCE_MARK, 0)
+        var context = ""
+        if (mark >= 0) {
+            // `source[kind]:file\u{1f}instance:begin:end`
+            var close = mark
+            while (close < line.size && line[close] != 58) close = close + 1
+            val instance = line.slice(mark + BOOTSTRAP_GENERIC_SOURCE_MARK.size, close)
+            line = "${line.slice(0, mark)}${line.slice(close, line.size)}"
+            // A generic's own body (checked with its parameters' classes) needs no instance named.
+            if (!bootstrapGenericMentionsParameter(instance)) {
+                context = "context[generic-instance]: ${bootstrapGenericVisible(instance)}\n"
+            }
+        }
+        output = "$output${bootstrapGenericVisible(line)}"
+        if (lineEnd < diagnostics.size) output = "$output\n"
+        output = "$output$context"
+        lineBegin = lineEnd + 1
+    }
+    output
+}
+
+/** Matches `pattern` (a generic parameter's type, its type parameters
+ *  named in `parameters`) against `actual`, binding each parameter met in
+ *  `bindings` ("" while unbound). What can't match binds nothing: the
+ *  analysis of the instance reports the mismatch. */
+fun bootstrapGenericUnify(
+    pattern: BootstrapGenericType,
+    actual: BootstrapGenericType,
+    parameters: array<string>,
+    var bindings: array<string>
+): void {
+    if (actual.arguments.size == 0 && !actual.instance &&
+        (actual.head == "unknown" || actual.head == "never" ||
+         actual.head == "null" || actual.head == "any" || actual.head == "")) return
+    if (pattern.arguments.size == 0 && !pattern.instance) {
+        var index = 0
+        while (index < parameters.size) {
+            if (parameters[index] == pattern.head) {
+                if (bindings[index] == "") {
+                    var bound = bootstrapGenericTypeString(actual)
+                    bound = bootstrapBorrowElementType(bound)
+                    if (bootstrapIsIndexedBorrowType(bound)) bound = bootstrapIndexedBorrowElementType(bound)
+                    bindings[index] = bound
+                }
+                return
+            }
+            index = index + 1
+        }
+        return
+    }
+    // A borrow of a value matches as the value.
+    if ((actual.head == "borrow" || (actual.head.size > 7 && actual.head.slice(0, 7) == "borrow@")) &&
+        !actual.instance && actual.arguments.size == 1) {
+        bootstrapGenericUnify(pattern, actual.arguments[0], parameters, bindings)
+        return
+    }
+    // A `T?` parameter takes a value of `T`.
+    if (pattern.head == "nullable" && !pattern.instance &&
+        !(actual.head == "nullable" && !actual.instance)) {
+        bootstrapGenericUnify(pattern.arguments[0], actual, parameters, bindings)
+        return
+    }
+    if (pattern.head != actual.head || pattern.instance != actual.instance ||
+        pattern.arguments.size != actual.arguments.size) return
+    var argument = 0
+    while (argument < pattern.arguments.size) {
+        bootstrapGenericUnify(pattern.arguments[argument], actual.arguments[argument], parameters, bindings)
+        argument = argument + 1
+    }
+}
+
+/** Whether `type` names any of `parameters`. */
+fun bootstrapGenericMentions(type: BootstrapGenericType, parameters: array<string>): bool {
+    if (type.arguments.size == 0 && !type.instance) {
+        for (parameter in parameters) if (parameter == type.head) return true
+        return false
+    }
+    for (argument in type.arguments) if (bootstrapGenericMentions(argument, parameters)) return true
+    false
+}
+
+/** How deeply instances nest in a type string (bounds runaway instantiation). */
+fun bootstrapGenericDepth(type: BootstrapGenericType): int {
+    var deepest = 0
+    for (argument in type.arguments) {
+        val depth = bootstrapGenericDepth(argument)
+        if (depth > deepest) deepest = depth
+    }
+    if (type.instance) deepest + 1 else deepest
+}
+
+/** `text` (a type as written) with each whole word naming one of
+ *  `parameters` replaced by its `replacements`. */
+fun bootstrapGenericSubstituteWords(
+    text: string,
+    parameters: array<string>,
+    replacements: array<string>
+): string {
+    if (parameters.size == 0) return text
+    var output = ""
+    var cursor = 0
+    var index = 0
+    while (index < text.size) {
+        if (bootstrapGenericWordByte(text[index]) &&
+            (index == 0 || !bootstrapGenericWordByte(text[index - 1]))) {
+            var end = index
+            while (end < text.size && bootstrapGenericWordByte(text[end])) end = end + 1
+            // A member's name (`m.T`) is no type parameter.
+            val member = index > 0 && text[index - 1] == 46
+            var parameter = 0
+            while (!member && parameter < parameters.size) {
+                if (end - index == parameters[parameter].size &&
+                    text.slice(index, end) == parameters[parameter]) {
+                    output = "$output${text.slice(cursor, index)}${replacements[parameter]}"
+                    cursor = end
+                    parameter = parameters.size
+                }
+                parameter = parameter + 1
+            }
+            index = end
+        } else index = index + 1
+    }
+    "$output${text.slice(cursor, text.size)}"
+}
+
+/** A generic's type parameters' names (`T` of `T:Shape`). */
+fun bootstrapGenericParameterNames(declaration: BootstrapDeclaration): array<string> {
+    val names: array<string> = []
+    for (parameter in declaration.typeParameters) {
+        var end = 0
+        while (end < parameter.size && parameter[end] != 58) end = end + 1
+        names.append(parameter.slice(0, end))
+    }
+    names
+}
+
+/** The generics of a program, for the probe that types their uses
+ *  (generics.ab). A generic is a function, an extension or a class; its id
+ *  names its instances: the name, and for an extension the receiver too
+ *  (`map__abla_on_array_cT`), since extensions of one name on other
+ *  receivers are other generics. */
+class BootstrapGenericTable(
+    val ids: array<string>,
+    val names: array<string>,
+    // An extension's receiver as a type string, its type parameters by name.
+    val owners: array<string>,
+    val declarations: array<BootstrapDeclaration>,
+    val probing: bool,
+    // The bodies the probe types (bootstrapOverloadBodyKey).
+    val bodies: BootstrapStringSet
+) {
+    /** The function or class generic called `name`, else -1. */
+    fun findFree(name: string): int {
+        var index = 0
+        while (index < this.names.size) {
+            if (this.owners[index] == "" && this.names[index] == name) return index
+            index = index + 1
+        }
+        -1
+    }
+
+    /** A private function or class generic seen from another module as
+     *  `name` (its own name carries its module's prefix), else -1. */
+    fun findPrivate(name: string): int {
+        var index = 0
+        while (index < this.names.size) {
+            if (this.owners[index] == "" && this.declarations[index].isPrivate &&
+                this.names[index] != name && bootstrapSourceVisibleType(this.names[index]) == name) return index
+            index = index + 1
+        }
+        -1
+    }
+
+    fun findId(id: string): int {
+        var index = 0
+        while (index < this.ids.size) {
+            if (this.ids[index] == id) return index
+            index = index + 1
+        }
+        -1
+    }
+
+    fun isClass(name: string): bool {
+        val index = this.findFree(name)
+        index >= 0 && this.declarations[index].kind == "class"
+    }
+
+    fun hasExtension(name: string): bool {
+        var index = 0
+        while (index < this.names.size) {
+            if (this.owners[index] != "" && this.names[index] == name) return true
+            index = index + 1
+        }
+        false
+    }
+
+    fun probes(declaration: BootstrapDeclaration): bool =
+        this.bodies.contains(bootstrapOverloadBodyKey(declaration))
+}
+
+fun bootstrapNoGenerics(): BootstrapGenericTable =
+    BootstrapGenericTable([], [], [], [], false, bootstrapStringSet())
+
+/** `text` (a type as written) with each generic class applied to type
+ *  arguments (`Box<int>`) named by its instance; each instance named is
+ *  appended to `requests`. */
+fun bootstrapGenericRewriteType(
+    text: string,
+    table: BootstrapGenericTable,
+    var requests: array<string>
+): string {
+    var angle = false
+    for (byte in text) if (byte == 60) angle = true
+    if (!angle) return text
+    var output = ""
+    var cursor = 0
+    var index = 0
+    while (index < text.size) {
+        if (bootstrapGenericWordByte(text[index]) &&
+            (index == 0 || !bootstrapGenericWordByte(text[index - 1]))) {
+            var end = index
+            while (end < text.size && bootstrapGenericWordByte(text[end])) end = end + 1
+            val word = text.slice(index, end)
+            if (end < text.size && text[end] == 60 && table.isClass(word)) {
+                // The matching `>` (not an arrow's).
+                var depth = 0
+                var close = end
+                var found = -1
+                while (found < 0 && close < text.size) {
+                    if (text[close] == 60) depth = depth + 1
+                    if (text[close] == 62 && !(close > 0 && text[close - 1] == 45)) {
+                        depth = depth - 1
+                        if (depth == 0) found = close
+                    }
+                    close = close + 1
+                }
+                if (found > 0) {
+                    val arguments: array<string> = []
+                    for (argument in bootstrapGenericSplitTopLevel(text.slice(end + 1, found))) {
+                        arguments.append(bootstrapNormalizeType(
+                            bootstrapGenericRewriteType(argument, table, requests)
+                        ))
+                    }
+                    val name = bootstrapGenericInstanceName(word, arguments)
+                    requests.append(name)
+                    output = "$output${text.slice(cursor, index)}$name"
+                    cursor = found + 1
+                    index = found + 1
+                } else index = end
+            } else index = end
+        } else index = index + 1
+    }
+    "$output${text.slice(cursor, text.size)}"
+}
+
+/** A generic's parameter or result type as the probe matches it: a type
+ *  string whose type parameters are their names. */
+fun bootstrapGenericPattern(text: string, table: BootstrapGenericTable): BootstrapGenericType {
+    val ignored: array<string> = []
+    bootstrapGenericParse(bootstrapNormalizeType(bootstrapGenericRewriteType(text, table, ignored)))
+}
+
+/** `type` with each of `parameters` replaced by its binding (type strings). */
+fun bootstrapGenericSubstitute(
+    type: BootstrapGenericType,
+    parameters: array<string>,
+    bindings: array<string>
+): BootstrapGenericType {
+    if (type.arguments.size == 0 && !type.instance) {
+        var index = 0
+        while (index < parameters.size) {
+            if (parameters[index] == type.head && bindings[index] != "") {
+                return bootstrapGenericParse(bindings[index])
+            }
+            index = index + 1
+        }
+        return type
+    }
+    val arguments: array<BootstrapGenericType> = []
+    for (argument in type.arguments) arguments.append(bootstrapGenericSubstitute(argument, parameters, bindings))
+    BootstrapGenericType(type.head, arguments, type.instance)
+}
+
+/** A callee spelled with type arguments (`first<int>`): its name. */
+/** A call's text without its copy mark (BOOTSTRAP_GENERIC_COPY_MARK). */
+fun bootstrapGenericUnmarked(text: string): string {
+    val mark = bootstrapGenericFind(text, BOOTSTRAP_GENERIC_COPY_MARK, 0)
+    if (mark < 0) text else text.slice(0, mark)
+}
+
+fun bootstrapGenericCalleeName(marked: string): string {
+    val text = bootstrapGenericUnmarked(marked)
+    var index = 0
+    while (index < text.size) {
+        if (text[index] == 60) return text.slice(0, index)
+        index = index + 1
+    }
+    text
+}
+
+/** A callee's type arguments as written (`first<int, Box<int>>`). */
+fun bootstrapGenericCalleeArguments(marked: string): array<string> {
+    val text = bootstrapGenericUnmarked(marked)
+    val name = bootstrapGenericCalleeName(text)
+    if (name.size == text.size || text.size < name.size + 2) return []
+    bootstrapGenericSplitTopLevel(text.slice(name.size + 1, text.size - 1))
+}
+
+fun bootstrapGenericFailure(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    code: string
+): void {
+    val end = if (expression.end > expression.begin) expression.end else expression.begin + 1
+    analyzer.genericFailures = "${analyzer.genericFailures}error[E_SEMANTIC]: $code\nsource[semantic]:${analyzer.currentSourceIdentity}:${expression.begin}:$end\n"
+    analyzer.genericFailedCalls.append(BootstrapOverloadResolution(
+        analyzer.currentSourceIdentity, expression.begin, expression.end,
+        expression.kind, expression.text, "invalid", expression.text
+    ))
+}
+
+/** Binds the type parameters of generic `template` for a call: its explicit
+ *  type arguments, the receiver's type `receiver` of an extension's call,
+ *  then the arguments' types (from child `firstArgument`). The instance's
+ *  name, or "" (a failure recorded) when a parameter stays unbound. */
+fun bootstrapGenericBind(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    template: int,
+    receiver: string,
+    firstArgument: int
+): BootstrapGenericInstanceCall {
+    // What the generic says, before any argument is typed (which changes the analyzer).
+    val parameters = bootstrapGenericParameterNames(analyzer.generics.declarations[template])
+    val declared: array<string> = []
+    for (name in analyzer.generics.declarations[template].parameters) declared.append(name)
+    val patterns: array<BootstrapGenericType> = []
+    for (type in analyzer.generics.declarations[template].parameterTypes) {
+        patterns.append(bootstrapGenericPattern(type, analyzer.generics))
+    }
+    val id = "${analyzer.generics.ids[template]}"
+    val visible = bootstrapSourceVisibleType(analyzer.generics.names[template])
+    val owner = if (receiver != "") bootstrapGenericParse(analyzer.generics.owners[template])
+        else bootstrapGenericLeaf("")
+    // The result's type: a class's instance, or the declared result.
+    var result = bootstrapGenericLeaf("")
+    if (analyzer.generics.declarations[template].kind == "class") {
+        val arguments: array<BootstrapGenericType> = []
+        for (parameter in parameters) arguments.append(bootstrapGenericLeaf(parameter))
+        result = BootstrapGenericType(id, arguments, true)
+    } else if (analyzer.generics.declarations[template].resultType != "inferred") {
+        result = bootstrapGenericPattern(analyzer.generics.declarations[template].resultType, analyzer.generics)
+    }
+    val requests: array<string> = []
+    val bindings: array<string> = []
+    for (parameter in parameters) bindings.append("")
+    val explicit = bootstrapGenericCalleeArguments(expression.text)
+    var failed = false
+    if (explicit.size > 0 && explicit.size != parameters.size) {
+        bootstrapGenericFailure(analyzer, expression, "generic.arity:$visible:${parameters.size}:${explicit.size}")
+        failed = true
+    }
+    if (!failed) {
+        var index = 0
+        while (index < explicit.size) {
+            bindings[index] = bootstrapNormalizeType(
+                bootstrapGenericRewriteType(explicit[index], analyzer.generics, requests)
+            )
+            index = index + 1
+        }
+    }
+    if (receiver != "") {
+        bootstrapGenericUnify(owner, bootstrapGenericParse(receiver), parameters, bindings)
+    }
+    // The type expected of the call's result binds first.
+    if (analyzer.genericExpectedBegin == expression.begin &&
+        analyzer.genericExpectedEnd == expression.end && analyzer.genericExpected != "") {
+        bootstrapGenericUnify(result, bootstrapGenericParse(analyzer.genericExpected), parameters, bindings)
+        analyzer.genericExpectedBegin = -1
+    }
+    // The arguments, positional then named; lambdas last, once the
+    // parameters their parameters' types name are bound.
+    val lambdaParameters: array<int> = []
+    val lambdas: array<BootstrapExpression> = []
+    var position = 0
+    var child = firstArgument
+    while (child < expression.children.size) {
+        val argument = expression.children[child]
+        var parameter = position
+        var value = argument
+        if (argument.kind == "named.argument" && argument.children.size == 1) {
+            value = argument.children[0]
+            parameter = -1
+            var named = 0
+            while (named < declared.size) {
+                if (declared[named] == argument.text) parameter = named
+                named = named + 1
+            }
+        } else position = position + 1
+        if (value.kind == "lambda" || value.kind == "lambda.move") {
+            lambdaParameters.append(parameter)
+            lambdas.append(value)
+        } else {
+            val type = analyzer.infer(value)
+            if (parameter >= 0 && parameter < patterns.size) {
+                bootstrapGenericUnify(patterns[parameter], bootstrapGenericParse(type), parameters, bindings)
+            }
+        }
+        child = child + 1
+    }
+    var lambda = 0
+    while (lambda < lambdas.size) {
+        val parameter = lambdaParameters[lambda]
+        if (parameter >= 0 && parameter < patterns.size) {
+            // The lambda's parameters typed as the generic's function
+            // parameter says, with what is bound so far.
+            val expected = bootstrapGenericSubstitute(patterns[parameter], parameters, bindings)
+            var function = expected
+            while (!function.instance && function.arguments.size == 1 &&
+                   (function.head == "once" || function.head == "mut" ||
+                    function.head == "noescape" || function.head == "nullable")) {
+                function = function.arguments[0]
+            }
+            var bound = function.head == "function" && !function.instance
+            var index = 0
+            while (bound && index + 1 < function.arguments.size) {
+                if (bootstrapGenericMentions(function.arguments[index], parameters)) bound = false
+                index = index + 1
+            }
+            if (bound) {
+                analyzer.contextualizeLambdaParameters(lambdas[lambda], bootstrapGenericTypeString(expected))
+                bootstrapGenericUnify(
+                    patterns[parameter], bootstrapGenericParse(analyzer.infer(lambdas[lambda])),
+                    parameters, bindings
+                )
+            } else analyzer.infer(lambdas[lambda])
+        } else analyzer.infer(lambdas[lambda])
+        lambda = lambda + 1
+    }
+    for (request in requests) analyzer.genericRequests.append(request)
+    if (failed) return BootstrapGenericInstanceCall("", parameters, bindings)
+    var index = 0
+    while (index < parameters.size) {
+        if (bindings[index] == "") {
+            bootstrapGenericFailure(analyzer, expression, "generic.cannot-infer:$visible:${parameters[index]}")
+            return BootstrapGenericInstanceCall("", parameters, bindings)
+        }
+        index = index + 1
+    }
+    val name = bootstrapGenericInstanceName(id, bindings)
+    analyzer.genericRequests.append(name)
+    BootstrapGenericInstanceCall(name, parameters, bindings)
+}
+
+class BootstrapGenericInstanceCall(
+    val name: string,
+    val parameters: array<string>,
+    val bindings: array<string>
+)
+
+/** The type of a call's result for instance `call` of `template`: "unknown"
+ *  while it is inferred from a body the probe hasn't got yet. */
+fun bootstrapGenericResultType(
+    var analyzer: BootstrapAnalyzer,
+    template: int,
+    call: BootstrapGenericInstanceCall
+): string {
+    if (analyzer.generics.declarations[template].kind == "class") return call.name
+    val resultType = "${analyzer.generics.declarations[template].resultType}"
+    if (resultType == "inferred") return "unknown"
+    val sources: array<string> = []
+    for (binding in call.bindings) sources.append(bootstrapGenericSourceType(bootstrapGenericParse(binding)))
+    val requests: array<string> = []
+    val type = bootstrapNormalizeType(bootstrapGenericRewriteType(
+        bootstrapGenericSubstituteWords(resultType, call.parameters, sources),
+        analyzer.generics,
+        requests
+    ))
+    for (request in requests) analyzer.genericRequests.append(request)
+    type
+}
+
+/** In the probe: the type of a call of a generic function or class (the call
+ *  recorded to name its instance), else "". */
+fun bootstrapGenericInferCall(var analyzer: BootstrapAnalyzer, expression: BootstrapExpression): string {
+    val name = bootstrapGenericCalleeName(expression.text)
+    val template = analyzer.generics.findFree(name)
+    if (template < 0) {
+        // Another module's private generic: reported as sema reports any
+        // private name, since the generic itself is gone after this pass.
+        val hidden = analyzer.generics.findPrivate(name)
+        if (hidden < 0 || analyzer.hasVisibleLocal(name)) return ""
+        val module = analyzer.generics.declarations[hidden].sourceIdentity
+        if (module == bootstrapGenericSourceFile(analyzer.currentSourceIdentity)) return ""
+        bootstrapGenericFailure(analyzer, expression, "name.private:$name:$module@${expression.begin}")
+        return "unknown"
+    }
+    if (analyzer.hasVisibleLocal(name)) return ""
+    val call = bootstrapGenericBind(analyzer, expression, template, "", 0)
+    if (call.name == "") return "unknown"
+    analyzer.genericResolutions.append(BootstrapOverloadResolution(
+        analyzer.currentSourceIdentity, expression.begin, expression.end,
+        expression.kind, expression.text, expression.kind, call.name
+    ))
+    bootstrapGenericResultType(analyzer, template, call)
+}
+
+/** In the probe: the type of a call of a generic extension on `receiver`
+ *  (its type), else "". */
+fun bootstrapGenericInferMemberCall(
+    var analyzer: BootstrapAnalyzer,
+    expression: BootstrapExpression,
+    receiver: string
+): string {
+    val name = bootstrapGenericCalleeName(expression.text)
+    if (!analyzer.generics.hasExtension(name)) return ""
+    val actual = bootstrapBorrowElementType(receiver)
+    val chosen = bootstrapGenericExtensionFor(analyzer.generics, name, actual)
+    if (chosen < 0) return ""
+    val module = analyzer.generics.declarations[chosen].sourceIdentity
+    if (analyzer.generics.declarations[chosen].isPrivate &&
+        module != bootstrapGenericSourceFile(analyzer.currentSourceIdentity)) {
+        bootstrapGenericFailure(analyzer, expression, "name.private:$actual.$name:$module@${expression.begin}")
+        return "unknown"
+    }
+    val call = bootstrapGenericBind(analyzer, expression, chosen, actual, 1)
+    if (call.name == "") return "unknown"
+    analyzer.genericResolutions.append(BootstrapOverloadResolution(
+        analyzer.currentSourceIdentity, expression.begin, expression.end,
+        expression.kind, expression.text, expression.kind, call.name
+    ))
+    bootstrapGenericResultType(analyzer, chosen, call)
+}
+
+/** The generic extension `name` whose receiver type matches `actual`, else -1. */
+fun bootstrapGenericExtensionFor(table: BootstrapGenericTable, name: string, actual: string): int {
+    var template = 0
+    while (template < table.names.size) {
+        if (table.owners[template] != "" && table.names[template] == name) {
+            val parameters = bootstrapGenericParameterNames(table.declarations[template])
+            val bindings: array<string> = []
+            for (parameter in parameters) bindings.append("")
+            val owner = bootstrapGenericParse(table.owners[template])
+            bootstrapGenericUnify(owner, bootstrapGenericParse(actual), parameters, bindings)
+            if (bootstrapGenericTypeString(bootstrapGenericSubstitute(owner, parameters, bindings)) == actual) {
+                return template
+            }
+        }
+        template = template + 1
+    }
+    -1
+}

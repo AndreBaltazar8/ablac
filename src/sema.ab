@@ -5,6 +5,7 @@ import "ct_lift.ab"
 import "generator.ab"
 import "ct_infer.ab"
 import "ct_init.ab"
+import "generic_types.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/sys/linux/fs"
@@ -6374,7 +6375,22 @@ class BootstrapAnalyzer(
     val stmSources: array<string> = [],
     val stmTexts: array<string> = [],
     // Whether any declaration is a private extension member: -1 not known yet.
-    var privateExtensionsKnown: int = -1
+    var privateExtensionsKnown: int = -1,
+    // The generics probe (generics.ab): the generics, and the calls of them
+    // it typed, the instances those name, and the calls it couldn't bind.
+    val generics: BootstrapGenericTable = bootstrapNoGenerics(),
+    val genericResolutions: array<BootstrapOverloadResolution> = [],
+    val genericRequests: array<string> = [],
+    var genericFailures: string = "",
+    // The calls genericFailures reports, which become invalid nodes when
+    // the last probe still can't bind them.
+    val genericFailedCalls: array<BootstrapOverloadResolution> = [],
+    // The type expected of the expression at genericExpectedBegin (a typed
+    // local's initializer, a returned value): a generic's call there binds
+    // its type parameters from it first.
+    var genericExpected: string = "",
+    var genericExpectedBegin: int = -1,
+    var genericExpectedEnd: int = -1
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -7874,8 +7890,9 @@ class BootstrapAnalyzer(
             if (declaration.isPrivate && declaration.extensionOwner == "" &&
                 declaration.name != name &&
                 bootstrapSourceVisibleType(declaration.name) == name &&
-                declaration.sourceIdentity != this.currentSourceIdentity) {
-                return declaration.sourceIdentity
+                bootstrapGenericSourceFile(declaration.sourceIdentity) !=
+                    bootstrapGenericSourceFile(this.currentSourceIdentity)) {
+                return bootstrapGenericSourceFile(declaration.sourceIdentity)
             }
         }
         ""
@@ -7897,8 +7914,9 @@ class BootstrapAnalyzer(
             if (declaration.isPrivate && declaration.name == name &&
                 declaration.extensionOwner != "" &&
                 bootstrapNormalizeType(declaration.extensionOwner) == owner &&
-                declaration.sourceIdentity != this.currentSourceIdentity) {
-                return declaration.sourceIdentity
+                bootstrapGenericSourceFile(declaration.sourceIdentity) !=
+                    bootstrapGenericSourceFile(this.currentSourceIdentity)) {
+                return bootstrapGenericSourceFile(declaration.sourceIdentity)
             }
         }
         ""
@@ -10253,7 +10271,9 @@ class BootstrapAnalyzer(
             this.fail(
                 "map.untyped: declare its type, as in val m: Map<string, int> = Map()"
             )
-        } else if (key != "string" && key != "i64") {
+        } else if (key != "string" && key != "i64" &&
+                   // A generic's `K` (generics.ab): each instance checks its own.
+                   !bootstrapIsGenericParameterClass(key)) {
             this.fail("map.key-type:$key")
         }
         if (method == "set" || method == "remove" || method == "clear" ||
@@ -10570,6 +10590,12 @@ class BootstrapAnalyzer(
             result = bootstrapInferRange(this, expression, result)
         }
         if (expression.kind == "identifier") {
+            // A generic function is called, not passed as a value (generics.ab).
+            if (this.generics.probing && this.generics.findFree(expression.text) >= 0 &&
+                !this.generics.isClass(expression.text) && !this.hasVisibleLocal(expression.text)) {
+                bootstrapGenericFailure(this, expression, "generic.reference:${bootstrapSourceVisibleType(expression.text)}")
+                return "unknown"
+            }
             result = bootstrapInferIdentifier(this, expression, result)
         }
         if (expression.kind == "lambda" ||
@@ -10608,6 +10634,10 @@ class BootstrapAnalyzer(
                 val overloaded = this.inferOverloadedCall(expression)
                 if (overloaded != "") return overloaded
             }
+            if (this.generics.probing) {
+                val generic = bootstrapGenericInferCall(this, expression)
+                if (generic != "") return generic
+            }
             result = bootstrapInferCall(this, expression, result)
         }
         if (expression.kind == "call.value") {
@@ -10628,6 +10658,10 @@ class BootstrapAnalyzer(
             if (this.overloads.keys.size > 0) {
                 val overloaded = this.inferOverloadedMethodCall(expression, receiver)
                 if (overloaded != "") return overloaded
+            }
+            if (this.generics.probing) {
+                val generic = bootstrapGenericInferMemberCall(this, expression, receiver)
+                if (generic != "") return generic
             }
             result = bootstrapInferMemberCall(
                 this, expression, rawReceiver, receiver, result
@@ -11043,7 +11077,9 @@ class BootstrapAnalyzer(
                         bootstrapNormalizeType(
                             declaration.parameterTypes[ownershipParameter]
                         )
-                    )) {
+                    ) && !bootstrapGenericSourceIsInstance(declaration.sourceIdentity)) {
+                        // `own value: T` in a generic owns a resource and
+                        // copies any other value (generics.ab).
                         this.fail(
                             "ownership.owned-parameter-type:$symbolName"
                         )
@@ -11073,7 +11109,8 @@ class BootstrapAnalyzer(
                         )
                     }
                     if (method.parameterKinds[ownershipParameter] == "own" &&
-                        !this.typeIsAffine(parameterType)) {
+                        !this.typeIsAffine(parameterType) &&
+                        !bootstrapGenericSourceIsInstance(method.sourceIdentity)) {
                         this.fail(
                             "ownership.owned-parameter-type:${declaration.name}.${method.name}"
                         )
@@ -11268,7 +11305,8 @@ class BootstrapAnalyzer(
                 (declaration.kind == "fun" ||
                  declaration.kind == "compile.fun") &&
                 declaration.expression.kind != "missing" &&
-                (this.overloads.keys.size == 0 || this.overloads.probes(declaration))
+                (this.overloads.keys.size == 0 || this.overloads.probes(declaration)) &&
+                (!this.generics.probing || this.generics.probes(declaration))
             ) {
                 val functionLocals: array<BootstrapSymbol> = []
                 if (declaration.extensionOwner != "") {
@@ -11446,7 +11484,8 @@ class BootstrapAnalyzer(
                     }
                     methodAnnotation = methodAnnotation + 1
                 }
-                if (this.overloads.keys.size > 0 && !this.overloads.probes(method)) {
+                if ((this.overloads.keys.size > 0 && !this.overloads.probes(method)) ||
+                    (this.generics.probing && !this.generics.probes(method))) {
                     methodIndex = methodIndex + 1
                     continue
                 }
@@ -11602,11 +11641,12 @@ class BootstrapAnalyzer(
         this.initEdges.owner = -1
         this.initEdges.declaration = -1
         // The overload probe types only some bodies: the build's analysis checks.
-        val initialization = if (this.overloads.keys.size == 0)
+        val probe = this.overloads.keys.size > 0 || this.generics.probing
+        val initialization = if (!probe)
             bootstrapCheckInitialization(this) else BootstrapInitialization([], [], [], [])
-        if (this.overloads.keys.size == 0) bootstrapCheckThreadGlobals(this)
-        if (this.overloads.keys.size == 0 && this.stmEnabled) bootstrapCheckStm(this)
-        if (this.overloads.keys.size == 0) bootstrapPublishInferredResults(this)
+        if (!probe) bootstrapCheckThreadGlobals(this)
+        if (!probe && this.stmEnabled) bootstrapCheckStm(this)
+        if (!probe) bootstrapPublishInferredResults(this)
         BootstrapSemanticResult(
             this.symbols,
             this.errors,
@@ -13452,6 +13492,11 @@ fun bootstrapInferReturn(
     if (analyzer.atomicDepth > 0) analyzer.fail("stm.control:return@${expression.begin}")
     var returned = "void"
     if (expression.children[0].kind != "missing") {
+        if (analyzer.generics.probing && analyzer.currentResultType != "inferred") {
+            analyzer.genericExpected = analyzer.currentResultType
+            analyzer.genericExpectedBegin = expression.children[0].begin
+            analyzer.genericExpectedEnd = expression.children[0].end
+        }
         returned = analyzer.infer(expression.children[0])
     }
     analyzer.validateBorrowReturn(
@@ -13553,6 +13598,12 @@ fun bootstrapInferLocal(
                 expression.children[0],
                 bootstrapNormalizeType(expression.children[1].text)
             )
+        }
+        if (analyzer.generics.probing && expression.children.size > 1 &&
+            expression.children[1].text != "inferred") {
+            analyzer.genericExpected = bootstrapNormalizeType(expression.children[1].text)
+            analyzer.genericExpectedBegin = expression.children[0].begin
+            analyzer.genericExpectedEnd = expression.children[0].end
         }
         initializerType = analyzer.infer(expression.children[0])
         if (!bootstrapIsBorrowType(initializerType) &&
@@ -14524,7 +14575,8 @@ fun bootstrapAnalyzer(
     // Without them (the overload probe: overload.ab), no compile effect, and
     // no region retention, is reported.
     effects: bool = true,
-    regions: bool = true
+    regions: bool = true,
+    generics: BootstrapGenericTable = bootstrapNoGenerics()
 ): BootstrapAnalyzer {
     val none: array<BootstrapDeclaration> = []
     val symbols: array<BootstrapSymbol> = []
@@ -14618,7 +14670,8 @@ fun bootstrapAnalyzer(
         -1,
         bootstrapNoInferredResults(),
         bootstrapNoInitEdges(),
-        stmEnabled = bootstrapProgramUsesStm(parsed.declarations)
+        stmEnabled = bootstrapProgramUsesStm(parsed.declarations),
+        generics = generics
     )
 }
 

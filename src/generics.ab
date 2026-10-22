@@ -1,0 +1,822 @@
+// Generic functions, extensions and classes (docs/language.md#generics):
+//
+//   fun <T> first(items: array<T>): T = items[0]
+//   class Box<T>(val value: T)
+//   fun <T, R> array<T>.mapped(f: (T) -> R): array<R> = …
+//
+// Generics are monomorphized before the build's analysis: each generic is
+// replaced by one copy per type arguments it is used with (an instance), and
+// every use names its instance, so every later stage sees ordinary
+// declarations. An instance is its generic with the type parameters replaced
+// in every type written in it (parameters, result, fields, locals, lambda
+// parameters, typed empty arrays and maps) and named for its generic and type
+// arguments (generic_types.ab): `Box<int>` everywhere is the one class
+// `Box__abla_generic_i64`. Its nodes keep their generic's places; its source
+// identity is its generic's file marked with its name, so what the analysis
+// keeps per node stays apart per instance, and a diagnostic in it names its
+// generic's file and the instance (bootstrapGenericDiagnostics).
+//
+// Type arguments written out (`Box<int>` in a type, `first<int>(xs)`,
+// `Box<int>(1)`) are read from the text. Inferred ones come from a probe
+// analysis, as overloads do (overload.ab): it types each call of a generic,
+// matches the generic's parameter types against the arguments' types (and an
+// extension's receiver type against the receiver's), and records the
+// instance. A call whose arguments' types depend on an instance not made yet
+// (a result inferred from a body, a field of an instance) binds in a later
+// round, after the instances it found are made; the rounds stop when a round
+// binds nothing new. A call still unbound then is an error
+// (generic.cannot-infer).
+//
+// A generic's body is checked once with each type parameter a class with no
+// members (bootstrapGenericParameterClass), so only what every type has
+// applies to a `T`; that instance is only checked, never built. The
+// instances built are checked as any declaration: ownership follows each
+// instance's types (`Box<Ticket>` holds a resource, so it is one).
+//
+// A program without generics is returned as it is, without a probe.
+
+import "overload.ab"
+
+class BootstrapGenericState(
+    val table: BootstrapGenericTable,
+    val instances: array<BootstrapDeclaration>,
+    val instanceNames: BootstrapStringSet,
+    val requests: array<string>,
+    // Instances made since the last probe: their bodies are probed next.
+    var fresh: BootstrapStringSet,
+    // Instances that couldn't be made (their calls become invalid nodes),
+    // and the generics a runaway instantiation was reported for.
+    var failed: BootstrapStringSet,
+    var runaway: BootstrapStringSet,
+    // What the pass reports itself (bootstrapInstantiateGenerics counts it).
+    var diagnostics: string
+)
+
+fun bootstrapGenericError(var state: BootstrapGenericState, code: string, declaration: BootstrapDeclaration): void {
+    state.diagnostics = "${state.diagnostics}error[E_SEMANTIC]: $code\nsource[semantic]:${declaration.sourceIdentity}:${declaration.begin}:${if (declaration.end > declaration.begin) declaration.end else declaration.begin + 1}\n"
+}
+
+fun bootstrapGenericDeclaration(
+    declaration: BootstrapDeclaration,
+    name: string,
+    expression: BootstrapExpression,
+    parameterTypes: array<string>,
+    resultType: string,
+    methods: array<BootstrapDeclaration>,
+    parameterDefaults: array<BootstrapExpression>,
+    extensionOwner: string,
+    sourceIdentity: string
+): BootstrapDeclaration = BootstrapDeclaration(
+    declaration.kind,
+    name,
+    declaration.begin,
+    declaration.end,
+    expression,
+    declaration.parameters,
+    parameterTypes,
+    resultType,
+    methods,
+    parameterDefaults,
+    declaration.externalLibrary,
+    declaration.parameterKinds,
+    extensionOwner,
+    declaration.isTrusted,
+    declaration.isResource,
+    declaration.isNoEscape,
+    declaration.generatedNamespace,
+    declaration.generatedOriginBegin,
+    declaration.generatedOriginEnd,
+    declaration.annotations,
+    declaration.annotationArguments,
+    declaration.annotationBegins,
+    declaration.annotationEnds,
+    sourceIdentity,
+    declaration.conformances,
+    declaration.isSealed,
+    declaration.isPrivate,
+    []
+)
+
+/** `expression` with each type written in it rewritten by `rewrite` (type
+ *  parameters replaced, then generic classes named by their instances), and
+ *  each call or reference spelled with type arguments (`first<int>`) naming
+ *  its instance. */
+fun bootstrapGenericRewriteExpression(
+    expression: BootstrapExpression,
+    identity: string,
+    parameters: array<string>,
+    sources: array<string>,
+    var state: BootstrapGenericState
+): BootstrapExpression {
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(
+        bootstrapGenericRewriteExpression(child, identity, parameters, sources, state)
+    )
+    var text = expression.text
+    val kind = expression.kind
+    if (kind == "type" || (kind == "array" && text.size > 6 && text.slice(0, 6) == "array<")) {
+        val before = state.requests.size
+        text = bootstrapGenericRewriteType(
+            bootstrapGenericSubstituteWords(text, parameters, sources), state.table, state.requests
+        )
+        // `Box<int, string>`: reported here, and the type is unknown after.
+        var request = before
+        while (request < state.requests.size) {
+            val name = state.requests[request]
+            val template = state.table.findId(bootstrapGenericInstanceGeneric(name))
+            val expected = if (template < 0) 0
+                else bootstrapGenericParameterNames(state.table.declarations[template]).size
+            val written = bootstrapGenericInstanceArguments(name).size
+            if (template >= 0 && written != expected) {
+                if (!state.failed.contains(name)) {
+                    state.diagnostics = "${state.diagnostics}error[E_SEMANTIC]: generic.arity:${bootstrapSourceVisibleType(state.table.names[template])}:$expected:$written\nsource[semantic]:$identity:${expression.begin}:${if (expression.end > expression.begin) expression.end else expression.begin + 1}\n"
+                    state.failed.add(name)
+                }
+                text = if (kind == "type") "unknown" else "array<unknown>"
+            }
+            request = request + 1
+        }
+    } else if ((kind == "call" || kind == "identifier" || kind == "member.call" ||
+                kind == "member") && text.size > 0 && text[text.size - 1] == 62) {
+        val name = bootstrapGenericCalleeName(text)
+        if (name.size < text.size) {
+            // The type arguments written at a call: replaced, and for a
+            // function or class, resolved here.
+            text = "$name${bootstrapGenericSubstituteWords(text.slice(name.size, text.size), parameters, sources)}"
+            val template = state.table.findFree(name)
+            if (template >= 0 && (kind == "call" || kind == "identifier")) {
+                val written = bootstrapGenericCalleeArguments(text)
+                val expected = bootstrapGenericParameterNames(state.table.declarations[template]).size
+                if (written.size != expected) {
+                    state.diagnostics = "${state.diagnostics}error[E_SEMANTIC]: generic.arity:${bootstrapSourceVisibleType(name)}:$expected:${written.size}\nsource[semantic]:$identity:${expression.begin}:${if (expression.end > expression.begin) expression.end else expression.begin + 1}\n"
+                    return BootstrapExpression("invalid", text, expression.begin, expression.end, children)
+                }
+                val arguments: array<string> = []
+                for (argument in written) arguments.append(bootstrapNormalizeType(
+                    bootstrapGenericRewriteType(argument, state.table, state.requests)
+                ))
+                text = bootstrapGenericInstanceName(state.table.ids[template], arguments)
+                state.requests.append(text)
+            }
+        }
+    }
+    BootstrapExpression(kind, text, expression.begin, expression.end, children)
+}
+
+fun bootstrapGenericRewriteTypes(
+    types: array<string>,
+    parameters: array<string>,
+    sources: array<string>,
+    var state: BootstrapGenericState
+): array<string> {
+    val rewritten: array<string> = []
+    for (type in types) rewritten.append(bootstrapGenericRewriteType(
+        bootstrapGenericSubstituteWords(type, parameters, sources), state.table, state.requests
+    ))
+    rewritten
+}
+
+/** `declaration` with its types and calls rewritten (see
+ *  bootstrapGenericRewriteExpression); named `name` from `identity` when it
+ *  is an instance. */
+fun bootstrapGenericRewriteDeclaration(
+    declaration: BootstrapDeclaration,
+    name: string,
+    identity: string,
+    parameters: array<string>,
+    sources: array<string>,
+    var state: BootstrapGenericState
+): BootstrapDeclaration {
+    val defaults: array<BootstrapExpression> = []
+    for (value in declaration.parameterDefaults) defaults.append(
+        bootstrapGenericRewriteExpression(value, identity, parameters, sources, state)
+    )
+    val methods: array<BootstrapDeclaration> = []
+    for (method in declaration.methods) {
+        val methodIdentity = if (identity == declaration.sourceIdentity) method.sourceIdentity
+            else "${if (method.sourceIdentity != "") method.sourceIdentity else declaration.sourceIdentity}$BOOTSTRAP_GENERIC_SOURCE_MARK$name"
+        methods.append(bootstrapGenericRewriteDeclaration(
+            method, method.name, methodIdentity, parameters, sources, state
+        ))
+    }
+    val resultType = if (declaration.resultType == "inferred") "inferred"
+        else bootstrapGenericRewriteType(
+            bootstrapGenericSubstituteWords(declaration.resultType, parameters, sources),
+            state.table, state.requests
+        )
+    bootstrapGenericDeclaration(
+        declaration,
+        name,
+        bootstrapGenericRewriteExpression(declaration.expression, identity, parameters, sources, state),
+        bootstrapGenericRewriteTypes(declaration.parameterTypes, parameters, sources, state),
+        resultType,
+        methods,
+        defaults,
+        if (declaration.extensionOwner == "") ""
+            else bootstrapGenericRewriteType(
+                bootstrapGenericSubstituteWords(declaration.extensionOwner, parameters, sources),
+                state.table, state.requests
+            ),
+        identity
+    )
+}
+
+/** `expression` with each call or reference naming one of `failed` an
+ *  invalid node (its failure is reported already). */
+fun bootstrapGenericInvalidate(expression: BootstrapExpression, failed: BootstrapStringSet): BootstrapExpression {
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapGenericInvalidate(child, failed))
+    val call = expression.kind == "call" || expression.kind == "identifier" || expression.kind == "member.call"
+    BootstrapExpression(
+        if (call && failed.contains(expression.text)) "invalid" else expression.kind,
+        expression.text, expression.begin, expression.end, children
+    )
+}
+
+fun bootstrapGenericInvalidateDeclaration(
+    declaration: BootstrapDeclaration,
+    failed: BootstrapStringSet
+): BootstrapDeclaration {
+    val methods: array<BootstrapDeclaration> = []
+    for (method in declaration.methods) methods.append(bootstrapGenericInvalidateDeclaration(method, failed))
+    val defaults: array<BootstrapExpression> = []
+    for (value in declaration.parameterDefaults) defaults.append(bootstrapGenericInvalidate(value, failed))
+    bootstrapGenericDeclaration(
+        declaration, declaration.name, bootstrapGenericInvalidate(declaration.expression, failed),
+        declaration.parameterTypes, declaration.resultType, methods, defaults,
+        declaration.extensionOwner, declaration.sourceIdentity
+    )
+}
+
+/** `expression` with `move(name)` of each of `copied` its value. */
+fun bootstrapGenericUnmove(expression: BootstrapExpression, copied: array<string>): BootstrapExpression {
+    if (expression.kind == "call" && expression.text == "move" && expression.children.size == 1 &&
+        expression.children[0].kind == "identifier") {
+        for (name in copied) if (name == expression.children[0].text) return expression.children[0]
+    }
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapGenericUnmove(child, copied))
+    BootstrapExpression(expression.kind, expression.text, expression.begin, expression.end, children)
+}
+
+/** An instance's functions with each `own` parameter of a type that is no
+ *  resource read as a copy (bootstrapGenericUnmove). */
+fun bootstrapGenericCopyOwned(declaration: BootstrapDeclaration, affine: array<string>): BootstrapDeclaration {
+    val copied: array<string> = []
+    var parameter = 0
+    while (parameter < declaration.parameters.size && parameter < declaration.parameterKinds.size) {
+        if (declaration.kind != "class" && declaration.parameterKinds[parameter] == "own" &&
+            parameter < declaration.parameterTypes.size &&
+            !bootstrapSummaryTypeIsAffine(declaration.parameterTypes[parameter], affine)) {
+            copied.append(declaration.parameters[parameter])
+        }
+        parameter = parameter + 1
+    }
+    val methods: array<BootstrapDeclaration> = []
+    for (method in declaration.methods) methods.append(bootstrapGenericCopyOwned(method, affine))
+    if (copied.size == 0 && methods.size == 0) return declaration
+    bootstrapGenericDeclaration(
+        declaration, declaration.name,
+        if (copied.size > 0) bootstrapGenericUnmove(declaration.expression, copied) else declaration.expression,
+        declaration.parameterTypes, declaration.resultType, methods, declaration.parameterDefaults,
+        declaration.extensionOwner, declaration.sourceIdentity
+    )
+}
+
+/** Makes every instance requested (and those its types and written calls
+ *  name in turn). */
+fun bootstrapGenericMakeRequested(var state: BootstrapGenericState): void {
+    var next = 0
+    while (next < state.requests.size) {
+        val name = state.requests[next]
+        next = next + 1
+        if (state.instanceNames.contains(name)) continue
+        state.instanceNames.add(name)
+        val template = state.table.findId(bootstrapGenericInstanceGeneric(name))
+        if (template < 0) continue
+        val declaration = state.table.declarations[template]
+        val parameters = bootstrapGenericParameterNames(declaration)
+        val arguments = bootstrapGenericInstanceArguments(name)
+        val visible = bootstrapGenericVisible(name)
+        if (arguments.size != parameters.size) {
+            // `Box<int, int>` in a declaration's type (a local's is
+            // reported where it is written).
+            if (!state.failed.contains(name)) bootstrapGenericError(
+                state,
+                "generic.arity:${bootstrapSourceVisibleType(state.table.names[template])}:${parameters.size}:${arguments.size}",
+                declaration
+            )
+            state.failed.add(name)
+            continue
+        }
+        if (bootstrapGenericDepth(bootstrapGenericParse(name)) > 24) {
+            // Each instance makes a larger one (`f(Box(x))` in `f`).
+            if (!state.runaway.contains(state.table.ids[template])) {
+                state.runaway.add(state.table.ids[template])
+                bootstrapGenericError(
+                    state,
+                    "generic.instantiation-depth:${bootstrapSourceVisibleType(state.table.names[template])}",
+                    declaration
+                )
+            }
+            state.failed.add(name)
+            continue
+        }
+        val sources: array<string> = []
+        for (argument in arguments) sources.append(bootstrapGenericSourceType(bootstrapGenericParse(argument)))
+        state.instances.append(bootstrapGenericRewriteDeclaration(
+            declaration, name, "${declaration.sourceIdentity}$BOOTSTRAP_GENERIC_SOURCE_MARK$name",
+            parameters, sources, state
+        ))
+        state.fresh.add(name)
+    }
+    state.requests.clear()
+}
+
+/** Whether `expression` holds a call the probe may bind: of a generic by
+ *  name, or of a method named like a generic extension. */
+fun bootstrapGenericMayResolve(expression: BootstrapExpression, table: BootstrapGenericTable): bool {
+    if (expression.kind == "call" || expression.kind == "identifier") {
+        val name = bootstrapGenericCalleeName(expression.text)
+        if (table.findFree(name) >= 0 || (expression.kind == "call" && table.findPrivate(name) >= 0)) return true
+    } else if (expression.kind == "member.call") {
+        if (table.hasExtension(bootstrapGenericCalleeName(expression.text))) return true
+    }
+    for (child in expression.children) if (bootstrapGenericMayResolve(child, table)) return true
+    false
+}
+
+fun bootstrapGenericBodyMayResolve(declaration: BootstrapDeclaration, table: BootstrapGenericTable): bool {
+    if (bootstrapGenericMayResolve(declaration.expression, table)) return true
+    for (value in declaration.parameterDefaults) if (bootstrapGenericMayResolve(value, table)) return true
+    false
+}
+
+/** The bodies a probe types: those that may bind a call, and every body of
+ *  the instances in `also` (by name; all instances when `everyInstance`). */
+fun bootstrapGenericProbedBodies(
+    declarations: array<BootstrapDeclaration>,
+    table: BootstrapGenericTable,
+    also: BootstrapStringSet,
+    onlyAlso: bool
+): BootstrapStringSet {
+    var bodies = bootstrapStringSet()
+    for (declaration in declarations) {
+        val instance = also.contains(declaration.name)
+        if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
+            if (instance || (!onlyAlso && bootstrapGenericBodyMayResolve(declaration, table))) {
+                bodies.add(bootstrapOverloadBodyKey(declaration))
+            }
+        } else if (declaration.kind == "class") {
+            for (method in declaration.methods) {
+                if (instance || (!onlyAlso && bootstrapGenericBodyMayResolve(method, table))) {
+                    bodies.add(bootstrapOverloadBodyKey(method))
+                }
+            }
+        }
+    }
+    bodies
+}
+
+/** The classes among `declarations` whose delegated properties' `by` may
+ *  bind a call: the instances in `fresh`, and any whose `by` calls a generic. */
+fun bootstrapGenericDelegatingClasses(
+    declarations: array<BootstrapDeclaration>,
+    table: BootstrapGenericTable,
+    fresh: BootstrapStringSet
+): array<BootstrapDeclaration> {
+    val classes: array<BootstrapDeclaration> = []
+    for (declaration in declarations) {
+        if (bootstrapHasDelegatedProperty(declaration) && (fresh.contains(declaration.name) ||
+            bootstrapGenericBodyMayResolve(declaration, table))) classes.append(declaration)
+    }
+    classes
+}
+
+/** The diagnostics among `diagnostics` placed in a generic's own body
+ *  (the instance of its type parameters' classes). */
+fun bootstrapGenericBodyDiagnostics(diagnostics: string): string {
+    var output = ""
+    var entry = ""
+    var keep = false
+    var lineBegin = 0
+    while (lineBegin < diagnostics.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < diagnostics.size && diagnostics[lineEnd] != 10) lineEnd = lineEnd + 1
+        val line = diagnostics.slice(lineBegin, lineEnd)
+        if (line.size > 6 && line.slice(0, 6) == "error[") {
+            if (keep) output = "$output$entry"
+            entry = ""
+            keep = false
+        }
+        entry = "$entry$line\n"
+        if (line.size > 7 && line.slice(0, 7) == "source[") {
+            val instance = bootstrapGenericSourceInstance(line)
+            if (instance != "" && bootstrapGenericMentionsParameter(instance)) keep = true
+        }
+        lineBegin = lineEnd + 1
+    }
+    if (keep) output = "$output$entry"
+    output
+}
+
+/** A `source[…]` record without its instance: the place in the generic. */
+fun bootstrapGenericSourceRecordPlace(line: string): string {
+    val mark = bootstrapGenericFind(line, BOOTSTRAP_GENERIC_SOURCE_MARK, 0)
+    if (mark < 0) return line
+    var close = mark
+    while (close < line.size && line[close] != 58) close = close + 1
+    "${line.slice(0, mark)}${line.slice(close, line.size)}"
+}
+
+/** Each diagnostic of `diagnostics` once: one at the same place of a
+ *  generic's body in several instances is reported for the first. */
+fun bootstrapGenericUniqueDiagnostics(diagnostics: string): string {
+    var seen = bootstrapStringSet()
+    var output = ""
+    var entry = ""
+    var key = ""
+    var lineBegin = 0
+    while (lineBegin <= diagnostics.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < diagnostics.size && diagnostics[lineEnd] != 10) lineEnd = lineEnd + 1
+        val line = diagnostics.slice(lineBegin, lineEnd)
+        if (lineEnd >= diagnostics.size || (line.size > 6 && line.slice(0, 6) == "error[")) {
+            if (entry != "" && !seen.contains(key)) {
+                seen.add(key)
+                output = "$output$entry"
+            }
+            entry = ""
+            key = line
+        }
+        if (line.size > 0) entry = "$entry$line\n"
+        if (line.size > 7 && line.slice(0, 7) == "source[") {
+            key = "$key\n${bootstrapGenericSourceRecordPlace(line)}"
+        }
+        lineBegin = lineEnd + 1
+    }
+    output
+}
+
+/** `parsed` with its generics replaced by their instances, and every use of
+ *  one naming its instance. */
+/** `expression` with each call of a generic (`free` names a function or
+ *  class, `extensions` an extension) whose span, kind and text `seen` already
+ *  holds for `identity` marked with its count (BOOTSTRAP_GENERIC_COPY_MARK). */
+fun bootstrapGenericMarkCopies(
+    expression: BootstrapExpression,
+    identity: string,
+    free: BootstrapStringSet,
+    extensions: BootstrapStringSet,
+    var seen: BootstrapStringSet
+): BootstrapExpression {
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(
+        bootstrapGenericMarkCopies(child, identity, free, extensions, seen)
+    )
+    var text = expression.text
+    val name = bootstrapGenericCalleeName(text)
+    if ((expression.kind == "call" && free.contains(name)) ||
+        (expression.kind == "member.call" && extensions.contains(name))) {
+        val key = "$identity$BOOTSTRAP_GENERIC_SOURCE_MARK${expression.begin}:${expression.end}:${expression.kind}:$text"
+        if (seen.contains(key)) {
+            var count = 1
+            while (seen.contains("$key$BOOTSTRAP_GENERIC_COPY_MARK$count")) count = count + 1
+            seen.add("$key$BOOTSTRAP_GENERIC_COPY_MARK$count")
+            text = "$text$BOOTSTRAP_GENERIC_COPY_MARK$count"
+        } else seen.add(key)
+    }
+    BootstrapExpression(expression.kind, text, expression.begin, expression.end, children)
+}
+
+fun bootstrapGenericMarkDeclaration(
+    declaration: BootstrapDeclaration,
+    identity: string,
+    free: BootstrapStringSet,
+    extensions: BootstrapStringSet,
+    var seen: BootstrapStringSet
+): BootstrapDeclaration {
+    val own = if (declaration.sourceIdentity != "") declaration.sourceIdentity else identity
+    val methods: array<BootstrapDeclaration> = []
+    for (method in declaration.methods) methods.append(
+        bootstrapGenericMarkDeclaration(method, own, free, extensions, seen)
+    )
+    val defaults: array<BootstrapExpression> = []
+    for (value in declaration.parameterDefaults) defaults.append(
+        bootstrapGenericMarkCopies(value, own, free, extensions, seen)
+    )
+    bootstrapGenericWithTypeParameters(
+        bootstrapGenericDeclaration(
+            declaration, declaration.name,
+            bootstrapGenericMarkCopies(declaration.expression, own, free, extensions, seen),
+            declaration.parameterTypes, declaration.resultType, methods, defaults,
+            declaration.extensionOwner, declaration.sourceIdentity
+        ),
+        declaration.typeParameters
+    )
+}
+
+/** `expression` with its copy marks dropped (a call the probe never bound). */
+fun bootstrapGenericUnmark(expression: BootstrapExpression): BootstrapExpression {
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapGenericUnmark(child))
+    BootstrapExpression(
+        expression.kind, bootstrapGenericUnmarked(expression.text),
+        expression.begin, expression.end, children
+    )
+}
+
+fun bootstrapGenericUnmarkDeclaration(declaration: BootstrapDeclaration): BootstrapDeclaration {
+    val methods: array<BootstrapDeclaration> = []
+    for (method in declaration.methods) methods.append(bootstrapGenericUnmarkDeclaration(method))
+    val defaults: array<BootstrapExpression> = []
+    for (value in declaration.parameterDefaults) defaults.append(bootstrapGenericUnmark(value))
+    bootstrapGenericDeclaration(
+        declaration, declaration.name, bootstrapGenericUnmark(declaration.expression),
+        declaration.parameterTypes, declaration.resultType, methods, defaults,
+        declaration.extensionOwner, declaration.sourceIdentity
+    )
+}
+
+fun bootstrapGenericWithTypeParameters(
+    declaration: BootstrapDeclaration,
+    typeParameters: array<string>
+): BootstrapDeclaration = BootstrapDeclaration(
+    declaration.kind, declaration.name, declaration.begin, declaration.end,
+    declaration.expression, declaration.parameters, declaration.parameterTypes,
+    declaration.resultType, declaration.methods, declaration.parameterDefaults,
+    declaration.externalLibrary, declaration.parameterKinds, declaration.extensionOwner,
+    declaration.isTrusted, declaration.isResource, declaration.isNoEscape,
+    declaration.generatedNamespace, declaration.generatedOriginBegin,
+    declaration.generatedOriginEnd, declaration.annotations,
+    declaration.annotationArguments, declaration.annotationBegins,
+    declaration.annotationEnds, declaration.sourceIdentity, declaration.conformances,
+    declaration.isSealed, declaration.isPrivate, typeParameters
+)
+
+fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseResult {
+    var generic = false
+    for (declaration in parsed.declarations) {
+        if (declaration.typeParameters.size > 0) generic = true
+        for (method in declaration.methods) if (method.typeParameters.size > 0) generic = true
+    }
+    if (!generic) return parsed
+
+    // Calls of generics that share a span, told apart (bootstrapGenericMarkCopies).
+    var free = bootstrapStringSet()
+    var extensions = bootstrapStringSet()
+    for (declaration in parsed.declarations) {
+        if (declaration.typeParameters.size > 0) {
+            if (declaration.kind == "class" || declaration.extensionOwner == "") free.add(declaration.name)
+            else extensions.add(declaration.name)
+        }
+    }
+    var seen = bootstrapStringSet()
+    val source: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) source.append(
+        bootstrapGenericMarkDeclaration(declaration, declaration.sourceIdentity, free, extensions, seen)
+    )
+    var marked = false
+    for (key in seen.keys) if (bootstrapGenericFind(key, BOOTSTRAP_GENERIC_COPY_MARK, 0) >= 0) marked = true
+
+    // The generics: classes first (an extension's receiver may name one).
+    val ids: array<string> = []
+    val names: array<string> = []
+    val owners: array<string> = []
+    val templates: array<BootstrapDeclaration> = []
+    for (declaration in source) {
+        if (declaration.kind == "class" && declaration.typeParameters.size > 0) {
+            ids.append(declaration.name)
+            names.append(declaration.name)
+            owners.append("")
+            templates.append(declaration)
+        }
+    }
+    val classes = BootstrapGenericTable(ids, names, owners, templates, false, bootstrapStringSet())
+    for (declaration in source) {
+        if ((declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+            declaration.typeParameters.size > 0) {
+            var owner = ""
+            if (declaration.extensionOwner != "") {
+                val ignored: array<string> = []
+                owner = bootstrapNormalizeType(
+                    bootstrapGenericRewriteType(declaration.extensionOwner, classes, ignored)
+                )
+            }
+            ids.append(if (owner == "") declaration.name
+                else "${declaration.name}__abla_on_${bootstrapGenericEscape(owner)}")
+            names.append(declaration.name)
+            owners.append(owner)
+            templates.append(declaration)
+        }
+    }
+    var state = BootstrapGenericState(
+        BootstrapGenericTable(ids, names, owners, templates, false, bootstrapStringSet()),
+        [], bootstrapStringSet(), [], bootstrapStringSet(), bootstrapStringSet(),
+        bootstrapStringSet(), ""
+    )
+
+    // What v1 refuses.
+    for (declaration in source) {
+        for (parameter in declaration.typeParameters) {
+            if (bootstrapGenericFind(parameter, ":", 0) >= 0) {
+                bootstrapGenericError(state, "generic.bound-not-supported:${declaration.name}:$parameter", declaration)
+            }
+        }
+        for (method in declaration.methods) {
+            if (method.typeParameters.size > 0) {
+                bootstrapGenericError(state, "generic.method-not-supported:${declaration.name}.${method.name}", method)
+            }
+        }
+        if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
+            var other = 0
+            while (other < templates.size) {
+                val template = templates[other]
+                if (template.name == declaration.name && template.kind != "class" &&
+                    (template.begin != declaration.begin || template.sourceIdentity != declaration.sourceIdentity) &&
+                    bootstrapNormalizeType(template.extensionOwner) == bootstrapNormalizeType(declaration.extensionOwner)) {
+                    bootstrapGenericError(state, "generic.overload:${bootstrapSourceVisibleType(declaration.name)}", declaration)
+                }
+                other = other + 1
+            }
+        }
+    }
+
+    // Every other declaration with its written type arguments resolved; each
+    // generic's own instance (its type parameters' classes) to check its body.
+    val none: array<string> = []
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in source) {
+        if (declaration.typeParameters.size == 0) {
+            declarations.append(bootstrapGenericRewriteDeclaration(
+                declaration, declaration.name, declaration.sourceIdentity, none, none, state
+            ))
+        }
+    }
+    val parameterClasses: array<BootstrapDeclaration> = []
+    var template = 0
+    while (template < templates.size) {
+        val declaration = templates[template]
+        val arguments: array<string> = []
+        for (parameter in bootstrapGenericParameterNames(declaration)) {
+            val name = bootstrapGenericParameterClass(ids[template], parameter)
+            arguments.append(name)
+            parameterClasses.append(BootstrapDeclaration(
+                "class", name, declaration.begin, declaration.begin,
+                BootstrapExpression("missing", "", declaration.begin, declaration.begin, []),
+                [], [], "inferred", [], [], "", [], "", false, false, false, "", 0, 0,
+                [], [], [], [], declaration.sourceIdentity, []
+            ))
+        }
+        state.requests.append(bootstrapGenericInstanceName(ids[template], arguments))
+        template = template + 1
+    }
+    bootstrapGenericMakeRequested(state)
+
+    // Probe until a round binds nothing new.
+    var failures = ""
+    var failedCalls: array<BootstrapOverloadResolution> = []
+    var program: array<BootstrapDeclaration> = []
+    for (declaration in declarations) program.append(declaration)
+    var round = 0
+    var probing = true
+    while (probing) {
+        val input: array<BootstrapDeclaration> = []
+        for (declaration in program) input.append(declaration)
+        for (declaration in parameterClasses) input.append(declaration)
+        for (declaration in state.instances) input.append(declaration)
+        val bodies = bootstrapGenericProbedBodies(input, state.table, state.fresh, false)
+        val delegating = bootstrapGenericDelegatingClasses(input, state.table, state.fresh)
+        if (bodies.keys.size == 0 && delegating.size == 0) {
+            failures = ""
+            failedCalls = []
+            probing = false
+        } else {
+            val probeInput = BootstrapParseResult(
+                input, parsed.actions, parsed.errors, parsed.extensionErrors,
+                parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+            )
+            var probe = bootstrapAnalyzer(
+                probeInput, [], [], [], [], bootstrapNoOverloads(), false, false,
+                BootstrapGenericTable(ids, names, owners, templates, true, bodies)
+            )
+            probe.analyze(probeInput)
+            // A delegated property's `by` is typed with its class, not at a
+            // body: each one that may bind a call is typed here.
+            for (declaration in delegating) {
+                var parameter = 0
+                while (parameter < declaration.parameters.size) {
+                    if (bootstrapIsDelegatedProperty(declaration, parameter)) {
+                        probe.delegatedFieldType(declaration, parameter)
+                    }
+                    parameter = parameter + 1
+                }
+            }
+            failures = probe.genericFailures
+            failedCalls = []
+            for (call in probe.genericFailedCalls) failedCalls.append(call)
+            state.fresh = bootstrapStringSet()
+            val resolutions = probe.genericResolutions
+            if (resolutions.size > 0) {
+                val index = bootstrapOverloadIndex(resolutions)
+                val bySource = bootstrapOverloadBySource(resolutions)
+                var position = 0
+                while (position < program.size) {
+                    val declaration = program[position]
+                    if (bootstrapOverloadTouches(declaration, resolutions, bySource)) {
+                        program[position] = bootstrapOverloadRewriteDeclaration(declaration, resolutions, index)
+                    }
+                    position = position + 1
+                }
+                val instances: array<BootstrapDeclaration> = []
+                for (declaration in state.instances) instances.append(
+                    if (bootstrapOverloadTouches(declaration, resolutions, bySource))
+                        bootstrapOverloadRewriteDeclaration(declaration, resolutions, index)
+                    else declaration
+                )
+                state.instances.clear()
+                for (declaration in instances) state.instances.append(declaration)
+            }
+            for (request in probe.genericRequests) state.requests.append(request)
+            bootstrapGenericMakeRequested(state)
+            round = round + 1
+            if (resolutions.size == 0 && state.fresh.keys.size == 0) probing = false
+            else if (round > 64) {
+                state.diagnostics = "${state.diagnostics}error[E_SEMANTIC]: generic.instantiation-depth:rounds\n"
+                probing = false
+            }
+        }
+    }
+
+    // Each generic's body, checked with its type parameters' classes.
+    val checkInput: array<BootstrapDeclaration> = []
+    for (declaration in program) checkInput.append(declaration)
+    for (declaration in parameterClasses) checkInput.append(declaration)
+    for (declaration in state.instances) checkInput.append(declaration)
+    var checked = bootstrapStringSet()
+    for (declaration in state.instances) {
+        if (bootstrapGenericMentionsParameter(declaration.name)) checked.add(declaration.name)
+    }
+    val checkResult = BootstrapParseResult(
+        checkInput, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+    var check = bootstrapAnalyzer(
+        checkResult, [], [], [], [], bootstrapNoOverloads(), false, false,
+        BootstrapGenericTable(ids, names, owners, templates, true,
+            bootstrapGenericProbedBodies(checkInput, state.table, checked, true))
+    )
+    check.analyze(checkResult)
+    val bodyDiagnostics = bootstrapGenericBodyDiagnostics(check.diagnostics)
+    val reported = bootstrapGenericUniqueDiagnostics("${state.diagnostics}$failures$bodyDiagnostics")
+    var errors = 0
+    var line = 0
+    while (line + 6 <= reported.size) {
+        if ((line == 0 || reported[line - 1] == 10) && reported.slice(line, line + 6) == "error[") errors = errors + 1
+        line = line + 1
+    }
+
+    // The program: every non-generic declaration, then the instances built.
+    for (declaration in state.instances) {
+        if (!bootstrapGenericMentionsParameter(declaration.name)) program.append(declaration)
+    }
+    // `own value: T` of an instance whose `T` is no resource holds a copy:
+    // `move(value)` is the value.
+    val affine = bootstrapBuildAffineTypeNames(program)
+    var position = 0
+    while (position < program.size) {
+        val declaration = program[position]
+        if (bootstrapGenericSourceIsInstance(declaration.sourceIdentity)) {
+            program[position] = bootstrapGenericCopyOwned(declaration, affine)
+        }
+        position = position + 1
+    }
+    // A call that couldn't be bound, or names an instance that couldn't be
+    // made, is reported: it is no call of anything any more.
+    if (failedCalls.size > 0 || state.failed.keys.size > 0) {
+        val index = bootstrapOverloadIndex(failedCalls)
+        val bySource = bootstrapOverloadBySource(failedCalls)
+        var position = 0
+        while (position < program.size) {
+            var declaration = program[position]
+            if (failedCalls.size > 0 && bootstrapOverloadTouches(declaration, failedCalls, bySource)) {
+                declaration = bootstrapOverloadRewriteDeclaration(declaration, failedCalls, index)
+            }
+            if (state.failed.keys.size > 0) declaration = bootstrapGenericInvalidateDeclaration(declaration, state.failed)
+            program[position] = declaration
+            position = position + 1
+        }
+    }
+    if (marked) {
+        var position = 0
+        while (position < program.size) {
+            program[position] = bootstrapGenericUnmarkDeclaration(program[position])
+            position = position + 1
+        }
+    }
+    BootstrapParseResult(
+        program, parsed.actions, parsed.errors + errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents,
+        "${parsed.diagnostics}$reported"
+    )
+}

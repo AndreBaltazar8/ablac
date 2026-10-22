@@ -47,7 +47,11 @@ class BootstrapDeclaration(
     // `sealed interface Shape`: its implementers are its own module's.
     val isSealed: bool = false,
     // `private fun helper()`: visible only in its own module.
-    val isPrivate: bool = false
+    val isPrivate: bool = false,
+    // `fun <T, U> f(…)`, `class Box<T>`: the type parameters as written
+    // (`T`, or `T:Shape&Named` with bounds). Only generics.ab reads them:
+    // it replaces each generic declaration by its instantiations.
+    val typeParameters: array<string> = []
 )
 
 /** `declaration`, sealed. */
@@ -80,7 +84,8 @@ fun bootstrapDeclarationSealed(
     declaration.sourceIdentity,
     declaration.conformances,
     true,
-    declaration.isPrivate
+    declaration.isPrivate,
+    declaration.typeParameters
 )
 
 /** `declaration`, private to its module. */
@@ -113,7 +118,8 @@ fun bootstrapDeclarationPrivate(
     declaration.sourceIdentity,
     declaration.conformances,
     declaration.isSealed,
-    true
+    true,
+    declaration.typeParameters
 )
 
 class BootstrapParseResult(
@@ -1325,6 +1331,85 @@ class BootstrapParser(
 
     /** At `array<T>()` or `Map<K, V>()`: the position of the type's closing
      *  `>`, else -1. */
+    /** At `<` after a name: the index of the `>` closing a list of type
+     *  arguments followed by `(` or `{` (`first<int>(xs)`, `xs.map<int> {`),
+     *  else -1. `a < b > (c)` reads as type arguments too (as in Kotlin);
+     *  as a comparison it never type-checked. */
+    fun typeArgumentsEnd(): int {
+        var index = this.position
+        var angles = 0
+        var parentheses = 0
+        while (index < this.tokens.size) {
+            val kind = this.tokens[index].kind
+            if (kind == "<") angles = angles + 1
+            else if (kind == ">") angles = angles - 1
+            else if (kind == ">>") angles = angles - 2
+            else if (kind == ">>>") angles = angles - 3
+            else if (kind == "(") parentheses = parentheses + 1
+            else if (kind == ")") parentheses = parentheses - 1
+            else if (kind != "identifier" && kind != "," && kind != "?" &&
+                     kind != "->" && kind != ".") return -1
+            if (angles < 0 || parentheses < 0) return -1
+            if (angles == 0) {
+                if (parentheses != 0 || index + 1 >= this.tokens.size) return -1
+                val next = this.tokens[index + 1].kind
+                return if (next == "(" || next == "{") index else -1
+            }
+            index = index + 1
+        }
+        -1
+    }
+
+    /** `<T, U : Shape & Named>` after `fun` or a class's name: each
+     *  parameter as `T`, or `T:Shape&Named` with its bounds. */
+    fun parseTypeParameters(): array<string> {
+        val parameters: array<string> = []
+        if (this.position + 1 < this.tokens.size &&
+            bootstrapTokenText(this.source, this.tokens[this.position + 1]) == "const") {
+            // `<const N: int>`: reserved.
+            this.failReserved("a `const` type parameter")
+            this.skipAngleGroup()
+            return parameters
+        }
+        this.expect("<")
+        var open = true
+        while (open && !this.at("end")) {
+            val name = this.tokens[this.position]
+            this.expect("identifier")
+            var parameter = bootstrapTokenText(this.source, name)
+            if (this.consume(":")) {
+                var bound = ""
+                var angles = 0
+                var reading = true
+                while (reading && !this.at("end")) {
+                    if (angles == 0 && (this.at(",") || this.at(">") || this.at(">>"))) {
+                        reading = false
+                    } else if (angles == 1 && this.at(">>")) {
+                        // `<T : Source<int>>`: the `>>` closes the bound and the list.
+                        bound = "$bound>"
+                        angles = 0
+                        reading = false
+                    } else {
+                        if (this.at("<")) angles = angles + 1
+                        if (this.at(">")) angles = angles - 1
+                        bound = "$bound${bootstrapTokenText(this.source, this.tokens[this.position])}"
+                        this.position = this.position + 1
+                    }
+                }
+                parameter = "$parameter:$bound"
+                if (this.at(">>") && bound.size > 0 && bound[bound.size - 1] == 62) {
+                    this.position = this.position + 1
+                    parameters.append(parameter)
+                    return parameters
+                }
+            }
+            parameters.append(parameter)
+            if (!this.consume(",")) open = false
+        }
+        this.expect(">")
+        parameters
+    }
+
     fun typedEmptyEnd(): int {
         if (!this.atWord("array") && !this.atWord("Map")) return -1
         var index = this.position + 1
@@ -1529,7 +1614,26 @@ class BootstrapParser(
         var expression = initial
         var more = true
         while (more) {
-            if (this.at("(")) {
+            val typeArgumentsClose = if (this.at("<") &&
+                (expression.kind == "identifier" || expression.kind == "member"))
+                this.typeArgumentsEnd() else -1
+            if (typeArgumentsClose >= 0) {
+                // `first<int>(xs)`, `Box<int>(1)`, `xs.map<string> { … }`:
+                // the type arguments stay in the callee's spelling
+                // (`first<int>`), which generics.ab resolves.
+                var typeArguments = ""
+                while (this.position <= typeArgumentsClose) {
+                    typeArguments = "$typeArguments${bootstrapTokenText(this.source, this.tokens[this.position])}"
+                    this.position = this.position + 1
+                }
+                expression = BootstrapExpression(
+                    expression.kind,
+                    "${expression.text}$typeArguments",
+                    expression.begin,
+                    this.tokens[typeArgumentsClose].end,
+                    expression.children
+                )
+            } else if (this.at("(")) {
                 val arguments: array<BootstrapExpression> = []
                 this.position = this.position + 1
                 this.skipSeparators()
@@ -2238,10 +2342,8 @@ class BootstrapParser(
         if (this.atWord("type")) kind = "type"
         this.position = this.position + 1
         // `fun <T> first(…)`: a generic function.
-        if (kind == "fun" && this.at("<")) {
-            this.failReserved("a generic function (`fun <T>`)")
-            this.skipAngleGroup()
-        }
+        var typeParameters: array<string> = []
+        if (kind == "fun" && this.at("<")) typeParameters = this.parseTypeParameters()
         var nameToken = this.tokens[this.position]
         this.expect("identifier")
         var declarationName = bootstrapTokenText(this.source, nameToken)
@@ -2351,8 +2453,9 @@ class BootstrapParser(
             }
             else if (this.at("{")) expression = this.parseBlock()
         } else if (kind == "class" || kind == "interface") {
-            // `class Box<T>`: a generic class or interface.
-            if (this.at("<")) {
+            // `class Box<T>`: a generic class. A generic interface is reserved.
+            if (this.at("<") && kind == "class") typeParameters = this.parseTypeParameters()
+            else if (this.at("<")) {
                 this.failReserved("a generic ${kind} (`$kind ${declarationName}<T>`)")
                 this.skipAngleGroup()
             }
@@ -2460,7 +2563,10 @@ class BootstrapParser(
             [],
             [],
             this.sourceIdentity,
-            conformances
+            conformances,
+            false,
+            false,
+            typeParameters
         )
     }
 
@@ -2550,7 +2656,8 @@ class BootstrapParser(
             declaration.sourceIdentity,
             declaration.conformances,
             declaration.isSealed,
-            declaration.isPrivate
+            declaration.isPrivate,
+            declaration.typeParameters
         )
     }
 
@@ -2589,7 +2696,8 @@ class BootstrapParser(
             declaration.sourceIdentity,
             declaration.conformances,
             declaration.isSealed,
-            declaration.isPrivate
+            declaration.isPrivate,
+            declaration.typeParameters
         )
     }
 
@@ -2628,7 +2736,8 @@ class BootstrapParser(
             declaration.sourceIdentity,
             declaration.conformances,
             declaration.isSealed,
-            declaration.isPrivate
+            declaration.isPrivate,
+            declaration.typeParameters
         )
     }
 
@@ -2669,7 +2778,8 @@ class BootstrapParser(
             declaration.sourceIdentity,
             declaration.conformances,
             declaration.isSealed,
-            declaration.isPrivate
+            declaration.isPrivate,
+            declaration.typeParameters
         )
     }
 
@@ -2708,7 +2818,8 @@ class BootstrapParser(
             declaration.sourceIdentity,
             declaration.conformances,
             declaration.isSealed,
-            declaration.isPrivate
+            declaration.isPrivate,
+            declaration.typeParameters
         )
     }
 
@@ -2755,7 +2866,8 @@ class BootstrapParser(
             declaration.sourceIdentity,
             declaration.conformances,
             declaration.isSealed,
-            declaration.isPrivate
+            declaration.isPrivate,
+            declaration.typeParameters
         )
     }
 
@@ -2859,7 +2971,8 @@ class BootstrapParser(
             declaration.sourceIdentity,
             declaration.conformances,
             declaration.isSealed,
-            declaration.isPrivate
+            declaration.isPrivate,
+            declaration.typeParameters
         )
     }
 
@@ -3007,7 +3120,8 @@ fun bootstrapAppendExtensionFieldDefaults(var declarations: array<BootstrapDecla
                 [],
                 [],
                 [],
-                field.sourceIdentity
+                field.sourceIdentity,
+                field.typeParameters
             ))
         }
         index = index + 1

@@ -720,10 +720,9 @@ closure does with its captures
 ([ownership.md](ownership.md#closures-and-ownership)). Generic arguments are
 written `Type<A, B>`.
 
-Only the built-in types take type arguments (`array`, `Map`, `Task`,
-`Shared`, the `Fn` family and the others listed above). A program can't
-declare its own generic functions or classes: `fun <T> first(...)` and
-`class Box<T>(...)` are parse errors until generics land.
+Besides the built-in types (`array`, `Map`, `Task`, `Shared`, the `Fn`
+family and the others listed above), a program's own generic classes take
+type arguments: `Box<int>` ([generics](#generics)).
 
 ### `void` and `never`
 
@@ -1660,6 +1659,104 @@ fun main {
 - Overloads are resolved before code generation, so they cost nothing at run
   time. Named arguments and function references don't choose between
   overloads.
+
+## Generics
+
+A function, an extension function or a class may take type parameters,
+written `<T>` (several: `<K, V>`) before a function's name or after a
+class's:
+
+```abla
+import "abla/io"
+
+class Box<T>(val value: T) {
+    fun get(): T = this.value
+}
+
+class Pair<A, B>(val first: A, val second: B)
+
+fun <T> first(items: array<T>): T = items[0]
+
+fun <T, R> array<T>.mapped(f: (T) -> R): array<R> {
+    val out: array<R> = []
+    for (item in this) out.append(f(item))
+    out
+}
+
+fun <K, V> Map<K, V>.valueOr(key: K, fallback: V): V {
+    val found = this.get(key)
+    if (found != null) found else fallback
+}
+
+fun main {
+    println("${first([3, 4])} ${first(["a", "b"])}")   // T is int, then string
+    val words = [1, 2].mapped { n -> "n$n" }           // R is string, from the lambda
+    println(words[1])
+    val box = Box(7)                                   // a Box<int>
+    val small: Box<u8> = Box(200)                      // T from the expected type
+    println("${box.get() + 1} ${small.get()}")
+    val ages: Map<string, int> = Map()
+    ages.set("ada", 36)
+    println("${ages.valueOr("ada", 0)} ${ages.valueOr("bob", -1)}")
+    println(Pair("x", 2.5).first)
+    println("${first<int>([9])} ${Box<string>("written").get()}")
+}
+// output:
+// 3 a
+// n2
+// 8 200
+// 36 -1
+// x
+// 9 written
+```
+
+- **Type arguments are inferred** from a call's arguments (an extension's
+  from its receiver too) and from the type expected of the call's result (a
+  typed local's initializer, a returned value), never across statements. A
+  lambda argument's parameters take their types from what is inferred
+  before it, and its result can bind a type parameter (`R` above). They may
+  be written out: `first<int>(xs)`, `Box<int>(1)`. A type parameter nothing
+  binds is `generic.cannot-infer:<f>:<T>`, the wrong number written out is
+  `generic.arity:<f>:<expected>:<written>`.
+- **Monomorphized.** Each use names one copy of the generic for its type
+  arguments (an instance): `Box<int>` and `Box<string>` are two classes,
+  each compiled as if written out, so a call costs what a call of an
+  ordinary function costs. Every module that uses `Box<int>` uses the same
+  copy. A generic no code uses produces no code.
+- **The body is checked once**, with each type parameter a type that has
+  nothing but what every type has (`==`, being passed and stored). Calling
+  a method or reading a field of a `T` is an error at the generic
+  (`member:T.size`). Bounds that let a body call an interface's methods
+  (`<T : Shape>`) come with interfaces; until then they are
+  `generic.bound-not-supported`.
+- **Each instance is checked too**, with its own types. Ownership follows
+  the type arguments: an instance holding a resource is a resource
+  (`Box<Ticket>` is one, `Box<int>` is not), and an error that only an
+  instance has names it (`context[generic-instance]: twice<Ticket>`).
+  Every method of a generic class is part of each instance, so a method
+  that copies a field of type `T` (`fun get(): T = this.value`) keeps that
+  class from holding a resource. `own value: T` owns a resource argument
+  and copies any other.
+- **Defaults and delegates** are filled in with each call's type
+  arguments: with `fun <T> boxedOr(value: T, box: Box<T> = Box(value))`,
+  `boxedOr(1)` makes a `Box<int>` and `boxedOr("s")` a `Box<string>`. A
+  generic class's property may be delegated (`var value: T by Slot(start)`),
+  and its delegate is the instance its type arguments name.
+- **Names in a generic's body** resolve where the generic is written, in
+  every instance: its module's `private` declarations and, in a
+  strict-imports package, its module's imports, whichever module uses it. A
+  `private` generic is its module's alone (`name.private`), and another
+  module's public generic of the same name is another generic.
+- **Invariant.** `Box<Square>` is not a `Box<Shape>`.
+- A generic whose instances make ever larger instances (`deep(Box(x))` in
+  `deep`) is `generic.instantiation-depth:<f>`. A generic function may not
+  share its name with another function (`generic.overload:<f>`), a class's
+  methods take no type parameters of their own
+  (`generic.method-not-supported`), and a generic function is called, not
+  passed as a value (`generic.reference:<f>`). Generic interfaces (`interface Source<T>`) and
+  `where` clauses are reserved syntax.
+- **At compile time** generics behave as at run time: `#first([1, 2])`
+  evaluates the instance the call names.
 
 ## Expressions and operators
 

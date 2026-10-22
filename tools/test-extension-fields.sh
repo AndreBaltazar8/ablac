@@ -67,6 +67,6 @@ rejected invalid field.extension-default:Point.missing field.extension-owner:int
     { echo "extension fields: a duplicate reported more than once"; exit 1; }
 rejected invalid-resource field.extension-resource:Plain.t
 rejected reserved E_PARSE_NOT_YET_SUPPORTED
-[[ $(grep -c 'E_PARSE_NOT_YET_SUPPORTED' "$output_directory/reserved.err") == 5 ]] ||
+[[ $(grep -c 'E_PARSE_NOT_YET_SUPPORTED' "$output_directory/reserved.err") == 4 ]] ||
     { echo "extension fields: reserved syntax:"; cat "$output_directory/reserved.err"; exit 1; }
 echo "extension fields: reads, writes, defaults, mutations, val, modules, drops, # (both tiers), compiler API, diagnostics, reserved syntax"
