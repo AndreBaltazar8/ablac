@@ -95,7 +95,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 |---|---|---|---|
 | `abla/text`, `abla/bytes`, `abla/float/text` | [stdlib/text.md](stdlib/text.md) | good | string-helpers, text-unicode, bytes, floating-text |
 | `abla/io`, `abla/fs`, `abla/process/*` | [stdlib/system.md](stdlib/system.md) | good | portable-buffered-io, filesystem, fs-tree, process-capture, process-environment, process-exit |
-| `abla/core`, `abla/math`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` | [stdlib/numbers.md](stdlib/numbers.md) | good | floating-math, stdlib, bits (`abla/integer`: none) |
+| `abla/core`, `abla/math`, `abla/math/v8`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` | [stdlib/numbers.md](stdlib/numbers.md) | good | floating-math, stdlib, bits, math-v8 (`abla/integer`: none) |
 | `abla/crypto`, `abla/date` | [stdlib/security-and-dates.md](stdlib/security-and-dates.md) | good | crypto, date |
 | `abla/test`, `ablac test` | [stdlib/testing.md](stdlib/testing.md) | good | test-ablac-test |
 | `abla/json`, `abla/http/json` | [json.md](json.md) | good | json-subparser, json-expressions, runtime-json, test-json-limits |

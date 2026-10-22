@@ -11,7 +11,7 @@ carry them.
 |---|---|
 | [Text, bytes and number formatting](stdlib/text.md) | `abla/text`, `abla/bytes`, `abla/float/text` |
 | [Console, files, processes and time](stdlib/system.md) | `abla/io`, `abla/fs`, `abla/process/*` |
-| [Numbers, bits and randomness](stdlib/numbers.md) | `abla/core`, `abla/math`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` |
+| [Numbers, bits and randomness](stdlib/numbers.md) | `abla/core`, `abla/math`, `abla/math/v8`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` |
 | [Hashing, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/date` |
 | [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
 | [JSON](json.md) | `abla/json`, `abla/http/json`, `$json` |
@@ -28,6 +28,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 |---|---|
 | `abla/core` | `int.abs()`, `int.sign()` |
 | `abla/math` | numeric algorithms: integer `min`/`max`/`clamp`, `f64` functions and constants |
+| `abla/math/v8` | `abla/math`'s declarations with the results of V8's `Math` (Node 22, x86-64), bit for bit |
 | `abla/float` | `f64`/`f32` conversions and bit patterns |
 | `abla/float/text` | shortest round-trip `f64` text and parsing; needed to interpolate floats |
 | `abla/integer` | exact integer intrinsics (`u32.countLeadingZeros()`) |

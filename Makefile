@@ -251,6 +251,7 @@ test: ablac
 	tools/test-frame-closures.sh $(COMPILER)
 	tools/test-wasm-mvc-extension.sh $(COMPILER)
 	tools/test-initializer-evaluation.sh $(COMPILER)
+	tools/test-math-v8.sh $(COMPILER)
 
 check: test self-rebuild
 

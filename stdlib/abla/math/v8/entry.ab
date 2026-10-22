@@ -1,0 +1,1103 @@
+// abla/math with the results of V8's Math as Node 22 gives them on x86-64: the
+// same declarations as abla/math, so a program switches between the two by its
+// import alone. The functions below are hand ports of V8's src/base/ieee754.cc
+// (fdlibm 5.3 as V8 modified it) and of its Math.min, Math.max and Math.hypot
+// builtins, built from +, -, *, / and exact operations, so native, Wasm and
+// compile-time evaluation give the same bits. Where JavaScript and abla/math
+// disagree (pow of ±1 and NaN, NaN and -0 in fmin/fmax, hypot of an infinity
+// and a NaN), this module answers as JavaScript does.
+
+import "abla/float"
+
+fun min(left: int, right: int): int = if (left < right) left else right
+
+fun max(left: int, right: int): int = if (left > right) left else right
+
+fun clamp(value: int, minimum: int, maximum: int): int {
+    val lower = if (value < minimum) minimum else value
+    if (lower > maximum) maximum else lower
+}
+
+// --- f64 ----------------------------------------------------------------------
+
+noescape extern:"intrinsic" fun ablaF64Sqrt(value: f64): f64
+noescape extern:"intrinsic" fun ablaF64Floor(value: f64): f64
+noescape extern:"intrinsic" fun ablaF64Ceil(value: f64): f64
+noescape extern:"intrinsic" fun ablaF64Trunc(value: f64): f64
+noescape extern:"intrinsic" fun ablaF64Abs(value: f64): f64
+noescape extern:"intrinsic" fun ablaF64RoundEven(value: f64): f64
+
+// pi (Math.PI)
+val mathPi: f64 = f64FromBits(0x400921FB54442D18)
+// pi / 2
+val mathHalfPi: f64 = f64FromBits(0x3FF921FB54442D18)
+// pi / 4
+val mathQuarterPi: f64 = f64FromBits(0x3FE921FB54442D18)
+// 2 pi
+val mathTau: f64 = f64FromBits(0x401921FB54442D18)
+// e (Math.E)
+val mathE: f64 = f64FromBits(0x4005BF0A8B145769)
+// ln 2 (Math.LN2)
+val mathLn2: f64 = f64FromBits(0x3FE62E42FEFA39EF)
+
+// Exact in IEEE-754, and so in JavaScript too.
+fun sqrt(value: f64): f64 = ablaF64Sqrt(value)
+fun floor(value: f64): f64 = ablaF64Floor(value)
+fun ceil(value: f64): f64 = ablaF64Ceil(value)
+fun trunc(value: f64): f64 = ablaF64Trunc(value)
+fun fabs(value: f64): f64 = ablaF64Abs(value)
+/** Round half to even (IEEE roundTiesToEven), e.g. 2.5 -> 2.0, 3.5 -> 4.0. */
+fun roundEven(value: f64): f64 = ablaF64RoundEven(value)
+
+fun isNaN(value: f64): bool = value != value
+fun isFinite(value: f64): bool = value - value == 0.0
+
+/** Math.min(left, right): NaN if either is NaN, and -0 below +0. */
+fun fmin(left: f64, right: f64): f64 {
+    if (left < right) return left
+    if (right < left) return right
+    if (left == right) return if (f64ToBits(left) < 0) left else right
+    left + right
+}
+
+/** Math.max(left, right): NaN if either is NaN, and +0 above -0. */
+fun fmax(left: f64, right: f64): f64 {
+    if (left > right) return left
+    if (right > left) return right
+    if (left == right) return if (f64ToBits(left) < 0) right else left
+    left + right
+}
+
+fun fclamp(value: f64, minimum: f64, maximum: f64): f64 {
+    val lower = if (value < minimum) minimum else value
+    if (lower > maximum) maximum else lower
+}
+fun lerp(from: f64, to: f64, t: f64): f64 = from + (to - from) * t
+
+/** Math.hypot(x, y): scaled by the larger magnitude, so it neither overflows
+ *  nor underflows early; an infinity wins over a NaN. */
+fun hypot(x: f64, y: f64): f64 {
+    var biggest = 0.0
+    var anyNaN = false
+    var ax = 0.0
+    var ay = 0.0
+    if (isNaN(x)) anyNaN = true
+    else {
+        ax = fabs(x)
+        if (ax > biggest) biggest = ax
+    }
+    if (isNaN(y)) anyNaN = true
+    else {
+        ay = fabs(y)
+        if (ay > biggest) biggest = ay
+    }
+    if (biggest == 1.0 / 0.0) return biggest
+    if (anyNaN) return 0.0 / 0.0
+    if (biggest == 0.0) return 0.0
+    // Kahan summation of the squares of the normalized magnitudes.
+    var sum = 0.0
+    var compensation = 0.0
+    var n = ax / biggest
+    var summand = n * n - compensation
+    var preliminary = sum + summand
+    compensation = (preliminary - sum) - summand
+    sum = preliminary
+    n = ay / biggest
+    summand = n * n - compensation
+    preliminary = sum + summand
+    sum = preliminary
+    sqrt(sum) * biggest
+}
+
+// --- words ----------------------------------------------------------------------
+// fdlibm reads a double as two 32-bit words. Here a high word is kept as the
+// sign-extended int32 the C code holds, and a low word as the uint32.
+
+@inline
+fun __v8High(value: f64): int = f64ToBits(value) >> 32
+
+@inline
+fun __v8Low(value: f64): int = f64ToBits(value) & 0xffffffff
+
+// The f64 whose high and low 32-bit words are these.
+fun __v8Words(high: int, low: int): f64 =
+    f64FromBits(((high & 0xffffffff) << 32) | (low & 0xffffffff))
+
+// `value` with its low 32 bits cleared (SET_LOW_WORD(value, 0)).
+fun __v8ClearLow(value: f64): f64 =
+    f64FromBits(f64ToBits(value) & -4294967296)
+
+// 1e300 and 1e-300: squared, an overflow to infinity and an underflow to zero.
+val __v8Huge: f64 = f64FromBits(0x7E37E43C8800759C)
+val __v8Tiny: f64 = f64FromBits(0x01A56E1FC2F8F359)
+// 2^54 and 2^-54
+val __v8Two54: f64 = f64FromBits(0x4350000000000000)
+val __v8TwoM54: f64 = f64FromBits(0x3C90000000000000)
+
+// x · 2^n, rounded once (C's scalbn, as glibc rounds it).
+fun __v8Scalbn(value: f64, n: int): f64 {
+    var x = value
+    var hx = __v8High(x)
+    var k = (hx & 0x7ff00000) >> 20
+    if (k == 0) {
+        if (((hx & 0x7fffffff) | __v8Low(x)) == 0) return x
+        x = x * __v8Two54
+        hx = __v8High(x)
+        k = ((hx & 0x7ff00000) >> 20) - 54
+    }
+    if (k == 0x7ff) return x + x
+    k = k + n
+    if (k > 0x7fe) return __v8Huge * (if (hx < 0) -__v8Huge else __v8Huge)
+    if (k > 0) return __v8Words((hx & 0x800fffff) | (k << 20), __v8Low(x))
+    if (k <= -54) {
+        if (n > 50000) return __v8Huge * (if (hx < 0) -__v8Huge else __v8Huge)
+        return __v8Tiny * (if (hx < 0) -__v8Tiny else __v8Tiny)
+    }
+    __v8Words((hx & 0x800fffff) | ((k + 54) << 20), __v8Low(x)) * __v8TwoM54
+}
+
+// --- trigonometry -----------------------------------------------------------
+
+// 396 hex digits of 2/pi, 24 bits per entry.
+val __v8TwoOverPi: array<int> = [
+    0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62, 0x95993C,
+    0x439041, 0xFE5163, 0xABDEBB, 0xC561B7, 0x246E3A, 0x424DD2, 0xE00649,
+    0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129, 0xA73EE8, 0x8235F5, 0x2EBB44,
+    0x84E99C, 0x7026B4, 0x5F7E41, 0x3991D6, 0x398353, 0x39F49C, 0x845F8B,
+    0xBDF928, 0x3B1FF8, 0x97FFDE, 0x05980F, 0xEF2F11, 0x8B5A0A, 0x6D1F6D,
+    0x367ECF, 0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5,
+    0xF17B3D, 0x0739F7, 0x8A5292, 0xEA6BFB, 0x5FB11F, 0x8D5D08, 0x560330,
+    0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3, 0x91615E, 0xE61B08,
+    0x659985, 0x5F14A0, 0x68408D, 0xFFD880, 0x4D7327, 0x310606, 0x1556CA,
+    0x73A8C9, 0x60E27B, 0xC08C6B
+]
+
+// The high words of n · pi/2 for n = 1 .. 32.
+val __v8Npio2Hw: array<int> = [
+    0x3FF921FB, 0x400921FB, 0x4012D97C, 0x401921FB, 0x401F6A7A, 0x4022D97C,
+    0x4025FDBB, 0x402921FB, 0x402C463A, 0x402F6A7A, 0x4031475C, 0x4032D97C,
+    0x40346B9C, 0x4035FDBB, 0x40378FDB, 0x403921FB, 0x403AB41B, 0x403C463A,
+    0x403DD85A, 0x403F6A7A, 0x40407E4C, 0x4041475C, 0x4042106C, 0x4042D97C,
+    0x4043A28C, 0x40446B9C, 0x404534AC, 0x4045FDBB, 0x4046C6CB, 0x40478FDB,
+    0x404858EB, 0x404921FB
+]
+
+// pi/2 in 24-bit pieces.
+val __v8PIo2: array<f64> = [
+    f64FromBits(0x3FF921FB40000000), f64FromBits(0x3E74442D00000000),
+    f64FromBits(0x3CF8469880000000), f64FromBits(0x3B78CC5160000000),
+    f64FromBits(0x39F01B8380000000), f64FromBits(0x387A252040000000),
+    f64FromBits(0x36E3822280000000), f64FromBits(0x3569F31D00000000)
+]
+
+// 53 bits of 2/pi
+val __v8InvPio2: f64 = f64FromBits(0x3FE45F306DC9C883)
+// first 33 bits of pi/2
+val __v8Pio2_1: f64 = f64FromBits(0x3FF921FB54400000)
+// pi/2 - __v8Pio2_1
+val __v8Pio2_1t: f64 = f64FromBits(0x3DD0B4611A626331)
+// second 33 bits of pi/2
+val __v8Pio2_2: f64 = f64FromBits(0x3DD0B4611A600000)
+// pi/2 - (__v8Pio2_1 + __v8Pio2_2)
+val __v8Pio2_2t: f64 = f64FromBits(0x3BA3198A2E037073)
+// third 33 bits of pi/2
+val __v8Pio2_3: f64 = f64FromBits(0x3BA3198A2E000000)
+// pi/2 - (__v8Pio2_1 + __v8Pio2_2 + __v8Pio2_3)
+val __v8Pio2_3t: f64 = f64FromBits(0x397B839A252049C1)
+// 2^24 and 2^-24
+val __v8Two24: f64 = f64FromBits(0x4170000000000000)
+val __v8TwoM24: f64 = f64FromBits(0x3E70000000000000)
+
+// The remainder of a large x (|x| > 2^19 · pi/2, finite) rem pi/2, from
+// __ieee754_rem_pio2: sets reduced[0] + reduced[1] and returns the quadrant
+// count n.
+fun __v8RemPio2Large(x: f64, var reduced: array<f64>): int {
+    val hx = __v8High(x)
+    val ix = hx & 0x7fffffff
+    // z = scalbn(|x|, ilogb(x) - 23), cut into 24-bit pieces
+    val e0 = (ix >> 20) - 1046
+    var z = __v8Words(ix - (e0 << 20), __v8Low(x))
+    val tx: array<f64> = filledArray(3, 0.0)
+    var i = 0
+    while (i < 2) {
+        tx[i] = f64FromInt(f64ToInt(z))
+        z = (z - tx[i]) * __v8Two24
+        i += 1
+    }
+    tx[2] = z
+    var nx = 3
+    while (tx[nx - 1] == 0.0) nx -= 1
+    val n = __v8KernelRemPio2(tx, reduced, e0, nx)
+    if (hx < 0) {
+        reduced[0] = -reduced[0]
+        reduced[1] = -reduced[1]
+        return -n
+    }
+    n
+}
+
+// __kernel_rem_pio2 for prec = 2 (53-bit doubles, a two-part result): the
+// remainder of the large x whose 24-bit pieces are x[0 .. nx - 1], scaled by
+// 2^e0, modulo pi/2.
+fun __v8KernelRemPio2(x: array<f64>, var y: array<f64>, e0: int, nx: int): int {
+    val jk = 4
+    val jp = jk
+    val f: array<f64> = filledArray(20, 0.0)
+    val q: array<f64> = filledArray(20, 0.0)
+    val fq: array<f64> = filledArray(20, 0.0)
+    val iq: array<int> = filledArray(20, 0)
+    // jx, jv, q0 (q0 < 3)
+    val jx = nx - 1
+    var jv = (e0 - 3) / 24
+    if (jv < 0) jv = 0
+    var q0 = e0 - 24 * (jv + 1)
+    // f[0 .. jx + jk], where f[jx + jk] = ipio2[jv + jk]
+    var j = jv - jx
+    val m = jx + jk
+    var i = 0
+    while (i <= m) {
+        f[i] = if (j < 0) 0.0 else f64FromInt(__v8TwoOverPi[j])
+        i += 1
+        j += 1
+    }
+    // q[0 .. jk]
+    i = 0
+    while (i <= jk) {
+        var fw = 0.0
+        j = 0
+        while (j <= jx) {
+            fw = fw + x[j] * f[jx + i - j]
+            j += 1
+        }
+        q[i] = fw
+        i += 1
+    }
+    var jz = jk
+    var n = 0
+    var ih = 0
+    var z = 0.0
+    var recompute = true
+    while (recompute) {
+        recompute = false
+        // distill q[] into iq[], reversed
+        i = 0
+        j = jz
+        z = q[jz]
+        while (j > 0) {
+            val fw = f64FromInt(f64ToInt(__v8TwoM24 * z))
+            iq[i] = f64ToInt(z - __v8Two24 * fw)
+            z = q[j - 1] + fw
+            i += 1
+            j -= 1
+        }
+        // n
+        z = __v8Scalbn(z, q0)
+        z = z - 8.0 * floor(z * 0.125)
+        n = f64ToInt(z)
+        z = z - f64FromInt(n)
+        ih = 0
+        if (q0 > 0) {
+            // iq[jz - 1] decides n
+            i = iq[jz - 1] >> (24 - q0)
+            n = n + i
+            iq[jz - 1] = iq[jz - 1] - (i << (24 - q0))
+            ih = iq[jz - 1] >> (23 - q0)
+        } else if (q0 == 0) {
+            ih = iq[jz - 1] >> 23
+        } else if (z >= 0.5) {
+            ih = 2
+        }
+        if (ih > 0) {
+            // q > 0.5
+            n = n + 1
+            var carry = 0
+            i = 0
+            while (i < jz) {
+                // 1 - q
+                j = iq[i]
+                if (carry == 0) {
+                    if (j != 0) {
+                        carry = 1
+                        iq[i] = 0x1000000 - j
+                    }
+                } else {
+                    iq[i] = 0xFFFFFF - j
+                }
+                i += 1
+            }
+            if (q0 == 1) iq[jz - 1] = iq[jz - 1] & 0x7FFFFF
+            else if (q0 == 2) iq[jz - 1] = iq[jz - 1] & 0x3FFFFF
+            if (ih == 2) {
+                z = 1.0 - z
+                if (carry != 0) z = z - __v8Scalbn(1.0, q0)
+            }
+        }
+        // recompute when the result cancelled
+        if (z == 0.0) {
+            j = 0
+            i = jz - 1
+            while (i >= jk) {
+                j = j | iq[i]
+                i -= 1
+            }
+            if (j == 0) {
+                // k = the number of terms needed
+                var k = 1
+                while (jk >= k && iq[jk - k] == 0) k += 1
+                i = jz + 1
+                while (i <= jz + k) {
+                    // add q[jz + 1] .. q[jz + k]
+                    f[jx + i] = f64FromInt(__v8TwoOverPi[jv + i])
+                    var fw = 0.0
+                    j = 0
+                    while (j <= jx) {
+                        fw = fw + x[j] * f[jx + i - j]
+                        j += 1
+                    }
+                    q[i] = fw
+                    i += 1
+                }
+                jz = jz + k
+                recompute = true
+            }
+        }
+    }
+    // chop off zero terms
+    if (z == 0.0) {
+        jz -= 1
+        q0 -= 24
+        while (iq[jz] == 0) {
+            jz -= 1
+            q0 -= 24
+        }
+    } else {
+        // break z into 24-bit pieces if needed
+        z = __v8Scalbn(z, 0 - q0)
+        if (z >= __v8Two24) {
+            val fw = f64FromInt(f64ToInt(__v8TwoM24 * z))
+            iq[jz] = f64ToInt(z - __v8Two24 * fw)
+            jz += 1
+            q0 += 24
+            iq[jz] = f64ToInt(fw)
+        } else {
+            iq[jz] = f64ToInt(z)
+        }
+    }
+    // the integer pieces as doubles
+    var fw = __v8Scalbn(1.0, q0)
+    i = jz
+    while (i >= 0) {
+        q[i] = fw * f64FromInt(iq[i])
+        fw = fw * __v8TwoM24
+        i -= 1
+    }
+    // PIo2[0 .. jp] · q[jz .. 0]
+    i = jz
+    while (i >= 0) {
+        fw = 0.0
+        var k = 0
+        while (k <= jp && k <= jz - i) {
+            fw = fw + __v8PIo2[k] * q[i + k]
+            k += 1
+        }
+        fq[jz - i] = fw
+        i -= 1
+    }
+    // compress fq[] into y[]
+    fw = 0.0
+    i = jz
+    while (i >= 0) {
+        fw = fw + fq[i]
+        i -= 1
+    }
+    y[0] = if (ih == 0) fw else -fw
+    fw = fq[0] - fw
+    i = 1
+    while (i <= jz) {
+        fw = fw + fq[i]
+        i += 1
+    }
+    y[1] = if (ih == 0) fw else -fw
+    n & 7
+}
+
+// cos kernel
+val __v8C1: f64 = f64FromBits(0x3FA555555555554C)
+val __v8C2: f64 = f64FromBits(0xBF56C16C16C15177)
+val __v8C3: f64 = f64FromBits(0x3EFA01A019CB1590)
+val __v8C4: f64 = f64FromBits(0xBE927E4F809C52AD)
+val __v8C5: f64 = f64FromBits(0x3E21EE9EBDB4B1C4)
+val __v8C6: f64 = f64FromBits(0xBDA8FAE9BE8838D4)
+// sin kernel
+val __v8S1: f64 = f64FromBits(0xBFC5555555555549)
+val __v8S2: f64 = f64FromBits(0x3F8111111110F8A6)
+val __v8S3: f64 = f64FromBits(0xBF2A01A019C161D5)
+val __v8S4: f64 = f64FromBits(0x3EC71DE357B1FE7D)
+val __v8S5: f64 = f64FromBits(0xBE5AE5E68A2B9CEB)
+val __v8S6: f64 = f64FromBits(0x3DE5D93A5ACFD57C)
+
+// cos(x + y) on [-pi/4, pi/4] (__kernel_cos).
+fun __v8KernelCos(x: f64, y: f64): f64 {
+    val ix = __v8High(x) & 0x7fffffff
+    if (ix < 0x3E400000) return 1.0 // |x| < 2^-27
+    val z = x * x
+    val r = z * (__v8C1 + z * (__v8C2 + z * (__v8C3 + z * (__v8C4 +
+        z * (__v8C5 + z * __v8C6)))))
+    if (ix < 0x3FD33333) return 1.0 - (0.5 * z - (z * r - x * y)) // |x| < 0.3
+    val qx = if (ix > 0x3FE90000) 0.28125 else __v8Words(ix - 0x00200000, 0)
+    val iz = 0.5 * z - qx
+    val a = 1.0 - qx
+    a - (iz - (z * r - x * y))
+}
+
+// sin(x + y) on [-pi/4, pi/4] (__kernel_sin); y is used when hasTail.
+fun __v8KernelSin(x: f64, y: f64, hasTail: bool): f64 {
+    val ix = __v8High(x) & 0x7fffffff
+    if (ix < 0x3E400000) return x // |x| < 2^-27
+    val z = x * x
+    val v = z * x
+    val r = __v8S2 + z * (__v8S3 + z * (__v8S4 + z * (__v8S5 + z * __v8S6)))
+    if (!hasTail) x + v * (__v8S1 + z * r)
+    else x - ((z * (0.5 * y - v * r) - y) - v * __v8S1)
+}
+
+// tan kernel
+val __v8T: array<f64> = [
+    f64FromBits(0x3FD5555555555563), f64FromBits(0x3FC111111110FE7A),
+    f64FromBits(0x3FABA1BA1BB341FE), f64FromBits(0x3F9664F48406D637),
+    f64FromBits(0x3F8226E3E96E8493), f64FromBits(0x3F6D6D22C9560328),
+    f64FromBits(0x3F57DBC8FEE08315), f64FromBits(0x3F4344D8F2F26501),
+    f64FromBits(0x3F3026F71A8D1068), f64FromBits(0x3F147E88A03792A6),
+    f64FromBits(0x3F12B80F32F0A7E9), f64FromBits(0xBEF375CBDB605373),
+    f64FromBits(0x3EFB2A7074BF7AD4)
+]
+// pi/4 and its tail
+val __v8Pio4: f64 = f64FromBits(0x3FE921FB54442D18)
+val __v8Pio4Lo: f64 = f64FromBits(0x3C81A62633145C07)
+
+// tan(x + y) (iy = 1) or -1 / tan(x + y) (iy = -1) on [-pi/4, pi/4]
+// (__kernel_tan).
+fun __v8KernelTan(value: f64, tail: f64, iy: int): f64 {
+    var x = value
+    var y = tail
+    val hx = __v8High(x)
+    val ix = hx & 0x7fffffff
+    if (ix < 0x3E300000) {
+        // |x| < 2^-28
+        if (((ix | __v8Low(x)) | (iy + 1)) == 0) return 1.0 / fabs(x)
+        if (iy == 1) return x
+        // -1 / (x + y), carefully
+        val w = x + y
+        val z = __v8ClearLow(w)
+        val v = y - (z - x)
+        val a = -1.0 / w
+        val t = __v8ClearLow(a)
+        val s = 1.0 + t * z
+        return t + a * (s + t * v)
+    }
+    if (ix >= 0x3FE59428) {
+        // |x| >= 0.6744
+        if (hx < 0) {
+            x = -x
+            y = -y
+        }
+        val z = __v8Pio4 - x
+        val w = __v8Pio4Lo - y
+        x = z + w
+        y = 0.0
+    }
+    val z = x * x
+    var w = z * z
+    // x^5 (T[1] + x^4 T[3] + ... + x^20 T[11]) +
+    // x^5 (x^2 (T[2] + x^4 T[4] + ... + x^22 T[12]))
+    var r = __v8T[1] + w * (__v8T[3] + w * (__v8T[5] + w * (__v8T[7] +
+        w * (__v8T[9] + w * __v8T[11]))))
+    var v = z * (__v8T[2] + w * (__v8T[4] + w * (__v8T[6] + w * (__v8T[8] +
+        w * (__v8T[10] + w * __v8T[12])))))
+    var s = z * x
+    r = y + z * (s * (r + v) + y)
+    r = r + __v8T[0] * s
+    w = x + r
+    if (ix >= 0x3FE59428) {
+        v = f64FromInt(iy)
+        return f64FromInt(1 - ((hx >> 30) & 2)) *
+            (v - 2.0 * (x - (w * w / (w + v) - r)))
+    }
+    if (iy == 1) return w
+    // -1 / (x + r), accurately
+    val zz = __v8ClearLow(w)
+    v = r - (zz - x)
+    val a = -1.0 / w
+    val t = __v8ClearLow(a)
+    s = 1.0 + t * zz
+    t + a * (s + t * v)
+}
+
+// sin (kind 0), cos (kind 1) or tan (kind 2) of y0 + y1 = x - n · pi/2.
+fun __v8TrigReduced(kind: int, n: int, y0: f64, y1: f64): f64 {
+    // tan: 1 when n is even, -1 when odd
+    if (kind == 2) return __v8KernelTan(y0, y1, 1 - ((n & 1) << 1))
+    val quadrant = (n + kind) & 3
+    if (quadrant == 0) __v8KernelSin(y0, y1, true)
+    else if (quadrant == 1) __v8KernelCos(y0, y1)
+    else if (quadrant == 2) -__v8KernelSin(y0, y1, true)
+    else -__v8KernelCos(y0, y1)
+}
+
+// sin (kind 0), cos (kind 1) or tan (kind 2) of x. The argument reduction is
+// __ieee754_rem_pio2's; up to 2^19 · pi/2 it allocates nothing, and beyond
+// that its scratch arrays live in a region.
+fun __v8Trig(x: f64, kind: int): f64 {
+    val hx = __v8High(x)
+    val ix = hx & 0x7fffffff
+    if (ix <= 0x3FE921FB) {
+        // |x| ~<= pi/4: no reduction
+        if (kind == 0) return __v8KernelSin(x, 0.0, false)
+        if (kind == 1) return __v8KernelCos(x, 0.0)
+        return __v8KernelTan(x, 0.0, 1)
+    }
+    if (ix >= 0x7FF00000) return x - x // inf or NaN -> NaN
+    if (ix < 0x4002D97C) {
+        // |x| < 3pi/4: n = ±1
+        if (hx > 0) {
+            var z = x - __v8Pio2_1
+            if (ix != 0x3FF921FB) {
+                // 33+53 bits of pi are enough
+                val y0 = z - __v8Pio2_1t
+                return __v8TrigReduced(kind, 1, y0, (z - y0) - __v8Pio2_1t)
+            }
+            // near pi/2: 33+33+53 bits of pi
+            z = z - __v8Pio2_2
+            val y0 = z - __v8Pio2_2t
+            return __v8TrigReduced(kind, 1, y0, (z - y0) - __v8Pio2_2t)
+        }
+        var z = x + __v8Pio2_1
+        if (ix != 0x3FF921FB) {
+            val y0 = z + __v8Pio2_1t
+            return __v8TrigReduced(kind, -1, y0, (z - y0) + __v8Pio2_1t)
+        }
+        z = z + __v8Pio2_2
+        val y0 = z + __v8Pio2_2t
+        return __v8TrigReduced(kind, -1, y0, (z - y0) + __v8Pio2_2t)
+    }
+    if (ix > 0x413921FB) {
+        // the large path
+        return region {
+            val reduced: array<f64> = filledArray(2, 0.0)
+            val n = __v8RemPio2Large(x, reduced)
+            __v8TrigReduced(kind, n, reduced[0], reduced[1])
+        }
+    }
+    // |x| ~<= 2^19 · pi/2: the medium path
+    val t = fabs(x)
+    val n = f64ToInt(t * __v8InvPio2 + 0.5)
+    val fn = f64FromInt(n)
+    var r = t - fn * __v8Pio2_1
+    var w = fn * __v8Pio2_1t
+    var y0 = r - w
+    if (n >= 32 || ix == __v8Npio2Hw[n - 1]) {
+        // cancellation is possible
+        val j = ix >> 20
+        var i = j - ((__v8High(y0) >> 20) & 0x7FF)
+        if (i > 16) {
+            // a second iteration, good to 118 bits
+            var t2 = r
+            w = fn * __v8Pio2_2
+            r = t2 - w
+            w = fn * __v8Pio2_2t - ((t2 - r) - w)
+            y0 = r - w
+            i = j - ((__v8High(y0) >> 20) & 0x7FF)
+            if (i > 49) {
+                // a third, 151 bits
+                t2 = r
+                w = fn * __v8Pio2_3
+                r = t2 - w
+                w = fn * __v8Pio2_3t - ((t2 - r) - w)
+                y0 = r - w
+            }
+        }
+    }
+    val y1 = (r - y0) - w
+    if (hx < 0) __v8TrigReduced(kind, -n, -y0, -y1)
+    else __v8TrigReduced(kind, n, y0, y1)
+}
+
+/** Math.sin(x). */
+fun sin(x: f64): f64 = __v8Trig(x, 0)
+
+/** Math.cos(x). */
+fun cos(x: f64): f64 = __v8Trig(x, 1)
+
+/** Math.tan(x). */
+fun tan(x: f64): f64 = __v8Trig(x, 2)
+
+// atan(0.5), atan(1), atan(1.5) and atan(inf): high and low parts
+val __v8AtanHi: array<f64> = [
+    f64FromBits(0x3FDDAC670561BB4F), f64FromBits(0x3FE921FB54442D18),
+    f64FromBits(0x3FEF730BD281F69B), f64FromBits(0x3FF921FB54442D18)
+]
+val __v8AtanLo: array<f64> = [
+    f64FromBits(0x3C7A2B7F222F65E2), f64FromBits(0x3C81A62633145C07),
+    f64FromBits(0x3C7007887AF0CBBD), f64FromBits(0x3C91A62633145C07)
+]
+// atan polynomial
+val __v8AT: array<f64> = [
+    f64FromBits(0x3FD555555555550D), f64FromBits(0xBFC999999998EBC4),
+    f64FromBits(0x3FC24924920083FF), f64FromBits(0xBFBC71C6FE231671),
+    f64FromBits(0x3FB745CDC54C206E), f64FromBits(0xBFB3B0F2AF749A6D),
+    f64FromBits(0x3FB10D66A0D03D51), f64FromBits(0xBFADDE2D52DEFD9A),
+    f64FromBits(0x3FA97B4B24760DEB), f64FromBits(0xBFA2B4442C6A6C2F),
+    f64FromBits(0x3F90AD3AE322DA11)
+]
+
+/** Math.atan(x). */
+fun atan(value: f64): f64 {
+    var x = value
+    val hx = __v8High(x)
+    val ix = hx & 0x7fffffff
+    if (ix >= 0x44100000) {
+        // |x| >= 2^66
+        if (ix > 0x7FF00000 || (ix == 0x7FF00000 && __v8Low(x) != 0)) return x + x
+        return if (hx > 0) __v8AtanHi[3] + __v8AtanLo[3]
+            else -__v8AtanHi[3] - __v8AtanLo[3]
+    }
+    var id = -1
+    if (ix < 0x3FDC0000) {
+        // |x| < 0.4375
+        if (ix < 0x3E400000) return x // |x| < 2^-27
+    } else {
+        x = fabs(x)
+        if (ix < 0x3FF30000) {
+            // |x| < 1.1875
+            if (ix < 0x3FE60000) {
+                // 7/16 <= |x| < 11/16
+                id = 0
+                x = (2.0 * x - 1.0) / (2.0 + x)
+            } else {
+                // 11/16 <= |x| < 19/16
+                id = 1
+                x = (x - 1.0) / (x + 1.0)
+            }
+        } else if (ix < 0x40038000) {
+            // |x| < 2.4375
+            id = 2
+            x = (x - 1.5) / (1.0 + 1.5 * x)
+        } else {
+            // 2.4375 <= |x| < 2^66
+            id = 3
+            x = -1.0 / x
+        }
+    }
+    val z = x * x
+    val w = z * z
+    val s1 = z * (__v8AT[0] + w * (__v8AT[2] + w * (__v8AT[4] + w * (__v8AT[6] +
+        w * (__v8AT[8] + w * __v8AT[10])))))
+    val s2 = w * (__v8AT[1] + w * (__v8AT[3] + w * (__v8AT[5] + w * (__v8AT[7] +
+        w * __v8AT[9]))))
+    if (id < 0) return x - x * (s1 + s2)
+    val result = __v8AtanHi[id] - ((x * (s1 + s2) - __v8AtanLo[id]) - x)
+    if (hx < 0) -result else result
+}
+
+// pi - mathPi
+val __v8PiLo: f64 = f64FromBits(0x3CA1A62633145C07)
+
+/** Math.atan2(y, x): the angle of the vector (x, y) from the +x axis. */
+fun atan2(y: f64, x: f64): f64 {
+    val hx = __v8High(x)
+    val lx = __v8Low(x)
+    val ix = hx & 0x7fffffff
+    val hy = __v8High(y)
+    val ly = __v8Low(y)
+    val iy = hy & 0x7fffffff
+    if ((ix | (if (lx != 0) 1 else 0)) > 0x7FF00000 ||
+        (iy | (if (ly != 0) 1 else 0)) > 0x7FF00000) return x + y // a NaN
+    if (((hx - 0x3FF00000) | lx) == 0) return atan(y) // x = 1
+    // 2 · sign(x) + sign(y)
+    var m = ((hy >> 31) & 1) | ((hx >> 30) & 2)
+    if ((iy | ly) == 0) {
+        // y = ±0
+        return if (m <= 1) y else if (m == 2) mathPi + __v8Tiny
+            else -mathPi - __v8Tiny
+    }
+    if ((ix | lx) == 0) {
+        // x = ±0
+        return if (hy < 0) -mathHalfPi - __v8Tiny else mathHalfPi + __v8Tiny
+    }
+    if (ix == 0x7FF00000) {
+        // x = ±inf
+        if (iy == 0x7FF00000) {
+            return if (m == 0) mathQuarterPi + __v8Tiny
+                else if (m == 1) -mathQuarterPi - __v8Tiny
+                else if (m == 2) 3.0 * mathQuarterPi + __v8Tiny
+                else -3.0 * mathQuarterPi - __v8Tiny
+        }
+        return if (m == 0) 0.0 else if (m == 1) -0.0
+            else if (m == 2) mathPi + __v8Tiny else -mathPi - __v8Tiny
+    }
+    if (iy == 0x7FF00000) {
+        // y = ±inf
+        return if (hy < 0) -mathHalfPi - __v8Tiny else mathHalfPi + __v8Tiny
+    }
+    // y / x
+    val k = (iy - ix) >> 20
+    var z = 0.0
+    if (k > 60) {
+        // |y / x| > 2^60
+        z = mathHalfPi + 0.5 * __v8PiLo
+        m = m & 1
+    } else if (hx < 0 && k < -60) {
+        // 0 > |y| / x > -2^-60
+        z = 0.0
+    } else z = atan(fabs(y / x))
+    if (m == 0) z
+    else if (m == 1) -z
+    else if (m == 2) mathPi - (z - __v8PiLo)
+    else (z - __v8PiLo) - mathPi
+}
+
+// --- exponential, logarithm, power -------------------------------------------
+
+// exp overflows above this (709.782712893384)
+val __v8ExpOverflow: f64 = f64FromBits(0x40862E42FEFA39EF)
+// exp underflows below this (-745.1332191019411)
+val __v8ExpUnderflow: f64 = f64FromBits(0xC0874910D52D3051)
+// ln 2, its high part (low 32 bits zero)
+val __v8Ln2Hi: f64 = f64FromBits(0x3FE62E42FEE00000)
+// ln 2 - __v8Ln2Hi
+val __v8Ln2Lo: f64 = f64FromBits(0x3DEA39EF35793C76)
+// 1 / ln 2
+val __v8InvLn2: f64 = f64FromBits(0x3FF71547652B82FE)
+// exp polynomial (also pow's)
+val __v8P1: f64 = f64FromBits(0x3FC555555555553E)
+val __v8P2: f64 = f64FromBits(0xBF66C16C16BEBD93)
+val __v8P3: f64 = f64FromBits(0x3F11566AAF25DE2C)
+val __v8P4: f64 = f64FromBits(0xBEBBBD41C5D26BF1)
+val __v8P5: f64 = f64FromBits(0x3E66376972BEA4D0)
+// 2^-1000 and 2^1023
+val __v8TwoM1000: f64 = f64FromBits(0x0170000000000000)
+val __v8Two1023: f64 = f64FromBits(0x7FE0000000000000)
+
+/** Math.exp(x). */
+fun exp(value: f64): f64 {
+    var x = value
+    val xsb = (__v8High(x) >> 31) & 1
+    val hx = __v8High(x) & 0x7fffffff
+    if (hx >= 0x40862E42) {
+        // |x| >= 709.78...
+        if (hx >= 0x7FF00000) {
+            if (((hx & 0xFFFFF) | __v8Low(x)) != 0) return x + x // NaN
+            return if (xsb == 0) x else 0.0 // exp(±inf) = inf, 0
+        }
+        if (x > __v8ExpOverflow) return __v8Huge * __v8Huge
+        if (x < __v8ExpUnderflow) return __v8TwoM1000 * __v8TwoM1000
+    }
+    var hi = 0.0
+    var lo = 0.0
+    var k = 0
+    if (hx > 0x3FD62E42) {
+        // |x| > ln2 / 2
+        if (hx < 0x3FF0A2B2) {
+            // and |x| < 1.5 ln2; the reduction below misses e's last bit
+            if (x == 1.0) return mathE
+            if (xsb == 0) {
+                hi = x - __v8Ln2Hi
+                lo = __v8Ln2Lo
+            } else {
+                hi = x + __v8Ln2Hi
+                lo = -__v8Ln2Lo
+            }
+            k = 1 - xsb - xsb
+        } else {
+            k = f64ToInt(__v8InvLn2 * x + (if (xsb == 0) 0.5 else -0.5))
+            val t = f64FromInt(k)
+            hi = x - t * __v8Ln2Hi
+            lo = t * __v8Ln2Lo
+        }
+        x = hi - lo
+    } else if (hx < 0x3E300000) {
+        // |x| < 2^-28
+        return 1.0 + x
+    }
+    val t = x * x
+    val twopk = if (k >= -1021) __v8Words(0x3FF00000 + (k << 20), 0)
+        else __v8Words(0x3FF00000 + ((k + 1000) << 20), 0)
+    val c = x - t * (__v8P1 + t * (__v8P2 + t * (__v8P3 + t * (__v8P4 + t * __v8P5))))
+    if (k == 0) return 1.0 - ((x * c) / (c - 2.0) - x)
+    val y = 1.0 - ((lo - (x * c) / (2.0 - c)) - hi)
+    if (k >= -1021) {
+        if (k == 1024) return y * 2.0 * __v8Two1023
+        return y * twopk
+    }
+    y * twopk * __v8TwoM1000
+}
+
+// log polynomial
+val __v8Lg1: f64 = f64FromBits(0x3FE5555555555593)
+val __v8Lg2: f64 = f64FromBits(0x3FD999999997FA04)
+val __v8Lg3: f64 = f64FromBits(0x3FD2492494229359)
+val __v8Lg4: f64 = f64FromBits(0x3FCC71C51D8E78AF)
+val __v8Lg5: f64 = f64FromBits(0x3FC7466496CB03DE)
+val __v8Lg6: f64 = f64FromBits(0x3FC39A09D078C69F)
+val __v8Lg7: f64 = f64FromBits(0x3FC2F112DF3E5244)
+// 1/3 (0.33333333333333333)
+val __v8Third: f64 = f64FromBits(0x3FD5555555555555)
+
+/** Math.log(x): the natural logarithm, -inf at ±0 and NaN below. */
+fun log(value: f64): f64 {
+    var x = value
+    var hx = __v8High(x)
+    var k = 0
+    if (hx < 0x00100000) {
+        // x < 2^-1022
+        if (((hx & 0x7fffffff) | __v8Low(x)) == 0) return -1.0 / 0.0 // log(±0)
+        if (hx < 0) return 0.0 / 0.0 // log(-x)
+        // subnormal: scale up
+        k = k - 54
+        x = x * __v8Two54
+        hx = __v8High(x)
+    }
+    if (hx >= 0x7FF00000) return x + x
+    k = k + (hx >> 20) - 1023
+    hx = hx & 0x000FFFFF
+    val i = (hx + 0x95F64) & 0x100000
+    // normalize x or x/2
+    x = __v8Words(hx | (i ^ 0x3FF00000), __v8Low(x))
+    k = k + (i >> 20)
+    val f = x - 1.0
+    if ((0x000FFFFF & (2 + hx)) < 3) {
+        // -2^-20 <= f < 2^-20
+        if (f == 0.0) {
+            if (k == 0) return 0.0
+            val dk = f64FromInt(k)
+            return dk * __v8Ln2Hi + dk * __v8Ln2Lo
+        }
+        val r = f * f * (0.5 - __v8Third * f)
+        if (k == 0) return f - r
+        val dk = f64FromInt(k)
+        return dk * __v8Ln2Hi - ((r - dk * __v8Ln2Lo) - f)
+    }
+    val s = f / (2.0 + f)
+    val dk = f64FromInt(k)
+    val z = s * s
+    val w = z * z
+    val t1 = w * (__v8Lg2 + w * (__v8Lg4 + w * __v8Lg6))
+    val t2 = z * (__v8Lg1 + w * (__v8Lg3 + w * (__v8Lg5 + w * __v8Lg7)))
+    val r = t2 + t1
+    if (((hx - 0x6147A) | (0x6B851 - hx)) > 0) {
+        val hfsq = 0.5 * f * f
+        if (k == 0) return f - (hfsq - s * (hfsq + r))
+        return dk * __v8Ln2Hi - ((hfsq - (s * (hfsq + r) + dk * __v8Ln2Lo)) - f)
+    }
+    if (k == 0) return f - s * (f - r)
+    dk * __v8Ln2Hi - ((s * (f - r) - dk * __v8Ln2Lo) - f)
+}
+
+// log2(1.5), its high part and the rest
+val __v8DpH: f64 = f64FromBits(0x3FE2B80340000000)
+val __v8DpL: f64 = f64FromBits(0x3E4CFDEB43CFD006)
+// 2^53
+val __v8Two53: f64 = f64FromBits(0x4340000000000000)
+// pow's log polynomial, (3/2)(log(x) - 2s - 2/3 s^3)
+val __v8L1: f64 = f64FromBits(0x3FE3333333333303)
+val __v8L2: f64 = f64FromBits(0x3FDB6DB6DB6FABFF)
+val __v8L3: f64 = f64FromBits(0x3FD55555518F264D)
+val __v8L4: f64 = f64FromBits(0x3FD17460A91D4101)
+val __v8L5: f64 = f64FromBits(0x3FCD864A93C9DB65)
+val __v8L6: f64 = f64FromBits(0x3FCA7E284A454EEF)
+// ln 2, its high 21 bits and the rest
+val __v8Lg2H: f64 = f64FromBits(0x3FE62E4300000000)
+val __v8Lg2L: f64 = f64FromBits(0xBE205C610CA86C39)
+// -(1024 - log2(overflow + 0.5 ulp))
+val __v8Ovt: f64 = f64FromBits(0x3C971547652B82FE)
+// 2 / (3 ln 2), as a float, and the rest
+val __v8Cp: f64 = f64FromBits(0x3FEEC709DC3A03FD)
+val __v8CpH: f64 = f64FromBits(0x3FEEC709E0000000)
+val __v8CpL: f64 = f64FromBits(0xBE3E2FE0145B01F5)
+// 1 / ln 2, its high 24 bits and the rest
+val __v8IvLn2H: f64 = f64FromBits(0x3FF7154760000000)
+val __v8IvLn2L: f64 = f64FromBits(0x3E54AE0BF85DDF44)
+
+/** Math.pow(x, y), as JavaScript defines it: pow(x, ±0) is 1 for every x,
+ *  a NaN anywhere else gives NaN, and so does pow(±1, ±inf). */
+fun pow(x: f64, y: f64): f64 {
+    val hx = __v8High(x)
+    val lx = __v8Low(x)
+    val hy = __v8High(y)
+    val ly = __v8Low(y)
+    var ix = hx & 0x7fffffff
+    val iy = hy & 0x7fffffff
+    // y = ±0
+    if ((iy | ly) == 0) return 1.0
+    // a NaN
+    if (ix > 0x7ff00000 || (ix == 0x7ff00000 && lx != 0) ||
+        iy > 0x7ff00000 || (iy == 0x7ff00000 && ly != 0)) return x + y
+    // for a negative x: 0 when y is not an integer, 1 when odd, 2 when even
+    var yisint = 0
+    if (hx < 0) {
+        if (iy >= 0x43400000) yisint = 2
+        else if (iy >= 0x3ff00000) {
+            val e = (iy >> 20) - 0x3ff
+            if (e > 20) {
+                val j = ly >> (52 - e)
+                if ((j << (52 - e)) == ly) yisint = 2 - (j & 1)
+            } else if (ly == 0) {
+                val j = iy >> (20 - e)
+                if ((j << (20 - e)) == iy) yisint = 2 - (j & 1)
+            }
+        }
+    }
+    if (ly == 0) {
+        if (iy == 0x7ff00000) {
+            // y = ±inf
+            if (((ix - 0x3ff00000) | lx) == 0) return y - y // (±1)^±inf is NaN
+            if (ix >= 0x3ff00000) return if (hy >= 0) y else 0.0
+            return if (hy < 0) -y else 0.0
+        }
+        if (iy == 0x3ff00000) return if (hy < 0) 1.0 / x else x // y = ±1
+        if (hy == 0x40000000) return x * x // y = 2
+        if (hy == 0x3fe00000 && hx >= 0) return sqrt(x) // y = 0.5, x >= +0
+    }
+    var ax = fabs(x)
+    if (lx == 0 && (ix == 0x7ff00000 || ix == 0 || ix == 0x3ff00000)) {
+        // x = ±0, ±inf or ±1
+        var z = ax
+        if (hy < 0) z = 1.0 / z
+        if (hx < 0) {
+            if (((ix - 0x3ff00000) | yisint) == 0) z = 0.0 / 0.0 // (-1)^non-integer
+            else if (yisint == 1) z = -z
+        }
+        return z
+    }
+    var n = (hx >> 31) + 1
+    // a negative x to a non-integer power
+    if ((n | yisint) == 0) return 0.0 / 0.0
+    // the sign of the result: negative for a negative x to an odd power
+    val s = if ((n | (yisint - 1)) == 0) -1.0 else 1.0
+    // log2(|x|) = t1 + t2
+    var t1 = 0.0
+    var t2 = 0.0
+    if (iy > 0x41e00000) {
+        // |y| > 2^31
+        if (iy > 0x43f00000) {
+            // |y| > 2^64: over- or underflows
+            if (ix <= 0x3fefffff) {
+                return if (hy < 0) __v8Huge * __v8Huge else __v8Tiny * __v8Tiny
+            }
+            if (ix >= 0x3ff00000) {
+                return if (hy > 0) __v8Huge * __v8Huge else __v8Tiny * __v8Tiny
+            }
+        }
+        // over- or underflows unless x is near 1
+        if (ix < 0x3fefffff) {
+            return if (hy < 0) s * __v8Huge * __v8Huge else s * __v8Tiny * __v8Tiny
+        }
+        if (ix > 0x3ff00000) {
+            return if (hy > 0) s * __v8Huge * __v8Huge else s * __v8Tiny * __v8Tiny
+        }
+        // |1 - x| <= 2^-20: log(x) by x - x^2/2 + x^3/3 - x^4/4
+        val t = ax - 1.0
+        val w = (t * t) * (0.5 - t * (__v8Third - t * 0.25))
+        val u = __v8IvLn2H * t
+        val v = t * __v8IvLn2L - w * __v8InvLn2
+        t1 = __v8ClearLow(u + v)
+        t2 = v - (t1 - u)
+    } else {
+        n = 0
+        if (ix < 0x00100000) {
+            // subnormal x
+            ax = ax * __v8Two53
+            n = n - 53
+            ix = __v8High(ax)
+        }
+        n = n + (ix >> 20) - 0x3ff
+        val j = ix & 0x000fffff
+        ix = j | 0x3ff00000
+        // |x| < sqrt(3/2): k = 0; < sqrt(3): k = 1; else halve it
+        var k = 0
+        if (j > 0x3988E) {
+            if (j < 0xBB67A) k = 1
+            else {
+                n = n + 1
+                ix = ix - 0x00100000
+            }
+        }
+        ax = __v8Words(ix, __v8Low(ax))
+        val bp = if (k == 0) 1.0 else 1.5
+        val dpH = if (k == 0) 0.0 else __v8DpH
+        val dpL = if (k == 0) 0.0 else __v8DpL
+        // ss = sH + sL = (x - 1) / (x + 1) or (x - 1.5) / (x + 1.5)
+        var u = ax - bp
+        var v = 1.0 / (ax + bp)
+        val ss = u * v
+        val sH = __v8ClearLow(ss)
+        // tH = ax + bp, its high part
+        var tH = __v8Words(((ix >> 1) | 0x20000000) + 0x00080000 + (k << 18), 0)
+        var tL = ax - (tH - bp)
+        val sL = v * ((u - sH * tH) - sH * tL)
+        // log(ax)
+        var s2 = ss * ss
+        var r = s2 * s2 * (__v8L1 + s2 * (__v8L2 + s2 * (__v8L3 + s2 * (__v8L4 +
+            s2 * (__v8L5 + s2 * __v8L6)))))
+        r = r + sL * (sH + ss)
+        s2 = sH * sH
+        tH = __v8ClearLow(3.0 + s2 + r)
+        tL = r - ((tH - 3.0) - s2)
+        // u + v = ss · (1 + ...)
+        u = sH * tH
+        v = sL * tH + tL * ss
+        // 2 / (3 log 2) · (ss + ...)
+        val pH = __v8ClearLow(u + v)
+        val pL = v - (pH - u)
+        val zH = __v8CpH * pH
+        val zL = __v8CpL * pH + pL * __v8Cp + dpL
+        // log2(ax) = n + dpH + zH + zL
+        val t = f64FromInt(n)
+        t1 = __v8ClearLow(((zH + zL) + dpH) + t)
+        t2 = zL - (((t1 - t) - dpH) - zH)
+    }
+    // (y1 + y2) · (t1 + t2), with y1 the high part of y
+    val y1 = __v8ClearLow(y)
+    val pL = (y - y1) * t1 + y * t2
+    var pH = y1 * t1
+    var z = pL + pH
+    var j = __v8High(z)
+    val i = __v8Low(z)
+    if (j >= 0x40900000) {
+        // z >= 1024
+        if (((j - 0x40900000) | i) != 0) return s * __v8Huge * __v8Huge
+        if (pL + __v8Ovt > z - pH) return s * __v8Huge * __v8Huge
+    } else if ((j & 0x7fffffff) >= 0x4090cc00) {
+        // z <= -1075
+        if ((((j & 0xffffffff) - 0xc090cc00) | i) != 0) return s * __v8Tiny * __v8Tiny
+        if (pL <= z - pH) return s * __v8Tiny * __v8Tiny
+    }
+    // 2^(pH + pL)
+    val ia = j & 0x7fffffff
+    var k = (ia >> 20) - 0x3ff
+    n = 0
+    if (ia > 0x3fe00000) {
+        // |z| > 0.5: n = [z + 0.5]
+        n = j + (0x00100000 >> (k + 1))
+        k = ((n & 0x7fffffff) >> 20) - 0x3ff
+        val t = __v8Words(n & ~(0x000fffff >> k), 0)
+        n = ((n & 0x000fffff) | 0x00100000) >> (20 - k)
+        if (j < 0) n = 0 - n
+        pH = pH - t
+    }
+    var t = __v8ClearLow(pL + pH)
+    val u = t * __v8Lg2H
+    val v = (pL - (t - pH)) * mathLn2 + t * __v8Lg2L
+    z = u + v
+    val w = v - (z - u)
+    t = z * z
+    t1 = z - t * (__v8P1 + t * (__v8P2 + t * (__v8P3 + t * (__v8P4 + t * __v8P5))))
+    // V8 divides by the whole ((t1 - 2) - (w + z w)), where fdlibm subtracts
+    // (w + z w) after the division.
+    val r = (z * t1) / ((t1 - 2.0) - (w + z * w))
+    z = 1.0 - (r - z)
+    j = __v8High(z) + (n << 20)
+    if ((j >> 20) <= 0) z = __v8Scalbn(z, n) // a subnormal result
+    else z = __v8Words(j, __v8Low(z))
+    s * z
+}

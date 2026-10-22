@@ -4,6 +4,7 @@
 |---|---|
 | `abla/core` | `int.abs`, `int.sign` |
 | `abla/math` | integer `min`/`max`/`clamp`; `f64` functions and constants |
+| `abla/math/v8` | the same declarations as `abla/math`, with the results of JavaScript's `Math` in V8 |
 | `abla/float` | conversions between integers and floats, and float bit patterns |
 | `abla/float/text` | float formatting and parsing ([text.md](text.md#ablafloattext-floats-as-text)) |
 | `abla/bits` | named bit operations (`bitAnd`, `bitShiftLeft`, ...) |
@@ -48,6 +49,64 @@ fun main {
 
 The functions are implemented in Abla, so results are bit-for-bit identical
 on every target and at compile time.
+
+## `abla/math/v8`
+
+`abla/math/v8` declares exactly what `abla/math` declares (every function with
+its parameter names and types, every constant), and computes the results
+Node 22's `Math` gives on x86-64: a program moves from one to the other by its
+import alone. Use it where Abla code must agree with JavaScript to the bit, such
+as a simulation that a browser replays in JavaScript.
+
+```abla
+import "abla/io"
+import "abla/float/text"
+import "abla/math" as correct
+import "abla/math/v8" as v8
+
+fun main {
+    val nan = 0.0 / 0.0
+    val inf = 1.0 / 0.0
+    println("${correct.pow(1.0, nan)} ${v8.pow(1.0, nan)} ${correct.pow(-1.0, inf)} ${v8.pow(-1.0, inf)}")
+    println("${correct.fmin(nan, 1.0)} ${v8.fmin(nan, 1.0)} ${1.0 / correct.fmin(-0.0, 0.0)} ${1.0 / v8.fmin(-0.0, 0.0)}")
+    println("${correct.hypot(inf, nan)} ${v8.hypot(inf, nan)} ${v8.hypot(1e300, 1e300)}")
+    println("${v8.sin(1e300)} ${v8.tan(1e10)} ${v8.pow(2.5, 3.1)}")
+}
+// output:
+// 1 NaN 1 NaN
+// 1 NaN Infinity -Infinity
+// NaN Infinity 1.4142135623730952e+300
+// -0.8178819121159085 -0.5583496378112418 17.12434728726902
+```
+
+- `sin`, `cos`, `tan`, `atan`, `atan2`, `exp`, `log` and `pow` are ports of
+  V8's `src/base/ieee754.cc` (fdlibm 5.3 as V8 changed it), the argument
+  reduction of huge angles included; `hypot` is V8's `Math.hypot` (scaled by
+  the larger magnitude, Kahan-summed), and `fmin`/`fmax` are `Math.min` and
+  `Math.max`. `sqrt`, `floor`, `ceil`, `trunc`, `fabs`, `isNaN` and `isFinite`
+  are exact in both modules, and the constants are the same values.
+- Where JavaScript and `abla/math` disagree, this module answers as JavaScript
+  does: `pow(1, NaN)` and `pow(±1, ±inf)` are NaN; `fmin` and `fmax` return NaN
+  when either argument is NaN and order -0 below +0; `hypot` of an infinity and
+  a NaN is infinity, and it doesn't overflow before its result does.
+- The functions without a JavaScript counterpart (`min`, `max`, `clamp`,
+  `fclamp`, `lerp`, `roundEven`) are `abla/math`'s.
+- The reference is Node 22 on x86-64, which runs V8's C code as written. Node
+  builds for Arm64 fuse multiply-adds in that code, so they differ from it (and
+  from each other's platforms) by an ulp in about 0.07% of results; macOS's C
+  library also truncates `pow`'s subnormal results there. A NaN's payload is
+  not part of the contract, as JavaScript doesn't show it.
+- Like `abla/math`, the module uses only `+`, `-`, `*`, `/` and exact
+  operations, so native, Wasm and compile-time results are the same bits.
+  Angles beyond 2^19 · pi/2 reduce through scratch arrays in a
+  [region](../regions.md), so no call leaves garbage behind.
+
+`tools/test-math-v8.sh` checks both claims: the two modules' declarations,
+read from the compiler, must match, and every function's results over a
+seeded set of inputs (random bit patterns, each function's branch points and
+their neighbours, huge, subnormal and special arguments) must have the bits
+recorded from Node 22 on x86-64, natively at every optimization level, as
+release and development WebAssembly, and under `#` in both tiers.
 
 ## `abla/float`
 
