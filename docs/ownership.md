@@ -285,6 +285,11 @@ The rules:
   owner's scope (including `return`, `break` and `continue`), reassignment of
   its owner, or the end of the function that received it with `own`. A value
   that was moved away is not dropped where it used to be.
+- A new resource that nothing takes is dropped where it is discarded: a
+  statement such as `issue(5)` on its own, the body of a loop, or the branch
+  of an `if` without `else`. A block whose value is one of its own locals
+  (`{ val t = issue(5); t }`) hands that local on with its value, so the block
+  doesn't drop it too.
 - Copying is rejected: `val b = a` must be `val b = move(a)`
   (`ownership.move-required`). Passing `a` to an `own` parameter also needs
   `move(a)`. A fresh value, like `refund(issue(5))`, needs no `move`.

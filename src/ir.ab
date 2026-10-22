@@ -5013,6 +5013,33 @@ class BootstrapLowerer(
         }
     }
 
+    /** A discarded value (sema.ab, bootstrapExpressionYieldsFreshValue) that
+     *  is a resource nothing else holds is dropped where it is discarded. */
+    fun dropDiscarded(value: int, expression: BootstrapExpression) {
+        if (value >= 0 && bootstrapExpressionYieldsFreshValue(expression) &&
+            !this.callHandsOnAssignment(expression)) {
+            val type = this.lowerExpressionType(expression)
+            // (A closure is left alone, as the evaluator leaves it.)
+            if (!bootstrapIsBorrowType(type) && !bootstrapIsFunctionType(type)) {
+                this.emitAffineValueDrop(value, type)
+            }
+        }
+    }
+
+    /** A call of a function without a result type whose body ends in an
+     *  assignment: its value is the assigned place's, which keeps it. */
+    fun callHandsOnAssignment(expression: BootstrapExpression): bool {
+        if (expression.kind != "call") return false
+        val index = this.functionDeclarations.find(expression.text)
+        if (index < 0) return false
+        val declaration = this.declarations[index]
+        var tail = declaration.expression
+        while (tail.kind == "block" && tail.children.size > 0) {
+            tail = tail.children[tail.children.size - 1]
+        }
+        declaration.resultType == "inferred" && bootstrapIsAssignment(tail)
+    }
+
     fun emitAffineValueDrop(value: int, type: string) {
         val normalized = bootstrapNormalizeType(type)
         if (this.lowerTypeIsAffine(normalized)) {
@@ -5778,9 +5805,20 @@ class BootstrapLowerer(
             result = if (underlying == "") operand else underlying
         }
         if (expression.kind == "block" && expression.children.size > 0) {
-            result = this.lowerExpressionType(
-                expression.children[expression.children.size - 1]
-            )
+            val tail = expression.children[expression.children.size - 1]
+            result = this.lowerExpressionType(tail)
+            // A local of the block, out of scope once the block is lowered:
+            // its declared type, or its initializer's.
+            if (result == "unknown" && tail.kind == "identifier") {
+                for (statement in expression.children) {
+                    if (bootstrapStatementDeclaresLocal(statement) &&
+                        statement.text == tail.text && statement.children.size > 1) {
+                        result = if (statement.children[1].text != "inferred")
+                            bootstrapNormalizeType(statement.children[1].text)
+                        else this.lowerExpressionType(statement.children[0])
+                    }
+                }
+            }
         }
         if (expression.kind == "when") {
             var branchType = "unknown"
@@ -8971,6 +9009,22 @@ fun bootstrapLowerBlock(
 ): int {
     var result = initial
     val previousScope = lowerer.enterLocalScope()
+    // A local of this block that is its value (`{ val t = make(); t }`, also
+    // as a branch of a last `if` or `when`) moves out of it, so the block's
+    // end does not drop it as well: the value's new owner does.
+    val handedOn = lowerer.implicitResults.size
+    if (expression.children.size > 0) {
+        val tails: array<BootstrapExpression> = []
+        lowerer.collectImplicitResults(expression.children[expression.children.size - 1], tails)
+        for (tail in tails) {
+            if (tail.kind == "identifier") {
+                for (statement in expression.children) {
+                    if (bootstrapStatementDeclaresLocal(statement) &&
+                        statement.text == tail.text) lowerer.implicitResults.append(tail)
+                }
+            }
+        }
+    }
     // A local a closure captures lives in a cell from its declaration
     // on. Converting it where the closure was built ran again on each
     // pass of a loop and wrapped the cell in a second cell; inside one
@@ -8981,6 +9035,7 @@ fun bootstrapLowerBlock(
     while (statement < expression.children.size) {
         val lowered = expression.children[statement]
         result = lowerer.lowerExpression(lowered)
+        if (statement + 1 < expression.children.size) lowerer.dropDiscarded(result, lowered)
         val after = bootstrapConditionAfterIf(lowered)
         if (after != "") lowerer.addNullableRefinements(
             lowered.children[0], after == "true"
@@ -9001,6 +9056,7 @@ fun bootstrapLowerBlock(
     if (result < 0) result = lowerer.emit("const.void", -1, -1, "")
     lowerer.emitScopeDrops(lowerer.currentScope)
     lowerer.leaveLocalScope(previousScope)
+    lowerer.implicitResults.truncate(handedOn)
     result
 }
 
@@ -10233,6 +10289,10 @@ fun bootstrapLowerIf(
     val previousThenScope = lowerer.enterLocalScope()
     lowerer.addNullableRefinements(expression.children[0], true)
     val thenValue = lowerer.lowerExpression(expression.children[1])
+    // Without `else`, the branch's value is discarded.
+    if (expression.children[2].kind == "missing") {
+        lowerer.dropDiscarded(thenValue, expression.children[1])
+    }
     lowerer.leaveLocalScope(previousThenScope)
     lowerer.emitControl("local.set", thenValue, -1, -1, temporary)
     lowerer.emitControl("jump", -1, mergeLabel, -1, "")
@@ -10345,7 +10405,9 @@ fun bootstrapLowerWhile(
     val condition = lowerer.lowerExpression(expression.children[0])
     lowerer.emitControl("branch", condition, bodyLabel, mergeLabel, "")
     lowerer.emitControl("label", -1, bodyLabel, -1, "")
-    lowerer.lowerExpression(expression.children[1])
+    lowerer.dropDiscarded(
+        lowerer.lowerExpression(expression.children[1]), expression.children[1]
+    )
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.breakLabel = previousBreakLabel
     lowerer.continueLabel = previousContinueLabel
@@ -10376,7 +10438,9 @@ fun bootstrapLowerDoWhile(
     lowerer.continueScope = lowerer.currentScope
     lowerer.emitControl("jump", -1, bodyLabel, -1, "")
     lowerer.emitControl("label", -1, bodyLabel, -1, "")
-    lowerer.lowerExpression(expression.children[0])
+    lowerer.dropDiscarded(
+        lowerer.lowerExpression(expression.children[0]), expression.children[0]
+    )
     lowerer.emitControl("jump", -1, conditionLabel, -1, "")
     lowerer.emitControl("label", -1, conditionLabel, -1, "")
     val condition = lowerer.lowerExpression(expression.children[1])
@@ -10507,7 +10571,9 @@ fun bootstrapLowerFor(
         iteratorValue = lowerer.emit("cell.create", value, -1, "")
     }
     lowerer.emit("local.declare", iteratorValue, -1, iteratorStorage)
-    lowerer.lowerExpression(expression.children[1])
+    lowerer.dropDiscarded(
+        lowerer.lowerExpression(expression.children[1]), expression.children[1]
+    )
     lowerer.emitControl("jump", -1, incrementLabel, -1, "")
     lowerer.breakLabel = previousBreakLabel
     lowerer.continueLabel = previousContinueLabel
