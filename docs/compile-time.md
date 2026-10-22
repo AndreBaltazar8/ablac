@@ -695,7 +695,7 @@ reason:
 | `abla/fs` writes, moves and removals | works with `filesystem.write`, staged until the build succeeds |
 | Standard-library code built on its own raw memory (byte buffers) | works, no grant |
 | Other system calls (processes, sockets) | works with `trusted.native` ([native code](#native-code-at-compile-time)) |
-| `extern:"c"` functions, trusted raw memory, `nativeFunctionAddress` callbacks | works with `trusted.native` |
+| `extern:"c"` functions, trusted raw memory (static and thread-local storage included), `nativeFunctionAddress` callbacks | works with `trusted.native` |
 | `abla/platform/host` | works: each function under the capability it implies |
 | Fixed-width integer conversions (`u16(x)`), nominal conversions (`Pin(x)`), integer extension methods | works |
 | The runtime memory API (`memoryLiveBytes`, `memoryCollect`, ...) | evaluator: `E_EVAL_MEMORY_UNAVAILABLE`; native tier: its own runtime's heap ([limits](#limits)) |

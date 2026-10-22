@@ -83,13 +83,17 @@ fun ctNativeSetEntry(path: string): void {
     return
 }
 
+// The thread-local objects compile-time code made, by call site
+// (nativeThreadLocalBytes).
+val ctNativeThreadLocals: Map<string, int> = Map()
+
 fun ctNativeIntrinsicPrefix(name: string): bool =
     name.startsWith("ablaUnsafe") || name.startsWith("ablaLinux") ||
     name.startsWith("ablaRuntimePointer") || name.startsWith("__ablaRuntime") ||
     name == "ablaRuntimeTrap" || name == "ablaHostIsMacOS" ||
     name == "ablaHostValueArgumentsIndirect" ||
     name == "nativeStackAllocate" || name == "nativeStaticAllocate" ||
-    name == "nativeFunctionAddress"
+    name == "nativeThreadLocalBytes" || name == "nativeFunctionAddress"
 
 // The raw intrinsics evaluated here (the extern:"intrinsic" declarations of
 // abla/unsafe/memory, abla/unsafe/native and abla/sys/linux, and the runtime's
@@ -116,7 +120,7 @@ fun ctNativeIntrinsic(name: string): bool =
     name == "ablaUnsafeAtomicCompareExchangeRelaxedU32" ||
     name == "ablaUnsafeAtomicFence" ||
     name == "nativeStackAllocate" || name == "nativeStaticAllocate" ||
-    name == "nativeFunctionAddress" ||
+    name == "nativeThreadLocalBytes" || name == "nativeFunctionAddress" ||
     name == "ablaUnsafeCallVoid0" || name == "ablaUnsafeCallI32" ||
     name == "ablaUnsafeCallVoidPointer3" ||
     name == "ablaLinuxSyscall" || name == "ablaRuntimeTrap" ||
@@ -473,6 +477,26 @@ trusted fun ctNativeEvaluateIntrinsic(
         val rounded = (if (capacity > 0) capacity else 1) + 7
         val storage = __ablaRuntimeAllocateLayout(rounded / 8 * 8, 10)
         ablaUnsafeSetMemory(nativePointerFromAddress(storage), 0, rounded / 8 * 8)
+        result = bootstrapEvalInteger(storage)
+    } else if (name == "nativeThreadLocalBytes") {
+        // A program's thread-local object, one per call site, holding the
+        // given bytes. Compile-time code runs on one thread, so each site's
+        // object is made once and lasts for the compilation.
+        val site = "${evaluator.sourceIdentity}:${expression.begin}"
+        val known = ctNativeThreadLocals.get(site)
+        var storage = if (known != null) known else 0
+        if (storage == 0) {
+            val contents = if (expression.children.size > 0)
+                bootstrapEvalUnwrapBorrow(evaluator.evaluate(expression.children[0])).text else ""
+            storage = __ablaRuntimeAllocateLayout((contents.size + 8) / 8 * 8, 10)
+            ablaUnsafeSetMemory(nativePointerFromAddress(storage), 0, (contents.size + 8) / 8 * 8)
+            var index = 0
+            while (index < contents.size) {
+                ablaUnsafeStoreU8(nativePointerFromAddress(storage + index), contents[index])
+                index = index + 1
+            }
+            ctNativeThreadLocals.set(site, storage)
+        }
         result = bootstrapEvalInteger(storage)
     } else if (name == "ablaUnsafeCallVoid0") {
         val function = ctNativeAddressArgument(evaluator, expression, 0, name)
