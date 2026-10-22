@@ -126,7 +126,10 @@ build_and_run() { # dir tag entry mode
         cd "$dir" || exit 1
         # Through the runner, whatever $compiler is: a bare compiler binary
         # bounds nothing itself (only the repository launcher does), with the
-        # launcher's memory default.
+        # launcher's memory default. Only the executable runs, so a release
+        # build skips its relocatable object sidecar (ABLA_NO_SIDECAR), a
+        # second optimization and code generation of the whole program.
+        ABLA_NO_SIDECAR=1 \
         ABLA_COMPILE_EVAL=$mode ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096} \
             limited "$compiler" build "$entry" -o "$tag.program" --no-cache \
             >"$tag.compiler.out" 2>"$tag.err"
