@@ -255,14 +255,17 @@ two results always add up to 30.
 A thread shares nothing by accident:
 
 - A thread body may capture only `Shared<T>`, `Mutex<T>` and `Weak<T>`
-  handles, which move into the thread. Clone the handle first if the parent
-  needs it too (`thread.capture-type`).
+  handles, which move into the thread, and `TVar<T>`s, which change only in
+  [transactions](language.md#transactions). Clone a handle first if the
+  parent needs it too (`thread.capture-type`).
 - It can't assign to a captured variable (`thread.capture-mutation`) or name
   a mutable top-level `var` (`thread.mutable-global`).
 - Every global it reaches, in its body or through the functions, methods and
   function values it calls, must be one no other thread can change: a `val`
   of a scalar, a string, a function, or a `Shared`, `Mutex` or `Weak`
-  handle (or an optional one of those), or a compile-time value. A class
+  handle or a `TVar` (or an optional one of those), a `val` or `var`
+  delegated to a `TVar` (`var balance: int by TVar(100)`; replacing its
+  delegate in a thread is `thread.mutable-global`), or a compile-time value. A class
   instance, an array, a map or a `var` is `thread.shared-global:<name>`:
   wrap it in a `Mutex` (or `Shared`). The runtime's own globals are its
   business. A standard-library `val` marked `@threadShared` (abla/json's

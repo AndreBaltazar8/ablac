@@ -1,0 +1,78 @@
+// Transactions on one thread (language design §3b): TVars as delegates of
+// locals, globals and class properties, `atomic` (nested ones join), `retry`
+// and `orElse` (the first alternative's writes undone when it retries), and
+// helpers that reach TVars outside an `atomic`, called inside one.
+
+var stock: int by TVar(10)
+
+class Account(val owner: string, var balance: int by TVar(0), var history: string by TVar("")) {
+    // Runs only inside a transaction: it reaches the TVars outside an `atomic`.
+    fun withdraw(amount: int): void {
+        if (balance < amount) retry
+        balance -= amount
+        history = "$history-$amount"
+        return
+    }
+    fun deposit(amount: int): void {
+        balance += amount
+        history = "$history+$amount"
+        return
+    }
+}
+
+fun transfer(from: Account, to: Account, amount: int): bool = atomic {
+    atomic {
+        from.withdraw(amount)
+        to.deposit(amount)
+        true
+    } orElse { false }
+}
+
+// Takes from the stock, or what is left, or nothing.
+fun take(wanted: int): int = atomic {
+    atomic {
+        stock -= wanted
+        if (stock < 0) retry
+        wanted
+    } orElse {
+        atomic {
+            if (stock == 0) retry
+            val left = stock
+            stock = 0
+            left
+        } orElse { 0 }
+    }
+}
+
+fun check(condition: bool, code: int): int = if (condition) 0 else code
+
+fun main: int {
+    var failed = 0
+    val a = Account("a")
+    val b = Account("b")
+    atomic { a.deposit(50) }
+    failed += check(transfer(a, b, 30), 1)
+    failed += check(!transfer(a, b, 30), 2)
+    failed += check(atomic { a.balance } == 20 && atomic { b.balance } == 30, 3)
+    failed += check(atomic { a.history } == "+50-30" && atomic { b.history } == "+30", 4)
+    failed += check(take(4) == 4 && take(4) == 4 && take(4) == 2 && take(4) == 0, 5)
+    failed += check(atomic { stock } == 0, 6)
+    val counter = TVar(0)
+    val names: TVar<string> = TVar("")
+    val total = atomic {
+        counter.setValue(counter.getValue() + 1)
+        names.setValue(names.getValue() + "x")
+        atomic { counter.setValue(counter.getValue() * 10) }
+        counter.getValue()
+    }
+    failed += check(total == 10 && atomic { names.getValue() } == "x", 7)
+    var local by TVar(5)
+    val seen = atomic {
+        local += 1
+        val made: array<int> = []
+        made.append(local)
+        made[0]
+    }
+    failed += check(seen == 6 && atomic { local } == 6, 8)
+    if (failed == 0) 42 else failed
+}

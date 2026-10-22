@@ -257,6 +257,7 @@ test: ablac
 	tools/test-delegated-properties.sh $(COMPILER)
 	tools/test-null-operators.sh $(COMPILER)
 	tools/test-resource-temporaries.sh $(COMPILER)
+	tools/test-transactions.sh $(COMPILER)
 
 check: test self-rebuild
 

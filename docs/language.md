@@ -25,7 +25,8 @@ Contents: [design rules](#design-rules) ·
 [expressions](#expressions-and-operators) ·
 [control flow](#control-flow) · [ownership](#ownership-and-resources) ·
 [regions](#scoped-allocation-regions) · [memory](#memory-management) ·
-[compile time](#compile-time-execution) · [modules](#modules-and-imports) ·
+[compile time](#compile-time-execution) ·
+[transactions](#transactions) · [modules](#modules-and-imports) ·
 [annotations](#annotations) ·
 [trusted and native code](#trusted-native-implementations)
 
@@ -1928,8 +1929,161 @@ These have their own page, [concurrency.md](concurrency.md). In brief:
 - `task { ... }` is a cooperative coroutine (`Task<T>`); `await` runs it
   and returns its result ([details](concurrency.md#tasks)).
 - `thread { ... }` starts an OS thread (`Thread<T>`); `await` joins it. A
-  thread may capture only `Shared`, `Mutex` and `Weak` handles
+  thread may capture only `Shared`, `Mutex` and `Weak` handles and `TVar`s
   ([details](concurrency.md#threads)).
+
+## Transactions
+
+A `TVar<T>` is a variable that threads share and change only inside
+`atomic { ... }`: each `atomic` block runs as one indivisible step (a
+transaction). Other threads see all of its writes or none of them, and a
+block that read something another thread changed meanwhile runs again by
+itself. A `TVar` is a [delegate](#delegated-bindings), so a binding or a
+class property delegated to one reads and writes through the transaction:
+
+```abla
+import "abla/io"
+
+class Account(val owner: string, var balance: int by TVar(0)) {
+    fun deposit(amount: int): void {
+        balance += amount
+        return
+    }
+}
+
+fun transfer(from: Account, to: Account, amount: int): bool = atomic {
+    if (from.balance < amount) false
+    else {
+        from.balance -= amount
+        to.deposit(amount)     // a helper that reaches a TVar: fine inside `atomic`
+        true
+    }
+}
+
+fun main {
+    val ada = Account("ada")
+    val bob = Account("bob")
+    atomic { ada.deposit(50) }
+    println("${transfer(ada, bob, 30)} ${transfer(ada, bob, 30)}")
+    println(atomic { "${ada.balance} ${bob.balance}" })
+}
+// output:
+// true false
+// 20 30
+```
+
+- `TVar(value)` makes one (`TVar<int>`, ...); `getValue()` and `setValue(v)`
+  read and write it, and `var x by TVar(v)` (a local, a global or a class
+  property) does that through `x`. Its type may not be a resource or affine
+  (`stm.resource`).
+- `atomic { ... }` is an expression worth its block's value. Inside another
+  transaction it joins that one: both commit together.
+- `retry` gives up the attempt and waits until a TVar the block read changes,
+  then runs it again: a block that can't proceed yet (an empty queue, a
+  balance too low) just says so. `retry` is a name like any other: a local or
+  function called `retry` hides it.
+- `atomic { a } orElse { b }` runs `b` when `a` retries, after undoing what
+  `a` wrote; when `b` retries too, the whole transaction waits for a change
+  to anything either read. `orElse` may follow another `orElse`.
+- With one thread (always on WebAssembly) a transaction runs directly, with
+  an undo log: there is nothing to conflict with, and a `retry` that no
+  `orElse` takes panics (`retry can never wake`), as nothing could change
+  what the block read. A panic contained by a checked export rolls the
+  transaction back. On WebAssembly a `retry` inside an `orElse` alternative
+  traps, as nothing can leave the alternative there.
+- `#` code runs transactions as plain code, with the same results.
+
+```abla
+import "abla/io"
+
+var stock: int by TVar(10)
+
+// Takes `wanted` from the stock, or whatever is left, or nothing.
+fun take(wanted: int): int = atomic {
+    atomic {
+        stock -= wanted
+        if (stock < 0) retry   // undone: the next alternative runs
+        wanted
+    } orElse {
+        atomic {
+            if (stock == 0) retry
+            val left = stock
+            stock = 0
+            left
+        } orElse { 0 }
+    }
+}
+
+fun main {
+    println("${take(4)} ${take(4)} ${take(4)} ${take(4)} ${#take(12)}")
+}
+// output:
+// 4 4 2 0 10
+```
+
+Threads share TVars like `Shared` handles: a thread may capture one, and a
+global `TVar` or a global delegated to one is a global threads may reach
+([concurrency.md](concurrency.md#threads)). Two producers retry while the
+slot is full; the consumer retries while it is empty:
+
+```abla
+import "abla/io"
+
+var slot: int by TVar(0)      // 0: empty
+
+fun produce(from: int, count: int): int {
+    for (value in from until from + count) {
+        atomic {
+            if (slot != 0) retry
+            slot = value
+        }
+    }
+    count
+}
+
+fun main {
+    val one = thread { produce(1, 100) }
+    val two = thread { produce(101, 100) }
+    var sum = 0
+    for (index in 0 until 200) {
+        sum += atomic {
+            if (slot == 0) retry
+            val taken = slot
+            slot = 0
+            taken
+        }
+    }
+    println("${await one + await two} values, sum $sum")
+}
+// output:
+// 200 values, sum 20100
+```
+
+### What a transaction may do
+
+An attempt that conflicts is thrown away and run again, so a transaction may
+change only what can be put back. The compiler checks:
+
+| Diagnostic | Cause |
+|---|---|
+| `stm.outside-atomic:<what>` | A TVar (or `retry`) reached outside any transaction: a function or method that reaches one outside an `atomic`, itself or through what it calls, runs only inside a transaction, and `main`, a global's initializer, a lambda (other than a transaction's body) and a top-level action can't be inside one |
+| `stm.effect:<effect>` | A transaction's body, or anything it calls, prints or reads the standard streams (`io`), touches the file system (`filesystem`), the network (`network`) or native code (`native`), or starts a thread or task (`thread`). Reading the clock, random numbers and the environment is allowed |
+| `stm.resource:<name>` | A `TVar` of a resource or affine type, or a resource-typed local declared in a transaction: an abandoned attempt would skip its drop |
+| `stm.outside-mutation:<what>` | Inside a transaction, a change to anything but a TVar or what the transaction made (its own locals and the objects they hold): assigning a captured local, a global or a field, changing an outside object (a field, an element, a mutating method, a `var` argument), replacing an outer delegate, or calling a function that changes a global |
+| `stm.control:return` | `return` inside a transaction's body, which is a closure: it would leave only the block |
+| `stm.orElse-type:<a>:<b>` | The alternatives of an `orElse` have unrelated types |
+
+```abla error
+import "abla/io"
+
+var balance: int by TVar(10)
+
+fun main: int = atomic {
+    println("balance $balance")
+    balance
+}
+// error: stm.effect:io:println
+```
 
 ## Modules and imports
 
