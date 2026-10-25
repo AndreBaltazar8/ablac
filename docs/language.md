@@ -1124,17 +1124,20 @@ fun total(shapes: array<Shape>): int {
 
 fun main {
     val shapes: array<Shape> = [Square(2), Circle(1)]
-    println("${total(shapes)} ${shapes[0].describe()} ${shapes[1].describe()}")
+    println("${total(shapes)} ${shapes[0].describe()} ${shapes[1].describe()} ${Square(3).describe()}")
 }
 // output:
-// 7 shape of 4 circle
+// 7 shape of 4 circle shape of 9
 ```
 
 - **Members.** An interface member is a method signature. A member without a
   body names its result type (`interface.member-untyped`). A member with a
   body is a *default*: it runs for a class that has no method of that name,
-  with `this` the instance. An interface has no fields. A field-like need is a
-  method, which an [extension field](#extension-fields) can back.
+  with `this` the instance. The class's values have that member too
+  (`Square(3).describe()`), a direct call of the default body, without the
+  class comparison a call through an interface value makes. An interface has
+  no fields. A field-like need is a method, which an
+  [extension field](#extension-fields) can back.
 - **Conformance.** A class names its interfaces after its fields
   (`class Square(…) : Shape, Named`). `extend Square : Printable` at top level
   does the same for a class declared elsewhere, in any module. A class
