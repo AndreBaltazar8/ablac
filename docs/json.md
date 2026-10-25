@@ -159,10 +159,30 @@ slice. `readObject` and `readArray` return readers sharing the same forward
 parser state. Object readers additionally expose `readInteger`,
 `readNumber`, `readBoolean` and `readNull`; array readers use `next` with
 `readString`, `readInteger`, `readNumber`, `readBoolean`, `readNull`,
-`readObject`, `readArray`, or `skip`, and both have `peek`. Call `finishNested` before
-continuing in the parent and `finish` on the root reader. The canonical
+`readObject`, `readArray`, `readRaw`, or `skip`, and both have `peek`. An array
+reader's `readRaw` is the object reader's for the current element: its text as
+the input spells it, whitespace around it skipped, nested values validated, and
+`""` with the reader's error when the element is malformed or there is none.
+Call `finishNested` before continuing in the parent and `finish` on the root
+reader. The canonical
 `nextExpectedRaw` path fuses compact `,"name":` tokens while preserving the
 whitespace-aware diagnostic fallback.
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val items = jsonArrayReader("[1, {\"a\": [2, 3]}, \"x\"]")
+    while (items.next()) println(items.readRaw())
+    println("${items.finish()}")
+}
+// output:
+// 1
+// {"a": [2, 3]}
+// "x"
+// true
+```
 
 Typed decoding of numeric data needs three more reads, on both readers.
 `readNumber()` reads any JSON number (fraction and exponent included) as the
