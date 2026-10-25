@@ -100,6 +100,14 @@ for source in "$cases"/errors/*.ab; do
         { printf 'generics: errors/%s:\nexpected:\n%s\ngot:\n%s\n' "$name" "$expected" "$log" >&2; exit 1; }
 done
 
+# A class's generic method keeps its class's name in debug information (and
+# so in traces): `<module>.Sack.remap`, not the extension it is made into.
+"$compiler" build "$cases/methods-label.ab" -o "$output_directory/methods-label.o" \
+    --emit object -g --no-cache
+llvm-dwarfdump --debug-info "$output_directory/methods-label.o" > "$output_directory/methods-label.dwarf"
+grep -Fq '"methods-label.Sack.remap"' "$output_directory/methods-label.dwarf" ||
+    { echo "generics: a generic method's instance isn't named Sack.remap in debug information" >&2; exit 1; }
+
 # The incremental case, built with the build cache before and after the edit.
 work=$output_directory/incremental
 rm -rf "$work"

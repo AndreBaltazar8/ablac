@@ -128,13 +128,14 @@ only its parse errors.
 | `interface.no-witness:<I>:<class>` | at run time: a call through an interface on an instance of a class with no witness for it (the dispatch fallback; no program reaches it today) |
 | `E_COMPILER_TRANSFORM_INTERFACE` | `compiler.declareInterface` or `compiler.addConformance` outside a transform, or without its handle and names ([compiler API](compiler-api.md#interfaces)) |
 | `E_PARSE_NOT_YET_SUPPORTED` | reserved syntax: a `where` clause, `const` type parameters, an interface's `type Item`, a `sealed class` |
-| `generic.cannot-infer:<f>:<T>` | nothing at a call binds type parameter `T`: write the type arguments out (`f<int>(…)`) or give the result an expected type ([generics](language.md#generics)) |
-| `generic.arity:<f>:<expected>:<written>` | the wrong number of type arguments written out, or a generic class's type with the wrong number |
+| `generic.cannot-infer:<f>:<T>` | nothing at a call binds type parameter `T`: write the type arguments out (`f<int>(…)`) or give the result an expected type ([generics](language.md#generics)); a class's generic method is named by its class (`Bag.remap`) |
+| `generic.arity:<f>:<expected>:<written>` | the wrong number of type arguments written out, or a generic class's type with the wrong number; at a generic method's or extension's call, the type arguments written name only the parameters the receiver's type doesn't fix |
 | `generic.instantiation-depth:<f>` | `f`'s instances make ever larger instances (`f(Box(x))` in `f`) |
 | `generic.overload:<f>` | a generic function sharing its name (and receiver) with another function |
 | `generic.bound:<f>:<T>:<type>:<interface>` | a type argument that is not the bound interface and doesn't conform to it ([bounds](language.md#bounds)); a bound that is a generic interface's instance reads as one (`Ordered<i64>`) |
 | `generic.bound-not-interface:<f>:<T>:<bound>` | a type parameter's bound that names no interface |
-| `generic.method-not-supported:<C>.<m>` | a method with type parameters of its own |
+| `generic.interface-method:<I>.<m>` | an interface's method with type parameters of its own: a call through an interface value would need each class's instance for each type argument ([generic methods](language.md#generic-methods)) |
+| `generic.method-shadows:<C>.<m>:<T>` | a method's type parameter named like one of its class's |
 | `generic.reference:<f>` | a generic function used as a value rather than called |
 | `E_COMPILER_GENERIC_INSTANTIATE` | `compiler.instantiate` of something that is no generic class or function, or with the wrong number of type arguments ([compiler API](compiler-api.md#generics)) |
 | `context[generic-instance]: <instance>` | a record after a diagnostic placed in a generic's body: the instance (`twice<Ticket>`) in which it is an error |

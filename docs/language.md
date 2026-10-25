@@ -1666,9 +1666,9 @@ fun main {
 
 ## Generics
 
-A function, an extension function or a class may take type parameters,
-written `<T>` (several: `<K, V>`) before a function's name or after a
-class's:
+A function, an extension function, a class or a class's method may take
+type parameters, written `<T>` (several: `<K, V>`) before a function's name
+or after a class's:
 
 ```abla
 import "abla/io"
@@ -1754,14 +1754,58 @@ fun main {
 - **Invariant.** `Box<Square>` is not a `Box<Shape>`.
 - A generic whose instances make ever larger instances (`deep(Box(x))` in
   `deep`) is `generic.instantiation-depth:<f>`. A generic function may not
-  share its name with another function (`generic.overload:<f>`), a class's
-  methods take no type parameters of their own
-  (`generic.method-not-supported`), and a generic function is called, not
-  passed as a value (`generic.reference:<f>`). `where` clauses are
-  reserved syntax.
+  share its name with another function (`generic.overload:<f>`), and a
+  generic function is called, not passed as a value
+  (`generic.reference:<f>`). `where` clauses are reserved syntax.
 - **At compile time** generics behave as at run time: `#first([1, 2])`
   evaluates the instance the call names. `#` code in a generic's body runs
   per instance ([below](#compile-time-code-per-instance)).
+
+### Generic methods
+
+A class's method may take type parameters of its own, besides its class's:
+
+```abla
+import "abla/io"
+
+class Bag<T>(val items: array<T>) {
+    fun <U> remap(f: (T) -> U): Bag<U> {
+        val out: array<U> = []
+        for (item in items) out.append(f(item))
+        Bag(out)
+    }
+
+    fun <U> fold(start: U, step: (U, T) -> U): U {
+        var total = start
+        for (item in items) total = step(total, item)
+        total
+    }
+}
+
+fun main {
+    val bag = Bag([1, 2, 3])
+    val words = bag.remap { n -> "n$n" }
+    println("${words.items[2]} ${bag.fold(0) { total, n -> total + n }} ${bag.remap<string> { n -> "$n!" }.items[0]}")
+}
+// output:
+// n3 6 1!
+```
+
+- A call binds the method's type parameters as a generic function's call
+  does (its arguments, the type expected of its result), and the class's
+  from the receiver. Written out, the type arguments name only the method's
+  own: `bag.remap<string>(…)`.
+- It is made per receiver instance and type arguments, a direct call like
+  any method's, and reaches what any method reaches: the class's fields and
+  methods, its module's `private` names, a delegated property's delegate
+  (`this.^level`), `this` of a resource class. `#` code in it runs per
+  instance. A class without type parameters may have generic methods too.
+- A method's type parameter may not reuse a name of its class's
+  (`generic.method-shadows`). An interface's method takes no type parameters
+  of its own (`generic.interface-method`): a call through an interface value
+  would need each class's instance for each type argument. So a class's
+  generic method doesn't answer an interface member either.
+- Diagnostics and debug information name it by its class: `Bag.remap`.
 
 ### Bounds
 

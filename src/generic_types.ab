@@ -148,6 +148,38 @@ fun bootstrapGenericInstanceGeneric(name: string): string {
     if (mark < 0) "" else name.slice(0, mark)
 }
 
+// The generic methods of the program being built, as "Class.method": the
+// extensions bootstrapGenericMethodsAsExtensions made of them are named so in
+// diagnostics and debug information.
+var bootstrapGenericMethods = bootstrapStringSet()
+
+/** "Class.method" when `method` on the receiver written `owner` (`Bag<T>`)
+ *  is a class's generic method, else "". */
+fun bootstrapGenericMethodName(owner: string, method: string): string {
+    // (The receiver as written, or as the generics table keeps it: `Bag<T>`'s
+    // instance name.)
+    val head = bootstrapGenericCalleeName(owner)
+    val generic = bootstrapGenericInstanceGeneric(head)
+    val key = "${bootstrapSourceVisibleType(if (generic != "") generic else head)}.${bootstrapSourceVisibleType(method)}"
+    if (bootstrapGenericMethods.contains(key)) key else ""
+}
+
+/** bootstrapGenericMethodName of an extension's instance (named
+ *  `<method>__abla_on_<owner>__abla_generic_<arguments>`), else "". */
+fun bootstrapGenericMethodNameOf(instance: string): string {
+    val id = bootstrapGenericInstanceGeneric(instance)
+    val on = if (id == "") -1 else bootstrapGenericFind(id, "__abla_on_", 0)
+    if (on < 0) return ""
+    bootstrapGenericMethodName(bootstrapGenericUnescape(id.slice(on + 10, id.size)), id.slice(0, on))
+}
+
+/** Whether type `type` names `name` anywhere. */
+fun bootstrapGenericTypeMentions(type: BootstrapGenericType, name: string): bool {
+    if (type.head == name) return true
+    for (argument in type.arguments) if (bootstrapGenericTypeMentions(argument, name)) return true
+    false
+}
+
 /** Splits `text` at its commas outside brackets. */
 fun bootstrapGenericSplitTopLevel(text: string): array<string> {
     val parts: array<string> = []
@@ -337,7 +369,12 @@ fun bootstrapGenericVisibleType(type: BootstrapGenericType): string {
             arguments = if (index == 0) argument else "$arguments, $argument"
             index = index + 1
         }
-        return "${bootstrapSourceVisibleType(type.head)}<$arguments>"
+        // A class's generic method's instance: `Bag.remap<i64, string>`.
+        val on = bootstrapGenericFind(type.head, "__abla_on_", 0)
+        val method = if (on < 0) "" else bootstrapGenericMethodName(
+            bootstrapGenericUnescape(type.head.slice(on + 10, type.head.size)), type.head.slice(0, on)
+        )
+        return "${if (method != "") method else bootstrapSourceVisibleType(type.head)}<$arguments>"
     }
     if (type.arguments.size == 0) {
         val mark = bootstrapGenericFind(type.head, BOOTSTRAP_GENERIC_PARAMETER_MARK, 0)
@@ -991,7 +1028,10 @@ fun bootstrapGenericBind(
         patterns.append(bootstrapGenericPattern(type, analyzer.generics))
     }
     val id = "${analyzer.generics.ids[template]}"
-    val visible = bootstrapSourceVisibleType(analyzer.generics.names[template])
+    // (A class's generic method, made an extension, by its class: `Bag.remap`.)
+    val method = if (receiver != "")
+        bootstrapGenericMethodName(analyzer.generics.owners[template], analyzer.generics.names[template]) else ""
+    val visible = if (method != "") method else bootstrapSourceVisibleType(analyzer.generics.names[template])
     val owner = if (receiver != "") bootstrapGenericParse(analyzer.generics.owners[template])
         else bootstrapGenericLeaf("")
     // The result's type: a class's instance, or the declared result.
@@ -1007,18 +1047,28 @@ fun bootstrapGenericBind(
     val bindings: array<string> = []
     for (parameter in parameters) bindings.append("")
     val explicit = bootstrapGenericCalleeArguments(expression.text)
+    // An extension's explicit type arguments may name only the parameters its
+    // receiver's type doesn't fix (`bag.remap<string>(…)`: `U`, not `T`).
+    val explicitTargets: array<int> = []
+    var explicitIndex = 0
+    while (explicitIndex < parameters.size) {
+        if (explicit.size == parameters.size || !bootstrapGenericTypeMentions(owner, parameters[explicitIndex])) {
+            explicitTargets.append(explicitIndex)
+        }
+        explicitIndex = explicitIndex + 1
+    }
     var failed = false
-    if (explicit.size > 0 && explicit.size != parameters.size) {
-        bootstrapGenericFailure(analyzer, expression, "generic.arity:$visible:${parameters.size}:${explicit.size}")
+    if (explicit.size > 0 && explicit.size != explicitTargets.size) {
+        bootstrapGenericFailure(analyzer, expression, "generic.arity:$visible:${explicitTargets.size}:${explicit.size}")
         failed = true
     }
     if (!failed) {
-        var index = 0
-        while (index < explicit.size) {
-            bindings[index] = bootstrapNormalizeType(
-                bootstrapGenericRewriteType(explicit[index], analyzer.generics, requests)
+        explicitIndex = 0
+        while (explicitIndex < explicit.size) {
+            bindings[explicitTargets[explicitIndex]] = bootstrapNormalizeType(
+                bootstrapGenericRewriteType(explicit[explicitIndex], analyzer.generics, requests)
             )
-            index = index + 1
+            explicitIndex = explicitIndex + 1
         }
     }
     if (receiver != "") {

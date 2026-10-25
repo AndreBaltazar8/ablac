@@ -818,7 +818,80 @@ fun bootstrapGenericWithTypeParameters(
     declaration.isSealed, declaration.isPrivate, typeParameters
 )
 
-fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseResult {
+fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseResult =
+    bootstrapInstantiateGenericsIn(bootstrapGenericMethodsAsExtensions(parsed))
+
+/** `parsed` with each class's method that takes type parameters of its own
+ *  written as the generic extension it is: in `class Box<T>`, `fun <U>
+ *  map(f: (T) -> U): Box<U>` is `fun <T, U> Box<T>.map(…)` (in a class
+ *  without type parameters, `fun <U> Owner.map`), so it is made per receiver
+ *  instance and type arguments, inferred at the call and run per instance
+ *  under `#` as a generic extension is. Its body, already reading the class's
+ *  members through `this.` (receiver_names.ab), and its module are the
+ *  method's. An interface's generic method stays, for
+ *  generic.interface-method; one reusing a class's type parameter's name, for
+ *  generic.method-shadows. */
+fun bootstrapGenericMethodsAsExtensions(parsed: BootstrapParseResult): BootstrapParseResult {
+    bootstrapGenericMethods = bootstrapStringSet()
+    var any = false
+    for (declaration in parsed.declarations) {
+        if (declaration.kind == "class") {
+            for (method in declaration.methods) if (bootstrapGenericIsTemplate(method)) any = true
+        }
+    }
+    if (!any) return parsed
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) {
+        if (declaration.kind != "class") {
+            declarations.append(declaration)
+            continue
+        }
+        val classParameters: array<string> = []
+        for (parameter in declaration.typeParameters) classParameters.append(bootstrapGenericParameterName(parameter))
+        var owner = declaration.name
+        if (classParameters.size > 0) {
+            owner = "$owner<"
+            var index = 0
+            while (index < classParameters.size) {
+                owner = if (index == 0) "$owner${classParameters[index]}" else "$owner,${classParameters[index]}"
+                index = index + 1
+            }
+            owner = "$owner>"
+        }
+        val kept: array<BootstrapDeclaration> = []
+        val extensions: array<BootstrapDeclaration> = []
+        for (method in declaration.methods) {
+            var shadows = false
+            for (parameter in method.typeParameters) {
+                for (name in classParameters) if (name == bootstrapGenericParameterName(parameter)) shadows = true
+            }
+            if (!bootstrapGenericIsTemplate(method) || shadows) {
+                kept.append(method)
+                continue
+            }
+            bootstrapGenericMethods.add("${bootstrapSourceVisibleType(declaration.name)}.${bootstrapSourceVisibleType(method.name)}")
+            val typeParameters: array<string> = []
+            for (parameter in declaration.typeParameters) typeParameters.append(parameter)
+            for (parameter in method.typeParameters) typeParameters.append(parameter)
+            extensions.append(bootstrapGenericWithTypeParameters(
+                bootstrapGenericDeclaration(
+                    method, method.name, method.expression, method.parameterTypes, method.resultType,
+                    [], method.parameterDefaults, owner,
+                    if (method.sourceIdentity != "") method.sourceIdentity else declaration.sourceIdentity
+                ),
+                typeParameters
+            ))
+        }
+        declarations.append(if (extensions.size > 0) bootstrapDeclarationWithMethods(declaration, kept) else declaration)
+        for (extension in extensions) declarations.append(extension)
+    }
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+}
+
+fun bootstrapInstantiateGenericsIn(parsed: BootstrapParseResult): BootstrapParseResult {
     var generic = false
     for (declaration in parsed.declarations) {
         if (bootstrapGenericIsTemplate(declaration)) generic = true
@@ -915,9 +988,25 @@ fun bootstrapInstantiateGenerics(parsed: BootstrapParseResult): BootstrapParseRe
                 }
             }
         }
+        // (A class's other generic methods are extensions by now:
+        // bootstrapGenericMethodsAsExtensions.)
         for (method in declaration.methods) {
             if (bootstrapGenericIsTemplate(method)) {
-                bootstrapGenericError(state, "generic.method-not-supported:${declaration.name}.${method.name}", method)
+                var shadowed = ""
+                for (parameter in method.typeParameters) {
+                    for (outer in declaration.typeParameters) {
+                        if (bootstrapGenericParameterName(outer) == bootstrapGenericParameterName(parameter)) {
+                            shadowed = bootstrapGenericParameterName(parameter)
+                        }
+                    }
+                }
+                bootstrapGenericError(
+                    state,
+                    if (declaration.kind == "interface")
+                        "generic.interface-method:${bootstrapSourceVisibleType(declaration.name)}.${method.name}"
+                    else "generic.method-shadows:${bootstrapSourceVisibleType(declaration.name)}.${method.name}:$shadowed",
+                    method
+                )
             }
         }
         if (declaration.kind == "fun" || declaration.kind == "compile.fun") {
