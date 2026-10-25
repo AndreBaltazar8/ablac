@@ -537,6 +537,58 @@ trusted fun bootstrapRebuildHeldModule(): int {
     status
 }
 
+// Writes the Mach-O object of the module the backend kept (bootstrapLlvmHoldModule) for a
+// development build, as llvmAotEmitObjectFileFast does from the module's text: the
+// default triple, a generic CPU, PIC, the fast passes and FastISel. The module moves to a
+// fresh context first (bootstrapRebuildHeldModule), and is disposed either way.
+trusted fun bootstrapEmitHeldNativeObject(objectPath: string): int {
+    val nullPointer = nativeNullPointer()
+    var status = if (pointerIsNull(bootstrapLlvmHeldModule)) 165 else 0
+    if (status == 0 && llvmInitializeNativeTarget() != 0) status = 166
+    if (status == 0) status = bootstrapRebuildHeldModule()
+    val module = bootstrapLlvmHeldModule
+    val target = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    val triple = LLVMGetDefaultTargetTriple()
+    if (status == 0 && LLVMGetTargetFromTriple(triple, target.address, message.address) != 0) {
+        status = 166
+    }
+    var machine = nullPointer
+    var layout = nullPointer
+    var options = nullPointer
+    if (status == 0) {
+        machine = LLVMCreateTargetMachine(target.load(), triple, "generic", "", 0, 2, 0)
+        if (pointerIsNull(machine)) status = 166
+        else LLVMSetTargetMachineGlobalISel(machine, 0)
+    }
+    if (status == 0) {
+        LLVMSetTarget(module, triple)
+        layout = LLVMCreateTargetDataLayout(machine)
+        LLVMSetModuleDataLayout(module, layout)
+        options = LLVMCreatePassBuilderOptions()
+        status = llvmConsumeError(
+            LLVMRunPasses(module, llvmPassesFast(), machine, options), 167
+        )
+    }
+    if (status == 0 && LLVMTargetMachineEmitToFile(
+        machine, module, objectPath, 1, message.address
+    ) != 0) status = 168
+    if (status != 0 && !pointerIsNull(message.load())) {
+        linuxPrintStandardError(
+            "error[E_LLVM_CODEGEN]: ${nativeCString(message.load())}\n"
+        )
+    }
+    if (!pointerIsNull(options)) LLVMDisposePassBuilderOptions(options)
+    if (!pointerIsNull(layout)) LLVMDisposeTargetData(layout)
+    if (!pointerIsNull(machine)) LLVMDisposeTargetMachine(machine)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    LLVMDisposeMessage(triple)
+    target.close()
+    message.close()
+    bootstrapDisposeHeldModule()
+    status
+}
+
 fun bootstrapDisposeHeldModule(): void {
     if (!pointerIsNull(bootstrapLlvmHeldModule)) LLVMDisposeModule(bootstrapLlvmHeldModule)
     if (!pointerIsNull(bootstrapLlvmHeldContext)) LLVMContextDispose(bootstrapLlvmHeldContext)
@@ -1797,6 +1849,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // and llc that emit cross-target objects, so their versions join it.
     val compilerImageRead = Path("/proc/self/exe").readText()
     val cacheEnabled = allowCache && compilerImageRead.size > 0
+    // A Mach-O development build keeps its module in process for code generation too:
+    // nothing reads the text it would render (about 100 MB for a large program), which
+    // the object emitter only parsed back. (ELF goes through the text: its partition
+    // cache reads it, and a small module's function sections are added to it.)
+    // ABLA_KEEP_LLVM_TEXT=1 and ABLA_LLVM_OUT_OF_PROCESS=1 keep the text.
+    val nativeHeld = target.hosted && target.objectFormat == "macho" && !ltoEligible &&
+        cacheProfile == "inprocess-fast" && !bootstrapKeepLlvmText() &&
+        !bootstrapLlvmOutOfProcess()
     var backendIdentity = ""
     if (cacheEnabled) {
         backendIdentity = "abla-backend\nllvm-library:${llvmLibraryVersion()}"
@@ -1896,7 +1956,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         bootstrapLlvmBitcodePath = if (inProcessCodegen) "" else bitcodePath
         bootstrapLlvmFastInlineThreshold =
             if (fastCross) bootstrapFastInlineThreshold() else 0
-        bootstrapLlvmHoldModule = inProcessCodegen
+        bootstrapLlvmHoldModule = inProcessCodegen || nativeHeld
         val compilation = bootstrapCompileLlvmParsedCached(
             parsedGraph,
             irCache,
@@ -1936,9 +1996,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 status = 154
                 failureKind = "reported"
             } else {
-                if (bitcodeHandoff) {
+                if (bitcodeHandoff || nativeHeld) {
                     // A text of an earlier build would no longer match the module.
                     Path(llvmPath).remove()
+                    // (Nor may the build's transaction put it back.)
+                    if (nativeHeld) bootstrapDropBuildTransactionPath(llvmPath)
                     status = 0
                 } else {
                     val emitted = if (target.objectFormat == "elf" &&
@@ -1988,6 +2050,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     )
                 } else if (inProcessCodegen) {
                     status = bootstrapEmitHeldWasmObject(target.llvmTriple, objectPath)
+                } else if (nativeHeld) {
+                    status = bootstrapEmitHeldNativeObject(objectPath)
                 } else if (bitcodeHandoff) {
                     status = emitObject(bitcodePath, objectPath)
                     Path(bitcodePath).remove()
