@@ -1223,11 +1223,6 @@ fun bootstrapNormalizeTypeSlow(type: string): string {
         val element = bootstrapNormalizeType(type.slice(5, type.size - 1))
         result = "cell:$element"
     }
-    if (type.size >= 7 && type.slice(0, 5) == "TVar<" &&
-        type.slice(type.size - 1, type.size) == ">") {
-        val element = bootstrapNormalizeType(type.slice(5, type.size - 1))
-        result = "tvar:$element"
-    }
     if (type.size >= 8 && type.slice(0, 4) == "Map<" &&
         type.slice(type.size - 1, type.size) == ">") {
         val comma = bootstrapTypeArgumentComma(type, 4, type.size - 1)
@@ -1286,9 +1281,6 @@ fun ablaCompilerTypeNeedsNormalization(type: string): bool {
         needed = true
     }
     if (!needed && type.size >= 5 && type.slice(0, 5) == "Cell<") {
-        needed = true
-    }
-    if (!needed && type.size >= 5 && type.slice(0, 5) == "TVar<") {
         needed = true
     }
     if (!needed && type.size >= 4 && type.slice(0, 4) == "Map<") {
@@ -1541,54 +1533,46 @@ fun bootstrapMutexElementType(type: string): string {
 fun bootstrapIsCellType(type: string): bool =
     type.size >= 5 && type.slice(0, 5) == "cell:"
 
-// ---- TVar<T>, built in until generics land ----
-// `TVar<T>` is `tvar:T`: a transactional variable, shaped as the library class
-// it will be:
-//
-//   class TVar<T>(value: T) {      // T neither a resource nor affine
-//       fun getValue(): T          // the transaction's read
-//       fun setValue(value: T): void   // the transaction's write
-//   }
-//
-// Its methods answer the ordinary method queries (methodResultType,
-// methodParameterCount, methodParameterType), so calls, delegation (`by
-// TVar(…)`) and their diagnostics are a class's; lowering maps them to the
-// runtime (ir.ab: __ablaRuntimeTVarCreate, __ablaRuntimeStmRead/Write).
-fun bootstrapIsTVarType(type: string): bool =
-    type.size >= 5 && type.slice(0, 5) == "tvar:"
-
-fun bootstrapTVarElementType(type: string): string =
-    if (bootstrapIsTVarType(type)) type.slice(5, type.size) else "unknown"
-
-fun bootstrapTVarMethodParameters(method: string): int =
-    if (method == "getValue") 0 else if (method == "setValue") 1 else -1
-
-fun bootstrapTVarMethodResult(owner: string, method: string): string =
-    if (method == "getValue") bootstrapTVarElementType(owner)
-    else if (method == "setValue") "void" else "unknown"
-
-fun bootstrapTVarMethodParameter(owner: string, method: string, parameter: int): string =
-    if (method == "setValue" && parameter == 0) bootstrapTVarElementType(owner) else "unknown"
-
-@noinline
-fun bootstrapInferCallTVar(
-    var analyzer: BootstrapAnalyzer,
-    expression: BootstrapExpression,
-    initial: string
-): string {
-    var result = initial
-    if (expression.children.size != 1) {
-        analyzer.fail("constructor.arity:TVar")
-        result = "unknown"
-    } else {
-        val element = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
-        // An aborted attempt would skip a resource's drop, or drop it twice.
-        if (analyzer.typeIsAffine(element)) analyzer.fail("stm.resource:TVar<$element>")
-        result = "tvar:$element"
+// ---- Runtime-valued classes ----
+// A class annotated `@__abla_runtime_value("<make> <method>:<function> …")`
+// (abla/stm's TVar; the annotation is the standard library's alone) has the
+// runtime's own values for instances: `TVar(1)` is `<make>(1)`, and each
+// listed method, declared without a body, is a call of its runtime function
+// with the instance first (ir.ab). Everything else about it is a class's.
+fun bootstrapRuntimeValueSpec(declaration: BootstrapDeclaration): string {
+    var index = 0
+    while (index < declaration.annotations.size) {
+        if (declaration.annotations[index] == "__abla_runtime_value" &&
+            index < declaration.annotationArguments.size &&
+            declaration.annotationArguments[index].kind == "string") {
+            return declaration.annotationArguments[index].text
+        }
+        index = index + 1
     }
-    result
+    ""
 }
-// ---- end of TVar<T> ----
+
+/** The runtime function that makes an instance (the spec's first word). */
+fun bootstrapRuntimeValueConstructor(spec: string): string {
+    var end = 0
+    while (end < spec.size && spec[end] != 32) end = end + 1
+    spec.slice(0, end)
+}
+
+/** The runtime function the spec names for `method`, else "". */
+fun bootstrapRuntimeValueMethod(spec: string, method: string): string {
+    var begin = 0
+    while (begin < spec.size) {
+        var end = begin
+        while (end < spec.size && spec[end] != 32) end = end + 1
+        val word = spec.slice(begin, end)
+        if (word.size > method.size + 1 && word.slice(0, method.size) == method &&
+            word[method.size] == 58) return word.slice(method.size + 1, word.size)
+        begin = end + 1
+    }
+    ""
+}
+// ---- end of runtime-valued classes ----
 
 // Map<K, V> is `map:K:V`; K is string or i64 (or unknown for an untyped
 // `Map()`), so the colon after it always ends the key.
@@ -3295,8 +3279,7 @@ fun bootstrapSummaryTypeIsManagedReferenceAt(
 ): bool {
     val normalized = bootstrapNormalizeType(type)
     var managed = bootstrapIsArrayType(normalized) ||
-        bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized) ||
-        bootstrapIsTVarType(normalized)
+        bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized)
     var declaration = 0
     while (!managed && declaration < declarations.size) {
         val candidate = declarations[declaration]
@@ -3329,7 +3312,6 @@ fun bootstrapSummaryTypeIsManagedReferenceIn(
     val normalized = bootstrapNormalizeType(type)
     var managed = bootstrapIsArrayType(normalized) ||
         bootstrapIsCellType(normalized) || bootstrapIsMapType(normalized) ||
-        bootstrapIsTVarType(normalized) ||
         managedTypes.find(normalized) >= 0
     if (!managed && depth < 32 && bootstrapIsNullableType(normalized)) {
         managed = bootstrapSummaryTypeIsManagedReferenceIn(
@@ -3773,8 +3755,7 @@ fun bootstrapExpressionCompileEffects(
     var mask = 0
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
-        expression.text != "Cell" && expression.text != "Map" &&
-        expression.text != "TVar") {
+        expression.text != "Cell" && expression.text != "Map") {
         mask = bootstrapCompileEffectLookup(
             summary,
             expression.text,
@@ -4132,7 +4113,6 @@ fun bootstrapDelegatedCompileEffectsIn(
     if (expression.kind == "call" && expression.text != "move" &&
         expression.text != "Shared" && expression.text != "Mutex" &&
         expression.text != "Cell" && expression.text != "Map" &&
-        expression.text != "TVar" &&
         !bound.binds(expression.text, "${expression.text}#${expression.children.size}")) {
         mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,
@@ -6469,8 +6449,24 @@ class BootstrapAnalyzer(
     var genericExpectedEnd: int = -1,
     // The locals by name (localIndex.last, then .previous): a name's lookup
     // walks only the locals of that name, not every local of the function.
-    var localIndex: BootstrapLocalIndex = bootstrapLocalIndex()
+    var localIndex: BootstrapLocalIndex = bootstrapLocalIndex(),
+    // The classes conforming to Transactional (isTransactionalType) and the
+    // runtime-valued ones (isRuntimeValueType).
+    val transactionalNames: BootstrapStringSet = bootstrapStringSet(),
+    val runtimeValueNames: BootstrapStringSet = bootstrapStringSet()
 ) {
+    /** Whether `type` is a class conforming to Transactional (a TVar, or a
+     *  library's transactional delegate): reads and writes through it are
+     *  its transaction's. */
+    fun isTransactionalType(type: string): bool =
+        this.transactionalNames.keys.size > 0 &&
+            this.transactionalNames.contains(bootstrapBorrowElementType(bootstrapNormalizeType(type)))
+
+    /** Whether `type` is a runtime-valued class (bootstrapRuntimeValueSpec). */
+    fun isRuntimeValueType(type: string): bool =
+        this.runtimeValueNames.keys.size > 0 &&
+            this.runtimeValueNames.contains(bootstrapBorrowElementType(bootstrapNormalizeType(type)))
+
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
         while (capacity < expectedSymbols * 2 + 1) {
@@ -7488,7 +7484,6 @@ class BootstrapAnalyzer(
                 val promoting = expression.text == "memoryPromoteString"
                 val constructing = expression.text == "Shared" ||
                     expression.text == "Cell" || expression.text == "Map" ||
-                    expression.text == "TVar" ||
                     this.findKind(expression.text) == "class"
                 if (moving) {
                     owned = this.regionExpressionIsOwned(
@@ -7889,7 +7884,7 @@ class BootstrapAnalyzer(
             (this.findKind(root) == "var" || this.findKind(root) == "val")
         // (The runtime's own globals, a collection's bookkeeping, aren't the
         // program's state.)
-        if (global && !bootstrapIsTVarType(this.delegateType(root)) &&
+        if (global && !this.isTransactionalType(this.delegateType(root)) &&
             !bootstrapRuntimeModuleSource(this.currentSourceIdentity)) {
             this.stmNote("global", -1, at, root)
         }
@@ -8058,7 +8053,6 @@ class BootstrapAnalyzer(
     }
 
     fun methodResultType(owner: string, method: string, at: int = -1): string {
-        if (bootstrapIsTVarType(owner)) return bootstrapTVarMethodResult(owner, method)
         var result = "unknown"
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -8080,7 +8074,6 @@ class BootstrapAnalyzer(
     }
 
     fun methodParameterCount(owner: string, method: string): int {
-        if (bootstrapIsTVarType(owner)) return bootstrapTVarMethodParameters(method)
         var result = -1
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -8090,7 +8083,6 @@ class BootstrapAnalyzer(
     }
 
     fun methodRequiredParameterCount(owner: string, method: string): int {
-        if (bootstrapIsTVarType(owner)) return bootstrapTVarMethodParameters(method)
         var result = -1
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -8114,7 +8106,6 @@ class BootstrapAnalyzer(
         method: string,
         parameter: int
     ): string {
-        if (bootstrapIsTVarType(owner)) return bootstrapTVarMethodParameter(owner, method, parameter)
         var result = "unknown"
         val entry = this.methodDeclarations.find(owner, method)
         if (entry >= 0) {
@@ -8311,6 +8302,11 @@ class BootstrapAnalyzer(
             if (bootstrapIsBorrowType(rawDelegateType)) {
                 this.fail("ownership.borrow-store:delegate.$binding")
             }
+            // Checking the contract calls nothing: the getter and setter run
+            // where the binding is read and written (validateDelegatedRead,
+            // the assignment), inside a transaction for a transactional one.
+            val stmEnabled = this.stmEnabled
+            this.stmEnabled = false
             val getterParameters = this.methodParameterCount(
                 delegateType,
                 "getValue"
@@ -8370,6 +8366,7 @@ class BootstrapAnalyzer(
                 this.compileDepth == 0) {
                 this.fail("compile.call-runtime:$delegateType.getValue")
             }
+            this.stmEnabled = stmEnabled
         }
         bootstrapDelegatedType(
             expression.text == "var",
@@ -8383,8 +8380,9 @@ class BootstrapAnalyzer(
         name: string
     ): void {
         val owner = this.delegateType(name)
-        // The getter runs here (the transactions' checks: bootstrapCheckStm).
-        if (!bootstrapIsTVarType(owner)) {
+        // The getter runs here (the transactions' checks: bootstrapCheckStm);
+        // a runtime-valued class's (a TVar's) is the runtime's.
+        if (!this.isRuntimeValueType(owner)) {
             this.stmNote("call", this.selectedMethodHandle(owner, "getValue"), expression.begin, "")
         }
         val receiverKind = this.methodReceiverKind(owner, "getValue")
@@ -8482,8 +8480,7 @@ class BootstrapAnalyzer(
             bootstrapIsBorrowType(normalized)) return false
         if (bootstrapIsArrayType(normalized) ||
             bootstrapIsCellType(normalized) ||
-            bootstrapIsMapType(normalized) ||
-            bootstrapIsTVarType(normalized)) return true
+            bootstrapIsMapType(normalized)) return true
         val declaration = this.typeDeclarations.find(normalized)
         if (declaration >= 0) {
             val kind = this.declarations[declaration].kind
@@ -9714,7 +9711,7 @@ class BootstrapAnalyzer(
         bootstrapIsSharedType(normalized) ||
             bootstrapIsMutexType(normalized) ||
             bootstrapIsWeakType(normalized) ||
-            bootstrapIsTVarType(normalized)
+            this.isTransactionalType(normalized)
     }
 
     fun validateThreadCaptures(body: BootstrapExpression): void {
@@ -9751,7 +9748,7 @@ class BootstrapAnalyzer(
         if ((expression.kind == "identifier" ||
              expression.kind == "assign") &&
             this.globalKindNamed(expression) == "var" &&
-            !bootstrapIsTVarType(this.delegateType(expression.text))) found = true
+            !this.isTransactionalType(this.delegateType(expression.text))) found = true
         if (expression.kind == "delegate.assign" && expression.children.size > 0 &&
             expression.children[0].kind == "identifier" &&
             this.globalKindNamed(expression.children[0]) == "var") found = true
@@ -10637,16 +10634,13 @@ class BootstrapAnalyzer(
         if (expression.kind == "call" && expression.text == "Cell") {
             result = bootstrapInferCallCell(this, expression, result)
         }
-        if (expression.kind == "call" && expression.text == "TVar") {
-            result = bootstrapInferCallTVar(this, expression, result)
-        }
         if (expression.kind == "call" && expression.text == "filledArray") {
             result = bootstrapInferCallFilledArray(this, expression, result)
         }
         if (expression.kind == "call" && expression.text != "move" &&
             expression.text != "Shared" && expression.text != "Mutex" &&
             expression.text != "Cell" && expression.text != "filledArray" &&
-            expression.text != "Map" && expression.text != "TVar") {
+            expression.text != "Map") {
             if (this.overloads.keys.size > 0) {
                 val overloaded = this.inferOverloadedCall(expression)
                 if (overloaded != "") return overloaded
@@ -11024,6 +11018,13 @@ class BootstrapAnalyzer(
             if (declaration.kind == "class" || declaration.kind == "interface" ||
                 declaration.kind == "extend") {
                 this.validateConformances(declaration)
+            }
+            // The standard library's own annotation (runtime-valued classes).
+            for (annotation in declaration.annotations) {
+                if (annotation == "__abla_runtime_value" &&
+                    !bootstrapStandardLibraryModuleSource(bootstrapGenericSourceFile(declaration.sourceIdentity))) {
+                    this.failAtOffset("annotation.reserved:$annotation", declaration.begin)
+                }
             }
             // Exporting publishes a function: never a private one.
             if (declaration.isPrivate) {
@@ -11941,7 +11942,7 @@ fun bootstrapInferIdentifier(
     if (result != "unknown" &&
         analyzer.nameIsDelegated(expression.text)) {
         analyzer.validateDelegatedRead(expression, expression.text)
-        if (bootstrapIsTVarType(analyzer.delegateType(expression.text))) {
+        if (analyzer.isTransactionalType(analyzer.delegateType(expression.text))) {
             analyzer.stmNote("access", -1, expression.begin, expression.text)
         }
         // (A property without a getter, reported with it, stays a field read.)
@@ -13034,8 +13035,9 @@ fun bootstrapInferMemberCall(
             analyzer, bootstrapMemberCallAsValueCall(expression), result
         )
     } else {
-        // A TVar's getValue and setValue are its transaction's reads and writes.
-        if (bootstrapIsTVarType(receiver)) {
+        // A TVar's getValue and setValue are its transaction's reads and
+        // writes (any transactional delegate's).
+        if (analyzer.isTransactionalType(receiver)) {
             analyzer.stmNote("access", -1, expression.begin, "${expression.text}()")
         }
         val receiverKind = analyzer.methodReceiverKind(
@@ -13780,7 +13782,7 @@ fun bootstrapInferAssign(
     }
     val property = delegated && analyzer.namesDelegatedField(expression.text)
     var propertyAction = "self.assign"
-    if (delegated && bootstrapIsTVarType(analyzer.delegateType(expression.text))) {
+    if (delegated && analyzer.isTransactionalType(analyzer.delegateType(expression.text))) {
         analyzer.stmNote("access", -1, expression.begin, expression.text)
     } else analyzer.stmCheckMutation(
         BootstrapExpression("identifier", expression.text, expression.begin, expression.end, []),
@@ -13797,7 +13799,7 @@ fun bootstrapInferAssign(
     }
     if (delegated) {
         val delegateType = analyzer.delegateType(expression.text)
-        if (!bootstrapIsTVarType(delegateType)) analyzer.stmNote(
+        if (!analyzer.isRuntimeValueType(delegateType)) analyzer.stmNote(
             "call", analyzer.selectedMethodHandle(delegateType, "setValue"), expression.begin, ""
         )
         val setterInput = analyzer.methodParameterType(
@@ -14703,14 +14705,33 @@ fun bootstrapAnalyzer(
         bootstrapNoInferredResults(),
         bootstrapNoInitEdges(),
         stmEnabled = bootstrapProgramUsesStm(parsed.declarations),
-        generics = generics
+        generics = generics,
+        transactionalNames = bootstrapTransactionalClasses(parsed.declarations, false),
+        runtimeValueNames = bootstrapTransactionalClasses(parsed.declarations, true)
     )
 }
 
-/** Whether a program has an `atomic` or makes a TVar: only then are the
- *  transactions' checks recorded (bootstrapCheckStm). */
+/** The classes among `declarations` conforming to Transactional, or with
+ *  `runtimeValued` the runtime-valued ones (bootstrapRuntimeValueSpec). */
+fun bootstrapTransactionalClasses(declarations: array<BootstrapDeclaration>, runtimeValued: bool): BootstrapStringSet {
+    val names = bootstrapStringSet()
+    val transactional = bootstrapInterfaceIndexIn(declarations, "Transactional") >= 0
+    for (declaration in declarations) {
+        if (transactional && declaration.kind == "class" &&
+            (if (runtimeValued) bootstrapRuntimeValueSpec(declaration) != ""
+             else bootstrapTypeConformsIn(declarations, declaration.name, "Transactional"))) {
+            names.add(declaration.name)
+        }
+    }
+    names
+}
+
+/** Whether a program has an `atomic` or transactional delegates (abla/stm,
+ *  which a program naming TVar has): only then are the transactions'
+ *  checks recorded (bootstrapCheckStm). */
 fun bootstrapProgramUsesStm(declarations: array<BootstrapDeclaration>): bool {
     for (declaration in declarations) {
+        if (declaration.kind == "interface" && declaration.name == "Transactional") return true
         if (bootstrapExpressionUsesStm(declaration.expression)) return true
         for (fallback in declaration.parameterDefaults) {
             if (bootstrapExpressionUsesStm(fallback)) return true
@@ -14723,8 +14744,7 @@ fun bootstrapProgramUsesStm(declarations: array<BootstrapDeclaration>): bool {
 }
 
 fun bootstrapExpressionUsesStm(expression: BootstrapExpression): bool {
-    if (expression.kind == "atomic" ||
-        (expression.kind == "call" && expression.text == "TVar")) return true
+    if (expression.kind == "atomic") return true
     for (child in expression.children) {
         if (bootstrapExpressionUsesStm(child)) return true
     }
@@ -14852,6 +14872,16 @@ fun bootstrapCheckStm(var analyzer: BootstrapAnalyzer): void {
     val source = analyzer.currentSourceIdentity
     // Each mistake once, though a call is recorded at each lookup.
     val reported = bootstrapStringSet()
+    // Where a TVar access outside a transaction is reported: a transactional
+    // delegate's getter or setter called there is that same mistake.
+    val accessed = bootstrapStringSet()
+    event = 0
+    while (event < events) {
+        if (analyzer.stmKinds[event] == "access" && !analyzer.stmInside[event]) {
+            accessed.add("${analyzer.stmSources[event]}:${analyzer.stmBegins[event]}")
+        }
+        event = event + 1
+    }
     event = 0
     while (event < events) {
         val owner = analyzer.stmOwners[event]
@@ -14866,7 +14896,7 @@ fun bootstrapCheckStm(var analyzer: BootstrapAnalyzer): void {
         }
         if (kind == "call" && target >= 0 && target < nodes && callable[target]) {
             if (!inside && anywhere && transactional[target]) {
-                code = "stm.outside-atomic:${names[target]}"
+                if (!accessed.contains("${analyzer.stmSources[event]}:$at")) code = "stm.outside-atomic:${names[target]}"
             } else if (inside && inputs[target]) {
                 code = "stm.effect:io:${names[target]}"
             } else if (inside && threads[target]) {

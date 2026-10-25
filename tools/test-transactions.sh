@@ -42,6 +42,15 @@ for program in surface-bank surface-channel nested-orelse; do
         run=$((run + 1))
     done
 done
+# abla/stm under strict imports: TVar and Transactional unimported, used by
+# private declarations, a library's own transactional delegate shared by
+# threads; then a program's own TVar, which wins over the library's.
+for program in library/main own-tvar; do
+    name=${program//\//-}
+    "$compiler" build "$project_root/tests/cases/stm/$program.ab" \
+        -o "$output_directory/$name" --no-cache
+    expect_42 "$output_directory/$name"
+done
 # The orElse alternatives' kept values survive collections at every point.
 ABLA_GC_STRESS=1 expect_42 "$output_directory/nested-orelse"
 
@@ -70,7 +79,7 @@ fixtures=(
     effect-io effect-fs effect-thread effect-delegate effect-native
     resource-tvar resource-local
     mutation-local mutation-object mutation-global
-    control-return orelse-type
+    control-return orelse-type reserved outside-transactional
 )
 diagnostics=(
     'stm.outside-atomic:getValue()' 'stm.outside-atomic:withdraw'
@@ -81,6 +90,7 @@ diagnostics=(
     'stm.outside-mutation:seen' 'stm.outside-mutation:log.append()'
     'stm.outside-mutation:count:calls'
     'stm.control:return' 'stm.orElse-type:i64:string'
+    'annotation.reserved:__abla_runtime_value' 'stm.outside-atomic:total'
 )
 index=0
 while [[ $index -lt ${#fixtures[@]} ]]; do
@@ -103,4 +113,4 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     index=$((index + 1))
 done
 
-printf 'transactions: semantics (both evaluators, WebAssembly), bank, channel and nested orElse under contention (%s runs each), and every check passed\n' "$runs"
+printf 'transactions: semantics (both evaluators, WebAssembly), bank, channel and nested orElse under contention (%s runs each), abla/stm under strict imports and a program'"'"'s own TVar, and every check passed\n' "$runs"

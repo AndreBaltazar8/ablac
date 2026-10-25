@@ -2257,7 +2257,17 @@ fun main {
 - `TVar(value)` makes one (`TVar<int>`, ...); `getValue()` and `setValue(v)`
   read and write it, and `var x by TVar(v)` (a local, a global or a class
   property) does that through `x`. Its type may not be a resource or affine
-  (`stm.resource`).
+  (`stm.resource:TVar<T>`). `TVar` is the generic class `TVar<T>` of
+  `abla/stm`, which a program that names it has without importing it (a
+  declaration of its own called `TVar` wins); its instances are the
+  runtime's transactional variables themselves, so making, reading and
+  writing one costs what the runtime's calls do.
+- A delegate class conforming to `abla/stm`'s `Transactional` interface (as
+  `TVar` does) is a transactional delegate: a binding delegated to one may
+  be read and written inside `atomic` and shared by threads, as one
+  delegated to a `TVar` may. Such a class's own `getValue` and `setValue`
+  are checked as any code a transaction runs (their effects, what they
+  change), so a library delegate built on TVars works like a TVar.
 - `atomic { ... }` is an expression worth its block's value. Inside another
   transaction it joins that one: both commit together.
 - `retry` gives up the attempt and waits until a TVar the block read changes,
@@ -2352,7 +2362,7 @@ change only what can be put back. The compiler checks:
 |---|---|
 | `stm.outside-atomic:<what>` | A TVar (or `retry`) reached outside any transaction: a function or method that reaches one outside an `atomic`, itself or through what it calls, runs only inside a transaction, and `main`, a global's initializer, a lambda (other than a transaction's body) and a top-level action can't be inside one |
 | `stm.effect:<effect>` | A transaction's body, or anything it calls, prints or reads the standard streams (`io`), touches the file system (`filesystem`), the network (`network`) or native code (`native`), or starts a thread or task (`thread`). Reading the clock, random numbers and the environment is allowed |
-| `stm.resource:<name>` | A `TVar` of a resource or affine type, or a resource-typed local declared in a transaction: an abandoned attempt would skip its drop |
+| `stm.resource:<name>` | A `TVar` of a resource or affine type (`stm.resource:TVar<Ticket>`), or a resource-typed local declared in a transaction (`stm.resource:ticket`): an abandoned attempt would skip its drop |
 | `stm.outside-mutation:<what>` | Inside a transaction, a change to anything but a TVar or what the transaction made (its own locals and the objects they hold): assigning a captured local, a global or a field, changing an outside object (a field, an element, a mutating method, a `var` argument), replacing an outer delegate, or calling a function that changes a global |
 | `stm.control:return` | `return` inside a transaction's body, which is a closure: it would leave only the block |
 | `stm.orElse-type:<a>:<b>` | The alternatives of an `orElse` have unrelated types |

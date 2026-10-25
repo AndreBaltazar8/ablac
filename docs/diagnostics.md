@@ -164,9 +164,12 @@ in [ownership.md](ownership.md#reading-ownership-diagnostics).
 `stm.outside-mutation`, `stm.control:return`, `stm.orElse-type` and
 `stm.orelse-retry-wasm` are
 explained in [language.md](language.md#what-a-transaction-may-do).
-A misused `TVar` is reported as a class's would be (it has a constructor of
-one argument, `getValue()` and `setValue(value)`): `constructor.arity:TVar`,
-`method.unknown`, `method.arity`, `method.argument`.
+A misused `TVar` is reported as any generic class's is (`TVar<T>` of
+`abla/stm`, with a constructor of one argument, `getValue()` and
+`setValue(value)`), naming its instance as `TVar<i64>`:
+`generic.cannot-infer:TVar:T`, `method.unknown`, `method.arity`,
+`method.argument`. `annotation.reserved:<name>` is an annotation only the
+standard library may use (`__abla_runtime_value`).
 
 ## Regions
 
