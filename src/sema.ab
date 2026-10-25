@@ -693,70 +693,74 @@ fun bootstrapBuildMutableReceiverSummary(
     val managedTypes = bootstrapManagedTypeIndex(declarations)
     val exclusive = bootstrapExclusiveArgumentsOf(declarations)
     val fields = bootstrapSummaryFields(declarations)
-    var changed = true
-    while (changed) {
-        changed = false
-        var declaration = 0
-        while (declaration < declarations.size) {
-            val candidate = declarations[declaration]
-            val extensionOwner = bootstrapNormalizeType(
-                candidate.extensionOwner
-            )
-            if (extensionOwner != "" &&
-                (bootstrapSummaryTypeIsAffine(extensionOwner, affineTypes) ||
-                 bootstrapSummaryTypeIsManagedReferenceIn(
-                    extensionOwner,
-                    managedTypes,
-                    0
-                 )) &&
-                !bootstrapMutableReceiverContains(
-                    summary,
-                    extensionOwner,
-                    candidate.name
-                ) && bootstrapExpressionMayMutateReceiver(
-                    candidate.expression,
-                    declarations,
-                    extensionOwner,
-                    summary,
-                    exclusive,
-                    fields,
-                    candidate.parameters,
-                    []
-                )) {
-                bootstrapMutableReceiverAdd(summary, extensionOwner, candidate.name)
-                changed = true
-            }
-            if (bootstrapSummaryTypeIsAffine(candidate.name, affineTypes) ||
+    // A body is walked again only once a method it calls joins the summary
+    // (BootstrapBodySchedule).
+    val declarationOf: array<int> = []
+    val methodOf: array<int> = []
+    val callers = bootstrapCallersOf(declarations, declarationOf, methodOf)
+    var schedule = bootstrapBodySchedule(declarationOf.size)
+    var round = true
+    while (round) {
+        var body = schedule.take()
+        while (body >= 0) {
+            val candidate = declarations[declarationOf[body]]
+            val method = methodOf[body]
+            if (method < 0) {
+                val extensionOwner = bootstrapNormalizeType(
+                    candidate.extensionOwner
+                )
+                if (extensionOwner != "" &&
+                    (bootstrapSummaryTypeIsAffine(extensionOwner, affineTypes) ||
+                     bootstrapSummaryTypeIsManagedReferenceIn(
+                        extensionOwner,
+                        managedTypes,
+                        0
+                     )) &&
+                    !bootstrapMutableReceiverContains(
+                        summary,
+                        extensionOwner,
+                        candidate.name
+                    ) && bootstrapExpressionMayMutateReceiver(
+                        candidate.expression,
+                        declarations,
+                        extensionOwner,
+                        summary,
+                        exclusive,
+                        fields,
+                        candidate.parameters,
+                        []
+                    )) {
+                    bootstrapMutableReceiverAdd(summary, extensionOwner, candidate.name)
+                    callers.touch(candidate.name, schedule)
+                }
+            } else if (bootstrapSummaryTypeIsAffine(candidate.name, affineTypes) ||
                 bootstrapSummaryTypeIsManagedReferenceIn(
                     candidate.name,
                     managedTypes,
                     0
                 )) {
-                var method = 0
-                while (method < candidate.methods.size) {
-                    val found = candidate.methods[method]
-                    if (!bootstrapMutableReceiverContains(
-                            summary,
-                            candidate.name,
-                            found.name
-                        ) && bootstrapExpressionMayMutateReceiver(
-                            found.expression,
-                            declarations,
-                            candidate.name,
-                            summary,
-                            exclusive,
-                            fields,
-                            found.parameters,
-                            []
-                        )) {
-                        bootstrapMutableReceiverAdd(summary, candidate.name, found.name)
-                        changed = true
-                    }
-                    method = method + 1
+                val found = candidate.methods[method]
+                if (!bootstrapMutableReceiverContains(
+                        summary,
+                        candidate.name,
+                        found.name
+                    ) && bootstrapExpressionMayMutateReceiver(
+                        found.expression,
+                        declarations,
+                        candidate.name,
+                        summary,
+                        exclusive,
+                        fields,
+                        found.parameters,
+                        []
+                    )) {
+                    bootstrapMutableReceiverAdd(summary, candidate.name, found.name)
+                    callers.touch(found.name, schedule)
                 }
             }
-            declaration = declaration + 1
+            body = schedule.take()
         }
+        round = schedule.nextRound()
     }
     summary
 }
@@ -4890,6 +4894,175 @@ fun bootstrapStringSetCopy(source: BootstrapStringSet): BootstrapStringSet {
     BootstrapStringSet(keys, slots)
 }
 
+/** The bodies a pass to a fixed point walks, numbered in program order, in
+ *  rounds. Walking every body in order each round until one changes nothing
+ *  walks again bodies whose answer cannot change: only a body touched since
+ *  its last walk (something it calls changed) is walked. One touched ahead of
+ *  the body being walked is walked later in the same round, one at or behind
+ *  it in the next round, so the bodies are walked, and the summary grows, in
+ *  the order walking every body would give. `current` is a min-heap. */
+class BootstrapBodySchedule(
+    val pending: array<bool>,
+    val current: array<int>,
+    val next: array<int>,
+    var at: int
+) {
+    /** The next body of this round, or -1 once the round is over. */
+    fun take(): int {
+        if (this.current.size == 0) return -1
+        val body = this.current[0]
+        val last = this.current[this.current.size - 1]
+        this.current.truncate(this.current.size - 1)
+        if (this.current.size > 0) {
+            var slot = 0
+            var settled = false
+            while (!settled) {
+                var child = slot * 2 + 1
+                if (child + 1 < this.current.size &&
+                    this.current[child + 1] < this.current[child]) child = child + 1
+                if (child < this.current.size && this.current[child] < last) {
+                    this.current[slot] = this.current[child]
+                    slot = child
+                } else settled = true
+            }
+            this.current[slot] = last
+        }
+        this.pending[body] = false
+        this.at = body
+        body
+    }
+
+    fun touch(body: int): void {
+        if (!this.pending[body]) {
+            this.pending[body] = true
+            if (body > this.at) {
+                this.current.append(body)
+                var slot = this.current.size - 1
+                while (slot > 0 && this.current[(slot - 1) / 2] > body) {
+                    this.current[slot] = this.current[(slot - 1) / 2]
+                    slot = (slot - 1) / 2
+                }
+                this.current[slot] = body
+            } else this.next.append(body)
+        }
+        return
+    }
+
+    /** Starts the next round: false when no body is left to walk. */
+    fun nextRound(): bool {
+        // (Behind none of them, each goes to this round.)
+        this.at = -1
+        var index = 0
+        while (index < this.next.size) {
+            val body = this.next[index]
+            this.pending[body] = false
+            this.touch(body)
+            index = index + 1
+        }
+        this.next.truncate(0)
+        this.current.size > 0
+    }
+}
+
+/** A schedule whose first round walks every one of `bodies` bodies. */
+fun bootstrapBodySchedule(bodies: int): BootstrapBodySchedule {
+    val current: array<int> = []
+    var body = 0
+    while (body < bodies) {
+        current.append(body)
+        body = body + 1
+    }
+    BootstrapBodySchedule(filledArray(bodies, true), current, [], -1)
+}
+
+/** The bodies that call each name (a call's or a member call's text): once a
+ *  body's summary changes, only the bodies calling it can answer differently.
+ *  A name's bodies form a chain from `heads`. */
+class BootstrapCallers(
+    val names: BootstrapStringSet,
+    val heads: array<int>,
+    val bodies: array<int>,
+    val next: array<int>
+) {
+    fun add(name: string, body: int): void {
+        var index = this.names.indexOf(name)
+        if (index < 0) {
+            this.names.add(name)
+            index = this.names.keys.size - 1
+            this.heads.append(-1)
+        }
+        // (A body's calls are added together: one entry per name is enough.)
+        if (this.heads[index] < 0 || this.bodies[this.heads[index]] != body) {
+            this.bodies.append(body)
+            this.next.append(this.heads[index])
+            this.heads[index] = this.bodies.size - 1
+        }
+        return
+    }
+
+    fun collect(expression: BootstrapExpression, body: int): void {
+        if (expression.kind == "call" || expression.kind == "member.call") {
+            this.add(expression.text, body)
+        }
+        for (child in expression.children) this.collect(child, body)
+        return
+    }
+
+    /** Touches every body that calls `name`, or (a method's name being
+     *  `Owner.method`) any part of it after a dot. */
+    fun touch(name: string, var schedule: BootstrapBodySchedule): void {
+        this.touchName(name, schedule)
+        var dot = 1
+        while (dot < name.size) {
+            if (name[dot] == 46) this.touchName(name.slice(dot + 1, name.size), schedule)
+            dot = dot + 1
+        }
+        return
+    }
+
+    fun touchName(name: string, var schedule: BootstrapBodySchedule): void {
+        val index = this.names.indexOf(name)
+        if (index >= 0) {
+            var entry = this.heads[index]
+            while (entry >= 0) {
+                schedule.touch(this.bodies[entry])
+                entry = this.next[entry]
+            }
+        }
+        return
+    }
+}
+
+fun bootstrapCallers(): BootstrapCallers =
+    BootstrapCallers(bootstrapStringSet(), [], [], [])
+
+/** The callers of every body of `declarations` (each declaration's body, then
+ *  each of its methods', numbered in that order), with `declarationOf` and
+ *  `methodOf` (-1: the declaration's own body) filled in for each body. */
+fun bootstrapCallersOf(
+    declarations: array<BootstrapDeclaration>,
+    var declarationOf: array<int>,
+    var methodOf: array<int>
+): BootstrapCallers {
+    val callers = bootstrapCallers()
+    var declarationIndex = 0
+    while (declarationIndex < declarations.size) {
+        val declaration = declarations[declarationIndex]
+        callers.collect(declaration.expression, declarationOf.size)
+        declarationOf.append(declarationIndex)
+        methodOf.append(-1)
+        var method = 0
+        while (method < declaration.methods.size) {
+            callers.collect(declaration.methods[method].expression, declarationOf.size)
+            declarationOf.append(declarationIndex)
+            methodOf.append(method)
+            method = method + 1
+        }
+        declarationIndex = declarationIndex + 1
+    }
+    callers
+}
+
 // The names lists keep their order; the sets beside them answer membership:
 // `unsafe` holds unsafeNames, `unsafeMembers` every part of one after a dot
 // (a member call `x.name` is unsafe when some unsafe `….name` is), and
@@ -5564,46 +5737,54 @@ fun bootstrapBuildRegionCallSummary(
         }
         declarationIndex = declarationIndex + 1
     }
-    var changed = true
-    while (changed) {
-        changed = false
-        declarationIndex = 0
-        while (declarationIndex < declarations.size) {
-            val declaration = declarations[declarationIndex]
-            if ((declaration.kind == "fun" ||
-                 declaration.kind == "compile.fun") &&
-                !bootstrapRegionCallIsUnsafe(summary, declaration.name) &&
-                moduleRecheck.contains(declaration.name) &&
-                bootstrapRegionExpressionStoresModuleValue(
+    // A body is walked again only once something it calls changes in the
+    // summary (BootstrapBodySchedule).
+    val declarationOf: array<int> = []
+    val methodOf: array<int> = []
+    val callers = bootstrapCallersOf(declarations, declarationOf, methodOf)
+    var schedule = bootstrapBodySchedule(declarationOf.size)
+    var round = true
+    while (round) {
+        var body = schedule.take()
+        while (body >= 0) {
+            val declaration = declarations[declarationOf[body]]
+            val methodIndex = methodOf[body]
+            var changed = false
+            if (methodIndex < 0) {
+                if ((declaration.kind == "fun" ||
+                     declaration.kind == "compile.fun") &&
+                    !bootstrapRegionCallIsUnsafe(summary, declaration.name) &&
+                    moduleRecheck.contains(declaration.name) &&
+                    bootstrapRegionExpressionStoresModuleValue(
+                        declaration.expression,
+                        moduleValues,
+                        bootstrapNamesWith(declaration.parameters, []),
+                        summary,
+                        [0]
+                    )) {
+                    bootstrapRegionAddUnsafe(summary, declaration.name)
+                    changed = true
+                }
+                if (bootstrapRegionExpressionRetainsParameters(
                     declaration.expression,
-                    moduleValues,
-                    bootstrapNamesWith(declaration.parameters, []),
-                    summary,
-                    [0]
-                )) {
-                bootstrapRegionAddUnsafe(summary, declaration.name)
-                changed = true
-            }
-            if (bootstrapRegionExpressionRetainsParameters(
-                declaration.expression,
-                declaration.name,
-                declaration.parameters,
-                declaration.parameterTypes,
-                declarations,
-                summary
-            )) changed = true
-            if ((declaration.kind == "fun" ||
-                 declaration.kind == "compile.fun") &&
-                !bootstrapRegionCallIsUnsafe(summary, declaration.name) &&
-                bootstrapRegionExpressionCallsUnsafe(
-                    declaration.expression,
+                    declaration.name,
+                    declaration.parameters,
+                    declaration.parameterTypes,
+                    declarations,
                     summary
-                )) {
-                bootstrapRegionAddUnsafe(summary, declaration.name)
-                changed = true
-            }
-            var methodIndex = 0
-            while (methodIndex < declaration.methods.size) {
+                )) changed = true
+                if ((declaration.kind == "fun" ||
+                     declaration.kind == "compile.fun") &&
+                    !bootstrapRegionCallIsUnsafe(summary, declaration.name) &&
+                    bootstrapRegionExpressionCallsUnsafe(
+                        declaration.expression,
+                        summary
+                    )) {
+                    bootstrapRegionAddUnsafe(summary, declaration.name)
+                    changed = true
+                }
+                if (changed) callers.touch(declaration.name, schedule)
+            } else {
                 val method = declaration.methods[methodIndex]
                 val name = "${declaration.name}.${method.name}"
                 if (bootstrapRegionExpressionRetainsParameters(
@@ -5641,10 +5822,11 @@ fun bootstrapBuildRegionCallSummary(
                     bootstrapRegionAddUnsafe(summary, name)
                     changed = true
                 }
-                methodIndex = methodIndex + 1
+                if (changed) callers.touch(name, schedule)
             }
-            declarationIndex = declarationIndex + 1
+            body = schedule.take()
         }
+        round = schedule.nextRound()
     }
     summary
 }
