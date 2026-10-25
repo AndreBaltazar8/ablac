@@ -548,8 +548,10 @@ fun bootstrapExpressionMayMutateReceiver(
     summary: BootstrapMutableReceiverSummary,
     exclusive: BootstrapExclusiveArguments,
     fields: BootstrapSummaryFields,
-    shadowed: array<string>,
-    aliases: array<string>
+    // The names in scope that shadow a field, and those aliasing the
+    // receiver's array: each node adds its own and takes them out again.
+    var shadowed: array<string>,
+    var aliases: array<string>
 ): bool {
     var mutates = expression.kind == "assign" &&
         !bootstrapAffineNamesContain(shadowed, expression.text) &&
@@ -634,28 +636,30 @@ fun bootstrapExpressionMayMutateReceiver(
     }
     // A parameter or local named like a field shadows it from its
     // declaration on: `val keys = []; keys.append(k)` leaves `this` alone.
-    var scope = bootstrapNamesWith(shadowed, [])
-    var child = 0
-    val lambda = expression.kind == "lambda" ||
-        expression.kind == "lambda.move" ||
-        expression.kind == "lambda.generator"
-    if (lambda) {
-        val parameters: array<string> = []
-        while (child + 1 < expression.children.size) {
-            parameters.append(expression.children[child].text)
-            child = child + 1
-        }
-        scope = bootstrapNamesWith(shadowed, parameters)
-    }
     // A loop over the receiver's array aliases it; any other loop variable
     // shadows a field of its name.
     val aliasing = expression.kind == "for" && expression.children.size > 1 &&
         bootstrapReceiverPlaceRoot(
             expression.children[0], fields, owner, shadowed, aliases
         )
+    val mark = shadowed.size
+    var child = 0
+    val lambda = expression.kind == "lambda" ||
+        expression.kind == "lambda.move" ||
+        expression.kind == "lambda.generator"
+    if (lambda) {
+        while (child + 1 < expression.children.size) {
+            shadowed.append(expression.children[child].text)
+            child = child + 1
+        }
+    }
     while (!mutates && child < expression.children.size) {
         val found = expression.children[child]
         val body = expression.kind == "for" && child == 1
+        val bodyMark = shadowed.size
+        val aliasMark = aliases.size
+        if (body && !aliasing) shadowed.append(expression.text)
+        if (body && aliasing) aliases.append(expression.text)
         mutates = bootstrapExpressionMayMutateReceiver(
             found,
             declarations,
@@ -663,19 +667,18 @@ fun bootstrapExpressionMayMutateReceiver(
             summary,
             exclusive,
             fields,
-            if (body && !aliasing) {
-                bootstrapNamesWith(scope, [expression.text])
-            } else scope,
-            if (body && aliasing) {
-                bootstrapNamesWith(aliases, [expression.text])
-            } else aliases
+            shadowed,
+            aliases
         )
+        shadowed.truncate(bodyMark)
+        aliases.truncate(aliasMark)
         if (expression.kind == "block" &&
             (found.kind == "local.val" || found.kind == "local.var")) {
-            scope = bootstrapNamesWith(scope, [found.text])
+            shadowed.append(found.text)
         }
         child = child + 1
     }
+    shadowed.truncate(mark)
     mutates
 }
 
@@ -727,7 +730,7 @@ fun bootstrapBuildMutableReceiverSummary(
                         summary,
                         exclusive,
                         fields,
-                        candidate.parameters,
+                        bootstrapNamesWith(candidate.parameters, []),
                         []
                     )) {
                     bootstrapMutableReceiverAdd(summary, extensionOwner, candidate.name)
@@ -751,7 +754,7 @@ fun bootstrapBuildMutableReceiverSummary(
                         summary,
                         exclusive,
                         fields,
-                        found.parameters,
+                        bootstrapNamesWith(found.parameters, []),
                         []
                     )) {
                     bootstrapMutableReceiverAdd(summary, candidate.name, found.name)
