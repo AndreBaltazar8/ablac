@@ -209,6 +209,7 @@ test-serial: ablac
 	tools/test-compile-time-cell-capture.sh $(COMPILER)
 	tools/test-hosted-network.sh $(COMPILER)
 	tools/test-native-platform-boundary.sh $(COMPILER)
+	tools/test-math-no-libm.sh $(COMPILER)
 	tools/test-lambda-context.sh $(COMPILER)
 	tools/test-reproducible-build.sh $(COMPILER)
 	tools/test-inferred-receivers.sh $(COMPILER)

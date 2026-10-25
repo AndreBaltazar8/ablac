@@ -3708,22 +3708,30 @@ fun bootstrapLlvmEmitCoreIntrinsic(
             val value = bootstrapLlvmScalarOperand(
                 backend, storage, instruction.operands[0], "f64"
             )
-            val symbol = if (name == "ablaF64Sqrt") "llvm.sqrt.f64"
-                else if (name == "ablaF64Floor") "llvm.floor.f64"
-                else if (name == "ablaF64Ceil") "llvm.ceil.f64"
-                else if (name == "ablaF64Trunc") "llvm.trunc.f64"
-                else if (name == "ablaF64Abs") "llvm.fabs.f64"
-                else "llvm.roundeven.f64"
-            val intrinsic = bootstrapLlvmDeclare(
-                backend, symbol, backend.f64Type,
-                [backend.f64Type], false, [false]
-            )
-            bootstrapLlvmSetNativeValue(
-                backend, storage, instruction.result,
-                bootstrapLlvmCall(
-                    backend, intrinsic, [value], "f64.unary", false, [false]
+            val rounding = name != "ablaF64Sqrt" && name != "ablaF64Abs"
+            if (rounding && !bootstrapLlvmTargetHasRoundingInstructions(backend.targetTriple)) {
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result,
+                    bootstrapLlvmSoftwareRounding(backend, name, value)
                 )
-            )
+            } else {
+                val symbol = if (name == "ablaF64Sqrt") "llvm.sqrt.f64"
+                    else if (name == "ablaF64Floor") "llvm.floor.f64"
+                    else if (name == "ablaF64Ceil") "llvm.ceil.f64"
+                    else if (name == "ablaF64Trunc") "llvm.trunc.f64"
+                    else if (name == "ablaF64Abs") "llvm.fabs.f64"
+                    else "llvm.roundeven.f64"
+                val intrinsic = bootstrapLlvmDeclare(
+                    backend, symbol, backend.f64Type,
+                    [backend.f64Type], false, [false]
+                )
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result,
+                    bootstrapLlvmCall(
+                        backend, intrinsic, [value], "f64.unary", false, [false]
+                    )
+                )
+            }
         }
     }
     // IEEE 754-2019 minimum and maximum (NaN wins, -0 below +0): one
@@ -8481,4 +8489,57 @@ fun bootstrapLlvmEmitFunction(
         bootstrapLlvmFoldValueSlotAddresses(backend, llvmFunction)
     }
     errors
+}
+
+// floor, ceil, trunc or roundeven of value from additions, comparisons and
+// copysign, for a target without rounding instructions (baseline x86-64,
+// where LLVM would call the C library's): roundeven(x) is
+// copysign((|x| + 2^52) - 2^52, x) below 2^52 and x from there on (a NaN goes
+// through the addition, which quiets it as the instructions do); floor takes 1
+// off where roundeven went up, ceil(x) = -floor(-x), trunc(x) =
+// copysign(floor(|x|), x). The bits are the instructions'.
+fun bootstrapLlvmSoftwareRounding(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    value: i64*
+): i64* {
+    val f64 = backend.f64Type
+    val fabs = bootstrapLlvmDeclare(backend, "llvm.fabs.f64", f64, [f64], false, [false])
+    val copysign = bootstrapLlvmDeclare(
+        backend, "llvm.copysign.f64", f64, [f64, f64], false, [false, false]
+    )
+    val big = LLVMConstRealOfStringAndSize(f64, "4503599627370496", i32(16))
+    val one = LLVMConstRealOfStringAndSize(f64, "1", i32(1))
+    // the argument floor works on: -x for ceil, |x| for trunc
+    var x = value
+    if (name == "ablaF64Ceil") x = LLVMBuildFNeg(backend.builder, value, "round.negate")
+    if (name == "ablaF64Trunc") x = bootstrapLlvmCall(backend, fabs, [value], "round.abs", false, [false])
+    val magnitude = bootstrapLlvmCall(backend, fabs, [x], "round.magnitude", false, [false])
+    val shifted = LLVMBuildFSub(
+        backend.builder,
+        LLVMBuildFAdd(backend.builder, magnitude, big, "round.add"),
+        big, "round.subtract"
+    )
+    val signed = bootstrapLlvmCall(
+        backend, copysign, [shifted, x], "round.sign", false, [false, false]
+    )
+    val small = LLVMBuildFCmp(
+        backend.builder, llvmRealUnorderedLessThan(), magnitude, big, "round.small"
+    )
+    val even = LLVMBuildSelect(backend.builder, small, signed, x, "round.even")
+    if (name == "ablaF64RoundEven") return even
+    val up = LLVMBuildFCmp(
+        backend.builder, llvmRealOrderedGreaterThan(), even, x, "round.up"
+    )
+    val floor = LLVMBuildSelect(
+        backend.builder, up, LLVMBuildFSub(backend.builder, even, one, "round.down"),
+        even, "round.floor"
+    )
+    if (name == "ablaF64Ceil") return LLVMBuildFNeg(backend.builder, floor, "round.ceil")
+    if (name == "ablaF64Trunc") {
+        return bootstrapLlvmCall(
+            backend, copysign, [floor, value], "round.trunc", false, [false, false]
+        )
+    }
+    floor
 }
