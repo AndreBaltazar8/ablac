@@ -4028,8 +4028,66 @@ fun bootstrapCollectDelegatedNames(
     }
 }
 
-// The names a node binds before any binder: shared, never appended to.
-val BOOTSTRAP_EFFECT_NO_NAMES: array<string> = []
+// The bindings in scope at a node, as bootstrapEffectBind keys: each name's
+// keys ("\n"-separated), and an undo log, so a block binds each local in O(1)
+// and drops them all when it ends (truncate) instead of copying its scope.
+class BootstrapEffectScope(
+    val names: Map<string, string>,
+    val undoNames: array<string>,
+    // What each logged name meant before ("" none).
+    val undoValues: array<string>
+) {
+    /** Binds `keys`: each replaces what its name meant before. */
+    fun bind(keys: array<string>): void {
+        var index = 0
+        while (index < keys.size) {
+            val name = bootstrapEffectKeyName(keys[index])
+            // (Keys of one name bound together are all bound.)
+            var value = ""
+            var same = 0
+            while (same < keys.size) {
+                if (bootstrapEffectKeyName(keys[same]) == name) {
+                    value = if (value == "") keys[same] else "$value\n${keys[same]}"
+                }
+                same = same + 1
+            }
+            val before = this.names.get(name)
+            this.undoNames.append(name)
+            this.undoValues.append(if (before != null) before else "")
+            this.names.set(name, value)
+            index = index + 1
+        }
+        return
+    }
+
+    /** Whether `key` (of `name`) is bound. */
+    fun binds(name: string, key: string): bool {
+        val value = this.names.get(name)
+        if (value == null) return false
+        if (value == key) return true
+        // (Several keys: one per line.)
+        var begin = 0
+        while (begin <= value.size) {
+            var end = begin
+            while (end < value.size && value[end] != 10) end = end + 1
+            if (value.slice(begin, end) == key) return true
+            begin = end + 1
+        }
+        false
+    }
+
+    /** Undoes the bindings made since the log had `mark` entries. */
+    fun truncate(mark: int): void {
+        while (this.undoNames.size > mark) {
+            val last = this.undoNames.size - 1
+            if (this.undoValues[last] == "") this.names.remove(this.undoNames[last])
+            else this.names.set(this.undoNames[last], this.undoValues[last])
+            this.undoNames.truncate(last)
+            this.undoValues.truncate(last)
+        }
+        return
+    }
+}
 
 fun bootstrapExpressionDelegatedCompileEffects(
     expression: BootstrapExpression,
@@ -4040,6 +4098,24 @@ fun bootstrapExpressionDelegatedCompileEffects(
     scopeTypes: array<string> = [],
     owner: string = "",
     bound: array<string> = []
+): int {
+    val scope = BootstrapEffectScope(Map(), [], [])
+    scope.bind(bound)
+    bootstrapDelegatedCompileEffectsIn(
+        expression, summary, delegatedNames, typeMap, scopeNames, scopeTypes,
+        owner, scope
+    )
+}
+
+fun bootstrapDelegatedCompileEffectsIn(
+    expression: BootstrapExpression,
+    summary: BootstrapCompileEffectSummary,
+    delegatedNames: array<string>,
+    typeMap: BootstrapEffectTypeMap,
+    scopeNames: array<string>,
+    scopeTypes: array<string>,
+    owner: string,
+    var bound: BootstrapEffectScope
 ): int {
     var mask = 0
     if (expression.kind == "identifier" &&
@@ -4057,7 +4133,7 @@ fun bootstrapExpressionDelegatedCompileEffects(
         expression.text != "Shared" && expression.text != "Mutex" &&
         expression.text != "Cell" && expression.text != "Map" &&
         expression.text != "TVar" &&
-        !bootstrapAffineNamesContain(bound, "${expression.text}#${expression.children.size}")) {
+        !bound.binds(expression.text, "${expression.text}#${expression.children.size}")) {
         mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,
             expression.text,
@@ -4087,25 +4163,20 @@ fun bootstrapExpressionDelegatedCompileEffects(
     // What the children see: a lambda's parameters and a loop's variable in
     // its body, and each local from the statement after it on. Read only once
     // a binder extends it (a new array), so it starts as no array of its own.
-    var inner = BOOTSTRAP_EFFECT_NO_NAMES
-    var extended = false
+    // (Bound while the children are walked, and undone after.)
+    val mark = bound.undoNames.size
     var parameters = 0
     if (expression.kind == "lambda" || expression.kind == "lambda.move") {
         parameters = expression.children.size - 1
-        inner = bootstrapEffectBind(bound, expression.children, parameters)
-        extended = true
+        bound.bind(bootstrapEffectBinderKeys(expression.children, parameters))
     }
     var child = begin
     while (child < end) {
         if (child == 1 && expression.kind == "for") {
-            inner = bootstrapEffectBind(bound, [expression], 1)
-            extended = true
+            bound.bind(bootstrapEffectBinderKeys([expression], 1))
         }
         if (child >= parameters) {
-            val childMask = if (extended) bootstrapExpressionDelegatedCompileEffects(
-                expression.children[child], summary, delegatedNames, typeMap,
-                scopeNames, scopeTypes, owner, inner
-            ) else bootstrapExpressionDelegatedCompileEffects(
+            val childMask = bootstrapDelegatedCompileEffectsIn(
                 expression.children[child], summary, delegatedNames, typeMap,
                 scopeNames, scopeTypes, owner, bound
             )
@@ -4113,12 +4184,11 @@ fun bootstrapExpressionDelegatedCompileEffects(
         }
         val statement = expression.children[child]
         if (statement.kind == "local.val" || statement.kind == "local.var") {
-            inner = if (extended) bootstrapEffectBind(inner, [statement], 1)
-                else bootstrapEffectBind(bound, [statement], 1)
-            extended = true
+            bound.bind(bootstrapEffectBinderKeys([statement], 1))
         }
         child = child + 1
     }
+    bound.truncate(mark)
     mask
 }
 
@@ -4153,8 +4223,8 @@ fun bootstrapEffectBinderKey(binder: BootstrapExpression): string {
 
 /** `bound` with the first `count` of `binders` bound: each replaces what its
  *  name meant before. */
-fun bootstrapEffectBind(
-    bound: array<string>,
+/** What the first `count` of `binders` bind, as keys. */
+fun bootstrapEffectBinderKeys(
     binders: array<BootstrapExpression>,
     count: int
 ): array<string> {
@@ -4164,20 +4234,7 @@ fun bootstrapEffectBind(
         keys.append(bootstrapEffectBinderKey(binders[index]))
         index = index + 1
     }
-    bootstrapEffectBindKeys(bound, keys)
-}
-
-fun bootstrapEffectBindKeys(bound: array<string>, keys: array<string>): array<string> {
-    val names: array<string> = []
-    for (key in bound) {
-        var replaced = false
-        for (added in keys) {
-            if (bootstrapEffectKeyName(added) == bootstrapEffectKeyName(key)) replaced = true
-        }
-        if (!replaced) names.append(key)
-    }
-    for (key in keys) names.append(key)
-    names
+    keys
 }
 
 fun bootstrapEffectKeyName(key: string): string {
@@ -6256,6 +6313,16 @@ fun bootstrapOperatorFunctionName(kind: string): string = when (kind) {
     else -> ""
 }
 
+// A function's locals by name: the last local of each name, and for each local
+// the one of its name before it (-1 none), for the first `count` locals.
+class BootstrapLocalIndex(
+    val last: Map<string, int>,
+    val previous: array<int>,
+    var count: int
+)
+
+fun bootstrapLocalIndex(): BootstrapLocalIndex = BootstrapLocalIndex(Map(), [], 0)
+
 class BootstrapAnalyzer(
     val symbols: array<BootstrapSymbol>,
     var symbolSlots: array<int>,
@@ -6399,7 +6466,10 @@ class BootstrapAnalyzer(
     // its type parameters from it first.
     var genericExpected: string = "",
     var genericExpectedBegin: int = -1,
-    var genericExpectedEnd: int = -1
+    var genericExpectedEnd: int = -1,
+    // The locals by name (localIndex.last, then .previous): a name's lookup
+    // walks only the locals of that name, not every local of the function.
+    var localIndex: BootstrapLocalIndex = bootstrapLocalIndex()
 ) {
     fun prepareSymbolIndex(expectedSymbols: int): void {
         var capacity = 8
@@ -6965,14 +7035,10 @@ class BootstrapAnalyzer(
     fun findType(name: string): string {
         var result = "unknown"
         var binding = ""
-        var localIndex = 0
-        while (localIndex < this.locals.size) {
-            if (this.locals[localIndex].name == name &&
-                this.scopeIsVisible(this.locals[localIndex].scope)) {
-                result = this.locals[localIndex].type
-                binding = bootstrapRefinementBinding(this.locals[localIndex])
-            }
-            localIndex = localIndex + 1
+        val local = this.visibleLocalIndex(name)
+        if (local >= 0) {
+            result = this.locals[local].type
+            binding = bootstrapRefinementBinding(this.locals[local])
         }
         // A refinement narrows the declaration it was made for, never a
         // local that shadows it in a nested block.
@@ -7080,14 +7146,8 @@ class BootstrapAnalyzer(
 
     fun findStorageType(name: string): string {
         var result = "unknown"
-        var localIndex = 0
-        while (localIndex < this.locals.size) {
-            if (this.locals[localIndex].name == name &&
-                this.scopeIsVisible(this.locals[localIndex].scope)) {
-                result = this.locals[localIndex].type
-            }
-            localIndex = localIndex + 1
-        }
+        val local = this.visibleLocalIndex(name)
+        if (local >= 0) result = this.locals[local].type
         // A field is stored as itself (a delegated property as its delegate),
         // whatever a top-level delegate of its name stores.
         if (result == "unknown" && this.currentOwner != "") {
@@ -7168,16 +7228,8 @@ class BootstrapAnalyzer(
     }
 
     fun visibleRefinementBinding(name: string): string {
-        var result = ""
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) {
-                result = bootstrapRefinementBinding(this.locals[index])
-            }
-            index = index + 1
-        }
-        result
+        val index = this.visibleLocalIndex(name)
+        if (index >= 0) bootstrapRefinementBinding(this.locals[index]) else ""
     }
 
     // A local redeclaring a parameter in the block that is the body of its
@@ -7185,14 +7237,10 @@ class BootstrapAnalyzer(
     fun redeclaresParameter(name: string): bool {
         var kind = ""
         var scope = -1
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) {
-                kind = this.locals[index].kind
-                scope = this.locals[index].scope
-            }
-            index = index + 1
+        val index = this.visibleLocalIndex(name)
+        if (index >= 0) {
+            kind = this.locals[index].kind
+            scope = this.locals[index].scope
         }
         (kind == "parameter" || kind == "owned.parameter" ||
          kind == "mutable.parameter") &&
@@ -7222,14 +7270,11 @@ class BootstrapAnalyzer(
     }
 
     fun hasLocal(name: string): bool {
-        var found = false
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.locals[index].scope == this.currentScope) found = true
-            index = index + 1
+        var index = this.lastLocalNamed(name)
+        while (index >= 0 && this.locals[index].scope != this.currentScope) {
+            index = this.localIndex.previous[index]
         }
-        found
+        index >= 0
     }
 
     /** Whether `name` here is a visible local or (in a method) a field: then it
@@ -7296,66 +7341,52 @@ class BootstrapAnalyzer(
         this.hasVisibleLocal(name) || (this.currentOwner != "" &&
             this.fieldType(this.currentOwner, name) != "unknown")
 
-    /** The visible local named `name` (the innermost), -1 none. */
-    fun visibleLocalIndex(name: string): int {
-        var found = -1
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) found = index
-            index = index + 1
-        }
-        found
+    /** Starts the locals index afresh: `locals` is another function's now. */
+    fun resetLocalIndex(): void {
+        this.localIndex = bootstrapLocalIndex()
     }
 
-    fun hasVisibleLocal(name: string): bool {
-        var found = false
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) found = true
-            index = index + 1
+    /** The last local named `name` (localIndex.previous gives the one of its
+     *  name before it), -1 none. */
+    fun lastLocalNamed(name: string): int {
+        // Indexes the locals appended since the last lookup.
+        if (this.localIndex.count > this.locals.size) this.resetLocalIndex()
+        while (this.localIndex.count < this.locals.size) {
+            val local = this.localIndex.count
+            val before = this.localIndex.last.get(this.locals[local].name)
+            this.localIndex.previous.append(if (before != null) before else -1)
+            this.localIndex.last.set(this.locals[local].name, local)
+            this.localIndex.count = local + 1
         }
-        found
+        val last = this.localIndex.last.get(name)
+        if (last != null) last else -1
     }
+
+    /** The visible local named `name` (the last declared of those visible),
+     *  -1 none. */
+    fun visibleLocalIndex(name: string): int {
+        var index = this.lastLocalNamed(name)
+        while (index >= 0 && !this.scopeIsVisible(this.locals[index].scope)) {
+            index = this.localIndex.previous[index]
+        }
+        index
+    }
+
+    fun hasVisibleLocal(name: string): bool = this.visibleLocalIndex(name) >= 0
 
     fun visibleLocalKind(name: string): string {
-        var result = "unknown"
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) {
-                result = this.locals[index].kind
-            }
-            index = index + 1
-        }
-        result
+        val index = this.visibleLocalIndex(name)
+        if (index >= 0) this.locals[index].kind else "unknown"
     }
 
     fun visibleLocalIdentity(name: string): string {
-        var result = ""
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) {
-                result = this.locals[index].identity
-            }
-            index = index + 1
-        }
-        result
+        val index = this.visibleLocalIndex(name)
+        if (index >= 0) this.locals[index].identity else ""
     }
 
     fun visibleBorrowSource(name: string): string {
-        var result = ""
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) {
-                result = this.locals[index].borrowSource
-            }
-            index = index + 1
-        }
-        result
+        val index = this.visibleLocalIndex(name)
+        if (index >= 0) this.locals[index].borrowSource else ""
     }
 
     fun hasMovableLocal(name: string): bool =
@@ -7381,30 +7412,14 @@ class BootstrapAnalyzer(
         this.visibleLocalKind(name) == "mutable.parameter"
 
     fun localIsMutable(name: string): bool {
-        var mutable = false
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) {
-                mutable = this.locals[index].kind == "var" ||
-                    bootstrapDelegatedIsMutable(this.locals[index].type)
-            }
-            index = index + 1
-        }
-        mutable
+        val index = this.visibleLocalIndex(name)
+        index >= 0 && (this.locals[index].kind == "var" ||
+            bootstrapDelegatedIsMutable(this.locals[index].type))
     }
 
     fun visibleLocalScope(name: string): int {
-        var result = -1
-        var index = 0
-        while (index < this.locals.size) {
-            if (this.locals[index].name == name &&
-                this.scopeIsVisible(this.locals[index].scope)) {
-                result = this.locals[index].scope
-            }
-            index = index + 1
-        }
-        result
+        val index = this.visibleLocalIndex(name)
+        if (index >= 0) this.locals[index].scope else -1
     }
 
     fun scopeIsWithin(scope: int, ancestor: int): bool {
@@ -7604,16 +7619,7 @@ class BootstrapAnalyzer(
 
     /** Whether a local (a parameter, a block's `val`) named `name` is in
      *  scope. */
-    fun localVisible(name: string): bool {
-        var found = false
-        var localIndex = 0
-        while (!found && localIndex < this.locals.size) {
-            found = this.locals[localIndex].name == name &&
-                this.scopeIsVisible(this.locals[localIndex].scope)
-            localIndex = localIndex + 1
-        }
-        found
-    }
+    fun localVisible(name: string): bool = this.visibleLocalIndex(name) >= 0
 
     fun findKind(name: string): string {
         var result = "unknown"
@@ -11163,6 +11169,7 @@ class BootstrapAnalyzer(
         this.initEdges.owner = -1
         this.initEdges.declaration = -1
         this.locals = []
+        this.resetLocalIndex()
         this.refinementNames = []
         this.refinementTypes = []
         this.refinementScopes = []
@@ -11373,6 +11380,7 @@ class BootstrapAnalyzer(
                     parameter = parameter + 1
                 }
                 this.locals = functionLocals
+                this.resetLocalIndex()
                 this.refinementNames = []
                 this.refinementTypes = []
                 this.refinementScopes = []
@@ -11550,6 +11558,7 @@ class BootstrapAnalyzer(
                     parameter = parameter + 1
                 }
                 this.locals = methodLocals
+                this.resetLocalIndex()
                 this.refinementNames = []
                 this.refinementTypes = []
                 this.refinementScopes = []
