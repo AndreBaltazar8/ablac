@@ -194,12 +194,14 @@ fun bootstrapReceiverArgumentFits(
 fun bootstrapReceiverTakes(
     context: BootstrapReceiverContext,
     call: BootstrapExpression,
-    arguments: array<BootstrapExpression>
+    arguments: array<BootstrapExpression>,
+    methodNames: BootstrapStringSet,
+    fieldNames: BootstrapStringSet
 ): bool {
     val members = context.members
     // (Neither a method nor a field of that name: nothing takes the call.)
-    if (!context.methodNames.contains(call.text) &&
-        !context.fieldNames.contains(call.text)) return false
+    if (!methodNames.contains(call.text) &&
+        !fieldNames.contains(call.text)) return false
     var named = false
     for (argument in arguments) if (argument.kind == "named.argument") named = true
     var method = 0
@@ -274,15 +276,16 @@ class BootstrapReceiverContext(
     val bound: BootstrapStringSet,
     val globals: array<string>,
     val scope: BootstrapExpectedScope,
-    val callees: BootstrapExpectedCallees,
-    // The members' names, looked up per name the body uses.
-    val methodNames: BootstrapStringSet,
-    val fieldNames: BootstrapStringSet
+    val callees: BootstrapExpectedCallees
 )
 
+/** `methodNames` and `fieldNames` are the receiver's members' names
+ *  (bootstrapStringSetOf), made once per receiver. */
 fun bootstrapReceiverRewrite(
     expression: BootstrapExpression,
-    context: BootstrapReceiverContext
+    context: BootstrapReceiverContext,
+    methodNames: BootstrapStringSet,
+    fieldNames: BootstrapStringSet
 ): BootstrapExpression {
     val members = context.members
     val bound = context.bound
@@ -290,7 +293,7 @@ fun bootstrapReceiverRewrite(
     val children: array<BootstrapExpression> = []
     var changed = false
     for (child in expression.children) {
-        val rewritten = bootstrapReceiverRewrite(child, context)
+        val rewritten = bootstrapReceiverRewrite(child, context, methodNames, fieldNames)
         if (rewritten != child) changed = true
         children.append(rewritten)
     }
@@ -302,14 +305,14 @@ fun bootstrapReceiverRewrite(
         // scalar conversion's name (`u32(x)`) always means the conversion: a
         // member of that name is called as `this.u32(...)`.
         if (expression.kind == "call" && !bootstrapReceiverIsConversion(name) &&
-            (bootstrapReceiverTakes(context, expression, children) ||
-             (context.methodNames.contains(name) &&
+            (bootstrapReceiverTakes(context, expression, children, methodNames, fieldNames) ||
+             (methodNames.contains(name) &&
               !bootstrapReceiverGlobalCallable(globals, name)))) {
             val arguments: array<BootstrapExpression> = [bootstrapReceiverThis(expression)]
             for (child in children) arguments.append(child)
             return BootstrapExpression("member.call", name, expression.begin, expression.end, arguments)
         }
-        if (context.fieldNames.contains(name)) {
+        if (fieldNames.contains(name)) {
             if (expression.kind == "identifier") {
                 return BootstrapExpression(
                     "member", name, expression.begin, expression.end,
@@ -334,25 +337,25 @@ fun bootstrapReceiverRewriteBody(
     globals: array<string>,
     owner: string,
     world: BootstrapExpectedWorld,
-    callees: BootstrapExpectedCallees
+    callees: BootstrapExpectedCallees,
+    methodNames: BootstrapStringSet,
+    fieldNames: BootstrapStringSet
 ): BootstrapDeclaration {
     var bound: array<string> = []
     for (parameter in declaration.parameters) bound.append(parameter)
     bootstrapReceiverBoundNames(declaration.expression, bound)
     val boundNames = bootstrapStringSet()
     for (name in bound) boundNames.add(name)
-    val methodNames = bootstrapStringSet()
-    for (name in members.methods) methodNames.add(name)
-    val fieldNames = bootstrapStringSet()
-    for (name in members.fields) fieldNames.add(name)
     val scope = bootstrapExpectedBodyScope(declaration, owner, world.classes, world.globals)
     bootstrapDeclarationWithExpression(
         declaration,
         bootstrapReceiverRewrite(
             declaration.expression,
             BootstrapReceiverContext(
-                members, boundNames, globals, scope, callees, methodNames, fieldNames
-            )
+                members, boundNames, globals, scope, callees
+            ),
+            methodNames,
+            fieldNames
         )
     )
 }
@@ -368,9 +371,14 @@ fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseR
         var rewritten = declaration
         if (declaration.kind == "class" && declaration.methods.size > 0) {
             val members = index.of(declaration.name)
+            val methodNames = bootstrapStringSetOf(members.methods)
+            val fieldNames = bootstrapStringSetOf(members.fields)
             val methods: array<BootstrapDeclaration> = []
             for (method in declaration.methods) {
-                methods.append(bootstrapReceiverRewriteBody(method, members, globals, declaration.name, world, callees))
+                methods.append(bootstrapReceiverRewriteBody(
+                    method, members, globals, declaration.name, world, callees,
+                    methodNames, fieldNames
+                ))
             }
             rewritten = bootstrapDeclarationWithMethods(declaration, methods)
             changed = true
@@ -380,7 +388,8 @@ fun bootstrapResolveReceiverNames(parsed: BootstrapParseResult): BootstrapParseR
             val members = index.of(declaration.extensionOwner)
             if (members.methods.size > 0 || members.fields.size > 0) {
                 rewritten = bootstrapReceiverRewriteBody(
-                    declaration, members, globals, declaration.extensionOwner, world, callees
+                    declaration, members, globals, declaration.extensionOwner, world, callees,
+                    bootstrapStringSetOf(members.methods), bootstrapStringSetOf(members.fields)
                 )
                 changed = true
             }

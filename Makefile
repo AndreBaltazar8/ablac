@@ -281,6 +281,7 @@ test-serial: ablac
 	tools/test-frontend-locals-scaling.sh $(COMPILER)
 	tools/test-stm-wasm-unwinding.sh $(COMPILER)
 	tools/test-sysroot-path-symbols.sh $(COMPILER)
+	tools/test-frontend-call-chain-scaling.sh $(COMPILER)
 
 check: test self-rebuild
 
