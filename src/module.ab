@@ -2277,74 +2277,114 @@ fun bootstrapValidateImportAliases(
     state: BootstrapModuleState
 ): BootstrapImportAliasValidation {
     var errors = 0
-    var diagnostics = ""
+    // Each importer is lexed once, and its aliases are found by name as its
+    // identifiers go by; each aliased edge's diagnostics are still reported
+    // edge by edge, in token order.
+    val edgeDiagnostics: array<string> = []
+    // A use as `alias.member` skips the member's tokens for that alias.
+    val skipUntil: array<int> = []
+    val importerSlots: Map<string, int> = Map()
+    val importerPaths: array<string> = []
+    val importerNames: array<Map<string, int>> = []
+    val sameName: array<int> = []
     var aliasIndex = 0
     while (aliasIndex < aliases.size) {
         val edge = aliases[aliasIndex]
-        if (edge.alias != "") {
-            val importerIndex = state.indexOf(edge.importer)
-            val targetIndex = state.indexOf(edge.target)
-            if (importerIndex >= 0 && targetIndex >= 0) {
-                val importer = state.snapshots[importerIndex]
-                val target = state.snapshots[targetIndex]
-                val tokens = bootstrapLex(importer.source)
-                var tokenIndex = 0
-                var inImport = false
-                while (tokenIndex < tokens.size) {
-                    val token = tokens[tokenIndex]
-                    if (token.kind == "import") inImport = true
-                    if (token.kind == "newline" || token.kind == ";") {
-                        inImport = false
-                    }
-                    if (!inImport && token.kind == "identifier" &&
-                        bootstrapTokenText(importer.source, token) ==
-                            edge.alias &&
-                        !bootstrapAliasShadowedAt(
-                            importer.discovery, edge.alias, token.begin
-                        )) {
-                        if (tokenIndex + 2 < tokens.size &&
-                            tokens[tokenIndex + 1].kind == "." &&
-                            tokens[tokenIndex + 2].kind == "identifier") {
-                            val member = bootstrapTokenText(
-                                importer.source,
-                                tokens[tokenIndex + 2]
-                            )
-                            var exposed = false
-                            var declaration = 0
-                            while (declaration <
-                                target.discovery.declarations.size) {
-                                if (target.discovery.declarations[
-                                    declaration
-                                ].name == member &&
-                                    !target.discovery.declarations[
-                                        declaration
-                                    ].isPrivate) exposed = true
-                                declaration = declaration + 1
-                            }
-                            if (!exposed && bootstrapModuleDeclaresOnlyPrivately(
-                                target.discovery, member
-                            )) {
-                                errors = errors + 1
-                                diagnostics =
-                                    "${diagnostics}error[E_NAME_PRIVATE]: `$member` is private to ${edge.target}\ncontext[canonical-module]: ${edge.target}\nsource[qualified-import]:${edge.importer}:${token.begin}:${tokens[tokenIndex + 2].end}\n"
-                            } else if (!exposed) {
-                                errors = errors + 1
-                                diagnostics =
-                                    "${diagnostics}error[E_IMPORT_ALIAS_MEMBER_UNKNOWN]: module alias `${edge.alias}` has no exposed declaration named `$member`\ncontext[canonical-module]: ${edge.target}\nsource[qualified-import]:${edge.importer}:${token.begin}:${tokens[tokenIndex + 2].end}\n"
-                            }
-                            tokenIndex = tokenIndex + 2
-                        } else {
-                            errors = errors + 1
-                            diagnostics =
-                                "${diagnostics}error[E_IMPORT_ALIAS_USED_AS_VALUE]: module alias `${edge.alias}` is compile-time-only and must qualify a declaration\ncontext[canonical-module]: ${edge.target}\nsource[qualified-import]:${edge.importer}:${token.begin}:${token.end}\n"
-                        }
-                    }
-                    tokenIndex = tokenIndex + 1
-                }
+        edgeDiagnostics.append("")
+        skipUntil.append(0)
+        sameName.append(-1)
+        if (edge.alias != "" && state.indexOf(edge.importer) >= 0 &&
+            state.indexOf(edge.target) >= 0) {
+            val known = importerSlots.get(edge.importer)
+            var slot = importerPaths.size
+            if (known != null) {
+                slot = known
+            } else {
+                importerSlots.set(edge.importer, slot)
+                importerPaths.append(edge.importer)
+                val names: Map<string, int> = Map()
+                importerNames.append(names)
+            }
+            // (Later edges of a name are reached from the first.)
+            val first = importerNames[slot].get(edge.alias)
+            if (first == null) {
+                importerNames[slot].set(edge.alias, aliasIndex)
+            } else {
+                var last = first
+                while (sameName[last] >= 0) last = sameName[last]
+                sameName[last] = aliasIndex
             }
         }
         aliasIndex = aliasIndex + 1
     }
+    var importerIndex = 0
+    while (importerIndex < importerPaths.size) {
+        val importer = state.snapshots[state.indexOf(importerPaths[importerIndex])]
+        val names = importerNames[importerIndex]
+        val tokens = bootstrapLex(importer.source)
+        var tokenIndex = 0
+        var inImport = false
+        while (tokenIndex < tokens.size) {
+            val token = tokens[tokenIndex]
+            if (token.kind == "import") inImport = true
+            if (token.kind == "newline" || token.kind == ";") {
+                inImport = false
+            }
+            val first = if (!inImport && token.kind == "identifier")
+                names.get(bootstrapTokenText(importer.source, token)) else null
+            var named = if (first != null) first else -1
+            while (named >= 0) {
+                val edge = aliases[named]
+                if (tokenIndex >= skipUntil[named] &&
+                    !bootstrapAliasShadowedAt(
+                        importer.discovery, edge.alias, token.begin
+                    )) {
+                    val target = state.snapshots[state.indexOf(edge.target)]
+                    if (tokenIndex + 2 < tokens.size &&
+                        tokens[tokenIndex + 1].kind == "." &&
+                        tokens[tokenIndex + 2].kind == "identifier") {
+                        val member = bootstrapTokenText(
+                            importer.source,
+                            tokens[tokenIndex + 2]
+                        )
+                        var exposed = false
+                        var declaration = 0
+                        while (declaration <
+                            target.discovery.declarations.size) {
+                            if (target.discovery.declarations[
+                                declaration
+                            ].name == member &&
+                                !target.discovery.declarations[
+                                    declaration
+                                ].isPrivate) exposed = true
+                            declaration = declaration + 1
+                        }
+                        if (!exposed && bootstrapModuleDeclaresOnlyPrivately(
+                            target.discovery, member
+                        )) {
+                            errors = errors + 1
+                            edgeDiagnostics[named] =
+                                "${edgeDiagnostics[named]}error[E_NAME_PRIVATE]: `$member` is private to ${edge.target}\ncontext[canonical-module]: ${edge.target}\nsource[qualified-import]:${edge.importer}:${token.begin}:${tokens[tokenIndex + 2].end}\n"
+                        } else if (!exposed) {
+                            errors = errors + 1
+                            edgeDiagnostics[named] =
+                                "${edgeDiagnostics[named]}error[E_IMPORT_ALIAS_MEMBER_UNKNOWN]: module alias `${edge.alias}` has no exposed declaration named `$member`\ncontext[canonical-module]: ${edge.target}\nsource[qualified-import]:${edge.importer}:${token.begin}:${tokens[tokenIndex + 2].end}\n"
+                        }
+                        skipUntil[named] = tokenIndex + 3
+                    } else {
+                        errors = errors + 1
+                        edgeDiagnostics[named] =
+                            "${edgeDiagnostics[named]}error[E_IMPORT_ALIAS_USED_AS_VALUE]: module alias `${edge.alias}` is compile-time-only and must qualify a declaration\ncontext[canonical-module]: ${edge.target}\nsource[qualified-import]:${edge.importer}:${token.begin}:${token.end}\n"
+                    }
+                }
+                named = sameName[named]
+            }
+            tokenIndex = tokenIndex + 1
+        }
+        importerIndex = importerIndex + 1
+    }
+    var diagnostics = ""
+    for (edgeDiagnostic in edgeDiagnostics) diagnostics = "$diagnostics$edgeDiagnostic"
     BootstrapImportAliasValidation(errors, diagnostics)
 }
 
