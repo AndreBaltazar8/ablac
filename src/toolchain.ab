@@ -415,6 +415,30 @@ trusted fun bootstrapRestoreLlvmJumpTableDefault(): void {
     return
 }
 
+// A module that leaves `orElse` attempts by an exception (bootstrapLlvmWasmUnwinding)
+// is generated with WebAssembly exception handling, as legacy try/catch_all, which the
+// engines without exnref (older Safari, Node 20) run. In process these are LLVM's
+// process-wide options: set for that module's code generation and reset after it, so a
+// later module in the same process is generated as if they had never been set.
+trusted fun bootstrapSetLlvmWasmExceptions(enabled: bool): void {
+    val program = "ablac"
+    val handling = if (enabled) "--wasm-enable-eh=true" else "--wasm-enable-eh=false"
+    val legacy = "--wasm-use-legacy-eh=true"
+    val arguments = nativeByteBuffer(32)
+    arguments.storeI64(0, nativeCStringAddress(program))
+    arguments.storeI64(8, nativeCStringAddress(handling))
+    arguments.storeI64(16, nativeCStringAddress(legacy))
+    arguments.storePointer(24, nativeNullPointer())
+    LLVMParseCommandLineOptions(3, arguments.address, "")
+    arguments.close()
+    return
+}
+
+// The same options for a code generator run as a tool (llc, or wasm-ld's LTO with
+// `-mllvm` before each).
+fun bootstrapWasmExceptionOptions(): array<string> =
+    if (bootstrapLlvmWasmUnwinding) ["--wasm-enable-eh", "--wasm-use-legacy-eh"] else []
+
 // Optimizes the module the backend kept (bootstrapLlvmHoldModule) with a fast build's
 // passes and writes its WebAssembly object, as opt and llc -O0 would: the target
 // machine's data layout (which opt gives a module without one), static relocations
@@ -428,6 +452,8 @@ trusted fun bootstrapEmitHeldWasmObject(llvmTriple: string, objectPath: string):
     LLVMInitializeWebAssemblyTarget()
     LLVMInitializeWebAssemblyTargetMC()
     LLVMInitializeWebAssemblyAsmPrinter()
+    // A module with exception handling defines its tag in module assembly.
+    if (bootstrapLlvmWasmUnwinding) LLVMInitializeWebAssemblyAsmParser()
     val triple = LLVMNormalizeTargetTriple(llvmTriple)
     val target = nativePointerCell(nullPointer)
     val message = nativePointerCell(nullPointer)
@@ -437,6 +463,9 @@ trusted fun bootstrapEmitHeldWasmObject(llvmTriple: string, objectPath: string):
     var machine = nullPointer
     var layout = nullPointer
     var options = nullPointer
+    // (Read when the target machine is made: set before it, reset after it is gone.)
+    val exceptions = bootstrapLlvmWasmUnwinding
+    if (exceptions) bootstrapSetLlvmWasmExceptions(true)
     if (status == 0) {
         machine = LLVMCreateTargetMachine(target.load(), triple, "", "", 0, 1, 0)
         if (pointerIsNull(machine)) status = 166
@@ -465,6 +494,7 @@ trusted fun bootstrapEmitHeldWasmObject(llvmTriple: string, objectPath: string):
     if (!pointerIsNull(options)) LLVMDisposePassBuilderOptions(options)
     if (!pointerIsNull(layout)) LLVMDisposeTargetData(layout)
     if (!pointerIsNull(machine)) LLVMDisposeTargetMachine(machine)
+    if (exceptions) bootstrapSetLlvmWasmExceptions(false)
     if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
     LLVMDisposeMessage(triple)
     target.close()
@@ -579,6 +609,9 @@ fun bootstrapExternalEmitObjectForTarget(
         )
         emitObject.argument(if (fast) "-O0" else "-O2")
         emitObject.argument("-mtriple=$llvmTriple")
+        if (bootstrapTextContains(llvmTriple, "wasm")) {
+            for (option in bootstrapWasmExceptionOptions()) emitObject.argument(option)
+        }
         if (!verify) emitObject.argument("--disable-verify")
         if (bitcodeInput) emitObject.argument("--discard-value-names")
         if (mcuTarget) {
@@ -2405,6 +2438,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (wasmLtoEligible) {
             linkModule.argument("--lto-O3")
             linkModule.argument("--lto-partitions=$BOOTSTRAP_WASM_LTO_PARTITIONS")
+            for (option in bootstrapWasmExceptionOptions()) {
+                linkModule.argument("-mllvm")
+                linkModule.argument(option)
+            }
         }
         linkModule.argument("-z")
         // Keep the module's committed linear-memory floor aligned with
@@ -2449,6 +2486,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         optimizeModule.argument("--enable-nontrapping-float-to-int")
         optimizeModule.argument("--enable-bulk-memory")
         optimizeModule.argument("--enable-mutable-globals")
+        // Only a module that leaves `orElse` attempts by an exception has any.
+        if (bootstrapLlvmWasmUnwinding) optimizeModule.argument("--enable-exception-handling")
         // Functions in call-count order first: Binaryen's inlining and the module's size depend
         // on the order the link left them in, which the LTO partitions change. Sorted, a
         // game's client comes out within 0.01% of one size whatever the partitioning, and 0.3%

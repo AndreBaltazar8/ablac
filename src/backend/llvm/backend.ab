@@ -408,6 +408,61 @@ fun bootstrapPreSemanticPipeline(written: BootstrapParseResult): BootstrapParseR
         ))
     ))
 
+// Whether the module being built is a WebAssembly one whose `orElse`
+// alternatives can retry (bootstrapSemanticWasmUnwinds): its attempts are left
+// by an exception (bootstrapWasmUnwindingParse, bootstrapLlvmDefineStmInvoke),
+// and it alone is built with exception handling (toolchain.ab).
+var bootstrapLlvmWasmUnwinding = false
+
+// The WebAssembly platform's attempt, abandon and unwinding, and the versions
+// whose bodies replace them in a module that leaves attempts by an exception
+// (abla/runtime/platform/wasm.ab).
+val BOOTSTRAP_WASM_UNWINDING = [
+    "__ablaRuntimePlatformAttempt", "__ablaRuntimePlatformUnwindingAttempt",
+    "__ablaRuntimePlatformAbandon", "__ablaRuntimePlatformUnwindingAbandon",
+    "__ablaRuntimePlatformUnwindSave", "__ablaRuntimePlatformUnwindingSave",
+    "__ablaRuntimePlatformUnwindRestore", "__ablaRuntimePlatformUnwindingRestore"
+]
+
+/** `parsed` with each of the platform's attempt, abandon and unwinding running
+ *  its unwinding version's body (same parameters, analyzed with the program),
+ *  so the runtime's callers reach them unchanged. */
+fun bootstrapWasmUnwindingParse(parsed: BootstrapParseResult): BootstrapParseResult {
+    val bodies: array<BootstrapExpression> = []
+    val found: array<bool> = []
+    var pair = 0
+    while (pair < BOOTSTRAP_WASM_UNWINDING.size) {
+        bodies.append(BootstrapExpression("missing", "", 0, 0, []))
+        found.append(false)
+        pair = pair + 2
+    }
+    for (declaration in parsed.declarations) {
+        pair = 0
+        while (pair < BOOTSTRAP_WASM_UNWINDING.size) {
+            if (declaration.kind == "fun" && declaration.name == BOOTSTRAP_WASM_UNWINDING[pair + 1]) {
+                bodies[pair / 2] = declaration.expression
+                found[pair / 2] = true
+            }
+            pair = pair + 2
+        }
+    }
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) {
+        var replaced = declaration
+        pair = 0
+        while (pair < BOOTSTRAP_WASM_UNWINDING.size) {
+            if (declaration.kind == "fun" && declaration.name == BOOTSTRAP_WASM_UNWINDING[pair] &&
+                found[pair / 2]) replaced = bootstrapDeclarationWithExpression(declaration, bodies[pair / 2])
+            pair = pair + 2
+        }
+        declarations.append(replaced)
+    }
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+}
+
 // Rounds of lowering that commit compile-time code's edits, at most.
 val BOOTSTRAP_COMPILE_EDIT_ROUNDS = 8
 
@@ -492,8 +547,14 @@ fun bootstrapCompileLlvmParsedCached(
     // (Whether the build is for WebAssembly: what a transaction may do there.)
     val outerTargetsWasm = bootstrapSemanticTargetsWasm
     bootstrapSemanticTargetsWasm = bootstrapTextContains(targetTriple, "wasm")
+    bootstrapSemanticWasmUnwinds = false
     val analyzed = bootstrapCtAnalyze(parsed, targetTriple)
     bootstrapSemanticTargetsWasm = outerTargetsWasm
+    // A WebAssembly program whose `orElse` alternatives can retry leaves them
+    // by an exception; any other module is built as it always was.
+    bootstrapLlvmWasmUnwinding = bootstrapSemanticWasmUnwinds &&
+        bootstrapTextContains(targetTriple, "wasm")
+    bootstrapSemanticWasmUnwinds = false
     bootstrapLlvmTraceMemory("frontend.semantic.end")
     val actionInputPaths: array<string> = []
     val actionInputContents: array<string> = []
@@ -552,7 +613,8 @@ fun bootstrapCompileLlvmParsedCached(
     if (round > 0) bootstrapRestoreCompileGlobals(globals)
     val earlierRoundEdits = bootstrapTakeCompileRoundEdits()
     val program = bootstrapLowerParsedCached(
-        parsed, analyzed, cache, pruneUnused
+        if (bootstrapLlvmWasmUnwinding) bootstrapWasmUnwindingParse(parsed) else parsed,
+        analyzed, cache, pruneUnused
     )
     bootstrapCompileEditRound = -1
     bootstrapCompileRoundRaw = []

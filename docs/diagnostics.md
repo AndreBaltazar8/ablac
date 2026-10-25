@@ -161,8 +161,7 @@ in [ownership.md](ownership.md#reading-ownership-diagnostics).
 ## Transactions
 
 `stm.outside-atomic`, `stm.effect:<effect>`, `stm.resource`,
-`stm.outside-mutation`, `stm.control:return`, `stm.orElse-type` and
-`stm.orelse-retry-wasm` are
+`stm.outside-mutation`, `stm.control:return` and `stm.orElse-type` are
 explained in [language.md](language.md#what-a-transaction-may-do).
 A misused `TVar` is reported as any generic class's is (`TVar<T>` of
 `abla/stm`, with a constructor of one argument, `getValue()` and

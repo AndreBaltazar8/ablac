@@ -62,17 +62,14 @@ if command -v node >/dev/null 2>&1; then wasm_runner=node; else wasm_runner=bun;
 (cd "$project_root" && "$output_directory/wasm-driver")
 wasm_output=$("$wasm_runner" "$project_root/tests/cases/stm/run.mjs" "$output_directory/transactions.wasm")
 [[ $wasm_output == 0 ]] || { echo "transactions (WebAssembly): $wasm_output failed" >&2; exit 1; }
-# There, an orElse alternative that can retry is refused when it compiles.
-set +e
+# There, an orElse alternative that retries is left by an exception (more in
+# tools/test-stm-wasm-unwinding.sh).
 (cd "$project_root" && "$compiler" build tests/cases/stm/surface-orelse-wasm-build.ab \
-    -o "$output_directory/orelse-driver" --no-cache > "$output_directory/orelse-driver.log" 2>&1)
-set -e
-if ! grep -Fq 'stm.orelse-retry-wasm' "$output_directory/orelse-driver.log" ||
-    (cd "$project_root" && "$output_directory/orelse-driver" 2>/dev/null); then
-    echo "transactions (WebAssembly): an orElse alternative that retries was not refused" >&2
-    cat "$output_directory/orelse-driver.log" >&2
-    exit 1
-fi
+    -o "$output_directory/orelse-driver" --no-cache > "$output_directory/orelse-driver.log" 2>&1) ||
+    { cat "$output_directory/orelse-driver.log" >&2; exit 1; }
+(cd "$project_root" && "$output_directory/orelse-driver")
+wasm_output=$("$wasm_runner" "$project_root/tests/cases/stm/run.mjs" "$output_directory/orelse.wasm")
+[[ $wasm_output == 0 ]] || { echo "transactions (WebAssembly orElse): $wasm_output failed" >&2; exit 1; }
 
 fixtures=(
     outside-direct outside-helper outside-lambda outside-retry

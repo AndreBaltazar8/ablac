@@ -1,0 +1,112 @@
+// `orElse` alternatives that retry, in a WebAssembly module (one thread:
+// direct transactions). The alternative is left by an exception from any
+// depth, its writes are undone, and the stack, root frames and region it left
+// are restored: thousands of abandoned attempts neither grow the stack nor
+// leave the collector a stale root frame.
+import "abla/memory"
+
+var stock: int by TVar(10)
+var trail: string by TVar("")
+
+class Shelf(var count: int by TVar(0), var label: string by TVar(""))
+
+fun shelfOf(count: int): Shelf {
+    val shelf = Shelf()
+    atomic { shelf.count = count }
+    shelf
+}
+
+fun take(wanted: int): int = atomic {
+    atomic {
+        if (stock < wanted) retry
+        stock -= wanted
+        wanted
+    } orElse { 0 }
+}
+
+// A retry three calls down, after writes and allocations on the way.
+fun deepest(shelf: Shelf, wanted: int): int {
+    shelf.label = "${shelf.label}d"
+    val held: array<string> = []
+    for (index in 0 until 50) held.append("held-$index-$wanted")
+    if (shelf.count < wanted) retry
+    shelf.count -= wanted
+    held.size
+}
+
+fun middle(shelf: Shelf, wanted: int): int {
+    shelf.label = "${shelf.label}m"
+    deepest(shelf, wanted) + 1
+}
+
+fun outer(shelf: Shelf, wanted: int): int {
+    shelf.label = "${shelf.label}o"
+    middle(shelf, wanted) + 1
+}
+
+fun chain(shelf: Shelf, wanted: int): int = atomic {
+    atomic { outer(shelf, wanted) } orElse { -1 }
+}
+
+// The inner first alternative retrying runs the inner second; both retrying,
+// the outer first is left too and the outer second runs.
+fun nested(shelf: Shelf, first: int, second: int): string = atomic {
+    atomic {
+        trail = "${trail}a"
+        atomic {
+            trail = "${trail}b"
+            if (shelf.count < first) retry
+            "first"
+        } orElse {
+            trail = "${trail}c"
+            if (shelf.count < second) retry
+            "second"
+        }
+    } orElse {
+        trail = "${trail}d"
+        "third"
+    }
+}
+
+fun descend(depth: int): int = if (depth == 0) retry else descend(depth - 1) + 1
+
+fun recursive(): int = atomic { atomic { descend(200) } orElse { 7 } }
+
+fun nestedCase(first: int, second: int): string {
+    atomic { trail = "" }
+    val chosen = nested(shelfOf(5), first, second)
+    "$chosen ${atomic { trail }}"
+}
+
+// Values held outside the transactions survive collections between and after
+// abandoned attempts.
+fun collected(): int {
+    val kept: array<string> = []
+    for (index in 0 until 20) kept.append("kept-$index")
+    var failed = 0
+    for (round in 0 until 300) {
+        if (chain(shelfOf(0), 1) != -1) failed += 1
+        if (round % 50 == 0) memoryCollect()
+    }
+    memoryCollect()
+    for (index in 0 until 20) if (kept[index] != "kept-$index") failed += 1
+    failed
+}
+
+@export("run")
+fun run(): int {
+    var failed = 0
+    if (take(3) != 3) failed += 1
+    if (take(9) != 0) failed += 1
+    if (atomic { stock } != 7) failed += 1
+    val shelf = shelfOf(5)
+    if (chain(shelf, 9) != -1) failed += 1
+    if (atomic { "${shelf.count} ${shelf.label}" } != "5 ") failed += 1
+    if (chain(shelf, 2) != 52) failed += 1
+    if (atomic { "${shelf.count} ${shelf.label}" } != "3 omd") failed += 1
+    if (nestedCase(1, 1) != "first ab") failed += 1
+    if (nestedCase(9, 1) != "second ac") failed += 1
+    if (nestedCase(9, 9) != "third d") failed += 1
+    for (attempt in 0 until 2000) if (recursive() != 7) failed += 1
+    failed + collected()
+}

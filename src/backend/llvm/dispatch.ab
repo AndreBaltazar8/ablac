@@ -741,6 +741,10 @@ fun bootstrapLlvmDefineStmInvoke(backend: BootstrapLlvmBackend): void {
     if (pointerIsNull(indirect)) return
     LLVMSetLinkage(invoke, llvmInternalLinkage())
     bootstrapLlvmAddFunctionAttribute(backend, invoke, "noinline")
+    if (bootstrapLlvmWasmUnwinding) {
+        bootstrapLlvmDefineWasmStmInvoke(backend, invoke, indirect)
+        return
+    }
     val setjmp = bootstrapLlvmDeclare(
         backend, "_setjmp", backend.i32Type, [backend.pointerType], false, [false]
     )
@@ -782,5 +786,81 @@ fun bootstrapLlvmDefineStmInvoke(backend: BootstrapLlvmBackend): void {
     LLVMBuildRet(backend.builder, LLVMConstInt(result, 0, 0))
     LLVMPositionBuilderAtEnd(backend.builder, abandoned)
     LLVMBuildRet(backend.builder, LLVMConstInt(result, 1, 0))
+    return
+}
+
+/** abla_stm_invoke on WebAssembly with exception handling (a module whose
+ *  `orElse` alternatives can retry: bootstrapLlvmWasmUnwinding): the attempt is
+ *  an invoke whose catch_all (legacy try/catch_all; `catchpad [ptr null]` asks
+ *  for no type check, so no personality routine runs) returns 1, and
+ *  abla_stm_throw, which abandons it, throws with LLVM's C++ tag (defined in
+ *  the module). The stack pointer is restored at the catch by LLVM; the root
+ *  frames and region by the runtime (__ablaRuntimePlatformUnwindingRestore).
+ *  These two functions alone use exception handling. */
+fun bootstrapLlvmDefineWasmStmInvoke(
+    backend: BootstrapLlvmBackend,
+    invoke: i64*,
+    indirect: i64*
+): void {
+    bootstrapLlvmAddStringFunctionAttribute(backend, invoke, "target-features", "+exception-handling")
+    val personality = bootstrapLlvmDeclare(
+        backend, "__gxx_wasm_personality_v0", backend.i32Type, [], false, []
+    )
+    LLVMSetPersonalityFn(invoke, personality)
+    val entry = LLVMAppendBasicBlockInContext(backend.context, invoke, "entry")
+    val returned = LLVMAppendBasicBlockInContext(backend.context, invoke, "returned")
+    val dispatch = LLVMAppendBasicBlockInContext(backend.context, invoke, "dispatch")
+    val caught = LLVMAppendBasicBlockInContext(backend.context, invoke, "caught")
+    val abandoned = LLVMAppendBasicBlockInContext(backend.context, invoke, "abandoned")
+    val result = LLVMGetReturnType(LLVMGlobalGetValueType(invoke))
+    LLVMPositionBuilderAtEnd(backend.builder, entry)
+    val arguments = llvmPointerVector(4)
+    arguments.set(0, LLVMGetParam(invoke, 1))
+    arguments.set(1, LLVMGetParam(invoke, 0))
+    arguments.set(2, LLVMConstNull(backend.pointerType))
+    arguments.set(3, LLVMConstInt(backend.i64Type, 0, 0))
+    val attempt = LLVMBuildInvoke2(
+        backend.builder, LLVMGlobalGetValueType(indirect), indirect,
+        arguments.pointer(), 4, returned, dispatch, ""
+    )
+    arguments.drop()
+    bootstrapLlvmAddSret(backend, attempt, true)
+    LLVMPositionBuilderAtEnd(backend.builder, returned)
+    LLVMBuildRet(backend.builder, LLVMConstInt(result, 0, 0))
+    LLVMPositionBuilderAtEnd(backend.builder, dispatch)
+    val catchSwitch = LLVMBuildCatchSwitch(
+        backend.builder, nativeNullPointer(), nativeNullPointer(), 1, "stm.dispatch"
+    )
+    LLVMAddHandler(catchSwitch, caught)
+    LLVMPositionBuilderAtEnd(backend.builder, caught)
+    val everything = llvmPointerVector(1)
+    everything.set(0, LLVMConstNull(backend.pointerType))
+    val pad = LLVMBuildCatchPad(backend.builder, catchSwitch, everything.pointer(), 1, "stm.caught")
+    everything.drop()
+    LLVMBuildCatchRet(backend.builder, pad, abandoned)
+    LLVMPositionBuilderAtEnd(backend.builder, abandoned)
+    LLVMBuildRet(backend.builder, LLVMConstInt(result, 1, 0))
+    val thrower = LLVMGetNamedFunction(backend.module, "abla_stm_throw")
+    if (pointerIsNull(thrower) || LLVMIsDeclaration(thrower) == 0) return
+    LLVMSetLinkage(thrower, llvmInternalLinkage())
+    bootstrapLlvmAddFunctionAttribute(backend, thrower, "noinline")
+    bootstrapLlvmAddFunctionAttribute(backend, thrower, "noreturn")
+    bootstrapLlvmAddStringFunctionAttribute(backend, thrower, "target-features", "+exception-handling")
+    val raise = bootstrapLlvmDeclare(
+        backend, "llvm.wasm.throw", backend.voidType, [backend.i32Type, backend.pointerType], false, [false, false]
+    )
+    LLVMPositionBuilderAtEnd(
+        backend.builder, LLVMAppendBasicBlockInContext(backend.context, thrower, "entry")
+    )
+    // Tag 0: LLVM's C++ exception tag; the catch_all above takes any. No C++
+    // runtime defines it here, so the module does (hidden: every LTO partition
+    // links it, and no export names it).
+    val tag = ".globl __cpp_exception\n.hidden __cpp_exception\n.tagtype __cpp_exception i32\n__cpp_exception:\n"
+    LLVMAppendModuleInlineAsm(backend.module, tag, tag.size)
+    bootstrapLlvmCall(
+        backend, raise, [LLVMConstInt(backend.i32Type, 0, 0), LLVMConstNull(backend.pointerType)],
+        "", false, [false, false]
+    )
+    LLVMBuildUnreachable(backend.builder)
     return
 }
