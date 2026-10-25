@@ -4,7 +4,7 @@
 # reaches any other way is E_NAME_NOT_IMPORTED with the import to add;
 # `--strict-imports` makes a manifest-less program strict; and a flat
 # program's `--visibility-report`, applied by tools/fix-imports.ab, makes it
-# build strict.
+# build strict. The standard library is strict too.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -63,4 +63,23 @@ grep -qF "fix-imports: 1 module(s) changed" "$output_directory/fix.out" ||
 "$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/fixed-main" \
     --no-cache --strict-imports
 runs "$output_directory/fixed-main" "81 x/y"
-echo "strict-imports: strict package, export import, --strict-imports, report + fix-imports"
+# The standard library is a strict package: its facades pass on what they
+# front, and a library module that uses a name it doesn't import is rejected,
+# with the library module to import (here in a copy of the sysroot).
+"$compiler" build "$cases/facade.ab" -o "$output_directory/facade" --no-cache --strict-imports
+runs "$output_directory/facade" "x/y true"
+sysroot=${ABLA_SYSROOT:-$project_root}
+library_root="$output_directory/sysroot"
+mkdir -p "$library_root"
+cp -R "$sysroot/stdlib" "$sysroot/runtime" "$library_root/"
+mkdir -p "$library_root/stdlib/abla/strict-fixture"
+cp "$cases/library-fixture.ab" "$library_root/stdlib/abla/strict-fixture/entry.ab"
+ABLA_SYSROOT="$library_root" rejected "$cases/library-user.ab" "" \
+    'error[E_NAME_NOT_IMPORTED]: `Path` is declared in' 'help: add: import "abla/sys/linux/fs"'
+# A program's value named like a type the library's annotations name.
+"$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named" --no-cache
+runs "$output_directory/value-named" "5"
+"$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named-strict" \
+    --no-cache --strict-imports
+runs "$output_directory/value-named-strict" "5"
+echo "strict-imports: strict package, export import, --strict-imports, report + fix-imports, strict standard library"

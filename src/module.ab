@@ -1949,12 +1949,14 @@ class BootstrapImportAliasValidation(
 // Strict imports (`visibility = "imports"` in a package's abla.toml, or
 // `--strict-imports` for modules whose package doesn't say): a module sees its
 // own declarations, those of the modules it imports without an alias, the
-// `export import`s of a strict one, and everything a flat one (the standard
-// library, a package that doesn't opt in) reaches. A name it uses from any
-// other module is E_NAME_NOT_IMPORTED, with the import to add.
-// `--visibility-report <path>` writes every such use, in any module but the
-// standard library's, to <path> (module, line, column, name, declaring module,
-// import), whether the module is strict or not; tools/fix-imports.ab applies it.
+// `export import`s of a strict one, everything a flat one (a package that
+// doesn't opt in) reaches, and the runtime and abla/stm, which every program
+// has. The standard library is strict when its own abla.toml says so. A name
+// a module uses from any other module is E_NAME_NOT_IMPORTED, with the import
+// to add. `--visibility-report <path>` writes every such use, in a program's
+// module whether it is strict or not and in a strict library module, to
+// <path> (module, line, column, name, declaring module, import);
+// tools/fix-imports.ab applies it.
 var bootstrapStrictImportsRequested: bool = false
 var bootstrapVisibilityReportPath: string = ""
 var bootstrapVisibilityReportStarted: bool = false
@@ -1977,9 +1979,29 @@ fun bootstrapModuleManifestVisibility(modulePath: string): string {
     ""
 }
 
+// The standard library's `visibility`, from its own abla.toml (read once per
+// root).
+var bootstrapStandardLibraryVisibilityRoot: string = ""
+var bootstrapStandardLibraryVisibilityValue: string = ""
+
+fun bootstrapStandardLibraryVisibility(): string {
+    val root = bootstrapStandardLibraryRoot()
+    if (root != bootstrapStandardLibraryVisibilityRoot) {
+        val manifest = Path(root).child("abla.toml")
+        bootstrapStandardLibraryVisibilityValue = if (manifest.exists())
+            bootstrapTomlStringField(manifest.text, "visibility") else ""
+        bootstrapStandardLibraryVisibilityRoot = root
+    }
+    bootstrapStandardLibraryVisibilityValue
+}
+
 fun bootstrapModuleStrict(modulePath: string): bool {
-    if (bootstrapStandardLibraryModuleSource(modulePath) ||
-        modulePath.startsWith("<")) return false
+    if (modulePath.startsWith("<")) return false
+    // The standard library is one package, whose abla.toml says for all of it
+    // (`--strict-imports` is for a program's modules).
+    if (bootstrapStandardLibraryModuleSource(modulePath)) {
+        return bootstrapStandardLibraryVisibility() == "imports"
+    }
     val visibility = bootstrapModuleManifestVisibility(modulePath)
     if (visibility == "imports") true
     else if (visibility == "program") false
@@ -1997,6 +2019,17 @@ fun bootstrapImportSpelling(importer: string, target: string): string {
         if (name.endsWith("/entry.ab")) name = name.slice(0, name.size - 9)
         return name
     }
+    bootstrapRelativeImportSpelling(importer, target)
+}
+
+/** `target` as a standard-library module imports it: another library module
+ *  by its name, a file of one (`openssl.ab`) by its relative path. */
+fun bootstrapStandardLibraryImportSpelling(importer: string, target: string): string =
+    if (target.endsWith("/entry.ab")) bootstrapImportSpelling(importer, target)
+    else bootstrapRelativeImportSpelling(importer, target)
+
+/** `target`'s path relative to `importer`'s directory, as an import spells it. */
+fun bootstrapRelativeImportSpelling(importer: string, target: string): string {
     val from = bootstrapPathSegments(Path(importer).parent().text)
     val to = bootstrapPathSegments(target)
     var common = 0
@@ -2047,10 +2080,15 @@ fun bootstrapValidateStrictImports(
     // functions may use without `this.`.
     val classes = bootstrapStringSet()
     val classMembers: array<array<string>> = []
+    // The names some module declares as a type, which a type annotation can
+    // name (`: never` is the built-in type, whatever values are called).
+    val typeNames = bootstrapStringSet()
     var module = 0
     while (module < snapshots.size) {
         val prefixed = strictSummary.targetPrefix(snapshots[module].path) != ""
         for (declaration in snapshots[module].discovery.declarations) {
+            if (declaration.kind == "class" || declaration.kind == "interface" ||
+                declaration.kind == "type") typeNames.add(declaration.name)
             if (!prefixed && declaration.extensionOwner == "" &&
                 !declaration.isPrivate && declaration.name != "" &&
                 declaration.kind != "extend") {
@@ -2089,7 +2127,7 @@ fun bootstrapValidateStrictImports(
                 module, aliases, snapshots, asStrict
             )
             val findings = bootstrapStrictImportFindings(
-                snapshot, names, declaring, classes, classMembers, visible
+                snapshot, names, declaring, classes, classMembers, visible, typeNames
             )
             for (finding in findings) {
                 if (!suggestedKnown[finding.declaring]) {
@@ -2098,7 +2136,12 @@ fun bootstrapValidateStrictImports(
                     )
                     suggestedKnown[finding.declaring] = true
                 }
-                val spelling = if (suggested[finding.declaring] != "")
+                // A standard-library module imports the declaring module itself.
+                val spelling = if (bootstrapStandardLibraryModuleSource(snapshot.path))
+                    bootstrapStandardLibraryImportSpelling(
+                        snapshot.path, snapshots[finding.declaring].path
+                    )
+                    else if (suggested[finding.declaring] != "")
                     suggested[finding.declaring]
                     else bootstrapImportSpelling(
                         snapshot.path, snapshots[finding.declaring].path
@@ -2163,11 +2206,18 @@ fun bootstrapStrictVisibleModules(
 ): array<bool> {
     val visible = filledArray(snapshots.size, false)
     visible[module] = true
-    // abla/stm, which a program has without importing it.
+    // abla/stm, and the runtime the compiler loads into every program for its
+    // target (abla/runtime/self and abla/runtime/platform's host.ab or
+    // wasm.ab), which a program has without importing them.
     val transactions = bootstrapImplicitTransactionsPath()
+    val runtime = bootstrapNormalizeModulePath(Path(bootstrapStandardLibraryRoot()).child(
+        "abla/runtime/self/entry.ab"
+    ).text)
     var index = 0
     while (index < snapshots.size) {
-        if (snapshots[index].path == transactions) visible[index] = true
+        val path = snapshots[index].path
+        if (path == transactions || path == runtime ||
+            bootstrapRuntimePlatformModule(path)) visible[index] = true
         index = index + 1
     }
     val pending: array<int> = []
@@ -2227,7 +2277,8 @@ fun bootstrapStrictImportFindings(
     declaring: array<array<int>>,
     classes: BootstrapStringSet,
     classMembers: array<array<string>>,
-    visible: array<bool>
+    visible: array<bool>,
+    typeNames: BootstrapStringSet
 ): array<BootstrapStrictImportFinding> {
     val result: array<BootstrapStrictImportFinding> = []
     val source = snapshot.source
@@ -2258,7 +2309,14 @@ fun bootstrapStrictImportFindings(
             previous != "." && previous != "fun" && previous != "@" &&
             !(next == "=" && depth > 0)) {
             val text = bootstrapTokenText(source, token)
-            val known = names.indexOf(text)
+            // A type annotation names a type: a value of that name elsewhere
+            // isn't what it uses.
+            val previousWord = if (previous == "identifier")
+                bootstrapTokenText(source, tokens[index - 1]) else ""
+            val typePosition = previous == ":" || previousWord == "is" ||
+                previousWord == "as" || previous == "as"
+            val known = if (typePosition && !typeNames.contains(text)) -1
+                else names.indexOf(text)
             if (known >= 0 && !own.contains(text) && !reported.contains(text)) {
                 var seen = false
                 for (candidate in declaring[known]) {

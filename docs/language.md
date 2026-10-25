@@ -2578,10 +2578,14 @@ fun main: int = nextId()
 // error: add: import "./shapes/ids.ab"
 ```
 
-- A module that isn't strict passes on everything it reaches, as today. The
-  standard library is never strict, so `import "abla/fs"` still gives `Path`
-  although `abla/fs` reaches it through another module. A strict package may
-  import a flat one and the other way round.
+- A module that isn't strict passes on everything it reaches, as today. A
+  strict package may import a flat one and the other way round.
+- The standard library is a strict package. A module that fronts another
+  passes it on with `export import`, so `import "abla/fs"` gives `Path`
+  although `abla/fs` declares nothing itself; `abla/net`, `abla/random` and
+  `abla/process` do the same. The runtime the compiler adds to every program
+  (`abla/runtime/self` and its target's platform module) and `abla/stm` are
+  seen by every module without an import.
 - Member names (after `.`, or a class's own members in its body), named
   arguments and a declaration's own parameters and locals aren't looked up
   this way. Aliases, `private` and `E_IMPORT_UNQUALIFIED_AMBIGUOUS` work as
