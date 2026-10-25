@@ -61,6 +61,20 @@ alias_plain_status=$?
 set -e
 [[ $alias_plain_status -eq 42 ]] || exit 1
 
+# A member, parameter (and named argument), local or lambda parameter named
+# like a top-level declaration of its module, at run time and under `#`.
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode "$compiler" build \
+        "$project_root/tests/cases/modules/import-alias-members.ab" \
+        -o "$output/import-alias-members-$mode" --no-cache
+    set +e
+    members_output=$("$project_root/tools/run-limited.sh" "$output/import-alias-members-$mode")
+    members_status=$?
+    set -e
+    [[ $members_status -eq 42 ]] ||
+        { echo "import aliases: members ($mode) exited with $members_status, printed:"; echo "$members_output"; exit 1; }
+done
+
 check_invalid() {
     local fixture=$1
     local code=$2
@@ -94,4 +108,4 @@ grep -q 'identifier:privateLeft' "$output/transitive.err"
 "$project_root/tools/test-generated-cross-module-diagnostics.sh" "$compiler"
 
 printf '%s\n' \
-    'import aliases: qualified values/calls/types + isolation + canonical identities + diagnostics passed'
+    'import aliases: qualified values/calls/types + members named like top-level names + isolation + canonical identities + diagnostics passed'
