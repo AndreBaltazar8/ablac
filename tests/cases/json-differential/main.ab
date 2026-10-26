@@ -114,9 +114,9 @@ fun differentialDelete(keys: array<string>, values: array<Json>, key: string): a
 }
 
 // The edit script, on every even-numbered object (in document order) below 60:
-// set the first key (the last member with it, when it repeats), add a key,
-// delete the second key, set and delete a key, delete the added key and set it
-// again.
+// set the first key (the last member with it, when it repeats), add a key and
+// an object keyed by array indexes, delete the second key, set and delete a
+// key, delete the added key and set it again.
 fun differentialScript(ordinal: int): bool = ordinal % 2 == 0 && ordinal < 60
 
 fun differentialEditTree(value: Json, var counter: array<int>): Json {
@@ -137,6 +137,7 @@ fun differentialEditTree(value: Json, var counter: array<int>): Json {
         val second = if (value.keys.size > 1) value.keys[1] else "none"
         differentialSet(keys, values, first, jsonBoolean(true))
         differentialSet(keys, values, "added", jsonString("a\u0001b\u00e9"))
+        differentialSet(keys, values, "7", jsonObject(["b", "2", "1"], [jsonInteger(1), jsonInteger(2), jsonInteger(3)]))
         for (step in 0 until 3) {
             val key = if (step == 0) second else if (step == 1) "tmp" else "added"
             if (step == 1) differentialSet(keys, values, "tmp", jsonInteger(1))
@@ -172,6 +173,7 @@ fun differentialEditNode(var edits: JsonEdits, node: JsonNode, var counter: arra
         val second = if (node.size() > 1) node.keyAt(1) else "none"
         edits.set(node, first, jsonBoolean(true))
         edits.set(node, "added", jsonString("a\u0001b\u00e9"))
+        edits.set(node, "7", jsonObject(["b", "2", "1"], [jsonInteger(1), jsonInteger(2), jsonInteger(3)]))
         edits.delete(node, second)
         edits.set(node, "tmp", jsonInteger(1))
         edits.delete(node, "tmp")
@@ -186,14 +188,73 @@ fun differentialEditNode(var edits: JsonEdits, node: JsonNode, var counter: arra
     return
 }
 
+// JavaScript's key order, applied by the test: keys that are array indexes ("0",
+// or digits without a leading zero, below 4294967295) first, ascending, then
+// the others in their order.
+fun differentialIndex(key: string): int {
+    if (key.size == 0 || key.size > 10 || (key.size > 1 && key[0] == 48)) return -1
+    var value = 0
+    for (byte in key) {
+        if (byte < 48 || byte > 57) return -1
+        value = value * 10 + byte - 48
+    }
+    if (value < 4294967295) value else -1
+}
+
+fun differentialJsOrder(value: Json): Json {
+    if (value.kind == 4) {
+        val values: array<Json> = []
+        for (element in value.values) values.append(differentialJsOrder(element))
+        return Json(4, "", 0, false, [], values, value.numberValue)
+    }
+    if (value.kind != 5) return value
+    val keys: array<string> = []
+    val values: array<Json> = []
+    val taken: array<bool> = []
+    for (key in value.keys) taken.append(false)
+    // Index keys, smallest first (the first of equal ones first).
+    var more = true
+    while (more) {
+        var best = -1
+        var index = 0
+        while (index < value.keys.size) {
+            val number = differentialIndex(value.keys[index])
+            if (!taken[index] && number >= 0 &&
+                (best < 0 || number < differentialIndex(value.keys[best]))) best = index
+            index = index + 1
+        }
+        if (best < 0) more = false
+        else {
+            taken[best] = true
+            keys.append(value.keys[best])
+            values.append(differentialJsOrder(value.values[best]))
+        }
+    }
+    var index = 0
+    while (index < value.keys.size) {
+        if (!taken[index]) {
+            keys.append(value.keys[index])
+            values.append(differentialJsOrder(value.values[index]))
+        }
+        index = index + 1
+    }
+    Json(5, "", 0, false, keys, values, value.numberValue)
+}
+
 // The document written back (as jsonStringify writes jsonParse's tree), and with
 // the edit script (as jsonStringify writes the tree with it applied).
 fun differentialEmits(document: JsonDocument, value: Json): bool {
     if (document.emit() != jsonStringify(value)) return false
+    val ordered = jsonStringify(differentialJsOrder(value))
+    if (document.emit(true) != ordered || jsonStringify(document.root().toJson(true)) != ordered ||
+        jsonStringify(jsonJsKeyOrder(value)) != ordered) return false
     var edits = document.edits()
     differentialEditNode(edits, document.root(), [0])
-    val expected = jsonStringify(differentialEditTree(value, [0]))
-    edits.emit() == expected && jsonStringify(edits.toJson()) == expected
+    val editedTree = differentialEditTree(value, [0])
+    val expected = jsonStringify(editedTree)
+    val expectedOrdered = jsonStringify(differentialJsOrder(editedTree))
+    edits.emit() == expected && jsonStringify(edits.toJson()) == expected &&
+        edits.emit(true) == expectedOrdered && jsonStringify(edits.toJson(true)) == expectedOrdered
 }
 
 fun differentialParse(input: string, limits: JsonLimits): string {
@@ -301,7 +362,8 @@ fun differentialDocuments(): array<string> {
         "[]",
         "  ",
         "{\"a\":[{\"b\":[{\"c\":[1,2,{\"d\":\"\\ud800\"}]}]}]}",
-        "{\"a\":1,\"b\":{\"x\":1,\"x\":2,\"y\":[{\"z\":1,\"z\":{\"q\":1,\"q\":2}}]},\"a\":3,\"b\":0}"
+        "{\"a\":1,\"b\":{\"x\":1,\"x\":2,\"y\":[{\"z\":1,\"z\":{\"q\":1,\"q\":2}}]},\"a\":3,\"b\":0}",
+        "{\"b\":1,\"10\":2,\"a\":{\"3\":0,\"z\":1,\"0\":2},\"2\":4,\"01\":5,\"4294967294\":6,\"4294967295\":7,\"-1\":8,\"0\":9,\"2\":10}"
     ]
 }
 

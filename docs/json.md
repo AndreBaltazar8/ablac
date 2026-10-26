@@ -261,6 +261,28 @@ fun main {
 // [{"id":1,"seen":true},{"id":2,"seen":true}]
 ```
 
+`jsonStringify`, `toJson()` and `emit()` keep an object's members in source
+order. JavaScript orders an object's keys differently: keys that are array
+indexes (`"0"`, or digits without a leading zero, below 2^32 - 1) come first,
+ascending, then the others in the order they were added. `toJson(true)`,
+`emit(true)` (a document's or an edit list's) and `jsonJsKeyOrder(value)` (any
+tree) give that order, so `document.emit(true)` writes what
+`JSON.stringify(JSON.parse(source))` writes under `jsonPermissiveLimits`:
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val document = jsonDocument("{\"b\":1,\"10\":2,\"a\":3,\"2\":4,\"01\":5}", jsonPermissiveLimits).document
+    println(document.emit())
+    println(document.emit(true))
+}
+// output:
+// {"b":1,"10":2,"a":3,"2":4,"01":5}
+// {"2":4,"10":2,"b":1,"a":3,"01":5}
+```
+
 A reader (`jsonObjectReader(source, jsonPermissiveLimits)`) can't merge as it
 goes: it gives every member as written, duplicates included, in source order.
 Keeping the last value read for each key gives `JSON.parse`'s result.

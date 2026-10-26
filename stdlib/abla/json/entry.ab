@@ -1927,6 +1927,90 @@ fun JsonCursor.key(): string =
 // Whether the current member's key is `name`, compared in place.
 fun JsonCursor.keyIs(name: string): bool = this.keyIndex >= 0 && jsonNodeTextIs(this.document, this.keyIndex, name)
 
+// The value of `key` as a JavaScript array index ("0", or digits without a
+// leading zero, below 2^32 - 1), or -1 for any other key.
+private fun jsonJsIndex(key: string): int {
+    if (key.size == 0 || key.size > 10 || (key.size > 1 && key[0] == 48)) return -1
+    var value = 0
+    for (byte in key) {
+        if (byte < 48 || byte > 57) return -1
+        value = value * 10 + byte - 48
+    }
+    if (value < 4294967295) value else -1
+}
+
+// The positions of `keys` in the order JavaScript gives an object's keys: array
+// indexes first, ascending, then the others in their order.
+private fun jsonJsOrder(keys: array<string>): array<int> {
+    val indexValues: array<int> = []
+    val indexPositions: array<int> = []
+    val others: array<int> = []
+    var position = 0
+    while (position < keys.size) {
+        val value = jsonJsIndex(keys[position])
+        if (value >= 0) {
+            indexValues.append(value)
+            indexPositions.append(position)
+        } else others.append(position)
+        position = position + 1
+    }
+    // A stable merge sort of the index keys by value, bottom up.
+    var values: array<int> = []
+    var positions: array<int> = []
+    for (value in indexValues) values.append(value)
+    for (at in indexPositions) positions.append(at)
+    var width = 1
+    while (width < values.size) {
+        val nextValues: array<int> = []
+        val nextPositions: array<int> = []
+        var begin = 0
+        while (begin < values.size) {
+            val middle = if (begin + width < values.size) begin + width else values.size
+            val end = if (begin + 2 * width < values.size) begin + 2 * width else values.size
+            var left = begin
+            var right = middle
+            while (left < middle || right < end) {
+                if (right >= end || (left < middle && values[left] <= values[right])) {
+                    nextValues.append(values[left])
+                    nextPositions.append(positions[left])
+                    left = left + 1
+                } else {
+                    nextValues.append(values[right])
+                    nextPositions.append(positions[right])
+                    right = right + 1
+                }
+            }
+            begin = end
+        }
+        values = nextValues
+        positions = nextPositions
+        width = width * 2
+    }
+    val order: array<int> = []
+    for (at in positions) order.append(at)
+    for (at in others) order.append(at)
+    order
+}
+
+// `value` with every object's members in the order JavaScript gives them (array
+// indexes first, ascending, then the other keys in their order), as
+// JSON.stringify(JSON.parse(text)) writes them.
+fun jsonJsKeyOrder(value: Json): Json {
+    if (value.kind == 4) {
+        val values: array<Json> = []
+        for (element in value.values) values.append(jsonJsKeyOrder(element))
+        return Json(4, "", 0, false, jsonNoKeys, values, jsonNoNumber)
+    }
+    if (value.kind != 5 || value.keys.size != value.values.size) return value
+    val keys: array<string> = []
+    val values: array<Json> = []
+    for (position in jsonJsOrder(value.keys)) {
+        keys.append(value.keys[position])
+        values.append(jsonJsKeyOrder(value.values[position]))
+    }
+    Json(5, "", 0, false, keys, values, jsonNoNumber)
+}
+
 // Edits to a document's objects, written out with the rest of the document in
 // one pass by emit(). An edit names an object of the document (a JsonNode) and a
 // key; edits apply in the order they were made, to the object's members as
@@ -2043,16 +2127,44 @@ private fun jsonEmitMembersBuild(edits: JsonEdits, index: int): JsonEmitMembers 
     result
 }
 
-// Builds the member list of every object written from one (edited, or with merged
-// keys), afresh: edits made since the last emit count.
-private fun jsonEditsPrepare(var edits: JsonEdits): void {
+// Builds the member list of every object written from one (edited, with merged
+// keys, or, in JavaScript's key order, with an array-index key), afresh: edits
+// made since the last emit count.
+private fun jsonEditsPrepare(var edits: JsonEdits, jsKeyOrder: bool): void {
     edits.prepared.clear()
-    val tape = edits.document.tape
+    val document = edits.document
+    val tape = document.tape
     var index = 0
     while (index < tape.size) {
         val word = tape[index]
-        if ((word & 15) == 5 && ((word & jsonTapeFlag) != 0 || edits.byObject.has(index))) {
-            edits.prepared.set(index, jsonEmitMembersBuild(edits, index))
+        if ((word & 15) == 5) {
+            var listed = (word & jsonTapeFlag) != 0 || edits.byObject.has(index)
+            if (!listed && jsKeyOrder) {
+                val end = tape[index + 3]
+                var member = index + 4
+                while (!listed && member < end) {
+                    listed = jsonJsIndex(jsonTapeStringText(document, member)) >= 0
+                    member = tape[member + 7]
+                }
+            }
+            if (listed) {
+                var members = jsonEmitMembersBuild(edits, index)
+                if (jsKeyOrder) {
+                    val keys: array<string> = []
+                    val tapeValues: array<int> = []
+                    val jsonValues: array<Json> = []
+                    for (position in jsonJsOrder(members.keys)) {
+                        keys.append(members.keys[position])
+                        tapeValues.append(members.tapeValues[position])
+                        jsonValues.append(
+                            if (members.tapeValues[position] >= 0) members.jsonValues[position]
+                            else jsonJsKeyOrder(members.jsonValues[position])
+                        )
+                    }
+                    members = JsonEmitMembers(keys, tapeValues, jsonValues)
+                }
+                edits.prepared.set(index, members)
+            }
         }
         index = index + 4
     }
@@ -2065,14 +2177,15 @@ private fun jsonEmitMembersOf(edits: JsonEdits, index: int): JsonEmitMembers {
     if (known != null) known else jsonEmitMembersBuild(edits, index)
 }
 
-// Whether the object at `index` is written from a member list.
-private fun jsonEmitListed(edits: JsonEdits, index: int): bool =
-    (edits.document.tape[index] & jsonTapeFlag) != 0 || edits.byObject.has(index)
+// Whether the object at `index` is written from a (prepared) member list.
+private fun jsonEmitListed(edits: JsonEdits, index: int): bool = edits.prepared.has(index)
 
-// The edited document as a tree: what jsonParse gives, with the edits applied.
-fun JsonEdits.toJson(): Json {
-    jsonEditsPrepare(this)
-    jsonEditedTree(this, if (this.document.tape.size > 0) 0 else -1)
+// The edited document as a tree: what jsonParse gives, with the edits applied
+// (with every object's keys in JavaScript's order, if asked).
+fun JsonEdits.toJson(jsKeyOrder: bool = false): Json {
+    jsonEditsPrepare(this, false)
+    val tree = jsonEditedTree(this, if (this.document.tape.size > 0) 0 else -1)
+    if (jsKeyOrder) jsonJsKeyOrder(tree) else tree
 }
 
 private fun jsonEditedTree(edits: JsonEdits, index: int): Json {
@@ -2105,17 +2218,20 @@ private fun jsonEditedTree(edits: JsonEdits, index: int): Json {
     Json(5, "", 0, false, keys, values, jsonNoNumber)
 }
 
-// The document as jsonStringify writes jsonParse's tree.
-fun JsonDocument.emit(): string = this.edits().emit()
+// The document as jsonStringify writes jsonParse's tree (in JavaScript's key
+// order, if asked: as JSON.stringify(JSON.parse(source)) writes it).
+fun JsonDocument.emit(jsKeyOrder: bool = false): string = this.edits().emit(jsKeyOrder)
 
 // The edited document as jsonStringify writes it (jsonStringify(toJson())), in one
 // pass over the tape: numbers as written, strings as jsonStringify writes them,
 // edited objects (and objects whose repeated keys merged) from their members;
-// "null" when an edit's value can't be written.
-fun JsonEdits.emit(): string {
-    if (ablaAtCompileTime()) return jsonStringify(this.toJson())
+// "null" when an edit's value can't be written. With jsKeyOrder, every object's
+// keys come in JavaScript's order (array indexes first, ascending), as
+// JSON.stringify writes an object JSON.parse made and the edits changed.
+fun JsonEdits.emit(jsKeyOrder: bool = false): string {
+    if (ablaAtCompileTime()) return jsonStringify(this.toJson(jsKeyOrder))
     if (this.document.tape.size == 0) return "null"
-    jsonEditsPrepare(this)
+    jsonEditsPrepare(this, jsKeyOrder)
     val size = jsonTapeEncodedSize(this, 0)
     if (size < 0) "null" else jsonTapeEncodeSized(this, size)
 }
@@ -2247,7 +2363,10 @@ trusted fun jsonTapeEncodeAt(edits: JsonEdits, index: int, destination: int): in
 // The node as jsonParse's tree: equal kind by kind, member by member, to what
 // jsonParse built for these bytes under the document's limits (null for a
 // missing node).
-fun JsonNode.toJson(): Json = jsonNodeTree(this.document, this.index)
+fun JsonNode.toJson(jsKeyOrder: bool = false): Json {
+    val tree = jsonNodeTree(this.document, this.index)
+    if (jsKeyOrder) jsonJsKeyOrder(tree) else tree
+}
 
 private fun jsonNodeTree(document: JsonDocument, index: int): Json {
     if (index < 0) return jsonNull()
