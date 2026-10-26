@@ -752,11 +752,12 @@ fun bootstrapLlvmCollectingFunctions(
     result
 }
 
-fun bootstrapLlvmGcRootPlan(
-    function: BootstrapIrFunction,
-    functionIndex: BootstrapLlvmNameIndex,
-    mayCollect: array<bool>
-): array<bool> {
+// Each SSA value's definition and last use, by instruction index (-1 when it has
+// none). A value defined before a loop and used inside it counts as used at the
+// loop's back-edge.
+class BootstrapLlvmValueIntervals(val definitions: array<int>, val lastUses: array<int>)
+
+fun bootstrapLlvmValueIntervals(function: BootstrapIrFunction): BootstrapLlvmValueIntervals {
     var valueCount = 0
     var instruction = 0
     while (instruction < function.instructions.size) {
@@ -776,20 +777,13 @@ fun bootstrapLlvmGcRootPlan(
 
     val definitions: array<int> = []
     val lastUses: array<int> = []
-    val result: array<bool> = []
     var value = 0
     while (value < valueCount) {
         definitions.append(-1)
         lastUses.append(-1)
-        result.append(false)
         value = value + 1
     }
 
-    // collectorPrefix[n] counts collection-capable instructions before n.
-    // That makes the old strict interval (definition, last use) an O(1)
-    // lookup for every SSA value instead of rescanning the whole function.
-    val collectorPrefix: array<int> = []
-    collectorPrefix.append(0)
     instruction = 0
     while (instruction < function.instructions.size) {
         val candidate = function.instructions[instruction]
@@ -805,13 +799,6 @@ fun bootstrapLlvmGcRootPlan(
             if (used >= 0) lastUses[used] = instruction
             operand = operand + 1
         }
-        var collectorCount = collectorPrefix[instruction]
-        if (bootstrapLlvmInstructionMayCollect(
-            candidate,
-            functionIndex,
-            mayCollect
-        )) collectorCount = collectorCount + 1
-        collectorPrefix.append(collectorCount)
         instruction = instruction + 1
     }
 
@@ -883,18 +870,113 @@ fun bootstrapLlvmGcRootPlan(
             loop = loop + 1
         }
     }
+    BootstrapLlvmValueIntervals(definitions, lastUses)
+}
 
-    value = 0
-    while (value < valueCount) {
+fun bootstrapLlvmGcRootPlan(
+    function: BootstrapIrFunction,
+    functionIndex: BootstrapLlvmNameIndex,
+    mayCollect: array<bool>
+): array<bool> {
+    val intervals = bootstrapLlvmValueIntervals(function)
+    val definitions = intervals.definitions
+    val lastUses = intervals.lastUses
+    // collectorPrefix[n] counts collection-capable instructions before n.
+    // That makes the old strict interval (definition, last use) an O(1)
+    // lookup for every SSA value instead of rescanning the whole function.
+    val collectorPrefix: array<int> = []
+    collectorPrefix.append(0)
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        var collectorCount = collectorPrefix[instruction]
+        if (bootstrapLlvmInstructionMayCollect(
+            function.instructions[instruction],
+            functionIndex,
+            mayCollect
+        )) collectorCount = collectorCount + 1
+        collectorPrefix.append(collectorCount)
+        instruction = instruction + 1
+    }
+    val result: array<bool> = []
+    var value = 0
+    while (value < definitions.size) {
         val definition = definitions[value]
         val lastUse = lastUses[value]
-        if (definition >= 0 && lastUse > definition &&
-            collectorPrefix[lastUse] > collectorPrefix[definition + 1]) {
-            result[value] = true
-        }
+        result.append(definition >= 0 && lastUse > definition &&
+            collectorPrefix[lastUse] > collectorPrefix[definition + 1])
         value = value + 1
     }
     result
+}
+
+// Where a function's root frame is pushed lazily: `sites[i]` for a label whose
+// block has an instruction that may collect (or, with `pressure`, allocate),
+// and for instruction 0 when the function's first block has one (it then
+// pushes at entry, as every call does). A block runs to its end once entered,
+// so its start is as late as its first such instruction, and few values live
+// across a label: values pass between blocks in locals, which are rooted.
+fun bootstrapLlvmLazyRootSites(
+    function: BootstrapIrFunction,
+    functionIndex: BootstrapLlvmNameIndex,
+    mayCollect: array<bool>,
+    pressure: bool
+): array<bool> {
+    val sites: array<bool> = []
+    var block = 0
+    var index = 0
+    while (index < function.instructions.size) {
+        sites.append(false)
+        val instruction = function.instructions[index]
+        if (instruction.opcode == "label") block = index
+        else if (bootstrapLlvmInstructionMayCollect(instruction, functionIndex, mayCollect) ||
+            pressure && bootstrapLlvmInstructionMayAllocate(instruction)) {
+            sites[block] = true
+        }
+        index = index + 1
+    }
+    sites
+}
+
+// Whether the pressure safe point may run at each of `sites` rather than at
+// entry: a collection there must find every boxed value the rest of the
+// function reads rooted, and the root plan roots only what lives across a
+// collecting instruction. `boxed[v]`: whether value v has a value slot (a
+// scalar's never holds a reference).
+fun bootstrapLlvmLazyPressureSafe(
+    function: BootstrapIrFunction,
+    sites: array<bool>,
+    rootValues: array<bool>,
+    boxed: array<bool>
+): bool {
+    val intervals = bootstrapLlvmValueIntervals(function)
+    // The unrooted boxed values live at each instruction, as a difference array.
+    val live: array<int> = []
+    var index = 0
+    while (index <= function.instructions.size) {
+        live.append(0)
+        index = index + 1
+    }
+    var value = 0
+    while (value < intervals.definitions.size) {
+        val definition = intervals.definitions[value]
+        val lastUse = intervals.lastUses[value]
+        if (definition >= 0 && lastUse > definition &&
+            value < boxed.size && boxed[value] &&
+            !(value < rootValues.size && rootValues[value])) {
+            live[definition + 1] = live[definition + 1] + 1
+            live[lastUse + 1] = live[lastUse + 1] - 1
+        }
+        value = value + 1
+    }
+    var unrooted = 0
+    var safe = true
+    index = 0
+    while (index < function.instructions.size && safe) {
+        unrooted = unrooted + live[index]
+        if (sites[index] && unrooted > 0) safe = false
+        index = index + 1
+    }
+    safe
 }
 
 fun bootstrapLlvmParameterId(

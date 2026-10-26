@@ -710,3 +710,24 @@ tool cost 9.5–9.7 s of user CPU under either pipeline with the JIT cache off.
 The full pipeline also made the `--fast` compile-time parity suite 9% slower
 (249 s against 229 s). These are relative measurements under a load
 of 15–35, interleaved and taken three times each.
+
+## Lazy root frames (2026-10-26)
+
+A function that may reach the collector pushed its root frame, and ran its
+pressure safe point when it allocates, at entry on every call, even on a path
+that returns before anything can collect or allocate. The frame's slots are
+still written at entry, but the push and the safe point now run at the start of
+the first block that may collect (or allocate, for a function with a safe
+point), behind a flag that the return paths read before popping. LLVM promotes
+the flag, so a path that never pushes carries no frame code at all. A function
+whose first block needs the frame, or whose safe point would find an unrooted
+boxed value live at a later block, keeps pushing at entry.
+
+Against the compiler it was branched from, on the same machine and load:
+a scalar fast path with an allocating cold path (`if (x < 100.0) return
+x * 0.5 + 1.0`, 1e8 calls) dropped from 0.21–0.22 s to 0.11–0.12 s, the time of
+the same function without the cold path; the v8 port's `sin` from 0.29 to
+0.27–0.28 s for 2e7 calls; the `--fast` self-build's user time from a median of
+14.8 to 14.6 s. JSON parsing and a simulation tick, whose hot functions have no
+early-return fast path, were unchanged within noise. The compiler rebuilt by
+itself writes byte-identical module text.

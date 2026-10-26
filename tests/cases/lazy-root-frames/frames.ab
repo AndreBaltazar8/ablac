@@ -1,0 +1,109 @@
+import "abla/io"
+import "abla/float/text"
+
+// Functions whose root frames are pushed lazily: a fast path returns before
+// anything can collect or allocate, a slow path pushes the frame (and runs the
+// pressure safe point) on its way in. Run with a collection at every safe point
+// (ABLA_GC_STRESS=1), every value the slow paths hold must still be rooted.
+
+// The test reads this function's code: its first block pushes nothing.
+fun halfOrBoxed(x: f64): f64 {
+    if (x < 100.0) return x * 0.5 + 1.0
+    val boxed: array<f64> = filledArray(2, 0.0)
+    boxed[0] = x
+    boxed[0] + boxed[1]
+}
+
+// A frame pushed in a loop's first allocating iteration, then returned from a
+// later one; a return before the loop pushes nothing.
+fun labels(count: int): int {
+    if (count == 0) return 0
+    var total = 0
+    for (index in 0 until count) {
+        if (index > 40) return total
+        val label = "label-$index"
+        total = total + label.size
+    }
+    total
+}
+
+// Recursion: the leaves return before allocating; a label lives across both
+// recursive calls, each of which may collect.
+fun tree(depth: int, seed: int): int {
+    if (depth == 0) return seed % 7
+    val label = "node-$seed"
+    tree(depth - 1, seed * 2) + tree(depth - 1, seed * 2 + 1) + label.size
+}
+
+fun padded(text: string): string {
+    if (text.size > 6) return text
+    "$text......"
+}
+
+fun words(count: int): Generator<string> = generator {
+    var index = 0
+    while (index < count) {
+        yield padded("w${count - index}")
+        index = index + 1
+    }
+}
+
+// Through a function value: a fast path and an allocating one.
+fun measureWith(values: array<int>, measure: (int) -> int): int {
+    var total = 0
+    for (value in values) total = total + measure(value)
+    total
+}
+
+val counter: TVar<int> = TVar(0)
+
+// A transaction's body allocates on some paths; a conflict abandons it from
+// whatever frames it pushed.
+fun bump(round: int): int = atomic {
+    val seen = counter.getValue()
+    if (round % 3 == 0) {
+        counter.setValue(seen + 1)
+        1
+    } else {
+        val note = "round $round saw $seen"
+        counter.setValue(seen + note.size % 2 + 1)
+        2
+    }
+}
+
+fun bumps(seed: int): int {
+    var total = 0
+    for (round in seed until seed + 3000) total = total + bump(round)
+    total
+}
+
+fun main: int {
+    var halves = 0.0
+    var x = 0.0
+    for (index in 0 until 20000) {
+        halves = halves + halfOrBoxed(x)
+        x = x + 0.01
+    }
+    println("halves ${halves}")
+    println("labels ${labels(0)} ${labels(10)} ${labels(100)}")
+    var trees = 0
+    for (round in 0 until 30) trees = trees + tree(8, round)
+    println("trees $trees")
+    var text = 0
+    for (word in words(200)) text = text + word.size
+    println("words $text")
+    val values: array<int> = []
+    for (index in 0 until 500) values.append(index)
+    val measured = measureWith(values) { value ->
+        if (value % 2 == 0) value
+        else "odd-$value".size
+    }
+    println("measured $measured")
+    val a = thread { bumps(0) }
+    val b = thread { bumps(1) }
+    val c = thread { bumps(2) }
+    val committed = await a + await b + await c
+    val final = atomic { counter.getValue() }
+    println("bumps $committed counter ${final >= 9000}")
+    0
+}

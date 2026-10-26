@@ -280,7 +280,14 @@ class BootstrapLlvmFunctionStorage(
     val gcFrame: i64*,
     val gcRoots: i64*,
     val gcRootsType: i64*,
-    val gcRootCount: int
+    val gcRootCount: int,
+    // A function pushes its root frame (and runs its pressure safe point, when it
+    // allocates) lazily: at the first instruction that may collect or allocate,
+    // not at entry. `gcPushed` is its i1 flag (null when it pushes eagerly or has
+    // nothing to push), `gcPressure` whether the push runs the safe point too.
+    var gcPushed: i64* = nativeNullPointer(),
+    var gcPressure: bool = false,
+    var gcFunction: i64* = nativeNullPointer()
 )
 
 fun BootstrapLlvmFunctionStorage.block(label: int): i64* {
@@ -1122,28 +1129,75 @@ fun bootstrapLlvmPushRoots(
             }
             index = index + 1
         }
-        val first = bootstrapLlvmArrayElement(
-            backend, storage.gcRootsType, storage.gcRoots, 0, "gc.roots.pointer"
-        )
-        bootstrapLlvmCallNamed(
-            backend,
-            "abla_runtime_roots_push",
-            [storage.gcFrame, first,
-             LLVMConstInt(backend.i64Type, storage.gcRootCount, 0)],
-            "", false, [false, false, false]
-        )
+        if (pointerIsNull(storage.gcPushed)) bootstrapLlvmEmitRootsPush(backend, storage)
     }
+}
+
+fun bootstrapLlvmEmitRootsPush(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage
+): void {
+    val first = bootstrapLlvmArrayElement(
+        backend, storage.gcRootsType, storage.gcRoots, 0, "gc.roots.pointer"
+    )
+    bootstrapLlvmCallNamed(
+        backend,
+        "abla_runtime_roots_push",
+        [storage.gcFrame, first,
+         LLVMConstInt(backend.i64Type, storage.gcRootCount, 0)],
+        "", false, [false, false, false]
+    )
+    return
+}
+
+// At the start of a block that may collect or allocate, in a function that
+// pushes lazily: the frame is pushed (and the pressure safe point run) the
+// first time such a block is entered in this call. A collection runs only at a
+// safe point or inside a call that may collect, so it always finds the frame
+// pushed; its slots name the values' storage, so it reads them as they are then.
+fun bootstrapLlvmEnsureRoots(
+    backend: BootstrapLlvmBackend,
+    storage: BootstrapLlvmFunctionStorage,
+    llvmFunction: i64*
+): void {
+    if (pointerIsNull(storage.gcPushed)) return
+    val pushed = LLVMBuildLoad2(backend.builder, backend.i1Type, storage.gcPushed, "gc.pushed")
+    val push = LLVMAppendBasicBlockInContext(backend.context, llvmFunction, "gc.push")
+    val ready = LLVMAppendBasicBlockInContext(backend.context, llvmFunction, "gc.ready")
+    LLVMBuildCondBr(backend.builder, pushed, ready, push)
+    LLVMPositionBuilderAtEnd(backend.builder, push)
+    if (storage.gcRootCount > 0) bootstrapLlvmEmitRootsPush(backend, storage)
+    if (storage.gcPressure) {
+        bootstrapLlvmCallNamed(backend, "abla_runtime_memory_pressure", [], "", false, [])
+    }
+    LLVMBuildStore(backend.builder, LLVMConstInt(backend.i1Type, 1, 0), storage.gcPushed)
+    LLVMBuildBr(backend.builder, ready)
+    LLVMPositionBuilderAtEnd(backend.builder, ready)
 }
 
 fun bootstrapLlvmPopRoots(
     backend: BootstrapLlvmBackend,
     storage: BootstrapLlvmFunctionStorage
 ): void {
-    if (storage.gcRootCount > 0) {
+    if (storage.gcRootCount > 0 && pointerIsNull(storage.gcPushed)) {
         bootstrapLlvmCallNamed(
             backend, "abla_runtime_roots_pop", [storage.gcFrame],
             "", false, [false]
         )
+    } else if (storage.gcRootCount > 0) {
+        // Pushed lazily: popped only if this call pushed it.
+        val llvmFunction = storage.gcFunction
+        val pushed = LLVMBuildLoad2(backend.builder, backend.i1Type, storage.gcPushed, "gc.pushed")
+        val pop = LLVMAppendBasicBlockInContext(backend.context, llvmFunction, "gc.pop")
+        val done = LLVMAppendBasicBlockInContext(backend.context, llvmFunction, "gc.popped")
+        LLVMBuildCondBr(backend.builder, pushed, pop, done)
+        LLVMPositionBuilderAtEnd(backend.builder, pop)
+        bootstrapLlvmCallNamed(
+            backend, "abla_runtime_roots_pop", [storage.gcFrame],
+            "", false, [false]
+        )
+        LLVMBuildBr(backend.builder, done)
+        LLVMPositionBuilderAtEnd(backend.builder, done)
     }
 }
 
@@ -7259,16 +7313,38 @@ fun bootstrapLlvmEmitFunction(
     bootstrapLlvmInitializeParameters(
         backend, function, llvmFunction, storage
     )
-    bootstrapLlvmPushRoots(backend, storage)
-    val lifetimes = bootstrapLlvmValueLifetimes(function, storage, rootValues)
-    if (backend.pressureSafePoints && collecting && directlyAllocates &&
+    val pressure = backend.pressureSafePoints && collecting && directlyAllocates &&
         !runtimeImplementation &&
-        function.name != "__bootstrap_globals") {
+        function.name != "__bootstrap_globals"
+    // The frame is pushed lazily, at the start of the first block that needs
+    // it, unless the first block does or the safe point cannot move from entry
+    // (and not in the global initializer, which runs once).
+    var lazy = (storage.gcRootCount > 0 || pressure) &&
+        function.name != "__bootstrap_globals"
+    var rootSites: array<bool> = []
+    if (lazy) {
+        rootSites = bootstrapLlvmLazyRootSites(function, functionIndex, mayCollect, pressure)
+        lazy = rootSites.size > 0 && !rootSites[0]
+    }
+    if (lazy && pressure) {
+        val boxed: array<bool> = []
+        for (slot in storage.values) boxed.append(!pointerIsNull(slot))
+        lazy = bootstrapLlvmLazyPressureSafe(function, rootSites, rootValues, boxed)
+    }
+    if (lazy) {
+        storage.gcPushed = LLVMBuildAlloca(backend.builder, backend.i1Type, "gc.pushed.flag")
+        LLVMBuildStore(backend.builder, LLVMConstInt(backend.i1Type, 0, 0), storage.gcPushed)
+        storage.gcPressure = pressure
+        storage.gcFunction = llvmFunction
+    }
+    bootstrapLlvmPushRoots(backend, storage)
+    if (pressure && !lazy) {
         bootstrapLlvmCallNamed(
             backend, "abla_runtime_memory_pressure", [],
             "", false, []
         )
     }
+    val lifetimes = bootstrapLlvmValueLifetimes(function, storage, rootValues)
     val resultUsesOutput = bootstrapLlvmDirectResultUsesOutput(function)
     val output = if (resultUsesOutput) LLVMGetParam(llvmFunction, 0)
         else nativeNullPointer()
@@ -7312,6 +7388,9 @@ fun bootstrapLlvmEmitFunction(
                 backend.builder, storage.block(instruction.target)
             )
             terminated = false
+            if (!pointerIsNull(storage.gcPushed) && rootSites[instructionIndex]) {
+                bootstrapLlvmEnsureRoots(backend, storage, llvmFunction)
+            }
         }
         if (reachable && instruction.opcode == "const.i64") {
             matched = true

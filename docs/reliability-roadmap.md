@@ -140,7 +140,9 @@ identifier. Arrays and objects publish entries only after complete writes;
 values, fields, closures, ropes, strings, cells, and shared storage trace only
 their pointer-bearing slots. Native resource buffers are pinned raw until
 deterministic drop or region reset. Selecting a managed-memory limit enables
-compiler-published function-entry pressure safe points; collector-free programs
+compiler-published pressure safe points, each run where its function's root
+frame is pushed: lazily, at the first block that may collect or allocate, so a
+path that returns before one pushes nothing; collector-free programs
 strip the tracer. `resource class`,
 `Shared`/`Weak`, and lexical regions keep their deterministic contracts outside
 the collector. Every emitted runtime also enforces an

@@ -293,6 +293,7 @@ test-serial: ablac
 	tools/test-subparser-site-key.sh $(COMPILER)
 	tools/test-stable-names.sh $(COMPILER)
 	tools/test-lambda-ordinal.sh $(COMPILER)
+	tools/test-lazy-root-frames.sh $(COMPILER)
 
 check: test self-rebuild
 
