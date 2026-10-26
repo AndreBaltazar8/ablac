@@ -294,6 +294,7 @@ test-serial: ablac
 	tools/test-stable-names.sh $(COMPILER)
 	tools/test-lambda-ordinal.sh $(COMPILER)
 	tools/test-lazy-root-frames.sh $(COMPILER)
+	tools/test-import-remap.sh $(COMPILER)
 
 check: test self-rebuild
 

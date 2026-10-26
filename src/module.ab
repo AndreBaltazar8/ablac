@@ -13,6 +13,7 @@ import "sema.ab"
 import "subparser.ab"
 import "eval.ab"
 import "generic_types.ab"
+import "import_remap.ab"
 
 fun bootstrapFrontendTraceMemory(label: string): void {
     val configured = linuxEnvironment("ABLA_COMPILER_MEMORY_TRACE")
@@ -64,7 +65,10 @@ fun bootstrapResolveImport(importer: string, requested: string): string {
     }
     val package = bootstrapResolvePackageImport(importer, requested)
     if (package != "") result = package
-    bootstrapCanonicalEscapingPath(bootstrapNormalizeModulePath(result))
+    bootstrapImportRemapApply(
+        importer,
+        bootstrapCanonicalEscapingPath(bootstrapNormalizeModulePath(result))
+    )
 }
 
 class BootstrapImportEdge(
@@ -2633,11 +2637,19 @@ class BootstrapModuleGraphIndex(
     val aliasNext: array<int>,
     val unqualifiedNames: Map<string, int>,
     val modules: Map<string, int>,
-    var indexedModules: int
+    var indexedModules: int,
+    // The root manifest whose `[imports]` remaps this graph ("" until the
+    // first module outside the standard library loads; "-" when it has none),
+    // the remaps, each directory's nearest manifest, and the other manifests
+    // with an `[imports]` table already reported.
+    var remapRoot: string,
+    var remapEntries: array<BootstrapImportRemapEntry>,
+    val manifestOfDirectory: Map<string, string>,
+    val remapReported: Map<string, int>
 )
 
 fun bootstrapModuleGraphIndex(): BootstrapModuleGraphIndex =
-    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0)
+    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map())
 
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
@@ -2807,6 +2819,7 @@ class BootstrapModuleGraph(
     fun loadContract(modulePath: string): string {
         val identity = bootstrapNormalizeModulePath(modulePath)
         if (!this.contains(identity)) {
+            this.checkModuleManifest(identity)
             val snapshot = this.state.acquire(identity)
             this.errors = this.errors + snapshot.importErrors
             this.diagnostics =
@@ -2843,8 +2856,118 @@ class BootstrapModuleGraph(
         ""
     }
 
+    /** The abla.toml nearest above `modulePath`, or "" when there is none. */
+    fun nearestManifest(modulePath: string): string {
+        val start = Path(bootstrapAbsoluteModulePath(modulePath)).parent()
+        val known = this.index.manifestOfDirectory.get(start.text)
+        if (known != null) return known
+        var directory = start
+        var result = ""
+        var depth = 0
+        while (result == "" && depth < 128) {
+            val candidate = directory.child("abla.toml")
+            if (candidate.exists()) result = candidate.text
+            val parent = directory.parent()
+            if (parent.text == directory.text) depth = 128
+            directory = parent
+            depth = depth + 1
+        }
+        this.index.manifestOfDirectory.set(start.text, result)
+        result
+    }
+
+    /** Reads the remaps of the root manifest, the one nearest `entryPath`,
+     *  and checks each: both modules exist, and the target declares what the
+     *  source does. */
+    fun useRootManifest(entryPath: string): void {
+        if (this.index.remapRoot != "") return
+        val manifest = this.nearestManifest(entryPath)
+        this.index.remapRoot = if (manifest == "") "-" else manifest
+        bootstrapImportRemapEntries = []
+        if (manifest == "" || bootstrapManifestTableOffset(manifest, "imports") < 0) {
+            return
+        }
+        val resolved: array<BootstrapImportRemapEntry> = []
+        for (line in bootstrapImportRemapLines(manifest)) {
+            if (line.code == "") {
+                resolved.append(BootstrapImportRemapEntry(
+                    line.written, line.writtenTarget,
+                    bootstrapResolveImport(manifest, line.written),
+                    bootstrapResolveImport(manifest, line.writtenTarget),
+                    line.begin, line.end
+                ))
+            } else {
+                resolved.append(BootstrapImportRemapEntry(
+                    "", "", "", "", line.begin, line.end, line.code, line.problem
+                ))
+            }
+        }
+        val entries: array<BootstrapImportRemapEntry> = []
+        var index = 0
+        while (index < resolved.size) {
+            val entry = resolved[index]
+            var code = entry.code
+            var problem = entry.problem
+            var notes = ""
+            if (code == "") {
+                problem = bootstrapImportRemapProblem(resolved, index)
+                if (problem != "") code = "E_IMPORT_REMAP_INVALID"
+            }
+            if (code == "") {
+                val mismatch = bootstrapImportRemapMismatches(
+                    entry,
+                    this.state.acquire(this.state.exposedTarget(entry.source)).discovery,
+                    this.state.acquire(this.state.exposedTarget(entry.target)).discovery
+                )
+                if (mismatch.errors > 0) {
+                    code = "E_IMPORT_REMAP_MISMATCH"
+                    problem = "`${entry.writtenTarget}` can't stand in for `${entry.written}`: it must declare everything `${entry.written}` declares publicly, with the same signatures"
+                    notes = mismatch.diagnostics
+                }
+            }
+            if (code != "") {
+                this.errors = this.errors + 1
+                this.diagnostics = "${this.diagnostics}${bootstrapImportRemapDiagnostic(
+                    code, problem, manifest, entry.begin, entry.end
+                )}$notes"
+            }
+            entries.append(BootstrapImportRemapEntry(
+                entry.written, entry.writtenTarget, entry.source, entry.target,
+                entry.begin, entry.end, code, problem, notes
+            ))
+            index = index + 1
+        }
+        this.index.remapEntries = entries
+        bootstrapImportRemapEntries = entries
+    }
+
+    /** An `[imports]` table in `modulePath`'s manifest, unless that is the
+     *  root's, is an error (once per manifest). */
+    fun checkModuleManifest(modulePath: string): void {
+        if (bootstrapStandardLibraryModuleSource(modulePath) ||
+            modulePath.startsWith("<")) return
+        val manifest = this.nearestManifest(modulePath)
+        if (manifest == "" || manifest == this.index.remapRoot ||
+            this.index.remapReported.get(manifest) != null) return
+        this.index.remapReported.set(manifest, 1)
+        val offset = bootstrapManifestTableOffset(manifest, "imports")
+        if (offset >= 0) {
+            this.errors = this.errors + 1
+            this.diagnostics = "${this.diagnostics}${bootstrapImportRemapDiagnostic(
+                "E_IMPORT_REMAP_NOT_ROOT",
+                "only the root abla.toml may remap imports; this manifest is a dependency's (module `$modulePath`)",
+                manifest, offset, offset + 9
+            )}"
+        }
+    }
+
     fun load(modulePath: string): string {
         val identity = bootstrapNormalizeModulePath(modulePath)
+        if (this.index.remapRoot == "" &&
+            !bootstrapStandardLibraryModuleSource(identity)) {
+            this.useRootManifest(identity)
+        }
+        bootstrapImportRemapEntries = this.index.remapEntries
         if (this.modules.size == 0 &&
             this.authorizedCompileCapabilities.size == 0) {
             val capabilities = bootstrapManifestCompileCapabilities(identity)
@@ -2859,6 +2982,7 @@ class BootstrapModuleGraph(
         }
         var output = ""
         if (!this.contains(identity)) {
+            this.checkModuleManifest(identity)
             val snapshot = this.state.acquire(identity)
             bootstrapFrontendTraceMemory("graph.acquire:$identity")
             this.errors = this.errors + snapshot.importErrors
@@ -2948,6 +3072,11 @@ class BootstrapModuleGraph(
     }
 
     fun parse(): BootstrapParseResult {
+        bootstrapImportRemapEntries = this.index.remapEntries
+        bootstrapModuleImportsClear()
+        for (alias in this.aliases) {
+            bootstrapModuleImportRecord(alias.target, alias.importer, alias.begin, alias.end)
+        }
         this.loadImplicitTransactions()
         bootstrapFrontendTraceMemory(
             "parse.begin:${this.orderedSnapshots.size}"

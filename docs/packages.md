@@ -123,6 +123,41 @@ program-wide (`--strict-imports` makes a package without the key strict). The
 key belongs to the nearest manifest at or above a module, so a strict package
 can depend on a flat one and the other way round.
 
+## Import remaps
+
+The root manifest (the `abla.toml` nearest above the program's entry) may
+replace a module for the whole build:
+
+```toml
+[imports]
+"abla/math" = "abla/math/v8"
+```
+
+Every module that imports `abla/math`, in the program or in anything it links
+(a library with its own manifest, a dependency, the standard library), gets
+`abla/math/v8` instead. This is how a program that uses one module links a
+library written against another that stands in for it, when the two would
+otherwise clash: their declarations are program-wide names, and the program
+can't edit the library's imports. Rules:
+
+- Both sides are written as imports are: a standard-library name, or a path
+  relative to the manifest. A remap matches the module an import resolves to,
+  whichever way the import is written.
+- The target must declare everything the source declares publicly, with the
+  same kind, name, type parameters, parameter types and result type as written
+  (parameter names may differ), and a class the same methods. It may declare
+  more. "Publicly" leaves out `private` declarations, names that start with
+  `__` (an implementation's helpers) and bindings to compiler intrinsics or
+  host hooks (an `extern` other than `extern:"c"`). Otherwise the build fails with `E_IMPORT_REMAP_MISMATCH`, which lists
+  each declaration missing or different.
+- A remap takes one step: a target can't itself be remapped. The target's own
+  imports aren't remapped, so a target may import and wrap its source.
+- Only the root manifest remaps. An `[imports]` table in any other manifest
+  the build reaches is `E_IMPORT_REMAP_NOT_ROOT`: a library can't change what
+  the program that links it imports.
+- The manifest is part of the build cache's identity, so changing a remap
+  rebuilds. A remap that no import reaches changes nothing in the output.
+
 ## Hosted system libraries
 
 A hosted root program may explicitly request installed system/driver libraries:

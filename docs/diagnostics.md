@@ -87,7 +87,7 @@ only its parse errors.
 | `library.program-global:<name>@<offset>` | standard-library code names a program's global `val` or `var` ([modules](language.md#modules-and-imports)) |
 | `global.initialization-cycle:<a>-><b>->...<a>` | top-level initializers that depend on each other, directly or through functions ([language.md](language.md#values-and-variables)) |
 | `local.duplicate`, `local.shadows-parameter`, `local.uninitialized-type`, `local.uninitialized-val` | see [values and variables](language.md#values-and-variables) |
-| `symbol.duplicate:<name>:<files>` | two declarations with the same name and parameter types |
+| `symbol.duplicate:<name>@<offset>:<files>` | two declarations with the same name and parameter types. When they are in two modules, a `note:` per module names the import that brings it in (once per pair of modules), and `help:` says how to keep them apart: alias one import, or [remap](packages.md#import-remaps) one module to the other |
 | `call.overload-ambiguous`, `call.overload-no-match` | see [overloads](language.md#overloads-and-operator-functions) |
 | `arithmetic.type@<offset>:<left>:<right>`, `bitwise.type`, `comparison.type`, `logical.type`, `unary.boolean` | operand types that don't fit the operator ([integers](language.md#integers)); `<`, `<=`, `>`, `>=` take numbers and strings only |
 | `division.zero@<offset>` | an integer divisor that is always zero ([integers](language.md#integers)) |
@@ -226,6 +226,10 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_IMPORT_UNQUALIFIED_AMBIGUOUS` | two unaliased imports expose the same name ([modules](language.md#modules-and-imports)) |
 | `E_NAME_NOT_IMPORTED` | a [strict](language.md#strict-imports) module uses a name of a module it doesn't import; `help:` is the import to add |
 | `E_IMPORT_ALIAS_*` | alias errors: duplicate alias, module imported twice, unknown member, alias used as a value |
+| `E_IMPORT_REMAP_MANIFEST` | a line of the root `abla.toml`'s `[imports]` isn't `"<module>" = "<module>"` ([import remaps](packages.md#import-remaps)) |
+| `E_IMPORT_REMAP_INVALID` | a remapped module doesn't exist, maps to itself, is remapped twice, or its target is remapped too |
+| `E_IMPORT_REMAP_MISMATCH` | the target doesn't declare everything the source declares publicly with the same signatures; a `note:` per declaration missing or different |
+| `E_IMPORT_REMAP_NOT_ROOT` | a dependency's `abla.toml` (not the root's) has an `[imports]` table |
 | `E_IMPORT_PROVIDER_*` | a source provider expression or its result is invalid ([packages.md](packages.md)) |
 | `E_PACKAGE_*` | lockfile, fetch, cache, digest, cycle and capability errors of dependencies ([packages.md](packages.md)) |
 | `E_NATIVE_LIBRARY_MANIFEST` | invalid `nativeLibraries` in `abla.toml` |

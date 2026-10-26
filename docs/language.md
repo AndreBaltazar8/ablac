@@ -2493,7 +2493,10 @@ fun main {
   decides ambiguity and aliases, and a module's own declaration of a name, or
   a local, shadows the others. A package can opt into
   [strict imports](#strict-imports), where a module sees only what it
-  imports.
+  imports. Two modules that both declare a name (`symbol.duplicate`) are
+  kept apart by aliasing one import, or, when one module stands in for the
+  other, by a [remap](packages.md#import-remaps) in the root `abla.toml`,
+  which gives every module of the build the same one.
 - An alias belongs to the importing module only, and it is a compile-time
   namespace, not a value (`E_IMPORT_ALIAS_USED_AS_VALUE`). Importing a
   module doesn't expose the aliases *it* uses. Other alias errors:

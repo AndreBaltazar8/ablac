@@ -1,0 +1,296 @@
+// Import remaps: the root abla.toml's `[imports]` section maps a module to
+// another for the whole build,
+//
+//     [imports]
+//     "abla/math" = "abla/math/v8"
+//
+// so every module that imports the left one, a linked library's included,
+// gets the right one instead. Both sides are written as imports (a
+// standard-library name, or a path relative to the manifest) and match on the
+// module they resolve to. The target's own imports are not remapped (a target
+// may wrap its source). Only the root manifest may remap: an `[imports]`
+// section in any other manifest the build reaches is an error.
+import "abla/sys/linux/fs"
+import "module_paths.ab"
+import "package.ab"
+import "parser.ab"
+
+/** One `"from" = "to"` line: both sides as written and as resolved, and the
+ *  line's byte range in the manifest. */
+class BootstrapImportRemapEntry(
+    val written: string,
+    val writtenTarget: string,
+    val source: string,
+    val target: string,
+    val begin: int,
+    val end: int,
+    // What is wrong with it ("" when it applies): the diagnostic's code, its
+    // message and `note:` lines.
+    val code: string = "",
+    val problem: string = "",
+    val notes: string = ""
+)
+
+// The remaps of the graph being loaded; bootstrapResolveImport applies them.
+var bootstrapImportRemapEntries: array<BootstrapImportRemapEntry> = []
+
+/** `resolved`, the module an import of `importer` resolves to, after the
+ *  remaps. */
+fun bootstrapImportRemapApply(importer: string, resolved: string): string {
+    if (bootstrapImportRemapEntries.size == 0) return resolved
+    for (entry in bootstrapImportRemapEntries) {
+        if (entry.code == "" && entry.source == resolved) {
+            val from = bootstrapCanonicalEscapingPath(
+                bootstrapNormalizeModulePath(importer)
+            )
+            return if (from == entry.target) resolved else entry.target
+        }
+    }
+    resolved
+}
+
+/** Where the quoted string at `cursor` in `line` ends (after its closing
+ *  quote), or -1 when there is none. */
+fun bootstrapImportRemapQuotedEnd(line: string, cursor: int): int {
+    if (cursor >= line.size || line[cursor] != 34) return -1
+    var end = cursor + 1
+    while (end < line.size && line[end] != 34) end = end + 1
+    if (end >= line.size) -1 else end + 1
+}
+
+/** Where `manifestPath`'s `[name]` table starts, or -1 when it has none. */
+fun bootstrapManifestTableOffset(manifestPath: string, name: string): int {
+    val source = Path(manifestPath).readText()
+    var lineBegin = 0
+    while (lineBegin < source.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < source.size && source[lineEnd] != 10 &&
+               source[lineEnd] != 13) lineEnd = lineEnd + 1
+        if (bootstrapPackageTrim(source.slice(lineBegin, lineEnd)) == "[$name]") {
+            return lineBegin
+        }
+        lineBegin = lineEnd + 1
+    }
+    -1
+}
+
+/** The `[imports]` lines of `manifestPath`, unresolved (a malformed one
+ *  with its diagnostic's code). */
+fun bootstrapImportRemapLines(manifestPath: string): array<BootstrapImportRemapEntry> {
+    val entries: array<BootstrapImportRemapEntry> = []
+    val source = Path(manifestPath).readText()
+    var inImports = false
+    var lineBegin = 0
+    while (lineBegin < source.size) {
+        var lineEnd = lineBegin
+        while (lineEnd < source.size && source[lineEnd] != 10 &&
+               source[lineEnd] != 13) lineEnd = lineEnd + 1
+        // (A `#` outside quotes starts a comment.)
+        var contentEnd = lineEnd
+        var quote = false
+        var cursor = lineBegin
+        while (cursor < contentEnd) {
+            if (source[cursor] == 34) quote = !quote
+            if (source[cursor] == 35 && !quote) contentEnd = cursor
+            cursor = cursor + 1
+        }
+        val line = bootstrapPackageTrim(source.slice(lineBegin, contentEnd))
+        if (line.size > 0 && line[0] == 91) {
+            inImports = line == "[imports]"
+        } else if (inImports && line != "") {
+            val writtenEnd = bootstrapImportRemapQuotedEnd(line, 0)
+            var valueCursor = if (writtenEnd > 0) writtenEnd else line.size
+            while (valueCursor < line.size &&
+                   (line[valueCursor] == 32 || line[valueCursor] == 9)) {
+                valueCursor = valueCursor + 1
+            }
+            var targetBegin = -1
+            if (valueCursor < line.size && line[valueCursor] == 61) {
+                valueCursor = valueCursor + 1
+                while (valueCursor < line.size &&
+                       (line[valueCursor] == 32 || line[valueCursor] == 9)) {
+                    valueCursor = valueCursor + 1
+                }
+                if (bootstrapImportRemapQuotedEnd(line, valueCursor) == line.size) {
+                    targetBegin = valueCursor
+                }
+            }
+            val written = if (writtenEnd > 0) line.slice(1, writtenEnd - 1) else ""
+            val target = if (targetBegin >= 0)
+                line.slice(targetBegin + 1, line.size - 1) else ""
+            if (written == "" || target == "") {
+                entries.append(BootstrapImportRemapEntry(
+                    "", "", "", "", lineBegin, lineEnd,
+                    "E_IMPORT_REMAP_MANIFEST",
+                    "expected `\"<module>\" = \"<module>\"` in [imports]"
+                ))
+            } else {
+                entries.append(BootstrapImportRemapEntry(
+                    written, target, "", "", lineBegin, lineEnd
+                ))
+            }
+        }
+        lineBegin = lineEnd + 1
+    }
+    entries
+}
+
+fun bootstrapImportRemapExists(path: string): bool = Path(path).info().exists()
+
+/** What makes `entries[index]` unusable besides its declarations, or "". */
+fun bootstrapImportRemapProblem(
+    entries: array<BootstrapImportRemapEntry>,
+    index: int
+): string {
+    val entry = entries[index]
+    if (!bootstrapImportRemapExists(entry.source)) {
+        return "`${entry.written}` doesn't exist (looked for ${entry.source})"
+    }
+    if (!bootstrapImportRemapExists(entry.target)) {
+        return "`${entry.writtenTarget}` doesn't exist (looked for ${entry.target})"
+    }
+    if (entry.source == entry.target) return "`${entry.written}` is remapped to itself"
+    var other = 0
+    while (other < entries.size) {
+        if (entries[other].code != "E_IMPORT_REMAP_MANIFEST") {
+            if (other < index && entries[other].source == entry.source) {
+                return "`${entry.written}` is remapped more than once"
+            }
+            if (entries[other].source == entry.target) {
+                return "`${entry.writtenTarget}` is itself remapped (a remap takes one step)"
+            }
+        }
+        other = other + 1
+    }
+    ""
+}
+
+fun bootstrapImportRemapDiagnostic(
+    code: string,
+    message: string,
+    manifestPath: string,
+    begin: int,
+    end: int
+): string = "error[$code]: $message\nsource[manifest]:$manifestPath:$begin:$end\n"
+
+class BootstrapImportRemapMismatch(val errors: int, val diagnostics: string)
+
+/** `declaration`'s signature as the remap check compares it: its kind, owner,
+ *  name, type parameters, parameter types and result type as written (not
+ *  its parameters' names). */
+fun bootstrapImportRemapSignature(
+    declaration: BootstrapDeclaration,
+    owner: string
+): string {
+    var text = "${declaration.kind} $owner"
+    if (declaration.extensionOwner != "") text = "$text${declaration.extensionOwner}."
+    text = "$text${declaration.name}"
+    if (declaration.typeParameters.size > 0) {
+        text = "$text<"
+        var index = 0
+        while (index < declaration.typeParameters.size) {
+            if (index > 0) text = "$text, "
+            text = "$text${declaration.typeParameters[index]}"
+            index = index + 1
+        }
+        text = "$text>"
+    }
+    if (declaration.kind != "val" && declaration.kind != "var") {
+        text = "$text("
+        var index = 0
+        while (index < declaration.parameterTypes.size) {
+            if (index > 0) text = "$text, "
+            if (index < declaration.parameterKinds.size &&
+                declaration.parameterKinds[index] != "" &&
+                declaration.parameterKinds[index] != "parameter") {
+                text = "$text${declaration.parameterKinds[index]} "
+            }
+            text = "$text${declaration.parameterTypes[index]}"
+            index = index + 1
+        }
+        text = "$text)"
+    }
+    if (declaration.resultType != "") text = "$text: ${declaration.resultType}"
+    if (declaration.conformances.size > 0) {
+        text = "$text :"
+        var index = 0
+        while (index < declaration.conformances.size) {
+            text = "$text ${declaration.conformances[index]}"
+            index = index + 1
+        }
+    }
+    text
+}
+
+/** Whether the remap check compares `declaration`: one a module offers its
+ *  importers, so not `private`, not named `__…` (an implementation's), and
+ *  not a binding to a compiler intrinsic or host hook (an `extern` other than
+ *  `extern:"c"`). */
+fun bootstrapImportRemapCompared(declaration: BootstrapDeclaration): bool =
+    !declaration.isPrivate && declaration.name != "" &&
+        !declaration.name.startsWith("__") &&
+        !(declaration.kind == "extern" && declaration.externalLibrary != "c")
+
+/** The public signatures `declarations` give (a class's methods each on
+ *  their own), with the name each belongs to. */
+fun bootstrapImportRemapCollect(
+    declarations: array<BootstrapDeclaration>,
+    owner: string,
+    var signatures: array<string>,
+    var names: array<string>
+): void {
+    for (declaration in declarations) {
+        if (bootstrapImportRemapCompared(declaration)) {
+            signatures.append(bootstrapImportRemapSignature(declaration, owner))
+            names.append("$owner${declaration.name}")
+            if (declaration.methods.size > 0) {
+                bootstrapImportRemapCollect(
+                    declaration.methods, "$owner${declaration.name}.",
+                    signatures, names
+                )
+            }
+        }
+    }
+}
+
+/** What `source` declares publicly that `target` doesn't, as `note:` lines
+ *  (a target may declare more). */
+fun bootstrapImportRemapMismatches(
+    entry: BootstrapImportRemapEntry,
+    source: BootstrapParseResult,
+    target: BootstrapParseResult
+): BootstrapImportRemapMismatch {
+    val sourceSignatures: array<string> = []
+    val sourceNames: array<string> = []
+    val targetSignatures: array<string> = []
+    val targetNames: array<string> = []
+    bootstrapImportRemapCollect(source.declarations, "", sourceSignatures, sourceNames)
+    bootstrapImportRemapCollect(target.declarations, "", targetSignatures, targetNames)
+    val targetSet: Map<string, int> = Map()
+    for (signature in targetSignatures) targetSet.set(signature, 1)
+    var errors = 0
+    var notes = ""
+    var index = 0
+    while (index < sourceSignatures.size) {
+        val signature = sourceSignatures[index]
+        if (targetSet.get(signature) == null) {
+            errors = errors + 1
+            if (errors <= 20) {
+                var other = ""
+                var candidate = 0
+                while (candidate < targetNames.size) {
+                    if (targetNames[candidate] == sourceNames[index]) {
+                        other = "$other, `${targetSignatures[candidate]}`"
+                    }
+                    candidate = candidate + 1
+                }
+                notes = if (other == "")
+                    "${notes}note: `$signature` is missing from `${entry.writtenTarget}`\n"
+                else "${notes}note: `$signature` differs in `${entry.writtenTarget}`: ${other.slice(2, other.size)}\n"
+            }
+        }
+        index = index + 1
+    }
+    if (errors > 20) notes = "${notes}note: and ${errors - 20} more\n"
+    BootstrapImportRemapMismatch(errors, notes)
+}
