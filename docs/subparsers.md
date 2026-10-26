@@ -112,6 +112,12 @@ of two ways:
   `parserRawTakeUntilText(cursor, delimiter)`, `parserRawTakeName`,
   `parserRawTakeSymbol`, `parserRawSkipWhitespace`, `parserRawEnd`, and
   `parserRawPosition` for spans.
+- **The site**, for what a subparser names after where it is (a generated
+  type, a namespace): `parserSiteKey(cursor)`, the method, function or global
+  that holds the `$name` and its offset there, as identifier characters
+  (`update_112`). A line or an import added above that declaration leaves the
+  key alone; a position would move, and rename what it named, which changes
+  the program's symbols. Positions are for spans and diagnostics.
 
 It builds its result with the `syntax*` builders: `syntaxInteger`,
 `syntaxString`, `syntaxBoolean`, `syntaxNull`, `syntaxIdentifier`,
@@ -232,6 +238,8 @@ provider-visible declaration set, including imported helper functions. Use
 `parserSourceIdentity(cursor)` plus the expression span for a request namespace
 that distinguishes otherwise identical imported modules. Request and finalizer
 invariant diagnostics include that identity, namespace, and source span.
+Name the namespace after `parserSiteKey(cursor)` rather than the span itself:
+the span moves with every edit above it.
 Resolved function and type handles use compilation-wide canonical identities,
 so a generated adapter can retain a target declared in a relative module or a
 locked package without depending on a transient per-module declaration index.

@@ -688,9 +688,13 @@ literal, lexical-local, and receiver-bearing arguments. Inserted conversions
 and complete post-resolution node maps remain.
 
 `parserSourceIdentity(cursor)` returns the canonical identity of the module
-owned by the active parser cursor. Providers should include it with the source
-span when constructing request namespaces, because byte offsets are local to a
-module and can be identical in separate imports.
+owned by the active parser cursor. Providers should include it when
+constructing request namespaces, because what identifies a site within a
+module can be identical in separate imports. `parserSiteKey(cursor)` is that
+site: the method, function or global holding the `$name` and its offset
+within it (`render_48`). Unlike a byte offset in the file, it doesn't change
+when a line or an import is added above the declaration, so neither do the
+names built from it.
 
 ## Programmable build nodes
 
