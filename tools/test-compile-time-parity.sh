@@ -30,6 +30,10 @@
 #                   to finish: a `#` side expected to end in timeout or
 #                   interp-threads, and a run-time side whose case is expected
 #                   to end in runtime-skipped in every mode run (default 20)
+#   PARITY_KNOWN_STEP_LIMIT
+#                   the interpreter's step limit (ABLA_EVAL_STEP_LIMIT) for a
+#                   `#` side expected to end in interp-steps (default 5000000,
+#                   a tenth of the interpreter's own)
 #   PARITY_EXPECT   a file of "<mode> <case> [<status>]" lines that must end with
 #                   that status, `pass` when there is none (default
 #                   tests/cases/parity/expected-pass.txt); the script fails when
@@ -75,6 +79,7 @@ filter=${PARITY_FILTER:-}
 jobs=${PARITY_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 seconds=${PARITY_SECONDS:-120}
 known_timeout_seconds=${PARITY_KNOWN_TIMEOUT_SECONDS:-20}
+known_step_limit=${PARITY_KNOWN_STEP_LIMIT:-5000000}
 expect=${PARITY_EXPECT:-$project_root/tests/cases/parity/expected-pass.txt}
 output=${PARITY_OUTPUT:-$project_root/build/compile-time-parity}
 order=${PARITY_ORDER:-$project_root/tests/cases/parity/slow-first.txt}
@@ -278,9 +283,12 @@ run_case() { # kind name source
 run_mode() { # kind name source mode
     local kind=$1 name=$2 source=$3 mode=$4
     local dir=$output/work/$name granted="" side_seconds=$seconds
-    # A `#` side expected never to finish only needs to show that it doesn't.
+    # A `#` side expected never to finish only needs to show that it doesn't,
+    # and one expected past the interpreter's step limit to pass a lower one
+    # (ABLA_EVAL_STEP_LIMIT only lowers it): either way the status is the same.
     case $(expected_status "$mode" "$name") in
         timeout | interp-threads) side_seconds=$known_timeout_seconds ;;
+        interp-steps) local -x ABLA_EVAL_STEP_LIMIT=$known_step_limit ;;
     esac
     # A program that doesn't build, or doesn't finish (a server waiting for
     # clients), has no run-time result to compare.
@@ -417,7 +425,8 @@ publish_mode() { # kind name mode seconds runtime-seconds
 export -f run_case run_mode publish_mode build_and_run first_error limited \
     expected_status by_design_status by_design_reason sources_match starts_thread \
     has_compile_time_code
-export output compiler seconds known_timeout_seconds modes expected project_root by_design build_flags
+export output compiler seconds known_timeout_seconds known_step_limit modes expected project_root \
+    by_design build_flags
 
 # The cases known to take longest start first (PARITY_ORDER, a file of case
 # names, slowest first), so none of them is left running alone at the end;
