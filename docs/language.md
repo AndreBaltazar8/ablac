@@ -2187,7 +2187,9 @@ reclaim whole blocks of allocations at once.
   collection on any target.
 - Every program has a hard limit on the total memory it allocates, one GiB
   by default, adjustable with `abla/memory`. Exceeding it is a controlled
-  panic, raised before the allocation happens.
+  panic, raised before the allocation happens. A program whose reachable
+  data stays just under its limit also reaches that panic, instead of
+  collecting on nearly every allocating call.
 - Native buffers owned by resources stay in place until they are dropped or
   their region ends.
 

@@ -276,6 +276,18 @@ collection in either mode: a program that can reach either is compiled with
 pressure safe points, and the call turns collection under pressure on at run
 time (after `memorySetManualCollection()` too).
 
+Near its limit, pressure collection stops before it would run at nearly every
+allocating call. Its threshold stays below the limit, leaving a quarter of it
+(at most 64 MiB) as room. When a collection keeps so much that less than 1/64
+of the limit is left under that threshold, the next collection waits until
+half of the remaining room to the limit is used, and never for less than 1/64
+of the limit. A program whose live data grows to its limit reaches the limit's
+panic (`memory limit exceeded`, exit code 101) after a few collections. A
+program whose reachable data stays within about 1/64 of its limit also
+panics, where it would otherwise collect without end and make almost no
+progress. A long-running program, such as a server, that must not stop there
+needs a higher limit.
+
 | Program | Default | Opt out / in |
 | --- | --- | --- |
 | hosted native, with `main` | pressure | `memorySetManualCollection()` |
