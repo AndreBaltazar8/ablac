@@ -677,3 +677,36 @@ Abla remained faster than Go in all four workloads. Regression coverage checks
 a nonzero write offset, more than 64 rope leaves, the flattening fallback, and
 the raw libc-free syscall path. All 75 compiler/runtime fixtures and the
 byte-identical self-rebuild pass.
+
+## `--fast` and `--o1` IR pipelines (2026-10-26)
+
+A native `--fast` build runs only `function(mem2reg,simplifycfg)` before
+codegen at level 0, so nothing is inlined: a loop over a string's bytes calls
+the runtime for every byte. Over 8 million quotes in a 2.5 MB text, it ran in
+2220–2270 ms, against 51–101 ms at `--o1`. Three ways to close that gap were
+measured and parked. The `--fast` profile stays the cheap compile, because tests
+that are dominated by compile time pay for every second its pipeline adds.
+
+| `--fast` IR pipeline (codegen level 0) | self-build cost | byte loop |
+|---|---|---|
+| `function(mem2reg,simplifycfg)` (kept) | 14.1–15.7 s user CPU | 2270 ms |
+| `--o1`'s IR pipeline, inline threshold 100 | +17–31% | 191 ms |
+| the same without `instcombine` | +25–45% | 247 ms |
+| inline and `sroa` only | +32–48% | 506 ms |
+| `always-inline` on small runtime functions | +120–300% (wall) | 624–667 ms |
+
+The leaner pipelines compile *slower* than the full one: `instcombine` shrinks
+the inlined code enough that codegen at level 0 does less work, which more than
+pays for the pass itself. Inline thresholds of 25, 50 and 100 cost the same.
+The cost is in inlining and in compiling the grown code, not in the cleanup
+passes. `always-inline` also turns on every existing `@inline` hint, and code at
+level 0 keeps all of that growth.
+
+The full pipeline at codegen level 0 is no substitute for `--o1` either. It
+compiles the compiler with about 2.7× less CPU (22.8 s against 62.6 s median,
+under load), but its byte loop runs at 300–355 ms against `--o1`'s 78–101 ms.
+For `ablac run`, the JIT's compile of the program dominates: the determinism
+tool cost 9.5–9.7 s of user CPU under either pipeline with the JIT cache off.
+The full pipeline also made the `--fast` compile-time parity suite 9% slower
+(249 s against 229 s). These are relative measurements under a load
+of 15–35, interleaved and taken three times each.
