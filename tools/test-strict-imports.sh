@@ -85,6 +85,10 @@ runs "$output_directory/value-named" "5"
 "$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named-strict" \
     --no-cache --strict-imports
 runs "$output_directory/value-named-strict" "5"
+# A name reached only through a strict library module's own import is
+# suggested by the module that declares it, not by the one the program wrote.
+rejected "$cases/through-library.ab" --strict-imports \
+    '`utf8Encode` is declared in' 'help: add: import "abla/text"'
 # A type inside generic arguments or a function type names a type too.
 "$compiler" build "$cases/generic-types/main.ab" -o "$output_directory/generic-types" \
     --no-cache --strict-imports
