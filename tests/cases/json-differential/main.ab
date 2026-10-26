@@ -1,0 +1,147 @@
+// JSON results under mutation: valid documents and thousands of variants
+// (truncated, a byte replaced, a byte inserted), each parsed, read with the
+// object and array readers (readRaw and skip), under six sets of limits. One
+// line per input (with the argument "full"): every error's code and position,
+// and a hash of the messages, the trees' stringified text and the raw slices;
+// without it, a hash of each block of 10 such lines. The expected output was
+// recorded before the readers' and the parser's fast paths existed: they must
+// decide, report and produce exactly what the plain code did.
+import "abla/io"
+import "abla/json"
+import "abla/process/arguments"
+import "abla/text"
+
+fun differentialHash(hash: int, text: string): int {
+    var result = hash
+    for (byte in text) result = (result ^ byte) * 1099511628211
+    (result ^ 255) * 1099511628211
+}
+
+fun differentialError(code: string, offset: int): string =
+    if (code.size == 0) "ok" else "$code@$offset"
+
+fun differentialParse(input: string, limits: JsonLimits): string {
+    val parsed = jsonParse(input, limits)
+    var hash = differentialHash(-3750763034362895579, parsed.error.message)
+    hash = differentialHash(hash, jsonStringify(parsed.value))
+    val error = parsed.error
+    "P ${differentialError(error.code, error.byteOffset)}:${error.line}:${error.column} $hash"
+}
+
+fun differentialObject(input: string, limits: JsonLimits): string {
+    var reader = jsonObjectReader(input, limits)
+    var hash = -3750763034362895579
+    var members = 0
+    while (members < 1000) {
+        val key = reader.next()
+        if (reader.done || reader.state.errorCode.size > 0) break
+        hash = differentialHash(hash, key)
+        if (members % 2 == 0) hash = differentialHash(hash, reader.readRaw())
+        else reader.skip()
+        members = members + 1
+    }
+    reader.finish()
+    val state = reader.state
+    hash = differentialHash(hash, state.errorMessage)
+    "O ${differentialError(state.errorCode, state.errorOffset)} $members $hash"
+}
+
+fun differentialArray(input: string, limits: JsonLimits): string {
+    var reader = jsonArrayReader("[" + input + "]", limits)
+    var hash = -3750763034362895579
+    var items = 0
+    while (items < 1000 && reader.next()) {
+        if (items % 2 == 0) hash = differentialHash(hash, reader.readRaw())
+        else reader.skip()
+        items = items + 1
+    }
+    reader.finish()
+    val state = reader.state
+    hash = differentialHash(hash, state.errorMessage)
+    "A ${differentialError(state.errorCode, state.errorOffset)} $items $hash"
+}
+
+fun differentialMembers(count: int, repeat: bool): string {
+    val parts: array<string> = []
+    var index = 0
+    while (index < count) {
+        parts.append("\"m$index\":$index")
+        index = index + 1
+    }
+    if (repeat) parts.append("\"m3\":0")
+    "{" + textJoin(parts, ",") + "}"
+}
+
+fun differentialDocuments(): array<string> {
+    val accent = "\u00e9"
+    [
+        "{\"a\":1,\"b\":[true,false,null],\"c\":{\"d\":\"e\\\"f\\\\g\\/h\\b\\f\\n\\r\\t\",\"u\":\"\\u00e9\\ud83d\\ude00\"},\"n\":-0.5e+3}",
+        "[1,-2,3.25,1e10,-0,0.0,1E-7,123456789012345678901234,9223372036854775807,-9223372036854775808]",
+        "{\"k\":\"v\",\"k\":\"w\",\"\":[]}",
+        " \n{ \"x\" : [ 1 , { } , [ ] , \"\" ] ,\r\n \"y\" :\tnull } \t",
+        "\"plain $accent text \u6f22\u5b57 \\u0041\"",
+        "[[[[[[[1,[2]]]]]]],{\"d\":{\"e\":{\"f\":{}}}}]",
+        "{\"long\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"esc\":\"\\u0000\\u001f\\\"\"}",
+        differentialMembers(20, true),
+        differentialMembers(18, false),
+        "[true,false,null,\"t\",\"\\/\",{\"a\":{\"a\":{\"a\":1}}}]",
+        "{\"bad\":\"" + accent.slice(0, 1) + "\",\"ok\":2}",
+        "[01,1.,.5,1e,-,+1,1e+,0x1]",
+        "",
+        "{}",
+        "[]",
+        "  ",
+        "{\"a\":[{\"b\":[{\"c\":[1,2,{\"d\":\"\\ud800\"}]}]}]}"
+    ]
+}
+
+fun main: int {
+    val strict = jsonDefaultLimits()
+    val small = JsonLimits(4096, 4, 40, 8, 3, true)
+    val open = JsonLimits(2147483647, 256, 2147483647, 2147483647, 2147483647, false)
+    val tight = JsonLimits(4096, 64, 12, 1048576, 10000, false)
+    val merged = JsonLimits(4096, 64, 100000, 1048576, 3, false, true)
+    val limitSets = [strict, small, open, tight, merged, jsonPermissiveLimits]
+    val bytes = ["\"", "\\", ",", ":", "[", "]", "{", "}", "0", "-", "+", ".", "e", "t", "n", " ", "\n", "x", "u", "/", "\u00e9".slice(0, 1)]
+    val inputs: array<string> = []
+    for (document in differentialDocuments()) {
+        inputs.append(document)
+        var position = 0
+        while (position <= document.size) {
+            inputs.append(document.slice(0, position))
+            if (position < document.size) {
+                var choice = 0
+                while (choice < 3) {
+                    val byte = bytes[(position * 7 + choice * 5) % bytes.size]
+                    inputs.append(document.slice(0, position) + byte + document.slice(position + 1, document.size))
+                    choice = choice + 1
+                }
+                val inserted = bytes[(position * 3) % bytes.size]
+                inputs.append(document.slice(0, position) + inserted + document.slice(position, document.size))
+            }
+            position = position + 1
+        }
+    }
+    var full = false
+    for (position in 0 until processArgumentCount()) {
+        if (processArgument(position) == "full") full = true
+    }
+    var index = 0
+    var block = -3750763034362895579
+    for (input in inputs) {
+        var line = "$index"
+        var set = 0
+        for (limits in limitSets) {
+            line = "$line | $set ${differentialParse(input, limits)} ${differentialObject(input, limits)} ${differentialArray(input, limits)}"
+            set = set + 1
+        }
+        if (full) println(line)
+        block = differentialHash(block, line)
+        index = index + 1
+        if (index % 10 == 0 || index == inputs.size) {
+            if (!full) println("${(index - 1) / 10 * 10} $block")
+            block = -3750763034362895579
+        }
+    }
+    0
+}

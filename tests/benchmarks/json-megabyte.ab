@@ -1,0 +1,168 @@
+// abla/json at megabyte scale: a ~15 MB document (an object holding an array of
+// 160k objects of 6 members, ~1.3M nodes) and each way of reading or writing it,
+// best of three runs each: picking one top-level member past the big array
+// (skip), the array as raw slices (readRaw), a typed streaming decode, building
+// the tree (jsonParse, as a validity check and as a tree), and stringifying each
+// element. The light phases run first: the tree is ~1 GB live.
+//
+//     ablac build tests/benchmarks/json-megabyte.ab -o json-megabyte   (optimized: not --fast)
+//     ./json-megabyte [objects]          (default 160000)
+
+import "abla/io"
+import "abla/json"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/text"
+
+val benchLimits = JsonLimits(2147483647, 256, 2147483647, 2147483647, 2147483647, false)
+
+class BenchItem(var pos: array<f64> = [], var size: array<f64> = [], var kind: f64 = 0.0, var color: string = "")
+
+fun benchItem(var items: JsonArrayReader): BenchItem {
+    var reader = items.readObject()
+    var item = BenchItem()
+    while (true) {
+        val key = reader.next()
+        if (reader.done || reader.state.errorCode.size > 0) break
+        if (key == "pos") {
+            var values = reader.readArray()
+            while (values.next()) item.pos.append(values.readNumber())
+            values.finishNested()
+        } else if (key == "size") {
+            var values = reader.readArray()
+            while (values.next()) item.size.append(values.readNumber())
+            values.finishNested()
+        } else if (key == "kind") item.kind = reader.readNumber()
+        else if (key == "color") item.color = reader.readString()
+        else reader.skip()
+    }
+    reader.finishNested()
+    item
+}
+
+fun benchDocument(objects: int): string {
+    val parts: array<string> = []
+    var index = 0
+    while (index < objects) {
+        parts.append("{\"pos\":[${index},${index % 97},-${index % 13}.5],\"size\":[10,10.25,10],\"kind\":${index % 7},\"color\":\"#a0b0c0\",\"flag\":true,\"note\":null}")
+        index = index + 1
+    }
+    "{\"title\":\"doc\",\"items\":[" + textJoin(parts, ",") + "],\"extra\":[]}"
+}
+
+fun benchPick(text: string): string {
+    var title = ""
+    var reader = jsonObjectReader(text, benchLimits)
+    while (true) {
+        val key = reader.next()
+        if (reader.done || reader.state.errorCode.size > 0) break
+        if (key == "title") title = reader.readString() else reader.skip()
+    }
+    title
+}
+
+fun benchRaw(text: string): int {
+    var total = 0
+    var reader = jsonObjectReader(text, benchLimits)
+    while (true) {
+        val key = reader.next()
+        if (reader.done || reader.state.errorCode.size > 0) break
+        if (key == "items") {
+            var items = reader.readArray()
+            while (items.next()) total = total + items.readRaw().size
+            items.finishNested()
+        } else reader.skip()
+    }
+    total
+}
+
+fun benchStream(text: string): int {
+    var reader = jsonObjectReader(text, benchLimits)
+    var count = 0
+    while (true) {
+        val key = reader.next()
+        if (reader.done || reader.state.errorCode.size > 0) break
+        if (key == "items") {
+            var items = reader.readArray()
+            while (items.next()) {
+                if (benchItem(items).pos.size == 3) count = count + 1
+            }
+            items.finishNested()
+        } else reader.skip()
+    }
+    count
+}
+
+fun benchStringify(tree: Json): int {
+    val items = tree.get("items")
+    var total = 0
+    var index = 0
+    while (index < items.size()) {
+        total = total + jsonStringify(items.at(index)).size
+        index = index + 1
+    }
+    total
+}
+
+fun benchObjects(): int {
+    if (processArgumentCount() < 1) return 160000
+    val text = processArgument(0)
+    var objects = 0
+    for (index in 0 until text.size) objects = objects * 10 + text[index] - 48
+    if (objects > 0) objects else 160000
+}
+
+fun benchBest(times: array<int>): int {
+    var best = times[0]
+    for (time in times) if (time < best) best = time
+    best
+}
+
+fun benchReport(name: string, times: array<int>, bytes: int, result: string) {
+    val best = benchBest(times)
+    val rate = if (best > 0) bytes / 1000 / best else 0
+    println("$name: $best ms ($rate MB/s) $result")
+}
+
+fun main: int {
+    val text = benchDocument(benchObjects())
+    println("document: ${text.size} bytes")
+    var times: array<int> = []
+    var result = ""
+    for (round in 0 until 3) {
+        val start = monotonicMilliseconds()
+        result = benchPick(text)
+        times.append(monotonicMilliseconds() - start)
+    }
+    benchReport("pick one member (skip)", times, text.size, result)
+    times = []
+    for (round in 0 until 3) {
+        val start = monotonicMilliseconds()
+        result = "${benchRaw(text)} bytes"
+        times.append(monotonicMilliseconds() - start)
+    }
+    benchReport("items as raw slices (readRaw)", times, text.size, result)
+    times = []
+    for (round in 0 until 3) {
+        val start = monotonicMilliseconds()
+        result = "${benchStream(text)} items"
+        times.append(monotonicMilliseconds() - start)
+    }
+    benchReport("typed streaming decode", times, text.size, result)
+    times = []
+    for (round in 0 until 3) {
+        val start = monotonicMilliseconds()
+        result = "${jsonParse(text, benchLimits).succeeded}"
+        times.append(monotonicMilliseconds() - start)
+    }
+    benchReport("validity through jsonParse", times, text.size, result)
+    val tree = jsonParse(text, benchLimits).value
+    times = []
+    for (round in 0 until 3) {
+        val start = monotonicMilliseconds()
+        result = "${benchStringify(tree)} bytes"
+        times.append(monotonicMilliseconds() - start)
+    }
+    benchReport("stringify each element", times, text.size, result)
+    0
+}

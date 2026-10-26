@@ -286,6 +286,7 @@ test-serial: ablac
 	tools/test-frontend-call-chain-scaling.sh $(COMPILER)
 	tools/test-compiler-memory-budget.sh $(COMPILER)
 	tools/test-gc-background-free.sh $(COMPILER)
+	tools/test-json-differential.sh $(COMPILER)
 
 check: test self-rebuild
 

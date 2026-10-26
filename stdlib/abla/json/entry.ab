@@ -238,51 +238,54 @@ private fun jsonNumberGrammar(text: string): JsonNumberGrammar {
 }
 
 // -1 not a JSON number, 0 a valid non-integer, 1 a valid integer.
-private fun jsonNumberKind(text: string): int {
-    var offset = 0
-    var valid = text.size > 0
+private fun jsonNumberKind(text: string): int = jsonNumberKindRange(text, 0, text.size)
+
+// jsonNumberKind of the bytes [begin, end) of `text`, read in place.
+private fun jsonNumberKindRange(text: string, begin: int, end: int): int {
+    var offset = begin
+    var valid = end > begin
     var integer = true
     if (valid && text[offset] == 45) {
         offset = offset + 1
-        if (offset >= text.size) valid = false
+        if (offset >= end) valid = false
     }
     if (valid && text[offset] == 48) {
         offset = offset + 1
-        if (offset < text.size && text[offset] >= 48 && text[offset] <= 57) {
+        if (offset < end && text[offset] >= 48 && text[offset] <= 57) {
             valid = false
         }
     } else if (valid && text[offset] >= 49 && text[offset] <= 57) {
-        while (offset < text.size && text[offset] >= 48 &&
+        while (offset < end && text[offset] >= 48 &&
                text[offset] <= 57) {
             offset = offset + 1
         }
     } else valid = false
-    if (valid && offset < text.size && text[offset] == 46) {
+    if (valid && offset < end && text[offset] == 46) {
         integer = false
         offset = offset + 1
         val fractionBegin = offset
-        while (offset < text.size && text[offset] >= 48 &&
+        while (offset < end && text[offset] >= 48 &&
                text[offset] <= 57) {
             offset = offset + 1
         }
         if (offset == fractionBegin) valid = false
     }
-    if (valid && offset < text.size &&
+    if (valid && offset < end &&
         (text[offset] == 101 || text[offset] == 69)) {
         integer = false
         offset = offset + 1
-        if (offset < text.size &&
+        if (offset < end &&
             (text[offset] == 43 || text[offset] == 45)) {
             offset = offset + 1
         }
         val exponentBegin = offset
-        while (offset < text.size && text[offset] >= 48 &&
+        while (offset < end && text[offset] >= 48 &&
                text[offset] <= 57) {
             offset = offset + 1
         }
         if (offset == exponentBegin) valid = false
     }
-    if (offset != text.size) valid = false
+    if (offset != end) valid = false
     if (!valid) -1 else if (integer) 1 else 0
 }
 
@@ -1176,104 +1179,170 @@ private fun jsonScanLiteral(var state: JsonParserState, literal: string): void {
 // Strings are decoded only while validating escapes and duplicate object keys;
 // the caller may retain the original byte slice through `readRaw` below.
 private fun jsonScanValue(var state: JsonParserState, depth: int): void {
-    jsonSkipWhitespace(state)
+    state.offset = jsonScanAt(state, state.offset, depth)
+    return
+}
+
+// The string at `offset` (after any whitespace), consumed: the offset after it. A
+// plain one (no escape, valid UTF-8, within the limit) is only searched for its
+// closing quote, not copied; any other goes through jsonParseString's own fallback,
+// which decodes it and reports exactly what jsonParseString does.
+private fun jsonScanString(var state: JsonParserState, offset: int): int {
+    val source = state.source
+    var at = offset
+    if (at < source.size && source[at] != 34) at = ablaJsonWhitespaceEnd(source, at)
+    val quoteOffset = at
+    if (at < source.size && source[at] == 34) at = at + 1
+    else state.fail("unexpected_token", "expected JSON string", at)
+    if (state.errorCode.size != 0) return at
+    val plainEnd = ablaJsonFindPlainStringEnd(source, at, source.size)
+    if (plainEnd >= at && plainEnd - at <= state.limits.maximumStringBytes) {
+        return plainEnd + 1
+    }
+    jsonParseStringFallback(state, quoteOffset, at)
+    state.offset
+}
+
+// jsonScanValue's walk with its cursor in a local: the offset after the value at
+// `offset`. It checks, in the same order and at the same offsets, what the walk
+// over `state.offset` with decoded strings and number slices did, and allocates
+// nothing for plain strings, numbers and literals; an object's keys are kept only
+// while duplicates are rejected (its member count is enough for the limit).
+private fun jsonScanAt(var state: JsonParserState, start: int, depth: int): int {
+    val source = state.source
+    val size = source.size
+    var offset = ablaJsonWhitespaceEnd(source, start)
     if (state.errorCode.size == 0 && depth > state.limits.maximumDepth) {
         state.fail(
-            "depth_limit", "JSON nesting exceeds configured limit", state.offset
+            "depth_limit", "JSON nesting exceeds configured limit", offset
         )
     }
     if (state.errorCode.size == 0) {
         state.nodes = state.nodes + 1
         if (state.nodes > state.limits.maximumNodes) state.fail(
-            "node_limit", "JSON node count exceeds configured limit", state.offset
+            "node_limit", "JSON node count exceeds configured limit", offset
         )
     }
-    if (state.errorCode.size == 0 && state.offset >= state.source.size) {
-        state.fail("unexpected_end", "expected JSON value", state.offset)
+    if (state.errorCode.size == 0 && offset >= size) {
+        state.fail("unexpected_end", "expected JSON value", offset)
     }
-    if (state.errorCode.size == 0) {
-        val byte = state.source[state.offset]
-        if (byte == 34) jsonParseString(state)
-        else if (byte == 91) {
-            state.offset = state.offset + 1
-            jsonSkipWhitespace(state)
-            var closed = false
-            if (state.offset < state.source.size &&
-                state.source[state.offset] == 93) {
-                state.offset = state.offset + 1
+    if (state.errorCode.size != 0) return offset
+    val byte = source[offset]
+    if (byte == 34) return jsonScanString(state, offset)
+    if (byte == 91) {
+        offset = ablaJsonWhitespaceEnd(source, offset + 1)
+        var closed = false
+        if (offset < size && source[offset] == 93) {
+            offset = offset + 1
+            closed = true
+        }
+        while (state.errorCode.size == 0 && !closed) {
+            offset = ablaJsonWhitespaceEnd(source, jsonScanAt(state, offset, depth + 1))
+            if (offset < size && source[offset] == 93) {
+                offset = offset + 1
                 closed = true
-            }
-            while (state.errorCode.size == 0 && !closed) {
-                jsonScanValue(state, depth + 1)
-                jsonSkipWhitespace(state)
-                if (state.offset < state.source.size &&
-                    state.source[state.offset] == 93) {
-                    state.offset = state.offset + 1
-                    closed = true
-                } else {
-                    jsonReaderConsume(state, 44)
-                    jsonSkipWhitespace(state)
-                    if (state.offset < state.source.size &&
-                        state.source[state.offset] == 93) state.fail(
-                            "unexpected_token", "trailing comma in JSON array",
-                            state.offset
-                        )
-                }
-            }
-        } else if (byte == 123) {
-            state.offset = state.offset + 1
-            val keys: array<string> = []
-            var keyIndex: JsonKeyTable? = null
-            jsonSkipWhitespace(state)
-            var closed = false
-            if (state.offset < state.source.size &&
-                state.source[state.offset] == 125) {
-                state.offset = state.offset + 1
-                closed = true
-            }
-            while (state.errorCode.size == 0 && !closed) {
-                if (keys.size >= state.limits.maximumObjectMembers) state.fail(
-                    "node_limit", "JSON object member limit exceeded",
-                    state.offset
+            } else {
+                offset = jsonScanConsume(state, offset, 44)
+                offset = ablaJsonWhitespaceEnd(source, offset)
+                if (offset < size && source[offset] == 93) state.fail(
+                    "unexpected_token", "trailing comma in JSON array", offset
                 )
+            }
+        }
+        return offset
+    }
+    if (byte == 123) {
+        val keep = state.limits.rejectDuplicateKeys
+        val keys: array<string> = []
+        var keyIndex: JsonKeyTable? = null
+        var members = 0
+        offset = ablaJsonWhitespaceEnd(source, offset + 1)
+        var closed = false
+        if (offset < size && source[offset] == 125) {
+            offset = offset + 1
+            closed = true
+        }
+        while (state.errorCode.size == 0 && !closed) {
+            if (members >= state.limits.maximumObjectMembers) state.fail(
+                "node_limit", "JSON object member limit exceeded", offset
+            )
+            if (keep) {
+                state.offset = offset
                 val key = jsonParseString(state)
-                var duplicate = false
-                if (state.limits.rejectDuplicateKeys) {
-                    if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
-                        keyIndex = jsonKeyTable()
-                    }
-                    duplicate = jsonKeyRepeats(keys, keyIndex, key)
+                offset = state.offset
+                if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
+                    keyIndex = jsonKeyTable()
                 }
-                if (duplicate) state.fail(
-                    "duplicate_key", "duplicate JSON object key", state.offset
+                if (jsonKeyRepeats(keys, keyIndex, key)) state.fail(
+                    "duplicate_key", "duplicate JSON object key", offset
                 )
                 if (state.errorCode.size == 0) keys.append(key)
-                jsonReaderConsume(state, 58)
-                jsonScanValue(state, depth + 1)
-                jsonSkipWhitespace(state)
-                if (state.offset < state.source.size &&
-                    state.source[state.offset] == 125) {
-                    state.offset = state.offset + 1
-                    closed = true
-                } else {
-                    jsonReaderConsume(state, 44)
-                    jsonSkipWhitespace(state)
-                    if (state.offset < state.source.size &&
-                        state.source[state.offset] == 125) state.fail(
-                            "unexpected_token", "trailing comma in JSON object",
-                            state.offset
-                        )
-                }
+            } else offset = jsonScanString(state, offset)
+            if (state.errorCode.size == 0) members = members + 1
+            offset = jsonScanConsume(state, offset, 58)
+            offset = ablaJsonWhitespaceEnd(source, jsonScanAt(state, offset, depth + 1))
+            if (offset < size && source[offset] == 125) {
+                offset = offset + 1
+                closed = true
+            } else {
+                offset = jsonScanConsume(state, offset, 44)
+                offset = ablaJsonWhitespaceEnd(source, offset)
+                if (offset < size && source[offset] == 125) state.fail(
+                    "unexpected_token", "trailing comma in JSON object", offset
+                )
             }
-        } else if ((byte >= 48 && byte <= 57) || byte == 45) {
-            jsonScanNumber(state)
-        } else if (byte == 116) jsonScanLiteral(state, "true")
-        else if (byte == 102) jsonScanLiteral(state, "false")
-        else if (byte == 110) jsonScanLiteral(state, "null")
-        else state.fail(
-            "unexpected_token", "unexpected token in JSON input", state.offset
-        )
+        }
+        return offset
     }
+    if ((byte >= 48 && byte <= 57) || byte == 45) {
+        val begin = offset
+        var scanning = true
+        while (scanning && offset < size) {
+            val next = source[offset]
+            scanning = (next >= 48 && next <= 57) || next == 45 ||
+                next == 43 || next == 46 || next == 101 || next == 69
+            if (scanning) offset = offset + 1
+        }
+        if (jsonNumberKindRange(source, begin, offset) < 0) {
+            state.fail("invalid_number", "invalid JSON number", begin)
+        }
+        return offset
+    }
+    val literal = if (byte == 116) 1 else if (byte == 102) 2 else if (byte == 110) 3 else 0
+    if (literal > 0 && jsonLiteralAt(source, offset, literal)) {
+        return offset + (if (literal == 2) 5 else 4)
+    }
+    state.fail("unexpected_token", "unexpected token in JSON input", offset)
+    offset
+}
+
+// Whether `true` (1), `false` (2) or `null` (3) is at `offset`.
+private fun jsonLiteralAt(source: string, offset: int, literal: int): bool {
+    if (literal == 2) {
+        offset + 5 <= source.size && source[offset] == 102 &&
+            source[offset + 1] == 97 && source[offset + 2] == 108 &&
+            source[offset + 3] == 115 && source[offset + 4] == 101
+    } else if (literal == 1) {
+        offset + 4 <= source.size && source[offset] == 116 &&
+            source[offset + 1] == 114 && source[offset + 2] == 117 &&
+            source[offset + 3] == 101
+    } else {
+        offset + 4 <= source.size && source[offset] == 110 &&
+            source[offset + 1] == 117 && source[offset + 2] == 108 &&
+            source[offset + 3] == 108
+    }
+}
+
+// jsonReaderConsume on a local cursor: the offset after `expected` (after any
+// whitespace), or where it was missing, reported as there.
+private fun jsonScanConsume(var state: JsonParserState, offset: int, expected: int): int {
+    val at = ablaJsonWhitespaceEnd(state.source, offset)
+    val matches = state.errorCode.size == 0 &&
+        at < state.source.size && state.source[at] == expected
+    if (!matches) state.fail(
+        "unexpected_token", "unexpected token while reading JSON", at
+    )
+    at + (if (matches) 1 else 0)
 }
 
 // The end of the JSON number (RFC 8259: -?(0|[1-9][0-9]*)(.[0-9]+)?
