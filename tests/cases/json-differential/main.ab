@@ -3,7 +3,8 @@
 // spread positions), each parsed, read with the
 // object and array readers (readRaw and skip), under six sets of limits. One
 // line per input (with the argument "full"): every error's code and position
-// (jsonValidate's too, when it differs from jsonParse's),
+// (jsonValidate's and jsonDocument's too, when they differ from jsonParse's, or
+// when the document's nodes don't read as the tree),
 // and a hash of the messages, the trees' stringified text and the raw slices;
 // without it, a hash of each block of 10 such lines. The expected output was
 // recorded before the readers' and the parser's fast paths existed: they must
@@ -22,6 +23,32 @@ fun differentialHash(hash: int, text: string): int {
 fun differentialError(code: string, offset: int): string =
     if (code.size == 0) "ok" else "$code@$offset"
 
+// Whether a document's node reads as jsonParse's tree: kind, size, scalars,
+// every element, and every member by position and by key.
+fun differentialSame(node: JsonNode, value: Json): bool {
+    if (node.kind() != value.kind || node.size() != value.size()) return false
+    if (value.kind == 1) return node.asString() == value.asString()
+    if (value.kind == 2) {
+        val left = node.asNumber()
+        val right = value.asNumber()
+        return left.text == right.text && left.integer == right.integer &&
+            left.intValue == right.intValue && left.intAvailable == right.intAvailable &&
+            node.asInt() == value.asInt() && node.intAvailable() == value.intAvailable()
+    }
+    if (value.kind == 3) return node.asBoolean() == value.asBoolean()
+    var index = 0
+    while (index < value.size()) {
+        if (!differentialSame(node.at(index), value.at(index))) return false
+        if (value.kind == 5) {
+            val key = value.keys[index]
+            if (node.keyAt(index) != key || !node.has(key) ||
+                !differentialSame(node.get(key), value.get(key))) return false
+        }
+        index = index + 1
+    }
+    !node.has("\u0000missing") && node.at(value.size()).kind() == 0 && !node.at(value.size()).exists()
+}
+
 fun differentialParse(input: string, limits: JsonLimits): string {
     val parsed = jsonParse(input, limits)
     var hash = differentialHash(-3750763034362895579, parsed.error.message)
@@ -35,7 +62,19 @@ fun differentialParse(input: string, limits: JsonLimits): string {
         other.message == error.message && other.byteOffset == error.byteOffset &&
         other.line == error.line && other.column == error.column && checked.value.isNull()
     val validate = if (agrees) "" else " V ${other.code}@${other.byteOffset}:${other.line}:${other.column} ${other.message}"
-    "P ${differentialError(error.code, error.byteOffset)}:${error.line}:${error.column} $hash$validate"
+    // jsonDocument too, and its nodes read as the tree does.
+    val document = jsonDocument(input, limits)
+    val third = document.error
+    var documented = document.succeeded == parsed.succeeded && third.code == error.code &&
+        third.message == error.message && third.byteOffset == error.byteOffset &&
+        third.line == error.line && third.column == error.column
+    if (documented && parsed.succeeded) {
+        val root = document.document.root()
+        documented = jsonStringify(root.toJson()) == jsonStringify(parsed.value) &&
+            differentialSame(root, parsed.value) && root.raw().size > 0
+    }
+    val tape = if (documented) "" else " D ${third.code}@${third.byteOffset}"
+    "P ${differentialError(error.code, error.byteOffset)}:${error.line}:${error.column} $hash$validate$tape"
 }
 
 fun differentialObject(input: string, limits: JsonLimits): string {

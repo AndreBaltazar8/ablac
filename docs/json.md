@@ -160,6 +160,44 @@ fun main {
 // true
 ```
 
+## Documents: a parsed tree without the tree
+
+`jsonDocument(source, limits)` parses as `jsonParse` does (the same
+`succeeded` and `error`, merging included) but keeps the document as its
+source and a tape of four integers per value instead of building `Json`
+nodes: a fraction of the memory, nothing for the collector to walk value by
+value, and several times faster on large documents. Its `root()` is a
+`JsonNode`, which reads like the tree:
+
+- `kind()`, `isNull()` … `isObject()`, `size()`, `exists()` (false for a
+  missing member or element, which reads as null);
+- `at(index)` (an element, or an object's member value), `keyAt(index)`,
+  `get(key)`, `has(key)`, `getString(key)`, `getInt(key)`;
+- `asString()`, `asNumber()`, `asInt()`, `intAvailable()`, `asBoolean()`;
+- `raw()`: the value's source text exactly as written, a slice, not a copy;
+- `toJson()`: the `Json` tree `jsonParse` builds for that value.
+
+Members read as `jsonParse`'s object holds them: with `mergeDuplicateKeys` a
+repeated key counts once, at its first position, with its last value; `get`
+gives the last value for a key either way. Strings with escapes are decoded
+when read.
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val parsed = jsonDocument("{\"name\":\"Abla\",\"versions\":[1, 2.5e1],\"name\":\"x\"}", jsonPermissiveLimits)
+    val root = parsed.document.root()
+    val versions = root.get("versions")
+    println("${root.size()} ${root.getString("name")} ${versions.size()} ${versions.at(1).raw()}")
+    println(jsonStringify(root.toJson()))
+}
+// output:
+// 2 x 2 2.5e1
+// {"name":"x","versions":[1,2.5e1]}
+```
+
 A reader (`jsonObjectReader(source, jsonPermissiveLimits)`) can't merge as it
 goes: it gives every member as written, duplicates included, in source order.
 Keeping the last value read for each key gives `JSON.parse`'s result.

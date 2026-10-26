@@ -1326,6 +1326,499 @@ private fun jsonValidateAt(var state: JsonParserState, start: int, depth: int): 
     offset
 }
 
+// A parsed document kept as its source and a tape: four ints per value, in
+// source order, so a large document is a few allocations and nothing the
+// collector traces value by value. Each value is [kind | flag | count << 8,
+// begin, end, next]: Json's kinds (0 null, 1 string, 2 number, 3 boolean,
+// 4 array, 5 object); the flag (16) marks a string with escapes, `true`, an
+// integer number, or an object whose repeated keys merged; count is an array's
+// elements or the members jsonParse's object would hold; [begin, end) is the
+// value's source bytes (a string's with its quotes); next is the tape index
+// after it. An object's members are a key (a string) followed by its value,
+// every one as written.
+class JsonDocument(
+    val source: string,
+    val tape: array<int>,
+    val limits: JsonLimits
+)
+
+// A value of a document: its tape index, or -1 for a missing one (which reads
+// as null).
+class JsonNode(
+    val document: JsonDocument,
+    val index: int
+)
+
+class JsonDocumentResult(
+    val document: JsonDocument,
+    val succeeded: bool,
+    val error: JsonError
+)
+
+private val jsonTapeFlag = 16
+
+// `source` parsed into a document: the same `succeeded` and `error` jsonParse
+// gives under `limits`, and on success a document whose nodes read as
+// jsonParse's tree does (toJson() builds that tree for any node).
+fun jsonDocument(
+    source: string,
+    limits: JsonLimits = jsonDefaultLimits()
+): JsonDocumentResult {
+    val state = JsonParserState(source, limits, 0, 0, "", "", 0)
+    if (!jsonLimitsValid(limits)) {
+        state.fail("input_limit", "invalid JSON parser limits", 0)
+    }
+    if (state.errorCode.size == 0 && source.size > limits.maximumBytes) {
+        state.fail(
+            "input_limit", "JSON input exceeds configured byte limit",
+            limits.maximumBytes
+        )
+    }
+    if (state.errorCode.size == 0) {
+        val utf8 = utf8Info(source)
+        if (!utf8.valid) {
+            state.fail("invalid_unicode", "JSON input is not valid UTF-8", utf8.errorOffset)
+        }
+    }
+    val tape: array<int> = []
+    if (state.errorCode.size == 0) state.offset = jsonDocumentAt(state, tape, state.offset, 1)
+    jsonSkipWhitespace(state)
+    if (state.errorCode.size == 0 && state.offset != source.size) {
+        state.fail("trailing_input", "trailing input after JSON value", state.offset)
+    }
+    if (state.errorCode.size == 0) {
+        JsonDocumentResult(JsonDocument(source, tape, limits), true, JsonError("", "", 0, 1, 1))
+    } else {
+        val location = jsonErrorLocation(source, state.errorOffset)
+        JsonDocumentResult(
+            JsonDocument(source, [], limits),
+            false,
+            JsonError(
+                state.errorCode,
+                state.errorMessage,
+                state.errorOffset,
+                location[0],
+                location[1]
+            )
+        )
+    }
+}
+
+private fun jsonTapeAppend(var tape: array<int>, word: int, begin: int, end: int): void {
+    tape.append(word)
+    tape.append(begin)
+    tape.append(end)
+    tape.append(tape.size + 1)
+    return
+}
+
+// The string at `offset` (its quote), consumed onto the tape: the offset after it.
+private fun jsonDocumentString(var state: JsonParserState, var tape: array<int>, offset: int): int {
+    val source = state.source
+    val plainEnd = ablaJsonFindPlainStringEnd(source, offset + 1, source.size)
+    if (plainEnd > offset && plainEnd - offset - 1 <= state.limits.maximumStringBytes) {
+        jsonTapeAppend(tape, 1, offset, plainEnd + 1)
+        return plainEnd + 1
+    }
+    jsonParseStringFallback(state, offset, offset + 1)
+    if (state.errorCode.size == 0) jsonTapeAppend(tape, 1 | jsonTapeFlag, offset, state.offset)
+    state.offset
+}
+
+// jsonValidateAt's walk (jsonParseValue's checks, in order, at the same offsets),
+// writing each value onto `tape`: the offset after the value at `start`.
+private fun jsonDocumentAt(
+    var state: JsonParserState,
+    var tape: array<int>,
+    start: int,
+    depth: int
+): int {
+    val source = state.source
+    val size = source.size
+    var offset = ablaJsonWhitespaceEnd(source, start)
+    if (state.errorCode.size == 0 && depth > state.limits.maximumDepth) {
+        state.fail("depth_limit", "JSON nesting exceeds configured limit", offset)
+    }
+    if (state.errorCode.size == 0) {
+        state.nodes = state.nodes + 1
+        if (state.nodes > state.limits.maximumNodes) {
+            state.fail("node_limit", "JSON node count exceeds configured limit", offset)
+        }
+    }
+    if (state.errorCode.size == 0 && offset >= size) {
+        state.fail("unexpected_end", "expected JSON value", offset)
+    }
+    if (state.errorCode.size != 0) return offset
+    val byte = source[offset]
+    if (byte == 34) return jsonDocumentString(state, tape, offset)
+    if (byte == 91) {
+        val at = tape.size
+        jsonTapeAppend(tape, 4, offset, offset)
+        var count = 0
+        offset = ablaJsonWhitespaceEnd(source, offset + 1)
+        var closed = false
+        if (offset < size && source[offset] == 93) {
+            offset = offset + 1
+            closed = true
+        }
+        while (state.errorCode.size == 0 && !closed) {
+            offset = ablaJsonWhitespaceEnd(source, jsonDocumentAt(state, tape, offset, depth + 1))
+            count = count + 1
+            if (offset >= size) {
+                state.fail("unexpected_end", "unterminated JSON array", offset)
+            } else if (source[offset] == 93) {
+                offset = offset + 1
+                closed = true
+            } else if (source[offset] == 44) {
+                offset = ablaJsonWhitespaceEnd(source, offset + 1)
+                if (offset < size && source[offset] == 93) {
+                    state.fail("unexpected_token", "trailing comma in JSON array", offset)
+                }
+            } else state.fail(
+                "unexpected_token", "expected comma or closing bracket", offset
+            )
+        }
+        tape[at] = 4 | (count << 8)
+        tape[at + 2] = offset
+        tape[at + 3] = tape.size
+        return offset
+    }
+    if (byte == 123) {
+        val at = tape.size
+        jsonTapeAppend(tape, 5, offset, offset)
+        val reject = state.limits.rejectDuplicateKeys
+        val merge = !reject && state.limits.mergeDuplicateKeys
+        val keys: array<string> = []
+        var keyIndex: JsonKeyTable? = null
+        var members = 0
+        var merged = false
+        offset = ablaJsonWhitespaceEnd(source, offset + 1)
+        var closed = false
+        if (offset < size && source[offset] == 125) {
+            offset = offset + 1
+            closed = true
+        }
+        while (state.errorCode.size == 0 && !closed) {
+            if (offset >= size) {
+                state.fail("unexpected_end", "unterminated JSON object", offset)
+            } else if (source[offset] != 34) {
+                state.fail("unexpected_token", "JSON object key must be a string", offset)
+            }
+            var key = ""
+            if (state.errorCode.size == 0) {
+                val keyBegin = offset
+                offset = jsonDocumentString(state, tape, offset)
+                if (state.errorCode.size == 0 && (reject || merge)) {
+                    key = jsonNodeText(source, state.limits, tape, tape.size - 4)
+                }
+                if (state.errorCode.size != 0) offset = if (offset < keyBegin) keyBegin else offset
+            }
+            if (state.errorCode.size == 0 && members >= state.limits.maximumObjectMembers) {
+                state.fail(
+                    "node_limit", "JSON object member count exceeds configured limit", offset
+                )
+            }
+            var duplicate = false
+            var earlier = -1
+            if (reject) {
+                if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
+                    keyIndex = jsonKeyTable()
+                }
+                duplicate = jsonKeyRepeats(keys, keyIndex, key)
+            } else if (merge && state.errorCode.size == 0) {
+                if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
+                    keyIndex = jsonKeyTable()
+                }
+                earlier = jsonKeyPosition(keys, keyIndex, key)
+            }
+            if (state.errorCode.size == 0 && duplicate) {
+                state.fail("duplicate_key", "duplicate JSON object key", offset)
+            }
+            offset = ablaJsonWhitespaceEnd(source, offset)
+            if (state.errorCode.size == 0 && (offset >= size || source[offset] != 58)) {
+                state.fail("unexpected_token", "expected colon after JSON object key", offset)
+            }
+            if (state.errorCode.size == 0) offset = offset + 1
+            if (state.errorCode.size == 0) offset = jsonDocumentAt(state, tape, offset, depth + 1)
+            if (state.errorCode.size == 0 && earlier >= 0) merged = true
+            if (state.errorCode.size == 0 && earlier < 0) {
+                if (reject || merge) keys.append(key)
+                members = members + 1
+            }
+            offset = ablaJsonWhitespaceEnd(source, offset)
+            if (state.errorCode.size == 0 && offset >= size) {
+                state.fail("unexpected_end", "unterminated JSON object", offset)
+            } else if (state.errorCode.size == 0 && source[offset] == 125) {
+                offset = offset + 1
+                closed = true
+            } else if (state.errorCode.size == 0 && source[offset] == 44) {
+                offset = ablaJsonWhitespaceEnd(source, offset + 1)
+                if (offset < size && source[offset] == 125) {
+                    state.fail("unexpected_token", "trailing comma in JSON object", offset)
+                }
+            } else if (state.errorCode.size == 0) state.fail(
+                "unexpected_token", "expected comma or closing brace", offset
+            )
+        }
+        tape[at] = 5 | (if (merged) jsonTapeFlag else 0) | (members << 8)
+        tape[at + 2] = offset
+        tape[at + 3] = tape.size
+        return offset
+    }
+    if ((byte >= 48 && byte <= 57) || byte == 45 || byte == 43) {
+        val begin = offset
+        var scanning = true
+        while (scanning && offset < size) {
+            val next = source[offset]
+            scanning = (next >= 48 && next <= 57) || next == 45 ||
+                next == 43 || next == 46 || next == 101 || next == 69
+            if (scanning) offset = offset + 1
+        }
+        val kind = jsonNumberKindRange(source, begin, offset)
+        if (kind < 0) state.fail("invalid_number", "invalid JSON number", begin)
+        else jsonTapeAppend(tape, 2 | (if (kind == 1) jsonTapeFlag else 0), begin, offset)
+        return offset
+    }
+    if (jsonLiteralAt(source, offset, 1)) {
+        jsonTapeAppend(tape, 3 | jsonTapeFlag, offset, offset + 4)
+        return offset + 4
+    }
+    if (jsonLiteralAt(source, offset, 2)) {
+        jsonTapeAppend(tape, 3, offset, offset + 5)
+        return offset + 5
+    }
+    if (jsonLiteralAt(source, offset, 3)) {
+        jsonTapeAppend(tape, 0, offset, offset + 4)
+        return offset + 4
+    }
+    state.fail("unexpected_token", "unexpected token in JSON input", offset)
+    offset
+}
+
+// The text of the string at tape index `index` (decoded, if it has escapes).
+private fun jsonNodeText(source: string, limits: JsonLimits, tape: array<int>, index: int): string {
+    val begin = tape[index + 1]
+    val end = tape[index + 2]
+    if ((tape[index] & jsonTapeFlag) == 0) return source.slice(begin + 1, end - 1)
+    val state = JsonParserState(source, limits, begin, 0, "", "", 0)
+    jsonParseQuoted(state)
+}
+
+// Whether the string at tape index `index` reads as `key`, compared in place
+// when it has no escapes.
+private fun jsonNodeTextIs(document: JsonDocument, index: int, key: string): bool {
+    val tape = document.tape
+    if ((tape[index] & jsonTapeFlag) != 0) {
+        return jsonNodeText(document.source, document.limits, tape, index) == key
+    }
+    val begin = tape[index + 1] + 1
+    if (tape[index + 2] - 1 - begin != key.size) return false
+    val source = document.source
+    var position = 0
+    while (position < key.size) {
+        if (source[begin + position] != key[position]) return false
+        position = position + 1
+    }
+    true
+}
+
+fun JsonDocument.root(): JsonNode = JsonNode(this, if (this.tape.size > 0) 0 else -1)
+
+fun JsonNode.kind(): int = if (this.index < 0) 0 else this.document.tape[this.index] & 15
+fun JsonNode.isNull(): bool = this.kind() == 0
+fun JsonNode.isString(): bool = this.kind() == 1
+fun JsonNode.isNumber(): bool = this.kind() == 2
+fun JsonNode.isBoolean(): bool = this.kind() == 3
+fun JsonNode.isArray(): bool = this.kind() == 4
+fun JsonNode.isObject(): bool = this.kind() == 5
+// Whether the node is a value of the document (not a missing member or element).
+fun JsonNode.exists(): bool = this.index >= 0
+
+// An array's elements or an object's members (as jsonParse's object holds them:
+// repeated keys counted once when they merge); 0 for anything else.
+fun JsonNode.size(): int {
+    val kind = this.kind()
+    if (kind == 4 || kind == 5) this.document.tape[this.index] >> 8 else 0
+}
+
+// The value's source text, exactly as written (a string with its quotes); "" for
+// a missing node.
+fun JsonNode.raw(): string =
+    if (this.index < 0) ""
+    else this.document.source.slice(this.document.tape[this.index + 1], this.document.tape[this.index + 2])
+
+fun JsonNode.asString(): string =
+    if (this.kind() == 1) jsonNodeText(this.document.source, this.document.limits, this.document.tape, this.index)
+    else ""
+
+fun JsonNode.asBoolean(): bool =
+    this.kind() == 3 && (this.document.tape[this.index] & jsonTapeFlag) != 0
+
+// As Json's asNumber: the number's text and integer value (an empty number for
+// anything else).
+fun JsonNode.asNumber(): JsonNumber {
+    if (this.kind() != 2) return jsonEmptyNumber()
+    val text = this.raw()
+    val integer = (this.document.tape[this.index] & jsonTapeFlag) != 0
+    val available = integer && jsonIntegerTextAvailable(text)
+    JsonNumber(text, integer, if (available) jsonIntegerTextValue(text) else 0, available)
+}
+
+fun JsonNode.intAvailable(): bool = this.asNumber().intAvailable
+
+fun JsonNode.asInt(): int {
+    val number = this.asNumber()
+    if (number.intAvailable) number.intValue else 0
+}
+
+// The tape index of an array's element `position`, or -1.
+private fun jsonNodeElement(node: JsonNode, position: int): int {
+    if (node.kind() != 4 || position < 0 || position >= node.size()) return -1
+    val tape = node.document.tape
+    var child = node.index + 4
+    var remaining = position
+    while (remaining > 0) {
+        child = tape[child + 3]
+        remaining = remaining - 1
+    }
+    child
+}
+
+// The tape index of the key of an object's member `position` as jsonParse's
+// object holds it (its first key, with the last value for that key, when keys
+// merged), or -1.
+private fun jsonNodeMemberKey(node: JsonNode, position: int): int {
+    if (node.kind() != 5 || position < 0 || position >= node.size()) return -1
+    val tape = node.document.tape
+    val end = tape[node.index + 3]
+    var key = node.index + 4
+    if ((tape[node.index] & jsonTapeFlag) == 0) {
+        var remaining = position
+        while (remaining > 0) {
+            key = tape[key + 7]
+            remaining = remaining - 1
+        }
+        return key
+    }
+    // Merged: count distinct keys in first-appearance order.
+    val seen: array<string> = []
+    while (key < end) {
+        val text = jsonNodeText(node.document.source, node.document.limits, tape, key)
+        var known = false
+        for (earlier in seen) if (earlier == text) known = true
+        if (!known) {
+            if (seen.size == position) return key
+            seen.append(text)
+        }
+        key = tape[key + 7]
+    }
+    -1
+}
+
+// The value of the last member whose key is the text at tape index `keyIndex`.
+private fun jsonNodeLastValue(node: JsonNode, keyIndex: int): int {
+    val tape = node.document.tape
+    val text = jsonNodeText(node.document.source, node.document.limits, tape, keyIndex)
+    val found = jsonNodeFind(node, text)
+    if (found >= 0) found else keyIndex + 4
+}
+
+// The tape index of the value of the last member keyed `key`, or -1.
+private fun jsonNodeFind(node: JsonNode, key: string): int {
+    if (node.kind() != 5) return -1
+    val tape = node.document.tape
+    val end = tape[node.index + 3]
+    var member = node.index + 4
+    var found = -1
+    while (member < end) {
+        if (jsonNodeTextIs(node.document, member, key)) found = member + 4
+        member = tape[member + 7]
+    }
+    found
+}
+
+// An array's element or an object's member value at `position` (as Json's `at`),
+// or a missing node.
+fun JsonNode.at(position: int): JsonNode {
+    if (this.kind() == 5) {
+        val key = jsonNodeMemberKey(this, position)
+        val merged = (this.document.tape[this.index] & jsonTapeFlag) != 0
+        return JsonNode(
+            this.document,
+            if (key < 0) -1 else if (merged) jsonNodeLastValue(this, key) else key + 4
+        )
+    }
+    JsonNode(this.document, jsonNodeElement(this, position))
+}
+
+// An object's key at `position` (as Json's `keys`), or "".
+fun JsonNode.keyAt(position: int): string {
+    val key = jsonNodeMemberKey(this, position)
+    if (key < 0) "" else jsonNodeText(this.document.source, this.document.limits, this.document.tape, key)
+}
+
+// The value of an object's last member keyed `key` (as Json's `get`), or a
+// missing node.
+fun JsonNode.get(key: string): JsonNode = JsonNode(this.document, jsonNodeFind(this, key))
+
+fun JsonNode.has(key: string): bool = jsonNodeFind(this, key) >= 0
+
+fun JsonNode.getString(key: string): string = this.get(key).asString()
+
+fun JsonNode.getInt(key: string): int = this.get(key).asInt()
+
+// The node as jsonParse's tree: equal kind by kind, member by member, to what
+// jsonParse built for these bytes under the document's limits (null for a
+// missing node).
+fun JsonNode.toJson(): Json = jsonNodeTree(this.document, this.index)
+
+private fun jsonNodeTree(document: JsonDocument, index: int): Json {
+    if (index < 0) return jsonNull()
+    val tape = document.tape
+    val word = tape[index]
+    val kind = word & 15
+    if (kind == 0) return jsonNull()
+    if (kind == 1) {
+        return Json(1, jsonNodeText(document.source, document.limits, tape, index), 0, false, jsonNoKeys, jsonNoValues, jsonNoNumber)
+    }
+    if (kind == 2) {
+        val number = JsonNode(document, index).asNumber()
+        return Json(2, "", number.intValue, false, jsonNoKeys, jsonNoValues, number)
+    }
+    if (kind == 3) return jsonBoolean((word & jsonTapeFlag) != 0)
+    val end = tape[index + 3]
+    if (kind == 4) {
+        val values: array<Json> = []
+        var child = index + 4
+        while (child < end) {
+            values.append(jsonNodeTree(document, child))
+            child = tape[child + 3]
+        }
+        return Json(4, "", 0, false, jsonNoKeys, values, jsonNoNumber)
+    }
+    val keys: array<string> = []
+    val values: array<Json> = []
+    val merge = (word & jsonTapeFlag) != 0
+    var keyIndex: JsonKeyTable? = null
+    var member = index + 4
+    while (member < end) {
+        val key = jsonNodeText(document.source, document.limits, tape, member)
+        val value = jsonNodeTree(document, member + 4)
+        var earlier = -1
+        if (merge) {
+            if (keyIndex == null && keys.size >= jsonKeyIndexMembers) keyIndex = jsonKeyTable()
+            earlier = jsonKeyPosition(keys, keyIndex, key)
+        }
+        if (earlier >= 0) values[earlier] = value
+        else {
+            keys.append(key)
+            values.append(value)
+        }
+        member = tape[member + 7]
+    }
+    Json(5, "", 0, false, keys, values, jsonNoNumber)
+}
+
 private fun jsonReaderConsume(var state: JsonParserState, expected: int): bool {
     val offset = ablaJsonWhitespaceEnd(state.source, state.offset)
     val matches = state.errorCode.size == 0 &&
