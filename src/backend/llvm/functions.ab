@@ -1729,6 +1729,11 @@ fun bootstrapLlvmEmitIntegerDivision(
 // bootstrapEmitLlvmProgram.
 var bootstrapLlvmFloatRemainderSymbol = ""
 
+// The direct symbol of the WebAssembly platform's browser host shim
+// (__ablaRuntimeWasmSyscall) in a bare wasm32 module being built, or "": set by
+// bootstrapEmitLlvmProgram.
+var bootstrapLlvmWasmSyscallSymbol = ""
+
 // A float `%`: LLVM's frem, which is the C library's fmod (or fmodf) where
 // there is one, or on WebAssembly, which has neither an instruction nor a C
 // library, the platform's exact fmod (an f32 one through f64, which is exact).
@@ -6862,51 +6867,70 @@ fun bootstrapLlvmEmitCoreIntrinsic(
                 ))
                 operand = operand + 1
             }
-            val syscall = bootstrapLlvmDeclare(
-                backend,
-                if (backend.macOS) "abla_darwin_linux_syscall" else "syscall",
-                backend.i64Type,
-                types, false, bootstrapLlvmFalseFlags(7)
-            )
-            val raw = bootstrapLlvmCall(
-                backend, syscall, arguments, "linux.syscall",
-                false, bootstrapLlvmFalseFlags(7)
-            )
-            var result = raw
-            if (!backend.macOS) {
-                val failed = LLVMBuildICmp(
-                    backend.builder, llvmIntEqual(), raw,
-                    LLVMConstInt(backend.i64Type, -1, 1),
-                    "linux.syscall.failed"
-                )
-                val errnoLocation = bootstrapLlvmDeclare(
-                    backend, "__errno_location", backend.pointerType,
-                    [], false, []
-                )
-                val errnoPointer = bootstrapLlvmCall(
-                    backend, errnoLocation, [], "linux.errno.pointer",
-                    false, []
-                )
-                val errno = LLVMBuildLoad2(
-                    backend.builder, backend.i32Type, errnoPointer,
-                    "linux.errno"
-                )
-                val negativeErrno = LLVMBuildNeg(
-                    backend.builder,
-                    LLVMBuildZExt(
-                        backend.builder, errno, backend.i64Type,
-                        "linux.errno.i64"
-                    ),
-                    "linux.errno.negative"
-                )
-                result = LLVMBuildSelect(
-                    backend.builder, failed, negativeErrno, raw,
-                    "linux.syscall.result"
+            val shim = if (bootstrapLlvmWasmSyscallSymbol == "") nativeNullPointer()
+                else LLVMGetNamedFunction(backend.module, bootstrapLlvmWasmSyscallSymbol)
+            // A bare wasm32 module's system calls go to the browser host shim,
+            // which returns -errno itself (its direct form takes the arguments
+            // up to the last one it reads).
+            if (!pointerIsNull(shim)) {
+                val read: array<i64*> = []
+                while (read.size < int(LLVMCountParams(shim))) {
+                    read.append(arguments[read.size])
+                }
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result, bootstrapLlvmCall(
+                        backend, shim, read, "wasm.syscall", false,
+                        bootstrapLlvmFalseFlags(read.size)
+                    )
                 )
             }
-            bootstrapLlvmSetNativeValue(
-                backend, storage, instruction.result, result
-            )
+            if (pointerIsNull(shim)) {
+                val syscall = bootstrapLlvmDeclare(
+                    backend,
+                    if (backend.macOS) "abla_darwin_linux_syscall" else "syscall",
+                    backend.i64Type,
+                    types, false, bootstrapLlvmFalseFlags(7)
+                )
+                val raw = bootstrapLlvmCall(
+                    backend, syscall, arguments, "linux.syscall",
+                    false, bootstrapLlvmFalseFlags(7)
+                )
+                var result = raw
+                if (!backend.macOS) {
+                    val failed = LLVMBuildICmp(
+                        backend.builder, llvmIntEqual(), raw,
+                        LLVMConstInt(backend.i64Type, -1, 1),
+                        "linux.syscall.failed"
+                    )
+                    val errnoLocation = bootstrapLlvmDeclare(
+                        backend, "__errno_location", backend.pointerType,
+                        [], false, []
+                    )
+                    val errnoPointer = bootstrapLlvmCall(
+                        backend, errnoLocation, [], "linux.errno.pointer",
+                        false, []
+                    )
+                    val errno = LLVMBuildLoad2(
+                        backend.builder, backend.i32Type, errnoPointer,
+                        "linux.errno"
+                    )
+                    val negativeErrno = LLVMBuildNeg(
+                        backend.builder,
+                        LLVMBuildZExt(
+                            backend.builder, errno, backend.i64Type,
+                            "linux.errno.i64"
+                        ),
+                        "linux.errno.negative"
+                    )
+                    result = LLVMBuildSelect(
+                        backend.builder, failed, negativeErrno, raw,
+                        "linux.syscall.result"
+                    )
+                }
+                bootstrapLlvmSetNativeValue(
+                    backend, storage, instruction.result, result
+                )
+            }
         }
     }
     if (name == "ablaRuntimeWasmHeapBase") {

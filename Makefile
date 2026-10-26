@@ -103,6 +103,7 @@ test-serial: ablac
 	tools/test-wasm-export-extern.sh $(COMPILER)
 	tools/test-wasm-import-module.sh $(COMPILER)
 	tools/test-wasm-float-remainder.sh $(COMPILER)
+	tools/test-wasm-host.sh $(COMPILER)
 	tools/test-wasm-debug-reproducible.sh $(COMPILER)
 	tools/test-rewritten-module-diagnostics.sh $(COMPILER)
 	tools/test-build-removed-outputs.sh $(COMPILER)

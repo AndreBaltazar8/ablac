@@ -1378,3 +1378,55 @@ trusted fun __ablaRuntimeFloatRemainder(x: f64, y: f64): f64 {
     }
     if (x < 0.0) rest * -1.0 else rest
 }
+
+// The browser host ABI. A WebAssembly module for a bare wasm32 target has no
+// kernel and no C library: the backend calls __ablaRuntimeWasmSyscall for each
+// raw Linux system call (ablaLinuxSyscall, under abla/io, abla/process/exit,
+// abla/process/time, abla/random…), which keeps the calls the standard library
+// makes on these four imports from module "abla_host" and fails the others
+// with ENOSYS. A module imports only those its program reaches.
+//   write(fd: i32, data: i32, length: i32) -> i32   bytes written, or -errno
+//   exit(code: i32)                                  ends the program; never returns
+//   clock_ns(clock: i32) -> i64                      0: wall clock (ns since 1970), 1: monotonic
+//   random(data: i32, length: i32) -> i32            random bytes written, or -errno
+@wasmImport(["abla_host", "write"])
+trusted noescape extern:"c" fun __ablaHostWrite(descriptor: i32, data: i32, length: i32): i32
+
+@wasmImport(["abla_host", "exit"])
+trusted noescape extern:"c" fun __ablaHostExit(code: i32): void
+
+@wasmImport(["abla_host", "clock_ns"])
+trusted noescape extern:"c" fun __ablaHostClockNs(clock: i32): i64
+
+@wasmImport(["abla_host", "random"])
+trusted noescape extern:"c" fun __ablaHostRandom(data: i32, length: i32): i32
+
+trusted fun __ablaRuntimeWasmSyscall(
+    number: int,
+    a0: int,
+    a1: int,
+    a2: int,
+    a3: int,
+    a4: int,
+    a5: int
+): int {
+    // write
+    if (number == 1) return int(__ablaHostWrite(i32(a0), i32(a1), i32(a2)))
+    // exit, exit_group
+    if (number == 60 || number == 231) {
+        __ablaHostExit(i32(a0))
+        ablaRuntimeTrap()
+    }
+    // clock_gettime(clock, timespec): CLOCK_REALTIME is the wall clock, the
+    // others the monotonic one
+    if (number == 228) {
+        val nanoseconds = int(__ablaHostClockNs(if (a0 == 0) i32(0) else i32(1)))
+        if (nanoseconds < 0) return -22
+        ablaRuntimeStoreI64(a1, nanoseconds / 1000000000)
+        ablaRuntimeStoreI64(a1 + 8, nanoseconds % 1000000000)
+        return 0
+    }
+    // getrandom(data, length, flags)
+    if (number == 318) return int(__ablaHostRandom(i32(a0), i32(a1)))
+    -38
+}

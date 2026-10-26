@@ -85,6 +85,23 @@ The embedding runtime must validate the imported symbol names and signatures
 before instantiation. A Wasm build with debug information keeps the function
 names and publishes `<module>.map` and `<module>.debug.wasm` beside the module.
 
+A bare wasm32 module (`wasm32-unknown-unknown`, such as a page's) has no kernel
+and no C library, so the standard library's system calls (`abla/io`'s
+`println`, `abla/process/exit`, `abla/process/time`'s clocks, random bytes) go
+to the browser host ABI instead: a few imports from module `abla_host`, of
+which a module imports only those its program reaches. Every other system call
+fails with `-ENOSYS` (-38). A float `%` needs no import: the module carries an
+exact fmod.
+
+| Import | Signature | |
+|---|---|---|
+| `abla_host.write` | `(fd: i32, data: i32, length: i32) -> i32` | writes `length` bytes at `data` to descriptor 1 or 2; the bytes written, or `-errno` |
+| `abla_host.exit` | `(code: i32)` | ends the program with `code` (a host throws); never returns |
+| `abla_host.clock_ns` | `(clock: i32) -> i64` | 0: the wall clock in nanoseconds since 1970-01-01T00:00:00Z; 1: a monotonic clock in nanoseconds |
+| `abla_host.random` | `(data: i32, length: i32) -> i32` | fills `length` bytes at `data` with cryptographically random bytes; `length`, or `-errno` |
+
+Pointers are addresses in the module's exported `memory`.
+
 Development (`--fast`) builds carry debug information: DWARF line tables,
 readable function symbols and, natively, frame pointers and a printed stack on
 a crash. Release builds don't; `-g`/`--debug`, `--no-debug` and
