@@ -20,6 +20,24 @@ fail() {
     exit 1
 }
 
+# The compiler binary itself: a launcher sets its own ABLA_SYSROOT, which
+# would replace the copies'. (Beside the launcher, beside the launcher a link
+# points at, or in a released toolchain's libexec.)
+compiler_payload=$compiler
+resolved=$compiler
+while [[ -L $resolved ]]; do
+    target=$(readlink "$resolved")
+    [[ $target == /* ]] || target=$(dirname "$resolved")/$target
+    resolved=$target
+done
+if [[ -x $compiler.bin ]]; then
+    compiler_payload=$compiler.bin
+elif [[ -x $resolved.bin ]]; then
+    compiler_payload=$resolved.bin
+elif [[ -x $(dirname "$resolved")/../libexec/ablac.bin ]]; then
+    compiler_payload=$(dirname "$resolved")/../libexec/ablac.bin
+fi
+
 # Copies, not links: a link resolves to the same path.
 roots=()
 for name in s a-sysroot-path-much-longer-than-the-first-one; do
@@ -35,7 +53,7 @@ for index in 0 1; do
     root=${roots[$index]}
     side="$output_directory/side-$index"
     mkdir -p "$side"
-    (cd "$project_root" && ABLA_SYSROOT="$root" "$compiler" build \
+    (cd "$project_root" && ABLA_SYSROOT="$root" "$compiler_payload" build \
         "$cases/main.ab" -o "$output_directory/program" --no-cache)
     mv "$output_directory/program" "$side/program"
     nm -U "$side/program" | awk '{print $NF}' | sort > "$side/symbols"
@@ -44,7 +62,7 @@ for index in 0 1; do
     status=$?
     set -e
     [[ $status == 42 ]] || fail "the program built against ${root##*/} exited with $status"
-    (cd "$project_root" && ABLA_SYSROOT="$root" "$compiler" build \
+    (cd "$project_root" && ABLA_SYSROOT="$root" "$compiler_payload" build \
         tests/cases/sysroot-path-symbols/build.ab \
         -o "$output_directory/build-driver" --no-cache)
     mv "$output_directory/module.wasm" "$side/module.wasm"
