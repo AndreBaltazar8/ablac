@@ -1,0 +1,106 @@
+// Work that makes garbage across many collections and keeps a little: lists
+// of objects, strings, and large arrays; its checksum is the same however the
+// collector returns memory.
+import "abla/memory"
+import "abla/platform/host"
+import "abla/process/arguments"
+import "abla/process/command"
+import "abla/process/metrics"
+import "abla/process/time"
+import "abla/unsafe/memory"
+
+class Node(val value: int, val next: Node?)
+
+fun listOf(count: int, base: int): Node? {
+    var list: Node? = null
+    for (index in 0 until count) list = Node(index + base, list)
+    list
+}
+
+fun sumOf(list: Node?): int {
+    var total = 0
+    var walk = list
+    var more = true
+    while (more) {
+        val node = walk
+        if (node == null) more = false
+        else {
+            total = total + node.value
+            walk = node.next
+        }
+    }
+    total
+}
+
+fun churn(rounds: int): int {
+    val kept: array<Node?> = []
+    val labels: array<string> = []
+    var checksum = 0
+    for (round in 0 until rounds) {
+        val list = listOf(20000, round)
+        val sum = sumOf(list)
+        checksum = (checksum * 31 + sum) % 1000000007
+        val label = "round $round sum $sum"
+        if (round % 25 == 0) {
+            kept.append(list)
+            labels.append(label)
+        }
+    }
+    for (list in kept) checksum = (checksum + sumOf(list)) % 1000000007
+    for (label in labels) checksum = (checksum + label.size) % 1000000007
+    checksum
+}
+
+// Large arrays the system allocator maps on their own: freed, they leave the
+// process's resident memory. True when it falls below the live bytes the last
+// collection found, once both collections (and the helper's frees) are done.
+fun filledTotal(): int {
+    var arrays: array<array<int>> = []
+    for (index in 0 until 48) arrays.append(filledArray(524288, index))
+    var total = 0
+    for (array in arrays) total = total + array[7]
+    total
+}
+
+noescape extern:"c" fun malloc_zone_statistics(zone: i64*, statistics: i64*): void
+
+// The bytes macOS's malloc holds for the program (malloc_statistics_t's
+// size_in_use); -1 elsewhere. The test is inside, so a Linux link never sees
+// the Darwin symbol.
+fun allocatorBytesInUse(): int {
+    if (!ablaHostIsMacOS()) return -1
+    val statistics = nativeByteBuffer(32)
+    malloc_zone_statistics(nativeNullPointer(), statistics.address)
+    val inUse = statistics.loadI64(8)
+    statistics.close()
+    inUse
+}
+
+// What a collection frees goes back to the allocator once the helper is done:
+// macOS's malloc counts it out of use (its resident pages may stay, reusable,
+// until the system needs them), and elsewhere filling as much again reuses it
+// rather than adding its size to the resident set.
+fun returned(): bool {
+    val first = filledTotal()
+    val liveBefore = memoryLiveBytes()
+    memoryCollect()
+    memoryCollect()
+    sleep(50)
+    val inUse = allocatorBytesInUse()
+    if (inUse >= 0) return first == 1128 && inUse < liveBefore / 2
+    val residentBefore = processResidentBytes()
+    val second = filledTotal()
+    first == 1128 && second == 1128 && processResidentBytes() - residentBefore < liveBefore / 2
+}
+
+// A child process started while the helper may be freeing the last batch.
+fun child(): string = command("/bin/echo").argument("child").captureText()
+
+// Rounds of churn: the first argument, else 300.
+fun roundsWanted(): int {
+    if (processArgumentCount() < 2) return 300
+    val text = processArgument(1)
+    var rounds = 0
+    for (index in 0 until text.size) rounds = rounds * 10 + text[index] - 48
+    rounds
+}

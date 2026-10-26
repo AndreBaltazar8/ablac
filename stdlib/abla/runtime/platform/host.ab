@@ -1,6 +1,7 @@
 import "abla/unsafe/memory"
 import "abla/runtime/scalar"
 import "abla/unsafe/memory/raw"
+import "abla/unsafe/native"
 
 trusted noescape extern:"c" fun malloc(size: int): i64*
 trusted noescape extern:"c" fun free(pointer: i64*): void
@@ -14,6 +15,7 @@ trusted noescape extern:"c" fun write(
 trusted noescape extern:"c" fun _exit(status: int): void
 trusted noescape extern:"c" fun _longjmp(buffer: i64*, value: int): void
 trusted noescape extern:"c" fun getenv(name: i64*): i64*
+trusted noescape extern:"c" fun getpid(): i32
 trusted noescape extern:"c" fun pthread_mutex_init(
     mutex: i64*,
     attributes: i64*
@@ -1125,6 +1127,94 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
     return
 }
 
+// Background freeing (opt-in: memorySetBackgroundFree). A collection hands the blocks
+// it found unreachable to a helper thread, which free()s them while the program goes
+// on; the next collection waits for it first. The helper is the runtime's own (a plain
+// pthread, not an Abla thread: collections go on while it runs), and touches nothing
+// but those blocks, which nothing can reach. A forked child has no such thread: it
+// drops the batch its parent was freeing. A program that doesn't opt in is built with
+// the collection above and none of this (nor its state: no global of its own).
+
+// The helper's state, static storage only a program that opts in has: +0 on (0/1),
+// +8 the helper's pthread_t, +16 a helper is freeing (0/1), +24 the process that
+// started it, +32 the batch the sweep is filling (chunks of [next chunk, count,
+// headers…], 65534 headers a chunk).
+trusted fun __ablaRuntimeHostFreeState(): int = nativeStaticAllocate(48)
+
+trusted fun __ablaRuntimePlatformMemorySetBackgroundFree(enabled: bool): void {
+    ablaRuntimeStoreI64(__ablaRuntimeHostFreeState(), if (enabled) 1 else 0)
+    return
+}
+
+// Frees every block of a batch, then its chunks: the helper's entry (C ABI, through
+// nativeFunctionAddress), or the collection itself when no helper could start.
+trusted fun __ablaRuntimeHostFreeWorker(batch: int): int {
+    var chunk = batch
+    while (chunk != 0) {
+        val count = ablaRuntimeLoadI64(chunk + 8)
+        var index = 0
+        while (index < count) {
+            free(ablaRuntimePointerFromAddress(ablaRuntimeLoadI64(chunk + 16 + index * 8)))
+            index = index + 1
+        }
+        val next = ablaRuntimeLoadI64(chunk)
+        free(ablaRuntimePointerFromAddress(chunk))
+        chunk = next
+    }
+    0
+}
+
+// A block the sweep found unreachable, for the helper.
+trusted fun __ablaRuntimeHostFreeLater(header: int): void {
+    val state = __ablaRuntimeHostFreeState()
+    var chunk = ablaRuntimeLoadI64(state + 32)
+    if (chunk == 0 || ablaRuntimeLoadI64(chunk + 8) == 65534) {
+        val fresh = ablaRuntimePointerAddress(malloc(65536 * 8))
+        if (fresh == 0) {
+            free(ablaRuntimePointerFromAddress(header))
+            return
+        }
+        ablaRuntimeStoreI64(fresh, chunk)
+        ablaRuntimeStoreI64(fresh + 8, 0)
+        chunk = fresh
+        ablaRuntimeStoreI64(state + 32, chunk)
+    }
+    val count = ablaRuntimeLoadI64(chunk + 8)
+    ablaRuntimeStoreI64(chunk + 16 + count * 8, header)
+    ablaRuntimeStoreI64(chunk + 8, count + 1)
+    return
+}
+
+// Waits for the helper still freeing the last collection's batch (in the process that
+// started it; a forked child forgets it).
+trusted fun __ablaRuntimeHostFreeWait(): void {
+    val state = __ablaRuntimeHostFreeState()
+    if (ablaRuntimeLoadI64(state + 16) == 0) return
+    ablaRuntimeStoreI64(state + 16, 0)
+    if (int(getpid()) == ablaRuntimeLoadI64(state + 24)) {
+        pthread_join(ablaRuntimeLoadI64(state + 8), ablaRuntimePointerFromAddress(0))
+    }
+    return
+}
+
+// Hands the batch the sweep filled to a helper (freed here when none can start).
+trusted fun __ablaRuntimeHostFreeStart(): void {
+    val state = __ablaRuntimeHostFreeState()
+    val batch = ablaRuntimeLoadI64(state + 32)
+    ablaRuntimeStoreI64(state + 32, 0)
+    if (batch == 0) return
+    if (pthread_create(
+        ablaRuntimePointerFromAddress(state + 8),
+        ablaRuntimePointerFromAddress(0),
+        ablaRuntimePointerFromAddress(nativeFunctionAddress(__ablaRuntimeHostFreeWorker)),
+        ablaRuntimePointerFromAddress(batch)
+    ) == 0) {
+        ablaRuntimeStoreI64(state + 16, 1)
+        ablaRuntimeStoreI64(state + 24, int(getpid()))
+    } else __ablaRuntimeHostFreeWorker(batch)
+    return
+}
+
 trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     // Region pages are reclaimed as a unit and may contain references into
     // the persistent heap. Defer collection until the outermost region ends,
@@ -1170,6 +1260,91 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     val freed = before - __ablaRuntimeHostLiveBytes
     __ablaRuntimeHostHeapUnlock(mutex)
     freed
+}
+
+// __ablaRuntimePlatformMemoryCollect with background freeing: what a program that turns
+// it on (memorySetBackgroundFree, anywhere in its own code) has as its collection in
+// place of the one above (bootstrapBackgroundFreeParse); a program that doesn't never
+// reaches it, nor the helper.
+trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
+    // Region pages are reclaimed as a unit and may contain references into
+    // the persistent heap. Defer collection until the outermost region ends,
+    // when compiler-published stack/global roots are sufficient.
+    val mutex = __ablaRuntimeHostHeapLock()
+    if (__ablaRuntimeHostRegionLoad() != 0 ||
+        __ablaRuntimeHostActiveThreads != 0) {
+        __ablaRuntimeHostHeapUnlock(mutex)
+        return 0
+    }
+    val before = __ablaRuntimeHostLiveBytes
+    val allocationCount = __ablaRuntimeHostAllocationCount
+    if (allocationCount == 0) {
+        __ablaRuntimeHostHeapUnlock(mutex)
+        return 0
+    }
+    __ablaRuntimeHostCollectionWorklist = ablaRuntimePointerAddress(
+        malloc(allocationCount * 8)
+    )
+    if (__ablaRuntimeHostCollectionWorklist == 0) ablaRuntimeTrap()
+    __ablaRuntimeHostCollectionCount = allocationCount
+    __ablaRuntimeHostCollectionWorklistCount = 0
+    // A helper still freeing is waited for even when background freeing has been
+    // turned off since: its thread is joined.
+    __ablaRuntimeHostFreeWait()
+    val background = ablaRuntimeLoadI64(__ablaRuntimeHostFreeState()) != 0
+    __ablaRuntimeHostCollectionPagesBuild()
+    __ablaRuntimeHostMarkRootValues()
+    __ablaRuntimeHostTraceMarkedAllocations()
+    if (background) {
+        __ablaRuntimeHostBackgroundSweep()
+        __ablaRuntimeHostFreeStart()
+    } else __ablaRuntimeHostCollectionSweep()
+    free(ablaRuntimePointerFromAddress(
+        __ablaRuntimeHostCollectionWorklist
+    ))
+    free(ablaRuntimePointerFromAddress(
+        __ablaRuntimeHostCollectionRanges
+    ))
+    free(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionPages))
+    free(ablaRuntimePointerFromAddress(__ablaRuntimeHostCollectionBitmaps))
+    __ablaRuntimeHostCollectionPages = 0
+    __ablaRuntimeHostCollectionPageMask = 0
+    __ablaRuntimeHostCollectionBitmaps = 0
+    __ablaRuntimeHostCollectionLargeCount = 0
+    __ablaRuntimeHostCollectionCount = 0
+    __ablaRuntimeHostCollectionWorklist = 0
+    __ablaRuntimeHostCollectionWorklistCount = 0
+    __ablaRuntimeHostCollectionRanges = 0
+    val freed = before - __ablaRuntimeHostLiveBytes
+    __ablaRuntimeHostHeapUnlock(mutex)
+    freed
+}
+
+// __ablaRuntimeHostCollectionSweep, handing what it frees to the helper.
+trusted fun __ablaRuntimeHostBackgroundSweep(): void {
+    var kept = 0
+    var slot = 0
+    while (slot < __ablaRuntimeHostRegistrySlots) {
+        val entry = ablaRuntimeLoadI64(__ablaRuntimeHostRegistry + slot * 8)
+        if (entry != 0) {
+            val header = entry & -16
+            val state = ablaRuntimeLoadI64(header + 24)
+            if (state >= 0 && state < 16 && state != 10 && state != 12) {
+                __ablaRuntimeHostLiveBytes =
+                    __ablaRuntimeHostLiveBytes - ablaRuntimeLoadI64(header + 16)
+                __ablaRuntimeHostAllocationCount = __ablaRuntimeHostAllocationCount - 1
+                __ablaRuntimeHostFreeLater(header)
+            } else {
+                if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
+                ablaRuntimeStoreI64(header, kept)
+                ablaRuntimeStoreI64(__ablaRuntimeHostRegistry + kept * 8, entry)
+                kept = kept + 1
+            }
+        }
+        slot = slot + 1
+    }
+    __ablaRuntimeHostRegistrySlots = kept
+    return
 }
 
 trusted fun __ablaRuntimeRootsPush(

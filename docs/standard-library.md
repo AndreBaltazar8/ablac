@@ -229,7 +229,8 @@ long-lived-state policy is explicit.
 
 `abla/memory` exposes `memoryLiveBytes()`, `memoryLimit()`,
 `memorySetLimit(bytes)`, `memorySetCollectionGrowth(bytes)`,
-`memorySetManualCollection()`, and the explicit `memoryCollect()` safe point. The
+`memorySetManualCollection()`, `memorySetBackgroundFree(enabled)`, and the
+explicit `memoryCollect()` safe point. The
 collector returns reclaimed bytes, preserves compiler-rooted locals,
 parameters, globals, affine/native payloads, and higher-order call buffers, and
 reclaims unreachable cyclic arrays/objects using precise allocation layouts.
@@ -260,6 +261,15 @@ Collection has two modes:
   code. A hosted program opts into it with `memorySetManualCollection()`: a
   call anywhere `main` can reach compiles it without pressure safe points, and
   at run time the call stops pressure collection.
+
+`memorySetBackgroundFree(true)` (hosted native targets; elsewhere a no-op) moves
+returning unreachable blocks to the system allocator out of the collection: the
+sweep hands them to a helper thread of the runtime's own, which frees them while
+the program goes on, and the next collection waits for it first. It is off by
+default, so a program has no helper thread unless it asks; results are the same
+either way, and the memory is back with the system allocator before the next
+collection. A forked child drops the batch its parent's helper was freeing. The
+compiler turns it on.
 
 `memorySetLimit(bytes)` and `memorySetCollectionGrowth(bytes)` select pressure
 collection in either mode: a program that can reach either is compiled with

@@ -488,6 +488,52 @@ fun bootstrapWasmUnwindingParse(parsed: BootstrapParseResult): BootstrapParseRes
     )
 }
 
+/** Whether `expression` calls a function named `name` (a module's prefix aside). */
+fun bootstrapExpressionCallsNamed(expression: BootstrapExpression, name: string): bool {
+    if (expression.kind == "call" && bootstrapCanonicalDeclarationSourceName(expression.text) == name) return true
+    for (child in expression.children) if (bootstrapExpressionCallsNamed(child, name)) return true
+    false
+}
+
+/** Whether the program's own code (not the standard library's) turns on background
+ *  freeing (memorySetBackgroundFree, or the runtime's runtimeMemorySetBackgroundFree). */
+fun bootstrapProgramWantsBackgroundFree(parsed: BootstrapParseResult): bool {
+    for (declaration in parsed.declarations) {
+        if (bootstrapStandardLibraryModuleSource(declaration.sourceIdentity)) continue
+        if (bootstrapExpressionCallsNamed(declaration.expression, "memorySetBackgroundFree") ||
+            bootstrapExpressionCallsNamed(declaration.expression, "runtimeMemorySetBackgroundFree")) return true
+        for (method in declaration.methods) {
+            if (bootstrapExpressionCallsNamed(method.expression, "memorySetBackgroundFree") ||
+                bootstrapExpressionCallsNamed(method.expression, "runtimeMemorySetBackgroundFree")) return true
+        }
+    }
+    false
+}
+
+/** `parsed` whose collection is the host runtime's one with background freeing
+ *  (__ablaRuntimeHostBackgroundMemoryCollect's body, same signature, analyzed with the
+ *  program): built only for a program that turns it on, so any other program's
+ *  collection, and code, are what they were. */
+fun bootstrapBackgroundFreeParse(parsed: BootstrapParseResult): BootstrapParseResult {
+    var body = BootstrapExpression("missing", "", 0, 0, [])
+    for (declaration in parsed.declarations) {
+        if (declaration.kind == "fun" && declaration.name == "__ablaRuntimeHostBackgroundMemoryCollect") {
+            body = declaration.expression
+        }
+    }
+    if (body.kind == "missing") return parsed
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in parsed.declarations) declarations.append(
+        if (declaration.kind == "fun" && declaration.name == "__ablaRuntimePlatformMemoryCollect")
+            bootstrapDeclarationWithExpression(declaration, body)
+        else declaration
+    )
+    BootstrapParseResult(
+        declarations, parsed.actions, parsed.errors, parsed.extensionErrors,
+        parsed.compileInputPaths, parsed.compileInputContents, parsed.diagnostics
+    )
+}
+
 // Rounds of lowering that commit compile-time code's edits, at most.
 val BOOTSTRAP_COMPILE_EDIT_ROUNDS = 8
 
@@ -638,7 +684,9 @@ fun bootstrapCompileLlvmParsedCached(
     if (round > 0) bootstrapRestoreCompileGlobals(globals)
     val earlierRoundEdits = bootstrapTakeCompileRoundEdits()
     val program = bootstrapLowerParsedCached(
-        if (bootstrapLlvmWasmUnwinding) bootstrapWasmUnwindingParse(parsed) else parsed,
+        if (bootstrapLlvmWasmUnwinding) bootstrapWasmUnwindingParse(parsed)
+        else if (bootstrapProgramWantsBackgroundFree(parsed)) bootstrapBackgroundFreeParse(parsed)
+        else parsed,
         analyzed, cache, pruneUnused
     )
     bootstrapCompileEditRound = -1

@@ -617,8 +617,10 @@ there is no step limit, only a [time limit](#native-evaluation).
 
 The runtime memory API (`memoryLiveBytes`, `memoryCollect`, `memoryReset`,
 ...) needs a heap of the program's own. The evaluator has none, so there each
-function used is one `E_EVAL_MEMORY_UNAVAILABLE` error. Native compile-time
-code has a runtime of its own, and the API measures and manages that heap.
+function used is one `E_EVAL_MEMORY_UNAVAILABLE` error. The exception is
+`memorySetBackgroundFree`, which only changes when freed memory goes back to
+the system and so does nothing in the evaluator. Native compile-time code has
+a runtime of its own, and the API measures and manages that heap.
 
 ### Threads at compile time
 
