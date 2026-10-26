@@ -231,6 +231,36 @@ fun main {
 //  id 2 name 😀 (2)
 ```
 
+To change a document and write it out, collect edits and emit: `edits()`
+starts a list; `set(object, key, value)` and `delete(object, key)` name an
+object node of the document, a key and (for `set`) a `Json` value; `emit()`
+writes the edited document in one pass. The result is exactly
+`jsonStringify` of `jsonParse`'s tree with the edits applied (also available
+as `edits.toJson()`): compact, strings escaped as `jsonStringify` escapes
+them, numbers as written. Edits apply in order to the members as
+`jsonParse`'s object holds them: `set` replaces the value of the last member
+with that key, or adds the member at the end; `delete` removes every member
+with that key. `document.emit()` writes the document unchanged (as
+`jsonStringify(jsonParse(source).value)`).
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val document = jsonDocument("[{\"id\": 1, \"note\": \"x\"}, {\"id\": 2}]").document
+    var edits = document.edits()
+    var records = document.root().elements()
+    while (records.next()) {
+        edits.set(records.node(), "seen", jsonBoolean(true))
+        edits.delete(records.node(), "note")
+    }
+    println(edits.emit())
+}
+// output:
+// [{"id":1,"seen":true},{"id":2,"seen":true}]
+```
+
 A reader (`jsonObjectReader(source, jsonPermissiveLimits)`) can't merge as it
 goes: it gives every member as written, duplicates included, in source order.
 Keeping the last value read for each key gives `JSON.parse`'s result.

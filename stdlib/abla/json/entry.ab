@@ -1927,6 +1927,323 @@ fun JsonCursor.key(): string =
 // Whether the current member's key is `name`, compared in place.
 fun JsonCursor.keyIs(name: string): bool = this.keyIndex >= 0 && jsonNodeTextIs(this.document, this.keyIndex, name)
 
+// Edits to a document's objects, written out with the rest of the document in
+// one pass by emit(). An edit names an object of the document (a JsonNode) and a
+// key; edits apply in the order they were made, to the object's members as
+// jsonParse holds them: set replaces the value of the last member with that key,
+// or adds the member at the end; delete removes every member with that key.
+// Edits naming anything but an object of this document are ignored.
+class JsonEdits(
+    val document: JsonDocument,
+    val targets: array<int>,
+    val keys: array<string>,
+    val deletes: array<bool>,
+    val values: array<Json>,
+    // Per object's tape index, its edits' positions, in order.
+    val byObject: Map<int, array<int>>,
+    // Per object written from a member list (edited, or with merged keys).
+    val prepared: Map<int, JsonEmitMembers>
+)
+
+// An object's members as emit writes them: each a key and either a tape index
+// (value from the document) or, at -1, a Json from an edit.
+class JsonEmitMembers(
+    val keys: array<string>,
+    val tapeValues: array<int>,
+    val jsonValues: array<Json>
+)
+
+@threadShared
+val jsonEmitPlaceholder = Json(0, "", 0, false, jsonNoKeys, jsonNoValues, jsonNoNumber)
+
+fun JsonDocument.edits(): JsonEdits = JsonEdits(this, [], [], [], [], Map(), Map())
+
+private fun jsonEditAdd(var edits: JsonEdits, target: JsonNode, key: string, delete: bool, value: Json): void {
+    if (target.document != edits.document || target.kind() != 5) return
+    val position = edits.targets.size
+    edits.targets.append(target.index)
+    edits.keys.append(key)
+    edits.deletes.append(delete)
+    edits.values.append(value)
+    val list = edits.byObject.get(target.index)
+    if (list != null) list.append(position)
+    else edits.byObject.set(target.index, [position])
+    return
+}
+
+fun JsonEdits.set(target: JsonNode, key: string, value: Json): void =
+    jsonEditAdd(this, target, key, false, value)
+
+fun JsonEdits.delete(target: JsonNode, key: string): void =
+    jsonEditAdd(this, target, key, true, jsonEmitPlaceholder)
+
+// The members emit writes for the object at tape index `index`, built.
+private fun jsonEmitMembersBuild(edits: JsonEdits, index: int): JsonEmitMembers {
+    val document = edits.document
+    val tape = document.tape
+    val keys: array<string> = []
+    val tapeValues: array<int> = []
+    val jsonValues: array<Json> = []
+    val merge = (tape[index] & jsonTapeFlag) != 0
+    var keyIndex: JsonKeyTable? = null
+    val end = tape[index + 3]
+    var member = index + 4
+    while (member < end) {
+        val key = jsonNodeText(document.source, document.limits, tape, member)
+        var earlier = -1
+        if (merge) {
+            if (keyIndex == null && keys.size >= jsonKeyIndexMembers) keyIndex = jsonKeyTable()
+            earlier = jsonKeyPosition(keys, keyIndex, key)
+        }
+        if (earlier >= 0) tapeValues[earlier] = member + 4
+        else {
+            keys.append(key)
+            tapeValues.append(member + 4)
+            jsonValues.append(jsonEmitPlaceholder)
+        }
+        member = tape[member + 7]
+    }
+    var result = JsonEmitMembers(keys, tapeValues, jsonValues)
+    val list = edits.byObject.get(index)
+    if (list != null) {
+        for (position in list) {
+            val key = edits.keys[position]
+            if (edits.deletes[position]) {
+                val keptKeys: array<string> = []
+                val keptTape: array<int> = []
+                val keptJson: array<Json> = []
+                var at = 0
+                while (at < result.keys.size) {
+                    if (result.keys[at] != key) {
+                        keptKeys.append(result.keys[at])
+                        keptTape.append(result.tapeValues[at])
+                        keptJson.append(result.jsonValues[at])
+                    }
+                    at = at + 1
+                }
+                result = JsonEmitMembers(keptKeys, keptTape, keptJson)
+            } else {
+                var last = -1
+                var at = 0
+                while (at < result.keys.size) {
+                    if (result.keys[at] == key) last = at
+                    at = at + 1
+                }
+                if (last >= 0) {
+                    result.tapeValues[last] = -1
+                    result.jsonValues[last] = edits.values[position]
+                } else {
+                    result.keys.append(key)
+                    result.tapeValues.append(-1)
+                    result.jsonValues.append(edits.values[position])
+                }
+            }
+        }
+    }
+    result
+}
+
+// Builds the member list of every object written from one (edited, or with merged
+// keys), afresh: edits made since the last emit count.
+private fun jsonEditsPrepare(var edits: JsonEdits): void {
+    edits.prepared.clear()
+    val tape = edits.document.tape
+    var index = 0
+    while (index < tape.size) {
+        val word = tape[index]
+        if ((word & 15) == 5 && ((word & jsonTapeFlag) != 0 || edits.byObject.has(index))) {
+            edits.prepared.set(index, jsonEmitMembersBuild(edits, index))
+        }
+        index = index + 4
+    }
+    return
+}
+
+// The prepared members of the object at `index`.
+private fun jsonEmitMembersOf(edits: JsonEdits, index: int): JsonEmitMembers {
+    val known = edits.prepared.get(index)
+    if (known != null) known else jsonEmitMembersBuild(edits, index)
+}
+
+// Whether the object at `index` is written from a member list.
+private fun jsonEmitListed(edits: JsonEdits, index: int): bool =
+    (edits.document.tape[index] & jsonTapeFlag) != 0 || edits.byObject.has(index)
+
+// The edited document as a tree: what jsonParse gives, with the edits applied.
+fun JsonEdits.toJson(): Json {
+    jsonEditsPrepare(this)
+    jsonEditedTree(this, if (this.document.tape.size > 0) 0 else -1)
+}
+
+private fun jsonEditedTree(edits: JsonEdits, index: int): Json {
+    if (index < 0) return jsonNull()
+    val tape = edits.document.tape
+    val kind = tape[index] & 15
+    if (kind == 4) {
+        val values: array<Json> = []
+        val end = tape[index + 3]
+        var child = index + 4
+        while (child < end) {
+            values.append(jsonEditedTree(edits, child))
+            child = tape[child + 3]
+        }
+        return Json(4, "", 0, false, jsonNoKeys, values, jsonNoNumber)
+    }
+    if (kind != 5) return jsonNodeTree(edits.document, index)
+    val members = jsonEmitMembersOf(edits, index)
+    val keys: array<string> = []
+    val values: array<Json> = []
+    var at = 0
+    while (at < members.keys.size) {
+        keys.append(members.keys[at])
+        values.append(
+            if (members.tapeValues[at] >= 0) jsonEditedTree(edits, members.tapeValues[at])
+            else members.jsonValues[at]
+        )
+        at = at + 1
+    }
+    Json(5, "", 0, false, keys, values, jsonNoNumber)
+}
+
+// The document as jsonStringify writes jsonParse's tree.
+fun JsonDocument.emit(): string = this.edits().emit()
+
+// The edited document as jsonStringify writes it (jsonStringify(toJson())), in one
+// pass over the tape: numbers as written, strings as jsonStringify writes them,
+// edited objects (and objects whose repeated keys merged) from their members;
+// "null" when an edit's value can't be written.
+fun JsonEdits.emit(): string {
+    if (ablaAtCompileTime()) return jsonStringify(this.toJson())
+    if (this.document.tape.size == 0) return "null"
+    jsonEditsPrepare(this)
+    val size = jsonTapeEncodedSize(this, 0)
+    if (size < 0) "null" else jsonTapeEncodeSized(this, size)
+}
+
+private fun jsonTapeStringText(document: JsonDocument, index: int): string {
+    val tape = document.tape
+    if ((tape[index] & jsonTapeFlag) == 0) return document.source.slice(tape[index + 1] + 1, tape[index + 2] - 1)
+    jsonNodeText(document.source, document.limits, tape, index)
+}
+
+private fun jsonTapeEncodedSize(edits: JsonEdits, index: int): int {
+    val document = edits.document
+    val tape = document.tape
+    val kind = tape[index] & 15
+    if (kind == 0) return 4
+    if (kind == 3) return if ((tape[index] & jsonTapeFlag) != 0) 4 else 5
+    if (kind == 2) return tape[index + 2] - tape[index + 1]
+    if (kind == 1) return jsonStringEncodedSize(jsonTapeStringText(document, index))
+    if (kind == 4) {
+        val count = tape[index] >> 8
+        var total = if (count > 0) 1 + count else 2
+        val end = tape[index + 3]
+        var child = index + 4
+        while (child < end) {
+            val size = jsonTapeEncodedSize(edits, child)
+            if (size < 0) return -1
+            total = total + size
+            child = tape[child + 3]
+        }
+        return total
+    }
+    if (jsonEmitListed(edits, index)) {
+        val members = jsonEmitMembersOf(edits, index)
+        val count = members.keys.size
+        var total = if (count > 0) 1 + count * 2 else 2
+        var at = 0
+        while (at < count) {
+            val keySize = jsonStringEncodedSize(members.keys[at])
+            val size = if (members.tapeValues[at] >= 0) jsonTapeEncodedSize(edits, members.tapeValues[at])
+                else jsonEncodedSize(members.jsonValues[at])
+            if (keySize < 0 || size < 0) return -1
+            total = total + keySize + size
+            at = at + 1
+        }
+        return total
+    }
+    val count = tape[index] >> 8
+    var total = if (count > 0) 1 + count * 2 else 2
+    val end = tape[index + 3]
+    var member = index + 4
+    while (member < end) {
+        val keySize = jsonStringEncodedSize(jsonTapeStringText(document, member))
+        val size = jsonTapeEncodedSize(edits, member + 4)
+        if (keySize < 0 || size < 0) return -1
+        total = total + keySize + size
+        member = tape[member + 7]
+    }
+    total
+}
+
+trusted fun jsonTapeEncodeSized(edits: JsonEdits, size: int): string {
+    val buffer = nativeByteBuffer(size + 1)
+    val written = jsonTapeEncodeAt(edits, 0, nativePointerAddress(buffer.address))
+    buffer.adoptString(written - nativePointerAddress(buffer.address))
+}
+
+trusted fun jsonTapeEncodeAt(edits: JsonEdits, index: int, destination: int): int {
+    val document = edits.document
+    val tape = document.tape
+    val kind = tape[index] & 15
+    if (kind == 0 || kind == 2 || kind == 3) {
+        val begin = tape[index + 1]
+        val length = tape[index + 2] - begin
+        ablaUnsafeCopyMemory(destination, ablaUnsafeStringAddress(document.source) + begin, length)
+        return destination + length
+    }
+    if (kind == 1) return jsonEncodeStringAt(jsonTapeStringText(document, index), destination)
+    var at = destination
+    if (kind == 4) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(at), 91)
+        at = at + 1
+        val end = tape[index + 3]
+        var child = index + 4
+        while (child < end) {
+            if (child > index + 4) {
+                ablaUnsafeStoreU8(nativePointerFromAddress(at), 44)
+                at = at + 1
+            }
+            at = jsonTapeEncodeAt(edits, child, at)
+            child = tape[child + 3]
+        }
+        ablaUnsafeStoreU8(nativePointerFromAddress(at), 93)
+        return at + 1
+    }
+    ablaUnsafeStoreU8(nativePointerFromAddress(at), 123)
+    at = at + 1
+    if (jsonEmitListed(edits, index)) {
+        val members = jsonEmitMembersOf(edits, index)
+        var position = 0
+        while (position < members.keys.size) {
+            if (position > 0) {
+                ablaUnsafeStoreU8(nativePointerFromAddress(at), 44)
+                at = at + 1
+            }
+            at = jsonEncodeStringAt(members.keys[position], at)
+            ablaUnsafeStoreU8(nativePointerFromAddress(at), 58)
+            at = if (members.tapeValues[position] >= 0) jsonTapeEncodeAt(edits, members.tapeValues[position], at + 1)
+                else jsonEncodeAt(members.jsonValues[position], at + 1)
+            position = position + 1
+        }
+    } else {
+        val end = tape[index + 3]
+        var member = index + 4
+        while (member < end) {
+            if (member > index + 4) {
+                ablaUnsafeStoreU8(nativePointerFromAddress(at), 44)
+                at = at + 1
+            }
+            at = jsonEncodeStringAt(jsonTapeStringText(document, member), at)
+            ablaUnsafeStoreU8(nativePointerFromAddress(at), 58)
+            at = jsonTapeEncodeAt(edits, member + 4, at + 1)
+            member = tape[member + 7]
+        }
+    }
+    ablaUnsafeStoreU8(nativePointerFromAddress(at), 125)
+    at + 1
+}
+
 // The node as jsonParse's tree: equal kind by kind, member by member, to what
 // jsonParse built for these bytes under the document's limits (null for a
 // missing node).

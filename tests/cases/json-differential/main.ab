@@ -86,6 +86,116 @@ fun differentialCursor(node: JsonNode, value: Json): bool {
     index == value.size() && !cursor.next()
 }
 
+// One object's edits, on keys and values as jsonParse's object holds them: set
+// replaces the last member's value or appends; delete removes every member.
+fun differentialSet(var keys: array<string>, var values: array<Json>, key: string, value: Json): void {
+    var last = -1
+    var index = 0
+    while (index < keys.size) {
+        if (keys[index] == key) last = index
+        index = index + 1
+    }
+    if (last >= 0) values[last] = value
+    else {
+        keys.append(key)
+        values.append(value)
+    }
+    return
+}
+
+fun differentialDelete(keys: array<string>, values: array<Json>, key: string): array<int> {
+    val kept: array<int> = []
+    var index = 0
+    while (index < keys.size) {
+        if (keys[index] != key) kept.append(index)
+        index = index + 1
+    }
+    kept
+}
+
+// The edit script, on every even-numbered object (in document order) below 60:
+// set the first key (the last member with it, when it repeats), add a key,
+// delete the second key, set and delete a key, delete the added key and set it
+// again.
+fun differentialScript(ordinal: int): bool = ordinal % 2 == 0 && ordinal < 60
+
+fun differentialEditTree(value: Json, var counter: array<int>): Json {
+    if (value.kind == 4) {
+        val values: array<Json> = []
+        for (element in value.values) values.append(differentialEditTree(element, counter))
+        return Json(4, "", 0, false, [], values, value.numberValue)
+    }
+    if (value.kind != 5) return value
+    val ordinal = counter[0]
+    counter[0] = ordinal + 1
+    var keys: array<string> = []
+    var values: array<Json> = []
+    for (key in value.keys) keys.append(key)
+    for (element in value.values) values.append(differentialEditTree(element, counter))
+    if (differentialScript(ordinal)) {
+        val first = if (value.keys.size > 0) value.keys[0] else "k0"
+        val second = if (value.keys.size > 1) value.keys[1] else "none"
+        differentialSet(keys, values, first, jsonBoolean(true))
+        differentialSet(keys, values, "added", jsonString("a\u0001b\u00e9"))
+        for (step in 0 until 3) {
+            val key = if (step == 0) second else if (step == 1) "tmp" else "added"
+            if (step == 1) differentialSet(keys, values, "tmp", jsonInteger(1))
+            val kept = differentialDelete(keys, values, key)
+            val keptKeys: array<string> = []
+            val keptValues: array<Json> = []
+            for (index in kept) {
+                keptKeys.append(keys[index])
+                keptValues.append(values[index])
+            }
+            keys = keptKeys
+            values = keptValues
+        }
+        differentialSet(keys, values, "added", jsonNull())
+    }
+    Json(5, "", 0, false, keys, values, value.numberValue)
+}
+
+fun differentialEditNode(var edits: JsonEdits, node: JsonNode, var counter: array<int>): void {
+    if (node.kind() == 4) {
+        var index = 0
+        while (index < node.size()) {
+            differentialEditNode(edits, node.at(index), counter)
+            index = index + 1
+        }
+        return
+    }
+    if (node.kind() != 5) return
+    val ordinal = counter[0]
+    counter[0] = ordinal + 1
+    if (differentialScript(ordinal)) {
+        val first = if (node.size() > 0) node.keyAt(0) else "k0"
+        val second = if (node.size() > 1) node.keyAt(1) else "none"
+        edits.set(node, first, jsonBoolean(true))
+        edits.set(node, "added", jsonString("a\u0001b\u00e9"))
+        edits.delete(node, second)
+        edits.set(node, "tmp", jsonInteger(1))
+        edits.delete(node, "tmp")
+        edits.delete(node, "added")
+        edits.set(node, "added", jsonNull())
+    }
+    var index = 0
+    while (index < node.size()) {
+        differentialEditNode(edits, node.at(index), counter)
+        index = index + 1
+    }
+    return
+}
+
+// The document written back (as jsonStringify writes jsonParse's tree), and with
+// the edit script (as jsonStringify writes the tree with it applied).
+fun differentialEmits(document: JsonDocument, value: Json): bool {
+    if (document.emit() != jsonStringify(value)) return false
+    var edits = document.edits()
+    differentialEditNode(edits, document.root(), [0])
+    val expected = jsonStringify(differentialEditTree(value, [0]))
+    edits.emit() == expected && jsonStringify(edits.toJson()) == expected
+}
+
 fun differentialParse(input: string, limits: JsonLimits): string {
     val parsed = jsonParse(input, limits)
     var hash = differentialHash(-3750763034362895579, parsed.error.message)
@@ -108,7 +218,8 @@ fun differentialParse(input: string, limits: JsonLimits): string {
     if (documented && parsed.succeeded) {
         val root = document.document.root()
         documented = jsonStringify(root.toJson()) == jsonStringify(parsed.value) &&
-            differentialSame(root, parsed.value) && root.raw().size > 0
+            differentialSame(root, parsed.value) && root.raw().size > 0 &&
+            differentialEmits(document.document, parsed.value)
     }
     val tape = if (documented) "" else " D ${third.code}@${third.byteOffset}"
     "P ${differentialError(error.code, error.byteOffset)}:${error.line}:${error.column} $hash$validate$tape"
@@ -189,7 +300,8 @@ fun differentialDocuments(): array<string> {
         "{}",
         "[]",
         "  ",
-        "{\"a\":[{\"b\":[{\"c\":[1,2,{\"d\":\"\\ud800\"}]}]}]}"
+        "{\"a\":[{\"b\":[{\"c\":[1,2,{\"d\":\"\\ud800\"}]}]}]}",
+        "{\"a\":1,\"b\":{\"x\":1,\"x\":2,\"y\":[{\"z\":1,\"z\":{\"q\":1,\"q\":2}}]},\"a\":3,\"b\":0}"
     ]
 }
 
