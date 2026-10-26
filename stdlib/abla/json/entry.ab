@@ -2259,6 +2259,15 @@ fun jsonAppendStringPortable(var output: ByteBuffer, value: string): bool {
 // span. The portable writer is the evaluator's; it is not in a runtime build.
 @noinline
 trusted fun jsonAppendEscapedNative(var output: ByteBuffer, value: string): void {
+    val length = jsonEscapedSize(value)
+    jsonWriteEscapedAt(value, output.stageReserve(length))
+    output.staged = output.staged + length
+    output.byteCount = output.byteCount + length
+    return
+}
+
+// The bytes `value` takes as a quoted, escaped JSON string.
+trusted fun jsonEscapedSize(value: string): int {
     val size = value.size
     val source = ablaUnsafeStringAddress(value)
     var length = 2
@@ -2270,10 +2279,16 @@ trusted fun jsonAppendEscapedNative(var output: ByteBuffer, value: string): void
             else if (byte < 32) 6 else 1)
         index = index + 1
     }
-    val destination = output.stageReserve(length)
+    length
+}
+
+// Writes `value` quoted and escaped at `destination` (jsonEscapedSize bytes).
+trusted fun jsonWriteEscapedAt(value: string, destination: int): void {
+    val size = value.size
+    val source = ablaUnsafeStringAddress(value)
     ablaUnsafeStoreU8(nativePointerFromAddress(destination), 34)
     var written = 1
-    index = 0
+    var index = 0
     while (index < size) {
         val byte = ablaUnsafeLoadU8(nativePointerFromAddress(source + index))
         if (byte == 34 || byte == 92 || byte < 32) {
@@ -2302,8 +2317,6 @@ trusted fun jsonAppendEscapedNative(var output: ByteBuffer, value: string): void
         index = index + 1
     }
     ablaUnsafeStoreU8(nativePointerFromAddress(destination + written), 34)
-    output.staged = output.staged + length
-    output.byteCount = output.byteCount + length
     return
 }
 
@@ -2598,7 +2611,7 @@ private fun jsonWriteValue(var writer: JsonWriter, value: Json): void {
     if (value.kind == 0) writer.output.appendText("null")
     else if (value.kind == 1) jsonWriteString(writer, value.stringValue)
     else if (value.kind == 2) {
-        if (jsonNumberGrammar(value.numberValue.text).valid) {
+        if (jsonNumberKind(value.numberValue.text) >= 0) {
             writer.output.appendText(value.numberValue.text)
         } else writer.valid = false
     } else if (value.kind == 3) {
@@ -2628,9 +2641,130 @@ private fun jsonWriteValue(var writer: JsonWriter, value: Json): void {
 }
 
 fun jsonStringify(value: Json): string {
-    val writer = JsonWriter(byteBuffer(), true)
-    jsonWriteValue(writer, value)
-    if (writer.valid) writer.output.toText() else "null"
+    if (ablaAtCompileTime()) {
+        val writer = JsonWriter(byteBuffer(), true)
+        jsonWriteValue(writer, value)
+        return if (writer.valid) writer.output.toText() else "null"
+    }
+    // Compiled code sizes the text first (which also finds anything that can't
+    // be written: the result is then "null", as the writer gives), then writes it
+    // into one allocation of that size: no buffer of pieces, no copy at the end.
+    val size = jsonEncodedSize(value)
+    if (size < 0) "null" else jsonEncodeSized(value, size)
+}
+
+// The bytes jsonStringify writes for `value`, or -1 when it can't be written (a
+// string that isn't valid UTF-8, a number that isn't JSON's, an object whose keys
+// and values differ in count, an unknown kind).
+private fun jsonEncodedSize(value: Json): int {
+    val kind = value.kind
+    if (kind == 0) return 4
+    if (kind == 1) return jsonStringEncodedSize(value.stringValue)
+    if (kind == 2) {
+        val text = value.numberValue.text
+        return if (jsonNumberKind(text) >= 0) text.size else -1
+    }
+    if (kind == 3) return if (value.boolValue) 4 else 5
+    if (kind == 4) {
+        val values = value.values
+        var total = if (values.size > 0) 1 + values.size else 2
+        for (element in values) {
+            val size = jsonEncodedSize(element)
+            if (size < 0) return -1
+            total = total + size
+        }
+        return total
+    }
+    if (kind == 5) {
+        val keys = value.keys
+        val values = value.values
+        if (keys.size != values.size) return -1
+        var total = if (keys.size > 0) 1 + keys.size * 2 else 2
+        var index = 0
+        while (index < keys.size) {
+            val keySize = jsonStringEncodedSize(keys[index])
+            if (keySize < 0) return -1
+            val size = jsonEncodedSize(values[index])
+            if (size < 0) return -1
+            total = total + keySize + size
+            index = index + 1
+        }
+        return total
+    }
+    -1
+}
+
+private fun jsonStringEncodedSize(value: string): int {
+    if (jsonStringIsPlain(value)) return value.size + 2
+    if (!value.isValidUtf8()) return -1
+    jsonEscapedSize(value)
+}
+
+// `value`, which jsonEncodedSize sized at `size` bytes, written into a string of
+// exactly that size.
+trusted fun jsonEncodeSized(value: Json, size: int): string {
+    val buffer = nativeByteBuffer(size + 1)
+    val written = jsonEncodeAt(value, nativePointerAddress(buffer.address))
+    buffer.adoptString(written - nativePointerAddress(buffer.address))
+}
+
+// Writes `value` (sized and checked by jsonEncodedSize) at `destination`: the
+// address after it.
+trusted fun jsonEncodeAt(value: Json, destination: int): int {
+    val kind = value.kind
+    if (kind == 0) return jsonEncodeTokenAt("null", destination)
+    if (kind == 1) return jsonEncodeStringAt(value.stringValue, destination)
+    if (kind == 2) return jsonEncodeTokenAt(value.numberValue.text, destination)
+    if (kind == 3) return jsonEncodeTokenAt(if (value.boolValue) "true" else "false", destination)
+    var at = destination
+    if (kind == 4) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(at), 91)
+        at = at + 1
+        var index = 0
+        for (element in value.values) {
+            if (index > 0) {
+                ablaUnsafeStoreU8(nativePointerFromAddress(at), 44)
+                at = at + 1
+            }
+            at = jsonEncodeAt(element, at)
+            index = index + 1
+        }
+        ablaUnsafeStoreU8(nativePointerFromAddress(at), 93)
+        return at + 1
+    }
+    ablaUnsafeStoreU8(nativePointerFromAddress(at), 123)
+    at = at + 1
+    val keys = value.keys
+    val values = value.values
+    var index = 0
+    while (index < keys.size) {
+        if (index > 0) {
+            ablaUnsafeStoreU8(nativePointerFromAddress(at), 44)
+            at = at + 1
+        }
+        at = jsonEncodeStringAt(keys[index], at)
+        ablaUnsafeStoreU8(nativePointerFromAddress(at), 58)
+        at = jsonEncodeAt(values[index], at + 1)
+        index = index + 1
+    }
+    ablaUnsafeStoreU8(nativePointerFromAddress(at), 125)
+    at + 1
+}
+
+trusted fun jsonEncodeTokenAt(text: string, destination: int): int {
+    ablaUnsafeCopyMemory(destination, ablaUnsafeStringAddress(text), text.size)
+    destination + text.size
+}
+
+trusted fun jsonEncodeStringAt(value: string, destination: int): int {
+    if (jsonStringIsPlain(value)) {
+        ablaUnsafeStoreU8(nativePointerFromAddress(destination), 34)
+        ablaUnsafeCopyMemory(destination + 1, ablaUnsafeStringAddress(value), value.size)
+        ablaUnsafeStoreU8(nativePointerFromAddress(destination + value.size + 1), 34)
+        return destination + value.size + 2
+    }
+    jsonWriteEscapedAt(value, destination)
+    destination + jsonEscapedSize(value)
 }
 
 compile fun ablaJsonSyntaxCall(
