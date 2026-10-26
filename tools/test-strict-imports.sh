@@ -89,6 +89,12 @@ runs "$output_directory/value-named-strict" "5"
 # suggested by the module that declares it, not by the one the program wrote.
 rejected "$cases/through-library.ab" --strict-imports \
     '`utf8Encode` is declared in' 'help: add: import "abla/text"'
+# Built by a path relative to another directory (`ablac build ../main.ab`
+# from lib/): the package is still strict, and the import is spelled from
+# the module that needs it.
+(compiler=$(cd "$(dirname "$compiler")" && pwd)/$(basename "$compiler")
+cd "$cases/nested/lib" && rejected ../main.ab "" \
+    'error[E_NAME_NOT_IMPORTED]: `thing` is declared in' 'help: add: import "../shared/thing.ab"')
 # A type inside generic arguments or a function type names a type too.
 "$compiler" build "$cases/generic-types/main.ab" -o "$output_directory/generic-types" \
     --no-cache --strict-imports
