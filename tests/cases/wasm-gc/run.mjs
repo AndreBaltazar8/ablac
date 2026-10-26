@@ -43,6 +43,7 @@ const summary = {
 };
 console.log(JSON.stringify(summary));
 if (summary.liveBytes > 1e6) throw new Error("live bytes did not stay flat");
+if (collecting.census() !== 1n) throw new Error("the heap census disagrees with the live bytes");
 if (peakBytes * 4 > reference.memory.buffer.byteLength) {
     throw new Error("collecting instance memory was not bounded");
 }

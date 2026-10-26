@@ -242,6 +242,15 @@ negative values or a value below current live usage, and fails before asking
 the platform allocator for memory. Native resource allocations are pinned
 until explicit ownership drop or region reset.
 
+`memoryCensus()` says what the tracked heap holds, for diagnostics: per
+allocation layout (strings' bytes, arrays, class instances, ...) how many
+allocations and their payload bytes, which add up to `memoryLiveBytes()`;
+the instances' declared fields by the tag of the value each holds; and what
+the allocations cost past their payloads (their headers, and on Wasm the
+allocator's block headers and size-class rounding). It walks the heap once
+and collects nothing, so call `memoryCollect()` first to count only what is
+reachable.
+
 Collection has two modes:
 
 - **Pressure collection** (the default for hosted native programs with

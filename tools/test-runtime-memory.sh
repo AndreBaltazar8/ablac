@@ -120,6 +120,16 @@ ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
 host_collector_status=$?
 set -e
 [[ $host_collector_status -eq 42 ]] || exit 1
+census_program="$directory/census-program"
+"$compiler" build \
+    "$project_root/tests/cases/modules/runtime-memory-census.ab" \
+    -o "$census_program"
+set +e
+ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
+    "$project_root/tools/run-limited.sh" "$census_program"
+census_status=$?
+set -e
+[[ $census_status -eq 42 ]] || exit 1
 # Reachable data kept just under the limit: the program stops with the limit's
 # panic, in seconds, instead of collecting at nearly every allocating call.
 near_limit_program="$directory/near-limit-program"
@@ -135,4 +145,4 @@ set -e
 [[ $near_limit_status -eq 101 ]] || exit 1
 rg -q 'memory limit exceeded' "$directory/near-limit.err"
 printf '%s\n' \
-    'portable memory runtime: direct declarations + pressure safe points + limits + pure/host collection + bootstrapped global containers passed'
+    'portable memory runtime: direct declarations + pressure safe points + limits + pure/host collection + census + bootstrapped global containers passed'
