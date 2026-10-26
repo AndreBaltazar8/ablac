@@ -302,10 +302,13 @@ var bootstrapIrSourceFiles: array<string> = []
 var bootstrapIrSourcePosition: int = -1
 var bootstrapIrSourceFile: int = -1
 var bootstrapIrSourceLabel: string = ""
-// The lowered name of the function (or global) whose body is being lowered:
-// its lambdas are named after it, so lambdas at the same span in two files,
-// or in two instances of one generic, don't share a symbol.
+// The lowered name of the function (or global) whose body is being lowered,
+// and its span: its lambdas are named after it and their span within it, so
+// lambdas at the same span in two files, or in two instances of one generic,
+// don't share a symbol, and an edit outside it doesn't rename them.
 var bootstrapIrLambdaOwner: string = ""
+var bootstrapIrLambdaOwnerBegin: int = 0
+var bootstrapIrLambdaOwnerEnd: int = 0
 
 fun bootstrapIrSourceFileIndex(identity: string): int {
     // An instance of a generic is in its generic's file (generics.ab).
@@ -7777,11 +7780,13 @@ class BootstrapLowerer(
         val savedSourcePosition = bootstrapIrSourcePosition
         val savedSourceLabel = bootstrapIrSourceLabel
         val savedLambdaOwner = bootstrapIrLambdaOwner
+        val savedLambdaOwnerBegin = bootstrapIrLambdaOwnerBegin
+        val savedLambdaOwnerEnd = bootstrapIrLambdaOwnerEnd
         bootstrapIrSourceFile = if (declaration.generatedNamespace != "") -1
             else bootstrapIrSourceFileIndex(declaration.sourceIdentity)
-        bootstrapIrLambdaOwner = if (declaration.extensionOwner != "")
-            "extension_${declaration.extensionOwner}_${declaration.name}"
-            else declaration.name
+        bootstrapIrLambdaOwner = bootstrapLambdaOwnerName(declaration)
+        bootstrapIrLambdaOwnerBegin = declaration.begin
+        bootstrapIrLambdaOwnerEnd = declaration.end
         val functionPosition = bootstrapIrSourcePositionOf(
             bootstrapIrSourceFile, declaration.begin
         )
@@ -7921,6 +7926,8 @@ class BootstrapLowerer(
         bootstrapIrSourcePosition = savedSourcePosition
         bootstrapIrSourceLabel = savedSourceLabel
         bootstrapIrLambdaOwner = savedLambdaOwner
+        bootstrapIrLambdaOwnerBegin = savedLambdaOwnerBegin
+        bootstrapIrLambdaOwnerEnd = savedLambdaOwnerEnd
         val loweringErrors = functionLowerer.errors - this.errors
         val reportedFunction = BootstrapIrFunction(
             loweredFunction.name,
@@ -7981,7 +7988,11 @@ class BootstrapLowerer(
         val savedSourcePosition = bootstrapIrSourcePosition
         val savedSourceLabel = bootstrapIrSourceLabel
         val savedLambdaOwner = bootstrapIrLambdaOwner
-        bootstrapIrLambdaOwner = "${owner.name}_${method.name}"
+        val savedLambdaOwnerBegin = bootstrapIrLambdaOwnerBegin
+        val savedLambdaOwnerEnd = bootstrapIrLambdaOwnerEnd
+        bootstrapIrLambdaOwner = bootstrapLambdaMethodOwnerName(owner, method)
+        bootstrapIrLambdaOwnerBegin = method.begin
+        bootstrapIrLambdaOwnerEnd = method.end
         bootstrapIrSourceFile = if (method.generatedNamespace != "" ||
             owner.generatedNamespace != "") -1
             else bootstrapIrSourceFileIndex(
@@ -8104,6 +8115,8 @@ class BootstrapLowerer(
         bootstrapIrSourcePosition = savedSourcePosition
         bootstrapIrSourceLabel = savedSourceLabel
         bootstrapIrLambdaOwner = savedLambdaOwner
+        bootstrapIrLambdaOwnerBegin = savedLambdaOwnerBegin
+        bootstrapIrLambdaOwnerEnd = savedLambdaOwnerEnd
         val loweringErrors = methodLowerer.errors - this.errors
         val reportedMethod = BootstrapIrFunction(
             loweredMethod.name,
@@ -8481,10 +8494,16 @@ class BootstrapLowerer(
                     bootstrapIrSourceFile, declaration.begin
                 )
                 val savedLambdaOwner = bootstrapIrLambdaOwner
-                bootstrapIrLambdaOwner = declaration.name
+                val savedLambdaOwnerBegin = bootstrapIrLambdaOwnerBegin
+                val savedLambdaOwnerEnd = bootstrapIrLambdaOwnerEnd
+                bootstrapIrLambdaOwner = bootstrapLambdaOwnerName(declaration)
+                bootstrapIrLambdaOwnerBegin = declaration.begin
+                bootstrapIrLambdaOwnerEnd = declaration.end
                 val value = this.lowerExpression(declaration.expression)
                 this.emit("global.store", value, -1, declaration.name)
                 bootstrapIrLambdaOwner = savedLambdaOwner
+                bootstrapIrLambdaOwnerBegin = savedLambdaOwnerBegin
+                bootstrapIrLambdaOwnerEnd = savedLambdaOwnerEnd
                 bootstrapIrSourceFile = -1
                 bootstrapIrSourcePosition = -1
             }
@@ -9086,20 +9105,34 @@ fun bootstrapLowerLambdaFunction(
     lambdaLowerer.emitOwnedParameterDrops()
     lowerer.errors = lambdaLowerer.errors
     // Transactional declaration sinks restart their local function
-    // index. Source spans keep lambda symbols deterministic and unique
-    // across independently committed declarations. They are the lambda's
-    // span in its file, not in the module's rewritten source, whose
-    // prefixed names spell the module's path: so the symbol doesn't depend
-    // on where the file is. The owner's lowered name ends it: spans repeat
-    // across files, and in each instance of a generic.
-    val lambdaFile = if (symbolPrefix != "") {
-        bootstrapLiftLambdaSource(lowerer.declarations, expression)
-    } else if (bootstrapIrSourceFile >= 0) {
-        bootstrapIrSourceFiles[bootstrapIrSourceFile]
-    } else ""
+    // index. A lambda is named after its owner, the function, method or
+    // global whose body holds it, by the owner's lowered name (unique in the
+    // program: lambdas at the same span in two files, or in two instances of
+    // one generic, don't share a symbol), and its span within the owner: an
+    // edit outside the owner (a line or an import above it) leaves the name
+    // alone. Spans are in the file, not in the module's rewritten source,
+    // whose prefixed names spell the module's path: so the symbol doesn't
+    // depend on where the file is. A lambda the owner being lowered doesn't
+    // hold (a compile-time value's, lifted) is named after the declaration
+    // that does; one no declaration holds, after its span in its file.
+    var lambdaOwner = bootstrapIrLambdaOwner
+    var ownerBegin = bootstrapIrLambdaOwnerBegin
+    var lambdaFile = if (symbolPrefix == "" && bootstrapIrSourceFile >= 0)
+        bootstrapIrSourceFiles[bootstrapIrSourceFile] else ""
+    if (symbolPrefix != "" || lambdaOwner == "" ||
+        expression.begin < bootstrapIrLambdaOwnerBegin ||
+        expression.end > bootstrapIrLambdaOwnerEnd) {
+        val holder = bootstrapLambdaOwnerOf(lowerer.declarations, expression)
+        if (holder != null) {
+            lambdaOwner = holder.name
+            ownerBegin = holder.begin
+            lambdaFile = holder.source
+        } else lambdaOwner = ""
+    }
     val lambdaRewrite = bootstrapSourceRewriteOf(lambdaFile)
+    val lambdaBase = if (lambdaOwner == "") 0 else lambdaRewrite.original(ownerBegin)
     val lambdaName =
-        "${symbolPrefix}lambda_${lambdaRewrite.original(expression.begin)}_${lambdaRewrite.originalEnd(expression.end)}_${lowerer.functions.size}${if (bootstrapIrLambdaOwner == "") "" else "__$bootstrapIrLambdaOwner"}"
+        "${symbolPrefix}lambda_${lambdaRewrite.original(expression.begin) - lambdaBase}_${lambdaRewrite.originalEnd(expression.end) - lambdaBase}_${lowerer.functions.size}${if (lambdaOwner == "") "" else "__$lambdaOwner"}"
     val lambdaFunction = bootstrapFinalizeIrFunction(
         lambdaName,
         lambdaParameters,
