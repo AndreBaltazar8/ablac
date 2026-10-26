@@ -85,6 +85,10 @@ runs "$output_directory/value-named" "5"
 "$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named-strict" \
     --no-cache --strict-imports
 runs "$output_directory/value-named-strict" "5"
+# A type inside generic arguments or a function type names a type too.
+"$compiler" build "$cases/generic-types/main.ab" -o "$output_directory/generic-types" \
+    --no-cache --strict-imports
+runs "$output_directory/generic-types" "5 2 1 3"
 # A library module's other file isn't API: a flat program's report names the
 # entry module that reaches it, and a strict program is told it's internal.
 "$compiler" build "$cases/internal.ab" -o "$output_directory/internal" --no-cache \
