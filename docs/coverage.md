@@ -62,7 +62,7 @@ Test scripts marked † run in no suite: neither the Makefile `test` target nor
 | `Shared` views, `Borrow<T>`, `borrow(...)` results | `sema.ab` | [ownership.md#borrowed-views-and-borrow-results](ownership.md#borrowed-views-and-borrow-results) | good | test-borrow-lifetimes |
 | `Cell`, `Shared`, `Weak`, `Mutex` | `sema.ab`, runtime | [ownership.md#sharing-cell-shared-weak-mutex](ownership.md#sharing-cell-shared-weak-mutex) | good | test-shared-ownership, test-mutex, interior-cell (native) |
 | `Fn`/`FnMut`/`FnOnce`/`FnNoEscape`, `move { }` | `sema.ab` | [ownership.md#closures-and-ownership](ownership.md#closures-and-ownership) | good | test-callable-families, test-scoped-region |
-| Regions | `parser.ab`, `sema.ab` | [regions.md](regions.md) | good | test-scoped-region, scoped-region (native) |
+| Regions | `parser.ab`, `sema.ab` | [regions.md](regions.md) | good | test-scoped-region, test-region-extension-names, scoped-region (native) |
 
 ## Compile time
 
