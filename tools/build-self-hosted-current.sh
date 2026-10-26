@@ -49,6 +49,30 @@ if [[ $("$compiler" --version) == "ablac 0.2.20" ]]; then
         "$compiler" "$bridge_directory/ablac" "$source_directory/src/orc_main.ab"
     compiler="$bridge_directory/ablac"
 fi
+# The runtime keeps only typed instances, which a compiler from before them
+# (v0.2.22, and the checkpoint above) does not make. Such a compiler first
+# builds these sources against a copy of the standard library whose runtime
+# also keeps the older layout (tools/bootstrap-untyped-objects.patch); that
+# compiler makes typed instances and builds the result.
+mkdir -p "$project_root/build"
+objects_directory=$(mktemp -d "$project_root/build/bootstrap-objects.XXXXXX")
+trap 'rm -rf -- "$objects_directory" ${bridge_directory:+"$bridge_directory"}' EXIT
+probe_status=0
+ABLA_COMPILER_PAYLOAD=$compiler ABLA_SYSROOT=$project_root ABLA_MAX_SECONDS=120 \
+    "$project_root/tools/run-limited-compiler.sh" build \
+    "$project_root/tools/bootstrap-typed-instances.ab" -o "$objects_directory/probe" \
+    --no-cache > "$objects_directory/probe.log" 2>&1 || { cat "$objects_directory/probe.log" >&2; exit 1; }
+ABLA_MAX_SECONDS=60 "$project_root/tools/run-limited.sh" "$objects_directory/probe" \
+    > /dev/null 2>&1 || probe_status=$?
+if [[ $probe_status -ne 42 ]]; then
+    cp -R "$project_root/stdlib" "$objects_directory/stdlib"
+    patch -p1 -s -d "$objects_directory" < "$project_root/tools/bootstrap-untyped-objects.patch"
+    echo "bootstrapping typed instances through the older object layout"
+    ABLA_STDLIB="$objects_directory/stdlib" \
+        "$project_root/tools/build-self-hosted-release.sh" \
+        "$compiler" "$objects_directory/ablac" "$entry"
+    compiler="$objects_directory/ablac"
+fi
 
 "$project_root/tools/build-self-hosted-release.sh" \
     "$compiler" "$output" "$entry"

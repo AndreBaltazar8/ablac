@@ -15,6 +15,9 @@ executed by the matching Mac release gate.
 published ablac binary
         |
         v
+current src/*.ab, a runtime with both object layouts -> bridge compiler
+        |   (only while the published binary predates typed instances,
+        v    see "Typed instance layout")
 current src/*.ab -> build/ablac.bin
         |
         v
@@ -116,11 +119,15 @@ behind a 16-byte header naming the class's descriptor, where they used to be
 32-byte slots of a symbol and a boxed value. The code generator and the
 runtime changed together: generated code passes a field's place (offset, kind
 and tag, bit 48 set) where it used to pass its index, and a class's descriptor
-(+ 2^62) where it passed its field count. A stage-1 compiler is built by a
-seed whose code generator still makes the older calls, so the runtime keeps
-the older layout for the code such a compiler made: each instance says which
-layout it has (a typed instance's first word is its descriptor + 2^62), and
-the older calls are told apart by those bits. Stage 2 and everything it builds
-make typed instances only. Once the seed makes typed instances, the older
-layout's paths are removed from the runtime.
-
+(+ 2^62) where it passed its field count. The runtime that made both layouts
+(for a stage-1 compiler whose seed still made the older calls) was the bridge;
+this runtime makes typed instances only. A compiler from before typed
+instances (the v0.2.22 bootstrap release is one) can't build a compiler that
+runs on it: its code would pass field counts, on which the runtime traps. So
+`tools/build-self-hosted-current.sh` first builds and runs
+`tools/bootstrap-typed-instances.ab` with the compiler it starts from; when
+that doesn't exit 42, the compiler builds the sources once against a copy of
+the standard library whose runtime also keeps the older layout
+(`tools/bootstrap-untyped-objects.patch`), and the compiler that comes out of
+it builds the result. Once the bootstrap release makes typed instances, that
+step goes.

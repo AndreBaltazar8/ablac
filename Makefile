@@ -34,7 +34,8 @@ $(BUILD_DIR):
 # tools/bootstrap-compiler.sh. It immediately rebuilds the current source graph,
 # so src/*.ab remains the only compiler implementation in the repository.
 $(COMPILER_PAYLOAD): $(COMPILER_SOURCES) tools/build-self-hosted-release.sh \
-		tools/build-self-hosted-current.sh \
+		tools/build-self-hosted-current.sh tools/bootstrap-typed-instances.ab \
+		tools/bootstrap-untyped-objects.patch \
 		| $(BUILD_DIR) tools/bootstrap-compiler.sh
 	@if test ! -x $@; then tools/bootstrap-compiler.sh $@; fi
 	$(install_launcher)
@@ -307,6 +308,7 @@ test-serial: ablac
 	tools/test-object-layout.sh $(COMPILER)
 	tools/test-cache-layout-version.sh $(COMPILER)
 	tools/test-loop-safe-point.sh $(COMPILER)
+	tools/test-bootstrap-untyped-objects.sh $(COMPILER)
 
 check: test self-rebuild
 

@@ -28,7 +28,7 @@ ARG LLVM_VERSION=23
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg lsb-release wget software-properties-common \
-        make git libssl-dev libffi-dev libedit-dev zlib1g-dev \
+        make git patch libssl-dev libffi-dev libedit-dev zlib1g-dev \
     && wget -q https://apt.llvm.org/llvm.sh \
     && bash llvm.sh ${LLVM_VERSION} \
     && apt-get install -y --no-install-recommends \
@@ -40,7 +40,9 @@ FROM toolchain AS compiler
 COPY --from=ablac . /opt/ablac
 WORKDIR /opt/ablac
 # The published bootstrap compiler was linked inside the Nix toolchain shell;
-# point its ELF interpreter path at the system loader.
+# point its ELF interpreter path at the system loader. The current sources
+# build through tools/build-self-hosted-current.sh, which adds the steps an
+# older compiler needs (IN_NIX_SHELL: the image is the toolchain shell).
 RUN rm -rf build && tools/bootstrap-compiler.sh build/ablac.bin \
     && interpreter=$(readelf -l build/ablac.bin | sed -n 's/.*interpreter: \(.*\)]/\1/p') \
     && if [ -n "$interpreter" ] && [ ! -e "$interpreter" ]; then \
@@ -55,9 +57,9 @@ RUN rm -rf build && tools/bootstrap-compiler.sh build/ablac.bin \
            && mv build/ablac-step build/ablac.bin && rm -f build/ablac-step.ll || exit 1; \
        done \
     && rm -rf bootstrap-chain \
-    && ABLA_SYSROOT=/opt/ablac ABLA_MAX_MEMORY_MB=6000 ABLA_MAX_SECONDS=3000 \
-        tools/run-limited.sh build/ablac.bin build src/orc_main.ab \
-        -o build/ablac-current --no-cache \
+    && IN_NIX_SHELL=image ABLA_RELEASE_SELFHOST_BUILD_MEMORY_MB=6000 \
+        ABLA_RELEASE_SELFHOST_BUILD_SECONDS=3000 \
+        tools/build-self-hosted-current.sh build/ablac.bin build/ablac-current \
     && mv build/ablac-current build/ablac.bin \
     && rm -f build/ablac-current.ll
 

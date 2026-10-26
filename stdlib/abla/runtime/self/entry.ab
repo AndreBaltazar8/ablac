@@ -2643,7 +2643,8 @@ trusted fun __ablaRuntimeArraySetOther(array: int, index: int, element: any): vo
 //   4 a reference, 8 bytes (the one word of a value whose tag the type fixes);
 //   5 a nullable reference, 8 bytes (0 is null).
 // Typed accesses carry the field's place: its offset (bits 0-31), kind (32-39),
-// tag (40-47) and bit 48 set. An instance starts zeroed; construction then
+// tag (40-47) and bit 48 set (what told it from the index an older layout's
+// code passed). An instance starts zeroed; construction then
 // stores every declared field (object.create through
 // __ablaRuntimeFieldInitialize, the compile-time lift by name).
 //
@@ -2665,20 +2666,6 @@ trusted fun __ablaRuntimeArraySetOther(array: int, index: int, element: any): vo
 // it copies it: the new array is published only once whole, and the old one is
 // left to the collector, since another thread may still read it.
 //
-// Until every compiler that builds this runtime makes typed instances, it also
-// keeps the layout before them, for code an older compiler made (a bootstrap's
-// first stage): a 32-byte header (+0 the class's symbol, +8 how many inline
-// slots hold a field, +16 how many it has, +24 its overflow), then 32-byte
-// inline slots (a symbol word, then a value), the declared fields in
-// declaration order. Such code passes a field's index where a place goes
-// (below bit 48) and a field count where a descriptor goes (below bit 62). A
-// typed instance's first word is its descriptor + 2^62, an untyped one's its
-// class's symbol (below 2^31), so each instance says which it is.
-// Whether `object` is a typed instance.
-@inline
-trusted fun __ablaRuntimeObjectTyped(object: int): bool =
-    ablaRuntimeLoadI64(object) >= 4611686018427387904
-
 @inline
 trusted fun __ablaRuntimeObjectDescriptor(object: int): int =
     ablaRuntimeLoadI64(object) - 4611686018427387904
@@ -2701,20 +2688,19 @@ trusted fun __ablaRuntimeDescriptorPlace(descriptor: int, index: int): int {
 // The symbol of the class `object` is an instance of.
 @inline
 trusted fun __ablaRuntimeObjectSymbol(object: int): int =
-    if (__ablaRuntimeObjectTyped(object)) {
-        __ablaRuntimeDescriptorSymbol(__ablaRuntimeObjectDescriptor(object))
-    } else ablaRuntimeLoadI32(object)
+    __ablaRuntimeDescriptorSymbol(__ablaRuntimeObjectDescriptor(object))
 
 // The address of the word holding `object`'s overflow.
 @inline
-trusted fun __ablaRuntimeOverflowWord(object: int): int =
-    object + if (__ablaRuntimeObjectTyped(object)) 8 else 24
+trusted fun __ablaRuntimeOverflowWord(object: int): int = object + 8
 
-// `marked` is the descriptor + 2^62 (an older compiler passes the field count).
+// `marked` is the class's descriptor + 2^62, which the instance's first word
+// holds.
 trusted fun __ablaRuntimeObjectCreate(typeSymbol: int, marked: int): any {
-    if (marked < 4611686018427387904) return __ablaRuntimeObjectCreateUntyped(typeSymbol, marked)
     val descriptor = marked - 4611686018427387904
-    if (__ablaRuntimeDescriptorSymbol(descriptor) != typeSymbol) ablaRuntimeTrap()
+    if (descriptor <= 0 || __ablaRuntimeDescriptorSymbol(descriptor) != typeSymbol) {
+        ablaRuntimeTrap()
+    }
     val size = ablaRuntimeLoadI32(descriptor + 8)
     val object = __ablaRuntimeAllocateLayout(size, 5)
     var word = 0
@@ -2723,18 +2709,6 @@ trusted fun __ablaRuntimeObjectCreate(typeSymbol: int, marked: int): any {
         word = word + 8
     }
     ablaRuntimeStoreI64(object, marked)
-    ablaRuntimeMakeValue(8, 0, object, 0)
-}
-
-@noinline
-trusted fun __ablaRuntimeObjectCreateUntyped(typeSymbol: int, count: int): any {
-    if (count < 0) ablaRuntimeTrap()
-    val object = __ablaRuntimeAllocateLayout(32 + count * 32, 5)
-    // The whole word: its high half says the instance is untyped.
-    ablaRuntimeStoreI64(object, typeSymbol)
-    ablaRuntimeStoreI64(object + 8, 0)
-    ablaRuntimeStoreI64(object + 16, count)
-    ablaRuntimeStoreI64(object + 24, 0)
     ablaRuntimeMakeValue(8, 0, object, 0)
 }
 
@@ -2795,10 +2769,8 @@ trusted fun __ablaRuntimeFieldStore(object: int, place: int, fieldValue: any): v
     return
 }
 
-// The place of `object`'s declared field `symbol`, or -1 (an instance of the
-// untyped layout keeps its declared fields in its inline slots: -1).
+// The place of `object`'s declared field `symbol`, or -1.
 trusted fun __ablaRuntimeFieldPlace(object: int, symbol: int): int {
-    if (!__ablaRuntimeObjectTyped(object)) return -1
     val descriptor = __ablaRuntimeObjectDescriptor(object)
     val count = __ablaRuntimeDescriptorFields(descriptor)
     var index: int = 0
@@ -2811,24 +2783,14 @@ trusted fun __ablaRuntimeFieldPlace(object: int, symbol: int): int {
     -1
 }
 
-// The address of `object`'s slot holding `symbol` (an untyped instance's
-// inline slot, or an overflow slot), or 0.
+// The address of `object`'s overflow slot holding `symbol`, or 0.
 trusted fun __ablaRuntimeFieldSlot(object: int, symbol: int): int {
-    var index: int = 0
-    if (!__ablaRuntimeObjectTyped(object)) {
-        val count: int = ablaRuntimeLoadI64(object + 8)
-        while (index < count) {
-            val slot: int = object + 32 + index * 32
-            if (ablaRuntimeLoadI32(slot) == symbol) return slot
-            index = index + 1
-        }
-    }
     val overflow: int = ablaRuntimeLoadI64(__ablaRuntimeOverflowWord(object))
     if (overflow == 0) return 0
     val used: int = ablaRuntimeLoadI64(overflow + 16)
     // Orders the slots read below after the count another thread published.
     if (__ablaRuntimePlatformThreadsEnabled()) ablaRuntimeFence()
-    index = 1
+    var index: int = 1
     while (index <= used) {
         val slot: int = overflow + index * 32
         if (ablaRuntimeLoadI32(slot) == symbol) return slot
@@ -2948,30 +2910,18 @@ trusted fun __ablaRuntimeFieldGet(value: any, symbol: int): any {
 // declared fields. Such fields cannot move or be added dynamically, so do not
 // look up their symbols on every cursor/count/flag access. Nor check a scalar
 // field's kind: every field is a constructor parameter, stored (and lifted,
-// and set) only from a value of its declared type. (An untyped instance's
-// declared field `place` is its inline slot's index; its value's word is at
-// +16 of the slot.)
+// and set) only from a value of its declared type.
 @inline
 trusted fun __ablaRuntimeFieldAddressIndexed(value: any, place: int): int {
     val object = __ablaRuntimeWord0(value)
     if (object == 0 || place < 0) ablaRuntimeTrap()
-    if (place >= 281474976710656) object + (place & 4294967295)
-    else object + 32 + place * 32 + 16
+    object + (place & 4294967295)
 }
 
 trusted fun __ablaRuntimeFieldGetIndexed(value: any, symbol: int, place: int): any {
     val object = __ablaRuntimeWord0(value)
     if (object == 0 || place < 0) ablaRuntimeTrap()
-    if (place >= 281474976710656) __ablaRuntimeFieldLoad(object, place)
-    else {
-        val address = object + 32 + place * 32 + 8
-        ablaRuntimeMakeValue(
-            ablaRuntimeLoadSlotI32(address),
-            ablaRuntimeLoadSlotI32(address + 4),
-            ablaRuntimeLoadSlotI64(address + 8),
-            ablaRuntimeLoadSlotI64(address + 16)
-        )
-    }
+    __ablaRuntimeFieldLoad(object, place)
 }
 
 // A declared string field (kind 3) and a declared reference field (kind 4 or
@@ -3029,29 +2979,15 @@ trusted fun __ablaRuntimeFieldSetReference(
 trusted fun __ablaRuntimeFieldGetIndexedI64(value: any, symbol: int, place: int): int =
     ablaRuntimeLoadSlotI64(__ablaRuntimeFieldAddressIndexed(value, place))
 
-trusted fun __ablaRuntimeFieldGetIndexedBool(value: any, symbol: int, place: int): bool {
-    val address = __ablaRuntimeFieldAddressIndexed(value, place)
-    if (place >= 281474976710656) ablaRuntimeLoadSlotU8(address) != 0
-    else ablaRuntimeLoadSlotI64(address) != 0
-}
+trusted fun __ablaRuntimeFieldGetIndexedBool(value: any, symbol: int, place: int): bool =
+    ablaRuntimeLoadSlotU8(__ablaRuntimeFieldAddressIndexed(value, place)) != 0
 
 // Not inlined: inlined, it would let LLVM follow every constructor's stores
 // into later reads of the same instance; a game's client grew by 47 KB of
-// wasm (+1.3 KB with brotli) for no measurable speed. (`place` is the
-// field's symbol for an untyped instance: its next inline slot.)
+// wasm (+1.3 KB with brotli) for no measurable speed.
 @noinline
 trusted fun __ablaRuntimeFieldInitialize(value: any, place: int, fieldValue: any): int {
-    val object = __ablaRuntimeObjectAddress(value)
-    if (place >= 281474976710656) __ablaRuntimeFieldStore(object, place, fieldValue)
-    else {
-        val count = ablaRuntimeLoadI64(object + 8)
-        val capacity = ablaRuntimeLoadI64(object + 16)
-        if (count >= capacity) ablaRuntimeTrap()
-        val field = object + 32 + count * 32
-        ablaRuntimeStoreI32(field, place)
-        __ablaRuntimeCopyValue(fieldValue, field + 8)
-        ablaRuntimeStoreI64(object + 8, count + 1)
-    }
+    __ablaRuntimeFieldStore(__ablaRuntimeObjectAddress(value), place, fieldValue)
     0
 }
 
@@ -3062,16 +2998,7 @@ trusted fun __ablaRuntimeFieldSet(value: any, symbol: int, fieldValue: any): int
     else {
         val slot = __ablaRuntimeFieldSlot(object, symbol)
         if (slot != 0) __ablaRuntimeCopyValue(fieldValue, slot + 8)
-        else if (!__ablaRuntimeObjectTyped(object) &&
-                 ablaRuntimeLoadI64(object + 8) < ablaRuntimeLoadI64(object + 16)) {
-            // An untyped instance still being built (the compile-time lift sets
-            // its declared fields by name, in order): the next inline slot.
-            val count = ablaRuntimeLoadI64(object + 8)
-            val field = object + 32 + count * 32
-            ablaRuntimeStoreI32(field, symbol)
-            __ablaRuntimeCopyValue(fieldValue, field + 8)
-            ablaRuntimeStoreI64(object + 8, count + 1)
-        } else __ablaRuntimeOverflowAdd(object, symbol, fieldValue)
+        else __ablaRuntimeOverflowAdd(object, symbol, fieldValue)
     }
     0
 }
@@ -3084,14 +3011,7 @@ trusted fun __ablaRuntimeFieldSetIndexed(
 ): int {
     val object = __ablaRuntimeWord0(value)
     if (object == 0 || place < 0) ablaRuntimeTrap()
-    if (place >= 281474976710656) __ablaRuntimeFieldStore(object, place, fieldValue)
-    else {
-        val field = object + 32 + place * 32
-        val source = ablaRuntimeValueAddress(fieldValue)
-        ablaRuntimeStoreSlotI64(field + 8, ablaRuntimeLoadI64(source))
-        ablaRuntimeStoreSlotI64(field + 16, ablaRuntimeLoadI64(source + 8))
-        ablaRuntimeStoreSlotI64(field + 24, ablaRuntimeLoadI64(source + 16))
-    }
+    __ablaRuntimeFieldStore(object, place, fieldValue)
     0
 }
 
@@ -3101,13 +3021,7 @@ trusted fun __ablaRuntimeFieldSetIndexedI64(
     place: int,
     fieldValue: int
 ): int {
-    val address = __ablaRuntimeFieldAddressIndexed(value, place)
-    if (place < 281474976710656) {
-        ablaRuntimeStoreSlotI32(address - 8, 2)
-        ablaRuntimeStoreSlotI32(address - 4, 0)
-        ablaRuntimeStoreSlotI64(address + 8, 0)
-    }
-    ablaRuntimeStoreSlotI64(address, fieldValue)
+    ablaRuntimeStoreSlotI64(__ablaRuntimeFieldAddressIndexed(value, place), fieldValue)
     0
 }
 
@@ -3117,14 +3031,9 @@ trusted fun __ablaRuntimeFieldSetIndexedBool(
     place: int,
     fieldValue: bool
 ): int {
-    val address = __ablaRuntimeFieldAddressIndexed(value, place)
-    if (place >= 281474976710656) ablaRuntimeStoreSlotU8(address, if (fieldValue) 1 else 0)
-    else {
-        ablaRuntimeStoreSlotI32(address - 8, 3)
-        ablaRuntimeStoreSlotI32(address - 4, 0)
-        ablaRuntimeStoreSlotI64(address, if (fieldValue) 1 else 0)
-        ablaRuntimeStoreSlotI64(address + 8, 0)
-    }
+    ablaRuntimeStoreSlotU8(
+        __ablaRuntimeFieldAddressIndexed(value, place), if (fieldValue) 1 else 0
+    )
     0
 }
 
@@ -3166,15 +3075,13 @@ trusted fun __ablaRuntimeMemoryCensusCount(census: int, header: int, overhead: i
     __ablaRuntimeMemoryCensusAddOverhead(census, overhead)
     if (layout == 5 && size >= 16) {
         val object = header + 32
-        val typed = __ablaRuntimeObjectTyped(object)
-        val descriptor = if (typed) __ablaRuntimeObjectDescriptor(object) else 0
-        val count = if (typed) __ablaRuntimeDescriptorFields(descriptor)
-            else ablaRuntimeLoadI64(object + 8)
+        val descriptor = __ablaRuntimeObjectDescriptor(object)
+        val count = __ablaRuntimeDescriptorFields(descriptor)
         var index = 0
         while (index < count) {
-            val tag = if (typed) __ablaRuntimeTag(__ablaRuntimeFieldLoad(
+            val tag = __ablaRuntimeTag(__ablaRuntimeFieldLoad(
                 object, __ablaRuntimeDescriptorPlace(descriptor, index)
-            )) else ablaRuntimeLoadI32(object + 32 + index * 32 + 8)
+            ))
             if (tag >= 0 && tag < 16) {
                 __ablaRuntimeMemoryCensusIncrement(census + (32 + tag) * 8, 1)
             }

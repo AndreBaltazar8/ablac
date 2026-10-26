@@ -7,6 +7,10 @@ called out below.
 
 ## Compiler and stdlib
 
+- [ ] Remove the legacy field-count object path once the bootstrap pin includes commit 2
+  (typed instances only): `tools/bootstrap-untyped-objects.patch`,
+  `tools/bootstrap-typed-instances.ab` and their stage in `tools/build-self-hosted-current.sh`.
+
 - [ ] **`ablac run` becomes a live JIT.** The direction for `run` is a live in-process JIT: a
   running program loads code and redefines its own functions while it runs. Done: the JIT
   module gets the `--o1` IR pipeline (`--fast`: the fast one), which made `run` the in-process
