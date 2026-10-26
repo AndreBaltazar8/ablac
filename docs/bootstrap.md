@@ -27,6 +27,13 @@ it to rebuild the current sources. `make self-rebuild` builds another compiler,
 requires byte-identical LLVM IR from both compilers, audits the child for
 unresolved Abla runtime symbols, and uses it to build and run a native probe.
 
+`tools/test-clean-bootstrap.sh` checks that path from a fresh clone: the
+pinned release builds a stage-1 compiler from the current sources, and the
+stage-1 builds and runs a program. It reports which errors stop it when the
+sources use something newer than the pinned release, which means the pin has
+to move. It isn't part of `make test`; `ABLA_BOOTSTRAP_URL` and
+`ABLA_BOOTSTRAP_SHA256` try a candidate release.
+
 The published binary is trusted only as the initial translator. The readable
 Abla source graph and fixed-point check define the maintained compiler. A
 future release can be bootstrapped by the previous Abla release without
