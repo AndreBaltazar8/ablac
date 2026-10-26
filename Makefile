@@ -282,6 +282,7 @@ test-serial: ablac
 	tools/test-stm-wasm-unwinding.sh $(COMPILER)
 	tools/test-sysroot-path-symbols.sh $(COMPILER)
 	tools/test-frontend-call-chain-scaling.sh $(COMPILER)
+	tools/test-compiler-memory-budget.sh $(COMPILER)
 
 check: test self-rebuild
 
