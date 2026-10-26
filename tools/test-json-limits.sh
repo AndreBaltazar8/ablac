@@ -14,4 +14,15 @@ set +e
 status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1
-echo "json limits: per call, above the defaults, depth bounded"
+
+# jsonPermissiveLimits: JSON.parse's limits and duplicate keys, run time and `#`.
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode "$compiler" build "$project_root/tests/cases/modules/json-permissive.ab" \
+        -o "$output_directory/permissive-$mode" --no-cache
+    set +e
+    "$output_directory/permissive-$mode"
+    status=$?
+    set -e
+    [[ $status -eq 42 ]] || { echo "json limits: permissive ($mode) exited $status"; exit 1; }
+done
+echo "json limits: per call, above the defaults, depth bounded, the permissive preset (JSON.parse's limits and duplicate keys)"

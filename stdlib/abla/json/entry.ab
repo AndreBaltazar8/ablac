@@ -46,7 +46,11 @@ class JsonLimits(
     val maximumNodes: int,
     val maximumStringBytes: int,
     val maximumObjectMembers: int,
-    val rejectDuplicateKeys: bool
+    val rejectDuplicateKeys: bool,
+    // Allowed duplicate keys as JavaScript's JSON.parse reads them: a key
+    // keeps its first position and takes its last value. (Off, a parsed
+    // object keeps every member in source order.)
+    val mergeDuplicateKeys: bool = false
 )
 
 class JsonNumberGrammar(
@@ -182,6 +186,20 @@ val jsonStandardLimits = JsonLimits(
 )
 
 fun jsonDefaultLimits(): JsonLimits = jsonStandardLimits
+
+// What JavaScript's JSON.parse accepts: no byte, node, string or member
+// limit, the deepest nesting jsonParse allows, and duplicate keys merged as
+// JSON.parse merges them.
+@threadShared
+val jsonPermissiveLimits = JsonLimits(
+    9223372036854775807,
+    256,
+    9223372036854775807,
+    9223372036854775807,
+    9223372036854775807,
+    false,
+    true
+)
 
 // Each call's limits are its own: a caller parsing a large trusted document
 // (a map, an admin export) raises bytes, nodes and members as far as it
@@ -859,11 +877,18 @@ private fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                     )
                 }
                 var duplicate = false
+                // A merged duplicate's earlier position, or -1.
+                var earlier = -1
                 if (state.limits.rejectDuplicateKeys) {
                     if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
                         keyIndex = jsonKeyTable()
                     }
                     duplicate = jsonKeyRepeats(keys, keyIndex, key)
+                } else if (state.limits.mergeDuplicateKeys && state.errorCode.size == 0) {
+                    if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
+                        keyIndex = jsonKeyTable()
+                    }
+                    earlier = jsonKeyPosition(keys, keyIndex, key)
                 }
                 if (state.errorCode.size == 0 && duplicate) {
                     state.fail(
@@ -885,7 +910,9 @@ private fun jsonParseValue(var state: JsonParserState, depth: int): Json {
                 if (state.errorCode.size == 0) {
                     value = jsonParseValue(state, depth + 1)
                 }
-                if (state.errorCode.size == 0) {
+                if (state.errorCode.size == 0 && earlier >= 0) {
+                    values[earlier] = value
+                } else if (state.errorCode.size == 0) {
                     keys.append(key)
                     values.append(value)
                 }
@@ -1008,6 +1035,19 @@ fun JsonKeyTable.repeatsOrAdd(key: string): bool {
     false
 }
 
+// `key`'s position in the table, or -1 when it is new; adds it then.
+fun JsonKeyTable.positionOrAdd(key: string): int {
+    if (!this.repeatsOrAdd(key)) return -1
+    val hash = jsonKeyHash(key)
+    var slot = hash & this.mask
+    while (this.slots[slot] != 0) {
+        val entry = this.slots[slot]
+        if (this.hashes[entry - 1] == hash && this.names[entry - 1] == key) return entry - 1
+        slot = (slot + 1) & this.mask
+    }
+    -1
+}
+
 // Whether `key` repeats one of `keys`, the members before it. Only asked
 // while duplicates are rejected, so `keys` are distinct: a short object scans
 // them; a longer one (from jsonKeyIndexMembers) keeps `index`, a table that
@@ -1028,6 +1068,26 @@ private fun jsonKeyRepeats(
     }
     if (index.names.size == 0) for (earlier in keys) index.repeatsOrAdd(earlier)
     index.repeatsOrAdd(key)
+}
+
+// The position of `key` among `keys` (distinct: an object merging its
+// duplicates), or -1. As jsonKeyRepeats, a longer object keeps `index`, which
+// takes `key` when it is new.
+private fun jsonKeyPosition(
+    keys: array<string>,
+    var index: JsonKeyTable?,
+    key: string
+): int {
+    if (index == null) {
+        var position = 0
+        while (position < keys.size) {
+            if (keys[position] == key) return position
+            position = position + 1
+        }
+        return -1
+    }
+    if (index.names.size == 0) for (earlier in keys) index.positionOrAdd(earlier)
+    index.positionOrAdd(key)
 }
 
 // An empty key table for an object that has reached jsonKeyIndexMembers.

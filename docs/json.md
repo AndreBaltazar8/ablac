@@ -104,21 +104,44 @@ of:
 
 Error messages are diagnostic text and may improve; branch on the code.
 
-Every parse is bounded by `JsonLimits`. `jsonDefaultLimits()` returns:
+Every parse is bounded by `JsonLimits`. `jsonDefaultLimits()` returns
+`jsonStandardLimits`:
 
-| Limit | Default | Hard ceiling |
-|---|---:|---:|
-| input bytes | 1 MiB | 16 MiB |
-| nesting depth | 64 | 256 |
-| value nodes | 100,000 | 1,000,000 |
-| decoded bytes per string | 1 MiB | 16 MiB |
-| members per object | 10,000 | 100,000 |
+| Limit | Default |
+|---|---:|
+| input bytes | 1 MiB |
+| nesting depth | 64 |
+| value nodes | 100,000 |
+| decoded bytes per string | 1 MiB |
+| members per object | 10,000 |
 
-Limits must be positive and no greater than the hard ceilings. Invalid limits
-return `input_limit`. Duplicate keys are rejected by default. Setting
+Each call's limits are its own: a caller parsing a large trusted document
+raises bytes, nodes, strings and members as far as it needs. Limits must be
+positive, and the depth at most 256, since parsing recurses per level; invalid
+limits return `input_limit`. Duplicate keys are rejected by default. Setting
 `rejectDuplicateKeys` to false preserves every member in source order;
 `jsonStringify` emits them in that order and `get` observes the last matching
-member.
+member. Setting `mergeDuplicateKeys` as well merges them as JavaScript's
+`JSON.parse` does: a key keeps its first position and takes its last value.
+
+`jsonPermissiveLimits` reads what `JSON.parse` reads: no byte, node, string or
+member limit, nesting to depth 256, and duplicate keys merged:
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val parsed = jsonParse("{\"a\":1,\"b\":2,\"a\":3}", jsonPermissiveLimits)
+    println("${jsonStringify(parsed.value)} ${parsed.value.getInt("a")}")
+}
+// output:
+// {"a":3,"b":2} 3
+```
+
+A reader (`jsonObjectReader(source, jsonPermissiveLimits)`) can't merge as it
+goes: it gives every member as written, duplicates included, in source order.
+Keeping the last value read for each key gives `JSON.parse`'s result.
 
 ## Forward-only reading and streaming encoding
 
