@@ -19,6 +19,8 @@
 #   RUN_TESTS_COMMANDS   a file of commands, one per line, to run instead of the
 #                        recipe (with $(COMPILER) already substituted)
 #   RUN_TESTS_FILTER     an extended regex: run only the commands it matches
+#   RUN_TESTS_EXCLUDE    an extended regex: leave out the commands it matches
+#                        (a step a caller already runs on its own)
 #   RUN_TESTS_HISTORY    the results of an earlier run (a results.tsv) whose
 #                        times order this one (default: the last run's, kept in
 #                        build/test-results/suite-history.tsv)
@@ -34,6 +36,7 @@ jobs=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 min_free=${RUN_TESTS_MIN_FREE:-25}
 output=${RUN_TESTS_OUTPUT:-$project_root/build/test-results/suite}
 filter=${RUN_TESTS_FILTER:-}
+exclude=${RUN_TESTS_EXCLUDE:-}
 history_file=$project_root/build/test-results/suite-history.tsv
 history=${RUN_TESTS_HISTORY:-$history_file}
 [[ $jobs =~ ^[1-9][0-9]*$ ]] || { echo "JOBS must be a positive integer, got $jobs" >&2; exit 2; }
@@ -88,6 +91,7 @@ order() {
         n=$((n + 1))
         [[ -z $command ]] && continue
         [[ -z $filter || $command =~ $filter ]] || continue
+        [[ -n $exclude && $command =~ $exclude ]] && continue
         printf '%s\t%s\n' "$n" "$command"
     done <"$output/commands.txt" |
         awk -F'\t' -v history="$history" -v compiler="$compiler" '
