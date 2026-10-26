@@ -1164,8 +1164,139 @@ class BootstrapIrClass(
     val name: string,
     val id: int,
     val fields: array<string>,
-    val fieldParameters: array<int>
+    val fieldParameters: array<int>,
+    // Each field's place (bootstrapIrFieldPlace), in the order of `fields`, and
+    // an instance's size in bytes, header included.
+    val fieldPlaces: array<int> = [],
+    val size: int = 16
 )
+
+// An instance's layout: a 16-byte header (+0 its class's descriptor + 2^62,
+// +8 its overflow of extension fields or 0), then its declared fields, each stored by
+// its type's kind (as the runtime reads them, stdlib/abla/runtime/self/entry.ab):
+//   0 a boxed value, 24 bytes (any type the kinds below don't cover);
+//   1 a word, 8 bytes: an int, f64 or f32 (its 32-bit pattern, zero-extended) or
+//     a raw pointer;
+//   2 a bool, 1 byte;
+//   3 a string, 16 bytes: its value's two words;
+//   4 a reference, 8 bytes: the one word of a value whose tag the type fixes
+//     (an array or map 7, an instance 8);
+//   5 a nullable reference, 8 bytes: 0 is null.
+// The words and wider fields come first, in declaration order, then the bools.
+// A field's place packs its offset (bits 0-31), kind (32-39) and tag (40-47),
+// and sets bit 48 (what tells it from a field's index, which code an older
+// compiler made passes); typed field accesses carry it (as the instruction's
+// target), so the runtime addresses the field without a lookup.
+val BOOTSTRAP_IR_FIELD_BOXED = 0
+val BOOTSTRAP_IR_FIELD_WORD = 1
+val BOOTSTRAP_IR_FIELD_BOOL = 2
+val BOOTSTRAP_IR_FIELD_STRING = 3
+val BOOTSTRAP_IR_FIELD_REFERENCE = 4
+val BOOTSTRAP_IR_FIELD_NULLABLE_REFERENCE = 5
+val BOOTSTRAP_IR_OBJECT_HEADER = 16
+
+fun bootstrapIrFieldPlace(offset: int, kind: int, tag: int): int =
+    offset + kind * 4294967296 + tag * 1099511627776 + 281474976710656
+
+fun bootstrapIrFieldPlaceKind(place: int): int = (place / 4294967296) % 256
+
+fun bootstrapIrFieldKindSize(kind: int): int =
+    if (kind == BOOTSTRAP_IR_FIELD_BOXED) 24
+    else if (kind == BOOTSTRAP_IR_FIELD_BOOL) 1
+    else if (kind == BOOTSTRAP_IR_FIELD_STRING) 16
+    else 8
+
+/** The tag a value of `type` (normalized) always has, when the type fixes one
+ *  and a field can hold it as one word: an array or map's 7, a class instance's
+ *  or an interface value's 8; else 0. */
+fun bootstrapIrReferenceTag(
+    declarations: array<BootstrapDeclaration>,
+    typeDeclarations: BootstrapFunctionDeclarationIndex,
+    type: string
+): int {
+    if (bootstrapIsArrayType(type) || bootstrapIsMapType(type)) return 7
+    val found = typeDeclarations.find(type)
+    if (found < 0) return 0
+    val declaration = declarations[found]
+    if (declaration.name != type) return 0
+    if (declaration.kind == "interface") return 8
+    // A runtime value's class (abla/stm's TVar) has the runtime's own values.
+    if (declaration.kind == "class" && bootstrapRuntimeValueSpec(declaration) == "") 8 else 0
+}
+
+/** How a field of `type` (normalized) is stored: kind + 256 * tag. */
+fun bootstrapIrFieldStorage(
+    declarations: array<BootstrapDeclaration>,
+    typeDeclarations: BootstrapFunctionDeclarationIndex,
+    type: string
+): int {
+    if (type == "i64" || type == "f64" || type == "f32" || bootstrapIrRawPointerType(type)) {
+        return BOOTSTRAP_IR_FIELD_WORD
+    }
+    if (type == "bool") return BOOTSTRAP_IR_FIELD_BOOL
+    if (type == "string") return BOOTSTRAP_IR_FIELD_STRING
+    val nullable = bootstrapIsNullableType(type)
+    val tag = bootstrapIrReferenceTag(
+        declarations, typeDeclarations,
+        if (nullable) bootstrapNullableElementType(type) else type
+    )
+    if (tag == 0) BOOTSTRAP_IR_FIELD_BOXED
+    else (if (nullable) BOOTSTRAP_IR_FIELD_NULLABLE_REFERENCE else BOOTSTRAP_IR_FIELD_REFERENCE) +
+        256 * tag
+}
+
+/** A raw pointer type (`i64*`), whose field reads as its address. */
+fun bootstrapIrRawPointerType(type: string): bool =
+    type.size > 1 &&
+        type.slice(type.size - 1, type.size) == "*" &&
+        !bootstrapTextContains(type, ":") &&
+        !bootstrapTextContains(type, "(") &&
+        !bootstrapTextContains(type, "<")
+
+/** Whether parameter `parameter` of class `declaration` is a field. */
+fun bootstrapIrIsField(declaration: BootstrapDeclaration, parameter: int): bool =
+    parameter < declaration.parameterKinds.size &&
+        (declaration.parameterKinds[parameter] == "val" ||
+         declaration.parameterKinds[parameter] == "var")
+
+/** The places of class `declaration`'s fields, in declaration order, then its
+ *  instances' size. */
+fun bootstrapIrClassLayout(
+    declarations: array<BootstrapDeclaration>,
+    typeDeclarations: BootstrapFunctionDeclarationIndex,
+    declaration: BootstrapDeclaration
+): array<int> {
+    val storages: array<int> = []
+    var parameter = 0
+    while (parameter < declaration.parameters.size) {
+        if (bootstrapIrIsField(declaration, parameter)) {
+            storages.append(bootstrapIrFieldStorage(
+                declarations, typeDeclarations,
+                if (parameter < declaration.parameterTypes.size) {
+                    bootstrapNormalizeType(declaration.parameterTypes[parameter])
+                } else "unknown"
+            ))
+        }
+        parameter = parameter + 1
+    }
+    val places: array<int> = []
+    for (storage in storages) places.append(0)
+    var offset = BOOTSTRAP_IR_OBJECT_HEADER
+    // The words and wider fields, then the bools.
+    for (round in 0 until 2) {
+        var field = 0
+        while (field < storages.size) {
+            val kind = storages[field] % 256
+            if ((kind == BOOTSTRAP_IR_FIELD_BOOL) == (round == 1)) {
+                places[field] = bootstrapIrFieldPlace(offset, kind, storages[field] / 256)
+                offset = offset + bootstrapIrFieldKindSize(kind)
+            }
+            field = field + 1
+        }
+    }
+    places.append((offset + 7) / 8 * 8)
+    places
+}
 
 fun bootstrapIrIsTerminator(opcode: string): bool =
     opcode == "jump" || opcode == "branch" || opcode == "return" ||
@@ -4693,6 +4824,12 @@ fun bootstrapCollectLoweredOpcodeTargets(
         bootstrapMarkIrRuntimeDeclaration(
             "__ablaRuntimeFieldGetIndexed", targets, reachable, pending
         )
+        bootstrapMarkIrRuntimeDeclaration(
+            "__ablaRuntimeFieldGetString", targets, reachable, pending
+        )
+        bootstrapMarkIrRuntimeDeclaration(
+            "__ablaRuntimeFieldGetReference", targets, reachable, pending
+        )
     }
     if (candidate.opcode == "field.get.indexed.i64" ||
         candidate.opcode == "field.get.indexed.ptr" ||
@@ -4715,6 +4852,12 @@ fun bootstrapCollectLoweredOpcodeTargets(
     if (candidate.opcode == "field.set.indexed") {
         bootstrapMarkIrRuntimeDeclaration(
             "__ablaRuntimeFieldSetIndexed", targets, reachable, pending
+        )
+        bootstrapMarkIrRuntimeDeclaration(
+            "__ablaRuntimeFieldSetString", targets, reachable, pending
+        )
+        bootstrapMarkIrRuntimeDeclaration(
+            "__ablaRuntimeFieldSetReference", targets, reachable, pending
         )
     }
     if (candidate.opcode == "field.set.indexed.i64" ||
@@ -5542,6 +5685,8 @@ class BootstrapLowerer(
         found
     }
 
+    /** The place (bootstrapIrFieldPlace) of the declared field `field` of
+     *  class `owner`, or -1. */
     fun lowerFieldIndex(owner: string, field: string): int {
         val normalizedOwner = bootstrapBorrowElementType(
             bootstrapNormalizeType(owner)
@@ -5555,15 +5700,18 @@ class BootstrapLowerer(
                 var parameter = 0
                 var runtimeIndex = 0
                 while (parameter < declaration.parameters.size) {
-                    if (parameter < declaration.parameterKinds.size &&
-                        (declaration.parameterKinds[parameter] == "val" ||
-                         declaration.parameterKinds[parameter] == "var")) {
+                    if (bootstrapIrIsField(declaration, parameter)) {
                         if (declaration.parameters[parameter] == field) {
                             result = runtimeIndex
                         }
                         runtimeIndex = runtimeIndex + 1
                     }
                     parameter = parameter + 1
+                }
+                if (result >= 0) {
+                    result = bootstrapIrClassLayout(
+                        this.declarations, this.typeDeclarations, declaration
+                    )[result]
                 }
             }
         }
@@ -8413,19 +8561,24 @@ class BootstrapLowerer(
                 val fieldParameters: array<int> = []
                 var parameter = 0
                 while (parameter < declaration.parameters.size) {
-                    if (parameter < declaration.parameterKinds.size &&
-                        (declaration.parameterKinds[parameter] == "val" ||
-                         declaration.parameterKinds[parameter] == "var")) {
+                    if (bootstrapIrIsField(declaration, parameter)) {
                         fields.append(declaration.parameters[parameter])
                         fieldParameters.append(parameter)
                     }
                     parameter = parameter + 1
                 }
+                val layout = bootstrapIrClassLayout(
+                    this.declarations, this.typeDeclarations, declaration
+                )
+                val places: array<int> = []
+                for (field in 0 until fields.size) places.append(layout[field])
                 classes.append(BootstrapIrClass(
                     declaration.name,
                     classes.size,
                     fields,
-                    fieldParameters
+                    fieldParameters,
+                    places,
+                    layout[fields.size]
                 ))
             }
             // Native signatures are also the scalar ABI source of truth for

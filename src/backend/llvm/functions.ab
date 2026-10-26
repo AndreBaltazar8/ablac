@@ -2445,12 +2445,13 @@ fun bootstrapLlvmEmitNativeCall(
     supported
 }
 
-// The runtime's field-slot accessors, ablaRuntimeLoadSlotI32/I64 and
-// ablaRuntimeStoreSlotI32/I64: the one load or store in each is a declared
+// The runtime's field-slot accessors, ablaRuntimeLoadSlotU8/I32/I64 and
+// ablaRuntimeStoreSlotU8/I32/I64: the one load or store in each is a declared
 // field slot's.
 fun bootstrapLlvmSlotAccessor(name: string): bool =
     name == "ablaRuntimeLoadSlotI32" || name == "ablaRuntimeLoadSlotI64" ||
-        name == "ablaRuntimeStoreSlotI32" || name == "ablaRuntimeStoreSlotI64"
+        name == "ablaRuntimeStoreSlotI32" || name == "ablaRuntimeStoreSlotI64" ||
+        name == "ablaRuntimeLoadSlotU8" || name == "ablaRuntimeStoreSlotU8"
 
 fun bootstrapLlvmCoreIntrinsic(name: string): bool =
     name == "ablaCountLeadingZerosU32" ||
@@ -8364,47 +8365,35 @@ fun bootstrapLlvmEmitFunction(
             val found = classIndex.find(instruction.text)
             if (found < 0) supported = false
             if (found >= 0) {
+                val foundClass = program.classes[found]
                 bootstrapLlvmCallNamed(
                     backend, "abla_object_create",
                     [storage.values[instruction.result], LLVMConstInt(
                         backend.i32Type,
                         bootstrapLlvmStableNameId(instruction.text), 0
-                    ), LLVMConstInt(
-                        backend.i64Type,
-                        program.classes[found].fields.size, 0
-                    )],
+                    ), LLVMConstAdd(LLVMConstPtrToInt(
+                        bootstrapLlvmClassDescriptor(backend, foundClass),
+                        backend.i64Type
+                    ), LLVMConstInt(backend.i64Type, 4611686018427387904, 0))],
                     "", true, [false, false, false]
                 )
                 if (instruction.opcode == "object.create") {
-                    var classPosition = 0
-                    while (classPosition < program.classes.size) {
-                        val foundClass = program.classes[classPosition]
-                        if (foundClass.name == instruction.text) {
-                            var field = 0
-                            while (field < foundClass.fields.size &&
-                                   field < foundClass.fieldParameters.size) {
-                                val argument =
-                                    foundClass.fieldParameters[field]
-                                if (argument < instruction.operands.size) {
-                                    bootstrapLlvmCallNamed(
-                                        backend, "abla_field_initialize",
-                                        [storage.values[instruction.result],
-                                         LLVMConstInt(
-                                            backend.i32Type,
-                                            bootstrapLlvmStableNameId(
-                                                foundClass.fields[field]
-                                            ), 0
-                                         ),
-                                         storage.values[
-                                            instruction.operands[argument]
-                                         ]],
-                                        "", false, [true, false, true]
-                                    )
-                                }
-                                field = field + 1
-                            }
+                    var field = 0
+                    while (field < foundClass.fields.size &&
+                           field < foundClass.fieldParameters.size) {
+                        val argument = foundClass.fieldParameters[field]
+                        if (argument < instruction.operands.size) {
+                            bootstrapLlvmCallNamed(
+                                backend, "abla_field_initialize",
+                                [storage.values[instruction.result],
+                                 LLVMConstInt(
+                                    backend.i64Type, foundClass.fieldPlaces[field], 0
+                                 ),
+                                 storage.values[instruction.operands[argument]]],
+                                "", false, [true, false, true]
+                            )
                         }
-                        classPosition = classPosition + 1
+                        field = field + 1
                     }
                 }
             }
@@ -8442,7 +8431,7 @@ fun bootstrapLlvmEmitFunction(
             if (found < 0 || instruction.target < 0) supported = false
             if (found >= 0 && instruction.target >= 0) {
                 bootstrapLlvmCallNamed(
-                    backend, "abla_field_get_indexed",
+                    backend, bootstrapLlvmFieldBridge("abla_field_get", instruction.target),
                     [storage.values[instruction.result],
                      storage.values[instruction.left],
                      LLVMConstInt(
@@ -8540,7 +8529,7 @@ fun bootstrapLlvmEmitFunction(
             if (found >= 0 && instruction.target >= 0 &&
                 instruction.operands.size == 2) {
                 bootstrapLlvmCallNamed(
-                    backend, "abla_field_set_indexed",
+                    backend, bootstrapLlvmFieldBridge("abla_field_set", instruction.target),
                     [storage.values[instruction.operands[0]], LLVMConstInt(
                         backend.i32Type,
                         bootstrapLlvmStableNameId(instruction.text), 0
@@ -8718,4 +8707,63 @@ fun bootstrapLlvmSoftwareRounding(
         )
     }
     floor
+}
+
+// Class `irClass`'s descriptor (the runtime's instance layout, self/entry.ab):
+// a private constant of this module, made on its first use.
+fun bootstrapLlvmClassDescriptor(
+    backend: BootstrapLlvmBackend,
+    irClass: BootstrapIrClass
+): i64* {
+    val symbol = bootstrapLlvmStableNameId(irClass.name)
+    val name = "abla_class_$symbol"
+    val existing = LLVMGetNamedGlobal(backend.module, name)
+    if (!pointerIsNull(existing)) return existing
+    val words: array<int> = [symbol, irClass.fields.size, irClass.size, 0]
+    var traced = 0
+    for (field in 0 until irClass.fields.size) {
+        val place = irClass.fieldPlaces[field]
+        val kind = bootstrapIrFieldPlaceKind(place)
+        words.append(bootstrapLlvmStableNameId(irClass.fields[field]))
+        words.append(place % 4294967296)
+        words.append(kind)
+        words.append((place / 1099511627776) % 256)
+        if (kind == BOOTSTRAP_IR_FIELD_BOXED || kind == BOOTSTRAP_IR_FIELD_STRING ||
+            kind == BOOTSTRAP_IR_FIELD_REFERENCE ||
+            kind == BOOTSTRAP_IR_FIELD_NULLABLE_REFERENCE) traced = traced + 1
+    }
+    words[3] = traced
+    for (field in 0 until irClass.fields.size) {
+        val place = irClass.fieldPlaces[field]
+        val kind = bootstrapIrFieldPlaceKind(place)
+        if (kind == BOOTSTRAP_IR_FIELD_BOXED || kind == BOOTSTRAP_IR_FIELD_STRING ||
+            kind == BOOTSTRAP_IR_FIELD_REFERENCE ||
+            kind == BOOTSTRAP_IR_FIELD_NULLABLE_REFERENCE) {
+            words.append(place % 4294967296)
+            words.append(kind)
+        }
+    }
+    val values = llvmPointerVector(words.size)
+    for (index in 0 until words.size) {
+        values.set(index, LLVMConstInt(backend.i32Type, words[index], 0))
+    }
+    val type = LLVMArrayType2(backend.i32Type, words.size)
+    val descriptor = LLVMAddGlobal(backend.module, type, name)
+    LLVMSetInitializer(descriptor, LLVMConstArray2(backend.i32Type, values.pointer(), words.size))
+    values.drop()
+    LLVMSetGlobalConstant(descriptor, 1)
+    LLVMSetLinkage(descriptor, llvmPrivateLinkage())
+    descriptor
+}
+
+// The runtime bridge reading (`prefix` abla_field_get) or writing (abla_field_set)
+// a declared field of `place`: one of its kind's own (a string's two words, a
+// reference's word), or the general one, which reads the kind from the place.
+fun bootstrapLlvmFieldBridge(prefix: string, place: int): string {
+    val kind = bootstrapIrFieldPlaceKind(place)
+    if (place < 281474976710656) "${prefix}_indexed"
+    else if (kind == BOOTSTRAP_IR_FIELD_STRING) "${prefix}_string"
+    else if (kind == BOOTSTRAP_IR_FIELD_REFERENCE ||
+             kind == BOOTSTRAP_IR_FIELD_NULLABLE_REFERENCE) "${prefix}_reference"
+    else "${prefix}_indexed"
 }

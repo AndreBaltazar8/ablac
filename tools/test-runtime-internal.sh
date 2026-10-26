@@ -22,7 +22,9 @@ for name in ablaRuntimeValueAddress ablaRuntimeValueWord0 __ablaRuntimeWord0 \
     __ablaRuntimeWord1 __ablaRuntimeObjectAddress __ablaRuntimeFieldAddressScan \
     __ablaRuntimeFieldAddress __ablaRuntimeFieldAddressIndexed \
     __ablaRuntimeCellAddress __ablaRuntimeArrayAddress ablaRuntimeLoadSlotI32 \
-    ablaRuntimeLoadSlotI64 ablaRuntimeStoreSlotI32 ablaRuntimeStoreSlotI64; do
+    ablaRuntimeLoadSlotI64 ablaRuntimeStoreSlotI32 ablaRuntimeStoreSlotI64 \
+    ablaRuntimeLoadSlotU8 ablaRuntimeStoreSlotU8 __ablaRuntimeObjectDescriptor \
+    __ablaRuntimeFieldLoad __ablaRuntimeFieldStore; do
     grep -qF "error[E_SEMANTIC]: native.runtime-internal:$name" \
         "$output_directory/refused.err" ||
         { echo "runtime internal: $name not refused"; cat "$output_directory/refused.err"; exit 1; }

@@ -304,6 +304,8 @@ test-serial: ablac
 	tools/test-local-root-liveness.sh $(COMPILER)
 	tools/test-global-initializer-split.sh $(COMPILER)
 	tools/test-gc-growth.sh $(COMPILER)
+	tools/test-object-layout.sh $(COMPILER)
+	tools/test-cache-layout-version.sh $(COMPILER)
 
 check: test self-rebuild
 

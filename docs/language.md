@@ -2721,9 +2721,12 @@ a value, an object, a field, a cell or an array (`ablaRuntimeValueAddress`,
 `ablaRuntimeValueWord0`, `__ablaRuntimeWord0`, `__ablaRuntimeWord1`,
 `__ablaRuntimeObjectAddress`, `__ablaRuntimeFieldAddress`,
 `__ablaRuntimeFieldAddressScan`, `__ablaRuntimeFieldAddressIndexed`,
-`__ablaRuntimeCellAddress`, `__ablaRuntimeArrayAddress`), and the field-slot
-accessors (`ablaRuntimeLoadSlotI32`, `ablaRuntimeLoadSlotI64`,
-`ablaRuntimeStoreSlotI32`, `ablaRuntimeStoreSlotI64`), are called only by
+`__ablaRuntimeCellAddress`, `__ablaRuntimeArrayAddress`,
+`__ablaRuntimeObjectDescriptor`), the field-slot accessors
+(`ablaRuntimeLoadSlotU8`, `ablaRuntimeLoadSlotI32`, `ablaRuntimeLoadSlotI64`,
+`ablaRuntimeStoreSlotU8`, `ablaRuntimeStoreSlotI32`, `ablaRuntimeStoreSlotI64`)
+and the placed field accessors (`__ablaRuntimeFieldLoad`,
+`__ablaRuntimeFieldStore`), are called only by
 modules under `abla/runtime` and by the code the compiler generates for
 compile-time evaluation. A call from anywhere else, trusted or not, is an error
 (`native.runtime-internal:ablaRuntimeValueWord0`). The compiler and the backend

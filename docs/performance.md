@@ -759,3 +759,36 @@ v8 port's `sin` module stores into its frames at 20 places instead of 84, and
 tick (2.40 s against 2.39 s user time over 12 interleaved runs each, with 11%
 fewer frame stores and 1% less code) were unchanged within noise. The compiler
 rebuilt by itself writes byte-identical module text.
+
+## Typed instance layout (2026-10-27)
+
+A class instance held each declared field as a 32-byte slot (the field's
+symbol and a boxed 24-byte value) behind a 32-byte header: every field, a bool
+included, cost 32 bytes. Instances now store each field by its type's kind
+behind a 16-byte header (the class's descriptor and the overflow of extension
+fields): an int, f64, f32 or raw pointer is one word, a bool one byte, a
+string its two words, an array, map, instance or interface value one word (0
+when a nullable one is null), and any other type (`any`, functions, nullable
+scalars, the runtime's own values) a boxed value. Words and wider fields come
+first, in declaration order, then the bools. A class's descriptor, a constant
+the compiler emits, lists each field's symbol, offset and kind (for reads and
+writes by name, the compile-time lift and the heap census) and the fields the
+collector traces. Typed accesses carry the field's offset, kind and tag; a
+string or reference field has its own accessor, so an unoptimized build reads
+one without choosing among kinds.
+
+Payload bytes per instance (`memoryCensus`):
+
+| Class | Before | After |
+|---|---:|---:|
+| `Small(int, f64, bool, string)` | 160 | 56 |
+| `Wide(10 × f64)` | 352 | 96 |
+| 646 fields (264 f64, 323 bool, 29 string, 19 instance, 5 array) | 20,704 | 3,112 |
+| the same with its 24 default instances and arrays | 23,864 | 4,296 |
+
+The allocation header (32 bytes, and on Wasm the allocator's block header and
+size-class rounding) is unchanged. A game simulation that keeps its state in
+raw columns measured the same in release builds and 5-7% faster per tick in
+development builds; its server's instances (8% of its heap under load) shrink
+about 3.4 times; a compiled program's class descriptors add about 60 bytes of
+constant data per class.

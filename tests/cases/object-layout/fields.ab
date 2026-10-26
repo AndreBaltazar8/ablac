@@ -1,0 +1,171 @@
+// Every kind of declared field an instance stores (stdlib/abla/runtime/self/
+// entry.ab): words (int, f64, f32), bools, strings, references (an array, a
+// map, an instance, an interface value, nullable ones) and boxed values (any,
+// a function, a nullable int, a cell). Each is read and written typed, read
+// and written by name (as drops and the compile-time lift do), and survives
+// collections while garbage is made around it. Shared by the native program
+// (main.ab) and the WebAssembly module (module.ab); returns how many checks
+// failed.
+import "abla/memory"
+import "abla/float"
+
+interface Shape {
+    fun area(): int
+}
+
+class Square(val side: int) : Shape {
+    fun area(): int = this.side * this.side
+}
+
+class Leaf(var label: string, var weight: f64)
+
+class Everything(
+    var count: int,
+    var ratio: f64,
+    var narrow: f32,
+    var on: bool,
+    var name: string,
+    var items: array<int>,
+    var table: Map<string, int>,
+    var leaf: Leaf,
+    var shape: Shape,
+    var maybe: Leaf?,
+    var anything: any,
+    var step: (int) -> int,
+    var optional: int?,
+    var off: bool,
+    var last: string
+)
+
+fun everything(seed: int): Everything {
+    val table: Map<string, int> = Map()
+    table.set("seed", seed)
+    var maybe: Leaf? = null
+    if (seed % 3 != 0) maybe = Leaf("maybe-$seed", 2.5)
+    var anything: any = seed
+    if (seed % 2 == 0) anything = "text-$seed"
+    var optional: int? = null
+    if (seed % 4 != 0) optional = seed * 10
+    Everything(
+        seed, f64FromInt(seed) * 0.5, f32FromI32(i32(seed)), seed % 2 == 0, "name-$seed",
+        [seed, seed + 1], table, Leaf("leaf-$seed", 1.5), Square(seed), maybe,
+        anything, { x -> x + seed }, optional, seed % 2 != 0, "last-$seed"
+    )
+}
+
+fun churn(rounds: int): int {
+    var total = 0
+    for (round in 0 until rounds) {
+        val scratch = "garbage-$round-${[round, round].size}"
+        total = total + scratch.size
+    }
+    total
+}
+
+fun checkOne(item: Everything, seed: int): int {
+    var failures = 0
+    if (item.count != seed) failures = failures + 1
+    if (item.ratio != f64FromInt(seed) * 0.5) failures = failures + 1
+    if (item.narrow != f32FromI32(i32(seed))) failures = failures + 1
+    if (item.on != (seed % 2 == 0)) failures = failures + 1
+    if (item.off != (seed % 2 != 0)) failures = failures + 1
+    if (item.name != "name-$seed") failures = failures + 1
+    if (item.items.size != 2 || item.items[1] != seed + 1) failures = failures + 1
+    if (item.table.get("seed") != seed) failures = failures + 1
+    if (item.leaf.label != "leaf-$seed" || item.leaf.weight != 1.5) failures = failures + 1
+    if (item.shape.area() != seed * seed) failures = failures + 1
+    val maybe = item.maybe
+    if (seed % 3 == 0) {
+        if (maybe != null) failures = failures + 1
+    } else if (maybe == null || maybe.label != "maybe-$seed") failures = failures + 1
+    if (item.step(1) != seed + 1) failures = failures + 1
+    val optional = item.optional
+    if (seed % 4 == 0) {
+        if (optional != null) failures = failures + 1
+    } else if (optional == null || optional != seed * 10) failures = failures + 1
+    if (item.last != "last-$seed") failures = failures + 1
+    failures
+}
+
+// A field's symbol, as the compiler names it (ir.ab's bootstrapIrStableNameId).
+fun fieldSymbol(name: string): int {
+    var hash = 181
+    for (index in 0 until name.size) {
+        hash = hash * 281 + name[index] + 1
+        hash = hash - (hash / 1000000007) * 1000000007
+    }
+    if (hash < 0) 0 - hash else hash
+}
+
+trusted fun byName(item: Everything, field: string): any = __ablaRuntimeFieldGet(item, fieldSymbol(field))
+
+trusted fun setByName(item: Everything, field: string, value: any): void {
+    __ablaRuntimeFieldSet(item, fieldSymbol(field), value)
+    return
+}
+
+trusted fun number(value: any): int = __ablaRuntimeAsI64(value)
+
+trusted fun isNull(value: any): bool = __ablaRuntimeTag(value) == 1
+
+trusted fun textSize(value: any): int = __ablaRuntimeStringLengthValue(value)
+
+fun rewrite(var item: Everything, seed: int): void {
+    item.count = item.count + 1000
+    item.ratio = item.ratio + 1.0
+    item.on = !item.on
+    item.name = "renamed-$seed"
+    item.items = [seed * 3]
+    item.leaf = Leaf("new-$seed", 4.0)
+    item.maybe = null
+    if (seed % 3 == 0) item.maybe = Leaf("now-$seed", 1.0)
+    item.anything = seed + 7
+    item.optional = null
+    item.last = ""
+    return
+}
+
+trusted fun layoutFailures(): int {
+    var failures = 0
+    val items: array<Everything> = []
+    for (seed in 0 until 40) {
+        items.append(everything(seed))
+        churn(20)
+    }
+    memoryCollect()
+    for (seed in 0 until 40) failures = failures + checkOne(items[seed], seed)
+    // Typed writes of every kind, then collections.
+    for (seed in 0 until 40) {
+        rewrite(items[seed], seed)
+        churn(10)
+    }
+    memoryCollect()
+    for (seed in 0 until 40) {
+        val item = items[seed]
+        if (item.count != seed + 1000 || item.ratio != f64FromInt(seed) * 0.5 + 1.0) failures = failures + 1
+        if (item.on != (seed % 2 != 0) || item.name != "renamed-$seed") failures = failures + 1
+        if (item.items[0] != seed * 3 || item.leaf.label != "new-$seed") failures = failures + 1
+        val maybe = item.maybe
+        if (seed % 3 == 0) {
+            if (maybe == null || maybe.label != "now-$seed") failures = failures + 1
+        } else if (maybe != null) failures = failures + 1
+        if (item.optional != null || item.last != "" || item.last.size != 0) failures = failures + 1
+    }
+    // By name: reads box each kind, writes unbox it.
+    val probe = items[5]
+    if (number(byName(probe, "count")) != 1005) failures = failures + 1
+    if (textSize(byName(probe, "name")) != "renamed-5".size) failures = failures + 1
+    if (!isNull(byName(probe, "maybe"))) failures = failures + 1
+    if (number(byName(probe, "anything")) != 12) failures = failures + 1
+    setByName(probe, "count", __ablaRuntimeI64(77))
+    setByName(probe, "name", "by-name")
+    setByName(probe, "maybe", Leaf("named", 3.0))
+    setByName(probe, "on", __ablaRuntimeBool(true))
+    if (probe.count != 77 || probe.name != "by-name" || !probe.on) failures = failures + 1
+    val named = probe.maybe
+    if (named == null || named.label != "named") failures = failures + 1
+    memoryCollect()
+    val kept = probe.maybe
+    if (probe.name != "by-name" || kept == null || kept.label != "named") failures = failures + 1
+    failures
+}

@@ -35,7 +35,9 @@ rg -q 'call i64 @abla_array_length_i64' "$typed_ir"
 rg -q 'call i64 @abla_array_get_i64' "$typed_ir"
 rg -q 'call i1 @abla_array_get_bool' "$typed_ir"
 rg -q 'call i1 @abla_string_equal_bool' "$typed_ir"
-rg -q 'call void @abla_field_get_indexed' "$typed_ir"
+# A string field has its own reader (abla_field_get_string), a reference one
+# its own (abla_field_get_reference); any other kind the general one.
+rg -q 'call void @abla_field_get_(indexed|string|reference)\(' "$typed_ir"
 rg -q 'call i64 @abla_field_get_indexed_i64' "$typed_ir"
 rg -q 'call i1 @abla_field_get_indexed_bool' "$typed_ir"
 rg -q 'call void @abla_field_set_indexed_i64' "$typed_ir"
