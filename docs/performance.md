@@ -718,10 +718,15 @@ pressure safe point when it allocates, at entry on every call, even on a path
 that returns before anything can collect or allocate. The frame's slots are
 still written at entry, but the push and the safe point now run at the start of
 the first block that may collect (or allocate, for a function with a safe
-point), behind a flag that the return paths read before popping. LLVM promotes
-the flag, so a path that never pushes carries no frame code at all. A function
-whose first block needs the frame, or whose safe point would find an unrooted
-boxed value live at a later block, keeps pushing at entry.
+point). A forward pass over the blocks finds, for each push site and each
+return, whether every path into it pushed the frame or none did: a site no path
+pushed before pushes, one every path pushed before emits nothing, and a return
+pops only when its paths pushed. A function keeps pushing at entry when no
+return can be reached without the push, when a site or return could be reached
+both ways (a push in a loop: a flag tested at run time cost about 1.2% more
+code in an optimized compiler for little time), when its first block needs the
+frame, or when its safe point would find an unrooted boxed value live at a
+later block.
 
 Against the compiler it was branched from, on the same machine and load:
 a scalar fast path with an allocating cold path (`if (x < 100.0) return
@@ -729,5 +734,8 @@ x * 0.5 + 1.0`, 1e8 calls) dropped from 0.21–0.22 s to 0.11–0.12 s, the time
 the same function without the cold path; the v8 port's `sin` from 0.29 to
 0.27–0.28 s for 2e7 calls; the `--fast` self-build's user time from a median of
 14.8 to 14.6 s. JSON parsing and a simulation tick, whose hot functions have no
-early-return fast path, were unchanged within noise. The compiler rebuilt by
+early-return fast path, were unchanged within noise. The optimized compiler's
+code is the size it is without lazy frames (5,885,812 bytes of text built
+without them, 5,885,684 with them): the first version, with the flag in every
+function with a push in a loop, made it 1.6% larger. The compiler rebuilt by
 itself writes byte-identical module text.

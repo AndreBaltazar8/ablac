@@ -937,6 +937,141 @@ fun bootstrapLlvmLazyRootSites(
     sites
 }
 
+// Whether a lazily pushed frame is pushed, where it matters: per instruction,
+// at each block's start (before that block's push, when it is a site) and at
+// each return; `[count]` at the function's end, where the emitter adds the
+// return of a block that falls off it. 0: no path there pushed it, 2: every
+// path did (a block no path reaches reads 2), 1: some did. Blocks start at 0
+// and at each label, jumps and branches are the only edges between them, and
+// a block's first return, unreachable, jump or branch ends it. A forward
+// must/may dataflow over that graph, to its fixpoint.
+fun bootstrapLlvmPushedStates(function: BootstrapIrFunction, sites: array<bool>): array<int> {
+    val count = function.instructions.size
+    var maximumLabel = -1
+    for (instruction in function.instructions) {
+        if (instruction.opcode == "label" && instruction.target > maximumLabel) {
+            maximumLabel = instruction.target
+        }
+    }
+    // Blocks, the block each label starts, and each block's edges: up to two
+    // successors, or the function's end (-2), or none (-1).
+    val starts: array<int> = []
+    val blockAt: array<int> = []
+    while (blockAt.size <= maximumLabel) blockAt.append(-1)
+    var index = 0
+    while (index < count) {
+        val instruction = function.instructions[index]
+        if (index == 0 || instruction.opcode == "label") {
+            starts.append(index)
+            if (instruction.opcode == "label" && instruction.target >= 0) {
+                blockAt[instruction.target] = starts.size - 1
+            }
+        }
+        index = index + 1
+    }
+    val blocks = starts.size
+    val first: array<int> = []
+    val second: array<int> = []
+    val exits: array<int> = []
+    var block = 0
+    while (block < blocks) {
+        val end = if (block + 1 < blocks) starts[block + 1] else count
+        var successor = if (block + 1 < blocks) block + 1 else -2
+        var alternate = -1
+        var exit = -1
+        index = starts[block]
+        while (index < end && exit < 0) {
+            val instruction = function.instructions[index]
+            if (instruction.opcode == "return" || instruction.opcode == "unreachable") {
+                successor = -1
+                exit = index
+            } else if (instruction.opcode == "jump" || instruction.opcode == "branch") {
+                successor = if (instruction.target >= 0 && instruction.target <= maximumLabel)
+                    blockAt[instruction.target] else -1
+                if (instruction.opcode == "branch" && instruction.alternate >= 0 &&
+                    instruction.alternate <= maximumLabel) alternate = blockAt[instruction.alternate]
+                exit = index
+            }
+            index = index + 1
+        }
+        first.append(successor)
+        second.append(alternate)
+        exits.append(exit)
+        block = block + 1
+    }
+    // must[b]/may[b]: pushed on every/some path into b.
+    val must: array<bool> = []
+    val may: array<bool> = []
+    block = 0
+    while (block < blocks) {
+        must.append(block != 0)
+        may.append(false)
+        block = block + 1
+    }
+    var changed = true
+    while (changed) {
+        changed = false
+        val nextMust: array<bool> = []
+        val nextMay: array<bool> = []
+        block = 0
+        while (block < blocks) {
+            nextMust.append(block != 0)
+            nextMay.append(false)
+            block = block + 1
+        }
+        block = 0
+        while (block < blocks) {
+            val site = sites[starts[block]]
+            val outMust = must[block] || site
+            val outMay = may[block] || site
+            var edge = 0
+            while (edge < 2) {
+                val target = if (edge == 0) first[block] else second[block]
+                if (target >= 0) {
+                    nextMust[target] = nextMust[target] && outMust
+                    nextMay[target] = nextMay[target] || outMay
+                }
+                edge = edge + 1
+            }
+            block = block + 1
+        }
+        block = 0
+        while (block < blocks) {
+            if (nextMust[block] != must[block] || nextMay[block] != may[block]) changed = true
+            must[block] = nextMust[block]
+            may[block] = nextMay[block]
+            block = block + 1
+        }
+    }
+    val states: array<int> = []
+    index = 0
+    while (index <= count) {
+        states.append(2)
+        index = index + 1
+    }
+    var endMust = true
+    var endMay = false
+    block = 0
+    while (block < blocks) {
+        val site = sites[starts[block]]
+        states[starts[block]] = bootstrapLlvmPushedState(must[block], may[block])
+        val out = bootstrapLlvmPushedState(must[block] || site, may[block] || site)
+        if (exits[block] >= 0 && function.instructions[exits[block]].opcode == "return") {
+            states[exits[block]] = out
+        }
+        if (first[block] == -2) {
+            endMust = endMust && (must[block] || site)
+            endMay = endMay || may[block] || site
+        }
+        block = block + 1
+    }
+    states[count] = bootstrapLlvmPushedState(endMust, endMay)
+    states
+}
+
+fun bootstrapLlvmPushedState(must: bool, may: bool): int =
+    if (must) 2 else if (may) 1 else 0
+
 // Whether the pressure safe point may run at each of `sites` rather than at
 // entry: a collection there must find every boxed value the rest of the
 // function reads rooted, and the root plan roots only what lives across a

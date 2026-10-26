@@ -282,12 +282,10 @@ class BootstrapLlvmFunctionStorage(
     val gcRootsType: i64*,
     val gcRootCount: int,
     // A function pushes its root frame (and runs its pressure safe point, when it
-    // allocates) lazily: at the first instruction that may collect or allocate,
-    // not at entry. `gcPushed` is its i1 flag (null when it pushes eagerly or has
-    // nothing to push), `gcPressure` whether the push runs the safe point too.
-    var gcPushed: i64* = nativeNullPointer(),
-    var gcPressure: bool = false,
-    var gcFunction: i64* = nativeNullPointer()
+    // allocates) lazily (`gcLazy`): at the first block that may collect or
+    // allocate, not at entry. `gcPressure`: whether the push runs the safe point too.
+    var gcLazy: bool = false,
+    var gcPressure: bool = false
 )
 
 fun BootstrapLlvmFunctionStorage.block(label: int): i64* {
@@ -1129,7 +1127,7 @@ fun bootstrapLlvmPushRoots(
             }
             index = index + 1
         }
-        if (pointerIsNull(storage.gcPushed)) bootstrapLlvmEmitRootsPush(backend, storage)
+        if (!storage.gcLazy) bootstrapLlvmEmitRootsPush(backend, storage)
     }
 }
 
@@ -1151,53 +1149,35 @@ fun bootstrapLlvmEmitRootsPush(
 }
 
 // At the start of a block that may collect or allocate, in a function that
-// pushes lazily: the frame is pushed (and the pressure safe point run) the
-// first time such a block is entered in this call. A collection runs only at a
-// safe point or inside a call that may collect, so it always finds the frame
-// pushed; its slots name the values' storage, so it reads them as they are then.
+// pushes lazily, when no path into it pushed the frame yet (`state` 0, from
+// bootstrapLlvmPushedStates; 2: every path did, so nothing to do): the frame is
+// pushed and the pressure safe point run. A collection runs only at a safe
+// point or inside a call that may collect, so it always finds the frame pushed;
+// its slots name the values' storage, so it reads them as they are then.
 fun bootstrapLlvmEnsureRoots(
     backend: BootstrapLlvmBackend,
     storage: BootstrapLlvmFunctionStorage,
-    llvmFunction: i64*
+    state: int
 ): void {
-    if (pointerIsNull(storage.gcPushed)) return
-    val pushed = LLVMBuildLoad2(backend.builder, backend.i1Type, storage.gcPushed, "gc.pushed")
-    val push = LLVMAppendBasicBlockInContext(backend.context, llvmFunction, "gc.push")
-    val ready = LLVMAppendBasicBlockInContext(backend.context, llvmFunction, "gc.ready")
-    LLVMBuildCondBr(backend.builder, pushed, ready, push)
-    LLVMPositionBuilderAtEnd(backend.builder, push)
+    if (!storage.gcLazy || state != 0) return
     if (storage.gcRootCount > 0) bootstrapLlvmEmitRootsPush(backend, storage)
     if (storage.gcPressure) {
         bootstrapLlvmCallNamed(backend, "abla_runtime_memory_pressure", [], "", false, [])
     }
-    LLVMBuildStore(backend.builder, LLVMConstInt(backend.i1Type, 1, 0), storage.gcPushed)
-    LLVMBuildBr(backend.builder, ready)
-    LLVMPositionBuilderAtEnd(backend.builder, ready)
 }
 
+// `pushed`: whether every path here pushed the frame (2) or none did (0); an
+// eager frame is always pushed.
 fun bootstrapLlvmPopRoots(
     backend: BootstrapLlvmBackend,
-    storage: BootstrapLlvmFunctionStorage
+    storage: BootstrapLlvmFunctionStorage,
+    pushed: int
 ): void {
-    if (storage.gcRootCount > 0 && pointerIsNull(storage.gcPushed)) {
+    if (storage.gcRootCount > 0 && (!storage.gcLazy || pushed == 2)) {
         bootstrapLlvmCallNamed(
             backend, "abla_runtime_roots_pop", [storage.gcFrame],
             "", false, [false]
         )
-    } else if (storage.gcRootCount > 0) {
-        // Pushed lazily: popped only if this call pushed it.
-        val llvmFunction = storage.gcFunction
-        val pushed = LLVMBuildLoad2(backend.builder, backend.i1Type, storage.gcPushed, "gc.pushed")
-        val pop = LLVMAppendBasicBlockInContext(backend.context, llvmFunction, "gc.pop")
-        val done = LLVMAppendBasicBlockInContext(backend.context, llvmFunction, "gc.popped")
-        LLVMBuildCondBr(backend.builder, pushed, pop, done)
-        LLVMPositionBuilderAtEnd(backend.builder, pop)
-        bootstrapLlvmCallNamed(
-            backend, "abla_runtime_roots_pop", [storage.gcFrame],
-            "", false, [false]
-        )
-        LLVMBuildBr(backend.builder, done)
-        LLVMPositionBuilderAtEnd(backend.builder, done)
     }
 }
 
@@ -6981,11 +6961,12 @@ fun bootstrapLlvmEmitFunctionReturn(
     function: BootstrapIrFunction,
     storage: BootstrapLlvmFunctionStorage,
     value: int,
-    output: i64*
+    output: i64*,
+    pushed: int
 ): void {
     val scalar = bootstrapLlvmDirectScalarType(function.resultType)
     if (bootstrapLlvmDirectResultIsVoid(function)) {
-        bootstrapLlvmPopRoots(backend, storage)
+        bootstrapLlvmPopRoots(backend, storage, pushed)
         LLVMBuildRetVoid(backend.builder)
     } else if (scalar != "") {
         var native = LLVMConstNull(backend.type(scalar))
@@ -7002,7 +6983,7 @@ fun bootstrapLlvmEmitFunctionReturn(
                 )
             }
         }
-        bootstrapLlvmPopRoots(backend, storage)
+        bootstrapLlvmPopRoots(backend, storage, pushed)
         LLVMBuildRet(backend.builder, native)
     } else {
         if (value >= 0) bootstrapLlvmCopyValue(
@@ -7011,7 +6992,7 @@ fun bootstrapLlvmEmitFunctionReturn(
         else bootstrapLlvmRuntimeCall(
             backend, "abla_void", output, []
         )
-        bootstrapLlvmPopRoots(backend, storage)
+        bootstrapLlvmPopRoots(backend, storage, pushed)
         LLVMBuildRetVoid(backend.builder)
     }
     return
@@ -7331,11 +7312,29 @@ fun bootstrapLlvmEmitFunction(
         for (slot in storage.values) boxed.append(!pointerIsNull(slot))
         lazy = bootstrapLlvmLazyPressureSafe(function, rootSites, rootValues, boxed)
     }
+    // Lazy only when a return can be reached without the push (else every call
+    // pushes and entry is as good), and every site and return knows whether its
+    // paths pushed: one that some reach pushed and some not (a site in a loop)
+    // would need a flag tested at run time, which costs more code than the push.
+    var pushedStates: array<int> = []
     if (lazy) {
-        storage.gcPushed = LLVMBuildAlloca(backend.builder, backend.i1Type, "gc.pushed.flag")
-        LLVMBuildStore(backend.builder, LLVMConstInt(backend.i1Type, 0, 0), storage.gcPushed)
+        pushedStates = bootstrapLlvmPushedStates(function, rootSites)
+        val end = pushedStates[function.instructions.size]
+        var skips = end == 0
+        var known = end != 1
+        var stateIndex = 0
+        while (stateIndex < function.instructions.size) {
+            val state = pushedStates[stateIndex]
+            val returns = function.instructions[stateIndex].opcode == "return"
+            if (returns && state == 0) skips = true
+            if ((returns || rootSites[stateIndex]) && state == 1) known = false
+            stateIndex = stateIndex + 1
+        }
+        lazy = skips && known
+    }
+    if (lazy) {
+        storage.gcLazy = true
         storage.gcPressure = pressure
-        storage.gcFunction = llvmFunction
     }
     bootstrapLlvmPushRoots(backend, storage)
     if (pressure && !lazy) {
@@ -7388,8 +7387,8 @@ fun bootstrapLlvmEmitFunction(
                 backend.builder, storage.block(instruction.target)
             )
             terminated = false
-            if (!pointerIsNull(storage.gcPushed) && rootSites[instructionIndex]) {
-                bootstrapLlvmEnsureRoots(backend, storage, llvmFunction)
+            if (storage.gcLazy && rootSites[instructionIndex]) {
+                bootstrapLlvmEnsureRoots(backend, storage, pushedStates[instructionIndex])
             }
         }
         if (reachable && instruction.opcode == "const.i64") {
@@ -8007,7 +8006,8 @@ fun bootstrapLlvmEmitFunction(
         if (reachable && instruction.opcode == "return") {
             matched = true
             bootstrapLlvmEmitFunctionReturn(
-                backend, function, storage, instruction.left, output
+                backend, function, storage, instruction.left, output,
+                if (storage.gcLazy) pushedStates[instructionIndex] else 2
             )
             terminated = true
         }
@@ -8557,7 +8557,8 @@ fun bootstrapLlvmEmitFunction(
     }
     if (!terminated) {
         bootstrapLlvmEmitFunctionReturn(
-            backend, function, storage, function.result, output
+            backend, function, storage, function.result, output,
+            if (storage.gcLazy) pushedStates[function.instructions.size] else 2
         )
     }
     var addressesValues = false
