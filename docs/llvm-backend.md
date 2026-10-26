@@ -35,6 +35,12 @@ grown and reset.
 - Target triple and data layout are explicit compiler inputs.
 - Functions, globals, symbols, constants, and metadata are emitted in stable
   source/IR order.
+- What the compiler names after a place in the source (a lambda's function,
+  a generator's state slots, a generated module's declarations, a
+  subparser's `parserSiteKey`) is named after the function, method or global
+  that holds it and its offset there, never its position in the file: a line
+  or an import added above a declaration leaves the IR byte-identical
+  (`tools/test-stable-names.sh`).
 - LLVM optimization level and pipeline are versioned compiler inputs.
 - Object and executable comparisons normalize platform metadata that is not
   semantically controlled; LLVM IR snapshots remain byte-identical.

@@ -290,6 +290,7 @@ test-serial: ablac
 	tools/test-json-differential.sh $(COMPILER)
 	tools/test-lambda-symbols.sh $(COMPILER)
 	tools/test-subparser-site-key.sh $(COMPILER)
+	tools/test-stable-names.sh $(COMPILER)
 
 check: test self-rebuild
 
