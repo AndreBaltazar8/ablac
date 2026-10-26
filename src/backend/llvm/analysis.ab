@@ -752,6 +752,56 @@ fun bootstrapLlvmCollectingFunctions(
     result
 }
 
+// The function's loops, as instruction ranges: a jump or branch to a label at
+// or before it closes the loop that starts at that label.
+class BootstrapLlvmLoops(val starts: array<int>, val ends: array<int>)
+
+fun bootstrapLlvmLoops(function: BootstrapIrFunction): BootstrapLlvmLoops {
+    var maximumLabel = -1
+    var instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "label" && candidate.target > maximumLabel) {
+            maximumLabel = candidate.target
+        }
+        instruction = instruction + 1
+    }
+    val labelAt: array<int> = []
+    while (labelAt.size <= maximumLabel) labelAt.append(-1)
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "label" && candidate.target >= 0) {
+            labelAt[candidate.target] = instruction
+        }
+        instruction = instruction + 1
+    }
+    val loopStarts: array<int> = []
+    val loopEnds: array<int> = []
+    instruction = 0
+    while (instruction < function.instructions.size) {
+        val candidate = function.instructions[instruction]
+        if (candidate.opcode == "jump" || candidate.opcode == "branch") {
+            var edge = 0
+            while (edge < 2) {
+                val label = if (edge == 0) candidate.target
+                    else if (candidate.opcode == "branch") candidate.alternate
+                    else -1
+                if (label >= 0 && label <= maximumLabel) {
+                    val start = labelAt[label]
+                    if (start >= 0 && start <= instruction) {
+                        loopStarts.append(start)
+                        loopEnds.append(instruction)
+                    }
+                }
+                edge = edge + 1
+            }
+        }
+        instruction = instruction + 1
+    }
+    BootstrapLlvmLoops(loopStarts, loopEnds)
+}
+
 // Each SSA value's definition and last use, by instruction index (-1 when it has
 // none). A value defined before a loop and used inside it counts as used at the
 // loop's back-edge.
@@ -808,48 +858,9 @@ fun bootstrapLlvmValueIntervals(function: BootstrapIrFunction): BootstrapLlvmVal
     // that, so `for (e in makeEvents()) { allocate(); use(e) }` left the
     // iterated array unrooted and a collection mid-loop freed it. Extend such
     // intervals to the back-edge, to a fixpoint for nested loops.
-    var maximumLabel = -1
-    instruction = 0
-    while (instruction < function.instructions.size) {
-        val candidate = function.instructions[instruction]
-        if (candidate.opcode == "label" && candidate.target > maximumLabel) {
-            maximumLabel = candidate.target
-        }
-        instruction = instruction + 1
-    }
-    val labelAt: array<int> = []
-    while (labelAt.size <= maximumLabel) labelAt.append(-1)
-    instruction = 0
-    while (instruction < function.instructions.size) {
-        val candidate = function.instructions[instruction]
-        if (candidate.opcode == "label" && candidate.target >= 0) {
-            labelAt[candidate.target] = instruction
-        }
-        instruction = instruction + 1
-    }
-    val loopStarts: array<int> = []
-    val loopEnds: array<int> = []
-    instruction = 0
-    while (instruction < function.instructions.size) {
-        val candidate = function.instructions[instruction]
-        if (candidate.opcode == "jump" || candidate.opcode == "branch") {
-            var edge = 0
-            while (edge < 2) {
-                val label = if (edge == 0) candidate.target
-                    else if (candidate.opcode == "branch") candidate.alternate
-                    else -1
-                if (label >= 0 && label <= maximumLabel) {
-                    val start = labelAt[label]
-                    if (start >= 0 && start <= instruction) {
-                        loopStarts.append(start)
-                        loopEnds.append(instruction)
-                    }
-                }
-                edge = edge + 1
-            }
-        }
-        instruction = instruction + 1
-    }
+    val loops = bootstrapLlvmLoops(function)
+    val loopStarts = loops.starts
+    val loopEnds = loops.ends
     var extended = loopStarts.size > 0
     while (extended) {
         extended = false
@@ -907,6 +918,205 @@ fun bootstrapLlvmGcRootPlan(
         value = value + 1
     }
     result
+}
+
+// Whether an opcode reads or writes a local only through its own slot: it takes
+// no borrow or resource view of the local that something else could read
+// later. A place's root copies the local's value at that instruction, as a load.
+fun bootstrapLlvmPlainLocalAccess(opcode: string): bool =
+    opcode == "local.declare" || opcode == "local.assign" ||
+    opcode == "local.set" || opcode == "local.load" ||
+    opcode == "local.move" || opcode == "place.root" ||
+    bootstrapIrIsLocalZero(opcode)
+
+// The place markers the ownership checks read: no code, and no view of the
+// local after them, so the locals their paths name are only used there.
+fun bootstrapLlvmPlaceMarker(opcode: string): bool =
+    opcode == "place.load" || opcode == "place.set" || opcode == "place.move"
+
+fun bootstrapLlvmIdentifierByte(byte: int): bool =
+    byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 ||
+    byte >= 97 && byte <= 122 || byte == 95 || byte == 36 || byte >= 128
+
+// Whether the block a label starts ends the function: it reaches a return (or
+// the end) before any jump, branch or next label, so nothing runs after it.
+fun bootstrapLlvmTerminalBlock(function: BootstrapIrFunction, label: int): bool {
+    var index = label + 1
+    var result = true
+    var scanning = true
+    while (index < function.instructions.size && scanning) {
+        val opcode = function.instructions[index].opcode
+        if (opcode == "return" || opcode == "unreachable") scanning = false
+        else if (opcode == "label" || opcode == "jump" || opcode == "branch") {
+            result = false
+            scanning = false
+        }
+        index = index + 1
+    }
+    result
+}
+
+// One instruction's use of a local (see bootstrapLlvmLocalRootPlan): it widens
+// the local's interval, pins it when `pins`, and roots it when it is the first
+// use in a terminal block with a safe point (`siteBlock`, else -1) and does
+// not write the local, so the value from before the block is live there.
+fun bootstrapLlvmLocalUse(
+    var first: array<int>,
+    var last: array<int>,
+    var pinned: array<bool>,
+    var seenIn: array<int>,
+    local: int,
+    index: int,
+    pins: bool,
+    writes: bool,
+    siteBlock: int
+) {
+    if (first[local] < 0) first[local] = index
+    last[local] = index
+    if (pins) pinned[local] = true
+    if (siteBlock >= 0 && seenIn[local] != siteBlock) {
+        seenIn[local] = siteBlock
+        if (!writes) pinned[local] = true
+    }
+}
+
+// Which locals a function's root frame holds. A local is named by the
+// instructions that use it (`text`); its interval runs from the first to the
+// last of them, widened over every loop it meets (to a fixpoint), since a loop
+// can carry its value from a later instruction back to an earlier one. Every
+// path between two uses stays inside the interval, so a local whose interval
+// has no instruction that may collect holds nothing a collection must keep (it
+// keeps its value slot, which SROA promotes). A local any other opcode names (a
+// borrow, resource view or allocation) stays rooted, as every local was. A
+// label in `pressureSites` collects too, since a frame pushed lazily runs its
+// safe point there; when its block ends the function, only for the locals the
+// block reads before writing them (the rest are dead there). Indexed by
+// instruction, as the function's locals are: `[i]` for the local declared at i.
+fun bootstrapLlvmLocalRootPlan(
+    function: BootstrapIrFunction,
+    functionIndex: BootstrapLlvmNameIndex,
+    mayCollect: array<bool>,
+    pressureSites: array<bool>
+): array<bool> {
+    val count = function.instructions.size
+    val localIndex = bootstrapLlvmLocalIndex(function)
+    // Per local, keyed by the declaration its name finds (as storage does).
+    var first: array<int> = []
+    var last: array<int> = []
+    var pinned: array<bool> = []
+    var seenIn: array<int> = []
+    val terminal: array<bool> = []
+    val collectorPrefix: array<int> = []
+    collectorPrefix.append(0)
+    var index = 0
+    while (index < count) {
+        first.append(-1)
+        last.append(-1)
+        pinned.append(false)
+        seenIn.append(-1)
+        terminal.append(index < pressureSites.size && pressureSites[index] &&
+            bootstrapLlvmTerminalBlock(function, index))
+        index = index + 1
+    }
+    var siteBlock = -1
+    index = 0
+    while (index < count) {
+        val instruction = function.instructions[index]
+        if (instruction.opcode == "label") siteBlock = if (terminal[index]) index else -1
+        if (instruction.text != "" && bootstrapLlvmPlainLocalAccess(instruction.opcode)) {
+            val local = localIndex.find(instruction.text)
+            if (local >= 0 && local < count) {
+                bootstrapLlvmLocalUse(
+                    first, last, pinned, seenIn, local, index, false,
+                    bootstrapIrWritesLocal(instruction.opcode), siteBlock
+                )
+            }
+        } else if (instruction.text != "") {
+            // Any other opcode pins every local its text names, whole or as a part
+            // of a compound text (a borrow's "storage|source"); a place marker
+            // only uses them.
+            val pins = !bootstrapLlvmPlaceMarker(instruction.opcode)
+            val whole = localIndex.find(instruction.text)
+            if (whole >= 0 && whole < count) {
+                bootstrapLlvmLocalUse(
+                    first, last, pinned, seenIn, whole, index, pins, false, siteBlock
+                )
+            }
+            var compound = false
+            var scan = 0
+            while (scan < instruction.text.size && !compound) {
+                if (!bootstrapLlvmIdentifierByte(instruction.text[scan])) compound = true
+                scan = scan + 1
+            }
+            var start = 0
+            var at = if (compound) 0 else instruction.text.size + 1
+            while (at <= instruction.text.size) {
+                if (at == instruction.text.size ||
+                    !bootstrapLlvmIdentifierByte(instruction.text[at])) {
+                    if (at > start) {
+                        val local = localIndex.find(instruction.text.slice(start, at))
+                        if (local >= 0 && local < count) {
+                            bootstrapLlvmLocalUse(
+                                first, last, pinned, seenIn, local, index, pins, false,
+                                siteBlock
+                            )
+                        }
+                    }
+                    start = at + 1
+                }
+                at = at + 1
+            }
+        }
+        var collectors = collectorPrefix[index]
+        if (bootstrapLlvmInstructionMayCollect(instruction, functionIndex, mayCollect) ||
+            index < pressureSites.size && pressureSites[index] && !terminal[index]) {
+            collectors = collectors + 1
+        }
+        collectorPrefix.append(collectors)
+        index = index + 1
+    }
+    // The locals used at all (each declaration its name finds).
+    val used: array<int> = []
+    index = 0
+    while (index < count) {
+        if (first[index] >= 0) used.append(index)
+        index = index + 1
+    }
+    val loops = bootstrapLlvmLoops(function)
+    var widened = loops.starts.size > 0 && used.size > 0
+    while (widened) {
+        widened = false
+        var loop = 0
+        while (loop < loops.starts.size) {
+            val start = loops.starts[loop]
+            val end = loops.ends[loop]
+            for (local in used) {
+                if (first[local] <= end && last[local] >= start &&
+                    (first[local] > start || last[local] < end)) {
+                    if (first[local] > start) first[local] = start
+                    if (last[local] < end) last[local] = end
+                    widened = true
+                }
+            }
+            loop = loop + 1
+        }
+    }
+    // Each declaration takes its name's verdict.
+    val rooted: array<bool> = []
+    index = 0
+    while (index < count) {
+        val instruction = function.instructions[index]
+        var root = false
+        if (bootstrapIrDeclaresLocal(instruction.opcode)) {
+            val local = localIndex.find(instruction.text)
+            root = !(local >= 0 && local < count && first[local] >= 0) ||
+                pinned[local] ||
+                collectorPrefix[last[local] + 1] > collectorPrefix[first[local]]
+        }
+        rooted.append(root)
+        index = index + 1
+    }
+    rooted
 }
 
 // Where a function's root frame is pushed lazily: `sites[i]` for a label whose

@@ -739,3 +739,23 @@ code is the size it is without lazy frames (5,885,812 bytes of text built
 without them, 5,885,684 with them): the first version, with the flag in every
 function with a push in a loop, made it 1.6% larger. The compiler rebuilt by
 itself writes byte-identical module text.
+
+## Locals rooted by liveness (2026-10-26)
+
+A function's root frame held every pointer-bearing local from entry to return,
+so each assignment to one was also a store into the frame. A local now has a
+frame slot only when a collection can see it: when it holds a value across a
+call that may collect, an allocation, or a safe point where a lazy frame is
+pushed. Uses and assignments are placed in source order, a loop's interval
+widened to the whole loop, so a local whose value is dead before every such
+site is a plain SSA value. A block that ends the function counts only for the
+locals it reads before writing. Collections at every safe point
+(`ABLA_GC_STRESS=1`) keep the program's output.
+
+Against the compiler it was branched from, on the same machine and load: the
+v8 port's `sin` module stores into its frames at 20 places instead of 84, and
+2e7 calls dropped from 0.29–0.32 s to 0.13 s user time. JSON parsing, the
+`--fast` self-build (user time median 17.0 to 16.4 s) and a game simulation
+tick (2.40 s against 2.39 s user time over 12 interleaved runs each, with 11%
+fewer frame stores and 1% less code) were unchanged within noise. The compiler
+rebuilt by itself writes byte-identical module text.

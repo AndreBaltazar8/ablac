@@ -274,6 +274,8 @@ class BootstrapLlvmFunctionStorage(
     val scratchTypes: array<i64*>,
     val auxiliary: array<i64*>,
     val rootValues: array<bool>,
+    // Which locals (by declaring instruction) the frame holds.
+    val rootLocals: array<bool>,
     val localIndex: BootstrapLlvmNameIndex,
     val labels: array<int>,
     val blocks: array<i64*>,
@@ -658,6 +660,7 @@ fun bootstrapLlvmCreateFunctionStorage(
     llvmFunction: i64*,
     collecting: bool,
     rootValues: array<bool>,
+    rootLocals: array<bool>,
     scalarPlan: BootstrapLlvmScalarPlan,
     tables: BootstrapLlvmConstantTables
 ): BootstrapLlvmFunctionStorage {
@@ -871,7 +874,9 @@ fun bootstrapLlvmCreateFunctionStorage(
         }
         index = 0
         while (index < locals.size) {
-            if (!pointerIsNull(locals[index])) rootCount = rootCount + 1
+            if (!pointerIsNull(locals[index]) && bootstrapLlvmLocalRooted(rootLocals, index)) {
+                rootCount = rootCount + 1
+            }
             index = index + 1
         }
     }
@@ -891,7 +896,7 @@ fun bootstrapLlvmCreateFunctionStorage(
         values, nativeValues, scalarPlan.valueTypes,
         locals, nativeLocals, scalarPlan.localTypes,
         parameters, scratch, scratchTypes, auxiliary,
-        rootValues, bootstrapLlvmLocalIndex(function),
+        rootValues, rootLocals, bootstrapLlvmLocalIndex(function),
         labels, blocks, gcFrame, gcRoots, gcRootsType, rootCount
     )
 }
@@ -1050,6 +1055,11 @@ fun bootstrapLlvmParameterHasDefault(
     false
 }
 
+// Whether the frame holds the local declared at `index` (every local, when the
+// plan is empty).
+fun bootstrapLlvmLocalRooted(rootLocals: array<bool>, index: int): bool =
+    index >= rootLocals.size || rootLocals[index]
+
 fun bootstrapLlvmPushRoots(
     backend: BootstrapLlvmBackend,
     storage: BootstrapLlvmFunctionStorage
@@ -1088,7 +1098,8 @@ fun bootstrapLlvmPushRoots(
         }
         index = 0
         while (index < storage.locals.size) {
-            if (!pointerIsNull(storage.locals[index])) {
+            if (!pointerIsNull(storage.locals[index]) &&
+                bootstrapLlvmLocalRooted(storage.rootLocals, index)) {
                 val destination = bootstrapLlvmArrayElement(
                     backend, storage.gcRootsType, storage.gcRoots,
                     root, "gc.root"
@@ -7334,6 +7345,30 @@ fun bootstrapLlvmEmitFunction(
     if (collecting) rootValues = bootstrapLlvmGcRootPlan(
         function, functionIndex, mayCollect
     )
+    val pressure = backend.pressureSafePoints && collecting && directlyAllocates &&
+        !runtimeImplementation &&
+        function.name != "__bootstrap_globals"
+    // A frame pushed lazily runs its safe point where it pushes (a site no path
+    // into pushed it yet): those collect too, for the locals live across them.
+    // (Pushed at entry after all, it runs there, before any local holds a value.)
+    var lazySites: array<bool> = []
+    val pressureSites: array<bool> = []
+    if (pressure) {
+        val sites = bootstrapLlvmLazyRootSites(function, functionIndex, mayCollect, pressure)
+        if (sites.size > 0 && !sites[0]) {
+            lazySites = sites
+            val states = bootstrapLlvmPushedStates(function, sites)
+            var siteIndex = 0
+            while (siteIndex < sites.size) {
+                pressureSites.append(sites[siteIndex] && states[siteIndex] == 0)
+                siteIndex = siteIndex + 1
+            }
+        }
+    }
+    var rootLocals: array<bool> = []
+    if (collecting) rootLocals = bootstrapLlvmLocalRootPlan(
+        function, functionIndex, mayCollect, pressureSites
+    )
     val scalarPlan = bootstrapLlvmBuildScalarPlan(
         program, function, functionIndex, nativeIndex
     )
@@ -7346,14 +7381,11 @@ fun bootstrapLlvmEmitFunction(
         else bootstrapLlvmNoStackClosures
     var storage = bootstrapLlvmCreateFunctionStorage(
         backend, function, llvmFunction, collecting, rootValues,
-        scalarPlan, tables
+        rootLocals, scalarPlan, tables
     )
     bootstrapLlvmInitializeParameters(
         backend, function, llvmFunction, storage
     )
-    val pressure = backend.pressureSafePoints && collecting && directlyAllocates &&
-        !runtimeImplementation &&
-        function.name != "__bootstrap_globals"
     // The frame is pushed lazily, at the start of the first block that needs
     // it, unless the first block does or the safe point cannot move from entry
     // (and not in the global initializer, which runs once).
@@ -7361,7 +7393,8 @@ fun bootstrapLlvmEmitFunction(
         function.name != "__bootstrap_globals"
     var rootSites: array<bool> = []
     if (lazy) {
-        rootSites = bootstrapLlvmLazyRootSites(function, functionIndex, mayCollect, pressure)
+        rootSites = if (lazySites.size > 0) lazySites
+            else bootstrapLlvmLazyRootSites(function, functionIndex, mayCollect, pressure)
         lazy = rootSites.size > 0 && !rootSites[0]
     }
     if (lazy && pressure) {

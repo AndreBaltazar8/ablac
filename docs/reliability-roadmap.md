@@ -131,7 +131,8 @@ Use an ownership model, but design it for Abla instead of copying Rust syntax.
 Freely aliased ordinary classes and primitive arrays now have the first
 cycle-safe tracing-heap rung, not implicit reference counting and not a general
 `unsafe` mode. The compiler computes a transitive collection effect, emits
-liveness-compressed root frames only for functions that can reach a safe point,
+liveness-compressed root frames (a value or local is in one only while a
+collection can see it) only for functions that can reach a safe point,
 and propagates it through address-taken/indirect calls. A separate entry-point
 reachability walk omits the mark/sweep implementation entirely when no live
 path can invoke collection. Globals and indirect dispatcher buffers are roots
