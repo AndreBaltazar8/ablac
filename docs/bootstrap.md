@@ -82,6 +82,18 @@ The v0.2.14 tag preserves the bridge source and its reproducible source chain
 from v0.2.13 in `tools/bootstrap-word0-bridge.sh`. Release tags preserve that
 history; the temporary bridge branch is no longer needed.
 
+## Strict-imports transition
+
+The compiler's sources are a strict-imports package (`src/abla.toml` says
+`visibility = "imports"`): each module imports the modules whose names it
+uses. A few of them use the runtime's names, which every module sees
+without an import only from the compiler that made the standard library
+strict and the runtime visible everywhere. A compiler that knows
+`visibility` but predates that rule (v0.2.20 is one) rejects those uses,
+so building the compiler from source needs either a compiler that has the
+rule or one from before `visibility`, which builds the sources flat. Clean
+builds start from a bootstrap release that has it.
+
 ## Object layout change (extension-field overflow)
 
 A class instance's header changed: `+24` is now its overflow of fields set by
