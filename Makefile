@@ -287,6 +287,7 @@ test-serial: ablac
 	tools/test-compiler-memory-budget.sh $(COMPILER)
 	tools/test-gc-background-free.sh $(COMPILER)
 	tools/test-json-differential.sh $(COMPILER)
+	tools/test-lambda-symbols.sh $(COMPILER)
 
 check: test self-rebuild
 
