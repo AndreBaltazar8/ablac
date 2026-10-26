@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# (These checks read the default cache, build/.abla-cache under the working directory.)
+unset ABLA_CACHE_DIR
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "$0")/.." && pwd)

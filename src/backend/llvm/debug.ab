@@ -210,6 +210,30 @@ fun bootstrapLlvmDebugAbsolutePath(path: string, directory: string): string {
     if (result == "") "/" else result
 }
 
+// A source file's DIFile. For a native object the compilation directory is ".", as
+// clang's -fdebug-compilation-dir=. and Go's -trimpath make it: a path the build names
+// relatively stays relative (a debugger resolves it from where it runs, the project
+// root), and an absolute one (the standard library's) is split into its directory and
+// name. The working directory never reaches the object, so a copy of the project built
+// from its own root gives the same object, and the build cache may share it. A
+// WebAssembly module's DWARF keeps absolute paths (`directory`, the working directory,
+// joined): browser tools resolve them as file URLs.
+fun bootstrapLlvmDebugCreateFile(builder: i64*, path: string, directory: string): i64* {
+    if (directory != "" || (path.size > 0 && path[0] == 47)) {
+        val parts = bootstrapLlvmDebugSplitPath(bootstrapLlvmDebugAbsolutePath(
+            path, if (directory != "") directory else "/"
+        ))
+        return LLVMDIBuilderCreateFile(
+            builder, parts[1], parts[1].size, parts[0], parts[0].size
+        )
+    }
+    var relative = path
+    while (relative.size > 2 && relative.slice(0, 2) == "./") {
+        relative = relative.slice(2, relative.size)
+    }
+    LLVMDIBuilderCreateFile(builder, relative, relative.size, ".", 1)
+}
+
 // The module a source file names, for qualified symbols: "renderer" for
 // .../renderer.ab, "exit" for .../exit/entry.ab.
 fun bootstrapLlvmDebugModuleName(path: string): string {
@@ -250,20 +274,16 @@ fun bootstrapLlvmDebugBegin(
     program: BootstrapIrProgram
 ): BootstrapLlvmDebug {
     if (!bootstrapLlvmDebugInfo) return bootstrapLlvmDebugDisabled()
-    val directory = currentDirectory().text
+    val directory = if (bootstrapTextContains(backend.targetTriple, "wasm"))
+        currentDirectory().text else ""
     val builder = LLVMCreateDIBuilder(backend.module)
     val files: array<i64*> = []
     val lineStarts: array<array<int>> = []
     val rewrites: array<BootstrapSourceRewrite> = []
     var file = 0
     while (file < bootstrapIrSourceFiles.size) {
-        val path = bootstrapLlvmDebugAbsolutePath(
-            bootstrapIrSourceFiles[file], directory
-        )
-        val parts = bootstrapLlvmDebugSplitPath(path)
-        files.append(LLVMDIBuilderCreateFile(
-            builder, parts[1], parts[1].size, parts[0], parts[0].size
-        ))
+        val path = bootstrapIrSourceFiles[file]
+        files.append(bootstrapLlvmDebugCreateFile(builder, path, directory))
         val source = Path(path)
         lineStarts.append(if (source.exists())
             bootstrapLlvmDebugLineStarts(source.readText())
@@ -272,12 +292,10 @@ fun bootstrapLlvmDebugBegin(
         file = file + 1
     }
     // The unit is named after the program's entry source.
-    val entry = bootstrapLlvmDebugSplitPath(bootstrapLlvmDebugAbsolutePath(
-        if (bootstrapLlvmDebugEntry != "") bootstrapLlvmDebugEntry
-        else "<abla>", directory
-    ))
-    val unitFile = LLVMDIBuilderCreateFile(
-        builder, entry[1], entry[1].size, entry[0], entry[0].size
+    val unitFile = bootstrapLlvmDebugCreateFile(
+        builder,
+        if (bootstrapLlvmDebugEntry != "") bootstrapLlvmDebugEntry else "<abla>",
+        directory
     )
     var function = 0
     val producer = "ablac"

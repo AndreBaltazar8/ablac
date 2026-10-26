@@ -4,6 +4,8 @@
 # program compiles afresh. (The program imports abla/json, whose subparser
 # registrations are top-level compile actions: they do not prevent caching.)
 set -euo pipefail
+# (These checks read the default cache, build/.abla-cache under the working directory.)
+unset ABLA_CACHE_DIR
 
 if [[ $# -ne 1 ]]; then
     printf 'usage: %s <self-hosted-compiler>\n' "$0" >&2

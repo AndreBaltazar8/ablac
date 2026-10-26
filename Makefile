@@ -179,6 +179,7 @@ test-serial: ablac
 	tools/test-doc-examples.sh $(COMPILER)
 	tools/test-runtime-memory.sh $(COMPILER)
 	tools/test-native-object-cache.sh $(COMPILER)
+	tools/test-cache-dir.sh $(COMPILER)
 	tools/test-build-cache-build-program.sh $(COMPILER)
 	tools/test-native-partition-cache.sh $(COMPILER)
 	tools/test-lowered-ir-cache.sh $(COMPILER)

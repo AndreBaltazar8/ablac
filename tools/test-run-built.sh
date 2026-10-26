@@ -6,6 +6,8 @@
 # input, and its exit status. A second --built run reuses the cached object,
 # and --built --fast keeps a cache entry of its own.
 set -euo pipefail
+# (These checks read the default cache, build/.abla-cache under the working directory.)
+unset ABLA_CACHE_DIR
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

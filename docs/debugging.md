@@ -27,6 +27,16 @@ What a debug build contains:
 - **Line tables** (DWARF 5, line tables only: no types or variables). Each
   instruction's location is the Abla expression it was lowered from; an
   implicit return belongs to the body's last line.
+- **Source paths as the build names them.** A native object's compilation
+  directory is `.` (like clang's `-fdebug-compilation-dir=.`): a source the
+  build reached by a relative path keeps that path, and the standard library's
+  keep their absolute ones. Run the debugger from the directory the build ran
+  in (the project root) and it finds the sources; elsewhere, map them
+  (`settings set target.source-map . /path/to/project` in lldb). The working
+  directory never reaches the object, so a copy of a project built from its own
+  root gives the same object, and a shared build cache (`--cache-dir`) serves
+  both. A WebAssembly module's DWARF keeps absolute paths, which browser
+  developer tools resolve as file URLs.
 - **Readable symbols.** Each emitted function is named
   `<module>.<declaration>`: `renderer.Renderer.draw` for the method `draw` of
   `Renderer` in `renderer.ab`, `exit.panic` for `panic` in

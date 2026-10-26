@@ -6,6 +6,8 @@
 # keyed by the adapter's source, clang, SDK and target. `--no-cache` uses
 # neither.
 set -euo pipefail
+# (These checks read the default cache, build/.abla-cache under the working directory.)
+unset ABLA_CACHE_DIR
 
 if [[ $# -ne 1 ]]; then
     printf 'usage: %s <self-hosted-compiler>\n' "$0" >&2

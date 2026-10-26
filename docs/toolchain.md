@@ -171,7 +171,13 @@ frontend, compile-time evaluator, verifier, object emitter, and linker; it is
 not a cached or partial build. The default output is a native executable under
 `build/`.
 
-Native objects are cached under `build/.abla-cache`. A hit requires an exact
+Native objects are cached under `build/.abla-cache` in the working directory,
+or in the directory `--cache-dir <dir>` (on `build`, `test` and `run`) or
+`ABLA_CACHE_DIR` names; `ablac run`'s objects too. A directory outside the tree
+outlives it: a build in a fresh copy of a project, made from the copy's root,
+finds the entries an earlier copy's builds left (entries are keyed by content
+and by paths as the build names them, so projects and copies can share one
+directory). A hit requires an exact
 comparison of the complete bundled source after matching its length, two
 independent deterministic fingerprints, target/LLVM ABI version, and
 optimization profile. Cache manifests are published only after successful
@@ -319,6 +325,7 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_SYSROOT`, `ABLA_STDLIB` | where the toolchain's standard library and runtime are found (above) |
 | `ABLA_LLVM`, `ABLA_LLD` | other prefixes of the LLVM and LLD the compiler links |
 | `ABLA_DEBUG=1\|0` | debug information on or off, overriding the build profile ([debugging.md](debugging.md)) |
+| `ABLA_CACHE_DIR` | where builds and `ablac run` keep their caches (default `build/.abla-cache`; `--cache-dir` wins) |
 | `ABLA_MAX_MEMORY_MB`, `ABLA_MAX_SECONDS`, `ABLA_MAX_CPU_SECONDS`, `ABLA_KILL_GRACE_SECONDS` | the launcher's resource guard for the compiler and anything compile-time code starts ([performance.md](performance.md)) |
 | `ABLA_MAX_STACK_KB` | the compiler's stack size in a packaged toolchain |
 | `ABLA_NATIVE_JOBS` | parallel native object jobs |

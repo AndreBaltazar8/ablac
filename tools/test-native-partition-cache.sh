@@ -4,6 +4,8 @@
 # bodies stay in the root object, so an edit to one refreshes no partition.
 # Partitioning is ELF-only, so other hosts build the x86-64 Linux object.
 set -euo pipefail
+# (These checks read the default cache, build/.abla-cache under the working directory.)
+unset ABLA_CACHE_DIR
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
