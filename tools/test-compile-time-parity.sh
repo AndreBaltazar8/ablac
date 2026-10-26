@@ -383,15 +383,13 @@ publish_mode() { # kind name mode seconds runtime-seconds
     local kind=$1 name=$2 mode=$3
     local dir=$output/work/$name target=$output/cases/$3/$2 entry
     mkdir -p "$target"
-    for entry in "$dir"/* "$dir"/.[!.]*; do
-        [[ -e $entry && $(basename "$entry") != .staged.pristine ]] || continue
-        # Keep only what a failure needs; the copies of the module tree stay.
-        if [[ $kind == module ]]; then
-            case $(basename "$entry") in
-                runtime* | staged* | abla.toml) ;;
-                *) continue ;;
-            esac
-        fi
+    # Keep only what a failure needs: of a module case, its two sides and its
+    # grant, not the copy of the module tree beside them (hundreds of files,
+    # once looked at one by one, seconds a case).
+    local entries=("$dir"/* "$dir"/.[!.]*)
+    [[ $kind == module ]] && entries=("$dir"/runtime* "$dir"/staged* "$dir"/abla.toml)
+    for entry in "${entries[@]}"; do
+        [[ -e $entry && ${entry##*/} != .staged.pristine ]] || continue
         # (A link: the run-time side's files are shared by every mode.)
         if [[ -f $entry ]]; then
             ln "$entry" "$target/" || cp -p "$entry" "$target/"
