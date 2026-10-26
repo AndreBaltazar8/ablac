@@ -4,8 +4,9 @@ set -euo pipefail
 # Wasm module built after a development build of it leaves no object beside it
 # (the build's transaction used to put the earlier one back), and so does a hosted
 # release executable built without its sidecar (the default, or --no-sidecar) after
-# one built with it (--sidecar; the executable is the same). A build that fails
-# still puts every earlier output back.
+# one built with it (--sidecar; the executable is the same). A development build
+# that hands its module on without LLVM text leaves no earlier text beside it. A
+# build that fails still puts every earlier output back.
 
 compiler=${1:-build/ablac.bin}
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -20,9 +21,11 @@ fail() {
     exit 1
 }
 
+printf 'stale\n' > "$module.ll"
 "$compiler" build "$cases/dev.ab" -o "$output_directory/dev-driver" --no-cache
 [ -f "$module" ] || fail "the development build wrote no module"
 [ -f "$module.o" ] || fail "the development build wrote no object"
+[ ! -e "$module.ll" ] || fail "the development module kept an earlier build's LLVM text"
 "$compiler" build "$cases/release.ab" -o "$output_directory/release-driver" --no-cache
 [ -f "$module" ] || fail "the release build wrote no module"
 [ ! -e "$module.o" ] || fail "the release module kept the development build's object"
@@ -36,6 +39,15 @@ fi
 cmp -s "$module" "$output_directory/release.wasm" ||
     fail "a failing build did not restore the module"
 [ ! -e "$module.o" ] || fail "a failing build restored a removed object"
+
+# A hosted development build: an earlier text is gone (Mach-O emits none) or replaced.
+fast="$output_directory/fast"
+printf 'stale\n' > "$fast.ll"
+"$compiler" build "$cases/hosted.ab" -o "$fast" --no-cache --fast
+[ -x "$fast" ] || fail "the development build wrote no executable"
+if [ -e "$fast.ll" ] && grep -qx stale "$fast.ll"; then
+    fail "the development executable kept an earlier build's LLVM text"
+fi
 
 # A hosted release executable: its sidecar object with --sidecar (or ABLA_SIDECAR=1),
 # none by default or with --no-sidecar, which wins over the environment.
