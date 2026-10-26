@@ -774,199 +774,194 @@ private fun jsonParseString(var state: JsonParserState): string {
     } else jsonParseStringFallback(state, quoteOffset, contentBegin)
 }
 
-private fun jsonParseNumber(var state: JsonParserState): Json {
-    val begin = state.offset
-    var scanning = true
-    while (scanning && state.offset < state.source.size) {
-        val byte = state.source[state.offset]
-        scanning = (byte >= 48 && byte <= 57) || byte == 45 ||
-            byte == 43 || byte == 46 || byte == 101 || byte == 69
-        if (scanning) state.offset = state.offset + 1
+// jsonParseString at a value or key, the cursor on its quote.
+private fun jsonParseQuoted(var state: JsonParserState): string {
+    val source = state.source
+    val quoteOffset = state.offset
+    val contentBegin = quoteOffset + 1
+    val plainEnd = ablaJsonFindPlainStringEnd(source, contentBegin, source.size)
+    if (plainEnd >= contentBegin &&
+        plainEnd - contentBegin <= state.limits.maximumStringBytes) {
+        state.offset = plainEnd + 1
+        return source.slice(contentBegin, plainEnd)
     }
-    val text = state.source.slice(begin, state.offset)
-    val parsed = jsonNumberText(text)
-    if (parsed.kind != 2) state.fail("invalid_number", "invalid JSON number", begin)
-    parsed
+    jsonParseStringFallback(state, quoteOffset, contentBegin)
 }
 
+// The value at the cursor, built, and the cursor after it: jsonParse's walk. Its
+// checks come in this order at these offsets (jsonValidateAt makes the same ones
+// without building). The cursor is a local within each value; what a string
+// decodes to from valid input is valid UTF-8, so nodes are made directly, without
+// jsonString's and jsonObject's UTF-8 checks (or a null made first for each
+// value), and a number's grammar is read once, in place.
 private fun jsonParseValue(var state: JsonParserState, depth: int): Json {
-    jsonSkipWhitespace(state)
-    var result = jsonNull()
+    val source = state.source
+    val size = source.size
+    var offset = ablaJsonWhitespaceEnd(source, state.offset)
     if (state.errorCode.size == 0 && depth > state.limits.maximumDepth) {
-        state.fail("depth_limit", "JSON nesting exceeds configured limit", state.offset)
+        state.fail("depth_limit", "JSON nesting exceeds configured limit", offset)
     }
     if (state.errorCode.size == 0) {
         state.nodes = state.nodes + 1
         if (state.nodes > state.limits.maximumNodes) {
-            state.fail("node_limit", "JSON node count exceeds configured limit", state.offset)
+            state.fail("node_limit", "JSON node count exceeds configured limit", offset)
         }
     }
-    if (state.errorCode.size == 0 && state.offset >= state.source.size) {
-        state.fail("unexpected_end", "expected JSON value", state.offset)
+    if (state.errorCode.size == 0 && offset >= size) {
+        state.fail("unexpected_end", "expected JSON value", offset)
     }
-    if (state.errorCode.size == 0) {
-        val byte = state.source[state.offset]
-        if (byte == 34) result = jsonString(jsonParseString(state))
-        else if (byte == 91) {
-            state.offset = state.offset + 1
-            val values: array<Json> = []
-            jsonSkipWhitespace(state)
-            var closed = false
-            if (state.offset < state.source.size &&
-                state.source[state.offset] == 93) {
-                state.offset = state.offset + 1
+    if (state.errorCode.size != 0) {
+        state.offset = offset
+        return jsonNull()
+    }
+    val byte = source[offset]
+    if (byte == 34) {
+        state.offset = offset
+        return Json(1, jsonParseQuoted(state), 0, false, jsonNoKeys, jsonNoValues, jsonNoNumber)
+    }
+    if (byte == 91) {
+        val values: array<Json> = []
+        offset = ablaJsonWhitespaceEnd(source, offset + 1)
+        var closed = false
+        if (offset < size && source[offset] == 93) {
+            offset = offset + 1
+            closed = true
+        }
+        while (state.errorCode.size == 0 && !closed) {
+            state.offset = offset
+            values.append(jsonParseValue(state, depth + 1))
+            offset = ablaJsonWhitespaceEnd(source, state.offset)
+            if (offset >= size) {
+                state.fail("unexpected_end", "unterminated JSON array", offset)
+            } else if (source[offset] == 93) {
+                offset = offset + 1
                 closed = true
+            } else if (source[offset] == 44) {
+                offset = ablaJsonWhitespaceEnd(source, offset + 1)
+                if (offset < size && source[offset] == 93) {
+                    state.fail("unexpected_token", "trailing comma in JSON array", offset)
+                }
+            } else state.fail(
+                "unexpected_token", "expected comma or closing bracket", offset
+            )
+        }
+        state.offset = offset
+        return Json(4, "", 0, false, jsonNoKeys, values, jsonNoNumber)
+    }
+    if (byte == 123) {
+        val keys: array<string> = []
+        var keyIndex: JsonKeyTable? = null
+        val values: array<Json> = []
+        offset = ablaJsonWhitespaceEnd(source, offset + 1)
+        var closed = false
+        if (offset < size && source[offset] == 125) {
+            offset = offset + 1
+            closed = true
+        }
+        while (state.errorCode.size == 0 && !closed) {
+            if (offset >= size) {
+                state.fail("unexpected_end", "unterminated JSON object", offset)
+            } else if (source[offset] != 34) {
+                state.fail("unexpected_token", "JSON object key must be a string", offset)
             }
-            while (state.errorCode.size == 0 && !closed) {
-                values.append(jsonParseValue(state, depth + 1))
-                jsonSkipWhitespace(state)
-                if (state.offset >= state.source.size) {
-                    state.fail(
-                        "unexpected_end", "unterminated JSON array", state.offset
-                    )
-                } else if (state.source[state.offset] == 93) {
-                    state.offset = state.offset + 1
-                    closed = true
-                } else if (state.source[state.offset] == 44) {
-                    state.offset = state.offset + 1
-                    jsonSkipWhitespace(state)
-                    if (state.offset < state.source.size &&
-                        state.source[state.offset] == 93) {
-                        state.fail(
-                            "unexpected_token",
-                            "trailing comma in JSON array",
-                            state.offset
-                        )
-                    }
-                } else state.fail(
-                    "unexpected_token",
-                    "expected comma or closing bracket",
-                    state.offset
+            var key = ""
+            if (state.errorCode.size == 0) {
+                state.offset = offset
+                key = jsonParseQuoted(state)
+                offset = state.offset
+            }
+            if (state.errorCode.size == 0 &&
+                keys.size >= state.limits.maximumObjectMembers) {
+                state.fail(
+                    "node_limit", "JSON object member count exceeds configured limit", offset
                 )
             }
-            result = jsonArray(values)
-        } else if (byte == 123) {
-            state.offset = state.offset + 1
-            val keys: array<string> = []
-            var keyIndex: JsonKeyTable? = null
-            val values: array<Json> = []
-            jsonSkipWhitespace(state)
-            var closed = false
-            if (state.offset < state.source.size &&
-                state.source[state.offset] == 125) {
-                state.offset = state.offset + 1
-                closed = true
+            var duplicate = false
+            // A merged duplicate's earlier position, or -1.
+            var earlier = -1
+            if (state.limits.rejectDuplicateKeys) {
+                if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
+                    keyIndex = jsonKeyTable()
+                }
+                duplicate = jsonKeyRepeats(keys, keyIndex, key)
+            } else if (state.limits.mergeDuplicateKeys && state.errorCode.size == 0) {
+                if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
+                    keyIndex = jsonKeyTable()
+                }
+                earlier = jsonKeyPosition(keys, keyIndex, key)
             }
-            while (state.errorCode.size == 0 && !closed) {
-                if (state.offset >= state.source.size) {
-                    state.fail(
-                        "unexpected_end", "unterminated JSON object", state.offset
-                    )
-                } else if (state.source[state.offset] != 34) {
-                    state.fail(
-                        "unexpected_token",
-                        "JSON object key must be a string",
-                        state.offset
-                    )
-                }
-                var key = ""
-                if (state.errorCode.size == 0) key = jsonParseString(state)
-                if (state.errorCode.size == 0 &&
-                    keys.size >= state.limits.maximumObjectMembers) {
-                    state.fail(
-                        "node_limit",
-                        "JSON object member count exceeds configured limit",
-                        state.offset
-                    )
-                }
-                var duplicate = false
-                // A merged duplicate's earlier position, or -1.
-                var earlier = -1
-                if (state.limits.rejectDuplicateKeys) {
-                    if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
-                        keyIndex = jsonKeyTable()
-                    }
-                    duplicate = jsonKeyRepeats(keys, keyIndex, key)
-                } else if (state.limits.mergeDuplicateKeys && state.errorCode.size == 0) {
-                    if (keyIndex == null && keys.size >= jsonKeyIndexMembers) {
-                        keyIndex = jsonKeyTable()
-                    }
-                    earlier = jsonKeyPosition(keys, keyIndex, key)
-                }
-                if (state.errorCode.size == 0 && duplicate) {
-                    state.fail(
-                        "duplicate_key", "duplicate JSON object key", state.offset
-                    )
-                }
-                jsonSkipWhitespace(state)
-                if (state.errorCode.size == 0 &&
-                    (state.offset >= state.source.size ||
-                     state.source[state.offset] != 58)) {
-                    state.fail(
-                        "unexpected_token",
-                        "expected colon after JSON object key",
-                        state.offset
-                    )
-                }
-                if (state.errorCode.size == 0) state.offset = state.offset + 1
-                var value = jsonNull()
-                if (state.errorCode.size == 0) {
-                    value = jsonParseValue(state, depth + 1)
-                }
+            if (state.errorCode.size == 0 && duplicate) {
+                state.fail("duplicate_key", "duplicate JSON object key", offset)
+            }
+            offset = ablaJsonWhitespaceEnd(source, offset)
+            if (state.errorCode.size == 0 && (offset >= size || source[offset] != 58)) {
+                state.fail("unexpected_token", "expected colon after JSON object key", offset)
+            }
+            if (state.errorCode.size == 0) offset = offset + 1
+            if (state.errorCode.size == 0) {
+                state.offset = offset
+                val value = jsonParseValue(state, depth + 1)
+                offset = state.offset
                 if (state.errorCode.size == 0 && earlier >= 0) {
                     values[earlier] = value
                 } else if (state.errorCode.size == 0) {
                     keys.append(key)
                     values.append(value)
                 }
-                jsonSkipWhitespace(state)
-                if (state.errorCode.size == 0 &&
-                    state.offset >= state.source.size) {
-                    state.fail(
-                        "unexpected_end", "unterminated JSON object", state.offset
-                    )
-                } else if (state.errorCode.size == 0 &&
-                    state.source[state.offset] == 125) {
-                    state.offset = state.offset + 1
-                    closed = true
-                } else if (state.errorCode.size == 0 &&
-                    state.source[state.offset] == 44) {
-                    state.offset = state.offset + 1
-                    jsonSkipWhitespace(state)
-                    if (state.offset < state.source.size &&
-                        state.source[state.offset] == 125) {
-                        state.fail(
-                            "unexpected_token",
-                            "trailing comma in JSON object",
-                            state.offset
-                        )
-                    }
-                } else if (state.errorCode.size == 0) state.fail(
-                    "unexpected_token",
-                    "expected comma or closing brace",
-                    state.offset
-                )
             }
-            result = jsonObject(keys, values)
-        } else if ((byte >= 48 && byte <= 57) || byte == 45 || byte == 43) {
-            result = jsonParseNumber(state)
-        } else if (state.offset + 4 <= state.source.size &&
-            state.source.slice(state.offset, state.offset + 4) == "true") {
-            state.offset = state.offset + 4
-            result = jsonBoolean(true)
-        } else if (state.offset + 5 <= state.source.size &&
-            state.source.slice(state.offset, state.offset + 5) == "false") {
-            state.offset = state.offset + 5
-            result = jsonBoolean(false)
-        } else if (state.offset + 4 <= state.source.size &&
-            state.source.slice(state.offset, state.offset + 4) == "null") {
-            state.offset = state.offset + 4
-            result = jsonNull()
-        } else state.fail(
-            "unexpected_token", "unexpected token in JSON input", state.offset
-        )
+            offset = ablaJsonWhitespaceEnd(source, offset)
+            if (state.errorCode.size == 0 && offset >= size) {
+                state.fail("unexpected_end", "unterminated JSON object", offset)
+            } else if (state.errorCode.size == 0 && source[offset] == 125) {
+                offset = offset + 1
+                closed = true
+            } else if (state.errorCode.size == 0 && source[offset] == 44) {
+                offset = ablaJsonWhitespaceEnd(source, offset + 1)
+                if (offset < size && source[offset] == 125) {
+                    state.fail("unexpected_token", "trailing comma in JSON object", offset)
+                }
+            } else if (state.errorCode.size == 0) state.fail(
+                "unexpected_token", "expected comma or closing brace", offset
+            )
+        }
+        state.offset = offset
+        return Json(5, "", 0, false, keys, values, jsonNoNumber)
     }
-    result
+    if ((byte >= 48 && byte <= 57) || byte == 45 || byte == 43) {
+        val begin = offset
+        var scanning = true
+        while (scanning && offset < size) {
+            val next = source[offset]
+            scanning = (next >= 48 && next <= 57) || next == 45 ||
+                next == 43 || next == 46 || next == 101 || next == 69
+            if (scanning) offset = offset + 1
+        }
+        state.offset = offset
+        val kind = jsonNumberKindRange(source, begin, offset)
+        if (kind < 0) {
+            state.fail("invalid_number", "invalid JSON number", begin)
+            return jsonNull()
+        }
+        val text = source.slice(begin, offset)
+        val available = kind == 1 && jsonIntegerTextAvailable(text)
+        val intValue = if (available) jsonIntegerTextValue(text) else 0
+        return Json(2, "", intValue, false, jsonNoKeys, jsonNoValues, JsonNumber(text, kind == 1, intValue, available))
+    }
+    if (jsonLiteralAt(source, offset, 1)) {
+        state.offset = offset + 4
+        return jsonBoolean(true)
+    }
+    if (jsonLiteralAt(source, offset, 2)) {
+        state.offset = offset + 5
+        return jsonBoolean(false)
+    }
+    if (jsonLiteralAt(source, offset, 3)) {
+        state.offset = offset + 4
+        return jsonNull()
+    }
+    state.fail("unexpected_token", "unexpected token in JSON input", offset)
+    state.offset = offset
+    jsonNull()
 }
 
 private fun jsonErrorLocation(source: string, offset: int): array<int> {
