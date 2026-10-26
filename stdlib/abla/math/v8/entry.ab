@@ -29,6 +29,8 @@ noescape extern:"intrinsic" fun ablaF64Ceil(value: f64): f64
 noescape extern:"intrinsic" fun ablaF64Trunc(value: f64): f64
 noescape extern:"intrinsic" fun ablaF64Abs(value: f64): f64
 noescape extern:"intrinsic" fun ablaF64RoundEven(value: f64): f64
+noescape extern:"intrinsic" fun ablaF64Fma(x: f64, y: f64, z: f64): f64
+noescape extern:"intrinsic" fun ablaF64FmaIsFused(): bool
 
 // pi (Math.PI)
 val mathPi: f64 = f64FromBits(0x400921FB54442D18)
@@ -76,6 +78,136 @@ fun fclamp(value: f64, minimum: f64, maximum: f64): f64 {
     if (lower > maximum) maximum else lower
 }
 fun lerp(from: f64, to: f64, t: f64): f64 = from + (to - from) * t
+
+/** x * y + z rounded once (IEEE 754 fusedMultiplyAdd). JavaScript has no
+ *  Math.fma: this is abla/math's exact fma, not a port, with the same bits on
+ *  every target (the hardware's instruction where there is one, an exact
+ *  software routine elsewhere). */
+fun fma(x: f64, y: f64, z: f64): f64 =
+    if (ablaF64FmaIsFused()) ablaF64Fma(x, y, z) else __mathFmaSoftware(x, y, z)
+
+// x y + z rounded once (IEEE 754 fusedMultiplyAdd), in integers: fma where the target has no fused multiply-add instruction, and at compile
+// time. The exact sum is formed in 128 bits with a sticky bit, then rounded
+// once to the nearest double (to even on a tie).
+fun __mathFmaSoftware(x: f64, y: f64, z: f64): f64 {
+    val xb = f64ToBits(x)
+    val yb = f64ToBits(y)
+    val zb = f64ToBits(z)
+    val xe = (xb >>> 52) & 0x7ff
+    val ye = (yb >>> 52) & 0x7ff
+    val ze = (zb >>> 52) & 0x7ff
+    // an infinite, NaN or zero x or y: x y is exact
+    if (xe == 0x7ff || ye == 0x7ff || (xb << 1) == 0 || (yb << 1) == 0) return x * y + z
+    // x y finite and nonzero: an infinite or NaN z is the result
+    if (ze == 0x7ff) return z + z
+    // a zero z: x y rounded once, keeping its sign if it underflows to zero
+    if ((zb << 1) == 0) return x * y
+    // |x| = mx 2^ex and so on, with integer significands
+    val mx = (xb & 0xfffffffffffff) | (if (xe != 0) 1 << 52 else 0)
+    val my = (yb & 0xfffffffffffff) | (if (ye != 0) 1 << 52 else 0)
+    val mz = (zb & 0xfffffffffffff) | (if (ze != 0) 1 << 52 else 0)
+    val ex = (if (xe != 0) xe else 1) - 1075
+    val ey = (if (ye != 0) ye else 1) - 1075
+    val ez = (if (ze != 0) ze else 1) - 1075
+    // P = mx my 2^ep and Z = mz 2^ezz, each with its top bit moved to bit 125
+    val ph0 = __mathMulHigh(mx, my)
+    val pl0 = mx * my
+    val pshift = (if (ph0 != 0) __mathClz(ph0) else 64 + __mathClz(pl0)) - 2
+    val ph = __mathShl128High(ph0, pl0, pshift)
+    val pl = __mathShl128Low(pl0, pshift)
+    val ep = ex + ey - pshift
+    val zshift = 62 + __mathClz(mz)
+    val zh = __mathShl128High(0, mz, zshift)
+    val zl = __mathShl128Low(mz, zshift)
+    val ezz = ez - zshift
+    val ps = (xb ^ yb) >>> 63
+    val zs = zb >>> 63
+    // the larger magnitude first
+    val pFirst = if (ep != ezz) ep > ezz else if (ph != zh) __mathULess(zh, ph) else !__mathULess(pl, zl)
+    val bh = if (pFirst) ph else zh
+    val bl = if (pFirst) pl else zl
+    val be = if (pFirst) ep else ezz
+    val bs = if (pFirst) ps else zs
+    val sh = if (pFirst) zh else ph
+    val sl = if (pFirst) zl else pl
+    val d = be - (if (pFirst) ezz else ep)
+    // the smaller one aligned, the bits shifted out kept as a sticky bit
+    var th = __mathShr128High(sh, d)
+    var tl = __mathShr128Low(sh, sl, d)
+    val lost = if (d >= 128) true
+        else __mathShl128High(th, tl, d) != sh || __mathShl128Low(tl, d) != sl
+    if (lost) tl = tl | 1
+    var rh = 0
+    var rl = 0
+    if (bs == (if (pFirst) zs else ps)) {
+        rl = bl + tl
+        rh = bh + th + (if (__mathULess(rl, bl)) 1 else 0)
+    } else {
+        rl = bl - tl
+        rh = bh - th - (if (__mathULess(bl, tl)) 1 else 0)
+        // an exact cancellation is +0 when rounding to nearest
+        if ((rh | rl) == 0) return 0.0
+    }
+    // the sum's top 63 bits, the rest as a sticky bit: r 2^e, 2^62 <= r < 2^63
+    val lr = if (rh != 0) __mathClz(rh) else 64 + __mathClz(rl)
+    val nh = __mathShl128High(rh, rl, lr)
+    val nl = __mathShl128Low(rl, lr)
+    val r = (nh >>> 1) | (if ((nh & 1) != 0 || nl != 0) 1 else 0)
+    val e = be + 65 - lr
+    // round to 53 bits, or to the subnormal grid 2^-1074
+    val k = if (e >= -1084) 10 else -(e + 1074)
+    if (k >= 64) return if (bs == 1) -0.0 else 0.0
+    var m = r >>> k
+    val rem = r & ((1 << k) - 1)
+    val half = 1 << (k - 1)
+    if (rem > half || (rem == half && (m & 1) != 0)) m += 1
+    if (k > 10) return f64FromBits(m | (bs << 63))
+    if (e + 1085 + (m >>> 53) >= 2047) return if (bs == 1) -1.0 / 0.0 else 1.0 / 0.0
+    f64FromBits((((e + 1084) << 52) + m) | (bs << 63))
+}
+
+// The number of leading zero bits of a 64-bit word.
+fun __mathClz(x: int): int {
+    if (x == 0) return 64
+    if (x < 0) return 0
+    val high = x >>> 32
+    // floor(log2) from the exponent of an exactly converted 32-bit half
+    if (high != 0) return 31 - ((f64ToBits(f64FromInt(high)) >>> 52) - 1023)
+    63 - ((f64ToBits(f64FromInt(x)) >>> 52) - 1023)
+}
+
+@inline
+fun __mathULess(a: int, b: int): bool = u64(a) < u64(b)
+
+// The high 64 bits of the unsigned 128-bit product a * b, from 32-bit halves
+// with the carries out of the low word counted. (LLVM fuses the textbook
+// form, which sums the middle terms first, into a 128-bit multiplication
+// that wasm32 has only as a library call; this form it leaves alone.)
+@inline
+fun __mathMulHigh(a: int, b: int): int {
+    val a0 = a & 0xffffffff
+    val a1 = a >>> 32
+    val b0 = b & 0xffffffff
+    val b1 = b >>> 32
+    val p00 = a0 * b0
+    val p01 = a0 * b1
+    val p10 = a1 * b0
+    val t = p00 + (p01 << 32)
+    val t2 = t + (p10 << 32)
+    a1 * b1 + (p01 >>> 32) + (p10 >>> 32) + (if (__mathULess(t, p00)) 1 else 0) +
+        (if (__mathULess(t2, t)) 1 else 0)
+}
+
+// The 128-bit (hi, lo) shifted left by n >= 0: the high word, then the low word.
+fun __mathShl128High(hi: int, lo: int, n: int): int =
+    if (n == 0) hi else if (n < 64) (hi << n) | (lo >>> (64 - n)) else if (n < 128) lo << (n - 64) else 0
+fun __mathShl128Low(lo: int, n: int): int = if (n < 64) lo << n else 0
+
+// The 128-bit (hi, lo) shifted right by n >= 0 (logically): high word, low word.
+fun __mathShr128High(hi: int, n: int): int = if (n < 64) hi >>> n else 0
+fun __mathShr128Low(hi: int, lo: int, n: int): int =
+    if (n == 0) lo else if (n < 64) (lo >>> n) | (hi << (64 - n)) else if (n < 128) hi >>> (n - 64) else 0
+
 
 /** Math.hypot(x, y): scaled by the larger magnitude, so it neither overflows
  *  nor underflows early; an infinity wins over a NaN. */
