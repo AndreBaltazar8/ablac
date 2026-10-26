@@ -38,6 +38,13 @@
 #                   emptied first, so runs at the same time each need their own
 #   PARITY_ORDER    a file of case names started before the others, slowest
 #                   first (default tests/cases/parity/slow-first.txt)
+#   PARITY_BUILD_FLAGS
+#                   more flags for every build of both sides (`--fast` builds
+#                   each program without the optimizer, in about half the
+#                   time). Default: none, a release (O2) build. Under --fast
+#                   parity no longer covers a miscompile only the optimizer
+#                   makes, so a change to the backend or code generation runs
+#                   it without the flag
 #
 # Results: <output>/results.tsv (case, mode, status, detail, then the seconds
 # the mode's `#` side took and the seconds the run-time side it was compared
@@ -71,6 +78,7 @@ known_timeout_seconds=${PARITY_KNOWN_TIMEOUT_SECONDS:-20}
 expect=${PARITY_EXPECT:-$project_root/tests/cases/parity/expected-pass.txt}
 output=${PARITY_OUTPUT:-$project_root/build/compile-time-parity}
 order=${PARITY_ORDER:-$project_root/tests/cases/parity/slow-first.txt}
+build_flags=${PARITY_BUILD_FLAGS:-}
 [[ $output == /* ]] || output=$PWD/$output
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 
@@ -134,7 +142,7 @@ build_and_run() { # dir tag entry mode
         # second optimization and code generation of the whole program.
         ABLA_NO_SIDECAR=1 \
         ABLA_COMPILE_EVAL=$mode ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096} \
-            limited "$compiler" build "$entry" -o "$tag.program" --no-cache \
+            limited "$compiler" build "$entry" -o "$tag.program" --no-cache $build_flags \
             >"$tag.compiler.out" 2>"$tag.err"
     )
     status=$?
@@ -409,7 +417,7 @@ publish_mode() { # kind name mode seconds runtime-seconds
 export -f run_case run_mode publish_mode build_and_run first_error limited \
     expected_status by_design_status by_design_reason sources_match starts_thread \
     has_compile_time_code
-export output compiler seconds known_timeout_seconds modes expected project_root by_design
+export output compiler seconds known_timeout_seconds modes expected project_root by_design build_flags
 
 # The cases known to take longest start first (PARITY_ORDER, a file of case
 # names, slowest first), so none of them is left running alone at the end;
