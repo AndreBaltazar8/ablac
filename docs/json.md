@@ -139,6 +139,27 @@ fun main {
 // {"a":3,"b":2} 3
 ```
 
+`jsonValidate(source, limits)` answers whether `jsonParse` would accept a
+document without building its tree: the same `succeeded` and `error` (code,
+message, offset, line and column) under the same limits, merging included,
+with a null `value`. It checks a large document at tens of megabytes a second,
+allocating only for strings with escapes and for the keys of objects whose
+duplicates are rejected or merged:
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val checked = jsonValidate("[1, 2, {\"a\": tru}]")
+    println("${checked.succeeded} ${checked.error.code} at ${checked.error.byteOffset}")
+    println("${jsonValidate("{\"a\":1,\"a\":2}", jsonPermissiveLimits).succeeded}")
+}
+// output:
+// false unexpected_token at 13
+// true
+```
+
 A reader (`jsonObjectReader(source, jsonPermissiveLimits)`) can't merge as it
 goes: it gives every member as written, duplicates included, in source order.
 Keeping the last value read for each key gives `JSON.parse`'s result.
