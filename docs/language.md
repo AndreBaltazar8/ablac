@@ -2585,7 +2585,10 @@ fun main: int = nextId()
   although `abla/fs` declares nothing itself; `abla/net`, `abla/random` and
   `abla/process` do the same. The runtime the compiler adds to every program
   (`abla/runtime/self` and its target's platform module) and `abla/stm` are
-  seen by every module without an import.
+  seen by every module without an import. A library module's other files
+  (such as its native bindings) aren't API: a flat program reaches their
+  names through the module that imports them, and a strict one doesn't, which
+  E_NAME_NOT_IMPORTED says.
 - Member names (after `.`, or a class's own members in its body), named
   arguments and a declaration's own parameters and locals aren't looked up
   this way. Aliases, `private` and `E_IMPORT_UNQUALIFIED_AMBIGUOUS` work as

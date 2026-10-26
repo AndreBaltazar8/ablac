@@ -82,4 +82,13 @@ runs "$output_directory/value-named" "5"
 "$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named-strict" \
     --no-cache --strict-imports
 runs "$output_directory/value-named-strict" "5"
-echo "strict-imports: strict package, export import, --strict-imports, report + fix-imports, strict standard library"
+# A library module's other file isn't API: a flat program's report names the
+# entry module that reaches it, and a strict program is told it's internal.
+"$compiler" build "$cases/internal.ab" -o "$output_directory/internal" --no-cache \
+    --visibility-report "$output_directory/internal.tsv" > "$output_directory/internal.out" 2>&1 || true
+grep -F "	OpenSSL_version_num	" "$output_directory/internal.tsv" | grep -qF 'import "abla/tls/hosted"' ||
+    { echo "strict-imports: the internal name's report line:"; cat "$output_directory/internal.tsv"; exit 1; }
+rejected "$cases/internal.ab" --strict-imports \
+    '`OpenSSL_version_num` is internal to the standard library' \
+    'help: a library module that offers it would be a change to the standard library to request'
+echo "strict-imports: strict package, export import, --strict-imports, report + fix-imports, strict standard library, internal library files"
