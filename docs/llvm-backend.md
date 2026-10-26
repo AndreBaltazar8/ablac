@@ -40,7 +40,9 @@ grown and reset.
   subparser's `parserSiteKey`) is named after the function, method or global
   that holds it and its offset there, never its position in the file: a line
   or an import added above a declaration leaves the IR byte-identical
-  (`tools/test-stable-names.sh`).
+  (`tools/test-stable-names.sh`). A lambda's number counts the functions
+  lowered in its owner before it, not in the program, so a function added
+  in another module renames no lambda (`tools/test-lambda-ordinal.sh`).
 - LLVM optimization level and pipeline are versioned compiler inputs.
 - Object and executable comparisons normalize platform metadata that is not
   semantically controlled; LLVM IR snapshots remain byte-identical.

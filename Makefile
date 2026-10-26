@@ -291,6 +291,7 @@ test-serial: ablac
 	tools/test-lambda-symbols.sh $(COMPILER)
 	tools/test-subparser-site-key.sh $(COMPILER)
 	tools/test-stable-names.sh $(COMPILER)
+	tools/test-lambda-ordinal.sh $(COMPILER)
 
 check: test self-rebuild
 
