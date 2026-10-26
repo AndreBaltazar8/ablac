@@ -21,22 +21,9 @@ fail() {
 }
 
 # The compiler binary itself: a launcher sets its own ABLA_SYSROOT, which
-# would replace the copies'. (Beside the launcher, beside the launcher a link
-# points at, or in a released toolchain's libexec.)
-compiler_payload=$compiler
-resolved=$compiler
-while [[ -L $resolved ]]; do
-    target=$(readlink "$resolved")
-    [[ $target == /* ]] || target=$(dirname "$resolved")/$target
-    resolved=$target
-done
-if [[ -x $compiler.bin ]]; then
-    compiler_payload=$compiler.bin
-elif [[ -x $resolved.bin ]]; then
-    compiler_payload=$resolved.bin
-elif [[ -x $(dirname "$resolved")/../libexec/ablac.bin ]]; then
-    compiler_payload=$(dirname "$resolved")/../libexec/ablac.bin
-fi
+# would replace the copies'.
+source "$project_root/tools/compiler-binary.sh"
+compiler_payload=$(abla_compiler_binary "$compiler")
 
 # Copies, not links: a link resolves to the same path.
 roots=()

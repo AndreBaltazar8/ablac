@@ -64,18 +64,8 @@ run_program 42 || exit 1
 # even for identical program source. The variant behaves the same; only its
 # image (an inert ELF section, or a Mach-O signature identifier) differs.
 # (Beside the launcher, or beside the launcher a link to one points at.)
-compiler_payload=$compiler
-resolved=$compiler
-while [[ -L $resolved ]]; do
-    target=$(readlink "$resolved")
-    [[ $target == /* ]] || target=$(dirname "$resolved")/$target
-    resolved=$target
-done
-if [[ -x $compiler.bin ]]; then
-    compiler_payload=$compiler.bin
-elif [[ -x $resolved.bin ]]; then
-    compiler_payload=$resolved.bin
-fi
+source "$project_root/tools/compiler-binary.sh"
+compiler_payload=$(abla_compiler_binary "$compiler")
 # `make_variant <path> <identity>`: a copy of the compiler whose image differs.
 make_variant() {
     cp -- "$compiler_payload" "$1" || return 1

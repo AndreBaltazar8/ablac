@@ -74,8 +74,11 @@ mkdir -p "$library_root"
 cp -R "$sysroot/stdlib" "$sysroot/runtime" "$library_root/"
 mkdir -p "$library_root/stdlib/abla/strict-fixture"
 cp "$cases/library-fixture.ab" "$library_root/stdlib/abla/strict-fixture/entry.ab"
+# (With the compiler binary: a launcher would set its own sysroot.)
+source "$project_root/tools/compiler-binary.sh"
+(compiler=$(abla_compiler_binary "$compiler")
 ABLA_SYSROOT="$library_root" rejected "$cases/library-user.ab" "" \
-    'error[E_NAME_NOT_IMPORTED]: `Path` is declared in' 'help: add: import "abla/sys/linux/fs"'
+    'error[E_NAME_NOT_IMPORTED]: `Path` is declared in' 'help: add: import "abla/sys/linux/fs"')
 # A program's value named like a type the library's annotations name.
 "$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named" --no-cache
 runs "$output_directory/value-named" "5"
