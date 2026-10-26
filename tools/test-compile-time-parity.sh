@@ -36,6 +36,8 @@
 #                   one of them doesn't, and lists cases that newly pass.
 #   PARITY_OUTPUT   the results directory (default build/compile-time-parity);
 #                   emptied first, so runs at the same time each need their own
+#   PARITY_ORDER    a file of case names started before the others, slowest
+#                   first (default tests/cases/parity/slow-first.txt)
 #
 # Results: <output>/results.tsv (case, mode, status, detail, then the seconds
 # the mode's `#` side took and the seconds the run-time side it was compared
@@ -68,6 +70,7 @@ seconds=${PARITY_SECONDS:-120}
 known_timeout_seconds=${PARITY_KNOWN_TIMEOUT_SECONDS:-20}
 expect=${PARITY_EXPECT:-$project_root/tests/cases/parity/expected-pass.txt}
 output=${PARITY_OUTPUT:-$project_root/build/compile-time-parity}
+order=${PARITY_ORDER:-$project_root/tests/cases/parity/slow-first.txt}
 [[ $output == /* ]] || output=$PWD/$output
 export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 
@@ -408,7 +411,20 @@ export -f run_case run_mode publish_mode build_and_run first_error limited \
     has_compile_time_code
 export output compiler seconds known_timeout_seconds modes expected project_root by_design
 
-list_cases | while read -r kind name source; do
+# The cases known to take longest start first (PARITY_ORDER, a file of case
+# names, slowest first), so none of them is left running alone at the end;
+# the order changes no result.
+ordered_cases() {
+    local cases first name
+    cases=$(list_cases)
+    first=$(awk '$1 != "" && $1 !~ /^#/ { print $1 }' "$order" 2>/dev/null)
+    for name in $first; do
+        awk -v n="$name" '$2 == n' <<<"$cases"
+    done
+    awk -v first=" $(tr '\n' ' ' <<<"$first")" 'index(first, " " $2 " ") == 0' <<<"$cases"
+}
+
+ordered_cases | while read -r kind name source; do
     [[ -z $filter || $name =~ $filter ]] || continue
     printf '%s\0%s\0%s\0' "$kind" "$name" "$source"
 done | xargs -0 -n3 -P "$jobs" bash -c 'run_case "$@"' run_case
