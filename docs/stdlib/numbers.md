@@ -152,6 +152,38 @@ The three modules declare the same names, so a program picks one by its import:
   matters more than the last bit (a game client, a hot inner loop); still the
   same bits on every target.
 
+### Cost
+
+Nanoseconds per call on an Apple M-series machine, in loops over typical
+arguments, natively and as WebAssembly under Node 22. The machine was loaded
+while these ran, so the WebAssembly figures are rough (some moved by 2x between
+runs); the native ones hold to about 0.5 ns.
+
+| Function | `abla/math` native | `abla/math/fast` native | `abla/math/v8` native | `abla/math` Wasm | `abla/math/fast` Wasm | `abla/math/v8` Wasm |
+|---|---|---|---|---|---|---|
+| `sin` | 8.0 | 3.5 | 23 | 17 | 3.7 | 15 |
+| `cos` | 7.5 | 3.5 | 23 | 20 | 4.4 | 12 |
+| `tan` | 37.5 | 7.5 | 36 | 65 | 12 | 23 |
+| `atan2` | 11 | 6.5 | 12 | 16 | 7.9 | 22 |
+| `exp` | 4.5 | 4.5 | 5.0 | 7.5 | 7.2 | 6.7 |
+| `log` | 5.0 | 4.5 | 5.0 | 10 | 5.8 | 5.5 |
+| `pow` | 16 | 42 | 39 | 39 | 46 | 34 |
+| `hypot` | 4.0 | 1.0 | 3.5 | 17 | 2.1 | 7.4 |
+
+A module using `sin`, `cos`, `tan`, `atan2`, `exp`, `log`, `pow`, `hypot` and
+`sqrt` is 71,817 bytes of WebAssembly with `abla/math` (34,433 with brotli),
+44,889 (13,473) with `abla/math/v8` and 13,257 (4,648) with `abla/math/fast`.
+Correct rounding needs exact products and a test that falls back to a slower,
+more precise path near a rounding boundary; WebAssembly has no fused
+multiply-add, so its exact products cost several instructions each, which is
+why `abla/math` is further behind there.
+
+Pick `abla/math` unless a profile says otherwise: most code calls these
+functions far less often than the table suggests, and its results are the same
+everywhere. Pick `abla/math/fast` for code that calls `sin`, `cos`, `tan` or
+`hypot` in a hot loop, or where a few tens of kilobytes of download matter.
+Pick `abla/math/v8` only to agree with JavaScript.
+
 ## `abla/float`
 
 | Function | Converts |
