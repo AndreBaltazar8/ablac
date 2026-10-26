@@ -94,7 +94,9 @@ fun main {
   `fmax` return NaN when either argument is NaN and order -0 below +0, and
   that `hypot` of an infinity and a NaN is infinity.
 - The functions without a JavaScript counterpart (`min`, `max`, `clamp`,
-  `fclamp`, `lerp`, `roundEven`) are `abla/math`'s.
+  `fclamp`, `lerp`, `roundEven`, `fma`) are `abla/math`'s. JavaScript has no
+  `Math.fma`: `fma` here is the exact IEEE fused multiply-add, rounded once, not
+  a port.
 - The reference is V8's code as written, as Node 22.14 (V8 12.4.254.21) runs
   it on x86-64: no fused multiply-adds, and a correctly rounded `scalbn`. Node
   and browsers on Arm64 or macOS can differ from it by 1 ulp in about 0.07–0.1%
@@ -117,6 +119,38 @@ recorded from Node 22.14 on x86-64, natively at every optimization level, as
 release and development WebAssembly, and under `#` in both tiers. It runs the
 harness on Node 22.14 (`MATH_V8_NODE`, default
 `~/.nvm/versions/node/v22.14.0/bin/node`) and checks its V8 version.
+
+## `abla/math/fast`
+
+`abla/math/fast` declares exactly what `abla/math` declares, with the results
+`abla/math` gave before it became correctly rounded: fdlibm-style functions
+within about 1 ulp, a fraction of the size and, for `sin`, `cos`, `tan`,
+`atan2` and `hypot`, several times faster. `fmin`, `fmax` and `fclamp` follow
+`abla/math`'s IEEE 754-2019 rules here too, and `fma` is the same exact one, so
+switching the import changes only how the other functions round.
+
+```abla
+import "abla/io"
+import "abla/math" as correct
+import "abla/math/fast" as fast
+
+fun main {
+    println("${correct.sqrt(2.0) == fast.sqrt(2.0)} ${correct.fmin(0.0, -0.0) == fast.fmin(0.0, -0.0)}")
+}
+// true true
+```
+
+## Choosing between the three
+
+The three modules declare the same names, so a program picks one by its import:
+
+- `abla/math`, the default: every function correctly rounded (the double
+  nearest the exact result), the same bits on every target and at compile time.
+- `abla/math/v8`: JavaScript's results, bit for bit, where Abla code must agree
+  with code running in a browser's or Node's `Math`.
+- `abla/math/fast`: within about 1 ulp, for code where download size or speed
+  matters more than the last bit (a game client, a hot inner loop); still the
+  same bits on every target.
 
 ## `abla/float`
 
