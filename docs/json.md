@@ -173,7 +173,8 @@ value, and several times faster on large documents. Its `root()` is a
   missing member or element, which reads as null);
 - `at(index)` (an element, or an object's member value), `keyAt(index)`,
   `get(key)`, `has(key)`, `getString(key)`, `getInt(key)`;
-- `asString()`, `asNumber()`, `asInt()`, `intAvailable()`, `asBoolean()`;
+- `asString()`, `asNumber()`, `asInt()`, `intAvailable()`, `asBoolean()`,
+  `asF64()` (a number as the nearest `f64`, as a reader's `readNumber`);
 - `raw()`: the value's source text exactly as written, a slice, not a copy;
 - `toJson()`: the `Json` tree `jsonParse` builds for that value.
 
@@ -196,6 +197,38 @@ fun main {
 // output:
 // 2 x 2 2.5e1
 // {"name":"x","versions":[1,2.5e1]}
+```
+
+To go through every element or member, take a cursor: `elements()` on an
+array, `members()` on an object. `next()` steps to the next one, and the
+cursor reads the current one in place (`kind()`, `size()`, `asString()`,
+`asInt()`, `asF64()`, `asNumber()`, `asBoolean()`, `raw()`, `utf16Length()`, and for a
+member `key()` and `keyIs(name)`, which compares without making a string):
+stepping and reading scalars allocate nothing. `node()` gives the current one
+as a `JsonNode`, and `elements()` / `members()` a cursor into it. Members come
+as `jsonParse`'s object holds them. `utf16Length()` is a string's length in
+UTF-16 code units, as JavaScript counts it.
+
+```abla
+import "abla/io"
+import "abla/json"
+
+fun main {
+    val parsed = jsonDocument("[{\"id\":1,\"name\":\"a\\u00e9\"},{\"id\":2,\"name\":\"\\ud83d\\ude00\"}]")
+    var records = parsed.document.root().elements()
+    while (records.next()) {
+        var fields = records.members()
+        var line = ""
+        while (fields.next()) {
+            if (fields.keyIs("id")) line = "$line id ${fields.asInt()}"
+            else line = "$line ${fields.key()} ${fields.asString()} (${fields.utf16Length()})"
+        }
+        println(line)
+    }
+}
+// output:
+//  id 1 name aé (2)
+//  id 2 name 😀 (2)
 ```
 
 A reader (`jsonObjectReader(source, jsonPermissiveLimits)`) can't merge as it
