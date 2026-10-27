@@ -12,6 +12,7 @@ pkgs.mkShell {
     gcc
     gnumake
     time
+    curl
     gdb
     valgrind
     llvm.clang-tools
