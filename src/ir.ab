@@ -5994,6 +5994,16 @@ class BootstrapLowerer(
         result
     }
 
+    /** Whether `branch` ends in a call of type `never` (`panic(…)`, or a
+     *  block whose last statement is one). */
+    fun lowerBranchEndsInNever(branch: BootstrapExpression): bool {
+        if (!bootstrapBranchEndsInCall(branch)) return false
+        if (branch.kind == "block") {
+            return this.lowerBranchEndsInNever(branch.children[branch.children.size - 1])
+        }
+        this.lowerExpressionType(branch) == "never"
+    }
+
     fun lowerCallDiverges(expression: BootstrapExpression): bool {
         var diverges = false
         if (expression.kind == "call") {
@@ -6561,6 +6571,33 @@ class BootstrapLowerer(
     // a new value as the source: sema types its result as that value, not
     // as a view (borrowResultOfFreshSource).
     fun lowerBorrowsFromNewValue(expression: BootstrapExpression): bool {
+        val chosen = this.lowerBorrowedArgument(expression)
+        chosen != null && chosen.kind != "identifier" &&
+            chosen.kind != "member" && chosen.kind != "index" &&
+            chosen.kind != "delegate.project" &&
+            this.lowerBorrowArgumentSource(chosen) == ""
+    }
+
+    // Whether `expression` calls a `borrow(source)` function or method with
+    // a place under a global as the source, or a view of one: sema types its
+    // result as an ordinary reference (managed.static), as reading the
+    // global is.
+    fun lowerBorrowsFromGlobal(expression: BootstrapExpression, depth: int = 0): bool {
+        val chosen = this.lowerBorrowedArgument(expression)
+        if (chosen == null || depth > 32) return false
+        if (chosen.kind == "call" || chosen.kind == "member.call") {
+            return this.lowerBorrowsFromGlobal(chosen, depth + 1)
+        }
+        if (chosen.kind != "identifier" && chosen.kind != "member" &&
+            chosen.kind != "index") return false
+        val root = bootstrapPlaceRootName(chosen)
+        root != "" && root != "this" && !this.isLocal(root) &&
+            !this.isParameter(root) && !this.isField(root) && this.isGlobal(root)
+    }
+
+    // The argument a `borrow(source)` call's result views (the receiver for
+    // `borrow(this)`), or null.
+    fun lowerBorrowedArgument(expression: BootstrapExpression): BootstrapExpression? {
         var argument: BootstrapExpression? = null
         if (expression.kind == "call") {
             val contract = this.lowerBorrowCallResultSource("", expression.text)
@@ -6587,11 +6624,7 @@ class BootstrapLowerer(
                 }
             }
         }
-        val chosen = argument
-        chosen != null && chosen.kind != "identifier" &&
-            chosen.kind != "member" && chosen.kind != "index" &&
-            chosen.kind != "delegate.project" &&
-            this.lowerBorrowArgumentSource(chosen) == ""
+        argument
     }
 
     fun lowerBorrowSource(expression: BootstrapExpression): string {
@@ -9237,7 +9270,16 @@ fun bootstrapLowerBlock(
         val lowered = expression.children[statement]
         result = lowerer.lowerExpression(lowered)
         if (statement + 1 < expression.children.size) lowerer.dropDiscarded(result, lowered)
-        val after = bootstrapConditionAfterIf(lowered)
+        // (A branch ending in a call of type `never` leaves, as the
+        // analyzer found: bootstrapInferIf.)
+        val after = if (lowered.kind == "if" && lowered.children.size == 3)
+            bootstrapConditionAfterIf(
+                lowered,
+                lowerer.lowerBranchEndsInNever(lowered.children[1]),
+                lowered.children[2].kind != "missing" &&
+                    lowerer.lowerBranchEndsInNever(lowered.children[2])
+            )
+        else ""
         if (after != "") lowerer.addNullableRefinements(
             lowered.children[0], after == "true"
         )
@@ -9404,8 +9446,10 @@ fun bootstrapLowerLocal(
                 lowerer.lowerPlacePath(expression.children[0])
             } else lowerer.lowerBorrowSource(expression.children[0])
             if (source == "" && !managedAlias &&
-                lowerer.lowerBorrowsFromNewValue(expression.children[0])) {
-                // A view of a new value is that value.
+                (lowerer.lowerBorrowsFromNewValue(expression.children[0]) ||
+                 lowerer.lowerBorrowsFromGlobal(expression.children[0]))) {
+                // A view of a new value is that value; a view of a global is
+                // an ordinary reference, as reading the global is.
                 lowerer.localTypes[lowerer.localTypes.size - 1] =
                     bootstrapBorrowElementType(localType)
                 bootstrapSemanticUnit()

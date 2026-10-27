@@ -539,7 +539,8 @@ A map without a declared type is `map.untyped`, other key types are
 `T?` holds a `T` or `null`. A nullable value can't be used as a `T` until
 the compiler can see it isn't `null`. Checking a `val` or a parameter
 narrows it on the path where the check holds, and after an `if` whose
-branch leaves the block (`return`, `break`, `continue`):
+branch leaves the block (`return`, `break`, `continue`, or a call of type
+`never` such as `panic(…)`, alone or ending the branch's block):
 
 ```abla
 import "abla/io"

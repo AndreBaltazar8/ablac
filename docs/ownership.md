@@ -113,8 +113,9 @@ Rules for `var` parameters:
   `ownership.mutable-alias`. Disjoint parts are fine:
   `copyInto(pair.left, pair.right)`.
 - Methods work the same way. The compiler works out on its own whether a
-  method changes its receiver (`this`), including through fields of fields,
-  and then treats the receiver as a `var` argument.
+  method changes its receiver (`this`), including through fields of fields
+  and elements of array fields (`parts[i].grow()` changes `this`), and then
+  treats the receiver as a `var` argument.
 
 `own` is valid only for affine types (`ownership.owned-parameter-type`
 otherwise). See [resources](#resources-values-with-one-owner).
@@ -197,11 +198,15 @@ or turned into a `var` (`ownership.borrow-mutation`,
 A function may return a reference that is new, or one rooted in a global:
 
 - a new object: a constructor call, a literal, a local `val` built up in
-  the function, or the result of a function that returns a new object;
+  the function, or the result of a function or method that returns a new
+  object (whatever its receiver: `local.clone()`, `holder.items[0].clone()`);
 - a reference rooted in a top-level binding, such as a global itself, a
-  field of one, a `for` variable over one, or a `val` read from one. A
-  global outlives every call, so returning it creates no unchecked alias;
-- an `if`/`when` whose every branch is one of these.
+  field of one, an element of one, an entry of a global `Map`
+  (`store.get(key) ?? panic(…)`), a `for` variable over one, a `val` read
+  from one, or a `borrow(name) T` result of a call given one. A global
+  outlives every call, so returning it creates no unchecked alias;
+- an `if`/`when` whose every branch is one of these, or ends in a call of
+  type `never` (`panic(…)`), which gives no value.
 
 ```abla fragment
 val shared = Counter(0)
@@ -212,9 +217,10 @@ fun same(counter: Counter): Counter = counter       // rejected
 ```
 
 Returning a parameter or `this` as a plain result is rejected
-(`ownership.managed-return-borrow-contract`): the caller would get a second,
-unchecked name for its own object. To return a view of it, declare the
-result `borrow(name) T`
+(`ownership.managed-return-borrow-contract`, whose `help:` names the
+contract to declare): the caller would get a second, unchecked name for its
+own object; so is a place under one, such as an entry of a parameter's
+`Map`. To return a view of it, declare the result `borrow(name) T`
 ([below](#borrowed-views-and-borrow-results)); otherwise build and return a
 new value, or return nothing and let the caller keep its own reference.
 
@@ -515,9 +521,16 @@ The contract may be left out. When every return path of a class or array
 result comes from one parameter or from `this` (or is a new object that
 stores it, or a call that borrows from it), the compiler infers
 `borrow(name)`: `fun same(counter: Counter): Counter = counter` and
-`fun get(): Counter = counter` in a method behave as above. A result whose
-paths come from several sources keeps its declared type, and a written
-contract is always kept as written.
+`fun get(): Counter = counter` in a method behave as above. So does a
+nullable result (`fun get(): Counter? = counter`, also a generic `T`
+instantiated with a nullable class), where a `null` path has no source. A
+result whose paths come from several sources keeps its declared type, and a
+written contract is always kept as written.
+
+A view of a global (`holder.get()` with `holder` a global) is as lasting as
+the global, so a local holding it is an ordinary reference, as
+`val c = holder.counter` is: it may be a `var`, and the global may change
+while it is used.
 
 ## Sharing: `Cell`, `Shared`, `Weak`, `Mutex`
 
