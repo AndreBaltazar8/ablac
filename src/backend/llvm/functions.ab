@@ -7348,20 +7348,24 @@ fun bootstrapLlvmEmitFunction(
         )) directlyAllocates = true
         allocationInstruction = allocationInstruction + 1
     }
-    var rootValues: array<bool> = []
-    if (collecting) rootValues = bootstrapLlvmGcRootPlan(
-        function, functionIndex, mayCollect
-    )
     val pressure = backend.pressureSafePoints && collecting && directlyAllocates &&
         !runtimeImplementation &&
         !bootstrapLlvmModuleInitializer(function.name)
+    // A loop that allocates also runs the safe point on its back edge (see there).
+    val loopSafePoints = bootstrapLlvmLoopSafePoints(function, pressure)
+    var rootValues: array<bool> = []
+    if (collecting) rootValues = bootstrapLlvmGcRootPlan(
+        function, functionIndex, mayCollect, loopSafePoints
+    )
     // A frame pushed lazily runs its safe point where it pushes (a site no path
     // into pushed it yet): those collect too, for the locals live across them.
     // (Pushed at entry after all, it runs there, before any local holds a value.)
     var lazySites: array<bool> = []
     val pressureSites: array<bool> = []
     if (pressure) {
-        val sites = bootstrapLlvmLazyRootSites(function, functionIndex, mayCollect, pressure)
+        val sites = bootstrapLlvmLazyRootSites(
+            function, functionIndex, mayCollect, pressure, loopSafePoints
+        )
         if (sites.size > 0 && !sites[0]) {
             lazySites = sites
             val states = bootstrapLlvmPushedStates(function, sites)
@@ -7374,7 +7378,7 @@ fun bootstrapLlvmEmitFunction(
     }
     var rootLocals: array<bool> = []
     if (collecting) rootLocals = bootstrapLlvmLocalRootPlan(
-        function, functionIndex, mayCollect, pressureSites
+        function, functionIndex, mayCollect, pressureSites, loopSafePoints
     )
     val scalarPlan = bootstrapLlvmBuildScalarPlan(
         program, function, functionIndex, nativeIndex
@@ -7401,7 +7405,9 @@ fun bootstrapLlvmEmitFunction(
     var rootSites: array<bool> = []
     if (lazy) {
         rootSites = if (lazySites.size > 0) lazySites
-            else bootstrapLlvmLazyRootSites(function, functionIndex, mayCollect, pressure)
+            else bootstrapLlvmLazyRootSites(
+                function, functionIndex, mayCollect, pressure, loopSafePoints
+            )
         lazy = rootSites.size > 0 && !rootSites[0]
     }
     if (lazy && pressure) {
@@ -8128,6 +8134,11 @@ fun bootstrapLlvmEmitFunction(
             matched = true
             val target = storage.block(instruction.target)
             if (pointerIsNull(target)) supported = false
+            if (bootstrapLlvmLoopSafePoint(loopSafePoints, instructionIndex)) {
+                bootstrapLlvmCallNamed(
+                    backend, "abla_runtime_memory_pressure_loop", [], "", false, []
+                )
+            }
             if (!pointerIsNull(target)) LLVMBuildBr(backend.builder, target)
             terminated = true
         }
@@ -8145,6 +8156,11 @@ fun bootstrapLlvmEmitFunction(
                         backend, "abla_as_bool",
                         [storage.values[instruction.left]],
                         "branch.condition", false, [true]
+                    )
+                }
+                if (bootstrapLlvmLoopSafePoint(loopSafePoints, instructionIndex)) {
+                    bootstrapLlvmCallNamed(
+                        backend, "abla_runtime_memory_pressure_loop", [], "", false, []
                     )
                 }
                 LLVMBuildCondBr(backend.builder, condition, yes, no)

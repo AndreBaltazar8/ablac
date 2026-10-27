@@ -802,6 +802,36 @@ fun bootstrapLlvmLoops(function: BootstrapIrFunction): BootstrapLlvmLoops {
     BootstrapLlvmLoops(loopStarts, loopEnds)
 }
 
+// Where a loop's back edge runs a pressure safe point: a jump or branch back to a label
+// at or before it, when an instruction from that label to it may allocate. A function's
+// own safe point runs once per call, where it pushes its frame, so a loop whose
+// allocations all happen in runtime helpers (string building, array growth) and that
+// calls nothing else would reach none however much garbage it made. Only with `pressure`
+// (the function's safe points); every analysis that asks whether an instruction may
+// collect counts these.
+fun bootstrapLlvmLoopSafePoints(function: BootstrapIrFunction, pressure: bool): array<bool> {
+    val points: array<bool> = []
+    val allocations: array<int> = []
+    allocations.append(0)
+    for (instruction in function.instructions) {
+        points.append(false)
+        allocations.append(allocations[allocations.size - 1] +
+            if (pressure && bootstrapLlvmInstructionMayAllocate(instruction)) 1 else 0)
+    }
+    if (!pressure) return points
+    val loops = bootstrapLlvmLoops(function)
+    var loop = 0
+    while (loop < loops.starts.size) {
+        val end = loops.ends[loop]
+        if (allocations[end + 1] > allocations[loops.starts[loop]]) points[end] = true
+        loop = loop + 1
+    }
+    points
+}
+
+fun bootstrapLlvmLoopSafePoint(loopSafePoints: array<bool>, index: int): bool =
+    index < loopSafePoints.size && loopSafePoints[index]
+
 // Each SSA value's definition and last use, by instruction index (-1 when it has
 // none). A value defined before a loop and used inside it counts as used at the
 // loop's back-edge.
@@ -887,7 +917,8 @@ fun bootstrapLlvmValueIntervals(function: BootstrapIrFunction): BootstrapLlvmVal
 fun bootstrapLlvmGcRootPlan(
     function: BootstrapIrFunction,
     functionIndex: BootstrapLlvmNameIndex,
-    mayCollect: array<bool>
+    mayCollect: array<bool>,
+    loopSafePoints: array<bool>
 ): array<bool> {
     val intervals = bootstrapLlvmValueIntervals(function)
     val definitions = intervals.definitions
@@ -904,7 +935,9 @@ fun bootstrapLlvmGcRootPlan(
             function.instructions[instruction],
             functionIndex,
             mayCollect
-        )) collectorCount = collectorCount + 1
+        ) || bootstrapLlvmLoopSafePoint(loopSafePoints, instruction)) {
+            collectorCount = collectorCount + 1
+        }
         collectorPrefix.append(collectorCount)
         instruction = instruction + 1
     }
@@ -913,8 +946,12 @@ fun bootstrapLlvmGcRootPlan(
     while (value < definitions.size) {
         val definition = definitions[value]
         val lastUse = lastUses[value]
+        // A value live around a loop ends at its back edge (bootstrapLlvmValueIntervals),
+        // whose safe point collects while it is still live: that one counts too.
+        val end = if (lastUse >= 0 && bootstrapLlvmLoopSafePoint(loopSafePoints, lastUse))
+            lastUse + 1 else lastUse
         result.append(definition >= 0 && lastUse > definition &&
-            collectorPrefix[lastUse] > collectorPrefix[definition + 1])
+            collectorPrefix[end] > collectorPrefix[definition + 1])
         value = value + 1
     }
     result
@@ -996,7 +1033,8 @@ fun bootstrapLlvmLocalRootPlan(
     function: BootstrapIrFunction,
     functionIndex: BootstrapLlvmNameIndex,
     mayCollect: array<bool>,
-    pressureSites: array<bool>
+    pressureSites: array<bool>,
+    loopSafePoints: array<bool>
 ): array<bool> {
     val count = function.instructions.size
     val localIndex = bootstrapLlvmLocalIndex(function)
@@ -1069,6 +1107,7 @@ fun bootstrapLlvmLocalRootPlan(
         }
         var collectors = collectorPrefix[index]
         if (bootstrapLlvmInstructionMayCollect(instruction, functionIndex, mayCollect) ||
+            bootstrapLlvmLoopSafePoint(loopSafePoints, index) ||
             index < pressureSites.size && pressureSites[index] && !terminal[index]) {
             collectors = collectors + 1
         }
@@ -1129,7 +1168,8 @@ fun bootstrapLlvmLazyRootSites(
     function: BootstrapIrFunction,
     functionIndex: BootstrapLlvmNameIndex,
     mayCollect: array<bool>,
-    pressure: bool
+    pressure: bool,
+    loopSafePoints: array<bool>
 ): array<bool> {
     val sites: array<bool> = []
     var block = 0
@@ -1139,7 +1179,8 @@ fun bootstrapLlvmLazyRootSites(
         val instruction = function.instructions[index]
         if (instruction.opcode == "label") block = index
         else if (bootstrapLlvmInstructionMayCollect(instruction, functionIndex, mayCollect) ||
-            pressure && bootstrapLlvmInstructionMayAllocate(instruction)) {
+            pressure && bootstrapLlvmInstructionMayAllocate(instruction) ||
+            bootstrapLlvmLoopSafePoint(loopSafePoints, index)) {
             sites[block] = true
         }
         index = index + 1
@@ -3431,6 +3472,9 @@ fun bootstrapLlvmSelfHostedRuntimeSymbol(name: string): string {
     }
     if (name == "__ablaRuntimeMemoryPressure") {
         symbol = "abla_runtime_memory_pressure"
+    }
+    if (name == "__ablaRuntimeMemoryPressureLoop") {
+        symbol = "abla_runtime_memory_pressure_loop"
     }
     if (name == "__ablaRuntimeStringStatic") symbol = "abla_string_static"
     if (name == "__ablaRuntimeStringData") symbol = "abla_string_data"

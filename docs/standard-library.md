@@ -254,8 +254,10 @@ reachable.
 Collection has two modes:
 
 - **Pressure collection** (the default for hosted native programs with
-  `main`). Every allocating function is a safe point: on entry it collects
-  once the tracked heap has grown past a threshold. (Comparing or indexing a
+  `main`). Every allocating function is a safe point: on entry (where its
+  root frame is pushed) and on the back edge of each of its loops that
+  allocates, it collects once the tracked heap has grown past a threshold, so
+  a loop that only builds strings or grows arrays collects too. (Comparing or indexing a
   string may flatten a rope, which allocates the rope's own copy; that alone
   makes no safe point.) The first collection runs
   at 32 MiB; each later one once the heap has grown by

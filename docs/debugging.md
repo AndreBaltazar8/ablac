@@ -131,7 +131,9 @@ A value that some function fails to keep rooted is only freed when a
 collection happens to run while it is unrooted, which under normal pressure
 can take millions of allocations. Run a hosted native program with
 `ABLA_GC_STRESS=1` to make every safe point collect: the program reads the
-variable once at startup, and then each allocating function collects on entry.
+variable once at startup, and then each allocating function collects on entry
+(and a loop that allocates on every 1,024th pass over its back edge, so building
+a long list doesn't walk it once per node).
 A missing root then frees its value at once, and the next use of it fails
 close to the cause.
 

@@ -319,20 +319,29 @@ directory lookup per candidate pointer) and sweeps with `free`.
   the runtime's integer arithmetic to native integers whatever the build
   profile removes that cost for every runtime function, not only the
   collector, and makes the parked pass unnecessary.
-- **Next: lazy sweep.** Sweep pages on allocation instead of all at once at
-  the end of a collection, so a collection's pause is its mark only; the
-  sweep's work moves into allocation and stays proportional to it. Estimated
-  2–3 days; revisit against a real program's release pauses before starting.
-- **Gap: a loop that allocates only through the runtime never collects.** A
-  pressure safe point runs where a function that allocates pushes its frame,
-  once per call. A loop whose allocations all happen in runtime helpers (string
-  building, array growth) and that calls no other function reaches none: one
+- **A real server's pauses are its sweep.** A release game server under six
+  bots measured: marking about 2 ms; the pause grows with the garbage freed,
+  about 1 µs per object (some 1,400 instances of about 320 bytes each made per
+  tick). Freeing in the background (`memorySetBackgroundFree(true)`) gave the
+  best 99th-percentile pause, 3.2 ms against 15 ms; a 256 MB growth step gave
+  the worst. Incremental marking is therefore not needed.
+- **Next: a cheaper sweep.** Sweep pages on allocation instead of all at once
+  at the end of a collection (lazy sweep), or reuse freed objects by size
+  class instead of returning each to `free`, so a collection's pause is its
+  mark only and the sweep's work stays proportional to allocation. Estimated
+  2–3 days.
+- **Fixed: a loop that allocates only through the runtime never collected.**
+  A function's pressure safe point ran once per call, where it pushes its
+  frame, so a loop whose allocations all happen in runtime helpers (string
+  building, array growth) and that calls no other function reached none: one
   that made 136 MB of garbage strings in `main` never collected, under
-  `ABLA_GC_STRESS=1` too, with each of four recent compilers. A safe point
-  on such a loop's back edge (or in the runtime's allocating helpers) closes it.
+  `ABLA_GC_STRESS=1` too. Each loop that allocates now runs the safe point on
+  its back edge; every analysis that asks whether an instruction may collect
+  (the root plan for values and for locals, the lazy frame's push sites)
+  counts it, so the frame is pushed there and what lives across it is rooted.
 - **Later: background free on by default for hosted programs** (today
   `memorySetBackgroundFree(true)`), gated on a long run, collector stress and a
-  pause comparison; incremental marking only after lazy sweep.
+  pause comparison (the server measurement above favours it).
 
 ## 4. Compile-time effects and subparser safety
 

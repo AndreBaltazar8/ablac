@@ -306,6 +306,7 @@ test-serial: ablac
 	tools/test-gc-growth.sh $(COMPILER)
 	tools/test-object-layout.sh $(COMPILER)
 	tools/test-cache-layout-version.sh $(COMPILER)
+	tools/test-loop-safe-point.sh $(COMPILER)
 
 check: test self-rebuild
 
