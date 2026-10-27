@@ -15,7 +15,10 @@
 # - a method returning a nullable field is a view of its receiver, like one
 #   returning a non-null field, and a view of a global is held in a local
 #   like a read of the global (a view of a local still conflicts with
-#   changing it, and can't be held in a `var`).
+#   changing it, and can't be held in a `var`);
+# - a string read through a view is a value of its own outside a region: it
+#   joins a plain string and is returned (in a region, storing it outside is
+#   still refused).
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -72,5 +75,7 @@ rejected rooted-refused 2 "ownership.managed-return-borrow-contract:function.cac
 runs getter "0 1 2 3 4 5"
 rejected getter-refused 1 '`holder` is changed while `account`, which borrows it'
 rejected getter-mutable 1 "ownership.borrow-mutable-local:account"
+runs view-strings "ann none ann x an red ann/bob"
+rejected view-strings-region 3 "region.escape:assignment.saved" "region.escape:assignment.other"
 
 echo "ownership precision: ok"

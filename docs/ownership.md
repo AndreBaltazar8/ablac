@@ -532,6 +532,13 @@ the global, so a local holding it is an ordinary reference, as
 `val c = holder.counter` is: it may be a `var`, and the global may change
 while it is used.
 
+A scalar or a string read through a view (`view.name`, `view.names[0]`) is
+a value of its own, as one read through a parameter is: it joins a plain
+string (`view?.name ?? "none"`, `if (f) view.name else ""`), may be
+returned, and stays valid when the view's source changes. Inside a
+`region { ... }` a string read through a view of a region's object stays a
+view, because the region frees it ([regions](regions.md)).
+
 ## Sharing: `Cell`, `Shared`, `Weak`, `Mutex`
 
 When one owner isn't enough, these wrappers make sharing explicit:
