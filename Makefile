@@ -159,6 +159,7 @@ test-serial: ablac
 	PARITY_SET=probes PARITY_OUTPUT=$(BUILD_DIR)/compile-time-parity-probes tools/test-compile-time-parity.sh $(COMPILER)
 	tools/test-scoped-region.sh $(COMPILER)
 	tools/test-region-extension-names.sh $(COMPILER)
+	tools/test-null-default-leave.sh $(COMPILER)
 	tools/test-exhaustive-when.sh $(COMPILER)
 	tools/test-loop-control.sh $(COMPILER)
 	tools/test-nullable-refinement.sh $(COMPILER)
