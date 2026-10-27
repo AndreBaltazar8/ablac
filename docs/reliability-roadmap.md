@@ -286,6 +286,54 @@ traces cover every control-flow edge, Miri-like IR interpretation detects
 invalid accesses during tests, and safe stress programs pass ASan/TSan with no
 leaks other than explicitly process-lifetime allocations.
 
+### Collector pauses: measured, and what comes next
+
+A synthetic heap of 200,000 entities (305 MiB live, 134 MiB of garbage per
+collection) measured these pauses on one machine: a native `--fast` build
+ticked in 71.7 ms on average with a worst pause of 2.15 s and an explicit
+collection of 2.35 s; a release build in 20.6 ms, 506 ms and 437 ms. The
+collector allocates each object with `malloc` behind a 32-byte header,
+rebuilds a page directory at every collection, marks conservatively (a
+directory lookup per candidate pointer) and sweeps with `free`.
+
+- **Shipped:** `ABLA_GC_GROWTH=<bytes>` sets the least growth between
+  collections (and the first collection at half of it) without a rebuild: a
+  smaller step collects more often over less garbage, so each pause is
+  shorter.
+- **Parked: the collector optimized in `--fast` builds.** The collections
+  (`__ablaRuntimePlatformMemoryCollect`, the background and pressure ones) and
+  what they call, found by walking the LLVM calls, run one pass pipeline
+  while every other function with a body is marked `optnone` and `noinline`
+  for that run, the marks then removed. Compile CPU of a mid-size program
+  (four interleaved runs) against the explicit collection above: the --o1
+  pipeline with the inliner +14% and 404 ms; function passes only
+  (`mem2reg,sroa,early-cse,instcombine,simplifycfg`) +1.5% and 433 ms;
+  `mem2reg` alone +0% and 1,082 ms. The function-pass variant passes the 3%
+  compile-cost bar. It is kept, unmerged, on the branch
+  `backend/gc-fast-collector-parked` (b7e911ab), built only as a first-stage
+  compiler: landing it needs a full verify (self-build identity, the suite)
+  and a collector stress run of its own.
+- **The long-term fix: native integers in runtime functions.** Most of a
+  `--fast` collection's cost is its integers boxed through a runtime call per
+  operation, as unoptimized code of any runtime function has them. Lowering
+  the runtime's integer arithmetic to native integers whatever the build
+  profile removes that cost for every runtime function, not only the
+  collector, and makes the parked pass unnecessary.
+- **Next: lazy sweep.** Sweep pages on allocation instead of all at once at
+  the end of a collection, so a collection's pause is its mark only; the
+  sweep's work moves into allocation and stays proportional to it. Estimated
+  2–3 days; revisit against a real program's release pauses before starting.
+- **Gap: a loop that allocates only through the runtime never collects.** A
+  pressure safe point runs where a function that allocates pushes its frame,
+  once per call. A loop whose allocations all happen in runtime helpers (string
+  building, array growth) and that calls no other function reaches none: one
+  that made 136 MB of garbage strings in `main` never collected, under
+  `ABLA_GC_STRESS=1` too, with each of four recent compilers. A safe point
+  on such a loop's back edge (or in the runtime's allocating helpers) closes it.
+- **Later: background free on by default for hosted programs** (today
+  `memorySetBackgroundFree(true)`), gated on a long run, collector stress and a
+  pause comparison; incremental marking only after lazy sweep.
+
 ## 4. Compile-time effects and subparser safety
 
 Do not equate "same language" with "all effects are always allowed."

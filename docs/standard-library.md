@@ -261,7 +261,10 @@ Collection has two modes:
   at 32 MiB; each later one once the heap has grown by
   `max(64 MiB, half of what the last collection kept)`, capped below the limit.
   `memorySetCollectionGrowth(bytes)` lowers the least growth for programs that
-  care about their footprint. Run with `ABLA_GC_STRESS=1` to
+  care about their footprint. Without a rebuild, `ABLA_GC_GROWTH=<bytes>`
+  (decimal, at least 1 MiB; read once at startup) sets the least growth and
+  starts the first collection at half of it: a smaller step collects more often
+  over less garbage, so each pause is shorter. Run with `ABLA_GC_STRESS=1` to
   collect at every safe point instead
   ([debugging.md](debugging.md#collector-stress-abla_gc_stress1)).
 - **Manual collection** (the default for wasm and freestanding targets, and

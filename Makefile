@@ -302,6 +302,7 @@ test-serial: ablac
 	tools/test-ownership-precision.sh $(COMPILER)
 	tools/test-local-root-liveness.sh $(COMPILER)
 	tools/test-global-initializer-split.sh $(COMPILER)
+	tools/test-gc-growth.sh $(COMPILER)
 
 check: test self-rebuild
 
