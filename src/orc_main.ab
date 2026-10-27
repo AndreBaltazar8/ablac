@@ -3,6 +3,7 @@ import "module.ab"
 import "analysis_service.ab"
 import "toolchain.ab"
 import "jit_cache.ab"
+import "test_runner.ab"
 import "ct_bridge_driver.ab"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
@@ -239,57 +240,181 @@ fun bootstrapRunBuilt(
 // takes the middle profile, between --fast and the release default.
 var bootstrapOrcBalanced = false
 
-// `ablac test <file.ab>... [--o1] [--no-cache]`: builds each test program
-// (--fast, or --o1) into build/abla-test and runs it; one passes when it
-// exits 0 (see abla/test's testsPassed). 0 when every one passed.
+// `ablac test <file.ab|directory>... [--o1] [--no-cache] [--cache-dir <dir>] [--each] [-v]`:
+// builds the test programs (--fast, or --o1) into build/abla-test and runs each; one
+// passes when it exits 0 (see abla/test's testsPassed). A directory names its files
+// ending in `test.ab`. Several files build as few programs as they can (test_runner.ab:
+// bundles, each run once per test in a process of its own); --each, or a single file,
+// builds every file on its own. -v lists each bundle's files and what fell back. 0 when
+// every test passed.
 fun bootstrapOrcTest(argumentCount: int): int {
-    val sources: array<string> = []
+    val arguments: array<string> = []
     var useCache = true
+    var each = false
+    var verbose = false
     var option = 1
     while (option < argumentCount) {
         val value = linuxArgument(option)
         if (value == "--o1") bootstrapOrcBalanced = true
         else if (value == "--no-cache") useCache = false
+        else if (value == "--each") each = true
+        else if (value == "-v" || value == "--verbose") verbose = true
         else if (value == "--cache-dir" && option + 1 < argumentCount) {
             option = option + 1
             bootstrapCacheDirectoryRequest = linuxArgument(option)
-        } else sources.append(value)
+        } else arguments.append(value)
         option = option + 1
     }
+    val sources = bootstrapTestSources(arguments)
     if (sources.size == 0) return 2
     val target = bootstrapTargetDescriptor(bootstrapHostTargetName())
-    val directory = Path("build/abla-test")
-    directory.createDirectories()
+    Path("build/abla-test").createDirectories()
     var failed = 0
-    var index = 0
-    while (index < sources.size) {
-        val source = sources[index]
-        var name = Path(source).name()
-        if (name.size > 3 && name.slice(name.size - 3, name.size) == ".ab") {
-            name = name.slice(0, name.size - 3)
+    if (each || sources.size == 1) {
+        for (source in sources) {
+            if (!bootstrapOrcTestAlone(source, useCache, target)) failed = failed + 1
         }
-        val output = directory.child(name).text
-        var result = bootstrapOrcBuild(
-            source, output, !bootstrapOrcBalanced, useCache, target,
-            "executable"
-        )
-        val built = result == 0
-        if (built) result = linuxCommand(output).run()
-        if (result == 0) {
-            linuxPrintStandardOutput("PASS $source\n")
-        } else {
-            failed = failed + 1
-            linuxPrintStandardOutput(
-                if (built) "FAIL $source (exit $result)\n"
-                else "FAIL $source (build)\n"
+    } else {
+        val bundles = bootstrapTestBundlePartition(sources)
+        var count = 0
+        for (chosen in bundles) {
+            if (chosen + 1 > count) count = chosen + 1
+        }
+        var bundle = 0
+        while (bundle < count) {
+            val members: array<string> = []
+            var index = 0
+            while (index < sources.size) {
+                if (bundles[index] == bundle) members.append(sources[index])
+                index = index + 1
+            }
+            failed = failed + bootstrapOrcTestBundle(
+                bundle, members, useCache, target, verbose
             )
+            bundle = bundle + 1
         }
-        index = index + 1
     }
     linuxPrintStandardOutput(
         "${sources.size - failed} passed, $failed failed\n"
     )
     if (failed == 0) 0 else 1
+}
+
+// Builds `source` on its own into build/abla-test and runs it; whether it passed.
+fun bootstrapOrcTestAlone(
+    source: string,
+    useCache: bool,
+    target: BootstrapTargetDescriptor
+): bool {
+    var name = Path(source).name()
+    if (name.size > 3 && name.slice(name.size - 3, name.size) == ".ab") {
+        name = name.slice(0, name.size - 3)
+    }
+    val output = Path("build/abla-test").child(name).text
+    var result = bootstrapOrcBuild(
+        source, output, !bootstrapOrcBalanced, useCache, target,
+        "executable"
+    )
+    val built = result == 0
+    if (built) result = linuxCommand(output).run()
+    bootstrapOrcTestReport(source, built, result)
+}
+
+fun bootstrapOrcTestReport(source: string, built: bool, result: int): bool {
+    if (result == 0) linuxPrintStandardOutput("PASS $source\n")
+    else {
+        linuxPrintStandardOutput(
+            if (built) "FAIL $source (exit $result)\n"
+            else "FAIL $source (build)\n"
+        )
+    }
+    result == 0
+}
+
+// Builds `members` as bundle `index` and runs each test in it; the failures. A build
+// that fails is retried without the files its errors are in or reach them through
+// their imports (at most twice), and those files are built and run on their own (which
+// reports their errors); when the errors can't be placed, every member is.
+fun bootstrapOrcTestBundle(
+    index: int,
+    members: array<string>,
+    useCache: bool,
+    target: BootstrapTargetDescriptor,
+    verbose: bool
+): int {
+    val remaining: array<string> = []
+    for (member in members) remaining.append(member)
+    val alone: array<string> = []
+    val output = "build/abla-test/bundle-$index"
+    if (verbose && members.size == 1) {
+        linuxPrintStandardOutput("bundle $index: one file, built on its own: ${members[0]}\n")
+    }
+    var built = false
+    var round = 0
+    while (!built && remaining.size > 1 && round < 3) {
+        val root = "$output.ab"
+        Path(root).writeTextAtomic(bootstrapTestBundleRoot(2, remaining))
+        bootstrapBuildDiagnosticsKept = true
+        bootstrapBuildDiagnostics = ""
+        val status = bootstrapOrcBuild(
+            root, output, !bootstrapOrcBalanced, useCache, target, "executable"
+        )
+        bootstrapBuildDiagnosticsKept = false
+        if (status == 0) built = true
+        else {
+            val paths = bootstrapTestDiagnosticPaths(bootstrapBuildDiagnostics)
+            val kept: array<string> = []
+            val dropped: array<string> = []
+            for (member in remaining) {
+                var hit = false
+                for (reached in bootstrapTestReach(member)) {
+                    for (path in paths) {
+                        if (path == reached) hit = true
+                    }
+                }
+                if (hit) dropped.append(member) else kept.append(member)
+            }
+            if (dropped.size == 0 || kept.size == 0) {
+                for (member in remaining) alone.append(member)
+                if (verbose) {
+                    linuxPrintStandardOutput(
+                        "bundle $index: its errors are in no one file; its ${remaining.size} files build on their own\n"
+                    )
+                }
+                remaining.truncate(0)
+            } else {
+                for (member in dropped) alone.append(member)
+                if (verbose) {
+                    linuxPrintStandardOutput(
+                        "bundle $index: ${dropped.size} files build on their own (their errors):\n"
+                    )
+                    for (member in dropped) linuxPrintStandardOutput("  $member\n")
+                }
+                remaining.truncate(0)
+                for (member in kept) remaining.append(member)
+            }
+        }
+        round = round + 1
+    }
+    if (!built) {
+        for (member in remaining) alone.append(member)
+        remaining.truncate(0)
+    }
+    if (verbose && remaining.size > 0) {
+        linuxPrintStandardOutput("bundle $index (${remaining.size} files, $output):\n")
+        for (member in remaining) linuxPrintStandardOutput("  $member\n")
+    }
+    var failed = 0
+    var entry = 0
+    while (entry < remaining.size) {
+        val result = linuxCommand(output).argument("$entry").run()
+        if (!bootstrapOrcTestReport(remaining[entry], true, result)) failed = failed + 1
+        entry = entry + 1
+    }
+    for (member in alone) {
+        if (!bootstrapOrcTestAlone(member, useCache, target)) failed = failed + 1
+    }
+    failed
 }
 
 // Debug information for `build`: "on" (-g / --debug), "off" (--no-debug) or

@@ -1,0 +1,222 @@
+import "module.ab"
+import "abla/sys/linux/fs"
+
+// `ablac test` over many files builds them as few programs as it can (bundles): one
+// generated root imports each test file under an alias, which gives every top-level
+// name of that file (its `main` and helpers included) the file's own prefix, and its
+// `main` runs the test the first argument names. A bundle is built once (one frontend,
+// one object, one link) and run once per test, each run a process of its own: globals
+// start fresh, and a crash or an exit status is that test's alone. What a file declares
+// for a type of another module (an extension member, an `extend` conformance) or for the
+// link (an extern) keeps no prefix, so two files declaring the same one go to separate
+// bundles. A file a bundle can't build with is built and run on its own, as a single
+// file always is.
+
+/** The test files `arguments` name, each once: a file as given, a directory's files
+ *  whose names end in `test.ab` (sorted). */
+fun bootstrapTestSources(arguments: array<string>): array<string> {
+    val sources: array<string> = []
+    for (argument in arguments) {
+        val path = Path(argument)
+        if (path.info().isDirectory()) {
+            val found: array<string> = []
+            for (entry in path.entries()) {
+                val name = entry.name()
+                if (name.size >= 7 && name.slice(name.size - 7, name.size) == "test.ab" &&
+                    !entry.info().isDirectory()) {
+                    found.append(bootstrapTestJoin(argument, name))
+                }
+            }
+            for (name in bootstrapTestSorted(found)) bootstrapTestAppendOnce(sources, name)
+        } else bootstrapTestAppendOnce(sources, argument)
+    }
+    sources
+}
+
+fun bootstrapTestJoin(directory: string, name: string): string =
+    if (directory.size > 0 && directory[directory.size - 1] == 47) "$directory$name"
+    else "$directory/$name"
+
+fun bootstrapTestAppendOnce(var values: array<string>, value: string): void {
+    var known = false
+    for (existing in values) {
+        if (existing == value) known = true
+    }
+    if (!known) values.append(value)
+    return
+}
+
+/** `values` in byte order (an insertion sort: a directory's tests are few). */
+fun bootstrapTestSorted(values: array<string>): array<string> {
+    val sorted: array<string> = []
+    for (value in values) {
+        var at = sorted.size
+        sorted.append(value)
+        while (at > 0 && bootstrapTestLess(value, sorted[at - 1])) {
+            sorted[at] = sorted[at - 1]
+            at = at - 1
+        }
+        sorted[at] = value
+    }
+    sorted
+}
+
+fun bootstrapTestLess(left: string, right: string): bool {
+    var index = 0
+    while (index < left.size && index < right.size) {
+        if (left[index] != right[index]) return left[index] < right[index]
+        index = index + 1
+    }
+    left.size < right.size
+}
+
+/** What a test file declares that no other file of its bundle may: the extension
+ *  members, `extend` conformances and externs among its top-level declarations. */
+fun bootstrapTestBundleClaims(path: string): array<string> {
+    val claims: array<string> = []
+    val source = Path(path).readText()
+    val discovery = bootstrapModuleDiscovery(source, path)
+    for (declaration in discovery.declarations) {
+        if (declaration.extensionOwner != "") {
+            bootstrapTestAppendOnce(
+                claims, "member:${declaration.extensionOwner}.${declaration.name}"
+            )
+        }
+        if (declaration.kind == "extend") {
+            for (conformance in declaration.conformances) {
+                bootstrapTestAppendOnce(claims, "extend:${declaration.name}:$conformance")
+            }
+        }
+        if (declaration.kind == "extern") {
+            bootstrapTestAppendOnce(claims, "extern:${declaration.name}")
+        }
+    }
+    claims
+}
+
+/** Each source's bundle: the first bundle none of whose files claims what it claims
+ *  (bootstrapTestBundleClaims), in order, so a suite without such clashes is one bundle. */
+fun bootstrapTestBundlePartition(sources: array<string>): array<int> {
+    val bundles: array<int> = []
+    // Every claim taken so far, and the bundle that took it.
+    val takenClaims: array<string> = []
+    val takenBy: array<int> = []
+    var count = 0
+    for (source in sources) {
+        val claims = bootstrapTestBundleClaims(source)
+        var chosen = -1
+        var bundle = 0
+        while (chosen < 0 && bundle < count) {
+            var clash = false
+            var taken = 0
+            while (!clash && taken < takenClaims.size) {
+                if (takenBy[taken] == bundle) {
+                    for (claim in claims) {
+                        if (claim == takenClaims[taken]) clash = true
+                    }
+                }
+                taken = taken + 1
+            }
+            if (!clash) chosen = bundle
+            bundle = bundle + 1
+        }
+        if (chosen < 0) {
+            chosen = count
+            count = count + 1
+        }
+        for (claim in claims) {
+            takenClaims.append(claim)
+            takenBy.append(chosen)
+        }
+        bundles.append(chosen)
+    }
+    bundles
+}
+
+/** The root module of a bundle written in `directory` (relative to the working
+ *  directory, `depth` levels below it): each member imported under an alias, by a path
+ *  that names it as the working directory does, and a `main` that runs the member its
+ *  first argument numbers (2 for any other). */
+fun bootstrapTestBundleRoot(depth: int, members: array<string>): string {
+    var up = ""
+    var level = 0
+    while (level < depth) {
+        up = "$up../"
+        level = level + 1
+    }
+    var text = "// Generated by `ablac test`: runs the test its first argument numbers.\nimport \"abla/sys/linux/process\"\n"
+    var index = 0
+    while (index < members.size) {
+        val member = bootstrapNormalizeModulePath(members[index])
+        val path = if (member.size > 0 && member[0] == 47) member else "$up$member"
+        text = "${text}import \"$path\" as abla_test_$index\n"
+        index = index + 1
+    }
+    text = "${text}\nfun main: int {\n    val entry = if (linuxArgumentCount() > 0) linuxArgument(0) else \"\"\n"
+    index = 0
+    while (index < members.size) {
+        text = "$text    if (entry == \"$index\") return abla_test_$index.main()\n"
+        index = index + 1
+    }
+    "$text    2\n}\n"
+}
+
+/** The modules `source` reaches through its imports, itself included, by the paths a
+ *  build names them. */
+fun bootstrapTestReach(source: string): array<string> {
+    val reached: array<string> = [bootstrapNormalizeModulePath(source)]
+    var next = 0
+    while (next < reached.size) {
+        val module = reached[next]
+        next = next + 1
+        val text = Path(module).readText()
+        for (edge in bootstrapScanImports(text).edges) {
+            if (!edge.provider) {
+                val imported = bootstrapResolveImport(module, edge.source)
+                bootstrapTestAppendOnce(reached, imported)
+                bootstrapTestAppendOnce(reached, bootstrapImportAliasExposedTarget(imported))
+            }
+        }
+    }
+    reached
+}
+
+/** The source files a build's diagnostics point at (`source[…]:<path>:<begin>:<end>` and
+ *  `--> <path>:<line>:<column>` lines). */
+fun bootstrapTestDiagnosticPaths(diagnostics: string): array<string> {
+    val paths: array<string> = []
+    var begin = 0
+    while (begin < diagnostics.size) {
+        var end = begin
+        while (end < diagnostics.size && diagnostics[end] != 10) end = end + 1
+        var line = diagnostics.slice(begin, end)
+        while (line.size > 0 && line[0] == 32) line = line.slice(1, line.size)
+        var path = ""
+        if (line.size > 4 && line.slice(0, 4) == "--> ") {
+            path = bootstrapTestStripPosition(line.slice(4, line.size))
+        } else if (line.size > 7 && line.slice(0, 7) == "source[") {
+            var close = 7
+            while (close < line.size && line[close] != 93) close = close + 1
+            if (close + 2 < line.size && line[close + 1] == 58) {
+                path = bootstrapTestStripPosition(line.slice(close + 2, line.size))
+            }
+        }
+        if (path != "") bootstrapTestAppendOnce(paths, path)
+        begin = end + 1
+    }
+    paths
+}
+
+/** `path:<n>:<n>` without its two trailing numbers. */
+fun bootstrapTestStripPosition(text: string): string {
+    var end = text.size
+    var fields = 0
+    while (fields < 2) {
+        var colon = end - 1
+        while (colon >= 0 && text[colon] != 58) colon = colon - 1
+        if (colon < 0) return ""
+        end = colon
+        fields = fields + 1
+    }
+    text.slice(0, end)
+}

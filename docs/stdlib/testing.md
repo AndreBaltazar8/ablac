@@ -41,5 +41,17 @@ FAIL tests/text.ab (exit 1)
 
 `ablac test` builds each file (into `build/abla-test/`), runs it, prints
 `PASS <file>` or `FAIL <file> (exit <status>)`, and ends with a summary. Its
-exit status is 1 when any program failed. It accepts `--no-cache` like
-`ablac build`.
+exit status is 1 when any program failed. It accepts `--no-cache` and
+`--cache-dir <dir>` like `ablac build`. A directory names its files ending in
+`test.ab`.
+
+Several files build as few programs as possible, so the modules they share
+are compiled once rather than once per test. A generated program imports each
+file under an alias (so files may reuse names such as `main` or a helper's)
+and runs the test its argument numbers, each test in a process of its own:
+its globals start fresh and its crash or exit status is its own, exactly as
+when it is built alone. Files that declare the same extension member,
+`extend` conformance or extern go to separate programs. A file whose build
+fails (or whose imports do) is built and run on its own, which reports its
+errors; the others still share their program. `--each` builds every file on
+its own; `-v` lists which files share a program.
