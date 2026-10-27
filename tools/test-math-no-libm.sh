@@ -12,7 +12,14 @@ mkdir -p "$output_directory"
 source="$project_root/tests/cases/math-no-libm/everything.ab"
 libm='^_?(fma|fmaf|floor|ceil|trunc|round|roundeven|rint|nearbyint|fmin|fmax|fminimum|fmaximum|sqrt|fabs|sin|cos|tan|atan|atan2|exp|log|pow|hypot|fmod|copysign)$'
 
-for target in x86_64-linux x86_64-macos arm64-macos; do
+targets=(x86_64-linux x86_64-macos arm64-macos)
+if [[ $(uname -s) != Darwin && -z ${ABLA_MACOS_SDK:-} ]]; then
+    # Hosted Mach-O objects also compile the Darwin adapter, which needs SDK
+    # headers. Release CI runs this check on macOS for both Mach-O targets.
+    echo 'math no-libm: Mach-O requires ABLA_MACOS_SDK; checking ELF here'
+    targets=(x86_64-linux)
+fi
+for target in "${targets[@]}"; do
     object="$output_directory/everything-$target.o"
     "$compiler" build "$source" --target "$target" --emit object -o "$object" --no-cache
     calls=$(nm -u "$object" | awk '{print $NF}' | grep -E "$libm" || true)

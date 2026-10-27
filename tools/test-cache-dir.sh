@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A build cache outside the tree serves copies of a project: two copies of one
 # program at different absolute paths, each built from its own root with the same
-# --cache-dir. The second build is a hit, gives exactly what an uncached build there
+# --cache-dir. The second build is a hit, gives exactly what a cold-cache build there
 # gives (a development object carries no working directory: its debug information's
 # compilation directory is "."), and leaves no cache inside either copy; `ablac run` in
 # the second copy reuses the first one's object. ABLA_CACHE_DIR names the directory as
@@ -47,13 +47,15 @@ runs "$second/out/main"
 for copy in "$first" "$second"; do
     [[ ! -e $copy/build/.abla-cache ]] || fail "a build with --cache-dir cached inside $copy"
 done
-# The hit is what an uncached build of the second copy gives.
+# Compare identical compilation paths: cached ELF builds partition the module,
+# while --no-cache builds it as one object. A new empty cache forces all parts
+# to be rebuilt without changing that partitioning.
 cp "$second/out/main" "$work/hit"
 cp "$second/out/main.o" "$work/hit.o"
 rm -f "$second/out/main.ll"
-build "$second" --no-cache
-cmp -s "$second/out/main.o" "$work/hit.o" || fail "the cached object differs from an uncached build's"
-cmp -s "$second/out/main" "$work/hit" || fail "the cached executable differs from an uncached build's"
+build "$second" --cache-dir "$work/fresh-cache"
+cmp -s "$second/out/main.o" "$work/hit.o" || fail "the cached object differs from a cold-cache build's"
+cmp -s "$second/out/main" "$work/hit" || fail "the cached executable differs from a cold-cache build's"
 # Neither copy's directory reaches a development object.
 if LC_ALL=C grep -q "$work" "$second/out/main.o"; then
     fail "a development object names the directory it was built in"

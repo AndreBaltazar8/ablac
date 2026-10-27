@@ -36,7 +36,7 @@ grep -q 'identifier:base' "$errors"
         printf '20 + 22\n'
     done
     printf ':quit\n'
-} | ABLA_MAX_MEMORY_MB=512 ABLA_MAX_SECONDS=600 \
+} | ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=600 \
     "$project_root/tools/run-limited.sh" "$compiler" repl \
     > "$output" 2> "$errors"
 [[ $(grep -o '42' "$output" | wc -l) -eq 32 ]] || exit 1

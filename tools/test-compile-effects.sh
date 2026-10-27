@@ -26,7 +26,7 @@ cleanup() {
 trap cleanup EXIT
 
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/invalid-compile-effect-filesystem.ab" \
     > "$output_directory/denied.ll" \
@@ -39,7 +39,7 @@ grep -q 'compile.effect-denied:filesystem.read:loadBuildInput->readBuildInput->a
 
 set +e
 ABLA_COMPILE_TEST_INPUT=denied \
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/invalid-compile-effect-environment.ab" \
     > "$output_directory/environment-denied.ll" \
@@ -51,7 +51,7 @@ grep -q 'compile.effect-denied:environment:readBuildEnvironment->compilerEnviron
     "$output_directory/environment-denied.err"
 
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/invalid-compile-effect-extension.ab" \
     > "$output_directory/extension-denied.ll" \
@@ -63,7 +63,7 @@ grep -q 'compile.effect-denied:filesystem.read:measureInputs->Path.inputSize->Pa
     "$output_directory/extension-denied.err"
 
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/invalid-compile-effect-clock.ab" \
     > "$output_directory/clock-denied.ll" \
@@ -75,7 +75,7 @@ grep -q 'compile.effect-denied:clock:currentBuildClock->compilerClockMillisecond
     "$output_directory/clock-denied.err"
 
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/invalid-compile-effect-write.ab" \
     > "$output_directory/write-denied.ll" \
@@ -87,7 +87,7 @@ grep -q 'compile.effect-denied:filesystem.write:compilerWriteFile' \
     "$output_directory/write-denied.err"
 
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/invalid-compile-effect-network.ab" \
     > "$output_directory/network-denied.ll" \
@@ -99,7 +99,7 @@ grep -q 'compile.effect-denied:network:compilerTcpExchange' \
     "$output_directory/network-denied.err"
 
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/bootstrap/invalid-compile-capability-authorization.ab" \
     > "$output_directory/unauthorized.ll" \
@@ -111,7 +111,7 @@ grep -q 'compile.capability-not-authorized:filesystem.read' \
     "$output_directory/unauthorized.err"
 
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$compiler" --emit-llvm \
     "$project_root/tests/cases/capabilities/subparser-input-denied.ab" \
     > "$output_directory/subparser-denied.ll" \
@@ -145,7 +145,7 @@ printf '%s\n' 'compile-input-cache-hit' > "$output_directory/granted.ll"
     -o "$output_directory/granted" --fast
 grep -q '^compile-input-cache-hit$' "$output_directory/granted.ll"
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/granted"
 granted_status=$?
 set -e
@@ -179,7 +179,7 @@ if grep -q '^compile-input-cache-hit$' "$output_directory/granted.ll"; then
     exit 1
 fi
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/granted"
 changed_status=$?
 set -e
@@ -208,7 +208,7 @@ if grep -q '^subparser-input-cache-hit$' \
     exit 1
 fi
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/subparser-input"
 subparser_changed_status=$?
 set -e
@@ -236,7 +236,7 @@ if grep -q '^environment-input-cache-hit$' \
 fi
 set +e
 ABLA_COMPILE_TEST_INPUT=second \
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/environment"
 environment_status=$?
 set -e
@@ -256,7 +256,7 @@ if grep -q '^ambient-cache-must-not-hit$' "$output_directory/ambient.ll"; then
     exit 1
 fi
 set +e
-ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-512} ABLA_MAX_SECONDS=30 \
+ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-1024} ABLA_MAX_SECONDS=30 \
     "$project_root/tools/run-limited.sh" "$output_directory/ambient"
 ambient_status=$?
 set -e

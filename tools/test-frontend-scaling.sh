@@ -51,7 +51,7 @@ generate() {
 cpu() {
     local directory=$1 status=0
     (cd "$directory" &&
-        /usr/bin/time -p "$compiler" build main.ab -o program --fast --no-cache \
+        "${ABLA_TIME:-$(type -P time)}" -p "$compiler" build main.ab -o program --fast --no-cache \
             >build.out 2>build.err) || status=$?
     [[ $status -ne 0 ]] || { echo "frontend scaling: $directory built despite its error" >&2; exit 1; }
     grep -q 'identifier:missingName' "$directory/build.err" ||

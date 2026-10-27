@@ -98,6 +98,8 @@ if [[ $OSTYPE == darwin* ]]; then
         "$wall_seconds" "$@"
     set -e
 else
+    # Leave one CPU second between SIGXCPU and the hard SIGKILL fallback so
+    # the normal exit status identifies the CPU limit (152).
     set +e
     bounded timeout \
         --signal=TERM \
@@ -105,7 +107,7 @@ else
         "${wall_seconds}s" \
         prlimit \
             --as="${memory_bytes}:${memory_bytes}" \
-            --cpu="${cpu_seconds}:${cpu_seconds}" \
+            --cpu="${cpu_seconds}:$((cpu_seconds + 1))" \
             --core=0:0 \
             -- \
             "$@"

@@ -11,6 +11,7 @@ pkgs.mkShell {
   packages = with pkgs; [
     gcc
     gnumake
+    time
     gdb
     valgrind
     llvm.clang-tools

@@ -18,9 +18,13 @@ fail() {
     exit 1
 }
 
-for program in background inline; do
+for program in background inline fork; do
     "$compiler" build "$cases/$program.ab" -o "$output_directory/$program" --no-cache
 done
+# Bound the process tree as well as the parent: the regression is a child
+# waiting forever on a lock whose owning thread existed only in the parent.
+forked=$(ABLA_MAX_SECONDS=60 "$project_root/tools/run-limited.sh" "$output_directory/fork")
+[[ $forked == "80196000000" ]] || fail "fork/free race: unexpected checksum '$forked'"
 background=$("$output_directory/background")
 inline=$("$output_directory/inline")
 [[ $background == "$inline" ]] || fail "with background freeing: '$background', without: '$inline'"

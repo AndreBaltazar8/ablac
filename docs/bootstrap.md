@@ -34,6 +34,14 @@ sources use something newer than the pinned release, which means the pin has
 to move. It isn't part of `make test`; `ABLA_BOOTSTRAP_URL` and
 `ABLA_BOOTSTRAP_SHA256` try a candidate release.
 
+For the v0.2.20 to v0.2.21 transition, `build-self-hosted-current.sh` first
+builds checkpoint `773683772ce54bcfae4fdfd7049b55bd28ea1814` from a
+checksum-pinned source archive. That checkpoint implements private declarations
+and generics, but its own standard library still uses syntax v0.2.20 accepts.
+The intermediate compiler then builds the current sources. This automatic
+handoff applies to a v0.2.20 compiler only; newer bootstraps build directly.
+The release workflow still rebuilds stage 2 and verifies the fixed point.
+
 The published binary is trusted only as the initial translator. The readable
 Abla source graph and fixed-point check define the maintained compiler. A
 future release can be bootstrapped by the previous Abla release without

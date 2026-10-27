@@ -73,7 +73,7 @@ steps:
   - uses: actions/checkout@v6
   - uses: AndreBaltazar8/setup-abla@v1
     with:
-      version: '0.2.20'
+      version: '0.2.21'
   - run: ablac build app.ab -o build/app
 ```
 
@@ -142,6 +142,12 @@ starts while free memory is under 25% (`RUN_TESTS_MIN_FREE`). Each script
 writes its log to `build/test-results/suite/<n>.log`; `results.tsv` there
 lists every script's exit status and time. `make test-serial` runs the same
 scripts one after another.
+
+The `abla/math/v8` comparison needs Node **22.14.0** (V8
+`12.4.254.21-node.22`), whose results the test records. Set `MATH_V8_NODE`
+to that executable if it is not installed through nvm at its default path.
+Mach-O math checks need a macOS SDK; without `ABLA_MACOS_SDK`, Linux checks
+ELF locally and the macOS release jobs check both Mach-O architectures.
 
 The self-hosted conformance part of the suite is scheduled by
 [`abla-testrunner`](https://github.com/AndreBaltazar8/abla-testrunner),
