@@ -25,6 +25,25 @@ status=$?
 set -e
 test "$status" -eq 42
 
+# A default that calls an overload, copied into a call that omits it.
+"$compiler" build \
+    "$project_root/tests/cases/modules/overload-defaults.ab" \
+    -o "$output_root/overload-defaults" --no-cache
+set +e
+"$output_root/overload-defaults"
+status=$?
+set -e
+test "$status" -eq 42
+
+set +e
+"$compiler" build \
+    "$project_root/tests/cases/modules/overload-default-ambiguous.ab" \
+    -o "$output_root/overload-default-ambiguous" --no-cache > "$output_root/default-ambiguous.log" 2>&1
+status=$?
+set -e
+test "$status" -ne 0
+grep -q 'call.overload-ambiguous:pick(P,Q)' "$output_root/default-ambiguous.log"
+
 set +e
 "$compiler" build \
     "$project_root/tests/cases/modules/overload-ambiguous.ab" \
@@ -33,4 +52,4 @@ status=$?
 set -e
 test "$status" -ne 0
 grep -q 'call.overload-ambiguous:pick(P,Q)' "$output_root/ambiguous.log"
-echo "overloads: free/extension/method overloads, operators (in parameter defaults too), ambiguity diagnostic passed"
+echo "overloads: free/extension/method overloads, operators (in parameter defaults too), overloads in defaults a call omits, ambiguity diagnostics passed"

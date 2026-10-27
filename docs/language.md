@@ -1661,6 +1661,10 @@ fun main {
   (`/`), `rem` (`%`) and `unaryMinus` (prefix `-`). An operator applies when
   its receiver is the left operand's type and it accepts the right operand.
   Otherwise the expression is ordinary arithmetic, unchanged.
+- A parameter default may call an overload or use an operator function
+  (`class Rec(var season: int = Config.season())`). A call that leaves the
+  parameter out, a constructor's or a named call's included, uses the
+  candidate the default's arguments select.
 - Overloads are resolved before code generation, so they cost nothing at run
   time. Named arguments and function references don't choose between
   overloads.
