@@ -135,6 +135,49 @@ Unsafe pointer offsets lower through integer address arithmetic for every
 offset, including zero. This keeps boxed `AblaValue` storage out of native
 structure addressing and is covered by a zero-offset store regression.
 
+## Module initializer
+
+A program's globals are initialized, in source order, by one function
+(`__bootstrap_globals`) that runs before `main` (or a module's first export).
+A program with large literal tables makes it large: a few hundred kilobytes
+of `Item(field = …, …)` literals compiled to a WebAssembly function of
+several megabytes, past what engines compile (V8 refuses a function body over
+7,654,321 bytes). Two cuts bound it, both keeping the order of every store:
+
+- An initializer of more than 131,072 IR instructions is cut at the ends of
+  globals into pieces of about 8,000 (`__bootstrap_globals_0`, `_1`, …) that
+  it calls in order before the rest. Its values each keep a stack slot (it is
+  not optimized), so the pieces also keep its frame well inside a WebAssembly
+  module's 1 MiB stack; what remains is numbered from 0 like the pieces, so
+  it holds slots only for its own values.
+- An array literal in a global's initializer spanning at least 256 KiB of
+  source computes each element spanning at least 256 bytes (other than a
+  string or number literal, which is one instruction) in a function of its
+  own (`__bootstrap_globals_element_<n>`), and passes the results to the same
+  array construction.
+
+The pieces get what the initializer gets: no pressure safe point, and in
+WebAssembly `optnone` and `noinline`, so LLVM doesn't join them again. A
+release build's Binaryen pass inlines a function with one caller, so it joins
+pieces back, but only up to its own bound on a function's size (about 400 KB),
+far under the engines' limit. A program under both bounds compiles as before.
+
+Not done yet, measured: a table of literal objects costs about 140–150 bytes of
+WebAssembly per field in the initializer (one global of 100 items of a
+100-field class: 1.51 MB in a `--fast` build, 1.39 MB in release, its largest
+function nearly all of it). Fields left to their defaults cost the same, since
+the defaults are computed per item. Two steps would shrink it:
+
+- *(B)* Optimize the outlined element functions in release (they are `optnone`
+  like the initializer, which is only worth it for one long straight-line
+  body). Half a day to measure.
+- *(A)* Emit an object literal whose fields are all constants as data, as an
+  all-constant array literal already is (`abla.table.*`), so the initializer
+  copies it instead of building it field by field. About two days; gates: the
+  release and `--fast` sizes of such a table, a large client's modules equal
+  or smaller, interpreter parity, and collector stress on a table-heavy
+  program.
+
 ## Typed inline assembly
 
 Target packages may declare a `trusted noescape extern:"inline-assembly"`

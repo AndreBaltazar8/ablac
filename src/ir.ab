@@ -314,6 +314,10 @@ var bootstrapIrLambdaOwnerEnd: int = 0
 // in the program. A function's or method's body has an array of its own (its
 // transactional sink, so 0); a global's initializer appends to the program's.
 var bootstrapIrLambdaOwnerFunctions: int = 0
+// While a global's initializer is lowered into the module initializer itself (not a
+// lambda in it): a large array literal there computes its large elements in functions
+// of their own (bootstrapLowerArray).
+var bootstrapIrGlobalInitializer: bool = false
 
 fun bootstrapIrSourceFileIndex(identity: string): int {
     // An instance of a generic is in its generic's file (generics.ab).
@@ -2833,6 +2837,65 @@ fun bootstrapVerifyIrFunction(
         instructionIndex = instructionIndex + 1
     }
     errors
+}
+
+// A module's initializer (`__bootstrap_globals`) runs every global's initializer in
+// order. Past this many IR instructions it is cut, at a global's end, into functions of
+// about this size that it calls in that order: one function for a large program's
+// literal tables outgrew what engines compile (V8 refuses a WebAssembly function body
+// past 7,654,321 bytes), and the initializer keeps every value in a stack slot of its
+// own (it is not optimized), so a larger piece's frame took much of a WebAssembly
+// module's 1 MiB stack.
+val BOOTSTRAP_IR_GLOBALS_CHUNK = 8000
+// The size an initializer is cut from: about three times what a large client
+// application's takes, so such programs build as they did before cutting existed.
+val BOOTSTRAP_IR_GLOBALS_SPLIT = 131072
+
+// `instructions` with their values and labels numbered from 0 (from the least each
+// holds), or an empty array when one reads a value or names a label from before them.
+fun bootstrapIrRenumbered(instructions: array<BootstrapInstruction>): array<BootstrapInstruction> {
+    var valueBase = -1
+    var labelBase = -1
+    for (instruction in instructions) {
+        if (instruction.result >= 0 && (valueBase < 0 || instruction.result < valueBase)) {
+            valueBase = instruction.result
+        }
+        if (instruction.opcode == "label" && instruction.target >= 0 &&
+            (labelBase < 0 || instruction.target < labelBase)) labelBase = instruction.target
+    }
+    if (valueBase < 0) valueBase = 0
+    if (labelBase < 0) labelBase = 0
+    val renumbered: array<BootstrapInstruction> = []
+    val none: array<BootstrapInstruction> = []
+    for (instruction in instructions) {
+        val labelled = instruction.opcode == "label" || instruction.opcode == "jump" ||
+            instruction.opcode == "branch"
+        if (instruction.left >= 0 && instruction.left < valueBase ||
+            instruction.right >= 0 && instruction.right < valueBase ||
+            labelled && instruction.target >= 0 && instruction.target < labelBase ||
+            instruction.opcode == "branch" && instruction.alternate >= 0 &&
+                instruction.alternate < labelBase) return none
+        val operands: array<int> = []
+        for (operand in instruction.operands) {
+            if (operand >= 0 && operand < valueBase) return none
+            operands.append(if (operand >= 0) operand - valueBase else operand)
+        }
+        renumbered.append(BootstrapInstruction(
+            instruction.opcode,
+            if (instruction.result >= 0) instruction.result - valueBase else instruction.result,
+            if (instruction.left >= 0) instruction.left - valueBase else instruction.left,
+            if (instruction.right >= 0) instruction.right - valueBase else instruction.right,
+            instruction.text,
+            if (labelled && instruction.target >= 0) instruction.target - labelBase
+                else instruction.target,
+            if (instruction.opcode == "branch" && instruction.alternate >= 0)
+                instruction.alternate - labelBase else instruction.alternate,
+            operands,
+            instruction.texts,
+            instruction.position
+        ))
+    }
+    renumbered
 }
 
 fun bootstrapFinalizeIrFunction(
@@ -8449,6 +8512,8 @@ class BootstrapLowerer(
             parsed.declarations,
             this.inferredResults.initializationOrder
         )
+        // Where each global's initialization ends in the initializer, where it may be cut.
+        val globalEnds: array<int> = []
         var pendingDeclaration = 0
         while (pendingDeclaration < pendingDeclarations.size) {
             index = pendingDeclarations[pendingDeclaration]
@@ -8573,7 +8638,9 @@ class BootstrapLowerer(
                 bootstrapIrLambdaOwnerBegin = declaration.begin
                 bootstrapIrLambdaOwnerEnd = declaration.end
                 bootstrapIrLambdaOwnerFunctions = this.functions.size
+                bootstrapIrGlobalInitializer = true
                 val value = this.lowerExpression(declaration.expression)
+                bootstrapIrGlobalInitializer = false
                 this.emit("global.store", value, -1, declaration.name)
                 bootstrapIrLambdaOwner = savedLambdaOwner
                 bootstrapIrLambdaOwnerBegin = savedLambdaOwnerBegin
@@ -8627,18 +8694,104 @@ class BootstrapLowerer(
                 )
                 instruction = instruction + 1
             }
+            globalEnds.append(this.instructions.size)
+        }
+        // Past BOOTSTRAP_IR_GLOBALS_SPLIT instructions, the initializer is cut at globals'
+        // ends into pieces of about BOOTSTRAP_IR_GLOBALS_CHUNK (see there). A cut that
+        // would leave a value or local across two pieces is not taken; the piece then
+        // grows by a quarter and tries the next end.
+        val globalChunks: array<string> = []
+        // What the pieces held, as lowered: the module's instructions (BootstrapIrProgram)
+        // stay all of the initializer's, in order, whatever it was cut into.
+        val cutGlobalInstructions: array<BootstrapInstruction> = []
+        if (this.instructions.size >= BOOTSTRAP_IR_GLOBALS_SPLIT) {
+            var pieceBegin = 0
+            var pieceSize = BOOTSTRAP_IR_GLOBALS_CHUNK
+            for (end in globalEnds) {
+                if (end - pieceBegin < pieceSize) continue
+                val lowered: array<BootstrapInstruction> = []
+                var copied = pieceBegin
+                while (copied < end) {
+                    lowered.append(this.instructions[copied])
+                    copied = copied + 1
+                }
+                val piece = bootstrapIrRenumbered(lowered)
+                var cut = false
+                if (piece.size > 0) {
+                    var last = -1
+                    for (candidate in piece) if (candidate.result > last) last = candidate.result
+                    piece.append(BootstrapInstruction(
+                        "const.void", last + 1, -1, -1, "", -1, -1, [], [], -1
+                    ))
+                    val pieceParameters: array<string> = []
+                    val chunk = bootstrapFinalizeIrFunction(
+                        "__bootstrap_globals_${globalChunks.size}",
+                        pieceParameters,
+                        piece,
+                        last + 1,
+                        [],
+                        "void"
+                    )
+                    if (chunk.verificationErrors == 0) {
+                        this.functions.append(chunk)
+                        globalChunks.append(chunk.name)
+                        for (candidate in lowered) cutGlobalInstructions.append(candidate)
+                        pieceBegin = end
+                        cut = true
+                    }
+                }
+                pieceSize = if (cut) BOOTSTRAP_IR_GLOBALS_CHUNK
+                    else end - pieceBegin + BOOTSTRAP_IR_GLOBALS_CHUNK / 4
+            }
+            if (pieceBegin > 0) {
+                val remaining: array<BootstrapInstruction> = []
+                var copied = pieceBegin
+                while (copied < this.instructions.size) {
+                    remaining.append(this.instructions[copied])
+                    copied = copied + 1
+                }
+                this.instructions.truncate(0)
+                for (candidate in remaining) this.instructions.append(candidate)
+            }
         }
         bootstrapIrTraceMemory(
             "lower.demanded:${pendingDeclarations.size}"
         )
-        if (this.functions.size > 0 && this.instructions.size > 0) {
+        if (this.functions.size > 0 &&
+            (this.instructions.size > 0 || globalChunks.size > 0)) {
             val result = this.emit("const.void", -1, -1, "")
+            // The pieces cut off run first, in order, then what follows them.
+            val ordered: array<BootstrapInstruction> = []
+            if (globalChunks.size > 0) {
+                for (chunkName in globalChunks) {
+                    ordered.append(BootstrapInstruction(
+                        "call", this.nextValue, -1, -1, chunkName, -1, -1, [], [], -1
+                    ))
+                    this.nextValue = this.nextValue + 1
+                }
+                for (candidate in this.instructions) ordered.append(candidate)
+            }
+            // Its values numbered from 0 like the pieces': the backend gives an
+            // unoptimized function a stack slot for every value number below its last.
+            var globalBase = 0
+            var renumbered: array<BootstrapInstruction> = []
+            if (globalChunks.size > 0) {
+                renumbered = bootstrapIrRenumbered(ordered)
+                globalBase = -1
+                for (candidate in ordered) {
+                    if (candidate.result >= 0 && (globalBase < 0 || candidate.result < globalBase)) {
+                        globalBase = candidate.result
+                    }
+                }
+                if (renumbered.size == 0 || globalBase < 0) globalBase = 0
+            }
             val globalParameters: array<string> = []
             val globalFunction = bootstrapFinalizeIrFunction(
                 "__bootstrap_globals",
                 globalParameters,
-                this.instructions,
-                result,
+                if (renumbered.size > 0) renumbered
+                    else if (globalChunks.size > 0) ordered else this.instructions,
+                result - globalBase,
                 [],
                 "void"
             )
@@ -8706,8 +8859,13 @@ class BootstrapLowerer(
             ))
             runtimeFunction = runtimeFunction + 1
         }
+        val moduleInstructions: array<BootstrapInstruction> = []
+        if (globalChunks.size > 0) {
+            for (candidate in cutGlobalInstructions) moduleInstructions.append(candidate)
+            for (candidate in this.instructions) moduleInstructions.append(candidate)
+        }
         BootstrapIrProgram(
-            this.instructions,
+            if (globalChunks.size > 0) moduleInstructions else this.instructions,
             runtimeFunctions,
             classes,
             natives,
@@ -8717,7 +8875,10 @@ class BootstrapLowerer(
             this.compileInputPaths,
             this.compileInputContents,
             this.errors,
-            bootstrapIrLookupOf(this.instructions, globalNames),
+            bootstrapIrLookupOf(
+                if (globalChunks.size > 0) moduleInstructions else this.instructions,
+                globalNames
+            ),
             this.validationFailures,
             bootstrapIrExtensionFieldNames(parsed.declarations)
         )
@@ -8786,6 +8947,15 @@ fun bootstrapLowerStringTemplate(
     result
 }
 
+// A global's array literal spanning at least this much source (a generated table)
+// computes each element spanning at least BOOTSTRAP_IR_OUTLINED_ELEMENT in a function of
+// its own, which the module initializer calls: inline, a table's items made one
+// function that engines would not compile (see BOOTSTRAP_IR_GLOBALS_CHUNK). A literal
+// element (a string, a number) is one instruction, so it stays inline. Tables under
+// the size are lowered as they were before the initializer was cut.
+val BOOTSTRAP_IR_OUTLINED_TABLE = 262144
+val BOOTSTRAP_IR_OUTLINED_ELEMENT = 256
+
 @noinline
 fun bootstrapLowerArray(
     var lowerer: BootstrapLowerer,
@@ -8793,14 +8963,110 @@ fun bootstrapLowerArray(
     initial: int
 ): int {
     var result = initial
+    val outline = bootstrapIrGlobalInitializer &&
+        expression.end - expression.begin >= BOOTSTRAP_IR_OUTLINED_TABLE
     val elements: array<int> = []
     var element = 0
     while (element < expression.children.size) {
-        elements.append(lowerer.lowerExpression(expression.children[element]))
+        val child = expression.children[element]
+        elements.append(
+            if (outline && child.end - child.begin >= BOOTSTRAP_IR_OUTLINED_ELEMENT &&
+                child.kind != "string" && child.kind != "integer" && child.kind != "float")
+                bootstrapLowerOutlinedElement(lowerer, child)
+            else lowerer.lowerExpression(child)
+        )
         element = element + 1
     }
     result = lowerer.emitMany("array.create", elements, "")
     result
+}
+
+// A global table's element, computed by a function of its own (it reads globals and
+// calls functions, as the initializer would: a global's initializer has no locals to
+// capture), and its call in the initializer.
+fun bootstrapLowerOutlinedElement(
+    var lowerer: BootstrapLowerer,
+    expression: BootstrapExpression
+): int {
+    val instructions: array<BootstrapInstruction> = []
+    val parameters: array<string> = []
+    val implicitResults: array<BootstrapExpression> = []
+    lowerer.collectImplicitResults(expression, implicitResults)
+    val elementLowerer = BootstrapLowerer(
+        instructions,
+        lowerer.functions,
+        parameters,
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [-1],
+        0,
+        lowerer.declarations,
+        lowerer.functionDeclarations,
+        lowerer.typeDeclarations,
+        lowerer.scalarTypeDeclarations,
+        lowerer.valueDeclarations,
+        lowerer.methodDeclarations,
+        lowerer.affineTypes,
+        lowerer.neverCallNames,
+        lowerer.mutableReceivers,
+        lowerer.managedAliasBegins,
+        lowerer.managedAliasEnds,
+        lowerer.managedAliasSources,
+        lowerer.managedAliasFiles,
+        [],
+        [],
+        [],
+        implicitResults,
+        lowerer.currentOwner,
+        [],
+        [],
+        lowerer.compileInputPaths,
+        lowerer.compileInputContents,
+        0,
+        0,
+        -1,
+        -1,
+        -1,
+        -1,
+        lowerer.validationOnly,
+        lowerer.errors,
+        bootstrapIrLocalNames(),
+        [],
+        lowerer.liftProbe,
+        lowerer.inferredResults
+    )
+    val value = elementLowerer.lowerExpression(expression)
+    lowerer.errors = elementLowerer.errors
+    val name = "__bootstrap_globals_element_${lowerer.functions.size}"
+    val function = bootstrapFinalizeIrFunction(
+        name,
+        parameters,
+        instructions,
+        value,
+        [],
+        "unknown",
+        elementLowerer.localStorage,
+        bootstrapIrRuntimeTypes(
+            lowerer.declarations, lowerer.scalarTypeDeclarations, elementLowerer.localTypes
+        ),
+        false,
+        false,
+        false,
+        "",
+        "",
+        bootstrapIrSourcePositionOf(bootstrapIrSourceFile, expression.begin)
+    )
+    lowerer.errors = lowerer.errors + function.verificationErrors
+    lowerer.functions.append(function)
+    lowerer.emitMany("call", [], name)
 }
 
 @noinline
@@ -9176,7 +9442,10 @@ fun bootstrapLowerLambdaFunction(
         lowerer.liftProbe,
         lowerer.inferredResults
     )
+    val enclosingGlobalInitializer = bootstrapIrGlobalInitializer
+    bootstrapIrGlobalInitializer = false
     val lambdaResult = lambdaLowerer.lowerExpression(body)
+    bootstrapIrGlobalInitializer = enclosingGlobalInitializer
     lambdaLowerer.emitOwnedParameterDrops()
     lowerer.errors = lambdaLowerer.errors
     // Transactional declaration sinks restart their local function
