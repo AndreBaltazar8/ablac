@@ -11,6 +11,8 @@ rm -rf "$output_directory"
 mkdir -p "$output_directory/again"
 cd "$project_root"
 export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096}
+# Units without the code generation cache (tools/test-codegen-cache.sh has it).
+export ABLA_CODEGEN_CACHE=0
 if command -v node >/dev/null 2>&1; then wasm_runner=node; else wasm_runner=bun; fi
 fail() {
     echo "codegen units: $1" >&2
@@ -44,13 +46,20 @@ for case in closure-captures collections classes defer strings-runtime global-in
         fail "$case: in units it exited $actual_status (not $expected_status) or printed otherwise"
     cmp -s <(symbols "$output_directory/$case-one") <(symbols "$output_directory/$case-units") ||
         fail "$case: the defined symbols differ"
-    # macOS: the object is an archive of the units, whose members the
-    # executable's debug map names (each carries its DWARF).
+    # macOS: the object is an archive of the units (the data's, and those of
+    # the 8 of functions that have any: they go to units by their source
+    # file, so a small program leaves some empty), whose members with DWARF the
+    # executable's debug map names.
     if [[ $(uname) == Darwin ]]; then
-        [[ $(llvm-ar t "$output_directory/$case-units.o") == $'unit0.o\nunit1.o\nunit2.o\nunit3.o\nunit4.o\nunit5.o\nunit6.o\nunit7.o' ]] ||
-            fail "$case: the object is not an archive of the 8 units"
-        named=$(nm -ap "$output_directory/$case-units" | grep -c " OSO $output_directory/$case-units.o(unit[0-7].o)\$" || true)
-        [[ $named == 8 ]] || fail "$case: the debug map names $named of the 8 units"
+        members=$(llvm-ar t "$output_directory/$case-units.o")
+        [[ $members == unit0.o$'\n'* && $(wc -l <<< "$members") -ge 3 ]] ||
+            fail "$case: the object is not an archive of the units: $members"
+        # (A unit of only the backend's own functions has no DWARF.)
+        named=$(nm -ap "$output_directory/$case-units" | sed -n "s#.* OSO $output_directory/$case-units.o(\(.*\))\$#\1#p")
+        [[ -n $named ]] || fail "$case: the debug map names no unit"
+        for member in $named; do
+            [[ $'\n'$members$'\n' == *$'\n'$member$'\n'* ]] || fail "$case: the debug map names $member, not a member"
+        done
     fi
 done
 

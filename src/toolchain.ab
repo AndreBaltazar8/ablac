@@ -478,7 +478,11 @@ fun bootstrapWasmExceptionOptions(): array<string> =
 // machine's data layout (which opt gives a module without one), static relocations
 // (a module links as one static image), no verification (the compiler verified the
 // module as it emitted it). The module is disposed either way.
-trusted fun bootstrapEmitHeldWasmObject(llvmTriple: string, objectPath: string): int {
+trusted fun bootstrapEmitHeldWasmObject(
+    llvmTriple: string,
+    objectPath: string,
+    places: BootstrapCodegenUnitPlaces
+): int {
     val nullPointer = nativeNullPointer()
     val module = bootstrapLlvmHeldModule
     var status = if (pointerIsNull(module)) 165 else 0
@@ -515,10 +519,10 @@ trusted fun bootstrapEmitHeldWasmObject(llvmTriple: string, objectPath: string):
     // A large module is generated as units, by child compilers at once.
     val units = status == 0 && bootstrapCodegenUnitsFor(module)
     if (units) {
-        val starts = bootstrapWriteCodegenUnits(module, objectPath)
+        val counts = bootstrapWriteCodegenUnits(module, objectPath)
         bootstrapDisposeHeldModule()
-        status = if (starts.size == 0) 145 else bootstrapRunCodegenUnits(
-            if (exceptions) "wasm-eh" else "wasm", llvmTriple, objectPath, starts
+        status = if (counts.size == 0) 145 else bootstrapRunCodegenUnits(
+            if (exceptions) "wasm-eh" else "wasm", llvmTriple, objectPath, places, counts
         )
     }
     // Codegen starts from a fresh context: the old one still holds what building
@@ -573,8 +577,12 @@ trusted fun bootstrapRebuildHeldModule(): int {
 // default triple, a generic CPU, PIC, the fast passes and FastISel. The module moves to a
 // fresh context first (bootstrapRebuildHeldModule), and is disposed either way. With
 // `unitsAllowed` (an executable's), a large module is generated as code generation
-// units, and the object is an archive of them (codegen_units.ab).
-trusted fun bootstrapEmitHeldNativeObject(objectPath: string, unitsAllowed: bool): int {
+// units at `places`, and the object is an archive of them (codegen_units.ab).
+trusted fun bootstrapEmitHeldNativeObject(
+    objectPath: string,
+    unitsAllowed: bool,
+    places: BootstrapCodegenUnitPlaces
+): int {
     val nullPointer = nativeNullPointer()
     var status = if (pointerIsNull(bootstrapLlvmHeldModule)) 165 else 0
     if (status == 0 && llvmInitializeNativeTarget() != 0) status = 166
@@ -606,10 +614,10 @@ trusted fun bootstrapEmitHeldNativeObject(objectPath: string, unitsAllowed: bool
     // A large module is generated as units, by child compilers at once.
     val units = status == 0 && unitsAllowed && bootstrapCodegenUnitsFor(module)
     if (units) {
-        val starts = bootstrapWriteCodegenUnits(module, objectPath)
+        val counts = bootstrapWriteCodegenUnits(module, objectPath)
         bootstrapDisposeHeldModule()
-        status = if (starts.size == 0) 145 else bootstrapRunCodegenUnits(
-            "native", nativeCString(triple), objectPath, starts
+        status = if (counts.size == 0) 145 else bootstrapRunCodegenUnits(
+            "native", nativeCString(triple), objectPath, places, counts
         )
     } else if (status == 0 && LLVMTargetMachineEmitToFile(
         machine, module, objectPath, 1, message.address
@@ -638,21 +646,24 @@ fun bootstrapDisposeHeldModule(): void {
     return
 }
 
-// `ablac --codegen-unit <kind> <triple> <module.bc> <first> <end> <index> <object>`:
-// unit `index` of a fast build cut into code generation units (codegen_units.ab),
-// the functions the module defines from ordinal `first` up to `end`. Reads the
-// parent's optimized module lazily, declares the other units' functions, moves the
-// rest into a module of its own (which reads only this unit's bodies) and writes its
-// object with the parent's code generation settings: `kind` `native` (a generic CPU,
-// PIC, FastISel), or `wasm` / `wasm-eh` (static, with exception handling).
+// `ablac --codegen-unit <kind> <triple> <module.bc> <plan> <index> <object> <cache> <salt>`:
+// unit `index` of a fast build cut into code generation units (codegen_units.ab) by
+// the plan file `plan`. Reads the parent's optimized module lazily, declares what
+// other units define, moves the rest into a module of its own (which reads only this
+// unit's bodies) and writes its object with the parent's code generation settings:
+// `kind` `native` (a generic CPU, PIC, FastISel), or `wasm` / `wasm-eh` (static, with
+// exception handling). With the code generation cache `cache` (not ""), the object
+// is the cache's under the key of the unit's bitcode and `salt`, reused or written
+// there; `<object>.path` says which, and whether it was reused.
 trusted fun bootstrapEmitCodegenUnit(
     kind: string,
     llvmTriple: string,
     bitcodePath: string,
-    first: int,
-    end: int,
+    planPath: string,
     index: int,
-    objectPath: string
+    objectPath: string,
+    cache: string,
+    salt: string
 ): int {
     val nullPointer = nativeNullPointer()
     val buffer = nativePointerCell(nullPointer)
@@ -663,7 +674,8 @@ trusted fun bootstrapEmitCodegenUnit(
     LLVMContextSetDiscardValueNames(context, 1)
     val wasm = kind != "native"
     val exceptions = kind == "wasm-eh"
-    var status = if (first >= 0 && end >= first && index >= 0) 0 else 2
+    val plan = bootstrapReadCodegenUnitPlan(planPath)
+    var status = if (index >= 0) 0 else 2
     if (status == 0 && LLVMCreateMemoryBufferWithContentsOfFile(
         bitcodePath, buffer.address, message.address
     ) != 0) status = 145
@@ -685,8 +697,11 @@ trusted fun bootstrapEmitCodegenUnit(
         }
     } else if (status == 0 && llvmInitializeNativeTarget() != 0) status = 166
     var module = nullPointer
+    if (status == 0 && !bootstrapCodegenUnitStrip(lazy.load(), plan, index)) {
+        LLVMDisposeModule(lazy.load())
+        status = 2
+    }
     if (status == 0) {
-        bootstrapCodegenUnitStrip(lazy.load(), first, end, index)
         // Linking into an empty module reads the bodies it moves, and only those; it
         // takes the target, data layout, module flags and inline assembly along, and
         // leaves out what nothing kept names. (The lazy module is gone either way.)
@@ -708,10 +723,32 @@ trusted fun bootstrapEmitCodegenUnit(
     if (status == 0) {
         layout = LLVMCreateTargetDataLayout(machine)
         LLVMSetModuleDataLayout(module, layout)
-        if (LLVMTargetMachineEmitToFile(
-            machine, module, objectPath, 1, message.address
-        ) != 0) status = 168
     }
+    // The cache's key: the unit's whole module as the code generator gets it, and
+    // what generates it.
+    var entry = ""
+    var reused = false
+    if (status == 0 && cache != "") {
+        val bitcode = LLVMWriteBitcodeToMemoryBuffer(module)
+        if (pointerIsNull(bitcode)) status = 169
+        else {
+            val start = LLVMGetBufferStart(bitcode)
+            val size = LLVMGetBufferSize(bitcode)
+            val identity = "$kind $llvmTriple $salt"
+            val first = bootstrapCodegenBytesHash(start, size, bootstrapCodegenTextHash(identity, 3))
+            val second = bootstrapCodegenBytesHash(start, size, bootstrapCodegenTextHash(identity, 5))
+            LLVMDisposeMemoryBuffer(bitcode)
+            entry = "$cache/${bootstrapCodegenHex(first)}${bootstrapCodegenHex(second)}.o"
+            reused = Path(entry).info().isFile()
+        }
+    }
+    if (status == 0 && !reused && LLVMTargetMachineEmitToFile(
+        machine, module, objectPath, 1, message.address
+    ) != 0) status = 168
+    // (A new object moves into the cache whole: another build may be writing the same.)
+    if (status == 0 && entry != "" && !reused && !Path(objectPath).moveTo(Path(entry))) status = 145
+    if (status == 0 && entry != "" &&
+        !Path("$objectPath.path").writeText("$entry\n${if (reused) "1" else "0"}")) status = 145
     if (status != 0 && !pointerIsNull(message.load())) {
         linuxPrintStandardError(
             "error[E_LLVM_CODEGEN]: unit $index: ${nativeCString(message.load())}\n"
@@ -2191,10 +2228,17 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     status = bootstrapEmitParallelObject(
                         llvmPath, objectPath
                     )
-                } else if (inProcessCodegen) {
-                    status = bootstrapEmitHeldWasmObject(target.llvmTriple, objectPath)
-                } else if (nativeHeld) {
-                    status = bootstrapEmitHeldNativeObject(objectPath, nativeUnits)
+                } else if (inProcessCodegen || nativeHeld) {
+                    // Code generation units (codegen_units.ab) and their cache, on for
+                    // every build: a key names the whole input of the code generator,
+                    // so nothing there is stale.
+                    val places = BootstrapCodegenUnitPlaces(
+                        bootstrapCodegenCacheDirectory(cacheDirectory),
+                        "${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${llvmLibraryVersion()}"
+                    )
+                    status = if (inProcessCodegen)
+                        bootstrapEmitHeldWasmObject(target.llvmTriple, objectPath, places)
+                        else bootstrapEmitHeldNativeObject(objectPath, nativeUnits, places)
                 } else if (bitcodeHandoff) {
                     status = emitObject(bitcodePath, objectPath)
                     Path(bitcodePath).remove()

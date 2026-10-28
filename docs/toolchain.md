@@ -139,7 +139,12 @@ archive of the units that the link loads whole); release builds are always one
 whole-module object. `ABLA_CODEGEN_UNITS=<n>` sets the number of units (1 turns
 units off), `ABLA_CODEGEN_JOBS=<n>` how many children run at once (default: the
 cores), `ABLA_CODEGEN_UNITS_MINIMUM=<n>` the fewest IR instructions a module is cut
-at (default 150,000), and `ABLA_CODEGEN_UNITS_TRACE=1` prints the cut. See
+at (default 150,000), and `ABLA_CODEGEN_UNITS_TRACE=1` prints the cut. A unit's
+object is kept in the code generation cache (`<cache directory>/codegen`) under a
+key of the unit's code, so a unit no edit changed isn't generated again, by any
+build: nothing there can be stale, so `--no-cache` leaves it on;
+`ABLA_CODEGEN_CACHE=0` turns it off, and `ABLA_CODEGEN_CACHE_MB=<n>` bounds it
+(default 2048: past it the oldest objects go). See
 [llvm-backend.md](llvm-backend.md#code-generation-units).
 
 A release WebAssembly module ends with Binaryen's `wasm-opt -O3`, run with as many
@@ -358,7 +363,7 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_MAX_MEMORY_MB`, `ABLA_MAX_SECONDS`, `ABLA_MAX_CPU_SECONDS`, `ABLA_KILL_GRACE_SECONDS` | the launcher's resource guard for the compiler and anything compile-time code starts ([performance.md](performance.md)) |
 | `ABLA_MAX_STACK_KB` | the compiler's stack size in a packaged toolchain |
 | `ABLA_NATIVE_JOBS` | parallel native object jobs |
-| `ABLA_CODEGEN_UNITS`, `ABLA_CODEGEN_JOBS`, `ABLA_CODEGEN_UNITS_MINIMUM`, `ABLA_CODEGEN_UNITS_TRACE` | a development build's code generation units (above) |
+| `ABLA_CODEGEN_UNITS`, `ABLA_CODEGEN_JOBS`, `ABLA_CODEGEN_UNITS_MINIMUM`, `ABLA_CODEGEN_UNITS_TRACE`, `ABLA_CODEGEN_CACHE`, `ABLA_CODEGEN_CACHE_MB` | a development build's code generation units and their cache (above) |
 | `ABLA_EVAL_STEP_LIMIT`, `ABLA_EVAL_DEPTH_LIMIT` | lower the compile-time step and recursion-depth limits ([compile-time.md](compile-time.md#limits)) |
 | `ABLA_COMPILE_EVAL=interp\|jit\|auto`, `ABLA_COMPILE_EVAL_TRACE=1`, `ABLA_COMPILE_EVAL_DUMP=<dir>`, `ABLA_COMPILE_EVAL_TIME_LIMIT=<s>` | run compile-time code in the evaluator (default) or as native code (`auto` is `jit` today), report each site's tier and why a site stays in the evaluator, keep the native slices, and bound one native evaluation (default 600 s, `0` none) ([compile-time.md](compile-time.md#native-evaluation)) |
 | `ABLA_JIT_CACHE=0`, `ABLA_JIT_CACHE_TRACE=1` | turn `ablac run`'s object cache off, or report its decisions on standard error (above) |
