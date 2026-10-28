@@ -309,6 +309,7 @@ test-serial: ablac
 	tools/test-cache-layout-version.sh $(COMPILER)
 	tools/test-loop-safe-point.sh $(COMPILER)
 	tools/test-bootstrap-untyped-objects.sh $(COMPILER)
+	tools/test-codegen-units.sh $(COMPILER)
 
 check: test self-rebuild
 

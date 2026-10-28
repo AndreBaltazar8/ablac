@@ -135,6 +135,67 @@ Unsafe pointer offsets lower through integer address arithmetic for every
 offset, including zero. This keeps boxed `AblaValue` storage out of native
 structure addressing and is covered by a zero-offset store regression.
 
+## Code generation units
+
+A development (`--fast`) build's module is optimized whole and then, if it is
+large, generated as a fixed number of units, by child compilers at once
+(`src/codegen_units.ab`). This covers the in-process emitters: a WebAssembly
+development module, and a Mach-O development executable's object (an object or
+library artifact is one object). Release builds stay one whole-module object
+and are unchanged.
+
+The cut is made after optimization, so inlining and every other module-wide
+decision is the one a one-object build makes; only the code generator runs per
+unit, and the code of each function is the same post-optimization IR.
+
+1. The parent gives every function and global variable with local linkage a
+   hidden external name, `__abla_unit.<name>`, so a unit can name what another
+   defines, and works out the plan: consecutive defined functions, cut where
+   the instruction count crosses each `1/units` of the module. It writes the
+   module once as bitcode (`<object>.units.bc`) and frees its own copy.
+2. Each child (`ablac --codegen-unit <kind> <triple> <bitcode> <first> <end>
+   <index> <object>`) reads the module lazily: function bodies are read only
+   when something needs them. It declares the functions of other units (their
+   calling convention, visibility and attributes carried over), so their
+   bodies are never read, and links what is left into an empty module, which
+   reads its own bodies and leaves out what nothing kept names. Unit 0 also
+   keeps every global variable's definition, the module's inline assembly (the
+   WebAssembly exception tag) and the `llvm.*` arrays; the other units declare
+   them. An alias of something the unit doesn't define is replaced by a
+   declaration of its name.
+3. The parent combines the unit objects into the build's one file: a
+   WebAssembly object by a relocatable link (`wasm-ld -r`, which links the
+   DWARF sections too), a native object as an archive of them (`llvm-ar` with
+   no times or owners; members `unit0.o`…), which the executable's link loads
+   whole (`-force_load`). The build cache keeps that one file, as before.
+
+The number of units is fixed (8; `ABLA_CODEGEN_UNITS`, 1 turns units off), not
+taken from the machine, so the plan, and so the object, is the same everywhere;
+how many children run at once is the machine's (`ABLA_CODEGEN_JOBS`, else the
+cores, at most one a unit). A module under 150,000 instructions
+(`ABLA_CODEGEN_UNITS_MINIMUM`) is one object: a child costs more to start than
+its share of a small module's code generation. Units run only in the compiler's
+own driver, whose image is the child; a program that embeds the toolchain
+writes one object. `ABLA_CODEGEN_UNITS_TRACE=1` prints the cut on standard
+error.
+
+Units are not byte-identical to the one-object build (sections and symbols are
+laid out per unit, and local names carry the `__abla_unit.` prefix in the
+image's symbol table and a WebAssembly module's name section), but a units
+build is reproducible: the same module gives the same bytes. The final image's
+defined external symbols, imports, exports and tag section are those of the
+one-object build (`tools/test-codegen-units.sh`).
+
+Debug information on macOS: an executable's debug map names its objects, and
+the debugger reads their DWARF there. For a units build it names the archive's
+members (`<object>(unit3.o)`), so the archive holds the debug information, as a
+one-object build's object does, and names no directory: a copy of the project
+at another path builds the same archive. (A relocatable `ld -r` would not carry
+the DWARF through: it writes a debug map naming the unit objects' paths.)
+
+A child holds the module's globals and metadata and its own share of the
+function bodies, not the whole module.
+
 ## Module initializer
 
 A program's globals are initialized, in source order, by one function

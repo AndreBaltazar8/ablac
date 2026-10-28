@@ -15,6 +15,7 @@ import "eval.ab"
 import "abla/unsafe/memory/raw"
 import "backend/llvm/debug.ab"
 import "backend/llvm/bindings.ab"
+import "codegen_units.ab"
 import "sema.ab"
 import "abla/sys/linux"
 import "ir.ab"
@@ -511,12 +512,21 @@ trusted fun bootstrapEmitHeldWasmObject(llvmTriple: string, objectPath: string):
             LLVMRunPasses(module, bootstrapFastPasses(), machine, options), 167
         )
     }
+    // A large module is generated as units, by child compilers at once.
+    val units = status == 0 && bootstrapCodegenUnitsFor(module)
+    if (units) {
+        val starts = bootstrapWriteCodegenUnits(module, objectPath)
+        bootstrapDisposeHeldModule()
+        status = if (starts.size == 0) 145 else bootstrapRunCodegenUnits(
+            if (exceptions) "wasm-eh" else "wasm", llvmTriple, objectPath, starts
+        )
+    }
     // Codegen starts from a fresh context: the old one still holds what building
     // and optimizing the module left behind, which kept the tree's peak above
     // that of a separate opt and llc.
-    if (status == 0) status = bootstrapRebuildHeldModule()
+    if (status == 0 && !units) status = bootstrapRebuildHeldModule()
     val emitted = bootstrapLlvmHeldModule
-    if (status == 0 && LLVMTargetMachineEmitToFile(
+    if (status == 0 && !units && LLVMTargetMachineEmitToFile(
         machine, emitted, objectPath, 1, message.address
     ) != 0) status = 168
     if (status != 0 && !pointerIsNull(message.load())) {
@@ -561,8 +571,10 @@ trusted fun bootstrapRebuildHeldModule(): int {
 // Writes the Mach-O object of the module the backend kept (bootstrapLlvmHoldModule) for a
 // development build, as llvmAotEmitObjectFileFast does from the module's text: the
 // default triple, a generic CPU, PIC, the fast passes and FastISel. The module moves to a
-// fresh context first (bootstrapRebuildHeldModule), and is disposed either way.
-trusted fun bootstrapEmitHeldNativeObject(objectPath: string): int {
+// fresh context first (bootstrapRebuildHeldModule), and is disposed either way. With
+// `unitsAllowed` (an executable's), a large module is generated as code generation
+// units, and the object is an archive of them (codegen_units.ab).
+trusted fun bootstrapEmitHeldNativeObject(objectPath: string, unitsAllowed: bool): int {
     val nullPointer = nativeNullPointer()
     var status = if (pointerIsNull(bootstrapLlvmHeldModule)) 165 else 0
     if (status == 0 && llvmInitializeNativeTarget() != 0) status = 166
@@ -591,7 +603,15 @@ trusted fun bootstrapEmitHeldNativeObject(objectPath: string): int {
             LLVMRunPasses(module, llvmPassesFast(), machine, options), 167
         )
     }
-    if (status == 0 && LLVMTargetMachineEmitToFile(
+    // A large module is generated as units, by child compilers at once.
+    val units = status == 0 && unitsAllowed && bootstrapCodegenUnitsFor(module)
+    if (units) {
+        val starts = bootstrapWriteCodegenUnits(module, objectPath)
+        bootstrapDisposeHeldModule()
+        status = if (starts.size == 0) 145 else bootstrapRunCodegenUnits(
+            "native", nativeCString(triple), objectPath, starts
+        )
+    } else if (status == 0 && LLVMTargetMachineEmitToFile(
         machine, module, objectPath, 1, message.address
     ) != 0) status = 168
     if (status != 0 && !pointerIsNull(message.load())) {
@@ -616,6 +636,99 @@ fun bootstrapDisposeHeldModule(): void {
     bootstrapLlvmHeldModule = nativeNullPointer()
     bootstrapLlvmHeldContext = nativeNullPointer()
     return
+}
+
+// `ablac --codegen-unit <kind> <triple> <module.bc> <first> <end> <index> <object>`:
+// unit `index` of a fast build cut into code generation units (codegen_units.ab),
+// the functions the module defines from ordinal `first` up to `end`. Reads the
+// parent's optimized module lazily, declares the other units' functions, moves the
+// rest into a module of its own (which reads only this unit's bodies) and writes its
+// object with the parent's code generation settings: `kind` `native` (a generic CPU,
+// PIC, FastISel), or `wasm` / `wasm-eh` (static, with exception handling).
+trusted fun bootstrapEmitCodegenUnit(
+    kind: string,
+    llvmTriple: string,
+    bitcodePath: string,
+    first: int,
+    end: int,
+    index: int,
+    objectPath: string
+): int {
+    val nullPointer = nativeNullPointer()
+    val buffer = nativePointerCell(nullPointer)
+    val message = nativePointerCell(nullPointer)
+    val lazy = nativePointerCell(nullPointer)
+    val target = nativePointerCell(nullPointer)
+    val context = LLVMContextCreate()
+    LLVMContextSetDiscardValueNames(context, 1)
+    val wasm = kind != "native"
+    val exceptions = kind == "wasm-eh"
+    var status = if (first >= 0 && end >= first && index >= 0) 0 else 2
+    if (status == 0 && LLVMCreateMemoryBufferWithContentsOfFile(
+        bitcodePath, buffer.address, message.address
+    ) != 0) status = 145
+    // (The module takes the buffer when it is read.)
+    if (status == 0 && LLVMGetBitcodeModuleInContext2(
+        context, buffer.load(), lazy.address
+    ) != 0) {
+        LLVMDisposeMemoryBuffer(buffer.load())
+        status = 145
+    }
+    if (status == 0 && wasm) {
+        LLVMInitializeWebAssemblyTargetInfo()
+        LLVMInitializeWebAssemblyTarget()
+        LLVMInitializeWebAssemblyTargetMC()
+        LLVMInitializeWebAssemblyAsmPrinter()
+        if (exceptions) {
+            LLVMInitializeWebAssemblyAsmParser()
+            bootstrapSetLlvmWasmExceptions(true)
+        }
+    } else if (status == 0 && llvmInitializeNativeTarget() != 0) status = 166
+    var module = nullPointer
+    if (status == 0) {
+        bootstrapCodegenUnitStrip(lazy.load(), first, end, index)
+        // Linking into an empty module reads the bodies it moves, and only those; it
+        // takes the target, data layout, module flags and inline assembly along, and
+        // leaves out what nothing kept names. (The lazy module is gone either way.)
+        module = LLVMModuleCreateWithNameInContext("unit", context)
+        if (LLVMLinkModules2(module, lazy.load()) != 0) status = 145
+    }
+    val triple = LLVMNormalizeTargetTriple(llvmTriple)
+    if (status == 0 && LLVMGetTargetFromTriple(triple, target.address, message.address) != 0) {
+        status = 166
+    }
+    var machine = nullPointer
+    var layout = nullPointer
+    if (status == 0) {
+        machine = if (wasm) LLVMCreateTargetMachine(target.load(), triple, "", "", 0, 1, 0)
+            else LLVMCreateTargetMachine(target.load(), triple, "generic", "", 0, 2, 0)
+        if (pointerIsNull(machine)) status = 166
+        else if (!wasm) LLVMSetTargetMachineGlobalISel(machine, 0)
+    }
+    if (status == 0) {
+        layout = LLVMCreateTargetDataLayout(machine)
+        LLVMSetModuleDataLayout(module, layout)
+        if (LLVMTargetMachineEmitToFile(
+            machine, module, objectPath, 1, message.address
+        ) != 0) status = 168
+    }
+    if (status != 0 && !pointerIsNull(message.load())) {
+        linuxPrintStandardError(
+            "error[E_LLVM_CODEGEN]: unit $index: ${nativeCString(message.load())}\n"
+        )
+    }
+    if (!pointerIsNull(layout)) LLVMDisposeTargetData(layout)
+    if (!pointerIsNull(machine)) LLVMDisposeTargetMachine(machine)
+    if (!pointerIsNull(module)) LLVMDisposeModule(module)
+    LLVMContextDispose(context)
+    if (exceptions) bootstrapSetLlvmWasmExceptions(false)
+    if (!pointerIsNull(message.load())) LLVMDisposeMessage(message.load())
+    LLVMDisposeMessage(triple)
+    buffer.close()
+    message.close()
+    lazy.close()
+    target.close()
+    status
 }
 
 fun bootstrapExternalEmitObjectForTarget(
@@ -1882,6 +1995,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val nativeHeld = target.hosted && target.objectFormat == "macho" && !ltoEligible &&
         cacheProfile == "inprocess-fast" && !bootstrapKeepLlvmText() &&
         !bootstrapLlvmOutOfProcess()
+    // An executable's held module may be generated as code generation units, whose
+    // object is an archive of them (codegen_units.ab) that the link loads whole: only an
+    // executable's, as an object or library artifact is that object itself. (Its cache
+    // entries are its own for that reason.)
+    val nativeUnits = nativeHeld && artifact == "executable"
     var backendIdentity = ""
     if (cacheEnabled) {
         backendIdentity = "abla-backend\nllvm-library:${llvmLibraryVersion()}"
@@ -1905,7 +2023,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val partitionCacheNamespace =
         "$cacheDirectory/native-partition-${target.name}-llvm21-v3-$cacheProfile${if (bootstrapLlvmDebugInfo) "-g" else ""}-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"
     // A program that built flat may not build with --strict-imports.
-    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v14-$cacheProfile${if (bootstrapStrictImportsRequested) "-strict" else ""}-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
+    val cacheStem = "$cacheDirectory/native-${target.name}-llvm21-v14-$cacheProfile${if (bootstrapStrictImportsRequested) "-strict" else ""}${if (nativeUnits) "-units" else ""}-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash-${sourceIdentity.size}-$firstHash-$secondHash"
     val cacheObjectPath = "$cacheStem.o"
     val cacheLlvmPath = "$cacheStem.ll"
     val cacheSourcePath = "$cacheStem.source"
@@ -2076,7 +2194,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                 } else if (inProcessCodegen) {
                     status = bootstrapEmitHeldWasmObject(target.llvmTriple, objectPath)
                 } else if (nativeHeld) {
-                    status = bootstrapEmitHeldNativeObject(objectPath)
+                    status = bootstrapEmitHeldNativeObject(objectPath, nativeUnits)
                 } else if (bitcodeHandoff) {
                     status = emitObject(bitcodePath, objectPath)
                     Path(bitcodePath).remove()
@@ -2396,7 +2514,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             }
             link.argument("-lLLVM")
         }
-        link.argument(if (ltoEligible && !linkLlvm)
+        // (An archive of code generation units is loaded whole; ld64 loads an object
+        // so named as it loads it plainly.)
+        if (nativeUnits) link.argument("-Wl,-force_load,$objectPath")
+        else link.argument(if (ltoEligible && !linkLlvm)
             ltoObjectPath
         else objectPath)
         if (macTarget) link.argument(hostPath)

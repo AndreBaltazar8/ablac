@@ -1,0 +1,456 @@
+// Code generation units. A development build's module is optimized whole, as
+// before, and then cut into a fixed number of units that child compilers turn
+// into objects at once; the objects are combined into the build's one file (a
+// WebAssembly object, or an archive of native ones: bootstrapCodegenCombineUnits).
+//
+// The cut is made after optimization, so inlining and every other module-wide
+// decision is the same as for one object; only the code generator runs per
+// unit. The parent gives every local function and global a hidden external
+// name (bootstrapCodegenUnitPromote), so a unit can reach what another
+// defines, works out the plan (bootstrapCodegenUnitPlan: consecutive functions
+// of about equal size) and writes the module once. Each child reads it lazily
+// (function bodies are read when needed), declares the functions of other
+// units (bootstrapCodegenUnitStrip) and moves what is left into a module of
+// its own, which reads only its own bodies. Unit 0 also keeps every global
+// variable, the module's inline assembly and its `llvm.*` arrays.
+//
+// The number of units is fixed (BOOTSTRAP_CODEGEN_UNITS, or ABLA_CODEGEN_UNITS;
+// 1 turns units off), not taken from the machine: the plan, and so the object,
+// is the same on every machine. How many children run at once is the
+// machine's: ABLA_CODEGEN_JOBS, else the cores, at most one a unit.
+
+import "abla/sys/linux"
+import "abla/sys/linux/fs"
+import "abla/sys/linux/io"
+import "abla/sys/linux/process"
+import "abla/platform/host"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+import "abla/llvm/orc"
+import "backend/llvm/bindings.ab"
+import "backend/llvm/debug.ab"
+
+noescape extern:"c" fun LLVMGetFirstGlobal(module: i64*): i64*
+noescape extern:"c" fun LLVMGetNextGlobal(global: i64*): i64*
+noescape extern:"c" fun LLVMGetFirstGlobalAlias(module: i64*): i64*
+noescape extern:"c" fun LLVMGetNextGlobalAlias(alias: i64*): i64*
+noescape extern:"c" fun LLVMAliasGetAliasee(alias: i64*): i64*
+noescape extern:"c" fun LLVMAliasSetAliasee(alias: i64*, aliasee: i64*): void
+noescape extern:"c" fun LLVMGlobalClearMetadata(global: i64*): void
+noescape extern:"c" fun LLVMDeleteGlobal(global: i64*): void
+noescape extern:"c" fun LLVMSetModuleInlineAsm2(module: i64*, assembly: cstring, length: int): void
+noescape extern:"c" fun LLVMSetFunctionCallConv(function: i64*, convention: i32): void
+noescape extern:"c" fun LLVMGetAttributesAtIndex(function: i64*, index: i32, attributes: i64*): void
+noescape extern:"c" fun LLVMIsStringAttribute(attribute: i64*): i32
+noescape extern:"c" fun LLVMIsAGlobalValue(value: i64*): i64*
+noescape extern:"c" fun LLVMGetModuleContext(module: i64*): i64*
+noescape extern:"c" fun LLVMGetBitcodeModuleInContext2(context: i64*, buffer: i64*, module: i64*): i32
+noescape extern:"c" fun LLVMLinkModules2(destination: i64*, source: i64*): i32
+
+// Units a development build's module is cut into (ABLA_CODEGEN_UNITS overrides it).
+val BOOTSTRAP_CODEGEN_UNITS = 8
+
+// Below this many instructions a module is one object: a child compiler costs
+// more to start than its share of a small module's code generation.
+val BOOTSTRAP_CODEGEN_UNITS_MINIMUM = 150000
+
+/** The value of `text`, one to nine decimal digits, else -1. */
+fun bootstrapCodegenDigits(text: string): int {
+    if (text.size == 0 || text.size > 9) return -1
+    var value = 0
+    for (byte in text) {
+        if (byte < 48 || byte > 57) return -1
+        value = value * 10 + byte - 48
+    }
+    value
+}
+
+/** The decimal value of the environment variable `name`, else `fallback`. */
+fun bootstrapCodegenEnvironmentCount(name: string, fallback: int): int {
+    val configured = linuxEnvironment(name)
+    val value = if (configured.found) bootstrapCodegenDigits(configured.value) else -1
+    if (value < 0) fallback else value
+}
+
+/** How many units a large development module is cut into; 1 is one object. */
+fun bootstrapCodegenUnitCount(): int {
+    var units = bootstrapCodegenEnvironmentCount("ABLA_CODEGEN_UNITS", BOOTSTRAP_CODEGEN_UNITS)
+    if (units < 1) units = 1
+    if (units > 64) units = 64
+    units
+}
+
+/** The fewest instructions a module needs to be cut (ABLA_CODEGEN_UNITS_MINIMUM). */
+fun bootstrapCodegenUnitMinimum(): int =
+    bootstrapCodegenEnvironmentCount("ABLA_CODEGEN_UNITS_MINIMUM", BOOTSTRAP_CODEGEN_UNITS_MINIMUM)
+
+/** The machine's cores (`sysctl hw.ncpu` on macOS, `nproc` elsewhere), at least 1. */
+fun bootstrapCodegenHostCores(): int {
+    val command = if (ablaHostIsMacOS()) {
+        val sysctl = linuxCommand("sysctl")
+        sysctl.argument("-n")
+        sysctl.argument("hw.ncpu")
+        sysctl
+    } else linuxCommand("nproc")
+    var cores = 0
+    for (byte in command.captureText()) {
+        if (byte >= 48 && byte <= 57) cores = cores * 10 + byte - 48
+        else if (cores > 0) return cores
+    }
+    if (cores < 1) 1 else cores
+}
+
+/** How many unit children run at once: ABLA_CODEGEN_JOBS, else the cores, at
+ *  most `units`. */
+fun bootstrapCodegenJobs(units: int): int {
+    var jobs = bootstrapCodegenEnvironmentCount("ABLA_CODEGEN_JOBS", 0)
+    if (jobs < 1) jobs = bootstrapCodegenHostCores()
+    if (jobs > units) jobs = units
+    if (jobs < 1) 1 else jobs
+}
+
+/** The instructions of `function`'s body. */
+trusted fun bootstrapCodegenFunctionSize(function: i64*): int {
+    var count = 0
+    var block = LLVMGetFirstBasicBlock(function)
+    while (!pointerIsNull(block)) {
+        var instruction = LLVMGetFirstInstruction(block)
+        while (!pointerIsNull(instruction)) {
+            count = count + 1
+            instruction = LLVMGetNextInstruction(instruction)
+        }
+        block = LLVMGetNextBasicBlock(block)
+    }
+    count
+}
+
+/** The instructions of every function `module` defines. */
+trusted fun bootstrapCodegenModuleSize(module: i64*): int {
+    var total = 0
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == i32(0)) {
+            total = total + bootstrapCodegenFunctionSize(function)
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    total
+}
+
+/** Where each of `units` units starts among the functions `module` defines,
+ *  in order, and then their count (`units + 1` ordinals). Consecutive
+ *  functions share a unit, and each unit holds about as many instructions:
+ *  a function goes to the unit its first instruction falls in. */
+trusted fun bootstrapCodegenUnitPlan(module: i64*, units: int): array<int> {
+    val sizes: array<int> = []
+    var total = 0
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == i32(0)) {
+            // (One more than its instructions: an empty body still costs a symbol.)
+            val size = bootstrapCodegenFunctionSize(function) + 1
+            sizes.append(size)
+            total = total + size
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    val starts: array<int> = []
+    var before = 0
+    var ordinal = 0
+    for (size in sizes) {
+        var unit = if (total > 0) before * units / total else 0
+        if (unit >= units) unit = units - 1
+        while (starts.size <= unit) starts.append(ordinal)
+        before = before + size
+        ordinal = ordinal + 1
+    }
+    while (starts.size <= units) starts.append(ordinal)
+    starts
+}
+
+/** Whether `name` is one of LLVM's own (`llvm.used`, an intrinsic). */
+fun bootstrapCodegenLlvmName(name: string): bool =
+    name.size >= 5 && name.slice(0, 5) == "llvm."
+
+/** Gives every function and global variable with local linkage (internal or
+ *  private) a hidden external name, `__abla_unit.<name>`, so a unit can name
+ *  what another defines. Hidden symbols stay inside the one image the units
+ *  are linked into. */
+trusted fun bootstrapCodegenUnitPromote(module: i64*): void {
+    var anonymous = 0
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == i32(0)) {
+            anonymous = bootstrapCodegenPromoteValue(function, anonymous)
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    var global = LLVMGetFirstGlobal(module)
+    while (!pointerIsNull(global)) {
+        if (LLVMIsDeclaration(global) == i32(0)) {
+            anonymous = bootstrapCodegenPromoteValue(global, anonymous)
+        }
+        global = LLVMGetNextGlobal(global)
+    }
+    return
+}
+
+trusted fun bootstrapCodegenPromoteValue(value: i64*, anonymous: int): int {
+    val linkage = LLVMGetLinkage(value)
+    if (linkage != llvmInternalLinkage() && linkage != i32(9)) return anonymous
+    val name = bootstrapLlvmDebugValueName(value)
+    if (bootstrapCodegenLlvmName(name)) return anonymous
+    var next = anonymous
+    val promoted = if (name == "") {
+        next = next + 1
+        "__abla_unit.anonymous.$anonymous"
+    } else "__abla_unit.$name"
+    LLVMSetValueName2(value, promoted, promoted.size)
+    LLVMSetLinkage(value, i32(0))
+    LLVMSetVisibility(value, llvmHiddenVisibility())
+    next
+}
+
+/** A declaration standing for `function` (which is then deleted): its name,
+ *  type, calling convention, visibility and attributes (not the string ones,
+ *  which describe a body). */
+trusted fun bootstrapCodegenDeclareFunction(module: i64*, function: i64*): void {
+    val name = bootstrapLlvmDebugValueName(function)
+    LLVMSetValueName2(function, "", 0)
+    val declaration = LLVMAddFunction(module, name, LLVMGlobalGetValueType(function))
+    LLVMSetFunctionCallConv(declaration, LLVMGetFunctionCallConv(function))
+    LLVMSetVisibility(declaration, LLVMGetVisibility(function))
+    var index = -1
+    val parameters = int(LLVMCountParams(function))
+    while (index <= parameters) {
+        val count = int(LLVMGetAttributeCountAtIndex(function, i32(index)))
+        if (count > 0) {
+            val attributes = nativeByteBuffer(count * 8)
+            LLVMGetAttributesAtIndex(function, i32(index), attributes.pointerAt(0))
+            var slot = 0
+            while (slot < count) {
+                val attribute = nativePointerFromAddress(attributes.loadI64(slot * 8))
+                if (LLVMIsStringAttribute(attribute) == i32(0)) {
+                    LLVMAddAttributeAtIndex(declaration, i32(index), attribute)
+                }
+                slot = slot + 1
+            }
+            attributes.close()
+        }
+        index = index + 1
+    }
+    LLVMReplaceAllUsesWith(function, declaration)
+    LLVMDeleteFunction(function)
+    return
+}
+
+/** A private function that never returns: what a dropped alias points at. */
+trusted fun bootstrapCodegenAliasStub(module: i64*): i64* {
+    val context = LLVMGetModuleContext(module)
+    val type = LLVMFunctionType(LLVMVoidTypeInContext(context), nativeNullPointer(), i32(0), i32(0))
+    val stub = LLVMAddFunction(module, "__abla_unit.dropped", type)
+    LLVMSetLinkage(stub, i32(9))
+    val builder = LLVMCreateBuilderInContext(context)
+    LLVMPositionBuilderAtEnd(builder, LLVMAppendBasicBlockInContext(context, stub, "entry"))
+    LLVMBuildUnreachable(builder)
+    LLVMDisposeBuilder(builder)
+    stub
+}
+
+/** Cuts the module read from the parent down to unit `index`, the functions
+ *  it defines from ordinal `first` up to `end`: the others become
+ *  declarations (their bodies, not read yet, never are), and outside unit 0
+ *  every global variable is declared, the `llvm.*` arrays and the inline
+ *  assembly go, and an alias of something this unit doesn't define is
+ *  dropped (its uses name the alias's symbol, which its own unit defines). */
+trusted fun bootstrapCodegenUnitStrip(module: i64*, first: int, end: int, index: int): void {
+    // (Addresses: a function's handle stays valid until it is replaced.)
+    val others: array<int> = []
+    var defined = 0
+    var function = LLVMGetFirstFunction(module)
+    while (!pointerIsNull(function)) {
+        if (LLVMIsDeclaration(function) == i32(0)) {
+            if (defined < first || defined >= end) others.append(nativePointerAddress(function))
+            defined = defined + 1
+        }
+        function = LLVMGetNextFunction(function)
+    }
+    for (other in others) bootstrapCodegenDeclareFunction(module, nativePointerFromAddress(other))
+    if (index != 0) {
+        val arrays: array<int> = []
+        var global = LLVMGetFirstGlobal(module)
+        while (!pointerIsNull(global)) {
+            if (bootstrapCodegenLlvmName(bootstrapLlvmDebugValueName(global))) {
+                arrays.append(nativePointerAddress(global))
+            } else if (LLVMIsDeclaration(global) == i32(0)) {
+                LLVMSetInitializer(global, nativeNullPointer())
+                LLVMSetLinkage(global, i32(0))
+                LLVMGlobalClearMetadata(global)
+            }
+            global = LLVMGetNextGlobal(global)
+        }
+        for (array in arrays) LLVMDeleteGlobal(nativePointerFromAddress(array))
+        LLVMSetModuleInlineAsm2(module, "", 0)
+    }
+    var stub = nativeNullPointer()
+    var alias = LLVMGetFirstGlobalAlias(module)
+    while (!pointerIsNull(alias)) {
+        val aliasee = LLVMAliasGetAliasee(alias)
+        val target = LLVMIsAGlobalValue(aliasee)
+        val kept = if (pointerIsNull(target)) index == 0
+            else LLVMIsDeclaration(target) == i32(0)
+        if (!kept) {
+            val name = bootstrapLlvmDebugValueName(alias)
+            val type = LLVMGlobalGetValueType(alias)
+            LLVMSetValueName2(alias, "", 0)
+            val declaration = if (LLVMGetTypeKind(type) == i32(9))
+                LLVMAddFunction(module, name, type)
+                else LLVMAddGlobal(module, type, name)
+            LLVMSetVisibility(declaration, LLVMGetVisibility(alias))
+            LLVMReplaceAllUsesWith(alias, declaration)
+            if (pointerIsNull(stub)) stub = bootstrapCodegenAliasStub(module)
+            LLVMAliasSetAliasee(alias, stub)
+            LLVMSetLinkage(alias, i32(9))
+        }
+        alias = LLVMGetNextGlobalAlias(alias)
+    }
+    return
+}
+
+/** Starts the unit child `arguments` (this compiler, `--codegen-unit …`): its
+ *  process, or 0 when it can't start. */
+fun bootstrapCodegenStartUnit(arguments: array<string>): int {
+    val child = linuxCommand("/proc/self/exe")
+    for (argument in arguments) child.argument(argument)
+    val process = child.start().process
+    if (process > 0) process else 0
+}
+
+/** Runs the unit children, at most `jobs` at once: 0 when every one succeeds,
+ *  else the first failure's status (the rest are still waited for). */
+fun bootstrapCodegenRunUnits(commands: array<array<string>>, jobs: int): int {
+    var status = 0
+    var next = 0
+    val running: array<int> = []
+    while (next < commands.size && running.size < jobs) {
+        val process = bootstrapCodegenStartUnit(commands[next])
+        if (process == 0 && status == 0) status = 127
+        running.append(process)
+        next = next + 1
+    }
+    var active = 0
+    for (process in running) if (process > 0) active = active + 1
+    while (active > 0) {
+        var progressed = false
+        var slot = 0
+        while (slot < running.size) {
+            if (running[slot] > 0) {
+                val observed = linuxWaitProcess(running[slot], true)
+                if (observed.output != "pending") {
+                    progressed = true
+                    if (observed.status != 0 && status == 0) status = observed.status
+                    running[slot] = 0
+                    active = active - 1
+                    // After a failure the remaining units are not started.
+                    if (status == 0 && next < commands.size) {
+                        val process = bootstrapCodegenStartUnit(commands[next])
+                        if (process == 0) status = 127
+                        else {
+                            running[slot] = process
+                            active = active + 1
+                        }
+                        next = next + 1
+                    }
+                }
+            }
+            slot = slot + 1
+        }
+        if (active > 0 && !progressed) linuxSleepMillisecondsChecked(1)
+    }
+    status
+}
+
+/** Combines the unit objects into `objectPath`: a WebAssembly object by a
+ *  relocatable link (`wasm-ld -r`, which links their DWARF too); a native one
+ *  as an archive of them (`llvm-ar`, without times or owners), which the link
+ *  loads whole (`-force_load`). macOS's relocatable link would turn the units'
+ *  DWARF into a debug map naming the unit objects' paths; an executable's
+ *  debug map names the archive's members instead (`<object>(unit3.o)`), as it
+ *  names a one-object build's object, so the archive holds the debug
+ *  information and names no directory. Either way the build cache keeps one
+ *  file. */
+fun bootstrapCodegenCombineUnits(kind: string, parts: array<string>, objectPath: string): int {
+    Path(objectPath).remove()
+    val combine = if (kind == "native") linuxCommand("llvm-ar") else linuxCommand("wasm-ld")
+    if (kind == "native") {
+        combine.argument("rcsD")
+        combine.argument("--format=darwin")
+        combine.argument(objectPath)
+    } else combine.argument("-r")
+    for (part in parts) combine.argument(part)
+    if (kind != "native") {
+        combine.argument("-o")
+        combine.argument(objectPath)
+    }
+    combine.run()
+}
+
+// Whether this process is the compiler's own driver (orc_main.ab), whose image
+// the unit children run (`/proc/self/exe --codegen-unit`). A program that
+// embeds the toolchain emits one object.
+var bootstrapCodegenUnitsInCompiler = false
+
+/** Whether a fast build cuts `module` into units: the compiler's driver runs,
+ *  more than one unit is configured and the module has at least the minimum
+ *  instructions. */
+fun bootstrapCodegenUnitsFor(module: i64*): bool =
+    bootstrapCodegenUnitsInCompiler && bootstrapCodegenUnitCount() > 1 &&
+    bootstrapCodegenModuleSize(module) >= bootstrapCodegenUnitMinimum()
+
+/** Gives the optimized `module`'s locals hidden external names and writes it
+ *  as bitcode for the unit children (`<objectPath>.units.bc`): the plan
+ *  (bootstrapCodegenUnitPlan), or [] when it can't be written. The caller
+ *  then disposes the module, so the children's copies don't add to it, and
+ *  calls bootstrapRunCodegenUnits with the plan. */
+fun bootstrapWriteCodegenUnits(module: i64*, objectPath: string): array<int> {
+    bootstrapCodegenUnitPromote(module)
+    val starts = bootstrapCodegenUnitPlan(module, bootstrapCodegenUnitCount())
+    if (LLVMWriteBitcodeToFile(module, "$objectPath.units.bc") == i32(0)) starts else []
+}
+
+/** Writes `objectPath` from the bitcode bootstrapWriteCodegenUnits wrote: one
+ *  child a unit (`kind`: `native`, `wasm` or `wasm-eh`; `triple` the target),
+ *  at most bootstrapCodegenJobs at once, the objects combined into one
+ *  (bootstrapCodegenCombineUnits). The unit objects are `unit<n>.o` in
+ *  `<objectPath>.units`, names that become the archive's members, and are
+ *  removed after. */
+fun bootstrapRunCodegenUnits(kind: string, triple: string, objectPath: string, starts: array<int>): int {
+    val units = starts.size - 1
+    val bitcodePath = "$objectPath.units.bc"
+    val directory = "$objectPath.units"
+    Path(directory).removeTree()
+    var status = if (Path(directory).createDirectories()) 0 else 145
+    val parts: array<string> = []
+    val commands: array<array<string>> = []
+    var unit = 0
+    while (unit < units) {
+        val part = "$directory/unit$unit.o"
+        parts.append(part)
+        commands.append([
+            "--codegen-unit", kind, triple, bitcodePath,
+            "${starts[unit]}", "${starts[unit + 1]}", "$unit", part
+        ])
+        unit = unit + 1
+    }
+    val jobs = bootstrapCodegenJobs(units)
+    // ABLA_CODEGEN_UNITS_TRACE=1 says so on standard error.
+    val trace = linuxEnvironment("ABLA_CODEGEN_UNITS_TRACE")
+    if (trace.found && trace.value == "1") {
+        linuxPrintStandardError("codegen units: $units units, $jobs at once ($kind)\n")
+    }
+    if (status == 0) status = bootstrapCodegenRunUnits(commands, jobs)
+    Path(bitcodePath).remove()
+    if (status == 0) status = bootstrapCodegenCombineUnits(kind, parts, objectPath)
+    Path(directory).removeTree()
+    status
+}
