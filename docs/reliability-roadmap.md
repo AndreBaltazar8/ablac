@@ -300,36 +300,18 @@ directory lookup per candidate pointer) and sweeps with `free`.
   collections (and the first collection at half of it) without a rebuild: a
   smaller step collects more often over less garbage, so each pause is
   shorter.
-- **Parked: the collector optimized in `--fast` builds.** The collections
-  (`__ablaRuntimePlatformMemoryCollect`, the background and pressure ones) and
-  what they call, found by walking the LLVM calls, run one pass pipeline
-  while every other function with a body is marked `optnone` and `noinline`
-  for that run, the marks then removed. Compile CPU of a mid-size program
-  (four interleaved runs) against the explicit collection above: the --o1
-  pipeline with the inliner +14% and 404 ms; function passes only
-  (`mem2reg,sroa,early-cse,instcombine,simplifycfg`) +1.5% and 433 ms;
-  `mem2reg` alone +0% and 1,082 ms. The function-pass variant passes the 3%
-  compile-cost bar. It is kept, unmerged, on the branch
-  `backend/gc-fast-collector-parked` (b7e911ab), built only as a first-stage
-  compiler: landing it needs a full verify (self-build identity, the suite)
-  and a collector stress run of its own.
 - **The long-term fix: native integers in runtime functions.** Most of a
   `--fast` collection's cost is its integers boxed through a runtime call per
   operation, as unoptimized code of any runtime function has them. Lowering
   the runtime's integer arithmetic to native integers whatever the build
   profile removes that cost for every runtime function, not only the
-  collector, and makes the parked pass unnecessary.
+  collector.
 - **A real server's pauses are its sweep.** A release game server under six
   bots measured: marking about 2 ms; the pause grows with the garbage freed,
   about 1 µs per object (some 1,400 instances of about 320 bytes each made per
   tick). Freeing in the background (`memorySetBackgroundFree(true)`) gave the
   best 99th-percentile pause, 3.2 ms against 15 ms; a 256 MB growth step gave
   the worst. Incremental marking is therefore not needed.
-- **Next: a cheaper sweep.** Sweep pages on allocation instead of all at once
-  at the end of a collection (lazy sweep), or reuse freed objects by size
-  class instead of returning each to `free`, so a collection's pause is its
-  mark only and the sweep's work stays proportional to allocation. Estimated
-  2–3 days.
 - **Fixed: a loop that allocates only through the runtime never collected.**
   A function's pressure safe point ran once per call, where it pushes its
   frame, so a loop whose allocations all happen in runtime helpers (string
