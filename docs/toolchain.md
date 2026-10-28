@@ -38,8 +38,9 @@ long-running program. The executable is kept as `build/.abla-run/<source path>`.
 Either way the program keeps the standard streams, the working directory and
 the environment.
 
-`ablac test` builds test programs into `build/abla-test/` (several files as
-few programs as possible, each test still run in its own process), runs them,
+`ablac test` builds test programs into `build/abla-test/`, each named by the
+files in it, so runs at once in one directory don't share a build (several files
+as few programs as possible, each test still run in its own process), runs them,
 prints `PASS <file>` or `FAIL <file> (exit <status>)` and a summary, and
 exits with 1 when any failed; see [stdlib/testing.md](stdlib/testing.md).
 

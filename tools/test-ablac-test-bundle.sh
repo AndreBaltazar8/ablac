@@ -8,7 +8,8 @@
 # Shared modules count too: two that declare the same public name (`ApiResult`), each
 # imported by other tests, put those tests in separate bundles with no file built on
 # its own, while overloads (`render(int)` and `render(string)`, two `Box.label`s) and
-# private names share one.
+# private names share one. Two runs at once in one directory, over other files, each
+# report their own results (each bundle's build is named by its files).
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -73,4 +74,21 @@ done
 for name in text text-again; do
     [[ $(bundle_of "$name.test.ab") == 1 ]] || { cat "$work/shared.out" >&2; fail "$name.test.ab is not in bundle 1"; }
 done
-echo "test bundle: bundled results match --each (duplicate names, extension clash, broken import, crash, exit status, shared-module clash)"
+# Runs over other files never write the same build (-v names each bundle's), so two at
+# once in one directory can't run each other's programs.
+paths() { sed -nE 's/^bundle [0-9]+ \([0-9]+ files, (.*)\):$/\1/p' "$1" | sort; }
+[[ -n $(paths "$work/bundled.out") && -n $(paths "$work/shared.out") ]] || fail "-v named no bundle builds"
+[[ -z $(comm -12 <(paths "$work/bundled.out") <(paths "$work/shared.out")) ]] ||
+    fail "runs over other files share a bundle build: $(comm -12 <(paths "$work/bundled.out") <(paths "$work/shared.out") | tr '\n' ' ')"
+# Two runs at once in one directory, over other files: each reports what it did alone.
+s1=0; s2=0
+"$compiler" test --no-cache "$cases" > "$work/both-cases.out" 2>/dev/null & first=$!
+"$compiler" test --no-cache "$shared" > "$work/both-shared.out" 2>/dev/null & second=$!
+wait $first || s1=$?
+wait $second || s2=$?
+[[ $s1 -eq 1 && $s2 -eq 0 ]] || fail "concurrent runs exited $s1 and $s2"
+grep -E '^(PASS|FAIL) ' "$work/both-cases.out" | sort | diff "$work/bundled.results" - > "$work/both.diff" ||
+    { cat "$work/both.diff" >&2; fail "a concurrent run's results differ"; }
+grep -E '^(PASS|FAIL) ' "$work/both-shared.out" | sort | diff "$work/shared.results" - > "$work/both.diff" ||
+    { cat "$work/both.diff" >&2; fail "the other concurrent run's results differ"; }
+echo "test bundle: bundled results match --each (duplicate names, extension clash, broken import, crash, exit status, shared-module clash, concurrent runs)"
