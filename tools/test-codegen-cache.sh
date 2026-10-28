@@ -6,7 +6,7 @@
 # cache's objects. A cache past ABLA_CODEGEN_CACHE_MB loses its oldest objects.
 set -euo pipefail
 compiler=${1:-build/ablac.bin}
-project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 output_directory="$project_root/build/codegen-cache"
 rm -rf "$output_directory"
 mkdir -p "$output_directory"

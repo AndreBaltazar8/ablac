@@ -5,7 +5,7 @@
 # and WebAssembly modules with and without exception handling.
 set -euo pipefail
 compiler=${1:-build/ablac.bin}
-project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 output_directory="$project_root/build/codegen-units"
 rm -rf "$output_directory"
 mkdir -p "$output_directory/again"
