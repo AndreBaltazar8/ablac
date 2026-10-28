@@ -75,7 +75,7 @@ rejected rooted-refused 2 "ownership.managed-return-borrow-contract:function.cac
 runs getter "0 1 2 3 4 5"
 rejected getter-refused 1 '`holder` is changed while `account`, which borrows it'
 rejected getter-mutable 1 "ownership.borrow-mutable-local:account"
-runs view-strings "ann none ann x an red ann/bob"
+runs view-strings "ann none ann x an red ann/bob ann ann -"
 rejected view-strings-region 3 "region.escape:assignment.saved" "region.escape:assignment.other"
 
 echo "ownership precision: ok"
