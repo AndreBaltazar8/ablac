@@ -15,11 +15,13 @@ let
     # callx8), EXTUI for masks and right shifts (never selected upstream), and
     # literal pools in their function's text section
     # (-xtensa-text-section-literals), which keeps an object's code together
-    # under GNU ld so those CALL8s stay in range.
+    # under GNU ld so those CALL8s stay in range; MOVI and constant-pool L32R
+    # rematerialize instead of being spilled to the stack.
     patches = (old.patches or [ ]) ++ [
       ./llvm-xtensa-direct-calls.patch
       ./llvm-xtensa-extui.patch
       ./llvm-xtensa-text-section-literals.patch
+      ./llvm-xtensa-rematerialize.patch
     ];
   });
 in
