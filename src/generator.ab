@@ -54,7 +54,9 @@ class BootstrapGeneratorScope(
 class BootstrapGeneratorLoop(
     val breakState: int,
     val continueState: int,
-    val scope: int
+    val scope: int,
+    // The loop's label ("" when it has none): `break@label` leaves it.
+    val label: string = ""
 )
 
 class BootstrapGeneratorExpansion(
@@ -114,6 +116,13 @@ fun bootstrapGeneratorMisplacedYield(
     [-1, -1]
 }
 
+fun bootstrapGeneratorNamesLabel(labels: array<string>, label: string): bool {
+    for (found in labels) {
+        if (found == label) return true
+    }
+    false
+}
+
 class BootstrapGeneratorMachine(
     val id: string,
     val begin: int,
@@ -132,7 +141,10 @@ class BootstrapGeneratorMachine(
     var error: string,
     var errorBegin: int,
     var errorEnd: int,
-    var counter: int
+    var counter: int,
+    // The labels of the loops kept whole that `rewrite` is inside: a
+    // `break@label` of one of them stays as it is.
+    val keptLabels: array<string> = []
 ) {
     fun node(
         kind: string,
@@ -381,12 +393,22 @@ class BootstrapGeneratorMachine(
             )
         }
         if (!nested && kind == "return") return this.gotoNode("close", expression)
-        if (!nested && loopDepth == 0 && (kind == "break" || kind == "continue")) {
-            if (this.loops.size == 0) {
+        if (!nested && (kind == "break" || kind == "continue") &&
+            (if (expression.text == "") loopDepth == 0
+             else !bootstrapGeneratorNamesLabel(this.keptLabels, expression.text))) {
+            var found = this.loops.size - 1
+            if (expression.text != "") {
+                while (found >= 0 && this.loops[found].label != expression.text) {
+                    found = found - 1
+                }
+                // No loop of that label: the checker names it.
+                if (found < 0) return expression
+            }
+            if (found < 0) {
                 this.fail("generator.loop-control:${expression.kind}", expression)
                 return expression
             }
-            val loop = this.loops[this.loops.size - 1]
+            val loop = this.loops[found]
             return this.exitJump(
                 loop,
                 if (kind == "break") loop.breakState else loop.continueState,
@@ -409,16 +431,20 @@ class BootstrapGeneratorMachine(
             result = this.node(kind, expression.text, expression, children)
         } else if (kind == "for") {
             val source = this.rewrite(expression.children[0], loopDepth, nested)
-            this.bind(expression.text, expression.text)
+            this.bind(bootstrapForName(expression), bootstrapForName(expression))
+            this.keptLabels.append(bootstrapLoopLabel(expression))
             val body = this.rewrite(expression.children[1], loopDepth + 1, nested)
+            this.keptLabels.truncate(this.keptLabels.size - 1)
             result = this.node(kind, expression.text, expression, [source, body])
         } else if (kind == "while" || kind == "do.while") {
             val children: array<BootstrapExpression> = []
+            this.keptLabels.append(bootstrapLoopLabel(expression))
             var child = 0
             while (child < expression.children.size) {
                 children.append(this.rewrite(expression.children[child], loopDepth + 1, nested))
                 child = child + 1
             }
+            this.keptLabels.truncate(this.keptLabels.size - 1)
             result = this.node(kind, expression.text, expression, children)
         } else if (kind == "lambda" || kind == "lambda.move" || kind == "lambda.generator") {
             val children: array<BootstrapExpression> = []
@@ -674,7 +700,9 @@ class BootstrapGeneratorMachine(
         ]))
         this.current = -1
         this.mark(bodyState, statement)
-        this.loops.append(BootstrapGeneratorLoop(endState, conditionState, this.scope))
+        this.loops.append(BootstrapGeneratorLoop(
+            endState, conditionState, this.scope, bootstrapLoopLabel(statement)
+        ))
         this.processBody(statement.children[1])
         this.loops.truncate(this.loops.size - 1)
         this.jump(conditionState, statement)
@@ -687,7 +715,9 @@ class BootstrapGeneratorMachine(
         val conditionState = this.newState()
         val endState = this.newState()
         this.mark(bodyState, statement)
-        this.loops.append(BootstrapGeneratorLoop(endState, conditionState, this.scope))
+        this.loops.append(BootstrapGeneratorLoop(
+            endState, conditionState, this.scope, bootstrapLoopLabel(statement)
+        ))
         this.processBody(statement.children[0])
         this.loops.truncate(this.loops.size - 1)
         this.jump(conditionState, statement)
@@ -751,13 +781,15 @@ class BootstrapGeneratorMachine(
         this.current = -1
         this.mark(bodyState, statement)
         // The element is not dropped: an array's is borrowed.
-        val element = this.newSlot(statement.text, this.missing(statement))
-        this.bind(statement.text, element)
+        val element = this.newSlot(bootstrapForName(statement), this.missing(statement))
+        this.bind(bootstrapForName(statement), element)
         this.emit(this.node("assign", element, statement, [
             if (range) this.identifier(index, statement)
             else this.node("generator.forvalue", "", statement, slots)
         ]))
-        this.loops.append(BootstrapGeneratorLoop(endState, stepState, this.scope))
+        this.loops.append(BootstrapGeneratorLoop(
+            endState, stepState, this.scope, bootstrapLoopLabel(statement)
+        ))
         this.processBody(statement.children[1])
         this.loops.truncate(this.loops.size - 1)
         this.jump(stepState, statement)

@@ -11,6 +11,31 @@ class BootstrapExpression(
     val children: array<BootstrapExpression>
 )
 
+// Where a labeled `for` keeps its label: its text is "variable@label".
+fun bootstrapForLabelAt(text: string): int {
+    var index = 0
+    while (index < text.size) {
+        if (text[index] == 64) return index
+        index = index + 1
+    }
+    -1
+}
+
+/** The label of a `while`, `do … while` or `for` loop ("" when it has
+ *  none). */
+fun bootstrapLoopLabel(loop: BootstrapExpression): string {
+    if (loop.kind == "while" || loop.kind == "do.while") return loop.text
+    if (loop.kind != "for") return ""
+    val at = bootstrapForLabelAt(loop.text)
+    if (at < 0) "" else loop.text.slice(at + 1, loop.text.size)
+}
+
+/** The variable a `for` loop binds: its text without a label. */
+fun bootstrapForName(loop: BootstrapExpression): string {
+    val at = bootstrapForLabelAt(loop.text)
+    if (at < 0) loop.text else loop.text.slice(0, at)
+}
+
 class BootstrapParameters(
     val names: array<string>,
     val types: array<string>,
@@ -814,6 +839,8 @@ class BootstrapParser(
                 statements.append(this.parseReturn())
             } else if (this.at("defer")) {
                 statements.append(this.parseDefer())
+            } else if (this.atLoopLabel()) {
+                statements.append(this.parseLabeledLoop())
             } else if (this.at("break") || this.at("continue")) {
                 statements.append(this.parseLoopControl())
             } else statements.append(this.parseExpression())
@@ -1001,6 +1028,8 @@ class BootstrapParser(
                 statements.append(this.parseReturn())
             } else if (this.at("defer")) {
                 statements.append(this.parseDefer())
+            } else if (this.atLoopLabel()) {
+                statements.append(this.parseLabeledLoop())
             } else if (this.at("break") || this.at("continue")) {
                 statements.append(this.parseLoopControl())
             } else statements.append(this.parseExpression())
@@ -1035,6 +1064,7 @@ class BootstrapParser(
             this.parseLoopControl()
         }
         else if (this.at("for")) this.parseFor()
+        else if (this.atLoopLabel()) this.parseLabeledLoop()
         else if (this.at("{")) this.parseBlock()
         else this.parseExpression()
     }
@@ -1085,11 +1115,60 @@ class BootstrapParser(
         }
     }
 
+    // `break@outer` / `continue@outer`: the `@` and the label follow the
+    // keyword with no space between. The node's text is the label ("" for
+    // the innermost loop).
     fun parseLoopControl(): BootstrapExpression {
         val token = this.tokens[this.position]
         val kind = token.kind
         this.position = this.position + 1
+        val mark = this.tokens[this.position]
+        if (mark.kind == "@" && mark.begin == token.end &&
+            this.position + 1 < this.tokens.size) {
+            val name = this.tokens[this.position + 1]
+            if (name.kind == "identifier" && name.begin == mark.end) {
+                this.position = this.position + 2
+                return BootstrapExpression(
+                    kind, bootstrapTokenText(this.source, name),
+                    token.begin, name.end, []
+                )
+            }
+            this.failAt(
+                "LOOP_LABEL",
+                "expected a label right after `$kind@`",
+                mark.begin,
+                mark.end
+            )
+            this.position = this.position + 1
+        }
         BootstrapExpression(kind, "", token.begin, token.end, [])
+    }
+
+    // `name@ while …`, `name@ do …`, `name@ for …`: an identifier with `@`
+    // right after it (no space), before a loop keyword. (An annotation is
+    // `@name`, before a declaration.)
+    fun atLoopLabel(): bool {
+        if (!this.at("identifier") || this.position + 2 >= this.tokens.size) return false
+        val name = this.tokens[this.position]
+        val mark = this.tokens[this.position + 1]
+        val loop = this.tokens[this.position + 2].kind
+        mark.kind == "@" && mark.begin == name.end &&
+            (loop == "while" || loop == "do" || loop == "for")
+    }
+
+    // A labeled loop: the loop's node, beginning at its label. A `while` or
+    // `do … while` keeps the label in its text; a `for`, whose text is its
+    // variable, keeps "variable@label" (bootstrapLoopLabel, bootstrapForName).
+    fun parseLabeledLoop(): BootstrapExpression {
+        val name = this.tokens[this.position]
+        val label = bootstrapTokenText(this.source, name)
+        this.position = this.position + 2
+        val loop =
+            if (this.at("while")) this.parseWhile()
+            else if (this.at("do")) this.parseDoWhile()
+            else this.parseFor()
+        val text = if (loop.kind == "for") "${loop.text}@$label" else label
+        BootstrapExpression(loop.kind, text, name.begin, loop.end, loop.children)
     }
 
     fun parseReturn(): BootstrapExpression {

@@ -654,8 +654,9 @@ fun main {
 - `??` groups to the right (`a ?? b ?? c` is `a ?? (b ?? c)`). It binds more
   loosely than arithmetic and ranges and more tightly than comparisons:
   `a ?? 1 + 2` is `a ?? (1 + 2)`, and `a ?? 0 < n` is `(a ?? 0) < n`.
-- The right side of `??` may be `return`, `break` or `continue`, which leave
-  as an `if` branch does: `val x = y ?? return`.
+- The right side of `??` may be `return`, `break` or `continue` (also
+  `break@label` / `continue@label`), which leave as an `if` branch does:
+  `val x = y ?? return`.
 - Each side is evaluated at most once, left to right. The left side must be
   able to be `null`: `?.` on a value that can't be is `safe-call.non-null:<T>`
   (use `.`), and `??` after one is `null-default.non-null:<T>`.
@@ -2132,6 +2133,56 @@ fun main {
 
 - `break` leaves the innermost loop; `continue` starts its next iteration.
   Outside a loop they are `break.outside-loop` and `continue.outside-loop`.
+- A loop may have a label: a name followed directly by `@` (no space), before
+  `while`, `do` or `for`. `break@name` leaves the loop labeled `name` and
+  `continue@name` starts its next iteration (a `do … while` tests its
+  condition first), from any loop inside it; the `@` and the name follow the
+  keyword with no space. They may stand wherever `break` and `continue` may,
+  including the right side of `??`. Leaving runs the drops and `defer`s of
+  every scope left, innermost first, and compiles to a plain jump. A labeled
+  `do { … } while (false)` is a block with several exits:
+
+  ```abla
+  import "abla/io"
+
+  fun classify(n: int): string {
+      var kind = "small"
+      done@ do {
+          if (n < 0) { kind = "negative"; break@done }
+          outer@ for (row in 0 until n) {
+              for (column in 0 until row) {
+                  if (column * row == 6) { kind = "six"; break@done }
+                  if (column > 2) continue@outer
+              }
+          }
+      } while (false)
+      return kind
+  }
+
+  fun main {
+      println("${classify(-1)} ${classify(2)} ${classify(4)}")
+  }
+  // output:
+  // negative small six
+  ```
+
+  A label names a loop of the same function only: one no loop around the
+  jump has (a lambda doesn't see its caller's loops) is
+  `break.unknown-label:<name>` / `continue.unknown-label:<name>`, and a loop
+  inside another taking the outer one's label is `loop.label-shadowed:<name>`:
+
+  ```abla error
+  fun main {
+      rows@ for (row in 0 until 3) {
+          rows@ while (true) break@rows   // error: loop.label-shadowed:rows
+          continue@columns                // error: continue.unknown-label:columns
+      }
+  }
+  ```
+
+  A label is unrelated to an annotation, which is `@name` before a
+  declaration. A `while (true)` that `break@` its own label can end, so its
+  type is `void`, not `never`.
 - `return` leaves the innermost function or lambda; a bare `return` returns
   `void` (`return.type`, `return.outside-function`).
 - Conditions must be `bool` (`if.condition`, `while.condition`,

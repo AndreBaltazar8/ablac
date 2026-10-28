@@ -678,8 +678,8 @@ fun bootstrapExpressionMayMutateReceiver(
         val body = expression.kind == "for" && child == 1
         val bodyMark = shadowed.size
         val aliasMark = aliases.size
-        if (body && !aliasing) shadowed.append(expression.text)
-        if (body && aliasing) aliases.append(expression.text)
+        if (body && !aliasing) shadowed.append(bootstrapForName(expression))
+        if (body && aliasing) aliases.append(bootstrapForName(expression))
         mutates = bootstrapExpressionMayMutateReceiver(
             found,
             declarations,
@@ -2566,6 +2566,12 @@ fun bootstrapSemanticHelp(code: string): string {
     var colon = 0
     while (colon < code.size && code[colon] != 58) colon = colon + 1
     when (code.slice(0, colon)) {
+        "break.unknown-label" ->
+            "`break@name` leaves the enclosing loop labeled `name@`; no loop around it (in this function) has that label"
+        "continue.unknown-label" ->
+            "`continue@name` goes on with the enclosing loop labeled `name@`; no loop around it (in this function) has that label"
+        "loop.label-shadowed" ->
+            "a loop inside another loop can't take the outer loop's label: give it a name of its own"
         "library.program-global" ->
             "the standard library reads only its own globals, never a program's: this name is the library's local or a missing declaration"
         "interface.missing-member" ->
@@ -3086,11 +3092,20 @@ fun bootstrapWhenLiteralKey(expression: BootstrapExpression): string {
     key
 }
 
+// Whether a `break` under `expression` leaves the loop it is the body of:
+// a plain `break` outside any nested loop, or `break@label` naming that
+// loop (`label`, "" when it has none) from any depth. (A `break@outer` of
+// a loop further out leaves this loop too, but control then goes on after
+// the outer loop, not after this one.)
 fun bootstrapExpressionBreaksCurrentLoop(
     expression: BootstrapExpression,
-    nestedLoops: int
+    nestedLoops: int,
+    label: string = ""
 ): bool {
-    var breaks = expression.kind == "break" && nestedLoops == 0
+    var breaks = expression.kind == "break" && (
+        (expression.text == "" && nestedLoops == 0) ||
+        (expression.text != "" && expression.text == label)
+    )
     var childLoops = nestedLoops
     if (expression.kind == "while" || expression.kind == "do.while" ||
         expression.kind == "for") childLoops = nestedLoops + 1
@@ -3102,7 +3117,8 @@ fun bootstrapExpressionBreaksCurrentLoop(
         while (!breaks && child < expression.children.size) {
             breaks = bootstrapExpressionBreaksCurrentLoop(
                 expression.children[child],
-                childLoops
+                childLoops,
+                label
             )
             child = child + 1
         }
@@ -4251,6 +4267,7 @@ fun bootstrapEffectBindingKey(name: string, type: string): string {
  *  its declared type (a local initialized with a lambda by that lambda's
  *  parameters), a loop variable as no function. */
 fun bootstrapEffectBinderKey(binder: BootstrapExpression): string {
+    if (binder.kind == "for") return "${bootstrapForName(binder)}#-"
     if (binder.kind == "lambda.parameter" && binder.children.size > 0) {
         return bootstrapEffectBindingKey(binder.text, binder.children[0].text)
     }
@@ -5707,7 +5724,7 @@ fun bootstrapRegionExpressionStoresModuleValue(
         val found = expression.children[child]
         val body = expression.kind == "for" && child == 1
         val bodyMark = shadowed.size
-        if (body) shadowed.append(expression.text)
+        if (body) shadowed.append(bootstrapForName(expression))
         stores = bootstrapRegionExpressionStoresModuleValue(
             found, values, shadowed, summary, methodCalls
         )
@@ -6777,7 +6794,11 @@ class BootstrapAnalyzer(
     // The span of the top-level declaration being analyzed, which each
     // overload resolution records.
     var overloadBodyBegin: int = -1,
-    var overloadBodyEnd: int = -1
+    var overloadBodyEnd: int = -1,
+    // The label of each loop being analyzed ("" for an unlabeled one),
+    // innermost last. Only the last loopDepth of them enclose the code
+    // being analyzed: a lambda sets loopDepth to 0, hiding its caller's.
+    val loopLabels: array<string> = []
 ) {
     /** Whether `type` is a class conforming to Transactional (a TVar, or a
      *  library's transactional delegate): reads and writes through it are
@@ -14769,16 +14790,51 @@ fun bootstrapInferWhile(
     var result = initial
     val condition = analyzer.infer(expression.children[0])
     if (condition != "bool") analyzer.fail("while.condition")
-    analyzer.loopDepth = analyzer.loopDepth + 1
+    bootstrapEnterLoop(analyzer, expression)
     analyzer.infer(expression.children[1])
-    analyzer.loopDepth = analyzer.loopDepth - 1
+    bootstrapLeaveLoop(analyzer)
     result = "void"
     if (expression.children[0].kind == "true" &&
         !bootstrapExpressionBreaksCurrentLoop(
             expression.children[1],
-            0
+            0,
+            bootstrapLoopLabel(expression)
         )) result = "never"
     result
+}
+
+// A loop's body is analyzed between these: they count the loop in
+// loopDepth and keep its label, rejecting a label an enclosing loop of the
+// same function already has.
+fun bootstrapEnterLoop(var analyzer: BootstrapAnalyzer, loop: BootstrapExpression): void {
+    val label = bootstrapLoopLabel(loop)
+    if (label != "" && bootstrapEnclosingLoopLabel(analyzer, label) >= 0) {
+        analyzer.inferBegin = loop.begin
+        analyzer.inferSource = analyzer.currentSourceIdentity
+        analyzer.fail("loop.label-shadowed:$label")
+    }
+    analyzer.loopLabels.append(label)
+    analyzer.loopDepth = analyzer.loopDepth + 1
+    return
+}
+
+fun bootstrapLeaveLoop(var analyzer: BootstrapAnalyzer): void {
+    analyzer.loopDepth = analyzer.loopDepth - 1
+    analyzer.loopLabels.truncate(analyzer.loopLabels.size - 1)
+    return
+}
+
+// How many loops out (0: the innermost) the enclosing loop labeled `label`
+// is, or -1 when none is.
+fun bootstrapEnclosingLoopLabel(analyzer: BootstrapAnalyzer, label: string): int {
+    var depth = 0
+    while (depth < analyzer.loopDepth && depth < analyzer.loopLabels.size) {
+        if (analyzer.loopLabels[analyzer.loopLabels.size - 1 - depth] == label) {
+            return depth
+        }
+        depth = depth + 1
+    }
+    -1
 }
 
 @noinline
@@ -14788,16 +14844,17 @@ fun bootstrapInferDoWhile(
     initial: string
 ): string {
     var result = initial
-    analyzer.loopDepth = analyzer.loopDepth + 1
+    bootstrapEnterLoop(analyzer, expression)
     analyzer.infer(expression.children[0])
-    analyzer.loopDepth = analyzer.loopDepth - 1
+    bootstrapLeaveLoop(analyzer)
     val condition = analyzer.infer(expression.children[1])
     if (condition != "bool") analyzer.fail("do-while.condition")
     result = "void"
     if (expression.children[1].kind == "true" &&
         !bootstrapExpressionBreaksCurrentLoop(
             expression.children[0],
-            0
+            0,
+            bootstrapLoopLabel(expression)
         )) result = "never"
     result
 }
@@ -14843,17 +14900,18 @@ fun bootstrapInferFor(
             "element:${bootstrapPlaceRootName(expression.children[0])}"
         } else ""
     val previousScope = analyzer.enterScope()
+    val iteratorName = bootstrapForName(expression)
     analyzer.locals.append(BootstrapSymbol(
-        expression.text,
+        iteratorName,
         "val",
         elementType,
         analyzer.currentScope,
         elementSource,
-        "abla:${analyzer.currentSourceIdentity}:${expression.begin}:for:${expression.text}"
+        "abla:${analyzer.currentSourceIdentity}:${expression.begin}:for:$iteratorName"
     ))
-    analyzer.loopDepth = analyzer.loopDepth + 1
+    bootstrapEnterLoop(analyzer, expression)
     analyzer.infer(expression.children[1])
-    analyzer.loopDepth = analyzer.loopDepth - 1
+    bootstrapLeaveLoop(analyzer)
     analyzer.leaveScope(previousScope)
     result = "void"
     result
@@ -14871,7 +14929,12 @@ fun bootstrapInferBreak(
     }
     if (analyzer.loopDepth <= 0) analyzer.fail(
         "${expression.kind}.outside-loop"
-    )
+    ) else if (expression.text != "" &&
+               bootstrapEnclosingLoopLabel(analyzer, expression.text) < 0) {
+        analyzer.inferBegin = expression.begin
+        analyzer.inferSource = analyzer.currentSourceIdentity
+        analyzer.fail("${expression.kind}.unknown-label:${expression.text}")
+    }
     result = "never"
     result
 }
