@@ -5,6 +5,10 @@
 # that declare the same extension member go to separate bundles, a file whose import
 # has an error is dropped from its bundle and built on its own (which reports the
 # error), a crash fails only its own test, and a test's exit status is reported as is.
+# Shared modules count too: two that declare the same public name (`ApiResult`), each
+# imported by other tests, put those tests in separate bundles with no file built on
+# its own, while overloads (`render(int)` and `render(string)`, two `Box.label`s) and
+# private names share one.
 set -euo pipefail
 
 compiler=${1:-build/ablac.bin}
@@ -44,4 +48,29 @@ grep -qx "bundle 1: one file, built on its own: $cases/extension-two.test.ab" "$
     fail "bundle 1"
 grep -qx "  $cases/broken.test.ab" "$work/bundled.out" || fail "the broken file was not dropped"
 grep -q "missing.ab" "$work/bundled.err" || fail "the broken file's own build did not report its error"
-echo "test bundle: bundled results match --each (duplicate names, extension clash, broken import, crash, exit status)"
+
+shared=tests/cases/test-bundle-shared
+status=0
+"$compiler" test -v --no-cache "$shared" > "$work/shared.out" 2> "$work/shared.err" || status=$?
+[[ $status -eq 0 ]] || { cat "$work/shared.out" "$work/shared.err" >&2; fail "the shared-module suite exited $status"; }
+status=0
+"$compiler" test --each --no-cache "$shared" > "$work/shared-each.out" 2>&1 || status=$?
+[[ $status -eq 0 ]] || fail "the shared-module suite's --each exited $status"
+grep -E '^(PASS|FAIL) ' "$work/shared.out" | sort > "$work/shared.results"
+grep -E '^(PASS|FAIL) ' "$work/shared-each.out" | sort > "$work/shared-each.results"
+diff "$work/shared-each.results" "$work/shared.results" > "$work/shared.diff" ||
+    { cat "$work/shared.diff" >&2; fail "shared-module bundled results differ from --each's"; }
+grep -qx "8 passed, 0 failed" "$work/shared.out" || { cat "$work/shared.out" >&2; fail "the shared-module summary"; }
+grep -q "^8 files, 2 bundles (" "$work/shared.out" || { cat "$work/shared.out" >&2; fail "the shared-module partition"; }
+! grep -q "on their own" "$work/shared.out" || { cat "$work/shared.out" >&2; fail "a shared-module file was built on its own"; }
+# The bundle a file landed in: the last "bundle <n> (" line above its own line.
+bundle_of() {
+    awk -v file="  $shared/$1" '/^bundle [0-9]+ \(/ { bundle = $2 } $0 == file { print bundle }' "$work/shared.out"
+}
+for name in label-number label-text number number-again render-number render-text; do
+    [[ $(bundle_of "$name.test.ab") == 0 ]] || { cat "$work/shared.out" >&2; fail "$name.test.ab is not in bundle 0"; }
+done
+for name in text text-again; do
+    [[ $(bundle_of "$name.test.ab") == 1 ]] || { cat "$work/shared.out" >&2; fail "$name.test.ab is not in bundle 1"; }
+done
+echo "test bundle: bundled results match --each (duplicate names, extension clash, broken import, crash, exit status, shared-module clash)"

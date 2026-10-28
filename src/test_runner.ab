@@ -1,5 +1,7 @@
 import "module.ab"
 import "module_paths.ab"
+import "parser.ab"
+import "sema.ab"
 import "abla/sys/linux/fs"
 
 // `ablac test` over many files builds them as few programs as it can (bundles): one
@@ -9,9 +11,10 @@ import "abla/sys/linux/fs"
 // one object, one link) and run once per test, each run a process of its own: globals
 // start fresh, and a crash or an exit status is that test's alone. What a file declares
 // for a type of another module (an extension member, an `extend` conformance) or for the
-// link (an extern) keeps no prefix, so two files declaring the same one go to separate
-// bundles. A file a bundle can't build with is built and run on its own, as a single
-// file always is.
+// link (an extern) keeps no prefix, and neither do the public names of the modules the
+// files import plainly, so two files that reach two declarations of one such name go to
+// separate bundles. A file a bundle can't build with is built and run on its own, as a
+// single file always is.
 
 /** The test files `arguments` name, each once: a file as given, a directory's files
  *  whose names end in `test.ab` (sorted). */
@@ -71,67 +74,286 @@ fun bootstrapTestLess(left: string, right: string): bool {
     left.size < right.size
 }
 
-/** What a test file declares that no other file of its bundle may: the extension
- *  members, `extend` conformances and externs among its top-level declarations. */
-fun bootstrapTestBundleClaims(path: string): array<string> {
-    val claims: array<string> = []
-    val source = Path(path).readText()
-    val discovery = bootstrapModuleDiscovery(source, path)
-    for (declaration in discovery.declarations) {
-        if (declaration.extensionOwner != "") {
-            bootstrapTestAppendOnce(
-                claims, "member:${declaration.extensionOwner}.${declaration.name}"
-            )
-        }
-        if (declaration.kind == "extend") {
-            for (conformance in declaration.conformances) {
-                bootstrapTestAppendOnce(claims, "extend:${declaration.name}:$conformance")
+/** What `ablac test` knows of each module the test files reach, each module read,
+ *  scanned and parsed once per run: the modules it imports (plainly, and under an
+ *  alias), and the names it declares that one program can hold only once (its claims;
+ *  bootstrapTestModuleClaims). */
+class BootstrapTestModules(
+    val index: Map<string, int>,
+    val paths: array<string>,
+    val plainImports: array<array<string>>,
+    val aliasedImports: array<array<string>>,
+    // An `entry.ab` that only imports one module (an alias of it names that module).
+    val exposes: array<string>,
+    val claimKeys: array<array<string>>,
+    val claimSignatures: array<array<string>>,
+    // Whether the claim stands when the module's names carry an alias's prefix.
+    val claimsPrefixed: array<array<bool>>
+) {
+    /** The entry of the module at `path`, read and parsed on first use. */
+    fun module(path: string): int {
+        val known = this.index.get(path)
+        if (known != null) return known
+        val text = Path(path).readText()
+        val scan = bootstrapScanImports(text)
+        val parsed = bootstrapParseWithIdentity(text, path)
+        val plain: array<string> = []
+        val aliased: array<string> = []
+        for (edge in scan.edges) {
+            if (!edge.provider) {
+                val imported = bootstrapResolveImport(path, edge.source)
+                if (edge.alias == "") bootstrapTestAppendOnce(plain, imported)
+                else bootstrapTestAppendOnce(aliased, imported)
             }
         }
-        if (declaration.kind == "extern") {
-            bootstrapTestAppendOnce(claims, "extern:${declaration.name}")
-        }
+        var exposes = ""
+        if (path.size >= 9 && path.slice(path.size - 9, path.size) == "/entry.ab" &&
+            parsed.declarations.size == 0 && scan.errors == 0 && scan.edges.size == 1 &&
+            !scan.edges[0].provider && scan.edges[0].alias == "") exposes = plain[0]
+        val keys: array<string> = []
+        val signatures: array<string> = []
+        val prefixed: array<bool> = []
+        bootstrapTestModuleClaims(parsed.declarations, keys, signatures, prefixed)
+        val entry = this.paths.size
+        this.index.set(path, entry)
+        this.paths.append(path)
+        this.plainImports.append(plain)
+        this.aliasedImports.append(aliased)
+        this.exposes.append(exposes)
+        this.claimKeys.append(keys)
+        this.claimSignatures.append(signatures)
+        this.claimsPrefixed.append(prefixed)
+        entry
     }
-    claims
 }
 
-/** Each source's bundle: the first bundle none of whose files claims what it claims
- *  (bootstrapTestBundleClaims), in order, so a suite without such clashes is one bundle. */
-fun bootstrapTestBundlePartition(sources: array<string>): array<int> {
+fun bootstrapTestModules(): BootstrapTestModules =
+    BootstrapTestModules(Map(), [], [], [], [], [], [], [])
+
+/** The names a module declares that one program holds once, as claims: a key, an
+ *  overload signature (a function's parameter types; "" for anything else), and
+ *  whether it stands when the module's names carry a prefix (an alias's, which every
+ *  test file's do). A public top-level name is program-wide only without a prefix; an
+ *  extension member, an `extend` conformance and an extern keep no prefix. `main` is
+ *  the bundle's own (an imported module's becomes private), and private names are
+ *  their module's alone. */
+fun bootstrapTestModuleClaims(
+    declarations: array<BootstrapDeclaration>,
+    var keys: array<string>,
+    var signatures: array<string>,
+    var prefixed: array<bool>
+): void {
+    for (declaration in declarations) {
+        val name = declaration.name
+        if (declaration.extensionOwner != "") {
+            keys.append("member:${declaration.extensionOwner}.$name")
+            signatures.append(bootstrapTestOverloadSignature(declaration))
+            prefixed.append(true)
+        } else if (declaration.kind == "extend") {
+            for (conformance in declaration.conformances) {
+                keys.append("extend:$name:$conformance")
+                signatures.append("")
+                prefixed.append(true)
+            }
+        } else if (name != "" && declaration.kind != "invalid") {
+            if (declaration.kind == "extern") {
+                keys.append("extern:$name")
+                signatures.append("")
+                prefixed.append(true)
+            }
+            if (!declaration.isPrivate && name != "main") {
+                keys.append("name:$name")
+                signatures.append(bootstrapTestOverloadSignature(declaration))
+                prefixed.append(false)
+            }
+        }
+    }
+    return
+}
+
+/** What tells a function from its overloads (bootstrapDeclarationsOverload): its
+ *  parameter types; "" for any other declaration, which no other overloads. */
+fun bootstrapTestOverloadSignature(declaration: BootstrapDeclaration): string {
+    if (declaration.kind != "fun") return ""
+    var signature = "("
+    for (type in declaration.parameterTypes) {
+        signature = "$signature${bootstrapNormalizeType(type)}\n"
+    }
+    "$signature)"
+}
+
+/** The modules `source` reaches through its imports (itself first), as entries of
+ *  `modules`, and whether each one's names carry a prefix: the test file's own (the
+ *  bundle imports it under an alias), and those of a module some import names under an
+ *  alias (a prefix holds program-wide). */
+class BootstrapTestReach(val modules: array<int>, val prefixed: array<bool>)
+
+fun bootstrapTestReachModules(
+    var modules: BootstrapTestModules,
+    source: string
+): BootstrapTestReach {
+    val reached: array<int> = []
+    // Each reached module's place in `reached`.
+    val places: Map<int, int> = Map()
+    val prefixed: array<bool> = []
+    bootstrapTestReachAdd(
+        reached, places, prefixed, modules.module(bootstrapNormalizeModulePath(source)), true
+    )
+    var next = 0
+    while (next < reached.size) {
+        val module = reached[next]
+        next = next + 1
+        var edge = 0
+        while (edge < modules.plainImports[module].size) {
+            val imported = modules.module(modules.plainImports[module][edge])
+            bootstrapTestReachAdd(reached, places, prefixed, imported, false)
+            edge = edge + 1
+        }
+        edge = 0
+        while (edge < modules.aliasedImports[module].size) {
+            val target = modules.module(modules.aliasedImports[module][edge])
+            bootstrapTestReachAdd(reached, places, prefixed, target, true)
+            if (modules.exposes[target] != "") {
+                val exposed = modules.module(modules.exposes[target])
+                bootstrapTestReachAdd(reached, places, prefixed, exposed, true)
+            }
+            edge = edge + 1
+        }
+    }
+    BootstrapTestReach(reached, prefixed)
+}
+
+fun bootstrapTestReachAdd(
+    var reached: array<int>,
+    var places: Map<int, int>,
+    var prefixed: array<bool>,
+    module: int,
+    aliased: bool
+): void {
+    val place = places.get(module)
+    if (place != null) {
+        if (aliased) prefixed[place] = true
+    } else {
+        places.set(module, reached.size)
+        reached.append(module)
+        prefixed.append(aliased)
+    }
+    return
+}
+
+/** What one bundle's files hold so far: each module they reach (1: with its names
+ *  prefixed, 2: without), and each claim key with the modules claiming it and their
+ *  overload signatures. */
+class BootstrapTestBundleClaims(
+    val modules: Map<int, int>,
+    val keys: Map<string, int>,
+    val owners: array<array<int>>,
+    val signatures: array<array<string>>
+) {
+    /** Whether `module`'s claims (all of them, or only those standing under a prefix)
+     *  can join this bundle: no other module claims one of their keys, unless both
+     *  are functions with other parameter types (overloads). A module the bundle
+     *  already holds was checked when it joined, against all the bundle held then and
+     *  by each module that joined after. */
+    fun admits(modules: BootstrapTestModules, module: int, prefixed: bool): bool {
+        val held = this.modules.get(module)
+        if (held != null && (held == 2 || prefixed)) return true
+        val keys = modules.claimKeys[module]
+        var claim = 0
+        while (claim < keys.size) {
+            val slot = this.keys.get(keys[claim])
+            if (slot != null && (!prefixed || modules.claimsPrefixed[module][claim])) {
+                val signature = modules.claimSignatures[module][claim]
+                var other = 0
+                while (other < this.owners[slot].size) {
+                    val otherSignature = this.signatures[slot][other]
+                    if (this.owners[slot][other] != module &&
+                        (signature == "" || otherSignature == "" ||
+                         signature == otherSignature)) return false
+                    other = other + 1
+                }
+            }
+            claim = claim + 1
+        }
+        true
+    }
+
+    fun add(modules: BootstrapTestModules, module: int, prefixed: bool): void {
+        val held = this.modules.get(module)
+        if (held != null && (held == 2 || prefixed)) return
+        this.modules.set(module, if (prefixed) 1 else 2)
+        val keys = modules.claimKeys[module]
+        var claim = 0
+        while (claim < keys.size) {
+            if (!prefixed || modules.claimsPrefixed[module][claim]) {
+                var slot = -1
+                val known = this.keys.get(keys[claim])
+                if (known != null) slot = known
+                else {
+                    slot = this.owners.size
+                    this.keys.set(keys[claim], slot)
+                    this.owners.append([])
+                    this.signatures.append([])
+                }
+                var present = false
+                for (owner in this.owners[slot]) {
+                    if (owner == module) present = true
+                }
+                if (!present) {
+                    this.owners[slot].append(module)
+                    this.signatures[slot].append(modules.claimSignatures[module][claim])
+                }
+            }
+            claim = claim + 1
+        }
+        return
+    }
+}
+
+/** Each source's bundle (`bundles`), and how many modules the partition read. */
+class BootstrapTestPartition(val bundles: array<int>, val modulesRead: int)
+
+/** Each source's bundle: the first bundle where nothing the source reaches claims a
+ *  name another module of the bundle claims (bootstrapTestModuleClaims), in order, so a
+ *  suite without such clashes is one bundle. Every bundle starts with what its
+ *  generated root imports (bootstrapTestBundleRoot). */
+fun bootstrapTestBundlePartition(sources: array<string>): BootstrapTestPartition {
+    val modules = bootstrapTestModules()
+    val rootImports = bootstrapTestReachModules(
+        modules, bootstrapResolveImport("build/abla-test/bundle.ab", "abla/sys/linux/process")
+    )
     val bundles: array<int> = []
-    // Every claim taken so far, and the bundle that took it.
-    val takenClaims: array<string> = []
-    val takenBy: array<int> = []
-    var count = 0
+    val claims: array<BootstrapTestBundleClaims> = []
     for (source in sources) {
-        val claims = bootstrapTestBundleClaims(source)
+        val reach = bootstrapTestReachModules(modules, source)
         var chosen = -1
         var bundle = 0
-        while (chosen < 0 && bundle < count) {
-            var clash = false
-            var taken = 0
-            while (!clash && taken < takenClaims.size) {
-                if (takenBy[taken] == bundle) {
-                    for (claim in claims) {
-                        if (claim == takenClaims[taken]) clash = true
-                    }
-                }
-                taken = taken + 1
+        while (chosen < 0 && bundle < claims.size) {
+            var admits = true
+            var module = 0
+            while (admits && module < reach.modules.size) {
+                admits = claims[bundle].admits(
+                    modules, reach.modules[module], reach.prefixed[module]
+                )
+                module = module + 1
             }
-            if (!clash) chosen = bundle
+            if (admits) chosen = bundle
             bundle = bundle + 1
         }
         if (chosen < 0) {
-            chosen = count
-            count = count + 1
+            chosen = claims.size
+            val fresh = BootstrapTestBundleClaims(Map(), Map(), [], [])
+            for (module in rootImports.modules) fresh.add(modules, module, false)
+            claims.append(fresh)
         }
-        for (claim in claims) {
-            takenClaims.append(claim)
-            takenBy.append(chosen)
+        var module = 0
+        while (module < reach.modules.size) {
+            claims[chosen].add(modules, reach.modules[module], reach.prefixed[module])
+            module = module + 1
         }
         bundles.append(chosen)
     }
-    bundles
+    BootstrapTestPartition(bundles, modules.paths.size)
 }
 
 /** The root module of a bundle written in `directory` (relative to the working

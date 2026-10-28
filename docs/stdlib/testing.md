@@ -51,7 +51,12 @@ file under an alias (so files may reuse names such as `main` or a helper's)
 and runs the test its argument numbers, each test in a process of its own:
 its globals start fresh and its crash or exit status is its own, exactly as
 when it is built alone. Files that declare the same extension member,
-`extend` conformance or extern go to separate programs. A file whose build
-fails (or whose imports do) is built and run on its own, which reports its
-errors; the others still share their program. `--each` builds every file on
-its own; `-v` lists which files share a program.
+`extend` conformance or extern go to separate programs, and so do files whose
+imports would bring two declarations of one name into a program: two modules
+that each declare a public `ApiResult` (or the same extension member), one
+imported by some tests and the other by others. Overloads (the same function
+name with other parameter types) and private names don't keep files apart. A
+file whose build fails (or whose imports do) is built and run on its own,
+which reports its errors; the others still share their program. `--each`
+builds every file on its own; `-v` prints how many programs the files make
+(and how many modules were read to tell) and lists which files share one.
