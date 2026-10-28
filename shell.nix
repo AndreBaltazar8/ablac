@@ -4,9 +4,11 @@
     sha256 = "012w2z2w4k0c3kg9hcy9cpd7qgxgrpxvf0735vy014r7x9qhmbjw";
   }) {}
   # LLVM with the experimental Xtensa backend for ESP32 work (abla-embedded).
-  # Release CI passes --arg xtensa false: host artifacts do not need it and
-  # it would otherwise build LLVM from source on every run.
-, xtensa ? true }:
+  # Off on CI (GitHub sets CI=true): host artifacts do not need it, and every
+  # nested nix-shell would otherwise build LLVM from source. Override with
+  # ABLA_NIX_XTENSA=1/0 or --arg xtensa true/false.
+, xtensa ? (let forced = builtins.getEnv "ABLA_NIX_XTENSA"; in
+    if forced != "" then forced == "1" else builtins.getEnv "CI" == "") }:
 
 let
   toolchain = import ./nix/llvm.nix { inherit pkgs; };
