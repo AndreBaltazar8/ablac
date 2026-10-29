@@ -1,0 +1,179 @@
+
+--- a/lib/Target/Xtensa/XtensaAsmPrinter.cpp
++++ b/lib/Target/Xtensa/XtensaAsmPrinter.cpp
+@@ -17,6 +17,7 @@
+ #include "MCTargetDesc/XtensaTargetStreamer.h"
+ #include "TargetInfo/XtensaTargetInfo.h"
+ #include "XtensaConstantPoolValue.h"
++#include "XtensaSubtarget.h"
+ #include "llvm/ADT/StringExtras.h"
+ #include "llvm/BinaryFormat/ELF.h"
+ #include "llvm/CodeGen/MachineConstantPool.h"
+@@ -29,9 +30,17 @@
+ #include "llvm/MC/MCSymbol.h"
+ #include "llvm/MC/MCSymbolELF.h"
+ #include "llvm/MC/TargetRegistry.h"
++#include "llvm/Support/CommandLine.h"
+ 
+ using namespace llvm;
+ 
++// Upstream never selects the Code Density branches. With final layout known
++// here, a forward BEQZ/BNEZ whose target is in BEQZ.N/BNEZ.N range under
++// worst-case sizes is emitted narrow (2 bytes instead of 3).
++static cl::opt<bool> XtensaNarrowBranches(
++    "xtensa-narrow-branches", cl::init(false), cl::Hidden,
++    cl::desc("Emit beqz.n/bnez.n for forward branches proven in range"));
++
+ static Xtensa::Specifier
+ getModifierSpecifier(XtensaCP::XtensaCPModifier Modifier) {
+   switch (Modifier) {
+@@ -47,19 +56,115 @@
+   unsigned Opc = MI->getOpcode();
+ 
+   switch (Opc) {
++  case Xtensa::BEQZ:
++  case Xtensa::BNEZ:
++    if (NarrowBranches.count(MI)) {
++      MCInst LoweredMI;
++      lowerToMCInst(MI, LoweredMI);
++      LoweredMI.setOpcode(Opc == Xtensa::BEQZ ? Xtensa::BEQZ_N
++                                              : Xtensa::BNEZ_N);
++      EmitToStreamer(*OutStreamer, LoweredMI);
++      return;
++    }
++    break;
+   case Xtensa::BR_JT:
+     EmitToStreamer(
+         *OutStreamer,
+         MCInstBuilder(Xtensa::JX).addReg(MI->getOperand(0).getReg()));
+     return;
+   default:
+-    MCInst LoweredMI;
+-    lowerToMCInst(MI, LoweredMI);
+-    EmitToStreamer(*OutStreamer, LoweredMI);
++    break;
++  }
++  MCInst LoweredMI;
++  lowerToMCInst(MI, LoweredMI);
++  EmitToStreamer(*OutStreamer, LoweredMI);
++}
++
++// Inline assembly whose size the assembler decides (directives such as
++// .align or .literal, and loops, whose bodies it aligns) bounds no distance.
++static bool hasUnboundedSize(const MachineInstr &MI) {
++  if (!MI.isInlineAsm())
++    return false;
++  StringRef Asm = MI.getOperand(0).getSymbolName();
++  while (!Asm.empty()) {
++    auto [Statement, Rest] = Asm.split('\n');
++    Asm = Rest;
++    Statement = Statement.split('#').first.trim();
++    while (Statement.contains(':') && !Statement.starts_with(".")) {
++      Statement = Statement.split(':').second.trim();
++    }
++    if (Statement.starts_with(".") || Statement.starts_with("loop") ||
++        Statement.contains(';'))
++      return true;
++  }
++  return false;
++}
++
++void XtensaAsmPrinter::selectNarrowBranches(const MachineFunction &MF) {
++  NarrowBranches.clear();
++  if (!XtensaNarrowBranches || !MF.getSubtarget<XtensaSubtarget>().hasDensity())
+     return;
++  const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
++  // Offsets from the function start under the largest and smallest encoding
++  // of everything before: the assembler may still narrow an instruction but
++  // never widens one, and block alignment adds at most Align - 1 bytes.
++  DenseMap<const MachineBasicBlock *, std::pair<uint64_t, uint64_t>> Blocks;
++  DenseMap<const MachineInstr *, std::pair<uint64_t, uint64_t>> Branches;
++  const uint64_t Unbounded = uint64_t(1) << 32;
++  bool Changed = true;
++  while (Changed) {
++    Changed = false;
++    uint64_t Max = 0, Min = 0;
++    for (const MachineBasicBlock &MBB : MF) {
++      Max += MBB.getAlignment().value() - 1;
++      Blocks[&MBB] = {Max, Min};
++      for (const MachineInstr &MI : MBB) {
++        unsigned Size = TII->getInstSizeInBytes(MI);
++        if ((MI.getOpcode() == Xtensa::BEQZ ||
++             MI.getOpcode() == Xtensa::BNEZ) &&
++            MI.getOperand(1).isMBB()) {
++          Branches[&MI] = {Max, Min};
++          if (NarrowBranches.count(&MI))
++            Size = 2;
++        }
++        if (hasUnboundedSize(MI)) {
++          Max += Unbounded;
++        } else {
++          Max += Size;
++          // A 3-byte instruction may become a 2-byte one; meta instructions
++          // and inline assembly may emit nothing.
++          if (Size != 0 && !MI.isInlineAsm())
++            Min += 2;
++        }
++      }
++    }
++    for (auto &[MI, Offsets] : Branches) {
++      if (NarrowBranches.count(MI))
++        continue;
++      const MachineBasicBlock *Target = MI->getOperand(1).getMBB();
++      if (Target->getParent() != &MF ||
++          Target->getSectionID() != MI->getParent()->getSectionID())
++        continue;
++      auto [TargetMax, TargetMin] = Blocks.lookup(Target);
++      // Bytes between the end of the branch and its target. The narrow
++      // encoding reaches pc + 4 .. pc + 67, so 2 .. 65 of them.
++      if (TargetMin < Offsets.second + 2 || TargetMax < Offsets.first + 3)
++        continue;
++      uint64_t GapMax = TargetMax - Offsets.first - 3;
++      uint64_t GapMin = TargetMin - Offsets.second - 2;
++      if (GapMin >= 2 && GapMax <= 65) {
++        NarrowBranches.insert(MI);
++        Changed = true;
++      }
++    }
+   }
+ }
+ 
++bool XtensaAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
++  selectNarrowBranches(MF);
++  return AsmPrinter::runOnMachineFunction(MF);
++}
++
+ void XtensaAsmPrinter::emitMachineConstantPoolValue(
+     MachineConstantPoolValue *MCPV) {
+   XtensaConstantPoolValue *XtensaCPV =
+
+--- a/lib/Target/Xtensa/XtensaAsmPrinter.h
++++ b/lib/Target/Xtensa/XtensaAsmPrinter.h
+@@ -14,6 +14,7 @@
+ #define LLVM_LIB_TARGET_XTENSA_XTENSAASMPRINTER_H
+ 
+ #include "XtensaTargetMachine.h"
++#include "llvm/ADT/SmallPtrSet.h"
+ #include "llvm/CodeGen/AsmPrinter.h"
+ #include "llvm/CodeGen/MachineConstantPool.h"
+ #include "llvm/Support/Compiler.h"
+@@ -27,6 +28,10 @@
+ 
+ class LLVM_LIBRARY_VISIBILITY XtensaAsmPrinter : public AsmPrinter {
+   const MCSubtargetInfo *STI;
++  // BEQZ/BNEZ whose target is provably within BEQZ.N/BNEZ.N range.
++  SmallPtrSet<const MachineInstr *, 32> NarrowBranches;
++
++  void selectNarrowBranches(const MachineFunction &MF);
+ 
+ public:
+   static char ID;
+@@ -39,6 +44,8 @@
+   StringRef getPassName() const override { return "Xtensa Assembly Printer"; }
+   void emitInstruction(const MachineInstr *MI) override;
+ 
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
+   void emitConstantPool() override;
+ 
+   void emitMachineConstantPoolEntry(const MachineConstantPoolEntry &CPE, int i);

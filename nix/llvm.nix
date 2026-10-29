@@ -16,12 +16,14 @@ let
     # literal pools in their function's text section
     # (-xtensa-text-section-literals), which keeps an object's code together
     # under GNU ld so those CALL8s stay in range; MOVI and constant-pool L32R
-    # rematerialize instead of being spilled to the stack.
+    # rematerialize instead of being spilled to the stack; forward BEQZ/BNEZ
+    # proven in range are emitted as BEQZ.N/BNEZ.N (-xtensa-narrow-branches).
     patches = (old.patches or [ ]) ++ [
       ./llvm-xtensa-direct-calls.patch
       ./llvm-xtensa-extui.patch
       ./llvm-xtensa-text-section-literals.patch
       ./llvm-xtensa-rematerialize.patch
+      ./llvm-xtensa-narrow-branches.patch
     ];
   });
 in
