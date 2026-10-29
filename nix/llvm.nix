@@ -17,13 +17,16 @@ let
     # (-xtensa-text-section-literals), which keeps an object's code together
     # under GNU ld so those CALL8s stay in range; MOVI and constant-pool L32R
     # rematerialize instead of being spilled to the stack; forward BEQZ/BNEZ
-    # proven in range are emitted as BEQZ.N/BNEZ.N (-xtensa-narrow-branches).
+    # proven in range are emitted as BEQZ.N/BNEZ.N (-xtensa-narrow-branches);
+    # single-bit tests branch with BBCI/BBSI, and masks EXTUI absorbs stay
+    # immediates instead of literal loads.
     patches = (old.patches or [ ]) ++ [
       ./llvm-xtensa-direct-calls.patch
       ./llvm-xtensa-extui.patch
       ./llvm-xtensa-text-section-literals.patch
       ./llvm-xtensa-rematerialize.patch
       ./llvm-xtensa-narrow-branches.patch
+      ./llvm-xtensa-bit-tests.patch
     ];
   });
 in
