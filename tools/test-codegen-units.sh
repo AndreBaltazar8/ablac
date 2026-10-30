@@ -24,7 +24,14 @@ units() { ABLA_CODEGEN_UNITS=8 ABLA_CODEGEN_UNITS_MINIMUM=0 ABLA_CODEGEN_UNITS_T
 # A program's defined external symbols, without the names units give locals.
 symbols() { llvm-nm -g --defined-only "$1" | awk '{print $NF}' | grep -v '__abla_unit\.' | sort; }
 
-for case in closure-captures collections classes defer strings-runtime global-init-template-call; do
+# Native units are only for a Mach-O executable's object, built from the
+# module held in process (toolchain.ab nativeUnits); elsewhere a native build
+# is one object, so only WebAssembly is cut.
+native_cases=()
+if [[ $(uname) == Darwin ]]; then
+    native_cases=(closure-captures collections classes defer strings-runtime global-init-template-call)
+fi
+for case in "${native_cases[@]}"; do
     source="tests/cases/modules/$case.ab"
     one "$compiler" build "$source" -o "$output_directory/$case-one" --fast --no-cache
     units "$compiler" build "$source" -o "$output_directory/$case-units" --fast --no-cache \
@@ -90,4 +97,4 @@ for module in unwinding plain; do
 done
 [[ $("$wasm_runner" tests/cases/stm/run.mjs "$output_directory/wasm-units/unwinding.wasm") == 0 ]] ||
     fail "unwinding.wasm in units: checks failed"
-echo "codegen units: native and WebAssembly (exception handling too) as one unit and as eight: same results, symbols and interface; reproducible"
+echo "codegen units: ${native_cases[*]:+native and }WebAssembly (exception handling too) as one unit and as eight: same results, symbols and interface; reproducible"

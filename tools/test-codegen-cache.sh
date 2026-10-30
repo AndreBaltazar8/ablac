@@ -24,42 +24,49 @@ units() {
 }
 reused() { sed -n 's/^codegen units: .* \([0-9]*\) reused$/\1/p' "$1"; }
 
-source="$output_directory/program.ab"
-cp tests/cases/modules/collections.ab "$source"
-units "$source" -o "$output_directory/program" 2> "$output_directory/cold.trace" ||
-    { cat "$output_directory/cold.trace" >&2; fail "the cold build failed"; }
-[[ $(reused "$output_directory/cold.trace") == 0 ]] || fail "a cold cache reused a unit"
-cp "$output_directory/program.o" "$output_directory/cold.o"
-units "$source" -o "$output_directory/program" 2> "$output_directory/warm.trace"
-ran() { sed -n 's/^codegen units: .* the data, \([0-9]*\) with code.*/\1/p' "$1"; }
-units_run=$(ran "$output_directory/warm.trace")
-[[ $(reused "$output_directory/warm.trace") == "$units_run" ]] ||
-    fail "a warm build reused $(reused "$output_directory/warm.trace") of $units_run units"
-cmp -s "$output_directory/program.o" "$output_directory/cold.o" ||
-    fail "the warm build's object differs from the cold one's"
-"$output_directory/program" || [[ $? == 42 ]] || fail "the warm build's program failed"
-
-# macOS: the executable's debug map names the archive's members.
+# Native units are only for a Mach-O executable's object, built from the
+# module held in process (toolchain.ab nativeUnits); elsewhere a native build
+# is one object and only WebAssembly is cut.
+edit_reused=0
+units_run=0
 if [[ $(uname) == Darwin ]]; then
-    debug_map=$(nm -ap "$output_directory/program")
-    named=$(grep -c " OSO $output_directory/program.o(unit[0-9]\.o)\$" <<< "$debug_map" || true)
-    [[ $named -ge 2 ]] || fail "the debug map names $named units"
-fi
+    source="$output_directory/program.ab"
+    cp tests/cases/modules/collections.ab "$source"
+    units "$source" -o "$output_directory/program" 2> "$output_directory/cold.trace" ||
+        { cat "$output_directory/cold.trace" >&2; fail "the cold build failed"; }
+    [[ $(reused "$output_directory/cold.trace") == 0 ]] || fail "a cold cache reused a unit"
+    cp "$output_directory/program.o" "$output_directory/cold.o"
+    units "$source" -o "$output_directory/program" 2> "$output_directory/warm.trace"
+    ran() { sed -n 's/^codegen units: .* the data, \([0-9]*\) with code.*/\1/p' "$1"; }
+    units_run=$(ran "$output_directory/warm.trace")
+    [[ $(reused "$output_directory/warm.trace") == "$units_run" ]] ||
+        fail "a warm build reused $(reused "$output_directory/warm.trace") of $units_run units"
+    cmp -s "$output_directory/program.o" "$output_directory/cold.o" ||
+        fail "the warm build's object differs from the cold one's"
+    "$output_directory/program" || [[ $? == 42 ]] || fail "the warm build's program failed"
 
-# An edit to one function generates its file's units again, not the standard
-# library's; the result is the build without the cache's, byte for byte (at the
-# same path: the executable names its object).
-sed -i.bak 's/values.size + values\[0\]/values.size + 0 + values[0]/' "$source"
-units "$source" -o "$output_directory/program" 2> "$output_directory/edit.trace"
-edit_reused=$(reused "$output_directory/edit.trace")
-[[ $edit_reused -ge $((units_run - 2)) && $edit_reused -lt $units_run ]] ||
-    fail "an edit reused $edit_reused of $units_run units"
-"$output_directory/program" || [[ $? == 42 ]] || fail "the edited program failed"
-cp "$output_directory/program.o" "$output_directory/edit.o"
-ABLA_CODEGEN_CACHE=0 ABLA_CODEGEN_UNITS=8 ABLA_CODEGEN_UNITS_MINIMUM=0 \
-    "$compiler" build "$source" -o "$output_directory/program" --fast --no-cache 2> /dev/null
-cmp -s "$output_directory/program.o" "$output_directory/edit.o" ||
-    fail "the edited program's object differs from the build without the cache"
+    # macOS: the executable's debug map names the archive's members.
+    if [[ $(uname) == Darwin ]]; then
+        debug_map=$(nm -ap "$output_directory/program")
+        named=$(grep -c " OSO $output_directory/program.o(unit[0-9]\.o)\$" <<< "$debug_map" || true)
+        [[ $named -ge 2 ]] || fail "the debug map names $named units"
+    fi
+
+    # An edit to one function generates its file's units again, not the standard
+    # library's; the result is the build without the cache's, byte for byte (at the
+    # same path: the executable names its object).
+    sed -i.bak 's/values.size + values\[0\]/values.size + 0 + values[0]/' "$source"
+    units "$source" -o "$output_directory/program" 2> "$output_directory/edit.trace"
+    edit_reused=$(reused "$output_directory/edit.trace")
+    [[ $edit_reused -ge $((units_run - 2)) && $edit_reused -lt $units_run ]] ||
+        fail "an edit reused $edit_reused of $units_run units"
+    "$output_directory/program" || [[ $? == 42 ]] || fail "the edited program failed"
+    cp "$output_directory/program.o" "$output_directory/edit.o"
+    ABLA_CODEGEN_CACHE=0 ABLA_CODEGEN_UNITS=8 ABLA_CODEGEN_UNITS_MINIMUM=0 \
+        "$compiler" build "$source" -o "$output_directory/program" --fast --no-cache 2> /dev/null
+    cmp -s "$output_directory/program.o" "$output_directory/edit.o" ||
+        fail "the edited program's object differs from the build without the cache"
+fi
 
 # WebAssembly, with exception handling: a second build reuses every unit and
 # gives the same module.
@@ -84,7 +91,14 @@ done
 
 # Past its size, the cache keeps only what the last build used.
 before=$(find "$cache/codegen" -name '*.o' | wc -l)
-ABLA_CODEGEN_CACHE_MB=0 units tests/cases/modules/classes.ab -o "$output_directory/classes" 2> /dev/null
+if [[ $(uname) == Darwin ]]; then
+    ABLA_CODEGEN_CACHE_MB=0 units tests/cases/modules/classes.ab -o "$output_directory/classes" 2> /dev/null
+    kept=9
+else
+    # (Two modules: what one build of both used.)
+    ABLA_CODEGEN_CACHE_MB=0 wasm_build wasm-full
+    kept=18
+fi
 after=$(find "$cache/codegen" -name '*.o' | wc -l)
-[[ $after -le 9 && $after -lt $before ]] || fail "a full cache kept $after of $before objects"
-echo "codegen cache: a warm build reuses every unit and gives the same object; an edit reuses $edit_reused of $units_run; WebAssembly too; a full cache sheds its oldest objects"
+[[ $after -le $kept && $after -lt $before ]] || fail "a full cache kept $after of $before objects"
+echo "codegen cache: a warm build reuses every unit and gives the same object; $(if [[ $units_run != 0 ]]; then echo "an edit reuses $edit_reused of $units_run; "; fi)WebAssembly too; a full cache sheds its oldest objects"
