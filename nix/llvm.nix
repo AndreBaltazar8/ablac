@@ -19,7 +19,9 @@ let
     # rematerialize instead of being spilled to the stack; forward BEQZ/BNEZ
     # proven in range are emitted as BEQZ.N/BNEZ.N (-xtensa-narrow-branches);
     # single-bit tests branch with BBCI/BBSI, and masks EXTUI absorbs stay
-    # immediates instead of literal loads.
+    # immediates instead of literal loads. A frame past 255 bytes gets the
+    # register scavenger's emergency slot (upstream waits for 2 KiB, while
+    # byte loads and stores only reach 255).
     patches = (old.patches or [ ]) ++ [
       ./llvm-xtensa-direct-calls.patch
       ./llvm-xtensa-extui.patch
@@ -27,6 +29,7 @@ let
       ./llvm-xtensa-rematerialize.patch
       ./llvm-xtensa-narrow-branches.patch
       ./llvm-xtensa-bit-tests.patch
+      ./llvm-xtensa-scavenging-slot.patch
     ];
   });
 in
