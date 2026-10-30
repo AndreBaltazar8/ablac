@@ -263,6 +263,7 @@ test-serial: ablac
 	tools/test-unbounded-exports.sh $(COMPILER)
 	tools/test-programmable-build.sh $(COMPILER)
 	tools/test-checked-export.sh $(COMPILER)
+	tools/test-export-global-roots.sh $(COMPILER)
 	tools/test-stm.sh $(COMPILER)
 	tools/test-frame-closures.sh $(COMPILER)
 	tools/test-wasm-mvc-extension.sh $(COMPILER)
