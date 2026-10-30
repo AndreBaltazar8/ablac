@@ -21,4 +21,9 @@ set -e
 grep -q '^FAIL arithmetic: expected 5, got 4$' build/ablac-test-fail.out
 grep -q "^FAIL $cases/failing.ab (exit 1)$" build/ablac-test-fail.out
 grep -q '^1 passed, 1 failed$' build/ablac-test-fail.out
+# Several programs: each one's names carry a module prefix, which a
+# subparser's raw text must not see.
+"$compiler" test "$cases/raw-word-1.ab" "$cases/raw-word-2.ab" --no-cache \
+    > build/ablac-test-raw.out
+grep -q '^2 passed, 0 failed$' build/ablac-test-raw.out
 echo "ablac test: runs test programs and reports failing checks"
