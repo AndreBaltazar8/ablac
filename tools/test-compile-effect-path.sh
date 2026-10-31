@@ -16,7 +16,7 @@ if [[ $status -ne 42 ]]; then
     printf 'compile-effect graph regression returned %s, expected 42\n' "$status" >&2
     exit 1
 fi
-for kind in filesystem environment network write clock; do
+for kind in filesystem environment network write clock generic-receiver; do
     set +e
     ABLA_MAX_SECONDS=30 "$project_root/tools/run-limited.sh" "$compiler" \
         build "$project_root/tests/cases/bootstrap/invalid-compile-effect-$kind.ab" \

@@ -3807,16 +3807,64 @@ fun bootstrapCompileEffectLookup(
             else summary.names[index] == name
         if (matches) {
             mask = bootstrapCompileEffectMerge(mask, summary.masks[index])
-            val reader = bootstrapCompileEffectReading
-            if (reader >= 0 && bootstrapCompileEffectLastReader[index] != reader) {
-                bootstrapCompileEffectLastReader[index] = reader
-                bootstrapCompileEffectEdgeReaders.append(reader)
-                bootstrapCompileEffectEdgeReads.append(index)
-            }
+            bootstrapCompileEffectRecordRead(index)
         }
         index = next[index]
     }
     mask
+}
+
+fun bootstrapCompileEffectRecordRead(index: int): void {
+    val reader = bootstrapCompileEffectReading
+    if (reader >= 0 && bootstrapCompileEffectLastReader[index] != reader) {
+        bootstrapCompileEffectLastReader[index] = reader
+        bootstrapCompileEffectEdgeReaders.append(reader)
+        bootstrapCompileEffectEdgeReads.append(index)
+    }
+    return
+}
+
+// Whether a method declared on `owner` can be what a call on another type
+// `receiver` reaches: a type parameter, an interface or an alias can stand for
+// it, and `array<T>` for any array. A class or builtin owner is only itself.
+fun bootstrapEffectOwnerAdmits(map: BootstrapEffectTypeMap, owner: string, receiver: string): bool {
+    if (owner.size > 6 && owner.slice(0, 6) == "array<") {
+        return receiver.size > 6 && receiver.slice(0, 6) == "array<"
+    }
+    if (bootstrapEffectTypeMapGet(map, "type:$owner") == "class") return false
+    !bootstrapEffectPreciseType(map, owner)
+}
+
+// The effects of `name` called on the concrete type `receiver`: its own
+// `receiver.name`, or without one what a more general owner declares. (A method
+// no owner declares is a builtin's.)
+fun bootstrapCompileEffectReceiverLookup(
+    summary: BootstrapCompileEffectSummary,
+    typeMap: BootstrapEffectTypeMap,
+    receiver: string,
+    name: string
+): int {
+    val exact = "$receiver.$name"
+    var general = 0
+    var hasExact = false
+    val slots = summary.methodSlots
+    if (slots.size == 0) return 0
+    var slot = bootstrapFunctionDeclarationHash(name)
+    slot = slot - slot / slots.size * slots.size
+    var index = slots[slot]
+    while (index >= 0) {
+        if (summary.methodNames[index] == name) {
+            val entry = summary.names[index]
+            val owner = bootstrapEffectNormalizeType(entry.slice(0, entry.size - name.size - 1))
+            if (owner == receiver) hasExact = true
+            else if (bootstrapEffectOwnerAdmits(typeMap, owner, receiver)) {
+                general = bootstrapCompileEffectMerge(general, summary.masks[index])
+                bootstrapCompileEffectRecordRead(index)
+            }
+        }
+        index = summary.methodNext[index]
+    }
+    if (hasExact) bootstrapCompileEffectLookup(summary, exact, false) else general
 }
 
 /** How many of `expression`'s children compile-time evaluation can reach:
@@ -4085,7 +4133,7 @@ fun bootstrapCollectEffectLocals(
     if ((expression.kind == "local.val" || expression.kind == "local.var") &&
         expression.children.size >= 2) {
         var type = bootstrapEffectNormalizeType(expression.children[1].text)
-        if (type == "") {
+        if (type == "" || type == "inferred") {
             type = bootstrapEffectExpressionType(expression.children[0], map, names, types, owner)
         }
         names.append(expression.text)
@@ -4239,7 +4287,7 @@ fun bootstrapDelegatedCompileEffectsIn(
         if (bootstrapEffectPreciseType(typeMap, receiver)) {
             mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectMerge(
                 bootstrapCompileBuiltinEffect(expression.text),
-                bootstrapCompileEffectLookup(summary, "$receiver.${expression.text}", false)
+                bootstrapCompileEffectReceiverLookup(summary, typeMap, receiver, expression.text)
             ))
         } else mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,
