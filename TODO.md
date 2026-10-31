@@ -17,34 +17,11 @@
 
 ## Bugs seen
 
-Reproduced on 2026-10-31 at `f5471dc` unless noted. The first four were reported by Abla One,
-which works around them.
-
-- [ ] A `when` whose arms return globals fails with `ownership.managed-return-borrow-contract`,
-      though `if` compiles: `val A = [1]`, `val B = [2]`,
-      `fun pick(n: string): array<int> = when (n) { "a" -> A` newline `else -> B }`.
-- [ ] An import alias doesn't reach a facade's `export import`
-      (`E_IMPORT_ALIAS_MEMBER_UNKNOWN`): with `export import "inner.ab"` in `facade.ab`,
-      `import "facade.ab" as f` then `f.innerValue()`. abla-pdf must be imported without `as`.
-- [ ] A named-argument call to a method through implicit `this` gives `E_NAMED_ARGUMENT_TARGET`,
-      though the docs don't rule it out: `fun n(): int = m(b = 1, a = 3)` inside the class of `m`.
-- [ ] A nominal `type X = int` can't be an array index (`index.type`), though
-      `docs/language.md` says it's accepted where an int is: `val i: X = 1`, `a[i]`.
-- [ ] A method named `transform` looks taken for a compile-time transform:
-      `compile.effect-denied:filesystem.write:PdfPage.transform->PdfPage.op->Path.appendText`,
-      once a project imports Abla One's `src/server/remote.ab`. Reported by Abla One; a
-      plain class with a `transform` method compiles, so it needs that import to reproduce.
-- [ ] `make test` can't pass on a machine without Node 22.14.0 under nvm: `tools/test-math-v8.sh`
-      fails at once (`needs Node 22.14.0 ... or MATH_V8_NODE`), the only failure of 240 on Linux.
-      Pin that Node in `shell.nix`, or skip with a message when it's missing.
-
-## Diagnostics
-
-- [ ] An unquoted import reports a division by zero: `import abla/io` gives `E_EVAL_EXPRESSION`
-      for `abla` and `io`, `E_EVAL_DIVISION_BY_ZERO`, then `E_IMPORT_PROVIDER_RESULT`. It
-      should say the path needs quotes.
-- [ ] A local named `generator` gives `E_PARSE_SUSPENDING_BODY: expected a block after
-      generator`, which doesn't say the word is reserved: `val generator = 1`.
+- [ ] A named call's omitted default is read in the caller's scope: with `val limit = 7` and
+      `fun f(a: int, b: int = limit): int`, `f(a = 1)` in a method of a class with a field
+      `limit` reads the field (sema resolves a plain name to the field), and a local `limit` in
+      the caller shadows it too. Calls in such a default are fine since `call.top-level`.
+      Normalizing to the callee's own default would fix it (seen 2026-10-31).
 
 ## Compiler and stdlib
 
@@ -253,15 +230,3 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   field-slot alias tags (native 42/42 us a tick with mobs, WebAssembly within 1%). An
   `assume` would turn any producer missed later (extension fields with defaults,
   generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
-
-- [ ] `httpsClient` and `httpIpv4Client` bound each read and write, not the exchange: a peer
-  that sends a byte just inside each timeout holds the caller until `maximumResponseBytes` is
-  reached. A deadline for the whole exchange needs its own setting, since large downloads
-  legitimately outlast the per-read timeout.
-
-- [ ] `webSocketServerBlockBrokenPipe` leaves SIGPIPE blocked in the thread for good, so that
-  program's own writes to a closed pipe no longer end it. `linuxBrokenPipeHold` and
-  `linuxBrokenPipeRelease` scope it to the OpenSSL call.
-
-- [ ] `TcpConnection.readWithTimeout` returns "" at once for a timeout over ten seconds, the same
-  as a timeout or a closed peer. Callers can't tell, and passing a longer one looks like a dead peer.
