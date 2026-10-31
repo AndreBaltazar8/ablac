@@ -253,3 +253,15 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   field-slot alias tags (native 42/42 us a tick with mobs, WebAssembly within 1%). An
   `assume` would turn any producer missed later (extension fields with defaults,
   generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
+
+- [ ] `httpsClient` and `httpIpv4Client` bound each read and write, not the exchange: a peer
+  that sends a byte just inside each timeout holds the caller until `maximumResponseBytes` is
+  reached. A deadline for the whole exchange needs its own setting, since large downloads
+  legitimately outlast the per-read timeout.
+
+- [ ] `webSocketServerBlockBrokenPipe` leaves SIGPIPE blocked in the thread for good, so that
+  program's own writes to a closed pipe no longer end it. `linuxBrokenPipeHold` and
+  `linuxBrokenPipeRelease` scope it to the OpenSSL call.
+
+- [ ] `TcpConnection.readWithTimeout` returns "" at once for a timeout over ten seconds, the same
+  as a timeout or a closed peer. Callers can't tell, and passing a longer one looks like a dead peer.
