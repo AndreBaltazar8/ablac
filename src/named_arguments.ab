@@ -106,7 +106,10 @@ class BootstrapNamedArgumentNormalizer(
     var sourceIdentity: string = "",
     // The class or type whose members the body being normalized reaches by
     // plain name ("" outside a method or extension function).
-    var receiver: string = ""
+    var receiver: string = "",
+    // Inside a method's or extension function's body, whose plain names
+    // bootstrapResolveReceiverNames then reaches for the receiver's members.
+    var inReceiverBody: bool = false
 ) {
     fun fail(code: string, message: string, expression: BootstrapExpression) {
         this.errors = this.errors + 1
@@ -117,6 +120,17 @@ class BootstrapNamedArgumentNormalizer(
     }
 
     fun target(name: string): int = this.targets.find(name)
+
+    // `expression` (a top-level function's or constructor's default, now in a
+    // caller's method body) keeps the top-level meaning of the calls in it.
+    fun keepTopLevelCalls(expression: BootstrapExpression): BootstrapExpression {
+        val children: array<BootstrapExpression> = []
+        for (child in expression.children) children.append(this.keepTopLevelCalls(child))
+        BootstrapExpression(
+            if (expression.kind == "call") "call.top-level" else expression.kind,
+            expression.text, expression.begin, expression.end, children
+        )
+    }
 
     // The class methods and extension functions named `name` that have a
     // parameter for every named argument in `children` (a member call's).
@@ -589,10 +603,13 @@ class BootstrapNamedArgumentNormalizer(
                                 substituted, receiver, this.methodClass(memberTargets, 0)
                             )
                             // The temporary has no declared type to give a literal.
-                            val normalizedDefault = bootstrapNamedF32Literal(
+                            var normalizedDefault = bootstrapNamedF32Literal(
                                 this.normalize(substituted),
                                 declaration.parameterTypes[parameter]
                             )
+                            if (!method && this.inReceiverBody) {
+                                normalizedDefault = this.keepTopLevelCalls(normalizedDefault)
+                            }
                             temporaryNames[parameter] = temporary
                             if (bootstrapIsAnyDelegatedProperty(declaration, parameter)) {
                                 // The delegate goes straight into its field: it
@@ -619,8 +636,11 @@ class BootstrapNamedArgumentNormalizer(
                     normalizedValues.append(values[parameter])
                     parameter = parameter + 1
                 }
+                // Its names chose the top-level target, which positional
+                // arguments alone wouldn't tell a receiver's method from.
                 statements.append(BootstrapExpression(
-                    result.kind,
+                    if (!method && hasNamed && this.inReceiverBody) "call.top-level"
+                    else result.kind,
                     result.text,
                     result.begin,
                     result.end,
@@ -680,7 +700,10 @@ fun bootstrapNormalizeNamedDeclaration(
         ))
         method = method + 1
     }
+    val enclosingBody = normalizer.inReceiverBody
+    normalizer.inReceiverBody = normalizer.receiver != "" && declaration.kind != "class"
     val body = normalizer.normalize(declaration.expression)
+    normalizer.inReceiverBody = enclosingBody
     normalizer.receiver = enclosing
     BootstrapDeclaration(
         declaration.kind,
