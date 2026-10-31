@@ -291,6 +291,13 @@ collection in either mode: a program that can reach either is compiled with
 pressure safe points, and the call turns collection under pressure on at run
 time (after `memorySetManualCollection()` too).
 
+A limit bounds live bytes, not the memory the process holds, which also has what
+collections parked on free lists. On Wasm a limit also lowers the thresholds at
+which parked memory is merged for reuse, to a limit's eighth and sixteenth, so a
+heap smaller than the defaults (4 MiB parked, then every 1 MiB) gets merges too.
+Linear memory can still reach several times the limit: garbage of many sizes
+under a 2 MiB limit grew it by 7 MiB (`tools/test-wasm-reclaim-limit.sh`).
+
 Near its limit, pressure collection stops before it would run at nearly every
 allocating call. Its threshold stays below the limit, leaving a quarter of it
 (at most 64 MiB) as room. When a collection keeps so much that less than 1/64
