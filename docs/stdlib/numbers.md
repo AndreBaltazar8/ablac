@@ -50,6 +50,14 @@ fun main {
 | `isNaN`, `isFinite` | |
 | `mathPi`, `mathHalfPi`, `mathQuarterPi`, `mathTau`, `mathE`, `mathLn2` | constants |
 
+Every function above that takes `f64`s also has an `f32` overload, which a float
+literal among its arguments fits (`fclamp(a, 0.0, 1.0)`). `lerp` computes in
+`f32`; the rest compute through their `f64` namesake and narrow. `sqrt` and the
+roundings are then correctly rounded `f32`s; the others can be a unit off in the
+last place, rarely, from rounding twice. `abla/math/fast` and `abla/math/v8` have
+the same overloads, over their own `f64` functions. A name with an overload is no
+longer one function to `compiler.findFunction`.
+
 The functions are implemented in Abla, so results are bit-for-bit identical
 on every target and at compile time.
 
@@ -190,6 +198,7 @@ Pick `abla/math/v8` only to agree with JavaScript.
 |---|---|
 | `f64FromInt(n)`, `f64ToInt(x)` | `int` and `f64` (`f64ToInt` truncates toward zero, saturates out-of-range values to the `int` limits, and gives 0 for NaN) |
 | `f64ToF32(x)`, `f32ToF64(x)` | between float widths |
+| `f32FromInt(n)`, `f32ToInt(x)` | `int` and `f32`: the nearest `f32` (ties to even), and toward zero with `f64ToInt`'s saturation and NaN as 0 |
 | `f32FromI32`, `f32FromU32`, `f32ToI32`, `f32ToU32` | between `f32` and 32-bit integers; `f32ToI32`/`f32ToU32` truncate toward zero, saturate and give 0 for NaN, like `f64ToInt` |
 | `f64ToBits(x)`, `f64FromBits(n)`, `f32ToBits(x)`, `f32FromBits(n)` | to and from IEEE bit patterns |
 

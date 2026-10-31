@@ -1,4 +1,5 @@
 import "ct_native_effects.ab"
+import "f32_literal.ab"
 import "module_paths.ab"
 import "subparser.ab"
 import "ct_lift.ab"
@@ -3084,7 +3085,7 @@ fun bootstrapJoinTypes(left: string, right: string): string {
 fun bootstrapWhenLiteralKey(expression: BootstrapExpression): string {
     var key = ""
     if (expression.kind == "integer" || expression.kind == "float" ||
-        expression.kind == "true" ||
+        expression.kind == "float32" || expression.kind == "true" ||
         expression.kind == "false" || expression.kind == "null" ||
         expression.kind == "string") {
         key = "${expression.kind}:${expression.text}"
@@ -5617,7 +5618,7 @@ fun bootstrapRegionModuleValues(
 // before inference).
 fun bootstrapRegionScalarLiteral(expression: BootstrapExpression): bool {
     var scalar = expression.kind == "integer" || expression.kind == "float" ||
-        expression.kind == "true" || expression.kind == "false"
+        expression.kind == "float32" || expression.kind == "true" || expression.kind == "false"
     if ((expression.kind == "unary-" || expression.kind == "unary!") &&
         expression.children.size == 1) {
         scalar = bootstrapRegionScalarLiteral(expression.children[0])
@@ -6563,6 +6564,29 @@ fun bootstrapNoOverloads(): BootstrapOverloadTable =
 
 // A call (or an operator on a non-scalar operand) the probe pass resolved: the
 // node at `begin..end` in `sourceIdentity` becomes `kind` naming `name`.
+fun bootstrapNoF32Children(): array<int> {
+    val none: array<int> = []
+    none
+}
+
+/** The children of a call of `declaration` (the first of them after `first`
+ *  being its first argument) that are passed for an f32 parameter. */
+fun bootstrapOverloadF32Children(
+    declaration: BootstrapDeclaration,
+    first: int,
+    count: int
+): array<int> {
+    val children: array<int> = []
+    var parameter = 0
+    while (parameter < declaration.parameterTypes.size && first + parameter < count) {
+        if (bootstrapNormalizeType(declaration.parameterTypes[parameter]) == "f32") {
+            children.append(first + parameter)
+        }
+        parameter = parameter + 1
+    }
+    children
+}
+
 class BootstrapOverloadResolution(
     val sourceIdentity: string,
     val begin: int,
@@ -6575,7 +6599,9 @@ class BootstrapOverloadResolution(
     // parameter default copied into a named call keeps the default's span,
     // which lies outside the call's declaration.
     val bodyBegin: int = -1,
-    val bodyEnd: int = -1
+    val bodyEnd: int = -1,
+    // The children passed for an f32 parameter, where a float literal is an f32.
+    val f32Children: array<int> = bootstrapNoF32Children()
 )
 
 /** Two functions of one name whose parameter types differ: an overload. */
@@ -8526,11 +8552,15 @@ class BootstrapAnalyzer(
                     argumentTypes.size <= declaration.parameterTypes.size
                 var exact = 0
                 var argument = 0
+                val firstArgument = at.children.size - argumentTypes.size
                 while (fits && argument < argumentTypes.size) {
                     val expected = bootstrapNormalizeType(declaration.parameterTypes[argument])
                     val actual = bootstrapBorrowElementType(argumentTypes[argument])
                     // An operator applies only to operands known to fit it.
                     if (expected == actual) exact = exact + 1
+                    // A float literal also fits an f32, less well than an f64.
+                    else if (expected == "f32" && actual == "f64" && firstArgument >= 0 &&
+                             bootstrapIsFloatLiteralExpression(at.children[firstArgument + argument])) {}
                     else if ((operatorOnly && (actual == "unknown" || actual == "any")) ||
                              !this.typesOrUpcast(expected, actual)) fits = false
                     argument = argument + 1
@@ -8570,7 +8600,12 @@ class BootstrapAnalyzer(
         this.overloadResolutions.append(BootstrapOverloadResolution(
             this.currentSourceIdentity, expression.begin, expression.end,
             expression.kind, expression.text, kind, name,
-            this.overloadBodyBegin, this.overloadBodyEnd
+            this.overloadBodyBegin, this.overloadBodyEnd,
+            bootstrapOverloadF32Children(
+                this.overloadDeclaration(owner, this.overloadDeclarationIndex(owner, name)),
+                if (kind == "member.call") 1 else 0,
+                children.size
+            )
         ))
         val index = this.overloadDeclarationIndex(owner, name)
         val declaration = this.overloadDeclaration(owner, index)
@@ -10918,6 +10953,10 @@ class BootstrapAnalyzer(
      *  the syntax declares does (expected_types.ab): analysis checks its
      *  elements against it and lowering builds it as that type. */
     fun contextualizeArrayLiteral(value: BootstrapExpression, expected: string): void {
+        if (expected == "f32" || expected == "nullable:f32") {
+            this.recordContextualLiteral(value, "f32")
+            return
+        }
         val array = if (bootstrapIsNullableType(expected))
             bootstrapNullableElementType(expected) else expected
         if (!bootstrapIsArrayType(array) || bootstrapTypeMentions(array, "unknown") ||
@@ -10931,7 +10970,9 @@ class BootstrapAnalyzer(
     /** Records `type` (source text) for the untyped literal `value` is, or
      *  that the block or `if` it is ends in. */
     fun recordContextualLiteral(value: BootstrapExpression, type: string): void {
-        if (value.kind == "array" && value.text == "") {
+        if ((type == "f32" || type == "f32?") && bootstrapIsFloatLiteralExpression(value)) {
+            this.recordF32Literals(value)
+        } else if (value.kind == "array" && value.text == "") {
             val array = bootstrapExpectedArrayType(type)
             if (array != "") {
                 this.contextualLiterals.add(this.currentSourceIdentity, value.begin, value.end, array)
@@ -10942,6 +10983,16 @@ class BootstrapAnalyzer(
             this.recordContextualLiteral(value.children[1], type)
             this.recordContextualLiteral(value.children[2], type)
         }
+        return
+    }
+
+    /** Records every literal of `value` (bootstrapIsFloatLiteralExpression) as
+     *  an f32, which lowering writes in (bootstrapApplyContextualLiterals). */
+    fun recordF32Literals(value: BootstrapExpression): void {
+        if (value.kind == "float") {
+            this.contextualLiterals.add(this.currentSourceIdentity, value.begin, value.end, "f32")
+        }
+        for (child in value.children) this.recordF32Literals(child)
         return
     }
 
@@ -11075,12 +11126,20 @@ class BootstrapAnalyzer(
         }
         val leftExpression = expression.children[0]
         val rightExpression = expression.children[1]
-        val rawLeft = if (this.scalarBinaryExpression(leftExpression))
+        var rawLeft = if (this.scalarBinaryExpression(leftExpression))
             this.inferScalarBinaryExpression(leftExpression)
         else this.infer(leftExpression)
-        val rawRight = if (this.scalarBinaryExpression(rightExpression))
+        var rawRight = if (this.scalarBinaryExpression(rightExpression))
             this.inferScalarBinaryExpression(rightExpression)
         else this.infer(rightExpression)
+        if (expression.kind == "+" || expression.kind == "-" || expression.kind == "*" ||
+            expression.kind == "/" || expression.kind == "%") {
+            if (this.f32LiteralOperand(rawLeft, rawRight, rightExpression)) {
+                rawRight = this.inferF32Operand(rightExpression)
+            } else if (this.f32LiteralOperand(rawRight, rawLeft, leftExpression)) {
+                rawLeft = this.inferF32Operand(leftExpression)
+            }
+        }
         if (this.overloads.keys.size > 0) {
             val operated = this.inferOperatorCall(expression, [rawLeft, rawRight])
             if (operated != "") return operated
@@ -11128,6 +11187,29 @@ class BootstrapAnalyzer(
         result
     }
 
+    /** A literal taken as f32: it must be in the range of one. */
+    fun inferF32Literal(expression: BootstrapExpression): string {
+        if (bootstrapF32LiteralBits(expression.text) < 0) {
+            this.inferBegin = expression.begin
+            this.inferSource = this.currentSourceIdentity
+            this.fail("float.f32-range:${expression.text}")
+        }
+        "f32"
+    }
+
+    /** Takes the float literals of `literal` as f32 where the other operand of
+     *  an operator is one, and returns the type it then has. */
+    fun inferF32Operand(literal: BootstrapExpression): string {
+        this.recordF32Literals(literal)
+        this.infer(literal)
+    }
+
+    /** Whether one operand is an f32 and the other (`literal`, typed `type`)
+     *  a float literal, which takes that width. */
+    fun f32LiteralOperand(other: string, type: string, literal: BootstrapExpression): bool =
+        type == "f64" && this.scalarValueType(bootstrapBorrowElementType(other)) == "f32" &&
+            bootstrapIsFloatLiteralExpression(literal)
+
     fun infer(expression: BootstrapExpression): string {
         if (expression.begin > 0) {
             this.inferBegin = expression.begin
@@ -11142,7 +11224,13 @@ class BootstrapAnalyzer(
         // case's locals.
         var result = "unknown"
         if (expression.kind == "integer") result = "i64"
-        if (expression.kind == "float") result = "f64"
+        if (expression.kind == "float") {
+            result = "f64"
+            if (this.contextualLiterals.begins.size > 0 && this.contextualLiterals.find(
+                this.currentSourceIdentity, expression.begin, expression.end
+            ) == "f32") result = this.inferF32Literal(expression)
+        }
+        if (expression.kind == "float32") result = this.inferF32Literal(expression)
         if (expression.kind == "true" || expression.kind == "false") result = "bool"
         if (expression.kind == "null") result = "null"
         if (expression.kind == "string") result = "string"
@@ -12833,6 +12921,7 @@ fun bootstrapInferCallValue(
         val expected = if (bootstrapIsFunctionType(calleeType))
             bootstrapFunctionParameterType(calleeType, argument - 1) else "unknown"
         analyzer.contextualizeLambdaParameters(expression.children[argument], expected)
+        analyzer.contextualizeArrayLiteral(expression.children[argument], expected)
         val actual = analyzer.infer(expression.children[argument])
         if (!analyzer.typesOrUpcast(expected, actual)) {
             analyzer.fail("function.argument:value@${expression.children[argument].begin}:$expected:$actual")
@@ -13030,6 +13119,9 @@ fun bootstrapInferCall(
             expression.children[argument],
             expectedArgument
         )
+        if (expectedArgument == "f32") {
+            analyzer.recordContextualLiteral(expression.children[argument], "f32")
+        }
         resolvedArgumentTypes.append(
             analyzer.infer(expression.children[argument])
         )
@@ -15156,8 +15248,13 @@ fun bootstrapInferComparison(
 ): string {
     var result = initial
     // A borrow compares as what it borrows (`borrowed != null`).
-    val left = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
-    val right = bootstrapBorrowElementType(analyzer.infer(expression.children[1]))
+    var left = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
+    var right = bootstrapBorrowElementType(analyzer.infer(expression.children[1]))
+    if (analyzer.f32LiteralOperand(left, right, expression.children[1])) {
+        right = analyzer.inferF32Operand(expression.children[1])
+    } else if (analyzer.f32LiteralOperand(right, left, expression.children[0])) {
+        left = analyzer.inferF32Operand(expression.children[0])
+    }
     // The test of `a ?? b` or `a?.b` (parser.ab, nullGuard): `a` must be
     // able to be null.
     if (expression.text == "??" || expression.text == "?.") {

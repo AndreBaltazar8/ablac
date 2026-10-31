@@ -113,6 +113,7 @@ test-serial: ablac
 	tools/test-float-interpolation.sh $(COMPILER)
 	tools/test-compile-time-branch.sh $(COMPILER)
 	tools/test-floating-point.sh $(COMPILER)
+	tools/test-f32.sh $(COMPILER)
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
 	tools/test-memory-checkpoint.sh $(COMPILER)

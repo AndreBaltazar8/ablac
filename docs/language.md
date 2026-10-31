@@ -286,7 +286,7 @@ fun main {
 | `bool` | `true`, `false` |
 | `i8`, `i16`, `i32`, `i64` | signed integers; `int` is `i64` |
 | `u8`, `u16`, `u32`, `u64` | unsigned integers |
-| `f32`, `f64` | IEEE floating point; literals are `f64` |
+| `f32`, `f64` | IEEE floating point; a literal is `f64` unless its context wants `f32` |
 | `char` | a byte-sized character code |
 | `string` | immutable UTF-8 text, indexed by byte |
 | `array<T>` | a growable sequence |
@@ -363,8 +363,8 @@ fun main {
 ### Floating point
 
 `f64` is the default. `abla/float` converts between integers and floats
-(`f64FromInt`, `f64ToInt`, `f64ToF32`, `f32ToF64`, ...) and to and from bit
-patterns. `abla/math` has `sqrt`, `pow`, `sin`, `floor`, `mathPi` and the
+(`f64FromInt`, `f64ToInt`, `f32FromInt`, `f32ToInt`, `f64ToF32`, `f32ToF64`,
+...) and to and from bit patterns. `abla/math` has `sqrt`, `pow`, `sin`, `floor`, `mathPi` and the
 rest. `abla/float/text` prints shortest round-trip text and is needed to
 put a float in a template:
 
@@ -379,17 +379,33 @@ fun main {
     val area = mathPi * r * r
     println(f64Text(area))
     println("${f64ToInt(floor(area))} ${f64FromInt(3) / 2.0}")
-    val small: f32 = f64ToF32(0.1)
+    val small: f32 = 0.1
     println(f64Text(f32ToF64(small)))
+    println("$small ${small * 2.5} ${sqrt(small) < 1.0}")
 }
 // output:
 // 19.634954084936208
 // 19 1.5
 // 0.10000000149011612
+// 0.10000000149011612 0.25 true
 ```
 
-Both operands of float arithmetic must have the same width. A float to
-integer conversion (`f64ToInt`, `f32ToI32`, `f32ToU32`) truncates toward zero
+A float literal takes `f32` where the context wants one: a declared type (a
+local, a global, a field, a parameter and its default, a result, an array's
+elements, a store into any of these) or an `f32` on the other side of an
+operator (`a * 2.0`, `1.0 < a`). Arithmetic over nothing but literals takes it
+as a whole (`val third: f32 = 1.0 / 3.0`). The value is the `f32` nearest the
+digits themselves, not the nearest `f32` to the nearest `f64`, and a literal
+past the largest `f32` is `float.f32-range`. One too small for any `f32` is
+zero. Nothing else converts: an `f64` variable where an `f32` is wanted stays an
+error (`local.initializer`, `arithmetic.type`, `array.element-type`), and so
+does `a * 2` with an integer. The cases of a `when` over an `f32` take no width
+from it (`when.match`); compare with `==` instead.
+
+Both operands of float arithmetic must have the same width. In a template an
+`f32` is written as the `f64` of the same value, so `0.1` as an `f32` reads
+`0.10000000149011612`. A float to
+integer conversion (`f64ToInt`, `f32ToInt`, `f32ToI32`, `f32ToU32`) truncates toward zero
 and saturates: a value beyond the integer type gives its smallest or largest
 value, and NaN gives 0, on every target. Floats work at compile time too, with
 identical results. The sign and payload bits of a NaN produced by arithmetic

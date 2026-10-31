@@ -1,0 +1,191 @@
+// A float literal is an f64 unless its context wants an f32: a declared f32, or
+// an f32 on the other side of an operator. Such a literal becomes a `float32`
+// node, whose value is the f32 nearest the decimal text itself. Going through
+// the nearest f64 would round twice and be wrong for a text just past the
+// midpoint of two f32s, so the digits are worked out exactly here, and lowering
+// and compile-time evaluation read the same bits.
+import "parser.ab"
+import "abla/float"
+
+/** A float literal, or arithmetic over nothing but float literals: what may
+ *  take f32 as a whole (`1.0 / 3.0`). */
+fun bootstrapIsFloatLiteralExpression(expression: BootstrapExpression): bool {
+    val kind = expression.kind
+    if (kind == "float") return true
+    if ((kind == "unary-" || kind == "unary+") && expression.children.size == 1) {
+        return bootstrapIsFloatLiteralExpression(expression.children[0])
+    }
+    if ((kind == "+" || kind == "-" || kind == "*" || kind == "/" || kind == "%") &&
+        expression.children.size == 2) {
+        return bootstrapIsFloatLiteralExpression(expression.children[0]) &&
+            bootstrapIsFloatLiteralExpression(expression.children[1])
+    }
+    false
+}
+
+/** `expression` (bootstrapIsFloatLiteralExpression) with its literals as f32. */
+fun bootstrapF32Literals(expression: BootstrapExpression): BootstrapExpression {
+    val kind = if (expression.kind == "float") "float32" else expression.kind
+    val children: array<BootstrapExpression> = []
+    for (child in expression.children) children.append(bootstrapF32Literals(child))
+    BootstrapExpression(kind, expression.text, expression.begin, expression.end, children)
+}
+
+// Unsigned big integers, little endian, 24 bits to a limb.
+
+fun bootstrapF32BigMulAdd(var number: array<int>, factor: int, addend: int): void {
+    var carry = addend
+    var limb = 0
+    while (limb < number.size) {
+        val value = number[limb] * factor + carry
+        number[limb] = value & 16777215
+        carry = value >> 24
+        limb = limb + 1
+    }
+    while (carry > 0) {
+        number.append(carry & 16777215)
+        carry = carry >> 24
+    }
+    return
+}
+
+fun bootstrapF32BigSize(number: array<int>): int {
+    var size = number.size
+    while (size > 0 && number[size - 1] == 0) size = size - 1
+    size
+}
+
+fun bootstrapF32BigCompare(left: array<int>, right: array<int>): int {
+    val leftSize = bootstrapF32BigSize(left)
+    val rightSize = bootstrapF32BigSize(right)
+    if (leftSize != rightSize) return if (leftSize < rightSize) -1 else 1
+    var limb = leftSize - 1
+    while (limb >= 0) {
+        if (left[limb] != right[limb]) return if (left[limb] < right[limb]) -1 else 1
+        limb = limb - 1
+    }
+    0
+}
+
+/** `number` -= `other`, which is not larger. */
+fun bootstrapF32BigSubtract(var number: array<int>, other: array<int>): void {
+    var borrow = 0
+    var limb = 0
+    while (limb < number.size) {
+        var value = number[limb] - borrow
+        if (limb < other.size) value = value - other[limb]
+        borrow = 0
+        if (value < 0) {
+            value = value + 16777216
+            borrow = 1
+        }
+        number[limb] = value
+        limb = limb + 1
+    }
+    return
+}
+
+/** The IEEE bits of the f32 nearest the decimal `text` (digits, an optional
+ *  fraction and exponent; ties to even), or -1 past the largest finite f32. A
+ *  text too small for any f32 is 0. */
+fun bootstrapF32LiteralBits(text: string): int {
+    val numerator: array<int> = []
+    val denominator: array<int> = [1]
+    var digits = 0
+    var exponent = 0
+    var index = 0
+    var fraction = false
+    while (index < text.size && text[index] != 101 && text[index] != 69) {
+        val byte = text[index]
+        if (byte == 46) fraction = true
+        else if (byte >= 48 && byte <= 57) {
+            if (digits > 0 || byte != 48) {
+                bootstrapF32BigMulAdd(numerator, 10, byte - 48)
+                digits = digits + 1
+            }
+            if (fraction) exponent = exponent - 1
+        }
+        index = index + 1
+    }
+    if (digits == 0) return 0
+    if (index < text.size) {
+        index = index + 1
+        var negative = false
+        if (index < text.size && (text[index] == 45 || text[index] == 43)) {
+            negative = text[index] == 45
+            index = index + 1
+        }
+        var written = 0
+        while (index < text.size) {
+            if (written < 100000000) written = written * 10 + text[index] - 48
+            index = index + 1
+        }
+        exponent = exponent + (if (negative) -written else written)
+    }
+    // The value is below 10^magnitude and at least a tenth of it. Outside
+    // these bounds it is past every f32 either way, whatever the digits.
+    val magnitude = digits + exponent
+    if (magnitude > 40) return -1
+    if (magnitude < -50) return 0
+    var power = 0
+    while (power < exponent) {
+        bootstrapF32BigMulAdd(numerator, 10, 0)
+        power = power + 1
+    }
+    while (power > exponent) {
+        bootstrapF32BigMulAdd(denominator, 10, 0)
+        power = power - 1
+    }
+    // Scale to numerator/denominator in [2^23, 2^24), the value being that
+    // times 2^binary; a subnormal stops short at 2^-149.
+    var binary = 0
+    val top: array<int> = []
+    for (limb in denominator) top.append(limb)
+    bootstrapF32BigMulAdd(top, 16777216, 0)
+    while (bootstrapF32BigCompare(numerator, top) >= 0) {
+        bootstrapF32BigMulAdd(denominator, 2, 0)
+        bootstrapF32BigMulAdd(top, 2, 0)
+        binary = binary + 1
+    }
+    val half: array<int> = []
+    for (limb in denominator) half.append(limb)
+    bootstrapF32BigMulAdd(half, 8388608, 0)
+    while (binary > -149 && bootstrapF32BigCompare(numerator, half) < 0) {
+        bootstrapF32BigMulAdd(numerator, 2, 0)
+        binary = binary - 1
+    }
+    // Long division, a bit at a time. At its end the numerator is 2^24 times
+    // the remainder, so against `half` (2^23 times the denominator) it says
+    // how the remainder stands to half a unit.
+    var quotient = 0
+    var bit = 0
+    while (bit < 24) {
+        quotient = quotient * 2
+        if (bootstrapF32BigCompare(numerator, half) >= 0) {
+            bootstrapF32BigSubtract(numerator, half)
+            quotient = quotient + 1
+        }
+        bootstrapF32BigMulAdd(numerator, 2, 0)
+        bit = bit + 1
+    }
+    val remainder = bootstrapF32BigCompare(numerator, half)
+    if (remainder > 0 || (remainder == 0 && (quotient & 1) == 1)) quotient = quotient + 1
+    if (quotient == 16777216) {
+        quotient = 8388608
+        binary = binary + 1
+    }
+    if (quotient < 8388608) return quotient
+    val biased = binary + 150
+    if (biased >= 255) return -1
+    (biased << 23) | (quotient - 8388608)
+}
+
+/** A boxed f32's word: its bits sign-extended, as both tiers read them. */
+fun bootstrapF32LiteralWord(text: string): int {
+    val bits = bootstrapF32LiteralBits(text)
+    if (bits >= 2147483648) bits - 4294967296 else bits
+}
+
+/** The bits of the f64 holding exactly the f32 nearest `text`. */
+fun bootstrapF32LiteralAsF64Bits(text: string): int =
+    f64ToBits(f32ToF64(f32FromBits(u32(bootstrapF32LiteralBits(text)))))
