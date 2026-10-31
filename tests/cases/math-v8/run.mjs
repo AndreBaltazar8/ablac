@@ -12,7 +12,7 @@
 // an ulp), and macOS's scalbn truncates pow's subnormal results, so the local
 // Node is not the reference everywhere. By default each function's results are
 // checked against digests recorded from x86-64 Node 22 (expected.json, by
-// sample count). With `--expected <dir>`, against the result files `expect`
+// sample count), which any Node can compare. With `--expected <dir>`, against the result files `expect`
 // wrote there (on x86-64 Node 22: per-case detail); with `--live`, against this
 // Node's Math.
 //

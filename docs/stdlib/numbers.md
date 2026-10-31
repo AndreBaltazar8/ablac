@@ -124,9 +124,9 @@ read from the compiler, must match, and every function's results over a
 seeded set of inputs (random bit patterns, each function's branch points and
 their neighbours, huge, subnormal and special arguments) must have the bits
 recorded from Node 22.14 on x86-64, natively at every optimization level, as
-release and development WebAssembly, and under `#` in both tiers. It runs the
-harness on Node 22.14 (`MATH_V8_NODE`, default
-`~/.nvm/versions/node/v22.14.0/bin/node`) and checks its V8 version.
+release and development WebAssembly, and under `#` in both tiers. The harness
+compares against those recorded digests, so it runs on any Node (`MATH_V8_NODE`,
+else the one on `PATH`); without one the test says so and is skipped.
 
 ## `abla/math/fast`
 

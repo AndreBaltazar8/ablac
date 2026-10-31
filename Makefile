@@ -274,6 +274,7 @@ test-serial: ablac
 	tools/test-wasm-mvc-extension.sh $(COMPILER)
 	tools/test-initializer-evaluation.sh $(COMPILER)
 	tools/test-math-v8.sh $(COMPILER)
+	tools/test-math-v8-no-node.sh $(COMPILER)
 	tools/test-interfaces.sh $(COMPILER)
 	tools/test-managed-alias-files.sh $(COMPILER)
 	tools/test-delegated-properties.sh $(COMPILER)

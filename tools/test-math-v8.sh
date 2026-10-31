@@ -5,8 +5,9 @@
 # release and development WebAssembly, and under `#` in the evaluator and the
 # native tier. MATH_V8_SAMPLES sets the inputs per function for the native and
 # WebAssembly checks (250000; expected.json records 1000000 and 4000000 too).
-# The harness runs on Node 22.14.0 (V8 12.4.254.21), the release the digests
-# were recorded from; MATH_V8_NODE names its executable.
+# The results are checked against digests recorded from Node 22.14.0 (V8
+# 12.4.254.21), and the harness's inputs use only exact operations, so it runs on
+# any Node: MATH_V8_NODE, else the one on PATH. Without a Node it is skipped.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -16,15 +17,13 @@ cases="$project_root/tests/cases/math-v8"
 samples=${MATH_V8_SAMPLES:-250000}
 mkdir -p "$output_directory/ct"
 
-node=${MATH_V8_NODE:-$HOME/.nvm/versions/node/v22.14.0/bin/node}
-expected_v8=12.4.254.21-node.22
-if [[ ! -x $node ]]; then
-    echo "math-v8: needs Node 22.14.0 at $node (or MATH_V8_NODE)" >&2
-    exit 1
+node=${MATH_V8_NODE:-$(command -v node || true)}
+if [[ -z $node ]]; then
+    echo "math-v8: skipped: no node on PATH and MATH_V8_NODE is unset (nix-shell shell.nix has one)"
+    exit 0
 fi
-node_v8=$("$node" -p process.versions.v8)
-if [[ $node_v8 != "$expected_v8" ]]; then
-    echo "math-v8: $node has V8 $node_v8, expected $expected_v8" >&2
+if [[ ! -x $node ]]; then
+    echo "math-v8: MATH_V8_NODE is $node, which isn't executable" >&2
     exit 1
 fi
 
@@ -93,4 +92,4 @@ done
 rm -rf "$output_directory"/io-*
 [[ $failed -eq 0 ]] || exit 1
 
-echo "math-v8: interface alike; native fast/o1/o2, wasm release/fast and # (evaluator and native tier) bit-identical to Node 22.14 (V8 $expected_v8) x86-64 Math"
+echo "math-v8: interface alike; native fast/o1/o2, wasm release/fast and # (evaluator and native tier) bit-identical to the digests of Node 22.14 (V8 12.4.254.21) x86-64 Math, checked on Node $("$node" -p process.version)"
