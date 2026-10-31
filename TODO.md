@@ -42,6 +42,9 @@
 
 ## Compiler and stdlib
 
+- [ ] Integers up to 256 bits, signed and unsigned (128 and 256, with whatever smaller widths are missing), checked first
+      against what exists: arithmetic, overflow rules, shifts, big-endian and little-endian bytes, decimal and hex text.
+      The owner wants this for Ethereum-based work, so a `uint256` has to behave as the EVM's does when asked to wrap.
 - [ ] Remove the older object layout's bootstrap step, which nothing needs now that the pin
   (v0.2.25) makes typed instances: `tools/bootstrap-untyped-objects.patch`,
   `tools/bootstrap-typed-instances.ab`, `tools/test-bootstrap-untyped-objects.sh`, their stage
