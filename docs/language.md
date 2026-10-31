@@ -819,7 +819,8 @@ fun main {
   a caller's variable of the same name. A named call by plain name in a method
   or extension function goes to the receiver's method when one has those
   parameters, as `this.name(...)` would; otherwise it goes to the top-level
-  function, whose defaults call top-level functions. A named method call is resolved before types are known: every class
+  function. A default left out of a named call keeps its callee's meaning: the
+  caller's locals and fields don't hide the globals and functions it names. A named method call is resolved before types are known: every class
   method and extension of that name with those parameter names must take the
   same parameters (and fill an omitted one the same way), otherwise it is
   `E_NAMED_ARGUMENT_TARGET` and the arguments go by position. Unknown, duplicate, out-of-order or

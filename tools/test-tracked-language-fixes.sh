@@ -38,6 +38,7 @@ expect_error invalid-import-alias-export-ambiguous E_IMPORT_ALIAS_MEMBER_AMBIGUO
 expect_error invalid-import-alias-export-unknown E_IMPORT_ALIAS_MEMBER_UNKNOWN
 expect_error invalid-import-alias-export-private E_IMPORT_ALIAS_MEMBER_UNKNOWN
 expect_exit named-implicit-this 42
+expect_exit named-default-scope 42
 expect_exit nominal-index 42
 expect_error invalid-nominal-index index.type
 expect_exit nominal-method-capture 42

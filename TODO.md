@@ -17,11 +17,11 @@
 
 ## Bugs seen
 
-- [ ] A named call's omitted default is read in the caller's scope: with `val limit = 7` and
-      `fun f(a: int, b: int = limit): int`, `f(a = 1)` in a method of a class with a field
-      `limit` reads the field (sema resolves a plain name to the field), and a local `limit` in
-      the caller shadows it too. Calls in such a default are fine since `call.top-level`.
-      Normalizing to the callee's own default would fix it (seen 2026-10-31).
+- [ ] A named call's omitted default that calls an overloaded top-level function still reaches
+      a local function value of that name in the caller: `fun over(n: int)`, `fun over(s: string)`,
+      `fun g(a: int, b: int = over(1))`, then `val over = { n: int -> n + 5 }` and `g(a = 0)` calls
+      the local. Globals and non-overloaded functions go through accessors
+      (`named_arguments.ab`); an overload has no single function to copy (seen 2026-10-31).
 
 ## Compiler and stdlib
 

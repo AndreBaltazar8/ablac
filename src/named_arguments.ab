@@ -3,6 +3,7 @@
 // committed to the raw program (bootstrapCommitEdits), which a new body's named
 // arguments are normalized with.
 import "f32_literal.ab"
+import "receiver_names.ab"
 import "staged_parser.ab"
 import "abla/sys/linux/process"
 import "parser.ab"
@@ -109,7 +110,12 @@ class BootstrapNamedArgumentNormalizer(
     var receiver: string = "",
     // Inside a method's or extension function's body, whose plain names
     // bootstrapResolveReceiverNames then reaches for the receiver's members.
-    var inReceiverBody: bool = false
+    var inReceiverBody: bool = false,
+    // The names the declaration being normalized binds itself: its parameters
+    // and locals, anywhere in it.
+    var callerNames: array<string> = [],
+    // Functions that read a global a caller's name hides (globalAccessor).
+    val accessors: array<BootstrapDeclaration> = []
 ) {
     fun fail(code: string, message: string, expression: BootstrapExpression) {
         this.errors = this.errors + 1
@@ -120,6 +126,81 @@ class BootstrapNamedArgumentNormalizer(
     }
 
     fun target(name: string): int = this.targets.find(name)
+
+    // Whether a plain `name` in the code being normalized means the caller's
+    // own: something it binds, or a field of its receiver.
+    fun callerHides(name: string): bool {
+        if (bootstrapReceiverNameIn(this.callerNames, name)) return true
+        if (this.receiver == "") return false
+        for (declaration in this.declarations) {
+            if (declaration.kind == "class" && declaration.name == this.receiver &&
+                this.ownerField(declaration, name)) return true
+            if (bootstrapIsExtensionFieldKind(declaration.kind) &&
+                declaration.extensionOwner == this.receiver &&
+                declaration.name == name) return true
+        }
+        false
+    }
+
+    // The name of a function reading the global `global`, which a default can
+    // call from where a local or field of that name hides it.
+    fun globalAccessor(global: BootstrapDeclaration): string {
+        val name = "__abla_global_${global.name}"
+        for (accessor in this.accessors) if (accessor.name == name) return name
+        // (Already there from an earlier round of compile-time edits.)
+        if (this.target(name) >= 0) return name
+        this.accessors.append(BootstrapDeclaration(
+            "fun", name, global.begin, global.end,
+            BootstrapExpression("identifier", global.name, global.begin, global.end, []),
+            [], [], if (global.resultType == "") "inferred" else global.resultType,
+            [], [], "", [], "", false, false, false, "", 0, 0, [], [], [], [],
+            global.sourceIdentity
+        ))
+        name
+    }
+
+    // The name of a copy of the top-level function `function`, for a default to
+    // call where a local of that name hides it.
+    fun functionAccessor(function: string): string {
+        val name = "__abla_function_$function"
+        for (accessor in this.accessors) if (accessor.name == name) return name
+        if (this.target(name) >= 0) return name
+        val copy = bootstrapNamedFunctionCopy(this.declarations[this.target(function)], name)
+        this.accessors.append(copy)
+        name
+    }
+
+    // `expression` (a default, now in a caller's body) with each global it reads
+    // or function it calls that the caller hides reached through an accessor. `own` are the names that
+    // are the default's: what it binds, and the arguments put in for parameters.
+    fun readCalleeGlobals(
+        expression: BootstrapExpression,
+        own: array<string>
+    ): BootstrapExpression {
+        if (expression.kind == "identifier" && !bootstrapReceiverNameIn(own, expression.text) &&
+            this.callerHides(expression.text)) {
+            for (declaration in this.declarations) {
+                if ((declaration.kind == "val" || declaration.kind == "var") &&
+                    declaration.extensionOwner == "" && declaration.name == expression.text) {
+                    return BootstrapExpression(
+                        "call", this.globalAccessor(declaration),
+                        expression.begin, expression.end, []
+                    )
+                }
+            }
+        }
+        val children: array<BootstrapExpression> = []
+        for (child in expression.children) children.append(this.readCalleeGlobals(child, own))
+        var text = expression.text
+        if (expression.kind == "call" && !bootstrapReceiverNameIn(own, text) &&
+            this.callerHides(text)) {
+            val function = this.target(text)
+            if (function >= 0 && this.declarations[function].kind != "class") {
+                text = this.functionAccessor(text)
+            }
+        }
+        BootstrapExpression(expression.kind, text, expression.begin, expression.end, children)
+    }
 
     // `expression` (a top-level function's or constructor's default, now in a
     // caller's method body) keeps the top-level meaning of the calls in it.
@@ -607,6 +688,10 @@ class BootstrapNamedArgumentNormalizer(
                                 this.normalize(substituted),
                                 declaration.parameterTypes[parameter]
                             )
+                            var own: array<string> = []
+                            for (name in temporaryNames) own.append(name)
+                            bootstrapReceiverBoundNames(normalizedDefault, own)
+                            normalizedDefault = this.readCalleeGlobals(normalizedDefault, own)
                             if (!method && this.inReceiverBody) {
                                 normalizedDefault = this.keepTopLevelCalls(normalizedDefault)
                             }
@@ -655,6 +740,22 @@ class BootstrapNamedArgumentNormalizer(
     }
 }
 
+fun bootstrapNamedFunctionCopy(
+    function: BootstrapDeclaration,
+    name: string
+): BootstrapDeclaration = BootstrapDeclaration(
+    function.kind, name, function.begin, function.end, function.expression,
+    function.parameters, function.parameterTypes, function.resultType,
+    function.methods, function.parameterDefaults, function.externalLibrary,
+    function.parameterKinds, function.extensionOwner, function.isTrusted,
+    function.isResource, function.isNoEscape, function.generatedNamespace,
+    function.generatedOriginBegin, function.generatedOriginEnd,
+    function.annotations, function.annotationArguments,
+    function.annotationBegins, function.annotationEnds, function.sourceIdentity,
+    function.conformances, function.isSealed, function.isPrivate,
+    function.typeParameters
+)
+
 // The declarations a named member call may name: `methods[i]` indexes the
 // methods of class `owners[i]`, or is -1 for the extension function `owners[i]`.
 class BootstrapNamedMethodTargets(val owners: array<int>, val methods: array<int>)
@@ -682,6 +783,15 @@ fun bootstrapNormalizeNamedDeclaration(
     declaration: BootstrapDeclaration
 ): BootstrapDeclaration {
     val enclosing = normalizer.receiver
+    val enclosingNames: array<string> = []
+    for (name in normalizer.callerNames) enclosingNames.append(name)
+    if (declaration.kind != "class") {
+        var names: array<string> = []
+        for (name in enclosingNames) names.append(name)
+        for (name in declaration.parameters) names.append(name)
+        bootstrapReceiverBoundNames(declaration.expression, names)
+        normalizer.callerNames = names
+    }
     if (declaration.kind == "class") normalizer.receiver = declaration.name
     else if (declaration.extensionOwner != "") normalizer.receiver = declaration.extensionOwner
     val defaults: array<BootstrapExpression> = []
@@ -705,6 +815,9 @@ fun bootstrapNormalizeNamedDeclaration(
     val body = normalizer.normalize(declaration.expression)
     normalizer.inReceiverBody = enclosingBody
     normalizer.receiver = enclosing
+    val restoredNames: array<string> = []
+    for (name in enclosingNames) restoredNames.append(name)
+    normalizer.callerNames = restoredNames
     BootstrapDeclaration(
         declaration.kind,
         declaration.name,
@@ -829,6 +942,18 @@ fun bootstrapNormalizeNamedArguments(
             ))
         } else declarations.append(candidate)
         declaration = declaration + 1
+    }
+    // (A copied function's body may name arguments, and ask for more accessors.)
+    var accessor = 0
+    while (accessor < normalizer.accessors.size) {
+        val candidate = normalizer.accessors[accessor]
+        normalizer.sourceIdentity = candidate.sourceIdentity
+        declarations.append(
+            if (bootstrapDeclarationRequiresNamedNormalization(normalizer, candidate))
+                bootstrapNormalizeNamedDeclaration(normalizer, candidate)
+            else candidate
+        )
+        accessor = accessor + 1
     }
     val actions: array<BootstrapExpression> = []
     var action = 0
