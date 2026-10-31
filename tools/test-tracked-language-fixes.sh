@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # when arms returning globals, aliases through `export import`, named calls through
 # implicit `this`, nominal ints as indexes and in receiver capture, reserved words
-# as names, and a method named `transform` under `#compiler.transform`.
+# as names, a method named `transform` under `#compiler.transform`, and an import
+# path without quotes.
 set -euo pipefail
 
 compiler=${1:-build/ablac}
@@ -44,5 +45,10 @@ expect_error invalid-reserved-generator '`generator` is a reserved word'
 expect_error invalid-reserved-generator '`task` is a reserved word'
 expect_error invalid-reserved-generator '`thread` is a reserved word'
 expect_exit transform-method-effects 42
+expect_error invalid-import-unquoted E_IMPORT_PATH_UNQUOTED
+if grep -q E_EVAL_DIVISION_BY_ZERO "$output/invalid-import-unquoted.log"; then
+    echo 'an unquoted import still reports a division by zero' >&2
+    exit 1
+fi
 expect_error invalid-transform-method-effects compile.effect-denied:filesystem.write
 echo "tracked language fixes: pass"
