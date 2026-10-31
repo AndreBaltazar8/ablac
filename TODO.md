@@ -17,6 +17,11 @@
 
 ## Bugs seen
 
+- [ ] `jsonParse` at compile time needs `filesystem.write`: the effect path ends
+      `jsonParseEscapedPortable->Path.appendText`, though it writes no file. Seen 2026-10-31 with
+      `#compilerGrant("filesystem.read")` alone in novakind's `domain/i18n.ab`.
+- [ ] `Json.get` and `Json.has` are linear, so a compile-time loop over about 1000 keys ran past the
+      50,000,000 step limit (novakind's catalogs). Worked around with a `Map`.
 - [ ] `E_NAMED_ARGUMENT_HIDDEN` also rejects a caller whose local of that name isn't a function,
       which would be fine: a generic function's or method's omitted default calling a global
       function value, constructor or foreign function, with `val double = 40` in the caller and
