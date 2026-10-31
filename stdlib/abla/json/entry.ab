@@ -16,6 +16,13 @@ class JsonNumber(
     val intAvailable: bool
 )
 
+// An object of jsonKeyIndexMembers members or more keeps in `stringValue`, which
+// it has no other use for, an index for get and has: its member count, then an
+// open addressing table of positions + 1 into `keys`, probed linearly from each
+// key's FNV-1a hash and at most half full, all as 32-bit little-endian integers.
+// (In a string so that a node stays this size, whatever it holds.) A repeated
+// key finds its last position, as a scan does; a count that no longer matches
+// `keys`, or no index, means a scan.
 class Json(
     val kind: int,
     val stringValue: string,
@@ -377,7 +384,7 @@ fun jsonObject(keys: array<string>, values: array<Json>): Json {
         valid = keys[index].isValidUtf8()
         index = index + 1
     }
-    if (valid) Json(5, "", 0, false, keys, values, jsonNoNumber)
+    if (valid) jsonIndexedObject(keys, values)
     else jsonNull()
 }
 
@@ -446,7 +453,16 @@ fun Json.asInt(): int =
 fun Json.intAvailable(): bool =
     this.kind == 2 && this.numberValue.intAvailable
 
+private fun Json.hasKeyIndex(): bool =
+    this.kind == 5 && this.stringValue.size >= 4 &&
+    textReadU32LittleEndian(this.stringValue, 0) == this.keys.size
+
 fun Json.get(key: string): Json {
+    if (this.hasKeyIndex()) {
+        val position = jsonKeyIndexPosition(this.stringValue, this.keys, key)
+        return if (position >= 0 && position < this.values.size) this.values[position]
+            else jsonNull()
+    }
     var value = jsonNull()
     var found = false
     var index = if (this.keys.size < this.values.size) {
@@ -466,6 +482,7 @@ fun Json.get(key: string): Json {
 }
 
 fun Json.has(key: string): bool {
+    if (this.hasKeyIndex()) return jsonKeyIndexPosition(this.stringValue, this.keys, key) >= 0
     var found = false
     var index = 0
     while (!found && index < this.keys.size) {
@@ -935,7 +952,7 @@ private fun jsonParseValue(var state: JsonParserState, depth: int): Json {
             )
         }
         state.offset = offset
-        return Json(5, "", 0, false, keys, values, jsonNoNumber)
+        return Json(5, jsonKeyIndexFrom(keyIndex, keys), 0, false, keys, values, jsonNoNumber)
     }
     if ((byte >= 48 && byte <= 57) || byte == 45 || byte == 43) {
         val begin = offset
@@ -1100,6 +1117,82 @@ private fun jsonKeyPosition(
 
 // An empty key table for an object that has reached jsonKeyIndexMembers.
 private fun jsonKeyTable(): JsonKeyTable = JsonKeyTable([], [], jsonKeyTableSlots(64), 63)
+
+// The index of an object with these keys, "" for a short one.
+private fun jsonKeyIndexOf(keys: array<string>): string {
+    if (keys.size < jsonKeyIndexMembers) return ""
+    var size = 64
+    while (size <= keys.size * 2) size = size * 2
+    val mask = size - 1
+    val slots = jsonKeyTableSlots(size)
+    var position = 0
+    while (position < keys.size) {
+        var slot = jsonKeyHash(keys[position]) & mask
+        while (slots[slot] != 0 && keys[slots[slot] - 1] != keys[position]) {
+            slot = (slot + 1) & mask
+        }
+        position = position + 1
+        slots[slot] = position
+    }
+    jsonKeyIndexText(keys.size, slots)
+}
+
+// The same from the table that checked `keys` while they were parsed, if any:
+// it holds exactly them, in their order.
+private fun jsonKeyIndexFrom(table: JsonKeyTable?, keys: array<string>): string {
+    if (table == null) return jsonKeyIndexOf(keys)
+    jsonKeyIndexText(keys.size, table.slots)
+}
+
+private fun jsonKeyIndexText(count: int, slots: array<int>): string {
+    if (ablaAtCompileTime()) {
+        val output = byteBuffer()
+        jsonKeyIndexAppend(output, count)
+        for (slot in slots) jsonKeyIndexAppend(output, slot)
+        output.toText()
+    } else jsonKeyIndexTextNative(count, slots)
+}
+
+private fun jsonKeyIndexAppend(var output: ByteBuffer, value: int): void {
+    output.appendText(byteEncode(value & 255))
+    output.appendText(byteEncode((value >> 8) & 255))
+    output.appendText(byteEncode((value >> 16) & 255))
+    output.appendText(byteEncode((value >> 24) & 255))
+    return
+}
+
+trusted fun jsonKeyIndexTextNative(count: int, slots: array<int>): string {
+    val size = (slots.size + 1) * 4
+    val buffer = nativeByteBuffer(size + 1)
+    var address = nativePointerAddress(buffer.address)
+    var index = -1
+    while (index < slots.size) {
+        val value = if (index < 0) count else slots[index]
+        ablaUnsafeStoreU8(nativePointerFromAddress(address), value & 255)
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + 1), (value >> 8) & 255)
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + 2), (value >> 16) & 255)
+        ablaUnsafeStoreU8(nativePointerFromAddress(address + 3), (value >> 24) & 255)
+        address = address + 4
+        index = index + 1
+    }
+    buffer.adoptString(size)
+}
+
+private fun jsonIndexedObject(keys: array<string>, values: array<Json>): Json =
+    Json(5, jsonKeyIndexOf(keys), 0, false, keys, values, jsonNoNumber)
+
+// `key`'s last position among `keys`, or -1.
+private fun jsonKeyIndexPosition(index: string, keys: array<string>, key: string): int {
+    val mask = index.size / 4 - 2
+    var slot = jsonKeyHash(key) & mask
+    var entry = textReadU32LittleEndian(index, 4 + slot * 4)
+    while (entry != 0) {
+        if (entry <= keys.size && keys[entry - 1] == key) return entry - 1
+        slot = (slot + 1) & mask
+        entry = textReadU32LittleEndian(index, 4 + slot * 4)
+    }
+    -1
+}
 
 fun jsonParse(
     source: string,
@@ -2008,7 +2101,7 @@ fun jsonJsKeyOrder(value: Json): Json {
         keys.append(value.keys[position])
         values.append(jsonJsKeyOrder(value.values[position]))
     }
-    Json(5, "", 0, false, keys, values, jsonNoNumber)
+    jsonIndexedObject(keys, values)
 }
 
 // Edits to a document's objects, written out with the rest of the document in
@@ -2215,7 +2308,7 @@ private fun jsonEditedTree(edits: JsonEdits, index: int): Json {
         )
         at = at + 1
     }
-    Json(5, "", 0, false, keys, values, jsonNoNumber)
+    jsonIndexedObject(keys, values)
 }
 
 // The document as jsonStringify writes jsonParse's tree (in JavaScript's key
@@ -2412,7 +2505,7 @@ private fun jsonNodeTree(document: JsonDocument, index: int): Json {
         }
         member = tape[member + 7]
     }
-    Json(5, "", 0, false, keys, values, jsonNoNumber)
+    jsonIndexedObject(keys, values)
 }
 
 private fun jsonReaderConsume(var state: JsonParserState, expected: int): bool {

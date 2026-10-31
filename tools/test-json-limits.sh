@@ -25,4 +25,25 @@ for mode in interp jit; do
     set -e
     [[ $status -eq 42 ]] || { echo "json limits: permissive ($mode) exited $status"; exit 1; }
 done
+# Get and has through a key index, and JSON at compile time: a parse needs only
+# the grant reading its file, and lookups in a large object stay in the step limit.
+for mode in interp jit; do
+    ABLA_COMPILE_EVAL=$mode "$compiler" build "$project_root/tests/cases/modules/json-key-index.ab" \
+        -o "$output_directory/key-index-$mode" --fast --no-cache
+    set +e
+    "$output_directory/key-index-$mode"
+    status=$?
+    set -e
+    [[ $status -eq 42 ]] || { echo "json limits: key index ($mode) exited $status"; exit 1; }
+    (
+        cd "$project_root"
+        ABLA_COMPILE_EVAL=$mode "$compiler" build tests/cases/json-compile-time/main.ab \
+            -o "$output_directory/compile-time-$mode" --fast --no-cache
+    )
+    set +e
+    "$output_directory/compile-time-$mode" > /dev/null
+    status=$?
+    set -e
+    [[ $status -eq 42 ]] || { echo "json limits: compile time ($mode) exited $status"; exit 1; }
+done
 echo "json limits: per call, above the defaults, depth bounded, the permissive preset (JSON.parse's limits and duplicate keys)"
