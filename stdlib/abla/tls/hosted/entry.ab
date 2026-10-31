@@ -4,6 +4,8 @@
 
 import "openssl.ab"
 import "../../jwt/libcrypto.ab"
+import "../../crypto/hosted/libcrypto.ab"
+import "../../crypto/hosted/pkcs12.ab"
 import "abla/dns"
 import "abla/sys/linux/net"
 import "abla/unsafe/memory"
@@ -43,6 +45,7 @@ private fun hostedTlsStageCode(stage: string): int = when (stage) {
     "socket_attach" -> 8
     "handshake" -> 9
     "certificate_verification" -> 10
+    "client_identity" -> 14
     else -> 1
 }
 
@@ -61,6 +64,7 @@ private fun hostedTlsErrorText(code: int): string = when (code) {
     11 -> "TLS certificate, private key, or listener failed"
     12 -> "TLS server handshake failed"
     13 -> "TLS read or write timed out"
+    14 -> "TLS failed at client_identity: no usable client certificate and key"
     else -> "TLS failed"
 }
 
@@ -124,12 +128,135 @@ trusted fun tlsLastError(): string =
 private fun tlsTcpConnectTimeout(timeoutMilliseconds: int): int =
     if (timeoutMilliseconds > 10000) 10000 else timeoutMilliseconds
 
+// A client certificate, its chain and its private key, for mutual TLS: held by
+// OpenSSL and freed when dropped. Check error first, or ok().
+resource class TlsClientIdentity(
+    val certificate: int,
+    val key: int,
+    val chain: array<int>,
+    val error: string
+) {
+    trusted fun drop(): void {
+        if (this.certificate != 0) X509_free(nativePointerFromAddress(this.certificate))
+        if (this.key != 0) EVP_PKEY_free(nativePointerFromAddress(this.key))
+        var index = 0
+        while (index < this.chain.size) {
+            X509_free(nativePointerFromAddress(this.chain[index]))
+            index = index + 1
+        }
+        return
+    }
+    fun ok(): bool = this.certificate != 0 && this.key != 0
+}
+
+// Takes ownership of what it's given. Refuses a key that isn't the certificate's.
+private trusted fun tlsIdentityFrom(
+    certificate: int, key: int, chain: array<int>, error: string
+): TlsClientIdentity {
+    var problem = error
+    if (problem == "" && (certificate == 0 || key == 0)) {
+        problem = "the client identity needs a certificate and its private key"
+    }
+    if (problem == "" && X509_check_private_key(
+        nativePointerFromAddress(certificate), nativePointerFromAddress(key)
+    ) != i32(1)) {
+        problem = "the private key isn't the client certificate's"
+    }
+    ERR_clear_error()
+    if (problem == "") return TlsClientIdentity(certificate, key, chain, "")
+    if (certificate != 0) X509_free(nativePointerFromAddress(certificate))
+    if (key != 0) EVP_PKEY_free(nativePointerFromAddress(key))
+    var index = 0
+    while (index < chain.size) {
+        X509_free(nativePointerFromAddress(chain[index]))
+        index = index + 1
+    }
+    TlsClientIdentity(0, 0, [], problem)
+}
+
+// From PEM text: the certificate first and then any intermediates, and its key,
+// PKCS#8 or PKCS#1, encrypted with `passphrase` if it is. A key that needs one fails
+// without it; it never asks on the terminal.
+trusted fun tlsClientIdentityFromPem(
+    certificatePem: string, keyPem: string, passphrase: string = ""
+): TlsClientIdentity {
+    val chain: array<int> = []
+    if (certificatePem.size == 0 || keyPem.size == 0 || cryptoHasNul(passphrase)) {
+        return tlsIdentityFrom(0, 0, chain, "the client identity needs a certificate and its private key")
+    }
+    val none = nativeNullPointer()
+    val certificates = BIO_new_mem_buf(
+        nativePointerFromAddress(nativeStringAddress(certificatePem)), certificatePem.size
+    )
+    var certificate = 0
+    if (!pointerIsNull(certificates)) {
+        certificate = nativePointerAddress(PEM_read_bio_X509(certificates, none, none, none))
+        var reading = certificate != 0
+        while (reading) {
+            val next = nativePointerAddress(PEM_read_bio_X509(certificates, none, none, none))
+            if (next == 0) reading = false
+            else chain.append(next)
+        }
+        BIO_free(certificates)
+    }
+    var key = 0
+    val keys = BIO_new_mem_buf(
+        nativePointerFromAddress(nativeStringAddress(keyPem)), keyPem.size
+    )
+    if (!pointerIsNull(keys)) {
+        // With no callback, OpenSSL takes the last argument as the passphrase itself.
+        key = nativePointerAddress(PEM_read_bio_PrivateKey(
+            keys, none, none, nativePointerFromAddress(nativeCStringAddress(passphrase))
+        ))
+        BIO_free(keys)
+    }
+    ERR_clear_error()
+    tlsIdentityFrom(
+        certificate, key, chain,
+        if (certificate == 0) "not a readable certificate in PEM"
+        else if (key == 0) "not a readable private key in PEM, or a wrong passphrase"
+        else ""
+    )
+}
+
+// From a PKCS#12 (.pfx) container, which is how AT's manuals have a certificate
+// and its key joined.
+trusted fun tlsClientIdentityFromPkcs12(der: string, password: string): TlsClientIdentity {
+    val parts = cryptoPkcs12Open(der, password)
+    tlsIdentityFrom(parts.certificate, parts.key, parts.chain, parts.error)
+}
+
+// Adds the identity to a new context. OpenSSL counts its own references.
+private trusted fun tlsContextUseIdentity(
+    context: i64*, certificate: int, key: int, chain: array<int>
+): bool {
+    if (SSL_CTX_use_certificate(context, nativePointerFromAddress(certificate)) != i32(1) ||
+        SSL_CTX_use_PrivateKey(context, nativePointerFromAddress(key)) != i32(1) ||
+        SSL_CTX_check_private_key(context) != i32(1)) {
+        ERR_clear_error()
+        return false
+    }
+    var index = 0
+    while (index < chain.size) {
+        // SSL_CTX_add1_chain_cert takes a reference of its own.
+        if (SSL_CTX_ctrl(context, 89, 1, nativePointerFromAddress(chain[index])) != 1) {
+            ERR_clear_error()
+            return false
+        }
+        index = index + 1
+    }
+    true
+}
+
 trusted fun tlsOpen(
     host: string,
     caPath: string,
     port: int,
     timeoutMilliseconds: int,
-    readWriteTimeoutMilliseconds: int = 30000
+    readWriteTimeoutMilliseconds: int = 30000,
+    identityCertificate: int = 0,
+    identityKey: int = 0,
+    identityChain: array<int> = []
 ): int {
     var handle = -1
     var stage = "configuration"
@@ -152,7 +279,8 @@ trusted fun tlsOpen(
     }
     if (!ready) { hostedTlsSetError(hostedTlsStageCode(stage)); return -1 }
     tlsUpgradeHandle(
-        connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds
+        connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds,
+        identityCertificate, identityKey, identityChain
     )
 }
 
@@ -164,7 +292,10 @@ trusted fun tlsUpgradeHandle(
     host: string,
     caPath: string,
     timeoutMilliseconds: int = 5000,
-    readWriteTimeoutMilliseconds: int = 30000
+    readWriteTimeoutMilliseconds: int = 30000,
+    identityCertificate: int = 0,
+    identityKey: int = 0,
+    identityChain: array<int> = []
 ): int {
     var handle = -1
     var stage = "configuration"
@@ -185,6 +316,12 @@ trusted fun tlsUpgradeHandle(
             ) == 1
         else SSL_CTX_set_default_verify_paths(context) == 1
         ready = trustLoaded
+    }
+    if (ready && identityCertificate != 0) {
+        stage = "client_identity"
+        ready = tlsContextUseIdentity(
+            context, identityCertificate, identityKey, identityChain
+        )
     }
     if (ready) {
         stage = "session_create"
@@ -266,6 +403,28 @@ fun tlsConnectWithCa(
 ): TlsConnection = TlsConnection(
     tlsOpen(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds)
 )
+
+// Mutual TLS: as tlsConnect, presenting the identity, and trusting the CA file at
+// caPath if it isn't "". Under TLS 1.3 a server's refusal of the client certificate
+// arrives after the handshake, so it shows as a failing first read, not as a failed
+// connect. The identity may be dropped once this returns.
+trusted fun tlsConnectWithIdentity(
+    host: string,
+    identity: TlsClientIdentity,
+    caPath: string = "",
+    port: int = 443,
+    timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds
+): TlsConnection {
+    if (!identity.ok()) {
+        hostedTlsSetError(14)
+        return TlsConnection(-1)
+    }
+    TlsConnection(tlsOpen(
+        host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds,
+        identity.certificate, identity.key, identity.chain
+    ))
+}
 
 // Replaces the limits on one read and one write; 0 waits as long as it takes.
 // A read that times out returns "" and can be repeated (tlsLastError tells it

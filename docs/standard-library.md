@@ -12,7 +12,7 @@ carry them.
 | [Text, bytes and number formatting](stdlib/text.md) | `abla/text`, `abla/bytes`, `abla/float/text` |
 | [Console, files, processes and time](stdlib/system.md) | `abla/io`, `abla/fs`, `abla/process/*` |
 | [Numbers, bits and randomness](stdlib/numbers.md) | `abla/core`, `abla/math`, `abla/math/v8`, `abla/math/fast`, `abla/float`, `abla/bits`, `abla/integer`, `abla/random` |
-| [Hashing, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/date` |
+| [Hashing, encryption, encoding and dates](stdlib/security-and-dates.md) | `abla/crypto`, `abla/crypto/hosted`, `abla/date` |
 | [Testing](stdlib/testing.md) | `abla/test` and `ablac test` |
 | [JSON](json.md) | `abla/json`, `abla/http/json`, `$json` |
 | [Networking](networking.md) | `abla/net`, `abla/http/*`, `abla/websocket/*`, `abla/tls/hosted`, `abla/dns`, `abla/dns/async`, `abla/jwt` |
@@ -36,7 +36,8 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/bits` | named functions for 64-bit bit operations |
 | `abla/bytes` | byte buffers, byte encoding, borrowed slices, stable hashing |
 | `abla/text` | string helpers (split, trim, replace, ...) and UTF-8 validation, code points and slicing |
-| `abla/crypto` | SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
+| `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
+| `abla/crypto/hosted` | AES-GCM, AES-CBC, AES-ECB, RSA signatures and encryption, PEM, DER, X.509 and PKCS#12 keys, through OpenSSL |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
 | `abla/test` | checks for test programs run by `ablac test` |
 | `abla/io` | console output, end-of-input-aware line input, buffered text writers |

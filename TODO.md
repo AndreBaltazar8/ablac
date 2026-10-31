@@ -23,6 +23,23 @@
       `f(a = 1)`. Normalization runs before types are known. Passing the argument or renaming the
       local avoids it; it is never a wrong call (seen 2026-10-31).
 
+- [ ] A lambda whose return type is inferred from a call gives `any`-like results that `+` doesn't
+      type: with `val read = { name: string -> linuxReadFile(name) }`, `read("x") + "y"` traps at
+      run time in `abla_add` (`__ablaRuntimeRequire`, Illegal instruction), and
+      `(read("x") + "y").size` fails to build with `E_LLVM_INSTRUCTION_UNSUPPORTED`: `cannot lower
+      result ... field.get target size`. A named function avoids it (seen 2026-10-31).
+- [ ] `webSocketServerTlsUsePemKey` passes OpenSSL a null callback and null data, so an encrypted
+      PEM key given by `webSocketServerTlsPem` asks for a passphrase on the terminal instead of
+      failing. Found reading it 2026-10-31, not run. `abla/crypto/hosted` passes a passphrase string.
+
+- [ ] `tools/test-tls-faults.sh`, stage `mask`, takes 16 s on an idle machine, and passes its 40 s
+      limit only there: with 48 busy loops it hit the limit 6 of 6 times, the same with and without
+      the crypto branch (2026-10-31; `https` POST of 32 MiB to a resetting peer, twice). It failed 2
+      of 3 `make test` runs at JOBS=30 before going to the serial list in `tools/run-tests.sh`. Why a
+      refused 32 MiB write takes that long isn't known.
+- [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
+      out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
+
 ## Compiler and stdlib
 
 - [ ] Remove the older object layout's bootstrap step, which nothing needs now that the pin

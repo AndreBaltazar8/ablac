@@ -1,0 +1,608 @@
+// AES and RSA through OpenSSL's libcrypto, the same provider abla/tls/hosted uses.
+// A program links OpenSSL only if it imports this module; abla/crypto stays pure
+// Abla. Bytes are byte-preserving strings, as in abla/crypto. A CryptoResult's
+// error names what failed and never carries key material or plaintext.
+//
+// What OpenSSL gives here and hand-written Abla wouldn't: AES without key-dependent
+// table lookups (AES-NI, or its bit-sliced or vector code where the CPU has them),
+// RSA private-key operations with blinding and constant-time exponentiation, and
+// cleansing of the key it holds when freed. Keys passed in as Abla strings can't be
+// wiped: they stay in memory until the collector reuses it, so read them as late as
+// you can and don't keep them.
+
+import "libcrypto.ab"
+import "../../jwt/libcrypto.ab"
+import "pkcs12.ab"
+import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+class CryptoResult(val bytes: string, val ok: bool, val error: string)
+
+private fun cryptoFailed(error: string): CryptoResult = CryptoResult("", false, error)
+
+// OpenSSL takes C int lengths. This bound leaves room for a padding block and a tag.
+private val cryptoMaximumBytes = 2147483000
+
+// Compares in time that depends only on the length, through CRYPTO_memcmp, which
+// is written so that a compiler can't turn it into an early exit (abla/crypto's
+// constantTimeEquals has no such guarantee from the code generator). Inputs of
+// different lengths are unequal at once, so the length isn't hidden.
+trusted fun opensslConstantTimeEquals(left: string, right: string): bool {
+    if (left.size != right.size) return false
+    if (left.size == 0) return true
+    CRYPTO_memcmp(
+        nativePointerFromAddress(nativeStringAddress(left)),
+        nativePointerFromAddress(nativeStringAddress(right)),
+        left.size
+    ) == i32(0)
+}
+
+// ---------------------------------------------------------------------------
+// AES
+
+private trusted fun aesCipher(mode: int, keySize: int): i64* = when (mode * 100 + keySize) {
+    16 -> EVP_aes_128_ecb()
+    24 -> EVP_aes_192_ecb()
+    32 -> EVP_aes_256_ecb()
+    116 -> EVP_aes_128_cbc()
+    124 -> EVP_aes_192_cbc()
+    132 -> EVP_aes_256_cbc()
+    216 -> EVP_aes_128_gcm()
+    224 -> EVP_aes_192_gcm()
+    232 -> EVP_aes_256_gcm()
+    else -> nativeNullPointer()
+}
+
+private val aesModeEcb = 0
+private val aesModeCbc = 1
+private val aesModeGcm = 2
+private val aesWrongKey = "an AES key has 16, 24 or 32 bytes"
+private val aesTooLong = "the data is too long for OpenSSL's int lengths"
+
+private trusted fun cryptoOutputLength(cell: NativeByteBuffer): int =
+    cell.loadI64(0) & 4294967295
+
+// ECB and CBC, with PKCS#7 padding, OpenSSL's default for block modes (for a
+// 16-byte block it is the same thing Java calls PKCS5Padding).
+private trusted fun aesBlockCipher(
+    encrypt: bool, mode: int, key: string, iv: string, input: string
+): CryptoResult {
+    val cipher = aesCipher(mode, key.size)
+    if (pointerIsNull(cipher)) return cryptoFailed(aesWrongKey)
+    if (input.size > cryptoMaximumBytes) return cryptoFailed(aesTooLong)
+    if (!encrypt && (input.size == 0 || input.size % 16 != 0)) {
+        return cryptoFailed("the ciphertext isn't a whole number of 16-byte blocks")
+    }
+    val context = EVP_CIPHER_CTX_new()
+    if (pointerIsNull(context)) return cryptoFailed("OpenSSL could not allocate a cipher")
+    val capacity = input.size + 33
+    val output = nativeByteBuffer(capacity)
+    val length = nativeByteBuffer(8)
+    length.storeI64(0, 0)
+    var ok = EVP_CipherInit_ex(
+        context, cipher, nativeNullPointer(),
+        nativePointerFromAddress(nativeStringAddress(key)),
+        if (mode == aesModeEcb) nativeNullPointer()
+        else nativePointerFromAddress(nativeStringAddress(iv)),
+        if (encrypt) 1 else 0
+    ) == i32(1)
+    var written = 0
+    if (ok && input.size > 0) {
+        ok = EVP_CipherUpdate(
+            context, output.address, length.address,
+            nativePointerFromAddress(nativeStringAddress(input)), input.size
+        ) == i32(1)
+        written = cryptoOutputLength(length)
+    }
+    val initialized = ok
+    if (ok) {
+        length.storeI64(0, 0)
+        ok = EVP_CipherFinal_ex(
+            context, output.pointerAt(written), length.address
+        ) == i32(1)
+        if (ok) written = written + cryptoOutputLength(length)
+    }
+    length.close()
+    EVP_CIPHER_CTX_free(context)
+    ERR_clear_error()
+    if (ok) return CryptoResult(output.adoptString(written), true, "")
+    OPENSSL_cleanse(output.address, capacity)
+    output.close()
+    cryptoFailed(
+        if (initialized && !encrypt) "bad padding"
+        else "OpenSSL refused the cipher operation"
+    )
+}
+
+// AES-ECB exists because protocols require it, and AT's WS-Security header is one:
+// equal blocks encrypt equally, so it leaks patterns and authenticates nothing. Use
+// aesGcmEncrypt for anything of your own.
+fun aesEcbEncryptPkcs5(key: string, plaintext: string): CryptoResult =
+    aesBlockCipher(true, aesModeEcb, key, "", plaintext)
+
+// See aesEcbEncryptPkcs5. "bad padding" is a distinct failure and takes a different
+// path, so never let a remote party see which failure happened.
+fun aesEcbDecryptPkcs5(key: string, ciphertext: string): CryptoResult =
+    aesBlockCipher(false, aesModeEcb, key, "", ciphertext)
+
+// AES-CBC, unauthenticated: anyone can alter what it decrypts to, and answering
+// differently on bad padding gives away the plaintext. Pair it with a MAC checked
+// first, or use aesGcmEncrypt. The IV has 16 bytes and must be unpredictable,
+// from secureRandomBytes, for each message.
+fun aesCbcEncryptPkcs7(key: string, iv: string, plaintext: string): CryptoResult =
+    if (iv.size != 16) cryptoFailed("an AES-CBC IV has 16 bytes")
+    else aesBlockCipher(true, aesModeCbc, key, iv, plaintext)
+
+fun aesCbcDecryptPkcs7(key: string, iv: string, ciphertext: string): CryptoResult =
+    if (iv.size != 16) cryptoFailed("an AES-CBC IV has 16 bytes")
+    else aesBlockCipher(false, aesModeCbc, key, iv, ciphertext)
+
+private val aesGcmTagBytes = 16
+private val aesGcmNonceBytes = 12
+private val aesGcmCommandGetTag = 16
+private val aesGcmCommandSetTag = 17
+
+private trusted fun aesGcm(
+    encrypt: bool, key: string, nonce: string, input: string, aad: string
+): CryptoResult {
+    val cipher = aesCipher(aesModeGcm, key.size)
+    if (pointerIsNull(cipher)) return cryptoFailed(aesWrongKey)
+    if (nonce.size != aesGcmNonceBytes) return cryptoFailed("an AES-GCM nonce here has 12 bytes")
+    if (input.size > cryptoMaximumBytes || aad.size > cryptoMaximumBytes) return cryptoFailed(aesTooLong)
+    if (!encrypt && input.size < aesGcmTagBytes) return cryptoFailed("the ciphertext is shorter than its tag")
+    val bodySize = if (encrypt) input.size else input.size - aesGcmTagBytes
+    val context = EVP_CIPHER_CTX_new()
+    if (pointerIsNull(context)) return cryptoFailed("OpenSSL could not allocate a cipher")
+    val capacity = bodySize + aesGcmTagBytes + 33
+    val output = nativeByteBuffer(capacity)
+    val length = nativeByteBuffer(8)
+    length.storeI64(0, 0)
+    var ok = EVP_CipherInit_ex(
+        context, cipher, nativeNullPointer(),
+        nativePointerFromAddress(nativeStringAddress(key)),
+        nativePointerFromAddress(nativeStringAddress(nonce)),
+        if (encrypt) 1 else 0
+    ) == i32(1)
+    if (ok && !encrypt) {
+        ok = EVP_CIPHER_CTX_ctrl(
+            context, aesGcmCommandSetTag, aesGcmTagBytes,
+            nativePointerFromAddress(nativeStringAddress(input) + bodySize)
+        ) == i32(1)
+    }
+    if (ok && aad.size > 0) {
+        ok = EVP_CipherUpdate(
+            context, nativeNullPointer(), length.address,
+            nativePointerFromAddress(nativeStringAddress(aad)), aad.size
+        ) == i32(1)
+    }
+    var written = 0
+    if (ok && bodySize > 0) {
+        ok = EVP_CipherUpdate(
+            context, output.address, length.address,
+            nativePointerFromAddress(nativeStringAddress(input)), bodySize
+        ) == i32(1)
+        written = cryptoOutputLength(length)
+    }
+    if (ok) {
+        length.storeI64(0, 0)
+        ok = EVP_CipherFinal_ex(
+            context, output.pointerAt(written), length.address
+        ) == i32(1)
+        if (ok) written = written + cryptoOutputLength(length)
+    }
+    if (ok && encrypt) {
+        ok = EVP_CIPHER_CTX_ctrl(
+            context, aesGcmCommandGetTag, aesGcmTagBytes, output.pointerAt(written)
+        ) == i32(1)
+        written = written + aesGcmTagBytes
+    }
+    length.close()
+    EVP_CIPHER_CTX_free(context)
+    ERR_clear_error()
+    if (ok) return CryptoResult(output.adoptString(written), true, "")
+    OPENSSL_cleanse(output.address, capacity)
+    output.close()
+    cryptoFailed(
+        if (encrypt) "OpenSSL refused the cipher operation"
+        else "authentication failed: the data, key, nonce or associated data is wrong"
+    )
+}
+
+// Authenticated encryption, the one to reach for. Returns the ciphertext followed by
+// its 16-byte tag. The nonce has 12 bytes and must never repeat under one key:
+// a repeat exposes the XOR of both plaintexts and allows forgeries. Random nonces
+// from secureRandomBytes are safe for up to about 2^32 messages per key.
+fun aesGcmEncrypt(key: string, nonce: string, plaintext: string, associatedData: string = ""): CryptoResult =
+    aesGcm(true, key, nonce, plaintext, associatedData)
+
+// Takes the ciphertext followed by its tag. Nothing is returned unless the tag verifies.
+fun aesGcmDecrypt(key: string, nonce: string, ciphertext: string, associatedData: string = ""): CryptoResult =
+    aesGcm(false, key, nonce, ciphertext, associatedData)
+
+// ---------------------------------------------------------------------------
+// RSA keys
+
+// A private key held by OpenSSL, freed when dropped. Check error first, or ok().
+resource class RsaPrivateKey(val handle: int, val bits: int, val error: string) {
+    trusted fun drop(): void {
+        if (this.handle != 0) EVP_PKEY_free(nativePointerFromAddress(this.handle))
+        return
+    }
+    fun ok(): bool = this.handle != 0
+}
+
+resource class RsaPublicKey(val handle: int, val bits: int, val error: string) {
+    trusted fun drop(): void {
+        if (this.handle != 0) EVP_PKEY_free(nativePointerFromAddress(this.handle))
+        return
+    }
+    fun ok(): bool = this.handle != 0
+}
+
+private fun rsaPrivateFailed(error: string): RsaPrivateKey = RsaPrivateKey(0, 0, error)
+private fun rsaPublicFailed(error: string): RsaPublicKey = RsaPublicKey(0, 0, error)
+
+// Takes ownership of key. Refuses what isn't RSA, and with `check`, a private key
+// whose numbers don't agree, which would otherwise sign wrongly or leak its factors.
+private trusted fun rsaInspect(key: i64*, check: bool): int {
+    val rsa = EVP_PKEY_get1_RSA(key)
+    if (pointerIsNull(rsa)) {
+        ERR_clear_error()
+        EVP_PKEY_free(key)
+        return -1
+    }
+    val bits = int(RSA_bits(rsa))
+    val consistent = !check || RSA_check_key(rsa) == i32(1)
+    RSA_free(rsa)
+    ERR_clear_error()
+    if (!consistent) {
+        EVP_PKEY_free(key)
+        return -2
+    }
+    bits
+}
+
+private trusted fun rsaPrivateFrom(key: i64*, unreadable: string): RsaPrivateKey {
+    if (pointerIsNull(key)) {
+        ERR_clear_error()
+        return rsaPrivateFailed(unreadable)
+    }
+    val bits = rsaInspect(key, true)
+    if (bits == -1) return rsaPrivateFailed("not an RSA key")
+    if (bits == -2) return rsaPrivateFailed("the RSA private key failed its consistency check")
+    RsaPrivateKey(nativePointerAddress(key), bits, "")
+}
+
+private trusted fun rsaPublicFrom(key: i64*, unreadable: string): RsaPublicKey {
+    if (pointerIsNull(key)) {
+        ERR_clear_error()
+        return rsaPublicFailed(unreadable)
+    }
+    val bits = rsaInspect(key, false)
+    if (bits == -1) return rsaPublicFailed("not an RSA key")
+    RsaPublicKey(nativePointerAddress(key), bits, "")
+}
+
+private trusted fun cryptoBioFor(text: string): i64* =
+    BIO_new_mem_buf(nativePointerFromAddress(nativeStringAddress(text)), text.size)
+
+// A PEM private key: PKCS#8 ("PRIVATE KEY", or "ENCRYPTED PRIVATE KEY" with the
+// passphrase) or PKCS#1 ("RSA PRIVATE KEY"). An encrypted key without its passphrase
+// fails; it never asks on the terminal.
+trusted fun rsaPrivateKeyFromPem(pem: string, passphrase: string = ""): RsaPrivateKey {
+    val unreadable = "not a readable RSA private key in PEM, or a wrong passphrase"
+    if (pem.size == 0 || pem.size > cryptoMaximumBytes || cryptoHasNul(passphrase)) {
+        return rsaPrivateFailed(unreadable)
+    }
+    val bio = cryptoBioFor(pem)
+    if (pointerIsNull(bio)) return rsaPrivateFailed(unreadable)
+    // With no callback, OpenSSL takes the last argument as the passphrase itself.
+    val key = PEM_read_bio_PrivateKey(
+        bio, nativeNullPointer(), nativeNullPointer(),
+        nativePointerFromAddress(nativeCStringAddress(passphrase))
+    )
+    BIO_free(bio)
+    rsaPrivateFrom(key, unreadable)
+}
+
+// A DER private key, unencrypted: PKCS#8 or PKCS#1. Nothing may follow it.
+trusted fun rsaPrivateKeyFromDer(der: string): RsaPrivateKey {
+    val unreadable = "not a readable unencrypted RSA private key in DER"
+    if (der.size == 0 || der.size > cryptoMaximumBytes) return rsaPrivateFailed(unreadable)
+    val start = nativeStringAddress(der)
+    val cursor = nativeByteBuffer(8)
+    cursor.storeI64(0, start)
+    val key = d2i_AutoPrivateKey(nativeNullPointer(), cursor.address, der.size)
+    val consumed = cursor.loadI64(0) - start
+    cursor.close()
+    if (!pointerIsNull(key) && consumed != der.size) {
+        EVP_PKEY_free(key)
+        return rsaPrivateFailed(unreadable)
+    }
+    rsaPrivateFrom(key, unreadable)
+}
+
+// The private key of a PKCS#12 (.pfx) container. abla/tls/hosted's
+// tlsClientIdentityFromPkcs12 takes the certificates too.
+trusted fun rsaPrivateKeyFromPkcs12(der: string, password: string): RsaPrivateKey {
+    val parts = cryptoPkcs12Open(der, password)
+    if (parts.certificate != 0) X509_free(nativePointerFromAddress(parts.certificate))
+    var index = 0
+    while (index < parts.chain.size) {
+        X509_free(nativePointerFromAddress(parts.chain[index]))
+        index = index + 1
+    }
+    if (parts.error != "") return rsaPrivateFailed(parts.error)
+    if (parts.key == 0) return rsaPrivateFailed("the PKCS#12 data holds no private key")
+    rsaPrivateFrom(nativePointerFromAddress(parts.key), "")
+}
+
+private trusted fun rsaPublicFromCertificate(certificate: i64*, unreadable: string): RsaPublicKey {
+    if (pointerIsNull(certificate)) {
+        ERR_clear_error()
+        return rsaPublicFailed(unreadable)
+    }
+    val key = X509_get_pubkey(certificate)
+    X509_free(certificate)
+    rsaPublicFrom(key, unreadable)
+}
+
+// The first block of a PEM: "PUBLIC KEY" (SubjectPublicKeyInfo), "RSA PUBLIC KEY"
+// (PKCS#1) or "CERTIFICATE". A certificate's key is taken as it stands: its chain,
+// dates and name aren't checked here.
+trusted fun rsaPublicKeyFromPem(pem: string): RsaPublicKey {
+    val unreadable = "not a readable RSA public key or certificate in PEM"
+    if (pem.size == 0 || pem.size > cryptoMaximumBytes) return rsaPublicFailed(unreadable)
+    val bio = cryptoBioFor(pem)
+    if (pointerIsNull(bio)) return rsaPublicFailed(unreadable)
+    val none = nativeNullPointer()
+    val publicAt = pem.indexOf("-----BEGIN PUBLIC KEY-----")
+    val pkcs1At = pem.indexOf("-----BEGIN RSA PUBLIC KEY-----")
+    val certificateAt = pem.indexOf("-----BEGIN CERTIFICATE-----")
+    var first = -1
+    if (publicAt >= 0) first = publicAt
+    if (pkcs1At >= 0 && (first < 0 || pkcs1At < first)) first = pkcs1At
+    if (certificateAt >= 0 && (first < 0 || certificateAt < first)) first = certificateAt
+    if (first < 0) {
+        BIO_free(bio)
+        return rsaPublicFailed(unreadable)
+    }
+    if (first == certificateAt) {
+        val certificate = PEM_read_bio_X509(bio, none, none, none)
+        BIO_free(bio)
+        return rsaPublicFromCertificate(certificate, unreadable)
+    }
+    if (first == publicAt) {
+        val key = PEM_read_bio_PUBKEY(bio, none, none, none)
+        BIO_free(bio)
+        return rsaPublicFrom(key, unreadable)
+    }
+    val rsa = PEM_read_bio_RSAPublicKey(bio, none, none, none)
+    BIO_free(bio)
+    if (pointerIsNull(rsa)) {
+        ERR_clear_error()
+        return rsaPublicFailed(unreadable)
+    }
+    val key = EVP_PKEY_new()
+    if (!pointerIsNull(key) && EVP_PKEY_set1_RSA(key, rsa) != i32(1)) {
+        EVP_PKEY_free(key)
+        RSA_free(rsa)
+        return rsaPublicFailed(unreadable)
+    }
+    RSA_free(rsa)
+    rsaPublicFrom(key, unreadable)
+}
+
+// A DER SubjectPublicKeyInfo. Nothing may follow it.
+trusted fun rsaPublicKeyFromDer(der: string): RsaPublicKey {
+    val unreadable = "not a readable RSA SubjectPublicKeyInfo in DER"
+    if (der.size == 0 || der.size > cryptoMaximumBytes) return rsaPublicFailed(unreadable)
+    val start = nativeStringAddress(der)
+    val cursor = nativeByteBuffer(8)
+    cursor.storeI64(0, start)
+    val key = d2i_PUBKEY(nativeNullPointer(), cursor.address, der.size)
+    val consumed = cursor.loadI64(0) - start
+    cursor.close()
+    if (!pointerIsNull(key) && consumed != der.size) {
+        EVP_PKEY_free(key)
+        return rsaPublicFailed(unreadable)
+    }
+    rsaPublicFrom(key, unreadable)
+}
+
+// The key of a DER X.509 certificate, with the same limits as rsaPublicKeyFromPem.
+trusted fun rsaPublicKeyFromCertificateDer(der: string): RsaPublicKey {
+    val unreadable = "not a readable X.509 certificate in DER"
+    if (der.size == 0 || der.size > cryptoMaximumBytes) return rsaPublicFailed(unreadable)
+    val start = nativeStringAddress(der)
+    val cursor = nativeByteBuffer(8)
+    cursor.storeI64(0, start)
+    val certificate = d2i_X509(nativeNullPointer(), cursor.address, der.size)
+    val consumed = cursor.loadI64(0) - start
+    cursor.close()
+    if (!pointerIsNull(certificate) && consumed != der.size) {
+        X509_free(certificate)
+        return rsaPublicFailed(unreadable)
+    }
+    rsaPublicFromCertificate(certificate, unreadable)
+}
+
+// ---------------------------------------------------------------------------
+// RSA signatures: RSASSA-PKCS1-v1_5, deterministic
+
+// Below this, only the functions with Legacy in their name work.
+private val rsaMinimumBits = 2048
+private val rsaLegacyMinimumBits = 1024
+
+private val rsaPaddingPkcs1 = 1
+private val rsaPaddingOaep = 4
+private val rsaControlPadding = 4097
+private val rsaControlMgf1Digest = 4101
+private val rsaControlOaepDigest = 4105
+
+// Says PKCS#1 v1.5 out loud on what EVP_DigestSignInit or EVP_DigestVerifyInit left in
+// the cell: an RSA-PSS key's own default would sign PSS under a PKCS#1 name, and this
+// makes it refuse instead.
+private trusted fun rsaRequirePkcs1(cell: NativeByteBuffer): bool =
+    EVP_PKEY_CTX_ctrl(
+        nativePointerFromAddress(cell.loadI64(0)), -1, -1,
+        rsaControlPadding, rsaPaddingPkcs1, nativeNullPointer()
+    ) == i32(1)
+
+private trusted fun rsaSign(handle: int, digest: i64*, message: string): CryptoResult {
+    if (message.size > cryptoMaximumBytes) return cryptoFailed("the message is too long")
+    val context = EVP_MD_CTX_new()
+    if (pointerIsNull(context)) return cryptoFailed("OpenSSL could not allocate a digest")
+    val capacity = 8193
+    val output = nativeByteBuffer(capacity)
+    val length = nativeByteBuffer(8)
+    length.storeI64(0, capacity - 1)
+    val key = nativePointerFromAddress(handle)
+    val none = nativeNullPointer()
+    val keyContext = nativeByteBuffer(8)
+    keyContext.storeI64(0, 0)
+    val signed = EVP_DigestSignInit(context, keyContext.address, digest, none, key) == i32(1) &&
+        rsaRequirePkcs1(keyContext) &&
+        EVP_DigestSign(
+            context, output.address, length.address,
+            nativePointerFromAddress(nativeStringAddress(message)), message.size
+        ) == i32(1)
+    val written = length.loadI64(0)
+    length.close()
+    keyContext.close()
+    EVP_MD_CTX_free(context)
+    ERR_clear_error()
+    if (signed) return CryptoResult(output.adoptString(written), true, "")
+    output.close()
+    cryptoFailed("OpenSSL refused to sign with this key and hash")
+}
+
+private trusted fun rsaVerify(handle: int, digest: i64*, message: string, signature: string): bool {
+    if (signature.size == 0 || message.size > cryptoMaximumBytes || signature.size > cryptoMaximumBytes) return false
+    val context = EVP_MD_CTX_new()
+    if (pointerIsNull(context)) return false
+    val none = nativeNullPointer()
+    val keyContext = nativeByteBuffer(8)
+    keyContext.storeI64(0, 0)
+    val verified = EVP_DigestVerifyInit(
+        context, keyContext.address, digest, none, nativePointerFromAddress(handle)
+    ) == i32(1) && rsaRequirePkcs1(keyContext) && EVP_DigestVerify(
+        context,
+        nativePointerFromAddress(nativeStringAddress(signature)), signature.size,
+        nativePointerFromAddress(nativeStringAddress(message)), message.size
+    ) == i32(1)
+    keyContext.close()
+    EVP_MD_CTX_free(context)
+    ERR_clear_error()
+    verified
+}
+
+// RSA PKCS#1 v1.5 with SHA-256 on a key of 2048 bits or more.
+trusted fun RsaPrivateKey.signPkcs1Sha256(message: string): CryptoResult {
+    if (this.handle == 0) return cryptoFailed(this.error)
+    if (this.bits < rsaMinimumBits) return cryptoFailed("the key has under 2048 bits")
+    rsaSign(this.handle, EVP_sha256(), message)
+}
+
+trusted fun RsaPublicKey.verifyPkcs1Sha256(message: string, signature: string): bool =
+    this.handle != 0 && this.bits >= rsaMinimumBits &&
+    rsaVerify(this.handle, EVP_sha256(), message, signature)
+
+// SHA-1 collisions are practical and 1024-bit RSA is within reach of a well-funded
+// attacker, so nothing new should use this. It exists for what mandates it, as
+// Portugal's Despacho 8632/2014 does for invoice signatures. Takes 1024 bits or more.
+trusted fun RsaPrivateKey.signPkcs1Sha1Legacy(message: string): CryptoResult {
+    if (this.handle == 0) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    rsaSign(this.handle, EVP_sha1(), message)
+}
+
+// See signPkcs1Sha1Legacy.
+trusted fun RsaPublicKey.verifyPkcs1Sha1Legacy(message: string, signature: string): bool =
+    this.handle != 0 && this.bits >= rsaLegacyMinimumBits &&
+    rsaVerify(this.handle, EVP_sha1(), message, signature)
+
+// ---------------------------------------------------------------------------
+// RSA encryption
+
+private trusted fun rsaCipher(
+    encrypt: bool, handle: int, padding: int, digest: i64*, input: string
+): CryptoResult {
+    if (input.size > 65536) return cryptoFailed("the input is longer than any RSA key takes")
+    val none = nativeNullPointer()
+    val context = EVP_PKEY_CTX_new(nativePointerFromAddress(handle), none)
+    if (pointerIsNull(context)) return cryptoFailed("OpenSSL could not allocate a key operation")
+    var ok = (if (encrypt) EVP_PKEY_encrypt_init(context) else EVP_PKEY_decrypt_init(context)) == i32(1)
+    if (ok) ok = EVP_PKEY_CTX_ctrl(context, -1, -1, rsaControlPadding, padding, none) == i32(1)
+    if (ok && padding == rsaPaddingOaep) {
+        ok = EVP_PKEY_CTX_ctrl(context, -1, -1, rsaControlOaepDigest, 0, digest) == i32(1) &&
+            EVP_PKEY_CTX_ctrl(context, -1, -1, rsaControlMgf1Digest, 0, digest) == i32(1)
+    }
+    val capacity = 8193
+    val output = nativeByteBuffer(capacity)
+    val length = nativeByteBuffer(8)
+    length.storeI64(0, capacity - 1)
+    if (ok) {
+        val source = nativePointerFromAddress(nativeStringAddress(input))
+        ok = (if (encrypt) EVP_PKEY_encrypt(context, output.address, length.address, source, input.size)
+        else EVP_PKEY_decrypt(context, output.address, length.address, source, input.size)) == i32(1)
+    }
+    val written = length.loadI64(0)
+    length.close()
+    EVP_PKEY_CTX_free(context)
+    ERR_clear_error()
+    if (ok) return CryptoResult(output.adoptString(written), true, "")
+    OPENSSL_cleanse(output.address, capacity)
+    output.close()
+    cryptoFailed(
+        if (encrypt) "OpenSSL refused: the input is probably too long for this key"
+        else "decryption failed"
+    )
+}
+
+// OAEP with SHA-256 for both hashes, on 2048 bits or more: what new designs use.
+trusted fun RsaPublicKey.encryptOaepSha256(plaintext: string): CryptoResult {
+    if (this.handle == 0) return cryptoFailed(this.error)
+    if (this.bits < rsaMinimumBits) return cryptoFailed("the key has under 2048 bits")
+    rsaCipher(true, this.handle, rsaPaddingOaep, EVP_sha256(), plaintext)
+}
+
+trusted fun RsaPrivateKey.decryptOaepSha256(ciphertext: string): CryptoResult {
+    if (this.handle == 0) return cryptoFailed(this.error)
+    if (this.bits < rsaMinimumBits) return cryptoFailed("the key has under 2048 bits")
+    rsaCipher(false, this.handle, rsaPaddingOaep, EVP_sha256(), ciphertext)
+}
+
+// OAEP with SHA-1 for both hashes, the default of Java's OAEPPadding and .NET's
+// fOAEP. SHA-1's collisions don't break OAEP; it's Legacy for what it talks to.
+trusted fun RsaPublicKey.encryptOaepSha1Legacy(plaintext: string): CryptoResult {
+    if (this.handle == 0) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    rsaCipher(true, this.handle, rsaPaddingOaep, EVP_sha1(), plaintext)
+}
+
+trusted fun RsaPrivateKey.decryptOaepSha1Legacy(ciphertext: string): CryptoResult {
+    if (this.handle == 0) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    rsaCipher(false, this.handle, rsaPaddingOaep, EVP_sha1(), ciphertext)
+}
+
+// RSAES-PKCS1-v1_5, which AT's clients use for the WS-Security Nonce. A party who can
+// tell whether decryption's padding was good can decrypt anything (Bleichenbacher),
+// so only use it where the protocol leaves no choice. Encryption is randomized.
+trusted fun RsaPublicKey.encryptPkcs1Legacy(plaintext: string): CryptoResult {
+    if (this.handle == 0) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    rsaCipher(true, this.handle, rsaPaddingPkcs1, nativeNullPointer(), plaintext)
+}
+
+// See encryptPkcs1Legacy. From OpenSSL 3.2 a bad padding isn't an error: it decrypts
+// to random-looking bytes of its own (implicit rejection), so ok says little and the
+// caller must check the plaintext's expected form and length. Before 3.2 it fails,
+// which is the oracle: never let a remote party see that difference.
+trusted fun RsaPrivateKey.decryptPkcs1Legacy(ciphertext: string): CryptoResult {
+    if (this.handle == 0) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    rsaCipher(false, this.handle, rsaPaddingPkcs1, nativeNullPointer(), ciphertext)
+}

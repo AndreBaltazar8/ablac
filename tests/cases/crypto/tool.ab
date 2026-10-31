@@ -1,0 +1,115 @@
+// A command line over abla/crypto and abla/crypto/hosted, for tools/test-crypto.sh to
+// compare with the openssl CLI: `tool <op> <arguments>`, with binary data in files and
+// keys in hexadecimal or PEM files. Prints the result in hexadecimal, or says "refused".
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/hosted"
+import "abla/http/tls"
+import "abla/http"
+import "abla/process/arguments"
+import "abla/random"
+import "abla/sys/linux"
+import "abla/tls/hosted"
+
+fun arg(index: int): string = processArgument(index)
+fun file(index: int): string = linuxReadFile(arg(index), 16777216)
+
+fun show(result: CryptoResult): int {
+    if (!result.ok) {
+        println("refused: ${result.error}")
+        return 3
+    }
+    println(hexEncode(result.bytes))
+    0
+}
+
+fun answer(ok: bool): int {
+    println(if (ok) "yes" else "no")
+    if (ok) 0 else 3
+}
+
+fun privateKey(index: int): RsaPrivateKey = rsaPrivateKeyFromPem(file(index))
+fun publicKey(index: int): RsaPublicKey = rsaPublicKeyFromPem(file(index))
+
+fun mtlsExchange(var connection: TlsConnection): int {
+    if (connection.handle < 0) {
+        println("connect failed: ${tlsLastError()}")
+        return 3
+    }
+    connection.write("GET / HTTP/1.0\r\n\r\n")
+    val reply = connection.read(65536)
+    connection.close()
+    if (reply.size == 0) {
+        println("no reply: ${tlsLastError()}")
+        return 3
+    }
+    println(reply.slice(0, if (reply.size < 15) reply.size else 15))
+    0
+}
+
+fun main: int {
+    val op = arg(0)
+    when (op) {
+        "sha1" -> { println(hexEncode(sha1(file(1)))); 0 }
+        "sha256" -> { println(hexEncode(sha256(file(1)))); 0 }
+        "sha384" -> { println(hexEncode(sha384(file(1)))); 0 }
+        "sha512" -> { println(hexEncode(sha512(file(1)))); 0 }
+        "hmac-sha1" -> { println(hexEncode(hmacSha1(hexDecode(arg(1)), file(2)))); 0 }
+        "hmac-sha256" -> { println(hexEncode(hmacSha256(hexDecode(arg(1)), file(2)))); 0 }
+        "hmac-sha384" -> { println(hexEncode(hmacSha384(hexDecode(arg(1)), file(2)))); 0 }
+        "hmac-sha512" -> { println(hexEncode(hmacSha512(hexDecode(arg(1)), file(2)))); 0 }
+        "ecb-encrypt" -> show(aesEcbEncryptPkcs5(hexDecode(arg(1)), file(2)))
+        "ecb-decrypt" -> show(aesEcbDecryptPkcs5(hexDecode(arg(1)), file(2)))
+        "cbc-encrypt" -> show(aesCbcEncryptPkcs7(hexDecode(arg(1)), hexDecode(arg(2)), file(3)))
+        "cbc-decrypt" -> show(aesCbcDecryptPkcs7(hexDecode(arg(1)), hexDecode(arg(2)), file(3)))
+        "sign-sha1" -> { val key = privateKey(1); show(key.signPkcs1Sha1Legacy(file(2))) }
+        "sign-sha256" -> { val key = privateKey(1); show(key.signPkcs1Sha256(file(2))) }
+        "verify-sha1" -> { val key = publicKey(1); answer(key.verifyPkcs1Sha1Legacy(file(2), file(3))) }
+        "verify-sha256" -> { val key = publicKey(1); answer(key.verifyPkcs1Sha256(file(2), file(3))) }
+        "encrypt-pkcs1" -> { val key = publicKey(1); show(key.encryptPkcs1Legacy(file(2))) }
+        "encrypt-oaep-sha1" -> { val key = publicKey(1); show(key.encryptOaepSha1Legacy(file(2))) }
+        "encrypt-oaep-sha256" -> { val key = publicKey(1); show(key.encryptOaepSha256(file(2))) }
+        "decrypt-pkcs1" -> { val key = privateKey(1); show(key.decryptPkcs1Legacy(file(2))) }
+        "decrypt-oaep-sha1" -> { val key = privateKey(1); show(key.decryptOaepSha1Legacy(file(2))) }
+        "decrypt-oaep-sha256" -> { val key = privateKey(1); show(key.decryptOaepSha256(file(2))) }
+        // tool mtls-pem <port> <ca> <certificate.pem> <key.pem> [passphrase]
+        "mtls-pem" -> {
+            val identity = tlsClientIdentityFromPem(file(3), file(4), if (processArgumentCount() > 5) arg(5) else "")
+            if (!identity.ok()) { println("identity: ${identity.error}"); return 3 }
+            mtlsExchange(tlsConnectWithIdentity("localhost", identity, arg(2), linuxParsePort(arg(1))))
+        }
+        // tool mtls-p12 <port> <ca> <file.p12> <password>
+        "mtls-p12" -> {
+            val identity = tlsClientIdentityFromPkcs12(file(3), arg(4))
+            if (!identity.ok()) { println("identity: ${identity.error}"); return 3 }
+            mtlsExchange(tlsConnectWithIdentity("localhost", identity, arg(2), linuxParsePort(arg(1))))
+        }
+        // tool mtls-none <port> <ca>: no certificate presented.
+        "mtls-none" -> mtlsExchange(tlsConnectWithCa("localhost", arg(2), linuxParsePort(arg(1))))
+        // tool https-pem <port> <ca> <certificate.pem> <key.pem>
+        "https-pem" -> {
+            val client = httpsClientWithIdentityPem(
+                "localhost", file(3), file(4), caPath = arg(2), port = linuxParsePort(arg(1))
+            )
+            val response = client.send(httpGet("/"))
+            println("${response.succeeded} ${response.response.status}")
+            if (response.succeeded) 0 else 3
+        }
+        // tool https-p12 <port> <ca> <file.p12> <password>
+        "https-p12" -> {
+            val client = httpsClientWithIdentityPkcs12(
+                "localhost", file(3), arg(4), caPath = arg(2), port = linuxParsePort(arg(1))
+            )
+            val response = client.send(httpGet("/"))
+            println("${response.succeeded} ${response.response.status}")
+            if (response.succeeded) 0 else 3
+        }
+        else -> { println("unknown operation"); 2 }
+    }
+}
+
+fun linuxParsePort(text: string): int {
+    var port = 0
+    for (c in text) port = port * 10 + (c - 48)
+    port
+}

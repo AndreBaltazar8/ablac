@@ -502,6 +502,8 @@ that watches `descriptors()` in its own poller stops watching one when
 `done(id)` says so, before taking it. `HttpAsyncClient` drives its resolver
 that way, from its one poller.
 
+`abla/http/tls`'s `httpsClientWithIdentityPem(host, certificatePem, keyPem, passphrase = "", caPath = "", port = 443, ...)` and `httpsClientWithIdentityPkcs12(host, der, password, caPath = "", port = 443, ...)` are `httpsClient` with mutual TLS. They keep the identity's bytes in the client and open them for each connection.
+
 `abla/tls/hosted` dynamically loads OpenSSL 1.1 or 3 only when imported. Client
 connections enable peer verification, system trust, SNI, and hostname checks.
 An explicit CA-file connector and certificate/private-key listener support
@@ -516,6 +518,8 @@ line. Hosted secure random is supplied by
 |---|---|
 | `tlsConnect(host, port = 443, timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | a verified `TlsConnection`, with `read`, `write` and `close` |
 | `tlsConnectWithCa(host, caPath, port, timeout, readWriteTimeout)` | the same, trusting the given CA file |
+| `tlsClientIdentityFromPem(certificatePem, keyPem, passphrase = "")`, `tlsClientIdentityFromPkcs12(der, password)` | a `TlsClientIdentity` for mutual TLS: a client certificate, any intermediates and its private key, checked against each other. `identity.ok()` and `identity.error` say how it went |
+| `tlsConnectWithIdentity(host, identity, caPath = "", port = 443, timeout, readWriteTimeout)` | as `tlsConnect`, presenting the identity, and trusting the CA file if given. Under TLS 1.3 a server's refusal of the certificate shows on the first read, since the handshake has already finished for the client |
 | `tlsUpgrade(var connection, host, caPath = "", timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | start TLS on an existing TCP connection; a socket that already has timeouts keeps them |
 | `connection.setTimeouts(readMilliseconds, writeMilliseconds)` | replace the limits on an open connection (also on a `TcpConnection`); 0 waits as long as it takes |
 | `tlsListen(certificatePath, privateKeyPath, host = "::", port = 443, ...)` | a `TlsListener`, with `accept(handshakeTimeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` |

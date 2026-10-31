@@ -1,0 +1,71 @@
+// Opens a PKCS#12 (.pfx) container: what abla/crypto/hosted's private key and
+// abla/tls/hosted's client identity both read.
+
+import "libcrypto.ab"
+import "../../jwt/libcrypto.ab"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+// Addresses of OpenSSL objects the caller now owns; 0 for what is absent.
+class CryptoPkcs12Parts(
+    val key: int,
+    val certificate: int,
+    val chain: array<int>,
+    val error: string
+)
+
+trusted fun cryptoHasNul(value: string): bool {
+    var index = 0
+    while (index < value.size) {
+        if (value[index] == 0) return true
+        index = index + 1
+    }
+    false
+}
+
+trusted fun cryptoPkcs12Open(der: string, password: string): CryptoPkcs12Parts {
+    val chain: array<int> = []
+    val refused = "could not open the PKCS#12 data: a wrong password, damaged data, or a cipher OpenSSL 3 only has in its legacy provider (RC2, as `openssl pkcs12 -export` of OpenSSL 1.x writes)"
+    if (der.size == 0 || cryptoHasNul(password)) {
+        return CryptoPkcs12Parts(0, 0, chain, refused)
+    }
+    val cursor = nativeByteBuffer(8)
+    cursor.storeI64(0, nativeStringAddress(der))
+    val container = d2i_PKCS12(nativeNullPointer(), cursor.address, der.size)
+    cursor.close()
+    if (pointerIsNull(container)) {
+        ERR_clear_error()
+        return CryptoPkcs12Parts(0, 0, chain, refused)
+    }
+    val parts = nativeByteBuffer(24)
+    parts.storeI64(0, 0)
+    parts.storeI64(8, 0)
+    parts.storeI64(16, 0)
+    val opened = PKCS12_parse(
+        container,
+        nativePointerFromAddress(nativeCStringAddress(password)),
+        parts.pointerAt(0), parts.pointerAt(8), parts.pointerAt(16)
+    ) == i32(1)
+    PKCS12_free(container)
+    val key = parts.loadI64(0)
+    val certificate = parts.loadI64(8)
+    val stack = parts.loadI64(16)
+    parts.close()
+    if (stack != 0) {
+        val pointer = nativePointerFromAddress(stack)
+        val count = int(OPENSSL_sk_num(pointer))
+        var index = 0
+        while (index < count) {
+            val certificateInChain = OPENSSL_sk_value(pointer, index)
+            if (opened) chain.append(nativePointerAddress(certificateInChain))
+            else X509_free(certificateInChain)
+            index = index + 1
+        }
+        OPENSSL_sk_free(pointer)
+    }
+    ERR_clear_error()
+    if (opened) return CryptoPkcs12Parts(key, certificate, chain, "")
+    if (key != 0) EVP_PKEY_free(nativePointerFromAddress(key))
+    if (certificate != 0) X509_free(nativePointerFromAddress(certificate))
+    CryptoPkcs12Parts(0, 0, [], refused)
+}

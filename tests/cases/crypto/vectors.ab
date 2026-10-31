@@ -1,0 +1,207 @@
+// NIST CAVP and Wycheproof vectors (tests/vectors/crypto) through abla/crypto and
+// abla/crypto/hosted. Prints a count per file; exit 1 on any failure.
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/hosted"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+
+var failures = 0
+
+fun fail(file: string, number: int, why: string): void {
+    failures = failures + 1
+    if (failures < 40) println("FAIL $file line $number: $why")
+    return
+}
+
+fun hex(field: string): string = if (field == "-") "" else hexDecode(field)
+
+fun records(path: string): array<string> =
+    linuxReadFile(path, 16777216).split("\n")
+
+fun checkHashes(directory: string): int {
+    var count = 0
+    var number = 0
+    for (line in records("$directory/sha.txt")) {
+        number = number + 1
+        if (line == "") continue
+        val f = line.split(" ")
+        val message = hex(f[1])
+        val got = when (f[0]) {
+            "sha1" -> sha1(message)
+            "sha256" -> sha256(message)
+            "sha384" -> sha384(message)
+            else -> sha512(message)
+        }
+        if (hexEncode(got) != f[2]) fail("sha", number, f[0])
+        count = count + 1
+    }
+    count
+}
+
+fun checkHmacs(directory: string): int {
+    var count = 0
+    var number = 0
+    for (line in records("$directory/hmac.txt")) {
+        number = number + 1
+        if (line == "") continue
+        val f = line.split(" ")
+        val key = hex(f[2])
+        val message = hex(f[3])
+        val got = hexEncode(when (f[1]) {
+            "sha1" -> hmacSha1(key, message)
+            "sha256" -> hmacSha256(key, message)
+            "sha384" -> hmacSha384(key, message)
+            else -> hmacSha512(key, message)
+        })
+        // A vector's tag may be truncated. An invalid one must not match, truncated or not.
+        val expected = if (f[4] == "-") "" else f[4]
+        val matches = got.slice(0, expected.size) == expected
+        if (matches != (f[5] != "invalid")) fail("hmac", number, f[1])
+        count = count + 1
+    }
+    count
+}
+
+// The CAVP cases have no padding, so a whole-block plaintext encrypts to the vector's
+// ciphertext followed by one more block, the padding's. To decrypt without a raw
+// mode, that block is made with ECB: E(0x10 x 16) for ECB, and for CBC E(0x10 x 16
+// XOR the last ciphertext block).
+fun checkBlock(directory: string): int {
+    var count = 0
+    var number = 0
+    val padding = "\x10".repeat(16)
+    for (line in records("$directory/aes-block.txt")) {
+        number = number + 1
+        if (line == "") continue
+        val f = line.split(" ")
+        if (f[0] == "cbc-pkcs7") {
+            val key = hex(f[1])
+            val iv = hex(f[2])
+            val message = hex(f[3])
+            val ciphertext = hex(f[4])
+            val decrypted = aesCbcDecryptPkcs7(key, iv, ciphertext)
+            if (f[5] == "valid") {
+                val encrypted = aesCbcEncryptPkcs7(key, iv, message)
+                if (!encrypted.ok || encrypted.bytes != ciphertext) fail("aes-block", number, "cbc-pkcs7 encrypt")
+                if (!decrypted.ok || decrypted.bytes != message) fail("aes-block", number, "cbc-pkcs7 decrypt")
+            } else if (decrypted.ok) fail("aes-block", number, "cbc-pkcs7 accepted an invalid one")
+        } else {
+            val key = hex(f[2])
+            val iv = hex(f[3])
+            val plaintext = hex(f[4])
+            val ciphertext = hex(f[5])
+            if (f[0] == "ecb") {
+                val encrypted = aesEcbEncryptPkcs5(key, plaintext)
+                val last = aesEcbEncryptPkcs5(key, padding).bytes.slice(0, 16)
+                if (!encrypted.ok || encrypted.bytes != ciphertext + last) fail("aes-block", number, "ecb encrypt")
+                val decrypted = aesEcbDecryptPkcs5(key, ciphertext + last)
+                if (!decrypted.ok || decrypted.bytes != plaintext) fail("aes-block", number, "ecb decrypt")
+            } else {
+                val encrypted = aesCbcEncryptPkcs7(key, iv, plaintext)
+                if (!encrypted.ok || encrypted.bytes.slice(0, ciphertext.size) != ciphertext) fail("aes-block", number, "cbc encrypt")
+                val tail = ciphertext.slice(ciphertext.size - 16, ciphertext.size)
+                val last = aesEcbEncryptPkcs5(key, binaryXor(padding, tail)).bytes.slice(0, 16)
+                val decrypted = aesCbcDecryptPkcs7(key, iv, ciphertext + last)
+                if (!decrypted.ok || decrypted.bytes != plaintext) fail("aes-block", number, "cbc decrypt")
+            }
+        }
+        count = count + 1
+    }
+    count
+}
+
+fun checkGcm(directory: string): int {
+    var count = 0
+    var number = 0
+    for (line in records("$directory/aes-gcm.txt")) {
+        number = number + 1
+        if (line == "") continue
+        val f = line.split(" ")
+        val key = hex(f[1])
+        val nonce = hex(f[2])
+        val plaintext = hex(f[3])
+        val aad = hex(f[4])
+        val sealed = hex(f[5]) + hex(f[6])
+        val opened = aesGcmDecrypt(key, nonce, sealed, aad)
+        if (f[7] == "valid") {
+            val encrypted = aesGcmEncrypt(key, nonce, plaintext, aad)
+            if (!encrypted.ok || encrypted.bytes != sealed) fail("aes-gcm", number, "encrypt")
+            if (!opened.ok || opened.bytes != plaintext) fail("aes-gcm", number, "decrypt")
+        } else if (opened.ok || opened.bytes != "") fail("aes-gcm", number, "accepted an invalid one")
+        count = count + 1
+    }
+    count
+}
+
+fun checkSignatures(directory: string): int {
+    var count = 0
+    var number = 0
+    var privateDer = ""
+    var publicDer = ""
+    for (line in records("$directory/rsa.txt")) {
+        number = number + 1
+        if (line == "") continue
+        val f = line.split(" ")
+        if (f[0] == "key") {
+            privateDer = hex(f[1])
+            publicDer = hex(f[2])
+        } else if (f[0] == "public") {
+            publicDer = hex(f[1])
+        } else if (f[0] == "private") {
+            privateDer = hex(f[1])
+        } else if (f[0] == "sign-sha1" || f[0] == "sign-sha256") {
+            val key = rsaPrivateKeyFromDer(privateDer)
+            val publicKey = rsaPublicKeyFromDer(publicDer)
+            val message = hex(f[1])
+            val signature = hex(f[2])
+            val legacy = f[0] == "sign-sha1"
+            val made = if (legacy) key.signPkcs1Sha1Legacy(message) else key.signPkcs1Sha256(message)
+            if (!made.ok || made.bytes != signature) fail("rsa", number, "${f[0]} ${made.error}")
+            val verified = if (legacy) publicKey.verifyPkcs1Sha1Legacy(message, signature)
+                else publicKey.verifyPkcs1Sha256(message, signature)
+            if (!verified) fail("rsa", number, "${f[0]} verify")
+            count = count + 1
+        } else if (f[0] == "verify-sha256") {
+            val publicKey = rsaPublicKeyFromDer(publicDer)
+            if (!publicKey.ok()) fail("rsa", number, publicKey.error)
+            val verified = publicKey.verifyPkcs1Sha256(hex(f[1]), hex(f[2]))
+            if (f[3] == "valid" && !verified) fail("rsa", number, "refused a valid signature")
+            if (f[3] == "invalid" && verified) fail("rsa", number, "accepted an invalid signature")
+            count = count + 1
+        } else {
+            val key = rsaPrivateKeyFromDer(privateDer)
+            if (!key.ok()) fail("rsa", number, key.error)
+            val message = hex(f[1])
+            val ciphertext = hex(f[2])
+            val got = when (f[0]) {
+                "decrypt-pkcs1" -> key.decryptPkcs1Legacy(ciphertext)
+                "decrypt-oaep-sha256" -> key.decryptOaepSha256(ciphertext)
+                else -> key.decryptOaepSha1Legacy(ciphertext)
+            }
+            if (f[3] == "valid") {
+                if (!got.ok || got.bytes != message) fail("rsa", number, "${f[0]} valid: ${got.error}")
+            } else if (f[3] == "invalid") {
+                // PKCS#1 v1.5 from OpenSSL 3.2 returns unrelated bytes for bad padding;
+                // what matters is that it's never the vector's plaintext.
+                if (f[0] == "decrypt-pkcs1") {
+                    if (got.ok && f[1] != "-" && got.bytes == message) fail("rsa", number, "decrypt-pkcs1 accepted an invalid one")
+                } else if (got.ok) fail("rsa", number, "${f[0]} accepted an invalid one")
+            }
+            count = count + 1
+        }
+    }
+    count
+}
+
+fun main: int {
+    val directory = processArgument(0)
+    println("sha ${checkHashes(directory)}")
+    println("hmac ${checkHmacs(directory)}")
+    println("aes-block ${checkBlock(directory)}")
+    println("aes-gcm ${checkGcm(directory)}")
+    println("rsa ${checkSignatures(directory)}")
+    println("failures $failures")
+    if (failures == 0) 0 else 1
+}
