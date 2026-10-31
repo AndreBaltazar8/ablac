@@ -70,6 +70,20 @@ for case in "${native_cases[@]}"; do
     fi
 done
 
+# Each link stays on one thread: a thread per CPU, with the launcher's stack each,
+# runs a many-core machine out of the 4 GiB address space ("Resource temporarily
+# unavailable"), and how many start depends on the machine's load.
+linkers="$output_directory/linkers"
+mkdir -p "$linkers"
+real_wasm_ld=$(command -v wasm-ld)
+cat > "$linkers/wasm-ld" <<EOF
+#!/usr/bin/env bash
+[[ " \$* " == *" --threads=1 "* ]] || { echo "wasm-ld without --threads=1: \$*" >> "$linkers/unbounded"; }
+exec "$real_wasm_ld" "\$@"
+EOF
+chmod +x "$linkers/wasm-ld"
+export PATH="$linkers:$PATH"
+
 # WebAssembly: the modules land in build/codegen-units/wasm, kept aside per build.
 wasm_build() { # $1 = one or units, $2 = where to keep the modules
     rm -rf "$output_directory/wasm"
@@ -97,4 +111,5 @@ for module in unwinding plain; do
 done
 [[ $("$wasm_runner" tests/cases/stm/run.mjs "$output_directory/wasm-units/unwinding.wasm") == 0 ]] ||
     fail "unwinding.wasm in units: checks failed"
+[[ ! -e $linkers/unbounded ]] || fail "$(cat "$linkers/unbounded")"
 echo "codegen units: ${native_cases[*]:+native and }WebAssembly (exception handling too) as one unit and as eight: same results, symbols and interface; reproducible"
