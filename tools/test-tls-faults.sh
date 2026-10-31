@@ -22,7 +22,7 @@ status=0
 for stage in mask \
     https-reset-read https-reset-write https-stall-read https-stall-write \
     http-reset-read http-reset-write http-stall-read http-stall-write \
-    http-kept http-long-timeout \
+    http-kept http-long-timeout read-long-timeout \
     async-reset-write async-stall async-retry; do
     SSL_CERT_FILE="$output_directory/certificate.pem" timeout 40 \
         "$output_directory/faults" "$output_directory/certificate.pem" "$output_directory/key.pem" "$stage" \
@@ -53,6 +53,18 @@ if [[ $rc -ne 0 ]]; then
     status=1
 else
     echo "ok   timeouts"
+fi
+"$compiler" build tests/cases/tls-faults/deadlines.ab -o "$output_directory/deadlines" --fast --no-cache || exit 2
+SSL_CERT_FILE="$output_directory/certificate.pem" timeout 30 \
+    "$output_directory/deadlines" "$output_directory/certificate.pem" "$output_directory/key.pem" \
+    > "$output_directory/deadlines.log" 2>&1
+rc=$?
+if [[ $rc -ne 0 ]]; then
+    echo "FAIL deadlines: exit $rc"
+    sed 's/^/     /' "$output_directory/deadlines.log"
+    status=1
+else
+    echo "ok   deadlines"
 fi
 [[ $status -eq 0 ]] && echo 'TLS faults: passed'
 exit "$status"

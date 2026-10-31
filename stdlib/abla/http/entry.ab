@@ -2,6 +2,7 @@
 // this module does not pull in JSON, files, TLS, the compiler, or hot reload.
 
 import "abla/net"
+import "abla/sys/linux/process"
 import "abla/text"
 
 class HttpHeader(val name: string, val value: string)
@@ -684,13 +685,29 @@ fun httpClient(
     timeoutMilliseconds
 )
 
+// When an exchange of at most `deadlineMilliseconds` must end (0: never).
+fun httpExchangeDeadline(deadlineMilliseconds: int): int =
+    if (deadlineMilliseconds > 0) linuxMonotonicMilliseconds() + deadlineMilliseconds else 0
+
+// How long the next read or write of an exchange may wait: `timeoutMilliseconds`,
+// or what is left before `deadline` when that's shorter, and 0 when none is left.
+fun httpExchangeWait(deadline: int, timeoutMilliseconds: int): int {
+    if (deadline == 0) return timeoutMilliseconds
+    val left = deadline - linuxMonotonicMilliseconds()
+    if (left <= 0) 0
+    else if (timeoutMilliseconds > 0 && timeoutMilliseconds < left) timeoutMilliseconds
+    else left
+}
+
 private fun httpExchangeIpv4(
     address: string,
     port: int,
     request: string,
     maximumResponseBytes: int,
-    timeoutMilliseconds: int
+    timeoutMilliseconds: int,
+    deadlineMilliseconds: int
 ): HttpTransportResult {
+    val deadline = httpExchangeDeadline(deadlineMilliseconds)
     // The connector takes at most ten seconds; a longer timeout is still valid
     // for the exchange. It bounds each read and write, which the socket enforces.
     val connection = tcpConnectIpv4(
@@ -701,17 +718,31 @@ private fun httpExchangeIpv4(
     if (succeeded) succeeded = connection.setTimeouts(
         timeoutMilliseconds, timeoutMilliseconds
     )
-    if (succeeded) succeeded = connection.write(request) == request.size
+    var written = 0
+    while (succeeded && written < request.size) {
+        val wait = httpExchangeWait(deadline, timeoutMilliseconds)
+        succeeded = wait > 0 && (deadline == 0 || connection.setTimeouts(wait, wait))
+        if (succeeded) {
+            val end = if (request.size - written < 65536) request.size else written + 65536
+            succeeded = connection.write(request.slice(written, end)) == end - written
+            written = end
+        }
+    }
     var response = ""
     var reading = succeeded
     while (reading && response.size < maximumResponseBytes) {
         val remaining = maximumResponseBytes - response.size
         val readMaximum = if (remaining < 65536) remaining else 65536
-        val chunk = connection.read(readMaximum)
-        if (chunk.size > 0) response = "$response$chunk"
-        if (chunk.size == 0) reading = false
-        // A peer that keeps the connection open has finished at its own framing.
-        if (httpParseResponse(response).complete) reading = false
+        val wait = httpExchangeWait(deadline, timeoutMilliseconds)
+        succeeded = wait > 0 && (deadline == 0 || connection.setTimeouts(wait, wait))
+        reading = succeeded
+        if (reading) {
+            val chunk = connection.read(readMaximum)
+            if (chunk.size > 0) response = "$response$chunk"
+            if (chunk.size == 0) reading = false
+            // A peer that keeps the connection open has finished at its own framing.
+            if (httpParseResponse(response).complete) reading = false
+        }
     }
     if (connection.descriptor >= 0) connection.close()
     HttpTransportResult(response, succeeded)
@@ -722,11 +753,14 @@ fun httpIpv4Client(
     address: string,
     port: int,
     maximumResponseBytes: int = 1048576,
-    timeoutMilliseconds: int = 5000
+    timeoutMilliseconds: int = 5000,
+    // A limit on the whole exchange (0: none). The timeout bounds each read and
+    // write, so a peer sending a byte at a time can otherwise hold the caller.
+    deadlineMilliseconds: int = 0
 ): HttpClient = httpClient(
     authority,
     { request: string, maximum: int, timeout: int ->
-        httpExchangeIpv4(address, port, request, maximum, timeout)
+        httpExchangeIpv4(address, port, request, maximum, timeout, deadlineMilliseconds)
     },
     maximumResponseBytes,
     timeoutMilliseconds

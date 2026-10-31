@@ -8,23 +8,39 @@ private fun httpExchangeTls(
     port: int,
     request: string,
     maximumResponseBytes: int,
-    timeoutMilliseconds: int
+    timeoutMilliseconds: int,
+    deadlineMilliseconds: int
 ): HttpTransportResult {
+    val deadline = httpExchangeDeadline(deadlineMilliseconds)
     // The client's one timeout also bounds each read and write of the exchange.
     val connection = tlsConnect(
         host, port, timeoutMilliseconds, timeoutMilliseconds
     )
     var succeeded = connection.handle >= 0
-    if (succeeded) succeeded = connection.write(request) == request.size
+    var written = 0
+    while (succeeded && written < request.size) {
+        val wait = httpExchangeWait(deadline, timeoutMilliseconds)
+        succeeded = wait > 0 && (deadline == 0 || connection.setTimeouts(wait, wait))
+        if (succeeded) {
+            val end = if (request.size - written < 65536) request.size else written + 65536
+            succeeded = connection.write(request.slice(written, end)) == end - written
+            written = end
+        }
+    }
     var response = ""
     var reading = succeeded
     while (reading && response.size < maximumResponseBytes) {
         val remaining = maximumResponseBytes - response.size
         val readMaximum = if (remaining < 65536) remaining else 65536
-        val chunk = connection.read(readMaximum)
-        if (chunk.size > 0) response = "$response$chunk"
-        if (chunk.size == 0) reading = false
-        if (httpParseResponse(response).complete) reading = false
+        val wait = httpExchangeWait(deadline, timeoutMilliseconds)
+        succeeded = wait > 0 && (deadline == 0 || connection.setTimeouts(wait, wait))
+        reading = succeeded
+        if (reading) {
+            val chunk = connection.read(readMaximum)
+            if (chunk.size > 0) response = "$response$chunk"
+            if (chunk.size == 0) reading = false
+            if (httpParseResponse(response).complete) reading = false
+        }
     }
     connection.close()
     HttpTransportResult(response, succeeded)
@@ -34,11 +50,13 @@ fun httpsClient(
     host: string,
     port: int = 443,
     maximumResponseBytes: int = 1048576,
-    timeoutMilliseconds: int = 5000
+    timeoutMilliseconds: int = 5000,
+    // A limit on the whole exchange (0: none); see httpIpv4Client.
+    deadlineMilliseconds: int = 0
 ): HttpClient = httpClient(
     if (port == 443) host else "$host:$port",
     { request: string, maximum: int, timeout: int ->
-        httpExchangeTls(host, port, request, maximum, timeout)
+        httpExchangeTls(host, port, request, maximum, timeout, deadlineMilliseconds)
     },
     maximumResponseBytes,
     timeoutMilliseconds

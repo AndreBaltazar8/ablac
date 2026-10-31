@@ -123,7 +123,7 @@ fun main {
 | `httpGet(path)`, `httpPost(path, body)`, `httpRequest(method, path, body, headers)` | build a request |
 | `httpParseRequest(text)`, `httpParseResponse(text)`, `response.render()` | parse and render the wire format |
 | `serveHttp(router, port)`, `serveHttpOnce`, `serveHttpOnListener` | serve over TCP |
-| `httpIpv4Client(...)`, `httpsClient(host, port, maxBytes, timeout)` (from `abla/http/tls`), `client.send(request)` | send requests |
+| `httpIpv4Client(authority, address, port, maxBytes, timeout, deadline)`, `httpsClient(host, port, maxBytes, timeout, deadline)` (from `abla/http/tls`), `client.send(request)` | send requests; `timeout` bounds each read and write, the optional `deadline` the whole exchange, in milliseconds |
 
 ### Portable sockets: `abla/net/hosted`
 
@@ -335,8 +335,8 @@ configuration that failed to load has a non-empty `error`, and a server given
 it closes its listener (`localPort()` is -1) rather than serve plaintext.
 
 OpenSSL writes with `write(2)`, which raises `SIGPIPE` when the peer has reset
-the socket. A TLS server's `step` and `flush` block `SIGPIPE` in the thread
-running them (the signal mask is per thread), so such a write fails with
+the socket. A TLS server holds `SIGPIPE` around each OpenSSL call and releases
+it after, leaving the thread's mask as it was, so such a write fails with
 `EPIPE` and only that connection closes, whichever thread drives the server.
 On macOS, sockets carry `SO_NOSIGPIPE` already. A program that
 builds with `--emit object` and links the object itself must put
