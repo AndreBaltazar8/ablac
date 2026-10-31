@@ -2701,6 +2701,14 @@ and capabilities stay out of the client. A contract's fingerprint excludes
 function bodies: changing a signature, annotation, default or data shape
 changes it, and a body-only edit does not.
 
+A program can import a module normally and as a contract, as a web server that
+also runs its client code does. The implementation is in the program, and code
+importing the module normally calls it directly. Code importing it as a contract
+still makes contract calls, consumed as in a client build: `backend.remoteIncrement`
+there is the contract function, not the implementation, and the data shapes are the
+module's own classes. A module one contract's shapes need is also the real one if
+the program has its implementation.
+
 ### Console programs
 
 Portable console programs import `abla/io`; each target supplies the

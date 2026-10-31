@@ -1144,11 +1144,14 @@ class BootstrapModuleAlias(
 // What a graph's import edges say about each module, looked up instead of
 // scanning every edge per module: the modules imported under an alias
 // somewhere (their names carry the module prefix) or only for their contract,
-// each importer's edges in order (`firstEdge`, then `nextEdge`), and the place
-// of each module in the snapshots.
+// the modules imported as a contract by code of a program that also has their
+// implementations (bootstrapContractTwin), each importer's edges in order
+// (`firstEdge`, then `nextEdge`), and the place of each module in the snapshots.
 class BootstrapAliasSummary(
     val aliasedTargets: Map<string, int>,
     val contractTargets: Map<string, int>,
+    val fullModules: Map<string, int>,
+    val twinnedTargets: Map<string, int>,
     val importers: Map<string, int>,
     val firstEdge: array<int>,
     val lastEdge: array<int>,
@@ -1162,6 +1165,11 @@ class BootstrapAliasSummary(
     fun isContractTarget(target: string): bool =
         this.contractTargets.get(target) != null
 
+    /** Whether `edge`'s functions mean the target's contract twin. */
+    fun isTwinEdge(edge: BootstrapModuleAlias): bool =
+        edge.contractOnly && this.fullModules.has(edge.importer) &&
+            this.fullModules.has(edge.target)
+
     /** The first of `importer`'s edges, or -1; nextEdge gives the next. */
     fun firstEdgeOf(importer: string): int {
         val slot = this.importers.get(importer)
@@ -1171,14 +1179,21 @@ class BootstrapAliasSummary(
 
 fun bootstrapAliasSummary(
     aliases: array<BootstrapModuleAlias>,
-    snapshots: array<BootstrapModuleSnapshot>
+    snapshots: array<BootstrapModuleSnapshot>,
+    fullModules: Map<string, int>
 ): BootstrapAliasSummary {
-    val summary = BootstrapAliasSummary(Map(), Map(), Map(), [], [], [], Map())
+    val summary = BootstrapAliasSummary(Map(), Map(), fullModules, Map(), Map(), [], [], [], Map())
     var index = 0
     while (index < aliases.size) {
         val alias = aliases[index]
         if (alias.alias != "") summary.aliasedTargets.set(alias.target, 1)
-        if (alias.contractOnly) summary.contractTargets.set(alias.target, 1)
+        if (alias.contractOnly && !fullModules.has(alias.target)) {
+            summary.contractTargets.set(alias.target, 1)
+        }
+        if (summary.isTwinEdge(alias)) {
+            summary.twinnedTargets.set(alias.target, 1)
+            summary.contractTargets.set(bootstrapContractTwinPath(alias.target), 1)
+        }
         var slot = summary.firstEdge.size
         val known = summary.importers.get(alias.importer)
         if (known != null) {
@@ -1203,7 +1218,8 @@ fun bootstrapAliasSummary(
 
 fun bootstrapContractDeclaration(
     declaration: BootstrapDeclaration,
-    moduleIdentity: string
+    moduleIdentity: string,
+    name: string = declaration.name
 ): BootstrapDeclaration {
     val annotations: array<string> = []
     var annotation = 0
@@ -1217,7 +1233,7 @@ fun bootstrapContractDeclaration(
     } else declaration.externalLibrary
     BootstrapDeclaration(
         kind,
-        declaration.name,
+        name,
         declaration.begin,
         declaration.end,
         BootstrapExpression(
@@ -1273,6 +1289,44 @@ fun bootstrapProjectContract(
         [],
         [],
         parsed.diagnostics
+    )
+}
+
+// A program that has a module's implementations can also import it as a
+// contract: a web server running its own client code does. The importer's
+// calls must stay contract calls, as they are in a client build, so the
+// functions also exist as a twin, a pseudo-module of contract functions next to
+// the real one. Classes aren't twinned: both sides mean the same types.
+fun bootstrapContractTwinPath(modulePath: string): string = "$modulePath#contract"
+
+fun bootstrapIsTwinFunction(declaration: BootstrapDeclaration): bool =
+    declaration.kind == "fun" && declaration.extensionOwner == "" &&
+        !declaration.isPrivate && declaration.name != ""
+
+/** Declares `snapshot`'s functions (as prepared: their types use final names). */
+fun bootstrapContractTwinSnapshot(
+    snapshot: BootstrapModuleSnapshot
+): BootstrapModuleSnapshot {
+    val path = bootstrapContractTwinPath(snapshot.path)
+    val prefix = bootstrapModuleCanonicalPrefix(path)
+    val declarations: array<BootstrapDeclaration> = []
+    for (declaration in snapshot.discovery.declarations) {
+        if (bootstrapIsTwinFunction(declaration)) {
+            declarations.append(bootstrapContractDeclaration(
+                declaration, snapshot.path,
+                "$prefix${bootstrapCanonicalDeclarationSourceName(declaration.name)}"
+            ))
+        }
+    }
+    val discovery = BootstrapParseResult(
+        declarations, [], 0, 0, [], [], ""
+    )
+    val identity = bootstrapModuleInterfaceIdentity(discovery, 0, 0)
+    BootstrapModuleSnapshot(
+        path, "", [], 0, true, 0, 0,
+        bootstrapModuleFingerprint(identity, 17, 257, 1000000007),
+        bootstrapModuleFingerprint(identity, 97, 263, 1000000009),
+        discovery
     )
 }
 
@@ -1712,6 +1766,19 @@ fun bootstrapRewriteModuleSource(
             summary.targetPrefix(edge.target)
         } else ""
         val target = summary.snapshotIndex.get(edge.target)
+        // (Before the module's own names: the first match is taken.)
+        if (edge.importer == snapshot.path && edge.alias == "" &&
+            target != null && summary.isTwinEdge(edge)) {
+            val twinPrefix = bootstrapModuleCanonicalPrefix(
+                bootstrapContractTwinPath(edge.target)
+            )
+            for (declaration in snapshots[target].discovery.declarations) {
+                if (bootstrapIsTwinFunction(declaration)) {
+                    names.append(declaration.name)
+                    replacements.append("$twinPrefix${declaration.name}")
+                }
+            }
+        }
         if (targetPrefix != "" && target != null) {
             bootstrapAppendPrefixedNames(
                 snapshots[target].discovery, targetPrefix,
@@ -1738,12 +1805,20 @@ fun bootstrapRewriteModuleSource(
     } else []
     val localAliases: array<string> = []
     val aliasPrefixes: array<string> = []
+    // The target whose functions are the alias's twin's, or -1.
+    val aliasTwins: array<int> = []
+    val aliasEdges: array<int> = []
     var aliasIndex = summary.firstEdgeOf(snapshot.path)
     while (aliasIndex >= 0) {
         val edge = aliases[aliasIndex]
         if (edge.importer == snapshot.path && edge.alias != "") {
             localAliases.append(edge.alias)
             aliasPrefixes.append(bootstrapModuleCanonicalPrefix(edge.target))
+            aliasEdges.append(aliasIndex)
+            val target = summary.snapshotIndex.get(edge.target)
+            aliasTwins.append(
+                if (target != null && summary.isTwinEdge(edge)) target else -1
+            )
         }
         aliasIndex = summary.nextEdge[aliasIndex]
     }
@@ -1786,9 +1861,19 @@ fun bootstrapRewriteModuleSource(
                 val member = tokens[tokenIndex + 2]
                 output = "$output${snapshot.source.slice(cursor, token.begin)}"
                 rewrittenBegins.append(output.size)
-                output = "$output${aliasPrefixes[qualified]}${bootstrapTokenText(
-                    snapshot.source, member
-                )}"
+                val memberName = bootstrapTokenText(snapshot.source, member)
+                var memberPrefix = aliasPrefixes[qualified]
+                if (aliasTwins[qualified] >= 0) {
+                    for (declaration in snapshots[aliasTwins[qualified]].discovery.declarations) {
+                        if (declaration.name == memberName &&
+                            bootstrapIsTwinFunction(declaration)) {
+                            memberPrefix = bootstrapModuleCanonicalPrefix(
+                                bootstrapContractTwinPath(aliases[aliasEdges[qualified]].target)
+                            )
+                        }
+                    }
+                }
+                output = "$output$memberPrefix$memberName"
                 rewrittenEnds.append(output.size)
                 originalBegins.append(token.begin)
                 originalEnds.append(member.end)
@@ -2110,7 +2195,7 @@ fun bootstrapValidateStrictImports(
         if (found) anyStrict = true
     }
     if (!anyStrict && !report) return BootstrapImportAliasValidation(0, "")
-    val strictSummary = bootstrapAliasSummary(aliases, snapshots)
+    val strictSummary = bootstrapAliasSummary(aliases, snapshots, Map())
     // Every module's names, as plain references could reach them: not an
     // extension member, private, nor of a module whose names carry its
     // prefix (imported under an alias somewhere).
@@ -2646,11 +2731,15 @@ class BootstrapModuleGraphIndex(
     var remapRoot: string,
     var remapEntries: array<BootstrapImportRemapEntry>,
     val manifestOfDirectory: Map<string, string>,
-    val remapReported: Map<string, int>
+    val remapReported: Map<string, int>,
+    // The modules loaded with their implementations (the rest, only their
+    // contract), and those of them loaded for their contract first.
+    val fullModules: Map<string, int>,
+    val upgradedModules: Map<string, int>
 )
 
 fun bootstrapModuleGraphIndex(): BootstrapModuleGraphIndex =
-    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map())
+    BootstrapModuleGraphIndex(Map(), [], [], [], Map(), Map(), 0, "", [], Map(), Map(), Map(), Map())
 
 class BootstrapModuleGraph(
     val modules: array<BootstrapModule>,
@@ -2683,6 +2772,16 @@ class BootstrapModuleGraph(
         var ownEdge = this.index.firstAlias[slot]
         while (ownEdge >= 0) {
             val found = this.aliases[ownEdge]
+            // A module loaded for its contract before its implementations
+            // recorded this edge then: the edge now is the implementation's.
+            if (found.target == target && found.contractOnly &&
+                this.index.upgradedModules.has(importer.path)) {
+                this.aliases[ownEdge] = BootstrapModuleAlias(
+                    importer.path, target, edge.alias, edge.contractOnly,
+                    edge.begin, edge.end, edge.exported, edge.source
+                )
+                return
+            }
             if (edge.alias != "" && found.alias == edge.alias) duplicateAlias = true
             if (found.target == target) duplicateTarget = true
             ownEdge = this.index.aliasNext[ownEdge]
@@ -2962,6 +3061,24 @@ class BootstrapModuleGraph(
         }
     }
 
+    /** A module loaded for its contract now loads in full, at its new place. */
+    fun dropContractLoad(identity: string): void {
+        this.index.upgradedModules.set(identity, 1)
+        var index = 0
+        while (index < this.orderedSnapshots.size) {
+            if (this.orderedSnapshots[index].path == identity) {
+                while (index + 1 < this.orderedSnapshots.size) {
+                    this.orderedSnapshots[index] = this.orderedSnapshots[index + 1]
+                    index = index + 1
+                }
+                this.orderedSnapshots.truncate(index)
+                return
+            }
+            index = index + 1
+        }
+        return
+    }
+
     fun load(modulePath: string): string {
         val identity = bootstrapNormalizeModulePath(modulePath)
         if (this.index.remapRoot == "" &&
@@ -2982,14 +3099,17 @@ class BootstrapModuleGraph(
             }
         }
         var output = ""
-        if (!this.contains(identity)) {
+        val known = this.contains(identity)
+        if (!known || !this.index.fullModules.has(identity)) {
+            this.index.fullModules.set(identity, 1)
+            if (known) this.dropContractLoad(identity)
             this.checkModuleManifest(identity)
             val snapshot = this.state.acquire(identity)
             bootstrapFrontendTraceMemory("graph.acquire:$identity")
             this.errors = this.errors + snapshot.importErrors
             this.diagnostics =
                 "${this.diagnostics}${bootstrapScanImports(snapshot.source).diagnostics}"
-            this.modules.append(BootstrapModule(identity, snapshot.source))
+            if (!known) this.modules.append(BootstrapModule(identity, snapshot.source))
             var index = 0
             while (index < snapshot.importEdges.size) {
                 val edge = snapshot.importEdges[index]
@@ -3096,20 +3216,24 @@ class BootstrapModuleGraph(
         val importedRegistrations: array<BootstrapSubparserRegistration> = []
         val preparedSnapshots: array<BootstrapModuleSnapshot> = []
         val aliasSummary = bootstrapAliasSummary(
-            this.aliases, this.orderedSnapshots
+            this.aliases, this.orderedSnapshots, this.index.fullModules
         )
         val shadows = bootstrapModuleShadows(
             this.aliases, this.orderedSnapshots, aliasSummary
         )
         var preparedIndex = 0
         while (preparedIndex < this.orderedSnapshots.size) {
-            preparedSnapshots.append(bootstrapPrepareModuleSnapshot(
+            val prepared = bootstrapPrepareModuleSnapshot(
                 this.orderedSnapshots[preparedIndex],
                 this.aliases,
                 this.orderedSnapshots,
                 shadows,
                 aliasSummary
-            ))
+            )
+            preparedSnapshots.append(prepared)
+            if (aliasSummary.twinnedTargets.has(prepared.path)) {
+                preparedSnapshots.append(bootstrapContractTwinSnapshot(prepared))
+            }
             preparedIndex = preparedIndex + 1
         }
         bootstrapFrontendTraceMemory(
