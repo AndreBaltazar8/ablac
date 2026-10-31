@@ -2761,6 +2761,9 @@ Exports:
   export returns a status and contains panics.
 - Naked-assembly exports with several names share one definition. Other
   exports get one adapter per name.
+- A program entered only through its exports never runs `main`, which is what
+  publishes a program's globals to the collector. The first export that reaches
+  a reference global does it instead, whether the initializer is constant or not.
 
 ## Trusted native implementations
 
