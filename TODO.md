@@ -32,13 +32,36 @@
       PEM key given by `webSocketServerTlsPem` asks for a passphrase on the terminal instead of
       failing. Found reading it 2026-10-31, not run. `abla/crypto/hosted` passes a passphrase string.
 
-- [ ] `tools/test-tls-faults.sh`, stage `mask`, takes 16 s on an idle machine, and passes its 40 s
-      limit only there: with 48 busy loops it hit the limit 6 of 6 times, the same with and without
-      the crypto branch (2026-10-31; `https` POST of 32 MiB to a resetting peer, twice). It failed 2
-      of 3 `make test` runs at JOBS=30 before going to the serial list in `tools/run-tests.sh`. Why a
-      refused 32 MiB write takes that long isn't known.
 - [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
       out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
+
+## Tools (found porting NovaKind's scripts, 2026-10-31)
+
+- [ ] A program can't handle a signal: no `sigaction`, so nothing can clean up on Ctrl-C or TERM. A tool that edits a file
+      for a moment and must put it back stays a shell script for its `trap` (NovaKind's `scripts/android-test-apk.sh`).
+- [ ] No pipeline: a `Command`'s standard output can go to a file or to this program, not to another command, so
+      `git archive | tar` goes through a temporary file. `capture` doesn't take standard error either (only `errors(file)`).
+- [ ] A builder can't be chained on a named value: with `val run = command("x")`, `run.environment("A", "1").environment("B", "2")`
+      is `ownership.borrow-exclusive:Command.environment`, though the same chain straight off `command("x")` compiles. Any method
+      returning `this` has this, and a function taking one needs `var run: Command`. Each call has to be its own statement.
+- [ ] Missing and written by hand in every tool: parsing an int from text (`abla-postgres` `pgInt`, `abla-s3` `s3ParseInt`,
+      `oneParseInt`, NovaKind's `toolInteger`), `array<string>.join`, `array.removeLast`, a UUID, multi-line string literals (`"""`
+      doesn't parse), `Path.home`, a `createDirectories` with a mode (`Path.writeText` is always 0666 less umask).
+- [ ] `sha256Stream` hashes 4.4 MB/s built `--fast` (32 MiB in 7.7 s, 2026-10-31), one byte at a time through `array<int>`; the
+      `sha256` it sits beside has the same loop. NovaKind's server keeps OpenSSL's EVP for that reason (`server/sha256_stream.ab`).
+      A program that avoids linking OpenSSL has nothing faster. Worth doing over a native buffer.
+- [ ] A program that links OpenSSL won't start without `LD_LIBRARY_PATH` from the nix shell (`libssl.so.3 => not found`), even if
+      it never makes a TLS connection: `abla-s3` always pulls it in, also with `S3_USE_TLS=false`. And that `LD_LIBRARY_PATH` breaks the
+      host's coreutils for what it starts (`env`, `pwd`: `GLIBC_ABI_DT_X86_64_PLT`). NovaKind needs two programs because of it. A
+      lazy load of libssl, or an rpath at build, would remove both.
+- [ ] `abla/crypto/hosted` can use an RSA key but not generate one, so a throwaway test key still calls `openssl genrsa`.
+- [ ] There is no YAML library: NovaKind's `provision-mail` edits `~/.config/icy/mail.yaml` by its lines and refuses anything else
+      under `accounts:`.
+- [ ] `abla-s3` has no list-objects, create-bucket or head-bucket; a tool goes through `bucketRequest` and `sendOnce`, and parses the XML.
+- [ ] `ablac package vendor --project .` wrote an untracked `vendor/` as well as `.abla/packages`, in a project whose build reads only
+      the second. Noticed in `git status` after running it.
+- [ ] `sha256Stream`, `Command.environment` and the rest went in with `tools/test-linux-process.sh`, but the compiler's fixed point
+      wasn't run on that commit, though the compiler uses `LinuxCommand`: its constructor gained defaulted fields.
 
 ## Compiler and stdlib
 
@@ -82,6 +105,12 @@
 
 ## Toolchain and project
 
+- [ ] **`make test` under 2 minutes, and its tooling in Abla.** 165 s at JOBS=30 (2026-10-31, about
+  3,700 CPU-seconds, half of them in the compiler's own frontend across thousands of builds, so
+  30 cores give 125 s at best: more needs less work per build, not more parallelism). What's left:
+  `test-self-hosted.sh` runs alone (about 35 s) because it reruns suite scripts in their build
+  directories. `tools/` is still 283 shell scripts; `tools/abla-test-driver` already runs
+  `tests/abla-tests.json`, and `tools/run-tests.sh` and the scripts should move onto it.
 - [ ] **Nothing runs the tests on a push.** `.github/workflows/release.yml` is the only workflow,
   and it starts by hand. Run `make test` and the fixed point on pushes to master.
 - [ ] **No formatter and no language server.** `ablac` has `analyze` and the analysis service to
