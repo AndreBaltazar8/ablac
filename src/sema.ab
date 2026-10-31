@@ -3623,7 +3623,9 @@ class BootstrapCompileEffectSummary(
     val nameSlots: array<int>,
     val nameNext: array<int>,
     val methodSlots: array<int>,
-    val methodNext: array<int>
+    val methodNext: array<int>,
+    // For a `#` expression's receivers (bootstrapEffectGlobalType).
+    val typeMap: BootstrapEffectTypeMap = BootstrapEffectTypeMap([], [], [], [])
 )
 
 fun bootstrapCompileEffectHas(mask: int, effect: int): bool =
@@ -3976,6 +3978,13 @@ fun bootstrapBuildEffectTypeMap(
                 method = method + 1
             }
         }
+        if (bootstrapDeclarationIsValue(declaration.kind) &&
+            declaration.extensionOwner == "") {
+            bootstrapEffectTypeMapPut(
+                map, "global:${declaration.name}",
+                bootstrapEffectNormalizeType(declaration.resultType)
+            )
+        }
         if (declaration.kind == "fun" || declaration.kind == "compile.fun" ||
             declaration.kind == "extern") {
             val result = bootstrapEffectNormalizeType(declaration.resultType)
@@ -3989,6 +3998,22 @@ fun bootstrapBuildEffectTypeMap(
         index = index + 1
     }
     map
+}
+
+// The declared type of the global a bare receiver names, unless a member of the
+// enclosing class or something in scope there takes the name first.
+fun bootstrapEffectGlobalType(
+    expression: BootstrapExpression,
+    map: BootstrapEffectTypeMap,
+    names: array<string>,
+    owner: string,
+    bound: BootstrapEffectScope
+): string {
+    if (expression.kind != "identifier" || expression.text == "this" ||
+        bound.names.get(expression.text) != null ||
+        bootstrapAffineNamesContain(names, expression.text) ||
+        bootstrapEffectTypeMapGet(map, "field:$owner.${expression.text}") != "") return ""
+    bootstrapEffectTypeMapGet(map, "global:${expression.text}")
 }
 
 fun bootstrapEffectUsableType(type: string): bool =
@@ -4203,9 +4228,14 @@ fun bootstrapDelegatedCompileEffectsIn(
         ))
     }
     if (expression.kind == "member.call") {
-        val receiver = if (expression.children.size > 0) bootstrapEffectExpressionType(
+        var receiver = if (expression.children.size > 0) bootstrapEffectExpressionType(
             expression.children[0], typeMap, scopeNames, scopeTypes, owner
         ) else ""
+        if (receiver == "" && expression.children.size > 0) {
+            receiver = bootstrapEffectGlobalType(
+                expression.children[0], typeMap, scopeNames, owner, bound
+            )
+        }
         if (bootstrapEffectPreciseType(typeMap, receiver)) {
             mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectMerge(
                 bootstrapCompileBuiltinEffect(expression.text),
@@ -4404,6 +4434,7 @@ fun bootstrapBuildCompileEffectSummary(
         methodNext.append(methodNextEntry)
         effectEntry = effectEntry + 1
     }
+    val typeMap = bootstrapBuildEffectTypeMap(declarations)
     val summary = BootstrapCompileEffectSummary(
         names,
         methodNames,
@@ -4411,7 +4442,8 @@ fun bootstrapBuildCompileEffectSummary(
         nameSlots,
         nameNext,
         methodSlots,
-        methodNext
+        methodNext,
+        typeMap
     )
     val globalDelegatedNames: array<string> = []
     declarationIndex = 0
@@ -4424,7 +4456,6 @@ fun bootstrapBuildCompileEffectSummary(
         declarationIndex = declarationIndex + 1
     }
     // Receiver-typing scopes, one per summary entry (same order as `masks`).
-    val typeMap = bootstrapBuildEffectTypeMap(declarations)
     val entryScopeNames: array<array<string>> = []
     val entryScopeTypes: array<array<string>> = []
     val entryOwners: array<string> = []
@@ -7255,7 +7286,8 @@ class BootstrapAnalyzer(
         bootstrapCompileContainEffects(bootstrapExpressionDelegatedCompileEffects(
             expression,
             this.compileEffects,
-            delegatedNames
+            delegatedNames,
+            this.compileEffects.typeMap
         ), 0)
     }
 
@@ -10488,7 +10520,7 @@ class BootstrapAnalyzer(
                        expression,
                        0,
                        true
-                   ) && !this.managedReferenceIsStatic(expression)) {
+                   ) && !this.managedResultLasts(expression)) {
             var source = this.managedReturnParameterSource(expression)
             if (source == "") source = "nonfresh"
             this.fail(
@@ -10661,6 +10693,19 @@ class BootstrapAnalyzer(
                 (thenNever || this.managedReferenceIsStatic(expression.children[1])) &&
                 (elseNever || this.managedReferenceIsStatic(expression.children[2]))
         }
+        if (expression.kind == "when") {
+            var anyArm = false
+            var branch = 2
+            while (branch < expression.children.size) {
+                val arm = expression.children[branch]
+                if (!this.expressionIsNever(arm)) {
+                    if (!this.managedReferenceIsStatic(arm)) return false
+                    anyArm = true
+                }
+                branch = branch + 2
+            }
+            return anyArm
+        }
         // An entry of a global Map is as lasting as an element of a global array.
         if (this.isMapGet(expression)) {
             return this.managedReferenceIsStatic(expression.children[0])
@@ -10682,6 +10727,37 @@ class BootstrapAnalyzer(
         else if (this.hasVisibleLocal(root)) {
             this.visibleBorrowSource(root) == "managed.static"
         } else this.namesGlobal(bootstrapPlaceRoot(expression))
+    }
+
+    fun expressionIsNever(expression: BootstrapExpression): bool =
+        this.ownershipExpressionType(expression) == "never"
+
+    // Whether a returned reference needs no contract: each branch gives a new
+    // value or one rooted in a global, in any mix.
+    fun managedResultLasts(expression: BootstrapExpression): bool {
+        if (expression.kind == "if" && expression.children.size > 2 &&
+            expression.children[2].kind != "missing") {
+            val thenNever = this.ifThenNever(expression)
+            val elseNever = this.ifElseNever(expression)
+            return !(thenNever && elseNever) &&
+                (thenNever || this.managedResultLasts(expression.children[1])) &&
+                (elseNever || this.managedResultLasts(expression.children[2]))
+        }
+        if (expression.kind == "when") {
+            var anyArm = false
+            var branch = 2
+            while (branch < expression.children.size) {
+                val arm = expression.children[branch]
+                if (!this.expressionIsNever(arm)) {
+                    if (!this.managedResultLasts(arm)) return false
+                    anyArm = true
+                }
+                branch = branch + 2
+            }
+            return anyArm
+        }
+        this.expressionProducesFreshManagedReference(expression, 0, true) ||
+            this.managedReferenceIsStatic(expression)
     }
 
     // A block's value read, through its own `val` locals, from a global.
@@ -13403,7 +13479,9 @@ fun bootstrapInferIndex(
     val rawReceiver = analyzer.infer(expression.children[0])
     val receiver = bootstrapBorrowElementType(rawReceiver)
     val index = analyzer.infer(expression.children[1])
-    if (index != "i64") analyzer.fail("index.type")
+    if (index != "i64" && analyzer.scalarTypeUnderlying(index) != "i64") {
+        analyzer.fail("index.type")
+    }
     if (receiver == "string") result = "i64"
     else if (bootstrapIsArrayType(receiver)) {
         result = bootstrapArrayElementType(receiver)
@@ -13452,7 +13530,9 @@ fun bootstrapInferIndexAssign(
     if (bootstrapIsBorrowType(value)) {
         analyzer.fail("ownership.borrow-store:index.assign")
     }
-    if (index != "i64") analyzer.fail("index.assign-index")
+    if (index != "i64" && analyzer.scalarTypeUnderlying(index) != "i64") {
+        analyzer.fail("index.assign-index")
+    }
     if (!bootstrapIsArrayType(receiver) ||
         !bootstrapTypesCompatible(
             bootstrapArrayElementType(receiver),

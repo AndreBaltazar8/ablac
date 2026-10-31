@@ -722,7 +722,7 @@ fun main {
 - `UserId(41)` converts an `int` to a `UserId`. An `int` is not accepted
   where a `UserId` is required (`function.argument:...:UserId:i64`).
 - The other direction is implicit: a `UserId` is accepted where an `int` is,
-  as an argument, a typed local, a result, an operand or in a string
+  as an argument, a typed local, a result, an operand, an index or in a string
   template. Arithmetic produces the underlying type, so wrapping the result is
   explicit.
 - Inside an extension of a nominal type, `this` is the underlying value.
@@ -816,7 +816,9 @@ fun main {
   constructors, methods and extension functions. Each argument (and a method
   call's receiver, first) is evaluated once, in source order. A method's
   default reads the receiver's fields (an extension's through `this`), never
-  a caller's variable of the same name. A named method call is resolved before types are known: every class
+  a caller's variable of the same name. A named call by plain name in a method
+  or extension function goes to the receiver's method when one has those
+  parameters, as `this.name(...)` would. A named method call is resolved before types are known: every class
   method and extension of that name with those parameter names must take the
   same parameters (and fill an omitted one the same way), otherwise it is
   `E_NAMED_ARGUMENT_TARGET` and the arguments go by position. Unknown, duplicate, out-of-order or
@@ -2570,7 +2572,10 @@ fun main {
   other, by a [remap](packages.md#import-remaps) in the root `abla.toml`,
   which gives every module of the build the same one.
 - An alias belongs to the importing module only, and it is a compile-time
-  namespace, not a value (`E_IMPORT_ALIAS_USED_AS_VALUE`). Importing a
+  namespace, not a value (`E_IMPORT_ALIAS_USED_AS_VALUE`). It reaches the
+  module's own declarations and those its `export import`s pass on; two passed
+  on under one name are `E_IMPORT_ALIAS_MEMBER_AMBIGUOUS` unless the module
+  declares the name itself. Importing a
   module doesn't expose the aliases *it* uses. Other alias errors:
   `E_IMPORT_ALIAS_DUPLICATE` (one alias bound twice),
   `E_IMPORT_ALIAS_TARGET_DUPLICATE` (one module imported twice),

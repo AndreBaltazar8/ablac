@@ -1177,6 +1177,52 @@ class BootstrapAliasSummary(
     }
 }
 
+/** `target` and every module its `export import`s pass on, nearest first. */
+fun bootstrapAliasReachedModules(
+    target: string,
+    aliases: array<BootstrapModuleAlias>
+): array<string> {
+    val reached = [target]
+    var next = 0
+    while (next < reached.size) {
+        val from = reached[next]
+        for (edge in aliases) {
+            if (edge.exported && edge.alias == "" && edge.importer == from &&
+                !bootstrapAffineNamesContain(reached, edge.target)) {
+                reached.append(edge.target)
+            }
+        }
+        next = next + 1
+    }
+    reached
+}
+
+/** The modules an alias of `target` finds `member` in: `target` alone when it
+ *  declares it (as a module's own declaration shadows), else each module its
+ *  `export import`s pass on that does. */
+fun bootstrapAliasMemberModules(
+    target: string,
+    member: string,
+    aliases: array<BootstrapModuleAlias>,
+    snapshots: array<BootstrapModuleSnapshot>
+): array<string> {
+    val found: array<string> = []
+    for (module in bootstrapAliasReachedModules(target, aliases)) {
+        val snapshot = bootstrapSnapshotIndex(snapshots, module)
+        if (snapshot >= 0) {
+            var declares = false
+            for (declaration in snapshots[snapshot].discovery.declarations) {
+                if (declaration.name == member && !declaration.isPrivate) declares = true
+            }
+            if (declares) {
+                if (module == target) return [target]
+                found.append(module)
+            }
+        }
+    }
+    found
+}
+
 fun bootstrapAliasSummary(
     aliases: array<BootstrapModuleAlias>,
     snapshots: array<BootstrapModuleSnapshot>,
@@ -1186,7 +1232,13 @@ fun bootstrapAliasSummary(
     var index = 0
     while (index < aliases.size) {
         val alias = aliases[index]
-        if (alias.alias != "") summary.aliasedTargets.set(alias.target, 1)
+        if (alias.alias != "") {
+            // What an alias reaches through the module's `export import`s
+            // carries its prefix too.
+            for (target in bootstrapAliasReachedModules(alias.target, aliases)) {
+                summary.aliasedTargets.set(target, 1)
+            }
+        }
         if (alias.contractOnly && !fullModules.has(alias.target)) {
             summary.contractTargets.set(alias.target, 1)
         }
@@ -1863,6 +1915,12 @@ fun bootstrapRewriteModuleSource(
                 rewrittenBegins.append(output.size)
                 val memberName = bootstrapTokenText(snapshot.source, member)
                 var memberPrefix = aliasPrefixes[qualified]
+                val declaring = bootstrapAliasMemberModules(
+                    aliases[aliasEdges[qualified]].target, memberName, aliases, snapshots
+                )
+                if (declaring.size > 0) {
+                    memberPrefix = bootstrapModuleCanonicalPrefix(declaring[0])
+                }
                 if (aliasTwins[qualified] >= 0) {
                     for (declaration in snapshots[aliasTwins[qualified]].discovery.declarations) {
                         if (declaration.name == memberName &&
@@ -2670,17 +2728,14 @@ fun bootstrapValidateImportAliases(
                             importer.source,
                             tokens[tokenIndex + 2]
                         )
-                        var exposed = false
-                        var declaration = 0
-                        while (declaration <
-                            target.discovery.declarations.size) {
-                            if (target.discovery.declarations[
-                                declaration
-                            ].name == member &&
-                                !target.discovery.declarations[
-                                    declaration
-                                ].isPrivate) exposed = true
-                            declaration = declaration + 1
+                        val declaring = bootstrapAliasMemberModules(
+                            edge.target, member, aliases, state.snapshots
+                        )
+                        val exposed = declaring.size > 0
+                        if (declaring.size > 1) {
+                            errors = errors + 1
+                            edgeDiagnostics[named] =
+                                "${edgeDiagnostics[named]}error[E_IMPORT_ALIAS_MEMBER_AMBIGUOUS]: module alias `${edge.alias}` reaches `$member` in both ${declaring[0]} and ${declaring[1]}\n"
                         }
                         if (!exposed && bootstrapModuleDeclaresOnlyPrivately(
                             target.discovery, member

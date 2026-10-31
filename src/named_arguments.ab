@@ -103,7 +103,10 @@ class BootstrapNamedArgumentNormalizer(
     var errors: int,
     var diagnostics: string,
     // The module of the declaration being normalized, for source records.
-    var sourceIdentity: string = ""
+    var sourceIdentity: string = "",
+    // The class or type whose members the body being normalized reaches by
+    // plain name ("" outside a method or extension function).
+    var receiver: string = ""
 ) {
     fun fail(code: string, message: string, expression: BootstrapExpression) {
         this.errors = this.errors + 1
@@ -119,14 +122,16 @@ class BootstrapNamedArgumentNormalizer(
     // parameter for every named argument in `children` (a member call's).
     fun methodTargets(
         name: string,
-        children: array<BootstrapExpression>
+        children: array<BootstrapExpression>,
+        // Only this type's methods ("" any type's).
+        owner: string = ""
     ): BootstrapNamedMethodTargets {
         val owners: array<int> = []
         val methods: array<int> = []
         var index = 0
         while (index < this.declarations.size) {
             val declaration = this.declarations[index]
-            if (declaration.kind == "class") {
+            if (declaration.kind == "class" && (owner == "" || declaration.name == owner)) {
                 var method = 0
                 while (method < declaration.methods.size) {
                     if (declaration.methods[method].name == name &&
@@ -138,6 +143,7 @@ class BootstrapNamedArgumentNormalizer(
                 }
             } else if (declaration.name == name &&
                 declaration.extensionOwner != "" &&
+                (owner == "" || declaration.extensionOwner == owner) &&
                 (declaration.kind == "fun" || declaration.kind == "compile.fun") &&
                 this.acceptsNamed(declaration, children)) {
                 owners.append(index)
@@ -373,10 +379,27 @@ class BootstrapNamedArgumentNormalizer(
         }
         var normalizeCall = hasNamed
         var selectedTarget = -1
-        if (result.kind == "call") selectedTarget = this.target(result.text)
         var memberTargets = BootstrapNamedMethodTargets([], [])
+        // A plain call in a method that the receiver's method takes is that
+        // method's, before any top-level declaration of the name.
+        if (result.kind == "call" && hasNamed && this.receiver != "") {
+            val arguments: array<BootstrapExpression> = [
+                BootstrapExpression("identifier", "this", result.begin, result.begin, [])
+            ]
+            for (argument in result.children) arguments.append(argument)
+            val own = this.methodTargets(result.text, arguments, this.receiver)
+            if (own.owners.size > 0) {
+                result = BootstrapExpression(
+                    "member.call", result.text, result.begin, result.end, arguments
+                )
+                memberTargets = own
+            }
+        }
+        if (result.kind == "call") selectedTarget = this.target(result.text)
         if (result.kind == "member.call" && hasNamed) {
-            memberTargets = this.methodTargets(result.text, result.children)
+            if (memberTargets.owners.size == 0) {
+                memberTargets = this.methodTargets(result.text, result.children)
+            }
             selectedTarget = if (memberTargets.owners.size == 0) -1
                 else if (this.sameParameters(memberTargets)) 0
                 else -2
@@ -638,6 +661,9 @@ fun bootstrapNormalizeNamedDeclaration(
     var normalizer: BootstrapNamedArgumentNormalizer,
     declaration: BootstrapDeclaration
 ): BootstrapDeclaration {
+    val enclosing = normalizer.receiver
+    if (declaration.kind == "class") normalizer.receiver = declaration.name
+    else if (declaration.extensionOwner != "") normalizer.receiver = declaration.extensionOwner
     val defaults: array<BootstrapExpression> = []
     var defaultIndex = 0
     while (defaultIndex < declaration.parameterDefaults.size) {
@@ -654,12 +680,14 @@ fun bootstrapNormalizeNamedDeclaration(
         ))
         method = method + 1
     }
+    val body = normalizer.normalize(declaration.expression)
+    normalizer.receiver = enclosing
     BootstrapDeclaration(
         declaration.kind,
         declaration.name,
         declaration.begin,
         declaration.end,
-        normalizer.normalize(declaration.expression),
+        body,
         declaration.parameters,
         declaration.parameterTypes,
         declaration.resultType,

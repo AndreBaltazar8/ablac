@@ -91,6 +91,7 @@ test-serial: ablac
 	tools/test-unsafe-static-memory.sh $(COMPILER)
 	tools/test-native-cstring-lifetime.sh $(COMPILER)
 	tools/test-nominal-scalars.sh $(COMPILER)
+	tools/test-tracked-language-fixes.sh $(COMPILER)
 	tools/test-native-width-integers.sh $(COMPILER)
 	tools/test-fixed-width-boxed-arithmetic.sh $(COMPILER)
 	tools/test-closure-captures.sh $(COMPILER)
