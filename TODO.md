@@ -1,15 +1,57 @@
 # TODO
 
-Open compiler, package, and performance work. The package audit began at
-`1a90db5` (2026-10-08); resolved entries were removed after the v0.2.15 Linux
-release checks on 2026-10-11. Platform and package checks still missing are
-called out below.
+## Rules
+
+- All open work on ablac is tracked here: the compiler, runtime, standard library, tooling and
+  what packages need from them. Add new tasks as they come up.
+- Each big item gets at least one commit of its own, and can take several.
+- This file can be committed at any time, along with the work or on its own.
+- As soon as a task is completed, take it off this file, in the commit that
+  finishes it. Git history is the record of what got done.
+- Only list what is really open. A task is done when it is verified where it runs (the tests,
+  the fixed point, and the target or package it is for), not just when it compiles.
+- Any bug or error seen goes here right away, even if it looks minor or unrelated, with what
+  was seen and how to reproduce it. Don't only mention it in a report.
+- Keep the measurements on performance items, and what was tried and dropped, so nobody
+  repeats the work. Date them: they go stale.
+
+## Bugs seen
+
+Reproduced on 2026-10-31 at `f5471dc` unless noted. The first four were reported by Abla One,
+which works around them.
+
+- [ ] A `when` whose arms return globals fails with `ownership.managed-return-borrow-contract`,
+      though `if` compiles: `val A = [1]`, `val B = [2]`,
+      `fun pick(n: string): array<int> = when (n) { "a" -> A` newline `else -> B }`.
+- [ ] An import alias doesn't reach a facade's `export import`
+      (`E_IMPORT_ALIAS_MEMBER_UNKNOWN`): with `export import "inner.ab"` in `facade.ab`,
+      `import "facade.ab" as f` then `f.innerValue()`. abla-pdf must be imported without `as`.
+- [ ] A named-argument call to a method through implicit `this` gives `E_NAMED_ARGUMENT_TARGET`,
+      though the docs don't rule it out: `fun n(): int = m(b = 1, a = 3)` inside the class of `m`.
+- [ ] A nominal `type X = int` can't be an array index (`index.type`), though
+      `docs/language.md` says it's accepted where an int is: `val i: X = 1`, `a[i]`.
+- [ ] A method named `transform` looks taken for a compile-time transform:
+      `compile.effect-denied:filesystem.write:PdfPage.transform->PdfPage.op->Path.appendText`,
+      once a project imports Abla One's `src/server/remote.ab`. Reported by Abla One; a
+      plain class with a `transform` method compiles, so it needs that import to reproduce.
+- [ ] `make test` can't pass on a machine without Node 22.14.0 under nvm: `tools/test-math-v8.sh`
+      fails at once (`needs Node 22.14.0 ... or MATH_V8_NODE`), the only failure of 240 on Linux.
+      Pin that Node in `shell.nix`, or skip with a message when it's missing.
+
+## Diagnostics
+
+- [ ] An unquoted import reports a division by zero: `import abla/io` gives `E_EVAL_EXPRESSION`
+      for `abla` and `io`, `E_EVAL_DIVISION_BY_ZERO`, then `E_IMPORT_PROVIDER_RESULT`. It
+      should say the path needs quotes.
+- [ ] A local named `generator` gives `E_PARSE_SUSPENDING_BODY: expected a block after
+      generator`, which doesn't say the word is reserved: `val generator = 1`.
 
 ## Compiler and stdlib
 
-- [ ] Remove the legacy field-count object path once the bootstrap pin includes commit 2
-  (typed instances only): `tools/bootstrap-untyped-objects.patch`,
-  `tools/bootstrap-typed-instances.ab` and their stage in `tools/build-self-hosted-current.sh`.
+- [ ] Remove the older object layout's bootstrap step, which nothing needs now that the pin
+  (v0.2.25) makes typed instances: `tools/bootstrap-untyped-objects.patch`,
+  `tools/bootstrap-typed-instances.ab`, `tools/test-bootstrap-untyped-objects.sh`, their stage
+  in `tools/build-self-hosted-current.sh` and their lines in the `Makefile`.
 
 - [ ] **`ablac run` becomes a live JIT.** The direction for `run` is a live in-process JIT: a
   running program loads code and redefines its own functions while it runs. Done: the JIT
@@ -23,22 +65,6 @@ called out below.
   indirection stubs (ORC lazy reexports or an indirect stubs manager) so a function can be
   redefined while the program runs.
 
-
-- [ ] **Extension fields: the surface.** The runtime stores fields set by name beyond a
-  class's declared ones in the instance's overflow (`__ablaRuntimeFieldSet`/`FieldGet`,
-  collected on both platforms, carried by the compile-time lift as `#<symbol>`). Still to
-  come: the declarations (`var Point.label: string = ""`), their defaults through
-  `__ablaRuntimeFieldDefault` (null until then), drops of resource-typed extension fields
-  with their holder, and the compiler-API operations.
-
-- [ ] **Transactional memory: the surface.** The runtime runs transactions
-  (`__ablaRuntimeStmAtomic` over a closure, `StmRead`/`StmWrite`/`StmRetry`, TVars of tag
-  14; tools/test-stm.sh). Still to come: `TVar<T>` as a delegate, `atomic { }`, `retry`,
-  `orElse` (a checkpoint of the write buffer and a nested attempt), the checks
-  (`stm.outside-atomic`, `stm.effect:<effect>`, `stm.resource`, `stm.outside-mutation`),
-  and a body lowered to a closure that is not allocated (making it costs more than a
-  small transaction).
-
 - [ ] **Transactional memory: partitioned clocks.** Every writing commit takes a version
   from one global clock, so small transactions on many threads queue on its cache line:
   four threads each reading and writing 4 TVars a block take 88 ns a block (wall over all
@@ -47,41 +73,39 @@ called out below.
   that race for the clock). Clocks per partition of TVars (or per thread, compared as
   vectors) would let disjoint transactions scale.
 
-- **Tried, not pursued: telling LLVM a class-typed field holds an object.** A read of a
-  field whose type is a class that is neither optional nor affine was followed by
-  `llvm.assume(address != 0)`, so what reads the object next could drop its null check
-  (branch ct/noalias-params, 657395e). Every producer fills such fields (constructors,
-  the compile-time lift, assignment), and only affine fields can be moved out. On a
-  game's simulation it made no measurable difference, alone or on top of the
-  field-slot alias tags (native 42/42 us a tick with mobs, WebAssembly within 1%). An
-  `assume` would turn any producer missed later (extension fields with defaults,
-  generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
-
-- [ ] **Interfaces (paused, roadmap).** Nominal and retroactive conformance (`extend C : I`),
-  default methods, witness-table dispatch, `as?` downcasts, resource interfaces.
-- [ ] **Generics (paused, roadmap).** Monomorphized `fun <T>` / `class Box<T>` with interface
-  bounds, inferred type arguments, invariant; the syntax is reserved (`E_PARSE_NOT_YET_SUPPORTED`).
+- [ ] **The rest of the reserved generic syntax.** `where` clauses, `const` type parameters and
+  an interface's `type Item` still give `E_PARSE_NOT_YET_SUPPORTED`. Decide which to build.
 - [ ] **Module-scoped globals.** A module seeing only its own and its imports' globals would
   need a language-wide migration: measured on 2026-10-19, 102 errors in the compiler's own
   sources and 2061 in a game client written against today's flat namespace. Today the standard
   library never reads a program's globals (`library.program-global`).
-- [ ] **Software transactional memory surface (paused, roadmap).** `var x: T by TVar(v)`,
-  `atomic { }` with `retry` / `orElse`, over the runtime's TVar and transaction entry points.
+
+## Toolchain and project
+
+- [ ] **Nothing runs the tests on a push.** `.github/workflows/release.yml` is the only workflow,
+  and it starts by hand. Run `make test` and the fixed point on pushes to master.
+- [ ] **No formatter and no language server.** `ablac` has `analyze` and the analysis service to
+  build them on (`docs/reliability-roadmap.md` section 8: derive them from the compiler's
+  parser and type APIs so they can't drift from the language).
+- [ ] **Clean-bootstrap convergence.** Tiers 4 and 5 of `docs/reliability-roadmap.md`: two
+  independent bootstrap routes that reach the same canonical compiler IR on fresh builders.
+- [ ] **No target support matrix.** Publish which targets are tested and at what level
+  (`docs/reliability-roadmap.md` section 8).
+- [ ] **Language editions and a deprecation policy,** and signed package identities above the
+  immutable locks, when the ecosystem needs them (`docs/reliability-roadmap.md` section 8).
+- [ ] **Docs behind the code.** `docs/status.md`'s next priorities still list interfaces and
+  checked generics, and comments still call shipped features unsupported: `failReserved` in
+  `src/parser.ab` (`<T>`, `sealed`) and `validateConformances` in `src/sema.ab` (an
+  interface's parents).
 
 ## Packages
 
 Package-side work (not changed from ablac):
 
-- [ ] **abla-mobile's native layer still targets the removed C runtime.**
-  `runtime/native/CMakeLists.txt` compiles ablac's `runtime/abla_runtime.c`
-  (removed in `93ce196`), and the C platform layer implements that old ABI.
-  Compiler-side Android objects now contain the Abla runtime; update the package's
-  native layer and verify a complete Gradle/NDK build on both architectures.
-- [ ] **Verify abla-embedded's runtime at the ESP-IDF link.** RISC-V objects
-  compiled in the original audit; Xtensa builds still needed a matching ESP LLVM.
-  The audit also found general-dynamic TLS references (`__tls_get_addr`), which
-  ESP-IDF may not supply. Recheck the current TLS lowering with the actual target
-  toolchains and complete the ESP-IDF links before closing this item.
+- [ ] **abla-mobile still carries the removed C runtime's path.**
+  `runtime/native/CMakeLists.txt` picks it when ablac has `runtime/abla_runtime.c`, removed in
+  `93ce196`, so that branch and the C platform layer behind it can go. Verify a complete
+  Gradle/NDK build on both architectures.
 
 ## Compile time and memory
 
@@ -218,8 +242,14 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   `abla_fn_<a>_<b>`; the compiler's own `--emit-llvm` maps each to its source name
   through the function's `"abla.source"` attribute.
 
-## Not checked
+## Tried, not pursued
 
-Linux-only linking and running (abla-graphics, abla-doom, the X11/Wayland
-tests), the ESP32 and Android cross builds (their toolchains aren't installed),
-and tests that need network services.
+- **Telling LLVM a class-typed field holds an object.** A read of a
+  field whose type is a class that is neither optional nor affine was followed by
+  `llvm.assume(address != 0)`, so what reads the object next could drop its null check
+  (branch ct/noalias-params, 657395e). Every producer fills such fields (constructors,
+  the compile-time lift, assignment), and only affine fields can be moved out. On a
+  game's simulation it made no measurable difference, alone or on top of the
+  field-slot alias tags (native 42/42 us a tick with mobs, WebAssembly within 1%). An
+  `assume` would turn any producer missed later (extension fields with defaults,
+  generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
