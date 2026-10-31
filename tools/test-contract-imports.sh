@@ -17,6 +17,11 @@ set -e
 [[ $status -eq 42 ]] || exit 1
 
 "$compiler" build \
+    "$project_root/tests/cases/modules/contract-reflection.ab" \
+    -o "$output/reflection-program" --no-cache
+[[ $("$project_root/tools/run-limited.sh" "$output/reflection-program") == "2 0 2 Second" ]] || exit 1
+
+"$compiler" build \
     "$project_root/tests/cases/modules/contract-effect-import.ab" \
     -o "$output/effect-program" --no-cache
 set +e

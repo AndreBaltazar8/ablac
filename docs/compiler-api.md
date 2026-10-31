@@ -114,6 +114,8 @@ complete program before analysis:
 | Methods | Purpose |
 |---|---|
 | `functions()`, `findFunction(name)`, `functionsAnnotated(annotation)` | find function handles (`-1` when not found) |
+| `compilerContractFunctionsAnnotated(annotation)` | the functions an `import contract` brought, by annotation (signatures only; `functionsAnnotated` leaves them out) |
+| `compilerClassTypeParameterCount(class)`, `compilerClassTypeParameterName(class, index)` | a generic class's type parameters |
 | `functionName`, `functionIdentity`, `functionModuleIdentity`, `functionOwner`, `parameterCount`, `parameterName`, `parameterType`, `resultType`, `annotationCount`, `annotation`, `isCompileOnly`, `isTrusted`, `isExternal` | read a function's signature and metadata |
 | `bindings()`, `findBinding(name)`, `bindingName`, `bindingIsMutable`, `bindingIsDelegated`, `bindingExposedType`, `bindingDelegateType`, `bindingGetter`, `bindingSetter`, `bindingCanReplaceDelegate`, `bindingByBegin`, `bindingByEnd` | read top-level bindings ([below](#binding-reflection)) |
 | `transform(handler)` | register a transform (only as a literal top-level action) |
