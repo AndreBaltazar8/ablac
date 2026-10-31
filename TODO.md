@@ -42,6 +42,9 @@
 
 ## Compiler and stdlib
 
+- [ ] The standard library has no Unix domain sockets: `abla/sys/linux` and `abla/net` only offer TCP, IPv4 and IPv6, and
+      `abla/http` and `abla/tls/hosted` listen and connect over those. NovaKind's signer uses loopback with a secret for it, where a
+      socket's file permissions would say who may connect.
 - [ ] Integers up to 256 bits, signed and unsigned (128 and 256, with whatever smaller widths are missing), checked first
       against what exists: arithmetic, overflow rules, shifts, big-endian and little-endian bytes, decimal and hex text.
       The owner wants this for Ethereum-based work, so a `uint256` has to behave as the EVM's does when asked to wrap.
