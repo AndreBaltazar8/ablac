@@ -17,11 +17,11 @@
 
 ## Bugs seen
 
-- [ ] A named call's omitted default that calls an overloaded top-level function still reaches
-      a local function value of that name in the caller: `fun over(n: int)`, `fun over(s: string)`,
-      `fun g(a: int, b: int = over(1))`, then `val over = { n: int -> n + 5 }` and `g(a = 0)` calls
-      the local. Globals and non-overloaded functions go through accessors
-      (`named_arguments.ab`); an overload has no single function to copy (seen 2026-10-31).
+- [ ] `E_NAMED_ARGUMENT_HIDDEN` also rejects a caller whose local of that name isn't a function,
+      which would be fine: a generic function's or method's omitted default calling a global
+      function value, constructor or foreign function, with `val double = 40` in the caller and
+      `f(a = 1)`. Normalization runs before types are known. Passing the argument or renaming the
+      local avoids it; it is never a wrong call (seen 2026-10-31).
 
 ## Compiler and stdlib
 

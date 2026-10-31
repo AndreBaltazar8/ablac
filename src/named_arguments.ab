@@ -159,15 +159,107 @@ class BootstrapNamedArgumentNormalizer(
         name
     }
 
-    // The name of a copy of the top-level function `function`, for a default to
-    // call where a local of that name hides it.
+    // Whether a local, or a function-typed field, of this name takes a call of it.
+    fun callerCalls(name: string): bool {
+        if (bootstrapReceiverNameIn(this.callerNames, name)) return true
+        if (this.receiver == "") return false
+        for (declaration in this.declarations) {
+            if (declaration.kind == "class" && declaration.name == this.receiver) {
+                var index = 0
+                while (index < declaration.parameters.size) {
+                    if (declaration.parameters[index] == name && this.ownerField(declaration, name) &&
+                        index < declaration.parameterTypes.size &&
+                        bootstrapIsFunctionType(bootstrapNormalizeType(declaration.parameterTypes[index]))) {
+                        return true
+                    }
+                    index = index + 1
+                }
+            }
+        }
+        false
+    }
+
+    // The name of a copy of the top-level function `function`, every overload of
+    // it, for a default to call where a local of that name hides it. Overload
+    // resolution then chooses among the copies as it would among the originals.
     fun functionAccessor(function: string): string {
         val name = "__abla_function_$function"
         for (accessor in this.accessors) if (accessor.name == name) return name
-        if (this.target(name) >= 0) return name
-        val copy = bootstrapNamedFunctionCopy(this.declarations[this.target(function)], name)
-        this.accessors.append(copy)
+        if (this.target(name) != -1) return name
+        for (copy in bootstrapNamedFunctionCopies(this.declarations, function, name)) {
+            this.accessors.append(copy)
+        }
         name
+    }
+
+    // The callable top-level declaration a call of `name` reaches when it can't
+    // be copied (a constructor, a function value or a foreign function).
+    fun uncopiableCallable(name: string): bool {
+        for (declaration in this.declarations) {
+            if (declaration.name == name && declaration.extensionOwner == "" &&
+                (declaration.kind == "class" || declaration.kind == "extern" ||
+                 declaration.kind == "val" || declaration.kind == "var")) return true
+        }
+        false
+    }
+
+    // Whether `expression` (a default) calls a constructor, function value or
+    // foreign function of a name the caller hides.
+    fun callsHiddenUncopiable(expression: BootstrapExpression, own: array<string>): bool {
+        if (expression.kind == "call" && !bootstrapReceiverNameIn(own, expression.text) &&
+            this.callerHides(expression.text) && this.uncopiableCallable(expression.text)) return true
+        for (child in expression.children) {
+            if (this.callsHiddenUncopiable(child, own)) return true
+        }
+        false
+    }
+
+    // A call of a new top-level function that computes `declaration`'s default
+    // for parameter `parameter`, out of the caller's reach. It takes the earlier
+    // parameters the default reads, which `arguments` names in the caller.
+    fun defaultFunctionCall(
+        declaration: BootstrapDeclaration,
+        parameter: int,
+        arguments: array<string>,
+        at: BootstrapExpression
+    ): BootstrapExpression {
+        val value = declaration.parameterDefaults[parameter]
+        var used: array<string> = []
+        bootstrapNamedIdentifiers(value, used)
+        val parameters: array<string> = []
+        val types: array<string> = []
+        val kinds: array<string> = []
+        val passed: array<BootstrapExpression> = []
+        var earlier = 0
+        while (earlier < parameter) {
+            if (bootstrapReceiverNameIn(used, declaration.parameters[earlier])) {
+                parameters.append(declaration.parameters[earlier])
+                types.append(declaration.parameterTypes[earlier])
+                kinds.append("")
+                passed.append(BootstrapExpression(
+                    "identifier", arguments[earlier], at.begin, at.end, []
+                ))
+            }
+            earlier = earlier + 1
+        }
+        var serial = 0
+        var name = "__abla_default_${declaration.name}_${parameter}_$serial"
+        while (this.target(name) != -1 || this.hasAccessor(name)) {
+            serial = serial + 1
+            name = "__abla_default_${declaration.name}_${parameter}_$serial"
+        }
+        this.accessors.append(BootstrapDeclaration(
+            "fun", name, value.begin, value.end, value,
+            parameters, types, declaration.parameterTypes[parameter],
+            [], [], "", kinds, "", false, false, false, "", 0, 0, [], [], [], [],
+            declaration.sourceIdentity
+        ))
+        BootstrapExpression("call", name, at.begin, at.end, passed)
+    }
+
+    fun hasAccessor(name: string): bool {
+        for (accessor in this.accessors) if (accessor.name == name) return true
+        false
     }
 
     // `expression` (a default, now in a caller's body) with each global it reads
@@ -194,10 +286,13 @@ class BootstrapNamedArgumentNormalizer(
         var text = expression.text
         if (expression.kind == "call" && !bootstrapReceiverNameIn(own, text) &&
             this.callerHides(text)) {
-            val function = this.target(text)
-            if (function >= 0 && this.declarations[function].kind != "class") {
-                text = this.functionAccessor(text)
-            }
+            if (this.uncopiableCallable(text)) {
+                if (this.callerCalls(text)) this.fail(
+                    "HIDDEN",
+                    "a default left out of this call calls `$text`, which a local or field here hides, and it can't run elsewhere (a method's or generic function's): pass that argument, or rename the local",
+                    expression
+                )
+            } else if (this.target(text) != -1) text = this.functionAccessor(text)
         }
         BootstrapExpression(expression.kind, text, expression.begin, expression.end, children)
     }
@@ -691,7 +786,17 @@ class BootstrapNamedArgumentNormalizer(
                             var own: array<string> = []
                             for (name in temporaryNames) own.append(name)
                             bootstrapReceiverBoundNames(normalizedDefault, own)
-                            normalizedDefault = this.readCalleeGlobals(normalizedDefault, own)
+                            if (!method && declaration.typeParameters.size == 0 &&
+                                !bootstrapIsAnyDelegatedProperty(declaration, parameter) &&
+                                this.callsHiddenUncopiable(normalizedDefault, own)) {
+                                // No accessor reaches these: the whole default
+                                // runs where it was written.
+                                normalizedDefault = this.defaultFunctionCall(
+                                    declaration, parameter, temporaryNames, result
+                                )
+                            } else {
+                                normalizedDefault = this.readCalleeGlobals(normalizedDefault, own)
+                            }
                             if (!method && this.inReceiverBody) {
                                 normalizedDefault = this.keepTopLevelCalls(normalizedDefault)
                             }
@@ -740,21 +845,39 @@ class BootstrapNamedArgumentNormalizer(
     }
 }
 
-fun bootstrapNamedFunctionCopy(
-    function: BootstrapDeclaration,
+/** The names `expression` reads. */
+fun bootstrapNamedIdentifiers(expression: BootstrapExpression, var names: array<string>): void {
+    if (expression.kind == "identifier") names.append(expression.text)
+    for (child in expression.children) bootstrapNamedIdentifiers(child, names)
+    return
+}
+
+/** Copies, named `name`, of the top-level functions named `function`. */
+fun bootstrapNamedFunctionCopies(
+    declarations: array<BootstrapDeclaration>,
+    function: string,
     name: string
-): BootstrapDeclaration = BootstrapDeclaration(
-    function.kind, name, function.begin, function.end, function.expression,
-    function.parameters, function.parameterTypes, function.resultType,
-    function.methods, function.parameterDefaults, function.externalLibrary,
-    function.parameterKinds, function.extensionOwner, function.isTrusted,
-    function.isResource, function.isNoEscape, function.generatedNamespace,
-    function.generatedOriginBegin, function.generatedOriginEnd,
-    function.annotations, function.annotationArguments,
-    function.annotationBegins, function.annotationEnds, function.sourceIdentity,
-    function.conformances, function.isSealed, function.isPrivate,
-    function.typeParameters
-)
+): array<BootstrapDeclaration> {
+    val copies: array<BootstrapDeclaration> = []
+    for (each in declarations) {
+        if (each.name == function && each.extensionOwner == "" &&
+            (each.kind == "fun" || each.kind == "compile.fun")) {
+            copies.append(BootstrapDeclaration(
+                each.kind, name, each.begin, each.end, each.expression,
+                each.parameters, each.parameterTypes, each.resultType,
+                each.methods, each.parameterDefaults, each.externalLibrary,
+                each.parameterKinds, each.extensionOwner, each.isTrusted,
+                each.isResource, each.isNoEscape, each.generatedNamespace,
+                each.generatedOriginBegin, each.generatedOriginEnd,
+                each.annotations, each.annotationArguments,
+                each.annotationBegins, each.annotationEnds, each.sourceIdentity,
+                each.conformances, each.isSealed, each.isPrivate,
+                each.typeParameters
+            ))
+        }
+    }
+    copies
+}
 
 // The declarations a named member call may name: `methods[i]` indexes the
 // methods of class `owners[i]`, or is -1 for the extension function `owners[i]`.

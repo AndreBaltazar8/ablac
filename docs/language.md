@@ -820,7 +820,10 @@ fun main {
   or extension function goes to the receiver's method when one has those
   parameters, as `this.name(...)` would; otherwise it goes to the top-level
   function. A default left out of a named call keeps its callee's meaning: the
-  caller's locals and fields don't hide the globals and functions it names. A named method call is resolved before types are known: every class
+  caller's locals and fields don't hide the globals and functions it names. A
+  method's or generic function's default calling a constructor, function value or
+  foreign function that the caller's local hides is `E_NAMED_ARGUMENT_HIDDEN`:
+  pass the argument. A named method call is resolved before types are known: every class
   method and extension of that name with those parameter names must take the
   same parameters (and fill an omitted one the same way), otherwise it is
   `E_NAMED_ARGUMENT_TARGET` and the arguments go by position. Unknown, duplicate, out-of-order or
@@ -1631,6 +1634,7 @@ fun main {
 | `E_DELEGATE_AFFINE_VALUE` | `getValue()` returns an owned affine value |
 | `E_DELEGATE_BORROW_CONFLICT` | The delegate is replaced while a borrow of it from `^name` is still used |
 | `E_NAMED_ARGUMENT_DELEGATED` | A constructor argument names a delegated property |
+| `E_NAMED_ARGUMENT_HIDDEN` | A method's or generic function's default left out of a named call calls something the caller hides |
 | `E_DELEGATE_INITIALIZER_SCOPE` | A delegated property's `by` reads itself, a later parameter, an earlier delegated property or `this` |
 | `E_PARSE_DELEGATED_PARAMETER` | `by` on a function's parameter |
 
