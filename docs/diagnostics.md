@@ -216,6 +216,7 @@ listed in [concurrency.md](concurrency.md#diagnostics).
 | `E_COMPILE_EDIT_FIXPOINT` (`compile.edit-fixpoint`) | compile-time code changed the program in each of 8 rounds of lowering; the message lists the last round's edits ([committing changes](compile-time.md#committing-program-changes)) |
 | `E_INDEPENDENT_MODULE_*` | a misused independent module ([programmable-builds.md](programmable-builds.md)) |
 | `E_CONTRACT_CALL_NOT_CONSUMED` | a [contract](language.md#contract-imports) call left in the program |
+| `E_IMPORT_ALIAS_MEMBER_AMBIGUOUS` | an import alias names a member two nested exports of a facade both provide: import it from the module that defines it |
 
 ## Modules and packages
 
