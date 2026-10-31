@@ -514,12 +514,30 @@ line. Hosted secure random is supplied by
 
 | Function | Result |
 |---|---|
-| `tlsConnect(host, port = 443, timeoutMilliseconds = 5000)` | a verified `TlsConnection`, with `read`, `write` and `close` |
-| `tlsConnectWithCa(host, caPath, port, timeout)` | the same, trusting the given CA file |
-| `tlsUpgrade(var connection, host, caPath = "")` | start TLS on an existing TCP connection |
-| `tlsListen(certificatePath, privateKeyPath, host = "::", port = 443, ...)` | a `TlsListener`, with `accept()` |
+| `tlsConnect(host, port = 443, timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | a verified `TlsConnection`, with `read`, `write` and `close` |
+| `tlsConnectWithCa(host, caPath, port, timeout, readWriteTimeout)` | the same, trusting the given CA file |
+| `tlsUpgrade(var connection, host, caPath = "", timeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` | start TLS on an existing TCP connection; a socket that already has timeouts keeps them |
+| `connection.setTimeouts(readMilliseconds, writeMilliseconds)` | replace the limits on an open connection (also on a `TcpConnection`); 0 waits as long as it takes |
+| `tlsListen(certificatePath, privateKeyPath, host = "::", port = 443, ...)` | a `TlsListener`, with `accept(handshakeTimeoutMilliseconds = 5000, readWriteTimeoutMilliseconds = 30000)` |
 | `webSocketServerTls(certificatePath, privateKeyPath, handshakeTimeoutMilliseconds = 5000)` | from `abla/websocket/server/tls`: a `WebSocketServerTls` for `WebSocketServerOptions(tls = ...)` ([TLS](#tls-wss-and-https)); `webSocketServerTlsPem` takes PEM text |
 | `tlsAvailable()`, `tlsLastError()` | whether OpenSSL could be loaded, and the last error |
+
+`timeoutMilliseconds` bounds connecting and the handshake. The other limit bounds
+each `read` and each `write` of the open connection, so a peer that goes quiet
+costs one limit rather than a hung process, and it isn't a limit on the whole
+exchange: a peer sending a little at a time can take longer. A read that times
+out returns `""` and may be repeated, and `tlsLastError()` then says `TLS read
+or write timed out` (after a closed connection it is empty). A write that
+times out leaves the connection unusable.
+
+`httpsClient` and `httpIpv4Client` use their one `timeoutMilliseconds` for all
+of these, and `webSocketTlsClient` for everything except waiting for a frame, which
+a quiet conversation can make as long as it likes.
+
+A peer that resets the socket fails the operation that notices it. OpenSSL's
+writes would raise `SIGPIPE`, so `TlsConnection` and `abla/http/async` hold the
+signal around each OpenSSL call, and the thread's mask and the program's handler
+are as they were afterwards: `app | head` still ends the way it did.
 
 ## Persistent HTTP and streaming
 

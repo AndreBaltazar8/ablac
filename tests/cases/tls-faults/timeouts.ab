@@ -1,0 +1,106 @@
+// The configurable limits of abla/tls/hosted, and what they mean for a
+// connection: how long each wait lasts, and that a read can be repeated.
+// Usage: timeouts <certificate> <key>
+import "peer.ab"
+import "abla/io"
+import "abla/net"
+import "abla/process"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/tls/hosted"
+import "abla/websocket/tls"
+
+fun failed(stage: string, detail: string): int {
+    eprintln("$stage: $detail")
+    1
+}
+
+fun within(stage: string, started: int, lowest: int, highest: int): int {
+    val elapsed = monotonicMilliseconds() - started
+    println("$stage: ${elapsed}ms")
+    if (elapsed < lowest || elapsed > highest) failed(stage, "took ${elapsed}ms") else 0
+}
+
+fun checks(certificate: string, key: string, tlsPort: int, silentPort: int): int {
+    // The read limit, and a read repeated after it.
+    val slow = tlsConnectWithCa("localhost", certificate, tlsPort, 3000, 300)
+    if (slow.handle < 0) return failed("connect", tlsLastError())
+    slow.write("GET /late HTTP/1.1\r\n\r\n")
+    var started = monotonicMilliseconds()
+    if (slow.read(64) != "") return failed("read limit", "wanted a timeout")
+    if (within("read limit", started, 250, 2000) != 0) return 1
+    if (tlsLastError() != "TLS read or write timed out") return failed("read limit", tlsLastError())
+    if (!slow.setTimeouts(3000, 3000)) return failed("set", "refused")
+    if (slow.read(64) != "late") return failed("repeated read", tlsLastError())
+    if (slow.read(64) != "" || tlsLastError() != "") return failed("closed", "reads as a timeout: ${tlsLastError()}")
+    slow.close()
+
+    // 0 waits as long as it takes.
+    val patient = tlsConnectWithCa("localhost", certificate, tlsPort, 3000, 100)
+    patient.setTimeouts(0, 0)
+    patient.write("GET /late HTTP/1.1\r\n\r\n")
+    if (patient.read(64) != "late") return failed("no limit", "no reply")
+    patient.close()
+
+    // The default leaves room for a slow reply.
+    val defaulted = tlsConnectWithCa("localhost", certificate, tlsPort, 200)
+    defaulted.write("GET /late HTTP/1.1\r\n\r\n")
+    if (defaulted.read(64) != "late") return failed("default limit", "no reply")
+    defaulted.close()
+
+    // The handshake has the connection's first limit.
+    started = monotonicMilliseconds()
+    val silent = tlsConnectWithCa("127.0.0.1", certificate, silentPort, 300)
+    if (silent.handle >= 0) return failed("handshake", "connected")
+    if (tlsLastError() != "TLS failed at handshake") return failed("handshake", tlsLastError())
+    if (within("handshake limit", started, 250, 2000) != 0) return 1
+
+    // An upgraded socket: limits of its own stay, otherwise the arguments apply.
+    var own = tcpConnectIpv6(ipv6Loopback(tlsPort), 3000)
+    own.setTimeouts(400, 400)
+    val ownSecured = tlsUpgrade(own, "localhost", certificate)
+    if (ownSecured.handle < 0) return failed("upgrade", tlsLastError())
+    ownSecured.write("GET /stall HTTP/1.1\r\n\r\n")
+    started = monotonicMilliseconds()
+    if (ownSecured.read(64) != "") return failed("upgrade", "wanted a timeout")
+    if (within("upgrade keeps the socket's limit", started, 350, 2000) != 0) return 1
+    ownSecured.close()
+    var bare = tcpConnectIpv6(ipv6Loopback(tlsPort), 3000)
+    val bareSecured = tlsUpgrade(bare, "localhost", certificate, 3000, 300)
+    bareSecured.write("GET /stall HTTP/1.1\r\n\r\n")
+    started = monotonicMilliseconds()
+    if (bareSecured.read(64) != "") return failed("upgrade", "wanted a timeout")
+    if (within("upgrade's argument", started, 250, 2000) != 0) return 1
+    bareSecured.close()
+
+    // A silent client costs a listener one handshake limit, not the clients behind it.
+    var listener = tlsListen(certificate, key, "::", 0)
+    val quiet = tcpConnectIpv6(ipv6Loopback(listener.localPort()), 3000)
+    started = monotonicMilliseconds()
+    val nobody = listener.accept(300)
+    if (nobody.handle >= 0) return failed("accept", "handshake succeeded")
+    if (within("accept limit", started, 250, 2000) != 0) return 1
+    quiet.close()
+    listener.close()
+
+    // A quiet WebSocket isn't a dead one: its frames take as long as they take.
+    val socket = webSocketTlsClientWithCa("localhost", "/ws", certificate, tlsPort, 300)
+    if (socket.closed) return failed("websocket", "not connected")
+    val frame = socket.readFrame(64)
+    if (!frame.available || frame.frame.payload != "hi") return failed("websocket", "no frame after a pause")
+    socket.close()
+    0
+}
+
+fun main: int {
+    val certificate = processArgument(0)
+    val key = processArgument(1)
+    var tlsListener = tlsListen(certificate, key, "::", 0)
+    var silentListener = tcpListenAddress(ipv4Loopback(0))
+    val tlsPort = tlsListener.localPort()
+    val silentPort = silentListener.localPort()
+    if (tlsPort <= 0 || silentPort <= 0) return failed("setup", "no listener")
+    if (peerForked()) { peerServeTls(tlsListener); return 0 }
+    if (peerForked()) { peerServeSilent(silentListener); return 0 }
+    checks(certificate, key, tlsPort, silentPort)
+}

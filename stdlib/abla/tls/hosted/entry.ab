@@ -3,6 +3,7 @@
 // C runtime source or host-value adapter participates in this path.
 
 import "openssl.ab"
+import "../../jwt/libcrypto.ab"
 import "abla/dns"
 import "abla/sys/linux/net"
 import "abla/unsafe/memory"
@@ -24,6 +25,12 @@ trusted fun hostedTlsSetError(code: int): void {
 
 private val hostedTlsListenerFailed = 11
 private val hostedTlsServerHandshakeFailed = 12
+private val hostedTlsTimedOut = 13
+
+// How long one read or write of an open connection may wait, unless the
+// connection is told otherwise. Connecting and the handshake have their own,
+// shorter limit; a protocol may reasonably wait this long for its peer's reply.
+private val tlsDefaultReadWriteTimeoutMilliseconds = 30000
 
 // A failed stage of a client connection, as its error code.
 private fun hostedTlsStageCode(stage: string): int = when (stage) {
@@ -53,6 +60,7 @@ private fun hostedTlsErrorText(code: int): string = when (code) {
     10 -> "TLS failed at certificate_verification"
     11 -> "TLS certificate, private key, or listener failed"
     12 -> "TLS server handshake failed"
+    13 -> "TLS read or write timed out"
     else -> "TLS failed"
 }
 
@@ -120,7 +128,8 @@ trusted fun tlsOpen(
     host: string,
     caPath: string,
     port: int,
-    timeoutMilliseconds: int
+    timeoutMilliseconds: int,
+    readWriteTimeoutMilliseconds: int = 30000
 ): int {
     var handle = -1
     var stage = "configuration"
@@ -142,12 +151,21 @@ trusted fun tlsOpen(
         ready = connection.descriptor >= 0
     }
     if (!ready) { hostedTlsSetError(hostedTlsStageCode(stage)); return -1 }
-    tlsUpgradeHandle(connection, host, caPath)
+    tlsUpgradeHandle(
+        connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds
+    )
 }
 
 // Takes ownership of an established TCP socket, including on failure.
 // Certificate-chain and hostname verification are identical to tlsConnect.
-trusted fun tlsUpgradeHandle(var connection: TcpConnection, host: string, caPath: string): int {
+// A socket that already has timeouts keeps them, through the handshake and after.
+trusted fun tlsUpgradeHandle(
+    var connection: TcpConnection,
+    host: string,
+    caPath: string,
+    timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = 30000
+): int {
     var handle = -1
     var stage = "configuration"
     var context = nativeNullPointer()
@@ -185,15 +203,27 @@ trusted fun tlsUpgradeHandle(var connection: TcpConnection, host: string, caPath
         stage = "socket_attach"
         ready = SSL_set_fd(session, connection.descriptor) == 1
     }
+    val configured = ready && linuxSocketHasTimeouts(connection.descriptor)
     if (ready) {
         stage = "handshake"
+        if (!configured) linuxSocketSetTimeouts(
+            connection.descriptor, timeoutMilliseconds, timeoutMilliseconds
+        )
+        ERR_clear_error()
+        val held = linuxBrokenPipeHold()
         ready = SSL_connect(session) == 1
+        linuxBrokenPipeRelease(held)
     }
     if (ready) {
         stage = "certificate_verification"
         ready = SSL_get_verify_result(session) == 0
     }
     if (ready) {
+        if (!configured) linuxSocketSetTimeouts(
+            connection.descriptor,
+            readWriteTimeoutMilliseconds,
+            readWriteTimeoutMilliseconds
+        )
         handle = tlsAllocateConnection(
             context, session, connection.descriptor, true
         )
@@ -208,24 +238,43 @@ trusted fun tlsUpgradeHandle(var connection: TcpConnection, host: string, caPath
     handle
 }
 
-fun tlsUpgrade(var connection: TcpConnection, host: string, caPath: string = ""): TlsConnection =
-    TlsConnection(tlsUpgradeHandle(connection, host, caPath))
+fun tlsUpgrade(
+    var connection: TcpConnection,
+    host: string,
+    caPath: string = "",
+    timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds
+): TlsConnection = TlsConnection(tlsUpgradeHandle(
+    connection, host, caPath, timeoutMilliseconds, readWriteTimeoutMilliseconds
+))
 
 fun tlsConnect(
     host: string,
     port: int = 443,
-    timeoutMilliseconds: int = 5000
+    timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds
 ): TlsConnection = TlsConnection(
-    tlsOpen(host, "", port, timeoutMilliseconds)
+    tlsOpen(host, "", port, timeoutMilliseconds, readWriteTimeoutMilliseconds)
 )
 
 fun tlsConnectWithCa(
     host: string,
     caPath: string,
     port: int = 443,
-    timeoutMilliseconds: int = 5000
+    timeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds
 ): TlsConnection = TlsConnection(
-    tlsOpen(host, caPath, port, timeoutMilliseconds)
+    tlsOpen(host, caPath, port, timeoutMilliseconds, readWriteTimeoutMilliseconds)
+)
+
+// Replaces the limits on one read and one write; 0 waits as long as it takes.
+// A read that times out returns "" and can be repeated (tlsLastError tells it
+// from a closed connection). A write that times out leaves the connection unusable.
+trusted fun TlsConnection.setTimeouts(
+    readMilliseconds: int,
+    writeMilliseconds: int
+): bool = this.handle >= 0 && linuxSocketSetTimeouts(
+    tlsControlInt(this.handle, 16), readMilliseconds, writeMilliseconds
 )
 
 trusted fun tlsListenHandle(
@@ -287,7 +336,12 @@ trusted fun TlsListener.localPort(): int = if (this.handle >= 0) {
     port
 } else -1
 
-trusted fun TlsListener.accept(): TlsConnection {
+// A client that connects and says nothing costs one handshake timeout, so it
+// can't hold up the clients behind it.
+trusted fun TlsListener.accept(
+    handshakeTimeoutMilliseconds: int = 5000,
+    readWriteTimeoutMilliseconds: int = tlsDefaultReadWriteTimeoutMilliseconds
+): TlsConnection {
     var handle = -1
     if (this.handle >= 0) {
         val context = tlsControlPointer(this.handle, 0)
@@ -301,11 +355,21 @@ trusted fun TlsListener.accept(): TlsConnection {
             ready = !pointerIsNull(session)
         }
         if (ready) ready = SSL_set_fd(session, descriptor) == 1
-        if (ready) ready = SSL_accept(session) == 1
-        if (ready) handle = tlsAllocateConnection(
-            context, session, descriptor, false
-        )
-        else {
+        if (ready) {
+            linuxSocketSetTimeouts(
+                descriptor, handshakeTimeoutMilliseconds, handshakeTimeoutMilliseconds
+            )
+            ERR_clear_error()
+            val held = linuxBrokenPipeHold()
+            ready = SSL_accept(session) == 1
+            linuxBrokenPipeRelease(held)
+        }
+        if (ready) {
+            linuxSocketSetTimeouts(
+                descriptor, readWriteTimeoutMilliseconds, readWriteTimeoutMilliseconds
+            )
+            handle = tlsAllocateConnection(context, session, descriptor, false)
+        } else {
             if (!pointerIsNull(session)) SSL_free(session)
             if (descriptor >= 0) linuxTcpCloseDescriptor(descriptor)
             hostedTlsSetError(hostedTlsServerHandshakeFailed)
@@ -314,15 +378,28 @@ trusted fun TlsListener.accept(): TlsConnection {
     TlsConnection(handle)
 }
 
+// A blocking socket that wants to go on waiting has hit its timeout. Anything
+// else is the end of the connection, which has no error to report.
+private trusted fun hostedTlsNoteFailure(session: i64*, result: int): void {
+    val code: int = SSL_get_error(session, i32(result))
+    hostedTlsSetError(if (code == 2 || code == 3) hostedTlsTimedOut else 0)
+    return
+}
+
 trusted fun TlsConnection.read(maximum: int = 65536): string {
     var result = ""
     if (this.handle >= 0 && maximum > 0 && maximum <= 16777216) {
         val buffer = nativeByteBuffer(maximum + 1)
-        val measured: int = SSL_read(
-            tlsControlPointer(this.handle, 8), buffer.address, maximum
-        )
+        val session = tlsControlPointer(this.handle, 8)
+        ERR_clear_error()
+        val held = linuxBrokenPipeHold()
+        val measured: int = SSL_read(session, buffer.address, maximum)
         if (measured > 0) result = buffer.adoptString(measured)
-        else buffer.close()
+        else {
+            buffer.close()
+            hostedTlsNoteFailure(session, measured)
+        }
+        linuxBrokenPipeRelease(held)
     }
     result
 }
@@ -333,20 +410,29 @@ trusted fun TlsConnection.write(contents: string): int {
     while (writing && offset < contents.size) {
         var length = contents.size - offset
         if (length > 2147483647) length = 2147483647
+        val session = tlsControlPointer(this.handle, 8)
+        ERR_clear_error()
+        val held = linuxBrokenPipeHold()
         val written: int = SSL_write(
-            tlsControlPointer(this.handle, 8),
+            session,
             contents.slice(offset, offset + length),
             length
         )
-        if (written <= 0) writing = false
-        else offset = offset + written
+        if (written <= 0) {
+            writing = false
+            hostedTlsNoteFailure(session, written)
+        } else offset = offset + written
+        linuxBrokenPipeRelease(held)
     }
     if (writing) offset else -1
 }
 
 trusted fun tlsCloseHandle(handle: int): bool {
     val session = tlsControlPointer(handle, 8)
+    ERR_clear_error()
+    val held = linuxBrokenPipeHold()
     SSL_shutdown(session)
+    linuxBrokenPipeRelease(held)
     SSL_free(session)
     if (tlsControlInt(handle, 24) != 0) {
         SSL_CTX_free(tlsControlPointer(handle, 0))

@@ -1085,8 +1085,100 @@ fun linuxSocketSetNonblocking(descriptor: int, enabled: bool): bool {
     succeeded
 }
 
+// SO_RCVTIMEO and SO_SNDTIMEO: how long one blocking read or write of this
+// socket may wait, 0 for as long as it takes. It also covers calls made on the
+// socket by a library such as OpenSSL.
+fun linuxSocketSetTimeouts(
+    descriptor: int,
+    readMilliseconds: int,
+    writeMilliseconds: int
+): bool {
+    val interval = nativeByteBuffer(16)
+    interval.storeI64(0, readMilliseconds / 1000)
+    interval.storeI64(8, (readMilliseconds % 1000) * 1000)
+    val read = linuxSyscall5(
+        54, descriptor, 1, 20, nativePointerAddress(interval.address), 16
+    )
+    interval.storeI64(0, writeMilliseconds / 1000)
+    interval.storeI64(8, (writeMilliseconds % 1000) * 1000)
+    val write = linuxSyscall5(
+        54, descriptor, 1, 21, nativePointerAddress(interval.address), 16
+    )
+    interval.close()
+    read == 0 && write == 0
+}
+
+private fun linuxSocketTimeoutSet(descriptor: int, option: int): bool {
+    val value = nativeByteBuffer(24)
+    value.storeI64(0, 0)
+    value.storeI64(8, 0)
+    value.storeI64(16, 16)
+    val found = linuxSyscall5(
+        55, descriptor, 1, option,
+        nativePointerAddress(value.address),
+        nativePointerAddress(value.address) + 16
+    )
+    val set = found == 0 && (value.loadI64(0) != 0 || value.loadI64(8) != 0)
+    value.close()
+    set
+}
+
+// Whether either timeout has been set on this socket.
+fun linuxSocketHasTimeouts(descriptor: int): bool =
+    linuxSocketTimeoutSet(descriptor, 20) || linuxSocketTimeoutSet(descriptor, 21)
+
+// A write to a socket the peer reset raises SIGPIPE, unless it passes
+// MSG_NOSIGNAL, which OpenSSL's write(2) can't. Hold SIGPIPE around such a call
+// so that it fails with EPIPE, then release it: the caller's mask and handler,
+// which also decide what happens to its own writes to a closed pipe, stay as
+// they were. The signal goes to the writing thread, and the mask is per thread.
+// (Darwin sockets carry SO_NOSIGPIPE, so nothing is raised there.)
+// The result is for linuxBrokenPipeRelease: whether it was blocked already.
+fun linuxBrokenPipeHold(): bool {
+    val signals = nativeByteBuffer(16)
+    signals.storeI64(0, 4096)
+    signals.storeI64(8, 0)
+    linuxSyscall4(
+        14, 0,
+        nativePointerAddress(signals.address),
+        nativePointerAddress(signals.address) + 8,
+        8
+    )
+    val blocked = signals.loadI64(8) / 4096 % 2 != 0
+    signals.close()
+    blocked
+}
+
+fun linuxBrokenPipeRelease(blockedBefore: bool): void {
+    if (!blockedBefore) {
+        val signals = nativeByteBuffer(24)
+        signals.storeI64(0, 4096)
+        signals.storeI64(8, 0)
+        signals.storeI64(16, 0)
+        // rt_sigtimedwait with a zero timeout takes a signal the call raised.
+        linuxSyscall4(
+            128,
+            nativePointerAddress(signals.address),
+            0,
+            nativePointerAddress(signals.address) + 8,
+            8
+        )
+        linuxSyscall4(14, 1, nativePointerAddress(signals.address), 0, 8)
+        signals.close()
+    }
+    return
+}
+
 fun TcpListener.setNonblocking(enabled: bool = true): bool =
     linuxSocketSetNonblocking(this.descriptor, enabled)
+
+// Bounds each blocking read and write; see linuxSocketSetTimeouts.
+fun TcpConnection.setTimeouts(
+    readMilliseconds: int,
+    writeMilliseconds: int
+): bool = this.descriptor >= 0 && linuxSocketSetTimeouts(
+    this.descriptor, readMilliseconds, writeMilliseconds
+)
 
 fun TcpConnection.setNonblocking(enabled: bool = true): bool =
     linuxSocketSetNonblocking(this.descriptor, enabled)

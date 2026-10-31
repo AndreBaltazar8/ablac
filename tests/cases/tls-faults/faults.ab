@@ -1,0 +1,155 @@
+// The HTTP clients against misbehaving peers, through the API they had before
+// socket timeouts existed: on that code a stage dies of SIGPIPE (status 141) or
+// hangs. tools/test-tls-faults.sh runs each under a time limit. Usage:
+//   faults <certificate> <key> <stage>
+import "peer.ab"
+import "abla/http"
+import "abla/http/async"
+import "abla/http/tls"
+import "abla/io"
+import "abla/net"
+import "abla/process"
+import "abla/process/time"
+import "abla/sys/linux"
+import "abla/tls/hosted"
+import "abla/unsafe/memory"
+
+fun failed(stage: string, detail: string): int {
+    eprintln("$stage: $detail")
+    1
+}
+
+// Whether the calling thread blocks SIGPIPE at the moment.
+trusted fun sigpipeBlocked(): bool {
+    val mask = nativeByteBuffer(8)
+    mask.storeI64(0, 0)
+    linuxSyscall4(14, 0, 0, nativePointerAddress(mask.address), 8)
+    val blocked = mask.loadI64(0) / 4096 % 2 != 0
+    mask.close()
+    blocked
+}
+
+trusted fun sigpipeBlock(): void {
+    val mask = nativeByteBuffer(8)
+    mask.storeI64(0, 4096)
+    linuxSyscall4(14, 0, nativePointerAddress(mask.address), 0, 8)
+    mask.close()
+    return
+}
+
+fun exchange(stage: string, client: HttpClient, request: HttpRequest, wantOk: bool, lowest: int, highest: int): int {
+    val started = monotonicMilliseconds()
+    val result = client.send(request)
+    val elapsed = monotonicMilliseconds() - started
+    println("$stage: ok=${result.succeeded} complete=${result.complete} status=${result.response.status} ${elapsed}ms")
+    if (wantOk && (!result.succeeded || !result.complete || result.response.body != "body"))
+        return failed(stage, "wanted the body")
+    if (!wantOk && result.succeeded && result.complete) return failed(stage, "wanted a failure")
+    if (elapsed < lowest || elapsed > highest) return failed(stage, "took ${elapsed}ms")
+    0
+}
+
+// The same faults for both blocking clients; the client must survive each.
+fun blockingFault(stage: string, client: HttpClient): int {
+    val fine = exchange(stage, client, httpGet("/fine"), true, 0, 5000)
+    if (fine != 0) return fine
+    val outcome = if (stage.endsWith("reset-read"))
+        exchange(stage, client, httpGet("/reset"), false, 0, 5000)
+    else if (stage.endsWith("reset-write"))
+        exchange(stage, client, httpPost("/reset", "x".repeat(33554432)), false, 0, 5000)
+    else if (stage.endsWith("stall-read"))
+        exchange(stage, client, httpGet("/stall"), false, 250, 5000)
+    else if (stage.endsWith("stall-write"))
+        exchange(stage, client, httpPost("/stall", "x".repeat(33554432)), false, 250, 5000)
+    else failed(stage, "no such stage")
+    if (outcome != 0) return outcome
+    // Still here to do another request.
+    exchange(stage, client, httpGet("/fine"), true, 0, 5000)
+}
+
+fun asyncWait(stage: string, var client: HttpAsyncClient, id: int): HttpAsyncCompletion {
+    var result = HttpAsyncCompletion(id, -1, [], "", "no completion", 0)
+    var waiting = true
+    val limit = monotonicMilliseconds() + 15000
+    while (waiting && monotonicMilliseconds() < limit) {
+        client.step(50)
+        val done = client.takeCompletions()
+        var index = 0
+        while (index < done.size) {
+            if (done[index].id == id) {
+                result = done[index]
+                waiting = false
+            }
+            index = index + 1
+        }
+    }
+    println("$stage: status=${result.status} error=\"${result.error}\" ${result.elapsedMilliseconds}ms")
+    result
+}
+
+// The API that retries: a request whose pooled connection the peer dropped
+// goes once more on a fresh one.
+fun asyncFault(stage: string, port: int): int {
+    val client = httpAsyncClient()
+    val base = "https://localhost:$port"
+    if (stage == "async-retry") {
+        val kept = asyncWait(stage, client, client.get("$base/kept", [], 3000))
+        if (kept.status != 200) return failed(stage, "the first request")
+        val retried = asyncWait(stage, client, client.get("$base/flaky", [], 3000))
+        if (retried.status != 200 || retried.body != "body") return failed(stage, "not retried")
+        return 0
+    }
+    if (stage == "async-reset-write") {
+        val reset = asyncWait(stage, client, client.request("POST", "$base/reset", [], "x".repeat(33554432), 5000))
+        if (reset.status == 200 || reset.status == -1) return failed(stage, "wanted a failure")
+    } else if (stage == "async-stall") {
+        val stalled = asyncWait(stage, client, client.get("$base/stall", [], 300))
+        if (stalled.error != "timeout") return failed(stage, "wanted a timeout")
+    } else return failed(stage, "no such stage")
+    val fine = asyncWait(stage, client, client.get("$base/fine", [], 3000))
+    if (fine.status != 200) failed(stage, "the request after") else 0
+}
+
+// The guard leaves the signal's mask as it found it, either way, and doesn't
+// change what happens to the program's own writes to a closed pipe.
+fun maskFault(stage: string, client: HttpClient): int {
+    if (sigpipeBlocked()) return failed(stage, "blocked to begin with")
+    val first = exchange(stage, client, httpPost("/reset", "x".repeat(33554432)), false, 0, 5000)
+    if (first != 0) return first
+    if (sigpipeBlocked()) return failed(stage, "a request left it blocked")
+    sigpipeBlock()
+    val second = exchange(stage, client, httpPost("/reset", "x".repeat(33554432)), false, 0, 5000)
+    if (second != 0) return second
+    if (!sigpipeBlocked()) failed(stage, "a request unblocked it") else 0
+}
+
+fun run(stage: string, tlsPort: int, tcpPort: int): int {
+    val https = httpsClient("localhost", tlsPort, 1048576, 300)
+    val plain = httpIpv4Client("127.0.0.1:$tcpPort", "127.0.0.1", tcpPort, 1048576, 300)
+    if (stage == "mask") return maskFault(stage, https)
+    if (stage.startsWith("https-")) return blockingFault(stage, https)
+    if (stage.startsWith("async-")) return asyncFault(stage, tlsPort)
+    // A framed response ends the exchange, though the peer keeps the socket open.
+    if (stage == "http-kept") {
+        val patient = httpIpv4Client("127.0.0.1:$tcpPort", "127.0.0.1", tcpPort, 1048576, 3000)
+        return exchange(stage, patient, httpGet("/kept"), true, 0, 1500)
+    }
+    // Over the connector's ten seconds is still a valid timeout for the client.
+    if (stage == "http-long-timeout") {
+        val patient = httpIpv4Client("127.0.0.1:$tcpPort", "127.0.0.1", tcpPort, 1048576, 15000)
+        return exchange(stage, patient, httpGet("/fine"), true, 0, 5000)
+    }
+    if (stage.startsWith("http-")) return blockingFault(stage, plain)
+    failed(stage, "no such stage")
+}
+
+fun main: int {
+    var tlsListener = tlsListen(processArgument(0), processArgument(1), "::", 0)
+    var tcpListener = tcpListenAddress(ipv4Loopback(0))
+    val tlsPort = tlsListener.localPort()
+    val tcpPort = tcpListener.localPort()
+    if (tlsPort <= 0 || tcpPort <= 0) return failed("setup", "no listener")
+    if (peerForked()) { peerServeTls(tlsListener); return 0 }
+    if (peerForked()) { peerServeTcp(tcpListener); return 0 }
+    run(processArgument(2), tlsPort, tcpPort)
+}
