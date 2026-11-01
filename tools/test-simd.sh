@@ -17,7 +17,7 @@ rm -rf "$out"
 mkdir -p "$out"
 
 for mode in "" --fast; do
-    "$compiler" build "$cases/native.ab" -o "$out/native" $mode
+    "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache $mode
     "$out/native" || { echo "simd native ${mode:-release}: check $? failed" >&2; exit 1; }
 done
 echo "ok   x86-64: release and --fast, cpu has aes/clmul/avx2 where /proc/cpuinfo says"
@@ -27,14 +27,14 @@ if command -v qemu-x86_64 >/dev/null; then
     qemu-x86_64 -cpu qemu64 "$out/native" || { echo "simd under qemu64 (no AES): check $? failed" >&2; exit 1; }
     echo "ok   x86-64 under qemu64: no AES, CLMUL or AVX2, the paths behind cpuHas not taken"
 fi
-"$compiler" build "$cases/positive-language.ab" -o "$out/language"
+"$compiler" build "$cases/positive-language.ab" -o "$out/language" --no-cache
 "$out/language" || { echo "simd language: check $? failed" >&2; exit 1; }
-"$compiler" build "$cases/positive-language.ab" -o "$out/language-debug" --fast -g
+"$compiler" build "$cases/positive-language.ab" -o "$out/language-debug" --no-cache --fast -g
 "$out/language-debug" || { echo "simd language -g: check $? failed" >&2; exit 1; }
 echo "ok   language: fields, arrays, maps, nullable, defaults, globals, closures, -g"
 
 # Wasm: SIMD128 runs, and its instructions are in the module.
-"$compiler" build "$cases/build.ab" -o "$out/wasm-driver" 2> "$out/wasm.log" || { cat "$out/wasm.log" >&2; exit 1; }
+"$compiler" build "$cases/build.ab" -o "$out/wasm-driver" --no-cache 2> "$out/wasm.log" || { cat "$out/wasm.log" >&2; exit 1; }
 "$out/wasm-driver"
 node "$cases/run.mjs" "$out/simd.wasm"
 wasm-dis "$out/simd.wasm" > "$out/simd.wat" 2>/dev/null
@@ -43,7 +43,7 @@ echo "ok   wasm under node $(node --version): SIMD128 instructions, no AES"
 
 # AArch64: no executable target exists, so an object, a start of its own, and qemu.
 if command -v qemu-aarch64 >/dev/null; then
-    "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver"
+    "$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache
     llvm-mc -triple aarch64-linux-gnu -filetype=obj "$cases/aarch64-start.s" -o "$out/aarch64-start.o"
     ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
     llvm-objdump -d "$out/aarch64" > "$out/aarch64.s"
@@ -71,7 +71,7 @@ done
 exec "$real_llc" -mcpu=esp32 "\${arguments[@]}"
 EOF
 chmod +x "$tools_directory/llc"
-PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xtensa.o" \
+PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 grep -q 'Machine: EM_XTENSA' <<<"$(llvm-readobj --file-headers "$out/xtensa.o")"
 echo "ok   xtensa: compiled only, not run; every vector operation is scalar code there"
@@ -79,7 +79,7 @@ echo "ok   xtensa: compiled only, not run; every vector operation is scalar code
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")
     set +e
-    "$compiler" build "$invalid" -o "$out/invalid" --fast > "$out/invalid.out" 2>&1
+    "$compiler" build "$invalid" -o "$out/invalid" --no-cache --fast > "$out/invalid.out" 2>&1
     status=$?
     set -e
     if [[ $status -eq 0 ]] || ! grep -qF "$expected" "$out/invalid.out"; then

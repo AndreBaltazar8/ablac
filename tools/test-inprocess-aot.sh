@@ -22,7 +22,7 @@ ABLA_MAX_SECONDS=60 \
     "$project_root/tools/run-limited.sh" \
     "$compiler" build \
     "$project_root/tests/cases/bootstrap/block.ab" \
-    -o "$output"
+    -o "$output" --no-cache
 
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \

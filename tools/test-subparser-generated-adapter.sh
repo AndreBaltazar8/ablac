@@ -305,7 +305,7 @@ grep -q 'error\[E_EXT_FUNCTION_HANDLE_OUT_OF_RANGE\]:' \
 set +e
 PATH="$missing_toolchain_path" "$compiler" build \
     "$project_root/tests/cases/bootstrap/block.ab" \
-    -o "$output_directory/invalid-native-toolchain" \
+    -o "$output_directory/invalid-native-toolchain" --no-cache \
     > "$output_directory/invalid-native-toolchain.out" \
     2> "$output_directory/invalid-native-toolchain.err"
 invalid_native_toolchain_status=$?

@@ -14,20 +14,20 @@ mkdir -p "$output_directory"
 cd "$project_root"
 
 for mode in "" --fast; do
-    "$compiler" build "$cases/native.ab" -o "$output_directory/native" $mode
+    "$compiler" build "$cases/native.ab" -o "$output_directory/native" --no-cache $mode
     "$output_directory/native" || {
         echo "f32 native ${mode:-release}: check $? failed" >&2
         exit 1
     }
 done
 
-"$compiler" build "$cases/compile-time.ab" -o "$output_directory/compile-time"
+"$compiler" build "$cases/compile-time.ab" -o "$output_directory/compile-time" --no-cache
 "$output_directory/compile-time" || {
     echo "f32 compile time: check $? failed" >&2
     exit 1
 }
 
-"$compiler" build "$cases/build.ab" -o "$output_directory/build-driver"
+"$compiler" build "$cases/build.ab" -o "$output_directory/build-driver" --no-cache
 "$output_directory/build-driver"
 node "$cases/run.mjs" "$output_directory/f32.wasm"
 
@@ -47,7 +47,7 @@ exec "$real_llc" -mcpu=esp32 "\${arguments[@]}"
 EOF
 chmod +x "$tools_directory/llc"
 PATH="$tools_directory:$PATH" "$compiler" build "$cases/xtensa.ab" \
-    -o "$output_directory/xtensa.o" \
+    -o "$output_directory/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 grep -q 'Machine: EM_XTENSA' <<<"$(llvm-readobj --file-headers "$output_directory/xtensa.o")"
 # 3.14159 as the nearest f32, 0x40490FD0, little endian: the literal is in the
@@ -58,7 +58,7 @@ LC_ALL=C grep -aqP '\xD0\x0F\x49\x40' "$output_directory/xtensa.o"
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")
     set +e
-    "$compiler" build "$invalid" -o "$output_directory/invalid" --fast \
+    "$compiler" build "$invalid" -o "$output_directory/invalid" --no-cache --fast \
         > "$output_directory/invalid.out" 2>&1
     status=$?
     set -e

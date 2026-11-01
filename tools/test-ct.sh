@@ -46,21 +46,21 @@ read_target() { # arch, object
 
 # --- x86-64 ---------------------------------------------------------------------------
 for mode in "" --fast; do
-    "$compiler" build "$cases/native.ab" -o "$out/native" $mode
+    "$compiler" build "$cases/native.ab" -o "$out/native" --no-cache $mode
     "$out/native" || { echo "ct native ${mode:-release}: check $? failed" >&2; exit 1; }
 done
-"$compiler" build "$cases/object-x86.ab" -o "$out/x86.o" --emit object
+"$compiler" build "$cases/object-x86.ab" -o "$out/x86.o" --emit object --no-cache
 read_target x86_64 "$out/x86.o"
 
 # --- AArch64 --------------------------------------------------------------------------
-"$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver"
+"$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
 qemu-aarch64 -cpu max "$out/aarch64" || { echo "ct aarch64: check $? failed" >&2; exit 1; }
 read_target aarch64 "$out/aarch64.o"
 
 # --- Wasm: the final module ----------------------------------------------------------
-"$compiler" build "$cases/build.ab" -o "$out/wasm-driver" 2> "$out/wasm.log" || { cat "$out/wasm.log" >&2; exit 1; }
+"$compiler" build "$cases/build.ab" -o "$out/wasm-driver" --no-cache 2> "$out/wasm.log" || { cat "$out/wasm.log" >&2; exit 1; }
 "$out/wasm-driver"
 node "$cases/run.mjs" "$out/ct.wasm"
 read_target wasm "$out/ct.wasm"
@@ -79,7 +79,7 @@ done
 exec "$real_llc" -mcpu=esp32 "\${arguments[@]}"
 EOF
 chmod +x "$tools_directory/llc"
-PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xtensa.o" \
+PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 read_target xtensa "$out/xtensa.o"
 
@@ -87,7 +87,7 @@ read_target xtensa "$out/xtensa.o"
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")
     set +e
-    "$compiler" build "$invalid" -o "$out/invalid" --fast > "$out/invalid.out" 2>&1
+    "$compiler" build "$invalid" -o "$out/invalid" --no-cache --fast > "$out/invalid.out" 2>&1
     status=$?
     set -e
     if [[ $status -eq 0 ]] || ! grep -qF "$expected" "$out/invalid.out"; then

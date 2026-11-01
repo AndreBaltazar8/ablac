@@ -172,6 +172,10 @@
   Release builds' `opt`, `clang -flto` and LTO link stay: they are what those tests exercise. `tools/`
   is still 283 shell scripts; `tools/abla-test-driver` already runs `tests/abla-tests.json`, and
   `tools/run-tests.sh` and the scripts should move onto it.
+  A script that changes what a build runs (a shim or wrapper on `PATH`, an empty `PATH`) also keeps
+  `--no-cache`: a hit would pass without running it. Building the compiler itself: 67 s to 55 s wall and
+  153 to 108 CPU-seconds on 2026-11-01, by doing only inlining and global propagation before the split;
+  most of the rest is the frontend (about 10 s) and that step, both on one core.
   By script on 2026-11-01 (CPU-seconds, about 4,000 in all with the crypto and SIMD tests): self-hosted
   480, doc-examples 310, ct-bridge 240, gc-growth 214, parity probes 185. Don't build gc-growth's stress
   run optimized: it runs 23x faster because collections move, so it would prove less. The frontend's
