@@ -1,0 +1,383 @@
+// Constant-time big-number arithmetic on raw memory, for RSA: 32-bit little-endian limbs, a fixed
+// length per modulus, and no branch or memory index from a value. tools/test-ct.sh reads
+// bnMontgomeryMultiplyBody, bnLookupBody, bnConditionalSubtractBody and bnAddMultipleBody on each
+// target. What's public here: the lengths, and in bnExpPublic the exponent.
+
+import "abla/ct"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+@inline trusted fun bnPointer(address: int): i64* = ablaUnsafePointerOffset(ablaUnsafeNullPointer(), address)
+@inline trusted fun bnLoad(address: int): secretU32 = secretU32(u32(ablaUnsafeLoadU32(bnPointer(address))))
+@inline trusted fun bnStore(address: int, value: secretU32): void =
+    ablaUnsafeStoreU32(bnPointer(address), int(value.declassify()))
+
+trusted fun bnAllocate(words: int): int {
+    val address = ablaUnsafePointerAddress(ablaUnsafeAllocate(words * 4 + 8))
+    bnClear(address, words)
+    address
+}
+
+/** Wipes and frees what bnAllocate gave. */
+trusted fun bnRelease(address: int, words: int): void {
+    bnClear(address, words)
+    ablaUnsafeFree(bnPointer(address))
+}
+
+@noinline trusted fun bnClear(address: int, words: int): void {
+    for (i in 0 until words) ablaUnsafeStoreU32(bnPointer(address + i * 4), 0)
+}
+
+@noinline trusted fun bnCopy(to: int, from: int, words: int): void {
+    for (i in 0 until words) ablaUnsafeStoreU32(bnPointer(to + i * 4), ablaUnsafeLoadU32(bnPointer(from + i * 4)))
+}
+
+/** The big-endian bytes at `data` as `words` limbs; the bytes must fit. */
+trusted fun bnFromBytes(to: int, words: int, data: int, count: int): void {
+    bnClear(to, words)
+    for (at in 0 until count) {
+        // Byte `at` from the end goes in limb at / 4: public positions, and a read-modify-write
+        // that doesn't look at the value.
+        val limb = to + (at / 4) * 4
+        val byte = secretU32(u32(ablaUnsafeLoadU8(bnPointer(data + count - 1 - at))))
+        bnStore(limb, bnLoad(limb) | (byte << ((at % 4) * 8)))
+    }
+}
+
+trusted fun bnToBytes(to: int, count: int, from: int): void {
+    for (at in 0 until count) {
+        val word = bnLoad(from + (at / 4) * 4)
+        ablaUnsafeStoreU8(bnPointer(to + count - 1 - at), int((word >> ((at % 4) * 8)).declassify() & u32(255)))
+    }
+}
+
+/** -1 / modulus[0] mod 2^32 of an odd modulus, by Newton's iteration: the value is secret for a prime. */
+trusted fun bnInverseWord(to: int, modulus: int): void {
+    val m = bnLoad(modulus)
+    var x = m
+    for (round in 0 until 5) x = x * (secretU32(u32(2)) - m * x)
+    bnStore(to, secretU32(u32(0)) - x)
+}
+
+/** `out` = `a` + `b`'s value subtracted when it's at least `b`, or a carry says so: from `value`, words long,
+ *  with `top` the word above it. */
+@inline trusted fun bnConditionalSubtractBody(out: int, value: int, top: secretU32, modulus: int, words: int, scratch: int): void {
+    var borrow = secretU32(u32(0))
+    for (j in 0 until words) {
+        val x = bnLoad(value + j * 4)
+        val y = bnLoad(modulus + j * 4)
+        val difference = x - y - borrow
+        borrow = ((~x & y) | ((~x | y) & difference)) >> 31
+        bnStore(scratch + j * 4, difference)
+    }
+    val subtract = ctIsNonZero(top) | ctIsZero(borrow)
+    for (j in 0 until words) {
+        bnStore(out + j * 4, ctSelect(subtract, bnLoad(scratch + j * 4), bnLoad(value + j * 4)))
+    }
+}
+
+/** `out` = `a` * `b` / 2^(32 words) mod `modulus`, the product below modulus * 2^(32 words). `inverse`
+ *  holds bnInverseWord's word, `t` has 2 * words + 2 scratch words. `out` may be `a` or `b`. */
+@inline trusted fun bnMontgomeryMultiplyBody(
+    out: int, a: int, b: int, modulus: int, inverse: int, words: int, t: int
+): void {
+    val negated = bnLoad(inverse)
+    for (j in 0 until words + 2) bnStore(t + j * 4, secretU32(u32(0)))
+    for (i in 0 until words) {
+        val multiplier = bnLoad(b + i * 4).widen()
+        var carry = secretU64(u64(0))
+        for (j in 0 until words) {
+            val sum = bnLoad(a + j * 4).widen() * multiplier + bnLoad(t + j * 4).widen() + carry
+            bnStore(t + j * 4, sum.low())
+            carry = sum.high().widen()
+        }
+        val top = bnLoad(t + words * 4).widen() + carry
+        bnStore(t + words * 4, top.low())
+        bnStore(t + (words + 1) * 4, top.high())
+        val quotient = (bnLoad(t) * negated).widen()
+        carry = (quotient * bnLoad(modulus).widen() + bnLoad(t).widen()).high().widen()
+        for (j in 1 until words) {
+            val sum = quotient * bnLoad(modulus + j * 4).widen() + bnLoad(t + j * 4).widen() + carry
+            bnStore(t + (j - 1) * 4, sum.low())
+            carry = sum.high().widen()
+        }
+        val last = bnLoad(t + words * 4).widen() + carry
+        bnStore(t + (words - 1) * 4, last.low())
+        bnStore(t + words * 4, bnLoad(t + (words + 1) * 4) + last.high())
+    }
+    bnConditionalSubtractBody(out, t, bnLoad(t + words * 4), modulus, words, t + (words + 2) * 4)
+}
+
+@noinline trusted fun bnMontgomeryMultiply(out: int, a: int, b: int, modulus: int, inverse: int, words: int, t: int): void =
+    bnMontgomeryMultiplyBody(out, a, b, modulus, inverse, words, t)
+
+/** `out` = entry `index` of `count` entries of `words` limbs at `table`, reading them all. */
+@inline trusted fun bnLookupBody(out: int, table: int, count: int, words: int, index: secretU32): void {
+    for (j in 0 until words) bnStore(out + j * 4, secretU32(u32(0)))
+    for (entry in 0 until count) {
+        val take = ctEq(index, secretU32(u32(entry)))
+        for (j in 0 until words) {
+            bnStore(out + j * 4, bnLoad(out + j * 4) | (bnLoad(table + (entry * words + j) * 4) & take))
+        }
+    }
+}
+
+@noinline trusted fun bnLookup(out: int, table: int, count: int, words: int, index: secretU32): void =
+    bnLookupBody(out, table, count, words, index)
+
+/** `out` = 2^(2 * 32 * words) mod `modulus`, by doubling and subtracting. `t` as for multiply. */
+@noinline trusted fun bnResidueSquare(out: int, modulus: int, words: int, t: int): void {
+    bnClear(out, words)
+    ablaUnsafeStoreU32(bnPointer(out), 1)
+    for (round in 0 until 64 * words) {
+        var carry = secretU32(u32(0))
+        for (j in 0 until words) {
+            val x = bnLoad(out + j * 4)
+            bnStore(out + j * 4, (x << 1) | carry)
+            carry = x >> 31
+        }
+        bnConditionalSubtractBody(out, out, carry, modulus, words, t)
+    }
+}
+
+// What a modulus needs ready: the modulus, its inverse word, 2^2k mod it, and its one (2^k mod it).
+class BnModulus(val memory: int, val words: int) {
+    fun value(): int = this.memory
+    fun inverse(): int = this.memory + this.words * 4
+    fun square(): int = this.memory + this.words * 4 + 4
+    fun one(): int = this.memory + this.words * 8 + 4
+    fun scratch(): int = this.memory + this.words * 12 + 4
+    fun total(): int = this.words * 3 + 1 + bnScratchWords(this.words)
+}
+
+fun bnScratchWords(words: int): int = 2 * words + 4
+
+/** Prepares an odd modulus of `words` limbs from big-endian bytes. */
+trusted fun bnModulusFrom(data: int, count: int, words: int): BnModulus {
+    val total = words * 3 + 1 + bnScratchWords(words)
+    val memory = bnAllocate(total)
+    val modulus = BnModulus(memory, words)
+    bnFromBytes(modulus.value(), words, data, count)
+    bnInverseWord(modulus.inverse(), modulus.value())
+    bnResidueSquare(modulus.square(), modulus.value(), words, modulus.scratch())
+    val unit = bnAllocate(words)
+    ablaUnsafeStoreU32(bnPointer(unit), 1)
+    bnMultiply(modulus, modulus.one(), modulus.square(), unit)
+    bnRelease(unit, words)
+    modulus
+}
+
+trusted fun bnModulusRelease(modulus: BnModulus): void = bnRelease(modulus.memory, modulus.total())
+
+@inline trusted fun bnMultiply(modulus: BnModulus, out: int, a: int, b: int): void =
+    bnMontgomeryMultiply(out, a, b, modulus.value(), modulus.inverse(), modulus.words, modulus.scratch())
+
+// Into and out of Montgomery form.
+trusted fun bnEncode(modulus: BnModulus, out: int, a: int): void = bnMultiply(modulus, out, a, modulus.square())
+
+trusted fun bnDecode(modulus: BnModulus, out: int, a: int): void {
+    val unit = bnAllocate(modulus.words)
+    ablaUnsafeStoreU32(bnPointer(unit), 1)
+    bnMultiply(modulus, out, a, unit)
+    bnRelease(unit, modulus.words)
+}
+
+private val BN_WINDOW_ENTRIES = 16
+
+/** `out` = `base` ^ `exponent` mod the modulus, `base` below it in plain form, `exponent` of `bits` bits in
+ *  limbs. Every window squares four times and multiplies once by an entry read from all sixteen, whatever
+ *  the exponent's bits are. */
+@noinline trusted fun bnExpSecret(modulus: BnModulus, out: int, base: int, exponent: int, bits: int): void {
+    val words = modulus.words
+    val table = bnAllocate(BN_WINDOW_ENTRIES * words)
+    val entry = bnAllocate(words)
+    bnCopy(table, modulus.one(), words)
+    bnEncode(modulus, table + words * 4, base)
+    for (i in 2 until BN_WINDOW_ENTRIES) {
+        bnMultiply(modulus, table + i * words * 4, table + (i - 1) * words * 4, table + words * 4)
+    }
+    val windows = (bits + 3) / 4
+    bnCopy(out, modulus.one(), words)
+    var window = windows - 1
+    while (window >= 0) {
+        for (i in 0 until 4) bnMultiply(modulus, out, out, out)
+        val position = window * 4
+        val limb = position / 32
+        val offset = position % 32
+        var digit = bnLoad(exponent + limb * 4) >> offset
+        if (offset > 28 && (limb + 1) * 32 < bits) digit = digit | (bnLoad(exponent + (limb + 1) * 4) << (32 - offset))
+        bnLookup(entry, table, BN_WINDOW_ENTRIES, words, digit & secretU32(u32(15)))
+        bnMultiply(modulus, out, out, entry)
+        window = window - 1
+    }
+    bnDecode(modulus, out, out)
+    bnRelease(table, BN_WINDOW_ENTRIES * words)
+    bnRelease(entry, words)
+}
+
+/** `out` = `base` ^ `exponent` mod the modulus, with a **public** big-endian exponent. `base` stays secret:
+ *  this branches only on the exponent's bits. */
+@noinline trusted fun bnExpPublic(modulus: BnModulus, out: int, base: int, exponent: string): void {
+    val words = modulus.words
+    val encoded = bnAllocate(words)
+    bnEncode(modulus, encoded, base)
+    bnCopy(out, modulus.one(), words)
+    for (at in 0 until exponent.size) {
+        val byte = int(exponent[at])
+        var bit = 7
+        while (bit >= 0) {
+            bnMultiply(modulus, out, out, out)
+            if (((byte >> bit) & 1) == 1) bnMultiply(modulus, out, out, encoded)
+            bit = bit - 1
+        }
+    }
+    bnDecode(modulus, out, out)
+    bnRelease(encoded, words)
+}
+
+/** `out` (aWords + bWords limbs) = `a` * `b`. */
+@noinline trusted fun bnMultiplyPlain(out: int, a: int, aWords: int, b: int, bWords: int): void {
+    bnClear(out, aWords + bWords)
+    for (i in 0 until bWords) bnAddMultipleBody(out + i * 4, a, aWords, bnLoad(b + i * 4))
+}
+
+/** `out` += `a` * `multiplier`, the carry stored after aWords limbs. */
+@inline trusted fun bnAddMultipleBody(out: int, a: int, aWords: int, multiplier: secretU32): void {
+    val wide = multiplier.widen()
+    var carry = secretU64(u64(0))
+    for (j in 0 until aWords) {
+        val sum = bnLoad(a + j * 4).widen() * wide + bnLoad(out + j * 4).widen() + carry
+        bnStore(out + j * 4, sum.low())
+        carry = sum.high().widen()
+    }
+    bnStore(out + aWords * 4, carry.low())
+}
+
+/** `a` < `b` as a public answer to two values allowed to be known. */
+trusted fun bnLessPublic(a: int, b: int, words: int): bool {
+    var i = words - 1
+    while (i >= 0) {
+        val x = ablaUnsafeLoadU32(bnPointer(a + i * 4))
+        val y = ablaUnsafeLoadU32(bnPointer(b + i * 4))
+        if (x != y) return (x & 4294967295) < (y & 4294967295)
+        i = i - 1
+    }
+    false
+}
+
+/** Whether two values are the same, as a mask made public: for a check that fails loudly. */
+trusted fun bnEqual(a: int, b: int, words: int): bool {
+    var difference = secretU32(u32(0))
+    for (j in 0 until words) difference = difference | (bnLoad(a + j * 4) ^ bnLoad(b + j * 4))
+    ctIsZero(difference).declassify() != u32(0)
+}
+
+// --- Inversion of a public value, in variable time ------------------------------------------
+// For the blinding factor: what is inverted is r * t, and t is random, so what its running time
+// shows has nothing to do with r. Odd modulus only.
+
+fun bnPublicIsEven(a: array<int>): bool = (a[0] & 1) == 0
+
+fun bnPublicIsZero(a: array<int>): bool {
+    for (limb in a) if (limb != 0) return false
+    true
+}
+
+fun bnPublicIsOne(a: array<int>): bool {
+    if (a[0] != 1) return false
+    for (i in 1 until a.size) if (a[i] != 0) return false
+    true
+}
+
+fun bnPublicHalve(var a: array<int>): void {
+    var carry = 0
+    var i = a.size - 1
+    while (i >= 0) {
+        val next = a[i] & 1
+        a[i] = (a[i] >> 1) | (carry << 31)
+        carry = next
+        i = i - 1
+    }
+    return
+}
+
+fun bnPublicAdd(var a: array<int>, b: array<int>): void {
+    var carry = 0
+    for (i in 0 until a.size) {
+        val sum = a[i] + b[i] + carry
+        a[i] = sum & 4294967295
+        carry = sum >> 32
+    }
+    return
+}
+
+fun bnPublicSubtract(var a: array<int>, b: array<int>): void {
+    var borrow = 0
+    for (i in 0 until a.size) {
+        val difference = a[i] - b[i] - borrow
+        a[i] = difference & 4294967295
+        borrow = if (difference < 0) 1 else 0
+    }
+    return
+}
+
+fun bnPublicLess(a: array<int>, b: array<int>): bool {
+    var i = a.size - 1
+    while (i >= 0) {
+        if (a[i] != b[i]) return a[i] < b[i]
+        i = i - 1
+    }
+    false
+}
+
+/** The inverse mod `modulus` (odd) of `value`, or an empty array if there is none. */
+fun bnPublicInverse(value: array<int>, modulus: array<int>): array<int> {
+    val size = modulus.size
+    val zero: array<int> = []
+    for (i in 0 until size) zero.append(0)
+    val u: array<int> = []
+    val v: array<int> = []
+    val x1: array<int> = []
+    val x2: array<int> = []
+    for (i in 0 until size) {
+        u.append(value[i])
+        v.append(modulus[i])
+        x1.append(if (i == 0) 1 else 0)
+        x2.append(0)
+    }
+    if (bnPublicIsZero(u)) return []
+    // One word more, for the sums below before they halve.
+    u.append(0)
+    v.append(0)
+    x1.append(0)
+    x2.append(0)
+    val wide: array<int> = []
+    for (i in 0 until size) wide.append(modulus[i])
+    wide.append(0)
+    while (!bnPublicIsOne(u) && !bnPublicIsOne(v)) {
+        if (bnPublicIsZero(u) || bnPublicIsZero(v)) return []
+        while (bnPublicIsEven(u)) {
+            bnPublicHalve(u)
+            if (!bnPublicIsEven(x1)) bnPublicAdd(x1, wide)
+            bnPublicHalve(x1)
+        }
+        while (bnPublicIsEven(v)) {
+            bnPublicHalve(v)
+            if (!bnPublicIsEven(x2)) bnPublicAdd(x2, wide)
+            bnPublicHalve(x2)
+        }
+        if (bnPublicLess(u, v)) {
+            bnPublicSubtract(v, u)
+            if (bnPublicLess(x2, x1)) bnPublicAdd(x2, wide)
+            bnPublicSubtract(x2, x1)
+        } else {
+            bnPublicSubtract(u, v)
+            if (bnPublicLess(x1, x2)) bnPublicAdd(x1, wide)
+            bnPublicSubtract(x1, x2)
+        }
+    }
+    val answer = if (bnPublicIsOne(u)) x1 else x2
+    val result: array<int> = []
+    for (i in 0 until size) result.append(answer[i])
+    result
+}

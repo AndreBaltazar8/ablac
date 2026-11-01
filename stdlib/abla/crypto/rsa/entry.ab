@@ -1,0 +1,609 @@
+// RSA with no OpenSSL: PKCS#1 v1.5 and OAEP encryption and verification, PEM, DER, PKCS#8, SPKI and X.509
+// public keys, and PKCS#1 v1.5 signing with blinding on constant-time arithmetic (abla/crypto/bignum). The
+// names are abla/crypto/hosted's. What each protects against is in docs/stdlib/security-and-dates.md.
+
+import "abla/bytes"
+import "abla/ct"
+import "abla/crypto"
+import "abla/crypto/bignum"
+import "abla/crypto/der"
+import "abla/random"
+import "abla/simd/target"
+import "abla/text"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+export import "abla/crypto/result"
+
+// --- Randomness: encryption and blinding need it, and refuse without it --------------------
+
+var cryptoRandomIsSet = false
+var cryptoRandomSource: (int) -> string = { count: int -> "" }
+
+/** What gives `count` random bytes on a target with no getrandom here: Wasm (a host's
+ *  crypto.getRandomValues), an ESP32's hardware RNG. Its quality is yours to answer for. */
+fun cryptoSetRandom(source: (int) -> string): void {
+    cryptoRandomSource = source
+    cryptoRandomIsSet = true
+    return
+}
+
+fun cryptoRandomBytes(count: int): string {
+    if (cryptoRandomIsSet) {
+        val given: string = cryptoRandomSource(count)
+        return if (given.size == count) given else ""
+    }
+    // abla/random's getrandom has x86-64 Linux's system call number.
+    if (simdTargetArch() != SIMD_ARCH_X86_64) return ""
+    val made = secureRandomBytes(count)
+    if (made.succeeded) made.bytes else ""
+}
+
+private val RSA_NO_RANDOM = "no random source here: call cryptoSetRandom"
+private val rsaMinimumBits = 2048
+private val rsaLegacyMinimumBits = 1024
+// As OpenSSL, for a key that would only be a way to waste time.
+private val rsaMaximumBits = 16384
+
+// --- Keys ------------------------------------------------------------------------------------
+
+/** A public key: the modulus, big-endian without leading zeros, and the exponent. Check `error` or `ok()`. */
+class RsaPublicKey(val modulus: string, val exponent: string, val bits: int, val error: string) {
+    fun ok(): bool = this.error == ""
+}
+
+fun rsaPublicFailed(error: string): RsaPublicKey = RsaPublicKey("", "", 0, error)
+
+/** A private key, its numbers in memory wiped when dropped. Check `error` or `ok()`. */
+resource class RsaPrivateKey(
+    val modulus: string, val publicExponent: string, val bits: int, val error: string,
+    val memory: int, val primeWords: int, val fieldWords: int
+) {
+    trusted fun drop(): void {
+        if (this.memory != 0) bnRelease(this.memory, this.fieldWords)
+        return
+    }
+    fun ok(): bool = this.memory != 0
+
+    // Each is primeWords limbs in the key's memory.
+    fun primeP(): int = this.memory
+    fun primeQ(): int = this.memory + this.primeWords * 4
+    fun exponentP(): int = this.memory + this.primeWords * 8
+    fun exponentQ(): int = this.memory + this.primeWords * 12
+    fun inverseQ(): int = this.memory + this.primeWords * 16
+}
+
+trusted fun rsaPrivateFailed(error: string): RsaPrivateKey = RsaPrivateKey("", "", 0, error, 0, 0, 0)
+
+fun rsaBitLength(value: string): int {
+    if (value.size == 0) return 0
+    var top = int(value[0])
+    var bits = (value.size - 1) * 8
+    while (top > 0) {
+        bits = bits + 1
+        top = top >> 1
+    }
+    bits
+}
+
+fun rsaPublicFromNumbers(modulus: string, exponent: string, unreadable: string): RsaPublicKey {
+    if (modulus == "" || exponent == "") return rsaPublicFailed(unreadable)
+    val bits = rsaBitLength(modulus)
+    if ((int(modulus[modulus.size - 1]) & 1) == 0) return rsaPublicFailed("an RSA modulus is odd")
+    if (bits > rsaMaximumBits) return rsaPublicFailed("the key has over 16384 bits")
+    if ((int(exponent[exponent.size - 1]) & 1) == 0) return rsaPublicFailed("an RSA exponent is odd")
+    if (exponent.size == 1 && int(exponent[0]) < 3) return rsaPublicFailed("the RSA exponent is too small")
+    if (rsaBitLength(exponent) > bits) return rsaPublicFailed("the RSA exponent is too large")
+    RsaPublicKey(modulus, exponent, bits, "")
+}
+
+// rsaEncryption, 1.2.840.113549.1.1.1.
+private val OID_RSA = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"
+
+/** RSAPublicKey: SEQUENCE { modulus, exponent } */
+fun rsaPublicFromPkcs1(der: string, begin: int, end: int, unreadable: string): RsaPublicKey {
+    val outer = derItem(der, begin, end)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != end) return rsaPublicFailed(unreadable)
+    val modulus = derItem(der, outer.start, outer.end)
+    if (!modulus.ok) return rsaPublicFailed(unreadable)
+    val exponent = derItem(der, modulus.end, outer.end)
+    if (!exponent.ok || exponent.end != outer.end) return rsaPublicFailed(unreadable)
+    rsaPublicFromNumbers(derPositiveInteger(der, modulus), derPositiveInteger(der, exponent), unreadable)
+}
+
+/** Whether an AlgorithmIdentifier says rsaEncryption, with NULL or absent parameters. */
+fun rsaAlgorithmIsRsa(der: string, algorithm: DerItem): bool {
+    if (!algorithm.ok || algorithm.tag != DER_SEQUENCE) return false
+    val oid = derItem(der, algorithm.start, algorithm.end)
+    if (!oid.ok || oid.tag != DER_OID || der.slice(oid.start, oid.end) != OID_RSA) return false
+    if (oid.end == algorithm.end) return true
+    val parameters = derItem(der, oid.end, algorithm.end)
+    parameters.ok && parameters.tag == 5 && parameters.start == parameters.end && parameters.end == algorithm.end
+}
+
+/** SubjectPublicKeyInfo at `begin`, which must end at `end`. */
+fun rsaPublicFromSpki(der: string, begin: int, end: int, unreadable: string): RsaPublicKey {
+    val outer = derItem(der, begin, end)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != end) return rsaPublicFailed(unreadable)
+    val algorithm = derItem(der, outer.start, outer.end)
+    if (!algorithm.ok) return rsaPublicFailed(unreadable)
+    val key = derItem(der, algorithm.end, outer.end)
+    if (!key.ok || key.tag != DER_BIT_STRING || key.end != outer.end || key.end == key.start) {
+        return rsaPublicFailed(unreadable)
+    }
+    if (!rsaAlgorithmIsRsa(der, algorithm)) return rsaPublicFailed("not an RSA key")
+    if (int(der[key.start]) != 0) return rsaPublicFailed(unreadable)
+    rsaPublicFromPkcs1(der, key.start + 1, key.end, unreadable)
+}
+
+/** SubjectPublicKeyInfo, or what hosted also reads there, in DER. */
+fun rsaPublicKeyFromDer(der: string): RsaPublicKey =
+    rsaPublicFromSpki(der, 0, der.size, "not a readable RSA public key in DER")
+
+/** The key of an X.509 certificate in DER. Neither its chain, its dates nor its signature is checked. */
+fun rsaPublicKeyFromCertificateDer(der: string): RsaPublicKey {
+    val unreadable = "not a readable X.509 certificate in DER"
+    val certificate = derItem(der, 0, der.size)
+    if (!certificate.ok || certificate.tag != DER_SEQUENCE || certificate.end != der.size) {
+        return rsaPublicFailed(unreadable)
+    }
+    val tbs = derItem(der, certificate.start, certificate.end)
+    if (!tbs.ok || tbs.tag != DER_SEQUENCE) return rsaPublicFailed(unreadable)
+    var at = tbs.start
+    var item = derItem(der, at, tbs.end)
+    // An optional [0] version, then serial, signature, issuer, validity, subject.
+    if (item.ok && item.tag == 160) {
+        at = item.end
+        item = derItem(der, at, tbs.end)
+    }
+    for (skip in 0 until 5) {
+        if (!item.ok) return rsaPublicFailed(unreadable)
+        at = item.end
+        item = derItem(der, at, tbs.end)
+    }
+    if (!item.ok) return rsaPublicFailed(unreadable)
+    rsaPublicFromSpki(der, at, item.end, unreadable)
+}
+
+/** `PUBLIC KEY` (SubjectPublicKeyInfo), `RSA PUBLIC KEY`, or the key of a `CERTIFICATE`. */
+fun rsaPublicKeyFromPem(pem: string): RsaPublicKey {
+    val unreadable = "not a readable RSA public key in PEM"
+    val label = pemLabel(pem)
+    val der = pemBase64Decode(pemBody(pem, label))
+    if (der == "") return rsaPublicFailed(unreadable)
+    if (label == "PUBLIC KEY") return rsaPublicFromSpki(der, 0, der.size, unreadable)
+    if (label == "RSA PUBLIC KEY") return rsaPublicFromPkcs1(der, 0, der.size, unreadable)
+    if (label == "CERTIFICATE") return rsaPublicKeyFromCertificateDer(der)
+    rsaPublicFailed(unreadable)
+}
+
+// --- Private keys -----------------------------------------------------------------------------
+
+/** RSAPrivateKey, in PKCS#1. Its numbers go into raw memory; `der` itself remains a string, which nothing
+ *  wipes: see the docs. */
+trusted fun rsaPrivateFromPkcs1(der: string, begin: int, end: int, unreadable: string): RsaPrivateKey {
+    val outer = derItem(der, begin, end)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != end) return rsaPrivateFailed(unreadable)
+    val version = derItem(der, outer.start, outer.end)
+    if (!version.ok || version.tag != DER_INTEGER || der.slice(version.start, version.end) != "\x00") {
+        return rsaPrivateFailed(unreadable)
+    }
+    val numbers: array<string> = []
+    var at = version.end
+    for (index in 0 until 8) {
+        val item = derItem(der, at, outer.end)
+        if (!item.ok) return rsaPrivateFailed(unreadable)
+        val value = derPositiveInteger(der, item)
+        if (value == "") return rsaPrivateFailed(unreadable)
+        numbers.append(value)
+        at = item.end
+    }
+    if (at != outer.end) return rsaPrivateFailed(unreadable)
+    rsaPrivateFromNumbers(numbers[0], numbers[1], numbers[3], numbers[4], numbers[5], numbers[6], numbers[7])
+}
+
+private val RSA_CHECK_FAILED = "the RSA private key failed its consistency check"
+
+trusted fun rsaPrivateFromNumbers(
+    modulus: string, exponent: string, p: string, q: string, dp: string, dq: string, qInverse: string
+): RsaPrivateKey {
+    val checkedPublic = rsaPublicFromNumbers(modulus, exponent, RSA_CHECK_FAILED)
+    if (!checkedPublic.ok()) return rsaPrivateFailed(checkedPublic.error)
+    val bits = checkedPublic.bits
+    if ((int(p[p.size - 1]) & 1) == 0 || (int(q[q.size - 1]) & 1) == 0) return rsaPrivateFailed(RSA_CHECK_FAILED)
+    // One size of limbs for both primes and their numbers: the larger's, which is at least half
+    // the modulus's, so a value below the modulus fits in twice as many. Their sizes aren't hidden.
+    var largest = if (p.size > q.size) p.size else q.size
+    if (dp.size > largest) largest = dp.size
+    if (dq.size > largest) largest = dq.size
+    if (qInverse.size > largest) largest = qInverse.size
+    val words = (largest + 3) / 4
+    if (words * 2 < (modulus.size + 3) / 4) return rsaPrivateFailed(RSA_CHECK_FAILED)
+    val total = words * 5
+    val memory = bnAllocate(total)
+    val key = RsaPrivateKey(modulus, exponent, bits, "", memory, words, total)
+    bnFromBytes(key.primeP(), words, ablaUnsafeStringAddress(p), p.size)
+    bnFromBytes(key.primeQ(), words, ablaUnsafeStringAddress(q), q.size)
+    bnFromBytes(key.exponentP(), words, ablaUnsafeStringAddress(dp), dp.size)
+    bnFromBytes(key.exponentQ(), words, ablaUnsafeStringAddress(dq), dq.size)
+    bnFromBytes(key.inverseQ(), words, ablaUnsafeStringAddress(qInverse), qInverse.size)
+    if (!rsaPrivateIsConsistent(key)) {
+        // key's drop wipes and frees its memory.
+        val failed = rsaPrivateFailed(RSA_CHECK_FAILED)
+        return failed
+    }
+    key
+}
+
+/** p * q is the modulus, and the key takes a number to its power and back. */
+trusted fun rsaPrivateIsConsistent(key: RsaPrivateKey): bool {
+    val words = key.primeWords
+    val wide = words * 2
+    val product = bnAllocate(wide)
+    val expected = bnAllocate(wide)
+    bnMultiplyPlain(product, key.primeP(), words, key.primeQ(), words)
+    bnFromBytes(expected, wide, ablaUnsafeStringAddress(key.modulus), key.modulus.size)
+    val same = bnEqual(product, expected, wide)
+    bnRelease(product, wide)
+    bnRelease(expected, wide)
+    if (!same) return false
+    val probe = "\x02" + "\x00".repeat(key.modulus.size - 2) + "\x03"
+    val signed = rsaPrivateOperation(key, probe)
+    signed.ok
+}
+
+// PrivateKeyInfo: SEQUENCE { version, AlgorithmIdentifier, OCTET STRING { RSAPrivateKey }, ... }
+trusted fun rsaPrivateFromPkcs8(der: string, unreadable: string): RsaPrivateKey {
+    val outer = derItem(der, 0, der.size)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != der.size) return rsaPrivateFailed(unreadable)
+    val version = derItem(der, outer.start, outer.end)
+    if (!version.ok || version.tag != DER_INTEGER) return rsaPrivateFailed(unreadable)
+    val algorithm = derItem(der, version.end, outer.end)
+    if (!algorithm.ok) return rsaPrivateFailed(unreadable)
+    if (!rsaAlgorithmIsRsa(der, algorithm)) return rsaPrivateFailed("not an RSA key")
+    val key = derItem(der, algorithm.end, outer.end)
+    if (!key.ok || key.tag != DER_OCTET_STRING) return rsaPrivateFailed(unreadable)
+    rsaPrivateFromPkcs1(der, key.start, key.end, unreadable)
+}
+
+/** Unencrypted PKCS#8 or PKCS#1 DER. */
+trusted fun rsaPrivateKeyFromDer(der: string): RsaPrivateKey {
+    val unreadable = "not a readable RSA private key in DER"
+    val outer = derItem(der, 0, der.size)
+    if (!outer.ok || outer.tag != DER_SEQUENCE || outer.end != der.size) return rsaPrivateFailed(unreadable)
+    val version = derItem(der, outer.start, outer.end)
+    if (!version.ok) return rsaPrivateFailed(unreadable)
+    val next = derItem(der, version.end, outer.end)
+    if (!next.ok) return rsaPrivateFailed(unreadable)
+    if (next.tag == DER_SEQUENCE) rsaPrivateFromPkcs8(der, unreadable)
+    else rsaPrivateFromPkcs1(der, 0, der.size, unreadable)
+}
+
+/** `PRIVATE KEY` (PKCS#8) or `RSA PRIVATE KEY` (PKCS#1). Encrypted ones are refused, as are RSA PSS keys:
+ *  abla/crypto/hosted reads those. */
+trusted fun rsaPrivateKeyFromPem(pem: string): RsaPrivateKey {
+    val unreadable = "not a readable RSA private key in PEM"
+    val label = pemLabel(pem)
+    if (label == "ENCRYPTED PRIVATE KEY") return rsaPrivateFailed("an encrypted key: abla/crypto/rsa doesn't read these")
+    val body = pemBody(pem, label)
+    if (bodyHasHeaders(body)) return rsaPrivateFailed("an encrypted key: abla/crypto/rsa doesn't read these")
+    val der = pemBase64Decode(body)
+    if (der == "") return rsaPrivateFailed(unreadable)
+    if (label == "PRIVATE KEY") return rsaPrivateFromPkcs8(der, unreadable)
+    if (label == "RSA PRIVATE KEY") return rsaPrivateFromPkcs1(der, 0, der.size, unreadable)
+    rsaPrivateFailed(if (label == "EC PRIVATE KEY") "not an RSA key" else unreadable)
+}
+
+fun bodyHasHeaders(body: string): bool = pemFind(body, "Proc-Type:", 0) >= 0
+
+// --- The private operation -------------------------------------------------------------------
+
+/** `value`, bytes of the modulus's length below it, to the private exponent: blinded, by CRT, in constant
+ *  time, and checked with the public exponent before it's returned. */
+trusted fun rsaPrivateOperation(key: RsaPrivateKey, value: string): CryptoResult {
+    val modulusBytes = key.modulus.size
+    val nWords = (modulusBytes + 3) / 4
+    val modulus = bnModulusFrom(ablaUnsafeStringAddress(key.modulus), modulusBytes, nWords)
+    val input = bnAllocate(nWords)
+    val blinded = bnAllocate(nWords)
+    val output = bnAllocate(nWords)
+    val factor = bnAllocate(nWords)
+    val inverse = bnAllocate(nWords)
+    bnFromBytes(input, nWords, ablaUnsafeStringAddress(value), value.size)
+    var result = cryptoFailed(RSA_NO_RANDOM)
+    if (rsaBlindingFactors(key, modulus, factor, inverse)) {
+        // blinded = value * factor^e mod n; the private operation; * factor^-1 mod n.
+        val power = bnAllocate(nWords)
+        bnExpPublic(modulus, power, factor, key.publicExponent)
+        rsaMultiplyPlain(modulus, blinded, input, power)
+        bnRelease(power, nWords)
+        rsaCrt(key, modulus, output, blinded)
+        rsaMultiplyPlain(modulus, output, output, inverse)
+        val check = bnAllocate(nWords)
+        bnExpPublic(modulus, check, output, key.publicExponent)
+        val right = bnEqual(check, input, nWords)
+        bnRelease(check, nWords)
+        if (right) {
+            val out = nativeByteBuffer(modulusBytes + 1)
+            bnToBytes(ablaUnsafePointerAddress(out.pointerAt(0)), modulusBytes, output)
+            result = CryptoResult(out.adoptString(modulusBytes), true, "")
+        } else result = cryptoFailed(RSA_CHECK_FAILED)
+    }
+    bnRelease(input, nWords)
+    bnRelease(blinded, nWords)
+    bnRelease(output, nWords)
+    bnRelease(factor, nWords)
+    bnRelease(inverse, nWords)
+    bnModulusRelease(modulus)
+    result
+}
+
+/** `out` = a * b mod the modulus, all in plain form. */
+trusted fun rsaMultiplyPlain(modulus: BnModulus, out: int, a: int, b: int): void {
+    val encoded = bnAllocate(modulus.words)
+    bnEncode(modulus, encoded, a)
+    bnMultiply(modulus, out, encoded, b)
+    bnRelease(encoded, modulus.words)
+}
+
+/** A random factor and its inverse, without inverting anything secret: r * t, with t random, is what gets
+ *  inverted, in variable time, and then r^-1 = (r * t)^-1 * t. False if there's no randomness. */
+trusted fun rsaBlindingFactors(key: RsaPrivateKey, modulus: BnModulus, factor: int, inverse: int): bool {
+    val nWords = modulus.words
+    val mask = bnAllocate(nWords)
+    val product = bnAllocate(nWords)
+    var done = false
+    var tries = 0
+    while (!done && tries < 16) {
+        tries = tries + 1
+        val r = cryptoRandomBytes(key.modulus.size)
+        val t = cryptoRandomBytes(key.modulus.size)
+        if (r == "" || t == "") break
+        bnFromBytes(factor, nWords, ablaUnsafeStringAddress(r), r.size)
+        bnFromBytes(mask, nWords, ablaUnsafeStringAddress(t), t.size)
+        // Reduced by a Montgomery multiplication by 2^2k mod n, then back out: each below n.
+        bnEncode(modulus, factor, factor)
+        bnDecode(modulus, factor, factor)
+        bnEncode(modulus, mask, mask)
+        bnDecode(modulus, mask, mask)
+        rsaMultiplyPlain(modulus, product, factor, mask)
+        val publicProduct = rsaPublicLimbs(product, nWords)
+        val publicModulus = rsaPublicLimbs(modulus.value(), nWords)
+        val inverted = bnPublicInverse(publicProduct, publicModulus)
+        if (inverted.size == nWords) {
+            val held = bnAllocate(nWords)
+            for (i in 0 until nWords) {
+                ablaUnsafeStoreU32(bnPointer(held + i * 4), inverted[i])
+            }
+            rsaMultiplyPlain(modulus, inverse, held, mask)
+            bnRelease(held, nWords)
+            done = true
+        }
+    }
+    bnRelease(mask, nWords)
+    bnRelease(product, nWords)
+    done
+}
+
+// A value allowed to be known, as limbs for the variable-time inverse.
+trusted fun rsaPublicLimbs(address: int, words: int): array<int> {
+    val limbs: array<int> = []
+    for (i in 0 until words) limbs.append(ablaUnsafeLoadU32(bnPointer(address + i * 4)) & 4294967295)
+    limbs
+}
+
+/** `out` = `value` ^ d mod n, by CRT with fixed-window exponents. */
+trusted fun rsaCrt(key: RsaPrivateKey, modulus: BnModulus, out: int, value: int): void {
+    val words = key.primeWords
+    val p = rsaModulusFromLimbs(key.primeP(), words)
+    val q = rsaModulusFromLimbs(key.primeQ(), words)
+    val m1 = bnAllocate(words)
+    val m2 = bnAllocate(words)
+    val h = bnAllocate(words)
+    val wide = words * 2
+    val nWords = modulus.words
+    val padded = bnAllocate(wide)
+    bnCopy(padded, value, nWords)
+    rsaReduceWide(p, m1, padded)
+    rsaReduceWide(q, m2, padded)
+    bnExpSecret(p, m1, m1, key.exponentP(), words * 32)
+    bnExpSecret(q, m2, m2, key.exponentQ(), words * 32)
+    // h = qInverse * (m1 - m2) mod p, with m2 first reduced mod p: q may be the larger.
+    val m2p = bnAllocate(words)
+    bnEncode(p, m2p, m2)
+    bnDecode(p, m2p, m2p)
+    var borrow = secretU32(u32(0))
+    for (j in 0 until words) {
+        val x = bnLoad(m1 + j * 4)
+        val y = bnLoad(m2p + j * 4)
+        val difference = x - y - borrow
+        borrow = ((~x & y) | ((~x | y) & difference)) >> 31
+        bnStore(h + j * 4, difference)
+    }
+    // Add p back if that went below zero.
+    val negative = ctFromLowBit(borrow)
+    var carry = secretU32(u32(0))
+    for (j in 0 until words) {
+        val x = bnLoad(h + j * 4)
+        val y = bnLoad(p.value() + j * 4) & negative
+        val sum = x + y + carry
+        carry = ((x & y) | ((x | y) & ~sum)) >> 31
+        bnStore(h + j * 4, sum)
+    }
+    rsaMultiplyPlain(p, h, h, key.inverseQ())
+    // out = m2 + h * q, which is below the modulus, whatever room the product had.
+    bnMultiplyPlain(padded, h, words, key.primeQ(), words)
+    carry = secretU32(u32(0))
+    for (j in 0 until wide) {
+        val x = bnLoad(padded + j * 4)
+        val y = if (j < words) bnLoad(m2 + j * 4) else secretU32(u32(0))
+        val sum = x + y + carry
+        carry = ((x & y) | ((x | y) & ~sum)) >> 31
+        bnStore(padded + j * 4, sum)
+    }
+    bnCopy(out, padded, nWords)
+    bnRelease(padded, wide)
+    bnRelease(m1, words)
+    bnRelease(m2, words)
+    bnRelease(m2p, words)
+    bnRelease(h, words)
+    bnModulusRelease(p)
+    bnModulusRelease(q)
+}
+
+trusted fun rsaModulusFromLimbs(limbs: int, words: int): BnModulus {
+    val bytes = nativeByteBuffer(words * 4 + 1)
+    val address = ablaUnsafePointerAddress(bytes.pointerAt(0))
+    bnToBytes(address, words * 4, limbs)
+    val modulus = bnModulusFrom(address, words * 4, words)
+    for (at in 0 until words * 4) ablaUnsafeStoreU8(bnPointer(address + at), 0)
+    bytes.close()
+    modulus
+}
+
+/** `out` = `value`, of 2 * words limbs, mod the modulus: low + high * 2^k, by multiplying each part. */
+trusted fun rsaReduceWide(modulus: BnModulus, out: int, value: int): void {
+    val words = modulus.words
+    val high = bnAllocate(words)
+    // A multiplication by 2^2k mod m is one by 2^k: high * 2^k as it stands, and low made plain again.
+    bnMultiply(modulus, high, value + words * 4, modulus.square())
+    bnEncode(modulus, out, value)
+    bnDecode(modulus, out, out)
+    var carry = secretU32(u32(0))
+    for (j in 0 until words) {
+        val x = bnLoad(out + j * 4)
+        val y = bnLoad(high + j * 4)
+        val sum = x + y + carry
+        carry = ((x & y) | ((x | y) & ~sum)) >> 31
+        bnStore(out + j * 4, sum)
+    }
+    bnConditionalSubtractBody(out, out, carry, modulus.value(), words, modulus.scratch())
+    bnRelease(high, words)
+}
+
+// --- EMSA-PKCS1-v1_5 --------------------------------------------------------------------------
+
+private val DIGEST_INFO_SHA1 = "\x30\x21\x30\x09\x06\x05\x2b\x0e\x03\x02\x1a\x05\x00\x04\x14"
+private val DIGEST_INFO_SHA256 = "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20"
+
+fun rsaEncodedSignature(size: int, digestInfo: string, digest: string): string {
+    val filler = size - 3 - digestInfo.size - digest.size
+    if (filler < 8) return ""
+    "\x00\x01" + "\xff".repeat(filler) + "\x00" + digestInfo + digest
+}
+
+/** `value` ^ e mod n, as `size` bytes, or "" if `value` isn't a number below n of that length. */
+trusted fun rsaPublicOperation(key: RsaPublicKey, value: string): string {
+    if (value.size != key.modulus.size) return ""
+    val size = key.modulus.size
+    val words = (size + 3) / 4
+    val modulus = bnModulusFrom(ablaUnsafeStringAddress(key.modulus), size, words)
+    val input = bnAllocate(words)
+    bnFromBytes(input, words, ablaUnsafeStringAddress(value), size)
+    var result = ""
+    if (bnLessPublic(input, modulus.value(), words)) {
+        val output = bnAllocate(words)
+        bnExpPublic(modulus, output, input, key.exponent)
+        val out = nativeByteBuffer(size + 1)
+        bnToBytes(ablaUnsafePointerAddress(out.pointerAt(0)), size, output)
+        result = out.adoptString(size)
+        bnRelease(output, words)
+    }
+    bnRelease(input, words)
+    bnModulusRelease(modulus)
+    result
+}
+
+fun rsaVerifyWith(key: RsaPublicKey, digestInfo: string, digest: string, signature: string): bool {
+    val expected = rsaEncodedSignature(key.modulus.size, digestInfo, digest)
+    if (expected == "") return false
+    val recovered = rsaPublicOperation(key, signature)
+    recovered != "" && recovered == expected
+}
+
+trusted fun rsaSignWith(key: RsaPrivateKey, digestInfo: string, digest: string): CryptoResult {
+    val encoded = rsaEncodedSignature(key.modulus.size, digestInfo, digest)
+    if (encoded == "") return cryptoFailed("the key is too small for this hash")
+    rsaPrivateOperation(key, encoded)
+}
+
+/** RSASSA-PKCS1-v1_5 with SHA-256, on a key of 2048 bits or more: deterministic, whatever the blinding. */
+trusted fun RsaPrivateKey.signPkcs1Sha256(message: string): CryptoResult {
+    if (!this.ok()) return cryptoFailed(this.error)
+    if (this.bits < rsaMinimumBits) return cryptoFailed("the key has under 2048 bits")
+    rsaSignWith(this, DIGEST_INFO_SHA256, sha256(message))
+}
+
+fun RsaPublicKey.verifyPkcs1Sha256(message: string, signature: string): bool =
+    this.ok() && this.bits >= rsaMinimumBits && rsaVerifyWith(this, DIGEST_INFO_SHA256, sha256(message), signature)
+
+/** SHA-1 collisions are practical, and 1024-bit RSA is within reach of a well-funded attacker, so nothing new
+ *  should use this. It exists for what mandates it, as Portugal's Despacho 8632/2014 does for invoices. */
+trusted fun RsaPrivateKey.signPkcs1Sha1Legacy(message: string): CryptoResult {
+    if (!this.ok()) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    rsaSignWith(this, DIGEST_INFO_SHA1, sha1(message))
+}
+
+fun RsaPublicKey.verifyPkcs1Sha1Legacy(message: string, signature: string): bool =
+    this.ok() && this.bits >= rsaLegacyMinimumBits && rsaVerifyWith(this, DIGEST_INFO_SHA1, sha1(message), signature)
+
+// --- Encryption ---------------------------------------------------------------------------------
+
+fun rsaMgf1(seed: string, size: int, hash: (string) -> string): string {
+    var out = ""
+    var counter = 0
+    while (out.size < size) {
+        val c = "${rsaByte(counter >> 24)}${rsaByte(counter >> 16)}${rsaByte(counter >> 8)}${rsaByte(counter)}"
+        out = out + hash(seed + c)
+        counter = counter + 1
+    }
+    out.slice(0, size)
+}
+
+fun rsaByte(value: int): string = byteEncode(value & 255)
+
+fun rsaEncryptOaep(key: RsaPublicKey, plaintext: string, hash: (string) -> string, hashSize: int): CryptoResult {
+    val size = key.modulus.size
+    if (plaintext.size + 2 * hashSize + 2 > size) return cryptoFailed("the input is too long for this key")
+    val seed = cryptoRandomBytes(hashSize)
+    if (seed == "") return cryptoFailed(RSA_NO_RANDOM)
+    val block = hash("") + "\x00".repeat(size - plaintext.size - 2 * hashSize - 2) + "\x01" + plaintext
+    val maskedBlock = binaryXor(block, rsaMgf1(seed, block.size, hash))
+    val maskedSeed = binaryXor(seed, rsaMgf1(maskedBlock, hashSize, hash))
+    val encrypted = rsaPublicOperation(key, "\x00" + maskedSeed + maskedBlock)
+    if (encrypted == "") cryptoFailed("the input is too long for this key") else CryptoResult(encrypted, true, "")
+}
+
+/** OAEP with SHA-256 for both hashes, on 2048 bits or more: what new designs use. */
+fun RsaPublicKey.encryptOaepSha256(plaintext: string): CryptoResult {
+    if (!this.ok()) return cryptoFailed(this.error)
+    if (this.bits < rsaMinimumBits) return cryptoFailed("the key has under 2048 bits")
+    rsaEncryptOaep(this, plaintext, { data: string -> sha256(data) }, 32)
+}
+
+/** OAEP with SHA-1 for both hashes, the default of Java's OAEPPadding and .NET's fOAEP. */
+fun RsaPublicKey.encryptOaepSha1Legacy(plaintext: string): CryptoResult {
+    if (!this.ok()) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    rsaEncryptOaep(this, plaintext, { data: string -> sha1(data) }, 20)
+}
+
+/** RSAES-PKCS1-v1_5, which AT's clients use for the WS-Security Nonce. Use it only where the protocol leaves
+ *  no choice; the danger is in decrypting, and this module doesn't decrypt. Randomized. */
+fun RsaPublicKey.encryptPkcs1Legacy(plaintext: string): CryptoResult {
+    if (!this.ok()) return cryptoFailed(this.error)
+    if (this.bits < rsaLegacyMinimumBits) return cryptoFailed("the key has under 1024 bits")
+    val size = this.modulus.size
+    if (plaintext.size + 11 > size) return cryptoFailed("the input is too long for this key")
+    val fillerSize = size - plaintext.size - 3
+    var filler = ""
+    while (filler.size < fillerSize) {
+        val random = cryptoRandomBytes(fillerSize * 2)
+        if (random == "") return cryptoFailed(RSA_NO_RANDOM)
+        for (at in 0 until random.size) {
+            if (filler.size < fillerSize && int(random[at]) != 0) filler = filler + random.slice(at, at + 1)
+        }
+    }
+    val encrypted = rsaPublicOperation(this, "\x00\x02" + filler + "\x00" + plaintext)
+    if (encrypted == "") cryptoFailed("the input is too long for this key") else CryptoResult(encrypted, true, "")
+}

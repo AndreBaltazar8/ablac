@@ -1,0 +1,75 @@
+// abla/crypto/aes and abla/crypto/rsa against abla/crypto/hosted on random inputs, byte for byte where the
+// answer is deterministic and each opening the other's where it isn't. On both of this module's paths.
+// tools/test-crypto-pure.sh passes the key files and the rounds.
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/aes" as pure
+import "abla/crypto/rsa" as pureRsa
+import "abla/crypto/hosted" as hosted
+import "abla/process/arguments"
+import "abla/random"
+import "abla/sys/linux"
+
+var failures = 0
+
+fun expect(ok: bool, what: string): void {
+    if (!ok) {
+        failures = failures + 1
+        if (failures < 30) println("FAIL $what")
+    }
+    return
+}
+
+fun random(count: int): string = if (count == 0) "" else secureRandomBytes(count).bytes
+
+fun main: int {
+    var rounds = 0
+    val text = processArgument(1)
+    for (at in 0 until text.size) rounds = rounds * 10 + int(text[at]) - 48
+    val sizes = [0, 1, 15, 16, 17, 31, 32, 33, 55, 64, 100, 1000, 4096]
+    val strongPem = linuxReadFile("${processArgument(0)}/k2048.pem", 65536)
+    val weakPem = linuxReadFile("${processArgument(0)}/k1024.pem", 65536)
+    val strongPublicPem = linuxReadFile("${processArgument(0)}/k2048-spki.pem", 65536)
+    val strong = pureRsa.rsaPrivateKeyFromPem(strongPem)
+    val weak = pureRsa.rsaPrivateKeyFromPem(weakPem)
+    val strongPublic = pureRsa.rsaPublicKeyFromPem(strongPublicPem)
+    val hostedStrong = hosted.rsaPrivateKeyFromPem(strongPem)
+    val hostedWeak = hosted.rsaPrivateKeyFromPem(weakPem)
+    val hostedPublic = hosted.rsaPublicKeyFromPem(strongPublicPem)
+    for (round in 0 until rounds) {
+        pure.aesUseHardware = round % 2 == 0
+        val size = sizes[round % sizes.size]
+        val message = random(size)
+        val aad = random(round % 40)
+        for (bytes in [16, 24, 32]) {
+            val key = random(bytes)
+            val iv = random(16)
+            val nonce = random(12)
+            val ecb = pure.aesEcbEncryptPkcs5(key, message)
+            expect(ecb.bytes == hosted.aesEcbEncryptPkcs5(key, message).bytes, "ecb encrypt $bytes $size")
+            expect(pure.aesEcbDecryptPkcs5(key, ecb.bytes).bytes == message, "ecb decrypt $bytes $size")
+            val cbc = pure.aesCbcEncryptPkcs7(key, iv, message)
+            expect(cbc.bytes == hosted.aesCbcEncryptPkcs7(key, iv, message).bytes, "cbc encrypt $bytes $size")
+            expect(pure.aesCbcDecryptPkcs7(key, iv, cbc.bytes).bytes == message, "cbc decrypt $bytes $size")
+            val gcm = pure.aesGcmEncrypt(key, nonce, message, aad)
+            expect(gcm.bytes == hosted.aesGcmEncrypt(key, nonce, message, aad).bytes, "gcm encrypt $bytes $size")
+            expect(pure.aesGcmDecrypt(key, nonce, gcm.bytes, aad).bytes == message, "gcm decrypt $bytes $size")
+            expect(hosted.aesGcmDecrypt(key, nonce, gcm.bytes, aad).ok, "hosted opens gcm $bytes $size")
+        }
+        val signature = strong.signPkcs1Sha256(message)
+        expect(signature.bytes == hostedStrong.signPkcs1Sha256(message).bytes, "sign sha256 $size")
+        expect(hostedPublic.verifyPkcs1Sha256(message, signature.bytes), "hosted verifies ours $size")
+        expect(strongPublic.verifyPkcs1Sha256(message, signature.bytes), "ours verifies ours $size")
+        val legacy = weak.signPkcs1Sha1Legacy(message)
+        expect(legacy.bytes == hostedWeak.signPkcs1Sha1Legacy(message).bytes, "sign sha1 $size")
+        val secret = random(round % 100)
+        val oaep = strongPublic.encryptOaepSha256(secret)
+        expect(hostedStrong.decryptOaepSha256(oaep.bytes).bytes == secret, "hosted opens oaep sha256")
+        val oaep1 = strongPublic.encryptOaepSha1Legacy(secret)
+        expect(hostedStrong.decryptOaepSha1Legacy(oaep1.bytes).bytes == secret, "hosted opens oaep sha1")
+        val pkcs1 = strongPublic.encryptPkcs1Legacy(secret)
+        expect(hostedStrong.decryptPkcs1Legacy(pkcs1.bytes).bytes == secret, "hosted opens pkcs1")
+    }
+    println("failures $failures")
+    if (failures == 0) 0 else 1
+}

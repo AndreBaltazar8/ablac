@@ -1,0 +1,218 @@
+// What must be refused, on keys made by tools/test-crypto.sh: wrong lengths, bad
+// padding, tampering, key formats, weak-key limits. Exit 1 on any failure.
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/aes"
+import "abla/crypto/rsa"
+import "abla/process/arguments"
+import "abla/sys/linux"
+import "abla/text"
+
+var failures = 0
+
+fun expect(ok: bool, what: string): void {
+    if (!ok) {
+        failures = failures + 1
+        println("FAIL $what")
+    }
+    return
+}
+
+fun refused(result: CryptoResult, why: string, what: string): void {
+    expect(!result.ok && result.bytes == "" && result.error.contains(why), "$what: ${result.error}")
+    return
+}
+
+fun flip(value: string, at: int): string {
+    val mask = "\x00".repeat(at) + "\x01" + "\x00".repeat(value.size - at - 1)
+    binaryXor(value, mask)
+}
+
+fun checkAes(): void {
+    val key = hexDecode("000102030405060708090a0b0c0d0e0f")
+    val iv = hexDecode("101112131415161718191a1b1c1d1e1f")
+    val nonce = hexDecode("202122232425262728292a2b")
+    for (size in [0, 1, 15, 17, 31, 33]) {
+        refused(aesEcbEncryptPkcs5("k".repeat(size), "x"), "16, 24 or 32", "ecb key $size")
+        refused(aesCbcEncryptPkcs7("k".repeat(size), iv, "x"), "16, 24 or 32", "cbc key $size")
+        refused(aesGcmEncrypt("k".repeat(size), nonce, "x"), "16, 24 or 32", "gcm key $size")
+    }
+    for (size in [0, 15, 17]) {
+        refused(aesCbcEncryptPkcs7(key, "i".repeat(size), "x"), "IV", "cbc iv $size")
+        refused(aesCbcDecryptPkcs7(key, "i".repeat(size), "x".repeat(16)), "IV", "cbc iv $size")
+    }
+    for (size in [0, 8, 11, 13, 16]) refused(aesGcmEncrypt(key, "n".repeat(size), "x"), "12 bytes", "gcm nonce $size")
+    for (size in [0, 1, 15, 17]) {
+        refused(aesEcbDecryptPkcs5(key, "c".repeat(size)), "16-byte blocks", "ecb length $size")
+        refused(aesCbcDecryptPkcs7(key, iv, "c".repeat(size)), "16-byte blocks", "cbc length $size")
+    }
+    for (size in [0, 1, 15]) refused(aesGcmDecrypt(key, nonce, "c".repeat(size)), "shorter than its tag", "gcm length $size")
+
+    // Every plaintext length around a block boundary comes back, and the padding is
+    // always added: a whole block grows by another.
+    for (size in [0, 1, 15, 16, 17, 31, 32, 33, 1000]) {
+        val message = "m".repeat(size)
+        val ecb = aesEcbEncryptPkcs5(key, message)
+        expect(ecb.ok && ecb.bytes.size == (size / 16 + 1) * 16, "ecb size $size")
+        expect(aesEcbDecryptPkcs5(key, ecb.bytes).bytes == message, "ecb round trip $size")
+        val cbc = aesCbcEncryptPkcs7(key, iv, message)
+        expect(aesCbcDecryptPkcs7(key, iv, cbc.bytes).bytes == message, "cbc round trip $size")
+        val gcm = aesGcmEncrypt(key, nonce, message, "aad")
+        expect(gcm.ok && gcm.bytes.size == size + 16, "gcm size $size")
+        val opened = aesGcmDecrypt(key, nonce, gcm.bytes, "aad")
+        expect(opened.ok && opened.bytes == message, "gcm round trip $size")
+    }
+
+    // Bad padding: decrypting these blocks with the raw cipher's plaintext ending as
+    // given. E(block) is the first block of its ECB padded encryption.
+    for (tail in ["\x00", "\x11", "\xff", "\x01\x02", "\x03\x03\x04"]) {
+        val block = "p".repeat(16 - tail.size) + tail
+        val ciphertext = aesEcbEncryptPkcs5(key, block).bytes.slice(0, 16)
+        refused(aesEcbDecryptPkcs5(key, ciphertext), "bad padding", "ecb bad padding")
+        val chained = binaryXor(aesEcbEncryptPkcs5(key, binaryXor(block, iv)).bytes.slice(0, 16), "\x00".repeat(16))
+        refused(aesCbcDecryptPkcs7(key, iv, chained), "bad padding", "cbc bad padding")
+    }
+
+    // GCM: any flipped bit anywhere, a wrong key, nonce or associated data.
+    val sealed = aesGcmEncrypt(key, nonce, "the message", "aad").bytes
+    for (at in 0 until sealed.size) refused(aesGcmDecrypt(key, nonce, flip(sealed, at), "aad"), "authentication failed", "gcm tamper $at")
+    refused(aesGcmDecrypt(key, nonce, sealed, "aaX"), "authentication failed", "gcm aad")
+    refused(aesGcmDecrypt(key, nonce, sealed), "authentication failed", "gcm no aad")
+    refused(aesGcmDecrypt(flip(key, 0), nonce, sealed, "aad"), "authentication failed", "gcm key")
+    refused(aesGcmDecrypt(key, flip(nonce, 0), sealed, "aad"), "authentication failed", "gcm nonce")
+    refused(aesGcmDecrypt(key, nonce, sealed.slice(0, sealed.size - 1), "aad"), "authentication failed", "gcm truncated")
+    return
+}
+
+fun read(name: string): string = linuxReadFile("${processArgument(0)}/$name", 1048576)
+
+fun checkKeys(): void {
+    val message = "2026-10-31;2026-10-31T12:00:00;FT A/1;12.30;"
+
+    // Every form of the same 1024-bit key signs alike, and verifies under every form
+    // of its public key.
+    val reference = rsaPrivateKeyFromPem(read("k1024.pem"))
+    expect(reference.ok() && reference.bits == 1024, "1024 pkcs8 pem: ${reference.error}")
+    val signed = reference.signPkcs1Sha1Legacy(message)
+    expect(signed.ok && signed.bytes.size == 128, "signature size")
+    expect(reference.signPkcs1Sha1Legacy(message).bytes == signed.bytes, "signing is deterministic")
+    expect(base64Encode(signed.bytes).size == 172, "172 characters")
+    val traditional = rsaPrivateKeyFromPem(read("k1024-traditional.pem"))
+    expect(traditional.signPkcs1Sha1Legacy(message).bytes == signed.bytes, "traditional pem: ${traditional.error}")
+    val pkcs8Der = rsaPrivateKeyFromDer(read("k1024.der"))
+    expect(pkcs8Der.signPkcs1Sha1Legacy(message).bytes == signed.bytes, "pkcs8 der: ${pkcs8Der.error}")
+    val pkcs1Der = rsaPrivateKeyFromDer(read("k1024-traditional.der"))
+    expect(pkcs1Der.signPkcs1Sha1Legacy(message).bytes == signed.bytes, "pkcs1 der: ${pkcs1Der.error}")
+
+
+    for (name in ["spki.pem", "rsapublic.pem", "certificate.pem"]) {
+        val key = rsaPublicKeyFromPem(read(name))
+        expect(key.ok() && key.bits == 1024, "$name: ${key.error}")
+        expect(key.verifyPkcs1Sha1Legacy(message, signed.bytes), "$name verifies")
+    }
+    val fromSpki = rsaPublicKeyFromDer(read("spki.der"))
+    expect(fromSpki.verifyPkcs1Sha1Legacy(message, signed.bytes), "spki der: ${fromSpki.error}")
+    val fromCertificate = rsaPublicKeyFromCertificateDer(read("certificate.der"))
+    expect(fromCertificate.verifyPkcs1Sha1Legacy(message, signed.bytes), "certificate der: ${fromCertificate.error}")
+
+    // Tampering: any flipped bit of the signature or the message, the wrong key.
+    for (at in 0 until signed.bytes.size) {
+        expect(!fromSpki.verifyPkcs1Sha1Legacy(message, flip(signed.bytes, at)), "tampered signature $at")
+    }
+    for (at in 0 until message.size) {
+        expect(!fromSpki.verifyPkcs1Sha1Legacy(flip(message, at), signed.bytes), "tampered message $at")
+    }
+    expect(!fromSpki.verifyPkcs1Sha1Legacy(message, ""), "empty signature")
+    expect(!fromSpki.verifyPkcs1Sha1Legacy(message, signed.bytes.slice(0, 127)), "short signature")
+    expect(!fromSpki.verifyPkcs1Sha1Legacy(message, signed.bytes + "\x00"), "long signature")
+
+    // 1024 bits and SHA-1 only under the Legacy names.
+    refused(reference.signPkcs1Sha256(message), "under 2048", "1024 sha256 sign")
+    expect(!fromSpki.verifyPkcs1Sha256(message, signed.bytes), "1024 sha256 verify")
+    refused(fromSpki.encryptOaepSha256("x"), "under 2048", "1024 oaep")
+
+    // A 2048-bit key: sizes, tampering, and the padding limits.
+    val strong = rsaPrivateKeyFromPem(read("k2048.pem"))
+    val strongPublic = rsaPublicKeyFromPem(read("k2048-spki.pem"))
+    expect(strong.bits == 2048, "2048 bits")
+    val signature = strong.signPkcs1Sha256(message)
+    expect(signature.ok && signature.bytes.size == 256, "2048 signature")
+    expect(strongPublic.verifyPkcs1Sha256(message, signature.bytes), "2048 verifies")
+    expect(!strongPublic.verifyPkcs1Sha1Legacy(message, signature.bytes), "sha256 signature isn't sha1's")
+    expect(!strongPublic.verifyPkcs1Sha256(message + "x", signature.bytes), "2048 message tamper")
+    expect(!fromSpki.verifyPkcs1Sha1Legacy(message, signature.bytes), "wrong key")
+
+    val secret = hexDecode("000102030405060708090a0b0c0d0e0f")
+    for (kind in 0 until 3) {
+        val made = when (kind) {
+            0 -> strongPublic.encryptPkcs1Legacy(secret)
+            1 -> strongPublic.encryptOaepSha1Legacy(secret)
+            else -> strongPublic.encryptOaepSha256(secret)
+        }
+        expect(made.ok && made.bytes.size == 256, "encrypt $kind: ${made.error}")
+        val again = when (kind) {
+            0 -> strongPublic.encryptPkcs1Legacy(secret)
+            1 -> strongPublic.encryptOaepSha1Legacy(secret)
+            else -> strongPublic.encryptOaepSha256(secret)
+        }
+        expect(made.bytes != again.bytes, "encryption $kind is randomized")
+    }
+    refused(strongPublic.encryptPkcs1Legacy("x".repeat(246)), "too long", "pkcs1 limit")
+    expect(strongPublic.encryptPkcs1Legacy("x".repeat(245)).ok, "pkcs1 fits")
+    refused(strongPublic.encryptOaepSha256("x".repeat(191)), "too long", "oaep sha256 limit")
+    expect(strongPublic.encryptOaepSha256("x".repeat(190)).ok, "oaep sha256 fits")
+    refused(strongPublic.encryptOaepSha1Legacy("x".repeat(215)), "too long", "oaep sha1 limit")
+    expect(strongPublic.encryptOaepSha1Legacy("x".repeat(214)).ok, "oaep sha1 fits")
+
+    // What isn't an RSA key, or isn't a key.
+    for (text in ["", "nonsense", "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"]) {
+        expect(!rsaPrivateKeyFromPem(text).ok(), "private pem '$text'")
+        expect(!rsaPublicKeyFromPem(text).ok(), "public pem '$text'")
+        expect(!rsaPrivateKeyFromDer(text).ok(), "private der '$text'")
+        expect(!rsaPublicKeyFromDer(text).ok(), "public der '$text'")
+        expect(!rsaPublicKeyFromCertificateDer(text).ok(), "certificate der '$text'")
+    }
+    val ec = rsaPrivateKeyFromPem(read("ec.pem"))
+    expect(!ec.ok() && ec.error.contains("not an RSA key"), "ec private: ${ec.error}")
+    val ecPublic = rsaPublicKeyFromPem(read("ec-spki.pem"))
+    expect(!ecPublic.ok() && ecPublic.error.contains("not an RSA key"), "ec public: ${ecPublic.error}")
+    expect(!rsaPrivateKeyFromDer(read("k1024.der") + "\x00").ok(), "bytes after a private key")
+    expect(!rsaPublicKeyFromDer(read("spki.der") + "\x00").ok(), "bytes after a public key")
+    expect(!rsaPublicKeyFromCertificateDer(read("certificate.der") + "\x00").ok(), "bytes after a certificate")
+    expect(!rsaPublicKeyFromDer(read("spki.der").slice(0, 40)).ok(), "cut public key")
+    val damaged = read("k1024.der")
+    expect(!rsaPrivateKeyFromDer(flip(damaged, damaged.size - 30)).ok(), "damaged private key fails its check")
+
+    // RSA-PSS keys don't do PKCS#1 v1.5.
+    val pss = rsaPrivateKeyFromPem(read("pss.pem"))
+    if (pss.ok()) expect(!pss.signPkcs1Sha256(message).ok, "pss key refuses pkcs1")
+
+    // A key failed to load refuses everything, with its own error.
+    val none = rsaPrivateKeyFromPem("nonsense")
+    expect(!none.signPkcs1Sha1Legacy(message).ok, "a failed key signs nothing")
+    expect(!rsaPublicKeyFromPem("nonsense").verifyPkcs1Sha1Legacy(message, "x"), "a failed key verifies nothing")
+
+    // A value at or past the modulus isn't a signature; nor is a modulus of the wrong form a key.
+    expect(!fromSpki.verifyPkcs1Sha1Legacy(message, "\xff".repeat(128)), "signature past the modulus")
+    val evenKey = rsaPublicFromNumbers("\xff\xfe", "\x03", "unreadable")
+    expect(!evenKey.ok() && evenKey.error.contains("odd"), "even modulus")
+    val evenExponent = rsaPublicFromNumbers("\xff\xff", "\x04", "unreadable")
+    expect(!evenExponent.ok() && evenExponent.error.contains("odd"), "even exponent")
+    expect(!rsaPublicFromNumbers("\xff\xff", "\x01", "unreadable").ok(), "exponent 1")
+    expect(!rsaPublicFromNumbers("", "\x03", "unreadable").ok(), "no modulus")
+    // Without a random source, what needs one refuses: a signature must never go unblinded.
+    cryptoSetRandom({ count: int -> "" })
+    refused(reference.signPkcs1Sha1Legacy(message), "cryptoSetRandom", "sign with no randomness")
+    refused(fromSpki.encryptOaepSha1Legacy("x"), "cryptoSetRandom", "oaep with no randomness")
+    return
+}
+
+fun main: int {
+    for (hardware in [true, false]) {
+        aesUseHardware = hardware
+        checkAes()
+    }
+    checkKeys()
+    println("failures $failures")
+    if (failures == 0) 0 else 1
+}

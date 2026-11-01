@@ -410,8 +410,16 @@ def check_xtensa(lines, secret, pointers):
     # parameter makes all the argument registers secret, and only pointer lists are exact.
     # (A pointer parameter is an `int`, so also a pair: the address is the low one.)
     start = frozenset(f"ptr:a{2 + 2 * i}" for i in pointers)
-    if secret:
+    if secret and not pointers:
         start = start | frozenset(f"a{i}" for i in range(2, 8))
+    elif secret:
+        # Past the pointers' pairs, a u32 parameter lands at the next register, or on the stack
+        # if there's none left, and then this checker can't see it: refuse rather than pass it.
+        for i in secret:
+            at = 2 + 2 * i
+            if at > 7:
+                raise SystemExit("a secret past the argument registers isn't read here")
+            start = start | frozenset([f"a{at}"])
 
     def step(state, text, address):
         state = set(state)
@@ -496,26 +504,101 @@ WASM_UNARY = re.compile(r"^(i32|i64|f32|f64|v128|i8x16|i16x8|i32x4|i64x2|f32x4|f
 def check_wasm(lines, secret, pointers):
     # Function parameters are locals. The stack's shape follows from each instruction, and the
     # lines are visited in order several times to carry what locals pick up around loops.
-    locals_tainted = set(secret)
-    pointer_locals = set(pointers)
-    for _ in range(16):
-        before = (set(locals_tainted), set(pointer_locals))
+    # Each pass starts at the function's entry; a loop's head joins what its back edges brought in
+    # the pass before, and a block's end what branches out of it did, until nothing changes.
+    heads = {}
+    for _ in range(64):
+        before = {k: (set(v[0]), set(v[1])) for k, v in heads.items()}
+        locals_tainted = set(secret)
+        pointer_locals = set(pointers)
         stack = []
-        for address, text in lines:
+        control = []
+        unreachable = False
+
+        def branch_to(depth):
+            if depth >= len(control):
+                return
+            entry = control[-1 - depth]
+            if entry["kind"] == "loop":
+                head = heads.setdefault(entry["at"], (set(), set()))
+                head[0].update(locals_tainted)
+                head[1].update(pointer_locals)
+                return
+            entry["exit_tainted"].update(locals_tainted)
+            entry["exit_pointer"].update(pointer_locals)
+            if entry["results"] and stack:
+                entry["secret"] = entry["secret"] or stack[-1][0]
+                entry["pointer"] = entry["pointer"] or stack[-1][1]
+
+        for at, (address, text) in enumerate(lines):
             parts = text.split()
-            if not parts:
+            if not parts or parts[0] == "local":
                 continue
             op = parts[0]
-            if op in ("block", "loop", "end", "nop", "return", "unreachable", "else", "drop") or op.startswith("end_"):
+            if op in ("block", "loop", "if"):
+                if op == "if" and not unreachable:
+                    value = stack.pop() if stack else (False, False)
+                    if value[0]:
+                        raise Violation(f"secret branch: {text}")
+                if op == "loop" and at in heads:
+                    locals_tainted |= heads[at][0]
+                    pointer_locals |= heads[at][1]
+                control.append({"kind": op, "at": at, "height": len(stack),
+                                "results": len(parts) > 1 and parts[1] != "#",
+                                "secret": False, "pointer": False, "dead": unreachable,
+                                "start_tainted": set(locals_tainted), "start_pointer": set(pointer_locals),
+                                "exit_tainted": set(), "exit_pointer": set(), "else": False})
+                continue
+            if op in ("else", "end"):
+                entry = control.pop() if control else None
+                if entry is None:
+                    continue  # the function's own end
+                if not unreachable:
+                    entry["exit_tainted"].update(locals_tainted)
+                    entry["exit_pointer"].update(pointer_locals)
+                    if entry["results"] and stack:
+                        entry["secret"] = entry["secret"] or stack[-1][0]
+                        entry["pointer"] = entry["pointer"] or stack[-1][1]
+                del stack[entry["height"]:]
+                if op == "else":
+                    entry["else"] = True
+                    control.append(entry)
+                    locals_tainted = set(entry["start_tainted"])
+                    pointer_locals = set(entry["start_pointer"])
+                    unreachable = entry["dead"]
+                else:
+                    if entry["kind"] == "if" and not entry["else"]:
+                        entry["exit_tainted"].update(entry["start_tainted"])
+                        entry["exit_pointer"].update(entry["start_pointer"])
+                    locals_tainted = set(entry["exit_tainted"])
+                    pointer_locals = set(entry["exit_pointer"])
+                    if entry["results"]:
+                        stack.append((entry["secret"], entry["pointer"]))
+                    unreachable = entry["dead"]
+                continue
+            if unreachable:
+                continue
+            if op in ("nop", "drop") or op.startswith("end_"):
                 if op == "drop" and stack:
                     stack.pop()
                 continue
-            if op == "if" or op == "br_if" or op == "br_table":
+            if op in ("return", "unreachable"):
+                unreachable = True
+                continue
+            if op == "br":
+                branch_to(int(parts[1]))
+                unreachable = True
+                continue
+            if op in ("br_if", "br_table"):
                 value = stack.pop() if stack else (False, False)
                 if value[0]:
                     raise Violation(f"secret branch: {text}")
-                continue
-            if op == "br":
+                if op == "br_if":
+                    branch_to(int(parts[1]))
+                else:
+                    for depth in range(len(control)):
+                        branch_to(depth)
+                    unreachable = True
                 continue
             if op == "local.get":
                 n = int(parts[1])
@@ -572,7 +655,7 @@ def check_wasm(lines, secret, pointers):
                 stack.append((a[0], a[1] and ("wrap" in op or "extend" in op)))
             else:
                 raise Violation(f"instruction this checker doesn't know: {text}")
-        if (locals_tainted, pointer_locals) == before:
+        if {k: (set(v[0]), set(v[1])) for k, v in heads.items()} == before:
             return
     raise SystemExit("no fixed point")
 

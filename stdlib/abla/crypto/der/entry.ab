@@ -1,0 +1,141 @@
+// DER and PEM, as far as RSA keys need them: strict, with no indefinite lengths, no bytes left over
+// and no length longer than it has to be. Used on secrets, the parser branches on tags and lengths,
+// which are public; a value's bytes it only copies. The PEM decoder doesn't branch on the base 64.
+
+import "abla/ct"
+import "abla/bytes"
+import "abla/process/exit"
+
+class DerItem(val tag: int, val start: int, val end: int, val ok: bool)
+
+fun derFailed(): DerItem = DerItem(0, 0, 0, false)
+
+/** The item at `at`, within `limit`. */
+fun derItem(data: string, at: int, limit: int): DerItem {
+    if (at + 2 > limit) return derFailed()
+    val tag = int(data[at])
+    // Only one-byte tags appear in these structures.
+    if ((tag & 31) == 31) return derFailed()
+    val first = int(data[at + 1])
+    if (first < 128) {
+        if (at + 2 + first > limit) return derFailed()
+        return DerItem(tag, at + 2, at + 2 + first, true)
+    }
+    val count = first - 128
+    if (count == 0 || count > 4 || at + 2 + count > limit) return derFailed()
+    if (int(data[at + 2]) == 0) return derFailed()
+    var size = 0
+    for (i in 0 until count) size = size * 256 + int(data[at + 2 + i])
+    if (size < 128 || at + 2 + count + size > limit) return derFailed()
+    DerItem(tag, at + 2 + count, at + 2 + count + size, true)
+}
+
+val DER_INTEGER = 2
+val DER_BIT_STRING = 3
+val DER_OCTET_STRING = 4
+val DER_OID = 6
+val DER_SEQUENCE = 48
+
+/** An INTEGER's value with no leading zero, or "" if it isn't a positive one in its shortest form. */
+fun derPositiveInteger(data: string, item: DerItem): string {
+    if (item.tag != DER_INTEGER || item.end == item.start) return ""
+    val first = int(data[item.start])
+    if (first >= 128) return ""
+    if (first != 0) return data.slice(item.start, item.end)
+    if (item.end - item.start == 1) return ""
+    if (int(data[item.start + 1]) < 128) return ""
+    data.slice(item.start + 1, item.end)
+}
+
+/** The base 64 between a PEM's BEGIN and END `label`, without branching on the characters, or "". */
+fun pemBody(text: string, label: string): string {
+    val begin = "-----BEGIN $label-----"
+    val end = "-----END $label-----"
+    val start = pemFind(text, begin, 0)
+    if (start < 0) return ""
+    val finish = pemFind(text, end, start + begin.size)
+    if (finish < 0) return ""
+    text.slice(start + begin.size, finish)
+}
+
+fun pemFind(text: string, wanted: string, from: int): int {
+    var at = from
+    while (at + wanted.size <= text.size) {
+        if (text.slice(at, at + wanted.size) == wanted) return at
+        at = at + 1
+    }
+    -1
+}
+
+/** The first label in a PEM text, or "". */
+fun pemLabel(text: string): string {
+    val marker = "-----BEGIN "
+    val at = pemFind(text, marker, 0)
+    if (at < 0) return ""
+    val end = pemFind(text, "-----", at + marker.size)
+    if (end < 0) return ""
+    text.slice(at + marker.size, end)
+}
+
+@inline fun pemInRange(c: secretU32, low: int, high: int): secretU32 =
+    ~ctLt(c, secretU32(u32(low))) & ctLt(c, secretU32(u32(high + 1)))
+
+/** A base 64 character's value, with no table and no branch on it; 0 for what isn't one. */
+@inline fun ctBase64Value(c: secretU32): secretU32 {
+    val upper = pemInRange(c, 65, 90)
+    val lower = pemInRange(c, 97, 122)
+    val digit = pemInRange(c, 48, 57)
+    val plus = ctEq(c, secretU32(u32(43)))
+    val slash = ctEq(c, secretU32(u32(47)))
+    (upper & (c - secretU32(u32(65)))) | (lower & (c - secretU32(u32(71)))) |
+        (digit & (c + secretU32(u32(4)))) | (plus & secretU32(u32(62))) | (slash & secretU32(u32(63)))
+}
+
+/** All ones if `c` isn't a base 64 character. */
+@inline fun ctBase64Valid(c: secretU32): secretU32 =
+    ~(pemInRange(c, 65, 90) | pemInRange(c, 97, 122) | pemInRange(c, 48, 57) |
+        ctEq(c, secretU32(u32(43))) | ctEq(c, secretU32(u32(47))))
+
+/** Decodes base 64, skipping line breaks and spaces (a public fact), with no branch or table on a character.
+ *  "" for anything else, or padding in the wrong place. */
+fun pemBase64Decode(body: string): string {
+    var out = byteBuffer()
+    var bad = secretU32(u32(0))
+    var pending = secretU32(u32(0))
+    var count = 0
+    var padding = 0
+    for (at in 0 until body.size) {
+        val raw = int(body[at])
+        if (raw == 10 || raw == 13 || raw == 32 || raw == 9) continue
+        if (raw == 61) {
+            padding = padding + 1
+            continue
+        }
+        if (padding > 0) return ""
+        val c = secretU32(u32(raw))
+        bad = bad | ctBase64Valid(c)
+        pending = (pending << 6) | ctBase64Value(c)
+        count = count + 1
+        if (count % 4 == 0) {
+            pemEmit(out, pending >> 16)
+            pemEmit(out, pending >> 8)
+            pemEmit(out, pending)
+            pending = secretU32(u32(0))
+        }
+    }
+    if (bad.declassify() != u32(0)) return ""
+    val left = count % 4
+    if ((left + padding) % 4 != 0 || left == 1 || padding > 2) return ""
+    if (left == 2) pemEmit(out, pending >> 4)
+    if (left == 3) {
+        pemEmit(out, pending >> 10)
+        pemEmit(out, pending >> 2)
+    }
+    out.toText()
+}
+
+// The byte goes to the buffer as a value, as any copy of a secret does.
+fun pemEmit(var out: ByteBuffer, byte: secretU32): void {
+    out.appendByteValue(int(byte.declassify() & u32(255)))
+    return
+}

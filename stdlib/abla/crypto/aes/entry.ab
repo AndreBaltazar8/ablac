@@ -305,8 +305,14 @@ trusted fun aesWipe(address: int, size: int): void {
     aesMixColumns(q)
 }
 
+@noinline trusted fun aesSoftEncryptCore(q: int, keys: int, rounds: int): void =
+    aesSoftEncryptBody(q, keys, rounds)
+
+@noinline trusted fun aesSoftDecryptCore(q: int, keys: int, rounds: int): void =
+    aesSoftDecryptBody(q, keys, rounds)
+
 /** Encrypts the two blocks in `q`, already orthogonalized, under `keys`: 8 words a round. */
-@noinline trusted fun aesSoftEncryptCore(q: int, keys: int, rounds: int): void {
+@inline trusted fun aesSoftEncryptBody(q: int, keys: int, rounds: int): void {
     aesAddRoundKey(q, keys)
     for (round in 1 until rounds) {
         aesSubBytes(q)
@@ -319,7 +325,7 @@ trusted fun aesWipe(address: int, size: int): void {
     aesAddRoundKey(q, keys + rounds * 32)
 }
 
-@noinline trusted fun aesSoftDecryptCore(q: int, keys: int, rounds: int): void {
+@inline trusted fun aesSoftDecryptBody(q: int, keys: int, rounds: int): void {
     aesAddRoundKey(q, keys + rounds * 32)
     var round = rounds - 1
     while (round >= 1) {
@@ -480,7 +486,7 @@ fun aesKeySizeError(key: string): string =
 // --- ECB and CBC ---------------------------------------------------------------------------
 // The padding is checked in a way that doesn't branch on its bytes, though the answer is still an
 // answer: see "padding oracle" in the docs.
-trusted fun aesPaddingLength(address: int): int {
+@inline trusted fun aesPaddingBad(address: int): secretU32 {
     val last = secretU32(u32(ablaUnsafeLoadU8(aesPointer(address + 15))))
     var bad = ctIsZero(last) | ~ctLt(last, secretU32(u32(17)))
     for (at in 0 until 16) {
@@ -489,7 +495,12 @@ trusted fun aesPaddingLength(address: int): int {
         val inside = ctLt(secretU32(u32(at)), last)
         bad = bad | (inside & ~ctEq(byte, last))
     }
-    if (bad.declassify() != u32(0)) -1 else int(last.declassify())
+    bad
+}
+
+trusted fun aesPaddingLength(address: int): int {
+    if (aesPaddingBad(address).declassify() != u32(0)) return -1
+    ablaUnsafeLoadU8(aesPointer(address + 15))
 }
 
 trusted fun aesPadded(plaintext: string): NativeByteBuffer {
@@ -515,7 +526,9 @@ trusted fun aesEcbEncryptPkcs5(key: string, plaintext: string): CryptoResult {
 trusted fun aesEcbDecryptPkcs5(key: string, ciphertext: string): CryptoResult {
     val keyError = aesKeySizeError(key)
     if (keyError != "") return cryptoFailed(keyError)
-    if (ciphertext.size == 0 || ciphertext.size % 16 != 0) return cryptoFailed("bad padding")
+    if (ciphertext.size == 0 || ciphertext.size % 16 != 0) {
+        return cryptoFailed("the ciphertext isn't a whole number of 16-byte blocks")
+    }
     val expanded = aesExpand(key, aesHardwareAvailable())
     val buffer = nativeByteBuffer(ciphertext.size + 1)
     val address = ablaUnsafePointerAddress(buffer.pointerAt(0))
@@ -562,7 +575,9 @@ trusted fun aesCbcDecryptPkcs7(key: string, iv: string, ciphertext: string): Cry
     if (iv.size != 16) return cryptoFailed("an AES-CBC IV has 16 bytes")
     val keyError = aesKeySizeError(key)
     if (keyError != "") return cryptoFailed(keyError)
-    if (ciphertext.size == 0 || ciphertext.size % 16 != 0) return cryptoFailed("bad padding")
+    if (ciphertext.size == 0 || ciphertext.size % 16 != 0) {
+        return cryptoFailed("the ciphertext isn't a whole number of 16-byte blocks")
+    }
     val expanded = aesExpand(key, aesHardwareAvailable())
     val buffer = nativeByteBuffer(ciphertext.size + 1)
     val address = ablaUnsafePointerAddress(buffer.pointerAt(0))
@@ -596,12 +611,10 @@ trusted fun aesCbcDecryptPkcs7(key: string, iv: string, ciphertext: string): Cry
     ablaUnsafeStoreU8(aesPointer(address + 3), int(bits & u32(255)))
 }
 
+@noinline trusted fun ghashSoftMultiply(y: int, h: int): void = ghashSoftMultiplyBody(y, h)
+
 /** `y` = `y` * `h`, both 16 big-endian bytes, in GCM's bit order. */
-@noinline trusted fun ghashSoftMultiply(y: int, h: int): void {
-    val x0 = aesLoadBig(y)
-    val x1 = aesLoadBig(y + 4)
-    val x2 = aesLoadBig(y + 8)
-    val x3 = aesLoadBig(y + 12)
+@inline trusted fun ghashSoftMultiplyBody(y: int, h: int): void {
     var v0 = aesLoadBig(h)
     var v1 = aesLoadBig(h + 4)
     var v2 = aesLoadBig(h + 8)
@@ -611,7 +624,7 @@ trusted fun aesCbcDecryptPkcs7(key: string, iv: string, ciphertext: string): Cry
     var z2 = secretU32(u32(0))
     var z3 = secretU32(u32(0))
     for (word in 0 until 4) {
-        val x = if (word == 0) x0 else if (word == 1) x1 else if (word == 2) x2 else x3
+        val x = aesLoadBig(y + word * 4)
         for (bit in 0 until 32) {
             val take = ctFromLowBit(x >> (31 - bit))
             z0 = z0 ^ (v0 & take)
@@ -753,7 +766,7 @@ fun aesGcmHardware(): bool = cpuHas("clmul") && aesUseHardware
 trusted fun aesGcmEncrypt(key: string, nonce: string, plaintext: string, associatedData: string = ""): CryptoResult {
     val keyError = aesKeySizeError(key)
     if (keyError != "") return cryptoFailed(keyError)
-    if (nonce.size != 12) return cryptoFailed("an AES-GCM nonce has 12 bytes")
+    if (nonce.size != 12) return cryptoFailed("an AES-GCM nonce here has 12 bytes")
     val hardware = aesGcmHardware()
     val expanded = aesExpand(key, aesHardwareAvailable())
     val state = aesGcmStart(expanded, nonce, associatedData, hardware)
@@ -768,9 +781,9 @@ trusted fun aesGcmEncrypt(key: string, nonce: string, plaintext: string, associa
 trusted fun aesGcmDecrypt(key: string, nonce: string, ciphertext: string, associatedData: string = ""): CryptoResult {
     val keyError = aesKeySizeError(key)
     if (keyError != "") return cryptoFailed(keyError)
-    if (nonce.size != 12) return cryptoFailed("an AES-GCM nonce has 12 bytes")
+    if (nonce.size != 12) return cryptoFailed("an AES-GCM nonce here has 12 bytes")
     val failure = "authentication failed: the data, key, nonce or associated data is wrong"
-    if (ciphertext.size < 16) return cryptoFailed(failure)
+    if (ciphertext.size < 16) return cryptoFailed("the ciphertext is shorter than its tag")
     val hardware = aesGcmHardware()
     val expanded = aesExpand(key, aesHardwareAvailable())
     val state = aesGcmStart(expanded, nonce, associatedData, hardware)
