@@ -8,6 +8,7 @@ import "../../crypto/hosted/libcrypto.ab"
 import "../../crypto/hosted/pkcs12.ab"
 import "abla/dns"
 import "abla/sys/linux/net"
+import "abla/sys/linux/process"
 import "abla/unsafe/memory"
 import "abla/unsafe/memory/raw"
 
@@ -348,7 +349,13 @@ trusted fun tlsUpgradeHandle(
         )
         ERR_clear_error()
         val held = linuxBrokenPipeHold()
-        ready = SSL_connect(session) == 1
+        val wait = HostedTlsWait(connection.descriptor)
+        var shook = SSL_connect(session)
+        while (shook != 1 && hostedTlsInterrupted(wait, session, int(shook))) {
+            shook = SSL_connect(session)
+        }
+        hostedTlsWaitDone(wait)
+        ready = shook == 1
         linuxBrokenPipeRelease(held)
     }
     if (ready) {
@@ -520,7 +527,13 @@ trusted fun TlsListener.accept(
             )
             ERR_clear_error()
             val held = linuxBrokenPipeHold()
-            ready = SSL_accept(session) == 1
+            val wait = HostedTlsWait(descriptor)
+            var shook = SSL_accept(session)
+            while (shook != 1 && hostedTlsInterrupted(wait, session, int(shook))) {
+                shook = SSL_accept(session)
+            }
+            hostedTlsWaitDone(wait)
+            ready = shook == 1
             linuxBrokenPipeRelease(held)
         }
         if (ready) {
@@ -535,6 +548,41 @@ trusted fun TlsListener.accept(
         }
     }
     TlsConnection(handle)
+}
+
+// One blocking OpenSSL call on a socket with timeouts. OpenSSL reads EINTR, as from
+// a stop and continue, like the timeout (both retry), and there is no errno to read
+// here: one that came back well before its limit was interrupted, and goes on for
+// what is left of it.
+class HostedTlsWait(
+    val descriptor: int,
+    val started: int = linuxMonotonicMilliseconds(),
+    var readLimit: int = -1,
+    var writeLimit: int = -1
+)
+
+private trusted fun hostedTlsInterrupted(var wait: HostedTlsWait, session: i64*, result: int): bool {
+    val code: int = SSL_get_error(session, i32(result))
+    if (code != 2 && code != 3) return false
+    val reading = code == 2
+    val option = if (reading) 20 else 21
+    if (reading && wait.readLimit < 0) wait.readLimit = linuxSocketTimeout(wait.descriptor, option)
+    if (!reading && wait.writeLimit < 0) wait.writeLimit = linuxSocketTimeout(wait.descriptor, option)
+    val limit = if (reading) wait.readLimit else wait.writeLimit
+    if (limit == 0) return true
+    // (Both clock readings round down, so a timeout can read 1 ms early.)
+    val left = limit - (linuxMonotonicMilliseconds() - wait.started)
+    if (left <= 1) return false
+    linuxSocketSetTimeout(wait.descriptor, option, left)
+    ERR_clear_error()
+    true
+}
+
+// The limits as they were, for the next call.
+private fun hostedTlsWaitDone(wait: HostedTlsWait): void {
+    if (wait.readLimit > 0) linuxSocketSetTimeout(wait.descriptor, 20, wait.readLimit)
+    if (wait.writeLimit > 0) linuxSocketSetTimeout(wait.descriptor, 21, wait.writeLimit)
+    return
 }
 
 // A blocking socket that wants to go on waiting has hit its timeout. Anything
@@ -552,7 +600,12 @@ trusted fun TlsConnection.read(maximum: int = 65536): string {
         val session = tlsControlPointer(this.handle, 8)
         ERR_clear_error()
         val held = linuxBrokenPipeHold()
-        val measured: int = SSL_read(session, buffer.address, maximum)
+        val wait = HostedTlsWait(tlsControlInt(this.handle, 16))
+        var measured: int = SSL_read(session, buffer.address, maximum)
+        while (measured <= 0 && hostedTlsInterrupted(wait, session, measured)) {
+            measured = SSL_read(session, buffer.address, maximum)
+        }
+        hostedTlsWaitDone(wait)
         if (measured > 0) result = buffer.adoptString(measured)
         else {
             buffer.close()
@@ -572,11 +625,13 @@ trusted fun TlsConnection.write(contents: string): int {
         val session = tlsControlPointer(this.handle, 8)
         ERR_clear_error()
         val held = linuxBrokenPipeHold()
-        val written: int = SSL_write(
-            session,
-            contents.slice(offset, offset + length),
-            length
-        )
+        val wait = HostedTlsWait(tlsControlInt(this.handle, 16))
+        val chunk = contents.slice(offset, offset + length)
+        var written: int = SSL_write(session, chunk, length)
+        while (written <= 0 && hostedTlsInterrupted(wait, session, written)) {
+            written = SSL_write(session, chunk, length)
+        }
+        hostedTlsWaitDone(wait)
         if (written <= 0) {
             writing = false
             hostedTlsNoteFailure(session, written)

@@ -21,6 +21,20 @@ fun within(stage: string, started: int, lowest: int, highest: int): int {
     if (elapsed < lowest || elapsed > highest) failed(stage, "took ${elapsed}ms") else 0
 }
 
+// A child that stops this process for a moment 100 ms from now.
+fun stopSelfSoon(): int {
+    val parent = linuxSyscall0(39)
+    val process = linuxSyscall0(57)
+    if (process == 0) {
+        linuxSleep(100)
+        linuxSyscall2(62, parent, 19)
+        linuxSleep(50)
+        linuxSyscall2(62, parent, 18)
+        linuxSyscall1(60, 0)
+    }
+    process
+}
+
 fun checks(certificate: string, key: string, tlsPort: int, silentPort: int): int {
     // The read limit, and a read repeated after it.
     val slow = tlsConnectWithCa("localhost", certificate, tlsPort, 3000, 300)
@@ -47,6 +61,25 @@ fun checks(certificate: string, key: string, tlsPort: int, silentPort: int): int
     defaulted.write("GET /late HTTP/1.1\r\n\r\n")
     if (defaulted.read(64) != "late") return failed("default limit", "no reply")
     defaulted.close()
+
+    // A stop and continue during the read isn't its timeout (EINTR), and the limit
+    // stays what it was: it isn't a new one from there.
+    val interrupted = tlsConnectWithCa("localhost", certificate, tlsPort, 3000, 5000)
+    interrupted.write("GET /late HTTP/1.1\r\n\r\n")
+    val stopper = stopSelfSoon()
+    val reply = interrupted.read(64)
+    linuxWaitProcess(stopper)
+    if (reply != "late") return failed("interrupted read", "'$reply' ${tlsLastError()}")
+    val cutShort = tlsConnectWithCa("localhost", certificate, tlsPort, 3000, 400)
+    cutShort.write("GET /stall HTTP/1.1\r\n\r\n")
+    val stopperAgain = stopSelfSoon()
+    started = monotonicMilliseconds()
+    if (cutShort.read(64) != "") return failed("interrupted limit", "wanted a timeout")
+    if (tlsLastError() != "TLS read or write timed out") return failed("interrupted limit", tlsLastError())
+    if (within("interrupted limit", started, 350, 20000) != 0) return 1
+    linuxWaitProcess(stopperAgain)
+    if (!cutShort.setTimeouts(100, 100)) return failed("interrupted limit", "refused")
+    cutShort.close()
 
     // The handshake has the connection's first limit.
     started = monotonicMilliseconds()
