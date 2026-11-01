@@ -70,14 +70,10 @@
       timing checks (600 ms, NXDOMAIN under 400 ms) are tight on a loaded machine.
 - [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
-      in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed.
+      in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
+      on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
 - [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
       out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
-- [ ] A local rebuild of a Linux release in the default shell differs from CI's in 62 bytes: the
-      RUNPATH's two store paths, the Xtensa LLVM's libLLVM and that shell's own `nix-shell/lib`, which
-      doesn't exist and changes with any edit to `shell.nix`. `ABLA_NIX_XTENSA=0` matches CI byte for byte
-      (docs/bootstrap.md). The prebuilt Xtensa LLVM work puts CI in the same shell, which should end
-      the first; check it when that lands. Seen 2026-11-01.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
       `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
 - [ ] `ablac.bin` run without `ABLA_SYSROOT` from outside the repository finds no runtime and doesn't say

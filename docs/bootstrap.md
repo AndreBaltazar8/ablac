@@ -49,14 +49,14 @@ A Linux release is reproducible byte for byte. From the tag, in any directory,
 with `gh release download <tag> -p ablac-x86_64-linux` as `published`:
 
 ```sh
-ABLA_NIX_XTENSA=0 tools/build-self-hosted-current.sh published build/rebuilt
+tools/build-self-hosted-current.sh published build/rebuilt
 cmp published build/rebuilt
 ```
 
-(`chmod +x` it first.) `ABLA_NIX_XTENSA=0` is the shell release CI uses: the default
-shell's Xtensa LLVM links another libLLVM, so the RUNPATH's store paths differ and
-nothing else. Releases up to v0.2.27 also cut the module by the machine's
-processors, so they match only with `ABLA_NATIVE_JOBS=4`, the runner's count.
+(`chmod +x` it first.) Since v0.2.28 release CI uses the default shell, whose store paths
+are in the binary's RUNPATH, so `ABLA_NIX_XTENSA=0` or an edit to `shell.nix` changes those
+bytes and nothing else. Releases up to v0.2.27 were built without Xtensa and cut the module
+by the machine's processors, so they match only with `ABLA_NIX_XTENSA=0 ABLA_NATIVE_JOBS=4`.
 `tools/test-reproducible-elsewhere.sh` guards this; `--self` is the release's gate.
 
 The published binary is trusted only as the initial translator. The readable
