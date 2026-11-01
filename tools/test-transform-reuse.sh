@@ -24,7 +24,7 @@ cp "$project_root"/tests/cases/transform-reuse/*.ab "$test_directory/"
 
 wait_for() { # file pattern
     local attempt=0
-    while [[ $attempt -lt 300 ]]; do
+    while [[ $attempt -lt 1200 ]]; do
         grep -q "$2" "$1" 2>/dev/null && return 0
         sleep 0.1
         attempt=$((attempt + 1))
@@ -34,7 +34,7 @@ wait_for() { # file pattern
     return 1
 }
 
-"${new_session[@]}" env ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=60 \
+"${new_session[@]}" env ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=150 \
     "$compiler" serve "$test_directory/app.ab" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
 server=$!

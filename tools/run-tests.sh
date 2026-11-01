@@ -9,6 +9,9 @@
 # serial_reason below) start once it has ended. The longest commands of the last
 # run start first.
 #
+# Scripts in tools/test-fast-builds.txt build at --fast; RUN_TESTS_FULL=1
+# (`make test-full`) builds them for release.
+#
 # Environment:
 #   JOBS                 commands run at once (default: the number of CPUs)
 #   RUN_TESTS_MIN_FREE   no command starts while the system's free memory is
@@ -142,7 +145,12 @@ start() { # n
     command=$(sed -n "${n}p" "$output/commands.txt")
     (
         begin=$(seconds_now)
-        bash -c "$command" >"$output/$n.log" 2>&1 </dev/null
+        fast_builds=
+        if [[ -z ${RUN_TESTS_FULL:-} && $command =~ (test-[[:alnum:]-]+) ]] &&
+            grep -qx "${BASH_REMATCH[1]}" "$project_root/tools/test-fast-builds.txt"; then
+            fast_builds=1
+        fi
+        ABLA_TEST_FAST_BUILDS=$fast_builds bash -c "$command" >"$output/$n.log" 2>&1 </dev/null
         status=$?
         end=$(seconds_now)
         printf '%s %s\n' "$status" "$(awk -v b="$begin" -v e="$end" 'BEGIN { printf "%.1f", e - b }')" \

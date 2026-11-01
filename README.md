@@ -141,7 +141,8 @@ as many as the machine has CPUs, `JOBS=4 make test` for fewer, and none
 starts while free memory is under 25% (`RUN_TESTS_MIN_FREE`). Each script
 writes its log to `build/test-results/suite/<n>.log`; `results.tsv` there
 lists every script's exit status and time. `make test-serial` runs the same
-scripts one after another.
+scripts one after another. Scripts in `tools/test-fast-builds.txt` build at `--fast`
+here; `make test-full`, which a release must pass, builds them for release.
 
 The `abla/math/v8` comparison needs Node **22.14.0** (V8
 `12.4.254.21-node.22`), whose results the test records. Set `MATH_V8_NODE`

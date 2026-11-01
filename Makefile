@@ -22,7 +22,7 @@ define install_launcher
 	fi
 endef
 
-.PHONY: all bootstrap ablac ablac-dev self-rebuild test test-serial check compile benchmark \
+.PHONY: all bootstrap ablac ablac-dev self-rebuild test test-full test-serial check compile benchmark \
 	benchmark-network clean prepare-test-driver
 
 all: ablac
@@ -74,6 +74,10 @@ prepare-test-driver:
 # runs it one command after another.
 test: ablac
 	tools/run-tests.sh $(COMPILER)
+
+# Every script's builds for release: what a release must pass.
+test-full: ablac
+	RUN_TESTS_FULL=1 tools/run-tests.sh $(COMPILER)
 
 test-serial: ablac
 	tools/test-version.sh $(COMPILER)
@@ -325,7 +329,7 @@ test-serial: ablac
 	tools/test-codegen-units.sh $(COMPILER)
 	tools/test-codegen-cache.sh $(COMPILER)
 
-check: test self-rebuild
+check: test-full self-rebuild
 
 compile: ablac
 	@test -n "$(SOURCE)" || { \
