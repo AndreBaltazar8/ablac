@@ -48,8 +48,9 @@ SHA-1 and MD5 are there for protocols that require them (WebSocket
 handshakes, legacy checksums), not for security.
 
 The hashes and HMACs have no secret-dependent branch or table index in their rounds,
-but nothing stops the code generator adding one, and the key's length shows. The same goes
-for `constantTimeEquals`; `opensslConstantTimeEquals` below is the stronger of the two.
+but nothing stops the code generator adding one, and the key's length shows.
+`constantTimeEquals` is `abla/ct`'s `ctEquals` when compiled ([what that promises](../constant-time.md)),
+and an ordinary loop at compile time. Different lengths are unequal at once.
 `hexEncode`, `hexDecode` and the Base64 functions aren't constant-time at all. Nothing
 here wipes memory: a secret in a string stays there until the memory is reused.
 

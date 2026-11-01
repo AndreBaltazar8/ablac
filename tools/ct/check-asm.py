@@ -406,7 +406,12 @@ XT_COND_MOVE = re.compile(r"^(moveqz|movnez|movltz|movgez)")
 
 
 def check_xtensa(lines, secret, pointers):
-    start = frozenset(f"a{2 + i}" for i in secret) | frozenset(f"ptr:a{2 + i}" for i in pointers)
+    # A u64 takes an aligned pair of registers, so positions don't map one to one: any secret
+    # parameter makes all the argument registers secret, and only pointer lists are exact.
+    # (A pointer parameter is an `int`, so also a pair: the address is the low one.)
+    start = frozenset(f"ptr:a{2 + 2 * i}" for i in pointers)
+    if secret:
+        start = start | frozenset(f"a{i}" for i in range(2, 8))
 
     def step(state, text, address):
         state = set(state)
@@ -456,7 +461,8 @@ def check_xtensa(lines, secret, pointers):
             value = value or t(dest)
         if op in ("xor",) and ops[1] == ops[2]:
             value = False
-        if op in ("addi", "addi.n", "mov", "mov.n", "or", "add", "add.n", "addmi") and "ptr:" + ops[1] in state and len(ops) > 1:
+        if op in ("addi", "addi.n", "mov", "mov.n", "or", "add", "add.n", "addmi", "addx2", "addx4", "addx8") and \
+                any("ptr:" + o in state for o in ops[1:]):
             state.add("ptr:" + dest)
             state.discard(dest)
             return frozenset(state)
@@ -536,8 +542,12 @@ def check_wasm(lines, secret, pointers):
                 address_value = stack.pop() if stack else (False, False)
                 if address_value[0]:
                     raise Violation(f"secret address: {text}")
-            elif op == "select":
+            elif op in ("select", "f32.select"):
+                # (llvm-objdump prints the untyped select as f32.select.) It's data in the
+                # language, but what an engine makes of it is its own business.
                 c = stack.pop() if stack else (False, False)
+                if c[0]:
+                    raise Violation(f"secret select, which an engine may branch on: {text}")
                 b = stack.pop() if stack else (False, False)
                 a = stack.pop() if stack else (False, False)
                 stack.append((a[0] or b[0] or c[0], a[1] or b[1]))
@@ -558,7 +568,8 @@ def check_wasm(lines, secret, pointers):
                 stack.append((a[0] or b[0] or c[0], (a[1] or b[1]) and not (a[0] or b[0])))
             elif WASM_UNARY.match(op):
                 a = stack.pop() if stack else (False, False)
-                stack.append((a[0], False))
+                # A pointer stays one through a change of width (an int's address is an i64).
+                stack.append((a[0], a[1] and ("wrap" in op or "extend" in op)))
             else:
                 raise Violation(f"instruction this checker doesn't know: {text}")
         if (locals_tainted, pointer_locals) == before:
@@ -588,7 +599,13 @@ def main():
     failed = 0
     for spec in specs:
         name, secret, pointers = parse_spec(spec)
-        lines = disassemble(path, name)
+        lines = disassemble(path, name, ["--mcpu=esp32"] if arch == "xtensa" else [])
+        # What the disassembler can't read could be anything: a pass over it would mean nothing.
+        unread = [text for _, text in lines if "unknown" in text]
+        if unread:
+            print(f"LEAK {arch} {name}: the disassembler can't read: {unread[0]}")
+            failed = 1
+            continue
         try:
             CHECKERS[arch](lines, secret, pointers)
             print(f"ok   {arch} {name} ({len(lines)} instructions)")

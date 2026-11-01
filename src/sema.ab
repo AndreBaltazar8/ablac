@@ -1528,7 +1528,7 @@ fun bootstrapRegionResultIsIndependent(type: string): bool {
     normalized == "i32" || normalized == "i64" ||
     normalized == "u8" || normalized == "u16" ||
     normalized == "u32" || normalized == "u64" ||
-    normalized == "f32" || normalized == "f64" || bootstrapIsVectorType(normalized)
+    normalized == "f32" || normalized == "f64" || bootstrapIsMachineValueType(normalized)
 }
 
 /** Whether a value of `type` read through a view (`view.name`, `view[i]`) is
@@ -2031,7 +2031,8 @@ fun bootstrapConformanceSignatureMatches(
 
 fun bootstrapTypesCompatible(expected: string, actual: string): bool {
     var compatible = expected == actual || expected == "unknown" ||
-        actual == "unknown" || actual == "never" || expected == "any"
+        actual == "unknown" || actual == "never" ||
+        (expected == "any" && !bootstrapIsSecretType(actual))
     if (bootstrapIsBorrowType(actual) &&
         expected == bootstrapBorrowElementType(actual)) compatible = true
     // An immutable-repeatable callable can safely satisfy a mutable-repeatable
@@ -4080,7 +4081,7 @@ fun bootstrapEffectPreciseType(map: BootstrapEffectTypeMap, type: string): bool 
     type == "string" || type == "int" || type == "bool" || type == "char" ||
         type == "i8" || type == "i16" || type == "i32" || type == "i64" ||
         type == "u8" || type == "u16" || type == "u32" || type == "u64" ||
-        type == "f32" || type == "f64" || bootstrapIsVectorType(type) ||
+        type == "f32" || type == "f64" || bootstrapIsMachineValueType(type) ||
         (type.size > 6 && type.slice(0, 6) == "array<")
 }
 
@@ -12067,18 +12068,18 @@ class BootstrapAnalyzer(
             var noinlineAnnotation = -1
             var annotation = 0
             if ((declaration.kind == "class" || declaration.kind == "type" ||
-                declaration.kind == "interface") && bootstrapIsVectorType(declaration.name)) {
-                this.fail("simd.type-name:${declaration.name} is a vector type")
+                declaration.kind == "interface") && bootstrapIsMachineValueType(declaration.name)) {
+                this.fail("simd.type-name:${declaration.name} is a type of the language")
             }
             while (annotation < declaration.annotations.size) {
                 if (declaration.annotations[annotation] == "export" ||
                     declaration.annotations[annotation] == "exportChecked") {
-                    var vectorSignature = bootstrapIsVectorType(bootstrapNormalizeType(declaration.resultType))
+                    var vectorSignature = bootstrapIsMachineValueType(bootstrapNormalizeType(declaration.resultType))
                     for (parameter in declaration.parameterTypes) {
-                        if (bootstrapIsVectorType(bootstrapNormalizeType(parameter))) vectorSignature = true
+                        if (bootstrapIsMachineValueType(bootstrapNormalizeType(parameter))) vectorSignature = true
                     }
                     if (vectorSignature) {
-                        this.fail("simd.export:${declaration.name}: a vector can't cross an export")
+                        this.fail("simd.export:${declaration.name}: a vector or secret can't cross an export")
                     }
                 }
                 if (declaration.annotations[annotation] == "naked") {
@@ -12613,6 +12614,9 @@ fun bootstrapInferStringTemplate(
         val partType = if (partUnderlying != "") partUnderlying else inferredPart
         if (bootstrapIsVectorType(partType)) {
             analyzer.fail("simd.template:a vector has no text of its own: use .text()")
+        }
+        if (bootstrapIsSecretType(partType)) {
+            analyzer.fail("secret.template:a secret has no text: declassify it first")
         }
         // A float is written by abla/float/text's f64Text, the
         // shortest text that reads back as it (as JavaScript does).
@@ -15264,6 +15268,9 @@ fun bootstrapInferWhen(
     // What the `when` is expected to be, each arm's value is (generics' inference).
     val expected = bootstrapGenericExpectedOf(analyzer, expression)
     val subject = analyzer.infer(expression.children[0])
+    if (bootstrapIsMachineValueType(bootstrapBorrowElementType(subject))) {
+        analyzer.fail("secret.when:a `when` branches on its subject, which can't be a vector or secret")
+    }
     var branchType = "unknown"
     var hasElse = false
     var hasTrue = false
@@ -15473,6 +15480,10 @@ fun bootstrapInferComparison(
     // A borrow compares as what it borrows (`borrowed != null`).
     var left = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
     var right = bootstrapBorrowElementType(analyzer.infer(expression.children[1]))
+    if (bootstrapIsSecretType(left) || bootstrapIsSecretType(right)) {
+        analyzer.fail("secret.compare:`${expression.kind}` would make a secret a bool: use ctEq or ctLt, which give a mask")
+        return "bool"
+    }
     if (bootstrapIsVectorType(left) || bootstrapIsVectorType(right)) {
         analyzer.fail("simd.equality:`${expression.kind}` on a vector has no one meaning: use .eq(), .lt() and so on, then .all() or .any()")
         return "bool"

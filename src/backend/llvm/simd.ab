@@ -109,7 +109,9 @@ fun bootstrapLlvmUnboxVector(
 fun bootstrapLlvmProgramHasSimd(program: BootstrapIrProgram): bool {
     for (function in program.functions) {
         for (instruction in function.instructions) {
-            if (instruction.opcode == "extern.intrinsic" && bootstrapSimdIntrinsic(instruction.text)) {
+            if (instruction.opcode == "extern.intrinsic" && bootstrapSimdIntrinsic(instruction.text) &&
+                !instruction.text.startsWith("ablaCt") && !instruction.text.startsWith("ablaSimdTarget") &&
+                !instruction.text.startsWith("ablaSimdCpu")) {
                 return true
             }
         }
@@ -439,6 +441,9 @@ fun bootstrapLlvmEmitSimdIntrinsic(
         )
         return true
     }
+    if (name.startsWith("ablaCt")) {
+        return bootstrapLlvmEmitCtIntrinsic(backend, storage, instruction)
+    }
     val shuffled = bootstrapSimdShuffleType(name)
     if (shuffled != "") {
         val count = bootstrapVectorLaneCount(shuffled)
@@ -690,6 +695,89 @@ fun bootstrapLlvmEmitSimdIntrinsic(
         } else return false
     } else return false
     bootstrapLlvmSetNativeValue(backend, storage, instruction.result, result)
+    true
+}
+
+// What makes `abla/ct` hold against the optimizer: a value through inline assembly that
+// claims to compute it, so LLVM knows nothing of how the result relates to the input.
+// Without this it recognizes a mask made of arithmetic as a compare, and the mask and two ANDs
+// as a select, which it may then make a branch. An i64 on a 32-bit target goes in halves,
+// since a pair of registers can't be one assembly operand on all of them.
+fun bootstrapLlvmEmitCtBarrierWord(backend: BootstrapLlvmBackend, value: i64*, type: i64*): i64* {
+    val function = bootstrapLlvmFunctionType(backend, type, [type])
+    val wasm = bootstrapLlvmSimdArch(backend.targetTriple) == BOOTSTRAP_SIMD_ARCH_WASM
+    // A Wasm operand is a local, and the assembly has to move the value itself.
+    val assembly = if (wasm) "local.get \${1}\nlocal.set \${0}" else ""
+    val constraints = if (wasm) "=r,r" else "=r,0"
+    bootstrapLlvmCallTyped(
+        backend, function,
+        LLVMGetInlineAsm(function, assembly, assembly.size, constraints, constraints.size, 0, 0, 0, 0),
+        [value], "ct.barrier"
+    )
+}
+
+fun bootstrapLlvmEmitCtBarrier(backend: BootstrapLlvmBackend, value: i64*, lane: string): i64* {
+    val bits = bootstrapLaneBits(lane)
+    if (bits < 32) {
+        // A narrow value in a word: its own width is what comes out.
+        val wide = LLVMBuildZExt(backend.builder, value, backend.i32Type, "ct.wide")
+        return LLVMBuildTrunc(
+            backend.builder, bootstrapLlvmEmitCtBarrierWord(backend, wide, backend.i32Type),
+            backend.type(lane), "ct.narrow"
+        )
+    }
+    if (bits == 32 || !bootstrapLlvmTargetUses32BitPointers(backend.targetTriple) ||
+        bootstrapLlvmSimdArch(backend.targetTriple) == BOOTSTRAP_SIMD_ARCH_WASM) {
+        return bootstrapLlvmEmitCtBarrierWord(backend, value, backend.type(lane))
+    }
+    val low = bootstrapLlvmEmitCtBarrierWord(
+        backend, LLVMBuildTrunc(backend.builder, value, backend.i32Type, "ct.low"), backend.i32Type
+    )
+    val high = bootstrapLlvmEmitCtBarrierWord(
+        backend,
+        LLVMBuildTrunc(
+            backend.builder,
+            LLVMBuildLShr(backend.builder, value, LLVMConstInt(backend.i64Type, 32, 0), "ct.high.bits"),
+            backend.i32Type, "ct.high"
+        ),
+        backend.i32Type
+    )
+    LLVMBuildOr(
+        backend.builder,
+        LLVMBuildZExt(backend.builder, low, backend.i64Type, "ct.low.wide"),
+        LLVMBuildShl(
+            backend.builder, LLVMBuildZExt(backend.builder, high, backend.i64Type, "ct.high.wide"),
+            LLVMConstInt(backend.i64Type, 32, 0), "ct.high.place"
+        ),
+        "ct.joined"
+    )
+}
+
+// ablaCtSecret_<lane>(lane): the barrier; ablaCtBits_<lane>(secret): the same bits, public.
+fun bootstrapLlvmEmitCtIntrinsic(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): bool {
+    val name = instruction.text
+    if (name == "ablaCtNarrowTarget") {
+        val narrow = bootstrapLlvmTargetUses32BitPointers(backend.targetTriple) &&
+            bootstrapLlvmSimdArch(backend.targetTriple) != BOOTSTRAP_SIMD_ARCH_WASM
+        bootstrapLlvmSetNativeValue(
+            backend, storage, instruction.result, LLVMConstInt(backend.i1Type, if (narrow) 1 else 0, 0)
+        )
+        return true
+    }
+    if (instruction.operands.size != 1) return false
+    val barrier = name.startsWith("ablaCtSecret_")
+    if (!barrier && !name.startsWith("ablaCtBits_")) return false
+    val lane = name.slice(if (barrier) 13 else 11, name.size)
+    if (bootstrapLaneBits(lane) == 0) return false
+    val value = bootstrapLlvmScalarOperand(backend, storage, instruction.operands[0], lane)
+    bootstrapLlvmSetNativeValue(
+        backend, storage, instruction.result,
+        if (barrier) bootstrapLlvmEmitCtBarrier(backend, value, lane) else value
+    )
     true
 }
 
