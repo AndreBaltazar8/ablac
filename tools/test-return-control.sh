@@ -9,7 +9,7 @@ mkdir -p "$output_directory"
 program="$output_directory/program"
 "$compiler" build \
     "$project_root/tests/cases/modules/return-control.ab" \
-    -o "$program" --no-cache
+    -o "$program"
 
 set +e
 "$project_root/tools/run-limited.sh" "$program"
@@ -23,7 +23,7 @@ fi
 nested_program="$output_directory/nested-if-expression"
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-if-expression.ab" \
-    -o "$nested_program" --no-cache
+    -o "$nested_program"
 set +e
 "$project_root/tools/run-limited.sh" "$nested_program"
 nested_status=$?
@@ -37,7 +37,7 @@ rm -f "$output_directory/invalid"
 set +e
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/invalid-return-type.ab" \
-    -o "$output_directory/invalid" --no-cache \
+    -o "$output_directory/invalid" \
     >"$output_directory/invalid-output.txt" \
     2>"$output_directory/invalid-errors.txt"
 invalid_status=$?

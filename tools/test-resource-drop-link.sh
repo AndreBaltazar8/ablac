@@ -9,7 +9,7 @@ output_directory="$project_root/build/resource-drop-link"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/resource-lambda-drop.ab" \
-    -o "$output_directory/resource-lambda-drop" --no-cache
+    -o "$output_directory/resource-lambda-drop"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/resource-lambda-drop"
 status=$?

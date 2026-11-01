@@ -8,7 +8,7 @@ output_root=$project_root/build/floating-point-test
 mkdir -p "$output_root"
 "$compiler" build \
     "$project_root/tests/cases/modules/floating-point.ab" \
-    -o "$output_root/floating-point" --no-cache
+    -o "$output_root/floating-point"
 set +e
 "$output_root/floating-point"
 floating_status=$?
@@ -17,7 +17,7 @@ test "$floating_status" -eq 42
 
 "$compiler" build \
     "$project_root/tests/cases/modules/floating-math.ab" \
-    -o "$output_root/floating-math" --no-cache
+    -o "$output_root/floating-math"
 set +e
 "$output_root/floating-math"
 math_status=$?
@@ -26,7 +26,7 @@ test "$math_status" -eq 42
 
 "$compiler" build \
     "$project_root/tests/cases/modules/floating-text.ab" \
-    -o "$output_root/floating-text" --no-cache
+    -o "$output_root/floating-text"
 set +e
 "$output_root/floating-text"
 text_status=$?
@@ -35,7 +35,7 @@ test "$text_status" -eq 42
 
 "$compiler" build \
     "$project_root/tests/cases/modules/floating-f32-storage.ab" \
-    -o "$output_root/floating-f32-storage" --no-cache
+    -o "$output_root/floating-f32-storage"
 set +e
 "$output_root/floating-f32-storage"
 f32_status=$?
@@ -44,7 +44,7 @@ test "$f32_status" -eq 42
 
 "$compiler" build --project \
     "$project_root/tests/cases/floating-native" \
-    -o "$output_root/floating-native" --no-cache
+    -o "$output_root/floating-native"
 set +e
 "$output_root/floating-native"
 native_status=$?
@@ -58,7 +58,7 @@ fi
 
 if "$compiler" build \
     "$project_root/tests/cases/modules/invalid-floating-mixed.ab" \
-    -o "$output_root/invalid-mixed" --no-cache \
+    -o "$output_root/invalid-mixed" \
     >"$output_root/invalid-mixed.stdout" \
     2>"$output_root/invalid-mixed.stderr"; then
     echo 'mixed integer/floating arithmetic unexpectedly compiled' >&2
@@ -69,7 +69,7 @@ rg -q 'arithmetic.type' "$output_root/invalid-mixed.stderr"
 # Floats evaluate at compile time (see test-compile-time-floats).
 "$compiler" build \
     "$project_root/tests/cases/modules/floating-compile-time.ab" \
-    -o "$output_root/compile-time" --no-cache
+    -o "$output_root/compile-time"
 set +e
 "$output_root/compile-time"
 compile_time_status=$?

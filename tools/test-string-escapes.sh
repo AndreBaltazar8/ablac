@@ -9,7 +9,7 @@ output_directory="$project_root/build/string-escapes"
 mkdir -p "$output_directory"
 cases="$project_root/tests/cases/modules"
 
-"$compiler" build "$cases/string-escapes.ab" -o "$output_directory/string-escapes" --no-cache >/dev/null
+"$compiler" build "$cases/string-escapes.ab" -o "$output_directory/string-escapes" >/dev/null
 actual=$("$output_directory/string-escapes")
 expected=$'0 124 8 124 65 124 255\n1 65 195 169 226 130 172\n65 195 169 240 159 152 128 244 143 191 191\n"\'\\$ \n\t|'
 [[ $actual == "$expected" ]] || { echo "decoded escapes differ:"; echo "$actual"; exit 1; }
@@ -18,7 +18,7 @@ expect() { # file text…
     local file=$1; shift
     set +e
     diagnostics=$("$compiler" build "$cases/$file.ab" \
-        -o "$output_directory/$file" --no-cache 2>&1)
+        -o "$output_directory/$file" 2>&1)
     status=$?
     set -e
     [[ $status -ne 0 ]] || { echo "$file: built"; exit 1; }

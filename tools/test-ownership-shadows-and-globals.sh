@@ -8,7 +8,7 @@ cases=$project_root/tests/cases/modules
 
 mkdir -p "$output_directory"
 "$compiler" build "$cases/ownership-shadows-and-globals.ab" \
-    -o "$output_directory/program" --no-cache --fast
+    -o "$output_directory/program" --fast
 set +e
 "$output_directory/program"
 status=$?
@@ -21,7 +21,7 @@ fi
 
 set +e
 "$compiler" build "$cases/invalid-receiver-shadowed-late.ab" \
-    -o "$output_directory/invalid" --no-cache --fast \
+    -o "$output_directory/invalid" --fast \
     > "$output_directory/invalid.out" 2>&1
 invalid_status=$?
 set -e
@@ -32,7 +32,7 @@ grep -q 'ownership.mutable-borrow:receiver.Obj.sneaky' \
 for invalid in invalid-move-used-after invalid-move-in-loop; do
     set +e
     "$compiler" build "$cases/$invalid.ab" \
-        -o "$output_directory/$invalid" --no-cache --fast \
+        -o "$output_directory/$invalid" --fast \
         > "$output_directory/$invalid.out" 2>&1
     move_status=$?
     set -e
@@ -41,7 +41,7 @@ for invalid in invalid-move-used-after invalid-move-in-loop; do
 done
 
 "$compiler" build "$cases/constructor-stores-parameter.ab" \
-    -o "$output_directory/stores-parameter" --no-cache --fast
+    -o "$output_directory/stores-parameter" --fast
 set +e
 "$output_directory/stores-parameter"
 status=$?
@@ -50,7 +50,7 @@ set -e
 
 set +e
 "$compiler" build "$cases/invalid-constructor-stores-shadowed-parameter.ab" \
-    -o "$output_directory/stores-shadowed" --no-cache --fast \
+    -o "$output_directory/stores-shadowed" --fast \
     > "$output_directory/stores-shadowed.out" 2>&1
 stores_status=$?
 set -e
@@ -59,7 +59,7 @@ grep -q 'ownership.borrow-escape' "$output_directory/stores-shadowed.out"
 
 set +e
 "$compiler" build "$cases/invalid-constructor-stores-parameter-alias.ab" \
-    -o "$output_directory/stores-alias" --no-cache --fast \
+    -o "$output_directory/stores-alias" --fast \
     > "$output_directory/stores-alias.out" 2>&1
 alias_status=$?
 set -e
@@ -69,7 +69,7 @@ grep -q 'E_BORROW_CONFLICT\]: in `main`, `node` is changed while `first`' \
 
 set +e
 "$compiler" build "$cases/invalid-borrow-conflict.ab" \
-    -o "$output_directory/borrow-conflict" --no-cache --fast \
+    -o "$output_directory/borrow-conflict" --fast \
     > "$output_directory/borrow-conflict.out" 2>&1
 conflict_status=$?
 set -e
@@ -81,7 +81,7 @@ grep -q 'in `Box.grow`, `this.items` is changed while `shared`' \
 grep -q '0 semantic, 2 IR, 2 total error' "$output_directory/borrow-conflict.out"
 
 "$compiler" build "$cases/shared-loop-elements.ab" \
-    -o "$output_directory/shared-loop" --no-cache --fast
+    -o "$output_directory/shared-loop" --fast
 set +e
 "$output_directory/shared-loop"
 status=$?
@@ -92,7 +92,7 @@ for invalid in invalid-shared-loop-append invalid-shared-loop-nested \
     invalid-shared-loop-var-argument; do
     set +e
     "$compiler" build "$cases/$invalid.ab" \
-        -o "$output_directory/$invalid" --no-cache --fast \
+        -o "$output_directory/$invalid" --fast \
         > "$output_directory/$invalid.out" 2>&1
     loop_status=$?
     set -e

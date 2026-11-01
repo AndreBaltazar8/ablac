@@ -9,7 +9,7 @@ mkdir -p "$output_directory"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/map.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$output_directory/program"
 status=$?
@@ -19,7 +19,7 @@ set -e
 # The same under a collection every few KB.
 "$compiler" build \
     "$project_root/tests/cases/modules/map-collect.ab" \
-    -o "$output_directory/collect" --no-cache
+    -o "$output_directory/collect"
 set +e
 "$output_directory/collect"
 status=$?
@@ -28,7 +28,7 @@ set -e
 # A map built at compile time.
 "$compiler" build \
     "$project_root/tests/cases/modules/map-compile-time.ab" \
-    -o "$output_directory/compile-time" --no-cache
+    -o "$output_directory/compile-time"
 set +e
 "$output_directory/compile-time"
 status=$?

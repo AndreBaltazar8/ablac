@@ -15,7 +15,7 @@ for megabytes in 4 16 64; do
     # (perl's alarm: a wall bound on macOS and Linux alike.)
     ABLA_MAX_MEMORY_MB=$megabytes perl -e 'alarm 60; exec @ARGV' \
         "$compiler" build "$project_root/src/orc_main.ab" \
-        -o "$output_directory/compiler" --fast --no-cache \
+        -o "$output_directory/compiler" --fast \
         > "$output_directory/build.out" 2> "$output_directory/build.err"
     status=$?
     set -e

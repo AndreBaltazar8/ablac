@@ -11,7 +11,7 @@ cases="$project_root/tests/cases/thread-globals"
 output_directory="$project_root/build/thread-globals"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/ok.ab" -o "$output_directory/ok" --no-cache
+"$compiler" build "$cases/ok.ab" -o "$output_directory/ok"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/ok" >"$output_directory/ok.out"
 status=$?
@@ -20,7 +20,7 @@ set -e
 [[ "$(cat "$output_directory/ok.out")" == "42 9" ]] ||
     { echo "thread globals: ok printed $(cat "$output_directory/ok.out")" >&2; exit 1; }
 
-if "$compiler" build "$cases/shared.ab" -o "$output_directory/shared" --no-cache \
+if "$compiler" build "$cases/shared.ab" -o "$output_directory/shared" \
     >"$output_directory/shared.log" 2>&1; then
     echo "thread globals: shared built" >&2; exit 1
 fi
@@ -33,7 +33,7 @@ grep -q 'wrap it in Shared<T> or Mutex<T>' "$output_directory/shared.log" ||
 if grep -q 'thread.shared-global:__abla' "$output_directory/shared.log"; then
     echo "thread globals: a runtime global reported" >&2; exit 1
 fi
-if "$compiler" build "$cases/annotation.ab" -o "$output_directory/annotation" --no-cache \
+if "$compiler" build "$cases/annotation.ab" -o "$output_directory/annotation" \
     >"$output_directory/annotation.log" 2>&1; then
     echo "thread globals: @threadShared accepted in a program" >&2; exit 1
 fi

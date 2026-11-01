@@ -32,7 +32,7 @@ for build in plain shifted; do
     # One file name: a signed executable's signature names it.
     mkdir -p "$output_directory/$build"
     "$compiler" build "$output_directory/case/main.ab" \
-        -o "$output_directory/$build/main" --no-cache
+        -o "$output_directory/$build/main"
     set +e
     output=$("$output_directory/$build/main")
     status=$?

@@ -10,7 +10,7 @@ output_directory="$project_root/build/process-metrics"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/process-metrics.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 output=$(ABLA_TEST_ULIMIT=$(ulimit -n) "$output_directory/program")
 status=$?
@@ -23,7 +23,7 @@ set -e
 for mode in "" --fast; do
     "$compiler" build "$project_root/tests/cases/modules/process-metrics.ab" \
         --target x86_64-linux --emit object $mode \
-        -o "$output_directory/linux$mode.o" --no-cache 2>/dev/null
+        -o "$output_directory/linux$mode.o" 2>/dev/null
     if nm -u "$output_directory/linux$mode.o" | grep -q proc_pidinfo; then
         echo "process metrics: the x86_64-linux object$mode references proc_pidinfo"
         exit 1

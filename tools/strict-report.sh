@@ -18,7 +18,7 @@ report="$directory/report.tsv"
 rm -f -- "$report"
 
 if ! (cd "$project_root" && "$compiler" build src/orc_main.ab -o "$directory/ablac" \
-    --fast --no-cache --visibility-report "$report") > "$directory/build.log" 2>&1; then
+    --fast --visibility-report "$report") > "$directory/build.log" 2>&1; then
     echo "strict report: the compiler didn't build (log: $directory/build.log)"
     grep -m3 -A2 '^error' "$directory/build.log"
     exit 2

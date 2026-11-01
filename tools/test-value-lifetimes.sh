@@ -14,7 +14,7 @@ if [[ $starts -eq 0 || $starts -ne $ends ]]; then
     echo "value lifetimes: expected matching markers, got $starts starts and $ends ends" >&2
     exit 1
 fi
-"$compiler" build "$source" -o "$output_directory/program" --no-cache
+"$compiler" build "$source" -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?

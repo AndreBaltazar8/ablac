@@ -10,15 +10,15 @@ cases="$project_root/tests/cases/inferred-results"
 output_directory="$project_root/build/inferred-results"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/main" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/main"
 set +e
 output=$("$output_directory/main")
 status=$?
 "$compiler" build "$cases/invalid-cycle.ab" -o "$output_directory/invalid" \
-    --no-cache > "$output_directory/cycle.err" 2>&1
+    > "$output_directory/cycle.err" 2>&1
 cycle_status=$?
 "$compiler" build "$cases/invalid-mutual-cycle.ab" -o "$output_directory/invalid" \
-    --no-cache > "$output_directory/mutual.err" 2>&1
+    > "$output_directory/mutual.err" 2>&1
 mutual_status=$?
 set -e
 expected='box5 10 15 2.5
@@ -41,7 +41,7 @@ grep -q 'give it a result type' "$output_directory/cycle.err"
 grep -q 'function.result-cycle:pong@38' "$output_directory/mutual.err"
 grep -q 'function.result-cycle:walk@' "$output_directory/mutual.err"
 [[ $(grep -c '^error' "$output_directory/mutual.err") -eq 2 ]]
-"$compiler" build "$cases/reflect.ab" -o "$output_directory/reflect" --no-cache
+"$compiler" build "$cases/reflect.ab" -o "$output_directory/reflect"
 reflected=$("$output_directory/reflect")
 [[ $reflected == $'listUsers -> string\ncountUsers -> i64\nhasUsers -> bool' ]] || {
     echo "inferred results: reflection said:"; echo "$reflected"; exit 1

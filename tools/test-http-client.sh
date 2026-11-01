@@ -47,7 +47,7 @@ sed "s/39092/$port/g" "$project_root/tests/cases/http-client-ipv4.ab" \
     > "$output_directory/http-client-ipv4.ab"
 
 "$compiler" build "$output_directory/http-client-ipv4.ab" \
-    -o "$program" --fast --no-cache
+    -o "$program" --fast
 set +e
 "$project_root/tools/run-limited.sh" "$program"
 status=$?
@@ -58,7 +58,7 @@ trap - EXIT
 
 # The same exchanges against the program's own loopback listener.
 "$compiler" build "$project_root/tests/cases/modules/http-client.ab" \
-    -o "$output_directory/loopback" --fast --no-cache
+    -o "$output_directory/loopback" --fast
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/loopback"
 status=$?

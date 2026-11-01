@@ -37,7 +37,7 @@ fun main: int = if (scheduled) 0 else 1
 EOF
 
 "$compiler" build "$root_file" \
-    -o "$output_directory/many-exports-root" --fast --no-cache
+    -o "$output_directory/many-exports-root" --fast
 "$output_directory/many-exports-root"
 # The dynamic symbol table on ELF; a Mach-O library's exports are its
 # external definitions (with a leading underscore).

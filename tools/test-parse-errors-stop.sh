@@ -15,7 +15,7 @@ check() { # file count (count = expected `error[` lines, 0 = any)
     diagnostics=$(ABLA_MAX_SECONDS=30 ABLA_MAX_CPU_SECONDS=30 \
         "$project_root/tools/run-limited.sh" "$compiler" build \
         "$project_root/tests/cases/modules/$file.ab" \
-        -o "$output_directory/$file" --no-cache 2>&1)
+        -o "$output_directory/$file" 2>&1)
     status=$?
     set -e
     [[ $status -ne 0 ]] || { echo "$file: built"; exit 1; }

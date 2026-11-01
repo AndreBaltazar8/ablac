@@ -11,7 +11,7 @@ mkdir -p "$output_directory"
 
 library=$output_directory/libroots.so
 if [[ $(uname -s) == Darwin ]]; then library=$output_directory/libroots.dylib; fi
-"$compiler" build "$cases/library.ab" --emit shared-library -o "$library" --no-cache
+"$compiler" build "$cases/library.ab" --emit shared-library -o "$library"
 clang "$cases/caller.c" -L"$output_directory" -lroots \
     -Wl,-rpath,"$output_directory" -o "$output_directory/caller"
 ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=60 \

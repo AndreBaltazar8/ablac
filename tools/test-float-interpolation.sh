@@ -9,7 +9,7 @@ cases=$project_root/tests/cases/modules
 mkdir -p "$output_directory"
 for mode in "" --fast; do
     "$compiler" build "$cases/float-interpolation.ab" \
-        -o "$output_directory/program" --no-cache $mode
+        -o "$output_directory/program" $mode
     set +e
     "$output_directory/program"
     status=$?
@@ -23,7 +23,7 @@ done
 
 set +e
 "$compiler" build "$cases/invalid-float-interpolation-import.ab" \
-    -o "$output_directory/invalid" --no-cache --fast \
+    -o "$output_directory/invalid" --fast \
     > "$output_directory/invalid.out" 2>&1
 invalid_status=$?
 set -e

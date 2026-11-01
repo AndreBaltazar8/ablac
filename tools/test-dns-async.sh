@@ -14,7 +14,7 @@ mkdir -p "$output_directory"
 
 for name in dns-async http-async; do
     "$compiler" build "$project_root/tests/cases/modules/$name.ab" \
-        -o "$output_directory/$name" --no-cache
+        -o "$output_directory/$name"
     set +e
     output=$(ABLA_TEST_DIRECTORY="$output_directory" \
         ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=30 \
@@ -29,5 +29,5 @@ done
 # The resolver builds for the Linux target too.
 "$compiler" build "$project_root/tests/cases/modules/dns-async.ab" \
     --target x86_64-linux --emit object -o "$output_directory/linux.o" \
-    --no-cache 2>/dev/null
+    2>/dev/null
 echo "dns async: literals, A/AAAA, resend, stray replies, NXDOMAIN, timeouts, cancel, outside loop, search/ndots, hosts, blocking, http"

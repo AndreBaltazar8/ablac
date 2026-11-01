@@ -8,7 +8,7 @@ program="$project_root/build/portable-buffered-io/program"
 mkdir -p "$(dirname -- "$program")"
 "$compiler" build \
     "$project_root/tests/cases/modules/portable-buffered-io.ab" \
-    -o "$program" --fast --no-cache
+    -o "$program" --fast
 
 set +e
 "$project_root/tools/run-limited.sh" "$program"

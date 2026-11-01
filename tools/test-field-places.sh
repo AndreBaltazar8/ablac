@@ -10,7 +10,7 @@ cases=$project_root/tests/cases/field-places
 output_directory=$project_root/build/field-places
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/program" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program" > "$output_directory/program.out"
 status=$?
@@ -27,7 +27,7 @@ check_rejected() {
     local expected=$2
     local output="$output_directory/$fixture"
     rm -f "$output"
-    if "$compiler" build "$cases/$fixture.ab" -o "$output" --no-cache \
+    if "$compiler" build "$cases/$fixture.ab" -o "$output" \
         > "$output.log" 2>&1; then
         echo "field places: $fixture built" >&2
         exit 1

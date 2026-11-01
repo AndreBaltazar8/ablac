@@ -8,7 +8,7 @@ output_directory="$project_root/build/optimize-o1"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/string-helpers.ab" \
-    -o "$output_directory/program" --o1 --no-cache
+    -o "$output_directory/program" --o1
 set +e
 "$output_directory/program"
 status=$?

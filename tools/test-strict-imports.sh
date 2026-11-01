@@ -27,7 +27,7 @@ runs() { # $1 = executable, $2 = the output it must print (exit 42)
 
 rejected() { # $1 = source, $2 = extra build flag or "", then the texts its diagnostics must contain
     local source=$1 flag=$2; shift 2
-    if "$compiler" build "$source" -o "$output_directory/invalid" --no-cache $flag \
+    if "$compiler" build "$source" -o "$output_directory/invalid" $flag \
         > "$output_directory/rejected.err" 2>&1; then
         echo "strict-imports: $source compiled"; exit 1
     fi
@@ -38,21 +38,21 @@ rejected() { # $1 = source, $2 = extra build flag or "", then the texts its diag
 }
 
 # A strict package: re-exported names, members and named arguments resolve.
-"$compiler" build "$cases/pkg/main.ab" -o "$output_directory/pkg" --no-cache
+"$compiler" build "$cases/pkg/main.ab" -o "$output_directory/pkg"
 runs "$output_directory/pkg" "4 18 8 5"
 rejected "$cases/pkg/bad.ab" "" \
     'error[E_NAME_NOT_IMPORTED]: `utilHelp` is declared in' 'help: add: import "./util.ab"'
 
 # A flat program builds as before, and is rejected with --strict-imports; a
 # standard-library name is suggested by the import the program writes.
-"$compiler" build "$cases/flat/main.ab" -o "$output_directory/flat" --no-cache
+"$compiler" build "$cases/flat/main.ab" -o "$output_directory/flat"
 runs "$output_directory/flat" "81 x/y"
 rejected "$cases/flat/main.ab" --strict-imports \
     '`bThing` is declared in' 'help: add: import "./b.ab"' 'help: add: import "abla/fs"'
 
 # Report, apply, and build strict.
 cp -R "$cases/flat" "$output_directory/fixed"
-"$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/flat" --no-cache \
+"$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/flat" \
     --visibility-report "$output_directory/report.tsv"
 grep -qF "	bThing	" "$output_directory/report.tsv" ||
     { echo "strict-imports: the report lacks bThing"; cat "$output_directory/report.tsv"; exit 1; }
@@ -61,12 +61,12 @@ grep -qF "	bThing	" "$output_directory/report.tsv" ||
 grep -qF "fix-imports: 1 module(s) changed" "$output_directory/fix.out" ||
     { echo "strict-imports: fix-imports printed:"; cat "$output_directory/fix.out"; exit 1; }
 "$compiler" build "$output_directory/fixed/main.ab" -o "$output_directory/fixed-main" \
-    --no-cache --strict-imports
+    --strict-imports
 runs "$output_directory/fixed-main" "81 x/y"
 # The standard library is a strict package: its facades pass on what they
 # front, and a library module that uses a name it doesn't import is rejected,
 # with the library module to import (here in a copy of the sysroot).
-"$compiler" build "$cases/facade.ab" -o "$output_directory/facade" --no-cache --strict-imports
+"$compiler" build "$cases/facade.ab" -o "$output_directory/facade" --strict-imports
 runs "$output_directory/facade" "x/y true"
 sysroot=${ABLA_SYSROOT:-$project_root}
 library_root="$output_directory/sysroot"
@@ -80,10 +80,10 @@ source "$project_root/tools/compiler-binary.sh"
 ABLA_SYSROOT="$library_root" rejected "$cases/library-user.ab" "" \
     'error[E_NAME_NOT_IMPORTED]: `Path` is declared in' 'help: add: import "abla/sys/linux/fs"')
 # A program's value named like a type the library's annotations name.
-"$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named" --no-cache
+"$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named"
 runs "$output_directory/value-named" "5"
 "$compiler" build "$cases/value-named-like-type.ab" -o "$output_directory/value-named-strict" \
-    --no-cache --strict-imports
+    --strict-imports
 runs "$output_directory/value-named-strict" "5"
 # A name reached only through a strict library module's own import is
 # suggested by the module that declares it, not by the one the program wrote.
@@ -97,11 +97,11 @@ cd "$cases/nested/lib" && rejected ../main.ab "" \
     'error[E_NAME_NOT_IMPORTED]: `thing` is declared in' 'help: add: import "../shared/thing.ab"')
 # A type inside generic arguments or a function type names a type too.
 "$compiler" build "$cases/generic-types/main.ab" -o "$output_directory/generic-types" \
-    --no-cache --strict-imports
+    --strict-imports
 runs "$output_directory/generic-types" "5 2 1 3"
 # A library module's other file isn't API: a flat program's report names the
 # entry module that reaches it, and a strict program is told it's internal.
-"$compiler" build "$cases/internal.ab" -o "$output_directory/internal" --no-cache \
+"$compiler" build "$cases/internal.ab" -o "$output_directory/internal" \
     --visibility-report "$output_directory/internal.tsv" > "$output_directory/internal.out" 2>&1 || true
 grep -F "	OpenSSL_version_num	" "$output_directory/internal.tsv" | grep -qF 'import "abla/tls/hosted"' ||
     { echo "strict-imports: the internal name's report line:"; cat "$output_directory/internal.tsv"; exit 1; }

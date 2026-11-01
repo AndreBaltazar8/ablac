@@ -6,7 +6,7 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 package="$project_root/tests/cases/package-project"
 output="$package/build/package-probe"
 
-"$compiler" build --project "$package" --fast --no-cache
+"$compiler" build --project "$package" --fast
 set +e
 "$project_root/tools/run-limited.sh" "$output"
 status=$?
@@ -22,7 +22,7 @@ set -e
 set +e
 invalid_output=$("$compiler" build --project \
     "$project_root/tests/cases/package-project-invalid" \
-    --fast --no-cache 2>&1)
+    --fast 2>&1)
 invalid_status=$?
 set -e
 [[ $invalid_status -eq 2 ]] || exit 1

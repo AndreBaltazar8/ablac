@@ -7,7 +7,7 @@ output_directory="$project_root/build/unsafe-boundary"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/unsafe-boundary.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 grep -Eq 'cmpxchg .* seq_cst seq_cst' "$output_directory/program.ll"
 grep -Eq 'cmpxchg .* monotonic monotonic' "$output_directory/program.ll"
 grep -Eq '^  fence seq_cst$' "$output_directory/program.ll"
@@ -25,7 +25,7 @@ for fixture in invalid-unsafe-call invalid-unsafe-function; do
     rm -f "$output"
     set +e
     "$compiler" build "$project_root/tests/cases/bootstrap/$fixture.ab" \
-        -o "$output" --no-cache >"$output.out" 2>"$output.err"
+        -o "$output" >"$output.out" 2>"$output.err"
     result=$?
     set -e
     if [[ $result -ne 1 ]] || ! grep -Fq 'native.trust:' "$output.err"; then

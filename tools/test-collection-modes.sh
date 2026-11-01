@@ -30,7 +30,7 @@ check_case() {
             exit 1
         }
     fi
-    "$compiler" build "$source" -o "$directory/$name" --no-cache || exit 1
+    "$compiler" build "$source" -o "$directory/$name" || exit 1
     set +e
     ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
         "$project_root/tools/run-limited.sh" "$directory/$name"

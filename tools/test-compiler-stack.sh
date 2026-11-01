@@ -16,13 +16,13 @@ mkdir -p "$output_directory"
 (
     ulimit -S -s 8192
     "$payload" build "$project_root/tests/cases/modules/deep-nesting.ab" \
-        -o "$output_directory/program" --no-cache
+        -o "$output_directory/program"
 )
 set +e
 "$output_directory/program"
 status=$?
 "$compiler" build "$project_root/tests/cases/modules/invalid-no-main.ab" \
-    -o "$output_directory/no-main" --no-cache \
+    -o "$output_directory/no-main" \
     > "$output_directory/no-main.out" 2> "$output_directory/no-main.err"
 no_main=$?
 set -e

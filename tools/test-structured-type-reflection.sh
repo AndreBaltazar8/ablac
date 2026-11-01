@@ -14,7 +14,7 @@ mkdir -p "$directory"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/structured-type-reflection.ab" \
-    --no-cache -o "$program"
+    -o "$program"
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$program"
@@ -25,7 +25,7 @@ set -e
 set +e
 "$compiler" build \
     "$project_root/tests/cases/modules/invalid-structured-type-handle.ab" \
-    --no-cache -o "$directory/invalid" \
+    -o "$directory/invalid" \
     > "$directory/invalid.out" 2> "$directory/invalid.err"
 invalid_status=$?
 set -e

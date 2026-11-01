@@ -11,12 +11,12 @@ cases="$project_root/tests/cases/inferred-receivers"
 output_directory="$project_root/build/inferred-receivers"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/main" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/main"
 set +e
 output=$("$output_directory/main")
 status=$?
 "$compiler" build "$cases/invalid-element.ab" -o "$output_directory/invalid" \
-    --no-cache > "$output_directory/invalid.err" 2>&1
+    > "$output_directory/invalid.err" 2>&1
 invalid_status=$?
 set -e
 expected='2 4 true 2 true 1 2 true|2 4 true 2 true 1 2 true'

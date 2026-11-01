@@ -22,7 +22,7 @@ test -s "$temporary_directory/stdlib.ll"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/host-runtime.ab" \
-    -o "$temporary_directory/host-runtime" --no-cache
+    -o "$temporary_directory/host-runtime"
 test -x "$temporary_directory/host-runtime"
 
 printf '%s\n' \

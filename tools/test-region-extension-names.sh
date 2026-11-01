@@ -15,21 +15,21 @@ output_directory="$project_root/build/region-extension-names"
 rm -rf "$output_directory"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/allowed.ab" -o "$output_directory/allowed" --no-cache
+"$compiler" build "$cases/allowed.ab" -o "$output_directory/allowed"
 status=0
 "$project_root/tools/run-limited.sh" "$output_directory/allowed" || status=$?
 [[ $status == 42 ]] ||
     { echo "region extension names: allowed exited $status, not 42" >&2; exit 1; }
 
 if "$compiler" build "$cases/refused.ab" -o "$output_directory/refused" \
-    --no-cache > "$output_directory/refused.err" 2>&1; then
+    > "$output_directory/refused.err" 2>&1; then
     echo "region extension names: refused.ab compiled" >&2; exit 1
 fi
 grep -qxF 'error[E_SEMANTIC]: region.call-retention:floor' "$output_directory/refused.err" ||
     { echo "region extension names: Node.floor not refused" >&2; cat "$output_directory/refused.err" >&2; exit 1; }
 
 (cd "$project_root" && "$compiler" build "$cases/build.ab" \
-    -o "$output_directory/build-driver" --no-cache)
+    -o "$output_directory/build-driver")
 (cd "$project_root" && "$output_directory/build-driver")
 for module in math math-dev fast fast-dev v8 v8-dev; do
     [[ -s $output_directory/$module.wasm ]] ||

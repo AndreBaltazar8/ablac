@@ -24,7 +24,7 @@ if grep -Fq '@__ablaRuntimeAllocateLayout' "$output"; then
 fi
 
 "$compiler" build tests/cases/modules/unsafe-stack-memory.ab \
-    -o "$binary" --no-cache
+    -o "$binary"
 set +e
 tools/run-limited.sh "$binary"
 status=$?

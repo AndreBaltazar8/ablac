@@ -13,7 +13,7 @@ check() { # file count expected… (count = number of `error[` lines)
     local file=$1 count=$2; shift 2
     set +e
     diagnostics=$("$compiler" build "$project_root/tests/cases/modules/$file.ab" \
-        -o "$output_directory/$file" --no-cache 2>&1)
+        -o "$output_directory/$file" 2>&1)
     status=$?
     set -e
     [[ $status -ne 0 ]] || { echo "$file: built"; exit 1; }

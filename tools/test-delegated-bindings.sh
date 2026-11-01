@@ -11,7 +11,7 @@ export ABLA_MAX_CPU_SECONDS=${ABLA_MAX_CPU_SECONDS:-$ABLA_MAX_SECONDS}
 
 "$compiler" build \
     "$project_root/tests/cases/modules/delegated-bindings.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
@@ -61,7 +61,7 @@ while [[ $index -lt ${#fixtures[@]} ]]; do
     set +e
     "$compiler" build \
         "$project_root/tests/cases/modules/$fixture.ab" \
-        -o "$output" --no-cache >"$output.out" 2>"$output.err"
+        -o "$output" >"$output.out" 2>"$output.err"
     result=$?
     set -e
     if [[ $result -ne 1 ]] || ! grep -Fq "$expected" "$output.err"; then

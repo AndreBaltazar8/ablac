@@ -32,7 +32,7 @@ for build in plain added; do
     fi
     (cd "$work" && "$compiler" --emit-llvm main.ab > "$work/main.ll")
     sed -n 's/^define [^@]*@\([^(]*\)(.*/\1/p' "$work/main.ll" | sort -u > "$work/symbols"
-    "$compiler" build "$work/main.ab" -o "$work/main" --no-cache
+    "$compiler" build "$work/main.ab" -o "$work/main"
     set +e
     "$work/main" > "$work/output" 2>&1
     echo "status $?" >> "$work/output"

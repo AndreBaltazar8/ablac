@@ -10,7 +10,7 @@ output_directory="$project_root/build/module-shadowing"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/shadow-imports.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$output_directory/program"
 status=$?
@@ -24,7 +24,7 @@ grep -q 'E_IMPORT_UNQUALIFIED_AMBIGUOUS' "$output_directory/invalid.err" || exit
 
 # An imported module's `main` does not replace the program's.
 "$compiler" build "$project_root/tests/cases/modules/shadow-main.ab" \
-    -o "$output_directory/main" --no-cache || exit 1
+    -o "$output_directory/main" || exit 1
 set +e
 "$output_directory/main"
 status=$?

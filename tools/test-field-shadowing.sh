@@ -11,7 +11,7 @@ output_directory="$project_root/build/field-shadowing"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/field-shadowing/main.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
@@ -20,7 +20,7 @@ set -e
 
 # `import "abla/math"` brings the cos and sin the array fields are named like.
 "$compiler" build "$project_root/tests/cases/field-shadowing/calls.ab" \
-    -o "$output_directory/calls" --no-cache
+    -o "$output_directory/calls"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/calls" >/dev/null
 status=$?
@@ -28,14 +28,14 @@ set -e
 [[ $status -eq 42 ]] || { echo "field shadowing: calls expected 42, got $status" >&2; exit 1; }
 
 if "$compiler" build "$project_root/tests/cases/field-shadowing/method-arity.ab" \
-    -o "$output_directory/method-arity" --no-cache >"$output_directory/method-arity.log" 2>&1; then
+    -o "$output_directory/method-arity" >"$output_directory/method-arity.log" 2>&1; then
     echo "field shadowing: method-arity built" >&2; exit 1
 fi
 grep -q 'method.arity:Counter.reset' "$output_directory/method-arity.log" ||
     { echo "field shadowing: method-arity not reported against the method" >&2
       cat "$output_directory/method-arity.log" >&2; exit 1; }
 if "$compiler" build "$project_root/tests/cases/field-shadowing/method-argument.ab" \
-    -o "$output_directory/method-argument" --no-cache >"$output_directory/method-argument.log" 2>&1; then
+    -o "$output_directory/method-argument" >"$output_directory/method-argument.log" 2>&1; then
     echo "field shadowing: method-argument built" >&2; exit 1
 fi
 grep -q 'method.argument:Counter.reset' "$output_directory/method-argument.log" ||

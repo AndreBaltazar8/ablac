@@ -9,12 +9,12 @@ cases="$project_root/tests/cases/when-null"
 output_directory="$project_root/build/when-null"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/main" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/main"
 set +e
 output=$("$output_directory/main")
 status=$?
 "$compiler" build "$cases/invalid-before-null.ab" -o "$output_directory/invalid" \
-    --no-cache > "$output_directory/invalid.err" 2>&1
+    > "$output_directory/invalid.err" 2>&1
 invalid_status=$?
 set -e
 expected='none letter a 1 other:xyz b or none 5 -1 42 100

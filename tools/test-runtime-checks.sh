@@ -16,14 +16,14 @@ mkdir -p "$out"
 fail() { echo "runtime checks: $*" >&2; exit 1; }
 
 # The same text at run time and under `#`, and the expected text.
-"$compiler" build "$cases/arithmetic.ab" -o "$out/arithmetic" --no-cache
+"$compiler" build "$cases/arithmetic.ab" -o "$out/arithmetic"
 "$out/arithmetic" > "$out/arithmetic.out"
 [[ $(sed -n 1p "$out/arithmetic.out") == "$(sed -n 2p "$out/arithmetic.out")" ]] ||
     fail "division differs under #"
 grep -q -- ' -9223372036854775808:0 -9223372036854775808:0 16938 -9223372036854775808 0$' \
     "$out/arithmetic.out" || fail "MIN / -1 does not wrap"
 
-"$compiler" build "$cases/string-order.ab" -o "$out/string-order" --no-cache
+"$compiler" build "$cases/string-order.ab" -o "$out/string-order"
 "$out/string-order" > "$out/string-order.out"
 [[ $(sed -n 1p "$out/string-order.out") == "$(sed -n 2p "$out/string-order.out")" ]] ||
     fail "string order differs under #"
@@ -31,7 +31,7 @@ expected_order=' <<= >>= <=>= <<= <<= >>= >>= <<= >>= <<= [][Zebra][apple][apple
 [[ $(sed -n 1p "$out/string-order.out") == "$expected_order" ]] ||
     fail "string order: $(sed -n 1p "$out/string-order.out")"
 
-"$compiler" build "$cases/widths.ab" -o "$out/widths" --no-cache
+"$compiler" build "$cases/widths.ab" -o "$out/widths"
 "$out/widths" > "$out/widths.out"
 expected_widths='-128 0 -32768 0 -2147483648 0 6148914691236517205 0 1 35 5 3 2'
 printf '%s\n' "$expected_widths" "$expected_widths" | cmp -s - "$out/widths.out" ||
@@ -46,7 +46,7 @@ for which in int rem u8 i32 u64; do
         fail "$which / 0: $(cat "$out/widths-$which.err")"
 done
 
-"$compiler" build "$cases/bounds.ab" -o "$out/bounds" --no-cache
+"$compiler" build "$cases/bounds.ab" -o "$out/bounds"
 expect_panic() {
     local which=$1 message=$2 status
     set +e
@@ -72,7 +72,7 @@ expect_panic filled "filledArray with a negative size (-4)"
 
 # A panic on any thread or coroutine ends the whole process at once, built and
 # under `ablac run`.
-"$compiler" build "$cases/concurrent.ab" -o "$out/concurrent" --no-cache
+"$compiler" build "$cases/concurrent.ab" -o "$out/concurrent"
 for which in main thread task generator thread-panic; do
     message='panic: index 5 out of bounds for array of size 2'
     [[ $which == thread-panic ]] && message='panic: from a thread'
@@ -94,7 +94,7 @@ for which in main thread task generator thread-panic; do
 done
 
 # A debug build prints the stack after the panic.
-"$compiler" build "$cases/bounds.ab" -o "$out/bounds-debug" --no-cache -g
+"$compiler" build "$cases/bounds.ab" -o "$out/bounds-debug" -g
 set +e
 "$out/bounds-debug" array-read > /dev/null 2> "$out/bounds-debug.err"
 status=$?
@@ -106,7 +106,7 @@ grep -q '^stack ' "$out/bounds-debug.err" || fail "debug build printed no stack"
 
 # A stack overflow panics; another SIGSEGV still ends the process by the signal.
 for flags in "" "-g"; do
-    "$compiler" build "$cases/stack.ab" -o "$out/stack" --no-cache $flags
+    "$compiler" build "$cases/stack.ab" -o "$out/stack" $flags
     set +e
     "$out/stack" overflow > /dev/null 2> "$out/stack-overflow.err"
     overflow_status=$?
@@ -125,7 +125,7 @@ done
 # Under `#`: positioned errors with the same text.
 set +e
 "$compiler" build "$cases/compile-time-panics.ab" -o "$out/compile-time-panics" \
-    --no-cache > "$out/compile-time-panics.err" 2>&1
+    > "$out/compile-time-panics.err" 2>&1
 status=$?
 set -e
 [[ $status -ne 0 ]] || fail "compile-time panics compiled"
@@ -146,10 +146,10 @@ done
 # A constant zero divisor; an order of something that has none.
 set +e
 "$compiler" build "$cases/invalid-division-zero.ab" -o "$out/invalid" \
-    --no-cache > "$out/division-zero.err" 2>&1
+    > "$out/division-zero.err" 2>&1
 division_status=$?
 "$compiler" build "$cases/invalid-ordering.ab" -o "$out/invalid" \
-    --no-cache > "$out/ordering.err" 2>&1
+    > "$out/ordering.err" 2>&1
 ordering_status=$?
 set -e
 [[ $division_status -ne 0 && $ordering_status -ne 0 ]] ||
@@ -162,7 +162,7 @@ set -e
 # WebAssembly, where the division instructions trap by themselves.
 if command -v node > /dev/null; then
     (cd "$project_root" && "$compiler" build "$cases/wasm/build.ab" \
-        -o "$out/wasm-driver" --no-cache)
+        -o "$out/wasm-driver")
     "$out/wasm-driver"
     node "$cases/wasm/run.mjs" "$out/runtime-checks.wasm"
 fi

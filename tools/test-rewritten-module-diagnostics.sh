@@ -10,7 +10,7 @@ output_directory="$project_root/build/rewritten-diagnostics"
 mkdir -p "$output_directory"
 
 if (cd "$project_root" && "$compiler" build "$case_directory/main.ab" \
-    -o "$output_directory/main" --no-cache) > "$output_directory/out.txt" 2>&1; then
+    -o "$output_directory/main") > "$output_directory/out.txt" 2>&1; then
     echo "rewritten module diagnostics: the build was expected to fail" >&2
     exit 1
 fi

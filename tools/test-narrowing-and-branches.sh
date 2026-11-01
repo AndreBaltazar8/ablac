@@ -8,7 +8,7 @@ source_file=$project_root/tests/cases/modules/narrowing-and-branches.ab
 program=$output_directory/program
 
 mkdir -p "$output_directory"
-"$compiler" build "$source_file" -o "$program" --no-cache
+"$compiler" build "$source_file" -o "$program"
 set +e
 "$program"
 status=$?

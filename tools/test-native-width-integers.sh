@@ -24,7 +24,7 @@ if grep -Eq 'export\.arguments|call void @abla_(add|divide|equal)' \
     exit 1
 fi
 
-"$compiler" build "$source_file" -o "$program" --no-cache
+"$compiler" build "$source_file" -o "$program"
 set +e
 "$program"
 status=$?

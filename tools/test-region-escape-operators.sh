@@ -12,7 +12,7 @@ mkdir -p "$output_directory"
 reject() {
     set +e
     diagnostics=$("$compiler" build "$project_root/tests/cases/modules/$1.ab" \
-        -o "$output_directory/$1" --no-cache 2>&1)
+        -o "$output_directory/$1" 2>&1)
     status=$?
     set -e
     [[ $status -ne 0 && $diagnostics == *"region.escape:assignment.saved"* ]] ||
@@ -23,6 +23,6 @@ reject region-escape-concatenation
 reject region-escape-operator-object
 reject region-escape-when
 "$compiler" build "$project_root/tests/cases/modules/region-concatenation-inside.ab" \
-    -o "$output_directory/inside" --no-cache
+    -o "$output_directory/inside"
 [[ $("$output_directory/inside") == "6 0 50" ]] || exit 1
 echo "region escape: operator results stay in their region"

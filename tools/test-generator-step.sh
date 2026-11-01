@@ -12,7 +12,7 @@ output_directory="$project_root/build/generator-step"
 mkdir -p "$output_directory"
 
 for name in counter words; do
-    "$compiler" build "$cases/$name.ab" -o "$output_directory/$name" --no-cache
+    "$compiler" build "$cases/$name.ab" -o "$output_directory/$name"
     "$compiler" --emit-llvm "$cases/$name.ab" > "$output_directory/$name.ll"
 done
 [[ $("$output_directory/counter") == 5000411500 ]] || {

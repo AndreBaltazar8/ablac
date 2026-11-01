@@ -8,7 +8,7 @@ output_root=$project_root/build/static-strings-test
 mkdir -p "$output_root"
 "$compiler" build \
     "$project_root/tests/cases/modules/static-string-concat.ab" \
-    -o "$output_root/static-string-concat" --no-cache
+    -o "$output_root/static-string-concat"
 set +e
 "$output_root/static-string-concat"
 status=$?
@@ -17,7 +17,7 @@ test "$status" -eq 42
 
 "$compiler" build \
     "$project_root/tests/cases/modules/static-string-template.ab" \
-    -o "$output_root/static-string-template" --no-cache
+    -o "$output_root/static-string-template"
 set +e
 "$output_root/static-string-template"
 status=$?

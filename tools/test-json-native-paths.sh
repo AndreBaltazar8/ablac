@@ -22,7 +22,7 @@ val built = #wasmBuildModule(
 )
 fun main: int = if (built) 0 else 1
 AB
-    "$compiler" build "$output_directory/build-$name.ab" --no-cache \
+    "$compiler" build "$output_directory/build-$name.ab" \
         -o "$output_directory/build-$name"
     node --input-type=module - "$output_directory/$name.wasm" <<'JS'
 import { readFileSync } from "node:fs";

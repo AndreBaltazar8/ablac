@@ -10,7 +10,7 @@ mkdir -p "$output_directory"
 # the outer binding returns when the block ends: natively, in the
 # compile-time evaluator, and in WebAssembly.
 "$compiler" build "$project_root/tests/cases/local-shadowing/main.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
@@ -21,7 +21,7 @@ if [[ $status -ne 42 ]]; then
 fi
 
 (cd "$project_root" && "$compiler" build tests/cases/local-shadowing/build.ab \
-    -o "$output_directory/build-driver" --no-cache)
+    -o "$output_directory/build-driver")
 "$output_directory/build-driver"
 node "$project_root/tests/cases/local-shadowing/run.mjs" \
     "$output_directory/local-shadowing.wasm"

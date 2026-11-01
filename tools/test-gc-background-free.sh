@@ -18,19 +18,29 @@ fail() {
     exit 1
 }
 
+pids=()
 for program in background inline fork; do
-    "$compiler" build "$cases/$program.ab" -o "$output_directory/$program" --no-cache
+    "$compiler" build "$cases/$program.ab" -o "$output_directory/$program" --no-cache &
+    pids+=("$!")
 done
+for pid in "${pids[@]}"; do wait "$pid"; done
 # Bound the process tree as well as the parent: the regression is a child
 # waiting forever on a lock whose owning thread existed only in the parent.
 forked=$(ABLA_MAX_SECONDS=60 "$project_root/tools/run-limited.sh" "$output_directory/fork")
 [[ $forked == "80196000000" ]] || fail "fork/free race: unexpected checksum '$forked'"
+# (Each pair of runs at once: nothing here depends on the machine being quiet.)
+"$output_directory/inline" > "$output_directory/inline.out" &
+inline_pid=$!
 background=$("$output_directory/background")
-inline=$("$output_directory/inline")
+wait "$inline_pid"
+inline=$(<"$output_directory/inline.out")
 [[ $background == "$inline" ]] || fail "with background freeing: '$background', without: '$inline'"
 [[ $background == *" 6 true" ]] || fail "unexpected output '$background' (child's text, freed memory returned)"
+ABLA_GC_STRESS=1 "$output_directory/inline" 3 > "$output_directory/inline-stressed.out" &
+inline_pid=$!
 stressed=$(ABLA_GC_STRESS=1 "$output_directory/background" 3)
-[[ $stressed == "$(ABLA_GC_STRESS=1 "$output_directory/inline" 3)" ]] ||
+wait "$inline_pid"
+[[ $stressed == "$(<"$output_directory/inline-stressed.out")" ]] ||
     fail "under ABLA_GC_STRESS=1 the outputs differ"
 # The linked programs (--emit-llvm writes the unpruned runtime, threads and all).
 nm -u "$output_directory/inline" > "$output_directory/inline.symbols"

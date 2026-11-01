@@ -9,15 +9,15 @@ cases="$project_root/tests/cases/array-filled"
 output_directory="$project_root/build/array-filled"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/main" --no-cache
-"$compiler" build "$cases/trap.ab" -o "$output_directory/trap" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/main"
+"$compiler" build "$cases/trap.ab" -o "$output_directory/trap"
 set +e
 "$output_directory/main"
 status=$?
 "$output_directory/trap" 2> "$output_directory/trap.err"
 trap_status=$?
 "$compiler" build "$cases/invalid.ab" -o "$output_directory/invalid" \
-    --no-cache > "$output_directory/invalid.err" 2>&1
+    > "$output_directory/invalid.err" 2>&1
 invalid_status=$?
 set -e
 [[ $status -eq 42 ]] || exit 1

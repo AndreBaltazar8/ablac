@@ -50,7 +50,7 @@ if rg -q 'call void @abla_(length|index_get)' "$typed_ir"; then
     exit 1
 fi
 
-"$compiler" build "$source_file" -o "$executable" --no-cache
+"$compiler" build "$source_file" -o "$executable"
 set +e
 "$executable"
 status=$?
@@ -60,7 +60,7 @@ if [[ $status -ne 42 ]]; then
     exit 1
 fi
 
-"$compiler" build "$typed_source" -o "$typed_executable" --no-cache
+"$compiler" build "$typed_source" -o "$typed_executable"
 set +e
 "$typed_executable"
 status=$?

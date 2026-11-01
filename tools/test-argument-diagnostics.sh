@@ -9,7 +9,7 @@ mkdir -p "$output_root"
 set +e
 "$compiler" build \
     "$project_root/tests/cases/modules/argument-type-error.ab" \
-    -o "$output_root/argument-type-error" --no-cache > "$output_root/error.log" 2>&1
+    -o "$output_root/argument-type-error" > "$output_root/error.log" 2>&1
 status=$?
 set -e
 test "$status" -ne 0

@@ -9,7 +9,7 @@ output_directory="$project_root/build/memory-drop-root"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/runtime-memory-drop-root.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$output_directory/program"
 status=$?

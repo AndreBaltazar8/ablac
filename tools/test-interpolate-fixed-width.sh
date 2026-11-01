@@ -10,7 +10,7 @@ mkdir -p "$output_directory"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/interpolate-fixed-width.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$output_directory/program"
 status=$?
@@ -20,7 +20,7 @@ set -e
 # A string reached through a borrowed alias interpolates too.
 "$compiler" build \
     "$project_root/tests/cases/modules/interpolate-borrowed.ab" \
-    -o "$output_directory/borrowed" --no-cache
+    -o "$output_directory/borrowed"
 set +e
 "$output_directory/borrowed"
 status=$?

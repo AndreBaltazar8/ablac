@@ -15,7 +15,7 @@ printf 'sea\n' > "$output_directory/work/outside/c.txt"
 ln -s ../outside "$output_directory/work/source/link"
 
 "$compiler" build "$project_root/tests/cases/modules/fs-tree.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 (cd "$output_directory/work" && "$output_directory/program")
 status=$?

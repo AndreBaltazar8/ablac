@@ -8,7 +8,7 @@ mkdir -p "$output_directory"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nominal-scalar.ab" \
-    -o "$output_directory/nominal-scalar" --no-cache
+    -o "$output_directory/nominal-scalar"
 set +e
 "$output_directory/nominal-scalar"
 status=$?
@@ -20,7 +20,7 @@ fi
 
 "$compiler" build \
     "$project_root/tests/cases/modules/inferred-nominal-global-method.ab" \
-    -o "$output_directory/inferred-nominal-global-method" --no-cache
+    -o "$output_directory/inferred-nominal-global-method"
 set +e
 "$output_directory/inferred-nominal-global-method"
 status=$?
@@ -33,7 +33,7 @@ fi
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nominal-global-extension-name.ab" \
-    -o "$output_directory/nominal-global-extension-name" --no-cache
+    -o "$output_directory/nominal-global-extension-name"
 set +e
 "$output_directory/nominal-global-extension-name"
 status=$?
@@ -46,7 +46,7 @@ fi
 
 "$compiler" build \
     "$project_root/tests/cases/modules/module-val-constant.ab" \
-    -o "$output_directory/module-val-constant" --no-cache
+    -o "$output_directory/module-val-constant"
 set +e
 "$output_directory/module-val-constant"
 status=$?
@@ -86,7 +86,7 @@ fi
 
 if "$compiler" build \
     "$project_root/tests/cases/modules/invalid-nominal-scalar-conversion.ab" \
-    -o "$output_directory/invalid" --no-cache \
+    -o "$output_directory/invalid" \
     >"$output_directory/invalid.out" 2>"$output_directory/invalid.err"; then
     echo 'implicit underlying-to-nominal conversion unexpectedly compiled' >&2
     exit 1

@@ -8,7 +8,7 @@ output_root=$project_root/build/compound-assignment-test
 mkdir -p "$output_root"
 "$compiler" build \
     "$project_root/tests/cases/modules/compound-assignment.ab" \
-    -o "$output_root/compound-assignment" --no-cache
+    -o "$output_root/compound-assignment"
 set +e
 "$output_root/compound-assignment"
 status=$?
@@ -18,7 +18,7 @@ test "$status" -eq 42
 set +e
 "$compiler" build \
     "$project_root/tests/cases/modules/compound-assignment-call.ab" \
-    -o "$output_root/compound-assignment-call" --no-cache > "$output_root/call.log" 2>&1
+    -o "$output_root/compound-assignment-call" > "$output_root/call.log" 2>&1
 status=$?
 set -e
 test "$status" -ne 0

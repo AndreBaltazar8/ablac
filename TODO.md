@@ -48,6 +48,12 @@
 
 - [ ] `tools/test-graceful-reload.sh` failed once under `make test` at JOBS=50 (load about 40, 31 s,
       2026-11-01), and passed at JOBS=40, 60 and a second 50. Not looked into.
+- [ ] `tools/test-dns-async.sh` failed once under `make test` at load about 60, from other work on the
+      machine: "no records" with a 600 ms resolver timeout against a forked mock (2026-11-01). Its
+      timing checks (600 ms, NXDOMAIN under 400 ms) are tight on a loaded machine.
+- [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
+      and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
+      in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed.
 - [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
       out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
 - [ ] The Linux release binary isn't reproduced outside CI. Rebuilding v0.2.27 from its own artifact
@@ -143,15 +149,17 @@
 
 ## Toolchain and project
 
-- [ ] **`make test` under 2 minutes, and its tooling in Abla.** About 150 s at JOBS=30 (2026-11-01),
-  about 3,700 CPU-seconds, so 30 cores give 123 s at best: more needs less work per build. Measured
-  over a whole run: LLVM 45% (`opt` 18% of all CPU), the frontend 29% with no hot spot (top function
-  1.4%), libc 12%. Most likely win: not redoing the frontend and LLVM for the same stdlib and runtime
-  in every build. Tried and dropped: glibc malloc tunables (no change, 4 programs); JOBS=40, 50, 60
-  (187, 178 to 262, 212 s, with other work on the machine, and a flake at 50). Release builds' `opt`,
-  `clang -flto` and LTO link stay: they are what those tests exercise. `tools/` is still 283 shell
-  scripts; `tools/abla-test-driver` already runs `tests/abla-tests.json`, and `tools/run-tests.sh`
-  and the scripts should move onto it.
+- [ ] **`make test` under 2 minutes, and its tooling in Abla.** On 2026-11-01 at JOBS=30, with other
+  work on the machine: 170 s or more after a compiler change (about 4,000 CPU-seconds), 121 s on a
+  rerun with the same compiler (about 3,000; the suite's builds share the default cache, and
+  `tools/run-tests.sh` clears it when the compiler changes). The cold run is the one left: 30 cores give
+  133 s at best, so it needs less work per build. A script that sets a compile-affecting `ABLA_*`
+  variable or uses compile grants keeps `--no-cache`: the cache key ignores those variables, so a hit
+  would pass without testing that mode. Over a whole run: LLVM 45% (`opt` 18% of all CPU), the frontend
+  29%, libc 12%. Tried and dropped: glibc malloc tunables (no change); JOBS=40, 50, 60 (slower, noisy).
+  Release builds' `opt`, `clang -flto` and LTO link stay: they are what those tests exercise. `tools/`
+  is still 283 shell scripts; `tools/abla-test-driver` already runs `tests/abla-tests.json`, and
+  `tools/run-tests.sh` and the scripts should move onto it.
   By script on 2026-11-01 (CPU-seconds, about 4,000 in all with the crypto and SIMD tests): self-hosted
   480, doc-examples 310, ct-bridge 240, gc-growth 214, parity probes 185. Don't build gc-growth's stress
   run optimized: it runs 23x faster because collections move, so it would prove less. The frontend's

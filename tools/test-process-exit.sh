@@ -8,7 +8,7 @@ output_directory="$project_root/build/process-exit"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/process-exit.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$output_directory/program" > "$output_directory/plain.out"
 plain=$?

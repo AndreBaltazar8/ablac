@@ -10,7 +10,7 @@ cases="$project_root/tests/cases/lambda-context"
 output_directory="$project_root/build/lambda-context"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/main" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/main"
 set +e
 output=$("$output_directory/main")
 status=$?

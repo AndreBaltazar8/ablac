@@ -9,7 +9,7 @@ output_directory="$project_root/build/resource-scope-drops"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/resource-short-name-drop.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 output=$("$output_directory/program")
 expected=$'inner 3\ndrop File 3\nwork 2 4\ndrop Files 4\ndrop Doc 2\ndrop A 1\ndone'
 [[ $output == "$expected" ]] || { echo "unexpected output:"; echo "$output"; exit 1; }

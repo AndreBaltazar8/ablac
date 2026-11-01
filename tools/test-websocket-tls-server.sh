@@ -20,7 +20,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
 
 "$project_root/tools/run-limited.sh" "$compiler" build \
     tests/cases/modules/websocket-tls-server.ab \
-    -o "$output_directory/websocket-tls-server" --no-cache
+    -o "$output_directory/websocket-tls-server"
 set +e
 output=$(ABLA_MAX_SECONDS=60 ABLA_MAX_CPU_SECONDS=60 \
     "$project_root/tools/run-limited.sh" "$output_directory/websocket-tls-server" 2>&1)
@@ -32,7 +32,7 @@ set -e
 # The plain server keeps its link: no OpenSSL.
 "$project_root/tools/run-limited.sh" "$compiler" build \
     tests/cases/modules/websocket-server.ab \
-    -o "$output_directory/websocket-server" --no-cache
+    -o "$output_directory/websocket-server"
 if [[ $(uname) == Darwin ]]; then
     libraries=$(otool -L "$output_directory/websocket-server")
 else

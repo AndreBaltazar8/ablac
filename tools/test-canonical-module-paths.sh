@@ -8,7 +8,7 @@ mkdir -p "$output_directory"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/canonical-module-paths.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?

@@ -41,7 +41,7 @@ for index in 0 1; do
     side="$output_directory/side-$index"
     mkdir -p "$side"
     (cd "$project_root" && ABLA_SYSROOT="$root" "$compiler_payload" build \
-        "$cases/main.ab" -o "$output_directory/program" --no-cache)
+        "$cases/main.ab" -o "$output_directory/program")
     mv "$output_directory/program" "$side/program"
     nm -U "$side/program" | awk '{print $NF}' | sort > "$side/symbols"
     set +e
@@ -51,7 +51,7 @@ for index in 0 1; do
     [[ $status == 42 ]] || fail "the program built against ${root##*/} exited with $status"
     (cd "$project_root" && ABLA_SYSROOT="$root" "$compiler_payload" build \
         tests/cases/sysroot-path-symbols/build.ab \
-        -o "$output_directory/build-driver" --no-cache)
+        -o "$output_directory/build-driver")
     mv "$output_directory/module.wasm" "$side/module.wasm"
 done
 [[ $(cat "$output_directory/side-0/output") == "42 1 example.test" ]] ||

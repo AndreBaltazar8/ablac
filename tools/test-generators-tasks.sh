@@ -12,7 +12,7 @@ mkdir -p "$output_directory"
 
 check() {
     "$compiler" build "$project_root/tests/cases/modules/$1.ab" \
-        -o "$output_directory/$1" --no-cache
+        -o "$output_directory/$1"
     set +e
     output=$("$output_directory/$1")
     status=$?
@@ -32,7 +32,7 @@ check_run() {
 reject() {
     set +e
     diagnostics=$("$compiler" build "$project_root/tests/cases/modules/$1.ab" \
-        -o "$output_directory/$1" --no-cache 2>&1)
+        -o "$output_directory/$1" 2>&1)
     status=$?
     set -e
     [[ $status -ne 0 && $diagnostics == *"$2"* ]] || { echo "$1: expected $2"; echo "$diagnostics"; exit 1; }
@@ -48,7 +48,7 @@ check_run generator-lazy $'produce 0\ngot 0\nproduce 1\ngot 1\nproduce 2\ngot 2\
 # Generators in a WebAssembly module (no stack switching, no host runtime).
 if command -v node >/dev/null 2>&1; then wasm_runner=node; else wasm_runner=bun; fi
 (cd "$project_root" && "$compiler" build tests/cases/generator-wasm/build.ab \
-    -o "$output_directory/generator-wasm-driver" --no-cache)
+    -o "$output_directory/generator-wasm-driver")
 "$output_directory/generator-wasm-driver"
 wasm_output=$("$wasm_runner" "$project_root/tests/cases/generator-wasm/run.mjs" \
     "$output_directory/generator-wasm.wasm" 20)

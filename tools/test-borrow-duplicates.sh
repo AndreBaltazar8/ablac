@@ -10,7 +10,7 @@ mkdir -p "$output_directory"
 # A method and an extension of the same name on one class name different
 # borrow sources; the later declaration wins, in either order. The borrow
 # checker finds them through a name index, which must keep that order.
-"$compiler" build "$cases/later-extension.ab" -o "$output_directory/later-extension" --no-cache
+"$compiler" build "$cases/later-extension.ab" -o "$output_directory/later-extension"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/later-extension"
 status=$?

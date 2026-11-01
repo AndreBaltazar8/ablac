@@ -13,7 +13,7 @@ mkdir -p "$output_directory"
 cd "$project_root"
 
 "$compiler" build tests/cases/wasm-reclaim-limit/build.ab \
-    -o "$output_directory/build-driver" --no-cache
+    -o "$output_directory/build-driver"
 "$output_directory/build-driver"
 node --disable-wasm-trap-handler tests/cases/wasm-reclaim-limit/run.mjs \
     "$output_directory/limit.wasm"

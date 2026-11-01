@@ -9,7 +9,7 @@ program=$output_directory/program
 
 mkdir -p "$output_directory"
 for mode in "" --fast; do
-    "$compiler" build "$source_file" -o "$program" --no-cache $mode
+    "$compiler" build "$source_file" -o "$program" $mode
     set +e
     "$program"
     status=$?

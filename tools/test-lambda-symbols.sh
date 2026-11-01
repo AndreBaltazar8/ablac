@@ -12,7 +12,7 @@ cases="$project_root/tests/cases/lambda-symbols"
 output_directory="$project_root/build/lambda-symbols"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/main" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/main"
 set +e
 output=$("$output_directory/main")
 status=$?

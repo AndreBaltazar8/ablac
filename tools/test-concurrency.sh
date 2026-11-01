@@ -8,7 +8,7 @@ mkdir -p "$output_directory"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/concurrency.ab" \
-    --no-cache -o "$output_directory/program"
+    -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
@@ -20,7 +20,7 @@ fi
 
 "$compiler" build \
     "$project_root/tests/cases/modules/thread-heap-mutex.ab" \
-    --no-cache -o "$output_directory/thread-heap-mutex"
+    -o "$output_directory/thread-heap-mutex"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/thread-heap-mutex"
 status=$?
@@ -32,7 +32,7 @@ fi
 
 "$compiler" build \
     "$project_root/tests/cases/concurrency/thread-rope-flatten.ab" \
-    --no-cache -o "$output_directory/thread-rope-flatten"
+    -o "$output_directory/thread-rope-flatten"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/thread-rope-flatten"
 status=$?
@@ -46,7 +46,7 @@ rm -f "$output_directory/invalid"
 set +e
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/invalid-concurrency.ab" \
-    --no-cache -o "$output_directory/invalid" \
+    -o "$output_directory/invalid" \
     >"$output_directory/invalid.out" \
     2>"$output_directory/invalid.err"
 invalid_status=$?
@@ -78,7 +78,7 @@ for index in "${!defer_fixtures[@]}"; do
     set +e
     "$compiler" build \
         "$project_root/tests/cases/bootstrap/$fixture.ab" \
-        --no-cache -o "$output_directory/$fixture" \
+        -o "$output_directory/$fixture" \
         >"$output_directory/$fixture.out" \
         2>"$output_directory/$fixture.err"
     fixture_status=$?

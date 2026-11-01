@@ -8,7 +8,7 @@ diagnostics=$project_root/build/xtensa-interrupt-handler-test.stderr
 
 "$compiler" build \
     "$project_root/tests/cases/modules/xtensa-interrupt-handler.ab" \
-    -o "$program" --fast --no-cache
+    -o "$program" --fast
 set +e
 "$program" 2>"$diagnostics"
 status=$?

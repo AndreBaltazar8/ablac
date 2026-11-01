@@ -23,7 +23,7 @@ fail() {
 # build <case> <log>: the build must fail; the summary's total must match
 # the error lines.
 build_fails() {
-    if (cd "$cases" && "$compiler" build "$1" -o "$output/program" --no-cache) \
+    if (cd "$cases" && "$compiler" build "$1" -o "$output/program") \
         >"$2" 2>&1; then
         fail "$1 built" "$2"
     fi

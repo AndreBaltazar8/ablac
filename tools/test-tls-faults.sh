@@ -16,7 +16,7 @@ cd "$project_root"
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
     -keyout "$output_directory/key.pem" -out "$output_directory/certificate.pem" 2>/dev/null || exit 2
-"$compiler" build tests/cases/tls-faults/faults.ab -o "$output_directory/faults" --fast --no-cache || exit 2
+"$compiler" build tests/cases/tls-faults/faults.ab -o "$output_directory/faults" --fast || exit 2
 
 status=0
 for stage in mask \
@@ -43,7 +43,7 @@ for stage in mask \
 done
 [[ -n ${TLS_FAULTS_FAULTS_ONLY:-} ]] && exit "$status"
 
-"$compiler" build tests/cases/tls-faults/timeouts.ab -o "$output_directory/timeouts" --fast --no-cache || exit 2
+"$compiler" build tests/cases/tls-faults/timeouts.ab -o "$output_directory/timeouts" --fast || exit 2
 timeout 60 "$output_directory/timeouts" "$output_directory/certificate.pem" "$output_directory/key.pem" \
     > "$output_directory/timeouts.log" 2>&1
 rc=$?
@@ -54,7 +54,7 @@ if [[ $rc -ne 0 ]]; then
 else
     echo "ok   timeouts"
 fi
-"$compiler" build tests/cases/tls-faults/deadlines.ab -o "$output_directory/deadlines" --fast --no-cache || exit 2
+"$compiler" build tests/cases/tls-faults/deadlines.ab -o "$output_directory/deadlines" --fast || exit 2
 SSL_CERT_FILE="$output_directory/certificate.pem" timeout 30 \
     "$output_directory/deadlines" "$output_directory/certificate.pem" "$output_directory/key.pem" \
     > "$output_directory/deadlines.log" 2>&1

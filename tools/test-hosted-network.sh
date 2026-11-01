@@ -11,7 +11,7 @@ output_directory="$project_root/build/hosted-network"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/hosted-network.ab" \
-    -o "$output_directory/hosted-network" --no-cache
+    -o "$output_directory/hosted-network"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/hosted-network"
 status=$?
@@ -21,7 +21,7 @@ set -e
 for program in hosted-network/socket-options modules/http-event; do
     name=$(basename "$program")
     "$compiler" build "$project_root/tests/cases/$program.ab" \
-        -o "$output_directory/$name" --no-cache
+        -o "$output_directory/$name"
     set +e
     "$project_root/tools/run-limited.sh" "$output_directory/$name"
     status=$?

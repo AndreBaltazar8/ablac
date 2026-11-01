@@ -55,13 +55,13 @@ wasm_has_function() {
 build_slice() {
     "$compiler" build \
         "$project_root/tests/cases/program-build/artifact-slice-root.ab" \
-        -o "$output_directory/server" --fast --no-cache
+        -o "$output_directory/server" --fast
 }
 
 build_stateful_slice() {
     "$compiler" build \
         "$project_root/tests/cases/program-build/artifact-slice-stateful-root.ab" \
-        -o "$stateful_output_directory/server" --fast --no-cache
+        -o "$stateful_output_directory/server" --fast
 }
 
 build_slice
@@ -138,7 +138,7 @@ NODE
 set +e
 "$compiler" build \
     "$project_root/tests/cases/program-build/artifact-slice-stateful-root-invalid.ab" \
-    -o "$stateful_fail_output/server" --fast --no-cache \
+    -o "$stateful_fail_output/server" --fast \
     >"$stateful_output_directory/stateful-invalid.out" \
     2>"$stateful_output_directory/stateful-invalid.err"
 invalid_stateful_status=$?
@@ -158,7 +158,7 @@ rm -f "$stateful_conflict_output/server" \
 set +e
 "$compiler" build \
     "$project_root/tests/cases/program-build/artifact-slice-stateful-root-conflict.ab" \
-    -o "$stateful_conflict_output/server" --fast --no-cache \
+    -o "$stateful_conflict_output/server" --fast \
     >"$stateful_conflict_output/conflict.out" \
     2>"$stateful_conflict_output/conflict.err"
 conflict_status=$?

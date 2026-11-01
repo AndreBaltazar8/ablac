@@ -34,7 +34,7 @@ assert_compiler_diagnostic_accounting() {
 "$compiler" --emit-llvm "$source_file" > "$output_directory/second.ll"
 cmp "$output_directory/first.ll" "$output_directory/second.ll"
 opt -passes=verify -disable-output "$output_directory/first.ll"
-"$compiler" build "$source_file" -o "$output_directory/program" --no-cache
+"$compiler" build "$source_file" -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?
@@ -43,7 +43,7 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/subparser-typed-conversion.ab" \
-    -o "$output_directory/conversion-program" --no-cache
+    -o "$output_directory/conversion-program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/conversion-program"
 conversion_status=$?
@@ -52,7 +52,7 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-deferred-request.ab" \
-    -o "$output_directory/nested-deferred-program" --no-cache
+    -o "$output_directory/nested-deferred-program"
 set +e
 "$project_root/tools/run-limited.sh" \
     "$output_directory/nested-deferred-program"
@@ -62,7 +62,7 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/raw-extension-literal.ab" \
-    -o "$output_directory/raw-extension-literal-program" --no-cache
+    -o "$output_directory/raw-extension-literal-program"
 set +e
 "$project_root/tools/run-limited.sh" \
     "$output_directory/raw-extension-literal-program"
@@ -87,7 +87,7 @@ grep -Fq 'source[subparser]:' \
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-deferred-source-identity.ab" \
-    -o "$output_directory/nested-deferred-identity-program" --no-cache
+    -o "$output_directory/nested-deferred-identity-program"
 set +e
 "$project_root/tools/run-limited.sh" \
     "$output_directory/nested-deferred-identity-program"
@@ -97,7 +97,7 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-deferred-nominal-action.ab" \
-    -o "$output_directory/nested-deferred-nominal-program" --no-cache
+    -o "$output_directory/nested-deferred-nominal-program"
 set +e
 "$project_root/tools/run-limited.sh" \
     "$output_directory/nested-deferred-nominal-program"
@@ -107,13 +107,13 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/nested-generated-subparser.ab" \
-    -o "$output_directory/nested-generated-subparser-program" --no-cache
+    -o "$output_directory/nested-generated-subparser-program"
 
 "$output_directory/nested-generated-subparser-program"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/late-nominal-action.ab" \
-    -o "$output_directory/late-nominal-program" --no-cache
+    -o "$output_directory/late-nominal-program"
 set +e
 "$project_root/tools/run-limited.sh" \
     "$output_directory/late-nominal-program"
@@ -123,7 +123,7 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/cross-late-root.ab" \
-    -o "$output_directory/cross-late-program" --no-cache
+    -o "$output_directory/cross-late-program"
 set +e
 "$project_root/tools/run-limited.sh" \
     "$output_directory/cross-late-program"
@@ -133,7 +133,7 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/cross-late-root-reversed.ab" \
-    -o "$output_directory/cross-late-reversed-program" --no-cache
+    -o "$output_directory/cross-late-reversed-program"
 set +e
 "$project_root/tools/run-limited.sh" \
     "$output_directory/cross-late-reversed-program"
@@ -263,7 +263,7 @@ assert_compiler_diagnostic_accounting \
 
 ABLA_MAX_MEMORY_MB=4096 "$compiler" build \
     "$project_root/tests/cases/modules/ir-diagnostic-fallback.ab" \
-    -o "$output_directory/ir-diagnostic-fallback" --no-cache
+    -o "$output_directory/ir-diagnostic-fallback"
 set +e
 "$project_root/tools/run-limited.sh" \
     "$output_directory/ir-diagnostic-fallback"
@@ -274,7 +274,7 @@ set -e
 set +e
 PATH="$missing_toolchain_path" "$compiler" build \
     "$project_root/tests/cases/modules/types-error.ab" \
-    -o "$output_directory/invalid-compiler" --no-cache \
+    -o "$output_directory/invalid-compiler" \
     > "$output_directory/invalid-compiler.out" \
     2> "$output_directory/invalid-compiler.err"
 invalid_compiler_status=$?
@@ -305,7 +305,7 @@ grep -q 'error\[E_EXT_FUNCTION_HANDLE_OUT_OF_RANGE\]:' \
 set +e
 PATH="$missing_toolchain_path" "$compiler" build \
     "$project_root/tests/cases/bootstrap/block.ab" \
-    -o "$output_directory/invalid-native-toolchain" --no-cache \
+    -o "$output_directory/invalid-native-toolchain" \
     > "$output_directory/invalid-native-toolchain.out" \
     2> "$output_directory/invalid-native-toolchain.err"
 invalid_native_toolchain_status=$?

@@ -29,7 +29,7 @@ rg -q '^define (hidden|internal) void @abla_runtime_roots_pop\(' "$plain_ir"
 rg -q '^define (hidden|internal) void @abla_runtime_memory_pressure\(\)' "$plain_ir"
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-global-container.ab" \
-    -o "$global_container_program" --no-cache
+    -o "$global_container_program"
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$global_container_program"
@@ -53,7 +53,7 @@ rg -Fq 'call void @abla_runtime_memory_pressure()' \
 loop_roots_program="$directory/loop-roots-program"
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-loop-roots.ab" \
-    -o "$loop_roots_program" --no-cache
+    -o "$loop_roots_program"
 set +e
 ABLA_MAX_MEMORY_MB=256 ABLA_MAX_SECONDS=60 \
     "$project_root/tools/run-limited.sh" "$loop_roots_program"
@@ -113,7 +113,7 @@ set -e
 [[ $pressure_status -eq 42 ]] || exit 1
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-collect-host.ab" \
-    --no-cache -o "$host_collector_program"
+    -o "$host_collector_program"
 set +e
 ABLA_MAX_MEMORY_MB=128 ABLA_MAX_SECONDS=10 \
     "$project_root/tools/run-limited.sh" "$host_collector_program"

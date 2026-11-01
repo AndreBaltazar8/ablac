@@ -9,12 +9,12 @@ output_directory="$project_root/build/extension-receivers"
 mkdir -p "$output_directory"
 cases="$project_root/tests/cases/modules"
 
-"$compiler" build "$cases/extension-receiver-types.ab" -o "$output_directory/types" --no-cache >/dev/null
+"$compiler" build "$cases/extension-receiver-types.ab" -o "$output_directory/types" >/dev/null
 actual=$("$output_directory/types")
 [[ $actual == "6 2 true false" ]] || { echo "extension receivers: '$actual'"; exit 1; }
 
 set +e
-diagnostics=$("$compiler" build "$cases/invalid-extension-receiver.ab" -o "$output_directory/invalid" --no-cache 2>&1)
+diagnostics=$("$compiler" build "$cases/invalid-extension-receiver.ab" -o "$output_directory/invalid" 2>&1)
 status=$?
 set -e
 [[ $status -ne 0 ]] || { echo "invalid receiver: built"; exit 1; }

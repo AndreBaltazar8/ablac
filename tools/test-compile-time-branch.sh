@@ -10,7 +10,7 @@ output_directory="$project_root/build/compile-time-branch"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/compile-time-branch/buffer.ab" \
-    -o "$output_directory/buffer" --no-cache
+    -o "$output_directory/buffer"
 set +e
 "$output_directory/buffer"
 status=$?
@@ -20,7 +20,7 @@ status=$?
 invalid_status=$?
 set -e
 "$compiler" build "$project_root/tests/cases/compile-time-branch/global-type.ab" \
-    -o "$output_directory/global-type" --no-cache
+    -o "$output_directory/global-type"
 set +e
 "$output_directory/global-type"
 global_status=$?

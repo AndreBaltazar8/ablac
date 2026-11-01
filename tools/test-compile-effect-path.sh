@@ -6,7 +6,7 @@ export ABLA_SYSROOT=${ABLA_SYSROOT:-$project_root}
 output_directory="$project_root/build/compile-effect-path"
 mkdir -p "$output_directory"
 "$compiler" build "$project_root/tests/cases/compiler/compile-effect-path.ab" \
-    -o "$output_directory/regression" --fast --no-cache
+    -o "$output_directory/regression" --fast
 set +e
 ABLA_MAX_SECONDS=5 ABLA_MAX_MEMORY_MB=256 \
     "$project_root/tools/run-limited.sh" "$output_directory/regression"
@@ -20,7 +20,7 @@ for kind in filesystem environment network write clock generic-receiver; do
     set +e
     ABLA_MAX_SECONDS=30 "$project_root/tools/run-limited.sh" "$compiler" \
         build "$project_root/tests/cases/bootstrap/invalid-compile-effect-$kind.ab" \
-        -o "$output_directory/denied" --fast --no-cache \
+        -o "$output_directory/denied" --fast \
         > "$output_directory/$kind.log" 2>&1
     status=$?
     set -e

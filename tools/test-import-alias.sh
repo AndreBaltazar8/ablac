@@ -8,7 +8,7 @@ case $compiler in /*) ;; *) compiler=$project_root/$compiler ;; esac
 output_root=$project_root/build/import-alias-test
 mkdir -p "$output_root"
 cd "$project_root/tests/cases/import-alias/pkg/app"
-"$compiler" build main.ab -o "$output_root/import-alias" --no-cache
+"$compiler" build main.ab -o "$output_root/import-alias"
 set +e
 "$output_root/import-alias"
 status=$?

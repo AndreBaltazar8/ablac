@@ -35,12 +35,12 @@ choose_call=$(sed -n \
 if [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]]; then
     "$compiler" build \
         "$project_root/tests/cases/internal-function-assembly.ab" \
-        -o "$native" --no-cache || exit 1
+        -o "$native" || exit 1
     symbols=$(nm "$native") || exit 1
 else
     "$compiler" build \
         "$project_root/tests/cases/internal-function-assembly.ab" \
-        --target x86_64-linux --emit object -o "$native.o" --no-cache || exit 1
+        --target x86_64-linux --emit object -o "$native.o" || exit 1
     symbols=$(llvm-nm "$native.o") || exit 1
 fi
 rg -q 'abla_test_reachable_from_assembly$' <<<"$symbols" || exit 1
@@ -59,7 +59,7 @@ fi
 # symbol without becoming part of the public artifact ABI.
 "$compiler" build \
     "$project_root/tests/cases/required-internal-function.ab" \
-    -o "$required_native" --emit object --no-cache
+    -o "$required_native" --emit object
 # Mach-O prefixes C symbols with an underscore.
 nm "$required_native" | rg -q ' t _?abla_test_late_runtime_helper$' || exit 1
 if rg -q 'abla_test_late_runtime_helper' "$required_native.abi.json"; then

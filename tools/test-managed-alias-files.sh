@@ -34,7 +34,7 @@ cp "$cases/main.ab" "$output/shifted/"
 { echo '// Every offset after this line moves.'; cat "$cases/holder.ab"; } \
     > "$output/shifted/holder.ab"
 
-"$compiler" build "$output/aligned/main.ab" -o "$output/program" --no-cache
+"$compiler" build "$output/aligned/main.ab" -o "$output/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output/program"
 status=$?

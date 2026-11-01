@@ -9,6 +9,6 @@ mkdir -p "$output_directory"
 
 (cd "$project_root" && "$compiler" build \
     tests/cases/wasm-export-extern/build.ab \
-    -o "$output_directory/build-driver" --no-cache)
+    -o "$output_directory/build-driver")
 "$output_directory/build-driver"
 node "$project_root/tests/cases/wasm-export-extern/run.mjs" "$module"

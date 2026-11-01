@@ -15,7 +15,7 @@ rm -rf "$output_directory"
 mkdir -p "$output_directory"
 
 (cd "$project_root" && "$compiler" build "$cases/build.ab" \
-    -o "$output_directory/build-driver" --no-cache)
+    -o "$output_directory/build-driver")
 (cd "$project_root" && "$output_directory/build-driver")
 for module in host host-dev; do
     node "$cases/run.mjs" "$output_directory/$module.wasm"

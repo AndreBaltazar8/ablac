@@ -14,11 +14,11 @@ output_directory="$project_root/build/wasm-float-remainder"
 rm -rf "$output_directory"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/native.ab" -o "$output_directory/native" --no-cache
+"$compiler" build "$cases/native.ab" -o "$output_directory/native"
 "$output_directory/native" > "$output_directory/native.txt"
 
 (cd "$project_root" && "$compiler" build "$cases/build.ab" \
-    -o "$output_directory/build-driver" --no-cache)
+    -o "$output_directory/build-driver")
 (cd "$project_root" && "$output_directory/build-driver")
 for module in remainder remainder-dev; do
     node "$cases/run.mjs" "$output_directory/$module.wasm" > "$output_directory/$module.txt"

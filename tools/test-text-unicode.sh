@@ -6,7 +6,7 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 program="$project_root/build/text-unicode"
 
 "$compiler" build "$project_root/tests/cases/modules/text-unicode.ab" \
-    -o "$program" --fast --no-cache
+    -o "$program" --fast
 set +e
 "$project_root/tools/run-limited.sh" "$program"
 status=$?

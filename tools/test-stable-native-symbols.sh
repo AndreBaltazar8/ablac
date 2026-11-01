@@ -7,7 +7,7 @@ program="$project_root/build/stable-native-symbols-test"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/stable-native-symbols.ab" \
-    -o "$program" --fast --no-cache
+    -o "$program" --fast
 set +e
 ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=60 \
     "$project_root/tools/run-limited.sh" "$program"

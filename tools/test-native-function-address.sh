@@ -7,7 +7,7 @@ program=$project_root/build/native-function-address-test
 
 "$compiler" build \
     "$project_root/tests/cases/modules/native-function-address.ab" \
-    -o "$program" --fast --no-cache
+    -o "$program" --fast
 set +e
 "$program"
 status=$?

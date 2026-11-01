@@ -13,7 +13,7 @@ cases="$project_root/tests/cases/modules"
 mkdir -p -- "$output"
 
 expect_exit() { # fixture, status
-    "$compiler" build "$cases/$1.ab" -o "$output/$1" --no-cache
+    "$compiler" build "$cases/$1.ab" -o "$output/$1"
     local status=0
     "$output/$1" || status=$?
     if [[ $status -ne $2 ]]; then
@@ -23,7 +23,7 @@ expect_exit() { # fixture, status
 }
 expect_error() { # fixture, text
     local status=0
-    "$compiler" build "$cases/$1.ab" -o "$output/$1" --no-cache >"$output/$1.log" 2>&1 || status=$?
+    "$compiler" build "$cases/$1.ab" -o "$output/$1" >"$output/$1.log" 2>&1 || status=$?
     if [[ $status -eq 0 ]] || ! grep -qF -- "$2" "$output/$1.log"; then
         printf '%s: expected a failure with: %s\n' "$1" "$2" >&2
         cat "$output/$1.log" >&2

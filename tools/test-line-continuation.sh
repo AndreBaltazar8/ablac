@@ -8,7 +8,7 @@ source_file=$project_root/tests/cases/modules/line-continuation.ab
 program=$output_directory/program
 
 mkdir -p "$output_directory"
-"$compiler" build "$source_file" -o "$program" --no-cache --fast
+"$compiler" build "$source_file" -o "$program" --fast
 set +e
 "$program"
 status=$?

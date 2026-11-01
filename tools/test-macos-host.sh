@@ -33,13 +33,13 @@ expect_status_42() {
 }
 
 "$compiler" build "$project_root/tests/cases/bootstrap/block.ab" \
-    --fast --no-cache -o "$output_directory/block"
+    --fast -o "$output_directory/block"
 file "$output_directory/block" |
     grep -q "Mach-O 64-bit executable $expected_architecture"
 expect_status_42 "$output_directory/block"
 
 "$compiler" build "$project_root/tests/cases/modules/portable-io.ab" \
-    --fast --no-cache -o "$output_directory/portable-io"
+    --fast -o "$output_directory/portable-io"
 set +e
 "$output_directory/portable-io" > "$output_directory/portable-io.txt"
 io_status=$?
@@ -50,11 +50,11 @@ cmp "$output_directory/portable-io.expected" \
     "$output_directory/portable-io.txt"
 
 "$compiler" build "$project_root/tests/cases/modules/filesystem.ab" \
-    --fast --no-cache -o "$output_directory/filesystem"
+    --fast -o "$output_directory/filesystem"
 expect_status_42 "$output_directory/filesystem"
 
 "$compiler" build "$project_root/tests/cases/modules/process-capture.ab" \
-    --fast --no-cache -o "$output_directory/process-capture"
+    --fast -o "$output_directory/process-capture"
 expect_status_42 "$output_directory/process-capture"
 
 expect_status_42 \

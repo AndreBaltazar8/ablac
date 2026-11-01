@@ -9,14 +9,14 @@ mkdir -p "$output_directory"
 
 (cd "$project_root" && "$compiler" build \
     tests/cases/wasm-import-module/build.ab \
-    -o "$output_directory/build-driver" --no-cache)
+    -o "$output_directory/build-driver")
 "$output_directory/build-driver"
 node "$project_root/tests/cases/wasm-import-module/run.mjs" "$module"
 
 set +e
 (cd "$project_root" && "$compiler" build \
     tests/cases/wasm-import-module/invalid.ab \
-    -o "$output_directory/invalid" --fast --no-cache) \
+    -o "$output_directory/invalid" --fast) \
     >"$output_directory/invalid.out" 2>"$output_directory/invalid.err"
 invalid_status=$?
 set -e

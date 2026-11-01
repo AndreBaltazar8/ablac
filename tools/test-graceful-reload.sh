@@ -37,7 +37,7 @@ cp "$project_root/tests/cases/bootstrap/graceful-http-v1.ab" \
 wait_for_log() {
     local pattern=$1
     local attempt=0
-    while [[ $attempt -lt 150 ]]; do
+    while [[ $attempt -lt 900 ]]; do
         if grep -q "$pattern" "$test_directory/stderr.txt" 2>/dev/null; then
             return 0
         fi
@@ -48,11 +48,13 @@ wait_for_log() {
     return 1
 }
 
+# (These limits only stop a hang: each generation compiles first, which a loaded
+# machine slows several times.)
 # Each generation prints its port once it listens, just after the reload line.
 wait_for_ports() {
     local count=$1
     local attempt=0
-    while [[ $attempt -lt 150 ]]; do
+    while [[ $attempt -lt 900 ]]; do
         if [[ $(grep -cE '^[0-9]+$' "$test_directory/stderr.txt" 2>/dev/null) -ge $count ]]; then
             return 0
         fi
@@ -63,7 +65,7 @@ wait_for_ports() {
     return 1
 }
 
-"${new_session[@]}" env ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=20 \
+"${new_session[@]}" env ABLA_MAX_MEMORY_MB=1536 ABLA_MAX_SECONDS=120 \
     "$compiler" serve "$test_directory/app.ab" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
 supervisor=$!
@@ -73,7 +75,7 @@ wait_for_ports 1
 port=$(grep -E '^[0-9]+$' "$test_directory/stderr.txt" | tail -1)
 [[ $port =~ ^[0-9]+$ ]] || exit 1
 
-curl --silent --fail --max-time 6 "http://127.0.0.1:$port/slow" \
+curl --silent --fail --max-time 60 "http://127.0.0.1:$port/slow" \
     > "$test_directory/v1.txt" &
 request=$!
 wait_for_log 'request-start-v1'
@@ -88,7 +90,7 @@ request=0
 wait_for_ports 2
 next_port=$(grep -E '^[0-9]+$' "$test_directory/stderr.txt" | tail -1)
 [[ $next_port =~ ^[0-9]+$ ]] || exit 1
-curl --silent --fail --max-time 6 \
+curl --silent --fail --max-time 60 \
     "http://127.0.0.1:$next_port/slow" > "$test_directory/v2.txt"
 [[ $(< "$test_directory/v2.txt") == slow-v2 ]] || exit 1
 

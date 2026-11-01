@@ -10,7 +10,7 @@ cases="$project_root/tests/cases/init-order"
 output_directory="$project_root/build/init-order"
 mkdir -p "$output_directory"
 
-"$compiler" build "$cases/main.ab" -o "$output_directory/main" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/main"
 output=$("$output_directory/main")
 expected='init second
 init first
@@ -28,7 +28,7 @@ init eighth
 
 # A global holding a function, called by name in another global's initializer
 # (inferred and typed): the call reads that global, so it initializes first.
-"$compiler" build "$cases/call-value.ab" -o "$output_directory/call-value" --no-cache
+"$compiler" build "$cases/call-value.ab" -o "$output_directory/call-value"
 output=$("$output_directory/call-value") ||
     { echo "init order: call-value exited with $?"; exit 1; }
 [[ $output == $'leaf 7\nleaf 7' ]] ||
@@ -37,7 +37,7 @@ output=$("$output_directory/call-value") ||
 # Globals a parameter default reads initialize before a global whose
 # initializer leaves that argument out (function, extension and method), and so
 # do the globals an extension function's body reads.
-"$compiler" build "$cases/default-reads.ab" -o "$output_directory/default-reads" --no-cache
+"$compiler" build "$cases/default-reads.ab" -o "$output_directory/default-reads"
 output=$("$output_directory/default-reads") ||
     { echo "init order: default-reads exited with $?"; exit 1; }
 [[ $output == '7 8 14 10' ]] ||
@@ -46,7 +46,7 @@ output=$("$output_directory/default-reads") ||
 rejected() { # $1 = case, then the texts its diagnostics must contain
     local name=$1; shift
     if "$compiler" build "$cases/$name.ab" -o "$output_directory/invalid" \
-        --no-cache > "$output_directory/$name.err" 2>&1; then
+        > "$output_directory/$name.err" 2>&1; then
         echo "init order: $name compiled"; exit 1
     fi
     for text in "$@"; do

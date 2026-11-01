@@ -9,7 +9,7 @@ mkdir -p "$output_directory"
 executable="$output_directory/selfhost"
 
 start_ns=$(date +%s%N)
-"$compiler" build "$source_file" -o "$executable" --no-cache
+"$compiler" build "$source_file" -o "$executable"
 end_ns=$(date +%s%N)
 
 elapsed_ms=$(((end_ns - start_ns) / 1000000))

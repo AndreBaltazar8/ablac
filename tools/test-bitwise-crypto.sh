@@ -9,7 +9,7 @@ mkdir -p "$output_directory"
 set +e
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/invalid-bitwise-type.ab" \
-    -o "$output_directory/invalid" --no-cache \
+    -o "$output_directory/invalid" \
     >"$output_directory/invalid-output.txt" \
     2>"$output_directory/invalid-errors.txt"
 invalid_status=$?

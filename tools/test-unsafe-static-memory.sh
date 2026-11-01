@@ -59,7 +59,7 @@ grep -Eq \
 # Section names and flags are ELF semantics (a Mach-O section specifier is
 # "segment,section"), so the object is emitted for the ELF target on any host.
 "$compiler" build "$section_tls_source" --target x86_64-linux --emit object \
-    -o "$output_directory/section-linked-thread-local.o" --no-cache
+    -o "$output_directory/section-linked-thread-local.o"
 llvm-readelf -SW "$output_directory/section-linked-thread-local.o" \
     > "$output_directory/section-linked-thread-local.sections"
 grep -Eq \
@@ -123,7 +123,7 @@ grep -Eq \
     '^@abla_global_.* = internal constant i64 ptrtoint \(ptr @.*\.native\.mutable\.bytes to i64\), align 8$' \
     "$output_directory/static-u32s-module-value.ll"
 
-"$compiler" build "$source_file" -o "$output_directory/program" --no-cache
+"$compiler" build "$source_file" -o "$output_directory/program"
 set +e
 "$project_root/tools/run-limited.sh" "$output_directory/program"
 status=$?

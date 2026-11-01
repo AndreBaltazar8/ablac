@@ -55,7 +55,7 @@ for program in "${programs[@]}"; do
         # One file name: a signed executable's signature names it.
         mkdir -p "$work/$build"
         (cd "$work/case" && "$compiler" --emit-llvm "$main" > "$work/$build/main.ll")
-        "$compiler" build "$work/case/$main" -o "$work/$build/main" --no-cache
+        "$compiler" build "$work/case/$main" -o "$work/$build/main"
         set +e
         "$work/$build/main" > "$work/$build/output" 2>&1
         echo "status $?" >> "$work/$build/output"

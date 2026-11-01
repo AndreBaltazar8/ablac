@@ -10,7 +10,7 @@ output_directory="$project_root/build/labeled-loops"
 mkdir -p "$output_directory"
 
 "$compiler" build "$project_root/tests/cases/modules/labeled-loops.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 output=$("$project_root/tools/run-limited.sh" "$output_directory/program")
 expected='nested 5012
 classify negative | small 2 | seven | big
@@ -48,7 +48,7 @@ expect_errors() {
     rm -f "$output_directory/$name"
     set +e
     "$compiler" build "$project_root/tests/cases/bootstrap/$name.ab" \
-        -o "$output_directory/$name" --no-cache \
+        -o "$output_directory/$name" \
         >"$output_directory/$name-output.txt" 2>"$output_directory/$name-errors.txt"
     local status=$?
     set -e

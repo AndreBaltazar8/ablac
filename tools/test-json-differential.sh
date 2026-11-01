@@ -11,7 +11,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cases="$project_root/tests/cases/json-differential"
 output_directory="$project_root/build/json-differential"
 mkdir -p "$output_directory"
-"$compiler" build "$cases/main.ab" -o "$output_directory/differential" --no-cache
+"$compiler" build "$cases/main.ab" -o "$output_directory/differential"
 "$output_directory/differential" > "$output_directory/actual.txt"
 if ! diff -q "$cases/expected.txt" "$output_directory/actual.txt" > /dev/null; then
     echo "json differential: blocks differ from the recorded results (first inputs of each):" >&2

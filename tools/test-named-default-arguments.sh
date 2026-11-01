@@ -13,7 +13,7 @@ check_failure() {
     set +e
     "$compiler" build \
         "$project_root/tests/cases/modules/$source" \
-        -o "$output_directory/$stem" --fast --no-cache \
+        -o "$output_directory/$stem" --fast \
         >"$output_directory/$stem.out" \
         2>"$output_directory/$stem.err"
     local status=$?
@@ -29,7 +29,7 @@ check_failure invalid-named-argument-order.ab ORDER
 
 "$compiler" build \
     "$project_root/tests/cases/modules/named-many-default-arguments.ab" \
-    -o "$output_directory/named-many-default-arguments" --fast --no-cache
+    -o "$output_directory/named-many-default-arguments" --fast
 set +e
 "$output_directory/named-many-default-arguments"
 named_many_status=$?
@@ -38,7 +38,7 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/named-var-arguments.ab" \
-    -o "$output_directory/named-var-arguments" --fast --no-cache
+    -o "$output_directory/named-var-arguments" --fast
 set +e
 "$output_directory/named-var-arguments"
 named_var_status=$?

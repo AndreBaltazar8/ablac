@@ -8,7 +8,7 @@ output_root=$project_root/build/overloads-test
 mkdir -p "$output_root"
 "$compiler" build \
     "$project_root/tests/cases/modules/overloads.ab" \
-    -o "$output_root/overloads" --no-cache
+    -o "$output_root/overloads"
 set +e
 "$output_root/overloads"
 status=$?
@@ -18,7 +18,7 @@ test "$status" -eq 42
 # Operators in parameter defaults.
 "$compiler" build \
     "$project_root/tests/cases/modules/operator-defaults.ab" \
-    -o "$output_root/operator-defaults" --no-cache
+    -o "$output_root/operator-defaults"
 set +e
 "$output_root/operator-defaults"
 status=$?
@@ -28,7 +28,7 @@ test "$status" -eq 42
 # A default that calls an overload, copied into a call that omits it.
 "$compiler" build \
     "$project_root/tests/cases/modules/overload-defaults.ab" \
-    -o "$output_root/overload-defaults" --no-cache
+    -o "$output_root/overload-defaults"
 set +e
 "$output_root/overload-defaults"
 status=$?
@@ -38,7 +38,7 @@ test "$status" -eq 42
 set +e
 "$compiler" build \
     "$project_root/tests/cases/modules/overload-default-ambiguous.ab" \
-    -o "$output_root/overload-default-ambiguous" --no-cache > "$output_root/default-ambiguous.log" 2>&1
+    -o "$output_root/overload-default-ambiguous" > "$output_root/default-ambiguous.log" 2>&1
 status=$?
 set -e
 test "$status" -ne 0
@@ -47,7 +47,7 @@ grep -q 'call.overload-ambiguous:pick(P,Q)' "$output_root/default-ambiguous.log"
 set +e
 "$compiler" build \
     "$project_root/tests/cases/modules/overload-ambiguous.ab" \
-    -o "$output_root/overload-ambiguous" --no-cache > "$output_root/ambiguous.log" 2>&1
+    -o "$output_root/overload-ambiguous" > "$output_root/ambiguous.log" 2>&1
 status=$?
 set -e
 test "$status" -ne 0

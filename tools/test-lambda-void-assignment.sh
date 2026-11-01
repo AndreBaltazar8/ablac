@@ -10,7 +10,7 @@ mkdir -p "$output_directory"
 
 "$compiler" build \
     "$project_root/tests/cases/modules/lambda-void-assignment.ab" \
-    -o "$output_directory/program" --no-cache
+    -o "$output_directory/program"
 set +e
 "$output_directory/program"
 status=$?
@@ -19,7 +19,7 @@ set -e
 
 "$compiler" build \
     "$project_root/tests/cases/modules/function-void-assignment.ab" \
-    -o "$output_directory/function" --no-cache
+    -o "$output_directory/function"
 set +e
 output=$("$output_directory/function")
 status=$?

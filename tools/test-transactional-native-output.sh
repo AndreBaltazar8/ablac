@@ -13,13 +13,13 @@ program="$directory/program"
 mkdir -p "$directory"
 
 "$compiler" build "$project_root/tests/cases/bootstrap/function.ab" \
-    --fast --no-cache -o "$program"
+    --fast -o "$program"
 before=$(sha256sum "$program")
 
 set +e
 "$compiler" build \
     "$project_root/tests/cases/bootstrap/invalid-condition.ab" \
-    --fast --no-cache -o "$program" \
+    --fast -o "$program" \
     > "$directory/invalid.out" 2> "$directory/invalid.err"
 invalid_status=$?
 set -e

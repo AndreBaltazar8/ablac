@@ -23,7 +23,7 @@ hex() { od -An -vtx1 "$1" | tr -d ' \n'; }
 random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 for program in vectors edge tool against-hosted kat-native; do
-    "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
+    "$compiler" build "$cases/$program.ab" -o "$out/$program" \
         > "$out/$program.build.log" 2>&1 || { cat "$out/$program.build.log"; exit 2; }
 done
 tool=$out/tool
@@ -114,9 +114,9 @@ done
 
 # --- Known answers elsewhere ---------------------------------------------------------------
 "$out/kat-native" || fail "known answers native: $?"
-"$compiler" build "$cases/wasm-build.ab" -o "$out/wasm-driver" --no-cache > "$out/wasm.log" 2>&1 || { cat "$out/wasm.log"; fail "wasm build"; }
+"$compiler" build "$cases/wasm-build.ab" -o "$out/wasm-driver" > "$out/wasm.log" 2>&1 || { cat "$out/wasm.log"; fail "wasm build"; }
 "$out/wasm-driver" && node "$cases/run.mjs" "$out/crypto.wasm" && echo "ok   wasm under node: known answers, software" || fail "wasm"
-"$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" --no-cache > "$out/aarch64.log" 2>&1 || { cat "$out/aarch64.log"; fail "aarch64 build"; }
+"$compiler" build "$cases/aarch64-build.ab" -o "$out/aarch64-driver" > "$out/aarch64.log" 2>&1 || { cat "$out/aarch64.log"; fail "aarch64 build"; }
 llvm-mc -triple aarch64-linux-gnu -filetype=obj tests/cases/simd/aarch64-start.s -o "$out/aarch64-start.o"
 ld.lld -static --no-pie -z notext "$out/aarch64.o" "$out/aarch64-start.o" -o "$out/aarch64"
 llvm-objdump -d "$out/aarch64" > "$out/aarch64.s"
@@ -135,7 +135,7 @@ done
 exec "$real_llc" -mcpu=esp32 "\${arguments[@]}"
 EOF
 chmod +x "$tools_directory/llc"
-if PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xtensa.o" --no-cache \
+if PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xtensa.o" \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object > "$out/xtensa.log" 2>&1; then
     echo "ok   xtensa: compiled, not run"
 else

@@ -9,7 +9,7 @@ mkdir -p "$output_directory"
 
 check() {
     "$compiler" build "$project_root/tests/cases/modules/$1.ab" \
-        -o "$output_directory/$1" --no-cache
+        -o "$output_directory/$1"
     set +e
     output=$("$output_directory/$1")
     status=$?

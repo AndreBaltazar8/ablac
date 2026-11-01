@@ -5,9 +5,9 @@
 #   tools/run-tests.sh [compiler]
 #
 # Each command runs in the repository root, with its output in a log of its
-# own. The commands that can't run beside the others (listed in serial_reason
-# below) run afterwards, beside each other. The longest commands of the last run
-# start first.
+# own. The commands that can't run beside test-self-hosted.sh (listed in
+# serial_reason below) start once it has ended. The longest commands of the last
+# run start first.
 #
 # Environment:
 #   JOBS                 commands run at once (default: the number of CPUs)
@@ -46,8 +46,17 @@ cd "$project_root" || exit 1
 rm -rf "$output"
 mkdir -p "$output"
 
-# Why a command waits for the others (empty: it runs alongside them). The driver
-# of test-self-hosted.sh reruns these suite scripts in the same build directories.
+# The suite's builds share the default cache, so a rerun reuses what the same
+# compiler built. Its entries key on the compiler: another one's are only garbage.
+compiler_stamp=$(cksum <"$(readlink -f "$compiler.bin" 2>/dev/null || echo "$compiler")" 2>/dev/null || true)
+stamp_file=$project_root/build/.abla-cache.compiler
+if [[ -z $compiler_stamp || ! -f $stamp_file || $(<"$stamp_file") != "$compiler_stamp" ]]; then
+    rm -rf "$project_root/build/.abla-cache"
+    printf '%s\n' "$compiler_stamp" >"$stamp_file"
+fi
+
+# Why a command waits for test-self-hosted.sh (empty: it needn't), whose driver
+# reruns these suite scripts in the same build directories.
 serial_reason() { # command
     case $1 in
         *tools/test-borrow-lifetimes.sh* | *tools/test-floating-point.sh* | \
@@ -183,13 +192,26 @@ stop() {
 }
 trap stop INT TERM
 
+# Whether test-self-hosted.sh is still to run or running (run_all's `pending`).
+self_hosted_active() {
+    local n
+    for n in ${pending[@]+"${pending[@]}"} ${running_ns[@]+"${running_ns[@]}"}; do
+        [[ $(sed -n "${n}p" "$output/commands.txt") == *tools/test-self-hosted.sh* ]] && return 0
+    done
+    return 1
+}
+
 # Runs the given commands, at most `limit` at a time.
 run_all() { # limit n...
     local limit=$1
     shift
     local pending=("$@") free
-    while ((${#pending[@]} > 0 || ${#running_ns[@]} > 0)); do
+    while ((${#pending[@]} > 0 || ${#running_ns[@]} > 0 || ${#serial[@]} > 0)); do
         reap
+        if ((${#serial[@]} > 0)) && ! self_hosted_active; then
+            pending+=("${serial[@]}")
+            serial=()
+        fi
         while ((${#pending[@]} > 0 && ${#running_ns[@]} < limit)); do
             if ((${#running_ns[@]} > 0 && min_free > 0)); then
                 free=$(free_percent)
@@ -202,9 +224,8 @@ run_all() { # limit n...
     done
 }
 
-echo "running ${#parallel[@]} commands, $jobs at a time, then ${#serial[@]} after them ($output)"
+echo "running ${#parallel[@]} commands, $jobs at a time, and ${#serial[@]} once test-self-hosted.sh ends ($output)"
 run_all "$jobs" ${parallel[@]+"${parallel[@]}"}
-run_all "$jobs" ${serial[@]+"${serial[@]}"}
 
 sort -n -o "$output/results.tsv" "$output/results.tsv" 2>/dev/null
 if [[ -z $filter && -s $output/results.tsv ]]; then

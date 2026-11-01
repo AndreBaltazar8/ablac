@@ -14,7 +14,7 @@ output_directory="$project_root/build/transform-targets"
 mkdir -p "$output_directory"
 
 runs() { # $1 = case, $2 = the exit status its program must have, then build flags
-    "$compiler" build "$cases/$1.ab" -o "$output_directory/$1" --no-cache "${@:3}"
+    "$compiler" build "$cases/$1.ab" -o "$output_directory/$1" "${@:3}"
     set +e
     "$output_directory/$1"
     local status=$?
@@ -34,7 +34,7 @@ runs module 42 --strict-imports
 runs private 42 --strict-imports
 
 refused() { # $1 = case, $2 = the diagnostic it must report
-    if "$compiler" build "$cases/$1.ab" -o "$output_directory/$1" --no-cache \
+    if "$compiler" build "$cases/$1.ab" -o "$output_directory/$1" \
         > "$output_directory/$1.err" 2>&1; then
         echo "transform targets: $1 compiled"; exit 1
     fi

@@ -14,7 +14,7 @@ cases="$project_root/tests/cases/modules"
 check() { # file count expected… (count = number of `error[` lines)
     local file=$1 count=$2 status errors; shift 2
     set +e
-    diagnostics=$("$compiler" build "$cases/$file.ab" -o "$output_directory/$file" --no-cache 2>&1)
+    diagnostics=$("$compiler" build "$cases/$file.ab" -o "$output_directory/$file" 2>&1)
     status=$?
     set -e
     [[ $status -ne 0 ]] || { echo "$file: built"; exit 1; }
@@ -32,10 +32,10 @@ check invalid-safe-call 1 "safe-call.non-null:M"
 check invalid-unknown-in-arithmetic 1 "identifier:x"
 check invalid-elvis-template 1 "E_PARSE_ELVIS" "Abla writes Kotlin's \`?:\` as \`??\`"
 
-"$compiler" build "$cases/defer-assignment-tail.ab" -o "$output_directory/defer-assignment-tail" --no-cache >/dev/null
+"$compiler" build "$cases/defer-assignment-tail.ab" -o "$output_directory/defer-assignment-tail" >/dev/null
 actual=$("$output_directory/defer-assignment-tail")
 [[ $actual == "1 x 2 3" ]] || { echo "defer-assignment-tail: '$actual'"; exit 1; }
-"$compiler" build "$cases/trailing-lambda-member-call.ab" -o "$output_directory/trailing-lambda-member-call" --no-cache >/dev/null
+"$compiler" build "$cases/trailing-lambda-member-call.ab" -o "$output_directory/trailing-lambda-member-call" >/dev/null
 actual=$("$output_directory/trailing-lambda-member-call")
 [[ $actual == "30 11 101 0" ]] || { echo "trailing-lambda-member-call: '$actual'"; exit 1; }
 echo "diagnostic hints: method.unknown (+ import), ?. and ?:, defer ending in an assignment, trailing lambda after a member call"

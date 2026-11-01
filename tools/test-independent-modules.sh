@@ -53,19 +53,19 @@ NODE
 set +e
 "$compiler" build \
     "$project_root/tests/cases/program-build/invalid-independent-module-reference.ab" \
-    -o "$output_directory/invalid-reference" --fast --no-cache \
+    -o "$output_directory/invalid-reference" --fast \
     >"$output_directory/invalid-reference.out" \
     2>"$output_directory/invalid-reference.err"
 invalid_reference_status=$?
 "$compiler" build \
     "$project_root/tests/cases/program-build/invalid-runtime-declaration-block.ab" \
-    -o "$output_directory/invalid-runtime-block" --fast --no-cache \
+    -o "$output_directory/invalid-runtime-block" --fast \
     >"$output_directory/invalid-runtime-block.out" \
     2>"$output_directory/invalid-runtime-block.err"
 invalid_runtime_status=$?
 "$compiler" build \
     "$project_root/tests/cases/program-build/invalid-independent-module-export.ab" \
-    -o "$output_directory/invalid-export" --fast --no-cache \
+    -o "$output_directory/invalid-export" --fast \
     >"$output_directory/invalid-export.out" \
     2>"$output_directory/invalid-export.err"
 invalid_export_status=$?

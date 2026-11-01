@@ -11,7 +11,7 @@ mkdir -p "$output_directory"
 
 library=$output_directory/libchecked.so
 if [[ $(uname -s) == Darwin ]]; then library=$output_directory/libchecked.dylib; fi
-"$compiler" build "$cases/library.ab" --emit shared-library -o "$library" --no-cache
+"$compiler" build "$cases/library.ab" --emit shared-library -o "$library"
 clang "$cases/caller.c" -L"$output_directory" -lchecked \
     -Wl,-rpath,"$output_directory" -o "$output_directory/caller"
 
@@ -26,7 +26,7 @@ set -e
 abi_library=$output_directory/libabla_app.so
 if [[ $(uname -s) == Darwin ]]; then abi_library=$output_directory/libabla_app.dylib; fi
 "$compiler" build "$project_root/tests/cases/program-build/exported-library.ab" \
-    --emit shared-library -o "$abi_library" --no-cache
+    --emit shared-library -o "$abi_library"
 clang "$project_root/tests/cases/program-build/export-caller.c" \
     -L"$output_directory" -labla_app -Wl,-rpath,"$output_directory" \
     -o "$output_directory/foreign-caller"

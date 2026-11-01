@@ -25,10 +25,10 @@ fail() {
     exit 1
 }
 status=0
-"$compiler" test -v --no-cache "$cases" > "$work/bundled.out" 2> "$work/bundled.err" || status=$?
+"$compiler" test -v "$cases" > "$work/bundled.out" 2> "$work/bundled.err" || status=$?
 [[ $status -eq 1 ]] || { cat "$work/bundled.out" "$work/bundled.err" >&2; fail "a suite with failures exited $status"; }
 status=0
-"$compiler" test --each --no-cache "$cases" > "$work/each.out" 2> "$work/each.err" || status=$?
+"$compiler" test --each "$cases" > "$work/each.out" 2> "$work/each.err" || status=$?
 [[ $status -eq 1 ]] || fail "--each exited $status"
 grep -E '^(PASS|FAIL) ' "$work/bundled.out" | sort > "$work/bundled.results"
 grep -E '^(PASS|FAIL) ' "$work/each.out" | sort > "$work/each.results"
@@ -52,10 +52,10 @@ grep -q "missing.ab" "$work/bundled.err" || fail "the broken file's own build di
 
 shared=tests/cases/test-bundle-shared
 status=0
-"$compiler" test -v --no-cache "$shared" > "$work/shared.out" 2> "$work/shared.err" || status=$?
+"$compiler" test -v "$shared" > "$work/shared.out" 2> "$work/shared.err" || status=$?
 [[ $status -eq 0 ]] || { cat "$work/shared.out" "$work/shared.err" >&2; fail "the shared-module suite exited $status"; }
 status=0
-"$compiler" test --each --no-cache "$shared" > "$work/shared-each.out" 2>&1 || status=$?
+"$compiler" test --each "$shared" > "$work/shared-each.out" 2>&1 || status=$?
 [[ $status -eq 0 ]] || fail "the shared-module suite's --each exited $status"
 grep -E '^(PASS|FAIL) ' "$work/shared.out" | sort > "$work/shared.results"
 grep -E '^(PASS|FAIL) ' "$work/shared-each.out" | sort > "$work/shared-each.results"
@@ -82,8 +82,8 @@ paths() { sed -nE 's/^bundle [0-9]+ \([0-9]+ files, (.*)\):$/\1/p' "$1" | sort; 
     fail "runs over other files share a bundle build: $(comm -12 <(paths "$work/bundled.out") <(paths "$work/shared.out") | tr '\n' ' ')"
 # Two runs at once in one directory, over other files: each reports what it did alone.
 s1=0; s2=0
-"$compiler" test --no-cache "$cases" > "$work/both-cases.out" 2>/dev/null & first=$!
-"$compiler" test --no-cache "$shared" > "$work/both-shared.out" 2>/dev/null & second=$!
+"$compiler" test "$cases" > "$work/both-cases.out" 2>/dev/null & first=$!
+"$compiler" test "$shared" > "$work/both-shared.out" 2>/dev/null & second=$!
 wait $first || s1=$?
 wait $second || s2=$?
 [[ $s1 -eq 1 && $s2 -eq 0 ]] || fail "concurrent runs exited $s1 and $s2"
