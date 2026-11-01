@@ -1,0 +1,126 @@
+// The target-specific operations against FIPS-197's example and small carry-less products,
+// where cpuHas says the CPU has them; elsewhere they are compiled and not reached.
+// 0 if everything agrees, or the number of the first check that doesn't.
+import "abla/simd"
+
+val SBOX = "63 7c 77 7b f2 6b 6f c5 30 01 67 2b fe d7 ab 76 ca 82 c9 7d fa 59 47 f0 ad d4 a2 af 9c a4 72 c0 b7 fd 93 26 36 3f f7 cc 34 a5 e5 f1 71 d8 31 15 04 c7 23 c3 18 96 05 9a 07 12 80 e2 eb 27 b2 75 09 83 2c 1a 1b 6e 5a a0 52 3b d6 b3 29 e3 2f 84 53 d1 00 ed 20 fc b1 5b 6a cb be 39 4a 4c 58 cf d0 ef aa fb 43 4d 33 85 45 f9 02 7f 50 3c 9f a8 51 a3 40 8f 92 9d 38 f5 bc b6 da 21 10 ff f3 d2 cd 0c 13 ec 5f 97 44 17 c4 a7 7e 3d 64 5d 19 73 60 81 4f dc 22 2a 90 88 46 ee b8 14 de 5e 0b db e0 32 3a 0a 49 06 24 5c c2 d3 ac 62 91 95 e4 79 e7 c8 37 6d 8d d5 4e a9 6c 56 f4 ea 65 7a ae 08 ba 78 25 2e 1c a6 b4 c6 e8 dd 74 1f 4b bd 8b 8a 70 3e b5 66 48 03 f6 0e 61 35 57 b9 86 c1 1d 9e e1 f8 98 11 69 d9 8e 94 9b 1e 87 e9 ce 55 28 df 8c a1 89 0d bf e6 42 68 41 99 2d 0f b0 54 bb 16"
+
+fun hexDigit(code: int): int = if (code >= 97) code - 87 else code - 48
+
+fun sboxOf(byte: int): int =
+    hexDigit(int(SBOX[byte * 3])) * 16 + hexDigit(int(SBOX[byte * 3 + 1]))
+
+fun fromHex(text: string): string {
+    var out = ""
+    var at = 0
+    while (at < text.size) {
+        out = out + byteText(hexDigit(int(text[at])) * 16 + hexDigit(int(text[at + 1])))
+        at = at + 2
+    }
+    out
+}
+
+fun toHex(bytes: string): string {
+    val digits = "0123456789abcdef"
+    var text = ""
+    for (at in 0 until bytes.size) {
+        val byte = int(bytes[at])
+        text = text + digits.slice(byte >> 4, (byte >> 4) + 1) + digits.slice(byte & 15, (byte & 15) + 1)
+    }
+    text
+}
+
+fun byteText(byte: int): string = u8x16Splat(u8(byte)).bytes().slice(0, 1)
+
+fun roundKeys(key: string): array<string> {
+    val words: array<int> = []
+    for (at in 0 until 16) words.append(int(key[at]))
+    var rcon = 1
+    var at = 16
+    while (at < 176) {
+        var a = words[at - 4]
+        var b = words[at - 3]
+        var c = words[at - 2]
+        var d = words[at - 1]
+        if (at % 16 == 0) {
+            val t = a
+            a = sboxOf(b) ^ rcon
+            b = sboxOf(c)
+            c = sboxOf(d)
+            d = sboxOf(t)
+            rcon = (rcon << 1) ^ (if (rcon >= 128) 283 else 0)
+        }
+        words.append(words[at - 16] ^ a)
+        words.append(words[at - 15] ^ b)
+        words.append(words[at - 14] ^ c)
+        words.append(words[at - 13] ^ d)
+        at = at + 4
+    }
+    val keys: array<string> = []
+    for (round in 0 until 11) {
+        var text = ""
+        for (byte in 0 until 16) text = text + byteText(words[round * 16 + byte])
+        keys.append(text)
+    }
+    keys
+}
+
+@target("aes")
+@noinline fun encrypt(plain: string, keys: array<string>): string {
+    var state = u8x16Load(plain) ^ u8x16Load(keys[0])
+    for (round in 1 until 10) state = aesEncRound(state, u8x16Load(keys[round]))
+    aesEncLastRound(state, u8x16Load(keys[10])).bytes()
+}
+
+@target("aes")
+@noinline fun decrypt(sealed: string, keys: array<string>): string {
+    var state = u8x16Load(sealed) ^ u8x16Load(keys[10])
+    var round = 9
+    while (round >= 1) {
+        state = aesDecRound(state, aesInvMixColumns(u8x16Load(keys[round])))
+        round = round - 1
+    }
+    aesDecLastRound(state, u8x16Load(keys[0])).bytes()
+}
+
+@target("clmul")
+@noinline fun products(): string {
+    val a = u64x2(u64(3), u64(5))
+    val b = u64x2(u64(7), u64(-9223372036854775807 - 1))
+    clmul(a, b, 0).bytes() + clmul(a, b, 1).bytes() + clmul(a, b, 16).bytes() + clmul(a, b, 17).bytes()
+}
+
+@target("avx2")
+@noinline fun wide(a: u32x8, b: f64x4): u32x8 = (a + a) ^ b.asU32x8()
+
+fun simdHardwareChecks(): int {
+    if (cpuHas("aes")) {
+        val keys = roundKeys(fromHex("000102030405060708090a0b0c0d0e0f"))
+        val plain = fromHex("00112233445566778899aabbccddeeff")
+        val sealed = encrypt(plain, keys)
+        if (toHex(sealed) != "69c4e0d86a7b0430d8cdb78070b4c55a") return 1
+        if (toHex(decrypt(sealed, keys)) != "00112233445566778899aabbccddeeff") return 2
+    }
+    if (cpuHas("clmul")) {
+        // 3*7 = 9; 5*7 = 27; 3*2^63 = 2^63 + 2^64; 5*2^63 = 2^63 + 2^65.
+        val expected = "0900000000000000" + "0000000000000000" +
+            "1b00000000000000" + "0000000000000000" +
+            "0000000000000080" + "0100000000000000" +
+            "0000000000000080" + "0200000000000000"
+        if (toHex(products()) != expected) return 3
+    }
+    if (cpuHas("avx2")) {
+        val a = u32x8Splat(u32(3))
+        if (wide(a, f64x4Splat(0.0)).get(7) != u32(6)) return 4
+    }
+    // What the build has is what the target has; a typo isn't an answer.
+    val arch = simdTargetArch()
+    if (targetHas("sse2") != (arch == SIMD_ARCH_X86_64)) return 5
+    if (targetHas("neon") != (arch == SIMD_ARCH_AARCH64)) return 6
+    if (targetHas("simd128") != (arch == SIMD_ARCH_WASM)) return 7
+    if (targetHas("aes")) return 8
+    if (arch == SIMD_ARCH_WASM || arch == SIMD_ARCH_XTENSA) {
+        if (cpuHas("aes") || cpuHas("clmul") || cpuHas("avx2")) return 9
+    }
+    0
+}

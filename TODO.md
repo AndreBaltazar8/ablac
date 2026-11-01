@@ -17,6 +17,12 @@
 
 ## Bugs seen
 
+- [ ] A method on a lambda result whose return type is inferred picks the first overload of that
+      name instead of failing or finding the right one: with `val add = { x: u32x4 -> x + a }`,
+      `add(b).text()` prints `add(b)` as a `u8x16` (the same family as the lambda entry below; a
+      declared `val add: (u32x4) -> u32x4` is right). Seen 2026-10-31 on the simd branch.
+- [ ] `@inline operator fun` used to be a parse error (fixed with abla/simd), but an annotation
+      after `operator` still is: `operator @inline fun` gives `E_PARSE_*`. Seen 2026-10-31.
 - [ ] `E_NAMED_ARGUMENT_HIDDEN` also rejects a caller whose local of that name isn't a function,
       which would be fine: a generic function's or method's omitted default calling a global
       function value, constructor or foreign function, with `val double = 40` in the caller and

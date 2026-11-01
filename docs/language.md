@@ -1683,7 +1683,8 @@ fun main {
   `call.overload-no-match`. Two declarations with the same parameter types
   are `symbol.duplicate`.
 - The operator names are `plus` (`+`), `minus` (`-`), `times` (`*`), `div`
-  (`/`), `rem` (`%`) and `unaryMinus` (prefix `-`). An operator applies when
+  (`/`), `rem` (`%`), `unaryMinus` (prefix `-`), `and` (`&`), `or` (`|`), `xor`
+  (`^`), `inv` (prefix `~`), `shl` (`<<`) and `shr` (`>>`). An operator applies when
   its receiver is the left operand's type and it accepts the right operand.
   Otherwise the expression is ordinary arithmetic, unchanged.
 - A parameter default may call an overload or use an operator function

@@ -1,0 +1,702 @@
+// Lowers abla/simd's intrinsics to LLVM vectors (docs/simd.md). Names follow one
+// closed grammar: `ablaSimd_<operation>_<type>`, a conversion's being
+// `ablaSimd_<operation>_<from>_<to>`, plus `<type>Shuffle` and the target-specific
+// operations (aesEncRound and its family, clmul). A vector is an LLVM vector in the
+// scalar plan, 16 or 32 bytes of string data when boxed, and an integer of its width
+// across a direct call (bootstrapLlvmDirectType).
+
+import "../../simd_types.ab"
+import "../../ir.ab"
+import "../../sema.ab"
+import "core.ab"
+import "bindings.ab"
+import "functions.ab"
+import "analysis.ab"
+import "exports.ab"
+import "abla/unsafe/memory/raw"
+
+val BOOTSTRAP_SIMD_ARCH_OTHER = 0
+val BOOTSTRAP_SIMD_ARCH_X86_64 = 1
+val BOOTSTRAP_SIMD_ARCH_AARCH64 = 2
+val BOOTSTRAP_SIMD_ARCH_WASM = 3
+val BOOTSTRAP_SIMD_ARCH_XTENSA = 4
+
+fun bootstrapLlvmSimdArch(triple: string): int =
+    if (bootstrapTextContains(triple, "x86_64")) BOOTSTRAP_SIMD_ARCH_X86_64
+    else if (bootstrapTextContains(triple, "aarch64") || bootstrapTextContains(triple, "arm64")) {
+        BOOTSTRAP_SIMD_ARCH_AARCH64
+    }
+    else if (bootstrapTextContains(triple, "wasm32")) BOOTSTRAP_SIMD_ARCH_WASM
+    else if (bootstrapTextContains(triple, "xtensa")) BOOTSTRAP_SIMD_ARCH_XTENSA
+    else BOOTSTRAP_SIMD_ARCH_OTHER
+
+/** LLVM's target-features attribute for what `@target` wrote, on this target ("" for none). */
+fun bootstrapLlvmSimdTargetFeatures(triple: string, features: string): string {
+    val arch = bootstrapLlvmSimdArch(triple)
+    var result = ""
+    for (feature in bootstrapSimdFeatureList(features)) {
+        val llvm = if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+            if (feature == "aes") "+aes"
+            else if (feature == "clmul") "+pclmul"
+            else if (feature == "avx2") "+avx2"
+            else if (feature == "sse41") "+sse4.1"
+            else if (feature == "ssse3") "+ssse3"
+            else ""
+        } else if (arch == BOOTSTRAP_SIMD_ARCH_AARCH64 && (feature == "aes" || feature == "clmul")) {
+            "+aes"
+        } else ""
+        if (llvm != "") result = if (result == "") llvm else "$result,$llvm"
+    }
+    result
+}
+
+fun bootstrapLlvmVectorType(backend: BootstrapLlvmBackend, type: string): i64* =
+    LLVMVectorType(backend.type(bootstrapVectorLaneType(type)), i32(bootstrapVectorLaneCount(type)))
+
+// What a vector is across a direct call: an integer of its width. A vector
+// parameter's registers depend on the features of the function it is compiled in, so
+// `@target("avx2")` code and its plain callers would disagree about a u32x8; an
+// integer's don't, on any target. LLVM drops the casts when it inlines.
+fun bootstrapLlvmDirectType(backend: BootstrapLlvmBackend, scalar: string): i64* =
+    if (bootstrapIsVectorType(scalar)) {
+        LLVMIntTypeInContext(backend.context, i32(bootstrapVectorBits(scalar)))
+    } else backend.type(scalar)
+
+fun bootstrapLlvmToDirect(backend: BootstrapLlvmBackend, value: i64*, scalar: string): i64* =
+    if (bootstrapIsVectorType(scalar)) {
+        LLVMBuildBitCast(backend.builder, value, bootstrapLlvmDirectType(backend, scalar), "vector.direct")
+    } else value
+
+fun bootstrapLlvmFromDirect(backend: BootstrapLlvmBackend, value: i64*, scalar: string): i64* =
+    if (bootstrapIsVectorType(scalar)) {
+        LLVMBuildBitCast(backend.builder, value, backend.type(scalar), "vector.native")
+    } else value
+
+/** Boxes a vector: a string of its bytes, which every boxed path already carries. */
+fun bootstrapLlvmBoxVector(
+    backend: BootstrapLlvmBackend,
+    destination: i64*,
+    native: i64*,
+    type: string
+): void {
+    bootstrapLlvmCallNamed(
+        backend, "abla_vector_box",
+        [destination, LLVMConstInt(backend.i64Type, bootstrapVectorBits(type) / 8, 0)],
+        "", true, [false, false]
+    )
+    val data = bootstrapLlvmCallNamed(
+        backend, "abla_string_data", [destination], "vector.box.data", false, [true]
+    )
+    val stored = LLVMBuildStore(backend.builder, native, data)
+    LLVMSetAlignment(stored, 1)
+    return
+}
+
+fun bootstrapLlvmUnboxVector(
+    backend: BootstrapLlvmBackend,
+    boxed: i64*,
+    type: string,
+    name: string
+): i64* {
+    val data = bootstrapLlvmCallNamed(
+        backend, "abla_string_data", [boxed], "$name.data", false, [true]
+    )
+    val loaded = LLVMBuildLoad2(backend.builder, backend.type(type), data, name)
+    LLVMSetAlignment(loaded, 1)
+    loaded
+}
+
+fun bootstrapLlvmProgramHasSimd(program: BootstrapIrProgram): bool {
+    for (function in program.functions) {
+        for (instruction in function.instructions) {
+            if (instruction.opcode == "extern.intrinsic" && bootstrapSimdIntrinsic(instruction.text)) {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fun bootstrapLlvmSimdSuffix(type: string): string {
+    val lane = bootstrapVectorLaneType(type)
+    val kind = if (lane.startsWith("f")) "f" else "i"
+    "v${bootstrapVectorLaneCount(type)}$kind${bootstrapLaneBits(lane)}"
+}
+
+fun bootstrapLlvmSimdCall(
+    backend: BootstrapLlvmBackend,
+    name: string,
+    result: i64*,
+    arguments: array<i64*>
+): i64* {
+    val types: array<i64*> = []
+    for (argument in arguments) types.append(LLVMTypeOf(argument))
+    val flags = bootstrapLlvmFalseFlags(arguments.size)
+    bootstrapLlvmCall(
+        backend, bootstrapLlvmDeclare(backend, name, result, types, false, flags),
+        arguments, if (arguments.size == 0) "" else "simd", false, flags
+    )
+}
+
+/** The integer vector of a vector's bits (itself if it is one). */
+fun bootstrapLlvmSimdBitsType(backend: BootstrapLlvmBackend, type: string): i64* {
+    val lane = bootstrapVectorLaneType(type)
+    LLVMVectorType(
+        LLVMIntTypeInContext(backend.context, i32(bootstrapLaneBits(lane))),
+        i32(bootstrapVectorLaneCount(type))
+    )
+}
+
+fun bootstrapLlvmSimdSplat(
+    backend: BootstrapLlvmBackend,
+    value: i64*,
+    vectorType: i64*,
+    count: int
+): i64* {
+    var result = LLVMGetUndef(vectorType)
+    for (lane in 0 until count) {
+        result = LLVMBuildInsertElement(
+            backend.builder, result, value, LLVMConstInt(backend.i32Type, lane, 0), "simd.splat"
+        )
+    }
+    result
+}
+
+fun bootstrapLlvmEmitSimdTrap(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction,
+    result: i64*
+): void {
+    bootstrapLlvmSimdCall(backend, "llvm.trap", backend.voidType, [])
+    bootstrapLlvmSetNativeValue(backend, storage, instruction.result, LLVMConstNull(result))
+    return
+}
+
+// One word of what the CPU says about itself; 0 where it says nothing. On x86-64
+// register 0-3 of cpuid(leaf, sub) (eax to edx), or 4 for xgetbv(sub); on AArch64
+// ID_AA64ISAR0_EL1, which Linux emulates for user code, and fixed on Apple's chips, whose
+// system forbids reading it and which all have AES and PMULL.
+fun bootstrapLlvmEmitCpuProbe(
+    backend: BootstrapLlvmBackend,
+    leaf: i64*,
+    sub: i64*,
+    register: i64*
+): i64* {
+    val arch = bootstrapLlvmSimdArch(backend.targetTriple)
+    if (arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
+        if (bootstrapTextContains(backend.targetTriple, "apple")) return LLVMConstInt(backend.i64Type, 32, 0)
+        val type = bootstrapLlvmFunctionType(backend, backend.i64Type, [])
+        val assembly = "mrs $0, ID_AA64ISAR0_EL1"
+        val constraints = "=r"
+        return bootstrapLlvmCallTyped(
+            backend, type,
+            LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 0, 0, 0, 0),
+            [], "cpu.probe"
+        )
+    }
+    if (arch != BOOTSTRAP_SIMD_ARCH_X86_64) return LLVMConstInt(backend.i64Type, 0, 0)
+    val constantRegister = LLVMIsAConstantInt(register)
+    val which = if (pointerIsNull(constantRegister)) 0 else LLVMConstIntGetSExtValue(constantRegister)
+    val narrowLeaf = LLVMBuildTrunc(backend.builder, leaf, backend.i32Type, "cpu.leaf")
+    val narrowSub = LLVMBuildTrunc(backend.builder, sub, backend.i32Type, "cpu.sub")
+    if (which == 4) {
+        val pair = bootstrapLlvmStructType(backend, [backend.i32Type, backend.i32Type])
+        val type = bootstrapLlvmFunctionType(backend, pair, [backend.i32Type])
+        val assembly = ".byte 0x0f, 0x01, 0xd0"
+        val constraints = "={ax},={dx},{cx}"
+        val call = bootstrapLlvmCallTyped(
+            backend, type,
+            LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 0, 0, 0, 0),
+            [narrowSub], "cpu.xgetbv"
+        )
+        return LLVMBuildZExt(
+            backend.builder, LLVMBuildExtractValue(backend.builder, call, 0, "cpu.eax"),
+            backend.i64Type, "cpu.word"
+        )
+    }
+    val four = bootstrapLlvmStructType(
+        backend, [backend.i32Type, backend.i32Type, backend.i32Type, backend.i32Type]
+    )
+    val type = bootstrapLlvmFunctionType(backend, four, [backend.i32Type, backend.i32Type])
+    val assembly = "cpuid"
+    val constraints = "={ax},={bx},={cx},={dx},{ax},{cx}"
+    val call = bootstrapLlvmCallTyped(
+        backend, type,
+        LLVMGetInlineAsm(type, assembly, assembly.size, constraints, constraints.size, 0, 0, 0, 0),
+        [narrowLeaf, narrowSub], "cpu.id"
+    )
+    LLVMBuildZExt(
+        backend.builder, LLVMBuildExtractValue(backend.builder, call, i32(which), "cpu.register"),
+        backend.i64Type, "cpu.word"
+    )
+}
+
+fun bootstrapLlvmStructType(backend: BootstrapLlvmBackend, elements: array<i64*>): i64* {
+    val types = llvmPointerVector(elements.size)
+    for (at in 0 until elements.size) types.set(at, elements[at])
+    val result = LLVMStructTypeInContext(backend.context, types.pointer(), i32(elements.size), 0)
+    types.drop()
+    result
+}
+
+// The target-specific operations. Each portable name is one instruction on x86-64 and
+// what the same round is on AArch64; elsewhere the program traps, which code behind
+// cpuHas never reaches.
+fun bootstrapLlvmEmitSimdHardware(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): bool {
+    val name = instruction.text
+    val arch = bootstrapLlvmSimdArch(backend.targetTriple)
+    val bytes = backend.type("u8x16")
+    val quads = backend.type("u64x2")
+    if (name == "clmul") {
+        if (instruction.operands.size != 3) return false
+        val selector = LLVMIsAConstantInt(bootstrapLlvmNativeValue(backend, storage, instruction.operands[2]))
+        if (pointerIsNull(selector)) return false
+        val which = LLVMConstIntGetSExtValue(selector)
+        val a = bootstrapLlvmScalarOperand(backend, storage, instruction.operands[0], "u64x2")
+        val b = bootstrapLlvmScalarOperand(backend, storage, instruction.operands[1], "u64x2")
+        if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+            bootstrapLlvmSetNativeValue(backend, storage, instruction.result, bootstrapLlvmSimdCall(
+                backend, "llvm.x86.pclmulqdq", quads, [a, b, LLVMConstInt(backend.i8Type, which, 0)]
+            ))
+        } else if (arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
+            val left = LLVMBuildExtractElement(
+                backend.builder, a, LLVMConstInt(backend.i32Type, which & 1, 0), "clmul.left"
+            )
+            val right = LLVMBuildExtractElement(
+                backend.builder, b, LLVMConstInt(backend.i32Type, (which >> 4) & 1, 0), "clmul.right"
+            )
+            val product = bootstrapLlvmSimdCall(
+                backend, "llvm.aarch64.neon.pmull64", bytes, [left, right]
+            )
+            bootstrapLlvmSetNativeValue(
+                backend, storage, instruction.result,
+                LLVMBuildBitCast(backend.builder, product, quads, "clmul")
+            )
+        } else bootstrapLlvmEmitSimdTrap(backend, storage, instruction, quads)
+        return true
+    }
+    val unary = name == "aesInvMixColumns"
+    if (instruction.operands.size != (if (unary) 1 else 2)) return false
+    val state = bootstrapLlvmScalarOperand(backend, storage, instruction.operands[0], "u8x16")
+    if (arch == BOOTSTRAP_SIMD_ARCH_X86_64) {
+        val intrinsic =
+            if (name == "aesEncRound") "aesenc"
+            else if (name == "aesEncLastRound") "aesenclast"
+            else if (name == "aesDecRound") "aesdec"
+            else if (name == "aesDecLastRound") "aesdeclast"
+            else "aesimc"
+        val wideState = LLVMBuildBitCast(backend.builder, state, quads, "aes.state")
+        val arguments = [wideState]
+        if (!unary) arguments.append(LLVMBuildBitCast(
+            backend.builder,
+            bootstrapLlvmScalarOperand(backend, storage, instruction.operands[1], "u8x16"),
+            quads, "aes.key"
+        ))
+        val done = bootstrapLlvmSimdCall(backend, "llvm.x86.aesni.$intrinsic", quads, arguments)
+        bootstrapLlvmSetNativeValue(
+            backend, storage, instruction.result,
+            LLVMBuildBitCast(backend.builder, done, bytes, "aes.result")
+        )
+    } else if (arch == BOOTSTRAP_SIMD_ARCH_AARCH64) {
+        // AESE adds the key before SubBytes where AESENC adds it after MixColumns, so a
+        // zero key and an XOR afterwards make them the same round.
+        val zero = LLVMConstNull(bytes)
+        var done = if (unary) {
+            bootstrapLlvmSimdCall(backend, "llvm.aarch64.crypto.aesimc", bytes, [state])
+        } else {
+            val encrypting = name == "aesEncRound" || name == "aesEncLastRound"
+            val core = bootstrapLlvmSimdCall(
+                backend, if (encrypting) "llvm.aarch64.crypto.aese" else "llvm.aarch64.crypto.aesd",
+                bytes, [state, zero]
+            )
+            if (name == "aesEncRound") bootstrapLlvmSimdCall(backend, "llvm.aarch64.crypto.aesmc", bytes, [core])
+            else if (name == "aesDecRound") bootstrapLlvmSimdCall(backend, "llvm.aarch64.crypto.aesimc", bytes, [core])
+            else core
+        }
+        if (!unary) done = LLVMBuildXor(
+            backend.builder, done,
+            bootstrapLlvmScalarOperand(backend, storage, instruction.operands[1], "u8x16"), "aes.result"
+        )
+        bootstrapLlvmSetNativeValue(backend, storage, instruction.result, done)
+    } else bootstrapLlvmEmitSimdTrap(backend, storage, instruction, bytes)
+    true
+}
+
+fun bootstrapLlvmSimdCompare(
+    backend: BootstrapLlvmBackend,
+    operation: string,
+    type: string,
+    left: i64*,
+    right: i64*
+): i64* {
+    val lane = bootstrapVectorLaneType(type)
+    val floating = lane.startsWith("f")
+    val unsigned = lane.startsWith("u")
+    val test = if (floating) {
+        LLVMBuildFCmp(
+            backend.builder,
+            if (operation == "eq") llvmRealOrderedEqual()
+            else if (operation == "ne") llvmRealUnorderedNotEqual()
+            else if (operation == "lt") llvmRealOrderedLessThan()
+            else if (operation == "le") llvmRealOrderedLessOrEqual()
+            else if (operation == "gt") llvmRealOrderedGreaterThan()
+            else llvmRealOrderedGreaterOrEqual(),
+            left, right, "simd.compare"
+        )
+    } else {
+        LLVMBuildICmp(
+            backend.builder,
+            if (operation == "eq") llvmIntEqual()
+            else if (operation == "ne") llvmIntNotEqual()
+            else if (operation == "lt") (if (unsigned) llvmIntUnsignedLessThan() else llvmIntSignedLessThan())
+            else if (operation == "le") (if (unsigned) llvmIntUnsignedLessOrEqual() else llvmIntSignedLessOrEqual())
+            else if (operation == "gt") (if (unsigned) llvmIntUnsignedGreaterThan() else llvmIntSignedGreaterThan())
+            else (if (unsigned) llvmIntUnsignedGreaterOrEqual() else llvmIntSignedGreaterOrEqual()),
+            left, right, "simd.compare"
+        )
+    }
+    LLVMBuildSExt(backend.builder, test, bootstrapLlvmSimdBitsType(backend, type), "simd.mask")
+}
+
+fun bootstrapLlvmSimdShift(
+    backend: BootstrapLlvmBackend,
+    operation: string,
+    type: string,
+    value: i64*,
+    count: i64*
+): i64* {
+    val lane = bootstrapVectorLaneType(type)
+    val bits = bootstrapLaneBits(lane)
+    val laneCount = bootstrapVectorLaneCount(type)
+    val laneType = backend.type(lane)
+    val vector = backend.type(type)
+    if (operation == "rotl" || operation == "rotr") {
+        val amount = bootstrapLlvmSimdSplat(
+            backend,
+            LLVMBuildTrunc(
+                backend.builder,
+                LLVMBuildAnd(backend.builder, count, LLVMConstInt(backend.i64Type, bits - 1, 0), "simd.rotate.count"),
+                laneType, "simd.rotate.lane"
+            ),
+            vector, laneCount
+        )
+        return bootstrapLlvmSimdCall(
+            backend,
+            "llvm.${if (operation == "rotl") "fshl" else "fshr"}.${bootstrapLlvmSimdSuffix(type)}",
+            vector, [value, value, amount]
+        )
+    }
+    // As for scalars, a count outside the lane's width gives zero.
+    val inRange = LLVMBuildICmp(
+        backend.builder, llvmIntUnsignedLessThan(), count,
+        LLVMConstInt(backend.i64Type, bits, 0), "simd.shift.in.range"
+    )
+    val safe = LLVMBuildSelect(
+        backend.builder, inRange, count, LLVMConstInt(backend.i64Type, 0, 0), "simd.shift.safe"
+    )
+    val amount = bootstrapLlvmSimdSplat(
+        backend, LLVMBuildTrunc(backend.builder, safe, laneType, "simd.shift.lane"), vector, laneCount
+    )
+    val shifted =
+        if (operation == "shl") LLVMBuildShl(backend.builder, value, amount, "simd.shl")
+        else if (lane.startsWith("u")) LLVMBuildLShr(backend.builder, value, amount, "simd.shr")
+        else LLVMBuildAShr(backend.builder, value, amount, "simd.shr")
+    LLVMBuildSelect(backend.builder, inRange, shifted, LLVMConstNull(vector), "simd.shift")
+}
+
+fun bootstrapLlvmEmitSimdIntrinsic(
+    backend: BootstrapLlvmBackend,
+    var storage: BootstrapLlvmFunctionStorage,
+    instruction: BootstrapInstruction
+): bool {
+    val name = instruction.text
+    val operands = instruction.operands
+    if (bootstrapSimdIntrinsicFeature(name) != "") {
+        return bootstrapLlvmEmitSimdHardware(backend, storage, instruction)
+    }
+    if (name == "ablaSimdTargetArch") {
+        bootstrapLlvmSetNativeValue(
+            backend, storage, instruction.result,
+            LLVMConstInt(backend.i64Type, bootstrapLlvmSimdArch(backend.targetTriple), 0)
+        )
+        return true
+    }
+    if (name == "ablaSimdCpuProbe") {
+        if (operands.size != 3) return false
+        bootstrapLlvmSetNativeValue(
+            backend, storage, instruction.result,
+            bootstrapLlvmEmitCpuProbe(
+                backend,
+                bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[0]),
+                bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[1]),
+                bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[2])
+            )
+        )
+        return true
+    }
+    val shuffled = bootstrapSimdShuffleType(name)
+    if (shuffled != "") {
+        val count = bootstrapVectorLaneCount(shuffled)
+        if (operands.size != count + 2) return false
+        val mask: array<i64*> = []
+        for (lane in 0 until count) {
+            val index = LLVMIsAConstantInt(bootstrapLlvmNativeValue(backend, storage, operands[lane + 2]))
+            if (pointerIsNull(index)) return false
+            val value = LLVMConstIntGetSExtValue(index)
+            if (value < 0 || value >= 2 * count) return false
+            mask.append(LLVMConstInt(backend.i32Type, value, 0))
+        }
+        bootstrapLlvmSetNativeValue(
+            backend, storage, instruction.result,
+            LLVMBuildShuffleVector(
+                backend.builder,
+                bootstrapLlvmScalarOperand(backend, storage, operands[0], shuffled),
+                bootstrapLlvmScalarOperand(backend, storage, operands[1], shuffled),
+                bootstrapLlvmConstVector(mask),
+                "simd.shuffle"
+            )
+        )
+        return true
+    }
+    if (!name.startsWith("ablaSimd_")) return false
+    var split = 9
+    while (split < name.size && int(name[split]) != 95) split = split + 1
+    if (split >= name.size) return false
+    val operation = name.slice(9, split)
+    var typeEnd = split + 1
+    while (typeEnd < name.size && int(name[typeEnd]) != 95) typeEnd = typeEnd + 1
+    val type = name.slice(split + 1, typeEnd)
+    val target = if (typeEnd < name.size) name.slice(typeEnd + 1, name.size) else ""
+    if (!bootstrapIsVectorType(type)) return false
+    val lane = bootstrapVectorLaneType(type)
+    val laneCount = bootstrapVectorLaneCount(type)
+    val floating = lane.startsWith("f")
+    val unsigned = lane.startsWith("u")
+    val vector = backend.type(type)
+    val builder = backend.builder
+
+    var result: i64* = nativeNullPointer()
+    if (operation == "load") {
+        if (operands.size != 1) return false
+        val pointer = LLVMBuildIntToPtr(
+            builder, bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[0]),
+            backend.pointerType, "simd.load.address"
+        )
+        result = LLVMBuildLoad2(builder, vector, pointer, "simd.load")
+        LLVMSetAlignment(result, 1)
+        bootstrapLlvmTagAccess(backend, result, false)
+    } else if (operation == "store") {
+        if (operands.size != 2) return false
+        val pointer = LLVMBuildIntToPtr(
+            builder, bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[0]),
+            backend.pointerType, "simd.store.address"
+        )
+        val stored = LLVMBuildStore(
+            builder, bootstrapLlvmScalarOperand(backend, storage, operands[1], type), pointer
+        )
+        LLVMSetAlignment(stored, 1)
+        bootstrapLlvmTagAccess(backend, stored, false)
+        return true
+    } else if (operation == "bytes") {
+        if (operands.size != 1) return false
+        bootstrapLlvmBoxVector(
+            backend, storage.values[instruction.result],
+            bootstrapLlvmScalarOperand(backend, storage, operands[0], type), type
+        )
+        return true
+    } else if (operation == "splat") {
+        if (operands.size != 1) return false
+        result = bootstrapLlvmSimdSplat(
+            backend, bootstrapLlvmScalarOperand(backend, storage, operands[0], lane), vector, laneCount
+        )
+    } else if (operation == "make") {
+        if (operands.size != laneCount) return false
+        result = LLVMGetUndef(vector)
+        for (at in 0 until laneCount) {
+            result = LLVMBuildInsertElement(
+                builder, result, bootstrapLlvmScalarOperand(backend, storage, operands[at], lane),
+                LLVMConstInt(backend.i32Type, at, 0), "simd.make"
+            )
+        }
+    } else if (operation == "get") {
+        if (operands.size != 2) return false
+        result = LLVMBuildExtractElement(
+            builder, bootstrapLlvmScalarOperand(backend, storage, operands[0], type),
+            bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[1]), "simd.get"
+        )
+    } else if (operation == "with") {
+        if (operands.size != 3) return false
+        result = LLVMBuildInsertElement(
+            builder, bootstrapLlvmScalarOperand(backend, storage, operands[0], type),
+            bootstrapLlvmScalarOperand(backend, storage, operands[2], lane),
+            bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[1]), "simd.with"
+        )
+    } else if (operation == "bits") {
+        if (operands.size != 1) return false
+        result = LLVMBuildBitCast(
+            builder, bootstrapLlvmScalarOperand(backend, storage, operands[0], type),
+            backend.type(target), "simd.bits"
+        )
+    } else if (operation == "convert") {
+        if (operands.size != 1) return false
+        val value = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
+        val targetType = backend.type(target)
+        val targetLane = bootstrapVectorLaneType(target)
+        if (floating && !targetLane.startsWith("f")) {
+            // Saturating, NaN gives 0, as f32ToI32 does.
+            val sign = if (targetLane.startsWith("u")) "fptoui" else "fptosi"
+            result = bootstrapLlvmSimdCall(
+                backend,
+                "llvm.$sign.sat.${bootstrapLlvmSimdSuffix(target)}.${bootstrapLlvmSimdSuffix(type)}",
+                targetType, [value]
+            )
+        } else if (!floating && targetLane.startsWith("f")) {
+            result = if (unsigned) LLVMBuildUIToFP(builder, value, targetType, "simd.convert")
+                else LLVMBuildSIToFP(builder, value, targetType, "simd.convert")
+        } else return false
+    } else if (operation == "low" || operation == "high") {
+        if (operands.size != 1) return false
+        val half = laneCount / 2
+        val mask: array<i64*> = []
+        for (at in 0 until half) {
+            mask.append(LLVMConstInt(backend.i32Type, at + (if (operation == "high") half else 0), 0))
+        }
+        val value = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
+        result = LLVMBuildShuffleVector(
+            builder, value, LLVMGetUndef(vector), bootstrapLlvmConstVector(mask), "simd.half"
+        )
+    } else if (operation == "concat") {
+        if (operands.size != 2) return false
+        val mask: array<i64*> = []
+        for (at in 0 until laneCount * 2) mask.append(LLVMConstInt(backend.i32Type, at, 0))
+        result = LLVMBuildShuffleVector(
+            builder,
+            bootstrapLlvmScalarOperand(backend, storage, operands[0], type),
+            bootstrapLlvmScalarOperand(backend, storage, operands[1], type),
+            bootstrapLlvmConstVector(mask), "simd.concat"
+        )
+    } else if (operation == "bitmask") {
+        if (operands.size != 1) return false
+        val value = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
+        val bitsType = bootstrapLlvmSimdBitsType(backend, type)
+        val negative = LLVMBuildICmp(
+            builder, llvmIntSignedLessThan(),
+            LLVMBuildBitCast(builder, value, bitsType, "simd.bitmask.bits"),
+            LLVMConstNull(bitsType), "simd.bitmask.test"
+        )
+        result = LLVMBuildZExt(
+            builder,
+            LLVMBuildBitCast(
+                builder, negative, LLVMIntTypeInContext(backend.context, i32(laneCount)), "simd.bitmask.pack"
+            ),
+            backend.i64Type, "simd.bitmask"
+        )
+    } else if (operation == "sum") {
+        if (operands.size != 1) return false
+        val value = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
+        val suffix = bootstrapLlvmSimdSuffix(type)
+        result = if (floating) {
+            bootstrapLlvmSimdCall(
+                backend, "llvm.vector.reduce.fadd.$suffix", backend.type(lane),
+                [LLVMConstNull(backend.type(lane)), value]
+            )
+        } else bootstrapLlvmSimdCall(
+            backend, "llvm.vector.reduce.add.$suffix", backend.type(lane), [value]
+        )
+    } else if (operation == "shl" || operation == "shr" ||
+               operation == "rotl" || operation == "rotr") {
+        if (operands.size != 2 || floating) return false
+        result = bootstrapLlvmSimdShift(
+            backend, operation, type,
+            bootstrapLlvmScalarOperand(backend, storage, operands[0], type),
+            bootstrapLlvmCoreIntrinsicInteger(backend, storage, operands[1])
+        )
+    } else if (operation == "select") {
+        if (operands.size != 3) return false
+        val bitsType = bootstrapLlvmSimdBitsType(backend, type)
+        val mask = bootstrapLlvmScalarOperand(
+            backend, storage, operands[0], "u${bootstrapLaneBits(lane)}x$laneCount"
+        )
+        val first = LLVMBuildBitCast(
+            builder, bootstrapLlvmScalarOperand(backend, storage, operands[1], type), bitsType, "simd.select.a"
+        )
+        val second = LLVMBuildBitCast(
+            builder, bootstrapLlvmScalarOperand(backend, storage, operands[2], type), bitsType, "simd.select.b"
+        )
+        result = LLVMBuildBitCast(
+            builder,
+            LLVMBuildOr(
+                builder,
+                LLVMBuildAnd(builder, mask, first, "simd.select.left"),
+                LLVMBuildAnd(builder, LLVMBuildNot(builder, mask, "simd.select.other"), second, "simd.select.right"),
+                "simd.select"
+            ),
+            vector, "simd.selected"
+        )
+    } else if (operands.size == 1) {
+        val value = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
+        val suffix = bootstrapLlvmSimdSuffix(type)
+        if (operation == "neg") {
+            result = if (floating) LLVMBuildFNeg(builder, value, "simd.neg")
+                else LLVMBuildNeg(builder, value, "simd.neg")
+        } else if (operation == "not" && !floating) {
+            result = LLVMBuildNot(builder, value, "simd.not")
+        } else if (operation == "abs") {
+            result = if (floating) {
+                bootstrapLlvmSimdCall(backend, "llvm.fabs.$suffix", vector, [value])
+            } else bootstrapLlvmSimdCall(
+                backend, "llvm.abs.$suffix", vector, [value, LLVMConstInt(backend.i1Type, 0, 0)]
+            )
+        } else if (operation == "sqrt" && floating) {
+            result = bootstrapLlvmSimdCall(backend, "llvm.sqrt.$suffix", vector, [value])
+        } else return false
+    } else if (operands.size == 2) {
+        val left = bootstrapLlvmScalarOperand(backend, storage, operands[0], type)
+        val right = bootstrapLlvmScalarOperand(backend, storage, operands[1], type)
+        val suffix = bootstrapLlvmSimdSuffix(type)
+        if (operation == "add") {
+            result = if (floating) LLVMBuildFAdd(builder, left, right, "simd.add")
+                else LLVMBuildAdd(builder, left, right, "simd.add")
+        } else if (operation == "sub") {
+            result = if (floating) LLVMBuildFSub(builder, left, right, "simd.sub")
+                else LLVMBuildSub(builder, left, right, "simd.sub")
+        } else if (operation == "mul") {
+            result = if (floating) LLVMBuildFMul(builder, left, right, "simd.mul")
+                else LLVMBuildMul(builder, left, right, "simd.mul")
+        } else if (operation == "div" && floating) {
+            result = LLVMBuildFDiv(builder, left, right, "simd.div")
+        } else if (operation == "and" && !floating) {
+            result = LLVMBuildAnd(builder, left, right, "simd.and")
+        } else if (operation == "or" && !floating) {
+            result = LLVMBuildOr(builder, left, right, "simd.or")
+        } else if (operation == "xor" && !floating) {
+            result = LLVMBuildXor(builder, left, right, "simd.xor")
+        } else if (operation == "min" || operation == "max") {
+            val intrinsic = if (floating) (if (operation == "min") "minimum" else "maximum")
+                else "${if (unsigned) "u" else "s"}$operation"
+            result = bootstrapLlvmSimdCall(backend, "llvm.$intrinsic.$suffix", vector, [left, right])
+        } else if ((operation == "addSat" || operation == "subSat") && !floating) {
+            val sign = if (unsigned) "u" else "s"
+            val direction = if (operation == "addSat") "add" else "sub"
+            result = bootstrapLlvmSimdCall(backend, "llvm.$sign$direction.sat.$suffix", vector, [left, right])
+        } else if (operation == "eq" || operation == "ne" || operation == "lt" ||
+                   operation == "le" || operation == "gt" || operation == "ge") {
+            result = bootstrapLlvmSimdCompare(backend, operation, type, left, right)
+        } else return false
+    } else return false
+    bootstrapLlvmSetNativeValue(backend, storage, instruction.result, result)
+    true
+}
+
+fun bootstrapLlvmConstVector(values: array<i64*>): i64* {
+    val vector = llvmPointerVector(values.size)
+    for (at in 0 until values.size) vector.set(at, values[at])
+    val result = LLVMConstVector(vector.pointer(), i32(values.size))
+    vector.drop()
+    result
+}

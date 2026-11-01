@@ -1,4 +1,6 @@
 import "ct_native_effects.ab"
+import "simd_types.ab"
+import "ir.ab"
 import "f32_literal.ab"
 import "module_paths.ab"
 import "subparser.ab"
@@ -1515,6 +1517,9 @@ fun bootstrapWhenNotNullCondition(expression: BootstrapExpression): BootstrapExp
     ])
 }
 
+// What `@target` names on the function sema is in.
+var bootstrapSimdCurrentFeatures = ""
+
 fun bootstrapRegionResultIsIndependent(type: string): bool {
     val normalized = bootstrapNormalizeType(type)
     normalized == "void" || normalized == "never" || normalized == "null" ||
@@ -1523,7 +1528,7 @@ fun bootstrapRegionResultIsIndependent(type: string): bool {
     normalized == "i32" || normalized == "i64" ||
     normalized == "u8" || normalized == "u16" ||
     normalized == "u32" || normalized == "u64" ||
-    normalized == "f32" || normalized == "f64"
+    normalized == "f32" || normalized == "f64" || bootstrapIsVectorType(normalized)
 }
 
 /** Whether a value of `type` read through a view (`view.name`, `view[i]`) is
@@ -4075,7 +4080,7 @@ fun bootstrapEffectPreciseType(map: BootstrapEffectTypeMap, type: string): bool 
     type == "string" || type == "int" || type == "bool" || type == "char" ||
         type == "i8" || type == "i16" || type == "i32" || type == "i64" ||
         type == "u8" || type == "u16" || type == "u32" || type == "u64" ||
-        type == "f32" || type == "f64" ||
+        type == "f32" || type == "f64" || bootstrapIsVectorType(type) ||
         (type.size > 6 && type.slice(0, 6) == "array<")
 }
 
@@ -6707,6 +6712,12 @@ fun bootstrapOperatorFunctionName(kind: string): string = when (kind) {
     "/" -> "div"
     "%" -> "rem"
     "unary-" -> "unaryMinus"
+    "&" -> "and"
+    "|" -> "or"
+    "^" -> "xor"
+    "unary~" -> "inv"
+    "<<" -> "shl"
+    ">>" -> "shr"
     else -> ""
 }
 
@@ -8728,6 +8739,63 @@ class BootstrapAnalyzer(
         val chosen = this.chooseOverload(expression, receiver, key, types, false)
         if (chosen == "") return "unknown"
         this.resolveOverload(expression, "member.call", receiver, chosen, expression.children)
+    }
+
+    /** `@target("aes,clmul")`: known features, on a function LLVM won't inline blindly. */
+    fun validateTargetAnnotation(declaration: BootstrapDeclaration, annotation: int): void {
+        val argument = if (annotation < declaration.annotationArguments.size) {
+            declaration.annotationArguments[annotation]
+        } else null
+        if (argument == null || argument.kind != "string" || argument.text == "") {
+            this.fail("simd.target-arguments:${declaration.name}")
+            return
+        }
+        for (feature in bootstrapSimdFeatureList(argument.text)) {
+            if (!bootstrapSimdFeatureKnown(feature)) {
+                this.fail("simd.target-feature:${declaration.name}: unknown feature `$feature`")
+            }
+        }
+        if (declaration.kind != "fun") this.fail("simd.target-function:${declaration.name}")
+        if (bootstrapDeclarationHasAnnotation(declaration, "inline")) {
+            this.fail("simd.target-inline:${declaration.name}: a @target function can't be @inline")
+        }
+    }
+
+    /** What only a compiler can check of abla/simd's calls: a shuffle's indices are
+     *  literals in range, and a target-specific operation is under its `@target`. */
+    fun validateSimdCall(expression: BootstrapExpression): void {
+        val name = expression.text
+        if (!bootstrapSimdIntrinsic(name) || !this.simdIntrinsicDeclared(name)) return
+        val shuffled = bootstrapSimdShuffleType(name)
+        if (shuffled != "") {
+            val count = bootstrapVectorLaneCount(shuffled)
+            for (at in 2 until expression.children.size) {
+                val index = expression.children[at]
+                val value = if (index.kind == "integer") bootstrapVectorDigits(index.text)
+                    else -1
+                if (index.kind != "integer" || (value == 0 && index.text != "0") || value >= 2 * count) {
+                    this.fail("simd.shuffle-index:$name: indices are literals from 0 to ${2 * count - 1}")
+                }
+            }
+        }
+        if (name == "clmul" && expression.children.size == 3) {
+            val selector = expression.children[2]
+            if (selector.kind != "integer") {
+                this.fail("simd.clmul-selector:the selector is a literal")
+            }
+        }
+        val feature = bootstrapSimdIntrinsicFeature(name)
+        if (feature != "" && !bootstrapSimdFeatureListHas(bootstrapSimdCurrentFeatures, feature)) {
+            this.fail("simd.target-required:`$name` needs a function marked @target(\"$feature\")")
+        }
+    }
+
+    /** Whether `name` is the standard library's intrinsic, not a program's function. */
+    fun simdIntrinsicDeclared(name: string): bool {
+        val found = this.functionDeclarations.find(name)
+        if (found < 0) return false
+        val declaration = this.declarations[found]
+        declaration.kind == "extern" && declaration.externalLibrary == "intrinsic"
     }
 
     /** An operator on operand types with an operator function: `a + b` calls
@@ -11520,6 +11588,10 @@ class BootstrapAnalyzer(
             result = "bool"
         }
         if (expression.kind == "unary~") {
+            if (this.overloads.keys.size > 0) {
+                val operated = this.inferOperatorCall(expression, [this.infer(expression.children[0])])
+                if (operated != "") return operated
+            }
             result = bootstrapInferComplement(this, expression, result)
         }
         if (expression.kind == "&&" || expression.kind == "||") {
@@ -11994,7 +12066,21 @@ class BootstrapAnalyzer(
             var inlineAnnotation = -1
             var noinlineAnnotation = -1
             var annotation = 0
+            if ((declaration.kind == "class" || declaration.kind == "type" ||
+                declaration.kind == "interface") && bootstrapIsVectorType(declaration.name)) {
+                this.fail("simd.type-name:${declaration.name} is a vector type")
+            }
             while (annotation < declaration.annotations.size) {
+                if (declaration.annotations[annotation] == "export" ||
+                    declaration.annotations[annotation] == "exportChecked") {
+                    var vectorSignature = bootstrapIsVectorType(bootstrapNormalizeType(declaration.resultType))
+                    for (parameter in declaration.parameterTypes) {
+                        if (bootstrapIsVectorType(bootstrapNormalizeType(parameter))) vectorSignature = true
+                    }
+                    if (vectorSignature) {
+                        this.fail("simd.export:${declaration.name}: a vector can't cross an export")
+                    }
+                }
                 if (declaration.annotations[annotation] == "naked") {
                     nakedAnnotation = annotation
                 }
@@ -12025,6 +12111,9 @@ class BootstrapAnalyzer(
                             "") {
                         this.fail("section.arguments:${declaration.name}")
                     }
+                }
+                if (declaration.annotations[annotation] == "target") {
+                    this.validateTargetAnnotation(declaration, annotation)
                 }
                 if (declaration.annotations[annotation] == "wasmImport") {
                     if (declaration.kind != "extern" ||
@@ -12191,6 +12280,7 @@ class BootstrapAnalyzer(
                 this.regionDepth = 0
                 this.regionScope = -1
                 if (declaration.isTrusted) this.trustedDepth = 1
+                bootstrapSimdCurrentFeatures = bootstrapDeclarationStringAnnotation(declaration, "target")
                 if (declaration.kind == "compile.fun") {
                     this.compileDepth = 1
                 } else this.compileDepth = 0
@@ -12371,6 +12461,7 @@ class BootstrapAnalyzer(
                 this.regionDepth = 0
                 this.regionScope = -1
                 if (method.isTrusted) this.trustedDepth = 1
+                bootstrapSimdCurrentFeatures = bootstrapDeclarationStringAnnotation(method, "target")
                 if (method.kind == "compile.fun") {
                     this.compileDepth = 1
                 } else this.compileDepth = 0
@@ -12520,6 +12611,9 @@ fun bootstrapInferStringTemplate(
         // A nominal scalar is written as the value it wraps.
         val partUnderlying = analyzer.scalarTypeUnderlying(inferredPart)
         val partType = if (partUnderlying != "") partUnderlying else inferredPart
+        if (bootstrapIsVectorType(partType)) {
+            analyzer.fail("simd.template:a vector has no text of its own: use .text()")
+        }
         // A float is written by abla/float/text's f64Text, the
         // shortest text that reads back as it (as JavaScript does).
         val float = partType == "f64" || partType == "f32"
@@ -13110,6 +13204,7 @@ fun bootstrapInferCall(
         analyzer.trustedDepth == 0) {
         analyzer.fail("native.trust:${expression.text}")
     }
+    if (!localCallable) analyzer.validateSimdCall(expression)
     if (!localCallable && bootstrapRuntimeInternalFunction(expression.text) &&
         !bootstrapRuntimeInternalCaller(analyzer.currentSourceIdentity)) {
         analyzer.fail("native.runtime-internal:${expression.text}")
@@ -15378,6 +15473,10 @@ fun bootstrapInferComparison(
     // A borrow compares as what it borrows (`borrowed != null`).
     var left = bootstrapBorrowElementType(analyzer.infer(expression.children[0]))
     var right = bootstrapBorrowElementType(analyzer.infer(expression.children[1]))
+    if (bootstrapIsVectorType(left) || bootstrapIsVectorType(right)) {
+        analyzer.fail("simd.equality:`${expression.kind}` on a vector has no one meaning: use .eq(), .lt() and so on, then .all() or .any()")
+        return "bool"
+    }
     if (analyzer.f32LiteralOperand(left, right, expression.children[1])) {
         right = analyzer.inferF32Operand(expression.children[1])
     } else if (analyzer.f32LiteralOperand(right, left, expression.children[0])) {

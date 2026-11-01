@@ -11,6 +11,8 @@ import "abla/unsafe/memory/raw"
 import "abla/unsafe/memory"
 import "abla/sys/linux/io"
 import "dispatch.ab"
+import "simd.ab"
+import "../../simd_types.ab"
 
 // The module initializer, or one of the pieces it calls in order (a large one's
 // globals are cut into pieces: BOOTSTRAP_IR_GLOBALS_CHUNK).
@@ -76,6 +78,9 @@ fun bootstrapLlvmDeclareXtensaInterruptEntry(
     LLVMSetSection(declared, ".iram1.text")
     declared
 }
+
+// Whether this program uses any vector: a Wasm module then has SIMD128 (docs/simd.md).
+var bootstrapLlvmProgramUsesSimd = false
 
 fun bootstrapLlvmDirectScalarType(type: string): string {
     bootstrapLlvmScalarType(type)
@@ -200,14 +205,14 @@ fun bootstrapLlvmDeclareDirectFunction(
         )
         parameters.append(
             if (scalar == "") backend.pointerType
-            else backend.type(scalar)
+            else bootstrapLlvmDirectType(backend, scalar)
         )
         parameter = parameter + 1
     }
     val declared = bootstrapLlvmDeclare(
         backend, bootstrapLlvmDirectFunctionSymbol(name),
         if (scalarResult == "") backend.voidType
-        else backend.type(scalarResult),
+        else bootstrapLlvmDirectType(backend, scalarResult),
         parameters, bootstrapLlvmDirectResultUsesOutput(function),
         bootstrapLlvmFalseFlags(parameters.size)
     )
@@ -239,6 +244,13 @@ fun bootstrapLlvmDeclareDirectFunction(
     if (!function.naked && mcuTarget) {
         bootstrapLlvmAddFunctionAttribute(backend, declared, "optsize")
         bootstrapLlvmAddFunctionAttribute(backend, declared, "minsize")
+    }
+    val simdFeatures = bootstrapLlvmSimdTargetFeatures(backend.targetTriple, function.targetFeatures)
+    if (simdFeatures != "") {
+        bootstrapLlvmAddStringFunctionAttribute(backend, declared, "target-features", simdFeatures)
+    }
+    if (bootstrapLlvmProgramUsesSimd && bootstrapTextContains(backend.targetTriple, "wasm32")) {
+        bootstrapLlvmAddStringFunctionAttribute(backend, declared, "target-features", "+simd128")
     }
     if (!function.naked && !function.noinlineHint &&
         (function.inlineHint || runtimeInline)) {
@@ -964,7 +976,8 @@ fun bootstrapLlvmInitializeParameters(
             )
         } else {
             bootstrapLlvmBoxScalar(
-                backend, storage.parameters[parameter], source, scalar
+                backend, storage.parameters[parameter],
+                bootstrapLlvmFromDirect(backend, source, scalar), scalar
             )
         }
         LLVMBuildBr(backend.builder, ready)
@@ -1225,6 +1238,7 @@ fun bootstrapLlvmUnboxScalar(
     scalar: string,
     name: string
 ): i64* {
+    if (bootstrapIsVectorType(scalar)) return bootstrapLlvmUnboxVector(backend, boxed, scalar, name)
     var result = bootstrapLlvmCallNamed(
         backend,
         if (scalar == "bool") "abla_as_bool" else "abla_as_i64",
@@ -1288,6 +1302,7 @@ fun bootstrapLlvmBoxScalar(
     native: i64*,
     scalar: string
 ): void {
+    if (bootstrapIsVectorType(scalar)) return bootstrapLlvmBoxVector(backend, destination, native, scalar)
     var stored = native
     if (scalar == "f64") stored = LLVMBuildBitCast(
         backend.builder, native, backend.i64Type, "scalar.f64.bits"
@@ -1547,12 +1562,12 @@ fun bootstrapLlvmDirectCallArguments(
                         "direct.argument.cast"
                     )
                 }
-                arguments.append(native)
+                arguments.append(bootstrapLlvmToDirect(backend, native, scalar))
             }
         } else {
             arguments.append(
                 if (scalar == "") LLVMConstNull(backend.pointerType)
-                else LLVMConstNull(backend.type(scalar))
+                else LLVMConstNull(bootstrapLlvmDirectType(backend, scalar))
             )
         }
         parameter = parameter + 1
@@ -1569,12 +1584,12 @@ fun bootstrapLlvmEmitDirectCall(
 ): i64* {
     val scalar = bootstrapLlvmDirectScalarType(function.resultType)
     val returnsVoid = bootstrapLlvmDirectResultIsVoid(function)
-    val result = bootstrapLlvmCall(
+    val result = bootstrapLlvmFromDirect(backend, bootstrapLlvmCall(
         backend, target, arguments,
         if (scalar == "") "" else "direct.scalar",
         scalar == "" && !returnsVoid,
         bootstrapLlvmFalseFlags(arguments.size)
-    )
+    ), scalar)
     if (scalar != "" && !pointerIsNull(output)) {
         bootstrapLlvmBoxScalar(backend, output, result, scalar)
     }
@@ -2454,6 +2469,7 @@ fun bootstrapLlvmSlotAccessor(name: string): bool =
         name == "ablaRuntimeLoadSlotU8" || name == "ablaRuntimeStoreSlotU8"
 
 fun bootstrapLlvmCoreIntrinsic(name: string): bool =
+    bootstrapSimdIntrinsic(name) ||
     name == "ablaCountLeadingZerosU32" ||
     name == "ablaRuntimeValueAddress" ||
     name == "ablaRuntimeValueWord0" ||
@@ -3367,6 +3383,9 @@ fun bootstrapLlvmEmitCoreIntrinsic(
     if (!supported) return supported
 
     val name = instruction.text
+    if (bootstrapSimdIntrinsic(name)) {
+        return bootstrapLlvmEmitSimdIntrinsic(backend, storage, instruction)
+    }
     if (name == "nativeInitializeGlobals") {
         if (instruction.operands.size != 0) supported = false
         if (instruction.operands.size == 0) {
@@ -7095,7 +7114,7 @@ fun bootstrapLlvmEmitFunctionReturn(
             }
         }
         bootstrapLlvmPopRoots(backend, storage, pushed)
-        LLVMBuildRet(backend.builder, native)
+        LLVMBuildRet(backend.builder, bootstrapLlvmToDirect(backend, native, scalar))
     } else {
         if (value >= 0) bootstrapLlvmCopyValue(
             backend, storage.values[value], output, "function.result"
@@ -7619,9 +7638,9 @@ fun bootstrapLlvmEmitFunction(
                             if (needsArgumentCount) 1 else 0
                         bootstrapLlvmSetNativeValue(
                             backend, storage, instruction.result,
-                            LLVMGetParam(
+                            bootstrapLlvmFromDirect(backend, LLVMGetParam(
                                 llvmFunction, i32(found + parameterBegin)
-                            )
+                            ), scalar)
                         )
                     } else bootstrapLlvmSetNativeValue(
                         backend, storage, instruction.result,
