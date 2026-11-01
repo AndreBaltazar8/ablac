@@ -174,11 +174,13 @@
 - [ ] **`make test` under 2 minutes after a compiler change too, and its tooling in Abla.** On 2026-11-01 at
   JOBS=30, starting at load 7.5 from other work: 154 s after a compiler change (about 3,850 CPU-seconds),
   115 to 119 s on a rerun with the same compiler (about 2,900; the suite's builds share the default cache, and
-  `tools/run-tests.sh` clears it when the compiler changes). The cold run is the one left: 30 cores give
-  128 s at best, so it needs less work per build. A script that sets a compile-affecting `ABLA_*`
+  `tools/run-tests.sh` clears it when the compiler changes). The cold run is the one left: this machine's
+  8 fast cores and the rest (30 threads) do about 23.5 CPU-seconds a second however they're scheduled
+  (JOBS=40, 48, 60: 158 to 162 s, on a quiet machine), so under 2 minutes needs about 2,800 CPU-seconds:
+  less work per build. Starting test-self-hosted.sh late so it reuses builds saved 190 CPU-seconds and no wall time. A script that sets a compile-affecting `ABLA_*`
   variable or uses compile grants keeps `--no-cache`: the cache key ignores those variables, so a hit
   would pass without testing that mode. Over a whole run: LLVM 45% (`opt` 18% of all CPU), the frontend
-  29%, libc 12%. Tried and dropped: glibc malloc tunables (no change); JOBS=40, 50, 60 (slower, noisy).
+  29%, libc 12%. Tried and dropped: glibc malloc tunables (no change); 
   Release builds' `opt`, `clang -flto` and LTO link stay: they are what those tests exercise. `tools/`
   is still 283 shell scripts; `tools/abla-test-driver` already runs `tests/abla-tests.json`, and
   `tools/run-tests.sh` and the scripts should move onto it.
