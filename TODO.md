@@ -38,6 +38,8 @@
       PEM key given by `webSocketServerTlsPem` asks for a passphrase on the terminal instead of
       failing. Found reading it 2026-10-31, not run. `abla/crypto/hosted` passes a passphrase string.
 
+- [ ] `tools/test-graceful-reload.sh` failed once under `make test` at JOBS=50 (load about 40, 31 s,
+      2026-11-01), and passed at JOBS=40, 60 and a second 50. Not looked into.
 - [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
       out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
 
@@ -111,12 +113,15 @@
 
 ## Toolchain and project
 
-- [ ] **`make test` under 2 minutes, and its tooling in Abla.** 165 s at JOBS=30 (2026-10-31, about
-  3,700 CPU-seconds, half of them in the compiler's own frontend across thousands of builds, so
-  30 cores give 125 s at best: more needs less work per build, not more parallelism). What's left:
-  `test-self-hosted.sh` runs alone (about 35 s) because it reruns suite scripts in their build
-  directories. `tools/` is still 283 shell scripts; `tools/abla-test-driver` already runs
-  `tests/abla-tests.json`, and `tools/run-tests.sh` and the scripts should move onto it.
+- [ ] **`make test` under 2 minutes, and its tooling in Abla.** About 150 s at JOBS=30 (2026-11-01),
+  about 3,700 CPU-seconds, so 30 cores give 123 s at best: more needs less work per build. Measured
+  over a whole run: LLVM 45% (`opt` 18% of all CPU), the frontend 29% with no hot spot (top function
+  1.4%), libc 12%. Most likely win: not redoing the frontend and LLVM for the same stdlib and runtime
+  in every build. Tried and dropped: glibc malloc tunables (no change, 4 programs); JOBS=40, 50, 60
+  (187, 178 to 262, 212 s, with other work on the machine, and a flake at 50). Release builds' `opt`,
+  `clang -flto` and LTO link stay: they are what those tests exercise. `tools/` is still 283 shell
+  scripts; `tools/abla-test-driver` already runs `tests/abla-tests.json`, and `tools/run-tests.sh`
+  and the scripts should move onto it.
 - [ ] **Nothing runs the tests on a push.** `.github/workflows/release.yml` is the only workflow,
   and it starts by hand. Run `make test` and the fixed point on pushes to master.
 - [ ] **No formatter and no language server.** `ablac` has `analyze` and the analysis service to
