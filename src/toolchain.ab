@@ -3169,6 +3169,47 @@ fun bootstrapServe(sourcePath: string): int {
     )
 }
 
+// What the build read of each module, not what is there now: an edit made during
+// the build then counts as a change.
+fun bootstrapServeWatch(modules: array<Path>, state: BootstrapModuleState): FileWatch {
+    val revisions: array<int> = []
+    for (module in modules) {
+        val known = state.snapshotIndex.get(module.text)
+        revisions.append(if (known == null) module.revision() else state.snapshots[known].revision)
+    }
+    FileWatch(modules, revisions)
+}
+
+// A generation's executable and the files its build left beside it.
+fun bootstrapServeRemoveGeneration(process: int, generation: int): void {
+    val name = ".abla-serve-$process-$generation"
+    for (entry in Path("build").entries()) {
+        val file = entry.name()
+        if (file == name || file.startsWith("$name.")) entry.remove()
+    }
+    return
+}
+
+// What a `serve` that was killed left: it has no chance to, and a process that is
+// gone won't need it.
+fun bootstrapServeRemoveAbandoned(): void {
+    val prefix = ".abla-serve-"
+    for (entry in Path("build").entries()) {
+        val file = entry.name()
+        if (file.startsWith(prefix)) {
+            var end = prefix.size
+            var process = 0
+            while (end < file.size && file[end] >= 48 && file[end] <= 57) {
+                process = process * 10 + file[end] - 48
+                end = end + 1
+            }
+            // kill(process, 0): ESRCH, no such process.
+            if (end > prefix.size && linuxSyscall2(62, process, 0) == -3) entry.remove()
+        }
+    }
+    return
+}
+
 fun bootstrapServeWithEmitter(
     sourcePath: string,
     emitObject: (string, string) -> int,
@@ -3177,6 +3218,7 @@ fun bootstrapServeWithEmitter(
     var child = LinuxChildProcess(-1)
     var generation = 0
     var started = 0
+    bootstrapServeRemoveAbandoned()
     var watcher = watchFile(Path(sourcePath))
     val moduleState = bootstrapModuleState()
     val irCache = bootstrapIrCacheState()
@@ -3205,12 +3247,12 @@ fun bootstrapServeWithEmitter(
                 )
                 accepted = false
             }
-            watcher = watchFiles(build.modules)
+            watcher = bootstrapServeWatch(build.modules, moduleState)
             generation = generation + 1
             if (accepted) {
                 if (child.process >= 0) {
                     child.stop()
-                    Path("build/.abla-serve-${linuxProcessId()}-$started").remove()
+                    bootstrapServeRemoveGeneration(linuxProcessId(), started)
                 }
                 child = linuxCommand(outputPath).start()
                 started = generation - 1

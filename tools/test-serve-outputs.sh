@@ -57,4 +57,46 @@ if grep -q 'two' "$test_directory/one/stdout.txt" || grep -q 'one' "$test_direct
     echo "serve outputs: one ran the other's build" >&2
     exit 1
 fi
+# A killed one's files go when the next starts, and no one else's.
+# (By session: the launcher's `timeout` puts the compiler in a group of its own.)
+pkill -KILL -s "${servers[1]}"
+wait "${servers[1]}" 2>/dev/null || true
+servers=("${servers[0]}")
+mkdir "$test_directory/three"
+printf 'import "abla/io"\nfun main { println("three-a") }\n' > "$test_directory/three/app.ab"
+"${new_session[@]}" env ABLA_SYSROOT="$project_root" ABLA_CACHE_DIR="$project_root/build/.abla-cache" ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=150 \
+    "$compiler" serve "$test_directory/three/app.ab" \
+    > "$test_directory/three/stdout.txt" 2> "$test_directory/three/stderr.txt" &
+servers+=($!)
+wait_for "$test_directory/three/stdout.txt" 'three-a'
+[[ $(outputs | wc -l) -eq 2 ]] ||
+    { echo "serve outputs: a killed serve's build stayed" >&2; outputs >&2; exit 1; }
+
+# An edit made during a build isn't lost: this one's build takes seconds, at compile
+# time, and the edit comes in the middle of it.
+mkdir "$test_directory/slow"
+cat > "$test_directory/slow/app.ab" <<'AB'
+import "abla/io"
+compile fun spin(): int {
+    var total = 0
+    var step = 0
+    while (step < 40000000) {
+        total = total + step
+        step = step + 1
+    }
+    total
+}
+val spun = #spin()
+fun main { println("slow-a $spun") }
+AB
+"${new_session[@]}" env ABLA_SYSROOT="$project_root" ABLA_CACHE_DIR="$project_root/build/.abla-cache" ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=150 \
+    "$compiler" serve "$test_directory/slow/app.ab" \
+    > "$test_directory/slow/stdout.txt" 2> "$test_directory/slow/stderr.txt" &
+servers+=($!)
+sleep 1
+if grep -q 'reloaded generation 1' "$test_directory/slow/stderr.txt"; then
+    echo 'serve outputs: the build was over before the edit; the check says nothing' >&2
+fi
+printf 'import "abla/io"\nfun main { println("slow-b") }\n' > "$test_directory/slow/app.ab"
+wait_for "$test_directory/slow/stdout.txt" 'slow-b'
 echo 'serve outputs: each serve runs its own build'

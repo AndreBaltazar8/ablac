@@ -48,7 +48,7 @@ wait_for_log() {
 mkdir "$test_directory/build"
 cd "$test_directory"
 export ABLA_CACHE_DIR="$project_root/build/.abla-cache"
-"${new_session[@]}" env ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=15 \
+"${new_session[@]}" env ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=150 \
     "$compiler" serve "$test_directory/app.ab" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
 server=$!
