@@ -1,19 +1,26 @@
-{ pkgs ? import (builtins.fetchTarball {
-    name = "nixpkgs-6510408d147d8c5e6d76043e899e9251756f6a75";
-    url = "https://github.com/NixOS/nixpkgs/archive/6510408d147d8c5e6d76043e899e9251756f6a75.tar.gz";
-    sha256 = "012w2z2w4k0c3kg9hcy9cpd7qgxgrpxvf0735vy014r7x9qhmbjw";
-  }) {}
+{ pkgs ? import ./nix/nixpkgs.nix
   # LLVM with the experimental Xtensa backend for ESP32 work (abla-embedded).
-  # Off on CI (GitHub sets CI=true): host artifacts do not need it, and every
-  # nested nix-shell would otherwise build LLVM from source. Override with
-  # ABLA_NIX_XTENSA=1/0 or --arg xtensa true/false.
+  # x86_64 Linux takes the prebuilt one (nix/llvm-prebuilt.nix); elsewhere it is
+  # built from source, so CI (GitHub sets CI=true) leaves it off there. Override
+  # with ABLA_NIX_XTENSA=1/0 or --arg xtensa true/false.
 , xtensa ? (let forced = builtins.getEnv "ABLA_NIX_XTENSA"; in
-    if forced != "" then forced == "1" else builtins.getEnv "CI" == "") }:
+    if forced != "" then forced == "1"
+    else builtins.getEnv "CI" == "" || pkgs.stdenv.hostPlatform.system == "x86_64-linux")
+  # Build LLVM from nix/llvm.nix and its patches: ABLA_NIX_LLVM_SOURCE=1 or
+  # --arg llvmFromSource true. A change to those patches does this by itself
+  # until a new release is pinned, and is an error on CI.
+, llvmFromSource ? builtins.getEnv "ABLA_NIX_LLVM_SOURCE" == "1" }:
 
 let
   toolchain = import ./nix/llvm.nix { inherit pkgs; };
   llvm = toolchain.llvmPackages;
-  llvmTools = if xtensa then toolchain.llvm else llvm.llvm;
+  prebuilt = import ./nix/llvm-prebuilt.nix { inherit pkgs; };
+  prebuiltUsable = pkgs.stdenv.hostPlatform.system == "x86_64-linux" && !llvmFromSource &&
+    (prebuilt.matchesPatches || (if builtins.getEnv "CI" == "" then false else throw
+      "nix/llvm-xtensa-*.patch differ from the pinned LLVM: release a new one (docs/llvm-xtensa.md)"));
+  llvmTools = if !xtensa then llvm.llvm
+    else if prebuiltUsable then prebuilt.llvm
+    else toolchain.llvm;
 in
 pkgs.mkShell {
   packages = with pkgs; [

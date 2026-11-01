@@ -84,7 +84,8 @@ contract to Darwin libc, socket, and kqueue APIs. It contains no Abla value,
 allocation, evaluator, or compiler implementation.
 
 LLVM, Clang, and the platform linker remain native toolchain dependencies.
-Linux pins them through Nix; macOS uses Homebrew LLVM and the system
+Linux pins them through Nix, with [a prebuilt LLVM for Xtensa](llvm-xtensa.md);
+macOS uses Homebrew LLVM and the system
 Mach-O linker. Removing those hosted dependencies is a separate freestanding goal described in
 [full-self-hosting.md](full-self-hosting.md).
 

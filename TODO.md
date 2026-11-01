@@ -17,6 +17,11 @@
 
 ## Bugs seen
 
+- [ ] **`shell.nix`'s `LD_LIBRARY_PATH` breaks a host's own Nix tools.** In the `nixos/nix:2.31.2`
+  image `/usr/bin/env` is linked against glibc 2.40; inside the shell it then loads libraries
+  from the shell's 2.44 and dies on `GLIBC_ABI_DT_X86_64_PLT`, so a `#!/usr/bin/env` script
+  doesn't start (2026-11-01). GitHub's Ubuntu `curl` has the same failure (see the release
+  notes). The path is there for OpenSSL at run time; a binary's runpath would do it.
 - [ ] A method on a lambda result whose return type is inferred picks the first overload of that
       name instead of failing or finding the right one: with `val add = { x: u32x4 -> x + a }`,
       `add(b).text()` prints `add(b)` as a `u8x16` (the same family as the lambda entry below; a
@@ -161,6 +166,11 @@
 
 ## Toolchain and project
 
+- [ ] **Released toolchains can't target Xtensa.** CI's Nix shell has the patched LLVM
+  ([llvm-xtensa.md](docs/llvm-xtensa.md)), but `abla-toolchain-x86_64-linux` bundles
+  apt.llvm.org's LLVM from an Ubuntu 22.04 image and the macOS jobs use Homebrew's, neither
+  with Xtensa. The Nix-built one needs Nix's glibc 2.44, so Linux would need a build against an
+  old glibc, and macOS one built on a Mac of each architecture.
 - [ ] **`make test` under 2 minutes, and its tooling in Abla.** On 2026-11-01 at JOBS=30, with other
   work on the machine: 170 s or more after a compiler change (about 3,800 CPU-seconds), 125 s on a
   rerun with the same compiler, starting at load 7.5 (about 3,150; the suite's builds share the default cache, and
