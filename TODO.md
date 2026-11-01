@@ -17,6 +17,15 @@
 
 ## Bugs seen
 
+- [ ] **Threaded native programs die with SIGILL when the stack limit doesn't fit their memory limit.** Seen
+  2026-11-01 running `make test-full` under `ulimit -s 131072`: `tools/test-self-hosted.sh` fails
+  native-linux-net, native-websocket-live, native-concurrency and native-network-advanced with
+  `expected 42, got 132`. By hand, `tests/cases/modules/concurrency.ab` under
+  `ABLA_MAX_MEMORY_MB=128 tools/run-limited.sh` gives 132 at `-s 131072` and 42 at `-s 8192`, and 42 at
+  `-s 131072` with 4096 MB; v0.2.28 does the same. Probably each thread's default stack follows
+  RLIMIT_STACK, so one thread's 128 MiB doesn't fit the address-space limit (inferred from those runs, not
+  traced). The suite passes at the default limit. If thread creation is what fails, it should say so
+  instead of trapping.
 - [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
   while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
