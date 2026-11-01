@@ -54,10 +54,6 @@ serial_reason() { # command
             # (test-nominal-scalars, test-unsafe-stack-memory, ...) in the
             # same build directories, and runs eight tests at a time itself.
             echo "reruns suite scripts in their build directories; parallel itself" ;;
-        *tools/test-tls-faults.sh*)
-            echo "its mask stage overruns its time limit on a loaded machine" ;;
-        *tools/test-compile-time-parity.sh*)
-            echo "builds PARITY_JOBS cases at a time itself" ;;
     esac
 }
 

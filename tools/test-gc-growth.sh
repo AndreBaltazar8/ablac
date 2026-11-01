@@ -25,6 +25,22 @@ ignored=$(ABLA_GC_GROWTH=2mb "$program")
 [[ $ignored == "$expected small false" ]] || fail "ABLA_GC_GROWTH=2mb is not bytes, yet: '$ignored'"
 tiny=$(ABLA_GC_GROWTH=4096 "$program")
 [[ $tiny == "$expected small false" ]] || fail "ABLA_GC_GROWTH=4096 is under 1 MiB, yet: '$tiny'"
-stressed=$(ABLA_GC_STRESS=1 ABLA_GC_GROWTH=2097152 "$program")
-[[ $stressed == "$expected small true" ]] || fail "under ABLA_GC_STRESS=1: '$stressed'"
+# Every round collects under stress, about two minutes in one process: the same
+# rounds, shared out among processes. Their totals add up to the whole run's.
+shards=10
+pids=()
+for ((shard = 0; shard < shards; shard++)); do
+    ABLA_GC_STRESS=1 ABLA_GC_GROWTH=2097152 "$program" \
+        $((shard * 100000)) $(((shard + 1) * 100000)) > "$output_directory/stress-$shard.out" &
+    pids+=("$!")
+done
+for pid in "${pids[@]}"; do wait "$pid" || fail "under ABLA_GC_STRESS=1: a process failed"; done
+stressed_total=0
+for ((shard = 0; shard < shards; shard++)); do
+    read -r _ total _ kept _ small < "$output_directory/stress-$shard.out"
+    [[ $kept == 7890 && $small == true ]] ||
+        fail "under ABLA_GC_STRESS=1, shard $shard: $(<"$output_directory/stress-$shard.out")"
+    stressed_total=$((stressed_total + total))
+done
+[[ $stressed_total == 48778890 ]] || fail "under ABLA_GC_STRESS=1: total $stressed_total"
 echo 'gc growth: ABLA_GC_GROWTH sets the step between collections; other values are ignored'
