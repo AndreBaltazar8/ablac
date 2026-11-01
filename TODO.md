@@ -22,60 +22,29 @@
   2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
   imu-offsets` and `wifi-connect`. `llvm-xtensa-scavenging-slot.patch` reserves the slot past 255 bytes, but
   `LEA_ADD`'s `ADDI` reaches only 127 (`isValidAddrOffsetForOpcode`). `!isInt<8>(MaxSPOffset)` fixes it:
-  checked with an Xtensa-only `llc` from the fork plus that one line, and both examples then compile. It's on
-  branch `llvm-xtensa-lea-scavenging`, not master: a changed patch sends every local shell to the over-an-hour
-  source build until a new `llvm-23.1.3-xtensa-<n>` release is published and pinned (docs/llvm-xtensa.md), and
-  that release is the owner's call.
-- [ ] **`--emit-llvm` and `ablac run` lower every declaration, so big import graphs cost twice the memory.**
-  Measured 2026-11-01 on abla-embedded's `tests/package-import.ab` (788 modules, 27,097 declarations): `build`
-  demands 3,075 declarations and peaks at 3.2 GB, `--emit-llvm` lowers 13,187 functions and peaks at 5.2 GB, past
-  the launcher's 4,096 MB (`ABLA_COMPILER_MEMORY_TRACE=1`). Both spend 1.0 GB live by the end of parsing:
-  `parse.normalize` alone grows 270 MB to 990 MB. Pruning in `bootstrapCompileLlvmParsed` brought it to 2.85 GB,
-  but `--emit-llvm` checking every body is a tested contract (`test-borrow-lifetimes.sh`, `test-unsafe-mmio.sh`,
-  `test-emitted-value-runtime.sh`), so it stays. `run` could prune with no such contract; it shares that function.
-- [ ] **`shell.nix`'s `LD_LIBRARY_PATH` breaks a host's own Nix tools.** In the `nixos/nix:2.31.2`
-  image `/usr/bin/env` is linked against glibc 2.40; inside the shell it then loads libraries
-  from the shell's 2.44 and dies on `GLIBC_ABI_DT_X86_64_PLT`, so a `#!/usr/bin/env` script
-  doesn't start (2026-11-01). GitHub's Ubuntu `curl` has the same failure (see the release
-  notes). The path is there for OpenSSL at run time; a binary's runpath would do it.
-- [ ] A method on a lambda result whose return type is inferred picks the first overload of that
-      name instead of failing or finding the right one: with `val add = { x: u32x4 -> x + a }`,
-      `add(b).text()` prints `add(b)` as a `u8x16` (the same family as the lambda entry below; a
-      declared `val add: (u32x4) -> u32x4` is right). Seen 2026-10-31 on the simd branch.
-- [ ] `val given = source(count)` with `source` a global `var` of declared type `(int) -> string`
-      fails to build at `given.size`: `E_LLVM_INSTRUCTION_UNSUPPORTED ... field.get target size` (the
-      same as the lambda entry below, on a declared function type). `val given: string =` avoids it.
-      Seen 2026-11-01 in abla/crypto/rsa.
-- [ ] `@inline operator fun` used to be a parse error (fixed with abla/simd), but an annotation
-      after `operator` still is: `operator @inline fun` gives `E_PARSE_*`. Seen 2026-10-31.
-- [ ] `E_NAMED_ARGUMENT_HIDDEN` also rejects a caller whose local of that name isn't a function,
-      which would be fine: a generic function's or method's omitted default calling a global
-      function value, constructor or foreign function, with `val double = 40` in the caller and
-      `f(a = 1)`. Normalization runs before types are known. Passing the argument or renaming the
-      local avoids it; it is never a wrong call (seen 2026-10-31).
-
-- [ ] A lambda whose return type is inferred from a call gives `any`-like results that `+` doesn't
-      type: with `val read = { name: string -> linuxReadFile(name) }`, `read("x") + "y"` traps at
-      run time in `abla_add` (`__ablaRuntimeRequire`, Illegal instruction), and
-      `(read("x") + "y").size` fails to build with `E_LLVM_INSTRUCTION_UNSUPPORTED`: `cannot lower
-      result ... field.get target size`. A named function avoids it (seen 2026-10-31).
-- [ ] `webSocketServerTlsUsePemKey` passes OpenSSL a null callback and null data, so an encrypted
-      PEM key given by `webSocketServerTlsPem` asks for a passphrase on the terminal instead of
-      failing. Found reading it 2026-10-31, not run. `abla/crypto/hosted` passes a passphrase string.
-
-- [ ] `tools/test-graceful-reload.sh` failed once under `make test` at JOBS=50 (load about 40, 31 s,
-      2026-11-01), and passed at JOBS=40, 60 and a second 50. Not looked into.
-- [ ] `tools/test-dns-async.sh` failed once under `make test` at load about 60, from other work on the
-      machine: "no records" with a 600 ms resolver timeout against a forked mock (2026-11-01). Its
-      timing checks (600 ms, NXDOMAIN under 400 ms) are tight on a loaded machine.
+  checked with an Xtensa-only `llc` from the fork plus that one line, and both examples then compile. Branch
+  `llvm-xtensa-lea-scavenging` has it, pinned to the published `llvm-23.1.3-xtensa-2` (2026-11-01): both examples build with it
+  and its `llc` output matches the patches' source build. It's held back from master with `mcu-gc-inline`, until the PaperMono
+  hardware test; merging it is what closes this.
 - [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
-- [ ] `native-websocket-server-protocol` (`tools/test-self-hosted.sh`) failed once under `make test`:
-      "step 2 expected 42, got 1" (2026-11-01). Its checks include a 400 ms idle timeout. Not looked into.
-- [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
-      out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
+- [ ] `--emit-llvm` of abla-embedded's `tests/package-import.ab` fails on master and with these fixes: 71 semantic errors on its
+      main (`call.target:esp32RecoveredSntpInit`, `integer.narrowing:...`, `region.noescape-effect:nvs_flash_init`), and on
+      `abla-embedded-fixes` (22b335b) `cpuCoreId` `cannot lower result extern.intrinsic target nativeXtensaCoreId`, as the host
+      target has no such thing. It's what its `tools/check-source` runs. Lowering only what's reached took that run from 5.0 GB and
+      172 s to 2.8 GB and 78 s (2026-11-01), still over the launcher's 4,096 MB for no other reason than `ABLA_MAX_MEMORY_MB`.
+- [ ] A call of a local that isn't a function builds and traps: `val double = 40; double(1)`, with a global function value
+      `double`, is Illegal instruction at run time (2026-11-01). It should reach the global, or fail to build.
+- [ ] `ablac serve` takes its file snapshots after the build (`watchFiles(build.modules)`), so an edit made during a build isn't
+      seen until the next one. Read in `bootstrapServeWithEmitter`, 2026-11-01, not run.
+- [ ] A killed `ablac serve` leaves its last build, and every generation's `.o.part.*`, in `build/` (`.abla-serve-<pid>-<n>*`).
+      Only a replaced generation's executable is removed (2026-11-01).
+- [ ] After a SIGSTOP and SIGCONT during a TLS read with a timeout, `tests/cases/tls-faults/timeouts` gets "default limit: no
+      reply" from `tlsConnectWithCa(...)`'s read (2026-11-01, stopping the process group in bursts). Likely EINTR from `recv` with
+      `SO_RCVTIMEO` taken as the end of the read; not looked into.
+- [ ] `tools/test-hot-reload.sh` gives `serve` `ABLA_MAX_SECONDS=15`, the tightest of the serve tests. It hasn't failed so far.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
       `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
 - [ ] `ablac.bin` run without `ABLA_SYSROOT` from outside the repository finds no runtime and doesn't say
@@ -85,8 +54,6 @@
       installed `ablac`: their `llc` shim for `-relocation-model=static` goes first on `PATH`, and the
       install's wrapper puts its own LLVM ahead of it, so llc aborts on PIC. They pass with the
       wrapper's payload, `libexec/ablac.bin`. `test-f32.sh` has the same shim; not run this way.
-
-- 4 GiB for one import of `src/esp32.ab` (abla-embedded's `tests/package-import.ab`, `--emit-llvm`) belongs under "Compile time and memory".
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
@@ -98,10 +65,6 @@
 - [ ] Missing and written by hand in every tool: parsing an int from text (`abla-postgres` `pgInt`, `abla-s3` `s3ParseInt`,
       `oneParseInt`, NovaKind's `toolInteger`), `array<string>.join`, `array.removeLast`, a UUID, multi-line string literals (`"""`
       doesn't parse), `Path.home`, a `createDirectories` with a mode (`Path.writeText` is always 0666 less umask).
-- [ ] A program that links OpenSSL won't start without `LD_LIBRARY_PATH` from the nix shell (`libssl.so.3 => not found`), even if
-      it never makes a TLS connection: `abla-s3` always pulls it in, also with `S3_USE_TLS=false`. And that `LD_LIBRARY_PATH` breaks the
-      host's coreutils for what it starts (`env`, `pwd`: `GLIBC_ABI_DT_X86_64_PLT`). NovaKind needs two programs because of it. A
-      lazy load of libssl, or an rpath at build, would remove both.
 - [ ] `abla/crypto/hosted` can use an RSA key but not generate one, so a throwaway test key still calls `openssl genrsa`.
 - [ ] There is no YAML library: NovaKind's `provision-mail` edits `~/.config/icy/mail.yaml` by its lines and refuses anything else
       under `accounts:`.
