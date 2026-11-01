@@ -160,14 +160,16 @@ A signal doesn't interrupt anything here: `watchSignals` blocks those named, and
 looks, so cleaning up is ordinary code. Children started meanwhile get signals as usual.
 
 ```abla
+import "abla/fs"
 import "abla/process"
 
 fun main: int {
+    val file = Path("/tmp/abla-signal-example")
     val watch = watchSignals([signalInterrupt, signalTerminate])
-    editForAMoment()
+    file.writeText("edited for a moment")
     // The command's status, or 128 + the signal, once the command has been stopped.
-    val status = command("gradle").argument("assemble").runWatching(watch)
-    putItBack()
+    val status = command("true").runWatching(watch)
+    file.remove()
     watch.close()
     status
 }
