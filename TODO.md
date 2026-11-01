@@ -189,10 +189,11 @@
   `--no-cache`: a hit would pass without running it. Building the compiler itself: 67 s to about 54 s wall and
   153 to about 108 CPU-seconds on 2026-11-01, by doing only inlining and globalopt before the split;
   most of the rest is the frontend (about 10 s) and that step, both on one core.
-  Removing unreachable `abla_fn_` functions from the IR before opt (hello world: 374 to 91, release
-  builds 12 to 26% less CPU, smaller binaries) was tried and dropped on 2026-11-01: json-readers ran 41%
-  slower (1.27 to 1.79 s, repeated on a quiet machine), as it changes what LLVM inlines. Its first version also
-  failed builds with status 131 (test-private, test-ct-bridge). Understanding why could get the saving back.
+  Removing unreachable `abla_fn_` functions before opt (local branch `prune-dead-functions`; hello world
+  374 to 91) was tried on 2026-11-01 and not landed: release builds of small and mid-sized programs 6 to 19%
+  less CPU, but no gain building the compiler (about 120 CPU-seconds either way; it comes out 7% smaller
+  and its frontend 5% faster), and json-readers' readInteger 54% slower (16.6 to 25.6 ns), as LLVM inlines
+  differently. Removing them after the inlining step keeps run times and saves nothing.
   By script on 2026-11-01 (CPU-seconds, about 4,000 in all with the crypto and SIMD tests): self-hosted
   480, doc-examples 310, ct-bridge 240, gc-growth 214, parity probes 185. Don't build gc-growth's stress
   run optimized: it runs 23x faster because collections move, so it would prove less. The frontend's
