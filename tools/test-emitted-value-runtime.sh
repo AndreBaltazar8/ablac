@@ -30,7 +30,7 @@ for executable in nested-string string-runtime value-runtime; do
 done
 
 "$compiler" --emit-llvm \
-    "$project_root/tests/cases/modules/vm.ab" \
+    "$project_root/tests/cases/bootstrap/emitted-value-runtime.ab" \
     > "$output_directory/runtime.ll"
 
 # The value runtime is Abla compiled into each module: every function of it
