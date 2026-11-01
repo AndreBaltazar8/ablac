@@ -7,43 +7,29 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 output_directory="$project_root/build/json-limits"
 mkdir -p "$output_directory"
 
-"$compiler" build "$project_root/tests/cases/modules/json-large-limits.ab" \
-    -o "$output_directory/program" --no-cache
-set +e
-"$output_directory/program"
-status=$?
-set -e
-[[ $status -eq 42 ]] || exit 1
+cd "$project_root"
+# Builds and runs one case; every case has its own files, so they run at once.
+check() { # label, mode (or ""), source, flags
+    local label=$1 mode=$2 source=$3 flags=$4 status=0
+    ABLA_COMPILE_EVAL=${mode:-${ABLA_COMPILE_EVAL:-}} "$compiler" build "$source" \
+        -o "$output_directory/$label" $flags --no-cache || { echo "json limits: $label did not build"; return 1; }
+    "$output_directory/$label" > /dev/null || status=$?
+    [[ $status -eq 42 ]] || { echo "json limits: $label exited $status"; return 1; }
+}
 
-# jsonPermissiveLimits: JSON.parse's limits and duplicate keys, run time and `#`.
+pids=()
+check program "" tests/cases/modules/json-large-limits.ab "" &
+pids+=("$!")
 for mode in interp jit; do
-    ABLA_COMPILE_EVAL=$mode "$compiler" build "$project_root/tests/cases/modules/json-permissive.ab" \
-        -o "$output_directory/permissive-$mode" --no-cache
-    set +e
-    "$output_directory/permissive-$mode"
-    status=$?
-    set -e
-    [[ $status -eq 42 ]] || { echo "json limits: permissive ($mode) exited $status"; exit 1; }
+    # jsonPermissiveLimits: JSON.parse's limits and duplicate keys, run time and `#`.
+    check "permissive-$mode" "$mode" tests/cases/modules/json-permissive.ab "" &
+    pids+=("$!")
+    # Get and has through a key index, and JSON at compile time: a parse needs only
+    # the grant reading its file, and lookups in a large object stay in the step limit.
+    check "key-index-$mode" "$mode" tests/cases/modules/json-key-index.ab --fast &
+    pids+=("$!")
+    check "compile-time-$mode" "$mode" tests/cases/json-compile-time/main.ab --fast &
+    pids+=("$!")
 done
-# Get and has through a key index, and JSON at compile time: a parse needs only
-# the grant reading its file, and lookups in a large object stay in the step limit.
-for mode in interp jit; do
-    ABLA_COMPILE_EVAL=$mode "$compiler" build "$project_root/tests/cases/modules/json-key-index.ab" \
-        -o "$output_directory/key-index-$mode" --fast --no-cache
-    set +e
-    "$output_directory/key-index-$mode"
-    status=$?
-    set -e
-    [[ $status -eq 42 ]] || { echo "json limits: key index ($mode) exited $status"; exit 1; }
-    (
-        cd "$project_root"
-        ABLA_COMPILE_EVAL=$mode "$compiler" build tests/cases/json-compile-time/main.ab \
-            -o "$output_directory/compile-time-$mode" --fast --no-cache
-    )
-    set +e
-    "$output_directory/compile-time-$mode" > /dev/null
-    status=$?
-    set -e
-    [[ $status -eq 42 ]] || { echo "json limits: compile time ($mode) exited $status"; exit 1; }
-done
+for pid in "${pids[@]}"; do wait "$pid"; done
 echo "json limits: per call, above the defaults, depth bounded, the permissive preset (JSON.parse's limits and duplicate keys)"

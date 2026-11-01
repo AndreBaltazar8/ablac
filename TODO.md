@@ -162,8 +162,8 @@
 ## Toolchain and project
 
 - [ ] **`make test` under 2 minutes, and its tooling in Abla.** On 2026-11-01 at JOBS=30, with other
-  work on the machine: 170 s or more after a compiler change (about 4,000 CPU-seconds), 121 s on a
-  rerun with the same compiler (about 3,000; the suite's builds share the default cache, and
+  work on the machine: 170 s or more after a compiler change (about 3,800 CPU-seconds), 125 s on a
+  rerun with the same compiler, starting at load 7.5 (about 3,150; the suite's builds share the default cache, and
   `tools/run-tests.sh` clears it when the compiler changes). The cold run is the one left: 30 cores give
   133 s at best, so it needs less work per build. A script that sets a compile-affecting `ABLA_*`
   variable or uses compile grants keeps `--no-cache`: the cache key ignores those variables, so a hit
@@ -173,8 +173,8 @@
   is still 283 shell scripts; `tools/abla-test-driver` already runs `tests/abla-tests.json`, and
   `tools/run-tests.sh` and the scripts should move onto it.
   A script that changes what a build runs (a shim or wrapper on `PATH`, an empty `PATH`) also keeps
-  `--no-cache`: a hit would pass without running it. Building the compiler itself: 67 s to 55 s wall and
-  153 to 108 CPU-seconds on 2026-11-01, by doing only inlining and global propagation before the split;
+  `--no-cache`: a hit would pass without running it. Building the compiler itself: 67 s to about 54 s wall and
+  153 to about 108 CPU-seconds on 2026-11-01, by doing only inlining and globalopt before the split;
   most of the rest is the frontend (about 10 s) and that step, both on one core.
   By script on 2026-11-01 (CPU-seconds, about 4,000 in all with the crypto and SIMD tests): self-hosted
   480, doc-examples 310, ct-bridge 240, gc-growth 214, parity probes 185. Don't build gc-growth's stress

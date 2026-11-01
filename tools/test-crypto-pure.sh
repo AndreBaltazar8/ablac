@@ -22,9 +22,16 @@ fail() { echo "FAIL $*"; status=1; }
 hex() { od -An -vtx1 "$1" | tr -d ' \n'; }
 random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
-for program in vectors edge tool against-hosted kat-native; do
+# (At once: each writes only its own files.)
+pids=()
+programs=(vectors edge tool against-hosted kat-native)
+for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
-        > "$out/$program.build.log" 2>&1 || { cat "$out/$program.build.log"; exit 2; }
+        > "$out/$program.build.log" 2>&1 &
+    pids+=("$!")
+done
+for index in "${!programs[@]}"; do
+    wait "${pids[$index]}" || { cat "$out/${programs[$index]}.build.log"; exit 2; }
 done
 tool=$out/tool
 
