@@ -10,6 +10,7 @@
 | `abla/process/environment` | environment variables |
 | `abla/process/command` | running child processes |
 | `abla/process/exit` | `exit` and `panic` |
+| `abla/process/signal` | handling a signal: cleaning up on Ctrl-C or TERM (Linux) |
 | `abla/process/time` | clocks and `sleep` |
 | `abla/process/supervisor` | supervised child processes with logs and process-tree termination |
 | `abla/process/metrics` | CPU time, memory, open descriptors, start time and heap of the running process |
@@ -149,6 +150,31 @@ fun main {
 
 `ablac run file.ab -- a b` passes `a` and `b` as `processArgument(0)` and
 `processArgument(1)`.
+
+A command's environment is this process's, with `environment(name, value)` set on it and
+`removeEnvironment(name)` taken out of it.
+
+### Signals: `abla/process/signal`
+
+A signal doesn't interrupt anything here: `watchSignals` blocks those named, and `received` reads them when the program
+looks, so cleaning up is ordinary code. Children started meanwhile get signals as usual.
+
+```abla
+import "abla/process"
+
+fun main: int {
+    val watch = watchSignals([signalInterrupt, signalTerminate])
+    editForAMoment()
+    // The command's status, or 128 + the signal, once the command has been stopped.
+    val status = command("gradle").argument("assemble").runWatching(watch)
+    putItBack()
+    watch.close()
+    status
+}
+```
+
+`received(timeoutMilliseconds)` gives the next signal or 0; -1 waits as long as it takes. It uses `signalfd`, so it is
+Linux only: elsewhere the watch's `started` is false and nothing is blocked.
 
 ## Time: `abla/process/time`
 

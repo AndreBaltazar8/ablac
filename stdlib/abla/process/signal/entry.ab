@@ -1,0 +1,68 @@
+// Handling a signal: blocked and read through signalfd(2) in the program's own time, rather than a handler that can run in
+// the middle of anything. Linux only; on other hosts `watchSignals` gives a watch whose `started` is false.
+
+import "abla/process/command"
+import "abla/sys/linux"
+import "abla/sys/linux/process"
+import "abla/unsafe/memory"
+import "abla/unsafe/memory/raw"
+
+val signalHangup = 1
+val signalInterrupt = 2
+val signalTerminate = 15
+
+class SignalWatch(val descriptor: int, val started: bool)
+
+/** From here on these signals don't end the program: `received` says when one came. Children started after this get them as usual. */
+fun watchSignals(signals: array<int>): SignalWatch {
+    var mask = 0
+    for (signal in signals) mask = mask | (1 << (signal - 1))
+    linuxWatchedSignals.storeI64(0, mask)
+    linuxWatchingSignals = true
+    val address = nativePointerAddress(linuxWatchedSignals.address)
+    // rt_sigprocmask(SIG_BLOCK, ...), then signalfd4(-1, ..., SFD_CLOEXEC | SFD_NONBLOCK).
+    if (linuxSyscall4(14, 0, address, 0, 8) != 0) return SignalWatch(-1, false)
+    val descriptor = linuxSyscall4(289, -1, address, 8, 526336)
+    SignalWatch(descriptor, descriptor >= 0)
+}
+
+/** The next signal that came, waiting up to `timeoutMilliseconds` (-1: as long as it takes), or 0 if none did. */
+fun SignalWatch.received(timeoutMilliseconds: int = 0): int {
+    if (!this.started) return 0
+    val poll = nativeByteBuffer(8)
+    // A struct pollfd: the descriptor, then events = POLLIN.
+    poll.storeI64(0, this.descriptor | (1 << 32))
+    val ready = linuxSyscall3(7, nativePointerAddress(poll.address), 1, timeoutMilliseconds)
+    poll.close()
+    if (ready <= 0) return 0
+    val information = nativeByteBuffer(128)
+    val read = linuxSyscall3(0, this.descriptor, nativePointerAddress(information.address), 128)
+    val signal = if (read == 128) information.load(0) else 0
+    information.close()
+    signal
+}
+
+/** Runs the command to its end, as `run` does, unless a watched signal comes: then it stops the command (TERM, and KILL after
+ *  `graceMilliseconds`) and gives 128 + the signal, for the program to clean up and leave. */
+fun Command.runWatching(watch: SignalWatch, graceMilliseconds: int = 5000): int {
+    val child = this.native.start()
+    if (child.process < 0) return 127
+    while (true) {
+        val signal = watch.received(50)
+        if (signal != 0) {
+            child.stop(graceMilliseconds)
+            return 128 + signal
+        }
+        val state = linuxWaitProcess(child.process, true)
+        if (state.output != "pending") return state.status
+    }
+    127
+}
+
+/** Back to how signals were: any still pending take effect as this returns. */
+fun SignalWatch.close(): void {
+    if (this.started) linuxSyscall1(3, this.descriptor)
+    linuxSyscall4(14, 1, nativePointerAddress(linuxWatchedSignals.address), 0, 8)
+    linuxWatchingSignals = false
+    return
+}

@@ -76,8 +76,6 @@
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
-- [ ] A program can't handle a signal: no `sigaction`, so nothing can clean up on Ctrl-C or TERM. A tool that edits a file
-      for a moment and must put it back stays a shell script for its `trap` (NovaKind's `scripts/android-test-apk.sh`).
 - [ ] No pipeline: a `Command`'s standard output can go to a file or to this program, not to another command, so
       `git archive | tar` goes through a temporary file. `capture` doesn't take standard error either (only `errors(file)`).
 - [ ] A builder can't be chained on a named value: with `val run = command("x")`, `run.environment("A", "1").environment("B", "2")`
