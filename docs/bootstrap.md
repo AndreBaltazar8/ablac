@@ -45,6 +45,20 @@ The intermediate compiler then builds the current sources. This automatic
 handoff applies to a v0.2.20 compiler only; newer bootstraps build directly.
 The release workflow still rebuilds stage 2 and verifies the fixed point.
 
+A Linux release is reproducible byte for byte. From the tag, in any directory,
+with `gh release download <tag> -p ablac-x86_64-linux` as `published`:
+
+```sh
+ABLA_NIX_XTENSA=0 tools/build-self-hosted-current.sh published build/rebuilt
+cmp published build/rebuilt
+```
+
+(`chmod +x` it first.) `ABLA_NIX_XTENSA=0` is the shell release CI uses: the default
+shell's Xtensa LLVM links another libLLVM, so the RUNPATH's store paths differ and
+nothing else. Releases up to v0.2.27 also cut the module by the machine's
+processors, so they match only with `ABLA_NATIVE_JOBS=4`, the runner's count.
+`tools/test-reproducible-elsewhere.sh` guards this; `--self` is the release's gate.
+
 The published binary is trusted only as the initial translator. The readable
 Abla source graph and fixed-point check define the maintained compiler. A
 future release can be bootstrapped by the previous Abla release without

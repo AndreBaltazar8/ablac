@@ -56,10 +56,16 @@
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed.
 - [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
       out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
-- [ ] The Linux release binary isn't reproduced outside CI. Rebuilding v0.2.27 from its own artifact
-      here gives 10052312 bytes against 10049432, with `.text` 1122 bytes bigger, and v0.2.26 also
-      differs. CI's own stage 1 and 2 agree, and so do local ones. It isn't LLVM: `ABLA_NIX_XTENSA=0`
-      links the same libLLVM as CI and gives the same size as the Xtensa shell. Not explained (2026-11-01).
+- [ ] A local rebuild of a Linux release in the default shell differs from CI's in 62 bytes: the
+      RUNPATH's two store paths, the Xtensa LLVM's libLLVM and that shell's own `nix-shell/lib`, which
+      doesn't exist and changes with any edit to `shell.nix`. `ABLA_NIX_XTENSA=0` matches CI byte for byte
+      (docs/bootstrap.md). The prebuilt Xtensa LLVM work puts CI in the same shell, which should end
+      the first; check it when that lands. Seen 2026-11-01.
+- [ ] macOS: nobody has compared a local rebuild with the published binary, and
+      `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
+- [ ] `ablac.bin` run without `ABLA_SYSROOT` from outside the repository finds no runtime and doesn't say
+      so: `fun main: int = 7` fails at link with `ld.lld: undefined symbol: abla_i64`, from
+      `env -u ABLA_SYSROOT .../ablac.bin build m.ab -o m --no-cache`. Seen 2026-11-01.
 - [ ] `tools/test-simd.sh`, `test-ct.sh` and `test-crypto-pure.sh` fail on Xtensa when given an
       installed `ablac`: their `llc` shim for `-relocation-model=static` goes first on `PATH`, and the
       install's wrapper puts its own LLVM ahead of it, so llc aborts on PIC. They pass with the

@@ -26,9 +26,11 @@ for hot semantic/runtime operations. A clean full LLVM emission took 309.5
 seconds and 1,727,684 KiB peak RSS.
 
 The release path now runs whole-module O1 plus a focused SCCP/GVN cleanup
-before splitting into twice the available worker count, then emits O2 machine
-code concurrently. The worker count defaults to `nproc`, is capped at 32, and
-can be bounded explicitly with `ABLA_NATIVE_JOBS`. A top-level function
+before splitting into 8 parts, then emits O2 machine code concurrently. The part
+count is fixed because it changes the code: the same sources give the same
+executable on any machine (`tools/test-reproducible-elsewhere.sh`). The worker count
+only says how many parts run at once: it defaults to `nproc`, is capped at 32,
+and can be bounded explicitly with `ABLA_NATIVE_JOBS`. A top-level function
 declaration hash index also replaces repeated full declaration scans for
 parameter metadata in semantic analysis. On the same 32-thread i9-13900K host,
 the selected follow-up profile measured a 43.95-second backend and a

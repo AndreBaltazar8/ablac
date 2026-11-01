@@ -362,7 +362,7 @@ release gate still verifies byte-identical IR from the rebuilt compiler.
 | `ABLA_CACHE_DIR` | where builds and `ablac run` keep their caches (default `build/.abla-cache`; `--cache-dir` wins) |
 | `ABLA_MAX_MEMORY_MB`, `ABLA_MAX_SECONDS`, `ABLA_MAX_CPU_SECONDS`, `ABLA_KILL_GRACE_SECONDS` | the launcher's resource guard for the compiler and anything compile-time code starts ([performance.md](performance.md)) |
 | `ABLA_MAX_STACK_KB` | the compiler's stack size in a packaged toolchain |
-| `ABLA_NATIVE_JOBS` | parallel native object jobs |
+| `ABLA_NATIVE_JOBS` | how many parts of a large release module are generated at once; the output does not depend on it |
 | `ABLA_CODEGEN_UNITS`, `ABLA_CODEGEN_JOBS`, `ABLA_CODEGEN_UNITS_MINIMUM`, `ABLA_CODEGEN_UNITS_TRACE`, `ABLA_CODEGEN_CACHE`, `ABLA_CODEGEN_CACHE_MB` | a development build's code generation units and their cache (above) |
 | `ABLA_EVAL_STEP_LIMIT`, `ABLA_EVAL_DEPTH_LIMIT` | lower the compile-time step and recursion-depth limits ([compile-time.md](compile-time.md#limits)) |
 | `ABLA_COMPILE_EVAL=interp\|jit\|auto`, `ABLA_COMPILE_EVAL_TRACE=1`, `ABLA_COMPILE_EVAL_DUMP=<dir>`, `ABLA_COMPILE_EVAL_TIME_LIMIT=<s>` | run compile-time code in the evaluator (default) or as native code (`auto` is `jit` today), report each site's tier and why a site stays in the evaluator, keep the native slices, and bound one native evaluation (default 600 s, `0` none) ([compile-time.md](compile-time.md#native-evaluation)) |

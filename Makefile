@@ -225,6 +225,7 @@ test-serial: ablac
 	tools/test-math-fast.sh $(COMPILER)
 	tools/test-lambda-context.sh $(COMPILER)
 	tools/test-reproducible-build.sh $(COMPILER)
+	tools/test-reproducible-elsewhere.sh $(COMPILER)
 	tools/test-inferred-receivers.sh $(COMPILER)
 	tools/test-gc-stress.sh $(COMPILER)
 	tools/test-generator-step.sh $(COMPILER)
