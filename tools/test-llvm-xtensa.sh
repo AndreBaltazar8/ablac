@@ -60,6 +60,61 @@ for instruction in 'call8[[:space:]]+target' 'extui' 'bbsi' 'beqz\.n'; do
     }
 done
 
+# A frame of 128 to 255 bytes that takes a stack address, under register pressure:
+# LEA_ADD's ADDI reaches 127 bytes, so a scratch register may need the scavenger's
+# slot (reduced from a function of abla-embedded's imu-offsets).
+cat > "$out/scavenging.ll" <<'IR'
+target datalayout = "e-m:e-p:32:32-v1:8:8-i64:64-i128:128-n32"
+target triple = "xtensa-esp-unknown-elf"
+
+define fastcc i32 @abla_fn_670449120_736179281_direct(i1 %scalar.compare.not, ptr %unsafe.stack.allocation430, i32 %unsafe.load.i, ptr %unsafe.stack.allocation383.i, i32 %0, i32 %scalar.add.i445, i8 %unsafe.load255.i, i5 %scalar.local67.0.i) {
+entry:
+  %unsafe.stack.allocation383.i1 = alloca [112 x i8], align 16
+  br i1 %scalar.compare.not, label %source.label75, label %common.ret
+
+common.ret:                                       ; preds = %abla_fn_392033005_197864730_direct.exit.thread, %entry
+  ret i32 0
+
+source.label75:                                   ; preds = %entry
+  %unsafe.stack.allocation4303 = alloca [48 x i8], align 16
+  br label %source.label68.i.outer756
+
+source.label68.i.outer756:                        ; preds = %source.label72.i, %source.label75
+  br label %source.label68.i
+
+source.label68.i:                                 ; preds = %source.label69.i, %source.label68.i.outer756
+  switch i5 %scalar.local67.0.i, label %source.label69.i [
+    i5 -14, label %abla_fn_392033005_197864730_direct.exit.thread
+    i5 -13, label %abla_fn_392033005_197864730_direct.exit.thread
+    i5 14, label %source.label107.i
+    i5 -15, label %abla_fn_392033005_197864730_direct.exit.thread
+  ]
+
+source.label69.i:                                 ; preds = %source.label68.i
+  br i1 %scalar.compare.not, label %source.label72.i, label %source.label68.i
+
+source.label72.i:                                 ; preds = %source.label69.i
+  store i32 %unsafe.load.i, ptr %unsafe.stack.allocation383.i, align 8
+  store i32 255, ptr null, align 4
+  store i32 0, ptr %unsafe.stack.allocation430, align 16
+  %direct.scalar389.i = call fastcc i32 null(i32 %scalar.add.i445, i32 0, i32 0, i32 0, i32 %0, i32 0, i32 1, i32 0, i32 0)
+  br label %source.label68.i.outer756
+
+source.label107.i:                                ; preds = %source.label68.i
+  ret i32 0
+
+abla_fn_392033005_197864730_direct.exit.thread:   ; preds = %source.label68.i, %source.label68.i, %source.label68.i
+  switch i8 %unsafe.load255.i, label %common.ret [
+    i8 -128, label %source.label155
+    i8 0, label %source.label155
+  ]
+
+source.label155:                                  ; preds = %abla_fn_392033005_197864730_direct.exit.thread, %abla_fn_392033005_197864730_direct.exit.thread
+  ret i32 0
+}
+IR
+llc -mcpu=esp32 -relocation-model=static -O2 "$out/scavenging.ll" -o "$out/scavenging.s"
+
 mkdir -p "$out/tools"
 real_llc=$(command -v llc)
 cat > "$out/tools/llc" <<SH

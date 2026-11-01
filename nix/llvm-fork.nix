@@ -5,11 +5,11 @@
 
 let
   base = (import ./llvm.nix { inherit pkgs; }).llvmPackages.libllvm;
-  commit = "a254932917786ca006920fcb8ec02f3c5556dd06";
+  commit = "e4da75d481e81131665fbc2c368d3a956bbc4f2b";
   fork = pkgs.fetchzip {
     name = "llvm-project-${commit}";
     url = "https://github.com/AndreBaltazar8/llvm-project/archive/${commit}.tar.gz";
-    sha256 = "0qas936724pji68p2y426rl2196is4gqwrma13d9cbjmn975imqq";
+    sha256 = "19z9pypqvc89i9m61q3pvzclcjg30cymqvkkpscwwll57s5y40cp";
   };
 in
 (base.override {
