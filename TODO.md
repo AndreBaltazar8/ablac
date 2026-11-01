@@ -72,6 +72,8 @@
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
+- [ ] `native-websocket-server-protocol` (`tools/test-self-hosted.sh`) failed once under `make test`:
+      "step 2 expected 42, got 1" (2026-11-01). Its checks include a 400 ms idle timeout. Not looked into.
 - [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
       out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
@@ -187,6 +189,10 @@
   `--no-cache`: a hit would pass without running it. Building the compiler itself: 67 s to about 54 s wall and
   153 to about 108 CPU-seconds on 2026-11-01, by doing only inlining and globalopt before the split;
   most of the rest is the frontend (about 10 s) and that step, both on one core.
+  Removing unreachable `abla_fn_` functions from the IR before opt (hello world: 374 to 91, release
+  builds 12 to 26% less CPU, smaller binaries) was tried and dropped on 2026-11-01: json-readers ran 41%
+  slower (1.27 to 1.79 s, repeated on a quiet machine), as it changes what LLVM inlines. Its first version also
+  failed builds with status 131 (test-private, test-ct-bridge). Understanding why could get the saving back.
   By script on 2026-11-01 (CPU-seconds, about 4,000 in all with the crypto and SIMD tests): self-hosted
   480, doc-examples 310, ct-bridge 240, gc-growth 214, parity probes 185. Don't build gc-growth's stress
   run optimized: it runs 23x faster because collections move, so it would prove less. The frontend's
