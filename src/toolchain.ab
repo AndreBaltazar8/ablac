@@ -2,6 +2,7 @@ import "backend/llvm/backend.ab"
 import "module.ab"
 import "sourcemap.ab"
 import "abla/sys/linux/fs"
+import "abla/bytes"
 import "abla/text"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
@@ -1051,16 +1052,13 @@ fun bootstrapPreparePartitionLlvm(
 // Release-parallel emission needs interprocedural optimization before
 // llvm-split separates callees from callers. Splitting first leaves recursive
 // semantic and lowering paths behind cross-partition runtime calls and made a
-// complete frontend emission more than an order of magnitude slower. Each part
-// then runs O2 on all cores, so this one-core step does only what needs the whole
-// module: inlining with the cleanup that guides it, and global propagation. Against
-// the LTO input's pipeline below, the compiler builds in 50 s rather than 67 s and
-// runs as fast, 12% larger (2026-11-01). Other trims made it run slower.
+// complete frontend emission more than an order of magnitude slower. O1 is the
+// measured balance for the compiler (2026-11-01, with its dead functions removed): 9.3 MB
+// and about 70 s. Only inlining here builds it in 55 s but at 10.4 MB or more, and O1
+// followed by SCCP and GVN gains nothing on it.
 fun bootstrapPrepareSplitLlvm(llvmPath: string, preparedPath: string): int {
     val prepare = linuxCommand("opt")
-    prepare.argument(
-        "-passes=function(sroa,early-cse),always-inline,cgscc(devirt<1>(inline,function(sroa,early-cse,simplifycfg))),globalopt,globaldce"
-    )
+    prepare.argument("-passes=default<O1>,globaldce")
     prepare.argument(llvmPath)
     prepare.argument("-o")
     prepare.argument(preparedPath)
@@ -1376,6 +1374,114 @@ fun bootstrapExtractLlvmFunctions(
     extract.argument(outputPath)
     extract.run()
 }
+
+// A module's text without the generated functions nothing reaches: `abla_fn_` functions that
+// aren't referred to from `main`, another function kept, a global or inline assembly. Mostly
+// boxed-ABI wrappers whose callers use the direct bodies: they are hidden, so opt can't drop
+// them. Half of the compiler's functions, and it comes out 8% smaller. Only for a program
+// linking LLVM: in another program, what LLVM inlines changes, and json-readers' readInteger
+// ran 54% slower (2026-11-01). A reference this misses is a parse error in opt.
+fun bootstrapLlvmWithoutDeadFunctions(llvm: string): string {
+    val marker = "\ndefine "
+    val names: array<string> = []
+    val begins: array<int> = []
+    val ends: array<int> = []
+    val slots: Map<string, int> = Map()
+    val outside = byteBuffer()
+    var cursor = 0
+    var found = llvm.indexOf(marker, 0)
+    while (found >= 0) {
+        val begin = found + 1
+        val lineEnd = llvm.indexOf("\n", begin)
+        val close = llvm.indexOf("\n}\n", begin)
+        if (lineEnd < 0 || close < 0) return llvm
+        val end = close + 3
+        val at = llvm.indexOf("@", begin)
+        if (at < 0 || at > lineEnd) return llvm
+        var nameEnd = at + 1
+        while (nameEnd < lineEnd && llvm[nameEnd] != 40) nameEnd = nameEnd + 1
+        val name = llvm.slice(at + 1, nameEnd)
+        slots.set(name, names.size)
+        names.append(name)
+        begins.append(begin)
+        ends.append(end)
+        outside.appendText(llvm.slice(cursor, begin))
+        cursor = end
+        found = llvm.indexOf(marker, end - 1)
+    }
+    outside.appendText(llvm.slice(cursor, llvm.size))
+    val kept: array<bool> = []
+    val pending: array<int> = []
+    var index = 0
+    while (index < names.size) {
+        val line = llvm.slice(begins[index], begins[index] + 40)
+        val generated = names[index].startsWith("abla_fn_") &&
+            (line.startsWith("define hidden ") || line.startsWith("define internal ") ||
+             line.startsWith("define private "))
+        val other = !generated && !line.startsWith("define internal ") && !line.startsWith("define private ")
+        kept.append(other)
+        if (other) pending.append(index)
+        index = index + 1
+    }
+    bootstrapLlvmMarkReferences(outside.toText(), slots, kept, pending)
+    var head = 0
+    while (head < pending.size) {
+        val function = pending[head]
+        head = head + 1
+        // (Past its own signature's name is the same walk: a self-reference changes nothing.)
+        bootstrapLlvmMarkReferences(llvm.slice(begins[function], ends[function]), slots, kept, pending)
+    }
+    val output = byteBuffer()
+    cursor = 0
+    index = 0
+    while (index < names.size) {
+        output.appendText(llvm.slice(cursor, begins[index]))
+        if (kept[index]) output.appendText(llvm.slice(begins[index], ends[index]))
+        cursor = ends[index]
+        index = index + 1
+    }
+    output.appendText(llvm.slice(cursor, llvm.size))
+    output.toText()
+}
+
+// Marks what `text` refers to: `@name`, and any generated name, as inline assembly writes it.
+fun bootstrapLlvmMarkReferences(
+    text: string,
+    slots: Map<string, int>,
+    var kept: array<bool>,
+    var pending: array<int>
+): void {
+    var offset = 0
+    while (offset < text.size) {
+        val byte = text[offset]
+        val generated = byte == 97 && offset + 8 <= text.size &&
+            text[offset + 5] == 102 && text.slice(offset, offset + 8) == "abla_fn_"
+        if (byte == 64 || generated) {
+            val first = if (byte == 64) offset + 1 else offset
+            var last = first
+            if (last < text.size && text[last] == 34) {
+                // A quoted name, quotes and all, as a definition's is kept.
+                last = last + 1
+                while (last < text.size && text[last] != 34) last = last + 1
+                if (last < text.size) last = last + 1
+            } else {
+                while (last < text.size && bootstrapLlvmNameByte(text[last])) last = last + 1
+            }
+            val slot = slots.get(text.slice(first, last))
+            if (slot != null && !kept[slot]) {
+                kept[slot] = true
+                pending.append(slot)
+            }
+            offset = if (last > offset) last else offset + 1
+        } else offset = offset + 1
+    }
+    return
+}
+
+// A byte of an unquoted LLVM name.
+fun bootstrapLlvmNameByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) ||
+    byte == 95 || byte == 46 || byte == 36 || byte == 45
 
 fun bootstrapEmitPartitionedObject(
     llvmPath: string,
@@ -2223,10 +2329,14 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                     bootstrapDropBuildTransactionPath(llvmPath)
                     status = 0
                 } else {
-                    val emitted = if (target.objectFormat == "elf" &&
-                        compilation.output.size <= 4194304) {
-                        bootstrapAddLlvmElfFunctionSections(compilation.output)
+                    val live = if (linkLlvm && target.hosted && target.objectFormat == "elf" &&
+                        artifact == "executable") {
+                        bootstrapLlvmWithoutDeadFunctions(compilation.output)
                     } else compilation.output
+                    val emitted = if (target.objectFormat == "elf" &&
+                        live.size <= 4194304) {
+                        bootstrapAddLlvmElfFunctionSections(live)
+                    } else live
                     if (Path(llvmPath).writeTextAtomic(emitted)) status = 0
                     else {
                         status = 145
