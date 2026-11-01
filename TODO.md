@@ -363,3 +363,5 @@ compiler, 1% slower fixed-step simulation; branch `perf/compile-memory-v2`.) Not
   field-slot alias tags (native 42/42 us a tick with mobs, WebAssembly within 1%). An
   `assume` would turn any producer missed later (extension fields with defaults,
   generics) into undefined behaviour instead of a trap, so it isn't worth carrying.
+
+- `adoptNativeString` tests `address > 0`, but real ARM64 Android's `malloc` returns tagged pointers (`0xb400...`), which are negative as `int`. It then returns the `""` literal, and `ByteBuffer.stageReserve` writes into read-only memory: SIGSEGV at the first append. Emulators don't tag, so they pass. Should be `address != 0`; other address comparisons in the runtime need the same check (`__ablaRuntimeHostCollection*` tables shift addresses arithmetically). abla-mobile's manifest now sets `allowNativeHeapPointerTagging="false"`, which hides this on Android. Found 2026-11-01 on a Galaxy S25 Ultra.
