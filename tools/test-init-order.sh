@@ -43,6 +43,14 @@ output=$("$output_directory/default-reads") ||
 [[ $output == '7 8 14 10' ]] ||
     { echo "init order: default-reads output:"; echo "$output"; exit 1; }
 
+# A function address in a static table is a relocation, not a read: a vtable may
+# hold methods that read it.
+"$compiler" build "$cases/static-table-address.ab" -o "$output_directory/static-table-address"
+output=$("$output_directory/static-table-address") ||
+    { echo "init order: static-table-address exited with $?"; exit 1; }
+[[ $output == $'8\ntrue' ]] ||
+    { echo "init order: static-table-address output:"; echo "$output"; exit 1; }
+
 rejected() { # $1 = case, then the texts its diagnostics must contain
     local name=$1; shift
     if "$compiler" build "$cases/$name.ab" -o "$output_directory/invalid" \
@@ -60,6 +68,7 @@ rejected invalid-through-functions 'global.initialization-cycle:total->total' \
 rejected invalid-modules 'global.initialization-cycle:qy->px->qy' 'cycle-q.ab:'
 rejected invalid-compile-time 'global.initialization-cycle:a2->b2->a2'
 rejected invalid-call-value-cycle 'global.initialization-cycle:maker->node->maker'
+rejected invalid-address-call 'global.initialization-cycle:selfish->selfish'
 if grep -q 'E_EVAL' "$output_directory/invalid-compile-time.err"; then
     echo "init order: the cycle was evaluated under #"; exit 1
 fi

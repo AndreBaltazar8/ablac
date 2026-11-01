@@ -225,7 +225,9 @@ fun main {
   across modules) is a compile error, `global.initialization-cycle:a->b->a`,
   at run time and under `#` alike, so no initializer can see a global that
   isn't initialized yet. Code in a lambda counts for the initializer it is
-  written in, since it may run there.
+  written in, since it may run there. `nativeFunctionAddress(f)` among the
+  words of a static table (`nativeStaticU32s` and its kin) is the one name
+  that isn't a read: the table holds the address and runs nothing.
 - A local lives from its declaration to the end of its block. A local in a
   nested block may shadow an outer local, a parameter or a field; the outer
   one is visible again after the block, including to closures that captured

@@ -17,6 +17,22 @@
 
 ## Bugs seen
 
+- [ ] **Xtensa `llc` aborts on frames of 128 to 255 bytes that take a stack address.** `LLVM ERROR: Error
+  while trying to spill A6 from class AR: Cannot scavenge register without an emergency spill slot!`, seen
+  2026-11-01 on `esp32RecoveredZN3nvs7Storage9writeItem...` from abla-embedded's `tools/build-example
+  imu-offsets` and `wifi-connect`. `llvm-xtensa-scavenging-slot.patch` reserves the slot past 255 bytes, but
+  `LEA_ADD`'s `ADDI` reaches only 127 (`isValidAddrOffsetForOpcode`). `!isInt<8>(MaxSPOffset)` fixes it:
+  checked with an Xtensa-only `llc` from the fork plus that one line, and both examples then compile. It's on
+  branch `llvm-xtensa-lea-scavenging`, not master: a changed patch sends every local shell to the over-an-hour
+  source build until a new `llvm-23.1.3-xtensa-<n>` release is published and pinned (docs/llvm-xtensa.md), and
+  that release is the owner's call.
+- [ ] **`--emit-llvm` and `ablac run` lower every declaration, so big import graphs cost twice the memory.**
+  Measured 2026-11-01 on abla-embedded's `tests/package-import.ab` (788 modules, 27,097 declarations): `build`
+  demands 3,075 declarations and peaks at 3.2 GB, `--emit-llvm` lowers 13,187 functions and peaks at 5.2 GB, past
+  the launcher's 4,096 MB (`ABLA_COMPILER_MEMORY_TRACE=1`). Both spend 1.0 GB live by the end of parsing:
+  `parse.normalize` alone grows 270 MB to 990 MB. Pruning in `bootstrapCompileLlvmParsed` brought it to 2.85 GB,
+  but `--emit-llvm` checking every body is a tested contract (`test-borrow-lifetimes.sh`, `test-unsafe-mmio.sh`,
+  `test-emitted-value-runtime.sh`), so it stays. `run` could prune with no such contract; it shares that function.
 - [ ] **`shell.nix`'s `LD_LIBRARY_PATH` breaks a host's own Nix tools.** In the `nixos/nix:2.31.2`
   image `/usr/bin/env` is linked against glibc 2.40; inside the shell it then loads libraries
   from the shell's 2.44 and dies on `GLIBC_ABI_DT_X86_64_PLT`, so a `#!/usr/bin/env` script

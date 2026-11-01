@@ -77,4 +77,22 @@ PATH="$out/tools:$PATH" "$compiler" build \
     --target-triple xtensa-esp-unknown-elf --object-format elf --emit object
 llvm-readobj --file-headers "$out/fixture.o" | grep -q 'Machine: EM_XTENSA'
 
+# The intrinsics whose inline assembly the compiler writes: LLVM's Xtensa backend
+# takes `r` for an address register and rejects `a`.
+cat > "$out/intrinsics.ab" <<'AB'
+import "abla/unsafe/xtensa"
+@export("intrinsics_probe")
+trusted fun probe(mask: u32): u32 {
+    nativeXtensaDelayCycles(8)
+    nativeXtensaInterruptsEnable(mask) | nativeXtensaInterruptsDisable(mask)
+}
+AB
+PATH="$out/tools:$PATH" "$compiler" build "$out/intrinsics.ab" -o "$out/intrinsics.o" \
+    --target-triple xtensa-esp-unknown-elf --object-format elf --emit object --no-cache
+grep -Fq '"r,~{a8},~{a9}"' "$out/intrinsics.o.ll"
+llc -mcpu=esp32 -relocation-model=static -O2 "$out/intrinsics.o.ll" -o "$out/intrinsics.s" 2>"$out/intrinsics.err"
+if grep -q 'unknown asm constraint' "$out/intrinsics.err"; then
+    cat "$out/intrinsics.err" >&2
+    exit 1
+fi
 echo 'Xtensa LLVM passed'
