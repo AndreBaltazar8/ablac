@@ -1014,6 +1014,7 @@ int64_t abla_darwin_linux_syscall(int64_t number, int64_t argument0,
     }
     break;
   }
+  case 278:
   case 318:
     arc4random_buf((void *)(uintptr_t)argument0, (size_t)argument1);
     result = argument1;

@@ -30,10 +30,6 @@
       fails to build at `given.size`: `E_LLVM_INSTRUCTION_UNSUPPORTED ... field.get target size` (the
       same as the lambda entry below, on a declared function type). `val given: string =` avoids it.
       Seen 2026-11-01 in abla/crypto/rsa.
-- [ ] `abla/sys/linux/random`'s `secureRandomBytes` calls system call 318, x86-64's getrandom. On
-      AArch64 Linux that number is something else (getrandom is 278); on Wasm and Xtensa there's no
-      such thing. `abla/crypto/rsa` only uses it on x86-64 and asks for `cryptoSetRandom` elsewhere.
-      Found reading it 2026-11-01, not run.
 - [ ] `@inline operator fun` used to be a parse error (fixed with abla/simd), but an annotation
       after `operator` still is: `operator @inline fun` gives `E_PARSE_*`. Seen 2026-10-31.
 - [ ] `E_NAMED_ARGUMENT_HIDDEN` also rejects a caller whose local of that name isn't a function,
