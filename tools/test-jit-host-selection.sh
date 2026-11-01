@@ -14,7 +14,7 @@ compiler=$1
 cd "$project_root"
 
 for program in bootstrap/block modules/filesystem modules/host-runtime; do
-    before=$(find build -maxdepth 1 \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null | sort)
+    before=$(find build -maxdepth 1 \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null | sort || true)
     set +e
     ABLA_MAX_MEMORY_MB=768 ABLA_MAX_SECONDS=60 \
         "$project_root/tools/run-limited.sh" "$compiler" run --jit \
@@ -25,7 +25,7 @@ for program in bootstrap/block modules/filesystem modules/host-runtime; do
         printf 'run --jit %s: exit %s\n' "$program" "$status" >&2
         exit 1
     }
-    after=$(find build -maxdepth 1 \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null | sort)
+    after=$(find build -maxdepth 1 \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null | sort || true)
     [[ $after == "$before" ]] || exit 1
 done
 printf '%s\n' \

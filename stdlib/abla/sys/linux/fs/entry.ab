@@ -297,6 +297,90 @@ fun Path.writeTextAtomic(contents: string): bool {
     success
 }
 
+// Creates the file with these contents and permissions, failing if anything
+// is there already, so a secret is never readable by others on the way or
+// written over what another process made.
+fun Path.createExclusive(contents: string = "", mode: int = 384): bool {
+    // O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC.
+    val descriptor = linuxOpen(this.text, 524481, mode).descriptor
+    if (descriptor < 0) return false
+    var success = linuxWriteAll(descriptor, contents)
+    if (linuxSyscall1(3, descriptor) != 0) success = false
+    success
+}
+
+// chmod. The bits are usually written in octal: 448 is 0700, 384 is 0600.
+fun Path.setPermissions(mode: int): bool =
+    linuxSyscall2(90, nativeCStringAddress(this.text), mode) == 0
+
+// The permission bits (448 for 0700), or -1 when the path doesn't exist. A
+// symbolic link is followed.
+fun Path.permissions(): int {
+    val status = nativeByteBuffer(144)
+    val measured = linuxSyscall4(
+        262,
+        -100,
+        nativeCStringAddress(this.text),
+        nativePointerAddress(status.address),
+        0
+    )
+    val mode = if (measured == 0) linuxLoadU32(status, 24) & 4095 else -1
+    status.close()
+    mode
+}
+
+// Makes this path a symbolic link to `target`, which is stored as written.
+fun Path.linkTo(target: string): bool =
+    linuxSyscall2(
+        88,
+        nativeCStringAddress(target),
+        nativeCStringAddress(this.text)
+    ) == 0
+
+// What this symbolic link holds, or "" when it isn't one.
+fun Path.linkTarget(): string {
+    val buffer = nativeByteBuffer(4097)
+    val measured = linuxSyscall3(
+        89,
+        nativeCStringAddress(this.text),
+        nativePointerAddress(buffer.address),
+        4096
+    )
+    var result = ""
+    if (measured > 0) result = buffer.adoptString(measured)
+    else buffer.close()
+    result
+}
+
+// An advisory lock on a file (flock), across processes. It goes when the
+// holding process does. What this process starts inherits it only when asked,
+// and then it lasts until they have gone too.
+class FileLock(val descriptor: int)
+
+// A lock on this path, creating the file. Not held yet; `descriptor` is
+// negative when the file can't be opened.
+fun Path.fileLock(inherited: bool = false): FileLock {
+    // O_WRONLY | O_CREAT, and O_CLOEXEC unless inherited.
+    FileLock(linuxOpen(this.text, if (inherited) 65 else 524353, 438).descriptor)
+}
+
+// Waits for the lock.
+fun FileLock.hold(): bool {
+    var status = -4
+    // A signal interrupts the wait (EINTR).
+    while (status == -4 && this.descriptor >= 0) {
+        status = linuxSyscall2(73, this.descriptor, 2)
+    }
+    status == 0
+}
+
+// Takes the lock only if it's free.
+fun FileLock.tryHold(): bool =
+    this.descriptor >= 0 && linuxSyscall2(73, this.descriptor, 6) == 0
+
+fun FileLock.release(): bool =
+    this.descriptor >= 0 && linuxSyscall2(73, this.descriptor, 8) == 0
+
 fun Path.moveTo(destination: Path): bool {
     var success = linuxCreateDirectories(linuxParentPath(destination.text))
     if (success) {

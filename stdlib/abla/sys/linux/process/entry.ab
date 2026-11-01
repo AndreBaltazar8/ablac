@@ -18,7 +18,14 @@ class LinuxEnvironmentValue(val value: string, val found: bool)
 
 class LinuxProcessResult(val status: int, val output: string)
 
-class LinuxCommand(val arguments: array<string>)
+class LinuxCommand(
+    val arguments: array<string>,
+    val overrides: array<string> = [],
+    var workingDirectory: string = "",
+    var inputPath: string = "",
+    var outputPath: string = "",
+    var errorPath: string = ""
+)
 
 class LinuxChildProcess(val process: int)
 
@@ -224,14 +231,140 @@ fun LinuxCommand.argument(value: string): LinuxCommand {
     this
 }
 
+// `name` set to `value` for what this command starts; the rest of the
+// environment carries over.
+fun LinuxCommand.environment(name: string, value: string): LinuxCommand {
+    this.overrides.append("$name=$value")
+    this
+}
+
+// Where the command runs, instead of this process's working directory.
+fun LinuxCommand.directory(path: string): LinuxCommand {
+    this.workingDirectory = path
+    this
+}
+
+// Standard input read from this file.
+fun LinuxCommand.input(path: string): LinuxCommand {
+    this.inputPath = path
+    this
+}
+
+// Standard output written to this file, created if missing (with the mode a
+// file already there has) and emptied. "/dev/null" discards it.
+fun LinuxCommand.output(path: string): LinuxCommand {
+    this.outputPath = path
+    this
+}
+
+// Standard error written to this file, as with `output`.
+fun LinuxCommand.errors(path: string): LinuxCommand {
+    this.errorPath = path
+    this
+}
+
+// The inherited environment with this command's overrides on top, as an envp.
+private trusted fun LinuxCommand.environmentVector(): NativeByteBuffer {
+    val entries: array<string> = []
+    var cursor = linuxEnvironmentPointer()
+    var current = nativeNullPointer()
+    if (!pointerIsNull(cursor)) {
+        current = NativePointerCell(cursor, false, false).load()
+    }
+    while (!pointerIsNull(current)) {
+        val entry = borrowNativeCString(current)
+        var replaced = false
+        for (override in this.overrides) {
+            val name = override.slice(0, linuxNameSize(override) + 1)
+            if (entry.size >= name.size && entry.slice(0, name.size) == name) {
+                replaced = true
+            }
+        }
+        if (!replaced) entries.append(entry)
+        cursor = ablaUnsafePointerOffset(cursor, 8)
+        current = NativePointerCell(cursor, false, false).load()
+    }
+    for (override in this.overrides) entries.append(override)
+    linuxArgumentVector(entries)
+}
+
+private fun linuxNameSize(entry: string): int {
+    var index = 0
+    while (index < entry.size && entry[index] != 61) index = index + 1
+    index
+}
+
+private fun linuxRedirect(path: string, flags: int, target: int): bool {
+    val opened = linuxOpen(path, flags, 438).descriptor
+    var ready = opened >= 0
+    if (ready) ready = linuxSyscall2(33, opened, target) >= 0
+    if (opened > 2) linuxSyscall1(3, opened)
+    ready
+}
+
+// The working directory and redirects, then the exec. Only returns, with 127,
+// when one of them fails.
+private fun LinuxCommand.execPrepared(
+    executable: string,
+    vector: NativeByteBuffer,
+    environment: NativeByteBuffer
+): int {
+    var ready = true
+    if (this.workingDirectory != "") {
+        ready = linuxSyscall1(
+            80,
+            nativeCStringAddress(this.workingDirectory)
+        ) == 0
+    }
+    if (ready && this.inputPath != "") {
+        ready = linuxRedirect(this.inputPath, 0, 0)
+    }
+    // O_WRONLY | O_CREAT | O_TRUNC.
+    if (ready && this.outputPath != "") {
+        ready = linuxRedirect(this.outputPath, 577, 1)
+    }
+    if (ready && this.errorPath != "") {
+        ready = linuxRedirect(this.errorPath, 577, 2)
+    }
+    if (ready) {
+        linuxSyscall3(
+            59,
+            nativeCStringAddress(executable),
+            nativePointerAddress(vector.address),
+            nativePointerAddress(environment.address)
+        )
+    }
+    127
+}
+
 fun LinuxCommand.run(): int {
     var result = 127
     if (this.arguments.size > 0) {
         val executable = linuxExecutablePath(this.arguments[0])
         val vector = linuxArgumentVector(this.arguments)
+        val environment = this.environmentVector()
         val process = int(fork())
-        if (process == 0) result = linuxExecPrepared(executable, vector)
+        if (process == 0) {
+            this.execPrepared(executable, vector, environment)
+            linuxSyscall1(60, 127)
+        }
         if (process > 0) result = linuxWaitProcess(process).status
+        environment.close()
+        vector.close()
+    }
+    result
+}
+
+// Replaces this process with the command: nothing after it runs, unless it
+// fails, when it returns 127.
+fun LinuxCommand.execute(): int {
+    var result = 127
+    if (this.arguments.size > 0) {
+        val executable = linuxExecutablePath(this.arguments[0])
+        val vector = linuxArgumentVector(this.arguments)
+        val environment = this.environmentVector()
+        result = this.execPrepared(executable, vector, environment)
+        environment.close()
         vector.close()
     }
     result
@@ -242,6 +375,7 @@ fun LinuxCommand.capture(): LinuxProcessResult {
     if (this.arguments.size > 0) {
         val executable = linuxExecutablePath(this.arguments[0])
         val vector = linuxArgumentVector(this.arguments)
+        val environment = this.environmentVector()
         val descriptors = nativeByteBuffer(8)
         descriptors.storeI64(0, 0)
         val pipeStatus = linuxSyscall2(
@@ -263,7 +397,8 @@ fun LinuxCommand.capture(): LinuxProcessResult {
                 linuxSyscall1(3, readDescriptor)
                 linuxSyscall2(33, writeDescriptor, 1)
                 linuxSyscall1(3, writeDescriptor)
-                linuxExecPrepared(executable, vector)
+                this.execPrepared(executable, vector, environment)
+                linuxSyscall1(60, 127)
             }
             if (process > 0) {
                 linuxSyscall1(3, writeDescriptor)
@@ -282,6 +417,7 @@ fun LinuxCommand.capture(): LinuxProcessResult {
             }
         }
         descriptors.close()
+        environment.close()
         vector.close()
     }
     result
@@ -294,8 +430,13 @@ fun LinuxCommand.start(): LinuxChildProcess {
     if (this.arguments.size > 0) {
         val executable = linuxExecutablePath(this.arguments[0])
         val vector = linuxArgumentVector(this.arguments)
+        val environment = this.environmentVector()
         process = int(fork())
-        if (process == 0) linuxExecPrepared(executable, vector)
+        if (process == 0) {
+            this.execPrepared(executable, vector, environment)
+            linuxSyscall1(60, 127)
+        }
+        environment.close()
         vector.close()
     }
     LinuxChildProcess(process)

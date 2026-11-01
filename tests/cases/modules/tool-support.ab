@@ -1,0 +1,99 @@
+import "abla/crypto"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+import "abla/process/command"
+import "abla/text"
+
+// What a command-line tool needs of the host: a command's environment, directory and
+// redirects, exclusive files, permissions, links, locks, a hash in pieces, sorting.
+var failures = 0
+fun check(ok: bool, label: string): void {
+    if (!ok) {
+        eprintln("FAIL $label")
+        failures = failures + 1
+    }
+    return
+}
+
+fun main: int {
+    val folder = Path("/tmp/abla-tool-support-${linuxProcessId()}")
+    folder.removeTree()
+    check(folder.createDirectories(), "directory")
+
+    val secret = folder.child("secret")
+    check(secret.createExclusive("one", 384), "exclusive creates")
+    check(!secret.createExclusive("two", 384), "exclusive refuses what's there")
+    check(secret.readText() == "one", "exclusive left the contents")
+    check(secret.permissions() == 384, "mode ${secret.permissions()}")
+    check(secret.setPermissions(416), "chmod")
+    check(secret.permissions() == 416, "chmod took")
+    check(folder.child("nothing").permissions() == -1, "no such path")
+
+    val link = folder.child("link")
+    check(link.linkTo("secret"), "link")
+    check(link.linkTarget() == "secret", "link target")
+    check(secret.linkTarget() == "", "not a link")
+    check(link.readText() == "one", "through the link")
+
+    // Environment: set, replaced, and the rest inherited.
+    val env = command("sh").argument("-c").argument("printf '%s|%s' \"\$ABLA_TOOL_ONE\" \"\$PATH\"")
+        .environment("ABLA_TOOL_ONE", "a=b").capture()
+    check(env.status == 0 && env.output.startsWith("a=b|") && env.output.size > 4, "environment ${env.output}")
+    val replaced = command("sh").argument("-c").argument("printf %s \"\$HOME\"")
+        .environment("HOME", "/elsewhere").capture()
+    check(replaced.output == "/elsewhere", "replaced ${replaced.output}")
+    check(processEnvironmentOr("ABLA_TOOL_ONE", "unset") == "unset", "this process's stays")
+
+    val where = command("pwd").directory(folder.text).capture()
+    check(where.output == "${folder.text}\n", "directory ${where.output}")
+    check(command("pwd").directory("/nowhere/at/all").run() == 127, "no such directory")
+
+    // Redirects: binary bytes through a file, standard error apart.
+    val out = folder.child("out")
+    val err = folder.child("err")
+    check(command("sh").argument("-c").argument("printf 'o\\000k'; printf bad >&2").output(out.text).errors(err.text).run() == 0, "redirects run")
+    check(out.readText().size == 3 && err.readText() == "bad", "redirected")
+    val copied = folder.child("copied")
+    check(command("cat").input(out.text).output(copied.text).run() == 0, "input")
+    check(copied.readText() == out.readText(), "input copied")
+    check(command("cat").input("/nowhere/at/all").run() == 127, "no such input")
+    check(secret.permissions() == 416, "mode kept")
+
+    // A lock is exclusive between processes, and isn't inherited.
+    val lockPath = folder.child("lock")
+    val lock = lockPath.fileLock()
+    check(lock.descriptor >= 0 && lock.hold(), "hold")
+    val other = lockPath.fileLock()
+    check(!other.tryHold(), "held by another descriptor")
+    val sleeper = command("sleep").argument("5").start()
+    check(lock.release(), "release")
+    check(other.tryHold(), "free even though a child runs")
+    sleeper.stop(10)
+    check(other.release(), "release the other")
+
+    // In pieces, across block boundaries, against the whole.
+    for (size in [0, 1, 55, 56, 63, 64, 65, 119, 120, 1000]) {
+        var whole = ""
+        var index = 0
+        while (index < size) {
+            whole = "${whole}x"
+            index = index + 1
+        }
+        val stream = sha256Stream()
+        stream.update(whole.slice(0, size / 3))
+        stream.update(whole.slice(size / 3, size))
+        check(stream.finish() == sha256(whole), "sha256 of $size")
+    }
+    val known = sha256Stream()
+    known.update("abc")
+    check(hexEncode(known.finish()) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256 abc")
+
+    val sorted = sortedStrings(["b", "a", "ab", "", "B", "a"])
+    var joined = ""
+    for (value in sorted) joined = "$joined$value,"
+    check(joined == ",B,a,a,ab,b,", "sorted $joined")
+
+    folder.removeTree()
+    if (failures == 0) 42 else 1
+}
