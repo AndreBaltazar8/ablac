@@ -40,6 +40,9 @@ expect_error invalid-import-alias-export-private E_IMPORT_ALIAS_MEMBER_UNKNOWN
 expect_exit named-implicit-this 42
 expect_exit named-default-scope 42
 expect_error invalid-named-default-hidden-generic E_NAMED_ARGUMENT_HIDDEN
+expect_exit named-default-hidden-value 42
+expect_exit operator-annotation-after 42
+expect_exit lambda-inferred-result 42
 expect_exit nominal-index 42
 expect_error invalid-nominal-index index.type
 expect_exit nominal-method-capture 42

@@ -203,6 +203,41 @@ class BootstrapNamedArgumentNormalizer(
         false
     }
 
+    // Whether a generated function can compute `declaration`'s default for
+    // `parameter`: every type parameter its type mentions is one that the earlier
+    // parameters the default reads give, so a call infers it.
+    fun defaultFunctionInfers(declaration: BootstrapDeclaration, parameter: int): bool {
+        var used: array<string> = []
+        bootstrapNamedIdentifiers(declaration.parameterDefaults[parameter], used)
+        for (typeParameter in declaration.typeParameters) {
+            if (!bootstrapTypeMentions(declaration.parameterTypes[parameter], typeParameter)) continue
+            var inferred = false
+            var earlier = 0
+            while (earlier < parameter) {
+                if (bootstrapReceiverNameIn(used, declaration.parameters[earlier]) &&
+                    bootstrapTypeMentions(declaration.parameterTypes[earlier], typeParameter)) {
+                    inferred = true
+                }
+                earlier = earlier + 1
+            }
+            if (!inferred) return false
+        }
+        true
+    }
+
+    // The same for a method's default too, whose receiver it takes as a parameter:
+    // only not when its class is generic, as a generated function has no type
+    // parameters of its class's. The class's declaration, or -1 for none.
+    fun defaultFunctionFits(
+        declaration: BootstrapDeclaration,
+        parameter: int,
+        method: bool,
+        owner: int
+    ): bool {
+        this.defaultFunctionInfers(declaration, parameter) &&
+            (!method || owner < 0 || this.declarations[owner].typeParameters.size == 0)
+    }
+
     // Whether `expression` (a default) calls a constructor, function value or
     // foreign function of a name the caller hides.
     fun callsHiddenUncopiable(expression: BootstrapExpression, own: array<string>): bool {
@@ -221,19 +256,35 @@ class BootstrapNamedArgumentNormalizer(
         declaration: BootstrapDeclaration,
         parameter: int,
         arguments: array<string>,
-        at: BootstrapExpression
+        at: BootstrapExpression,
+        method: bool,
+        owner: int,
+        receiver: BootstrapExpression
     ): BootstrapExpression {
-        val value = declaration.parameterDefaults[parameter]
+        val written = declaration.parameterDefaults[parameter]
+        val parameterName = "__abla_receiver"
+        // Renamed first, as a parameter hides a field of its name.
+        val value = if (method) this.qualifyReceiver(
+            this.replaceParameterReferences(written, declaration.parameters, arguments),
+            BootstrapExpression("identifier", parameterName, at.begin, at.end, []), owner
+        ) else written
         var used: array<string> = []
         bootstrapNamedIdentifiers(value, used)
         val parameters: array<string> = []
         val types: array<string> = []
         val kinds: array<string> = []
         val passed: array<BootstrapExpression> = []
+        if (method && bootstrapReceiverNameIn(used, parameterName)) {
+            parameters.append(parameterName)
+            types.append(if (owner >= 0) this.declarations[owner].name else declaration.extensionOwner)
+            kinds.append("")
+            passed.append(receiver)
+        }
         var earlier = 0
         while (earlier < parameter) {
-            if (bootstrapReceiverNameIn(used, declaration.parameters[earlier])) {
-                parameters.append(declaration.parameters[earlier])
+            val earlierName = if (method) arguments[earlier] else declaration.parameters[earlier]
+            if (bootstrapReceiverNameIn(used, earlierName)) {
+                parameters.append(earlierName)
                 types.append(declaration.parameterTypes[earlier])
                 kinds.append("")
                 passed.append(BootstrapExpression(
@@ -241,6 +292,13 @@ class BootstrapNamedArgumentNormalizer(
                 ))
             }
             earlier = earlier + 1
+        }
+        // Those a call of it infers: the rest aren't the default's concern.
+        val typeParameters: array<string> = []
+        for (typeParameter in declaration.typeParameters) {
+            var mentioned = false
+            for (type in types) if (bootstrapTypeMentions(type, typeParameter)) mentioned = true
+            if (mentioned) typeParameters.append(typeParameter)
         }
         var serial = 0
         var name = "__abla_default_${declaration.name}_${parameter}_$serial"
@@ -252,7 +310,7 @@ class BootstrapNamedArgumentNormalizer(
             "fun", name, value.begin, value.end, value,
             parameters, types, declaration.parameterTypes[parameter],
             [], [], "", kinds, "", false, false, false, "", 0, 0, [], [], [], [],
-            declaration.sourceIdentity
+            declaration.sourceIdentity, [], false, false, typeParameters
         ))
         BootstrapExpression("call", name, at.begin, at.end, passed)
     }
@@ -286,10 +344,24 @@ class BootstrapNamedArgumentNormalizer(
         var text = expression.text
         if (expression.kind == "call" && !bootstrapReceiverNameIn(own, text) &&
             this.callerHides(text)) {
+            for (declaration in this.declarations) {
+                if ((declaration.kind == "val" || declaration.kind == "var") &&
+                    declaration.extensionOwner == "" && declaration.name == text) {
+                    // The accessor hands back the global function value itself.
+                    val arguments: array<BootstrapExpression> = [BootstrapExpression(
+                        "call", this.globalAccessor(declaration),
+                        expression.begin, expression.end, []
+                    )]
+                    for (child in children) arguments.append(child)
+                    return BootstrapExpression(
+                        "call.value", "", expression.begin, expression.end, arguments
+                    )
+                }
+            }
             if (this.uncopiableCallable(text)) {
                 if (this.callerCalls(text)) this.fail(
                     "HIDDEN",
-                    "a default left out of this call calls `$text`, which a local or field here hides, and it can't run elsewhere (a method's or generic function's): pass that argument, or rename the local",
+                    "a default left out of this call calls `$text`, which a local or field here hides, and it can't run elsewhere (a generic class's method's, or its type depends on a type parameter a call wouldn't infer): pass that argument, or rename the local",
                     expression
                 )
             } else if (this.target(text) != -1) text = this.functionAccessor(text)
@@ -773,6 +845,7 @@ class BootstrapNamedArgumentNormalizer(
                                 declaration.parameters,
                                 temporaryNames
                             )
+                            val defaultOwner = if (method) this.methodClass(memberTargets, 0) else -1
                             // A method's default reads the receiver's
                             // members, not the caller's names.
                             if (method) substituted = this.qualifyReceiver(
@@ -786,13 +859,14 @@ class BootstrapNamedArgumentNormalizer(
                             var own: array<string> = []
                             for (name in temporaryNames) own.append(name)
                             bootstrapReceiverBoundNames(normalizedDefault, own)
-                            if (!method && declaration.typeParameters.size == 0 &&
+                            if (this.defaultFunctionFits(declaration, parameter, method, defaultOwner) &&
                                 !bootstrapIsAnyDelegatedProperty(declaration, parameter) &&
                                 this.callsHiddenUncopiable(normalizedDefault, own)) {
                                 // No accessor reaches these: the whole default
                                 // runs where it was written.
                                 normalizedDefault = this.defaultFunctionCall(
-                                    declaration, parameter, temporaryNames, result
+                                    declaration, parameter, temporaryNames, result,
+                                    method, defaultOwner, receiver
                                 )
                             } else {
                                 normalizedDefault = this.readCalleeGlobals(normalizedDefault, own)
