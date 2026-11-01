@@ -2,6 +2,7 @@ import "backend/llvm/backend.ab"
 import "module.ab"
 import "sourcemap.ab"
 import "abla/sys/linux/fs"
+import "abla/text"
 import "abla/sys/linux/io"
 import "abla/sys/linux/process"
 import "abla/platform/host"
@@ -871,6 +872,12 @@ fun bootstrapNativeCacheHash(
 ): int {
     var hash = seed
     var index = 0
+    // Four bytes a step: this hashes the whole compiler.
+    while (index + 4 <= source.size) {
+        hash = hash * factor + textReadU32LittleEndian(source, index) + 1
+        hash = hash - (hash / modulus) * modulus
+        index = index + 4
+    }
     while (index < source.size) {
         hash = hash * factor + source[index] + 1
         hash = hash - (hash / modulus) * modulus
@@ -2029,8 +2036,6 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     // would let every such compiler share entries: that build runs uncached.
     // The image does not contain a shared LLVM library, nor the external opt
     // and llc that emit cross-target objects, so their versions join it.
-    val compilerImageRead = Path("/proc/self/exe").readText()
-    val cacheEnabled = allowCache && compilerImageRead.size > 0
     // A Mach-O development build keeps its module in process for code generation too:
     // nothing reads the text it would render (about 100 MB for a large program), which
     // the object emitter only parsed back. (ELF goes through the text: its partition
@@ -2039,6 +2044,11 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     val nativeHeld = target.hosted && target.objectFormat == "macho" && !ltoEligible &&
         cacheProfile == "inprocess-fast" && !bootstrapKeepLlvmText() &&
         !bootstrapLlvmOutOfProcess()
+    // Reading and hashing about 10 MB is a sixth of a small build, so only what keys
+    // on the image does it: the cache, and code generation units (on for every build).
+    val compilerImageUsed = allowCache || inProcessCodegen || nativeHeld
+    val compilerImageRead = if (compilerImageUsed) Path("/proc/self/exe").readText() else ""
+    val cacheEnabled = allowCache && compilerImageRead.size > 0
     // An executable's held module may be generated as code generation units, whose
     // object is an archive of them (codegen_units.ab) that the link loads whole: only an
     // executable's, as an object or library artifact is that object itself. (Its cache
@@ -2057,12 +2067,12 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
     }
     val compilerImage = "$compilerImageRead\n$backendIdentity"
-    val compilerFirstHash = bootstrapNativeCacheHash(
+    val compilerFirstHash = if (compilerImageUsed) bootstrapNativeCacheHash(
         compilerImage, 41, 269, 1000000007
-    )
-    val compilerSecondHash = bootstrapNativeCacheHash(
+    ) else 0
+    val compilerSecondHash = if (compilerImageUsed) bootstrapNativeCacheHash(
         compilerImage, 101, 271, 1000000009
-    )
+    ) else 0
     val cacheDirectory = bootstrapCacheDirectory()
     val partitionCacheNamespace =
         "$cacheDirectory/native-partition-${target.name}-llvm21-v3-$cacheProfile${if (bootstrapLlvmDebugInfo) "-g" else ""}-${compilerImage.size}-$compilerFirstHash-$compilerSecondHash"

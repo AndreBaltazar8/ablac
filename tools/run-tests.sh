@@ -5,9 +5,9 @@
 #   tools/run-tests.sh [compiler]
 #
 # Each command runs in the repository root, with its output in a log of its
-# own. The commands that can't share the machine with the others (listed in
-# serial_reason below) run afterwards, one at a time. The longest commands of
-# the last run start first.
+# own. The commands that can't run beside the others (listed in serial_reason
+# below) run afterwards, beside each other. The longest commands of the last run
+# start first.
 #
 # Environment:
 #   JOBS                 commands run at once (default: the number of CPUs)
@@ -46,14 +46,15 @@ cd "$project_root" || exit 1
 rm -rf "$output"
 mkdir -p "$output"
 
-# Why a command must run alone (empty: it runs alongside the others).
+# Why a command waits for the others (empty: it runs alongside them). The driver
+# of test-self-hosted.sh reruns these suite scripts in the same build directories.
 serial_reason() { # command
     case $1 in
-        *tools/test-self-hosted.sh*)
-            # Its driver reruns several of the suite's own scripts
-            # (test-nominal-scalars, test-unsafe-stack-memory, ...) in the
-            # same build directories, and runs eight tests at a time itself.
-            echo "reruns suite scripts in their build directories; parallel itself" ;;
+        *tools/test-borrow-lifetimes.sh* | *tools/test-floating-point.sh* | \
+        *tools/test-nominal-scalars.sh* | *tools/test-unsafe-stack-memory.sh* | \
+        *tools/test-local-shadowing.sh* | *tools/test-eval-steps.sh* | \
+        *tools/test-borrow-duplicates.sh*)
+            echo "test-self-hosted.sh reruns it in the same build directory" ;;
     esac
 }
 
@@ -201,12 +202,9 @@ run_all() { # limit n...
     done
 }
 
-echo "running ${#parallel[@]} commands, $jobs at a time, then ${#serial[@]} alone ($output)"
+echo "running ${#parallel[@]} commands, $jobs at a time, then ${#serial[@]} after them ($output)"
 run_all "$jobs" ${parallel[@]+"${parallel[@]}"}
-for n in ${serial[@]+"${serial[@]}"}; do
-    echo "alone: $(sed -n "${n}p" "$output/commands.txt") ($(serial_reason "$(sed -n "${n}p" "$output/commands.txt")"))"
-done
-run_all 1 ${serial[@]+"${serial[@]}"}
+run_all "$jobs" ${serial[@]+"${serial[@]}"}
 
 sort -n -o "$output/results.tsv" "$output/results.tsv" 2>/dev/null
 if [[ -z $filter && -s $output/results.tsv ]]; then
