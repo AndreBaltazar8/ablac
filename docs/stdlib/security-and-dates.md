@@ -3,13 +3,15 @@
 | Import | What it gives you |
 |---|---|
 | `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
-| `abla/crypto/hosted` | AES (GCM, CBC, ECB), RSA signatures and encryption, key parsing: through OpenSSL |
+| `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES (GCM, CBC, ECB), RSA signing, verifying and encryption, key parsing: in Abla, on every target |
+| `abla/crypto/hosted` | the same and more, through OpenSSL |
 | `abla/random` | a cryptographically secure source (`getrandom(2)`) |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
 | `abla/jwt`, `abla/jwt/remote` | JSON Web Token verification ([networking.md](../networking.md)) |
 
 `abla/crypto` and `abla/date` are pure Abla: they work on every target and at compile
-time. `abla/crypto/hosted` is OpenSSL, and links it into the programs that import it.
+time. `abla/crypto/aes` and `abla/crypto/rsa` are too, but not at compile time. `abla/crypto/hosted`
+is OpenSSL, and links it into the programs that import it. [Which to use](#which-to-use).
 
 ## `abla/crypto`
 
@@ -58,8 +60,7 @@ here wipes memory: a secret in a string stays there until the memory is reused.
 
 AES and RSA through OpenSSL's libcrypto, the provider `abla/tls/hosted` already uses, 1.1.1
 or 3.x. Programs that don't import it don't link it, and stay free of libc.
-Where OpenSSL is missing (embedded targets, wasm) there is no AES or RSA in the
-standard library: see [why](#why-not-in-abla).
+Where OpenSSL is missing (embedded targets, wasm), use [`abla/crypto/aes` and `abla/crypto/rsa`](#abla-cryptoaes-and-abla-cryptorsa).
 
 ```abla
 import "abla/io"
@@ -137,17 +138,89 @@ that a compiler can't make it stop early. Different lengths are unequal at once.
 | Verification and public-key encryption | no secret is involved in the key | |
 | Key bytes in Abla strings | none: strings can't be wiped | PEM text, passphrases and `secureRandomBytes` results stay in memory until it is reused. Read them late and don't keep them. Failed decryptions cleanse their buffer, and successful ones are the caller's |
 
-### Why not in Abla
-
-AES written in Abla would use table lookups indexed by key bytes, which leak through the
-cache, and RSA would need big-number code that doesn't branch or index on secret bits,
-through a code generator that promises nothing about either. `abla-saft` and `abla-pdf` carry such RSA for themselves, documented as not
-hardened. SHA-512 and the HMACs are in Abla because they have no such tables, and so
-they run at compile time and on every target, as the older hashes do.
-
 Left out so far: RSA-PSS, RSA key generation, ECDSA signing, Ed25519, ChaCha20-Poly1305, HKDF,
 SHA-3, SHA-224, CBC without padding, GCM with other nonce or tag sizes, and OAEP labels. Nothing here needs them
 yet, and each is a short wrapper around OpenSSL when something does.
+
+## `abla/crypto/aes` and `abla/crypto/rsa`
+
+AES and RSA with no OpenSSL, for wherever it isn't, and for programs that shouldn't link it: the same names
+as `abla/crypto/hosted`, so a program imports one or the other, or one under an alias (`import
+"abla/crypto/hosted" as hosted`). `abla/crypto/pure` is both. Same vectors, same results: see [the
+tests](#how-this-is-tested). The difference is in what they don't offer, and in how far their timing has been
+looked at.
+
+```abla
+import "abla/io"
+import "abla/crypto"
+import "abla/crypto/aes"
+
+fun main {
+    val key = hexDecode("000102030405060708090a0b0c0d0e0f")
+    val nonce = hexDecode("202122232425262728292a2b")
+    val sealed = aesGcmEncrypt(key, nonce, "a message", "its context")
+    println(aesGcmDecrypt(key, nonce, sealed.bytes, "its context").bytes)
+    println(aesGcmDecrypt(key, nonce, sealed.bytes, "another").error)
+    println(aesEcbDecryptPkcs5(key, aesEcbEncryptPkcs5(key, "hello").bytes).bytes)
+}
+// output:
+// a message
+// authentication failed: the data, key, nonce or associated data is wrong
+// hello
+```
+
+| | |
+|---|---|
+| `aesGcmEncrypt`, `aesGcmDecrypt`, `aesCbcEncryptPkcs7`, `aesCbcDecryptPkcs7`, `aesEcbEncryptPkcs5`, `aesEcbDecryptPkcs5` | as in [`abla/crypto/hosted`](#aes) |
+| `rsaPublicKeyFromPem`, `rsaPublicKeyFromDer`, `rsaPublicKeyFromCertificateDer` | as [there](#rsa). A certificate's chain, dates and signature aren't checked |
+| `rsaPrivateKeyFromPem(pem)`, `rsaPrivateKeyFromDer(der)` | PKCS#8 and PKCS#1, unencrypted. **No** encrypted PEM, no PKCS#12: use the hosted module, or decrypt first |
+| `private.signPkcs1Sha256`, `public.verifyPkcs1Sha256`, `private.signPkcs1Sha1Legacy`, `public.verifyPkcs1Sha1Legacy` | as there, with the same minimum sizes |
+| `public.encryptOaepSha256`, `public.encryptOaepSha1Legacy`, `public.encryptPkcs1Legacy` | as there. **No decryption**: doing it safely is a separate piece of work (Manger, Marvin), and nothing needs it yet |
+| `cryptoSetRandom(source)` | where the randomness for encryption and blinding comes from. Needed on anything but x86-64 Linux, where it's `getrandom`: a Wasm host's `crypto.getRandomValues`, an ESP32's hardware RNG. Its quality is yours to answer for. Without one, what needs it fails, and signing never goes on unblinded |
+
+### What timing protection each has, and hasn't
+
+Read [constant-time.md](../constant-time.md) first: it's what "read" below means, and its limits (a CPU's own
+variable-time instructions, Wasm engines, speculation, memory left behind) apply to every line here.
+
+| | Protects | Read on the 4 targets | Doesn't protect |
+|---|---|---|---|
+| AES software (bitsliced) | no table, no branch on key or data | S-box, rounds, in both directions. **The key schedule and the block's loading aren't read**: they use the same secret types | a CPU whose word operations vary with data |
+| AES hardware (x86-64 AES-NI, ARMv8) | no table, per the vendor | no: one instruction a round, and vendors state the timing doesn't depend on data, though ARM's DIT isn't set | |
+| Which of the two | | | not hidden: a program on one machine always takes the same one |
+| GHASH software | masks and shifts, 128 steps for each block, no table | yes | |
+| GHASH hardware | carry-less multiply, per the vendor | no | |
+| GCM's tag check | every byte compared, before any plaintext is made | yes | a tag length is public |
+| CBC and ECB padding | checked with masks | yes | **the answer**: "bad padding" is returned. That is a padding oracle if a remote party sees it. Never let one |
+| RSA verify, encrypt | public values, so nothing to protect but the message before encryption: its bytes aren't branched on in the arithmetic | Montgomery multiplication | padding is built from `string`s with the usual operations; the plaintext's length is public |
+| RSA signing | blinded base, CRT with a 4-bit fixed window read whole, squarings and multiplications independent of the exponent, result checked with the public exponent | Montgomery multiplication, the table lookup, the conditional subtraction. **Not read**: the steps around them in `rsaCrt`, which use the same secret types and branch only on lengths | sizes of p, q and their numbers are public. No exponent blinding, which the fixed window makes unnecessary for timing but would help against power analysis. On Xtensa `mull`'s timing is unpublished: see below |
+| Key loading | the base 64 of a PEM isn't branched on or looked up | the character step | DER tags and lengths are branched on, which are public, as is the position of line breaks. An integer's length shows through parsing. **The `string`s holding the DER and base 64 aren't wiped** |
+| Keys in memory | a private key's numbers are in raw memory, wiped on drop; AES's schedule too | | what was copied before: the PEM, its decoded `string` |
+| `hexDecode`, `base64Decode` | nothing | | not constant-time: don't feed them secrets that matter |
+
+On **ESP32-S3** all of this is software (the S3's AES peripheral isn't used), and it's the least examined: read in
+the assembly, compiled, and never run here. Its multiplier has no published timing. For a key that matters,
+don't use it there without measuring it on the board.
+
+Nothing here has been through what OpenSSL's has: years of attack, and timing measured on real hardware. No
+statistical test (`dudect`) has been run: the assembly check shows no branch or index on a secret, and no more
+than that.
+
+### Which to use
+
+- On a hosted server with OpenSSL, for keys that matter: `abla/crypto/hosted`. It has more (decryption, encrypted
+  keys, PKCS#12) and more scrutiny, and is about 14 times faster at signing. TLS stays on it.
+- For embedded and Wasm, or where linking OpenSSL isn't wanted: these. Compared on an i9-13900K with 2048-bit
+  keys, 2026-11-01: signing 5.1 ms (OpenSSL 0.36 ms); GCM 476 MiB/s with instructions and 34 MiB/s without (OpenSSL
+  2700 MiB/s); ECB 2700 MiB/s and 130 MiB/s.
+
+### How this is tested
+
+`tools/test-crypto-pure.sh`: the NIST CAVP and Wycheproof vectors of `tools/test-crypto.sh` on both AES paths,
+on this CPU and on `qemu-x86_64 -cpu qemu64` with neither instruction; refusals; random inputs against
+`abla/crypto/hosted` and the `openssl` CLI, both ways. Known answers on AArch64 under qemu (with AES and PMULL) and
+on Wasm under Node. On Xtensa it's compiled, and read by `tools/test-ct.sh`, not run. **OAEP and PKCS#1 decryption
+vectors aren't run, since neither decrypts.**
 
 ## Dates: `abla/date`
 

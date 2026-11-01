@@ -41,6 +41,7 @@ Built into the language rather than imported: `string`, arrays, `Map`,
 | `abla/simd` | fixed-width vectors; `targetHas`, `cpuHas`, AES rounds and carry-less multiply |
 | `abla/ct` | secret integers, masks and selects with no branch or index on the value |
 | `abla/crypto` | SHA-512, SHA-384, SHA-256, SHA-1, MD5, HMAC, PBKDF2, Base64, hexadecimal, constant-time comparison |
+| `abla/crypto/aes`, `abla/crypto/rsa`, `abla/crypto/pure` | AES and RSA in Abla, no OpenSSL, on every target; what timing protection each has is documented |
 | `abla/crypto/hosted` | AES-GCM, AES-CBC, AES-ECB, RSA signatures and encryption, PEM, DER, X.509 and PKCS#12 keys, through OpenSSL |
 | `abla/date` | UTC calendar dates, ISO 8601 and HTTP dates |
 | `abla/test` | checks for test programs run by `ablac test` |

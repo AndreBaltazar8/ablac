@@ -239,6 +239,7 @@ test-serial: ablac
 	tools/test-http-client.sh $(COMPILER)
 	tools/test-tls-faults.sh $(COMPILER)
 	tools/test-crypto.sh $(COMPILER)
+	tools/test-crypto-pure.sh $(COMPILER)
 	tools/test-import-aliases.sh $(COMPILER)
 	tools/test-linux-arguments.sh $(COMPILER)
 	tools/test-linux-io.sh $(COMPILER)

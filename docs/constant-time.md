@@ -48,8 +48,10 @@ The check reads release builds. A `--fast` build isn't read: its calls aren't in
 would stop at them. Nothing in that path is expected to add a branch, but that is an expectation, so
 build secret code in release.
 
-The fixtures are what is checked: `ctSelect`, `ctEq`, `ctLt`, `ctIsNonZero`, arithmetic,
-`ctDifferenceAddress`, at the widths listed in the script, and later, what `abla/crypto` builds on them.
+The fixtures are what is checked: `ctSelect`, `ctEq`, `ctLt`, `ctIsNonZero`, arithmetic and
+`ctDifferenceAddress`, at the widths listed in the script, and what `abla/crypto` builds on them: AES's
+bitsliced rounds and padding check, software GHASH, Montgomery multiplication, the exponent table's lookup and
+the base 64 step ([what's protected, function by function](stdlib/security-and-dates.md#what-timing-protection-each-has-and-hasnt)).
 Your own function isn't read unless you add it to such a test. The types stop you writing a leak in it;
 they don't stop you declassifying.
 
