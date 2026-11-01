@@ -8,6 +8,7 @@ fi
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=$1
+[[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 test_directory=$(mktemp -d "$project_root/build/hot-reload.XXXXXX")
 server=0
 
@@ -43,6 +44,10 @@ wait_for_log() {
     return 1
 }
 
+# (Its own directory: serve leaves its last build where it runs.)
+mkdir "$test_directory/build"
+cd "$test_directory"
+export ABLA_CACHE_DIR="$project_root/build/.abla-cache"
 "${new_session[@]}" env ABLA_MAX_MEMORY_MB=1024 ABLA_MAX_SECONDS=15 \
     "$compiler" serve "$test_directory/app.ab" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &

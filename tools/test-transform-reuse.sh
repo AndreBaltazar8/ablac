@@ -5,6 +5,7 @@
 set -euo pipefail
 
 compiler=${1:-build/ablac}
+[[ $compiler == /* || $compiler != */* ]] || compiler="$PWD/$compiler"
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 test_directory=$(mktemp -d "$project_root/build/transform-reuse.XXXXXX")
 server=0
@@ -34,6 +35,10 @@ wait_for() { # file pattern
     return 1
 }
 
+# (Its own directory: serve leaves its last build where it runs.)
+mkdir "$test_directory/build"
+cd "$test_directory"
+export ABLA_CACHE_DIR="$project_root/build/.abla-cache"
 "${new_session[@]}" env ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=150 \
     "$compiler" serve "$test_directory/app.ab" \
     > "$test_directory/stdout.txt" 2> "$test_directory/stderr.txt" &
