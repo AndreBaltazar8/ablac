@@ -50,6 +50,14 @@
       2026-11-01), and passed at JOBS=40, 60 and a second 50. Not looked into.
 - [ ] `tools/test-transform-reuse.sh` failed once under `make test` (JOBS=30, load about 15): "timed
       out waiting for other=1". It then passed three times alone (2026-10-31). Not explained.
+- [ ] The Linux release binary isn't reproduced outside CI. Rebuilding v0.2.27 from its own artifact
+      here gives 10052312 bytes against 10049432, with `.text` 1122 bytes bigger, and v0.2.26 also
+      differs. CI's own stage 1 and 2 agree, and so do local ones. It isn't LLVM: `ABLA_NIX_XTENSA=0`
+      links the same libLLVM as CI and gives the same size as the Xtensa shell. Not explained (2026-11-01).
+- [ ] `tools/test-simd.sh`, `test-ct.sh` and `test-crypto-pure.sh` fail on Xtensa when given an
+      installed `ablac`: their `llc` shim for `-relocation-model=static` goes first on `PATH`, and the
+      install's wrapper puts its own LLVM ahead of it, so llc aborts on PIC. They pass with the
+      wrapper's payload, `libexec/ablac.bin`. `test-f32.sh` has the same shim; not run this way.
 
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
