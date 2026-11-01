@@ -60,7 +60,7 @@ here wipes memory: a secret in a string stays there until the memory is reused.
 
 AES and RSA through OpenSSL's libcrypto, the provider `abla/tls/hosted` already uses, 1.1.1
 or 3.x. Programs that don't import it don't link it, and stay free of libc.
-Where OpenSSL is missing (embedded targets, wasm), use [`abla/crypto/aes` and `abla/crypto/rsa`](#abla-cryptoaes-and-abla-cryptorsa).
+Where OpenSSL is missing (embedded targets, wasm), use [`abla/crypto/aes` and `abla/crypto/rsa`](#ablacryptoaes-and-ablacryptorsa).
 
 ```abla
 import "abla/io"
