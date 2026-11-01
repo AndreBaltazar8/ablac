@@ -93,6 +93,15 @@ limited_status=$?
 set -e
 [[ $limited_status -eq 101 ]] || exit 1
 rg -q 'memory limit exceeded' "$directory/limited.err"
+# The system refusing memory, below any limit of the runtime's own, says so rather than trapping.
+"$compiler" build "$project_root/tests/cases/modules/runtime-out-of-memory.ab" -o "$directory/out-of-memory"
+set +e
+(ulimit -v 400000; "$directory/out-of-memory") > "$directory/out-of-memory.out" 2> "$directory/out-of-memory.err"
+out_of_memory_status=$?
+set -e
+[[ $out_of_memory_status -eq 101 ]] || { echo "out of memory: exit $out_of_memory_status" >&2; exit 1; }
+rg -q 'panic: out of memory: the system refused an allocation' "$directory/out-of-memory.err"
+rg -q 'ABLA_MAX_MEMORY_MB' "$directory/out-of-memory.err"
 "$compiler" build \
     "$project_root/tests/cases/modules/runtime-memory-collect.ab" \
     -o "$collector_program"

@@ -25,4 +25,16 @@ for megabytes in 4 16 64; do
         exit 1
     fi
 done
+# Below the budget, the address space running out first, as under the launcher's own limit: a message, not Illegal instruction.
+set +e
+(ulimit -v 400000; ABLA_MAX_MEMORY_MB=4096 perl -e 'alarm 60; exec @ARGV' \
+    "$compiler" build "$project_root/src/orc_main.ab" -o "$output_directory/compiler" --fast) \
+    > "$output_directory/build.out" 2> "$output_directory/build.err"
+status=$?
+set -e
+if [[ $status -ne 101 ]] || ! grep -Fq 'panic: out of memory' "$output_directory/build.err" || ! grep -Fq 'ABLA_MAX_MEMORY_MB' "$output_directory/build.err"; then
+    echo "compiler memory budget: a build out of address space exited $status" >&2
+    sed -n '1,20p' "$output_directory/build.err" >&2
+    exit 1
+fi
 echo "compiler memory budget: builds over 4, 16 and 64 MB budgets stop with the limit's panic within 60 s"
