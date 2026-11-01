@@ -71,6 +71,12 @@
       install's wrapper puts its own LLVM ahead of it, so llc aborts on PIC. They pass with the
       wrapper's payload, `libexec/ablac.bin`. `test-f32.sh` has the same shim; not run this way.
 
+- A compiler that reaches its memory cap dies with "Illegal instruction" and no message (`ud2` in the runtime, seen
+  2026-11-01 on 0.2.27): `build/ablac --emit-llvm` on abla-embedded's `tests/package-import.ab` under its default
+  4096 MB, while 5000 MB or more gets to the program's real diagnostics. It should say it ran out of memory and
+  which limit to raise, as `ABLA_MAX_MEMORY_MB` isn't something anyone guesses from a SIGILL. 4 GiB for one import
+  of `src/esp32.ab` also belongs under "Compile time and memory".
+
 ## Tools (found porting NovaKind's scripts, 2026-10-31)
 
 - [ ] A program can't handle a signal: no `sigaction`, so nothing can clean up on Ctrl-C or TERM. A tool that edits a file
