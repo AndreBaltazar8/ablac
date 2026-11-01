@@ -81,6 +81,20 @@
 
 ## Compiler and stdlib
 
+- [ ] **abla-saft's move onto `abla/crypto/rsa` waits for a release.** Its branch `pure-rsa` (32ecb51) passes
+  its tests and `make signatures` against this tree, but its CI pins a release with no such module, so it
+  isn't on its main. Merge it after the next release, and bump its CI there. abla-pdf still carries its own
+  unblinded RSA for its own signing: it could move the same way.
+- [ ] **`abla/crypto/rsa` has no decryption** (OAEP, PKCS#1 v1.5), so `tests/vectors/crypto/rsa.txt`'s `decrypt-`
+  lines aren't run on it. Manger and Marvin are why it isn't a short addition: padding has to be checked
+  with masks and the failure made implicit. Nor does it read encrypted PEM or PKCS#12.
+- [ ] **No timing measurements of abla/crypto.** `tools/test-ct.sh` reads the assembly; nothing has run a statistical
+  test (`dudect`) on real hardware, or anything at all on an ESP32-S3. The Xtensa path is compiled and read only.
+- [ ] **`--fast` builds aren't read by `tools/test-ct.sh`**: the checker stops at their calls. It could follow
+  internal calls.
+- [ ] **Not read in abla/crypto, though typed secret:** AES's key schedule and block loading, `rsaCrt`'s steps around
+  the fixtures, `bnFromBytes`, `bnToBytes`, `bnResidueSquare`. Each could be a fixture.
+
 - [ ] The standard library has no Unix domain sockets: `abla/sys/linux` and `abla/net` only offer TCP, IPv4 and IPv6, and
       `abla/http` and `abla/tls/hosted` listen and connect over those. NovaKind's signer uses loopback with a secret for it, where a
       socket's file permissions would say who may connect.
