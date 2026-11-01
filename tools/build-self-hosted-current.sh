@@ -17,6 +17,11 @@ compiler=$1
 if [[ $compiler != /* ]]; then compiler=$project_root/$compiler; fi
 output=$2
 entry=${3:-src/orc_main.ab}
+# A compiler linked outside this shell (the pinned one) doesn't say where its
+# OpenSSL is. What it starts here is the shell's, so this reaches no host tool.
+if [[ -n ${ABLA_LINUX_OPENSSL_LIB:-} ]] && ! "$compiler" --version >/dev/null 2>&1; then
+    export LD_LIBRARY_PATH=$ABLA_LINUX_OPENSSL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+fi
 # v0.2.20 cannot parse the private declarations now used by the library.
 # This checkpoint implements private declarations and generics while its own
 # library still uses the old syntax. Keep the source transition reproducible
