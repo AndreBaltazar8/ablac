@@ -24,7 +24,7 @@ random_hex() { head -c "$1" /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
 
 # (At once: each writes only its own files.)
 pids=()
-programs=(vectors edge tool against-hosted kat-native)
+programs=(vectors edge tool against-hosted both kat-native)
 for program in "${programs[@]}"; do
     "$compiler" build "$cases/$program.ab" -o "$out/$program" --no-cache \
         > "$out/$program.build.log" 2>&1 &
@@ -77,6 +77,12 @@ if timeout 300 "$out/against-hosted" "$keys" "$rounds" > "$out/against-hosted.lo
     echo "ok   against abla/crypto/hosted: $rounds rounds"
 else
     fail "against hosted (exit $?)"; tail -20 "$out/against-hosted.log"
+fi
+
+if timeout 60 "$out/both" "$keys/k2048.pem" > "$out/both.log" 2>&1 < /dev/null; then
+    echo "ok   one program with both RSAs, no aliases"
+else
+    fail "both (exit $?)"; tail -20 "$out/both.log"
 fi
 
 # --- Random inputs against the openssl CLI, on both paths ------------------------------------

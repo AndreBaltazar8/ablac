@@ -71,13 +71,13 @@ import "abla/random"
 fun main {
     val key = secureRandomBytes(32)
     val nonce = secureRandomBytes(12)
-    val sealed = aesGcmEncrypt(key.bytes, nonce.bytes, "a message", "its context")
-    val opened = aesGcmDecrypt(key.bytes, nonce.bytes, sealed.bytes, "its context")
+    val sealed = hostedAesGcmEncrypt(key.bytes, nonce.bytes, "a message", "its context")
+    val opened = hostedAesGcmDecrypt(key.bytes, nonce.bytes, sealed.bytes, "its context")
     println("${sealed.bytes.size} ${opened.bytes}")
-    println(aesGcmDecrypt(key.bytes, nonce.bytes, sealed.bytes, "another").error)
-    val ecb = aesEcbEncryptPkcs5("0123456789abcdef", "hello")
+    println(hostedAesGcmDecrypt(key.bytes, nonce.bytes, sealed.bytes, "another").error)
+    val ecb = hostedAesEcbEncryptPkcs5("0123456789abcdef", "hello")
     println(hexEncode(ecb.bytes))
-    val none = rsaPrivateKeyFromPem("not a key")
+    val none = hostedRsaPrivateKeyFromPem("not a key")
     println("${none.ok()}")
 }
 // output:
@@ -94,9 +94,9 @@ and never holds key material or plaintext.
 
 | Function | Notes |
 |---|---|
-| `aesGcmEncrypt(key, nonce, plaintext, associatedData = "")`, `aesGcmDecrypt(key, nonce, ciphertext, associatedData = "")` | use this one. The result is the ciphertext and then a 16-byte tag; decryption returns nothing unless the tag verifies. The nonce has 12 bytes and must never repeat under a key |
-| `aesCbcEncryptPkcs7(key, iv, plaintext)`, `aesCbcDecryptPkcs7(key, iv, ciphertext)` | unauthenticated. The IV has 16 unpredictable bytes. Bad padding is a distinct failure, so never show a remote party which failure happened (a padding oracle): pair it with a MAC checked first |
-| `aesEcbEncryptPkcs5(key, plaintext)`, `aesEcbDecryptPkcs5(key, ciphertext)` | **for protocols that require it only**, such as Portugal's AT WS-Security header. Equal blocks encrypt equally |
+| `hostedAesGcmEncrypt(key, nonce, plaintext, associatedData = "")`, `hostedAesGcmDecrypt(key, nonce, ciphertext, associatedData = "")` | use this one. The result is the ciphertext and then a 16-byte tag; decryption returns nothing unless the tag verifies. The nonce has 12 bytes and must never repeat under a key |
+| `hostedAesCbcEncryptPkcs7(key, iv, plaintext)`, `hostedAesCbcDecryptPkcs7(key, iv, ciphertext)` | unauthenticated. The IV has 16 unpredictable bytes. Bad padding is a distinct failure, so never show a remote party which failure happened (a padding oracle): pair it with a MAC checked first |
+| `hostedAesEcbEncryptPkcs5(key, plaintext)`, `hostedAesEcbDecryptPkcs5(key, ciphertext)` | **for protocols that require it only**, such as Portugal's AT WS-Security header. Equal blocks encrypt equally |
 
 Keys have 16, 24 or 32 bytes. For a 16-byte block, PKCS#5 and PKCS#7 padding are the same.
 
@@ -107,11 +107,11 @@ copy is freed and cleansed when it's dropped.
 
 | Function | Reads |
 |---|---|
-| `rsaPrivateKeyFromPem(pem, passphrase = "")` | PKCS#8, encrypted PKCS#8, PKCS#1. An encrypted key without its passphrase fails; it never asks on the terminal |
-| `rsaPrivateKeyFromDer(der)` | unencrypted PKCS#8 or PKCS#1 |
-| `rsaPrivateKeyFromPkcs12(der, password)` | a `.pfx`. OpenSSL 3 refuses RC2 (what OpenSSL 1.x's `pkcs12 -export` writes) unless re-encrypted: `openssl pkcs12 -in old.pfx -legacy -nodes \| openssl pkcs12 -export -out new.pfx` |
-| `rsaPublicKeyFromPem(pem)` | `PUBLIC KEY` (SubjectPublicKeyInfo), `RSA PUBLIC KEY`, or the key of a `CERTIFICATE`. The certificate's chain and dates aren't checked |
-| `rsaPublicKeyFromDer(der)`, `rsaPublicKeyFromCertificateDer(der)` | SubjectPublicKeyInfo; an X.509 certificate's key |
+| `hostedRsaPrivateKeyFromPem(pem, passphrase = "")` | PKCS#8, encrypted PKCS#8, PKCS#1. An encrypted key without its passphrase fails; it never asks on the terminal |
+| `hostedRsaPrivateKeyFromDer(der)` | unencrypted PKCS#8 or PKCS#1 |
+| `hostedRsaPrivateKeyFromPkcs12(der, password)` | a `.pfx`. OpenSSL 3 refuses RC2 (what OpenSSL 1.x's `pkcs12 -export` writes) unless re-encrypted: `openssl pkcs12 -in old.pfx -legacy -nodes \| openssl pkcs12 -export -out new.pfx` |
+| `hostedRsaPublicKeyFromPem(pem)` | `PUBLIC KEY` (SubjectPublicKeyInfo), `RSA PUBLIC KEY`, or the key of a `CERTIFICATE`. The certificate's chain and dates aren't checked |
+| `hostedRsaPublicKeyFromDer(der)`, `hostedRsaPublicKeyFromCertificateDer(der)` | SubjectPublicKeyInfo; an X.509 certificate's key |
 
 | Method | Keys | Notes |
 |---|---|---|
@@ -144,9 +144,9 @@ yet, and each is a short wrapper around OpenSSL when something does.
 
 ## `abla/crypto/aes` and `abla/crypto/rsa`
 
-AES and RSA with no OpenSSL, for wherever it isn't, and for programs that shouldn't link it: the same names
-as `abla/crypto/hosted`, so a program imports one or the other, or one under an alias (`import
-"abla/crypto/hosted" as hosted`). `abla/crypto/pure` is both. Same vectors, same results: see [the
+AES and RSA with no OpenSSL, for wherever it isn't, and for programs that shouldn't link it. They answer to the names
+`abla/crypto/hosted` gives with `hosted` in front (`rsaPrivateKeyFromPem` there is `hostedRsaPrivateKeyFromPem`), so one
+program, or the packages it uses, can have both. `abla/crypto/pure` is both of these two. Same vectors, same results: see [the
 tests](#how-this-is-tested). The difference is in what they don't offer, and in how far their timing has been
 looked at.
 
