@@ -100,7 +100,8 @@ only its parse errors.
 | `when.non-exhaustive`, `when.duplicate`, `when.else-last`, `when.else-duplicate`, `when.empty` | see [control flow](language.md#control-flow) |
 | `break.outside-loop`, `continue.outside-loop`, `return.outside-function` | control transfer outside its construct |
 | `E_NAMED_ARGUMENT_UNKNOWN`, `_DUPLICATE`, `_ORDER`, `_REQUIRED`, `_TARGET`, `_ARITY` | named-argument errors ([functions](language.md#functions)) |
-| `E_NAMED_ARGUMENT_HIDDEN` | a default left out of a named call calls a constructor or foreign function that a local or function-typed field in the caller hides, and can't move out of the caller (a generic class's method, or a type a call wouldn't infer): pass the argument |
+| `call.not-function:<name>` | a call by a name that a local or field holds, not a function, while the top-level name is a function value: rename one |
+| `E_NAMED_ARGUMENT_HIDDEN` | a default left out of a named call calls a constructor or foreign function that a local or function-typed field in the caller hides, and its type has a type parameter no earlier parameter gives: pass the argument |
 | `E_NAMED_ARGUMENT_DELEGATED` | a constructor argument names a delegated property, whose delegate comes from its `by` ([delegated properties](language.md#delegated-class-properties)) |
 | `field.extension-owner:<T>` | an extension field on a type with no object to hold it: a scalar, string, array, nominal type or interface ([extension fields](language.md#extension-fields)) |
 | `field.extension-shadows:<T>.<f>` | an extension field named like a field or method of its class |

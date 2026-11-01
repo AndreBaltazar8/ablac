@@ -204,18 +204,15 @@ class BootstrapNamedArgumentNormalizer(
     }
 
     // Whether a generated function can compute `declaration`'s default for
-    // `parameter`: every type parameter its type mentions is one that the earlier
-    // parameters the default reads give, so a call infers it.
+    // `parameter`: every type parameter its type mentions is one that an earlier
+    // parameter gives, so a call of it infers that.
     fun defaultFunctionInfers(declaration: BootstrapDeclaration, parameter: int): bool {
-        var used: array<string> = []
-        bootstrapNamedIdentifiers(declaration.parameterDefaults[parameter], used)
         for (typeParameter in declaration.typeParameters) {
-            if (!bootstrapTypeMentions(declaration.parameterTypes[parameter], typeParameter)) continue
+            if (!bootstrapNamedTypeMentions(declaration.parameterTypes[parameter], typeParameter)) continue
             var inferred = false
             var earlier = 0
             while (earlier < parameter) {
-                if (bootstrapReceiverNameIn(used, declaration.parameters[earlier]) &&
-                    bootstrapTypeMentions(declaration.parameterTypes[earlier], typeParameter)) {
+                if (bootstrapNamedTypeMentions(declaration.parameterTypes[earlier], typeParameter)) {
                     inferred = true
                 }
                 earlier = earlier + 1
@@ -225,24 +222,12 @@ class BootstrapNamedArgumentNormalizer(
         true
     }
 
-    // The same for a method's default too, whose receiver it takes as a parameter:
-    // only not when its class is generic, as a generated function has no type
-    // parameters of its class's. The class's declaration, or -1 for none.
-    fun defaultFunctionFits(
-        declaration: BootstrapDeclaration,
-        parameter: int,
-        method: bool,
-        owner: int
-    ): bool {
-        this.defaultFunctionInfers(declaration, parameter) &&
-            (!method || owner < 0 || this.declarations[owner].typeParameters.size == 0)
-    }
-
     // Whether `expression` (a default) calls a constructor, function value or
     // foreign function of a name the caller hides.
     fun callsHiddenUncopiable(expression: BootstrapExpression, own: array<string>): bool {
-        if (expression.kind == "call" && !bootstrapReceiverNameIn(own, expression.text) &&
-            this.callerHides(expression.text) && this.uncopiableCallable(expression.text)) return true
+        val called = bootstrapNamedCallBase(expression.text)
+        if (expression.kind == "call" && !bootstrapReceiverNameIn(own, called) &&
+            this.callerHides(called) && this.uncopiableCallable(called)) return true
         for (child in expression.children) {
             if (this.callsHiddenUncopiable(child, own)) return true
         }
@@ -274,16 +259,26 @@ class BootstrapNamedArgumentNormalizer(
         val types: array<string> = []
         val kinds: array<string> = []
         val passed: array<BootstrapExpression> = []
-        if (method && bootstrapReceiverNameIn(used, parameterName)) {
+        // A generic class's receiver goes along always: it says what its type
+        // parameters are, which the default's type may mention.
+        val classTypes: array<string> = if (owner >= 0) this.declarations[owner].typeParameters else []
+        if (method && (classTypes.size > 0 || bootstrapReceiverNameIn(used, parameterName))) {
             parameters.append(parameterName)
-            types.append(if (owner >= 0) this.declarations[owner].name else declaration.extensionOwner)
+            types.append(if (owner < 0) declaration.extensionOwner
+                else if (classTypes.size == 0) this.declarations[owner].name
+                else "${this.declarations[owner].name}<${bootstrapNamedTypeList(classTypes)}>")
             kinds.append("")
             passed.append(receiver)
         }
         var earlier = 0
         while (earlier < parameter) {
             val earlierName = if (method) arguments[earlier] else declaration.parameters[earlier]
-            if (bootstrapReceiverNameIn(used, earlierName)) {
+            var gives = false
+            for (typeParameter in declaration.typeParameters) {
+                if (bootstrapNamedTypeMentions(declaration.parameterTypes[parameter], typeParameter) &&
+                    bootstrapNamedTypeMentions(declaration.parameterTypes[earlier], typeParameter)) gives = true
+            }
+            if (gives || bootstrapReceiverNameIn(used, earlierName)) {
                 parameters.append(earlierName)
                 types.append(declaration.parameterTypes[earlier])
                 kinds.append("")
@@ -295,9 +290,10 @@ class BootstrapNamedArgumentNormalizer(
         }
         // Those a call of it infers: the rest aren't the default's concern.
         val typeParameters: array<string> = []
+        for (typeParameter in classTypes) typeParameters.append(typeParameter)
         for (typeParameter in declaration.typeParameters) {
             var mentioned = false
-            for (type in types) if (bootstrapTypeMentions(type, typeParameter)) mentioned = true
+            for (type in types) if (bootstrapNamedTypeMentions(type, typeParameter)) mentioned = true
             if (mentioned) typeParameters.append(typeParameter)
         }
         var serial = 0
@@ -342,8 +338,9 @@ class BootstrapNamedArgumentNormalizer(
         val children: array<BootstrapExpression> = []
         for (child in expression.children) children.append(this.readCalleeGlobals(child, own))
         var text = expression.text
-        if (expression.kind == "call" && !bootstrapReceiverNameIn(own, text) &&
-            this.callerHides(text)) {
+        val called = bootstrapNamedCallBase(text)
+        if (expression.kind == "call" && !bootstrapReceiverNameIn(own, called) &&
+            this.callerHides(called)) {
             for (declaration in this.declarations) {
                 if ((declaration.kind == "val" || declaration.kind == "var") &&
                     declaration.extensionOwner == "" && declaration.name == text) {
@@ -358,10 +355,10 @@ class BootstrapNamedArgumentNormalizer(
                     )
                 }
             }
-            if (this.uncopiableCallable(text)) {
-                if (this.callerCalls(text)) this.fail(
+            if (this.uncopiableCallable(called)) {
+                if (this.callerCalls(called)) this.fail(
                     "HIDDEN",
-                    "a default left out of this call calls `$text`, which a local or field here hides, and it can't run elsewhere (a generic class's method's, or its type depends on a type parameter a call wouldn't infer): pass that argument, or rename the local",
+                    "a default left out of this call calls `$text`, which a local or field here hides, and it can't run elsewhere (its type has a type parameter no earlier parameter gives): pass that argument, or rename the local",
                     expression
                 )
             } else if (this.target(text) != -1) text = this.functionAccessor(text)
@@ -859,7 +856,7 @@ class BootstrapNamedArgumentNormalizer(
                             var own: array<string> = []
                             for (name in temporaryNames) own.append(name)
                             bootstrapReceiverBoundNames(normalizedDefault, own)
-                            if (this.defaultFunctionFits(declaration, parameter, method, defaultOwner) &&
+                            if (this.defaultFunctionInfers(declaration, parameter) &&
                                 !bootstrapIsAnyDelegatedProperty(declaration, parameter) &&
                                 this.callsHiddenUncopiable(normalizedDefault, own)) {
                                 // No accessor reaches these: the whole default
@@ -924,6 +921,36 @@ fun bootstrapNamedIdentifiers(expression: BootstrapExpression, var names: array<
     if (expression.kind == "identifier") names.append(expression.text)
     for (child in expression.children) bootstrapNamedIdentifiers(child, names)
     return
+}
+
+/** A call's name without its type arguments: `Box<T>` is a call of `Box`. */
+fun bootstrapNamedCallBase(text: string): string {
+    var index = 0
+    while (index < text.size && text[index] != 60) index = index + 1
+    text.slice(0, index)
+}
+
+/** Whether a type's text names `word` whole. */
+fun bootstrapNamedTypeMentions(type: string, word: string): bool {
+    var index = 0
+    while (index + word.size <= type.size) {
+        if (type.slice(index, index + word.size) == word &&
+            (index == 0 || !bootstrapNamedTypeWordByte(type[index - 1])) &&
+            (index + word.size == type.size || !bootstrapNamedTypeWordByte(type[index + word.size]))) {
+            return true
+        }
+        index = index + 1
+    }
+    false
+}
+
+fun bootstrapNamedTypeWordByte(byte: int): bool =
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+
+fun bootstrapNamedTypeList(names: array<string>): string {
+    var text = ""
+    for (name in names) text = if (text == "") name else "$text,$name"
+    text
 }
 
 /** Copies, named `name`, of the top-level functions named `function`. */

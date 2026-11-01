@@ -41,6 +41,8 @@ expect_exit named-implicit-this 42
 expect_exit named-default-scope 42
 expect_error invalid-named-default-hidden-generic E_NAMED_ARGUMENT_HIDDEN
 expect_exit named-default-hidden-value 42
+expect_error invalid-call-not-function call.not-function:double
+expect_error invalid-call-not-function-field call.not-function:scale
 expect_exit operator-annotation-after 42
 expect_exit lambda-inferred-result 42
 expect_exit nominal-index 42
