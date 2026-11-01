@@ -13,8 +13,13 @@ fun main {
     println((a + b).text())
     println(a.lt(u32x4Splat(3)).select(a, b).text())
     println(u32x4Shuffle(a, b, 0, 4, 1, 5).text())
-    println((a * a).sum())
+    println("${(a * a).sum()}")
 }
+// output:
+// [11, 12, 13, 14]
+// [1, 2, 10, 10]
+// [1, 10, 2, 10]
+// 30
 ```
 
 ## Types
@@ -80,6 +85,8 @@ dies with an illegal instruction. On targets without them they trap.
 
 ```abla
 import "abla/simd"
+
+fun softwareLastRound(state: u8x16, key: u8x16): u8x16 = state ^ key // not really
 
 @target("aes")
 fun lastRound(state: u8x16, key: u8x16): u8x16 = aesEncLastRound(state, key)

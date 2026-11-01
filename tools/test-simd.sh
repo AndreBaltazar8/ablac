@@ -3,7 +3,7 @@
 # compiler (tests/cases/simd/checks.ab), and the target-specific operations against FIPS-197.
 #   run:      x86-64 (release and --fast, on this CPU and under qemu with no AES, CLMUL or
 #             AVX2), AArch64 under qemu, Wasm under Node.
-#   compiled: Xtensa, whose object is checked for the scalar code it should be.
+#   compiled: Xtensa, whose vectors are scalar code; nothing here runs it.
 # Then the misuses the compiler refuses, each with the error on its first line.
 set -euo pipefail
 
