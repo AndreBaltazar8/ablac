@@ -18,53 +18,56 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=localhost \
     -keyout "$output_directory/key.pem" -out "$output_directory/certificate.pem" 2>/dev/null || exit 2
 "$compiler" build tests/cases/tls-faults/faults.ab -o "$output_directory/faults" --fast || exit 2
 
-status=0
-for stage in mask \
-    https-reset-read https-reset-write https-stall-read https-stall-write \
-    http-reset-read http-reset-write http-stall-read http-stall-write \
-    http-kept http-long-timeout read-long-timeout \
-    async-reset-write async-stall async-retry; do
-    SSL_CERT_FILE="$output_directory/certificate.pem" timeout 40 \
-        "$output_directory/faults" "$output_directory/certificate.pem" "$output_directory/key.pem" "$stage" \
-        > "$output_directory/$stage.log" 2>&1
-    rc=$?
-    if [[ $rc -eq 0 ]]; then
-        echo "ok   $stage"
+# Each stage forks its own peers on ports of its own: most of each is waiting for
+# a limit, so they wait together.
+report() { # name rc
+    if [[ $2 -eq 0 ]]; then
+        echo "ok   $1"
     else
-        case $rc in
+        case $2 in
             124) why='hung' ;;
             141) why='died of SIGPIPE' ;;
-            *) why="exit $rc" ;;
+            *) why="exit $2" ;;
         esac
-        echo "FAIL $stage: $why"
-        sed 's/^/     /' "$output_directory/$stage.log"
+        echo "FAIL $1: $why"
+        sed 's/^/     /' "$output_directory/$1.log"
         status=1
     fi
+}
+status=0
+stages=(mask
+    https-reset-read https-reset-write https-stall-read https-stall-write
+    http-reset-read http-reset-write http-stall-read http-stall-write
+    http-kept http-long-timeout read-long-timeout
+    async-reset-write async-stall async-retry)
+pids=()
+for stage in "${stages[@]}"; do
+    SSL_CERT_FILE="$output_directory/certificate.pem" timeout 40 \
+        "$output_directory/faults" "$output_directory/certificate.pem" "$output_directory/key.pem" "$stage" \
+        > "$output_directory/$stage.log" 2>&1 &
+    pids+=($!)
+done
+for index in "${!stages[@]}"; do
+    rc=0
+    wait "${pids[$index]}" || rc=$?
+    report "${stages[$index]}" "$rc"
 done
 [[ -n ${TLS_FAULTS_FAULTS_ONLY:-} ]] && exit "$status"
 
 "$compiler" build tests/cases/tls-faults/timeouts.ab -o "$output_directory/timeouts" --fast || exit 2
-timeout 60 "$output_directory/timeouts" "$output_directory/certificate.pem" "$output_directory/key.pem" \
-    > "$output_directory/timeouts.log" 2>&1
-rc=$?
-if [[ $rc -ne 0 ]]; then
-    echo "FAIL timeouts: exit $rc"
-    sed 's/^/     /' "$output_directory/timeouts.log"
-    status=1
-else
-    echo "ok   timeouts"
-fi
 "$compiler" build tests/cases/tls-faults/deadlines.ab -o "$output_directory/deadlines" --fast || exit 2
+timeout 60 "$output_directory/timeouts" "$output_directory/certificate.pem" "$output_directory/key.pem" \
+    > "$output_directory/timeouts.log" 2>&1 &
+timeouts=$!
 SSL_CERT_FILE="$output_directory/certificate.pem" timeout 30 \
     "$output_directory/deadlines" "$output_directory/certificate.pem" "$output_directory/key.pem" \
-    > "$output_directory/deadlines.log" 2>&1
-rc=$?
-if [[ $rc -ne 0 ]]; then
-    echo "FAIL deadlines: exit $rc"
-    sed 's/^/     /' "$output_directory/deadlines.log"
-    status=1
-else
-    echo "ok   deadlines"
-fi
+    > "$output_directory/deadlines.log" 2>&1 &
+deadlines=$!
+rc=0
+wait "$timeouts" || rc=$?
+report timeouts "$rc"
+rc=0
+wait "$deadlines" || rc=$?
+report deadlines "$rc"
 [[ $status -eq 0 ]] && echo 'TLS faults: passed'
 exit "$status"
