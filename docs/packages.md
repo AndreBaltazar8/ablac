@@ -12,7 +12,16 @@ does not fetch while parsing or during an ordinary build. Libraries can return
 the same type from their own compile functions, including providers that do not
 use Git.
 
-The surrounding import may bind any provider result to a local namespace:
+A longer path imports one module of the package, not its entry, the way
+`abla/crypto/hosted` is one module of `abla/crypto`:
+
+```abla fragment
+import github("owner/abla-blockchain/evm")
+import github("owner/abla-blockchain/bitcoin/script") as script
+```
+
+See [Subpaths](#subpaths). The surrounding import may bind any provider result to
+a local namespace:
 
 ```abla fragment
 import github("AndreBaltazar8/abla-mvc") as mvc
@@ -79,7 +88,8 @@ produce files; the package layer only validates and locks its result. File
 paths must be relative and contained, the result must include `abla.toml` and
 the declared entry, and total content is bounded to 128 MiB.
 
-`gitImportSource(name, url, selectorKind, selector)` is the Git implementation
+`importSubpath(source, path)` returns `source` naming one module inside it
+([Subpaths](#subpaths)). `gitImportSource(name, url, selectorKind, selector)` is the Git implementation
 of the same `ImportSource` type. Selector kinds are `rev`, `tag`, `branch`, and
 `head`. `github("owner/repository")` is a convenience provider using `HEAD`.
 For example:
@@ -122,6 +132,43 @@ what it imports. `visibility = "program"`, or no key, keeps every name visible
 program-wide (`--strict-imports` makes a package without the key strict). The
 key belongs to the nearest manifest at or above a module, so a strict package
 can depend on a flat one and the other way round.
+
+## Subpaths
+
+`github("owner/repository/path")` is the package `owner/repository`, at the module
+`path` inside it. Any provider's source can name one with
+`importSubpath(source, "path")`:
+
+```abla fragment
+compile fun companyEvm(): ImportSource = importSubpath(companyChain(), "evm")
+
+import companyEvm()
+```
+
+A subpath isn't a package of its own. The lock has one record for the package, with
+one revision and one content digest, whichever subpaths are imported, and `package
+vendor` copies the whole package. A module has one identity however it is reached:
+through two subpaths, or a subpath and a relative import. Relative imports inside a
+subpath's module work as anywhere in the package. Only what the program imports is
+compiled: a subpath's import doesn't load the package's entry, or the other
+subpaths. `package update` follows the provider imports of the entry and of every
+subpath imported, so importing a new subpath that has its own provider imports
+needs an update.
+
+`path` resolves beside the package's entry: for `entry = "src/chain.ab"`, `evm` is
+`src/evm/entry.ab`, then `src/evm.ab`. A package can instead list what is public, and
+then only that can be imported:
+
+```toml
+[exports]
+"evm" = "src/evm/entry.ab"
+"bitcoin/script" = "src/btc/script.ab"
+```
+
+- `E_PACKAGE_SUBPATH_INVALID`: a path that is absolute, or has an empty, `.`, `..` or
+  `.git` part, or goes through a symbolic link.
+- `E_PACKAGE_SUBPATH_MISSING`: no such module; it says where it looked.
+- `E_PACKAGE_SUBPATH_PRIVATE`: the package has `[exports]`, and this isn't in it.
 
 ## Import remaps
 

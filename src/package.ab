@@ -28,7 +28,9 @@ class BootstrapPackageDependency(
     val selector: string,
     val resolvedRevision: string,
     val resolvedEntry: string,
-    val resolvedFiles: array<BootstrapPackageSourceFile>
+    val resolvedFiles: array<BootstrapPackageSourceFile>,
+    // The modules inside the package that imports name, beside its entry.
+    val subpaths: array<string> = []
 )
 
 class BootstrapPackageDependencies(
@@ -213,6 +215,9 @@ fun bootstrapPackageDiscoverImportProviders(
                 if (decoded.errors == 0 && existing < 0) {
                     dependencies.append(decoded.dependency)
                 }
+                if (decoded.errors == 0 && existing >= 0) {
+                    bootstrapPackageAddSubpaths(dependencies[existing], decoded.dependency)
+                }
                 if (decoded.errors == 0 && existing >= 0 &&
                     (dependencies[existing].provider != decoded.dependency.provider ||
                      dependencies[existing].identity != decoded.dependency.identity ||
@@ -264,6 +269,8 @@ fun bootstrapPackageDependencyFromValue(
     val revisionValue = bootstrapPackageEvalField(value, "resolvedRevision")
     val entryValue = bootstrapPackageEvalField(value, "resolvedEntry")
     val filesValue = bootstrapPackageEvalField(value, "resolvedFiles")
+    val subpathValue = bootstrapPackageEvalField(value, "subpath")
+    val subpaths: array<string> = []
     val name = nameValue.text
     val provider = providerValue.text
     val identity = identityValue.text
@@ -323,10 +330,17 @@ fun bootstrapPackageDependencyFromValue(
         if (errors != 0) diagnostic =
             "error[E_IMPORT_PROVIDER_RESOLUTION]: resolved ImportSource has invalid revision, entry, or files\n"
     }
+    if (errors == 0 && subpathValue.kind == "string" && subpathValue.text != "") {
+        if (bootstrapPackageRelativePathValid(subpathValue.text)) subpaths.append(subpathValue.text)
+        else {
+            errors = 1
+            diagnostic = "error[E_PACKAGE_SUBPATH_INVALID]: `${subpathValue.text}` isn't a path inside package '$name': it must be relative, with no empty, `.`, `..` or `.git` part\n"
+        }
+    }
     BootstrapImportProviderResult(
         BootstrapPackageDependency(
             name, provider, identity, source, selectorKind, selector,
-            revision, entry, files
+            revision, entry, files, subpaths
         ),
         errors,
         diagnostic
@@ -645,6 +659,18 @@ fun bootstrapPackageDependencyIndex(
     result
 }
 
+fun bootstrapPackageAddSubpaths(
+    var dependency: BootstrapPackageDependency,
+    other: BootstrapPackageDependency
+): void {
+    for (subpath in other.subpaths) {
+        if (!bootstrapPackageStringsContain(dependency.subpaths, subpath)) {
+            dependency.subpaths.append(subpath)
+        }
+    }
+    return
+}
+
 fun bootstrapPackageMergeDependencies(
     left: BootstrapPackageDependencies,
     right: BootstrapPackageDependencies
@@ -661,6 +687,7 @@ fun bootstrapPackageMergeDependencies(
     while (index < right.values.size) {
         val dependency = right.values[index]
         val existing = bootstrapPackageDependencyIndex(values, dependency.name)
+        if (existing >= 0) bootstrapPackageAddSubpaths(values[existing], dependency)
         if (existing < 0) values.append(dependency)
         else if (values[existing].provider != dependency.provider ||
             values[existing].identity != dependency.identity ||
@@ -1234,6 +1261,119 @@ fun bootstrapPackageStackContains(stack: array<string>, name: string): bool {
     found
 }
 
+// The `[exports]` table of a package's manifest: which subpaths it makes public,
+// and the module each is. `found` says whether it has one.
+class BootstrapPackageExports(
+    val found: bool,
+    val names: array<string>,
+    val targets: array<string>
+)
+
+fun bootstrapPackageReadExports(manifestPath: string): BootstrapPackageExports {
+    val names: array<string> = []
+    val targets: array<string> = []
+    val source = Path(manifestPath).readText()
+    var found = false
+    var inExports = false
+    var begin = 0
+    while (begin < source.size) {
+        var end = begin
+        while (end < source.size && source[end] != 10 && source[end] != 13) end = end + 1
+        val line = bootstrapPackageTrim(source.slice(begin, end))
+        if (line.size > 0 && line[0] == 91) {
+            inExports = line == "[exports]"
+            if (inExports) found = true
+        } else if (inExports && line.size > 0 && line[0] == 34) {
+            var close = 1
+            while (close < line.size && line[close] != 34) close = close + 1
+            val rest = if (close < line.size) line.slice(close + 1, line.size) else ""
+            var open = 0
+            while (open < rest.size && rest[open] != 34) open = open + 1
+            var last = rest.size - 1
+            while (last > open && rest[last] != 34) last = last - 1
+            if (last > open) {
+                names.append(line.slice(1, close))
+                targets.append(rest.slice(open + 1, last))
+            }
+        }
+        begin = end + 1
+    }
+    BootstrapPackageExports(found, names, targets)
+}
+
+class BootstrapPackageSubpath(val path: string, val diagnostic: string)
+
+// The module `subpath` names in the package at `root`: what `[exports]` says when
+// the manifest has that table, otherwise, as in the standard library,
+// `<subpath>/entry.ab` and then `<subpath>.ab` beside the package's entry.
+fun bootstrapPackageFindSubpath(root: string, name: string, subpath: string): BootstrapPackageSubpath {
+    val manifest = "$root/abla.toml"
+    val exports = bootstrapPackageReadExports(manifest)
+    var candidates: array<string> = []
+    var looked = ""
+    if (exports.found) {
+        var target = ""
+        for (index in 0 until exports.names.size) {
+            if (exports.names[index] == subpath) target = exports.targets[index]
+        }
+        if (target == "") {
+            var public = ""
+            for (exported in exports.names) public = if (public == "") exported else "$public, $exported"
+            return BootstrapPackageSubpath("", "error[E_PACKAGE_SUBPATH_PRIVATE]: package '$name' doesn't export `$subpath`; its [exports] are: $public\n")
+        }
+        if (!bootstrapPackageRelativePathValid(target)) {
+            return BootstrapPackageSubpath("", "error[E_PACKAGE_SUBPATH_INVALID]: package '$name' exports `$subpath` as `$target`, which isn't a path inside it\n")
+        }
+        candidates.append(target)
+    } else {
+        val entry = bootstrapPackageManifestString(manifest, "entry")
+        val written = if (entry == "") "src/$name.ab" else entry
+        val directory = Path(written).parent().text
+        val base = if (directory == "." || directory == "") subpath else "$directory/$subpath"
+        candidates.append("$base/entry.ab")
+        candidates.append("$base.ab")
+    }
+    for (candidate in candidates) {
+        looked = if (looked == "") candidate else "$looked, $candidate"
+        // A link could lead out of the package, whatever the path says.
+        var prefix = 0
+        while (prefix <= candidate.size) {
+            if (prefix == candidate.size || candidate[prefix] == 47) {
+                if (Path("$root/${candidate.slice(0, prefix)}").isSymbolicLink()) {
+                    return BootstrapPackageSubpath("", "error[E_PACKAGE_SUBPATH_INVALID]: `$subpath` in package '$name' goes through a symbolic link, `${candidate.slice(0, prefix)}`\n")
+                }
+            }
+            prefix = prefix + 1
+        }
+        if (Path("$root/$candidate").info().isFile()) {
+            return BootstrapPackageSubpath("$root/$candidate", "")
+        }
+    }
+    BootstrapPackageSubpath("", "error[E_PACKAGE_SUBPATH_MISSING]: package '$name' has no module `$subpath` (looked for $looked)\n")
+}
+
+// The providers that the subpaths a dependency is imported by reach, resolved too:
+// its entry doesn't have to import those modules.
+fun bootstrapPackageResolveSubpaths(
+    dependency: BootstrapPackageDependency,
+    cacheSource: string,
+    var packages: array<BootstrapLockedPackage>,
+    nestedStack: array<string>,
+    resolveEffects: int
+): BootstrapPackageResult {
+    for (subpath in dependency.subpaths) {
+        val found = bootstrapPackageFindSubpath(cacheSource, dependency.name, subpath)
+        if (found.diagnostic != "") return BootstrapPackageResult(1, found.diagnostic)
+        val imported = bootstrapPackageDiscoverImportProviders(found.path, true, resolveEffects)
+        if (imported.errors != 0) return BootstrapPackageResult(1, imported.diagnostic)
+        for (transitive in imported.values) {
+            val resolved = bootstrapPackageResolveOne(transitive, packages, nestedStack, resolveEffects)
+            if (resolved.status != 0) return resolved
+        }
+    }
+    BootstrapPackageResult(0, "")
+}
+
 fun bootstrapPackageResolveOne(
     dependency: BootstrapPackageDependency,
     var packages: array<BootstrapLockedPackage>,
@@ -1256,6 +1396,18 @@ fun bootstrapPackageResolveOne(
             found.selector != dependency.selector) {
             status = 1
             diagnostic = "error[E_PACKAGE_COLLISION]: dependency '${dependency.name}' has incompatible ImportSource identities or selectors ('${found.identity}' versus '${dependency.identity}')\n"
+        }
+        // Another importer may reach other modules of it, with their own providers.
+        if (status == 0) {
+            val nestedStack: array<string> = []
+            for (name in stack) nestedStack.append(name)
+            nestedStack.append(dependency.name)
+            val resolved = bootstrapPackageResolveSubpaths(
+                dependency, "${bootstrapPackageCachePath(found)}/source",
+                packages, nestedStack, resolveEffects
+            )
+            status = resolved.status
+            diagnostic = resolved.diagnostic
         }
     }
     if (status == 0 && existing < 0) {
@@ -1364,6 +1516,13 @@ fun bootstrapPackageResolveOne(
                 diagnostic = resolved.diagnostic
                 index = index + 1
             }
+            if (status == 0) {
+                val resolved = bootstrapPackageResolveSubpaths(
+                    dependency, cacheSource, packages, nestedStack, resolveEffects
+                )
+                status = resolved.status
+                diagnostic = resolved.diagnostic
+            }
             if (status == 0) packages.append(locked)
         }
     }
@@ -1458,7 +1617,9 @@ fun bootstrapPackageValidateDependencies(
     dependencies: BootstrapPackageDependencies,
     packages: array<BootstrapLockedPackage>,
     var visited: array<string>,
-    stack: array<string>
+    stack: array<string>,
+    // "package/subpath" for those walked: another importer may name others.
+    var walkedSubpaths: array<string>
 ): BootstrapPackageResult {
     var status = if (dependencies.errors == 0) 0 else 1
     var diagnostic = dependencies.diagnostic
@@ -1498,10 +1659,36 @@ fun bootstrapPackageValidateDependencies(
                 declared, imported
             )
             val nested = bootstrapPackageValidateDependencies(
-                projectRoot, nestedDependencies, packages, visited, nestedStack
+                projectRoot, nestedDependencies, packages, visited, nestedStack, walkedSubpaths
             )
             status = nested.status
             diagnostic = nested.diagnostic
+        }
+        if (status == 0) {
+            for (subpath in dependency.subpaths) {
+                val walked = "${dependency.name}/$subpath"
+                if (status == 0 && !bootstrapPackageStringsContain(walkedSubpaths, walked)) {
+                    walkedSubpaths.append(walked)
+                    val found = bootstrapPackageFindSubpath(
+                        "$projectRoot/.abla/packages/${dependency.name}/source",
+                        dependency.name, subpath
+                    )
+                    if (found.diagnostic != "") {
+                        status = 1
+                        diagnostic = found.diagnostic
+                    } else {
+                        val nestedStack: array<string> = []
+                        for (name in stack) nestedStack.append(name)
+                        nestedStack.append(dependency.name)
+                        val nested = bootstrapPackageValidateDependencies(
+                            projectRoot, bootstrapPackageDiscoverImportProviders(found.path),
+                            packages, visited, nestedStack, walkedSubpaths
+                        )
+                        status = nested.status
+                        diagnostic = nested.diagnostic
+                    }
+                }
+            }
         }
         index = index + 1
     }
@@ -1613,8 +1800,9 @@ fun bootstrapPackagePrepareWithDependencies(
     if (status == 0 && direct.values.size > 0) {
         val visited: array<string> = []
         val stack: array<string> = []
+        val walkedSubpaths: array<string> = []
         val graph = bootstrapPackageValidateDependencies(
-            projectRoot, direct, lock.packages, visited, stack
+            projectRoot, direct, lock.packages, visited, stack, walkedSubpaths
         )
         status = graph.status
         diagnostic = graph.diagnostic
@@ -1709,6 +1897,25 @@ fun bootstrapPackageDirectoryIsDependencyCopy(directory: Path): bool {
         packages.name() == "packages" &&
         packages.parent().name() == ".abla"
     vendored || prepared
+}
+
+// The root of the package whose entry `bootstrapResolvePackageImport` found: a
+// prepared copy's `source`, or the vendored tree.
+fun bootstrapPackageRootOfEntry(entry: string, name: string): string {
+    val prepared = "/.abla/packages/$name/entry.ab"
+    if (entry.size >= prepared.size && entry.slice(entry.size - prepared.size, entry.size) == prepared) {
+        return "${entry.slice(0, entry.size - "entry.ab".size)}source"
+    }
+    if (entry.startsWith(".abla/packages/$name/entry.ab")) return ".abla/packages/$name/source"
+    val vendored = "vendor/$name/"
+    var index = entry.size - vendored.size
+    while (index >= 0) {
+        if (entry.slice(index, index + vendored.size) == vendored && (index == 0 || entry[index - 1] == 47)) {
+            return entry.slice(0, index + vendored.size - 1)
+        }
+        index = index - 1
+    }
+    ""
 }
 
 fun bootstrapResolvePackageImport(importer: string, requested: string): string {

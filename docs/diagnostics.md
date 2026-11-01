@@ -101,6 +101,9 @@ only its parse errors.
 | `break.outside-loop`, `continue.outside-loop`, `return.outside-function` | control transfer outside its construct |
 | `E_NAMED_ARGUMENT_UNKNOWN`, `_DUPLICATE`, `_ORDER`, `_REQUIRED`, `_TARGET`, `_ARITY` | named-argument errors ([functions](language.md#functions)) |
 | `call.not-function:<name>` | a call by a name that a local or field holds, not a function, while the top-level name is a function value: rename one |
+| `E_PACKAGE_SUBPATH_INVALID` | a package subpath that is absolute, has an empty, `.`, `..` or `.git` part, or goes through a symbolic link ([packages.md](packages.md#subpaths)) |
+| `E_PACKAGE_SUBPATH_MISSING` | no module at that subpath of the package; it says where it looked |
+| `E_PACKAGE_SUBPATH_PRIVATE` | the package has `[exports]`, and that subpath isn't in it |
 | `E_NAMED_ARGUMENT_HIDDEN` | a default left out of a named call calls a constructor or foreign function that a local or function-typed field in the caller hides, and its type has a type parameter no earlier parameter gives: pass the argument |
 | `E_NAMED_ARGUMENT_DELEGATED` | a constructor argument names a delegated property, whose delegate comes from its `by` ([delegated properties](language.md#delegated-class-properties)) |
 | `field.extension-owner:<T>` | an extension field on a type with no object to hold it: a scalar, string, array, nominal type or interface ([extension fields](language.md#extension-fields)) |

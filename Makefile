@@ -297,6 +297,7 @@ test-serial: ablac
 	tools/test-serve-outputs.sh $(COMPILER)
 	tools/test-shell-environment.sh $(COMPILER)
 	tools/test-emit-reachable.sh $(COMPILER)
+	tools/test-package-subpaths.sh $(COMPILER)
 	tools/test-process-metrics.sh $(COMPILER)
 	tools/test-dns-async.sh $(COMPILER)
 	tools/test-websocket-tls-server.sh $(COMPILER)
