@@ -91,113 +91,9 @@ private fun cryptoSha256Constants(): array<int> = [
 ]
 
 fun sha256(value: string): string {
-    val input: array<int> = []
-    cryptoAppendText(input, value)
-    val bitLength = input.size * 8
-    input.append(128)
-    while (input.size - input.size / 64 * 64 != 56) input.append(0)
-    input.append(0)
-    input.append(0)
-    input.append(0)
-    input.append(0)
-    cryptoAppendU32Big(input, bitLength)
-
-    var h0 = 1779033703
-    var h1 = 3144134277
-    var h2 = 1013904242
-    var h3 = 2773480762
-    var h4 = 1359893119
-    var h5 = 2600822924
-    var h6 = 528734635
-    var h7 = 1541459225
-    val constants = cryptoSha256Constants()
-    var offset = 0
-    while (offset < input.size) {
-        val words: array<int> = []
-        var index = 0
-        while (index < 16) {
-            words.append(cryptoReadU32Big(input, offset + index * 4))
-            index = index + 1
-        }
-        while (index < 64) {
-            val previous15 = words[index - 15]
-            val previous2 = words[index - 2]
-            val small0 = cryptoXorWord(
-                cryptoXorWord(cryptoRotateRight32(previous15, 7),
-                    cryptoRotateRight32(previous15, 18)),
-                previous15 >>> 3
-            )
-            val small1 = cryptoXorWord(
-                cryptoXorWord(cryptoRotateRight32(previous2, 17),
-                    cryptoRotateRight32(previous2, 19)),
-                previous2 >>> 10
-            )
-            words.append(cryptoU32(
-                words[index - 16] + small0 + words[index - 7] + small1
-            ))
-            index = index + 1
-        }
-
-        var a = h0
-        var b = h1
-        var c = h2
-        var d = h3
-        var e = h4
-        var f = h5
-        var g = h6
-        var h = h7
-        index = 0
-        while (index < 64) {
-            val big1 = cryptoXorWord(
-                cryptoXorWord(cryptoRotateRight32(e, 6),
-                    cryptoRotateRight32(e, 11)),
-                cryptoRotateRight32(e, 25)
-            )
-            val choose = cryptoXorWord(
-                e & f, cryptoNotWord(e) & g
-            )
-            val temporary1 = cryptoU32(
-                h + big1 + choose + constants[index] + words[index]
-            )
-            val big0 = cryptoXorWord(
-                cryptoXorWord(cryptoRotateRight32(a, 2),
-                    cryptoRotateRight32(a, 13)),
-                cryptoRotateRight32(a, 22)
-            )
-            val majority = cryptoXorWord(
-                cryptoXorWord(a & b, a & c), b & c
-            )
-            val temporary2 = cryptoU32(big0 + majority)
-            h = g
-            g = f
-            f = e
-            e = cryptoU32(d + temporary1)
-            d = c
-            c = b
-            b = a
-            a = cryptoU32(temporary1 + temporary2)
-            index = index + 1
-        }
-        h0 = cryptoU32(h0 + a)
-        h1 = cryptoU32(h1 + b)
-        h2 = cryptoU32(h2 + c)
-        h3 = cryptoU32(h3 + d)
-        h4 = cryptoU32(h4 + e)
-        h5 = cryptoU32(h5 + f)
-        h6 = cryptoU32(h6 + g)
-        h7 = cryptoU32(h7 + h)
-        offset = offset + 64
-    }
-    val output: array<int> = []
-    cryptoAppendU32Big(output, h0)
-    cryptoAppendU32Big(output, h1)
-    cryptoAppendU32Big(output, h2)
-    cryptoAppendU32Big(output, h3)
-    cryptoAppendU32Big(output, h4)
-    cryptoAppendU32Big(output, h5)
-    cryptoAppendU32Big(output, h6)
-    cryptoAppendU32Big(output, h7)
-    cryptoByteString(output)
+    val stream = sha256Stream()
+    stream.update(value)
+    stream.finish()
 }
 
 private fun cryptoSha512Constants(): array<int> = [
@@ -422,145 +318,116 @@ fun binaryXor(left: string, right: string): string {
     cryptoByteString(output)
 }
 
-// SHA-256 of more bytes than fit in memory, or arrive in pieces: `sha256` takes
-// one string and a 32-bit length. update(), any number of times, then finish(),
-// which gives the same 32 bytes `sha256` would.
+// SHA-256 of more bytes than fit in memory, or arrive in pieces. update(), any number of times, then finish(), which gives
+// the same 32 bytes `sha256` would. Whole blocks go straight from the string given, with one schedule kept across them.
 class Sha256Stream(
     val state: array<int>,
     val constants: array<int>,
-    var pending: array<int>,
+    val schedule: array<int>,
+    var pending: string,
     var total: int
 )
 
-fun sha256Stream(): Sha256Stream = Sha256Stream(
-    [1779033703, 3144134277, 1013904242, 2773480762,
-     1359893119, 2600822924, 528734635, 1541459225],
-    cryptoSha256Constants(), [], 0
-)
+fun sha256Stream(): Sha256Stream {
+    val schedule: array<int> = []
+    while (schedule.size < 64) schedule.append(0)
+    Sha256Stream(
+        [1779033703, 3144134277, 1013904242, 2773480762,
+         1359893119, 2600822924, 528734635, 1541459225],
+        cryptoSha256Constants(), schedule, "", 0
+    )
+}
 
+// Rotates written out, and no call in the loops: built --fast nothing inlines, and this is most of the time spent.
 private fun cryptoSha256Block(
     var state: array<int>,
     constants: array<int>,
-    input: array<int>,
+    var words: array<int>,
+    input: string,
     offset: int
 ): void {
-    var h0 = state[0]
-    var h1 = state[1]
-    var h2 = state[2]
-    var h3 = state[3]
-    var h4 = state[4]
-    var h5 = state[5]
-    var h6 = state[6]
-    var h7 = state[7]
-    val words: array<int> = []
     var index = 0
     while (index < 16) {
-        words.append(cryptoReadU32Big(input, offset + index * 4))
+        val at = offset + index * 4
+        words[index] = (input[at] << 24) | (input[at + 1] << 16) | (input[at + 2] << 8) | input[at + 3]
         index = index + 1
     }
     while (index < 64) {
-        val previous15 = words[index - 15]
-        val previous2 = words[index - 2]
-        val small0 = cryptoXorWord(
-            cryptoXorWord(cryptoRotateRight32(previous15, 7),
-                cryptoRotateRight32(previous15, 18)),
-            previous15 >>> 3
-        )
-        val small1 = cryptoXorWord(
-            cryptoXorWord(cryptoRotateRight32(previous2, 17),
-                cryptoRotateRight32(previous2, 19)),
-            previous2 >>> 10
-        )
-        words.append(cryptoU32(
-            words[index - 16] + small0 + words[index - 7] + small1
-        ))
+        val v15 = words[index - 15]
+        val v2 = words[index - 2]
+        val small0 = ((v15 >>> 7) | (v15 << 25)) ^ ((v15 >>> 18) | (v15 << 14)) ^ (v15 >>> 3)
+        val small1 = ((v2 >>> 17) | (v2 << 15)) ^ ((v2 >>> 19) | (v2 << 13)) ^ (v2 >>> 10)
+        words[index] = (words[index - 16] + (small0 & 4294967295) + words[index - 7] + (small1 & 4294967295)) & 4294967295
         index = index + 1
     }
-
-    var a = h0
-    var b = h1
-    var c = h2
-    var d = h3
-    var e = h4
-    var f = h5
-    var g = h6
-    var h = h7
+    var a = state[0]
+    var b = state[1]
+    var c = state[2]
+    var d = state[3]
+    var e = state[4]
+    var f = state[5]
+    var g = state[6]
+    var h = state[7]
     index = 0
     while (index < 64) {
-        val big1 = cryptoXorWord(
-            cryptoXorWord(cryptoRotateRight32(e, 6),
-                cryptoRotateRight32(e, 11)),
-            cryptoRotateRight32(e, 25)
-        )
-        val choose = cryptoXorWord(
-            e & f, cryptoNotWord(e) & g
-        )
-        val temporary1 = cryptoU32(
-            h + big1 + choose + constants[index] + words[index]
-        )
-        val big0 = cryptoXorWord(
-            cryptoXorWord(cryptoRotateRight32(a, 2),
-                cryptoRotateRight32(a, 13)),
-            cryptoRotateRight32(a, 22)
-        )
-        val majority = cryptoXorWord(
-            cryptoXorWord(a & b, a & c), b & c
-        )
-        val temporary2 = cryptoU32(big0 + majority)
+        val big1 = (((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))) & 4294967295
+        val temporary1 = h + big1 + ((e & f) ^ ((e ^ 4294967295) & g)) + constants[index] + words[index]
+        val big0 = (((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))) & 4294967295
+        val temporary2 = big0 + ((a & b) ^ (a & c) ^ (b & c))
         h = g
         g = f
         f = e
-        e = cryptoU32(d + temporary1)
+        e = (d + temporary1) & 4294967295
         d = c
         c = b
         b = a
-        a = cryptoU32(temporary1 + temporary2)
+        a = (temporary1 + temporary2) & 4294967295
         index = index + 1
     }
-    h0 = cryptoU32(h0 + a)
-    h1 = cryptoU32(h1 + b)
-    h2 = cryptoU32(h2 + c)
-    h3 = cryptoU32(h3 + d)
-    h4 = cryptoU32(h4 + e)
-    h5 = cryptoU32(h5 + f)
-    h6 = cryptoU32(h6 + g)
-    h7 = cryptoU32(h7 + h)
-    state[0] = h0
-    state[1] = h1
-    state[2] = h2
-    state[3] = h3
-    state[4] = h4
-    state[5] = h5
-    state[6] = h6
-    state[7] = h7
+    state[0] = (state[0] + a) & 4294967295
+    state[1] = (state[1] + b) & 4294967295
+    state[2] = (state[2] + c) & 4294967295
+    state[3] = (state[3] + d) & 4294967295
+    state[4] = (state[4] + e) & 4294967295
+    state[5] = (state[5] + f) & 4294967295
+    state[6] = (state[6] + g) & 4294967295
+    state[7] = (state[7] + h) & 4294967295
     return
 }
 
 fun Sha256Stream.update(value: string): void {
     this.total = this.total + value.size
-    var index = 0
-    while (index < value.size) {
-        this.pending.append(value[index])
-        index = index + 1
+    var offset = 0
+    if (this.pending.size > 0) {
+        val wanted = 64 - this.pending.size
+        val taken = if (value.size < wanted) value.size else wanted
+        this.pending = "${this.pending}${value.slice(0, taken)}"
+        offset = taken
         if (this.pending.size == 64) {
-            cryptoSha256Block(this.state, this.constants, this.pending, 0)
-            this.pending = []
+            cryptoSha256Block(this.state, this.constants, this.schedule, this.pending, 0)
+            this.pending = ""
         }
     }
+    while (value.size - offset >= 64) {
+        cryptoSha256Block(this.state, this.constants, this.schedule, value, offset)
+        offset = offset + 64
+    }
+    if (offset < value.size) this.pending = "${this.pending}${value.slice(offset, value.size)}"
     return
 }
 
 fun Sha256Stream.finish(): string {
     val bitLength = this.total * 8
     val tail: array<int> = []
-    for (byte in this.pending) tail.append(byte)
+    for (byte in this.pending) tail.append(int(byte))
     tail.append(128)
     while (tail.size % 64 != 56) tail.append(0)
     cryptoAppendU32Big(tail, bitLength >>> 32)
     cryptoAppendU32Big(tail, bitLength & 4294967295)
+    val text = cryptoByteString(tail)
     var offset = 0
-    while (offset < tail.size) {
-        cryptoSha256Block(this.state, this.constants, tail, offset)
+    while (offset < text.size) {
+        cryptoSha256Block(this.state, this.constants, this.schedule, text, offset)
         offset = offset + 64
     }
     val output: array<int> = []

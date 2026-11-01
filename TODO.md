@@ -86,9 +86,6 @@
 - [ ] Missing and written by hand in every tool: parsing an int from text (`abla-postgres` `pgInt`, `abla-s3` `s3ParseInt`,
       `oneParseInt`, NovaKind's `toolInteger`), `array<string>.join`, `array.removeLast`, a UUID, multi-line string literals (`"""`
       doesn't parse), `Path.home`, a `createDirectories` with a mode (`Path.writeText` is always 0666 less umask).
-- [ ] `sha256Stream` hashes 4.4 MB/s built `--fast` (32 MiB in 7.7 s, 2026-10-31), one byte at a time through `array<int>`; the
-      `sha256` it sits beside has the same loop. NovaKind's server keeps OpenSSL's EVP for that reason (`server/sha256_stream.ab`).
-      A program that avoids linking OpenSSL has nothing faster. Worth doing over a native buffer.
 - [ ] A program that links OpenSSL won't start without `LD_LIBRARY_PATH` from the nix shell (`libssl.so.3 => not found`), even if
       it never makes a TLS connection: `abla-s3` always pulls it in, also with `S3_USE_TLS=false`. And that `LD_LIBRARY_PATH` breaks the
       host's coreutils for what it starts (`env`, `pwd`: `GLIBC_ABI_DT_X86_64_PLT`). NovaKind needs two programs because of it. A
