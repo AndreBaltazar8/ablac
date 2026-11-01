@@ -18,9 +18,16 @@ if [[ $compiler != /* ]]; then compiler=$project_root/$compiler; fi
 output=$2
 entry=${3:-src/orc_main.ab}
 # A compiler linked outside this shell (the pinned one) doesn't say where its
-# OpenSSL is. What it starts here is the shell's, so this reaches no host tool.
+# OpenSSL is. A copy says so: LD_LIBRARY_PATH would also reach the tools it starts,
+# which a host's own may not survive.
 if [[ -n ${ABLA_LINUX_OPENSSL_LIB:-} ]] && ! "$compiler" --version >/dev/null 2>&1; then
-    export LD_LIBRARY_PATH=$ABLA_LINUX_OPENSSL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    mkdir -p "$project_root/build"
+    located_compiler=$(mktemp "$project_root/build/.bootstrap-located.XXXXXX")
+    trap 'rm -f -- "$located_compiler"' EXIT
+    cp -f "$compiler" "$located_compiler"
+    patchelf --add-rpath "$ABLA_LINUX_OPENSSL_LIB" "$located_compiler"
+    chmod +x "$located_compiler"
+    compiler=$located_compiler
 fi
 # v0.2.20 cannot parse the private declarations now used by the library.
 # This checkpoint implements private declarations and generics while its own
@@ -29,7 +36,7 @@ fi
 if [[ $("$compiler" --version) == "ablac 0.2.20" ]]; then
     mkdir -p "$project_root/build"
     bridge_directory=$(mktemp -d "$project_root/build/bootstrap-language.XXXXXX")
-    trap 'rm -rf -- "$bridge_directory"' EXIT
+    trap 'rm -rf -- "$bridge_directory" ${located_compiler:+"$located_compiler"}' EXIT
     bridge_revision=773683772ce54bcfae4fdfd7049b55bd28ea1814
     bridge_sha256=0c2024ce8b45c1c6f8b8aaade79998a03752c6c64df6266c211df149d53d9640
     archive="$bridge_directory/source.tar.gz"
@@ -61,7 +68,7 @@ fi
 # compiler makes typed instances and builds the result.
 mkdir -p "$project_root/build"
 objects_directory=$(mktemp -d "$project_root/build/bootstrap-objects.XXXXXX")
-trap 'rm -rf -- "$objects_directory" ${bridge_directory:+"$bridge_directory"}' EXIT
+trap 'rm -rf -- "$objects_directory" ${bridge_directory:+"$bridge_directory"} ${located_compiler:+"$located_compiler"}' EXIT
 probe_status=0
 ABLA_COMPILER_PAYLOAD=$compiler ABLA_SYSROOT=$project_root ABLA_MAX_SECONDS=120 \
     "$project_root/tools/run-limited-compiler.sh" build \

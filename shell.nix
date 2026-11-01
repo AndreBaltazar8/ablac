@@ -38,6 +38,10 @@ pkgs.mkShell {
     binaryen
     nodejs
     openssl
+    # prlimit, for tools/run-limited.sh: an image may have none of its own.
+    util-linux
+    # tools/build-self-hosted-current.sh, for a compiler linked elsewhere.
+    patchelf
   ];
 
   shellHook = ''
