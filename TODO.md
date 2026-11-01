@@ -171,11 +171,11 @@
   apt.llvm.org's LLVM from an Ubuntu 22.04 image and the macOS jobs use Homebrew's, neither
   with Xtensa. The Nix-built one needs Nix's glibc 2.44, so Linux would need a build against an
   old glibc, and macOS one built on a Mac of each architecture.
-- [ ] **`make test` under 2 minutes, and its tooling in Abla.** On 2026-11-01 at JOBS=30, with other
-  work on the machine: 170 s or more after a compiler change (about 3,800 CPU-seconds), 125 s on a
-  rerun with the same compiler, starting at load 7.5 (about 3,150; the suite's builds share the default cache, and
+- [ ] **`make test` under 2 minutes after a compiler change too, and its tooling in Abla.** On 2026-11-01 at
+  JOBS=30, starting at load 7.5 from other work: 164 s after a compiler change (about 4,100 CPU-seconds),
+  115 to 119 s on a rerun with the same compiler (about 2,900; the suite's builds share the default cache, and
   `tools/run-tests.sh` clears it when the compiler changes). The cold run is the one left: 30 cores give
-  133 s at best, so it needs less work per build. A script that sets a compile-affecting `ABLA_*`
+  137 s at best, so it needs less work per build. A script that sets a compile-affecting `ABLA_*`
   variable or uses compile grants keeps `--no-cache`: the cache key ignores those variables, so a hit
   would pass without testing that mode. Over a whole run: LLVM 45% (`opt` 18% of all CPU), the frontend
   29%, libc 12%. Tried and dropped: glibc malloc tunables (no change); JOBS=40, 50, 60 (slower, noisy).

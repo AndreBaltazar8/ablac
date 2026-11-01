@@ -44,7 +44,10 @@ if (($# == 0)); then
     done
 fi
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/abla-doc-examples.XXXXXX")
+# At the same path each run: a build's cache key names its source's.
+work=$project_root/build/doc-examples-work
+rm -rf "$work"
+mkdir -p "$work"
 if [[ ${DOC_EXAMPLES_KEEP:-0} != 1 ]]; then
     trap 'rm -rf "$work"' EXIT
 else
@@ -53,6 +56,9 @@ fi
 export ABLA_MAX_MEMORY_MB=${ABLA_MAX_MEMORY_MB:-4096}
 export ABLA_MAX_SECONDS=${ABLA_MAX_SECONDS:-60}
 export ABLA_MAX_CPU_SECONDS=${ABLA_MAX_CPU_SECONDS:-$ABLA_MAX_SECONDS}
+
+# Each example builds in its own directory, whose default cache would go with it.
+export ABLA_CACHE_DIR=${ABLA_CACHE_DIR:-$project_root/build/.abla-cache}
 
 jobs=${DOC_EXAMPLES_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 passed=0
