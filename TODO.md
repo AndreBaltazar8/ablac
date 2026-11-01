@@ -30,21 +30,14 @@
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
       on 2026-11-01, `~/.nix-profile/bin/git` was missing for a moment.
-- [ ] `--emit-llvm` of abla-embedded's `tests/package-import.ab` fails on master and with these fixes: 71 semantic errors on its
-      main (`call.target:esp32RecoveredSntpInit`, `integer.narrowing:...`, `region.noescape-effect:nvs_flash_init`), and on
-      `abla-embedded-fixes` (22b335b) `cpuCoreId` `cannot lower result extern.intrinsic target nativeXtensaCoreId`, as the host
-      target has no such thing. It's what its `tools/check-source` runs. Lowering only what's reached took that run from 5.0 GB and
-      172 s to 2.8 GB and 78 s (2026-11-01), still over the launcher's 4,096 MB for no other reason than `ABLA_MAX_MEMORY_MB`.
-- [ ] A call of a local that isn't a function builds and traps: `val double = 40; double(1)`, with a global function value
-      `double`, is Illegal instruction at run time (2026-11-01). It should reach the global, or fail to build.
-- [ ] `ablac serve` takes its file snapshots after the build (`watchFiles(build.modules)`), so an edit made during a build isn't
-      seen until the next one. Read in `bootstrapServeWithEmitter`, 2026-11-01, not run.
-- [ ] A killed `ablac serve` leaves its last build, and every generation's `.o.part.*`, in `build/` (`.abla-serve-<pid>-<n>*`).
-      Only a replaced generation's executable is removed (2026-11-01).
-- [ ] After a SIGSTOP and SIGCONT during a TLS read with a timeout, `tests/cases/tls-faults/timeouts` gets "default limit: no
-      reply" from `tlsConnectWithCa(...)`'s read (2026-11-01, stopping the process group in bursts). Likely EINTR from `recv` with
-      `SO_RCVTIMEO` taken as the end of the read; not looked into.
-- [ ] `tools/test-hot-reload.sh` gives `serve` `ABLA_MAX_SECONDS=15`, the tightest of the serve tests. It hasn't failed so far.
+- [ ] A finished `ablac serve` child stays a zombie until the next generation replaces it: nothing reaps it while `serve` sleeps
+      (`[.abla-serve-<pid>] <defunct>`, seen 2026-11-01).
+- [ ] `kill -- -$session` doesn't reach a compiler started through `build/ablac`: `tools/run-limited.sh`'s `timeout` makes it a process
+      group of its own. SIGTERM is forwarded; SIGKILL to the group leaves `ablac` running until its limit (2026-11-01).
+- [ ] `E_NAMED_ARGUMENT_HIDDEN` remains for one case: a default calling a constructor or foreign function the caller hides, whose type
+      has a type parameter no earlier parameter gives (`fun <T> f(a: int, b: Box<T> = Box<T>(1))`, `val Box = ...` in the caller, `f(a = 1)`).
+      A generated function couldn't be told `T`, and a named call has no type arguments (`f<string>(a = 1)` is `E_NAMED_ARGUMENT_TARGET`).
+      Passing `b` or renaming the local avoids it.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
       `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
 - [ ] `ablac.bin` run without `ABLA_SYSROOT` from outside the repository finds no runtime and doesn't say
