@@ -44,6 +44,10 @@ var bootstrapBuildTransactionActive: bool = false
 // them again as IR failures.
 var bootstrapDiagnosedLoweringErrors: int = 0
 var bootstrapBuildTransactionCount: int = 0
+// Which of this process's transactions is running (bootstrapBuildTransactionRoot),
+// and the descriptor holding its lock (-1: none).
+var bootstrapBuildTransactionSerial: int = 0
+var bootstrapBuildTransactionLock: int = -1
 
 class BootstrapCompileProgramRequest(
     val name: string,
@@ -1155,27 +1159,192 @@ fun bootstrapTakeCompileProgramRequests(
 fun bootstrapCompileOutputRoot(): string =
     "build/.abla-compile-outputs-${linuxProcessId()}"
 
+// A build's transaction is build/.abla-build-transaction-<pid>-<n>, this
+// process's n-th. Recording an output moves what was there into it ($i.path,
+// $i.existed, $i.data; $i.dropped when the build removes the output on
+// purpose), so a failed build puts the earlier outputs back. The build holds a
+// lock on its `lock` file while it runs, which the kernel lets go of however the
+// process ends, and `committing` marks a commit under way. A build that ended
+// without finishing its transaction (killed, or stopped by a panic such as the
+// memory limit's) leaves it behind; the next build in the directory finishes
+// its commit, or else rolls it back, and removes it.
 fun bootstrapBuildTransactionRoot(): string =
-    "build/.abla-build-transaction-${linuxProcessId()}"
+    "build/.abla-build-transaction-${linuxProcessId()}-$bootstrapBuildTransactionSerial"
+
+/** Removes a transaction's journal, leaving its outputs as they are. The
+ *  marker and the lock go last: until then, what's left still says whether a
+ *  commit was under way. */
+fun bootstrapRemoveBuildTransactionJournal(root: string): void {
+    val directory = Path(root)
+    for (entry in directory.entries()) {
+        val name = entry.name()
+        if (name != "committing" && name != "lock") entry.remove()
+    }
+    Path("$root/committing").remove()
+    Path("$root/lock").remove()
+    directory.remove()
+    return
+}
 
 fun bootstrapClearBuildTransactionJournal(): void {
-    val root = bootstrapBuildTransactionRoot()
-    var index = 0
-    while (index < bootstrapBuildTransactionCount) {
-        Path("$root/$index.path").remove()
-        Path("$root/$index.existed").remove()
-        Path("$root/$index.data").remove()
-        Path("$root/$index.dropped").remove()
-        index = index + 1
+    bootstrapRemoveBuildTransactionJournal(bootstrapBuildTransactionRoot())
+    if (bootstrapBuildTransactionLock >= 0) {
+        LinuxFileDescriptor(bootstrapBuildTransactionLock).close()
+        bootstrapBuildTransactionLock = -1
     }
-    Path(root).remove()
     bootstrapBuildTransactionCount = 0
     bootstrapSemanticUnit()
+}
+
+/** One more than the highest entry a transaction's journal holds. */
+fun bootstrapBuildTransactionJournalSize(root: string): int {
+    var size = 0
+    for (entry in Path(root).entries()) {
+        val name = entry.name()
+        var end = 0
+        var index = 0
+        while (end < name.size && end < 9 && name[end] >= 48 && name[end] <= 57) {
+            index = index * 10 + name[end] - 48
+            end = end + 1
+        }
+        if (end > 0 && name.size == end + 5 && name.slice(end, name.size) == ".path" &&
+            index >= size) size = index + 1
+    }
+    size
+}
+
+/** Puts back the outputs the first `count` entries moved aside, if the build
+ *  didn't make them on purpose; whatever it wrote in their place stays. */
+fun bootstrapFinishBuildTransactionCommit(root: string, count: int): void {
+    var index = 0
+    while (index < count) {
+        val path = Path("$root/$index.path").readText()
+        if (path.size > 0 && Path("$root/$index.existed").readText() == "1" &&
+            !Path(path).exists() && !Path("$root/$index.dropped").exists()) {
+            Path("$root/$index.data").moveTo(Path(path))
+        }
+        index = index + 1
+    }
+    return
+}
+
+/** Puts every output the first `count` entries record back as it was, last
+ *  first: whether all of them are. An entry without its data never moved the
+ *  earlier output (its build stopped first) or has put it back already. */
+fun bootstrapRollBackBuildTransactionJournal(root: string, count: int): bool {
+    var restored = true
+    var index = count
+    while (index > 0) {
+        index = index - 1
+        val path = Path("$root/$index.path").readText()
+        val existed = Path("$root/$index.existed").readText()
+        val data = Path("$root/$index.data")
+        if (path.size > 0 && existed == "1") {
+            if (data.exists()) {
+                Path(path).remove()
+                if (!data.moveTo(Path(path))) restored = false
+            }
+        } else if (path.size > 0 && existed == "0" &&
+                   !Path(path).remove() && Path(path).exists()) {
+            restored = false
+        }
+    }
+    restored
+}
+
+/** Brings a transaction whose build has ended to an end: its commit finished if
+ *  one was under way, otherwise rolled back; then removes it. */
+fun bootstrapRecoverBuildTransaction(root: string): void {
+    val count = bootstrapBuildTransactionJournalSize(root)
+    if (Path("$root/committing").exists()) {
+        bootstrapFinishBuildTransactionCommit(root, count)
+    } else {
+        bootstrapRollBackBuildTransactionJournal(root, count)
+    }
+    bootstrapRemoveBuildTransactionJournal(root)
+    return
+}
+
+/** Whether `name` is `prefix` and a process id, then nothing or (with
+ *  `serial`) a dash: that id, else -1. */
+fun bootstrapBuildScratchOwner(name: string, prefix: string, serial: bool): int {
+    if (name.size <= prefix.size || name.slice(0, prefix.size) != prefix) return -1
+    var end = prefix.size
+    var owner = 0
+    while (end < name.size && end - prefix.size < 9 && name[end] >= 48 && name[end] <= 57) {
+        owner = owner * 10 + name[end] - 48
+        end = end + 1
+    }
+    var matched = end > prefix.size
+    if (matched && end < name.size) matched = serial && name[end] == 45
+    if (matched) owner else -1
+}
+
+/** Whether no process has id `owner` (always false where /proc can't tell). */
+fun bootstrapBuildOwnerGone(owner: int): bool =
+    Path("/proc/self").exists() && !Path("/proc/$owner").exists()
+
+/** Each build first ends what builds before it in this directory left
+ *  unfinished. A transaction is ended once its lock is free, so a running
+ *  build's is never touched, whatever process now has its owner's id. An older
+ *  compiler's (named by its process id alone, with no lock) and the other
+ *  per-process scratch directories go once no process has their id; those
+ *  transactions are only removed, not undone, since builds since may have
+ *  replaced their outputs. */
+fun bootstrapRecoverBuildTransactions(): void {
+    val scratch = [
+        ".abla-compile-outputs-", ".abla-compile-globals-",
+        ".abla-program-requests-", ".abla-defined-targets-",
+        ".abla-export-requests-", ".abla-artifact-root-requests-",
+        ".abla-function-body-replacements-",
+        ".abla-function-annotation-additions-",
+        ".abla-driver-diagnostics-", ".abla-generated-module-requests-"
+    ]
+    val self = linuxProcessId()
+    for (entry in Path("build").entries()) {
+        val name = entry.name()
+        val owner = bootstrapBuildScratchOwner(name, ".abla-build-transaction-", true)
+        if (owner >= 0) {
+            // O_RDONLY | O_CLOEXEC: a missing lock isn't created.
+            val lock = linuxOpen("${entry.text}/lock", 524288)
+            if (lock.descriptor >= 0) {
+                if (FileLock(lock.descriptor).tryHold()) {
+                    bootstrapRecoverBuildTransaction(entry.text)
+                }
+                lock.close()
+            } else if (owner == self || bootstrapBuildOwnerGone(owner)) {
+                bootstrapRemoveBuildTransactionJournal(entry.text)
+            }
+        } else {
+            var kind = 0
+            while (kind < scratch.size) {
+                val scratchOwner = bootstrapBuildScratchOwner(name, scratch[kind], false)
+                if (scratchOwner >= 0 && scratchOwner != self &&
+                    bootstrapBuildOwnerGone(scratchOwner)) entry.removeTree()
+                kind = kind + 1
+            }
+        }
+    }
+    return
 }
 
 fun bootstrapBeginBuildTransaction(): void {
     bootstrapBuildTransactionActive = false
     bootstrapClearBuildTransactionJournal()
+    bootstrapRecoverBuildTransactions()
+    bootstrapBuildTransactionSerial = bootstrapBuildTransactionSerial + 1
+    // Locked before it has its name, so no other build sees it unlocked.
+    val root = bootstrapBuildTransactionRoot()
+    val staging = "$root.new"
+    if (Path(staging).createDirectories()) {
+        val lock = Path("$staging/lock").fileLock()
+        if (lock.tryHold() && Path(staging).moveTo(Path(root))) {
+            bootstrapBuildTransactionLock = lock.descriptor
+        } else {
+            if (lock.descriptor >= 0) LinuxFileDescriptor(lock.descriptor).close()
+            bootstrapRemoveBuildTransactionJournal(staging)
+        }
+    }
     bootstrapBuildTransactionActive = true
     bootstrapSemanticUnit()
 }
@@ -1231,36 +1400,21 @@ fun bootstrapDropBuildTransactionPath(path: string): void {
 fun bootstrapCommitBuildTransaction(): void {
     bootstrapBuildTransactionActive = false
     val root = bootstrapBuildTransactionRoot()
-    var index = 0
-    while (index < bootstrapBuildTransactionCount) {
-        val path = Path("$root/$index.path").readText()
-        if (Path("$root/$index.existed").readText() == "1" &&
-            !Path(path).exists() && !Path("$root/$index.dropped").exists()) {
-            Path("$root/$index.data").moveTo(Path(path))
-        }
-        index = index + 1
+    // A build stopped from here on has its commit finished, not rolled back.
+    if (bootstrapBuildTransactionCount > 0) {
+        Path("$root/committing").writeTextAtomic("1")
     }
+    bootstrapFinishBuildTransactionCommit(root, bootstrapBuildTransactionCount)
     bootstrapClearBuildTransactionJournal()
     bootstrapSemanticUnit()
 }
 
 fun bootstrapRollbackBuildTransaction(): bool {
     bootstrapBuildTransactionActive = false
-    var restored = true
-    val root = bootstrapBuildTransactionRoot()
-    var index = bootstrapBuildTransactionCount
-    while (index > 0) {
-        index = index - 1
-        val path = Path("$root/$index.path").readText()
-        if (Path("$root/$index.existed").readText() == "1") {
-            Path(path).remove()
-            if (!Path("$root/$index.data").moveTo(Path(path))) {
-                restored = false
-            }
-        } else if (!Path(path).remove() && Path(path).exists()) {
-            restored = false
-        }
-    }
+    val restored = bootstrapRollBackBuildTransactionJournal(
+        bootstrapBuildTransactionRoot(),
+        bootstrapBuildTransactionCount
+    )
     bootstrapClearBuildTransactionJournal()
     restored
 }

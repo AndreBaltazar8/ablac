@@ -115,6 +115,7 @@ test-serial: ablac
 	tools/test-wasm-debug-reproducible.sh $(COMPILER)
 	tools/test-rewritten-module-diagnostics.sh $(COMPILER)
 	tools/test-build-removed-outputs.sh $(COMPILER)
+	tools/test-build-transaction-recovery.sh $(COMPILER)
 	tools/test-value-slot-addresses.sh $(COMPILER)
 	tools/test-build-same-process.sh $(COMPILER)
 	tools/test-float-interpolation.sh $(COMPILER)
