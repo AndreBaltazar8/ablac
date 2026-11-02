@@ -37,9 +37,11 @@
   hardware test; merging it is what closes this.
 - [ ] **abla-one's limits on 0.2.29.** (a) A class's methods are all compiled, used or not, so what only one method reaches stays in
   every program with the class. (b) `bootstrapLlvmAddressTaken` counts a function's value taken in an unreachable function, so it's in
-  `abla_llvm_call_indirect`'s table and linked. (c) A function value's or interface method's managed result can't be returned as it is
-  (`ownership.managed-return-borrow-contract:return:nonfresh`) when the call takes parameters; a nullable function type can't be called
-  after a null check (`call.target`) or assigned a function (`assignment.type`).
+  `abla_llvm_call_indirect`'s table and linked.
+- [ ] A lambda that returns its parameter checks as a plain function type: `val keep: (Row) -> Row = { c: Row -> c }` compiles, where
+  `fun id(c: Row): Row = c` is `ownership.borrow-escape`, so a call of such a value counts as making a new value. Seen 2026-11-02.
+- [ ] A lambda with no declared result, passed for `(int) -> string?`, doesn't take that type from an unconditional `null`:
+  `w({ x: int -> null })` is `function.argument:...:function:(i64)->null`. Seen 2026-11-02.
 - [ ] Once during `make test` (2026-11-01), `tools/test-ct.sh` saw `python3: No such file or directory`
       and `suite-package-providers` failed to resolve a local git dependency, with neither recurring
       in the next runs. Suspected: the Nix profile changing mid-run. Not confirmed, but during a `home-manager switch`
