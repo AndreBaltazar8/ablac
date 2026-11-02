@@ -46,6 +46,8 @@
       has a type parameter no earlier parameter gives (`fun <T> f(a: int, b: Box<T> = Box<T>(1))`, `val Box = ...` in the caller, `f(a = 1)`).
       A generated function couldn't be told `T`, and a named call has no type arguments (`f<string>(a = 1)` is `E_NAMED_ARGUMENT_TARGET`).
       Passing `b` or renaming the local avoids it.
+- [ ] `tools/test-linux-process.sh` failed once under `make test-full` ("close unblocks them", 1 of 4 runs on 2026-11-02), then passed
+      25 of 25 alone. Not looked into.
 - [ ] macOS: nobody has compared a local rebuild with the published binary, and
       `tools/test-reproducible-elsewhere.sh` skips it (2026-11-01).
 - [ ] `tools/test-simd.sh`, `test-ct.sh` and `test-crypto-pure.sh` fail on Xtensa when given an
@@ -145,6 +147,8 @@
   `--no-cache`: a hit would pass without running it. Building the compiler itself: 67 s to about 54 s wall and
   153 to about 108 CPU-seconds on 2026-11-01, by doing only inlining and globalopt before the split;
   most of the rest is the frontend (about 10 s) and that step, both on one core.
+  Whole-module O2 or O3 for the compiler itself instead of O1, split and O2 was tried on 2026-11-01: no faster
+  (fib's `--emit-llvm` 3.28 G instructions split, 3.42 G O2, 3.28 G O3), and it takes about 120 s on one core.
   Removing unreachable `abla_fn_` functions before opt (local branch `prune-dead-functions`; hello world
   374 to 91) was tried on 2026-11-01 and not landed: release builds of small and mid-sized programs 6 to 19%
   less CPU, but no gain building the compiler (about 120 CPU-seconds either way; it comes out 7% smaller
@@ -181,6 +185,17 @@ Package-side work (not changed from ablac):
   Gradle/NDK build on both architectures.
 
 ## Compile time and memory
+
+- [ ] **The small-block lists never go back to the system or to another size.** Blocks up to 512 bytes
+  (`__ablaRuntimeHostSmallLists`) stay on their list once freed, and `malloc_trim` can't reach them. Measured
+  2026-11-01, peak RSS against malloc for each: trees, strings and maps 7 to 19% lower, json-readers 33% higher
+  (137 to 182 MB), json-megabyte varying between runs (190 to 319 MB against 243 to 308). A program whose sizes
+  shift over time keeps the old sizes' memory. Empty chunks could be returned at a collection.
+- [ ] **Run times of non-Linux hosted targets aren't measured with the new allocator and root frames.** macOS keeps
+  its LTO link (`wholeProgram` is ELF only) and has not been built or run with these changes; Wasm passes the suite,
+  its size and speed not compared. An earlier try at size lists on Darwin gained no cycles and raised peak memory.
+- [ ] **A benchmark's cycles can move 20% with the code unchanged.** `fib` at 2026-11-01 is byte-identical machine
+  code at another address and takes 20% more cycles. `tools/bench-compare.py` reports instructions for that reason.
 
 - [ ] **Temporaries spanning IR blocks never share a stack slot.** Every IR value that is
   not a scalar gets its own 24-byte slot. A value used only inside one IR block, defined by

@@ -581,13 +581,71 @@ trusted fun __ablaRuntimeHostRegionAllocate(size: int): int {
     header + 32
 }
 
+// Blocks of up to 512 bytes, header included, come from lists by size, 16 bytes apart, filled
+// from chunks cut in order: under a collector every block is freed once, and a malloc and a
+// free each cost more than the object's first use. They are taken and given back under the
+// heap lock, and a block stays its size for good. Its first word links it while free.
+var __ablaRuntimeHostSmallNext: int = 0
+var __ablaRuntimeHostSmallEnd: int = 0
+
+// (Static storage, as the collection's page cache: 33 lists by a block's size / 16.)
+trusted fun __ablaRuntimeHostSmallLists(): int = nativeStaticAllocate(264)
+
+// A new chunk to cut blocks from. What is left of the last one goes on the list of its size.
+@noinline
+trusted fun __ablaRuntimeHostSmallRefill(total: int): int {
+    val rest = __ablaRuntimeHostSmallEnd - __ablaRuntimeHostSmallNext
+    if (rest >= 32) {
+        val list = __ablaRuntimeHostSmallLists() + (rest >> 4) * 8
+        ablaRuntimeStoreI64(__ablaRuntimeHostSmallNext, ablaRuntimeLoadI64(list))
+        ablaRuntimeStoreI64(list, __ablaRuntimeHostSmallNext)
+    }
+    val chunk = ablaRuntimePointerAddress(malloc(1048576))
+    if (chunk == 0) __ablaRuntimeHostOutOfMemory()
+    __ablaRuntimeHostSmallNext = chunk + total
+    __ablaRuntimeHostSmallEnd = chunk + 1048576
+    chunk
+}
+
+@inline
+trusted fun __ablaRuntimeHostBlockAllocate(size: int): int {
+    val total = (size + 47) & -16
+    if (total > 512) {
+        val header = ablaRuntimePointerAddress(malloc(size + 32))
+        if (header == 0) __ablaRuntimeHostOutOfMemory()
+        return header
+    }
+    val list = __ablaRuntimeHostSmallLists() + (total >> 4) * 8
+    val free = ablaRuntimeLoadI64(list)
+    if (free != 0) {
+        ablaRuntimeStoreI64(list, ablaRuntimeLoadI64(free))
+        return free
+    }
+    val next = __ablaRuntimeHostSmallNext
+    if (total > __ablaRuntimeHostSmallEnd - next) return __ablaRuntimeHostSmallRefill(total)
+    __ablaRuntimeHostSmallNext = next + total
+    next
+}
+
+// Whether a block of `size` payload bytes is on the lists above.
+@inline
+trusted fun __ablaRuntimeHostBlockSmall(size: int): bool = size <= 480
+
+@inline
+trusted fun __ablaRuntimeHostBlockFree(header: int, size: int): void {
+    if (__ablaRuntimeHostBlockSmall(size)) {
+        val list = __ablaRuntimeHostSmallLists() + (((size + 47) & -16) >> 4) * 8
+        ablaRuntimeStoreI64(header, ablaRuntimeLoadI64(list))
+        ablaRuntimeStoreI64(list, header)
+    } else free(ablaRuntimePointerFromAddress(header))
+}
+
 // Inlined into each runtime allocator (as it always was by size): left out of line, those
 // allocators become small enough to be inlined into every allocation site instead.
 @inline
 trusted fun __ablaRuntimeHostTrackedAllocate(size: int, layout: int): int {
     if (size > 4611686018427387871) ablaRuntimeTrap()
-    val header = ablaRuntimePointerAddress(malloc(size + 32))
-    if (header == 0) __ablaRuntimeHostOutOfMemory()
+    val header = __ablaRuntimeHostBlockAllocate(size)
     ablaRuntimeStoreI64(header + 8, 0)
     ablaRuntimeStoreI64(header + 16, size)
     ablaRuntimeStoreI64(header + 24, layout)
@@ -647,7 +705,7 @@ trusted fun __ablaRuntimeHostFreeUnlocked(address: int): void {
             val owner = ablaRuntimeLoadI64(header + 24)
             if (owner >= 0 && owner < 48) {
                 __ablaRuntimeHostUnregister(header)
-                free(ablaRuntimePointerFromAddress(header))
+                __ablaRuntimeHostBlockFree(header, size)
                 __ablaRuntimeHostAllocationCount =
                     __ablaRuntimeHostAllocationCount - 1
             } else {
@@ -1059,8 +1117,20 @@ trusted fun __ablaRuntimeHostMarkRootValues(): void {
     var frame: int = __ablaRuntimeHostRootFrameLoad()
     while (frame != 0) {
         val roots = ablaRuntimeLoadI64(frame + 8)
-        val count = ablaRuntimeLoadI64(frame + 16)
+        val packed = ablaRuntimeLoadI64(frame + 16)
+        val count = packed & 4294967295
         var index: int = 0
+        // Past the table's words, the count says how many values its first word's array holds.
+        var inBlock = packed >>> 32
+        if (inBlock != 0) {
+            var held = ablaRuntimeLoadI64(roots)
+            while (inBlock > 0) {
+                __ablaRuntimeHostMarkValue(held)
+                held = held + 24
+                inBlock = inBlock - 1
+            }
+            index = 1
+        }
         while (index < count) {
             val value = ablaRuntimeLoadI64(roots + index * 8)
             if (value != 0) __ablaRuntimeHostMarkValue(value)
@@ -1164,10 +1234,10 @@ trusted fun __ablaRuntimeHostCollectionSweep(): void {
             val header = entry & -16
             val state = ablaRuntimeLoadI64(header + 24)
             if (state >= 0 && state < 16 && state != 10 && state != 12) {
-                __ablaRuntimeHostLiveBytes =
-                    __ablaRuntimeHostLiveBytes - ablaRuntimeLoadI64(header + 16)
+                val size = ablaRuntimeLoadI64(header + 16)
+                __ablaRuntimeHostLiveBytes = __ablaRuntimeHostLiveBytes - size
                 __ablaRuntimeHostAllocationCount = __ablaRuntimeHostAllocationCount - 1
-                free(ablaRuntimePointerFromAddress(header))
+                __ablaRuntimeHostBlockFree(header, size)
             } else {
                 if (state >= 16) ablaRuntimeStoreI64(header + 24, state - 32)
                 ablaRuntimeStoreI64(header, kept)
@@ -1220,6 +1290,11 @@ trusted fun __ablaRuntimeHostFreeWorker(batch: int): int {
 
 // A block the sweep found unreachable, for the helper.
 trusted fun __ablaRuntimeHostFreeLater(header: int): void {
+    val blockSize = ablaRuntimeLoadI64(header + 16)
+    if (__ablaRuntimeHostBlockSmall(blockSize)) {
+        __ablaRuntimeHostBlockFree(header, blockSize)
+        return
+    }
     val state = __ablaRuntimeHostFreeState()
     var chunk = ablaRuntimeLoadI64(state + 32)
     if (chunk == 0 || ablaRuntimeLoadI64(chunk + 8) == 65534) {

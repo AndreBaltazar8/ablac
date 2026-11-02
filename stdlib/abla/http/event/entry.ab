@@ -47,7 +47,9 @@ resource class HttpEventServer(
     val lastActivityMilliseconds: array<int>,
     var draining: bool,
     var drainDeadlineMilliseconds: int,
-    var stopped: bool
+    var stopped: bool,
+    // The clock when this pass of step began: a request needn't read it again.
+    var passMilliseconds: int
 ) {
     fun drop(): void {
         var index = 0
@@ -88,7 +90,7 @@ fun httpEventServer(
     HttpEventServer(
         router, httpEventUnusedHandler, httpEventUnusedHandler, false, false,
         move(listener), move(poller), options,
-        [], [], [], [], [], [], [], [], [], false, 0, false
+        [], [], [], [], [], [], [], [], [], false, 0, false, linuxMonotonicMilliseconds()
     )
 }
 
@@ -107,7 +109,7 @@ fun httpEventServerHandler(
     HttpEventServer(
         httpRouter(), handler, httpEventUnusedHandler, true, false,
         move(listener), move(poller), options,
-        [], [], [], [], [], [], [], [], [], false, 0, false
+        [], [], [], [], [], [], [], [], [], false, 0, false, linuxMonotonicMilliseconds()
     )
 }
 
@@ -126,7 +128,7 @@ fun httpEventServerNoEscapeHandler(
     HttpEventServer(
         httpRouter(), httpEventUnusedHandler, handler, false, true,
         move(listener), move(poller), options,
-        [], [], [], [], [], [], [], [], [], false, 0, false
+        [], [], [], [], [], [], [], [], [], false, 0, false, linuxMonotonicMilliseconds()
     )
 }
 
@@ -454,7 +456,7 @@ fun HttpEventServer.processNoEscapeInputInRegion(
             if (written.written > 0 &&
                 written.written < framedResponse.size) {
                 this.lastActivityMilliseconds[slot] =
-                    linuxMonotonicMilliseconds()
+                    this.passMilliseconds
             }
             if (written.failed() && written.errorCode != 11) {
                 this.closeSlot(slot)
@@ -614,7 +616,7 @@ fun HttpEventServer.readReady(slot: int): void {
                     accumulating = false
                     if (incoming.size > 0) {
                         this.lastActivityMilliseconds[slot] =
-                            linuxMonotonicMilliseconds()
+                            this.passMilliseconds
                         val input = "$pending$incoming"
                         if (input.size >
                             this.options.maximumHeaderBytes +
@@ -663,7 +665,7 @@ fun HttpEventServer.readReady(slot: int): void {
             connection.descriptor = -1
             if (incoming.size > 0) {
                 this.lastActivityMilliseconds[slot] =
-                    linuxMonotonicMilliseconds()
+                    this.passMilliseconds
                 this.inputs[slot] = memoryPromoteString(
                     "${this.inputs[slot]}$incoming"
                 )
@@ -693,7 +695,7 @@ fun HttpEventServer.writeReady(slot: int): void {
         val written = connection.writeResult(remaining)
         connection.descriptor = -1
         if (written.written > 0) {
-            this.lastActivityMilliseconds[slot] = linuxMonotonicMilliseconds()
+            this.lastActivityMilliseconds[slot] = this.passMilliseconds
         }
         this.outputOffsets[slot] =
             this.outputOffsets[slot] + written.written
@@ -728,6 +730,7 @@ fun HttpEventServer.step(timeoutMilliseconds: int = 1000): int {
         maximumEvents,
         timeoutMilliseconds
     )
+    this.passMilliseconds = linuxMonotonicMilliseconds()
     var index = 0
     while (index + 12 <= events.size) {
         val flags = textReadU32LittleEndian(events, index)
@@ -759,7 +762,7 @@ fun HttpEventServer.step(timeoutMilliseconds: int = 1000): int {
         index = index + 12
     }
     if (this.options.idleTimeoutMilliseconds > 0) {
-        val now = linuxMonotonicMilliseconds()
+        val now = this.passMilliseconds
         index = 0
         while (index < this.descriptors.size) {
             if (this.descriptors[index] >= 0 &&

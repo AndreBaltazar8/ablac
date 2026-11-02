@@ -238,7 +238,8 @@ fun bootstrapLlvmDeclareDirectFunction(
     // calls; explicit @inline remains alwaysinline and @noinline remains an
     // exact source-level boundary.
     val mcuTarget = bootstrapLlvmMcuTarget(backend.targetTriple)
-    val runtimeInline = bootstrapLlvmMcuRuntimeInline(
+    val nativeInline = bootstrapLlvmNativeRuntimeInline(backend.targetTriple, function.name)
+    val runtimeInline = nativeInline || bootstrapLlvmMcuRuntimeInline(
         backend.targetTriple, function.name
     )
     if (!function.naked && mcuTarget) {
@@ -252,13 +253,13 @@ fun bootstrapLlvmDeclareDirectFunction(
     if (bootstrapLlvmProgramUsesSimd && bootstrapTextContains(backend.targetTriple, "wasm32")) {
         bootstrapLlvmAddStringFunctionAttribute(backend, declared, "target-features", "+simd128")
     }
-    if (!function.naked && !function.noinlineHint &&
+    if (!function.naked && (!function.noinlineHint || nativeInline) &&
         (function.inlineHint || runtimeInline)) {
         bootstrapLlvmAddFunctionAttribute(
             backend, declared, "alwaysinline"
         )
     }
-    if (!function.naked && function.noinlineHint) {
+    if (!function.naked && function.noinlineHint && !nativeInline) {
         bootstrapLlvmAddFunctionAttribute(backend, declared, "noinline")
     }
     // A function that never returns (a panic, `exit`) runs at most once: its
@@ -301,6 +302,9 @@ class BootstrapLlvmFunctionStorage(
     val gcRoots: i64*,
     val gcRootsType: i64*,
     val gcRootCount: int,
+    // The array holding `gcRootBlockCount` rooted values, named by the table's first word.
+    val gcRootBlock: i64*,
+    val gcRootBlockCount: int,
     // A function pushes its root frame (and runs its pressure safe point, when it
     // allocates) lazily (`gcLazy`): at the first block that may collect or
     // allocate, not at entry. `gcPressure`: whether the push runs the safe point too.
@@ -694,18 +698,60 @@ fun bootstrapLlvmCreateFunctionStorage(
     val blocks: array<i64*> = []
     val nullPointer = nativeNullPointer()
     val valueCount = bootstrapLlvmValueCount(function)
+    // The rooted values and locals share one array: one memset defines them all and one word
+    // of the root table names them all, where separate slots each take a store of zero and a
+    // table entry, a good part of a large function's code. (With debug information, each
+    // keeps an alloca for its variable.)
+    var rootBlockCount = 0
+    if (collecting && !bootstrapLlvmDebugInfo) {
+        var counted = 0
+        while (counted < valueCount) {
+            if (bootstrapLlvmValueHasSlot(counted, tables, scalarPlan) &&
+                counted < rootValues.size && rootValues[counted]) {
+                rootBlockCount = rootBlockCount + 1
+            }
+            counted = counted + 1
+        }
+        counted = 0
+        while (counted < function.instructions.size) {
+            val opcode = function.instructions[counted].opcode
+            if ((opcode == "local.declare" || bootstrapIrIsLocalZero(opcode) ||
+                 opcode == "local.allocate") &&
+                !(counted < scalarPlan.localTypes.size && scalarPlan.localTypes[counted] != "") &&
+                bootstrapLlvmLocalRooted(rootLocals, counted)) {
+                rootBlockCount = rootBlockCount + 1
+            }
+            counted = counted + 1
+        }
+        if (rootBlockCount < 2) rootBlockCount = 0
+    }
+    var rootBlock: i64* = nullPointer
+    var rootBlockType: i64* = nullPointer
+    if (rootBlockCount > 0) {
+        rootBlockType = LLVMArrayType2(backend.valueType, rootBlockCount)
+        rootBlock = LLVMBuildAlloca(backend.builder, rootBlockType, "gc.block")
+        LLVMSetAlignment(rootBlock, 8)
+        LLVMBuildMemSet(
+            backend.builder, rootBlock, LLVMConstInt(backend.i8Type, 0, 0),
+            LLVMConstInt(backend.i64Type, rootBlockCount * 24, 0), 8
+        )
+    }
+    var rootBlockNext = 0
     var index = 0
     while (index < valueCount) {
         var slot: i64* = nullPointer
-        val elided = index < tables.elided.size && tables.elided[index]
-        if (!elided && (index >= scalarPlan.valueTypes.size ||
-            scalarPlan.valueTypes[index] == "" ||
-            (index < scalarPlan.boxedValues.size &&
-             scalarPlan.boxedValues[index]))) {
-            slot = LLVMBuildAlloca(
-                backend.builder, backend.valueType, "value"
-            )
-            LLVMSetAlignment(slot, 8)
+        if (bootstrapLlvmValueHasSlot(index, tables, scalarPlan)) {
+            if (rootBlockCount > 0 && index < rootValues.size && rootValues[index]) {
+                slot = bootstrapLlvmArrayElement(
+                    backend, rootBlockType, rootBlock, rootBlockNext, "value"
+                )
+                rootBlockNext = rootBlockNext + 1
+            } else {
+                slot = LLVMBuildAlloca(
+                    backend.builder, backend.valueType, "value"
+                )
+                LLVMSetAlignment(slot, 8)
+            }
         }
         values.append(slot)
         nativeValues.append(nullPointer)
@@ -722,7 +768,12 @@ fun bootstrapLlvmCreateFunctionStorage(
             instruction.opcode == "local.allocate") {
             val scalar = if (index < scalarPlan.localTypes.size)
                 scalarPlan.localTypes[index] else ""
-            if (scalar == "") {
+            if (scalar == "" && rootBlockCount > 0 && bootstrapLlvmLocalRooted(rootLocals, index)) {
+                local = bootstrapLlvmArrayElement(
+                    backend, rootBlockType, rootBlock, rootBlockNext, "local"
+                )
+                rootBlockNext = rootBlockNext + 1
+            } else if (scalar == "") {
                 local = LLVMBuildAlloca(
                     backend.builder, backend.valueType, "local"
                 )
@@ -833,7 +884,7 @@ fun bootstrapLlvmCreateFunctionStorage(
     // Every value is written by the instruction that defines it before it is
     // read, so only the slots a root frame scans need a defined value first.
     while (index < values.size) {
-        if (collecting && index < rootValues.size && rootValues[index] &&
+        if (collecting && rootBlockCount == 0 && index < rootValues.size && rootValues[index] &&
             !pointerIsNull(values[index])) {
             val stored = LLVMBuildStore(backend.builder, zero, values[index])
             LLVMSetAlignment(stored, 8)
@@ -842,7 +893,8 @@ fun bootstrapLlvmCreateFunctionStorage(
     }
     index = 0
     while (index < locals.size) {
-        if (!pointerIsNull(locals[index])) {
+        if (!pointerIsNull(locals[index]) &&
+            !(rootBlockCount > 0 && bootstrapLlvmLocalRooted(rootLocals, index))) {
             val stored = LLVMBuildStore(backend.builder, zero, locals[index])
             LLVMSetAlignment(stored, 8)
         }
@@ -884,18 +936,21 @@ fun bootstrapLlvmCreateFunctionStorage(
             if (!pointerIsNull(parameters[index])) rootCount = rootCount + 1
             index = index + 1
         }
-        index = 0
-        while (index < values.size && index < rootValues.size) {
-            if (rootValues[index] &&
-                !pointerIsNull(values[index])) rootCount = rootCount + 1
-            index = index + 1
-        }
-        index = 0
-        while (index < locals.size) {
-            if (!pointerIsNull(locals[index]) && bootstrapLlvmLocalRooted(rootLocals, index)) {
-                rootCount = rootCount + 1
+        if (rootBlockCount > 0) rootCount = rootCount + 1
+        else {
+            index = 0
+            while (index < values.size && index < rootValues.size) {
+                if (rootValues[index] &&
+                    !pointerIsNull(values[index])) rootCount = rootCount + 1
+                index = index + 1
             }
-            index = index + 1
+            index = 0
+            while (index < locals.size) {
+                if (!pointerIsNull(locals[index]) && bootstrapLlvmLocalRooted(rootLocals, index)) {
+                    rootCount = rootCount + 1
+                }
+                index = index + 1
+            }
         }
     }
     var gcFrame: i64* = nullPointer
@@ -915,9 +970,20 @@ fun bootstrapLlvmCreateFunctionStorage(
         locals, nativeLocals, scalarPlan.localTypes,
         parameters, scratch, scratchTypes, auxiliary,
         rootValues, rootLocals, bootstrapLlvmLocalIndex(function),
-        labels, blocks, gcFrame, gcRoots, gcRootsType, rootCount
+        labels, blocks, gcFrame, gcRoots, gcRootsType, rootCount, rootBlock, rootBlockCount
     )
 }
+
+// Whether a value is kept in a slot (not elided, nor only a native scalar).
+fun bootstrapLlvmValueHasSlot(
+    index: int,
+    tables: BootstrapLlvmConstantTables,
+    scalarPlan: BootstrapLlvmScalarPlan
+): bool =
+    !(index < tables.elided.size && tables.elided[index]) &&
+    (index >= scalarPlan.valueTypes.size ||
+     scalarPlan.valueTypes[index] == "" ||
+     (index < scalarPlan.boxedValues.size && scalarPlan.boxedValues[index]))
 
 fun bootstrapLlvmInitializeParameters(
     backend: BootstrapLlvmBackend,
@@ -1086,7 +1152,15 @@ fun bootstrapLlvmPushRoots(
     if (storage.gcRootCount > 0) {
         var root = 0
         var index = 0
-        while (index < storage.values.size) {
+        if (storage.gcRootBlockCount > 0) {
+            LLVMBuildStore(
+                backend.builder, storage.gcRootBlock, bootstrapLlvmArrayElement(
+                    backend, storage.gcRootsType, storage.gcRoots, 0, "gc.root"
+                )
+            )
+            root = 1
+        }
+        while (storage.gcRootBlockCount == 0 && index < storage.values.size) {
             if (index < storage.rootValues.size &&
                 storage.rootValues[index] &&
                 !pointerIsNull(storage.values[index])) {
@@ -1116,7 +1190,7 @@ fun bootstrapLlvmPushRoots(
             index = index + 1
         }
         index = 0
-        while (index < storage.locals.size) {
+        while (storage.gcRootBlockCount == 0 && index < storage.locals.size) {
             if (!pointerIsNull(storage.locals[index]) &&
                 bootstrapLlvmLocalRooted(storage.rootLocals, index)) {
                 val destination = bootstrapLlvmArrayElement(
@@ -1172,7 +1246,8 @@ fun bootstrapLlvmEmitRootsPush(
         backend,
         "abla_runtime_roots_push",
         [storage.gcFrame, first,
-         LLVMConstInt(backend.i64Type, storage.gcRootCount, 0)],
+         // A frame's count: the table's words, and above them the values in its block.
+         LLVMConstInt(backend.i64Type, storage.gcRootCount + storage.gcRootBlockCount * 4294967296, 0)],
         "", false, [false, false, false]
     )
     return
@@ -7148,8 +7223,9 @@ fun bootstrapLlvmFoldValueSlotAddresses(
     )
     while (!pointerIsNull(instruction)) {
         val next = LLVMGetNextInstruction(instruction)
-        if (!pointerIsNull(LLVMIsAAllocaInst(instruction)) &&
-            LLVMGetAllocatedType(instruction) == backend.valueType) {
+        if ((!pointerIsNull(LLVMIsAAllocaInst(instruction)) &&
+             LLVMGetAllocatedType(instruction) == backend.valueType) ||
+            bootstrapLlvmIsArrayValueSlot(backend, instruction)) {
             var use = LLVMGetFirstUse(instruction)
             while (!pointerIsNull(use)) {
                 val user = LLVMGetUser(use)
@@ -7161,6 +7237,16 @@ fun bootstrapLlvmFoldValueSlotAddresses(
         }
         instruction = next
     }
+}
+
+// An element of an array of values in this frame (a getelementptr of `gc.block`, the rooted
+// values, or of a closure's captures): a slot like any other.
+fun bootstrapLlvmIsArrayValueSlot(backend: BootstrapLlvmBackend, instruction: i64*): bool {
+    if (int(LLVMGetInstructionOpcode(instruction)) != 29) return false
+    val base = LLVMGetOperand(instruction, 0)
+    if (pointerIsNull(LLVMIsAAllocaInst(base))) return false
+    val allocated = LLVMGetAllocatedType(base)
+    int(LLVMGetTypeKind(allocated)) == 11 && LLVMGetElementType(allocated) == backend.valueType
 }
 
 fun bootstrapLlvmFoldValueSlotAddress(

@@ -16,6 +16,61 @@ build; the former covers parsing, semantic analysis, lowering, and LLVM text
 emission, while the latter additionally includes LLVM optimization, parallel
 object emission, and linking.
 
+Compare two compilers with `tools/bench-compare.py` (compile instructions, stripped size,
+run cycles and instructions, on `tests/benchmarks`).
+
+## One optimization pass for a Linux executable (2026-11-01)
+
+A release Linux executable now goes through one `opt` (`internalize`, `forceattrs`, O2 at
+inline threshold 225) and one `llc` (loops aligned to 32 bytes), with no LTO link. Against v0.2.29,
+14 programs including the compiler, all changes below measured together:
+
+| Metric (geometric mean) | Change |
+|---|---:|
+| Release build, instructions | -41.9% |
+| Release build, cycles | -34% to -36%, three runs |
+| Stripped size | -10.1% |
+| Run instructions (11 programs) | -22.2% |
+| Run cycles (11 programs, median of 15 turns) | -18.2%, both runs |
+| Run time (same) | -16.3% and -16.0% |
+| `abla-compare` server, user instructions per request (8 workloads) | -12.0% |
+| `abla-compare` server, user cycles per request (same, median of 11) | -11.3% |
+| `abla-compare` server, CPU per request, user and kernel (same, median of 7) | -7.5% |
+| `abla-compare` server, throughput (same, median of 5) | +1.4% |
+| `abla-compare` server, stripped size | -3.0% |
+| `abla-compare` server, release build time | -28% (5.3 s to 3.8 s) |
+
+These averages favour small programs: building the compiler itself takes 10.5% fewer instructions
+and it comes out 8.0% smaller. Median run time improves on all 11 programs, most in allocation,
+strings and calls through function values; nbody, matrix and fib gain 1 to 4%. An HTTP server
+gains less, and its throughput barely moves. Most of a small request is its `read` and `sendto` in
+the kernel, which no compiled code changes (plaintext 0.4 us of user time beside 1.5 us of kernel;
+json-items-128 11.0 and 2.8). The event loop now reads the clock once a pass rather than once a
+request: a real syscall and a malloc each time. headers-32's user instructions per request are unchanged (-0.4%). Beside the pipeline: blocks
+of up to 512 bytes come from lists by size instead of malloc; a function's rooted values share one
+array, zeroed once and named by one word of its root table; hot runtime readers are `@inline`; map
+slots hold hash bits.
+
+The benchmarks in `tests/benchmarks` didn't show what a low threshold costs a server: `abla-compare`
+ran 13% more instructions per request at 100 while they looked better. Keep a server in the
+comparison when changing inlining. What moved it, for a program that's smaller as well:
+
+- Native programs inline field stores and object and array creation, with allocation left out of
+  line: a call site knows the field's kind and the class, so those checks fold (-9% on the server's
+  instructions, server 5.6% smaller). Wasm and MCUs keep the calls.
+- `@inline` on the ordering operators and map reads: they fold when the operands' types are known
+  (json-items-128 -7%, maps -15% cycles).
+- `--align-loops=32`: fib's identical code ran 11% slower at another address. It now gains 4%, for
+  2% of size.
+
+Tried and dropped: threshold 300 (size only -8.6%, instructions 2% better); a second O2 round (no
+gain); forcing small functions inline (up to 47% bigger, no gain); `@inline` on array set and append
+or on stdlib text wrappers (no gain for the size); scanning for a byte by words (HTTP lines are too
+short). `-force-attribute=optsize` makes the server 12% smaller and its cycles about 6 points worse,
+and as late as code generation about 8 points (loop alignment goes with it). The machine
+outliner and `--icf=all` are no smaller. At low thresholds the runtime's `@inline`s matter: at 100
+without them, nbody ran 4x slower.
+
 ## Pure-Abla runtime rebuild profile (2026-08-17)
 
 Replacing the C runtime exposed a release-builder regression rather than an

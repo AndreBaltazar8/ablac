@@ -1098,6 +1098,78 @@ fun bootstrapPrepareParallelLlvm(
     prepare.run()
 }
 
+// A hosted Linux executable's optimization, in one opt and one llc: the module already
+// holds the runtime, so all an LTO link adds is knowing what is visible, and internalize
+// says that from the start. Inlining then counts each function's last call, and half the
+// module is gone before the expensive passes run. The threshold is LLVM's O2 default: at 100
+// abla-compare's HTTP servers ran 13% more instructions per request, and 300 is 2% faster for
+// 3.7% more size over 14 programs. Nothing unwinds through Abla code, so without debug information `nounwind` drops
+// its unwind tables, 4 to 6% of a program. Against opt's inlining, clang's O2 and an LTO link
+// (2026-11-01, 14 programs): about 40% fewer instructions in those tools, and smaller.
+fun bootstrapOptimizeWholeProgram(
+    llvmPath: string,
+    optimizedPath: string,
+    objectPath: string,
+    abiManifest: string
+): int {
+    val optimize = linuxCommand("opt")
+    val visible = bootstrapNativeAbiExportSymbols(abiManifest)
+    visible.append("main")
+    bootstrapLlvmAssemblyNames(Path(llvmPath).readText(), visible)
+    var names = ""
+    var index = 0
+    while (index < visible.size) {
+        names = if (index == 0) visible[index] else "$names,${visible[index]}"
+        index = index + 1
+    }
+    optimize.argument("-internalize-public-api-list=$names")
+    optimize.argument("-inline-threshold=225")
+    if (!bootstrapLlvmDebugInfo) optimize.argument("-force-attribute=nounwind")
+    optimize.argument("-passes=internalize,forceattrs,default<O2>,globaldce")
+    optimize.argument(llvmPath)
+    optimize.argument("-o")
+    optimize.argument(optimizedPath)
+    var status = optimize.run()
+    if (status == 0) {
+        val emitObject = linuxCommand("llc")
+        emitObject.argument("-filetype=obj")
+        emitObject.argument("-relocation-model=pic")
+        emitObject.argument("-O2")
+        emitObject.argument("--function-sections")
+        emitObject.argument("--data-sections")
+        // Where a hot loop falls within a 32-byte fetch line otherwise decides its speed:
+        // fib's code ran 11% slower at another address. Costs about 2% of size.
+        emitObject.argument("--align-loops=32")
+        if (!bootstrapLlvmToolsVerify()) emitObject.argument("--disable-verify")
+        emitObject.argument(optimizedPath)
+        emitObject.argument("-o")
+        emitObject.argument(objectPath)
+        status = emitObject.run()
+    }
+    status
+}
+
+// Appends the generated names in the module's inline assembly, which opt doesn't read.
+fun bootstrapLlvmAssemblyNames(llvm: string, var names: array<string>): void {
+    var found = llvm.indexOf(" asm \"", 0)
+    while (found >= 0) {
+        val lineEnd = llvm.indexOf("\n", found)
+        val end = if (lineEnd < 0) llvm.size else lineEnd
+        var offset = found
+        while (offset < end) {
+            if (llvm[offset] == 97 && offset + 5 <= end && llvm.slice(offset, offset + 5) == "abla_" &&
+                !bootstrapLlvmNameByte(llvm[offset - 1])) {
+                var last = offset
+                while (last < end && bootstrapLlvmNameByte(llvm[last])) last = last + 1
+                names.append(llvm.slice(offset, last))
+                offset = last
+            } else offset = offset + 1
+        }
+        found = llvm.indexOf(" asm \"", end)
+    }
+    return
+}
+
 // The LTO input: the module after the O1 cleanup, its user-function wrappers internal.
 // Hosted LTO first specializes the universal ABI wrappers while they are
 // visible, then makes them private before whole-program dead-code elimination.
@@ -2348,7 +2420,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
                         bootstrapLlvmWithoutDeadFunctions(compilation.output)
                     } else compilation.output
                     val emitted = if (target.objectFormat == "elf" &&
-                        live.size <= 4194304) {
+                        live.size <= 4194304 && !(sidecarDeclined && !linkLlvm)) {
                         bootstrapAddLlvmElfFunctionSections(live)
                     } else live
                     if (Path(llvmPath).writeTextAtomic(emitted)) status = 0
@@ -2613,8 +2685,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     var ltoCache = ""
     if (ltoEligible && !linkLlvm && cacheEnabled && compileInputsCacheable) {
         ltoCache = bootstrapToolObjectCachePath(
-            "$cacheStem.lto-v1",
-            "${target.llvmTriple}\n${bootstrapToolIdentity("opt")}\n${bootstrapToolIdentity(if (macTarget) macClang else "clang")}\n$macSdkRoot"
+            "$cacheStem.lto-v2",
+            "${target.llvmTriple}\n${bootstrapToolIdentity("opt")}\n${bootstrapToolIdentity("llc")}\n${bootstrapToolIdentity(if (macTarget) macClang else "clang")}\n$macSdkRoot"
         )
     }
     var ltoReused = false
@@ -2623,13 +2695,22 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         ltoReused = ltoCacheInfo.isFile() && ltoCacheInfo.size > 0 &&
             bootstrapCopyNativeObject(ltoCache, ltoObjectPath) == 0
     }
-    if (status == 0 && ltoEligible && !linkLlvm && !ltoReused) {
+    // A Linux executable is one module holding the runtime, so optimizing it as a whole
+    // program needs no linker: see bootstrapOptimizeWholeProgram.
+    val wholeProgram = ltoEligible && !linkLlvm && target.objectFormat == "elf"
+    if (status == 0 && wholeProgram && !ltoReused) {
+        status = bootstrapOptimizeWholeProgram(llvmPath, ltoPreparedPath, ltoObjectPath, abiManifest)
+        if (status == 0 && ltoCache != "" && Path(cacheDirectory).createDirectories()) {
+            bootstrapPublishCacheFile(ltoObjectPath, ltoCache)
+        }
+    }
+    if (status == 0 && ltoEligible && !linkLlvm && !wholeProgram && !ltoReused) {
         status = bootstrapPrepareLtoLlvm(llvmPath, ltoPreparedPath)
         // Preparing read and rewrote the module's text (well over 100 MB for a large
         // program): garbage now, while the LTO compile and link run beside this process.
         bootstrapCollectAndRelease()
     }
-    if (status == 0 && ltoEligible && !linkLlvm && !ltoReused) {
+    if (status == 0 && ltoEligible && !linkLlvm && !wholeProgram && !ltoReused) {
         val compileLtoProgram = if (macTarget) linuxCommand(macClang)
             else linuxCommand("env")
         if (!macTarget) {
@@ -2661,7 +2742,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (status == 0 && target.hosted && artifact == "executable") {
         val link = bootstrapLinkCommand(if (macTarget) macClang else "clang")
         link.argument("-pthread")
-        if (ltoEligible && !linkLlvm) {
+        if (ltoEligible && !linkLlvm && !wholeProgram) {
             link.argument("-O2")
             link.argument("-flto")
         }

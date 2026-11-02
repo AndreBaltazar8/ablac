@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Objects the build cache keeps for the external tools: a cache hit of a release
 # executable takes the LTO object its entry's first build made (it neither
-# prepares the module with `opt` nor compiles it with clang again), keyed by the
+# optimizes the module with `opt` nor generates its code again), keyed by the
 # tools it was made with; and a Mach-O build takes the Darwin adapter's object,
 # keyed by the adapter's source, clang, SDK and target. `--no-cache` uses
 # neither.
@@ -80,7 +80,7 @@ opt_runs() { wc -l <opt.runs 2>/dev/null | tr -d ' ' || echo 0; }
 build -o program
 runs program
 [[ $(opt_runs) == 1 ]] || fail "the first build ran opt $(opt_runs) times"
-[[ $(count '*.lto-v1-*.o') == 1 ]] || fail "the release build kept no LTO object"
+[[ $(count '*.lto-v2-*.o') == 1 ]] || fail "the release build kept no LTO object"
 cp program program.first
 
 # A hit takes the LTO object from the cache: opt does not run again.
@@ -99,7 +99,7 @@ write_opt second
 build -o program
 runs program
 [[ $(opt_runs) == 3 ]] || fail "another opt reused the first opt's LTO object"
-[[ $(count '*.lto-v1-*.o') == 2 ]] || fail "another opt kept no LTO object of its own"
+[[ $(count '*.lto-v2-*.o') == 2 ]] || fail "another opt kept no LTO object of its own"
 
 if $darwin; then
     [[ $(count 'darwin-adapter-v1-*.o') == 1 ]] || fail "no cached Darwin adapter object"
