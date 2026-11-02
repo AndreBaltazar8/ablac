@@ -46,8 +46,8 @@ strings and calls through function values; nbody, matrix and fib gain 1 to 4%. A
 gains less, and its throughput barely moves. Most of a small request is its `read` and `sendto` in
 the kernel, which no compiled code changes (plaintext 0.4 us of user time beside 1.5 us of kernel;
 json-items-128 11.0 and 2.8). The event loop now reads the clock once a pass rather than once a
-request: a real syscall and a malloc each time. headers-32's user instructions per request are unchanged (-0.4%). Beside the pipeline: blocks
-of up to 512 bytes come from lists by size instead of malloc; a function's rooted values share one
+request: a real syscall and a malloc each time. headers-32's user instructions per request are unchanged (-0.4%). Beside the pipeline: freed blocks
+of up to 512 bytes go on lists by size for the next allocation (capped since, below); a function's rooted values share one
 array, zeroed once and named by one word of its root table; hot runtime readers are `@inline`; map
 slots hold hash bits.
 
@@ -70,6 +70,34 @@ short). `-force-attribute=optsize` makes the server 12% smaller and its cycles a
 and as late as code generation about 8 points (loop alignment goes with it). The machine
 outliner and `--icf=all` are no smaller. At low thresholds the runtime's `@inline`s matter: at 100
 without them, nbody ran 4x slower.
+
+### The free lists, capped (2026-11-02)
+
+Cut from 1 MB chunks and kept for good, the lists held each size's high-water mark through a
+compiler's phases. An Xtensa build of abla-embedded's `tests/package-import.ab` peaked at 3.74 GB
+against 3.04 GB before, past `build/ablac`'s 4 GB address-space limit, and the compiler's own
+`--emit-llvm` at 1.67 GB against 1.25 to 1.40. Blocks on a list serve only their size, so neither
+malloc's larger requests nor LLVM can use them. Now each small block is malloc'ed at its own size
+(lists 8 bytes apart), and the lists hold at most 32 MB between them. Those builds peak at 3.04 GB
+and 1.25 to 1.40 GB, and `tools/test-compiler-memory-peak.sh` holds the second to its record.
+
+| Against the uncapped lists, `tools/bench-compare.py` | Change |
+|---|---:|
+| Release build, instructions | +3.3% |
+| Run instructions (11 programs) | +18.6% |
+| Median run time (same) | +10.8% |
+| trees, strings | +39%, +39% |
+| websocket-codec, json-readers, json-megabyte, maps | +16%, +8%, +7.5%, +7% |
+
+Against no lists at all, the capped ones save 3.7% of build instructions and 3 to 5% of run time on
+trees, strings and maps. Tried and dropped, by peak on package-import: 16-byte classes, malloc'ed
+(3.42 GB, an extra 8 to 16 bytes on tens of millions of blocks); a 256 MB cap (3.53 to 3.57 GB);
+trimming each list at a collection to what its size handed out since the last (3.74 GB, as most
+blocks are freed between collections, and none run inside a region); chunks released once
+empty, aligned by `aligned_alloc` (4.7 GB) or inside a 2 MB malloc (3.99 GB; 3.44 GB with
+`MALLOC_MMAP_THRESHOLD_`): fragmentation keeps nearly every chunk alive. Against v0.2.30 with
+all of the above: build instructions -41.6%, stripped size -11.1%, run instructions -7.7%,
+median run time -6.7% and -8.1% in two runs.
 
 ## Pure-Abla runtime rebuild profile (2026-08-17)
 

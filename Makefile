@@ -103,6 +103,7 @@ test-serial: ablac
 	tools/test-eval-steps.sh $(COMPILER)
 	tools/test-borrow-duplicates.sh $(COMPILER)
 	tools/test-host-llvm-tools.sh $(COMPILER)
+	tools/test-compiler-memory-peak.sh $(COMPILER)
 	tools/test-borrow-lifetimes.sh $(COMPILER)
 	tools/test-narrowing-and-branches.sh $(COMPILER)
 	tools/test-line-continuation.sh $(COMPILER)

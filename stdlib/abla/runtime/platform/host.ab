@@ -581,62 +581,49 @@ trusted fun __ablaRuntimeHostRegionAllocate(size: int): int {
     header + 32
 }
 
-// Blocks of up to 512 bytes, header included, come from lists by size, 16 bytes apart, filled
-// from chunks cut in order: under a collector every block is freed once, and a malloc and a
-// free each cost more than the object's first use. They are taken and given back under the
-// heap lock, and a block stays its size for good. Its first word links it while free.
-var __ablaRuntimeHostSmallNext: int = 0
-var __ablaRuntimeHostSmallEnd: int = 0
+// Blocks of up to 512 bytes, header included, go on a list by size when freed (8 bytes apart,
+// as malloc was asked for them), and the next allocation of that size takes one: under a
+// collector every block is freed once, and a malloc and a free each cost more than the
+// object's first use. The lists hold at most 32 MB between them; past that a block goes back
+// to malloc. Blocks on a list serve only their size, so what they hold is lost to everything
+// else: cut from chunks and kept for good, they took an Xtensa build of abla-embedded's
+// package-import from 3.04 GB to 3.74 GB at its peak (2026-11-02). They are taken and given
+// back under the heap lock. A block's first word links it while free.
+var __ablaRuntimeHostSmallBytes: int = 0
 
-// (Static storage, as the collection's page cache: 33 lists by a block's size / 16.)
-trusted fun __ablaRuntimeHostSmallLists(): int = nativeStaticAllocate(264)
-
-// A new chunk to cut blocks from. What is left of the last one goes on the list of its size.
-@noinline
-trusted fun __ablaRuntimeHostSmallRefill(total: int): int {
-    val rest = __ablaRuntimeHostSmallEnd - __ablaRuntimeHostSmallNext
-    if (rest >= 32) {
-        val list = __ablaRuntimeHostSmallLists() + (rest >> 4) * 8
-        ablaRuntimeStoreI64(__ablaRuntimeHostSmallNext, ablaRuntimeLoadI64(list))
-        ablaRuntimeStoreI64(list, __ablaRuntimeHostSmallNext)
-    }
-    val chunk = ablaRuntimePointerAddress(malloc(1048576))
-    if (chunk == 0) __ablaRuntimeHostOutOfMemory()
-    __ablaRuntimeHostSmallNext = chunk + total
-    __ablaRuntimeHostSmallEnd = chunk + 1048576
-    chunk
-}
+// (Static storage, as the collection's page cache: 65 lists, at a block's size.)
+trusted fun __ablaRuntimeHostSmallLists(): int = nativeStaticAllocate(520)
 
 @inline
 trusted fun __ablaRuntimeHostBlockAllocate(size: int): int {
-    val total = (size + 47) & -16
-    if (total > 512) {
-        val header = ablaRuntimePointerAddress(malloc(size + 32))
-        if (header == 0) __ablaRuntimeHostOutOfMemory()
-        return header
+    val total = (size + 39) & -8
+    if (total <= 512) {
+        val list = __ablaRuntimeHostSmallLists() + total
+        val free = ablaRuntimeLoadI64(list)
+        if (free != 0) {
+            ablaRuntimeStoreI64(list, ablaRuntimeLoadI64(free))
+            __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes - total
+            return free
+        }
     }
-    val list = __ablaRuntimeHostSmallLists() + (total >> 4) * 8
-    val free = ablaRuntimeLoadI64(list)
-    if (free != 0) {
-        ablaRuntimeStoreI64(list, ablaRuntimeLoadI64(free))
-        return free
-    }
-    val next = __ablaRuntimeHostSmallNext
-    if (total > __ablaRuntimeHostSmallEnd - next) return __ablaRuntimeHostSmallRefill(total)
-    __ablaRuntimeHostSmallNext = next + total
-    next
+    val header = ablaRuntimePointerAddress(malloc(if (total <= 512) total else size + 32))
+    if (header == 0) __ablaRuntimeHostOutOfMemory()
+    header
 }
 
-// Whether a block of `size` payload bytes is on the lists above.
+// Whether a block of `size` payload bytes goes on the lists above when freed now.
 @inline
-trusted fun __ablaRuntimeHostBlockSmall(size: int): bool = size <= 480
+trusted fun __ablaRuntimeHostBlockKept(size: int): bool =
+    size <= 480 && __ablaRuntimeHostSmallBytes < 33554432
 
 @inline
 trusted fun __ablaRuntimeHostBlockFree(header: int, size: int): void {
-    if (__ablaRuntimeHostBlockSmall(size)) {
-        val list = __ablaRuntimeHostSmallLists() + (((size + 47) & -16) >> 4) * 8
+    if (__ablaRuntimeHostBlockKept(size)) {
+        val total = (size + 39) & -8
+        val list = __ablaRuntimeHostSmallLists() + total
         ablaRuntimeStoreI64(header, ablaRuntimeLoadI64(list))
         ablaRuntimeStoreI64(list, header)
+        __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes + total
     } else free(ablaRuntimePointerFromAddress(header))
 }
 
@@ -1291,7 +1278,7 @@ trusted fun __ablaRuntimeHostFreeWorker(batch: int): int {
 // A block the sweep found unreachable, for the helper.
 trusted fun __ablaRuntimeHostFreeLater(header: int): void {
     val blockSize = ablaRuntimeLoadI64(header + 16)
-    if (__ablaRuntimeHostBlockSmall(blockSize)) {
+    if (__ablaRuntimeHostBlockKept(blockSize)) {
         __ablaRuntimeHostBlockFree(header, blockSize)
         return
     }
