@@ -4012,9 +4012,25 @@ fun bootstrapBuildEffectTypeMap(
     declarations: array<BootstrapDeclaration>
 ): BootstrapEffectTypeMap {
     val map = BootstrapEffectTypeMap([], [], [], [])
+    // What each class conforms to (`conforms:`, its own `: A, B` and `extend`s) and each
+    // interface extends (`parents:`), by generic base, a name a line.
+    val conformances: Map<string, string> = Map()
+    val conforming: array<string> = []
     var index = 0
     while (index < declarations.size) {
         val declaration = declarations[index]
+        if ((declaration.kind == "class" || declaration.kind == "interface" ||
+            declaration.kind == "extend") && declaration.conformances.size > 0) {
+            val key = (if (declaration.kind == "interface") "parents:" else "conforms:") +
+                bootstrapEffectGenericBase(bootstrapEffectNormalizeType(declaration.name))
+            var names = conformances.get(key) ?? ""
+            if (names == "") conforming.append(key)
+            for (conformance in declaration.conformances) {
+                val name = bootstrapEffectGenericBase(bootstrapEffectNormalizeType(conformance))
+                names = if (names == "") name else "$names\n$name"
+            }
+            conformances.set(key, names)
+        }
         if (declaration.kind == "class" || declaration.kind == "interface" ||
             declaration.kind == "type") {
             bootstrapEffectTypeMapPut(map, "type:${declaration.name}", declaration.kind)
@@ -4061,7 +4077,77 @@ fun bootstrapBuildEffectTypeMap(
         }
         index = index + 1
     }
+    for (key in conforming) bootstrapEffectTypeMapPut(map, key, conformances.get(key) ?? "")
     map
+}
+
+/** The interface `type` names (by its generic base), or "" when it names no interface. */
+fun bootstrapEffectInterfaceType(map: BootstrapEffectTypeMap, type: string): string {
+    if (!bootstrapEffectUsableType(type)) return ""
+    if (bootstrapEffectTypeMapGet(map, "type:$type") == "interface") return bootstrapEffectGenericBase(type)
+    val base = bootstrapEffectGenericBase(type)
+    if (bootstrapEffectTypeMapGet(map, "type:$base") == "interface") base else ""
+}
+
+/** Whether the class `owner` conforms to the interface `target`: through one it names,
+ *  or one that extends it. */
+fun bootstrapEffectClassConforms(map: BootstrapEffectTypeMap, owner: string, target: string): bool {
+    val pending: array<string> = []
+    val seen: Map<string, bool> = Map()
+    for (name in bootstrapEffectTypeMapGet(map, "conforms:${bootstrapEffectGenericBase(owner)}").split("\n")) {
+        if (name != "" && !seen.has(name)) {
+            seen.set(name, true)
+            pending.append(name)
+        }
+    }
+    var next = 0
+    while (next < pending.size) {
+        val found = pending[next]
+        if (found == target) return true
+        for (name in bootstrapEffectTypeMapGet(map, "parents:$found").split("\n")) {
+            if (name != "" && !seen.has(name)) {
+                seen.set(name, true)
+                pending.append(name)
+            }
+        }
+        next = next + 1
+    }
+    false
+}
+
+// The effects of `name` called on a value of the interface `target`: the methods and
+// extensions of the classes conforming to it, and the interfaces' defaults. An interface value
+// is never a builtin's, and never a class's that doesn't conform (`LinuxFileDescriptor.read`
+// isn't what an `XmlSource`'s `read` runs).
+fun bootstrapCompileEffectInterfaceLookup(
+    summary: BootstrapCompileEffectSummary,
+    typeMap: BootstrapEffectTypeMap,
+    target: string,
+    name: string
+): int {
+    var mask = 0
+    val slots = summary.methodSlots
+    if (slots.size == 0) return 0
+    var slot = bootstrapFunctionDeclarationHash(name)
+    slot = slot - slot / slots.size * slots.size
+    var index = slots[slot]
+    while (index >= 0) {
+        if (summary.methodNames[index] == name) {
+            val entry = summary.names[index]
+            val owner = bootstrapEffectNormalizeType(entry.slice(0, entry.size - name.size - 1))
+            var kind = bootstrapEffectTypeMapGet(typeMap, "type:$owner")
+            if (kind == "") kind = bootstrapEffectTypeMapGet(typeMap, "type:${bootstrapEffectGenericBase(owner)}")
+            val admitted = if (kind == "class") bootstrapEffectClassConforms(typeMap, owner, target)
+                else if (kind == "interface" || kind == "type") true
+                else !bootstrapEffectPreciseType(typeMap, owner)
+            if (admitted) {
+                mask = bootstrapCompileEffectMerge(mask, summary.masks[index])
+                bootstrapCompileEffectRecordRead(index)
+            }
+        }
+        index = summary.methodNext[index]
+    }
+    mask
 }
 
 // The declared type of the global a bare receiver names, unless a member of the
@@ -4301,10 +4387,16 @@ fun bootstrapDelegatedCompileEffectsIn(
                 expression.children[0], typeMap, scopeNames, owner, bound
             )
         }
+        val target = bootstrapEffectInterfaceType(typeMap, receiver)
         if (bootstrapEffectPreciseType(typeMap, receiver)) {
             mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectMerge(
                 bootstrapCompileBuiltinEffect(expression.text),
                 bootstrapCompileEffectReceiverLookup(summary, typeMap, receiver, expression.text)
+            ))
+        } else if (target != "") {
+            mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectMerge(
+                bootstrapCompileBuiltinEffect(expression.text),
+                bootstrapCompileEffectInterfaceLookup(summary, typeMap, target, expression.text)
             ))
         } else mask = bootstrapCompileEffectMerge(mask, bootstrapCompileEffectLookup(
             summary,

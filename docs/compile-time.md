@@ -383,6 +383,8 @@ fun main {
 Without the grant, the build stops with `compile.effect-denied:filesystem.read`.
 A call through an interface counts what its implementers do, but only those the `#` expression's code can
 make: reading a string through `Source` isn't denied because a `FileSource` exists that nothing here creates.
+Of a class that doesn't conform to the interface, nothing is: a `read` extension of a file handle the expression
+makes isn't what a `Source`'s `read` runs.
 The same holds for a vector's extensions: a `Map`'s `get` doesn't reach abla/simd's `i8x16.get` unless the
 expression's code calls something that returns an `i8x16`.
 Without the manifest entry, it stops with `compile.capability-not-authorized:filesystem.read`.

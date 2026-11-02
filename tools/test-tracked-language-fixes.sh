@@ -91,6 +91,9 @@ expect_exit compile-effect-unmade-implementer 42
 expect_error invalid-compile-effect-made-implementer compile.effect-denied:
 expect_exit compile-effect-map-get-beside-simd 42
 expect_exit compile-effect-unmade-vector 42
+expect_exit compile-effect-interface-nonconforming 42
+expect_error invalid-compile-effect-interface-extend 'compile.effect-denied:filesystem.read:measured->total->Handle.read'
+expect_error invalid-compile-effect-interface-inherited 'compile.effect-denied:filesystem.read:measured->total->Handle.read'
 expect_error invalid-compile-effect-made-vector 'compile.effect-denied:filesystem.read:found->i8x16.lookup->Path.readText'
 expect_error invalid-transform-failing-loop E_EVAL_EXPRESSION
 if (( $(wc -l <"$output/invalid-transform-failing-loop.log") > 200 )) ||
