@@ -43,6 +43,7 @@ expect_exit constructor-array-interface 42
 expect_exit nullable-array-field 42
 expect_exit nullable-function-type 42
 expect_exit function-value-result-return 42
+expect_error invalid-closure-argument-fnmut 'declare the parameter `var g: FnMut() -> int`'
 expect_exit default-closure-two-callers 42
 expect_error invalid-named-default-hidden-generic E_NAMED_ARGUMENT_HIDDEN
 expect_exit named-default-hidden-value 42

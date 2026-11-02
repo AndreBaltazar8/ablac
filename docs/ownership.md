@@ -695,7 +695,13 @@ fun main {
   and `FnOnce` for `move { ... }`. `FnMut` and `FnOnce` closures are affine:
   copying one is an error and passing one to `own` needs `move(...)`.
 - An `Fn` can be passed where an `FnMut` is expected, not the other way round
-  (`ownership.fnmut-parameter-mode`, `ownership.fnonce-parameter-mode`).
+  (`ownership.fnmut-parameter-mode`, `ownership.fnonce-parameter-mode`). A
+  closure that assigns a captured local or changes an object it captured
+  (a field, an element, a mutating method) is an `FnMut`, so passing it to
+  `g: () -> int` is `function.argument:...:mut:function:()->i64`: declare
+  the parameter `var g: FnMut() -> int`. A plain function type promises a
+  value that can be copied and called from anywhere, which a closure
+  changing its captures can't be.
 - An ordinary `{ ... }` closure can't capture a resource
   (`ownership.capture-move-required`). `move { ... }` moves every affine
   variable it uses into the closure when the closure is created. Calling the

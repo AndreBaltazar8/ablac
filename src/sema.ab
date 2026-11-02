@@ -9963,6 +9963,58 @@ class BootstrapAnalyzer(
         result
     }
 
+    // After an argument's type error: a closure that changes what it captured
+    // is an FnMut (one that consumes a capture, an FnOnce), which a plain
+    // function type can't take. Says how to declare the parameter, with its
+    // name and type when the callee is a declared function.
+    fun explainClosureArgument(owner: string, callee: string, parameter: int, expected: string, actual: string): void {
+        var family = ""
+        var mode = ""
+        var does = ""
+        if (actual.size > 4 && actual.slice(0, 4) == "mut:" &&
+            !(expected.size > 4 && expected.slice(0, 4) == "mut:") &&
+            this.typesCompatible(expected, actual.slice(4, actual.size))) {
+            family = "FnMut"
+            mode = "var"
+            does = "changes what it captured (a captured local, or an object it reaches)"
+        } else if (actual.size > 5 && actual.slice(0, 5) == "once:" &&
+                   !(expected.size > 5 && expected.slice(0, 5) == "once:") &&
+                   this.typesCompatible(expected, actual.slice(5, actual.size))) {
+            family = "FnOnce"
+            mode = "own"
+            does = "consumes what it captured"
+        }
+        if (family != "") {
+            var written = "$mode name: $family(...) -> T"
+            val index = if (callee == "") -1 else this.overloadDeclarationIndex(owner, callee)
+            if (index >= 0) {
+                val declaration = this.overloadDeclaration(owner, index)
+                if (parameter >= 0 && parameter < declaration.parameters.size &&
+                    parameter < declaration.parameterTypes.size) {
+                    val spelled = declaration.parameterTypes[parameter]
+                    if (spelled.size > 0 && spelled[0] == 40) {
+                        // Kept without spaces: `()->int` reads as `() -> int`.
+                        var spaced = ""
+                        var at = 0
+                        while (at < spelled.size) {
+                            if (at + 1 < spelled.size && spelled[at] == 45 && spelled[at + 1] == 62) {
+                                spaced = "$spaced -> "
+                                at = at + 2
+                            } else {
+                                spaced = "$spaced${spelled.slice(at, at + 1)}"
+                                at = at + 1
+                            }
+                        }
+                        written = "$mode ${declaration.parameters[parameter]}: $family$spaced"
+                    }
+                }
+            }
+            this.diagnostics =
+                "${this.diagnostics}help: the closure $does, so its type is `$family`, which a plain function type can't take: declare the parameter `$written`\n"
+        }
+        return
+    }
+
     fun typedRequestIndex(expression: BootstrapExpression): int {
         var matched = -1
         var request = 0
@@ -13327,6 +13379,7 @@ fun bootstrapInferCallValue(
         val actual = analyzer.infer(expression.children[argument])
         if (!analyzer.typesOrUpcast(expected, actual)) {
             analyzer.fail("function.argument:value@${expression.children[argument].begin}:$expected:$actual")
+            analyzer.explainClosureArgument("", "", argument - 1, expected, actual)
         }
         if (bootstrapIsFunctionType(calleeType)) {
             val kind = bootstrapFunctionParameterKind(calleeType, argument - 1)
@@ -13582,7 +13635,10 @@ fun bootstrapInferCall(
                 analyzer.regionCalls,
                 analyzer.declarations
             ) &&
-                !analyzer.upcastsToInterface(expected, actual)) analyzer.fail("function.argument:${expression.text}@${expression.children[argument].begin}:$expected:$actual")
+                !analyzer.upcastsToInterface(expected, actual)) {
+                analyzer.fail("function.argument:${expression.text}@${expression.children[argument].begin}:$expected:$actual")
+                analyzer.explainClosureArgument("", if (parameterCount < 0) "" else expression.text, argument, expected, actual)
+            }
             var parameterKind = "parameter"
             if (parameterCount >= 0) {
                 parameterKind = analyzer.functionParameterKind(
@@ -14203,6 +14259,7 @@ fun bootstrapInferMemberCall(
             ) &&
                 !analyzer.upcastsToInterface(expected, actual)) {
                 analyzer.fail("method.argument:${receiver}.${expression.text}@${expression.children[argument].begin}:$expected:$actual")
+                analyzer.explainClosureArgument(receiver, expression.text, argument - 1, expected, actual)
             }
             if (analyzer.methodParameterKind(
                     receiver,

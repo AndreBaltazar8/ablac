@@ -74,7 +74,7 @@ only its parse errors.
 | `call.target:<name>` | no function of that name |
 | `function.arity:<f>`, `method.arity:<T>.<m>`, `constructor.arity` | wrong number of arguments |
 | `method.unknown:<T>.<m>` | `T` has no method `m` (a help line names the standard module to import when one declares it, e.g. `abla/text` for `string.trim`) |
-| `function.argument:<f>@<offset>:<expected>:<actual>`, `method.argument`, `constructor.argument` | an argument of the wrong type |
+| `function.argument:<f>@<offset>:<expected>:<actual>`, `method.argument`, `constructor.argument` | an argument of the wrong type; a help line says when the argument is a closure that changes its captures (`mut:function:...`: declare the parameter `var g: FnMut(...) -> T`) or consumes them (`own g: FnOnce(...) -> T`) |
 | `function.result:<f>:<declared>:<actual>`, `method.result` | the body's value doesn't match the declared result type ([language.md](language.md#void-and-never)) |
 | `return.type@<offset>:<expected>:<found>` | a `return` value doesn't match the result type; a help line says when the value is a closure that changes its captures (declare the result `FnMut(...) -> T`) |
 | `member:<Type>.<name>` | no such property or method; `member:nullable:...` means the receiver may be `null` |
