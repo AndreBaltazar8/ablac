@@ -5159,6 +5159,17 @@ class BootstrapEvaluator(
             this.syntax[callable.integer].children.size - 1 != expression.children.size)) {
             target = -1
         }
+        // Before analysis (a transform's code) a call of the receiver's own method is
+        // still a plain call; analysis makes it a method call.
+        if (target < 0 && bootstrapEvalReceiverHasMethod(this, expression.text)) {
+            val arguments: array<BootstrapExpression> = [
+                BootstrapExpression("identifier", "this", expression.begin, expression.begin, [])
+            ]
+            for (argument in expression.children) arguments.append(argument)
+            return this.evaluate(BootstrapExpression(
+                "member.call", expression.text, expression.begin, expression.end, arguments
+            ))
+        }
         if (target < 0) callable = bootstrapEvalGlobalCallable(this, expression.text)
         if (callable.kind == "function") targetName = callable.text
         if (callable.kind == "closure") {
@@ -5911,7 +5922,10 @@ class BootstrapEvaluator(
         // While a stack-depth stop unwinds, the levels it passes through
         // failed because of it: it is the one diagnostic, not one per level.
         val unwinding = bootstrapEvalDepthReported
-        if (bootstrapEvalDepth == 0) bootstrapEvalDepthReported = false
+        if (bootstrapEvalDepth == 0) {
+            bootstrapEvalDepthReported = false
+            bootstrapEvalFailedFrames = 0
+        }
         if (!unwinding && this.errors > errorsBefore &&
             this.diagnostics.size == diagnosticsBefore) {
             bootstrapEvalExpressionFailed(this, expression)
@@ -6283,11 +6297,18 @@ fun bootstrapEvalRuntimePanic(
     bootstrapEvalInvalid()
 }
 
+// One failure's frames, one per level it passes through, up to a limit: a failure in
+// recursive compile-time code would otherwise print its whole depth, again and again.
+val BOOTSTRAP_EVAL_FAILED_FRAMES = 32
+var bootstrapEvalFailedFrames = 0
+
 @noinline
 fun bootstrapEvalExpressionFailed(
     var evaluator: BootstrapEvaluator,
     expression: BootstrapExpression
 ): void {
+    bootstrapEvalFailedFrames = bootstrapEvalFailedFrames + 1
+    if (bootstrapEvalFailedFrames > BOOTSTRAP_EVAL_FAILED_FRAMES) return
     val source = evaluator.sourceIdentity
     if (source == "") {
         evaluator.recordEvaluatorDiagnostic(
@@ -6397,6 +6418,34 @@ fun bootstrapRuntimeGlobalInitial(
     evaluator.steps = initializer.steps
     evaluator.diagnostics = initializer.diagnostics
     value
+}
+
+/** Whether the evaluation runs a method whose receiver's class has a method `name`, or an extension of it. */
+fun bootstrapEvalReceiverHasMethod(evaluator: BootstrapEvaluator, name: string): bool {
+    val found = evaluator.find("this")
+    if (found < 0) return false
+    val receiver = if (evaluator.values[found].kind == "slot") evaluator.values[found].elements[0]
+        else evaluator.values[found]
+    if (receiver.kind != "object") return false
+    var node = evaluator.firstNamed(receiver.owner)
+    while (node >= 0) {
+        val declaration = evaluator.declarations[evaluator.namedDeclaration(node)]
+        if (declaration.kind == "class" && declaration.name == receiver.owner) {
+            for (method in declaration.methods) {
+                if (method.name == name) return true
+            }
+        }
+        node = evaluator.nextNamed(node)
+    }
+    node = evaluator.firstNamed(name)
+    while (node >= 0) {
+        val declaration = evaluator.declarations[evaluator.namedDeclaration(node)]
+        if (declaration.name == name && (declaration.kind == "fun" || declaration.kind == "compile.fun") &&
+            declaration.extensionOwner != "" &&
+            bootstrapNormalizeType(declaration.extensionOwner) == bootstrapNormalizeType(receiver.owner)) return true
+        node = evaluator.nextNamed(node)
+    }
+    false
 }
 
 /** Whether the evaluation runs a method whose receiver has a field `name`. */
@@ -8311,7 +8360,10 @@ fun bootstrapEvaluateWhile(
     var result = bootstrapEvalInvalid()
     var looping = true
     result = bootstrapEvalVoid()
-    while (looping &&
+    // A turn that failed ends the loop: what it would have changed didn't change, so
+    // the next one would fail the same way, up to the step limit.
+    val errorsBefore = evaluator.errors
+    while (looping && evaluator.errors == errorsBefore &&
            evaluator.evaluate(expression.children[0]).boolean &&
            evaluator.steps <= evaluator.context.stepLimit) {
         result = evaluator.evaluate(expression.children[1])
@@ -8345,7 +8397,9 @@ fun bootstrapEvaluateDoWhile(
     var more = true
     var looping = true
     result = bootstrapEvalVoid()
-    while (more && looping && evaluator.steps <= evaluator.context.stepLimit) {
+    val errorsBefore = evaluator.errors
+    while (more && looping && evaluator.errors == errorsBefore &&
+           evaluator.steps <= evaluator.context.stepLimit) {
         result = evaluator.evaluate(expression.children[0])
         bootstrapEvalDropDiscarded(evaluator, expression.children[0], result)
         // A stack-depth stop unwinding through the loop ends it: another turn

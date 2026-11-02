@@ -55,6 +55,14 @@ expect_error invalid-reserved-generator '`generator` is a reserved word'
 expect_error invalid-reserved-generator '`task` is a reserved word'
 expect_error invalid-reserved-generator '`thread` is a reserved word'
 expect_exit transform-method-effects 42
+expect_exit transform-implicit-this 42
+expect_error invalid-transform-failing-loop E_EVAL_EXPRESSION
+if (( $(wc -l <"$output/invalid-transform-failing-loop.log") > 200 )) ||
+    grep -q E_EVAL_STEP_LIMIT "$output/invalid-transform-failing-loop.log"; then
+    echo 'a failing loop in compile-time code ran on, or its report is not short' >&2
+    wc -l "$output/invalid-transform-failing-loop.log" >&2
+    exit 1
+fi
 expect_error invalid-import-unquoted E_IMPORT_PATH_UNQUOTED
 if grep -q E_EVAL_DIVISION_BY_ZERO "$output/invalid-import-unquoted.log"; then
     echo 'an unquoted import still reports a division by zero' >&2
