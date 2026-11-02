@@ -63,10 +63,16 @@ for byte. Its name is `uint256` because that's what's asked of it and what Solid
   `x + uint256(1)`. A literal too big for an `int` comes through `uint256Words` or `uint256FromHex`.
 - **Keep secrets.** Its comparison and division take a time that depends on the value. A key belongs in
   `abla/ct` ([ct.md](ct.md)).
-- **Run at compile time** (`#` is refused by `compile.` errors), cross an `@export` (`simd.export`), be
-  the subject of a `when` (`secret.when`: use `if`), or be a `Map` key (use `.toBytes()`). `type Wei = uint256`
-  is `type.underlying`. `u64(x)` doesn't take one: `x.toU64()`. All of these are as vectors have it.
+- **Cross an `@export`** (`simd.export`), be the subject of a `when` (`secret.when`: use `if`), or be a `Map`
+  key (use `.toBytes()`). `u64(x)` doesn't take one: `x.toU64()`. All of these are as vectors have it.
+- **Lend a `type Wei = uint256` its operators.** It converts as any nominal scalar does, `Wei(x)` in and
+  `val x: uint256 = wei` out; arithmetic, comparison and methods are the `uint256`'s, on that `x`.
 - **Mean anything unsigned in another width.** 128 bits and signed 256 aren't here yet (TODO.md).
+
+## At compile time
+
+`#` runs all of it, with the same results as a program's: the evaluator has a value of 32 bytes for it, and a
+`uint256` it hands the program is those bytes. `/` by zero is `E_EVAL_DIVISION_BY_ZERO`.
 
 ## On each target
 

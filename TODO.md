@@ -102,8 +102,6 @@
       socket's file permissions would say who may connect.
 - [ ] The rest of integers up to 256 bits: `uint256` is in (`abla/uint256`, docs/stdlib/uint256.md), with big-endian
       bytes. Left: signed 256, 128 both ways, and little-endian bytes, when something needs them.
-- [ ] `uint256` at compile time: `#` refuses it, as vectors, since the evaluator has no value that wide. Every other
-      integer width evaluates. `type Wei = uint256` is `type.underlying` too, though `type Pin = u64` is fine.
 - [ ] Remove the older object layout's bootstrap step, which nothing needs now that the pin
   (v0.2.25) makes typed instances: `tools/bootstrap-untyped-objects.patch`,
   `tools/bootstrap-typed-instances.ab`, `tools/test-bootstrap-untyped-objects.sh`, their stage

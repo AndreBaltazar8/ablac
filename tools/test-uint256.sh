@@ -143,6 +143,14 @@ EOF
 done
 echo "ok   by zero: panic, status 101"
 
+for mode in "" --fast; do
+    "$compiler" build "$cases/compile-time.ab" -o "$out/compile-time" --no-cache $mode
+    "$out/compile-time" > "$out/compile-time.out" || { echo "uint256 under #, ${mode:-release}: check $? failed" >&2; tail -n 4 "$out/compile-time.out" >&2; exit 1; }
+    "$compiler" build "$cases/nominal.ab" -o "$out/nominal" --no-cache $mode
+    "$out/nominal" || { echo "uint256 nominal, ${mode:-release}: check $? failed" >&2; exit 1; }
+done
+echo "ok   under #, as at run time; a type of its own name"
+
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")
     set +e
