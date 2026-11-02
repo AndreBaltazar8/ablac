@@ -19,6 +19,63 @@ object emission, and linking.
 Compare two compilers with `tools/bench-compare.py` (compile instructions, stripped size,
 run cycles and instructions, on `tests/benchmarks`).
 
+## String readers pass words into shared paths (2026-11-02)
+
+Against master `753d1d10`, using its compiler with the two sysroots,
+`tools/bench-compare.py` (13 programs, two builds and three run rounds):
+
+| Metric (geometric mean) | Change |
+|---|---:|
+| Release build, instructions | -1.1% |
+| Stripped size | -2.0% |
+| Run instructions (11 programs) | -1.0% |
+| `abla-compare` server, user instructions per request (9 workloads) | -0.67% |
+| `abla-compare` server, stripped size | -4.1% (290,000 to 278,048 bytes) |
+
+The size improvement alone falls short of the requested 10%. json-readers is
+5.7% smaller and json-megabyte 4.3%; their run instructions fall 0.8% and 6.0%.
+Every run benchmark is unchanged or improved in instructions. Cycles move with
+the loaded machine; they are not the acceptance measure here.
+
+- **A rope's slow data reader takes only its rope pointer.** The inline
+  `StringData` used to materialize a 24-byte boxed string for the rare
+  `StringDataSlow` call. That callee now reconstructs the string from its rope
+  pointer, keeping those copies out of every caller.
+- **String equality passes the strings' four words.** `StringBytesEqual` resolves
+  their data itself, without two boxed argument copies at every inline equality
+  check. Length and empty-string checks stay in the caller.
+- **A safe point tests the byte threshold before the thread-local region.**
+  `MemoryPressure` avoids resolving the region while below the threshold. The
+  collection checks and the GC-stress loop cadence are unchanged.
+
+The server was pinned to P-core 8, with 40,000 requests and three rounds per
+workload, checking exact responses. Its parameters workload showed +0.21% in the
+nine-workload run; a separate 100,000-request, five-round comparison showed -1.13%.
+The other eight workloads improved in the first run. Runtime-only `make test`
+used master's payload through the normal launcher: 254 commands passed initially;
+self-hosted and killed-build passed on rerun (all 256 commands, including the
+self-hosted driver's 89 cases). The test parent needs an 8 MiB **soft** stack for
+its 128 MiB-limited threaded programs; the compiler launcher still sets its own
+128 MiB stack, with the hard limit retained. Killed-build's short-lived temporary
+can be missed under load; its isolated rerun exercised the kill successfully.
+
+Screened and dropped:
+
+- `@noinline` on float bignum helpers: nbody/matrix only 0.9/1.4% smaller,
+  nbody 0.3% more run instructions. Formatting the float's digits through one
+  ByteBuffer grew them 11/13% and nbody ran 2.7% more instructions.
+- Out-of-line `MemoryPressure` and `MemoryPressureLoop`: six programs 1.5%
+  smaller, 1.0% more run instructions.
+- One unsigned bounds comparison instead of signed lower/upper checks: 0.1%
+  smaller over 13, but dispatch ran 4.8% more instructions.
+- A shorter `StringLengthValue` expression: a further size saving, but strings
+  and maps ran 0.4/0.8% more instructions.
+- Global `optsize` only during optimization, stripped before llc (to retain
+  loop alignment): four programs 2.6% smaller, nbody/readers/megabyte ran
+  2.7/3.7/3.7% more instructions. Targeting float functions also regressed nbody.
+- LLVM IR outlining after O2: four programs 1.3% larger, 44.8% more run
+  instructions. `global-merge-func,mergefunc` gave no size improvement.
+
 ## Builds without text, smaller runtime paths, cold slow paths (2026-11-02)
 
 Against the v0.2.31 compiler (master at `e66208b4`, before this work and before the build
