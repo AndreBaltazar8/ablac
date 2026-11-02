@@ -52,6 +52,12 @@ import "../shared.ab"
 import github("owner/leaf")
 fun scriptValue(): int = sharedBump() * 10 + leafValue()
 T
+# A subpath passing on another's names.
+mkdir -p "$chain/src/passed"
+cat > "$chain/src/passed/entry.ab" <<'T'
+export import "../evm/entry.ab"
+fun passedValue(): int = 1
+T
 ln -s /etc "$chain/src/outside"
 commit "$chain"
 
@@ -105,6 +111,19 @@ grep -q leaf "$test_root/one/abla.lock" && fail "a subpath nobody imports was fo
 grep -q 'evmValue' "$test_root/one.ll" || fail 'the subpath is not in the program'
 grep -q 'scriptValue' "$test_root/one.ll" && fail 'another subpath was compiled'
 
+# A strict package's module sees what a subpath declares and passes on, built by its
+# path from the project's directory too (the subpath's import is then a relative path).
+new_app strict <<'AB'
+import github("owner/chain/passed")
+fun main: int = evmValue() + passedValue()
+AB
+printf 'visibility = "imports"\n' >> "$test_root/strict/abla.toml"
+"$compiler" package update --project "$test_root/strict" || fail 'strict update failed'
+(cd "$test_root/strict" && "$compiler" build src/main.ab -o out) || fail 'strict build failed'
+status=0
+"$test_root/strict/out" || status=$?
+[[ $status -eq 11 ]] || fail "a strict package's subpath import exited $status"
+
 # Vendored: no cache, no prepared copy, a single-file build.
 "$compiler" package vendor --project "$test_root/app" || fail 'vendor failed'
 [[ -f $test_root/app/vendor/chain/src/evm/entry.ab && -f $test_root/app/vendor/leaf/src/leaf.ab ]] ||
@@ -144,4 +163,4 @@ status=0
 expect_refused private E_PACKAGE_SUBPATH_PRIVATE 'github("owner/chain/evm")'
 grep -q 'public' "$test_root/private.log" || fail "a private path doesn't list what is public"
 
-echo 'package subpaths: one lock record and module identity, the rest not compiled, bad paths refused'
+echo 'package subpaths: one lock record and module identity, the rest not compiled, seen by a strict package, bad paths refused'
