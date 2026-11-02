@@ -121,6 +121,7 @@ test-serial: ablac
 	tools/test-f32.sh $(COMPILER)
 	tools/test-simd.sh $(COMPILER)
 	tools/test-ct.sh $(COMPILER)
+	tools/test-uint256.sh $(COMPILER)
 	tools/test-array-truncate.sh $(COMPILER)
 	tools/test-array-filled.sh $(COMPILER)
 	tools/test-memory-checkpoint.sh $(COMPILER)

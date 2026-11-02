@@ -1,0 +1,85 @@
+# `abla/uint256`
+
+Unsigned 256-bit integers: EVM amounts and hashes. `uint256` is a type of the language, like `u64`;
+what's done with it comes with the import.
+
+```abla
+import "abla/io"
+import "abla/uint256"
+
+fun main {
+    val wei = uint256FromDecimal("1500000000000000000")
+    if (wei == null) return
+    val total = wei * uint256(3) + uint256(1)
+    println("$total ${total.toHex()}")
+    println("${total / uint256(1000000000)} ${total % uint256(10)} ${total > wei}")
+    println("${uint256(0) - uint256(1) == uint256Max()} ${uint256(1) << 255 >> 254}")
+    val fits = uint256Max().addChecked(uint256(1))
+    println(if (fits == null) "doesn't fit" else "$fits")
+    println("${uint256FromBytes(total.toBytes()) == total}")
+}
+// output:
+// 4500000000000000001 0x3e73362871420001
+// 4500000000 1 true
+// true 2
+// doesn't fit
+// true
+```
+
+## Why a language type
+
+Every integer width is one in Abla: known by name, a value in a register that a local, a call and a
+return don't allocate for, with conversions by its name. `uint256` is the same, on the road already
+taken by `u32x8`: an LLVM `i256` in a function's scalar plan, and 32 bytes of string data where a
+value goes boxed (a field, an array element, a capture, a generic, a `T?`), as nothing wider than a
+slot fits one. A stdlib class would have allocated each result, and couldn't have `==` or `<`.
+
+Its operators are `operator fun`s in this module, and each is one LLVM instruction where the target
+allows, so a program that doesn't import it has none of it: a hello program comes out the same byte
+for byte. Its name is `uint256` because that's what's asked of it and what Solidity calls it.
+
+## What it does
+
+| | |
+|---|---|
+| `+ - * & \| ^ ~ -x` | wrap at 256 bits, as every fixed width's do and as the EVM's do; both sides must be `uint256` |
+| `/ %` | unsigned; by zero is the language's panic, `division by zero`, exit 101 |
+| `<< >>` | a count of any integer type; negative or at least 256 gives zero. `>>` is logical. `a.shl(b)` and `a.shr(b)` take a `uint256` count, as the EVM's SHL and SHR |
+| `== != < <= > >=` | both sides `uint256` |
+| `"$x"` | decimal, as any integer |
+| `uint256(x)` | from any integer width. As every widening, a signed source extends its sign: `uint256(-1)` is the largest value. `uint256OrNull(x)` is null below zero |
+| `uint256Max()`, `uint256Words(w7, ..., w0)` | 2^256 - 1; eight `u32`s, most significant first, for a constant too big for a literal |
+| `a.addChecked(b)`, `a.subChecked(b)`, `a.mulChecked(b)` | `uint256?`: null if it doesn't fit |
+| `a.toU64()`, `toInt()`, `toU32()`, `toU16()`, `toU8()` | the low bits, as every narrowing |
+| `a.toU64OrNull()`, `toIntOrNull()`, `toU32OrNull()`, `toU16OrNull()`, `toU8OrNull()` | null if it doesn't fit. `toIntOrNull` fits below 2^63 |
+| `a.toDecimal()`, `uint256FromDecimal(text)` | digits only: no sign, space or point; leading zeros are allowed; null otherwise, or above the range |
+| `a.toHex()`, `uint256FromHex(text)` | `0x`, lower case, no leading zeros, as a JSON-RPC quantity; reads with or without `0x`, in either case |
+| `a.toBytes()`, `uint256FromBytes(bytes)` | 32 bytes, big-endian, an EVM word; reads up to 32, padding on the left |
+| `a.isZero()`, `a.bit(i)`, `a.bitLength()` | |
+
+## What it doesn't do
+
+- **Mix with other types.** `x + 1` and `x == 0` are `arithmetic.type` and `comparison.type`, as for vectors:
+  `x + uint256(1)`. A literal too big for an `int` comes through `uint256Words` or `uint256FromHex`.
+- **Keep secrets.** Its comparison and division take a time that depends on the value. A key belongs in
+  `abla/ct` ([ct.md](ct.md)).
+- **Run at compile time** (`#` is refused by `compile.` errors), cross an `@export` (`simd.export`), be
+  the subject of a `when` (`secret.when`: use `if`), or be a `Map` key (use `.toBytes()`). `type Wei = uint256`
+  is `type.underlying`. `u64(x)` doesn't take one: `x.toU64()`. All of these are as vectors have it.
+- **Mean anything unsigned in another width.** 128 bits and signed 256 aren't here yet (TODO.md).
+
+## On each target
+
+`tools/test-uint256.sh` runs it against Python's integers on fresh random values and edge values each
+time, without a C library:
+
+| Target | How it's run | What it calls |
+|---|---|---|
+| x86-64, AArch64 | natively, under qemu | nothing |
+| Wasm | under Node | nothing: a program using this has its own `__multi3`, for the wide `mul` LLVM makes |
+| Xtensa (`-mcpu=esp32`) | under qemu (dc232b), without `mul32high` because it has none; built with it too | nothing for arithmetic |
+| RISC-V 32 and 64 | under qemu | without the M extension, which ablac's RISC-V code doesn't assume, libgcc's `__muldi3`, `__mulsi3`, on 64 bits `__multi3`, and on 32 bits the shifts `__ashldi3` and `__lshrdi3`: what a `*` or a `u64` shift calls there anyway. They aren't libc |
+
+Multiplication is `i256`'s `mul` on x86-64 and AArch64 and 36 word products elsewhere. Division is LLVM's
+expansion to a shift-and-subtract loop, one for `/` and one for `%`, each once in a program (about 2 KB on Xtensa).
+`toDecimal` calls both, nine digits at a time.

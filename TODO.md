@@ -95,9 +95,13 @@
 - [ ] The standard library has no Unix domain sockets: `abla/sys/linux` and `abla/net` only offer TCP, IPv4 and IPv6, and
       `abla/http` and `abla/tls/hosted` listen and connect over those. NovaKind's signer uses loopback with a secret for it, where a
       socket's file permissions would say who may connect.
-- [ ] Integers up to 256 bits, signed and unsigned (128 and 256, with whatever smaller widths are missing), checked first
-      against what exists: arithmetic, overflow rules, shifts, big-endian and little-endian bytes, decimal and hex text.
-      The owner wants this for Ethereum-based work, so a `uint256` has to behave as the EVM's does when asked to wrap.
+- [ ] The rest of integers up to 256 bits: `uint256` is in (`abla/uint256`, docs/stdlib/uint256.md), with big-endian
+      bytes. Left: signed 256, 128 both ways, and little-endian bytes, when something needs them.
+- [ ] `uint256` at compile time: `#` refuses it, as vectors, since the evaluator has no value that wide. Every other
+      integer width evaluates. `type Wei = uint256` is `type.underlying` too, though `type Pin = u64` is fine.
+- [ ] A vector's `if`-expression join boxes each branch's value through `abla_vector_box`, an allocation in plain
+      arithmetic (`bootstrapIrLocalZeroOpcode` has no typed zero for them). `uint256` has `local.zero.uint256`, found
+      while adding it; vectors can have the same.
 - [ ] Remove the older object layout's bootstrap step, which nothing needs now that the pin
   (v0.2.25) makes typed instances: `tools/bootstrap-untyped-objects.patch`,
   `tools/bootstrap-typed-instances.ab`, `tools/test-bootstrap-untyped-objects.sh`, their stage

@@ -9,6 +9,7 @@
 | `abla/float/text` | float formatting and parsing ([text.md](text.md#ablafloattext-floats-as-text)) |
 | `abla/bits` | named bit operations (`bitAnd`, `bitShiftLeft`, ...) |
 | `abla/integer` | `u32.countLeadingZeros()` |
+| [`abla/uint256`](uint256.md) | unsigned 256-bit integers |
 | `abla/random` | cryptographically secure random bytes |
 
 Integer arithmetic, widths and conversions are part of the language

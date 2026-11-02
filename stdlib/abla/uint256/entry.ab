@@ -1,0 +1,285 @@
+// Unsigned 256-bit integers: the language's `uint256` and what's done with it (docs/stdlib/uint256.md).
+// Operators wrap, as every fixed width's do and as the EVM's do; the `Checked` forms say when it doesn't fit.
+// Not for secrets: comparison and division take a time that depends on the value. abla/ct is for those.
+
+noescape extern:"intrinsic" fun ablaU256NativeMul(): bool
+noescape extern:"intrinsic" fun ablaU256_fromU64(value: u64): uint256
+noescape extern:"intrinsic" fun ablaU256_fromI64(value: i64): uint256
+noescape extern:"intrinsic" fun ablaU256_toU64(value: uint256): u64
+noescape extern:"intrinsic" fun ablaU256_not(value: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_add(a: uint256, b: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_sub(a: uint256, b: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_mul(a: uint256, b: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_udiv(a: uint256, b: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_urem(a: uint256, b: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_and(a: uint256, b: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_or(a: uint256, b: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_xor(a: uint256, b: uint256): uint256
+noescape extern:"intrinsic" fun ablaU256_shl(a: uint256, count: u32): uint256
+noescape extern:"intrinsic" fun ablaU256_lshr(a: uint256, count: u32): uint256
+noescape extern:"intrinsic" fun ablaU256_eq(a: uint256, b: uint256): bool
+noescape extern:"intrinsic" fun ablaU256_lt(a: uint256, b: uint256): bool
+noescape extern:"intrinsic" fun ablaU256NarrowTarget(): bool
+
+// As every widening: a signed source sign-extends, so uint256(-1) is the largest value, as u64(-1) is.
+@inline fun uint256(value: int): uint256 = ablaU256_fromI64(value)
+@inline fun uint256(value: i32): uint256 = ablaU256_fromI64(i64(value))
+@inline fun uint256(value: i16): uint256 = ablaU256_fromI64(i64(value))
+@inline fun uint256(value: i8): uint256 = ablaU256_fromI64(i64(value))
+@inline fun uint256(value: u64): uint256 = ablaU256_fromU64(value)
+@inline fun uint256(value: u32): uint256 = ablaU256_fromU64(u64(value))
+@inline fun uint256(value: u16): uint256 = ablaU256_fromU64(u64(value))
+@inline fun uint256(value: u8): uint256 = ablaU256_fromU64(u64(value))
+/** Eight words, most significant first: how to write a constant that doesn't fit an `int`. */
+fun uint256Words(w7: u32, w6: u32, w5: u32, w4: u32, w3: u32, w2: u32, w1: u32, w0: u32): uint256 {
+    var out = uint256(w7)
+    out = ablaU256_or(ablaU256_shl(out, u32(32)), uint256(w6))
+    out = ablaU256_or(ablaU256_shl(out, u32(32)), uint256(w5))
+    out = ablaU256_or(ablaU256_shl(out, u32(32)), uint256(w4))
+    out = ablaU256_or(ablaU256_shl(out, u32(32)), uint256(w3))
+    out = ablaU256_or(ablaU256_shl(out, u32(32)), uint256(w2))
+    out = ablaU256_or(ablaU256_shl(out, u32(32)), uint256(w1))
+    ablaU256_or(ablaU256_shl(out, u32(32)), uint256(w0))
+}
+/** 2^256 - 1. */
+@inline fun uint256Max(): uint256 = ablaU256_not(uint256(0))
+/** Refuses what's below zero, where uint256(value) would extend the sign. */
+fun uint256OrNull(value: int): uint256? = if (value < 0) null else uint256(value)
+
+// What the compiler calls for `==`, `<` and the rest (bootstrapLowerArithmetic), and for "$x".
+@inline fun uint256Equal(a: uint256, b: uint256): bool = ablaU256_eq(a, b)
+@inline fun uint256NotEqual(a: uint256, b: uint256): bool = !ablaU256_eq(a, b)
+@inline fun uint256Less(a: uint256, b: uint256): bool = ablaU256_lt(a, b)
+@inline fun uint256LessEqual(a: uint256, b: uint256): bool = !ablaU256_lt(b, a)
+@inline fun uint256Greater(a: uint256, b: uint256): bool = ablaU256_lt(b, a)
+@inline fun uint256GreaterEqual(a: uint256, b: uint256): bool = !ablaU256_lt(a, b)
+fun uint256Text(value: uint256): string = value.toDecimal()
+
+@inline operator fun uint256.plus(other: uint256): uint256 = ablaU256_add(this, other)
+@inline operator fun uint256.minus(other: uint256): uint256 = ablaU256_sub(this, other)
+@inline operator fun uint256.unaryMinus(): uint256 = ablaU256_sub(uint256(0), this)
+@inline operator fun uint256.and(other: uint256): uint256 = ablaU256_and(this, other)
+@inline operator fun uint256.or(other: uint256): uint256 = ablaU256_or(this, other)
+@inline operator fun uint256.xor(other: uint256): uint256 = ablaU256_xor(this, other)
+@inline operator fun uint256.inv(): uint256 = ablaU256_not(this)
+
+// One word of a number, least significant first.
+private @inline fun uint256Word(value: uint256, index: int): u32 = u32(ablaU256_toU64(ablaU256_lshr(value, u32(index * 32))))
+
+// A word times a word. On a 32-bit target a u64 product calls __muldi3, and four 16-bit products don't.
+// Not inlined, or LLVM evaluates the product at the width of what it's added to, and calls __multi3 for it.
+private @noinline fun uint256WordProduct(a: u32, b: u32): u64 {
+    if (!ablaU256NarrowTarget()) return u64(a) * u64(b)
+    val aLow = a & u32(65535)
+    val aHigh = a >> 16
+    val bLow = b & u32(65535)
+    val bHigh = b >> 16
+    val low = aLow * bLow
+    val first = aHigh * bLow + (low >> 16)
+    val second = aLow * bHigh + (first & u32(65535))
+    (u64(aHigh * bHigh + (first >> 16) + (second >> 16)) << 32) | u64((second << 16) | (low & u32(65535)))
+}
+
+// Column by column from the top: each step moves what's done up a word and adds the next column.
+private @noinline fun uint256MultiplyWords(a: uint256, b: uint256): uint256 {
+    var out = uint256(0)
+    var column = 7
+    while (column >= 0) {
+        out = ablaU256_shl(out, u32(32))
+        for (i in 0 until column + 1) {
+            out = ablaU256_add(out, ablaU256_fromU64(uint256WordProduct(uint256Word(a, i), uint256Word(b, column - i))))
+        }
+        column = column - 1
+    }
+    out
+}
+
+@inline operator fun uint256.times(other: uint256): uint256 =
+    if (ablaU256NativeMul()) ablaU256_mul(this, other) else uint256MultiplyWords(this, other)
+
+// LLVM expands a division to a loop where it's written, so it's written once.
+// By zero, the language's own panic: a u32 divided by the zero it's been told about.
+private @inline fun uint256CheckDivisor(b: uint256): void {
+    if (ablaU256_eq(b, uint256(0))) u32(1) / u32(ablaU256_toU64(b))
+}
+private @noinline fun uint256Divide(a: uint256, b: uint256): uint256 {
+    uint256CheckDivisor(b)
+    ablaU256_udiv(a, b)
+}
+private @noinline fun uint256Remainder(a: uint256, b: uint256): uint256 {
+    uint256CheckDivisor(b)
+    ablaU256_urem(a, b)
+}
+@inline operator fun uint256.div(other: uint256): uint256 = uint256Divide(this, other)
+@inline operator fun uint256.rem(other: uint256): uint256 = uint256Remainder(this, other)
+
+// As every width's: a count that's negative or at least the width gives zero.
+fun uint256ShiftLeft(value: uint256, count: int): uint256 =
+    if (count < 0 || count >= 256) uint256(0) else ablaU256_shl(value, u32(count))
+fun uint256ShiftRight(value: uint256, count: int): uint256 =
+    if (count < 0 || count >= 256) uint256(0) else ablaU256_lshr(value, u32(count))
+@inline operator fun uint256.shl(count: int): uint256 = uint256ShiftLeft(this, count)
+@inline operator fun uint256.shr(count: int): uint256 = uint256ShiftRight(this, count)
+@inline operator fun uint256.shl(count: i32): uint256 = uint256ShiftLeft(this, int(count))
+@inline operator fun uint256.shr(count: i32): uint256 = uint256ShiftRight(this, int(count))
+@inline operator fun uint256.shl(count: i16): uint256 = uint256ShiftLeft(this, int(count))
+@inline operator fun uint256.shr(count: i16): uint256 = uint256ShiftRight(this, int(count))
+@inline operator fun uint256.shl(count: i8): uint256 = uint256ShiftLeft(this, int(count))
+@inline operator fun uint256.shr(count: i8): uint256 = uint256ShiftRight(this, int(count))
+@inline operator fun uint256.shl(count: u64): uint256 = uint256ShiftLeft(this, int(count))
+@inline operator fun uint256.shr(count: u64): uint256 = uint256ShiftRight(this, int(count))
+@inline operator fun uint256.shl(count: u32): uint256 = uint256ShiftLeft(this, int(count))
+@inline operator fun uint256.shr(count: u32): uint256 = uint256ShiftRight(this, int(count))
+@inline operator fun uint256.shl(count: u16): uint256 = uint256ShiftLeft(this, int(count))
+@inline operator fun uint256.shr(count: u16): uint256 = uint256ShiftRight(this, int(count))
+@inline operator fun uint256.shl(count: u8): uint256 = uint256ShiftLeft(this, int(count))
+@inline operator fun uint256.shr(count: u8): uint256 = uint256ShiftRight(this, int(count))
+// The EVM's SHL and SHR take a 256-bit count.
+fun uint256.shl(count: uint256): uint256 =
+    if (ablaU256_lt(count, uint256(256))) ablaU256_shl(this, u32(ablaU256_toU64(count))) else uint256(0)
+fun uint256.shr(count: uint256): uint256 =
+    if (ablaU256_lt(count, uint256(256))) ablaU256_lshr(this, u32(ablaU256_toU64(count))) else uint256(0)
+
+@inline fun uint256.isZero(): bool = ablaU256_eq(this, uint256(0))
+/** Bit `index`, the least significant being 0; beyond the width, 0. */
+fun uint256.bit(index: int): bool =
+    index >= 0 && index < 256 && (ablaU256_toU64(ablaU256_lshr(this, u32(index))) & u64(1)) == u64(1)
+/** The fewest bits that hold it: 0 for zero. */
+fun uint256.bitLength(): int {
+    var word = 7
+    while (word >= 0) {
+        var top = uint256Word(this, word)
+        if (top != u32(0)) {
+            var bits = 0
+            while (top != u32(0)) {
+                top = top >> 1
+                bits = bits + 1
+            }
+            return word * 32 + bits
+        }
+        word = word - 1
+    }
+    0
+}
+
+/** The sum, or null if it doesn't fit. */
+fun uint256.addChecked(other: uint256): uint256? {
+    val sum = ablaU256_add(this, other)
+    if (ablaU256_lt(sum, this)) null else sum
+}
+/** The difference, or null below zero. */
+fun uint256.subChecked(other: uint256): uint256? =
+    if (ablaU256_lt(this, other)) null else ablaU256_sub(this, other)
+/** The product, or null if it doesn't fit. */
+fun uint256.mulChecked(other: uint256): uint256? {
+    val bits = this.bitLength() + other.bitLength()
+    if (bits <= 256) return this * other
+    if (bits > 257) return null
+    // Two numbers of 257 bits between them: half of it fits, and doubling it says.
+    val half = this * ablaU256_lshr(other, u32(1))
+    if (half.bit(255)) return null
+    val doubled = ablaU256_shl(half, u32(1))
+    if (!other.bit(0)) return doubled
+    doubled.addChecked(this)
+}
+
+// Narrowing as every width's does: keeps the low bits.
+@inline fun uint256.toU64(): u64 = ablaU256_toU64(this)
+@inline fun uint256.toInt(): int = int(ablaU256_toU64(this))
+@inline fun uint256.toU32(): u32 = u32(ablaU256_toU64(this))
+@inline fun uint256.toU16(): u16 = u16(ablaU256_toU64(this))
+@inline fun uint256.toU8(): u8 = u8(ablaU256_toU64(this))
+// Or null if it doesn't fit.
+fun uint256.toU64OrNull(): u64? = if (this.bitLength() > 64) null else this.toU64()
+fun uint256.toIntOrNull(): int? = if (this.bitLength() > 63) null else this.toInt()
+fun uint256.toU32OrNull(): u32? = if (this.bitLength() > 32) null else this.toU32()
+fun uint256.toU16OrNull(): u16? = if (this.bitLength() > 16) null else this.toU16()
+fun uint256.toU8OrNull(): u8? = if (this.bitLength() > 8) null else this.toU8()
+
+private @inline fun uint256ByteBefore(byte: int, text: string): string = "${char(byte)}$text"
+
+/** In decimal, as "$x" writes it. */
+fun uint256.toDecimal(): string {
+    if (this.isZero()) return "0"
+    // Nine digits at a time, in a u32: dividing a u64 would call __udivdi3 on a 32-bit target.
+    val chunk = uint256(1000000000)
+    var text = ""
+    var rest = this
+    while (!rest.isZero()) {
+        var low = uint256Remainder(rest, chunk).toU32()
+        rest = uint256Divide(rest, chunk)
+        for (digit in 0 until 9) {
+            if (low != u32(0) || !rest.isZero()) text = uint256ByteBefore(48 + int(low % u32(10)), text)
+            low = low / u32(10)
+        }
+    }
+    text
+}
+
+/** In hex with 0x, in lower case, and no leading zeros: a JSON-RPC quantity. */
+fun uint256.toHex(): string {
+    if (this.isZero()) return "0x0"
+    var text = ""
+    var rest = this
+    while (!rest.isZero()) {
+        val digit = int(rest.toU64() & u64(15))
+        text = uint256ByteBefore(if (digit < 10) 48 + digit else 87 + digit, text)
+        rest = ablaU256_lshr(rest, u32(4))
+    }
+    "0x$text"
+}
+
+/** Digits only: no sign, space or point; leading zeros are allowed. Null if it isn't that, or doesn't fit. */
+fun uint256FromDecimal(text: string): uint256? {
+    if (text.size == 0) return null
+    // floor((2^256 - 1) / 10), whose last digit then allows up to 5.
+    val limit = uint256Words(
+        u32(429496729), u32(2576980377), u32(2576980377), u32(2576980377),
+        u32(2576980377), u32(2576980377), u32(2576980377), u32(2576980377)
+    )
+    var out = uint256(0)
+    for (at in 0 until text.size) {
+        val digit = int(text[at]) - 48
+        if (digit < 0 || digit > 9) return null
+        if (ablaU256_lt(limit, out) || (ablaU256_eq(out, limit) && digit > 5)) return null
+        out = ablaU256_add(ablaU256_add(ablaU256_shl(out, u32(3)), ablaU256_shl(out, u32(1))), uint256(digit))
+    }
+    out
+}
+
+/** With or without 0x, in either case. Null with no digits, on anything else, or if it doesn't fit. */
+fun uint256FromHex(text: string): uint256? {
+    var start = 0
+    if (text.size >= 2 && int(text[0]) == 48 && (int(text[1]) == 120 || int(text[1]) == 88)) start = 2
+    if (text.size == start) return null
+    var out = uint256(0)
+    for (at in start until text.size) {
+        val c = int(text[at])
+        val digit = if (c >= 48 && c <= 57) c - 48
+            else if (c >= 97 && c <= 102) c - 87
+            else if (c >= 65 && c <= 70) c - 55
+            else -1
+        if (digit < 0 || !ablaU256_lshr(out, u32(252)).isZero()) return null
+        out = ablaU256_or(ablaU256_shl(out, u32(4)), uint256(digit))
+    }
+    out
+}
+
+/** 32 bytes, big-endian: an EVM word. */
+fun uint256.toBytes(): string {
+    var text = ""
+    var rest = this
+    for (at in 0 until 32) {
+        text = uint256ByteBefore(int(rest.toU64() & u64(255)), text)
+        rest = ablaU256_lshr(rest, u32(8))
+    }
+    text
+}
+
+/** Big-endian bytes, fewer than 32 padding on the left. Null above 32. */
+fun uint256FromBytes(bytes: string): uint256? {
+    if (bytes.size > 32) return null
+    var out = uint256(0)
+    for (at in 0 until bytes.size) out = ablaU256_or(ablaU256_shl(out, u32(8)), uint256(int(bytes[at])))
+    out
+}
