@@ -76,6 +76,17 @@ PATH="$tools_directory:$PATH" "$compiler" build "$cases/object.ab" -o "$out/xten
 grep -q 'Machine: EM_XTENSA' <<<"$(llvm-readobj --file-headers "$out/xtensa.o")"
 echo "ok   xtensa: compiled only, not run; every vector operation is scalar code there"
 
+for mode in "" --fast; do
+    "$compiler" build "$cases/if-join.ab" -o "$out/if-join" --no-cache $mode
+    "$out/if-join" || { echo "simd if join ${mode:-release}: check $? failed" >&2; exit 1; }
+done
+# Only the boxed entry of a function, for a call through a value, boxes its result.
+if "$compiler" --emit-llvm "$cases/if-join.ab" |
+    awk '/^define/ { direct = /_direct\(/ } direct && /call.*@abla_vector_box/ { found = 1 } END { exit !found }'; then
+    echo "a vector's if join boxes its branches" >&2
+    exit 1
+fi
+
 for invalid in "$cases"/invalid-*.ab; do
     expected=$(sed -n '1s|^// *||p' "$invalid")
     set +e
