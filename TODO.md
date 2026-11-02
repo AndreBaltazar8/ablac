@@ -17,13 +17,6 @@
 
 ## Bugs seen
 
-- [ ] **abla-xml's reader doesn't finish under compile-time evaluation, with millions of error lines.** Seen 2026-11-02 on 0.2.29
-  from abla-soap. A `compile fun` run by `#compiler.transform` calling `xmlParse("<a/>")` from abla-xml hits `E_EVAL_STEP_LIMIT`, and
-  prints a `compile-time evaluation failed` frame per call (2.2 million lines, about 60 s). Separately `#xmlParse(...)` is
-  `compile.effect-denied:trusted.native:xmlParse->XmlChunkDecoder.next->...->XmlFileSource.read`, as the check follows an interface
-  call to an implementer the call can't reach. Either stops generating typed SOAP clients with `#`, which NovaKind's TODO wanted;
-  abla-soap has a tool instead. Also, one error's frames should be bounded.
-
 - [ ] **Threaded native programs die with SIGILL when the stack limit doesn't fit their memory limit.** Seen
   2026-11-01 running `make test-full` under `ulimit -s 131072`: `tools/test-self-hosted.sh` fails
   native-linux-net, native-websocket-live, native-concurrency and native-network-advanced with

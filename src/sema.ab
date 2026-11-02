@@ -15,6 +15,7 @@ import "abla/sys/linux/fs"
 import "parser.ab"
 import "ct_eval.ab"
 import "expected_types.ab"
+import "overload.ab"
 
 fun bootstrapSemanticUnit(): void {}
 
@@ -4995,6 +4996,112 @@ fun bootstrapBuildCompileEffectGrants(
     grants
 }
 
+// A call through an interface takes the effects of every method of that name, so
+// `#xmlParse(text)` was denied for what a file source does, though a string's parse makes
+// no file source. Before denying, the check asks which classes the expression can make,
+// and looks again with the methods of the others left out. It reads names, not types, so it
+// keeps a class on any mention of its name: `reached` and `names` only grow.
+val BOOTSTRAP_EFFECT_IMPLICIT_CALLS = ["iterator", "hasNext", "next", "getValue", "setValue", "close", "drop", "text"]
+
+/** Everything `expression` names, in `names`, and the methods it calls, in `methods`. */
+fun bootstrapEffectCollectNames(
+    expression: BootstrapExpression,
+    var names: Map<string, bool>,
+    var methods: Map<string, bool>
+): void {
+    val kind = expression.kind
+    if (kind == "member.call" || kind == "member" || kind == "member.assign") {
+        methods.set(expression.text, true)
+    } else if (expression.text != "" && kind != "string" && kind != "string.template" &&
+        kind != "integer" && kind != "float" && kind != "named.argument" &&
+        kind != "local.val" && kind != "local.var") {
+        // An instantiated generic's name goes by its `Box` as well as its `Box<int>`.
+        names.set(expression.text, true)
+        names.set(bootstrapEffectGenericBase(expression.text), true)
+    }
+    for (child in expression.children) bootstrapEffectCollectNames(child, names, methods)
+    return
+}
+
+fun bootstrapEffectGenericBase(name: string): string {
+    var index = 0
+    while (index < name.size) {
+        if (name[index] == 60) return name.slice(0, index)
+        index = index + 1
+    }
+    name
+}
+
+fun bootstrapEffectDeclarationReached(
+    declaration: BootstrapDeclaration,
+    names: Map<string, bool>,
+    methods: Map<string, bool>
+): bool {
+    if (declaration.kind == "interface") return true
+    if (names.has(declaration.name) || names.has(bootstrapEffectGenericBase(declaration.name))) return true
+    if (declaration.extensionOwner == "") return false
+    if (methods.has(declaration.name)) return true
+    for (annotation in declaration.annotations) {
+        if (annotation == "operator") return true
+    }
+    for (name in BOOTSTRAP_EFFECT_IMPLICIT_CALLS) {
+        if (name == declaration.name) return true
+    }
+    false
+}
+
+/** `declarations` without the methods and extensions of the classes `expression` can't make. */
+fun bootstrapEffectDeclarationsMadeBy(
+    expression: BootstrapExpression,
+    declarations: array<BootstrapDeclaration>
+): array<BootstrapDeclaration> {
+    val names: Map<string, bool> = Map()
+    val methods: Map<string, bool> = Map()
+    bootstrapEffectCollectNames(expression, names, methods)
+    val classes: Map<string, bool> = Map()
+    for (declaration in declarations) {
+        if (declaration.kind == "class") classes.set(bootstrapEffectNormalizeType(declaration.name), true)
+    }
+    val reached: array<bool> = []
+    for (declaration in declarations) reached.append(false)
+    val made: Map<string, bool> = Map()
+    var grew = true
+    while (grew) {
+        grew = false
+        var index = 0
+        while (index < declarations.size) {
+            val declaration = declarations[index]
+            // An extension of a class runs on an instance: none, until it's made.
+            val owner = bootstrapEffectNormalizeType(declaration.extensionOwner)
+            if (!reached[index] && (owner == "" || !classes.has(owner) || made.has(owner)) &&
+                bootstrapEffectDeclarationReached(declaration, names, methods)) {
+                reached[index] = true
+                grew = true
+                if (declaration.kind == "class") made.set(bootstrapEffectNormalizeType(declaration.name), true)
+                bootstrapEffectCollectNames(declaration.expression, names, methods)
+                for (argument in declaration.parameterDefaults) bootstrapEffectCollectNames(argument, names, methods)
+                for (method in declaration.methods) {
+                    bootstrapEffectCollectNames(method.expression, names, methods)
+                    for (argument in method.parameterDefaults) bootstrapEffectCollectNames(argument, names, methods)
+                }
+            }
+            index = index + 1
+        }
+    }
+    val result: array<BootstrapDeclaration> = []
+    var index = 0
+    while (index < declarations.size) {
+        val declaration = declarations[index]
+        if (reached[index]) {
+            result.append(declaration)
+        } else if (declaration.kind == "class") {
+            result.append(bootstrapDeclarationWithMethods(declaration, []))
+        } else if (declaration.extensionOwner == "") result.append(declaration)
+        index = index + 1
+    }
+    result
+}
+
 fun bootstrapDeniedCompileEffects(effects: int, grants: int): int {
     var denied = 0
     var effect = 4
@@ -7329,7 +7436,10 @@ class BootstrapAnalyzer(
         }
     }
 
-    fun expressionCompileEffects(expression: BootstrapExpression): int {
+    fun expressionCompileEffects(expression: BootstrapExpression): int =
+        this.expressionCompileEffects(expression, this.compileEffects)
+
+    fun expressionCompileEffects(expression: BootstrapExpression, summary: BootstrapCompileEffectSummary): int {
         val delegatedNames: array<string> = []
         var declaration = 0
         while (declaration < this.declarations.size) {
@@ -7345,9 +7455,9 @@ class BootstrapAnalyzer(
         // outside the standard library is trusted.native.
         bootstrapCompileContainEffects(bootstrapExpressionDelegatedCompileEffects(
             expression,
-            this.compileEffects,
+            summary,
             delegatedNames,
-            this.compileEffects.typeMap
+            summary.typeMap
         ), 0)
     }
 
@@ -12697,7 +12807,15 @@ fun bootstrapInferCompile(
         analyzer.compileEffectGrants
     )
     val denied = bootstrapCompileEffectName(deniedEffects)
-    if (denied != "") {
+    if (denied != "" && bootstrapDeniedCompileEffects(
+        analyzer.expressionCompileEffects(
+            expression.children[0],
+            bootstrapBuildCompileEffectSummary(
+                bootstrapEffectDeclarationsMadeBy(expression.children[0], analyzer.declarations)
+            )
+        ),
+        analyzer.compileEffectGrants
+    ) != 0) {
         val path = bootstrapCompileEffectPath(
             expression.children[0],
             analyzer.declarations,

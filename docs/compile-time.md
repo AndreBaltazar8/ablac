@@ -381,6 +381,8 @@ fun main {
 ```
 
 Without the grant, the build stops with `compile.effect-denied:filesystem.read`.
+A call through an interface counts what its implementers do, but only those the `#` expression's code can
+make: reading a string through `Source` isn't denied because a `FileSource` exists that nothing here creates.
 Without the manifest entry, it stops with `compile.capability-not-authorized:filesystem.read`.
 In a package, a dependency's `compileCapabilities` must be a subset of the
 root project's (`E_PACKAGE_CAPABILITY_DENIED`).

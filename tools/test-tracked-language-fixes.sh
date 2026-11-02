@@ -56,6 +56,8 @@ expect_error invalid-reserved-generator '`task` is a reserved word'
 expect_error invalid-reserved-generator '`thread` is a reserved word'
 expect_exit transform-method-effects 42
 expect_exit transform-implicit-this 42
+expect_exit compile-effect-unmade-implementer 42
+expect_error invalid-compile-effect-made-implementer compile.effect-denied:
 expect_error invalid-transform-failing-loop E_EVAL_EXPRESSION
 if (( $(wc -l <"$output/invalid-transform-failing-loop.log") > 200 )) ||
     grep -q E_EVAL_STEP_LIMIT "$output/invalid-transform-failing-loop.log"; then
