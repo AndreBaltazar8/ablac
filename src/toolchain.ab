@@ -94,6 +94,37 @@ fun bootstrapLinkCommand(linker: string): LinuxCommand {
     command
 }
 
+var bootstrapHostLlvmToolsDirectory: string = ""
+
+// Where a host build's opt and llc are: ABLA_LLVM_TOOLS (shell.nix sets it), else the bin/
+// beside a shipped toolchain's libexec/ablac.bin, else the first directory on PATH that holds
+// both. Never a lone llc ahead on PATH: abla-embedded puts one there that adds -mcpu=esp32, and
+// since a host executable goes through llc, a host build under it failed to make x86_64 code.
+// Cross targets still run PATH's llc, as those wrappers are for them.
+fun bootstrapHostLlvmTool(name: string): string {
+    if (bootstrapHostLlvmToolsDirectory == "") {
+        val configured = linuxEnvironment("ABLA_LLVM_TOOLS")
+        var directory = if (configured.found) configured.value else ""
+        if (directory == "") {
+            val shipped = Path(Path("/proc/self/exe").linkTarget()).parent().parent().child("bin")
+            if (bootstrapHoldsLlvmTools(shipped.text)) directory = shipped.text
+        }
+        if (directory == "") {
+            val search = linuxEnvironment("PATH")
+            if (search.found) {
+                for (entry in search.value.split(":")) {
+                    if (directory == "" && entry != "" && bootstrapHoldsLlvmTools(entry)) directory = entry
+                }
+            }
+        }
+        bootstrapHostLlvmToolsDirectory = if (directory == "") "-" else directory
+    }
+    if (bootstrapHostLlvmToolsDirectory == "-") name else "$bootstrapHostLlvmToolsDirectory/$name"
+}
+
+fun bootstrapHoldsLlvmTools(directory: string): bool =
+    Path("$directory/opt").info().isFile() && Path("$directory/llc").info().isFile()
+
 fun bootstrapTargetDescriptor(name: string): BootstrapTargetDescriptor {
     var result = BootstrapTargetDescriptor(
         name, "", "", false, false, "", "", "", false
@@ -1051,7 +1082,7 @@ fun bootstrapPreparePartitionLlvm(
     llvmPath: string,
     preparedPath: string
 ): int {
-    val prepare = linuxCommand("opt")
+    val prepare = linuxCommand(bootstrapHostLlvmTool("opt"))
     prepare.argument(
         "-passes=always-inline,function(sroa,mem2reg,early-cse,instcombine<no-verify-fixpoint>,simplifycfg,dse,adce),globaldce"
     )
@@ -1070,7 +1101,7 @@ fun bootstrapPreparePartitionLlvm(
 // and about 70 s. Only inlining here builds it in 55 s but at 10.4 MB or more, and O1
 // followed by SCCP and GVN gains nothing on it.
 fun bootstrapPrepareSplitLlvm(llvmPath: string, preparedPath: string): int {
-    val prepare = linuxCommand("opt")
+    val prepare = linuxCommand(bootstrapHostLlvmTool("opt"))
     prepare.argument("-passes=default<O1>,globaldce")
     prepare.argument(llvmPath)
     prepare.argument("-o")
@@ -1087,7 +1118,7 @@ fun bootstrapPrepareParallelLlvm(
     preparedPath: string,
     text: bool = true
 ): int {
-    val prepare = linuxCommand("opt")
+    val prepare = linuxCommand(bootstrapHostLlvmTool("opt"))
     prepare.argument(
         "-passes=function(sroa,early-cse),always-inline,cgscc(devirt<1>(inline,function(sroa,early-cse,simplifycfg))),globalopt,globaldce"
     )
@@ -1112,7 +1143,7 @@ fun bootstrapOptimizeWholeProgram(
     objectPath: string,
     abiManifest: string
 ): int {
-    val optimize = linuxCommand("opt")
+    val optimize = linuxCommand(bootstrapHostLlvmTool("opt"))
     val visible = bootstrapNativeAbiExportSymbols(abiManifest)
     visible.append("main")
     bootstrapLlvmAssemblyNames(Path(llvmPath).readText(), visible)
@@ -1131,7 +1162,7 @@ fun bootstrapOptimizeWholeProgram(
     optimize.argument(optimizedPath)
     var status = optimize.run()
     if (status == 0) {
-        val emitObject = linuxCommand("llc")
+        val emitObject = linuxCommand(bootstrapHostLlvmTool("llc"))
         emitObject.argument("-filetype=obj")
         emitObject.argument("-relocation-model=pic")
         emitObject.argument("-O2")
@@ -2686,7 +2717,7 @@ fun bootstrapNativeBuildWithEmitterStateCache(
     if (ltoEligible && !linkLlvm && cacheEnabled && compileInputsCacheable) {
         ltoCache = bootstrapToolObjectCachePath(
             "$cacheStem.lto-v2",
-            "${target.llvmTriple}\n${bootstrapToolIdentity("opt")}\n${bootstrapToolIdentity("llc")}\n${bootstrapToolIdentity(if (macTarget) macClang else "clang")}\n$macSdkRoot"
+            "${target.llvmTriple}\n${bootstrapToolIdentity(bootstrapHostLlvmTool("opt"))}\n${bootstrapToolIdentity(bootstrapHostLlvmTool("llc"))}\n${bootstrapToolIdentity(if (macTarget) macClang else "clang")}\n$macSdkRoot"
         )
     }
     var ltoReused = false

@@ -17,8 +17,8 @@ project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 compiler=$1
 [[ $compiler != */* || $compiler == /* ]] || compiler=$PWD/$compiler
 # The compiler binary itself (beside the launcher, or beside the launcher a link
-# points at): a launcher puts its own LLVM tools first on PATH, and this test
-# puts its own `opt` there.
+# points at): a host build takes its opt and llc from ABLA_LLVM_TOOLS, which
+# this test points at a directory with its own `opt`.
 resolved=$compiler
 while [[ -L $resolved ]]; do
     target=$(readlink "$resolved")
@@ -34,8 +34,9 @@ fi
 sysroot=${ABLA_SYSROOT:-$project_root}
 export ABLA_SYSROOT=$sysroot
 real_opt=$(command -v opt || true)
-if [[ -z $real_opt ]]; then
-    echo 'tool object cache: no opt on PATH' >&2
+real_llc=$(command -v llc || true)
+if [[ -z $real_opt || -z $real_llc ]]; then
+    echo 'tool object cache: no opt or llc on PATH' >&2
     exit 1
 fi
 
@@ -54,6 +55,7 @@ write_opt() { # comment
     mv -f shims/opt.next shims/opt
 }
 write_opt first
+ln -s "$real_llc" shims/llc
 darwin=false
 [[ $(uname -s) == Darwin ]] && darwin=true
 
@@ -62,7 +64,7 @@ fail() {
     exit 1
 }
 build() { # build arguments
-    PATH="$work/shims:$PATH" ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 \
+    PATH="$work/shims:$PATH" ABLA_LLVM_TOOLS="$work/shims" ABLA_MAX_MEMORY_MB=2048 ABLA_MAX_SECONDS=120 \
         "$project_root/tools/run-limited.sh" "$payload" build main.ab "$@" \
         >build.log 2>&1 || { cat build.log >&2; fail "build $* failed"; }
 }

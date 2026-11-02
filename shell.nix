@@ -46,6 +46,8 @@ pkgs.mkShell {
 
   shellHook = ''
     export ABLAC_DEV_SHELL=1
+    # A host build's opt and llc (src/toolchain.ab), whatever else is first on PATH.
+    export ABLA_LLVM_TOOLS="${llvmTools}/bin"
     export ABLA_MACOS_CLANG="${llvm.clang-unwrapped}/bin/clang"
     export ABLA_LINUX_OPENSSL_LIB="${pkgs.openssl.out}/lib"
     # What links here finds this OpenSSL when it runs. LD_LIBRARY_PATH would do it
