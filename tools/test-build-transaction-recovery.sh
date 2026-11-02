@@ -178,6 +178,22 @@ build other other
 [[ -z $(transactions) ]] || fail "an older compiler's transaction is left once its process has gone"
 [[ ! -e build/.abla-compile-outputs-$alive ]] || fail "a scratch directory is left once its process has gone"
 
+# A build that stops on finding no runtime puts its outputs back and leaves no
+# transaction.
+if [[ -x $compiler.bin ]]; then
+    mkdir -p no-runtime
+    printf 'earlier' > no-runtime/m
+    status=0
+    (cd no-runtime && env -u ABLA_SYSROOT -u ABLA_STDLIB "$compiler.bin" build \
+        "$cases/one.ab" -o m --no-cache) > no-runtime.log 2>&1 || status=$?
+    [[ $status -ne 0 ]] && grep -q E_TOOLCHAIN_ROOT no-runtime.log ||
+        fail "a build with no runtime in reach did not stop on it"
+    [[ -z $(compgen -G "no-runtime/build/.abla-build-transaction-*") ]] ||
+        fail "a build with no runtime in reach left its transaction"
+    [[ $(cat no-runtime/m) == earlier ]] ||
+        fail "a build with no runtime in reach did not put its output back"
+fi
+
 build two app
 same_set two || fail "the last build's outputs differ from the second program's"
 [[ -z $(transactions) ]] || fail "a finished build left its transaction"
