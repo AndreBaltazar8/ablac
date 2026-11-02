@@ -237,7 +237,7 @@ generation; HTTP handlers can adopt it once their response promotion and
 long-lived-state policy is explicit.
 
 `abla/memory` exposes `memoryLiveBytes()`, `memoryLimit()`,
-`memorySetLimit(bytes)`, `memorySetCollectionGrowth(bytes)`,
+`memorySetLimit(bytes)`, `memorySetCollectionGrowth(bytes)`, `memorySetFreeBlockLimit(bytes)`,
 `memorySetManualCollection()`, `memorySetBackgroundFree(enabled)`, and the
 explicit `memoryCollect()` safe point. The
 collector returns reclaimed bytes, preserves compiler-rooted locals,
@@ -270,8 +270,10 @@ Collection has two modes:
   makes no safe point.) The first collection runs
   at 32 MiB; each later one once the heap has grown by
   `max(64 MiB, half of what the last collection kept)`, capped below the limit.
-  `memorySetCollectionGrowth(bytes)` lowers the least growth for programs that
-  care about their footprint. Without a rebuild, `ABLA_GC_GROWTH=<bytes>`
+  `memorySetCollectionGrowth(bytes)` sets the least growth (lower, for programs that
+  care about their footprint); called before the first collection (hosted), it also
+  starts that one at half of it. `memorySetFreeBlockLimit(bytes)` bounds the freed
+  small blocks kept for reuse by size (128 MiB by default). Without a rebuild, `ABLA_GC_GROWTH=<bytes>`
   (decimal, at least 1 MiB; read once at startup) sets the least growth and
   starts the first collection at half of it: a smaller step collects more often
   over less garbage, so each pause is shorter. Run with `ABLA_GC_STRESS=1` to

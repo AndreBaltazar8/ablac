@@ -295,6 +295,8 @@ var __ablaRuntimeHostCollectionGrowth: int = __ablaRuntimeHostGcGrowthConfigured
 // safe point's check is the same compare either way.
 var __ablaRuntimeHostGcStress: bool = __ablaRuntimeHostGcStressConfigured()
 var __ablaRuntimeHostCollectionCount: int = 0
+// Whether a collection has run (memorySetCollectionGrowth moves the first one only).
+var __ablaRuntimeHostCollected: bool = false
 var __ablaRuntimeHostCollectionMinimum: int = 0
 var __ablaRuntimeHostCollectionMaximum: int = 0
 var __ablaRuntimeHostCollectionWorklist: int = 0
@@ -584,15 +586,43 @@ trusted fun __ablaRuntimeHostRegionAllocate(size: int): int {
 // Blocks of up to 512 bytes, header included, go on a list by size when freed (8 bytes apart,
 // as malloc was asked for them), and the next allocation of that size takes one: under a
 // collector every block is freed once, and a malloc and a free each cost more than the
-// object's first use. The lists hold at most 32 MB between them; past that a block goes back
-// to malloc. Blocks on a list serve only their size, so what they hold is lost to everything
-// else: cut from chunks and kept for good, they took an Xtensa build of abla-embedded's
-// package-import from 3.04 GB to 3.74 GB at its peak (2026-11-02). They are taken and given
-// back under the heap lock. A block's first word links it while free.
+// object's first use. The lists hold at most 128 MB between them (memorySetFreeBlockLimit
+// changes it; the compiler keeps 32 MB); past that a block goes back to malloc. Blocks on a
+// list serve only their size, so what they hold is lost to everything else: cut from chunks
+// and kept for good, they took an Xtensa build of abla-embedded's package-import from
+// 3.04 GB to 3.74 GB at its peak (2026-11-02). Within the limit they keep what they serve
+// (__ablaRuntimeHostSmallListsSize). They are taken and given back under the heap lock. A
+// block's first word links it while free.
 var __ablaRuntimeHostSmallBytes: int = 0
+var __ablaRuntimeHostSmallLimit: int = 134217728
 
 // (Static storage, as the collection's page cache: 65 lists, at a block's size.)
 trusted fun __ablaRuntimeHostSmallLists(): int = nativeStaticAllocate(520)
+
+// What the lists serve between collections sets how much they keep at the next: as much
+// as they served since the last, a quarter more, at least 32 MB and at most the limit. A
+// program that frees and reallocates its small blocks between collections (trees, strings)
+// keeps what it reuses; one that doesn't (json-megabyte peaked 116 MB higher at a fixed
+// 128 MB) keeps 32 MB, as before.
+var __ablaRuntimeHostSmallKept: int = 33554432
+var __ablaRuntimeHostSmallMarked: int = 0
+var __ablaRuntimeHostSmallPushed: int = 0
+
+// Before a sweep: the lists' size for the cycle that ends, from what they served in it.
+trusted fun __ablaRuntimeHostSmallListsSize(): void {
+    val served = __ablaRuntimeHostSmallMarked + __ablaRuntimeHostSmallPushed -
+        __ablaRuntimeHostSmallBytes
+    var kept = served + served / 4
+    if (kept < 33554432) kept = 33554432
+    if (kept > __ablaRuntimeHostSmallLimit) kept = __ablaRuntimeHostSmallLimit
+    __ablaRuntimeHostSmallKept = kept
+}
+
+// After a sweep: what the next cycle's serving is counted from.
+trusted fun __ablaRuntimeHostSmallListsMark(): void {
+    __ablaRuntimeHostSmallMarked = __ablaRuntimeHostSmallBytes
+    __ablaRuntimeHostSmallPushed = 0
+}
 
 @inline
 trusted fun __ablaRuntimeHostBlockAllocate(size: int): int {
@@ -614,7 +644,7 @@ trusted fun __ablaRuntimeHostBlockAllocate(size: int): int {
 // Whether a block of `size` payload bytes goes on the lists above when freed now.
 @inline
 trusted fun __ablaRuntimeHostBlockKept(size: int): bool =
-    size <= 480 && __ablaRuntimeHostSmallBytes < 33554432
+    size <= 480 && __ablaRuntimeHostSmallBytes < __ablaRuntimeHostSmallKept
 
 @inline
 trusted fun __ablaRuntimeHostBlockFree(header: int, size: int): void {
@@ -624,6 +654,7 @@ trusted fun __ablaRuntimeHostBlockFree(header: int, size: int): void {
         ablaRuntimeStoreI64(header, ablaRuntimeLoadI64(list))
         ablaRuntimeStoreI64(list, header)
         __ablaRuntimeHostSmallBytes = __ablaRuntimeHostSmallBytes + total
+        __ablaRuntimeHostSmallPushed = __ablaRuntimeHostSmallPushed + total
     } else free(ablaRuntimePointerFromAddress(header))
 }
 
@@ -798,7 +829,10 @@ trusted fun __ablaRuntimePlatformMemorySetLimit(limit: int): void {
 }
 
 // Collect under allocation pressure once the tracked heap has grown `bytes`
-// (or half again, if more) past what the last collection kept.
+// (or half again, if more) past what the last collection kept. Before the first
+// collection, the first comes once the heap has grown half of `bytes`, as with
+// ABLA_GC_GROWTH: a compiler asking for 256 MB steps had collected at 32 MB, in
+// the middle of a small build.
 trusted fun __ablaRuntimePlatformMemorySetCollectionGrowth(bytes: int): void {
     if (bytes <= 0) ablaRuntimeTrap()
     __ablaRuntimeHostCollectionGrowth = bytes
@@ -810,8 +844,19 @@ trusted fun __ablaRuntimePlatformMemorySetCollectionGrowth(bytes: int): void {
     val next = __ablaRuntimeHostLiveBytes + bytes
     if (__ablaRuntimeHostCollectionThreshold > next) {
         __ablaRuntimeHostCollectionThreshold = next
+    } else if (!__ablaRuntimeHostCollected && !__ablaRuntimeHostGcStress) {
+        val first = __ablaRuntimeHostLiveBytes + bytes / 2
+        if (first > __ablaRuntimeHostCollectionThreshold) {
+            __ablaRuntimeHostCollectionThreshold = first
+        }
     }
     return
+}
+
+// At most `bytes` of freed small blocks kept for reuse (__ablaRuntimeHostSmallBytes).
+trusted fun __ablaRuntimePlatformMemorySetFreeBlockLimit(bytes: int): void {
+    if (bytes < 0) ablaRuntimeTrap()
+    __ablaRuntimeHostSmallLimit = bytes
 }
 
 // Manual collection: allocation pressure no longer collects (until a later
@@ -1352,11 +1397,14 @@ trusted fun __ablaRuntimePlatformMemoryCollect(): int {
     )
     if (__ablaRuntimeHostCollectionWorklist == 0) __ablaRuntimeHostOutOfMemory()
     __ablaRuntimeHostCollectionCount = allocationCount
+    __ablaRuntimeHostCollected = true
     __ablaRuntimeHostCollectionWorklistCount = 0
     __ablaRuntimeHostCollectionPagesBuild()
     __ablaRuntimeHostMarkRootValues()
     __ablaRuntimeHostTraceMarkedAllocations()
+    __ablaRuntimeHostSmallListsSize()
     __ablaRuntimeHostCollectionSweep()
+    __ablaRuntimeHostSmallListsMark()
     free(ablaRuntimePointerFromAddress(
         __ablaRuntimeHostCollectionWorklist
     ))
@@ -1403,6 +1451,7 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     )
     if (__ablaRuntimeHostCollectionWorklist == 0) __ablaRuntimeHostOutOfMemory()
     __ablaRuntimeHostCollectionCount = allocationCount
+    __ablaRuntimeHostCollected = true
     __ablaRuntimeHostCollectionWorklistCount = 0
     // A helper still freeing is waited for even when background freeing has been
     // turned off since: its thread is joined.
@@ -1411,10 +1460,12 @@ trusted fun __ablaRuntimeHostBackgroundMemoryCollect(): int {
     __ablaRuntimeHostCollectionPagesBuild()
     __ablaRuntimeHostMarkRootValues()
     __ablaRuntimeHostTraceMarkedAllocations()
+    __ablaRuntimeHostSmallListsSize()
     if (background) {
         __ablaRuntimeHostBackgroundSweep()
         __ablaRuntimeHostFreeStart()
     } else __ablaRuntimeHostCollectionSweep()
+    __ablaRuntimeHostSmallListsMark()
     free(ablaRuntimePointerFromAddress(
         __ablaRuntimeHostCollectionWorklist
     ))
@@ -1480,10 +1531,16 @@ trusted fun __ablaRuntimeRootsPop(frame: int): int {
         __ablaRuntimeHostRootFrameStore(ablaRuntimeLoadI64(frame))
         return 0
     }
-    // An export's static global-root frame is pushed once, lazily, by the
-    // first export that touches globals, possibly while an outer frame is
-    // live. That outer frame's pop then finds the permanent frame above it,
-    // so unlink it from the middle; a frame absent from the chain is a bug.
+    __ablaRuntimeRootsUnlink(frame)
+}
+
+// A pop that finds another frame on top: an export's static global-root frame is pushed
+// once, lazily, by the first export that touches globals, possibly while an outer frame
+// is live. That outer frame's pop then finds the permanent frame above it, so unlink it
+// from the middle; a frame absent from the chain is a bug. Out of line and cold: inlined
+// at every return of every rooted function, this walk was 4% of a program's code.
+@noinline
+trusted fun __ablaRuntimeRootsUnlink(frame: int): int {
     var newer = __ablaRuntimeHostRootFrameLoad()
     while (newer != 0) {
         val older = ablaRuntimeLoadI64(newer)

@@ -95,6 +95,150 @@ fun bootstrapLinkCommand(linker: string): LinuxCommand {
     command
 }
 
+// A Linux link runs the `ld.lld` that clang would run, without clang. Through a Nix shell's
+// clang, a small program's link was 60 ms of 330: the wrapper's shell script and clang's own
+// start, ahead of 13 ms of linking. The first link asks clang (`-###`) for the command it
+// would run and keeps it in the cache directory, under the link's arguments and the
+// environment clang and its wrapper read (PATH, LIBRARY_PATH, COMPILER_PATH, NIX_*, …),
+// with the object and output as placeholders. A link the kept command fails, or a command
+// clang doesn't print as one `ld.lld` run, goes through clang as before (and, failing,
+// shows clang's errors). ABLA_LINK_DIRECT=0 always links through clang.
+fun bootstrapRunHostLink(link: LinuxCommand, objectPath: string, outputPath: string): int {
+    val configured = linuxEnvironment("ABLA_LINK_DIRECT")
+    if (configured.found && configured.value == "0") return link.run()
+    val directory = Path(bootstrapCacheDirectory()).child("link")
+    val probe = directory.child(bootstrapHostLinkKey(link.arguments, objectPath, outputPath))
+    var kept = probe.readText()
+    if (kept == "" && directory.createDirectories()) {
+        kept = bootstrapProbeHostLink(link, objectPath, outputPath)
+        if (kept != "") probe.writeTextAtomic(kept)
+    }
+    if (kept != "") {
+        val lines = kept.split("\n")
+        val direct = linuxCommand(bootstrapLinkProbeArgument(lines[0], objectPath, outputPath))
+        var index = 1
+        while (index < lines.size) {
+            direct.argument(bootstrapLinkProbeArgument(lines[index], objectPath, outputPath))
+            index = index + 1
+        }
+        val errors = "$outputPath.link-errors"
+        direct.errors(errors)
+        val status = direct.run()
+        Path(errors).remove()
+        if (status == 0) return 0
+        probe.remove()
+    }
+    link.run()
+}
+
+// A kept argument with its placeholder put back.
+fun bootstrapLinkProbeArgument(argument: string, objectPath: string, outputPath: string): string =
+    if (argument == "\x01object") objectPath
+    else if (argument == "\x01output") outputPath
+    else argument
+
+// The key of a link's kept command: its arguments, the object and output as placeholders,
+// and what in the environment can change the command clang runs.
+fun bootstrapHostLinkKey(
+    arguments: array<string>,
+    objectPath: string,
+    outputPath: string
+): string {
+    var text = "abla-link-probe 1"
+    for (argument in arguments) {
+        text = "$text\n${if (argument == objectPath) "\x01object"
+            else if (argument == outputPath) "\x01output" else argument}"
+    }
+    for (entry in linuxEnvironmentEntries()) {
+        if (bootstrapLinkReadsEnvironment(entry)) text = "$text\n$entry"
+    }
+    val first = bootstrapNativeCacheHash(text, 17, 257, 1000000007)
+    val second = bootstrapNativeCacheHash(text, 31, 263, 1000000009)
+    "$first-$second"
+}
+
+// Whether clang, its Nix wrapper or the linker reads this `NAME=value` entry. Not the
+// temporary directory a Nix shell names afresh on each entry: nothing in a link command
+// comes from it.
+fun bootstrapLinkReadsEnvironment(entry: string): bool =
+    (entry.startsWith("NIX_") && !entry.startsWith("NIX_BUILD_TOP=")) ||
+    entry.startsWith("PATH=") || entry.startsWith("LIBRARY_PATH=") ||
+    entry.startsWith("COMPILER_PATH=") || entry.startsWith("GCC_EXEC_PREFIX=") ||
+    entry.startsWith("LD_RUN_PATH=") || entry.startsWith("SDKROOT=") ||
+    entry.startsWith("CLANG_") || entry.startsWith("CCC_") ||
+    entry.startsWith("ZERO_AR_DATE=")
+
+// The command clang runs for `link`, one argument a line with the object and the output as
+// placeholders; "" unless clang prints exactly one command, an `ld.lld`, holding each once.
+fun bootstrapProbeHostLink(link: LinuxCommand, objectPath: string, outputPath: string): string {
+    val probe = linuxCommand(link.arguments[0])
+    var index = 1
+    while (index < link.arguments.size) {
+        probe.argument(link.arguments[index])
+        index = index + 1
+    }
+    probe.argument("-###")
+    val printed = "$outputPath.link-probe"
+    probe.errors(printed)
+    probe.output("/dev/null")
+    val status = probe.run()
+    val text = Path(printed).readText()
+    Path(printed).remove()
+    if (status != 0) return ""
+    var command: array<string> = []
+    var commands = 0
+    for (line in text.split("\n")) {
+        if (line.startsWith(" \"")) {
+            commands = commands + 1
+            command = bootstrapLinkProbeWords(line)
+        }
+    }
+    if (commands != 1 || command.size < 2 || !command[0].endsWith("/ld.lld")) return ""
+    var objects = 0
+    var outputs = 0
+    var kept = ""
+    index = 0
+    while (index < command.size) {
+        var argument = command[index]
+        if (argument.indexOf("\n", 0) >= 0 || argument.indexOf("\x01", 0) >= 0) return ""
+        if (argument == objectPath) {
+            objects = objects + 1
+            argument = "\x01object"
+        } else if (argument == outputPath) {
+            outputs = outputs + 1
+            argument = "\x01output"
+        }
+        kept = if (index == 0) argument else "$kept\n$argument"
+        index = index + 1
+    }
+    if (objects != 1 || outputs != 1) "" else kept
+}
+
+// The words of a command as clang's `-###` prints it: each in double quotes, with `\`
+// before a `"`, `\` or `$` inside.
+fun bootstrapLinkProbeWords(line: string): array<string> {
+    val words: array<string> = []
+    var index = 0
+    while (index < line.size) {
+        if (line[index] == 34) {
+            var word = ""
+            index = index + 1
+            var start = index
+            while (index < line.size && line[index] != 34) {
+                if (line[index] == 92 && index + 1 < line.size) {
+                    word = "$word${line.slice(start, index)}"
+                    index = index + 1
+                    start = index
+                }
+                index = index + 1
+            }
+            words.append("$word${line.slice(start, if (index < line.size) index else line.size)}")
+        }
+        index = index + 1
+    }
+    words
+}
+
 var bootstrapHostLlvmToolsDirectory: string = ""
 
 // Where a host build's opt and llc are: ABLA_LLVM_TOOLS (shell.nix sets it), else the bin/
@@ -381,6 +525,54 @@ fun bootstrapLlvmToolsVerify(): bool {
     val configured = linuxEnvironment("ABLA_LLVM_VERIFY")
     configured.found && configured.value == "1"
 }
+
+// What a Linux release executable is optimized with, after internalizing it: LLVM 23's
+// default<O2>,globaldce as `opt -print-pipeline-passes` writes it, without 26 of its passes
+// (2026-11-02). Dropped one at a time over tests/benchmarks, then together, twice over:
+// five of the eight instcombines (all after the inliner's first), four of the eight
+// simplifycfgs, two LICMs, sccp, the second correlated propagation, loop-unroll and loop-unroll-full,
+// constraint elimination, called-value propagation, bdce, adce, loop-instsimplify,
+// instsimplify, a tailcallelim, an infer-alignment, a globals-aa `require` and the closing
+// `verify`. opt and llc do 17.8% less work, programs come out 0.4% smaller and run 0.5%
+// fewer instructions (none more than 0.2% more). Those whose removal cost run time or size
+// stay (gvn: nbody 13% slower; indvars: matrix 5%; the first sroa, dse, slp-vectorizer).
+// Spelled out, the pipeline names LLVM's pass options; an LLVM that can't parse it gets
+// default<O2>,globaldce instead.
+val BOOTSTRAP_HOST_RELEASE_PASSES =
+    "memprof-remove-attributes,annotation2metadata,forceattrs,inferattrs,coro-early," +
+    "function<eager-inv>(ee-instrument<>,lower-expect," +
+    "simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;no-switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>," +
+    "sroa<modify-cfg>,early-cse<>),openmp-opt,ipsccp,globalopt," +
+    "function<eager-inv>(mem2reg,instcombine<max-iterations=1;no-verify-fixpoint>," +
+    "simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>)," +
+    "always-inline,function(invalidate<aa>),require<profile-summary>," +
+    "cgscc(devirt<4>(inline,function-attrs<skip-non-recursive-function-attrs>," +
+    "openmp-opt-cgscc,function<eager-inv;no-rerun>(sroa<modify-cfg>,early-cse<memssa>," +
+    "speculative-execution<only-if-divergent-target>,jump-threading," +
+    "correlated-propagation,jump-table-to-switch," +
+    "simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;no-switch-to-arithmetic;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;no-sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>," +
+    "instcombine<max-iterations=1;no-verify-fixpoint>,aggressive-instcombine," +
+    "libcalls-shrinkwrap,reassociate,loop-mssa(loop-simplifycfg," +
+    "loop-rotate<header-duplication;no-prepare-for-lto;no-check-exit-count>," +
+    "licm<allowspeculation>,simple-loop-unswitch<no-nontrivial;trivial>),loop(loop-idiom," +
+    "indvars,extra-simple-loop-unswitch-passes,loop-deletion),sroa<modify-cfg>," +
+    "vector-combine,mldst-motion<no-split-footer-bb>,gvn<>," +
+    "instcombine<max-iterations=1;no-verify-fixpoint>,dfa-jump-threading,jump-threading," +
+    "memcpyopt,dse,move-auto-init,coro-elide," +
+    "simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;switch-range-to-icmp;switch-to-arithmetic;no-switch-to-lookup;keep-loops;hoist-common-insts;no-hoist-loads-stores-with-cond-faulting;sink-common-insts;speculate-blocks;simplify-cond-branch;no-speculate-unpredictables>)," +
+    "function-attrs,function(require<should-not-run-function-passes>),coro-split," +
+    "coro-annotation-elide)),deadargelim,coro-cleanup,globalopt,globaldce," +
+    "elim-avail-extern,rpo-function-attrs,recompute-globalsaa," +
+    "function<eager-inv>(drop-unnecessary-assumes,float2int,lower-constant-intrinsics," +
+    "loop(loop-rotate<header-duplication;no-prepare-for-lto;check-exit-count>," +
+    "loop-deletion,loop-interchange),loop-distribute,inject-tli-mappings," +
+    "loop-vectorize<no-interleave-forced-only;no-vectorize-forced-only;>," +
+    "drop-unnecessary-assumes,loop-load-elim,slp-vectorizer,vector-combine," +
+    "transform-warning,sroa<preserve-cfg;aggregate-to-vector>,infer-alignment," +
+    "alignment-from-assumptions,loop-sink,div-rem-pairs,mergeicmps,expand-memcmp," +
+    "tailcallelim),alloc-token,globaldce,constmerge,cg-profile," +
+    "rel-lookup-table-converter,lower-comment-string,function(annotation-remarks)," +
+    "globaldce"
 
 // Bootstrap-only object emission. The final compiler replaces this strategy
 // with the in-process LLVM implementation from abla/llvm/aot.
@@ -1255,7 +1447,7 @@ fun bootstrapOptimizeWholeProgram(
     optimize.argument("-internalize-public-api-list=$names")
     optimize.argument("-inline-threshold=225")
     if (!bootstrapLlvmDebugInfo) optimize.argument("-force-attribute=nounwind")
-    optimize.argument("-passes=internalize,forceattrs,default<O2>,globaldce")
+    optimize.argument("-passes=internalize,$BOOTSTRAP_HOST_RELEASE_PASSES")
     optimize.argument(llvmPath)
     optimize.argument("-o")
     optimize.argument(optimizedPath)
@@ -1352,8 +1544,14 @@ trusted fun bootstrapOptimizeHeldWholeProgram(
         LLVMPassBuilderOptionsSetSLPVectorization(options, 1)
         LLVMPassBuilderOptionsSetLoopUnrolling(options, 1)
         status = llvmConsumeError(
-            LLVMRunPasses(module, "default<O2>,globaldce", machine, options), 167
+            LLVMRunPasses(module, BOOTSTRAP_HOST_RELEASE_PASSES, machine, options), 167
         )
+        // (A pipeline LLVM can't parse fails before any pass runs.)
+        if (status != 0) {
+            status = llvmConsumeError(
+                LLVMRunPasses(module, "default<O2>,globaldce", machine, options), 167
+            )
+        }
     }
     if (status == 0 && LLVMWriteBitcodeToFile(module, optimizedPath) != 0) status = 164
     if (!pointerIsNull(options)) LLVMDisposePassBuilderOptions(options)
@@ -2728,8 +2926,10 @@ fun bootstrapNativeBuildWithEmitterStateCache(
             }
             // The program, its analysis and its IR are garbage once the module is written,
             // but until a collection they hold the heap they grew (over 1 GB for a large
-            // module) while opt and llc, larger still, run beside this process.
-            if (status == 0) {
+            // module) while opt and llc, larger still, run beside this process. Below
+            // 256 MB that's little against LLVM's own peak, and the collection is 3% of a
+            // small program's build.
+            if (status == 0 && runtimeMemoryLiveBytes() >= 268435456) {
                 bootstrapCollectAndRelease()
                 bootstrapLlvmTraceMemory("emit.collected")
             }
@@ -3115,10 +3315,9 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         }
         // (An archive of code generation units is loaded whole; ld64 loads an object
         // so named as it loads it plainly.)
+        val linkedObject = if (ltoEligible && !linkLlvm) ltoObjectPath else objectPath
         if (nativeUnits) link.argument("-Wl,-force_load,$objectPath")
-        else link.argument(if (ltoEligible && !linkLlvm)
-            ltoObjectPath
-        else objectPath)
+        else link.argument(linkedObject)
         if (macTarget) link.argument(hostPath)
         // OpenSSL is not on Darwin's default library path, whether the graph
         // links it for TLS or the manifest names it.
@@ -3145,7 +3344,8 @@ fun bootstrapNativeBuildWithEmitterStateCache(
         if (!macTarget) link.argument("-lm")
         link.argument("-o")
         link.argument(publishPath)
-        status = link.run()
+        status = if (macTarget || nativeUnits) link.run()
+            else bootstrapRunHostLink(link, linkedObject, publishPath)
     }
     // The Abla runtime is part of the program LLVM unit, so its ordinary
     // object is already the complete packageable sidecar.
