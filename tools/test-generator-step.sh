@@ -18,7 +18,7 @@ done
 [[ $("$output_directory/counter") == 5000411500 ]] || {
     echo "generator step: counter printed $("$output_directory/counter")"; exit 1
 }
-[[ $("$output_directory/words") == 2177800 ]] || {
+[[ $("$output_directory/words") == 2577800 ]] || {
     echo "generator step: words printed $("$output_directory/words")"; exit 1
 }
 

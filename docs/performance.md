@@ -19,6 +19,51 @@ object emission, and linking.
 Compare two compilers with `tools/bench-compare.py` (compile instructions, stripped size,
 run cycles and instructions, on `tests/benchmarks`).
 
+## A string slice needs no collection safe point (2026-11-02)
+
+`string.slice` returns a view. Like reading a character or comparing strings,
+it may first flatten a rope, whose copy remains reachable from the rope. The
+runtime does not collect while doing that. It therefore no longer counts as
+an allocating operation in `bootstrapLlvmInstructionMayAllocate`: a function
+that only slices does not need an entry pressure check or a root frame, and
+its callers need not root values solely across that call. Real allocations,
+callbacks and explicit collection retain their safe points.
+
+Together with the string-reader changes below, against master `753d1d10`:
+
+| Metric (geometric mean) | Change |
+|---|---:|
+| Release build, instructions (13 programs) | -2.5% |
+| Stripped size (13 programs) | -2.4% |
+| Run instructions (11 programs) | -1.2% |
+| `abla-compare` server, user instructions per request (9 workloads) | -2.58% |
+| Server stripped size | -7.4% (290,000 to 268,608 bytes) |
+
+This screen used one build and two run rounds per benchmark; the compiler was
+built with master's compiler and the changed runtime. Every run benchmark and
+all nine server workloads improve or remain unchanged in instructions. In
+json-readers' unoptimized IR, root pushes fall from 62 to 58, entry pressure
+checks from 45 to 37 and loop pressure checks from 23 to 22. The combined
+changes still do not reach the requested 10% geomean size reduction.
+
+GC stress, collection modes, collection growth and string retention pass.
+The new stress fixture keeps interior slices of flat strings and flattened
+ropes after their parents are gone, with explicit collection between appends.
+It also indexes and compares rope temporaries with no named owner; this passes
+under `ABLA_GC_STRESS=1`. The generator-step fixture now really allocates a decorated word: its former
+slice per word was a view, so its assertion that an allocating step roots
+would otherwise test the wrong case. With that fixture and checksum corrected,
+`make test` passes all 256 commands in a clean run (214 seconds, 16 jobs).
+A compiler self-build succeeds, and its json-readers LLVM text is byte-identical
+to that emitted by the previous stage of the compiler.
+
+The separate compiler-GC-stress check does **not** pass: both master and the
+candidate crash in `__ablaRuntimeArrayGetOther` called by
+`bootstrapRewriteModuleSource`. GDB shows the same instruction offset (+65)
+and invalid address (`0x736c61626f`, `SEGV_MAPERR`) in the untouched baseline
+compiler/sysroot and the rebuilt candidate. This is a pre-existing correctness
+issue, distinct from the passing program-level GC stress and regular suite.
+
 ## String readers pass words into shared paths (2026-11-02)
 
 Against master `753d1d10`, using its compiler with the two sysroots,
